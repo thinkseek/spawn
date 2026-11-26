@@ -34,7 +34,8 @@ import {
   sourceLabel,
   verificationNote,
 } from "../../features";
-import { fetchFeatureMap } from "../../featuresApi";
+import type { FeatureTruthResponse } from "../../featureCoverage";
+import { fetchFeatureMap, fetchOptionalFeatureTruth } from "../../featuresApi";
 import type { GraphGroupingMode } from "../../featuresGraph";
 import {
   buildFeatureMindMapTree,
@@ -67,10 +68,21 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
   const [groupingMode, setGroupingMode] = useState<GraphGroupingMode>("auto");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [focusTrigger, setFocusTrigger] = useState(0);
+  const [truthData, setTruthData] = useState<FeatureTruthResponse | null>(null);
 
   const data = poll.data;
   const mission =
     data?.missions.find((entry) => entry.id === chosen) ?? data?.missions[0] ?? null;
+
+  // Non-blocking read-only enrichment from `/api/features/truth`.
+  const missionId = mission?.id ?? null;
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchOptionalFeatureTruth(controller.signal, missionId).then((next) => {
+      if (!controller.signal.aborted) setTruthData(next);
+    });
+    return () => controller.abort();
+  }, [missionId]);
 
   const tree = useMemo(
     () => (mission ? buildFeatureMindMapTree(mission, { groupingMode }) : null),
@@ -222,6 +234,7 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
                   tree={tree}
                   fileIndex={fileIndex}
                   relationIndex={relationIndex}
+                  truth={truthData}
                   onSelectNode={handleJumpToNode}
                   onOpenSession={onOpenSession}
                   onClose={() => setSelectedNodeId(null)}

@@ -42,6 +42,8 @@ import type {
   MindMapTreeNode,
   RelationIndex,
 } from "../../featuresGraph";
+import type { FeatureTruthResponse } from "../../featureCoverage";
+import { featureTruthSummaryFor, purityCodeLabel } from "../../featureCoverage";
 import { RELATION_META, getSharedCoOwners } from "../../featuresGraph";
 import { FOCUS_RING, cx } from "../ui";
 
@@ -51,6 +53,7 @@ export interface FeatureInspectorProps {
   tree: FeatureMindMapTree;
   fileIndex: FileIndex;
   relationIndex: RelationIndex;
+  truth?: FeatureTruthResponse | null;
   onSelectNode: (nodeId: string) => void;
   onOpenSession: (sessionId: string) => void;
   onClose: () => void;
@@ -66,10 +69,12 @@ export function FeatureInspector({
   tree,
   fileIndex,
   relationIndex,
+  truth = null,
   onSelectNode,
   onOpenSession,
   onClose,
 }: FeatureInspectorProps) {
+  const truthSummary = node.feature ? featureTruthSummaryFor(truth, node.feature.id) : null;
   return (
     <aside
       aria-label={`Inspector: ${node.title}`}
@@ -100,6 +105,24 @@ export function FeatureInspector({
                 {node.feature.live && !node.feature.verified && (
                   <span className="rounded-chip bg-wait-tint px-1.5 py-px text-micro text-warning">
                     unverified live
+                  </span>
+                )}
+                {truthSummary && (
+                  <span
+                    className={cx(
+                      "rounded-chip px-1.5 py-px text-micro font-medium",
+                      truthSummary.status === "error"
+                        ? "bg-fail-tint text-destructive"
+                        : truthSummary.status === "warn"
+                          ? "bg-wait-tint text-warning"
+                          : "bg-ok-tint text-success",
+                    )}
+                  >
+                    {truthSummary.status === "error"
+                      ? `truth/purity: ${truthSummary.truthErrors + truthSummary.purityErrors} err`
+                      : truthSummary.status === "warn"
+                        ? `truth: ${truthSummary.truthWarnings + truthSummary.purityWarnings} warn`
+                        : "truth clean"}
                   </span>
                 )}
               </>
@@ -133,6 +156,7 @@ export function FeatureInspector({
             tree={tree}
             fileIndex={fileIndex}
             relationIndex={relationIndex}
+            truthSummary={truthSummary}
             onSelectNode={onSelectNode}
             onOpenSession={onOpenSession}
           />
@@ -157,6 +181,7 @@ function FeatureDetailBody({
   tree,
   fileIndex,
   relationIndex,
+  truthSummary,
   onSelectNode,
   onOpenSession,
 }: {
@@ -165,6 +190,7 @@ function FeatureDetailBody({
   tree: FeatureMindMapTree;
   fileIndex: FileIndex;
   relationIndex: RelationIndex;
+  truthSummary: ReturnType<typeof featureTruthSummaryFor>;
   onSelectNode: (nodeId: string) => void;
   onOpenSession: (sessionId: string) => void;
 }) {
@@ -562,6 +588,62 @@ function FeatureDetailBody({
           </div>
         </InspectorSection>
       )}
+
+      {/* Read-only Dependency Truth & Purity */}
+      {truthSummary &&
+        (truthSummary.truthFindings.length > 0 || truthSummary.purityFindings.length > 0) && (
+          <InspectorSection
+            title={`Dependency truth & purity (${truthSummary.truthFindings.length + truthSummary.purityFindings.length})`}
+          >
+            <ul className="flex flex-col gap-1.5 text-micro">
+              {truthSummary.truthFindings.map((finding, idx) => (
+                <li
+                  key={`${finding.code}:${idx}`}
+                  className="rounded-control border border-surface-border bg-page-canvas px-2.5 py-1.5"
+                >
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span
+                      className={cx(
+                        "rounded-chip px-1.5 py-px font-medium",
+                        finding.severity === "error"
+                          ? "bg-fail-tint text-destructive"
+                          : finding.severity === "warn"
+                            ? "bg-wait-tint text-warning"
+                            : "bg-info-tint text-info",
+                      )}
+                    >
+                      {finding.severity}
+                    </span>
+                    <span className="font-mono text-foreground">{finding.code}</span>
+                    {finding.waived && <span className="text-faint-foreground">(waived)</span>}
+                  </div>
+                  {finding.fix && <p className="mt-1 text-muted-foreground">{finding.fix}</p>}
+                  {finding.evidence.slice(0, 2).map((edge, edgeIdx) => (
+                    <p key={edgeIdx} className="mt-0.5 truncate font-mono text-faint-foreground">
+                      {edge.from}:{edge.line} → {edge.to}
+                    </p>
+                  ))}
+                </li>
+              ))}
+              {truthSummary.purityFindings.map((finding, idx) => (
+                <li
+                  key={`${finding.code}:purity:${idx}`}
+                  className="rounded-control border border-destructive/30 bg-fail-tint/40 px-2.5 py-1.5"
+                >
+                  <div className="flex items-center gap-1.5">
+                    <span className="rounded-chip bg-fail-tint px-1.5 py-px font-medium text-destructive">
+                      {finding.severity}
+                    </span>
+                    <span className="font-mono text-foreground">
+                      {purityCodeLabel(finding.code)}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-muted-foreground">{finding.detail}</p>
+                </li>
+              ))}
+            </ul>
+          </InspectorSection>
+        )}
     </div>
   );
 }

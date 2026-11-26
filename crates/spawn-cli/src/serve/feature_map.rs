@@ -83,11 +83,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Map, Value, json};
 
-use super::{BAD_REQUEST, now_ms, objective_missions, open_store, parameter, task_in_flight};
+use super::{
+    BAD_REQUEST, answers, now_ms, objective_missions, open_store, parameter, task_in_flight,
+};
 
 /// The largest mapping file read. A capability list is identities, not
 /// prose: a megabyte is already far more than any mission needs.
@@ -4966,5 +4968,636 @@ mod tests {
             ["cap-resource-envelopes"],
             "4/029 is its own node"
         );
+    }
+}
+
+/// Bounded in-memory LRU capacity for computed `/api/features/truth` answers.
+const MAX_TRUTH_CACHE_ENTRIES: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TruthCacheKey {
+    canonical_root: PathBuf,
+    canonical_registry: PathBuf,
+    registry_mtime_nanos: u128,
+    registry_size: u64,
+    git_head: Option<String>,
+    today: String,
+}
+
+#[derive(Debug)]
+struct TruthCache {
+    entries: Vec<(TruthCacheKey, Arc<answers::Answer>)>,
+    cap: usize,
+}
+
+impl TruthCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn get(&mut self, key: &TruthCacheKey) -> Option<Arc<answers::Answer>> {
+        let pos = self.entries.iter().position(|(seen, _)| seen == key)?;
+        let entry = self.entries.remove(pos);
+        let answer = Arc::clone(&entry.1);
+        self.entries.push(entry);
+        Some(answer)
+    }
+
+    fn insert(&mut self, key: TruthCacheKey, answer: Arc<answers::Answer>) {
+        self.entries.retain(|(seen, _)| {
+            seen.canonical_root != key.canonical_root
+                || seen.canonical_registry != key.canonical_registry
+        });
+        while self.entries.len() >= self.cap {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, answer));
+    }
+}
+
+static FEATURE_TRUTH_CACHE: OnceLock<Mutex<TruthCache>> = OnceLock::new();
+
+/// Read-only `GET /api/features/truth[?project=<name>|?mission=<id>]` handler:
+/// resolves the project root & registry cleanly, hits a bounded cache keyed by
+/// `(root, registry mtime/size, git HEAD, utc_today)`, and produces a deterministic
+/// JSON answer with a weak `ETag` (for conditional `If-None-Match` -> `304`).
+pub(in crate::serve) fn feature_truth_answer(query: &str) -> answers::Answer {
+    let (root, registry_path) = match resolve_truth_target(query) {
+        Ok(paths) => paths,
+        Err((status, body)) => {
+            return answers::Answer {
+                status,
+                body: body.to_string(),
+                etag: None,
+            };
+        }
+    };
+    let today = truth_utc_today();
+    let cache_lock =
+        FEATURE_TRUTH_CACHE.get_or_init(|| Mutex::new(TruthCache::new(MAX_TRUTH_CACHE_ENTRIES)));
+    let Ok(mut cache) = cache_lock.lock() else {
+        let mut isolated = TruthCache::new(1);
+        let (answer, _) = compute_or_get_truth_answer(&root, &registry_path, &today, &mut isolated);
+        return answer.as_ref().clone();
+    };
+    let (answer, _) = compute_or_get_truth_answer(&root, &registry_path, &today, &mut cache);
+    answer.as_ref().clone()
+}
+
+fn truth_utc_today() -> String {
+    let stamp = crate::backup::Stamp::at(now_ms()).text();
+    format!("{}-{}-{}", &stamp[0..4], &stamp[4..6], &stamp[6..8])
+}
+
+fn query_param_presence<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .find_map(|pair| match pair.split_once('=') {
+            Some((key, value)) => (key == name).then_some(value),
+            None => (pair == name).then_some(""),
+        })
+}
+
+fn decode_query_component(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' {
+            let hi = *bytes.get(idx + 1)?;
+            let lo = *bytes.get(idx + 2)?;
+            let hex = [hi, lo];
+            let hex_str = std::str::from_utf8(&hex).ok()?;
+            let byte = u8::from_str_radix(hex_str, 16).ok()?;
+            out.push(byte);
+            idx += 3;
+        } else {
+            out.push(bytes[idx]);
+            idx += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_DEFAULT_PROJECT: std::cell::RefCell<Option<(PathBuf, PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(in crate::serve) fn with_test_default_project<T>(
+    root: &Path,
+    registry: &Path,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<(PathBuf, PathBuf)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_DEFAULT_PROJECT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = TEST_DEFAULT_PROJECT.with(|slot| {
+        slot.borrow_mut()
+            .replace((root.to_path_buf(), registry.to_path_buf()))
+    });
+    let _reset = Reset(prev);
+    f()
+}
+
+fn default_project_paths() -> (PathBuf, PathBuf) {
+    #[cfg(test)]
+    if let Some(overridden) = TEST_DEFAULT_PROJECT.with(|slot| slot.borrow().clone()) {
+        return overridden;
+    }
+    let root = crate::feature_inventory::default_root();
+    let registry = crate::feature_inventory::default_registry_path(&root);
+    (root, registry)
+}
+
+fn resolve_truth_target(query: &str) -> Result<(PathBuf, PathBuf), (u16, Value)> {
+    if query_param_presence(query, "mission").is_some() {
+        return super::feature_paths(query);
+    }
+    if let Some(raw_project) = query_param_presence(query, "project") {
+        let decoded = decode_query_component(raw_project).unwrap_or_default();
+        let trimmed = decoded.trim();
+        if trimmed.is_empty() {
+            return Err((
+                400,
+                json!({
+                    "error": format!("{BAD_REQUEST}empty project parameter"),
+                    "code": "bad_project",
+                }),
+            ));
+        }
+        return resolve_named_project(trimmed);
+    }
+    let (root, registry) = default_project_paths();
+    if !registry.exists() {
+        return Err((
+            404,
+            json!({
+                "error": format!("feature registry not found at {}", registry.display()),
+                "code": "registry_not_found",
+            }),
+        ));
+    }
+    Ok((root, registry))
+}
+
+fn resolve_named_project(name: &str) -> Result<(PathBuf, PathBuf), (u16, Value)> {
+    let (default_root, default_registry) = default_project_paths();
+    if default_registry.exists()
+        && (name.eq_ignore_ascii_case("default")
+            || project_matches_name(name, &default_root, &default_registry))
+    {
+        return Ok((default_root, default_registry));
+    }
+    if let Ok(store) = open_store()
+        && let Ok(missions) = objective_missions(&store)
+    {
+        for mission in &missions {
+            let Some(id) = mission["id"].as_i64() else {
+                continue;
+            };
+            let Some((root, registry)) = super::coverage_mission_paths(mission, id) else {
+                continue;
+            };
+            if name == id.to_string() || project_matches_name(name, &root, &registry) {
+                return Ok((root, registry));
+            }
+        }
+    }
+    Err((
+        404,
+        json!({
+            "error": format!("unknown project {name:?}"),
+            "code": "project_not_found",
+            "project": name,
+        }),
+    ))
+}
+
+fn project_matches_name(wanted: &str, root: &Path, registry_path: &Path) -> bool {
+    if root
+        .file_name()
+        .and_then(|dir| dir.to_str())
+        .is_some_and(|dir| dir.eq_ignore_ascii_case(wanted))
+    {
+        return true;
+    }
+    crate::feature_inventory::load_registry(registry_path)
+        .is_ok_and(|reg| reg.boundary.project_name.eq_ignore_ascii_case(wanted))
+}
+
+fn git_head_sha(canonical_root: &Path) -> Option<String> {
+    let output = crate::sources::controller_git()
+        .arg("-C")
+        .arg(canonical_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+fn build_truth_cache_key(
+    root: &Path,
+    registry_path: &Path,
+    today: &str,
+) -> Result<TruthCacheKey, String> {
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|error| format!("resolve project root {}: {error}", root.display()))?;
+    let canonical_registry = std::fs::canonicalize(registry_path).map_err(|error| {
+        format!(
+            "resolve feature registry {}: {error}",
+            registry_path.display()
+        )
+    })?;
+    let meta = std::fs::metadata(&canonical_registry)
+        .map_err(|error| format!("stat feature registry {}: {error}", registry_path.display()))?;
+    let registry_mtime_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |dur| dur.as_nanos());
+    let git_head = git_head_sha(&canonical_root);
+    Ok(TruthCacheKey {
+        canonical_root,
+        canonical_registry,
+        registry_mtime_nanos,
+        registry_size: meta.len(),
+        git_head,
+        today: today.to_string(),
+    })
+}
+
+fn compute_or_get_truth_answer(
+    root: &Path,
+    registry_path: &Path,
+    today: &str,
+    cache: &mut TruthCache,
+) -> (Arc<answers::Answer>, bool) {
+    let Ok(key) = build_truth_cache_key(root, registry_path, today) else {
+        let computed = compute_truth_answer(root, registry_path, None, today);
+        return (Arc::new(computed), false);
+    };
+    if let Some(hit) = cache.get(&key) {
+        return (hit, true);
+    }
+    let computed = Arc::new(compute_truth_answer(
+        root,
+        registry_path,
+        key.git_head.as_deref(),
+        today,
+    ));
+    if computed.status == 200 {
+        cache.insert(key, Arc::clone(&computed));
+    }
+    (computed, false)
+}
+
+fn compute_truth_answer(
+    root: &Path,
+    registry_path: &Path,
+    git_head: Option<&str>,
+    today: &str,
+) -> answers::Answer {
+    let result = build_truth_payload(root, registry_path, git_head, today);
+    answers::answer("/api/features/truth", result, BAD_REQUEST)
+}
+
+fn build_truth_payload(
+    root: &Path,
+    registry_path: &Path,
+    git_head: Option<&str>,
+    today: &str,
+) -> Result<Value, String> {
+    let registry = crate::feature_inventory::load_registry(registry_path)?;
+    let (code_graph, _) = crate::feature_inventory::build_code_graph(root, &registry.boundary)?;
+    let policy = spawn_core::feature_deps::TruthPolicy::default();
+    let truth_report = spawn_core::feature_deps::truth(&code_graph, &registry, &policy, today);
+    let enforced = spawn_core::feature_deps::enforced_truth_violations(&truth_report);
+    let purity_report = spawn_core::feature_deps::check_purity(&registry, Some(&code_graph));
+    let by_code = &truth_report.counts.by_code;
+    let code_count = |code: &str| by_code.get(code).copied().unwrap_or(0);
+
+    Ok(json!({
+        "schema_version": spawn_core::feature_deps::TRUTH_SCHEMA_VERSION,
+        "project": registry.boundary.project_name,
+        "root": root.display().to_string(),
+        "registry_path": registry_path.display().to_string(),
+        "git_head": git_head,
+        "today": today,
+        "projection": truth_report.projection,
+        "counts": {
+            "error": truth_report.counts.error,
+            "warn": truth_report.counts.warn,
+            "info": truth_report.counts.info,
+            "waived": truth_report.counts.waived,
+            "enforced_violations": enforced.len(),
+            "under_declared": code_count("under_declared"),
+            "implied_only": code_count("implied_only"),
+            "test_only_undeclared": code_count("test_only_undeclared"),
+            "ghost": code_count("ghost"),
+            "inverted": code_count("inverted"),
+            "unverifiable": code_count("unverifiable"),
+            "static_cycle": code_count("static_cycle"),
+            "basis_without_note": code_count("basis_without_note"),
+            "kernel_leak": code_count("kernel_leak"),
+            "entrypoint_imported": code_count("entrypoint_imported"),
+            "waiver_unused": code_count("waiver_unused"),
+            "by_code": by_code,
+        },
+        "enforced_violations": enforced,
+        "findings": truth_report.findings,
+        "purity": {
+            "schema_version": purity_report.schema_version,
+            "clean": purity_report.is_clean(),
+            "counts": purity_report.counts,
+            "findings": purity_report.findings,
+        },
+        "graph": {
+            "units": code_graph.units.len(),
+            "files": code_graph.files.len(),
+            "edges": code_graph.edges.len(),
+            "diagnostics": code_graph.diagnostics.len(),
+        }
+    }))
+}
+
+#[cfg(test)]
+mod truth_tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use serde_json::{Value, json};
+
+    use super::{
+        TruthCache, compute_or_get_truth_answer, resolve_truth_target, with_test_default_project,
+    };
+    use crate::serve::answers;
+
+    struct TempRepo(PathBuf);
+
+    impl TempRepo {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("spawn-truth-api-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(root: &std::path::Path, args: &[&str]) -> String {
+        let root_str = root.to_string_lossy().to_string();
+        let mut full = vec!["-C", &root_str];
+        full.extend_from_slice(args);
+        crate::sources::test_git(&full).unwrap()
+    }
+
+    fn write_fixture_repo(root: &std::path::Path, declare_dep: bool, add_domain_file: bool) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs/feature-map")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+        std::fs::write(
+            root.join("src/a.rs"),
+            "use crate::b::val;\npub fn f() -> u32 { val() }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn val() -> u32 { 7 }\n").unwrap();
+
+        let relations = if declare_dep {
+            json!([{"kind": "depends_on", "target": "cap-b"}])
+        } else {
+            json!([])
+        };
+        let domain_files = if add_domain_file {
+            json!(["src/lib.rs"])
+        } else {
+            json!([])
+        };
+        let registry = json!({
+            "schema_version": 1,
+            "initiative_id": "fx",
+            "boundary": {
+                "project_name": "TruthSample",
+                "description": "Fixture for /api/features/truth",
+                "included_categories": ["tracked-source"],
+                "exclusions": []
+            },
+            "features": [
+                {
+                    "id": "dom-root",
+                    "title": "Root Domain",
+                    "kind": "domain",
+                    "summary": "Domain root",
+                    "files": domain_files,
+                    "relations": [],
+                    "provenance": {}
+                },
+                {
+                    "id": "cap-a",
+                    "title": "Feature A",
+                    "kind": "capability",
+                    "parent": "dom-root",
+                    "summary": "Depends on B in code",
+                    "files": ["src/a.rs"],
+                    "relations": relations,
+                    "provenance": {}
+                },
+                {
+                    "id": "cap-b",
+                    "title": "Feature B",
+                    "kind": "capability",
+                    "parent": "dom-root",
+                    "summary": "Library base",
+                    "files": ["Cargo.toml", "src/b.rs", "src/lib.rs"],
+                    "relations": [],
+                    "provenance": {}
+                }
+            ]
+        });
+        std::fs::write(
+            root.join("docs/feature-map/registry.json"),
+            format!("{}\n", serde_json::to_string_pretty(&registry).unwrap()),
+        )
+        .unwrap();
+    }
+
+    fn init_git_commit(root: &std::path::Path, msg: &str) {
+        if !root.join(".git").exists() {
+            crate::sources::test_git(&[
+                "init",
+                "-q",
+                "--initial-branch=main",
+                &root.to_string_lossy(),
+            ])
+            .unwrap();
+        }
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", msg]);
+    }
+
+    fn snapshot_mtimes(root: &std::path::Path) -> BTreeMap<PathBuf, (u64, u128)> {
+        let mut out = BTreeMap::new();
+        for rel in [
+            "Cargo.toml",
+            "src/a.rs",
+            "src/b.rs",
+            "docs/feature-map/registry.json",
+        ] {
+            let p = root.join(rel);
+            let meta = std::fs::metadata(&p).unwrap();
+            let nanos = meta
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            out.insert(p, (meta.len(), nanos));
+        }
+        out
+    }
+
+    #[test]
+    fn truth_payload_etag_cache_hit_and_invalidation_on_registry_and_head() {
+        let repo = TempRepo::new("cache-invalidation");
+        write_fixture_repo(&repo.0, false, true);
+        init_git_commit(&repo.0, "initial");
+        let reg_path = repo.0.join("docs/feature-map/registry.json");
+        let before = snapshot_mtimes(&repo.0);
+
+        let mut cache = TruthCache::new(16);
+        let (first, hit1) =
+            compute_or_get_truth_answer(&repo.0, &reg_path, "2026-11-26", &mut cache);
+        assert!(!hit1);
+        assert_eq!(first.status, 200);
+        let etag1 = first.etag.as_deref().expect("weak etag").to_string();
+        assert!(etag1.starts_with("W/\""));
+        assert!(answers::not_modified(Some(&etag1), &etag1));
+
+        // Strictly read-only: zero files on disk were modified.
+        assert_eq!(snapshot_mtimes(&repo.0), before);
+
+        let payload1: Value = serde_json::from_str(&first.body).unwrap();
+        assert_eq!(payload1["project"], "TruthSample");
+        assert_eq!(payload1["counts"]["under_declared"], 1);
+        assert_eq!(payload1["counts"]["enforced_violations"], 1);
+        assert_eq!(payload1["purity"]["clean"], false);
+        assert_eq!(payload1["purity"]["counts"]["error"], 1);
+        let head1 = payload1["git_head"].as_str().unwrap().to_string();
+
+        // Repeated request hits cache and keeps exact weak ETag.
+        let (second, hit2) =
+            compute_or_get_truth_answer(&repo.0, &reg_path, "2026-11-26", &mut cache);
+        assert!(hit2);
+        assert_eq!(second.etag.as_deref(), Some(etag1.as_str()));
+
+        // Editing registry.json changes mtime/size and invalidates the cache.
+        write_fixture_repo(&repo.0, true, false);
+        let (third, hit3) =
+            compute_or_get_truth_answer(&repo.0, &reg_path, "2026-11-26", &mut cache);
+        assert!(!hit3);
+        let etag3 = third.etag.as_deref().expect("updated etag");
+        assert_ne!(etag3, etag1);
+        let payload3: Value = serde_json::from_str(&third.body).unwrap();
+        assert_eq!(payload3["counts"]["under_declared"], 0);
+        assert_eq!(payload3["counts"]["enforced_violations"], 0);
+        assert_eq!(payload3["purity"]["clean"], true);
+
+        // Committing to git changes HEAD and invalidates the cache even with identical registry bytes.
+        init_git_commit(&repo.0, "declare dependency and clean domain");
+        let (fourth, hit4) =
+            compute_or_get_truth_answer(&repo.0, &reg_path, "2026-11-26", &mut cache);
+        assert!(!hit4);
+        let payload4: Value = serde_json::from_str(&fourth.body).unwrap();
+        let head4 = payload4["git_head"].as_str().unwrap().to_string();
+        assert_ne!(head4, head1);
+        assert_ne!(fourth.etag.as_deref(), Some(etag3));
+    }
+
+    #[test]
+    fn truth_cache_evicts_oldest_entries_beyond_bound() {
+        let mut cache = TruthCache::new(2);
+        let ans = std::sync::Arc::new(answers::Answer {
+            status: 200,
+            body: "{}".to_string(),
+            etag: Some("W/\"1\"".to_string()),
+        });
+        for idx in 0..4 {
+            let key = super::TruthCacheKey {
+                canonical_root: PathBuf::from(format!("/repo-{idx}")),
+                canonical_registry: PathBuf::from(format!(
+                    "/repo-{idx}/docs/feature-map/registry.json"
+                )),
+                registry_mtime_nanos: 1,
+                registry_size: 2,
+                git_head: None,
+                today: "2026-11-26".to_string(),
+            };
+            cache.insert(key, std::sync::Arc::clone(&ans));
+        }
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entries[0].0.canonical_root, PathBuf::from("/repo-2"));
+        assert_eq!(cache.entries[1].0.canonical_root, PathBuf::from("/repo-3"));
+    }
+
+    #[test]
+    fn query_project_and_mission_resolution_enforces_boundaries() {
+        let repo = TempRepo::new("query-resolve");
+        write_fixture_repo(&repo.0, true, false);
+        let reg_path = repo.0.join("docs/feature-map/registry.json");
+
+        with_test_default_project(&repo.0, &reg_path, || {
+            assert!(resolve_truth_target("").is_ok());
+            assert!(resolve_truth_target("project=TruthSample").is_ok());
+            assert!(resolve_truth_target("project=truthsample").is_ok());
+            assert!(resolve_truth_target("project=default").is_ok());
+
+            let (empty_st, empty_body) = resolve_truth_target("project=").unwrap_err();
+            assert_eq!(empty_st, 400);
+            assert_eq!(empty_body["code"], "bad_project");
+
+            let (bare_st, bare_body) = resolve_truth_target("project").unwrap_err();
+            assert_eq!(bare_st, 400);
+            assert_eq!(bare_body["code"], "bad_project");
+
+            let (missing_st, missing_body) =
+                resolve_truth_target("project=../../etc/passwd").unwrap_err();
+            assert_eq!(missing_st, 404);
+            assert_eq!(missing_body["code"], "project_not_found");
+
+            let (bad_mission_st, bad_mission_body) =
+                resolve_truth_target("mission=abc").unwrap_err();
+            assert_eq!(bad_mission_st, 400);
+            assert_eq!(bad_mission_body["code"], "bad_mission");
+        });
+
+        let missing_default_reg = repo.0.join("docs/feature-map/missing.json");
+        with_test_default_project(&repo.0, &missing_default_reg, || {
+            let (st, body) = resolve_truth_target("project=default").unwrap_err();
+            assert_eq!(st, 404);
+            assert_eq!(body["code"], "project_not_found");
+        });
     }
 }

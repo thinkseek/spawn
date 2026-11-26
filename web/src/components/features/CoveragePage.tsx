@@ -7,15 +7,18 @@ import {
   type CoverageProject,
   type CoverageScope,
   type FeatureCoverageResponse,
+  type FeatureTruthResponse,
 } from "../../featureCoverage";
 import {
   associateWildFile,
   fetchCoverageProjects,
   fetchFeatureCoverage,
+  fetchFeatureTruth,
   runWildFileScan,
 } from "../../featureCoverageApi";
 import { relativeTime } from "../../format";
 import { LiveStatus, PageHeader } from "../ui";
+import { DependencyTruthPanel } from "./DependencyTruthPanel";
 import { WildFileScanPanel } from "./WildFileScanPanel";
 
 /** Feature file coverage & one-click unassociated-file ("野文件") scan view
@@ -31,6 +34,12 @@ export function CoveragePage() {
   const [shown, setShown] = useState<{ scope: CoverageScope; data: FeatureCoverageResponse } | null>(
     null,
   );
+  const [truthShown, setTruthShown] = useState<{
+    scope: CoverageScope;
+    data: FeatureTruthResponse;
+  } | null>(null);
+  const [truthLoading, setTruthLoading] = useState(true);
+  const [truthError, setTruthError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -38,6 +47,26 @@ export function CoveragePage() {
   const mission = scope.mission;
   // Only the current scope's report is ever drawn (or associated against).
   const data = shown && isCurrentCoverageScope(shown.scope, scope) ? shown.data : null;
+  const truthData =
+    truthShown && isCurrentCoverageScope(truthShown.scope, scope) ? truthShown.data : null;
+
+  const loadTruthForScope = useCallback((target: CoverageScope, signal?: AbortSignal) => {
+    setTruthLoading(true);
+    setTruthError(null);
+    void fetchFeatureTruth(signal ?? new AbortController().signal, target.mission)
+      .then((next) => {
+        if (!isCurrentCoverageScope(target, scopeRef.current)) return;
+        setTruthShown({ scope: target, data: next });
+        setTruthError(null);
+        setTruthLoading(false);
+      })
+      .catch((cause) => {
+        if (cause instanceof DOMException && cause.name === "AbortError") return;
+        if (!isCurrentCoverageScope(target, scopeRef.current)) return;
+        setTruthError(cause instanceof Error ? cause.message : "Failed to load dependency truth");
+        setTruthLoading(false);
+      });
+  }, []);
 
   // The project list is a convenience: without it the default project still reads.
   useEffect(() => {
@@ -53,6 +82,9 @@ export function CoveragePage() {
     scopeRef.current = nextScope;
     setScope(nextScope);
     setShown(null);
+    setTruthShown(null);
+    setTruthError(null);
+    setTruthLoading(true);
     setScanning(false);
     setLoadError(null);
     setActionError(null);
@@ -73,8 +105,9 @@ export function CoveragePage() {
         if (!isCurrentCoverageScope(started, scopeRef.current)) return;
         setLoadError(cause instanceof Error ? cause.message : "Failed to load coverage");
       });
+    loadTruthForScope(started, controller.signal);
     return () => controller.abort();
-  }, [scope]);
+  }, [scope, loadTruthForScope]);
 
   const handleScan = useCallback(async () => {
     const started = scopeRef.current;
@@ -89,30 +122,35 @@ export function CoveragePage() {
       setActionNotice(
         `Scan complete: ${next.report.counts.in_scope} in-scope, ${next.report.counts.covered} covered, ${next.report.counts.unassociated_wild} wild, ${next.report.counts.stale_references} stale.`,
       );
+      loadTruthForScope(started);
     } catch (cause) {
       if (!isCurrentCoverageScope(started, scopeRef.current)) return;
       setActionError(cause instanceof Error ? cause.message : "Scan failed");
     } finally {
       if (isCurrentCoverageScope(started, scopeRef.current)) setScanning(false);
     }
-  }, []);
+  }, [loadTruthForScope]);
 
-  const handleAssociate = useCallback(async (path: string, featureIds: string[]) => {
-    const started = scopeRef.current;
-    setActionError(null);
-    setActionNotice(null);
-    try {
-      const next = await associateWildFile(path, featureIds, undefined, started.mission);
-      if (!isCurrentCoverageScope(started, scopeRef.current)) return;
-      setShown({ scope: started, data: next });
-      setActionNotice(
-        `Associated ${path} with ${featureIds.join(", ")} (remaining wild files: ${next.report.counts.unassociated_wild}).`,
-      );
-    } catch (cause) {
-      if (!isCurrentCoverageScope(started, scopeRef.current)) return;
-      setActionError(cause instanceof Error ? cause.message : "Association failed");
-    }
-  }, []);
+  const handleAssociate = useCallback(
+    async (path: string, featureIds: string[]) => {
+      const started = scopeRef.current;
+      setActionError(null);
+      setActionNotice(null);
+      try {
+        const next = await associateWildFile(path, featureIds, undefined, started.mission);
+        if (!isCurrentCoverageScope(started, scopeRef.current)) return;
+        setShown({ scope: started, data: next });
+        setActionNotice(
+          `Associated ${path} with ${featureIds.join(", ")} (remaining wild files: ${next.report.counts.unassociated_wild}).`,
+        );
+        loadTruthForScope(started);
+      } catch (cause) {
+        if (!isCurrentCoverageScope(started, scopeRef.current)) return;
+        setActionError(cause instanceof Error ? cause.message : "Association failed");
+      }
+    },
+    [loadTruthForScope],
+  );
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
@@ -170,6 +208,15 @@ export function CoveragePage() {
             onScan={() => void handleScan()}
             onAssociate={handleAssociate}
           />
+          <div className="mx-auto max-w-[1600px] px-4 pb-6 sm:px-5">
+            <DependencyTruthPanel
+              key={`truth-${scope.epoch}`}
+              data={truthData}
+              loading={truthLoading}
+              error={truthError}
+              onRetry={() => loadTruthForScope(scopeRef.current)}
+            />
+          </div>
         </div>
       )}
     </main>

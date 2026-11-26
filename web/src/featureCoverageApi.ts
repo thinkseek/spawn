@@ -9,8 +9,11 @@ import {
   normalizeCoverageProjects,
   parseCoverageHttpResponse,
   parseFeatureCoverageResponse,
+  parseFeatureTruthResponse,
+  truthUrl,
   type CoverageProject,
   type FeatureCoverageResponse,
+  type FeatureTruthResponse,
 } from "./featureCoverage.ts";
 
 /** GET /api/features/coverage/projects: every open objective mission whose
@@ -28,6 +31,19 @@ export async function fetchFeatureCoverage(
     coverageUrl("/api/features/coverage", mission),
     signal,
     parseFeatureCoverageResponse,
+  );
+}
+
+/** GET /api/features/truth: read-only code dependency truth & semantic purity report. */
+export async function fetchFeatureTruth(
+  signal: AbortSignal,
+  mission: number | null = null,
+  project: string | null = null,
+): Promise<FeatureTruthResponse> {
+  return readApi(
+    truthUrl({ mission, project }),
+    signal,
+    parseFeatureTruthResponse,
   );
 }
 
