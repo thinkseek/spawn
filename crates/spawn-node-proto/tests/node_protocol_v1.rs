@@ -15,7 +15,9 @@ use spawn_node_proto::codec::{EMPTY_SHA256, b64u, hex, sha256_hex, unhex};
 use spawn_node_proto::enroll::EnrollToken;
 use spawn_node_proto::envelope::{NodeSigner, request_signing_input};
 use spawn_node_proto::grant::{Grant, SignedGrant, grant_signing_input};
-use spawn_node_proto::heartbeat::{Ack, Beat, NEXT_BEAT_IDLE_MS};
+use spawn_node_proto::heartbeat::{
+    Ack, Beat, MAX_BATTERY_PCT, MAX_REMAINING_MINS, NEXT_BEAT_IDLE_MS, PowerTelemetry,
+};
 use spawn_node_proto::response::{RefusalBody, RequestId, sign_response, verify_response};
 use spawn_node_proto::result::{ResultMeta, build_body};
 use spawn_node_proto::spec::{NodeSpec, spec_sha256};
@@ -804,4 +806,65 @@ fn collect(root: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
             out.push(name);
         }
     }
+}
+
+#[test]
+fn p6_heartbeat_power_roundtrip_and_bounds() {
+    let base_bytes = read("heartbeat.req.json");
+    let base = Beat::parse(&base_bytes).unwrap();
+    assert_eq!(base.power, None);
+
+    let mut with_battery = base.clone();
+    with_battery.power = Some(PowerTelemetry {
+        on_ac: false,
+        battery_pct: Some(18),
+        charging: false,
+        remaining_mins: Some(42),
+    });
+    let encoded = with_battery.to_bytes().unwrap();
+    let parsed_json: Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(parsed_json["power"]["on_ac"], false);
+    assert_eq!(parsed_json["power"]["battery_pct"], 18);
+    assert_eq!(parsed_json["power"]["charging"], false);
+    assert_eq!(parsed_json["power"]["remaining_mins"], 42);
+    assert_eq!(Beat::parse(&encoded).unwrap(), with_battery);
+
+    let mut ac_only = base;
+    ac_only.power = Some(PowerTelemetry {
+        on_ac: true,
+        battery_pct: None,
+        charging: false,
+        remaining_mins: None,
+    });
+    let ac_bytes = ac_only.to_bytes().unwrap();
+    assert_eq!(Beat::parse(&ac_bytes).unwrap(), ac_only);
+
+    let mut at_max = parsed_json.clone();
+    at_max["power"]["battery_pct"] = serde_json::json!(MAX_BATTERY_PCT);
+    at_max["power"]["remaining_mins"] = serde_json::json!(MAX_REMAINING_MINS);
+    assert!(
+        Beat::parse(serde_json::to_string(&at_max).unwrap().as_bytes()).is_ok(),
+        "boundary values should pass"
+    );
+
+    let mut too_high_pct = parsed_json.clone();
+    too_high_pct["power"]["battery_pct"] = serde_json::json!(101);
+    assert_eq!(
+        Beat::parse(serde_json::to_string(&too_high_pct).unwrap().as_bytes()).unwrap_err(),
+        Error::Body("power.battery_pct")
+    );
+
+    let mut too_high_mins = parsed_json.clone();
+    too_high_mins["power"]["remaining_mins"] = serde_json::json!(1_000_000_000);
+    assert_eq!(
+        Beat::parse(serde_json::to_string(&too_high_mins).unwrap().as_bytes()).unwrap_err(),
+        Error::Body("power.remaining_mins")
+    );
+
+    let mut negative_pct = parsed_json;
+    negative_pct["power"]["battery_pct"] = serde_json::json!(-1);
+    assert!(matches!(
+        Beat::parse(serde_json::to_string(&negative_pct).unwrap().as_bytes()),
+        Err(Error::Shape(_))
+    ));
 }

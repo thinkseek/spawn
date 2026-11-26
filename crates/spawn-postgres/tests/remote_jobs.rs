@@ -1289,3 +1289,57 @@ fn a_v1_name_is_never_a_p1_node() {
         "a P1 name is not enrolled"
     );
 }
+
+#[test]
+fn v1_beat_power_projects_into_node_v1_and_nodes_v1() {
+    let (store, _schema) = store("rj_beat_power");
+    let n1 = enroll(&store, "npow1", 41, &json!({}));
+    let n2 = enroll(&store, "npow2", 42, &json!({}));
+    let b1 = boot(1);
+
+    assert_eq!(
+        store.node_v1("npow1").expect("node_v1").expect("row").power,
+        None
+    );
+
+    // Beat without power keeps `power: None`.
+    let plain_beat = beat(&[], &[], 2, 1024);
+    let ans1 = beat_once(&store, &n1, &b1, 1, &plain_beat);
+    assert_eq!(ans1["ok"], true);
+    assert_eq!(
+        store.node_v1("npow1").expect("node_v1").expect("row").power,
+        None
+    );
+
+    // Beat carrying power projects into both `node_v1` and `nodes_v1`.
+    let power_payload = json!({
+        "on_ac": false,
+        "battery_pct": 15,
+        "charging": false,
+        "remaining_mins": 30
+    });
+    let mut beat_with_power = beat(&[], &[], 2, 1024);
+    beat_with_power["power"] = power_payload.clone();
+    let ans2 = beat_once(&store, &n1, &b1, 2, &beat_with_power);
+    assert_eq!(ans2["ok"], true);
+
+    let single = store.node_v1("npow1").expect("node_v1").expect("row");
+    assert_eq!(single.power.as_ref(), Some(&power_payload));
+
+    beat_once(&store, &n2, &b1, 1, &plain_beat);
+    let listed = store.nodes_v1().expect("nodes_v1");
+    assert_eq!(listed.len(), 2);
+    let npow1_row = listed.iter().find(|n| n.name == "npow1").expect("npow1");
+    let npow2_row = listed.iter().find(|n| n.name == "npow2").expect("npow2");
+    assert_eq!(npow1_row.power.as_ref(), Some(&power_payload));
+    assert_eq!(npow2_row.power, None);
+
+    // Subsequent beat with `"power": null` clears projected power back to None.
+    let mut beat_null_power = beat(&[], &[], 2, 1024);
+    beat_null_power["power"] = Value::Null;
+    beat_once(&store, &n1, &b1, 3, &beat_null_power);
+    assert_eq!(
+        store.node_v1("npow1").expect("node_v1").expect("row").power,
+        None
+    );
+}
