@@ -10943,7 +10943,7 @@ mod tests {
     /// no input rule.
     #[test]
     fn a_human_and_the_resolver_answering_one_dialog_each_press_once_in_order() {
-        let (store, host, mut bridge, execution) = resolver_rig(DIALOG);
+        let (store, host, mut bridge, execution) = resolver_rig(PROCEED);
         let human = submit_key(&store, "human", "approve-1:1", NamedKey::Digit1);
         let resolver_key = format!("resolve:{execution}:session_1:0000000000000001:1:1");
         let resolver = submit_key(&store, RESOLVE_PRINCIPAL, &resolver_key, NamedKey::Digit1);
@@ -10953,7 +10953,7 @@ mod tests {
         assert_eq!(command_outcome(&store, human), Some(Outcome::Succeeded));
         assert_eq!(
             command_outcome(&store, resolver),
-            Some(Outcome::Failed(super::GONE_DIALOG.to_string()))
+            Some(Outcome::Failed(super::GONE_PROCEED.to_string()))
         );
         assert_eq!(host.keys(), vec!["1".to_string()], "the person's key only");
         assert!(steps_of(&store, resolver).is_empty(), "no pressing");
@@ -10982,13 +10982,13 @@ mod tests {
         drive_work(&mut bridge, &store, || command_outcome(&store, gone).is_some());
         assert_eq!(
             command_outcome(&store, gone),
-            Some(Outcome::Failed(super::GONE_DIALOG.to_string()))
+            Some(Outcome::Failed(super::GONE_PROCEED.to_string()))
         );
         assert!(host.keys().is_empty());
         assert!(steps_of(&store, gone).is_empty());
         store.set_pane(
             &TerminalName::for_execution(&execution),
-            DIALOG,
+            PROCEED,
         );
         let shown = submit_key(
             &store,
@@ -11006,7 +11006,7 @@ mod tests {
     }
 
     /// Claude Code's numbered dialog at its prompt position.
-    const DIALOG: &str = "Do you want to proceed?\n$ 1. Yes\n  2. No\n";
+    const PROCEED: &str = "Do you want to proceed?\n$ 1. Yes\n  2. No\n";
 
     /// A started Claude Code execution (session 1) whose pane then shows
     /// `pane`, and the execution.
