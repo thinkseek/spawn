@@ -1048,6 +1048,24 @@ mod tests {
         }
     }
 
+    /// agy's conversations are the directories of `<home>/brain`, which
+    /// the Bridge scans when the host reports none; Claude Code's sessions
+    /// are never scanned (the Bridge names them).
+    #[test]
+    fn agy_scans_its_brain_and_claude_scans_nothing() {
+        assert_eq!(
+            AgyDriver.session_scan_dir(&agy_home()).as_deref(),
+            Some("/home/a/.gemini/antigravity-cli/brain")
+        );
+        let mut trailing = agy_home();
+        trailing.sessions.push('/');
+        assert_eq!(
+            AgyDriver.session_scan_dir(&trailing).as_deref(),
+            Some("/home/a/.gemini/antigravity-cli/brain")
+        );
+        assert_eq!(ClaudeDriver.session_scan_dir(&home()), None);
+    }
+
     #[test]
     fn agy_reads_its_lines_screen_and_trust_dialog() {
         let mut cursor = LineCursor {
