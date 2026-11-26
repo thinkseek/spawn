@@ -633,7 +633,8 @@ impl World for Fleet<'_> {
     fn capture(&self, live: &Live) -> Result<String, String> {
         let execution =
             spawn_core::id::ExecutionId::new(&live.execution).map_err(|error| error.to_string())?;
-        crate::serve::approvals::capture(self.host, &execution, &live.agent)
+        let session = SessionId::new(&live.session).map_err(|error| error.to_string())?;
+        crate::serve::approvals::capture(self.host, self.store, &session, &execution, &live.agent)
     }
 
     fn pause(&self) {

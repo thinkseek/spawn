@@ -2989,6 +2989,9 @@ fn session_list(id: &str, what: &str, query: &str) -> Result<Value, String> {
 
 /// The tail of a session's terminal, read from tmux: a live peek at compute,
 /// not storage. Capturing a pane changes nothing, so the API stays read-only.
+/// It leaves the host masked unless the session's newest start is
+/// positively Claude Code's (decision C2, N4: a failed lookup masks;
+/// `spawn_core::driver::excerpt_for`).
 /// `owner` names the session's agent when the session has no state yet (a
 /// resident before its first event).
 fn pane(id: &str, owner: Option<&str>) -> Result<Value, String> {
@@ -3014,8 +3017,11 @@ fn pane(id: &str, owner: Option<&str>) -> Result<Value, String> {
     let workspace = WorkspaceId::new(format!("{agent}:{root}/{agent}")).map_err(err)?;
     let host = crate::config::terminal_host()?;
     let text = if live {
-        host.capture_tail(&terminal, &workspace, PANE_LINES)
-            .unwrap_or_default()
+        let raw = host
+            .capture_tail(&terminal, &workspace, PANE_LINES)
+            .unwrap_or_default();
+        let engine = store.latest_engine(&session).ok().flatten();
+        spawn_core::driver::excerpt_for(engine.as_deref(), &raw)
     } else {
         String::new()
     };
