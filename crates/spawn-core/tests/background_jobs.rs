@@ -561,6 +561,7 @@ fn the_bridge_records_the_jobs_of_an_execution_from_its_transcript() {
             from: None,
             model: None,
             charter: None,
+            model_label: None,
         },
     );
     settle_start(&mut bridge, &store, 1);

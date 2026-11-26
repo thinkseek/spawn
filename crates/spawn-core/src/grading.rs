@@ -8,9 +8,12 @@
 //! - a [`GradedPreset`] is one entry of the grading catalog
 //!   (`grading_presets`), named by its `preset_id`. It is not a
 //!   [`ModelProfile`]: it *maps to* one (`model_profile`), the switch the
-//!   dispatcher already knows (`default` or `cheap`). In phase 1 that is
-//!   all of it that reaches a worker: `engine_label` and `model_label` are
-//!   labels for people.
+//!   dispatcher already knows (`default` or `cheap`). Its `engine_label`
+//!   picks the worker's engine when it names a registered driver
+//!   ([`GradedPreset::driver_id`]), and its `model_label` then reaches that
+//!   engine as its model (`model_label` on the start command, agy's
+//!   `--model`); a label that names no driver stays a label for people,
+//!   and the worker runs on Claude Code (`label_only`).
 //! - a [`SkillGrade`] is what a preset has proven it can do (`l1` to `l3`);
 //!   a [`TaskDifficulty`] is what a task needs (`l1` to `l3`). Both travel
 //!   as `l1`..`l3` on every record and every JSON answer, and are stored as
@@ -267,11 +270,13 @@ pub fn is_preset_id(text: &str) -> bool {
 pub struct GradedPreset {
     /// Its name, [`is_preset_id`].
     pub preset_id: String,
-    /// The engine it stands for (`claude`, ...): a label for people;
-    /// nothing runs on it in phase 1.
+    /// The engine it stands for (`claude`, `agy`, ...): the worker's
+    /// engine when it names a registered driver, else a label for people
+    /// ([`GradedPreset::driver_id`]).
     pub engine_label: String,
-    /// The model it stands for, as the engine names it: a label for
-    /// people; nothing runs on it in phase 1.
+    /// The model it stands for, as the engine names it: what an engine
+    /// told its model at launch runs (agy's `--model`); a label for people
+    /// otherwise.
     pub model_label: String,
     /// The [`ModelProfile`] the dispatcher starts its worker on: in phase 1
     /// the only part of a preset that reaches a worker.
@@ -303,7 +308,44 @@ pub struct GradedPreset {
     pub last_event: i64,
 }
 
+/// The engine a preset's worker runs ([`GradedPreset::driver_id`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PresetDriver {
+    /// A registered driver's id (`claude`, `agy`): the start command's
+    /// `engine`.
+    pub driver: &'static str,
+    /// The preset's `engine_label` names no registered driver: the worker
+    /// runs on Claude Code ([`crate::driver::DEFAULT`]), and the labels are
+    /// for people only.
+    pub label_only: bool,
+}
+
+/// The engine a preset whose `engine_label` is `engine_label` runs
+/// ([`GradedPreset::driver_id`]): delivery reads it from a task row, which
+/// carries the label, not the whole preset.
+pub fn preset_driver(engine_label: &str) -> PresetDriver {
+    match crate::driver::driver(engine_label) {
+        Some(driver) => PresetDriver {
+            driver: driver.id(),
+            label_only: false,
+        },
+        None => PresetDriver {
+            driver: crate::driver::DEFAULT,
+            label_only: true,
+        },
+    }
+}
+
 impl GradedPreset {
+    /// The engine its worker runs (design 7.1, "the one link"): its
+    /// `engine_label` when that names a registered driver, else Claude Code
+    /// with `label_only`. Driver ids equal Herdr's agent kinds. Pure: it
+    /// never reads whether the host can run the engine (delivery does, and
+    /// makes no start for an engine the host cannot run).
+    pub fn driver_id(&self) -> PresetDriver {
+        preset_driver(&self.engine_label)
+    }
+
     /// The grade routing reads: none unless the state is routed, else the
     /// locked grade if set, else the calibrated one.
     pub fn routing_grade(&self) -> Option<SkillGrade> {
@@ -1328,6 +1370,37 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_presets_driver_is_its_engine_label_when_registered_else_claude_label_only() {
+        let mut p = preset("p", SkillGrade::L1, 1);
+        assert_eq!(
+            p.driver_id(),
+            PresetDriver {
+                driver: "claude",
+                label_only: false
+            }
+        );
+        p.engine_label = "agy".to_string();
+        assert_eq!(
+            p.driver_id(),
+            PresetDriver {
+                driver: "agy",
+                label_only: false
+            }
+        );
+        for label in ["codex", "opencode", "Claude", ""] {
+            p.engine_label = label.to_string();
+            assert_eq!(
+                p.driver_id(),
+                PresetDriver {
+                    driver: crate::driver::DEFAULT,
+                    label_only: true
+                },
+                "{label}"
+            );
+        }
+    }
 
     fn preset(id: &str, grade: SkillGrade, cost_rank: u32) -> GradedPreset {
         GradedPreset {

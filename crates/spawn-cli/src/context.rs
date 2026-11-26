@@ -3,8 +3,13 @@
 //!
 //! The task is read from storage. The terminal tail is a compute peek at
 //! tmux; the Observer stores the copy it used as evidence, so the judgement
-//! stays replayable from storage alone. The reply is read from the engine's
-//! transcript, from where the last read ended.
+//! stays replayable from storage alone. The tail leaves the host through
+//! here (the judge's evidence, the attention view's read back), so it is
+//! masked here first: as it is only for a session whose newest start is
+//! positively Claude Code's, through its engine's mask otherwise, a failed
+//! lookup included (decision C2, N4; `spawn_core::driver::excerpt_for`).
+//! The reply is read from the engine's transcript, from where the last read
+//! ended.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -48,6 +53,8 @@ impl ObservationContext for HostContext {
             .terminals
             .capture_tail(&terminal, &workspace, TAIL_LINES)
             .ok()?;
+        let engine = self.store.latest_engine(session).ok().flatten();
+        let text = spawn_core::driver::excerpt_for(engine.as_deref(), &text);
         let trimmed = text.trim_end();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }

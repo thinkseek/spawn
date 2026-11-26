@@ -260,6 +260,15 @@ pub(crate) struct Facts {
     /// The model profile of the session's latest execution.
     #[serde(default)]
     pub(crate) model: ModelProfile,
+    /// The engine of the session's latest execution (`claude`, `agy`);
+    /// none when it never ran (or a record names none: Claude Code's).
+    #[serde(default)]
+    pub(crate) engine: Option<String>,
+    /// The model label that execution's engine was launched on, for an
+    /// engine besides Claude Code (agy): what a resume runs; none when it
+    /// recorded none (the host's `SPAWN_AGY_MODEL` then).
+    #[serde(default)]
+    pub(crate) model_label: Option<String>,
     /// Executions the dispatcher's resumes started that were lost (or
     /// exited non-zero) within a minute, since the session's last execution
     /// that stayed up.
@@ -506,6 +515,11 @@ pub(crate) enum Why {
     /// a transient error whose retries are spent (`model_unavailable`)
     /// ([`digest::model_finals`], told once).
     ModelFinal,
+    /// A task's delivery would run on an engine, or a model label, this
+    /// host cannot run (`engine_unavailable`, [`deliver`]'s
+    /// `engine_unavailable`): no command is made, and the task waits. A
+    /// condition while the engine stays unavailable.
+    EngineUnavailable,
 }
 
 impl Why {
@@ -703,6 +717,9 @@ pub(crate) fn load(
             .map_err(|error| format!("dispatch facts: {error}"))?;
     let mut work = Work::load(store)?;
     work.waits = waits;
+    // What the capability probe found (`spawn loop` probes at its start and
+    // hourly): before it, a task on an engine besides Claude Code waits.
+    work.engines = crate::serve::capabilities::current_engines();
     Ok((rows, work))
 }
 
@@ -723,6 +740,7 @@ pub(crate) fn load_if_permitted(
         return Ok(None);
     };
     work.waits = waits;
+    work.engines = crate::serve::capabilities::current_engines();
     Ok(Some((rows, work)))
 }
 
@@ -1398,6 +1416,8 @@ mod tests {
             charter: None,
             jobs: Vec::new(),
             recovered: None,
+            engine: None,
+            model_label: None,
         }
     }
 
@@ -1545,6 +1565,8 @@ mod tests {
             charter: None,
             jobs: Vec::new(),
             recovered: None,
+            engine: None,
+            model_label: None,
         }
     }
 

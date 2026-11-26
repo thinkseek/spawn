@@ -212,6 +212,7 @@ impl Rig {
                 from: None,
                 model: None,
                 charter: None,
+                model_label: None,
             },
         );
         for attempt in 0..1_024 {

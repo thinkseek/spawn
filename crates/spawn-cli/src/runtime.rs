@@ -438,7 +438,7 @@ fn claude_config_env(
 /// (else `agy`) and its model `SPAWN_AGY_MODEL` (unset, a start of agy is
 /// refused: agy left to pick falls back to its costliest model). An
 /// unknown name stops `spawn loop`, said.
-fn engines(
+pub(crate) fn engines(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Vec<(String, spawn_core::driver::EngineHome)>, String> {
     let named = lookup("SPAWN_ENGINES").unwrap_or_else(|| spawn_core::driver::DEFAULT.to_string());

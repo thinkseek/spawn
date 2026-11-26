@@ -756,6 +756,7 @@ mod tests {
                 from: None,
                 model: None,
                 charter: None,
+                model_label: None,
             }),
             order(CommandAction::Input {
                 text: "next".to_string(),

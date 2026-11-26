@@ -6,7 +6,7 @@ Every route `spawn serve` answers under `/api/`, on one page. The router is
 dispatch on one table, `ROUTES`; what each answer holds is documented on its
 handler there. Words are as in the [glossary](./glossary.md).
 
-`main` serves 32 GET route patterns and 9 POST routes. (Before issue 98's
+`main` serves 33 GET route patterns and 9 POST routes. (Before issue 98's
 canonical names it was 28 GET patterns: a session's commands and
 judgements were one pattern, `/api/fleet/<session>/<view>`, and are two
 routes now.) A `<name>` in a path is one non-empty segment: `<id>` a
@@ -49,7 +49,7 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | GET | `/api/sessions/<id>` | One session: state, executions (with `restart_of`), its events after `?after=`, `reassigned_to` and `reassigned_from` | `spawn tail --session <id>` (overlapping) | web (agent detail) |
 | GET | `/api/sessions/<id>/commands` | One session's commands, each with `waiting` while the Bridge holds it for the turn; `?limit=` (50, at most 500) | `spawn tail --session <id>` (overlapping, not compared field by field) | web (agent detail) |
 | GET | `/api/sessions/<id>/judgements` | One session's judgements, newest first; `?limit=` (50, at most 500) | `spawn tail --session <id>` (overlapping, not compared field by field) | web (agent detail) |
-| GET | `/api/sessions/<id>/pane` | The tail of the session's live terminal, read from tmux | – | web (agent detail) |
+| GET | `/api/sessions/<id>/pane` | The tail of the session's live terminal, read from its terminal host; as it is only when the session's newest start is positively Claude Code's, else without its account lines (a failed lookup masks too) | – | web (agent detail) |
 | GET | `/api/tasks/<n>` | One task's brief, report and review note in full | – | web (Missions) |
 | GET | `/api/tasks/<n>/gate` | One objective task in full: brief, report, latest gate log, every gate verdict with its log | `spawn task stages --id N` (its stages alone) | web (RSI) |
 | GET | `/api/objectives` | Every open objective mission: its backlog's objectives, tasks, gate verdicts, metrics and resident | `spawn mission objectives` (the backlog alone) | web (RSI) |
@@ -63,7 +63,8 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | GET | `/api/core-lines` | The core lines the owner steers by, each figure with its value, range and state | – | web (Home) |
 | GET | `/api/verifications` | What is landed and verified or not | `spawn verify list` (the same, ages aside) | no web page; nightly scenario 133 |
 | GET | `/api/nodes` | Every node joined and not removed, without `ssh`, `endpoint`, `note` or `pubkey` | `spawn node list --json` (which also prints those four) | web (Fleet, with each node's power and soft drain) |
-| GET | `/api/grading` | The grading catalog: every preset with every `spawn grade list --json` field plus `routing_grade`, `profile` (its execution profile, else its model profile) and `reprobe_due`; `profiles`, every profile name, sorted | `spawn grade list --json` (the presets alone, without the three added fields) | no web page yet |
+| GET | `/api/grading` | The grading catalog: every preset with every `spawn grade list --json` field plus `routing_grade`, `profile` (its execution profile, else its model profile), `driver` and `label_only` (the engine its worker runs: its `engine_label` when that names a registered driver, else `claude` with `label_only: true`) and `reprobe_due`; `profiles`, every profile name, sorted | `spawn grade list --json` (the presets alone, without the five added fields) | no web page yet |
+| GET | `/api/capabilities` | What this host can run: `probed_at_ms`; `engines`, each registered engine with `program`, `enabled` (`SPAWN_ENGINES`), `installed` and `version` (`<program> --version`; both null for an engine `SPAWN_ENGINES` does not name, whose program is never run), `version_tested` (agy: its `major.minor` is one Spawn was checked against), `login` (its login files, each `{path, present}` from `stat`, never opened), `known_models` (agy, enabled: the labels `agy models` lists), `model` (`SPAWN_AGY_MODEL`) and `unavailable` (why it cannot start here; never set for Claude Code); `terminal`, the backend (`tmux`, or `herdr` with its `version`, `expected_protocol`, `pinned_manifests` and its running `server`'s `protocol` and active `manifests`, or `server_error`). The probe is bounded (its output too), runs no shell and is cached for an hour ([`serve/capabilities.rs`](../crates/spawn-cli/src/serve/capabilities.rs)) | – | no web page yet |
 | GET | `/api/features` | The feature map of every open objective mission (a mission's `--features` file), or of `?mission=`; `?limit=` (10, at most 50) | – | web (Features) |
 | GET | `/api/features/coverage` | The feature registry's file coverage (`docs/feature-map/registry.json`): wild files, stale references, features; `?mission=<id>` for that mission's project | `spawn features scan --json` | web (Coverage) |
 | GET | `/api/features/coverage/projects` | Every project the Coverage page can read, over all open objective missions | – | web (Coverage) |

@@ -121,6 +121,7 @@ fn mains_copies_are_back_after_a_resume_remounts_the_workspace() {
             from: None,
             model: None,
             charter: None,
+            model_label: None,
         },
     );
     settle_start(&mut bridge, &clock, "start");

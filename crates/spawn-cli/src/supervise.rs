@@ -330,6 +330,7 @@ fn revive(
                     from: None,
                     model: None,
                     charter,
+                    model_label: None,
                 },
                 format!(
                     "{session}-start-{execution}-{}-{}",

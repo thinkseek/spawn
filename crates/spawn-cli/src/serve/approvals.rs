@@ -800,10 +800,15 @@ fn backend(host: &spawn_host::LocalTerminalHost) -> &'static str {
     }
 }
 
-/// The pane tail of execution `execution` of `agent`, as `/api/sessions/<id>/pane`
-/// reads it (nothing when it cannot be captured).
+/// The pane tail of execution `execution` of `agent` in `session`, as
+/// `/api/sessions/<id>/pane` reads it (nothing when it cannot be captured),
+/// masked as that page masks it: as it is only when the session's newest
+/// start is positively Claude Code's (decision C2, N4: a failed lookup
+/// masks; `spawn_core::driver::excerpt_for`).
 pub(crate) fn capture(
     host: &spawn_host::LocalTerminalHost,
+    store: &spawn_postgres::PostgresStore,
+    session: &SessionId,
     execution: &spawn_core::id::ExecutionId,
     agent: &str,
 ) -> Result<String, String> {
@@ -811,9 +816,11 @@ pub(crate) fn capture(
     let root = crate::env_or("SPAWN_WORKSPACE_ROOT", "/tmp");
     let workspace =
         WorkspaceId::new(format!("{agent}:{root}/{agent}")).map_err(|error| error.to_string())?;
-    Ok(host
+    let raw = host
         .capture_tail(&terminal, &workspace, TAIL_LINES + 10)
-        .unwrap_or_default())
+        .unwrap_or_default();
+    let engine = store.latest_engine(session).ok().flatten();
+    Ok(spawn_core::driver::excerpt_for(engine.as_deref(), &raw))
 }
 
 /// The tail of `session`'s live pane; `None` when it runs no execution.
@@ -831,7 +838,7 @@ fn live_tail(
     let Some(execution) = latest.filter(|execution| execution.ended_at.is_none()) else {
         return Ok(None);
     };
-    capture(host, &execution.execution_id, agent).map(Some)
+    capture(host, store, session, &execution.execution_id, agent).map(Some)
 }
 
 /// The live panes: the fleet board's live sessions (one read), each pane
@@ -854,9 +861,13 @@ pub(crate) fn panes(
         if row["live"] != true {
             continue;
         }
-        let tail = spawn_core::id::ExecutionId::new(execution)
+        let tail = SessionId::new(session)
             .map_err(|error| error.to_string())
-            .and_then(|execution| capture(&host, &execution, agent));
+            .and_then(|id| {
+                let execution = spawn_core::id::ExecutionId::new(execution)
+                    .map_err(|error| error.to_string())?;
+                capture(&host, store, &id, &execution, agent)
+            });
         let tail = match tail {
             Ok(tail) => tail,
             Err(error) => {

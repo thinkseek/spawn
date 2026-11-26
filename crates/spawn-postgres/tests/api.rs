@@ -64,6 +64,7 @@ fn start(submission_session: SessionId, key: &str) -> Submission {
             from: None,
             model: None,
             charter: None,
+            model_label: None,
         },
     }
 }
@@ -2693,6 +2694,7 @@ fn dispatch_facts_name_the_charter_the_supervisors_native_session_holds() {
                 from: None,
                 model: None,
                 charter: charter.map(str::to_string),
+                model_label: None,
             },
             Some(Outcome::Succeeded),
         )

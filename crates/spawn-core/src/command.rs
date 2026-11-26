@@ -39,6 +39,21 @@ pub enum CommandAction {
         /// the Bridge.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         charter: Option<String>,
+        /// The model the engine runs, by the engine's own label, for an
+        /// engine told its model at launch (agy's `--model`): the task's
+        /// graded preset's `model_label` (design 7.1). Left out, the host's
+        /// own (`SPAWN_AGY_MODEL`); Claude Code takes its models from
+        /// `model` and never reads it. Left out of the JSON when absent, so
+        /// a start without it is byte for byte what it was before the field
+        /// existed. A Bridge built before it refuses a command that carries
+        /// it (`deny_unknown_fields`): drain the queued starts that carry it
+        /// before rolling back to one (docs/upgrading.md).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "plain_label"
+        )]
+        model_label: Option<String>,
     },
     /// Type text into the running Claude session.
     Input {
@@ -253,6 +268,33 @@ fn claude_only<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Stri
     }
 }
 
+/// Whether `label` may name an engine's model: 1 to 128 characters of
+/// letters, digits, `.`, `-`, `_`, `:` and `/`, never starting with `-`
+/// (it is one launch argument, after `--model`).
+pub fn is_model_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 128
+        && !label.starts_with('-')
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '/'))
+}
+
+/// A start's `model_label`: [`is_model_label`], or the command does not
+/// parse.
+fn plain_label<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let label = Option::<String>::deserialize(deserializer)?;
+    match label {
+        Some(label) if !is_model_label(&label) => Err(serde::de::Error::custom(format!(
+            "model_label {label:?} is not a model label: 1 to 128 letters, digits, '.', '-', \
+             '_', ':' or '/', not starting with '-'"
+        ))),
+        label => Ok(label),
+    }
+}
+
 /// Command submission as a store receives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Submission {
@@ -302,7 +344,35 @@ pub enum Outcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandAction, NamedKey};
+    use super::{CommandAction, NamedKey, is_model_label};
+
+    #[test]
+    fn a_start_without_model_label_is_byte_identical_and_one_with_it_round_trips() {
+        let plain = r#"{"type":"start","engine":"claude","prompt":"p","parent_session_id":null}"#;
+        let action: CommandAction = serde_json::from_str(plain).expect("parses");
+        assert_eq!(serde_json::to_string(&action).expect("serializes"), plain);
+        let labelled = r#"{"type":"start","engine":"agy","prompt":"p","parent_session_id":null,"model_label":"gemini-3.8-flash-low"}"#;
+        let action: CommandAction = serde_json::from_str(labelled).expect("parses");
+        let CommandAction::Start { model_label, .. } = &action else {
+            panic!("a start: {action:?}");
+        };
+        assert_eq!(model_label.as_deref(), Some("gemini-3.8-flash-low"));
+        assert_eq!(
+            serde_json::to_string(&action).expect("serializes"),
+            labelled
+        );
+        for bad in ["", "-rf", "a b", "x;y", "$(id)"] {
+            assert!(!is_model_label(bad), "{bad}");
+            let json = format!(
+                r#"{{"type":"start","engine":"agy","prompt":"p","model_label":{}}}"#,
+                serde_json::to_string(bad).expect("a string")
+            );
+            assert!(
+                serde_json::from_str::<CommandAction>(&json).is_err(),
+                "{json} parsed"
+            );
+        }
+    }
 
     #[test]
     fn a_key_action_names_one_key_of_the_closed_set() {

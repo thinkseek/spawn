@@ -44,6 +44,8 @@ fn purpose(first: &StopSent) -> String {
         )
     } else if let Some(id) = named("switch-model-") {
         format!("task #{id} waits for it to stop, to resume it on the task's model profile")
+    } else if let Some(id) = named("switch-engine-") {
+        format!("task #{id} waits for it to stop, to start it afresh on the task's engine")
     } else if let Some(id) = named("retire-task-") {
         format!("task #{id} is closed, so its worker is stopped")
     } else if let Some(id) = named("integrate-abort-") {
@@ -176,6 +178,8 @@ mod tests {
             stops,
             charter: None,
             jobs: Vec::new(),
+            engine: None,
+            model_label: None,
         }
     }
 
