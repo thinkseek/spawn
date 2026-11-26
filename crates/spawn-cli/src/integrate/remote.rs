@@ -1657,16 +1657,20 @@ impl Primary {
             let looked = store
                 .remote_job(job_id)
                 .map_err(|error| error.to_string())
-                .and_then(|row| {
-                    let Some(row) = row else {
-                        return Ok((Look::Ended(RemoteJobState::Cancelled), None));
-                    };
-                    look(store, &row, since, self.settings.queue_wait).map(|look| (look, Some(row)))
+                .and_then(|row| match row {
+                    Some(row) => look(store, &row, since, self.settings.queue_wait)
+                        .map(|looked| Some((looked, row))),
+                    None => Ok(None),
                 });
             let (looked, row) = match looked {
-                Ok(looked) => {
+                Ok(Some(looked)) => {
                     failures = 0;
                     looked
+                }
+                Ok(None) => {
+                    return PrimaryOutcome::Local {
+                        why: format!("{job_id} is gone from the ledger"),
+                    };
                 }
                 Err(error) => {
                     failures += 1;
@@ -1681,20 +1685,20 @@ impl Primary {
                     continue;
                 }
             };
-            match (looked, row) {
-                (Look::Queued, _) => std::thread::sleep(self.settings.every),
-                (Look::Leased(_), _) => {
+            match looked {
+                Look::Queued => std::thread::sleep(self.settings.every),
+                Look::Leased(_) => {
                     since = Instant::now();
                     std::thread::sleep(self.settings.every);
                 }
-                (Look::Raced, _) => {
+                Look::Raced => {
                     println!(
                         "integrate: task {task}'s node gate {job_id}: a node leased it as it \
                          was taken back; its result is waited for"
                     );
                     since = Instant::now();
                 }
-                (Look::TakenLocal, _) => {
+                Look::TakenLocal => {
                     return PrimaryOutcome::Local {
                         why: format!(
                             "no node leased {job_id} within {} s: taken back (fallback_local)",
@@ -1702,19 +1706,14 @@ impl Primary {
                         ),
                     };
                 }
-                (Look::Completed, Some(row)) => match self.completed(store, task, &row, given) {
+                Look::Completed => match self.completed(store, task, &row, given) {
                     Settled::Believed(outcome) => return outcome,
                     Settled::Requeued => since = Instant::now(),
                     Settled::Local(why) => return PrimaryOutcome::Local { why },
                 },
-                (Look::Ended(state), _) => {
+                Look::Ended(state) => {
                     return PrimaryOutcome::Local {
                         why: format!("{job_id} ended {state:?}"),
-                    };
-                }
-                (Look::Completed, None) => {
-                    return PrimaryOutcome::Local {
-                        why: format!("{job_id} is gone"),
                     };
                 }
             }
