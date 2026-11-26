@@ -552,6 +552,58 @@ fn manifest_of(cas: &Store, name: &str, snapshot: &Digest) -> Result<Manifest, S
     })
 }
 
+/// Record the snapshot `snapshot` of `args.name` after `head` (its domain's
+/// head, which it differs from): its revision, kind, entry count and
+/// whether the entries folded into `tree` rows.
+fn record_snapshot(
+    store: &PostgresStore,
+    cas: &Store,
+    args: &SnapshotArgs,
+    head: Option<&ProvChangeRecord>,
+    snapshot: &Digest,
+    manifest: &Manifest,
+    edges: &[ProvEdgeInput],
+) -> Result<(i32, ProvChangeKind, usize, bool), String> {
+    let base = match head {
+        Some(head) => parse_digest(&head.result)?,
+        None => empty_snapshot(),
+    };
+    let before = manifest_of(cas, &args.name, &base)?;
+    let rows = entries(&before, manifest, None);
+    let kind = if args.inputs.is_empty() {
+        ProvChangeKind::Import
+    } else {
+        ProvChangeKind::Derive
+    };
+    let who = attribution(store, args.task, kind)?;
+    let change = ProvChangeInput {
+        change_id: change_id_of(&args.name),
+        rev: head.map_or(1, |head| head.rev + 1),
+        kind,
+        domain: domain_of(&args.name),
+        agent_id: who.agent_id,
+        execution_id: None,
+        task_id: who.task_id,
+        preset_id: who.preset_id,
+        model_label: who.model_label,
+        transcript_ref: None,
+        attributed: who.attributed,
+        base: base.to_string(),
+        result: snapshot.to_string(),
+        boundary: ProvBoundary::Job,
+        at_ms: now_ms(),
+    };
+    store
+        .record_change(&change, &rows, edges)
+        .map_err(|error| error.to_string())?;
+    Ok((
+        change.rev,
+        kind,
+        rows.len(),
+        rows.iter().any(|row| row.class == ProvEntryClass::Tree),
+    ))
+}
+
 /// `spawn prov snapshot`: the answer (module doc).
 pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Value, String> {
     check_ref(&args.name)?;
@@ -585,44 +637,15 @@ pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Val
     let head = changes.first().cloned();
     let mut recorded = None;
     if head.as_ref().map(|head| head.result.as_str()) != Some(snapshot.to_string().as_str()) {
-        let base = match &head {
-            Some(head) => parse_digest(&head.result)?,
-            None => empty_snapshot(),
-        };
-        let before = manifest_of(&cas, &args.name, &base)?;
-        let rows = entries(&before, &manifest, None);
-        let kind = if args.inputs.is_empty() {
-            ProvChangeKind::Import
-        } else {
-            ProvChangeKind::Derive
-        };
-        let who = attribution(store, args.task, kind)?;
-        let change = ProvChangeInput {
-            change_id: change_id.clone(),
-            rev: head.as_ref().map_or(1, |head| head.rev + 1),
-            kind,
-            domain: domain.clone(),
-            agent_id: who.agent_id,
-            execution_id: None,
-            task_id: who.task_id,
-            preset_id: who.preset_id,
-            model_label: who.model_label,
-            transcript_ref: None,
-            attributed: who.attributed,
-            base: base.to_string(),
-            result: snapshot.to_string(),
-            boundary: ProvBoundary::Job,
-            at_ms: now_ms(),
-        };
-        store
-            .record_change(&change, &rows, &edges)
-            .map_err(|error| error.to_string())?;
-        recorded = Some((
-            change.rev,
-            kind,
-            rows.len(),
-            rows.iter().any(|row| row.class == ProvEntryClass::Tree),
-        ));
+        recorded = Some(record_snapshot(
+            store,
+            &cas,
+            args,
+            head.as_ref(),
+            &snapshot,
+            &manifest,
+            &edges,
+        )?);
         changes = store
             .prov_domain_changes(&domain)
             .map_err(|error| error.to_string())?;
