@@ -1891,8 +1891,8 @@ fn runner_of(terminal: &TerminalName, record: &Record) -> Runner {
 #[cfg(test)]
 mod tests {
     use super::{
-        Ended, MANIFESTS, PROMPT_LINE_LIMIT, Press, Record, chunks, herdr_key, launch_script,
-        manifest_mismatch, prompt_fits, resubscribes_after, socket_of_status,
+        Ended, MANIFESTS, PROMPT_LINE_LIMIT, Press, Record, chunks, herdr_key, launch_echo_shown,
+        launch_script, manifest_mismatch, prompt_fits, resubscribes_after, socket_of_status,
     };
     use spawn_core::id::{TerminalName, WorkspaceId};
     use spawn_core::port::{Launch, Runner, TerminalHost, TerminalServer};
@@ -2159,6 +2159,23 @@ mod tests {
             ..launch
         };
         assert!(launch_script(&bad).is_err());
+    }
+
+    /// The wait after a launch looks for the line that ran the script: its
+    /// name, even wrapped over two lines, or the command itself.
+    #[test]
+    fn the_launch_echo_is_found_even_wrapped() {
+        let name = "spawn-launch-spawn-exec_1-42-1700000000000000000.sh";
+        let echo = format!("$ exec /bin/sh '/tmp/run/{name}'\n");
+        assert!(launch_echo_shown(&echo, name));
+        let wrapped = "$ exec /bin/sh '/tmp/run/spawn-launch-spawn-exec_1-42-170000\n\
+                       0000000000000.sh'\n";
+        assert!(launch_echo_shown(wrapped, name));
+        assert!(launch_echo_shown("$ exec /bin/sh '/x/y'", "other.sh"));
+        assert!(!launch_echo_shown("", name));
+        assert!(!launch_echo_shown("\n\n\n", name));
+        assert!(!launch_echo_shown("Enter y/n:\n", name));
+        assert!(!launch_echo_shown("anything", ""));
     }
 
     #[test]
