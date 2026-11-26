@@ -101,6 +101,7 @@ run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_176_core_set_$run"
 TESTS_DB="bb_176_tests_$run"
 SPAWN_TMUX_SOCKET="bb-176-$run"
+export SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_PSQL=psql
 export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
 # The tmux server's socket lives in WORK, so the cleanup removes nothing

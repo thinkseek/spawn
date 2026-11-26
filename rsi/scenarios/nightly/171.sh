@@ -53,6 +53,7 @@ real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_171_text_$run"
 SPAWN_TMUX_SOCKET="bb-171-$run"
+export SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_PSQL=psql
 export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
 HOME=$WORK/home

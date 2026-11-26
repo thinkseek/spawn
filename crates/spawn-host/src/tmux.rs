@@ -1,4 +1,4 @@
-//! tmux adapter.
+//! tmux adapter: explicit fallback terminal backend (`SPAWN_TERMINAL_BACKEND=tmux`).
 //!
 //! tmux gives each execution a named session, a scrollback and a way to read
 //! the last lines of the pane. `send-keys -l` types bytes literally, so a

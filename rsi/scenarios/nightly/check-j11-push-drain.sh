@@ -212,6 +212,7 @@ section=021
 WORK=$W021
 SPAWN_DB_NAME=$DB021
 SPAWN_TMUX_SOCKET=$SOCKET021
+export SPAWN_TERMINAL_BACKEND=tmux
 export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET
 psql -d postgres -tA -c "create database $SPAWN_DB_NAME" >/dev/null 2>&1 ||
     harness "cannot create the database of section 021"

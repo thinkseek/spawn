@@ -61,10 +61,11 @@ mkdir -m 700 "$XDG_RUNTIME_DIR"
 export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_DB_NAME="bb_${PHASE}_${PHASE_DB:?PHASE_DB is not set}_$run"
 SPAWN_TMUX_SOCKET="bb-$PHASE-$run"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_TERMINAL_BACKEND SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"

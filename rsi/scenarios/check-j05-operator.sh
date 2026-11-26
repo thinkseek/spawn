@@ -96,6 +96,7 @@ export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_TMUX_SOCKET="bb-j05-$run"
+export SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_PSQL=psql
 export SPAWN_TMUX_SOCKET SPAWN_PSQL
 

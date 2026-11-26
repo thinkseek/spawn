@@ -640,18 +640,20 @@ mod tests {
 
     #[test]
     fn the_terminal_backend_is_tmux_unless_herdr_is_asked_for() {
-        assert_eq!(terminal_backend(None), Ok(TerminalBackend::Tmux));
-        assert_eq!(terminal_backend(Some("")), Ok(TerminalBackend::Tmux));
-        assert_eq!(terminal_backend(Some("tmux")), Ok(TerminalBackend::Tmux));
+        assert_eq!(terminal_backend(None), Ok(TerminalBackend::Herdr));
+        assert_eq!(terminal_backend(Some("")), Ok(TerminalBackend::Herdr));
         assert_eq!(terminal_backend(Some("herdr")), Ok(TerminalBackend::Herdr));
         assert_eq!(
             terminal_backend(Some(" herdr ")),
             Ok(TerminalBackend::Herdr)
         );
+        assert_eq!(terminal_backend(Some("tmux")), Ok(TerminalBackend::Tmux));
+        assert_eq!(terminal_backend(Some(" tmux ")), Ok(TerminalBackend::Tmux));
         for unknown in ["screen", "Herdr", "TMUX", "zellij"] {
             let error = terminal_backend(Some(unknown)).expect_err(unknown);
             assert!(error.contains("SPAWN_TERMINAL_BACKEND"), "{error}");
             assert!(error.contains(unknown), "{error}");
+            assert!(error.contains("herdr (the default)"), "{error}");
         }
     }
 
@@ -736,16 +738,16 @@ pub(crate) enum TerminalBackend {
     Herdr,
 }
 
-/// The backend `value` (`SPAWN_TERMINAL_BACKEND`) names: tmux when it is
-/// unset or empty, Herdr when it says so; anything else is refused, never
-/// read as tmux.
+/// The backend `value` (`SPAWN_TERMINAL_BACKEND`) names: Herdr when it is
+/// unset or empty, tmux when it says so; anything else is refused, never
+/// read as Herdr.
 pub(crate) fn terminal_backend(value: Option<&str>) -> Result<TerminalBackend, String> {
     match value.map(str::trim) {
-        None | Some("" | "tmux") => Ok(TerminalBackend::Tmux),
-        Some("herdr") => Ok(TerminalBackend::Herdr),
+        None | Some("" | "herdr") => Ok(TerminalBackend::Herdr),
+        Some("tmux") => Ok(TerminalBackend::Tmux),
         Some(other) => Err(format!(
-            "SPAWN_TERMINAL_BACKEND={other:?} names no terminal backend: use tmux (the default) \
-             or herdr"
+            "SPAWN_TERMINAL_BACKEND={other:?} names no terminal backend: use herdr (the default) \
+             or tmux"
         )),
     }
 }
@@ -765,11 +767,12 @@ pub(crate) fn herdr_shards(value: Option<&str>) -> Result<usize, String> {
     }
 }
 
-/// The terminal host the environment describes: tmux on this machine, on
-/// the server of `SPAWN_TMUX_SOCKET` when it is set; or, with
-/// `SPAWN_TERMINAL_BACKEND=herdr`, Herdr (`SPAWN_HERDR_PROGRAM`, `herdr` by
-/// default) on the session `SPAWN_HERDR_SESSION` (`spawn` by default),
-/// sharded across `SPAWN_HERDR_SHARDS` independent servers when greater than 1.
+/// The terminal host the environment describes: Herdr (`SPAWN_HERDR_PROGRAM`,
+/// `herdr` by default) on the session `SPAWN_HERDR_SESSION` (`spawn` by
+/// default), sharded across `SPAWN_HERDR_SHARDS` independent servers when
+/// greater than 1; or, with `SPAWN_TERMINAL_BACKEND=tmux`, tmux on this
+/// machine on the server of `SPAWN_TMUX_SOCKET` when set
+/// (`SPAWN_TMUX_PROGRAM`, `tmux` by default).
 pub(crate) fn terminal_host() -> Result<spawn_host::LocalTerminalHost, String> {
     Ok(
         match terminal_backend(env_value("SPAWN_TERMINAL_BACKEND").as_deref())? {

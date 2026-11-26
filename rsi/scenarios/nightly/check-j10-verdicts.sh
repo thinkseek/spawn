@@ -199,6 +199,7 @@ lane_world() {
     run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
     SPAWN_DB_NAME="bb_j10${lane}_verdicts_$run"
     SPAWN_TMUX_SOCKET="bb-j10${lane}-$run"
+    export SPAWN_TERMINAL_BACKEND=tmux
     export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET
     trap lane_finish EXIT
     trap 'exit 130' INT TERM

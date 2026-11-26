@@ -1,14 +1,15 @@
-//! The Herdr host against a real `herdr` (`SPAWN_TERMINAL_BACKEND=herdr`).
+//! The Herdr host against a real `herdr` (Spawn's default terminal backend).
 //!
 //! Each test runs its own Herdr session (`spawn-test-<pid>-<n>`), whose
 //! server the host starts itself, with its runtime directory in the test's
 //! scratch; the session's server is stopped and the session deleted when the
 //! test ends. The user's default and interactive sessions are never named.
 //!
-//! The `herdr` is `$HOME/.local/bin/herdr`, else the one on `PATH`; a host
-//! with neither skips these tests (and says so), unless
-//! `SPAWN_REQUIRE_HERDR=1`, which makes a missing `herdr` a failure: a
-//! developer's or verifier's host with one never passes by skipping.
+//! The `herdr` is `SPAWN_HERDR_PROGRAM` when set and non-empty, else
+//! `$HOME/.local/bin/herdr`, else `herdr` on `PATH`; a host with none skips
+//! these tests (and says so), unless `SPAWN_REQUIRE_HERDR=1`, which makes a
+//! missing `herdr` a failure: a developer's or verifier's host with one never
+//! passes by skipping.
 //!
 //! The agent witness (issue #91 P2 PR 2) is tested against a stub `agy`
 //! ([`STUB_AGY`]) that draws the states Herdr's agy manifest reads.

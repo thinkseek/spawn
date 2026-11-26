@@ -2015,7 +2015,7 @@ it per execution and prices it (objective 041;
 The Bridge stays the single state machine of every execution. What an engine
 does comes from its transcript, which the Bridge follows, and from its pane,
 which the engine's driver reads (`AgentDriver::read_screen`). On the Herdr
-terminal host (`SPAWN_TERMINAL_BACKEND=herdr`) a third reader is added: Herdr
+terminal host (the default, or `SPAWN_TERMINAL_BACKEND=herdr`; `SPAWN_TERMINAL_BACKEND=tmux` selects tmux) a third reader is added: Herdr
 detects the agent a pane runs and reads its state with rules of its own (its
 agent manifests). That reading is a **second witness**
 (`TerminalHost::agent`, an `AgentReading`). It never takes over. A host
@@ -2163,7 +2163,7 @@ Running agy in the fleet needs, on the host:
 - herdr 0.9.5 (protocol 22) with its antigravity-cli integration installed,
   so it reports agy's session;
 - agy logged in;
-- `SPAWN_TERMINAL_BACKEND=herdr`, `SPAWN_ENGINES=claude,agy` and
+- `SPAWN_TERMINAL_BACKEND=herdr` (the default; omit or set explicitly, or use `tmux` to roll back), `SPAWN_ENGINES=claude,agy` and
   `SPAWN_AGY_MODEL` in the loop's environment.
 
 The SQL gateway's own command checks are unchanged by this PR.

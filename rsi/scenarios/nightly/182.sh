@@ -313,6 +313,7 @@ git init -q "$WORK/seed" && printf 'base\n' >"$WORK/seed/README.md" &&
     git -C "$WORK/seed" -c user.name=bb -c user.email=bb@localhost -c commit.gpgsign=false commit -qm base &&
     git -C "$WORK/seed" push -q "$WORK/repo.git" HEAD:main || harness "seeding the repository failed"
 SPAWN_TMUX_SOCKET="bb-182-$run"
+export SPAWN_TERMINAL_BACKEND=tmux
 TMUX_TMPDIR=$WORK/tmux-sock
 mkdir -p "$TMUX_TMPDIR"
 printf '#!/bin/sh\nexec tmux -L %s "$@"\n' "$SPAWN_TMUX_SOCKET" >"$WORK/tmux"

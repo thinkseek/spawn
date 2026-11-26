@@ -702,10 +702,11 @@ fn herdr_detects_an_agent_inside_the_view_that_cannot_reach_its_socket() {
     let fixture = Fixture::new();
     // The real Herdr session directory of this user is masked too.
     let real_home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+    let real_config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| real_home.join(".config"), PathBuf::from);
     let mut config = fixture.config();
-    config
-        .host_directories
-        .push(real_home.join(".config/herdr"));
+    config.host_directories.push(real_config.join("herdr"));
     let Some(view) = view(config) else {
         return;
     };
@@ -766,10 +767,7 @@ fn herdr_detects_an_agent_inside_the_view_that_cannot_reach_its_socket() {
     };
     assert_eq!(reading.agent.as_deref(), Some("claude"), "{reading:?}");
     // The session's socket, as the host found it, is not there inside.
-    let socket = real_home.join(format!(
-        ".config/herdr/sessions/{}/herdr.sock",
-        session.name
-    ));
+    let socket = real_config.join(format!("herdr/sessions/{}/herdr.sock", session.name));
     assert!(socket.exists(), "the host's socket: {}", socket.display());
     let check = view
         .wrap(&ViewedLaunch {
