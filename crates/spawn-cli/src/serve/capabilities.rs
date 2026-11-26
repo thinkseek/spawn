@@ -12,8 +12,15 @@
 //! process still holds open past the bound fails, as one that does not
 //! exit does ([`run_bounded`]). It runs the program itself (never a shell)
 //! with nothing on its standard input, and its process group is killed
-//! when the run ends. The engines' login files are
-//! `stat`ed, never opened ([`login_files`]). The answer is cached for the
+//! when the run ends. An engine with no deny rules of its own
+//! ([`Guard::Sandbox`], agy) is probed only inside the same filesystem view
+//! the Bridge starts it in (`SPAWN_ENGINE_VIEW`, [`view_with`]): `bwrap
+//! --die-with-parent --unshare-pid` in a scratch workspace removed after,
+//! so neither its probe nor the background updater it leaves (`setsid`)
+//! sees what the view masks, nor outlives `bwrap`. With no view under
+//! `required` (the default) such an engine is down and its program never
+//! runs; `SPAWN_ENGINE_VIEW=off` probes it on the host as is. The engines'
+//! login files are `stat`ed, never opened ([`login_files`]). The answer is cached for the
 //! process: `spawn loop` probes at its start and then hourly on a thread
 //! of its own ([`start`]), so no pass waits on an engine's program;
 //! `spawn serve` probes when the cache is empty or an hour old.
@@ -41,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
-use spawn_core::driver::{AgyDriver, DEFAULT};
+use spawn_core::driver::{AgyDriver, DEFAULT, EngineHome, Guard};
 
 use crate::deliver::{EngineReady, Engines};
 
@@ -105,13 +112,154 @@ pub(crate) struct Probe {
 /// standard output, or why not ([`run_bounded`]).
 pub(crate) type Run<'a> = &'a dyn Fn(&str, &[&str], Duration) -> Result<String, String>;
 
+/// How the probe of an engine with no deny rules of its own
+/// ([`Guard::Sandbox`]) runs its program ([`view_with`]).
+pub(crate) enum Boxed {
+    /// `SPAWN_ENGINE_VIEW=off`: on the host, as is (the owner's choice).
+    Off,
+    /// Inside the view: `words` (the view's program and arguments, ending
+    /// in `--`) go before the program; `scratch`, the workspace the view
+    /// binds, is removed when this is dropped, after the probe's runs.
+    Inside {
+        words: Vec<String>,
+        scratch: Option<Scratch>,
+    },
+    /// No view: the engine is down, and its program is never run.
+    Unavailable(String),
+}
+
+/// A scratch directory a probe's view binds as its workspace, removed whole
+/// on drop.
+#[derive(Debug)]
+pub(crate) struct Scratch(PathBuf);
+
+impl Scratch {
+    /// A new 0700 directory below `base` (made new, never one there).
+    fn new(base: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos());
+        let dir = base.join(format!(
+            "spawn-capabilities-{}-{}-{nanos}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|error| format!("create {}: {error}", dir.display()))?;
+        Ok(Self(dir))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// What a probe reads from its host: the environment, a bounded run of a
-/// program (its standard output, or why not), and whether a path exists
-/// (`stat`, never `open`).
+/// program (its standard output, or why not), whether a path exists
+/// (`stat`, never `open`), and how a [`Guard::Sandbox`] engine's program
+/// runs (`view`, given the engine's id and home: [`view_with`]).
 pub(crate) struct Host<'a> {
     pub(crate) lookup: &'a dyn Fn(&str) -> Option<String>,
     pub(crate) run: Run<'a>,
     pub(crate) exists: &'a dyn Fn(&Path) -> bool,
+    pub(crate) view: &'a dyn Fn(&str, &EngineHome) -> Boxed,
+}
+
+/// The words that make a view, as [`spawn_core::port::EngineView`] builds
+/// them.
+type MakeView<'a> = Box<
+    dyn FnOnce(
+            &dyn Fn(&str) -> Option<String>,
+        ) -> Result<std::sync::Arc<dyn spawn_core::port::EngineView>, String>
+        + 'a,
+>;
+
+/// How the probe of the [`Guard::Sandbox`] engine `engine` (home `home`)
+/// runs on this host, by `SPAWN_ENGINE_VIEW` as the Bridge reads it
+/// ([`crate::runtime::engine_view`]): `off`, on the host; otherwise
+/// (`required`, unset, or anything else) inside the view `make` builds,
+/// in a scratch workspace of its own ([`Scratch`], below the first of
+/// `bases` the view can bind), or not at all.
+pub(crate) fn view_with(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    engine: &str,
+    home: &EngineHome,
+    bases: &[PathBuf],
+    make: MakeView<'_>,
+) -> Boxed {
+    use spawn_core::bridge::EngineViewPolicy;
+    let enabled = [(engine.to_string(), home.clone())];
+    let view = match crate::runtime::engine_view(lookup, &enabled, make).0 {
+        EngineViewPolicy::Off => return Boxed::Off,
+        EngineViewPolicy::Required(Err(why)) => {
+            return Boxed::Unavailable(format!("no filesystem view on this host ({why})"));
+        }
+        EngineViewPolicy::Required(Ok(view)) => view,
+    };
+    let mut why = "no scratch directory for it".to_string();
+    for base in bases.iter().filter(|base| base.is_dir()) {
+        let scratch = match Scratch::new(base) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                why = error;
+                continue;
+            }
+        };
+        let Some(workspace) = scratch.path().to_str() else {
+            continue;
+        };
+        match view.wrap(&spawn_core::port::ViewedLaunch {
+            engine,
+            workspace,
+            engine_home: &home.sessions,
+        }) {
+            Ok(words) if words.len() > 1 && words.last().is_some_and(|word| word == "--") => {
+                return Boxed::Inside {
+                    words,
+                    scratch: Some(scratch),
+                };
+            }
+            Ok(_) => why = "its words do not end in --".to_string(),
+            Err(error) => why = error,
+        }
+    }
+    Boxed::Unavailable(format!(
+        "its filesystem view ({}) cannot be made: {why}",
+        view.name()
+    ))
+}
+
+/// [`view_with`] on this host's `bwrap`, its scratch workspace below
+/// `/var/tmp`, else `$HOME/.cache` (`/tmp` and the loop's `TMPDIR` are
+/// masked inside the view, so never there).
+fn view_now(engine: &str, home: &EngineHome) -> Boxed {
+    let lookup = |name: &str| crate::env_value(name);
+    let mut bases = vec![PathBuf::from("/var/tmp")];
+    if let Some(dir) = lookup("HOME").filter(|dir| dir.starts_with('/')) {
+        bases.push(Path::new(&dir).join(".cache"));
+    }
+    view_with(
+        &lookup,
+        engine,
+        home,
+        &bases,
+        Box::new(|lookup| {
+            spawn_host::BwrapView::new("bwrap", spawn_host::ViewConfig::from_env(lookup)).map(
+                |view| std::sync::Arc::new(view) as std::sync::Arc<dyn spawn_core::port::EngineView>,
+            )
+        }),
+    )
 }
 
 /// The login files of `engine` this host would hold: Claude Code's
