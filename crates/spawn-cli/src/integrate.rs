@@ -5850,3 +5850,9 @@ mod cannot_judge_tests;
 /// sources and a stub gate.
 #[cfg(test)]
 mod database_tests;
+
+/// spawn-node v1 PR S5: the candidates' gates judged on a node first
+/// (`SPAWN_GATE_REMOTE=node`), M3a and M3b, and the outcomes of section 6.2
+/// on the ledger alone, against the test database.
+#[cfg(test)]
+mod remote_primary_tests;

@@ -151,6 +151,7 @@ struct Fixture {
     base: String,
     candidate: String,
     controller: PathBuf,
+    scenarios: PathBuf,
     primary: Primary,
     seed: std::cell::Cell<u8>,
 }
@@ -162,6 +163,7 @@ impl Fixture {
         let (repo, base, candidate) = fixtures::repository(&dir.0);
         let controller = fixtures::controller(&dir.0);
         let primary = Primary::new(settings(&dir.0, believe_reject, wait), dir.0.join("work"));
+        let scenarios = controller.join("rsi/scenarios");
         Self {
             ledger,
             dir,
@@ -169,13 +171,10 @@ impl Fixture {
             base,
             candidate,
             controller,
+            scenarios,
             primary,
             seed: std::cell::Cell::new(10),
         }
-    }
-
-    fn scenarios(&self) -> PathBuf {
-        self.controller.join("rsi/scenarios")
     }
 
     fn request(&self) -> PrimaryRequest<'_> {
@@ -185,7 +184,7 @@ impl Fixture {
             repo: &self.repo,
             base: &self.base,
             candidate: &self.candidate,
-            scenarios: Box::leak(self.scenarios().into_boxed_path()),
+            scenarios: &self.scenarios,
             scenario: None,
             gate_env: &[],
         }
@@ -255,12 +254,16 @@ fn local_why(outcome: &PrimaryOutcome) -> &str {
 /// needs its directories; M3b is off unless set to 1.
 #[test]
 fn the_primary_path_is_off_unless_node_and_refuses_what_it_does_not_know() {
-    let env = |pairs: &'static [(&'static str, &'static str)]| {
+    let env = |pairs: &[(&str, &str)]| {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
         move |name: &str| {
             pairs
                 .iter()
-                .find(|(key, _)| *key == name)
-                .map(|(_, value)| (*value).to_string())
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
         }
     };
     assert_eq!(remote::primary_settings(env(&[])), Ok(None));
@@ -279,13 +282,13 @@ fn the_primary_path_is_off_unless_node_and_refuses_what_it_does_not_know() {
         "M3b alone switches nothing on"
     );
     for unknown in ["nodes", "remote", "1", "NODE"] {
-        let pairs: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
+        let refused = remote::primary_settings(env(&[
             ("SPAWN_GATE_REMOTE", unknown),
             ("SPAWN_NODE_ARTIFACTS", "/a"),
             ("SPAWN_NODE_RESULTS", "/r"),
             ("CARGO_HOME", "/c"),
-        ]));
-        let refused = remote::primary_settings(env(pairs)).expect_err(unknown);
+        ]))
+        .expect_err(unknown);
         assert!(refused.contains("SPAWN_GATE_REMOTE"), "{refused}");
     }
     // `node` without its directories, or with relative ones.
@@ -325,15 +328,14 @@ fn the_primary_path_is_off_unless_node_and_refuses_what_it_does_not_know() {
     assert!(m3b.believe_reject);
     assert_eq!(m3b.queue_wait, Duration::from_secs(5));
     for off in ["0", ""] {
-        let pairs: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
-            ("SPAWN_GATE_REMOTE", "node"),
-            ("SPAWN_GATE_REMOTE_BELIEVE_REJECT", off),
-            ("SPAWN_NODE_ARTIFACTS", "/a"),
-            ("SPAWN_NODE_RESULTS", "/r"),
-            ("CARGO_HOME", "/c"),
-        ]));
         assert!(
-            !remote::primary_settings(env(pairs))
+            !remote::primary_settings(env(&[
+                ("SPAWN_GATE_REMOTE", "node"),
+                ("SPAWN_GATE_REMOTE_BELIEVE_REJECT", off),
+                ("SPAWN_NODE_ARTIFACTS", "/a"),
+                ("SPAWN_NODE_RESULTS", "/r"),
+                ("CARGO_HOME", "/c"),
+            ]))
                 .expect("settings")
                 .expect("on")
                 .believe_reject
@@ -409,7 +411,7 @@ fn m3a_an_acceptance_on_the_jobs_own_inputs_is_believed() {
     assert_eq!(given["controller"], "3".repeat(40));
     assert_eq!(
         given["scenarios_sha256"].as_str(),
-        super::inputs::scenarios_sha256(&world.scenarios()).as_deref()
+        super::inputs::scenarios_sha256(&world.scenarios).as_deref()
     );
     assert_eq!(env["runner"], "node:n1");
     assert_eq!(env["host"], "n252-host");
