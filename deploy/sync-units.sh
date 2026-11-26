@@ -39,8 +39,15 @@
 # `diff -u` it names, by hand.
 #
 # Exit status: 0 in sync (--check) or synced (--apply); 1 --check found a
-# unit to install or an unlisted host-local file; 2 usage, or a unit that
+# unit to install/sync or an unlisted host-local file; 2 usage, invalid
+# SPAWN_DEPLOY_EDGE_MODE, failed Phase 2 go-uds pre-check, or a unit that
 # could not be written (--apply stops at the first).
+#
+# SPAWN_DEPLOY_EDGE_MODE=legacy (default): existing behavior; absent units are
+# only named. SPAWN_DEPLOY_EDGE_MODE=go-uds: validates the 4 Phase 2 units
+# (spawn-core, spawn-node-{edge,gw,out}) for PG credential isolation and
+# Keep LoadCredential/RestartPreventExitStatus first, and installs missing
+# Phase 2 units on --apply (or flags them as missing on --check).
 set -euo pipefail
 
 say() { printf 'units: %s\n' "$*"; }
@@ -52,12 +59,65 @@ case $mode in
   exit 2
   ;;
 esac
+edge_mode=${SPAWN_DEPLOY_EDGE_MODE:-legacy}
+case $edge_mode in
+legacy | go-uds) ;;
+*)
+  echo "units: invalid SPAWN_DEPLOY_EDGE_MODE '$edge_mode' (expected legacy or go-uds)" >&2
+  exit 2
+  ;;
+esac
 src=${2:-$(cd "$(dirname "$0")" && pwd)/systemd}
 [ -d "$src" ] || {
   echo "units: no directory $src" >&2
   exit 2
 }
 unit_dir=${SPAWN_UNIT_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}
+
+is_phase2_unit() {
+  case $1 in
+  spawn-core.service | spawn-node-edge.service | spawn-node-gw.service | spawn-node-out.service)
+    return 0
+    ;;
+  *) return 1 ;;
+  esac
+}
+
+check_phase2_units_dir() {
+  local dir=$1 u conf
+  for u in spawn-core.service spawn-node-edge.service spawn-node-gw.service spawn-node-out.service; do
+    if [ ! -f "$dir/$u" ] || [ -L "$dir/$u" ]; then
+      echo "units: go-uds mode requires regular unit file $dir/$u" >&2
+      exit 2
+    fi
+  done
+  for u in spawn-node-edge.service spawn-node-gw.service spawn-node-out.service; do
+    if grep -qiE 'spawn\.env|DATABASE_URL' "$dir/$u"; then
+      echo "units: go-uds mode refused: Go front unit $u references spawn.env or DATABASE_URL" >&2
+      exit 2
+    fi
+    shopt -s nullglob
+    for conf in "$unit_dir/${u}.d"/*.conf; do
+      [ -f "$conf" ] || continue
+      if grep -qiE 'spawn\.env|DATABASE_URL' "$conf"; then
+        shopt -u nullglob
+        echo "units: go-uds mode refused: drop-in $conf references spawn.env or DATABASE_URL" >&2
+        exit 2
+      fi
+    done
+    shopt -u nullglob
+  done
+  if ! grep -qE '^[[:space:]]*LoadCredential=typesafe\.api-key:/run/keep/typesafe\.api-key[[:space:]]*$' "$dir/spawn-node-out.service"; then
+    echo "units: go-uds mode refused: spawn-node-out.service missing LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key" >&2
+    exit 2
+  fi
+  if ! grep -qE '^[[:space:]]*RestartPreventExitStatus=243[[:space:]]+78[[:space:]]*$' "$dir/spawn-node-out.service"; then
+    echo "units: go-uds mode refused: spawn-node-out.service missing RestartPreventExitStatus=243 78" >&2
+    exit 2
+  fi
+}
+
+[ "$edge_mode" != go-uds ] || check_phase2_units_dir "$src"
 
 # listed <name>: <name> (a unit, or <unit>.d/<file>) is in host-local.
 listed() {
@@ -74,7 +134,26 @@ for file in "$src"/spawn-*.service "$src"/spawn-*.timer "$src"/spawn-*.path; do
   if [ -L "$dest" ]; then
     linked+=("$name")
   elif [ ! -e "$dest" ]; then
-    absent+=("$name")
+    if [ "$edge_mode" = go-uds ] && is_phase2_unit "$name"; then
+      changed+=("$name")
+      if [ "$mode" = --apply ]; then
+        if ! mkdir -p "$unit_dir"; then
+          echo "units: could not create $unit_dir" >&2
+          exit 2
+        fi
+        tmp=$unit_dir/.$name.sync.$$
+        if ! { cp "$file" "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$dest"; }; then
+          rm -f "$tmp"
+          echo "units: could not install $dest from $file" >&2
+          exit 2
+        fi
+        say "installed $name"
+      else
+        say "missing (go-uds): $name (diff -u $dest $file)"
+      fi
+    else
+      absent+=("$name")
+    fi
   elif cmp -s "$file" "$dest"; then
     same=$((same + 1))
   else
@@ -113,6 +192,10 @@ if [ "${#changed[@]}" -gt 0 ] && [ "$mode" = --apply ]; then
       say "try-restarted $name"
       ;;
     spawn-loop.service | spawn-integrate.service | spawn-serve.service) ;;
+    spawn-core.service | spawn-node-edge.service | spawn-node-gw.service | spawn-node-out.service)
+      [ "$edge_mode" = go-uds ] ||
+        say "$name takes effect at its next start (now: systemctl --user try-restart $name)"
+      ;;
     *) say "$name takes effect at its next start (now: systemctl --user try-restart $name)" ;;
     esac
   done

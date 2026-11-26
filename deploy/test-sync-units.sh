@@ -187,6 +187,98 @@ check "deploy.sh syncs the units before it restarts the services" \
   bash -c 'awk "/sync-units.sh\" --apply/ { s = NR } /^restart\$/ && s && !r { r = NR } END { exit !(s && r > s) }" "$1"' _ "$here/deploy/deploy.sh"
 check "cutover-controller.sh runs the sync" grep -q 'deploy/sync-units.sh" --apply' "$here/deploy/cutover-controller.sh"
 
+# Phase 2 opt-in SPAWN_DEPLOY_EDGE_MODE=legacy|go-uds tests.
+p2_src=$scratch/p2-src p2_units=$scratch/p2-units
+mkdir -p "$p2_src" "$p2_units"
+cat >"$p2_src/spawn-core.service" <<'EOF'
+[Service]
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn serve --ipc --ipc-sock %t/spawn/core.sock
+EOF
+cat >"$p2_src/spawn-node-edge.service" <<'EOF'
+[Service]
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn-node front --serve edge --core-sock %t/spawn/core.sock
+EOF
+cat >"$p2_src/spawn-node-gw.service" <<'EOF'
+[Service]
+EnvironmentFile=-%h/.config/spawn/node-gw.env
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn-node front --serve node --core-sock %t/spawn/core.sock
+EOF
+cat >"$p2_src/spawn-node-out.service" <<'EOF'
+[Service]
+LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key
+RestartPreventExitStatus=243 78
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn-node front --serve outbound --out-sock %t/spawn/out.sock
+EOF
+
+rm -f "$SYSTEMCTL_LOG"
+status=0
+SPAWN_UNIT_DIR="$p2_units" SPAWN_DEPLOY_EDGE_MODE=bogus bash "$script" --check "$p2_src" >"$scratch/p2-bogus.out" 2>&1 || status=$?
+check "invalid SPAWN_DEPLOY_EDGE_MODE exits 2 (got $status)" [ "$status" = 2 ]
+check "invalid SPAWN_DEPLOY_EDGE_MODE calls no systemctl" [ ! -e "$SYSTEMCTL_LOG" ]
+
+status=0
+SPAWN_UNIT_DIR="$p2_units" SPAWN_DEPLOY_EDGE_MODE=legacy bash "$script" --apply "$p2_src" >"$scratch/p2-legacy.out" 2>&1 || status=$?
+check "legacy mode does not install absent Phase 2 units" \
+  bash -c '[ "$1" = 0 ] && [ ! -e "$2/spawn-core.service" ] && [ ! -e "$2/spawn-node-edge.service" ]' _ "$status" "$p2_units"
+
+rm -f "$SYSTEMCTL_LOG"
+status=0
+SPAWN_UNIT_DIR="$p2_units" SPAWN_DEPLOY_EDGE_MODE=go-uds bash "$script" --check "$p2_src" >"$scratch/p2-check.out" 2>&1 || status=$?
+check "go-uds --check exits 1 when Phase 2 units are not installed yet (got $status)" [ "$status" = 1 ]
+check "go-uds --check installs nothing and calls no systemctl" \
+  bash -c '[ ! -e "$1/spawn-core.service" ] && [ ! -e "$2" ]' _ "$p2_units" "$SYSTEMCTL_LOG"
+
+status=0
+SPAWN_UNIT_DIR="$p2_units" SPAWN_DEPLOY_EDGE_MODE=go-uds bash "$script" --apply "$p2_src" >"$scratch/p2-apply.out" 2>&1 || status=$?
+check "go-uds --apply exits 0 (got $status)" [ "$status" = 0 ]
+for u in spawn-core.service spawn-node-edge.service spawn-node-gw.service spawn-node-out.service; do
+  check "go-uds --apply installed $u (0644)" \
+    bash -c 'cmp -s "$1/$3" "$2/$3" && [ "$(stat -c %a "$2/$3")" = 644 ]' _ "$p2_src" "$p2_units" "$u"
+  check "go-uds --apply suppresses manual try-restart hint for $u" \
+    bash -c '! grep -q "$2 takes effect at its next start" "$1"' _ "$scratch/p2-apply.out" "$u"
+done
+check "go-uds --apply daemon-reloaded once" [ "$(grep -cx -- "--user daemon-reload" "$SYSTEMCTL_LOG")" -eq 1 ]
+
+rm -f "$SYSTEMCTL_LOG"
+status=0
+SPAWN_UNIT_DIR="$p2_units" SPAWN_DEPLOY_EDGE_MODE=go-uds bash "$script" --apply "$p2_src" >"$scratch/p2-again.out" 2>&1 || status=$?
+check "go-uds --apply again is a no-op (exits 0, no systemctl)" \
+  bash -c '[ "$1" = 0 ] && [ ! -e "$2" ]' _ "$status" "$SYSTEMCTL_LOG"
+
+# Fail-Closed go-uds pre-validations (missing unit, PG leak in unit or drop-in, missing LoadCredential/RestartPreventExitStatus).
+p2_bad=$scratch/p2-bad p2_bad_units=$scratch/p2-bad-units
+check_go_uds_refused() {
+  local label=$1 prep=$2
+  rm -rf "$p2_bad" "$p2_bad_units" "$SYSTEMCTL_LOG"
+  cp -r "$p2_src" "$p2_bad"
+  mkdir -p "$p2_bad_units"
+  eval "$prep"
+  status=0
+  SPAWN_UNIT_DIR="$p2_bad_units" SPAWN_DEPLOY_EDGE_MODE=go-uds bash "$script" --apply "$p2_bad" >"$scratch/p2-refused.out" 2>&1 || status=$?
+  check "$label: exits 2 (got $status)" [ "$status" = 2 ]
+  check "$label: installed nothing" [ -z "$(ls -A "$p2_bad_units" | grep -v '\.d$' || true)" ]
+  check "$label: calls no systemctl" [ ! -e "$SYSTEMCTL_LOG" ]
+  check "$label: prints no planted secret sentinel" bash -c '! grep -qF P2_UNIT_LEAK_SENTINEL "$1"' _ "$scratch/p2-refused.out"
+}
+check_go_uds_refused "missing Phase 2 unit" 'rm -f "$p2_bad/spawn-node-out.service"'
+check_go_uds_refused "Go edge unit referencing spawn.env" 'printf "EnvironmentFile=%s/spawn.env\n# P2_UNIT_LEAK_SENTINEL\n" "$p2_bad" >>"$p2_bad/spawn-node-edge.service"'
+check_go_uds_refused "Go gw unit referencing DATABASE_URL" 'printf "Environment=SPAWN_DATABASE_URL=P2_UNIT_LEAK_SENTINEL\n" >>"$p2_bad/spawn-node-gw.service"'
+check_go_uds_refused "Go out drop-in referencing DATABASE_URL" 'mkdir -p "$p2_bad_units/spawn-node-out.service.d" && printf "[Service]\nEnvironment=SPAWN_DATABASE_URL=P2_UNIT_LEAK_SENTINEL\n" >"$p2_bad_units/spawn-node-out.service.d/99-leak.conf"'
+check_go_uds_refused "spawn-node-out missing LoadCredential" 'grep -v "^LoadCredential=" "$p2_bad/spawn-node-out.service" >"$p2_bad/out.tmp" && mv "$p2_bad/out.tmp" "$p2_bad/spawn-node-out.service"'
+check_go_uds_refused "spawn-node-out missing RestartPreventExitStatus" 'grep -v "^RestartPreventExitStatus=" "$p2_bad/spawn-node-out.service" >"$p2_bad/out.tmp" && mv "$p2_bad/out.tmp" "$p2_bad/spawn-node-out.service"'
+
+# Real repository deploy/systemd Phase 2 contract checks.
+for u in spawn-core.service spawn-node-edge.service spawn-node-gw.service spawn-node-out.service; do
+  check "repo deploy/systemd/$u is a regular file" bash -c '[ -f "$1/$2" ] && [ ! -L "$1/$2" ]' _ "$repo_units" "$u"
+done
+for u in spawn-node-edge.service spawn-node-gw.service spawn-node-out.service; do
+  check "repo $u has zero spawn.env or DATABASE_URL references" bash -c '! grep -qiE "spawn\.env|DATABASE_URL" "$1/$2"' _ "$repo_units" "$u"
+done
+check "repo spawn-node-out.service declares LoadCredential and RestartPreventExitStatus=243 78" \
+  bash -c 'grep -qE "^[[:space:]]*LoadCredential=typesafe\.api-key:/run/keep/typesafe\.api-key[[:space:]]*$" "$1" && grep -qE "^[[:space:]]*RestartPreventExitStatus=243[[:space:]]+78[[:space:]]*$" "$1"' \
+  _ "$repo_units/spawn-node-out.service"
+
 echo "sync-units: $passed passed, $failures failed"
 [ "$failures" = 0 ] && echo "sync-units: all cases pass"
 [ "$failures" = 0 ]

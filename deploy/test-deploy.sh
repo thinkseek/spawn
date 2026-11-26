@@ -90,43 +90,28 @@ check() { # check <description> <command...>
   if "$@"; then pass "$what"; else fail "$what"; fi
 }
 
-# SPAWN_DEPLOY_TEST_URL_FILE names another file holding the test server's URL
-# (a reviewer's own server; the file, never the URL, goes in the environment).
-test_url_file=${SPAWN_DEPLOY_TEST_URL_FILE:-$HOME/.config/spawn/test-database.url}
-[ -f "$test_url_file" ] || die "no $test_url_file"
-test_url=$(cat "$test_url_file")
-case $test_url in *:15433/*) die "the test URL names port 15433, the live database" ;; esac
-db=spawn_deploy_test_$$
-live_url=${test_url%/*}/$db
-
+# Wait: preserve the existing header, set up scratch/guard_home unconditionally so the offline Phase 2 sandbox tests ALWAYS run without touching real host systemd or requiring PostgreSQL, and run the live-PG/Vite build end-to-end suite when test-database.url and web/node_modules exist.
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/spawn-deploy-test.XXXXXX")
+db=""
 cleanup() {
-  with_db "$test_url" psql -XAtq -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1 || true
+  pkill -f "$scratch/p2/" >/dev/null 2>&1 || true
+  if [ -n "$db" ] && [ -n "${test_url-}" ]; then
+    with_db "$test_url" psql -XAtq -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1 || true
+  fi
   # The controllers are read-only (deploy/controller.sh).
   chmod -R u+w "$scratch" 2>/dev/null || true
   rm -rf "$scratch"
 }
 trap cleanup EXIT
-with_db "$test_url" psql -XAtq -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db" >/dev/null
 
-live=$scratch/live
-
-# Never the real home (sync/cc-rules.md (a), after 2026-11-12): deploy.sh
-# and everything the test runs see HOME and the XDG roots in the scratch;
-# the toolchain is named from the real home first (the sandbox binds
-# CARGO_HOME's registry and RUSTUP_HOME read-only). guard_home refuses
-# (exit 2, nothing run) unless HOME, the live directory and every XDG root
-# are set, inside the scratch, and neither are, hold nor lie in the real
-# home; at the start and before every deploy.
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 export CARGO_HOME=${CARGO_HOME:-$real_home/.cargo} RUSTUP_HOME=${RUSTUP_HOME:-$real_home/.rustup}
 fake_home=$scratch/home
 mkdir -p "$fake_home/.config" "$fake_home/.cache" "$fake_home/.local/share"
 export HOME=$fake_home XDG_CACHE_HOME=$fake_home/.cache XDG_CONFIG_HOME=$fake_home/.config \
   XDG_DATA_HOME=$fake_home/.local/share
-# The value collector's copies outside $live (deploy.sh, issue 98): stand-ins in the scratch, never
-# the host's /var/tmp/spawn or /usr/local/lib/spawn/redact.
 export SPAWN_DEPLOY_SCANNER_DIR=$scratch/scanner SPAWN_DEPLOY_REDACT_DIR=$scratch/redact
+live=$scratch/live
 guard_home() {
   local gh_scratch gh_real gh_path gh_name
   [ -n "$scratch" ] && [ -n "$real_home" ] || {
@@ -166,6 +151,311 @@ guard_status=0
 (HOME=$real_home; guard_home) 2>"$scratch/guard.err" || guard_status=$?
 check "the guard refuses the real home (status $guard_status)" \
   bash -c '[ "$1" -eq 2 ] && grep -q "HOME .* is not inside the scratch" "$2"' _ "$guard_status" "$scratch/guard.err"
+
+echo "== Phase 2 opt-in cutover, precheck & reversible rollback (offline sandbox)"
+p2=$scratch/p2
+p2_home=$p2/home p2_live=$p2/live p2_units=$p2/home/.config/systemd/user p2_runtime=$p2/runtime p2_bin=$p2/bin p2_state=$p2/state
+mkdir -p "$p2_home/.config" "$p2_home/.cache" "$p2_home/.local/share" "$p2_units" "$p2_runtime/spawn" "$p2_live/bin" "$p2_bin" "$p2_state"
+printf '#!/bin/sh\nexit 0\n' >"$p2_live/bin/spawn-node"
+chmod 755 "$p2_live/bin/spawn-node"
+P2_SYSTEMCTL_LOG=$p2/systemctl.log
+P2_CORE_SOCK=$p2_runtime/spawn/core.sock
+P2_CORE_PID=$p2/core.pid
+
+cat >"$p2_bin/systemctl" <<'EOF'
+#!/bin/sh
+echo "$*" >>"$P2_SYSTEMCTL_LOG"
+[ "${1-}" = "--user" ] && shift || exit 0
+cmd=${1-}
+[ -n "$cmd" ] && shift || exit 0
+case $cmd in
+daemon-reload)
+  exit 0
+  ;;
+is-active)
+  [ "${1-}" = "--quiet" ] && shift || true
+  u=${1-}
+  [ -e "$P2_STATE_DIR/$u.active" ] && exit 0 || exit 3
+  ;;
+stop)
+  for u in "$@"; do
+    rm -f "$P2_STATE_DIR/$u.active"
+    if [ "$u" = "spawn-core.service" ] && [ -f "$P2_CORE_PID" ]; then
+      pid=$(cat "$P2_CORE_PID" 2>/dev/null || true)
+      [ -n "$pid" ] && kill "$pid" >/dev/null 2>&1 || true
+      rm -f "$P2_CORE_PID" "$P2_CORE_SOCK"
+    fi
+  done
+  exit 0
+  ;;
+restart | try-restart)
+  for u in "$@"; do
+    case " ${P2_ABSENT_UNITS-} " in *" $u "*) exit 5 ;; esac
+    case " ${P2_FAIL_UNITS-} " in *" $u "*) exit 1 ;; esac
+    : >"$P2_STATE_DIR/$u.active"
+    if [ "$u" = "spawn-core.service" ] && [ "${P2_CREATE_CORE_SOCK-1}" = 1 ]; then
+      rm -f "$P2_CORE_SOCK"
+      python3 -c '
+import os, socket, sys, time
+sock_path, pid_file = sys.argv[1], sys.argv[2]
+time.sleep(0.25)
+os.makedirs(os.path.dirname(sock_path), exist_ok=True)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sock_path)
+s.listen(4)
+open(pid_file, "w").write(str(os.getpid()))
+time.sleep(20)
+' "$P2_CORE_SOCK" "$P2_CORE_PID" </dev/null >/dev/null 2>&1 &
+    fi
+  done
+  exit 0
+  ;;
+esac
+EOF
+chmod 755 "$p2_bin/systemctl"
+
+p2_reset_state() {
+  rm -rf "$p2_state"/* "$P2_SYSTEMCTL_LOG" "$p2_units"/*
+  if [ -f "$P2_CORE_PID" ]; then
+    kill "$(cat "$P2_CORE_PID" 2>/dev/null || true)" >/dev/null 2>&1 || true
+  fi
+  rm -f "$P2_CORE_PID" "$P2_CORE_SOCK"
+}
+
+# 1. Invalid SPAWN_DEPLOY_EDGE_MODE fails closed before deploy.lock or systemctl.
+: >"$P2_SYSTEMCTL_LOG"
+set +e
+(
+  cd "$repo"
+  HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    SPAWN_DEPLOY_EDGE_MODE=bogus bash "$repo/deploy/deploy.sh" --main
+) >"$p2/bogus.out" 2>&1
+p2_status=$?
+set -e
+check "deploy rejects unknown SPAWN_DEPLOY_EDGE_MODE (status $p2_status)" [ "$p2_status" -ne 0 ]
+check "deploy names invalid SPAWN_DEPLOY_EDGE_MODE" grep -q "SPAWN_DEPLOY_EDGE_MODE must be 'legacy' or 'go-uds'" "$p2/bogus.out"
+check "deploy rejects unknown mode before creating deploy.lock or calling systemctl" \
+  bash -c '[ ! -e "$1/deploy.lock" ] && [ ! -s "$2" ]' _ "$p2_live" "$P2_SYSTEMCTL_LOG"
+
+# 2. Read-only --check-phase2-cutover precheck (clean repo pass + all fail-closed errors, zero secrets leaked).
+: >"$P2_SYSTEMCTL_LOG"
+set +e
+(
+  cd "$repo"
+  HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    bash "$repo/deploy/deploy.sh" --check-phase2-cutover "$repo/deploy/systemd"
+) >"$p2/precheck-ok.out" 2>&1
+p2_status=$?
+set -e
+check "--check-phase2-cutover passes on repo units (status $p2_status)" [ "$p2_status" -eq 0 ]
+check "--check-phase2-cutover reports ok" grep -q "phase2 cutover precheck ok" "$p2/precheck-ok.out"
+check "--check-phase2-cutover creates no deploy.lock and calls no systemctl" \
+  bash -c '[ ! -e "$1/deploy.lock" ] && [ ! -s "$2" ]' _ "$p2_live" "$P2_SYSTEMCTL_LOG"
+
+set +e
+(
+  cd "$repo"
+  HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live SPAWN_NODE_BIN="$p2/no-such-bin" \
+    PATH="$p2_bin:$PATH" bash "$repo/deploy/deploy.sh" --check-phase2-cutover "$repo/deploy/systemd"
+) >"$p2/precheck-missing-bin.out" 2>&1
+p2_status=$?
+set -e
+check "--check-phase2-cutover rejects missing spawn-node (status $p2_status)" [ "$p2_status" -ne 0 ]
+check "--check-phase2-cutover names missing spawn-node" grep -q "missing executable spawn-node binary" "$p2/precheck-missing-bin.out"
+
+p2_bad_units=$p2/bad-units
+run_bad_precheck() {
+  local label=$1 setup=$2
+  rm -rf "$p2_bad_units" "$p2_units"/spawn-node-*.service.d
+  mkdir -p "$p2_bad_units"
+  cp "$repo"/deploy/systemd/spawn-core.service "$repo"/deploy/systemd/spawn-node-*.service "$p2_bad_units"/
+  eval "$setup"
+  set +e
+  (
+    cd "$repo"
+    HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+      XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+      bash "$repo/deploy/deploy.sh" --check-phase2-cutover "$p2_bad_units"
+  ) >"$p2/precheck-bad.out" 2>&1
+  p2_status=$?
+  set -e
+  check "--check-phase2-cutover refuses $label (status $p2_status)" [ "$p2_status" -ne 0 ]
+  check "--check-phase2-cutover prints zero secret sentinels on $label" \
+    bash -c '! grep -qF P2_DEPLOY_LEAK_SENTINEL "$1"' _ "$p2/precheck-bad.out"
+}
+run_bad_precheck "missing Phase 2 unit" 'rm -f "$p2_bad_units/spawn-node-gw.service"'
+run_bad_precheck "Go edge referencing spawn.env" 'printf "EnvironmentFile=%s/spawn.env\n# P2_DEPLOY_LEAK_SENTINEL\n" "$p2_live" >>"$p2_bad_units/spawn-node-edge.service"'
+run_bad_precheck "Go out referencing DATABASE_URL" 'printf "Environment=SPAWN_DATABASE_URL=P2_DEPLOY_LEAK_SENTINEL\n" >>"$p2_bad_units/spawn-node-out.service"'
+run_bad_precheck "Go edge drop-in referencing DATABASE_URL" 'mkdir -p "$p2_units/spawn-node-edge.service.d" && printf "[Service]\nEnvironment=SPAWN_DATABASE_URL=P2_DEPLOY_LEAK_SENTINEL\n" >"$p2_units/spawn-node-edge.service.d/99-leak.conf"'
+run_bad_precheck "spawn-node-out missing LoadCredential" 'grep -v "^LoadCredential=" "$p2_bad_units/spawn-node-out.service" >"$p2_bad_units/out.tmp" && mv "$p2_bad_units/out.tmp" "$p2_bad_units/spawn-node-out.service"'
+rm -rf "$p2_units"/spawn-node-*.service.d
+
+# 3. Default SPAWN_DEPLOY_EDGE_MODE=legacy keeps existing behavior intact.
+p2_reset_state
+: >"$p2_state/spawn-loop.active"
+: >"$p2_state/spawn-integrate.active"
+: >"$p2_state/spawn-serve.active"
+set +e
+(
+  cd "$repo"
+  export HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    P2_STATE_DIR=$p2_state P2_SYSTEMCTL_LOG=$P2_SYSTEMCTL_LOG P2_CORE_SOCK=$P2_CORE_SOCK P2_CORE_PID=$P2_CORE_PID
+  unset SPAWN_DEPLOY_EDGE_MODE
+  # shellcheck source=deploy/deploy.sh
+  . "$repo/deploy/deploy.sh"
+  sync_units_for_deploy "$repo/deploy/systemd" >/dev/null
+  restart
+) >"$p2/legacy.out" 2>&1
+p2_status=$?
+set -e
+check "legacy mode restart succeeds (status $p2_status)" [ "$p2_status" -eq 0 ]
+check "legacy mode restarts spawn-loop spawn-integrate spawn-serve without stopping any unit" \
+  bash -c 'grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$1" && ! grep -q " stop " "$1"' _ "$P2_SYSTEMCTL_LOG"
+check "legacy mode does not install absent Phase 2 units" [ ! -e "$p2_units/spawn-core.service" ]
+
+# 4. go-uds cutover strict restart order (precheck -> sync -> spawn-core -> wait core.sock -> stop legacy -> start Go fronts).
+p2_reset_state
+for u in spawn-loop spawn-integrate spawn-serve.service spawn-node-gateway.service spawn-jev-relay.service spawn-jev-relay.path; do
+  : >"$p2_state/$u.active"
+done
+set +e
+(
+  cd "$repo"
+  export HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    P2_STATE_DIR=$p2_state P2_SYSTEMCTL_LOG=$P2_SYSTEMCTL_LOG P2_CORE_SOCK=$P2_CORE_SOCK P2_CORE_PID=$P2_CORE_PID \
+    P2_CREATE_CORE_SOCK=1 SPAWN_DEPLOY_EDGE_MODE=go-uds SPAWN_PHASE2_CORE_SOCK_TIMEOUT_SECS=5
+  # shellcheck source=deploy/deploy.sh
+  . "$repo/deploy/deploy.sh"
+  check_phase2_cutover "$repo/deploy/systemd" &&
+    sync_units_for_deploy "$repo/deploy/systemd" &&
+    restart
+  rc=$?
+  [ -S "$P2_CORE_SOCK" ] && echo "SOCKET_READY=1" || echo "SOCKET_READY=0"
+  if [ -f "$P2_CORE_PID" ]; then
+    kill "$(cat "$P2_CORE_PID" 2>/dev/null || true)" >/dev/null 2>&1 || true
+    rm -f "$P2_CORE_PID"
+  fi
+  exit "$rc"
+) >"$p2/cutover.out" 2>&1
+p2_status=$?
+set -e
+check "go-uds cutover succeeds (status $p2_status)" [ "$p2_status" -eq 0 ]
+check "go-uds core.sock was live during cutover" grep -q "SOCKET_READY=1" "$p2/cutover.out"
+for u in spawn-core.service spawn-node-edge.service spawn-node-gw.service spawn-node-out.service; do
+  check "go-uds cutover installed and activated $u" \
+    bash -c '[ -f "$1/$3" ] && [ -e "$2/$3.active" ]' _ "$p2_units" "$p2_state" "$u"
+done
+for u in spawn-serve.service spawn-node-gateway.service spawn-jev-relay.service spawn-jev-relay.path; do
+  check "go-uds cutover stopped legacy $u" [ ! -e "$p2_state/$u.active" ]
+done
+check "go-uds cutover follows strict sequence: daemon-reload -> spawn-core -> stop legacy -> Go fronts -> loop/integrate" \
+  bash -c 'awk "
+    /^--user daemon-reload$/ { reload=NR }
+    /^--user restart spawn-core\.service$/ { core=NR }
+    /^--user stop spawn-serve\.service$/ { s_serve=NR }
+    /^--user stop spawn-node-gateway\.service$/ { s_gw=NR }
+    /^--user stop spawn-jev-relay\.path$/ { s_path=NR }
+    /^--user stop spawn-jev-relay\.service$/ { s_jev=NR }
+    /^--user restart spawn-node-edge\.service spawn-node-gw\.service spawn-node-out\.service$/ { fronts=NR }
+    /^--user restart spawn-loop spawn-integrate$/ { loops=NR }
+    END {
+      exit !(reload && core > reload &&
+             s_serve > core && s_gw > core && s_path > core && s_jev > core &&
+             fronts > s_serve && fronts > s_gw && fronts > s_path && fronts > s_jev &&
+             loops > fronts)
+    }" "$1"' _ "$P2_SYSTEMCTL_LOG"
+
+# 5. go-uds Fail-Closed when core.sock times out: legacy units untouched, Go fronts never started.
+p2_reset_state
+for u in spawn-loop spawn-integrate spawn-serve.service spawn-node-gateway.service spawn-jev-relay.service spawn-jev-relay.path; do
+  : >"$p2_state/$u.active"
+done
+set +e
+(
+  cd "$repo"
+  export HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    P2_STATE_DIR=$p2_state P2_SYSTEMCTL_LOG=$P2_SYSTEMCTL_LOG P2_CORE_SOCK=$P2_CORE_SOCK P2_CORE_PID=$P2_CORE_PID \
+    P2_CREATE_CORE_SOCK=0 SPAWN_DEPLOY_EDGE_MODE=go-uds SPAWN_PHASE2_CORE_SOCK_TIMEOUT_SECS=1
+  # shellcheck source=deploy/deploy.sh
+  . "$repo/deploy/deploy.sh"
+  stopped=1
+  restart
+) >"$p2/timeout.out" 2>&1
+p2_status=$?
+set -e
+check "go-uds core.sock timeout fails closed (status $p2_status)" [ "$p2_status" -ne 0 ]
+check "timeout message says legacy units were left untouched" grep -q "legacy units were left untouched" "$p2/timeout.out"
+check "timeout stopped zero legacy units and started zero Go fronts" \
+  bash -c '! grep -q " stop " "$1" && ! grep -q "spawn-node-edge\.service" "$1"' _ "$P2_SYSTEMCTL_LOG"
+for u in spawn-serve.service spawn-node-gateway.service spawn-jev-relay.service spawn-jev-relay.path; do
+  check "legacy $u stayed active on timeout" [ -e "$p2_state/$u.active" ]
+done
+check "spawn-loop and spawn-integrate recovered on timeout" \
+  grep -qx -- "--user restart spawn-loop spawn-integrate" "$P2_SYSTEMCTL_LOG"
+
+# 6. Reversible rollback (go-uds -> legacy): stops all 4 Phase 2 units before restarting legacy units.
+p2_reset_state
+for u in spawn-core.service spawn-node-edge.service spawn-node-gw.service spawn-node-out.service spawn-loop spawn-integrate; do
+  : >"$p2_state/$u.active"
+done
+set +e
+(
+  cd "$repo"
+  export HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    P2_STATE_DIR=$p2_state P2_SYSTEMCTL_LOG=$P2_SYSTEMCTL_LOG P2_CORE_SOCK=$P2_CORE_SOCK P2_CORE_PID=$P2_CORE_PID \
+    SPAWN_DEPLOY_EDGE_MODE=legacy
+  # shellcheck source=deploy/deploy.sh
+  . "$repo/deploy/deploy.sh"
+  restart
+) >"$p2/rollback.out" 2>&1
+p2_status=$?
+set -e
+check "go-uds -> legacy rollback succeeds (status $p2_status)" [ "$p2_status" -eq 0 ]
+for u in spawn-core.service spawn-node-edge.service spawn-node-gw.service spawn-node-out.service; do
+  check "rollback stopped Phase 2 $u" [ ! -e "$p2_state/$u.active" ]
+done
+for u in spawn-node-gateway.service spawn-jev-relay.service spawn-jev-relay.path; do
+  check "rollback restarted legacy $u" [ -e "$p2_state/$u.active" ]
+done
+check "rollback stopped fronts/core before restarting legacy services" \
+  bash -c 'awk "
+    /^--user stop spawn-node-edge\.service$/ { s_edge=NR }
+    /^--user stop spawn-node-gw\.service$/ { s_gw=NR }
+    /^--user stop spawn-node-out\.service$/ { s_out=NR }
+    /^--user stop spawn-core\.service$/ { s_core=NR }
+    /^--user restart spawn-loop spawn-integrate spawn-serve$/ { r_srv=NR }
+    /^--user restart spawn-node-gateway\.service$/ { r_gw=NR }
+    /^--user restart spawn-jev-relay\.service$/ { r_jev=NR }
+    /^--user restart spawn-jev-relay\.path$/ { r_path=NR }
+    END {
+      exit !(s_edge && s_gw && s_out && s_core &&
+             r_srv > s_edge && r_srv > s_gw && r_srv > s_out && r_srv > s_core &&
+             r_gw > r_srv && r_jev > r_srv && r_path > r_srv)
+    }" "$1"' _ "$P2_SYSTEMCTL_LOG"
+
+rm -rf "$p2"
+
+# SPAWN_DEPLOY_TEST_URL_FILE names another file holding the test server's URL
+# (a reviewer's own server; the file, never the URL, goes in the environment).
+test_url_file=${SPAWN_DEPLOY_TEST_URL_FILE:-$real_home/.config/spawn/test-database.url}
+if [ "${SPAWN_TEST_DEPLOY_OFFLINE_ONLY-}" = 1 ] || [ ! -f "$test_url_file" ] || [ ! -d "$repo/web/node_modules" ]; then
+  echo "skip: full PG/build E2E deploy suite (need $test_url_file and $repo/web/node_modules)"
+  echo
+  if [ "$failures" -eq 0 ]; then echo "test-deploy: all passed"; else echo "test-deploy: $failures failed"; exit 1; fi
+  exit 0
+fi
+test_url=$(cat "$test_url_file")
+case $test_url in *:15433/*) die "the test URL names port 15433, the live database" ;; esac
+db=spawn_deploy_test_$$
+live_url=${test_url%/*}/$db
+with_db "$test_url" psql -XAtq -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db" >/dev/null
 missions=$live/missions/spawn.git
 mkdir -p "$live/bin" "$live/backups" "$scratch/tmp" "$scratch/fakebin"
 # A comment, a blank line and a plain NAME=value too: what check_env_file
@@ -197,6 +487,10 @@ echo "$*" >>"$SYSTEMCTL_LOG"
 # FAKE_INTEGRATOR_PID: the integrator's main pid (else none: no warm-up).
 case "$*" in "--user show -p MainPID --value spawn-integrate") [ -z "${FAKE_INTEGRATOR_PID-}" ] || echo "$FAKE_INTEGRATOR_PID" ;; esac
 case "$*" in "--user is-active --quiet spawn-integrate") [ -z "${FAKE_INTEGRATOR_INACTIVE-}" ] || exit 3 ;; esac
+case "$*" in "--user is-active --quiet spawn-core.service" | "--user is-active --quiet spawn-node-edge.service" | "--user is-active --quiet spawn-node-gw.service" | "--user is-active --quiet spawn-node-out.service")
+  [ -n "${FAKE_PHASE2_ACTIVE-}" ] || exit 3
+  ;;
+esac
 case "${SYSTEMCTL_FAIL-}" in "$*="*) exit "${SYSTEMCTL_FAIL##*=}" ;; esac
 case "$*" in "--user try-restart spawn-model-relay") exit 5 ;; esac
 case "$*" in "--user try-restart spawn-node-gateway") [ -n "${FAKE_GATEWAY_INSTALLED-}" ] || exit 5 ;; esac

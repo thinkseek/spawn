@@ -18,6 +18,10 @@ main, changes nothing live until that commit is gated and deployed.
 | `spawn-jev-relay` (and `.path`) | `scripts/jev-relay.py` on 127.0.0.1:8790, holding the API key (Keep's `/run/keep/typesafe.api-key`, by `LoadCredential`; objective 201). Without the file (after a reboot, until Keep delivers again) it fails with 243 and stays stopped; `spawn-jev-relay.path` starts it when Keep writes the file | never; stopped while the key file is absent or empty, until Keep writes it |
 | `spawn-model-relay` | `scripts/model-relay.py` on 127.0.0.1:8791: the engines' model calls, `deepseek-*` to DeepSeek with `DEEPSEEK_API_KEY` (from `~/.config/spawn/model-relay.env`, 0600, held only here), everything else to the gateway of `~/.claude/settings.json` with the engine's own auth ([fleet-architecture.md §3.3](../../docs/fleet-architecture.md#33-engine-models)) | never |
 | `spawn-node-gateway` | `spawn-node-gateway` on `SPAWN_NODE_GATEWAY_LISTEN` (default 127.0.0.1:18096): the signed HTTP front of the node ledger for spawn-node v1 ([node-protocol-v1.md](../../docs/node-protocol-v1.md)), logged in as the restricted `spawn_node_gateway` login from `~/.config/spawn/node-gateway.env` (0600), never `spawn.env`; installed by hand (below) | never (`Restart=always`) |
+| `spawn-core` | **Phase 2 opt-in** (`SPAWN_DEPLOY_EDGE_MODE=go-uds`): `spawn serve --ipc --ipc-sock %t/spawn/core.sock`, the local UDS IPC control core with zero direct TCP edge exposure ([spawn-ipc-v1.md](../../docs/spawn-ipc-v1.md)) | never (`Restart=always`) |
+| `spawn-node-edge` | **Phase 2 opt-in** (`SPAWN_DEPLOY_EDGE_MODE=go-uds`): `spawn-node front --serve edge --core-sock %t/spawn/core.sock --listen ${SPAWN_SERVE_ADDRESS} --web ${SPAWN_WEB_DIR}` HTTP/SSE & PWA front (zero `spawn.env` / `*DATABASE_URL*`) | never (`Restart=always`) |
+| `spawn-node-gw` | **Phase 2 opt-in** (`SPAWN_DEPLOY_EDGE_MODE=go-uds`): `spawn-node front --serve node --core-sock %t/spawn/core.sock` signed node gateway front (zero `spawn.env` / `*DATABASE_URL*`) | never (`Restart=always`) |
+| `spawn-node-out` | **Phase 2 opt-in** (`SPAWN_DEPLOY_EDGE_MODE=go-uds`): `spawn-node front --serve outbound --out-sock %t/spawn/out.sock` outbound Jev relay with `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key`, `RestartPreventExitStatus=243 78`, and zero `spawn.env` / `*DATABASE_URL*` | never; stays stopped while Keep key is absent or empty |
 | `spawn-fleet-test-db` | PostgreSQL 16 on a Unix socket only (`~/.local/share/spawn-rsi/fleet-pg`): the fleet's test server, which engines get as `SPAWN_TEST_DATABASE_URL` once it checks out (below) | never (`Restart=on-failure`) |
 | `spawn-backup` (`.timer`) | `spawn backup dump`: the hourly encrypted `pg_dump` of the event log to R2, bucket-locked, expired by R2's lifecycle; install, keys, windows and cost in [deploy/backup](../backup/README.md) | oneshot, hourly at :00 + up to 5 min |
 | `spawn-backup-bundle` (`.timer`) | `spawn backup bundle`: the daily encrypted bundle of the mission sources and the 14-day transcript window — a full bundle the ISO week's first (or when none is within 7 days), an increment against its base otherwise; with `SPAWN_BACKUP_SYNC_DIR` (the unit sets `/var/tmp/spawn/sync`) the notes folder too, read only, staged on the workspace's disk (never /tmp), its new or changed files scanned for credential values first (a hit, a place the scan could not search or a file it cannot read drops that part, never the rest); a failed run retries twice (15 min apart) | oneshot, daily at 04:00 + up to 1 h |
@@ -417,6 +421,46 @@ itself has no hold to take (the live binary predates it): stop
 `spawn-integrate` for that gate as before.
 
 `deploy/deploy.sh <verdict-file>` deploys the checked-out commit, and only one the gate accepted: the verdict file must be the gate's, accepted, with `"candidate"` = HEAD and `"base"` = the missions repo's current `main` (the script's header shows the gate command). Then: backup, release build (no kache) and UI build from a `git archive` export of HEAD (nothing untracked in the checkout is built) inside the bubblewrap sandbox of `scripts/sandbox.sh` (no network, `$HOME` hidden; the target directory `~/.cache/spawn/deploy-target` persists, so builds stay incremental), then with the integrator stopped it migrates the schema with the staged binary and only then swaps binary and UI (`spawn.prev` and `web.prev` kept; a deploy run again with the same build leaves them alone), switches the controller to HEAD's tree (below), moves the missions repo's `main` forward (never forced) and records `spawn mission moved`, so gated missions take the new main as their baseline instead of halting as if someone had pushed outside the gate. Between the push and that record it keeps `deploy.pending` in the live directory; a deploy that dies there is completed on its exit or by the next deploy. It takes `deploy.lock` in the live directory, so two deploys never run at once. It refuses a dirty tree, a HEAD that tracks files under a `node_modules/`, a HEAD that does not contain the current `main`, or less than `SPAWN_DEPLOY_MIN_FREE_GB` (default 10) free in `$TMPDIR` or the target directory, and restarts the services if anything fails after it stopped the integrator. `deploy/test-deploy.sh` runs it end to end against a fake live directory. It releases the owner's hold on the missions repo on every exit path (above). With `SPAWN_DEPLOY_MIRROR` set (a URL or a remote of the missions repo, in the environment or in `spawn.env`; unset, nothing is published), a deploy that succeeded then publishes the `main` it deployed there, last of all, after the restart and the hold's release: a plain `git push <mirror> <head>:refs/heads/main` from the missions repo, never forced, so a mirror whose `main` HEAD does not contain refuses it and the deploy names both commits. That, a mirror out of reach or without a credential, and a push not done within `SPAWN_DEPLOY_MIRROR_SECS` (default and at most 60) are one line on stderr and never the deploy's failure; the script holds no credential, the push authenticates as this user's `git push` does and never prompts, and pushes `main` alone (`--no-follow-tags`). The credential goes in a credential helper (`gh auth setup-git`) or a deploy key over ssh, never in the URL: git passes a URL to its helpers as an argument, readable in `/proc` by every process on the host, so a mirror that carries one (an http(s) URL with any user part, any URL with `user:password`, a remote or a `url.*.insteadOf` rewrite that resolves to one) is refused before anything is done, without the URL being printed or run; an empty `SPAWN_DEPLOY_MIRROR` in the environment deploys without the mirror. Rolling back to `spawn.prev` goes with `deploy/controller.sh switch spawn <the previous commit>` (`controllers/spawn.prev` names it), and is unsafe once the new binary has written an event kind the old one lacks ([docs/upgrading.md](../../docs/upgrading.md#deploying)).
+
+### Phase 2 opt-in cutover and rollback
+
+`deploy/deploy.sh` and `deploy/sync-units.sh` default to `SPAWN_DEPLOY_EDGE_MODE=legacy` so automated landings (`deploy/on-landing.sh`) keep existing legacy units running without disruption. Any value other than `legacy` or `go-uds` is refused fail-closed before taking the deploy lock or touching systemd.
+
+1. **Read-only preflight check** (modifies nothing on the host):
+   ```sh
+   bash deploy/deploy.sh --check-phase2-cutover
+   ```
+   Verifies:
+   - executable `spawn-node` binary at `$SPAWN_NODE_BIN` or `~/.local/share/spawn-rsi/bin/spawn-node`;
+   - all 4 Phase 2 unit files exist in `deploy/systemd/` (`spawn-core.service`, `spawn-node-edge.service`, `spawn-node-gw.service`, `spawn-node-out.service`);
+   - all 3 Go front units (`spawn-node-{edge,gw,out}.service`) and their systemd drop-ins contain zero `spawn.env` or `*DATABASE_URL*` references (D3 isolation);
+   - `spawn-node-out.service` declares `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key` and `RestartPreventExitStatus=243 78`.
+
+2. **Opt-in cutover (`SPAWN_DEPLOY_EDGE_MODE=go-uds`)**:
+   Ensure `~/.local/share/spawn-rsi/bin/spawn-node` is installed (and optional per-host non-secret overrides live in `~/.config/spawn/node-{edge,gw,out}.env` without Postgres URLs), then deploy with:
+   ```sh
+   SPAWN_DEPLOY_EDGE_MODE=go-uds bash deploy/deploy.sh <verdict-file>   # or --main / --landed
+   ```
+   The deploy runs in strict sequence: preflight check (before backup/stop) -> `sync-units.sh --apply` (installs/updates the 4 Phase 2 units) -> restarts `spawn-core.service` and waits up to `SPAWN_PHASE2_CORE_SOCK_TIMEOUT_SECS` (default 15 s) for `$XDG_RUNTIME_DIR/spawn/core.sock` (`-S`) -> if `core.sock` is not ready in time, **aborts fail-closed without stopping any legacy unit** -> once `core.sock` is ready, stops active legacy units (`spawn-serve`, `spawn-node-gateway`, `spawn-jev-relay.path`, `spawn-jev-relay`) -> starts `spawn-node-edge`, `spawn-node-gw`, `spawn-node-out`, restarts `spawn-loop` / `spawn-integrate`, and verifies all 4 Phase 2 units are `active`.
+
+3. **Post-cutover verification**:
+   ```sh
+   systemctl --user status spawn-core spawn-node-edge spawn-node-gw spawn-node-out
+   curl -fsS --unix-socket "${XDG_RUNTIME_DIR}/spawn/core.sock" http://localhost/ipc/v1/hello
+   CH_DEPLOY_SYSTEMD_DIR=~/.local/share/spawn-rsi/controllers/spawn/deploy/systemd \
+     bash ~/.local/share/spawn-rsi/controllers/spawn/scripts/keep/credential-health.sh
+   ```
+
+4. **Reversible rollback (`go-uds` -> `legacy`)**:
+   Running a normal deploy (or omitting `SPAWN_DEPLOY_EDGE_MODE`) with `SPAWN_DEPLOY_EDGE_MODE=legacy` automatically detects active Phase 2 units, stops `spawn-node-{edge,gw,out}.service` and `spawn-core.service` **before** restarting `spawn-loop`, `spawn-integrate`, `spawn-serve`, `spawn-node-gateway`, and `spawn-jev-relay` (preventing `:8787` / `:18096` port conflicts):
+   ```sh
+   SPAWN_DEPLOY_EDGE_MODE=legacy bash deploy/deploy.sh <verdict-file>   # or --main
+   ```
+   For immediate manual unit rollback without rebuilding:
+   ```sh
+   systemctl --user stop spawn-node-edge spawn-node-gw spawn-node-out spawn-core
+   systemctl --user restart spawn-loop spawn-integrate spawn-serve spawn-node-gateway spawn-jev-relay.path spawn-jev-relay
+   ```
 
 ## The controller
 

@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # Deploy the checked-out commit to the live fleet on this host.
 #
-#   deploy/deploy.sh <verdict-file>            # build, install, move missions main, restart
-#   deploy/deploy.sh --landed <outcome-file>   # build, install, restart: main already moved
-#   deploy/deploy.sh --main                    # the same for the missions main a gate accepted
+#   deploy/deploy.sh <verdict-file>                  # build, install, move missions main, restart
+#   deploy/deploy.sh --landed <outcome-file>         # build, install, restart: main already moved
+#   deploy/deploy.sh --main                          # the same for the missions main a gate accepted
+#   deploy/deploy.sh --check-phase2-cutover [<dir>]  # read-only Phase 2 go-uds preflight (zero host changes)
+#
+# SPAWN_DEPLOY_EDGE_MODE=legacy (default) | go-uds (opt-in Phase 2 split UDS+Go
+# front cutover: spawn-core.service + spawn-node-{edge,gw,out}.service). Any
+# other value is refused fail-closed. In legacy mode, any active Phase 2 units
+# are stopped before restarting legacy units to prevent :8787/:18096 conflicts.
 #
 # The live system runs only what a deploy installed: the binary and UI in
 # $live, and the controller ($live/controllers/spawn, deploy/controller.sh),
@@ -248,6 +254,9 @@ target=${SPAWN_DEPLOY_TARGET:-${XDG_CACHE_HOME:-$HOME/.cache}/spawn/deploy-targe
 min_free_gb=${SPAWN_DEPLOY_MIN_FREE_GB:-10}
 drain_secs=${SPAWN_DEPLOY_DRAIN_SECS:-3600}
 mirror_secs=${SPAWN_DEPLOY_MIRROR_SECS:-60}
+edge_mode_env=${SPAWN_DEPLOY_EDGE_MODE+set}
+edge_mode=${SPAWN_DEPLOY_EDGE_MODE:-legacy}
+core_sock_timeout_secs=${SPAWN_PHASE2_CORE_SOCK_TIMEOUT_SECS:-15}
 repo=$(git rev-parse --show-toplevel)
 cd "$repo"
 # shellcheck source=deploy/backup/lib.sh
@@ -258,6 +267,172 @@ cd "$repo"
 . "$repo/deploy/detach.sh"
 
 say() { printf 'deploy: %s\n' "$*"; }
+
+# validate_edge_mode: Fail-Closed mode check for SPAWN_DEPLOY_EDGE_MODE and
+# SPAWN_PHASE2_CORE_SOCK_TIMEOUT_SECS (when go-uds).
+validate_edge_mode() {
+  case $edge_mode in
+  legacy | go-uds) ;;
+  *)
+    die "SPAWN_DEPLOY_EDGE_MODE must be 'legacy' or 'go-uds', not '$edge_mode'; nothing was done, and an owner's hold on $missions stays held (deploy again, or: spawn mission release --source $missions)"
+    ;;
+  esac
+  if [ "$edge_mode" = go-uds ]; then
+    [[ $core_sock_timeout_secs =~ ^[1-9][0-9]*$ ]] && [ "${#core_sock_timeout_secs}" -le 3 ] && [ "$core_sock_timeout_secs" -le 300 ] ||
+      die "SPAWN_PHASE2_CORE_SOCK_TIMEOUT_SECS must be a whole number of seconds from 1 to 300, not '$core_sock_timeout_secs'"
+  fi
+}
+
+# check_phase2_cutover [<units-dir>]: pure read-only preflight before opt-in
+# go-uds cutover (zero lock, zero systemctl calls, zero host modifications,
+# zero secret/line echo).
+check_phase2_cutover() {
+  local units_dir=${1-}
+  [ -n "$units_dir" ] || units_dir=${SPAWN_DEPLOY_UNITS_DIR:-$repo/deploy/systemd}
+  local unit_dir=${SPAWN_UNIT_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}
+  local node_bin=${SPAWN_NODE_BIN:-$live/bin/spawn-node}
+  local bad=0 u conf
+
+  if [ ! -f "$node_bin" ] || [ ! -x "$node_bin" ]; then
+    printf 'deploy: precheck failed: missing executable spawn-node binary at %s\n' "$node_bin" >&2
+    bad=1
+  fi
+  if [ ! -d "$units_dir" ]; then
+    printf 'deploy: precheck failed: missing systemd units directory %s\n' "$units_dir" >&2
+    return 1
+  fi
+  for u in spawn-core.service spawn-node-edge.service spawn-node-gw.service spawn-node-out.service; do
+    if [ ! -f "$units_dir/$u" ] || [ -L "$units_dir/$u" ]; then
+      printf 'deploy: precheck failed: missing regular Phase 2 unit file %s/%s\n' "$units_dir" "$u" >&2
+      bad=1
+    fi
+  done
+  for u in spawn-node-edge.service spawn-node-gw.service spawn-node-out.service; do
+    if [ -f "$units_dir/$u" ] && grep -qiE 'spawn\.env|DATABASE_URL' "$units_dir/$u"; then
+      printf 'deploy: precheck failed: Go front unit %s/%s references spawn.env or DATABASE_URL\n' "$units_dir" "$u" >&2
+      bad=1
+    fi
+    shopt -s nullglob
+    for conf in "$unit_dir/${u}.d"/*.conf; do
+      [ -f "$conf" ] || continue
+      if grep -qiE 'spawn\.env|DATABASE_URL' "$conf"; then
+        printf 'deploy: precheck failed: drop-in %s references spawn.env or DATABASE_URL\n' "$conf" >&2
+        bad=1
+      fi
+    done
+    shopt -u nullglob
+  done
+  if [ -f "$units_dir/spawn-node-out.service" ]; then
+    if ! grep -qE '^[[:space:]]*LoadCredential=typesafe\.api-key:/run/keep/typesafe\.api-key[[:space:]]*$' "$units_dir/spawn-node-out.service"; then
+      printf 'deploy: precheck failed: %s/spawn-node-out.service missing LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key\n' "$units_dir" >&2
+      bad=1
+    fi
+    if ! grep -qE '^[[:space:]]*RestartPreventExitStatus=243[[:space:]]+78[[:space:]]*$' "$units_dir/spawn-node-out.service"; then
+      printf 'deploy: precheck failed: %s/spawn-node-out.service missing RestartPreventExitStatus=243 78\n' "$units_dir" >&2
+      bad=1
+    fi
+  fi
+  [ "$bad" -eq 0 ] || return 1
+  say "phase2 cutover precheck ok (spawn-node: $node_bin; units: $units_dir)"
+  return 0
+}
+
+wait_for_core_sock() {
+  local sock_path=$1 timeout_secs=$2 max_attempts elapsed=0
+  max_attempts=$((timeout_secs * 5))
+  while [ "$elapsed" -le "$max_attempts" ]; do
+    [ -S "$sock_path" ] && return 0
+    [ "$elapsed" -lt "$max_attempts" ] || break
+    sleep 0.2
+    elapsed=$((elapsed + 1))
+  done
+  return 1
+}
+
+phase2_stopped=0
+stop_phase2_units_if_active() {
+  local u
+  phase2_stopped=0
+  for u in spawn-node-edge.service spawn-node-gw.service spawn-node-out.service spawn-core.service; do
+    if systemctl --user is-active --quiet "$u"; then
+      say "stopping active Phase 2 unit $u before legacy restart"
+      systemctl --user stop "$u"
+      phase2_stopped=1
+    fi
+  done
+}
+
+restart_legacy_rollback_units() {
+  local u rc
+  for u in spawn-node-gateway.service spawn-jev-relay.service spawn-jev-relay.path; do
+    rc=0
+    systemctl --user restart "$u" || rc=$?
+    case $rc in
+    0) say "restarted legacy unit $u" ;;
+    5) say "legacy unit $u is not installed (skipped on rollback)" ;;
+    *) return "$rc" ;;
+    esac
+  done
+}
+
+restart_legacy() {
+  stop_phase2_units_if_active
+  systemctl --user restart spawn-loop spawn-integrate spawn-serve
+  if [ "$phase2_stopped" = 1 ]; then
+    restart_legacy_rollback_units
+  fi
+}
+
+restart_go_uds() {
+  local runtime_dir core_sock legacy_u p2_u
+  runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+  core_sock=${SPAWN_CORE_SOCK:-$runtime_dir/spawn/core.sock}
+  say "phase2 cutover: starting spawn-core.service and waiting for $core_sock (timeout ${core_sock_timeout_secs}s)"
+  systemctl --user restart spawn-core.service
+  if ! wait_for_core_sock "$core_sock" "$core_sock_timeout_secs"; then
+    if [ "${stopped-0}" = 1 ]; then
+      systemctl --user restart spawn-loop spawn-integrate ||
+        printf 'deploy: warning: could not restart spawn-loop/spawn-integrate after core.sock timeout\n' >&2
+      stopped=0
+    fi
+    die "phase2 cutover aborted: core.sock ($core_sock) did not become ready within ${core_sock_timeout_secs}s; legacy units were left untouched"
+  fi
+  for legacy_u in spawn-serve.service spawn-node-gateway.service spawn-jev-relay.path spawn-jev-relay.service; do
+    if systemctl --user is-active --quiet "$legacy_u"; then
+      say "phase2 cutover: stopping legacy unit $legacy_u"
+      systemctl --user stop "$legacy_u"
+    fi
+  done
+  systemctl --user restart spawn-node-edge.service spawn-node-gw.service spawn-node-out.service
+  systemctl --user restart spawn-loop spawn-integrate
+  for p2_u in spawn-core.service spawn-node-edge.service spawn-node-gw.service spawn-node-out.service; do
+    systemctl --user is-active --quiet "$p2_u" ||
+      die "phase2 cutover failed: $p2_u is not active after restart"
+  done
+}
+
+restart() {
+  case $edge_mode in
+  legacy) restart_legacy ;;
+  go-uds) restart_go_uds ;;
+  *) die "invalid SPAWN_DEPLOY_EDGE_MODE '$edge_mode'" ;;
+  esac
+}
+
+sync_units_for_deploy() {
+  SPAWN_DEPLOY_EDGE_MODE="$edge_mode" bash "$repo/deploy/sync-units.sh" --apply "$1"
+}
+
+validate_edge_mode
+if [ "${1-}" = --check-phase2-cutover ]; then
+  shift
+  [ $# -le 1 ] || die "usage: deploy/deploy.sh --check-phase2-cutover [<units-dir>]"
+  check_phase2_cutover "${1-}" || exit 1
+  exit 0
+fi
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
 
 # The drain's bound (header, "Draining"), checked before anything is done.
 [[ $drain_secs =~ ^[1-9][0-9]*$ ]] && [ "${#drain_secs}" -le 5 ] && [ "$drain_secs" -le 86400 ] ||
@@ -403,7 +578,11 @@ on_exit() {
   if [ "$status" -ne 0 ] && [ "$stopped" = 1 ]; then
     printf "deploy: failed (exit %s); restarting the services\n" "$status" >&2
     [ "$completing_at_start" = 1 ] || (complete_pending) || printf "deploy: the pending deploy is not complete: %s\n" "$pending" >&2
-    restart || printf "deploy: the restart failed too: systemctl --user status spawn-integrate\n" >&2
+    if [ "$edge_mode" = go-uds ]; then
+      systemctl --user restart spawn-loop spawn-integrate || printf "deploy: the restart failed too: systemctl --user status spawn-integrate\n" >&2
+    else
+      restart || printf "deploy: the restart failed too: systemctl --user status spawn-integrate\n" >&2
+    fi
   fi
   release_hold
   record_finished "$status"
@@ -459,14 +638,21 @@ for dir in "${TMPDIR:-/tmp}" "$target"; do
     die "$dir has ${free} GB free, the deploy needs $min_free_gb (SPAWN_DEPLOY_MIN_FREE_GB): free some space first"
 done
 
-# The mirror (header, "The mirror"): the environment's value, an empty one
-# too, before spawn.env's.
+# The mirror (header, "The mirror") and edge mode: the environment's value,
+# an empty one too, before spawn.env's.
 mirror_env=${SPAWN_DEPLOY_MIRROR+set} mirror=${SPAWN_DEPLOY_MIRROR-}
+edge_mode_env=${SPAWN_DEPLOY_EDGE_MODE+set} edge_mode=${SPAWN_DEPLOY_EDGE_MODE:-legacy}
 set -a
 # shellcheck disable=SC1091
 . "$live/spawn.env"
 set +a
 [ -n "$mirror_env" ] || mirror=${SPAWN_DEPLOY_MIRROR-}
+[ -n "$edge_mode_env" ] || edge_mode=${SPAWN_DEPLOY_EDGE_MODE:-legacy}
+validate_edge_mode
+if [ "$edge_mode" = go-uds ]; then
+  check_phase2_cutover "${SPAWN_DEPLOY_UNITS_DIR:-$repo/deploy/systemd}" ||
+    die "phase2 cutover precheck failed before backup; nothing was deployed and no service was touched"
+fi
 
 # mirror_credential <url>: the URL carries a credential (header, "The
 # mirror"): an http(s) URL with any user part, any other <scheme>:// URL
@@ -504,8 +690,6 @@ if [ -n "$mirror" ]; then
       die "the mirror $mirror (SPAWN_DEPLOY_MIRROR) is pushed to a URL that carries a credential (not printed; see remote.*.url, remote.*.pushurl and url.*.insteadOf in git's configuration); nothing was deployed: $mirror_fix"
   done <<<"$mirror_urls"
 fi
-
-restart() { systemctl --user restart spawn-loop spawn-integrate spawn-serve; }
 
 # units_supported: the installed binary runs its gates in systemd user units
 # of their own (gate v2 step 2; its startup line names them, read from the
@@ -745,8 +929,12 @@ if [ "$old" != "$head" ]; then
 fi
 # The units (step 7), from the controller just switched to HEAD's, before
 # the services restart on them.
+if [ "$edge_mode" = go-uds ]; then
+  check_phase2_cutover "$live/controllers/spawn/deploy/systemd" ||
+    die "the deploy is live at $head, but deployed Phase 2 units failed cutover precheck"
+fi
 units_status=0
-units_out=$(bash "$repo/deploy/sync-units.sh" --apply "$live/controllers/spawn/deploy/systemd") || units_status=$?
+units_out=$(SPAWN_DEPLOY_EDGE_MODE="$edge_mode" bash "$repo/deploy/sync-units.sh" --apply "$live/controllers/spawn/deploy/systemd") || units_status=$?
 [ -z "$units_out" ] || printf '%s\n' "$units_out" | sed 's/^/deploy: /'
 [ "$units_status" = 0 ] ||
   die "the deploy is live at $head, but its systemd units are not all installed (above): deploy/sync-units.sh --check"
@@ -938,11 +1126,13 @@ relays_failed=0
 for relay in jev-relay model-relay; do
   what=$relay.py
   if cmp -s "$export_dir/scripts/$relay.py" "$live/bin/$relay.py"; then
+    [ "$edge_mode" != go-uds ] || [ "$relay" != jev-relay ] || continue
     grep -qxF "units: installed spawn-$relay.service" <<<"$units_out" || continue
     what="its unit spawn-$relay.service"
   else
     install -m 755 "$export_dir/scripts/$relay.py" "$live/bin/$relay.py"
   fi
+  [ "$edge_mode" != go-uds ] || [ "$relay" != jev-relay ] || continue
   relay_status=0
   systemctl --user try-restart "spawn-$relay" || relay_status=$?
   case $relay_status in
@@ -957,13 +1147,16 @@ for relay in jev-relay model-relay; do
 done
 # The node gateway runs from $live/bin too: restarted only when its binary
 # (install_build) or its unit (step 7) changed, never with the services
-# above. A host that has not installed its unit (systemctl exit 5) keeps the
-# binary and restarts nothing.
+# above (and skipped when SPAWN_DEPLOY_EDGE_MODE=go-uds, where spawn-node-gw
+# serves :18096). A host that has not installed its unit (systemctl exit 5)
+# keeps the binary and restarts nothing.
 gw_what=""
-if [ "$gateway_changed" = 1 ]; then
-  gw_what=spawn-node-gateway
-elif grep -qxF "units: installed spawn-node-gateway.service" <<<"$units_out"; then
-  gw_what="its unit spawn-node-gateway.service"
+if [ "$edge_mode" = legacy ]; then
+  if [ "$gateway_changed" = 1 ]; then
+    gw_what=spawn-node-gateway
+  elif grep -qxF "units: installed spawn-node-gateway.service" <<<"$units_out"; then
+    gw_what="its unit spawn-node-gateway.service"
+  fi
 fi
 if [ -n "$gw_what" ]; then
   gw_status=0
