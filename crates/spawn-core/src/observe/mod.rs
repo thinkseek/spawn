@@ -34,11 +34,11 @@ pub use judge::{JudgeError, JudgeInput, Judgement, StateJudge, TurnFact};
 pub use observer::{NO_JUDGE, ObservationContext, Observer};
 
 /// A live execution with no open tool and no fact for this long is ambiguous.
-pub const QUIET_AFTER: Duration = Duration::from_mins(2);
+pub(crate) const QUIET_AFTER: Duration = Duration::from_mins(2);
 
 /// A live session is classified again this often when no fact arrives, so a
 /// silent hang is noticed.
-pub const RECHECK_EVERY: Duration = Duration::from_secs(30);
+pub(crate) const RECHECK_EVERY: Duration = Duration::from_secs(30);
 
 /// A session with no new fact for this long has settled: if its latest
 /// observation is older than its latest fact, the verdict on its facts is
@@ -48,21 +48,21 @@ pub const SETTLE: Duration = Duration::from_secs(2);
 
 /// A tool open this long with no progress of the engine (no transcript
 /// fact; a busy screen read again is none) is ambiguous: it may hang.
-pub const LONG_TOOL: Duration = Duration::from_mins(10);
+pub(crate) const LONG_TOOL: Duration = Duration::from_mins(10);
 
 /// A busy screen reading older than this no longer proves work: the screen is
 /// read only when a command runs, so a hang would keep it forever.
-pub const SCREEN_STALE: Duration = QUIET_AFTER;
+pub(crate) const SCREEN_STALE: Duration = QUIET_AFTER;
 
 /// First pause before asking an unavailable judge again; doubles per failure.
-pub const RETRY_BASE: Duration = Duration::from_secs(30);
+pub(crate) const RETRY_BASE: Duration = Duration::from_secs(30);
 
 /// Longest pause between retries of an unavailable judge.
 pub const RETRY_MAX: Duration = Duration::from_mins(10);
 
 /// Without a distribution, below this confidence a model judgement asks for
 /// attention.
-pub const CONFIDENT: f64 = 0.6;
+pub(crate) const CONFIDENT: f64 = 0.6;
 
 /// At or above this probability `needs_human` or `stuck` asks for attention.
 pub const LIKELY: f64 = 0.5;

@@ -102,7 +102,7 @@ impl ModelProfile {
 
     /// The default profile, which a record leaves out.
     #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
-    pub fn is_default(&self) -> bool {
+    fn is_default(&self) -> bool {
         *self == Self::Default
     }
 }
@@ -333,7 +333,7 @@ pub enum JobEnd {
 
 impl JobEnd {
     /// The end a task notification's `<status>` names.
-    pub fn from_status(status: &str) -> Self {
+    pub(crate) fn from_status(status: &str) -> Self {
         match status.trim() {
             "completed" => Self::Completed,
             "failed" => Self::Failed,
@@ -389,7 +389,7 @@ pub enum EventKind {
     #[serde(rename = "message.received")]
     MessageReceived,
     /// The Bridge typed a command's text with its marker
-    /// ([`crate::bridge::message_marker`]): the command is a message whose
+    /// (`message_marker`): the command is a message whose
     /// taking the transcript says. Written after the text is staged and
     /// before its `typing` step, keyed `cmd_<id>:message`, and only by a
     /// Bridge that types the marker: a command typed by an older Spawn has
@@ -850,7 +850,7 @@ impl EventKind {
     }
 
     /// Checkpoint the Bridge must take after this event, if any.
-    pub fn checkpoint_reason(&self) -> Option<CheckpointReason> {
+    pub(crate) fn checkpoint_reason(&self) -> Option<CheckpointReason> {
         match self {
             Self::ToolCompleted { .. } | Self::ToolFailed { .. } => {
                 Some(CheckpointReason::ToolCompleted)

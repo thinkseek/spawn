@@ -30,8 +30,11 @@ use crate::mission::TaskState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GradeWire {
+    /// Entry-level deterministic tier (`"l1"`, rank `1`).
     L1 = 1,
+    /// Standard mainline tier (`"l2"`, rank `2`).
     L2 = 2,
+    /// Strategic decision / highest-capability tier (`"l3"`, rank `3`).
     L3 = 3,
 }
 
@@ -53,7 +56,7 @@ impl GradeWire {
     }
 
     /// Parse either `"l1".."l3"` or historical numeric `"1".."3"`.
-    pub fn parse_wire(raw: &str) -> Option<Self> {
+    fn parse_wire(raw: &str) -> Option<Self> {
         match raw {
             "l1" | "1" => Some(Self::L1),
             "l2" | "2" => Some(Self::L2),
@@ -135,7 +138,9 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
+    /// Persistent named resident worker holding charter state across tasks.
     Resident,
+    /// Single-task ephemeral worker spawned for one assignment.
     Ephemeral,
 }
 
@@ -153,7 +158,9 @@ impl TaskKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MissionCloseState {
+    /// Mission completed cleanly (`done`).
     Done,
+    /// Mission abandoned or cancelled (`dropped`).
     Dropped,
 }
 
@@ -161,8 +168,10 @@ pub enum MissionCloseState {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcceptMode {
+    /// Accepted by human/coordinator review before landing.
     #[default]
     Review,
+    /// Requires integrator gate acceptance and landing onto base branch.
     Gate,
 }
 
@@ -170,13 +179,21 @@ pub enum AcceptMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GateVerdict {
+    /// Gate scenarios passed and commit is eligible to land.
     Accepted,
+    /// Code/behavior checks failed (`code` fault).
     Rejected,
+    /// Rebase or merge conflict against current main (`code` fault).
     Conflict,
+    /// Candidate head incompatible with baseline (`code` fault).
     Incompatible,
+    /// Gate run was aborted before reaching a code verdict (`infrastructure` fault).
     Aborted,
+    /// Candidate became obsolete before gate completion (`superseded`).
     Stale,
+    /// Host ran out of disk or temporary workspace capacity (`infrastructure` fault).
     NoRoom,
+    /// Gate runner or host infrastructure failed (`infrastructure` fault).
     HostFault,
 }
 
@@ -196,7 +213,7 @@ impl GateVerdict {
     }
 
     /// Verdict class pinned by `spawn_integrator_record` (`schema.sql`).
-    pub const fn expected_class(self) -> GateVerdictClass {
+    const fn expected_class(self) -> GateVerdictClass {
         match self {
             Self::Accepted | Self::Rejected | Self::Conflict | Self::Incompatible => {
                 GateVerdictClass::Code
@@ -211,18 +228,24 @@ impl GateVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GateVerdictClass {
+    /// Verdict reflects the submitted code change itself.
     Code,
+    /// Verdict reflects runner, host, or storage infrastructure conditions.
     Infrastructure,
+    /// Submission was superseded by newer state on main or a newer task.
     Superseded,
 }
 
 /// Reason category for `objective.retired`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ObjectiveRetireKind {
+    /// Objective was already fulfilled on `main`.
     #[serde(rename = "on-main")]
     OnMain,
+    /// Objective was merged/renumbered into another objective ID.
     #[serde(rename = "renumbered")]
     Renumbered,
+    /// Objective is no longer relevant or applicable.
     #[serde(rename = "obsolete")]
     Obsolete,
 }
@@ -231,7 +254,9 @@ pub enum ObjectiveRetireKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationResult {
+    /// Live environment verification succeeded.
     Pass,
+    /// Live environment verification failed.
     Fail,
 }
 
@@ -239,7 +264,9 @@ pub enum VerificationResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeployBy {
+    /// Automated post-landing deploy pipeline.
     Landing,
+    /// Manual deploy initiated by the operator/owner.
     Owner,
 }
 
@@ -247,9 +274,13 @@ pub enum DeployBy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlertVerdict {
+    /// Alert accurately identified a real problem.
     Right,
+    /// Alert was a false positive.
     False,
+    /// Alert described a condition already resolved before review.
     Stale,
+    /// Alert duplicated an existing active alert.
     Duplicate,
 }
 
@@ -257,7 +288,9 @@ pub enum AlertVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostDiskState {
+    /// Free disk bytes crossed below configured warning/floor threshold.
     Low,
+    /// Free disk bytes recovered above thresholds.
     Recovered,
 }
 
@@ -265,7 +298,9 @@ pub enum HostDiskState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostJudgeState {
+    /// Semantic judge endpoint failed calls and transitioned down.
     Down,
+    /// Semantic judge endpoint resumed healthy responses.
     Up,
 }
 
@@ -273,19 +308,33 @@ pub enum HostJudgeState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterruptionCause {
+    /// Engine process exited normally or unexpectedly mid-task.
     Exited,
+    /// Engine process crashed or terminated with fatal signal.
     Crashed,
+    /// Engine execution hit cgroup/host memory limit.
     MemoryLimit,
+    /// Engine context window was exhausted.
     ContextExhausted,
+    /// Configured model endpoint was unavailable.
     ModelUnavailable,
+    /// Engine authentication credentials expired or were rejected.
     ModelAuth,
+    /// Model provider returned a runtime API error.
     ModelError,
+    /// Host or daemon restarted underneath running executions.
     HostRestart,
+    /// Backing PostgreSQL database was unavailable.
     DatabaseUnavailable,
+    /// Host disk or temporary volume filled up.
     DiskFull,
+    /// Task reached budget or elapsed-time limit.
     Budget,
+    /// Operator or loop stopped the execution.
     Stopped,
+    /// Execution was explicitly restarted.
     Restarted,
+    /// Task was reassigned to another worker.
     Reassigned,
 }
 
@@ -293,9 +342,13 @@ pub enum InterruptionCause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryPath {
+    /// Resume the existing native session cleanly.
     Resume,
+    /// Hand off work into a fresh session/continuation.
     Handoff,
+    /// Hold and wait for external/human remediation before retrying.
     Wait,
+    /// Terminal state with no automatic recovery.
     Final,
 }
 
@@ -303,17 +356,22 @@ pub enum RecoveryPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackupArea {
+    /// Archived native session transcripts directory.
     Transcripts,
+    /// Session snapshots and metadata directory.
     Sessions,
 }
 
 /// Table imported by `legacy.imported`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LegacyTable {
+    /// Imported `mission_missions` row.
     #[serde(rename = "mission_missions")]
     MissionMissions,
+    /// Imported `mission_residents` row.
     #[serde(rename = "mission_residents")]
     MissionResidents,
+    /// Imported `mission_tasks` row.
     #[serde(rename = "mission_tasks")]
     MissionTasks,
 }
@@ -321,18 +379,40 @@ pub enum LegacyTable {
 /// Error returned when parsing or strictly validating a control/grading record.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ControlRecordError {
+    /// Input JSON value was not an object.
     #[error("control record must be a JSON object")]
     NotAnObject,
+    /// JSON object lacked a string `"type"` field.
     #[error("control record is missing string field `type`")]
     MissingType,
+    /// `"type"` named a record kind unknown to this schema version.
     #[error("unknown control record type `{0}`")]
     UnknownKind(String),
+    /// Typed serde decoding failed for the identified record kind.
     #[error("invalid payload for `{kind}`: {message}")]
-    Deserialize { kind: String, message: String },
+    Deserialize {
+        /// Parsed `"type"` name.
+        kind: String,
+        /// Serde error explanation.
+        message: String,
+    },
+    /// Decoded record violated a SQL/domain invariant under strict parsing.
     #[error("invariant violation for `{kind}`: {message}")]
-    Invariant { kind: String, message: String },
+    Invariant {
+        /// Parsed `"type"` name.
+        kind: String,
+        /// Violated invariant description.
+        message: String,
+    },
+    /// Closed-schema record carried unknown keys in strict mode.
     #[error("unexpected extra fields for fixed-schema `{kind}`: {fields:?}")]
-    UnexpectedFields { kind: String, fields: Vec<String> },
+    UnexpectedFields {
+        /// Parsed `"type"` name.
+        kind: String,
+        /// Sorted unexpected top-level field keys.
+        fields: Vec<String>,
+    },
+    /// Failed to serialize a control/grading record back to JSON.
     #[error("failed to serialize control record: {0}")]
     Serialize(String),
 }
@@ -341,934 +421,1408 @@ pub enum ControlRecordError {
 // ControlRecord payloads (67 variants)
 // ---------------------------------------------------------------------------
 
+/// Payload for `mission.added`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MissionAddedRecord {
+    /// Assigned mission ID.
     pub id: i64,
+    /// Mission goal text.
     pub text: String,
+    /// Optional origin caller or source label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Source repository names attached to the mission.
     #[serde(default)]
     pub sources: Vec<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `mission.configured`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MissionConfiguredRecord {
+    /// Mission ID being configured.
     pub id: i64,
+    /// Optional gate script or configuration path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
+    /// Optional acceptance mode (`review` or `gate`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accept: Option<AcceptMode>,
+    /// Optional JSON budget configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<Value>,
+    /// Optional structured objectives JSON specification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objectives: Option<Value>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `mission.closed`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MissionClosedRecord {
+    /// Mission ID being closed.
     pub id: i64,
+    /// Terminal mission state (`done` or `dropped`).
     pub state: MissionCloseState,
+    /// Optional closure summary text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `mission.halted`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MissionHaltedRecord {
+    /// Mission ID that halted.
     pub id: i64,
+    /// Optional halt reason message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Optional machine-readable halt cause.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
+    /// Optional source repository implicated in the halt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Optional previous head commit/ref on `source`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// Optional new head commit/ref on `source`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// Optional branches/items reported missing or gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gone: Option<Vec<String>>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `mission.resumed`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MissionResumedRecord {
+    /// Mission ID being resumed.
     pub id: i64,
+    /// Optional actor resuming the mission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    /// Optional halt event sequence ID cleared by this resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt: Option<i64>,
+    /// Optional idempotency/alert key cleared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `mission.paused`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MissionPausedRecord {
+    /// Mission ID being paused.
     pub id: i64,
+    /// Optional human-readable pause reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `mission.unpaused`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MissionUnpausedRecord {
+    /// Mission ID being unpaused.
     pub id: i64,
+    /// Optional sequence ID of the prior pause event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_event: Option<i64>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.assigned`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskAssignedRecord {
+    /// Assigned task ID.
     pub id: i64,
+    /// Parent mission ID.
     pub mission_id: i64,
+    /// Worker kind (`resident` or `ephemeral`).
     pub kind: TaskKind,
+    /// Assigned agent identifier.
     pub agent_id: String,
+    /// Spawn session identifier assigned to run the task.
     pub session_id: String,
+    /// Task brief text.
     pub brief: String,
+    /// Optional requested model profile wire string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Optional creator/assigner label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
+    /// Optional numeric objective index within the mission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objective: Option<i32>,
+    /// Optional scenario name targeted by this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenario: Option<String>,
+    /// Optional prior task ID if this task reissues an earlier one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reissue_of: Option<i64>,
+    /// Optional prior task ID whose branch/work this task continues.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continues: Option<i64>,
+    /// Optional prior task ID reassigned onto this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reassign_of: Option<i64>,
+    /// Optional task ID this assignment duplicates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duplicate_of: Option<i64>,
+    /// Whether this task is pinned against automatic reassignment/stealing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned: Option<bool>,
+    /// Classified or explicitly assigned task difficulty rank.
     #[serde(
         default,
         deserialize_with = "deserialize_opt_grade_wire",
         skip_serializing_if = "Option::is_none"
     )]
     pub difficulty: Option<GradeWire>,
+    /// Routing preset ID chosen for this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset_id: Option<String>,
+    /// Initial preset ID first assigned to the task (calibration attribution).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_preset_id: Option<String>,
+    /// Cumulative quality rejection count carried onto the task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality_rejections: Option<u32>,
+    /// Optional execution profile name carried from the preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_profile: Option<String>,
+    /// Optional structured difficulty classification metadata JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classification: Option<Value>,
+    /// Optional engine label from the routed preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
+    /// Optional model label from the routed preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_label: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.delivered`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskDeliveredRecord {
+    /// Task ID whose assignment command was delivered.
     pub id: i64,
+    /// Delivered command ID.
     pub command_id: i64,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.reported`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskReportedRecord {
+    /// Task ID being reported.
     pub id: i64,
+    /// Structured or textual completion report submitted by the worker.
     pub report: String,
+    /// Optional candidate commit SHA associated with the report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.report_unfinished`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskReportUnfinishedRecord {
+    /// Task ID whose report had unfinished markers.
     pub id: i64,
+    /// Report revision rejected by the unfinished-marker check.
     pub revision: u32,
+    /// Digest of the rejected report text.
     pub digest: String,
+    /// Detected unfinished-marker evidence JSON.
     pub markers: Value,
+    /// Feedback note sent back to the worker.
     pub note: String,
+    /// Command ID used to deliver the feedback note.
     pub command_id: i64,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.fork_failed`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskForkFailedRecord {
+    /// New task ID whose workspace fork failed.
     pub id: i64,
+    /// Prior task ID from which the fork was attempted.
     pub from: i64,
+    /// Base commit SHA that failed to check out/fork.
     pub commit: String,
+    /// Error description from the workspace adapter.
     pub error: String,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.reviewed`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskReviewedRecord {
+    /// Reviewed task ID.
     pub id: i64,
+    /// Whether the review accepted (`true`) or sent the task back (`false`).
     pub accepted: bool,
+    /// Optional reviewer feedback note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Optional report revision targeted by this review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u32>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.rerouted`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskReroutedRecord {
+    /// Rerouted task ID.
     pub id: i64,
+    /// Newly selected preset identifier.
     pub preset_id: String,
+    /// Model profile string selected by the reroute.
     pub model: String,
+    /// Previous preset identifier replaced by `preset_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_preset_id: Option<String>,
+    /// Optional report revision triggering the reroute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u32>,
+    /// Stepped difficulty rank routed at.
     #[serde(
         default,
         deserialize_with = "deserialize_opt_grade_wire",
         skip_serializing_if = "Option::is_none"
     )]
     pub routed_difficulty: Option<GradeWire>,
+    /// Optional execution profile selected with the new preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_profile: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.restarted`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskRestartedRecord {
     /// SQL `spawn_task_restart_as` writes `task` (not `id`).
     pub task: i64,
+    /// Target Spawn session identifier.
     pub session_id: String,
+    /// Agent identifier restarted for this task.
     pub agent_id: String,
+    /// Optional new execution identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
+    /// Optional actor that initiated the restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    /// Optional restart reason text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Optional restart sequence counter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n: Option<u64>,
+    /// Optional alert or idempotency key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.cancelled`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskCancelledRecord {
+    /// Cancelled task ID.
     pub id: i64,
+    /// Optional actor cancelling the task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    /// Optional cancellation reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Optional follow-up task ID that reissued this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reissued_as: Option<i64>,
+    /// Optional follow-up task ID that reassigned this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reassigned_as: Option<i64>,
+    /// Optional recorded attempt diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempts: Option<Vec<Value>>,
+    /// Whether cancellation followed explicit worker yield/exhaustion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yielded: Option<bool>,
+    /// Optional objective number marked solved prior to closure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub solved: Option<i64>,
+    /// Optional idempotency/alert key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.stolen`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskStolenRecord {
+    /// Task ID stolen from another queued worker.
     pub id: i64,
+    /// Previous worker session ID.
     pub from_session: String,
+    /// Previous worker agent ID.
     pub from_agent: String,
+    /// New worker session ID.
     pub to_session: String,
+    /// New worker agent ID.
     pub to_agent: String,
+    /// Optional worker pool name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
+    /// Actor/subsystem executing the work steal.
     pub by: String,
+    /// Optional reason for stealing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Epoch milliseconds since the task sat queued on the previous worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_since_ms: Option<i64>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.aborted`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskAbortedRecord {
+    /// Aborted task ID.
     pub id: i64,
+    /// Optional abort reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Optional judging identifier if aborted after judge escalation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judging: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.over_budget`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskOverBudgetRecord {
+    /// Task ID that exceeded its configured budget.
     pub id: i64,
+    /// Budget limit reason (`tool_calls`, `elapsed_ms`, etc.).
     pub reason: String,
+    /// Observed tool call count when halted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<u64>,
+    /// Observed elapsed execution time in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<i64>,
+    /// Configured budget JSON object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<Value>,
+    /// Retained branch name carrying partial work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Retained commit SHA on `branch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.gated`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskGatedRecord {
+    /// Gated task ID.
     pub id: i64,
+    /// Gate outcome verdict.
     pub verdict: GateVerdict,
+    /// Optional report revision tested by this gate run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u32>,
+    /// Optional verdict classification (`code`, `infrastructure`, `superseded`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<GateVerdictClass>,
+    /// Baseline commit SHA used by the gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// Candidate commit SHA tested by the gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate: Option<String>,
+    /// Path or reference to the gate runner log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
+    /// Numeric or summary metric string emitted by the gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metric: Option<String>,
+    /// Human/gate summary note explaining rejection or failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Optional judging identifier if judge assisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judging: Option<String>,
+    /// Optional structured evidence excerpt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// Retry backoff duration in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_ms: Option<i64>,
+    /// Next retry due timestamp in Unix epoch milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_ms: Option<i64>,
+    /// Whether this gate failure escalated the task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalate: Option<bool>,
+    /// Whether this gate failure raised an operator alert.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alert: Option<bool>,
+    /// Count of scenarios executed in the gate run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenarios: Option<u32>,
+    /// Names of scenarios executed in the gate run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenario_names: Option<Vec<String>>,
+    /// Remote ref or push outcome note when gate pushed results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pushed: Option<String>,
+    /// Whether the candidate was parked on failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parked: Option<bool>,
+    /// Sensitive paths or rules flagged during gating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sensitive: Option<Vec<String>>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.shadow_gated`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskShadowGatedRecord {
+    /// Gated task ID.
     pub id: i64,
+    /// Shadow gate runner identifier.
     pub runner: String,
+    /// Optional report revision tested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u32>,
+    /// Verdict produced by the shadow runner, if completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<GateVerdict>,
+    /// Input parameters passed to the shadow runner.
     pub inputs: Value,
+    /// Per-field diffs against primary gate results.
     #[serde(default)]
     pub unequal: Vec<Value>,
+    /// Whether shadow verdict agreed with primary verdict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agrees: Option<bool>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.held`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskHeldRecord {
+    /// Task ID placed on hold.
     pub id: i64,
+    /// Source hold ID blocking landing.
     pub hold: i64,
+    /// Source repository name under hold.
     pub source: String,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.released`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskReleasedRecord {
+    /// Task ID released from hold.
     pub id: i64,
+    /// Actor releasing the task.
     pub by: String,
+    /// Human-readable release reason.
     pub reason: String,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `task.landed`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskLandedRecord {
+    /// Landed task ID.
     pub id: i64,
+    /// Previous target branch commit before landing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// New target branch commit after landing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// Mission IDs advanced by this landing.
     #[serde(
         default,
         deserialize_with = "deserialize_opt_vec_i64",
         skip_serializing_if = "Option::is_none"
     )]
     pub missions: Option<Vec<i64>>,
+    /// Optional judging identifier if judge intervened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judging: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `resident.proposed`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResidentProposedRecord {
+    /// Proposed resident name.
     pub name: String,
+    /// Resident charter markdown/text specification.
     pub charter: String,
+    /// Optional actor proposing the resident.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposed_by: Option<String>,
+    /// Optional worker pool name assigned to the resident.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `resident.approved` and `resident.retired`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResidentNamedRecord {
+    /// Resident worker name.
     pub name: String,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `objective.solved`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObjectiveSolvedRecord {
+    /// Mission ID owning the solved objective.
     pub id: i64,
+    /// Numeric objective index within the mission.
     pub objective: i32,
+    /// Optional task ID whose gate proved the objective.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<i64>,
+    /// Scenario path/name that passed verification.
     pub scenario: String,
+    /// Base commit SHA on which the scenario ran.
     pub base: String,
+    /// Optional verification log path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `objective.verified`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObjectiveVerifiedRecord {
+    /// Mission ID owning the objective.
     pub mission: i64,
+    /// Numeric objective index within the mission.
     pub objective: i32,
+    /// Actor recording live verification.
     pub by: String,
+    /// Description of how the objective was verified.
     pub how: String,
+    /// Verification verdict (`pass` or `fail`).
     pub result: VerificationResult,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `objective.retired`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObjectiveRetiredRecord {
+    /// Mission ID owning the retired objective.
     pub id: i64,
+    /// Numeric objective index retired.
     pub objective: i32,
+    /// Retirement classification (`on-main`, `renumbered`, `obsolete`).
     pub kind: ObjectiveRetireKind,
+    /// Actor retiring the objective.
     pub by: String,
+    /// Explanation for retiring the objective.
     pub reason: String,
+    /// Optional CLI/subsystem caller identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `source.moved`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceMovedRecord {
+    /// Source repository name.
     pub source: String,
+    /// Previous `main` commit SHA.
     pub from: String,
+    /// New `main` commit SHA.
     pub to: String,
+    /// Optional actor moving the source head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    /// Optional source push request ID fulfilled by this move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<i64>,
+    /// Mission IDs notified/updated by this source move.
     #[serde(
         default,
         deserialize_with = "deserialize_opt_vec_i64",
         skip_serializing_if = "Option::is_none"
     )]
     pub missions: Option<Vec<i64>>,
+    /// Mission IDs cleared to green by this move.
     #[serde(
         default,
         deserialize_with = "deserialize_opt_vec_i64",
         skip_serializing_if = "Option::is_none"
     )]
     pub clear: Option<Vec<i64>>,
+    /// Mission IDs recorded without an active baseline.
     #[serde(
         default,
         deserialize_with = "deserialize_opt_vec_i64",
         skip_serializing_if = "Option::is_none"
     )]
     pub without_baseline: Option<Vec<i64>>,
+    /// Optional judging identifier if judge assisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judging: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `source.held`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceHeldRecord {
+    /// Source repository name placed on hold.
     pub source: String,
+    /// Mainline commit SHA pinned when the hold was taken.
     pub main: String,
+    /// Actor holding the source.
     pub by: String,
+    /// Hold lease duration in seconds.
     pub bound_s: u64,
+    /// Hold expiration timestamp in Unix epoch milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_ms: Option<i64>,
+    /// Prior hold ID renewed by this record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renews: Option<i64>,
+    /// Optional hold rationale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `source.released`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceReleasedRecord {
+    /// Source repository name released from hold.
     pub source: String,
+    /// Released hold ID.
     pub hold: i64,
+    /// Optional actor releasing the hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `source.hold_expired`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceHoldExpiredRecord {
+    /// Source repository whose hold expired.
     pub source: String,
+    /// Expired hold ID.
     pub hold: i64,
+    /// Expiration timestamp in Unix epoch milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_ms: Option<i64>,
+    /// Task IDs unblocked when the hold expired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<Vec<i64>>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `source.push_requested`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourcePushRequestedRecord {
+    /// Target source repository name.
     pub source: String,
+    /// Candidate commit SHA requested for push.
     pub commit: String,
+    /// Target git ref (serialized as `"ref"`).
     #[serde(rename = "ref")]
     pub git_ref: String,
+    /// Optional actor requesting the push.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    /// Whether the push goes through integrator gating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated: Option<bool>,
+    /// Whether the push was flagged urgent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub urgent: Option<bool>,
+    /// Optional rationale for the push request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `source.push_refused`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourcePushRefusedRecord {
+    /// Push request ID that was refused.
     pub request: i64,
+    /// Refusal reason message.
     pub reason: String,
+    /// Optional source repository name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Optional commit SHA refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Optional judging identifier if judge assisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judging: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `source.push_no_verdict`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourcePushNoVerdictRecord {
+    /// Push request ID left without a verdict.
     pub request: i64,
+    /// Optional diagnostic reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Optional gate/push log path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
+    /// Optional judging identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judging: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `source.main_red`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceMainRedRecord {
+    /// Source repository whose `main` turned red.
     pub source: String,
+    /// Failing `main` commit SHA.
     pub main: String,
+    /// Scenario name that failed.
     pub scenario: String,
+    /// Structured scenario failure details.
     pub failures: Vec<Value>,
+    /// Remediation task ID created for the failure.
     pub task: i64,
+    /// Whether an operator alert was raised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alert: Option<bool>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `source.main_probe`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceMainProbeRecord {
+    /// Source repository probed.
     pub source: String,
+    /// Main commit SHA probed.
     pub main: String,
+    /// Task ID inspecting the red `main`.
     pub task: i64,
+    /// Probe execution timestamp in Unix epoch milliseconds.
     pub probe_ms: i64,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `source.main_green`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceMainGreenRecord {
+    /// Source repository whose `main` returned green.
     pub source: String,
+    /// Passing scenario name.
     pub scenario: String,
+    /// Optional commit SHA that passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main: Option<String>,
+    /// Timestamp since `main` became red before turning green (epoch ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since_ms: Option<i64>,
+    /// Earlier failing `main` commit SHA cleared by this green run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub red_main: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Parent/ancestor process entry recorded in [`IntegratorStartedRecord`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessAncestor {
+    /// Operating system process ID.
     pub pid: u64,
+    /// Process executable name (`comm`).
     pub comm: String,
 }
 
+/// Payload for `integrator.started`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntegratorStartedRecord {
+    /// Integrator daemon PID.
     pub pid: u64,
+    /// Parent process PID.
     pub ppid: u64,
+    /// Optional parent executable name.
     #[serde(default)]
     pub parent_comm: Option<String>,
+    /// Process ancestor chain captured at startup.
     pub ancestors: Vec<ProcessAncestor>,
+    /// Working directory of the integrator process.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Linux cgroup path, if readable.
     #[serde(default)]
     pub cgroup: Option<String>,
+    /// Gate script path configured for this integrator.
     pub gate: String,
+    /// Whether `gate` came from environment override rather than mission config.
     pub gate_from_env: bool,
+    /// Workspace store root directory.
     pub root: String,
+    /// Whether running single-shot (`--once`).
     pub once: bool,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `integrator.draining`, `integrator.drained`, and `integrator.drain_expired`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntegratorDrainRecord {
+    /// Drain timeout window in seconds.
     pub bound_s: u64,
+    /// Optional gate run IDs still active or drained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gates: Option<Vec<i64>>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `host.disk`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostDiskRecord {
+    /// Filesystem path checked.
     pub path: String,
+    /// Threshold crossing direction (`low` or `recovered`).
     pub state: HostDiskState,
+    /// Available bytes measured on the filesystem.
     pub free_bytes: u64,
+    /// Optional filesystem label (e.g. `root`, `tmp`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Configured warning threshold in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warn_bytes: Option<u64>,
+    /// Configured hard floor threshold in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_bytes: Option<u64>,
+    /// Optional human/diagnostic explanation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `host.storage`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostStorageRecord {
+    /// Total bytes across archived transcripts.
     pub archive_bytes: u64,
+    /// Total files across archived transcripts.
     pub archive_files: u64,
+    /// Total bytes across managed workspace project trees.
     pub projects_bytes: u64,
+    /// Total files across managed workspace project trees.
     pub projects_files: u64,
+    /// Optional PostgreSQL database size in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_bytes: Option<u64>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `host.core_lines`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostCoreLinesRecord {
+    /// Sampled core source-line metrics keyed by subsystem.
     pub values: BTreeMap<String, Value>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `host.storage_bytes`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostStorageBytesRecord {
+    /// Per-source storage byte breakdown keyed by source/area name.
     pub sources: BTreeMap<String, Value>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `host.judge`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostJudgeRecord {
+    /// Configured judge identifier/label.
     pub judge: String,
+    /// Judge availability state (`down` or `up`).
     pub state: HostJudgeState,
+    /// Optional last error string when state is `down`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Timestamp when judge failures began (epoch ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_failed_ms: Option<i64>,
+    /// Consecutive failed judge call count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_calls: Option<u64>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `host.messages_marked`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostMessagesMarkedRecord {
+    /// Baseline cutoff timestamp in Unix epoch milliseconds.
     pub started_at_ms: i64,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `host.loop_started`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostLoopStartedRecord {
+    /// Ephemeral boot identifier for the started host loop instance.
     pub boot_id: String,
+    /// Loop start timestamp in Unix epoch milliseconds.
     pub started_at_ms: i64,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `execution.interrupted`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionInterruptedRecord {
+    /// Agent identifier of the interrupted worker.
     pub agent_id: String,
+    /// Session identifier owning the execution.
     pub session_id: String,
+    /// Execution identifier that was interrupted.
     pub execution_id: String,
+    /// Categorized interruption cause.
     pub cause: InterruptionCause,
+    /// Recovery action selected for the interruption.
     pub path: RecoveryPath,
+    /// Recovery attempt counter (1-based).
     pub attempt: u64,
+    /// Structured evidence explaining the interruption.
     pub evidence: Value,
+    /// Next retry due timestamp in Unix epoch milliseconds, if scheduled.
     #[serde(default)]
     pub due_ms: Option<i64>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `execution.cleared`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionClearedRecord {
+    /// Execution identifier cleared after recovery.
     pub execution_id: String,
+    /// Session identifier owning the execution.
     pub session_id: String,
+    /// Optional interruption cause that had paused execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<InterruptionCause>,
+    /// Total duration spent waiting before clearance (ms).
     pub waited_ms: i64,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `alert.fired`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlertFiredRecord {
+    /// Unique deduplication key for the alert.
     pub key: String,
+    /// Alert category name.
     pub kind: String,
+    /// Target entity identifier/subject of the alert.
     pub subject: String,
+    /// Optional human-readable alert text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Whether this record is an informational notice rather than an active alert.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<bool>,
+    /// Optional structured evidence JSON payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Value>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `alert.updated`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlertUpdatedRecord {
+    /// Deduplication key of the updated alert.
     pub key: String,
+    /// Alert category name.
     pub kind: String,
+    /// Target entity identifier/subject of the alert.
     pub subject: String,
+    /// Updated human-readable alert description.
     pub text: String,
+    /// Optional updated evidence JSON payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Value>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `alert.judged`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlertJudgedRecord {
+    /// Deduplication key of the judged alert.
     pub key: String,
+    /// Operator verdict recorded against the alert.
     pub verdict: AlertVerdict,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `alert.cleared`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlertClearedRecord {
+    /// Deduplication key of the cleared alert.
     pub key: String,
+    /// Alert category name.
     pub kind: String,
+    /// Target entity identifier/subject of the alert.
     pub subject: String,
+    /// Optional structured clearance evidence JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Value>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `deploy.finished`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeployFinishedRecord {
+    /// Whether the deploy succeeded (`true`) or failed (`false`).
     pub ok: bool,
+    /// Deployed commit SHA.
     pub head: String,
+    /// Deploy trigger source (`landing` or `owner`).
     pub by: DeployBy,
+    /// Explanation or status detail.
     pub reason: String,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `backup.dumped`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackupDumpedRecord {
+    /// Target key identifiers dumped into backup storage.
     #[serde(default)]
     pub keys: Vec<String>,
+    /// Optional backup retention tier labels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tiers: Option<Vec<String>>,
+    /// Optional details of skipped destinations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped: Option<Vec<Value>>,
+    /// Hex SHA-256 of the dump payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// Uncompressed dump size in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+    /// Stored (possibly encrypted/compressed) dump size in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stored_bytes: Option<u64>,
+    /// Number of events captured in the dump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<u64>,
+    /// Encryption key fingerprint used to seal the backup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealed_with: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `backup.bundled`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackupBundledRecord {
+    /// Bundle kind (`full` or `incremental`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Base event ID for incremental git/wal bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_event_id: Option<i64>,
+    /// Destination keys written for the bundle.
     #[serde(default)]
     pub keys: Vec<String>,
+    /// Retention tiers applied to this bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tiers: Option<Vec<String>>,
+    /// Optional skipped destination notes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped: Option<Vec<Value>>,
+    /// Hex SHA-256 of the bundle archive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// Unsealed bundle byte size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+    /// Stored bundle byte size after sealing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stored_bytes: Option<u64>,
+    /// Encryption key fingerprint used to seal the bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealed_with: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `backup.verified`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackupVerifiedRecord {
+    /// Whether integrity verification passed.
     pub ok: bool,
+    /// Optional failure/diagnostic reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Verified remote object key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Observed SHA-256 digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// Verification wall-clock duration in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `backup.stored`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackupStoredRecord {
+    /// Storage area replicated (`transcripts` or `sessions`).
     pub area: BackupArea,
+    /// Remote storage host label.
     pub host: String,
+    /// Storage account identifier.
     pub account: String,
+    /// Manifest key/identifier written for this pass.
     pub manifest: String,
+    /// Total files accounted for in the manifest.
     pub files: u64,
+    /// Count of files unchanged since previous pass.
     pub unchanged: u64,
+    /// Count of append-grown files incrementally synced.
     pub grown: u64,
+    /// Count of files uploaded whole.
     pub whole: u64,
+    /// Number of new segments uploaded.
     pub segments_written: u64,
+    /// Number of existing segments verified on remote.
     pub segments_found: u64,
+    /// Raw payload bytes transferred.
     pub bytes_written: u64,
+    /// Encryption key fingerprint used to seal segments/manifests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealed_with: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `backup.drilled.transcripts`, `backup.drilled.missions`, and `backup.drilled.sync`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackupDrillRecord {
+    /// Whether the restore drill succeeded.
     pub ok: bool,
+    /// Optional drill failure reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Drilled backup bundle key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<String>,
+    /// Base event ID covered by the drilled bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_event_id: Option<i64>,
+    /// Count of state mismatches discovered during the drill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mismatches: Option<u64>,
+    /// Drill execution time in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `backup.drilled.controllers`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackupDrilledControllersRecord {
+    /// Whether the controller parity drill passed.
     pub ok: bool,
+    /// Optional failure reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Drilled backup bundle key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<String>,
+    /// Base event ID of the drilled bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_event_id: Option<i64>,
+    /// Count of controller mismatches found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mismatches: Option<u64>,
+    /// Drill duration in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Drill run identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<i64>,
+    /// Controller identifier checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller: Option<String>,
+    /// Mission IDs replayed during the controller drill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missions: Option<Vec<i64>>,
+    /// Source name checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Current controller state snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<Value>,
+    /// Previous controller state snapshot for comparison.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev: Option<Value>,
+    /// Fields intentionally excluded from parity comparison.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left_out: Option<Vec<String>>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `legacy.imported`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LegacyImportedRecord {
+    /// Legacy SQL table name imported.
     pub table: LegacyTable,
+    /// Raw JSON representation of the imported row.
     pub row: Value,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
@@ -1277,72 +1831,139 @@ pub struct LegacyImportedRecord {
 /// `spawn_control_apply`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ControlRecordKind {
+    /// `mission.added` record.
     MissionAdded,
+    /// `mission.configured` record.
     MissionConfigured,
+    /// `mission.closed` record.
     MissionClosed,
+    /// `mission.halted` record.
     MissionHalted,
+    /// `mission.resumed` record.
     MissionResumed,
+    /// `mission.paused` record.
     MissionPaused,
+    /// `mission.unpaused` record.
     MissionUnpaused,
+    /// `task.assigned` record.
     TaskAssigned,
+    /// `task.delivered` record.
     TaskDelivered,
+    /// `task.reported` record.
     TaskReported,
+    /// `task.report_unfinished` record.
     TaskReportUnfinished,
+    /// `task.fork_failed` record.
     TaskForkFailed,
+    /// `task.reviewed` record.
     TaskReviewed,
+    /// `task.rerouted` record.
     TaskRerouted,
+    /// `task.restarted` record.
     TaskRestarted,
+    /// `task.cancelled` record.
     TaskCancelled,
+    /// `task.stolen` record.
     TaskStolen,
+    /// `task.aborted` record.
     TaskAborted,
+    /// `task.over_budget` record.
     TaskOverBudget,
+    /// `task.gated` record.
     TaskGated,
+    /// `task.shadow_gated` record.
     TaskShadowGated,
+    /// `task.held` record.
     TaskHeld,
+    /// `task.released` record.
     TaskReleased,
+    /// `task.landed` record.
     TaskLanded,
+    /// `resident.proposed` record.
     ResidentProposed,
+    /// `resident.approved` record.
     ResidentApproved,
+    /// `resident.retired` record.
     ResidentRetired,
+    /// `objective.solved` record.
     ObjectiveSolved,
+    /// `objective.verified` record.
     ObjectiveVerified,
+    /// `objective.retired` record.
     ObjectiveRetired,
+    /// `source.moved` record.
     SourceMoved,
+    /// `source.held` record.
     SourceHeld,
+    /// `source.released` record.
     SourceReleased,
+    /// `source.hold_expired` record.
     SourceHoldExpired,
+    /// `source.push_requested` record.
     SourcePushRequested,
+    /// `source.push_refused` record.
     SourcePushRefused,
+    /// `source.push_no_verdict` record.
     SourcePushNoVerdict,
+    /// `source.main_red` record.
     SourceMainRed,
+    /// `source.main_probe` record.
     SourceMainProbe,
+    /// `source.main_green` record.
     SourceMainGreen,
+    /// `integrator.started` record.
     IntegratorStarted,
+    /// `integrator.draining` record.
     IntegratorDraining,
+    /// `integrator.drained` record.
     IntegratorDrained,
+    /// `integrator.drain_expired` record.
     IntegratorDrainExpired,
+    /// `host.disk` record.
     HostDisk,
+    /// `host.storage` record.
     HostStorage,
+    /// `host.core_lines` record.
     HostCoreLines,
+    /// `host.storage_bytes` record.
     HostStorageBytes,
+    /// `host.judge` record.
     HostJudge,
+    /// `host.messages_marked` record.
     HostMessagesMarked,
+    /// `host.loop_started` record.
     HostLoopStarted,
+    /// `execution.interrupted` record.
     ExecutionInterrupted,
+    /// `execution.cleared` record.
     ExecutionCleared,
+    /// `alert.fired` record.
     AlertFired,
+    /// `alert.updated` record.
     AlertUpdated,
+    /// `alert.judged` record.
     AlertJudged,
+    /// `alert.cleared` record.
     AlertCleared,
+    /// `deploy.finished` record.
     DeployFinished,
+    /// `backup.dumped` record.
     BackupDumped,
+    /// `backup.bundled` record.
     BackupBundled,
+    /// `backup.verified` record.
     BackupVerified,
+    /// `backup.stored` record.
     BackupStored,
+    /// `backup.drilled.transcripts` record.
     BackupDrilledTranscripts,
+    /// `backup.drilled.missions` record.
     BackupDrilledMissions,
+    /// `backup.drilled.controllers` record.
     BackupDrilledControllers,
+    /// `backup.drilled.sync` record.
     BackupDrilledSync,
+    /// `legacy.imported` record.
     LegacyImported,
 }
 
@@ -1508,149 +2129,216 @@ impl fmt::Display for ControlRecordKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ControlRecord {
+    /// `mission.added` control record.
     #[serde(rename = "mission.added")]
     MissionAdded(MissionAddedRecord),
+    /// `mission.configured` control record.
     #[serde(rename = "mission.configured")]
     MissionConfigured(MissionConfiguredRecord),
+    /// `mission.closed` control record.
     #[serde(rename = "mission.closed")]
     MissionClosed(MissionClosedRecord),
+    /// `mission.halted` control record.
     #[serde(rename = "mission.halted")]
     MissionHalted(Box<MissionHaltedRecord>),
+    /// `mission.resumed` control record.
     #[serde(rename = "mission.resumed")]
     MissionResumed(MissionResumedRecord),
+    /// `mission.paused` control record.
     #[serde(rename = "mission.paused")]
     MissionPaused(MissionPausedRecord),
+    /// `mission.unpaused` control record.
     #[serde(rename = "mission.unpaused")]
     MissionUnpaused(MissionUnpausedRecord),
 
+    /// `task.assigned` control record.
     #[serde(rename = "task.assigned")]
     TaskAssigned(Box<TaskAssignedRecord>),
+    /// `task.delivered` control record.
     #[serde(rename = "task.delivered")]
     TaskDelivered(TaskDeliveredRecord),
+    /// `task.reported` control record.
     #[serde(rename = "task.reported")]
     TaskReported(TaskReportedRecord),
+    /// `task.report_unfinished` control record.
     #[serde(rename = "task.report_unfinished")]
     TaskReportUnfinished(Box<TaskReportUnfinishedRecord>),
+    /// `task.fork_failed` control record.
     #[serde(rename = "task.fork_failed")]
     TaskForkFailed(TaskForkFailedRecord),
+    /// `task.reviewed` control record.
     #[serde(rename = "task.reviewed")]
     TaskReviewed(TaskReviewedRecord),
+    /// `task.rerouted` control record.
     #[serde(rename = "task.rerouted")]
     TaskRerouted(Box<TaskReroutedRecord>),
+    /// `task.restarted` control record.
     #[serde(rename = "task.restarted")]
     TaskRestarted(Box<TaskRestartedRecord>),
+    /// `task.cancelled` control record.
     #[serde(rename = "task.cancelled")]
     TaskCancelled(Box<TaskCancelledRecord>),
+    /// `task.stolen` control record.
     #[serde(rename = "task.stolen")]
     TaskStolen(Box<TaskStolenRecord>),
+    /// `task.aborted` control record.
     #[serde(rename = "task.aborted")]
     TaskAborted(TaskAbortedRecord),
+    /// `task.over_budget` control record.
     #[serde(rename = "task.over_budget")]
     TaskOverBudget(Box<TaskOverBudgetRecord>),
+    /// `task.gated` control record.
     #[serde(rename = "task.gated")]
     TaskGated(Box<TaskGatedRecord>),
+    /// `task.shadow_gated` control record.
     #[serde(rename = "task.shadow_gated")]
     TaskShadowGated(Box<TaskShadowGatedRecord>),
+    /// `task.held` control record.
     #[serde(rename = "task.held")]
     TaskHeld(TaskHeldRecord),
+    /// `task.released` control record.
     #[serde(rename = "task.released")]
     TaskReleased(TaskReleasedRecord),
+    /// `task.landed` control record.
     #[serde(rename = "task.landed")]
     TaskLanded(Box<TaskLandedRecord>),
 
+    /// `resident.proposed` control record.
     #[serde(rename = "resident.proposed")]
     ResidentProposed(ResidentProposedRecord),
+    /// `resident.approved` control record.
     #[serde(rename = "resident.approved")]
     ResidentApproved(ResidentNamedRecord),
+    /// `resident.retired` control record.
     #[serde(rename = "resident.retired")]
     ResidentRetired(ResidentNamedRecord),
 
+    /// `objective.solved` control record.
     #[serde(rename = "objective.solved")]
     ObjectiveSolved(Box<ObjectiveSolvedRecord>),
+    /// `objective.verified` control record.
     #[serde(rename = "objective.verified")]
     ObjectiveVerified(ObjectiveVerifiedRecord),
+    /// `objective.retired` control record.
     #[serde(rename = "objective.retired")]
     ObjectiveRetired(ObjectiveRetiredRecord),
 
+    /// `source.moved` control record.
     #[serde(rename = "source.moved")]
     SourceMoved(Box<SourceMovedRecord>),
+    /// `source.held` control record.
     #[serde(rename = "source.held")]
     SourceHeld(Box<SourceHeldRecord>),
+    /// `source.released` control record.
     #[serde(rename = "source.released")]
     SourceReleased(SourceReleasedRecord),
+    /// `source.hold_expired` control record.
     #[serde(rename = "source.hold_expired")]
     SourceHoldExpired(SourceHoldExpiredRecord),
+    /// `source.push_requested` control record.
     #[serde(rename = "source.push_requested")]
     SourcePushRequested(Box<SourcePushRequestedRecord>),
+    /// `source.push_refused` control record.
     #[serde(rename = "source.push_refused")]
     SourcePushRefused(Box<SourcePushRefusedRecord>),
+    /// `source.push_no_verdict` control record.
     #[serde(rename = "source.push_no_verdict")]
     SourcePushNoVerdict(SourcePushNoVerdictRecord),
+    /// `source.main_red` control record.
     #[serde(rename = "source.main_red")]
     SourceMainRed(Box<SourceMainRedRecord>),
+    /// `source.main_probe` control record.
     #[serde(rename = "source.main_probe")]
     SourceMainProbe(SourceMainProbeRecord),
+    /// `source.main_green` control record.
     #[serde(rename = "source.main_green")]
     SourceMainGreen(Box<SourceMainGreenRecord>),
 
+    /// `integrator.started` control record.
     #[serde(rename = "integrator.started")]
     IntegratorStarted(Box<IntegratorStartedRecord>),
+    /// `integrator.draining` control record.
     #[serde(rename = "integrator.draining")]
     IntegratorDraining(IntegratorDrainRecord),
+    /// `integrator.drained` control record.
     #[serde(rename = "integrator.drained")]
     IntegratorDrained(IntegratorDrainRecord),
+    /// `integrator.drain_expired` control record.
     #[serde(rename = "integrator.drain_expired")]
     IntegratorDrainExpired(IntegratorDrainRecord),
 
+    /// `host.disk` control record.
     #[serde(rename = "host.disk")]
     HostDisk(Box<HostDiskRecord>),
+    /// `host.storage` control record.
     #[serde(rename = "host.storage")]
     HostStorage(HostStorageRecord),
+    /// `host.core_lines` control record.
     #[serde(rename = "host.core_lines")]
     HostCoreLines(HostCoreLinesRecord),
+    /// `host.storage_bytes` control record.
     #[serde(rename = "host.storage_bytes")]
     HostStorageBytes(HostStorageBytesRecord),
+    /// `host.judge` control record.
     #[serde(rename = "host.judge")]
     HostJudge(Box<HostJudgeRecord>),
+    /// `host.messages_marked` control record.
     #[serde(rename = "host.messages_marked")]
     HostMessagesMarked(HostMessagesMarkedRecord),
+    /// `host.loop_started` control record.
     #[serde(rename = "host.loop_started")]
     HostLoopStarted(HostLoopStartedRecord),
 
+    /// `execution.interrupted` control record.
     #[serde(rename = "execution.interrupted")]
     ExecutionInterrupted(Box<ExecutionInterruptedRecord>),
+    /// `execution.cleared` control record.
     #[serde(rename = "execution.cleared")]
     ExecutionCleared(ExecutionClearedRecord),
 
+    /// `alert.fired` control record.
     #[serde(rename = "alert.fired")]
     AlertFired(Box<AlertFiredRecord>),
+    /// `alert.updated` control record.
     #[serde(rename = "alert.updated")]
     AlertUpdated(Box<AlertUpdatedRecord>),
+    /// `alert.judged` control record.
     #[serde(rename = "alert.judged")]
     AlertJudged(AlertJudgedRecord),
+    /// `alert.cleared` control record.
     #[serde(rename = "alert.cleared")]
     AlertCleared(Box<AlertClearedRecord>),
 
+    /// `deploy.finished` control record.
     #[serde(rename = "deploy.finished")]
     DeployFinished(DeployFinishedRecord),
 
+    /// `backup.dumped` control record.
     #[serde(rename = "backup.dumped")]
     BackupDumped(Box<BackupDumpedRecord>),
+    /// `backup.bundled` control record.
     #[serde(rename = "backup.bundled")]
     BackupBundled(Box<BackupBundledRecord>),
+    /// `backup.verified` control record.
     #[serde(rename = "backup.verified")]
     BackupVerified(Box<BackupVerifiedRecord>),
+    /// `backup.stored` control record.
     #[serde(rename = "backup.stored")]
     BackupStored(Box<BackupStoredRecord>),
+    /// `backup.drilled.transcripts` control record.
     #[serde(rename = "backup.drilled.transcripts")]
     BackupDrilledTranscripts(Box<BackupDrillRecord>),
+    /// `backup.drilled.missions` control record.
     #[serde(rename = "backup.drilled.missions")]
     BackupDrilledMissions(Box<BackupDrillRecord>),
+    /// `backup.drilled.controllers` control record.
     #[serde(rename = "backup.drilled.controllers")]
     BackupDrilledControllers(Box<BackupDrilledControllersRecord>),
+    /// `backup.drilled.sync` control record.
     #[serde(rename = "backup.drilled.sync")]
     BackupDrilledSync(Box<BackupDrillRecord>),
 
+    /// `legacy.imported` control record.
     #[serde(rename = "legacy.imported")]
     LegacyImported(LegacyImportedRecord),
 }
@@ -1658,8 +2346,15 @@ pub enum ControlRecord {
 /// Legacy/forward-compatible parse result for `control.recorded` rows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CompatControlRecord {
+    /// Decoded known [`ControlRecord`] variant.
     Known(Box<ControlRecord>),
-    Unknown { kind: String, payload: Value },
+    /// Forward-compatible fallback carrying an unrecognized `'type'` name and raw payload.
+    Unknown {
+        /// Unrecognized `"type"` string.
+        kind: String,
+        /// Full raw JSON object payload.
+        payload: Value,
+    },
 }
 
 impl ControlRecord {
@@ -1808,7 +2503,7 @@ impl ControlRecord {
     }
 
     /// SQL `'type'` string for this record.
-    pub const fn kind_str(&self) -> &'static str {
+    const fn kind_str(&self) -> &'static str {
         self.kind().as_str()
     }
 
@@ -1859,69 +2554,109 @@ impl ControlRecord {
 // Sibling GradingRecord ADT (`grading.recorded` preset.* stream, 5 variants)
 // ---------------------------------------------------------------------------
 
+/// Payload for `preset.registered`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PresetRegisteredRecord {
+    /// Registered preset identifier.
     pub preset_id: String,
+    /// Runtime engine label (e.g. `claude`, `agy`).
     pub engine_label: String,
+    /// Model identifier passed to the engine.
     pub model_label: String,
+    /// Default model cost/capability profile name.
     pub model_profile: String,
+    /// Relative routing cost tiebreaker.
     pub cost_rank: i32,
+    /// Optional named execution profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_profile: Option<String>,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `preset.onboarded`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PresetOnboardedRecord {
+    /// Onboarded preset identifier.
     pub preset_id: String,
+    /// Preset lifecycle state prior to onboarding.
     pub from_state: String,
+    /// Resulting preset lifecycle state (`active` or `disabled`).
     pub to_state: String,
+    /// Proved grade rank (`None` when onboarding failed `l1`).
     #[serde(default, deserialize_with = "deserialize_opt_grade_wire")]
     pub to_grade: Option<GradeWire>,
+    /// Number of onboarding exam cases passed.
     pub passed: u32,
+    /// Total number of onboarding exam cases executed.
     pub total: u32,
+    /// Failed exam case IDs or descriptors.
     #[serde(default)]
     pub failed_cases: Vec<Value>,
+    /// Structured onboarding exam suite summary JSON.
     pub suite: Value,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `preset.regraded`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PresetRegradedRecord {
+    /// Regraded preset identifier.
     pub preset_id: String,
+    /// Calibration decision (`demote`, `restore`, etc.).
     pub decision: String,
+    /// Grade rank before regrading.
     #[serde(default, deserialize_with = "deserialize_opt_grade_wire")]
     pub from_grade: Option<GradeWire>,
+    /// Grade rank after regrading.
     #[serde(default, deserialize_with = "deserialize_opt_grade_wire")]
     pub to_grade: Option<GradeWire>,
+    /// Lifecycle state before regrading.
     pub from_state: String,
+    /// Lifecycle state after regrading.
     pub to_state: String,
+    /// First-pass task successes observed in the calibration window.
     pub first_pass: u32,
+    /// Total tasks evaluated in the calibration window.
     pub total: u32,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `preset.grade_locked`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PresetGradeLockedRecord {
+    /// Locked/unlocked preset identifier.
     pub preset_id: String,
+    /// Previous grade rank before lock change.
     #[serde(default, deserialize_with = "deserialize_opt_grade_wire")]
     pub from_grade: Option<GradeWire>,
+    /// Target locked grade rank (`None` when unlocking).
     #[serde(default, deserialize_with = "deserialize_opt_grade_wire")]
     pub to_grade: Option<GradeWire>,
+    /// Previous preset lifecycle state.
     pub from_state: String,
+    /// New preset lifecycle state.
     pub to_state: String,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Payload for `preset.state_changed`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PresetStateChangedRecord {
+    /// Preset identifier whose state changed.
     pub preset_id: String,
+    /// Previous lifecycle state.
     pub from_state: String,
+    /// New lifecycle state.
     pub to_state: String,
+    /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
@@ -1929,10 +2664,15 @@ pub struct PresetStateChangedRecord {
 /// Discriminant for every `grading.recorded` variant in `spawn_grading_apply`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum GradingRecordKind {
+    /// `preset.registered` record.
     PresetRegistered,
+    /// `preset.onboarded` record.
     PresetOnboarded,
+    /// `preset.regraded` record.
     PresetRegraded,
+    /// `preset.grade_locked` record.
     PresetGradeLocked,
+    /// `preset.state_changed` record.
     PresetStateChanged,
 }
 
@@ -1968,14 +2708,19 @@ impl GradingRecordKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum GradingRecord {
+    /// `preset.registered` grading record.
     #[serde(rename = "preset.registered")]
     PresetRegistered(PresetRegisteredRecord),
+    /// `preset.onboarded` grading record.
     #[serde(rename = "preset.onboarded")]
     PresetOnboarded(Box<PresetOnboardedRecord>),
+    /// `preset.regraded` grading record.
     #[serde(rename = "preset.regraded")]
     PresetRegraded(Box<PresetRegradedRecord>),
+    /// `preset.grade_locked` grading record.
     #[serde(rename = "preset.grade_locked")]
     PresetGradeLocked(PresetGradeLockedRecord),
+    /// `preset.state_changed` grading record.
     #[serde(rename = "preset.state_changed")]
     PresetStateChanged(PresetStateChangedRecord),
 }
@@ -2002,7 +2747,7 @@ impl GradingRecord {
     }
 
     /// SQL `'type'` string for this record.
-    pub const fn kind_str(&self) -> &'static str {
+    const fn kind_str(&self) -> &'static str {
         self.kind().as_str()
     }
 
@@ -2239,89 +2984,150 @@ pub enum EpisodeOutcome {
 /// Synchronized review checkpoint recorded against a specific report revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewSyncPoint {
+    /// Event sequence number of the `task.reviewed` record.
     pub event_seq: i64,
+    /// Event timestamp in Unix epoch milliseconds.
     pub at_ms: i64,
+    /// Report revision reviewed.
     pub revision: u32,
+    /// Whether the review accepted (`true`) or requested revisions (`false`).
     pub accepted: bool,
+    /// Optional reviewer feedback note.
     pub note: Option<String>,
 }
 
 /// Gate verdict checkpoint recorded during episode replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateSyncPoint {
+    /// Event sequence number of the `task.gated` record.
     pub event_seq: i64,
+    /// Event timestamp in Unix epoch milliseconds.
     pub at_ms: i64,
+    /// Report revision tested by the gate.
     pub revision: u32,
+    /// Integrator gate verdict.
     pub verdict: GateVerdict,
+    /// Verdict responsibility class (`code`, `infrastructure`, `superseded`).
     pub class: Option<GateVerdictClass>,
+    /// Baseline commit SHA used by the gate.
     pub base: Option<String>,
+    /// Candidate commit SHA tested by the gate.
     pub candidate: Option<String>,
+    /// Optional verdict explanation note.
     pub note: Option<String>,
 }
 
 /// Ordered control record timeline entry on an episode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EpisodeStage {
+    /// Control event sequence number.
     pub event_seq: i64,
+    /// Event timestamp in Unix epoch milliseconds.
     pub at_ms: i64,
+    /// Strong kind discriminant of the control record.
     pub kind: ControlRecordKind,
 }
 
 /// Deterministic projection of a single task's lifecycle from `control.recorded`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskEpisode {
+    /// Task identifier.
     pub task_id: i64,
+    /// Parent mission identifier.
     pub mission_id: i64,
+    /// Worker kind (`resident` or `ephemeral`).
     pub kind: TaskKind,
+    /// Assigned agent identifier (updated on restart/steal).
     pub agent_id: String,
+    /// Assigned Spawn session identifier (updated on restart/steal).
     pub session_id: String,
+    /// Task brief text.
     pub brief: String,
+    /// Optional creator/assigner label.
     pub created_by: Option<String>,
+    /// Optional numeric objective index within the mission.
     pub objective: Option<i32>,
+    /// Optional scenario targeted by this task.
     pub scenario: Option<String>,
+    /// Effective model profile string (`default`, `cheap`, etc.).
     pub model: String,
+    /// Effective difficulty rank (`l1`..`l3`).
     pub difficulty: GradeWire,
+    /// Currently attributed preset identifier, if routed.
     pub preset_id: Option<String>,
+    /// Initial preset identifier first assigned to the task.
     pub first_preset_id: Option<String>,
+    /// Routed engine label.
     pub engine: Option<String>,
+    /// Routed model label.
     pub model_label: Option<String>,
+    /// Whether the task is pinned against work stealing/rerouting.
     pub pinned: bool,
+    /// Original task ID if reissued.
     pub reissue_of: Option<i64>,
+    /// Prior task ID whose work this episode continues.
     pub continues: Option<i64>,
+    /// Original task ID if reassigned.
     pub reassign_of: Option<i64>,
 
+    /// Current replayed lifecycle state of the task.
     pub state: TaskState,
+    /// High-level terminal or in-flight episode outcome.
     pub outcome: EpisodeOutcome,
     /// Total revision loops (`mission_tasks.revisions`): quality rejections
     /// plus merge conflicts / incompatible heads.
     pub rework: u32,
     /// Quality-only sends-back (`mission_tasks.quality_rejections`).
     pub quality_rejections: u32,
+    /// Count of `task.rerouted` transitions observed.
     pub reroutes: u32,
+    /// Count of `task.restarted` transitions observed.
     pub restarts: u32,
+    /// Count of `task.stolen` transitions observed.
     pub steals: u32,
+    /// Count of `task.delivered` transitions observed.
     pub deliveries: u32,
+    /// Count of `task.reported` submissions observed.
     pub reports: u32,
 
+    /// Most recent delivered command identifier.
     pub last_command_id: Option<i64>,
+    /// Latest submitted completion report text.
     pub last_report: Option<String>,
+    /// Commit SHA carried on the latest completion report.
     pub last_report_commit: Option<String>,
+    /// Latest review feedback note.
     pub review_note: Option<String>,
+    /// Baseline commit SHA from `task.landed` or `task.gated`.
     pub base: Option<String>,
+    /// Latest gated candidate commit SHA.
     pub candidate: Option<String>,
+    /// Latest metric string emitted by the gate.
     pub metric: Option<String>,
+    /// Most recent integrator gate verdict observed.
     pub last_gate_verdict: Option<GateVerdict>,
+    /// Chronological review checkpoints observed in the episode.
     pub review_sync_points: Vec<ReviewSyncPoint>,
+    /// Chronological gate checkpoints observed in the episode.
     pub gate_verdicts: Vec<GateSyncPoint>,
+    /// Actor credited with closing/aborting the task, if terminal.
     pub terminal_by: Option<String>,
+    /// Reason recorded when closing/aborting the task, if terminal.
     pub terminal_reason: Option<String>,
 
+    /// Event sequence number of `task.assigned`.
     pub assigned_seq: i64,
+    /// Assignment timestamp in Unix epoch milliseconds.
     pub assigned_at_ms: i64,
+    /// First delivery timestamp in Unix epoch milliseconds.
     pub delivered_at_ms: Option<i64>,
+    /// Sequence number of the closing terminal event, if closed.
     pub closed_seq: Option<i64>,
+    /// Closure timestamp in Unix epoch milliseconds, if closed.
     pub closed_at_ms: Option<i64>,
+    /// Most recent event timestamp folded into this episode (epoch ms).
     pub updated_at_ms: i64,
+    /// Ordered timeline of control events touching this episode.
     pub stages: Vec<EpisodeStage>,
 }
 

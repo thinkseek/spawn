@@ -49,15 +49,18 @@ pub const RESTORE_MIN_TOTAL: u32 = 8;
 pub const RESTORE_AT_PERCENT: u32 = 90;
 
 /// The longest `preset_id`.
-pub const PRESET_ID_MAX: usize = 64;
+const PRESET_ID_MAX: usize = 64;
 
 /// What a preset has proven it can do: `l1` (simple, well-specified
 /// work) to `l3` (the hardest). Ordered: `L1 < L2 < L3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillGrade {
+    /// Entry tier (`l1`): deterministic, low-risk single-file tasks.
     L1 = 1,
+    /// Standard mainline tier (`l2`): general implementation and debugging tasks.
     L2 = 2,
+    /// Strategic tier (`l3`): highest-complexity architecture, security, and recovery tasks.
     L3 = 3,
 }
 
@@ -132,9 +135,12 @@ impl fmt::Display for SkillGrade {
 )]
 #[serde(rename_all = "lowercase")]
 pub enum TaskDifficulty {
+    /// Simple, bounded work eligible for `l1` presets.
     L1 = 1,
+    /// Standard task difficulty; default when omitted.
     #[default]
     L2 = 2,
+    /// Complex, cross-cutting, or high-risk work requiring `l3`.
     L3 = 3,
 }
 
@@ -289,6 +295,7 @@ pub struct GradedPreset {
     pub execution_profile: Option<ExecutionProfile>,
     /// Lower is cheaper; ties broken by `preset_id`.
     pub cost_rank: u32,
+    /// Current lifecycle state of the preset (`probation`, `active`, `demoted`, `disabled`).
     pub state: PresetState,
     /// The grade its onboarding exams proved; none before onboarding, or
     /// when it failed `l1`.
@@ -302,7 +309,9 @@ pub struct GradedPreset {
     /// calibrated or locked grade, or of its state to a routed one.
     /// Calibration reads only the tasks assigned since.
     pub window_start_ms: i64,
+    /// Creation timestamp in Unix epoch milliseconds.
     pub created_at_ms: i64,
+    /// Last modification timestamp in Unix epoch milliseconds.
     pub updated_at_ms: i64,
     /// The `grading.recorded` event that last changed it.
     pub last_event: i64,
@@ -388,8 +397,11 @@ pub fn catalog_covers(catalog: &[GradedPreset], difficulty: TaskDifficulty) -> b
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TopDownTier {
+    /// Deterministic low-cost mechanical offload tier (`T1` / `l1`).
     MechanicalOffload = 1,
+    /// Standard mainline supervisor and execution tier (`T2` / `l2`).
     Mainline = 2,
+    /// Strategic decision and escalation fallback tier (`T3` / `l3`).
     TopDecision = 3,
 }
 
@@ -439,36 +451,45 @@ pub fn tier_role(grade: Option<SkillGrade>) -> Option<&'static str> {
 
 /// Default T3 (`l3`) strategic decision & L2 escalation preset id.
 pub const TOPDOWN_L3_PRESET_ID: &str = "topdown-l3-fable";
-pub const TOPDOWN_L3_ENGINE_LABEL: &str = "claude";
-pub const TOPDOWN_L3_MODEL_LABEL: &str = "claude-fable-5-2";
-pub const TOPDOWN_L3_EXECUTION_PROFILE: &str = "fable-5-2";
-pub const TOPDOWN_L3_COST_RANK: u32 = 30;
+const TOPDOWN_L3_ENGINE_LABEL: &str = "claude";
+const TOPDOWN_L3_MODEL_LABEL: &str = "claude-fable-5-2";
+const TOPDOWN_L3_EXECUTION_PROFILE: &str = "fable-5-2";
+const TOPDOWN_L3_COST_RANK: u32 = 30;
 
 /// Default T2 (`l2`) strong mainline supervisor/execution preset id.
 pub const TOPDOWN_L2_PRESET_ID: &str = "topdown-l2-neon";
-pub const TOPDOWN_L2_ENGINE_LABEL: &str = "agy";
-pub const TOPDOWN_L2_MODEL_LABEL: &str = "gemini-pro-orchestrator-neon";
-pub const TOPDOWN_L2_EXECUTION_PROFILE: &str = "neon-mainline";
-pub const TOPDOWN_L2_COST_RANK: u32 = 20;
+const TOPDOWN_L2_ENGINE_LABEL: &str = "agy";
+const TOPDOWN_L2_MODEL_LABEL: &str = "gemini-pro-orchestrator-neon";
+const TOPDOWN_L2_EXECUTION_PROFILE: &str = "neon-mainline";
+const TOPDOWN_L2_COST_RANK: u32 = 20;
 
 /// Default T1 (`l1`) controlled deterministic mechanical offload preset id.
 pub const TOPDOWN_L1_PRESET_ID: &str = "topdown-l1-mechanical";
-pub const TOPDOWN_L1_ENGINE_LABEL: &str = "claude";
-pub const TOPDOWN_L1_MODEL_LABEL: &str = "deepseek-v4";
-pub const TOPDOWN_L1_EXECUTION_PROFILE: &str = "mechanical-l1";
-pub const TOPDOWN_L1_COST_RANK: u32 = 10;
+const TOPDOWN_L1_ENGINE_LABEL: &str = "claude";
+const TOPDOWN_L1_MODEL_LABEL: &str = "deepseek-v4";
+const TOPDOWN_L1_EXECUTION_PROFILE: &str = "mechanical-l1";
+const TOPDOWN_L1_COST_RANK: u32 = 10;
 
 /// Specification for one preset seeded by `spawn grade init-topdown`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopDownPresetSpec {
+    /// Unique preset identifier matching [`is_preset_id`].
     pub preset_id: &'static str,
+    /// Top-down hierarchy tier represented by this preset.
     pub tier: TopDownTier,
+    /// Runtime engine label (for example `claude` or `agy`).
     pub engine_label: &'static str,
+    /// Model identifier passed to the underlying engine.
     pub model_label: String,
+    /// Default model cost/capability profile.
     pub model_profile: ModelProfile,
+    /// Named execution profile string passed during seeding.
     pub execution_profile: &'static str,
+    /// Relative routing cost tiebreaker (lower is preferred).
     pub cost_rank: u32,
+    /// Initial [`SkillGrade`] assigned at seed time.
     pub initial_grade: SkillGrade,
+    /// Whether seeding locks the initial grade against calibration changes.
     pub lock_initial_grade: bool,
 }
 
@@ -558,6 +579,7 @@ pub fn can_offload_to_l1(classified: &DifficultyClassification, catalog: &[Grade
 /// Where a task goes ([`route_preset`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingDecision {
+    /// Selected preset identifier.
     pub preset_id: String,
     /// The preset's [`ModelProfile`], which the task's `model` takes.
     pub model_profile: ModelProfile,
@@ -571,9 +593,11 @@ pub struct RoutingDecision {
     pub difficulty: TaskDifficulty,
     /// The difficulty routed at: stepped up for its quality rejections.
     pub routed_difficulty: TaskDifficulty,
+    /// Minimum [`SkillGrade`] required at `routed_difficulty`.
     pub required_grade: SkillGrade,
     /// The chosen preset's routing grade.
     pub preset_grade: SkillGrade,
+    /// Cost rank of the selected preset.
     pub cost_rank: u32,
     /// Whether the assigner named the preset.
     pub explicit: bool,
@@ -604,29 +628,48 @@ impl RoutingDecision {
 /// unflagged `spawn task assign` falls back, and says so.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RoutingError {
+    /// Named preset is absent from the catalog.
     #[error("preset {preset_id} is not in the grading catalog")]
-    UnknownPreset { preset_id: String },
+    UnknownPreset {
+        /// Requested preset identifier.
+        preset_id: String,
+    },
+    /// Named preset exists but is in a non-routable state (`probation` or `disabled`).
     #[error("preset {preset_id} is {state}: only an active or demoted preset is routed")]
     NotRoutable {
+        /// Requested preset identifier.
         preset_id: String,
+        /// Preset's current non-routable state.
         state: PresetState,
     },
+    /// Named preset is active/demoted but lacks a calibrated or locked grade.
     #[error("preset {preset_id} has no grade: onboard it or lock its grade first")]
-    Ungraded { preset_id: String },
+    Ungraded {
+        /// Requested preset identifier.
+        preset_id: String,
+    },
+    /// Named preset's routing grade is below the required threshold for the routed difficulty.
     #[error(
         "preset {preset_id} is graded {grade}, below the {required} a task routed at {routed_difficulty} needs"
     )]
     BelowRequired {
+        /// Requested preset identifier.
         preset_id: String,
+        /// Actual routing grade of `preset_id`.
         grade: SkillGrade,
+        /// Minimum grade required by the routed difficulty.
         required: SkillGrade,
+        /// Stepped difficulty used for routing.
         routed_difficulty: TaskDifficulty,
     },
+    /// No routable preset in the catalog satisfies the required grade.
     #[error(
         "no routable preset is graded {required} or above (a task routed at {routed_difficulty})"
     )]
     NoSufficientPreset {
+        /// Minimum grade required.
         required: SkillGrade,
+        /// Stepped difficulty used for routing.
         routed_difficulty: TaskDifficulty,
     },
 }
@@ -708,9 +751,11 @@ pub fn route_preset(
 /// One onboarding exam case's result (evals/onboarding/).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExamCaseResult {
+    /// Unique identifier of the onboarding exam case.
     pub case_id: String,
     /// The grade the case examines (its directory's `l<n>-` prefix).
     pub grade: SkillGrade,
+    /// Whether the preset passed this exam case.
     pub passed: bool,
 }
 
@@ -722,7 +767,9 @@ pub struct OnboardingVerdict {
     pub onboarded_grade: Option<SkillGrade>,
     /// `active` with a grade, `disabled` without.
     pub state: PresetState,
+    /// Count of exam cases passed.
     pub passed: u32,
+    /// Total count of exam cases evaluated.
     pub total: u32,
     /// The cases that failed, in the order given.
     pub failed_cases: Vec<String>,
@@ -768,7 +815,9 @@ pub fn evaluate_onboarding(results: &[ExamCaseResult]) -> OnboardingVerdict {
 /// passed first time (landed or accepted, never sent back for quality).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskOutcomeSample {
+    /// Task identifier included in the calibration window.
     pub task_id: i64,
+    /// Whether the task succeeded without quality rejections.
     pub first_pass: bool,
 }
 
@@ -777,25 +826,39 @@ pub struct TaskOutcomeSample {
 #[serde(tag = "decision", rename_all = "lowercase")]
 pub enum CalibrationDecision {
     /// Nothing changes.
-    Hold { reason: String },
+    Hold {
+        /// Explanation why calibration kept the current grade/state.
+        reason: String,
+    },
     /// One grade lower.
     Demote {
+        /// Preset's calibrated grade prior to demotion.
         from_grade: SkillGrade,
+        /// Lower grade after demotion.
         to_grade: SkillGrade,
+        /// First-pass task count in the evaluation window.
         first_pass: u32,
+        /// Total task count in the evaluation window.
         total: u32,
     },
     /// One grade back up toward its onboarded grade.
     Restore {
+        /// Preset's lower calibrated grade prior to restoration.
         from_grade: SkillGrade,
+        /// Restored higher grade.
         to_grade: SkillGrade,
+        /// First-pass task count in the evaluation window.
         first_pass: u32,
+        /// Total task count in the evaluation window.
         total: u32,
     },
     /// Failing at `l1`: no longer routed.
     Disable {
+        /// Grade held before disabling.
         from_grade: SkillGrade,
+        /// First-pass task count in the evaluation window.
         first_pass: u32,
+        /// Total task count in the evaluation window.
         total: u32,
     },
 }
@@ -997,17 +1060,22 @@ pub const CLASSIFY_L1_MAX_CHARS: usize = 400;
 /// recorded classification carries nothing the brief's masking would hide.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassificationSignal {
+    /// Stable identifier of the matched classification rule.
     pub rule: String,
+    /// Signed score contribution added by `rule`.
     pub points: i32,
+    /// Structured rule-owned evidence tokens (never free brief text).
     pub evidence: Vec<String>,
 }
 
 /// What [`classify_difficulty`] decided, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DifficultyClassification {
+    /// Classified task difficulty (`l1`, `l2`, or `l3`).
     pub difficulty: TaskDifficulty,
+    /// Net score accumulated across all matched signals.
     pub score: i32,
-    /// [`CLASSIFIER_RULES`].
+    /// `CLASSIFIER_RULES`.
     pub rules: String,
     /// Every rule that matched, in the rule-set's order.
     pub signals: Vec<ClassificationSignal>,
@@ -1507,8 +1575,11 @@ pub const REPROBE_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
 /// (`mission_tasks.first_preset_id`, `difficulty`, `created_at_ms`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresetActivity {
+    /// Preset identifier.
     pub preset_id: String,
+    /// Task difficulty bucket.
     pub difficulty: TaskDifficulty,
+    /// Epoch milliseconds when a task was last first-assigned to `preset_id` at `difficulty`.
     pub last_assigned_ms: i64,
 }
 
