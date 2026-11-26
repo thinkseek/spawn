@@ -283,8 +283,7 @@ fn view_now(engine: &str, home: &EngineHome) -> Boxed {
     if let Some(dir) = lookup("HOME").filter(|dir| dir.starts_with('/')) {
         bases.push(Path::new(&dir).join(".cache"));
     }
-    let herdr_backend = crate::config::terminal_host()
-        .is_ok_and(|host| !matches!(host, spawn_host::LocalTerminalHost::Tmux(_)));
+    let herdr_backend = crate::config::terminal_host().is_ok();
     view_with(
         &lookup,
         engine,
@@ -760,7 +759,6 @@ fn terminal_backend() -> Value {
         Err(error) => return json!({ "backend": null, "error": error }),
     };
     match host {
-        spawn_host::LocalTerminalHost::Tmux(_) => json!({ "backend": "tmux" }),
         spawn_host::LocalTerminalHost::Herdr(herdr) => herdr_backend(&herdr, None),
         spawn_host::LocalTerminalHost::HerdrCore(hc) => herdr_core_backend(&hc, None),
         spawn_host::LocalTerminalHost::HerdrPool(pool) => {

@@ -860,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn the_terminal_backend_is_tmux_unless_herdr_is_asked_for() {
+    fn the_terminal_backend_is_herdr_only_and_refuses_tmux() {
         assert_eq!(terminal_backend(None), Ok(TerminalBackend::Herdr));
         assert_eq!(terminal_backend(Some("")), Ok(TerminalBackend::Herdr));
         assert_eq!(terminal_backend(Some("herdr")), Ok(TerminalBackend::Herdr));
@@ -868,14 +868,28 @@ mod tests {
             terminal_backend(Some(" herdr ")),
             Ok(TerminalBackend::Herdr)
         );
-        assert_eq!(terminal_backend(Some("tmux")), Ok(TerminalBackend::Tmux));
-        assert_eq!(terminal_backend(Some(" tmux ")), Ok(TerminalBackend::Tmux));
+        for removed in ["tmux", " tmux "] {
+            let error = terminal_backend(Some(removed)).expect_err(removed);
+            assert!(error.contains("SPAWN_TERMINAL_BACKEND"), "{error}");
+            assert!(error.contains("tmux"), "{error}");
+            assert!(error.contains("removed"), "{error}");
+        }
         for unknown in ["screen", "Herdr", "TMUX", "zellij"] {
             let error = terminal_backend(Some(unknown)).expect_err(unknown);
             assert!(error.contains("SPAWN_TERMINAL_BACKEND"), "{error}");
             assert!(error.contains(unknown), "{error}");
             assert!(error.contains("herdr (the default)"), "{error}");
         }
+    }
+
+    #[test]
+    fn terminal_host_selects_core_or_legacy_herdr_modes() {
+        use super::{HerdrMode, herdr_mode};
+        assert_eq!(herdr_mode(None), Ok(HerdrMode::Core));
+        assert_eq!(herdr_mode(Some("")), Ok(HerdrMode::Core));
+        assert_eq!(herdr_mode(Some(" core ")), Ok(HerdrMode::Core));
+        assert_eq!(herdr_mode(Some("legacy")), Ok(HerdrMode::Legacy));
+        assert!(herdr_mode(Some("tmux")).is_err());
     }
 
     #[test]
@@ -955,20 +969,23 @@ impl Flags {
 /// The terminal backends `SPAWN_TERMINAL_BACKEND` names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalBackend {
-    Tmux,
     Herdr,
 }
 
 /// The backend `value` (`SPAWN_TERMINAL_BACKEND`) names: Herdr when it is
-/// unset or empty, tmux when it says so; anything else is refused, never
-/// read as Herdr.
+/// unset, empty, or `"herdr"`; `"tmux"` (removed) and anything else are
+/// refused.
 pub(crate) fn terminal_backend(value: Option<&str>) -> Result<TerminalBackend, String> {
     match value.map(str::trim) {
         None | Some("" | "herdr") => Ok(TerminalBackend::Herdr),
-        Some("tmux") => Ok(TerminalBackend::Tmux),
+        Some("tmux") => Err(
+            "SPAWN_TERMINAL_BACKEND=\"tmux\" is no longer supported: tmux has been removed; \
+             use herdr (the default)"
+                .to_string(),
+        ),
         Some(other) => Err(format!(
-            "SPAWN_TERMINAL_BACKEND={other:?} names no terminal backend: use herdr (the default) \
-             or tmux"
+            "SPAWN_TERMINAL_BACKEND={other:?} names no terminal backend: only herdr (the default) \
+             is supported"
         )),
     }
 }
@@ -1026,57 +1043,38 @@ fn sibling_spawn_hc() -> String {
     "spawn-hc".to_string()
 }
 
-/// The terminal host the environment describes: by default embedded `herdr-core`
-/// via `spawn-hc` (or external legacy `herdr 0.9.5` with `SPAWN_HERDR_MODE=legacy`)
-/// on the session `SPAWN_HERDR_SESSION` (`spawn` by default), sharded across
-/// `SPAWN_HERDR_SHARDS` independent servers when greater than 1; or, with
-/// `SPAWN_TERMINAL_BACKEND=tmux`, tmux on this machine on the server of
-/// `SPAWN_TMUX_SOCKET` when set (`SPAWN_TMUX_PROGRAM`, `tmux` by default).
+/// The terminal host the environment describes: embedded `herdr-core` via
+/// `spawn-hc` by default (or external legacy `herdr 0.9.5` with
+/// `SPAWN_HERDR_MODE=legacy`) on the session `SPAWN_HERDR_SESSION` (`spawn` by
+/// default), sharded across `SPAWN_HERDR_SHARDS` independent servers when
+/// greater than 1.
 pub(crate) fn terminal_host() -> Result<spawn_host::LocalTerminalHost, String> {
-    Ok(
-        match terminal_backend(env_value("SPAWN_TERMINAL_BACKEND").as_deref())? {
-            TerminalBackend::Tmux => {
-                spawn_host::LocalTerminalHost::Tmux(spawn_host::TmuxHost::on_socket(
-                    &env_or("SPAWN_TMUX_PROGRAM", "tmux"),
-                    env_value("SPAWN_TMUX_SOCKET"),
-                ))
-            }
-            TerminalBackend::Herdr => {
-                let mode = herdr_mode(env_value("SPAWN_HERDR_MODE").as_deref())?;
-                let session = env_or("SPAWN_HERDR_SESSION", spawn_host::herdr::DEFAULT_SESSION);
-                let shards = herdr_shards(env_value("SPAWN_HERDR_SHARDS").as_deref())?;
-                match (mode, shards) {
-                    (HerdrMode::Core, 1) => spawn_host::LocalTerminalHost::HerdrCore(
-                        spawn_host::HerdrCoreHost::on_session(&sibling_spawn_hc(), &session)
-                            .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
-                    ),
-                    (HerdrMode::Core, count) => spawn_host::LocalTerminalHost::HerdrPool(
-                        spawn_host::HerdrPool::on_core_session(
-                            &sibling_spawn_hc(),
-                            &session,
-                            count,
-                        )
-                        .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
-                    ),
-                    (HerdrMode::Legacy, 1) => spawn_host::LocalTerminalHost::Herdr(
-                        spawn_host::HerdrHost::on_session(
-                            &env_or("SPAWN_HERDR_PROGRAM", "herdr"),
-                            &session,
-                        )
-                        .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
-                    ),
-                    (HerdrMode::Legacy, count) => spawn_host::LocalTerminalHost::HerdrPool(
-                        spawn_host::HerdrPool::on_session(
-                            &env_or("SPAWN_HERDR_PROGRAM", "herdr"),
-                            &session,
-                            count,
-                        )
-                        .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
-                    ),
-                }
-            }
-        },
-    )
+    let TerminalBackend::Herdr = terminal_backend(env_value("SPAWN_TERMINAL_BACKEND").as_deref())?;
+    let mode = herdr_mode(env_value("SPAWN_HERDR_MODE").as_deref())?;
+    let session = env_or("SPAWN_HERDR_SESSION", spawn_host::herdr::DEFAULT_SESSION);
+    let shards = herdr_shards(env_value("SPAWN_HERDR_SHARDS").as_deref())?;
+    Ok(match (mode, shards) {
+        (HerdrMode::Core, 1) => spawn_host::LocalTerminalHost::HerdrCore(
+            spawn_host::HerdrCoreHost::on_session(&sibling_spawn_hc(), &session)
+                .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
+        ),
+        (HerdrMode::Core, count) => spawn_host::LocalTerminalHost::HerdrPool(
+            spawn_host::HerdrPool::on_core_session(&sibling_spawn_hc(), &session, count)
+                .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
+        ),
+        (HerdrMode::Legacy, 1) => spawn_host::LocalTerminalHost::Herdr(
+            spawn_host::HerdrHost::on_session(&env_or("SPAWN_HERDR_PROGRAM", "herdr"), &session)
+                .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
+        ),
+        (HerdrMode::Legacy, count) => spawn_host::LocalTerminalHost::HerdrPool(
+            spawn_host::HerdrPool::on_session(
+                &env_or("SPAWN_HERDR_PROGRAM", "herdr"),
+                &session,
+                count,
+            )
+            .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
+        ),
+    })
 }
 
 #[cfg(test)]

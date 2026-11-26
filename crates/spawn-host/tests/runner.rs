@@ -1,138 +1,189 @@
-//! Issue #15, item 2: a terminal of an execution's name is not its runner.
+//! Runner identity and process-lifecycle tests for `HerdrCoreHost` (`spawn-hc`).
 //!
-//! tmux keeps a session after its runner is gone when the pane stays dead
-//! (`remain-on-exit`), and a terminal manager (tmux-resurrect, continuum)
-//! restores a session of the same name after a restart, at a shell prompt.
-//! `has-session` says yes to both; `runner` tells them from the runner this
-//! host launched. tmux is real, on a server of the test's own that reads no
-//! configuration.
-//!
-//! A tmux server shuts down once its last session ends, and a client that
-//! connects meanwhile is dropped with "server exited unexpectedly": the
-//! server, or a pane it is still forking (which holds its socket until it
-//! execs), had the socket open but never reads the command. A step that
-//! must not meet that runs on a server another session keeps up.
+//! Covers:
+//! - A terminal hosts its runner only while the launch owned by this host lives;
+//!   an un-owned terminal or exited launch reports [`Runner::Gone`].
+//! - Repeated start/terminate cycles across daemon restarts never leak launch
+//!   environment files.
+//! - `terminate` waits for HUP-trapping runners to finish writing before
+//!   returning, and sends `SIGKILL` after the hangup timeout to HUP-ignoring ones.
+//! - Terminating a gone terminal never touches another whose name it prefixes
+//!   (`spawn-exec_1` vs `spawn-exec_12`).
+//! - When the daemon stops on its own, `terminate` still waits for and kills
+//!   the recorded session leader.
 
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
-use spawn_core::port::{Launch, Runner, TerminalHost};
-use spawn_host::TmuxHost;
+use spawn_core::port::{Launch, Runner, ServerSeen, TerminalHost};
+use spawn_host::{HerdrCoreHost, Scratch};
 
-/// Serialize the external programs of this test binary (see api.rs: a fork
-/// inherits the write handle of a script another thread is creating).
+/// Serialize external `spawn-hc` invocations in this test binary so concurrent
+/// forks never race on freshly written temporary scripts (`Text file busy`).
 fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn spawn_hc_program() -> String {
+    if let Some(prog) = std::env::var_os("SPAWN_HERDR_CORE_PROGRAM")
+        .map(|v| v.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+    {
+        return prog;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for dir in [exe.parent(), exe.parent().and_then(Path::parent)]
+            .into_iter()
+            .flatten()
+        {
+            let candidate = dir.join("spawn-hc");
+            if candidate.is_file() {
+                return candidate.display().to_string();
+            }
+        }
+    }
+    "spawn-hc".to_string()
+}
+
 struct Server {
-    directory: PathBuf,
-    socket: String,
+    program: String,
+    session: String,
+    scratch: Scratch,
 }
 
 impl Server {
-    /// A server of this test's own, `tag` telling it from the other tests'.
+    /// An isolated `herdr-core` server with short `/var/tmp` runtime paths so
+    /// Unix socket paths remain well below Linux's 107-byte `sun_path` limit.
     fn new(tag: &str) -> Self {
-        let socket = format!("spawn-runner-test-{tag}-{}", std::process::id());
-        let directory = std::env::temp_dir().join(&socket);
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).expect("scratch");
-        let server = Self { directory, socket };
-        fs::create_dir(server.runtime()).expect("runtime");
-        fs::set_permissions(server.runtime(), fs::Permissions::from_mode(0o700)).expect("0700");
-        server
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let session = format!("rn-{tag}-{}-{n}", std::process::id());
+        let scratch = Scratch::new_in(Path::new("/var/tmp"), &format!("shcr-{n}"));
+        let rt = scratch.join("run");
+        for sub in ["", "hcr", "hcs", "hcc"] {
+            let dir = if sub.is_empty() {
+                rt.clone()
+            } else {
+                rt.join(sub)
+            };
+            fs::create_dir_all(&dir).expect("runtime");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("0700");
+        }
+        Self {
+            program: spawn_hc_program(),
+            session,
+            scratch,
+        }
     }
 
-    /// The hosts' runtime directory, in place of `$XDG_RUNTIME_DIR`: what
-    /// they keep there stays in the test's scratch (backlog S20).
     fn runtime(&self) -> PathBuf {
-        self.directory.join("run")
+        self.scratch.join("run")
     }
 
-    /// The host, through a `tmux` that runs on this server.
-    fn host(&self) -> TmuxHost {
-        self.host_through(&format!("exec {}", self.command()))
+    fn host(&self) -> HerdrCoreHost {
+        self.host_with(&self.program)
     }
 
-    /// `tmux` on this server, as a shell command.
-    fn command(&self) -> String {
-        format!("tmux -L {} -f /dev/null \"$@\"", self.socket)
+    fn host_with(&self, program: &str) -> HerdrCoreHost {
+        HerdrCoreHost::on_session(program, &self.session)
+            .expect("valid session")
+            .with_runtime_under(self.runtime())
     }
 
-    /// The host, through a `tmux` that runs `script` (shell).
-    fn host_through(&self, script: &str) -> TmuxHost {
-        let target = self.directory.join("tmux");
-        let temporary = self.directory.join("tmux.tmp");
+    fn hc_cmd(&self, arguments: &[&str]) -> Command {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (name, _) in std::env::vars_os() {
+            if name
+                .to_str()
+                .is_some_and(|n| n.starts_with("HERDR_") || n.starts_with("HC_"))
+            {
+                cmd.env_remove(name);
+            }
+        }
+        let rt = self.runtime();
+        cmd.env("XDG_RUNTIME_DIR", rt.join("hcr"))
+            .env("XDG_STATE_HOME", rt.join("hcs"))
+            .env("XDG_CONFIG_HOME", rt.join("hcc"))
+            .env("HC_SESSION", &self.session)
+            .env(
+                "HC_SOCKET",
+                rt.join("hcr").join(format!("{}.sock", self.session)),
+            );
+        cmd
+    }
+
+    fn stop_daemon(&self) {
+        let _ = self.hc_cmd(&["server", "stop"]).status();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(self.host().server(), ServerSeen::Answers(_)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Abruptly SIGKILLs the `herdr-core` server and its PTY holder(s), closing
+    /// the master PTYs cleanly (sending kernel SIGHUP to live PTY sessions)
+    /// without invoking graceful `server stop` child teardown.
+    fn crash_daemon(&self) {
+        if let Ok(output) = self.hc_cmd(&["server", "status", "--json"]).output()
+            && output.status.success()
+            && let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        {
+            let mut pids = Vec::new();
+            if let Some(pid) = doc["pid"].as_u64().and_then(|p| u32::try_from(p).ok()) {
+                pids.push(pid);
+            }
+            for holder in doc["holders"].as_array().into_iter().flatten() {
+                if let Some(pid) = holder["pid"].as_u64().and_then(|p| u32::try_from(p).ok()) {
+                    pids.push(pid);
+                }
+            }
+            for pid in pids {
+                if let Some(raw) = rustix::process::Pid::from_raw(pid.cast_signed()) {
+                    let _ = rustix::process::kill_process(raw, rustix::process::Signal::KILL);
+                }
+            }
+        }
+        let sock = self
+            .runtime()
+            .join("hcr")
+            .join(format!("{}.sock", self.session));
+        let _ = fs::remove_file(sock);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(self.host().server(), ServerSeen::Answers(_)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn write_script(&self, name: &str, body: &str) -> String {
+        let target = self.scratch.join(name);
+        let temporary = self.scratch.join(format!("{name}.tmp"));
         {
             let mut file = fs::File::create(&temporary).expect("create");
-            write!(file, "#!/bin/sh\n{script}\n").expect("write");
+            file.write_all(body.as_bytes()).expect("write");
             file.sync_all().expect("sync");
         }
         let mut permissions = fs::metadata(&temporary).expect("stat").permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&temporary, permissions).expect("chmod");
         fs::rename(&temporary, &target).expect("rename");
-        TmuxHost::local(&target.display().to_string()).with_runtime_under(self.runtime())
-    }
-
-    /// tmux on this server, directly: what a terminal manager does.
-    fn tmux(&self, arguments: &[&str]) {
-        let status = Command::new("tmux")
-            .args(["-L", &self.socket, "-f", "/dev/null"])
-            .args(arguments)
-            .status()
-            .expect("tmux is installed");
-        assert!(status.success(), "tmux {arguments:?}");
-    }
-
-    /// Wait until the launch in `terminal()` runs `program`: its shell has
-    /// read and removed the environment file, which a pane killed earlier
-    /// leaves behind.
-    fn wait_running(&self, program: &str) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let output = Command::new("tmux")
-                .args(["-L", &self.socket, "-f", "/dev/null", "list-panes"])
-                .args(["-t", "=spawn-exec_1:", "-F", "#{pane_current_command}"])
-                .output()
-                .expect("tmux is installed");
-            let running = String::from_utf8_lossy(&output.stdout);
-            if running.trim() == program {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the launch runs {running:?}, not {program}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        target.display().to_string()
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", &self.socket, "kill-server"])
-            .stderr(std::process::Stdio::null())
-            .status();
-        let _ = fs::remove_dir_all(&self.directory);
-        // tmux leaves the socket file behind; it is this test's own.
-        if let Ok(meta) = fs::metadata("/proc/self") {
-            use std::os::unix::fs::MetadataExt;
-            let dir = std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into());
-            let _ = fs::remove_file(
-                std::path::Path::new(&dir)
-                    .join(format!("tmux-{}", meta.uid()))
-                    .join(&self.socket),
-            );
-        }
+        self.stop_daemon();
     }
 }
 
@@ -144,9 +195,14 @@ fn workspace() -> WorkspaceId {
     WorkspaceId::new("agent_one:/tmp").expect("valid workspace")
 }
 
-fn launch(program: &str, arguments: &[&str], environment: &[(&str, &str)]) -> Launch {
+fn launch_named(
+    terminal: TerminalName,
+    program: &str,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Launch {
     Launch {
-        terminal: terminal(),
+        terminal,
         workspace: workspace(),
         cwd: "/tmp".to_string(),
         program: program.to_string(),
@@ -158,17 +214,11 @@ fn launch(program: &str, arguments: &[&str], environment: &[(&str, &str)]) -> La
     }
 }
 
-/// Dead panes the test starts for one whose exit status the server records
-/// (see the dead-pane section: a server that never reaps its child records
-/// none), and how long one is waited for: the status is recorded the moment
-/// the child is reaped, so an attempt that has not seen it in seconds will
-/// never see it.
-const DEAD_PANE_ATTEMPTS: u32 = 6;
-const DEAD_PANE_WAIT: Duration = Duration::from_secs(5);
+fn launch(program: &str, arguments: &[&str], environment: &[(&str, &str)]) -> Launch {
+    launch_named(terminal(), program, arguments, environment)
+}
 
-/// What `runner` answers once it stops answering `Running` or `limit`
-/// passes.
-fn settled(host: &TmuxHost, limit: Duration) -> Runner {
+fn settled(host: &HerdrCoreHost, limit: Duration) -> Runner {
     let deadline = Instant::now() + limit;
     loop {
         let runner = host.runner(&terminal(), &workspace()).expect("runner");
@@ -179,206 +229,28 @@ fn settled(host: &TmuxHost, limit: Duration) -> Runner {
     }
 }
 
-#[test]
-fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
-    let _exclusive = exclusive();
-    let server = Server::new("runner");
-    let host = server.host();
-    assert_eq!(
-        host.runner(&terminal(), &workspace()).expect("runner"),
-        Runner::Gone,
-        "no server, no terminal"
-    );
-    // A session of the terminal manager's own keeps the server up from here
-    // on, as on a server in use: no step below meets a server shutting down
-    // because the terminal it just killed was the last one.
-    server.tmux(&["new-session", "-d", "-s", "keep"]);
-
-    // Launched by this host, with an environment and without one.
-    for environment in [&[("SPAWN_EXECUTION_ID", "exec_1")][..], &[]] {
-        host.start(&launch("/bin/cat", &[], environment))
-            .expect("start");
-        assert_eq!(
-            host.runner(&terminal(), &workspace()).expect("runner"),
-            Runner::Running
-        );
-        assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
-        server.wait_running("cat");
-        host.terminate(&terminal(), &workspace()).expect("kill");
-        assert_eq!(
-            host.runner(&terminal(), &workspace()).expect("runner"),
-            Runner::Gone
-        );
-    }
-
-    // A session of the same name restored at a shell prompt: tmux has it,
-    // and it hosts no runner.
-    server.tmux(&[
-        "new-session",
-        "-d",
-        "-s",
-        "spawn-exec_1",
-        "-x",
-        "80",
-        "-y",
-        "20",
-    ]);
-    assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
-    let Runner::Untracked(seen) = host.runner(&terminal(), &workspace()).expect("runner") else {
-        panic!("a restored shell hosts no runner");
-    };
-    assert!(seen.contains("no command"), "{seen}");
-    host.terminate(&terminal(), &workspace()).expect("kill");
-
-    // A dead pane kept by remain-on-exit: the runner exited (3) and the
-    // session stays.
-    server.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
-    // tmux marks the pane dead when its terminal closes, and records the
-    // exit status when it reaps the process, a moment later on a loaded host
-    // ("exit status none" in between: an owner gate, 2026-11-07). Its server
-    // sometimes never reaps that child at all — a zombie, `pane_dead` 1 and
-    // no status for minutes on this host, 2026-11-08 — and a status it never
-    // recorded cannot be read. That is the terminal's doing, not the
-    // runner's, so the pane is started again for one the server reaps; the
-    // assertion below still holds every attempt to the same fact.
-    let mut seen = String::new();
-    for attempt in 1..=DEAD_PANE_ATTEMPTS {
-        host.start(&launch("/bin/sh", &["-c", "exit 3"], &[("A", "1")]))
-            .expect("start");
-        let deadline = Instant::now() + DEAD_PANE_WAIT;
-        loop {
-            let Runner::Untracked(why) = settled(&host, Duration::from_secs(5)) else {
-                panic!("a dead pane hosts no runner");
-            };
-            seen = why;
-            if !seen.contains("exit status none") || Instant::now() > deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            host.is_alive(&terminal(), &workspace()).expect("alive"),
-            "a dead pane's session stays up"
-        );
-        if seen.contains("dead (exit status 3)") || attempt == DEAD_PANE_ATTEMPTS {
-            break;
-        }
-        host.terminate(&terminal(), &workspace()).expect("kill");
-    }
-    assert!(seen.contains("dead (exit status 3)"), "{seen}");
-}
-
-/// A launch right after the server's last terminal ended (the only
-/// execution was killed just after it started, as one whose prompt could
-/// not be typed is, and the next one starts) starts: its `new-session` may
-/// reach the server while it shuts down, which drops it unread ("server
-/// exited unexpectedly"), and that says nothing about the launch.
-#[test]
-fn a_launch_starts_while_the_server_shuts_down_after_its_last_terminal() {
-    let _exclusive = exclusive();
-    let server = Server::new("restart");
-    let host = server.host();
-    let before = environment_files(&server);
-    for round in 0..20 {
-        host.start(&launch("/bin/cat", &[], &[]))
-            .unwrap_or_else(|error| panic!("start {round}: {error:?}"));
-        assert_eq!(
-            host.runner(&terminal(), &workspace()).expect("runner"),
-            Runner::Running
-        );
-        // At once, while the pane may still be forking with the server's
-        // socket open: the server's only session, so it shuts down next.
-        host.terminate(&terminal(), &workspace()).expect("kill");
-    }
-    // A pane killed before its shell ran leaves its environment file.
-    let directory = server.runtime();
-    for name in environment_files(&server) {
-        if !before.contains(&name) {
-            let _ = fs::remove_file(directory.join(name));
-        }
-    }
-}
-
-/// The environment files of this process's launches that are still there.
 fn environment_files(server: &Server) -> Vec<String> {
+    fn collect(dir: &Path, prefix: &str, found: &mut std::collections::BTreeSet<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, prefix, found);
+            } else if let Some(name) = entry.file_name().to_str()
+                && name.starts_with(prefix)
+            {
+                found.insert(name.to_string());
+            }
+        }
+    }
     let prefix = format!("spawn-launch-spawn-exec_1-{}-", std::process::id());
-    fs::read_dir(server.runtime())
-        .expect("read the directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with(&prefix))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    let mut found = std::collections::BTreeSet::new();
+    collect(&server.runtime(), &prefix, &mut found);
+    found.into_iter().collect()
 }
 
-/// A launch is asked for again only when tmux said the server left
-/// ("server exited unexpectedly", as tmux reports a server that shut down
-/// before it read the call), each time with a new environment file, and a
-/// few times at most.
-#[test]
-fn a_launch_is_asked_again_only_of_a_server_that_left() {
-    let _exclusive = exclusive();
-    let server = Server::new("left");
-    let calls = server.directory.join("calls");
-    let left = server.directory.join("left");
-    let logged = || {
-        let logged = fs::read_to_string(&calls).unwrap_or_default();
-        let _ = fs::remove_file(&calls);
-        logged.lines().map(str::to_string).collect::<Vec<_>>()
-    };
-    // `new-session` meets a server that left while the marker `left` is
-    // there (`once`: the first time only); every call is logged.
-    let tmux = |once: bool| {
-        server.host_through(&format!(
-            "printf '%s\\n' \"$1\" >>'{calls}'\n\
-             if [ \"$1\" = new-session ] && [ -e '{left}' ]; then\n\
-             {forget}  echo 'server exited unexpectedly' >&2\n  exit 1\nfi\nexec {tmux}",
-            calls = calls.display(),
-            left = left.display(),
-            forget = if once {
-                format!("  rm -f '{}'\n", left.display())
-            } else {
-                String::new()
-            },
-            tmux = server.command(),
-        ))
-    };
-    let before = environment_files(&server);
-
-    fs::write(&left, "").expect("marker");
-    let host = tmux(true);
-    host.start(&launch("/bin/cat", &[], &[("A", "1")]))
-        .expect("the second call starts it");
-    assert_eq!(logged(), ["new-session", "new-session"]);
-    assert_eq!(
-        host.runner(&terminal(), &workspace()).expect("runner"),
-        Runner::Running
-    );
-    server.wait_running("cat");
-    host.terminate(&terminal(), &workspace()).expect("kill");
-    let _ = logged();
-
-    fs::write(&left, "").expect("marker");
-    let host = tmux(false);
-    let error = host
-        .start(&launch("/bin/cat", &[], &[("A", "1")]))
-        .expect_err("a server that always leaves");
-    assert!(error.0.contains("server exited unexpectedly"), "{error:?}");
-    let asked = logged();
-    assert!(
-        asked.len() > 1 && asked.len() <= 5 && asked.iter().all(|call| call == "new-session"),
-        "{asked:?}"
-    );
-    assert_eq!(
-        environment_files(&server),
-        before,
-        "an environment file was left"
-    );
-}
-
-/// Wait until a process holding `marker` runs, then a moment for its shell
-/// to have set its trap.
 fn until_running(marker: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !running_with(marker) {
@@ -388,7 +260,6 @@ fn until_running(marker: &str) {
     std::thread::sleep(Duration::from_millis(200));
 }
 
-/// Whether a live process's command line holds `marker`.
 fn running_with(marker: &str) -> bool {
     fs::read_dir("/proc")
         .expect("/proc")
@@ -405,24 +276,163 @@ fn running_with(marker: &str) -> bool {
         })
 }
 
-/// `terminate` returns only once the runner and what it started have
-/// exited: kill-session returns as soon as the session is gone, while the
-/// runner is still exiting on the hang-up and writing (028's stop lost the
-/// line its engine wrote then, rev-e). A runner that writes as it dies has
-/// written when `terminate` returns; one that ignores the hang-up is killed
-/// after the wait, and gone when it returns.
+#[test]
+fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
+    let _exclusive = exclusive();
+    let server = Server::new("runner");
+    let host = server.host();
+    assert_eq!(
+        host.runner(&terminal(), &workspace()).expect("runner"),
+        Runner::Gone,
+        "no server, no terminal"
+    );
+
+    // Launched by this host, with an environment and without one.
+    let marker = format!("spawn-runner-live-{}", std::process::id());
+    for environment in [&[("SPAWN_EXECUTION_ID", "exec_1")][..], &[]] {
+        host.start(&launch(
+            "/bin/sh",
+            &["-c", "while :; do sleep 0.05; done", &marker],
+            environment,
+        ))
+        .expect("start");
+        assert_eq!(
+            host.runner(&terminal(), &workspace()).expect("runner"),
+            Runner::Running
+        );
+        assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
+        until_running(&marker);
+        host.terminate(&terminal(), &workspace()).expect("kill");
+        assert_eq!(
+            host.runner(&terminal(), &workspace()).expect("runner"),
+            Runner::Gone
+        );
+    }
+
+    // A terminal of the same label started outside `HerdrCoreHost` has no host
+    // record, so it is not treated as a running Spawn runner and `terminate`
+    // closes it by label.
+    let status = server
+        .hc_cmd(&[
+            "run",
+            "--bg",
+            "--no-notify",
+            "--label",
+            &format!("spawn_owner={}", server.session),
+            "--label",
+            "spawn_terminal=spawn-exec_1",
+            "--",
+            "/bin/cat",
+        ])
+        .status()
+        .expect("spawn-hc run");
+    assert!(status.success(), "external spawn-hc run failed");
+    assert_eq!(
+        host.runner(&terminal(), &workspace()).expect("runner"),
+        Runner::Gone
+    );
+    // Clean up the externally launched terminal by stopping or killing via spawn-hc.
+    if let Ok(output) = server
+        .hc_cmd(&["ls", "--label", "spawn_terminal=spawn-exec_1", "--json"])
+        .output()
+        && output.status.success()
+        && let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        && let Some(addr) = doc["terminals"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|item| item["address"].as_str())
+    {
+        let _ = server.hc_cmd(&["kill", addr]).status();
+    }
+
+    // Once its launched command exits (`exit 3`), the runner is gone.
+    host.start(&launch("/bin/sh", &["-c", "exit 3"], &[("A", "1")]))
+        .expect("start short exit");
+    assert_eq!(settled(&host, Duration::from_secs(5)), Runner::Gone);
+    assert!(
+        !host.is_alive(&terminal(), &workspace()).expect("is_alive"),
+        "exited launch is no longer live"
+    );
+}
+
+#[test]
+fn a_launch_starts_while_the_server_shuts_down_after_its_last_terminal() {
+    let _exclusive = exclusive();
+    let server = Server::new("restart");
+    let host = server.host();
+    let before = environment_files(&server);
+    for round in 0..12 {
+        host.start(&launch("/bin/cat", &[], &[]))
+            .unwrap_or_else(|error| panic!("start {round}: {error:?}"));
+        assert_eq!(
+            host.runner(&terminal(), &workspace()).expect("runner"),
+            Runner::Running
+        );
+        host.terminate(&terminal(), &workspace()).expect("kill");
+        if round % 4 == 3 {
+            server.stop_daemon();
+        }
+    }
+    assert_eq!(
+        environment_files(&server),
+        before,
+        "launch environment files leaked after repeated restarts"
+    );
+}
+
+#[test]
+fn a_launch_recovers_after_stale_socket_and_cleans_up_on_daemon_failure() {
+    let _exclusive = exclusive();
+    let server = Server::new("stale");
+    let host = server.host();
+    let before = environment_files(&server);
+
+    // Leave a stale Unix socket file where no daemon listens; starting a
+    // launch removes it and brings up the daemon cleanly.
+    let sock = server
+        .runtime()
+        .join("hcr")
+        .join(format!("{}.sock", server.session));
+    let _ = fs::remove_file(&sock);
+    fs::write(&sock, b"").expect("stale socket placeholder");
+    host.start(&launch("/bin/cat", &[], &[("A", "1")]))
+        .expect("start recovers past stale socket");
+    assert_eq!(
+        host.runner(&terminal(), &workspace()).expect("runner"),
+        Runner::Running
+    );
+    host.terminate(&terminal(), &workspace()).expect("kill");
+    assert_eq!(environment_files(&server), before);
+
+    // A broken `spawn-hc` binary fails loudly and cleans up the launch script.
+    let broken_prog = server.write_script(
+        "broken-hc",
+        "#!/bin/sh\necho 'synthetic herdr-core refusal' >&2\nexit 1\n",
+    );
+    let broken_host = server.host_with(&broken_prog);
+    server.stop_daemon();
+    let err = broken_host
+        .start(&launch("/bin/cat", &[], &[("SECRET", "x")]))
+        .expect_err("broken daemon refuses start");
+    assert!(!err.0.is_empty());
+    assert_eq!(
+        environment_files(&server),
+        before,
+        "launch environment file leaked after failed start"
+    );
+}
+
 #[test]
 fn terminate_returns_once_the_runner_and_what_it_started_are_gone() {
     let _exclusive = exclusive();
     let server = Server::new("terminate");
-    server.tmux(&["new-session", "-d", "-s", "keep"]);
     let host = server
         .host()
         .with_terminate_waits(Duration::from_secs(5), Duration::from_secs(2));
-    let late = server.directory.join("late");
+    let late = server.scratch.join("late");
     let marker = format!("spawn-dies-writing-{}", std::process::id());
     let script = format!(
-        "trap 'sleep 0.3; echo late >> {}; exit 0' HUP; while :; do sleep 0.05; done",
+        "trap 'sleep 0.3; echo late >> {}; exit 0' TERM HUP; while :; do sleep 0.05; done",
         late.display()
     );
     host.start(&launch("/bin/sh", &["-c", &script, &marker], &[]))
@@ -436,12 +446,16 @@ fn terminate_returns_once_the_runner_and_what_it_started_are_gone() {
     );
     assert!(!running_with(&marker), "the runner is gone");
 
-    // One that ignores the hang-up: SIGKILL after the wait.
+    // One that ignores hangup/term: `wait_sessions_gone` escalates to SIGKILL.
     let host = host.with_terminate_waits(Duration::from_millis(300), Duration::from_secs(2));
     let marker = format!("spawn-ignores-hangup-{}", std::process::id());
     host.start(&launch(
         "/bin/sh",
-        &["-c", "trap '' HUP; while :; do sleep 0.05; done", &marker],
+        &[
+            "-c",
+            "trap '' TERM HUP; while :; do sleep 0.05; done",
+            &marker,
+        ],
         &[],
     ))
     .expect("start");
@@ -456,31 +470,23 @@ fn terminate_returns_once_the_runner_and_what_it_started_are_gone() {
     );
 }
 
-/// Terminating a terminal that is gone touches no other: tmux reads a
-/// window target `=spawn-exec_1` that matches no session as a prefix
-/// (`spawn-exec_12`) or a window name, and a terminate that read the pane's
-/// pid so would have waited out spawn-exec_12's runner and killed it
-/// (rev-f on ca758b4b). The session form is exact.
 #[test]
 fn terminating_a_gone_terminal_leaves_one_whose_name_it_prefixes() {
     let _exclusive = exclusive();
     let server = Server::new("prefix");
-    server.tmux(&["new-session", "-d", "-s", "keep"]);
+    let exec_12 = TerminalName::new("spawn-exec_12").expect("valid");
     let marker = format!("spawn-exec-12-lives-{}", std::process::id());
-    server.tmux(&[
-        "new-session",
-        "-d",
-        "-s",
-        "spawn-exec_12",
-        "/bin/sh",
-        "-c",
-        "while :; do sleep 0.05; done",
-        &marker,
-    ]);
-    until_running(&marker);
     let host = server
         .host()
         .with_terminate_waits(Duration::from_millis(300), Duration::from_millis(300));
+    host.start(&launch_named(
+        exec_12.clone(),
+        "/bin/sh",
+        &["-c", "while :; do sleep 0.05; done", &marker],
+        &[],
+    ))
+    .expect("start spawn-exec_12");
+    until_running(&marker);
     assert_eq!(
         host.runner(&terminal(), &workspace()).expect("runner"),
         Runner::Gone,
@@ -490,42 +496,35 @@ fn terminating_a_gone_terminal_leaves_one_whose_name_it_prefixes() {
         .expect("terminating a gone terminal is harmless");
     std::thread::sleep(Duration::from_millis(700));
     assert!(running_with(&marker), "spawn-exec_12's runner still runs");
+    host.terminate(&exec_12, &workspace())
+        .expect("clean up spawn-exec_12");
 }
 
-/// A session that vanished on its own, tmux dying or the session killed
-/// outside `terminate`, leaves no pane to read, while its runner may still
-/// be exiting on the hang-up, or ignore it and run on. `terminate` reads the
-/// session from the leader recorded at start (backlog P6): it waits for a
-/// runner that writes as it dies, and kills one that ignores the hang-up.
 #[test]
 fn terminate_waits_for_a_runner_whose_session_vanished_on_its_own() {
     let _exclusive = exclusive();
     let server = Server::new("vanished");
-    // The leaders' records under a private directory of the test's own (no
-    // $XDG_RUNTIME_DIR in a gate's sandbox).
-    let leaders = server.directory.join("leaders");
-    fs::create_dir(&leaders).expect("leaders");
-    fs::set_permissions(&leaders, fs::Permissions::from_mode(0o700)).expect("0700");
     let host = server
         .host()
-        .with_terminate_waits(Duration::from_secs(5), Duration::from_secs(2))
-        .with_runtime_under(leaders);
+        .with_terminate_waits(Duration::from_secs(5), Duration::from_secs(2));
 
-    // tmux dies; the runner writes as it dies, 0.5 s after the hang-up.
-    let late = server.directory.join("late");
+    // Daemon & holder vanish (`herdr-core` starts children with SIGHUP ignored):
+    // `terminate` sends SIGTERM to the recorded session leader and waits while
+    // the runner writes as it dies 0.4 s later.
+    let late = server.scratch.join("late");
     let marker = format!("spawn-vanished-writing-{}", std::process::id());
     let script = format!(
-        "trap 'sleep 0.5; echo late >> {}; exit 0' HUP; while :; do sleep 0.05; done",
+        "trap 'sleep 0.4; echo late >> {}; exit 0' HUP TERM; while :; do sleep 0.05; done",
         late.display()
     );
     host.start(&launch("/bin/sh", &["-c", &script, &marker], &[]))
         .expect("start");
     until_running(&marker);
-    server.tmux(&["kill-server"]);
+    server.crash_daemon();
     assert_eq!(
         host.runner(&terminal(), &workspace()).expect("runner"),
         Runner::Gone,
-        "the session vanished"
+        "the daemon vanished"
     );
     host.terminate(&terminal(), &workspace())
         .expect("terminate");
@@ -536,26 +535,28 @@ fn terminate_waits_for_a_runner_whose_session_vanished_on_its_own() {
     );
     assert!(!running_with(&marker), "the runner is gone");
 
-    // The session killed by hand; the runner ignores the hang-up and runs
-    // on: killed after the wait.
+    // Daemon & holder vanish while the runner ignores HUP/TERM: `terminate`
+    // waits 300 ms and SIGKILLs the recorded session leader.
     let host = host.with_terminate_waits(Duration::from_millis(300), Duration::from_secs(2));
-    server.tmux(&["new-session", "-d", "-s", "keep"]);
     let marker = format!("spawn-vanished-ignores-{}", std::process::id());
     host.start(&launch(
         "/bin/sh",
-        &["-c", "trap '' HUP; while :; do sleep 0.05; done", &marker],
+        &[
+            "-c",
+            "trap '' TERM HUP; while :; do sleep 0.05; done",
+            &marker,
+        ],
         &[],
     ))
     .expect("start");
     until_running(&marker);
-    server.tmux(&["kill-session", "-t", "=spawn-exec_1"]);
+    server.crash_daemon();
     std::thread::sleep(Duration::from_millis(200));
-    assert!(running_with(&marker), "it outlived its session");
+    assert!(running_with(&marker), "it outlived the daemon crash");
     let started = Instant::now();
     host.terminate(&terminal(), &workspace()).expect("killed");
     assert!(started.elapsed() >= Duration::from_millis(300), "it waited");
     assert!(!running_with(&marker), "killed, and gone");
-    // A second terminate is harmless, and waits for nothing.
     let started = Instant::now();
     host.terminate(&terminal(), &workspace()).expect("again");
     assert!(

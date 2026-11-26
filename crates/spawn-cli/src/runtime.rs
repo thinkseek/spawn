@@ -63,7 +63,7 @@ fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, O
     }
     let workspaces: Arc<dyn WorkspaceStore> = Arc::new(missions);
     let mut host = crate::config::terminal_host()?;
-    let herdr_backend = !matches!(host, spawn_host::LocalTerminalHost::Tmux(_));
+    let herdr_backend = true;
     let mut config = bridge_config_for(herdr_backend)?;
     config.recover_worker_leases = recover_worker_leases;
     // The transcript archive's credential mask (objective 175): the

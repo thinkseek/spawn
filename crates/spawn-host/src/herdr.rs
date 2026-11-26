@@ -60,7 +60,7 @@ use spawn_core::port::{
 };
 
 use crate::process::ProcessId;
-use crate::tmux::{HANGUP_WAIT, KILL_WAIT};
+use crate::terminal_support::{HANGUP_WAIT, KILL_WAIT};
 
 /// The Herdr session the host runs on when none is named.
 pub const DEFAULT_SESSION: &str = "spawn";
@@ -437,11 +437,11 @@ pub(crate) fn herdr_key(key: &str) -> Result<Press, TerminalError> {
 
 /// Whether a variable of the caller's stays out of every `herdr` call (and
 /// so out of the server it starts, whose environment each pane inherits):
-/// the controller's settings and secrets, as for tmux ([`crate::tmux::scrub`]),
+/// the controller's settings and secrets, as for tmux ([`crate::terminal_support::scrub`]),
 /// and every `HERDR_*` one. Spawn run inside a Herdr pane has that pane's
 /// `HERDR_SOCKET_PATH`, which would aim a call at the user's own session.
 pub(crate) fn scrub(name: &std::ffi::OsStr) -> bool {
-    crate::tmux::scrub(name)
+    crate::terminal_support::scrub(name)
         || name
             .to_str()
             .is_some_and(|name| name.starts_with("HERDR_") || name.starts_with("HC_"))
@@ -509,7 +509,7 @@ impl HerdrHost {
     }
 
     /// The same host, reading, restoring and replacing every file below
-    /// `projects` through it, as [`crate::TmuxHost::with_files_beneath`].
+    /// `projects` through it.
     #[must_use]
     pub fn with_files_beneath(mut self, projects: crate::beneath::Beneath) -> Self {
         self.beneath = Some(projects);
@@ -1464,7 +1464,9 @@ pub(crate) const CLEAR_SCREEN: &str = "printf '\\033[H\\033[2J\\033[3J'\n";
 pub(crate) fn launch_script(launch: &Launch) -> Result<String, TerminalError> {
     let mut script = String::from(CLEAR_SCREEN);
     script.push_str("set -a\n");
-    script.push_str(&crate::tmux::environment_text(&launch.environment)?);
+    script.push_str(&crate::terminal_support::environment_text(
+        &launch.environment,
+    )?);
     script.push_str("set +a\nrm -f -- \"$0\"\nexec ");
     let mut words = vec![launch.program.clone()];
     words.extend(launch.arguments.iter().cloned());
@@ -1559,10 +1561,10 @@ impl TerminalHost for HerdrHost {
         // The environment (a database login among it) never goes on a
         // command line, nor through the pane's screen: it is in the script,
         // which only this uid reads and which removes itself.
-        let script = crate::tmux::write_private(
+        let script = crate::terminal_support::write_private(
             &state,
             &launch.terminal,
-            crate::tmux::LAUNCH,
+            crate::terminal_support::LAUNCH,
             "sh",
             "the launch",
             &launch_script(launch)?,
@@ -1806,10 +1808,10 @@ impl TerminalHost for HerdrHost {
                 CALL_LIMIT,
             );
         }
-        crate::tmux::wait_sessions_gone(terminal, &leaders, self.waits, "pane.close")?;
+        crate::terminal_support::wait_sessions_gone(terminal, &leaders, self.waits, "pane.close")?;
         // What the engine detached from its session, still beneath the
         // workspace: ended by pid before the caller's final checkpoint.
-        crate::tmux::end_stragglers(workspace.path(), self.waits)?;
+        crate::terminal_support::end_stragglers(workspace.path(), self.waits)?;
         self.forget(terminal);
         self.unfollow(terminal);
         Ok(())
@@ -1869,11 +1871,11 @@ impl TerminalHost for HerdrHost {
         path: &str,
         offset: u64,
     ) -> Result<Option<Vec<u8>>, TerminalError> {
-        crate::tmux::read_from_files(self.beneath.as_ref(), workspace, path, offset)
+        crate::terminal_support::read_from_files(self.beneath.as_ref(), workspace, path, offset)
     }
 
     fn list_dirs(&self, _workspace: &WorkspaceId, dir: &str) -> Result<Vec<String>, TerminalError> {
-        crate::tmux::list_dirs_files(self.beneath.as_ref(), dir)
+        crate::terminal_support::list_dirs_files(self.beneath.as_ref(), dir)
     }
 
     fn write_new(
@@ -1882,7 +1884,7 @@ impl TerminalHost for HerdrHost {
         path: &str,
         bytes: &[u8],
     ) -> Result<bool, TerminalError> {
-        crate::tmux::write_new_file(self.beneath.as_ref(), path, bytes)
+        crate::terminal_support::write_new_file(self.beneath.as_ref(), path, bytes)
     }
 
     fn replace_grown(
@@ -1892,7 +1894,7 @@ impl TerminalHost for HerdrHost {
         bytes: &[u8],
         current: &[u8],
     ) -> Result<bool, TerminalError> {
-        crate::tmux::replace_grown_file(self.beneath.as_ref(), path, bytes, current)
+        crate::terminal_support::replace_grown_file(self.beneath.as_ref(), path, bytes, current)
     }
 }
 
@@ -2415,7 +2417,6 @@ mod tests {
         for name in [
             "SPAWN_DATABASE_URL",
             "SPAWN_SERVE_TOKEN",
-            "SPAWN_TMUX_SOCKET",
             "SPAWN_HERDR_SESSION",
             "SPAWN_HERDR_PROGRAM",
             "PGPASSWORD",

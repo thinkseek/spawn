@@ -703,9 +703,16 @@ impl SpawnConfig {
 
     fn validate_terminal(&self) -> Result<(), String> {
         let backend = self.terminal.backend.as_deref().unwrap_or("herdr");
-        if !matches!(backend, "herdr" | "tmux") {
+        if backend == "tmux" {
+            return Err(
+                "[terminal].backend = \"tmux\" is no longer supported: tmux has been removed; \
+                 use \"herdr\""
+                    .to_string(),
+            );
+        }
+        if backend != "herdr" {
             return Err(format!(
-                "[terminal].backend = {backend:?} is invalid: expected \"herdr\" or \"tmux\""
+                "[terminal].backend = {backend:?} is invalid: expected \"herdr\""
             ));
         }
         if let Some(session) = &self.terminal.session {

@@ -26,7 +26,7 @@ use spawn_core::port::{
 use crate::herdr::{launch_script, no_listener, peer_server, private, scrub, valid_session};
 use crate::herdr_witness;
 use crate::process::ProcessId;
-use crate::tmux::{HANGUP_WAIT, KILL_WAIT};
+use crate::terminal_support::{HANGUP_WAIT, KILL_WAIT};
 
 /// Default session name used when `SPAWN_HERDR_SESSION` is unset.
 pub const DEFAULT_SESSION: &str = "spawn";
@@ -829,10 +829,10 @@ impl TerminalHost for HerdrCoreHost {
         self.forget(&launch.terminal);
         let server = self.ensure_server()?;
         self.checked(server)?;
-        let script = crate::tmux::write_private(
+        let script = crate::terminal_support::write_private(
             &state,
             &launch.terminal,
-            crate::tmux::LAUNCH,
+            crate::terminal_support::LAUNCH,
             "sh",
             "the launch",
             &launch_script(launch)?,
@@ -1075,6 +1075,7 @@ impl TerminalHost for HerdrCoreHost {
         } else {
             Vec::new()
         };
+        let mut killed_by_server = false;
         if let ServerSeen::Answers(Some(server)) = self.identity() {
             let owned_by_label = server != record.server
                 && self
@@ -1088,10 +1089,19 @@ impl TerminalHost for HerdrCoreHost {
                     });
             if server == record.server || owned_by_label {
                 self.kill_and_remove(&record.address)?;
+                killed_by_server = true;
             }
         }
-        crate::tmux::wait_sessions_gone(terminal, &leaders, self.waits, "terminal.kill")?;
-        crate::tmux::end_stragglers(workspace.path(), self.waits)?;
+        if !killed_by_server && !leaders.is_empty() {
+            crate::terminal_support::signal_sessions(&leaders, rustix::process::Signal::TERM);
+        }
+        crate::terminal_support::wait_sessions_gone(
+            terminal,
+            &leaders,
+            self.waits,
+            "terminal.kill",
+        )?;
+        crate::terminal_support::end_stragglers(workspace.path(), self.waits)?;
         self.forget(terminal);
         self.unfollow(terminal);
         Ok(())
@@ -1161,11 +1171,11 @@ impl TerminalHost for HerdrCoreHost {
         path: &str,
         offset: u64,
     ) -> Result<Option<Vec<u8>>, TerminalError> {
-        crate::tmux::read_from_files(self.beneath.as_ref(), workspace, path, offset)
+        crate::terminal_support::read_from_files(self.beneath.as_ref(), workspace, path, offset)
     }
 
     fn list_dirs(&self, _workspace: &WorkspaceId, dir: &str) -> Result<Vec<String>, TerminalError> {
-        crate::tmux::list_dirs_files(self.beneath.as_ref(), dir)
+        crate::terminal_support::list_dirs_files(self.beneath.as_ref(), dir)
     }
 
     fn write_new(
@@ -1174,7 +1184,7 @@ impl TerminalHost for HerdrCoreHost {
         path: &str,
         bytes: &[u8],
     ) -> Result<bool, TerminalError> {
-        crate::tmux::write_new_file(self.beneath.as_ref(), path, bytes)
+        crate::terminal_support::write_new_file(self.beneath.as_ref(), path, bytes)
     }
 
     fn replace_grown(
@@ -1184,7 +1194,7 @@ impl TerminalHost for HerdrCoreHost {
         bytes: &[u8],
         current: &[u8],
     ) -> Result<bool, TerminalError> {
-        crate::tmux::replace_grown_file(self.beneath.as_ref(), path, bytes, current)
+        crate::terminal_support::replace_grown_file(self.beneath.as_ref(), path, bytes, current)
     }
 }
 

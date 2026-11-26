@@ -1111,3 +1111,31 @@ fn cli_config_init_from_host_docker_plan_and_doctor_emit_valid_outputs() {
     assert!(doc_json.get("host_inherit").is_some());
     assert!(doc_json.get("archive_mask_tool").is_some());
 }
+
+#[test]
+fn config_toml_rejects_removed_tmux_terminal_backend() {
+    let dir = std::env::temp_dir().join(format!("spawn-config-toml-tmux-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let cfg = dir.join("spawn.toml");
+    std::fs::write(
+        &cfg,
+        "schema_version = 1\n\n[instance]\ndata_dir = \"/srv/spawn-instance\"\n\n[terminal]\nbackend = \"tmux\"\n",
+    )
+    .expect("write config");
+    let out = Command::new(env!("CARGO_BIN_EXE_spawn"))
+        .args(["config", "check", "--config", &cfg.display().to_string()])
+        .output()
+        .expect("run config check");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !out.status.success(),
+        "config check must reject backend = \"tmux\""
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("tmux"), "{stderr}");
+    assert!(
+        stderr.contains("removed") || stderr.contains("no longer supported"),
+        "{stderr}"
+    );
+}
