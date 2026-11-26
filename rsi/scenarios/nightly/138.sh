@@ -10,19 +10,25 @@
 # Black box, 045's world: a real `spawn loop` (the Bridge, the dispatcher,
 # the alerts step) runs two ephemeral workers on 045's fake engine, its mode
 # per agent (ctl/<agent>.mode): `take` writes what is typed into its
-# transcript and ends the turn; `nomark` (138's own) does the same but
-# writes the line without its marker ("[spawn message #<id>]"), as a
-# missed marker reads: never seen taken, yet the agent goes on to the next
-# input. Inputs come from a person (`spawn submit`).
+# transcript and ends the turn; `deaf` writes nothing of it: never seen
+# taken, its transcript unmoved; `hold` (138's own) is `deaf` with a busy
+# screen until the scenario releases it, so the Bridge, which types the
+# next input only after a ready screen read since the last typing, can
+# type a later one (after `deaf` it never does). Since PR #88 (ace244ad0,
+# issue #66 Part 1) a transcript line read after a typed message's typing
+# suppresses or clears its message_not_taken, so each untaken input here
+# is `hold` or `deaf` (its `read_since_typed` stays 0), typed only once the
+# previous turn's end is recorded. Inputs come from a person (`spawn submit`).
 # SPAWN_MESSAGE_TAKEN_SECS=12, SPAWN_ALERT_CHECK_SECS=1. Checked:
-#   (1) late, nomark: input A is typed and worked, its marker never seen, and its alert opens. late
-#       takes again; input B is taken. A's alert clears, its evidence naming
-#       B (`later_taken`).
-#   (2) late, nomark again: input C after B, its marker never seen, fires and is still
-#       open 10 s after it opened: nothing later was taken.
-#   (3) quick, nomark: input D is typed and worked, its marker never seen; quick takes again before
-#       D's bound and input E is taken. D never has an alert (24 s on), and
-#       late's C is still open: another session's taking counts for nothing.
+#   (1) late, hold: input A is typed, never seen taken, and its alert
+#       opens. late takes again; input B is taken. A's alert clears, its
+#       clear's evidence naming B (`later_taken`, which outranks
+#       `read_since_typed`).
+#   (2) late, deaf again: input C after B fires and is still open 10 s
+#       after it opened: nothing later was taken.
+#   (3) quick, hold: input D is typed; quick takes again before D's bound
+#       and input E is taken. D never has an alert (24 s on), and late's C
+#       is still open: another session's taking counts for nothing.
 # Exit: 0 pass, 1 a check failed, 2 harness.
 set -eu
 
@@ -234,14 +240,23 @@ while :; do
 }$typed"
   elif [ -n "$buffer" ]; then
     text=$(printf '%s' "$buffer" | jq -Rs .)
-    bare=$(printf '%s' "$buffer" | sed 's/\[spawn message #[0-9]*\]//g' | jq -Rs .)
     buffer=""
     case "$(mode)" in
-    nomark)
-      # Takes it and works its turn, but its line lacks the marker (138):
-      # the message is taken, its marker missed.
-      line "\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":$bare}"
-      log "prompt-nomark"
+    hold)
+      # Shows a turn running but writes nothing of it to the transcript
+      # until released (ctl/<agent>.release): never seen taken, transcript
+      # unmoved. Its busy-then-ready screen is what lets the Bridge type the
+      # next input (bridge.rs SessionView::answered); after `deaf` it never
+      # would.
+      # The spinner sits above an empty prompt, where the screen reader
+      # looks (screen.rs read_claude_screen): busy. The release erases both.
+      log "hold"
+      printf '\n✻ Working… (esc to interrupt)\n❯ '
+      until [ -e "$BB_WORK/ctl/$agent.release" ]; do sleep 0.2; done
+      rm -f "$BB_WORK/ctl/$agent.release"
+      log "released"
+      printf '\r\033[2K\033[1A\r\033[2Kdone\n\n❯ '
+      continue
       ;;
     deaf)
       log "deaf"
@@ -419,11 +434,47 @@ until_message() {
         sleep 0.5
     done
 }
-nomarks() { # <label>: how many lines its engine worked without their marker
-    awk -v a="$(get "$1" agent)" '$2 == a && $3 == "prompt-nomark"' "$WORK/engine.log" | wc -l | tr -d ' '
+logged() { # <label> <what>: how many times its engine logged that
+    awk -v a="$(get "$1" agent)" -v w="$2" '$2 == a && $3 == w' "$WORK/engine.log" | wc -l | tr -d ' '
+}
+# settled <label> <seconds>: its engine is idle and every turn end it wrote
+# is recorded (turn.stopped from the transcript), so an input typed next has
+# no older transcript line read after its typing; 0 when so in time.
+settled() {
+    deadline=$(($(date +%s) + $2))
+    until idle "$1" &&
+        [ "$(q "select count(*) from spawn_events where session_id = '$(get "$1" session)' and source = 'claude' and event_name = 'turn.stopped'")" -ge "$(logged "$1" turn-ended)" ]; do
+        [ "$(date +%s)" -lt "$deadline" ] || return 1
+        sleep 0.2
+    done
+}
+# untaken <label> <deaf|hold> <key> <text> <step>: switch the agent to that
+# mode, send, and wait until its engine logged the input so; prints its id.
+untaken() {
+    settled "$1" 30 || harness "($5) $1's last turn end was not recorded within 30 s"
+    printf '%s\n' "$2" >"$WORK/ctl/$(get "$1" agent).mode"
+    seen=$(logged "$1" "$2")
+    id=$(send "$1" "$3" "$4")
+    deadline=$(($(date +%s) + 20))
+    until [ "$(logged "$1" "$2")" -gt "$seen" ]; do
+        [ "$(date +%s)" -lt "$deadline" ] || harness "($5) $1's engine did not read input $id ($2) within 20 s"
+        sleep 0.2
+    done
+    echo "$id"
+}
+# release <label> <held id> <step>: once the Bridge recorded the held turn's
+# busy screen (after that input's typing), end the hold: its ready screen
+# then lets the next input be typed.
+release() {
+    deadline=$(($(date +%s) + 30))
+    until [ "$(q "select count(*) from spawn_events where session_id = '$(get "$1" session)' and event_name = 'screen.observed' and kind -> 'detail' ->> 'state' = 'busy' and id > (select min(id) from spawn_events where session_id = '$(get "$1" session)' and source = 'bridge' and source_event_id = 'cmd_$2:typed')")" -ge 1 ]; do
+        [ "$(date +%s)" -lt "$deadline" ] || harness "($3) no busy screen of $1 was recorded after input $2's typing within 30 s"
+        sleep 0.2
+    done
+    : >"$WORK/ctl/$(get "$1" agent).release"
 }
 idle() { # the agent's engine ended a turn and has had none since
-    awk -v a="$(get "$1" agent)" '$2 == a { last = $3 } END { exit !(last == "turn-ended" || last == "deaf") }' "$WORK/engine.log"
+    awk -v a="$(get "$1" agent)" '$2 == a { last = $3 } END { exit !(last == "turn-ended" || last == "deaf" || last == "released") }' "$WORK/engine.log"
 }
 terminal_of() { echo "spawn-$(q "select execution_id from agent_executions where session_id = '$(get "$1" session)' and ended_at_ms is null order by started_at_ms desc limit 1")"; }
 alerts() { # <command id>: its message_not_taken alerts, `state` a line each
@@ -476,29 +527,28 @@ note "every worker took its task"
 
 # --- (1) a later message taken clears the earlier one's alert --------------------------
 
-printf 'nomark\n' >"$WORK/ctl/$(get late agent).mode"
-a_id=$(send late bb-late-a "BB:PING late A")
+a_id=$(untaken late hold bb-late-a "BB:PING late A" 1)
 deadline=$(($(date +%s) + 40))
 until [ "$(alerts "$a_id" | tr '\n' ' ')" = "open " ] || [ "$(date +%s)" -ge "$deadline" ]; do sleep 0.5; done
 [ "$(alerts "$a_id" | tr '\n' ' ')" = "open " ] ||
     fail "(1) input A to late, typed and never taken, has alerts [$(alerts "$a_id" | tr '\n' ' ')], not one open within 40 s; its records: $(q "select left(string_agg((kind -> 'detail' -> 'record' ->> 'type') || ' ' || (kind -> 'detail' -> 'record' -> 'evidence')::text, ' | '), 600) from spawn_events where kind -> 'detail' -> 'record' ->> 'key' = 'message_not_taken:$a_id'")"
 printf 'take\n' >"$WORK/ctl/$(get late agent).mode"
 b_id=$(send late bb-late-b "BB:PING late B")
+release late "$a_id" 1
 until_message late "$b_id" '.taken >= 1' 40 ||
     harness "(1) input B to late was not taken within 40 s: $(m late "$b_id" '.message | tostring')"
 deadline=$(($(date +%s) + 20))
 until [ "$(alerts "$a_id" | tr '\n' ' ')" = "cleared " ] || [ "$(date +%s)" -ge "$deadline" ]; do sleep 0.5; done
 [ "$(alerts "$a_id" | tr '\n' ' ')" = "cleared " ] ||
     fail "(1) input B to late was taken after input A, and A's message_not_taken alert is [$(alerts "$a_id" | tr '\n' ' ')], not cleared within 20 s"
-named=$(q "select count(*) from spawn_events where kind -> 'detail' -> 'record' -> 'evidence' ->> 'later_taken' = '$b_id'")
+named=$(q "select count(*) from spawn_events where kind -> 'detail' -> 'record' ->> 'key' = 'message_not_taken:$a_id' and kind -> 'detail' -> 'record' ->> 'type' = 'alert.cleared' and kind -> 'detail' -> 'record' -> 'evidence' ->> 'later_taken' = '$b_id'")
 [ "$named" -ge 1 ] ||
-    fail "(1) A's alert cleared, and no record's evidence names B ($b_id) as later_taken: $(q "select left(string_agg((kind -> 'detail' -> 'record')::text, ' | '), 600) from spawn_events where kind -> 'detail' -> 'record' ->> 'key' = 'message_not_taken:$a_id' and kind -> 'detail' -> 'record' ->> 'type' = 'alert.cleared'")"
+    fail "(1) A's alert cleared, and its clear's evidence does not name B ($b_id) as later_taken: $(q "select left(string_agg((kind -> 'detail' -> 'record')::text, ' | '), 600) from spawn_events where kind -> 'detail' -> 'record' ->> 'key' = 'message_not_taken:$a_id' and kind -> 'detail' -> 'record' ->> 'type' = 'alert.cleared'")"
 note "(1) a later message taken cleared A's alert, naming it"
 
 # --- (2) one after the taken one, never taken, stays open ------------------------------
 
-printf 'nomark\n' >"$WORK/ctl/$(get late agent).mode"
-c_id=$(send late bb-late-c "BB:PING late C")
+c_id=$(untaken late deaf bb-late-c "BB:PING late C" 2)
 deadline=$(($(date +%s) + 40))
 until [ "$(alerts "$c_id" | tr '\n' ' ')" = "open " ] || [ "$(date +%s)" -ge "$deadline" ]; do sleep 0.5; done
 [ "$(alerts "$c_id" | tr '\n' ' ')" = "open " ] ||
@@ -510,20 +560,14 @@ note "(2) C, with nothing taken after it, fired and stays open"
 
 # --- (3) a later message taken before the bound: no alert ------------------------------
 
-printf 'nomark\n' >"$WORK/ctl/$(get quick agent).mode"
-before=$(nomarks quick)
-d_id=$(send quick bb-quick-d "BB:PING quick D")
+# The engine reads its mode as it takes the line: untaken returns only
+# once it has read D (held), so E, sent next, meets `take`.
+d_id=$(untaken quick hold bb-quick-d "BB:PING quick D" 3)
 until_message quick "$d_id" '.typed_at_ms != null' 20 ||
     harness "(3) input D to quick was not typed within 20 s: $(m quick "$d_id" '.message | tostring')"
-# The engine reads its mode as it takes the line: switch only once it has
-# worked D without its marker and ended that turn.
-deadline=$(($(date +%s) + 20))
-until [ "$(nomarks quick)" -gt "$before" ] && idle quick; do
-    [ "$(date +%s)" -lt "$deadline" ] || harness "(3) quick's engine did not work D without its marker within 20 s"
-    sleep 0.2
-done
 printf 'take\n' >"$WORK/ctl/$(get quick agent).mode"
 e_id=$(send quick bb-quick-e "BB:PING quick E")
+release quick "$d_id" 3
 until_message quick "$e_id" '.taken >= 1' 20 ||
     harness "(3) input E to quick was not taken within 20 s: $(m quick "$e_id" '.message | tostring')"
 [ "$(m quick "$d_id" '.message.taken')" = 0 ] ||
