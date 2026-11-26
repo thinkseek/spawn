@@ -512,6 +512,10 @@ pub(crate) struct Settings {
     pub(crate) guardrail_raise_ms: i64,
     /// How long it must stay back before its alert clears.
     pub(crate) guardrail_clear_ms: i64,
+    /// Minimum dwell time at `turn_stopped_idle` before `agent_stuck` fires.
+    pub(crate) stuck_idle_dwell_ms: i64,
+    /// Minimum dwell time at `quiet_live` before `agent_stuck` fires.
+    pub(crate) stuck_quiet_dwell_ms: i64,
 }
 
 /// A database URL, which holds a password: never shown, not even by
@@ -611,6 +615,8 @@ impl Settings {
             guardrail_ms: secs("SPAWN_ALERT_GUARDRAIL_SECS", 300, &mut warnings),
             guardrail_raise_ms: secs("SPAWN_GUARDRAIL_RAISE_SECS", 7200, &mut warnings),
             guardrail_clear_ms: secs("SPAWN_GUARDRAIL_CLEAR_SECS", 3600, &mut warnings),
+            stuck_idle_dwell_ms: secs("SPAWN_ALERT_STUCK_IDLE_DWELL_SECS", 60, &mut warnings),
+            stuck_quiet_dwell_ms: secs("SPAWN_ALERT_STUCK_QUIET_DWELL_SECS", 180, &mut warnings),
         };
         (settings, warnings)
     }
@@ -2524,6 +2530,19 @@ times in a row)",
                         }),
                     });
                 }
+                if let Some(session) = record["session_id"].as_str() {
+                    for key in self.open_keys("agent_stuck", session) {
+                        out.push(Event::Clear {
+                            key,
+                            evidence: json!({
+                                "execution_cleared": execution,
+                                "session_id": session,
+                                "waited_ms": record["waited_ms"],
+                                "event_id": event_id,
+                            }),
+                        });
+                    }
+                }
             }
             _ => {}
         }
@@ -2556,6 +2575,71 @@ times in a row)",
     /// and how long before that judgement the engine last moved, as the
     /// observation records them (`ambiguity`, its evidence's
     /// `progress_ms`).
+    fn push_clears(open: Vec<String>, evidence: &Value, out: &mut Vec<Event>) {
+        for key in open {
+            out.push(Event::Clear {
+                key,
+                evidence: evidence.clone(),
+            });
+        }
+    }
+
+    fn stuck_dwell_blocked(&self, judgement: &Value) -> bool {
+        let min_ms = match judgement["ambiguity"].as_str() {
+            Some("turn_stopped_idle") => self.settings.stuck_idle_dwell_ms,
+            Some("quiet_live") => self.settings.stuck_quiet_dwell_ms,
+            _ => return false,
+        };
+        judgement["evidence"]["quiet_ms"]
+            .as_i64()
+            .or_else(|| judgement["evidence"]["progress_ms"].as_i64())
+            .is_some_and(|ms| ms < min_ms)
+    }
+
+    fn fire_stuck(
+        session: &str,
+        event_id: i64,
+        stuck: f64,
+        observation: &Value,
+        held: Option<&(i64, String)>,
+        dispatch: Option<&[String]>,
+        out: &mut Vec<Event>,
+    ) {
+        let judgement = &observation["observation"];
+        let mut evidence = json!({
+            "agent_id": observation["agent_id"], "stuck": stuck,
+            "state": judgement["state"], "judge": judgement["judge"],
+            "event_id": event_id,
+        });
+        let mut text = format!(
+            "{session} is stuck ({stuck:.2}): {}",
+            judgement["state"].as_str().unwrap_or("unknown")
+        );
+        text = stuck_context(observation, &mut evidence, text);
+        if let Some((task, state)) = held {
+            let command = (state == "delivered").then(|| restart_command(*task));
+            evidence["task"] = json!(task);
+            evidence["task_state"] = json!(state);
+            evidence["command"] = json!(command);
+            text = format!("{text} on task #{task} ({state})");
+            if let Some(command) = &command {
+                text = format!("{text}; `{command}` gives it a fresh execution");
+            }
+        }
+        if let Some(dispatch) = dispatch {
+            evidence["dispatch"] = json!(dispatch);
+            text = format!("{text}; it has to dispatch: {}", dispatch.join(", "));
+        }
+        out.push(Event::Fire {
+            key: format!("agent_stuck:{session}:{event_id}"),
+            kind: "agent_stuck",
+            subject: session.to_string(),
+            evidence,
+            text,
+            notice: false,
+        });
+    }
+
     fn observe(&mut self, observations: &Value, out: &mut Vec<Event>) {
         for observation in observations.as_array().into_iter().flatten() {
             let session = observation["session_id"]
@@ -2569,13 +2653,13 @@ times in a row)",
             let ended = observation["ended_event"].as_i64();
             let judged = self.stuck_held(&session, observation);
             let is_supervisor = session == crate::supervise::SUPERVISOR_SESSION;
-            let held = if is_supervisor {
-                None
-            } else {
-                observation["agent_id"]
-                    .as_str()
-                    .and_then(|agent| self.held_task(agent))
-            };
+            let held = (!is_supervisor)
+                .then(|| {
+                    observation["agent_id"]
+                        .as_str()
+                        .and_then(|agent| self.held_task(agent))
+                })
+                .flatten();
             let done = held.as_ref().is_some_and(|(_, state)| {
                 PART_DONE.contains(&state.as_str())
                     && observation["agent_id"].as_str().is_some_and(ephemeral)
@@ -2583,82 +2667,64 @@ times in a row)",
             // A resident's task past its part is history, not what it is
             // stuck on: its alert names a task in work only.
             let held = held.filter(|(_, state)| done || !PART_DONE.contains(&state.as_str()));
-            let dispatch = if is_supervisor {
-                self.supervisor_work()
-            } else {
-                None
-            };
+            let dispatch = is_supervisor.then(|| self.supervisor_work()).flatten();
             let idle_supervisor = dispatch.as_ref().is_some_and(Vec::is_empty);
             if let Some(ended) = ended {
-                for key in open {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({
-                            "event_id": ended,
-                            "cause": observation["ended_cause"],
-                        }),
-                    });
-                }
+                Self::push_clears(
+                    open,
+                    &json!({"event_id": ended, "cause": observation["ended_cause"]}),
+                    out,
+                );
             } else if stuck.is_some_and(|stuck| stuck < LIKELY) {
-                for key in open {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({"stuck": stuck, "event_id": event_id}),
-                    });
-                }
+                Self::push_clears(open, &json!({"stuck": stuck, "event_id": event_id}), out);
+            } else if stuck.is_none()
+                && judgement["judge"] == "rules"
+                && judgement["state"] == "WORKING"
+            {
+                Self::push_clears(
+                    open,
+                    &json!({"event_id": event_id, "judge": "rules", "state": judgement["state"]}),
+                    out,
+                );
+            } else if let Some(progress_event) = observation["progress_event"].as_i64() {
+                Self::push_clears(
+                    open,
+                    &json!({
+                        "event_id": progress_event,
+                        "observation_event_id": event_id,
+                        "progress_event": progress_event,
+                    }),
+                    out,
+                );
             } else if done {
                 // Its task's record cleared it; one still open (a record
                 // read before a restart) clears at a later judgement.
                 let (task, state) = held.clone().unwrap_or_default();
-                for key in open {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({"event_id": event_id, "task": task, "task_state": state}),
-                    });
-                }
-            } else if idle_supervisor {
-                for key in open {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({
-                            "event_id": self.watermark, "nothing_to_dispatch": true,
-                        }),
-                    });
-                }
-            } else if open.is_empty() && !judged && stuck.is_some_and(|stuck| stuck >= LIKELY) {
-                let mut evidence = json!({
-                    "agent_id": observation["agent_id"], "stuck": stuck,
-                    "state": judgement["state"], "judge": judgement["judge"],
-                    "event_id": event_id,
-                });
-                let mut text = format!(
-                    "{session} is stuck ({:.2}): {}",
-                    stuck.unwrap_or_default(),
-                    judgement["state"].as_str().unwrap_or("unknown")
+                Self::push_clears(
+                    open,
+                    &json!({"event_id": event_id, "task": task, "task_state": state}),
+                    out,
                 );
-                text = stuck_context(observation, &mut evidence, text);
-                if let Some((task, state)) = &held {
-                    let command = (state == "delivered").then(|| restart_command(*task));
-                    evidence["task"] = json!(task);
-                    evidence["task_state"] = json!(state);
-                    evidence["command"] = json!(command);
-                    text = format!("{text} on task #{task} ({state})");
-                    if let Some(command) = &command {
-                        text = format!("{text}; `{command}` gives it a fresh execution");
-                    }
-                }
-                if let Some(dispatch) = &dispatch {
-                    evidence["dispatch"] = json!(dispatch);
-                    text = format!("{text}; it has to dispatch: {}", dispatch.join(", "));
-                }
-                out.push(Event::Fire {
-                    key: format!("agent_stuck:{session}:{event_id}"),
-                    kind: "agent_stuck",
-                    subject: session.clone(),
-                    evidence,
-                    text,
-                    notice: false,
-                });
+            } else if idle_supervisor {
+                Self::push_clears(
+                    open,
+                    &json!({"event_id": self.watermark, "nothing_to_dispatch": true}),
+                    out,
+                );
+            } else if open.is_empty()
+                && !judged
+                && !self.stuck_dwell_blocked(judgement)
+                && let Some(stuck) = stuck.filter(|s| *s >= LIKELY)
+            {
+                Self::fire_stuck(
+                    &session,
+                    event_id,
+                    stuck,
+                    observation,
+                    held.as_ref(),
+                    dispatch.as_deref(),
+                    out,
+                );
             }
         }
     }
@@ -2675,6 +2741,7 @@ times in a row)",
         let over = observation["ended_event"].is_i64()
             || stuck.is_some_and(|stuck| stuck < LIKELY)
             || (stuck.is_none() && judgement["judge"] == "rules")
+            || observation["progress_event"].is_i64()
             || self.stuck_judged.get(session).is_some_and(|held| {
                 held.zip(execution)
                     .is_some_and(|(held, current)| held != current)
@@ -2797,12 +2864,16 @@ times in a row)",
         for command in commands.as_array().into_iter().flatten() {
             let id = command["command"].as_i64().unwrap_or_default();
             let key = command["key"].as_str().unwrap_or_default();
+            let principal = command["principal"].as_str().unwrap_or_default();
+            let raw_error = command["error"].as_str().unwrap_or_default();
             if key.starts_with("owner-note-")
                 || self.known.contains_key(&format!("command_failed:{id}"))
+                || (spawn_core::bridge::LOOP_PRINCIPALS.contains(&principal)
+                    && raw_error.contains(spawn_core::bridge::PANE_NOT_READY))
             {
                 continue;
             }
-            let error = scrub(command["error"].as_str().unwrap_or_default());
+            let error = scrub(raw_error);
             out.push(Event::Fire {
                 key: format!("command_failed:{id}"),
                 kind: "command_failed",
@@ -5679,6 +5750,8 @@ mod tests {
             guardrail_ms: 300_000,
             guardrail_raise_ms: 7_200_000,
             guardrail_clear_ms: 3_600_000,
+            stuck_idle_dwell_ms: 60_000,
+            stuck_quiet_dwell_ms: 180_000,
         }
     }
 
@@ -9169,6 +9242,7 @@ connections\n";
     #[test]
     fn a_stuck_alert_carries_its_ambiguity_and_its_last_progress() {
         let mut step = monitor();
+        step.settings.stuck_idle_dwell_ms = 0;
         let observation = json!([{"session_id": "session_resident_r1",
             "agent_id": "agent_resident_r1", "event_id": 60, "at_ms": 0,
             "observation": {"stuck": 0.9, "state": "WAITING", "judge": "jev",
@@ -13216,5 +13290,121 @@ execute function alerts_test_deploys_mid_start();
             assert!(evidence["log_bytes"].as_u64().is_some(), "{evidence}");
             drop(store);
         }
+    }
+
+    #[test]
+    fn stuck_alert_waits_for_idle_and_quiet_dwell_hysteresis() {
+        let obs = |id: i64, amb: &str, quiet: i64| {
+            json!([{
+                "session_id": "session_worker_w",
+                "agent_id": "agent_worker_w",
+                "event_id": id,
+                "at_ms": 0,
+                "observation": {
+                    "stuck": 0.9, "state": "WAITING", "judge": "jev",
+                    "ambiguity": amb,
+                    "evidence": {"quiet_ms": quiet, "progress_ms": quiet}
+                }
+            }])
+        };
+        let mut m = monitor();
+        assert!(observed(&mut m, &obs(10, "turn_stopped_idle", 59_999)).is_empty());
+        assert_eq!(
+            fires(&observed(&mut m, &obs(11, "turn_stopped_idle", 60_000))),
+            ["agent_stuck:session_worker_w:11"]
+        );
+        let mut q = monitor();
+        assert!(observed(&mut q, &obs(20, "quiet_live", 179_999)).is_empty());
+        assert_eq!(
+            fires(&observed(&mut q, &obs(21, "quiet_live", 180_000))),
+            ["agent_stuck:session_worker_w:21"]
+        );
+    }
+
+    #[test]
+    fn stuck_alert_clears_on_rules_progress_event_and_execution_cleared() {
+        fn cleared_keys(evs: &[Event]) -> Vec<&str> {
+            evs.iter()
+                .filter_map(|e| match e {
+                    Event::Clear { key, .. } => Some(key.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut m = monitor();
+        let stuck_obs = |id: i64, progress: Option<i64>| {
+            let mut row = json!({
+                "session_id": "session_resident_r1", "agent_id": "agent_resident_r1",
+                "event_id": id, "at_ms": 0, "execution_event": 50,
+                "observation": {"stuck": 0.9, "state": "WAITING", "judge": "jev"}
+            });
+            if let Some(p) = progress {
+                row["progress_event"] = json!(p);
+            }
+            json!([row])
+        };
+        let mut run_obs = |obs: &Value| {
+            let ev = observed(&mut m, obs);
+            let out = decided(&m, ev);
+            commit(&mut m, &out);
+            out
+        };
+        assert_eq!(
+            fires(&run_obs(&stuck_obs(100, None))),
+            ["agent_stuck:session_resident_r1:100"]
+        );
+        let rules = json!([{"session_id": "session_resident_r1", "agent_id": "agent_resident_r1",
+            "event_id": 110, "at_ms": 0, "execution_event": 50,
+            "observation": {"state": "WORKING", "judge": "rules"}}]);
+        assert_eq!(
+            cleared_keys(&run_obs(&rules)),
+            ["agent_stuck:session_resident_r1:100"]
+        );
+        assert_eq!(
+            fires(&run_obs(&stuck_obs(120, None))),
+            ["agent_stuck:session_resident_r1:120"]
+        );
+        let progress_out = run_obs(&stuck_obs(120, Some(125)));
+        assert_eq!(
+            cleared_keys(&progress_out),
+            ["agent_stuck:session_resident_r1:120"]
+        );
+        assert_eq!(
+            fires(&run_obs(&stuck_obs(140, None))),
+            ["agent_stuck:session_resident_r1:140"]
+        );
+        let exec_clr = feed(
+            &mut m,
+            150,
+            0,
+            json!({
+                "type": "execution.cleared", "session_id": "session_resident_r1", "execution_id": "e1", "waited_ms": 100
+            }),
+        );
+        assert_eq!(
+            cleared_keys(&decided(&m, exec_clr)),
+            ["agent_stuck:session_resident_r1:140"]
+        );
+    }
+
+    #[test]
+    fn loop_principal_pane_not_ready_command_failure_is_suppressed() {
+        let mut monitor = monitor();
+        let commands = json!([
+            {"command": 10, "agent_id": "a", "session_id": "s", "principal": "spawn-dispatch",
+             "action": "input", "key": "dispatch-nudge-1",
+             "error": format!("pane state Busy {}", spawn_core::bridge::PANE_NOT_READY)},
+            {"command": 11, "agent_id": "a", "session_id": "s", "principal": "spawn-liveness",
+             "action": "input", "key": "liveness-1",
+             "error": spawn_core::bridge::PANE_NOT_READY},
+            {"command": 12, "agent_id": "a", "session_id": "s", "principal": "spawn-dispatch",
+             "action": "input", "key": "dispatch-2", "error": "terminal disappeared"},
+            {"command": 13, "agent_id": "a", "session_id": "s", "principal": "human",
+             "action": "input", "key": "human-1",
+             "error": spawn_core::bridge::PANE_NOT_READY},
+        ]);
+        let mut out = Vec::new();
+        monitor.commands(&commands, &mut out);
+        assert_eq!(fires(&out), ["command_failed:12", "command_failed:13"]);
     }
 }

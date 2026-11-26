@@ -32,6 +32,7 @@ struct CommandRow {
     principal: Principal,
     key: IdempotencyKey,
     submission: Submission,
+    created_at_ms: i64,
     finished: bool,
     lease: Option<Lease>,
 }
@@ -558,11 +559,13 @@ impl CommandQueue for MemoryStore {
         }
         state.next_command += 1;
         let id = CommandId(state.next_command);
+        let now = self.clock.now();
         state.commands.push(CommandRow {
             id,
             principal: principal.clone(),
             key: submission.idempotency_key.clone(),
             submission: submission.clone(),
+            created_at_ms: now.0,
             finished: false,
             lease: None,
         });
@@ -574,7 +577,6 @@ impl CommandQueue for MemoryStore {
             source_event_id: Some(format!("{id}:accepted")),
             kind: EventKind::CommandAccepted { command_id: id },
         };
-        let now = self.clock.now();
         state.insert(event, now);
         Ok(id)
     }
@@ -623,6 +625,7 @@ impl CommandQueue for MemoryStore {
         let submission = state.commands[index].submission.clone();
         let principal = state.commands[index].principal.as_str().to_string();
         let id = state.commands[index].id;
+        let created_at_ms = state.commands[index].created_at_ms;
         state.commands[index].lease = Some(Lease {
             worker: worker.to_string(),
             attempt,
@@ -636,6 +639,7 @@ impl CommandQueue for MemoryStore {
             agent_id: submission.agent_id,
             session_id: submission.session_id,
             principal,
+            created_at_ms,
             action,
         }))
     }
@@ -657,9 +661,13 @@ impl CommandQueue for MemoryStore {
 
     fn finish(&self, claimed: &Claimed, outcome: &Outcome) -> Result<(), StoreError> {
         let mut state = self.lock();
-        let failure = match outcome {
-            Outcome::Succeeded => None,
-            Outcome::Failed(reason) => Some(crate::redact::redact(reason)),
+        let (succeeded, error) = match outcome {
+            Outcome::Succeeded => (true, None),
+            Outcome::Failed(reason) => (false, Some(crate::redact::redact(reason))),
+            Outcome::Cancelled(reason) => (
+                false,
+                Some(format!("cancelled: {}", crate::redact::redact(reason))),
+            ),
         };
         let (agent_id, session_id) = {
             let row = state
@@ -693,8 +701,8 @@ impl CommandQueue for MemoryStore {
             source_event_id: Some(format!("{}:finished", claimed.command_id)),
             kind: EventKind::CommandFinished {
                 command_id: claimed.command_id,
-                succeeded: failure.is_none(),
-                error: failure,
+                succeeded,
+                error,
             },
         };
         let now = self.clock.now();

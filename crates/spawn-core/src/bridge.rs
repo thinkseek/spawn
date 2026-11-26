@@ -316,11 +316,14 @@ pub struct BridgeConfig {
     /// (`SPAWN_LIST_DIRS_LIMIT`).
     pub session_scan_limit: usize,
     /// Whether an engine with no deny rules of its own
-    /// ([`crate::driver::Guard::Sandbox`]) runs inside a filesystem view
-    /// (decision C2, N6; `SPAWN_ENGINE_VIEW`). Required by default, and
-    /// with no view: such an engine is refused (`engine_unavailable`)
-    /// until the host hands one over. Claude Code never runs in one.
+    /// engine sees whatever its uid sees, as before N6.
     pub engine_view: EngineViewPolicy,
+    /// Maximum release interval for an input waiting on a busy pane (#109).
+    pub input_wait_max_retry: Duration,
+    /// Maximum claim attempts before an unready waiting input expires (#109).
+    pub input_wait_max_attempts: u32,
+    /// Maximum age since submission before an unready waiting input expires (#109).
+    pub input_wait_ttl: Duration,
 }
 
 /// The prefix of the reason a start of an engine this host cannot run
@@ -385,7 +388,18 @@ impl BridgeConfig {
             backstops_per_pass: BACKSTOPS_PER_PASS,
             session_scan_limit: crate::port::LIST_DIRS_LIMIT,
             engine_view: EngineViewPolicy::unconfigured(),
+            input_wait_max_retry: Duration::from_mins(1),
+            input_wait_max_attempts: 30,
+            input_wait_ttl: Duration::from_mins(15),
         }
+    }
+
+    /// Bounded exponential backoff delay before retrying an input waiting on a
+    /// busy pane (#109).
+    pub fn input_wait_backoff(&self, attempt: u32) -> Duration {
+        let factor = 1_u32 << attempt.saturating_sub(1).min(6);
+        let cap = self.input_wait_max_retry.max(self.input_wait_retry);
+        self.input_wait_retry.saturating_mul(factor).min(cap)
     }
 
     /// Where the engine of driver `id` lives: Claude Code's from
@@ -1043,6 +1057,8 @@ struct SessionView {
     /// resolver's key checks nothing reached the pane after its own
     /// acceptance ([`Bridge::press`]).
     last_effect: Option<GlobalPosition>,
+    /// Timestamp of the latest agent progress event folded into this session (#109).
+    last_progress_at_ms: Option<i64>,
 }
 
 /// What the log says about a session's inputs: which wait for their turn,
@@ -1162,6 +1178,35 @@ impl SessionView {
             inputs: Inputs::default(),
             accepted_at: HashMap::new(),
             last_effect: None,
+            last_progress_at_ms: None,
+        }
+    }
+
+    fn fold_progress(&mut self, record: &EventRecord) {
+        let kind = &record.event.kind;
+        let is_progress = matches!(
+            kind,
+            EventKind::MessageReceived
+                | EventKind::ToolStarted { .. }
+                | EventKind::ToolCompleted { .. }
+                | EventKind::TurnStopped { .. }
+                | EventKind::JobStarted { .. }
+                | EventKind::JobEnded { .. }
+                | EventKind::CommandStepped {
+                    step: CommandStep::Typed,
+                    ..
+                }
+        ) || matches!(
+            kind,
+            EventKind::ArtifactCommitted { reason, .. }
+                if *reason != CheckpointReason::BaseMerged
+        );
+        if is_progress
+            && self
+                .last_progress_at_ms
+                .is_none_or(|prev| record.recorded_at.0 >= prev)
+        {
+            self.last_progress_at_ms = Some(record.recorded_at.0);
         }
     }
 
@@ -1603,6 +1648,9 @@ pub struct Bridge {
     /// on a report of its own): given to the tick's report at the end of
     /// [`Bridge::work`].
     stray_notes: Vec<String>,
+    /// Per session, most recent liveness recovery timestamp (`execution.cleared`
+    /// or succeeded `spawn-liveness` input/resume) for cooldown gating (#109).
+    liveness_recoveries: HashMap<SessionId, i64>,
 }
 
 /// How long a Bridge that goes away waits for its kills still under way
@@ -1756,6 +1804,7 @@ impl Bridge {
             abandoned_mounts: Vec::new(),
             kill_threads: std::sync::Mutex::new(Vec::new()),
             stray_notes: Vec::new(),
+            liveness_recoveries: HashMap::new(),
         }
     }
 
@@ -2068,6 +2117,16 @@ impl Bridge {
             let command_id = claimed.command_id;
             match self.handle(&claimed, &mut report)? {
                 Handled::Finished(outcome) => {
+                    if matches!(outcome, Outcome::Succeeded)
+                        && claimed.principal == "spawn-liveness"
+                        && matches!(
+                            claimed.action.get("type").and_then(|v| v.as_str()),
+                            Some("input" | "resume")
+                        )
+                    {
+                        self.liveness_recoveries
+                            .insert(claimed.session_id.clone(), self.clock.now().0);
+                    }
                     self.held.remove(&claimed.command_id);
                     self.prepared.remove(&claimed.command_id);
                     self.prompting.remove(&claimed.command_id);
@@ -2164,19 +2223,30 @@ impl Bridge {
         }
     }
 
+    fn fold_non_session(&mut self, record: &EventRecord) -> bool {
+        self.fold_finished_command(&record.event);
+        if let EventKind::ControlRecorded { record: ctl } = &record.event.kind
+            && ctl.get("type").and_then(|v| v.as_str()) == Some("execution.cleared")
+            && let Some(sid_str) = ctl.get("session_id").and_then(|v| v.as_str())
+            && let Ok(sid) = SessionId::new(sid_str)
+        {
+            self.liveness_recoveries.insert(sid, record.recorded_at.0);
+        }
+        record.event.kind.is_control()
+    }
+
     fn fold(&mut self, record: &EventRecord) {
-        let event = &record.event;
-        self.fold_finished_command(event);
-        // The control stream is not an agent's session.
-        if event.kind.is_control() {
+        if self.fold_non_session(record) {
             return;
         }
+        let event = &record.event;
         let view = self
             .sessions
             .entry(event.session_id.clone())
             .or_insert_with(|| SessionView::from_event(event));
         view.fold_branch(record);
         view.fold_steps(record);
+        view.fold_progress(record);
         view.transcript_read |= transcripts::read_from_transcript(event);
         let current = view
             .active
@@ -6687,6 +6757,7 @@ impl Bridge {
                 agent_id: claimed.agent_id.clone(),
                 session_id: claimed.session_id.clone(),
                 principal: RESOLVE_PRINCIPAL.to_string(),
+                created_at_ms: 0,
                 action: serde_json::Value::Null,
             });
         }
@@ -6758,6 +6829,7 @@ impl Bridge {
     /// on their own schedule) and any other waits for its turn
     /// ([`Self::not_yet`]).
     fn input(&mut self, claimed: &Claimed, text: &str) -> Result<Handled, StoreError> {
+        const RECOVERY_COOLDOWN_MS: i64 = 120_000;
         let finished = |outcome| Ok(Handled::Finished(outcome));
         let waited = self
             .sessions
@@ -6791,6 +6863,30 @@ impl Bridge {
                 return finished(Outcome::Failed(format!("the text {MAY_HAVE_TYPED}")));
             }
         }
+        let continue_nudge =
+            text.trim().eq_ignore_ascii_case("continue") && claimed.principal != "human";
+        if continue_nudge {
+            if self
+                .sessions
+                .get(&claimed.session_id)
+                .and_then(|v| v.last_progress_at_ms)
+                .is_some_and(|at| claimed.created_at_ms > 0 && at > claimed.created_at_ms)
+            {
+                return finished(Outcome::Cancelled(
+                    "superseded by worker progress".to_string(),
+                ));
+            }
+            if claimed.principal == "spawn_supervisor"
+                && self
+                    .liveness_recoveries
+                    .get(&claimed.session_id)
+                    .is_some_and(|at| self.clock.now().0.saturating_sub(*at) < RECOVERY_COOLDOWN_MS)
+            {
+                return finished(Outcome::Cancelled(
+                    "suppressed during liveness recovery cooldown".to_string(),
+                ));
+            }
+        }
         let shown = active
             .follow
             .screen
@@ -6804,9 +6900,16 @@ impl Bridge {
                 .then(|| "the input typed last has not been answered yet".to_string())
         });
         if let Some(why) = held {
-            return self.not_yet(claimed, &active, shown, Some(&why));
+            return self.not_yet(claimed, &active, shown, Some(&why), continue_nudge);
         }
-        self.type_when_ready(claimed, &active, text, waited.is_some(), shown)
+        self.type_when_ready(
+            claimed,
+            &active,
+            text,
+            waited.is_some(),
+            shown,
+            continue_nudge,
+        )
     }
 
     /// Read the pane and type `text` if it is ready, else leave the input to
@@ -6818,6 +6921,7 @@ impl Bridge {
         text: &str,
         waited: bool,
         shown: ScreenState,
+        continue_nudge: bool,
     ) -> Result<Handled, StoreError> {
         let finished = |outcome| Ok(Handled::Finished(outcome));
         // A failed capture or a staging refused, on a terminal still there,
@@ -6840,7 +6944,7 @@ impl Bridge {
                     Err(error) => {
                         if self.terminal_gone(active) {
                             if waits(&claimed.principal) {
-                                return self.not_yet(claimed, active, shown, None);
+                                return self.not_yet(claimed, active, shown, None, continue_nudge);
                             }
                             return finished(Outcome::Failed(format!(
                                 "terminal disappeared: {error}"
@@ -6852,6 +6956,7 @@ impl Bridge {
                                 active,
                                 ScreenState::Unknown,
                                 Some(&format!("pane unread ({error})")),
+                                continue_nudge,
                             );
                         }
                         continue;
@@ -6874,14 +6979,14 @@ impl Bridge {
                 )?;
             }
             if !reading.state.accepts_input() {
-                return self.not_yet(claimed, active, reading.state, None);
+                return self.not_yet(claimed, active, reading.state, None, continue_nudge);
             }
             match self.type_once(claimed, active, text)? {
                 Ok(()) => return finished(Outcome::Succeeded),
                 Err(Untyped::Refused(error)) => {
                     if self.terminal_gone(active) {
                         if waits(&claimed.principal) {
-                            return self.not_yet(claimed, active, shown, None);
+                            return self.not_yet(claimed, active, shown, None, continue_nudge);
                         }
                         return finished(Outcome::Failed(format!("terminal disappeared: {error}")));
                     }
@@ -6891,6 +6996,7 @@ impl Bridge {
                             active,
                             reading.state,
                             Some(&format!("submit text refused before typing ({error})")),
+                            continue_nudge,
                         );
                     }
                 }
@@ -6905,20 +7011,54 @@ impl Bridge {
 
     /// An input that cannot be typed yet (the pane shows `state`, or `why`):
     /// one of Spawn's own loops is refused at once, `pane state <state> does
-    /// not accept input`, having typed nothing; any other is recorded as
-    /// waiting (`command.step` `waiting`, once) and left unfinished.
+    /// not accept input`, having typed nothing; duplicate non-human `continue`
+    /// nudges coalesce and aged waits expire cleanly; otherwise recorded as
+    /// waiting (`command.step` `waiting`) with bounded exponential backoff.
     fn not_yet(
         &self,
         claimed: &Claimed,
         active: &Active,
         state: ScreenState,
         why: Option<&str>,
+        continue_nudge: bool,
     ) -> Result<Handled, StoreError> {
         if !waits(&claimed.principal) {
             let why = why.map_or_else(String::new, |why| format!(": {why}"));
             return Ok(Handled::Finished(Outcome::Failed(format!(
                 "pane state {state:?} {PANE_NOT_READY}{why}"
             ))));
+        }
+        if continue_nudge
+            && self.sessions.get(&claimed.session_id).is_some_and(|view| {
+                view.inputs
+                    .waiting
+                    .keys()
+                    .any(|id| *id < claimed.command_id)
+            })
+        {
+            return Ok(Handled::Finished(Outcome::Cancelled(
+                "coalesced duplicate busy nudge".to_string(),
+            )));
+        }
+        let unix_epoch_ms_floor: i64 = 1_000_000_000_000;
+        let ttl_ms = i64::try_from(self.config.input_wait_ttl.as_millis()).unwrap_or(i64::MAX);
+        let now_ms = self.clock.now().0;
+        let same_clock_epoch =
+            (now_ms >= unix_epoch_ms_floor) == (claimed.created_at_ms >= unix_epoch_ms_floor);
+        if claimed.attempt >= self.config.input_wait_max_attempts
+            || (claimed.created_at_ms > 0
+                && same_clock_epoch
+                && now_ms.saturating_sub(claimed.created_at_ms) >= ttl_ms)
+        {
+            let outcome = if continue_nudge {
+                Outcome::Cancelled("waiting nudge expired before pane became ready".to_string())
+            } else {
+                Outcome::Failed(format!(
+                    "waiting input expired before pane became ready (attempt {}, state {state:?})",
+                    claimed.attempt
+                ))
+            };
+            return Ok(Handled::Finished(outcome));
         }
         self.step(
             claimed,
@@ -6927,7 +7067,7 @@ impl Bridge {
             None,
         )?;
         Ok(Handled::Waiting {
-            retry: self.config.input_wait_retry,
+            retry: self.config.input_wait_backoff(claimed.attempt),
         })
     }
 
@@ -14930,5 +15070,180 @@ mod tests {
         // Both are past attempt 4 so prompt_retry returns ready_interval (250ms); cmd1 waited 15ms while cmd2 ran capture_tail.
         assert_eq!(rels.get(&cmd1), Some(&235));
         assert_eq!(rels.get(&cmd2), Some(&250));
+    }
+
+    #[test]
+    fn waiting_input_backoff_and_max_attempts_and_ttl_expiry() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let queue = RecordedQueue::new(store.clone());
+        let mut config = BridgeConfig::new("tester");
+        assert_eq!(
+            (1..=7)
+                .map(|a| config.input_wait_backoff(a).as_secs())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4, 8, 16, 32, 60]
+        );
+        config.input_wait_max_attempts = 4;
+        config.input_wait_ttl = Duration::from_secs(30);
+        let start_id = submit_resumable_start(&store, 1, "", READY);
+        let mut bridge = Bridge::new(
+            store.clone(),
+            queue.clone(),
+            store.clone(),
+            store.clone(),
+            config,
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, start_id).is_some()
+        });
+        store.set_pane(
+            &TerminalName::for_execution(&ExecutionId::for_command(start_id)),
+            BUSY,
+        );
+        let nudge_id = store
+            .submit(
+                &Principal::new("spawn_supervisor").expect("p"),
+                &Submission {
+                    agent_id: resumable_agent(1),
+                    session_id: resumable_session(1),
+                    idempotency_key: IdempotencyKey::new("nudge-1").expect("k"),
+                    action: CommandAction::Input {
+                        text: "continue".into(),
+                        tags: vec![],
+                    },
+                },
+            )
+            .expect("submit");
+        for expected_secs in [1_u64, 2, 4] {
+            store.expire_leases();
+            bridge.work().expect("wait");
+            assert_eq!(
+                queue.take_releases().last().map(|(_, d)| d.as_secs()),
+                Some(expected_secs)
+            );
+        }
+        store.expire_leases();
+        bridge.work().expect("expire by attempts");
+        assert_eq!(
+            command_outcome(&store, nudge_id),
+            Some(Outcome::Failed(
+                "cancelled: waiting nudge expired before pane became ready".into()
+            ))
+        );
+        let human_id = store
+            .submit(
+                &Principal::new("human").expect("p"),
+                &Submission {
+                    agent_id: resumable_agent(1),
+                    session_id: resumable_session(1),
+                    idempotency_key: IdempotencyKey::new("human-1").expect("k"),
+                    action: CommandAction::Input {
+                        text: "hello".into(),
+                        tags: vec![],
+                    },
+                },
+            )
+            .expect("submit");
+        clock.advance(Duration::from_secs(31));
+        bridge.work().expect("expire by ttl");
+        assert!(matches!(
+            command_outcome(&store, human_id),
+            Some(Outcome::Failed(ref msg)) if msg.contains("waiting input expired")
+        ));
+    }
+
+    #[test]
+    fn waiting_nudge_cancels_on_duplicate_progress_or_liveness_cooldown() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock.clone());
+        let starts: Vec<CommandId> = [1_u64, 2, 3]
+            .into_iter()
+            .map(|n| submit_resumable_start(&store, n, "", READY))
+            .collect();
+        drive_work(&mut bridge, &store, || {
+            starts
+                .iter()
+                .all(|id| command_outcome(&store, *id).is_some())
+        });
+        for id in starts {
+            store.set_pane(
+                &TerminalName::for_execution(&ExecutionId::for_command(id)),
+                BUSY,
+            );
+        }
+        let sup = Principal::new("spawn_supervisor").expect("p");
+        let nudge = |n: u64, key: &str| Submission {
+            agent_id: resumable_agent(n),
+            session_id: resumable_session(n),
+            idempotency_key: IdempotencyKey::new(key).expect("k"),
+            action: CommandAction::Input {
+                text: "continue".into(),
+                tags: vec![],
+            },
+        };
+        let n1a = store.submit(&sup, &nudge(1, "dup-a")).expect("s");
+        bridge.work().expect("w");
+        let n1b = store.submit(&sup, &nudge(1, "dup-b")).expect("s");
+        bridge.work().expect("w");
+        assert!(command_outcome(&store, n1a).is_none());
+        assert_eq!(
+            command_outcome(&store, n1b),
+            Some(Outcome::Failed(
+                "cancelled: coalesced duplicate busy nudge".into()
+            ))
+        );
+        let n2 = store.submit(&sup, &nudge(2, "prog")).expect("s");
+        bridge.work().expect("w");
+        clock.advance(Duration::from_millis(200));
+        store
+            .append(NewEvent {
+                agent_id: resumable_agent(2),
+                session_id: resumable_session(2),
+                execution_id: None,
+                source: Source::Claude,
+                source_event_id: Some("msg-1".into()),
+                kind: EventKind::MessageReceived,
+            })
+            .expect("msg");
+        store.expire_leases();
+        bridge.work().expect("w");
+        assert_eq!(
+            command_outcome(&store, n2),
+            Some(Outcome::Failed(
+                "cancelled: superseded by worker progress".into()
+            ))
+        );
+        store
+            .append(NewEvent {
+                agent_id: AgentId::new("agent_control").expect("a"),
+                session_id: SessionId::new("session_control").expect("s"),
+                execution_id: None,
+                source: Source::Control,
+                source_event_id: Some("clr-3".into()),
+                kind: EventKind::ControlRecorded {
+                    record: serde_json::json!({
+                        "type": "execution.cleared", "session_id": resumable_session(3).as_str()
+                    }),
+                },
+            })
+            .expect("ctl");
+        let n3 = store.submit(&sup, &nudge(3, "cool")).expect("s");
+        bridge.work().expect("w");
+        assert_eq!(
+            command_outcome(&store, n3),
+            Some(Outcome::Failed(
+                "cancelled: suppressed during liveness recovery cooldown".into()
+            ))
+        );
     }
 }

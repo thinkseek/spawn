@@ -43,7 +43,7 @@ pub(crate) const WATERMARK: &str = "select coalesce(max(id), 0) from spawn_event
 /// due at the next pass.
 pub(crate) const NEXT_LEASE: &str = concat!(
     "select min(coalesce(c.lease_until_ms, 0)) from spawn_commands c",
-    " where c.state <> 'finished'"
+    " where c.state not in ('finished', 'failed', 'cancelled')"
 );
 
 /// The channel `spawn_append_trusted` notifies on every append.

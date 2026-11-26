@@ -291,7 +291,17 @@ from (
     ep.id as episode,
     ep.action ->> 'type' as episode_action,
     exists (select 1 from spawn_commands c
-             where c.session_id = s.session_id and c.state <> 'finished') as open_command,
+             where c.session_id = s.session_id
+               and c.state not in ('finished', 'failed', 'cancelled')) as open_command,
+    greatest(
+      (select max(r.recorded_at_ms) from spawn_events r
+        where r.session_id = 'session_control' and r.event_name = 'control.recorded'
+          and r.kind -> 'detail' -> 'record' ->> 'type' = 'execution.cleared'
+          and r.kind -> 'detail' -> 'record' ->> 'session_id' = s.session_id),
+      (select max(c.finished_at_ms) from spawn_commands c
+        where c.session_id = s.session_id and c.principal = 'spawn-liveness'
+          and c.succeeded = true and c.created_at_ms > spawn_now_ms() - 86400000)
+    ) as last_liveness_recovery_ms,
     coalesce(mo.model, 'default') as model,
     mo.engine as engine,
     case when mo.engine <> 'claude' then mo.launch_model end as model_label,

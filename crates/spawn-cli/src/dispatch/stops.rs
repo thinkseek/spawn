@@ -180,6 +180,7 @@ mod tests {
             jobs: Vec::new(),
             engine: None,
             model_label: None,
+            last_liveness_recovery_ms: None,
         }
     }
 

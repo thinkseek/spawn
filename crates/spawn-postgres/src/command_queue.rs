@@ -16,7 +16,8 @@ pub(crate) const SUBMIT: &str = "select out_id from spawn_submit($1, $2, $3, $4,
 
 /// Lease the next command, if any. `$1` worker, `$2` lease in milliseconds.
 pub(crate) const CLAIM: &str =
-    "select out_id, out_attempt, out_agent, out_session, out_action, out_principal
+    "select out_id, out_attempt, out_agent, out_session, out_action, out_principal,
+            out_created_at_ms
                    from spawn_claim($1, $2)";
 
 /// Two-key advisory-lock namespace for Bridges, a key of their own: the
@@ -91,7 +92,8 @@ impl CommandQueue for PostgresStore {
                 let recovered = self.execute(
                     "update spawn_commands
                         set lease_until_ms = spawn_now_ms()
-                      where state <> 'finished' and lease_worker = $1
+                      where state not in ('finished', 'failed', 'cancelled')
+                        and lease_worker = $1
                         and lease_until_ms > spawn_now_ms()",
                     &[&worker],
                 )?;
@@ -150,6 +152,7 @@ impl CommandQueue for PostgresStore {
             agent_id: agent_id(row, "out_agent")?,
             session_id: session_id(row, "out_session")?,
             principal: row.get("out_principal"),
+            created_at_ms: row.get("out_created_at_ms"),
             action: row.get("out_action"),
         }))
     }
@@ -166,17 +169,28 @@ impl CommandQueue for PostgresStore {
     }
 
     fn finish(&self, claimed: &Claimed, outcome: &Outcome) -> Result<(), StoreError> {
-        let (succeeded, error) = match outcome {
-            Outcome::Succeeded => (true, None),
-            // The failure is kept in the command and its `command.finished`.
-            Outcome::Failed(reason) => (false, Some(spawn_core::redact::redact(reason))),
-        };
         let attempt = i32::try_from(claimed.attempt).unwrap_or(i32::MAX);
         let command = bigint(claimed.command_id.0);
-        let row = self.query_one(
-            "select spawn_finish($1, $2, $3, $4)",
-            &[&command, &attempt, &succeeded, &error],
-        )?;
+        let row = match outcome {
+            Outcome::Succeeded => self.query_one(
+                "select spawn_finish($1, $2, true, $3)",
+                &[&command, &attempt, &None::<String>],
+            )?,
+            Outcome::Failed(reason) => {
+                let error = Some(spawn_core::redact::redact(reason));
+                self.query_one(
+                    "select spawn_finish($1, $2, false, $3)",
+                    &[&command, &attempt, &error],
+                )?
+            }
+            Outcome::Cancelled(reason) => {
+                let reason = spawn_core::redact::redact(reason);
+                self.query_one(
+                    "select spawn_cancel($1, $2, $3)",
+                    &[&command, &attempt, &reason],
+                )?
+            }
+        };
         let status: String = row.get(0);
         match status.as_str() {
             "done" | "already" => Ok(()),
@@ -186,5 +200,33 @@ impl CommandQueue for PostgresStore {
             }),
             other => Err(StoreError::Backend(format!("finish returned {other}"))),
         }
+    }
+}
+
+impl PostgresStore {
+    /// Cancels an open (unleased or leased) command without counting it as a
+    /// `command_failed` failure.
+    pub fn cancel_open_command(&self, command_id: i64, reason: &str) -> Result<bool, StoreError> {
+        let reason = spawn_core::redact::redact(reason);
+        let row = self.query_one("select spawn_cancel($1, null, $2)", &[&command_id, &reason])?;
+        let status: String = row.get(0);
+        Ok(status == "done")
+    }
+
+    /// Returns open non-human `"continue"` input command IDs for `session_id`
+    /// (`#108/#109` stale nudge auto-cancel when task state moves on).
+    pub fn open_continue_commands(&self, session_id: &str) -> Result<Vec<i64>, StoreError> {
+        let rows = self.query(
+            "select id
+               from spawn_commands
+              where session_id = $1
+                and state not in ('finished', 'failed', 'cancelled')
+                and principal <> 'human'
+                and action ->> 'type' = 'input'
+                and lower(btrim(coalesce(action ->> 'text', ''))) = 'continue'
+              order by id",
+            &[&session_id],
+        )?;
+        Ok(rows.into_iter().map(|row| row.get(0)).collect())
     }
 }

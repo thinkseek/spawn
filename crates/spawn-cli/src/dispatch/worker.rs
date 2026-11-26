@@ -25,6 +25,10 @@ const NUDGE_KEY_PREFIX: &str = "dispatch-nudge-";
 /// Retries of a nudge that typed nothing, in one episode.
 const NUDGE_RETRIES: usize = 2;
 
+/// Cooldown after a liveness recovery before `dispatch` sends another
+/// automatic `"continue"` nudge (#109 / #111).
+pub(super) const RECOVERY_COOLDOWN_MS: i64 = 120_000;
+
 const HOUR_MS: i64 = 3_600_000;
 
 /// What the ladder decides for one worker.
@@ -171,9 +175,8 @@ fn nudges_this_hour(facts: &Facts, now_ms: i64) -> usize {
         .count()
 }
 
-/// How long until this worker's nudge limit frees up with no new record:
-/// the moment a nudge that reached it leaves the hour
-/// ([`nudges_this_hour`]). `None` when nothing keeps it from a nudge now.
+/// How long until this worker's nudge limit or recovery cooldown frees up
+/// with no new record. `None` when nothing keeps it from a nudge now.
 pub(super) fn due_in(facts: &Facts, now_ms: i64) -> Option<i64> {
     if !facts.live || facts.open_command {
         return None;
@@ -181,7 +184,14 @@ pub(super) fn due_in(facts: &Facts, now_ms: i64) -> Option<i64> {
     if !nudgeable(facts.current_observation()?) {
         return None;
     }
-    facts
+    let recovery_left = facts
+        .last_liveness_recovery_ms
+        .map(|at| {
+            at.saturating_add(RECOVERY_COOLDOWN_MS)
+                .saturating_sub(now_ms)
+        })
+        .filter(|left| *left > 0);
+    let hourly_left = facts
         .dispatched
         .iter()
         .filter(|sent| sent.key.starts_with(NUDGE_KEY_PREFIX) && reached(sent))
@@ -191,7 +201,13 @@ pub(super) fn due_in(facts: &Facts, now_ms: i64) -> Option<i64> {
                 .saturating_sub(now_ms)
         })
         .filter(|left| *left > 0)
-        .min()
+        .min();
+    match (recovery_left, hourly_left) {
+        (Some(r), Some(h)) => Some(r.max(h)),
+        (Some(r), None) => Some(r),
+        (None, h) if nudges_this_hour(facts, now_ms) >= NUDGES_PER_HOUR => h,
+        _ => None,
+    }
 }
 
 /// The guarded nudge, for a worker Jev judged idle and fine: `continue`
@@ -201,6 +217,12 @@ pub(super) fn due_in(facts: &Facts, now_ms: i64) -> Option<i64> {
 /// key of its own (`<key>-retry-<n>`) on a judgement made after it, up to
 /// [`NUDGE_RETRIES`] times, and then escalated as never typed.
 fn nudge(facts: &Facts, observation: &Observation, now_ms: i64) -> Decision {
+    if facts
+        .last_liveness_recovery_ms
+        .is_some_and(|at| now_ms.saturating_sub(at) < RECOVERY_COOLDOWN_MS)
+    {
+        return Decision::Nothing;
+    }
     let episode = facts.episode.unwrap_or(0);
     let judged_at = facts.observation_at_ms.unwrap_or(0);
     let key = format!("{NUDGE_KEY_PREFIX}{}-{episode}", facts.session_id);

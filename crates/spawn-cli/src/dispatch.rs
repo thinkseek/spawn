@@ -297,6 +297,10 @@ pub(crate) struct Facts {
     /// The live execution's open background jobs, oldest first.
     #[serde(default)]
     pub(crate) jobs: Vec<Job>,
+    /// Most recent liveness recovery (`execution.cleared` or `spawn-liveness`
+    /// input/resume success) timestamp for cooldown gating.
+    #[serde(default)]
+    pub(crate) last_liveness_recovery_ms: Option<i64>,
 }
 
 /// Whether a judgement says the turn stopped at the prompt: the rules left
@@ -702,7 +706,7 @@ pub(crate) fn decide_with(
     plan.told.retain(|item| !item.why.is_news());
     if let Some(supervisor) = supervisor.filter(|_| supervised) {
         plan.orders
-            .extend(digest::order(supervisor, &plan.pending, spawn));
+            .extend(digest::order_at(supervisor, &plan.pending, spawn, now_ms));
     }
     plan
 }
@@ -910,11 +914,18 @@ pub(crate) fn read_plan(
         if let Some(at) = stops::next_due(facts) {
             soon(at);
         }
-        // A worker held back from its one nudge by the hourly limit is due
-        // when the oldest nudge of that hour leaves it.
+        // A worker held back from its one nudge by the hourly limit or recovery cooldown.
         if let Some(left) = worker::due_in(facts, now) {
             soon(now.saturating_add(left));
         }
+    }
+    if supervised
+        && let Some(supervisor) = rows
+            .iter()
+            .find(|facts| facts.session_id == SUPERVISOR_SESSION)
+        && let Some(left) = digest::due_in(supervisor, now)
+    {
+        soon(now.saturating_add(left));
     }
     // A stall read that failed costs this pass its stall items, never its
     // deliveries: the next pass measures the same stalls again.
@@ -977,6 +988,90 @@ fn steal_first(
     Ok(read)
 }
 
+fn cancel_stale_continue_nudges(
+    store: &PostgresStore,
+    work: &Work,
+    rows: &[Facts],
+    now: i64,
+    lines: &mut Vec<String>,
+) -> bool {
+    let mut cancelled_any = false;
+    for facts in rows.iter().filter(|f| f.open_command && is_worker(f)) {
+        let cooldown = facts
+            .last_liveness_recovery_ms
+            .is_some_and(|at| now.saturating_sub(at) < worker::RECOVERY_COOLDOWN_MS);
+        let left_delivered = work
+            .tasks
+            .iter()
+            .filter(|t| t.session_id == facts.session_id)
+            .max_by_key(|t| t.id)
+            .is_some_and(|t| t.state != spawn_core::mission::TaskState::Delivered);
+        let reason = if cooldown {
+            "suppressed during liveness recovery cooldown"
+        } else if left_delivered {
+            "task left delivered state"
+        } else {
+            continue;
+        };
+        let ids = match store.open_continue_commands(&facts.session_id) {
+            Ok(ids) => ids,
+            Err(err) => {
+                lines.push(format!(
+                    "dispatch: open continues on {}: {err}",
+                    facts.session_id
+                ));
+                continue;
+            }
+        };
+        for id in ids {
+            match store.cancel_open_command(id, reason) {
+                Ok(true) => {
+                    cancelled_any = true;
+                    lines.push(format!(
+                        "dispatch: cancelled continue #{id} on {}: {reason}",
+                        facts.session_id
+                    ));
+                }
+                Ok(false) => {}
+                Err(err) => lines.push(format!("dispatch: cancel continue #{id}: {err}")),
+            }
+        }
+    }
+    cancelled_any
+}
+
+fn apply_delivered_and_reissues(
+    store: &PostgresStore,
+    delivered: Vec<(i64, i64)>,
+    reissues: Vec<deliver::Reissue>,
+    lines: &mut Vec<String>,
+) -> Result<(), String> {
+    for (task, command) in delivered {
+        store
+            .task_delivered(task, command)
+            .map_err(|error| error.to_string())?;
+        lines.push(format!(
+            "dispatch: task #{task} delivered (command {command})"
+        ));
+    }
+    for reissue in reissues {
+        // A refusal (the task moved on since the facts were read) costs this
+        // pass nothing else: the next pass reads the task as it is.
+        let attempts =
+            serde_json::to_value(&reissue.attempts).map_err(|error| error.to_string())?;
+        lines.push(match store.task_reissue(reissue.task, &attempts) {
+            Ok(new) => format!(
+                "dispatch: task #{} re-issued as task #{new}: its delivery never reached its \
+                 worker ({} attempts, nothing typed)",
+                reissue.task,
+                reissue.attempts.len()
+            ),
+            Err(error) => format!("dispatch: re-issue of task #{}: {error}", reissue.task),
+        });
+    }
+    Ok(())
+}
+
 /// Run one dispatcher step against the store: collect reports from idle
 /// workers under `root` (a draft is not taken: its worker is told instead,
 /// [`deliver::collect_reports`]), then submit the plan ([`read_plan`]), with the
@@ -1006,6 +1101,9 @@ pub(crate) fn step(
     // The agents' answers to their messages and the reports' answers to
     // their deliveries: changing no task and nothing this pass decides.
     lines.extend(crate::ack::answers(store, &rows, root, now_ms()));
+    if cancel_stale_continue_nudges(store, &work, &rows, now_ms(), &mut lines) {
+        (rows, work) = load(store, waits)?;
+    }
     let Reading {
         work,
         mut plan,
@@ -1030,29 +1128,7 @@ pub(crate) fn step(
             ));
         }
     }
-    for (task, command) in plan.delivered {
-        store
-            .task_delivered(task, command)
-            .map_err(|error| error.to_string())?;
-        lines.push(format!(
-            "dispatch: task #{task} delivered (command {command})"
-        ));
-    }
-    for reissue in plan.reissues {
-        // A refusal (the task moved on since the facts were read) costs this
-        // pass nothing else: the next pass reads the task as it is.
-        let attempts =
-            serde_json::to_value(&reissue.attempts).map_err(|error| error.to_string())?;
-        lines.push(match store.task_reissue(reissue.task, &attempts) {
-            Ok(new) => format!(
-                "dispatch: task #{} re-issued as task #{new}: its delivery never reached its \
-                 worker ({} attempts, nothing typed)",
-                reissue.task,
-                reissue.attempts.len()
-            ),
-            Err(error) => format!("dispatch: re-issue of task #{}: {error}", reissue.task),
-        });
-    }
+    apply_delivered_and_reissues(store, plan.delivered, plan.reissues, &mut lines)?;
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
     persist_accepted_worker_commits(store, root, &work, &mut lines);
     run_orders(store, &principal, root, &work, plan.orders, &mut lines)?;
@@ -1477,6 +1553,7 @@ mod tests {
             recovered: None,
             engine: None,
             model_label: None,
+            last_liveness_recovery_ms: None,
         }
     }
 
@@ -1626,6 +1703,7 @@ mod tests {
             recovered: None,
             engine: None,
             model_label: None,
+            last_liveness_recovery_ms: None,
         }
     }
 
@@ -3212,5 +3290,60 @@ mod tests {
             panic!("a digest is typed input");
         };
         assert_eq!(tags, &[mission.tag()], "only the mission is news");
+    }
+
+    #[test]
+    fn worker_cooldown_after_liveness_recovery_holds_continue_nudges_and_sets_due_in() {
+        let mut facts = worker(judged(SemanticState::Waiting, 0.9));
+        if let Some(obs) = facts.observation.as_mut() {
+            obs.ambiguity = Some(Ambiguity::TurnStoppedIdle);
+        }
+        facts.last_liveness_recovery_ms = Some(NOW - 30_000);
+        assert_eq!(super::worker::due_in(&facts, NOW), Some(90_000));
+        assert_eq!(
+            decide(&[facts.clone()], false, NOW, "spawn"),
+            super::Plan::default()
+        );
+        let plan = decide(&[facts], false, NOW + 90_000, "spawn");
+        assert_eq!(plan.orders.len(), 1);
+        assert_eq!(plan.orders[0].key, "dispatch-nudge-session_worker_a-7");
+    }
+
+    #[test]
+    fn supervisor_digest_backs_off_exponentially_after_pane_not_ready() {
+        let mut sup = idle_supervisor();
+        let esc = Escalation {
+            session_id: "session_worker_x".to_string(),
+            id: "idle-1".to_string(),
+            why: Why::Idle,
+            line: "stopped".to_string(),
+            since_ms: None,
+        };
+        let mut t = 1_000_000_i64;
+        let expected_waits = [5_000_i64, 10_000, 20_000, 40_000, 60_000, 60_000];
+        for (idx, wait) in expected_waits.into_iter().enumerate() {
+            sup.dispatched.push(Sent {
+                id: Some(i64::try_from(idx).expect("small") + 1),
+                key: format!("dispatch-digest-50-{idx:016x}"),
+                text: None,
+                created_at_ms: t - 50,
+                finished_at_ms: Some(t),
+                succeeded: Some(false),
+                error: Some(format!(
+                    "pane state Busy {}",
+                    spawn_core::bridge::PANE_NOT_READY
+                )),
+            });
+            assert_eq!(super::digest::due_in(&sup, t), Some(wait));
+            assert!(
+                super::digest::order_at(&sup, std::slice::from_ref(&esc), "spawn", t + wait - 1)
+                    .is_none()
+            );
+            assert!(
+                super::digest::order_at(&sup, std::slice::from_ref(&esc), "spawn", t + wait)
+                    .is_some()
+            );
+            t += wait + 100;
+        }
     }
 }

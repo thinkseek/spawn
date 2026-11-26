@@ -163,7 +163,16 @@ pub(super) fn wait_reason(state: SemanticState, input: &JudgeInput) -> Option<Wa
         SemanticState::Blocked if input.permission_pending => {
             Some(WaitReason::WaitingForUserPermission)
         }
-        SemanticState::Waiting => Some(WaitReason::WaitingForUserInput),
+        SemanticState::Waiting => {
+            // Suppress false WaitingForUserInput on active executions unless
+            // no tool is open and the session is genuinely at its prompt (#104).
+            let truly_waiting = !input.execution_active
+                || (!input.permission_pending
+                    && input.open_tools == 0
+                    && input.screen != Some(ScreenState::Busy)
+                    && at_prompt(input));
+            truly_waiting.then_some(WaitReason::WaitingForUserInput)
+        }
         SemanticState::Working if waits_on_own_job(input) => {
             Some(WaitReason::WaitingForBackgroundJob)
         }
@@ -284,4 +293,50 @@ pub(super) fn fold_completed(judgement: &Judgement) -> Judgement {
         folded.state = SemanticState::Waiting;
     }
     folded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_execution_without_prompt_never_gets_waiting_for_user_input() {
+        let active = JudgeInput {
+            agent_id: "agent_a".into(),
+            session_id: "session_a".into(),
+            engine: Some("claude".into()),
+            execution_active: true,
+            stalled_end: None,
+            last_end: None,
+            exit_code: None,
+            open_tools: 1,
+            open_jobs: 0,
+            oldest_job_ms: None,
+            last_tool: Some("bash".into()),
+            permission_pending: false,
+            screen: Some(ScreenState::Busy),
+            turn: None,
+            last_error: None,
+            evidence_seq: crate::event::SessionSeq(1),
+            ambiguity: Some(Ambiguity::QuietLive),
+            quiet_ms: Some(150_000),
+            progress_ms: Some(150_000),
+            task: None,
+            screen_tail: None,
+            reply: None,
+            perpetual: false,
+        };
+        assert_eq!(wait_reason(SemanticState::Waiting, &active), None);
+
+        let idle_at_prompt = JudgeInput {
+            open_tools: 0,
+            screen: Some(ScreenState::Ready),
+            turn: Some(TurnFact::Stopped),
+            ..active.clone()
+        };
+        assert_eq!(
+            wait_reason(SemanticState::Waiting, &idle_at_prompt),
+            Some(WaitReason::WaitingForUserInput)
+        );
+    }
 }

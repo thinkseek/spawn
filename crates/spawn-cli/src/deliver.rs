@@ -310,6 +310,19 @@ impl Waits {
     fn retry_wait_ms(&self, failures: usize) -> i64 {
         backoff(self.retry_ms, failures)
     }
+
+    /// Wait after the `refusals`-th `pane not ready` refusal before retrying:
+    /// bounded exponential backoff starting at `not_ready_ms` and capped at
+    /// `60_000` ms (or `not_ready_ms` when configured higher).
+    pub(crate) fn not_ready_wait_ms(&self, refusals: usize) -> i64 {
+        let cap = self.not_ready_ms.max(60_000);
+        let doublings = u32::try_from(refusals.saturating_sub(1))
+            .unwrap_or(u32::MAX)
+            .min(10);
+        self.not_ready_ms
+            .saturating_mul(1_i64 << doublings)
+            .min(cap)
+    }
 }
 
 /// The latest `source.moved` record (a deploy): its event's id, which keys
@@ -1261,7 +1274,7 @@ pub(crate) fn next_due(work: &Work, rows: &[Facts], now_ms: i64) -> Option<i64> 
                 continue;
             }
             let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
-            soon(finished.saturating_add(work.waits.not_ready_ms));
+            soon(finished.saturating_add(work.waits.not_ready_wait_ms(tries.len())));
         }
     }
     due
@@ -1411,7 +1424,7 @@ fn judge_attempts(waits: &Waits, sent: &[&crate::dispatch::Sent]) -> Attempts {
     if not_ready(last) && refusals <= NOT_READY_FREE {
         return Attempts::Retry {
             number: sent.len(),
-            due_ms: finished.saturating_add(waits.not_ready_ms),
+            due_ms: finished.saturating_add(waits.not_ready_wait_ms(refusals)),
         };
     }
     if failures > DELIVERY_RETRIES {
@@ -2690,7 +2703,7 @@ fn note_retry(key: &str, facts: &Facts, waits: &Waits, now_ms: i64) -> Option<St
         return None;
     }
     let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
-    (now_ms >= finished.saturating_add(waits.not_ready_ms))
+    (now_ms >= finished.saturating_add(waits.not_ready_wait_ms(attempts.len())))
         .then(|| format!("{retry}{}", attempts.len()))
 }
 
@@ -2812,6 +2825,7 @@ mod tests {
             recovered: None,
             engine: None,
             model_label: None,
+            last_liveness_recovery_ms: None,
         }
     }
 
@@ -4004,6 +4018,7 @@ mod tests {
         let tasks = work(vec![task(4, TaskState::Assigned, "resident")]);
         let busy = "pane state Busy does not accept input";
         let mut facts = worker(true, true);
+        let waits = super::Waits::default();
         let mut at = 1_000;
         for n in 0..5 {
             let key = if n == 0 {
@@ -4012,10 +4027,15 @@ mod tests {
                 format!("deliver-4-0-retry-{n}")
             };
             facts.dispatched.push(sent(10 + n, &key, at, Some(busy)));
-            let retry = super::orders(&tasks, &[facts.clone()], at + 5_000);
-            assert_eq!(retry.len(), 1, "refusal {n} is retried after 5 s");
+            let wait = waits.not_ready_wait_ms(usize::try_from(n + 1).expect("n"));
+            assert!(
+                super::orders(&tasks, &[facts.clone()], at + wait - 1).is_empty(),
+                "refusal {n} holds before {wait} ms"
+            );
+            let retry = super::orders(&tasks, &[facts.clone()], at + wait);
+            assert_eq!(retry.len(), 1, "refusal {n} is retried after {wait} ms");
             assert_eq!(retry[0].key, format!("deliver-4-0-retry-{}", n + 1));
-            at += 6_000;
+            at += wait + 1_000;
         }
         // A real failure after them is the first failed attempt: one minute.
         facts.dispatched.push(sent(
@@ -6066,5 +6086,16 @@ PENDING_ISSUES\n";
         assert_eq!(stops.len(), 1);
         assert_eq!(stops[0].key, "reassign-7-stop");
         assert!(super::cancel_notice(&moved).contains("reassigned to a fresh worker as task #8"));
+    }
+
+    #[test]
+    fn not_ready_wait_backoff_doubles_and_caps_at_sixty_seconds() {
+        let waits = super::Waits::default();
+        assert_eq!(waits.not_ready_wait_ms(1), 5_000);
+        assert_eq!(waits.not_ready_wait_ms(2), 10_000);
+        assert_eq!(waits.not_ready_wait_ms(3), 20_000);
+        assert_eq!(waits.not_ready_wait_ms(4), 40_000);
+        assert_eq!(waits.not_ready_wait_ms(5), 60_000);
+        assert_eq!(waits.not_ready_wait_ms(9), 60_000);
     }
 }

@@ -562,6 +562,7 @@ fn sigkill_recovers_a_claim_without_waiting_for_its_ttl() {
         agent_id: submission.agent_id.clone(),
         session_id: submission.session_id.clone(),
         principal: principal.as_str().to_string(),
+        created_at_ms: 0,
         action: serde_json::to_value(&submission.action).expect("action json"),
     };
     let mut client = admin(&schema);
