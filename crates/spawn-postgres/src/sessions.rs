@@ -149,6 +149,15 @@ pub(crate) const LATEST_TASK: &str =
                     and coalesce(action ->> 'prompt', action ->> 'text') is not null
                   order by id desc limit 1";
 
+/// The engine of a session's newest `start` command: its `engine`, or
+/// Claude Code's (`claude`, the wire default) for a start that names none;
+/// no row when the session has no start. `$1` session.
+pub(crate) const LATEST_ENGINE: &str =
+    "select coalesce(action ->> 'engine', 'claude') as engine
+                   from spawn_commands
+                  where session_id = $1 and action ->> 'type' = 'start'
+                  order by id desc limit 1";
+
 /// The newest execution and its workspace. `$1` session.
 pub(crate) const LATEST_TERMINAL: &str = "select execution_id,
                         kind -> 'detail' ->> 'workspace' as workspace
@@ -445,6 +454,16 @@ impl PostgresStore {
     pub fn latest_task(&self, session: &SessionId) -> Result<Option<String>, StoreError> {
         let row = self.query_opt(LATEST_TASK, &[&session.as_str()])?;
         Ok(row.and_then(|row| row.get("task")))
+    }
+
+    /// The engine of a session's newest `start` command (design decision
+    /// C2, N4): what decides whether a pane of the session leaves the host
+    /// as it is (Claude Code's) or through its engine's mask
+    /// (`spawn_core::driver::excerpt_for`). `None` when the session has no
+    /// start; a caller treats that, and an error, as not Claude Code's.
+    pub fn latest_engine(&self, session: &SessionId) -> Result<Option<String>, StoreError> {
+        let row = self.query_opt(LATEST_ENGINE, &[&session.as_str()])?;
+        Ok(row.and_then(|row| row.get("engine")))
     }
 
     /// Terminal and workspace of a session's newest execution. The terminal
