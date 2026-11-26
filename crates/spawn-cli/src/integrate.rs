@@ -2034,6 +2034,20 @@ struct Judge {
     /// The judging this clone takes over from an earlier integrator (D5,
     /// [`Integrator::adopt`]); None for one it starts.
     adopted: Option<Adopted>,
+    /// The candidates' gates judged on spawn-node v1 first
+    /// (`SPAWN_GATE_REMOTE=node`, [`remote::Primary`]); None (unset, empty
+    /// or `local`) judges every gate on this host, as before.
+    remote: Option<Arc<remote::Primary>>,
+}
+
+/// What the primary path gives the judging in place of a local run of the
+/// candidate's gate ([`Judge::remote_primary`]): the outcome to judge, the
+/// red check found passing on the base, and what was judged where.
+struct RemoteJudged {
+    judged: Result<gate::Verdict, GateFailure>,
+    base_check: Option<String>,
+    given: Value,
+    env: Value,
 }
 
 /// What an adopted judging judges, as its `judging.json` says: the
@@ -2271,6 +2285,7 @@ impl Integrator {
                 stop: None,
                 units: false,
                 adopted: None,
+                remote: None,
             },
             gates,
             cpu: None,
