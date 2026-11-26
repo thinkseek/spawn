@@ -130,6 +130,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$R2/requests.log" ]; then
             echo "199: the stand-in's last requests:" >&2

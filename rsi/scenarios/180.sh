@@ -154,6 +154,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ] && [ "$rc" -ne 6 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "180: the loop's last storage lines:" >&2

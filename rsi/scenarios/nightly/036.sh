@@ -111,9 +111,14 @@ for file in deploy/gate-runner.sh deploy/gate-runner/remote.sh deploy/gate-runne
         exit 1
     fi
 done
-pg_bin=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -n 1)
+pg_bin=${SPAWN_GATE_PG_BIN-}
+[ -n "$pg_bin" ] || pg_bin=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -n 1)
+if [ -z "$pg_bin" ] || [ ! -x "$pg_bin/postgres" ]; then
+    pg_prog=$(command -v postgres 2>/dev/null || true)
+    [ -z "$pg_prog" ] || pg_bin=$(dirname "$pg_prog")
+fi
 [ -n "$pg_bin" ] && [ -x "$pg_bin/postgres" ] ||
-    harness "no PostgreSQL programs (/usr/lib/postgresql/*/bin): the runner's setup needs a private server named"
+    harness "no PostgreSQL programs (/usr/lib/postgresql/*/bin or postgres on PATH): the runner's setup needs a private server named"
 for tool in psql git jq od bash sed grep awk date sha256sum sort find uname tar gzip timeout nice bwrap nproc; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
@@ -192,6 +197,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "036: the loop's last lines:" >&2

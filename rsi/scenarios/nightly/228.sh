@@ -94,6 +94,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ] && [ -s "$WORK/api.json" ]; then
         echo "228: the last answer's disk figures:" >&2
         jq -c '[.diagnostics[]? | select(.key == "storage.disk_fall" or .key == "storage.free_bytes")]' "$WORK/api.json" >&2 2>/dev/null || true

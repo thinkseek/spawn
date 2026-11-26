@@ -59,6 +59,7 @@ fi
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 . "$controller/scripts/blackbox/lib-herdr.sh"
 herdr_setup "$WORK" "p$PHASE"
+trap 'set +e; herdr_cleanup >/dev/null 2>&1 || true; chmod -R u+rwX "$WORK" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 SPAWN_DB_NAME="bb_${PHASE}_${PHASE_DB:?PHASE_DB is not set}_$run"
 SPAWN_PSQL=psql
 export WORK SPAWN_DB_NAME SPAWN_PSQL
@@ -72,22 +73,25 @@ server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 database_made=""
 loop_pid=""
 phase_teardown() {
+    set +e
     if command -v phase_cleanup >/dev/null 2>&1; then phase_cleanup || true; fi
     if [ -n "$loop_pid" ]; then
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
     fi
-    herdr_cleanup
+    herdr_cleanup || true
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
     chmod -R u+rwX "$WORK" 2>/dev/null || true
-    rm -rf "$WORK"
+    rm -rf "$WORK" 2>/dev/null || true
+    return 0
 }
 phase_finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "$PHASE: the loop's last lines:" >&2

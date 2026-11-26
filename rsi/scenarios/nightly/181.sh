@@ -76,6 +76,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ] && [ -s "$WORK/api.json" ]; then
         echo "181: the last answer's sustainability line:" >&2
         jq -c '.lines[] | select(.line == "sustainability")' "$WORK/api.json" >&2 2>/dev/null || true

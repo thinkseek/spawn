@@ -80,6 +80,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     cleanup
     if [ "$rc" -eq 0 ]; then exit 0; fi
     if [ "$rc" -eq 1 ] && [ -n "$asserted" ]; then exit 1; fi

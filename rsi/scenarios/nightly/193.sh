@@ -140,6 +140,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         for log in loop serve; do
             if [ -s "$WORK/$log.log" ]; then

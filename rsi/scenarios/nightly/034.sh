@@ -169,6 +169,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         echo "034: ended after $(($(date +%s) - started)) s" >&2
         if [ -s "$WORK/loop.log" ]; then

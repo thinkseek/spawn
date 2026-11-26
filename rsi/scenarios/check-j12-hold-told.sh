@@ -192,6 +192,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "j12: 030: the loop's last lines:" >&2
@@ -1229,6 +1230,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$R2/requests.log" ]; then
             echo "j12: 031: the stand-in's last requests:" >&2
@@ -2206,7 +2208,7 @@ stop_sections() {
         wait "$pid" 2>/dev/null || true
     done
 }
-trap 'trap - EXIT; stop_sections' EXIT
+trap 'trap - EXIT; set +e; stop_sections' EXIT
 trap 'exit 130' INT TERM
 
 echo "j12: [031] the backups, beside 030 (no loop)"

@@ -159,6 +159,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         echo "j11: ended in section $section" >&2
         if [ "$section" = 021 ]; then

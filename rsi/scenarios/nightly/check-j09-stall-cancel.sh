@@ -154,6 +154,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "j09: the loop's last lines:" >&2
@@ -208,6 +209,7 @@ section_026() {
     s026_finish() {
         rc=$?
         trap - EXIT
+        set +e
         if [ "$rc" -ne 0 ]; then
             if [ -s "$WORK/loop.log" ]; then
                 echo "j09: [026] the loop's last lines:" >&2
@@ -1168,6 +1170,7 @@ part_012() {
     p012_finish() {
         rc=$?
         trap - EXIT
+        set +e
         if [ "$rc" -ne 0 ]; then
             if [ -s "$WORK/integrate.log" ]; then
                 echo "j09: [012] the integrator's last lines:" >&2

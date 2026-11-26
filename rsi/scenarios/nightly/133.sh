@@ -111,6 +111,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ] && [ -s "$WORK/list.json" ]; then
         echo "133: the last answer (first 60 lines):" >&2
         head -n 60 "$WORK/list.json" >&2

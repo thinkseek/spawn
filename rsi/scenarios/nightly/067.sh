@@ -105,6 +105,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ] && [ -s "$WORK/serve.log" ]; then
         echo "067: serve's last lines:" >&2
         tail -n 10 "$WORK/serve.log" >&2

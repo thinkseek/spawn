@@ -94,6 +94,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ] && [ -s "$WORK/landing.json" ]; then
         echo "168: the last answer: $(head -c 600 "$WORK/landing.json")" >&2
     fi

@@ -102,6 +102,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         echo "194: the integrator's last lines:" >&2
         grep -v '^| ' "$WORK/integrate.log" 2>/dev/null | tail -n 20 >&2 || true

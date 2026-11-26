@@ -76,6 +76,7 @@ stem="guarded-bb238-$$-$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')"
 case $stem in guarded-bb238-[0-9]*-[0-9]*) ;; *) harness "a unit name of this run's own: [$stem]" ;; esac
 WORK=""
 cleanup() {
+    set +e
     for unit in "$stem.timer" "$stem.service" "$stem-x3.service" "$stem-x4.service"; do
         systemctl --user stop "$unit" >/dev/null 2>&1 || true
         systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
