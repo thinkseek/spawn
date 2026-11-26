@@ -3871,6 +3871,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Decision D6: a file over the cap is recorded with its size and its
+    /// `sha256:` digest, and its bytes are in no commit; a record written
+    /// before digests were (three fields, a bare size) still reads, and its
+    /// file is told of no second time.
+    #[test]
+    fn a_file_over_the_cap_is_recorded_with_its_digest_and_an_old_record_still_reads() {
+        use sha2::{Digest, Sha256};
+        let (checkout, store, workspace, base) = capped("cap-digest");
+        let directory = PathBuf::from(workspace.path());
+        let bytes = vec![7u8; (1 << 20) + 5];
+        std::fs::write(directory.join("big.bin"), &bytes).expect("write");
+        store.commit(&workspace, "one").expect("commit");
+        let expected = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let root = base.join("work");
+        let record = super::oversized_record(&root, "agent_a");
+        assert_eq!(record.len(), 1, "{record:?}");
+        assert_eq!(record[0].path.as_bytes(), b"big.bin");
+        assert_eq!(record[0].size, (1 << 20) + 5);
+        assert_eq!(record[0].digest.as_deref(), Some(expected.as_str()));
+        assert!(!record[0].told);
+        assert!(
+            !git(&checkout, &["ls-tree", "-r", "--name-only", "agent_a"]).contains("big.bin"),
+            "no byte of it in git"
+        );
+        // Changed, same size: read again.
+        let changed = vec![8u8; (1 << 20) + 5];
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(directory.join("big.bin"), &changed).expect("write");
+        store.commit(&workspace, "two").expect("commit");
+        let record = super::oversized_record(&root, "agent_a");
+        assert_eq!(
+            record[0].digest,
+            Some(format!("sha256:{:x}", Sha256::digest(&changed)))
+        );
+
+        // A record of the earlier format: no digest, still told.
+        let notices = store.notices(&workspace);
+        store.notices_told(&workspace, &notices);
+        let size = (1u64 << 20) + 5;
+        std::fs::write(
+            root.join(".oversized/agent_a"),
+            format!("told\0{size}\0big.bin\0"),
+        )
+        .expect("an old record");
+        let old = super::oversized_record(&root, "agent_a");
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].digest, None);
+        assert!(old[0].told);
+        assert!(store.notices(&workspace).is_empty(), "told stays told");
+        // The next checkpoint adds the digest and keeps it told.
+        std::fs::write(directory.join("work.txt"), "w\n").expect("write");
+        store.commit(&workspace, "three").expect("commit");
+        let record = super::oversized_record(&root, "agent_a");
+        assert!(record[0].told);
+        assert_eq!(
+            record[0].digest,
+            Some(format!("sha256:{:x}", Sha256::digest(&changed)))
+        );
+        // A malformed digest is no digest; a name that is no branch reads
+        // nothing.
+        std::fs::write(
+            root.join(".oversized/agent_a"),
+            format!("untold\0{size} sha256:XYZ\0big.bin\0"),
+        )
+        .expect("a bad digest");
+        assert_eq!(super::oversized_record(&root, "agent_a")[0].digest, None);
+        assert!(super::oversized_record(&root, "../agent_a").is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A file over the cap that `main` holds as a blob (it came from the
     /// source) stays a blob: leaving it out would delete it from the branch,
     /// and from `main` when the branch lands.
