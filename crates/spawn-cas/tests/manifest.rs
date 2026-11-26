@@ -239,6 +239,7 @@ fn the_pin_keeps_the_three_newest_snapshots_and_drops_the_fourth() {
     let mut snapshots: Vec<Digest> = Vec::new();
     for version in 1..=4 {
         write(&root, "version", &format!("v{version}"));
+        write(&root, "unique", &format!("only in {version}"));
         let manifest = Manifest::build(&root).expect("build");
         let snapshot = store.put_snapshot(&root, &manifest, false).expect("put");
         snapshots.insert(0, snapshot);
@@ -255,8 +256,8 @@ fn the_pin_keeps_the_three_newest_snapshots_and_drops_the_fourth() {
         .expect("the fourth snapshot's manifest reads");
     assert_eq!(
         store.snapshot_missing(dropped).expect("missing"),
-        [artifact.clone()],
-        "only v1 (an artifact too) is still here"
+        [sha256_of(b"only in 1")],
+        "its own bytes are gone; v1 (an artifact too) stays"
     );
     assert!(store.has(&artifact), "v1 is an artifact too");
     assert!(store.has(&sha256_of(b"in every snapshot")));
