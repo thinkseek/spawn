@@ -354,7 +354,10 @@ fn inside_the_view_the_masks_are_empty_and_only_the_three_binds_write() {
     );
     fails(
         &words,
-        &format!("cat '{}'", fixture.host_tmp().join("spawn-backup-1/dump").display()),
+        &format!(
+            "cat '{}'",
+            fixture.host_tmp().join("spawn-backup-1/dump").display()
+        ),
     );
     let meta = std::fs::symlink_metadata(&empty).expect("empty");
     assert!(meta.is_file() && meta.len() == 0);

@@ -381,7 +381,10 @@ impl BwrapView {
         if sound(&file) {
             Ok(file)
         } else {
-            Err(format!("{} is not a private empty 0444 file", file.display()))
+            Err(format!(
+                "{} is not a private empty 0444 file",
+                file.display()
+            ))
         }
     }
 
@@ -491,7 +494,8 @@ impl BwrapView {
             .collect();
         let refused = masked.iter().find(|target| {
             target.starts_with(&engine_home)
-                || (engine_home.starts_with(target) && !engine_homes.iter().any(|dir| dir == **target))
+                || (engine_home.starts_with(target)
+                    && !engine_homes.iter().any(|dir| dir == **target))
         });
         if let Some(target) = refused {
             return Err(format!(
@@ -698,7 +702,16 @@ mod tests {
         ]));
         assert_eq!(config.home, PathBuf::from("/home/u"));
         assert_eq!(config.runtime_dir, PathBuf::from("/run/user/7"));
-        assert_eq!(config.tmpdir, Some(PathBuf::from("/var/tmp/spawn")));
+        assert_eq!(config.host_tmpdir, Some(PathBuf::from("/var/tmp/spawn")));
+        // The private directory is inside the masked runtime directory,
+        // never in the shared TMPDIR.
+        assert_eq!(
+            config.private_dir,
+            PathBuf::from(format!(
+                "/run/user/7/spawn-engine-view-{}",
+                crate::current_uid()
+            ))
+        );
         assert_eq!(
             config.loop_dirs,
             vec![PathBuf::from("/home/u/.local/share/spawn-rsi")]
@@ -724,6 +737,15 @@ mod tests {
             "/home/u/.config/spawn",
             "/home/u/.config/cloudflare",
             "/home/u/.config/observe3-private",
+            // $XDG_CONFIG_HOME's own, too.
+            "/home/u/cfg/antigravity",
+            "/home/u/cfg/gh",
+            "/home/u/cfg/anthropic",
+            "/home/u/cfg/spawn",
+            "/home/u/cfg/cloudflare",
+            "/home/u/cfg/observe3-private",
+            // The loop's shared TMPDIR is masked, never bound.
+            "/var/tmp/spawn",
         ] {
             assert!(dirs.contains(&PathBuf::from(want)), "{want}: {dirs:?}");
         }
