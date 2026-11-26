@@ -5054,6 +5054,7 @@ impl Judge {
             scenarios,
             scenario,
             gate_env,
+            test_database,
         };
         let stopped = || self.stop.as_ref().is_some_and(|stop| stop.by().is_some());
         match primary.judge(store, &request, &stopped) {
@@ -5066,17 +5067,9 @@ impl Judge {
                     belief,
                 } = *believed;
                 // A rejection with no failure of the work's (connection or
-                // database errors only) is judged here: the crash window
-                // the host-fault rule reads is this host's test server's,
-                // which says nothing of the node's, so the sentinel stands
-                // for "maybe the node's server crashed".
-                if !verdict.accepted
-                    && test_database
-                    && host::host_fault(&verdict.reason, &verdict.output, || {
-                        vec!["the node's test server (not this host's log)".to_string()]
-                    })
-                    .is_some()
-                {
+                // database errors only) is judged here
+                // ([`remote::names_no_work_failure`]).
+                if remote::names_no_work_failure(&verdict, test_database) {
                     println!(
                         "integrate: task {}: the node's rejection on {job_id} names no failure \
                          of the work's ({belief} not applied): judged on this host",

@@ -1050,7 +1050,16 @@ impl NodeShadows {
             }
         };
         let judged = remote::judge_stored(&stored, &job.given);
-        let settled = remote::settle(store, row, &judged);
+        // A rejection naming only test-database errors is no valid run:
+        // the node's strikes are not reset (nor struck); still recorded.
+        let no_work_failure = judged.verdict.as_ref().is_some_and(|verdict| {
+            remote::names_no_work_failure(verdict, super::needs_test_database(&job.want.scenarios))
+        });
+        let settled = if no_work_failure {
+            Ok(None)
+        } else {
+            remote::settle(store, row, &judged)
+        };
         let requeued = matches!(
             &settled,
             Ok(Some(outcome)) if outcome.ok && outcome.next == Some(spawn_postgres::FaultNext::Queued)
@@ -1071,7 +1080,7 @@ impl NodeShadows {
             ),
             Ok(None) => {}
             Err(error) => eprintln!(
-                "integrate: task {task}'s node shadow {}: its fault not judged: {error}",
+                "integrate: task {task}'s node shadow {}: {error}",
                 row.job_id
             ),
         }
@@ -1885,6 +1894,100 @@ mod tests {
         // The record the writer takes as it is.
         super::super::record(&world.ledger.store, from_node).expect("recorded");
         assert_eq!(world.ledger.records("task.shadow_gated").len(), 1);
+    }
+
+    /// A node shadow's valid verdict puts the node's strikes back to 0
+    /// (`spawn_remote_job_valid`) and leaves `degraded` as it was.
+    #[test]
+    fn a_node_shadows_valid_verdict_resets_the_nodes_strikes() {
+        let world = NodeWorld::new("node-valid");
+        let mut nodes = world.nodes();
+        let task = world.task();
+        nodes.offer(&world.ledger.store, world.want(task));
+        let job_id = nodes.waiting()[0].clone();
+        let row = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
+        let node = world.ledger.enroll("n252", 9, &row.requires);
+        let verdict =
+            super::super::remote::tests::verdict_on("accepted", &world.base, &world.candidate);
+        world.run(&node, &job_id, 0, Some(&verdict));
+        world
+            .ledger
+            .admin()
+            .execute(
+                "update spawn_node_state set host_fault_strikes = 2, degraded = true
+                  where name = 'n252'",
+                &[],
+            )
+            .unwrap();
+        let written = Written::new();
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
+        assert!(nodes.waiting().is_empty());
+        let records = written.all();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["result"], "verdict");
+        assert_eq!(world.ledger.strikes("n252"), (0, true));
+        let row = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
+        assert_eq!(row.state, spawn_postgres::RemoteJobState::Completed);
+        assert!(
+            !world
+                .ledger
+                .store
+                .remote_job_valid(&job_id, row.lease_epoch - 1)
+                .unwrap(),
+            "judged once"
+        );
+    }
+
+    /// A node shadow's rejection naming only test-database errors (maybe
+    /// the node's own test server crashed) resets no strikes, and leaves
+    /// the job's epoch; it is still recorded.
+    #[test]
+    fn a_node_shadows_database_error_only_rejection_resets_no_strikes() {
+        let world = NodeWorld::new("node-db-only");
+        let mut nodes = world.nodes();
+        let task = world.task();
+        nodes.offer(&world.ledger.store, world.want(task));
+        let job_id = nodes.waiting()[0].clone();
+        let row = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
+        let node = world.ledger.enroll("n252", 9, &row.requires);
+        let grants = world.ledger.beat(&node);
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        let verdict = json!({"v": 1, "verdict": "rejected",
+                             "reason": crate::integrate::host::CHECK_TESTS_REGRESSION,
+                             "base": world.base, "candidate": world.candidate})
+        .to_string();
+        let (meta, log) = super::super::remote::tests::meta(
+            &job_id,
+            grants[0].1,
+            Some(0),
+            Some(&verdict),
+            "| == regression: check-tests.sh must still pass\n\
+             | FAILED api::tests::one: error connecting to server: Connection refused (os \
+             error 111)\n",
+            "",
+            Some(&NodeWorld::given(&row)),
+        );
+        world.ledger.complete(&world.results(), &node, &meta, &log);
+        world
+            .ledger
+            .admin()
+            .execute(
+                "update spawn_node_state set host_fault_strikes = 2 where name = 'n252'",
+                &[],
+            )
+            .unwrap();
+        let written = Written::new();
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
+        assert_eq!(written.all().len(), 1, "still recorded");
+        assert_eq!(world.ledger.strikes("n252"), (2, false));
+        let after = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
+        assert_eq!(after.lease_epoch, grants[0].1, "not judged");
     }
 
     /// A node's fault is struck on the ledger and the job queued again,

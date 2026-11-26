@@ -686,6 +686,133 @@ fn three_strikes_degrade_a_node_and_an_undrain_clears_them() {
     assert_eq!(granted, [("gate-strike-0003".to_string(), 1)]);
 }
 
+/// A valid run (`spawn_remote_job_valid`) puts the node's strikes back to
+/// 0, once per completion, and never clears `degraded`; a job not
+/// completed at that epoch, or whose node it excludes, is refused, and only
+/// the owner may call it.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_valid_run_resets_the_strikes_once_and_leaves_degraded() {
+    let (store, schema) = store("rj_valid");
+    let node = enroll(&store, "nv", 10, &json!({}));
+    for n in 0..5 {
+        store
+            .remote_job_enqueue(&job(
+                &format!("gate-valid-{n:04}"),
+                &[],
+                &[("gate_sandbox", 1)],
+            ))
+            .expect("enqueue");
+    }
+    for (seq, n) in (1..).zip(0..4) {
+        let id = format!("gate-valid-{n:04}");
+        let granted = grants(&beat_once(
+            &store,
+            &node,
+            &boot(1),
+            seq,
+            &beat(&[], &[], 1, 0),
+        ));
+        assert_eq!(granted, [(id.clone(), 1)]);
+        complete(&store, &node, &id, 1);
+    }
+    for n in 0..2 {
+        let fault = store
+            .remote_job_fault(
+                &format!("gate-valid-{n:04}"),
+                1,
+                "wrapper_error",
+                true,
+                FaultNext::Keep,
+            )
+            .expect("a fault");
+        assert_eq!(fault.strikes, Some(n + 1));
+    }
+    let node_row = |store: &PostgresStore| store.node_v1("nv").expect("a node").expect("the node");
+    assert_eq!(node_row(&store).host_fault_strikes, 2);
+
+    // Refused: a faulted job (its node excluded), a wrong epoch, a job not
+    // completed. Nothing changes.
+    assert!(
+        !store
+            .remote_job_valid("gate-valid-0000", 1)
+            .expect("excluded")
+    );
+    assert!(
+        !store
+            .remote_job_valid("gate-valid-0002", 2)
+            .expect("wrong epoch")
+    );
+    assert!(
+        !store
+            .remote_job_valid("gate-valid-0004", 0)
+            .expect("queued")
+    );
+    assert!(
+        !store
+            .remote_job_valid("gate-none-000000", 1)
+            .expect("unknown")
+    );
+    assert_eq!(node_row(&store).host_fault_strikes, 2);
+
+    // A valid run: 2 -> 0, the row still completed at the next epoch.
+    assert!(store.remote_job_valid("gate-valid-0002", 1).expect("valid"));
+    let row = node_row(&store);
+    assert_eq!((row.host_fault_strikes, row.degraded), (0, false));
+    let judged = state(&store, "gate-valid-0002");
+    assert_eq!(judged.state, RemoteJobState::Completed);
+    assert_eq!(judged.lease_epoch, 2);
+    assert!(judged.finished_at_ms.is_some());
+    // Once only: neither a second valid nor a stale fault at the old epoch.
+    assert!(
+        !store.remote_job_valid("gate-valid-0002", 1).expect("again"),
+        "a completion is judged once"
+    );
+    let stale = store
+        .remote_job_fault("gate-valid-0002", 1, "wrapper_error", true, FaultNext::Keep)
+        .expect("a stale fault");
+    assert!(!stale.ok, "a fault after a valid judging is refused");
+    assert_eq!(node_row(&store).host_fault_strikes, 0);
+
+    // A degraded node's valid run clears its strikes, never `degraded`.
+    let mut client = admin(&schema);
+    client
+        .execute(
+            "update spawn_node_state set host_fault_strikes = 2, degraded = true where name = 'nv'",
+            &[],
+        )
+        .expect("degrade");
+    assert!(store.remote_job_valid("gate-valid-0003", 1).expect("valid"));
+    let row = node_row(&store);
+    assert_eq!((row.host_fault_strikes, row.degraded), (0, true));
+    let answer: Value = client
+        .query_one("select spawn_remote_job_valid('gate-valid-0003', 1)", &[])
+        .expect("again")
+        .get(0);
+    assert_eq!(answer, json!({"ok": false}));
+
+    // Only the owner: never the gateway, a reader, a supervisor or PUBLIC.
+    for login in ["spawn_node_gateway", "spawn_reader", "spawn_supervisor"] {
+        let error = common::as_login(&schema, login)
+            .query_one("select spawn_remote_job_valid('gate-valid-0001', 1)", &[])
+            .expect_err(login);
+        assert_eq!(
+            error.code(),
+            Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "{login}: {error}"
+        );
+    }
+    let public: bool = client
+        .query_one(
+            "select has_function_privilege('public', 'spawn_remote_job_valid(text, bigint)',
+                                           'execute')",
+            &[],
+        )
+        .expect("public's privilege")
+        .get(0);
+    assert!(!public, "closed to PUBLIC");
+}
+
 /// The integrator's `take_local` at the epoch it read, racing a node's
 /// grant and result upload: exactly one of them wins, every time.
 #[test]
@@ -849,6 +976,7 @@ fn the_gateway_login_reaches_exactly_its_functions_and_no_table() {
         "select * from spawn_remote_jobs",
         "select spawn_node_sweep()",
         "select spawn_remote_job_take_local('gate-none-00000', 0)",
+        "select spawn_remote_job_valid('gate-none-00000', 0)",
         "select spawn_node_events('[]')",
     ] {
         let error = gateway.query(refused, &[]).expect_err(refused);
