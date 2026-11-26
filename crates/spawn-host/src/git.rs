@@ -3877,13 +3877,16 @@ mod tests {
     /// file is told of no second time.
     #[test]
     fn a_file_over_the_cap_is_recorded_with_its_digest_and_an_old_record_still_reads() {
-        use sha2::{Digest, Sha256};
+        let sha = |bytes: &[u8]| {
+            let digest = spawn_cas::sha256_reader(&mut &bytes[..]).expect("hash");
+            format!("sha256:{}", digest.hex())
+        };
         let (checkout, store, workspace, base) = capped("cap-digest");
         let directory = PathBuf::from(workspace.path());
         let bytes = vec![7u8; (1 << 20) + 5];
         std::fs::write(directory.join("big.bin"), &bytes).expect("write");
         store.commit(&workspace, "one").expect("commit");
-        let expected = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let expected = sha(&bytes);
         let root = base.join("work");
         let record = super::oversized_record(&root, "agent_a");
         assert_eq!(record.len(), 1, "{record:?}");
@@ -3903,7 +3906,7 @@ mod tests {
         let record = super::oversized_record(&root, "agent_a");
         assert_eq!(
             record[0].digest,
-            Some(format!("sha256:{:x}", Sha256::digest(&changed)))
+            Some(sha(&changed))
         );
 
         // A record of the earlier format: no digest, still told.
@@ -3927,7 +3930,7 @@ mod tests {
         assert!(record[0].told);
         assert_eq!(
             record[0].digest,
-            Some(format!("sha256:{:x}", Sha256::digest(&changed)))
+            Some(sha(&changed))
         );
         // A malformed digest is no digest; a name that is no branch reads
         // nothing.
