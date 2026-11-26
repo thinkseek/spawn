@@ -42,6 +42,7 @@ pub enum Refused {
     TooLarge,
     /// Another result for this job and epoch is stored already.
     Conflict,
+    /// Underlying filesystem I/O failure while persisting the result.
     Io(io::Error),
 }
 

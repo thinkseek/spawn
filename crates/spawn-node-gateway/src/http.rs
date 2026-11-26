@@ -112,6 +112,7 @@ impl Read for TimedStream {
 
 /// One request: the head parsed, the body still on the socket.
 pub struct Request<'a> {
+    /// HTTP request method (`GET`, `POST`, etc.).
     pub method: String,
     /// The request target, byte for byte.
     pub target: String,
@@ -172,23 +173,31 @@ impl Request<'_> {
 
 /// A response body.
 pub enum Body {
+    /// In-memory byte buffer payload.
     Bytes(Vec<u8>),
     /// `len` bytes of `file` from `offset`, streamed.
     File {
+        /// Open file handle to stream from.
         file: File,
+        /// Byte offset inside `file` to start streaming from.
         offset: u64,
+        /// Exact byte length to stream.
         len: u64,
     },
 }
 
 /// One response; `Content-Length` is always written from the body.
 pub struct Response {
+    /// HTTP status code (e.g., `200`, `400`).
     pub status: u16,
+    /// Additional response headers `(name, value)` beyond `Content-Length`.
     pub headers: Vec<(String, String)>,
+    /// Response payload bytes or streamed file body.
     pub body: Body,
 }
 
 impl Response {
+    /// Builds a response with an in-memory byte payload and empty header list.
     pub fn bytes(status: u16, body: Vec<u8>) -> Self {
         Self {
             status,
@@ -197,6 +206,7 @@ impl Response {
         }
     }
 
+    /// Appends a header `(name, value)` to the response builder.
     #[must_use]
     pub fn header(mut self, name: &str, value: impl Into<String>) -> Self {
         self.headers.push((name.to_string(), value.into()));

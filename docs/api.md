@@ -50,7 +50,7 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | GET | `/api/sessions/<id>/commands` | One session's commands, each with `waiting` while the Bridge holds it for the turn; `?limit=` (50, at most 500) | `spawn tail --session <id>` (overlapping, not compared field by field) | web (agent detail) |
 | GET | `/api/sessions/<id>/judgements` | One session's judgements, newest first; `?limit=` (50, at most 500) | `spawn tail --session <id>` (overlapping, not compared field by field) | web (agent detail) |
 | GET | `/api/sessions/<id>/pane` | The tail of the session's live terminal, read from its terminal host; as it is only when the session's newest start is positively Claude Code's, else without its account lines (a failed lookup masks too) | – | web (agent detail) |
-| GET | `/api/tasks/<n>` | One task's brief, report and review note in full | – | web (Missions) |
+| GET | `/api/tasks/<n>` | One task's brief, report and review note in full | `spawn task commits <id>`, `spawn task diff <id>`, `spawn task land <id>` (bare-repo review and merge counterparts) | web (Missions) |
 | GET | `/api/tasks/<n>/gate` | One objective task in full: brief, report, latest gate log, every gate verdict with its log | `spawn task stages --id N` (its stages alone) | web (RSI) |
 | GET | `/api/objectives` | Every open objective mission: its backlog's objectives, tasks, gate verdicts, metrics and resident | `spawn mission objectives` (the backlog alone) | web (RSI) |
 | GET | `/api/objectives/<m>/<n>` | One objective's whole prompt | – | web (RSI) |
@@ -58,7 +58,7 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | GET | `/api/scorecard` | Every dimension of the fleet at once; `?mission=&since=&until=` | `spawn scorecard --json` with the same flags: the same JSON | web (Scorecard) |
 | GET | `/api/scorecard/fleet` | How the fleet decides over a window; `?window=24h\|7d\|30d\|90d&until=<RFC 3339>` | – | web (Scorecard) |
 | GET | `/api/interventions` | The north star (human interventions per agent-hour) and the interventions behind it; `?window=24h\|7d&until=` | – | web (Home, Fleet) |
-| GET | `/api/alerts` | The alerts raised, notices folded; `?since=<span>` (alias `?window=<span>`) (the configured window when empty) | `spawn alerts --once --json` with the same flag: the same array | web (Home, sidebar) |
+| GET | `/api/alerts` | The alerts raised, notices folded (including `source_main_advanced` and `source_main_synced` repo-main tracking notices); `?since=<span>` (alias `?window=<span>`) (the configured window when empty) | `spawn alerts --once --json` with the same flag: the same array | web (Home, sidebar) |
 | GET | `/api/cost` | What the model calls cost per model, mission, task, agent and execution, and per landing; `?window=24h\|7d` | – | web (Cost) |
 | GET | `/api/core-lines` | The core lines the owner steers by, each figure with its value, range and state | – | web (Home) |
 | GET | `/api/verifications` | What is landed and verified or not | `spawn verify list` (the same, ages aside) | no web page; nightly scenario 133 |
@@ -251,6 +251,78 @@ done, and never pressed twice.
   `all`). `answered` is the resolver's answers in the session within 10
   minutes. `breaker` is `open` or `closed`, or `off` unless the switch is
   `all`.
+
+## Operator task review and merge CLI (PR #172)
+
+Three operator-facing subcommands under `spawn task` in
+[`crates/spawn-cli/src/missions.rs`](../crates/spawn-cli/src/missions.rs) inspect
+and land worker-authored commits preserved in the mission's bare repository,
+while keeping all existing `spawn task` verbs (`assign`, `accept`, `reject`,
+`cancel`, `release`, `restart`, `reassign`, `steal`, `stages`) backwards
+compatible and never printing credentials:
+
+- **`spawn task commits <id> [--json]`:** resolves the task's preserved ref in
+  precedence order — `refs/spawn/tasks/<id>/head` (`spawn_host::git::task_head_ref`),
+  `refs/spawn/workers/<agent>/head` (`spawn_host::git::worker_head_ref`), then
+  `refs/heads/spawn/<agent>` — and lists `refs/heads/main..<resolved_ref>`,
+  tagging each entry as either `author` or synthetic `checkpoint` (`spawn
+  checkpoint`). Prints a compact table by default; with `--json` outputs a
+  `schema_version: 1` payload containing `task_id`, `mission_id`, `agent_id`,
+  `resolved_ref`, `base_ref`, `base_sha`, `head_sha`, `commit_count`,
+  `author_commit_count`, `checkpoint_commit_count`, and `commits`. Returns an
+  actionable error when the task, mission repository, `refs/heads/main`, or
+  preserved ref is missing.
+- **`spawn task diff <id> [--stat]`:** resolves the task's preserved ref via the
+  same lookup order and runs `git diff main...<resolved_ref>` (or `--stat`)
+  inside the mission bare repository through `controller_git()`
+  (`spawn_host::git_command`).
+- **`spawn task land <id> [--ff-only | --squash] [--dry-run] [--json]`:**
+  safely lands clean task work onto `refs/heads/main` in the mission's local
+  bare repository:
+  - Defaults to `--ff-only`; passing `--ff-only` and `--squash` together is
+    refused.
+  - `--dry-run` validates ref existence, fast-forward ancestry (`--ff-only`) or
+    conflict-free mergeability (`--squash`), and prints the `schema_version: 1`
+    report (`task_id`, `mission_id`, `resolved_ref`, `base_ref`, `base_sha`,
+    `head_sha`, `new_main_sha`, `mode`, `dry_run`, `landed`, `can_land`, and
+    commit counts) without mutating `refs/heads/main`.
+  - Non-dry-run `--ff-only` verifies `refs/heads/main` is an ancestor of
+    `<resolved_ref>` and atomically advances `refs/heads/main` via
+    `git update-ref refs/heads/main <head_sha> <base_sha>`.
+  - Non-dry-run `--squash` stages the merge against `refs/heads/main` in an
+    isolated temporary worktree backed by `objects/info/alternates`, refuses
+    conflicts without mutating the bare repo, builds a single-parent squash commit
+    whose message omits synthetic `spawn checkpoint` subjects (carrying
+    `Spawn-Task` and `Spawn-Head` trailers), fetches it, and atomically updates
+    `refs/heads/main`.
+
+## External `refs/heads/main` advancement detection (PR #171)
+
+Local directory mission sources are polled for out-of-band pushes to
+`refs/heads/main` by `digest::sync_external_main` (invoked in
+[`dispatch::step`](../crates/spawn-cli/src/dispatch.rs) and
+[`Integrator::pass_on`](../crates/spawn-cli/src/integrate.rs)), and surfaced via
+supervisor digests and `/api/alerts` notices (`notice: true`):
+
+- **Poll cadence (`SPAWN_EXTERNAL_MAIN_POLL_SECS`):** positive whole seconds
+  `1..=3600`, default `15` (unset, invalid, or out-of-range values fall back to
+  `15` s). Bounds `digest::external_main_poll_ms()` wakeups in `dispatch::step`
+  when local sources are watched and no database event moved the log watermark.
+- **Notice kinds recorded in `spawn_alerts`:**
+  - `source_main_synced`: durable non-escalating baseline / checkpoint recorded
+    on initial observation and after `spawn integrate` landings or Step 0 owner
+    pushes.
+  - `source_main_advanced`: durable notice recorded when `refs/heads/main` moves
+    outside Spawn's own landing path (with idempotency key
+    `source_main_advanced:{source_hash:016x}:{anchor_event}:{range_hash:016x}`),
+    carrying `from`, `to`, `update_kind` (`fast_forward`, `non_fast_forward`, or
+    `rewound`), `old_reachable`, `ahead`, `behind`, up to 5 commit `subjects` (120
+    chars each), and affected `missions`.
+- **Own-landing exclusions & digest delivery:** ignores `task.landed`,
+  accepted gated `source.moved`, Step 0 `source.moved` requests, pending
+  `owner_requests`, and in-flight `accepted`/`landing` candidate heads. Active
+  `source_main_advanced` notices feed `Why::MainAdvanced` in supervisor digests,
+  deduplicated per notice via `missions main-advanced-<id>` tags.
 
 ## Operator CLI, preflight diagnostics & terminal backend
 

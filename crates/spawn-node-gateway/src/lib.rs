@@ -9,14 +9,26 @@
 //! fixed pool of worker threads, each holding its own PostgreSQL
 //! connection. No async runtime, no unsafe code.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+/// Content-addressed artifact verification and disk streaming.
 pub mod artifacts;
+/// In-memory node public-key cache with TTL and capacity eviction.
 pub mod cache;
+/// Environment and CLI configuration parsing.
 pub mod config;
+/// Request validation, signature checks, and PostgreSQL gateway handlers.
 pub mod gateway;
+/// Synchronous HTTP/1.1 listener and connection loop.
 pub mod http;
+/// Request byte/rate limits and per-node concurrency guards.
 pub mod limits;
+/// Primary Ed25519 signing key loading and creation.
 pub mod primary;
+/// Result log and metadata storage helpers.
 pub mod results;
+/// Bounded span/size parsing helpers.
 pub mod span;
 
 pub use config::Config;

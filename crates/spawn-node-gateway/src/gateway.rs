@@ -70,12 +70,19 @@ pub fn system_clock() -> Clock {
 
 /// What a gateway is made of.
 pub struct Settings {
+    /// Primary Ed25519 signing key used to sign gateway responses.
     pub primary: SigningKey,
+    /// Cell identifiers accepted by this gateway.
     pub cells: Vec<String>,
+    /// Optional reverse-proxy URL prefix stripped before routing.
     pub public_prefix: String,
+    /// Root directory containing artifact blobs and manifests.
     pub artifacts: PathBuf,
+    /// Directory where job logs and metadata are persisted.
     pub results: PathBuf,
+    /// Monotonic/wall clock source used for timestamps and signatures.
     pub clock: Clock,
+    /// Factory opening a synchronous PostgreSQL store connection per worker.
     pub connector: Connector,
 }
 
@@ -98,12 +105,16 @@ pub struct Gateway {
 /// each one only when it is well formed (empty or 0 otherwise).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Rid {
+    /// Lowercase 64-hex node identifier from the request header, or empty.
     pub node_id: String,
+    /// Lowercase 32-hex boot identifier from the request header, or empty.
     pub boot_id: String,
+    /// Parsed decimal sequence number from the request header, or `0`.
     pub seq: u64,
 }
 
 impl Rid {
+    /// Borrows the response-binding request identity tuple for signing.
     pub fn id(&self) -> RequestId<'_> {
         RequestId {
             node_id: &self.node_id,
@@ -160,7 +171,9 @@ const BAD: Answer = Answer::Refuse(Refusal::BadRequest);
 /// `POST /node/v1/spec`'s answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpecAnswer {
+    /// Protocol version (`1`).
     pub v: u64,
+    /// Server timestamp in Unix milliseconds.
     pub server_time_ms: u64,
     /// False when the ledger held this spec already.
     pub changed: bool,
@@ -169,9 +182,13 @@ pub struct SpecAnswer {
 /// `POST /node/v1/jobs/<job_id>/result`'s answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultAnswer {
+    /// Protocol version (`1`).
     pub v: u64,
+    /// Server timestamp in Unix milliseconds.
     pub server_time_ms: u64,
+    /// Identifier of the job whose result was recorded.
     pub job_id: String,
+    /// Lease epoch associated with the job result.
     pub lease_epoch: u64,
 }
 
@@ -210,6 +227,7 @@ struct JobSpec {
 }
 
 impl Gateway {
+    /// Constructs a new [`Gateway`] instance from validated [`Settings`].
     pub fn new(settings: Settings) -> Self {
         Self {
             primary: settings.primary,
