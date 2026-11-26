@@ -284,7 +284,7 @@ pub(crate) fn probe_now() -> Probe {
             run: &run_bounded,
             exists: &exists,
         },
-        crate::now_ms(),
+        crate::grading::now_ms(),
     )
 }
 

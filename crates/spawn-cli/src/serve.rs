@@ -147,6 +147,7 @@
 mod answers;
 pub(crate) mod approvals;
 pub(crate) mod attention;
+pub(crate) mod capabilities;
 pub(crate) mod core_lines;
 mod digest;
 pub(crate) mod feature_map;
@@ -973,6 +974,7 @@ const ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/verifications"),
     ("GET", "/api/nodes"),
     ("GET", "/api/grading"),
+    ("GET", "/api/capabilities"),
     ("GET", "/api/features"),
     ("GET", "/api/features/coverage"),
     ("GET", "/api/features/coverage/projects"),
@@ -1258,6 +1260,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/verifications" => Box::new(verifications),
         "/api/nodes" => Box::new(nodes),
         "/api/grading" => Box::new(grading),
+        "/api/capabilities" => Box::new(capabilities::capabilities),
         "/api/approvals" => Box::new(approvals::approvals),
         "/api/context/digest" => Box::new(digest::digest),
         "/api/prov/who" => Box::new(move || prov::who(query)),
@@ -7267,7 +7270,7 @@ mod tests {
         );
         let gets = super::ROUTES.iter().filter(|(m, _)| *m == "GET").count();
         let posts = super::ROUTES.iter().filter(|(m, _)| *m == "POST").count();
-        assert_eq!((gets, posts), (32, 9));
+        assert_eq!((gets, posts), (33, 9));
         assert!(
             doc.contains(&format!(
                 "serves {gets} GET route patterns and {posts} POST routes"

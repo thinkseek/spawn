@@ -712,6 +712,9 @@ pub(crate) fn load(
             .map_err(|error| format!("dispatch facts: {error}"))?;
     let mut work = Work::load(store)?;
     work.waits = waits;
+    // What the capability probe found (`spawn loop` probes at its start and
+    // hourly): before it, a task on an engine besides Claude Code waits.
+    work.engines = crate::serve::capabilities::current_engines();
     Ok((rows, work))
 }
 
@@ -732,6 +735,7 @@ pub(crate) fn load_if_permitted(
         return Ok(None);
     };
     work.waits = waits;
+    work.engines = crate::serve::capabilities::current_engines();
     Ok(Some((rows, work)))
 }
 
