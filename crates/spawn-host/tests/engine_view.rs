@@ -428,7 +428,8 @@ fn missing_and_odd_targets_are_skipped_and_said_without_aborting() {
 /// The argv invariants: the pid namespace, never a new session, never the
 /// network or every namespace unshared nor the program as pid 1; every
 /// mask before the first writable bind, and the binds in order
-/// (workspace, engine home, TMPDIR), each at its own path; resolved paths
+/// (workspace, engine home; the TMPDIR below the home is only named, never
+/// bound again), each at its own path; resolved paths
 /// only (a link is masked by its target); `--` last.
 #[test]
 fn the_argv_keeps_its_invariants() {
@@ -487,8 +488,6 @@ fn the_argv_keeps_its_invariants() {
         .filter(|three| three[0] == "--bind")
         .map(|three| (three[1].as_str(), three[2].as_str()))
         .collect();
-    // The engine's TMPDIR lies in its home, writable through that bind:
-    // never bound a second time, only named.
     assert_eq!(
         binds,
         vec![
