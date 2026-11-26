@@ -1,0 +1,24 @@
+[Unit]
+Description=Spawn: local UDS IPC control core (spawn serve --ipc) on core.sock
+After=network-online.target
+
+[Service]
+# Not the owner's checkout: nothing live reads it (deploy/deploy.sh).
+WorkingDirectory=%h/.local/share/spawn-rsi
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# The deployed UI build (deploy/deploy.sh installs it), not the checkout's.
+Environment=SPAWN_WEB_DIR=%h/.local/share/spawn-rsi/web
+# The feature map's tree (/api/features, docs/feature-map/registry.json):
+# the controller, the deployed commit's, not the working directory.
+Environment=SPAWN_FEATURE_ROOT=%h/.local/share/spawn-rsi/controllers/spawn
+Environment=SPAWN_CAS_ROOT=%h/.local/share/spawn-rsi/cas
+RuntimeDirectory=spawn
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn serve --ipc --ipc-sock %t/spawn/core.sock --cas %h/.local/share/spawn-rsi/cas
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
