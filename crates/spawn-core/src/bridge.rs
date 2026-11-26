@@ -9381,6 +9381,14 @@ mod tests {
     }
 
     fn submit_agy_start(store: &Arc<MemoryStore>, prompt: &str) -> CommandId {
+        submit_agy_start_on(store, prompt, None)
+    }
+
+    fn submit_agy_start_on(
+        store: &Arc<MemoryStore>,
+        prompt: &str,
+        model_label: Option<&str>,
+    ) -> CommandId {
         let id = store
             .submit(
                 &Principal::new("tester").expect("principal"),
@@ -9395,7 +9403,7 @@ mod tests {
                         from: None,
                         model: None,
                         charter: None,
-                        model_label: None,
+                        model_label: model_label.map(str::to_string),
                     },
                 },
             )
@@ -9452,6 +9460,77 @@ mod tests {
         assert!(
             why.contains("engine agy needs the herdr terminal backend"),
             "{why}"
+        );
+    }
+
+    /// The start's `model_label` (the task's preset's) is agy's `--model`,
+    /// on a host that names none (`SPAWN_AGY_MODEL` unset) or another.
+    #[test]
+    fn agy_starts_on_the_starts_model_label_over_the_hosts() {
+        for host_model in [None, Some("gemini-3.8-flash-low")] {
+            let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+            let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+            let host = Witnessed::over(store.clone());
+            host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+            let id = submit_agy_start_on(&store, "hello", Some("gemini-3.8-pro"));
+            let mut bridge = Bridge::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                host.clone(),
+                agy_config(host_model),
+            )
+            .with_clock(clock);
+            drive_work(&mut bridge, &store, || {
+                command_outcome(&store, id).is_some()
+            });
+            assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+            let launch = store.launches().pop().expect("launched");
+            let arguments = launch.arguments.join(" ");
+            assert!(
+                arguments.contains("/opt/agy/bin/agy --model gemini-3.8-pro --dangerously"),
+                "{host_model:?}: {arguments}"
+            );
+        }
+    }
+
+    /// agy's "is not recognized as a known model" line fails the start at
+    /// once: it never waits on, nor types into, an engine on a model nobody
+    /// chose.
+    #[test]
+    fn agys_unknown_model_line_fails_the_start() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let id = submit_agy_start_on(&store, "hello", Some("gemini-9"));
+        store.set_pane(
+            &TerminalName::for_execution(&ExecutionId::for_command(id)),
+            &format!(
+                "Warning: model \"gemini-9\" is not recognized as a known model\n{}",
+                agy_idle()
+            ),
+        );
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            agy_config(None),
+        )
+        .with_clock(clock);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        match command_outcome(&store, id) {
+            Some(Outcome::Failed(why)) => {
+                assert!(why.contains("is not recognized as a known model"), "{why}");
+            }
+            other => panic!("failed, not {other:?}"),
+        }
+        assert!(
+            store.submitted_texts().is_empty(),
+            "nothing typed into an engine on an unchosen model"
         );
     }
 
