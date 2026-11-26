@@ -101,6 +101,9 @@ fn manifests_are_sorted_bytewise_and_anything_else_is_refused() {
     assert_eq!(manifest.bytes(), 3);
     assert_eq!(manifest.subtree(b"a").len(), 1);
     assert_eq!(manifest.subtree(b"a").entries()[0].path, b"b");
+    // "a.txt" sorts between "a" and "a/": not under a/.
+    assert_eq!(manifest.subtree(b"a.txt").len(), 0);
+    assert_eq!(manifest.subtree(b"B").len(), 0);
 
     let hex = "ab".repeat(32);
     let refused = [
@@ -166,6 +169,16 @@ fn symlinks_are_never_followed_and_one_leaving_the_root_is_refused() {
         }
         fs::remove_file(&link).expect("unlink");
     }
+    // Through an inner link to the root itself, `..` leaves it: the text
+    // says inside, the kernel says outside.
+    symlink(".", root.join("here")).expect("a link to the root");
+    symlink("here/../outside/secret.txt", root.join("chained")).expect("chained");
+    assert!(matches!(
+        Manifest::build(&root),
+        Err(CasError::SymlinkEscape { .. })
+    ));
+    fs::remove_file(root.join("chained")).expect("unlink");
+    fs::remove_file(root.join("here")).expect("unlink");
     // A dangling link that would land outside is refused too.
     symlink("../../nowhere", root.join("sub/dangling")).expect("dangling");
     assert!(matches!(
@@ -235,7 +248,16 @@ fn the_pin_keeps_the_three_newest_snapshots_and_drops_the_fourth() {
     let kept = store.kept_snapshots("clean").expect("kept");
     assert_eq!(kept, snapshots[..KEEP_SNAPSHOTS]);
     let dropped = &snapshots[KEEP_SNAPSHOTS];
-    assert!(!store.has(dropped), "the fourth snapshot's manifest stays");
+    // The fourth newest loses its file bytes, never its manifest (D3).
+    assert!(store.has(dropped), "the fourth snapshot's manifest stays");
+    store
+        .snapshot_manifest(dropped)
+        .expect("the fourth snapshot's manifest reads");
+    assert_eq!(
+        store.snapshot_missing(dropped).expect("missing"),
+        [artifact.clone()],
+        "only v1 (an artifact too) is still here"
+    );
     assert!(store.has(&artifact), "v1 is an artifact too");
     assert!(store.has(&sha256_of(b"in every snapshot")));
     for snapshot in &kept {
@@ -247,7 +269,20 @@ fn the_pin_keeps_the_three_newest_snapshots_and_drops_the_fourth() {
         );
     }
     let pinned = store.pinned().expect("pinned");
-    assert!(pinned.contains(&kept[0]) && !pinned.contains(dropped));
+    assert!(pinned.contains(&kept[0]) && pinned.contains(dropped));
+    let mut every = snapshots.clone();
+    every.sort();
+    assert_eq!(store.kept_manifests("clean").expect("manifests"), every);
+    // A data quota of 0 evicts every unpinned data object: the manifests
+    // all stay, and so do the kept snapshots' bytes.
+    let quotas = spawn_cas::Quotas::from([(NS_DATA.to_string(), 0)]);
+    store.gc(&quotas).expect("gc");
+    for snapshot in &snapshots {
+        store.snapshot_manifest(snapshot).expect("pinned forever");
+    }
+    for snapshot in &kept {
+        store.verify_snapshot(snapshot).expect("kept whole");
+    }
     let names = store.pin_names(PROV_PIN_OWNER).expect("names");
     assert_eq!(names, ["clean"]);
     // Keeping the same list again changes nothing.
