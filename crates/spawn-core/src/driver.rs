@@ -253,6 +253,31 @@ pub struct LineFacts {
     pub version: Option<String>,
 }
 
+/// A pending agy tool call that asks to cancel or kill background work,
+/// resolved only when its matching `GENERIC` step succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingCancel {
+    /// `manage_task` killing, cancelling, or stopping a specific task id.
+    Task {
+        /// Task identifier named in the tool call arguments.
+        job_id: String,
+        /// End reason recorded if the call succeeds.
+        how: crate::event::JobEnd,
+    },
+    /// `manage_subagents` killing specific subagent conversation ids.
+    Subagents {
+        /// Subagent conversation identifiers named in the tool call arguments.
+        ids: Vec<String>,
+        /// End reason recorded if the call succeeds.
+        how: crate::event::JobEnd,
+    },
+    /// `manage_subagents` killing all active subagents (`Action: "kill_all"`).
+    AllSubagents {
+        /// End reason recorded if the call succeeds.
+        how: crate::event::JobEnd,
+    },
+}
+
 /// What a driver keeps between the lines of one transcript. Claude Code's
 /// lines read alone, so it only counts them. agy's do not
 /// ([`crate::ingest::agy_line`]): a tool's result is the next step after
@@ -268,6 +293,10 @@ pub struct LineCursor {
     /// agy's tool calls whose result has not come yet: the step that made
     /// each and its place among the step's calls, oldest first.
     pub pending_tools: Vec<(u64, usize)>,
+    /// agy's pending kill/cancel calls, keyed by `(step_index, call_index)`
+    /// from [`Self::pending_tools`], applied only when their matching
+    /// `GENERIC` step succeeds.
+    pub pending_cancels: std::collections::BTreeMap<(u64, usize), PendingCancel>,
     /// agy's background jobs started and not reported finished
     /// (`<conversation>/task-<n>`).
     pub open_jobs: std::collections::BTreeSet<String>,

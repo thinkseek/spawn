@@ -157,6 +157,15 @@ impl Snapshot {
                 self.turn = Some(TurnFact::Stopped);
                 self.last_error = None;
                 self.open_tools.clear();
+                // AgyDriver emits `TurnStopped` only once all transcript-tracked
+                // background jobs and subagents have closed (`!cursor.work_open()`).
+                // Clearing any residual `open_jobs` here prevents stale agy jobs
+                // (e.g. from a dropped step) from trapping the session in
+                // `WAITING_FOR_BACKGROUND_JOB`, while leaving Claude Code's
+                // post-TurnStopped background jobs untouched.
+                if self.engine.as_deref() == Some("agy") {
+                    self.open_jobs.clear();
+                }
             }
             EventKind::JobStarted { .. } | EventKind::JobEnded { .. } => self.job(record),
             EventKind::TurnFailed { error, .. } => {
@@ -203,15 +212,14 @@ impl Snapshot {
     /// under its id starts again after its end: open again, as of the new
     /// start.
     fn job(&mut self, record: &EventRecord) {
+        let same_execution =
+            record.event.execution_id.is_none() || record.event.execution_id == self.execution;
         match &record.event.kind {
-            EventKind::JobStarted { job_id, kind }
-                if record.event.execution_id.is_none()
-                    || record.event.execution_id == self.execution =>
-            {
+            EventKind::JobStarted { job_id, kind } if self.execution_active && same_execution => {
                 self.open_jobs
                     .insert(job_id.clone(), (*kind, record.recorded_at));
             }
-            EventKind::JobEnded { job_id, .. } => {
+            EventKind::JobEnded { job_id, .. } if same_execution => {
                 self.open_jobs.remove(job_id);
             }
             _ => {}
@@ -498,5 +506,120 @@ mod tests {
             last_error(vec![started(), turn_failed(), typed]).as_deref(),
             Some("API Error: 529 overloaded")
         );
+    }
+
+    fn apply_ev(snapshot: &mut Snapshot, n: u64, source: Source, kind: EventKind) {
+        snapshot.apply(&EventRecord {
+            position: GlobalPosition(n),
+            session_seq: SessionSeq(n),
+            recorded_at: Timestamp(i64::try_from(n).expect("small") * 1_000),
+            event: NewEvent {
+                agent_id: AgentId::new("agent_w").expect("valid"),
+                session_id: SessionId::new("session_w").expect("valid"),
+                execution_id: Some(ExecutionId::new("exec_1").expect("valid")),
+                source,
+                source_event_id: None,
+                kind,
+            },
+        });
+    }
+
+    #[test]
+    fn agy_turn_stopped_clears_residual_open_jobs_while_claude_keeps_them() {
+        use crate::event::{JobEnd, JobKind};
+
+        let run = |engine: &str| {
+            let mut snapshot = Snapshot::default();
+            apply_ev(
+                &mut snapshot,
+                1,
+                Source::Bridge,
+                EventKind::ExecutionStarted {
+                    engine: engine.to_string(),
+                    workspace: WorkspaceId::new("w:/workspaces/w").expect("valid"),
+                    command_id: CommandId(1),
+                    fork: None,
+                    model: ModelProfile::Default,
+                    transcript_from: None,
+                    launch: None,
+                },
+            );
+            apply_ev(
+                &mut snapshot,
+                2,
+                Source::Claude,
+                EventKind::JobStarted {
+                    job_id: "job_1".to_string(),
+                    kind: JobKind::Bash,
+                },
+            );
+            apply_ev(&mut snapshot, 3, Source::Claude, turn_stopped().1);
+            let input = snapshot.input(
+                &AgentId::new("agent_w").expect("valid"),
+                &SessionId::new("session_w").expect("valid"),
+                Timestamp(10_000),
+            );
+            // Normal JobEnded closes the remaining job for Claude Code.
+            apply_ev(
+                &mut snapshot,
+                4,
+                Source::Claude,
+                EventKind::JobEnded {
+                    job_id: "job_1".to_string(),
+                    how: JobEnd::Completed,
+                },
+            );
+            let after_end = snapshot.input(
+                &AgentId::new("agent_w").expect("valid"),
+                &SessionId::new("session_w").expect("valid"),
+                Timestamp(12_000),
+            );
+            (input.open_jobs, after_end.open_jobs)
+        };
+
+        assert_eq!(
+            run("agy"),
+            (0, 0),
+            "agy TurnStopped clears residual open_jobs"
+        );
+        assert_eq!(
+            run("claude"),
+            (1, 0),
+            "Claude Code keeps open_jobs across TurnStopped until JobEnded"
+        );
+    }
+
+    #[test]
+    fn late_job_started_after_execution_ended_does_not_reopen_jobs() {
+        use crate::event::{EndCause, JobKind};
+
+        let mut snapshot = Snapshot::default();
+        apply_ev(&mut snapshot, 1, Source::Bridge, started().1);
+        apply_ev(
+            &mut snapshot,
+            2,
+            Source::Bridge,
+            EventKind::ExecutionEnded {
+                cause: EndCause::Stopped,
+                exit_code: Some(0),
+                signal: None,
+                evidence: None,
+            },
+        );
+        apply_ev(
+            &mut snapshot,
+            3,
+            Source::Claude,
+            EventKind::JobStarted {
+                job_id: "late_job".to_string(),
+                kind: JobKind::Bash,
+            },
+        );
+        let input = snapshot.input(
+            &AgentId::new("agent_w").expect("valid"),
+            &SessionId::new("session_w").expect("valid"),
+            Timestamp(10_000),
+        );
+        assert_eq!(input.open_jobs, 0);
     }
 }

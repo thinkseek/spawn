@@ -2408,6 +2408,154 @@ fn agy_job_id(id: &str) -> Option<&str> {
     .then_some(id)
 }
 
+/// The message body inside a `SYSTEM_MESSAGE` (`content=…` after `sender=…`,
+/// stripping outer `<SYSTEM_MESSAGE>` tags when present).
+fn agy_message_body(text: &str) -> &str {
+    let mut body = text.trim();
+    if let Some(rest) = body.strip_prefix("<SYSTEM_MESSAGE>") {
+        body = rest
+            .strip_suffix("</SYSTEM_MESSAGE>")
+            .unwrap_or(rest)
+            .trim();
+    }
+    if let Some(at) = body.find("content=") {
+        let head = &body[..at];
+        if head.contains("sender=") || head.trim_start().starts_with("[Message]") {
+            return body[at + "content=".len()..].trim();
+        }
+    }
+    body
+}
+
+fn is_agy_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/')
+}
+
+/// Whether `text` contains `id` on identifier token boundaries (so `task-2`
+/// never matches `task-20`).
+fn agy_contains_id(text: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(rel) = text[start..].find(id) {
+        let idx = start + rel;
+        let before_ok = text[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_agy_id_char(c));
+        let after = idx + id.len();
+        let after_ok = text[after..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_agy_id_char(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        let step = text[idx..].chars().next().map_or(1, char::len_utf8);
+        start = idx + step;
+    }
+    false
+}
+
+/// Progress notice for a background command still running after `NotificationTimeoutSeconds`:
+/// keeps the job open in `cursor.open_jobs`.
+fn agy_is_still_running_notice(text: &str) -> bool {
+    agy_message_body(text)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.starts_with("background command is still running")
+                || lower.starts_with("command is still running")
+                || lower.starts_with("task is still running")
+        })
+}
+
+/// System-wide stop/force-cancellation notice closing all open tasks and subagents.
+fn agy_stops_all_work(text: &str) -> Option<JobEnd> {
+    let lower = agy_message_body(text).to_ascii_lowercase();
+    let global_stop = lower.contains("all your subagents and background tasks have been stopped")
+        || lower.contains("all background tasks and subagents have been stopped")
+        || lower.contains("all background tasks have been cancelled")
+        || lower.contains("all background tasks have been canceled")
+        || lower.contains("all background tasks have been killed");
+    if !global_stop {
+        return None;
+    }
+    if lower.contains("force cancellation") || lower.contains("killed") {
+        Some(JobEnd::Killed)
+    } else {
+        Some(JobEnd::Stopped)
+    }
+}
+
+/// Map lowercased termination/status wording to [`JobEnd`].
+fn agy_end_from_phrase(lower: &str) -> Option<JobEnd> {
+    if [
+        "was killed",
+        "killed",
+        "force cancellation",
+        "sigkill",
+        "terminated by signal",
+    ]
+    .iter()
+    .any(|pat| lower.contains(pat))
+    {
+        return Some(JobEnd::Killed);
+    }
+    if [
+        "tool execution was canceled",
+        "tool execution was cancelled",
+        "was canceled",
+        "was cancelled",
+        "cancelled",
+        "canceled",
+        "was stopped",
+        "stopped",
+        "aborted",
+        "interrupted",
+    ]
+    .iter()
+    .any(|pat| lower.contains(pat))
+    {
+        return Some(JobEnd::Stopped);
+    }
+    if ["timed out", "timed_out", "timeout", "expired"]
+        .iter()
+        .any(|pat| lower.contains(pat))
+    {
+        return Some(JobEnd::Expired);
+    }
+    if ["failed", "encountered error", "error:"]
+        .iter()
+        .any(|pat| lower.contains(pat))
+    {
+        return Some(JobEnd::Failed);
+    }
+    if ["completed", "succeeded"]
+        .iter()
+        .any(|pat| lower.contains(pat))
+    {
+        return Some(JobEnd::Completed);
+    }
+    None
+}
+
+fn agy_exit_code_end(text: &str) -> Option<JobEnd> {
+    let at = text.find("Command exited with code ")?;
+    let code: String = text[at + "Command exited with code ".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    Some(match code.parse::<i64>() {
+        Ok(0) => JobEnd::Completed,
+        Ok(_) => JobEnd::Failed,
+        Err(_) => JobEnd::Ended,
+    })
+}
+
 /// The sender a `SYSTEM_MESSAGE` names (`sender=<id>`): a job or a subagent
 /// that reported back. A system message with none (a reminder of the
 /// engine's own) ends nothing.
@@ -2428,20 +2576,341 @@ fn agy_subagent(text: &str) -> Option<String> {
     agy_job_id(id).map(str::to_string)
 }
 
-/// How a job's report says it finished: `Command exited with code N`.
+/// How a job's report says it finished: explicit cancel/kill/timeout/fail
+/// framing on the header line, `Command exited with code N`, or the leading
+/// result lines. Checking `Command exited with code ` before scanning body
+/// lines keeps a passing test whose stdout says `cancelled` as `Completed`.
 fn agy_job_end(text: &str) -> JobEnd {
-    let Some(at) = text.find("Command exited with code ") else {
-        return JobEnd::Ended;
-    };
-    let code: String = text[at + "Command exited with code ".len()..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '-')
-        .collect();
-    match code.parse::<i64>() {
-        Ok(0) => JobEnd::Completed,
-        Ok(_) => JobEnd::Failed,
-        Err(_) => JobEnd::Ended,
+    let body = agy_message_body(text);
+    let mut non_empty = body.lines().map(str::trim).filter(|line| {
+        !line.is_empty() && !line.starts_with("Created At:") && !line.starts_with("Completed At:")
+    });
+    if let Some(first) = non_empty.next() {
+        let first_lower = first.to_ascii_lowercase();
+        if !first_lower.contains("finished with result")
+            && let Some(how) = agy_end_from_phrase(&first_lower)
+        {
+            return how;
+        }
     }
+    if let Some(how) = agy_exit_code_end(body) {
+        return how;
+    }
+    for line in body
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("Created At:")
+                && !line.starts_with("Completed At:")
+        })
+        .take(3)
+    {
+        let lower = line.to_ascii_lowercase();
+        if line
+            == body
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("")
+            && lower.contains("finished with result")
+        {
+            continue;
+        }
+        if let Some(how) = agy_end_from_phrase(&lower) {
+            return how;
+        }
+    }
+    JobEnd::Ended
+}
+
+/// How a subagent `SYSTEM_MESSAGE` ended: only explicit status/notice framing
+/// maps to `Killed`/`Stopped`/`Expired`/`Failed`; normal subagent prose
+/// defaults to `Completed`.
+fn agy_subagent_end(text: &str) -> JobEnd {
+    let body = agy_message_body(text);
+    let Some(first) = body.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return JobEnd::Completed;
+    };
+    let lower = first.to_ascii_lowercase();
+    let explicit = matches!(
+        lower.as_str(),
+        "killed"
+            | "stopped"
+            | "cancelled"
+            | "canceled"
+            | "failed"
+            | "expired"
+            | "timed out"
+            | "timeout"
+    ) || [
+        "subagent ",
+        "task id ",
+        "[notice]",
+        "error:",
+        "encountered error",
+        "tool execution was cancel",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+    if explicit {
+        agy_end_from_phrase(&lower).unwrap_or(JobEnd::Completed)
+    } else {
+        JobEnd::Completed
+    }
+}
+
+/// Pending cancel/kill intent of an agy `manage_task` or `manage_subagents` call.
+fn agy_cancel_intent(name: &str, args: Option<&Value>) -> Option<crate::driver::PendingCancel> {
+    let parsed_args;
+    let obj = match args? {
+        Value::Object(map) => map,
+        Value::String(raw) => {
+            parsed_args = serde_json::from_str::<Value>(raw).ok()?;
+            parsed_args.as_object()?
+        }
+        _ => return None,
+    };
+    let action = obj
+        .get("Action")
+        .or_else(|| obj.get("action"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase())?;
+    match name {
+        "manage_task" => {
+            let how = match action.as_str() {
+                "kill" => JobEnd::Killed,
+                "cancel" | "stop" => JobEnd::Stopped,
+                _ => return None,
+            };
+            let job_id = obj
+                .get("TaskId")
+                .or_else(|| obj.get("task_id"))
+                .or_else(|| obj.get("taskId"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .and_then(agy_job_id)?
+                .to_string();
+            Some(crate::driver::PendingCancel::Task { job_id, how })
+        }
+        "manage_subagents" => match action.as_str() {
+            "kill" => {
+                let ids: Vec<String> = obj
+                    .get("ConversationIds")
+                    .or_else(|| obj.get("conversation_ids"))
+                    .or_else(|| obj.get("conversationIds"))
+                    .and_then(Value::as_array)?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter_map(agy_job_id)
+                    .map(str::to_string)
+                    .collect();
+                (!ids.is_empty()).then_some(crate::driver::PendingCancel::Subagents {
+                    ids,
+                    how: JobEnd::Killed,
+                })
+            }
+            "kill_all" => Some(crate::driver::PendingCancel::AllSubagents {
+                how: JobEnd::Killed,
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether a `GENERIC` kill response body actually reports failure despite `status: "DONE"`.
+fn agy_generic_body_indicates_failure(content: &str) -> bool {
+    let body_lines: Vec<String> = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("Created At:")
+                && !line.starts_with("Completed At:")
+        })
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if body_lines.iter().any(|line| {
+        [
+            "encountered error",
+            "error:",
+            "error invalid tool call",
+            "cannot kill",
+            "could not kill",
+            "unable to kill",
+            "failed to ",
+            "not found",
+            "no such ",
+            "permission denied",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+    }) {
+        return true;
+    }
+    let joined = body_lines.join("\n");
+    [
+        "cannot kill task",
+        "task is not running",
+        "belongs to a different conversation",
+        "failed to kill",
+        "failed to cancel",
+        "failed to stop",
+    ]
+    .iter()
+    .any(|phrase| joined.contains(phrase))
+}
+
+fn agy_tracked_ids_in(text: &str, cursor: &crate::driver::LineCursor) -> Vec<String> {
+    cursor
+        .open_jobs
+        .iter()
+        .chain(cursor.open_subagents.iter())
+        .filter(|id| agy_contains_id(text, id))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn agy_close_tracked_id(
+    native: &str,
+    step: u64,
+    id: &str,
+    how: JobEnd,
+    cursor: &mut crate::driver::LineCursor,
+) -> Option<Normalized> {
+    let closed = cursor.open_jobs.remove(id) || cursor.open_subagents.remove(id);
+    closed.then(|| {
+        keyed(
+            EventKind::JobEnded {
+                job_id: id.to_string(),
+                how,
+            },
+            format!("{native}:{step}:job:{id}:ended"),
+        )
+    })
+}
+
+fn agy_drain_all_open_work(
+    native: &str,
+    step: u64,
+    how: JobEnd,
+    cursor: &mut crate::driver::LineCursor,
+) -> Vec<Normalized> {
+    let mut all: std::collections::BTreeSet<String> = std::mem::take(&mut cursor.open_jobs);
+    all.extend(std::mem::take(&mut cursor.open_subagents));
+    all.into_iter()
+        .map(|id| {
+            keyed(
+                EventKind::JobEnded {
+                    job_id: id.clone(),
+                    how,
+                },
+                format!("{native}:{step}:job:{id}:ended"),
+            )
+        })
+        .collect()
+}
+
+/// Detect explicit termination wording in `content`/`error` naming tracked IDs.
+fn agy_explicit_named_ends(
+    content: &str,
+    error: &str,
+    status: Option<&str>,
+    cursor: &crate::driver::LineCursor,
+) -> Vec<(String, JobEnd)> {
+    let haystack = if error.is_empty() {
+        content.to_string()
+    } else {
+        format!("{content}\n{error}")
+    };
+    let candidate_ids = agy_tracked_ids_in(&haystack, cursor);
+    if candidate_ids.is_empty() {
+        return Vec::new();
+    }
+    let body_lower = agy_message_body(content).to_ascii_lowercase();
+    let error_step = matches!(status, Some("ERROR" | "FAILED"));
+    let hay_lower = haystack.to_ascii_lowercase();
+    let mut results = Vec::new();
+    for id in candidate_ids {
+        let line_how = haystack
+            .lines()
+            .map(str::trim)
+            .filter(|line| agy_contains_id(line, &id))
+            .find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+                if lower.contains("still running") || lower.contains("cannot kill") {
+                    return None;
+                }
+                if error_step
+                    || lower.contains("task ")
+                    || lower.contains("subagent")
+                    || lower.contains("job")
+                {
+                    if lower.contains("not running") || lower.contains("no longer running") {
+                        return Some(
+                            agy_end_from_phrase(&lower)
+                                .filter(|how| *how != JobEnd::Failed)
+                                .unwrap_or(JobEnd::Stopped),
+                        );
+                    }
+                    return agy_end_from_phrase(&lower);
+                }
+                None
+            });
+        if let Some(how) = line_how {
+            results.push((id, how));
+            continue;
+        }
+        if matches!(status, Some("DONE" | "COMPLETED"))
+            && agy_task_id(content) == Some(id.as_str())
+            && let Some(how) = agy_exit_code_end(content)
+        {
+            results.push((id, how));
+            continue;
+        }
+        if body_lower.contains("tool execution was canceled")
+            || body_lower.contains("tool execution was cancelled")
+        {
+            results.push((id, JobEnd::Stopped));
+            continue;
+        }
+        if error_step
+            && [
+                "killed",
+                "cancelled",
+                "canceled",
+                "stopped",
+                "terminated",
+                "not running",
+                "no longer running",
+                "timed out",
+                "timeout",
+                "expired",
+                "aborted",
+                "interrupted",
+                "exited",
+                "failed",
+                "error",
+            ]
+            .iter()
+            .any(|cue| hay_lower.contains(cue))
+        {
+            let how =
+                if hay_lower.contains("not running") || hay_lower.contains("no longer running") {
+                    agy_end_from_phrase(&hay_lower)
+                        .filter(|how| *how != JobEnd::Failed)
+                        .unwrap_or(JobEnd::Stopped)
+                } else {
+                    agy_end_from_phrase(&hay_lower).unwrap_or(JobEnd::Failed)
+                };
+            results.push((id, how));
+        }
+    }
+    results
 }
 
 /// The summary of an agy tool call: a command's as a Bash command's
@@ -2467,6 +2936,7 @@ fn agy_summary(name: &str, args: Option<&Value>) -> (Option<String>, bool) {
 /// them, and Esc writes no line).
 fn agy_finish_pending(cursor: &mut crate::driver::LineCursor) -> Vec<Normalized> {
     let native = cursor.native.clone();
+    cursor.pending_cancels.clear();
     cursor
         .pending_tools
         .drain(..)
@@ -2494,19 +2964,24 @@ fn agy_completed(native: &str, made: u64, index: usize) -> Normalized {
 /// step gives nothing, and nothing is ever refused.
 ///
 /// - `USER_INPUT`: a prompt (`message.received`), taking the messages whose
-///   markers it holds (`message.taken`); a tool call still without a result
-///   (an interrupt cut it, and Esc writes no line) ends here;
-/// - `PLANNER_RESPONSE`: a model call (`model.usage`, first); each of its
-///   `tool_calls` starts a tool (`tool.started`). One with no call ends the
-///   turn (`turn.stopped`) unless background work is open;
+///   markers it holds (`message.taken`), or a turn interrupt (`turn.stopped`
+///   when no background work stays open); a tool call still without a result
+///   ends here;
+/// - `PLANNER_RESPONSE`: a model call (`model.usage`, first); `ERROR`/`FAILED`
+///   ends pending calls without queueing malformed `tool_calls`; otherwise
+///   each `tool_calls` entry starts a tool (`tool.started`) and records any
+///   `manage_task`/`manage_subagents` kill/cancel intent; one with no call
+///   or a cancelled status ends the turn (`turn.stopped`) unless background
+///   work is open;
 /// - `GENERIC`: the result of the oldest call waiting for one
-///   (`tool.completed`, a failed one included: `ERROR` with its `error`,
-///   or a command that exited non-zero). A `RUNNING` one that names a
-///   `task id:` started a background job, and one that says `Created the
-///   following subagent:` (written `DONE` at once) a subagent
-///   (`job.started`; agy never updates the `RUNNING` step);
-/// - `SYSTEM_MESSAGE` with a `sender=` that is an open job or subagent: it
-///   finished (`job.ended`). One with no sender ends nothing.
+///   (`tool.completed`); resolves pending cancel/kill intents only on
+///   success, opens `RUNNING` tasks / created subagents, ignores `list` and
+///   still-running `status` polls, and closes tracked jobs/subagents on
+///   terminal statuses or explicit error/cancel/exit reports;
+/// - `SYSTEM_MESSAGE`: global stop/force-cancellation notices close all open
+///   work; still-running timeout notices keep work open; `sender=<id>` or
+///   explicit termination notices close the named job/subagent with the
+///   mapped [`JobEnd`].
 ///
 /// Steps may be missing (an interrupt leaves a gap): nothing waits on a
 /// step number.
@@ -2517,6 +2992,12 @@ pub fn agy_line(line: &str, cursor: &mut crate::driver::LineCursor) -> Vec<Norma
     let Some(step) = value.get("step_index").and_then(Value::as_u64) else {
         return Vec::new();
     };
+    if step == 0 && cursor.last_step.is_some_and(|prev| prev > 0) {
+        cursor.pending_tools.clear();
+        cursor.pending_cancels.clear();
+        cursor.open_jobs.clear();
+        cursor.open_subagents.clear();
+    }
     let field = |name: &str| value.get(name).and_then(Value::as_str);
     let native = cursor.native.clone();
     let key = |rest: &str| format!("{native}:{step}:{rest}");
@@ -2525,6 +3006,23 @@ pub fn agy_line(line: &str, cursor: &mut crate::driver::LineCursor) -> Vec<Norma
     match field("type") {
         Some("USER_INPUT") => {
             let mut events = agy_finish_pending(cursor);
+            let trimmed = content.trim_start();
+            if trimmed.starts_with("[Request interrupted")
+                || trimmed.starts_with("[User interrupted")
+                || trimmed.starts_with("[Turn cancelled")
+                || trimmed.starts_with("[Turn canceled")
+            {
+                if !cursor.work_open() {
+                    events.push(keyed(
+                        EventKind::TurnStopped {
+                            input_tokens: None,
+                            output_tokens: None,
+                        },
+                        key("stopped"),
+                    ));
+                }
+                return events;
+            }
             events.push(keyed(EventKind::MessageReceived, key("received")));
             events.extend(
                 crate::message::markers(content)
@@ -2540,27 +3038,51 @@ pub fn agy_line(line: &str, cursor: &mut crate::driver::LineCursor) -> Vec<Norma
         }
         Some("PLANNER_RESPONSE") => agy_planner(&value, step, cursor),
         Some("GENERIC") => agy_generic(&value, step, cursor),
-        Some("SYSTEM_MESSAGE") => {
-            let Some(sender) = agy_sender(content) else {
-                return Vec::new();
-            };
-            let how = if cursor.open_jobs.remove(sender) {
-                agy_job_end(content)
-            } else if cursor.open_subagents.remove(sender) {
-                JobEnd::Completed
-            } else {
-                return Vec::new();
-            };
-            vec![keyed(
-                EventKind::JobEnded {
-                    job_id: sender.to_string(),
-                    how,
-                },
-                key(&format!("job:{sender}:ended")),
-            )]
-        }
+        Some("SYSTEM_MESSAGE") => agy_system_message(content, &native, step, cursor),
         _ => Vec::new(),
     }
+}
+
+fn agy_system_message(
+    content: &str,
+    native: &str,
+    step: u64,
+    cursor: &mut crate::driver::LineCursor,
+) -> Vec<Normalized> {
+    if let Some(how) = agy_stops_all_work(content) {
+        return agy_drain_all_open_work(native, step, how, cursor);
+    }
+    let key = |rest: &str| format!("{native}:{step}:{rest}");
+    if let Some(sender) = agy_sender(content) {
+        if agy_is_still_running_notice(content) {
+            return Vec::new();
+        }
+        if cursor.open_jobs.remove(sender) {
+            return vec![keyed(
+                EventKind::JobEnded {
+                    job_id: sender.to_string(),
+                    how: agy_job_end(content),
+                },
+                key(&format!("job:{sender}:ended")),
+            )];
+        }
+        if cursor.open_subagents.remove(sender) {
+            return vec![keyed(
+                EventKind::JobEnded {
+                    job_id: sender.to_string(),
+                    how: agy_subagent_end(content),
+                },
+                key(&format!("job:{sender}:ended")),
+            )];
+        }
+        if sender != "system" {
+            return Vec::new();
+        }
+    }
+    agy_explicit_named_ends(content, "", None, cursor)
+        .into_iter()
+        .filter_map(|(id, how)| agy_close_tracked_id(native, step, &id, how, cursor))
+        .collect()
 }
 
 /// An agy `PLANNER_RESPONSE` step ([`agy_line`]): its model call's usage,
@@ -2600,6 +3122,27 @@ fn agy_planner(
             key("usage"),
         ));
     }
+    let status = field("status");
+    if matches!(status, Some("ERROR" | "FAILED")) {
+        events.extend(agy_finish_pending(cursor));
+        return events;
+    }
+    if matches!(
+        status,
+        Some("CANCELLED" | "CANCELED" | "ABORTED" | "INTERRUPTED")
+    ) {
+        events.extend(agy_finish_pending(cursor));
+        if !cursor.work_open() {
+            events.push(keyed(
+                EventKind::TurnStopped {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+                key("stopped"),
+            ));
+        }
+        return events;
+    }
     let calls = value
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -2635,12 +3178,16 @@ fn agy_planner(
             key(&format!("{index}:started")),
         ));
         cursor.pending_tools.push((step, index));
+        if let Some(intent) = agy_cancel_intent(name, call.get("args")) {
+            cursor.pending_cancels.insert((step, index), intent);
+        }
     }
     events
 }
 
 /// An agy `GENERIC` step ([`agy_line`]): the result of the oldest call
-/// waiting for one, and the background job or subagent it started.
+/// waiting for one, cancel/kill resolution, newly started background work,
+/// and terminal closures naming tracked jobs or subagents.
 fn agy_generic(
     value: &Value,
     step: u64,
@@ -2648,16 +3195,57 @@ fn agy_generic(
 ) -> Vec<Normalized> {
     let native = cursor.native.clone();
     let key = |rest: &str| format!("{native}:{step}:{rest}");
+    let status = value.get("status").and_then(Value::as_str);
+    let error = value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let content = value
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let mut events = Vec::new();
+    let mut cancel_intent = None;
     if !cursor.pending_tools.is_empty() {
         let (made, index) = cursor.pending_tools.remove(0);
         events.push(agy_completed(&native, made, index));
+        cancel_intent = cursor.pending_cancels.remove(&(made, index));
     }
-    if value.get("status").and_then(Value::as_str) == Some("RUNNING")
+    if let Some(intent) = cancel_intent {
+        let succeeded = matches!(status, Some("DONE" | "COMPLETED"))
+            && error.trim().is_empty()
+            && !agy_generic_body_indicates_failure(content);
+        if succeeded {
+            match intent {
+                crate::driver::PendingCancel::Task { job_id, how } => {
+                    if let Some(ev) = agy_close_tracked_id(&native, step, &job_id, how, cursor) {
+                        events.push(ev);
+                    }
+                }
+                crate::driver::PendingCancel::Subagents { ids, how } => {
+                    for id in ids {
+                        if let Some(ev) = agy_close_tracked_id(&native, step, &id, how, cursor) {
+                            events.push(ev);
+                        }
+                    }
+                }
+                crate::driver::PendingCancel::AllSubagents { how } => {
+                    let all = std::mem::take(&mut cursor.open_subagents);
+                    for id in all {
+                        events.push(keyed(
+                            EventKind::JobEnded {
+                                job_id: id.clone(),
+                                how,
+                            },
+                            format!("{native}:{step}:job:{id}:ended"),
+                        ));
+                    }
+                }
+            }
+        }
+        return events;
+    }
+    if status == Some("RUNNING")
         && let Some(id) = agy_task_id(content)
         && cursor.open_jobs.insert(id.to_string())
     {
@@ -2669,7 +3257,11 @@ fn agy_generic(
             key(&format!("job:{id}:started")),
         ));
     }
-    if let Some(id) = agy_subagent(content)
+    if !matches!(
+        status,
+        Some("ERROR" | "FAILED" | "INVALID" | "CANCELLED" | "CANCELED" | "KILLED" | "STOPPED")
+    ) && error.trim().is_empty()
+        && let Some(id) = agy_subagent(content)
         && cursor.open_subagents.insert(id.clone())
     {
         events.push(keyed(
@@ -2680,7 +3272,86 @@ fn agy_generic(
             key(&format!("job:{id}:started")),
         ));
     }
+    if cursor.work_open() {
+        agy_generic_close_tracked(content, error, status, &native, step, cursor, &mut events);
+    }
     events
+}
+
+fn agy_generic_close_tracked(
+    content: &str,
+    error: &str,
+    status: Option<&str>,
+    native: &str,
+    step: u64,
+    cursor: &mut crate::driver::LineCursor,
+    events: &mut Vec<Normalized>,
+) {
+    if matches!(
+        status,
+        Some("CANCELLED" | "CANCELED" | "STOPPED" | "KILLED")
+    ) {
+        let how = if status == Some("KILLED") {
+            JobEnd::Killed
+        } else {
+            JobEnd::Stopped
+        };
+        let haystack = if error.is_empty() {
+            content.to_string()
+        } else {
+            format!("{content}\n{error}")
+        };
+        for id in agy_tracked_ids_in(&haystack, cursor) {
+            if let Some(ev) = agy_close_tracked_id(native, step, &id, how, cursor) {
+                events.push(ev);
+            }
+        }
+        return;
+    }
+    if !matches!(status, Some("ERROR" | "FAILED" | "DONE" | "COMPLETED")) {
+        return;
+    }
+    if let Some(reported) = content.lines().map(str::trim).find_map(|line| {
+        line.to_ascii_lowercase()
+            .strip_prefix("status:")
+            .map(|rest| rest.trim().to_string())
+    }) {
+        if matches!(
+            reported.as_str(),
+            "running" | "pending" | "queued" | "active" | "working"
+        ) {
+            return;
+        }
+        let how = match reported.as_str() {
+            "killed" => Some(JobEnd::Killed),
+            "cancelled" | "canceled" | "stopped" => Some(JobEnd::Stopped),
+            "expired" | "timed_out" | "timed out" | "timeout" => Some(JobEnd::Expired),
+            "failed" | "error" => Some(JobEnd::Failed),
+            "done" | "completed" => Some(agy_exit_code_end(content).unwrap_or(JobEnd::Completed)),
+            _ => None,
+        };
+        if let Some(how) = how {
+            for id in agy_tracked_ids_in(content, cursor) {
+                if let Some(ev) = agy_close_tracked_id(native, step, &id, how, cursor) {
+                    events.push(ev);
+                }
+            }
+        }
+        return;
+    }
+    let content_lower = content.to_ascii_lowercase();
+    if matches!(status, Some("DONE" | "COMPLETED"))
+        && error.trim().is_empty()
+        && (content_lower.contains("currently running")
+            || content_lower.contains("active subagent"))
+    {
+        return;
+    }
+    for (id, how) in agy_explicit_named_ends(content, error, status, cursor) {
+        if let Some(ev) = agy_close_tracked_id(native, step, &id, how, cursor) {
+            events.push(ev);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2995,5 +3666,595 @@ mod agy_tests {
         };
         assert_eq!(keys(), keys());
         assert_eq!(keys().len(), 4);
+    }
+
+    #[test]
+    fn manage_task_kill_succeeded_closes_job_and_allows_turn_stopped() {
+        let mut cursor = cursor();
+        let start_call = line(
+            1,
+            "PLANNER_RESPONSE",
+            "DONE",
+            r#","tool_calls":[{"name":"run_command","args":{"CommandLine":"sleep 60"}}]"#,
+        );
+        assert_eq!(kinds(&agy_line(&start_call, &mut cursor)), ["tool.started"]);
+
+        let running = line(
+            2,
+            "GENERIC",
+            "RUNNING",
+            &content(&format!(
+                "Created At: x\nTool is running as a background task with task id: {CONV}/task-2"
+            )),
+        );
+        assert_eq!(
+            kinds(&agy_line(&running, &mut cursor)),
+            ["tool.completed", "job.started"]
+        );
+        assert!(cursor.work_open());
+
+        // While open, prose PLANNER_RESPONSE emits no TurnStopped.
+        let wait_prose = line(3, "PLANNER_RESPONSE", "DONE", &content("Still running."));
+        assert!(agy_line(&wait_prose, &mut cursor).is_empty());
+
+        // manage_task(kill) -> GENERIC DONE closes the job with JobEnd::Killed.
+        let kill_call = line(
+            4,
+            "PLANNER_RESPONSE",
+            "DONE",
+            &format!(
+                r#","tool_calls":[{{"name":"manage_task","args":{{"Action":"kill","TaskId":"{CONV}/task-2"}}}}]"#
+            ),
+        );
+        assert_eq!(kinds(&agy_line(&kill_call, &mut cursor)), ["tool.started"]);
+
+        let kill_done = line(
+            5,
+            "GENERIC",
+            "DONE",
+            &content(&format!("Task \"{CONV}/task-2\" cancelled.")),
+        );
+        let events = agy_line(&kill_done, &mut cursor);
+        assert_eq!(kinds(&events), ["tool.completed", "job.ended"]);
+        assert_eq!(
+            events[1].kind,
+            EventKind::JobEnded {
+                job_id: format!("{CONV}/task-2"),
+                how: JobEnd::Killed,
+            }
+        );
+        assert!(!cursor.work_open());
+        assert!(cursor.pending_cancels.is_empty());
+
+        // Subsequent prose emits TurnStopped cleanly.
+        let done = line(6, "PLANNER_RESPONSE", "DONE", &content("Cancelled."));
+        let events = agy_line(&done, &mut cursor);
+        assert_eq!(kinds(&events), ["turn.stopped"]);
+        assert_eq!(key(&events[0]), format!("{CONV}:6:stopped"));
+
+        // Late SYSTEM_MESSAGE for already-closed task does not duplicate JobEnded.
+        let late = system(
+            7,
+            &format!(
+                "[Message] timestamp=x sender={CONV}/task-2 priority=HIGH content=Task id \"{CONV}/task-2\" was canceled with result:\nTool execution was canceled"
+            ),
+        );
+        assert!(agy_line(&late, &mut cursor).is_empty());
+    }
+
+    #[test]
+    fn manage_task_kill_failed_does_not_close_open_job() {
+        let mut cursor = cursor();
+        let start = line(
+            1,
+            "PLANNER_RESPONSE",
+            "DONE",
+            r#","tool_calls":[{"name":"run_command","args":{"CommandLine":"sleep 60"}}]"#,
+        );
+        agy_line(&start, &mut cursor);
+        let running = line(
+            2,
+            "GENERIC",
+            "RUNNING",
+            &content(&format!(
+                "Tool is running as a background task with task id: {CONV}/task-2"
+            )),
+        );
+        agy_line(&running, &mut cursor);
+
+        // Failed kill via status=ERROR (must not match error text containing task id).
+        let kill1 = line(
+            3,
+            "PLANNER_RESPONSE",
+            "DONE",
+            &format!(
+                r#","tool_calls":[{{"name":"manage_task","args":{{"Action":"kill","TaskId":"{CONV}/task-2"}}}}]"#
+            ),
+        );
+        agy_line(&kill1, &mut cursor);
+        let kill1_err = line(
+            4,
+            "GENERIC",
+            "ERROR",
+            &format!(
+                r#","error":"cannot kill task \"{CONV}/task-2\": permission denied"{}"#,
+                content(&format!(
+                    "Encountered error in step execution: cannot kill task \"{CONV}/task-2\": permission denied"
+                ))
+            ),
+        );
+        let events = agy_line(&kill1_err, &mut cursor);
+        assert_eq!(kinds(&events), ["tool.completed"]);
+        assert!(cursor.work_open());
+
+        // Failed kill via status=DONE whose body reports an error.
+        let kill2 = line(
+            5,
+            "PLANNER_RESPONSE",
+            "DONE",
+            &format!(
+                r#","tool_calls":[{{"name":"manage_task","args":{{"Action":"kill","TaskId":"{CONV}/task-2"}}}}]"#
+            ),
+        );
+        agy_line(&kill2, &mut cursor);
+        let kill2_err_body = line(
+            6,
+            "GENERIC",
+            "DONE",
+            &content(&format!(
+                "Encountered error in step execution: cannot kill task \"{CONV}/task-2\": task busy"
+            )),
+        );
+        let events = agy_line(&kill2_err_body, &mut cursor);
+        assert_eq!(kinds(&events), ["tool.completed"]);
+        assert!(cursor.work_open());
+
+        // Prose still emits no TurnStopped while job remains open.
+        assert!(
+            agy_line(
+                &line(7, "PLANNER_RESPONSE", "DONE", &content("waiting")),
+                &mut cursor
+            )
+            .is_empty()
+        );
+
+        // Actual completion closes it and allows TurnStopped.
+        let finished = system(
+            8,
+            &format!(
+                "[Message] timestamp=x sender={CONV}/task-2 priority=HIGH content=Task id \"{CONV}/task-2\" finished with result:\nCommand exited with code 0."
+            ),
+        );
+        let events = agy_line(&finished, &mut cursor);
+        assert_eq!(
+            events[0].kind,
+            EventKind::JobEnded {
+                job_id: format!("{CONV}/task-2"),
+                how: JobEnd::Completed,
+            }
+        );
+        assert!(!cursor.work_open());
+        let done = agy_line(
+            &line(9, "PLANNER_RESPONSE", "DONE", &content("done")),
+            &mut cursor,
+        );
+        assert_eq!(kinds(&done), ["turn.stopped"]);
+    }
+
+    #[test]
+    fn manage_subagents_kill_and_kill_all_close_exact_subagents() {
+        let sub1 = "66666666-7777-4888-8999-aaaaaaaaaaa1";
+        let sub2 = "66666666-7777-4888-8999-aaaaaaaaaaa2";
+        let sub3 = "66666666-7777-4888-8999-aaaaaaaaaaa3";
+        let mut cursor = cursor();
+
+        let launch = line(
+            1,
+            "PLANNER_RESPONSE",
+            "DONE",
+            r#","tool_calls":[{"name":"invoke_subagent","args":{"Prompt":"a"}},{"name":"invoke_subagent","args":{"Prompt":"b"}},{"name":"invoke_subagent","args":{"Prompt":"c"}}]"#,
+        );
+        agy_line(&launch, &mut cursor);
+        for (step, sub) in [(2, sub1), (3, sub2), (4, sub3)] {
+            let created = line(
+                step,
+                "GENERIC",
+                "DONE",
+                &content(&format!(
+                    "Created the following subagent:\n{{\n  \"conversationId\": \"{sub}\"\n}}"
+                )),
+            );
+            agy_line(&created, &mut cursor);
+        }
+        assert_eq!(cursor.open_subagents.len(), 3);
+
+        // Kill only sub1.
+        let kill_one = line(
+            5,
+            "PLANNER_RESPONSE",
+            "DONE",
+            &format!(
+                r#","tool_calls":[{{"name":"manage_subagents","args":{{"Action":"kill","ConversationIds":["{sub1}"]}}}}]"#
+            ),
+        );
+        agy_line(&kill_one, &mut cursor);
+        let kill_one_done = line(6, "GENERIC", "DONE", &content("Killed 1 subagent(s)."));
+        let events = agy_line(&kill_one_done, &mut cursor);
+        assert_eq!(kinds(&events), ["tool.completed", "job.ended"]);
+        assert_eq!(
+            events[1].kind,
+            EventKind::JobEnded {
+                job_id: sub1.to_string(),
+                how: JobEnd::Killed,
+            }
+        );
+        assert_eq!(cursor.open_subagents.len(), 2);
+
+        // Failed kill on sub2 closes nothing.
+        let kill_fail = line(
+            7,
+            "PLANNER_RESPONSE",
+            "DONE",
+            &format!(
+                r#","tool_calls":[{{"name":"manage_subagents","args":{{"Action":"kill","ConversationIds":["{sub2}"]}}}}]"#
+            ),
+        );
+        agy_line(&kill_fail, &mut cursor);
+        let kill_fail_err = line(
+            8,
+            "GENERIC",
+            "ERROR",
+            &format!(r#","error":"failed"{}"#, content("cannot kill subagent")),
+        );
+        let events = agy_line(&kill_fail_err, &mut cursor);
+        assert_eq!(kinds(&events), ["tool.completed"]);
+        assert_eq!(cursor.open_subagents.len(), 2);
+
+        // kill_all closes remaining sub2 and sub3.
+        let kill_all = line(
+            9,
+            "PLANNER_RESPONSE",
+            "DONE",
+            r#","tool_calls":[{"name":"manage_subagents","args":{"Action":"kill_all"}}]"#,
+        );
+        agy_line(&kill_all, &mut cursor);
+        let kill_all_done = line(10, "GENERIC", "DONE", &content("All subagents killed."));
+        let events = agy_line(&kill_all_done, &mut cursor);
+        assert_eq!(kinds(&events), ["tool.completed", "job.ended", "job.ended"]);
+        assert!(!cursor.work_open());
+
+        let stop = agy_line(
+            &line(11, "PLANNER_RESPONSE", "DONE", &content("All stopped.")),
+            &mut cursor,
+        );
+        assert_eq!(kinds(&stop), ["turn.stopped"]);
+    }
+
+    fn start_task(cursor: &mut LineCursor, step_call: u64, step_running: u64, cmd: &str) {
+        let start = line(
+            step_call,
+            "PLANNER_RESPONSE",
+            "DONE",
+            &format!(
+                r#","tool_calls":[{{"name":"run_command","args":{{"CommandLine":"{cmd}"}}}}]"#
+            ),
+        );
+        agy_line(&start, cursor);
+        let running = line(
+            step_running,
+            "GENERIC",
+            "RUNNING",
+            &content(&format!(
+                "Tool is running as a background task with task id: {CONV}/task-{step_running}"
+            )),
+        );
+        agy_line(&running, cursor);
+    }
+
+    #[test]
+    fn generic_terminal_statuses_and_status_polls_handle_open_work_accurately() {
+        let mut cursor = cursor();
+        start_task(&mut cursor, 1, 2, "sleep 60");
+
+        // Malformed PLANNER_RESPONSE ERROR with tool_calls must not push into pending_tools.
+        let bad_planner = line(
+            3,
+            "PLANNER_RESPONSE",
+            "ERROR",
+            r#","error":"malformed function call","tool_calls":[{"name":"manage_task","args":{"Action":"kill","TaskId":"x"}}]"#,
+        );
+        assert!(agy_line(&bad_planner, &mut cursor).is_empty());
+        assert!(cursor.pending_tools.is_empty());
+        assert!(cursor.pending_cancels.is_empty());
+
+        // Polling manage_task(status) with Status: RUNNING and list() keeps job open.
+        agy_line(
+            &line(
+                4,
+                "PLANNER_RESPONSE",
+                "DONE",
+                &format!(
+                    r#","tool_calls":[{{"name":"manage_task","args":{{"Action":"status","TaskId":"{CONV}/task-2"}}}},{{"name":"manage_task","args":{{"Action":"list"}}}}]"#
+                ),
+            ),
+            &mut cursor,
+        );
+        let status_running = line(
+            5,
+            "GENERIC",
+            "DONE",
+            &content(&format!("Task: {CONV}/task-2\nStatus: RUNNING")),
+        );
+        assert_eq!(
+            kinds(&agy_line(&status_running, &mut cursor)),
+            ["tool.completed"]
+        );
+        let list_running = line(
+            6,
+            "GENERIC",
+            "DONE",
+            &content(&format!(
+                "You have 1 background task(s) currently running:\n[{{\"taskId\":\"{CONV}/task-2\"}}]"
+            )),
+        );
+        assert_eq!(
+            kinds(&agy_line(&list_running, &mut cursor)),
+            ["tool.completed"]
+        );
+        assert!(cursor.work_open());
+
+        // GENERIC with CANCELLED status naming tracked task closes it.
+        agy_line(
+            &line(
+                7,
+                "PLANNER_RESPONSE",
+                "DONE",
+                r#","tool_calls":[{"name":"read_file","args":{}}]"#,
+            ),
+            &mut cursor,
+        );
+        let cancelled = line(
+            8,
+            "GENERIC",
+            "CANCELLED",
+            &content(&format!("Task {CONV}/task-2 cancelled by host")),
+        );
+        let events = agy_line(&cancelled, &mut cursor);
+        assert_eq!(kinds(&events), ["tool.completed", "job.ended"]);
+        assert_eq!(
+            events[1].kind,
+            EventKind::JobEnded {
+                job_id: format!("{CONV}/task-2"),
+                how: JobEnd::Stopped,
+            }
+        );
+        assert!(!cursor.work_open());
+
+        // Second task closed via manage_task(status) returning Status: DONE.
+        start_task(&mut cursor, 9, 10, "echo ok");
+        agy_line(
+            &line(
+                11,
+                "PLANNER_RESPONSE",
+                "DONE",
+                &format!(
+                    r#","tool_calls":[{{"name":"manage_task","args":{{"Action":"status","TaskId":"{CONV}/task-10"}}}}]"#
+                ),
+            ),
+            &mut cursor,
+        );
+        let status_done = line(
+            12,
+            "GENERIC",
+            "DONE",
+            &content(&format!(
+                "Task: {CONV}/task-10\nStatus: DONE\nCommand exited with code 0."
+            )),
+        );
+        let events = agy_line(&status_done, &mut cursor);
+        assert_eq!(
+            events[1].kind,
+            EventKind::JobEnded {
+                job_id: format!("{CONV}/task-10"),
+                how: JobEnd::Completed,
+            }
+        );
+        assert!(!cursor.work_open());
+    }
+
+    #[test]
+    fn system_message_task_cancellation_still_running_and_exit_code() {
+        let mut cursor = cursor();
+        start_task(&mut cursor, 1, 2, "a");
+        start_task(&mut cursor, 3, 4, "b");
+        start_task(&mut cursor, 5, 6, "c");
+
+        // "Background command is still running after 300s:" must NOT close task-2.
+        let still_running = system(
+            7,
+            &format!(
+                "[Message] timestamp=x sender={CONV}/task-2 priority=HIGH \
+                 content=Background command is still running after 300s: sleep 600"
+            ),
+        );
+        assert!(agy_line(&still_running, &mut cursor).is_empty());
+        assert!(cursor.open_jobs.contains(&format!("{CONV}/task-2")));
+
+        let canceled = system(
+            8,
+            &format!(
+                "[Message] timestamp=x sender={CONV}/task-2 priority=HIGH \
+                 content=Task id \"{CONV}/task-2\" was canceled with result:\n\
+                 Tool execution was canceled"
+            ),
+        );
+        assert_eq!(
+            agy_line(&canceled, &mut cursor)[0].kind,
+            EventKind::JobEnded {
+                job_id: format!("{CONV}/task-2"),
+                how: JobEnd::Stopped,
+            }
+        );
+
+        let passed_with_word = system(
+            9,
+            &format!(
+                "[Message] timestamp=x sender={CONV}/task-4 priority=HIGH \
+                 content=Task id \"{CONV}/task-4\" finished with result:\n\
+                 Command exited with code 0.\ntest test_cancelled ... ok"
+            ),
+        );
+        assert_eq!(
+            agy_line(&passed_with_word, &mut cursor)[0].kind,
+            EventKind::JobEnded {
+                job_id: format!("{CONV}/task-4"),
+                how: JobEnd::Completed,
+            }
+        );
+
+        let timed_out = system(
+            10,
+            &format!(
+                "[Message] timestamp=x sender={CONV}/task-6 priority=HIGH \
+                 content=Task id \"{CONV}/task-6\" timed out after 300s"
+            ),
+        );
+        assert_eq!(
+            agy_line(&timed_out, &mut cursor)[0].kind,
+            EventKind::JobEnded {
+                job_id: format!("{CONV}/task-6"),
+                how: JobEnd::Expired,
+            }
+        );
+        assert!(!cursor.work_open());
+    }
+
+    #[test]
+    fn system_message_subagent_and_global_force_cancel_notices() {
+        let mut cursor = cursor();
+        start_task(&mut cursor, 1, 2, "a");
+        start_task(&mut cursor, 3, 4, "b");
+        agy_line(
+            &line(
+                5,
+                "PLANNER_RESPONSE",
+                "DONE",
+                r#","tool_calls":[{"name":"invoke_subagent","args":{"Prompt":"s"}}]"#,
+            ),
+            &mut cursor,
+        );
+        agy_line(
+            &line(
+                6,
+                "GENERIC",
+                "DONE",
+                &content(&format!(
+                    "Created the following subagent:\n{{\n  \"conversationId\": \"{SUB}\"\n}}"
+                )),
+            ),
+            &mut cursor,
+        );
+
+        // Subagent prose mentioning "failed test" stays Completed.
+        let sub_done = system(
+            7,
+            &format!(
+                "<SYSTEM_MESSAGE>\n[Message] timestamp=x sender={SUB} priority=HIGH \
+                 content=Done, I fixed the failed test.\n</SYSTEM_MESSAGE>"
+            ),
+        );
+        assert_eq!(
+            agy_line(&sub_done, &mut cursor)[0].kind,
+            EventKind::JobEnded {
+                job_id: SUB.to_string(),
+                how: JobEnd::Completed,
+            }
+        );
+
+        // Global force cancellation notice drains remaining task-2 and task-4 as Killed.
+        let force_cancel = system(
+            8,
+            "<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=system priority=LOW \
+             content=[Notice] All your subagents and background tasks have been stopped due to user force cancellation.\n\
+             </SYSTEM_MESSAGE>",
+        );
+        let ended: Vec<_> = agy_line(&force_cancel, &mut cursor)
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            ended,
+            vec![
+                EventKind::JobEnded {
+                    job_id: format!("{CONV}/task-2"),
+                    how: JobEnd::Killed,
+                },
+                EventKind::JobEnded {
+                    job_id: format!("{CONV}/task-4"),
+                    how: JobEnd::Killed,
+                },
+            ]
+        );
+        assert!(!cursor.work_open());
+        let turn_done = agy_line(
+            &line(9, "PLANNER_RESPONSE", "DONE", &content("done")),
+            &mut cursor,
+        );
+        assert_eq!(kinds(&turn_done), ["turn.stopped"]);
+    }
+
+    #[test]
+    fn subagent_explicit_kill_and_server_restart_notice_close_work() {
+        let mut cursor = cursor();
+        start_task(&mut cursor, 1, 2, "watch");
+        agy_line(
+            &line(
+                3,
+                "PLANNER_RESPONSE",
+                "DONE",
+                r#","tool_calls":[{"name":"invoke_subagent","args":{"Prompt":"work"}}]"#,
+            ),
+            &mut cursor,
+        );
+        agy_line(
+            &line(
+                4,
+                "GENERIC",
+                "DONE",
+                &content(&format!(
+                    "Created the following subagent:\n{{\n  \"conversationId\": \"{SUB}\"\n}}"
+                )),
+            ),
+            &mut cursor,
+        );
+
+        // Explicit subagent kill notice -> Killed.
+        let sub_killed = system(
+            5,
+            &format!(
+                "[Message] timestamp=x sender={SUB} priority=HIGH content=Subagent \"{SUB}\" was killed"
+            ),
+        );
+        assert_eq!(
+            agy_line(&sub_killed, &mut cursor)[0].kind,
+            EventKind::JobEnded {
+                job_id: SUB.to_string(),
+                how: JobEnd::Killed,
+            }
+        );
+
+        // Server restart notice drains open task -> Stopped.
+        let restart = system(
+            6,
+            "[Message] timestamp=x sender=system priority=LOW content=[Notice] All your subagents and background tasks have been stopped due to server restart.",
+        );
+        assert_eq!(
+            agy_line(&restart, &mut cursor)[0].kind,
+            EventKind::JobEnded {
+                job_id: format!("{CONV}/task-2"),
+                how: JobEnd::Stopped,
+            }
+        );
+        assert!(!cursor.work_open());
     }
 }
