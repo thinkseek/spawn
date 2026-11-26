@@ -10,13 +10,11 @@
 //! lock and records the whole result; a setting is cleared only by its own
 //! `--no-<setting>` switch.
 
-use std::collections::HashMap;
-
 use serde_json::{Value, json};
 use spawn_core::event::ModelProfile;
 use spawn_core::grading::{
     DifficultyClassification, GradedPreset, RoutingDecision, RoutingError, TaskDifficulty,
-    classify_difficulty, route_preset, route_with_reprobe, tier_role,
+    classify_difficulty, route_preset, route_with_reprobe,
 };
 
 use crate::{Flags, open_store};
@@ -1550,114 +1548,17 @@ fn objectives_row(mission: &Value) -> Value {
     })
 }
 
-/// Read the mission board (`store.mission_board(limit)`) and enrich each
-/// task with grading metadata (`difficulty`, `routed_difficulty`, `preset_id`,
+/// Read the mission board (`store.mission_board(limit)`), which projects
+/// task grading metadata (`difficulty`, `routed_difficulty`, `preset_id`,
 /// `first_preset_id`, `tier_role`, `quality_rejections`, and
-/// `rework_step_up` when stepped up/reworked) while preserving all existing
-/// board fields for backward compatibility.
+/// `rework_step_up`) natively in SQL.
 pub(crate) fn list_board(
     store: &spawn_postgres::PostgresStore,
     limit: i64,
 ) -> Result<Value, String> {
-    let mut board = store
+    store
         .mission_board(limit)
-        .map_err(|error| error.to_string())?;
-    let catalog = store.grading_catalog().unwrap_or_default();
-    enrich_board_grading(&mut board, &catalog, |task_id| {
-        store.routed_task(task_id).ok().flatten()
-    });
-    Ok(board)
-}
-
-fn enrich_board_grading(
-    board: &mut Value,
-    catalog: &[GradedPreset],
-    lookup: impl Fn(i64) -> Option<spawn_postgres::RoutedTask>,
-) {
-    let by_id: HashMap<&str, &GradedPreset> = catalog
-        .iter()
-        .map(|preset| (preset.preset_id.as_str(), preset))
-        .collect();
-    let Some(missions) = board
-        .as_object_mut()
-        .and_then(|obj| obj.get_mut("missions"))
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    for mission in missions {
-        let Some(tasks) = mission
-            .as_object_mut()
-            .and_then(|obj| obj.get_mut("tasks"))
-            .and_then(Value::as_array_mut)
-        else {
-            continue;
-        };
-        for task in tasks {
-            let Some(task_obj) = task.as_object_mut() else {
-                continue;
-            };
-            let Some(task_id) = task_obj.get("id").and_then(Value::as_i64) else {
-                continue;
-            };
-            let Some(routed) = lookup(task_id) else {
-                continue;
-            };
-            let rejections_u32 = u32::try_from(routed.quality_rejections.max(0)).unwrap_or(0);
-            let routed_difficulty = routed.difficulty.for_rework(rejections_u32);
-            let preset = routed
-                .preset_id
-                .as_deref()
-                .and_then(|preset_id| by_id.get(preset_id).copied());
-            let role = tier_role(
-                preset
-                    .and_then(GradedPreset::routing_grade)
-                    .or_else(|| Some(routed_difficulty.required_grade())),
-            );
-            task_obj.insert("difficulty".to_string(), json!(routed.difficulty));
-            task_obj.insert("routed_difficulty".to_string(), json!(routed_difficulty));
-            task_obj.insert(
-                "quality_rejections".to_string(),
-                json!(routed.quality_rejections),
-            );
-            if let Some(role) = role {
-                task_obj.insert("tier_role".to_string(), json!(role));
-            }
-            if let Some(preset_id) = &routed.preset_id {
-                task_obj.insert("preset_id".to_string(), json!(preset_id));
-            }
-            if let Some(first_preset_id) = &routed.first_preset_id {
-                task_obj.insert("first_preset_id".to_string(), json!(first_preset_id));
-            }
-            if let Some(preset) = preset {
-                if !preset.engine_label.is_empty() {
-                    task_obj.insert("engine_label".to_string(), json!(preset.engine_label));
-                }
-                if !preset.model_label.is_empty() {
-                    task_obj.insert("model_label".to_string(), json!(preset.model_label));
-                }
-                if let Some(profile) = &preset.execution_profile {
-                    task_obj.insert("execution_profile".to_string(), json!(profile));
-                }
-            }
-            if routed.quality_rejections > 0
-                || routed.first_preset_id != routed.preset_id
-                || routed_difficulty != routed.difficulty
-            {
-                task_obj.insert(
-                    "rework_step_up".to_string(),
-                    json!({
-                        "quality_rejections": routed.quality_rejections,
-                        "from_difficulty": routed.difficulty,
-                        "routed_difficulty": routed_difficulty,
-                        "stepped_up": routed_difficulty != routed.difficulty,
-                        "first_preset_id": routed.first_preset_id,
-                        "preset_id": routed.preset_id,
-                    }),
-                );
-            }
-        }
-    }
+        .map_err(|error| error.to_string())
 }
 
 fn mission_summary_line(mission: &Value) -> &str {
@@ -3531,26 +3432,7 @@ mod tests {
             "(no missions)"
         );
 
-        let catalog = vec![spawn_core::grading::GradedPreset {
-            preset_id: spawn_core::grading::TOPDOWN_L2_PRESET_ID.to_string(),
-            engine_label: "agy".to_string(),
-            model_label: "gemini-pro-orchestrator-neon".to_string(),
-            model_profile: ModelProfile::Default,
-            execution_profile: Some(
-                spawn_core::grading::ExecutionProfile::parse("neon-mainline").unwrap(),
-            ),
-            cost_rank: 20,
-            state: spawn_core::grading::PresetState::Active,
-            onboarded_grade: None,
-            calibrated_grade: None,
-            locked_grade: Some(spawn_core::grading::SkillGrade::L2),
-            window_start_ms: 0,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            last_event: 0,
-        }];
-
-        let mut board = json!({
+        let board = json!({
             "missions": [{
                 "id": 42,
                 "state": "open",
@@ -3560,43 +3442,44 @@ mod tests {
                         "id": 101,
                         "state": "revise",
                         "model": "default",
-                        "agent_id": "agent_w1"
+                        "agent_id": "agent_w1",
+                        "difficulty": "l1",
+                        "routed_difficulty": "l2",
+                        "tier_role": "mainline",
+                        "preset_id": spawn_core::grading::TOPDOWN_L2_PRESET_ID,
+                        "first_preset_id": spawn_core::grading::TOPDOWN_L1_PRESET_ID,
+                        "quality_rejections": 1,
+                        "engine_label": "agy",
+                        "model_label": "gemini-pro-orchestrator-neon",
+                        "execution_profile": "neon-mainline",
+                        "rework_step_up": {
+                            "quality_rejections": 1,
+                            "from_difficulty": "l1",
+                            "routed_difficulty": "l2",
+                            "stepped_up": true,
+                            "first_preset_id": spawn_core::grading::TOPDOWN_L1_PRESET_ID,
+                            "preset_id": spawn_core::grading::TOPDOWN_L2_PRESET_ID
+                        }
                     },
                     {
                         "id": 102,
                         "state": "assigned",
                         "model": "default",
-                        "agent_id": "agent_w2"
+                        "agent_id": "agent_w2",
+                        "difficulty": "l2",
+                        "routed_difficulty": "l2",
+                        "tier_role": "mainline",
+                        "preset_id": Value::Null,
+                        "first_preset_id": Value::Null,
+                        "quality_rejections": 0,
+                        "engine_label": Value::Null,
+                        "model_label": Value::Null,
+                        "execution_profile": Value::Null,
+                        "rework_step_up": Value::Null
                     }
                 ]
             }]
         });
-
-        super::enrich_board_grading(&mut board, &catalog, |id| match id {
-            101 => Some(spawn_postgres::RoutedTask {
-                task: 101,
-                state: "revise".to_string(),
-                revisions: 1,
-                quality_rejections: 1,
-                difficulty: spawn_core::grading::TaskDifficulty::L1,
-                preset_id: Some(spawn_core::grading::TOPDOWN_L2_PRESET_ID.to_string()),
-                first_preset_id: Some(spawn_core::grading::TOPDOWN_L1_PRESET_ID.to_string()),
-                model: "default".to_string(),
-            }),
-            _ => None,
-        });
-
-        let tasks = board["missions"][0]["tasks"].as_array().unwrap();
-        assert_eq!(tasks[0]["difficulty"], json!("l1"));
-        assert_eq!(tasks[0]["routed_difficulty"], json!("l2"));
-        assert_eq!(tasks[0]["tier_role"], json!("mainline"));
-        assert_eq!(
-            tasks[0]["preset_id"],
-            json!(spawn_core::grading::TOPDOWN_L2_PRESET_ID)
-        );
-        assert_eq!(tasks[0]["rework_step_up"]["stepped_up"], json!(true));
-        // Unrouted task 102 stays untouched and valid.
-        assert!(tasks[1].get("difficulty").is_none());
 
         let table = super::format_mission_board_table(&board);
         assert!(
@@ -3611,6 +3494,12 @@ mod tests {
             "{table}"
         );
         assert!(table.contains("T102"), "{table}");
+        assert!(
+            !table.contains(
+                "T102   assigned   default l2   mainline           -                        step-up"
+            ),
+            "{table}"
+        );
     }
 }
 
@@ -3900,12 +3789,16 @@ mod database_tests {
             json!("gemini-pro-orchestrator-neon")
         );
         assert_eq!(tasks[1]["execution_profile"], json!("neon-mainline"));
-        assert!(tasks[1].get("rework_step_up").is_none(), "{}", tasks[1]);
+        assert!(tasks[1]["rework_step_up"].is_null(), "{}", tasks[1]);
 
         // Task 3: L3 Fable top-decision.
         assert_eq!(tasks[2]["difficulty"], json!("l3"));
         assert_eq!(tasks[2]["tier_role"], json!("top-decision"));
         assert_eq!(tasks[2]["model_label"], json!("claude-fable-5-2"));
+
+        // `mission_by_id` (`spawn mission show`) projects the exact same grading fields.
+        let by_id = store.mission_by_id(mission).unwrap().unwrap();
+        assert_eq!(by_id["tasks"], board["missions"][0]["tasks"]);
 
         let table = super::format_mission_board_table(&board);
         assert!(table.contains("Mission #"), "{table}");

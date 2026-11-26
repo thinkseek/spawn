@@ -719,29 +719,45 @@ function TaskRow({
         {task.model === "cheap" && (
           <Pill className="bg-muted text-muted-foreground">cheap model</Pill>
         )}
-        {grading?.difficulty && (
-          <Badge
-            tone={gradeTone(grading.difficulty)}
-            title={
-              grading.tierRole
-                ? `Difficulty ${grading.difficulty} · tier ${grading.tierRole}`
-                : `Difficulty ${grading.difficulty}`
-            }
-          >
-            {grading.difficulty}
-            {grading.tierRole ? ` · ${grading.tierRole}` : ""}
-          </Badge>
-        )}
+        {(grading?.difficulty || grading?.routedDifficulty) &&
+          (() => {
+            const activeDifficulty = grading.routedDifficulty ?? grading.difficulty;
+            const difficultyLabel =
+              grading.steppedUp && grading.difficulty && grading.routedDifficulty
+                ? `${grading.difficulty} → ${grading.routedDifficulty}`
+                : activeDifficulty;
+            return (
+              <Badge
+                tone={grading.steppedUp ? "warning" : gradeTone(activeDifficulty)}
+                title={
+                  grading.steppedUp
+                    ? `Stepped up ${grading.difficulty} -> ${grading.routedDifficulty}${grading.tierRole ? ` · tier ${grading.tierRole}` : ""}`
+                    : grading.tierRole
+                      ? `Difficulty ${difficultyLabel} · tier ${grading.tierRole}`
+                      : `Difficulty ${difficultyLabel}`
+                }
+              >
+                {difficultyLabel}
+                {grading.tierRole ? ` · ${grading.tierRole}` : ""}
+              </Badge>
+            );
+          })()}
         {grading?.presetId && (
           <Badge
             tone={grading.rerouted ? "warning" : "neutral"}
-            title={
+            title={[
               grading.rerouted
                 ? `Rerouted ${grading.firstPresetId} -> ${grading.presetId}`
-                : grading.executionProfile
-                  ? `Preset ${grading.presetId} (${grading.executionProfile})`
-                  : `Preset ${grading.presetId}`
-            }
+                : `Preset ${grading.presetId}`,
+              grading.executionProfile ? `profile ${grading.executionProfile}` : null,
+              grading.modelLabel
+                ? grading.engineLabel
+                  ? `${grading.engineLabel} / ${grading.modelLabel}`
+                  : grading.modelLabel
+                : null,
+            ]
+              .filter(Boolean)
+              .join(" · ")}
           >
             <span className="font-mono">
               {grading.rerouted

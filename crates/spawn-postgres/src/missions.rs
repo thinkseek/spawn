@@ -636,16 +636,79 @@ macro_rules! active_holds {
     };
 }
 
+/// Every task of mission `m`, oldest first, carrying its stages
+/// ([`PostgresStore::task_stages`]), park status, and native grading
+/// projection (`difficulty`, `routed_difficulty`, `preset_id`,
+/// `first_preset_id`, `quality_rejections`, `tier_role`, `engine_label`,
+/// `model_label`, `execution_profile`, and `rework_step_up`).
+macro_rules! mission_tasks_json {
+    () => {
+        r"coalesce((select jsonb_agg(jsonb_build_object(
+                 'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
+                 'session_id', k.session_id, 'brief', left(k.brief, 600),
+                 'state', k.state, 'revisions', k.revisions,
+                 'review_note', k.review_note, 'report', k.report,
+                 'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
+                 'model', k.model, 'stages', spawn_task_stages(k.id),
+                 'held_by', k.held_by,
+                 -- Parked by the load-sensitive bound: its pushed commit
+                 -- and every scenario found load-sensitive on it (columns
+                 -- of the row already read; null for any other task).
+                 'parked', case when k.gate_parked_pushed is not null then
+                     jsonb_build_object('pushed', k.gate_parked_pushed,
+                                        'scenarios', k.gate_load_sensitive_scenarios) end,
+                 'difficulty', case k.difficulty when 1 then 'l1' when 2 then 'l2' when 3 then 'l3' end,
+                 'routed_difficulty', case g.routed_rank when 1 then 'l1' when 2 then 'l2' when 3 then 'l3' end,
+                 'preset_id', k.preset_id,
+                 'first_preset_id', k.first_preset_id,
+                 'quality_rejections', k.quality_rejections,
+                 'tier_role', case g.tier_rank when 1 then 'mechanical-offload' when 2 then 'mainline' when 3 then 'top-decision' end,
+                 'engine_label', coalesce(nullif(gp.engine_label, ''), nullif(k.engine, '')),
+                 'model_label', coalesce(nullif(gp.model_label, ''), nullif(k.model_label, '')),
+                 'execution_profile', gp.execution_profile,
+                 'rework_step_up', case when k.quality_rejections > 0
+                                          or k.first_preset_id is distinct from k.preset_id
+                                          or g.routed_rank <> k.difficulty then
+                     jsonb_build_object(
+                         'quality_rejections', k.quality_rejections,
+                         'from_difficulty', case k.difficulty when 1 then 'l1' when 2 then 'l2' when 3 then 'l3' end,
+                         'routed_difficulty', case g.routed_rank when 1 then 'l1' when 2 then 'l2' when 3 then 'l3' end,
+                         'stepped_up', g.routed_rank <> k.difficulty,
+                         'first_preset_id', k.first_preset_id,
+                         'preset_id', k.preset_id) end,
+                 'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
+                 'updated_at_ms', k.updated_at_ms) order by k.id)
+               from mission_tasks k
+               left join grading_presets gp on gp.preset_id = k.preset_id
+               cross join lateral (
+                 select r.routed_rank,
+                        coalesce(
+                          case when gp.state in ('active', 'demoted')
+                               then coalesce(gp.locked_grade, gp.calibrated_grade) end,
+                          r.routed_rank) as tier_rank
+                   from (select case when k.difficulty = 1 and k.quality_rejections >= 3 then 3
+                                     when k.difficulty = 1 and k.quality_rejections >= 1 then 2
+                                     when k.difficulty = 2 and k.quality_rejections >= 2 then 3
+                                     else k.difficulty end as routed_rank) r
+               ) g
+              where k.mission_id = m.id), '[]'::jsonb)"
+    };
+}
+
 /// The board of missions with their tasks, newest first; each task carries
-/// its stages ([`PostgresStore::task_stages`]) and each mission the `hold`
-/// on its source (the active hold's event id, or null) and the `halt` it
-/// is in (`{event, reason, at_ms, gone}`: its `mission.halted` record's
-/// event id and time, and the scenarios a halt on the floor names gone, else
-/// null; null while it is not halted) and the objectives `retired` by hand
-/// (objective 210: `[{objective, by, reason, caller, at_ms}]`, oldest first,
-/// `[]` when none, read from `mission_retired_objectives`, never from
-/// `spawn_events`, so the supervisor's login reads it); `holds` is every
-/// active hold ([`SOURCE_HOLDS`]).
+/// its stages ([`PostgresStore::task_stages`]), park status, and native
+/// grading projection (`difficulty`, `routed_difficulty`, `preset_id`,
+/// `first_preset_id`, `quality_rejections`, `tier_role`, `engine_label`,
+/// `model_label`, `execution_profile`, `rework_step_up`); each mission the
+/// `hold` on its source (the active hold's event id, or null) and the
+/// `halt` it is in (`{event, reason, at_ms, gone}`: its `mission.halted`
+/// record's event id and time, and the scenarios a halt on the floor names
+/// gone, else null; null while it is not halted) and the objectives
+/// `retired` by hand (objective 210: `[{objective, by, reason, caller,
+/// at_ms}]`, oldest first, `[]` when none, read from
+/// `mission_retired_objectives`, never from `spawn_events`, so the
+/// supervisor's login reads it); `holds` is every active hold
+/// ([`SOURCE_HOLDS`]).
 pub(crate) const MISSION_BOARD: &str = concat!(
     r"
 select jsonb_build_object(
@@ -669,23 +732,9 @@ select jsonb_build_object(
                from mission_retired_objectives o where o.mission_id = m.id), '[]'::jsonb)
                as retired,
              m.created_at_ms, m.updated_at_ms,
-             coalesce((select jsonb_agg(jsonb_build_object(
-                 'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
-                 'session_id', k.session_id, 'brief', left(k.brief, 600),
-                 'state', k.state, 'revisions', k.revisions,
-                 'review_note', k.review_note, 'report', k.report,
-                 'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
-                 'model', k.model, 'stages', spawn_task_stages(k.id),
-                 'held_by', k.held_by,
-                 -- Parked by the load-sensitive bound: its pushed commit
-                 -- and every scenario found load-sensitive on it (columns
-                 -- of the row already read; null for any other task).
-                 'parked', case when k.gate_parked_pushed is not null then
-                     jsonb_build_object('pushed', k.gate_parked_pushed,
-                                        'scenarios', k.gate_load_sensitive_scenarios) end,
-                 'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
-                 'updated_at_ms', k.updated_at_ms) order by k.id)
-               from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
+             ",
+    mission_tasks_json!(),
+    r" as tasks
         from mission_missions m
        order by m.id desc limit $1) x), '[]'::jsonb),
   'residents', coalesce((select jsonb_agg(row_to_json(r) order by r.name) from (
@@ -694,10 +743,12 @@ select jsonb_build_object(
 )"
 );
 
-/// One mission by id, with the same explicit fields and task stages as
-/// [`MISSION_BOARD`]. Unlike the board this has no recency window: an old or
-/// closed mission remains directly inspectable. `$1` is the mission id.
-pub(crate) const MISSION_BY_ID: &str = r"
+/// One mission by id, with the same explicit fields, task stages, and
+/// native grading projection as [`MISSION_BOARD`]. Unlike the board this has
+/// no recency window: an old or closed mission remains directly
+/// inspectable. `$1` is the mission id.
+pub(crate) const MISSION_BY_ID: &str = concat!(
+    r"
 select row_to_json(x) from (
       select m.id, m.text, m.origin, m.sources, m.state, m.summary,
              m.gate, m.accept, m.budget, m.baseline, m.halted, m.objectives,
@@ -714,23 +765,13 @@ select row_to_json(x) from (
                from mission_retired_objectives o where o.mission_id = m.id), '[]'::jsonb)
                as retired,
              m.created_at_ms, m.updated_at_ms,
-             coalesce((select jsonb_agg(jsonb_build_object(
-                 'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
-                 'session_id', k.session_id, 'brief', left(k.brief, 600),
-                 'state', k.state, 'revisions', k.revisions,
-                 'review_note', k.review_note, 'report', k.report,
-                 'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
-                 'model', k.model, 'stages', spawn_task_stages(k.id),
-                 'held_by', k.held_by,
-                 'parked', case when k.gate_parked_pushed is not null then
-                     jsonb_build_object('pushed', k.gate_parked_pushed,
-                                        'scenarios', k.gate_load_sensitive_scenarios) end,
-                 'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
-                 'updated_at_ms', k.updated_at_ms) order by k.id)
-               from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
+             ",
+    mission_tasks_json!(),
+    r" as tasks
         from mission_missions m
        where m.id = $1
-) x";
+) x"
+);
 
 /// What the labels of the tasks `$1` (an array of ids) are made of, read
 /// as [`MISSION_BOARD`] reads them (the mission's whole text, a brief's
