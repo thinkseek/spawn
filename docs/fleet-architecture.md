@@ -2345,9 +2345,17 @@ an e-mail address (`drop_agy_account_lines`).
 
 **The capability probe** (N5, `crates/spawn-cli/src/serve/capabilities.rs`).
 `spawn loop` probes at its start and then hourly, on a thread of its own.
-For each engine it runs `<program> --version` and, for an enabled agy,
-`agy models`, read by `AgyDriver::known_models`. Each run is bounded, takes
-no shell and has its standard input closed. Login files are only `stat`ed.
+It runs `<program> --version` for Claude Code and for each other engine
+`SPAWN_ENGINES` enables and, for an enabled agy, `agy models`, read by
+`AgyDriver::known_models`. An engine `SPAWN_ENGINES` does not name runs no
+process at all (decision C3): it is reported not enabled, its install and
+version unknown. Each run is bounded, its output too: a detached process
+(agy's background updater) that keeps the output open past the bound fails
+the run, and agy is reported down. Each run takes no shell and has its
+standard input closed. Login files are only `stat`ed. A resumed agy session
+runs the model label its last execution was launched on (its
+`execution.started` launch summary), the host's only when that recorded
+none.
 A failure takes down agy alone, never Claude Code. agy's
 "is not recognized as a known model" line on a starting pane fails that
 start at once (`AgentDriver::start_refusal`). An agy `major.minor` outside

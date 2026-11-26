@@ -193,7 +193,8 @@ loop's environment, `SPAWN_TERMINAL_BACKEND=herdr` and `SPAWN_AGY_MODEL`
 an agy start is refused before launch, saying what is missing. Claude Code
 is unaffected. The loop probes the engines at its start and hourly
 (`<program> --version`, `agy models`; bounded, no shell, login files only
-`stat`ed): an agy whose probe fails, or a preset's or `SPAWN_AGY_MODEL`'s
+`stat`ed; an engine `SPAWN_ENGINES` does not name is never run): an agy
+whose probe fails, or a preset's or `SPAWN_AGY_MODEL`'s
 label that `agy models` does not list, makes no start and raises
 `engine_unavailable`, while Claude Code keeps running. `GET
 /api/capabilities` shows what the probe found.

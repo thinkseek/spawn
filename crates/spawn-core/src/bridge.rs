@@ -6637,11 +6637,13 @@ impl Bridge {
                 claimed.session_id
             ))));
         }
-        let Some((native, engine, label)) = self.sessions.get(&claimed.session_id).and_then(|view| {
-            view.native
-                .clone()
-                .map(|native| (native, view.engine.clone(), view.model_label.clone()))
-        }) else {
+        let Some((native, engine, label)) =
+            self.sessions.get(&claimed.session_id).and_then(|view| {
+                view.native
+                    .clone()
+                    .map(|native| (native, view.engine.clone(), view.model_label.clone()))
+            })
+        else {
             return Ok(Handled::Finished(Outcome::Failed(
                 "no native session to resume".to_string(),
             )));

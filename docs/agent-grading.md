@@ -57,11 +57,16 @@ Delivery (`crates/spawn-cli/src/deliver.rs`) starts a task's worker on that
 engine. For an engine told its model at launch (agy), the start carries the
 preset's `model_label` (`CommandAction::Start.model_label`, agy's
 `--model`); a Claude Code start carries none and is byte for byte what it
-was. An ephemeral worker that ran on another engine is stopped
+was. An ephemeral worker that ran on another engine, or on agy with
+another model label than its task's preset names, is stopped
 (`switch-engine-<task>-<revision>`), then started afresh on the task's; a
-resident keeps the one engine it ran on. A resume runs the host's label for
-its engine (`SPAWN_AGY_MODEL`): the label of the start it resumes is not
-kept.
+resident keeps the one engine it ran on. A resume (a revision, a restart)
+runs the model label its session's last execution was launched on, as its
+`execution.started` records it (the launch summary's `model`), so a
+resumed worker stays on its preset's model and the preset is credited only
+with what it ran. Only an execution that recorded none resumes on the
+host's label (`SPAWN_AGY_MODEL`). Delivery checks a resume's label against
+`agy models` as it checks a start's.
 
 When the host cannot run the engine (not enabled in `SPAWN_ENGINES`, not
 installed, its probe failed) or `agy models` does not list the label (the

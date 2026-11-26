@@ -726,9 +726,7 @@ mod tests {
         let answer = run_bounded("sh", &["-c", &script], Duration::from_secs(1));
         let took = started.elapsed();
         if let Ok(pid) = std::fs::read_to_string(&pidfile) {
-            let _ = std::process::Command::new("kill")
-                .arg(pid.trim())
-                .status();
+            let _ = std::process::Command::new("kill").arg(pid.trim()).status();
         }
         let _ = std::fs::remove_dir_all(&dir);
         let why = answer.expect_err("held open past the bound");
