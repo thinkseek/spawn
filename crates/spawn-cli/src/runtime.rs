@@ -137,13 +137,13 @@ fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, O
     Ok((bridge, observer))
 }
 
-/// Programs and environment the Bridge puts into every terminal it starts.
 /// Whether the Bridge answers an engine's startup trust dialog itself
 /// under `mode` (`SPAWN_AUTO_APPROVE`): under every mode but `off`.
 fn auto_trust(mode: crate::resolve::Mode) -> bool {
     mode != crate::resolve::Mode::Off
 }
 
+/// Programs and environment the Bridge puts into every terminal it starts.
 fn bridge_config() -> Result<BridgeConfig, String> {
     let mut config = BridgeConfig::new(&env_or("SPAWN_WORKER", "spawn-worker"));
     config.spawn_program = spawn_program();

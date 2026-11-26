@@ -2225,8 +2225,10 @@ the key `resolve:<execution>:<dialog id>:1:1`.
 `all`, and a test pins that the resolver reads and submits nothing
 otherwise. `off` means no automatic answer at all, the startup trust dialog
 included (`BridgeConfig::auto_trust`, set by `runtime.rs`). A start that
-shows the dialog under `off` waits for a person. If nobody answers, its wait
-fails with a message naming the trust dialog and `SPAWN_AUTO_APPROVE=off`.
+shows the dialog under `off` waits, until its readiness limit, for someone
+to answer it in the engine's terminal itself (a key sent through Spawn
+queues behind the start). If nobody does, the start fails naming the dialog
+and the switch.
 
 **The audit trail.** Each automatic answer is on the record with kinds that
 exist: `command.accepted` (principal `spawn-resolve`), `command.step

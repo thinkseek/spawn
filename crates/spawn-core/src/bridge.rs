@@ -296,8 +296,11 @@ pub struct BridgeConfig {
     /// Whether the Bridge answers an engine's startup trust dialog itself
     /// (audited, as `key` commands of [`RESOLVE_PRINCIPAL`]). `true` by
     /// default; `false` under `SPAWN_AUTO_APPROVE=off`, where nothing is
-    /// answered automatically: a start that shows the dialog waits for a
-    /// person and fails its wait naming the dialog and the switch.
+    /// answered automatically: a start that shows the dialog waits, until
+    /// its readiness limit, for someone to answer it in the engine's
+    /// terminal itself (a key sent through Spawn queues behind the start);
+    /// if nobody does, the start fails naming the dialog and the switch
+    /// ([`TRUST_OFF`]).
     pub auto_trust: bool,
 }
 
@@ -6643,7 +6646,9 @@ pub const RESOLVE_PRINCIPAL: &str = "spawn-resolve";
 /// Why a start's wait for its prompt did not end under
 /// `SPAWN_AUTO_APPROVE=off` ([`BridgeConfig::auto_trust`]).
 pub const TRUST_OFF: &str = "the engine shows its startup trust dialog and SPAWN_AUTO_APPROVE=off: \
-     nothing answers it automatically; answer it from the agent page";
+     nothing answers it automatically. A key from the agent page or /api/approvals waits behind \
+     this start and cannot reach the dialog: answer it in the engine's terminal itself, or set \
+     SPAWN_AUTO_APPROVE=startup and resume the session";
 
 /// How a resolver's key ends when the dialog it answered is gone, or a
 /// person (or another command) acted on the pane since it was submitted:

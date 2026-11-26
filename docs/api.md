@@ -190,8 +190,10 @@ done, and never pressed twice.
   - `all`: the resolver reads panes and submits.
   - `startup`: only the Bridge's startup trust answer, as before.
   - `off`: no automatic answer at all, the startup trust dialog included. A
-    start that shows it waits for a person; if nobody answers, it fails
-    naming the dialog and the switch.
+    start that shows it waits, until its readiness limit, for someone to
+    answer it in the engine's terminal itself (a key sent through Spawn
+    queues behind the start); if nobody does, the start fails naming the
+    dialog and the switch.
 
   An unknown value is warned about and read as `startup`.
 - **Table** (`spawn_core::driver::table_answer`): only answers someone has
