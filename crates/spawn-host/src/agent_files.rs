@@ -5,7 +5,7 @@
 //! them. So the controller never opens such a file by its path: every
 //! reader goes through [`open_regular`], which
 //! - walks the parent directories from the workspace through held
-//!   descriptors ([`HeldDirectory`]), refusing a symlink or a file in the way;
+//!   descriptors (`HeldDirectory`), refusing a symlink or a file in the way;
 //! - opens the file itself `O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`
 //!   relative to its parent's descriptor, so a symlink is refused and a FIFO
 //!   with no writer does not block;
@@ -18,6 +18,9 @@
 //! make or move a file in a workspace go through [`create_new`],
 //! [`create_with`] (which never removes anything) and [`rename_within`],
 //! which walk the same way.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
@@ -188,10 +191,18 @@ pub enum Created {
     /// The bytes written so far are left at the partial name: the write or
     /// its confirmation failed, or the file's name was taken before the
     /// file got it.
-    Partial { partial: TreePath, why: String },
+    Partial {
+        /// Relative path to the leftover partial file.
+        partial: TreePath,
+        /// Human-readable reason completion or confirmation failed.
+        why: String,
+    },
     /// As [`Created::Partial`], but the partial name was taken too, so the
     /// bytes written have no name: nothing was named, nothing moved.
-    Unkept { why: String },
+    Unkept {
+        /// Human-readable reason the leftover partial bytes could not be kept.
+        why: String,
+    },
 }
 
 /// Create the file `relative` under `top` with what `write` writes, never
@@ -310,7 +321,12 @@ fn unnamed_file(_parent: &HeldDirectory) -> Result<OwnedFd, Errno> {
 /// is there (a regular file or a symlink, never followed: the entry is
 /// unlinked first), its missing parents made the way [`create_new`] makes
 /// them, and the file created exclusively.
-pub fn replace_with(top: &Path, relative: &TreePath, bytes: &[u8]) -> Result<(), AgentFileError> {
+/// Replace `relative` atomically through a held parent directory descriptor.
+pub(crate) fn replace_with(
+    top: &Path,
+    relative: &TreePath,
+    bytes: &[u8],
+) -> Result<(), AgentFileError> {
     use std::io::Write;
     checked(relative)?;
     let parent = HeldDirectory::parent_of(top, relative).map_err(AgentFileError::NotRegular)?;

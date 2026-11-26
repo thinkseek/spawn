@@ -15,7 +15,10 @@
 //! pane's working directory, the runner's exit file and the transcript path
 //! all come from that one id. Ids recorded under the root as it was
 //! configured, by a version that did not resolve it, still name the same
-//! directory; [`legacy_workspace`] says where it is now.
+//! directory; `legacy_workspace` says where it is now.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 use std::path::{Component, Path, PathBuf};
 
@@ -71,7 +74,7 @@ pub fn canonical_root(path: &Path) -> PathBuf {
 /// (`<old root>/<branch>`, recorded before the root was resolved through
 /// its symlinks): the old root resolves to `root`. `None` when it names a
 /// directory under no spelling of `root`.
-pub fn legacy_workspace(root: &Path, branch: &str, directory: &Path) -> Option<PathBuf> {
+pub(crate) fn legacy_workspace(root: &Path, branch: &str, directory: &Path) -> Option<PathBuf> {
     if branch.is_empty() {
         return None;
     }

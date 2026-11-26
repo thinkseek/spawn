@@ -4,6 +4,9 @@
 //! where `bwrap` is missing or misconfigured from a container environment where
 //! nested user namespaces are blocked by the outer container runtime.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::path::Path;
 
 use crate::engine_view::{BwrapView, ViewConfig};
@@ -41,10 +44,7 @@ pub fn detect_container() -> ContainerEnv {
 /// Testable implementation of [`detect_container`] inspecting `root` and
 /// environment variable lookup `env_lookup`.
 #[must_use]
-pub fn detect_container_with(
-    root: &Path,
-    env_lookup: &dyn Fn(&str) -> Option<String>,
-) -> ContainerEnv {
+fn detect_container_with(root: &Path, env_lookup: &dyn Fn(&str) -> Option<String>) -> ContainerEnv {
     let mut signals = Vec::new();
     let mut runtime: Option<String> = None;
 
@@ -120,7 +120,7 @@ pub fn probe_bwrap(program: &str, config: &ViewConfig) -> BwrapCapability {
 }
 
 /// Testable helper behind [`probe_bwrap`].
-pub fn probe_bwrap_with(
+fn probe_bwrap_with(
     check: impl FnOnce() -> Result<(), String>,
     detect: &dyn Fn() -> ContainerEnv,
 ) -> BwrapCapability {

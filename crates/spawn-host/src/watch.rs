@@ -14,6 +14,9 @@
 //! Bridge then reads its files on every pass, exactly as it did before
 //! watches, and says so once.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(any(target_os = "linux", test))]
 use std::path::Path;

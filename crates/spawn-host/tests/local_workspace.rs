@@ -425,7 +425,6 @@ fn cas_dedup_shares_artifacts_and_never_touches_transcripts() {
         .dedup_artifacts(&workspace)
         .unwrap()
         .expect("artifacts to look at");
-    assert!(report.skipped_transcripts >= 2, "{report:?}");
     assert_eq!(
         (
             inode("target/.transcripts/session.bin"),
@@ -436,11 +435,17 @@ fn cas_dedup_shares_artifacts_and_never_touches_transcripts() {
     );
     assert_eq!(fs::read(view.join("target/session.jsonl")).unwrap(), blob);
     if report.cow_supported {
+        assert!(report.skipped_transcripts >= 2, "{report:?}");
         assert!(report.deduplicated >= 2, "{report:?}");
         assert!(store.cas_root().is_dir());
         let pruned = store.prune_cas(Duration::ZERO).unwrap().expect("a CAS");
         assert!(pruned.errors.is_empty(), "{pruned:?}");
     } else {
+        assert_eq!(report.skipped_transcripts, 0, "{report:?}");
+        assert!(
+            !store.cas_root().exists(),
+            "non-CoW pass must not create CAS root"
+        );
         eprintln!(
             "no copy-on-write clones under {}: nothing shared",
             view.display()

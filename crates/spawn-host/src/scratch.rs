@@ -8,6 +8,9 @@
 //! ever removed: never anything found by a name or a pattern, since other
 //! processes keep their own scratch next to it.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::path::{Path, PathBuf};
 
 /// A new, empty directory under [`std::env::temp_dir`], removed on drop

@@ -18,6 +18,9 @@
 //! never followed, and a file with a second hard link is never read or
 //! written; each is an error, and nothing is copied.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -51,7 +54,7 @@ impl LocalTranscriptArchive {
 
     /// The loop's archive, `<workspace root>/.transcripts`, reached from
     /// `workspace_root` as given: pinned when the loop's mask is a
-    /// stand-in's ([`Beneath::pinned`]), so a root swapped for a link after
+    /// stand-in's (`Beneath::pinned`), so a root swapped for a link after
     /// the pin writes nothing through it.
     #[must_use]
     pub fn for_loop(workspace_root: Beneath) -> Self {

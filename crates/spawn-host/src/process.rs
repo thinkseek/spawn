@@ -1,5 +1,8 @@
 //! What a long-lived spawn process does to itself at start.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 /// Makes this process not dumpable (`prctl(PR_SET_DUMPABLE, 0)`), so that
 /// another process of the same user can no longer read its
 /// `/proc/<pid>/environ` (or `mem`, or attach to it): the kernel then treats
@@ -41,6 +44,7 @@ pub fn current_uid() -> u32 {
 /// a restart: a tmux pane's leader (P6), a gate's runner (gate v2 step 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessId {
+    /// Numeric OS process identifier (`/proc/<pid>`).
     pub pid: u32,
     /// 0 when it was not known (the process was gone when it was recorded).
     pub start: u64,
@@ -91,7 +95,7 @@ impl ProcessId {
     /// (same start time). A pid given anew, or a start that was not
     /// recorded while a process has the pid now, names nothing.
     #[must_use]
-    pub fn leads_its_session(&self) -> bool {
+    pub(crate) fn leads_its_session(&self) -> bool {
         if self.pid <= 1 {
             return false;
         }
@@ -104,7 +108,7 @@ impl ProcessId {
 
 /// The process's start time, or `None` when there is no such process.
 #[must_use]
-pub fn start_time(pid: u32) -> Option<u64> {
+pub(crate) fn start_time(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     start_time_of(&stat)
 }
@@ -146,7 +150,11 @@ pub fn private_to_us(path: &std::path::Path) -> bool {
 /// # Errors
 ///
 /// What the filesystem says.
-pub fn write_private(directory: &std::path::Path, name: &str, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_private(
+    directory: &std::path::Path,
+    name: &str,
+    text: &str,
+) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     std::fs::DirBuilder::new()

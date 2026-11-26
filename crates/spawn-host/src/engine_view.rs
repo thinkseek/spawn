@@ -45,7 +45,7 @@
 //!   an engine home that is or holds one (a misconfigured `SPAWN_AGY_HOME`
 //!   of `~/.gemini`, `~/.claude` or `/run/keep` is refused, never
 //!   unmasked). The one exception is an engine home below another engine's
-//!   masked home ([`ENGINE_HOMES`]: `~/.gemini/antigravity-cli` under
+//!   masked home (`ENGINE_HOMES`: `~/.gemini/antigravity-cli` under
 //!   `~/.gemini`), bound back into the mask's empty tmpfs.
 //!
 //! The masks, resolved again at every launch ([`BwrapView::plan`]):
@@ -79,6 +79,9 @@
 //! visible to the engine already running (`--ro-bind / /` is live); the
 //! next launch masks it.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -97,11 +100,11 @@ pub const TMP_FALLBACK: &str = ".spawn-tmp";
 /// The engines' homes masked below the user's home: the only masked
 /// directories an engine's own home may lie below (re-bound writable into
 /// the mask's tmpfs, `~/.gemini/antigravity-cli`), never equal to.
-pub const ENGINE_HOMES: &[&str] = &[".gemini", ".config/antigravity", ".codex", ".hermes"];
+const ENGINE_HOMES: &[&str] = &[".gemini", ".config/antigravity", ".codex", ".hermes"];
 
 /// The directories masked below the user's home, as written (a
 /// `.config/<x>` one also below `$XDG_CONFIG_HOME` when that is set).
-pub const HOME_DIRECTORIES: &[&str] = &[
+const HOME_DIRECTORIES: &[&str] = &[
     ".claude",
     ".gemini",
     ".config/antigravity",
@@ -118,14 +121,14 @@ pub const HOME_DIRECTORIES: &[&str] = &[
 ];
 
 /// The regular files masked below the user's home.
-pub const HOME_FILES: &[&str] = &[".claude.json", ".pgpass", ".netrc", ".git-credentials"];
+const HOME_FILES: &[&str] = &[".claude.json", ".pgpass", ".netrc", ".git-credentials"];
 
 /// The directories masked wherever the home is.
 pub const HOST_DIRECTORIES: &[&str] = &["/run/keep", "/run/keep-test", "/tmp"];
 
 /// The loop's directory below the user's home, whose environment files
 /// (`*.env*`, `env.sh`) are masked.
-pub const LOOP_DIRECTORY: &str = ".local/share/spawn-rsi";
+const LOOP_DIRECTORY: &str = ".local/share/spawn-rsi";
 
 /// How `$HOME` is isolated inside the filesystem view
 /// (`SPAWN_SANDBOX_HOME_ISOLATION`).
@@ -265,7 +268,7 @@ pub fn parse_extra_mounts(raw: &str) -> Vec<ExtraMount> {
 
 /// Parse `SPAWN_SANDBOX_INHERIT_HOST_PATHS` entries separated by `,` or `:`.
 #[must_use]
-pub fn parse_inherit_host_paths(raw: &str) -> Vec<PathBuf> {
+fn parse_inherit_host_paths(raw: &str) -> Vec<PathBuf> {
     raw.split([',', ':'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -490,7 +493,7 @@ impl BwrapView {
     /// The view through `program` (`bwrap` is looked up on `PATH`), once
     /// it has shown it works on this host: it starts `/bin/true` in a view
     /// of the same kind (same namespaces, a tmpfs and a bind) within
-    /// [`CHECK_LIMIT`].
+    /// `CHECK_LIMIT`.
     pub fn new(program: &str, config: ViewConfig) -> Result<Self, String> {
         let program = find_program(program)
             .ok_or_else(|| format!("{program} is not installed (not found on PATH)"))?;
