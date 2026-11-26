@@ -398,7 +398,7 @@ fn missing_and_odd_targets_are_skipped_and_said_without_aborting() {
     let Some(view) = view(config) else {
         return;
     };
-    let (workspace, engine_home, tmpdir) = fixture.launch();
+    let (workspace, engine_home, _) = fixture.launch();
     let plan = view
         .plan(&ViewedLaunch {
             engine: "agy",
@@ -712,7 +712,7 @@ fn herdr_detects_an_agent_inside_the_view_that_cannot_reach_its_socket() {
     std::fs::write(&stub, STUB_CLAUDE).expect("stub");
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("0755");
 
-    let (workspace, engine_home, tmpdir) = fixture.launch();
+    let (workspace, engine_home, _) = fixture.launch();
     let mut words = view
         .wrap(&ViewedLaunch {
             engine: "agy",
