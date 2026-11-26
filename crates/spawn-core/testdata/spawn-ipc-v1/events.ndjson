@@ -1,0 +1,5 @@
+{"type":"ready","latest_id":100,"recorded_at_ms":1795600000000,"replayed":2}
+{"type":"event","id":101,"agent_id":"builder-1","session_id":"session_a","execution_id":"exec-001","source":"hook","event_name":"TurnCompleted","detail":{"ok":true},"recorded_at_ms":1795600000100}
+{"type":"event","id":104,"agent_id":"builder-1","session_id":"session_a","execution_id":null,"source":"bridge","event_name":"ScreenObserved","detail":{"state":"ready"},"recorded_at_ms":1795600000250}
+{"type":"hb","latest_id":104,"recorded_at_ms":1795600005250}
+{"type":"resync","reason":"behind","after_id":10,"latest_id":104,"recorded_at_ms":1795600005250}

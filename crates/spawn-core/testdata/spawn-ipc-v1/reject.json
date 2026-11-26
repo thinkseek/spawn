@@ -1,0 +1,87 @@
+[
+  {
+    "case": "missing_content_length_on_post",
+    "method": "POST",
+    "path": "/api/sessions/session_a/input",
+    "headers": {
+      "Idempotency-Key": "req-1"
+    },
+    "body_bytes": 16,
+    "status": 411,
+    "error": "length_required"
+  },
+  {
+    "case": "chunked_transfer_encoding_forbidden",
+    "method": "POST",
+    "path": "/ipc/v1/node/beat",
+    "headers": {
+      "Transfer-Encoding": "chunked",
+      "Idempotency-Key": "req-2"
+    },
+    "body_bytes": 64,
+    "status": 411,
+    "error": "length_required"
+  },
+  {
+    "case": "body_exceeds_4mib",
+    "method": "POST",
+    "path": "/ipc/v1/node/spec",
+    "headers": {
+      "Content-Length": "4194305",
+      "Idempotency-Key": "req-3"
+    },
+    "body_bytes": 4194305,
+    "status": 413,
+    "error": "payload_too_large"
+  },
+  {
+    "case": "missing_idempotency_key_on_post",
+    "method": "POST",
+    "path": "/api/sessions/session_a/restart",
+    "headers": {
+      "Content-Length": "2"
+    },
+    "body_bytes": 2,
+    "status": 400,
+    "error": "bad_request"
+  },
+  {
+    "case": "mismatched_idempotency_key_header_and_body",
+    "method": "POST",
+    "path": "/api/sessions/session_a/reassign",
+    "headers": {
+      "Content-Length": "38",
+      "Idempotency-Key": "header-key-1"
+    },
+    "body_json": {
+      "agent": "builder-2",
+      "key": "body-key-2"
+    },
+    "status": 400,
+    "error": "bad_request"
+  },
+  {
+    "case": "control_chars_in_idempotency_key",
+    "method": "POST",
+    "path": "/ipc/v1/node/cas",
+    "headers": {
+      "Content-Length": "2",
+      "Idempotency-Key": "bad\nkey"
+    },
+    "body_bytes": 2,
+    "status": 400,
+    "error": "bad_request"
+  },
+  {
+    "case": "disallowed_pg_role_owner",
+    "pg_role": "owner",
+    "status": 403,
+    "error": "forbidden_role"
+  },
+  {
+    "case": "disallowed_pg_role_supervisor",
+    "pg_role": "spawn_supervisor",
+    "status": 403,
+    "error": "forbidden_role"
+  }
+]
