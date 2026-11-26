@@ -1,6 +1,7 @@
 //! Assembly of the Bridge and the Observer over one store and the host
-//! adapters (git workspaces, tmux terminals, judge).
+//! adapters (git workspaces, Herdr terminals, judge).
 
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use spawn_core::bridge::{Bridge, BridgeConfig, LaunchEnvironment, ModelRelay};
@@ -64,7 +65,7 @@ fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, O
     let workspaces: Arc<dyn WorkspaceStore> = Arc::new(missions);
     let mut host = crate::config::terminal_host()?;
     let herdr_backend = true;
-    let mut config = bridge_config_for(herdr_backend)?;
+    let mut config = bridge_config_for(herdr_backend, std::path::Path::new(&root))?;
     let judge_url = resolve_judge_url(flags, env_value);
     let preflight = preflight_model_endpoints_with(
         config.model_relay.take(),
@@ -182,10 +183,28 @@ fn parse_bounded_usize(
 }
 
 /// Build `BwrapView` config, enabling v2 sandbox features (`canonical_workspace`,
-/// whitelist `$HOME`, per-worker `brain/`) strictly on the Herdr backend.
+/// whitelist `$HOME`, per-worker `brain/`) strictly on the Herdr backend, and
+/// mounting an opt-in shared host build cache directory read-write when enabled.
 pub(crate) fn view_config_for_backend(
     lookup: &dyn Fn(&str) -> Option<String>,
     herdr_backend: bool,
+) -> spawn_host::ViewConfig {
+    let ws_root = lookup("SPAWN_WORKSPACE_ROOT")
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .map(PathBuf::from);
+    let shared_cache = resolve_shared_build_cache(lookup, ws_root.as_deref())
+        .ok()
+        .flatten();
+    view_config_for_backend_with_cache(lookup, herdr_backend, shared_cache.as_deref())
+}
+
+/// Like [`view_config_for_backend`], binding `shared_cache_root` read-write
+/// when `Some`.
+pub(crate) fn view_config_for_backend_with_cache(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    herdr_backend: bool,
+    shared_cache_root: Option<&Path>,
 ) -> spawn_host::ViewConfig {
     let mut cfg = spawn_host::ViewConfig::from_env(lookup);
     if !herdr_backend {
@@ -193,11 +212,14 @@ pub(crate) fn view_config_for_backend(
         cfg.home_isolation = spawn_host::HomeIsolation::Blacklist;
         cfg.isolate_brain = false;
     }
+    if let Some(cache_root) = shared_cache_root {
+        apply_shared_build_cache_mount(&mut cfg, cache_root);
+    }
     cfg
 }
 
 /// Programs and environment the Bridge puts into every terminal it starts.
-fn bridge_config_for(herdr_backend: bool) -> Result<BridgeConfig, String> {
+fn bridge_config_for(herdr_backend: bool, workspace_root: &Path) -> Result<BridgeConfig, String> {
     let mut config = BridgeConfig::new(&env_or("SPAWN_WORKER", "spawn-worker"));
     config.spawn_program = spawn_program();
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
@@ -215,20 +237,13 @@ fn bridge_config_for(herdr_backend: bool) -> Result<BridgeConfig, String> {
         parse_bounded_usize(&env_value, "SPAWN_BRIDGE_BACKSTOPS_PER_PASS", 2, 1, 64)?;
     config.session_scan_limit =
         parse_bounded_usize(&env_value, "SPAWN_LIST_DIRS_LIMIT", 64, 64, 4096)?;
-    // An engine with no deny rules of its own (or Claude with SPAWN_CLAUDE_SANDBOX=1)
-    // runs inside the host's filesystem view (decision C2, N6; SPAWN_ENGINE_VIEW).
+    let shared_cache = prepare_shared_build_caches(&env_value, workspace_root)?;
     config.claude_sandbox = claude_sandbox_enabled(&env_value);
-    let (policy, said) = engine_view_with(
+    let (policy, said) = bridge_engine_view(
         &env_value,
         &config.engines,
-        |lookup| {
-            spawn_host::BwrapView::new("bwrap", view_config_for_backend(lookup, herdr_backend))
-                .map(|view| Arc::new(view) as Arc<dyn spawn_core::port::EngineView>)
-        },
-        |lookup| {
-            spawn_host::ContainerView::new(view_config_for_backend(lookup, herdr_backend))
-                .map(|view| Arc::new(view) as Arc<dyn spawn_core::port::EngineView>)
-        },
+        herdr_backend,
+        shared_cache.root.as_deref(),
     );
     if let Some(said) = said {
         eprintln!("{said}");
@@ -258,6 +273,9 @@ fn bridge_config_for(herdr_backend: bool) -> Result<BridgeConfig, String> {
     // the path. Unset, the store's default under $HOME stands.
     config.environment.extend(path_env(env_value));
     config.environment.extend(supply_pa_env(env_value));
+    // Opt-in shared host toolchain build caches (issue #105): deterministic
+    // non-secret subdirectories under the cache root with caller overrides preserved.
+    config.environment.extend(shared_cache.env);
     // Engines on a Claude Code directory of their own, when the loop names
     // one (SPAWN_CLAUDE_CONFIG_DIR, issue #79); else the user's own.
     config.environment.extend(claude_config_env(env_value)?);
@@ -287,6 +305,318 @@ fn bridge_config_for(herdr_backend: bool) -> Result<BridgeConfig, String> {
         config.launch_environment = Some(Arc::new(fleet));
     }
     Ok(config)
+}
+
+/// Zero-secret toolchain build cache env variables mapped to subdirectories under
+/// the shared host cache root (`#105`).
+pub(crate) const SHARED_BUILD_CACHE_VARS: &[(&str, &str)] = &[
+    ("ZIG_GLOBAL_CACHE_DIR", "zig"),
+    ("CCACHE_DIR", "ccache"),
+    ("UV_CACHE_DIR", "uv"),
+    ("SCCACHE_DIR", "sccache"),
+    ("PIP_CACHE_DIR", "pip"),
+    ("NPM_CONFIG_CACHE", "npm"),
+    ("GOMODCACHE", "go-mod"),
+    ("GOCACHE", "go-build"),
+];
+
+const SHARED_CACHE_BARE_SYSTEM_DIRS: &[&str] = &[
+    "/",
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/home",
+    "/lib",
+    "/lib64",
+    "/media",
+    "/mnt",
+    "/opt",
+    "/proc",
+    "/root",
+    "/run",
+    "/sbin",
+    "/srv",
+    "/sys",
+    "/tmp",
+    "/usr",
+    "/usr/local",
+    "/var",
+    "/var/cache",
+    "/var/lib",
+    "/var/run",
+    "/var/tmp",
+];
+
+const SHARED_CACHE_SENSITIVE_SUBTREES: &[&str] = &[
+    "/etc",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/boot",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/usr",
+    "/run/keep",
+    "/run/keep-test",
+    "/var/run/keep",
+    "/var/run/keep-test",
+];
+
+fn bridge_engine_view(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    engines: &[(String, spawn_core::driver::EngineHome)],
+    herdr_backend: bool,
+    shared_cache_mount: Option<&Path>,
+) -> (spawn_core::bridge::EngineViewPolicy, Option<String>) {
+    engine_view_with(
+        lookup,
+        engines,
+        |l| {
+            spawn_host::BwrapView::new(
+                "bwrap",
+                view_config_for_backend_with_cache(l, herdr_backend, shared_cache_mount),
+            )
+            .map(|view| Arc::new(view) as Arc<dyn spawn_core::port::EngineView>)
+        },
+        |l| {
+            spawn_host::ContainerView::new(view_config_for_backend_with_cache(
+                l,
+                herdr_backend,
+                shared_cache_mount,
+            ))
+            .map(|view| Arc::new(view) as Arc<dyn spawn_core::port::EngineView>)
+        },
+    )
+}
+
+fn normalize_cache_path(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        if !matches!(component, Component::CurDir) {
+            normal.push(component.as_os_str());
+        }
+    }
+    if normal.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normal
+    }
+}
+
+fn reject_forbidden_cache_path(
+    path: &Path,
+    var_name: &str,
+    home: Option<&str>,
+) -> Result<(), String> {
+    let text = path.to_string_lossy();
+    if SHARED_CACHE_BARE_SYSTEM_DIRS.contains(&text.as_ref()) {
+        return Err(format!(
+            "{var_name} cannot target bare system directory {text:?}"
+        ));
+    }
+    for prefix in SHARED_CACHE_SENSITIVE_SUBTREES {
+        let prefix_path = Path::new(prefix);
+        if path == prefix_path || path.starts_with(prefix_path) {
+            return Err(format!(
+                "{var_name} cannot target sensitive system directory {text:?}"
+            ));
+        }
+    }
+    if let Some(home_raw) = home.map(str::trim).filter(|raw| !raw.is_empty()) {
+        let home_path = Path::new(home_raw);
+        if home_path.is_absolute() {
+            let home_norm = normalize_cache_path(home_path);
+            if path == home_norm
+                || std::fs::canonicalize(&home_norm)
+                    .ok()
+                    .is_some_and(|canon| path == canon)
+            {
+                return Err(format!(
+                    "{var_name} cannot target $HOME directly ({text:?}); use a subdirectory"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_shared_build_cache_dir(
+    raw: &str,
+    var_name: &str,
+    home: Option<&str>,
+) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return Err(format!(
+            "{var_name} must be a non-empty clean path, not {raw:?}"
+        ));
+    }
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return Err(format!(
+            "{var_name} must be an absolute path, not {trimmed:?}"
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!(
+            "{var_name} must not contain '..' segments, got {trimmed:?}"
+        ));
+    }
+    let normalized = normalize_cache_path(path);
+    reject_forbidden_cache_path(&normalized, var_name, home)?;
+    if let Ok(canonical) = std::fs::canonicalize(&normalized) {
+        reject_forbidden_cache_path(&canonical, var_name, home)?;
+    }
+    Ok(normalized)
+}
+
+fn parse_shared_cache_toggle(raw: Option<&str>) -> Result<Option<bool>, String> {
+    let Some(trimmed) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match trimmed.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => Err(format!(
+            "SPAWN_SHARED_BUILD_CACHES={trimmed:?} must be 1|true|yes|on or 0|false|no|off"
+        )),
+    }
+}
+
+/// Resolve opt-in shared host build cache directory (`SPAWN_SHARED_BUILD_CACHES`
+/// / `SPAWN_SHARED_BUILD_CACHE_DIR`), returning `Ok(None)` when disabled by default
+/// or explicitly turned off, or validating paths when enabled (`#105`).
+pub(crate) fn resolve_shared_build_cache(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    workspace_root: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    let raw_toggle = lookup("SPAWN_SHARED_BUILD_CACHES");
+    let toggle = parse_shared_cache_toggle(raw_toggle.as_deref())?;
+    if toggle == Some(false) {
+        return Ok(None);
+    }
+    let home = lookup("HOME");
+    if let Some(dir) = lookup("SPAWN_SHARED_BUILD_CACHE_DIR")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return validate_shared_build_cache_dir(
+            &dir,
+            "SPAWN_SHARED_BUILD_CACHE_DIR",
+            home.as_deref(),
+        )
+        .map(Some);
+    }
+    if toggle == Some(true) {
+        let Some(ws) = workspace_root else {
+            return Err(
+                "SPAWN_SHARED_BUILD_CACHES=1 requires a workspace root (set --root / SPAWN_WORKSPACE_ROOT or SPAWN_SHARED_BUILD_CACHE_DIR)"
+                    .to_string(),
+            );
+        };
+        if !ws.is_absolute()
+            || ws
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+            || normalize_cache_path(ws) == Path::new("/")
+        {
+            return Err(format!(
+                "SPAWN_SHARED_BUILD_CACHES requires a valid non-root workspace path, not {:?}",
+                ws.display()
+            ));
+        }
+        let default_dir = normalize_cache_path(ws).join(".caches");
+        return validate_shared_build_cache_dir(
+            &default_dir.display().to_string(),
+            "SPAWN_SHARED_BUILD_CACHES",
+            home.as_deref(),
+        )
+        .map(Some);
+    }
+    Ok(None)
+}
+
+/// Compute the 8 zero-secret build cache environment variables under `cache_root`,
+/// preserving any non-empty caller-supplied single-tool override.
+pub(crate) fn shared_build_cache_env(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    cache_root: &Path,
+) -> Vec<(String, String)> {
+    let mut entries = Vec::with_capacity(SHARED_BUILD_CACHE_VARS.len());
+    for (var, subdir) in SHARED_BUILD_CACHE_VARS {
+        let value = lookup(var)
+            .filter(|raw| !raw.trim().is_empty())
+            .unwrap_or_else(|| cache_root.join(subdir).display().to_string());
+        entries.push(((*var).to_string(), value));
+    }
+    entries
+}
+
+fn ensure_shared_build_cache_dirs(cache_root: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(cache_root).map_err(|error| {
+        format!(
+            "create shared build cache directory {}: {error}",
+            cache_root.display()
+        )
+    })?;
+    for (_, subdir) in SHARED_BUILD_CACHE_VARS {
+        let dir = cache_root.join(subdir);
+        std::fs::create_dir_all(&dir).map_err(|error| {
+            format!(
+                "create shared build cache subdirectory {}: {error}",
+                dir.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn apply_shared_build_cache_mount(cfg: &mut spawn_host::ViewConfig, cache_root: &Path) {
+    let target_norm = normalize_cache_path(cache_root);
+    let target_canon = std::fs::canonicalize(&target_norm).ok();
+    if let Some(existing) = cfg.extra_mounts.iter_mut().find(|mount| {
+        let mount_norm = normalize_cache_path(&mount.path);
+        mount_norm == target_norm
+            || target_canon.as_ref().is_some_and(|canon| {
+                std::fs::canonicalize(&mount_norm).ok().as_ref() == Some(canon)
+            })
+    }) {
+        existing.writable = true;
+        return;
+    }
+    cfg.extra_mounts.push(spawn_host::ExtraMount {
+        path: target_norm,
+        writable: true,
+    });
+}
+
+struct SharedBuildCachePlan {
+    root: Option<PathBuf>,
+    env: Vec<(String, String)>,
+}
+
+fn prepare_shared_build_caches(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    workspace_root: &Path,
+) -> Result<SharedBuildCachePlan, String> {
+    let Some(cache_root) = resolve_shared_build_cache(lookup, Some(workspace_root))? else {
+        return Ok(SharedBuildCachePlan {
+            root: None,
+            env: Vec::new(),
+        });
+    };
+    ensure_shared_build_cache_dirs(&cache_root)?;
+    let env = shared_build_cache_env(lookup, &cache_root);
+    Ok(SharedBuildCachePlan {
+        root: Some(cache_root),
+        env,
+    })
 }
 
 /// Forward a non-empty environment variable verbatim to engine panes.
@@ -988,7 +1318,7 @@ mod tests {
     }
     use spawn_core::bridge::LaunchEnvironment;
 
-    fn environment(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    fn environment(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let pairs: Vec<(String, String)> = pairs
             .iter()
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
@@ -1744,5 +2074,209 @@ mod tests {
         for secret in ["StrictSecret11", "StrictQuery22", "JudgeSec33", "JTok44"] {
             assert!(!err.contains(secret), "secret {secret} leaked: {err}");
         }
+    }
+
+    #[test]
+    fn shared_build_caches_default_off_and_explicit_toggle_off() {
+        use super::{resolve_shared_build_cache, view_config_for_backend};
+        use std::path::Path;
+
+        let ws = Path::new("/data01/spawn/workspaces");
+        for off in ["0", "false", "FALSE", "no", "off", "Off"] {
+            let env = environment(&[
+                ("HOME", "/home/owner"),
+                ("SPAWN_WORKSPACE_ROOT", "/data01/spawn/workspaces"),
+                ("SPAWN_SHARED_BUILD_CACHES", off),
+                ("SPAWN_SHARED_BUILD_CACHE_DIR", "/data01/custom-cache"),
+            ]);
+            assert_eq!(
+                resolve_shared_build_cache(&env, Some(ws)),
+                Ok(None),
+                "{off}"
+            );
+            let view = view_config_for_backend(&env, true);
+            assert!(view.extra_mounts.is_empty(), "{off}");
+        }
+
+        let unset = environment(&[
+            ("HOME", "/home/owner"),
+            ("SPAWN_WORKSPACE_ROOT", "/data01/spawn/workspaces"),
+        ]);
+        assert_eq!(resolve_shared_build_cache(&unset, Some(ws)), Ok(None));
+        assert!(
+            view_config_for_backend(&unset, true)
+                .extra_mounts
+                .is_empty()
+        );
+
+        let invalid_toggle = environment(&[("SPAWN_SHARED_BUILD_CACHES", "maybe")]);
+        assert!(resolve_shared_build_cache(&invalid_toggle, Some(ws)).is_err());
+    }
+
+    #[test]
+    fn shared_build_caches_opt_in_creates_subdirs_injects_vars_and_mounts_rw() {
+        use super::{
+            SHARED_BUILD_CACHE_VARS, prepare_shared_build_caches, view_config_for_backend,
+            view_config_for_backend_with_cache,
+        };
+        use std::path::PathBuf;
+
+        let base = std::env::temp_dir().join(format!("spawn-rt-caches-{}", std::process::id()));
+        let ws = base.join("ws");
+        std::fs::create_dir_all(&ws).expect("mkdir ws");
+        let expected_root = ws.join(".caches");
+
+        for val in ["1", "true", "YES", "on"] {
+            let env = environment(&[("HOME", "/home/owner"), ("SPAWN_SHARED_BUILD_CACHES", val)]);
+            let plan = prepare_shared_build_caches(&env, &ws).expect(val);
+            assert_eq!(plan.root.as_ref(), Some(&expected_root), "{val}");
+            assert_eq!(plan.env.len(), 8);
+            for (var, subdir) in SHARED_BUILD_CACHE_VARS {
+                let sub_path = expected_root.join(subdir);
+                assert!(sub_path.is_dir(), "missing {}", sub_path.display());
+                assert!(
+                    plan.env
+                        .contains(&((*var).to_string(), sub_path.display().to_string())),
+                    "missing {var} in {:?}",
+                    plan.env
+                );
+            }
+        }
+
+        // Sandbox ViewConfig keeps whitelist home isolation and adds a single RW ExtraMount.
+        let ro_existing = expected_root.display().to_string();
+        let mount_spec = format!("{ro_existing}:ro,/opt/tools:ro");
+        let env_mount = environment(&[
+            ("HOME", "/home/owner"),
+            ("SPAWN_WORKSPACE_ROOT", ws.to_str().expect("utf8")),
+            ("SPAWN_SHARED_BUILD_CACHES", "1"),
+            ("SPAWN_SANDBOX_HOME_ISOLATION", "whitelist"),
+            ("SPAWN_ENGINE_VIEW_WRITABLE", &mount_spec),
+        ]);
+        let view = view_config_for_backend(&env_mount, true);
+        assert_eq!(view.home_isolation, spawn_host::HomeIsolation::Whitelist);
+        let cache_mounts: Vec<&spawn_host::ExtraMount> = view
+            .extra_mounts
+            .iter()
+            .filter(|m| m.path == expected_root)
+            .collect();
+        assert_eq!(cache_mounts.len(), 1, "cache mount must be deduplicated");
+        assert!(cache_mounts[0].writable, "cache mount must be writable");
+        assert_eq!(view.extra_mounts.len(), 2);
+
+        let direct = view_config_for_backend_with_cache(
+            &environment(&[("HOME", "/home/owner")]),
+            true,
+            Some(&expected_root),
+        );
+        assert_eq!(
+            direct.extra_mounts,
+            vec![spawn_host::ExtraMount {
+                path: PathBuf::from(&expected_root),
+                writable: true,
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn shared_build_cache_dir_and_single_tool_overrides_preserve_caller_vars() {
+        use super::{prepare_shared_build_caches, shared_build_cache_env};
+        use std::path::PathBuf;
+
+        let base = std::env::temp_dir().join(format!("spawn-rt-override-{}", std::process::id()));
+        let ws = base.join("ws");
+        let custom = base.join("shared-custom");
+        std::fs::create_dir_all(&ws).expect("mkdir ws");
+        let custom_with_slash = format!("{}/", custom.display());
+
+        // `SPAWN_SHARED_BUILD_CACHE_DIR` alone enables caching at that custom path
+        // and keeps caller-set `CCACHE_DIR` and `GOCACHE` untouched.
+        let env = environment(&[
+            ("HOME", "/home/owner"),
+            ("SPAWN_SHARED_BUILD_CACHE_DIR", &custom_with_slash),
+            ("CCACHE_DIR", "/data01/caller/ccache"),
+            ("GOCACHE", "/data01/caller/go-build"),
+            ("PIP_CACHE_DIR", "  "),
+        ]);
+        let plan = prepare_shared_build_caches(&env, &ws).expect("custom cache");
+        assert_eq!(plan.root, Some(custom.clone()));
+        let expected: Vec<(String, String)> = vec![
+            ("ZIG_GLOBAL_CACHE_DIR", custom.join("zig")),
+            ("CCACHE_DIR", PathBuf::from("/data01/caller/ccache")),
+            ("UV_CACHE_DIR", custom.join("uv")),
+            ("SCCACHE_DIR", custom.join("sccache")),
+            ("PIP_CACHE_DIR", custom.join("pip")),
+            ("NPM_CONFIG_CACHE", custom.join("npm")),
+            ("GOMODCACHE", custom.join("go-mod")),
+            ("GOCACHE", PathBuf::from("/data01/caller/go-build")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.display().to_string()))
+        .collect();
+        assert_eq!(plan.env, expected);
+
+        let rechecked = shared_build_cache_env(&env, &custom);
+        assert_eq!(rechecked, expected);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn shared_build_caches_reject_relative_traversal_and_sensitive_dirs() {
+        use super::resolve_shared_build_cache;
+        use std::path::Path;
+
+        let ws = Path::new("/data01/spawn/workspaces");
+        for bad in [
+            "caches",
+            "./caches",
+            "~/caches",
+            "/data01/caches/../etc",
+            "/data01/../caches",
+            "/",
+            "/tmp",
+            "/etc",
+            "/etc/spawn-cache",
+            "/run",
+            "/run/keep",
+            "/run/keep/secrets",
+            "/run/keep-test",
+            "/run/keep-test/sub",
+            "/var/run/keep",
+            "/var/tmp",
+            "/home",
+            "/home/owner",
+        ] {
+            let env = environment(&[
+                ("HOME", "/home/owner"),
+                ("SPAWN_SHARED_BUILD_CACHE_DIR", bad),
+            ]);
+            assert!(
+                resolve_shared_build_cache(&env, Some(ws)).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+
+        // Symlink resolving into a sensitive directory is also rejected.
+        let base = std::env::temp_dir().join(format!("spawn-rt-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("mkdir base");
+        let sneak = base.join("sneaky-etc");
+        std::os::unix::fs::symlink("/etc", &sneak).expect("symlink");
+        let env = environment(&[
+            ("HOME", "/home/owner"),
+            (
+                "SPAWN_SHARED_BUILD_CACHE_DIR",
+                sneak.to_str().expect("utf8"),
+            ),
+        ]);
+        assert!(resolve_shared_build_cache(&env, Some(ws)).is_err());
+
+        // `SPAWN_SHARED_BUILD_CACHES=1` without any workspace root refuses cleanly.
+        let no_ws = environment(&[("SPAWN_SHARED_BUILD_CACHES", "1")]);
+        assert!(resolve_shared_build_cache(&no_ws, None).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -98,12 +98,25 @@ pub(crate) struct Plan {
 /// The build caches' roots, from the environment `env` gives: the XDG
 /// cache (`$XDG_CACHE_HOME`, else `$HOME/.cache`, counted whether or not it
 /// is there yet), Bun's install cache (`$BUN_INSTALL_CACHE_DIR`, else
-/// `$HOME/.bun/install/cache`) and pnpm's store (`$PNPM_HOME/store`, else
-/// `$HOME/.local/share/pnpm/store`), each of those two only when it is a
-/// directory. Each root once, by its canonical path (a cache reached two
-/// ways, through a symlink or a variable naming another's root, is counted
-/// once), in that order.
+/// `$HOME/.bun/install/cache`), pnpm's store (`$PNPM_HOME/store`, else
+/// `$HOME/.local/share/pnpm/store`), and any opt-in shared host build cache
+/// resolved via [`crate::runtime::resolve_shared_build_cache`] when present.
+/// Each of those optional roots is counted only when it is a directory, and
+/// each root once by its canonical path (a cache reached two ways, through a
+/// symlink or a variable naming another's root, is counted once), in that
+/// order.
+#[cfg(test)]
 pub(crate) fn build_cache_roots(env: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+    build_cache_roots_for(None, env)
+}
+
+/// Like [`build_cache_roots`], using explicit `workspace_root` (when supplied)
+/// before falling back to `SPAWN_WORKSPACE_ROOT` in `env` to resolve opt-in
+/// `<workspace_root>/.caches`.
+pub(crate) fn build_cache_roots_for(
+    workspace_root: Option<&Path>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
     let var = |name: &str| {
         env(name)
             .filter(|value| !value.trim().is_empty())
@@ -116,10 +129,19 @@ pub(crate) fn build_cache_roots(env: impl Fn(&str) -> Option<String>) -> Vec<Pat
     let pnpm = var("PNPM_HOME")
         .map(|pnpm| pnpm.join("store"))
         .or_else(|| under_home(".local/share/pnpm/store"));
+    let effective_ws = workspace_root
+        .map(Path::to_path_buf)
+        .or_else(|| var("SPAWN_WORKSPACE_ROOT"));
+    let shared = crate::runtime::resolve_shared_build_cache(&env, effective_ws.as_deref())
+        .ok()
+        .flatten();
     let present = |path: Option<PathBuf>| path.filter(|path| path.is_dir());
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut seen: Vec<PathBuf> = Vec::new();
-    for root in [xdg, present(bun), present(pnpm)].into_iter().flatten() {
+    for root in [xdg, present(bun), present(pnpm), present(shared)]
+        .into_iter()
+        .flatten()
+    {
         let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
         if seen.contains(&canonical) {
             continue;
@@ -128,11 +150,6 @@ pub(crate) fn build_cache_roots(env: impl Fn(&str) -> Option<String>) -> Vec<Pat
         roots.push(root);
     }
     roots
-}
-
-/// The build caches' roots now ([`build_cache_roots`]).
-fn build_cache() -> Vec<PathBuf> {
-    build_cache_roots(crate::env_value)
 }
 
 /// The script `SPAWN_STORAGE_EXTENTS` names, else the one beside the binary.
@@ -186,7 +203,7 @@ pub(crate) fn plan(root: Option<&Path>, settings: &StorageBytesSettings) -> Plan
         sources: sources(
             root,
             crate::storage::projects_path(),
-            build_cache(),
+            build_cache_roots_for(root, crate::env_value),
             settings,
         ),
         session_status: crate::storage::session_backup_status(),
@@ -773,3 +790,128 @@ fn summary(sources: &Map<String, Value>) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod shared_cache_tests {
+    use super::build_cache_roots_for;
+    use std::path::PathBuf;
+
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, val)| (*val).to_string())
+                .filter(|val| !val.is_empty())
+        }
+    }
+
+    #[test]
+    fn shared_build_cache_roots_opt_in_and_dedup() {
+        let base = std::env::temp_dir().join(format!(
+            "spawn-sb-shared-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let ws = base.join("workspaces");
+        let xdg = base.join("xdg");
+        let shared_default = ws.join(".caches");
+        let custom = base.join("custom-caches");
+        std::fs::create_dir_all(&ws).expect("ws");
+        std::fs::create_dir_all(&xdg).expect("xdg");
+        std::fs::create_dir_all(&shared_default).expect("shared_default");
+        std::fs::create_dir_all(&custom).expect("custom");
+
+        // Default off: `<ws>/.caches` is ignored even though it exists on disk.
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&ws),
+                env_of(&[("XDG_CACHE_HOME", xdg.to_str().expect("utf8"))])
+            ),
+            vec![xdg.clone()]
+        );
+
+        // Opt-in via `SPAWN_SHARED_BUILD_CACHES=1` with explicit workspace root.
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&ws),
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    ("SPAWN_SHARED_BUILD_CACHES", "1"),
+                ])
+            ),
+            vec![xdg.clone(), shared_default.clone()]
+        );
+
+        // Opt-in via `SPAWN_WORKSPACE_ROOT` fallback when `workspace_root` arg is None.
+        assert_eq!(
+            build_cache_roots_for(
+                None,
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    ("SPAWN_WORKSPACE_ROOT", ws.to_str().expect("utf8")),
+                    ("SPAWN_SHARED_BUILD_CACHES", "true"),
+                ])
+            ),
+            vec![xdg.clone(), shared_default.clone()]
+        );
+
+        // Explicit `SPAWN_SHARED_BUILD_CACHE_DIR` picks the custom dir instead of `.caches`.
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&ws),
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    (
+                        "SPAWN_SHARED_BUILD_CACHE_DIR",
+                        custom.to_str().expect("utf8")
+                    ),
+                ])
+            ),
+            vec![xdg.clone(), custom.clone()]
+        );
+
+        // Dedup: identical path to `XDG_CACHE_HOME` or symlink targeting `XDG_CACHE_HOME` counts once.
+        let link = base.join("shared-link");
+        std::os::unix::fs::symlink(&xdg, &link).expect("symlink");
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&ws),
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    ("SPAWN_SHARED_BUILD_CACHE_DIR", link.to_str().expect("utf8")),
+                ])
+            ),
+            vec![xdg.clone()]
+        );
+
+        // Missing shared cache directory is not counted; invalid path is safely skipped.
+        let missing_ws = base.join("missing-ws");
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&missing_ws),
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    ("SPAWN_SHARED_BUILD_CACHES", "1"),
+                ])
+            ),
+            vec![xdg.clone()]
+        );
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&ws),
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    ("SPAWN_SHARED_BUILD_CACHE_DIR", "/etc"),
+                ])
+            ),
+            vec![xdg]
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _: Vec<PathBuf> = Vec::new();
+    }
+}
