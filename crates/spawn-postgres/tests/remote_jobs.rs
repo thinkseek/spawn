@@ -437,7 +437,10 @@ fn an_idle_node_still_beats_every_five_seconds() {
             idle["next_beat_ms"], 5000,
             "beat {seq}: an idle node beats every 5 s, inside the 30 s queue wait"
         );
-        assert_eq!(idle["lease_ttl_s"], 90, "beat {seq}: the lease TTL is unchanged");
+        assert_eq!(
+            idle["lease_ttl_s"], 90,
+            "beat {seq}: the lease TTL is unchanged"
+        );
     }
 }
 
