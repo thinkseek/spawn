@@ -26,7 +26,8 @@ pub const MIN_GIT: (u32, u32) = (2, 43);
 pub const CONFIG_USAGE: &str = "\
 usage: spawn config check [--config <path>] [--json]
        spawn config effective [--config <path>] [--json]
-       spawn config init --data-dir <dir> [--name <name>] [--output <file>]";
+       spawn config init --data-dir <dir> [--name <name>] [--output <file>] [--from-host]
+       spawn config docker-plan [--config <path>] [--data-dir <dir>] [--image <image>] [--json]";
 
 /// Usage text for `spawn doctor` (referenced by `main.rs` help contract).
 pub const DOCTOR_USAGE: &str = "usage: spawn doctor [--config <path>] [--root <dir>] [--json]";
@@ -355,6 +356,10 @@ pub struct SandboxConfig {
     pub auto_approve: Option<String>,
     #[serde(default)]
     pub writable_mounts: Option<Vec<MountSpec>>,
+    #[serde(default)]
+    pub inherit_host: Option<String>,
+    #[serde(default)]
+    pub inherit_host_paths: Option<Vec<PathBuf>>,
 }
 
 impl Default for SandboxConfig {
@@ -364,6 +369,8 @@ impl Default for SandboxConfig {
             home_isolation: default_home_isolation(),
             auto_approve: default_auto_approve(),
             writable_mounts: None,
+            inherit_host: None,
+            inherit_host_paths: None,
         }
     }
 }
@@ -418,6 +425,8 @@ pub struct ClaudeConfig {
     pub enabled: bool,
     #[serde(default)]
     pub config_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub sandbox: Option<bool>,
 }
 
 impl Default for ClaudeConfig {
@@ -425,6 +434,7 @@ impl Default for ClaudeConfig {
         Self {
             enabled: true,
             config_dir: None,
+            sandbox: None,
         }
     }
 }
@@ -447,6 +457,7 @@ pub struct DerivedPaths {
     pub cas: PathBuf,
     pub transcripts: PathBuf,
     pub agy_data_dir: PathBuf,
+    pub claude_data_dir: PathBuf,
     pub tmp: PathBuf,
     pub herdr: PathBuf,
     pub xdg_config: PathBuf,
@@ -454,12 +465,13 @@ pub struct DerivedPaths {
 }
 
 impl DerivedPaths {
-    fn all(&self) -> [&Path; 8] {
+    fn all(&self) -> [&Path; 9] {
         [
             &self.workspaces,
             &self.cas,
             &self.transcripts,
             &self.agy_data_dir,
+            &self.claude_data_dir,
             &self.tmp,
             &self.herdr,
             &self.xdg_config,
@@ -536,6 +548,7 @@ impl SpawnConfig {
             cas: base.join("cas"),
             transcripts: base.join("transcripts"),
             agy_data_dir: base.join("engines").join("agy"),
+            claude_data_dir: base.join("engines").join("claude"),
             tmp: base.join("tmp"),
             herdr: base.join("herdr"),
             xdg_config: base.join("xdg-config"),
@@ -774,10 +787,10 @@ impl SpawnConfig {
 
     fn validate_sandbox(&self) -> Result<(), String> {
         if let Some(mode) = &self.sandbox.mode
-            && !matches!(mode.as_str(), "required" | "off")
+            && !matches!(mode.as_str(), "required" | "container" | "off")
         {
             return Err(format!(
-                "[sandbox].mode = {mode:?} is invalid: expected \"required\" or \"off\""
+                "[sandbox].mode = {mode:?} is invalid: expected \"required\", \"container\", or \"off\""
             ));
         }
         if let Some(iso) = &self.sandbox.home_isolation
@@ -793,6 +806,29 @@ impl SpawnConfig {
             return Err(format!(
                 "[sandbox].auto_approve = {approve:?} is invalid: expected \"off\", \"startup\", or \"all\""
             ));
+        }
+        if let Some(inherit) = &self.sandbox.inherit_host
+            && !matches!(inherit.as_str(), "off" | "auto")
+        {
+            return Err(format!(
+                "[sandbox].inherit_host = {inherit:?} is invalid: expected \"off\" or \"auto\""
+            ));
+        }
+        if let Some(paths) = &self.sandbox.inherit_host_paths {
+            for entry in paths {
+                let raw = entry.to_string_lossy();
+                if raw == "~" || raw == "/" || raw.contains(':') || raw.contains(',') {
+                    return Err(format!(
+                        "[sandbox].inherit_host_paths entry {raw:?} cannot be '/', '~', or contain ':' or ','"
+                    ));
+                }
+                validate_tilde_or_abs(entry, "[sandbox].inherit_host_paths")?;
+                if entry.is_absolute() && normalize_lexically(entry) == Path::new("/") {
+                    return Err(
+                        "[sandbox].inherit_host_paths entry cannot resolve to '/'".to_string()
+                    );
+                }
+            }
         }
         if let Some(mounts) = &self.sandbox.writable_mounts {
             for spec in mounts {
@@ -1075,7 +1111,7 @@ pub fn resolve_env_entries_with(
     resolve_storage_env(cfg, &mut entries);
     resolve_terminal_env(cfg, env_lookup, &mut entries);
     resolve_engines_env(cfg, &derived, env_lookup, &mut entries)?;
-    resolve_sandbox_and_network_env(cfg, &derived, &mut entries);
+    resolve_sandbox_and_network_env(cfg, &derived, env_lookup, &mut entries)?;
 
     Ok(entries.into_iter().collect())
 }
@@ -1216,13 +1252,21 @@ fn resolve_engines_env(
     }
     if cfg.engines.claude.as_ref().is_none_or(|c| c.enabled)
         && let Some(claude) = &cfg.engines.claude
-        && let Some(dir) = &claude.config_dir
     {
-        let expanded = expand_tilde(dir, env_lookup)?;
-        entries.insert(
-            "SPAWN_CLAUDE_CONFIG_DIR".to_string(),
-            expanded.display().to_string(),
-        );
+        if let Some(dir) = &claude.config_dir {
+            let expanded = expand_tilde(dir, env_lookup)?;
+            entries.insert(
+                "SPAWN_CLAUDE_CONFIG_DIR".to_string(),
+                expanded.display().to_string(),
+            );
+        }
+        if claude.sandbox == Some(true) {
+            entries.insert("SPAWN_CLAUDE_SANDBOX".to_string(), "1".to_string());
+            entries.insert(
+                "SPAWN_CLAUDE_DATA_DIR".to_string(),
+                derived.claude_data_dir.display().to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -1230,8 +1274,9 @@ fn resolve_engines_env(
 fn resolve_sandbox_and_network_env(
     cfg: &SpawnConfig,
     derived: &DerivedPaths,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
     entries: &mut BTreeMap<String, String>,
-) {
+) -> Result<(), String> {
     entries.insert(
         "SPAWN_ENGINE_VIEW".to_string(),
         cfg.sandbox
@@ -1254,6 +1299,21 @@ fn resolve_sandbox_and_network_env(
             .collect::<Vec<_>>()
             .join(",");
         entries.insert("SPAWN_ENGINE_VIEW_WRITABLE".to_string(), joined);
+    }
+    if let Some(inherit) = &cfg.sandbox.inherit_host {
+        entries.insert("SPAWN_SANDBOX_INHERIT_HOST".to_string(), inherit.clone());
+    }
+    if let Some(paths) = &cfg.sandbox.inherit_host_paths
+        && !paths.is_empty()
+    {
+        let mut expanded = Vec::with_capacity(paths.len());
+        for path in paths {
+            expanded.push(expand_tilde(path, env_lookup)?.display().to_string());
+        }
+        entries.insert(
+            "SPAWN_SANDBOX_INHERIT_HOST_PATHS".to_string(),
+            expanded.join(","),
+        );
     }
     entries.insert(
         "SPAWN_SANDBOX_HOME_ISOLATION".to_string(),
@@ -1309,6 +1369,7 @@ fn resolve_sandbox_and_network_env(
         entries.insert("no_proxy".to_string(), joined.clone());
         entries.insert("NO_PROXY".to_string(), joined);
     }
+    Ok(())
 }
 
 fn is_secret_env_name(name: &str) -> bool {
@@ -1851,7 +1912,7 @@ fn parse_config_flag(
     })
 }
 
-/// Entrypoint for `spawn config <check|effective|init>`.
+/// Entrypoint for `spawn config <check|effective|init|docker-plan>`.
 pub fn config_command(global_config: Option<&str>, rest: &[String]) -> Result<i32, String> {
     let Some((verb, args)) = rest.split_first() else {
         return Err(CONFIG_USAGE.to_string());
@@ -1860,6 +1921,7 @@ pub fn config_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
         "check" => cmd_config_check(global_config, args),
         "effective" => cmd_config_effective(global_config, args),
         "init" => cmd_config_init(args),
+        "docker-plan" => cmd_config_docker_plan(global_config, args),
         other => Err(format!(
             "unknown `spawn config` verb {other:?}\n{CONFIG_USAGE}"
         )),
@@ -1921,7 +1983,7 @@ fn cmd_config_effective(global_config: Option<&str>, args: &[String]) -> Result<
 }
 
 fn cmd_config_init(args: &[String]) -> Result<i32, String> {
-    let parsed = parse_config_flag(args, None, &[], &["data-dir", "name", "output"])?;
+    let parsed = parse_config_flag(args, None, &["from-host"], &["data-dir", "name", "output"])?;
     let data_dir_str = parsed
         .values
         .get("data-dir")
@@ -1934,8 +1996,11 @@ fn cmd_config_init(args: &[String]) -> Result<i32, String> {
         .get("name")
         .cloned()
         .unwrap_or_else(default_instance_name);
-    let toml_text = render_init_toml(&name, &data_dir);
-    // Self-check that generated TOML parses and validates cleanly.
+    let toml_text = if parsed.switches.contains("from-host") {
+        render_from_host_toml(&name, &data_dir)
+    } else {
+        render_init_toml(&name, &data_dir)
+    };
     SpawnConfig::from_toml_str(&toml_text)?;
 
     if let Some(output) = parsed.values.get("output") {
@@ -1961,13 +2026,13 @@ fn cmd_config_init(args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
+fn escape_toml_str(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn render_init_toml(name: &str, data_dir: &Path) -> String {
-    let dir_escaped = data_dir
-        .display()
-        .to_string()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    let name_escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    let dir_escaped = escape_toml_str(&data_dir.display().to_string());
+    let name_escaped = escape_toml_str(name);
     format!(
         r#"schema_version = 1
 
@@ -2019,6 +2084,356 @@ enabled = true
     )
 }
 
+const HOST_SAFE_INHERIT_DIRS: &[&str] = &[
+    ".rustup",
+    ".cargo/bin",
+    ".nvm",
+    ".pyenv",
+    ".asdf",
+    ".mise",
+    ".local/opt",
+    ".local/share/mise",
+];
+
+const HOST_SAFE_INHERIT_FILES: &[&str] = &[".cargo/config.toml", ".cargo/config"];
+
+struct HostInheritScan {
+    home: Option<PathBuf>,
+    safe_dirs: Vec<(String, PathBuf)>,
+    safe_files: Vec<(String, PathBuf)>,
+    gitconfig: Option<PathBuf>,
+    skipped: Vec<Value>,
+}
+
+fn scan_host_inherit_home(home: Option<&Path>) -> HostInheritScan {
+    let mut scan = HostInheritScan {
+        home: home.map(Path::to_path_buf),
+        safe_dirs: Vec::new(),
+        safe_files: Vec::new(),
+        gitconfig: None,
+        skipped: Vec::new(),
+    };
+    let Some(home_dir) = home.filter(|p| p.is_dir()) else {
+        return scan;
+    };
+    for rel in HOST_SAFE_INHERIT_DIRS {
+        let candidate = home_dir.join(rel);
+        if candidate.is_dir() {
+            scan.safe_dirs.push(((*rel).to_string(), candidate));
+        }
+    }
+    for rel in HOST_SAFE_INHERIT_FILES {
+        let candidate = home_dir.join(rel);
+        if candidate.is_file() {
+            scan.safe_files.push(((*rel).to_string(), candidate));
+        }
+    }
+    let gitcfg = home_dir.join(".gitconfig");
+    if gitcfg.is_file() {
+        match fs::read_to_string(&gitcfg) {
+            Ok(text) if spawn_host::engine_view::gitconfig_has_no_inline_secrets(&text) => {
+                scan.gitconfig = Some(gitcfg);
+            }
+            Ok(_) => scan.skipped.push(json!({
+                "path": gitcfg,
+                "reason": "contains inline credentials or auth headers",
+            })),
+            Err(error) => scan.skipped.push(json!({
+                "path": gitcfg,
+                "reason": format!("unreadable: {error}"),
+            })),
+        }
+    }
+    scan
+}
+
+fn scan_host_inherit() -> HostInheritScan {
+    let home = std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute());
+    scan_host_inherit_home(home.as_deref())
+}
+
+fn find_program_with_common_dirs(name: &str) -> Option<PathBuf> {
+    let mut dirs: Vec<String> = Vec::new();
+    if let Ok(path_env) = std::env::var("PATH") {
+        for part in path_env.split(':').filter(|s| !s.is_empty()) {
+            dirs.push(part.to_string());
+        }
+    }
+    for extra in ["/data00/spawn-toolchain/bin"] {
+        if !dirs.iter().any(|d| d == extra) {
+            dirs.push(extra.to_string());
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        for rel in [".local/bin", ".cargo/bin"] {
+            let p = PathBuf::from(&home).join(rel).display().to_string();
+            if !dirs.iter().any(|d| d == &p) {
+                dirs.push(p);
+            }
+        }
+    }
+    find_program_in_paths(name, &dirs)
+}
+
+fn render_from_host_toml(name: &str, data_dir: &Path) -> String {
+    let dir_escaped = escape_toml_str(&data_dir.display().to_string());
+    let name_escaped = escape_toml_str(name);
+    let view_cfg = spawn_host::ViewConfig::from_env(&|k| std::env::var(k).ok());
+    let bwrap_cap = spawn_host::probe_bwrap("bwrap", &view_cfg);
+    let sandbox_mode = match bwrap_cap {
+        spawn_host::BwrapCapability::BlockedInContainer(_) => "container",
+        _ => "required",
+    };
+
+    let mut toolchain_dirs: Vec<String> = Vec::new();
+    for tool in ["git", "herdr", "bwrap", "claude", "agy"] {
+        if let Some(found) = find_program_with_common_dirs(tool)
+            && let Some(parent) = found.parent()
+        {
+            let p = parent.display().to_string();
+            if !matches!(
+                p.as_str(),
+                "/usr/bin" | "/bin" | "/usr/local/bin" | "/usr/sbin" | "/sbin"
+            ) && !toolchain_dirs.contains(&p)
+            {
+                toolchain_dirs.push(p);
+            }
+        }
+    }
+    let toolchain_toml = toolchain_dirs
+        .iter()
+        .map(|d| format!("\"{}\"", escape_toml_str(d)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let has_agy = find_program_with_common_dirs("agy").is_some()
+        || std::env::var("HOME")
+            .ok()
+            .is_some_and(|h| Path::new(&h).join(".gemini/antigravity-cli").is_dir());
+    let claude_sandbox =
+        matches!(bwrap_cap, spawn_host::BwrapCapability::Ready) || sandbox_mode == "container";
+    let agy_block = if has_agy {
+        r#"
+[engines.agy]
+enabled = true
+auth_source = "~/.gemini/antigravity-cli"
+isolate_workers = true
+isolate_brain = true
+"#
+    } else {
+        r#"
+# [engines.agy]
+# enabled = true
+# auth_source = "~/.gemini/antigravity-cli"
+# isolate_workers = true
+# isolate_brain = true
+"#
+    };
+
+    format!(
+        r#"schema_version = 1
+
+[instance]
+name = "{name_escaped}"
+data_dir = "{dir_escaped}"
+
+[server]
+listen = "127.0.0.1:8787"
+auth = "local-open"
+
+[storage]
+workspace_backend = "auto"
+canonical_mount = "/workspace"
+cas_dedup = true
+
+[terminal]
+backend = "herdr"
+toolchain_paths = [{toolchain_toml}]
+
+[sandbox]
+mode = "{sandbox_mode}"
+home_isolation = "whitelist"
+inherit_host = "auto"
+auto_approve = "startup"
+writable_mounts = []
+
+[engines.claude]
+enabled = true
+sandbox = {claude_sandbox}
+{agy_block}"#
+    )
+}
+
+fn shell_quote_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=,@+".contains(c))
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn collect_docker_readonly_mounts(
+    scan: &HostInheritScan,
+    config_path: Option<&Path>,
+) -> Vec<(String, String)> {
+    let container_home = Path::new("/home/spawn");
+    let mut readonly_mounts: Vec<(String, String)> = Vec::new();
+    for (rel, host_path) in &scan.safe_dirs {
+        readonly_mounts.push((
+            host_path.display().to_string(),
+            container_home.join(rel).display().to_string(),
+        ));
+    }
+    for (rel, host_path) in &scan.safe_files {
+        readonly_mounts.push((
+            host_path.display().to_string(),
+            container_home.join(rel).display().to_string(),
+        ));
+    }
+    if let Some(gitcfg) = &scan.gitconfig {
+        readonly_mounts.push((
+            gitcfg.display().to_string(),
+            container_home.join(".gitconfig").display().to_string(),
+        ));
+    }
+    if let Some(cfg_path) = config_path {
+        readonly_mounts.push((
+            cfg_path.display().to_string(),
+            "/etc/spawn/spawn.toml".to_string(),
+        ));
+    }
+    readonly_mounts
+}
+
+fn build_docker_plan_report(
+    config_path: Option<&Path>,
+    data_dir: &Path,
+    repo: Option<&Path>,
+    image: &str,
+) -> Value {
+    let scan = scan_host_inherit();
+    let readonly_mounts = collect_docker_readonly_mounts(&scan, config_path);
+    let mut writable_mounts = vec![(data_dir.display().to_string(), "/var/lib/spawn".to_string())];
+    if let Some(repo_path) = repo {
+        writable_mounts.push((repo_path.display().to_string(), "/repo".to_string()));
+    }
+
+    let mut env = BTreeMap::from([
+        ("SPAWN_ENGINE_VIEW".to_string(), "container".to_string()),
+        ("SPAWN_SANDBOX_INHERIT_HOST".to_string(), "auto".to_string()),
+        ("SPAWN_TERMINAL_BACKEND".to_string(), "herdr".to_string()),
+    ]);
+    if config_path.is_some() {
+        env.insert(
+            "SPAWN_CONFIG".to_string(),
+            "/etc/spawn/spawn.toml".to_string(),
+        );
+    }
+    if repo.is_some() {
+        env.insert("SPAWN_GIT_REPO".to_string(), "/repo".to_string());
+    }
+    for var in [
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+    ] {
+        if let Ok(val) = std::env::var(var)
+            && !val.is_empty()
+            && !url_has_userinfo(&val)
+        {
+            env.insert(var.to_string(), val);
+        }
+    }
+
+    let mut docker_tokens = vec![
+        "docker".to_string(),
+        "run".to_string(),
+        "--rm".to_string(),
+        "-i".to_string(),
+    ];
+    for (k, v) in &env {
+        docker_tokens.push("-e".to_string());
+        docker_tokens.push(format!("{k}={v}"));
+    }
+    for (src, dst) in &writable_mounts {
+        docker_tokens.push("-v".to_string());
+        docker_tokens.push(format!("{src}:{dst}:rw"));
+    }
+    for (src, dst) in &readonly_mounts {
+        docker_tokens.push("-v".to_string());
+        docker_tokens.push(format!("{src}:{dst}:ro"));
+    }
+    docker_tokens.push(image.to_string());
+    docker_tokens.extend(["doctor".to_string(), "--json".to_string()]);
+    let docker_command = docker_tokens
+        .iter()
+        .map(|tok| shell_quote_arg(tok))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    json!({
+        "ok": true,
+        "image": image,
+        "data_dir": data_dir,
+        "repo": repo,
+        "env": env,
+        "writable_mounts": writable_mounts.iter().map(|(s, d)| json!({ "host": s, "container": d, "mode": "rw" })).collect::<Vec<_>>(),
+        "readonly_mounts": readonly_mounts.iter().map(|(s, d)| json!({ "host": s, "container": d, "mode": "ro" })).collect::<Vec<_>>(),
+        "skipped_host_paths": scan.skipped,
+        "docker_command": docker_command,
+    })
+}
+
+fn cmd_config_docker_plan(global_config: Option<&str>, rest: &[String]) -> Result<i32, String> {
+    let parsed = parse_config_flag(rest, global_config, &["json"], &["data-dir", "image"])?;
+    let json_mode = parsed.switches.contains("json");
+    let loaded = parsed
+        .config_path
+        .as_ref()
+        .map(|p| SpawnConfig::from_file(p))
+        .transpose()?;
+    let data_dir = parsed
+        .values
+        .get("data-dir")
+        .map(PathBuf::from)
+        .or_else(|| loaded.as_ref().map(|cfg| cfg.instance.data_dir.clone()))
+        .ok_or_else(|| "missing data_dir: pass --config <path> or --data-dir <dir>".to_string())?;
+    validate_data_dir(&data_dir)?;
+    let repo = loaded
+        .as_ref()
+        .and_then(|cfg| cfg.instance.default_repo.clone());
+    let image = parsed
+        .values
+        .get("image")
+        .cloned()
+        .unwrap_or_else(|| "spawn:latest".to_string());
+
+    let plan = build_docker_plan_report(
+        parsed.config_path.as_deref(),
+        &data_dir,
+        repo.as_deref(),
+        &image,
+    );
+    if json_mode {
+        let rendered = serde_json::to_string_pretty(&plan)
+            .map_err(|error| format!("serialize docker plan: {error}"))?;
+        println!("{rendered}");
+    } else {
+        println!("{}", plan["docker_command"].as_str().unwrap_or_default());
+    }
+    Ok(0)
+}
+
 /// Entrypoint for `spawn doctor [--config <path>] [--root <dir>] [--json]`.
 pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i32, String> {
     let parsed = parse_config_flag(rest, global_config, &["json"], &["root"])?;
@@ -2050,6 +2465,10 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
     let herdr = probe_herdr(&toolchain_paths);
     let bwrap = probe_simple_tool("bwrap", &toolchain_paths);
     let zstd = probe_simple_tool("zstd", &toolchain_paths);
+    let container = spawn_host::detect_container();
+    let bwrap_capability = probe_bwrap_capability(&bwrap);
+    let host_inherit = probe_host_inherit();
+    let archive_mask_tool = probe_archive_mask_tool();
 
     let root_fs = df_filesystem_info(Path::new("/")).ok();
     let data_fs_target = explicit_root
@@ -2086,6 +2505,14 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
             "bwrap": bwrap,
             "zstd": zstd,
         },
+        "container": {
+            "in_container": container.in_container,
+            "runtime": container.runtime,
+            "signals": container.signals,
+        },
+        "bwrap_capability": bwrap_capability,
+        "host_inherit": host_inherit,
+        "archive_mask_tool": archive_mask_tool,
         "filesystems": {
             "root": root_fs,
             "target": data_fs,
@@ -2103,6 +2530,55 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
         print_doctor_human(&report);
     }
     Ok(0)
+}
+
+fn probe_bwrap_capability(bwrap_tool: &Value) -> Value {
+    let bwrap_prog = bwrap_tool["program"]
+        .as_str()
+        .filter(|_| bwrap_tool["installed"].as_bool().unwrap_or(false))
+        .unwrap_or("bwrap");
+    let cfg = spawn_host::ViewConfig::from_env(&|k| std::env::var(k).ok());
+    match spawn_host::probe_bwrap(bwrap_prog, &cfg) {
+        spawn_host::BwrapCapability::Ready => json!({ "status": "ready" }),
+        spawn_host::BwrapCapability::BlockedInContainer(reason) => json!({
+            "status": "blocked_in_container",
+            "reason": reason,
+        }),
+        spawn_host::BwrapCapability::Unavailable(reason) => json!({
+            "status": "unavailable",
+            "reason": reason,
+        }),
+    }
+}
+
+fn probe_host_inherit() -> Value {
+    let scan = scan_host_inherit();
+    json!({
+        "home": scan.home,
+        "safe_dirs": scan.safe_dirs.iter().map(|(rel, p)| json!({ "rel": rel, "path": p })).collect::<Vec<_>>(),
+        "safe_files": scan.safe_files.iter().map(|(rel, p)| json!({ "rel": rel, "path": p })).collect::<Vec<_>>(),
+        "gitconfig": scan.gitconfig,
+        "skipped": scan.skipped,
+    })
+}
+
+fn probe_archive_mask_tool() -> Value {
+    let mut candidates = vec![PathBuf::from(
+        "/usr/local/lib/spawn/redact/emit-locations.py",
+    )];
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("../lib/spawn/redact/emit-locations.py"));
+        for ancestor in dir.ancestors().take(5) {
+            candidates.push(ancestor.join("scripts/redact/emit-locations.py"));
+        }
+    }
+    let found = candidates.into_iter().find(|p| p.is_file());
+    json!({
+        "available": found.is_some(),
+        "path": found,
+    })
 }
 
 fn resolve_doctor_probe_root(explicit_root: Option<&Path>, cfg: Option<&SpawnConfig>) -> PathBuf {
@@ -2294,6 +2770,28 @@ fn print_doctor_human(report: &Value) {
             );
         }
     }
+    let in_ctr = report["container"]["in_container"]
+        .as_bool()
+        .unwrap_or(false);
+    let ctr_rt = report["container"]["runtime"].as_str().unwrap_or("none");
+    println!("container: {in_ctr} (runtime={ctr_rt})");
+    println!(
+        "bwrap_capability: {}",
+        report["bwrap_capability"]["status"]
+            .as_str()
+            .unwrap_or("unknown")
+    );
+    let inherit_dirs = report["host_inherit"]["safe_dirs"]
+        .as_array()
+        .map_or(0, Vec::len);
+    let has_gitcfg = !report["host_inherit"]["gitconfig"].is_null();
+    println!("host_inherit: safe_dirs={inherit_dirs}, gitconfig_safe={has_gitcfg}");
+    println!(
+        "archive_mask_tool: available={}",
+        report["archive_mask_tool"]["available"]
+            .as_bool()
+            .unwrap_or(false)
+    );
     println!(
         "storage ({}): cow={}, overlay={}",
         report["storage_probes"]["path"]

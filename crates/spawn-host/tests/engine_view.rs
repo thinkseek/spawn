@@ -159,6 +159,10 @@ impl Fixture {
             isolate_workers: false,
             isolate_brain: false,
             agy_program: None,
+            inherit_host: spawn_host::HostInheritMode::Off,
+            inherit_host_paths: Vec::new(),
+            claude_program: None,
+            claude_data_dir: None,
         }
     }
 
@@ -1314,4 +1318,312 @@ fn bwrap_v2_preserves_host_netns_loopback() {
     );
     assert_eq!(ok(&words, &script), "pong");
     handle.join().expect("server thread");
+}
+
+#[test]
+fn whitelist_inherit_host_auto_binds_safe_toolchains_and_skips_secret_gitconfig() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let rustup = fixture.home().join(".rustup/toolchains/stable");
+    let cargo_bin = fixture.home().join(".cargo/bin");
+    let cargo_cfg = fixture.home().join(".cargo/config.toml");
+    let cargo_creds = fixture.home().join(".cargo/credentials.toml");
+    let gitconfig = fixture.home().join(".gitconfig");
+    write(&rustup.join("marker"), "rustup-ok");
+    write(&cargo_bin.join("cargo-ok"), "cargo-bin-ok");
+    write(&cargo_cfg, "[net]\noffline = true\n");
+    write(&cargo_creds, "[registry]\ntoken = \"cio-secret-123\"\n");
+    write(
+        &gitconfig,
+        "[user]\n\tname = Tester\n\temail = tester@example.com\n",
+    );
+
+    let mut config = fixture.config();
+    config.home_isolation = spawn_host::HomeIsolation::Whitelist;
+    config.canonical_workspace = Some(PathBuf::from("/workspace"));
+    config.inherit_host = spawn_host::HostInheritMode::Auto;
+    let Some(view) = view(config) else {
+        return;
+    };
+    let (workspace, engine_home, _) = fixture.launch();
+    let words = view
+        .wrap(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: Some("w-inherit"),
+            exit_file: None,
+        })
+        .expect("wrap");
+
+    assert_eq!(
+        ok(
+            &words,
+            &format!("cat '{}'", rustup.join("marker").display())
+        ),
+        "rustup-ok"
+    );
+    assert_eq!(
+        ok(
+            &words,
+            &format!("cat '{}'", cargo_bin.join("cargo-ok").display())
+        ),
+        "cargo-bin-ok"
+    );
+    assert_eq!(
+        ok(&words, &format!("cat '{}'", cargo_cfg.display())),
+        "[net]\noffline = true"
+    );
+    assert_eq!(
+        ok(
+            &words,
+            &format!("git config --file '{}' user.name", gitconfig.display())
+        ),
+        "Tester"
+    );
+    fails(&words, &format!("cat '{}'", cargo_creds.display()));
+    // Inherited paths must remain read-only inside the sandbox.
+    fails(
+        &words,
+        &format!("touch '{}'", cargo_bin.join("mutated").display()),
+    );
+
+    // Inline secret in .gitconfig must cause it to be skipped cleanly.
+    write(
+        &gitconfig,
+        "[url \"https://x-access-token:ghp_secret@github.com/\"]\n\tinsteadOf = https://github.com/\n",
+    );
+    let plan = view
+        .plan(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: Some("w-inherit-secret"),
+            exit_file: None,
+        })
+        .expect("plan skips secret gitconfig");
+    assert!(
+        plan.skipped.iter().any(|(p, _)| p.ends_with(".gitconfig")),
+        "expected .gitconfig skipped: {:?}",
+        plan.skipped
+    );
+    let words_secret = view
+        .wrap(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: Some("w-inherit-secret"),
+            exit_file: None,
+        })
+        .expect("wrap");
+    fails(&words_secret, &format!("cat '{}'", gitconfig.display()));
+}
+
+#[test]
+fn explicit_inherit_host_paths_refuses_secrets_and_allows_safe_ro_paths() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let safe_dir = fixture.home().join(".local/share/custom-tools");
+    let cargo_dir = fixture.home().join(".cargo");
+    write(&safe_dir.join("tool"), "tool-ok");
+    write(&cargo_dir.join("credentials.toml"), "token = 'secret'\n");
+    write(&fixture.home().join(".ssh/id_ed25519"), "PRIVATE KEY");
+
+    let mut config = fixture.config();
+    config.home_isolation = spawn_host::HomeIsolation::Whitelist;
+    config.canonical_workspace = Some(PathBuf::from("/workspace"));
+    config.inherit_host_paths = vec![fixture.home().join(".ssh")];
+    let Some(view_bad_ssh) = view(config) else {
+        return;
+    };
+    let (workspace, engine_home, _) = fixture.launch();
+    assert!(
+        view_bad_ssh
+            .plan(&ViewedLaunch {
+                engine: "agy",
+                workspace: &workspace,
+                engine_home: &engine_home,
+                worker_id: Some("w-bad-ssh"),
+                exit_file: None,
+            })
+            .is_err()
+    );
+
+    let mut config_bad_dir = fixture.config();
+    config_bad_dir.home_isolation = spawn_host::HomeIsolation::Whitelist;
+    config_bad_dir.inherit_host_paths = vec![cargo_dir];
+    let view_bad_dir = BwrapView::new("bwrap", config_bad_dir).expect("bwrap");
+    assert!(
+        view_bad_dir
+            .plan(&ViewedLaunch {
+                engine: "agy",
+                workspace: &workspace,
+                engine_home: &engine_home,
+                worker_id: Some("w-bad-cargo"),
+                exit_file: None,
+            })
+            .is_err()
+    );
+
+    let mut config_ok = fixture.config();
+    config_ok.home_isolation = spawn_host::HomeIsolation::Whitelist;
+    config_ok.canonical_workspace = Some(PathBuf::from("/workspace"));
+    config_ok.inherit_host_paths = vec![safe_dir.clone()];
+    let view_ok = BwrapView::new("bwrap", config_ok).expect("bwrap");
+    let words = view_ok
+        .wrap(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: Some("w-safe"),
+            exit_file: None,
+        })
+        .expect("wrap");
+    assert_eq!(
+        ok(
+            &words,
+            &format!("cat '{}'", safe_dir.join("tool").display())
+        ),
+        "tool-ok"
+    );
+}
+
+#[test]
+fn claude_bwrap_sandbox_isolates_home_and_shares_projects_with_host() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let claude_home = fixture.home().join(".claude");
+    let host_projects = claude_home.join("projects/-workspace");
+    write(&claude_home.join("settings.json"), "{\"sandbox\":true}\n");
+    write(
+        &claude_home.join(".credentials.json"),
+        "{\"claudeAiOauth\":\"tok\"}\n",
+    );
+    write(&claude_home.join("history.jsonl"), "host-history-line\n");
+    write(
+        &fixture.home().join(".claude.json"),
+        "{\"hostSecret\":\"nope\"}\n",
+    );
+    write(&fixture.home().join(".ssh/id_rsa"), "SSH_SECRET");
+    std::fs::create_dir_all(&host_projects).expect("host projects");
+
+    let claude_data = fixture.scratch.join("claude-data");
+    let mut config = fixture.config();
+    config.home_isolation = spawn_host::HomeIsolation::Whitelist;
+    config.canonical_workspace = Some(PathBuf::from("/workspace"));
+    config.claude_data_dir = Some(claude_data.clone());
+    let Some(view) = view(config) else {
+        return;
+    };
+    let (workspace, _, _) = fixture.launch();
+    let words = view
+        .wrap(&ViewedLaunch {
+            engine: "claude",
+            workspace: &workspace,
+            engine_home: &claude_home.display().to_string(),
+            worker_id: Some("claude-w1"),
+            exit_file: None,
+        })
+        .expect("wrap claude");
+
+    // Host secrets & sibling history stay hidden.
+    fails(
+        &words,
+        &format!("cat '{}'", fixture.home().join(".ssh/id_rsa").display()),
+    );
+    fails(
+        &words,
+        &format!("cat '{}'", claude_home.join("history.jsonl").display()),
+    );
+    assert_eq!(
+        ok(
+            &words,
+            &format!("cat '{}'", fixture.home().join(".claude.json").display())
+        ),
+        "{\"hasCompletedOnboarding\":true,\"theme\":\"dark\"}"
+    );
+    assert_eq!(
+        ok(
+            &words,
+            &format!("cat '{}'", claude_home.join(".claude.json").display())
+        ),
+        "{\"hasCompletedOnboarding\":true,\"theme\":\"dark\"}"
+    );
+    // Settings & credentials are readable but read-only.
+    assert_eq!(
+        ok(
+            &words,
+            &format!("cat '{}'", claude_home.join("settings.json").display())
+        ),
+        "{\"sandbox\":true}"
+    );
+    fails(
+        &words,
+        &format!(
+            "sh -c 'echo x > \"{}\"'",
+            claude_home.join("settings.json").display()
+        ),
+    );
+    // Writing a transcript inside <claude_home>/projects persists to host projects!
+    let transcript = claude_home.join("projects/-workspace/sess-1.jsonl");
+    assert_eq!(
+        ok(
+            &words,
+            &format!(
+                "printf 'ok\\n' > '{}' && cat '{}'",
+                transcript.display(),
+                transcript.display()
+            ),
+        ),
+        "ok"
+    );
+    assert_eq!(
+        std::fs::read_to_string(host_projects.join("sess-1.jsonl")).expect("host transcript"),
+        "ok\n"
+    );
+    // Double check host ~/.claude.json was never modified.
+    assert_eq!(
+        std::fs::read_to_string(fixture.home().join(".claude.json")).expect("host claude json"),
+        "{\"hostSecret\":\"nope\"}\n"
+    );
+}
+
+#[test]
+fn container_view_fails_closed_on_bare_host_and_sets_isolated_tmpdir_in_container() {
+    let fixture = Fixture::new();
+    let cfg = fixture.config();
+    let err =
+        spawn_host::ContainerView::new_with_detector(cfg.clone(), &|| spawn_host::ContainerEnv {
+            in_container: false,
+            runtime: None,
+            signals: Vec::new(),
+        })
+        .expect_err("must fail closed on bare host");
+    assert!(err.contains("bare host"), "{err}");
+
+    let view = spawn_host::ContainerView::new_with_detector(cfg, &|| spawn_host::ContainerEnv {
+        in_container: true,
+        runtime: Some("docker".to_string()),
+        signals: vec!["/.dockerenv".to_string()],
+    })
+    .expect("container view allowed when container detected");
+    assert_eq!(view.name(), "container");
+    assert_eq!(view.canonical_workspace(), None);
+    let (workspace, engine_home, expected_tmp) = fixture.launch();
+    let words = view
+        .wrap(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: Some("w-ctr"),
+            exit_file: None,
+        })
+        .expect("wrap container");
+    assert_eq!(words.last().map(String::as_str), Some("--"));
+    let mut cmd = std::process::Command::new(&words[0]);
+    cmd.args(&words[1..]);
+    cmd.args(["/bin/sh", "-c", "printf '%s' \"$TMPDIR\""]);
+    let out = cmd.output().expect("run wrapper");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected_tmp);
 }
