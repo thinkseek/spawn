@@ -9558,6 +9558,63 @@ mod tests {
         );
     }
 
+    /// An agy session whose execution started on `gemini-3.8-pro` (its
+    /// launch summary), bound to `conv-1`, and stopped.
+    fn seed_stopped_agy(store: &Arc<MemoryStore>) -> (AgentId, SessionId) {
+        let agent = AgentId::new("agent_agy").expect("agent");
+        let session = SessionId::new("session_agy").expect("session");
+        let earlier = ExecutionId::for_command(CommandId(900));
+        let event = |key: &str, kind: EventKind| NewEvent {
+            agent_id: agent.clone(),
+            session_id: session.clone(),
+            execution_id: Some(earlier.clone()),
+            source: Source::Bridge,
+            source_event_id: Some(format!("{earlier}:{key}")),
+            kind,
+        };
+        store
+            .append(event(
+                "started",
+                EventKind::ExecutionStarted {
+                    engine: "agy".to_string(),
+                    workspace: WorkspaceId::new("agent_agy:/workspaces/agent_agy")
+                        .expect("workspace"),
+                    command_id: CommandId(900),
+                    fork: None,
+                    model: crate::event::ModelProfile::Default,
+                    transcript_from: None,
+                    launch: Some(crate::event::LaunchSummary {
+                        model: Some("gemini-3.8-pro".to_string()),
+                        ..crate::event::LaunchSummary::default()
+                    }),
+                },
+            ))
+            .expect("started");
+        store
+            .append(event(
+                "native",
+                EventKind::NativeSessionStarted {
+                    engine: "agy".to_string(),
+                    native_session_id: "conv-1".to_string(),
+                    transcript_path: None,
+                    engine_version: None,
+                },
+            ))
+            .expect("native");
+        store
+            .append(event(
+                "ended",
+                EventKind::ExecutionEnded {
+                    cause: crate::event::EndCause::Stopped,
+                    exit_code: Some(0),
+                    signal: None,
+                    evidence: None,
+                },
+            ))
+            .expect("ended");
+        (agent, session)
+    }
+
     /// Review 589, must-fix 1: a resumed agy session runs the model label
     /// its last execution started on (its `execution.started` launch
     /// model), over the host's `SPAWN_AGY_MODEL` and with it unset: a
@@ -9569,57 +9626,7 @@ mod tests {
             let store = Arc::new(MemoryStore::new("shop", clock.clone()));
             let host = Witnessed::over(store.clone());
             host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
-            let agent = AgentId::new("agent_agy").expect("agent");
-            let session = SessionId::new("session_agy").expect("session");
-            let earlier = ExecutionId::for_command(CommandId(900));
-            let event = |key: &str, kind: EventKind| NewEvent {
-                agent_id: agent.clone(),
-                session_id: session.clone(),
-                execution_id: Some(earlier.clone()),
-                source: Source::Bridge,
-                source_event_id: Some(format!("{earlier}:{key}")),
-                kind,
-            };
-            store
-                .append(event(
-                    "started",
-                    EventKind::ExecutionStarted {
-                        engine: "agy".to_string(),
-                        workspace: WorkspaceId::new("agent_agy:/workspaces/agent_agy")
-                            .expect("workspace"),
-                        command_id: CommandId(900),
-                        fork: None,
-                        model: crate::event::ModelProfile::Default,
-                        transcript_from: None,
-                        launch: Some(crate::event::LaunchSummary {
-                            model: Some("gemini-3.8-pro".to_string()),
-                            ..crate::event::LaunchSummary::default()
-                        }),
-                    },
-                ))
-                .expect("started");
-            store
-                .append(event(
-                    "native",
-                    EventKind::NativeSessionStarted {
-                        engine: "agy".to_string(),
-                        native_session_id: "conv-1".to_string(),
-                        transcript_path: None,
-                        engine_version: None,
-                    },
-                ))
-                .expect("native");
-            store
-                .append(event(
-                    "ended",
-                    EventKind::ExecutionEnded {
-                        cause: crate::event::EndCause::Stopped,
-                        exit_code: Some(0),
-                        signal: None,
-                        evidence: None,
-                    },
-                ))
-                .expect("ended");
+            let (agent, session) = seed_stopped_agy(&store);
             let id = store
                 .submit(
                     &Principal::new("tester").expect("principal"),
@@ -9668,7 +9675,7 @@ mod tests {
                     EventKind::ExecutionStarted { launch, .. } => launch,
                     _ => None,
                 })
-                .last()
+                .next_back()
                 .expect("a launch summary");
             assert_eq!(resumed.model.as_deref(), Some("gemini-3.8-pro"));
             assert_eq!(resumed.relay_url, None);

@@ -3211,7 +3211,7 @@ mod tests {
                 model_label: recorded.map(str::to_string),
                 ..worker(true, true)
             };
-            let plan = orders(&planned, &[other.clone()]);
+            let plan = orders(&planned, std::slice::from_ref(&other));
             assert_eq!(plan[0].key, "switch-engine-4-0", "{recorded:?}");
             assert_eq!(plan[0].action, CommandAction::Stop);
             let stopped = Facts {
