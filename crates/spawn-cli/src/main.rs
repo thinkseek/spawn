@@ -52,6 +52,8 @@
 //! in [`commands`], environment and store access in [`config`], and the
 //! Bridge/Observer assembly in [`runtime`].
 
+#![forbid(unsafe_code)]
+
 mod ack;
 mod alerts;
 mod backup;
