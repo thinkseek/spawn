@@ -1106,7 +1106,7 @@ mod pv4_hook {
             ),
             (
                 &json!(digest),
-                &json!(big.len()),
+                &json!(size),
                 &json!("content"),
                 &Value::Null
             )
