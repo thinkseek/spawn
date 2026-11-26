@@ -212,7 +212,7 @@ rows=$(grep -v '^[[:space:]]*\(#\|$\)' "$here/credentials.manifest")
 
 # --- Issue #98 hardening: unix:// UDS health probe, EnvironmentFile= rollback, Go units PG isolation ---
 uds_dir=$(mktemp -d /tmp/ch-uds.XXXXXX) || exit 2
-python3 - "$uds_dir/out.sock" "$uds_dir/status" <<'PY' >/dev/null 2>&1 &
+python3 -B -I - "$uds_dir/out.sock" "$uds_dir/status" <<'PY' >/dev/null 2>&1 &
 import os, socketserver, sys
 sock_path, status_file = sys.argv[1], sys.argv[2]
 try:
@@ -221,12 +221,17 @@ except FileNotFoundError:
     pass
 class Handler(socketserver.StreamRequestHandler):
     def handle(self):
-        line = self.rfile.readline(4096)
+        line = self.rfile.readline(4096).decode("ascii", errors="replace").strip()
         while self.rfile.readline(4096) not in (b"\r\n", b"\n", b""):
             pass
-        code = open(status_file).read().strip() if os.path.exists(status_file) else "503"
-        reason = "OK" if code == "200" else "Service Unavailable"
-        body = b'{"status":"ok"}\n' if code == "200" else b'{"error":"down"}\n'
+        parts = line.split()
+        req_path = parts[1] if len(parts) >= 2 else ""
+        if req_path != "/out/v1/health":
+            code, reason, body = "404", "Not Found", b'{"error":"not found"}\n'
+        else:
+            code = open(status_file).read().strip() if os.path.exists(status_file) else "503"
+            reason = "OK" if code == "200" else "Service Unavailable"
+            body = b'{"status":"ok"}\n' if code == "200" else b'{"error":"down"}\n'
         resp = (
             f"HTTP/1.1 {code} {reason}\r\n"
             f"Content-Type: application/json\r\n"
@@ -256,11 +261,13 @@ run_uds() {
 setup_uds_manifest
 out=$(run_uds)
 [ ! -s "$scratch/alerts" ] && grep -q '^credential-health: ok: typesafe.api-key' <<<"$out" &&
-  pass "unix:// UDS healthz 200: healthy, no alert" || fail "unix:// UDS healthz 200"
+  pass "unix:// UDS /out/v1/health 200: healthy, no alert" || fail "unix:// UDS /out/v1/health 200"
 
 printf '503\n' >"$uds_dir/status"
-run_uds >/dev/null
-expect_fired "unix:// UDS healthz 503: service_down" typesafe.api-key:service_down
+out=$(run_uds)
+expect_fired "unix:// UDS /out/v1/health 503: service_down" typesafe.api-key:service_down
+grep -q '/out/v1/health answered 503' <<<"$out" &&
+  pass "unix:// UDS 503 fault names /out/v1/health answered 503" || fail "unix:// UDS fault text ($out)"
 
 key=$(sed -n 's/.*"key":"\(credential_health:typesafe.api-key:service_down:[0-9]*\)".*/\1/p' "$scratch/alerts" | head -1)
 printf 'OPEN %s\n' "$key" >>"$scratch/alerts"
@@ -269,9 +276,20 @@ run_uds >/dev/null
 grep -q "alert.cleared.*$key" "$scratch/alerts" &&
   pass "unix:// UDS recovered to 200: service_down cleared" || fail "unix:// UDS recovery clear"
 
+# Symlinked UDS socket and %t/ expansion against real curl.
+mkdir -p "$scratch/rt/spawn"
+ln -s "$uds_dir/out.sock" "$scratch/rt/spawn/sym.sock"
+reset2
+printf '[Service]\nLoadCredential=typesafe.api-key:/run/keep/typesafe.api-key\nExecStart=/usr/bin/spawn-node front --serve outbound\n' >"$scratch/unit"
+printf 'typesafe.api-key | spawn-node-out.service | unix://%%t/spawn/sym.sock|/out/v1/health | jev-relay | ~/.config/spawn/typesafe.env | TYPESAFE_API_KEY | -\n' \
+  >"$scratch/manifest"
+XDG_RUNTIME_DIR="$scratch/rt" run_uds >/dev/null
+expect_fired "unix:// symlinked socket refused: service_down" typesafe.api-key:service_down
+
 kill "$uds_pid" >/dev/null 2>&1 && wait "$uds_pid" 2>/dev/null || true
 uds_pid=""
 rm -f "$uds_dir/out.sock"
+setup_uds_manifest
 : >"$scratch/alerts"
 run_uds >/dev/null
 expect_fired "unix:// missing socket: service_down" typesafe.api-key:service_down
@@ -379,6 +397,118 @@ grep -q -- '--bind-retry-timeout 5s' "$repo_root/deploy/systemd/spawn-node-edge.
   grep -q '^RestartPreventExitStatus=243 78$' "$repo_root/deploy/systemd/spawn-node-out.service" || go_static_ok=""
 [ -n "$go_static_ok" ] &&
   pass "deploy/systemd/spawn-node-{edge,gw,out}.service enforce MemoryMax, GOMEMLIMIT, bind-retry, LoadCredential, zero PG" || fail "spawn-node-*.service static audit"
+
+# --- --validate-manifest dry-run validation (multi-row + unix://%t/..., exit 2 on invalid, zero alerts) ---
+rm -f "$scratch/alerts"
+cat >"$scratch/valid-multi.manifest" <<'EOF'
+# synthetic multi-row manifest for dry-run validation
+typesafe.api-key | spawn-node-out.service | unix://%t/spawn/out.sock|/out/v1/health | jev-relay | ~/.config/spawn/typesafe.env | TYPESAFE_API_KEY | -
+deepseek.api-key | spawn-model-relay.service | http://127.0.0.1:8791/healthz | model-relay | ~/.config/spawn/model-relay.env | DEEPSEEK_API_KEY | -
+EOF
+val_out=$(CH_FAKE_ALERTS="$scratch/alerts" bash "$check" --validate-manifest "$scratch/valid-multi.manifest" 2>&1)
+[ "$?" -eq 0 ] && grep -q 'manifest ok: 2 row(s) valid' <<<"$val_out" && [ ! -e "$scratch/alerts" ] &&
+  pass "--validate-manifest accepts valid multi-row unix://%t + http:// manifest with zero alerts" || fail "--validate-manifest valid ($val_out)"
+
+printf 'bad.row|only-three-fields|-\n' >"$scratch/invalid.manifest"
+val_bad_out=$(CH_FAKE_ALERTS="$scratch/alerts" bash "$check" --validate-manifest "$scratch/invalid.manifest" 2>&1); st=$?
+[ "$st" -eq 2 ] && grep -q 'nothing checked' <<<"$val_bad_out" && [ ! -e "$scratch/alerts" ] &&
+  pass "--validate-manifest rejects invalid row with exit 2 and zero alerts" || fail "--validate-manifest invalid row ($st: $val_bad_out)"
+
+val_miss_out=$(CH_FAKE_ALERTS="$scratch/alerts" bash "$check" --validate-manifest "$scratch/does-not-exist.manifest" 2>&1); st=$?
+[ "$st" -eq 2 ] && [ ! -e "$scratch/alerts" ] &&
+  pass "--validate-manifest rejects missing file with exit 2" || fail "--validate-manifest missing ($st)"
+
+val_noarg_out=$(bash "$check" --validate-manifest 2>&1); st=$?
+[ "$st" -eq 2 ] &&
+  pass "--validate-manifest without path exits 2" || fail "--validate-manifest noarg ($st)"
+
+# --- --audit-keep-migration (real deploy/systemd + synthetic sandbox + canary secret isolation) ---
+rm -f "$scratch/alerts"
+real_audit_json=$(CH_DEPLOY_SYSTEMD_DIR="" CH_UNIT_DIR="" CH_FAKE_ALERTS="$scratch/alerts" \
+  SPAWN_DATABASE_URL="" bash "$check" --audit-keep-migration --json)
+st=$?
+[ "$st" -eq 0 ] && [ ! -e "$scratch/alerts" ] && jq -e '
+  .go_units_pg_isolation.checked == true and
+  .go_units_pg_isolation.ok == true and
+  (.go_units_pg_isolation.violations | length == 0) and
+  (.counts.total == .counts.keep_managed + .counts.no_secrets + .counts.pending_migration) and
+  (.counts.keep_managed >= 2) and
+  (.units | map(select(.unit == "spawn-jev-relay.service" and .status == "keep_managed" and (.load_credentials | index("typesafe.api-key")) != null)) | length == 1) and
+  (.units | map(select(.unit == "spawn-node-out.service" and .status == "keep_managed" and (.load_credentials | index("typesafe.api-key")) != null)) | length == 1) and
+  (.units | map(select(.unit == "spawn-agent-presence.service" and .status == "no_secrets")) | length == 1) and
+  (.units | map(select(.unit == "spawn-model-relay.service" and .status == "pending_migration" and (.suggested_keep_ids | index("deepseek.api-key")) != null)) | length == 1) and
+  (.units | map(select(.unit == "spawn-loop.service" and .status == "pending_migration" and (.env_files | length > 0))) | length == 1)
+' <<<"$real_audit_json" >/dev/null &&
+  pass "--audit-keep-migration --json accurately classifies real repo deploy/systemd units" || fail "--audit-keep-migration --json real ($real_audit_json)"
+
+real_audit_human=$(CH_DEPLOY_SYSTEMD_DIR="" CH_UNIT_DIR="" SPAWN_DATABASE_URL="" bash "$check" --audit-keep-migration)
+grep -q 'keep_managed.*spawn-jev-relay\.service' <<<"$real_audit_human" &&
+  grep -q 'keep_managed.*spawn-node-out\.service' <<<"$real_audit_human" &&
+  grep -q 'pending_migration.*spawn-model-relay\.service' <<<"$real_audit_human" &&
+  grep -q 'go_units_pg_isolation=ok' <<<"$real_audit_human" &&
+  pass "--audit-keep-migration human output summarizes repo units and PG isolation" || fail "--audit-keep-migration human"
+
+# Synthetic sandbox audit directory with canary secret inside referenced .env files.
+audit_home=$scratch/audit-home
+audit_sys=$scratch/audit-units
+mkdir -p "$audit_home/.config/spawn" "$audit_home/.local/share/spawn-rsi" "$audit_sys/spawn-node-edge.service.d"
+printf 'CANARY_SECRET=made-up-audit-canary-value-9941\n' >"$audit_home/.config/spawn/demo.env"
+printf 'SPAWN_DATABASE_URL=postgres://user:made-up-audit-canary-value-9941@127.0.0.1:5432/db\n' >"$audit_home/.local/share/spawn-rsi/spawn.env"
+chmod 600 "$audit_home/.config/spawn/demo.env" "$audit_home/.local/share/spawn-rsi/spawn.env"
+
+cat >"$audit_sys/spawn-alpha-keep.service" <<'EOF'
+[Service]
+LoadCredential=alpha.key:/run/keep/alpha.key
+EOF
+cat >"$audit_sys/spawn-node-out.service" <<'EOF'
+[Service]
+LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key
+EnvironmentFile=-%h/.config/spawn/node-out.env
+EOF
+cat >"$audit_sys/spawn-mixed-pending.service" <<'EOF'
+[Service]
+LoadCredential=alpha.key:/run/keep/alpha.key
+EnvironmentFile=%h/.config/spawn/demo.env
+EOF
+cat >"$audit_sys/spawn-plain-pending.service" <<'EOF'
+[Service]
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+EOF
+cat >"$audit_sys/spawn-clean.service" <<'EOF'
+[Service]
+Environment=PATH=/usr/bin:/bin
+EOF
+cat >"$audit_sys/spawn-node-edge.service" <<'EOF'
+[Service]
+EnvironmentFile=-%h/.config/spawn/node-edge.env
+EOF
+cat >"$audit_sys/spawn-node-edge.service.d/bad.conf" <<'EOF'
+[Service]
+Environment=BAD_DATABASE_URL=postgres://synthetic-dropin-leak
+EOF
+
+syn_json=$(HOME="$audit_home" CH_DEPLOY_SYSTEMD_DIR="$audit_sys" CH_FAKE_ALERTS="$scratch/alerts" \
+  bash "$check" --audit-keep-migration --json)
+syn_human=$(HOME="$audit_home" CH_DEPLOY_SYSTEMD_DIR="$audit_sys" CH_FAKE_ALERTS="$scratch/alerts" \
+  bash "$check" --audit-keep-migration)
+
+jq -e '
+  .counts.total == 6 and
+  .counts.keep_managed == 2 and
+  .counts.no_secrets == 1 and
+  .counts.pending_migration == 3 and
+  .go_units_pg_isolation.checked == true and
+  .go_units_pg_isolation.ok == false and
+  (.go_units_pg_isolation.violations == ["spawn-node-edge.service"]) and
+  (.units | map(select(.unit == "spawn-mixed-pending.service" and .status == "pending_migration")) | length == 1) and
+  (.units | map(select(.unit == "spawn-plain-pending.service" and .status == "pending_migration" and (.suggested_keep_ids | index("spawn.database-url")) != null)) | length == 1)
+' <<<"$syn_json" >/dev/null &&
+  [ ! -e "$scratch/alerts" ] &&
+  pass "--audit-keep-migration classifies synthetic mixed/optional/Go units and writes zero alerts" || fail "--audit-keep-migration synthetic ($syn_json)"
+
+! grep -q 'made-up-audit-canary-value-9941' <<<"$syn_json$syn_human" &&
+  ! grep -q 'synthetic-dropin-leak' <<<"$syn_json$syn_human" &&
+  pass "--audit-keep-migration never reads or echoes env file contents or canary secrets" || fail "canary leaked in audit"
 
 echo "$fails failed"
 [ "$fails" -eq 0 ]
