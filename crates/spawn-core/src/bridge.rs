@@ -825,6 +825,12 @@ struct SessionView {
     /// The engine the session's last execution started: what a resume
     /// runs.
     engine: String,
+    /// The model label an engine told its model at launch (agy) last
+    /// started on, as its `execution.started` records it (the launch's
+    /// `model`): what a resume runs, so a resumed worker stays on its
+    /// preset's model. None for Claude Code, and for an execution that
+    /// recorded none (the host's `SPAWN_AGY_MODEL` then).
+    model_label: Option<String>,
     active: Option<Active>,
     /// What the log last says the agent's branch points at: the commit of
     /// its last `artifact.committed`, or the fork its branch was created at.
@@ -949,6 +955,7 @@ impl SessionView {
             transcript_read: false,
             model: ModelProfile::Default,
             engine: crate::driver::DEFAULT.to_string(),
+            model_label: None,
             active: None,
             recorded_head: None,
             latest: None,
@@ -1976,10 +1983,15 @@ impl Bridge {
                 workspace,
                 model,
                 transcript_from,
+                launch,
                 ..
             } => {
                 view.model = *model;
                 view.engine.clone_from(engine);
+                view.model_label = launch
+                    .as_ref()
+                    .and_then(|launch| launch.model.clone())
+                    .filter(|_| engine != crate::driver::DEFAULT);
                 if let Some(execution_id) = event.execution_id.clone() {
                     // As the store names it now: a record from before the
                     // root was resolved names the same directory.
@@ -4273,10 +4285,19 @@ impl Bridge {
                 .get(&claimed.session_id)
                 .map_or(ModelProfile::Default, |view| view.model)
         });
-        let (relay, config_dir, launch) = match self.engine_settings(claimed, model, report) {
+        let (relay, config_dir, mut launch) = match self.engine_settings(claimed, model, report) {
             Ok(settings) => settings,
             Err(why) => return Ok(Err(why)),
         };
+        // An engine told its model at launch runs on no relay of Claude
+        // Code's: its launch summary is the model it runs, which a resume
+        // of the session reads back (`SessionView::model_label`).
+        if label.is_some() {
+            launch = LaunchSummary {
+                model: label.clone(),
+                ..LaunchSummary::default()
+            };
+        }
         let fork = match self.ensure_branch(claimed, branch, from, report) {
             Ok(fork) => fork,
             Err(why) => return Ok(Err(why)),
@@ -6616,10 +6637,10 @@ impl Bridge {
                 claimed.session_id
             ))));
         }
-        let Some((native, engine)) = self.sessions.get(&claimed.session_id).and_then(|view| {
+        let Some((native, engine, label)) = self.sessions.get(&claimed.session_id).and_then(|view| {
             view.native
                 .clone()
-                .map(|native| (native, view.engine.clone()))
+                .map(|native| (native, view.engine.clone(), view.model_label.clone()))
         }) else {
             return Ok(Handled::Finished(Outcome::Failed(
                 "no native session to resume".to_string(),
@@ -6633,9 +6654,10 @@ impl Bridge {
                 native: Some(native.as_str()),
                 from: None,
                 model,
-                // A resume runs the host's model for its engine: the label
-                // of the start it resumes is not kept.
-                model_label: None,
+                // A resume runs the model label its session last started on
+                // (its `execution.started`), the host's only when that
+                // recorded none.
+                model_label: label.as_deref(),
                 driver: driver_or_default(&engine),
             },
             report,
