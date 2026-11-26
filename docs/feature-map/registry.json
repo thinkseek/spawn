@@ -1324,8 +1324,11 @@
         "crates/spawn-cas/tests/d6_journal_gc.rs",
         "crates/spawn-cas/tests/store.rs",
         "crates/spawn-host/src/cas_dedup.rs",
+        "crates/spawn-host/src/cas_merkle.rs",
         "crates/spawn-host/src/cow.rs",
+        "crates/spawn-host/src/git_border.rs",
         "crates/spawn-host/tests/cow.rs",
+        "crates/spawn-host/tests/d6_border.rs",
         "docs/cross-os-cow-storage.md",
         "docs/d6-cas-v1.md"
       ],

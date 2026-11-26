@@ -19,9 +19,11 @@ pub mod agent_files;
 pub mod archive_mask;
 pub mod beneath;
 pub mod cas_dedup;
+pub mod cas_merkle;
 pub mod cow;
 pub mod engine_view;
 pub mod git;
+pub mod git_border;
 pub mod herdr;
 pub mod herdr_core;
 pub mod herdr_witness;
@@ -44,6 +46,11 @@ mod audit;
 pub use cas_dedup::{
     ArtifactRoot, DedupConfig, DedupError, DedupReport, PruneReport, dedup_dirs, prune_unused,
 };
+pub use cas_merkle::{
+    BUILD_OUTPUT as D6_BUILD_OUTPUT, CasMerkleStore, D6RefKind, D6StoreError, InMemoryRefLedger,
+    LedgerRef, LedgerSnapshot, MaterializeReport, PublishRequest, PublishedSnapshot, RefLedger,
+    ScannedEntry, ScannedKind, TrackedSetPolicy, format_commit_body,
+};
 pub use cow::{
     CloneKind, CowStats, CowWorkspace, DirectoryOccupancy, WorkspaceLease, clone_or_copy,
     cow_clone_supported, directory_occupancy, live_users, reflink_file,
@@ -56,6 +63,7 @@ pub use git::{
     SET_ASIDE_FILES, SET_ASIDE_WAITS, git_command, has_conflict_block, has_conflict_block_sized,
     max_file_bytes, names_files_outside_git,
 };
+pub use git_border::{BorderRefTarget, ExportReport, GitBorderAdapter, ImportReport, ImportedRef};
 pub use herdr::{HerdrHost, HerdrPool};
 pub use herdr_core::HerdrCoreHost;
 #[cfg(target_os = "linux")]
