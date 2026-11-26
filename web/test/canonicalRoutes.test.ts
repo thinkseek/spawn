@@ -60,3 +60,13 @@ test("each renamed read and write is fetched at its canonical path", () => {
     assert.ok(read(file).includes(path), `${file} fetches ${path}`);
   }
 });
+
+test("live terminal screen capture UI names Herdr rather than tmux", () => {
+  const agentDetail = read("components/fleet/AgentDetail.tsx");
+  assert.ok(agentDetail.includes("`herdr ${data.terminal}`"), "live tab tooltip names herdr");
+  assert.ok(agentDetail.includes("herdr capture, not stored"), "live status label names herdr capture");
+  for (const file of sources(SRC)) {
+    const text = readFileSync(file, "utf8");
+    assert.doesNotMatch(text, /\btmux\b/i, `${file} must not reintroduce tmux UI copy or references`);
+  }
+});

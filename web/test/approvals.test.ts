@@ -20,7 +20,7 @@ const ANSWER = {
       kind: "choice",
       session_id: "session_worker_a",
       agent_id: "agent_worker_a",
-      backend: "tmux",
+      backend: "herdr",
       label: "Do you want to run this command?",
       summary: "rm -rf target",
       excerpt: "❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No",
@@ -39,7 +39,7 @@ const ANSWER = {
       kind: "attention",
       session_id: "session_worker_b",
       agent_id: "agent_worker_b",
-      backend: "tmux",
+      backend: "herdr",
       label: "waits for the owner",
       summary: "waits for the owner",
       excerpt: "",
@@ -72,6 +72,7 @@ test("the queue reads each known item, its options and its resume", () => {
   assert.equal(read.items.length, 3);
   const [choice, attention, mission] = read.items;
   assert.equal(choice.id, "session_worker_a:3f2c00000000beef");
+  assert.equal(choice.backend, "herdr");
   assert.deepEqual(
     choice.options.map((option) => [option.id, option.action, option.keys]),
     [
@@ -82,11 +83,61 @@ test("the queue reads each known item, its options and its resume", () => {
     ],
   );
   assert.deepEqual(choice.judgement, { state: "BLOCKED", needs_human: 0.9, reason: "asks" });
+  assert.equal(attention.backend, "herdr");
   assert.equal(attention.options.length, 0);
   assert.equal(attention.resume, null);
+  assert.equal(mission.backend, null);
   assert.deepEqual(mission.resume, { mission: 7, halt: 4412 });
   assert.deepEqual(read.warnings, ["approvals: a pane: gone"]);
   assert.equal(kindText("yes_no"), "yes / no");
+});
+
+test("active approval items carry the herdr backend while legacy backend strings remain defensively readable", () => {
+  const read = normalizeApprovals({
+    generated_at_ms: 2_000,
+    items: [
+      {
+        id: "session_live:1",
+        kind: "confirm",
+        session_id: "session_live",
+        agent_id: "agent_live",
+        backend: "herdr",
+        label: "Continue?",
+      },
+      {
+        id: "session_legacy:2",
+        kind: "attention",
+        session_id: "session_legacy",
+        agent_id: "agent_legacy",
+        backend: "tmux",
+        label: "historical approval record",
+      },
+      {
+        id: "session_missing:3",
+        kind: "attention",
+        session_id: "session_missing",
+        agent_id: "agent_missing",
+        label: "missing backend",
+      },
+      {
+        id: "session_non_string:4",
+        kind: "attention",
+        session_id: "session_non_string",
+        agent_id: "agent_non_string",
+        backend: 42,
+        label: "malformed backend",
+      },
+    ],
+  });
+  assert.deepEqual(
+    read.items.map((item) => [item.id, item.backend]),
+    [
+      ["session_live:1", "herdr"],
+      ["session_legacy:2", "tmux"],
+      ["session_missing:3", null],
+      ["session_non_string:4", null],
+    ],
+  );
 });
 
 test("an answer that is not a queue is a failed read", () => {

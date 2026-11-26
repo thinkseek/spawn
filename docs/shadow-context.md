@@ -18,6 +18,8 @@ What the passive shadow observer (`scripts/shadow/shadow_observe.py`) watches, h
 | Keep test delivery (`/run/keep-test/VERSION`) | Keep, on the Mac | owner login on the Mac | existence, mtime, size | the test folder was delivered | observed | 30 s | whether its content is current; production delivery does not exist yet |
 | Host | — | Mac, OrbStack | boot id, monotonic clock, loadavg, MemAvailable, statvfs | resources; reboot; a gap in sampling | observed | 30 s | the Mac itself; power; the VM's disk durability |
 
+> Note: The `tmux list-panes` row above reflects `scripts/shadow/shadow_observe.py`'s current phase-1 read-only probe of the human lead's external operator sessions (`supervisor`, `cc-astra`); Spawn's own agent runtime runs exclusively on Herdr (`herdr-core` / `spawn-hc`), not `tmux`.
+
 ## Not observed in this phase (explicit unknowns)
 - **The record (Postgres).** No credential-safe, read-only read path has been reviewed for the observer, so it does not connect. Task state, claims, leases, attempts, alerts, pause and halt events: **unknown** to the observer. No claim about schema or fencing is made from names.
 - **Desired state** (owner pause, stop, tombstone): the observer cannot read it yet. It honours only its own exclusion file.
