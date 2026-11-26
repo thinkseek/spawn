@@ -11684,6 +11684,39 @@ mod tests {
             .collect()
     }
 
+    /// Claude Code keeps its deny rules (`Guard::Settings`) and never runs
+    /// in the filesystem view, whatever the host's view policy: with no
+    /// view at all (the default) it still starts, as the plain runner.
+    #[test]
+    fn claude_code_never_runs_in_the_filesystem_view() {
+        let policies = [
+            EngineViewPolicy::unconfigured(),
+            EngineViewPolicy::Required(Ok(Arc::new(FakeView::default()))),
+        ];
+        for (number, policy) in (1_u64..).zip(policies) {
+            let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+            let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+            let id = submit_resumable_start(&store, number, "hello", READY);
+            let mut config = BridgeConfig::new("tester");
+            config.engine_view = policy;
+            let mut bridge = Bridge::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                config,
+            )
+            .with_clock(clock);
+            drive_work(&mut bridge, &store, || {
+                command_outcome(&store, id).is_some()
+            });
+            assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+            let launch = store.launches().pop().expect("launched");
+            assert_eq!(launch.program, "spawn");
+            assert_eq!(launch.arguments[..2], ["run", "--"]);
+        }
+    }
+
     #[test]
     fn a_reclaimed_start_launches_and_types_only_once() {
         let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
