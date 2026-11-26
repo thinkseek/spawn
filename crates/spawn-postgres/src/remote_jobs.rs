@@ -205,6 +205,8 @@ pub struct NodeV1 {
     pub spec_sha256: Option<String>,
     pub spec: Option<Value>,
     pub warm_bases: Vec<String>,
+    #[serde(default)]
+    pub power: Option<Value>,
 }
 
 /// `POST /node/v1/enroll`'s call: the token's digest, the node's new key,
@@ -507,8 +509,16 @@ impl PostgresStore {
     /// `spawn node list` beside the P1 nodes (PR S4).
     pub fn nodes_v1(&self) -> Result<Vec<NodeV1>, StoreError> {
         decode(self.query_json(
-            "select coalesce(jsonb_agg(to_jsonb(n) - 'pubkey' - 'enroll_token_sha256'
-                                       order by n.name), '[]'::jsonb)
+            "select coalesce(jsonb_agg(
+                              (to_jsonb(n) - 'pubkey' - 'enroll_token_sha256')
+                              || jsonb_build_object(
+                                   'power',
+                                   case when jsonb_typeof(n.beat -> 'power') = 'object'
+                                        then n.beat -> 'power'
+                                        else null
+                                   end
+                                 )
+                              order by n.name), '[]'::jsonb)
                from spawn_node_state n",
             &[],
         )?)
@@ -532,7 +542,14 @@ impl PostgresStore {
     /// One v1 node by name, or `None`.
     pub fn node_v1(&self, name: &str) -> Result<Option<NodeV1>, StoreError> {
         self.query_opt_json(
-            "select to_jsonb(n) - 'pubkey' - 'enroll_token_sha256'
+            "select (to_jsonb(n) - 'pubkey' - 'enroll_token_sha256')
+                    || jsonb_build_object(
+                         'power',
+                         case when jsonb_typeof(n.beat -> 'power') = 'object'
+                              then n.beat -> 'power'
+                              else null
+                         end
+                       )
                from spawn_node_state n where n.name = $1",
             &[&name],
         )?

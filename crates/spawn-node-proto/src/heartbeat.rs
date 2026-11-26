@@ -20,6 +20,10 @@ pub const MAX_GRANTS_PER_ANSWER: usize = 2;
 pub const MAX_WARM_BASES: usize = 4;
 /// Edges closer than this are coalesced into one beat.
 pub const EDGE_COALESCE_MS: u64 = 500;
+/// Maximum valid battery charge percentage (`0..=100`).
+pub const MAX_BATTERY_PCT: u8 = 100;
+/// Maximum remaining battery estimate in minutes (matches PG 9-digit limit).
+pub const MAX_REMAINING_MINS: u32 = 999_999_999;
 
 /// The node's own wish (`state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +80,33 @@ pub struct LeaseRef {
     pub lease_epoch: u64,
 }
 
+/// Power and battery telemetry reported optionally by a worker node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PowerTelemetry {
+    pub on_ac: bool,
+    #[serde(default)]
+    pub battery_pct: Option<u8>,
+    pub charging: bool,
+    #[serde(default)]
+    pub remaining_mins: Option<u32>,
+}
+
+impl PowerTelemetry {
+    /// Validate power telemetry bounds (`battery_pct <= 100`, `remaining_mins <= 999_999_999`).
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.battery_pct.is_some_and(|pct| pct > MAX_BATTERY_PCT) {
+            return Err(Error::Body("power.battery_pct"));
+        }
+        if self
+            .remaining_mins
+            .is_some_and(|mins| mins > MAX_REMAINING_MINS)
+        {
+            return Err(Error::Body("power.remaining_mins"));
+        }
+        Ok(())
+    }
+}
+
 /// A heartbeat body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Beat {
@@ -96,6 +127,8 @@ pub struct Beat {
     pub load1_milli: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_available_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<PowerTelemetry>,
     pub edge: Edge,
 }
 
@@ -132,6 +165,9 @@ impl Beat {
             .chain(self.lease_results_pending.iter().map(|lease| &lease.job_id));
         if !ids.into_iter().all(|id| is_job_id(id)) {
             return Err(Error::Body("job_id"));
+        }
+        if let Some(power) = &self.power {
+            power.validate()?;
         }
         Ok(())
     }
@@ -234,8 +270,47 @@ mod tests {
             warm_bases: vec![],
             load1_milli: Some(1250),
             mem_available_mb: None,
+            power: None,
             edge: Edge::Timer,
         }
+    }
+
+    #[test]
+    fn a_beat_power_field_roundtrips_and_enforces_bounds() {
+        let mut with_power = beat(0);
+        with_power.power = Some(PowerTelemetry {
+            on_ac: false,
+            battery_pct: Some(100),
+            charging: false,
+            remaining_mins: Some(MAX_REMAINING_MINS),
+        });
+        let bytes = with_power.to_bytes().unwrap();
+        assert!(bytes.windows(7).any(|w| w == b"\"power\""));
+        assert_eq!(Beat::parse(&bytes).unwrap(), with_power);
+
+        let no_power = beat(0).to_bytes().unwrap();
+        assert!(!no_power.windows(7).any(|w| w == b"\"power\""));
+
+        let mut bad_pct = beat(0);
+        bad_pct.power = Some(PowerTelemetry {
+            on_ac: true,
+            battery_pct: Some(101),
+            charging: true,
+            remaining_mins: None,
+        });
+        assert_eq!(bad_pct.validate(), Err(Error::Body("power.battery_pct")));
+
+        let mut bad_mins = beat(0);
+        bad_mins.power = Some(PowerTelemetry {
+            on_ac: false,
+            battery_pct: Some(50),
+            charging: false,
+            remaining_mins: Some(MAX_REMAINING_MINS + 1),
+        });
+        assert_eq!(
+            bad_mins.validate(),
+            Err(Error::Body("power.remaining_mins"))
+        );
     }
 
     #[test]

@@ -246,11 +246,37 @@ pub(super) fn json_of(node: &NodeV1, now: i64) -> Value {
         "last_beat_ms": node.last_beat_ms,
         "spec_sha256": node.spec_sha256,
         "warm_bases": node.warm_bases,
+        "power": node.power,
     })
+}
+
+fn power_summary(power: &Value, low_battery_drain: bool) -> Option<String> {
+    let map = power.as_object()?;
+    let on_ac = map.get("on_ac").and_then(Value::as_bool)?;
+    let mut words = vec![if on_ac { "AC" } else { "battery" }.to_string()];
+    if let Some(pct) = map.get("battery_pct").and_then(Value::as_u64) {
+        words.push(format!("{pct}%"));
+    }
+    if map.get("charging").and_then(Value::as_bool) == Some(true) {
+        words.push("charging".to_string());
+    } else if !on_ac {
+        words.push("discharging".to_string());
+    }
+    if let Some(mins) = map.get("remaining_mins").and_then(Value::as_u64) {
+        words.push(format!("{}h{:02}m", mins / 60, mins % 60));
+    }
+    if low_battery_drain {
+        words.push("LOW-BATTERY DRAIN".to_string());
+    }
+    Some(words.join(" "))
 }
 
 /// The v1 nodes' table (nothing when there is none).
 pub(super) fn lines(nodes: &[NodeV1], now: i64) -> Vec<String> {
+    lines_with_threshold(nodes, now, power::low_battery_from_env())
+}
+
+fn lines_with_threshold(nodes: &[NodeV1], now: i64, threshold: u8) -> Vec<String> {
     if nodes.is_empty() {
         return Vec::new();
     }
@@ -266,10 +292,17 @@ pub(super) fn lines(nodes: &[NodeV1], now: i64) -> Vec<String> {
         row(["NAME", "STATE", "CELL", "STRIKES", "NODE", "BEAT"]),
     ];
     for node in nodes {
-        let beat = node.last_beat_ms.map_or_else(
+        let mut beat = node.last_beat_ms.map_or_else(
             || "never".to_string(),
             |at| format!("{} s ago", now.saturating_sub(at) / 1000),
         );
+        if let Some(node_power) = &node.power
+            && let Some(summary) =
+                power_summary(node_power, power::low_battery(node_power, threshold))
+        {
+            beat.push_str("  ");
+            beat.push_str(&summary);
+        }
         let id: String = node
             .node_id
             .as_deref()
@@ -289,14 +322,59 @@ pub(super) fn lines(nodes: &[NodeV1], now: i64) -> Vec<String> {
     out
 }
 
-/// The P1 nodes' JSON array with the v1 nodes appended.
+fn v1_json_with_soft_drain(v1: &[NodeV1], now: i64, threshold: u8) -> Vec<Value> {
+    let originals: Vec<String> = v1.iter().map(|node| state_of(node, now)).collect();
+    let mut array = Value::Array(
+        v1.iter()
+            .zip(&originals)
+            .map(|(node, original_state)| {
+                let mut obj = json_of(node, now);
+                let mapped = if node.drained {
+                    "drained"
+                } else if node.status == "active" && !is_lost(node, now) && !node.degraded {
+                    "live"
+                } else {
+                    original_state.as_str()
+                };
+                if let Some(fields) = obj.as_object_mut() {
+                    fields.insert("state".to_string(), Value::String(mapped.to_string()));
+                }
+                obj
+            })
+            .collect(),
+    );
+    power::with_soft_drain(&mut array, threshold);
+    let mut items = match array {
+        Value::Array(items) => items,
+        _ => Vec::new(),
+    };
+    for (entry, original_state) in items.iter_mut().zip(originals) {
+        if let Some(fields) = entry.as_object_mut() {
+            fields.insert("state".to_string(), Value::String(original_state));
+        }
+    }
+    items
+}
+
+/// The P1 nodes' JSON array with the v1 nodes appended (soft-drained using
+/// `SPAWN_NODE_LOW_BATTERY_PCT`).
+#[cfg(test)]
 pub(super) fn merged_json(p1: Value, v1: &[NodeV1], now: i64) -> Value {
+    merged_json_with_threshold(p1, v1, now, power::low_battery_from_env())
+}
+
+pub(super) fn merged_json_with_threshold(
+    p1: Value,
+    v1: &[NodeV1],
+    now: i64,
+    threshold: u8,
+) -> Value {
     let mut all = match p1 {
         Value::Array(nodes) => nodes,
         Value::Null => Vec::new(),
         other => vec![other],
     };
-    all.extend(v1.iter().map(|node| json_of(node, now)));
+    all.extend(v1_json_with_soft_drain(v1, now, threshold));
     Value::Array(all)
 }
 
@@ -308,8 +386,9 @@ pub(super) fn list_command(words: &[String]) -> Result<i32, String> {
         _ => return Err(USAGE.to_string()),
     };
     let store = open_store()?;
+    let threshold = power::low_battery_from_env();
     let mut nodes = store.nodes().map_err(|error| error.to_string())?;
-    power::with_soft_drain(&mut nodes, power::low_battery_from_env());
+    power::with_soft_drain(&mut nodes, threshold);
     // A store whose schema has no v1 table yet lists its P1 nodes alone.
     let v1 = store.nodes_v1().unwrap_or_else(|error| {
         eprintln!("spawn node list: the spawn-node v1 nodes not read: {error}");
@@ -320,7 +399,7 @@ pub(super) fn list_command(words: &[String]) -> Result<i32, String> {
         let nodes = if v1.is_empty() {
             nodes
         } else {
-            merged_json(nodes, &v1, now)
+            merged_json_with_threshold(nodes, &v1, now, threshold)
         };
         println!(
             "{}",
@@ -367,6 +446,7 @@ mod tests {
             spec_sha256: None,
             spec: None,
             warm_bases: Vec::new(),
+            power: None,
         }
     }
 
@@ -560,5 +640,85 @@ mod tests {
         assert_eq!(store.node_v1("n252").unwrap().unwrap().status, "revoked");
         assert!(enroll_token(&store, "n252", None, &primary).is_err());
         assert!(revoke(&store, "nobody").is_err());
+    }
+
+    #[test]
+    fn v1_power_soft_drains_live_battery_nodes_and_renders_summary() {
+        let now = 1_050_000;
+        let mut low_batt = node("nbatt");
+        low_batt.power = Some(json!({
+            "on_ac": false,
+            "battery_pct": 15,
+            "charging": false,
+            "remaining_mins": 30
+        }));
+
+        let mut on_ac = node("nac");
+        on_ac.power = Some(json!({
+            "on_ac": true,
+            "battery_pct": 10,
+            "charging": true,
+            "remaining_mins": 45
+        }));
+
+        let mut degraded = node("ndeg");
+        degraded.degraded = true;
+        degraded.power = Some(json!({
+            "on_ac": true,
+            "battery_pct": 100,
+            "charging": false,
+            "remaining_mins": null
+        }));
+
+        let mut drained = node("ndrain");
+        drained.drained = true;
+        drained.power = Some(json!({
+            "on_ac": true,
+            "battery_pct": 100,
+            "charging": false,
+            "remaining_mins": null
+        }));
+
+        let v1 = [low_batt, on_ac, degraded, drained];
+        let merged = merged_json_with_threshold(json!([]), &v1, now, 20);
+        let rows = merged.as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+
+        // On battery <= 20: soft-drained without mutating stored v1 `state`.
+        assert_eq!(rows[0]["state"], "active");
+        assert_eq!(rows[0]["power"]["battery_pct"], 15);
+        assert_eq!(rows[0]["low_battery_drain"], true);
+        assert_eq!(rows[0]["effective_drained"], true);
+        assert_eq!(rows[0]["schedulable"], false);
+
+        // Plugged in on AC even at 10%: not soft-drained, schedulable.
+        assert_eq!(rows[1]["low_battery_drain"], false);
+        assert_eq!(rows[1]["effective_drained"], false);
+        assert_eq!(rows[1]["schedulable"], true);
+
+        // Degraded node stays non-schedulable even on AC.
+        assert_eq!(rows[2]["state"], "active,degraded");
+        assert_eq!(rows[2]["low_battery_drain"], false);
+        assert_eq!(rows[2]["schedulable"], false);
+
+        // Drained node keeps original v1 state and reports effective_drained=true.
+        assert_eq!(rows[3]["state"], "active,drained");
+        assert_eq!(rows[3]["effective_drained"], true);
+        assert_eq!(rows[3]["schedulable"], false);
+
+        // Threshold 0 disables soft drain.
+        let off = merged_json_with_threshold(json!([]), &v1[..1], now, 0);
+        assert_eq!(off[0]["low_battery_drain"], false);
+        assert_eq!(off[0]["effective_drained"], false);
+        assert_eq!(off[0]["schedulable"], true);
+
+        // Text table includes power summary and LOW-BATTERY DRAIN notice.
+        let table = lines_with_threshold(&v1, now, 20);
+        assert!(
+            table[3].contains("battery 15% discharging 0h30m LOW-BATTERY DRAIN"),
+            "{}",
+            table[3]
+        );
+        assert!(table[4].contains("AC 10% charging 0h45m"), "{}", table[4]);
     }
 }
