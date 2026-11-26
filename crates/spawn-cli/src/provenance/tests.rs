@@ -826,3 +826,284 @@ mod pv4 {
         assert_eq!(row(&report, "opus")["landed_tasks"], 4);
     }
 }
+
+/// PV4 at landing: the hook (`record_land`, its workspace root found from
+/// the mirror's place under `<root>/.sources/`) writes the very rows
+/// `spawn prov index --root` writes, `supersedes` edges and the files over
+/// the cap included; a second index run records nothing.
+mod pv4_hook {
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::{Path, PathBuf};
+
+    use postgres::{Client, NoTls};
+    use serde_json::{Value, json};
+    use spawn_postgres::testing::TestSchema;
+
+    use super::super::index::{self, Repo};
+    use super::super::{Landed, mirror_root, record_land};
+
+    const SOURCE: &str = "/srv/prov-pv4-hook.git";
+
+    fn git(dir: &Path, clock: i64, arguments: &[&str]) -> String {
+        let date = format!("{clock} +0000");
+        let output = spawn_host::test_git_command()
+            .arg("-C")
+            .arg(dir)
+            .args(arguments)
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn owner(schema: &TestSchema) -> Client {
+        let mut client = Client::connect(schema.url(), NoTls).expect("the owner");
+        client
+            .batch_execute(&format!("set search_path to {}", schema.name()))
+            .expect("the schema");
+        client
+    }
+
+    fn facts(client: &mut Client) {
+        client
+            .batch_execute(
+                "insert into mission_missions (id, text, origin, created_at_ms, updated_at_ms)
+                 overriding system value values (1, 'prov', 'human', 0, 0);
+                 insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
+                                            created_by, created_at_ms, updated_at_ms)
+                 overriding system value
+                 values (11, 1, 'ephemeral', 'agent_a', 'session_a', 'a', 'human', 1000, 1000),
+                        (12, 1, 'ephemeral', 'agent_b', 'session_b', 'b', 'human', 1000, 1000);",
+            )
+            .expect("the mission layer");
+        client
+            .execute(
+                "insert into spawn_events (agent_id, session_id, source, kind, session_seq,
+                                           recorded_at_ms)
+                 values ('spawn_supervisor', 'session_control', 'control', $1, 1, 1000)",
+                &[&json!({"name": "control.recorded", "detail": {"record": {
+                    "type": "task.assigned", "id": 12, "brief": "Undo 11\n\nreverts: task 11\nfixes: task 11"}}})],
+            )
+            .expect("a task.assigned record");
+    }
+
+    fn canonical(client: &mut Client) -> BTreeMap<String, Value> {
+        let names: HashMap<i64, String> = client
+            .query("select id, change_id || '#' || rev from prov_changes", &[])
+            .expect("the changes")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        client
+            .query(
+                "select change_id || '#' || rev, spawn_prov_canonical(id) from prov_changes",
+                &[],
+            )
+            .expect("the canonical values")
+            .iter()
+            .map(|row| {
+                let mut value: Value = row.get(1);
+                for entry in value["entries"].as_array_mut().into_iter().flatten() {
+                    if let Some(origin) = entry["origin"].as_i64() {
+                        entry["origin"] = json!(names[&origin]);
+                    }
+                }
+                (row.get(0), value)
+            })
+            .collect()
+    }
+
+    /// A merge of `branch` into main, with the integrator's trailers.
+    fn land(work: &Path, clock: i64, task: i64, branch: &str) -> String {
+        let head = git(work, clock, &["rev-parse", branch]);
+        git(
+            work,
+            clock,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                &format!(
+                    "Task {task}\n\nreverts: task 11\n\nSpawn-Task: {task}\nSpawn-Head: {head}\n"
+                ),
+                branch,
+            ],
+        );
+        git(work, clock, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn the_hook_writes_the_supersedes_edges_and_oversized_entries_the_indexer_writes() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let scratch = std::env::temp_dir().join(format!(
+            "spawn-prov-pv4-hook-{}-{nanos:x}",
+            std::process::id()
+        ));
+        let work = scratch.join("work");
+        std::fs::create_dir_all(&work).expect("the work tree");
+        let result = std::panic::catch_unwind(|| run(&scratch, &work));
+        let _ = std::fs::remove_dir_all(&scratch);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn run(scratch: &Path, work: &Path) {
+        let mut clock = 1_700_000_000;
+        let mut tick = || {
+            clock += 1;
+            clock
+        };
+        git(work, tick(), &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("a.rs"), "one\n").expect("write");
+        git(work, tick(), &["add", "-A"]);
+        git(work, tick(), &["commit", "-qm", "Initial import"]);
+        // Branches outside `spawn/`: no walk meets them before they land.
+        git(work, tick(), &["checkout", "-q", "-b", "agent_a"]);
+        std::fs::write(work.join("a.rs"), "one\nbad\n").expect("write");
+        git(work, tick(), &["commit", "-qam", "spawn checkpoint exec_a"]);
+        git(work, tick(), &["checkout", "-q", "main"]);
+        let l11 = land(work, tick(), 11, "agent_a");
+        git(work, tick(), &["checkout", "-q", "-b", "agent_b"]);
+        std::fs::write(work.join("a.rs"), "one\n").expect("write");
+        git(work, tick(), &["commit", "-qam", "spawn checkpoint exec_b"]);
+        git(work, tick(), &["checkout", "-q", "main"]);
+        let l12 = land(work, tick(), 12, "agent_b");
+
+        // The mirror, where the integrator keeps it, at the first landing.
+        let root = scratch.join("root");
+        let mirror: PathBuf = root.join(".sources").join("prov.git");
+        std::fs::create_dir_all(root.join(".sources")).expect("sources");
+        git(
+            scratch,
+            tick(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &work.display().to_string(),
+                &mirror.display().to_string(),
+            ],
+        );
+        assert_eq!(mirror_root(&mirror), Some(root.as_path()));
+        assert_eq!(mirror_root(&work), None);
+        let mirror_text = mirror.display().to_string();
+        git(&mirror, tick(), &["update-ref", "refs/heads/main", &l11]);
+        // Task 12's agent left a file over the cap out of its checkpoint.
+        let big = b"a large file's bytes".to_vec();
+        let digest = format!(
+            "sha256:{}",
+            spawn_cas::sha256_reader(&mut &big[..]).expect("hash").hex()
+        );
+        std::fs::create_dir_all(root.join(".oversized")).expect("the records");
+        std::fs::write(
+            root.join(".oversized/agent_b"),
+            format!("untold\0{} {digest}\0model.bin\0", big.len()),
+        )
+        .expect("the record");
+
+        let domain = index::domain_of(SOURCE);
+        let hooked = TestSchema::new("prov_pv4_hook");
+        let indexed = TestSchema::new("prov_pv4_indexed");
+        let hooked_store = hooked.store();
+        let indexed_store = indexed.store();
+        let mut hooked_client = owner(&hooked);
+        let mut indexed_client = owner(&indexed);
+        facts(&mut hooked_client);
+        facts(&mut indexed_client);
+        // Main up to task 11's landing, as the integrator's earlier hook
+        // or index left it.
+        let mut repo = Repo::open(&mirror_text).expect("the mirror");
+        index::index(&hooked_store, &mut repo, &domain).expect("main indexed");
+        drop(repo);
+
+        // Task 12 lands: the push moves main, then the hook.
+        git(&mirror, tick(), &["update-ref", "refs/heads/main", &l12]);
+        let recorded = record_land(&hooked_store, &mirror, SOURCE, &l12);
+        assert!(matches!(recorded, Ok(Landed::Recorded(_))), "{recorded:?}");
+
+        // The indexer, on a database of its own, with the root.
+        let mut repo = Repo::open(&mirror_text).expect("the mirror");
+        index::index_with(&indexed_store, &mut repo, &domain, Some(&root)).expect("indexed");
+        let hooked_rows = canonical(&mut hooked_client);
+        assert_eq!(hooked_rows, canonical(&mut indexed_client));
+        // And again: nothing.
+        let again = index::index_with(&hooked_store, &mut repo, &domain, Some(&root))
+            .expect("indexed again");
+        assert_eq!(again.recorded(), 0);
+        assert_eq!(canonical(&mut hooked_client), hooked_rows);
+
+        // What the rows say: level 1 and the fixes, from the brief alone
+        // (the landing messages' "reverts: task 11" is the agent's text);
+        // task 11's landing has no edge of the kind.
+        let land12 = hooked_rows
+            .values()
+            .find(|row| row["change"]["kind"] == "land" && row["change"]["task_id"] == 12)
+            .expect("task 12's landing");
+        let edges: Vec<&Value> = land12["edges"]
+            .as_array()
+            .expect("edges")
+            .iter()
+            .filter(|edge| edge["kind"] == "supersedes")
+            .collect();
+        let details: Vec<&Value> = edges.iter().map(|edge| &edge["detail"]).collect();
+        assert_eq!(
+            details,
+            [
+                &json!({"reason": "defect", "evidence": "dispatcher_fixes", "target_task": 11}),
+                &json!({"reason": "defect", "evidence": "level1_revert", "target_task": 11}),
+            ]
+        );
+        let land11 = hooked_rows
+            .values()
+            .find(|row| row["change"]["kind"] == "land" && row["change"]["task_id"] == 11)
+            .expect("task 11's landing");
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge["dst"] == land11["change"]["change_id"]),
+            "{edges:?}"
+        );
+        assert!(
+            land11["edges"]
+                .as_array()
+                .expect("edges")
+                .iter()
+                .all(|edge| edge["kind"] != "supersedes")
+        );
+        let model = land12["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .find(|entry| entry["path"] == "model.bin")
+            .expect("the file over the cap");
+        assert_eq!(
+            (
+                &model["after"],
+                &model["size"],
+                &model["class"],
+                &model["before"]
+            ),
+            (
+                &json!(digest),
+                &json!(big.len()),
+                &json!("content"),
+                &Value::Null
+            )
+        );
+        drop((hooked_store, indexed_store));
+    }
+}
