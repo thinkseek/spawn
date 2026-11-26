@@ -2,7 +2,7 @@
 
 [English README](../README.md) · [中文 README](../README.zh-CN.md) · [技术方案与接口契约](./design.md) · [视图层设计](./view-architecture.md) · [舰队架构](./fleet-architecture.md) · [存储](./storage.md) · [RSI](./rsi.md) · [升级](./upgrading.md)
 
-结论：Spawn 用 10 个 Rust crate（`spawn-core`、`spawn-postgres`、`spawn-host`、`spawn-cas`、`spawn-jev`、`spawn-kdf`、`spawn-codegraph`、`spawn-node-proto`、`spawn-node-gateway`、`spawn-cli`）连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件、对外提供 SQL 视图并以 `LISTEN/NOTIFY` 发出变更提示，Jev 判定语义状态，`spawn` 二进制做装配并提供 Thin Web + PWA 控制面（`spawn serve`）。Spawn 自己的源码全部同步阻塞，不写 async（见第 10 节：`postgres` 驱动内部链接了 `tokio`）。
+结论：Spawn 用 12 个 Rust crate（`spawn-core`、`spawn-postgres`、`spawn-host`、`spawn-cas`、`spawn-jev`、`spawn-kdf`、`spawn-codegraph`、`spawn-node-proto`、`spawn-node-gateway`、`ghostty-vt`、`spawn-hc`、`spawn-cli`）连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件、对外提供 SQL 视图并以 `LISTEN/NOTIFY` 发出变更提示，Jev 判定语义状态，`spawn` 二进制做装配并提供 Thin Web + PWA 控制面（`spawn serve`），独立配套二进制 `spawn-hc` 承载内嵌 `herdr-core` 守护进程（`spawn` 自身不链接 `herdr-core` 与 `ghostty-vt`）。Spawn 自己的源码全部同步阻塞，不写 async（见第 10 节：`postgres` 驱动内部链接了 `tokio`；`herdr-core` 的异步运行时被严格隔离在独立的 `spawn-hc` 二进制中）。
 
 ## 1. 能力与边界
 
@@ -26,14 +26,16 @@ Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎�
 | --- | --- | --- |
 | `spawn-core` | 类型、端口、事件归一、Bridge、Observer、能力图模型；内存实现与一致性套件在 `testing` feature 后。零 IO | serde、serde_json、sha2、thiserror |
 | `spawn-postgres` | EventLog + CommandQueue 的 PG 实现、`sql/schema.sql`、读方法、`LISTEN spawn_events` 连接（`wake.rs`） | spawn-core、spawn-kdf、postgres、postgres-protocol、fallible-iterator、serde、serde_json、whoami |
-| `spawn-host` | 终端（`TerminalHost`：`HerdrHost` 默认，`TmuxHost` 由 `SPAWN_TERMINAL_BACKEND=tmux` 显式选择）、工作区存储（`LocalWorkspaceStore`：`git`、`cow`、`overlay` 三种引擎加 `auto` 选择，同一 `WorkspaceStore` 契约；`cas_dedup` 对 Cow 工作区的 `target/`、`node_modules/` 去重，块存于 `spawn-cas`）、transcript 归档、inotify | spawn-core、spawn-cas、libc、rustix、serde_json |
+| `spawn-host` | 终端（`TerminalHost`：`HerdrCoreHost` 默认通过进程外 `spawn-hc` 运行，`HerdrPool` 按分片路由到 `<session>-s0..N`，`HerdrHost` 由 `SPAWN_HERDR_MODE=legacy` 选择，`TmuxHost` 由 `SPAWN_TERMINAL_BACKEND=tmux` 显式选择；`herdr_witness` 宿主机第二证人；`BwrapView` 沙箱隔离）、工作区存储（`LocalWorkspaceStore`：`git`、`cow`、`overlay` 三种引擎加 `auto` 选择，同一 `WorkspaceStore` 契约；`cas_dedup` 对 Cow 工作区的 `target/`、`node_modules/` 去重，块存于 `spawn-cas`）、transcript 归档、inotify | spawn-core、spawn-cas、libc、rustix、serde_json |
 | `spawn-cas` | 统一内容寻址存储：带算法前缀的摘要（`sha256:<64 hex>`）、`objects/<algo>/<2 hex>/<hex>`（0444）、`pins/<owner>/<name>`、按命名空间的 LRU GC（`access/<ns>/`）、`tmp/` 暂存；crash-only，不 fsync；与 Go `spawn-node/cas` 同一磁盘布局；旧 `cas_dedup` 的 `<2 hex>/<hex>` 原地改名收编，不重算哈希 | sha2、thiserror、libc |
 | `spawn-jev` | 判定 HTTP 客户端，端口在 core，实现在此 | spawn-core、serde、serde_json |
 | `spawn-kdf` | 受限登录口令的 PBKDF2-HMAC-SHA256 派生（单独一个 crate，开发构建也以 `opt-level = 3` 编译） | sha2、hmac |
 | `spawn-codegraph` | 能力图的代码依赖事实：从仓库文件抽取代码图 | spawn-core、syn、proc-macro2 |
 | `spawn-node-proto` | spawn-node v1 线协议：签名请求信封与响应、大小上限、严格 JSON、heartbeat/spec/grant/result/enroll 报文、`tree_sha256_v1`（即 `scenarios_sha256`），以及与 Go 守护进程共用的 golden fixtures（`testdata/node-protocol-v1/`） | ring、sha2、base64、serde、serde_json、thiserror |
 | `spawn-node-gateway` | 二进制 `spawn-node-gateway`：spawn-node v1 网关，节点与账本之间唯一的门。同步的 std HTTP/1.1 服务（16 个 worker，各持一条 PG 连接），以受限登录 `spawn_node_gateway` 调用四个 `spawn_node_gw_*` 函数（先验签再提交），签名每个应答与 grant，流式落盘 result，按 Range 提供 artifact；协议见 `docs/node-protocol-v1.md` | spawn-node-proto、spawn-postgres、ring、sha2、base64、serde、serde_json、zeroize |
-| `spawn-cli` | 二进制 `spawn`，装配上述实现；`spawn serve` 的 HTTP 服务、节点网格 | 上述全部，以及 tiny_http、rustix、ring、rustls 等 |
+| `ghostty-vt` | 供 `[patch."https://github.com/herdrdev/herdr-core"]` 使用的纯 Rust VT100/xterm/OSC-7501 仿真替代层（实现 `Terminal`、`StatusReport`、`Rgb`，零 Zig / 零 C FFI / 零 `build.rs`） | serde、serde_json |
+| `spawn-hc` | 独立配套二进制 `spawn-hc`：封装 `herdr-core` CLI/守护进程与 OpenRPC Unix socket 入口，将 `herdr-core` 及其 tokio 运行时与主 `spawn` 二进制进程外隔离 | herdr-core（及patched `ghostty-vt`） |
+| `spawn-cli` | 二进制 `spawn`，装配上述实现（不含 `herdr-core`/`ghostty-vt`，通过子进程与 Unix socket 驱动 `spawn-hc`）；`spawn serve` 的 HTTP 服务、节点网格 | 上述 core/host/pg 等实现层，以及 tiny_http、rustix、ring、rustls 等 |
 
 ```mermaid
 flowchart LR
@@ -46,6 +48,8 @@ flowchart LR
   graph[spawn-codegraph]
   proto[spawn-node-proto]
   gw[spawn-node-gateway]
+  vt[ghostty-vt]
+  hc[spawn-hc]
   cli[spawn-cli]
   pg --> core
   pg --> kdf
@@ -58,11 +62,12 @@ flowchart LR
   cli --> host
   cli --> graph
   cli --> proto
+  hc --> vt
   gw --> proto
   gw --> pg
 ```
 
-依赖单向：只有 `spawn-cli` 同时依赖各实现层；实现层之间的依赖只有两条：`spawn-postgres` 用 `spawn-kdf` 派生登录口令，`spawn-host` 的 `cas_dedup` 把块存进 `spawn-cas`。`spawn-node-gateway` 是另一个二进制，只依赖 `spawn-node-proto` 与 `spawn-postgres`。
+依赖单向：只有 `spawn-cli` 同时依赖 `spawn` 各同步实现层；独立配套二进制 `spawn-hc` 仅封装 `herdr-core`（经 Cargo `[patch]` 使用纯 Rust `ghostty-vt`），与 `spawn` 二进制完全隔离，因此 `spawn` 不引入 `herdr-core`、`ghostty-vt` 或任何新增异步依赖；实现层之间的依赖只有两条：`spawn-postgres` 用 `spawn-kdf` 派生登录口令，`spawn-host` 的 `cas_dedup` 把块存进 `spawn-cas`。`spawn-node-gateway` 是另一个二进制，只依赖 `spawn-node-proto` 与 `spawn-postgres`。
 
 ## 3. 一次任务的链路
 
@@ -173,9 +178,12 @@ spawn fleet
 | `SPAWN_MAX_FILE_MB` | `100` | Git 与 Cow checkpoint 收录的单个文件上限（MiB）；更大的文件不进 checkpoint，并告知 agent 一次（overlay 的 checkpoint 无上限） |
 | `SPAWN_WORKSPACE_BACKEND` | `git` | 根下所有工作区的引擎：`git`、`cow`（写时复制克隆）、`auto`（文件系统能克隆时用 Cow，否则 Git，从不选 overlay）、`overlay`（显式选择，仅 Linux；`spawn loop` 目前拒绝）。其他取值，或根已被另一引擎占用（`<root>/.spawn-workspace-backend`），`spawn loop` 启动即退出（docs/storage.md「Workspace backends」） |
 | `SPAWN_CAS_DEDUP` | 未设 | `1`：每次挂载 Cow 工作区时把 `target/`、`node_modules/` 对 `<root>/.cas` 去重（从不碰 transcript），卸载后修剪；`0` 或未设：关闭；其他取值 `spawn loop` 启动即退出 |
-| `SPAWN_TERMINAL_BACKEND` | `herdr` | 终端后端：`herdr`（默认）或 `tmux`（显式回退） |
-| `SPAWN_HERDR_PROGRAM` | `herdr` | herdr 可执行文件 |
-| `SPAWN_HERDR_SESSION` | `spawn` | herdr 私有 `--session` 会话名 |
+| `SPAWN_TERMINAL_BACKEND` | `herdr` | 终端后端：`herdr`（默认，经 `SPAWN_HERDR_MODE=core` 路由到内置 `spawn-hc`）或 `tmux`（显式回退） |
+| `SPAWN_HERDR_MODE` | `core` | herdr 后端模式：`core`（默认，使用同目录 `spawn-hc`）或 `legacy`（外置 legacy `herdr`） |
+| `SPAWN_HERDR_CORE_PROGRAM` | 同目录 `spawn-hc` | 内嵌 `herdr-core` 模式的可执行文件覆写路径 |
+| `SPAWN_HERDR_SHARDS` | `1` | Herdr 服务分片数（`1..=64`；大于 1 时按终端名确定性路由到 `<session>-s0..N`） |
+| `SPAWN_HERDR_PROGRAM` | `herdr` | legacy `herdr` 可执行文件（`SPAWN_HERDR_MODE=legacy` 时） |
+| `SPAWN_HERDR_SESSION` | `spawn` | `spawn-hc` / legacy `herdr` 私有会话名 |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 可执行文件（`SPAWN_TERMINAL_BACKEND=tmux` 时） |
 | `SPAWN_TMUX_SOCKET` | 无 | 私有 tmux socket（`SPAWN_TERMINAL_BACKEND=tmux` 时） |
 | `SPAWN_JUDGE_URL` | 未设 | 判定服务根地址，未设时用内置规则 |
