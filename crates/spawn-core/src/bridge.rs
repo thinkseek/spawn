@@ -9529,7 +9529,7 @@ mod tests {
             other => panic!("failed, not {other:?}"),
         }
         assert!(
-            store.submitted_texts().is_empty(),
+            store.submitted_held().is_empty(),
             "nothing typed into an engine on an unchosen model"
         );
     }
