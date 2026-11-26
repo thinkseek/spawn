@@ -619,6 +619,25 @@ const FOLLOW_OVERLAP: usize = 4096;
 /// execution's own ([`Bridge::bind_reported`]), in milliseconds.
 const SCAN_INTERVAL_MS: i64 = 2_000;
 
+/// A prompt (`USER_INPUT`) of agy's full transcript `bytes`, written at or
+/// after `not_before` (its `created_at`, epoch ms; none or unreadable is
+/// not), holds a marker `ours` accepts ([`Bridge::bind_reported`]).
+fn typed_since(bytes: &[u8], not_before: u64, ours: &dyn Fn(&CommandId) -> bool) -> bool {
+    String::from_utf8_lossy(bytes).lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+            value["type"] == "USER_INPUT"
+                && value["created_at"]
+                    .as_str()
+                    .and_then(rfc3339_ms)
+                    .and_then(|created| u64::try_from(created).ok())
+                    .is_some_and(|created| created >= not_before)
+                && value["content"]
+                    .as_str()
+                    .is_some_and(|content| crate::message::markers(content).iter().any(ours))
+        })
+    })
+}
+
 /// How much older than its execution's `execution.started` a prompt of an
 /// engine that names its own session may say it is and still bind it
 /// ([`Bridge::bind_reported`]): the engine's clock and the store's may
@@ -670,7 +689,10 @@ fn rfc3339_ms(text: &str) -> Option<i64> {
     let mut rest = &bytes[19..];
     let mut millis = 0;
     if let Some(fraction) = rest.strip_prefix(b".") {
-        let digits = fraction.iter().take_while(|byte| byte.is_ascii_digit()).count();
+        let digits = fraction
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
         if digits == 0 {
             return None;
         }
@@ -2154,19 +2176,19 @@ impl Bridge {
                     // As the store names it now: a record from before the
                     // root was resolved names the same directory.
                     let workspace = self.workspaces.canonical(workspace);
-                    let mut active = Active::started(
-                        execution_id,
-                        workspace,
-                        *transcript_from,
-                        driver_or_default(engine),
-                        record.recorded_at,
-                    );
-                    // A fresh start of this Bridge's own listed what was
-                    // there before its launch; a restart has no such list.
-                    if let Some(names) = self.preexisting.remove(&active.execution_id) {
-                        active.preexisting_natives = names;
-                    }
-                    view.active = Some(active);
+                    // What a fresh start of this Bridge's own listed before
+                    // its launch; a restart has no such list.
+                    let preexisting = self.preexisting.remove(&execution_id);
+                    view.active = Some(Active {
+                        preexisting_natives: preexisting.unwrap_or_default(),
+                        ..Active::started(
+                            execution_id,
+                            workspace,
+                            *transcript_from,
+                            driver_or_default(engine),
+                            record.recorded_at,
+                        )
+                    });
                 }
             }
             // After a restart, the last recorded screen. The Bridge's own
@@ -3338,17 +3360,16 @@ impl Bridge {
         let home = self.config.home_of(driver);
         let root = format!("{}/", home.sessions.trim_end_matches('/'));
         let not_before = active.started_at.saturating_sub(BIND_SKEW_MS);
-        // Bound already, by any execution of any session in the store.
-        let taken = |native: &str| {
-            self.sessions
-                .values()
-                .any(|view| view.natives.contains(native))
-        };
         // The transcript of `native`, when it is below the engine's home and
         // a prompt in it, written since this execution started, holds a
         // marker typed into this execution.
         let proven = |native: &str| -> Option<String> {
-            if taken(native) {
+            // Bound already, by any execution of any session in the store.
+            if self
+                .sessions
+                .values()
+                .any(|view| view.natives.contains(native))
+            {
                 return None;
             }
             let path = driver.transcript_path(&home, &workspace, native);
@@ -3358,21 +3379,7 @@ impl Bridge {
             let Ok(Some(bytes)) = self.terminals.read_from(&workspace, &path, 0) else {
                 return None;
             };
-            let typed = String::from_utf8_lossy(&bytes).lines().any(|line| {
-                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
-                    value["type"] == "USER_INPUT"
-                        && value["created_at"]
-                            .as_str()
-                            .and_then(rfc3339_ms)
-                            .is_some_and(|created| {
-                                u64::try_from(created).is_ok_and(|created| created >= not_before)
-                            })
-                        && value["content"].as_str().is_some_and(|content| {
-                            crate::message::markers(content).iter().any(ours)
-                        })
-                })
-            });
-            typed.then_some(path)
+            typed_since(&bytes, not_before, &ours).then_some(path)
         };
         let mut bound = reported
             .as_deref()
@@ -4397,19 +4404,10 @@ impl Bridge {
             started_at: u64::try_from(self.clock.now().0).unwrap_or(0),
             preexisting_natives: HashSet::new(),
         };
-        // A fresh start of an engine that names its own session: the
-        // conversations already below its home are none of this
-        // execution's ([`Self::bind_reported`]). Listed before the launch,
-        // handed to the view's execution when its record is folded.
         if native.is_none()
-            && prepared.driver.traits().session == SessionBinding::Reported
-            && let Some(dir) = prepared
-                .driver
-                .session_scan_dir(&self.config.home_of(prepared.driver))
-            && let Ok(names) = self.terminals.list_dirs(&active.workspace, &dir)
+            && let Some(names) = self.preexisting_natives(prepared.driver, &active.workspace)
         {
-            self.preexisting
-                .insert(active.execution_id.clone(), names.into_iter().collect());
+            self.preexisting.insert(active.execution_id.clone(), names);
         }
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
@@ -4446,6 +4444,24 @@ impl Bridge {
         }
         self.prepared.remove(&claimed.command_id);
         self.launch_and_prompt(claimed, &active, native, &prepared, prompt, report)
+    }
+
+    /// Before a fresh start of an engine that names its own session, the
+    /// conversations already below its home: none of them is the
+    /// execution's ([`Self::bind_reported`]). Listed before the launch and
+    /// handed to the view's execution when its record is folded
+    /// ([`Active::preexisting_natives`]).
+    fn preexisting_natives(
+        &self,
+        driver: &dyn AgentDriver,
+        workspace: &WorkspaceId,
+    ) -> Option<HashSet<String>> {
+        if driver.traits().session != SessionBinding::Reported {
+            return None;
+        }
+        let dir = driver.session_scan_dir(&self.config.home_of(driver))?;
+        let names = self.terminals.list_dirs(workspace, &dir).ok()?;
+        Some(names.into_iter().collect())
     }
 
     /// Why `driver`'s engine cannot start on this host for want of a
@@ -10688,8 +10704,7 @@ mod tests {
                 &Submission {
                     agent_id: AgentId::new("agent_agy").expect("agent"),
                     session_id: SessionId::new(session).expect("session"),
-                    idempotency_key: IdempotencyKey::new(format!("start-{session}"))
-                        .expect("key"),
+                    idempotency_key: IdempotencyKey::new(format!("start-{session}")).expect("key"),
                     action: CommandAction::Start {
                         engine: "agy".to_string(),
                         prompt: "hello".to_string(),
@@ -10756,7 +10771,10 @@ mod tests {
         );
         host.set_dirs(&brain, &[stale, skewed, timeless]);
         d1_polls(&clock, &mut bridge);
-        assert!(agy_natives(&store).is_empty(), "a stale conversation binds nothing");
+        assert!(
+            agy_natives(&store).is_empty(),
+            "a stale conversation binds nothing"
+        );
 
         // Restarted: what was there before the start is not known, and the
         // stale conversation still binds nothing.
@@ -10916,7 +10934,10 @@ mod tests {
     fn rfc3339_ms_reads_utc_fractions_and_offsets() {
         assert_eq!(rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(rfc3339_ms("2026-11-25T14:25:59Z"), Some(1_795_616_759_000));
-        assert_eq!(rfc3339_ms("2026-11-25T14:25:59.5Z"), Some(1_795_616_759_500));
+        assert_eq!(
+            rfc3339_ms("2026-11-25T14:25:59.5Z"),
+            Some(1_795_616_759_500)
+        );
         assert_eq!(
             rfc3339_ms("2026-11-25T14:25:59.123456789Z"),
             Some(1_795_616_759_123)
