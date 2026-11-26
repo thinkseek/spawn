@@ -148,17 +148,29 @@ pub struct RemoteJobSpec {
 /// A remote job as the ledger holds it.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct RemoteJob {
+    /// Unique job identifier (`spawn_remote_jobs.job_id`).
     pub job_id: String,
+    /// Scheduling cell identifier (`c0` by default).
     pub cell_id: String,
+    /// Kind of work performed (`gate`, `gate_shadow`, `build`, `de_batch`).
     pub kind: RemoteJobKind,
+    /// Current lifecycle state in the ledger.
     pub state: RemoteJobState,
+    /// Dispatch priority (higher executes first).
     pub priority: i32,
+    /// Associated judging identifier, if any.
     pub judging_id: Option<String>,
+    /// Associated mission id, if any.
     pub mission_id: Option<i64>,
+    /// Associated task id, if any.
     pub task_id: Option<i64>,
+    /// Job specification payload passed to the worker node.
     pub spec: Value,
+    /// Required node capabilities/tags map.
     pub requires: Value,
+    /// Estimated resource cost deducted from node capacity pools.
     pub cost: Value,
+    /// Baseline Git commit OID, if needed by the remote job.
     pub base_commit: Option<String>,
     /// Nodes that may not be leased it again.
     pub excluded_nodes: Vec<String>,
@@ -169,42 +181,66 @@ pub struct RemoteJob {
     /// Moves at every grant and every fence: only the current epoch's
     /// result is believed.
     pub lease_epoch: i64,
+    /// Timestamp when the current lease expires, in epoch milliseconds.
     pub lease_expires_ms: Option<i64>,
+    /// Timestamp until which a late result is accepted after lease expiry.
     pub grace_until_ms: Option<i64>,
+    /// Total execution attempts used so far.
     pub attempts: i32,
+    /// Maximum attempts permitted before fallback or dead-lettering.
     pub max_attempts: i32,
+    /// Timestamp when the job was first enqueued, in epoch milliseconds.
     pub enqueued_at_ms: i64,
+    /// Queue deadline timestamp in epoch milliseconds, if bounded.
     pub queue_deadline_ms: Option<i64>,
+    /// Timestamp when the current attempt was leased, in epoch milliseconds.
     pub leased_at_ms: Option<i64>,
+    /// Completion timestamp in epoch milliseconds, once finished.
     pub finished_at_ms: Option<i64>,
+    /// Remote process exit code, once finished.
     pub exit_code: Option<i32>,
     /// The node's result metadata, as it sent it.
     pub result: Option<Value>,
+    /// SHA-256 hex digest of the result artifact, if uploaded.
     pub result_sha256: Option<String>,
+    /// SHA-256 hex digest of the captured log artifact, if uploaded.
     pub log_sha256: Option<String>,
+    /// Byte length of the captured remote log, if known.
     pub log_bytes: Option<i64>,
 }
 
 /// A v1 node as the ledger holds it (its key and token digest left out).
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct NodeV1 {
+    /// Human-readable unique node name.
     pub name: String,
     /// SHA-256 of its Ed25519 key, in hex; none before enrollment.
     pub node_id: Option<String>,
+    /// Scheduling cell identifier (`c0` by default).
     pub cell_id: String,
     /// `pending`, `active` or `revoked`.
     pub status: String,
+    /// Whether an administrator drained this node from receiving new leases.
     pub drained: bool,
     /// Three strikes: no grants until an undrain.
     pub degraded: bool,
+    /// Whether the sweeper recorded a `node.lost` alert transition for the current outage.
     pub lost_recorded: bool,
+    /// Consecutive host-fault strikes accumulated by this node.
     pub host_fault_strikes: i32,
+    /// Node boot identifier sent on enrollment/heartbeat.
     pub boot_id: Option<String>,
+    /// Last monotonic heartbeat sequence number observed.
     pub beat_seq: i64,
+    /// Timestamp of the last heartbeat in epoch milliseconds.
     pub last_beat_ms: Option<i64>,
+    /// SHA-256 hex digest of the node's advertised capability specification.
     pub spec_sha256: Option<String>,
+    /// Node capability specification JSON object.
     pub spec: Option<Value>,
+    /// Base commits cached warmly on this node.
     pub warm_bases: Vec<String>,
+    /// Power/thermal telemetry reported in heartbeats, if available.
     #[serde(default)]
     pub power: Option<Value>,
 }
@@ -213,10 +249,15 @@ pub struct NodeV1 {
 /// its boot id and its spec (hashed by the gateway).
 #[derive(Clone, Copy, Debug)]
 pub struct NodeEnroll<'a> {
+    /// SHA-256 digest of the single-use enrollment token presented by the node.
     pub token_sha256: &'a [u8; 32],
+    /// 32-byte Ed25519 public key to bind to the enrolled node.
     pub pubkey: &'a [u8; 32],
+    /// Boot identifier reported by the enrolling node process.
     pub boot_id: &'a str,
+    /// SHA-256 hex digest of `spec`.
     pub spec_sha256: &'a str,
+    /// Node capability specification JSON payload.
     pub spec: &'a Value,
 }
 
@@ -224,13 +265,16 @@ pub struct NodeEnroll<'a> {
 /// caller's check of the answer passed).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Committed<T> {
+    /// Decoded SQL function response returned prior to signature verification.
     pub answer: T,
+    /// True if the verify closure passed and the database transaction committed.
     pub committed: bool,
 }
 
 /// An owner's change of a v1 node (`spawn_node_admin`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeAction {
+    /// Stop granting new remote jobs while allowing in-flight leases to drain.
     Drain,
     /// Also clears `degraded` and the strikes.
     Undrain,
@@ -254,7 +298,9 @@ impl NodeAction {
 pub enum FaultNext {
     /// To another node (this one excluded), while attempts remain.
     Queued,
+    /// Reassigned to run locally on the primary host.
     FallbackLocal,
+    /// Exhausted all retry attempts; moved to terminal dead-letter state.
     DeadLetter,
     /// The row stays completed.
     Keep,
@@ -275,6 +321,7 @@ impl FaultNext {
 /// that epoch, or was judged already.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct FaultOutcome {
+    /// Whether the fault transition applied cleanly at the requested epoch.
     pub ok: bool,
     /// Where the job went (the poison rule and the attempts may override
     /// the asked one).
@@ -286,6 +333,7 @@ pub struct FaultOutcome {
     /// The node's strikes after a strike.
     #[serde(default)]
     pub strikes: Option<i32>,
+    /// Whether the node crossed the strike limit and is now marked degraded.
     #[serde(default)]
     pub degraded: Option<bool>,
 }
@@ -294,8 +342,11 @@ pub struct FaultOutcome {
 /// their grace, nodes recorded lost.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct SweepOutcome {
+    /// Leases transitioned to `result_pending` awaiting grace completion.
     pub waiting: i64,
+    /// Expired leases fenced after their grace period elapsed.
     pub fenced: i64,
+    /// Nodes marked `lost` after missing their heartbeat threshold.
     pub lost: i64,
 }
 

@@ -5,7 +5,7 @@
 //! A test that needs the database makes a [`TestSchema`] and holds it for as
 //! long as it uses the schema. Dropping the guard drops the schema and
 //! everything in it, whether the test passed or failed (the guard dropped
-//! while the thread panics). With [`KEEP_FAILED`] set to `1` when the guard
+//! while the thread panics). With `KEEP_FAILED` set to `1` when the guard
 //! was made, a failed test's schema is kept for debugging and its name is
 //! printed. Only the schema the guard named is ever dropped, by that
 //! name: never one found by a pattern, since the tests of other processes
@@ -20,11 +20,11 @@
 use crate::PostgresStore;
 
 /// The variable that names the test database.
-pub const TEST_DATABASE_URL: &str = "SPAWN_TEST_DATABASE_URL";
+pub(crate) const TEST_DATABASE_URL: &str = "SPAWN_TEST_DATABASE_URL";
 
 /// The variable that keeps a failed test's schema for debugging: only the
 /// value `1` keeps it; unset, or any other value, drops it.
-pub const KEEP_FAILED: &str = "SPAWN_TEST_KEEP_FAILED";
+const KEEP_FAILED: &str = "SPAWN_TEST_KEEP_FAILED";
 
 /// How long the drop's connection waits for the server: a failing test's
 /// guard connects as it unwinds, and a server that never answers would
@@ -32,7 +32,7 @@ pub const KEEP_FAILED: &str = "SPAWN_TEST_KEEP_FAILED";
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A schema of the test's own, by name (it derefs to `str`), dropped on drop,
-/// a failing test's too unless [`KEEP_FAILED`] is `1` (then it is kept, and
+/// a failing test's too unless `KEEP_FAILED` is `1` (then it is kept, and
 /// its name said).
 ///
 /// Hold it before the connections that use the schema, so that they close
@@ -58,7 +58,7 @@ impl TestSchema {
     /// connection after it (`application_name`, objective 094), so a reader
     /// tells a live test's schema from a leftover.
     ///
-    /// It reads [`KEEP_FAILED`] now: a failed test keeps its schema only
+    /// It reads `KEEP_FAILED` now: a failed test keeps its schema only
     /// when the variable was `1` here.
     ///
     /// # Panics
@@ -139,7 +139,7 @@ fn client(url: &str) -> Result<postgres::Client, postgres::Error> {
 }
 
 /// Drops the schema: as the test passes, and as a failing test unwinds (the
-/// thread panicking), by the same statement, unless [`KEEP_FAILED`] was `1`
+/// thread panicking), by the same statement, unless `KEEP_FAILED` was `1`
 /// when the guard was made (then it is kept, and its name said). A drop
 /// that fails is said, never a panic: a panic while a failing test unwinds
 /// would abort the whole test process.
@@ -184,9 +184,11 @@ pub const FLEET_HEALTH: &str = crate::fleet::FLEET_HEALTH;
 /// transcript lookup uses its session/time/event-id index: tests/message_due.rs).
 pub const ALERT_MESSAGES_SINCE: &str = crate::alerts::MESSAGES_SINCE;
 
-/// The nodes' two reads, for a test to read their plans (each fact one
-/// seek, never a scan of a node's heartbeats: tests/nodes.rs).
+/// The `nodes` query statement, for a test to inspect its query plan
+/// (single seek per node, never a full heartbeat scan: `tests/nodes.rs`).
 pub const NODES: &str = crate::nodes::NODES;
+/// The `node_members` query statement, for a test to inspect its query plan
+/// (single seek per node, never a full heartbeat scan: `tests/nodes.rs`).
 pub const NODE_MEMBERS: &str = crate::nodes::MEMBERS;
 
 #[cfg(test)]

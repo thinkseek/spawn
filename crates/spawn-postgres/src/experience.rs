@@ -175,7 +175,7 @@ select jsonb_build_object(
 
 impl PostgresStore {
     /// How the fleet did over `[since_ms, until_ms)`, from the experience
-    /// views ([`WINDOW`]).
+    /// views (`WINDOW`).
     ///
     /// A mission's `owner_work` reads its last configuration record, and
     /// that is its configuration as its fold has it (`mission_missions`,
@@ -189,7 +189,7 @@ impl PostgresStore {
     }
 
     /// The interventions of `[since_ms, until_ms)` and the agent time
-    /// beside them ([`INTERVENTIONS`]).
+    /// beside them (`INTERVENTIONS`).
     pub fn interventions_window(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(INTERVENTIONS, &[&since_ms, &until_ms])
     }

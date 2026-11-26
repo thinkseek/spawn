@@ -2059,19 +2059,19 @@ impl PostgresStore {
     }
 
     /// An objective mission's task outcomes, oldest first
-    /// ([`OBJECTIVE_OUTCOMES`]).
+    /// (`OBJECTIVE_OUTCOMES`).
     pub fn objective_outcomes(&self, mission: i64) -> Result<Value, StoreError> {
         self.query_json(OBJECTIVE_OUTCOMES, &[&mission])
     }
 
     /// The objective yields not told to the supervisor yet
-    /// ([`OBJECTIVE_YIELDS`]).
+    /// (`OBJECTIVE_YIELDS`).
     pub fn objective_yields(&self) -> Result<Value, StoreError> {
         self.query_json(OBJECTIVE_YIELDS, &[])
     }
 
     /// The objectives that closed solved on the base and were not told to the
-    /// supervisor yet ([`OBJECTIVE_SOLVED_NEWS`]).
+    /// supervisor yet (`OBJECTIVE_SOLVED_NEWS`).
     pub fn objective_solved_news(&self) -> Result<Value, StoreError> {
         self.query_json(OBJECTIVE_SOLVED_NEWS, &[])
     }
@@ -2106,7 +2106,7 @@ impl PostgresStore {
     }
 
     /// The earlier tasks of one objective that ended without landing, newest
-    /// first, with the work each left ([`OBJECTIVE_PRIOR_WORK`]).
+    /// first, with the work each left (`OBJECTIVE_PRIOR_WORK`).
     pub fn objective_prior_work(
         &self,
         mission: i64,
@@ -2117,7 +2117,7 @@ impl PostgresStore {
     }
 
     /// The predecessor's work an ephemeral objective task starts from, or
-    /// null ([`OBJECTIVE_FORK`]).
+    /// null (`OBJECTIVE_FORK`).
     pub fn objective_fork(&self, task: i64) -> Result<Value, StoreError> {
         self.query_json(OBJECTIVE_FORK, &[&task])
     }
@@ -2136,7 +2136,7 @@ impl PostgresStore {
     }
 
     /// Take the integrator's lock on this connection, named `name` first
-    /// (`application_name`, objective 221: "spawn integrate pid=<pid>"), so
+    /// (`application_name`, objective 221: `"spawn integrate pid=<pid>"`), so
     /// a refused integrator can say who holds it. False means another
     /// connection holds it.
     pub fn integrator_lock(&self, name: &str) -> Result<bool, StoreError> {
@@ -2244,7 +2244,7 @@ impl PostgresStore {
 
     /// `source`'s owner landing requests, newest first, at most `limit`, each
     /// with its state and outcome; `commit` (a prefix) keeps that commit's
-    /// only ([`SOURCE_PUSHES`]).
+    /// only (`SOURCE_PUSHES`).
     pub fn source_pushes(
         &self,
         source: &str,
@@ -2255,13 +2255,13 @@ impl PostgresStore {
     }
 
     /// The owner's landing requests without an outcome yet, oldest first
-    /// ([`SOURCE_PUSHES_PENDING`]).
+    /// (`SOURCE_PUSHES_PENDING`).
     pub fn source_pushes_pending(&self) -> Result<Value, StoreError> {
         self.query_json(SOURCE_PUSHES_PENDING, &[])
     }
 
     /// The outcome of the owner's landing request `request`, `None` while it
-    /// is pending ([`SOURCE_PUSH_OUTCOME`]).
+    /// is pending (`SOURCE_PUSH_OUTCOME`).
     pub fn source_push_outcome(&self, request: i64) -> Result<Option<Value>, StoreError> {
         Ok(self
             .query_opt(SOURCE_PUSH_OUTCOME, &[&request])?
@@ -2270,7 +2270,7 @@ impl PostgresStore {
 
     /// The reason of the last `source.push_no_verdict` recorded for the
     /// owner's landing request `request`, `None` when it has none
-    /// ([`SOURCE_PUSH_LAST_NO_VERDICT`]).
+    /// (`SOURCE_PUSH_LAST_NO_VERDICT`).
     pub fn source_push_last_no_verdict(&self, request: i64) -> Result<Option<String>, StoreError> {
         Ok(self
             .query_opt(SOURCE_PUSH_LAST_NO_VERDICT, &[&request])?
@@ -2379,67 +2379,67 @@ impl PostgresStore {
     }
 
     /// The `no_room` gate records that escalate and were not told to the
-    /// supervisor yet, or were and still hold ([`GATE_ROOM_ESCALATIONS`]).
+    /// supervisor yet, or were and still hold (`GATE_ROOM_ESCALATIONS`).
     pub fn gate_room_escalations(&self) -> Result<Value, StoreError> {
         self.query_json(GATE_ROOM_ESCALATIONS, &[])
     }
 
     /// The `host_fault` gate records that escalate and were not told to the
-    /// supervisor yet ([`GATE_HOST_FAULT_ESCALATIONS`]).
+    /// supervisor yet (`GATE_HOST_FAULT_ESCALATIONS`).
     pub fn gate_host_fault_escalations(&self) -> Result<Value, StoreError> {
         self.query_json(GATE_HOST_FAULT_ESCALATIONS, &[])
     }
 
     /// The base disagreements that carry `alert` and were not told to the
-    /// supervisor yet ([`GATE_BASE_DISAGREES_ALERTS`]).
+    /// supervisor yet (`GATE_BASE_DISAGREES_ALERTS`).
     pub fn gate_base_disagrees_alerts(&self) -> Result<Value, StoreError> {
         self.query_json(GATE_BASE_DISAGREES_ALERTS, &[])
     }
 
     /// The shadow verdicts that disagreed with the primary's on the same
-    /// inputs, not told to the supervisor yet ([`SHADOW_DISAGREEMENTS`]).
+    /// inputs, not told to the supervisor yet (`SHADOW_DISAGREEMENTS`).
     pub fn shadow_disagreements(&self) -> Result<Value, StoreError> {
         self.query_json(SHADOW_DISAGREEMENTS, &[])
     }
 
     /// The red mains that started and the ones that ended, not told to the
-    /// supervisor yet ([`MAIN_RED_NEWS`]).
+    /// supervisor yet (`MAIN_RED_NEWS`).
     pub fn main_red_news(&self) -> Result<Value, StoreError> {
         self.query_json(MAIN_RED_NEWS, &[])
     }
 
     /// The sources away from this host and back, not told to the supervisor
-    /// yet ([`SOURCE_AWAY_NEWS`]).
+    /// yet (`SOURCE_AWAY_NEWS`).
     pub fn source_away_news(&self) -> Result<Value, StoreError> {
         self.query_json(SOURCE_AWAY_NEWS, &[])
     }
 
     /// The second overrun of an objective's chain that the supervisor was
-    /// not told of yet ([`OVER_BUDGET_ESCALATIONS`]).
+    /// not told of yet (`OVER_BUDGET_ESCALATIONS`).
     pub fn over_budget_escalations(&self) -> Result<Value, StoreError> {
         self.query_json(OVER_BUDGET_ESCALATIONS, &[])
     }
 
     /// The integrator's expired drains not told to the supervisor yet
-    /// ([`DRAIN_EXPIRIES`]).
+    /// (`DRAIN_EXPIRIES`).
     pub fn drain_expiries(&self) -> Result<Value, StoreError> {
         self.query_json(DRAIN_EXPIRIES, &[])
     }
 
     /// The `source.hold_expired` records not told to the supervisor yet,
-    /// with their holds and waiting tasks ([`HOLD_EXPIRIES`]).
+    /// with their holds and waiting tasks (`HOLD_EXPIRIES`).
     pub fn hold_expiries(&self) -> Result<Value, StoreError> {
         self.query_json(HOLD_EXPIRIES, &[])
     }
 
     /// Every active owner's hold with the tasks waiting behind it, and the
-    /// database's clock ([`SOURCE_HOLDS`]).
+    /// database's clock (`SOURCE_HOLDS`).
     pub fn source_holds(&self) -> Result<Value, StoreError> {
         self.query_json(SOURCE_HOLDS, &[])
     }
 
     /// `session`'s events recorded after `since_ms`, readings left out, in log order
-    /// ([`SESSION_ACTIVITY`]).
+    /// (`SESSION_ACTIVITY`).
     pub fn session_activity(
         &self,
         session: &str,
@@ -2458,7 +2458,7 @@ impl PostgresStore {
     }
 
     /// Milliseconds the fleet was alive between the log's events `from_id`
-    /// and `to_id`, each silence capped at `gap_ms` ([`FLEET_ALIVE`]).
+    /// and `to_id`, each silence capped at `gap_ms` (`FLEET_ALIVE`).
     pub fn fleet_alive_ms(&self, from_id: i64, to_id: i64, gap_ms: i64) -> Result<i64, StoreError> {
         Ok(self
             .query_one(FLEET_ALIVE, &[&from_id, &to_id, &gap_ms])?
@@ -2472,9 +2472,7 @@ impl PostgresStore {
             .get(0))
     }
 
-    /// The commit of the agent's latest `artifact.committed` event, if it
-    /// has one: what its pushed branch must contain to be landed.
-    /// When task `task` went over its budget (`[`OVERRUN_AT`]`), or null.
+    /// When task `task` went over its budget (`OVERRUN_AT`), or `None`.
     pub fn overrun_at(&self, task: i64) -> Result<Option<i64>, StoreError> {
         Ok(self
             .query_opt(OVERRUN_AT, &[&task.to_string()])?
@@ -2482,13 +2480,15 @@ impl PostgresStore {
     }
 
     /// An agent's latest checkpoint and when it was recorded
-    /// ([`CHECKPOINT_AT`]), or null.
+    /// (`CHECKPOINT_AT`), or null.
     pub fn checkpoint_at(&self, agent: &str) -> Result<Option<Value>, StoreError> {
         Ok(self
             .query_opt(CHECKPOINT_AT, &[&agent])?
             .map(|row| row.get::<_, Value>(0)))
     }
 
+    /// The commit of the agent's latest `artifact.committed` event (`LATEST_CHECKPOINT`),
+    /// if any: what its pushed branch must contain to be landed.
     pub fn latest_checkpoint(&self, agent: &str) -> Result<Option<String>, StoreError> {
         Ok(self
             .query_opt(LATEST_CHECKPOINT, &[&agent])?
@@ -2667,7 +2667,7 @@ impl PostgresStore {
     }
 
     /// What replaced what in `session`: the executions restarts started,
-    /// and the reassigns to and from it ([`SESSION_LINKS`]).
+    /// and the reassigns to and from it (`SESSION_LINKS`).
     pub fn session_links(&self, session: &str) -> Result<Value, StoreError> {
         self.query_json(SESSION_LINKS, &[&session])
     }
@@ -2727,7 +2727,7 @@ impl PostgresStore {
     }
 
     /// Every resident, by name: `[{name, agent_id, session_id, state,
-    /// pool}]` ([`RESIDENT_ROSTER`]): the dispatcher's retired residents and
+    /// pool}]` (`RESIDENT_ROSTER`): the dispatcher's retired residents and
     /// pools, in one read.
     pub fn resident_roster(&self) -> Result<Value, StoreError> {
         self.query_json_prepared(RESIDENT_ROSTER, &[])
@@ -2759,18 +2759,18 @@ impl PostgresStore {
         self.query_opt_json(MISSION_BY_ID, &[&id])
     }
 
-    /// What the dashboard's labels are made of ([`LABEL_FACTS`]).
+    /// What the dashboard's labels are made of (`LABEL_FACTS`).
     pub fn label_facts(&self) -> Result<Value, StoreError> {
         self.query_json(LABEL_FACTS, &[])
     }
 
-    /// What the labels of `tasks` are made of ([`TASK_LABEL_FACTS`]).
+    /// What the labels of `tasks` are made of (`TASK_LABEL_FACTS`).
     pub fn task_label_facts(&self, tasks: &[i64]) -> Result<Value, StoreError> {
         self.label_facts_of(tasks, &[])
     }
 
     /// What the labels of `tasks` and the names of `missions` are made of
-    /// ([`TASK_LABEL_FACTS`]): each mission named or holding one of the
+    /// (`TASK_LABEL_FACTS`): each mission named or holding one of the
     /// tasks, with those of its tasks alone.
     pub fn label_facts_of(&self, tasks: &[i64], missions: &[i64]) -> Result<Value, StoreError> {
         self.query_json(TASK_LABEL_FACTS, &[&tasks, &missions])
@@ -2791,7 +2791,7 @@ impl PostgresStore {
     }
 
     /// Open objective missions with their backlog directory
-    /// ([`OBJECTIVE_BACKLOGS`]).
+    /// (`OBJECTIVE_BACKLOGS`).
     pub fn objective_backlogs(&self) -> Result<Value, StoreError> {
         self.query_json(OBJECTIVE_BACKLOGS, &[])
     }
@@ -2808,7 +2808,7 @@ impl PostgresStore {
         Ok(self.query_one(OBJECTIVE_TASK, &[&task])?.get(0))
     }
 
-    /// One task's brief, report and review note in full ([`TASK_TEXTS`]);
+    /// One task's brief, report and review note in full (`TASK_TEXTS`);
     /// `None` when there is no such task.
     pub fn task_texts(&self, task: i64) -> Result<Option<Value>, StoreError> {
         Ok(self.query_one(TASK_TEXTS, &[&task])?.get(0))
@@ -2820,20 +2820,20 @@ impl PostgresStore {
     }
 
     /// The latest `source.moved` record, `{id, at_ms}`, or null
-    /// ([`LATEST_SOURCE_MOVED`]).
+    /// (`LATEST_SOURCE_MOVED`).
     pub fn latest_source_moved(&self) -> Result<Value, StoreError> {
         self.query_json(LATEST_SOURCE_MOVED, &[])
     }
 
     /// The owner's latest landing on `source`: the `to` of its latest
-    /// `source.moved` record, if any ([`SOURCE_OWNER_LANDED`]).
+    /// `source.moved` record, if any (`SOURCE_OWNER_LANDED`).
     pub fn source_owner_landed(&self, source: &str) -> Result<Option<String>, StoreError> {
         Ok(self
             .query_opt(SOURCE_OWNER_LANDED, &[&source])?
             .and_then(|row| row.get::<_, Option<String>>(0)))
     }
 
-    /// What deploy/on-landing.sh decides on ([`MAIN_LANDING`]): main's
+    /// What deploy/on-landing.sh decides on (`MAIN_LANDING`): main's
     /// gate-accepted landing on `source`, when the first landing after the
     /// live commit `deployed` was, the source's hold, and how many of its
     /// tasks the gate can still land (`judging`): a gated mission's tasks
@@ -2862,18 +2862,18 @@ impl PostgresStore {
     }
 
     /// The owner's pauses and unpauses the dispatcher acts on, with the
-    /// workers each holds ([`MISSION_PAUSES`]).
+    /// workers each holds (`MISSION_PAUSES`).
     pub fn mission_pauses(&self) -> Result<Value, StoreError> {
         self.query_json(MISSION_PAUSES, &[])
     }
 
     /// Residents whose latest delivered task is cancelled, with the
-    /// checkpoint it started from ([`CANCELLED_DELIVERIES`]).
+    /// checkpoint it started from (`CANCELLED_DELIVERIES`).
     pub fn cancelled_deliveries(&self) -> Result<Value, StoreError> {
         self.query_json_prepared(CANCELLED_DELIVERIES, &[])
     }
 
-    /// What the dispatcher measures stalls from ([`STALL_FACTS`]).
+    /// What the dispatcher measures stalls from (`STALL_FACTS`).
     pub fn stall_facts(&self) -> Result<Value, StoreError> {
         self.query_json_prepared(STALL_FACTS, &[])
     }

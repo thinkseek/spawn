@@ -47,16 +47,16 @@ pub(crate) const NEXT_LEASE: &str = concat!(
 );
 
 /// The channel `spawn_append_trusted` notifies on every append.
-pub const CHANNEL: &str = "spawn_events";
+const CHANNEL: &str = "spawn_events";
 
 impl PostgresStore {
-    /// The log's watermark ([`WATERMARK`]).
+    /// The log's watermark (`WATERMARK`).
     pub fn watermark(&self) -> Result<i64, StoreError> {
         Ok(self.query_one_prepared(WATERMARK, &[])?.get(0))
     }
 
     /// The time the earliest unfinished command may be claimed
-    /// ([`NEXT_LEASE`]): `None` when no command is unfinished.
+    /// (`NEXT_LEASE`): `None` when no command is unfinished.
     pub fn next_lease_ms(&self) -> Result<Option<i64>, StoreError> {
         Ok(self.query_one_prepared(NEXT_LEASE, &[])?.get(0))
     }

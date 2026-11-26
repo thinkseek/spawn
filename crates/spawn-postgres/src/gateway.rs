@@ -112,9 +112,13 @@ pub const MAX_MASTER_KEY_BYTES: usize = 240;
 /// runs no execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MasterMessageMode {
+    /// Queue input as a normal turn, waking the supervisor first if idle/stopped.
     Auto,
+    /// Send `Escape` before typing to steer the active supervisor turn immediately.
     Steer,
+    /// Queue input behind the active turn without interrupting it.
     Queue,
+    /// Stop the running supervisor and restart/resume it before delivering input.
     Restart,
 }
 

@@ -225,7 +225,7 @@ select coalesce(jsonb_agg(jsonb_build_object(
   from pg_namespace n
  where n.nspname not like 'pg\_%' and n.nspname not in ('information_schema', 'public')";
 
-/// The schemas of the test database at `url` ([`TEST_SCHEMAS`]): one
+/// The schemas of the test database at `url` (`TEST_SCHEMAS`): one
 /// read-only statement on a connection of its own, which gives up after 5 s
 /// connecting and 5 s querying, as [`test_database_size`]'s.
 ///
@@ -248,7 +248,9 @@ pub struct DatabaseIdentity {
     /// The host as named, for a server that is not local; empty for a
     /// local one.
     pub host: String,
+    /// TCP or Unix-socket port number (defaults to `PGPORT` or 5432).
     pub port: u16,
+    /// Target database name resolved after libpq defaults.
     pub database: String,
 }
 
@@ -316,7 +318,7 @@ pub fn database_identity(url: &str) -> Result<DatabaseIdentity, String> {
 }
 
 impl PostgresStore {
-    /// The `host.storage` samples the storage figures need ([`HOST_STORAGE`]):
+    /// The `host.storage` samples the storage figures need (`HOST_STORAGE`):
     /// the oldest at or after `since_ms` (overall and carrying each grower's
     /// size) and the newest at or before `before_ms`.
     pub fn host_storage(&self, since_ms: i64, before_ms: i64) -> Result<Value, StoreError> {
@@ -324,27 +326,27 @@ impl PostgresStore {
     }
 
     /// The `host.core_lines` samples recorded at or after `since_ms`, oldest
-    /// first, as `[{at_ms, values}]` ([`HOST_CORE_LINES`]).
+    /// first, as `[{at_ms, values}]` (`HOST_CORE_LINES`).
     pub fn host_core_lines(&self, since_ms: i64) -> Result<Value, StoreError> {
         self.query_json(HOST_CORE_LINES, &[&since_ms])
     }
 
     /// When the first `host.core_lines` sample carrying `key` as a number
-    /// was recorded, in ms; `None` before one ([`FIRST_CORE_LINES_VALUE`]).
+    /// was recorded, in ms; `None` before one (`FIRST_CORE_LINES_VALUE`).
     pub fn first_core_lines_value(&self, key: &str) -> Result<Option<i64>, StoreError> {
         Ok(self
             .query_json_prepared(FIRST_CORE_LINES_VALUE, &[&key])?
             .as_i64())
     }
 
-    /// The storage readings and the database's clock ([`HOST_STORAGE_BYTES`]):
+    /// The storage readings and the database's clock (`HOST_STORAGE_BYTES`):
     /// `{now_ms, newest, older: {at_ms, sources} | null, landings}`.
     pub fn host_storage_bytes(&self) -> Result<Value, StoreError> {
         self.query_json(HOST_STORAGE_BYTES, &[])
     }
 
     /// The database's name, size, schemas, event log bytes and five
-    /// largest tables ([`DATABASE_SIZE`]).
+    /// largest tables (`DATABASE_SIZE`).
     pub fn database_size(&self) -> Result<Value, StoreError> {
         self.query_json(&DATABASE_SIZE.replace("SCHEMAS_COUNT", SCHEMAS), &[])
     }
@@ -363,12 +365,12 @@ impl PostgresStore {
             .get(0))
     }
 
-    /// The latest `host.disk` record of every path ([`HOST_DISK`]).
+    /// The latest `host.disk` record of every path (`HOST_DISK`).
     pub fn host_disk(&self) -> Result<Value, StoreError> {
         self.query_json(HOST_DISK, &[])
     }
 
-    /// The latest `host.judge` record of every judge ([`HOST_JUDGE`]).
+    /// The latest `host.judge` record of every judge (`HOST_JUDGE`).
     pub fn host_judge(&self) -> Result<Value, StoreError> {
         self.query_json(HOST_JUDGE, &[])
     }
@@ -472,7 +474,7 @@ impl PostgresStore {
             .get(0))
     }
 
-    /// The records of one `backup.*` type since `since_ms` ([`BACKUP_RECORDS`]).
+    /// The records of one `backup.*` type since `since_ms` (`BACKUP_RECORDS`).
     pub fn backup_records(
         &self,
         kind: &str,
@@ -482,13 +484,13 @@ impl PostgresStore {
         self.query_json(BACKUP_RECORDS, &[&kind, &since_ms, &limit])
     }
 
-    /// The newest database copy and bundle ([`NEWEST_BACKUPS`]).
+    /// The newest database copy and bundle (`NEWEST_BACKUPS`).
     pub fn newest_backups(&self) -> Result<Value, StoreError> {
         self.query_json(NEWEST_BACKUPS, &[])
     }
 
     /// When the newest record of type `kind` with `ok` true was recorded
-    /// ([`NEWEST_PASSED`]); `None` without one.
+    /// (`NEWEST_PASSED`); `None` without one.
     pub fn newest_passed_record(&self, kind: &str) -> Result<Option<i64>, StoreError> {
         Ok(self
             .query_opt(NEWEST_PASSED, &[&kind])?
@@ -496,7 +498,7 @@ impl PostgresStore {
     }
 
     /// The newest record of type `kind` and its last pass
-    /// ([`DRILL_OF_TYPE`]): `{at_ms, record, passed_at_ms}`; `None` without
+    /// (`DRILL_OF_TYPE`): `{at_ms, record, passed_at_ms}`; `None` without
     /// a record of the type.
     pub fn drill_of_type(&self, kind: &str) -> Result<Option<Value>, StoreError> {
         Ok(self
@@ -504,7 +506,7 @@ impl PostgresStore {
             .map(|row| row.get(0)))
     }
 
-    /// Every distinct mission source ([`SOURCES`]).
+    /// Every distinct mission source (`SOURCES`).
     pub fn mission_sources(&self) -> Result<Value, StoreError> {
         self.query_json(SOURCES, &[])
     }

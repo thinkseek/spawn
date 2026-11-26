@@ -69,7 +69,7 @@ select coalesce(jsonb_object_agg(t.id::text, jsonb_build_object(
 
 impl PostgresStore {
     /// What each delivered task's worker did since the task reached it
-    /// ([`TASK_ACTIVITY`]), keyed by task id. Needs read access to
+    /// (`TASK_ACTIVITY`), keyed by task id. Needs read access to
     /// `spawn_events` (the owner, the dashboard's reader).
     pub fn task_activity(&self) -> Result<Value, StoreError> {
         self.query_json(TASK_ACTIVITY, &[])

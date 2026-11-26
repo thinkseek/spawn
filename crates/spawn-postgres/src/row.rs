@@ -55,7 +55,7 @@ pub(crate) fn execution_id(row: &Row) -> Result<Option<ExecutionId>, StoreError>
 static SKIPPED_SOURCES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 /// Event names retired from [`EventKind`] (#113 item 4) that may still
-/// exist in historical `spawn_events` rows or R2 archives. [`event_record`]
+/// exist in historical `spawn_events` rows or R2 archives. `event_record`
 /// skips them cleanly with one warning per name instead of deleting rows or
 /// stalling readers; unlisted unknown names remain [`StoreError::Corrupt`].
 pub const RETIRED_EVENTS: &[&str] = &[

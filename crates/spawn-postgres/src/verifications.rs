@@ -121,7 +121,7 @@ select jsonb_build_object(
 /// are read through `spawn_events_control_record_type` (type, time, id),
 /// never the whole control stream, then each task by its primary key. No
 /// time window: it grows with landings only.
-pub const CLAIMED_LANDED: &str = r"
+const CLAIMED_LANDED: &str = r"
 select distinct t.mission_id, t.objective
   from spawn_events e
   join mission_tasks t on t.id = (e.kind -> 'detail' -> 'record' ->> 'id')::bigint
@@ -138,7 +138,7 @@ const VERIFIED_BY: &str = "Verified by:";
 /// blanks are trimmed, that whole line trimmed; `None` without one. The
 /// phrase quoted inside another line is not it.
 #[must_use]
-pub fn verified_by_line(brief: &str) -> Option<String> {
+fn verified_by_line(brief: &str) -> Option<String> {
     brief
         .lines()
         .rev()
@@ -161,14 +161,14 @@ impl PostgresStore {
     }
 
     /// The landed objectives not verified since `since_ms`, and how many of
-    /// them landed at or before `old_at_ms` ([`UNVERIFIED`]): `{unverified,
+    /// them landed at or before `old_at_ms` (`UNVERIFIED`): `{unverified,
     /// old, newest_old_ms}`. The alert step reads it at every reading.
     pub fn unverified_landings(&self, since_ms: i64, old_at_ms: i64) -> Result<Value, StoreError> {
         self.query_json_prepared(UNVERIFIED, &[&since_ms, &old_at_ms])
     }
 
     /// Which of the claimed folders' `(mission, objective)` pairs landed
-    /// ([`CLAIMED_LANDED`]), each once, in order. An objective out of an
+    /// (`CLAIMED_LANDED`), each once, in order. An objective out of an
     /// `integer`'s range never landed.
     pub fn claimed_landed(&self, pairs: &[(i64, i64)]) -> Result<Vec<(i64, i64)>, StoreError> {
         let (missions, objectives): (Vec<i64>, Vec<i32>) = pairs
@@ -185,9 +185,9 @@ impl PostgresStore {
             .collect())
     }
 
-    /// What `spawn verify list` decides on ([`FACTS`]): each landing with
+    /// What `spawn verify list` decides on (`FACTS`): each landing with
     /// `verified_by`, its brief's "Verified by:" line or null
-    /// ([`verified_by_line`]), in place of the brief. Each landing and each
+    /// (`verified_by_line`), in place of the brief. Each landing and each
     /// verification also carries the event id of its record.
     pub fn verification_facts(&self) -> Result<Value, StoreError> {
         let mut facts = self.query_json(FACTS, &[])?;

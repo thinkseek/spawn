@@ -248,7 +248,7 @@ impl PostgresStore {
         Ok(i64::from(count))
     }
 
-    /// The cost of the messages timed in `[since_ms, until_ms)` ([`WINDOW`]):
+    /// The cost of the messages timed in `[since_ms, until_ms)` (`WINDOW`):
     /// `{total, landed, usd_per_landing, models, missions, tasks, agents,
     /// executions, counted_since_ms}`.
     pub fn cost_window(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
@@ -256,14 +256,14 @@ impl PostgresStore {
     }
 
     /// The cost of the messages timed in `[since_ms, until_ms)` without its
-    /// breakdown ([`SUMMARY`]): `{total, landed, usd_per_landing}`, each as
+    /// breakdown (`SUMMARY`): `{total, landed, usd_per_landing}`, each as
     /// [`Self::cost_window`] gives it.
     pub fn cost_summary(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(SUMMARY, &[&since_ms, &until_ms])
     }
 
     /// The cost of the messages timed in `[since_ms, until_ms)` in steps
-    /// of `step_ms` ([`TREND`]): `[{since_ms, usd, unpriced_tokens}]`,
+    /// of `step_ms` (`TREND`): `[{since_ms, usd, unpriced_tokens}]`,
     /// oldest first, one per step. An empty window or a step under 1 ms
     /// is no step: `[]`.
     pub fn cost_trend(
@@ -279,13 +279,13 @@ impl PostgresStore {
     }
 
     /// Each mission with a daily budget and its spend in `[since_ms,
-    /// until_ms)` ([`BUDGETS`]): `[{mission, budget_usd, spent_usd}]`.
+    /// until_ms)` (`BUDGETS`): `[{mission, budget_usd, spent_usd}]`.
     pub fn cost_budgets(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(BUDGETS, &[&since_ms, &until_ms])
     }
 
     /// The other Claude Code sessions' cost in `[since_ms, until_ms)`
-    /// ([`SESSIONS`]): `{total, rows, counted_since_ms}`.
+    /// (`SESSIONS`): `{total, rows, counted_since_ms}`.
     pub fn cost_sessions(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(SESSIONS, &[&since_ms, &until_ms])
     }
@@ -407,13 +407,21 @@ impl PostgresStore {
 /// and copies (its largest usage, its earliest line's time and model).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ArchivedMessage {
+    /// Agent id that owns the archived transcript.
     pub agent_id: String,
+    /// Upstream provider message identifier.
     pub message_id: String,
+    /// Model name reported by the provider.
     pub model: String,
+    /// Earliest message timestamp in Unix epoch milliseconds.
     pub at_ms: i64,
+    /// Input token count.
     pub input: i64,
+    /// Output token count.
     pub output: i64,
+    /// Prompt-cache creation token count.
     pub cache_write: i64,
+    /// Prompt-cache read token count.
     pub cache_read: i64,
 }
 
@@ -421,15 +429,20 @@ pub struct ArchivedMessage {
 /// and those it could not place (their agent has no execution).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ArchiveCounted {
+    /// Number of archived messages inserted or updated.
     pub counted: i64,
+    /// Number of archived messages skipped because no execution matched the agent/time.
     pub unplaced: i64,
 }
 
 /// An archive file as the loop counted it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ArchiveFile {
+    /// Transcript archive relative path (`<agent>/<file>`).
     pub file: String,
+    /// Last processed file length in bytes.
     pub length: i64,
+    /// File modification timestamp in Unix epoch milliseconds.
     pub modified_ms: i64,
 }
 
@@ -439,14 +452,23 @@ pub struct ArchiveFile {
 /// transcript file's stem.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SessionMessage {
+    /// Encoded Claude Code project directory name.
     pub project: String,
+    /// Session transcript file stem.
     pub session_id: String,
+    /// Upstream provider message identifier.
     pub message_id: String,
+    /// Model name reported by the provider.
     pub model: String,
+    /// Earliest message timestamp in Unix epoch milliseconds.
     pub at_ms: i64,
+    /// Input token count.
     pub input: i64,
+    /// Output token count.
     pub output: i64,
+    /// Prompt-cache creation token count.
     pub cache_write: i64,
+    /// Prompt-cache read token count.
     pub cache_read: i64,
 }
 
@@ -455,10 +477,15 @@ pub struct SessionMessage {
 /// line read, with its inode, length and modification time then.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SessionFile {
+    /// Relative path `<project>/<session>.jsonl`.
     pub file: String,
+    /// Filesystem inode number at the last scan.
     pub inode: i64,
+    /// Byte offset of the end of the last complete line read.
     pub offset_bytes: i64,
+    /// File length in bytes at the last scan.
     pub length: i64,
+    /// File modification timestamp in Unix epoch milliseconds.
     pub modified_ms: i64,
 }
 
@@ -468,8 +495,12 @@ pub struct SessionFile {
 /// time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SessionCounted {
+    /// Newly recorded external session messages.
     pub counted: i64,
+    /// Existing messages whose token counts or timestamps were updated.
     pub changed: i64,
+    /// Messages already covered by Spawn's own engine event accounting.
     pub engine: i64,
+    /// Lines skipped because required fields could not be parsed.
     pub invalid: i64,
 }

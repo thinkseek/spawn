@@ -311,34 +311,34 @@ select coalesce(jsonb_agg(jsonb_build_object(
 
 impl PostgresStore {
     /// The final model records not told to the supervisor yet
-    /// ([`MODEL_FINALS`]).
+    /// (`MODEL_FINALS`).
     pub fn model_finals(&self) -> Result<Value, StoreError> {
         self.query_json(MODEL_FINALS, &[])
     }
 
-    /// The sessions the recovery looks at ([`RECOVERY_SESSIONS`]).
+    /// The sessions the recovery looks at (`RECOVERY_SESSIONS`).
     pub fn recovery_sessions(&self) -> Result<Value, StoreError> {
         self.query_json(RECOVERY_SESSIONS, &[&RECENT_MS])
     }
 
     /// Whether an event above `after` is one the recovery reads
-    /// ([`RECOVERY_SIGNALS`]).
+    /// (`RECOVERY_SIGNALS`).
     pub fn recovery_signals(&self, after: i64) -> Result<bool, StoreError> {
         Ok(self.query_one(RECOVERY_SIGNALS, &[&after])?.get(0))
     }
 
-    /// One session's recovery facts ([`RECOVERY_FACTS`]).
+    /// One session's recovery facts (`RECOVERY_FACTS`).
     pub fn recovery_facts(&self, session: &SessionId) -> Result<Value, StoreError> {
         self.query_json(RECOVERY_FACTS, &[&session.as_str()])
     }
 
-    /// The latest `host.loop_started` record ([`LOOP_STARTED`]).
+    /// The latest `host.loop_started` record (`LOOP_STARTED`).
     pub fn loop_started(&self) -> Result<Option<Value>, StoreError> {
         self.query_opt_json(LOOP_STARTED, &[])
     }
 
     /// Whether the recovery recorded an interruption of the session's latest
-    /// execution ([`RECOVERED`]).
+    /// execution (`RECOVERED`).
     pub fn recovered(&self, session: &SessionId) -> Result<bool, StoreError> {
         Ok(self.query_one(RECOVERED, &[&session.as_str()])?.get(0))
     }

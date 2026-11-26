@@ -5,9 +5,9 @@
 //! `log`, in the `note` the worker reads back, in the reason the page shows,
 //! and so on for deploy, alert, backup and host records.
 //!
-//! [`masked`] passes every string of a record through
+//! `masked` passes every string of a record through
 //! [`spawn_core::redact::redact`], except the strings at a path in
-//! [`VERBATIM`]: the fields the folds and the Rust readers match (ids,
+//! `VERBATIM`: the fields the folds and the Rust readers match (ids,
 //! commits, enums, scenario names, the run's binding). In it `a.b` is key `b`
 //! under `a`, an array's elements share its path, and `a.*` is everything
 //! under `a` (strictly: `envelope` is not under `env`). A key not listed is
@@ -15,10 +15,10 @@
 //! only credential-shaped text, so a field outside the list that holds none
 //! is stored byte for byte.
 //!
-//! A few fields the store limits to 500 characters ([`LIMITED`]): when
+//! A few fields the store limits to 500 characters (`LIMITED`): when
 //! masking lengthens one from at most 500 past 500, it is cut back to 500,
 //! so masking never makes the store refuse a record it took before. No
-//! other field is ever cut. [`stored_text`] is exactly what [`masked`]
+//! other field is ever cut. [`stored_text`] is exactly what `masked`
 //! stores for one top-level field: a reader that compares a stored value
 //! with one it formats compares with that, never with a part of the
 //! transformation.
@@ -28,7 +28,7 @@ use spawn_core::redact::redact;
 
 /// The paths whose strings are stored as written, each group with the
 /// readers that match it.
-pub const VERBATIM: &[&str] = &[
+const VERBATIM: &[&str] = &[
     // The record's type: spawn_control_apply's dispatch, every reader's
     // filter (`kind -> 'detail' -> 'record' ->> 'type'`).
     "type",
@@ -161,7 +161,7 @@ pub const VERBATIM: &[&str] = &[
 /// The (record type, top-level field) pairs the store limits to 500
 /// characters (spawn_backup_record, spawn_deploy_record,
 /// spawn_verification_record, spawn_objective_retire).
-pub const LIMITED: &[(&str, &str)] = &[
+const LIMITED: &[(&str, &str)] = &[
     ("backup.drilled.transcripts", "reason"),
     ("backup.drilled.missions", "reason"),
     ("backup.drilled.controllers", "reason"),
@@ -171,8 +171,8 @@ pub const LIMITED: &[(&str, &str)] = &[
     ("objective.retired", "reason"),
 ];
 
-/// The store's limit on a [`LIMITED`] field, in characters.
-pub const LIMIT: usize = 500;
+/// The store's limit on a `LIMITED` field, in characters.
+const LIMIT: usize = 500;
 
 /// Whether the strings at `path` are stored as written.
 fn verbatim(path: &str) -> bool {
@@ -222,9 +222,9 @@ fn limited(original: &str, masked: String) -> String {
 }
 
 /// `record` as it is stored: every string masked but those at a
-/// [`VERBATIM`] path, a [`LIMITED`] field cut back as [`limited`] says.
+/// `VERBATIM` path, a `LIMITED` field cut back as `limited` says.
 #[must_use]
-pub fn masked(record: &Value) -> Value {
+pub(crate) fn masked(record: &Value) -> Value {
     let mut stored = record.clone();
     walk(&mut stored, "");
     let kind = record["type"].as_str().unwrap_or_default();
@@ -241,8 +241,9 @@ pub fn masked(record: &Value) -> Value {
     stored
 }
 
-/// Exactly what [`masked`] stores for the string `text` at top-level field
-/// `field` of a record of type `kind`.
+/// Exactly what `masked` stores for the string `text` at top-level field
+/// `field` of a record of type `kind` (masking credential-shaped text outside
+/// verbatim paths and enforcing any 500-character limit).
 #[must_use]
 pub fn stored_text(kind: &str, field: &str, text: &str) -> String {
     if verbatim(field) {
