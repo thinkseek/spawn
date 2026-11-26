@@ -14,7 +14,7 @@ table says what each one is, and what it is deliberately not.
 | grading catalog | `grading_presets`, `PostgresStore::grading_catalog()` | every graded preset | the **resident roster** (`resident_roster()`, `RESIDENT_ROSTER`, the supervisor charter's "roster"): approved residents |
 | `GradedPreset` / `preset_id` | a `grading_presets` row; `mission_tasks.preset_id`; `--preset` | one entry of the catalog, `[a-z0-9][a-z0-9_-]{0,63}` | `ModelProfile` (`--model default\|cheap`, `mission_tasks.model`): "profile" already names it, so the catalog never says "profile"; an `agent_id`, a resident, a node |
 | `model_profile` | column / field | the `ModelProfile` a preset's worker starts on | a second model switch: it *is* `--model` |
-| `engine_label`, `model_label` | columns / fields | labels for people: the engine and model the preset stands for | anything that runs: see "Phase 1 runs on `ModelProfile`" |
+| `engine_label`, `model_label` | columns / fields | the engine and model the preset stands for: the worker's engine when `engine_label` names a registered driver (`GradedPreset::driver_id()`), with `model_label` as that engine's model; else labels for people (`label_only`) | a `ModelProfile`: see "Phase 1 runs on `ModelProfile`" and "The engine a preset runs" |
 | `SkillGrade` (`l1`..`l3`) | `onboarded_grade`, `calibrated_grade`, `locked_grade` | what a preset has proven it can do | a Feature Map capability |
 | `routing_grade()` | `GradedPreset` | the grade routing reads: `locked_grade`, else `calibrated_grade`, and none unless the preset is routable | the state `active` |
 | `TaskDifficulty` (`l1`..`l3`, default `l2`) | `mission_tasks.difficulty` | what a task needs | a priority, an objective's size |
@@ -42,6 +42,33 @@ examined, graded and calibrated apart, but run the same: a reroute between
 them (`task.rerouted`) moves the task's preset and its calibration
 attribution, and the worker runs as before. `spawn task reject` says so
 (`same_model_profile: true` and a line on stderr).
+
+## The engine a preset runs (Herdr PR 4, design 7.1)
+
+`GradedPreset::driver_id()` (`spawn_core::grading::preset_driver`) gives the
+engine a preset's worker runs: its `engine_label` when that names a
+registered driver (`claude`, `agy`; driver ids equal Herdr's agent kinds),
+else `claude` with `label_only: true`, its labels then for people only.
+`/api/grading` names both (`driver`, `label_only`). Routing (`route_preset`)
+stays pure: grade, then cost rank, then id. It never reads whether a host
+can run the engine.
+
+Delivery (`crates/spawn-cli/src/deliver.rs`) starts a task's worker on that
+engine. For an engine told its model at launch (agy), the start carries the
+preset's `model_label` (`CommandAction::Start.model_label`, agy's
+`--model`); a Claude Code start carries none and is byte for byte what it
+was. An ephemeral worker that ran on another engine is stopped
+(`switch-engine-<task>-<revision>`), then started afresh on the task's; a
+resident keeps the one engine it ran on. A resume runs the host's label for
+its engine (`SPAWN_AGY_MODEL`): the label of the start it resumes is not
+kept.
+
+When the host cannot run the engine (not enabled in `SPAWN_ENGINES`, not
+installed, its probe failed) or `agy models` does not list the label (the
+capability probe, `GET /api/capabilities`), no command is made: the task
+waits, and one `engine_unavailable` escalation names the engine and the
+label. Never a silent fall back to Claude Code. Before the loop's first
+probe, a task on another engine waits without an escalation.
 
 ## Rules (`spawn_core::grading`, pure, integer-only)
 
