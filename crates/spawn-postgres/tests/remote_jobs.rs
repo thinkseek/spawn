@@ -704,8 +704,7 @@ fn a_valid_run_resets_the_strikes_once_and_leaves_degraded() {
             ))
             .expect("enqueue");
     }
-    let mut seq = 1;
-    for n in 0..4 {
+    for (seq, n) in (1..).zip(0..4) {
         let id = format!("gate-valid-{n:04}");
         let granted = grants(&beat_once(
             &store,
@@ -714,7 +713,6 @@ fn a_valid_run_resets_the_strikes_once_and_leaves_degraded() {
             seq,
             &beat(&[], &[], 1, 0),
         ));
-        seq += 1;
         assert_eq!(granted, [(id.clone(), 1)]);
         complete(&store, &node, &id, 1);
     }

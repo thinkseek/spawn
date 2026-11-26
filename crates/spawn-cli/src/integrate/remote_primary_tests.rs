@@ -529,13 +529,13 @@ fn m3a_judges_a_rejection_again_here_and_m3b_believes_it() {
 }
 
 /// A node with 2 strikes (and `degraded` as given, set once it holds its
-/// lease) finishes the primary path's job with exit 0 and a `word` verdict
+/// lease) finishes the primary path's job with exit 0 and a `stated` verdict
 /// on the job's own inputs, self-fenced or not: the outcome, and the
 /// node's strikes and `degraded` after it.
 fn valid_run_on_two_strikes(
     case: &str,
     believe_reject: bool,
-    word: &'static str,
+    stated: &'static str,
     self_fenced: bool,
     degraded: bool,
 ) -> (PrimaryOutcome, (i32, bool), spawn_postgres::RemoteJob) {
