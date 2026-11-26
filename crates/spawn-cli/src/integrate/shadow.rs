@@ -888,7 +888,10 @@ impl NodeShadows {
             &scenarios_at,
             scenarios_sha256
                 .as_deref()
-                .map(|digest| format!("{controller_commit}-{digest}"))
+                .and_then(|digest| {
+                    remote::controller_pack_key(&controller, &controller_commit, &scenarios_at, digest)
+                        .ok()
+                })
                 .as_deref(),
         );
         remove_tree(&snapshot);

@@ -1660,7 +1660,10 @@ impl Primary {
             &scenarios_at,
             scenarios_sha256
                 .as_deref()
-                .map(|digest| format!("{controller_commit}-{digest}"))
+                .and_then(|digest| {
+                    controller_pack_key(&controller, &controller_commit, &scenarios_at, digest)
+                        .ok()
+                })
                 .as_deref(),
         );
         super::shadow::remove_tree(&snapshot);
