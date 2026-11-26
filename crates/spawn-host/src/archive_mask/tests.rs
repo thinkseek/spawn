@@ -7,7 +7,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use spawn_core::port::ArchiveMask;
 
-use super::{CollectorMask, INSTALLED_TOOL, SANDBOX_ONLY, Tool, lines, unquote};
+use super::{CollectorMask, SANDBOX_ONLY, Tool, lines, unquote};
 use crate::Scratch;
 use crate::home::Home;
 
@@ -370,7 +370,8 @@ fn a_stand_in_is_honoured_only_in_a_gates_sandbox() {
     );
     let (mask, stand_in) = CollectorMask::configured(None, Some("1"), &roots, &home);
     assert_eq!(stand_in, None);
-    assert!(matches!(&mask.tool, Tool::Run(tool) if tool == Path::new(INSTALLED_TOOL)));
+    let expected_tool = super::resolve_installed_tool();
+    assert!(matches!(&mask.tool, Tool::Run(tool) if tool == &expected_tool));
 }
 
 /// R6: whatever the marker says, a stand-in is refused for a root inside
@@ -439,4 +440,70 @@ fn the_live_loop_s_roots_refuse_a_stand_in() {
         );
         assert_eq!(stand_in.is_some(), home.tmpfs, "{}", root.display());
     }
+}
+
+#[test]
+fn installed_tool_resolution_prefers_installed_and_falls_back_safely() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let world = World::new("mask-resolve");
+    let installed = world.path("usr/local/lib/spawn/redact/emit-locations.py");
+    let exe_bin = world.path("repo/target/debug/spawn");
+    let bin_tool = world.path("repo/target/debug/emit-locations.py");
+    let bin_secret = world.path("repo/target/debug/secret-values.py");
+    let dev_tool = world.path("repo/scripts/redact/emit-locations.py");
+    let dev_secret = world.path("repo/scripts/redact/secret-values.py");
+
+    let write_file = |path: &Path, mode: u32| {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, "#!/usr/bin/env python3\n").expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+
+    // Missing everywhere -> returns configured installed path.
+    assert_eq!(
+        super::resolve_installed_tool_from(&installed, Some(&exe_bin)),
+        installed
+    );
+
+    // Safe dev ancestor layout when installed & exe_dir lack the tool.
+    write_file(&dev_tool, 0o755);
+    write_file(&dev_secret, 0o644);
+    assert_eq!(
+        super::resolve_installed_tool_from(&installed, Some(&exe_bin)),
+        dev_tool
+    );
+
+    // Safe exe-dir layout ($live/bin/) takes precedence over dev ancestors.
+    write_file(&bin_tool, 0o755);
+    write_file(&bin_secret, 0o644);
+    assert_eq!(
+        super::resolve_installed_tool_from(&installed, Some(&exe_bin)),
+        bin_tool
+    );
+
+    // World-writable installed file is refused and falls back to safe exe_dir.
+    write_file(&installed, 0o777);
+    assert!(!super::is_safe_tool_file(&installed));
+    assert_eq!(
+        super::resolve_installed_tool_from(&installed, Some(&exe_bin)),
+        bin_tool
+    );
+
+    // Symlink at installed path is refused too.
+    std::fs::remove_file(&installed).expect("unlink");
+    symlink(&bin_tool, &installed).expect("symlink");
+    assert!(!super::is_safe_tool_file(&installed));
+    assert_eq!(
+        super::resolve_installed_tool_from(&installed, Some(&exe_bin)),
+        bin_tool
+    );
+
+    // Safe regular executable installed file wins over every fallback.
+    std::fs::remove_file(&installed).expect("unlink");
+    write_file(&installed, 0o755);
+    assert_eq!(
+        super::resolve_installed_tool_from(&installed, Some(&exe_bin)),
+        installed
+    );
 }

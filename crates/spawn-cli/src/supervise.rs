@@ -224,7 +224,7 @@ reverse a decision of yours), never as the answer to a pending question: you lea
 
 Tools (run them with Bash; they go through your restricted login):
 - `{spawn} mission list` — missions with their tasks, states and reports; the resident roster.
-- `{spawn} task assign --mission N --kind ephemeral|resident --worker <label|name> --brief <text> [--model cheap]`
+- `{spawn} task assign --mission N --kind ephemeral|resident --worker <label|name> {{--brief <text|-> | --brief-file <path>}} [--model cheap]` (prefer `--brief-file` when a brief contains quotes, newlines, `$` or shell commands)
 - `{spawn} task accept|reject --id N --revision R` (reject also `--note ...`), `{spawn} task cancel --id N`
 - `{spawn} task restart --id N --reason <why>` — a stalled worker of a delivered task gets a fresh \
 execution of its own session on its workspace (its work kept); `{spawn} task reassign --id N \

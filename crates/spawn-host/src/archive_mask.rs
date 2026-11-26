@@ -205,7 +205,7 @@ impl CollectorMask {
         home: &Home,
     ) -> (Self, Option<StandIn>) {
         let Some(tool) = tool else {
-            return (Self::with_tool(PathBuf::from(INSTALLED_TOOL)), None);
+            return (Self::with_tool(resolve_installed_tool()), None);
         };
         if sandbox != Some("1") {
             return (Self::refused(SANDBOX_ONLY.to_string()), None);
@@ -679,6 +679,74 @@ fn base64(bytes: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Whether `path` is an existing, non-symlink regular file not writable by
+/// group or others, owned by the running user or root.
+fn is_safe_supporting_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return false;
+    }
+    if (meta.mode() & 0o022) != 0 {
+        return false;
+    }
+    let my_uid = std::fs::metadata("/proc/self").ok().map(|m| m.uid());
+    my_uid.is_none_or(|uid| meta.uid() == uid || meta.uid() == 0)
+}
+
+/// Whether `path` is a safe regular executable script (not a symlink, executable,
+/// not group/world-writable, owned by current uid or root).
+pub(crate) fn is_safe_tool_file(path: &Path) -> bool {
+    if !is_safe_supporting_file(path) {
+        return false;
+    }
+    std::fs::symlink_metadata(path).is_ok_and(|meta| (meta.mode() & 0o111) != 0)
+}
+
+/// Resolve the location-collector tool when `SPAWN_ARCHIVE_LOCATIONS_TOOL` is
+/// unset: prefer [`INSTALLED_TOOL`], then verified safe layouts beside the
+/// running executable (`$live/bin/` or `../lib/spawn/redact/`) or a dev repo
+/// ancestor (`scripts/redact/`) that also carries `secret-values.py`, falling
+/// back to [`INSTALLED_TOOL`].
+pub(crate) fn resolve_installed_tool() -> PathBuf {
+    let exe = std::env::current_exe().ok();
+    resolve_installed_tool_from(Path::new(INSTALLED_TOOL), exe.as_deref())
+}
+
+pub(crate) fn resolve_installed_tool_from(installed: &Path, current_exe: Option<&Path>) -> PathBuf {
+    if is_safe_tool_file(installed) {
+        return installed.to_path_buf();
+    }
+    if let Some(exe) = current_exe {
+        if let Some(exe_dir) = exe.parent() {
+            for candidate in [
+                exe_dir.join("emit-locations.py"),
+                exe_dir.join("../lib/spawn/redact/emit-locations.py"),
+            ] {
+                if is_safe_tool_file(&candidate)
+                    && candidate
+                        .parent()
+                        .is_some_and(|dir| is_safe_supporting_file(&dir.join("secret-values.py")))
+                {
+                    return candidate;
+                }
+            }
+        }
+        for ancestor in exe.ancestors().take(6) {
+            let candidate = ancestor.join("scripts/redact/emit-locations.py");
+            if is_safe_tool_file(&candidate)
+                && candidate
+                    .parent()
+                    .is_some_and(|dir| is_safe_supporting_file(&dir.join("secret-values.py")))
+            {
+                return candidate;
+            }
+        }
+    }
+    installed.to_path_buf()
 }
 
 #[cfg(test)]

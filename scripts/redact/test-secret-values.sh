@@ -106,5 +106,17 @@ print(f"{fails} failed (secret-values)")
 sys.exit(1 if fails else 0)
 PY
 
+emit_out=$(python3 -I -B "$here/emit-locations.py" "$scratch/home" "$scratch/root")
+export emit_out
+python3 - <<'PY'
+import json, os, sys
+raw = os.environ["emit_out"]
+data = json.loads(raw)
+assert isinstance(data.get("entries"), list) and len(data["entries"]) > 0, data
+for secret in ["sk-test-0001-secret", "ghp_test_0002_secret", "postgres://user:pass@host/db"]:
+    assert secret not in raw, f"secret leaked: {secret}"
+print("emit-locations.py: ok")
+PY
+
 echo "$fails failed"
 [ "$fails" -eq 0 ]

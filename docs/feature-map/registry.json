@@ -2373,6 +2373,7 @@
         "scripts/keep/credential-health.sh",
         "scripts/keep/credentials.manifest",
         "scripts/keep/test-credential-health.sh",
+        "scripts/redact/emit-locations.py",
         "scripts/redact/secret-values.py",
         "scripts/redact/test-secret-values.sh",
         "scripts/rsi/check-credential-prints.py",

@@ -1609,6 +1609,23 @@ pub struct Bridge {
     /// on a report of its own): given to the tick's report at the end of
     /// [`Bridge::work`].
     stray_notes: Vec<String>,
+    /// Waiting inputs tracked per `command_id` for bounded exponential
+    /// retry backoff and stale supervisor `"continue"` expiration.
+    waiting_since: HashMap<CommandId, WaitingInput>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WaitingInput {
+    started_at_ms: i64,
+    lines_at_wait: u64,
+    attempts: u32,
+}
+
+const MAX_INPUT_WAIT_RETRY: Duration = Duration::from_secs(30);
+const STALE_CONTINUE_WAIT_MS: i64 = 300_000;
+
+fn is_supervisor_continue_nudge(principal: &str, text: &str) -> bool {
+    principal == "spawn_supervisor" && text.trim().eq_ignore_ascii_case("continue")
 }
 
 /// How long a Bridge that goes away waits for its kills still under way
@@ -1762,6 +1779,7 @@ impl Bridge {
             abandoned_mounts: Vec::new(),
             kill_threads: std::sync::Mutex::new(Vec::new()),
             stray_notes: Vec::new(),
+            waiting_since: HashMap::new(),
         }
     }
 
@@ -2077,6 +2095,7 @@ impl Bridge {
                     self.held.remove(&claimed.command_id);
                     self.prepared.remove(&claimed.command_id);
                     self.prompting.remove(&claimed.command_id);
+                    self.waiting_since.remove(&claimed.command_id);
                     if let Some(pending) = self.mounting.get_mut(&claimed.command_id) {
                         pending.cancel();
                     }
@@ -6848,6 +6867,24 @@ impl Bridge {
                 return finished(Outcome::Failed(format!("the text {MAY_HAVE_TYPED}")));
             }
         }
+        // Expire stale supervisor "continue" nudges once the session has
+        // already made transcript progress or after the waiting TTL.
+        if is_supervisor_continue_nudge(&claimed.principal, text)
+            && let Some(waiting) = self.waiting_since.get(&claimed.command_id).copied()
+        {
+            if active.follow.cursor.lines > waiting.lines_at_wait {
+                return finished(Outcome::Failed(format!(
+                    "stale supervisor continue nudge expired: transcript progressed ({} -> {} lines)",
+                    waiting.lines_at_wait, active.follow.cursor.lines
+                )));
+            }
+            let elapsed_ms = self.clock.now().0.saturating_sub(waiting.started_at_ms);
+            if elapsed_ms >= STALE_CONTINUE_WAIT_MS {
+                return finished(Outcome::Failed(format!(
+                    "stale supervisor continue nudge expired after {elapsed_ms} ms waiting"
+                )));
+            }
+        }
         let shown = active
             .follow
             .screen
@@ -6964,8 +7001,17 @@ impl Bridge {
     /// one of Spawn's own loops is refused at once, `pane state <state> does
     /// not accept input`, having typed nothing; any other is recorded as
     /// waiting (`command.step` `waiting`, once) and left unfinished.
+    /// Bounded exponential retry backoff for waiting inputs:
+    /// `base * 2^(attempt - 1)` clamped to `max(30s, base)`.
+    fn waiting_retry_delay(&self, attempt: u32) -> Duration {
+        let base = self.config.input_wait_retry;
+        let cap = MAX_INPUT_WAIT_RETRY.max(base);
+        let factor = 1u32 << attempt.saturating_sub(1).min(5);
+        base.saturating_mul(factor).min(cap)
+    }
+
     fn not_yet(
-        &self,
+        &mut self,
         claimed: &Claimed,
         active: &Active,
         state: ScreenState,
@@ -6977,15 +7023,25 @@ impl Bridge {
                 "pane state {state:?} {PANE_NOT_READY}{why}"
             ))));
         }
+        let now_ms = self.clock.now().0;
+        let entry = self
+            .waiting_since
+            .entry(claimed.command_id)
+            .or_insert(WaitingInput {
+                started_at_ms: now_ms,
+                lines_at_wait: active.follow.cursor.lines,
+                attempts: 0,
+            });
+        entry.attempts = entry.attempts.saturating_add(1);
+        let attempts = entry.attempts;
+        let retry = self.waiting_retry_delay(attempts);
         self.step(
             claimed,
             Some(&active.execution_id),
             CommandStep::Waiting,
             None,
         )?;
-        Ok(Handled::Waiting {
-            retry: self.config.input_wait_retry,
-        })
+        Ok(Handled::Waiting { retry })
     }
 
     /// Why an input that waited on `execution` was never typed: the
@@ -7018,6 +7074,7 @@ impl Bridge {
             .map(|(id, _)| *id)
             .collect();
         for id in mine {
+            self.waiting_since.remove(&id);
             let Some(claimed) = self.held.remove(&id) else {
                 continue;
             };
@@ -15031,5 +15088,186 @@ mod tests {
         // Both are past attempt 4 so prompt_retry returns ready_interval (250ms); cmd1 waited 15ms while cmd2 ran capture_tail.
         assert_eq!(rels.get(&cmd1), Some(&235));
         assert_eq!(rels.get(&cmd2), Some(&250));
+    }
+
+    #[test]
+    fn waiting_input_backs_off_exponentially_up_to_cap() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let queue = RecordedQueue::new(store.clone());
+        let mut config = BridgeConfig::new("tester");
+        config.ready_interval = Duration::ZERO;
+        config.input_wait_retry = Duration::from_secs(1);
+        let start_id = submit_resumable_start(&store, 1, "go", READY);
+        let mut bridge = Bridge::new(
+            store.clone(),
+            queue.clone(),
+            store.clone(),
+            store.clone(),
+            config,
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, start_id) == Some(Outcome::Succeeded)
+        });
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(start_id));
+        store.set_pane(&terminal, BUSY);
+        let _ = queue.take_releases();
+        store.expire_leases();
+
+        let input_id = store
+            .submit(
+                &Principal::new("human").expect("principal"),
+                &Submission {
+                    agent_id: resumable_agent(1),
+                    session_id: resumable_session(1),
+                    idempotency_key: IdempotencyKey::new("wait-backoff").expect("key"),
+                    action: CommandAction::Input {
+                        text: "wait".to_string(),
+                        tags: Vec::new(),
+                    },
+                },
+            )
+            .expect("submit");
+        let mut observed_ms = Vec::new();
+        for _ in 0..7 {
+            store.expire_leases();
+            bridge.work().expect("work");
+            for (id, delay) in queue.take_releases() {
+                if id == input_id {
+                    observed_ms.push(u64::try_from(delay.as_millis()).expect("ms"));
+                }
+            }
+        }
+        assert_eq!(
+            observed_ms,
+            vec![1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]
+        );
+        bridge.config.input_wait_retry = Duration::from_secs(45);
+        assert_eq!(bridge.waiting_retry_delay(1), Duration::from_secs(45));
+        assert_eq!(bridge.waiting_retry_delay(4), Duration::from_secs(45));
+    }
+
+    fn submit_continue_nudge(
+        store: &Arc<MemoryStore>,
+        num: u64,
+        principal: &str,
+        key: &str,
+    ) -> CommandId {
+        store
+            .submit(
+                &Principal::new(principal).expect("principal"),
+                &Submission {
+                    agent_id: resumable_agent(num),
+                    session_id: resumable_session(num),
+                    idempotency_key: IdempotencyKey::new(key).expect("key"),
+                    action: CommandAction::Input {
+                        text: "continue".to_string(),
+                        tags: Vec::new(),
+                    },
+                },
+            )
+            .expect("submit")
+    }
+
+    #[test]
+    fn stale_continue_nudge_expires_on_progress_and_ttl() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let mut config = BridgeConfig::new("tester");
+        config.ready_interval = Duration::ZERO;
+        config.input_wait_retry = Duration::from_secs(1);
+        let starts = [
+            submit_resumable_start(&store, 1, "", READY),
+            submit_resumable_start(&store, 2, "", READY),
+            submit_resumable_start(&store, 3, "", READY),
+        ];
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            config,
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || {
+            starts
+                .iter()
+                .all(|id| command_outcome(&store, *id) == Some(Outcome::Succeeded))
+        });
+        for start in starts {
+            store.set_pane(
+                &TerminalName::for_execution(&ExecutionId::for_command(start)),
+                BUSY,
+            );
+        }
+
+        let nudge_progress = submit_continue_nudge(&store, 1, "spawn_supervisor", "sup-nudge-1");
+        let nudge_ttl = submit_continue_nudge(&store, 2, "spawn_supervisor", "sup-nudge-2");
+        let human_note = submit_continue_nudge(&store, 3, "human", "human-continue-3");
+
+        store.expire_leases();
+        bridge.work().expect("initial wait");
+        assert!(bridge.waiting_since.contains_key(&nudge_progress));
+        assert!(bridge.waiting_since.contains_key(&nudge_ttl));
+        assert!(bridge.waiting_since.contains_key(&human_note));
+
+        // Part A: transcript cursor progress expires supervisor nudge on agent 1.
+        bridge
+            .sessions
+            .get_mut(&resumable_session(1))
+            .and_then(|s| s.active.as_mut())
+            .expect("active 1")
+            .follow
+            .cursor
+            .lines += 1;
+        store.expire_leases();
+        bridge.work().expect("expire on progress");
+        let Some(Outcome::Failed(why)) = command_outcome(&store, nudge_progress) else {
+            panic!("expected Failed on progress");
+        };
+        assert!(why.contains("transcript progressed"), "{why}");
+        assert!(!bridge.waiting_since.contains_key(&nudge_progress));
+
+        // Part B: 299_999 ms stays waiting; 300_000 ms expires supervisor nudge on agent 2.
+        clock.advance(Duration::from_millis(299_999));
+        store.expire_leases();
+        bridge.work().expect("before ttl");
+        assert_eq!(command_outcome(&store, nudge_ttl), None);
+
+        clock.advance(Duration::from_millis(1));
+        store.expire_leases();
+        bridge.work().expect("at ttl");
+        let Some(Outcome::Failed(why)) = command_outcome(&store, nudge_ttl) else {
+            panic!("expected Failed at TTL");
+        };
+        assert!(why.contains("300000 ms waiting"), "{why}");
+        assert!(!bridge.waiting_since.contains_key(&nudge_ttl));
+
+        // Part C: human "continue" is never expired by progress or TTL and delivers when READY.
+        bridge
+            .sessions
+            .get_mut(&resumable_session(3))
+            .and_then(|s| s.active.as_mut())
+            .expect("active 3")
+            .follow
+            .cursor
+            .lines += 5;
+        clock.advance(Duration::from_secs(100));
+        store.expire_leases();
+        bridge.work().expect("human stays waiting");
+        assert_eq!(command_outcome(&store, human_note), None);
+
+        store.set_pane(
+            &TerminalName::for_execution(&ExecutionId::for_command(starts[2])),
+            READY,
+        );
+        store.expire_leases();
+        bridge.work().expect("human delivered");
+        assert_eq!(
+            command_outcome(&store, human_note),
+            Some(Outcome::Succeeded)
+        );
+        assert!(!bridge.waiting_since.contains_key(&human_note));
     }
 }

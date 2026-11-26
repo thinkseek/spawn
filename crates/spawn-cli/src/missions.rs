@@ -118,8 +118,9 @@ pub(crate) const USAGE: &str = "usage:
       actual landing repository, gate and backlog paths, per-open-task delivery/report/gate
       diagnostics, and shell-quoted read-only checks. Prints JSON and creates nothing)
   spawn mission close --id N --state done|dropped [--summary <text>]
-  spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
-                    [--model default|cheap] [--engine <claude|agy>] [--model-label <label>] [--again] [--pin]
+  spawn task assign --mission N --kind ephemeral|resident --worker <label|resident>
+                    {--brief <text|-> | --brief-file <path>} [--model default|cheap]
+                    [--engine <claude|agy>] [--model-label <label>] [--again] [--pin]
                     [--difficulty l1|l2|l3] [--preset <preset_id>]
       (the supervisor's brief that a task of the mission in flight already has, trimmed of
        space, tab, CR and LF, is refused, naming that task; --again assigns it on purpose.
@@ -614,6 +615,36 @@ fn text(flags: &Flags, name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("--{name} is required\n{USAGE}"))
 }
 
+/// Brief text for `spawn task assign`: either `--brief <text|->` (where `-`
+/// reads stdin) or `--brief-file <path>`, mutually exclusive and non-empty
+/// after trimming.
+fn brief_text(flags: &Flags) -> Result<String, String> {
+    brief_text_with(flags, || {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .map_err(|error| format!("--brief -: cannot read stdin: {error}"))?;
+        Ok(buf)
+    })
+}
+
+fn brief_text_with(
+    flags: &Flags,
+    read_stdin: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    let raw = match (flags.get("brief"), flags.get("brief-file")) {
+        (Some(_), Some(_)) => return Err("give --brief or --brief-file, not both".to_string()),
+        (None, None) => return Err(format!("--brief or --brief-file is required\n{USAGE}")),
+        (Some(val), None) if val == "-" => read_stdin()?,
+        (Some(val), None) => val,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map_err(|error| format!("--brief-file {path}: cannot read: {error}"))?,
+    };
+    if raw.trim().is_empty() {
+        return Err(format!("--brief must not be empty\n{USAGE}"));
+    }
+    Ok(raw)
+}
+
 /// The `--revision` of the report a review judged, if named: without it,
 /// the report as it is now.
 fn revision(flags: &Flags) -> Result<Option<i32>, String> {
@@ -697,12 +728,13 @@ pub(crate) fn assign(
             );
         }
         let model = model(flags)?;
+        let brief = brief_text(flags)?;
         let task = store
             .task_assign_direct(
                 id(flags, "mission")?,
                 &text(flags, "kind")?,
                 &flags.get("worker").unwrap_or_default(),
-                &text(flags, "brief")?,
+                &brief,
                 model.as_str(),
                 flags.switch("again"),
                 flags.switch("pin"),
@@ -719,7 +751,8 @@ pub(crate) fn assign(
         }
         return Ok(answer);
     }
-    let (decision, classified) = match placement(store, flags)? {
+    let brief = brief_text(flags)?;
+    let (decision, classified) = match placement(store, flags, &brief)? {
         Placement::Routed(decision, classified) => (decision, classified),
         Placement::Model { fallback } => {
             let model = model(flags)?;
@@ -728,7 +761,7 @@ pub(crate) fn assign(
                     id(flags, "mission")?,
                     &text(flags, "kind")?,
                     &flags.get("worker").unwrap_or_default(),
-                    &text(flags, "brief")?,
+                    &brief,
                     model.as_str(),
                     flags.switch("again"),
                     flags.switch("pin"),
@@ -750,7 +783,7 @@ pub(crate) fn assign(
             id(flags, "mission")?,
             &text(flags, "kind")?,
             &flags.get("worker").unwrap_or_default(),
-            &text(flags, "brief")?,
+            &brief,
             decision.model_profile.as_str(),
             flags.switch("again"),
             flags.switch("pin"),
@@ -798,7 +831,11 @@ pub(crate) fn assign(
 ///   and when the catalog holds presets, saying why. An unflagged
 ///   assignment (the supervisor's) is never stopped by what the catalog
 ///   holds.
-fn placement(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Placement, String> {
+fn placement(
+    store: &spawn_postgres::PostgresStore,
+    flags: &Flags,
+    brief: &str,
+) -> Result<Placement, String> {
     let difficulty = flags
         .get("difficulty")
         .map(|text| {
@@ -832,18 +869,10 @@ fn placement(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Pla
         .map(|decision| Placement::Routed(decision, None))
         .map_err(|error| format!("agent grading: {error}"));
     }
-    Ok(
-        match route_unflagged(
-            store,
-            &flags.get("brief").unwrap_or_default(),
-            "--model default",
-        )? {
-            CatalogRoute::Routed(decision, classified) => {
-                Placement::Routed(decision, Some(classified))
-            }
-            CatalogRoute::Unrouted { fallback } => Placement::Model { fallback },
-        },
-    )
+    Ok(match route_unflagged(store, brief, "--model default")? {
+        CatalogRoute::Routed(decision, classified) => Placement::Routed(decision, Some(classified)),
+        CatalogRoute::Unrouted { fallback } => Placement::Model { fallback },
+    })
 }
 
 /// Where agent grading places a task its assigner named neither a
@@ -3090,5 +3119,49 @@ mod tests {
         }
         drop(sup_store);
         drop(store);
+    }
+
+    #[test]
+    fn assign_brief_file_and_stdin_cases() {
+        let dir = std::env::temp_dir().join(format!("spawn-brief-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let brief_path = dir.join("brief.md");
+        let body = "line 1 `pgrep -f foo`\n$VAR && ps -p 1234";
+        std::fs::write(&brief_path, body).expect("write brief file");
+
+        let from_file = Flags::parse(&[
+            "--brief-file".to_string(),
+            brief_path.to_string_lossy().into_owned(),
+        ])
+        .expect("flags");
+        assert_eq!(
+            crate::missions::brief_text_with(&from_file, || unreachable!()).expect("read file"),
+            body
+        );
+
+        let from_stdin = Flags::parse(&["--brief".to_string(), "-".to_string()]).expect("flags");
+        assert_eq!(
+            crate::missions::brief_text_with(&from_stdin, || Ok(body.to_string()))
+                .expect("read stdin"),
+            body
+        );
+
+        let both = Flags::parse(&[
+            "--brief".to_string(),
+            "inline".to_string(),
+            "--brief-file".to_string(),
+            brief_path.to_string_lossy().into_owned(),
+        ])
+        .expect("flags");
+        let conflict =
+            crate::missions::brief_text_with(&both, || unreachable!()).expect_err("exclusive");
+        assert!(conflict.contains("not both"), "{conflict}");
+
+        let empty = Flags::parse(&["--brief".to_string(), "   \n\t ".to_string()]).expect("flags");
+        let blank =
+            crate::missions::brief_text_with(&empty, || unreachable!()).expect_err("blank brief");
+        assert!(blank.contains("must not be empty"), "{blank}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
