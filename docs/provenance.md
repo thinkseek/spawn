@@ -381,9 +381,10 @@ Spawn once had a large-file chunk store, `Spawn-Large`:
 - `d4e58273` (storage phase 2, the last change to it) kept the head's
   `Spawn-Large` trailer across merges of main into an agent's branch.
 - `198cf5de` (2026-11-05) removed it, the owner's decision (CUTS.md): it
-  was local only (a manifest lived on one host, so a branch resumed on
-  another host mounted a tree that was not the whole workspace), and it
-  was unused live (no `Spawn-Large` commit existed). With it went
+  was local only (the chunks lived on the disk of the host that made
+  them) and unused live (no `Spawn-Large` commit existed), and a commit
+  whose files were partly outside Git was not a whole workspace by
+  itself. With it went
   `spawn_host::chunks`, chunk GC and `spawn chunks gc`, the stat cache, the
   `ChunkStore` port, `SPAWN_CHUNK_STORE` and the blake3, zstd and rustix
   dependencies. A large file is now an ordinary git blob up to
