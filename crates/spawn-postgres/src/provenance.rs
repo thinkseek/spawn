@@ -930,3 +930,110 @@ impl PostgresStore {
         .collect()
     }
 }
+
+/// One `supersedes` edge of a `land` change (PV4), as `spawn prov
+/// durability` reads it: the edge, and the change it leaves from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProvSupersedes {
+    pub edge: ProvEdgeRecord,
+    pub src: ProvChangeRecord,
+}
+
+impl PostgresStore {
+    /// The brief of each task of `ids` as its dispatcher wrote it: the
+    /// `brief` of the task's first `task.assigned` control record (PV4 reads
+    /// its `reverts:`, `fixes:` and `supersedes:` lines). A task with no
+    /// such record is absent. Never anything an agent wrote: a report, a
+    /// commit message.
+    pub fn prov_task_briefs(&self, ids: &[i64]) -> Result<HashMap<i64, String>, StoreError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
+        Ok(self
+            .query(
+                "select distinct on (x.r ->> 'id') (x.r ->> 'id')::bigint, x.r ->> 'brief'
+                   from (select e.id, e.kind -> 'detail' -> 'record' as r from spawn_events e
+                          where e.session_id = 'session_control'
+                            and e.event_name = 'control.recorded'
+                            and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.assigned'
+                            and e.kind -> 'detail' -> 'record' ->> 'id' = any($1)) x
+                  where jsonb_typeof(x.r -> 'brief') = 'string'
+                  order by x.r ->> 'id', x.id",
+                &[&ids],
+            )?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// Every `land` change with a task, in `domain` or, with `None`, in
+    /// every Git domain (`git:`), in the order they were recorded (by id):
+    /// the landings `spawn prov durability` counts its window in.
+    pub fn prov_land_changes(
+        &self,
+        domain: Option<&str>,
+    ) -> Result<Vec<ProvChangeRecord>, StoreError> {
+        change_records(&self.query(
+            &format!(
+                "select {CHANGE_COLUMNS} from prov_changes c
+                  where c.kind = 'land' and c.task_id is not null
+                    and case when $1::text is null then starts_with(c.domain, 'git:')
+                             else c.domain = $1 end
+                  order by c.id"
+            ),
+            &[&domain],
+        )?)
+    }
+
+    /// Every `supersedes` edge that leaves a `land` change, in `domain` or,
+    /// with `None`, in every Git domain, each with its change, by edge id.
+    pub fn prov_land_supersedes(
+        &self,
+        domain: Option<&str>,
+    ) -> Result<Vec<ProvSupersedes>, StoreError> {
+        self.query(
+            &format!(
+                "select {CHANGE_COLUMNS}, e.id, e.kind, e.src, e.dst, e.detail, e.at_ms
+                   from prov_edges e join prov_changes c on c.id = e.src
+                  where e.kind = 'supersedes' and c.kind = 'land'
+                    and case when $1::text is null then starts_with(c.domain, 'git:')
+                             else c.domain = $1 end
+                  order by e.id"
+            ),
+            &[&domain],
+        )?
+        .iter()
+        .map(|row| {
+            Ok(ProvSupersedes {
+                src: change_record(row)?,
+                edge: ProvEdgeRecord {
+                    id: row.get(16),
+                    kind: row.get::<_, String>(17).parse()?,
+                    src: row.get(18),
+                    dst: row.get(19),
+                    detail: row.get(20),
+                    at_ms: row.get(21),
+                },
+            })
+        })
+        .collect()
+    }
+
+    /// The changes `ids` names, by id.
+    pub fn prov_changes_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, ProvChangeRecord>, StoreError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        Ok(change_records(&self.query(
+            &format!("select {CHANGE_COLUMNS} from prov_changes c where c.id = any($1)"),
+            &[&ids],
+        )?)?
+        .into_iter()
+        .map(|change| (change.id, change))
+        .collect())
+    }
+}

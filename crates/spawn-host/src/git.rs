@@ -185,6 +185,174 @@ pub fn max_file_bytes(value: Option<&str>) -> u64 {
         .saturating_mul(1 << 20)
 }
 
+/// One entry of a branch's record of files over the cap
+/// ([`oversized_record`]): its size, whether the agent was told, and its
+/// `sha256:` digest (`None` in a record written before digests were, or
+/// for a file that could not be read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Oversized {
+    size: u64,
+    told: bool,
+    digest: Option<String>,
+}
+
+/// One file over the cap that checkpoints of a branch left out, as
+/// `<root>/.oversized/<branch>` records it ([`oversized_record`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OversizedFile {
+    /// The workspace path.
+    pub path: TreePath,
+    /// Its size in bytes when the checkpoint left it out.
+    pub size: u64,
+    /// `sha256:<64 hex>` of its bytes then; `None` in a record written
+    /// before digests were recorded, or for a file that could not be read.
+    pub digest: Option<String>,
+    /// Whether the agent was told.
+    pub told: bool,
+}
+
+/// Where a branch's record of files over the cap is under the workspace
+/// root `root`.
+fn oversized_file(root: &Path, branch: &str) -> PathBuf {
+    root.join(".oversized").join(branch)
+}
+
+/// Whether `text` is `sha256:` and 64 lowercase hex digits.
+fn is_sha256_digest(text: &str) -> bool {
+    text.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+/// A record of files over the cap, by path ([`oversized_record`] for the
+/// format). An entry that does not parse is left out, an empty path
+/// included: fields are split on every NUL (an empty field keeps its
+/// place), so one bad entry never shifts the ones after it.
+fn parse_oversized(bytes: &[u8]) -> BTreeMap<TreePath, Oversized> {
+    let bytes = bytes.strip_suffix(b"\0").unwrap_or(bytes);
+    if bytes.is_empty() {
+        return BTreeMap::new();
+    }
+    let fields: Vec<&[u8]> = bytes.split(|byte| *byte == 0).collect();
+    fields
+        .chunks_exact(3)
+        .filter_map(|entry| {
+            let told = match entry[0] {
+                b"told" => true,
+                b"untold" => false,
+                _ => return None,
+            };
+            let sized = std::str::from_utf8(entry[1]).ok()?;
+            let (size, digest) = match sized.split_once(' ') {
+                Some((size, digest)) => (size, is_sha256_digest(digest).then_some(digest)),
+                None => (sized, None),
+            };
+            let size = size.parse().ok()?;
+            if entry[2].is_empty() {
+                return None;
+            }
+            Some((
+                TreePath::from_bytes(entry[2]),
+                Oversized {
+                    size,
+                    told,
+                    digest: digest.map(str::to_string),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// The files over the cap ([`max_file_bytes`]) that checkpoints of
+/// `branch` left out, as the record under the workspace root `root` holds
+/// them, by path; empty when there is none, it cannot be read, or `branch`
+/// is not one plain file name (one normal path component: no `/`, `\\`,
+/// `.`, `..`, root or prefix), so the record read is always a file directly
+/// under `<root>/.oversized/`. The record is opened without following a
+/// symlink on the way (`.oversized` included) and must be a regular file.
+///
+/// The record, `<root>/.oversized/<branch>`, is NUL-separated, three fields
+/// each: `told` or `untold`, the size in bytes, the path. Since PV4
+/// (decision D6) the size field is followed by a space and the file's
+/// `sha256:<64 hex>` digest: the file is in no commit and its bytes are
+/// kept nowhere, but what it was is known. A record written before has no
+/// digest and still reads (`digest: None`).
+pub fn oversized_record(root: &Path, branch: &str) -> Vec<OversizedFile> {
+    if !is_plain_name(branch) {
+        return Vec::new();
+    }
+    let mut relative = b".oversized/".to_vec();
+    relative.extend_from_slice(branch.as_bytes());
+    let Ok(Some((bytes, _, false))) = crate::agent_files::read_regular(
+        root,
+        &TreePath::from_bytes(relative),
+        OVERSIZED_RECORD_LIMIT,
+    ) else {
+        return Vec::new();
+    };
+    parse_oversized(&bytes)
+        .into_iter()
+        .map(|(path, entry)| OversizedFile {
+            path,
+            size: entry.size,
+            digest: entry.digest,
+            told: entry.told,
+        })
+        .collect()
+}
+
+/// The most bytes [`oversized_record`] reads of a record: one larger is
+/// no record of this store's and reads as none.
+const OVERSIZED_RECORD_LIMIT: u64 = 64 << 20;
+
+/// Whether `name` is exactly one normal path component: not empty, no
+/// `/` or `\\`, not `.` or `..`, no root or prefix.
+fn is_plain_name(name: &str) -> bool {
+    use std::path::Component;
+    if name.is_empty() || name.contains(['/', '\\', '\0']) {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(part)), None) if part == std::ffi::OsStr::new(name)
+    )
+}
+
+/// The `sha256:` digest of the file over the cap at `path` under
+/// `directory`, `size` bytes when the checkpoint measured it. The digest
+/// `earlier` recorded is kept when the file still has that size and was
+/// last modified before the record was `written`; otherwise the file is
+/// read, without following a symlink anywhere on its path. `None` when it
+/// cannot be read or no longer has `size` bytes (a file that changed under
+/// the checkpoint: the next one records it).
+fn oversized_digest(
+    directory: &Path,
+    path: &TreePath,
+    size: u64,
+    earlier: Option<&Oversized>,
+    written: Option<std::time::SystemTime>,
+) -> Option<String> {
+    let opened = crate::agent_files::open_regular(directory, path).ok()??;
+    if opened.metadata.len() != size {
+        return None;
+    }
+    if let (Some(earlier), Some(written), Ok(modified)) =
+        (earlier, written, opened.metadata.modified())
+        && earlier.size == size
+        && earlier.digest.is_some()
+        && modified < written
+    {
+        return earlier.digest.clone();
+    }
+    let mut file = opened.file;
+    let digest = spawn_cas::sha256_reader(&mut file).ok()?;
+    Some(format!("sha256:{}", digest.hex()))
+}
+
 /// The trailer by which a checkpoint of an earlier version named a manifest
 /// of large files it kept outside git, in a chunk store this version does
 /// not have.
@@ -1078,45 +1246,36 @@ impl GitWorkspace {
     }
 
     /// Where the files over the cap that checkpoints of a branch left out are
-    /// recorded, NUL-separated, three fields each: `told` or `untold`, the
-    /// size in bytes, the path.
+    /// recorded ([`oversized_record`] reads it; the format is there).
     fn oversized_path(&self, branch: &str) -> PathBuf {
-        self.root.join(".oversized").join(branch)
+        oversized_file(&self.root, branch)
     }
 
-    /// The record at [`Self::oversized_path`]: by path, the size and whether
-    /// the agent was told. An unreadable or malformed record is empty.
-    fn read_oversized(&self, branch: &str) -> BTreeMap<TreePath, (u64, bool)> {
+    /// The record at [`Self::oversized_path`], by path. An unreadable or
+    /// malformed record is empty.
+    fn read_oversized(&self, branch: &str) -> BTreeMap<TreePath, Oversized> {
         let Ok(bytes) = std::fs::read(self.oversized_path(branch)) else {
             return BTreeMap::new();
         };
-        let fields: Vec<&[u8]> = nul_fields(&bytes).collect();
-        fields
-            .chunks_exact(3)
-            .filter_map(|entry| {
-                let told = match entry[0] {
-                    b"told" => true,
-                    b"untold" => false,
-                    _ => return None,
-                };
-                let size = std::str::from_utf8(entry[1]).ok()?.parse().ok()?;
-                Some((TreePath::from_bytes(entry[2]), (size, told)))
-            })
-            .collect()
+        parse_oversized(&bytes)
     }
 
     /// Best effort: a lost record tells the agent again at worst.
-    fn write_oversized(&self, branch: &str, record: &BTreeMap<TreePath, (u64, bool)>) {
+    fn write_oversized(&self, branch: &str, record: &BTreeMap<TreePath, Oversized>) {
         let path = self.oversized_path(branch);
         if record.is_empty() {
             let _ = std::fs::remove_file(&path);
             return;
         }
         let mut bytes = Vec::new();
-        for (file, (size, told)) in record {
-            bytes.extend_from_slice(if *told { b"told" } else { b"untold" });
+        for (file, entry) in record {
+            bytes.extend_from_slice(if entry.told { b"told" } else { b"untold" });
             bytes.push(0);
-            bytes.extend_from_slice(size.to_string().as_bytes());
+            bytes.extend_from_slice(entry.size.to_string().as_bytes());
+            if let Some(digest) = &entry.digest {
+                bytes.push(b' ');
+                bytes.extend_from_slice(digest.as_bytes());
+            }
             bytes.push(0);
             bytes.extend_from_slice(file.as_bytes());
             bytes.push(0);
@@ -1130,17 +1289,37 @@ impl GitWorkspace {
         }
     }
 
-    /// Record the files over the cap a checkpoint of `branch` just left out:
-    /// one already told of stays told; one no longer left out is forgotten,
-    /// so it is told of again if it grows past the cap again. The caller
-    /// holds the branch's lock.
-    pub(crate) fn record_oversized(&self, branch: &str, oversized: &[(TreePath, u64)]) {
+    /// Record the files over the cap a checkpoint of `branch` (its work tree
+    /// in `directory`) just left out: one already told of stays told; one no
+    /// longer left out is forgotten, so it is told of again if it grows past
+    /// the cap again. Each is recorded with its `sha256:` digest (decision
+    /// D6: digest and size are recorded, the bytes are kept nowhere), read
+    /// again only when the file may have changed since the record was
+    /// written ([`oversized_digest`]). The caller holds the branch's lock.
+    pub(crate) fn record_oversized(
+        &self,
+        branch: &str,
+        directory: &Path,
+        oversized: &[(TreePath, u64)],
+    ) {
         let before = self.read_oversized(branch);
-        let record: BTreeMap<TreePath, (u64, bool)> = oversized
+        let written = std::fs::metadata(self.oversized_path(branch))
+            .and_then(|meta| meta.modified())
+            .ok();
+        let record: BTreeMap<TreePath, Oversized> = oversized
             .iter()
             .map(|(path, size)| {
-                let told = before.get(path).is_some_and(|(_, told)| *told);
-                (path.clone(), (*size, told))
+                let earlier = before.get(path);
+                let told = earlier.is_some_and(|entry| entry.told);
+                let digest = oversized_digest(directory, path, *size, earlier, written);
+                (
+                    path.clone(),
+                    Oversized {
+                        size: *size,
+                        told,
+                        digest,
+                    },
+                )
             })
             .collect();
         if record != before {
@@ -1166,8 +1345,8 @@ impl GitWorkspace {
     fn untold_oversized(&self, branch: &str) -> Vec<String> {
         self.read_oversized(branch)
             .iter()
-            .filter(|(_, (_, told))| !*told)
-            .map(|(path, (size, _))| self.oversized_notice(path, *size))
+            .filter(|(_, entry)| !entry.told)
+            .map(|(path, entry)| self.oversized_notice(path, entry.size))
             .collect()
     }
 
@@ -1180,9 +1359,9 @@ impl GitWorkspace {
         };
         let mut record = self.read_oversized(branch);
         let mut changed = false;
-        for (path, (size, told)) in &mut record {
-            if !*told && notices.contains(&self.oversized_notice(path, *size)) {
-                *told = true;
+        for (path, entry) in &mut record {
+            if !entry.told && notices.contains(&self.oversized_notice(path, entry.size)) {
+                entry.told = true;
                 changed = true;
             }
         }
@@ -1504,7 +1683,7 @@ impl GitWorkspace {
             let _ = std::fs::remove_file(&index);
         }
         let (tree, oversized) = tree?;
-        self.record_oversized(&branch, &oversized);
+        self.record_oversized(&branch, &directory, &oversized);
 
         // A merge of main whose conflicts are now resolved: main is the
         // second parent, even when the tree did not change.
@@ -1599,7 +1778,7 @@ impl GitWorkspace {
             let _ = std::fs::remove_file(index);
         }
         let (tree, oversized) = tree?;
-        self.record_oversized(branch, &oversized);
+        self.record_oversized(branch, directory, &oversized);
         let mut arguments = vec!["commit-tree", tree.as_str()];
         if let Some(main) = main.as_deref() {
             arguments.extend(["-p", main]);
@@ -2269,7 +2448,7 @@ impl GitWorkspace {
         for path in special {
             crate::agent_files::remove(directory, path).map_err(unavailable)?;
         }
-        self.record_oversized(branch, &stay);
+        self.record_oversized(branch, directory, &stay);
         Ok(())
     }
 
@@ -2510,7 +2689,7 @@ impl GitWorkspace {
             let _ = std::fs::remove_file(&index);
         }
         let (tree, oversized) = tree?;
-        self.record_oversized(branch, &oversized);
+        self.record_oversized(branch, directory, &oversized);
         if let Some(previous) = &previous
             && self.git_output(&["rev-parse", &format!("{previous}^{{tree}}")])? == tree
         {
@@ -3726,6 +3905,127 @@ mod tests {
             "left out again"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Decision D6: a file over the cap is recorded with its size and its
+    /// `sha256:` digest, and its bytes are in no commit; a record written
+    /// before digests were (three fields, a bare size) still reads, and its
+    /// file is told of no second time.
+    #[test]
+    fn a_file_over_the_cap_is_recorded_with_its_digest_and_an_old_record_still_reads() {
+        let sha = |bytes: &[u8]| {
+            let digest = spawn_cas::sha256_reader(&mut &bytes[..]).expect("hash");
+            format!("sha256:{}", digest.hex())
+        };
+        let (checkout, store, workspace, base) = capped("cap-digest");
+        let directory = PathBuf::from(workspace.path());
+        let bytes = vec![7u8; (1 << 20) + 5];
+        std::fs::write(directory.join("big.bin"), &bytes).expect("write");
+        store.commit(&workspace, "one").expect("commit");
+        let expected = sha(&bytes);
+        let root = base.join("work");
+        let record = super::oversized_record(&root, "agent_a");
+        assert_eq!(record.len(), 1, "{record:?}");
+        assert_eq!(record[0].path.as_bytes(), b"big.bin");
+        assert_eq!(record[0].size, (1 << 20) + 5);
+        assert_eq!(record[0].digest.as_deref(), Some(expected.as_str()));
+        assert!(!record[0].told);
+        assert!(
+            !git(&checkout, &["ls-tree", "-r", "--name-only", "agent_a"]).contains("big.bin"),
+            "no byte of it in git"
+        );
+        // Changed, same size: read again.
+        let changed = vec![8u8; (1 << 20) + 5];
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(directory.join("big.bin"), &changed).expect("write");
+        store.commit(&workspace, "two").expect("commit");
+        let record = super::oversized_record(&root, "agent_a");
+        assert_eq!(record[0].digest, Some(sha(&changed)));
+
+        // A record of the earlier format: no digest, still told.
+        let notices = store.notices(&workspace);
+        store.notices_told(&workspace, &notices);
+        let size = (1u64 << 20) + 5;
+        std::fs::write(
+            root.join(".oversized/agent_a"),
+            format!("told\0{size}\0big.bin\0"),
+        )
+        .expect("an old record");
+        let old = super::oversized_record(&root, "agent_a");
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].digest, None);
+        assert!(old[0].told);
+        assert!(store.notices(&workspace).is_empty(), "told stays told");
+        // The next checkpoint adds the digest and keeps it told.
+        std::fs::write(directory.join("work.txt"), "w\n").expect("write");
+        store.commit(&workspace, "three").expect("commit");
+        let record = super::oversized_record(&root, "agent_a");
+        assert!(record[0].told);
+        assert_eq!(record[0].digest, Some(sha(&changed)));
+        // A malformed digest is no digest; a name that is no branch reads
+        // nothing.
+        std::fs::write(
+            root.join(".oversized/agent_a"),
+            format!("untold\0{size} sha256:XYZ\0big.bin\0"),
+        )
+        .expect("a bad digest");
+        assert_eq!(super::oversized_record(&root, "agent_a")[0].digest, None);
+        // An entry with an empty path is left out; the rest still reads.
+        std::fs::write(
+            root.join(".oversized/agent_a"),
+            format!("untold\0{size}\0\0told\0{size}\0big.bin\0"),
+        )
+        .expect("an empty path");
+        let read = super::oversized_record(&root, "agent_a");
+        assert_eq!(read.len(), 1, "{read:?}");
+        assert_eq!(read[0].path.as_bytes(), b"big.bin");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The record read is always a regular file directly under
+    /// `<root>/.oversized/`: a name that would leave it (`..`, an absolute
+    /// path, a separator) reads nothing even where a valid record lies, and
+    /// so does a record reached through a symbolic link.
+    #[test]
+    fn an_oversized_record_is_read_only_from_under_its_own_directory() {
+        let base = crate::Scratch::new("spawn-git-oversized-confined");
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join(".oversized")).expect("the records");
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let record = format!("untold\x007 {digest}\0x.bin\0");
+        // A valid record outside `.oversized`, at `<root>/outside`.
+        std::fs::write(root.join("outside"), &record).expect("outside");
+        std::fs::write(root.join(".oversized/agent_a"), &record).expect("inside");
+        let inside = super::oversized_record(&root, "agent_a");
+        assert_eq!(inside.len(), 1, "a legitimate record reads");
+        assert_eq!(inside[0].digest.as_deref(), Some(digest.as_str()));
+        assert_eq!(inside[0].size, 7);
+        let outside = root.join("outside");
+        for name in [
+            "../outside",
+            outside.to_str().expect("utf-8"),
+            "",
+            ".",
+            "..",
+            "a/b",
+            "agent_a/",
+            "..\\outside",
+            "/agent_a",
+        ] {
+            assert!(super::oversized_record(&root, name).is_empty(), "{name:?}");
+        }
+        // A record that is a symbolic link, even to a valid record, and a
+        // `.oversized` that is one: nothing.
+        std::os::unix::fs::symlink(&outside, root.join(".oversized/linked")).expect("a link");
+        assert!(super::oversized_record(&root, "linked").is_empty());
+        let other = base.join("other");
+        std::fs::create_dir_all(&other).expect("another root");
+        std::os::unix::fs::symlink(root.join(".oversized"), other.join(".oversized"))
+            .expect("a linked directory");
+        assert!(super::oversized_record(&other, "agent_a").is_empty());
+        // A directory where the record would be: nothing.
+        std::fs::create_dir_all(root.join(".oversized/dir")).expect("a directory");
+        assert!(super::oversized_record(&root, "dir").is_empty());
     }
 
     /// A file over the cap that `main` holds as a blob (it came from the

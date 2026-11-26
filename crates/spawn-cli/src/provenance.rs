@@ -35,9 +35,15 @@
 //! spawn-cas; and `blast` follows `used` edges across data snapshots and
 //! from code commits into them.
 //!
+//! PV4 adds `supersedes` edges at landing from the dispatcher's brief,
+//! the files over the cap a workspace left out (decision D6, both in
+//! [`index`]), and `durability` ([`durability`]): the shadow report of
+//! confirmed defects per preset (decisions D4, B6). It never routes.
+//!
 //! Every answer is JSON.
 
 pub(crate) mod data;
+pub(crate) mod durability;
 pub(crate) mod index;
 #[cfg(test)]
 mod land_tests;
@@ -58,7 +64,8 @@ use spawn_postgres::provenance::{
 use crate::Flags;
 
 /// The usage of `spawn prov`, the only copy (main's help reads it).
-pub(crate) const USAGE: &str = "usage: spawn prov index --source <source> [--repo <git dir>]\n       \
+pub(crate) const USAGE: &str = "usage: spawn prov index --source <source> [--repo <git dir>] \
+     [--root <workspace root>]\n       \
      (records the Git history of the source's main and of its spawn/* branches; safe to run \
      again)\n       \
      spawn prov who <path>[:<line>] --source <source> [--repo <git dir>]\n       \
@@ -79,7 +86,11 @@ pub(crate) const USAGE: &str = "usage: spawn prov index --source <source> [--rep
      spawn prov refs [--cas <dir>]\n       \
      spawn prov rollback [--plan] <ref> <snapshot> [--cas <dir>] [--task N]\n       \
      (moves the ref's head back to a snapshot it still keeps, as a revert revision; --plan \
-     writes nothing)";
+     writes nothing)\n       \
+     spawn prov durability [--source <source>] [--window-landings 50] [--window-days 14] \
+     [--json]\n       \
+     (shadow report: per preset, landed tasks and the confirmed defects charged to them; \
+     never routes)";
 
 /// `spawn prov <verb> ...`.
 pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
@@ -91,10 +102,11 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
             let flags = Flags::parse(&rest[1..])?;
             let source = flags.required("source")?;
             let repo = flags.get("repo").unwrap_or_else(|| source.clone());
+            let root = crate::config::workspace_root(&flags).map(std::path::PathBuf::from);
             let store = crate::open_store()?;
             let mut git = index::Repo::open(&repo)?;
             let domain = index::domain_of(&source);
-            let summary = index::index(&store, &mut git, &domain)?;
+            let summary = index::index_with(&store, &mut git, &domain, root.as_deref())?;
             println!(
                 "{}",
                 json!({
@@ -154,6 +166,7 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
         }
         "revert" | "split" | "compose" => plan_command(verb, &rest[1..]),
         "snapshot" | "refs" | "rollback" => data_command(verb, &rest[1..]),
+        "durability" => durability::command(&rest[1..]),
         _ => Err(USAGE.to_string()),
     }
 }
@@ -648,8 +661,16 @@ pub(crate) fn record_land(
     let view = plan::View::of(&mirror_path)?;
     view.git(&["update-ref", index::MAIN, candidate])?;
     let mut repo = index::Repo::open(&view.path())?;
-    let summary = index::index(store, &mut repo, &domain)?;
+    let summary = index::index_with(store, &mut repo, &domain, mirror_root(mirror))?;
     Ok(Landed::Recorded(summary))
+}
+
+/// The workspace root a source's mirror is under (`<root>/.sources/<name>`,
+/// [`crate::sources::mirror_path`]), whose `.oversized` records the hook
+/// reads (decision D6); `None` for a mirror anywhere else.
+pub(crate) fn mirror_root(mirror: &Path) -> Option<&Path> {
+    let sources = mirror.parent()?;
+    (sources.file_name()? == ".sources").then(|| sources.parent())?
 }
 
 /// [`record_land`] for the integrator's landing of task `task`: what it

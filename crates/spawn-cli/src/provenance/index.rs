@@ -27,18 +27,30 @@
 //! trailers are the integrator's own (`landing_message` indents every line
 //! of a report that could read as one), and only the last paragraph of a
 //! message is read as trailers.
+//!
+//! PV4 adds two things to a landing's `land` Change, the same in the
+//! indexer and the landing hook (which runs this walk):
+//! - `supersedes` edges from the dispatcher's brief of the landing's task
+//!   (its `task.assigned` record, never agent text): `reverts: task N`,
+//!   `fixes: task N`, `supersedes: task N (<reason>)` ([`directives`],
+//!   [`supersedes`]);
+//! - with a workspace root, the files over the cap the task's workspace
+//!   left out (`<root>/.oversized/<agent>`, decision D6), as `content`
+//!   entries with their `sha256:` digest and size, for the landing that is
+//!   main's newest commit ([`oversized_entries`]).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write as _};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use spawn_postgres::PostgresStore;
 use spawn_postgres::provenance::{
-    ProvAttributionSource, ProvBoundary, ProvChangeInput, ProvChangeKind, ProvEdgeInput,
-    ProvEdgeKind, ProvEntryClass, ProvEntryInput, ProvTaskFacts,
+    ProvAttributionSource, ProvBoundary, ProvChangeInput, ProvChangeKind, ProvChangeRecord,
+    ProvEdgeInput, ProvEdgeKind, ProvEntryClass, ProvEntryInput, ProvTaskFacts,
 };
 
 /// git's empty tree: the base of a root commit.
@@ -224,6 +236,129 @@ pub(crate) fn trailers(message: &str) -> Trailers {
         }
     }
     found
+}
+
+/// What a dispatcher's directive line says of an earlier task (PV4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DirectiveKind {
+    /// `reverts: task N`: this task undoes task N.
+    Reverts,
+    /// `fixes: task N`: this task fixes task N (reported, never scored).
+    Fixes,
+    /// `supersedes: task N (<reason>)`, a reason that is no defect.
+    Supersedes(SupersedeReason),
+}
+
+/// The reasons a `supersedes:` line may give: none is a defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SupersedeReason {
+    Refactor,
+    Format,
+    Planned,
+    Requirement,
+}
+
+impl SupersedeReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Refactor => "refactor",
+            Self::Format => "format",
+            Self::Planned => "planned",
+            Self::Requirement => "requirement",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        Some(match word.to_ascii_lowercase().as_str() {
+            "refactor" => Self::Refactor,
+            "format" => Self::Format,
+            "planned" => Self::Planned,
+            "requirement" => Self::Requirement,
+            _ => return None,
+        })
+    }
+}
+
+/// One directive of a dispatcher's brief.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Directive {
+    pub(crate) kind: DirectiveKind,
+    pub(crate) task: i64,
+}
+
+/// The `defect` reason of a `supersedes` edge.
+pub(crate) const REASON_DEFECT: &str = "defect";
+
+/// Evidence of level 1 (decisions B6, item 2): the dispatcher's `reverts:`
+/// landing restores the paths of the task it names to their `before`.
+pub(crate) const EVIDENCE_LEVEL1: &str = "level1_revert";
+
+/// Evidence of level 2: a regression test bisected to the landing. No
+/// writer yet; `spawn prov durability` counts it when one exists.
+pub(crate) const EVIDENCE_LEVEL2: &str = "level2_bisect";
+
+/// A `reverts:` whose landing does not restore those paths.
+pub(crate) const EVIDENCE_UNVERIFIED: &str = "unverified_revert";
+
+/// A dispatcher's `fixes:`: reported, never scored.
+pub(crate) const EVIDENCE_FIXES: &str = "dispatcher_fixes";
+
+/// A dispatcher's `supersedes: task N (<reason>)`.
+pub(crate) const EVIDENCE_SUPERSEDES: &str = "dispatcher_supersedes";
+
+/// The directives of a dispatcher's brief, in order, each once: every line
+/// that is, whole, `reverts: task N`, `fixes: task N` or `supersedes: task
+/// N (refactor|format|planned|requirement)`, any case, with optional
+/// spaces, an optional `#` before N, an optional list marker (`-`, `*`)
+/// and an optional final `.`. Anything else on the line (quotes, words
+/// around it) makes it no directive, so prose that mentions one is none.
+pub(crate) fn directives(brief: &str) -> Vec<Directive> {
+    let mut found: Vec<Directive> = Vec::new();
+    for line in brief.lines() {
+        let Some(directive) = directive(line) else {
+            continue;
+        };
+        if !found.contains(&directive) {
+            found.push(directive);
+        }
+    }
+    found
+}
+
+/// One line as a [`Directive`], if it is one.
+fn directive(line: &str) -> Option<Directive> {
+    let mut text = line.trim();
+    if let Some(rest) = text.strip_prefix(['-', '*'])
+        && rest.starts_with(char::is_whitespace)
+    {
+        text = rest.trim_start();
+    }
+    let text = text.strip_suffix('.').unwrap_or(text).trim_end();
+    let (word, rest) = text.split_once(':')?;
+    let word = word.trim().to_ascii_lowercase();
+    let rest = rest.trim_start();
+    let task_word = rest.get(..4)?;
+    if !task_word.eq_ignore_ascii_case("task") {
+        return None;
+    }
+    let rest = rest[4..].trim_start();
+    let rest = rest.strip_prefix('#').unwrap_or(rest);
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || (digits < rest.len() && !rest[digits..].starts_with([' ', '\t', '('])) {
+        return None;
+    }
+    let task: i64 = rest[..digits].parse().ok().filter(|task| *task > 0)?;
+    let tail = rest[digits..].trim();
+    let kind = match word.as_str() {
+        "reverts" if tail.is_empty() => DirectiveKind::Reverts,
+        "fixes" if tail.is_empty() => DirectiveKind::Fixes,
+        "supersedes" => {
+            let reason = tail.strip_prefix('(')?.strip_suffix(')')?.trim();
+            DirectiveKind::Supersedes(SupersedeReason::parse(reason)?)
+        }
+        _ => return None,
+    };
+    Some(Directive { kind, task })
 }
 
 /// One path of `git diff-tree -r -z --no-renames`.
@@ -597,6 +732,18 @@ impl Repo {
         })
     }
 
+    /// The object `commit` holds at `path` (a blob, a tree, a submodule's
+    /// commit), `None` when it holds nothing there.
+    pub(crate) fn object_at(&mut self, commit: &str, path: &str) -> Result<Option<String>, String> {
+        if path.is_empty() || path.starts_with('"') {
+            return Ok(None);
+        }
+        Ok(self
+            .objects
+            .info(&format!("{commit}:{path}"))?
+            .map(|(oid, _, _)| oid))
+    }
+
     /// The tree `commit` holds at the top-level directory `name`, if any.
     pub(crate) fn subtree(&mut self, commit: &str, name: &str) -> Result<Option<String>, String> {
         Ok(match self.objects.info(&format!("{commit}:{name}"))? {
@@ -891,6 +1038,8 @@ struct Facts {
     /// Each agent's tasks: `(created_at_ms, task)`, oldest first.
     agent_tasks: HashMap<String, Vec<(i64, i64)>>,
     tasks: HashMap<i64, ProvTaskFacts>,
+    /// The dispatcher's brief of each landing's task (PV4).
+    briefs: HashMap<i64, String>,
 }
 
 impl Facts {
@@ -939,11 +1088,22 @@ impl Facts {
         }
         tasks.sort_unstable();
         tasks.dedup();
+        let mut landed: Vec<i64> = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Main { trailers, .. } => trailers.task,
+                Item::Checkpoint { .. } => None,
+            })
+            .collect();
+        landed.sort_unstable();
+        landed.dedup();
+        let briefs = store.prov_task_briefs(&landed).map_err(error)?;
         let tasks = store.prov_task_facts(&tasks).map_err(error)?;
         Ok(Self {
             executions,
             agent_tasks,
             tasks,
+            briefs,
         })
     }
 
@@ -1147,12 +1307,201 @@ fn includes(
         .collect())
 }
 
+/// The `supersedes` edges of task `task`'s landing `commit` (PV4), from the
+/// directives of the dispatcher's brief of `task` ([`directives`]), never
+/// from anything an agent wrote. One edge for each `land` Change of the
+/// task a directive names in `domain` (its `change_id`), with the detail
+/// `{reason, evidence, target_task}`:
+/// - `reverts: task N`: `reason: "defect"`, evidence [`EVIDENCE_LEVEL1`]
+///   when the landing restores N's paths ([`restores`]), else
+///   [`EVIDENCE_UNVERIFIED`];
+/// - `fixes: task N`: `reason: "defect"`, evidence [`EVIDENCE_FIXES`];
+/// - `supersedes: task N (<reason>)`: that reason, evidence
+///   [`EVIDENCE_SUPERSEDES`].
+///
+/// A directive that names the task itself, or a task with no `land`
+/// Change in the domain, writes nothing. The edges depend on the store's
+/// rows of earlier landings and on the repository alone, so the hook and
+/// the indexer write the same.
+fn supersedes(
+    store: &PostgresStore,
+    repo: &mut Repo,
+    domain: &str,
+    facts: &Facts,
+    task: i64,
+    commit: &str,
+    entries: &[ProvEntryInput],
+) -> Result<Vec<ProvEdgeInput>, String> {
+    let error = |error: spawn_core::port::StoreError| error.to_string();
+    let Some(brief) = facts.briefs.get(&task) else {
+        return Ok(Vec::new());
+    };
+    let mut edges = Vec::new();
+    for Directive { kind, task: target } in directives(brief) {
+        if target == task {
+            continue;
+        }
+        let lands: Vec<ProvChangeRecord> = store
+            .prov_changes_for_task(target)
+            .map_err(error)?
+            .into_iter()
+            .filter(|change| change.kind == ProvChangeKind::Land && change.domain == domain)
+            .collect();
+        if lands.is_empty() {
+            continue;
+        }
+        let (reason, evidence) = match kind {
+            DirectiveKind::Reverts => {
+                let restored = restores(store, repo, &lands, commit, entries)?;
+                (
+                    REASON_DEFECT,
+                    if restored {
+                        EVIDENCE_LEVEL1
+                    } else {
+                        EVIDENCE_UNVERIFIED
+                    },
+                )
+            }
+            DirectiveKind::Fixes => (REASON_DEFECT, EVIDENCE_FIXES),
+            DirectiveKind::Supersedes(reason) => (reason.as_str(), EVIDENCE_SUPERSEDES),
+        };
+        let change_ids: BTreeSet<&str> = lands.iter().map(|land| land.change_id.as_str()).collect();
+        for change_id in change_ids {
+            edges.push(ProvEdgeInput {
+                kind: ProvEdgeKind::Supersedes,
+                dst: change_id.to_string(),
+                detail: json!({"reason": reason, "evidence": evidence, "target_task": target}),
+                at_ms: None,
+            });
+        }
+    }
+    Ok(edges)
+}
+
+/// Whether the landing `commit` (its `entries`) restores the paths the
+/// `land` Changes `lands` of one task landed to their `before` digests
+/// (decisions B6, item 2, level 1): for every `content`, `mechanical` or
+/// `tree` path they touched, `commit` holds what the earliest of them found
+/// there (absent where it was absent), and the landing touched at least
+/// one of them. `generated` paths (`Cargo.lock`, the registry) are not
+/// asked: they are made again, not restored. A path stored quoted cannot
+/// be read back, and makes it unverified.
+fn restores(
+    store: &PostgresStore,
+    repo: &mut Repo,
+    lands: &[ProvChangeRecord],
+    commit: &str,
+    entries: &[ProvEntryInput],
+) -> Result<bool, String> {
+    let mut ids: Vec<i64> = lands.iter().map(|land| land.id).collect();
+    ids.sort_unstable();
+    let mut before: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for entry in store
+        .prov_entries_of(&ids)
+        .map_err(|error| error.to_string())?
+    {
+        if entry.class == ProvEntryClass::Generated {
+            continue;
+        }
+        // `prov_entries_of` is by change, so the earliest land comes first.
+        before.entry(entry.path).or_insert(entry.before);
+    }
+    if before.is_empty() {
+        return Ok(false);
+    }
+    let touched: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    if !touches_any(before.keys().map(String::as_str), &touched) {
+        return Ok(false);
+    }
+    for (path, digest) in &before {
+        if path.starts_with('"') {
+            return Ok(false);
+        }
+        let now = repo.object_at(commit, path)?.map(|oid| git1(&oid));
+        if &now != digest {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether one of the paths `landed` (a task's entries) is one of the
+/// paths `touched` (a landing's entries), where either side may be folded
+/// (a `tree` row is a top-level directory, [`FOLD_OVER`]): the same path;
+/// a landed file under a folded touched directory; or a landed folded
+/// directory over a touched file. Folding is by top-level directory only,
+/// so comparing each path's top-level directory is exact.
+pub(crate) fn touches_any<'a>(landed: impl IntoIterator<Item = &'a str>, touched: &[&str]) -> bool {
+    fn top(path: &str) -> &str {
+        path.split_once('/').map_or(path, |(top, _)| top)
+    }
+    let paths: HashSet<&str> = touched.iter().copied().collect();
+    let tops: HashSet<&str> = touched
+        .iter()
+        .filter(|path| path.contains('/'))
+        .map(|path| top(path))
+        .collect();
+    landed.into_iter().any(|path| {
+        paths.contains(path)
+            || (path.contains('/') && paths.contains(top(path)))
+            || (!path.contains('/') && tops.contains(path))
+    })
+}
+
+/// The entries of the files over the cap (decision D6) that the workspace
+/// of `agent` left out, as `<root>/.oversized/<agent>` records them
+/// ([`spawn_host::git::oversized_record`]): one `content` entry for each
+/// file recorded with its digest, `after` its `sha256:` digest, `size` its
+/// bytes, no `before` (git never held it) and no origin. A path the
+/// landing's own entries hold, or one recorded without a digest (a record
+/// written before PV4), is left out.
+pub(crate) fn oversized_entries(
+    root: &Path,
+    agent: &str,
+    entries: &[ProvEntryInput],
+) -> Vec<ProvEntryInput> {
+    let taken: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    spawn_host::git::oversized_record(root, agent)
+        .into_iter()
+        .filter_map(|file| {
+            let digest = file.digest?;
+            let path = stored_path(file.path.as_bytes());
+            if taken.contains(path.as_str()) {
+                return None;
+            }
+            Some(ProvEntryInput {
+                path,
+                before: None,
+                after: Some(digest),
+                size: i64::try_from(file.size).ok(),
+                class: ProvEntryClass::Content,
+                origin: None,
+            })
+        })
+        .collect()
+}
+
 /// Index `repo`'s history into `domain`: everything not recorded yet, in
-/// the walk's order (module doc). Returns what it recorded.
+/// the walk's order (module doc), with no workspace root
+/// ([`index_with`]). Returns what it recorded.
+#[cfg(test)]
 pub(crate) fn index(
     store: &PostgresStore,
     repo: &mut Repo,
     domain: &str,
+) -> Result<Summary, String> {
+    index_with(store, repo, domain, None)
+}
+
+/// [`index`], with the workspace root `root` whose `.oversized` records
+/// add the files over the cap to the landing that is main's newest commit
+/// ([`oversized_entries`]): the record is the workspace as it is now, so it
+/// is true of that landing alone. `None`: no such entries.
+pub(crate) fn index_with(
+    store: &PostgresStore,
+    repo: &mut Repo,
+    domain: &str,
+    root: Option<&Path>,
 ) -> Result<Summary, String> {
     let mut known = Known::load(store, domain)?;
     let mut summary = Summary::default();
@@ -1161,6 +1510,7 @@ pub(crate) fn index(
         return Ok(summary);
     }
     let facts = Facts::load(store, &items)?;
+    let tip = repo.resolve(MAIN);
     for item in &items {
         let (change, entries, edges) = match item {
             Item::Checkpoint {
@@ -1191,7 +1541,22 @@ pub(crate) fn index(
                     &commit.id,
                     &[],
                 )?;
-                let edges = includes(store, &mut known, checkpoints, &mut entries)?;
+                let mut edges = includes(store, &mut known, checkpoints, &mut entries)?;
+                if let (ProvChangeKind::Land, Some(task)) = (change.kind, change.task_id) {
+                    edges.extend(supersedes(
+                        store, repo, domain, &facts, task, &commit.id, &entries,
+                    )?);
+                    if let Some(root) = root
+                        && tip.as_deref() == Some(commit.id.as_str())
+                        && let Some(agent) = facts.tasks.get(&task).map(|task| &task.agent_id)
+                    {
+                        let more = oversized_entries(root, agent, &entries);
+                        if !more.is_empty() {
+                            entries.extend(more);
+                            entries.sort_by(|a, b| a.path.cmp(&b.path));
+                        }
+                    }
+                }
                 match change.kind {
                     ProvChangeKind::Land => summary.lands += 1,
                     _ => summary.imports += 1,

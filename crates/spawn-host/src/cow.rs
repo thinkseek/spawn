@@ -2791,7 +2791,7 @@ impl CowWorkspace {
         let (tree, mut state, oversized) =
             self.snapshot(branch, &directory, &previous, &mut tally)?;
         // Told to the agent as the Git store tells it ([`Self::notices`]).
-        self.git.record_oversized(branch, &oversized);
+        self.git.record_oversized(branch, &directory, &oversized);
         self.set_last(tally);
         let reference = format!("refs/heads/{branch}");
         let current = self.commit_of(&reference);
