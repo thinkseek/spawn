@@ -1364,6 +1364,37 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_presets_driver_is_its_engine_label_when_registered_else_claude_label_only() {
+        let mut p = preset("p", SkillGrade::L1, 1);
+        assert_eq!(
+            p.driver_id(),
+            PresetDriver {
+                driver: "claude",
+                label_only: false
+            }
+        );
+        p.engine_label = "agy".to_string();
+        assert_eq!(
+            p.driver_id(),
+            PresetDriver {
+                driver: "agy",
+                label_only: false
+            }
+        );
+        for label in ["codex", "opencode", "Claude", ""] {
+            p.engine_label = label.to_string();
+            assert_eq!(
+                p.driver_id(),
+                PresetDriver {
+                    driver: crate::driver::DEFAULT,
+                    label_only: true
+                },
+                "{label}"
+            );
+        }
+    }
+
     fn preset(id: &str, grade: SkillGrade, cost_rank: u32) -> GradedPreset {
         GradedPreset {
             preset_id: id.to_string(),
