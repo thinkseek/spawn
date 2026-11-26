@@ -445,19 +445,17 @@ impl BwrapView {
         (directories, files, skipped)
     }
 
-    /// The view of one launch: every target resolved now, the masks first
-    /// and the writable binds last. Refused (an error) when the workspace
-    /// or the engine's home cannot be bound without uncovering a mask, or
-    /// cannot be made.
-    pub fn plan(&self, launch: &ViewedLaunch<'_>) -> Result<Plan, String> {
-        let workspace = canonical_directory(Path::new(launch.workspace), "the workspace", false)?;
-        let engine_home =
-            canonical_directory(Path::new(launch.engine_home), "the engine's home", true)?;
+    /// Why a writable bind of `workspace` or `engine_home` is refused:
+    /// it would uncover a mask, lie in one, or reach the view's `private`
+    /// directory (see the module's documentation).
+    fn refuse_binds(
+        &self,
+        workspace: &Path,
+        engine_home: &Path,
+        private: &Path,
+        masked: &[&PathBuf],
+    ) -> Result<(), String> {
         let home = std::fs::canonicalize(&self.config.home).unwrap_or(self.config.home.clone());
-        let private = self.private_dir()?;
-
-        let (directories, files, skipped) = self.targets();
-        let masked: Vec<&PathBuf> = directories.iter().chain(files.iter()).collect();
         // A writable bind may hold no mask (its bind would uncover it) and
         // lie in none (it would open a hole in it), nor reach the view's
         // private directory either way.
@@ -467,15 +465,15 @@ impl BwrapView {
                 .find(|target| target.starts_with(bound) || bound.starts_with(target))
         };
         let reaches_private =
-            |bound: &Path| private.starts_with(bound) || bound.starts_with(&private);
-        if reaches_private(&workspace) {
+            |bound: &Path| private.starts_with(bound) || bound.starts_with(private);
+        if reaches_private(workspace) {
             return Err(format!(
                 "the workspace {} overlaps the view's private directory {}",
                 workspace.display(),
                 private.display()
             ));
         }
-        if let Some(target) = overlap(&workspace) {
+        if let Some(target) = overlap(workspace) {
             return Err(format!(
                 "the workspace {} overlaps {}, which the view masks",
                 workspace.display(),
@@ -488,7 +486,7 @@ impl BwrapView {
                 engine_home.display()
             ));
         }
-        if reaches_private(&engine_home) {
+        if reaches_private(engine_home) {
             return Err(format!(
                 "the engine's home {} overlaps the view's private directory {}",
                 engine_home.display(),
@@ -504,7 +502,7 @@ impl BwrapView {
             .filter_map(|dir| std::fs::canonicalize(dir).ok())
             .collect();
         let refused = masked.iter().find(|target| {
-            target.starts_with(&engine_home)
+            target.starts_with(engine_home)
                 || (engine_home.starts_with(target)
                     && !engine_homes.iter().any(|dir| dir == **target))
         });
@@ -515,6 +513,23 @@ impl BwrapView {
                 target.display()
             ));
         }
+        Ok(())
+    }
+
+    /// The view of one launch: every target resolved now, the masks first
+    /// and the writable binds last. Refused (an error) when the workspace
+    /// or the engine's home cannot be bound without uncovering a mask, or
+    /// cannot be made.
+    pub fn plan(&self, launch: &ViewedLaunch<'_>) -> Result<Plan, String> {
+        let workspace = canonical_directory(Path::new(launch.workspace), "the workspace", false)?;
+        let engine_home =
+            canonical_directory(Path::new(launch.engine_home), "the engine's home", true)?;
+        let home = std::fs::canonicalize(&self.config.home).unwrap_or(self.config.home.clone());
+        let private = self.private_dir()?;
+
+        let (directories, files, skipped) = self.targets();
+        let masked: Vec<&PathBuf> = directories.iter().chain(files.iter()).collect();
+        self.refuse_binds(&workspace, &engine_home, &private, &masked)?;
         let tmpdir = engine_tmpdir(&engine_home)?;
 
         let mut words = vec![
