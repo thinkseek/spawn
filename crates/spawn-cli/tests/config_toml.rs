@@ -1110,6 +1110,202 @@ fn cli_config_init_from_host_docker_plan_and_doctor_emit_valid_outputs() {
     assert!(doc_json.get("bwrap_capability").is_some());
     assert!(doc_json.get("host_inherit").is_some());
     assert!(doc_json.get("archive_mask_tool").is_some());
+    assert!(doc_json.get("model_endpoints").is_some());
+}
+
+#[test]
+fn cli_doctor_reports_model_endpoints_unconfigured() {
+    let dir = TempDir::new("doctor-model-unconfigured");
+    let root_str = dir.path().display().to_string();
+
+    let out = spawn_bin(&["doctor", "--json", "--root", &root_str], &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+
+    let report: Value = serde_json::from_str(&stdout).expect("unconfigured doctor JSON");
+    assert_eq!(
+        report["model_endpoints"]["model_relay"]["status"],
+        json!("not_configured")
+    );
+    assert_eq!(
+        report["model_endpoints"]["judge"]["status"],
+        json!("not_configured")
+    );
+    assert!(report["model_endpoints"]["model_relay"]["latency_ms"].is_null());
+    assert!(report["model_endpoints"]["judge"]["latency_ms"].is_null());
+}
+
+#[test]
+fn cli_doctor_reports_model_endpoints_ok_with_live_loopback_server() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let dir = TempDir::new("doctor-model-ok");
+    let root_str = dir.path().display().to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback endpoint");
+    let ok_port = listener.local_addr().expect("local addr").port();
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept doctor probe");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            );
+            let _ = stream.flush();
+        }
+    });
+
+    let endpoint_url = format!("http://127.0.0.1:{ok_port}");
+    let out = spawn_bin(
+        &["doctor", "--json", "--root", &root_str],
+        &[
+            ("SPAWN_MODEL_RELAY", &endpoint_url),
+            ("SPAWN_JUDGE_URL", &endpoint_url),
+            ("SPAWN_DEFAULT_MODEL", "claude-opus-5-5"),
+            ("SPAWN_CHEAP_MODEL", "deepseek-v4-pro"),
+            ("SPAWN_SMALL_MODEL", "deepseek-flash"),
+        ],
+    );
+    server.join().expect("join mock server");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+
+    let report: Value = serde_json::from_str(&stdout).expect("ok doctor JSON");
+    assert_eq!(
+        report["model_endpoints"]["model_relay"]["status"],
+        json!("ok")
+    );
+    assert_eq!(
+        report["model_endpoints"]["model_relay"]["http_status"],
+        json!(200)
+    );
+    assert_eq!(
+        report["model_endpoints"]["model_relay"]["target"],
+        json!(format!("127.0.0.1:{ok_port}"))
+    );
+    assert!(
+        report["model_endpoints"]["model_relay"]["latency_ms"]
+            .as_u64()
+            .is_some()
+    );
+    assert_eq!(report["model_endpoints"]["judge"]["status"], json!("ok"));
+    assert_eq!(
+        report["model_endpoints"]["judge"]["http_status"],
+        json!(200)
+    );
+    assert!(
+        report["model_endpoints"]["judge"]["latency_ms"]
+            .as_u64()
+            .is_some()
+    );
+    assert_eq!(
+        report["model_endpoints"]["model_slots"]["default"],
+        json!("claude-opus-5-5")
+    );
+    assert_eq!(
+        report["model_endpoints"]["model_slots"]["cheap"],
+        json!("deepseek-v4-pro")
+    );
+    assert_eq!(
+        report["model_endpoints"]["model_slots"]["small"],
+        json!("deepseek-flash")
+    );
+}
+
+#[test]
+fn cli_doctor_reports_model_endpoints_unreachable_without_credential_leak() {
+    use std::net::TcpListener;
+
+    let dir = TempDir::new("doctor-model-unreachable");
+    let root_str = dir.path().display().to_string();
+    let closed_listener = TcpListener::bind("127.0.0.1:0").expect("bind closed port");
+    let closed_port = closed_listener.local_addr().expect("closed addr").port();
+    drop(closed_listener);
+
+    let secret_relay = format!(
+        "http://relayuser:RelaySecretPass99@127.0.0.1:{closed_port}/v1?api_key=RelayQueryTok88"
+    );
+    let secret_judge = format!(
+        "http://judgeuser:JudgeSecretPass77@127.0.0.1:{closed_port}/v1/systemone?token=JudgeQueryTok66"
+    );
+    let env = [
+        ("SPAWN_MODEL_RELAY", secret_relay.as_str()),
+        ("SPAWN_JUDGE_URL", secret_judge.as_str()),
+    ];
+
+    let down_json_out = spawn_bin(&["doctor", "--json", "--root", &root_str], &env);
+    let down_stdout = String::from_utf8_lossy(&down_json_out.stdout);
+    let down_stderr = String::from_utf8_lossy(&down_json_out.stderr);
+    assert_eq!(
+        down_json_out.status.code(),
+        Some(0),
+        "stdout={down_stdout}\nstderr={down_stderr}"
+    );
+    let down_json: Value = serde_json::from_str(&down_stdout).expect("down doctor JSON");
+
+    for slot in ["model_relay", "judge"] {
+        assert_eq!(
+            down_json["model_endpoints"][slot]["status"],
+            json!("unreachable"),
+            "{down_json}"
+        );
+        assert_eq!(
+            down_json["model_endpoints"][slot]["target"],
+            json!(format!("127.0.0.1:{closed_port}"))
+        );
+        assert!(
+            down_json["model_endpoints"][slot]["remediation"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "{down_json}"
+        );
+    }
+    let warnings = down_json["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .is_some_and(|s| s.contains("model_relay") && s.contains("unreachable"))),
+        "{warnings:?}"
+    );
+
+    let down_human_out = spawn_bin(&["doctor", "--root", &root_str], &env);
+    assert_eq!(down_human_out.status.code(), Some(0));
+    let human_stdout = String::from_utf8_lossy(&down_human_out.stdout);
+    let human_stderr = String::from_utf8_lossy(&down_human_out.stderr);
+    assert!(
+        human_stdout.contains("model_endpoints:")
+            && human_stdout.contains("unreachable")
+            && human_stdout.contains("remediation:"),
+        "{human_stdout}"
+    );
+
+    let all_outputs = format!("{down_stdout}\n{down_stderr}\n{human_stdout}\n{human_stderr}");
+    for secret in [
+        "RelaySecretPass99",
+        "RelayQueryTok88",
+        "relayuser",
+        "JudgeSecretPass77",
+        "JudgeQueryTok66",
+        "judgeuser",
+    ] {
+        assert!(
+            !all_outputs.contains(secret),
+            "credential {secret:?} leaked:\n{all_outputs}"
+        );
+    }
 }
 
 #[test]

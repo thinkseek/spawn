@@ -65,6 +65,17 @@ fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, O
     let mut host = crate::config::terminal_host()?;
     let herdr_backend = true;
     let mut config = bridge_config_for(herdr_backend)?;
+    let judge_url = resolve_judge_url(flags, env_value);
+    let preflight = preflight_model_endpoints_with(
+        config.model_relay.take(),
+        judge_url.as_deref(),
+        &env_value,
+        &spawn_jev::probe_http_endpoint,
+    )?;
+    for warning in &preflight.warnings {
+        eprintln!("{warning}");
+    }
+    config.model_relay = preflight.model_relay;
     config.recover_worker_leases = recover_worker_leases;
     // The transcript archive's credential mask (objective 175): the
     // installed collector's places, or a stand-in honoured only in a gate's
@@ -457,11 +468,74 @@ fn model_relay() -> Option<ModelRelay> {
     resolve_model_relay(env_value)
 }
 
-/// [`model_relay`] over the environment `lookup` reads (an empty value
-/// reads as unset).
+/// Returns `true` when an endpoint configuration value is intentionally disabled
+/// (empty/whitespace, `"off"`, or `"stub"` case-insensitively).
+fn is_disabled_endpoint(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("stub")
+}
+
+/// Startup preflight mode controlled by `SPAWN_MODEL_PREFLIGHT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelPreflightMode {
+    /// Log actionable warnings and apply safe degradation when unreachable (default).
+    Warn,
+    /// Abort startup immediately when any configured endpoint fails health preflight.
+    Strict,
+    /// Skip startup health probes altogether.
+    Off,
+}
+
+impl ModelPreflightMode {
+    fn parse(raw: Option<&str>) -> (Self, Option<String>) {
+        let trimmed = raw.map(str::trim).filter(|value| !value.is_empty());
+        match trimmed.map(str::to_ascii_lowercase).as_deref() {
+            None | Some("warn") => (Self::Warn, None),
+            Some("strict") => (Self::Strict, None),
+            Some("off") => (Self::Off, None),
+            Some(_) => (
+                Self::Warn,
+                Some(format!(
+                    "spawn: SPAWN_MODEL_PREFLIGHT={} is neither warn, strict, nor off: read as warn",
+                    trimmed.unwrap_or_default()
+                )),
+            ),
+        }
+    }
+}
+
+/// Whether `SPAWN_CHEAP_MODEL` should safely fall back to the default/direct path when
+/// `SPAWN_MODEL_RELAY` fails startup health preflight (`warn` mode).
+fn cheap_fallback_enabled(lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+    !matches!(
+        lookup("SPAWN_CHEAP_FALLBACK")
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("off" | "0" | "false" | "no" | "keep-relay")
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelPreflightOutcome {
+    model_relay: Option<ModelRelay>,
+    cheap_fell_back_to_default: bool,
+    fallback_target_model: Option<String>,
+    warnings: Vec<String>,
+}
+
+/// [`model_relay`] over the environment `lookup` reads (an empty value,
+/// `"off"`, or `"stub"` reads as unset).
 fn resolve_model_relay(lookup: impl Fn(&str) -> Option<String>) -> Option<ModelRelay> {
-    let value = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
-    let url = value("SPAWN_MODEL_RELAY").filter(|url| url != "off")?;
+    let value = |name: &str| {
+        lookup(name)
+            .map(|raw| raw.trim().to_string())
+            .filter(|trimmed| !trimmed.is_empty())
+    };
+    let url = value("SPAWN_MODEL_RELAY").filter(|url| !is_disabled_endpoint(url))?;
     let or = |name: &str, fallback: &str| value(name).unwrap_or_else(|| fallback.to_string());
     Some(ModelRelay {
         url: url.trim_end_matches('/').to_string(),
@@ -752,15 +826,134 @@ fn resolve_claude_projects(lookup: impl Fn(&str) -> Option<String>) -> String {
     )
 }
 
+/// Resolve the configured judge endpoint URL from `--judge-url` or
+/// `SPAWN_JUDGE_URL`, returning `None` when unset, empty, `"off"`, or `"stub"`.
+fn resolve_judge_url(flags: &Flags, lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    flags
+        .get("judge-url")
+        .or_else(|| lookup("SPAWN_JUDGE_URL"))
+        .map(|raw| raw.trim().to_string())
+        .filter(|url| !is_disabled_endpoint(url))
+}
+
+/// Probe explicitly configured `model_relay` and `judge` endpoints at startup.
+///
+/// Honors `SPAWN_MODEL_PREFLIGHT=warn|strict|off` (default `warn`), logs/returns
+/// only sanitized `host:port` or `unix://<socket>` targets without credentials
+/// or query strings, and safely clears an unreachable `model_relay` so
+/// `SPAWN_CHEAP_MODEL` falls back to the main/direct model path instead of
+/// wedging sessions on startup.
+fn preflight_model_endpoints_with(
+    relay: Option<ModelRelay>,
+    judge_url: Option<&str>,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    probe: &dyn Fn(&str, std::time::Duration) -> spawn_jev::EndpointHealth,
+) -> Result<ModelPreflightOutcome, String> {
+    let raw_mode = lookup("SPAWN_MODEL_PREFLIGHT");
+    let (mode, mode_notice) = ModelPreflightMode::parse(raw_mode.as_deref());
+    let mut warnings = Vec::new();
+    if let Some(notice) = mode_notice {
+        warnings.push(notice);
+    }
+
+    if mode == ModelPreflightMode::Off {
+        return Ok(ModelPreflightOutcome {
+            model_relay: relay,
+            cheap_fell_back_to_default: false,
+            fallback_target_model: None,
+            warnings,
+        });
+    }
+
+    let mut effective_relay = relay;
+    let mut cheap_fell_back_to_default = false;
+    let mut fallback_target_model = None;
+    let mut strict_errors = Vec::new();
+
+    if let Some(relay_cfg) = effective_relay.clone() {
+        let health = probe(&relay_cfg.url, spawn_jev::DEFAULT_PROBE_TIMEOUT);
+        if !health.status.is_ok() {
+            let detail = health.detail.as_deref().unwrap_or("endpoint unreachable");
+            let msg = format!(
+                "spawn preflight: slot=model_relay target={} status={} latency_ms={} detail=\"{}\" \
+                 hint=\"verify spawn-model-relay is running (or set SPAWN_MODEL_RELAY=off / SPAWN_MODEL_PREFLIGHT=off)\"",
+                health.target,
+                health.status.as_str(),
+                health.latency_ms,
+                detail,
+            );
+            match mode {
+                ModelPreflightMode::Strict => strict_errors.push(msg),
+                ModelPreflightMode::Warn => {
+                    warnings.push(msg);
+                    if cheap_fallback_enabled(lookup) {
+                        let fallback_display = relay_cfg
+                            .default_model
+                            .clone()
+                            .unwrap_or_else(|| "claude-default".to_string());
+                        fallback_target_model.clone_from(&relay_cfg.default_model);
+                        cheap_fell_back_to_default = true;
+                        effective_relay = None;
+                        warnings.push(format!(
+                            "spawn preflight warning: slot=model_relay action=cheap_fallback_to_default \
+                             cheap_model={} fallback_model={} target={} \
+                             hint=\"unreachable model relay cleared at startup so sessions fall back to the direct/default path (set SPAWN_CHEAP_FALLBACK=off to keep relay or SPAWN_MODEL_PREFLIGHT=strict to abort)\"",
+                            relay_cfg.cheap_model,
+                            fallback_display,
+                            health.target,
+                        ));
+                    }
+                }
+                ModelPreflightMode::Off => {}
+            }
+        }
+    }
+
+    if let Some(url) = judge_url
+        .map(str::trim)
+        .filter(|u| !is_disabled_endpoint(u))
+    {
+        let health = probe(url, spawn_jev::DEFAULT_PROBE_TIMEOUT);
+        if !health.status.is_ok() {
+            let detail = health.detail.as_deref().unwrap_or("endpoint unreachable");
+            let msg = format!(
+                "spawn preflight: slot=judge target={} status={} latency_ms={} detail=\"{}\" \
+                 hint=\"verify spawn-jev-relay is running (or set SPAWN_JUDGE_URL=off to rely on deterministic Observer rules)\"",
+                health.target,
+                health.status.as_str(),
+                health.latency_ms,
+                detail,
+            );
+            match mode {
+                ModelPreflightMode::Strict => strict_errors.push(msg),
+                ModelPreflightMode::Warn => warnings.push(msg),
+                ModelPreflightMode::Off => {}
+            }
+        }
+    }
+
+    if !strict_errors.is_empty() {
+        return Err(format!(
+            "model endpoint preflight failed (SPAWN_MODEL_PREFLIGHT=strict):\n{}",
+            strict_errors.join("\n")
+        ));
+    }
+
+    Ok(ModelPreflightOutcome {
+        model_relay: effective_relay,
+        cheap_fell_back_to_default,
+        fallback_target_model,
+        warnings,
+    })
+}
+
 /// The model judge at `--judge-url` or `SPAWN_JUDGE_URL`. Without one the
 /// Observer judges by the rules alone, and a case they cannot settle asks
 /// for attention.
 fn judge(flags: &Flags) -> Option<Arc<dyn StateJudge>> {
-    let url = flags
-        .get("judge-url")
-        .or_else(|| env_value("SPAWN_JUDGE_URL"))?;
+    let url = resolve_judge_url(flags, env_value)?;
     let mut config = JevConfig::new(&url);
-    if let Some(model) = env_value("SPAWN_JUDGE_MODEL") {
+    if let Some(model) = env_value("SPAWN_JUDGE_MODEL").filter(|m| !m.trim().is_empty()) {
         config.model = model;
     }
     Some(Arc::new(JevJudge::new(config)))
@@ -1350,5 +1543,206 @@ mod tests {
         assert!(parse_bounded_usize(&zero, "V", 8, 1, 128).is_err());
         let high = |_: &str| Some("129".to_string());
         assert!(parse_bounded_usize(&high, "V", 8, 1, 128).is_err());
+    }
+
+    #[test]
+    fn model_preflight_skips_unset_off_and_stub_endpoints() {
+        use super::{preflight_model_endpoints_with, resolve_judge_url, resolve_model_relay};
+        use crate::Flags;
+        use std::cell::Cell;
+
+        let calls = Cell::new(0usize);
+        let counting_probe = |url: &str, _timeout: std::time::Duration| {
+            calls.set(calls.get() + 1);
+            spawn_jev::EndpointHealth {
+                status: spawn_jev::EndpointStatus::Ok,
+                target: spawn_jev::sanitize_endpoint_target(url),
+                http_status: Some(200),
+                latency_ms: 1,
+                detail: None,
+            }
+        };
+
+        let empty_flags = Flags::default();
+        for disabled in ["", "off", "OFF", "stub", "Stub"] {
+            let pairs = [
+                ("SPAWN_MODEL_RELAY", disabled),
+                ("SPAWN_JUDGE_URL", disabled),
+            ];
+            let lookup = environment(&pairs);
+            assert_eq!(resolve_model_relay(&lookup), None);
+            assert_eq!(resolve_judge_url(&empty_flags, &lookup), None);
+            let outcome = preflight_model_endpoints_with(
+                resolve_model_relay(&lookup),
+                resolve_judge_url(&empty_flags, &lookup).as_deref(),
+                &lookup,
+                &counting_probe,
+            )
+            .expect("disabled endpoints stay Ok");
+            assert_eq!(outcome.model_relay, None);
+            assert!(outcome.warnings.is_empty());
+        }
+        assert_eq!(calls.get(), 0, "disabled endpoints must never probe");
+
+        let preflight_off = environment(&[
+            ("SPAWN_MODEL_RELAY", "http://127.0.0.1:8791"),
+            ("SPAWN_JUDGE_URL", "http://127.0.0.1:8790"),
+            ("SPAWN_MODEL_PREFLIGHT", "off"),
+        ]);
+        let relay = resolve_model_relay(&preflight_off).expect("relay");
+        let outcome = preflight_model_endpoints_with(
+            Some(relay.clone()),
+            Some("http://127.0.0.1:8790"),
+            &preflight_off,
+            &counting_probe,
+        )
+        .expect("preflight off succeeds");
+        assert_eq!(outcome.model_relay, Some(relay));
+        assert!(!outcome.cheap_fell_back_to_default);
+        assert_eq!(calls.get(), 0, "SPAWN_MODEL_PREFLIGHT=off must skip probes");
+    }
+
+    #[test]
+    fn model_preflight_healthy_endpoints_keep_relay_without_warnings() {
+        use super::{preflight_model_endpoints_with, resolve_model_relay};
+
+        let env = environment(&[
+            ("SPAWN_MODEL_RELAY", "http://127.0.0.1:8791"),
+            ("SPAWN_CHEAP_MODEL", "deepseek-flash"),
+            ("SPAWN_DEFAULT_MODEL", "claude-opus-5-5"),
+        ]);
+        let relay = resolve_model_relay(&env).expect("relay");
+        let ok_probe = |url: &str, _timeout: std::time::Duration| spawn_jev::EndpointHealth {
+            status: spawn_jev::EndpointStatus::Ok,
+            target: spawn_jev::sanitize_endpoint_target(url),
+            http_status: Some(200),
+            latency_ms: 2,
+            detail: None,
+        };
+        let outcome = preflight_model_endpoints_with(
+            Some(relay.clone()),
+            Some("http://127.0.0.1:8790"),
+            &env,
+            &ok_probe,
+        )
+        .expect("healthy endpoints succeed");
+        assert_eq!(outcome.model_relay, Some(relay));
+        assert!(!outcome.cheap_fell_back_to_default);
+        assert_eq!(outcome.fallback_target_model, None);
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn model_preflight_unreachable_warn_degrades_cheap_to_default_and_redacts_secrets() {
+        use super::{preflight_model_endpoints_with, resolve_model_relay};
+
+        let env_default_warn = environment(&[
+            (
+                "SPAWN_MODEL_RELAY",
+                "http://relayuser:RelaySecretPass99@127.0.0.1:8791?api_key=RelayQueryTok88",
+            ),
+            ("SPAWN_CHEAP_MODEL", "deepseek-v4-pro"),
+            ("SPAWN_DEFAULT_MODEL", "claude-opus-5-5"),
+        ]);
+        let relay = resolve_model_relay(&env_default_warn).expect("relay");
+        let down_probe = |url: &str, _timeout: std::time::Duration| spawn_jev::EndpointHealth {
+            status: spawn_jev::EndpointStatus::Unreachable,
+            target: spawn_jev::sanitize_endpoint_target(url),
+            http_status: None,
+            latency_ms: 4,
+            detail: Some(format!(
+                "connect {}: connection refused",
+                spawn_jev::sanitize_endpoint_target(url)
+            )),
+        };
+
+        let outcome = preflight_model_endpoints_with(
+            Some(relay.clone()),
+            Some("http://judgeuser:JudgeSecretPass77@127.0.0.1:8790?token=JudgeQueryTok66"),
+            &env_default_warn,
+            &down_probe,
+        )
+        .expect("default warn mode allows startup with fallback");
+
+        assert!(
+            outcome.model_relay.is_none(),
+            "unreachable relay must be cleared under safe cheap fallback"
+        );
+        assert!(outcome.cheap_fell_back_to_default);
+        assert_eq!(
+            outcome.fallback_target_model.as_deref(),
+            Some("claude-opus-5-5")
+        );
+        let joined = outcome.warnings.join("\n");
+        assert!(joined.contains("slot=model_relay"), "{joined}");
+        assert!(joined.contains("slot=judge"), "{joined}");
+        assert!(joined.contains("127.0.0.1:8791"), "{joined}");
+        assert!(joined.contains("127.0.0.1:8790"), "{joined}");
+        assert!(joined.contains("cheap_fallback_to_default"), "{joined}");
+        assert!(joined.contains("deepseek-v4-pro"), "{joined}");
+        assert!(joined.contains("claude-opus-5-5"), "{joined}");
+        for secret in [
+            "RelaySecretPass99",
+            "RelayQueryTok88",
+            "relayuser",
+            "JudgeSecretPass77",
+            "JudgeQueryTok66",
+            "judgeuser",
+        ] {
+            assert!(!joined.contains(secret), "secret {secret} leaked: {joined}");
+        }
+
+        // Opting out of cheap fallback keeps relay config attached while still warning.
+        let keep_relay_env = environment(&[
+            ("SPAWN_MODEL_RELAY", "http://127.0.0.1:8791"),
+            ("SPAWN_CHEAP_FALLBACK", "off"),
+        ]);
+        let relay_keep = resolve_model_relay(&keep_relay_env).expect("relay");
+        let kept = preflight_model_endpoints_with(
+            Some(relay_keep.clone()),
+            None,
+            &keep_relay_env,
+            &down_probe,
+        )
+        .expect("warn with keep-relay succeeds");
+        assert_eq!(kept.model_relay, Some(relay_keep));
+        assert!(!kept.cheap_fell_back_to_default);
+    }
+
+    #[test]
+    fn model_preflight_unreachable_strict_fails_fast_with_actionable_error() {
+        use super::{preflight_model_endpoints_with, resolve_model_relay};
+
+        let env = environment(&[
+            ("SPAWN_MODEL_PREFLIGHT", "strict"),
+            (
+                "SPAWN_MODEL_RELAY",
+                "http://strictuser:StrictSecret11@127.0.0.1:8791?api_key=StrictQuery22",
+            ),
+        ]);
+        let relay = resolve_model_relay(&env).expect("relay");
+        let down_probe = |url: &str, _timeout: std::time::Duration| spawn_jev::EndpointHealth {
+            status: spawn_jev::EndpointStatus::Unreachable,
+            target: spawn_jev::sanitize_endpoint_target(url),
+            http_status: Some(503),
+            latency_ms: 9,
+            detail: Some("endpoint returned HTTP 503".to_string()),
+        };
+
+        let err = preflight_model_endpoints_with(
+            Some(relay),
+            Some("http://j:JudgeSec33@127.0.0.1:8790?token=JTok44"),
+            &env,
+            &down_probe,
+        )
+        .expect_err("strict mode must abort startup");
+        assert!(err.contains("SPAWN_MODEL_PREFLIGHT=strict"), "{err}");
+        assert!(err.contains("slot=model_relay"), "{err}");
+        assert!(err.contains("slot=judge"), "{err}");
+        assert!(err.contains("127.0.0.1:8791"), "{err}");
+        assert!(err.contains("127.0.0.1:8790"), "{err}");
+        for secret in ["StrictSecret11", "StrictQuery22", "JudgeSec33", "JTok44"] {
+            assert!(!err.contains(secret), "secret {secret} leaked: {err}");
+        }
     }
 }
