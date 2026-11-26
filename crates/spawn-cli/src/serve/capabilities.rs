@@ -264,9 +264,10 @@ fn view_now(engine: &str, home: &EngineHome) -> Boxed {
 
 /// The login files of `engine` this host would hold: Claude Code's
 /// `.credentials.json` in its configuration directory
-/// (`SPAWN_CLAUDE_CONFIG_DIR`, else `~/.claude`); agy's Google login
-/// (`~/.gemini/oauth_creds.json`) and its home (`SPAWN_AGY_HOME`, else
-/// `~/.gemini/antigravity-cli`). Only their presence is ever read.
+/// (`SPAWN_CLAUDE_CONFIG_DIR`, else `~/.claude`); agy's file-based login
+/// token (`<agy home>/antigravity-oauth-token`, where agy 1.5.17 keeps it)
+/// and its home (`SPAWN_AGY_HOME`, else `~/.gemini/antigravity-cli`). Only
+/// their presence is ever read (`symlink_metadata`, never opened).
 fn login_files(engine: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> {
     let home = PathBuf::from(lookup("HOME").unwrap_or_else(|| "/root".to_string()));
     match engine {
@@ -276,11 +277,11 @@ fn login_files(engine: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<Pat
                 .map_or_else(|| home.join(".claude"), PathBuf::from);
             vec![dir.join(".credentials.json")]
         }
-        "agy" => vec![
-            home.join(".gemini/oauth_creds.json"),
-            lookup("SPAWN_AGY_HOME")
-                .map_or_else(|| home.join(spawn_core::driver::AGY_HOME), PathBuf::from),
-        ],
+        "agy" => {
+            let agy_home = lookup("SPAWN_AGY_HOME")
+                .map_or_else(|| home.join(spawn_core::driver::AGY_HOME), PathBuf::from);
+            vec![agy_home.join("antigravity-oauth-token"), agy_home]
+        }
         _ => Vec::new(),
     }
 }
@@ -332,7 +333,45 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
             });
             continue;
         }
-        let answer = (host.run)(&program, &["--version"], VERSION_LIMIT);
+        // An engine with no deny rules of its own runs inside its view, or
+        // not at all: with none, it is down and its program never runs.
+        let boxed = match configured {
+            Some((_, home)) if driver.traits().guard == Guard::Sandbox => (host.view)(id, home),
+            _ => Boxed::Off,
+        };
+        let prefix: Vec<&str> = match &boxed {
+            Boxed::Off => Vec::new(),
+            Boxed::Inside { words, .. } => words.iter().map(String::as_str).collect(),
+            Boxed::Unavailable(why) => {
+                engines.push(EngineProbe {
+                    engine: id.to_string(),
+                    title: driver.title().to_string(),
+                    program,
+                    enabled: true,
+                    installed: None,
+                    version: None,
+                    version_tested: None,
+                    login,
+                    known_models: None,
+                    model,
+                    unavailable: Some(format!(
+                        "{id} is probed and run only inside its filesystem view, and {why}: \
+                         it will not start (engine_unavailable)"
+                    )),
+                });
+                continue;
+            }
+        };
+        let run = |arguments: &[&str], limit: Duration| match prefix.split_first() {
+            None => (host.run)(&program, arguments, limit),
+            Some((view, words)) => {
+                let mut all: Vec<&str> = words.to_vec();
+                all.push(&program);
+                all.extend_from_slice(arguments);
+                (host.run)(view, &all, limit)
+            }
+        };
+        let answer = run(&["--version"], VERSION_LIMIT);
         let version = answer
             .as_ref()
             .ok()
@@ -346,7 +385,7 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
             .flatten();
         let mut known_models = None;
         if id == "agy" && unavailable.is_none() {
-            match (host.run)(&program, &["models"], MODELS_LIMIT) {
+            match run(&["models"], MODELS_LIMIT) {
                 Ok(listing) => {
                     let known = AgyDriver::known_models(&listing);
                     if known.is_empty() {
