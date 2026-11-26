@@ -8230,7 +8230,7 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex};
 
     use super::{Bridge, BridgeConfig, RESOLVE_PRINCIPAL, mounted_key, trust_answer_key, waits};
-    use super::{ENGINE_UNAVAILABLE, EngineViewPolicy, ViewedLaunch};
+    use super::{ENGINE_UNAVAILABLE, EngineViewPolicy, ViewedLaunch, rfc3339_ms};
     use crate::command::{CommandAction, NamedKey, Outcome, Submission};
     use crate::event::{CommandStep, ENGINE, EventKind, GlobalPosition, NewEvent, Source};
     use crate::id::{
@@ -10915,20 +10915,20 @@ mod tests {
     #[test]
     fn rfc3339_ms_reads_utc_fractions_and_offsets() {
         assert_eq!(rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(rfc3339_ms("2026-11-25T14:25:59Z"), Some(1_796_221_559_000));
-        assert_eq!(rfc3339_ms("2026-11-25T14:25:59.5Z"), Some(1_796_221_559_500));
+        assert_eq!(rfc3339_ms("2026-11-25T14:25:59Z"), Some(1_795_616_759_000));
+        assert_eq!(rfc3339_ms("2026-11-25T14:25:59.5Z"), Some(1_795_616_759_500));
         assert_eq!(
             rfc3339_ms("2026-11-25T14:25:59.123456789Z"),
-            Some(1_796_221_559_123)
+            Some(1_795_616_759_123)
         );
-        assert_eq!(rfc3339_ms("2026-11-25t14:25:59z"), Some(1_796_221_559_000));
+        assert_eq!(rfc3339_ms("2026-11-25t14:25:59z"), Some(1_795_616_759_000));
         assert_eq!(
             rfc3339_ms("2026-11-25T22:25:59+08:00"),
-            Some(1_796_221_559_000)
+            Some(1_795_616_759_000)
         );
         assert_eq!(
             rfc3339_ms("2026-11-25T09:25:59.250-05:00"),
-            Some(1_796_221_559_250)
+            Some(1_795_616_759_250)
         );
         assert_eq!(rfc3339_ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
         assert_eq!(rfc3339_ms("2000-03-01T00:00:00Z"), Some(951_868_800_000));
