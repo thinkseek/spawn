@@ -46,9 +46,9 @@
 //! [`Manifest`] is manifest-v1, a data snapshot's manifest: the
 //! `tree_sha256_v1` line list of a directory; the snapshot's identity is
 //! `sha256:<tree_sha256_v1>`. [`Store::put_snapshot`] stores one in the
-//! `data` namespace and [`Store::keep_snapshots`] keeps the
-//! [`KEEP_SNAPSHOTS`] newest of a data ref pinned (`pins/prov/<ref>`),
-//! crash-only like the rest (`spawn prov snapshot`, docs/provenance.md).
+//! `data` namespace and [`Store::keep_snapshots`] keeps the file bytes of
+//! the [`KEEP_SNAPSHOTS`] newest of a data ref, and every manifest it ever
+//! had, pinned (`pins/prov/<ref>`), crash-only like the rest (`spawn prov snapshot`, docs/provenance.md).
 //!
 //! The store's previous incarnation (`spawn-host`'s `cas_dedup`, objects
 //! at `<cas>/<2 hex>/<64 hex>`) is adopted in place by

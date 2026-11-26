@@ -75,7 +75,7 @@ pub(crate) const USAGE: &str = "usage: spawn prov index --source <source> [--rep
      spawn prov snapshot <dir> --ref <name> [--cas <dir>] [--input <ref|sha256:<hex>>]... \
      [--code <commit>]... [--config <file>]... [--task N] [--digest-only]\n       \
      (a data directory outside every workspace: its manifest-v1 into spawn-cas, one revision \
-     of data:<name>; the 3 newest snapshots stay pinned)\n       \
+     of data:<name>; the 3 newest snapshots keep their bytes, every manifest stays)\n       \
      spawn prov refs [--cas <dir>]\n       \
      spawn prov rollback [--plan] <ref> <snapshot> [--cas <dir>] [--task N]\n       \
      (moves the ref's head back to a snapshot it still keeps, as a revert revision; --plan \

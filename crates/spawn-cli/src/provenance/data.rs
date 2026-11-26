@@ -8,7 +8,8 @@
 //!   ref's Change: `derive` with its `used` edges (`--input`, `--code`,
 //!   `--config`), `import` when nothing is an input. The entries are the
 //!   paths that differ from the ref's head. A directory equal to the head
-//!   records nothing. `pins/prov/<ref>` keeps the three newest snapshots.
+//!   records nothing. `pins/prov/<ref>` keeps the file bytes of the three
+//!   newest snapshots, and every snapshot's manifest forever (D3).
 //! - `refs`: every data ref and its head.
 //! - `rollback [--plan] <ref> <snapshot>`: the ref's head moved back to a
 //!   snapshot it held, recorded as a `revert` revision; refused when the
@@ -804,8 +805,8 @@ fn prepare_rollback(
     } else {
         Some(format!(
             "rollback refused: {target} (data:{name} rev {}) is no longer kept: only the \
-             {KEEP_SNAPSHOTS} newest snapshots of a ref are pinned, and its bytes are gone. \
-             Nothing was recorded.",
+             {KEEP_SNAPSHOTS} newest snapshots of a ref keep their file bytes, and its are \
+             gone (its manifest is kept). Nothing was recorded.",
             origin.rev
         ))
     };
