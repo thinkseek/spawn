@@ -627,3 +627,122 @@ fn pg_lifecycle_control_and_grading_records_parse_strictly_and_replay_matches_sq
         .expect("refold");
     assert_replay_matches_sql(&mut client, &ids);
 }
+
+fn assert_owner_and_reader_parity(store: &PostgresStore, reader_store: &PostgresStore) {
+    let (owner_stream, owner_meta) = store.control_record_stream(true).expect("owner stream");
+    let (reader_stream, reader_meta) = reader_store
+        .control_record_stream(true)
+        .expect("reader stream");
+    assert!(!owner_stream.is_empty());
+    assert_eq!(owner_stream, reader_stream);
+    assert_eq!(owner_meta["warnings"], json!(0));
+    assert_eq!(owner_meta, reader_meta);
+
+    let (owner_eps, owner_summary) = store.replay_episodes(None, true).expect("owner replay");
+    let (reader_eps, reader_summary) = reader_store
+        .replay_episodes(None, true)
+        .expect("reader replay");
+    assert_eq!(owner_eps.len(), 7);
+    assert_eq!(owner_eps, reader_eps);
+    assert_eq!(owner_summary, reader_summary);
+    assert_eq!(owner_summary["total"], json!(7));
+    assert_eq!(owner_summary["landed"], json!(1));
+    assert_eq!(owner_summary["accepted"], json!(1));
+    assert_eq!(owner_summary["rejected"], json!(0));
+    assert_eq!(owner_summary["cancelled"], json!(3));
+    assert_eq!(owner_summary["aborted"], json!(1));
+    assert_eq!(owner_summary["over_budget"], json!(1));
+    assert_eq!(owner_summary["in_flight"], json!(0));
+    assert_eq!(owner_summary["total_rework"], json!(3));
+    assert_eq!(owner_summary["total_reroutes"], json!(1));
+    assert_eq!(owner_summary["review_sync_points"], json!(2));
+    assert_eq!(owner_summary["gate_verdicts"], json!(3));
+    assert_eq!(owner_summary["warnings"], json!(0));
+
+    let (owner_eps_p, owner_parity, owner_ok, owner_drifts) = store
+        .episode_parity_report(None, true)
+        .expect("owner parity");
+    let (reader_eps_p, reader_parity, reader_ok, reader_drifts) = reader_store
+        .episode_parity_report(None, true)
+        .expect("reader parity");
+    assert!(owner_ok, "owner drifts: {owner_drifts:?}");
+    assert!(reader_ok, "reader drifts: {reader_drifts:?}");
+    assert!(owner_drifts.is_empty());
+    assert!(reader_drifts.is_empty());
+    assert_eq!(owner_parity, reader_parity);
+    assert_eq!(owner_eps_p, reader_eps_p);
+
+    let mut mission_ids: Vec<i64> = owner_eps.iter().map(|ep| ep.mission_id).collect();
+    mission_ids.sort_unstable();
+    mission_ids.dedup();
+    assert_eq!(mission_ids.len(), 2);
+    for (mid, expected_count) in [(mission_ids[0], 4usize), (mission_ids[1], 3usize)] {
+        let (eps_o, sum_o, ok_o, drifts_o) = store
+            .episode_parity_report(Some(mid), true)
+            .expect("mission owner parity");
+        let (eps_r, sum_r, ok_r, drifts_r) = reader_store
+            .episode_parity_report(Some(mid), true)
+            .expect("mission reader parity");
+        assert!(ok_o && drifts_o.is_empty(), "{drifts_o:?}");
+        assert!(ok_r && drifts_r.is_empty(), "{drifts_r:?}");
+        assert_eq!(eps_o.len(), expected_count);
+        assert_eq!(eps_o, eps_r);
+        assert_eq!(sum_o, sum_r);
+    }
+}
+
+#[test]
+fn pg_owner_and_spawn_reader_replay_episodes_and_match_sql_projections() {
+    let (store, schema) = store("control_records_reader_replay");
+    seed_grading_and_residents(&store);
+    let sha_a = "a".repeat(40);
+    let sha_b = "b".repeat(40);
+    let _review_ids = drive_review_mission(&store, &sha_a, &sha_b);
+    let _gated_ids = drive_gated_and_ops_mission(&store);
+
+    let schema_url = common::schema_url(&schema);
+    let reader_url = spawn_postgres::role_url(&schema_url, "spawn_reader").expect("reader url");
+    let reader_store = PostgresStore::connect(&reader_url).expect("connect as spawn_reader");
+
+    assert_owner_and_reader_parity(&store, &reader_store);
+
+    // Inject an unknown future control variant into `session_control`:
+    // strict mode must fail while compat mode skips with structured warnings
+    // and keeps episode parity 100% intact for both owner and spawn_reader.
+    admin(&schema)
+        .query_one(
+            "select * from spawn_append('agent_control', 'session_control', null, 'control', null,
+                 jsonb_build_object('name', 'control.recorded',
+                                    'detail', jsonb_build_object('record',
+                                        jsonb_build_object('type', 'future.experiment.v99', 'id', 999))))",
+            &[],
+        )
+        .expect("append unknown control variant");
+
+    assert!(store.control_record_stream(true).is_err());
+    assert!(reader_store.control_record_stream(true).is_err());
+
+    let (compat_eps_o, compat_sum_o, compat_ok_o, compat_drifts_o) = store
+        .episode_parity_report(None, false)
+        .expect("owner compat parity");
+    let (compat_eps_r, compat_sum_r, compat_ok_r, compat_drifts_r) = reader_store
+        .episode_parity_report(None, false)
+        .expect("reader compat parity");
+    assert!(compat_ok_o && compat_drifts_o.is_empty());
+    assert!(compat_ok_r && compat_drifts_r.is_empty());
+    assert_eq!(compat_eps_o, compat_eps_r);
+    assert_eq!(compat_eps_o.len(), 7);
+    assert_eq!(compat_sum_o["warnings"], json!(1));
+    assert_eq!(
+        compat_sum_o["warning_details"]["unknown_variants"],
+        json!(1)
+    );
+    assert_eq!(
+        compat_sum_o["warning_details"]["by_kind"]["future.experiment.v99"],
+        json!(1)
+    );
+    assert_eq!(compat_sum_o, compat_sum_r);
+
+    drop(reader_store);
+    drop(store);
+}

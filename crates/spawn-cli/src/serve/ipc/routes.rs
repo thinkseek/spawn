@@ -230,6 +230,17 @@ fn dispatch_buffered(req: &IpcRequest, state: &IpcState) -> IpcResponse {
         return handle_api_get("/api/features/truth", req, state);
     }
 
+    if req.path == "/api/episodes" {
+        if !matches!(req.method.as_str(), "GET" | "HEAD") {
+            return IpcResponse::json(
+                405,
+                &json!({ "error": "method not allowed: this path takes GET only" }),
+            )
+            .with_header("Allow", "GET");
+        }
+        return handle_api_get("/api/episodes", req, state);
+    }
+
     let Some((expected_method, pattern, values)) = route(&req.path) else {
         return IpcResponse::json(404, &json!({ "error": "not found", "code": "not_found" }));
     };
@@ -300,6 +311,8 @@ fn handle_api_get(_pattern: &str, req: &IpcRequest, state: &IpcState) -> IpcResp
         serve::with_reader_url(reader_url, || {
             serve::feature_map::feature_truth_answer(&req.query)
         })
+    } else if req.path == "/api/episodes" {
+        serve::with_reader_url(reader_url, || serve::episodes_answer(&req.query))
     } else {
         serve::with_reader_url(reader_url, || {
             let Some(read) = serve::reader(&req.path, &req.query) else {
@@ -890,5 +903,78 @@ mod truth_tests {
             assert_eq!(busy.status, 503);
             drop(permits);
         });
+    }
+
+    #[test]
+    fn episodes_route_rejects_post_with_405_saturates_reads_pool_with_503_and_validates_query() {
+        let dir = ScratchDir::new("episodes-ipc");
+        let state = IpcState::new(
+            RoleUrls::from_explicit(
+                "postgres://spawn_reader@127.0.0.1:1/spawn".to_string(),
+                "postgres://spawn_human@127.0.0.1:1/spawn".to_string(),
+                "postgres://spawn_node_gateway@127.0.0.1:1/spawn".to_string(),
+            ),
+            dir.0.join("cas"),
+            None,
+        );
+
+        let post_resp =
+            dispatch_buffered(&ipc_request("POST", "/api/episodes", "", vec![]), &state);
+        assert_eq!(post_resp.status, 405);
+        assert!(
+            post_resp
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("allow") && v == "GET"),
+            "{:?}",
+            post_resp.headers
+        );
+
+        let mut permits = Vec::new();
+        for _ in 0..super::super::READS_POOL_SIZE {
+            permits.push(state.pools.reads_gate.try_acquire().unwrap());
+        }
+        let busy = dispatch_buffered(&ipc_request("GET", "/api/episodes", "", vec![]), &state);
+        assert_eq!(busy.status, 503);
+        drop(permits);
+
+        let bad_query = dispatch_buffered(
+            &ipc_request("GET", "/api/episodes", "mission=abc", vec![]),
+            &state,
+        );
+        assert_eq!(bad_query.status, 400);
+
+        let bad_head = dispatch_buffered(
+            &ipc_request("HEAD", "/api/episodes", "mission=", vec![]),
+            &state,
+        );
+        assert_eq!(bad_head.status, 400);
+        assert!(bad_head.body.is_empty());
+    }
+
+    #[test]
+    fn episodes_answer_emits_weak_etag_and_matches_if_none_match() {
+        let summary = json!({
+            "total": 0,
+            "landed": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "cancelled": 0,
+            "aborted": 0,
+            "over_budget": 0,
+            "in_flight": 0,
+            "total_rework": 0,
+            "total_reroutes": 0,
+            "review_sync_points": 0,
+            "gate_verdicts": 0,
+            "warnings": 0,
+        });
+        let payload = serve::episodes_payload(Some(4), &[], &summary, true, &[]);
+        let answer = answers::answer("/api/episodes", Ok(payload), BAD_REQUEST);
+        assert_eq!(answer.status, 200);
+        let etag = answer.etag.expect("weak ETag");
+        assert!(etag.starts_with("W/\""), "expected weak ETag, got {etag}");
+        assert!(answers::not_modified(Some(&etag), &etag));
+        assert!(!answers::not_modified(Some("W/\"different\""), &etag));
     }
 }

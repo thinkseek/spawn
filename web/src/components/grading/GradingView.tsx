@@ -1,6 +1,18 @@
-import { Cpu, Layers, Lock, RefreshCw, Terminal } from "lucide-react";
+import { Check, Clock, Cpu, Layers, Lock, OctagonAlert, RefreshCw, Terminal } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 
-import { usePoll } from "../../api";
+import { apiHeaders, usePoll } from "../../api";
+import {
+  EPISODE_OUTCOMES,
+  availableMissionIds,
+  episodeSyncPoints,
+  fetchOptionalEpisodes,
+  filterEpisodes,
+  outcomeTone,
+  type EpisodeOutcome,
+  type EpisodesResponse,
+  type TaskEpisode,
+} from "../../episodes.ts";
 import { fetchGrading } from "../../gradingApi";
 import type {
   GradingCatalog,
@@ -80,6 +92,8 @@ export function GradingView() {
                 ))}
               </div>
             )}
+
+            <EpisodesTimelineSection />
           </div>
         </div>
       )}
@@ -278,6 +292,268 @@ function PresetRow({ preset }: { preset: GradingPreset }) {
           {preset.onboarded_grade ?? "—"}
         </Fact>
       </div>
+    </li>
+  );
+}
+
+function useOptionalEpisodesState() {
+  const [data, setData] = useState<EpisodesResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const etagRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let activeController: AbortController | null = null;
+
+    const load = async () => {
+      activeController?.abort();
+      const controller = new AbortController();
+      activeController = controller;
+      const result = await fetchOptionalEpisodes({
+        signal: controller.signal,
+        headers: apiHeaders(),
+        etag: etagRef.current,
+      });
+      if (cancelled || controller.signal.aborted) return;
+      if (result.ok) {
+        etagRef.current = result.etag;
+        setError(null);
+        if (!result.notModified) {
+          setData(result.data);
+        }
+      } else {
+        setError(result.error);
+      }
+    };
+
+    void load();
+    const timer = setInterval(() => {
+      void load();
+    }, POLL_MS);
+
+    return () => {
+      cancelled = true;
+      activeController?.abort();
+      clearInterval(timer);
+    };
+  }, []);
+
+  return { data, error };
+}
+
+function EpisodesTimelineSection() {
+  const { data, error } = useOptionalEpisodesState();
+  const [missionFilter, setMissionFilter] = useState<string>("all");
+  const [outcomeFilter, setOutcomeFilter] = useState<EpisodeOutcome | "all">("all");
+  const [reworkOnly, setReworkOnly] = useState(false);
+
+  const episodes = data?.episodes ?? [];
+  const missionIds = availableMissionIds(episodes);
+  const parsedMission = missionFilter === "all" ? null : Number(missionFilter);
+  const filtered = filterEpisodes(episodes, {
+    missionId: parsedMission !== null && Number.isFinite(parsedMission) ? parsedMission : null,
+    outcome: outcomeFilter,
+    reworkOnly,
+  })
+    .slice()
+    .sort((a, b) => b.assigned_seq - a.assigned_seq);
+
+  return (
+    <Card>
+      <CardHeader
+        icon={<Clock size={14} />}
+        title={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>Control-stream Episode Replay &amp; Sync Points</span>
+            {data && (
+              <Badge tone={data.parity_ok ? "success" : "danger"}>
+                {data.parity_ok ? "SQL parity OK" : `parity drift (${data.drift_count})`}
+              </Badge>
+            )}
+            {data && data.warnings > 0 && (
+              <Badge tone="warning" icon={<OctagonAlert size={11} />}>
+                {data.warnings} compat skip{data.warnings === 1 ? "" : "s"}
+              </Badge>
+            )}
+          </span>
+        }
+        meta={
+          data ? (
+            <span className="tnum">
+              {filtered.length}/{data.summary.total} episode
+              {data.summary.total === 1 ? "" : "s"} · {data.summary.review_sync_points} review ·{" "}
+              {data.summary.gate_verdicts} gate
+            </span>
+          ) : (
+            <span>Read-only replay</span>
+          )
+        }
+      />
+
+      {error && !data && (
+        <p className="border-b border-surface-border px-4 py-2.5 text-caption text-faint-foreground">
+          Episode replay feed unavailable ({error}); grading catalog remains unaffected.
+        </p>
+      )}
+
+      {data && (
+        <div className="space-y-3 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-surface-border pb-3">
+            <div className="flex flex-wrap items-center gap-2 text-caption">
+              <Badge tone="success">landed {data.summary.landed}</Badge>
+              <Badge tone="success">accepted {data.summary.accepted}</Badge>
+              <Badge tone="info">in flight {data.summary.in_flight}</Badge>
+              <Badge tone="warning">rework {data.summary.total_rework}</Badge>
+              <Badge tone="neutral">reroutes {data.summary.total_reroutes}</Badge>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 text-caption">
+              <label className="flex items-center gap-1.5 text-muted-foreground">
+                <span>Mission</span>
+                <select
+                  aria-label="Filter episodes by mission"
+                  value={missionFilter}
+                  onChange={(e) => setMissionFilter(e.target.value)}
+                  className="rounded border border-surface-border bg-surface px-2 py-1 text-caption text-foreground"
+                >
+                  <option value="all">All</option>
+                  {missionIds.map((mid) => (
+                    <option key={mid} value={String(mid)}>
+                      #{mid}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="flex items-center gap-1.5 text-muted-foreground">
+                <span>Outcome</span>
+                <select
+                  aria-label="Filter episodes by outcome"
+                  value={outcomeFilter}
+                  onChange={(e) => setOutcomeFilter(e.target.value as EpisodeOutcome | "all")}
+                  className="rounded border border-surface-border bg-surface px-2 py-1 text-caption text-foreground"
+                >
+                  <option value="all">All</option>
+                  {EPISODE_OUTCOMES.map((out) => (
+                    <option key={out} value={out}>
+                      {out}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="inline-flex cursor-pointer items-center gap-1.5 rounded border border-surface-border bg-surface px-2 py-1 text-caption text-foreground">
+                <input
+                  type="checkbox"
+                  checked={reworkOnly}
+                  onChange={(e) => setReworkOnly(e.target.checked)}
+                />
+                <span>rework &gt; 0</span>
+              </label>
+            </div>
+          </div>
+
+          {filtered.length === 0 ? (
+            <p className="py-2 text-caption text-faint-foreground">
+              No replayed episodes match the selected filter.
+            </p>
+          ) : (
+            <ul className="divide-y divide-surface-border">
+              {filtered.map((ep) => (
+                <EpisodeRow key={ep.task_id} episode={ep} />
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function EpisodeRow({ episode }: { episode: TaskEpisode }) {
+  const syncPoints = episodeSyncPoints(episode);
+  const rerouted =
+    episode.first_preset_id !== null &&
+    episode.preset_id !== null &&
+    episode.first_preset_id !== episode.preset_id;
+
+  return (
+    <li className="space-y-2 py-3 first:pt-0 last:pb-0">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-mono text-label font-semibold text-foreground">
+          T{episode.task_id}
+        </span>
+        <span className="font-mono text-micro text-faint-foreground">
+          M#{episode.mission_id}
+        </span>
+        <Badge tone={outcomeTone(episode.outcome)}>{episode.outcome}</Badge>
+        <Badge tone="neutral">{episode.state}</Badge>
+        <Badge tone={gradeTone(episode.difficulty)}>{episode.difficulty}</Badge>
+        {episode.preset_id && (
+          <span className="font-mono text-micro text-muted-foreground">
+            {rerouted ? `${episode.first_preset_id} -> ${episode.preset_id}` : episode.preset_id}
+          </span>
+        )}
+        <span className="ml-auto flex items-center gap-2 font-mono text-micro text-faint-foreground">
+          <span>rework {episode.rework}</span>
+          {episode.quality_rejections > 0 && <span>rej {episode.quality_rejections}</span>}
+          {episode.reroutes > 0 && <span>reroute {episode.reroutes}</span>}
+        </span>
+      </div>
+
+      {episode.brief && (
+        <p className="line-clamp-2 text-caption text-muted-foreground">{episode.brief}</p>
+      )}
+
+      {syncPoints.length > 0 && (
+        <ul
+          aria-label={`Sync points for task ${episode.task_id}`}
+          className="space-y-1 border-l-2 border-surface-border pl-3"
+        >
+          {syncPoints.map((item) => {
+            if (item.kind === "review") {
+              const sp = item.sync;
+              return (
+                <li
+                  key={`review-${sp.event_seq}`}
+                  className="flex flex-wrap items-center gap-2 text-micro text-muted-foreground"
+                >
+                  <Badge
+                    tone={sp.accepted ? "success" : "warning"}
+                    icon={sp.accepted ? <Check size={10} /> : undefined}
+                  >
+                    review {sp.accepted ? "accepted" : "revise"}
+                  </Badge>
+                  <span className="font-mono text-faint-foreground">
+                    rev {sp.revision} · seq {sp.event_seq}
+                  </span>
+                  {sp.note && <span className="text-foreground/85">{sp.note}</span>}
+                </li>
+              );
+            }
+            const gv = item.sync;
+            const gateTone =
+              gv.verdict === "accepted"
+                ? "success"
+                : gv.verdict === "rejected" || gv.verdict === "aborted"
+                  ? "danger"
+                  : "warning";
+            return (
+              <li
+                key={`gate-${gv.event_seq}`}
+                className="flex flex-wrap items-center gap-2 text-micro text-muted-foreground"
+              >
+                <Badge tone={gateTone}>gate {gv.verdict}</Badge>
+                <span className="font-mono text-faint-foreground">
+                  rev {gv.revision} · seq {gv.event_seq}
+                  {gv.class ? ` · ${gv.class}` : ""}
+                </span>
+                {gv.note && <span className="text-foreground/85">{gv.note}</span>}
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </li>
   );
 }
