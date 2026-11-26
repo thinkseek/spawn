@@ -14,6 +14,10 @@
 //!     --bind <TMPDIR> <TMPDIR> --setenv TMPDIR <TMPDIR> --chdir <ws> -- <runner> <engine> <args>
 //! ```
 //!
+//! where `<TMPDIR>` is the engine's own, `<engine home>/.spawn-tmp`
+//! ([`TMP_FALLBACK`], 0700): never the loop's shared `TMPDIR`, which other
+//! host jobs write to and which is masked whole.
+//!
 //! where `<runner> <engine> <args>` is the usual `spawn run -- <engine>
 //! <args>`: the runner stays the engine's parent, and writes the exit
 //! status into the workspace, which is writable.
@@ -28,27 +32,35 @@
 //! - Never `--unshare-net`, `--unshare-all` nor `--as-pid-1`.
 //! - **Masks first, writable binds last**: everything is read-only
 //!   (`--ro-bind / /`), each mask hides one path, and only then are the
-//!   workspace, the engine's home and `TMPDIR` bound writable, each at its
-//!   own exact path, so the Bridge reads the transcripts from the host where
-//!   the engine writes them. An engine's home inside a masked directory
-//!   (`~/.gemini/antigravity-cli` under `~/.gemini`) is bound back into the
-//!   mask's empty tmpfs.
+//!   workspace, the engine's home and its `TMPDIR` bound writable, each at
+//!   its own exact path, so the Bridge reads the transcripts from the host
+//!   where the engine writes them.
+//! - **No writable bind overlaps a mask or the view's private directory**:
+//!   a workspace that holds or lies in a masked path is refused, and so is
+//!   an engine home that is or holds one (a misconfigured `SPAWN_AGY_HOME`
+//!   of `~/.gemini`, `~/.claude` or `/run/keep` is refused, never
+//!   unmasked). The one exception is an engine home below another engine's
+//!   masked home ([`ENGINE_HOMES`]: `~/.gemini/antigravity-cli` under
+//!   `~/.gemini`), bound back into the mask's empty tmpfs.
 //!
 //! The masks, resolved again at every launch ([`BwrapView::plan`]):
 //!
 //! - directories, each an empty `--tmpfs`: `/run/keep`, `/run/keep-test`,
 //!   the whole `$XDG_RUNTIME_DIR`, the whole `/tmp` (the fleet's tmux
-//!   sockets), the Herdr session directory (`$XDG_CONFIG_HOME/herdr`, by
+//!   sockets), the loop's shared `TMPDIR`, the Herdr session directory (`$XDG_CONFIG_HOME/herdr`, by
 //!   default `~/.config/herdr`, which holds its socket: a client in the view
 //!   could otherwise ask Herdr for a pane outside it), `~/.claude`, every
 //!   other engine's home (`~/.gemini` but for the engine's own home below
 //!   it, `~/.config/antigravity`, `~/.codex`, `~/.hermes`), `~/.ssh`,
 //!   `~/.gnupg`, `~/.config/gh`, `~/.aws`, `~/.config/anthropic`,
 //!   `~/.config/spawn`, `~/.config/cloudflare` and
-//!   `~/.config/observe3-private`;
+//!   `~/.config/observe3-private` (each `~/.config/<x>` also below
+//!   `$XDG_CONFIG_HOME` when that is set elsewhere);
 //! - regular files, each read-only bound over by a private empty 0444 file
 //!   (never `/dev/null`, whose bind answers `EACCES` instead of reading
-//!   empty): the loop's `spawn.env` and every other `*.env*` and `env.sh` in
+//!   empty), kept in a 0700 directory inside the masked runtime directory
+//!   (`$XDG_RUNTIME_DIR/spawn-engine-view-<uid>`), so the engine can
+//!   neither reach, rewrite nor swap it: the loop's `spawn.env` and every other `*.env*` and `env.sh` in
 //!   the loop's directory (`~/.local/share/spawn-rsi`), `~/.claude.json`,
 //!   `~/.pgpass`, `~/.netrc` and `~/.git-credentials`.
 //!
@@ -72,8 +84,7 @@ use spawn_core::port::{EngineView, ViewedLaunch};
 /// The longest the functional check of `bwrap` may take.
 const CHECK_LIMIT: Duration = Duration::from_secs(10);
 
-/// The directory below the engine's home its `TMPDIR` falls back on when
-/// no usable one is given.
+/// The directory below the engine's home that is its `TMPDIR` in the view.
 pub const TMP_FALLBACK: &str = ".spawn-tmp";
 
 /// The engines' homes masked below the user's home: the only masked
