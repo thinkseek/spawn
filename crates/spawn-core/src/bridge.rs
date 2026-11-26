@@ -6153,7 +6153,7 @@ impl Bridge {
                     wrapped.push(program);
                     wrapped.extend(arguments);
                     arguments = wrapped;
-                    program = view_program.clone();
+                    program.clone_from(view_program);
                 }
             }
         }
