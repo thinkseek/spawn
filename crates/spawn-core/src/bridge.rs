@@ -9511,6 +9511,118 @@ mod tests {
             .collect()
     }
 
+    /// A Bridge over the agy start of [`submit_agy_start`] with a witness at
+    /// `seq` 1, started until the start is done and the ready pane keyed.
+    fn n12_rig() -> (
+        Arc<ManualClock>,
+        Arc<MemoryStore>,
+        Arc<Witnessed>,
+        TerminalName,
+        Bridge,
+    ) {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        store.set_terminal_server(crate::port::ServerSeen::Answers(Some(
+            crate::port::TerminalServer {
+                pid: 77,
+                started_at_ms: 1_700,
+            },
+        )));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let id = submit_agy_start(&store, "");
+        let mut bridge = n12_bridge(&clock, &store, &host);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        bridge.poll().expect("poll");
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(id));
+        (clock, store, host, terminal, bridge)
+    }
+
+    fn n12_bridge(clock: &Arc<ManualClock>, store: &Arc<MemoryStore>, host: &Arc<Witnessed>) -> Bridge {
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            agy_config(Some("gemini-3.8-flash-low")),
+        )
+        .with_clock(clock.clone());
+        bridge.recover().expect("recover");
+        bridge
+    }
+
+    fn agy_drafted() -> String {
+        format!("Antigravity CLI 1.5.14\n{AGY_RULE}\n> half a thought\n{AGY_RULE}\n? for shortcuts\n")
+    }
+
+    /// Carry list N12 (a): ready (keyed by `seq` 1), then a draft under the
+    /// same `seq` (unkeyed), then a restart and the pane ready again: the
+    /// log's last screen is `Ready`, recorded unkeyed, never a keyed repeat
+    /// the log refuses (which left the log at `Drafted` while the pane was
+    /// ready).
+    #[test]
+    fn n12_ready_drafted_restart_ready_leaves_the_log_at_ready() {
+        let (clock, store, host, terminal, mut bridge) = n12_rig();
+        store.set_pane(&terminal, &agy_drafted());
+        bridge.poll().expect("poll");
+        bridge.poll().expect("poll");
+        assert_eq!(
+            screens_with_keys(&store),
+            vec![
+                (ScreenState::Ready, Some("exec_1:hs:77.1700:1".to_string())),
+                (ScreenState::Drafted, None),
+            ]
+        );
+        drop(bridge);
+        let mut restarted = n12_bridge(&clock, &store, &host);
+        store.set_pane(&terminal, &agy_idle());
+        restarted.poll().expect("poll");
+        restarted.poll().expect("poll");
+        let screens = screens_with_keys(&store);
+        assert_eq!(
+            screens.last(),
+            Some(&(ScreenState::Ready, None)),
+            "{screens:?}"
+        );
+        assert_eq!(screens.len(), 3, "{screens:?}");
+    }
+
+    /// Carry list N12 (b): a restart over an unchanged pane records nothing
+    /// new, and never a keyed duplicate.
+    #[test]
+    fn n12_a_restart_over_an_unchanged_pane_adds_no_keyed_duplicate() {
+        let (clock, store, host, _terminal, bridge) = n12_rig();
+        let before = screens_with_keys(&store);
+        drop(bridge);
+        let mut restarted = n12_bridge(&clock, &store, &host);
+        restarted.poll().expect("poll");
+        restarted.poll().expect("poll");
+        let after = screens_with_keys(&store);
+        assert!(after.len() <= before.len() + 1, "{after:?}");
+        let keyed: Vec<&Option<String>> = after.iter().map(|(_, key)| key).filter(|key| key.is_some()).collect();
+        let mut unique = keyed.clone();
+        unique.dedup();
+        assert_eq!(keyed, unique, "no keyed duplicate: {after:?}");
+        assert_eq!(after, before, "nothing changed on the pane: {after:?}");
+    }
+
+    /// Carry list N12 (c): a new `seq` after a restart is keyed again.
+    #[test]
+    fn n12_a_new_seq_after_a_restart_is_keyed_again() {
+        let (clock, store, host, terminal, bridge) = n12_rig();
+        drop(bridge);
+        let mut restarted = n12_bridge(&clock, &store, &host);
+        store.set_pane(&terminal, &agy_working());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Working, 2));
+        restarted.poll().expect("poll");
+        assert_eq!(
+            screens_with_keys(&store).last(),
+            Some(&(ScreenState::Busy, Some("exec_1:hs:77.1700:2".to_string())))
+        );
+    }
+
     /// With the host's reading, one capture that agrees with it is a fact,
     /// keyed by the host's server and reading; a busy screen recorded again
     /// after `screen_refresh` is unkeyed, so the log's unique keys never
