@@ -23,7 +23,10 @@
 # deploy completes it; the controller becomes HEAD's tree with the install
 # (with the UI's node_modules, without the checkout's untracked files), and
 # not before it; a relay unit that is not installed does not stop a
-# deploy; a deploy run again keeps its rollback copies; a deploy failing
+# deploy; the node gateway's binary is built, staged and installed with
+# spawn's (no .prev on its first install), and try-restarted only when it
+# changed (an absent unit, exit 5, does not stop a deploy; a failed restart
+# fails it once live); a deploy run again keeps its rollback copies; a deploy failing
 # after its push completes it on exit; a pending deploy that main has moved
 # past stops the deploy; deploy/hold.sh holds the missions repo at its main,
 # and the deploy releases that hold on success and on failure; --landed
@@ -187,6 +190,7 @@ cat >"$scratch/fakebin/systemctl" <<'EOF'
 # SYSTEMCTL_FAIL="<arguments>=<status>": that one call fails with <status>.
 # This host has no spawn-model-relay unit (the README installs relays by
 # hand): systemctl says so with status 5, as it does for "Unit not found".
+# Nor a spawn-node-gateway unit, unless FAKE_GATEWAY_INSTALLED is set.
 echo "$*" >>"$SYSTEMCTL_LOG"
 [ -z "${SYSTEMCTL_TIMES-}" ] || echo "$(date +%s.%N) $*" >>"$SYSTEMCTL_TIMES"
 # FAKE_INTEGRATOR_INACTIVE: the integrator unit is not running.
@@ -195,6 +199,7 @@ case "$*" in "--user show -p MainPID --value spawn-integrate") [ -z "${FAKE_INTE
 case "$*" in "--user is-active --quiet spawn-integrate") [ -z "${FAKE_INTEGRATOR_INACTIVE-}" ] || exit 3 ;; esac
 case "${SYSTEMCTL_FAIL-}" in "$*="*) exit "${SYSTEMCTL_FAIL##*=}" ;; esac
 case "$*" in "--user try-restart spawn-model-relay") exit 5 ;; esac
+case "$*" in "--user try-restart spawn-node-gateway") [ -n "${FAKE_GATEWAY_INSTALLED-}" ] || exit 5 ;; esac
 EOF
 real_git=$(command -v git)
 cat >"$scratch/fakebin/git" <<EOF
@@ -385,6 +390,9 @@ check "the live binary is untouched" cmp -s "$live/bin/spawn" "$scratch/stand-in
 check "no rollback copy was written" [ ! -e "$live/bin/spawn.prev" ]
 check "no UI was installed" [ ! -e "$live/web" ]
 check "nothing is left staged" bash -c '[ ! -e "$1/bin/spawn.staged" ] && [ ! -e "$1/web.staged" ]' _ "$live"
+check "no node gateway binary was installed" [ ! -e "$live/bin/spawn-node-gateway" ]
+check "no node gateway rollback copy was written" [ ! -e "$live/bin/spawn-node-gateway.prev" ]
+check "no node gateway binary is left staged" [ ! -e "$live/bin/spawn-node-gateway.staged" ]
 check "main did not move" [ "$(main)" = "$base" ]
 check "no controller was made current" [ ! -e "$live/controllers/spawn" ]
 check "the services restarted" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
@@ -404,6 +412,11 @@ check "the untracked web/public/stray.txt did not reach the UI" [ ! -e "$live/we
 check "the UI is installed (the planted vite.config.js and postcss.config.js did not run)" \
   [ -f "$live/web/index.html" ]
 check "spawn.prev is the binary it replaced" cmp -s "$live/bin/spawn.prev" "$scratch/stand-in"
+check "the node gateway binary is installed" \
+  bash -c '"$1" --help | grep -q "^usage: spawn-node-gateway"' _ "$live/bin/spawn-node-gateway"
+check "the untracked .cargo/config.toml did not reach spawn-node-gateway" \
+  bash -c '! readelf -n "$1" | grep -qi "$2"' _ "$live/bin/spawn-node-gateway" "$build_id"
+check "first install of spawn-node-gateway writes no .prev" [ ! -e "$live/bin/spawn-node-gateway.prev" ]
 check "the controller is HEAD's tree" \
   bash -c '[ "$(cat "$1/controllers/spawn/.controller")" = "$2" ] && [ -f "$1/controllers/spawn/scripts/rsi/gate.sh" ]' _ "$live" "$head"
 check "the controller has the UI's node_modules" [ -x "$live/controllers/spawn/web/node_modules/.bin/vite" ]
@@ -450,6 +463,58 @@ check "the integrator was stopped, started, and the services restarted" \
   bash -c 'grep -qx -- "--user stop spawn-integrate" "$1" && grep -qx -- "--user start spawn-integrate" "$1" &&
     grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$1"' _ "$SYSTEMCTL_LOG"
 check "the export is removed" bash -c '! compgen -G "$1/spawn-deploy-export-*" >/dev/null' _ "$scratch/tmp"
+check "the same node gateway again is not restarted" \
+  bash -c '! grep -q "try-restart spawn-node-gateway" "$1"' _ "$SYSTEMCTL_LOG"
+check "the same node gateway again writes no .prev" [ ! -e "$live/bin/spawn-node-gateway.prev" ]
+
+echo "== the node gateway: its binary installed, its unit try-restarted when installed"
+# Main is HEAD and the verdict is over it: each deploy below builds the same
+# commit again (the target is warm), so only the live gateway binary planted
+# before it differs.
+cp "$live/bin/spawn-node-gateway" "$scratch/real-gw"
+printf '#!/bin/sh\necho old-gw\n' >"$scratch/old-gw"
+chmod 755 "$scratch/old-gw"
+# 1. Changed binary, unit not installed (exit 5): installed, nothing restarted.
+cp "$scratch/old-gw" "$live/bin/spawn-node-gateway"
+: >"$SYSTEMCTL_LOG"
+deploy
+check "changed gateway, unit not installed: succeeded (status $status)" [ "$status" -eq 0 ]
+check "the gateway binary is replaced by the build" cmp -s "$live/bin/spawn-node-gateway" "$scratch/real-gw"
+check "spawn-node-gateway.prev holds the replaced copy" cmp -s "$live/bin/spawn-node-gateway.prev" "$scratch/old-gw"
+check "no node gateway binary is left staged" [ ! -e "$live/bin/spawn-node-gateway.staged" ]
+check "try-restart was asked once" [ "$(grep -cx -- "--user try-restart spawn-node-gateway" "$SYSTEMCTL_LOG")" -eq 1 ]
+check "says unit spawn-node-gateway is not installed" \
+  grep -q "installed spawn-node-gateway (unit spawn-node-gateway is not installed: nothing restarted)" "$out"
+check "the services' restart does not name the gateway" \
+  bash -c 'grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$1" && ! grep -q "^--user restart .*spawn-node-gateway" "$1"' _ "$SYSTEMCTL_LOG"
+# 2. Same binary, unit installed: no restart, the rollback copy stays.
+: >"$SYSTEMCTL_LOG"
+deploy FAKE_GATEWAY_INSTALLED=1
+check "same gateway: succeeded (status $status)" [ "$status" -eq 0 ]
+check "same gateway keeps spawn-node-gateway.prev" cmp -s "$live/bin/spawn-node-gateway.prev" "$scratch/old-gw"
+check "same gateway is not try-restarted" \
+  bash -c '! grep -q "try-restart spawn-node-gateway" "$1"' _ "$SYSTEMCTL_LOG"
+# 3. Changed binary, unit installed: try-restarted, after the services.
+cp "$scratch/old-gw" "$live/bin/spawn-node-gateway"
+: >"$SYSTEMCTL_LOG"
+deploy FAKE_GATEWAY_INSTALLED=1
+check "changed gateway, unit installed: succeeded (status $status)" [ "$status" -eq 0 ]
+check "the gateway binary is replaced by the build" cmp -s "$live/bin/spawn-node-gateway" "$scratch/real-gw"
+check "spawn-node-gateway was try-restarted after the services" \
+  bash -c 'awk "/^--user restart spawn-loop spawn-integrate spawn-serve\$/ { r = NR } /^--user try-restart spawn-node-gateway\$/ { g = NR } END { exit !(r && g > r) }" "$1"' _ "$SYSTEMCTL_LOG"
+check "says it restarted" grep -q "installed spawn-node-gateway (spawn-node-gateway restarted)" "$out"
+# 4. Changed binary, unit installed, the restart fails: live, and the deploy fails.
+cp "$scratch/old-gw" "$live/bin/spawn-node-gateway"
+: >"$SYSTEMCTL_LOG"
+deploy FAKE_GATEWAY_INSTALLED=1 SYSTEMCTL_FAIL="--user try-restart spawn-node-gateway=1"
+check "a failed gateway restart fails the deploy (status $status)" [ "$status" -ne 0 ]
+check "says restarting spawn-node-gateway failed" grep -q "restarting spawn-node-gateway failed (exit 1)" "$out"
+check "says the deploy is live" grep -q "the deploy is live at $head, but a relay or the node gateway did not restart" "$out"
+check "the gateway binary is installed all the same" cmp -s "$live/bin/spawn-node-gateway" "$scratch/real-gw"
+check "the services were restarted once, before it" \
+  [ "$(grep -cx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG")" -eq 1 ]
+check "main stays HEAD" [ "$(main)" = "$head" ]
+rm -f "$scratch/real-gw" "$scratch/old-gw"
 
 echo "== a deploy failing after its push completes it on exit"
 git --git-dir="$missions" update-ref refs/heads/main "$base"
@@ -795,6 +860,7 @@ check "says main moved" grep -q "the missions main moved during the deploy" "$ou
 check "main is where the landing left it" [ "$(main)" = "$other" ]
 check "nothing is pending" [ ! -e "$live/deploy.pending" ]
 check "nothing is left staged" bash -c '[ ! -e "$1/bin/spawn.staged" ] && [ ! -e "$1/web.staged" ]' _ "$live"
+check "no node gateway binary is left staged" [ ! -e "$live/bin/spawn-node-gateway.staged" ]
 check "stopped the integrator, then restarted the services" \
   bash -c 'grep -x -A99 -- "--user stop spawn-integrate" "$1" | grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve"' _ "$SYSTEMCTL_LOG"
 check "released the owner's hold" [ -z "$(missions_hold)" ]

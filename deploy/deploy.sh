@@ -90,17 +90,18 @@
 #      run there, both in the bubblewrap sandbox of scripts/sandbox.sh (no
 #      network, $HOME hidden, writable only the export and the target
 #      directory): proc-macros and the UI's build tools run the candidate's
-#      code, not the owner's. Binary and UI are staged in $live (spawn.staged,
-#      web.staged), not installed; the export and anything still staged are
-#      removed on every exit;
+#      code, not the owner's. The binaries and UI are staged in $live
+#      (spawn.staged, spawn-node-gateway.staged, web.staged), not installed;
+#      the export and anything still staged are removed on every exit;
 #   6. the integrator is stopped, its gates left running in their units
 #      (below, "Gates outlive the integrator"), or drained and stopped
 #      (below, "Draining") when its binary runs them as children, main is
 #      read again (it must still be the
 #      verdict's base), the staged binary migrates the schema, and only then
-#      binary and UI are installed: the replaced copies become spawn.prev and
-#      web.prev, unless the live copy already is this build (a deploy run
-#      again keeps its rollback copies), and the controller switches to
+#      binaries and UI are installed: the replaced copies become spawn.prev,
+#      spawn-node-gateway.prev and web.prev, unless the live copy already is
+#      this build (a deploy run again keeps its rollback copies; a first
+#      install of the node gateway writes no .prev), and the controller switches to
 #      HEAD's (one atomic rename; the one it replaces stays as
 #      controllers/spawn.prev, older ones are removed unless a process
 #      still uses them). Then $live/deploy.pending is written
@@ -120,9 +121,10 @@
 #      the services restarted;
 #   8. the services restart; the base cache is warmed for the new main in
 #      the background (see warm_base_cache); then each relay whose script
-#      or unit changed gets it and a try-restart; a relay unit that is not
-#      installed is skipped, any other relay failure is reported after the
-#      deploy is live;
+#      or unit changed gets it and a try-restart, and so does the node
+#      gateway (spawn-node-gateway) when its binary or unit changed; a relay
+#      or gateway unit that is not installed is skipped, any other failure
+#      to restart one is reported after the deploy is live;
 #   9. with SPAWN_DEPLOY_MIRROR set, the deployed main is published to the
 #      mirror (below, "The mirror"): the one step that never stops the
 #      deploy, or fails it.
@@ -395,7 +397,7 @@ stopped=0
 completing_at_start=0
 on_exit() {
   local status=$?
-  rm -rf "$export_dir" "$live/bin/spawn.staged" "$live/web.staged"
+  rm -rf "$export_dir" "$live/bin/spawn.staged" "$live/bin/spawn-node-gateway.staged" "$live/web.staged"
   if [ "$status" -ne 0 ] && [ "$stopped" = 1 ]; then
     printf "deploy: failed (exit %s); restarting the services\n" "$status" >&2
     [ "$completing_at_start" = 1 ] || (complete_pending) || printf "deploy: the pending deploy is not complete: %s\n" "$pending" >&2
@@ -582,15 +584,26 @@ complete_pending() {
   fi
 }
 
-# install_build: the staged binary and UI become the live ones. The copies
-# they replace become spawn.prev and web.prev, unless the live copy already
-# is this build (a deploy run again): then the rollback copies stay.
+# install_build: the staged binaries and UI become the live ones. The copies
+# they replace become spawn.prev, spawn-node-gateway.prev and web.prev, unless
+# the live copy already is this build (a deploy run again): then the rollback
+# copies stay. The node gateway's first install has nothing to keep. A
+# gateway binary that changed sets gateway_changed (its restart, step 8).
+gateway_changed=0
 install_build() {
   if cmp -s "$live/bin/spawn.staged" "$live/bin/spawn"; then
     rm -f "$live/bin/spawn.staged"
   else
     cp "$live/bin/spawn" "$live/bin/spawn.prev"
     mv "$live/bin/spawn.staged" "$live/bin/spawn"
+  fi
+  if [ -f "$live/bin/spawn-node-gateway" ] &&
+    cmp -s "$live/bin/spawn-node-gateway.staged" "$live/bin/spawn-node-gateway"; then
+    rm -f "$live/bin/spawn-node-gateway.staged"
+  else
+    [ ! -f "$live/bin/spawn-node-gateway" ] || cp "$live/bin/spawn-node-gateway" "$live/bin/spawn-node-gateway.prev"
+    mv "$live/bin/spawn-node-gateway.staged" "$live/bin/spawn-node-gateway"
+    gateway_changed=1
   fi
   if [ -d "$live/web" ] && diff -rq "$live/web.staged" "$live/web" >/dev/null; then
     rm -rf "$live/web.staged"
@@ -693,6 +706,7 @@ sandbox_run "$export_dir/web" sh -c './node_modules/.bin/tsc --noEmit &&
 # Staged, not installed: the live binary and UI change only once every
 # step before the push has passed (init-db runs the staged binary).
 cp "$target/release/spawn" "$live/bin/spawn.staged"
+cp "$target/release/spawn-node-gateway" "$live/bin/spawn-node-gateway.staged"
 rm -rf "$live/web.staged"
 cp -r "$export_dir/web-dist" "$live/web.staged"
 
@@ -911,4 +925,27 @@ for relay in jev-relay model-relay; do
     ;;
   esac
 done
-[ "$relays_failed" = 0 ] || die "the deploy is live at $head, but a relay did not restart (above)"
+# The node gateway runs from $live/bin too: restarted only when its binary
+# (install_build) or its unit (step 7) changed, never with the services
+# above. A host that has not installed its unit (systemctl exit 5) keeps the
+# binary and restarts nothing.
+gw_what=""
+if [ "$gateway_changed" = 1 ]; then
+  gw_what=spawn-node-gateway
+elif grep -qxF "units: installed spawn-node-gateway.service" <<<"$units_out"; then
+  gw_what="its unit spawn-node-gateway.service"
+fi
+if [ -n "$gw_what" ]; then
+  gw_status=0
+  systemctl --user try-restart spawn-node-gateway || gw_status=$?
+  case $gw_status in
+  0) say "installed $gw_what (spawn-node-gateway restarted)" ;;
+  5) say "installed $gw_what (unit spawn-node-gateway is not installed: nothing restarted)" ;;
+  *)
+    printf 'deploy: installed %s, but restarting spawn-node-gateway failed (exit %s): systemctl --user status spawn-node-gateway\n' \
+      "$gw_what" "$gw_status" >&2
+    relays_failed=1
+    ;;
+  esac
+fi
+[ "$relays_failed" = 0 ] || die "the deploy is live at $head, but a relay or the node gateway did not restart (above)"

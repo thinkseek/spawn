@@ -1,0 +1,28 @@
+[Unit]
+Description=Spawn: signed HTTP gateway for spawn-node v1 (restricted ledger login)
+After=network-online.target docker.service
+
+[Service]
+# Not the owner's checkout: nothing live reads it (deploy/deploy.sh).
+WorkingDirectory=%h/.local/share/spawn-rsi
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Non-secret defaults; EnvironmentFile below may override per host (e.g.
+# SPAWN_NODE_GATEWAY_LISTEN or SPAWN_NODE_GATEWAY_PUBLIC_PREFIX).
+# Primary Ed25519 PKCS#8 key (mode 0600, created on first start if absent)
+# under ~/.config/spawn, which engines may not read (CREDENTIAL_DENY).
+Environment=SPAWN_NODE_GATEWAY_KEY_FILE=%h/.config/spawn/node-gateway.pk8
+# Shared with the integrator (artifacts written by primary, results written by gateway).
+Environment=SPAWN_NODE_ARTIFACTS=%h/.local/share/spawn-rsi/node-artifacts
+Environment=SPAWN_NODE_RESULTS=%h/.local/share/spawn-rsi/node-results
+Environment=SPAWN_NODE_GATEWAY_LISTEN=127.0.0.1:18096
+Environment=SPAWN_NODE_GATEWAY_CELLS=c0
+# Restricted login only: SPAWN_NODE_GATEWAY_DATABASE_URL (0600, under
+# ~/.config/spawn). Never the owner's environment file: this unit must never
+# hold the owner database URL or model keys.
+EnvironmentFile=%h/.config/spawn/node-gateway.env
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn-node-gateway
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

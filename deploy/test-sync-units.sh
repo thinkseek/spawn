@@ -14,7 +14,8 @@
 # cannot write exits 2 and leaves no temporary file; usage exits 2; no
 # unit's text is ever printed (a value planted in a unit and a drop-in is
 # never in the output); the repo's deploy/systemd and host-local agree (no
-# name in both); deploy.sh syncs before it restarts the services, and
+# name in both); spawn-node-gateway.service is in deploy/systemd and reads
+# its own node-gateway.env, never spawn.env; deploy.sh syncs before it restarts the services, and
 # cutover-controller.sh runs the sync.
 #
 # TEST_SYNC_UNITS_SCRIPT=<path> runs that script instead of the checkout's.
@@ -178,6 +179,10 @@ done)
 check "host-local names no unit deploy/systemd has (${both:-none})" [ -z "$both" ]
 check "every deploy/systemd/spawn-* is a regular file" \
   bash -c 'for f in "$1"/spawn-*; do [ -f "$f" ] && [ ! -L "$f" ] || exit 1; done' _ "$repo_units"
+check "spawn-node-gateway.service is in deploy/systemd" [ -f "$repo_units/spawn-node-gateway.service" ]
+check "spawn-node-gateway.service uses node-gateway.env, never spawn.env" \
+  bash -c 'grep -qxF "EnvironmentFile=%h/.config/spawn/node-gateway.env" "$1" && ! grep -q "spawn\.env" "$1"' \
+  _ "$repo_units/spawn-node-gateway.service"
 check "deploy.sh syncs the units before it restarts the services" \
   bash -c 'awk "/sync-units.sh\" --apply/ { s = NR } /^restart\$/ && s && !r { r = NR } END { exit !(s && r > s) }" "$1"' _ "$here/deploy/deploy.sh"
 check "cutover-controller.sh runs the sync" grep -q 'deploy/sync-units.sh" --apply' "$here/deploy/cutover-controller.sh"
