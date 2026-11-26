@@ -153,7 +153,8 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn source init|list|show|sync|export ...   (internal source and metadata store: spawn source --help for each verb's flags)\n       \
      spawn config check [--config <path>] [--json]\n       \
      spawn config effective [--config <path>] [--json]\n       \
-     spawn config init --data-dir <dir> [--name <name>] [--output <file>]\n       \
+     spawn config init --data-dir <dir> [--name <name>] [--output <file>] [--from-host]\n       \
+     spawn config docker-plan [--config <path>] [--data-dir <dir>] [--image <image>] [--json]\n       \
      spawn doctor [--config <path>] [--root <dir>] [--json]";
 
 /// What the whole usage says last, after the commands.

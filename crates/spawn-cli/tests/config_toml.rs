@@ -940,3 +940,174 @@ fn toml_parser_rejects_excessive_nesting_depth() {
     let err_tbl = toml_parser::parse(&deep_tables).expect_err("deep inline table rejected");
     assert!(err_tbl.message.contains("depth"), "{err_tbl}");
 }
+
+#[test]
+fn sandbox_container_host_inherit_and_claude_sandbox_resolve_env() {
+    let dir = TempDir::new("inherit-claude-sbx");
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(&data_dir).expect("data dir");
+
+    let doc = format!(
+        r#"
+schema_version = 1
+
+[instance]
+name = "ctr-host"
+data_dir = "{}"
+
+[sandbox]
+mode = "container"
+home_isolation = "whitelist"
+inherit_host = "auto"
+inherit_host_paths = ["/opt/tools", "~/.local/sdk"]
+
+[engines.claude]
+enabled = true
+sandbox = true
+"#,
+        data_dir.display()
+    );
+    let cfg = SpawnConfig::from_toml_str(&doc).expect("valid config");
+    let entries: BTreeMap<String, String> = resolve_env_entries_with(&cfg, &|name| {
+        (name == "HOME").then(|| "/home/tester".to_string())
+    })
+    .expect("resolve env")
+    .into_iter()
+    .collect();
+
+    assert_eq!(
+        entries.get("SPAWN_ENGINE_VIEW").map(String::as_str),
+        Some("container")
+    );
+    assert_eq!(
+        entries
+            .get("SPAWN_SANDBOX_INHERIT_HOST")
+            .map(String::as_str),
+        Some("auto")
+    );
+    assert_eq!(
+        entries
+            .get("SPAWN_SANDBOX_INHERIT_HOST_PATHS")
+            .map(String::as_str),
+        Some("/opt/tools,/home/tester/.local/sdk")
+    );
+    assert_eq!(
+        entries.get("SPAWN_CLAUDE_SANDBOX").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        entries.get("SPAWN_CLAUDE_DATA_DIR").map(String::as_str),
+        Some(data_dir.join("engines/claude").to_string_lossy().as_ref())
+    );
+
+    let bad_inherit = format!(
+        "schema_version = 1\n[instance]\ndata_dir = \"{}\"\n[sandbox]\ninherit_host = \"unsafe\"\n",
+        data_dir.display()
+    );
+    assert!(SpawnConfig::from_toml_str(&bad_inherit).is_err());
+
+    let bad_root = format!(
+        "schema_version = 1\n[instance]\ndata_dir = \"{}\"\n[sandbox]\ninherit_host_paths = [\"/\"]\n",
+        data_dir.display()
+    );
+    assert!(SpawnConfig::from_toml_str(&bad_root).is_err());
+}
+
+#[test]
+fn cli_config_init_from_host_docker_plan_and_doctor_emit_valid_outputs() {
+    let dir = TempDir::new("cli-host-docker");
+    let fake_home = dir.path().join("home");
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(fake_home.join(".rustup/toolchains/stable")).expect("rustup");
+    fs::create_dir_all(fake_home.join(".cargo/bin")).expect("cargo bin");
+    fs::write(
+        fake_home.join(".cargo/config.toml"),
+        "[net]\noffline = true\n",
+    )
+    .expect("cargo config");
+    fs::write(
+        fake_home.join(".gitconfig"),
+        "[user]\n\tname = Ada\n\temail = ada@example.com\n",
+    )
+    .expect("gitconfig");
+    fs::create_dir_all(fake_home.join(".ssh")).expect("ssh");
+    fs::write(fake_home.join(".ssh/id_ed25519"), "SECRET_SSH_KEY").expect("ssh key");
+    fs::create_dir_all(&data_dir).expect("data dir");
+
+    let cfg_out = dir.path().join("spawn.from-host.toml");
+    let init_out = Command::new(env!("CARGO_BIN_EXE_spawn"))
+        .args([
+            "config",
+            "init",
+            "--from-host",
+            "--data-dir",
+            &data_dir.display().to_string(),
+            "--name",
+            "host-test",
+            "--output",
+            &cfg_out.display().to_string(),
+        ])
+        .env("HOME", &fake_home)
+        .output()
+        .expect("run config init --from-host");
+    assert!(
+        init_out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+    let generated = fs::read_to_string(&cfg_out).expect("read generated toml");
+    let parsed_cfg = SpawnConfig::from_toml_str(&generated).expect("generated toml validates");
+    assert_eq!(parsed_cfg.sandbox.inherit_host.as_deref(), Some("auto"));
+
+    let plan_out = Command::new(env!("CARGO_BIN_EXE_spawn"))
+        .args([
+            "config",
+            "docker-plan",
+            "--config",
+            &cfg_out.display().to_string(),
+            "--json",
+        ])
+        .env("HOME", &fake_home)
+        .output()
+        .expect("run config docker-plan --json");
+    assert!(
+        plan_out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+    let plan_json: Value = serde_json::from_slice(&plan_out.stdout).expect("docker-plan JSON");
+    assert_eq!(plan_json["ok"], json!(true));
+    assert_eq!(plan_json["env"]["SPAWN_ENGINE_VIEW"], json!("container"));
+    let ro = plan_json["readonly_mounts"].as_array().expect("ro mounts");
+    assert!(
+        ro.iter()
+            .any(|m| m["container"] == "/home/spawn/.gitconfig"),
+        "safe .gitconfig mounted: {ro:?}"
+    );
+    assert!(
+        !ro.iter()
+            .any(|m| m["container"].as_str().is_some_and(|s| s.contains(".ssh"))),
+        ".ssh must never appear in docker-plan mounts: {ro:?}"
+    );
+
+    let doc_out = Command::new(env!("CARGO_BIN_EXE_spawn"))
+        .args([
+            "doctor",
+            "--json",
+            "--root",
+            &data_dir.display().to_string(),
+        ])
+        .env("HOME", &fake_home)
+        .output()
+        .expect("run doctor --json");
+    assert!(
+        doc_out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&doc_out.stderr)
+    );
+    let doc_json: Value = serde_json::from_slice(&doc_out.stdout).expect("doctor JSON");
+    assert!(doc_json.get("container").is_some());
+    assert!(doc_json.get("bwrap_capability").is_some());
+    assert!(doc_json.get("host_inherit").is_some());
+    assert!(doc_json.get("archive_mask_tool").is_some());
+}

@@ -19,6 +19,7 @@ pub mod agent_files;
 pub mod archive_mask;
 pub mod beneath;
 pub mod cas_dedup;
+pub mod container;
 pub mod cow;
 pub mod engine_view;
 pub mod git;
@@ -44,11 +45,14 @@ mod audit;
 pub use cas_dedup::{
     ArtifactRoot, DedupConfig, DedupError, DedupReport, PruneReport, dedup_dirs, prune_unused,
 };
+pub use container::{BwrapCapability, ContainerEnv, detect_container, probe_bwrap};
 pub use cow::{
     CloneKind, CowStats, CowWorkspace, DirectoryOccupancy, WorkspaceLease, clone_or_copy,
     cow_clone_supported, directory_occupancy, live_users, reflink_file,
 };
-pub use engine_view::{BwrapView, ExtraMount, HomeIsolation, ViewConfig};
+pub use engine_view::{
+    BwrapView, ContainerView, ExtraMount, HomeIsolation, HostInheritMode, ViewConfig,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use git::test_git_command;
 pub use git::{
