@@ -624,14 +624,17 @@ fn production_std_net_ratchet_matches_phase2d_allowlist() {
     }
 }
 
-/// Issue #98 boundary guard: all six audited core/data library crates
-/// explicitly declare `#![forbid(unsafe_code)]`, `#![warn(missing_docs)]`,
-/// and contain zero non-test `unsafe` tokens in `src/`.
+/// Issue #98 boundary guard: all eight audited core/data/host/protocol
+/// library crates explicitly declare `#![forbid(unsafe_code)]`,
+/// `#![warn(missing_docs)]`, and contain zero non-test `unsafe` tokens in
+/// `src/`.
 #[test]
 fn pure_crates_forbid_unsafe_code() {
-    const AUDITED_SAFE_CRATES: [&str; 6] = [
+    const AUDITED_SAFE_CRATES: [&str; 8] = [
         "spawn-core",
         "spawn-postgres",
+        "spawn-host",
+        "spawn-node-proto",
         "spawn-cas",
         "spawn-kdf",
         "spawn-codegraph",

@@ -5,7 +5,7 @@
 Spawn 在隔离的工作区中运行 Claude Code agent，并把它们的全部行为记录到一个 PostgreSQL 事件日志。
 
 - 调用方向 PostgreSQL 中的队列提交命令（start、input、resume、stop）。
-- `spawn tick` 领取命令，创建一个 git 分支，导出工作树，在 Herdr 会话（或设 `SPAWN_TERMINAL_BACKEND=tmux` 使用 tmux 会话）中启动引擎。
+- `spawn tick` 领取命令，创建一个 git 分支，导出工作树，在 Herdr 会话中启动引擎（默认使用同级二进制 `spawn-hc` 内置的 `herdr-core`，也可通过 `SPAWN_HERDR_MODE=legacy` 使用传统 `herdr`）。
 - Claude Code 的 transcript、终端屏幕与引擎退出状态转为日志中的类型化事件。引擎所在终端不持有数据库登录。
 - Observer 判定每个会话的状态（可输入、运行中、阻塞、失败），并把结论作为事件写回。
 
@@ -17,8 +17,8 @@ Spawn 在隔离的工作区中运行 Claude Code agent，并把它们的全部�
 | --- | --- | --- |
 | Rust | 1.95 及以上 | 编译 |
 | PostgreSQL | 16 及以上 | 事件日志、命令队列、视图 |
-| herdr | 0.9.5（protocol 22） | 默认终端（`SPAWN_TERMINAL_BACKEND=herdr`） |
-| tmux | 3.x | 显式回退终端（`SPAWN_TERMINAL_BACKEND=tmux`） |
+| `spawn-hc` | 仓库内（`crates/spawn-hc`） | 默认内置 `herdr-core` 终端守护进程（`SPAWN_TERMINAL_BACKEND=herdr`，`SPAWN_HERDR_MODE=core`） |
+| herdr | 0.9.5（protocol 22） | 可选传统外部终端（`SPAWN_HERDR_MODE=legacy`） |
 | git | 2.40 及以上（`git --attr-source`，启动时检查） | 分支与工作区 |
 | Claude Code | 当前版本 | 引擎 |
 
@@ -26,9 +26,10 @@ Spawn 在隔离的工作区中运行 Claude Code agent，并把它们的全部�
 
 ```bash
 cargo install --path crates/spawn-cli
+cargo install --path crates/spawn-hc
 ```
 
-二进制名为 `spawn`。
+二进制名为 `spawn` 及其同级终端守护进程 `spawn-hc`（位于 `spawn` 同目录）。
 
 ## 快速开始
 
@@ -97,11 +98,12 @@ spawn tail --session session_demo
 | `SPAWN_GIT_REPO` | 必填 | 不属于任何任务的 agent（supervisor、临时 worker）用的裸仓库 |
 | `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
 | `SPAWN_WORKER` | `spawn-worker` | 领取命令时记录的 worker 名 |
-| `SPAWN_TERMINAL_BACKEND` | `herdr` | 终端后端（默认 `herdr`；可显式设 `tmux` 回退） |
-| `SPAWN_HERDR_PROGRAM` | `herdr` | herdr 路径 |
-| `SPAWN_HERDR_SESSION` | `spawn` | herdr `--session` 会话名 |
-| `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 路径（`SPAWN_TERMINAL_BACKEND=tmux` 时） |
-| `SPAWN_TMUX_SOCKET` | 默认 socket | tmux `-L` socket 名（`SPAWN_TERMINAL_BACKEND=tmux` 时） |
+| `SPAWN_TERMINAL_BACKEND` | `herdr` | 唯一终端后端（`herdr`；`tmux` 已移除并会明确拒绝） |
+| `SPAWN_HERDR_MODE` | `core` | Herdr 运行模式：`core`（默认，经同级 `spawn-hc` 运行内置 `herdr-core`）或 `legacy`（外部 `herdr`） |
+| `SPAWN_HERDR_CORE_PROGRAM` | 同级 `spawn-hc` | `SPAWN_HERDR_MODE=core` 时的 `spawn-hc` 路径覆盖 |
+| `SPAWN_HERDR_SHARDS` | `1` | Herdr 守护进程分片数（`1..=64`；`> 1` 时将终端路由到 `<session>-s0..N`） |
+| `SPAWN_HERDR_PROGRAM` | `herdr` | `SPAWN_HERDR_MODE=legacy` 时的传统 `herdr` 二进制路径 |
+| `SPAWN_HERDR_SESSION` | `spawn` | `spawn-hc` / 传统 `herdr` 的 `--session` 会话名 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code 路径 |
 | `SPAWN_CLAUDE_PROJECTS` | `$SPAWN_CLAUDE_CONFIG_DIR/projects`，否则 `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude Code 写 transcript 的目录 |
 | `SPAWN_CLAUDE_CONFIG_DIR` | 不设 | 可选：引擎专用的 Claude Code 目录（须为绝对路径，否则 `spawn loop` 不启动）（作为引擎的 `CLAUDE_CONFIG_DIR`），其 `settings.json` 须含网关 token；不设则照旧用 `~/.claude` |

@@ -25,6 +25,7 @@ impl SigningKey {
             .map_err(|_| Error::Key)
     }
 
+    /// Returns the Ed25519 verifying public key for this key pair.
     pub fn public_key(&self) -> PublicKey {
         let mut raw = [0; 32];
         raw.copy_from_slice(self.pair.public_key().as_ref());
@@ -66,6 +67,7 @@ impl PublicKey {
         Ok(Self(raw))
     }
 
+    /// Encodes the raw public key as unpadded base64url.
     pub fn to_b64u(&self) -> String {
         b64u(&self.0)
     }
@@ -102,6 +104,6 @@ impl PublicKey {
 }
 
 /// The 64 bytes of a base64url signature header or field.
-pub fn decode_signature(sig: &str) -> Result<Vec<u8>, Error> {
+pub(crate) fn decode_signature(sig: &str) -> Result<Vec<u8>, Error> {
     unb64u(sig, SIGNATURE_LEN).map_err(|_| Error::Header("signature"))
 }

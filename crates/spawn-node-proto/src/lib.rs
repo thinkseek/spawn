@@ -8,6 +8,9 @@
 //! `spawn_cas`; this crate layers the Ed25519 signing/verification (`ring`),
 //! strict base64url (`base64`), request envelope and response signatures on top.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 pub mod codec;
 pub mod enroll;
 pub mod envelope;

@@ -7,6 +7,9 @@
 //! `git`) and apply uniform locale and error handling (`git` runs in the C
 //! locale via [`git_command`]).
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::TerminalError;
 
@@ -110,8 +113,11 @@ pub use workspace::{
 /// The terminal host of this machine Spawn runs on: embedded `herdr-core`
 /// (`spawn-hc`), legacy `herdr`, or pooled shards, told apart only here.
 pub enum LocalTerminalHost {
+    /// Legacy external `herdr` daemon host.
     Herdr(HerdrHost),
+    /// Embedded `herdr-core` daemon host (`spawn-hc`, default).
     HerdrCore(HerdrCoreHost),
+    /// Sharded pool of `herdr` daemon hosts.
     HerdrPool(HerdrPool),
 }
 
