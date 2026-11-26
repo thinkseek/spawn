@@ -9,6 +9,9 @@
 //! - Warm Layer 0 baselines under `<root>/.d6/layers/<tree_hex>` never hard-link against
 //!   `<cas>/objects`, and mounted writable workspaces are isolated via `clone_or_copy`.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
@@ -76,13 +79,13 @@ const FLATTEN_CACHE_CAP: usize = 16;
 const VERIFIED_CLEAN_CAP: usize = 64;
 
 /// Minimum host RAM reserved before admitting D6 L1 `tmpfs` workspaces (`64 GiB`).
-pub const DEFAULT_L1_MIN_HOST_RESERVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const DEFAULT_L1_MIN_HOST_RESERVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// Default percentage of total host RAM reserved before admitting D6 L1 `tmpfs` workspaces (`15%`).
-pub const DEFAULT_L1_HOST_RESERVE_PCT: u8 = 15;
+const DEFAULT_L1_HOST_RESERVE_PCT: u8 = 15;
 /// Default L1 usage pressure threshold (%) that triggers flush and disk reclamation (`80%`).
-pub const DEFAULT_L1_FLUSH_THRESHOLD_PCT: u8 = 80;
+const DEFAULT_L1_FLUSH_THRESHOLD_PCT: u8 = 80;
 /// Default interval (ms) after which dirty/idle L1 workspaces trigger CAS+PG flush (`60s`).
-pub const DEFAULT_L1_FLUSH_INTERVAL_MS: i64 = 60_000;
+const DEFAULT_L1_FLUSH_INTERVAL_MS: i64 = 60_000;
 
 static D6_STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -651,7 +654,7 @@ impl<L: RefLedger> D6Workspace<L> {
     ///
     /// Incremental hard-link reuse via `Layer0Options::nearest` is strictly limited to an already
     /// cached non-CAS warm layer directory under `<root>/.d6/layers/`, never `<cas>/objects`.
-    pub fn ensure_warm_layer(
+    fn ensure_warm_layer(
         &self,
         tree: &Digest,
         preferred_nearest: Option<&Digest>,
@@ -3807,7 +3810,7 @@ impl<L: RefLedger> D6Workspace<L> {
 
 /// Probe current host RAM (`MemTotal` / `MemAvailable` from `/proc/meminfo`) and `tmpfs_root`
 /// available capacity (`statvfs`).
-pub fn probe_host_memory(tmpfs_root: &Path) -> Option<HostMemorySample> {
+fn probe_host_memory(tmpfs_root: &Path) -> Option<HostMemorySample> {
     let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
     let (total_bytes, available_bytes) = parse_proc_meminfo_bytes(&meminfo)?;
     let tmpfs_available_bytes = probe_fs_available_bytes(tmpfs_root);
@@ -3819,7 +3822,7 @@ pub fn probe_host_memory(tmpfs_root: &Path) -> Option<HostMemorySample> {
 }
 
 /// Parse `(MemTotal, MemAvailable)` in bytes from `/proc/meminfo` contents.
-pub fn parse_proc_meminfo_bytes(contents: &str) -> Option<(u64, u64)> {
+fn parse_proc_meminfo_bytes(contents: &str) -> Option<(u64, u64)> {
     let mut total_kb = None;
     let mut avail_kb = None;
     for line in contents.lines() {

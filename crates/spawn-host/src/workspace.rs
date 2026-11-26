@@ -18,6 +18,9 @@
 //! at `<root>/.cas` while the workspace is offline, and
 //! [`LocalWorkspaceStore::prune_cas`] drops the blobs nothing uses any more.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -699,7 +702,7 @@ impl LocalWorkspaceStore {
     }
 
     /// Deduplicate `workspace`'s build artifacts (`target/`,
-    /// `node_modules/`: [`ARTIFACT_DIRECTORIES`]) against [`Self::cas_root`],
+    /// `node_modules/`) against [`Self::cas_root`],
     /// with the workspace taken offline for the pass
     /// ([`CowWorkspace::offline`]: no worker holds its lease, none starts,
     /// no process is seen in it). Transcripts are never touched: a `*.jsonl`

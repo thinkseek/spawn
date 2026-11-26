@@ -3,6 +3,9 @@
 //! external Git bare repositories (`git fast-import` export + history import)
 //! with deterministic 40-hex OID verification.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -113,7 +116,7 @@ impl GitBorderAdapter {
     }
 
     /// Initialize an empty read-only-intended bare boundary mirror repository.
-    pub fn init_bare_mirror(&self, mirror_dir: &Path) -> Result<(), D6StoreError> {
+    fn init_bare_mirror(&self, mirror_dir: &Path) -> Result<(), D6StoreError> {
         fs::create_dir_all(mirror_dir)?;
         let out = git_command(&self.git_program)
             .arg("init")
@@ -126,7 +129,7 @@ impl GitBorderAdapter {
 
     /// Configure a bare mirror to reject external pushes directly (`receive.denyCurrentBranch`,
     /// `receive.denyNonFastForwards`, `receive.denyDeletes`, plus an executable `hooks/pre-receive`).
-    pub fn configure_readonly_receive(&self, mirror_dir: &Path) -> Result<(), D6StoreError> {
+    pub(crate) fn configure_readonly_receive(&self, mirror_dir: &Path) -> Result<(), D6StoreError> {
         for (key, val) in [
             ("receive.denyNonFastForwards", "true"),
             ("receive.denyDeletes", "true"),

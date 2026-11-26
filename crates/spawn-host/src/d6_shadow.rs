@@ -11,6 +11,9 @@
 //! - Every `merge_base` / `merge_main_clean` evaluates and records
 //!   [`crate::merkle_merge::classify_shadow_merge`] outcomes in [`ShadowOracleMetrics`].
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufReader, Read};

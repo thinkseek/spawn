@@ -11,6 +11,9 @@
 //!   `nearest_dir` whose matching inode differs from any CAS object.
 //! - Stages into a sibling temporary directory and publishes atomically with `rename`.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fs;
