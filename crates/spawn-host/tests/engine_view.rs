@@ -313,13 +313,16 @@ fn inside_the_view_the_masks_are_empty_and_only_the_three_binds_write() {
 }
 
 /// A target that is missing, or neither a directory nor a regular file (a
-/// socket), is skipped and said, and the view still starts.
+/// fifo, as a socket or a device), is skipped and said, and the view still starts.
 #[test]
 fn missing_and_odd_targets_are_skipped_and_said_without_aborting() {
     let _serial = exclusive();
     let fixture = Fixture::new();
-    let socket_path = fixture.scratch.join("odd.sock");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("socket");
+    // A fifo: neither a directory nor a regular file (a socket's path
+    // would be too long here).
+    let socket_path = fixture.scratch.join("odd.fifo");
+    let made = Command::new("mkfifo").arg(&socket_path).status().expect("mkfifo");
+    assert!(made.success());
     let missing = fixture.scratch.join("missing.env");
     let mut config = fixture.config();
     config.extra_files = vec![missing.clone(), socket_path.clone()];
@@ -493,8 +496,9 @@ fn a_bind_that_would_uncover_a_mask_is_refused_or_passed_over() {
 }
 
 /// A stand-in Claude Code: a shell script named `claude`, which Herdr
-/// detects by the process's name; it shows a prompt and waits.
-const STUB_CLAUDE: &str = "#!/bin/sh\nprintf '> \\r\\n'\nexec sleep 60\n";
+/// detects by the process's name; it shows a prompt and reads its input
+/// (a builtin: no child takes its place in the pane).
+const STUB_CLAUDE: &str = "#!/bin/sh\nprintf '> \\r\\n'\nwhile IFS= read -r line; do :; done\n";
 
 /// The installed `herdr`, if any answers `--version`.
 fn herdr_program() -> Option<String> {
