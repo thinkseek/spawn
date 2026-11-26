@@ -51,6 +51,7 @@ mod crypto;
 pub(crate) mod power;
 mod relay;
 mod transport;
+mod v1;
 mod ws;
 
 use transport::{Op, Route};
@@ -139,7 +140,7 @@ const OUTPUT_LIMIT: u64 = 256 * 1024;
 /// The longest text of a node (an arch, a GPU's name, an error) kept.
 const TEXT_CHARS: usize = 200;
 
-pub(crate) const USAGE: &str = "usage: spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]> [--note <text>]   (owner only)\n       spawn node add <name> --tcp <[tcp://]host:port>|--udp <[udp://]host:port>|--ssh <dest> [--via <hop>[,<hop>...]] [--mode direct|relay|hole_punch] [--note <text>]\n       spawn node list [--json]\n       spawn node drain|undrain|remove <name>   (owner only)\n       spawn node serve --listen <tcp://bind|udp://bind>[,...] | --tcp <bind> | --udp <bind> [--register-store] [--allow-loopback-forward] [--allow-unauthenticated]\n       spawn node register --to <[tcp://|udp://]host:port> --name <name> --listen <tcp://host:port|udp://host:port> [--via <hop>[=<endpoint>][,...]] [--mode direct|relay|hole_punch] [--note <text>]\n       spawn node add <name> --coord <ws://|wss://|tcp://...> --node-id <hex>|--peer <name> [--mode relay|hole_punch] [--note <text>]\n       spawn node probe <name> [--op inventory|beat] [--json]\n       spawn node coord --ws <bind>|--tcp <bind> [--udp <bind>] [--zone <name>] [--parent <ws://|wss://|tcp://...>] [--key-file <path>] [--lease-secs <n>] [--allow-unauthenticated]\n       spawn node connect --coord <ws://|wss://|tcp://...> --name <name> [--role worker|peer] [--zone <name>] [--key-file <path>] [--udp-stun <host:port>] [--register-to <primary>] [--register-store] [--note <text>] [--allow-unauthenticated]";
+pub(crate) const USAGE: &str = "usage: spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]> [--note <text>]   (owner only)\n       spawn node add <name> --tcp <[tcp://]host:port>|--udp <[udp://]host:port>|--ssh <dest> [--via <hop>[,<hop>...]] [--mode direct|relay|hole_punch] [--note <text>]\n       spawn node list [--json]\n       spawn node drain|undrain|remove <name>   (owner only)\n       spawn node enroll-token <name> [--cell <cell>] [--primary-pubkey <base64url> | --primary-pubkey-file <path>]   (owner only; spawn-node v1)\n       spawn node revoke <name>   (owner only; spawn-node v1)\n       spawn node serve --listen <tcp://bind|udp://bind>[,...] | --tcp <bind> | --udp <bind> [--register-store] [--allow-loopback-forward] [--allow-unauthenticated]\n       spawn node register --to <[tcp://|udp://]host:port> --name <name> --listen <tcp://host:port|udp://host:port> [--via <hop>[=<endpoint>][,...]] [--mode direct|relay|hole_punch] [--note <text>]\n       spawn node add <name> --coord <ws://|wss://|tcp://...> --node-id <hex>|--peer <name> [--mode relay|hole_punch] [--note <text>]\n       spawn node probe <name> [--op inventory|beat] [--json]\n       spawn node coord --ws <bind>|--tcp <bind> [--udp <bind>] [--zone <name>] [--parent <ws://|wss://|tcp://...>] [--key-file <path>] [--lease-secs <n>] [--allow-unauthenticated]\n       spawn node connect --coord <ws://|wss://|tcp://...> --name <name> [--role worker|peer] [--zone <name>] [--key-file <path>] [--udp-stun <host:port>] [--register-to <primary>] [--register-store] [--note <text>] [--allow-unauthenticated]";
 
 /// One line of text from a node, kept only when printable, and short.
 fn clean_text(text: &str) -> Option<String> {
@@ -719,33 +720,25 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
         "coord" => commands::coord(words),
         "connect" => commands::connect(words),
         "probe" => commands::probe(words),
-        "list" => {
-            let json = match words {
-                [] => false,
-                [flag] if flag == "--json" => true,
-                _ => return Err(USAGE.to_string()),
-            };
-            let mut nodes = open_store()?.nodes().map_err(|error| error.to_string())?;
-            power::with_soft_drain(&mut nodes, power::low_battery_from_env());
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&nodes).unwrap_or_default()
-                );
-            } else {
-                for line in lines(&nodes, now_ms()) {
-                    println!("{line}");
-                }
-            }
-            Ok(0)
-        }
+        // spawn-node v1 (nodes/v1.rs): its own two verbs, and `list`,
+        // `drain` and `undrain` over both kinds of node.
+        "enroll-token" => v1::enroll_token_command(words),
+        "revoke" => v1::revoke_command(words),
+        "list" => v1::list_command(words),
         "drain" | "undrain" | "remove" => {
             let (name, more) = name_word(words)?;
             if let Some(word) = more.first() {
                 return Err(format!("unexpected argument {word}\n{USAGE}"));
             }
+            let store = open_store()?;
+            if verb != "remove"
+                && let Some(line) = v1::drain(&store, name, verb == "drain")?
+            {
+                println!("{line}");
+                return Ok(0);
+            }
             let kind = format!("node.{verb}{}", if verb == "remove" { "d" } else { "ed" });
-            let event = open_store()?
+            let event = store
                 .node_record(&json!({"type": kind, "name": name}))
                 .map_err(|error| error.to_string())?;
             println!("node {name}: {kind} (event {event})");

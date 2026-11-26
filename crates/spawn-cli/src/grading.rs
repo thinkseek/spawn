@@ -1092,7 +1092,7 @@ mod tests {
         let record = classification_record(&classified, &decision);
         assert_eq!(record["difficulty"], json!("l3"));
         assert_eq!(record["routed_at"], json!("l2"));
-        assert_eq!(record["rules"], json!("brief-v1"));
+        assert_eq!(record["rules"], json!("brief-v2"));
         assert!(
             record["rationale"]
                 .as_str()
@@ -1769,7 +1769,7 @@ mod database_tests {
         assert_eq!(record["difficulty"], json!("l3"));
         assert_eq!(record["preset_id"], json!("strong"));
         assert_eq!(record["classification"]["difficulty"], json!("l3"));
-        assert_eq!(record["classification"]["rules"], json!("brief-v1"));
+        assert_eq!(record["classification"]["rules"], json!("brief-v2"));
         assert!(
             record["classification"]["rationale"]
                 .as_str()

@@ -22,9 +22,12 @@
 #       40 s, and 20 s after its bound no message_not_taken alert was ever
 #       fired for it.
 #   (2) notify: input B appears only inside a notification that quotes its
-#       marker; it is not taken, and its alert opens within 40 s (the rule
-#       is still the marker, as Spawn typed it, and the engine's own text
-#       takes nothing).
+#       marker; it is never taken (the marker, as Spawn typed it, stays the
+#       taken signal, and the engine's own text takes nothing). The
+#       notification and its turn move the transcript after B's typing,
+#       recorded before B's bound, so since PR #88 (ace244ad0, issue #66
+#       Part 1) its message_not_taken never fires: past the bound B reads
+#       not taken (taken 0, not_taken) with no alert ever fired.
 # Exit: 0 pass, 1 a check failed, 2 harness.
 #
 # Fails with 1 on live main a599100c: in (1) A is never taken and its alert
@@ -492,6 +495,14 @@ fired_count() { # <command id>: message_not_taken alerts ever fired for it, from
 given() { # <what logged>: how many inputs the engine wrote that way
     awk -v a="$(get busy agent)" -v w="$1" '$2 == a && $3 == w' "$WORK/engine.log" | wc -l | tr -d ' '
 }
+moved() { # <command id>: transcript events of its session recorded after its typing
+    q "select count(*) from spawn_events e,
+         (select min(t.id) as id, min(t.recorded_at_ms) as at from spawn_events t
+           where t.session_id = '$(get busy session)' and t.source = 'bridge'
+             and t.source_event_id = 'cmd_$1:typed') typing
+        where e.session_id = '$(get busy session)' and e.source = 'claude'
+          and (e.recorded_at_ms > typing.at or (e.recorded_at_ms = typing.at and e.id > typing.id))"
+}
 
 # --- (1) an input given mid-turn is taken -------------------------------------------
 
@@ -515,9 +526,11 @@ note "(1) an input given mid-turn was taken, and no alert fired"
 
 # --- (2) a marker quoted in the engine's own notification takes nothing ---------------
 
+# A's turn end is recorded too: what moves after B's typing is B's own.
 deadline=$(($(date +%s) + 30))
-until idle busy; do
-    [ "$(date +%s)" -lt "$deadline" ] || harness "(2) the engine did not end A's turn within 30 s"
+until idle busy &&
+    [ "$(q "select count(*) from spawn_events where session_id = '$(get busy session)' and source = 'claude' and event_name = 'turn.stopped'")" -ge "$(given turn-ended)" ]; do
+    [ "$(date +%s)" -lt "$deadline" ] || harness "(2) the engine did not end A's turn, recorded, within 30 s"
     sleep 0.2
 done
 printf 'notify\n' >"$WORK/ctl/$(get busy agent).mode"
@@ -528,14 +541,28 @@ until [ "$(given prompt-notify)" -gt "$before" ]; do
     [ "$(date +%s)" -lt "$deadline" ] || harness "(2) the engine did not write B inside a notification within 30 s"
     sleep 0.2
 done
-deadline=$(($(date +%s) + 40))
-until [ "$(alerts "$b_id" | tr '\n' ' ')" = "open " ] || [ "$(date +%s)" -ge "$deadline" ]; do sleep 0.5; done
+# The notification line is recorded: a transcript event of the session after
+# B's typing (read_since_typed's own count, spawn-postgres alerts.rs).
+deadline=$(($(date +%s) + 30))
+until [ "$(moved "$b_id")" -ge 1 ]; do
+    [ "$(date +%s)" -lt "$deadline" ] || harness "(2) no transcript line after B's typing was recorded within 30 s"
+    sleep 0.2
+done
 commands busy
 [ "$(m busy "$b_id" '.message.taken')" = 0 ] ||
     fail "(2) input B, seen only quoted in a job's notification, reads taken: $(m busy "$b_id" '.message | tostring')"
-[ "$(alerts "$b_id" | tr '\n' ' ')" = "open " ] ||
-    fail "(2) input B, never given as Spawn typed it, has alerts [$(alerts "$b_id" | tr '\n' ' ')], not one open within 40 s"
-note "(2) a marker quoted in a notification took nothing; B's alert is open"
+[ "$(m busy "$b_id" '.message.not_taken')" = false ] ||
+    harness "(2) B was already past its bound when its transcript moved (load?): $(m busy "$b_id" '.message | tostring')"
+# Its bound (12 s) passes: still not taken, and never an alert.
+until_message busy "$b_id" '.not_taken == true' 40 ||
+    harness "(2) input B did not reach its bound within 40 s: $(m busy "$b_id" '.message | tostring')"
+sleep 5
+commands busy
+[ "$(m busy "$b_id" '.message.taken')" = 0 ] ||
+    fail "(2) input B, seen only quoted in a job's notification, reads taken past its bound: $(m busy "$b_id" '.message | tostring')"
+[ "$(fired_count "$b_id")" = 0 ] && [ -z "$(alerts "$b_id")" ] ||
+    fail "(2) input B's transcript moved after its typing, yet message_not_taken fired $(fired_count "$b_id") time(s); alerts [$(alerts "$b_id" | tr '\n' ' ')]; none (PR #88)"
+note "(2) a marker quoted in a notification took nothing; its transcript moved, so no alert fired"
 
 echo "214: an input given mid-turn is taken; the engine's own text takes nothing"
 exit 0

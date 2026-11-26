@@ -200,7 +200,7 @@ must not see `evals/`: see `evals/onboarding/README.md`.
 Every phase-1 call, record, answer and test is unchanged: each addition is
 named only when it says something.
 
-### Difficulty classifier (`classify_difficulty`, rules `brief-v1`)
+### Difficulty classifier (`classify_difficulty`, rules `brief-v2`)
 
 An unflagged ephemeral `spawn task assign` (no `--difficulty`, `--preset`
 or `--model`; never a resident) with a non-empty catalog has its
@@ -218,7 +218,27 @@ and deterministic, and every rule that matched is kept as evidence:
 | `file_scope` | +1/+2 | 3 (6) or more distinct paths |
 | `crate_scope` | +1/+2 | 2 (3) or more distinct crates |
 | `long_brief` | +1 | above 2000 characters |
-| `low_risk` | -2 | typo, spelling, wording, readme, docstring, formatting, one-line, "docs only" (only when no risk rule matched and no broadening word is there: every, whatever, caller*, implement*, support*, feature*). Generic words such as comment, rename and bump are deliberately not markers: "add comment support", "rename X and update every caller" and "bump tokio and fix whatever breaks" are real work |
+| `low_risk` | -2 | mechanical, repetitive or tagging work only: typo\*, spelling\*, formatting\*, whitespace\*, rustfmt\*, mechanical\*, repetitive\*, "cargo fmt", "registry entry" anywhere; `tag` or `label` only as the brief's first word followed by a determiner (the, a, an, all, its, their, our, this, these: "Tag the open tasks", never "Tag matching is ..." or "Tag release v1.2"), `bulk-*` only as its first word ("Bulk-label ...", never "Tags ..." or "Bulk import ..."); regenerat\* only when its object, past a determiner, is a generated artifact (fixture\*, snapshot\*, lockfile\*, golden\*, generated\*). Only when no risk rule matched and no broadening word is there: widening (every\*, whatever\*, caller\*, implement\*, support\*, feature\*), authoring (writ\*, rewrit\*, draft\*, document\*, explain\*, explan\*, describ\*, summar\*, clarif\*, reword\*, rephras\*, comment\*), code to build (filter\*, render\*, pars\*, endpoint\*, api\*, display\*), or a defect, performance or behaviour (bug\*, crash\*, debug\*, hang\*, cause\*, speed\*, optimi\*, perf\*, slow\*, retry\*, validat\*, dedup\*, automat\*, handl\*, fail\*, lost\*, lose\*, wrong\*, missing\*, vanish\*, broke\*, corrupt\*). Every keyword here is a prefix (`*`). Generic words such as comment, rename and bump are deliberately not markers: "add comment support", "rename X and update every caller" and "bump tokio and fix whatever breaks" are real work |
+
+L1 means deterministic, repetitive or tagging work, never semantic
+writing. `brief-v2` (replacing `brief-v1`) dropped `wording`, `readme`,
+`docstring`, `one-line` and "docs only" / "doc only" from `low_risk`: a
+README section, a docstring or wording is authored, and a one-line change
+says nothing about determinism. A typo or spelling fix stays a mechanical
+fix wherever it sits ("Fix the typo in README.md" is `l1`), while "Update
+the README wording for the install section" and "Write the docstring for
+X" are `l2`; "Tag the 40 open tasks with their capability" and "Add the
+registry entry for the new file" are `l1`; "Implement label support" or
+"Add tag filtering to the task list" are `l2`. A tagging word that is
+not the brief's opening imperative names a thing the work is about, not
+the work: "Fix the crash in tag matching", "Speed up the bulk insert
+path", "Labels vanish after a restart", "Tag colour is too dark in the
+sidebar", "Bulk import fails on empty rows"
+and "Fix the scheduler" followed by a line "Tag the release afterwards"
+are `l2`. "Regenerate the fixtures" is `l1`; "Regenerate the session
+token and update the snapshot test" is `l2`. The rule keeps its name
+`low_risk`, so recorded signals read the same, and records written under
+`brief-v1` stay readable: nothing rejects a rules name it does not know.
 
 Keywords are read per word and per path segment (`sql/schema.sql` names
 the schema). The score is `l3` from 4; `l1` at -2 or below with no risk
@@ -357,9 +377,10 @@ the API now tell apart as many profiles as presets name.
   reads `/api/grading`. This change does not close issue #99 on its own.
 - The classifier reads only the brief's words and structure. A low-risk
   marker in a brief that names consequential work still reads `l1`: for
-  example, "One-line fix: make the dispatcher retry forever" classifies
-  `l1` on `one-line`. Name `--difficulty` when the wording understates
-  the change.
+  example, "Run cargo fmt and delete the old dispatcher" classifies `l1`
+  on "cargo fmt". (Under `brief-v1`, "One-line fix: make the dispatcher
+  retry forever" read `l1` on `one-line`; under `brief-v2` it is `l2`.)
+  Name `--difficulty` when the wording understates the change.
 - A malformed `SPAWN_GRADING_REPROBE_SECS` is warned about once per
   process (on stderr), and the default is used. It does not
   read the code a task will touch.

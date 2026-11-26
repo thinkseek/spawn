@@ -26,6 +26,21 @@
 //! two verdicts only when every `inputs` field is equal (`unequal` empty):
 //! two verdicts on different inputs are no comparison.
 //!
+//! A second source, beside the runner and independent of it (both may run
+//! at once, each recording its own `task.shadow_gated`): with
+//! `SPAWN_GATE_SHADOW_NODE=1` ([`NODE_ENV`]) the same verdicts, every N-th
+//! of them by the same `SPAWN_GATE_SHADOW_EVERY`, are queued as
+//! `gate_shadow` jobs for spawn-node v1 ([`NodeShadows`], design §12.4 M2):
+//! the artifacts are written for the gateway and the job is queued
+//! ([`super::remote`]); each pass looks at the jobs in flight, takes back
+//! one no node leased within `SPAWN_REMOTE_QUEUE_WAIT_SECS`, and reads a
+//! node's stored result into the very record a runner's end makes
+//! ([`node_record_of`]: `runner` is `node:<name>`, `inputs` what the node
+//! says it judged). A node's fault is judged on the ledger
+//! ([`super::remote::settle`]: strikes, exclusion, re-queue), never on a
+//! task. Nothing waits for it: the primary's verdict was recorded before
+//! it was offered.
+//!
 //! Like the base warm ([`super::warm`]) it cannot outlive the integrator
 //! unaccounted for: started from the main thread under `setpriv --pdeathsig
 //! TERM`, in its own process group in the integrator's tree, its pid and
@@ -42,7 +57,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use spawn_node_proto::grant::ArtifactRole;
+use spawn_postgres::PostgresStore;
+
 use super::inputs;
+use super::remote;
 use super::warm::{exited_unreaped, setpriv_available, signal_group, start_ticks};
 
 /// The runner's name for the transport; unset or empty: no shadow.
@@ -50,6 +69,18 @@ pub(super) const RUNNER_ENV: &str = "SPAWN_GATE_SHADOW_RUNNER";
 
 /// Shadow every N-th verdict (a whole number from 1; default 1).
 pub(super) const EVERY_ENV: &str = "SPAWN_GATE_SHADOW_EVERY";
+
+/// `1`: shadow on spawn-node v1 too ([`NodeShadows`]); unset, empty or
+/// `0`: not.
+pub(super) const NODE_ENV: &str = "SPAWN_GATE_SHADOW_NODE";
+
+/// Node shadows in flight at most: a verdict offered beyond is skipped,
+/// never queued.
+const NODE_IN_FLIGHT: usize = 4;
+
+/// How long the registry's manifest is reused before it is read again (it
+/// hashes the whole cargo registry).
+const REGISTRY_EVERY: Duration = Duration::from_hours(1);
 
 /// The shadow's pid file, in the shadow directory.
 pub(super) const PID_FILE: &str = "shadow.pid";
@@ -80,17 +111,67 @@ pub(super) fn settings(
     let Some(runner) = runner.map(str::trim).filter(|runner| !runner.is_empty()) else {
         return Ok(None);
     };
-    let every = match every.map(str::trim).filter(|every| !every.is_empty()) {
-        None => 1,
+    Ok(Some(Settings {
+        runner: runner.to_string(),
+        every: every_of(every)?,
+    }))
+}
+
+/// [`EVERY_ENV`]'s text: unset or empty is 1.
+fn every_of(every: Option<&str>) -> Result<u64, String> {
+    match every.map(str::trim).filter(|every| !every.is_empty()) {
+        None => Ok(1),
         Some(text) => text
             .parse::<u64>()
             .ok()
             .filter(|every| *every >= 1)
-            .ok_or_else(|| format!("{EVERY_ENV} is a whole number from 1, not {text:?}"))?,
+            .ok_or_else(|| format!("{EVERY_ENV} is a whole number from 1, not {text:?}")),
+    }
+}
+
+/// How the node source shadows: how often, the directories it shares with
+/// the gateway, the cargo home whose registry nodes must hold, and how
+/// long a job waits for a lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct NodeSettings {
+    pub(super) every: u64,
+    pub(super) artifacts: PathBuf,
+    pub(super) results: PathBuf,
+    pub(super) cargo_home: PathBuf,
+    pub(super) queue_wait: Duration,
+}
+
+/// The node source's settings from the environment (`lookup`): None unless
+/// [`NODE_ENV`] is `1`; an error for another value, an EVERY that is not a
+/// whole number from 1, or no artifact or results directory.
+pub(super) fn node_settings(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<NodeSettings>, String> {
+    match lookup(NODE_ENV).as_deref().map(str::trim) {
+        None | Some("" | "0") => return Ok(None),
+        Some("1") => {}
+        Some(other) => return Err(format!("{NODE_ENV} is 1 or 0, not {other:?}")),
+    }
+    let every = every_of(lookup(EVERY_ENV).as_deref())?;
+    let directory = |name: &str| -> Result<PathBuf, String> {
+        lookup(name)
+            .map(|text| PathBuf::from(text.trim()))
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| format!("{NODE_ENV}=1 needs {name}, an absolute directory"))
     };
-    Ok(Some(Settings {
-        runner: runner.to_string(),
+    let artifacts = directory(remote::ARTIFACTS_ENV)?;
+    let results = directory(remote::RESULTS_ENV)?;
+    let cargo_home = lookup("CARGO_HOME")
+        .filter(|text| !text.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| lookup("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .ok_or_else(|| format!("{NODE_ENV}=1 needs CARGO_HOME or HOME"))?;
+    Ok(Some(NodeSettings {
         every,
+        artifacts,
+        results,
+        cargo_home,
+        queue_wait: remote::queue_wait(lookup(remote::QUEUE_WAIT_ENV).as_deref()),
     }))
 }
 
@@ -107,6 +188,9 @@ pub(super) struct Want {
     /// The gate's repository (its first argument) and the gate directory.
     pub(super) repo: PathBuf,
     pub(super) scenarios: PathBuf,
+    /// The judging that gave the verdict, when one did (a node's job names
+    /// it `judging_id`).
+    pub(super) judging_id: Option<String>,
 }
 
 impl Want {
@@ -129,6 +213,7 @@ impl Want {
             env: record["env"].clone(),
             repo: repo.to_path_buf(),
             scenarios: scenarios.to_path_buf(),
+            judging_id: super::judging::current_id(),
         })
     }
 }
@@ -561,6 +646,41 @@ pub(super) fn record_of(
     let host = placed
         .as_ref()
         .and_then(|placed| placed["host"].as_str().map(str::to_string));
+    shadow_record(
+        want,
+        runner,
+        given,
+        Shadowed {
+            result,
+            verdict,
+            exit,
+            seconds,
+            host,
+            toolchain,
+        },
+    )
+}
+
+/// How a shadow ended, whatever judged it: the record's own fields.
+struct Shadowed {
+    result: Value,
+    verdict: Option<String>,
+    exit: i64,
+    seconds: u64,
+    host: Option<String>,
+    toolchain: Option<String>,
+}
+
+/// The one shape of `task.shadow_gated`, for a runner's end and a node's.
+fn shadow_record(want: &Want, runner: &str, given: &Value, ended: Shadowed) -> Value {
+    let Shadowed {
+        result,
+        verdict,
+        exit,
+        seconds,
+        host,
+        toolchain,
+    } = ended;
     let unequal = inputs::unequal(given, &want.inputs);
     let agrees = match &verdict {
         Some(verdict)
@@ -588,6 +708,477 @@ pub(super) fn record_of(
         "unequal": unequal,
         "agrees": agrees,
     })
+}
+
+/// A shadow queued for a node: the verdict it shadows, its job, the inputs
+/// it was granted, since when it waits for a lease, and when it was queued.
+struct NodeShadow {
+    want: Want,
+    job_id: String,
+    given: Value,
+    since: Instant,
+}
+
+/// The node source's shadows ([`NODE_ENV`]): queued, looked at once a pass,
+/// recorded when a node's result is read.
+pub(super) struct NodeShadows {
+    settings: NodeSettings,
+    /// The gate's environment, of which a grant carries a part
+    /// ([`remote::grant_env`]).
+    gate_env: Vec<(String, String)>,
+    artifacts: remote::Artifacts,
+    /// Snapshots of gate directories, while their pack is made.
+    work: PathBuf,
+    offered: u64,
+    jobs: Vec<NodeShadow>,
+    registry: Option<(Instant, remote::RegistryManifest)>,
+    /// Records that could not be written yet, tried again each pass.
+    unrecorded: Vec<Value>,
+}
+
+impl NodeShadows {
+    pub(super) fn new(
+        settings: NodeSettings,
+        gate_env: Vec<(String, String)>,
+        work: PathBuf,
+    ) -> Self {
+        let artifacts = remote::Artifacts::new(settings.artifacts.clone());
+        Self {
+            settings,
+            gate_env,
+            artifacts,
+            work,
+            offered: 0,
+            jobs: Vec::new(),
+            registry: None,
+            unrecorded: Vec::new(),
+        }
+    }
+
+    /// A verdict to shadow on a node: queued now, unless this is not an
+    /// N-th verdict or [`NODE_IN_FLIGHT`] shadows wait already (skipped,
+    /// never queued later).
+    pub(super) fn offer(&mut self, store: &PostgresStore, want: Want) {
+        self.offered += 1;
+        let task = want.task;
+        if !self.offered.is_multiple_of(self.settings.every) {
+            println!(
+                "integrate: task {task}: verdict not shadowed on a node (every {}-th is)",
+                self.settings.every
+            );
+            return;
+        }
+        if self.jobs.len() >= NODE_IN_FLIGHT {
+            println!(
+                "integrate: task {task}: verdict not shadowed on a node: {NODE_IN_FLIGHT} \
+                 node shadows wait already"
+            );
+            return;
+        }
+        match self.enqueue(store, &want) {
+            Ok((job_id, given)) => {
+                println!("integrate: task {task}: shadow queued for a node as {job_id}");
+                self.jobs.push(NodeShadow {
+                    want,
+                    job_id,
+                    given,
+                    since: Instant::now(),
+                });
+            }
+            Err(error) => {
+                println!("integrate: task {task}: verdict not shadowed on a node: {error}");
+            }
+        }
+    }
+
+    /// The registry's manifest, read again after [`REGISTRY_EVERY`].
+    fn registry(&mut self) -> Result<remote::RegistryManifest, String> {
+        if let Some((read, manifest)) = &self.registry
+            && read.elapsed() < REGISTRY_EVERY
+        {
+            return Ok(manifest.clone());
+        }
+        let manifest = self
+            .artifacts
+            .registry_manifest(&self.settings.cargo_home)?;
+        self.registry = Some((Instant::now(), manifest.clone()));
+        Ok(manifest)
+    }
+
+    /// What a node must hold for a gate of `controller`: the registry, the
+    /// gate's PostgreSQL, the web lockfile (published for the node to fetch
+    /// by its digest) and the toolchain, when the controller names them.
+    fn requires_of(
+        &self,
+        controller: &Path,
+        registry: String,
+    ) -> Result<std::collections::BTreeMap<String, String>, String> {
+        let mut requires = std::collections::BTreeMap::from([
+            ("registry".to_string(), registry),
+            ("pg".to_string(), remote::PG_MAJOR.to_string()),
+        ]);
+        if let Some(lock) = remote::web_lock(controller) {
+            // The node installs its web dependencies from this lockfile,
+            // fetched by the digest it requires.
+            let published = self
+                .artifacts
+                .put_copy(&controller.join("web/package-lock.json"))?;
+            if published.digest.hex != lock {
+                return Err("web/package-lock.json changed while it was published".to_string());
+            }
+            requires.insert("web_lock".to_string(), lock);
+        }
+        if let Some(channel) = remote::toolchain_channel(controller) {
+            requires.insert("toolchain".to_string(), channel);
+        }
+        Ok(requires)
+    }
+
+    /// Write the job's artifacts and queue it: its id and the inputs it
+    /// was granted.
+    fn enqueue(&mut self, store: &PostgresStore, want: &Want) -> Result<(String, Value), String> {
+        let controller = inputs::controller_of(&want.scenarios)
+            .ok_or_else(|| format!("{} has no controller above it", want.scenarios.display()))?;
+        let controller_commit = inputs::controller_commit(&controller).ok_or_else(|| {
+            format!(
+                "{} names no controller commit: a node could not say what it judged",
+                controller.join(".controller").display()
+            )
+        })?;
+        let scenarios_at = want
+            .scenarios
+            .strip_prefix(&controller)
+            .map_err(|_| format!("{} is not inside its controller", want.scenarios.display()))?
+            .to_path_buf();
+        let base = want.inputs["base"].as_str().unwrap_or_default();
+        let candidate = want.inputs["candidate"].as_str().unwrap_or_default();
+        let registry = self.registry()?;
+        // The set, a snapshot read once: what the pack holds is this copy.
+        std::fs::create_dir_all(&self.work)
+            .map_err(|error| format!("{}: {error}", self.work.display()))?;
+        let snapshot = self.work.join(format!(
+            "{}-{}-{}",
+            want.task,
+            std::process::id(),
+            self.offered
+        ));
+        remove_tree(&snapshot);
+        let copied = Command::new("cp")
+            .arg("-R")
+            .arg("--")
+            .arg(&want.scenarios)
+            .arg(&snapshot)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| format!("cannot run cp: {error}"))?;
+        if !copied.status.success() {
+            remove_tree(&snapshot);
+            return Err(format!(
+                "cannot copy {}: {}",
+                want.scenarios.display(),
+                String::from_utf8_lossy(&copied.stderr).trim()
+            ));
+        }
+        let scenarios_sha256 = inputs::scenarios_sha256(&snapshot);
+        let pack = self.artifacts.controller_pack(
+            &controller,
+            &snapshot,
+            &scenarios_at,
+            scenarios_sha256
+                .as_deref()
+                .map(|digest| format!("{controller_commit}-{digest}"))
+                .as_deref(),
+        );
+        remove_tree(&snapshot);
+        let pack = pack?;
+        let delta = self.artifacts.delta_bundle(&want.repo, base, candidate)?;
+        let baseline = self.artifacts.baseline_bundle(&want.repo, base)?;
+        let given = json!({
+            "base": base,
+            "candidate": candidate,
+            "controller": controller_commit,
+            "scenarios_sha256": scenarios_sha256,
+            "scenario": null,
+        });
+        let requires = self.requires_of(&controller, registry.registry)?;
+        let repo = want
+            .repo
+            .file_name()
+            .map(|name| name.to_string_lossy().trim_end_matches(".git").to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "repo".to_string());
+        let job = remote::GateJob {
+            kind: spawn_postgres::RemoteJobKind::GateShadow,
+            job_id: remote::job_id("gs", candidate),
+            judging_id: want.judging_id.clone(),
+            task_id: Some(want.task),
+            repo,
+            inputs: given.clone(),
+            env: remote::grant_env(&self.gate_env),
+            artifacts: vec![
+                delta.url(ArtifactRole::DeltaBundle),
+                baseline.url(ArtifactRole::BaselineBundle),
+                pack.url(ArtifactRole::ControllerPack),
+            ],
+            requires,
+        };
+        let job_id = remote::enqueue(store, &job)?;
+        Ok((job_id, given))
+    }
+
+    /// Each pass: the jobs in flight looked at once. One no node leased in
+    /// time is taken back (nothing recorded); a node's result is read,
+    /// judged on the ledger (a fault re-queued waits again) and recorded
+    /// with `write`, once (a record that could not be written is tried
+    /// again at the next pass).
+    pub(super) fn poll(
+        &mut self,
+        store: &PostgresStore,
+        write: &dyn Fn(&Value) -> Result<(), String>,
+    ) {
+        self.unrecorded.retain(|record| write(record).is_err());
+        self.reclaim_orphans(store);
+        let wait = self.settings.queue_wait;
+        let mut kept = Vec::new();
+        for mut job in std::mem::take(&mut self.jobs) {
+            let task = job.want.task;
+            match remote::step(store, &job.job_id, job.since, wait) {
+                Ok(remote::Waited::Queued) => kept.push(job),
+                // Its wait starts again from here: a lease fenced back to
+                // the queue gets a whole wait, not an immediate take-back.
+                Ok(remote::Waited::Leased(_)) => {
+                    job.since = Instant::now();
+                    kept.push(job);
+                }
+                Ok(remote::Waited::TakenLocal) => println!(
+                    "integrate: task {task}'s node shadow {}: no node leased it within {} s; \
+                     nothing recorded",
+                    job.job_id,
+                    wait.as_secs()
+                ),
+                Ok(remote::Waited::Ended(state)) => println!(
+                    "integrate: task {task}'s node shadow {} ended {state:?}; nothing recorded",
+                    job.job_id
+                ),
+                Ok(remote::Waited::Completed(row)) => match self.completed(store, &job, &row) {
+                    Completion::Requeued => {
+                        job.since = Instant::now();
+                        kept.push(job);
+                    }
+                    Completion::Record(record) => {
+                        if let Err(error) = write(&record) {
+                            eprintln!(
+                                "integrate: task {task}'s node shadow record: {error}; \
+                                     tried again at the next pass"
+                            );
+                            self.unrecorded.push(record);
+                        }
+                    }
+                    Completion::Nothing => {}
+                },
+                Err(error) => {
+                    eprintln!(
+                        "integrate: task {task}'s node shadow {}: {error}; looked at again",
+                        job.job_id
+                    );
+                    kept.push(job);
+                }
+            }
+        }
+        self.jobs = kept;
+    }
+
+    /// Take back every queued shadow this integrator does not wait for (a
+    /// predecessor's, left by a restart): nobody would read its result, and
+    /// it would hold a node's slot and its `need_sync` on a registry that
+    /// may be gone. A node that won the race keeps it.
+    fn reclaim_orphans(&self, store: &PostgresStore) {
+        let queued = match store.remote_jobs_queued(spawn_postgres::RemoteJobKind::GateShadow) {
+            Ok(queued) => queued,
+            Err(error) => {
+                eprintln!("integrate: the queued node shadows not read: {error}");
+                return;
+            }
+        };
+        for orphan in queued
+            .iter()
+            .filter(|job| !self.jobs.iter().any(|mine| mine.job_id == job.job_id))
+        {
+            match store.remote_job_take_local(&orphan.job_id, orphan.lease_epoch) {
+                Ok(true) => println!(
+                    "integrate: node shadow {} (task {:?}) queued by an earlier integrator: \
+                     taken back",
+                    orphan.job_id, orphan.task_id
+                ),
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "integrate: node shadow {} not taken back: {error}",
+                    orphan.job_id
+                ),
+            }
+        }
+    }
+
+    /// A completed job: its stored result judged (§6.2) and settled on the
+    /// ledger; its record, unless the job went to another node.
+    fn completed(
+        &self,
+        store: &PostgresStore,
+        job: &NodeShadow,
+        row: &spawn_postgres::RemoteJob,
+    ) -> Completion {
+        let task = job.want.task;
+        let stored = match remote::read_stored(&self.settings.results, &row.job_id, row.lease_epoch)
+        {
+            Ok(stored) => stored,
+            Err(error) => {
+                println!(
+                    "integrate: task {task}'s node shadow {}: its result cannot be read: \
+                     {error}; nothing recorded",
+                    row.job_id
+                );
+                let unread = remote::Judged::unreadable(error);
+                if let Err(error) = remote::settle(store, row, &unread) {
+                    eprintln!(
+                        "integrate: task {task}'s node shadow {}: {error}",
+                        row.job_id
+                    );
+                }
+                return Completion::Nothing;
+            }
+        };
+        let judged = remote::judge_stored(&stored, &job.given);
+        let settled = remote::settle(store, row, &judged);
+        let requeued = matches!(
+            &settled,
+            Ok(Some(outcome)) if outcome.ok && outcome.next == Some(spawn_postgres::FaultNext::Queued)
+        );
+        match &settled {
+            Ok(Some(outcome)) => println!(
+                "integrate: task {task}'s node shadow {}: {} ({}): strike {}, next {:?}{}",
+                row.job_id,
+                judged.evidence,
+                judged.reason,
+                judged.strike,
+                outcome.next,
+                if outcome.poison == Some(true) {
+                    ", the job is the poison"
+                } else {
+                    ""
+                }
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "integrate: task {task}'s node shadow {}: its fault not judged: {error}",
+                row.job_id
+            ),
+        }
+        if requeued {
+            return Completion::Requeued;
+        }
+        if judged.evidence == "self_fenced" {
+            return Completion::Nothing;
+        }
+        let runner = format!("node:{}", node_name(store, row, &stored));
+        Completion::Record(node_record_of(&job.want, &runner, &stored, &judged))
+    }
+
+    /// The node shadows in flight's jobs, for tests.
+    #[cfg(test)]
+    pub(super) fn waiting(&self) -> Vec<String> {
+        self.jobs.iter().map(|job| job.job_id.clone()).collect()
+    }
+}
+
+/// What a completed node shadow leaves.
+enum Completion {
+    /// Its record.
+    Record(Value),
+    /// Back in the queue for another node: waited for again.
+    Requeued,
+    /// Nothing (a self-fenced run, a result that cannot be read).
+    Nothing,
+}
+
+/// The name of the node that ran `row`: the ledger's, else what the node
+/// said, else its id's first 12 digits.
+fn node_name(
+    store: &PostgresStore,
+    row: &spawn_postgres::RemoteJob,
+    stored: &remote::Stored,
+) -> String {
+    let id = row.node_id.clone().unwrap_or_default();
+    store
+        .nodes_v1()
+        .ok()
+        .and_then(|nodes| {
+            nodes
+                .into_iter()
+                .find(|node| node.node_id.as_deref() == Some(id.as_str()))
+        })
+        .map(|node| node.name)
+        .or_else(|| {
+            stored
+                .meta
+                .env
+                .as_ref()
+                .and_then(|env| env.get("node").cloned())
+        })
+        .unwrap_or_else(|| id.chars().take(12).collect())
+}
+
+/// The `task.shadow_gated` record of a node's stored result for `want`,
+/// judged `judged`, on `runner` (`node:<name>`): the shape a runner's end
+/// has ([`record_of`]); `inputs` what the node says it judged, a verdict
+/// only when the node's gate wrote one, and `agrees` only for a verdict on
+/// the job's own commits with every input equal to the primary's.
+pub(super) fn node_record_of(
+    want: &Want,
+    runner: &str,
+    stored: &remote::Stored,
+    judged: &remote::Judged,
+) -> Value {
+    let meta = &stored.meta;
+    // A node that said no inputs (its fetch failed before it read them):
+    // an empty object, never null, which the record's writer refuses.
+    let given = meta
+        .inputs
+        .as_ref()
+        .and_then(|inputs| serde_json::to_value(inputs).ok())
+        .unwrap_or_else(|| json!({}));
+    let exit = meta.exit_code.unwrap_or_else(|| match &meta.signal {
+        Some(spawn_node_proto::result::Signal::Number(number)) => {
+            128 + i64::try_from(*number).unwrap_or(0)
+        }
+        _ => -1,
+    });
+    let env = |name: &str| meta.env.as_ref().and_then(|env| env.get(name).cloned());
+    let toolchain = env("toolchain").or_else(|| {
+        meta.streams(&stored.log)
+            .ok()
+            .and_then(|(stdout, _)| inputs::toolchain_of(&String::from_utf8_lossy(stdout)))
+    });
+    let believed = judged.verdict.is_some();
+    shadow_record(
+        want,
+        runner,
+        &given,
+        Shadowed {
+            result: if believed {
+                json!("verdict")
+            } else {
+                json!(judged.evidence)
+            },
+            // A verdict on other commits or inputs is no verdict here.
+            verdict: judged.stated.clone().filter(|_| believed),
+            exit,
+            seconds: meta.seconds,
+            host: env("host"),
+            toolchain,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -635,6 +1226,7 @@ mod tests {
             env: json!({"host": "primary", "toolchain": "rustc p", "runner": null}),
             repo: PathBuf::from("/nonexistent/repo.git"),
             scenarios: scenarios.to_path_buf(),
+            judging_id: None,
         }
     }
 
@@ -956,5 +1548,559 @@ mod tests {
             .flatten()
             .collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn the_node_source_is_its_own_switch_and_leaves_the_runners_alone() {
+        let env = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect();
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            }
+        };
+        let dirs = [
+            ("SPAWN_NODE_ARTIFACTS", "/srv/artifacts"),
+            ("SPAWN_NODE_RESULTS", "/srv/results"),
+            ("HOME", "/home/u"),
+        ];
+        assert_eq!(super::node_settings(env(&dirs)).unwrap(), None);
+        for off in ["", "0", " 0 "] {
+            let mut all = dirs.to_vec();
+            all.push((super::NODE_ENV, off));
+            assert_eq!(super::node_settings(env(&all)).unwrap(), None, "{off:?}");
+        }
+        let mut on = dirs.to_vec();
+        on.push((super::NODE_ENV, "1"));
+        on.push((super::EVERY_ENV, "3"));
+        on.push(("SPAWN_REMOTE_QUEUE_WAIT_SECS", "7"));
+        let settings = super::node_settings(env(&on)).unwrap().unwrap();
+        assert_eq!(settings.every, 3);
+        assert_eq!(settings.artifacts, PathBuf::from("/srv/artifacts"));
+        assert_eq!(settings.results, PathBuf::from("/srv/results"));
+        assert_eq!(settings.cargo_home, PathBuf::from("/home/u/.cargo"));
+        assert_eq!(settings.queue_wait, Duration::from_secs(7));
+        let mut cargo = on.clone();
+        cargo.push(("CARGO_HOME", "/opt/cargo"));
+        assert_eq!(
+            super::node_settings(env(&cargo))
+                .unwrap()
+                .unwrap()
+                .cargo_home,
+            PathBuf::from("/opt/cargo")
+        );
+        // Refused: another value, no directories, a relative one, a bad EVERY.
+        assert!(super::node_settings(env(&[(super::NODE_ENV, "yes")])).is_err());
+        assert!(super::node_settings(env(&[(super::NODE_ENV, "1")])).is_err());
+        let mut relative = vec![(super::NODE_ENV, "1"), ("SPAWN_NODE_ARTIFACTS", "a")];
+        relative.push(("SPAWN_NODE_RESULTS", "/r"));
+        assert!(super::node_settings(env(&relative)).is_err());
+        let mut every = on.clone();
+        every.retain(|(key, _)| *key != super::EVERY_ENV);
+        every.push((super::EVERY_ENV, "0"));
+        assert!(super::node_settings(env(&every)).is_err());
+        // The runner's settings read nothing of the node source's.
+        assert_eq!(settings_of(None, Some("3")), None);
+        assert_eq!(settings_of(Some("bb"), Some("3")).unwrap().every, 3);
+    }
+
+    fn settings_of(runner: Option<&str>, every: Option<&str>) -> Option<Settings> {
+        settings(runner, every).unwrap()
+    }
+
+    /// A world for the node source: a controller (with its fake dispatcher
+    /// for the runner), a source with a base and a candidate, a cargo
+    /// home, a results directory and a ledger.
+    struct NodeWorld {
+        dir: Scratch,
+        repo: PathBuf,
+        base: String,
+        candidate: String,
+        scenarios: PathBuf,
+        ctl: PathBuf,
+        primary: Value,
+        ledger: super::super::remote::tests::Ledger,
+    }
+
+    impl NodeWorld {
+        fn new(case: &str) -> Self {
+            use super::super::remote::tests as remote;
+            let dir = Scratch::new(case);
+            let ctl = controller(&dir.0, "accepted");
+            std::fs::create_dir_all(ctl.join("scripts")).unwrap();
+            std::fs::write(ctl.join("scripts/gate.sh"), "exit 0\n").unwrap();
+            std::fs::create_dir_all(ctl.join("web")).unwrap();
+            std::fs::write(
+                ctl.join("web/package-lock.json"),
+                "{\"lockfileVersion\":3}\n",
+            )
+            .unwrap();
+            let scenarios = ctl.join("rsi/scenarios");
+            let (repo, base, candidate) = remote::repository(&dir.0);
+            let cargo_home = dir.0.join("cargo");
+            std::fs::create_dir_all(cargo_home.join("registry/index")).unwrap();
+            std::fs::write(cargo_home.join("registry/index/config.json"), "{}").unwrap();
+            let primary = json!({"base": base, "candidate": candidate, "controller": MARKER,
+                                 "scenarios_sha256": super::inputs::scenarios_sha256(&scenarios),
+                                 "scenario": null});
+            Self {
+                ledger: remote::Ledger::new(&format!("shadow_{}", case.replace('-', "_"))),
+                dir,
+                repo,
+                base,
+                candidate,
+                scenarios,
+                ctl,
+                primary,
+            }
+        }
+
+        fn want(&self, task: i64) -> Want {
+            Want {
+                task,
+                revision: json!(1),
+                verdict: "accepted".to_string(),
+                inputs: self.primary.clone(),
+                env: json!({"host": "primary", "toolchain": "rustc p", "runner": null}),
+                repo: self.repo.clone(),
+                scenarios: self.scenarios.clone(),
+                judging_id: Some(JUDGING.to_string()),
+            }
+        }
+
+        /// A real task (the record's writer refuses one it does not hold).
+        fn task(&self) -> i64 {
+            let source = self.repo.to_string_lossy().to_string();
+            let mission = self
+                .ledger
+                .store
+                .mission_add("gated", &json!([source]), "human")
+                .expect("a mission");
+            self.ledger
+                .store
+                .task_assign(mission, "ephemeral", "worker", "brief", "default")
+                .expect("a task")
+        }
+
+        fn results(&self) -> PathBuf {
+            self.dir.0.join("results")
+        }
+
+        /// The node source of an integrator (a restarted one is another).
+        fn nodes(&self) -> super::NodeShadows {
+            super::NodeShadows::new(
+                super::NodeSettings {
+                    every: 1,
+                    artifacts: self.dir.0.join("artifacts"),
+                    results: self.results(),
+                    cargo_home: self.dir.0.join("cargo"),
+                    queue_wait: Duration::from_mins(1),
+                },
+                vec![
+                    ("PATH".to_string(), "/usr/bin".to_string()),
+                    ("SPAWN_GATE_JOBS".to_string(), "8".to_string()),
+                    (
+                        "SPAWN_TEST_DATABASE_URL".to_string(),
+                        ["postgres", "://", "gate@db.example/t"].concat(),
+                    ),
+                ],
+                self.dir.0.join("node-work"),
+            )
+        }
+
+        fn artifact(&self, digest: &spawn_node_proto::ContentDigest) -> PathBuf {
+            self.dir
+                .0
+                .join("artifacts/sha256")
+                .join(&digest.hex[..2])
+                .join(&digest.hex)
+        }
+
+        /// The inputs a job granted, as a node says it judged them.
+        fn given(row: &spawn_postgres::RemoteJob) -> Value {
+            let mut given = row.spec["inputs"].clone();
+            given.as_object_mut().unwrap().remove("repo");
+            given
+        }
+
+        /// `node` is granted `job_id` and stores a result of `exit`.
+        fn run(&self, node: &str, job_id: &str, exit: i64, verdict: Option<&str>) {
+            use super::super::remote::tests as remote;
+            let grants = self.ledger.beat(node);
+            assert_eq!(grants.len(), 1, "{grants:?}");
+            assert_eq!(grants[0].0, job_id);
+            let row = self.ledger.store.remote_job(job_id).unwrap().unwrap();
+            let (meta, log) = remote::meta(
+                job_id,
+                grants[0].1,
+                Some(exit),
+                verdict,
+                "| base cache: toolchain node-tc\n| gate ok\n",
+                "boom\n",
+                Some(&Self::given(&row)),
+            );
+            self.ledger.complete(&self.results(), node, &meta, &log);
+        }
+    }
+
+    const MARKER: &str = "0123456789abcdef0123456789abcdef01234567";
+    const JUDGING: &str = "0123456789ab0123456789abcdef";
+
+    /// What a records writer was given.
+    struct Written(std::cell::RefCell<Vec<Value>>);
+    impl Written {
+        fn new() -> Self {
+            Self(std::cell::RefCell::new(Vec::new()))
+        }
+        fn write(&self, record: &Value) {
+            self.0.borrow_mut().push(record.clone());
+        }
+        fn all(&self) -> Vec<Value> {
+            self.0.borrow().clone()
+        }
+    }
+
+    /// The job a node source queued: its row, and every artifact it names
+    /// written where the gateway serves it, the web lockfile included.
+    fn queued_and_published(world: &NodeWorld, job_id: &str) -> spawn_postgres::RemoteJob {
+        let row = world.ledger.store.remote_job(job_id).unwrap().unwrap();
+        assert_eq!(row.kind, spawn_postgres::RemoteJobKind::GateShadow);
+        assert_eq!(row.judging_id.as_deref(), Some(JUDGING));
+        assert_eq!(row.base_commit.as_deref(), Some(world.base.as_str()));
+        // The grant's environment: no node-owned variable, no database.
+        assert_eq!(row.spec["env"]["SPAWN_GATE_JOBS"], "8");
+        assert!(row.spec["env"].get("PATH").is_none());
+        assert!(row.spec["env"].get("SPAWN_TEST_DATABASE_URL").is_none());
+        assert_eq!(row.spec["inputs"]["controller"], MARKER);
+        assert_eq!(row.spec["inputs"]["repo"], "source");
+        // The grant's own `requires`, the row's too.
+        assert_eq!(row.spec["requires"], row.requires);
+        let roles: Vec<&str> = row.spec["artifact_urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|url| url["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            ["delta_bundle", "baseline_bundle", "controller_pack"]
+        );
+        for url in row.spec["artifact_urls"].as_array().unwrap() {
+            let digest =
+                spawn_node_proto::ContentDigest::parse(url["digest"].as_str().unwrap()).unwrap();
+            digest
+                .verify(&std::fs::read(world.artifact(&digest)).unwrap())
+                .unwrap();
+        }
+        assert!(
+            world
+                .dir
+                .0
+                .join("artifacts/registry-manifest.json")
+                .is_file()
+        );
+        assert_eq!(row.requires["pg"], "16");
+        assert_eq!(row.requires["registry"].as_str().unwrap().len(), 64);
+        assert_eq!(row.requires["toolchain"], json!(null));
+        // The lockfile the node installs from, fetchable by its digest.
+        let lock = row.requires["web_lock"].as_str().expect("a web_lock");
+        let digest = spawn_node_proto::ContentDigest::parse(&format!("sha256:{lock}")).unwrap();
+        assert_eq!(
+            std::fs::read(world.artifact(&digest)).unwrap(),
+            std::fs::read(world.ctl.join("web/package-lock.json")).unwrap()
+        );
+        row
+    }
+
+    /// M2 on both sources at once: one verdict offered to the runner (its
+    /// fake dispatcher) and to the node source; the node source writes the
+    /// artifacts, queues a `gate_shadow` job a node holding what it
+    /// requires is granted, reads the node's stored result, and records the
+    /// same `task.shadow_gated` the runner does (`runner` `node:<name>`).
+    #[test]
+    fn the_node_source_records_what_the_runner_records_beside_it() {
+        let world = NodeWorld::new("node-source");
+        let mut nodes = world.nodes();
+        let mut runner = Shadows::new(
+            Settings {
+                runner: "bb".into(),
+                every: 1,
+            },
+            world.dir.0.join("shadow"),
+        );
+        let task = world.task();
+        runner.offer(world.want(task));
+        nodes.offer(&world.ledger.store, world.want(task));
+        let waiting = nodes.waiting();
+        assert_eq!(waiting.len(), 1);
+        let row = queued_and_published(&world, &waiting[0]);
+        assert_eq!(row.task_id, Some(task));
+        let node = world.ledger.enroll("n252", 9, &row.requires);
+        let verdict =
+            super::super::remote::tests::verdict_on("accepted", &world.base, &world.candidate);
+        world.run(&node, &row.job_id, 0, Some(&verdict));
+        let written = Written::new();
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
+        assert!(nodes.waiting().is_empty());
+        let records = written.all();
+        assert_eq!(records.len(), 1);
+        let from_node = &records[0];
+        assert_eq!(from_node["type"], "task.shadow_gated");
+        assert_eq!(from_node["id"], task);
+        assert_eq!(from_node["runner"], "node:n252");
+        assert_eq!(from_node["result"], "verdict");
+        assert_eq!(from_node["verdict"], "accepted");
+        assert_eq!(from_node["primary"], "accepted");
+        assert_eq!(from_node["exit"], 0);
+        assert_eq!(from_node["seconds"], 42);
+        assert_eq!(from_node["unequal"], json!([]));
+        assert_eq!(from_node["agrees"], json!(true));
+        assert_eq!(from_node["inputs"], world.primary);
+        assert_eq!(
+            from_node["env"],
+            json!({"host": "n252-host", "toolchain": "rustc 1.95.0 x86_64",
+                   "runner": "node:n252"})
+        );
+        assert!(from_node.get("judging").is_none());
+        // The runner's record of the same verdict: the same shape.
+        let ended = wait_ended(&mut runner);
+        let keys = |record: &Value| -> Vec<String> {
+            let mut keys: Vec<String> = record.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys(&ended.record), keys(from_node));
+        assert_eq!(ended.record["runner"], "bb");
+        assert_eq!(ended.record["agrees"], json!(true));
+        super::remove_tree(&ended.work);
+        assert_eq!(world.ledger.strikes("n252"), (0, false));
+        // The record the writer takes as it is.
+        super::super::record(&world.ledger.store, from_node).expect("recorded");
+        assert_eq!(world.ledger.records("task.shadow_gated").len(), 1);
+    }
+
+    /// A node's fault is struck on the ledger and the job queued again,
+    /// nothing recorded for the task; one no node leases in time is taken
+    /// back, nothing recorded; and every N-th verdict is shadowed.
+    #[test]
+    fn a_node_fault_is_struck_and_queued_again_never_recorded_for_the_task() {
+        let world = NodeWorld::new("node-fault");
+        let mut nodes = world.nodes();
+        let written = Written::new();
+        nodes.offer(&world.ledger.store, world.want(8));
+        let job_id = nodes.waiting()[0].clone();
+        let row = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
+        let node = world.ledger.enroll("n252", 9, &row.requires);
+        world.run(&node, &job_id, 2, None);
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
+        assert_eq!(nodes.waiting(), vec![job_id.clone()]);
+        assert!(written.all().is_empty());
+        assert_eq!(world.ledger.strikes("n252"), (1, false));
+        let row = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
+        assert_eq!(row.state, spawn_postgres::RemoteJobState::Queued);
+        assert_eq!(row.excluded_nodes, vec![node.clone()]);
+        nodes.settings.queue_wait = Duration::ZERO;
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
+        assert!(nodes.waiting().is_empty());
+        assert!(written.all().is_empty());
+        assert_eq!(
+            world
+                .ledger
+                .store
+                .remote_job(&job_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            spawn_postgres::RemoteJobState::FallbackLocal
+        );
+        assert!(world.ledger.records("task.gated").is_empty());
+
+        // Every N-th: with every 2, the first of two is skipped.
+        nodes.settings.every = 2;
+        nodes.offered = 0;
+        nodes.offer(&world.ledger.store, world.want(9));
+        assert!(nodes.waiting().is_empty());
+        nodes.offer(&world.ledger.store, world.want(10));
+        assert_eq!(nodes.waiting().len(), 1);
+    }
+
+    /// A restarted integrator takes back the shadows its predecessor
+    /// queued (nobody waits for them any more), and keeps its own.
+    #[test]
+    fn a_restarted_integrator_takes_back_the_shadows_it_no_longer_waits_for() {
+        let world = NodeWorld::new("node-restart");
+        let mut before = world.nodes();
+        before.offer(&world.ledger.store, world.want(11));
+        let orphan = before.waiting()[0].clone();
+        drop(before);
+        let mut after = world.nodes();
+        after.offer(&world.ledger.store, world.want(12));
+        let mine = after.waiting()[0].clone();
+        let written = Written::new();
+        after.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
+        assert_eq!(
+            world
+                .ledger
+                .store
+                .remote_job(&orphan)
+                .unwrap()
+                .unwrap()
+                .state,
+            spawn_postgres::RemoteJobState::FallbackLocal
+        );
+        assert_eq!(
+            world.ledger.store.remote_job(&mine).unwrap().unwrap().state,
+            spawn_postgres::RemoteJobState::Queued
+        );
+        assert_eq!(after.waiting(), vec![mine.clone()]);
+        let queued = world
+            .ledger
+            .store
+            .remote_jobs_queued(spawn_postgres::RemoteJobKind::GateShadow)
+            .unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
+            [mine.as_str()]
+        );
+        assert!(written.all().is_empty());
+    }
+
+    /// A lease fenced back to the queue gets a whole wait again: the job's
+    /// wait restarts each time it is seen leased.
+    #[test]
+    fn a_lease_fenced_back_to_the_queue_gets_a_whole_wait() {
+        let world = NodeWorld::new("node-fenced");
+        let mut nodes = world.nodes();
+        nodes.settings.queue_wait = Duration::from_millis(800);
+        nodes.offer(&world.ledger.store, world.want(13));
+        let job_id = nodes.waiting()[0].clone();
+        let row = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
+        let node = world.ledger.enroll("n252", 9, &row.requires);
+        assert_eq!(world.ledger.beat(&node).len(), 1);
+        std::thread::sleep(Duration::from_millis(900));
+        let written = Written::new();
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
+        assert_eq!(nodes.waiting(), vec![job_id.clone()]);
+        // Fenced back to the queue (as a new boot or the sweep does).
+        world
+            .ledger
+            .admin()
+            .execute(
+                "update spawn_remote_jobs
+                    set state = 'queued', lease_epoch = lease_epoch + 1, node_id = null,
+                        boot_id = null, lease_expires_ms = null, grant_seq = null
+                  where job_id = $1",
+                &[&job_id],
+            )
+            .unwrap();
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
+        assert_eq!(nodes.waiting(), vec![job_id.clone()]);
+        assert_eq!(
+            world
+                .ledger
+                .store
+                .remote_job(&job_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            spawn_postgres::RemoteJobState::Queued
+        );
+    }
+
+    /// A node that said no inputs (its fetch failed first): its record
+    /// names an empty `inputs`, which the record's writer takes.
+    #[test]
+    fn a_node_that_said_no_inputs_is_recorded_with_empty_inputs() {
+        use super::super::remote::tests as remote;
+        let world = NodeWorld::new("node-no-inputs");
+        let (meta, log) = remote::meta("gs-222222222222-abcdefgh", 1, Some(2), None, "", "", None);
+        let stored = super::remote::Stored { meta, log };
+        let judged = super::remote::judge_stored(&stored, &world.primary);
+        let record = super::node_record_of(&world.want(world.task()), "node:n1", &stored, &judged);
+        assert_eq!(record["inputs"], json!({}));
+        assert_eq!(record["agrees"], Value::Null);
+        assert!(!record["unequal"].as_array().unwrap().is_empty());
+        super::super::record(&world.ledger.store, &record).expect("recorded");
+        assert_eq!(world.ledger.records("task.shadow_gated").len(), 1);
+    }
+
+    /// A node's verdict on other inputs than the primary's is said, but
+    /// compared with nothing; a node's fault on its last attempt is
+    /// recorded with no verdict.
+    #[test]
+    fn a_node_record_compares_only_equal_inputs() {
+        use super::super::remote::tests as remote;
+        let dir = Scratch::new("node-record");
+        let primary = primary_inputs(&dir.0, Some("3333333333333333333333333333333333333333"));
+        let wanted = want(7, "rejected", primary.clone(), &dir.0);
+        let (base, candidate) = ("5".repeat(40), "6".repeat(40));
+        let mut granted = primary.clone();
+        granted["base"] = json!(base);
+        granted["candidate"] = json!(candidate);
+        let verdict = remote::verdict_on("accepted", &base, &candidate);
+        let (meta, log) = remote::meta(
+            "gs-222222222222-abcdefgh",
+            1,
+            Some(0),
+            Some(&verdict),
+            "",
+            "",
+            Some(&granted),
+        );
+        let stored = super::remote::Stored { meta, log };
+        let judged = super::remote::judge_stored(&stored, &granted);
+        assert_eq!(judged.evidence, "accepted");
+        let record = super::node_record_of(&wanted, "node:n1", &stored, &judged);
+        assert_eq!(record["verdict"], "accepted");
+        // The primary judged other commits.
+        assert_eq!(record["unequal"], json!(["base", "candidate"]));
+        assert_eq!(record["agrees"], Value::Null);
+        let same = want(7, "rejected", granted.clone(), &dir.0);
+        let record = super::node_record_of(&same, "node:n1", &stored, &judged);
+        assert_eq!(record["unequal"], json!([]));
+        assert_eq!(record["agrees"], json!(false));
+        // A fault: no verdict, the evidence as its result.
+        let (meta, log) = remote::meta(
+            "gs-222222222222-abcdefgh",
+            1,
+            Some(6),
+            None,
+            "",
+            "",
+            Some(&granted),
+        );
+        let stored = super::remote::Stored { meta, log };
+        let judged = super::remote::judge_stored(&stored, &granted);
+        let record = super::node_record_of(&same, "node:n1", &stored, &judged);
+        assert_eq!(record["result"], "aborted");
+        assert_eq!(record["verdict"], Value::Null);
+        assert_eq!(record["agrees"], Value::Null);
+        assert_eq!(record["exit"], 6);
     }
 }
