@@ -4,34 +4,41 @@
 //! (`spawn-resolve`), which the Bridge presses as it presses a person's.
 //!
 //! - **Switch.** `SPAWN_AUTO_APPROVE = off | startup | all`, default
-//!   `startup`: the step submits nothing unless it is `all`. `startup` is
-//!   today's behaviour, the Bridge's own answer to an engine's startup trust
-//!   dialog (itself a `key` command of `spawn-resolve` since PR 3, so it is
-//!   audited too). `off` makes the resolver submit nothing as well; the
-//!   Bridge's startup answer is part of a start and is not switched here.
-//!   An unknown value is warned about and read as `startup`.
+//!   `startup`: the step reads and submits nothing unless it is `all`.
+//!   `startup` is today's behaviour, the Bridge's own answer to an engine's
+//!   startup trust dialog (a `key` command of `spawn-resolve` since PR 3, so
+//!   it is audited too). `off` is no automatic answer at all: the resolver
+//!   submits nothing, and the Bridge does not answer the startup trust
+//!   dialog either (`BridgeConfig::auto_trust`, set in `runtime.rs`). An
+//!   unknown value is warned about and read as `startup`.
 //! - **Table.** `spawn_core::driver::table_answer`, pure: only rows whose
-//!   screen was seen working answer with keys; every other row, and a hard
-//!   block (`spawn_core::driver::hard_block`: a login, a quota, a needed
+//!   screen was seen working answer, each with one key (today agy's
+//!   `trust_prompt` for its own workspace, probed). Every other row, and a
+//!   hard block (`spawn_core::driver::hard_block`: a login, a quota, a needed
 //!   update, exit-only choices), escalates: nothing is pressed, the item
 //!   stays in `/api/approvals` for a person, and the loop says so once.
-//! - **Guards, all of them, before any key:** two pane reads in a row give
-//!   the same dialog id (the approvals page's, `serve/approvals.rs`); on a
-//!   host with agent detection (Herdr), for an engine other than Claude
-//!   Code, its reading is `blocked` by a named rule with the blocker
-//!   visible; the driver's own reading of the pane is `Permission`; the
-//!   row's own guard holds; no command of the session is unfinished (a
-//!   person's answer, or ours, still in flight); the breaker is closed.
+//! - **Guards, all of them, before a key is submitted:** two pane reads in a
+//!   row give the same dialog id (the approvals page's, `serve/approvals.rs`);
+//!   on a host with agent detection (Herdr), for an engine other than Claude
+//!   Code, its reading is `blocked` by a named rule with the blocker visible;
+//!   the driver's own reading of both panes shows the dialog (`Permission`,
+//!   or its startup trust dialog for `trust_prompt`); the row's own guard
+//!   holds; no command of the session is unfinished (a person's answer, or
+//!   ours, still in flight); the breaker is closed. The Bridge checks again
+//!   when it presses the key: only while the dialog still shows and nothing
+//!   else went to the pane since the key was accepted.
+//! - **Trigger.** The resolver reads the live panes itself, twice; it does
+//!   not wait for the Bridge's `screen.observed permission`, which the
+//!   Bridge records on its own pass (normally before the answer).
 //! - **Breaker, folded from the log, never from memory.** Every count is
 //!   read from the commands of `spawn-resolve` (`commands_by`), and the
 //!   per-dialog count from the idempotency of `submit`: an answer is keyed
-//!   `resolve:<execution>:<dialog id>:<n>:<k>` (its `n`-th answer, its
-//!   `k`-th key), and a key submitted again returns the command already
-//!   there and writes nothing. So a restart re-reads the same counts.
-//!   - an answered dialog that still shows [`STILL_SHOWS_MS`] after its
-//!     answer, and before [`AGAIN_AFTER_MS`], opens it for that dialog;
-//!   - a second answer to the same dialog only from [`AGAIN_AFTER_MS`]
-//!     after the first; a third never (open);
+//!   `resolve:<execution>:<dialog id>:1:1`, and a key submitted again returns
+//!   the command already there and writes nothing. So a restart re-reads the
+//!   same counts.
+//!   - one automatic answer per dialog id per execution, never a second; an
+//!     answered dialog that still shows [`STILL_SHOWS_MS`] after its answer
+//!     is escalated once ("still shows after its answer");
 //!   - [`EXECUTION_ANSWERS`] answers in an execution within
 //!     [`EXECUTION_WINDOW_MS`] open it for that execution;
 //!   - [`FLEET_ANSWERS`] answers across the fleet within a minute open it
@@ -54,11 +61,10 @@ use crate::serve::approvals::{Prompt, detect, fnv1a, normalized};
 /// The resolver's principal: the Bridge's ([`spawn_core::bridge::RESOLVE_PRINCIPAL`]).
 pub(crate) const PRINCIPAL: &str = spawn_core::bridge::RESOLVE_PRINCIPAL;
 
-/// An answered dialog still showing this long after its answer opens the
-/// breaker for it (two reads of the loop's pass have seen it).
+/// An answered dialog still showing this long after its answer is
+/// escalated (two reads of the loop's pass have seen it); it is never
+/// answered again.
 pub(crate) const STILL_SHOWS_MS: i64 = 5_000;
-/// The earliest a second answer to the same dialog may follow the first.
-pub(crate) const AGAIN_AFTER_MS: i64 = 30_000;
 /// Answers in one execution within [`EXECUTION_WINDOW_MS`] that open the
 /// breaker for it.
 pub(crate) const EXECUTION_ANSWERS: usize = 5;
@@ -478,8 +484,10 @@ impl Resolver {
         Ok(lines)
     }
 
-    /// Submit the `n`-th answer to `dialog` (1, else 2), as the log allows
-    /// ([`Ledger`], `submit`'s idempotency): the line to log, if any.
+    /// Submit the one answer to `dialog` this execution may get, as the
+    /// log allows ([`Ledger`], `submit`'s idempotency): the line to log, if
+    /// any. Answered already: nothing, and once it still shows
+    /// [`STILL_SHOWS_MS`] after, one escalation.
     fn answer(
         &mut self,
         world: &dyn World,
@@ -490,57 +498,40 @@ impl Resolver {
         now: i64,
     ) -> Result<Option<String>, String> {
         let known: HashSet<i64> = ledger.answered.iter().map(|answered| answered.id).collect();
-        for n in 1..=2 {
-            let key = |k: usize| format!("resolve:{}:{dialog}:{n}:{k}", live.execution);
-            let first = world.submit(live, &key(1), keys[0])?;
-            if !known.contains(&first) {
-                for (at, named) in keys.iter().enumerate().skip(1) {
-                    world.submit(live, &key(at + 1), *named)?;
-                }
-                ledger.answered.insert(
-                    0,
-                    Answered {
-                        id: first,
-                        session: live.session.clone(),
-                        created_at_ms: now,
-                    },
-                );
-                let pressed: Vec<&str> = keys.iter().map(|key| key.name()).collect();
-                return Ok(Some(format!(
-                    "resolve: {} answered {dialog} ({n}): {}",
-                    live.session,
-                    pressed.join(" ")
-                )));
+        let key = |k: usize| format!("resolve:{}:{dialog}:1:{k}", live.execution);
+        let first = world.submit(live, &key(1), keys[0])?;
+        if !known.contains(&first) {
+            for (at, named) in keys.iter().enumerate().skip(1) {
+                world.submit(live, &key(at + 1), *named)?;
             }
-            let age = now
-                - ledger
-                    .get(first)
-                    .map_or(now, |answered| answered.created_at_ms);
-            if n == 2 {
-                break;
-            }
-            if age < STILL_SHOWS_MS {
-                return Ok(None);
-            }
-            if age < AGAIN_AFTER_MS {
-                let message = format!(
-                    "resolve: {} breaker open for {dialog}: it still shows {} s after its answer",
-                    live.session,
-                    age / 1000
-                );
-                return Ok(self
-                    .said
-                    .insert(format!("{}:{dialog}:shows", live.execution))
-                    .then_some(message));
-            }
+            ledger.answered.insert(
+                0,
+                Answered {
+                    id: first,
+                    session: live.session.clone(),
+                    created_at_ms: now,
+                },
+            );
+            let pressed: Vec<&str> = keys.iter().map(|key| key.name()).collect();
+            return Ok(Some(format!(
+                "resolve: {} answered {dialog}: {}",
+                live.session,
+                pressed.join(" ")
+            )));
+        }
+        let age = now - ledger.get(first).map_or(now, |answered| answered.created_at_ms);
+        if age < STILL_SHOWS_MS {
+            return Ok(None);
         }
         let message = format!(
-            "resolve: {} breaker open for {dialog}: answered twice already, never a third time",
-            live.session
+            "resolve: {} escalated {dialog}: it still shows after its answer ({} s); it is \
+             never answered automatically again",
+            live.session,
+            age / 1000
         );
         Ok(self
             .said
-            .insert(format!("{}:{dialog}:third", live.execution))
+            .insert(format!("{}:{dialog}:shows", live.execution))
             .then_some(message))
     }
 }
