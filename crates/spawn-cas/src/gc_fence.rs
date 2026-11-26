@@ -15,7 +15,7 @@ use crate::store::{is_shard, open_nofollow, remove_missing_ok};
 use crate::{Algo, CasError, ChunkIndex, Digest, NS_BLOB, NS_TREE, Store, TreeEntryKind, is_hex64};
 
 /// File binding a CAS root to its owning PostgreSQL database/schema.
-pub const GC_FENCE_FILE: &str = ".gc-fence";
+pub(crate) const GC_FENCE_FILE: &str = ".gc-fence";
 
 /// Persistent GC consecutive-unreachable round state under `tmp/`.
 pub const GC_UNREACH_STATE_FILE: &str = ".gc-unreach-state.json";

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 /// One TOML value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Value {
+pub(crate) enum Value {
     Str(String),
     Bool(bool),
     /// A number, date or other bare scalar, as written.
@@ -25,11 +25,11 @@ pub enum Value {
 }
 
 /// A TOML table.
-pub type Table = BTreeMap<String, Value>;
+pub(crate) type Table = BTreeMap<String, Value>;
 
 /// Why a manifest was not read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TomlError {
+pub(crate) struct TomlError {
     /// 1-based line; 0 for a manifest-level problem.
     pub line: u32,
     pub message: String,
@@ -46,7 +46,7 @@ impl std::fmt::Display for TomlError {
 }
 
 /// Parse `text` as the supported TOML subset.
-pub fn parse_toml(text: &str) -> Result<Table, TomlError> {
+pub(crate) fn parse_toml(text: &str) -> Result<Table, TomlError> {
     let mut parser = Parser {
         chars: text.chars().collect(),
         at: 0,
@@ -495,14 +495,14 @@ impl Parser {
 
 /// One build target a manifest declares (`[lib]`, `[[bin]]`, ...).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TargetDecl {
+pub(crate) struct TargetDecl {
     pub name: Option<String>,
     pub path: Option<String>,
 }
 
 /// Which table a dependency was declared in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DepKind {
+pub(crate) enum DepKind {
     Normal,
     Dev,
     Build,
@@ -510,7 +510,7 @@ pub enum DepKind {
 
 /// One dependency: the name the code uses and the package it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DepDecl {
+pub(crate) struct DepDecl {
     /// The dependency key (`serde`, `core_alias`).
     pub alias: String,
     /// The package (`package = "..."`, else the key).
@@ -522,7 +522,7 @@ pub struct DepDecl {
 
 /// What the resolver needs from one `Cargo.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CargoManifest {
+pub(crate) struct CargoManifest {
     /// `[package].name`; `None` for a virtual workspace manifest.
     pub package: Option<String>,
     pub lib: Option<TargetDecl>,
@@ -531,6 +531,8 @@ pub struct CargoManifest {
     pub examples: Vec<TargetDecl>,
     pub benches: Vec<TargetDecl>,
     /// `[package].build`: `Some(None)` when `build = false`.
+    // Three-state field: omitted (`None`), disabled via `build = false` (`Some(None)`), or path.
+    #[allow(clippy::option_option)]
     pub build: Option<Option<String>>,
     pub dependencies: Vec<DepDecl>,
     /// `[workspace.dependencies]`.
@@ -612,7 +614,7 @@ fn dependency_tables(table: &Table, out: &mut Vec<DepDecl>) -> Result<(), TomlEr
 }
 
 /// Read a `Cargo.toml`.
-pub fn read_cargo(text: &str) -> Result<CargoManifest, TomlError> {
+pub(crate) fn read_cargo(text: &str) -> Result<CargoManifest, TomlError> {
     let root = parse_toml(text)?;
     let mut manifest = CargoManifest::default();
     match root.get("package") {
@@ -667,11 +669,11 @@ pub fn read_cargo(text: &str) -> Result<CargoManifest, TomlError> {
 // JSON-with-comments that `tsconfig.json` allows.
 
 /// Deepest nesting a JSON manifest may have; a deeper one is refused.
-pub const MAX_JSON_DEPTH: usize = 128;
+pub(crate) const MAX_JSON_DEPTH: usize = 128;
 
 /// One JSON value. Objects keep their keys in written order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Json {
+pub(crate) enum Json {
     Null,
     Bool(bool),
     /// A number, as written.
@@ -910,7 +912,7 @@ fn is_json_number(word: &str) -> bool {
 }
 
 /// Parse strict JSON (RFC 8259: what `package.json` must be).
-pub fn parse_json(text: &str) -> Result<Json, String> {
+pub(crate) fn parse_json(text: &str) -> Result<Json, String> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut parser = JsonParser {
         bytes: text.as_bytes(),
@@ -927,7 +929,7 @@ pub fn parse_json(text: &str) -> Result<Json, String> {
 /// JSON with comments and trailing commas made JSON: comments become
 /// spaces (newlines kept, so lines still count), and a `,` before `}` or
 /// `]` is dropped. Strings are left alone.
-pub fn strip_jsonc(text: &str) -> String {
+pub(crate) fn strip_jsonc(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut at = 0;
@@ -986,7 +988,7 @@ pub fn strip_jsonc(text: &str) -> String {
 
 /// What the resolver needs from one `package.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PackageJson {
+pub(crate) struct PackageJson {
     pub name: Option<String>,
     /// `exports`, as written.
     pub exports: Option<Json>,
@@ -1008,7 +1010,7 @@ fn json_string(value: &Json, key: &str) -> Option<String> {
 }
 
 /// Read a `package.json`.
-pub fn read_package_json(text: &str) -> Result<PackageJson, String> {
+pub(crate) fn read_package_json(text: &str) -> Result<PackageJson, String> {
     let value = parse_json(text)?;
     if !matches!(value, Json::Obj(_)) {
         return Err("not a JSON object".to_string());
@@ -1047,12 +1049,12 @@ pub fn read_package_json(text: &str) -> Result<PackageJson, String> {
 }
 
 /// One `compilerOptions.paths` entry: pattern and its ordered target list.
-pub type TsPathEntry = (String, Vec<String>);
+pub(crate) type TsPathEntry = (String, Vec<String>);
 
 /// What the resolver needs from one `tsconfig.json` / `jsconfig.json`,
 /// before its `extends` chain is merged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TsConfig {
+pub(crate) struct TsConfig {
     /// `extends` (a string or, since TypeScript 5, an array), as written.
     pub extends: Vec<String>,
     pub base_url: Option<String>,
@@ -1064,7 +1066,7 @@ pub struct TsConfig {
 
 /// Read a `tsconfig.json` or `jsconfig.json` (comments and trailing commas
 /// allowed).
-pub fn read_tsconfig(text: &str) -> Result<TsConfig, String> {
+pub(crate) fn read_tsconfig(text: &str) -> Result<TsConfig, String> {
     let value = parse_json(&strip_jsonc(text))?;
     if !matches!(value, Json::Obj(_)) {
         return Err("not a JSON object".to_string());
@@ -1112,7 +1114,7 @@ pub fn read_tsconfig(text: &str) -> Result<TsConfig, String> {
 
 /// What the resolver needs from one `pyproject.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PyProjectManifest {
+pub(crate) struct PyProjectManifest {
     /// PEP 503 normalized package name (`[project].name`, else `[tool.poetry].name`).
     pub name: Option<String>,
     /// Candidate source roots relative to the manifest directory (e.g. `"src"`).
@@ -1128,7 +1130,7 @@ pub struct PyProjectManifest {
 
 /// Normalize a Python distribution name per PEP 503: lowercase ASCII and
 /// collapse runs of `[-_.]` to a single `-`.
-pub fn normalize_py_name(raw: &str) -> String {
+pub(crate) fn normalize_py_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut prev_dash = false;
     for ch in raw.trim().chars() {
@@ -1414,7 +1416,7 @@ fn read_pyproject_hatch(tool: &Table, manifest: &mut PyProjectManifest) {
 }
 
 /// Read a `pyproject.toml`.
-pub fn read_pyproject(text: &str) -> Result<PyProjectManifest, TomlError> {
+pub(crate) fn read_pyproject(text: &str) -> Result<PyProjectManifest, TomlError> {
     let root = parse_toml(text)?;
     let mut manifest = PyProjectManifest::default();
     read_pyproject_project(&root, &mut manifest);

@@ -12,6 +12,17 @@
 //!
 //! The criteria object is written in declaration order. The service renders
 //! each criteria entry as a labelled option, so order decides the prompt.
+//!
+//! # Security & Transport Invariants
+//! - When configured with `out.sock` ([`JevConfig::new_out_sock`]), [`JevJudge`]
+//!   validates the socket before connecting via [`validate_out_sock`]
+//!   (rejecting symlinks, non-sockets, foreign UIDs, and group/world-writable or
+//!   readable modes `mode & 0o077 != 0`).
+//! - Implemented in pure safe Rust (`#![forbid(unsafe_code)]`) using plain
+//!   `http://` or UNIX domain sockets without extra TLS/crypto dependencies.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -31,19 +42,19 @@ use spawn_core::observe::{JudgeError, JudgeInput, Judgement, StateJudge};
 pub const OUT_SOCK_ENV: &str = "SPAWN_OUT_SOCK";
 
 /// Fixed local RPC path exposed by `spawn-node front --serve outbound`.
-pub const OUT_JEV_CALL_PATH: &str = "/out/v1/jev/call";
+const OUT_JEV_CALL_PATH: &str = "/out/v1/jev/call";
 
 /// Response read limit (matches the 4 MiB IPC payload cap plus HTTP headers).
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024 + 64 * 1024;
 
 /// Question name of the state choice.
-pub const QUESTION: &str = "semantic_state";
+const QUESTION: &str = "semantic_state";
 
 /// Question name of the yes/no "a human must step in".
-pub const NEEDS_HUMAN: &str = "needs_human";
+const NEEDS_HUMAN: &str = "needs_human";
 
 /// Question name of the yes/no "the agent makes no progress".
-pub const STUCK: &str = "stuck";
+const STUCK: &str = "stuck";
 
 /// Instruction shown to the model for the state choice.
 const INSTRUCTIONS: &str = "What is the semantic state of this coding agent session? \
@@ -72,7 +83,9 @@ fn description(state: SemanticState) -> &'static str {
     }
 }
 
-/// Endpoint of the decision service.
+/// Return the System One endpoint URL for a relay or gateway `base_url`.
+///
+/// Strips any trailing `'/'` from `base_url` before appending `/v1/systemone`.
 pub fn endpoint(base_url: &str) -> String {
     format!("{}/v1/systemone", base_url.trim_end_matches('/'))
 }
@@ -81,15 +94,19 @@ pub fn endpoint(base_url: &str) -> String {
 ///
 /// The hosted endpoint rejects a request without `model` (422, read from
 /// the live service on 2026-11-04).
-pub const DEFAULT_MODEL: &str = "jev-latest";
+const DEFAULT_MODEL: &str = "jev-latest";
 
-/// Request body for one snapshot, naming [`DEFAULT_MODEL`].
+/// Build the JSON request body for one [`JudgeInput`] snapshot using the
+/// default `"jev-latest"` model.
+///
+/// Preserves [`SemanticState::ALL`] declaration order inside the serialized
+/// `criteria` map because the remote service renders choices in field order.
 pub fn build_request(input: &JudgeInput) -> String {
     build_request_for(input, DEFAULT_MODEL)
 }
 
-/// Request body for one snapshot, answered by `model`.
-pub fn build_request_for(input: &JudgeInput, model: &str) -> String {
+/// Build the JSON request body for one [`JudgeInput`] snapshot targeting an explicit `model`.
+fn build_request_for(input: &JudgeInput, model: &str) -> String {
     let state = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
     let mut criteria = String::from("{");
     for (index, candidate) in SemanticState::ALL.iter().enumerate() {
@@ -130,7 +147,17 @@ struct Answer {
     noul: Option<f64>,
 }
 
-/// Parse one answer body.
+/// Parse one Jev JSON response body into a validated [`Judgement`].
+///
+/// Selects `choice` when present, otherwise picks the `probabilities` entry with
+/// the highest score, clamps missing/invalid confidence values to
+/// [`Confidence::ZERO`], and extracts finite `[0.0, 1.0]` probabilities for
+/// `needs_human` and `stuck`.
+///
+/// # Errors
+/// Returns [`JudgeError::Unavailable`] if the payload is not valid JSON, lacks
+/// the `semantic_state` answer, has neither `choice` nor `probabilities`, or
+/// names an unknown [`SemanticState`] key.
 pub fn parse_reply(body: &str) -> Result<Judgement, JudgeError> {
     let reply: Reply = serde_json::from_str(body)
         .map_err(|error| JudgeError::Unavailable(format!("answer is not JSON: {error}")))?;
@@ -201,7 +228,8 @@ impl JevConfig {
     /// answer then was 8.5 s.
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
-    /// Configuration for one base URL.
+    /// Build an HTTP relay configuration for `base_url` (trailing `'/'` trimmed)
+    /// with [`Self::DEFAULT_TIMEOUT`] and model `"jev-latest"`.
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -211,7 +239,8 @@ impl JevConfig {
         }
     }
 
-    /// Configuration targeting a local `out.sock` UNIX domain socket.
+    /// Build an outbound UDS configuration targeting `path` (`out.sock`)
+    /// with [`Self::DEFAULT_TIMEOUT`] and model `"jev-latest"`.
     pub fn new_out_sock(path: impl Into<PathBuf>) -> Self {
         Self {
             base_url: String::new(),
@@ -221,19 +250,19 @@ impl JevConfig {
         }
     }
 
-    /// Route requests through the given local `out.sock` UNIX domain socket.
+    /// Return a copy of this configuration routed through local `out.sock` path `path`.
     #[must_use]
     pub fn with_out_sock(mut self, path: impl Into<PathBuf>) -> Self {
         self.out_sock = Some(path.into());
         self
     }
 
-    /// Read [`OUT_SOCK_ENV`] (`SPAWN_OUT_SOCK`) using the process environment.
+    /// Construct a `JevConfig` from [`OUT_SOCK_ENV`] (`SPAWN_OUT_SOCK`) if set and non-empty.
     pub fn from_out_sock_env() -> Option<Self> {
         Self::from_out_sock_lookup(|key| std::env::var(key).ok())
     }
 
-    /// Read [`OUT_SOCK_ENV`] (`SPAWN_OUT_SOCK`) using a custom lookup function.
+    /// Construct a `JevConfig` using an injected environment lookup closure for [`OUT_SOCK_ENV`].
     pub fn from_out_sock_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<Self> {
         let raw = lookup(OUT_SOCK_ENV)?;
         let trimmed = raw.trim();
@@ -283,8 +312,15 @@ impl StateJudge for JevJudge {
     }
 }
 
-/// Validate `path` before dialing `out.sock`: refuses symlinks, non-sockets,
-/// mismatched effective UID, and group/world permissions (`mode & 0o077 != 0`).
+/// Validate `path` before dialing `out.sock`.
+///
+/// Enforces that `path` is non-empty, exists as an `AF_UNIX` socket (never a
+/// symlink or regular file), is owned by the current effective UID, and grants
+/// zero group/other permission bits (`mode & 0o077 == 0`).
+///
+/// # Errors
+/// Returns an explanatory error string on empty paths, `lstat` failure,
+/// symlinks, non-socket files, UID mismatches, or permissive file modes.
 #[cfg(unix)]
 pub fn validate_out_sock(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {

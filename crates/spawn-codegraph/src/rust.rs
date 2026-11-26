@@ -14,7 +14,7 @@ use syn::{Attribute, Item, UseTree};
 
 /// The facts of one file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FileFacts {
+pub(crate) struct FileFacts {
     pub root: ModuleFacts,
     /// Some part `syn` refused, or that could not be cut to
     /// [`MAX_SYN_TOKENS`]: its facts come from a token walk.
@@ -23,7 +23,7 @@ pub struct FileFacts {
 
 /// The facts of one module (a file, or an inline `mod name { ... }`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ModuleFacts {
+pub(crate) struct ModuleFacts {
     /// Names of items declared directly in the module (fn, struct, enum,
     /// union, trait, const, static, type, `macro_rules!`).
     pub items: BTreeSet<String>,
@@ -44,7 +44,7 @@ pub struct ModuleFacts {
 
 impl ModuleFacts {
     /// The facts of the inline module at `inline` below this one.
-    pub fn nested(&self, inline: &[String]) -> Option<&Self> {
+    pub(crate) fn nested(&self, inline: &[String]) -> Option<&Self> {
         let Some((first, rest)) = inline.split_first() else {
             return Some(self);
         };
@@ -58,7 +58,7 @@ impl ModuleFacts {
 
 /// `mod name;` or `mod name { ... }`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModDecl {
+pub(crate) struct ModDecl {
     pub name: String,
     pub line: u32,
     /// Under `#[cfg(test)]`.
@@ -73,7 +73,7 @@ pub struct ModDecl {
 // Four independent facts about one syntax leaf, not a state machine.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UseEntry {
+pub(crate) struct UseEntry {
     pub segments: Vec<String>,
     /// The name it introduces (`as` alias, else the last segment); `None`
     /// for a glob or `as _`.
@@ -89,7 +89,7 @@ pub struct UseEntry {
 
 /// A path of two or more segments (or with a leading `::`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PathRef {
+pub(crate) struct PathRef {
     pub segments: Vec<String>,
     pub leading_colon: bool,
     pub line: u32,
@@ -98,7 +98,7 @@ pub struct PathRef {
 
 /// `include!`, `include_str!` or `include_bytes!` with a literal path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IncludeRef {
+pub(crate) struct IncludeRef {
     pub path: String,
     /// `concat!(env!("CARGO_MANIFEST_DIR"), "...")`: relative to the
     /// package root rather than the file.
@@ -128,7 +128,7 @@ pub const MAX_NESTING: usize = 256;
 /// `((T,),)`): about 31 MiB at this budget, half the parser thread's 64 MiB.
 /// The reader below splits larger items, bodies and expressions so that no
 /// call gets more; a piece it cannot split is read with a token walk.
-pub const MAX_SYN_TOKENS: usize = 1_000;
+pub(crate) const MAX_SYN_TOKENS: usize = 1_000;
 
 /// The most tokens a wrapper adds around what the reader counted
 /// (`impl H {…}`, `match H {…}`, `fn H() where … {}`, `let …;`): every
@@ -1517,7 +1517,7 @@ impl Reader {
 /// is read with a token walk that still finds its paths, and marks the
 /// file's facts `token_fallback`. `Err` (listed as `unparsed`) when the
 /// brackets nest past [`MAX_NESTING`] or the text does not lex.
-pub fn parse(text: &str) -> Result<FileFacts, String> {
+pub(crate) fn parse(text: &str) -> Result<FileFacts, String> {
     let deepest = bracket_depth(text);
     if deepest > MAX_NESTING {
         return Err(format!(

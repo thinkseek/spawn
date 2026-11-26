@@ -29,7 +29,7 @@ pub const CHUNK_AVG: usize = 1_048_576;
 pub const CHUNK_MAX: usize = 4_194_304;
 
 /// Magic header for `spawn-chunks-v1` index objects.
-pub const CHUNKS_MAGIC: &[u8] = b"spawn-chunks-v1\n";
+pub(crate) const CHUNKS_MAGIC: &[u8] = b"spawn-chunks-v1\n";
 
 const MASK_S: u64 = 0xFFFF_FC00_0000_0000;
 const MASK_L: u64 = 0xFFFF_C000_0000_0000;

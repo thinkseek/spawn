@@ -17,7 +17,7 @@ use crate::store::open_nofollow;
 use crate::{CasError, Digest, GitOid, Store};
 
 /// File name of the CAS root ref durability journal.
-pub const REFS_JOURNAL: &str = "refs.journal";
+pub(crate) const REFS_JOURNAL: &str = "refs.journal";
 
 /// One committed ref transition recorded in `refs.journal`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
