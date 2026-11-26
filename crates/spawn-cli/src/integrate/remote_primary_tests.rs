@@ -528,6 +528,98 @@ fn m3a_judges_a_rejection_again_here_and_m3b_believes_it() {
     }
 }
 
+/// A node with 2 strikes (and `degraded` as given, set once it holds its
+/// lease) finishes the primary path's job with exit 0 and a `word` verdict
+/// on the job's own inputs, self-fenced or not: the outcome, and the
+/// node's strikes and `degraded` after it.
+fn valid_run_on_two_strikes(
+    case: &str,
+    believe_reject: bool,
+    word: &'static str,
+    self_fenced: bool,
+    degraded: bool,
+) -> (PrimaryOutcome, (i32, bool), spawn_postgres::RemoteJob) {
+    let world = Fixture::new(case, believe_reject, Duration::from_secs(30));
+    let mut node = world.node("n1");
+    let results = world.results();
+    let mut admin = world.ledger.admin();
+    let ran = std::thread::spawn(move || {
+        let grant = node.lease(Duration::from_secs(30)).expect("a grant");
+        admin
+            .execute(
+                "update spawn_node_state set host_fault_strikes = 2, degraded = $1
+                  where name = 'n1'",
+                &[&degraded],
+            )
+            .expect("two strikes");
+        let verdict = verdict_for(word, &grant);
+        node.finish(
+            &results,
+            &grant,
+            Some(0),
+            Some(&verdict),
+            "| no\n",
+            |meta| {
+                meta.self_fenced = self_fenced;
+            },
+        );
+    });
+    let outcome = world
+        .primary
+        .judge(&world.ledger.store, &world.request(), &|| false);
+    ran.join().expect("the node");
+    (outcome, world.ledger.strikes("n1"), world.job())
+}
+
+/// Any valid run puts a node's strikes back to 0 (`spawn_remote_job_valid`):
+/// an M3a acceptance, an M3a rejection judged again here, an M3b believed
+/// rejection; a degraded node stays degraded (only an undrain clears it).
+/// A self-fenced run (no verdict) leaves the strikes as they were.
+#[test]
+fn a_valid_run_resets_the_nodes_strikes_and_a_self_fenced_one_does_not() {
+    // (a) M3a: an acceptance, believed.
+    let (outcome, strikes, row) =
+        valid_run_on_two_strikes("valid_m3a_accepts", false, "accepted", false, false);
+    assert_eq!(believed(outcome).belief, "M3a");
+    assert_eq!(strikes, (0, false), "an M3a acceptance resets the strikes");
+    assert_eq!(row.state, RemoteJobState::Completed);
+    assert_eq!(
+        row.lease_epoch, 2,
+        "the completion is judged: its epoch moved"
+    );
+    // (b) M3a: a rejection, a valid run judged again here.
+    let (outcome, strikes, _) =
+        valid_run_on_two_strikes("valid_m3a_rejects", false, "rejected", false, false);
+    assert!(local_why(&outcome).contains("valid run"));
+    assert_eq!(
+        strikes,
+        (0, false),
+        "an M3a valid rejection resets the strikes"
+    );
+    // (c) M3b: a rejection, believed.
+    let (outcome, strikes, _) =
+        valid_run_on_two_strikes("valid_m3b_rejects", true, "rejected", false, false);
+    let believed_rejection = believed(outcome);
+    assert_eq!(believed_rejection.belief, "M3b");
+    assert!(!believed_rejection.verdict.accepted);
+    assert_eq!(
+        strikes,
+        (0, false),
+        "an M3b believed rejection resets the strikes"
+    );
+    // A degraded node: its strikes go, `degraded` stays.
+    let (outcome, strikes, _) =
+        valid_run_on_two_strikes("valid_degraded", true, "accepted", false, true);
+    assert!(believed(outcome).verdict.accepted);
+    assert_eq!(strikes, (0, true), "only an undrain clears degraded");
+    // Self-fenced: no verdict, nothing reset.
+    let (outcome, strikes, row) =
+        valid_run_on_two_strikes("valid_self_fenced", false, "accepted", true, false);
+    local_why(&outcome);
+    assert_eq!(strikes, (2, false), "a self-fenced run resets nothing");
+    assert_eq!(row.lease_epoch, 1, "nothing judged it");
+}
+
 /// A verdict on other commits or inputs is the node's fault: struck,
 /// excluded, and the job goes to another node, whose verdict on the
 /// job's own inputs is believed.

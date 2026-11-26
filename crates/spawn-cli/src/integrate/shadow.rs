@@ -1887,6 +1887,51 @@ mod tests {
         assert_eq!(world.ledger.records("task.shadow_gated").len(), 1);
     }
 
+    /// A node shadow's valid verdict puts the node's strikes back to 0
+    /// (`spawn_remote_job_valid`) and leaves `degraded` as it was.
+    #[test]
+    fn a_node_shadows_valid_verdict_resets_the_nodes_strikes() {
+        let world = NodeWorld::new("node-valid");
+        let mut nodes = world.nodes();
+        let task = world.task();
+        nodes.offer(&world.ledger.store, world.want(task));
+        let job_id = nodes.waiting()[0].clone();
+        let row = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
+        let node = world.ledger.enroll("n252", 9, &row.requires);
+        let verdict =
+            super::super::remote::tests::verdict_on("accepted", &world.base, &world.candidate);
+        world.run(&node, &job_id, 0, Some(&verdict));
+        world
+            .ledger
+            .admin()
+            .execute(
+                "update spawn_node_state set host_fault_strikes = 2, degraded = true
+                  where name = 'n252'",
+                &[],
+            )
+            .unwrap();
+        let written = Written::new();
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
+        assert!(nodes.waiting().is_empty());
+        let records = written.all();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["result"], "verdict");
+        assert_eq!(world.ledger.strikes("n252"), (0, true));
+        let row = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
+        assert_eq!(row.state, spawn_postgres::RemoteJobState::Completed);
+        assert!(
+            !world
+                .ledger
+                .store
+                .remote_job_valid(&job_id, row.lease_epoch - 1)
+                .unwrap(),
+            "judged once"
+        );
+    }
+
     /// A node's fault is struck on the ledger and the job queued again,
     /// nothing recorded for the task; one no node leases in time is taken
     /// back, nothing recorded; and every N-th verdict is shadowed.
