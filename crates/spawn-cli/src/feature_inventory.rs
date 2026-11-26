@@ -7,7 +7,8 @@
 //! [`spawn_core::feature_coverage`]. This module performs bounded filesystem
 //! walking, git index querying, and atomic registry persistence.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -15,12 +16,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use spawn_core::feature_coverage::{
-    AssociationUpdate, BoundaryPolicy, FeatureRegistry, InventoryEntry, SCHEMA_VERSION, ScanReport,
-    associate_file, match_directory_exclusion, match_exclusion, scan_coverage,
+    AssociationUpdate, BoundaryPolicy, FeatureKind, FeatureNode, FeatureProvenance,
+    FeatureRegistry, FeatureRelation, InventoryEntry, RelationKind, SCHEMA_VERSION, ScanReport,
+    associate_file, looks_like_repo_path, match_directory_exclusion, match_exclusion,
+    normalize_repo_path, scan_coverage, validate_registry,
 };
 use spawn_core::feature_deps::{
-    self, CodeGraph, Diagnostic, DiagnosticCode, FeatureEdge, FeatureIndex, FileEdge, Scope,
-    TruthCounts, TruthPolicy, TruthReport,
+    self, CodeGraph, Diagnostic, DiagnosticCode, FeatureEdge, FeatureIndex, FileEdge, Finding,
+    PurityReport, Scope, TruthCounts, TruthPolicy, TruthReport,
 };
 
 /// Default registry path relative to the project root.
@@ -509,25 +512,58 @@ fn build_api_payload(
 }
 
 /// The usage of `spawn features`, the only copy (main's help reads it).
-pub(crate) const USAGE: &str = "usage: spawn features scan|check [--root <dir>] [--registry <file>] [--json]\n       \
-                                spawn features associate --path <file> --feature <id> [--feature <id>]... \
-                                [--root <dir>] [--registry <file>] [--json]\n       \
-                                spawn features graph [--root <dir>] [--registry <file>] [--level file|unit|feature] \
-                                [--from <id|path>] [--to <id|path>] [--feature <id>] [--json]";
+/// Note lines after each `spawn features ...` synopsis explain flags and
+/// extra subcommands while keeping `main.rs`'s `MORE_USAGE` contract exact.
+pub(crate) const USAGE: &str = "\
+usage: spawn features scan|check [--root <dir>] [--registry <file>] [--json]
+       check options: [--deps report|enforce] [--purity report|enforce] [--policy <file>]
+       spawn features associate --path <file> --feature <id> [--feature <id>]... [--root <dir>] [--registry <file>] [--json]
+       spawn features graph [--root <dir>] [--registry <file>] [--level file|unit|feature] [--from <id|path>] [--to <id|path>] [--feature <id>] [--json]
+       additional subcommands:
+         generate [--root <dir>] [--registry <file>] [--apply] [--force] [--json]
+         sync [--root <dir>] [--registry <file>] [--apply] [--policy <file>] [--json]";
 
-/// Entrypoint for `spawn features <scan|associate|check|graph>`.
+/// Entrypoint for `spawn features <scan|associate|check|graph|generate|sync>`.
 pub fn command(args: &[String]) -> Result<i32, String> {
     let Some((sub, rest)) = args.split_first() else {
         return Err(USAGE.to_string());
     };
     match sub.as_str() {
-        "scan" => cmd_scan(rest, false),
-        "check" => cmd_scan(rest, true),
+        "scan" => cmd_scan(rest),
+        "check" => cmd_check(rest),
         "associate" => cmd_associate(rest),
         "graph" => cmd_graph(rest),
+        "generate" => cmd_generate(rest),
+        "sync" => cmd_sync(rest),
         other => Err(format!(
-            "unknown features subcommand {other:?}; expected scan, associate, check, or graph"
+            "unknown features subcommand {other:?}; expected scan, check, associate, graph, generate, or sync"
         )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateMode {
+    Off,
+    Report,
+    Enforce,
+}
+
+impl GateMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Report => "report",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+fn parse_gate_mode(flag: &str, value: Option<&str>) -> Result<GateMode, String> {
+    match value {
+        None => Ok(GateMode::Off),
+        Some("report") => Ok(GateMode::Report),
+        Some("enforce") => Ok(GateMode::Enforce),
+        Some(other) => Err(format!("--{flag} {other:?} is not report or enforce")),
     }
 }
 
@@ -572,7 +608,7 @@ fn parse_common_opts(args: &[String]) -> Result<CommonOpts, String> {
     })
 }
 
-fn cmd_scan(args: &[String], fail_on_drift: bool) -> Result<i32, String> {
+fn cmd_scan(args: &[String]) -> Result<i32, String> {
     let opts = parse_common_opts(args)?;
     let registry = load_registry(&opts.registry)?;
     let report = scan_project_root(&opts.root, &registry)?;
@@ -584,8 +620,170 @@ fn cmd_scan(args: &[String], fail_on_drift: bool) -> Result<i32, String> {
     } else {
         print_human_report(&report);
     }
+    Ok(0)
+}
 
-    if fail_on_drift && !report.is_clean() {
+struct CheckOpts {
+    root: PathBuf,
+    registry: PathBuf,
+    deps: GateMode,
+    purity: GateMode,
+    policy: Option<PathBuf>,
+    json: bool,
+}
+
+fn parse_check_opts(args: &[String]) -> Result<CheckOpts, String> {
+    const CHECK_FLAGS: [&str; 5] = ["root", "registry", "deps", "purity", "policy"];
+    let flags = crate::Flags::parse_with_switches(args, &["json"])?;
+    if let Some(unknown) = flags.names().find(|name| !CHECK_FLAGS.contains(name)) {
+        return Err(format!("unexpected flag --{unknown}"));
+    }
+    let root = flags.get("root").map_or_else(default_root, PathBuf::from);
+    let registry = flags
+        .get("registry")
+        .map_or_else(|| default_registry_path(&root), PathBuf::from);
+    let deps = parse_gate_mode("deps", flags.get("deps").as_deref())?;
+    let purity = parse_gate_mode("purity", flags.get("purity").as_deref())?;
+    let policy = flags.get("policy").map(PathBuf::from);
+    Ok(CheckOpts {
+        root,
+        registry,
+        deps,
+        purity,
+        policy,
+        json: flags.switch("json"),
+    })
+}
+
+fn load_optional_truth_policy(path: Option<&Path>) -> Result<TruthPolicy, String> {
+    let Some(path) = path else {
+        return Ok(TruthPolicy::default());
+    };
+    let raw = fs::read_to_string(path)
+        .map_err(|error| format!("read truth policy {}: {error}", path.display()))?;
+    serde_json::from_str(&raw)
+        .map_err(|error| format!("parse truth policy {}: {error}", path.display()))
+}
+
+fn print_purity_summary(purity: &PurityReport, mode: GateMode) {
+    println!(
+        "semantic purity ({}) — errors={} warnings={} domain_direct_files={} glob_catch_all={} catch_all_bucket={} unrelated_directory_span={}",
+        mode.as_str(),
+        purity.counts.error,
+        purity.counts.warn,
+        purity
+            .counts
+            .by_code
+            .get("domain_direct_files")
+            .copied()
+            .unwrap_or(0),
+        purity
+            .counts
+            .by_code
+            .get("glob_catch_all")
+            .copied()
+            .unwrap_or(0),
+        purity
+            .counts
+            .by_code
+            .get("catch_all_bucket")
+            .copied()
+            .unwrap_or(0),
+        purity
+            .counts
+            .by_code
+            .get("unrelated_directory_span")
+            .copied()
+            .unwrap_or(0),
+    );
+    for finding in &purity.findings {
+        let samples = if finding.sample_paths.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", finding.sample_paths.join(", "))
+        };
+        println!(
+            "  {} {:?} {}: {}{samples}",
+            finding.code.as_str(),
+            finding.severity,
+            finding.feature_id,
+            finding.detail
+        );
+    }
+}
+
+fn cmd_check(args: &[String]) -> Result<i32, String> {
+    let opts = parse_check_opts(args)?;
+    let registry = load_registry(&opts.registry)?;
+    let report = scan_project_root(&opts.root, &registry)?;
+
+    if opts.deps == GateMode::Off && opts.purity == GateMode::Off {
+        if opts.json {
+            let text = serde_json::to_string_pretty(&report)
+                .map_err(|error| format!("serialize scan report: {error}"))?;
+            println!("{text}");
+        } else {
+            print_human_report(&report);
+        }
+        return Ok(i32::from(!report.is_clean()));
+    }
+
+    let policy = load_optional_truth_policy(opts.policy.as_deref())?;
+    let (graph, _) = build_code_graph(&opts.root, &registry.boundary)?;
+    let truth = (opts.deps != GateMode::Off)
+        .then(|| feature_deps::truth(&graph, &registry, &policy, &utc_today()));
+    let enforced: Vec<&Finding> = truth
+        .as_ref()
+        .map_or_else(Vec::new, feature_deps::enforced_truth_violations);
+    let purity =
+        (opts.purity != GateMode::Off).then(|| feature_deps::check_purity(&registry, Some(&graph)));
+
+    if opts.json {
+        let mut payload = serde_json::to_value(&report)
+            .map_err(|error| format!("serialize scan report: {error}"))?;
+        if let Some(obj) = payload.as_object_mut() {
+            if let Some(truth_report) = &truth {
+                obj.insert("deps_mode".to_string(), json!(opts.deps.as_str()));
+                obj.insert("deps_truth".to_string(), json!(truth_report));
+                obj.insert("deps_enforced_violations".to_string(), json!(enforced));
+            }
+            if let Some(purity_report) = &purity {
+                obj.insert("purity_mode".to_string(), json!(opts.purity.as_str()));
+                obj.insert("purity".to_string(), json!(purity_report));
+            }
+        }
+        let text = serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("serialize check report: {error}"))?;
+        println!("{text}");
+    } else {
+        print_human_report(&report);
+        if let Some(truth_report) = &truth {
+            let by_code = &truth_report.counts.by_code;
+            println!(
+                "dependency truth ({}) — under_declared={} implied={} test_only={} ghost={} inverted={} unverifiable={} cycles={} waived={} enforced_violations={}",
+                opts.deps.as_str(),
+                by_code.get("under_declared").copied().unwrap_or(0),
+                by_code.get("implied_only").copied().unwrap_or(0),
+                by_code.get("test_only_undeclared").copied().unwrap_or(0),
+                by_code.get("ghost").copied().unwrap_or(0),
+                by_code.get("inverted").copied().unwrap_or(0),
+                by_code.get("unverifiable").copied().unwrap_or(0),
+                by_code.get("static_cycle").copied().unwrap_or(0),
+                truth_report.counts.waived,
+                enforced.len(),
+            );
+            let truth_json = json!(truth_report);
+            print_findings(&truth_json, &|v| serde_json::from_value(v.clone()).ok());
+        }
+        if let Some(purity_report) = &purity {
+            print_purity_summary(purity_report, opts.purity);
+        }
+    }
+
+    let deps_fail = opts.deps == GateMode::Enforce && !enforced.is_empty();
+    let purity_fail =
+        opts.purity == GateMode::Enforce && purity.as_ref().is_some_and(|p| !p.is_clean());
+    if !report.is_clean() || deps_fail || purity_fail {
         Ok(1)
     } else {
         Ok(0)
@@ -1369,6 +1567,931 @@ fn print_findings(truth: &Value, parse_edge: &impl Fn(&Value) -> Option<FileEdge
             count(finding, "evidence_total"),
         );
     }
+}
+
+const CATCHALL_WORDS: [&str; 12] = [
+    "misc",
+    "miscellaneous",
+    "other",
+    "others",
+    "catchall",
+    "unclassified",
+    "uncategorized",
+    "unsorted",
+    "leftover",
+    "leftovers",
+    "everything",
+    "grabbag",
+];
+
+const COMPANION_DIRS: [&str; 12] = [
+    "docs", "doc", "tests", "test", "rsi", "deploy", "scripts", "evals", "examples", "benches",
+    "fixtures", ".github",
+];
+
+fn slugify_safe_token(raw: &str, fallback: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for part in raw
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+    {
+        let lower = part.to_ascii_lowercase();
+        if CATCHALL_WORDS.contains(&lower.as_str()) {
+            parts.push("component".to_string());
+        } else {
+            parts.push(lower);
+        }
+    }
+    if parts.is_empty() {
+        fallback.to_string()
+    } else {
+        parts.join("-")
+    }
+}
+
+fn dir_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+fn repo_relative_if_inside(
+    canonical_root: &Path,
+    target: &Path,
+    boundary: &BoundaryPolicy,
+) -> Option<String> {
+    let real_target = real_registry_path(target);
+    let rel = real_target.strip_prefix(canonical_root).ok()?;
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let norm = normalize_repo_path(&rel_str).ok()?;
+    match_exclusion(boundary, &norm).is_none().then_some(norm)
+}
+
+struct GenerateOpts {
+    root: PathBuf,
+    registry: PathBuf,
+    apply: bool,
+    force: bool,
+    json: bool,
+}
+
+fn parse_generate_opts(args: &[String]) -> Result<GenerateOpts, String> {
+    const GEN_FLAGS: [&str; 2] = ["root", "registry"];
+    let flags = crate::Flags::parse_with_switches(args, &["apply", "force", "json"])?;
+    if let Some(unknown) = flags.names().find(|name| !GEN_FLAGS.contains(name)) {
+        return Err(format!("unexpected flag --{unknown}"));
+    }
+    let root = flags.get("root").map_or_else(default_root, PathBuf::from);
+    let registry = flags
+        .get("registry")
+        .map_or_else(|| default_registry_path(&root), PathBuf::from);
+    Ok(GenerateOpts {
+        root,
+        registry,
+        apply: flags.switch("apply"),
+        force: flags.switch("force"),
+        json: flags.switch("json"),
+    })
+}
+
+struct GenCluster {
+    id_seed: String,
+    title: String,
+    summary: String,
+    files: BTreeSet<String>,
+}
+
+fn unit_id_seed_and_title(unit_id: &str) -> (String, String) {
+    let raw = unit_id
+        .strip_prefix("cargo:")
+        .or_else(|| unit_id.strip_prefix("npm:"))
+        .or_else(|| unit_id.strip_prefix("py:"))
+        .unwrap_or(unit_id);
+    let clean = raw.trim_start_matches('@').replace('/', "-");
+    let seed = slugify_safe_token(&clean, "unit");
+    let title = format!("{clean} component");
+    (seed, title)
+}
+
+fn assign_remaining_file_cluster(
+    path: &str,
+    src_subdirs: &BTreeSet<String>,
+    root_unit_key: Option<&str>,
+    clusters: &mut BTreeMap<String, GenCluster>,
+) {
+    if let Some(rest) = path.strip_prefix("src/")
+        && src_subdirs.len() >= 2
+        && let Some((sub, _)) = rest.split_once('/')
+    {
+        let key = format!("src:{sub}");
+        let seed = slugify_safe_token(sub, "module");
+        clusters
+            .entry(key)
+            .or_insert_with(|| GenCluster {
+                id_seed: seed,
+                title: format!("{sub} module"),
+                summary: format!("Module capabilities under src/{sub}/."),
+                files: BTreeSet::new(),
+            })
+            .files
+            .insert(path.to_string());
+        return;
+    }
+
+    if !path.contains('/') {
+        if src_subdirs.len() < 2
+            && let Some(root_key) = root_unit_key
+            && let Some(cluster) = clusters.get_mut(root_key)
+        {
+            cluster.files.insert(path.to_string());
+            return;
+        }
+        clusters
+            .entry("root:workspace".to_string())
+            .or_insert_with(|| GenCluster {
+                id_seed: "workspace-config".to_string(),
+                title: "Workspace configuration".to_string(),
+                summary: "Repository root manifests, build configuration, and top-level docs."
+                    .to_string(),
+                files: BTreeSet::new(),
+            })
+            .files
+            .insert(path.to_string());
+        return;
+    }
+
+    let (top, tail) = path.split_once('/').expect("checked contains('/')");
+    let container = matches!(
+        top,
+        "crates" | "packages" | "apps" | "services" | "libs" | "modules" | "scripts"
+    );
+    let (key, seed, title, summary) = if container && let Some((sub, _)) = tail.split_once('/') {
+        let seed = slugify_safe_token(&format!("{top}-{sub}"), "module");
+        (
+            format!("dir:{top}/{sub}"),
+            seed,
+            format!("{top}/{sub} module"),
+            format!("Files and automation under {top}/{sub}/."),
+        )
+    } else {
+        let label = if top == "docs" { "documentation" } else { top };
+        let seed = slugify_safe_token(label, "module");
+        (
+            format!("dir:{top}"),
+            seed,
+            format!("{top} module"),
+            format!("Cohesive files under {top}/."),
+        )
+    };
+    clusters
+        .entry(key)
+        .or_insert_with(|| GenCluster {
+            id_seed: seed,
+            title,
+            summary,
+            files: BTreeSet::new(),
+        })
+        .files
+        .insert(path.to_string());
+}
+
+fn attach_affinity_files(
+    unassigned: Vec<String>,
+    graph: &CodeGraph,
+    clusters: &mut BTreeMap<String, GenCluster>,
+    file_to_cluster: &mut BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut still_unassigned = Vec::new();
+    for path in unassigned {
+        let mut affinity: BTreeMap<String, usize> = BTreeMap::new();
+        for edge in &graph.edges {
+            let neighbor = if edge.from == path {
+                &edge.to
+            } else if edge.to == path {
+                &edge.from
+            } else {
+                continue;
+            };
+            if let Some(key) = file_to_cluster.get(neighbor) {
+                let w = if edge.scope == Scope::Prod { 3 } else { 1 };
+                *affinity.entry(key.clone()).or_default() += w;
+            }
+        }
+        let top_dir = path.split_once('/').map(|(top, _)| top);
+        let is_companion_or_root = top_dir.is_none_or(|d| COMPANION_DIRS.contains(&d));
+        let chosen = affinity
+            .into_iter()
+            .filter(|(key, _)| {
+                is_companion_or_root
+                    || clusters.get(key).is_some_and(|c| {
+                        let existing_top: BTreeSet<&str> = c
+                            .files
+                            .iter()
+                            .filter_map(|f| f.split_once('/').map(|(t, _)| t))
+                            .collect();
+                        top_dir.is_none_or(|t| existing_top.contains(t) || existing_top.len() < 2)
+                    })
+            })
+            .max_by(|(k1, s1), (k2, s2)| s1.cmp(s2).then_with(|| k2.cmp(k1)))
+            .map(|(k, _)| k);
+
+        if let Some(key) = chosen
+            && let Some(cluster) = clusters.get_mut(&key)
+        {
+            cluster.files.insert(path.clone());
+            file_to_cluster.insert(path, key);
+        } else {
+            still_unassigned.push(path);
+        }
+    }
+    still_unassigned
+}
+
+fn cluster_files_for_generate(in_scope: &BTreeSet<String>, graph: &CodeGraph) -> Vec<GenCluster> {
+    let mut clusters: BTreeMap<String, GenCluster> = BTreeMap::new();
+    let mut non_root_units: Vec<&spawn_core::feature_deps::Unit> =
+        graph.units.iter().filter(|u| !u.root.is_empty()).collect();
+    non_root_units.sort_by(|a, b| {
+        Reverse(a.root.len())
+            .cmp(&Reverse(b.root.len()))
+            .then_with(|| a.root.cmp(&b.root))
+    });
+
+    let root_unit = graph.units.iter().find(|u| u.root.is_empty());
+    let src_subdirs: BTreeSet<String> = in_scope
+        .iter()
+        .filter_map(|p| {
+            p.strip_prefix("src/")
+                .and_then(|rest| rest.split_once('/'))
+                .map(|(sub, _)| sub.to_string())
+        })
+        .collect();
+
+    let root_unit_key = root_unit.map(|u| format!("unit:{}", u.id));
+    if let (Some(ru), Some(key)) = (root_unit, root_unit_key.as_deref()) {
+        let (seed, title) = unit_id_seed_and_title(&ru.id);
+        clusters.insert(
+            key.to_string(),
+            GenCluster {
+                id_seed: seed,
+                title,
+                summary: format!("Code unit {}.", ru.id),
+                files: BTreeSet::new(),
+            },
+        );
+    }
+
+    let mut file_to_cluster: BTreeMap<String, String> = BTreeMap::new();
+    let mut unassigned: Vec<String> = Vec::new();
+    for path in in_scope {
+        if let Some(unit) = non_root_units
+            .iter()
+            .find(|u| path == &u.root || path.starts_with(&format!("{}/", u.root)))
+        {
+            let key = format!("unit:{}", unit.id);
+            let (seed, title) = unit_id_seed_and_title(&unit.id);
+            clusters
+                .entry(key.clone())
+                .or_insert_with(|| GenCluster {
+                    id_seed: seed,
+                    title,
+                    summary: format!("Code unit {} ({}/).", unit.id, unit.root),
+                    files: BTreeSet::new(),
+                })
+                .files
+                .insert(path.clone());
+            file_to_cluster.insert(path.clone(), key);
+        } else if let Some(info) = graph.files.get(path)
+            && info.unit.as_deref() == root_unit.map(|u| u.id.as_str())
+            && !(path.starts_with("src/") && src_subdirs.len() >= 2)
+            && let Some(key) = root_unit_key.as_deref()
+        {
+            clusters
+                .get_mut(key)
+                .expect("root unit cluster")
+                .files
+                .insert(path.clone());
+            file_to_cluster.insert(path.clone(), key.to_string());
+        } else {
+            unassigned.push(path.clone());
+        }
+    }
+
+    let still_unassigned =
+        attach_affinity_files(unassigned, graph, &mut clusters, &mut file_to_cluster);
+    for path in still_unassigned {
+        assign_remaining_file_cluster(&path, &src_subdirs, root_unit_key.as_deref(), &mut clusters);
+    }
+
+    clusters
+        .into_values()
+        .filter(|cluster| !cluster.files.is_empty())
+        .collect()
+}
+
+fn reaches_in_adj(start: &str, goal: &str, adj: &BTreeMap<String, BTreeSet<String>>) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::from([start]);
+    while let Some(cur) = queue.pop_front() {
+        if cur == goal {
+            return true;
+        }
+        if let Some(neighbors) = adj.get(cur) {
+            for next in neighbors {
+                if seen.insert(next.as_str()) {
+                    queue.push_back(next.as_str());
+                }
+            }
+        }
+    }
+    false
+}
+
+fn infer_acyclic_depends(graph: &CodeGraph, registry: &mut FeatureRegistry) {
+    let projected = feature_deps::project(graph, registry);
+    let mut candidates: Vec<(usize, String, String)> = projected
+        .edges
+        .into_iter()
+        .filter_map(|edge| {
+            let ([from], [to]) = (edge.from_any_of.as_slice(), edge.to_any_of.as_slice()) else {
+                return None;
+            };
+            (edge.prod_edges > 0 && from != to).then(|| (edge.prod_edges, from.clone(), to.clone()))
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        Reverse(a.0)
+            .cmp(&Reverse(b.0))
+            .then_with(|| (&a.1, &a.2).cmp(&(&b.1, &b.2)))
+    });
+
+    let mut adj: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut depends_for: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (_, from, to) in candidates {
+        if !reaches_in_adj(&to, &from, &adj) {
+            adj.entry(from.clone()).or_default().insert(to.clone());
+            depends_for.entry(from).or_default().insert(to);
+        }
+    }
+
+    for node in &mut registry.features {
+        if let Some(targets) = depends_for.get(&node.id) {
+            node.relations = targets
+                .iter()
+                .map(|target| FeatureRelation {
+                    kind: RelationKind::DependsOn,
+                    target: target.clone(),
+                    note: None,
+                })
+                .collect();
+        }
+    }
+}
+
+fn build_generated_registry(
+    root: &Path,
+    registry_path: &Path,
+    include_registry_file: bool,
+) -> Result<(FeatureRegistry, CodeGraph), String> {
+    let boundary = generic_boundary(root);
+    let initiative_id = slugify_safe_token(&boundary.project_name, "project");
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|error| format!("resolve project root {}: {error}", root.display()))?;
+    let inventory = collect_inventory(root, &boundary)?;
+    let (graph, _) = build_code_graph(root, &boundary)?;
+
+    let mut in_scope: BTreeSet<String> = inventory
+        .iter()
+        .filter(|e| !e.path.ends_with('/') && match_exclusion(&boundary, &e.path).is_none())
+        .filter_map(|e| normalize_repo_path(&e.path).ok())
+        .collect();
+    if include_registry_file
+        && let Some(rel_reg) = repo_relative_if_inside(&canonical_root, registry_path, &boundary)
+    {
+        in_scope.insert(rel_reg);
+    }
+
+    let domain_id = format!("domain-{initiative_id}");
+    let mut used_ids: BTreeSet<String> = BTreeSet::from([domain_id.clone()]);
+    let clusters = cluster_files_for_generate(&in_scope, &graph);
+
+    let mut features = vec![FeatureNode {
+        id: domain_id.clone(),
+        title: format!("{} domain", boundary.project_name),
+        kind: FeatureKind::Domain,
+        parent: None,
+        summary: format!(
+            "Top-level domain organizing {} capabilities.",
+            boundary.project_name
+        ),
+        status_note: None,
+        files: Vec::new(),
+        relations: Vec::new(),
+        provenance: FeatureProvenance::default(),
+    }];
+
+    let mut capabilities: Vec<FeatureNode> = Vec::with_capacity(clusters.len());
+    for cluster in clusters {
+        let base_id = format!("cap-{}", cluster.id_seed);
+        let mut id = base_id.clone();
+        let mut suffix = 2usize;
+        while !used_ids.insert(id.clone()) {
+            id = format!("{base_id}-{suffix}");
+            suffix += 1;
+        }
+        capabilities.push(FeatureNode {
+            id,
+            title: cluster.title,
+            kind: FeatureKind::Capability,
+            parent: Some(domain_id.clone()),
+            summary: cluster.summary,
+            status_note: None,
+            files: cluster.files.into_iter().collect(),
+            relations: Vec::new(),
+            provenance: FeatureProvenance::default(),
+        });
+    }
+    capabilities.sort_by(|a, b| a.id.cmp(&b.id));
+    features.extend(capabilities);
+
+    let mut registry = FeatureRegistry {
+        schema_version: SCHEMA_VERSION,
+        initiative_id,
+        boundary,
+        features,
+    };
+    infer_acyclic_depends(&graph, &mut registry);
+    let consistency = validate_registry(&registry);
+    if !consistency.is_clean() {
+        return Err(format!(
+            "generated registry failed validation: {consistency:?}"
+        ));
+    }
+    Ok((registry, graph))
+}
+
+fn cmd_generate(args: &[String]) -> Result<i32, String> {
+    let opts = parse_generate_opts(args)?;
+    if opts.apply && opts.registry.exists() && !opts.force {
+        return Err(format!(
+            "registry {} already exists; re-run with --force to overwrite",
+            opts.registry.display()
+        ));
+    }
+    let (registry, graph) = build_generated_registry(&opts.root, &opts.registry, opts.apply)?;
+    let truth = feature_deps::truth(&graph, &registry, &TruthPolicy::default(), &utc_today());
+    let purity = feature_deps::check_purity(&registry, Some(&graph));
+    let total_files: usize = registry.features.iter().map(|f| f.files.len()).sum();
+
+    if opts.apply {
+        save_registry_atomic(&opts.registry, &registry)?;
+    }
+
+    if opts.json || !opts.apply {
+        let payload = json!({
+            "schema_version": 1,
+            "applied": opts.apply,
+            "dry_run": !opts.apply,
+            "root": opts.root.display().to_string(),
+            "registry_path": opts.registry.display().to_string(),
+            "feature_count": registry.features.len(),
+            "covered_files": total_files,
+            "truth_counts": truth.counts,
+            "purity": purity,
+            "registry": registry,
+        });
+        let text = serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("serialize generate output: {error}"))?;
+        println!("{text}");
+    } else {
+        println!(
+            "generated {} feature(s) covering {} file(s) at {} (purity errors: {}, truth errors: {})",
+            registry.features.len(),
+            total_files,
+            opts.registry.display(),
+            purity.counts.error,
+            truth.counts.error,
+        );
+    }
+    Ok(0)
+}
+
+struct SyncOpts {
+    root: PathBuf,
+    registry: PathBuf,
+    policy: Option<PathBuf>,
+    apply: bool,
+    json: bool,
+}
+
+fn parse_sync_opts(args: &[String]) -> Result<SyncOpts, String> {
+    const SYNC_FLAGS: [&str; 3] = ["root", "registry", "policy"];
+    let flags = crate::Flags::parse_with_switches(args, &["apply", "json"])?;
+    if let Some(unknown) = flags.names().find(|name| !SYNC_FLAGS.contains(name)) {
+        return Err(format!("unexpected flag --{unknown}"));
+    }
+    let root = flags.get("root").map_or_else(default_root, PathBuf::from);
+    let registry = flags
+        .get("registry")
+        .map_or_else(|| default_registry_path(&root), PathBuf::from);
+    let policy = flags.get("policy").map(PathBuf::from);
+    Ok(SyncOpts {
+        root,
+        registry,
+        policy,
+        apply: flags.switch("apply"),
+        json: flags.switch("json"),
+    })
+}
+
+fn strip_stale_references(
+    registry: &mut FeatureRegistry,
+    in_scope: &BTreeSet<String>,
+) -> (Vec<Value>, Vec<Value>) {
+    let mut stale_files = Vec::new();
+    let mut stale_provenance = Vec::new();
+    for node in &mut registry.features {
+        let mut kept_files = Vec::with_capacity(node.files.len());
+        for raw in &node.files {
+            if normalize_repo_path(raw)
+                .ok()
+                .is_some_and(|norm| in_scope.contains(&norm))
+            {
+                kept_files.push(raw.clone());
+            } else {
+                stale_files.push(json!({ "feature_id": node.id, "path": raw }));
+            }
+        }
+        node.files = kept_files;
+
+        for (field, list) in [
+            ("tests", &mut node.provenance.tests),
+            ("artifacts", &mut node.provenance.artifacts),
+        ] {
+            let mut kept = Vec::with_capacity(list.len());
+            for raw in list.iter() {
+                let keep = !looks_like_repo_path(raw)
+                    || normalize_repo_path(raw)
+                        .ok()
+                        .is_some_and(|norm| in_scope.contains(&norm));
+                if keep {
+                    kept.push(raw.clone());
+                } else {
+                    stale_provenance.push(json!({
+                        "feature_id": node.id,
+                        "field": field,
+                        "path": raw,
+                    }));
+                }
+            }
+            *list = kept;
+        }
+    }
+    (stale_files, stale_provenance)
+}
+
+fn path_tokens(path: &str) -> BTreeSet<String> {
+    path.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|tok| tok.len() >= 2)
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn dir_cohesion_key(wild: &str, feature: &FeatureNode) -> (bool, usize, usize, usize, usize, bool) {
+    let wild_dir = dir_of(wild);
+    let wild_segs: Vec<&str> = wild_dir.split('/').filter(|s| !s.is_empty()).collect();
+    let mut same_dir_hits = 0usize;
+    let mut max_prefix_segs = 0usize;
+    let mut max_prefix_hits = 0usize;
+
+    for existing in &feature.files {
+        let ex_dir = dir_of(existing);
+        if ex_dir == wild_dir {
+            same_dir_hits += 1;
+        }
+        let shared = ex_dir
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .zip(wild_segs.iter().copied())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if shared > max_prefix_segs {
+            max_prefix_segs = shared;
+            max_prefix_hits = 1;
+        } else if shared == max_prefix_segs && shared > 0 {
+            max_prefix_hits += 1;
+        }
+    }
+
+    let wild_toks = path_tokens(wild);
+    let mut feature_toks = path_tokens(&feature.id);
+    feature_toks.extend(path_tokens(&feature.title));
+    let stem_hits = wild_toks.intersection(&feature_toks).count();
+    let non_root = !feature.kind.may_be_root();
+
+    (
+        same_dir_hits > 0,
+        max_prefix_segs,
+        stem_hits,
+        same_dir_hits,
+        max_prefix_hits,
+        non_root,
+    )
+}
+
+fn best_affinity_for_wild(
+    wild: &str,
+    eligible_indices: &[usize],
+    features: &[FeatureNode],
+    file_to_features: &BTreeMap<String, BTreeSet<usize>>,
+    graph: &CodeGraph,
+) -> Option<(usize, usize, Vec<String>)> {
+    let mut scores: BTreeMap<usize, (usize, Vec<String>)> = BTreeMap::new();
+    for edge in &graph.edges {
+        let neighbor = if edge.from == wild {
+            &edge.to
+        } else if edge.to == wild {
+            &edge.from
+        } else {
+            continue;
+        };
+        let Some(owners) = file_to_features.get(neighbor) else {
+            continue;
+        };
+        let owner_count = owners.len().max(1);
+        let base = if edge.scope == Scope::Prod && !edge.kind.is_structural() {
+            30usize
+        } else if edge.kind.is_structural() {
+            20
+        } else {
+            10
+        };
+        let weight = ((base * 10) / owner_count).max(1);
+        let desc = format!("{}:{} -> {}", edge.from, edge.line, edge.to);
+        for &owner_idx in owners {
+            let entry = scores.entry(owner_idx).or_insert_with(|| (0, Vec::new()));
+            entry.0 += weight;
+            if entry.1.len() < feature_deps::EVIDENCE_LIMIT {
+                entry.1.push(desc.clone());
+            }
+        }
+    }
+
+    eligible_indices
+        .iter()
+        .filter_map(|&idx| scores.remove(&idx).map(|(score, ev)| (idx, score, ev)))
+        .max_by(|(i1, s1, _), (i2, s2, _)| {
+            s1.cmp(s2)
+                .then_with(|| {
+                    dir_cohesion_key(wild, &features[*i1])
+                        .cmp(&dir_cohesion_key(wild, &features[*i2]))
+                })
+                .then_with(|| features[*i2].id.cmp(&features[*i1].id))
+        })
+}
+
+fn assign_pass_code_affinity(
+    registry: &mut FeatureRegistry,
+    eligible: &[usize],
+    remaining: &mut Vec<String>,
+    file_to_features: &mut BTreeMap<String, BTreeSet<usize>>,
+    touched_features: &mut BTreeSet<usize>,
+    graph: &CodeGraph,
+) -> Vec<Value> {
+    let mut assigned = Vec::new();
+    loop {
+        let mut best_global: Option<(usize, usize, usize, Vec<String>)> = None;
+        for (pos, wild) in remaining.iter().enumerate() {
+            if let Some((feat_idx, score, ev)) =
+                best_affinity_for_wild(wild, eligible, &registry.features, file_to_features, graph)
+            {
+                let candidate_key = (score, dir_cohesion_key(wild, &registry.features[feat_idx]));
+                let replace = match &best_global {
+                    None => true,
+                    Some((prev_pos, prev_feat, prev_score, _)) => {
+                        let prev_key = (
+                            *prev_score,
+                            dir_cohesion_key(&remaining[*prev_pos], &registry.features[*prev_feat]),
+                        );
+                        candidate_key > prev_key
+                            || (candidate_key == prev_key && wild < &remaining[*prev_pos])
+                    }
+                };
+                if replace {
+                    best_global = Some((pos, feat_idx, score, ev));
+                }
+            }
+        }
+        let Some((pos, feat_idx, score, evidence)) = best_global else {
+            break;
+        };
+        let path = remaining.remove(pos);
+        registry.features[feat_idx].files.push(path.clone());
+        file_to_features
+            .entry(path.clone())
+            .or_default()
+            .insert(feat_idx);
+        touched_features.insert(feat_idx);
+        assigned.push(json!({
+            "path": path,
+            "feature_id": registry.features[feat_idx].id,
+            "strategy": "code_graph_affinity",
+            "score": score,
+            "evidence": evidence,
+        }));
+    }
+    assigned
+}
+
+fn assign_wild_files_sync(
+    registry: &mut FeatureRegistry,
+    wild_paths: &[String],
+    graph: &CodeGraph,
+) -> Result<Vec<Value>, String> {
+    if wild_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let eligible: Vec<usize> = registry
+        .features
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, f)| (f.kind != FeatureKind::Domain).then_some(idx))
+        .collect();
+    if eligible.is_empty() {
+        return Err("registry has no non-domain feature node to receive wild files".to_string());
+    }
+
+    let mut file_to_features: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    for &idx in &eligible {
+        for path in &registry.features[idx].files {
+            if let Ok(norm) = normalize_repo_path(path) {
+                file_to_features.entry(norm).or_default().insert(idx);
+            }
+        }
+    }
+
+    let mut remaining: Vec<String> = wild_paths.to_vec();
+    let mut touched_features: BTreeSet<usize> = BTreeSet::new();
+    let mut assigned = assign_pass_code_affinity(
+        registry,
+        &eligible,
+        &mut remaining,
+        &mut file_to_features,
+        &mut touched_features,
+        graph,
+    );
+
+    // Pass 2: directory cohesion fallback for remaining files.
+    for path in remaining {
+        let feat_idx = *eligible
+            .iter()
+            .max_by(|&&i1, &&i2| {
+                dir_cohesion_key(&path, &registry.features[i1])
+                    .cmp(&dir_cohesion_key(&path, &registry.features[i2]))
+                    .then_with(|| registry.features[i2].id.cmp(&registry.features[i1].id))
+            })
+            .expect("eligible non-empty");
+        let cohesion = dir_cohesion_key(&path, &registry.features[feat_idx]);
+        let strategy = if cohesion.1 > 0 || cohesion.2 > 0 {
+            "directory_cohesion"
+        } else {
+            "fallback_cohesion"
+        };
+        registry.features[feat_idx].files.push(path.clone());
+        touched_features.insert(feat_idx);
+        assigned.push(json!({
+            "path": path,
+            "feature_id": registry.features[feat_idx].id,
+            "strategy": strategy,
+            "shared_dir_segments": cohesion.1,
+            "token_hits": cohesion.2,
+        }));
+    }
+
+    for idx in touched_features {
+        registry.features[idx].files.sort();
+        registry.features[idx].files.dedup();
+    }
+    Ok(assigned)
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct FindingKey<'a> {
+    code: &'static str,
+    waived: bool,
+    from: &'a [String],
+    to: &'a [String],
+    features: &'a [String],
+}
+
+fn finding_key(f: &Finding) -> FindingKey<'_> {
+    FindingKey {
+        code: f.code.as_str(),
+        waived: f.waived,
+        from: &f.from_any_of,
+        to: &f.to_any_of,
+        features: &f.features,
+    }
+}
+
+fn compute_truth_deltas(before: &TruthReport, after: &TruthReport) -> Value {
+    let before_keys: BTreeSet<FindingKey<'_>> = before.findings.iter().map(finding_key).collect();
+    let after_keys: BTreeSet<FindingKey<'_>> = after.findings.iter().map(finding_key).collect();
+    let added: Vec<&Finding> = after
+        .findings
+        .iter()
+        .filter(|f| !before_keys.contains(&finding_key(f)))
+        .collect();
+    let resolved: Vec<&Finding> = before
+        .findings
+        .iter()
+        .filter(|f| !after_keys.contains(&finding_key(f)))
+        .collect();
+    json!({
+        "before_counts": before.counts,
+        "after_counts": after.counts,
+        "added_count": added.len(),
+        "resolved_count": resolved.len(),
+        "added_findings": added,
+        "resolved_findings": resolved,
+    })
+}
+
+fn cmd_sync(args: &[String]) -> Result<i32, String> {
+    let opts = parse_sync_opts(args)?;
+    let registry = load_registry(&opts.registry)?;
+    let policy = load_optional_truth_policy(opts.policy.as_deref())?;
+    let inventory = collect_inventory(&opts.root, &registry.boundary)?;
+    let (graph, _) = build_code_graph(&opts.root, &registry.boundary)?;
+    let today = utc_today();
+
+    let before_scan = scan_coverage(&registry, &inventory, now_ms());
+    let before_truth = feature_deps::truth(&graph, &registry, &policy, &today);
+    let in_scope: BTreeSet<String> = inventory
+        .iter()
+        .filter(|e| {
+            !e.path.ends_with('/') && match_exclusion(&registry.boundary, &e.path).is_none()
+        })
+        .filter_map(|e| normalize_repo_path(&e.path).ok())
+        .collect();
+
+    let mut updated = registry.clone();
+    let (stale_removed, stale_provenance_removed) = strip_stale_references(&mut updated, &in_scope);
+    let wild_paths: Vec<String> = before_scan
+        .unassociated_files
+        .iter()
+        .map(|w| w.path.clone())
+        .collect();
+    let wild_assigned = assign_wild_files_sync(&mut updated, &wild_paths, &graph)?;
+
+    let consistency = validate_registry(&updated);
+    if !consistency.is_clean() {
+        return Err(format!(
+            "synced registry failed validation: {consistency:?}"
+        ));
+    }
+    let after_scan = scan_coverage(&updated, &inventory, now_ms());
+    let after_truth = feature_deps::truth(&graph, &updated, &policy, &today);
+    let purity = feature_deps::check_purity(&updated, Some(&graph));
+    let truth_deltas = compute_truth_deltas(&before_truth, &after_truth);
+    let changed = updated != registry;
+
+    if opts.apply && changed {
+        save_registry_atomic(&opts.registry, &updated)?;
+    }
+
+    if opts.json {
+        let payload = json!({
+            "schema_version": 1,
+            "applied": opts.apply && changed,
+            "dry_run": !opts.apply,
+            "changed": changed,
+            "root": opts.root.display().to_string(),
+            "registry_path": opts.registry.display().to_string(),
+            "counts_before": before_scan.counts,
+            "counts_after": after_scan.counts,
+            "stale_removed": stale_removed,
+            "stale_provenance_removed": stale_provenance_removed,
+            "wild_assigned": wild_assigned,
+            "truth_deltas": truth_deltas,
+            "purity": purity,
+        });
+        let text = serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("serialize sync report: {error}"))?;
+        println!("{text}");
+    } else {
+        println!(
+            "features sync ({}) — changed={} stale_removed={} wild_assigned={} after_wild={} after_stale={} truth_added={} truth_resolved={} purity_errors={}",
+            if opts.apply { "apply" } else { "dry-run" },
+            changed,
+            stale_removed.len() + stale_provenance_removed.len(),
+            wild_assigned.len(),
+            after_scan.counts.unassociated_wild,
+            after_scan.counts.stale_references,
+            truth_deltas["added_count"].as_u64().unwrap_or(0),
+            truth_deltas["resolved_count"].as_u64().unwrap_or(0),
+            purity.counts.error,
+        );
+    }
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -2231,5 +3354,38 @@ mod tests {
         assert_eq!(payload["truth"]["findings"], json!([]));
         assert_eq!(payload["truth"]["counts"]["error"], json!(0));
         assert_eq!(payload["truth"]["counts"]["by_code"], json!({}));
+    }
+
+    #[test]
+    fn check_deps_and_purity_unit_contracts() {
+        let project = Project::new("check-deps-purity", GRAPH_PROJECT);
+        let reg_path = project.0.join("registry.json");
+        let mut reg = graph_registry_fixture();
+        reg.features[1].files.extend([
+            "Cargo.toml".to_string(),
+            "README.md".to_string(),
+            "registry.json".to_string(),
+        ]);
+        save_registry_atomic(&reg_path, &reg).expect("save");
+        let args = |extra: &[&str]| -> Vec<String> {
+            std::iter::once("check".to_string())
+                .chain(graph_args(&project, extra))
+                .collect()
+        };
+
+        assert_eq!(
+            command(&args(&["--deps", "report"])).expect("deps report"),
+            0
+        );
+        assert_eq!(
+            command(&args(&["--deps", "enforce"])).expect("deps enforce"),
+            1
+        );
+        assert_eq!(
+            command(&args(&["--purity", "enforce"])).expect("purity enforce"),
+            0
+        );
+        let err = command(&args(&["--deps", "bogus"])).expect_err("bad deps mode");
+        assert!(err.contains("--deps"), "{err}");
     }
 }
