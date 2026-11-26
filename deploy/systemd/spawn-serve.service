@@ -6,7 +6,7 @@ After=network-online.target
 # Not the owner's checkout: nothing live reads it (deploy/deploy.sh).
 WorkingDirectory=%h/.local/share/spawn-rsi
 EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # The deployed UI build (deploy/deploy.sh installs it), not the checkout's.
 Environment=SPAWN_WEB_DIR=%h/.local/share/spawn-rsi/web
 # The feature map's tree (/api/features, docs/feature-map/registry.json):

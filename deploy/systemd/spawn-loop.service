@@ -8,8 +8,7 @@ Wants=spawn-jev-relay.service spawn-model-relay.service
 WorkingDirectory=%h/.local/share/spawn-rsi
 EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
 Environment=PATH=%h/.cargo/bin:%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-# Claude Code reaches its API through the local proxy; loopback stays direct.
-Environment=http_proxy=http://127.0.0.1:10801 https_proxy=http://127.0.0.1:10801 HTTP_PROXY=http://127.0.0.1:10801 HTTPS_PROXY=http://127.0.0.1:10801
+# Engines talk to loopback relays or direct egress; no local proxy listens on 10801.
 Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
 Environment=SPAWN_PROGRAM=%h/.local/share/spawn-rsi/bin/spawn
 # Free disk under 40 GiB is an alert (objective 204; the owner's core metric set).
