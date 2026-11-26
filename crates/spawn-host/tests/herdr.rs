@@ -895,6 +895,45 @@ fn a_server_of_other_detection_manifests_is_refused_naming_both() {
         .expect("terminate");
 }
 
+/// What `GET /api/capabilities` shows of the terminal backend (Herdr PR
+/// 4): the running server's protocol and its active agent detection
+/// manifests, beside the pinned ones; read-only, and an error, not a
+/// server started, when none answers.
+#[test]
+fn the_server_facts_name_its_protocol_and_active_manifests() {
+    let _serial = exclusive();
+    let Some(session) = Session::new() else {
+        return;
+    };
+    let host = session.host();
+    let one = terminal("spawn-exec_a9");
+    host.start(&session.launch(&one, "exec cat"))
+        .expect("start");
+    let facts = host.server_facts().expect("the server answers");
+    assert_eq!(facts["protocol"], spawn_host::herdr::PROTOCOL);
+    assert_eq!(facts["expected_protocol"], spawn_host::herdr::PROTOCOL);
+    for (agent, version) in spawn_host::herdr::MANIFESTS {
+        let active = facts["manifests"]
+            .as_array()
+            .expect("manifests")
+            .iter()
+            .find(|manifest| manifest["agent"] == agent)
+            .and_then(|manifest| manifest["active_version"].as_str());
+        assert_eq!(active, Some(version), "{facts}");
+        assert!(
+            facts["pinned_manifests"]
+                .as_array()
+                .expect("pinned")
+                .iter()
+                .any(|pin| pin["agent"] == agent && pin["version"] == version),
+            "{facts}"
+        );
+    }
+    assert!(host.program().ends_with("herdr"), "{}", host.program());
+    host.terminate(&one, &session.workspace())
+        .expect("terminate");
+}
+
 /// A process the engine detached from its session (`setsid`, as agy's
 /// background updater does) is still beneath the workspace once the pane
 /// is closed: terminate ends it by pid before it returns.
