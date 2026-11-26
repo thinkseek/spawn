@@ -204,7 +204,9 @@ only where they exercise it.
 A deploy that enables agy (`SPAWN_ENGINES=claude,agy`) also needs, in the
 loop's environment, `SPAWN_TERMINAL_BACKEND=herdr` and `SPAWN_AGY_MODEL`
 (optionally `SPAWN_AGY_PROGRAM`, `SPAWN_AGY_HOME`), and on the host herdr
-0.9.5 with its antigravity-cli integration and a logged-in agy. Without them,
+0.9.5 with its antigravity-cli integration, a logged-in agy and a working
+`bwrap` on the loop's `PATH` (agy runs only inside its filesystem view,
+`SPAWN_ENGINE_VIEW=required` by default; item 12 above). Without them,
 an agy start is refused before launch, saying what is missing. Claude Code
 is unaffected. The loop probes the engines at its start and hourly
 (`<program> --version`, `agy models`; bounded, no shell, login files only
