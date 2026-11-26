@@ -194,6 +194,10 @@ pub(crate) enum WorkspaceBackend {
     Cow,
     /// An unprivileged overlay per workspace (Linux): by name only.
     Overlay,
+    /// Dual-track oracle wrapping authoritative `git` beside shadow `d6`: opt-in only.
+    D6Shadow,
+    /// Pure-Rust CAS Merkle + ledger workspace store (`D6Workspace`): opt-in only.
+    D6,
     /// The cheapest engine the root supports that the loop serves
     /// ([`spawn_host::WorkspaceBackend::auto_with`]), chosen once at start.
     Auto,
@@ -205,6 +209,8 @@ impl WorkspaceBackend {
             Self::Git => "git",
             Self::Cow => "cow",
             Self::Overlay => "overlay",
+            Self::D6Shadow => "d6-shadow",
+            Self::D6 => "d6",
             Self::Auto => "auto",
         }
     }
@@ -220,11 +226,120 @@ pub(crate) fn workspace_backend(value: Option<&str>) -> Result<WorkspaceBackend,
             Some(spawn_host::WorkspaceBackend::Git) => Ok(WorkspaceBackend::Git),
             Some(spawn_host::WorkspaceBackend::Cow) => Ok(WorkspaceBackend::Cow),
             Some(spawn_host::WorkspaceBackend::Overlay) => Ok(WorkspaceBackend::Overlay),
+            Some(spawn_host::WorkspaceBackend::D6Shadow) => Ok(WorkspaceBackend::D6Shadow),
+            Some(spawn_host::WorkspaceBackend::D6) => Ok(WorkspaceBackend::D6),
             None => Err(format!(
                 "SPAWN_WORKSPACE_BACKEND={name:?} names no workspace backend: use git (the \
-                 default), cow, overlay or auto"
+                 default), cow, overlay, d6-shadow, d6 or auto"
             )),
         },
+    }
+}
+
+/// Default bounded L1 `tmpfs` budget in MiB when `SPAWN_D6_TMPFS_ROOT` is configured
+/// without `SPAWN_D6_TMPFS_BUDGET_MB`.
+pub(crate) const DEFAULT_D6_TMPFS_BUDGET_MB: u64 = 2048;
+
+/// Optional runtime configuration for opt-in `d6-shadow` and `d6` workspace backends.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct D6RuntimeConfig {
+    /// `SPAWN_D6_CAS_DIR`: override for the CAS Merkle + `refs.journal` directory.
+    pub(crate) cas_dir: Option<PathBuf>,
+    /// `SPAWN_D6_TMPFS_ROOT`: opt-in bounded L1 `tmpfs` upperdir directory.
+    pub(crate) tmpfs_root: Option<PathBuf>,
+    /// `SPAWN_D6_TMPFS_BUDGET_MB`: hard L1 memory budget in MiB (`2048` default when `tmpfs_root` set).
+    pub(crate) tmpfs_budget_mb: Option<u64>,
+    /// `SPAWN_D6_STRICT_FAIL_CLOSED`: fail checkpoints when `TrackedSetLeak` triggers in `d6-shadow`.
+    pub(crate) strict_fail_closed: bool,
+}
+
+fn parse_abs_dir(var_name: &str, raw: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let Some(text) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let path = std::path::Path::new(text);
+    if !path.is_absolute() {
+        return Err(format!(
+            "{var_name}={text:?} must be an absolute directory path"
+        ));
+    }
+    Ok(Some(spawn_host::canonical_root(path)))
+}
+
+fn parse_positive_u64(var_name: &str, raw: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(text) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    match text.parse::<u64>() {
+        Ok(value) if value > 0 => Ok(Some(value)),
+        _ => Err(format!(
+            "{var_name}={text:?} must be a positive whole number of MiB"
+        )),
+    }
+}
+
+fn parse_bool_flag(var_name: &str, raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("" | "0" | "false") => Ok(false),
+        Some("1" | "true") => Ok(true),
+        Some(other) => Err(format!("{var_name}={other:?} must be 1/true or 0/false")),
+    }
+}
+
+impl D6RuntimeConfig {
+    /// Parse `SPAWN_D6_*` configuration values explicitly (unit-testable without mutating env).
+    pub(crate) fn parse(
+        cas_dir: Option<&str>,
+        tmpfs_root: Option<&str>,
+        tmpfs_budget_mb: Option<&str>,
+        strict_fail_closed: Option<&str>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            cas_dir: parse_abs_dir("SPAWN_D6_CAS_DIR", cas_dir)?,
+            tmpfs_root: parse_abs_dir("SPAWN_D6_TMPFS_ROOT", tmpfs_root)?,
+            tmpfs_budget_mb: parse_positive_u64("SPAWN_D6_TMPFS_BUDGET_MB", tmpfs_budget_mb)?,
+            strict_fail_closed: parse_bool_flag("SPAWN_D6_STRICT_FAIL_CLOSED", strict_fail_closed)?,
+        })
+    }
+
+    /// Read and validate `SPAWN_D6_*` settings from the process environment.
+    pub(crate) fn from_env() -> Result<Self, String> {
+        Self::parse(
+            env_value("SPAWN_D6_CAS_DIR").as_deref(),
+            env_value("SPAWN_D6_TMPFS_ROOT").as_deref(),
+            env_value("SPAWN_D6_TMPFS_BUDGET_MB").as_deref(),
+            env_value("SPAWN_D6_STRICT_FAIL_CLOSED").as_deref(),
+        )
+    }
+
+    /// Resolved CAS root for `active` under workspace `root`.
+    pub(crate) fn effective_cas_dir(
+        &self,
+        root: &std::path::Path,
+        active: spawn_host::WorkspaceBackend,
+    ) -> PathBuf {
+        if let Some(dir) = &self.cas_dir {
+            return dir.clone();
+        }
+        match active {
+            spawn_host::WorkspaceBackend::D6Shadow => root.join(".d6-shadow").join("cas"),
+            _ => root.join(".d6").join("cas"),
+        }
+    }
+
+    /// Shadow staging/working root under `root` for `d6-shadow`.
+    pub(crate) fn shadow_work_root(root: &std::path::Path) -> PathBuf {
+        root.join(".d6-shadow").join("work")
+    }
+
+    /// Bounded L1 `tmpfs` policy when `SPAWN_D6_TMPFS_ROOT` is configured.
+    pub(crate) fn l1_policy(&self) -> Option<spawn_host::d6_workspace::L1TmpfsPolicy> {
+        self.tmpfs_root.as_ref().map(|tmpfs_root| {
+            spawn_host::d6_workspace::L1TmpfsPolicy::new(
+                tmpfs_root,
+                self.tmpfs_budget_mb.unwrap_or(DEFAULT_D6_TMPFS_BUDGET_MB),
+            )
+        })
     }
 }
 
@@ -300,6 +415,8 @@ pub(crate) struct WorkspaceSettings {
     pub(crate) active: spawn_host::WorkspaceBackend,
     /// `SPAWN_CAS_DEDUP=1`: build artifacts deduplicated (Cow only).
     pub(crate) cas_dedup: bool,
+    /// Opt-in D6 runtime configuration (`SPAWN_D6_*`).
+    pub(crate) d6: D6RuntimeConfig,
 }
 
 impl WorkspaceSettings {
@@ -311,7 +428,7 @@ impl WorkspaceSettings {
     /// Git's), so it starts where `spawn mission show` says it would; on a
     /// root no engine has, it is spawn-host's own rule
     /// ([`spawn_host::WorkspaceBackend::auto_with`]): Cow where the file
-    /// system clones, else Git; never the overlay.
+    /// system clones, else Git; never the overlay, never D6.
     pub(crate) fn resolve(
         configured: WorkspaceBackend,
         cas_dedup: bool,
@@ -321,6 +438,8 @@ impl WorkspaceSettings {
         let active = match configured {
             WorkspaceBackend::Git => spawn_host::WorkspaceBackend::Git,
             WorkspaceBackend::Cow => spawn_host::WorkspaceBackend::Cow,
+            WorkspaceBackend::D6Shadow => spawn_host::WorkspaceBackend::D6Shadow,
+            WorkspaceBackend::D6 => spawn_host::WorkspaceBackend::D6,
             WorkspaceBackend::Overlay => {
                 (probes.overlay)(root).map_err(|why| {
                     format!(
@@ -340,20 +459,29 @@ impl WorkspaceSettings {
             configured,
             active,
             cas_dedup,
+            d6: D6RuntimeConfig::default(),
         })
     }
 
+    /// Attach explicit [`D6RuntimeConfig`] settings (builder for tests and callers).
+    #[must_use]
+    pub(crate) fn with_d6(mut self, d6: D6RuntimeConfig) -> Self {
+        self.d6 = d6;
+        self
+    }
+
     /// The settings the environment gives for `root`
-    /// (`SPAWN_WORKSPACE_BACKEND`, `SPAWN_CAS_DEDUP`), resolved on the host
-    /// and the root claimed for the engine ([`spawn_host::claim_root`]: a
-    /// root another engine runs on is refused), once per root and process.
-    /// For a process that runs workspaces only: it writes under the root.
+    /// (`SPAWN_WORKSPACE_BACKEND`, `SPAWN_CAS_DEDUP`, `SPAWN_D6_*`), resolved on
+    /// the host and the root claimed for the engine ([`spawn_host::claim_root`]:
+    /// a root another incompatible engine runs on is refused), once per root
+    /// and process. For a process that runs workspaces only: it writes under the root.
     pub(crate) fn from_env(root: &std::path::Path) -> Result<Self, String> {
         static RESOLVED: std::sync::OnceLock<
             std::sync::Mutex<HashMap<PathBuf, Result<WorkspaceSettings, String>>>,
         > = std::sync::OnceLock::new();
         let configured = workspace_backend(env_value("SPAWN_WORKSPACE_BACKEND").as_deref())?;
         let cas = cas_dedup(env_value("SPAWN_CAS_DEDUP").as_deref())?;
+        let d6 = D6RuntimeConfig::from_env()?;
         let mut resolved = RESOLVED
             .get_or_init(Default::default)
             .lock()
@@ -361,7 +489,27 @@ impl WorkspaceSettings {
         resolved
             .entry(root.to_path_buf())
             .or_insert_with(|| {
-                let settings = Self::resolve(configured, cas, root, &Probes::host())?;
+                let settings = Self::resolve(configured, cas, root, &Probes::host())?.with_d6(d6);
+                if let Some(existing) = spawn_host::root_backend(root).map_err(|error| {
+                    format!("read workspace backend under {}: {error}", root.display())
+                })? && !spawn_host::workspace::backends_compatible(existing, settings.active)
+                {
+                    return Err(format!(
+                        "workspace root {} is claimed by {} engine, refusing {}",
+                        root.display(),
+                        existing.name(),
+                        settings.active.name()
+                    ));
+                }
+                if matches!(
+                    settings.active,
+                    spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow
+                ) {
+                    let cas_dir = settings.d6.effective_cas_dir(root, settings.active);
+                    spawn_host::CasMerkleStore::open(cas_dir.clone()).map_err(|error| {
+                        format!("open D6 CAS store at {}: {error}", cas_dir.display())
+                    })?;
+                }
                 settings.claim(root)?;
                 Ok(settings)
             })
@@ -382,6 +530,9 @@ impl WorkspaceSettings {
     /// ([`spawn_host::root_backend`]) or the one asked for by name; `auto`
     /// on a root no loop claimed yet is undecided (`active: null`).
     pub(crate) fn peek(root: &std::path::Path) -> serde_json::Value {
+        if let Err(error) = D6RuntimeConfig::from_env() {
+            return serde_json::json!({ "error": error });
+        }
         Self::peek_with(
             workspace_backend(env_value("SPAWN_WORKSPACE_BACKEND").as_deref()),
             cas_dedup(env_value("SPAWN_CAS_DEDUP").as_deref()),
@@ -405,10 +556,12 @@ impl WorkspaceSettings {
             WorkspaceBackend::Git => Some(spawn_host::WorkspaceBackend::Git),
             WorkspaceBackend::Cow => Some(spawn_host::WorkspaceBackend::Cow),
             WorkspaceBackend::Overlay => Some(spawn_host::WorkspaceBackend::Overlay),
+            WorkspaceBackend::D6Shadow => Some(spawn_host::WorkspaceBackend::D6Shadow),
+            WorkspaceBackend::D6 => Some(spawn_host::WorkspaceBackend::D6),
             WorkspaceBackend::Auto => None,
         };
         if let (Some(named), Some(marked)) = (named, marked)
-            && named != marked
+            && !spawn_host::workspace::backends_compatible(marked, named)
         {
             return serde_json::json!({
                 "error": format!(
@@ -420,11 +573,12 @@ impl WorkspaceSettings {
                 "root": marked.name(),
             });
         }
-        let active = marked.or(named);
+        let active = named.or(marked);
         let settings = active.map(|active| Self {
             configured,
             active,
             cas_dedup: cas,
+            d6: D6RuntimeConfig::default(),
         });
         serde_json::json!({
             "configured": configured.name(),
@@ -433,6 +587,66 @@ impl WorkspaceSettings {
             "cas_dedup": settings.as_ref().map_or(if cas { "on" } else { "off" }, Self::cas_state),
             "servable": settings.as_ref().is_none_or(|settings| settings.servable().is_ok()),
         })
+    }
+
+    fn build_d6_store(
+        &self,
+        repo: &std::path::Path,
+        root: &std::path::Path,
+        ledger: spawn_host::workspace::DynRefLedger,
+    ) -> Result<spawn_host::LocalWorkspaceStore, String> {
+        let cas_dir = self.d6.effective_cas_dir(root, self.active);
+        let cas = std::sync::Arc::new(
+            spawn_host::CasMerkleStore::open(&cas_dir)
+                .map_err(|error| format!("open D6 CAS store at {}: {error}", cas_dir.display()))?,
+        );
+        match self.active {
+            spawn_host::WorkspaceBackend::D6 => {
+                let mut opts = spawn_host::workspace::D6StoreOptions::new(cas, ledger);
+                if let Some(policy) = self.d6.l1_policy() {
+                    opts = opts.with_l1_policy(policy);
+                }
+                Ok(spawn_host::LocalWorkspaceStore::d6(
+                    repo.to_string_lossy().into_owned(),
+                    root,
+                    opts,
+                ))
+            }
+            spawn_host::WorkspaceBackend::D6Shadow => {
+                let mut opts = spawn_host::workspace::D6ShadowOptions::new(
+                    D6RuntimeConfig::shadow_work_root(root),
+                    cas,
+                    ledger,
+                )
+                .with_strict_fail_closed(self.d6.strict_fail_closed);
+                if let Some(policy) = self.d6.l1_policy() {
+                    opts = opts.with_l1_policy(policy);
+                }
+                Ok(spawn_host::LocalWorkspaceStore::d6_shadow(repo, root, opts))
+            }
+            other => Ok(match other {
+                spawn_host::WorkspaceBackend::Cow => {
+                    spawn_host::LocalWorkspaceStore::cow(repo, root)
+                }
+                #[cfg(target_os = "linux")]
+                spawn_host::WorkspaceBackend::Overlay => spawn_host::LocalWorkspaceStore::Overlay(
+                    spawn_host::OverlayWorkspace::new(repo, root),
+                ),
+                _ => spawn_host::LocalWorkspaceStore::git(repo, root),
+            }),
+        }
+    }
+
+    /// Construct a store bound directly to `pg` for D6/D6-shadow backends.
+    pub(crate) fn store_with_pg(
+        &self,
+        repo: &std::path::Path,
+        root: &std::path::Path,
+        pg: std::sync::Arc<PostgresStore>,
+    ) -> Result<spawn_host::LocalWorkspaceStore, String> {
+        let ledger: spawn_host::workspace::DynRefLedger =
+            std::sync::Arc::new(crate::sources::PostgresRefLedger::new(pg));
+        self.build_d6_store(repo, root, ledger)
     }
 
     /// The store of this engine over the bare repository `repo`,
@@ -449,6 +663,12 @@ impl WorkspaceSettings {
             spawn_host::WorkspaceBackend::Overlay => spawn_host::LocalWorkspaceStore::Overlay(
                 spawn_host::OverlayWorkspace::new(repo, root),
             ),
+            spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow => {
+                let ledger: spawn_host::workspace::DynRefLedger =
+                    std::sync::Arc::new(crate::sources::LazyPgRefLedger::new());
+                self.build_d6_store(repo, root, ledger)
+                    .unwrap_or_else(|error| panic!("{error}"))
+            }
             _ => spawn_host::LocalWorkspaceStore::git(repo, root),
         }
     }
@@ -470,13 +690,14 @@ impl WorkspaceSettings {
         root: &std::path::Path,
         store: std::sync::Arc<PostgresStore>,
     ) -> crate::sources::MissionWorkspaces {
-        crate::sources::MissionWorkspaces::one_shot(
-            self.store(repo, root),
-            root,
-            store,
-            self.factory(root),
-        )
-        .with_cas_dedup(self.cas_dedup)
+        let default = match self.active {
+            spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow => self
+                .store_with_pg(repo, root, std::sync::Arc::clone(&store))
+                .unwrap_or_else(|error| panic!("{error}")),
+            _ => self.store(repo, root),
+        };
+        crate::sources::MissionWorkspaces::one_shot(default, root, store, self.factory(root))
+            .with_cas_dedup(self.cas_dedup)
     }
 
     /// What the cas deduplication does with this engine: `"on"`, `"off"`,
@@ -863,7 +1084,7 @@ mod workspace_tests {
     use super::{Probes, WorkspaceBackend, WorkspaceSettings, cas_dedup, workspace_backend};
     use serde_json::json;
     use spawn_host::WorkspaceBackend as Engine;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[allow(clippy::unnecessary_wraps)] // the probe's signature
     fn unmarked(_: &Path) -> Result<Option<Engine>, String> {
@@ -891,12 +1112,17 @@ mod workspace_tests {
             workspace_backend(Some("overlay")),
             Ok(WorkspaceBackend::Overlay)
         );
+        assert_eq!(
+            workspace_backend(Some("d6-shadow")),
+            Ok(WorkspaceBackend::D6Shadow)
+        );
+        assert_eq!(workspace_backend(Some(" d6 ")), Ok(WorkspaceBackend::D6));
         assert_eq!(workspace_backend(Some("auto")), Ok(WorkspaceBackend::Auto));
-        for unknown in ["Git", "COW", "btrfs", "zfs", "overlayfs", "1"] {
+        for unknown in ["Git", "COW", "btrfs", "zfs", "overlayfs", "d6_shadow", "1"] {
             let error = workspace_backend(Some(unknown)).expect_err(unknown);
             assert!(error.contains("SPAWN_WORKSPACE_BACKEND"), "{error}");
             assert!(
-                error.contains("git (the default), cow, overlay or auto"),
+                error.contains("git (the default), cow, overlay, d6-shadow, d6 or auto"),
                 "{error}"
             );
         }
@@ -1162,5 +1388,98 @@ mod workspace_tests {
         assert_eq!(herdr_mode(Some(" core ")), Ok(HerdrMode::Core));
         assert_eq!(herdr_mode(Some("legacy")), Ok(HerdrMode::Legacy));
         assert!(herdr_mode(Some("other")).is_err());
+    }
+
+    #[test]
+    fn d6_runtime_config_parses_and_validates_all_fields() {
+        use super::{D6RuntimeConfig, DEFAULT_D6_TMPFS_BUDGET_MB};
+
+        let def = D6RuntimeConfig::parse(None, None, None, None).expect("default");
+        assert_eq!(def, D6RuntimeConfig::default());
+        assert_eq!(
+            def.effective_cas_dir(Path::new("/srv/work"), Engine::D6),
+            PathBuf::from("/srv/work/.d6/cas")
+        );
+        assert_eq!(
+            def.effective_cas_dir(Path::new("/srv/work"), Engine::D6Shadow),
+            PathBuf::from("/srv/work/.d6-shadow/cas")
+        );
+        assert!(def.l1_policy().is_none());
+
+        let configured = D6RuntimeConfig::parse(
+            Some(" /var/lib/d6-cas "),
+            Some("/dev/shm/d6-l1"),
+            None,
+            Some("true"),
+        )
+        .expect("configured");
+        assert_eq!(configured.cas_dir, Some(PathBuf::from("/var/lib/d6-cas")));
+        assert_eq!(configured.tmpfs_root, Some(PathBuf::from("/dev/shm/d6-l1")));
+        assert!(configured.strict_fail_closed);
+        let l1 = configured.l1_policy().expect("l1 policy");
+        assert_eq!(l1.tmpfs_budget_mb, DEFAULT_D6_TMPFS_BUDGET_MB);
+
+        let custom = D6RuntimeConfig::parse(None, Some("/dev/shm/d6-l1"), Some("4096"), Some("1"))
+            .expect("custom");
+        assert_eq!(custom.l1_policy().expect("l1").tmpfs_budget_mb, 4096);
+        assert!(custom.strict_fail_closed);
+
+        assert!(D6RuntimeConfig::parse(Some("relative/cas"), None, None, None).is_err());
+        assert!(D6RuntimeConfig::parse(None, Some("relative/tmpfs"), None, None).is_err());
+        assert!(D6RuntimeConfig::parse(None, None, Some("0"), None).is_err());
+        assert!(D6RuntimeConfig::parse(None, None, Some("abc"), None).is_err());
+        assert!(D6RuntimeConfig::parse(None, None, None, Some("yes")).is_err());
+    }
+
+    #[test]
+    fn d6_shadow_and_d6_compatibility_in_resolve_and_peek() {
+        let peek = WorkspaceSettings::peek_with;
+        // git root allows d6-shadow (active=d6-shadow, root=git), refuses pure d6
+        assert_eq!(
+            peek(
+                Ok(WorkspaceBackend::D6Shadow),
+                Ok(false),
+                Ok(Some(Engine::Git))
+            ),
+            json!({"configured": "d6-shadow", "active": "d6-shadow", "root": "git",
+                   "cas_dedup": "off", "servable": true})
+        );
+        let refused_d6 = peek(Ok(WorkspaceBackend::D6), Ok(false), Ok(Some(Engine::Git)));
+        assert!(
+            refused_d6["error"]
+                .as_str()
+                .unwrap()
+                .contains("git engine's"),
+            "{refused_d6}"
+        );
+        // pure d6 root refuses git and d6-shadow
+        assert!(
+            peek(Ok(WorkspaceBackend::Git), Ok(false), Ok(Some(Engine::D6)))["error"].is_string()
+        );
+        assert!(
+            peek(
+                Ok(WorkspaceBackend::D6Shadow),
+                Ok(false),
+                Ok(Some(Engine::D6))
+            )["error"]
+                .is_string()
+        );
+        // resolve d6 / d6-shadow need no cow/overlay probes and are servable
+        let never = |_: &Path| -> Result<(), String> { panic!("no overlay probe for d6") };
+        let never_cow = |_: &Path| -> bool { panic!("no cow probe for d6") };
+        for (cfg, eng) in [
+            (WorkspaceBackend::D6Shadow, Engine::D6Shadow),
+            (WorkspaceBackend::D6, Engine::D6),
+        ] {
+            let s = WorkspaceSettings::resolve(
+                cfg,
+                false,
+                Path::new("/srv/w"),
+                &probes(&never, &never_cow),
+            )
+            .expect("resolve");
+            assert_eq!(s.active, eng);
+            assert!(s.servable().is_ok());
+        }
     }
 }
