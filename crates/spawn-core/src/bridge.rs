@@ -427,20 +427,39 @@ struct Active {
     unmounting: bool,
     /// What the Bridge has read of the engine's files and screen.
     follow: Follow,
+    /// When its `execution.started` was recorded (the record's time, epoch
+    /// ms), the same after a restart: a prompt of an engine that names its
+    /// own session ([`Bridge::bind_reported`]) older than this (less
+    /// [`BIND_SKEW_MS`]) was not typed into this execution.
+    started_at: u64,
+    /// The conversations below the engine's home
+    /// ([`AgentDriver::session_scan_dir`]) that were there before a fresh
+    /// start launched it: none of them is this execution's, so the scan
+    /// never binds one. Empty after a restart (the start's listing is gone)
+    /// and for a resume.
+    preexisting_natives: HashSet<String>,
 }
 
 impl Active {
-    /// An execution as its `execution.started` record has it.
-    fn started(
-        execution_id: ExecutionId,
-        workspace: WorkspaceId,
-        transcript_from: Option<u64>,
-        driver: &'static dyn AgentDriver,
-    ) -> Self {
-        Self {
-            execution_id,
+    /// An execution as its `execution.started` `record` has it (its
+    /// workspace as the store names it now), with the record's time; `None`
+    /// for any other record.
+    fn started(record: &EventRecord, workspace: WorkspaceId) -> Option<Self> {
+        let EventKind::ExecutionStarted {
+            engine,
+            transcript_from,
+            ..
+        } = &record.event.kind
+        else {
+            return None;
+        };
+        let transcript_from = *transcript_from;
+        Some(Self {
+            execution_id: record.event.execution_id.clone()?,
             workspace,
-            driver,
+            driver: driver_or_default(engine),
+            started_at: u64::try_from(record.recorded_at.0).unwrap_or(0),
+            preexisting_natives: HashSet::new(),
             checkpoint: None,
             reported_end: None,
             unmounting: false,
@@ -452,7 +471,7 @@ impl Active {
                 binding: Binding::resumed(transcript_from.is_some()),
                 ..Follow::default()
             },
-        }
+        })
     }
 
     /// The terminal that hosts the execution: always `spawn-<execution>`,
@@ -603,6 +622,114 @@ const FOLLOW_OVERLAP: usize = 4096;
 /// The least time between two scans of an engine's conversations for an
 /// execution's own ([`Bridge::bind_reported`]), in milliseconds.
 const SCAN_INTERVAL_MS: i64 = 2_000;
+
+/// A prompt (`USER_INPUT`) of agy's full transcript `bytes`, written at or
+/// after `not_before` (its `created_at`, epoch ms; none or unreadable is
+/// not), holds a marker `ours` accepts ([`Bridge::bind_reported`]).
+fn typed_since(bytes: &[u8], not_before: u64, ours: &dyn Fn(&CommandId) -> bool) -> bool {
+    String::from_utf8_lossy(bytes).lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+            value["type"] == "USER_INPUT"
+                && value["created_at"]
+                    .as_str()
+                    .and_then(rfc3339_ms)
+                    .and_then(|created| u64::try_from(created).ok())
+                    .is_some_and(|created| created >= not_before)
+                && value["content"]
+                    .as_str()
+                    .is_some_and(|content| crate::message::markers(content).iter().any(ours))
+        })
+    })
+}
+
+/// How much older than its execution's `execution.started` a prompt of an
+/// engine that names its own session may say it is and still bind it
+/// ([`Bridge::bind_reported`]): the engine's clock and the store's may
+/// differ by this much, in milliseconds.
+const BIND_SKEW_MS: u64 = 5_000;
+
+/// An RFC 3339 date-time (`2026-11-25T14:25:59Z`, with fractional seconds
+/// and a `Z` or `±HH:MM` offset) as epoch milliseconds; `None` for anything
+/// else. Fractions beyond milliseconds are truncated.
+fn rfc3339_ms(text: &str) -> Option<i64> {
+    fn number(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(
+            bytes
+                .iter()
+                .fold(0, |sum, digit| sum * 10 + i64::from(digit - b'0')),
+        )
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't' | b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let year = number(&bytes[0..4])?;
+    let month = number(&bytes[5..7])?;
+    let day = number(&bytes[8..10])?;
+    let hour = number(&bytes[11..13])?;
+    let minute = number(&bytes[14..16])?;
+    let second = number(&bytes[17..19])?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    // A leap second (60) reads as the next second's start.
+    if day < 1 || day > days_in_month || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let mut rest = &bytes[19..];
+    let mut millis = 0;
+    if let Some(fraction) = rest.strip_prefix(b".") {
+        let digits = fraction
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return None;
+        }
+        let mut padded = [b'0'; 3];
+        for (slot, digit) in padded.iter_mut().zip(&fraction[..digits]) {
+            *slot = *digit;
+        }
+        millis = number(&padded)?;
+        rest = &fraction[digits..];
+    }
+    let offset = match rest {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2] => {
+            let hours = number(&[*h1, *h2])?;
+            let minutes = number(&[*m1, *m2])?;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let offset = (hours * 60 + minutes) * 60;
+            if *sign == b'-' { -offset } else { offset }
+        }
+        _ => return None,
+    };
+    // Days since 1970-01-01 of the civil date (Hinnant's days_from_civil).
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = shifted.div_euclid(400);
+    let year_of_era = shifted - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second - offset;
+    Some(seconds * 1_000 + millis)
+}
 
 impl Follow {
     /// The log records the execution's native session: it is known, as
@@ -857,6 +984,9 @@ struct SessionView {
     /// The native session the latest execution ran, which a resume
     /// continues.
     native: Option<String>,
+    /// Every native session an execution of this session was bound to: a
+    /// fresh start never binds one of them again ([`Bridge::bind_reported`]).
+    natives: HashSet<String>,
     /// The log holds events read from that session's transcript: it
     /// existed, and a resume must not start without it.
     transcript_read: bool,
@@ -1002,6 +1132,7 @@ impl SessionView {
             agent_id: event.agent_id.clone(),
             unfinished: HashSet::new(),
             native: None,
+            natives: HashSet::new(),
             transcript_read: false,
             model: ModelProfile::Default,
             engine: crate::driver::DEFAULT.to_string(),
@@ -1432,6 +1563,10 @@ pub struct Bridge {
     prepared: HashMap<CommandId, PreparedStart>,
     /// Prompt readiness retained per command between claims.
     prompting: HashMap<CommandId, PromptProgress>,
+    /// The conversations a fresh start found below its engine's home before
+    /// the launch, until its `execution.started` is folded into the view
+    /// ([`Active::preexisting_natives`]).
+    preexisting: HashMap<ExecutionId, HashSet<String>>,
     /// Workspace mounts running off the Bridge thread, bounded by
     /// [`MAX_CONCURRENT_MOUNTS`].
     mounting: HashMap<CommandId, PendingMount>,
@@ -1598,6 +1733,7 @@ impl Bridge {
             runners: None,
             prepared: HashMap::new(),
             prompting: HashMap::new(),
+            preexisting: HashMap::new(),
             mounting: HashMap::new(),
             abandoned_mounts: Vec::new(),
             kill_threads: std::sync::Mutex::new(Vec::new()),
@@ -1709,6 +1845,7 @@ impl Bridge {
         }
         self.cursor = GlobalPosition(0);
         self.sessions.clear();
+        self.preexisting.clear();
         self.catch_up()?;
         self.recover_archives();
         self.rederive_unrecorded();
@@ -2032,23 +2169,23 @@ impl Bridge {
                 engine,
                 workspace,
                 model,
-                transcript_from,
                 launch,
                 ..
             } => {
                 view.model = *model;
                 view.engine.clone_from(engine);
                 view.model_label = launched_label(engine, launch.as_ref());
-                if let Some(execution_id) = event.execution_id.clone() {
-                    // As the store names it now: a record from before the
-                    // root was resolved names the same directory.
-                    let workspace = self.workspaces.canonical(workspace);
-                    view.active = Some(Active::started(
-                        execution_id,
-                        workspace,
-                        *transcript_from,
-                        driver_or_default(engine),
-                    ));
+                // As the store names it now: a record from before the root
+                // was resolved names the same directory.
+                let workspace = self.workspaces.canonical(workspace);
+                if let Some(mut active) = Active::started(record, workspace) {
+                    // What a fresh start of this Bridge's own listed before
+                    // its launch; a restart has no such list.
+                    active.preexisting_natives = self
+                        .preexisting
+                        .remove(&active.execution_id)
+                        .unwrap_or_default();
+                    view.active = Some(active);
                 }
             }
             // After a restart, the last recorded screen. The Bridge's own
@@ -2099,6 +2236,7 @@ impl Bridge {
                     view.transcript_read = false;
                 }
                 view.native = Some(native_session_id.clone());
+                view.natives.insert(native_session_id.clone());
                 if current && let Some(active) = view.active.as_mut() {
                     active.follow.recorded_binding();
                 }
@@ -3168,6 +3306,16 @@ impl Bridge {
     /// another session's marker, or one never typed, is never bound. Then
     /// `session.native_started` is recorded, and the transcript is read from
     /// its start. Until then nothing is bound, and asked again next pass.
+    ///
+    /// A marker is only a store-local command id, so another store's or an
+    /// older run's conversation in the same shared home may quote the same
+    /// one (D1). Three guards keep those out: the prompt that holds the
+    /// marker must be no older than the execution's `execution.started`
+    /// (its `created_at`, less [`BIND_SKEW_MS`]; missing or unreadable
+    /// binds nothing); a conversation that was below the home before a
+    /// fresh start launched the engine ([`Active::preexisting_natives`]) is
+    /// never scanned into; and a native session any execution in the store
+    /// was already bound to is never bound again.
     fn bind_reported(
         &self,
         agent_id: &AgentId,
@@ -3208,9 +3356,19 @@ impl Bridge {
         let workspace = active.workspace.clone();
         let home = self.config.home_of(driver);
         let root = format!("{}/", home.sessions.trim_end_matches('/'));
+        let not_before = active.started_at.saturating_sub(BIND_SKEW_MS);
         // The transcript of `native`, when it is below the engine's home and
-        // a prompt in it holds a marker typed into this execution.
+        // a prompt in it, written since this execution started, holds a
+        // marker typed into this execution.
         let proven = |native: &str| -> Option<String> {
+            // Bound already, by any execution of any session in the store.
+            if self
+                .sessions
+                .values()
+                .any(|view| view.natives.contains(native))
+            {
+                return None;
+            }
             let path = driver.transcript_path(&home, &workspace, native);
             if !path.starts_with(&root) {
                 return None;
@@ -3218,15 +3376,7 @@ impl Bridge {
             let Ok(Some(bytes)) = self.terminals.read_from(&workspace, &path, 0) else {
                 return None;
             };
-            let typed = String::from_utf8_lossy(&bytes).lines().any(|line| {
-                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
-                    value["type"] == "USER_INPUT"
-                        && value["content"].as_str().is_some_and(|content| {
-                            crate::message::markers(content).iter().any(ours)
-                        })
-                })
-            });
-            typed.then_some(path)
+            typed_since(&bytes, not_before, &ours).then_some(path)
         };
         let mut bound = reported
             .as_deref()
@@ -3250,6 +3400,7 @@ impl Bridge {
                 .iter()
                 .filter(|native| plain_session_id(native))
                 .filter(|native| reported.as_deref() != Some(native.as_str()))
+                .filter(|native| !active.preexisting_natives.contains(native.as_str()))
                 .take(crate::port::LIST_DIRS_LIMIT)
                 .find_map(|native| proven(native).map(|path| (native.clone(), path)));
         }
@@ -4053,21 +4204,10 @@ impl Bridge {
     /// `execution.started`), put into the session's view as the fold would
     /// have: the view follows the log again.
     fn track_from_log(&mut self, session: &SessionId, record: &EventRecord) -> Option<Active> {
-        let EventKind::ExecutionStarted {
-            engine,
-            workspace,
-            transcript_from,
-            ..
-        } = &record.event.kind
-        else {
+        let EventKind::ExecutionStarted { workspace, .. } = &record.event.kind else {
             return None;
         };
-        let active = Active::started(
-            record.event.execution_id.clone()?,
-            self.workspaces.canonical(workspace),
-            *transcript_from,
-            driver_or_default(engine),
-        );
+        let active = Active::started(record, self.workspaces.canonical(workspace))?;
         if let Some(view) = self.sessions.get_mut(session) {
             view.active = Some(active.clone());
         }
@@ -4246,7 +4386,10 @@ impl Bridge {
                 binding: Binding::resumed(native.is_some()),
                 ..Follow::default()
             },
+            started_at: u64::try_from(self.clock.now().0).unwrap_or(0),
+            preexisting_natives: HashSet::new(),
         };
+        self.list_preexisting(native.is_none(), prepared.driver, &active);
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
         let recorded = self.append(
@@ -4282,6 +4425,23 @@ impl Bridge {
         }
         self.prepared.remove(&claimed.command_id);
         self.launch_and_prompt(claimed, &active, native, &prepared, prompt, report)
+    }
+
+    /// Before a `fresh` start (not a resume) of an engine that names its
+    /// own session, list the conversations already below its home: none of
+    /// them is the execution's ([`Self::bind_reported`]). Listed before the
+    /// launch and handed to the view's execution when its record is folded
+    /// ([`Active::preexisting_natives`]).
+    fn list_preexisting(&mut self, fresh: bool, driver: &dyn AgentDriver, active: &Active) {
+        if !fresh || driver.traits().session != SessionBinding::Reported {
+            return;
+        }
+        if let Some(dir) = driver.session_scan_dir(&self.config.home_of(driver))
+            && let Ok(names) = self.terminals.list_dirs(&active.workspace, &dir)
+        {
+            self.preexisting
+                .insert(active.execution_id.clone(), names.into_iter().collect());
+        }
     }
 
     /// Why `driver`'s engine cannot start on this host for want of a
@@ -8066,7 +8226,7 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex};
 
     use super::{Bridge, BridgeConfig, RESOLVE_PRINCIPAL, mounted_key, trust_answer_key, waits};
-    use super::{ENGINE_UNAVAILABLE, EngineViewPolicy, ViewedLaunch};
+    use super::{ENGINE_UNAVAILABLE, EngineViewPolicy, ViewedLaunch, rfc3339_ms};
     use crate::command::{CommandAction, NamedKey, Outcome, Submission};
     use crate::event::{CommandStep, ENGINE, EventKind, GlobalPosition, NewEvent, Source};
     use crate::id::{
@@ -10475,6 +10635,330 @@ mod tests {
                 Some(agy_transcript(ours))
             )]
         );
+    }
+
+    /// A prompt line of agy's full transcript written at `created_at`.
+    fn agy_user_line_at(text: &str, created_at: &str) -> String {
+        format!(
+            "{{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":{},\"content\":{}}}\n",
+            serde_json::to_string(created_at).expect("json"),
+            serde_json::to_string(&format!("<USER_REQUEST>\n{text}\n</USER_REQUEST>"))
+                .expect("json")
+        )
+    }
+
+    /// The store's clock at 2026-11-26T10:00:00Z, so a transcript's
+    /// `created_at` can be older than an execution's start.
+    fn d1_clock() -> Arc<ManualClock> {
+        Arc::new(ManualClock::new(Timestamp(
+            rfc3339_ms("2026-11-26T10:00:00Z").expect("time"),
+        )))
+    }
+
+    fn d1_bridge(
+        clock: &Arc<ManualClock>,
+        store: &Arc<MemoryStore>,
+        host: &Arc<Witnessed>,
+    ) -> Bridge {
+        Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            agy_config(Some("gemini-3.8-flash-low")),
+        )
+        .with_clock(clock.clone())
+    }
+
+    fn d1_polls(clock: &ManualClock, bridge: &mut Bridge) {
+        for _ in 0..4 {
+            clock.advance(Duration::from_secs(3));
+            bridge.poll().expect("poll");
+        }
+    }
+
+    fn submit_agy_start_in(store: &Arc<MemoryStore>, session: &str) -> CommandId {
+        let id = store
+            .submit(
+                &Principal::new("tester").expect("principal"),
+                &Submission {
+                    agent_id: AgentId::new("agent_agy").expect("agent"),
+                    session_id: SessionId::new(session).expect("session"),
+                    idempotency_key: IdempotencyKey::new(format!("start-{session}")).expect("key"),
+                    action: CommandAction::Start {
+                        engine: "agy".to_string(),
+                        prompt: "hello".to_string(),
+                        parent_session_id: None,
+                        from: None,
+                        model: None,
+                        charter: None,
+                        model_label: None,
+                    },
+                },
+            )
+            .expect("submit");
+        store.set_pane(
+            &TerminalName::for_execution(&ExecutionId::for_command(id)),
+            &agy_idle(),
+        );
+        id
+    }
+
+    /// D1 (O55 C3): a conversation in agy's shared brain from another store
+    /// or an older run may quote this execution's `[spawn message #N]`
+    /// (only a store-local id). Its prompt, older than the execution's
+    /// `execution.started`, never binds: not by the Bridge that started it,
+    /// nor after a restart (which has no list of what was there before the
+    /// start). A conversation whose prompt was written since does.
+    #[test]
+    fn agy_stale_brain_conversation_with_a_colliding_marker_never_binds() {
+        let clock = d1_clock();
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let id = submit_agy_start(&store, "hello");
+        let mut bridge = d1_bridge(&clock, &store, &host);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        let brain = format!("{AGY_HOME}/brain");
+        let stale = "cccccccc-0000-4000-8000-000000000001";
+        store.append_file(
+            &agy_transcript(stale),
+            &agy_user_line_at(
+                &crate::message::marked("old", id, true),
+                "2026-11-26T09:00:00Z",
+            ),
+        );
+        // Just past the skew tolerance, with an offset.
+        let skewed = "cccccccc-0000-4000-8000-000000000002";
+        store.append_file(
+            &agy_transcript(skewed),
+            &agy_user_line_at(
+                &crate::message::marked("old", id, true),
+                "2026-11-26T11:59:54.999+02:00",
+            ),
+        );
+        // No time at all: fails closed.
+        let timeless = "cccccccc-0000-4000-8000-000000000003";
+        store.append_file(
+            &agy_transcript(timeless),
+            &format!(
+                "{{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":{}}}\n",
+                serde_json::to_string(&crate::message::marked("old", id, true)).expect("json")
+            ),
+        );
+        host.set_dirs(&brain, &[stale, skewed, timeless]);
+        d1_polls(&clock, &mut bridge);
+        assert!(
+            agy_natives(&store).is_empty(),
+            "a stale conversation binds nothing"
+        );
+
+        // Restarted: what was there before the start is not known, and the
+        // stale conversation still binds nothing.
+        let mut bridge = d1_bridge(&clock, &store, &host);
+        bridge.recover().expect("recover");
+        d1_polls(&clock, &mut bridge);
+        assert!(agy_natives(&store).is_empty(), "nor after a restart");
+
+        // Written since the start (within the skew, in another offset).
+        let fresh = "cccccccc-0000-4000-8000-000000000004";
+        store.append_file(
+            &agy_transcript(fresh),
+            &agy_user_line_at(
+                &crate::message::marked("hello", id, true),
+                "2026-11-26T04:59:57-05:00",
+            ),
+        );
+        host.set_dirs(&brain, &[stale, skewed, timeless, fresh]);
+        d1_polls(&clock, &mut bridge);
+        assert_eq!(
+            agy_natives(&store),
+            vec![(
+                "agy".to_string(),
+                fresh.to_string(),
+                Some(agy_transcript(fresh))
+            )]
+        );
+    }
+
+    /// D1: a conversation that was below agy's brain before a fresh start
+    /// launched the engine is none of this execution's: the scan never binds
+    /// it, even with this execution's marker in a prompt written since.
+    #[test]
+    fn agy_brain_conversation_there_before_the_start_never_binds() {
+        let clock = d1_clock();
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let brain = format!("{AGY_HOME}/brain");
+        let before = "dddddddd-0000-4000-8000-000000000001";
+        host.set_dirs(&brain, &[before]);
+        let id = submit_agy_start(&store, "hello");
+        let mut bridge = d1_bridge(&clock, &store, &host);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        store.append_file(
+            &agy_transcript(before),
+            &agy_user_line_at(
+                &crate::message::marked("hello", id, true),
+                "2026-11-26T10:00:10Z",
+            ),
+        );
+        d1_polls(&clock, &mut bridge);
+        assert!(
+            agy_natives(&store).is_empty(),
+            "a conversation there before the start binds nothing"
+        );
+        let ours = "dddddddd-0000-4000-8000-000000000002";
+        store.append_file(
+            &agy_transcript(ours),
+            &agy_user_line_at(
+                &crate::message::marked("hello", id, true),
+                "2026-11-26T10:00:20Z",
+            ),
+        );
+        host.set_dirs(&brain, &[ours, before]);
+        d1_polls(&clock, &mut bridge);
+        assert_eq!(
+            agy_natives(&store),
+            vec![(
+                "agy".to_string(),
+                ours.to_string(),
+                Some(agy_transcript(ours))
+            )]
+        );
+    }
+
+    /// D1: a native session one session of the store is bound to is never
+    /// bound by another, though its transcript quotes the other's marker
+    /// (command ids collide across stores) and the host reports it for the
+    /// other's pane.
+    #[test]
+    fn agy_native_session_bound_by_another_session_never_binds_again() {
+        let clock = d1_clock();
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let brain = format!("{AGY_HOME}/brain");
+        let first = submit_agy_start_in(&store, "session_agy_a");
+        let mut bridge = d1_bridge(&clock, &store, &host);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, first).is_some()
+        });
+        assert_eq!(command_outcome(&store, first), Some(Outcome::Succeeded));
+        let taken = "eeeeeeee-0000-4000-8000-000000000001";
+        store.append_file(
+            &agy_transcript(taken),
+            &agy_user_line_at(
+                &crate::message::marked("hello", first, true),
+                "2026-11-26T10:00:05Z",
+            ),
+        );
+        host.set_dirs(&brain, &[taken]);
+        d1_polls(&clock, &mut bridge);
+        assert_eq!(agy_natives(&store).len(), 1, "the first session binds");
+
+        // The second session starts with nothing listed before its start.
+        host.set_dirs(&brain, &[]);
+        let second = submit_agy_start_in(&store, "session_agy_b");
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, second).is_some()
+        });
+        assert_eq!(command_outcome(&store, second), Some(Outcome::Succeeded));
+        store.append_file(
+            &agy_transcript(taken),
+            &agy_user_line_at(
+                &crate::message::marked("hello", second, true),
+                "2026-11-26T10:01:00Z",
+            ),
+        );
+        host.set_dirs(&brain, &[taken]);
+        let mut reported = agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 2);
+        reported.session = Some(taken.to_string());
+        host.set(reported);
+        d1_polls(&clock, &mut bridge);
+        // And after a restart.
+        let mut bridge = d1_bridge(&clock, &store, &host);
+        bridge.recover().expect("recover");
+        d1_polls(&clock, &mut bridge);
+        let natives: Vec<String> = agy_natives(&store)
+            .into_iter()
+            .map(|(_, native, _)| native)
+            .collect();
+        assert_eq!(natives, vec![taken.to_string()], "bound once only");
+
+        let ours = "eeeeeeee-0000-4000-8000-000000000002";
+        store.append_file(
+            &agy_transcript(ours),
+            &agy_user_line_at(
+                &crate::message::marked("hello", second, true),
+                "2026-11-26T10:01:10Z",
+            ),
+        );
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 3));
+        host.set_dirs(&brain, &[ours, taken]);
+        d1_polls(&clock, &mut bridge);
+        let natives: Vec<String> = agy_natives(&store)
+            .into_iter()
+            .map(|(_, native, _)| native)
+            .collect();
+        assert_eq!(natives, vec![taken.to_string(), ours.to_string()]);
+    }
+
+    #[test]
+    fn rfc3339_ms_reads_utc_fractions_and_offsets() {
+        assert_eq!(rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_ms("2026-11-25T14:25:59Z"), Some(1_795_616_759_000));
+        assert_eq!(
+            rfc3339_ms("2026-11-25T14:25:59.5Z"),
+            Some(1_795_616_759_500)
+        );
+        assert_eq!(
+            rfc3339_ms("2026-11-25T14:25:59.123456789Z"),
+            Some(1_795_616_759_123)
+        );
+        assert_eq!(rfc3339_ms("2026-11-25t14:25:59z"), Some(1_795_616_759_000));
+        assert_eq!(
+            rfc3339_ms("2026-11-25T22:25:59+08:00"),
+            Some(1_795_616_759_000)
+        );
+        assert_eq!(
+            rfc3339_ms("2026-11-25T09:25:59.250-05:00"),
+            Some(1_795_616_759_250)
+        );
+        assert_eq!(rfc3339_ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
+        assert_eq!(rfc3339_ms("2000-03-01T00:00:00Z"), Some(951_868_800_000));
+    }
+
+    #[test]
+    fn rfc3339_ms_refuses_malformed_times() {
+        for text in [
+            "",
+            "2026-11-25",
+            "2026-11-25T14:25:59",
+            "2026-11-25T14:25:59+0800",
+            "2026-11-25T14:25:59.Z",
+            "2026-11-25T14:25:59 Z",
+            "2026-13-01T00:00:00Z",
+            "2026-00-01T00:00:00Z",
+            "2023-02-29T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-11-25T24:00:00Z",
+            "2026-11-25T14:60:00Z",
+            "2026-11-25T14:25:59+24:00",
+            "2026/11/25T14:25:59Z",
+            "+026-11-25T14:25:59Z",
+            "2026-11-25T14:25:59Zjunk",
+            "2026-11-25T14:25:59.12a3Z",
+            "2026-11-25T14:25:5\u{e9}Z",
+        ] {
+            assert_eq!(rfc3339_ms(text), None, "{text:?}");
+        }
     }
 
     fn screens_with_keys(store: &Arc<MemoryStore>) -> Vec<(ScreenState, Option<String>)> {
