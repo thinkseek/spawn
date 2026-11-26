@@ -15,7 +15,9 @@ pub use spawn_core::node_proto::grant::{
 /// and the primary's signature.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SignedGrant {
+    /// Unpadded base64url encoding of the exact JSON grant bytes.
     pub grant: String,
+    /// Unpadded base64url Ed25519 signature produced by the primary key.
     pub sig: String,
 }
 

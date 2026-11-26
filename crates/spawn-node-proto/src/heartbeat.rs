@@ -29,8 +29,11 @@ pub const MAX_REMAINING_MINS: u32 = 999_999_999;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeState {
+    /// Node holds no active work and is available for grants.
     Idle,
+    /// Node is running or holding active leases.
     Active,
+    /// Node is finishing existing leases and refuses new grants.
     Draining,
 }
 
@@ -38,11 +41,17 @@ pub enum NodeState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Edge {
+    /// Initial beat sent right after node boot.
     Boot,
+    /// Periodic scheduled beat.
     Timer,
+    /// Beat triggered immediately because an execution slot freed up.
     SlotFree,
+    /// Beat triggered immediately upon finishing a job result.
     Completed,
+    /// Beat triggered upon accepting or acting on a grant.
     Grant,
+    /// Beat triggered to deliver sync or artifact state.
     Sync,
 }
 
@@ -50,44 +59,59 @@ pub enum Edge {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
+    /// Node is fetching workspace inputs or artifacts.
     Fetching,
+    /// Node is executing the job workload.
     Running,
+    /// Node is collecting and hashing job outputs.
     Collecting,
 }
 
 /// A pool's free and total slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pool {
+    /// Available capacity units in the pool.
     pub free: u64,
+    /// Total configured capacity units in the pool.
     pub total: u64,
 }
 
 /// A lease the node holds and has not finished.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
+    /// Identifier of the leased job.
     pub job_id: String,
+    /// Monotonic epoch identifying this lease assignment.
     pub lease_epoch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional execution phase; stripped first when trimming past 4 KB.
     pub phase: Option<Phase>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Elapsed runtime in seconds; stripped with `phase` under 4 KB trim.
     pub elapsed_s: Option<u64>,
 }
 
 /// A job at one lease epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRef {
+    /// Identifier of the referenced job.
     pub job_id: String,
+    /// Lease epoch of the referenced job.
     pub lease_epoch: u64,
 }
 
 /// Power and battery telemetry reported optionally by a worker node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PowerTelemetry {
+    /// Whether the worker is connected to AC power.
     pub on_ac: bool,
     #[serde(default)]
+    /// Remaining battery percentage (`0..=100`), when running on battery.
     pub battery_pct: Option<u8>,
+    /// Whether the battery is currently charging.
     pub charging: bool,
     #[serde(default)]
+    /// Estimated remaining battery runtime in minutes, if available.
     pub remaining_mins: Option<u32>,
 }
 
@@ -110,25 +134,37 @@ impl PowerTelemetry {
 /// A heartbeat body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Beat {
+    /// Protocol version (must equal [`VERSION`]).
     pub v: u64,
+    /// Logical cell identifier assigned to this node.
     pub cell_id: String,
+    /// Node's current scheduling state.
     pub state: NodeState,
+    /// 64-char lowercase hex SHA-256 of the node's active [`NodeSpec`](crate::spec::NodeSpec).
     pub spec_sha256: String,
     /// What is free after every lease the node holds, pool by pool.
     pub capacities: OrderedMap<Pool>,
+    /// Free and total ephemeral tmpfs budget in MiB.
     pub tmpfs_budget_mb: Pool,
     #[serde(default)]
+    /// Active job leases currently held by the node.
     pub leases: Vec<Lease>,
     #[serde(default)]
+    /// Finished job leases awaiting result upload or acknowledgment.
     pub lease_results_pending: Vec<LeaseRef>,
     #[serde(default)]
+    /// Up to [`MAX_WARM_BASES`] 40-char git base object IDs kept warm locally.
     pub warm_bases: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 1-minute host load average scaled by 1000 (milli-load).
     pub load1_milli: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Available host memory in MiB.
     pub mem_available_mb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional host power and battery telemetry.
     pub power: Option<PowerTelemetry>,
+    /// Event that triggered this beat.
     pub edge: Edge,
 }
 
@@ -146,6 +182,7 @@ impl Beat {
         Ok(beat)
     }
 
+    /// Validates beat version, hashes, warm bases, job ids, and power telemetry.
     pub fn validate(&self) -> Result<(), Error> {
         if self.v != VERSION {
             return Err(Error::Body("v"));
@@ -200,29 +237,43 @@ impl Beat {
 /// A lease the ledger does not hold for the node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fenced {
+    /// Identifier of the fenced job.
     pub job_id: String,
+    /// Lease epoch rejected by the ledger.
     pub lease_epoch: u64,
+    /// Human-readable reason the lease was fenced.
     pub reason: String,
 }
 
 /// The answer to a heartbeat (signed as every response is).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ack {
+    /// Protocol version (`1`).
     pub v: u64,
+    /// Gateway clock timestamp in Unix milliseconds.
     pub server_time_ms: u64,
+    /// Suggested delay before the next timer beat in milliseconds.
     pub next_beat_ms: u64,
+    /// Lease expiration TTL in seconds.
     pub lease_ttl_s: u64,
+    /// Whether the gateway requests a fresh `POST /node/v1/spec`.
     pub need_spec: bool,
     #[serde(default)]
+    /// Cache/store holds the gateway instructs the node to sync.
     pub need_sync: Holds,
     #[serde(default)]
+    /// Active leases renewed by this heartbeat.
     pub renewed: Vec<LeaseRef>,
     #[serde(default)]
+    /// Leases the gateway no longer considers valid for this node.
     pub fenced: Vec<Fenced>,
     #[serde(default)]
+    /// Pending job results acknowledged by the ledger.
     pub acked_results: Vec<LeaseRef>,
     #[serde(default)]
+    /// Signed work grants allocated to the node.
     pub grants: Vec<SignedGrant>,
+    /// Whether the node should transition to [`NodeState::Draining`].
     pub drain: bool,
 }
 
@@ -239,6 +290,7 @@ impl Ack {
         Ok(ack)
     }
 
+    /// Serializes the heartbeat acknowledgment to JSON bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         json::to_vec(self)
     }

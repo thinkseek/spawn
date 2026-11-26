@@ -58,14 +58,17 @@ impl EnrollToken {
         Self::parse(contents.strip_suffix('\n').unwrap_or(contents))
     }
 
+    /// Returns the full serialized token string (`sne1.<secret>.<pin>`).
     pub fn as_str(&self) -> &str {
         &self.text
     }
 
+    /// Returns the 32-byte raw enrollment secret.
     pub fn secret(&self) -> &[u8; 32] {
         &self.secret
     }
 
+    /// Returns the 16-byte primary key fingerprint pin.
     pub fn pin(&self) -> &[u8; PIN_LEN] {
         &self.pin
     }
@@ -104,9 +107,13 @@ impl std::fmt::Debug for EnrollToken {
 /// `POST /node/v1/enroll`'s body, signed by the new key itself with seq 0.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollRequest {
+    /// Protocol version (must equal [`VERSION`]).
     pub v: u64,
+    /// Raw serialized enrollment token string (`sne1.<secret>.<pin>`).
     pub token: String,
+    /// Base64url-encoded 32-byte Ed25519 public key of the enrolling node.
     pub pubkey: String,
+    /// Node specification advertised during enrollment.
     pub spec: NodeSpec,
 }
 
@@ -117,10 +124,12 @@ impl EnrollRequest {
         PublicKey::from_b64u(&self.pubkey)
     }
 
+    /// Parses and validates the request's enrollment token.
     pub fn token(&self) -> Result<EnrollToken, Error> {
         EnrollToken::parse(&self.token)
     }
 
+    /// Validates the version, node public key, enrollment token, and spec.
     pub fn validate(&self) -> Result<(), Error> {
         if self.v != VERSION {
             return Err(Error::Body("v"));
@@ -134,8 +143,11 @@ impl EnrollRequest {
 /// The part of the enroll answer the daemon pins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollAnswer {
+    /// Protocol version (`1`).
     pub v: u64,
+    /// Primary gateway clock timestamp in Unix milliseconds.
     pub server_time_ms: u64,
+    /// Base64url-encoded 32-byte Ed25519 verifying key of the primary gateway.
     pub primary_pubkey: String,
 }
 

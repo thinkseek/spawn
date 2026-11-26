@@ -17,10 +17,15 @@ pub use spawn_core::node_proto::target::{
 /// The largest `|ts_ms − server_time_ms|` the gateway takes (`409 clock_skew`).
 pub const MAX_SKEW_MS: u64 = 120_000;
 
+/// Header carrying the 64-char hex SHA-256 of the node public key.
 pub const HEADER_NODE_ID: &str = "Spawn-Node-Id";
+/// Header carrying the 32-char lowercase hex boot identifier.
 pub const HEADER_BOOT: &str = "Spawn-Node-Boot";
+/// Header carrying the strictly increasing per-boot sequence number.
 pub const HEADER_SEQ: &str = "Spawn-Node-Seq";
+/// Header carrying the node request timestamp in Unix milliseconds.
 pub const HEADER_TS: &str = "Spawn-Node-Ts";
+/// Header carrying the base64url-encoded 64-byte Ed25519 signature.
 pub const HEADER_SIG: &str = "Spawn-Node-Sig";
 /// The five request headers, in the order a client writes them.
 pub const REQUEST_HEADERS: [&str; 5] = [
@@ -34,7 +39,9 @@ pub const REQUEST_HEADERS: [&str; 5] = [
 /// The two methods v1 has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
+    /// HTTP `GET`.
     Get,
+    /// HTTP `POST`.
     Post,
 }
 
@@ -48,6 +55,7 @@ impl Method {
         }
     }
 
+    /// Returns the uppercase HTTP method name (`GET` or `POST`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Get => "GET",
@@ -70,7 +78,10 @@ pub enum Verb {
     /// `GET /node/v1/registry-manifest`.
     RegistryManifest,
     /// `POST /node/v1/jobs/<job_id>/result`.
-    Result { job_id: String },
+    Result {
+        /// Job identifier whose execution result is being reported.
+        job_id: String,
+    },
 }
 
 impl Verb {
@@ -108,6 +119,7 @@ impl Verb {
         }
     }
 
+    /// Returns the HTTP method required by this verb.
     pub fn method(&self) -> Method {
         match self {
             Self::Artifact(_) | Self::RegistryManifest => Method::Get,
@@ -228,12 +240,16 @@ pub fn request_signing_input(
 /// A node's identity for one boot: its key and the boot id.
 #[derive(Debug)]
 pub struct NodeSigner {
+    /// Signing key pair for this node.
     pub key: SigningKey,
+    /// Lowercase hex SHA-256 node identifier derived from [`SigningKey`].
     pub node_id: String,
+    /// 32-char lowercase hex identifier for the current boot.
     pub boot_id: String,
 }
 
 impl NodeSigner {
+    /// Builds a [`NodeSigner`] after verifying `boot_id` is 32 lowercase hex digits.
     pub fn new(key: SigningKey, boot_id: &str) -> Result<Self, Error> {
         if !is_lower_hex(boot_id, 32) {
             return Err(Error::Header(HEADER_BOOT));
@@ -278,9 +294,13 @@ impl NodeSigner {
 /// enroll, from the body).
 #[derive(Debug)]
 pub struct Checked<'a> {
+    /// Validated HTTP method.
     pub method: Method,
+    /// Validated request path and optional query string.
     pub target: &'a str,
+    /// Routed protocol verb for this request.
     pub verb: Verb,
+    /// Parsed request authentication headers.
     pub envelope: Envelope,
     /// The bytes the signature covers.
     pub signed_body: &'a [u8],

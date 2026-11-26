@@ -13,14 +13,19 @@ use crate::{Envelope, Error, VERSION, json};
 
 /// The first line of the response signing input.
 pub const RESPONSE_PREFIX: &str = "spawn-node-resp-v1";
+/// Header carrying the primary gateway key id (lowercase hex SHA-256).
 pub const HEADER_PRIMARY_KEY: &str = "Spawn-Primary-Key";
+/// Header carrying the base64url primary Ed25519 signature.
 pub const HEADER_PRIMARY_SIG: &str = "Spawn-Primary-Sig";
 
 /// The request a response answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestId<'a> {
+    /// 64-char hex node identifier bound to this request.
     pub node_id: &'a str,
+    /// 32-char lowercase hex boot identifier bound to this request.
     pub boot_id: &'a str,
+    /// Request sequence number bound to this request.
     pub seq: u64,
 }
 
@@ -62,6 +67,7 @@ pub struct ResponseSignature {
 }
 
 impl ResponseSignature {
+    /// Returns both response signature headers in canonical pair order.
     pub fn to_headers(&self) -> [(&'static str, String); 2] {
         [
             (HEADER_PRIMARY_KEY, self.primary_key.clone()),
@@ -122,12 +128,16 @@ pub fn verify_response(
 /// The body of every refusal: `{"v":1,"error":"…","server_time_ms":N}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefusalBody {
+    /// Protocol version (`1`).
     pub v: u64,
+    /// Wire error string mapped from [`Refusal`].
     pub error: String,
+    /// Gateway clock timestamp in Unix milliseconds.
     pub server_time_ms: u64,
 }
 
 impl RefusalBody {
+    /// Builds a [`RefusalBody`] from a typed [`Refusal`] and `server_time_ms`.
     pub fn new(refusal: Refusal, server_time_ms: u64) -> Self {
         Self {
             v: VERSION,
