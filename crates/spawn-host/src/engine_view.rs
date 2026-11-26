@@ -11,12 +11,15 @@
 //! ```text
 //! exec bwrap --ro-bind / / --dev /dev --proc /proc --die-with-parent --unshare-pid \
 //!     <masks> --bind <ws> <ws> --bind <engine home> <engine home> \
-//!     --bind <TMPDIR> <TMPDIR> --setenv TMPDIR <TMPDIR> --chdir <ws> -- <runner> <engine> <args>
+//!     --setenv TMPDIR <TMPDIR> --chdir <ws> -- <runner> <engine> <args>
 //! ```
 //!
 //! where `<TMPDIR>` is the engine's own, `<engine home>/.spawn-tmp`
 //! ([`TMP_FALLBACK`], 0700): never the loop's shared `TMPDIR`, which other
-//! host jobs write to and which is masked whole.
+//! host jobs write to and which is masked whole. It is writable through
+//! the engine home's bind and never bound again: a second bind would
+//! resolve its path anew when `bwrap` runs, after a writer outside the view
+//! could swap it.
 //!
 //! where `<runner> <engine> <args>` is the usual `spawn run -- <engine>
 //! <args>`: the runner stays the engine's parent, and writes the exit

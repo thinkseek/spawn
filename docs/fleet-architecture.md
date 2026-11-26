@@ -2377,13 +2377,17 @@ Code never runs in it. The launch script Herdr's pane runs ends in
 ```text
 exec bwrap --ro-bind / / --dev /dev --proc /proc --die-with-parent --unshare-pid \
     <masks> --bind <ws> <ws> --bind <engine home> <engine home> \
-    --bind <TMPDIR> <TMPDIR> --setenv TMPDIR <TMPDIR> --chdir <ws> -- \
+    --setenv TMPDIR <TMPDIR> --chdir <ws> -- \
     spawn run -- agy <args>
 ```
 
 `<TMPDIR>` is the engine's own, `<engine home>/.spawn-tmp` (0700): never
 the loop's shared `TMPDIR` (`/var/tmp/spawn` on a fleet host, where other
-host jobs keep scratch), which is masked whole. The runner stays the
+host jobs keep scratch), which is masked whole. It is writable through
+the engine home's bind and is not bound again (a second bind would resolve
+its path anew when `bwrap` runs, after a writer outside could swap it). The
+engine home is checked where it would resolve before it is made on disk,
+so a refused one is never created; it is checked again once made. The runner stays the
 engine's parent and writes the exit status into the workspace. Binding rules, from the probe under herdr 0.9.5 and bwrap 0.9.0:
 **never `--new-session`** (`setsid` takes the engine out of the pane's
 foreground process group, and Herdr's `agent.get` answers
