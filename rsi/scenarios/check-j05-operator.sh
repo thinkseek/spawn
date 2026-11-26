@@ -359,6 +359,84 @@ assert_contains "$(out)" "SPAWN STATUS" "status table header"
 assert_eq "$(scalar 'select count(*) from spawn_commands')" 0 "status writes no command"
 assert_eq "$(scalar 'select count(*) from spawn_events')" 0 "status writes no event"
 
+echo "j05: [bb010 cli contract] spawn task commits/diff/land validate arguments before the store"
+capture "$SPAWN_BIN" task commits
+assert_eq "$status" 1 "task commits missing id exit"
+assert_contains "$(err)" "task <id> is required" "task commits missing id message"
+
+capture "$SPAWN_BIN" task diff
+assert_eq "$status" 1 "task diff missing id exit"
+assert_contains "$(err)" "task <id> is required" "task diff missing id message"
+
+capture "$SPAWN_BIN" task land
+assert_eq "$status" 1 "task land missing id exit"
+assert_contains "$(err)" "task <id> is required" "task land missing id message"
+
+capture "$SPAWN_BIN" task land 1 --ff-only --squash
+assert_eq "$status" 1 "task land mutually exclusive flags exit"
+assert_contains "$(err)" "use either --ff-only or --squash, not both" \
+    "task land mutually exclusive flags message"
+
+capture "$SPAWN_BIN" task commits 1 --bogus
+assert_eq "$status" 1 "task commits unknown flag exit"
+assert_contains "$(err)" "unknown flag --bogus" "task commits unknown flag message"
+
+capture "$SPAWN_BIN" task diff 1 --bogus
+assert_eq "$status" 1 "task diff unknown flag exit"
+assert_contains "$(err)" "unknown flag --bogus" "task diff unknown flag message"
+
+capture "$SPAWN_BIN" task land 1 --bogus
+assert_eq "$status" 1 "task land unknown flag exit"
+assert_contains "$(err)" "unknown flag --bogus" "task land unknown flag message"
+
+assert_eq "$(scalar 'select count(*) from spawn_commands')" 0 "task review validation writes no command"
+assert_eq "$(scalar 'select count(*) from spawn_events')" 0 "task review validation writes no event"
+
+echo "j05: [bb010 cli contract] spawn doctor --json reports model_endpoints without leaking credentials"
+capture env -u SPAWN_CONFIG -u SPAWN_MODEL_RELAY -u SPAWN_JUDGE_URL -u SPAWN_MODEL_PREFLIGHT \
+    -u SPAWN_DEFAULT_MODEL -u SPAWN_CHEAP_MODEL -u SPAWN_SMALL_MODEL -u SPAWN_JUDGE_MODEL \
+    "$SPAWN_BIN" doctor --root "$WORK" --json
+assert_eq "$status" 0 "doctor --json unconfigured exit"
+out | jq -e '
+    (.ok | type == "boolean") and
+    (.tools | type == "object") and
+    (.model_endpoints | type == "object") and
+    (.model_endpoints.preflight_mode == "warn") and
+    (.model_endpoints.model_relay | type == "object") and
+    (.model_endpoints.model_relay.env_var == "SPAWN_MODEL_RELAY") and
+    (.model_endpoints.model_relay.status == "not_configured") and
+    (.model_endpoints.model_relay.target == null) and
+    (.model_endpoints.judge | type == "object") and
+    (.model_endpoints.judge.env_var == "SPAWN_JUDGE_URL") and
+    (.model_endpoints.judge.status == "not_configured") and
+    (.model_endpoints.judge.target == null) and
+    (.model_endpoints.model_slots | type == "object") and
+    (.model_endpoints.model_slots | has("default") and has("cheap") and has("small") and has("judge")) and
+    (.warnings | type == "array")
+' >/dev/null || fail "doctor --json unconfigured payload invalid: [$(out)]"
+
+capture env -u SPAWN_CONFIG -u SPAWN_MODEL_PREFLIGHT \
+    -u SPAWN_DEFAULT_MODEL -u SPAWN_CHEAP_MODEL -u SPAWN_SMALL_MODEL -u SPAWN_JUDGE_MODEL \
+    SPAWN_MODEL_RELAY="http://u:RelayPass55@127.0.0.1:1?api_key=RelayTok66" \
+    SPAWN_JUDGE_URL="http://j:JudgePass77@127.0.0.1:1?token=JudgeTok88" \
+    "$SPAWN_BIN" doctor --root "$WORK" --json
+assert_eq "$status" 0 "doctor --json unreachable redaction exit"
+out | jq -e '
+    (.model_endpoints.model_relay.status == "unreachable") and
+    (.model_endpoints.model_relay.target == "127.0.0.1:1") and
+    (.model_endpoints.model_relay.remediation | type == "string") and
+    (.model_endpoints.judge.status == "unreachable") and
+    (.model_endpoints.judge.target == "127.0.0.1:1") and
+    (.model_endpoints.judge.remediation | type == "string")
+' >/dev/null || fail "doctor --json unreachable payload invalid: [$(out)]"
+for leaked in RelayPass55 RelayTok66 JudgePass77 JudgeTok88; do
+    if printf '%s\n%s\n' "$(out)" "$(err)" | grep -qF "$leaked"; then
+        fail "doctor --json leaked synthetic credential marker $leaked"
+    fi
+done
+assert_eq "$(scalar 'select count(*) from spawn_commands')" 0 "doctor writes no command"
+assert_eq "$(scalar 'select count(*) from spawn_events')" 0 "doctor writes no event"
+
 # --- blackbox 060: spawn run -------------------------------------------------------
 part=bb060
 echo "j05: [bb060 the program is required]"
