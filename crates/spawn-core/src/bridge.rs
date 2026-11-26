@@ -10953,7 +10953,7 @@ mod tests {
         assert_eq!(command_outcome(&store, human), Some(Outcome::Succeeded));
         assert_eq!(
             command_outcome(&store, resolver),
-            Some(Outcome::Failed(super::GONE_PROCEED.to_string()))
+            Some(Outcome::Failed(super::GONE_DIALOG.to_string()))
         );
         assert_eq!(host.keys(), vec!["1".to_string()], "the person's key only");
         assert!(steps_of(&store, resolver).is_empty(), "no pressing");
@@ -10982,7 +10982,7 @@ mod tests {
         drive_work(&mut bridge, &store, || command_outcome(&store, gone).is_some());
         assert_eq!(
             command_outcome(&store, gone),
-            Some(Outcome::Failed(super::GONE_PROCEED.to_string()))
+            Some(Outcome::Failed(super::GONE_DIALOG.to_string()))
         );
         assert!(host.keys().is_empty());
         assert!(steps_of(&store, gone).is_empty());
