@@ -619,6 +619,92 @@ const FOLLOW_OVERLAP: usize = 4096;
 /// execution's own ([`Bridge::bind_reported`]), in milliseconds.
 const SCAN_INTERVAL_MS: i64 = 2_000;
 
+/// How much older than its execution's `execution.started` a prompt of an
+/// engine that names its own session may say it is and still bind it
+/// ([`Bridge::bind_reported`]): the engine's clock and the store's may
+/// differ by this much, in milliseconds.
+const BIND_SKEW_MS: u64 = 5_000;
+
+/// An RFC 3339 date-time (`2026-11-25T14:25:59Z`, with fractional seconds
+/// and a `Z` or `±HH:MM` offset) as epoch milliseconds; `None` for anything
+/// else. Fractions beyond milliseconds are truncated.
+fn rfc3339_ms(text: &str) -> Option<i64> {
+    fn number(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(
+            bytes
+                .iter()
+                .fold(0, |sum, digit| sum * 10 + i64::from(digit - b'0')),
+        )
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't' | b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let year = number(&bytes[0..4])?;
+    let month = number(&bytes[5..7])?;
+    let day = number(&bytes[8..10])?;
+    let hour = number(&bytes[11..13])?;
+    let minute = number(&bytes[14..16])?;
+    let second = number(&bytes[17..19])?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    // A leap second (60) reads as the next second's start.
+    if day < 1 || day > days_in_month || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let mut rest = &bytes[19..];
+    let mut millis = 0;
+    if let Some(fraction) = rest.strip_prefix(b".") {
+        let digits = fraction.iter().take_while(|byte| byte.is_ascii_digit()).count();
+        if digits == 0 {
+            return None;
+        }
+        let mut padded = [b'0'; 3];
+        for (slot, digit) in padded.iter_mut().zip(&fraction[..digits]) {
+            *slot = *digit;
+        }
+        millis = number(&padded)?;
+        rest = &fraction[digits..];
+    }
+    let offset = match rest {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2] => {
+            let hours = number(&[*h1, *h2])?;
+            let minutes = number(&[*m1, *m2])?;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let offset = (hours * 60 + minutes) * 60;
+            if *sign == b'-' { -offset } else { offset }
+        }
+        _ => return None,
+    };
+    // Days since 1970-01-01 of the civil date (Hinnant's days_from_civil).
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = shifted.div_euclid(400);
+    let year_of_era = shifted - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second - offset;
+    Some(seconds * 1_000 + millis)
+}
+
 impl Follow {
     /// The log records the execution's native session: it is known, as
     /// this Bridge bound it or not.
@@ -3278,7 +3364,9 @@ impl Bridge {
                         && value["created_at"]
                             .as_str()
                             .and_then(rfc3339_ms)
-                            .is_some_and(|created| created >= not_before)
+                            .is_some_and(|created| {
+                                u64::try_from(created).is_ok_and(|created| created >= not_before)
+                            })
                         && value["content"].as_str().is_some_and(|content| {
                             crate::message::markers(content).iter().any(ours)
                         })
