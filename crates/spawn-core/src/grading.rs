@@ -754,7 +754,7 @@ pub fn registered_profile(
 
 /// The version of [`classify_difficulty`]'s rules, carried on every
 /// classification so a recorded one says which rules decided it.
-pub const CLASSIFIER_RULES: &str = "brief-v1";
+pub const CLASSIFIER_RULES: &str = "brief-v2";
 
 /// A classification's score at or above which a task is `l3`.
 pub const CLASSIFY_L3_AT: i32 = 4;
@@ -854,30 +854,105 @@ const CROSS_CUTTING_PHRASES: &[&str] = &["across crates", "every crate", "backwa
 /// Multi-step markers.
 const MULTI_STEP_STEMS: &[&str] = &["multi-step", "end-to-end", "phase", "pipeline"];
 
-/// Low-risk markers: small, well-specified work.
-/// Only markers that name the change itself: a generic verb or noun
-/// (`comment`, `rename`, `bump`) also names real engineering work ("add
-/// comment support", "rename it and update every caller", "bump tokio
-/// and fix whatever breaks"), so none of those is one.
+/// Low-risk markers (`brief-v2`): mechanical, repetitive or tagging work
+/// only, where the result is decided by the request and not by judgement.
+/// Semantic writing (`wording`, `readme`, `docstring`, "docs only") is not
+/// one, and neither is `one-line`, which says nothing about determinism.
+/// A generic verb or noun (`comment`, `rename`, `bump`) also names real
+/// engineering work ("add comment support", "rename it and update every
+/// caller", "bump tokio and fix whatever breaks"), so none of those is one.
+/// These count wherever they stand.
 const LOW_RISK_STEMS: &[&str] = &[
     "typo",
     "spelling",
-    "wording",
-    "readme",
-    "docstring",
     "formatting",
-    "one-line",
+    "whitespace",
+    "rustfmt",
+    "mechanical",
+    "repetitive",
+];
+const LOW_RISK_PHRASES: &[&str] = &["cargo fmt", "registry entry"];
+
+/// Tagging markers that count only as the brief's first word, in the
+/// imperative form that names the work: exactly `tag` or `label` ("Tag the
+/// open tasks", "Label the stale issues", the next word one of
+/// [`DETERMINERS`], so "Tag matching is case-sensitive" is a report and
+/// "Tag release v1.2" is not counted), or a word starting `bulk-`
+/// ("Bulk-label ..."). A plural or a noun phrase there is the subject of a
+/// report ("Labels vanish after a restart", "Bulk import fails"), and
+/// anywhere else they name a thing the work is about ("fix the crash in
+/// tag matching"). Only the first line is read: a later line's "Tag the
+/// release" is one step of larger work.
+const LOW_RISK_LEAD_WORDS: &[&str] = &["tag", "label"];
+const LOW_RISK_LEAD_PREFIX: &str = "bulk-";
+
+/// `regenerat*` is a marker only when its object is a generated artifact
+/// ("regenerate the fixtures", "regenerate the golden snapshots"): the
+/// next word, past a determiner, starts with one of these. Never for a
+/// value the code makes ("regenerate the session token and update the
+/// snapshot test").
+const REGENERATE_STEM: &str = "regenerat";
+const GENERATED_ARTIFACT_STEMS: &[&str] =
+    &["fixture", "snapshot", "lockfile", "golden", "generated"];
+const DETERMINERS: &[&str] = &[
+    "the", "a", "an", "all", "its", "their", "our", "this", "these",
 ];
 
-/// Words that widen a change past a small one: any of them cancels the
-/// low-risk rule.
+/// Words that cancel the low-risk rule: words that widen a change past a
+/// small one, authoring words (writing that needs judgement), words naming
+/// code to build, and words naming a defect, performance or behaviour.
 const BROADENING_STEMS: &[&str] = &[
+    // Widening.
     "every",
     "whatever",
     "caller",
     "implement",
     "support",
     "feature",
+    // Authoring.
+    "writ",
+    "rewrit",
+    "draft",
+    "document",
+    "explain",
+    "explan",
+    "describ",
+    "summar",
+    "clarif",
+    "reword",
+    "rephras",
+    "comment",
+    // Code to build.
+    "filter",
+    "render",
+    "pars",
+    "endpoint",
+    "api",
+    "display",
+    // Defect, performance, behaviour.
+    "bug",
+    "crash",
+    "debug",
+    "hang",
+    "cause",
+    "speed",
+    "optimi",
+    "perf",
+    "slow",
+    "retry",
+    "validat",
+    "dedup",
+    "automat",
+    "handl",
+    // A defect reported subject-first ("Tags are lost on reload").
+    "fail",
+    "lost",
+    "lose",
+    "wrong",
+    "missing",
+    "vanish",
+    "broke",
+    "corrupt",
 ];
 
 /// File extensions a path token ends with.
@@ -956,6 +1031,56 @@ fn named_crates(tokens: &[&str]) -> usize {
     crates.len()
 }
 
+/// The tokens of a lowercased `text`: runs of letters, digits, `_`, `-`,
+/// `.` and `/`, trimmed of `.`, `-` and `/` at either end.
+fn tokenize(text: &str) -> Vec<&str> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')))
+        .map(|token| token.trim_matches(|c: char| matches!(c, '.' | '-' | '/')))
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// `tokens` split at `/`, so a keyword is read in every path segment.
+fn path_words<'a>(tokens: &[&'a str]) -> Vec<&'a str> {
+    tokens
+        .iter()
+        .flat_map(|token| token.split('/'))
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// The `low_risk` evidence: [`LOW_RISK_STEMS`] and [`LOW_RISK_PHRASES`]
+/// anywhere, a [`LOW_RISK_LEAD_WORDS`] or [`LOW_RISK_LEAD_PREFIX`] word as
+/// the brief's first word, and `regenerat*` whose object is a
+/// [`GENERATED_ARTIFACT_STEMS`] word.
+fn low_risk_markers(words: &[&str], text: &str) -> Vec<String> {
+    let mut markers = matched(words, text, LOW_RISK_STEMS, LOW_RISK_PHRASES);
+    if let Some(lead) = words.first() {
+        if LOW_RISK_LEAD_WORDS.contains(lead)
+            && words.get(1).is_some_and(|next| DETERMINERS.contains(next))
+        {
+            markers.push((*lead).to_string());
+        } else if lead.starts_with(LOW_RISK_LEAD_PREFIX) {
+            markers.push("bulk".to_string());
+        }
+    }
+    let regenerates_an_artifact = words.iter().enumerate().any(|(at, word)| {
+        word.starts_with(REGENERATE_STEM)
+            && words[at + 1..]
+                .iter()
+                .find(|next| !DETERMINERS.contains(next))
+                .is_some_and(|object| {
+                    GENERATED_ARTIFACT_STEMS
+                        .iter()
+                        .any(|stem| object.starts_with(stem))
+                })
+    });
+    if regenerates_an_artifact {
+        markers.push(REGENERATE_STEM.to_string());
+    }
+    markers
+}
+
 /// The difficulty a task's brief (and objective, if the caller appends
 /// it) reads as: a deterministic, integer-only rule-set over its structure
 /// and wording, every matched rule kept as evidence ([`CLASSIFIER_RULES`]).
@@ -972,10 +1097,21 @@ fn named_crates(tokens: &[&str]) -> usize {
 /// - `crate_scope` +1 from two distinct crates named (`crates/<name>` or a
 ///   `spawn-<name>` token), +2 from three;
 /// - `long_brief` +1 above 2000 characters;
-/// - `low_risk` -2: a low-risk marker (typo, spelling, readme, docstring,
-///   ...), only when no `security`, `migration` or `concurrency` rule
-///   matched and no broadening word (every, whatever, caller, implement,
-///   support, feature) is there.
+/// - `low_risk` -2: a mechanical marker (typo*, spelling*, formatting*,
+///   whitespace*, rustfmt*, mechanical*, repetitive*, "cargo fmt",
+///   "registry entry" anywhere; `tag` or `label` only as the brief's first
+///   word followed by a determiner, `bulk-*` only as its first word; regenerat* only when its object is a
+///   generated artifact: fixture*, snapshot*, lockfile*, golden*,
+///   generated*), only when no `security`,
+///   `migration` or `concurrency` rule matched and no broadening word is
+///   there: widening (every*, whatever*, caller*, implement*, support*,
+///   feature*), authoring (writ*, rewrit*, draft*, document*, explain*,
+///   explan*, describ*, summar*, clarif*, reword*, rephras*, comment*),
+///   code to build (filter*, render*, pars*, endpoint*, api*, display*),
+///   or a defect, performance or behaviour (bug*, crash*, debug*, hang*,
+///   cause*, speed*, optimi*, perf*, slow*, retry*, validat*, dedup*,
+///   automat*, handl*, fail*, lost*, lose*, wrong*, missing*, vanish*,
+///   broke*, corrupt*). A `*` marks a prefix: every keyword is one.
 ///
 /// `l3` from [`CLASSIFY_L3_AT`]; `l1` at or below [`CLASSIFY_L1_AT`] when
 /// no risk rule matched, at most one file is named and the brief is at
@@ -983,18 +1119,10 @@ fn named_crates(tokens: &[&str]) -> usize {
 /// brief no rule matched.
 pub fn classify_difficulty(brief: &str) -> DifficultyClassification {
     let text = brief.to_ascii_lowercase();
-    let tokens: Vec<&str> = text
-        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')))
-        .map(|token| token.trim_matches(|c: char| matches!(c, '.' | '-' | '/')))
-        .filter(|token| !token.is_empty())
-        .collect();
+    let tokens = tokenize(&text);
     // Keywords are read in every path segment too: `sql/schema.sql` names
     // the schema.
-    let words: Vec<&str> = tokens
-        .iter()
-        .flat_map(|token| token.split('/'))
-        .filter(|word| !word.is_empty())
-        .collect();
+    let words = path_words(&tokens);
     let mut signals = Vec::new();
     let mut add = |rule: &str, points: i32, evidence: Vec<String>| {
         if points != 0 && !evidence.is_empty() {
@@ -1057,11 +1185,7 @@ pub fn classify_difficulty(brief: &str) -> DifficultyClassification {
         vec![format!("{chars} chars")],
     );
     if !risky && matched(&words, &text, BROADENING_STEMS, &[]).is_empty() {
-        add(
-            "low_risk",
-            -2,
-            matched(&words, &text, LOW_RISK_STEMS, &["docs only", "doc only"]),
-        );
+        add("low_risk", -2, low_risk_markers(&words, &text));
     }
     let score: i32 = signals.iter().map(|signal| signal.points).sum();
     let difficulty = if score >= CLASSIFY_L3_AT {
@@ -2006,6 +2130,142 @@ mod tests {
             classify_difficulty("Fix the spelling in the docstring").difficulty,
             TaskDifficulty::L1
         );
+    }
+
+    #[test]
+    fn brief_v2_keeps_semantic_writing_out_of_l1() {
+        for brief in [
+            "Update the README wording for the install section",
+            "Write the docstring for route_preset",
+            "Improve the wording of the error message",
+            "Docs only: explain the reprobe rule",
+            "Make the one-line change in a.rs",
+            "Fix the typo and reword the sentence in README.md",
+            "Fix the typo in the comment",
+            "Draft a summary of the formatting rules",
+            "Docs only change",
+            "Add docstrings",
+            "Update the readme",
+            "Update the wording",
+            "One-line fix in a.rs",
+            "Writing the bulk import guide",
+            "Written guidance for tags",
+            "Add an explanation to each tag",
+            "Rewrite the tag rules",
+        ] {
+            let classified = classify_difficulty(brief);
+            assert_eq!(
+                classified.difficulty,
+                TaskDifficulty::L2,
+                "{brief}: {classified:?}"
+            );
+            assert!(
+                classified
+                    .signals
+                    .iter()
+                    .all(|signal| signal.rule != "low_risk"),
+                "{brief}: {classified:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn brief_v2_sends_mechanical_and_tagging_work_to_l1() {
+        for (brief, evidence) in [
+            ("Tag the 40 open tasks with their capability", "tag"),
+            ("Add the registry entry for the new file", "registry entry"),
+            ("Label the stale issues", "label"),
+            (
+                "Run cargo fmt on crates/spawn-core/src/grading.rs",
+                "cargo fmt",
+            ),
+            ("Strip the trailing whitespace", "whitespace"),
+            ("Regenerate the fixtures", "regenerat"),
+            ("Regenerate the golden snapshots", "regenerat"),
+            ("Bulk-label the stale tasks", "bulk"),
+            ("Typo fix\n\nTag the open tasks with l1", "typo"),
+            ("Tag the open tasks\nwith their capability", "tag"),
+            ("A mechanical bulk rename of the constant", "mechanical"),
+            ("Fix the typo in README.md", "typo"),
+        ] {
+            let classified = classify_difficulty(brief);
+            assert_eq!(
+                classified.difficulty,
+                TaskDifficulty::L1,
+                "{brief}: {classified:?}"
+            );
+            let low = classified
+                .signals
+                .iter()
+                .find(|signal| signal.rule == "low_risk")
+                .expect(brief);
+            assert_eq!(low.points, -2);
+            assert!(low.evidence.contains(&evidence.to_string()), "{low:?}");
+        }
+    }
+
+    #[test]
+    fn brief_v2_tags_and_labels_inside_real_work_stay_out_of_l1() {
+        for brief in [
+            "Implement label support",
+            "Add tag filtering to the task list",
+            "Render the labels on the web timeline",
+            "Parse the tag from the commit message",
+            "Add a label endpoint to the API",
+            "Display each task's tags",
+            "Add a bulk delete feature",
+            "Store the label in the tasks table inside one transaction",
+            // Defect, performance and behaviour work naming a tagging
+            // marker (supervisor review of task 580, F1).
+            "Fix the bug where tags vanish after a restart",
+            "Tasks lose their labels on reload; find the cause and fix it",
+            "Fix the crash in tag matching",
+            "Debug why the labeller hangs",
+            "Make tag lookup case-insensitive",
+            "Add a --tag flag to spawn task list",
+            "Validate labels before saving them",
+            "Deduplicate tags when merging tasks",
+            "Tag releases automatically from the integrator",
+            "Speed up the bulk insert path",
+            "Optimise the bulk loader in the importer",
+            "Add bulk retry to the dispatcher",
+            "Regenerate the cache when the config changes",
+            "Regenerate the session token on each login",
+            "Fix the whitespace handling in the tokenizer",
+            // Subject-first reports, later-line imperatives and a
+            // regenerated value (supervisor review of task 580, F4).
+            "Labels vanish after a restart",
+            "Tags are lost on reload",
+            "Bulk import fails on empty rows",
+            "Label colours are wrong in dark mode",
+            "Tags go missing after a merge",
+            "Bulk import is broken",
+            "Label data is corrupt after an upgrade",
+            "Fix the scheduler\nTag the release afterwards",
+            "Cleanup\n- Tag the open tasks\n- Remove the dead code path",
+            "Regenerate the session token and update the snapshot test",
+            "Regenerate the signing key next to the fixtures",
+            // A leading tag or label not followed by a determiner is the
+            // subject of a report (supervisor review of task 580, F5).
+            "Tag matching is case-sensitive; make it case-insensitive",
+            "Label overlaps the button on narrow screens",
+            "Tag colour is too dark in the sidebar",
+            "Label text is truncated on mobile",
+            "Tag is shown twice on the task page",
+        ] {
+            let classified = classify_difficulty(brief);
+            assert!(
+                classified.difficulty >= TaskDifficulty::L2,
+                "{brief}: {classified:?}"
+            );
+            assert!(
+                classified
+                    .signals
+                    .iter()
+                    .all(|signal| signal.rule != "low_risk"),
+                "{brief}: {classified:?}"
+            );
+        }
     }
 
     #[test]
