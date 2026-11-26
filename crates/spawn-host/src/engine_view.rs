@@ -400,10 +400,12 @@ impl BwrapView {
     }
 
     /// Every target resolved now: the directories and the regular files to
-    /// mask, and what was skipped and why. A target inside a masked
-    /// directory goes with it. Nothing is dropped for the engine's sake: an
-    /// engine home equal to, or holding, a target is refused
-    /// ([`BwrapView::plan`]).
+    /// mask, and what was skipped and why. All of them, a target inside
+    /// another masked directory included: the writable binds are checked
+    /// against every one ([`BwrapView::refuse_binds`]), and only the words
+    /// leave the nested ones out ([`prune_nested`]). Nothing is dropped for
+    /// the engine's sake: an engine home equal to, or holding, a target is
+    /// refused.
     fn targets(&self) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, String)>) {
         let home = std::fs::canonicalize(&self.config.home).unwrap_or(self.config.home.clone());
         let mut skipped = Vec::new();
@@ -434,14 +436,6 @@ impl BwrapView {
                 Err(why) => skipped.push((target, why)),
             }
         }
-        let inside_other = |path: &Path, all: &[PathBuf]| {
-            all.iter()
-                .any(|dir| dir.as_path() != path && path.starts_with(dir))
-        };
-        let all_directories = directories.clone();
-        directories.retain(|dir| !inside_other(dir, &all_directories));
-        files.retain(|file| !inside_other(file, &directories));
-
         (directories, files, skipped)
     }
 
@@ -521,15 +515,21 @@ impl BwrapView {
     /// or the engine's home cannot be bound without uncovering a mask, or
     /// cannot be made.
     pub fn plan(&self, launch: &ViewedLaunch<'_>) -> Result<Plan, String> {
-        let workspace = canonical_directory(Path::new(launch.workspace), "the workspace", false)?;
-        let engine_home =
-            canonical_directory(Path::new(launch.engine_home), "the engine's home", true)?;
+        let workspace = canonical_directory(Path::new(launch.workspace), "the workspace")?;
         let private = self.private_dir()?;
-
-        let (directories, files, skipped) = self.targets();
-        let masked: Vec<&PathBuf> = directories.iter().chain(files.iter()).collect();
+        let (all_directories, all_files, skipped) = self.targets();
+        let masked: Vec<&PathBuf> = all_directories.iter().chain(all_files.iter()).collect();
+        // The engine's home is checked where it would resolve before
+        // anything is made on disk: a refused one is never created.
+        let wanted = Path::new(launch.engine_home);
+        let prospective = prospective_canonical(wanted)
+            .map_err(|why| format!("the engine's home {}: {why}", wanted.display()))?;
+        self.refuse_binds(&workspace, &prospective, &private, &masked)?;
+        let engine_home = make_engine_home(wanted, &prospective)?;
+        // Made: checked again where it does resolve.
         self.refuse_binds(&workspace, &engine_home, &private, &masked)?;
         let tmpdir = engine_tmpdir(&engine_home)?;
+        let (directories, files) = prune_nested(&all_directories, &all_files);
 
         let mut words = vec![
             self.program.display().to_string(),
@@ -555,9 +555,12 @@ impl BwrapView {
                 masks.push(Mask::File(file.clone()));
             }
         }
+        // The TMPDIR below the engine's home is already writable through
+        // that bind: bound again, its path would be resolved anew when
+        // `bwrap` runs, after a writer outside the view could swap it.
         let mut bound: Vec<&Path> = Vec::new();
         for path in [workspace.as_path(), engine_home.as_path(), tmpdir.as_path()] {
-            if bound.contains(&path) {
+            if bound.iter().any(|done| path.starts_with(done)) {
                 continue;
             }
             bound.push(path);
@@ -632,6 +635,76 @@ fn engine_tmpdir(engine_home: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// The masks the words carry: `directories` and `files` less every one
+/// inside another masked directory, which goes with it.
+fn prune_nested(directories: &[PathBuf], files: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let inside_other = |path: &Path, all: &[PathBuf]| {
+        all.iter()
+            .any(|dir| dir.as_path() != path && path.starts_with(dir))
+    };
+    let kept: Vec<PathBuf> = directories
+        .iter()
+        .filter(|dir| !inside_other(dir, directories))
+        .cloned()
+        .collect();
+    let files = files
+        .iter()
+        .filter(|file| !inside_other(file, &kept))
+        .cloned()
+        .collect();
+    (kept, files)
+}
+
+/// Where `path` (absolute, no `..`) would resolve: its deepest existing
+/// ancestor canonicalized, the rest joined as written. Nothing is made.
+fn prospective_canonical(path: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err("not absolute".to_string());
+    }
+    if path.components().any(|part| part == Component::ParentDir) {
+        return Err("holds `..`".to_string());
+    }
+    let mut existing = path.to_path_buf();
+    let mut rest = Vec::new();
+    while std::fs::symlink_metadata(&existing).is_err() {
+        let Some(name) = existing.file_name().map(std::ffi::OsStr::to_os_string) else {
+            return Err("no part of it exists".to_string());
+        };
+        rest.push(name);
+        existing.pop();
+    }
+    let mut resolved = std::fs::canonicalize(&existing).map_err(|error| error.to_string())?;
+    for name in rest.into_iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
+}
+
+/// The engine's home, made 0700 (its missing parents too) when missing,
+/// and canonical; refused unless it resolves where it was checked
+/// (`prospective`) and is a directory.
+fn make_engine_home(wanted: &Path, prospective: &Path) -> Result<PathBuf, String> {
+    if std::fs::symlink_metadata(wanted).is_err() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(wanted)
+            .map_err(|error| format!("create the engine's home {}: {error}", wanted.display()))?;
+    }
+    let made = canonical_directory(wanted, "the engine's home")?;
+    if made == prospective {
+        Ok(made)
+    } else {
+        Err(format!(
+            "the engine's home {} resolves to {}, not {} where it was checked",
+            wanted.display(),
+            made.display(),
+            prospective.display()
+        ))
+    }
+}
+
 /// What a mask target resolved to.
 enum Resolved {
     Directory(PathBuf),
@@ -662,15 +735,9 @@ fn resolve(target: &Path) -> Result<Resolved, String> {
 }
 
 /// `path` canonical, a directory; made (0700) first when `create`.
-fn canonical_directory(path: &Path, what: &str, create: bool) -> Result<PathBuf, String> {
+fn canonical_directory(path: &Path, what: &str) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("{what} {} is not absolute", path.display()));
-    }
-    if create && !path.exists() {
-        std::fs::create_dir_all(path)
-            .map_err(|error| format!("create {what} {}: {error}", path.display()))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("chmod {what} {}: {error}", path.display()))?;
     }
     let canonical = std::fs::canonicalize(path)
         .map_err(|error| format!("{what} {}: {error}", path.display()))?;
