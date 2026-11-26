@@ -1002,3 +1002,37 @@ fn a_staged_text_reaches_a_detected_agent_through_agent_prompt() {
     screen_with(&host, &agy, &workspace, "esc to cancel");
     host.terminate(&agy, &workspace).expect("terminate");
 }
+
+/// R1 of PR H3-screen-fix: Herdr's pane shell echoes the line that runs the
+/// launch script (`$ exec /bin/sh '<script>'`). Left on the screen above a
+/// trust dialog, it read as a drafted prompt, so the Bridge took the input
+/// box for drawn and never answered the dialog. The launch script clears
+/// the screen first: the tail holds the dialog alone, which reads as
+/// nothing yet and gets the trust keys.
+#[test]
+fn the_launch_echo_is_cleared_before_the_program_draws() {
+    use spawn_core::screen::{ScreenState, TRUST_KEYS, is_trust_dialog, read_claude_screen};
+
+    let _serial = exclusive();
+    let Some(session) = Session::new() else {
+        return;
+    };
+    let host = session.host();
+    let workspace = session.workspace();
+    let dialog = terminal("spawn-exec_h5");
+    host.start(&session.launch(
+        &dialog,
+        "printf 'Quick safety check: Is this a project you created or one you trust?\\n\
+         y. Yes, I trust this folder\\nn. No, exit\\nEnter y/n:\\n\
+         Enter to confirm \\302\\267 Esc to cancel\\n'; exec cat",
+    ))
+    .expect("start");
+    let screen = screen_with(&host, &dialog, &workspace, "Esc to cancel");
+    assert!(!screen.contains("exec /bin/sh"), "the echo stayed:\n{screen}");
+    assert!(!screen.contains(".sh"), "the script's path stayed:\n{screen}");
+    assert!(is_trust_dialog(&screen), "{screen}");
+    let reading = read_claude_screen(&screen);
+    assert_eq!(reading.state, ScreenState::Unknown, "{reading:?}\n{screen}");
+    assert_eq!(TRUST_KEYS, ["y", "Enter"]);
+    host.terminate(&dialog, &workspace).expect("terminate");
+}
