@@ -889,8 +889,13 @@ impl NodeShadows {
             scenarios_sha256
                 .as_deref()
                 .and_then(|digest| {
-                    remote::controller_pack_key(&controller, &controller_commit, &scenarios_at, digest)
-                        .ok()
+                    remote::controller_pack_key(
+                        &controller,
+                        &controller_commit,
+                        &scenarios_at,
+                        digest,
+                    )
+                    .ok()
                 })
                 .as_deref(),
         );
@@ -1935,13 +1940,20 @@ mod tests {
         let gate = world.ctl.join("scripts/gate.sh");
         std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o644)).unwrap();
         let first = pack(&mut nodes);
-        assert_eq!(pack(&mut nodes), first, "the same controller, the same pack");
+        assert_eq!(
+            pack(&mut nodes),
+            first,
+            "the same controller, the same pack"
+        );
         std::fs::write(&gate, "exit 1\n").unwrap();
         let edited = pack(&mut nodes);
         assert_ne!(edited, first, "an edited gate.sh");
         std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
         let executable = pack(&mut nodes);
-        assert!(![&first, &edited].contains(&&executable), "an executable gate.sh");
+        assert!(
+            ![&first, &edited].contains(&&executable),
+            "an executable gate.sh"
+        );
         std::fs::write(world.ctl.join("web/package-lock.json"), "{}\n").unwrap();
         let locked = pack(&mut nodes);
         assert!(

@@ -662,7 +662,8 @@ pub(super) fn controller_pack_key(
     }
     let lock = controller.join("web/package-lock.json");
     if lock.is_file() {
-        let (digest, _) = hash_file(&lock).map_err(|error| format!("{}: {error}", lock.display()))?;
+        let (digest, _) =
+            hash_file(&lock).map_err(|error| format!("{}: {error}", lock.display()))?;
         field(&mut key, b"web-lock:present");
         field(&mut key, digest.as_bytes());
     } else {
@@ -690,7 +691,12 @@ fn scripts_digest(scripts: &Path) -> Result<String, String> {
         let mut record = Vec::new();
         if kind.is_symlink() {
             record.extend_from_slice(b"link\0");
-            record.extend_from_slice(std::fs::read_link(path).map_err(fail)?.as_os_str().as_bytes());
+            record.extend_from_slice(
+                std::fs::read_link(path)
+                    .map_err(fail)?
+                    .as_os_str()
+                    .as_bytes(),
+            );
         } else if kind.is_file() {
             let (digest, size) = hash_file(path).map_err(fail)?;
             record.extend_from_slice(format!("file\0{mode:o}\0{size}\0{digest}").as_bytes());
@@ -1661,8 +1667,7 @@ impl Primary {
             scenarios_sha256
                 .as_deref()
                 .and_then(|digest| {
-                    controller_pack_key(&controller, &controller_commit, &scenarios_at, digest)
-                        .ok()
+                    controller_pack_key(&controller, &controller_commit, &scenarios_at, digest).ok()
                 })
                 .as_deref(),
         );
