@@ -435,7 +435,9 @@ fn attribution(
     kind: ProvChangeKind,
 ) -> Result<Attribution, String> {
     if let Some(task) = task {
-        let facts = store.prov_task_facts(&[task]).map_err(|error| error.to_string())?;
+        let facts = store
+            .prov_task_facts(&[task])
+            .map_err(|error| error.to_string())?;
         let facts = facts
             .get(&task)
             .ok_or_else(|| format!("task {task} is unknown"))?;
@@ -577,7 +579,9 @@ pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Val
         })?;
     let domain = domain_of(&args.name);
     let change_id = change_id_of(&args.name);
-    let mut changes = store.prov_domain_changes(&domain).map_err(|error| error.to_string())?;
+    let mut changes = store
+        .prov_domain_changes(&domain)
+        .map_err(|error| error.to_string())?;
     let head = changes.first().cloned();
     let mut recorded = None;
     if head.as_ref().map(|head| head.result.as_str()) != Some(snapshot.to_string().as_str()) {
@@ -619,7 +623,9 @@ pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Val
             rows.len(),
             rows.iter().any(|row| row.class == ProvEntryClass::Tree),
         ));
-        changes = store.prov_domain_changes(&domain).map_err(|error| error.to_string())?;
+        changes = store
+            .prov_domain_changes(&domain)
+            .map_err(|error| error.to_string())?;
     }
     let kept = cas
         .keep_snapshots(&args.name, &newest_results(&changes))
@@ -659,7 +665,10 @@ pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Val
 /// snapshots its pin keeps.
 pub(crate) fn refs(store: &PostgresStore, cas: Option<&Store>) -> Result<Value, String> {
     let mut out = Vec::new();
-    for head in store.prov_heads(DOMAIN_PREFIX).map_err(|error| error.to_string())? {
+    for head in store
+        .prov_heads(DOMAIN_PREFIX)
+        .map_err(|error| error.to_string())?
+    {
         let name = head
             .head
             .domain
@@ -713,7 +722,9 @@ fn prepare_rollback(
     check_ref(name)?;
     let target = parse_digest(word)?;
     let domain = domain_of(name);
-    let changes = store.prov_domain_changes(&domain).map_err(|error| error.to_string())?;
+    let changes = store
+        .prov_domain_changes(&domain)
+        .map_err(|error| error.to_string())?;
     let head = changes
         .first()
         .cloned()
@@ -726,36 +737,32 @@ fn prepare_rollback(
     if head.result == target.to_string() {
         return Ok(None);
     }
-    let kept = cas.kept_snapshots(name).map_err(|error| error.to_string())?;
-    let mut refused = None;
-    if !kept.contains(&target) {
-        refused = Some(format!(
+    let kept = cas
+        .kept_snapshots(name)
+        .map_err(|error| error.to_string())?;
+    let refused = if kept.contains(&target) {
+        match cas.snapshot_missing(&target) {
+            Ok(missing) if missing.is_empty() => None,
+            Ok(missing) => Some(format!(
+                "rollback refused: {} file(s) of {target} (data:{name} rev {}) are not in the \
+                 store (a --digest-only snapshot never stored them). Nothing was recorded.",
+                missing.len(),
+                origin.rev
+            )),
+            Err(error) if error.is_not_found() => Some(format!(
+                "rollback refused: the manifest of {target} (data:{name}) is gone. Nothing was \
+                 recorded."
+            )),
+            Err(error) => return Err(error.to_string()),
+        }
+    } else {
+        Some(format!(
             "rollback refused: {target} (data:{name} rev {}) is no longer kept: only the \
              {KEEP_SNAPSHOTS} newest snapshots of a ref are pinned, and its bytes are gone. \
              Nothing was recorded.",
             origin.rev
-        ));
-    } else {
-        match cas.snapshot_missing(&target) {
-            Ok(missing) if missing.is_empty() => {}
-            Ok(missing) => {
-                refused = Some(format!(
-                    "rollback refused: {} file(s) of {target} (data:{name} rev {}) are not in \
-                     the store (a --digest-only snapshot never stored them). Nothing was \
-                     recorded.",
-                    missing.len(),
-                    origin.rev
-                ));
-            }
-            Err(error) if error.is_not_found() => {
-                refused = Some(format!(
-                    "rollback refused: the manifest of {target} (data:{name}) is gone. Nothing \
-                     was recorded."
-                ));
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
+        ))
+    };
     let rows = if refused.is_none() {
         let before = manifest_of(cas, name, &parse_digest(&head.result)?)?;
         let after = manifest_of(cas, name, &target)?;
@@ -854,7 +861,9 @@ pub(crate) fn rollback(
         .map_err(|error| error.to_string())?;
     let mut newest = vec![rollback.target.clone()];
     newest.extend(newest_results(&rollback.changes));
-    let kept = cas.keep_snapshots(name, &newest).map_err(|error| error.to_string())?;
+    let kept = cas
+        .keep_snapshots(name, &newest)
+        .map_err(|error| error.to_string())?;
     answer["recorded"] = json!(true);
     answer["kept"] = json!(
         kept.kept

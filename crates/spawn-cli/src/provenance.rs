@@ -153,14 +153,22 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "revert" | "split" | "compose" => plan_command(verb, &rest[1..]),
+        "snapshot" | "refs" | "rollback" => data_command(verb, &rest[1..]),
+        _ => Err(USAGE.to_string()),
+    }
+}
+
+/// `spawn prov snapshot|refs|rollback ...` (PV3b, [`data`]).
+fn data_command(verb: &str, rest: &[String]) -> Result<i32, String> {
+    match verb {
         "snapshot" => {
-            let args = data::snapshot_args(&rest[1..])?;
+            let args = data::snapshot_args(rest)?;
             let store = crate::open_store()?;
             println!("{}", pretty(&data::snapshot(&store, &args)?));
             Ok(0)
         }
         "refs" => {
-            let flags = Flags::parse(&rest[1..])?;
+            let flags = Flags::parse(rest)?;
             let cas = match flags.get("cas") {
                 Some(dir) => Some(spawn_cas::Store::open(dir).map_err(|error| error.to_string())?),
                 None => None,
@@ -170,7 +178,7 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "rollback" => {
-            let (words, planned, flags) = plan_arguments(&rest[1..])?;
+            let (words, planned, flags) = plan_arguments(rest)?;
             let [name, snapshot] = words.as_slice() else {
                 return Err(USAGE.to_string());
             };
