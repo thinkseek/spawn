@@ -7788,4 +7788,57 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn ipc_route_table_covers_every_canonical_route() {
+        let table: serde_json::Value = serde_json::from_str(include_str!(
+            "../../spawn-core/testdata/spawn-ipc-v1/routes.json"
+        ))
+        .expect("valid spawn-ipc-v1 routes.json");
+        let routes = table["routes"].as_array().expect("routes array");
+        let mut by_key = std::collections::BTreeMap::new();
+        for entry in routes {
+            let method = entry["method"].as_str().expect("method");
+            let pattern = entry["pattern"].as_str().expect("pattern");
+            assert!(
+                by_key.insert((method, pattern), entry).is_none(),
+                "duplicate route in routes.json: {method} {pattern}"
+            );
+        }
+        assert_eq!(super::ROUTES.len(), 42);
+        for &(method, pattern) in super::ROUTES {
+            let entry = by_key.get(&(method, pattern)).unwrap_or_else(|| {
+                panic!("missing canonical route in routes.json: {method} {pattern}")
+            });
+            if method == "GET" {
+                assert_eq!(entry["pool"], "reads", "{pattern}");
+                assert_eq!(entry["pg_role"], "spawn_reader", "{pattern}");
+                assert_eq!(entry["idempotency_key"], false, "{pattern}");
+            } else {
+                assert_eq!(method, "POST", "{pattern}");
+                assert_eq!(entry["pool"], "writes", "{pattern}");
+                assert_eq!(entry["idempotency_key"], true, "{pattern}");
+                let expected_role =
+                    if matches!(pattern, "/api/features/scan" | "/api/features/associate") {
+                        "none"
+                    } else {
+                        "spawn_human"
+                    };
+                assert_eq!(entry["pg_role"], expected_role, "{pattern}");
+            }
+        }
+        let api_count = routes
+            .iter()
+            .filter(|entry| {
+                entry["pattern"]
+                    .as_str()
+                    .is_some_and(|p| p.starts_with("/api/"))
+            })
+            .count();
+        assert_eq!(
+            api_count,
+            super::ROUTES.len(),
+            "routes.json /api/* count must match serve::ROUTES exactly"
+        );
+    }
 }

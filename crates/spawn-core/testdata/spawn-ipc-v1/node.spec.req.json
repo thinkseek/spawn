@@ -1,0 +1,15 @@
+{
+  "node_id": "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+  "boot_id": "00000000000000018796a5b4c3d2e1f0",
+  "spec_sha256": "9d45101b5c0e737a0f54529ff68d874651d84e9255f90ce2f9935f15e8458960",
+  "spec": {
+    "v": 1,
+    "name": "n252",
+    "cell_id": "c0",
+    "labels": ["linux", "x86_64", "tier:tmpfs-bwrap"],
+    "resources_total": { "cores": 192, "mem_mb": 2063000, "disk_mb": 3460000 },
+    "capacities_total": { "gate_sandbox": 4, "batch_cpu": 160 },
+    "tmpfs_budget_mb": 262144,
+    "holds": { "pg": "16" }
+  }
+}

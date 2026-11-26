@@ -1,0 +1,18 @@
+[
+  {
+    "case": "truncated_v1_47b",
+    "der_b64u": "MC4CAQAwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4"
+  },
+  {
+    "case": "wrong_len_v2_84b",
+    "der_b64u": "MFMCAQEwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4foSMDIQADoQe_884Qvh1w3RjnS8CZZ-TWMJulDV8d3IZkElUx"
+  },
+  {
+    "case": "wrong_oid_ed448",
+    "der_b64u": "MC4CAQAwBQYDK2VxBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f"
+  },
+  {
+    "case": "corrupt_v2_ring_tag",
+    "der_b64u": "MFECAQEwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fgSIAA6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"
+  }
+]

@@ -1,0 +1,7 @@
+{
+  "proto": "spawn-ipc-v1",
+  "build": "0.1.0-test",
+  "schema": 1,
+  "epoch": "boot-0000000000000001",
+  "latest_id": 104
+}
