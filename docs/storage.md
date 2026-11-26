@@ -44,8 +44,10 @@ locale (`LC_ALL=C`, no `LANGUAGE`; `spawn_host::git_command`). Spawn reads
 what git answers (a push's summary, a merge's conflict kinds, listings, the
 error it quotes in a record or a note), and a host whose locale is
 translated (`LANG=zh_CN.UTF-8`) would otherwise get git's messages in its
-language. tmux is given no locale: it has no translations, and one given to
-the command that starts its server would reach every pane.
+language. The Herdr terminal host (`herdr-core` / `spawn-hc`, or `herdr`) is
+given no forced `LC_ALL=C` override: its RPC protocol is JSON rather than
+translated prose, and forcing a locale on the server would reach every
+terminal pane.
 
 Spawn's own commits never sign, whatever the host's git configuration says:
 a checkpoint is `commit-tree`, which ignores `commit.gpgSign`, and a landing
@@ -255,10 +257,12 @@ commit with a key no agent holds cannot hang or fail a test.
 - **Ending an execution**: terminal killed, final checkpoint, workspace
   unmounted, then `execution.ended`. The kill comes first and returns only
   once the runner and every process it started have exited
-  (`TerminalHost::terminate`; the tmux host reads the pane's pid, the
-  leader of the session its runner runs in, before `kill-session`, waits up
-  to 5 s for that session's processes to exit, sends what is left SIGKILL
-  and waits 2 s more). That wait runs on a thread of its own, off the
+  (`TerminalHost::terminate`; the Herdr host closes the terminal via RPC —
+  `terminal.kill` / `terminal.rm` in `herdr-core` or `pane.close` /
+  `workspace.close` in `herdr` — waits up to 5 s (`HANGUP_WAIT`) for the
+  runner leader's session processes to exit, sends survivors SIGKILL and
+  waits 2 s more (`KILL_WAIT`), then sweeps any detached straggler processes
+  still beneath the workspace). That wait runs on a thread of its own, off the
   Bridge's serial loop (`TerminalHost::terminate_waits`, backlog P7): the
   end is pending, not failed, until the kill is done, each tick reading it
   (50 ms in line first, so a terminal already gone ends in the same tick;
@@ -274,15 +278,20 @@ commit with a key no agent holds cannot hang or fail a test.
   checkpoint first, a line it wrote after the checkpoint was deleted by the
   unmount (028's stop, 2026-11-09). Now nothing it writes can land after
   the final checkpoint. Every end goes this way: a stop, an exit, a lost
-  runner, an abandoned start. A session that vanished on its own (tmux
-  died, or the session was killed outside the Bridge) is waited for too:
-  the host records the pane's leader pid and start time at start (a
-  private file per tmux program and socket under `$XDG_RUNTIME_DIR`), and
-  the kill reads the session from it when no pane is left, so a runner
-  still exiting, or one that ignores the hang-up, is waited for or killed
+  runner, an abandoned start. A terminal that vanished on its own (the Herdr
+  daemon exited, or the terminal was killed outside the Bridge) is waited for
+  too: the host records the runner's leader pid and start time at start (a
+  private per-terminal record under `$XDG_RUNTIME_DIR`, e.g.
+  `spawn-hc-<uid>/` for `herdr-core`), and when the server is no longer
+  answering `herdr-core`'s `terminate` sends `SIGTERM` directly to the
+  recorded session (`signal_sessions`) before `wait_sessions_gone`, so a runner
+  still exiting, or one that ignores hang-up, is waited for or killed
   before the checkpoint (backlog P6). A record whose pid now belongs to a
-  process that started at another time names nothing. A process that left
-  the runner's session (`setsid`) is not waited for. A runner that outlives the kill and the
+  process that started at another time names nothing. Detached processes
+  (`setsid`, `nohup`, background updaters) whose working directory is still
+  inside the workspace are swept by `end_stragglers` (`SIGTERM` then
+  `SIGKILL` via pidfd) before the checkpoint; a detached process outside the
+  workspace is not swept. A runner that outlives the kill and the
   SIGKILL fails the attempt: no checkpoint and no unmount while it may still
   write, and the attempt counts toward the stall below like a failed
   checkpoint (`execution.end_stalled`'s `error` then names the kill). The
@@ -302,18 +311,19 @@ commit with a key no agent holds cannot hang or fail a test.
 - **When an execution has ended** (issue #15): its runner wrote its exit
   status (`exited`), or no runner the Bridge started runs it any more
   (`lost`): its terminal is gone, or is there and hosts no runner. A
-  terminal of the execution's name can outlive its runner: a pane kept dead
-  by `remain-on-exit`, or a session a terminal manager (tmux-resurrect,
-  continuum) restored after a restart at a shell prompt. tmux's
-  `has-session` says yes to both, and the Bridge used to call such an
-  execution running forever, while the log's guard refused every start of
-  its session. Now the tmux host answers `TerminalHost::runner` from
-  `list-panes`: the pane alive (`pane_dead` 0) and started by this host's
-  launch (`pane_start_command` names the launch's environment file,
-  `spawn-launch-<terminal>-`; every launch has one). Anything else is
-  `lost`, and its `execution.ended` carries `evidence`: what the host saw
-  (the dead pane's status, or what the pane was started with and runs),
-  and which command found it. The end is the one above: terminal killed
+  terminal of the execution's name can outlive its runner — historically an
+  issue when a dead pane or a restored shell fooled naive liveness checks,
+  leaving the Bridge treating the execution as running forever while the
+  log's guard refused every new start. On the Herdr host (`herdr-core` /
+  `spawn-hc`, or `herdr`), `TerminalHost::runner` and `TerminalHost::runners`
+  verify the Herdr server identity, live terminal/pane state (`terminal.list`
+  / `pane.list`), and the recorded runner leader pid and start time
+  (`record.leader.alive()`). A missing server or terminal answers
+  `Runner::Gone`; a live terminal whose recorded runner pid is gone answers
+  `Runner::Untracked` with evidence naming the terminal/pane address and
+  missing pid. Anything else than `Runner::Running` settles as `lost`, and
+  its `execution.ended` carries `evidence` of what the host saw. The end is
+  the one above: terminal killed
   (the restored shell too: no untracked engine is ever adopted), final
   checkpoint, unmount, record. A start, a resume and an input settle such an
   execution before they act (`Bridge::settle`), instead of failing on it
@@ -331,7 +341,9 @@ commit with a key no agent holds cannot hang or fail a test.
   orphan when the log holds that execution open: it is kept and the
   execution followed again.
 - **Workspace identity**: a workspace has one name, the one its engine
-  sees. tmux starts the pane in the workspace (`-c`), the kernel resolves
+  sees. The Herdr terminal host starts the terminal in the workspace (`cwd`
+  passed to `terminal.run` in `herdr-core` or `workspace.create` in
+  `herdr`), the kernel resolves
   every symlink on the way, and Claude Code files its transcript under the
   resolved working directory (every character but ASCII letters and digits
   replaced by `-`). So the workspace root is resolved through its symlinks
