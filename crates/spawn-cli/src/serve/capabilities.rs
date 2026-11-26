@@ -971,4 +971,245 @@ mod tests {
         );
         assert!(run_bounded("sh", &["-c", "exit 3"], Duration::from_secs(5)).is_err());
     }
+
+    const WRAPPED_VERSION: &str = "bwrap --die-with-parent --unshare-pid -- agy --version";
+    const WRAPPED_MODELS: &str = "bwrap --die-with-parent --unshare-pid -- agy models";
+
+    fn agy_answers() -> Vec<(&'static str, Result<&'static str, &'static str>)> {
+        vec![
+            ("claude --version", Ok("2.1.0 (Claude Code)\n")),
+            ("agy --version", Ok("1.5.17\n")),
+            ("agy models", Ok("gemini-3.8-pro\n")),
+            (WRAPPED_VERSION, Ok("1.5.17\n")),
+            (WRAPPED_MODELS, Ok("gemini-3.8-pro\n")),
+        ]
+    }
+
+    /// F1 (O55): a sandboxed engine (agy, `Guard::Sandbox`) with no view on
+    /// this host is down, and its program is never run on the host, not
+    /// even for `--version`; Claude Code is probed unwrapped, as before.
+    #[test]
+    fn a_sandboxed_engine_with_no_view_is_unavailable_and_never_run() {
+        let host = fake_viewed(
+            vec![("HOME", "/home/a"), ("SPAWN_ENGINES", "claude,agy")],
+            agy_answers(),
+            View::Refuse("no filesystem view on this host (bwrap is not installed)"),
+        );
+        let probe = host.probe();
+        assert_eq!(*host.runs.borrow(), ["claude --version"], "agy never ran");
+        assert_eq!(*host.viewed.borrow(), ["agy /home/a/.gemini/antigravity-cli"]);
+        let agy = &probe.engines[1];
+        assert!(agy.enabled);
+        assert_eq!(agy.installed, None);
+        assert_eq!(agy.version, None);
+        assert_eq!(agy.known_models, None);
+        let why = agy.unavailable.as_deref().expect("down");
+        assert!(why.contains("bwrap is not installed"), "{why}");
+        assert!(why.contains("engine_unavailable"), "{why}");
+        assert_eq!(agy.login.len(), 2, "its login files are still only stated");
+        let ready = engines(&probe);
+        assert!(matches!(
+            ready.runs("agy", Some("gemini-3.8-pro")),
+            Runs::Unavailable(why) if why.contains("filesystem view")
+        ));
+        assert_eq!(probe.engines[0].unavailable, None, "Claude is never down");
+        assert_eq!(
+            ready.runs("claude", None),
+            Runs::On("claude".to_string(), None)
+        );
+    }
+
+    /// F1: with a view, agy's `--version` and `models` run as the view's
+    /// program with agy and its arguments after `--`; Claude Code's
+    /// `--version` stays unwrapped, and a Claude-only host asks no view.
+    #[test]
+    fn a_sandboxed_engines_probes_run_inside_its_view_and_claudes_do_not() {
+        let host = fake_viewed(
+            vec![("HOME", "/home/a"), ("SPAWN_ENGINES", "claude,agy")],
+            agy_answers(),
+            View::Wrap,
+        );
+        let probe = host.probe();
+        assert_eq!(
+            *host.runs.borrow(),
+            ["claude --version", WRAPPED_VERSION, WRAPPED_MODELS]
+        );
+        assert_eq!(*host.viewed.borrow(), ["agy /home/a/.gemini/antigravity-cli"]);
+        let agy = &probe.engines[1];
+        assert_eq!(agy.installed, Some(true));
+        assert_eq!(agy.version.as_deref(), Some("1.5.17"));
+        assert_eq!(agy.unavailable, None);
+        assert_eq!(
+            engines(&probe).runs("agy", Some("gemini-3.8-pro")),
+            Runs::On("agy".to_string(), Some("gemini-3.8-pro".to_string()))
+        );
+        // A wrapped run that fails takes agy down alone.
+        let failing = fake_viewed(
+            vec![("SPAWN_ENGINES", "agy")],
+            vec![(WRAPPED_VERSION, Err("exited with exit status: 1"))],
+            View::Wrap,
+        );
+        let probe = failing.probe();
+        assert!(
+            probe.engines[1]
+                .unavailable
+                .as_deref()
+                .is_some_and(|why| why.contains("agy --version: exited")),
+            "{:?}",
+            probe.engines[1].unavailable
+        );
+        assert_eq!(probe.engines[0].unavailable, None);
+        // Claude Code alone: no view is asked for, nothing is wrapped.
+        for view in [View::Wrap, View::Refuse("none")] {
+            let claude = fake_viewed(vec![("HOME", "/home/a")], agy_answers(), view);
+            let probe = claude.probe();
+            assert_eq!(*claude.runs.borrow(), ["claude --version"]);
+            assert!(claude.viewed.borrow().is_empty());
+            assert_eq!(probe.engines[0].installed, Some(true));
+        }
+    }
+
+    /// A view that records what it was asked and wraps in a made-up
+    /// `bwrap`, or refuses.
+    #[derive(Debug, Default)]
+    struct FakeEngineView {
+        refuse: Option<&'static str>,
+        asked: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl spawn_core::port::EngineView for FakeEngineView {
+        fn name(&self) -> &'static str {
+            "bwrap"
+        }
+
+        fn wrap(&self, launch: &spawn_core::port::ViewedLaunch<'_>) -> Result<Vec<String>, String> {
+            self.asked.lock().expect("asked").push((
+                launch.engine.to_string(),
+                launch.workspace.to_string(),
+                launch.engine_home.to_string(),
+            ));
+            match self.refuse {
+                Some(why) => Err(why.to_string()),
+                None => Ok(["/usr/bin/bwrap", "--unshare-pid", "--"]
+                    .map(str::to_string)
+                    .to_vec()),
+            }
+        }
+    }
+
+    /// F1: `SPAWN_ENGINE_VIEW` as the Bridge reads it. `off` runs on the
+    /// host and builds no view; required (unset, or an invalid value) with
+    /// no view, or a view that refuses the launch, is unavailable; a view
+    /// wraps the probe in a scratch workspace of its own, removed on drop.
+    #[test]
+    fn the_probes_view_follows_spawn_engine_view_and_cleans_its_scratch() {
+        let home = EngineHome {
+            program: "agy".to_string(),
+            sessions: "/home/a/.gemini/antigravity-cli".to_string(),
+            model: None,
+        };
+        let base = std::env::temp_dir().join(format!("spawn-cap-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("base");
+        let bases = [base.join("missing"), base.clone()];
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            }
+        };
+        let off = env(&[("SPAWN_ENGINE_VIEW", "off")]);
+        let boxed = view_with(
+            &off,
+            "agy",
+            &home,
+            &bases,
+            Box::new(|_| panic!("off builds no view")),
+        );
+        assert!(matches!(boxed, Boxed::Off));
+        for pairs in [
+            &[][..],
+            &[("SPAWN_ENGINE_VIEW", "required")][..],
+            &[("SPAWN_ENGINE_VIEW", "maybe")][..],
+        ] {
+            let lookup = env(pairs);
+            let boxed = view_with(
+                &lookup,
+                "agy",
+                &home,
+                &bases,
+                Box::new(|_| Err("bwrap is not installed".to_string())),
+            );
+            assert!(
+                matches!(&boxed, Boxed::Unavailable(why) if why.contains("bwrap is not installed")),
+                "{pairs:?}"
+            );
+        }
+        let unset = env(&[]);
+        let view = std::sync::Arc::new(FakeEngineView::default());
+        let made = view.clone();
+        let boxed = view_with(
+            &unset,
+            "agy",
+            &home,
+            &bases,
+            Box::new(move |_| Ok(made as std::sync::Arc<dyn spawn_core::port::EngineView>)),
+        );
+        let Boxed::Inside { words, _scratch } = boxed else {
+            panic!("inside the view");
+        };
+        assert_eq!(words, ["/usr/bin/bwrap", "--unshare-pid", "--"]);
+        let scratch = _scratch.expect("a scratch workspace");
+        let workspace = scratch.path().to_path_buf();
+        assert!(workspace.is_dir() && workspace.starts_with(&base), "{workspace:?}");
+        assert_eq!(
+            *view.asked.lock().expect("asked"),
+            [(
+                "agy".to_string(),
+                workspace.display().to_string(),
+                home.sessions.clone()
+            )]
+        );
+        drop(scratch);
+        assert!(!workspace.exists(), "removed on drop");
+        // A view that refuses the launch: unavailable, nothing left behind.
+        let refusing = std::sync::Arc::new(FakeEngineView {
+            refuse: Some("the workspace overlaps /tmp, which the view masks"),
+            ..FakeEngineView::default()
+        });
+        let boxed = view_with(
+            &unset,
+            "agy",
+            &home,
+            &bases,
+            Box::new(move |_| Ok(refusing as std::sync::Arc<dyn spawn_core::port::EngineView>)),
+        );
+        assert!(
+            matches!(&boxed, Boxed::Unavailable(why) if why.contains("overlaps /tmp")),
+            "refused"
+        );
+        assert_eq!(std::fs::read_dir(&base).expect("base").count(), 0, "no scratch left");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// F2 (O55): agy 1.5.17 keeps its login token in a file below its home;
+    /// that file and the home are stated (`SPAWN_AGY_HOME` too), never a
+    /// file agy does not write.
+    #[test]
+    fn agys_login_file_is_its_token_below_its_home() {
+        let lookup = |name: &str| match name {
+            "HOME" => Some("/home/a".to_string()),
+            "SPAWN_AGY_HOME" => Some("/srv/agy".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            super::login_files("agy", &lookup),
+            [
+                std::path::PathBuf::from("/srv/agy/antigravity-oauth-token"),
+                std::path::PathBuf::from("/srv/agy"),
+            ]
+        );
+    }
 }
