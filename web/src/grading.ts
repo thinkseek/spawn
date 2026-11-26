@@ -43,23 +43,41 @@ export interface TopDownTierGroup {
   presets: GradingPreset[];
 }
 
+export interface TaskReworkStepUp {
+  quality_rejections: number;
+  from_difficulty: SkillGrade | null;
+  routed_difficulty: SkillGrade | null;
+  stepped_up: boolean;
+  first_preset_id: string | null;
+  preset_id: string | null;
+}
+
 export interface TaskGradingInput {
   difficulty?: SkillGrade | null;
+  routed_difficulty?: SkillGrade | null;
   preset_id?: string | null;
   first_preset_id?: string | null;
   tier_role?: TierRole | null;
   quality_rejections?: number | null;
+  engine_label?: string | null;
+  model_label?: string | null;
   execution_profile?: string | null;
+  rework_step_up?: TaskReworkStepUp | null;
 }
 
 export interface TaskGradingSummary {
   difficulty: SkillGrade | null;
+  routedDifficulty: SkillGrade | null;
+  steppedUp: boolean;
   tierRole: TierRole | null;
   presetId: string | null;
   firstPresetId: string | null;
   rerouted: boolean;
   qualityRejections: number;
+  engineLabel: string | null;
+  modelLabel: string | null;
   executionProfile: string | null;
+  reworkStepUp: TaskReworkStepUp | null;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -273,31 +291,93 @@ export function presetStateTone(state: PresetState): BadgeTone {
   }
 }
 
+export function normalizeTaskReworkStepUp(value: unknown): TaskReworkStepUp | null {
+  if (!isObject(value)) return null;
+  const from_difficulty = normalizeSkillGrade(value.from_difficulty);
+  const routed_difficulty = normalizeSkillGrade(value.routed_difficulty);
+  const first_preset_id = optionalText(value.first_preset_id);
+  const preset_id = optionalText(value.preset_id);
+  const quality_rejections = Math.max(0, Math.trunc(optionalNumber(value.quality_rejections) ?? 0));
+  const stepped_up =
+    value.stepped_up === true ||
+    (from_difficulty !== null && routed_difficulty !== null && from_difficulty !== routed_difficulty);
+  return {
+    quality_rejections,
+    from_difficulty,
+    routed_difficulty,
+    stepped_up,
+    first_preset_id,
+    preset_id,
+  };
+}
+
 export function taskGradingSummary(task: TaskGradingInput): TaskGradingSummary | null {
-  const difficulty = normalizeSkillGrade(task.difficulty);
-  const presetId = optionalText(task.preset_id);
-  const firstPresetId = optionalText(task.first_preset_id);
-  const tierRole = normalizeTierRole(task.tier_role) ?? tierRoleForGrade(difficulty);
-  const qualityRejections = Math.max(0, Math.trunc(optionalNumber(task.quality_rejections) ?? 0));
+  const reworkStepUp = normalizeTaskReworkStepUp(task.rework_step_up);
+  const difficulty = normalizeSkillGrade(task.difficulty) ?? reworkStepUp?.from_difficulty ?? null;
+  const routedDifficulty =
+    normalizeSkillGrade(task.routed_difficulty) ?? reworkStepUp?.routed_difficulty ?? difficulty;
+  const presetId = optionalText(task.preset_id) ?? reworkStepUp?.preset_id ?? null;
+  const firstPresetId = optionalText(task.first_preset_id) ?? reworkStepUp?.first_preset_id ?? null;
+  const qualityRejections = Math.max(
+    0,
+    Math.trunc(optionalNumber(task.quality_rejections) ?? reworkStepUp?.quality_rejections ?? 0),
+  );
+  const engineLabel = optionalText(task.engine_label);
+  const modelLabel = optionalText(task.model_label);
   const executionProfile = optionalText(task.execution_profile);
+  const rawTierRole = normalizeTierRole(task.tier_role);
+
+  // `mission_tasks.difficulty` defaults to 2 ('l2') and `rework_step_up` is
+  // `null` for historical or unrouted default rows. Suppress badges for pure
+  // default unrouted rows (`preset_id == null && first_preset_id == null &&
+  // quality_rejections == 0 && difficulty == 'l2' && routed_difficulty == 'l2'`)
+  // so legacy tasks do not show synthetic `l2 · mainline` pills everywhere.
+  const isPlainDefaultUnrouted =
+    presetId === null &&
+    firstPresetId === null &&
+    qualityRejections === 0 &&
+    difficulty === "l2" &&
+    (routedDifficulty === null || routedDifficulty === "l2") &&
+    reworkStepUp === null &&
+    executionProfile === null &&
+    engineLabel === null &&
+    modelLabel === null;
+  if (isPlainDefaultUnrouted) {
+    return null;
+  }
+
+  const tierRole = rawTierRole ?? tierRoleForGrade(routedDifficulty ?? difficulty);
   if (
     difficulty === null &&
+    routedDifficulty === null &&
     presetId === null &&
     firstPresetId === null &&
     tierRole === null &&
+    engineLabel === null &&
+    modelLabel === null &&
     executionProfile === null &&
-    qualityRejections === 0
+    qualityRejections === 0 &&
+    reworkStepUp === null
   ) {
     return null;
   }
+
+  const steppedUp =
+    reworkStepUp?.stepped_up === true ||
+    (difficulty !== null && routedDifficulty !== null && difficulty !== routedDifficulty);
   const rerouted = firstPresetId !== null && presetId !== null && firstPresetId !== presetId;
   return {
     difficulty,
+    routedDifficulty,
+    steppedUp,
     tierRole,
     presetId,
     firstPresetId,
     rerouted,
     qualityRejections,
+    engineLabel,
+    modelLabel,
     executionProfile,
+    reworkStepUp,
   };
 }

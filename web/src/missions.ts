@@ -12,8 +12,10 @@ import { normalizeHolds } from "./attention";
 import type { SourceHold } from "./attention";
 import {
   normalizeSkillGrade,
+  normalizeTaskReworkStepUp,
   normalizeTierRole,
   type SkillGrade,
+  type TaskReworkStepUp,
   type TierRole,
 } from "./grading.ts";
 
@@ -147,13 +149,17 @@ export interface MissionTask extends Labels {
   stages: TaskStage[];
   /** The models the worker runs on: "default", or "cheap" (all DeepSeek). */
   model: string | null;
-  /** Optional grading metadata, omitted gracefully by servers before projection. */
+  /** Optional grading metadata, projected by `MISSION_BOARD` and omitted gracefully by older servers. */
   difficulty?: SkillGrade | null;
+  routed_difficulty?: SkillGrade | null;
   preset_id?: string | null;
   first_preset_id?: string | null;
   tier_role?: TierRole | null;
   quality_rejections?: number | null;
+  engine_label?: string | null;
+  model_label?: string | null;
   execution_profile?: string | null;
+  rework_step_up?: TaskReworkStepUp | null;
   /** The owner's hold its landing last waited behind, if any. */
   held_by: number | null;
   /** Parked by the load-sensitive bound; null for any other task, and
@@ -330,11 +336,15 @@ function normalizeTask(value: unknown): MissionTask | null {
       .filter((stage): stage is TaskStage => stage !== null),
     model: optionalText(value.model),
     difficulty: normalizeSkillGrade(value.difficulty),
+    routed_difficulty: normalizeSkillGrade(value.routed_difficulty),
     preset_id: optionalText(value.preset_id),
     first_preset_id: optionalText(value.first_preset_id),
     tier_role: normalizeTierRole(value.tier_role),
     quality_rejections: optionalNumber(value.quality_rejections),
+    engine_label: optionalText(value.engine_label),
+    model_label: optionalText(value.model_label),
     execution_profile: optionalText(value.execution_profile),
+    rework_step_up: normalizeTaskReworkStepUp(value.rework_step_up),
     held_by: optionalNumber(value.held_by),
     parked: normalizeParked(value.parked),
     created_by: optionalText(value.created_by),

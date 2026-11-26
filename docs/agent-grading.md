@@ -409,14 +409,15 @@ the API now tell apart as many profiles as presets name.
 - `GET /api/grading`: `{presets: [... every catalog field, routing_grade,
   profile, driver, label_only, tier_role, reprobe_due], profiles: [sorted names]}`,
   read-only, rendered by the web UI's `#/grading` view (`GradingView`).
-- `spawn mission list [--limit N] [--json | --table]`: enriches each mission's
-  tasks with `difficulty`, `routed_difficulty`, `preset_id`, `first_preset_id`,
+- `MISSION_BOARD`, `MISSION_BY_ID`, `GET /api/missions`, `spawn mission list
+  [--limit N] [--json | --table]`, and `spawn mission show`: natively project
+  each task's `difficulty`, `routed_difficulty`, `preset_id`, `first_preset_id`,
   `tier_role`, `quality_rejections`, `engine_label`, `model_label`,
   `execution_profile`, and `rework_step_up` (`{quality_rejections,
   from_difficulty, routed_difficulty, stepped_up, first_preset_id, preset_id}`)
-  from `grading_presets` and `mission_tasks` (via `PostgresStore::routed_task`),
-  keeping `--json` as the default for existing callers and adding `--table` for
-  terminal review.
+  from `mission_tasks` left-joined to `grading_presets` directly in SQL (with
+  `routed_difficulty` matching `TaskDifficulty::for_rework`), keeping `--json`
+  as `spawn mission list`'s default and `--table` for terminal review.
 
 ## Known limits
 
@@ -465,14 +466,15 @@ the API now tell apart as many profiles as presets name.
   before.
 - **Item 4 of issue #99 is still name-only at dispatch.** `execution_profile`
   is carried by the catalog, routing, the records, `spawn grade`,
-  `spawn mission list`, and `/api/grading` (and shown in `#/grading`), but
-  the dispatcher still runs every worker on `model_profile` (`default` or
-  `cheap`). The web UI (`#/grading`, `MissionsView`, `TaskPanel`) now displays
-  the `/api/grading` catalog by Top-Down tier and renders optional task grading
-  badges when present, while the `MISSION_BOARD` SQL backing `GET /api/missions`
-  does not yet project `mission_tasks` grading columns (`spawn mission list`
-  supplies them via CLI enrichment; web task badges degrade gracefully when
-  omitted). This change does not close issue #99 on its own.
+  `MISSION_BOARD` / `MISSION_BY_ID`, `GET /api/missions`, `spawn mission list`,
+  and `/api/grading` (and shown in `#/grading`, `MissionsView`, and
+  `TaskPanel`), but the dispatcher still runs every worker on `model_profile`
+  (`default` or `cheap`). The web UI (`#/grading`, `MissionsView`, `TaskPanel`)
+  now displays the `/api/grading` catalog by Top-Down tier and natively
+  receives task grading metadata from `GET /api/missions`, suppressing
+  synthetic badges on pure unrouted historical `l2` default tasks while
+  highlighting routed, explicit `l1`/`l3`, and stepped-up tasks. This change
+  does not close issue #99 on its own.
 - The classifier reads only the brief's words and structure. Under `brief-v3`,
   destructive verbs such as `delete`, `remove`, `drop`, `replace`, and `change`
   (along with Chinese equivalents `删除`, `修改`, `修复`, `设计`, etc.) cancel
@@ -507,9 +509,10 @@ the API now tell apart as many profiles as presets name.
 - A re-issued or reassigned task keeps its preset without checking that it
   is still routable.
 - The suite's default path is relative to the working directory.
-- `#/grading` now displays the `/api/grading` catalog grouped by Top-Down tier
-  (`spawn grade list` shows the same in the CLI); `spawn mission list` shows
-  task difficulty, preset, `tier_role`, and `rework_step_up` history, while
-  `GET /api/missions` still awaits SQL projection of task grading columns in
-  `spawn-postgres` (the web `MissionsView` and `TaskPanel` render those badges
-  whenever provided).
+- `#/grading` displays the `/api/grading` catalog grouped by Top-Down tier
+  (`spawn grade list` shows the same in the CLI); `MISSION_BOARD`,
+  `MISSION_BY_ID`, `GET /api/missions`, `spawn mission list`, and
+  `spawn mission show` natively project task difficulty, `routed_difficulty`,
+  preset, `tier_role`, and `rework_step_up` history directly in SQL, and the
+  web `MissionsView` and `TaskPanel` render badges for routed, explicit, and
+  stepped-up tasks.

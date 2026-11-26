@@ -1959,3 +1959,319 @@ fn a_carried_continuation_replaces_its_overrun_in_calibration() {
         "the overrun still counts"
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mission_board_and_mission_by_id_project_grading_and_rework_matrix() {
+    let (store, schema) = store("mission_board_grading");
+    let mission = store
+        .mission_add("Board Grading Projection", &json!([]), "human")
+        .expect("add");
+
+    store
+        .grading_record(&json!({
+            "type": "preset.registered",
+            "preset_id": "small-l1",
+            "engine_label": "claude",
+            "model_label": "deepseek-v4.1-flash",
+            "model_profile": "cheap",
+            "execution_profile": "mechanical-l1",
+            "cost_rank": 10
+        }))
+        .expect("register small");
+    onboard(&store, "small-l1", "unexamined", "l1");
+
+    store
+        .grading_record(&json!({
+            "type": "preset.registered",
+            "preset_id": "mid-l2",
+            "engine_label": "agy",
+            "model_label": "gemini-pro-orchestrator-neon",
+            "model_profile": "default",
+            "execution_profile": "neon-mainline",
+            "cost_rank": 20
+        }))
+        .expect("register mid");
+    onboard(&store, "mid-l2", "unexamined", "l2");
+
+    store
+        .grading_record(&json!({
+            "type": "preset.registered",
+            "preset_id": "dis-l2",
+            "engine_label": "claude",
+            "model_label": "retired-model",
+            "model_profile": "default",
+            "cost_rank": 30
+        }))
+        .expect("register dis");
+    onboard(&store, "dis-l2", "unexamined", "l2");
+
+    // 1. Plain unrouted historical default task (`difficulty = 2`, no preset, no rework).
+    let t_default = store
+        .task_assign(mission, "ephemeral", "w-def", "legacy work", "default")
+        .expect("assign default");
+
+    // 2. Routed task on active preset `mid-l2`.
+    let t_routed = reported(
+        &store,
+        mission,
+        "routed ui fix",
+        "default",
+        TaskDifficulty::L2,
+        "mid-l2",
+        1,
+    );
+
+    // 3. Rework step-up task: starts L1 on `small-l1`, rejected once -> stepped up to L2 on `mid-l2`.
+    let t_stepup = reported(
+        &store,
+        mission,
+        "fix typo in README",
+        "cheap",
+        TaskDifficulty::L1,
+        "small-l1",
+        2,
+    );
+    store
+        .task_reject_rerouted(
+            t_stepup,
+            "needs mainline",
+            None,
+            "mid-l2",
+            1,
+            TaskDifficulty::L2,
+        )
+        .expect("reject and step up");
+
+    // 4. Disabled preset & direct `k.engine` / `k.model_label` fallback cases.
+    let t_disabled_preset = store
+        .task_assign_routed(
+            mission,
+            "ephemeral",
+            "w-dis",
+            "disabled preset fallback",
+            "default",
+            false,
+            false,
+            TaskDifficulty::L1,
+            Some("dis-l2"),
+        )
+        .expect("assign dis");
+    store
+        .grading_record(&json!({
+            "type": "preset.state_changed",
+            "preset_id": "dis-l2",
+            "from_state": "active",
+            "to_state": "disabled"
+        }))
+        .expect("disable dis");
+
+    let t_direct_labels = store
+        .task_assign(mission, "ephemeral", "w-direct", "direct labels", "default")
+        .expect("assign direct");
+    let mut client = admin(&schema);
+    client
+        .execute(
+            "update mission_tasks set difficulty = 3, engine = 'custom-eng', model_label = 'custom-mod' where id = $1",
+            &[&t_direct_labels],
+        )
+        .expect("set direct engine/model_label");
+
+    let board = store.mission_board(20).expect("board");
+    let by_id = store
+        .mission_by_id(mission)
+        .expect("by_id")
+        .expect("mission present");
+    assert_eq!(board["missions"][0]["tasks"], by_id["tasks"]);
+
+    let find_task = |id: i64| -> Value {
+        board["missions"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+
+    let def = find_task(t_default);
+    assert_eq!(def["difficulty"], "l2");
+    assert_eq!(def["routed_difficulty"], "l2");
+    assert_eq!(def["tier_role"], "mainline");
+    assert_eq!(def["quality_rejections"], 0);
+    assert!(def["preset_id"].is_null());
+    assert!(def["first_preset_id"].is_null());
+    assert!(def["engine_label"].is_null());
+    assert!(def["model_label"].is_null());
+    assert!(def["execution_profile"].is_null());
+    assert!(def["rework_step_up"].is_null());
+
+    let routed = find_task(t_routed);
+    assert_eq!(routed["difficulty"], "l2");
+    assert_eq!(routed["routed_difficulty"], "l2");
+    assert_eq!(routed["tier_role"], "mainline");
+    assert_eq!(routed["preset_id"], "mid-l2");
+    assert_eq!(routed["first_preset_id"], "mid-l2");
+    assert_eq!(routed["engine_label"], "agy");
+    assert_eq!(routed["model_label"], "gemini-pro-orchestrator-neon");
+    assert_eq!(routed["execution_profile"], "neon-mainline");
+    assert!(routed["rework_step_up"].is_null());
+
+    let stepup = find_task(t_stepup);
+    assert_eq!(stepup["difficulty"], "l1");
+    assert_eq!(stepup["routed_difficulty"], "l2");
+    assert_eq!(stepup["tier_role"], "mainline");
+    assert_eq!(stepup["preset_id"], "mid-l2");
+    assert_eq!(stepup["first_preset_id"], "small-l1");
+    assert_eq!(stepup["quality_rejections"], 1);
+    assert_eq!(stepup["engine_label"], "agy");
+    assert_eq!(stepup["model_label"], "gemini-pro-orchestrator-neon");
+    assert_eq!(stepup["execution_profile"], "neon-mainline");
+    assert_eq!(
+        stepup["rework_step_up"],
+        json!({
+            "quality_rejections": 1,
+            "from_difficulty": "l1",
+            "routed_difficulty": "l2",
+            "stepped_up": true,
+            "first_preset_id": "small-l1",
+            "preset_id": "mid-l2"
+        })
+    );
+
+    // Disabled preset is ignored for `tier_role`, falling back to `routed_rank` (`l1` -> `mechanical-offload`),
+    // while blank/absent preset labels fall back cleanly to `k.engine`/`k.model_label`.
+    let dis = find_task(t_disabled_preset);
+    assert_eq!(dis["difficulty"], "l1");
+    assert_eq!(dis["routed_difficulty"], "l1");
+    assert_eq!(dis["tier_role"], "mechanical-offload");
+
+    let direct = find_task(t_direct_labels);
+    assert_eq!(direct["difficulty"], "l3");
+    assert_eq!(direct["routed_difficulty"], "l3");
+    assert_eq!(direct["tier_role"], "top-decision");
+    assert_eq!(direct["engine_label"], "custom-eng");
+    assert_eq!(direct["model_label"], "custom-mod");
+    assert!(direct["execution_profile"].is_null());
+
+    // Exhaustive `(difficulty 1..=3, quality_rejections 0..=4)` rework matrix alignment
+    // with `TaskDifficulty::for_rework` (verifying L1+1->l2, L1+2->l2, L1+3->l3, L2+1->l2, L2+2->l3).
+    let expected_role = |grade: SkillGrade| match grade {
+        SkillGrade::L1 => "mechanical-offload",
+        SkillGrade::L2 => "mainline",
+        SkillGrade::L3 => "top-decision",
+    };
+    let t_matrix = store
+        .task_assign(mission, "ephemeral", "w-mat", "matrix check", "default")
+        .expect("assign matrix");
+    for d_rank in 1_i16..=3 {
+        let base_diff = TaskDifficulty::from_rank(i64::from(d_rank)).unwrap();
+        for rejections in 0_i32..=4 {
+            client
+                .execute(
+                    "update mission_tasks set difficulty = $1, quality_rejections = $2 where id = $3",
+                    &[&d_rank, &rejections, &t_matrix],
+                )
+                .expect("update matrix cell");
+            let expected = base_diff.for_rework(u32::try_from(rejections).unwrap());
+            let expected_str = expected.as_str();
+            let stepped = expected != base_diff;
+
+            let m_board = store.mission_board(20).expect("board matrix");
+            let m_by_id = store
+                .mission_by_id(mission)
+                .expect("by_id matrix")
+                .expect("mission");
+            let b_task = m_board["missions"][0]["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == t_matrix)
+                .unwrap();
+            let id_task = m_by_id["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == t_matrix)
+                .unwrap();
+            assert_eq!(b_task, id_task, "d={d_rank}, rej={rejections}");
+            assert_eq!(b_task["difficulty"], base_diff.as_str());
+            assert_eq!(
+                b_task["routed_difficulty"], expected_str,
+                "d={d_rank}, rej={rejections}"
+            );
+            assert_eq!(
+                b_task["tier_role"],
+                expected_role(expected.required_grade()),
+                "d={d_rank}, rej={rejections}"
+            );
+            if rejections == 0 {
+                assert!(b_task["rework_step_up"].is_null());
+            } else {
+                assert_eq!(
+                    b_task["rework_step_up"],
+                    json!({
+                        "quality_rejections": rejections,
+                        "from_difficulty": base_diff.as_str(),
+                        "routed_difficulty": expected_str,
+                        "stepped_up": stepped,
+                        "first_preset_id": Value::Null,
+                        "preset_id": Value::Null
+                    }),
+                    "d={d_rank}, rej={rejections}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn spawn_reader_and_spawn_supervisor_read_mission_board_and_mission_by_id_with_grading() {
+    let (store, schema) = store("mission_board_reader_privs");
+    let mission = store
+        .mission_add("Reader Privs", &json!([]), "human")
+        .expect("add");
+    store
+        .grading_record(&json!({
+            "type": "preset.registered",
+            "preset_id": "mid-l2",
+            "engine_label": "agy",
+            "model_label": "gemini-pro-orchestrator-neon",
+            "model_profile": "default",
+            "execution_profile": "neon-mainline",
+            "cost_rank": 20
+        }))
+        .expect("register");
+    onboard(&store, "mid-l2", "unexamined", "l2");
+    let _routed = reported(
+        &store,
+        mission,
+        "routed task",
+        "default",
+        TaskDifficulty::L2,
+        "mid-l2",
+        1,
+    );
+    let _legacy = store
+        .task_assign(mission, "ephemeral", "w-def", "legacy work", "default")
+        .expect("legacy");
+
+    let owner_board = store.mission_board(20).expect("owner board");
+    let owner_by_id = store
+        .mission_by_id(mission)
+        .expect("owner by_id")
+        .expect("mission");
+
+    for login in ["spawn_reader", "spawn_supervisor"] {
+        let role_url =
+            spawn_postgres::role_url(&common::schema_url(&schema), login).expect("role url");
+        let role_store = PostgresStore::connect(&role_url).expect("connect restricted login");
+        let role_board = role_store.mission_board(20).expect("role mission_board");
+        let role_by_id = role_store
+            .mission_by_id(mission)
+            .expect("role mission_by_id")
+            .expect("mission");
+        assert_eq!(role_board["missions"], owner_board["missions"], "{login}");
+        assert_eq!(role_by_id, owner_by_id, "{login}");
+    }
+}

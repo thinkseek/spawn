@@ -136,27 +136,128 @@ test("groupByTopDownTier sorts active ahead of demoted and omits empty ungraded 
   assert.equal(groups[2].presets.length, 0);
 });
 
-test("taskGradingSummary gracefully returns null when grading fields are absent and detects reroutes", () => {
+test("taskGradingSummary suppresses plain unrouted historical l2 tasks while showing routed, explicit, and stepped-up tasks", () => {
   assert.equal(taskGradingSummary({}), null);
   assert.equal(
     taskGradingSummary({ difficulty: null, preset_id: null, quality_rejections: 0 }),
     null,
   );
+  // Historical/unrouted Postgres default: difficulty=2 ('l2'), quality_rejections=0,
+  // no preset/first_preset/step-up, MISSION_BOARD fills tier_role='mainline'.
+  assert.equal(
+    taskGradingSummary({
+      difficulty: "l2",
+      routed_difficulty: "l2",
+      tier_role: "mainline",
+      preset_id: null,
+      first_preset_id: null,
+      quality_rejections: 0,
+      engine_label: null,
+      model_label: null,
+      execution_profile: null,
+      rework_step_up: null,
+    }),
+    null,
+  );
+
+  // Explicit unrouted l1 / l3 tasks still render badges.
+  const explicitL3 = taskGradingSummary({
+    difficulty: "l3",
+    routed_difficulty: "l3",
+    tier_role: "top-decision",
+    preset_id: null,
+    quality_rejections: 0,
+    rework_step_up: null,
+  });
+  assert.equal(explicitL3?.difficulty, "l3");
+  assert.equal(explicitL3?.routedDifficulty, "l3");
+  assert.equal(explicitL3?.steppedUp, false);
+  assert.equal(explicitL3?.tierRole, "top-decision");
+
+  const routedL2 = taskGradingSummary({
+    difficulty: "l2",
+    routed_difficulty: "l2",
+    tier_role: "mainline",
+    preset_id: "topdown-l2-neon",
+    first_preset_id: "topdown-l2-neon",
+    quality_rejections: 0,
+    engine_label: "agy",
+    model_label: "gemini-pro-orchestrator-neon",
+    execution_profile: "neon-mainline",
+    rework_step_up: null,
+  });
+  assert.deepEqual(routedL2, {
+    difficulty: "l2",
+    routedDifficulty: "l2",
+    steppedUp: false,
+    tierRole: "mainline",
+    presetId: "topdown-l2-neon",
+    firstPresetId: "topdown-l2-neon",
+    rerouted: false,
+    qualityRejections: 0,
+    engineLabel: "agy",
+    modelLabel: "gemini-pro-orchestrator-neon",
+    executionProfile: "neon-mainline",
+    reworkStepUp: null,
+  });
 
   const stepped = taskGradingSummary({
     difficulty: "l1",
+    routed_difficulty: "l2",
     preset_id: "topdown-l2-neon",
     first_preset_id: "topdown-l1-mechanical",
+    tier_role: "mainline",
     quality_rejections: 1,
+    engine_label: "agy",
+    model_label: "gemini-pro-orchestrator-neon",
     execution_profile: "neon-mainline",
+    rework_step_up: {
+      quality_rejections: 1,
+      from_difficulty: "l1",
+      routed_difficulty: "l2",
+      stepped_up: true,
+      first_preset_id: "topdown-l1-mechanical",
+      preset_id: "topdown-l2-neon",
+    },
   });
   assert.deepEqual(stepped, {
     difficulty: "l1",
-    tierRole: "mechanical-offload",
+    routedDifficulty: "l2",
+    steppedUp: true,
+    tierRole: "mainline",
     presetId: "topdown-l2-neon",
     firstPresetId: "topdown-l1-mechanical",
     rerouted: true,
     qualityRejections: 1,
+    engineLabel: "agy",
+    modelLabel: "gemini-pro-orchestrator-neon",
     executionProfile: "neon-mainline",
+    reworkStepUp: {
+      quality_rejections: 1,
+      from_difficulty: "l1",
+      routed_difficulty: "l2",
+      stepped_up: true,
+      first_preset_id: "topdown-l1-mechanical",
+      preset_id: "topdown-l2-neon",
+    },
   });
+
+  // Rework below step-up threshold (e.g. L2 with 1 rejection) shows rework without step-up.
+  const reworkedSameTier = taskGradingSummary({
+    difficulty: "l2",
+    routed_difficulty: "l2",
+    tier_role: "mainline",
+    preset_id: null,
+    quality_rejections: 1,
+    rework_step_up: {
+      quality_rejections: 1,
+      from_difficulty: "l2",
+      routed_difficulty: "l2",
+      stepped_up: false,
+      first_preset_id: null,
+      preset_id: null,
+    },
+  });
+  assert.equal(reworkedSameTier?.steppedUp, false);
+  assert.equal(reworkedSameTier?.qualityRejections, 1);
 });

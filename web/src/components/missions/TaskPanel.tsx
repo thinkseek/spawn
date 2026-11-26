@@ -143,35 +143,69 @@ export function TaskPanel({
             </Field>
           )}
           {task.model === "cheap" && <Field label="Model">cheap (DeepSeek)</Field>}
-          {grading?.difficulty && (
-            <Field label="Difficulty">
-              <span className="inline-flex flex-wrap items-center gap-1.5">
-                <Badge tone={gradeTone(grading.difficulty)}>{grading.difficulty}</Badge>
-                {grading.tierRole && (
-                  <span className="font-mono text-caption text-muted-foreground">
-                    {grading.tierRole}
+          {(grading?.difficulty || grading?.routedDifficulty) &&
+            (() => {
+              const activeDifficulty = grading.routedDifficulty ?? grading.difficulty;
+              return (
+                <Field label="Difficulty">
+                  <span className="inline-flex flex-wrap items-center gap-1.5">
+                    <Badge tone={grading.steppedUp ? "warning" : gradeTone(activeDifficulty)}>
+                      {grading.steppedUp && grading.difficulty && grading.routedDifficulty
+                        ? `${grading.difficulty} → ${grading.routedDifficulty}`
+                        : activeDifficulty}
+                    </Badge>
+                    {grading.tierRole && (
+                      <span className="font-mono text-caption text-muted-foreground">
+                        {grading.tierRole}
+                      </span>
+                    )}
                   </span>
-                )}
-              </span>
-            </Field>
-          )}
-          {grading?.presetId && (
-            <Field label="Preset">
-              <span className="font-mono text-caption">
-                {grading.rerouted
-                  ? `${grading.firstPresetId} → ${grading.presetId}`
-                  : grading.presetId}
-              </span>
+                </Field>
+              );
+            })()}
+          {(grading?.presetId || grading?.modelLabel || grading?.executionProfile) && (
+            <Field label={grading.presetId ? "Preset" : "Model"}>
+              {grading.presetId && (
+                <span className="font-mono text-caption">
+                  {grading.rerouted
+                    ? `${grading.firstPresetId} → ${grading.presetId}`
+                    : grading.presetId}
+                </span>
+              )}
               {grading.executionProfile && (
-                <span className="ml-1.5 text-caption text-muted-foreground">
+                <span
+                  className={cx(
+                    "text-caption text-muted-foreground",
+                    grading.presetId && "ml-1.5",
+                  )}
+                >
                   ({grading.executionProfile})
+                </span>
+              )}
+              {grading.modelLabel && (
+                <span
+                  className={cx(
+                    "font-mono text-caption text-muted-foreground",
+                    (grading.presetId || grading.executionProfile) && "ml-1.5",
+                  )}
+                >
+                  {grading.engineLabel
+                    ? `${grading.engineLabel}/${grading.modelLabel}`
+                    : grading.modelLabel}
                 </span>
               )}
             </Field>
           )}
           {grading && grading.qualityRejections > 0 && (
             <Field label="Quality rej">
-              <Badge tone="warning">{grading.qualityRejections}</Badge>
+              <span className="inline-flex flex-wrap items-center gap-1.5">
+                <Badge tone="warning">{grading.qualityRejections}</Badge>
+                {grading.steppedUp && grading.difficulty && grading.routedDifficulty && (
+                  <span className="text-caption text-warning">
+                    stepped up {grading.difficulty} → {grading.routedDifficulty}
+                  </span>
+                )}
+              </span>
             </Field>
           )}
         </dl>
