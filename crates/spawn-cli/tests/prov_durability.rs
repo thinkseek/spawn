@@ -115,7 +115,9 @@ impl Work {
             "-q",
             "--no-ff",
             "-m",
-            &format!("Task {task} (task {task})\n\n{body}\n\nSpawn-Task: {task}\nSpawn-Head: {head}\n"),
+            &format!(
+                "Task {task} (task {task})\n\n{body}\n\nSpawn-Task: {task}\nSpawn-Head: {head}\n"
+            ),
             &format!("spawn/{agent}"),
         ]);
         self.git(&["rev-parse", "HEAD"])
@@ -144,9 +146,15 @@ fn facts(client: &mut Client) {
         )
         .expect("the mission layer");
     let briefs = [
-        (11, "Objective 1: add a.rs\n\nreverts: task 99 is not a line of its own here"),
+        (
+            11,
+            "Objective 1: add a.rs\n\nreverts: task 99 is not a line of its own here",
+        ),
         (12, "Undo task 11\n\nReverts: task 11\n"),
-        (13, "Fix task 12\n\n- fixes: task 12\nsupersedes: task 11 (refactor)\n"),
+        (
+            13,
+            "Fix task 12\n\n- fixes: task 12\nsupersedes: task 11 (refactor)\n",
+        ),
         (14, "Undo task 13\n\nreverts: task 13\n"),
     ];
     for (seq, (task, brief)) in briefs.into_iter().enumerate() {
@@ -238,7 +246,9 @@ fn sha256(bytes: &[u8]) -> String {
 fn oversized(root: &Path, agent: &str, files: &[(&str, &[u8])]) {
     let mut record = Vec::new();
     for (path, bytes) in files {
-        record.extend_from_slice(format!("told\0{} {}\0{path}\0", bytes.len(), sha256(bytes)).as_bytes());
+        record.extend_from_slice(
+            format!("told\0{} {}\0{path}\0", bytes.len(), sha256(bytes)).as_bytes(),
+        );
     }
     let dir = root.join(".oversized");
     std::fs::create_dir_all(&dir).expect("the record's directory");
@@ -281,7 +291,9 @@ fn landings_supersede_by_the_dispatchers_brief_and_durability_charges_confirmed_
     let index = |schema: &str| {
         spawn_json(
             schema,
-            &["prov", "index", "--source", SOURCE, "--repo", &git_dir, "--root", &root_text],
+            &[
+                "prov", "index", "--source", SOURCE, "--repo", &git_dir, "--root", &root_text,
+            ],
         )
     };
     let first = index(&schema);
@@ -289,12 +301,18 @@ fn landings_supersede_by_the_dispatchers_brief_and_durability_charges_confirmed_
 
     let l11 = land_of(&schema, 11);
     let l13 = land_of(&schema, 13);
-    let id11 = l11["change"]["change_id"].as_str().expect("an id").to_string();
+    let id11 = l11["change"]["change_id"]
+        .as_str()
+        .expect("an id")
+        .to_string();
     let id12 = land_of(&schema, 12)["change"]["change_id"]
         .as_str()
         .expect("an id")
         .to_string();
-    let id13 = l13["change"]["change_id"].as_str().expect("an id").to_string();
+    let id13 = l13["change"]["change_id"]
+        .as_str()
+        .expect("an id")
+        .to_string();
     // Task 11's brief mentions a directive inside prose: none.
     assert!(supersedes(&l11).is_empty(), "{l11}");
     // Task 12 restores task 11's paths: level 1.
@@ -360,7 +378,11 @@ fn landings_supersede_by_the_dispatchers_brief_and_durability_charges_confirmed_
             .any(|entry| entry["path"] == "old.bin"),
         "{l11}"
     );
-    assert!(!work.git(&["ls-tree", "-r", "--name-only", "main"]).contains("model.bin"));
+    assert!(
+        !work
+            .git(&["ls-tree", "-r", "--name-only", "main"])
+            .contains("model.bin")
+    );
 
     // A second run records nothing.
     let rows = (
@@ -421,15 +443,30 @@ fn landings_supersede_by_the_dispatchers_brief_and_durability_charges_confirmed_
     // (the next landing after 11), and drops nothing else that counts.
     let narrow = spawn_json(
         &schema,
-        &["prov", "durability", "--json", "--source", SOURCE, "--window-landings", "1"],
+        &[
+            "prov",
+            "durability",
+            "--json",
+            "--source",
+            SOURCE,
+            "--window-landings",
+            "1",
+        ],
     );
     assert_eq!(narrow["domain"], format!("git:{SOURCE}"));
-    assert_eq!(narrow["not_scored"]["out_of_window"], 0.into_or_null());
+    assert!(
+        narrow["not_scored"].get("out_of_window").is_none(),
+        "{narrow}"
+    );
+    assert_eq!(narrow["defects"].as_array().map(Vec::len), Some(1));
     // The text report, and refused flags.
     let shown = spawn(&schema, &["prov", "durability"]);
     assert!(shown.status.success());
     let text = String::from_utf8_lossy(&shown.stdout);
-    assert!(text.contains("shadow only") && text.contains("opus"), "{text}");
+    assert!(
+        text.contains("shadow only") && text.contains("opus"),
+        "{text}"
+    );
     for bad in [
         &["prov", "durability", "--window-landings", "0"][..],
         &["prov", "durability", "--window-days", "x"][..],
@@ -447,16 +484,4 @@ fn landings_supersede_by_the_dispatchers_brief_and_durability_charges_confirmed_
             count(&mut client, "prov_edges"),
         )
     );
-}
-
-/// `Value::Null` for a missing key, so a count that must be absent reads
-/// as null.
-trait IntoOrNull {
-    fn into_or_null(self) -> Value;
-}
-
-impl IntoOrNull for i32 {
-    fn into_or_null(self) -> Value {
-        Value::Null
-    }
 }
