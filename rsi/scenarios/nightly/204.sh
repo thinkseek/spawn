@@ -50,6 +50,19 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
+SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
+if [ -z "$SPAWN_HC" ]; then
+    spawn_dir=$(dirname "$SPAWN_BIN")
+    if [ -x "$spawn_dir/spawn-hc" ]; then
+        SPAWN_HC=$spawn_dir/spawn-hc
+    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
+        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
+    elif command -v spawn-hc >/dev/null 2>&1; then
+        SPAWN_HC=$(command -v spawn-hc)
+    fi
+fi
+[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
+    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 # The candidate's tree: the gate runs a scenario from inside it, and its
 # web/src is what the page would run (the controller holds main's copy).
@@ -58,23 +71,35 @@ controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
 [ -f "$tree/web/src/home.ts" ] || harness "no web/src/home.ts under $tree (run from the candidate's tree)"
-for tool in psql tmux git jq od bash sed grep awk curl node; do
+for tool in psql git jq od bash sed grep awk curl node; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
+# A scratch HOME and XDG dirs in WORK: nothing here reads or writes
+# the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+HOME=$WORK/home
+mkdir -p "$HOME"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+export HOME
+real_runtime=${XDG_RUNTIME_DIR-}
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+XDG_RUNTIME_DIR=$WORK/r
+XDG_STATE_HOME=$WORK/state
+XDG_CONFIG_HOME=$WORK/config
+mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
+export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_204_disk_$run"
-SPAWN_TMUX_SOCKET="bb-204-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+SPAWN_HERDR_SESSION="bb-204-$hc_id"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
-# The tmux server's socket lives in WORK, so the cleanup removes nothing
-# outside it (cc-rules (a), 2026-11-12).
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$TMUX_TMPDIR"
-export TMUX_TMPDIR
+export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -85,13 +110,32 @@ server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 database_made=""
 loop_pid=""
 serve_pid=""
+hc() {
+    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
+        HC_SESSION="$SPAWN_HERDR_SESSION" \
+        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
+        "$SPAWN_HC" "$@"
+}
+stop_herdr() {
+    [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ] || return 0
+    for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
+        jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
+        hc kill "$addr" >/dev/null 2>&1 || true
+    done
+    hc server stop >/dev/null 2>&1 || true
+    hc_wait=0
+    while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
+        hc_wait=$((hc_wait + 1))
+        sleep 0.1
+    done
+}
 cleanup() {
     for pid in "$loop_pid" "$serve_pid"; do
         [ -n "$pid" ] || continue
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    stop_herdr
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -101,6 +145,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "204: the loop's last lines:" >&2
@@ -167,22 +212,20 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # one shows a prompt, takes what is typed and does nothing with it.
 bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
+[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 printf 'Welcome to Claude Code\n\n❯ '
 while :; do
   if bb_read_line typed; then printf 'you: %s\n\nidle\n❯ ' "$typed"; fi
 done
 ENGINE
 chmod 755 "$WORK/claude"
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_CHEAP_MODEL SPAWN_SMALL_MODEL \
     SPAWN_MODEL_PRICES SPAWN_API_TOKEN http_proxy https_proxy HTTP_PROXY HTTPS_PROXY \
-    SPAWN_ALERT_DISK_LOW_GB SPAWN_ALERT_DISK_OK_GB SPAWN_TEST_DATABASE_URL SPAWN_FLEET_TEST_DATABASE_URL; do
+    SPAWN_ALERT_DISK_LOW_GB SPAWN_ALERT_DISK_OK_GB SPAWN_TEST_DATABASE_URL SPAWN_FLEET_TEST_DATABASE_URL \
+    SPAWN_TERMINAL_BACKEND SPAWN_HERDR_MODE SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM \
+    SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM TMUX TMUX_PANE TMUX_TMPDIR; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -190,12 +233,9 @@ SPAWN_GIT_REPO=$repo
 SPAWN_WORKSPACE_ROOT=$WORK/ws
 SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
-# A scratch HOME: nothing here reads or writes the real one.
-real_home=$HOME
-HOME=$WORK/home
-mkdir -p "$HOME" "$SPAWN_CLAUDE_PROJECTS"
-[ "$HOME" != "$real_home" ] && [ "${HOME#"$WORK"/}" != "$HOME" ] || harness "HOME is not a scratch directory under WORK: $HOME"
-SPAWN_TMUX_PROGRAM=$WORK/tmux
+mkdir -p "$SPAWN_CLAUDE_PROJECTS"
+BB_PATH=$PATH
+SPAWN_HERDR_CORE_PROGRAM=$SPAWN_HC
 SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
 # The alert step reads every 2 s (default 30 s).
@@ -210,8 +250,8 @@ SPAWN_STALL_HALTED_SECS=1800
 SPAWN_MISSION_FILE=$WORK/mission.md
 SPAWN_DISK_WARN_GB=0
 SPAWN_DISK_FLOOR_GB=0
-export HOME SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS SPAWN_TMUX_PROGRAM SPAWN_WORKER SPAWN_LOOP_INTERVAL_MS \
+export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
+    SPAWN_CLAUDE_PROJECTS BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER SPAWN_LOOP_INTERVAL_MS \
     SPAWN_ALERT_CHECK_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_DELIVERY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
     SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS SPAWN_MISSION_FILE \

@@ -58,11 +58,24 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
+SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
+if [ -z "$SPAWN_HC" ]; then
+    spawn_dir=$(dirname "$SPAWN_BIN")
+    if [ -x "$spawn_dir/spawn-hc" ]; then
+        SPAWN_HC=$spawn_dir/spawn-hc
+    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
+        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
+    elif command -v spawn-hc >/dev/null 2>&1; then
+        SPAWN_HC=$(command -v spawn-hc)
+    fi
+fi
+[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
+    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql jq od sed grep curl head git tmux awk; do
+for tool in psql jq od sed grep curl head git awk; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
@@ -70,9 +83,11 @@ WORK=$(mktemp -d) || harness "mktemp failed"
 [ -d "$WORK" ] || harness "mktemp gave no directory"
 trap 'rm -rf "$WORK"' EXIT
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 SPAWN_DB_NAME="bb_182_lines_$run"
+SPAWN_HERDR_SESSION="bb-182-$hc_id"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -86,20 +101,32 @@ serve_pid=""
 loop_pid=""
 # (3b)'s loop, and the private tmux server it would use, are stopped and
 # waited on: kill-server returns before its processes end.
+hc() {
+    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
+        HC_SESSION="$SPAWN_HERDR_SESSION" \
+        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
+        "$SPAWN_HC" "$@"
+}
+stop_herdr() {
+    [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ] || return 0
+    for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
+        jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
+        hc kill "$addr" >/dev/null 2>&1 || true
+    done
+    hc server stop >/dev/null 2>&1 || true
+    hc_wait=0
+    while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
+        hc_wait=$((hc_wait + 1))
+        sleep 0.1
+    done
+}
 stop_loop() {
     if [ -n "$loop_pid" ]; then
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
         loop_pid=""
     fi
-    [ -n "${SPAWN_TMUX_SOCKET-}" ] || return 0
-    server=$(tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{pid}' 2>/dev/null | head -n 1 || true)
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-    i=0
-    while [ -n "$server" ] && kill -0 "$server" 2>/dev/null && [ "$i" -lt 50 ]; do
-        i=$((i + 1))
-        sleep 0.2
-    done
+    stop_herdr
 }
 stop_serve() {
     [ -n "$serve_pid" ] || return 0
@@ -121,6 +148,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ] && [ -s "$WORK/api.json" ]; then
         echo "182: the last answer's lists:" >&2
         jq -c '{readings: [.lines[] | {line, readings: [.readings[]? | .key]}], alert_figures: [.alert_figures[]? | .key], diagnostics: [.diagnostics[]? | {key, line, value}], ignored_ranges}' "$WORK/api.json" >&2 2>/dev/null || true
@@ -169,6 +197,16 @@ export HOME
 mkdir -p "$HOME"
 [ "${HOME#"$WORK"/}" != "$HOME" ] || harness "HOME is not a scratch directory under WORK: $HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+real_runtime=${XDG_RUNTIME_DIR-}
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+XDG_RUNTIME_DIR=$WORK/r
+XDG_STATE_HOME=$WORK/state
+XDG_CONFIG_HOME=$WORK/config
+mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
+export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
 SPAWN_WORKSPACE_ROOT=$WORK/ws
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
@@ -312,18 +350,15 @@ git init -q "$WORK/seed" && printf 'base\n' >"$WORK/seed/README.md" &&
     git -C "$WORK/seed" add -A &&
     git -C "$WORK/seed" -c user.name=bb -c user.email=bb@localhost -c commit.gpgsign=false commit -qm base &&
     git -C "$WORK/seed" push -q "$WORK/repo.git" HEAD:main || harness "seeding the repository failed"
-SPAWN_TMUX_SOCKET="bb-182-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$TMUX_TMPDIR"
-printf '#!/bin/sh\nexec tmux -L %s "$@"\n' "$SPAWN_TMUX_SOCKET" >"$WORK/tmux"
 printf '#!/bin/sh\nexit 1\n' >"$WORK/claude"
-chmod 755 "$WORK/tmux" "$WORK/claude"
+chmod 755 "$WORK/claude"
 before=$(q "select coalesce(max(id), 0) from spawn_events where kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines'")
 env -u SPAWN_SUPERVISOR -u SPAWN_DISPATCH -u SPAWN_GATE -u SPAWN_MODEL_RELAY -u SPAWN_JUDGE_URL \
-    -u SPAWN_JUDGE_MODEL -u SPAWN_PROGRAM -u CLAUDE_CONFIG_DIR \
-    TMUX_TMPDIR="$TMUX_TMPDIR" SPAWN_GIT_REPO="$WORK/repo.git" SPAWN_CLAUDE_PROGRAM="$WORK/claude" \
-    SPAWN_TMUX_PROGRAM="$WORK/tmux" SPAWN_WORKER=worker-bb SPAWN_LOOP_INTERVAL_MS=300 \
+    -u SPAWN_JUDGE_MODEL -u SPAWN_PROGRAM -u CLAUDE_CONFIG_DIR -u SPAWN_TERMINAL_BACKEND \
+    -u SPAWN_HERDR_MODE -u SPAWN_HERDR_SHARDS -u SPAWN_HERDR_PROGRAM -u SPAWN_TMUX_SOCKET \
+    -u SPAWN_TMUX_PROGRAM -u TMUX -u TMUX_PANE -u TMUX_TMPDIR \
+    BB_PATH="$PATH" SPAWN_GIT_REPO="$WORK/repo.git" SPAWN_CLAUDE_PROGRAM="$WORK/claude" \
+    SPAWN_HERDR_CORE_PROGRAM="$SPAWN_HC" SPAWN_WORKER=worker-bb SPAWN_LOOP_INTERVAL_MS=300 \
     SPAWN_MISSION_FILE="$WORK/mission.md" SPAWN_DISK_WARN_GB=0 SPAWN_DISK_FLOOR_GB=0 \
     SPAWN_TEST_DATABASE_URL="$server_url/$TEST_DB_NAME" \
     "$SPAWN_BIN" loop --repo "$WORK/repo.git" --root "$SPAWN_WORKSPACE_ROOT" >"$WORK/loop.log" 2>&1 &

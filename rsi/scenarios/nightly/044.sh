@@ -99,14 +99,26 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
+SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
+if [ -z "$SPAWN_HC" ]; then
+    spawn_dir=$(dirname "$SPAWN_BIN")
+    if [ -x "$spawn_dir/spawn-hc" ]; then
+        SPAWN_HC=$spawn_dir/spawn-hc
+    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
+        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
+    elif command -v spawn-hc >/dev/null 2>&1; then
+        SPAWN_HC=$(command -v spawn-hc)
+    fi
+fi
+[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
+    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed awk; do
+for tool in psql python3 git jq od bash sed awk; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
-real_tmux=$(command -v tmux)
 
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
@@ -115,10 +127,9 @@ trap 'rm -rf "$WORK"' EXIT
 # or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -127,16 +138,18 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
+XDG_RUNTIME_DIR=$WORK/r
+XDG_STATE_HOME=$WORK/state
+XDG_CONFIG_HOME=$WORK/config
+mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
+export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 SPAWN_DB_NAME="bb_044_restart_$run"
-SPAWN_TMUX_SOCKET="bb-044-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+SPAWN_HERDR_SESSION="bb-044-$hc_id"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -164,9 +177,215 @@ stop_loop() {
     wait "$wrapper_pid" 2>/dev/null || true
     wrapper_pid=""
 }
+hc() {
+    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
+        HC_SESSION="$SPAWN_HERDR_SESSION" \
+        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
+        "$SPAWN_HC" "$@"
+}
+hc_state_dir() {
+    python3 -c '
+import os, sys
+h = 0xcbf29ce484222325
+for w in (sys.argv[1], sys.argv[2]):
+    for b in w.encode() + b"\x00":
+        h = ((h ^ b) * 0x00000100000001b3) & 0xffffffffffffffff
+print(os.path.join(os.environ["XDG_RUNTIME_DIR"], f"spawn-hc-{os.getuid()}", f"{h:016x}"))
+' "$1" "$2"
+}
+release_hold_fifo() {
+    if [ -s "${WORK-}/hold-term-link" ]; then
+        rm -f "$(cat "$WORK/hold-term-link" 2>/dev/null || true)" 2>/dev/null || true
+        rm -f "$WORK/hold-term-link" 2>/dev/null || true
+    fi
+    if [ -p "${WORK-}/hold-fifo" ]; then
+        python3 -c '
+import os, sys
+try:
+    fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)
+    os.close(fd)
+except OSError:
+    pass
+' "$WORK/hold-fifo" 2>/dev/null || true
+        rm -f "$WORK/hold-fifo" 2>/dev/null || true
+    fi
+}
+reap_herdr_session() {
+    [ -n "${SPAWN_HERDR_SESSION-}" ] || return 0
+    python3 -c '
+import os, signal, time
+sess = os.environ["SPAWN_HERDR_SESSION"]
+sess_env = ("HC_SESSION=" + sess).encode()
+sess_bytes = sess.encode()
+xdg = os.environ.get("XDG_RUNTIME_DIR", "")
+xdg_env = ("XDG_RUNTIME_DIR=" + xdg).encode() if xdg else None
+ancestors = set()
+cur = os.getpid()
+while cur > 1 and cur not in ancestors:
+    ancestors.add(cur)
+    try:
+        with open(f"/proc/{cur}/stat", "rb") as sf:
+            cur = int(sf.read().rsplit(b")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        break
+pids = []
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    pid = int(name)
+    if pid in ancestors:
+        continue
+    matched = False
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            entries = f.read().split(b"\x00")
+            if sess_env in entries or (xdg_env and xdg_env in entries):
+                matched = True
+    except OSError:
+        pass
+    if not matched:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as cf:
+                cmd = cf.read()
+                if (b"spawn-hc" in cmd or b"hc-wrap" in cmd) and sess_bytes in cmd:
+                    matched = True
+        except OSError:
+            pass
+    if matched:
+        pids.append(pid)
+for pid in pids:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+deadline = time.time() + 2.0
+while time.time() < deadline:
+    alive = False
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+            alive = True
+            break
+        except OSError:
+            pass
+    if not alive:
+        break
+    time.sleep(0.05)
+' || true
+}
+stop_herdr() {
+    if [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; then
+        for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
+            jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
+            hc kill "$addr" >/dev/null 2>&1 || true
+        done
+        hc server stop >/dev/null 2>&1 || true
+        hc_wait=0
+        while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
+            hc_wait=$((hc_wait + 1))
+            sleep 0.1
+        done
+    fi
+    reap_herdr_session
+}
+kill_herdr_hard() {
+    python3 -c '
+import glob, os, signal, socket, struct, time
+pids = []
+seen = set()
+ancestors = set()
+cur = os.getpid()
+while cur > 1 and cur not in ancestors:
+    ancestors.add(cur)
+    try:
+        with open(f"/proc/{cur}/stat", "rb") as sf:
+            cur = int(sf.read().rsplit(b")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        break
+def add(pid):
+    if pid > 1 and pid not in ancestors and pid not in seen:
+        seen.add(pid)
+        pids.append(pid)
+
+# Kill spawn-run parents first so no child exit status is written to SPAWN_EXIT_FILE.
+for path in glob.glob(os.path.join(os.environ["WORK"], "pid-*")):
+    try:
+        with open(path) as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/stat", "rb") as sf:
+            after = sf.read().rsplit(b")", 1)[1].split()
+            ppid = int(after[1])
+        if ppid > 1:
+            with open(f"/proc/{ppid}/cmdline", "rb") as cf:
+                if b"spawn" in cf.read():
+                    add(ppid)
+        add(pid)
+    except (OSError, ValueError, IndexError):
+        pass
+
+sock_path = os.path.join(
+    os.environ["XDG_RUNTIME_DIR"],
+    "herdr-core",
+    os.environ["SPAWN_HERDR_SESSION"] + ".sock",
+)
+if os.path.exists(sock_path):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(sock_path)
+        creds = s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        add(struct.unpack("3i", creds)[0])
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+sess = os.environ["SPAWN_HERDR_SESSION"]
+target = ("HC_SESSION=" + sess).encode()
+sess_bytes = sess.encode()
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    pid = int(name)
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            if target in f.read().split(b"\x00"):
+                add(pid)
+                continue
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as cf:
+            cmd = cf.read()
+            if (b"spawn-hc" in cmd or b"hc-wrap" in cmd) and sess_bytes in cmd:
+                add(pid)
+    except OSError:
+        pass
+
+for pid in pids:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+deadline = time.time() + 2.0
+while time.time() < deadline:
+    alive = False
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+            alive = True
+            break
+        except OSError:
+            pass
+    if not alive:
+        break
+    time.sleep(0.05)
+' || true
+}
 cleanup() {
+    release_hold_fifo
     stop_loop
-    "$real_tmux" -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    stop_herdr
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -177,6 +396,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "044: the loop's last lines:" >&2
@@ -258,6 +478,7 @@ mkdir -p "$WORK/claude-config" "$WORK/state"
 # (turns.log). Its PID is in pid-<agent>.
 bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
+[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 mode=new
 while [ $# -gt 0 ]; do
@@ -327,43 +548,22 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-# Spawn's tmux, on the private socket. While `slow-start` exists, a
-# `new-session` while no server answers waits 3.5 s first. While `hold` names a terminal, a call
-# that names it (as a target `=<terminal>:`, `=<terminal>`, or its paste
-# buffer `spawn-<terminal>`) and `list-panes -a` exit 3, as a server that
-# cannot answer: the Bridge leaves that execution as it is.
-cat >"$WORK/tmux" <<EOF
+# Embedded Herdr wrapper: while `slow-start` exists and no server socket
+# answers yet, sleep 4.5 s before `server start`, then unlink the FIFO
+# hardlink path so `runners()` never blocks once the server answers while
+# any in-flight `terminate()` thread stays blocked on the FIFO inode.
+cat >"$WORK/hc-wrap" <<EOF
 #!/bin/sh
-if [ -f '$WORK/slow-start' ]; then
-    for arg in "\$@"; do
-        if [ "\$arg" = new-session ] && ! '$real_tmux' -L '$SPAWN_TMUX_SOCKET' list-sessions >/dev/null 2>&1; then
-            sleep 3.5
-            break
-        fi
-    done
-fi
-if [ -s '$WORK/hold' ]; then
-    held=\$(cat '$WORK/hold')
-    all=""
-    panes=""
-    for arg in "\$@"; do
-        case "\$arg" in
-        "=\$held:" | "=\$held" | "\$held" | "\$held:"* | "spawn-\$held")
-            echo "bb hold: \$held does not answer" >&2
-            exit 3
-            ;;
-        list-panes) panes=1 ;;
-        -a) all=1 ;;
-        esac
-    done
-    if [ -n "\$panes" ] && [ -n "\$all" ]; then
-        echo "bb hold: list-panes -a does not answer" >&2
-        exit 3
+if [ -f '$WORK/slow-start' ] && [ "\${1-}" = server ] && [ "\${2-}" = start ] && [ ! -S "\${HC_SOCKET-}" ]; then
+    sleep 4.5
+    if [ -s '$WORK/hold-term-link' ]; then
+        rm -f "\$(cat '$WORK/hold-term-link' 2>/dev/null || true)" 2>/dev/null || true
+        rm -f '$WORK/hold-term-link' 2>/dev/null || true
     fi
 fi
-exec '$real_tmux' -L '$SPAWN_TMUX_SOCKET' "\$@"
+exec '$SPAWN_HC' "\$@"
 EOF
-chmod 755 "$WORK/tmux"
+chmod 755 "$WORK/hc-wrap"
 
 # `spawn loop` as systemd runs spawn-loop.service: started again 5 s after
 # it exits (Restart=always, RestartSec=5). Each start and exit is logged.
@@ -386,7 +586,9 @@ for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_GATE SPAWN_DIS
     SPAWN_SUPERVISOR SPAWN_LOOP_INTERVAL_MS SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
     SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS SPAWN_CHEAP_MODEL SPAWN_SMALL_MODEL \
-    SPAWN_MODEL_RELAY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; do
+    SPAWN_MODEL_RELAY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY SPAWN_TERMINAL_BACKEND \
+    SPAWN_HERDR_MODE SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM \
+    TMUX TMUX_PANE TMUX_TMPDIR; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -398,13 +600,10 @@ SPAWN_CLAUDE_PROJECTS=$WORK/projects
 CLAUDE_CONFIG_DIR=$WORK/claude-config
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
+BB_PATH=$PATH
+SPAWN_HERDR_CORE_PROGRAM=$WORK/hc-wrap
 SPAWN_WORKER=worker-bb
 SPAWN_RECOVER_BACKOFF_SECS=2
-# The loop's own runtime directory, emptied at the restart as a reboot does.
-XDG_RUNTIME_DIR=$WORK/run
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # No stall is under test.
 SPAWN_STALL_ACTIVITY_SECS=1800
 SPAWN_STALL_DELIVERY_SECS=1800
@@ -414,7 +613,7 @@ SPAWN_STALL_LANDING_SECS=1800
 SPAWN_STALL_STOP_SECS=1800
 SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL BB_REPO SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS CLAUDE_CONFIG_DIR BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS CLAUDE_CONFIG_DIR BB_PROJECTS BB_WORK BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER \
     SPAWN_RECOVER_BACKOFF_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_DELIVERY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS \
     SPAWN_STALL_HALTED_SECS
@@ -503,7 +702,42 @@ snapshot() {
         order by e.id desc limit 1")"
     put "$1" fault "$(now_ms)"
 }
-server_answers() { "$real_tmux" -L "$SPAWN_TMUX_SOCKET" list-sessions >/dev/null 2>&1; }
+server_answers() {
+    python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect(sys.argv[1])
+    sys.exit(0)
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+' "$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" 2>/dev/null
+}
+server_start_secs() {
+    python3 -c '
+import os, socket, struct, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect(sys.argv[1])
+    creds = s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    pid = struct.unpack("3i", creds)[0]
+finally:
+    s.close()
+btime = None
+with open("/proc/stat") as f:
+    for line in f:
+        if line.startswith("btime "):
+            btime = int(line.split()[1])
+            break
+with open(f"/proc/{pid}/stat") as f:
+    after = f.read().rsplit(")", 1)[1].split()
+starttime = int(after[19])
+clk = os.sysconf("SC_CLK_TCK")
+print(btime + starttime // clk)
+' "$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" 2>/dev/null || true
+}
 
 # `<check> <label> <cause> <terminal_server gone: yes|no>`: the agent's
 # execution (snapshot) was interrupted with that cause, path resume, its
@@ -586,11 +820,19 @@ restart=$(now_ms)
 # As systemd stops the host: the loop gets SIGTERM and finishes its pass,
 # then the terminal server dies with every engine in it.
 stop_loop
-printf 'spawn-%s\n' "$(get second exec)" >"$WORK/hold"
 : >"$WORK/slow-start"
-"$real_tmux" -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+kill_herdr_hard
 find "$XDG_RUNTIME_DIR" -mindepth 1 -delete
 [ -z "$(ls -A "$XDG_RUNTIME_DIR")" ] || harness "the runtime directory is not empty after the restart"
+hc_state=$(hc_state_dir "$SPAWN_HERDR_CORE_PROGRAM" "$SPAWN_HERDR_SESSION")
+held_term="spawn-$(get second exec)"
+rm -f "$WORK/hold-fifo" "$WORK/hold-term-link"
+mkfifo -m 600 "$WORK/hold-fifo"
+mkdir -m 700 -p "$(dirname "$hc_state")" &&
+    mkdir -m 700 -p "$hc_state" &&
+    mkdir -m 700 -p "$hc_state/terminals" &&
+    ln "$WORK/hold-fifo" "$hc_state/terminals/$held_term"
+printf '%s\n' "$hc_state/terminals/$held_term" >"$WORK/hold-term-link"
 sleep 2
 server_answers && harness "the terminal server still answers after it was killed"
 for label in $labels; do put "$label" written "$(last_line "$(get "$label" agent)" | cut -d' ' -f2)"; done
@@ -609,7 +851,7 @@ rm -f "$WORK/slow-start"
 # record of the execution it runs (first's resumed one).
 resumed_exec=$(live_exec "$(get first session)")
 resumed_at=$(q "select started_at_ms from agent_executions where execution_id = '$resumed_exec'")
-server_at=$("$real_tmux" -L "$SPAWN_TMUX_SOCKET" display-message -p '#{start_time}' 2>/dev/null || true)
+server_at=$(server_start_secs)
 [ -n "$resumed_at" ] && [ -n "$server_at" ] && [ "$((server_at * 1000))" -gt "$((resumed_at + 2000))" ] ||
     harness "the new server (start ${server_at:-?} s) is not more than 2 s younger than $resumed_exec's record (${resumed_at:-?} ms): the slow launch did not hold"
 note "(1) the new server started $(secs $((server_at * 1000 - resumed_at))) s (whole seconds) after $resumed_exec's record"
@@ -617,7 +859,7 @@ note "(1) the new server started $(secs $((server_at * 1000 - resumed_at))) s (w
 # --- (2) the second end, with a new server up ---------------------------------------------
 
 released=$(now_ms)
-rm -f "$WORK/hold"
+release_hold_fifo
 check_worked 2 second "$released" 20000
 check_interrupted 2 second host_restart yes
 note "(2) second: host_restart, resumed, working again $(secs $(($(get second back) - released))) s after the hold's end"

@@ -69,11 +69,24 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
+SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
+if [ -z "$SPAWN_HC" ]; then
+    spawn_dir=$(dirname "$SPAWN_BIN")
+    if [ -x "$spawn_dir/spawn-hc" ]; then
+        SPAWN_HC=$spawn_dir/spawn-hc
+    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
+        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
+    elif command -v spawn-hc >/dev/null 2>&1; then
+        SPAWN_HC=$(command -v spawn-hc)
+    fi
+fi
+[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
+    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed grep awk; do
+for tool in psql python3 git jq od bash sed grep awk; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
@@ -92,10 +105,9 @@ trap 'rm -rf "$WORK"' EXIT
 # or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -104,16 +116,18 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
+XDG_RUNTIME_DIR=$WORK/r
+XDG_STATE_HOME=$WORK/state
+XDG_CONFIG_HOME=$WORK/config
+mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
+export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 SPAWN_DB_NAME="bb_025_follow_$run"
-SPAWN_TMUX_SOCKET="bb-025-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+SPAWN_HERDR_SESSION="bb-025-$hc_id"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -123,12 +137,57 @@ server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 
 database_made=""
 loop_pid=""
+hc_real() {
+    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
+        HC_SESSION="$SPAWN_HERDR_SESSION" \
+        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.real.sock" \
+        "$SPAWN_HC" "$@"
+}
+stop_herdr() {
+    real_sock="${XDG_RUNTIME_DIR-}/herdr-core/${SPAWN_HERDR_SESSION-}.real.sock"
+    proxy_sock="${XDG_RUNTIME_DIR-}/herdr-core/${SPAWN_HERDR_SESSION-}.sock"
+    if [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "$real_sock" ]; then
+        for addr in $(hc_real ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
+            jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
+            hc_real kill "$addr" >/dev/null 2>&1 || true
+        done
+        hc_real server stop >/dev/null 2>&1 || true
+        hc_wait=0
+        while [ "$hc_wait" -lt 20 ] && [ -S "$real_sock" ]; do
+            hc_wait=$((hc_wait + 1))
+            sleep 0.1
+        done
+    fi
+    if [ -s "${WORK-}/hc-proxy.pid" ]; then
+        ppid=$(cat "$WORK/hc-proxy.pid" 2>/dev/null || true)
+        if [ -n "$ppid" ]; then
+            kill -TERM "$ppid" 2>/dev/null || true
+            pw=0
+            while [ "$pw" -lt 10 ] && kill -0 "$ppid" 2>/dev/null; do
+                pw=$((pw + 1))
+                sleep 0.1
+            done
+            kill -KILL "$ppid" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$proxy_sock" "$WORK/hc-proxy.pid" 2>/dev/null || true
+    if [ -n "${SPAWN_HERDR_SESSION-}" ]; then
+        for p in /proc/[0-9]*/environ; do
+            [ -r "$p" ] || continue
+            if tr '\0' '\n' <"$p" 2>/dev/null | grep -qx "HC_SESSION=$SPAWN_HERDR_SESSION"; then
+                pid=${p#/proc/}
+                pid=${pid%/environ}
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+        done
+    fi
+}
 cleanup() {
     if [ -n "$loop_pid" ]; then
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
     fi
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    stop_herdr
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -139,6 +198,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "025: the loop's last lines:" >&2
@@ -217,6 +277,7 @@ done
 # $BB_WORK/engine.log.
 bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
+[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 while [ $# -gt 0 ]; do
   case "$1" in --resume | --session-id) native=$2 ;; esac
@@ -269,23 +330,161 @@ chmod 755 "$WORK/claude"
 
 # tmux on the private socket, every call noted (`<ms> <subcommand>`), each
 # capture-pane CAPTURE_DELAY_MS slower.
-cat >"$WORK/tmux" <<EOF
+cat >"$WORK/hc-proxy.py" <<'PROXY'
+import json
+import os
+import selectors
+import socket
+import sys
+import threading
+import time
+
+listen_path = sys.argv[1]
+target_path = sys.argv[2]
+log_path = sys.argv[3]
+delay_s = float(sys.argv[4])
+refuse_kill_path = sys.argv[5]
+log_lock = threading.Lock()
+
+
+def relay_sub(client, upstream):
+    sel = selectors.DefaultSelector()
+    sel.register(client, selectors.EVENT_READ, "c")
+    sel.register(upstream, selectors.EVENT_READ, "u")
+    try:
+        while True:
+            for key, _ in sel.select(timeout=1.0):
+                src = key.fileobj
+                dst = upstream if key.data == "c" else client
+                data = src.recv(65536)
+                if not data:
+                    return
+                dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        sel.close()
+
+
+def handle(conn):
+    upstream = None
+    try:
+        buf = bytearray()
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if b"\n" in chunk:
+                break
+        if not buf:
+            return
+        nl = buf.find(b"\n")
+        first_line = bytes(buf[: nl + 1]) if nl >= 0 else bytes(buf)
+        rest = bytes(buf[nl + 1 :]) if nl >= 0 else b""
+        method = "unknown"
+        req_id = 1
+        try:
+            req = json.loads(first_line.decode("utf-8", errors="replace"))
+            method = req.get("method") or "unknown"
+            req_id = req.get("id", 1)
+        except Exception:
+            pass
+        if log_path:
+            with log_lock:
+                with open(log_path, "a") as lf:
+                    lf.write(f"{int(time.time() * 1000)} {method}\n")
+        if refuse_kill_path and method == "terminal.kill" and os.path.exists(refuse_kill_path):
+            err = json.dumps({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32000,
+                    "message": "kill-session refused by the scenario",
+                    "data": {"kind": "internal"},
+                },
+            }) + "\n"
+            conn.sendall(err.encode("utf-8"))
+            return
+        if delay_s > 0 and method == "terminal.read":
+            time.sleep(delay_s)
+        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        upstream.connect(target_path)
+        upstream.sendall(first_line)
+        if rest:
+            upstream.sendall(rest)
+        if method == "events.subscribe":
+            relay_sub(conn, upstream)
+            return
+        rbuf = bytearray()
+        while True:
+            chunk = upstream.recv(65536)
+            if not chunk:
+                break
+            rbuf.extend(chunk)
+            if b"\n" in chunk:
+                break
+        if rbuf:
+            conn.sendall(bytes(rbuf))
+    except OSError:
+        pass
+    finally:
+        if upstream is not None:
+            try:
+                upstream.close()
+            except OSError:
+                pass
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+if os.path.exists(listen_path):
+    os.unlink(listen_path)
+os.makedirs(os.path.dirname(listen_path), mode=0o700, exist_ok=True)
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(listen_path)
+os.chmod(listen_path, 0o600)
+srv.listen(64)
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PROXY
+delay_secs=$(printf '0.%03d' "$CAPTURE_DELAY_MS")
+cat >"$WORK/hc-wrap" <<EOF
 #!/bin/sh
-sub=other
-for argument in "\$@"; do
-  [ "\$argument" != capture-pane ] || sub=capture-pane
-done
-printf '%s %s\n' "\$(date +%s%3N)" "\$sub" >>'$WORK/tmux.log'
-[ "\$sub" != capture-pane ] || sleep $(printf '0.%03d' "$CAPTURE_DELAY_MS")
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
+proxy_sock="\${HC_SOCKET-}"
+real_sock="\${proxy_sock%.sock}.real.sock"
+if [ "\${1-}" = server ] && [ "\${2-}" = start ]; then
+    if [ ! -S "\$real_sock" ]; then
+        HC_SOCKET="\$real_sock" '$SPAWN_HC' server start </dev/null >/dev/null 2>&1
+    fi
+    if ! python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.close()" "\$proxy_sock" 2>/dev/null; then
+        nohup python3 -I '$WORK/hc-proxy.py' "\$proxy_sock" "\$real_sock" '$WORK/hc.log' "$delay_secs" "" </dev/null >>'$WORK/hc-proxy.log' 2>&1 &
+        echo "\$!" >'$WORK/hc-proxy.pid'
+    fi
+    i=0
+    while [ "\$i" -lt 100 ]; do
+        if python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.close()" "\$proxy_sock" 2>/dev/null; then
+            exit 0
+        fi
+        i=\$((i + 1))
+        sleep 0.05
+    done
+    echo "hc-proxy did not answer on \$proxy_sock" >&2
+    exit 1
+fi
+exec env HC_SOCKET="\$real_sock" '$SPAWN_HC' "\$@"
 EOF
-chmod 755 "$WORK/tmux"
+chmod 755 "$WORK/hc-wrap"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_LOOP_INTERVAL_MS \
     SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_REVIEW_SECS \
     SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS \
-    SPAWN_STALL_HALTED_SECS; do
+    SPAWN_STALL_HALTED_SECS SPAWN_TERMINAL_BACKEND SPAWN_HERDR_MODE SPAWN_HERDR_SHARDS \
+    SPAWN_HERDR_PROGRAM SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM TMUX TMUX_PANE TMUX_TMPDIR; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -295,16 +494,17 @@ SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
+BB_PATH=$PATH
+SPAWN_HERDR_CORE_PROGRAM=$WORK/hc-wrap
 SPAWN_WORKER=worker-bb
 SPAWN_DISK_WARN_GB=0
 SPAWN_DISK_FLOOR_GB=0
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER \
     SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB
 mkdir -p "$SPAWN_WORKSPACE_ROOT"
 : >"$WORK/engine.log"
-: >"$WORK/tmux.log"
+: >"$WORK/hc.log"
 
 tries=0
 while :; do
@@ -360,8 +560,8 @@ settle() {
     done
 }
 captures_between() { # <from ms> <to ms>
-    awk -v from="$1" -v to="$2" '$2 == "capture-pane" && $1 >= from && $1 < to { n++ } END { print n + 0 }' \
-        "$WORK/tmux.log"
+    awk -v from="$1" -v to="$2" '$2 == "terminal.read" && $1 >= from && $1 < to { n++ } END { print n + 0 }' \
+        "$WORK/hc.log"
 }
 submit_input() { # <name> <key> <text>
     capture "$SPAWN_BIN" submit --principal bb-harness --agent "agent_resident_$1" \

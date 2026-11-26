@@ -99,15 +99,27 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
+SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
+if [ -z "$SPAWN_HC" ]; then
+    spawn_dir=$(dirname "$SPAWN_BIN")
+    if [ -x "$spawn_dir/spawn-hc" ]; then
+        SPAWN_HC=$spawn_dir/spawn-hc
+    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
+        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
+    elif command -v spawn-hc >/dev/null 2>&1; then
+        SPAWN_HC=$(command -v spawn-hc)
+    fi
+fi
+[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
+    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 tree=$(pwd)
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed awk curl node; do
+for tool in psql python3 git jq od bash sed awk curl node; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
-real_tmux=$(command -v tmux)
 
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
@@ -116,10 +128,9 @@ trap 'rm -rf "$WORK"' EXIT
 # or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -128,16 +139,18 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
+XDG_RUNTIME_DIR=$WORK/r
+XDG_STATE_HOME=$WORK/state
+XDG_CONFIG_HOME=$WORK/config
+mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
+export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 SPAWN_DB_NAME="bb_045_messages_$run"
-SPAWN_TMUX_SOCKET="bb-045-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+SPAWN_HERDR_SESSION="bb-045-$hc_id"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -172,10 +185,39 @@ stop_serve() {
     wait "$serve_pid" 2>/dev/null || true
     serve_pid=""
 }
+hc() {
+    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
+        HC_SESSION="$SPAWN_HERDR_SESSION" \
+        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
+        "$SPAWN_HC" "$@"
+}
+stop_herdr() {
+    [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ] || return 0
+    for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
+        jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
+        hc kill "$addr" >/dev/null 2>&1 || true
+    done
+    hc server stop >/dev/null 2>&1 || true
+    hc_wait=0
+    while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
+        hc_wait=$((hc_wait + 1))
+        sleep 0.1
+    done
+}
+hc_state_dir() {
+    python3 -c '
+import os, sys
+h = 0xcbf29ce484222325
+for w in (sys.argv[1], sys.argv[2]):
+    for b in w.encode() + b"\x00":
+        h = ((h ^ b) * 0x00000100000001b3) & 0xffffffffffffffff
+print(os.path.join(os.environ["XDG_RUNTIME_DIR"], f"spawn-hc-{os.getuid()}", f"{h:016x}"))
+' "$1" "$2"
+}
 cleanup() {
     stop_serve
     stop_loop
-    "$real_tmux" -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    stop_herdr
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -186,6 +228,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         for log in loop serve; do
             if [ -s "$WORK/$log.log" ]; then
@@ -260,6 +303,7 @@ mkdir -p "$WORK/claude-config" "$WORK/ctl" "$WORK/state"
 # prompt and turn end is logged (engine.log: ms agent what).
 bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
+[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -324,24 +368,7 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-# Spawn's tmux, on the private socket. While `refuse` names a terminal, the
-# load of its paste buffer (`spawn-<terminal>`) fails: nothing is typed.
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-if [ -s '$WORK/refuse' ]; then
-    held=\$(cat '$WORK/refuse')
-    load=""
-    for arg in "\$@"; do
-        [ "\$arg" = load-buffer ] && load=1
-        if [ -n "\$load" ] && [ "\$arg" = "spawn-\$held" ]; then
-            echo "bb refuse: the pane of \$held does not take a paste" >&2
-            exit 1
-        fi
-    done
-fi
-exec '$real_tmux' -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
+
 
 # `spawn loop` as systemd runs spawn-loop.service: started again 5 s after
 # it exits (Restart=always, RestartSec=5).
@@ -362,7 +389,9 @@ for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_GATE SPAWN_DIS
     SPAWN_SUPERVISOR SPAWN_LOOP_INTERVAL_MS SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
     SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS SPAWN_CHEAP_MODEL SPAWN_SMALL_MODEL \
-    SPAWN_MODEL_RELAY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; do
+    SPAWN_MODEL_RELAY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY SPAWN_TERMINAL_BACKEND \
+    SPAWN_HERDR_MODE SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM \
+    TMUX TMUX_PANE TMUX_TMPDIR; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -374,7 +403,8 @@ SPAWN_CLAUDE_PROJECTS=$WORK/projects
 CLAUDE_CONFIG_DIR=$WORK/claude-config
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
+BB_PATH=$PATH
+SPAWN_HERDR_CORE_PROGRAM=$SPAWN_HC
 SPAWN_WORKER=worker-bb
 SPAWN_MESSAGE_TAKEN_SECS=6
 SPAWN_ALERT_CHECK_SECS=1
@@ -387,7 +417,7 @@ SPAWN_STALL_LANDING_SECS=1800
 SPAWN_STALL_STOP_SECS=1800
 SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL BB_REPO SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS CLAUDE_CONFIG_DIR BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS CLAUDE_CONFIG_DIR BB_PROJECTS BB_WORK BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER \
     SPAWN_MESSAGE_TAKEN_SECS SPAWN_ALERT_CHECK_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS \
     SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS
@@ -610,7 +640,9 @@ note "(1) the task and two inputs with the same text: each typed, taken once and
 
 printf 'deaf\n' >"$WORK/ctl/$(get deaf agent).mode"
 printf 'twice\n' >"$WORK/ctl/$(get twice agent).mode"
-terminal_of refuse >"$WORK/refuse"
+hc_state=$(hc_state_dir "$SPAWN_HERDR_CORE_PROGRAM" "$SPAWN_HERDR_SESSION")
+refuse_term=$(terminal_of refuse)
+mkdir -p "$hc_state/staged/$refuse_term"
 deaf_id=$(send deaf bb-deaf "BB:PING deaf")
 refuse_id=$(send refuse bb-refuse "BB:PING refuse")
 twice_id=$(send twice bb-twice "BB:PING twice")
@@ -633,7 +665,7 @@ deadline=$(($(date +%s) + 15))
 until [ "$(alerts "$refuse_id" | grep -c open)" -ge 1 ] || [ "$(date +%s)" -ge "$deadline" ]; do sleep 0.5; done
 [ "$(alerts "$refuse_id" | tr '\n' ' ')" = "open " ] ||
     fail "(3) the input to refuse, never typed, has alerts [$(alerts "$refuse_id" | tr '\n' ' ')]; exactly one open message_not_taken"
-rm -f "$WORK/refuse"
+rmdir "$hc_state/staged/$refuse_term"
 until_message refuse "$refuse_id" '.state == "answered" and .taken == 1 and .not_taken == false' 30 ||
     fail "(3) the input to refuse, once the pane takes a paste, is not typed, taken and answered within 30 s: $(m refuse "$refuse_id" '.message | tostring')"
 deadline=$(($(date +%s) + 15))

@@ -137,11 +137,24 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
+SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
+if [ -z "$SPAWN_HC" ]; then
+    spawn_dir=$(dirname "$SPAWN_BIN")
+    if [ -x "$spawn_dir/spawn-hc" ]; then
+        SPAWN_HC=$spawn_dir/spawn-hc
+    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
+        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
+    elif command -v spawn-hc >/dev/null 2>&1; then
+        SPAWN_HC=$(command -v spawn-hc)
+    fi
+fi
+[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
+    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed grep awk; do
+for tool in psql python3 git jq od bash sed grep awk; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
@@ -160,10 +173,9 @@ trap 'rm -rf "$WORK"' EXIT
 # or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -172,16 +184,18 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
+XDG_RUNTIME_DIR=$WORK/r
+XDG_STATE_HOME=$WORK/state
+XDG_CONFIG_HOME=$WORK/config
+mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
+export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 SPAWN_DB_NAME="bb_023_wake_$run"
-SPAWN_TMUX_SOCKET="bb-023-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+SPAWN_HERDR_SESSION="bb-023-$hc_id"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -191,12 +205,41 @@ server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 
 database_made=""
 loop_pid=""
+hc() {
+    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
+        HC_SESSION="$SPAWN_HERDR_SESSION" \
+        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
+        "$SPAWN_HC" "$@"
+}
+stop_herdr() {
+    [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ] || return 0
+    for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
+        jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
+        hc kill "$addr" >/dev/null 2>&1 || true
+    done
+    hc server stop >/dev/null 2>&1 || true
+    hc_wait=0
+    while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
+        hc_wait=$((hc_wait + 1))
+        sleep 0.1
+    done
+}
+hc_state_dir() {
+    python3 -c '
+import os, sys
+h = 0xcbf29ce484222325
+for w in (sys.argv[1], sys.argv[2]):
+    for b in w.encode() + b"\x00":
+        h = ((h ^ b) * 0x00000100000001b3) & 0xffffffffffffffff
+print(os.path.join(os.environ["XDG_RUNTIME_DIR"], f"spawn-hc-{os.getuid()}", f"{h:016x}"))
+' "$1" "$2"
+}
 cleanup() {
     if [ -n "$loop_pid" ]; then
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
     fi
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    stop_herdr
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -207,6 +250,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "023: the loop's last lines:" >&2
@@ -287,6 +331,7 @@ done
 # turn and the engine writes nothing more (a worker busy and quiet).
 bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
+[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 while [ $# -gt 0 ]; do
   case "$1" in --resume | --session-id) native=$2 ;; esac
@@ -326,31 +371,14 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-# tmux on the private socket. While $WORK/broken exists, a text naming
-# `BB:FRAIL` cannot be staged: `load-buffer` (the Bridge stages every text
-# from a file) fails as tmux fails a command over its message size. Nothing
-# reaches the pane.
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-stage=
-for argument in "\$@"; do
-  [ "\$argument" = load-buffer ] && stage=1
-  last=\$argument
-done
-if [ -n "\$stage" ] && [ -f "\$last" ] && [ -e '$WORK/broken' ] &&
-    grep -q "BB:FRAIL" "\$last" 2>/dev/null; then
-  echo "command too long" >&2
-  exit 1
-fi
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
+
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH CLAUDE_CONFIG_DIR SPAWN_LOOP_INTERVAL_MS SPAWN_STALL_DELIVERY_SECS \
     SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS \
     SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS \
-    SPAWN_DELIVERY_RETRY_SECS SPAWN_REISSUE_AFTER_SECS; do
+    SPAWN_DELIVERY_RETRY_SECS SPAWN_REISSUE_AFTER_SECS SPAWN_TERMINAL_BACKEND SPAWN_HERDR_MODE \
+    SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM TMUX TMUX_PANE TMUX_TMPDIR; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -359,7 +387,8 @@ SPAWN_WORKSPACE_ROOT=$WORK/ws
 SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
-SPAWN_TMUX_PROGRAM=$WORK/tmux
+BB_PATH=$PATH
+SPAWN_HERDR_CORE_PROGRAM=$SPAWN_HC
 SPAWN_WORKER=worker-bb
 SPAWN_SUPERVISOR=1
 SPAWN_MISSION_FILE=$WORK/mission.md
@@ -374,7 +403,7 @@ SPAWN_STALL_LANDING_SECS=1800
 SPAWN_STALL_STOP_SECS=1800
 SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS SPAWN_TMUX_PROGRAM SPAWN_WORKER SPAWN_SUPERVISOR \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER SPAWN_SUPERVISOR \
     SPAWN_MISSION_FILE SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS \
     SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS
@@ -559,7 +588,10 @@ echo "023: idle minute: $idle_scans scans ($idle_seq sequential, $idle_idx by in
 
 snapshot "$WORK/busy.before"
 busy_start=$(now_ms)
-: >"$WORK/broken"
+hc_state=$(hc_state_dir "$SPAWN_HERDR_CORE_PROGRAM" "$SPAWN_HERDR_SESSION")
+frail_exec=$(q "select execution_id from agent_executions where session_id = 'session_resident_frail' and ended_at_ms is null order by started_at_ms desc limit 1")
+[ -n "$frail_exec" ] || harness "frail has no live execution before busy minute"
+mkdir -p "$hc_state/staged/spawn-$frail_exec"
 t1=$(assign alpha "Look into it. BB:HANG")
 t2=$(assign frail "Write it. BB:FRAIL")
 for id in "$t1" "$t2"; do
@@ -580,7 +612,7 @@ while :; do
         fi
     done
     if [ -z "$fixed_ms" ] && [ "$elapsed" -ge 32 ]; then
-        rm -f "$WORK/broken"
+        rmdir "$hc_state/staged/spawn-$frail_exec"
         fixed_ms=$(now_ms)
     fi
     sleep 0.25

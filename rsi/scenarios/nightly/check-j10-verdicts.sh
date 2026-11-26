@@ -71,11 +71,25 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
+SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
+if [ -z "$SPAWN_HC" ]; then
+    spawn_dir=$(dirname "$SPAWN_BIN")
+    if [ -x "$spawn_dir/spawn-hc" ]; then
+        SPAWN_HC=$spawn_dir/spawn-hc
+    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
+        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
+    elif command -v spawn-hc >/dev/null 2>&1; then
+        SPAWN_HC=$(command -v spawn-hc)
+    fi
+fi
+[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
+    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
+export SPAWN_HC
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed grep awk date df cut sha1sum; do
+for tool in psql git jq od bash sed grep awk date df cut sha1sum; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 real_git=$(command -v git)
@@ -100,7 +114,9 @@ for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SP
     SPAWN_GATE_MIN_FREE_MEMORY_MB SPAWN_INTEGRATE_GATES SPAWN_TEST_DATABASE_LOG \
     SPAWN_GATE_HOST_FAULT_BACKOFF_SECS SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
-    SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS SPAWN_INTEGRATE_WARM; do
+    SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS SPAWN_INTEGRATE_WARM \
+    SPAWN_TERMINAL_BACKEND SPAWN_HERDR_MODE SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM \
+    SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM TMUX TMUX_PANE TMUX_TMPDIR; do
     unset "$name" 2>/dev/null || true
 done
 # No base warm after a landing (035's setting, here for every part): a warm
@@ -113,12 +129,42 @@ export SPAWN_INTEGRATE_WARM
 
 # Set by each lane (in its own subshell): WORK, SPAWN_DB_NAME, SPAWN_TMUX_SOCKET,
 # lane, loop_pid, database_made, asserted, P (the part running).
+hc() {
+    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
+        HC_SESSION="$SPAWN_HERDR_SESSION" \
+        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
+        "$SPAWN_HC" "$@"
+}
+stop_herdr() {
+    if [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; then
+        for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
+            jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
+            hc kill "$addr" >/dev/null 2>&1 || true
+        done
+        hc server stop >/dev/null 2>&1 || true
+        hc_wait=0
+        while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
+            hc_wait=$((hc_wait + 1))
+            sleep 0.1
+        done
+    fi
+    if [ -n "${SPAWN_HERDR_SESSION-}" ]; then
+        for p in /proc/[0-9]*/environ; do
+            [ -r "$p" ] || continue
+            if tr '\0' '\n' <"$p" 2>/dev/null | grep -qx "HC_SESSION=$SPAWN_HERDR_SESSION"; then
+                pid=${p#/proc/}
+                pid=${pid%/environ}
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+        done
+    fi
+}
 lane_cleanup() {
     if [ -n "${loop_pid-}" ]; then
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
     fi
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    stop_herdr
     if [ -n "${database_made-}" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -128,6 +174,7 @@ lane_cleanup() {
 lane_finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ]; then
         echo "j10: lane $lane failed in part ${P##*/}" >&2
         if [ -s "$WORK/loop.log" ]; then
@@ -180,27 +227,25 @@ lane_world() {
     # or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
     real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
     HOME=$WORK/home
-    TMUX_TMPDIR=$WORK/tmux-sock
-    mkdir -p "$HOME" "$TMUX_TMPDIR"
+    mkdir -p "$HOME"
     [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-    export HOME TMUX_TMPDIR
-    # The runtime directory too (backlog S20): what Spawn keeps there (a
-    # launch's environment file, its terminals' leaders) stays in WORK, never
-    # in the real one. systemd's user manager stays reachable by its bus.
+    export HOME
     real_runtime=${XDG_RUNTIME_DIR-}
     if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
         DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
         export DBUS_SESSION_BUS_ADDRESS
     fi
-    XDG_RUNTIME_DIR=$WORK/runtime
-    mkdir -m 700 "$XDG_RUNTIME_DIR"
-    export XDG_RUNTIME_DIR
+    XDG_RUNTIME_DIR=$WORK/r
+    XDG_STATE_HOME=$WORK/state
+    XDG_CONFIG_HOME=$WORK/config
+    mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
+    export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
     # Not $$ alone: the gate's PID namespace makes it the same small number.
     run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+    hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
     SPAWN_DB_NAME="bb_j10${lane}_verdicts_$run"
-    SPAWN_TMUX_SOCKET="bb-j10${lane}-$run"
-    export SPAWN_TERMINAL_BACKEND=tmux
-    export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET
+    SPAWN_HERDR_SESSION="bb-j10${lane}-$hc_id"
+    export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION
     trap lane_finish EXIT
     trap 'exit 130' INT TERM
     # Logins of this lane's databases that a run killed before its cleanup
@@ -240,11 +285,6 @@ EOF
     GIT_CONFIG_GLOBAL=$WORK/gitconfig
     export GIT_CONFIG_GLOBAL
 
-    cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-    chmod 755 "$WORK/tmux"
 }
 
 # The loop's environment (020's, 033's: the supervisor on, every stall bound
@@ -257,7 +297,8 @@ lane_loop_env() {
     SPAWN_CLAUDE_PROJECTS=$WORK/projects
     BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
     BB_WORK=$WORK
-    SPAWN_TMUX_PROGRAM=$WORK/tmux
+    BB_PATH=$PATH
+    SPAWN_HERDR_CORE_PROGRAM=$SPAWN_HC
     SPAWN_WORKER=worker-bb
     SPAWN_LOOP_INTERVAL_MS=300
     # Free disk is not what this journey is about: no warning, no floor.
@@ -273,7 +314,7 @@ lane_loop_env() {
     SPAWN_STALL_STOP_SECS=1800
     SPAWN_STALL_HALTED_SECS=1800
     export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-        SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+        SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER \
         SPAWN_LOOP_INTERVAL_MS SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_SUPERVISOR \
         SPAWN_MISSION_FILE SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
         SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
@@ -295,6 +336,7 @@ lane_loop_env() {
     # session that is not a resident (the supervisor) takes no job.
     bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
+[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 while [ $# -gt 0 ]; do
   case "$1" in --resume | --session-id) native=$2 ;; esac
@@ -1662,6 +1704,7 @@ EOF
     # (logging it outside the workspace) and exits.
     cat >"$P/claude" <<EOF
 #!/bin/sh
+[ -n "\${BB_PATH-}" ] && PATH=\$BB_PATH && export PATH
 printf 'Welcome to Claude Code\n\n'
 printf '❯ '
 while IFS= read -r line; do
@@ -1684,10 +1727,11 @@ EOF
     SPAWN_GIT_REPO=$default
     SPAWN_CLAUDE_PROGRAM=$P/claude
     SPAWN_CLAUDE_PROJECTS=$P/projects
-    SPAWN_TMUX_PROGRAM=$WORK/tmux
+    BB_PATH=$PATH
+    SPAWN_HERDR_CORE_PROGRAM=$SPAWN_HC
     SPAWN_WORKER=worker-bb
     export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_CLAUDE_PROGRAM \
-        SPAWN_CLAUDE_PROJECTS SPAWN_TMUX_PROGRAM SPAWN_WORKER
+        SPAWN_CLAUDE_PROJECTS BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER
     host=$P/host
     integrator=$WORK/integrator
     mkdir -p "$host" "$integrator"
@@ -1774,6 +1818,7 @@ EOF
     assert_eq "$(main_file X.txt)" from-x "(b) X.txt on the source's main" #@ 008:352
     assert_eq "$(main_file OTHER.txt)" other "(b) main's own change kept by the landing" #@ 008:353
     echo "j10: 008 (b): a merge git could not run was an error, not a conflict, and landed once git could"
+    stop_herdr
 }
 
 # --- 033: a base that disagrees with itself ---------------------------------------------
@@ -2163,7 +2208,7 @@ stop_lanes() {
     done
     rm -rf "$lanes"
 }
-trap 'trap - EXIT; stop_lanes' EXIT
+trap 'trap - EXIT; set +e; stop_lanes' EXIT
 trap 'exit 130' INT TERM
 
 (lane_a) &

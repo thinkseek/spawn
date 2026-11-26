@@ -66,11 +66,24 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
+SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
+if [ -z "$SPAWN_HC" ]; then
+    spawn_dir=$(dirname "$SPAWN_BIN")
+    if [ -x "$spawn_dir/spawn-hc" ]; then
+        SPAWN_HC=$spawn_dir/spawn-hc
+    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
+        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
+    elif command -v spawn-hc >/dev/null 2>&1; then
+        SPAWN_HC=$(command -v spawn-hc)
+    fi
+fi
+[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
+    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed grep awk curl python3; do
+for tool in psql git jq od bash sed grep awk curl python3; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
@@ -81,25 +94,26 @@ trap 'rm -rf "$WORK"' EXIT
 # or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 real_runtime=${XDG_RUNTIME_DIR-}
 if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
+XDG_RUNTIME_DIR=$WORK/r
+XDG_STATE_HOME=$WORK/state
+XDG_CONFIG_HOME=$WORK/config
+mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
+export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 SPAWN_DB_NAME="bb_206_runs_$run"
-SPAWN_TMUX_SOCKET="bb-206-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+SPAWN_HERDR_SESSION="bb-206-$hc_id"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -118,6 +132,12 @@ relay_pid=""
 # session (each pane is its session's leader) or the server. Only these
 # pids, which this script's own server made, are ever signalled.
 # stop_world leaves in $WORK/left what is still alive after 10 s.
+hc() {
+    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
+        HC_SESSION="$SPAWN_HERDR_SESSION" \
+        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
+        "$SPAWN_HC" "$@"
+}
 stop_world() {
     for pid in "$loop_pid" "$serve_pid" "$relay_pid"; do
         [ -n "$pid" ] || continue
@@ -125,9 +145,29 @@ stop_world() {
         wait "$pid" 2>/dev/null || true
     done
     loop_pid="" serve_pid="" relay_pid=""
-    sessions=$(tmux -L "$SPAWN_TMUX_SOCKET" list-panes -a -F '#{pane_pid}' 2>/dev/null || true)
-    server=$(tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{pid}' 2>/dev/null | head -n 1 || true)
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    sessions=""
+    server=""
+    sock="${XDG_RUNTIME_DIR-}/herdr-core/${SPAWN_HERDR_SESSION-}.sock"
+    if [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "$sock" ]; then
+        server=$(python3 -c '
+import socket, struct, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect(sys.argv[1])
+    creds = s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    print(struct.unpack("3i", creds)[0])
+except OSError:
+    pass
+finally:
+    s.close()
+' "$sock" 2>/dev/null || true)
+        listed=$(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null || true)
+        sessions=$(printf '%s' "$listed" | jq -r '.terminals[]? | select(.state == "live") | .pid // empty' 2>/dev/null || true)
+        for addr in $(printf '%s' "$listed" | jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
+            hc kill "$addr" >/dev/null 2>&1 || true
+        done
+        hc server stop >/dev/null 2>&1 || true
+    fi
     i=0
     while :; do
         left=""
@@ -139,16 +179,21 @@ stop_world() {
                 { pid = $1; sub(/.*\) /, ""); split($0, f, " ")
                   if (index(want, " " f[4] " ")) printf " %s", pid }')"
         fi
-        [ -n "$left" ] || break
+        if [ -z "$left" ] && [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "$sock" ]; then
+            :
+        elif [ -z "$left" ]; then
+            break
+        fi
         i=$((i + 1))
         if [ "$i" -ge 50 ]; then
+            [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "$sock" ] && [ -z "$left" ] && left=" socket:$sock"
             break
         fi
         sleep 0.2
     done
     printf '%s' "$left" >"$WORK/left" 2>/dev/null || true
     for pid in $left; do
-        kill -KILL "${pid#server:}" 2>/dev/null || true
+        case "$pid" in socket:*) ;; *) kill -KILL "${pid#server:}" 2>/dev/null || true ;; esac
     done
 }
 cleanup() {
@@ -162,6 +207,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "206: the loop's last lines:" >&2
@@ -231,6 +277,7 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # does, so the Bridge sees its turns as a real engine's.
 bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
+[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 settings=
 while [ $# -gt 0 ]; do
@@ -272,16 +319,11 @@ while :; do
 done
 ENGINE
 chmod 755 "$WORK/claude"
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
-
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_CHEAP_MODEL SPAWN_SMALL_MODEL \
     SPAWN_MODEL_PRICES SPAWN_API_TOKEN SPAWN_ENVELOPE SPAWN_SLICE http_proxy https_proxy \
-    HTTP_PROXY HTTPS_PROXY; do
+    HTTP_PROXY HTTPS_PROXY SPAWN_TERMINAL_BACKEND SPAWN_HERDR_MODE SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM \
+    SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM TMUX TMUX_PANE TMUX_TMPDIR; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -291,7 +333,8 @@ SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
+BB_PATH=$PATH
+SPAWN_HERDR_CORE_PROGRAM=$SPAWN_HC
 SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
 # The alert step reads every 2 s (default 30 s).
@@ -312,7 +355,7 @@ SPAWN_DISK_FLOOR_GB=0
 # The supervisor runs, as on the host: its engine is one the Bridge starts.
 SPAWN_SUPERVISOR=1
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_ALERT_CHECK_SECS SPAWN_ALERT_MISSION_IDLE_SECS \
     SPAWN_RECOVER_BACKOFF_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_DELIVERY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
