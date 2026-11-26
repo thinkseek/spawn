@@ -706,14 +706,28 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{Host, engines, probe_with, run_bounded, untested_notice};
+    use super::{Boxed, Host, engines, probe_with, run_bounded, untested_notice, view_with};
     use crate::deliver::Runs;
+    use spawn_core::driver::EngineHome;
+
+    /// How the fake host's filesystem view answers for a sandboxed engine.
+    #[derive(Clone, Copy)]
+    enum View {
+        /// `SPAWN_ENGINE_VIEW=off`: run on the host.
+        Off,
+        /// Wrapped in a made-up `bwrap`.
+        Wrap,
+        /// None on this host, for this reason.
+        Refuse(&'static str),
+    }
 
     struct Fake {
         env: Vec<(&'static str, &'static str)>,
         answers: Vec<(&'static str, Result<&'static str, &'static str>)>,
         runs: RefCell<Vec<String>>,
         stat: RefCell<Vec<String>>,
+        view: View,
+        viewed: RefCell<Vec<String>>,
     }
 
     impl Fake {
