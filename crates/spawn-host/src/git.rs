@@ -1078,45 +1078,36 @@ impl GitWorkspace {
     }
 
     /// Where the files over the cap that checkpoints of a branch left out are
-    /// recorded, NUL-separated, three fields each: `told` or `untold`, the
-    /// size in bytes, the path.
+    /// recorded ([`oversized_record`] reads it; the format is there).
     fn oversized_path(&self, branch: &str) -> PathBuf {
-        self.root.join(".oversized").join(branch)
+        oversized_file(&self.root, branch)
     }
 
-    /// The record at [`Self::oversized_path`]: by path, the size and whether
-    /// the agent was told. An unreadable or malformed record is empty.
-    fn read_oversized(&self, branch: &str) -> BTreeMap<TreePath, (u64, bool)> {
+    /// The record at [`Self::oversized_path`], by path. An unreadable or
+    /// malformed record is empty.
+    fn read_oversized(&self, branch: &str) -> BTreeMap<TreePath, Oversized> {
         let Ok(bytes) = std::fs::read(self.oversized_path(branch)) else {
             return BTreeMap::new();
         };
-        let fields: Vec<&[u8]> = nul_fields(&bytes).collect();
-        fields
-            .chunks_exact(3)
-            .filter_map(|entry| {
-                let told = match entry[0] {
-                    b"told" => true,
-                    b"untold" => false,
-                    _ => return None,
-                };
-                let size = std::str::from_utf8(entry[1]).ok()?.parse().ok()?;
-                Some((TreePath::from_bytes(entry[2]), (size, told)))
-            })
-            .collect()
+        parse_oversized(&bytes)
     }
 
     /// Best effort: a lost record tells the agent again at worst.
-    fn write_oversized(&self, branch: &str, record: &BTreeMap<TreePath, (u64, bool)>) {
+    fn write_oversized(&self, branch: &str, record: &BTreeMap<TreePath, Oversized>) {
         let path = self.oversized_path(branch);
         if record.is_empty() {
             let _ = std::fs::remove_file(&path);
             return;
         }
         let mut bytes = Vec::new();
-        for (file, (size, told)) in record {
-            bytes.extend_from_slice(if *told { b"told" } else { b"untold" });
+        for (file, entry) in record {
+            bytes.extend_from_slice(if entry.told { b"told" } else { b"untold" });
             bytes.push(0);
-            bytes.extend_from_slice(size.to_string().as_bytes());
+            bytes.extend_from_slice(entry.size.to_string().as_bytes());
+            if let Some(digest) = &entry.digest {
+                bytes.push(b' ');
+                bytes.extend_from_slice(digest.as_bytes());
+            }
             bytes.push(0);
             bytes.extend_from_slice(file.as_bytes());
             bytes.push(0);
@@ -1130,17 +1121,37 @@ impl GitWorkspace {
         }
     }
 
-    /// Record the files over the cap a checkpoint of `branch` just left out:
-    /// one already told of stays told; one no longer left out is forgotten,
-    /// so it is told of again if it grows past the cap again. The caller
-    /// holds the branch's lock.
-    pub(crate) fn record_oversized(&self, branch: &str, oversized: &[(TreePath, u64)]) {
+    /// Record the files over the cap a checkpoint of `branch` (its work tree
+    /// in `directory`) just left out: one already told of stays told; one no
+    /// longer left out is forgotten, so it is told of again if it grows past
+    /// the cap again. Each is recorded with its `sha256:` digest (decision
+    /// D6: digest and size are recorded, the bytes are kept nowhere), read
+    /// again only when the file may have changed since the record was
+    /// written ([`oversized_digest`]). The caller holds the branch's lock.
+    pub(crate) fn record_oversized(
+        &self,
+        branch: &str,
+        directory: &Path,
+        oversized: &[(TreePath, u64)],
+    ) {
         let before = self.read_oversized(branch);
-        let record: BTreeMap<TreePath, (u64, bool)> = oversized
+        let written = std::fs::metadata(self.oversized_path(branch))
+            .and_then(|meta| meta.modified())
+            .ok();
+        let record: BTreeMap<TreePath, Oversized> = oversized
             .iter()
             .map(|(path, size)| {
-                let told = before.get(path).is_some_and(|(_, told)| *told);
-                (path.clone(), (*size, told))
+                let earlier = before.get(path);
+                let told = earlier.is_some_and(|entry| entry.told);
+                let digest = oversized_digest(directory, path, *size, earlier, written);
+                (
+                    path.clone(),
+                    Oversized {
+                        size: *size,
+                        told,
+                        digest,
+                    },
+                )
             })
             .collect();
         if record != before {
@@ -1166,8 +1177,8 @@ impl GitWorkspace {
     fn untold_oversized(&self, branch: &str) -> Vec<String> {
         self.read_oversized(branch)
             .iter()
-            .filter(|(_, (_, told))| !*told)
-            .map(|(path, (size, _))| self.oversized_notice(path, *size))
+            .filter(|(_, entry)| !entry.told)
+            .map(|(path, entry)| self.oversized_notice(path, entry.size))
             .collect()
     }
 
@@ -1180,9 +1191,9 @@ impl GitWorkspace {
         };
         let mut record = self.read_oversized(branch);
         let mut changed = false;
-        for (path, (size, told)) in &mut record {
-            if !*told && notices.contains(&self.oversized_notice(path, *size)) {
-                *told = true;
+        for (path, entry) in &mut record {
+            if !entry.told && notices.contains(&self.oversized_notice(path, entry.size)) {
+                entry.told = true;
                 changed = true;
             }
         }
@@ -1504,7 +1515,7 @@ impl GitWorkspace {
             let _ = std::fs::remove_file(&index);
         }
         let (tree, oversized) = tree?;
-        self.record_oversized(&branch, &oversized);
+        self.record_oversized(&branch, &directory, &oversized);
 
         // A merge of main whose conflicts are now resolved: main is the
         // second parent, even when the tree did not change.
@@ -1599,7 +1610,7 @@ impl GitWorkspace {
             let _ = std::fs::remove_file(index);
         }
         let (tree, oversized) = tree?;
-        self.record_oversized(branch, &oversized);
+        self.record_oversized(branch, directory, &oversized);
         let mut arguments = vec!["commit-tree", tree.as_str()];
         if let Some(main) = main.as_deref() {
             arguments.extend(["-p", main]);
@@ -2269,7 +2280,7 @@ impl GitWorkspace {
         for path in special {
             crate::agent_files::remove(directory, path).map_err(unavailable)?;
         }
-        self.record_oversized(branch, &stay);
+        self.record_oversized(branch, directory, &stay);
         Ok(())
     }
 
@@ -2510,7 +2521,7 @@ impl GitWorkspace {
             let _ = std::fs::remove_file(&index);
         }
         let (tree, oversized) = tree?;
-        self.record_oversized(branch, &oversized);
+        self.record_oversized(branch, directory, &oversized);
         if let Some(previous) = &previous
             && self.git_output(&["rev-parse", &format!("{previous}^{{tree}}")])? == tree
         {
