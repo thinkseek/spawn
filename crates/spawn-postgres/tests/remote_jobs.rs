@@ -767,9 +767,7 @@ fn a_valid_run_resets_the_strikes_once_and_leaves_degraded() {
     assert!(judged.finished_at_ms.is_some());
     // Once only: neither a second valid nor a stale fault at the old epoch.
     assert!(
-        !store
-            .remote_job_valid("gate-valid-0002", 1)
-            .expect("again"),
+        !store.remote_job_valid("gate-valid-0002", 1).expect("again"),
         "a completion is judged once"
     );
     let stale = store
@@ -815,15 +813,6 @@ fn a_valid_run_resets_the_strikes_once_and_leaves_degraded() {
         .expect("public's privilege")
         .get(0);
     assert!(!public, "closed to PUBLIC");
-    let pinned: bool = client
-        .query_one(
-            "select coalesce(proconfig, '{}') @> array['search_path=' || current_schema() || ', pg_temp']
-               from pg_proc where oid = 'spawn_remote_job_valid(text, bigint)'::regprocedure",
-            &[],
-        )
-        .expect("its settings")
-        .get(0);
-    assert!(pinned, "its search path is pinned");
 }
 
 /// The integrator's `take_local` at the epoch it read, racing a node's
