@@ -57,6 +57,7 @@ mod commands;
 mod commit_map;
 mod commit_now;
 mod config;
+mod config_file;
 mod context;
 mod core_lines_sample;
 mod cost;
@@ -91,6 +92,7 @@ mod sources;
 mod storage;
 mod storage_bytes;
 mod supervise;
+mod toml_parser;
 mod verify;
 
 // Re-exported at the crate root, where the command modules import them.
@@ -148,7 +150,11 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn features graph [--root <dir>] [--registry <file>] [--level file|unit|feature] [--from <id|path>] [--to <id|path>] [--feature <id>] [--json]\n       \
      spawn grade register|list|exam|onboard|lock-grade|unlock-grade|enable|disable|calibrate|upkeep ...   (the grading catalog: spawn grade --help for each verb's flags)\n       \
      spawn prov index|who|show|blast|revert|split|compose|snapshot|refs|rollback|durability ...   (file provenance: spawn prov --help for each verb's flags)\n       \
-     spawn source init|list|show|sync|export ...   (internal source and metadata store: spawn source --help for each verb's flags)";
+     spawn source init|list|show|sync|export ...   (internal source and metadata store: spawn source --help for each verb's flags)\n       \
+     spawn config check [--config <path>] [--json]\n       \
+     spawn config effective [--config <path>] [--json]\n       \
+     spawn config init --data-dir <dir> [--name <name>] [--output <file>]\n       \
+     spawn doctor [--config <path>] [--root <dir>] [--json]";
 
 /// What the whole usage says last, after the commands.
 const HELP_HINT: &str =
@@ -371,6 +377,18 @@ const COMMANDS: &[Command] = &[
         run: engine::run,
     },
     Command {
+        name: "config",
+        aliases: &[],
+        usage: &[config_file::CONFIG_USAGE],
+        run: |rest| config_file::config_command(None, rest),
+    },
+    Command {
+        name: "doctor",
+        aliases: &[],
+        usage: &[config_file::DOCTOR_USAGE],
+        run: |rest| config_file::doctor_command(None, rest),
+    },
+    Command {
         name: "version",
         aliases: &["--version", "-V"],
         usage: &[VERSION_USAGE],
@@ -580,8 +598,44 @@ fn help_requested(command: &str, rest: &[String]) -> bool {
         .any(|word| word == "--help")
 }
 
+const CONFIG_APPLIED_ENV: &str = "__SPAWN_CONFIG_APPLIED";
+
+fn parse_global_config(
+    arguments: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+) -> Result<Option<String>, String> {
+    let mut cli_config: Option<String> = None;
+    while let Some(arg) = arguments.peek() {
+        if arg == "--config" || arg == "-c" {
+            let flag = arguments.next().expect("peeked");
+            let Some(value) = arguments.next() else {
+                return Err(format!("{flag} needs a value"));
+            };
+            if value.starts_with('-') && value != "-" {
+                return Err(format!("{flag} needs a value, found {value}"));
+            }
+            cli_config = Some(value);
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            if value.is_empty() {
+                return Err("--config needs a value".to_string());
+            }
+            cli_config = Some(value.to_string());
+            arguments.next();
+        } else if let Some(value) = arg.strip_prefix("-c=") {
+            if value.is_empty() {
+                return Err("-c needs a value".to_string());
+            }
+            cli_config = Some(value.to_string());
+            arguments.next();
+        } else {
+            break;
+        }
+    }
+    Ok(cli_config)
+}
+
 pub(crate) fn dispatch() -> Result<i32, String> {
-    let mut arguments = std::env::args().skip(1);
+    let mut arguments = std::env::args().skip(1).peekable();
+    let cli_config = parse_global_config(&mut arguments)?;
     let Some(command) = arguments.next() else {
         return Err(full_usage());
     };
@@ -592,7 +646,27 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         return Ok(0);
     }
     match find(&command) {
-        Some(row) => (row.run)(&rest),
+        Some(row) => {
+            if row.name == "config" {
+                return config_file::config_command(cli_config.as_deref(), &rest);
+            }
+            if row.name == "doctor" {
+                return config_file::doctor_command(cli_config.as_deref(), &rest);
+            }
+            let effective_config = cli_config.or_else(|| env_value("SPAWN_CONFIG"));
+            if let Some(config_path) = effective_config
+                && !matches!(row.name, "version" | "run" | "ack" | "mask" | "mask-hook")
+                && env_value(CONFIG_APPLIED_ENV).as_deref() != Some(config_path.as_str())
+            {
+                return config_file::exec_with_config(
+                    std::path::Path::new(&config_path),
+                    &command,
+                    &rest,
+                    CONFIG_APPLIED_ENV,
+                );
+            }
+            (row.run)(&rest)
+        }
         None => Err(format!("unknown command {command}")),
     }
 }
@@ -849,7 +923,12 @@ mod tests {
                 "{removed} stays an unknown command"
             );
         }
-        assert_eq!(COMMANDS.len(), 31, "the commands: {words:?}");
+        assert_eq!(COMMANDS.len(), 33, "the commands: {words:?}");
+    }
+
+    #[test]
+    fn min_git_matches_config_module() {
+        assert_eq!(super::config_file::MIN_GIT, super::config::MIN_GIT);
     }
 
     #[test]

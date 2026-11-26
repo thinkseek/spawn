@@ -1,0 +1,942 @@
+//! Comprehensive tests for `toml_parser`, `config_file` (`SpawnConfig`,
+//! `SecretRef`, env resolution, secret redaction), and the `spawn config` /
+//! `spawn doctor` / `--config` CLI commands.
+
+#[allow(dead_code)]
+#[path = "../src/toml_parser.rs"]
+mod toml_parser;
+
+#[allow(dead_code)]
+#[path = "../src/config_file.rs"]
+mod config_file;
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use config_file::{SpawnConfig, effective_json_with, resolve_env_entries_with};
+use serde_json::{Value, json};
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(prefix: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-cfg-test-{prefix}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp test dir");
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn spawn_bin(args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    let path_val = std::env::var("PATH").unwrap_or_default();
+    Command::new(env!("CARGO_BIN_EXE_spawn"))
+        .args(args)
+        .env_clear()
+        .env("PATH", path_val)
+        .envs(extra_env.iter().copied())
+        .output()
+        .expect("run spawn binary")
+}
+
+fn env_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect()
+}
+
+fn env_as_map(entries: Vec<(String, String)>) -> BTreeMap<String, String> {
+    entries.into_iter().collect()
+}
+
+// =========================================================================
+// 1. toml_parser tests
+// =========================================================================
+
+#[test]
+fn toml_parser_handles_tables_arrays_inline_tables_escapes_and_comments() {
+    let doc = r#"
+# Top-level comment
+title = "spawn\t\"v2\"\n\\ok\u0041" # trailing comment
+raw = 'C:\no\escapes\#here'
+count = 1_000_000
+neg = -42
+pos = +7
+hex = 0xdead_beef
+oct = 0o755
+bin = 0b1010_0101
+ratio = 12.75_25
+exp = -2.5e-3
+flag_t = true
+flag_f = false
+
+multi_arr = [
+    # comment inside array
+    "alpha",
+    'beta', # trailing item comment
+    { k = 1, v = "x" },
+]
+
+inline = { a = 1, b = "x", nested = { ok = true } }
+empty_inline = {}
+
+[section]
+key = "val"
+dotted.inner = 99
+
+[section.sub]
+enabled = true
+
+[parent.child]
+x = 1
+
+# Defining parent after child header is valid in TOML 1.0
+[parent]
+y = 2
+
+[[items]]
+name = "first"
+tags = ["a", "b"]
+
+[items.meta]
+weight = 10
+
+[[items]]
+name = "second"
+
+[[items.sub]]
+id = 101
+"#;
+
+    let val = toml_parser::parse(doc).expect("valid TOML");
+    assert_eq!(val["title"], json!("spawn\t\"v2\"\n\\okA"));
+    assert_eq!(val["raw"], json!("C:\\no\\escapes\\#here"));
+    assert_eq!(val["count"], json!(1_000_000));
+    assert_eq!(val["neg"], json!(-42));
+    assert_eq!(val["pos"], json!(7));
+    assert_eq!(val["hex"], json!(0xdead_beef_i64));
+    assert_eq!(val["oct"], json!(0o755));
+    assert_eq!(val["bin"], json!(0b1010_0101));
+    assert_eq!(val["ratio"], json!(12.7525));
+    assert_eq!(val["exp"], json!(-0.0025));
+    assert_eq!(val["flag_t"], json!(true));
+    assert_eq!(val["flag_f"], json!(false));
+    assert_eq!(
+        val["multi_arr"],
+        json!(["alpha", "beta", {"k": 1, "v": "x"}])
+    );
+    assert_eq!(
+        val["inline"],
+        json!({"a": 1, "b": "x", "nested": {"ok": true}})
+    );
+    assert_eq!(val["empty_inline"], json!({}));
+    assert_eq!(val["section"]["key"], json!("val"));
+    assert_eq!(val["section"]["dotted"]["inner"], json!(99));
+    assert_eq!(val["section"]["sub"]["enabled"], json!(true));
+    assert_eq!(val["parent"], json!({"y": 2, "child": {"x": 1}}));
+    assert_eq!(
+        val["items"],
+        json!([
+            {"name": "first", "tags": ["a", "b"], "meta": {"weight": 10}},
+            {"name": "second", "sub": [{"id": 101}]},
+        ])
+    );
+}
+
+#[test]
+fn toml_parser_multiline_strings_and_quoted_keys() {
+    let doc = r#"
+["a.b".'c d']
+text = """
+hello \
+  world"""
+lit = '''
+line1
+line2'''
+"#;
+    let val = toml_parser::parse(doc).expect("valid multiline");
+    assert_eq!(val["a.b"]["c d"]["text"], json!("hello world"));
+    assert_eq!(val["a.b"]["c d"]["lit"], json!("line1\nline2"));
+}
+
+#[test]
+fn toml_parser_reports_line_col_on_duplicates_and_malformed_syntax() {
+    let cases = [
+        ("a = 1\na = 2\n", 2, 1, "duplicate key"),
+        ("[sec]\na = 1\n[sec]\nb = 2\n", 3, 1, "duplicate table"),
+        ("a.b = 1\n[a]\nc = 2\n", 2, 1, "dotted"),
+        ("[a]\nb = 1\n[a.c]\nd = 2\n", 0, 0, ""), // valid case checked separately? wait: let's keep only invalid here!
+    ];
+    // Test valid case separately
+    assert!(toml_parser::parse(cases[3].0).is_ok());
+
+    let error_cases = [
+        ("a = 1\na = 2\n", 2, 1, "duplicate key"),
+        ("[sec]\na = 1\n[sec]\nb = 2\n", 3, 1, "duplicate table"),
+        ("a.b = 1\n[a]\nc = 2\n", 2, 1, "dotted"),
+        ("a = 1\n[a]\nb = 2\n", 2, 1, "value"),
+        ("a = { x = 1 }\n[a.y]\nz = 2\n", 2, 1, "inline"),
+        ("x = { a = 1, }\n", 1, 14, "trailing comma"),
+        ("x = \"unterminated\n", 1, 18, "newline"),
+        ("x = \"unterminated", 1, 5, "unterminated"),
+        ("x = \"bad\\q\"\n", 1, 9, "escape"),
+        ("x = 01\n", 1, 5, "leading zero"),
+        ("[unclosed\n", 1, 10, "expected ']'"),
+        ("missing_eq 123\n", 1, 12, "expected '='"),
+    ];
+
+    for (input, exp_line, exp_col, needle) in error_cases {
+        let err = toml_parser::parse(input).expect_err(&format!("must fail: {input:?}"));
+        assert_eq!(err.line, exp_line, "line mismatch for {input:?}: {err}");
+        assert_eq!(err.col, exp_col, "col mismatch for {input:?}: {err}");
+        assert!(
+            err.to_string().contains(&format!("{exp_line}:{exp_col}:"))
+                && err.to_string().to_lowercase().contains(needle),
+            "unexpected error for {input:?}: {err}"
+        );
+    }
+}
+
+// =========================================================================
+// 2. SpawnConfig validation, SecretRef, redaction, and env mapping tests
+// =========================================================================
+
+#[test]
+fn spawn_config_rejects_unknown_fields_and_bad_schema_version() {
+    let wrong_version = r#"
+schema_version = 2
+
+[instance]
+data_dir = "/srv/spawn"
+"#;
+    let err = SpawnConfig::from_toml_str(wrong_version).expect_err("schema_version != 1");
+    assert!(err.contains("schema_version"), "{err}");
+
+    let unknown_top = r#"
+schema_version = 1
+surprise = true
+
+[instance]
+data_dir = "/srv/spawn"
+"#;
+    let err = SpawnConfig::from_toml_str(unknown_top).expect_err("unknown top field");
+    assert!(err.contains("unknown field"), "{err}");
+
+    let unknown_nested = r#"
+schema_version = 1
+
+[instance]
+data_dir = "/srv/spawn"
+
+[sandbox]
+mode = "required"
+extra_flag = 123
+"#;
+    let err = SpawnConfig::from_toml_str(unknown_nested).expect_err("unknown nested field");
+    assert!(err.contains("unknown field"), "{err}");
+
+    let unknown_mount = r#"
+schema_version = 1
+
+[instance]
+data_dir = "/srv/spawn"
+
+[[sandbox.writable_mounts]]
+host = "/srv/shared"
+mode = "rw"
+extra = "nope"
+"#;
+    let err = SpawnConfig::from_toml_str(unknown_mount).expect_err("unknown mount field");
+    assert!(err.contains("unknown field"), "{err}");
+}
+
+#[test]
+fn spawn_config_rejects_plaintext_secrets_with_clear_error() {
+    for snippet in [
+        r#"
+schema_version = 1
+[instance]
+data_dir = "/srv/spawn"
+[database]
+url = "postgres://spawn:plaintext@127.0.0.1:5432/spawn"
+"#,
+        r#"
+schema_version = 1
+[instance]
+data_dir = "/srv/spawn"
+[database]
+host = "127.0.0.1"
+name = "spawn"
+user = "spawn"
+password = "plaintext-password"
+"#,
+        r#"
+schema_version = 1
+[instance]
+data_dir = "/srv/spawn"
+[server]
+auth = "token"
+token = "plaintext-token"
+"#,
+    ] {
+        let err = SpawnConfig::from_toml_str(snippet).expect_err("plaintext secret rejected");
+        assert!(
+            err.contains("from_env")
+                && err.contains("from_file")
+                && err.contains("never plaintext"),
+            "missing helpful secret error: {err}"
+        );
+    }
+}
+
+#[test]
+fn spawn_config_rejects_relative_and_bare_system_data_dirs() {
+    for bad in [
+        "relative/dir",
+        ".",
+        "spawn",
+        "/",
+        "/tmp",
+        "/var",
+        "/var/lib",
+        "/var/tmp",
+        "/home",
+        "/root",
+        "/etc",
+        "/usr",
+        "/opt",
+        "/srv",
+        "/srv/spawn/../other",
+    ] {
+        let toml = format!("schema_version = 1\n[instance]\ndata_dir = \"{bad}\"\n");
+        let err = SpawnConfig::from_toml_str(&toml).expect_err(&format!("reject {bad}"));
+        assert!(err.contains("data_dir"), "bad={bad}: {err}");
+    }
+}
+
+#[test]
+fn spawn_config_validates_terminal_shards_range() {
+    for bad in [0usize, 65] {
+        let toml = format!(
+            "schema_version = 1\n[instance]\ndata_dir = \"/srv/spawn\"\n[terminal]\nshards = {bad}\n"
+        );
+        let err = SpawnConfig::from_toml_str(&toml).expect_err(&format!("reject shards={bad}"));
+        assert!(err.contains("shards"), "bad={bad}: {err}");
+    }
+    let ok = SpawnConfig::from_toml_str(
+        "schema_version = 1\n[instance]\ndata_dir = \"/srv/spawn\"\n[terminal]\nshards = 16\n",
+    )
+    .expect("accept valid shards");
+    assert_eq!(ok.terminal.shards, Some(16));
+}
+
+fn build_full_config_fixture(dir: &Path) -> (SpawnConfig, PathBuf, PathBuf) {
+    let pw_file = dir.join("pg.pw");
+    fs::write(&pw_file, "S3cr3tPgPass!\r\n").expect("write pw file");
+    fs::set_permissions(&pw_file, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    let tok_file = dir.join("serve.tok");
+    fs::write(&tok_file, "Tok3nValueXYZ\n").expect("write token file");
+
+    let toolchain_bin = dir.join("bin");
+    fs::create_dir_all(&toolchain_bin).expect("bin dir");
+    let fake_herdr = toolchain_bin.join("herdr");
+    fs::write(&fake_herdr, "#!/bin/sh\nexit 0\n").expect("write fake herdr");
+    fs::set_permissions(&fake_herdr, fs::Permissions::from_mode(0o755)).expect("chmod herdr");
+
+    let data_dir = dir.join("instance-data");
+    let toml = format!(
+        r#"
+schema_version = 1
+
+[instance]
+name = "alpha"
+data_dir = "{data_dir}"
+default_repo = "/srv/repos/main.git"
+
+[database]
+host = "db.internal"
+port = 5433
+name = "spawn_prod"
+user = "spawn_user"
+password = {{ from_file = "{pw_file}" }}
+
+[server]
+listen = "127.0.0.1:9090"
+auth = "local-open"
+token = {{ from_file = "{tok_file}" }}
+web_dir = "/srv/spawn/web"
+
+[storage]
+workspace_backend = "cow"
+canonical_mount = "/workspace"
+cas_dedup = true
+max_checkpoint_file_mb = 250
+
+[terminal]
+backend = "herdr"
+shards = 16
+toolchain_paths = ["{toolchain_bin}"]
+
+[network]
+http_proxy = "http://127.0.0.1:3128"
+https_proxy = "http://127.0.0.1:3129"
+no_proxy = ["localhost", "127.0.0.1", ".internal"]
+
+[sandbox]
+mode = "required"
+home_isolation = "whitelist"
+auto_approve = "startup"
+
+[[sandbox.writable_mounts]]
+host = "/srv/cache"
+mode = "rw"
+
+[[sandbox.writable_mounts]]
+host = "/srv/models"
+mode = "ro"
+
+[engines.claude]
+enabled = true
+config_dir = "~/.claude-spawn"
+
+[engines.agy]
+enabled = true
+default_model = "gemini-2.5-pro"
+auth_source = "~/.gemini/antigravity-cli"
+isolate_workers = true
+isolate_brain = true
+
+[advanced]
+loop_interval_ms = 250
+screen_quiet_ms = 400
+message_taken_secs = 90
+"#,
+        data_dir = data_dir.display(),
+        pw_file = pw_file.display(),
+        tok_file = tok_file.display(),
+        toolchain_bin = toolchain_bin.display(),
+    );
+
+    let cfg = SpawnConfig::from_toml_str(&toml).expect("parse full config");
+    (cfg, data_dir, toolchain_bin)
+}
+
+#[test]
+fn spawn_config_resolves_core_storage_terminal_and_network_env() {
+    let dir = TempDir::new("resolve-core");
+    let (cfg, data_dir, toolchain_bin) = build_full_config_fixture(dir.path());
+    let fake_env = env_map(&[("HOME", "/home/alice"), ("PATH", "/usr/bin:/bin")]);
+    let resolved = env_as_map(
+        resolve_env_entries_with(&cfg, &|k| fake_env.get(k).cloned()).expect("resolve env"),
+    );
+
+    assert_eq!(
+        resolved["SPAWN_DATABASE_URL"],
+        "postgres://spawn_user:S3cr3tPgPass%21@db.internal:5433/spawn_prod"
+    );
+    assert_eq!(
+        resolved["SPAWN_WORKSPACE_ROOT"],
+        data_dir.join("workspaces").display().to_string()
+    );
+    assert_eq!(resolved["SPAWN_GIT_REPO"], "/srv/repos/main.git");
+    assert_eq!(resolved["SPAWN_SERVE_ADDRESS"], "127.0.0.1:9090");
+    assert_eq!(resolved["SPAWN_SERVE_LOCAL_OPEN"], "1");
+    assert_eq!(resolved["SPAWN_SERVE_TOKEN"], "Tok3nValueXYZ");
+    assert_eq!(resolved["SPAWN_WEB_DIR"], "/srv/spawn/web");
+    assert_eq!(resolved["SPAWN_WORKSPACE_BACKEND"], "cow");
+    assert_eq!(resolved["SPAWN_CAS_DEDUP"], "1");
+    assert_eq!(resolved["SPAWN_MAX_FILE_MB"], "250");
+    assert_eq!(resolved["SPAWN_TERMINAL_BACKEND"], "herdr");
+    assert_eq!(resolved["SPAWN_HERDR_SESSION"], "spawn-alpha");
+    assert_eq!(resolved["SPAWN_HERDR_SHARDS"], "16");
+    assert_eq!(
+        resolved["SPAWN_HERDR_PROGRAM"],
+        toolchain_bin.join("herdr").display().to_string()
+    );
+    assert_eq!(
+        resolved["PATH"],
+        format!("{}:/usr/bin:/bin", toolchain_bin.display())
+    );
+    assert_eq!(resolved["http_proxy"], "http://127.0.0.1:3128");
+    assert_eq!(resolved["HTTP_PROXY"], "http://127.0.0.1:3128");
+    assert_eq!(resolved["https_proxy"], "http://127.0.0.1:3129");
+    assert_eq!(resolved["HTTPS_PROXY"], "http://127.0.0.1:3129");
+    assert_eq!(resolved["no_proxy"], "localhost,127.0.0.1,.internal");
+    assert_eq!(resolved["NO_PROXY"], "localhost,127.0.0.1,.internal");
+}
+
+#[test]
+fn spawn_config_resolves_engines_sandbox_xdg_and_redacts_secrets() {
+    let dir = TempDir::new("resolve-engines");
+    let (cfg, data_dir, _) = build_full_config_fixture(dir.path());
+    let fake_env = env_map(&[("HOME", "/home/alice"), ("PATH", "/usr/bin:/bin")]);
+    let lookup = |k: &str| fake_env.get(k).cloned();
+    let resolved = env_as_map(resolve_env_entries_with(&cfg, &lookup).expect("resolve env"));
+
+    assert_eq!(resolved["SPAWN_ENGINES"], "claude,agy");
+    assert_eq!(
+        resolved["SPAWN_AGY_HOME"],
+        "/home/alice/.gemini/antigravity-cli"
+    );
+    assert_eq!(
+        resolved["SPAWN_AGY_DATA_DIR"],
+        data_dir.join("engines/agy").display().to_string()
+    );
+    assert_eq!(resolved["SPAWN_AGY_MODEL"], "gemini-2.5-pro");
+    assert_eq!(resolved["SPAWN_AGY_ISOLATE_WORKERS"], "1");
+    assert_eq!(resolved["SPAWN_AGY_ISOLATE_BRAIN"], "1");
+    assert_eq!(
+        resolved["SPAWN_CLAUDE_CONFIG_DIR"],
+        "/home/alice/.claude-spawn"
+    );
+    assert_eq!(resolved["SPAWN_ENGINE_VIEW"], "required");
+    assert_eq!(
+        resolved["SPAWN_ENGINE_VIEW_WRITABLE"],
+        "/srv/cache,/srv/models:ro"
+    );
+    assert_eq!(resolved["SPAWN_SANDBOX_CANONICAL_WORKSPACE"], "/workspace");
+    assert_eq!(resolved["SPAWN_SANDBOX_HOME_ISOLATION"], "whitelist");
+    assert_eq!(resolved["SPAWN_AUTO_APPROVE"], "startup");
+    assert_eq!(resolved["SPAWN_LOOP_INTERVAL_MS"], "250");
+    assert_eq!(resolved["SPAWN_SCREEN_QUIET_MS"], "400");
+    assert_eq!(resolved["SPAWN_MESSAGE_TAKEN_SECS"], "90");
+    assert_eq!(
+        resolved["TMPDIR"],
+        data_dir.join("tmp").display().to_string()
+    );
+    assert_eq!(
+        resolved["XDG_CONFIG_HOME"],
+        data_dir.join("xdg-config").display().to_string()
+    );
+    assert_eq!(
+        resolved["XDG_CACHE_HOME"],
+        data_dir.join("xdg-cache").display().to_string()
+    );
+
+    let eff = effective_json_with(&cfg, &lookup).expect("effective json");
+    let eff_text = eff.to_string();
+    assert!(!eff_text.contains("S3cr3tPgPass"), "{eff_text}");
+    assert!(!eff_text.contains("Tok3nValueXYZ"), "{eff_text}");
+    assert_eq!(
+        eff["env"]["SPAWN_DATABASE_URL"],
+        json!("postgres://spawn_user:***@db.internal:5433/spawn_prod")
+    );
+    assert_eq!(eff["env"]["SPAWN_SERVE_TOKEN"], json!("***"));
+}
+
+#[test]
+fn from_env_secret_and_empty_from_file_are_handled_cleanly() {
+    let dir = TempDir::new("empty-secret");
+    let empty_file = dir.path().join("empty.secret");
+    fs::write(&empty_file, "\r\n").expect("write empty secret");
+
+    let toml_env = r#"
+schema_version = 1
+
+[instance]
+data_dir = "/srv/spawn-instance"
+
+[database]
+url = { from_env = "MY_DB_URL" }
+"#;
+    let cfg = SpawnConfig::from_toml_str(toml_env).expect("parse from_env");
+    let present = env_map(&[(
+        "MY_DB_URL",
+        "postgres://u:TopSecretFromEnv@localhost:5432/db",
+    )]);
+    let resolved =
+        env_as_map(resolve_env_entries_with(&cfg, &|k| present.get(k).cloned()).expect("resolve"));
+    assert_eq!(
+        resolved["SPAWN_DATABASE_URL"],
+        "postgres://u:TopSecretFromEnv@localhost:5432/db"
+    );
+
+    let eff = effective_json_with(&cfg, &|k| present.get(k).cloned()).expect("eff");
+    assert!(!eff.to_string().contains("TopSecretFromEnv"), "{eff}");
+    assert_eq!(
+        eff["env"]["SPAWN_DATABASE_URL"],
+        json!("postgres://u:***@localhost:5432/db")
+    );
+
+    // Unset env var fails cleanly
+    let missing_err = resolve_env_entries_with(&cfg, &|_| None).expect_err("missing env");
+    assert!(missing_err.contains("MY_DB_URL"), "{missing_err}");
+
+    // Empty secret file fails cleanly
+    let toml_empty = format!(
+        "schema_version = 1\n[instance]\ndata_dir = \"/srv/spawn-instance\"\n[server]\nauth = \"token\"\ntoken = {{ from_file = \"{}\" }}\n",
+        empty_file.display()
+    );
+    let cfg_empty = SpawnConfig::from_toml_str(&toml_empty).expect("parse");
+    let empty_err = resolve_env_entries_with(&cfg_empty, &|_| None).expect_err("empty file");
+    assert!(empty_err.contains("empty"), "{empty_err}");
+}
+
+// =========================================================================
+// 3. End-to-end binary tests (CARGO_BIN_EXE_spawn)
+// =========================================================================
+
+struct CliFixture {
+    dir: TempDir,
+    data_dir: PathBuf,
+    cfg_path: PathBuf,
+    db_secret: &'static str,
+    token_secret: &'static str,
+}
+
+impl CliFixture {
+    fn new(name: &str) -> Self {
+        let dir = TempDir::new(name);
+        let data_dir = dir.path().join("spawn-data-uncreated");
+        let secret_file = dir.path().join("db.secret");
+        let db_secret = "UltraSecretDbPass_98765";
+        let token_secret = "UltraSecretServeToken_54321";
+        fs::write(&secret_file, format!("{db_secret}\r\n")).expect("write secret file");
+        fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        let cfg_path = dir.path().join("spawn.toml");
+        let toml = format!(
+            r#"
+schema_version = 1
+
+[instance]
+name = "e2e"
+data_dir = "{data_dir}"
+
+[database]
+host = "127.0.0.1"
+port = 1
+name = "spawn_e2e"
+user = "spawn"
+password = {{ from_file = "{secret_file}" }}
+
+[server]
+listen = "127.0.0.1:8888"
+auth = "token"
+token = {{ from_env = "E2E_SERVE_TOKEN" }}
+
+[engines.agy]
+enabled = true
+default_model = "gemini-2.5-flash"
+"#,
+            data_dir = data_dir.display(),
+            secret_file = secret_file.display(),
+        );
+        fs::write(&cfg_path, toml).expect("write spawn.toml");
+        Self {
+            dir,
+            data_dir,
+            cfg_path,
+            db_secret,
+            token_secret,
+        }
+    }
+
+    fn cfg_str(&self) -> &str {
+        self.cfg_path.to_str().expect("utf-8")
+    }
+}
+
+#[test]
+fn cli_config_check_and_effective_redact_secrets() {
+    let fx = CliFixture::new("e2e-check");
+
+    let check_out = spawn_bin(
+        &["--config", fx.cfg_str(), "config", "check", "--json"],
+        &[("E2E_SERVE_TOKEN", fx.token_secret)],
+    );
+    let check_stdout = String::from_utf8_lossy(&check_out.stdout);
+    let check_stderr = String::from_utf8_lossy(&check_out.stderr);
+    assert_eq!(
+        check_out.status.code(),
+        Some(0),
+        "stdout={check_stdout}\nstderr={check_stderr}"
+    );
+    let check_json: Value = serde_json::from_str(&check_stdout).expect("check JSON");
+    assert_eq!(check_json["ok"], json!(true), "{check_json}");
+    assert_eq!(check_json["errors"], json!([]), "{check_json}");
+    assert!(
+        !fx.data_dir.exists(),
+        "config check must stay read-only and not create data_dir"
+    );
+
+    let eff_out = spawn_bin(
+        &["--config", fx.cfg_str(), "config", "effective", "--json"],
+        &[("E2E_SERVE_TOKEN", fx.token_secret)],
+    );
+    let eff_stdout = String::from_utf8_lossy(&eff_out.stdout);
+    let eff_stderr = String::from_utf8_lossy(&eff_out.stderr);
+    assert_eq!(
+        eff_out.status.code(),
+        Some(0),
+        "stdout={eff_stdout}\nstderr={eff_stderr}"
+    );
+    assert!(!eff_stdout.contains(fx.db_secret) && !eff_stderr.contains(fx.db_secret));
+    assert!(!eff_stdout.contains(fx.token_secret) && !eff_stderr.contains(fx.token_secret));
+    let eff_json: Value = serde_json::from_str(&eff_stdout).expect("effective JSON");
+    assert_eq!(
+        eff_json["env"]["SPAWN_DATABASE_URL"],
+        json!("postgres://spawn:***@127.0.0.1:1/spawn_e2e")
+    );
+    assert_eq!(eff_json["env"]["SPAWN_SERVE_TOKEN"], json!("***"));
+    assert_eq!(
+        eff_json["env"]["SPAWN_SANDBOX_CANONICAL_WORKSPACE"],
+        json!("/workspace")
+    );
+    assert_eq!(
+        eff_json["env"]["SPAWN_SANDBOX_HOME_ISOLATION"],
+        json!("whitelist")
+    );
+    assert_eq!(
+        eff_json["env"]["SPAWN_AGY_DATA_DIR"],
+        json!(fx.data_dir.join("engines/agy").display().to_string())
+    );
+    assert_eq!(eff_json["env"]["SPAWN_AGY_ISOLATE_BRAIN"], json!("1"));
+}
+
+#[test]
+fn cli_doctor_init_and_global_config_exec() {
+    let fx = CliFixture::new("e2e-doctor");
+
+    let doc_out = spawn_bin(
+        &["--config", fx.cfg_str(), "doctor", "--json"],
+        &[("E2E_SERVE_TOKEN", fx.token_secret)],
+    );
+    let doc_stdout = String::from_utf8_lossy(&doc_out.stdout);
+    let doc_stderr = String::from_utf8_lossy(&doc_out.stderr);
+    assert_eq!(
+        doc_out.status.code(),
+        Some(0),
+        "stdout={doc_stdout}\nstderr={doc_stderr}"
+    );
+    let doc_json: Value = serde_json::from_str(&doc_stdout).expect("doctor JSON");
+    assert!(
+        doc_json["kernel"]["release"].as_str().is_some(),
+        "{doc_json}"
+    );
+    assert!(doc_json["tools"]["git"].is_object(), "{doc_json}");
+    assert!(doc_json["tools"]["herdr"].is_object(), "{doc_json}");
+    assert!(doc_json["tools"]["bwrap"].is_object(), "{doc_json}");
+    assert!(doc_json["tools"]["zstd"].is_object(), "{doc_json}");
+    assert!(doc_json["filesystems"]["root"].is_object(), "{doc_json}");
+    assert_eq!(
+        doc_json["storage_probes"]["probed"],
+        json!(true),
+        "{doc_json}"
+    );
+
+    let init_data_dir = fx.dir.path().join("init-data");
+    let init_toml = fx.dir.path().join("generated.toml");
+    let init_out = spawn_bin(
+        &[
+            "config",
+            "init",
+            "--data-dir",
+            init_data_dir.to_str().expect("utf-8"),
+            "--name",
+            "prod1",
+            "--output",
+            init_toml.to_str().expect("utf-8"),
+        ],
+        &[],
+    );
+    assert_eq!(init_out.status.code(), Some(0));
+    let check_init = spawn_bin(
+        &[
+            "config",
+            "check",
+            "--config",
+            init_toml.to_str().expect("utf-8"),
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(check_init.status.code(), Some(0));
+    let init_rendered = fs::read_to_string(&init_toml).expect("read init toml");
+    assert!(
+        init_rendered.contains("listen = \"127.0.0.1:8787\""),
+        "{init_rendered}"
+    );
+    assert!(
+        init_rendered.contains("auto_approve = \"startup\""),
+        "{init_rendered}"
+    );
+
+    let fleet_out = spawn_bin(
+        &["--config", fx.cfg_str(), "fleet"],
+        &[("E2E_SERVE_TOKEN", fx.token_secret)],
+    );
+    let fleet_stderr = String::from_utf8_lossy(&fleet_out.stderr);
+    assert_eq!(fleet_out.status.code(), Some(1), "{fleet_stderr}");
+    assert!(
+        !fleet_stderr.contains("SPAWN_DATABASE_URL is not set"),
+        "expected --config to inject SPAWN_DATABASE_URL before fleet ran: {fleet_stderr}"
+    );
+
+    let bad_cfg = fx.dir.path().join("bad.toml");
+    fs::write(
+        &bad_cfg,
+        "schema_version = 1\n[instance]\ndata_dir = \"/tmp\"\n",
+    )
+    .expect("bad");
+    let bad_out = spawn_bin(
+        &[
+            "config",
+            "check",
+            "--config",
+            bad_cfg.to_str().expect("utf-8"),
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(bad_out.status.code(), Some(1));
+    let bad_json: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&bad_out.stdout)).expect("bad check JSON");
+    assert_eq!(bad_json["ok"], json!(false));
+    assert!(!bad_json["errors"].as_array().unwrap().is_empty());
+
+    let help_out = spawn_bin(
+        &["--config", bad_cfg.to_str().expect("utf-8"), "--help"],
+        &[],
+    );
+    assert_eq!(help_out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&help_out.stdout).starts_with("usage: spawn <init-db|"));
+}
+
+#[test]
+fn spawn_config_sandbox_defaults_startup_and_rejects_safe() {
+    let dir = TempDir::new("sandbox-startup");
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(&data_dir).expect("data dir");
+
+    let default_toml = format!(
+        "schema_version = 1\n[instance]\nname = \"s1\"\ndata_dir = \"{}\"\n",
+        data_dir.display()
+    );
+    let cfg = SpawnConfig::from_toml_str(&default_toml).expect("default config");
+    assert_eq!(cfg.sandbox.auto_approve.as_deref(), Some("startup"));
+    let resolved =
+        env_as_map(resolve_env_entries_with(&cfg, &|_| None).expect("resolve default env"));
+    assert_eq!(resolved["SPAWN_AUTO_APPROVE"], "startup");
+
+    for valid in ["off", "startup", "all"] {
+        let doc = format!("{default_toml}\n[sandbox]\nauto_approve = \"{valid}\"\n");
+        let parsed = SpawnConfig::from_toml_str(&doc).expect(valid);
+        assert_eq!(parsed.sandbox.auto_approve.as_deref(), Some(valid));
+    }
+
+    let safe_doc = format!("{default_toml}\n[sandbox]\nauto_approve = \"safe\"\n");
+    let err = SpawnConfig::from_toml_str(&safe_doc).expect_err("safe must be rejected");
+    assert!(err.contains("[sandbox].auto_approve"), "{err}");
+    assert!(err.contains("startup"), "{err}");
+}
+
+#[test]
+fn spawn_config_rejects_proxy_userinfo_and_redacts_effective_json() {
+    let dir = TempDir::new("proxy-redact");
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(&data_dir).expect("data dir");
+
+    for (field, url, secret) in [
+        (
+            "http_proxy",
+            "http://alice:Pr0xyPass!@proxy.local:3128",
+            "Pr0xyPass!",
+        ),
+        (
+            "https_proxy",
+            "http://TokOnlySecret@proxy.local:3129",
+            "TokOnlySecret",
+        ),
+    ] {
+        let doc = format!(
+            "schema_version = 1\n[instance]\nname = \"p\"\ndata_dir = \"{}\"\n[network]\n{field} = \"{url}\"\n",
+            data_dir.display()
+        );
+        let err = SpawnConfig::from_toml_str(&doc).expect_err("embedded proxy creds rejected");
+        assert!(err.contains(field), "{err}");
+        assert!(!err.contains(secret), "error must not echo secret: {err}");
+    }
+
+    let base_doc = format!(
+        "schema_version = 1\n[instance]\nname = \"p\"\ndata_dir = \"{}\"\n",
+        data_dir.display()
+    );
+    let mut cfg = SpawnConfig::from_toml_str(&base_doc).expect("base config");
+    cfg.network.http_proxy = Some("http://alice:Pr0xyPass!@proxy.local:3128".to_string());
+    cfg.network.https_proxy = Some("http://TokOnlySecret@proxy.local:3129".to_string());
+
+    let eff_err = effective_json_with(&cfg, &|_| None)
+        .expect_err("effective_json_with refuses embedded userinfo");
+    assert!(
+        !eff_err.contains("Pr0xyPass!") && !eff_err.contains("TokOnlySecret"),
+        "{eff_err}"
+    );
+
+    let masked_cfg = config_file::redacted_config_for_display(&cfg);
+    assert_eq!(
+        masked_cfg.network.http_proxy.as_deref(),
+        Some("http://alice:***@proxy.local:3128")
+    );
+    assert_eq!(
+        masked_cfg.network.https_proxy.as_deref(),
+        Some("http://***@proxy.local:3129")
+    );
+
+    cfg.network.http_proxy = Some("http://proxy.local:3128?password=QueryPass99".to_string());
+    cfg.network.https_proxy = Some("http://proxy.local:3129?token=QueryTok88".to_string());
+    let eff = effective_json_with(&cfg, &|_| None).expect("effective json");
+    let eff_text = eff.to_string();
+    assert!(!eff_text.contains("QueryPass99"), "{eff_text}");
+    assert!(!eff_text.contains("QueryTok88"), "{eff_text}");
+    assert_eq!(
+        eff["config"]["network"]["http_proxy"],
+        json!("http://proxy.local:3128?password=***")
+    );
+    assert_eq!(
+        eff["config"]["network"]["https_proxy"],
+        json!("http://proxy.local:3129?token=***")
+    );
+    assert_eq!(
+        eff["env"]["http_proxy"],
+        json!("http://proxy.local:3128?password=***")
+    );
+    assert_eq!(
+        eff["env"]["https_proxy"],
+        json!("http://proxy.local:3129?token=***")
+    );
+}
+
+#[test]
+fn toml_parser_rejects_excessive_nesting_depth() {
+    let ok_arrays = format!("a = {}1{}", "[".repeat(16), "]".repeat(16));
+    assert!(toml_parser::parse(&ok_arrays).is_ok());
+
+    let deep_arrays = format!("a = {}1{}", "[".repeat(70), "]".repeat(70));
+    let err_arr = toml_parser::parse(&deep_arrays).expect_err("deep array rejected");
+    assert!(err_arr.message.contains("depth"), "{err_arr}");
+
+    let deep_tables = format!("t = {}{}{}", "{ a = ".repeat(70), "1", " }".repeat(70));
+    let err_tbl = toml_parser::parse(&deep_tables).expect_err("deep inline table rejected");
+    assert!(err_tbl.message.contains("depth"), "{err_tbl}");
+}
