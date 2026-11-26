@@ -2,11 +2,7 @@
 
 [English README](../README.md) · [中文 README](../README.zh-CN.md) · [技术方案与接口契约](./design.md) · [视图层设计](./view-architecture.md) · [舰队架构](./fleet-architecture.md) · [存储](./storage.md) · [RSI](./rsi.md) · [升级](./upgrading.md)
 
-<<<<<<< b80be79318a700057d81d403b4b1d749e3ac3ca1
-结论：Spawn 用 9 个 Rust crate（`spawn-core`、`spawn-postgres`、`spawn-host`、`spawn-cas`、`spawn-jev`、`spawn-kdf`、`spawn-codegraph`、`spawn-node-proto`、`spawn-cli`）连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件、对外提供 SQL 视图并以 `LISTEN/NOTIFY` 发出变更提示，Jev 判定语义状态，`spawn` 二进制做装配并提供 Thin Web + PWA 控制面（`spawn serve`）。Spawn 自己的源码全部同步阻塞，不写 async（见第 10 节：`postgres` 驱动内部链接了 `tokio`）。
-=======
-结论：Spawn 用 9 个 Rust crate（`spawn-core`、`spawn-postgres`、`spawn-host`、`spawn-jev`、`spawn-kdf`、`spawn-codegraph`、`spawn-node-proto`、`spawn-node-gateway`、`spawn-cli`）连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件、对外提供 SQL 视图并以 `LISTEN/NOTIFY` 发出变更提示，Jev 判定语义状态，`spawn` 二进制做装配并提供 Thin Web + PWA 控制面（`spawn serve`）。Spawn 自己的源码全部同步阻塞，不写 async（见第 10 节：`postgres` 驱动内部链接了 `tokio`）。
->>>>>>> a1a306fd97bb40d6dac8092e151d3eab6ae04bda
+结论：Spawn 用 10 个 Rust crate（`spawn-core`、`spawn-postgres`、`spawn-host`、`spawn-cas`、`spawn-jev`、`spawn-kdf`、`spawn-codegraph`、`spawn-node-proto`、`spawn-node-gateway`、`spawn-cli`）连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件、对外提供 SQL 视图并以 `LISTEN/NOTIFY` 发出变更提示，Jev 判定语义状态，`spawn` 二进制做装配并提供 Thin Web + PWA 控制面（`spawn serve`）。Spawn 自己的源码全部同步阻塞，不写 async（见第 10 节：`postgres` 驱动内部链接了 `tokio`）。
 
 ## 1. 能力与边界
 
@@ -66,11 +62,7 @@ flowchart LR
   gw --> pg
 ```
 
-<<<<<<< b80be79318a700057d81d403b4b1d749e3ac3ca1
-依赖单向：只有 `spawn-cli` 同时依赖各实现层；实现层之间的依赖只有两条：`spawn-postgres` 用 `spawn-kdf` 派生登录口令，`spawn-host` 的 `cas_dedup` 把块存进 `spawn-cas`。
-=======
-依赖单向：只有 `spawn-cli` 同时依赖各实现层；实现层之间唯一的依赖是 `spawn-postgres` 用 `spawn-kdf` 派生登录口令。`spawn-node-gateway` 是另一个二进制，只依赖 `spawn-node-proto` 与 `spawn-postgres`。
->>>>>>> a1a306fd97bb40d6dac8092e151d3eab6ae04bda
+依赖单向：只有 `spawn-cli` 同时依赖各实现层；实现层之间的依赖只有两条：`spawn-postgres` 用 `spawn-kdf` 派生登录口令，`spawn-host` 的 `cas_dedup` 把块存进 `spawn-cas`。`spawn-node-gateway` 是另一个二进制，只依赖 `spawn-node-proto` 与 `spawn-postgres`。
 
 ## 3. 一次任务的链路
 
