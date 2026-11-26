@@ -18,7 +18,7 @@
 
 Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎。
 
-`spawn serve` 提供 Thin Web + PWA 控制面（默认绑 127.0.0.1，非回环地址必须设 `SPAWN_SERVE_TOKEN`；`SPAWN_SERVE_OPEN_NETWORKS` 列出的内网网段内、以该网段 IP 地址访问的客户端免 token）：31 个 GET 路由模式和 9 个 POST 路由。GET 包括看板、事件查询、`GET /api/stream` 的 SSE 实时事件流，以及把任务、落地、验证和部署分成 planned / implemented / verified / live 四态的能力图（`/api/features`、`#/features`，见 [feature-map.md](./feature-map.md)）。POST 中 7 个是人的写入，都以 `spawn_human` 登录调用对应的 `spawn_human_*` 函数：对会话的输入、按键、给 supervisor 的消息、对审批提示的回答（`spawn_human_input`、`spawn_human_key`、`spawn_human_master_message`）经 `spawn_submit` 提交 principal 为 `human` 的命令；停滞 worker 的重启与改派（`spawn_human_task`）调用 `spawn_task_restart_as` / `spawn_task_reassign_as`，写 `task.restarted` 等控制记录，`by` 为 `human`；停摆任务的恢复（`spawn_human_resume`）写一条 `mission.resumed` 记录。另 2 个是能力图的重新扫描与文件关联。完整路由表、方法与 CLI 对应见 [api.md](./api.md)（`serve.rs` 的测试保持两者一致）。发给 agent 会话的命令仍只经 `spawn_submit` 入队、由 Bridge 执行。
+`spawn serve` 提供 Thin Web + PWA 控制面（默认绑 127.0.0.1，非回环地址必须设 `SPAWN_SERVE_TOKEN`；`SPAWN_SERVE_OPEN_NETWORKS` 列出的内网网段内、以该网段 IP 地址访问的客户端免 token）：32 个 GET 路由模式和 9 个 POST 路由。GET 包括看板、事件查询、`GET /api/stream` 的 SSE 实时事件流，以及把任务、落地、验证和部署分成 planned / implemented / verified / live 四态的能力图（`/api/features`、`#/features`，见 [feature-map.md](./feature-map.md)）。POST 中 7 个是人的写入，都以 `spawn_human` 登录调用对应的 `spawn_human_*` 函数：对会话的输入、按键、给 supervisor 的消息、对审批提示的回答（`spawn_human_input`、`spawn_human_key`、`spawn_human_master_message`）经 `spawn_submit` 提交 principal 为 `human` 的命令；停滞 worker 的重启与改派（`spawn_human_task`）调用 `spawn_task_restart_as` / `spawn_task_reassign_as`，写 `task.restarted` 等控制记录，`by` 为 `human`；停摆任务的恢复（`spawn_human_resume`）写一条 `mission.resumed` 记录。另 2 个是能力图的重新扫描与文件关联。完整路由表、方法与 CLI 对应见 [api.md](./api.md)（`serve.rs` 的测试保持两者一致）。发给 agent 会话的命令仍只经 `spawn_submit` 入队、由 Bridge 执行。
 
 ## 2. crate 结构
 
@@ -150,7 +150,7 @@ spawn fleet
 | `run` | 在终端内启动引擎，退出时把退出码写入 `SPAWN_EXIT_FILE`（Bridge 读到后写 `execution.ended{Exited}`），转发退出码；不连数据库 |
 | `loop` | 常驻：每 500 ms 跑一轮 Bridge、Observer、派发与存活规则（`SPAWN_LOOP_INTERVAL_MS`） |
 | `integrate` | 常驻：对已验收任务跑黑盒门禁，宿主机提交并以 CAS 前移来源基线 |
-| `serve` | 常驻：Thin Web + PWA 控制面，31 个 GET 路由模式和 9 个 POST 路由（[api.md](./api.md)） |
+| `serve` | 常驻：Thin Web + PWA 控制面，32 个 GET 路由模式和 9 个 POST 路由（[api.md](./api.md)） |
 | `scorecard` | 只读记录，一次量出八个维度（吞吐、前导时间、一次通过率、返工、自主、可靠、成本、门禁耗时），带 n、方向、上一窗口与趋势（[design.md](design.md) §15） |
 | `mission` / `task` / `resident` | 任务域控制流：添加、配置、关闭、恢复任务，分派与验收子任务，提议、批准、退役常驻 worker |
 | `fleet` / `tail` | 舰队概览（每个会话及其判定）、单个会话的判定与事件尾随 |
