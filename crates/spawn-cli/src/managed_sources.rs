@@ -111,7 +111,9 @@ fn parse_named_flags(tail: &[String]) -> Result<(String, Flags), String> {
     let flags = Flags::parse_with_switches(flag_args, &["json"])?;
     let name = match (positional, flags.get("name")) {
         (Some(pos), Some(flag)) if pos != flag => {
-            return Err(format!("conflicting source names `{pos}` and `--name {flag}`"));
+            return Err(format!(
+                "conflicting source names `{pos}` and `--name {flag}`"
+            ));
         }
         (Some(pos), _) => pos,
         (None, Some(flag)) => flag,
@@ -128,9 +130,9 @@ pub(crate) fn validate_slug(name: &str) -> Result<(), String> {
         && !name.starts_with('.')
         && !name.starts_with('-')
         && !name.contains("..")
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'));
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        });
     if !valid {
         return Err(format!(
             "source name {name:?} must match [a-z0-9][a-z0-9._-]{{0,63}} without `..`"
@@ -200,7 +202,10 @@ fn classify_origin(raw: &str) -> Result<IngestOrigin, String> {
     }
     let abs = std::path::absolute(trimmed).map_err(|e| format!("resolve path {trimmed:?}: {e}"))?;
     if !abs.exists() {
-        return Err(format!("local source path {} does not exist", abs.display()));
+        return Err(format!(
+            "local source path {} does not exist",
+            abs.display()
+        ));
     }
     Ok(IngestOrigin::LocalDir(abs))
 }
@@ -315,8 +320,7 @@ pub(crate) fn list(root: &Path) -> Result<Vec<Value>, String> {
         return Ok(Vec::new());
     }
     let mut names = Vec::new();
-    let entries =
-        fs::read_dir(root).map_err(|e| format!("read {}: {e}", root.display()))?;
+    let entries = fs::read_dir(root).map_err(|e| format!("read {}: {e}", root.display()))?;
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         let Some(file) = path.file_name().and_then(|f| f.to_str()) else {
@@ -327,10 +331,7 @@ pub(crate) fn list(root: &Path) -> Result<Vec<Value>, String> {
         }
     }
     names.sort();
-    names
-        .into_iter()
-        .map(|name| show(root, &name))
-        .collect()
+    names.into_iter().map(|name| show(root, &name)).collect()
 }
 
 /// Show detailed metadata and live `main` head of internal source `name`.
@@ -530,7 +531,11 @@ fn ingest_local_dir(
     }
     let tmp = TempWorkDir::new(&format!("spawn-source-ingest-{name}"))?;
     copy_dir_excluding_git(local, tmp.path())?;
-    commit_dir_to_bare(tmp.path(), bare, &format!("Initialize internal source {name}"))
+    commit_dir_to_bare(
+        tmp.path(),
+        bare,
+        &format!("Initialize internal source {name}"),
+    )
 }
 
 fn fetch_remote_into_main(bare: &Path, url: &str, branch: Option<&str>) -> Result<(), String> {
@@ -559,8 +564,7 @@ fn seed_internal_repo(
 ) -> Result<(), String> {
     let tmp = TempWorkDir::new(&format!("spawn-source-seed-{name}"))?;
     let readme = format!("# {name}\n\nKind: {kind}\n\n{description}\n");
-    fs::write(tmp.path().join("README.md"), readme)
-        .map_err(|e| format!("write README.md: {e}"))?;
+    fs::write(tmp.path().join("README.md"), readme).map_err(|e| format!("write README.md: {e}"))?;
     let manifest = json!({
         "v": 1,
         "name": name,
@@ -572,7 +576,11 @@ fn seed_internal_repo(
         serde_json::to_string_pretty(&manifest).unwrap_or_default() + "\n",
     )
     .map_err(|e| format!("write SOURCE.json: {e}"))?;
-    commit_dir_to_bare(tmp.path(), bare, &format!("Initialize internal source {name}"))
+    commit_dir_to_bare(
+        tmp.path(),
+        bare,
+        &format!("Initialize internal source {name}"),
+    )
 }
 
 fn commit_dir_to_bare(work: &Path, bare: &Path, message: &str) -> Result<(), String> {
@@ -740,10 +748,16 @@ mod tests {
         assert_eq!(created["kind"], json!("task"));
         assert_eq!(created["upstream"], json!(null));
         assert!(sources_root.join("internal-ledger.git/HEAD").is_file());
-        assert!(sources_root.join("internal-ledger.scenarios/verify.sh").is_file());
-        assert!(sources_root
-            .join("internal-ledger.scenarios/no-test-database")
-            .is_file());
+        assert!(
+            sources_root
+                .join("internal-ledger.scenarios/verify.sh")
+                .is_file()
+        );
+        assert!(
+            sources_root
+                .join("internal-ledger.scenarios/no-test-database")
+                .is_file()
+        );
 
         // 2. Local plain non-git directory ingest + list + show + sync + export.
         let local_proj = scratch.join("local-proj");
@@ -770,7 +784,8 @@ mod tests {
 
         // Modify local dir and sync into internal store.
         std::fs::write(local_proj.join("hello.txt"), "v2\n").expect("write v2");
-        let sync_flags = Flags::parse(&["--sources-root".to_string(), root_arg.clone()]).expect("sync");
+        let sync_flags =
+            Flags::parse(&["--sources-root".to_string(), root_arg.clone()]).expect("sync");
         let synced = sync("local-proj", &sync_flags).expect("sync");
         assert_ne!(synced["head"], ingested["head"]);
 

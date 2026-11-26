@@ -1255,9 +1255,12 @@ mod tests {
         std::fs::create_dir_all(&staging).expect("staging");
         view.config.extra_writable = vec![staging.clone()];
         let planned = plan(&view, &workspace, &engine_home).expect("outside home allowed");
-        assert!(planned.words.windows(3).any(|w| {
-            w[0] == "--bind" && w[1] == staging.to_string_lossy() && w[2] == w[1]
-        }));
+        assert!(
+            planned
+                .words
+                .windows(3)
+                .any(|w| { w[0] == "--bind" && w[1] == staging.to_string_lossy() && w[2] == w[1] })
+        );
 
         let bad_in_home = view.config.home.join(".ssh");
         std::fs::create_dir_all(&bad_in_home).expect("ssh");
@@ -1282,8 +1285,11 @@ mod tests {
         for (rel, body) in seeds {
             std::fs::write(host_home.join(rel), body).expect("seed");
         }
-        std::fs::write(host_home.join("antigravity-oauth-token"), "top-secret-token")
-            .expect("oauth");
+        std::fs::write(
+            host_home.join("antigravity-oauth-token"),
+            "top-secret-token",
+        )
+        .expect("oauth");
 
         let ws2 = scratch.join("ws-two");
         std::fs::create_dir_all(&ws2).expect("ws2");

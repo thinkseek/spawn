@@ -1936,7 +1936,11 @@ impl HerdrPool {
     ///
     /// When `shards` is outside `1..=MAX_SHARDS`, or `base_session` cannot name
     /// Spawn's herdr session.
-    pub fn on_session(program: &str, base_session: &str, shards: usize) -> Result<Self, TerminalError> {
+    pub fn on_session(
+        program: &str,
+        base_session: &str,
+        shards: usize,
+    ) -> Result<Self, TerminalError> {
         if !(1..=MAX_SHARDS).contains(&shards) {
             return Err(TerminalError(format!(
                 "herdr shard count must be between 1 and {MAX_SHARDS}, not {shards}"
@@ -1962,8 +1966,7 @@ impl HerdrPool {
         if let Some(first) = self.shards.first_mut() {
             let shard = std::mem::replace(
                 first,
-                HerdrHost::on_session("herdr", DEFAULT_SESSION)
-                    .expect("DEFAULT_SESSION is valid"),
+                HerdrHost::on_session("herdr", DEFAULT_SESSION).expect("DEFAULT_SESSION is valid"),
             );
             *first = shard.with_files_beneath(projects);
         }
@@ -2116,9 +2119,9 @@ impl TerminalHost for HerdrPool {
                 }));
             }
             for handle in handles {
-                let part = handle
-                    .join()
-                    .map_err(|_| TerminalError("herdr pool runners thread panicked".to_string()))??;
+                let part = handle.join().map_err(|_| {
+                    TerminalError("herdr pool runners thread panicked".to_string())
+                })??;
                 collected.extend(part);
             }
             Ok(())
@@ -2136,7 +2139,8 @@ impl TerminalHost for HerdrPool {
         workspace: &WorkspaceId,
         lines: usize,
     ) -> Result<String, TerminalError> {
-        self.shard(terminal).capture_tail(terminal, workspace, lines)
+        self.shard(terminal)
+            .capture_tail(terminal, workspace, lines)
     }
 
     fn terminate(
@@ -2753,11 +2757,26 @@ mod tests {
             assert_eq!(idx, pool.shard_index(&term));
             counts[idx] += 1;
         }
-        assert!(counts.iter().all(|&c| c > 0), "all shards should be hit: {counts:?}");
+        assert!(
+            counts.iter().all(|&c| c > 0),
+            "all shards should be hit: {counts:?}"
+        );
 
-        assert_eq!(launch_clear_limit_from(None), std::time::Duration::from_secs(3));
-        assert_eq!(launch_clear_limit_from(Some("500")), std::time::Duration::from_millis(500));
-        assert_eq!(launch_clear_limit_from(Some("50")), std::time::Duration::from_secs(3));
-        assert_eq!(launch_clear_limit_from(Some("99999")), std::time::Duration::from_secs(3));
+        assert_eq!(
+            launch_clear_limit_from(None),
+            std::time::Duration::from_secs(3)
+        );
+        assert_eq!(
+            launch_clear_limit_from(Some("500")),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            launch_clear_limit_from(Some("50")),
+            std::time::Duration::from_secs(3)
+        );
+        assert_eq!(
+            launch_clear_limit_from(Some("99999")),
+            std::time::Duration::from_secs(3)
+        );
     }
 }

@@ -120,7 +120,10 @@ fn the_gate_cap_is_one_and_more_needs_a_server_per_gate() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("tmp scenarios");
     let default_gate = tmp.join("default-gate.sh");
-    assert_eq!(super::resolve_gate_script(&default_gate, &tmp), default_gate);
+    assert_eq!(
+        super::resolve_gate_script(&default_gate, &tmp),
+        default_gate
+    );
     let override_gate = tmp.join("gate.sh");
     std::fs::write(&override_gate, "#!/bin/sh\n").expect("override");
     assert_eq!(

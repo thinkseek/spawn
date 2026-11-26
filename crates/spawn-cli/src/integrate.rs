@@ -787,8 +787,7 @@ pub(crate) fn gate_slots_with(
     else {
         return Ok(DEFAULT_GATES);
     };
-    let concurrent_safe =
-        per_gate.map(str::trim) == Some("1") || no_db.map(str::trim) == Some("1");
+    let concurrent_safe = per_gate.map(str::trim) == Some("1") || no_db.map(str::trim) == Some("1");
     match text.trim().parse::<usize>() {
         Ok(1) => Ok(1),
         Ok(slots) if (2..=MAX_GATES).contains(&slots) => {

@@ -7,5 +7,8 @@
 fn clock_ticks_survives_undumpable_process() {
     spawn_host::undumpable().expect("set PR_SET_DUMPABLE=0");
     let hertz = rustix::param::clock_ticks_per_second();
-    assert!(hertz > 0, "clock_ticks_per_second must be positive, got {hertz}");
+    assert!(
+        hertz > 0,
+        "clock_ticks_per_second must be positive, got {hertz}"
+    );
 }

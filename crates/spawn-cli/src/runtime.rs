@@ -169,14 +169,18 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.claude_projects = claude_projects();
     config.engines = engines(env_value)?;
-    config.max_commands_per_tick = parse_bounded_usize(&env_value, "SPAWN_BRIDGE_MAX_COMMANDS", 16, 1, 512)?;
-    config.ready_attempts = parse_bounded_usize(&env_value, "SPAWN_BRIDGE_READY_ATTEMPTS", 40, 1, 240)?;
-    config.max_concurrent_mounts = parse_bounded_usize(&env_value, "SPAWN_MAX_CONCURRENT_MOUNTS", 8, 1, 128)?;
+    config.max_commands_per_tick =
+        parse_bounded_usize(&env_value, "SPAWN_BRIDGE_MAX_COMMANDS", 16, 1, 512)?;
+    config.ready_attempts =
+        parse_bounded_usize(&env_value, "SPAWN_BRIDGE_READY_ATTEMPTS", 40, 1, 240)?;
+    config.max_concurrent_mounts =
+        parse_bounded_usize(&env_value, "SPAWN_MAX_CONCURRENT_MOUNTS", 8, 1, 128)?;
     config.max_concurrent_checkpoints =
         parse_bounded_usize(&env_value, "SPAWN_MAX_CONCURRENT_CHECKPOINTS", 8, 1, 128)?;
     config.backstops_per_pass =
         parse_bounded_usize(&env_value, "SPAWN_BRIDGE_BACKSTOPS_PER_PASS", 2, 1, 64)?;
-    config.session_scan_limit = parse_bounded_usize(&env_value, "SPAWN_LIST_DIRS_LIMIT", 64, 64, 4096)?;
+    config.session_scan_limit =
+        parse_bounded_usize(&env_value, "SPAWN_LIST_DIRS_LIMIT", 64, 64, 4096)?;
     // An engine with no deny rules of its own runs only inside the host's
     // filesystem view (decision C2, N6; SPAWN_ENGINE_VIEW).
     let (policy, said) = engine_view(&env_value, &config.engines, |lookup| {

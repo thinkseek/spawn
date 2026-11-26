@@ -640,8 +640,9 @@ fn direct_engine(flags: &Flags) -> Result<Option<String>, String> {
         return Ok(None);
     };
     let trimmed = raw.trim();
-    let known = spawn_core::driver::driver(trimmed)
-        .ok_or_else(|| format!("--engine must be a registered engine (claude, agy), not {raw:?}"))?;
+    let known = spawn_core::driver::driver(trimmed).ok_or_else(|| {
+        format!("--engine must be a registered engine (claude, agy), not {raw:?}")
+    })?;
     Ok(Some(known.id().to_string()))
 }
 
@@ -651,7 +652,9 @@ fn direct_model_label(flags: &Flags, engine: Option<&str>) -> Result<Option<Stri
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() || !spawn_core::command::is_model_label(trimmed) {
-        return Err(format!("--model-label {raw:?} is not a valid engine model label"));
+        return Err(format!(
+            "--model-label {raw:?} is not a valid engine model label"
+        ));
     }
     if engine == Some(spawn_core::driver::DEFAULT) {
         return Err("claude uses --model default|cheap and takes no --model-label".to_string());
