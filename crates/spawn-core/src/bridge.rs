@@ -6150,7 +6150,7 @@ impl Bridge {
                         ));
                     };
                     let mut wrapped = view_arguments.to_vec();
-                    wrapped.push(program);
+                    wrapped.push(std::mem::take(&mut program));
                     wrapped.extend(arguments);
                     arguments = wrapped;
                     program.clone_from(view_program);
