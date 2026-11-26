@@ -2108,8 +2108,10 @@ transcript archive's mask roots.
   made: the session's last native session belongs to an earlier execution. The
   Bridge binds the session when all of these hold:
   - Herdr reports a session for the execution's own pane (`agent_session`,
-    an id);
-  - the reading's agent is the driver's (`agy`);
+    an id), or, when it reports none (inside the filesystem view, §3.9), a
+    conversation directory below `<agy home>/brain` names it;
+  - the reading's agent is the driver's (`agy`; no agent at all allows only
+    the scan);
   - the session's full transcript exists below agy's home;
   - a `USER_INPUT` line of that transcript holds the marker of a command
     whose `typing` step this session recorded, and that command is this
