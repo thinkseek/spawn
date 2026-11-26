@@ -788,7 +788,7 @@ fn a_valid_run_resets_the_strikes_once_and_leaves_degraded() {
     let row = node_row(&store);
     assert_eq!((row.host_fault_strikes, row.degraded), (0, true));
     let answer: Value = client
-        .query_one("select spawn_remote_job_valid('gate-valid-0003', 2)", &[])
+        .query_one("select spawn_remote_job_valid('gate-valid-0003', 1)", &[])
         .expect("again")
         .get(0);
     assert_eq!(answer, json!({"ok": false}));
