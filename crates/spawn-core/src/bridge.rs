@@ -4077,8 +4077,8 @@ impl Bridge {
             native,
             from,
             model,
-            model_label,
             driver,
+            ..
         } = *begin;
         let finished = |outcome| Ok(Handled::Finished(outcome));
         // Another Bridge may have started the session since this tick read
@@ -4088,13 +4088,7 @@ impl Bridge {
             return handled;
         }
         let branch = BranchName::for_agent(&claimed.agent_id);
-        let prepared = match self.prepare_start(
-            claimed,
-            &branch,
-            (driver, model, model_label),
-            from,
-            report,
-        )? {
+        let prepared = match self.prepare_start(claimed, &branch, begin, report)? {
             Ok(prepared) => prepared,
             Err(why) => return finished(self.fail_prepared_start(claimed, why)),
         };
@@ -4237,17 +4231,19 @@ impl Bridge {
         &mut self,
         claimed: &Claimed,
         branch: &BranchName,
-        (driver, model, model_label): (
-            &'static dyn AgentDriver,
-            Option<ModelProfile>,
-            Option<&str>,
-        ),
-        from: Option<&str>,
+        begin: &Begin<'_>,
         report: &mut TickReport,
     ) -> Result<Result<PreparedStart, String>, StoreError> {
         if let Some(prepared) = self.prepared.get(&claimed.command_id) {
             return Ok(Ok(prepared.clone()));
         }
+        let Begin {
+            from,
+            model,
+            model_label,
+            driver,
+            ..
+        } = *begin;
         // Only the engines this host enables (`SPAWN_ENGINES`) start, and
         // one other than Claude Code only with its model named, by the
         // start (`model_label`) or the host (`SPAWN_<ENGINE>_MODEL`): an
