@@ -12,8 +12,15 @@
 //! process still holds open past the bound fails, as one that does not
 //! exit does ([`run_bounded`]). It runs the program itself (never a shell)
 //! with nothing on its standard input, and its process group is killed
-//! when the run ends. The engines' login files are
-//! `stat`ed, never opened ([`login_files`]). The answer is cached for the
+//! when the run ends. An engine with no deny rules of its own
+//! ([`Guard::Sandbox`], agy) is probed only inside the same filesystem view
+//! the Bridge starts it in (`SPAWN_ENGINE_VIEW`, [`view_with`]): `bwrap
+//! --die-with-parent --unshare-pid` in a scratch workspace removed after,
+//! so neither its probe nor the background updater it leaves (`setsid`)
+//! sees what the view masks, nor outlives `bwrap`. With no view under
+//! `required` (the default) such an engine is down and its program never
+//! runs; `SPAWN_ENGINE_VIEW=off` probes it on the host as is. The engines'
+//! login files are `stat`ed, never opened ([`login_files`]). The answer is cached for the
 //! process: `spawn loop` probes at its start and then hourly on a thread
 //! of its own ([`start`]), so no pass waits on an engine's program;
 //! `spawn serve` probes when the cache is empty or an hour old.
@@ -41,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
-use spawn_core::driver::{AgyDriver, DEFAULT};
+use spawn_core::driver::{AgyDriver, DEFAULT, EngineHome, Guard};
 
 use crate::deliver::{EngineReady, Engines};
 
@@ -93,6 +100,32 @@ pub(crate) struct EngineProbe {
     pub(crate) unavailable: Option<String>,
 }
 
+impl EngineProbe {
+    /// An engine whose program the probe never ran (`program`, and whether
+    /// it is enabled), with why it cannot start.
+    fn not_run(
+        driver: &dyn spawn_core::driver::AgentDriver,
+        (program, enabled): (String, bool),
+        login: Vec<LoginFile>,
+        model: Option<String>,
+        why: String,
+    ) -> Self {
+        Self {
+            engine: driver.id().to_string(),
+            title: driver.title().to_string(),
+            program,
+            enabled,
+            installed: None,
+            version: None,
+            version_tested: None,
+            login,
+            known_models: None,
+            model,
+            unavailable: Some(why),
+        }
+    }
+}
+
 /// One probe of every registered engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Probe {
@@ -105,20 +138,164 @@ pub(crate) struct Probe {
 /// standard output, or why not ([`run_bounded`]).
 pub(crate) type Run<'a> = &'a dyn Fn(&str, &[&str], Duration) -> Result<String, String>;
 
+/// How the probe of an engine with no deny rules of its own
+/// ([`Guard::Sandbox`]) runs its program ([`view_with`]).
+pub(crate) enum Boxed {
+    /// `SPAWN_ENGINE_VIEW=off`: on the host, as is (the owner's choice).
+    Off,
+    /// Inside the view: `words` (the view's program and arguments, ending
+    /// in `--`) go before the program; `scratch`, the workspace the view
+    /// binds, is removed when this is dropped, after the probe's runs.
+    Inside {
+        words: Vec<String>,
+        _scratch: Option<Scratch>,
+    },
+    /// No view: the engine is down, and its program is never run.
+    Unavailable(String),
+}
+
+/// A scratch directory a probe's view binds as its workspace, removed whole
+/// on drop.
+#[derive(Debug)]
+pub(crate) struct Scratch(PathBuf);
+
+impl Scratch {
+    /// A new 0700 directory below `base` (made new, never one there).
+    fn new(base: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos());
+        let dir = base.join(format!(
+            "spawn-capabilities-{}-{}-{nanos}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|error| format!("create {}: {error}", dir.display()))?;
+        Ok(Self(dir))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// What a probe reads from its host: the environment, a bounded run of a
-/// program (its standard output, or why not), and whether a path exists
-/// (`stat`, never `open`).
+/// program (its standard output, or why not), whether a path exists
+/// (`stat`, never `open`), and how a [`Guard::Sandbox`] engine's program
+/// runs (`view`, given the engine's id and home: [`view_with`]).
 pub(crate) struct Host<'a> {
     pub(crate) lookup: &'a dyn Fn(&str) -> Option<String>,
     pub(crate) run: Run<'a>,
     pub(crate) exists: &'a dyn Fn(&Path) -> bool,
+    pub(crate) view: &'a dyn Fn(&str, &EngineHome) -> Boxed,
+}
+
+/// What builds the host's filesystem view ([`spawn_core::port::EngineView`])
+/// from the environment, as [`crate::runtime::engine_view`] takes it.
+type MakeView<'a> = Box<
+    dyn FnOnce(
+            &dyn Fn(&str) -> Option<String>,
+        ) -> Result<std::sync::Arc<dyn spawn_core::port::EngineView>, String>
+        + 'a,
+>;
+
+/// How the probe of the [`Guard::Sandbox`] engine `engine` (home `home`)
+/// runs on this host, by `SPAWN_ENGINE_VIEW` as the Bridge reads it
+/// ([`crate::runtime::engine_view`]): `off`, on the host; otherwise
+/// (`required`, unset, or anything else) inside the view `make` builds,
+/// in a scratch workspace of its own ([`Scratch`], below the first of
+/// `bases` the view can bind), or not at all.
+pub(crate) fn view_with(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    engine: &str,
+    home: &EngineHome,
+    bases: &[PathBuf],
+    make: MakeView<'_>,
+) -> Boxed {
+    use spawn_core::bridge::EngineViewPolicy;
+    let enabled = [(engine.to_string(), home.clone())];
+    let view = match crate::runtime::engine_view(lookup, &enabled, make).0 {
+        EngineViewPolicy::Off => return Boxed::Off,
+        EngineViewPolicy::Required(Err(why)) => {
+            return Boxed::Unavailable(format!("no filesystem view on this host ({why})"));
+        }
+        EngineViewPolicy::Required(Ok(view)) => view,
+    };
+    let mut why = "no scratch directory for it".to_string();
+    for base in bases.iter().filter(|base| base.is_dir()) {
+        let scratch = match Scratch::new(base) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                why = error;
+                continue;
+            }
+        };
+        let Some(workspace) = scratch.path().to_str() else {
+            continue;
+        };
+        match view.wrap(&spawn_core::port::ViewedLaunch {
+            engine,
+            workspace,
+            engine_home: &home.sessions,
+        }) {
+            Ok(words) if words.len() > 1 && words.last().is_some_and(|word| word == "--") => {
+                return Boxed::Inside {
+                    words,
+                    _scratch: Some(scratch),
+                };
+            }
+            Ok(_) => why = "its words do not end in --".to_string(),
+            Err(error) => why = error,
+        }
+    }
+    Boxed::Unavailable(format!(
+        "its filesystem view ({}) cannot be made: {why}",
+        view.name()
+    ))
+}
+
+/// [`view_with`] on this host's `bwrap`, its scratch workspace below
+/// `/var/tmp`, else `$HOME/.cache` (`/tmp` and the loop's `TMPDIR` are
+/// masked inside the view, so never there).
+fn view_now(engine: &str, home: &EngineHome) -> Boxed {
+    let lookup = |name: &str| crate::env_value(name);
+    let mut bases = vec![PathBuf::from("/var/tmp")];
+    if let Some(dir) = lookup("HOME").filter(|dir| dir.starts_with('/')) {
+        bases.push(Path::new(&dir).join(".cache"));
+    }
+    view_with(
+        &lookup,
+        engine,
+        home,
+        &bases,
+        Box::new(|lookup| {
+            spawn_host::BwrapView::new("bwrap", spawn_host::ViewConfig::from_env(lookup)).map(
+                |view| {
+                    std::sync::Arc::new(view) as std::sync::Arc<dyn spawn_core::port::EngineView>
+                },
+            )
+        }),
+    )
 }
 
 /// The login files of `engine` this host would hold: Claude Code's
 /// `.credentials.json` in its configuration directory
-/// (`SPAWN_CLAUDE_CONFIG_DIR`, else `~/.claude`); agy's Google login
-/// (`~/.gemini/oauth_creds.json`) and its home (`SPAWN_AGY_HOME`, else
-/// `~/.gemini/antigravity-cli`). Only their presence is ever read.
+/// (`SPAWN_CLAUDE_CONFIG_DIR`, else `~/.claude`); agy's file-based login
+/// token (`<agy home>/antigravity-oauth-token`, where agy 1.5.17 keeps it)
+/// and its home (`SPAWN_AGY_HOME`, else `~/.gemini/antigravity-cli`). Only
+/// their presence is ever read (`symlink_metadata`, never opened).
 fn login_files(engine: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> {
     let home = PathBuf::from(lookup("HOME").unwrap_or_else(|| "/root".to_string()));
     match engine {
@@ -128,11 +305,11 @@ fn login_files(engine: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<Pat
                 .map_or_else(|| home.join(".claude"), PathBuf::from);
             vec![dir.join(".credentials.json")]
         }
-        "agy" => vec![
-            home.join(".gemini/oauth_creds.json"),
-            lookup("SPAWN_AGY_HOME")
-                .map_or_else(|| home.join(spawn_core::driver::AGY_HOME), PathBuf::from),
-        ],
+        "agy" => {
+            let agy_home = lookup("SPAWN_AGY_HOME")
+                .map_or_else(|| home.join(spawn_core::driver::AGY_HOME), PathBuf::from);
+            vec![agy_home.join("antigravity-oauth-token"), agy_home]
+        }
         _ => Vec::new(),
     }
 }
@@ -167,24 +344,42 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
         if !is_enabled {
             // Decision C3: an engine the host does not enable is never run,
             // not even for its version.
-            engines.push(EngineProbe {
-                engine: id.to_string(),
-                title: driver.title().to_string(),
-                program,
-                enabled: false,
-                installed: None,
-                version: None,
-                version_tested: None,
+            engines.push(EngineProbe::not_run(
+                *driver,
+                (program, false),
                 login,
-                known_models: None,
                 model,
-                unavailable: Some(format!(
-                    "SPAWN_ENGINES does not name {id}: it is not enabled on this host"
-                )),
-            });
+                format!("SPAWN_ENGINES does not name {id}: it is not enabled on this host"),
+            ));
             continue;
         }
-        let answer = (host.run)(&program, &["--version"], VERSION_LIMIT);
+        // An engine with no deny rules of its own runs inside its view, or
+        // not at all: with none, it is down and its program never runs.
+        let boxed = match configured {
+            Some((_, home)) if driver.traits().guard == Guard::Sandbox => (host.view)(id, home),
+            _ => Boxed::Off,
+        };
+        let prefix: Vec<&str> = match &boxed {
+            Boxed::Off => Vec::new(),
+            Boxed::Inside { words, .. } => words.iter().map(String::as_str).collect(),
+            Boxed::Unavailable(why) => {
+                engines.push(EngineProbe::not_run(
+                    *driver,
+                    (program, true),
+                    login,
+                    model,
+                    format!(
+                        "{id} is probed and run only inside its filesystem view, and {why}: \
+                         it will not start (engine_unavailable)"
+                    ),
+                ));
+                continue;
+            }
+        };
+        let run = |arguments: &[&str], limit: Duration| {
+            run_in(host.run, &prefix, &program, arguments, limit)
+        };
+        let answer = run(&["--version"], VERSION_LIMIT);
         let version = answer
             .as_ref()
             .ok()
@@ -198,7 +393,7 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
             .flatten();
         let mut known_models = None;
         if id == "agy" && unavailable.is_none() {
-            match (host.run)(&program, &["models"], MODELS_LIMIT) {
+            match run(&["models"], MODELS_LIMIT) {
                 Ok(listing) => {
                     let known = AgyDriver::known_models(&listing);
                     if known.is_empty() {
@@ -224,8 +419,30 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
             // its program at launch, as it always did.
             unavailable: unavailable.filter(|_| id != DEFAULT),
         });
+        // The view's scratch workspace goes once both runs are done.
+        drop(boxed);
     }
     Probe { at_ms, engines }
+}
+
+/// `run` of `program` with `arguments` within `limit`, after `prefix` (a
+/// view's words ending in `--`) when there is one.
+fn run_in(
+    run: Run<'_>,
+    prefix: &[&str],
+    program: &str,
+    arguments: &[&str],
+    limit: Duration,
+) -> Result<String, String> {
+    match prefix.split_first() {
+        None => run(program, arguments, limit),
+        Some((view, words)) => {
+            let mut all: Vec<&str> = words.to_vec();
+            all.push(program);
+            all.extend_from_slice(arguments);
+            run(view, &all, limit)
+        }
+    }
 }
 
 /// What delivery may start, from `probe`: every enabled engine besides
@@ -334,6 +551,7 @@ pub(crate) fn probe_now() -> Probe {
             lookup: &lookup,
             run: &run_bounded,
             exists: &exists,
+            view: &view_now,
         },
         crate::grading::now_ms(),
     )
@@ -516,14 +734,28 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{Host, engines, probe_with, run_bounded, untested_notice};
+    use super::{Boxed, Host, engines, probe_with, run_bounded, untested_notice, view_with};
     use crate::deliver::Runs;
+    use spawn_core::driver::EngineHome;
+
+    /// How the fake host's filesystem view answers for a sandboxed engine.
+    #[derive(Clone, Copy)]
+    enum View {
+        /// `SPAWN_ENGINE_VIEW=off`: run on the host.
+        Off,
+        /// Wrapped in a made-up `bwrap`.
+        Wrap,
+        /// None on this host, for this reason.
+        Refuse(&'static str),
+    }
 
     struct Fake {
         env: Vec<(&'static str, &'static str)>,
         answers: Vec<(&'static str, Result<&'static str, &'static str>)>,
         runs: RefCell<Vec<String>>,
         stat: RefCell<Vec<String>>,
+        view: View,
+        viewed: RefCell<Vec<String>>,
     }
 
     impl Fake {
@@ -548,26 +780,54 @@ mod tests {
                 self.stat.borrow_mut().push(path.display().to_string());
                 path.ends_with(".credentials.json")
             };
+            let view = |engine: &str, home: &EngineHome| {
+                self.viewed
+                    .borrow_mut()
+                    .push(format!("{engine} {}", home.sessions));
+                match self.view {
+                    View::Off => Boxed::Off,
+                    View::Wrap => Boxed::Inside {
+                        words: ["bwrap", "--die-with-parent", "--unshare-pid", "--"]
+                            .map(str::to_string)
+                            .to_vec(),
+                        _scratch: None,
+                    },
+                    View::Refuse(why) => Boxed::Unavailable(why.to_string()),
+                }
+            };
             probe_with(
                 &Host {
                     lookup: &lookup,
                     run: &run,
                     exists: &exists,
+                    view: &view,
                 },
                 7,
             )
         }
     }
 
+    /// A fake host whose view is off (`SPAWN_ENGINE_VIEW=off`): the probe's
+    /// own logic, its program run as is.
     fn fake(
         env: Vec<(&'static str, &'static str)>,
         answers: Vec<(&'static str, Result<&'static str, &'static str>)>,
+    ) -> Fake {
+        fake_viewed(env, answers, View::Off)
+    }
+
+    fn fake_viewed(
+        env: Vec<(&'static str, &'static str)>,
+        answers: Vec<(&'static str, Result<&'static str, &'static str>)>,
+        view: View,
     ) -> Fake {
         Fake {
             env,
             answers,
             runs: RefCell::new(Vec::new()),
             stat: RefCell::new(Vec::new()),
+            view,
+            viewed: RefCell::new(Vec::new()),
         }
     }
 
@@ -600,7 +860,7 @@ mod tests {
             *host.stat.borrow(),
             [
                 "/home/a/.claude/.credentials.json",
-                "/home/a/.gemini/oauth_creds.json",
+                "/home/a/.gemini/antigravity-cli/antigravity-oauth-token",
                 "/home/a/.gemini/antigravity-cli",
             ]
         );
@@ -738,5 +998,263 @@ mod tests {
             Ok("1.5.17\n")
         );
         assert!(run_bounded("sh", &["-c", "exit 3"], Duration::from_secs(5)).is_err());
+    }
+
+    const WRAPPED_VERSION: &str = "bwrap --die-with-parent --unshare-pid -- agy --version";
+    const WRAPPED_MODELS: &str = "bwrap --die-with-parent --unshare-pid -- agy models";
+
+    fn agy_answers() -> Vec<(&'static str, Result<&'static str, &'static str>)> {
+        vec![
+            ("claude --version", Ok("2.1.0 (Claude Code)\n")),
+            ("agy --version", Ok("1.5.17\n")),
+            ("agy models", Ok("gemini-3.8-pro\n")),
+            (WRAPPED_VERSION, Ok("1.5.17\n")),
+            (WRAPPED_MODELS, Ok("gemini-3.8-pro\n")),
+        ]
+    }
+
+    /// F1 (O55): a sandboxed engine (agy, `Guard::Sandbox`) with no view on
+    /// this host is down, and its program is never run on the host, not
+    /// even for `--version`; Claude Code is probed unwrapped, as before.
+    #[test]
+    fn a_sandboxed_engine_with_no_view_is_unavailable_and_never_run() {
+        let host = fake_viewed(
+            vec![("HOME", "/home/a"), ("SPAWN_ENGINES", "claude,agy")],
+            agy_answers(),
+            View::Refuse("no filesystem view on this host (bwrap is not installed)"),
+        );
+        let probe = host.probe();
+        assert_eq!(*host.runs.borrow(), ["claude --version"], "agy never ran");
+        assert_eq!(
+            *host.viewed.borrow(),
+            ["agy /home/a/.gemini/antigravity-cli"]
+        );
+        let agy = &probe.engines[1];
+        assert!(agy.enabled);
+        assert_eq!(agy.installed, None);
+        assert_eq!(agy.version, None);
+        assert_eq!(agy.known_models, None);
+        let why = agy.unavailable.as_deref().expect("down");
+        assert!(why.contains("bwrap is not installed"), "{why}");
+        assert!(why.contains("engine_unavailable"), "{why}");
+        assert_eq!(agy.login.len(), 2, "its login files are still only stated");
+        let ready = engines(&probe);
+        assert!(matches!(
+            ready.runs("agy", Some("gemini-3.8-pro")),
+            Runs::Unavailable(why) if why.contains("filesystem view")
+        ));
+        assert_eq!(probe.engines[0].unavailable, None, "Claude is never down");
+        assert_eq!(
+            ready.runs("claude", None),
+            Runs::On("claude".to_string(), None)
+        );
+    }
+
+    /// F1: with a view, agy's `--version` and `models` run as the view's
+    /// program with agy and its arguments after `--`; Claude Code's
+    /// `--version` stays unwrapped, and a Claude-only host asks no view.
+    #[test]
+    fn a_sandboxed_engines_probes_run_inside_its_view_and_claudes_do_not() {
+        let host = fake_viewed(
+            vec![("HOME", "/home/a"), ("SPAWN_ENGINES", "claude,agy")],
+            agy_answers(),
+            View::Wrap,
+        );
+        let probe = host.probe();
+        assert_eq!(
+            *host.runs.borrow(),
+            ["claude --version", WRAPPED_VERSION, WRAPPED_MODELS]
+        );
+        assert_eq!(
+            *host.viewed.borrow(),
+            ["agy /home/a/.gemini/antigravity-cli"]
+        );
+        let agy = &probe.engines[1];
+        assert_eq!(agy.installed, Some(true));
+        assert_eq!(agy.version.as_deref(), Some("1.5.17"));
+        assert_eq!(agy.unavailable, None);
+        assert_eq!(
+            engines(&probe).runs("agy", Some("gemini-3.8-pro")),
+            Runs::On("agy".to_string(), Some("gemini-3.8-pro".to_string()))
+        );
+        // A wrapped run that fails takes agy down alone.
+        let failing = fake_viewed(
+            vec![("SPAWN_ENGINES", "agy")],
+            vec![(WRAPPED_VERSION, Err("exited with exit status: 1"))],
+            View::Wrap,
+        );
+        let probe = failing.probe();
+        assert!(
+            probe.engines[1]
+                .unavailable
+                .as_deref()
+                .is_some_and(|why| why.contains("agy --version: exited")),
+            "{:?}",
+            probe.engines[1].unavailable
+        );
+        assert_eq!(probe.engines[0].unavailable, None);
+        // Claude Code alone: no view is asked for, nothing is wrapped.
+        for view in [View::Wrap, View::Refuse("none")] {
+            let claude = fake_viewed(vec![("HOME", "/home/a")], agy_answers(), view);
+            let probe = claude.probe();
+            assert_eq!(*claude.runs.borrow(), ["claude --version"]);
+            assert!(claude.viewed.borrow().is_empty());
+            assert_eq!(probe.engines[0].installed, Some(true));
+        }
+    }
+
+    /// A view that records what it was asked and wraps in a made-up
+    /// `bwrap`, or refuses.
+    #[derive(Debug, Default)]
+    struct FakeEngineView {
+        refuse: Option<&'static str>,
+        asked: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl spawn_core::port::EngineView for FakeEngineView {
+        fn name(&self) -> &'static str {
+            "bwrap"
+        }
+
+        fn wrap(&self, launch: &spawn_core::port::ViewedLaunch<'_>) -> Result<Vec<String>, String> {
+            self.asked.lock().expect("asked").push((
+                launch.engine.to_string(),
+                launch.workspace.to_string(),
+                launch.engine_home.to_string(),
+            ));
+            match self.refuse {
+                Some(why) => Err(why.to_string()),
+                None => Ok(["/usr/bin/bwrap", "--unshare-pid", "--"]
+                    .map(str::to_string)
+                    .to_vec()),
+            }
+        }
+    }
+
+    /// F1: `SPAWN_ENGINE_VIEW` as the Bridge reads it. `off` runs on the
+    /// host and builds no view; required (unset, or an invalid value) with
+    /// no view, or a view that refuses the launch, is unavailable; a view
+    /// wraps the probe in a scratch workspace of its own, removed on drop.
+    #[test]
+    fn the_probes_view_follows_spawn_engine_view_and_cleans_its_scratch() {
+        let home = EngineHome {
+            program: "agy".to_string(),
+            sessions: "/home/a/.gemini/antigravity-cli".to_string(),
+            model: None,
+        };
+        let base = std::env::temp_dir().join(format!("spawn-cap-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("base");
+        let bases = [base.join("missing"), base.clone()];
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            }
+        };
+        let off = env(&[("SPAWN_ENGINE_VIEW", "off")]);
+        let boxed = view_with(
+            &off,
+            "agy",
+            &home,
+            &bases,
+            Box::new(|_| panic!("off builds no view")),
+        );
+        assert!(matches!(boxed, Boxed::Off));
+        for pairs in [
+            &[][..],
+            &[("SPAWN_ENGINE_VIEW", "required")][..],
+            &[("SPAWN_ENGINE_VIEW", "maybe")][..],
+        ] {
+            let lookup = env(pairs);
+            let boxed = view_with(
+                &lookup,
+                "agy",
+                &home,
+                &bases,
+                Box::new(|_| Err("bwrap is not installed".to_string())),
+            );
+            assert!(
+                matches!(&boxed, Boxed::Unavailable(why) if why.contains("bwrap is not installed")),
+                "{pairs:?}"
+            );
+        }
+        let unset = env(&[]);
+        let view = std::sync::Arc::new(FakeEngineView::default());
+        let made = view.clone();
+        let boxed = view_with(
+            &unset,
+            "agy",
+            &home,
+            &bases,
+            Box::new(move |_| Ok(made as std::sync::Arc<dyn spawn_core::port::EngineView>)),
+        );
+        let Boxed::Inside {
+            words,
+            _scratch: scratch,
+        } = boxed
+        else {
+            panic!("inside the view");
+        };
+        assert_eq!(words, ["/usr/bin/bwrap", "--unshare-pid", "--"]);
+        let scratch = scratch.expect("a scratch workspace");
+        let workspace = scratch.path().to_path_buf();
+        assert!(
+            workspace.is_dir() && workspace.starts_with(&base),
+            "{workspace:?}"
+        );
+        assert_eq!(
+            *view.asked.lock().expect("asked"),
+            [(
+                "agy".to_string(),
+                workspace.display().to_string(),
+                home.sessions.clone()
+            )]
+        );
+        drop(scratch);
+        assert!(!workspace.exists(), "removed on drop");
+        // A view that refuses the launch: unavailable, nothing left behind.
+        let refusing = std::sync::Arc::new(FakeEngineView {
+            refuse: Some("the workspace overlaps /tmp, which the view masks"),
+            ..FakeEngineView::default()
+        });
+        let boxed = view_with(
+            &unset,
+            "agy",
+            &home,
+            &bases,
+            Box::new(move |_| Ok(refusing as std::sync::Arc<dyn spawn_core::port::EngineView>)),
+        );
+        assert!(
+            matches!(&boxed, Boxed::Unavailable(why) if why.contains("overlaps /tmp")),
+            "refused"
+        );
+        assert_eq!(
+            std::fs::read_dir(&base).expect("base").count(),
+            0,
+            "no scratch left"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// F2 (O55): agy 1.5.17 keeps its login token in a file below its home;
+    /// that file and the home are stated (`SPAWN_AGY_HOME` too), never a
+    /// file agy does not write.
+    #[test]
+    fn agys_login_file_is_its_token_below_its_home() {
+        let lookup = |name: &str| match name {
+            "HOME" => Some("/home/a".to_string()),
+            "SPAWN_AGY_HOME" => Some("/srv/agy".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            super::login_files("agy", &lookup),
+            [
+                std::path::PathBuf::from("/srv/agy/antigravity-oauth-token"),
+                std::path::PathBuf::from("/srv/agy"),
+            ]
+        );
     }
 }

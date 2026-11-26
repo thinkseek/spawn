@@ -201,6 +201,17 @@ pub trait AgentDriver: Send + Sync + std::fmt::Debug {
     /// own ([`SessionBinding::Reported`]).
     fn reported_session(&self, line: &str) -> Option<String>;
 
+    /// The directory below the engine's home whose subdirectories are its
+    /// conversations, one per native session, when the engine names its own
+    /// ([`SessionBinding::Reported`]) and the Bridge may look for the one an
+    /// execution started there itself (agy's `<home>/brain`): the fallback
+    /// when the terminal host reports no session (agy's hooks and the
+    /// host's socket masked inside its filesystem view). `None` for an
+    /// engine whose sessions are not found that way.
+    fn session_scan_dir(&self, _home: &EngineHome) -> Option<String> {
+        None
+    }
+
     /// What one transcript line says.
     fn read_line(&self, line: &str, cursor: &mut LineCursor) -> LineFacts;
 
@@ -535,6 +546,11 @@ impl AgentDriver for AgyDriver {
     /// agy's lines never name its conversation: the host reports it.
     fn reported_session(&self, _line: &str) -> Option<String> {
         None
+    }
+
+    /// `<home>/brain`: one directory per conversation.
+    fn session_scan_dir(&self, home: &EngineHome) -> Option<String> {
+        Some(format!("{}/brain", home.sessions.trim_end_matches('/')))
     }
 
     fn read_line(&self, line: &str, cursor: &mut LineCursor) -> LineFacts {
@@ -1030,6 +1046,24 @@ mod tests {
         for bad in ["", "../x", "a/b", "a b", &"x".repeat(129)] {
             assert!(!plain_session_id(bad), "{bad:?}");
         }
+    }
+
+    /// agy's conversations are the directories of `<home>/brain`, which
+    /// the Bridge scans when the host reports none; Claude Code's sessions
+    /// are never scanned (the Bridge names them).
+    #[test]
+    fn agy_scans_its_brain_and_claude_scans_nothing() {
+        assert_eq!(
+            AgyDriver.session_scan_dir(&agy_home()).as_deref(),
+            Some("/home/a/.gemini/antigravity-cli/brain")
+        );
+        let mut trailing = agy_home();
+        trailing.sessions.push('/');
+        assert_eq!(
+            AgyDriver.session_scan_dir(&trailing).as_deref(),
+            Some("/home/a/.gemini/antigravity-cli/brain")
+        );
+        assert_eq!(ClaudeDriver.session_scan_dir(&home()), None);
     }
 
     #[test]

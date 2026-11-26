@@ -2108,8 +2108,10 @@ transcript archive's mask roots.
   made: the session's last native session belongs to an earlier execution. The
   Bridge binds the session when all of these hold:
   - Herdr reports a session for the execution's own pane (`agent_session`,
-    an id);
-  - the reading's agent is the driver's (`agy`);
+    an id), or, when it reports none (inside the filesystem view, §3.9), a
+    conversation directory below `<agy home>/brain` names it;
+  - the reading's agent is the driver's (`agy`; no agent at all allows only
+    the scan);
   - the session's full transcript exists below agy's home;
   - a `USER_INPUT` line of that transcript holds the marker of a command
     whose `typing` step this session recorded, and that command is this
@@ -2458,6 +2460,31 @@ view, as before H5, said once at the loop's start. Any other value is read
 as `required`, said once. Tested against a real `bwrap` and a real Herdr in
 `crates/spawn-host/tests/engine_view.rs` (no engine is run there: never
 agy; the Herdr agent is a shell stub named `claude`).
+
+**What agy sees and how it is bound inside the view** (O55, C3 step 3).
+The mask of `~/.gemini` covers `~/.gemini/config/{config.json,mcp_config.json}`
+too: agy runs on its defaults and the `--settings` it is launched with, never
+the host's configuration or MCP servers. The capability probe (§3.8) runs a
+`Guard::Sandbox` engine's `<program> --version` and `<program> models` inside
+the same view, by the same `SPAWN_ENGINE_VIEW` policy, in a scratch
+workspace of its own (below `/var/tmp`, else `$HOME/.cache`), removed after
+the runs. `--unshare-pid --die-with-parent` also ends agy's `setsid`
+background updater with `bwrap`. With no view under `required`, the engine
+is reported unavailable and its program is never run on the host; under
+`off` it is probed with no view. The view also masks agy's hook file
+(`~/.gemini/config/hooks.json`) and Herdr's socket (`$HERDR_SOCKET_PATH`), and
+neither is ever unmasked, so agy reports no session to Herdr: Herdr reads
+`agent=agy, session=None`. `Bridge::bind_reported` therefore tries Herdr's
+reported session first, when there is one, then falls back to scanning
+`<agy home>/brain/*` (`AgentDriver::session_scan_dir`,
+`TerminalHost::list_dirs`: plain directory names only, never symlinks,
+newest first, at most 64). The fallback runs only after something was typed
+into this execution, and never while Herdr says another agent holds the
+pane. Whichever way a conversation is found, it binds only when
+`brain/<id>/.system_generated/logs/transcript_full.jsonl` has a
+`USER_INPUT` line holding the marker of a command typed into this session
+at or after this execution's start: the anti-forgery check of §3.6 (N2) is
+unchanged.
 
 ## 4. Experience
 

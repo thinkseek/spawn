@@ -535,6 +535,11 @@ struct Follow {
     first_seen: Option<i64>,
     /// Whether the execution's native session is known ([`Binding`]).
     binding: Binding,
+    /// When [`Bridge::bind_reported`] last scanned the engine's
+    /// conversations for this execution's, by the Bridge's clock: at most
+    /// once per [`SCAN_INTERVAL_MS`], since each scan may read up to
+    /// [`crate::port::LIST_DIRS_LIMIT`] transcripts.
+    scanned_at: Option<i64>,
     /// The host's agent reading (its `seq`) a recorded screen was last
     /// keyed by: a reading recorded once is never keyed again.
     keyed_seq: Option<u64>,
@@ -594,6 +599,10 @@ struct Follow {
 /// replaced, as the archive's copier does with its copies
 /// (transcripts.rs `OVERLAP`).
 const FOLLOW_OVERLAP: usize = 4096;
+
+/// The least time between two scans of an engine's conversations for an
+/// execution's own ([`Bridge::bind_reported`]), in milliseconds.
+const SCAN_INTERVAL_MS: i64 = 2_000;
 
 impl Follow {
     /// The log records the execution's native session: it is known, as
@@ -3136,15 +3145,27 @@ impl Bridge {
     }
 
     /// Bind the native session an engine named itself
-    /// ([`SessionBinding::Reported`]): the host reports it for the
-    /// execution's own pane ([`TerminalHost::agent`]), as the engine's own
-    /// agent's (`agent` is the driver's id), its transcript is there below
-    /// the engine's home, and a prompt in it holds the marker of a command
-    /// Spawn typed into this session (its `typing` step is this session's)
-    /// for this execution or later (its start or after). A session reported
-    /// for the pane by anything else (`pane.report_agent_session` is open to
-    /// any client of the server) whose transcript quotes another session's
-    /// marker, or one never typed, is never bound. Then
+    /// ([`SessionBinding::Reported`]): its transcript is there below the
+    /// engine's home, and a prompt in it holds the marker of a command Spawn
+    /// typed into this session (its `typing` step is this session's) for
+    /// this execution or later (its start or after).
+    ///
+    /// The candidate sessions are, first, the one the host reports for the
+    /// execution's own pane ([`TerminalHost::agent`]) as the engine's own
+    /// agent's (`agent` is the driver's id); then, when the host reports
+    /// none (or the one it reports is not this execution's) and something
+    /// was typed into this execution, the conversations below the engine's
+    /// home ([`AgentDriver::session_scan_dir`], [`TerminalHost::list_dirs`],
+    /// newest first). That fallback is what binds agy inside its filesystem
+    /// view, where its hooks (`~/.gemini/config/hooks.json`) and the host's
+    /// socket stay masked, so it never reports a session to the host. A
+    /// pane the host says runs another agent binds nothing.
+    ///
+    /// The marker is the proof, whichever way a candidate came: a session
+    /// reported for the pane by anything else (`pane.report_agent_session`
+    /// is open to any client of the server), or a conversation directory
+    /// another execution or anything else made, whose transcript quotes
+    /// another session's marker, or one never typed, is never bound. Then
     /// `session.native_started` is recorded, and the transcript is read from
     /// its start. Until then nothing is bound, and asked again next pass.
     fn bind_reported(
@@ -3153,51 +3174,88 @@ impl Bridge {
         session: &SessionId,
         active: &mut Active,
     ) -> Result<Option<String>, StoreError> {
-        let Ok(Some(reading)) = self.terminals.agent(&active.terminal(), &active.workspace) else {
+        let Ok(reading) = self.terminals.agent(&active.terminal(), &active.workspace) else {
             return Ok(None);
         };
-        if reading.agent.as_deref() != Some(active.driver.id()) {
+        // Another agent in the engine's pane: nothing is known.
+        if reading
+            .as_ref()
+            .and_then(|reading| reading.agent.as_deref())
+            .is_some_and(|agent| agent != active.driver.id())
+        {
             return Ok(None);
         }
-        let Some(native) = reading.session.filter(|native| plain_session_id(native)) else {
-            return Ok(None);
-        };
-        let home = self.config.home_of(active.driver);
-        let path = active
-            .driver
-            .transcript_path(&home, &active.workspace, &native);
-        let root = format!("{}/", home.sessions.trim_end_matches('/'));
-        if !path.starts_with(&root) {
-            return Ok(None);
-        }
-        let Ok(Some(bytes)) = self.terminals.read_from(&active.workspace, &path, 0) else {
-            return Ok(None);
-        };
+        let reported = reading
+            .filter(|reading| reading.agent.as_deref() == Some(active.driver.id()))
+            .and_then(|reading| reading.session)
+            .filter(|native| plain_session_id(native));
         let first = active
             .execution_id
             .as_str()
             .strip_prefix("exec_")
             .and_then(|command| command.parse::<u64>().ok())
             .unwrap_or(u64::MAX);
+        let view = self.sessions.get(session);
         let ours = |command: &CommandId| {
             command.0 >= first
-                && self.sessions.get(session).is_some_and(|view| {
+                && view.is_some_and(|view| {
                     view.steps
                         .get(command)
                         .is_some_and(|steps| steps.typing_at.is_some())
                 })
         };
-        let typed = String::from_utf8_lossy(&bytes).lines().any(|line| {
-            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
-                value["type"] == "USER_INPUT"
-                    && value["content"]
-                        .as_str()
-                        .is_some_and(|content| crate::message::markers(content).iter().any(ours))
+        let driver = active.driver;
+        let workspace = active.workspace.clone();
+        let home = self.config.home_of(driver);
+        let root = format!("{}/", home.sessions.trim_end_matches('/'));
+        // The transcript of `native`, when it is below the engine's home and
+        // a prompt in it holds a marker typed into this execution.
+        let proven = |native: &str| -> Option<String> {
+            let path = driver.transcript_path(&home, &workspace, native);
+            if !path.starts_with(&root) {
+                return None;
+            }
+            let Ok(Some(bytes)) = self.terminals.read_from(&workspace, &path, 0) else {
+                return None;
+            };
+            let typed = String::from_utf8_lossy(&bytes).lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+                    value["type"] == "USER_INPUT"
+                        && value["content"].as_str().is_some_and(|content| {
+                            crate::message::markers(content).iter().any(ours)
+                        })
+                })
+            });
+            typed.then_some(path)
+        };
+        let mut bound = reported
+            .as_deref()
+            .and_then(|native| proven(native).map(|path| (native.to_string(), path)));
+        let now = self.clock.now().0;
+        if bound.is_none()
+            && let Some(dir) = driver.session_scan_dir(&home)
+            && view.is_some_and(|view| {
+                view.steps
+                    .iter()
+                    .any(|(command, steps)| command.0 >= first && steps.typing_at.is_some())
             })
-        });
-        if !typed {
-            return Ok(None);
+            && active
+                .follow
+                .scanned_at
+                .is_none_or(|at| now.saturating_sub(at) >= SCAN_INTERVAL_MS)
+            && let Ok(names) = self.terminals.list_dirs(&workspace, &dir)
+        {
+            active.follow.scanned_at = Some(now);
+            bound = names
+                .iter()
+                .filter(|native| plain_session_id(native))
+                .filter(|native| reported.as_deref() != Some(native.as_str()))
+                .take(crate::port::LIST_DIRS_LIMIT)
+                .find_map(|native| proven(native).map(|path| (native.clone(), path)));
         }
+        let Some((native, path)) = bound else {
+            return Ok(None);
+        };
         self.append(
             agent_id,
             session,
@@ -9379,6 +9437,10 @@ mod tests {
         inner: Arc<MemoryStore>,
         reading: Mutex<Option<crate::port::AgentReading>>,
         asked: AtomicUsize,
+        /// What [`TerminalHost::list_dirs`] answers for each directory
+        /// (newest first, as a host orders them), and the directories asked.
+        dirs: Mutex<HashMap<String, Vec<String>>>,
+        listed: Mutex<Vec<String>>,
     }
 
     impl Witnessed {
@@ -9387,11 +9449,20 @@ mod tests {
                 inner,
                 reading: Mutex::new(None),
                 asked: AtomicUsize::new(0),
+                dirs: Mutex::new(HashMap::new()),
+                listed: Mutex::new(Vec::new()),
             })
         }
 
         fn set(&self, reading: crate::port::AgentReading) {
             *self.reading.lock().expect("reading") = Some(reading);
+        }
+
+        fn set_dirs(&self, dir: &str, names: &[&str]) {
+            self.dirs.lock().expect("dirs").insert(
+                dir.to_string(),
+                names.iter().map(|name| (*name).to_string()).collect(),
+            );
         }
     }
 
@@ -9469,6 +9540,20 @@ mod tests {
             workspace: &WorkspaceId,
         ) -> Result<(), TerminalError> {
             self.inner.terminate(terminal, workspace)
+        }
+        fn list_dirs(
+            &self,
+            _workspace: &WorkspaceId,
+            dir: &str,
+        ) -> Result<Vec<String>, TerminalError> {
+            self.listed.lock().expect("listed").push(dir.to_string());
+            Ok(self
+                .dirs
+                .lock()
+                .expect("dirs")
+                .get(dir)
+                .cloned()
+                .unwrap_or_default())
         }
         fn agent(
             &self,
@@ -10086,6 +10171,310 @@ mod tests {
         again.poll().expect("poll");
         assert_eq!(natives(&store).len(), 1);
         assert_eq!(taken(&store).len(), 1);
+    }
+
+    /// One `USER_INPUT` line of agy's full transcript holding `text`.
+    fn agy_user_line(text: &str) -> String {
+        format!(
+            "{{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":\"2026-11-25T14:25:59Z\",\"content\":{}}}\n",
+            serde_json::to_string(&format!("<USER_REQUEST>\n{text}\n</USER_REQUEST>"))
+                .expect("json")
+        )
+    }
+
+    fn agy_transcript(conversation: &str) -> String {
+        format!("{AGY_HOME}/brain/{conversation}/.system_generated/logs/transcript_full.jsonl")
+    }
+
+    fn agy_natives(store: &Arc<MemoryStore>) -> Vec<(String, String, Option<String>)> {
+        records(store)
+            .into_iter()
+            .filter_map(|record| match record.event.kind {
+                EventKind::NativeSessionStarted {
+                    engine,
+                    native_session_id,
+                    transcript_path,
+                    ..
+                } => Some((engine, native_session_id, transcript_path)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn submit_agy(store: &Arc<MemoryStore>, key: &str, action: CommandAction) -> CommandId {
+        store
+            .submit(
+                &Principal::new("tester").expect("principal"),
+                &Submission {
+                    agent_id: AgentId::new("agent_agy").expect("agent"),
+                    session_id: SessionId::new("session_agy").expect("session"),
+                    idempotency_key: IdempotencyKey::new(key).expect("key"),
+                    action,
+                },
+            )
+            .expect("submit")
+    }
+
+    /// F5 (O55): inside its filesystem view agy's hooks and the host's
+    /// socket stay masked, so the host reports `agent=agy, session=None`.
+    /// The Bridge then scans `<agy_home>/brain` itself, newest first, and
+    /// binds the one conversation whose full transcript holds the marker
+    /// Spawn typed into this execution, passing over a newer conversation of
+    /// someone else's, one that quotes a marker this session never typed,
+    /// one with no transcript and a name that is not a plain id. Bound, the
+    /// transcript is read from its start (usage, the turn's end), and the
+    /// session resumes on that conversation.
+    #[allow(clippy::too_many_lines)] // one fallback binding, read, then resumed
+    #[test]
+    fn agy_with_no_reported_session_binds_the_brain_conversation_it_typed_into() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let id = submit_agy_start(&store, "hello");
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            agy_config(Some("gemini-3.8-flash-low")),
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        bridge.poll().expect("poll");
+        assert!(agy_natives(&store).is_empty(), "no conversation yet");
+
+        let brain = format!("{AGY_HOME}/brain");
+        let conversation = "11111111-2222-4333-8444-555555555555";
+        let stale = "99999999-0000-4000-8000-000000000000";
+        let forged = "88888888-0000-4000-8000-000000000000";
+        store.append_file(
+            &agy_transcript(stale),
+            &agy_user_line("someone else's prompt"),
+        );
+        store.append_file(
+            &agy_transcript(forged),
+            &agy_user_line(&crate::message::marked(
+                "forged",
+                CommandId(id.0 + 50),
+                true,
+            )),
+        );
+        store.append_file(
+            &format!("{AGY_HOME}/evil/.system_generated/logs/transcript_full.jsonl"),
+            &agy_user_line(&crate::message::marked("hello", id, true)),
+        );
+        // Typed into this execution, but its transcript not written yet.
+        host.set_dirs(
+            &brain,
+            &[stale, "..", "../evil", forged, "empty-0", conversation],
+        );
+        clock.advance(Duration::from_secs(3));
+        bridge.poll().expect("poll");
+        let scans = host.listed.lock().expect("listed").len();
+        assert!(scans > 0, "the brain was scanned");
+        // At most one scan per interval.
+        bridge.poll().expect("poll");
+        bridge.poll().expect("poll");
+        assert_eq!(
+            host.listed.lock().expect("listed").len(),
+            scans,
+            "throttled"
+        );
+        assert!(agy_natives(&store).is_empty(), "no transcript of ours yet");
+        assert!(
+            host.listed
+                .lock()
+                .expect("listed")
+                .iter()
+                .all(|dir| *dir == brain),
+            "only agy's brain is scanned"
+        );
+        let path = agy_transcript(conversation);
+        store.append_file(
+            &path,
+            &agy_user_line(&crate::message::marked("hello", id, true)),
+        );
+        clock.advance(Duration::from_secs(3));
+        bridge.poll().expect("poll");
+        assert_eq!(
+            agy_natives(&store),
+            vec![(
+                "agy".to_string(),
+                conversation.to_string(),
+                Some(path.clone())
+            )]
+        );
+        store.append_file(
+            &path,
+            "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-11-25T14:26:00Z\",\"model\":\"gemini-3.8-flash-low\",\"input_tokens\":10,\"output_tokens\":2,\"cache_read_tokens\":0,\"content\":\"hi\"}\n",
+        );
+        bridge.poll().expect("poll");
+        bridge.poll().expect("poll");
+        let usage = records(&store)
+            .into_iter()
+            .filter(|record| matches!(record.event.kind, EventKind::ModelUsage { .. }))
+            .count();
+        assert_eq!(usage, 1, "the transcript's usage is ingested");
+        let stopped: Vec<_> = records(&store)
+            .into_iter()
+            .filter(|record| matches!(record.event.kind, EventKind::TurnStopped { .. }))
+            .map(|record| record.event.source_event_id)
+            .collect();
+        assert_eq!(stopped, vec![Some(format!("{conversation}:1:stopped"))]);
+        // Nothing of the decoys was bound or read, and it stays one binding.
+        bridge.poll().expect("poll");
+        assert_eq!(agy_natives(&store).len(), 1);
+
+        // Stopped, the session resumes on the conversation found.
+        let stop = submit_agy(&store, "stop-agy", CommandAction::Stop);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, stop).is_some()
+        });
+        assert_eq!(command_outcome(&store, stop), Some(Outcome::Succeeded));
+        let resume = submit_agy(
+            &store,
+            "resume-agy",
+            CommandAction::Resume {
+                prompt: None,
+                model: None,
+            },
+        );
+        store.set_pane(
+            &TerminalName::for_execution(&ExecutionId::for_command(resume)),
+            &agy_idle(),
+        );
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, resume).is_some()
+        });
+        assert_eq!(command_outcome(&store, resume), Some(Outcome::Succeeded));
+        let arguments = store
+            .launches()
+            .pop()
+            .expect("launched")
+            .arguments
+            .join(" ");
+        assert!(
+            arguments.contains(&format!("--conversation {conversation} --model")),
+            "{arguments}"
+        );
+    }
+
+    /// F5's anti-forgery: a conversation below agy's brain binds only on a
+    /// marker typed into this session for this execution. Conversations
+    /// that hold someone else's prompt, a marker of a command never typed,
+    /// or a marker of an earlier execution's command, bind nothing; nor
+    /// does this execution's own conversation while the host says another
+    /// agent holds the pane.
+    #[test]
+    fn agy_brain_conversations_without_this_executions_marker_never_bind() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let id = submit_agy_start(&store, "hello");
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            agy_config(Some("gemini-3.8-flash-low")),
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        let brain = format!("{AGY_HOME}/brain");
+        let decoys = [
+            (
+                "aaaaaaaa-0000-4000-8000-000000000001",
+                agy_user_line("someone else's prompt"),
+            ),
+            (
+                "aaaaaaaa-0000-4000-8000-000000000002",
+                agy_user_line(&crate::message::marked(
+                    "forged",
+                    CommandId(id.0 + 50),
+                    true,
+                )),
+            ),
+            (
+                "aaaaaaaa-0000-4000-8000-000000000003",
+                agy_user_line(&crate::message::marked(
+                    "earlier",
+                    CommandId(id.0 - 1),
+                    true,
+                )),
+            ),
+            // This execution's marker, but not in a prompt line.
+            (
+                "aaaaaaaa-0000-4000-8000-000000000004",
+                format!(
+                    "{{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"content\":{}}}\n",
+                    serde_json::to_string(&crate::message::marked("quoted", id, true))
+                        .expect("json")
+                ),
+            ),
+        ];
+        for (conversation, line) in &decoys {
+            store.append_file(&agy_transcript(conversation), line);
+        }
+        let names: Vec<&str> = decoys.iter().map(|(name, _)| *name).collect();
+        host.set_dirs(&brain, &names);
+        for _ in 0..4 {
+            clock.advance(Duration::from_secs(3));
+            bridge.poll().expect("poll");
+        }
+        assert!(agy_natives(&store).is_empty(), "no decoy binds");
+        assert!(
+            !host.listed.lock().expect("listed").is_empty(),
+            "the brain was scanned"
+        );
+
+        // Its own conversation, while the host says Claude Code holds the
+        // pane: nothing is known, nothing is scanned or bound.
+        let ours = "bbbbbbbb-0000-4000-8000-000000000000";
+        store.append_file(
+            &agy_transcript(ours),
+            &agy_user_line(&crate::message::marked("hello", id, true)),
+        );
+        let mut all = names.clone();
+        all.push(ours);
+        host.set_dirs(&brain, &all);
+        host.set(agy_reading(
+            Some("claude"),
+            crate::port::AgentStatus::Idle,
+            2,
+        ));
+        host.listed.lock().expect("listed").clear();
+        for _ in 0..4 {
+            clock.advance(Duration::from_secs(3));
+            bridge.poll().expect("poll");
+        }
+        assert!(
+            agy_natives(&store).is_empty(),
+            "a foreign agent's pane binds nothing"
+        );
+        assert!(
+            host.listed.lock().expect("listed").is_empty(),
+            "nor is scanned"
+        );
+        // The engine's own pane again: its conversation binds.
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 3));
+        clock.advance(Duration::from_secs(3));
+        bridge.poll().expect("poll");
+        assert_eq!(
+            agy_natives(&store),
+            vec![(
+                "agy".to_string(),
+                ours.to_string(),
+                Some(agy_transcript(ours))
+            )]
+        );
     }
 
     fn screens_with_keys(store: &Arc<MemoryStore>) -> Vec<(ScreenState, Option<String>)> {

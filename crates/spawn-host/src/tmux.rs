@@ -13,7 +13,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
-use spawn_core::port::{Launch, READ_LIMIT, Runner, TerminalError, TerminalHost};
+use spawn_core::port::{LIST_DIRS_LIMIT, Launch, READ_LIMIT, Runner, TerminalError, TerminalHost};
 
 /// Variables kept out of the tmux server's environment, besides every
 /// `SPAWN_*` one (see [`scrub`]).
@@ -1135,6 +1135,10 @@ impl TerminalHost for TmuxHost {
         read_from_files(self.beneath.as_ref(), workspace, path, offset)
     }
 
+    fn list_dirs(&self, _workspace: &WorkspaceId, dir: &str) -> Result<Vec<String>, TerminalError> {
+        list_dirs_files(self.beneath.as_ref(), dir)
+    }
+
     fn write_new(
         &self,
         _workspace: &WorkspaceId,
@@ -1397,6 +1401,70 @@ fn read_beneath(
     Ok(Some(bytes))
 }
 
+/// [`TerminalHost::list_dirs`] on this machine's files: below `beneath`
+/// through it ([`read_from_files`]), else the local directory, opened
+/// without following a symlink at its last component. Each entry is
+/// stated without following it: only directories count, newest
+/// modification first (then by name), at most [`LIST_DIRS_LIMIT`].
+pub(crate) fn list_dirs_files(
+    beneath: Option<&crate::beneath::Beneath>,
+    dir: &str,
+) -> Result<Vec<String>, TerminalError> {
+    use rustix::fs::{Mode, OFlags};
+    if let Some(beneath) = beneath
+        && let Some(relative) = beneath.relative(std::path::Path::new(dir))
+    {
+        let Some(opened) = beneath.open_dir(relative).map_err(TerminalError)? else {
+            return Ok(Vec::new());
+        };
+        return newest_dirs(opened.descriptor(), dir);
+    }
+    let fd = match rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
+        Err(errno) => return Err(TerminalError(format!("open {dir}: {errno}"))),
+    };
+    newest_dirs(&fd, dir)
+}
+
+/// The subdirectories of the open directory `fd` (`shown` in errors), as
+/// [`list_dirs_files`] gives them.
+fn newest_dirs(fd: &std::os::fd::OwnedFd, shown: &str) -> Result<Vec<String>, TerminalError> {
+    use rustix::fs::{AtFlags, FileType};
+    let mut entries = rustix::fs::Dir::read_from(fd)
+        .map_err(|errno| TerminalError(format!("list {shown}: {errno}")))?;
+    let mut found: Vec<((i64, i64), String)> = Vec::new();
+    while let Some(entry) = entries.read() {
+        let entry = entry.map_err(|errno| TerminalError(format!("list {shown}: {errno}")))?;
+        let Ok(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            continue;
+        }
+        // Not followed: a symlink is a symlink, never the directory it names.
+        let Ok(stat) = rustix::fs::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) else {
+            continue;
+        };
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            continue;
+        }
+        #[allow(clippy::useless_conversion)] // the fields' widths differ by platform
+        let modified = (
+            i64::from(stat.st_mtime),
+            i64::try_from(stat.st_mtime_nsec).unwrap_or(0),
+        );
+        found.push((modified, name.to_string()));
+    }
+    found.sort_by(|(a, a_name), (b, b_name)| b.cmp(a).then_with(|| a_name.cmp(b_name)));
+    found.truncate(LIST_DIRS_LIMIT);
+    Ok(found.into_iter().map(|(_, name)| name).collect())
+}
+
 /// At most [`READ_LIMIT`] bytes of a local file from `offset`; `None` when
 /// it does not exist. The agent controls the path: a symlink is not followed
 /// and a FIFO does not block the open (`O_NOFOLLOW | O_NONBLOCK`), and
@@ -1431,8 +1499,8 @@ fn read_local(path: &str, offset: u64) -> Result<Option<Vec<u8>>, TerminalError>
 #[cfg(test)]
 mod tests {
     use super::{
-        READ_LIMIT, end_stragglers, read_in_workspace, read_local, replace_local, runner_of,
-        stragglers_beneath, sweepable,
+        READ_LIMIT, end_stragglers, list_dirs_files, read_in_workspace, read_local, replace_local,
+        runner_of, stragglers_beneath, sweepable,
     };
     use spawn_core::id::TerminalName;
     use spawn_core::port::Runner;
@@ -1472,6 +1540,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn touch_dir(dir: &std::path::Path, seconds: u64) {
+        let opened = std::fs::File::open(dir).unwrap();
+        opened
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds))
+            .unwrap();
+    }
+
+    /// F5: a directory's subdirectories, newest first, never a file, a
+    /// symlink to a directory, or anything through a symlinked directory;
+    /// at most 64; the same below a `Beneath`.
+    #[test]
+    fn list_dirs_gives_plain_subdirectories_newest_first() {
+        let dir = scratch("list-dirs");
+        let brain = dir.join("brain");
+        std::fs::create_dir_all(&brain).unwrap();
+        for (name, seconds) in [("old", 1_000), ("newest", 3_000), ("middle", 2_000)] {
+            std::fs::create_dir(brain.join(name)).unwrap();
+            touch_dir(&brain.join(name), seconds);
+        }
+        std::fs::write(brain.join("a-file"), b"x").unwrap();
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        touch_dir(&elsewhere, 9_000);
+        std::os::unix::fs::symlink(&elsewhere, brain.join("linked")).unwrap();
+        let path = brain.to_str().unwrap();
+        assert_eq!(
+            list_dirs_files(None, path).unwrap(),
+            vec!["newest", "middle", "old"]
+        );
+        let beneath = crate::beneath::Beneath::new(&dir);
+        assert_eq!(
+            list_dirs_files(Some(&beneath), path).unwrap(),
+            vec!["newest", "middle", "old"]
+        );
+        // Missing: empty. A symlinked directory is never listed through.
+        let missing = dir.join("missing");
+        assert!(
+            list_dirs_files(None, missing.to_str().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            list_dirs_files(Some(&beneath), missing.to_str().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        let link = dir.join("brain-link");
+        std::os::unix::fs::symlink(&brain, &link).unwrap();
+        assert!(list_dirs_files(None, link.to_str().unwrap()).is_err());
+        assert!(list_dirs_files(Some(&beneath), link.to_str().unwrap()).is_err());
+        // Bounded.
+        let many = dir.join("many");
+        std::fs::create_dir(&many).unwrap();
+        for at in 0..70_u64 {
+            let sub = many.join(format!("c{at:02}"));
+            std::fs::create_dir(&sub).unwrap();
+            touch_dir(&sub, 10_000 + at);
+        }
+        let listed = list_dirs_files(None, many.to_str().unwrap()).unwrap();
+        assert_eq!(listed.len(), spawn_core::port::LIST_DIRS_LIMIT);
+        assert_eq!(listed.first().map(String::as_str), Some("c69"));
+        assert_eq!(listed.last().map(String::as_str), Some("c06"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// S16: a transcript is replaced only by a longer file, only while it

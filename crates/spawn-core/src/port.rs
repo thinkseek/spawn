@@ -570,6 +570,9 @@ pub enum Runner {
 /// writes cannot make the Bridge hold an unbounded buffer.
 pub const READ_LIMIT: usize = 8 << 20;
 
+/// The most subdirectory names one [`TerminalHost::list_dirs`] returns.
+pub const LIST_DIRS_LIMIT: usize = 64;
+
 /// What a terminal host that watches agents itself (Herdr) says an agent
 /// is doing ([`TerminalHost::agent`]). Herdr's `done` (idle after work
 /// nobody has looked at yet) is [`AgentStatus::Idle`]: whether anyone saw
@@ -759,6 +762,23 @@ pub trait TerminalHost: Send + Sync {
         path: &str,
         offset: u64,
     ) -> Result<Option<Vec<u8>>, TerminalError>;
+
+    /// The names of the subdirectories of `dir`, as the terminal's process
+    /// sees it, newest modification first, at most [`LIST_DIRS_LIMIT`] of
+    /// them: plain single components only (never `.`, `..` or a name with a
+    /// `/`), never a symlink nor anything but a directory, and `dir` itself
+    /// never followed through a symlink. Empty when there is no such
+    /// directory. How the Bridge finds the conversation an engine that names
+    /// its own (agy) started, when the host cannot report it (agy's hooks
+    /// and the host's socket are masked inside the engine's filesystem
+    /// view). A host that cannot list answers empty.
+    fn list_dirs(
+        &self,
+        _workspace: &WorkspaceId,
+        _dir: &str,
+    ) -> Result<Vec<String>, TerminalError> {
+        Ok(Vec::new())
+    }
 
     /// Create the file at `path`, as the terminal's process sees it, with
     /// its missing parent directories, holding `bytes`, unless something is

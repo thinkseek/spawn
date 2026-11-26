@@ -594,6 +594,33 @@ fn agy_prompt(line: &str) -> Option<&str> {
     (rest.is_empty() || rest.starts_with(' ')).then(|| rest.trim())
 }
 
+/// Whether `text`, what agy's prompt line holds after its `>`, is agy's own
+/// placeholder for an empty prompt: the hint of its permission mode, as
+/// agy 1.5.17 draws it after a turn (`Auto mode: edits & safe commands
+/// auto-approved (shift+tab to cycle)`), never something typed. A mode's
+/// name (capitalized words), `mode:`, its description, and the cycle hint
+/// last.
+fn agy_mode_placeholder(text: &str) -> bool {
+    let Some(described) = text.trim().strip_suffix("(shift+tab to cycle)") else {
+        return false;
+    };
+    let Some((head, description)) = described.split_once(':') else {
+        return false;
+    };
+    let words: Vec<&str> = head.split_whitespace().collect();
+    words.len() <= 3
+        && words
+            .last()
+            .is_some_and(|word| word.eq_ignore_ascii_case("mode"))
+        && words
+            .iter()
+            .all(|word| word.chars().all(char::is_alphabetic))
+        && words
+            .first()
+            .is_some_and(|word| word.starts_with(char::is_uppercase))
+        && !description.trim().is_empty()
+}
+
 /// The most lines a draft wraps onto below agy's prompt line.
 const AGY_WRAPPED_LINES: usize = 8;
 
@@ -742,6 +769,10 @@ pub fn read_agy_screen(pane: &str) -> ScreenReading {
         // whatever its first line holds.
         Some(_) if lower > at + 1 => ScreenReading::new(ScreenState::Drafted, &lines[at]),
         Some("") => ScreenReading::new(ScreenState::Ready, &lines[at]),
+        // agy's mode hint in the empty prompt (1.5.17, after a turn).
+        Some(text) if agy_mode_placeholder(text) => {
+            ScreenReading::new(ScreenState::Ready, &lines[at])
+        }
         Some(_) => ScreenReading::new(ScreenState::Drafted, &lines[at]),
         None => ScreenReading::unknown(),
     }
@@ -803,6 +834,53 @@ mod agy_tests {
         let after = format!("{TRUST}{}", idle_with("", ">", "? for shortcuts", ""));
         assert!(!is_agy_trust_dialog(&after));
         assert_eq!(read_agy_screen(&after).state, ScreenState::Ready);
+    }
+
+    /// F6 (O55): agy 1.5.17 draws its permission mode's hint in the empty
+    /// prompt after a turn. That is ready, not a draft; a real draft (one
+    /// line, wrapped, or text that only mentions the hint) stays drafted.
+    #[test]
+    fn agys_mode_hint_in_the_empty_prompt_is_ready() {
+        let footer = "? for shortcuts            auto · Gemini 3.8 Flash · low";
+        let hint = "> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)";
+        let pane = idle_with("● Done: wrote the file.\n", hint, footer, "");
+        let reading = read_agy_screen(&pane);
+        assert_eq!(reading.state, ScreenState::Ready, "{reading:?}");
+        assert_eq!(reading.evidence, hint);
+        for other in [
+            "> Plan mode: read-only, nothing is changed (shift+tab to cycle)",
+            "> Default mode: asks before edits (shift+tab to cycle)",
+            "  >   Auto mode: edits & safe commands auto-approved (shift+tab to cycle)  ",
+        ] {
+            let pane = idle_with("", other, footer, "");
+            assert_eq!(read_agy_screen(&pane).state, ScreenState::Ready, "{other}");
+        }
+        for draft in [
+            "> fix the bug",
+            "> fix the bug (shift+tab to cycle)",
+            "> please explain: what does (shift+tab to cycle) do",
+            "> Auto mode: (shift+tab to cycle)",
+            "> rm -rf mode: x (shift+tab to cycle)",
+            "> Auto mode: edits & safe commands auto-approved",
+        ] {
+            let pane = idle_with("", draft, footer, "");
+            assert_eq!(
+                read_agy_screen(&pane).state,
+                ScreenState::Drafted,
+                "{draft}"
+            );
+        }
+        // The hint's text with a second input line under it is a draft.
+        let wrapped = idle_with(
+            "",
+            &format!("{hint}\n  and more of what was typed"),
+            footer,
+            "",
+        );
+        assert_eq!(read_agy_screen(&wrapped).state, ScreenState::Drafted);
+        // A running turn under the hint is still busy.
+        let busy = idle_with("", hint, "esc to cancel", "");
+        assert_eq!(read_agy_screen(&busy).state, ScreenState::Busy);
     }
 
     #[test]
