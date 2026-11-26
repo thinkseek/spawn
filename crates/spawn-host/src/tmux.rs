@@ -13,9 +13,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
-use spawn_core::port::{
-    LIST_DIRS_LIMIT, Launch, READ_LIMIT, Runner, TerminalError, TerminalHost,
-};
+use spawn_core::port::{LIST_DIRS_LIMIT, Launch, READ_LIMIT, Runner, TerminalError, TerminalHost};
 
 /// Variables kept out of the tmux server's environment, besides every
 /// `SPAWN_*` one (see [`scrub`]).
@@ -1580,8 +1578,16 @@ mod tests {
         );
         // Missing: empty. A symlinked directory is never listed through.
         let missing = dir.join("missing");
-        assert!(list_dirs_files(None, missing.to_str().unwrap()).unwrap().is_empty());
-        assert!(list_dirs_files(Some(&beneath), missing.to_str().unwrap()).unwrap().is_empty());
+        assert!(
+            list_dirs_files(None, missing.to_str().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            list_dirs_files(Some(&beneath), missing.to_str().unwrap())
+                .unwrap()
+                .is_empty()
+        );
         let link = dir.join("brain-link");
         std::os::unix::fs::symlink(&brain, &link).unwrap();
         assert!(list_dirs_files(None, link.to_str().unwrap()).is_err());

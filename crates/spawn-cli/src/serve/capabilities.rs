@@ -256,7 +256,9 @@ fn view_now(engine: &str, home: &EngineHome) -> Boxed {
         &bases,
         Box::new(|lookup| {
             spawn_host::BwrapView::new("bwrap", spawn_host::ViewConfig::from_env(lookup)).map(
-                |view| std::sync::Arc::new(view) as std::sync::Arc<dyn spawn_core::port::EngineView>,
+                |view| {
+                    std::sync::Arc::new(view) as std::sync::Arc<dyn spawn_core::port::EngineView>
+                },
             )
         }),
     )
@@ -997,7 +999,10 @@ mod tests {
         );
         let probe = host.probe();
         assert_eq!(*host.runs.borrow(), ["claude --version"], "agy never ran");
-        assert_eq!(*host.viewed.borrow(), ["agy /home/a/.gemini/antigravity-cli"]);
+        assert_eq!(
+            *host.viewed.borrow(),
+            ["agy /home/a/.gemini/antigravity-cli"]
+        );
         let agy = &probe.engines[1];
         assert!(agy.enabled);
         assert_eq!(agy.installed, None);
@@ -1034,7 +1039,10 @@ mod tests {
             *host.runs.borrow(),
             ["claude --version", WRAPPED_VERSION, WRAPPED_MODELS]
         );
-        assert_eq!(*host.viewed.borrow(), ["agy /home/a/.gemini/antigravity-cli"]);
+        assert_eq!(
+            *host.viewed.borrow(),
+            ["agy /home/a/.gemini/antigravity-cli"]
+        );
         let agy = &probe.engines[1];
         assert_eq!(agy.installed, Some(true));
         assert_eq!(agy.version.as_deref(), Some("1.5.17"));
@@ -1163,7 +1171,10 @@ mod tests {
         assert_eq!(words, ["/usr/bin/bwrap", "--unshare-pid", "--"]);
         let scratch = _scratch.expect("a scratch workspace");
         let workspace = scratch.path().to_path_buf();
-        assert!(workspace.is_dir() && workspace.starts_with(&base), "{workspace:?}");
+        assert!(
+            workspace.is_dir() && workspace.starts_with(&base),
+            "{workspace:?}"
+        );
         assert_eq!(
             *view.asked.lock().expect("asked"),
             [(
@@ -1190,7 +1201,11 @@ mod tests {
             matches!(&boxed, Boxed::Unavailable(why) if why.contains("overlaps /tmp")),
             "refused"
         );
-        assert_eq!(std::fs::read_dir(&base).expect("base").count(), 0, "no scratch left");
+        assert_eq!(
+            std::fs::read_dir(&base).expect("base").count(),
+            0,
+            "no scratch left"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -609,7 +609,9 @@ fn agy_mode_placeholder(text: &str) -> bool {
     };
     let words: Vec<&str> = head.split_whitespace().collect();
     words.len() <= 3
-        && words.last().is_some_and(|word| word.eq_ignore_ascii_case("mode"))
+        && words
+            .last()
+            .is_some_and(|word| word.eq_ignore_ascii_case("mode"))
         && words
             .iter()
             .all(|word| word.chars().all(char::is_alphabetic))
@@ -862,7 +864,11 @@ mod agy_tests {
             "> Auto mode: edits & safe commands auto-approved",
         ] {
             let pane = idle_with("", draft, footer, "");
-            assert_eq!(read_agy_screen(&pane).state, ScreenState::Drafted, "{draft}");
+            assert_eq!(
+                read_agy_screen(&pane).state,
+                ScreenState::Drafted,
+                "{draft}"
+            );
         }
         // The hint's text with a second input line under it is a draft.
         let wrapped = idle_with(

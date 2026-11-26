@@ -3226,9 +3226,9 @@ impl Bridge {
         if bound.is_none()
             && let Some(dir) = active.driver.session_scan_dir(&home)
             && view.is_some_and(|view| {
-                view.steps.iter().any(|(command, steps)| {
-                    command.0 >= first && steps.typing_at.is_some()
-                })
+                view.steps
+                    .iter()
+                    .any(|(command, steps)| command.0 >= first && steps.typing_at.is_some())
             })
             && let Ok(names) = self.terminals.list_dirs(&active.workspace, &dir)
         {
@@ -10237,7 +10237,10 @@ mod tests {
         let conversation = "11111111-2222-4333-8444-555555555555";
         let stale = "99999999-0000-4000-8000-000000000000";
         let forged = "88888888-0000-4000-8000-000000000000";
-        store.append_file(&agy_transcript(stale), &agy_user_line("someone else's prompt"));
+        store.append_file(
+            &agy_transcript(stale),
+            &agy_user_line("someone else's prompt"),
+        );
         store.append_file(
             &agy_transcript(forged),
             &agy_user_line(&crate::message::marked(
@@ -10251,16 +10254,26 @@ mod tests {
             &agy_user_line(&crate::message::marked("hello", id, true)),
         );
         // Typed into this execution, but its transcript not written yet.
-        host.set_dirs(&brain, &[stale, "..", "../evil", forged, "empty-0", conversation]);
+        host.set_dirs(
+            &brain,
+            &[stale, "..", "../evil", forged, "empty-0", conversation],
+        );
         bridge.poll().expect("poll");
         bridge.poll().expect("poll");
         assert!(agy_natives(&store).is_empty(), "no transcript of ours yet");
         assert!(
-            host.listed.lock().expect("listed").iter().all(|dir| *dir == brain),
+            host.listed
+                .lock()
+                .expect("listed")
+                .iter()
+                .all(|dir| *dir == brain),
             "only agy's brain is scanned"
         );
         let path = agy_transcript(conversation);
-        store.append_file(&path, &agy_user_line(&crate::message::marked("hello", id, true)));
+        store.append_file(
+            &path,
+            &agy_user_line(&crate::message::marked("hello", id, true)),
+        );
         bridge.poll().expect("poll");
         assert_eq!(
             agy_natives(&store),
@@ -10313,7 +10326,12 @@ mod tests {
             command_outcome(&store, resume).is_some()
         });
         assert_eq!(command_outcome(&store, resume), Some(Outcome::Succeeded));
-        let arguments = store.launches().pop().expect("launched").arguments.join(" ");
+        let arguments = store
+            .launches()
+            .pop()
+            .expect("launched")
+            .arguments
+            .join(" ");
         assert!(
             arguments.contains(&format!("--conversation {conversation} --model")),
             "{arguments}"
@@ -10347,14 +10365,25 @@ mod tests {
         assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
         let brain = format!("{AGY_HOME}/brain");
         let decoys = [
-            ("aaaaaaaa-0000-4000-8000-000000000001", agy_user_line("someone else's prompt")),
+            (
+                "aaaaaaaa-0000-4000-8000-000000000001",
+                agy_user_line("someone else's prompt"),
+            ),
             (
                 "aaaaaaaa-0000-4000-8000-000000000002",
-                agy_user_line(&crate::message::marked("forged", CommandId(id.0 + 50), true)),
+                agy_user_line(&crate::message::marked(
+                    "forged",
+                    CommandId(id.0 + 50),
+                    true,
+                )),
             ),
             (
                 "aaaaaaaa-0000-4000-8000-000000000003",
-                agy_user_line(&crate::message::marked("earlier", CommandId(id.0 - 1), true)),
+                agy_user_line(&crate::message::marked(
+                    "earlier",
+                    CommandId(id.0 - 1),
+                    true,
+                )),
             ),
             // This execution's marker, but not in a prompt line.
             (
@@ -10375,7 +10404,10 @@ mod tests {
             bridge.poll().expect("poll");
         }
         assert!(agy_natives(&store).is_empty(), "no decoy binds");
-        assert!(!host.listed.lock().expect("listed").is_empty(), "the brain was scanned");
+        assert!(
+            !host.listed.lock().expect("listed").is_empty(),
+            "the brain was scanned"
+        );
 
         // Its own conversation, while the host says Claude Code holds the
         // pane: nothing is known, nothing is scanned or bound.
@@ -10387,19 +10419,33 @@ mod tests {
         let mut all = names.clone();
         all.push(ours);
         host.set_dirs(&brain, &all);
-        host.set(agy_reading(Some("claude"), crate::port::AgentStatus::Idle, 2));
+        host.set(agy_reading(
+            Some("claude"),
+            crate::port::AgentStatus::Idle,
+            2,
+        ));
         host.listed.lock().expect("listed").clear();
         for _ in 0..4 {
             bridge.poll().expect("poll");
         }
-        assert!(agy_natives(&store).is_empty(), "a foreign agent's pane binds nothing");
-        assert!(host.listed.lock().expect("listed").is_empty(), "nor is scanned");
+        assert!(
+            agy_natives(&store).is_empty(),
+            "a foreign agent's pane binds nothing"
+        );
+        assert!(
+            host.listed.lock().expect("listed").is_empty(),
+            "nor is scanned"
+        );
         // The engine's own pane again: its conversation binds.
         host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 3));
         bridge.poll().expect("poll");
         assert_eq!(
             agy_natives(&store),
-            vec![("agy".to_string(), ours.to_string(), Some(agy_transcript(ours)))]
+            vec![(
+                "agy".to_string(),
+                ours.to_string(),
+                Some(agy_transcript(ours))
+            )]
         );
     }
 

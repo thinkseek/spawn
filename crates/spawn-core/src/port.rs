@@ -772,7 +772,11 @@ pub trait TerminalHost: Send + Sync {
     /// its own (agy) started, when the host cannot report it (agy's hooks
     /// and the host's socket are masked inside the engine's filesystem
     /// view). A host that cannot list answers empty.
-    fn list_dirs(&self, _workspace: &WorkspaceId, _dir: &str) -> Result<Vec<String>, TerminalError> {
+    fn list_dirs(
+        &self,
+        _workspace: &WorkspaceId,
+        _dir: &str,
+    ) -> Result<Vec<String>, TerminalError> {
         Ok(Vec::new())
     }
 
