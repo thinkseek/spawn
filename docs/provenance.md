@@ -263,7 +263,9 @@ manifest-v1 **is** the `tree_sha256_v1` line list of spawn-node v1
 (section 7, [docs/node-protocol-v1.md](./node-protocol-v1.md)): one line
 `<64 hex SHA-256 of the file>  <path>\n` per regular file under the root,
 sorted bytewise by path. Symbolic links are never followed (one inside the
-root is left out, one that points outside it is refused), and other
+root is left out, one that points outside it is refused, by its text and
+as the kernel would resolve it through other links, so `dirlink/../x` with
+`dirlink -> .` is refused too), and other
 special files are left out. The snapshot is `sha256:<tree_sha256_v1>`, the
 SHA-256 of those bytes, algorithm-prefixed (D2): an unprefixed digest is
 refused everywhere (`--input`, `rollback`, `blast`, `show`). File sizes are
@@ -299,7 +301,13 @@ digest>]... [--code <commit>]... [--config <file>]... [--task N]
    the paths that differ from the head's manifest (`before`/`after`
    `sha256:` digests, `size` the file's), folded past 10,000 entries into
    one `tree` row per top-level directory (its digests the directory's own
-   manifest-v1 digest; a top-level file stays a row) as in the Git domain;
+   manifest-v1 digest; a top-level file stays a row) as in the Git domain,
+   and, when even those rows are over 10,000 (a flat directory, or more
+   than 10,000 top-level directories), into **one `tree` row of the root,
+   path `.`**, its digests the two snapshots (absent for the empty one): a
+   Change never holds more than 10,000 entries. A directory's manifest is
+   found by one binary search in the sorted manifest, so folding is one
+   pass, not one scan per directory;
    and one `used` edge per `--input` (a ref: its head snapshot, the detail
    naming the ref, its `change_id` and `rev`; a digest: itself), `--code`
    (`git1:<commit>`, a full id) and `--config` (the file's `sha256:`, the
@@ -310,11 +318,16 @@ digest>]... [--code <commit>]... [--config <file>]... [--task N]
    false`), whatever its flags: the idempotency of `(change_id, result)`
    is held against the head. A result equal to an older revision is a new
    revision (that is what a rollback, or an edit undone, is).
-5. `pins/prov/<ref>` is rewritten to keep the **3 newest distinct
-   snapshots** of the ref (`KEEP_SNAPSHOTS`): for each, a `# snapshot
-   <digest>` line, its manifest's digest and its files'. The objects of a
-   snapshot that leaves the pin, which no pin names any more and which no
-   namespace but `data` records, are removed at once (`"dropped"`).
+5. `pins/prov/<ref>` is rewritten to keep the file bytes of the **3
+   newest distinct snapshots** of the ref (`KEEP_SNAPSHOTS`): for each, a
+   `# snapshot <digest>` line, its manifest's digest and its files'. Then
+   a `# manifests` line and the manifest of every snapshot the ref ever
+   had: **manifests are pinned forever** (decision D3, class A; a
+   `--digest-only` snapshot's manifest too), only file bytes are capped
+   (class B). The file objects of a snapshot that leaves the newest 3,
+   which no pin names any more and which no namespace but `data` records,
+   are removed at once (`"dropped"`); its manifest stays readable, and no
+   GC pass (a `data` quota of 0 included) removes it.
 
 It prints one JSON object: the ref, its domain and `change_id`, the
 snapshot, files and bytes, whether a revision was recorded (with its
@@ -350,16 +363,18 @@ content"), and running it again records it.
   it as newest. The directory itself is not touched. It is refused, with a
   plain message and nothing recorded, when the snapshot was never one of
   the ref's, or when its bytes are no longer pinned and present (a snapshot
-  past the 3 newest, whose objects were dropped, or a `--digest-only`
-  one). A rollback to the head records nothing.
+  past the 3 newest, whose file bytes were dropped though its manifest is
+  kept, or a `--digest-only` one). A rollback to the head records nothing.
 
 ### Blast across data snapshots
 
 `spawn prov blast` takes two more targets: `data:<ref>` (its Change, every
 revision) and a snapshot `sha256:<hex>` (the revisions whose result it
-is). A commit or a snapshot is also followed through the edges that name
-it directly, so `blast <commit>` reaches every data snapshot made with
-`--code <commit>`, whether or not the commit is indexed in a Git domain.
+is). A recorded Change's walk already follows the edges to its result;
+a commit or a snapshot that no recorded Change is gets followed through
+the edges that name it directly, so `blast <commit>` reaches every data
+snapshot made with `--code <commit>` even when no Git domain indexes the
+commit.
 Through `used` edges the walk goes from a snapshot to what read it (its
 result, or the content of one of its entries, `--input sha256:<file>`),
 and on. The answer gains `snapshots`: the data snapshots among the
@@ -431,4 +446,5 @@ data. Losing the store loses data bytes, never a commit.
   file) and are refused. A blast follows a snapshot's own result and its
   entries' contents: an output recorded as one ref for many inputs is
   affected as a whole, so record one ref per output to get the exact ones.
-  The 3 kept snapshots are per ref; older bytes are gone once dropped.
+  The 3 kept snapshots are per ref; older file bytes are gone once
+  dropped (their manifests stay, so what they held is still known).
