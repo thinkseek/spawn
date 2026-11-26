@@ -415,12 +415,11 @@ fn the_toy_pipeline_blast_names_the_affected_merge_and_rollback_repairs_it() {
         refs["refs"].as_array().map(Vec::len),
         Some(2 + SHARDS / GROUP)
     );
+    // Its third revision holds what its first held: two snapshots, each
+    // kept once.
     let merge3 = head_of(&refs, "merge-3");
-    assert_eq!(
-        merge3["kept"].as_array().map(Vec::len),
-        Some(3),
-        "three snapshots kept: {merge3}"
-    );
+    assert_eq!(merge3["kept"].as_array().map(Vec::len), Some(2), "{merge3}");
+    assert_eq!(merge3["revisions"], 3);
     let cas = Store::open(scratch.join("cas")).expect("the store");
     cas.verify_snapshot(&spawn_cas::Digest::parse(&good).expect("digest"))
         .expect("the good snapshot is whole");
