@@ -5,7 +5,7 @@ English · [简体中文](./README.zh-CN.md)
 Spawn runs Claude Code agents in isolated workspaces and records everything they do in one PostgreSQL event log.
 
 - A caller submits a command (start, input, resume, stop) to a queue in PostgreSQL.
-- `spawn tick` claims the command, forks a git branch, exports it into a working tree and starts the engine in a tmux session.
+- `spawn tick` claims the command, forks a git branch, exports it into a working tree and starts the engine in a Herdr session (or a tmux session with `SPAWN_TERMINAL_BACKEND=tmux`).
 - Claude Code's transcript, the terminal screen and the engine's exit status become typed events in the log. The engine's terminal holds no database login.
 - An Observer judges each session (ready, working, blocked, failed) and writes the result back as an event.
 
@@ -17,7 +17,8 @@ The log is the only state. Each `spawn tick` is a new process that rebuilds its 
 | --- | --- | --- |
 | Rust | 1.95 or later | Build |
 | PostgreSQL | 16 or later | Event log, command queue, views |
-| tmux | 3.x | Terminals |
+| herdr | 0.9.5 (protocol 22) | Default terminals (`SPAWN_TERMINAL_BACKEND=herdr`) |
+| tmux | 3.x | Explicit fallback terminals (`SPAWN_TERMINAL_BACKEND=tmux`) |
 | git | 2.43 or later (`git --attr-source`, checked at start) | Branches and workspaces |
 | Claude Code | current | Engine |
 
@@ -114,8 +115,11 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | `SPAWN_GIT_REPO` | required | Bare repository for agents no mission owns (the supervisor, ad hoc workers) |
 | `SPAWN_WORKSPACE_ROOT` | required | Directory holding one working tree per branch; `--root` overrides it for `tick` and `loop` |
 | `SPAWN_WORKER` | `spawn-worker` | Worker name on claimed commands |
-| `SPAWN_TMUX_PROGRAM` | `tmux` | tmux path |
-| `SPAWN_TMUX_SOCKET` | default socket | tmux `-L` socket name |
+| `SPAWN_TERMINAL_BACKEND` | `herdr` | Terminal backend (`herdr` by default, or `tmux` fallback) |
+| `SPAWN_HERDR_PROGRAM` | `herdr` | Herdr path (default backend) |
+| `SPAWN_HERDR_SESSION` | `spawn` | Herdr `--session` name |
+| `SPAWN_TMUX_PROGRAM` | `tmux` | tmux path (when `SPAWN_TERMINAL_BACKEND=tmux`) |
+| `SPAWN_TMUX_SOCKET` | default socket | tmux `-L` socket name (when `SPAWN_TERMINAL_BACKEND=tmux`) |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code path |
 | `SPAWN_CLAUDE_PROJECTS` | `$SPAWN_CLAUDE_CONFIG_DIR/projects`, else `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects` | Where Claude Code writes its transcripts |
 | `SPAWN_CLAUDE_CONFIG_DIR` | unset | Opt-in Claude Code directory (an absolute path; anything else stops `spawn loop`) for engines (their `CLAUDE_CONFIG_DIR`); its `settings.json` must hold the gateway token. Unset, engines use `~/.claude` as before |

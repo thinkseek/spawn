@@ -13,7 +13,7 @@
 | 事件存储 | PostgreSQL 16 | 建表、写入函数、视图、命令队列 |
 | 语义状态 | 规则，加判定模型 `/v1/systemone`（未配置时只用规则） | 规则先判；规则定不了的情形发一次 HTTP 请求；写一条 observation |
 | 对外接口 | SQL | 视图查询状态，`spawn_submit` 下发命令 |
-| 终端 | tmux（默认），或显式选择的 herdr | 建会话、输入文本、抓取屏尾 |
+| 终端 | herdr（默认），或显式选择的 tmux（`SPAWN_TERMINAL_BACKEND=tmux`） | 建会话、输入文本、抓取屏尾 |
 | 变更提示 | PostgreSQL `LISTEN/NOTIFY` | 每次追加事件 `pg_notify('spawn_events', <id>)`；`spawn loop` 和 `GET /api/stream` 收到即读，提示丢了也照读记录 |
 
 Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎。
@@ -26,7 +26,7 @@ Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎�
 | --- | --- | --- |
 | `spawn-core` | 类型、端口、事件归一、Bridge、Observer、能力图模型；内存实现与一致性套件在 `testing` feature 后。零 IO | serde、serde_json、sha2、thiserror |
 | `spawn-postgres` | EventLog + CommandQueue 的 PG 实现、`sql/schema.sql`、读方法、`LISTEN spawn_events` 连接（`wake.rs`） | spawn-core、spawn-kdf、postgres、postgres-protocol、fallible-iterator、serde、serde_json、whoami |
-| `spawn-host` | 终端（`TerminalHost`：`TmuxHost` 默认，`HerdrHost` 由 `SPAWN_TERMINAL_BACKEND=herdr` 显式选择）、工作区存储（`LocalWorkspaceStore`：`git`、`cow`、`overlay` 三种引擎加 `auto` 选择，同一 `WorkspaceStore` 契约；`cas_dedup` 对 Cow 工作区的 `target/`、`node_modules/` 去重，块存于 `spawn-cas`）、transcript 归档、inotify | spawn-core、spawn-cas、libc、rustix、serde_json |
+| `spawn-host` | 终端（`TerminalHost`：`HerdrHost` 默认，`TmuxHost` 由 `SPAWN_TERMINAL_BACKEND=tmux` 显式选择）、工作区存储（`LocalWorkspaceStore`：`git`、`cow`、`overlay` 三种引擎加 `auto` 选择，同一 `WorkspaceStore` 契约；`cas_dedup` 对 Cow 工作区的 `target/`、`node_modules/` 去重，块存于 `spawn-cas`）、transcript 归档、inotify | spawn-core、spawn-cas、libc、rustix、serde_json |
 | `spawn-cas` | 统一内容寻址存储：带算法前缀的摘要（`sha256:<64 hex>`）、`objects/<algo>/<2 hex>/<hex>`（0444）、`pins/<owner>/<name>`、按命名空间的 LRU GC（`access/<ns>/`）、`tmp/` 暂存；crash-only，不 fsync；与 Go `spawn-node/cas` 同一磁盘布局；旧 `cas_dedup` 的 `<2 hex>/<hex>` 原地改名收编，不重算哈希 | sha2、thiserror、libc |
 | `spawn-jev` | 判定 HTTP 客户端，端口在 core，实现在此 | spawn-core、serde、serde_json |
 | `spawn-kdf` | 受限登录口令的 PBKDF2-HMAC-SHA256 派生（单独一个 crate，开发构建也以 `opt-level = 3` 编译） | sha2、hmac |
@@ -173,8 +173,11 @@ spawn fleet
 | `SPAWN_MAX_FILE_MB` | `100` | Git 与 Cow checkpoint 收录的单个文件上限（MiB）；更大的文件不进 checkpoint，并告知 agent 一次（overlay 的 checkpoint 无上限） |
 | `SPAWN_WORKSPACE_BACKEND` | `git` | 根下所有工作区的引擎：`git`、`cow`（写时复制克隆）、`auto`（文件系统能克隆时用 Cow，否则 Git，从不选 overlay）、`overlay`（显式选择，仅 Linux；`spawn loop` 目前拒绝）。其他取值，或根已被另一引擎占用（`<root>/.spawn-workspace-backend`），`spawn loop` 启动即退出（docs/storage.md「Workspace backends」） |
 | `SPAWN_CAS_DEDUP` | 未设 | `1`：每次挂载 Cow 工作区时把 `target/`、`node_modules/` 对 `<root>/.cas` 去重（从不碰 transcript），卸载后修剪；`0` 或未设：关闭；其他取值 `spawn loop` 启动即退出 |
-| `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 可执行文件 |
-| `SPAWN_TMUX_SOCKET` | 无 | 私有 tmux socket |
+| `SPAWN_TERMINAL_BACKEND` | `herdr` | 终端后端：`herdr`（默认）或 `tmux`（显式回退） |
+| `SPAWN_HERDR_PROGRAM` | `herdr` | herdr 可执行文件 |
+| `SPAWN_HERDR_SESSION` | `spawn` | herdr 私有 `--session` 会话名 |
+| `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 可执行文件（`SPAWN_TERMINAL_BACKEND=tmux` 时） |
+| `SPAWN_TMUX_SOCKET` | 无 | 私有 tmux socket（`SPAWN_TERMINAL_BACKEND=tmux` 时） |
 | `SPAWN_JUDGE_URL` | 未设 | 判定服务根地址，未设时用内置规则 |
 | `SPAWN_WORKER` | `spawn-worker` | 租约中的 worker 名 |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | `spawn loop` 两轮之间的间隔 |

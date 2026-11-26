@@ -1,4 +1,4 @@
-//! Herdr adapter: an opt-in alternative to tmux (`SPAWN_TERMINAL_BACKEND=herdr`).
+//! Herdr adapter: Spawn's default terminal backend (`SPAWN_TERMINAL_BACKEND=herdr`, or unset).
 //!
 //! Herdr (<https://herdr.dev>) is a terminal workspace manager whose server
 //! holds workspaces, tabs and panes, and answers a JSON API on a Unix socket

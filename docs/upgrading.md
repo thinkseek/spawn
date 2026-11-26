@@ -204,9 +204,14 @@ only where they exercise it.
 
 ## Deploying
 
+Herdr (`SPAWN_TERMINAL_BACKEND=herdr`, protocol 22) is now the default terminal
+backend; set `SPAWN_TERMINAL_BACKEND=tmux` to explicitly fall back to tmux
+(all tmux-backed scenarios and hosts without herdr 0.9.5 need it explicitly set
+before restarting `spawn-loop`).
+
 A deploy that enables agy (`SPAWN_ENGINES=claude,agy`) also needs, in the
-loop's environment, `SPAWN_TERMINAL_BACKEND=herdr` and `SPAWN_AGY_MODEL`
-(optionally `SPAWN_AGY_PROGRAM`, `SPAWN_AGY_HOME`), and on the host herdr
+loop's environment, `SPAWN_AGY_MODEL` (Herdr is already default; optionally set
+`SPAWN_TERMINAL_BACKEND=herdr`, `SPAWN_AGY_PROGRAM`, `SPAWN_AGY_HOME`), and on the host herdr
 0.9.5 with its antigravity-cli integration, a logged-in agy and a working
 `bwrap` on the loop's `PATH` (agy runs only inside its filesystem view,
 `SPAWN_ENGINE_VIEW=required` by default; item 12 above). Without them,

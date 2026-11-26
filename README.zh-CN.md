@@ -5,7 +5,7 @@
 Spawn 在隔离的工作区中运行 Claude Code agent，并把它们的全部行为记录到一个 PostgreSQL 事件日志。
 
 - 调用方向 PostgreSQL 中的队列提交命令（start、input、resume、stop）。
-- `spawn tick` 领取命令，创建一个 git 分支，导出工作树，在 tmux 会话中启动引擎。
+- `spawn tick` 领取命令，创建一个 git 分支，导出工作树，在 Herdr 会话（或设 `SPAWN_TERMINAL_BACKEND=tmux` 使用 tmux 会话）中启动引擎。
 - Claude Code 的 transcript、终端屏幕与引擎退出状态转为日志中的类型化事件。引擎所在终端不持有数据库登录。
 - Observer 判定每个会话的状态（可输入、运行中、阻塞、失败），并把结论作为事件写回。
 
@@ -17,7 +17,8 @@ Spawn 在隔离的工作区中运行 Claude Code agent，并把它们的全部�
 | --- | --- | --- |
 | Rust | 1.95 及以上 | 编译 |
 | PostgreSQL | 16 及以上 | 事件日志、命令队列、视图 |
-| tmux | 3.x | 终端 |
+| herdr | 0.9.5（protocol 22） | 默认终端（`SPAWN_TERMINAL_BACKEND=herdr`） |
+| tmux | 3.x | 显式回退终端（`SPAWN_TERMINAL_BACKEND=tmux`） |
 | git | 2.40 及以上（`git --attr-source`，启动时检查） | 分支与工作区 |
 | Claude Code | 当前版本 | 引擎 |
 
@@ -96,8 +97,11 @@ spawn tail --session session_demo
 | `SPAWN_GIT_REPO` | 必填 | 不属于任何任务的 agent（supervisor、临时 worker）用的裸仓库 |
 | `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
 | `SPAWN_WORKER` | `spawn-worker` | 领取命令时记录的 worker 名 |
-| `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 路径 |
-| `SPAWN_TMUX_SOCKET` | 默认 socket | tmux `-L` socket 名 |
+| `SPAWN_TERMINAL_BACKEND` | `herdr` | 终端后端（默认 `herdr`；可显式设 `tmux` 回退） |
+| `SPAWN_HERDR_PROGRAM` | `herdr` | herdr 路径 |
+| `SPAWN_HERDR_SESSION` | `spawn` | herdr `--session` 会话名 |
+| `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 路径（`SPAWN_TERMINAL_BACKEND=tmux` 时） |
+| `SPAWN_TMUX_SOCKET` | 默认 socket | tmux `-L` socket 名（`SPAWN_TERMINAL_BACKEND=tmux` 时） |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code 路径 |
 | `SPAWN_CLAUDE_PROJECTS` | `$SPAWN_CLAUDE_CONFIG_DIR/projects`，否则 `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude Code 写 transcript 的目录 |
 | `SPAWN_CLAUDE_CONFIG_DIR` | 不设 | 可选：引擎专用的 Claude Code 目录（须为绝对路径，否则 `spawn loop` 不启动）（作为引擎的 `CLAUDE_CONFIG_DIR`），其 `settings.json` 须含网关 token；不设则照旧用 `~/.claude` |

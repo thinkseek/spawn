@@ -1,4 +1,4 @@
-//! Host adapters: tmux terminals, the workspace stores (Git, the opt-in
+//! Host adapters: Herdr (default) and tmux terminals, the workspace stores (Git, the opt-in
 //! copy-on-write and overlay stores, behind one [`LocalWorkspaceStore`]),
 //! the artifact deduplicator, the local transcript archive, and the
 //! filesystem view (`bwrap`) an engine without deny rules runs in.
@@ -68,8 +68,8 @@ pub use workspace::{
     BACKEND_MARKER, CAS_DIRECTORY, LocalWorkspaceStore, WorkspaceBackend, claim_root, root_backend,
 };
 
-/// The terminal host of this machine Spawn runs on: tmux (the default) or
-/// Herdr (`SPAWN_TERMINAL_BACKEND=herdr`), told apart only here.
+/// The terminal host of this machine Spawn runs on: Herdr (the default) or
+/// tmux (`SPAWN_TERMINAL_BACKEND=tmux`), told apart only here.
 pub enum LocalTerminalHost {
     Tmux(TmuxHost),
     Herdr(HerdrHost),
