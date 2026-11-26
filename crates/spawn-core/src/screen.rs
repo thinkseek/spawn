@@ -425,7 +425,7 @@ fn choice_footer<'a>(lines: &[&'a str]) -> Option<&'a str> {
 pub fn is_choice_footer(pane: &str) -> bool {
     let stripped: Vec<String> = pane.lines().map(strip_ansi).collect();
     let lines: Vec<&str> = stripped.iter().map(String::as_str).collect();
-    choice_footer(&lines).is_some() && !is_trust_dialog(pane)
+    choice_footer(&lines).is_some()
 }
 
 /// Parse the pane tail.
