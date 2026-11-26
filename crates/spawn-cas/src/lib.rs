@@ -1,86 +1,90 @@
-//! `spawn-cas`: the unified content-addressed store (design §10), the same
-//! layout as `spawn-node`'s Go `cas` package, byte for byte:
+//! `spawn-cas`: the unified content-addressed store (design §10, D6 Phase 0),
+//! on-disk compatible with `spawn-node`'s Go `cas` package:
 //!
 //! ```text
 //! <cas>/.spawn-cas                      marker (CAS_MARKER)
 //! <cas>/objects/<algo>/<2 hex>/<hex>    one immutable object, mode 0444
+//! <cas>/chunk-index/<algo>/<2 hex>/<hex>  spawn-chunks-v1 index for > 4 MiB blobs
 //! <cas>/pins/<owner>/<name>             a text file of digests something holds
 //! <cas>/access/<ns>/<algo>/<hex>        LRU record: its mtime is the last use
 //! <cas>/tmp/                            writes land here, then rename
 //! ```
 //!
-//! # Class B: crash-only
+//! # Class B & Persistent D6 Namespaces
 //!
-//! Nothing is fsynced. Any of the store may be removed at any instant,
-//! mid-write included, and the next [`Store::open`] reads what is left
-//! correctly with no repair step: an object is renamed into place whole
-//! (after it was verified), a pin file is replaced whole (temporary file
-//! and `rename`), GC deletes an object before its access record (a record
-//! that names nothing is dropped by the next pass), and abandoned
-//! temporaries are purged after [`TMP_MAX_AGE`].
+//! Ephemeral namespaces (`artifacts`, `base-cache`, `backup`, `data`) are
+//! crash-only unless pinned; D6 persistent namespaces (`tree`, `blob`) are never
+//! LRU-evicted and support filesystem-level [`Store::sync_store`] before
+//! publishing PostgreSQL snapshot roots.
 //!
 //! # Digests
 //!
-//! Every address carries its algorithm ([`Digest`]): `sha256:<64 hex>` or
-//! `blake3:<64 hex>`, lowercase; anything else is refused everywhere.
-//! BLAKE3 parses, but cannot be computed until its own PR (ST2): hashing or
-//! verifying it is [`CasError::AlgoUnavailable`], and unverifiable bytes
-//! are never stored.
+//! Every content address uses `sha256:<64 hex>`, lowercase; unprefixed digests
+//! and legacy `blake3:` addresses are refused everywhere (`D6 Fine Item 7.1`).
 //!
 //! # Safety rules
 //!
 //! - Bytes are verified on the way in ([`Store::commit`], [`Store::put`],
-//!   [`Store::publish`]) and on [`Store::read`]; bytes that do not hash to
-//!   their address are refused and removed.
-//! - Objects are opened `O_NOFOLLOW | O_NONBLOCK`: a symlink or a special
-//!   file planted as an object is refused, never followed.
+//!   [`Store::publish`], [`Store::put_blob`]) and on [`Store::read`] /
+//!   [`Store::stream_blob`]; bytes that do not hash to their address are
+//!   refused and removed.
+//! - Objects and chunk indices are opened `O_NOFOLLOW | O_NONBLOCK`: symlinks
+//!   and special files are refused, never followed.
 //! - A non-empty directory without [`CAS_MARKER`] is never taken for a
 //!   store ([`CasError::NotCas`]).
 //! - [`Store::pin`] and [`Store::gc`] exclude each other (an `flock` on
-//!   `pins/.lock`, so across threads and processes): a pin either is read
-//!   by a pass or is written after it, so a pin that returned with its
-//!   object present never loses it to that pass, or to any later one.
+//!   `pins/.lock`, across threads and processes).
 //!
 //! # Data snapshots
 //!
 //! [`Manifest`] is manifest-v1, a data snapshot's manifest: the
 //! `tree_sha256_v1` line list of a directory; the snapshot's identity is
-//! `sha256:<tree_sha256_v1>`. [`Store::put_snapshot`] stores one in the
-//! `data` namespace and [`Store::keep_snapshots`] keeps the file bytes of
-//! the [`KEEP_SNAPSHOTS`] newest of a data ref, and every manifest it ever
-//! had, pinned (`pins/prov/<ref>`), crash-only like the rest (`spawn prov snapshot`, docs/provenance.md).
-//!
-//! The store's previous incarnation (`spawn-host`'s `cas_dedup`, objects
-//! at `<cas>/<2 hex>/<64 hex>`) is adopted in place by
-//! [`Store::adopt_legacy_shards`]: a rename, nothing rehashed.
+//! `sha256:<tree_sha256_v1>`.
 
+mod chunker;
 mod digest;
 mod gc;
+mod git_oid;
 mod legacy;
 mod manifest;
+mod merkle;
 mod store;
 
 use std::io;
 use std::path::PathBuf;
 
+pub use chunker::{
+    CHUNK_AVG, CHUNK_MAX, CHUNK_MIN, CHUNKER_FASTCDC_V1, CHUNKS_MAGIC, ChunkIndex, ChunkRef,
+    StoredBlob, fastcdc_gear_table, next_chunk_len,
+};
 pub use digest::{
     Algo, Digest, Hasher, Verified, is_hex64, sha256_of, sha256_reader, verify_reader,
 };
 pub use gc::{
-    GcReport, NS_ARTIFACTS, NS_BACKUP, NS_BASE_CACHE, NS_DATA, Quotas, TMP_MAX_AGE, default_quotas,
+    GcReport, NS_ARTIFACTS, NS_BACKUP, NS_BASE_CACHE, NS_BLOB, NS_DATA, NS_TREE, Quotas,
+    TMP_MAX_AGE, default_quotas,
+};
+pub use git_oid::{
+    GIT_POINTER_THRESHOLD, GitOid, GitOidCache, git_blob_oid_of_bytes, git_pointer_bytes,
+    project_blob_oid, project_snapshot_oid, project_tree_oid,
 };
 pub use legacy::AdoptReport;
 pub use manifest::{
     KEEP_SNAPSHOTS, KeepReport, MANIFEST_V1, Manifest, ManifestEntry, PROV_PIN_OWNER,
 };
+pub use merkle::{
+    SNAPSHOT_MAGIC, Snapshot, TREE_MAGIC, Tree, TreeEntry, TreeEntryKind, TreeMutation,
+    empty_tree_digest, is_valid_entry_name,
+};
 pub use store::{
-    CAS_MARKER, Clock, GcLock, ObjectEntry, Publish, Store, is_valid_name, system_clock,
+    CAS_MARKER, Clock, GcLock, GcSharedLock, ObjectEntry, Publish, Store, is_valid_name,
+    system_clock,
 };
 
 /// What a store operation refused, or the I/O error that stopped it.
 #[derive(Debug, thiserror::Error)]
 pub enum CasError {
-    /// A digest that is not `sha256:<64 hex>` or `blake3:<64 hex>`.
+    /// A digest that is not `sha256:<64 hex>`.
     #[error("digest {input:?}: {reason}")]
     BadDigest {
         /// The text given.
@@ -88,15 +92,12 @@ pub enum CasError {
         /// What is wrong with it.
         reason: &'static str,
     },
-    /// The algorithm parses but cannot be computed in this build.
-    #[error("{0} verification is not available in this build (ST2)")]
-    AlgoUnavailable(Algo),
     /// The content does not hash to its address.
     #[error("content hashes to {got}, not {want}")]
     Mismatch {
         /// The address.
         want: Digest,
-        /// What the content hashes to (algorithm-prefixed).
+        /// What the content hashes to (`sha256:<64 hex>`).
         got: String,
     },
     /// An owner, pin name or namespace outside
@@ -130,6 +131,30 @@ pub enum CasError {
         /// What is wrong with it.
         reason: &'static str,
     },
+    /// Canonical `spawn-tree-v1`, `spawn-snapshot-v1`, or `spawn-chunks-v1` encoding violation.
+    #[error("malformed CAS object format: {0}")]
+    BadFormat(&'static str),
+    /// Object exceeded the write-side 4 MiB single-object hard cap.
+    #[error("{kind} object size {size} exceeds {max}-byte cap")]
+    TooLarge {
+        /// Object kind (`tree`, `snapshot`, `chunk index`).
+        kind: &'static str,
+        /// Actual encoded byte size.
+        size: usize,
+        /// Maximum allowed bytes.
+        max: usize,
+    },
+    /// Invalid or non-SHA1 Git OID projection input.
+    #[error("invalid Git OID: {0}")]
+    BadGitOid(&'static str),
+    /// Chunk index did not match the requested blob digest or byte total.
+    #[error("corrupt chunk index for {want}: {reason}")]
+    CorruptIndex {
+        /// Target file digest.
+        want: Digest,
+        /// Reason for rejection.
+        reason: &'static str,
+    },
     /// The file system said no.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -151,13 +176,15 @@ impl From<CasError> for io::Error {
     fn from(error: CasError) -> Self {
         match error {
             CasError::Io(error) => error,
-            CasError::NotCas(_) | CasError::BadDigest { .. } | CasError::BadName { .. } => {
-                io::Error::new(io::ErrorKind::InvalidInput, error)
-            }
-            CasError::Mismatch { .. } | CasError::BadManifest { .. } => {
-                io::Error::new(io::ErrorKind::InvalidData, error)
-            }
-            CasError::AlgoUnavailable(_) => io::Error::new(io::ErrorKind::Unsupported, error),
+            CasError::NotCas(_)
+            | CasError::BadDigest { .. }
+            | CasError::BadName { .. }
+            | CasError::BadGitOid(_)
+            | CasError::TooLarge { .. } => io::Error::new(io::ErrorKind::InvalidInput, error),
+            CasError::Mismatch { .. }
+            | CasError::BadManifest { .. }
+            | CasError::BadFormat(_)
+            | CasError::CorruptIndex { .. } => io::Error::new(io::ErrorKind::InvalidData, error),
             CasError::NotPlain(_) | CasError::SymlinkEscape { .. } => io::Error::other(error),
         }
     }

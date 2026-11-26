@@ -1,6 +1,6 @@
 //! Crash-only LRU garbage collection by namespace (design §10.3).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,14 @@ pub const NS_BASE_CACHE: &str = "base-cache";
 pub const NS_BACKUP: &str = "backup";
 /// Data snapshots.
 pub const NS_DATA: &str = "data";
+/// Persistent Merkle tree & snapshot metadata objects (D6, never LRU-evicted).
+pub const NS_TREE: &str = "tree";
+/// Persistent file & chunk blobs referenced by trees (D6, never LRU-evicted).
+pub const NS_BLOB: &str = "blob";
+
+pub(crate) fn is_persistent_namespace(name: &str) -> bool {
+    name == NS_TREE || name == NS_BLOB
+}
 
 /// Byte quotas by namespace; a namespace without one is never evicted.
 pub type Quotas = BTreeMap<String, u64>;
@@ -122,6 +130,7 @@ impl Store {
     fn evict(&self, quotas: &Quotas, report: &mut GcReport) -> Result<(), CasError> {
         let _lock = self.lock_gc()?;
         let pinned = self.pinned()?;
+        let persistent = self.persistent_digests()?;
         #[cfg(test)]
         if let Some(hook) = &self.after_pinned {
             hook();
@@ -133,7 +142,9 @@ impl Store {
             let name = namespace.file_name().to_string_lossy().into_owned();
             let mut records = self.records(&namespace.path())?;
             let mut total: u64 = records.iter().map(|record| record.size).sum();
-            if let Some(&quota) = quotas.get(&name) {
+            if let Some(&quota) = quotas.get(&name)
+                && !is_persistent_namespace(&name)
+            {
                 records.sort_by(|left, right| {
                     (left.used, &left.digest).cmp(&(right.used, &right.digest))
                 });
@@ -143,6 +154,16 @@ impl Store {
                     }
                     if pinned.contains(&record.digest) {
                         report.kept_pinned += 1;
+                        continue;
+                    }
+                    if persistent.contains(&record.digest) {
+                        if let Err(error) = remove_missing_ok(&record.path) {
+                            report
+                                .errors
+                                .push(format!("remove {}: {error}", record.path.display()));
+                            continue;
+                        }
+                        total -= record.size;
                         continue;
                     }
                     let object = self.object_path(&record.digest);
@@ -165,6 +186,34 @@ impl Store {
             report.namespace_use.insert(name, total);
         }
         Ok(())
+    }
+
+    /// All digests referenced in D6 persistent namespaces (`tree`, `blob`),
+    /// read under the exclusive GC lock so ephemeral LRU eviction never deletes
+    /// shared backing objects.
+    fn persistent_digests(&self) -> Result<BTreeSet<Digest>, CasError> {
+        let mut persistent = BTreeSet::new();
+        for name in [NS_TREE, NS_BLOB] {
+            let namespace = self.root().join("access").join(name);
+            for algo_dir in read_dir_or_empty(&namespace)? {
+                let Some(algo) = Algo::from_name(&algo_dir.file_name().to_string_lossy()) else {
+                    continue;
+                };
+                if !algo_dir.file_type()?.is_dir() {
+                    continue;
+                }
+                for record in read_dir_or_empty(&algo_dir.path())? {
+                    let hex = record.file_name().to_string_lossy().into_owned();
+                    if !is_hex64(&hex) {
+                        continue;
+                    }
+                    if fs::symlink_metadata(record.path()).is_ok_and(|meta| meta.is_file()) {
+                        persistent.insert(Digest::from_parts(algo, &hex)?);
+                    }
+                }
+            }
+        }
+        Ok(persistent)
     }
 
     /// The access records of one namespace directory whose object exists;
@@ -302,5 +351,50 @@ mod tests {
         }
         store.gc(&quotas).expect("gc");
         assert!(store.has(&digest), "a pinned object was evicted");
+    }
+
+    #[test]
+    fn persistent_write_during_gc_never_loses_a_shared_object() {
+        let scratch = Scratch::new("gc-persist-race");
+        let mut store = Store::open(scratch.0.join("cas")).expect("open");
+        let shared = b"shared ephemeral and persistent bytes";
+        let digest = store.put_bytes(NS_ARTIFACTS, shared).expect("put");
+        let (read_tx, read_rx) = mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let resume_rx = Mutex::new(resume_rx);
+        let fired = AtomicBool::new(false);
+        store.after_pinned = Some(Box::new(move || {
+            if !fired.swap(true, Ordering::SeqCst) {
+                read_tx.send(()).expect("signal");
+                resume_rx.lock().expect("lock").recv().expect("resume");
+            }
+        }));
+        let quotas = Quotas::from([(NS_ARTIFACTS.to_string(), 0)]);
+        let store = &store;
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let pass = scope.spawn(|| store.gc(&quotas).expect("gc"));
+            read_rx.recv().expect("the pass read pins and persistent");
+            let result_tx = result_tx.clone();
+            let thread_digest = digest.clone();
+            scope.spawn(move || {
+                let stored = store.put_blob(NS_BLOB, &mut shared.as_slice());
+                result_tx.send(stored.map(|b| (b.digest, store.has(&thread_digest))))
+            });
+            assert!(
+                result_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "put_blob returned while GC held the exclusive lock"
+            );
+            resume_tx.send(()).expect("resume");
+            pass.join().expect("gc thread");
+        });
+        let (written, has_after_put) = result_rx.recv().expect("put result").expect("put_blob");
+        assert_eq!(written, digest);
+        assert!(has_after_put);
+        assert!(store.has(&digest));
+        assert_eq!(store.read(&digest).expect("read"), shared);
+
+        store.gc(&quotas).expect("second gc");
+        assert!(store.has(&digest), "persistent object lost on second gc");
     }
 }

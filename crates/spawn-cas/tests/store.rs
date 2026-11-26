@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use spawn_cas::{
     Algo, CAS_MARKER, CasError, Digest, NS_ARTIFACTS, NS_BACKUP, NS_BASE_CACHE, NS_DATA, Quotas,
-    Store, TMP_MAX_AGE, default_quotas, is_valid_name, sha256_of, verify_reader,
+    Store, TMP_MAX_AGE, default_quotas, is_valid_name, sha256_of,
 };
 
 /// A fresh directory under the temporary directory, removed on drop.
@@ -72,14 +72,14 @@ fn hex_of(byte: &str) -> String {
 #[test]
 fn digests_parse_only_prefixed_lowercase_hex() {
     let hex = hex_of("ab");
-    for good in [format!("sha256:{hex}"), format!("blake3:{hex}")] {
-        let digest = Digest::parse(&good).expect(&good);
-        assert_eq!(digest.to_string(), good);
-        assert_eq!(good.parse::<Digest>().expect("from_str"), digest);
-    }
+    let good = format!("sha256:{hex}");
+    let digest = Digest::parse(&good).expect(&good);
+    assert_eq!(digest.to_string(), good);
+    assert_eq!(good.parse::<Digest>().expect("from_str"), digest);
     for bad in [
         hex.clone(),
         format!("sha256:{}", hex.to_uppercase()),
+        format!("blake3:{hex}"),
         format!("md5:{hex}"),
         format!("SHA256:{hex}"),
         format!("sha256:{}", &hex[..63]),
@@ -94,17 +94,6 @@ fn digests_parse_only_prefixed_lowercase_hex() {
             "{bad:?} accepted"
         );
     }
-    // blake3 parses, but cannot be hashed or verified until ST2.
-    let blake3 = Digest::parse(&format!("blake3:{hex}")).expect("blake3");
-    assert_eq!(blake3.algo(), Algo::Blake3);
-    assert!(matches!(
-        blake3.hasher(),
-        Err(CasError::AlgoUnavailable(Algo::Blake3))
-    ));
-    assert!(matches!(
-        verify_reader(&mut &b"x"[..], &blake3),
-        Err(CasError::AlgoUnavailable(Algo::Blake3))
-    ));
     assert_eq!(
         sha256_of(b"abc").to_string(),
         "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -128,7 +117,7 @@ fn put_lays_out_objects_and_verifies_them() {
     let meta = fs::metadata(&path).expect("object");
     assert_eq!(meta.permissions().mode() & 0o777, 0o444);
     assert!(scratch.join("cas").join(CAS_MARKER).is_file());
-    for directory in ["objects", "pins", "access", "tmp"] {
+    for directory in ["objects", "chunk-index", "pins", "access", "tmp"] {
         assert!(scratch.join("cas").join(directory).is_dir(), "{directory}");
     }
     assert!(
@@ -159,14 +148,6 @@ fn put_lays_out_objects_and_verifies_them() {
     assert!(store.read(&digest).is_err_and(|error| error.is_mismatch()));
     assert!(!store.has(&digest), "read removed the damaged object");
     assert!(store.read(&digest).is_err_and(|error| error.is_not_found()));
-
-    // A blake3 address is never stored: its bytes cannot be verified.
-    let blake3 = Digest::parse(&format!("blake3:{}", hex_of("cd"))).expect("blake3");
-    assert!(matches!(
-        store.put(NS_ARTIFACTS, &mut &b"x"[..], &blake3),
-        Err(CasError::AlgoUnavailable(_))
-    ));
-    assert!(!store.has(&blake3));
 }
 
 #[test]

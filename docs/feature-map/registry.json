@@ -1258,14 +1258,24 @@
       "title": "Copy-on-Write Workspace Store with CAS Dedup",
       "kind": "capability",
       "parent": "domain-host-execution",
-      "summary": "The cross-OS copy-on-write workspace store (reflink clones) with content-addressed block deduplication (M7 #557), stored in the unified spawn-cas crate (objects/<algo>/<2 hex>/<hex>, pins, per-namespace LRU GC; legacy <2 hex>/<hex> blobs adopted in place, ST1).",
+      "summary": "The cross-OS copy-on-write workspace store (reflink clones) with content-addressed block deduplication (M7 #557), stored in the unified spawn-cas crate (objects/<algo>/<2 hex>/<hex>, chunk-index/<algo>/<2 hex>/<hex>, pins, per-namespace LRU GC + persistent tree/blob namespaces, FastCDC v1 chunking, canonical spawn-tree-v1 / spawn-snapshot-v1 Merkle store, deterministic 40-hex Git OID projection, SHA-256 only; legacy <2 hex>/<hex> blobs adopted in place, ST1 / D6 Phase 0).",
       "files": [
         "crates/spawn-cas/Cargo.toml",
+        "crates/spawn-cas/src/chunker.rs",
         "crates/spawn-cas/src/digest.rs",
         "crates/spawn-cas/src/gc.rs",
+        "crates/spawn-cas/src/git_oid.rs",
         "crates/spawn-cas/src/legacy.rs",
         "crates/spawn-cas/src/lib.rs",
+        "crates/spawn-cas/src/merkle.rs",
         "crates/spawn-cas/src/store.rs",
+        "crates/spawn-cas/testdata/d6-cas-v1/child_tree.bin",
+        "crates/spawn-cas/testdata/d6-cas-v1/chunks.bin",
+        "crates/spawn-cas/testdata/d6-cas-v1/manifest.json",
+        "crates/spawn-cas/testdata/d6-cas-v1/pointer-100mib.bin",
+        "crates/spawn-cas/testdata/d6-cas-v1/snapshot.bin",
+        "crates/spawn-cas/testdata/d6-cas-v1/tree.bin",
+        "crates/spawn-cas/tests/d6_cas.rs",
         "crates/spawn-cas/tests/store.rs",
         "crates/spawn-host/src/cas_dedup.rs",
         "crates/spawn-host/src/cow.rs",
@@ -1294,6 +1304,7 @@
           "2a785c5cd"
         ],
         "tests": [
+          "crates/spawn-cas/tests/d6_cas.rs",
           "crates/spawn-cas/tests/store.rs",
           "crates/spawn-host/tests/cow.rs"
         ],

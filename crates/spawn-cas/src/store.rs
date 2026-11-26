@@ -19,8 +19,8 @@ pub const CAS_MARKER: &str = ".spawn-cas";
 
 const MARKER_TEXT: &str = "spawn-cas v1\n";
 
-/// The directories of the layout, under the root.
-const LAYOUT: [&str; 4] = ["objects", "pins", "access", "tmp"];
+/// The directories of the layout, under the root (`chunk-index/` frozen in D6 Phase 0).
+const LAYOUT: [&str; 5] = ["objects", "chunk-index", "pins", "access", "tmp"];
 
 /// The lock that orders [`Store::pin`] against [`Store::gc`]. Its name
 /// starts with a dot, which no pin name can (it is never read as a pin).
@@ -131,6 +131,14 @@ pub struct GcLock {
     _file: fs::File,
 }
 
+/// The shared side of the pin/GC lock ([`Store::lock_gc_shared`]), held
+/// concurrently by persistent-namespace writes/reuses to serialize against
+/// [`Store::gc`]'s exclusive lock.
+#[derive(Debug)]
+pub struct GcSharedLock {
+    _file: fs::File,
+}
+
 /// One spawn-cas root.
 pub struct Store {
     root: PathBuf,
@@ -199,6 +207,15 @@ impl Store {
             .join(digest.hex())
     }
 
+    /// Where the chunk index for a chunked blob `file_digest` lives.
+    pub fn chunk_index_path(&self, file_digest: &Digest) -> PathBuf {
+        self.root
+            .join("chunk-index")
+            .join(file_digest.algo().name())
+            .join(file_digest.shard())
+            .join(file_digest.hex())
+    }
+
     /// The access record of `digest` in namespace `namespace`.
     pub fn access_path(&self, namespace: &str, digest: &Digest) -> PathBuf {
         self.root
@@ -217,6 +234,27 @@ impl Store {
     /// Whether the object exists as a regular file (not that it verifies).
     pub fn has(&self, digest: &Digest) -> bool {
         fs::symlink_metadata(self.object_path(digest)).is_ok_and(|meta| meta.is_file())
+    }
+
+    /// Whether the blob `digest` is present either as a single object or as a chunk index.
+    pub fn has_blob(&self, digest: &Digest) -> bool {
+        self.has(digest)
+            || fs::symlink_metadata(self.chunk_index_path(digest)).is_ok_and(|meta| meta.is_file())
+    }
+
+    /// Flush buffered object and index writes in this store's filesystem before
+    /// publishing root references to PostgreSQL (D6 Phase 0 durability barrier).
+    pub fn sync_store(&self) -> Result<(), CasError> {
+        let dir = open_nofollow(&self.root)?;
+        #[cfg(target_os = "linux")]
+        {
+            rustix::fs::syncfs(&dir).map_err(io::Error::from)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            dir.sync_all()?;
+        }
+        Ok(())
     }
 
     /// The object, opened for reading: never through a symlink, never a
@@ -241,7 +279,6 @@ impl Store {
     /// Re-hash the stored object ([`CasError::Mismatch`] when it does not
     /// hash to its address). Nothing is removed.
     pub fn verify(&self, digest: &Digest) -> Result<(), CasError> {
-        digest.hasher()?;
         verify_reader(&mut self.open_object(digest)?, digest).map(drop)
     }
 
@@ -249,7 +286,6 @@ impl Store {
     /// ([`CasError::Mismatch`]) and the object removed: the next use is a
     /// miss and fetches it again.
     pub fn read(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
-        digest.hasher()?;
         let mut bytes = Vec::new();
         self.open_object(digest)?.read_to_end(&mut bytes)?;
         match verify_reader(&mut bytes.as_slice(), digest) {
@@ -316,6 +352,18 @@ impl Store {
         want: &Digest,
     ) -> Result<PathBuf, CasError> {
         check_name("namespace", namespace)?;
+        let _gc_guard = crate::gc::is_persistent_namespace(namespace)
+            .then(|| self.lock_gc_shared())
+            .transpose()?;
+        self.commit_unlocked(namespace, staged, want)
+    }
+
+    fn commit_unlocked(
+        &self,
+        namespace: &str,
+        staged: &Path,
+        want: &Digest,
+    ) -> Result<PathBuf, CasError> {
         let verified = (|| {
             let mut file = open_nofollow(staged)?;
             if !file.metadata()?.is_file() {
@@ -346,7 +394,9 @@ impl Store {
         want: &Digest,
     ) -> Result<PathBuf, CasError> {
         check_name("namespace", namespace)?;
-        want.hasher()?;
+        let _gc_guard = crate::gc::is_persistent_namespace(namespace)
+            .then(|| self.lock_gc_shared())
+            .transpose()?;
         if self.has(want) {
             self.touch(namespace, want)?;
             return Ok(self.object_path(want));
@@ -358,7 +408,7 @@ impl Store {
             remove_missing_ok(&staged)?;
             return Err(error.into());
         }
-        self.commit(namespace, &staged, want)
+        self.commit_unlocked(namespace, &staged, want)
     }
 
     /// Store `bytes` under their SHA-256 digest.
@@ -388,6 +438,7 @@ impl Store {
         }
         file.set_permissions(fs::Permissions::from_mode(0o444))?;
         let digest = verified.digest();
+        let _gc_guard = self.lock_gc_shared()?;
         self.object_dir(digest)?;
         match fs::hard_link(staged, self.object_path(digest)) {
             Ok(()) => Ok(Publish::Created),
@@ -397,10 +448,75 @@ impl Store {
     }
 
     /// Make `objects/<algo>/<2 hex>/` for `digest`.
-    fn object_dir(&self, digest: &Digest) -> Result<(), CasError> {
+    pub(crate) fn object_dir(&self, digest: &Digest) -> Result<(), CasError> {
         let algo = self.root.join("objects").join(digest.algo().name());
         plain_dir(&algo)?;
         plain_dir(&algo.join(digest.shard()))
+    }
+
+    /// Make `chunk-index/<algo>/<2 hex>/` for `digest`.
+    pub(crate) fn chunk_index_dir(&self, digest: &Digest) -> Result<(), CasError> {
+        let algo = self.root.join("chunk-index").join(digest.algo().name());
+        plain_dir(&algo)?;
+        plain_dir(&algo.join(digest.shard()))
+    }
+
+    /// Store pre-hashed in-memory `bytes` (`<= 4 MiB` by callers of D6 objects)
+    /// into `objects/`, recording `namespace` use.
+    pub(crate) fn put_hashed_bytes(
+        &self,
+        namespace: &str,
+        bytes: &[u8],
+        digest: &Digest,
+    ) -> Result<PathBuf, CasError> {
+        check_name("namespace", namespace)?;
+        let _gc_guard = crate::gc::is_persistent_namespace(namespace)
+            .then(|| self.lock_gc_shared())
+            .transpose()?;
+        if self.has(digest) {
+            self.touch(namespace, digest)?;
+            return Ok(self.object_path(digest));
+        }
+        let (mut file, staged) = self.temp_file("obj")?;
+        let write_result = file
+            .write_all(bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.set_permissions(fs::Permissions::from_mode(0o444)));
+        drop(file);
+        if let Err(error) = write_result {
+            remove_missing_ok(&staged)?;
+            return Err(error.into());
+        }
+        let target = self.object_path(digest);
+        self.object_dir(digest)?;
+        let link_result = fs::hard_link(&staged, &target);
+        let _ = remove_missing_ok(&staged);
+        match link_result {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.touch(namespace, digest)?;
+        Ok(target)
+    }
+
+    /// Read a file safely from `path` without following symlinks and verifying
+    /// it is a regular file.
+    pub(crate) fn read_plain_bytes(&self, path: &Path) -> Result<Vec<u8>, CasError> {
+        let _ = &self.root;
+        let mut file = open_nofollow(path).map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                CasError::NotPlain(path.to_path_buf())
+            } else {
+                error.into()
+            }
+        })?;
+        if !file.metadata()?.is_file() {
+            return Err(CasError::NotPlain(path.to_path_buf()));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 
     /// The namespaces holding an access record of `digest`, sorted: the
@@ -505,21 +621,36 @@ impl Store {
         Ok(found)
     }
 
-    /// The exclusive side of the pin/GC lock: held by [`Store::pin`] and
-    /// [`Store::gc`], and by any other caller that deletes objects by what
-    /// is pinned (read the pins after taking it).
-    pub fn lock_gc(&self) -> Result<GcLock, CasError> {
+    fn open_gc_lock(&self) -> Result<fs::File, CasError> {
         let pins = self.root.join("pins");
         plain_dir(&pins)?;
         let file = fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(pins.join(GC_LOCK))?;
+        Ok(file)
+    }
+
+    /// The exclusive side of the pin/GC lock: held by [`Store::pin`] and
+    /// [`Store::gc`], and by any other caller that deletes objects by what
+    /// is pinned (read the pins after taking it).
+    pub fn lock_gc(&self) -> Result<GcLock, CasError> {
+        let file = self.open_gc_lock()?;
         file.lock()?;
         Ok(GcLock { _file: file })
+    }
+
+    /// The shared side of the pin/GC lock: held concurrently by persistent
+    /// write/reuse operations so [`Store::gc`] cannot delete a shared object
+    /// between existence check and persistent access-record publication.
+    pub fn lock_gc_shared(&self) -> Result<GcSharedLock, CasError> {
+        let file = self.open_gc_lock()?;
+        file.lock_shared()?;
+        Ok(GcSharedLock { _file: file })
     }
 
     /// Write `pins/<owner>/<name>`: one digest per line, replaced whole
