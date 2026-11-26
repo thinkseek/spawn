@@ -322,7 +322,11 @@ fn rerun_and_validate(schema: &str, scratch: &Scratch, pipeline: &Pipeline, good
     // Its third revision holds what its first held: two snapshots, each
     // kept once.
     let merge_three = head_of(&refs, "merge-3");
-    assert_eq!(merge_three["kept"].as_array().map(Vec::len), Some(2), "{merge_three}");
+    assert_eq!(
+        merge_three["kept"].as_array().map(Vec::len),
+        Some(2),
+        "{merge_three}"
+    );
     assert_eq!(merge_three["revisions"], 3);
     let cas = Store::open(scratch.join("cas")).expect("the store");
     cas.verify_snapshot(&spawn_cas::Digest::parse(good).expect("digest"))
@@ -675,7 +679,6 @@ fn the_pin_keeps_three_snapshots_and_a_rollback_to_the_fourth_is_refused() {
     );
     other_rollbacks(&schema, &scratch, &data, &snapshots);
     drop(store);
-}    drop(store);
 }
 
 #[test]
