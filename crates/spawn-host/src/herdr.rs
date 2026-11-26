@@ -106,6 +106,50 @@ manifest_check = false\n";
 /// answers `ping` with another is refused.
 pub const PROTOCOL: u64 = 22;
 
+/// The agent detection manifests Spawn's readings were checked against
+/// (Herdr 0.9.5's bundled ones, which its cached remote ones equal on the
+/// VM, 2026-11-26): a server whose active version of one of them differs
+/// is refused, naming both (carry list N8). The `[update]` pin of
+/// [`SERVER_CONFIG`] holds only for a server this host started; this check
+/// holds for any. Moving a pin is a deliberate change: `herdr server
+/// update-agent-manifests`, the fixtures run again, then this list.
+pub const MANIFESTS: [(&str, &str); 2] = [("agy", "2026.10.05.1"), ("claude", "2026.10.11.1")];
+
+/// Why a `server.agent_manifests` answer (`listed`) does not hold the
+/// `pinned` manifests, naming each pinned and actual version; `None` when
+/// every pinned agent's active version is the pinned one.
+fn manifest_mismatch(session: &str, pinned: &[(String, String)], listed: &Value) -> Option<String> {
+    let active = |agent: &str| {
+        listed["manifests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|manifest| manifest["agent"].as_str() == Some(agent))
+            .and_then(|manifest| manifest["active_version"].as_str())
+            .map(str::to_string)
+    };
+    let differ: Vec<String> = pinned
+        .iter()
+        .filter_map(|(agent, version)| {
+            let actual = active(agent);
+            (actual.as_deref() != Some(version.as_str())).then(|| {
+                format!(
+                    "{agent} pinned {version}, actual {}",
+                    actual.as_deref().unwrap_or("none")
+                )
+            })
+        })
+        .collect();
+    (!differ.is_empty()).then(|| {
+        format!(
+            "herdr session {session} reads agents by other detection manifests than Spawn was \
+             checked against ({}): move the manifests back, or re-run the fixtures and move \
+             Spawn's pins",
+            differ.join("; ")
+        )
+    })
+}
+
 /// How long after an agent started in a pane, or was released from it, a
 /// reading that Herdr still marks `launch_pending` is no reading: the
 /// detection has not settled.
@@ -115,12 +159,33 @@ const LAUNCH_SETTLE: Duration = Duration::from_secs(1);
 /// host is gone or the panes it follows changed.
 const EVENT_POLL: Duration = Duration::from_millis(500);
 
+/// The largest `agent.prompt` request line this host sends, newline
+/// included: Herdr 0.9.5 resets the connection of a request line over
+/// 1 MiB (probed 2026-11-26: 1 000 000 bytes of text taken, 1 100 000
+/// reset), so a quarter of it. A longer text goes in [`TEXT_CHUNK`] pieces
+/// through `pane.send_text`.
+const PROMPT_LINE_LIMIT: usize = 256 * 1024;
+
+/// Whether `text` goes to `pane`'s agent in one `agent.prompt`: its request
+/// line, as [`call_at`] writes it, is at most [`PROMPT_LINE_LIMIT`].
+pub(crate) fn prompt_fits(pane: &str, text: &str) -> bool {
+    let request = json!({
+        "id": "spawn:agent.prompt",
+        "method": "agent.prompt",
+        "params": { "target": pane, "text": text },
+    });
+    request.to_string().len() < PROMPT_LINE_LIMIT
+}
+
 /// Herdr's error codes that refuse input to an agent: not ready yet (it was
 /// started moments ago) or blocked on a dialog. When `agent.get` answers with
 /// one, nothing was typed, and the caller may try again. In practice
 /// `agent.get` answers neither: `agent_not_ready` and `agent_blocked` come
-/// from Herdr's agent input calls (`agent.send_keys`, `agent.prompt`), which
-/// this host does not use yet (PR 3). A blocked agent's status, read from
+/// from Herdr's agent input calls; `submit_staged` uses `agent.prompt` and
+/// maps both to a refusal before typing (the text stays staged). Because
+/// the Bridge records a typing before it submits, such a refusal there is
+/// still read as one that may have typed: the guard that keeps it rare is
+/// this check at staging. A blocked agent's status, read from
 /// `agent.get`, refuses nothing here: the Bridge types only into a pane its
 /// own reading accepts input on.
 const NOT_TYPED: [&str; 2] = ["agent_not_ready", "agent_blocked"];
@@ -197,6 +262,8 @@ pub struct HerdrHost {
     socket: OnceLock<PathBuf>,
     /// The protocol a server must answer `ping` with ([`PROTOCOL`]).
     protocol: u64,
+    /// The manifests a server must have active ([`MANIFESTS`]).
+    manifests: Vec<(String, String)>,
     /// The agents followed, shared with the subscriber thread.
     agents: Arc<Mutex<Agents>>,
 }
@@ -223,6 +290,22 @@ impl Record {
             "server": self.server,
         })
         .to_string()
+    }
+
+    /// What [`HerdrHost::start`] writes before `workspace.create` (carry
+    /// list N3): the terminal is being made on `server`, and its workspace
+    /// is Spawn's even before it is named, so a sweep that lists it in
+    /// between keeps it. Replaced by the full record once the pane is known.
+    fn pending_text(server: TerminalServer) -> String {
+        json!({ "pending": true, "server": server }).to_string()
+    }
+
+    /// The server a pending record ([`Record::pending_text`]) names.
+    fn pending_server(text: &str) -> Option<TerminalServer> {
+        let value: Value = serde_json::from_str(text).ok()?;
+        (value["pending"] == true)
+            .then(|| serde_json::from_value(value["server"].clone()).ok())
+            .flatten()
     }
 
     fn parse(text: &str) -> Option<Self> {
@@ -368,6 +451,10 @@ impl HerdrHost {
             beneath: None,
             socket: OnceLock::new(),
             protocol: PROTOCOL,
+            manifests: MANIFESTS
+                .iter()
+                .map(|(agent, version)| ((*agent).to_string(), (*version).to_string()))
+                .collect(),
             agents: Arc::new(Mutex::new(Agents::default())),
         })
     }
@@ -377,6 +464,18 @@ impl HerdrHost {
     #[must_use]
     pub fn expecting_protocol(mut self, protocol: u64) -> Self {
         self.protocol = protocol;
+        self
+    }
+
+    /// The same host, expecting a server whose active manifests are
+    /// `manifests` (agent, version) instead of [`MANIFESTS`]: how a test
+    /// shows a server of other manifests refused.
+    #[must_use]
+    pub fn expecting_manifests(mut self, manifests: &[(&str, &str)]) -> Self {
+        self.manifests = manifests
+            .iter()
+            .map(|(agent, version)| ((*agent).to_string(), (*version).to_string()))
+            .collect();
         self
     }
 
@@ -536,6 +635,12 @@ impl HerdrHost {
                 self.protocol
             )));
         }
+        let listed = self
+            .call("server.agent_manifests", &json!({}), CALL_LIMIT)
+            .map_err(|call| call.into_error("server.agent_manifests"))?;
+        if let Some(refusal) = manifest_mismatch(&self.session, &self.manifests, &listed) {
+            return Err(TerminalError(refusal));
+        }
         self.sweep(server)?;
         lock(&self.agents).checked = Some(server);
         Ok(())
@@ -554,10 +659,13 @@ impl HerdrHost {
             .map_err(|call| call.into_error("workspace.list"))?;
         let state = self.state()?;
         let ours = |terminal: &TerminalName, workspace: &str| {
-            state
-                .as_deref()
-                .and_then(|state| Self::record_in(state, terminal).ok().flatten())
-                .is_some_and(|record| record.server == server && record.workspace == workspace)
+            state.as_deref().is_some_and(|state| {
+                Self::record_in(state, terminal)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.server == server && record.workspace == workspace)
+                    || Self::pending_in(state, terminal) == Some(server)
+            })
         };
         for workspace in listed["workspaces"].as_array().into_iter().flatten() {
             let (Some(label), Some(id)) = (
@@ -810,6 +918,44 @@ impl HerdrHost {
         }
     }
 
+    /// The server a pending record of `terminal` in `state` names: a start
+    /// that wrote it and has not named its pane yet, or one that stopped
+    /// in between (carry list N3).
+    fn pending_in(state: &Path, terminal: &TerminalName) -> Option<TerminalServer> {
+        std::fs::read_to_string(Self::record_path(state, terminal))
+            .ok()
+            .and_then(|text| Record::pending_server(&text))
+    }
+
+    /// Close every workspace on the server now that is labelled `terminal`:
+    /// what a start that stopped between `workspace.create` and its record
+    /// left (the pending record says one may exist).
+    fn close_labelled(&self, terminal: &TerminalName) -> Result<(), TerminalError> {
+        let listed = match self.call("workspace.list", &json!({}), CALL_LIMIT) {
+            Ok(listed) => listed,
+            Err(call) if call.gone() => return Ok(()),
+            Err(call) => return Err(call.into_error("workspace.list")),
+        };
+        for workspace in listed["workspaces"].as_array().into_iter().flatten() {
+            if workspace["label"].as_str() != Some(terminal.as_str()) {
+                continue;
+            }
+            let Some(id) = workspace["workspace_id"].as_str() else {
+                continue;
+            };
+            match self.call(
+                "workspace.close",
+                &json!({ "workspace_id": id }),
+                CALL_LIMIT,
+            ) {
+                Ok(_) => {}
+                Err(call) if call.gone() => {}
+                Err(call) => return Err(call.into_error("workspace.close")),
+            }
+        }
+        Ok(())
+    }
+
     /// Remove what this host keeps of `terminal`.
     fn forget(&self, terminal: &TerminalName) {
         if let Ok(state) = self.state_directory(false) {
@@ -884,18 +1030,30 @@ impl HerdrHost {
         server: TerminalServer,
         script: &Path,
     ) -> Result<Record, TerminalError> {
+        // The record first (carry list N3): a sweep that lists the new
+        // workspace before its pane is recorded keeps it.
+        crate::process::write_private(
+            &state.join("terminals"),
+            launch.terminal.as_str(),
+            &Record::pending_text(server),
+        )
+        .map_err(|error| TerminalError(format!("record {}: {error}", launch.terminal)))?;
         let created = self
             .call(
                 "workspace.create",
                 &json!({ "cwd": launch.cwd, "label": launch.terminal.as_str(), "focus": false }),
                 CALL_LIMIT,
             )
-            .map_err(|call| call.into_error("workspace.create"))?;
+            .map_err(|call| {
+                let _ = std::fs::remove_file(Self::record_path(state, &launch.terminal));
+                call.into_error("workspace.create")
+            })?;
         let pane = created["root_pane"]["pane_id"].as_str().map(str::to_string);
         let workspace = created["workspace"]["workspace_id"]
             .as_str()
             .map(str::to_string);
         let (Some(pane), Some(workspace)) = (pane, workspace) else {
+            let _ = std::fs::remove_file(Self::record_path(state, &launch.terminal));
             return Err(TerminalError(format!(
                 "workspace.create named no pane: {created}"
             )));
@@ -979,7 +1137,10 @@ fn call_at(socket: &Path, method: &str, params: &Value, limit: Duration) -> Resu
 /// as changed, since what changed meanwhile is unknown. It ends once its
 /// host is gone.
 fn subscribe(socket: &Path, agents: &Weak<Mutex<Agents>>) {
-    let mut first = true;
+    // Whether the next subscription follows a dropped connection (what
+    // changed meanwhile is unknown), not the first one nor one made again
+    // because the followed panes changed (carry list N7).
+    let mut reconnected = false;
     loop {
         let Some(shared) = agents.upgrade() else {
             return;
@@ -993,6 +1154,7 @@ fn subscribe(socket: &Path, agents: &Weak<Mutex<Agents>>) {
         };
         drop(shared);
         let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) else {
+            reconnected = true;
             std::thread::sleep(EVENT_POLL);
             continue;
         };
@@ -1012,22 +1174,22 @@ fn subscribe(socket: &Path, agents: &Weak<Mutex<Agents>>) {
         if stream.set_read_timeout(Some(EVENT_POLL)).is_err()
             || (&stream).write_all(line.as_bytes()).is_err()
         {
+            reconnected = true;
             std::thread::sleep(EVENT_POLL);
             continue;
         }
-        if !first {
+        if std::mem::take(&mut reconnected) {
             // What changed while no subscription held is unknown.
             let _ = call_at(socket, "session.snapshot", &json!({}), CALL_LIMIT);
             if let Some(shared) = agents.upgrade() {
                 lock(&shared).mark_all();
             }
         }
-        first = false;
         let mut reader = std::io::BufReader::new(stream);
         let mut line = String::new();
-        loop {
+        let ended = loop {
             match reader.read_line(&mut line) {
-                Ok(0) => break,
+                Ok(0) => break Ended::Dropped,
                 Ok(_) if line.ends_with('\n') => {
                     let Some(shared) = agents.upgrade() else {
                         return;
@@ -1046,13 +1208,32 @@ fn subscribe(socket: &Path, agents: &Weak<Mutex<Agents>>) {
                         return;
                     };
                     if lock(&shared).generation != generation {
-                        break;
+                        break Ended::Moved;
                     }
                 }
-                Err(_) => break,
+                Err(_) => break Ended::Dropped,
             }
-        }
+        };
+        reconnected = resubscribes_after(ended);
     }
+}
+
+/// Why a subscription's read ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// The connection dropped (the server stopped or restarted).
+    Dropped,
+    /// The followed panes changed: the same server, subscribed again.
+    Moved,
+}
+
+/// Whether the subscription made after `ended` is a real reconnect, which
+/// asks the snapshot and marks every followed terminal changed (carry list
+/// N7). A change of the followed panes is no reconnect: nothing was missed,
+/// and marking every terminal changed would make the Bridge read each pane
+/// again on every start and end.
+fn resubscribes_after(ended: Ended) -> bool {
+    ended == Ended::Dropped
 }
 
 /// One line the subscription pushed: a detection or a status change of a
@@ -1289,6 +1470,37 @@ impl TerminalHost for HerdrHost {
         let text = std::fs::read_to_string(&staged)
             .map_err(|error| TerminalError(format!("nothing staged for {terminal}: {error}")))?;
         let record = self.live_pane(terminal)?;
+        // To the pane's agent first, through `agent.prompt` (one ordered,
+        // paste-aware write, then its submission), never with `wait` (it
+        // returns on a false idle): only while the request stays well under
+        // Herdr's request line cap ([`prompt_fits`]). Its refusals of a
+        // blocked or not-ready agent type nothing: the text stays staged.
+        // A pane with no agent Herdr detects (`agent_not_found`, nothing
+        // typed either) takes the text the old way, and so does an empty
+        // text (Herdr refuses an empty prompt): Enter alone.
+        if !text.is_empty() && prompt_fits(&record.pane, &text) {
+            match self.call(
+                "agent.prompt",
+                &json!({ "target": record.pane, "text": text }),
+                CALL_LIMIT,
+            ) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&staged);
+                    return Ok(());
+                }
+                Err(Call::Refused { code, .. }) if refused_before_typing(&code) => {
+                    return Err(TerminalError(format!(
+                        "herdr refused before typing ({code}): the agent in {terminal} does not \
+                         take input now; nothing was typed"
+                    )));
+                }
+                Err(Call::Refused { code, .. }) if code == "agent_not_found" => {}
+                Err(call) => {
+                    let _ = std::fs::remove_file(&staged);
+                    return Err(call.into_error("agent.prompt"));
+                }
+            }
+        }
         // Typed as it is, then one Enter: a newline in the text is a line
         // feed, which an engine's prompt box reads as a new line, not as
         // its submission.
@@ -1425,9 +1637,19 @@ impl TerminalHost for HerdrHost {
     fn terminate(
         &self,
         terminal: &TerminalName,
-        _workspace: &WorkspaceId,
+        workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
         let Some(record) = self.record(terminal)? else {
+            // A start that stopped between its pending record and its
+            // pane (carry list N3): whatever workspace it made is closed.
+            if let Some(state) = self.state()?
+                && let Some(server) = Self::pending_in(&state, terminal)
+            {
+                if matches!(self.identity(), ServerSeen::Answers(Some(now)) if now == server) {
+                    self.close_labelled(terminal)?;
+                }
+                self.forget(terminal);
+            }
             return Ok(());
         };
         let leaders: Vec<u32> = if record.leader.leads_its_session() {
@@ -1449,6 +1671,9 @@ impl TerminalHost for HerdrHost {
             );
         }
         crate::tmux::wait_sessions_gone(terminal, &leaders, self.waits, "pane.close")?;
+        // What the engine detached from its session, still beneath the
+        // workspace: ended by pid before the caller's final checkpoint.
+        crate::tmux::end_stragglers(workspace.path(), self.waits)?;
         self.forget(terminal);
         self.unfollow(terminal);
         Ok(())
@@ -1548,7 +1773,10 @@ fn runner_of(terminal: &TerminalName, record: &Record) -> Runner {
 
 #[cfg(test)]
 mod tests {
-    use super::{Press, Record, chunks, herdr_key, launch_script, socket_of_status};
+    use super::{
+        Ended, MANIFESTS, PROMPT_LINE_LIMIT, Press, Record, chunks, herdr_key, launch_script,
+        manifest_mismatch, prompt_fits, resubscribes_after, socket_of_status,
+    };
     use spawn_core::id::{TerminalName, WorkspaceId};
     use spawn_core::port::{Launch, Runner, TerminalHost, TerminalServer};
 
@@ -1967,5 +2195,90 @@ mod tests {
         assert!(agents.changed.is_empty(), "{:?}", agents.changed);
         agents.mark_all();
         assert_eq!(agents.changed, vec![terminal]);
+    }
+
+    /// `agent.prompt` carries a text only while its whole request line,
+    /// JSON escapes counted, stays under the cap; above it the text goes in
+    /// chunks through `pane.send_text`.
+    #[test]
+    fn agent_prompt_takes_a_text_only_well_under_the_request_line_cap() {
+        assert!(prompt_fits("w1:p1", "hello"));
+        assert!(prompt_fits("w1:p1", &"x".repeat(200 * 1024)));
+        assert!(!prompt_fits("w1:p1", &"x".repeat(PROMPT_LINE_LIMIT)));
+        // Escapes count: 60 KiB of quotes is 120 KiB on the line, 60 KiB of
+        // control bytes is 360 KiB.
+        assert!(prompt_fits("w1:p1", &"\"".repeat(60 * 1024)));
+        assert!(!prompt_fits("w1:p1", &"\u{1}".repeat(60 * 1024)));
+        const {
+            assert!(
+                PROMPT_LINE_LIMIT * 4 <= 1024 * 1024,
+                "well under the probed 1 MiB cap"
+            );
+        };
+    }
+
+    /// Carry list N8: a server whose active manifest of a pinned agent
+    /// differs, or that has none, is refused naming both versions.
+    #[test]
+    fn a_manifest_other_than_the_pinned_one_is_refused_naming_both() {
+        let pinned: Vec<(String, String)> = MANIFESTS
+            .iter()
+            .map(|(agent, version)| ((*agent).to_string(), (*version).to_string()))
+            .collect();
+        let listed = |agy: &str| {
+            serde_json::json!({ "type": "agent_manifest_status", "manifests": [
+                { "agent": "pi", "active_version": "2026.10.01.1" },
+                { "agent": "claude", "source": "bundled", "active_version": "2026.10.11.1" },
+                { "agent": "agy", "source": "bundled", "active_version": agy },
+            ]})
+        };
+        assert_eq!(
+            manifest_mismatch("s", &pinned, &listed("2026.10.05.1")),
+            None
+        );
+        let refused = manifest_mismatch("s", &pinned, &listed("2026.11.01.1")).expect("refused");
+        assert!(
+            refused.contains("agy pinned 2026.10.05.1, actual 2026.11.01.1"),
+            "{refused}"
+        );
+        assert!(!refused.contains("claude pinned"), "{refused}");
+        let none = manifest_mismatch("s", &pinned, &serde_json::json!({ "manifests": [] }))
+            .expect("refused");
+        assert!(
+            none.contains("claude pinned 2026.10.11.1, actual none"),
+            "{none}"
+        );
+        assert!(
+            none.contains("agy pinned 2026.10.05.1, actual none"),
+            "{none}"
+        );
+    }
+
+    /// Carry list N7: only a dropped connection makes the next subscription
+    /// ask the snapshot and mark every terminal changed.
+    #[test]
+    fn only_a_dropped_connection_marks_every_terminal_changed() {
+        assert!(resubscribes_after(Ended::Dropped));
+        assert!(!resubscribes_after(Ended::Moved));
+    }
+
+    /// Carry list N3: the record written before `workspace.create` names
+    /// only the server, reads as no terminal, and is told apart.
+    #[test]
+    fn a_pending_record_names_its_server_and_no_terminal() {
+        let server = TerminalServer {
+            pid: 42,
+            started_at_ms: 7,
+        };
+        let text = Record::pending_text(server);
+        assert_eq!(Record::pending_server(&text), Some(server));
+        assert_eq!(Record::parse(&text), None);
+        let full = Record {
+            pane: "w1:p1".to_string(),
+            workspace: "w1".to_string(),
+            leader: crate::process::ProcessId { pid: 42, start: 7 },
+            server,
+        };
+        assert_eq!(Record::pending_server(&full.to_text()), None);
     }
 }

@@ -101,7 +101,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::command::{Claimed, CommandAction, NamedKey, Outcome};
+use crate::command::{Claimed, CommandAction, NamedKey, Outcome, Submission};
 use crate::driver::{
     AgentDriver, EngineHome, EngineLaunch, LineCursor, SessionBinding, driver_or_default,
     plain_session_id,
@@ -111,7 +111,8 @@ use crate::event::{
     EventRecord, Fork, GlobalPosition, LaunchSummary, ModelProfile, NewEvent, Source,
 };
 use crate::id::{
-    AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId,
+    AgentId, BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
+    TerminalName, WorkspaceId,
 };
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
@@ -292,6 +293,15 @@ pub struct BridgeConfig {
     /// expires a lease a live holder (a loop, or a claim made without the
     /// ownership protocol) still has: those wait out their TTL, as before.
     pub recover_worker_leases: bool,
+    /// Whether the Bridge answers an engine's startup trust dialog itself
+    /// (audited, as `key` commands of [`RESOLVE_PRINCIPAL`]). `true` by
+    /// default; `false` under `SPAWN_AUTO_APPROVE=off`, where nothing is
+    /// answered automatically: a start that shows the dialog waits, until
+    /// its readiness limit, for someone to answer it in the engine's
+    /// terminal itself (a key sent through Spawn queues behind the start);
+    /// if nobody does, the start fails naming the dialog and the switch
+    /// ([`TRUST_OFF`]).
+    pub auto_trust: bool,
 }
 
 /// Environment an engine gets only when it is safe at its launch (see
@@ -326,6 +336,7 @@ impl BridgeConfig {
             watch: None,
             launch_environment: None,
             recover_worker_leases: true,
+            auto_trust: true,
         }
     }
 
@@ -829,6 +840,12 @@ struct SessionView {
     last_message: Option<(ExecutionId, GlobalPosition)>,
     /// What the log says about the session's inputs ([`Inputs`]).
     inputs: Inputs,
+    /// Where each unfinished command's `command.accepted` is in the log.
+    accepted_at: HashMap<CommandId, GlobalPosition>,
+    /// Where the session's latest `pressed` or `typed` step is: what a
+    /// resolver's key checks nothing reached the pane after its own
+    /// acceptance ([`Bridge::press`]).
+    last_effect: Option<GlobalPosition>,
 }
 
 /// What the log says about a session's inputs: which wait for their turn,
@@ -935,6 +952,8 @@ impl SessionView {
             steps: HashMap::new(),
             last_message: None,
             inputs: Inputs::default(),
+            accepted_at: HashMap::new(),
+            last_effect: None,
         }
     }
 
@@ -962,6 +981,7 @@ impl SessionView {
                     CommandStep::Typing => steps.typing_at = Some(record.position),
                     CommandStep::Typed => {
                         steps.typed = true;
+                        self.last_effect = Some(record.position);
                         if let Some(execution) = event.execution_id.clone() {
                             self.inputs.typed = Some((execution, record.position));
                         }
@@ -978,15 +998,20 @@ impl SessionView {
                             steps.press = Press::Pressing;
                         }
                     }
-                    CommandStep::Pressed => steps.press = Press::Pressed,
+                    CommandStep::Pressed => {
+                        steps.press = Press::Pressed;
+                        self.last_effect = Some(record.position);
+                    }
                 }
             }
             EventKind::CommandFinished { command_id, .. } => {
                 self.unfinished.remove(command_id);
                 self.inputs.waiting.remove(command_id);
+                self.accepted_at.remove(command_id);
             }
             EventKind::CommandAccepted { command_id } => {
                 self.unfinished.insert(*command_id);
+                self.accepted_at.insert(*command_id, record.position);
             }
             EventKind::ScreenObserved {
                 state: ScreenState::Ready,
@@ -1964,10 +1989,8 @@ impl Bridge {
             // After a restart, the last recorded screen. The Bridge's own
             // readings keep its own clock, which the refresh is timed by.
             EventKind::ScreenObserved { state, .. } if current => {
-                if let Some(active) = view.active.as_mut()
-                    && active.follow.screen.map(|(known, _)| known) != Some(*state)
-                {
-                    active.follow.screen = Some((*state, record.recorded_at.0));
+                if let Some(active) = view.active.as_mut() {
+                    fold_screen(active, *state, record);
                 }
             }
             EventKind::ExecutionEnded { .. } if current && event.source == Source::Bridge => {
@@ -3378,6 +3401,9 @@ impl Bridge {
             killed
         } else {
             let started = std::time::Instant::now();
+            // The host ends the processes left beneath the workspace too (a
+            // daemon the engine detached), by pid, before it returns: the
+            // straggler check runs before the final checkpoint below.
             let result = self.terminals.terminate(&terminal, &active.workspace);
             (result, started.elapsed())
         };
@@ -4747,12 +4773,23 @@ impl Bridge {
     /// key goes (`pressing`) and the send after (`pressed`): a retried key
     /// whose `pressing` has no `pressed` is not sent again.
     fn press(&mut self, claimed: &Claimed, key: NamedKey) -> Result<Outcome, StoreError> {
+        // Pressed already (the Bridge's audited startup answer, or a press
+        // before a restart): done, whatever runs now.
+        if self.recorded_steps(claimed).press == Press::Pressed {
+            return Ok(Outcome::Succeeded);
+        }
         let Some(active) = self.running(&claimed.session_id) else {
             return Ok(Outcome::Failed(format!(
                 "{} runs no execution: a key needs a running engine; resume the session",
                 claimed.session_id
             )));
         };
+        if claimed.principal == RESOLVE_PRINCIPAL
+            && self.recorded_steps(claimed).press == Press::Due
+            && !self.answer_still_due(claimed, &active)
+        {
+            return Ok(Outcome::Failed(GONE_DIALOG.to_string()));
+        }
         match self.recorded_steps(claimed).press {
             Press::Due => {}
             Press::Pressed => return Ok(Outcome::Succeeded),
@@ -4795,6 +4832,32 @@ impl Bridge {
                 )))
             }
         }
+    }
+
+    /// Whether a resolver's key may still go (design section 8, PR 3
+    /// pitfall 2: a person and the resolver may both answer one dialog):
+    /// the pane, read now, still shows a dialog to the engine's driver
+    /// (`Permission`, or its startup trust dialog), and no other command of
+    /// the session was recorded `pressed` or `typed` since this one was
+    /// accepted. A pane that cannot be read is no dialog.
+    fn answer_still_due(&self, claimed: &Claimed, active: &Active) -> bool {
+        let Ok(pane) =
+            self.terminals
+                .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
+        else {
+            return false;
+        };
+        let shows = active.driver.read_screen(&pane).state == ScreenState::Permission
+            || active.driver.startup_answer(&pane).is_some();
+        let view = self.sessions.get(&claimed.session_id);
+        let accepted = view.and_then(|view| view.accepted_at.get(&claimed.command_id));
+        let moved = match (accepted, view.and_then(|view| view.last_effect)) {
+            (Some(accepted), Some(effect)) => effect > *accepted,
+            (Some(_), None) => false,
+            // Not seen accepted: whether anything went since cannot be told.
+            (None, _) => true,
+        };
+        shows && !moved
     }
 
     /// Text into the engine's input box, at most once, ending with the
@@ -5988,6 +6051,14 @@ impl Bridge {
             // whether the session is fresh or resumed. Answer once (a second
             // answer would land in the input box), and only the dialog itself:
             // on two equal reads, before any prompt.
+            if !self.config.auto_trust
+                && !progress.prompt_seen
+                && active.driver.startup_answer(&pane).is_some()
+            {
+                // SPAWN_AUTO_APPROVE=off: nothing answers it but a person.
+                progress.transient = Some(TRUST_OFF.to_string());
+                return Ok(self.prompt_retry(&progress));
+            }
             if !progress.answered_trust
                 && !progress.prompt_seen
                 && let Some(keys) = active.driver.startup_answer(&pane)
@@ -5997,10 +6068,7 @@ impl Bridge {
                     return Ok(self.prompt_retry(&progress));
                 }
                 progress.answered_trust = true;
-                if let Err(error) =
-                    self.terminals
-                        .send_keys(&active.terminal(), &active.workspace, keys)
-                {
+                if let Err(error) = self.answer_trust(claimed, active, keys)? {
                     return Ok(Handled::Finished(Outcome::Failed(format!(
                         "answer trust dialog: {error}"
                     ))));
@@ -6049,6 +6117,81 @@ impl Bridge {
             }
             finished => finished,
         }
+    }
+
+    /// The startup trust dialog's answer, audited: each key is a `key`
+    /// command of [`RESOLVE_PRINCIPAL`] (keyed [`trust_answer_key`]),
+    /// submitted, recorded `pressing`, pressed with the others in one send
+    /// (as before: the dialog reads keys, and they go together), and
+    /// recorded `pressed`. The commands queue behind this start, so the
+    /// Bridge claims them once the start is done, finds them pressed and
+    /// finishes them without pressing anything again. A key recorded
+    /// `pressing` or `pressed` already (a restarted Bridge on the same
+    /// dialog) presses nothing. A key Spawn has no command for (none of
+    /// today's) is pressed unaudited, as before.
+    fn answer_trust(
+        &self,
+        claimed: &Claimed,
+        active: &Active,
+        keys: &[&str],
+    ) -> Result<Result<(), TerminalError>, StoreError> {
+        let named: Option<Vec<NamedKey>> = keys
+            .iter()
+            .map(|key| {
+                NamedKey::ALL
+                    .iter()
+                    .copied()
+                    .find(|named| named.tmux() == *key)
+            })
+            .collect();
+        let Some(named) = named else {
+            return Ok(self
+                .terminals
+                .send_keys(&active.terminal(), &active.workspace, keys));
+        };
+        let principal = Principal::new(RESOLVE_PRINCIPAL)
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let mut audited = Vec::with_capacity(named.len());
+        for (at, key) in named.iter().enumerate() {
+            let idempotency_key =
+                IdempotencyKey::new(trust_answer_key(&active.execution_id, at + 1))
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+            let command_id = self.queue.submit(
+                &principal,
+                &Submission {
+                    agent_id: claimed.agent_id.clone(),
+                    session_id: claimed.session_id.clone(),
+                    idempotency_key,
+                    action: CommandAction::Key { key: *key },
+                },
+            )?;
+            audited.push(Claimed {
+                command_id,
+                attempt: 0,
+                agent_id: claimed.agent_id.clone(),
+                session_id: claimed.session_id.clone(),
+                principal: RESOLVE_PRINCIPAL.to_string(),
+                action: serde_json::Value::Null,
+            });
+        }
+        if audited
+            .iter()
+            .any(|key| self.recorded_steps(key).press != Press::Due)
+        {
+            return Ok(Ok(()));
+        }
+        for key in &audited {
+            self.step(key, Some(&active.execution_id), CommandStep::Pressing, None)?;
+        }
+        let sent = self
+            .terminals
+            .send_keys(&active.terminal(), &active.workspace, keys);
+        if sent.is_ok() {
+            for key in &audited {
+                self.step(key, Some(&active.execution_id), CommandStep::Pressed, None)?;
+            }
+        }
+        Ok(sent)
     }
 
     /// The resumable prompt entry point: one non-blocking readiness step per
@@ -6484,13 +6627,77 @@ pub const PANE_NOT_READY: &str = "does not accept input";
 /// the pane cannot take them ([`PANE_NOT_READY`]) and retried on their own
 /// schedule (the dispatcher's delivery retries, which its stall evidence
 /// reads); every other principal's input (a person's, the supervisor's)
-/// waits for its turn ([`CommandStep::Waiting`]).
-pub const LOOP_PRINCIPALS: [&str; 3] = ["spawn-dispatch", "spawn-integrate", "spawn-liveness"];
+/// waits for its turn ([`CommandStep::Waiting`]). The resolver
+/// ([`RESOLVE_PRINCIPAL`]) submits only `key` commands, which never wait in
+/// any case: listing it changes no input rule.
+pub const LOOP_PRINCIPALS: [&str; 4] = [
+    "spawn-dispatch",
+    "spawn-integrate",
+    "spawn-liveness",
+    RESOLVE_PRINCIPAL,
+];
+
+/// The principal of the automatic answers to an engine's dialogs: the
+/// run-time resolver of `spawn loop` (`spawn-cli`'s `resolve.rs`) and the
+/// Bridge's own answer to a startup trust dialog, each a `key` command on
+/// the record (design section 6.3, "What the audit shows").
+pub const RESOLVE_PRINCIPAL: &str = "spawn-resolve";
+
+/// Why a start's wait for its prompt did not end under
+/// `SPAWN_AUTO_APPROVE=off` ([`BridgeConfig::auto_trust`]).
+pub const TRUST_OFF: &str = "the engine shows its startup trust dialog and SPAWN_AUTO_APPROVE=off: \
+     nothing answers it automatically. A key from the agent page or /api/approvals waits behind \
+     this start and cannot reach the dialog: answer it in the engine's terminal itself, or set \
+     SPAWN_AUTO_APPROVE=startup and resume the session";
+
+/// How a resolver's key ends when the dialog it answered is gone, or a
+/// person (or another command) acted on the pane since it was submitted:
+/// nothing pressed, no `pressing` recorded ([`Bridge::press`]).
+pub const GONE_DIALOG: &str = "the dialog this answer was for is gone: nothing pressed";
+
+/// The idempotency key of the `n`-th key (from 1) of the Bridge's answer
+/// to the startup trust dialog of `execution`: `resolve:<execution>:trust:1:<n>`,
+/// the resolver's key shape with the dialog named `trust`. A restarted
+/// Bridge that sees the dialog again submits the same keys, finds them
+/// pressed, and presses nothing twice.
+pub fn trust_answer_key(execution: &ExecutionId, n: usize) -> String {
+    format!("resolve:{execution}:trust:1:{n}")
+}
 
 /// Whether an input from `principal` waits for its turn instead of being
 /// refused while the pane cannot take it.
 pub fn waits(principal: &str) -> bool {
     !LOOP_PRINCIPALS.contains(&principal)
+}
+
+/// A `screen.observed` of the running execution, read back after a
+/// restart: the last recorded screen, and the host reading the newest keyed
+/// screen was keyed by (carry list N12). A restarted Bridge never keys that
+/// reading again, so a screen recorded unkeyed under it before the restart
+/// (a draft over a ready pane, the same `seq`) is followed by one recorded
+/// unkeyed after it, not by a keyed one the log refuses as a repeat. The
+/// Bridge's own readings keep its own clock, which the refresh is timed by.
+fn fold_screen(active: &mut Active, state: ScreenState, record: &EventRecord) {
+    if active.follow.screen.map(|(known, _)| known) != Some(state) {
+        active.follow.screen = Some((state, record.recorded_at.0));
+    }
+    if let Some(seq) = record
+        .event
+        .source_event_id
+        .as_deref()
+        .and_then(|key| keyed_screen_seq(key, &active.execution_id))
+    {
+        active.follow.keyed_seq = Some(seq);
+    }
+}
+
+/// The host reading's `seq` a keyed `screen.observed` of `execution` was
+/// recorded under: its key is `<execution>:hs:<server pid>.<server start>:<seq>`
+/// ([`Bridge::follow_screen`]).
+fn keyed_screen_seq(key: &str, execution: &ExecutionId) -> Option<u64> {
+    let rest = key.strip_prefix(execution.as_str())?.strip_prefix(":hs:")?;
+    let (_, seq) = rest.rsplit_once(':')?;
+    seq.parse().ok()
 }
 
 /// The wire name of an end's cause.
@@ -7626,8 +7833,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
 
-    use super::{Bridge, BridgeConfig, mounted_key};
-    use crate::command::{CommandAction, Outcome, Submission};
+    use super::{Bridge, BridgeConfig, RESOLVE_PRINCIPAL, mounted_key, trust_answer_key, waits};
+    use crate::command::{CommandAction, NamedKey, Outcome, Submission};
     use crate::event::{CommandStep, ENGINE, EventKind, GlobalPosition, NewEvent, Source};
     use crate::id::{
         AgentId, BranchName, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId,
@@ -9386,6 +9593,132 @@ mod tests {
             .collect()
     }
 
+    /// A Bridge over the agy start of [`submit_agy_start`] with a witness at
+    /// `seq` 1, started until the start is done and the ready pane keyed.
+    fn n12_rig() -> (
+        Arc<ManualClock>,
+        Arc<MemoryStore>,
+        Arc<Witnessed>,
+        TerminalName,
+        Bridge,
+    ) {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        store.set_terminal_server(crate::port::ServerSeen::Answers(Some(
+            crate::port::TerminalServer {
+                pid: 77,
+                started_at_ms: 1_700,
+            },
+        )));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let id = submit_agy_start(&store, "");
+        let mut bridge = n12_bridge(&clock, &store, &host);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        bridge.poll().expect("poll");
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(id));
+        (clock, store, host, terminal, bridge)
+    }
+
+    fn n12_bridge(
+        clock: &Arc<ManualClock>,
+        store: &Arc<MemoryStore>,
+        host: &Arc<Witnessed>,
+    ) -> Bridge {
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            agy_config(Some("gemini-3.8-flash-low")),
+        )
+        .with_clock(clock.clone());
+        bridge.recover().expect("recover");
+        bridge
+    }
+
+    fn agy_drafted() -> String {
+        format!(
+            "Antigravity CLI 1.5.14\n{AGY_RULE}\n> half a thought\n{AGY_RULE}\n? for shortcuts\n"
+        )
+    }
+
+    /// Carry list N12 (a): ready (keyed by `seq` 1), then a draft under the
+    /// same `seq` (unkeyed), then a restart and the pane ready again: the
+    /// log's last screen is `Ready`, recorded unkeyed, never a keyed repeat
+    /// the log refuses (which left the log at `Drafted` while the pane was
+    /// ready).
+    #[test]
+    fn n12_ready_drafted_restart_ready_leaves_the_log_at_ready() {
+        let (clock, store, host, terminal, mut bridge) = n12_rig();
+        store.set_pane(&terminal, &agy_drafted());
+        bridge.poll().expect("poll");
+        bridge.poll().expect("poll");
+        assert_eq!(
+            screens_with_keys(&store),
+            vec![
+                (ScreenState::Ready, Some("exec_1:hs:77.1700:1".to_string())),
+                (ScreenState::Drafted, None),
+            ]
+        );
+        drop(bridge);
+        let mut restarted = n12_bridge(&clock, &store, &host);
+        store.set_pane(&terminal, &agy_idle());
+        restarted.poll().expect("poll");
+        restarted.poll().expect("poll");
+        let screens = screens_with_keys(&store);
+        assert_eq!(
+            screens.last(),
+            Some(&(ScreenState::Ready, None)),
+            "{screens:?}"
+        );
+        assert_eq!(screens.len(), 3, "{screens:?}");
+    }
+
+    /// Carry list N12 (b): a restart over an unchanged pane records nothing
+    /// new, and never a keyed duplicate.
+    #[test]
+    fn n12_a_restart_over_an_unchanged_pane_adds_no_keyed_duplicate() {
+        let (clock, store, host, _terminal, bridge) = n12_rig();
+        let before = screens_with_keys(&store);
+        drop(bridge);
+        let mut restarted = n12_bridge(&clock, &store, &host);
+        restarted.poll().expect("poll");
+        restarted.poll().expect("poll");
+        let after = screens_with_keys(&store);
+        assert!(after.len() <= before.len() + 1, "{after:?}");
+        let keyed: Vec<&Option<String>> = after
+            .iter()
+            .map(|(_, key)| key)
+            .filter(|key| key.is_some())
+            .collect();
+        let mut unique = keyed.clone();
+        unique.dedup();
+        assert_eq!(keyed, unique, "no keyed duplicate: {after:?}");
+        assert_eq!(after, before, "nothing changed on the pane: {after:?}");
+    }
+
+    /// Carry list N12 (c): a new `seq` after a restart is keyed again.
+    #[test]
+    fn n12_a_new_seq_after_a_restart_is_keyed_again() {
+        let (clock, store, host, terminal, bridge) = n12_rig();
+        drop(bridge);
+        let mut restarted = n12_bridge(&clock, &store, &host);
+        store.set_pane(&terminal, &agy_working());
+        host.set(agy_reading(
+            Some("agy"),
+            crate::port::AgentStatus::Working,
+            2,
+        ));
+        restarted.poll().expect("poll");
+        assert_eq!(
+            screens_with_keys(&store).last(),
+            Some(&(ScreenState::Busy, Some("exec_1:hs:77.1700:2".to_string())))
+        );
+    }
+
     /// With the host's reading, one capture that agrees with it is a fact,
     /// keyed by the host's server and reading; a busy screen recorded again
     /// after `screen_refresh` is unkeyed, so the log's unique keys never
@@ -10601,6 +10934,243 @@ mod tests {
             .collect();
         assert_eq!(host.keys(), expected);
         assert!(!bridge.prompting.contains_key(&id));
+
+        // The answer is on the record (PR 3): one `key` command a key, of
+        // `spawn-resolve`, keyed by the execution, recorded pressing and
+        // pressed, then finished once the start was done, with nothing
+        // pressed again. Submitting a key again returns the same command.
+        let execution = ExecutionId::for_command(id);
+        let principal = Principal::new(RESOLVE_PRINCIPAL).expect("principal");
+        for (at, key) in crate::screen::TRUST_KEYS.iter().enumerate() {
+            let named = NamedKey::ALL
+                .iter()
+                .copied()
+                .find(|named| named.tmux() == *key)
+                .expect("a named key");
+            let command = store
+                .submit(
+                    &principal,
+                    &Submission {
+                        agent_id: resumable_agent(1),
+                        session_id: resumable_session(1),
+                        idempotency_key: IdempotencyKey::new(trust_answer_key(&execution, at + 1))
+                            .expect("key"),
+                        action: CommandAction::Key { key: named },
+                    },
+                )
+                .expect("the same command");
+            drive_work(&mut bridge, &store, || {
+                command_outcome(&store, command).is_some()
+            });
+            assert_eq!(command_outcome(&store, command), Some(Outcome::Succeeded));
+            let steps: Vec<CommandStep> = store
+                .read_global(GlobalPosition(0), 100_000)
+                .expect("read")
+                .into_iter()
+                .filter_map(|record| match record.event.kind {
+                    EventKind::CommandStepped {
+                        command_id, step, ..
+                    } if command_id == command => Some(step),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(steps, vec![CommandStep::Pressing, CommandStep::Pressed]);
+        }
+        assert_eq!(host.keys(), expected, "nothing pressed twice");
+    }
+
+    /// `SPAWN_AUTO_APPROVE=off` (`auto_trust = false`): the trust dialog is
+    /// not answered, no command is submitted for it, and the wait fails
+    /// naming the dialog and the switch; once a person answers it (the pane
+    /// ready), the prompt is typed.
+    #[test]
+    fn with_auto_trust_off_the_trust_dialog_is_left_to_a_person() {
+        const TRUST: &str = "Quick safety check: Is this a project you created or one you trust?\n\
+                             y. Yes, I trust this folder\n\
+                             n. No, exit\n\
+                             Enter y/n:\n\
+                             Enter to confirm · Esc to cancel\n";
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Counted::over(store.clone());
+        let id = submit_resumable_start(&store, 1, "work", TRUST);
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(id));
+        let mut config = BridgeConfig::new("tester");
+        config.auto_trust = false;
+        config.ready_attempts = 6;
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            config,
+        )
+        .with_clock(clock.clone());
+        for _ in 0..3 {
+            bridge.work().expect("work");
+            store.expire_leases();
+        }
+        assert!(host.keys().is_empty(), "nothing pressed");
+        assert_eq!(command_outcome(&store, id), None, "still waiting");
+        store.set_pane(&terminal, READY);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        assert!(host.keys().is_empty(), "still nothing pressed");
+        let resolver_commands = records(&store)
+            .into_iter()
+            .filter(|record| matches!(record.event.kind, EventKind::CommandAccepted { .. }))
+            .count();
+        assert_eq!(resolver_commands, 1, "the start alone: no key command");
+
+        // Never answered: the wait fails naming the dialog and the switch.
+        let other = submit_resumable_start(&store, 2, "work", TRUST);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, other).is_some()
+        });
+        match command_outcome(&store, other) {
+            Some(Outcome::Failed(why)) => {
+                assert!(
+                    why.contains("trust dialog") && why.contains("SPAWN_AUTO_APPROVE=off"),
+                    "{why}"
+                );
+            }
+            outcome => panic!("a failed wait, not {outcome:?}"),
+        }
+        assert!(host.keys().is_empty());
+    }
+
+    /// A person and the resolver both answer one dialog (design section 8,
+    /// PR 3 pitfall 2), on the in-memory host: the person's key, pressed
+    /// first, moves the dialog on, so the resolver's key, submitted after
+    /// it, presses nothing (`Failed`, no `pressing`), although the pane
+    /// still draws the dialog. Inputs of `spawn-resolve` would be refused
+    /// like any loop's, but a key never waits for a turn: listing it changes
+    /// no input rule.
+    #[test]
+    fn a_human_and_the_resolver_answering_one_dialog_each_press_once_in_order() {
+        let (store, host, mut bridge, execution) = resolver_rig(PROCEED);
+        let human = submit_key(&store, "human", "approve-1:1", NamedKey::Digit1);
+        let resolver_key = format!("resolve:{execution}:session_1:0000000000000001:1:1");
+        let resolver = submit_key(&store, RESOLVE_PRINCIPAL, &resolver_key, NamedKey::Digit1);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, resolver).is_some()
+        });
+        assert_eq!(command_outcome(&store, human), Some(Outcome::Succeeded));
+        assert_eq!(
+            command_outcome(&store, resolver),
+            Some(Outcome::Failed(super::GONE_DIALOG.to_string()))
+        );
+        assert_eq!(host.keys(), vec!["1".to_string()], "the person's key only");
+        assert!(steps_of(&store, resolver).is_empty(), "no pressing");
+        assert_eq!(
+            submit_key(&store, RESOLVE_PRINCIPAL, &resolver_key, NamedKey::Digit1),
+            resolver
+        );
+        bridge.work().expect("one more claim");
+        assert_eq!(host.keys().len(), 1, "a resubmitted answer presses nothing");
+        assert!(!waits(RESOLVE_PRINCIPAL), "a loop principal");
+        assert!(waits("human"));
+    }
+
+    /// A resolver's key whose dialog is gone (the pane is at its prompt)
+    /// presses nothing and records no `pressing`; one whose dialog still
+    /// shows, with nothing pressed since, is pressed.
+    #[test]
+    fn a_resolver_key_whose_dialog_is_gone_presses_nothing() {
+        let (store, host, mut bridge, execution) = resolver_rig(READY);
+        let gone = submit_key(
+            &store,
+            RESOLVE_PRINCIPAL,
+            &format!("resolve:{execution}:session_1:0000000000000002:1:1"),
+            NamedKey::Digit1,
+        );
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, gone).is_some()
+        });
+        assert_eq!(
+            command_outcome(&store, gone),
+            Some(Outcome::Failed(super::GONE_DIALOG.to_string()))
+        );
+        assert!(host.keys().is_empty());
+        assert!(steps_of(&store, gone).is_empty());
+        store.set_pane(&TerminalName::for_execution(&execution), PROCEED);
+        let shown = submit_key(
+            &store,
+            RESOLVE_PRINCIPAL,
+            &format!("resolve:{execution}:session_1:0000000000000003:1:1"),
+            NamedKey::Digit1,
+        );
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, shown).is_some()
+        });
+        assert_eq!(command_outcome(&store, shown), Some(Outcome::Succeeded));
+        assert_eq!(host.keys(), vec!["1".to_string()]);
+        assert_eq!(
+            steps_of(&store, shown),
+            vec![CommandStep::Pressing, CommandStep::Pressed]
+        );
+    }
+
+    /// Claude Code's numbered dialog at its prompt position.
+    const PROCEED: &str = "Do you want to proceed?\n$ 1. Yes\n  2. No\n";
+
+    /// A started Claude Code execution (session 1) whose pane then shows
+    /// `pane`, and the execution.
+    fn resolver_rig(pane: &str) -> (Arc<MemoryStore>, Arc<Counted>, Bridge, ExecutionId) {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Counted::over(store.clone());
+        let id = submit_resumable_start(&store, 1, "work", READY);
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(id));
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        store.set_pane(&terminal, pane);
+        (store, host, bridge, ExecutionId::for_command(id))
+    }
+
+    fn submit_key(
+        store: &Arc<MemoryStore>,
+        principal: &str,
+        key: &str,
+        named: NamedKey,
+    ) -> CommandId {
+        store
+            .submit(
+                &Principal::new(principal).expect("principal"),
+                &Submission {
+                    agent_id: resumable_agent(1),
+                    session_id: resumable_session(1),
+                    idempotency_key: IdempotencyKey::new(key).expect("key"),
+                    action: CommandAction::Key { key: named },
+                },
+            )
+            .expect("submit")
+    }
+
+    fn steps_of(store: &Arc<MemoryStore>, command: CommandId) -> Vec<CommandStep> {
+        store
+            .read_global(GlobalPosition(0), 100_000)
+            .expect("read")
+            .into_iter()
+            .filter_map(|record| match record.event.kind {
+                EventKind::CommandStepped {
+                    command_id, step, ..
+                } if command_id == command => Some(step),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
