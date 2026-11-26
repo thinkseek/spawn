@@ -29,8 +29,8 @@
 # Blackbox 040 (queue) and 070 (views) are not here: they move to CI (step 3).
 #
 # Shape. No loop. Four databases, run one after another, because the parts'
-# assertions count whole tables (spawn_commands, spawn_events, the tmux
-# sessions) from an empty store, and a tick runs every pending command:
+# assertions count whole tables (spawn_commands, spawn_events, the live
+# terminals) from an empty store, and a tick runs every pending command:
 #   A: 010, 060, 020 (none of 010/060 writes a row, so 020's counts hold
 #      as written), then 027 and 007 (they read their own ids only);
 #   B: 080 alone (its counts start at zero);
@@ -38,7 +38,7 @@
 #   D: 100 (its overview starts with no session), then 017's history is
 #      seeded and 100's loopback server answers 017 (4). The history's
 #      window is October 2026, so 100's rows (written now) fall outside it.
-# One tmux socket (only 030 opens a terminal), one bare repository, one
+# One Herdr session (only 030 opens a terminal), one bare repository, one
 # fake engine for the whole journey. Each step echoes `j05: [NNN ...]` before
 # the checks it carries; blackbox steps are named [bbNNN <section>], after
 # the scenario's own `# ---` sections. Traceability:
@@ -51,7 +51,7 @@
 #
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh), from the root of the
 # tree under test: needs SPAWN_BIN and SPAWN_TEST_DATABASE_URL, creates and
-# drops its own databases, uses a private tmux socket, no network but
+# drops its own databases, uses a private Herdr session, no network but
 # loopback. Every wait is bounded in time.
 set -eu
 
@@ -63,42 +63,56 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
+SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
+if [ -z "$SPAWN_HC" ]; then
+    spawn_dir=$(dirname "$SPAWN_BIN")
+    if [ -x "$spawn_dir/spawn-hc" ]; then
+        SPAWN_HC=$spawn_dir/spawn-hc
+    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
+        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
+    elif command -v spawn-hc >/dev/null 2>&1; then
+        SPAWN_HC=$(command -v spawn-hc)
+    fi
+fi
+[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
+    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od curl sed grep cmp diff timeout; do
+for tool in psql git jq od curl sed grep cmp diff timeout; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
 J=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$J"' EXIT
-# A scratch HOME, and the tmux server's socket, in $J: nothing here reads
+# A scratch HOME, and isolated XDG dirs, in $J: nothing here reads
 # or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$J/home
-TMUX_TMPDIR=$J/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
-# launch's environment file, its terminals' leaders) stays in J, never
+# launch's environment file, herdr-core sockets/state) stays in J, never
 # in the real one. systemd's user manager stays reachable by its bus.
 real_runtime=${XDG_RUNTIME_DIR-}
 if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$J/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
+XDG_RUNTIME_DIR=$J/r
+XDG_STATE_HOME=$J/state
+XDG_CONFIG_HOME=$J/config
+mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
+export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
-SPAWN_TMUX_SOCKET="bb-j05-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+SPAWN_HERDR_SESSION="bb-j05-$hc_id"
 SPAWN_PSQL=psql
-export SPAWN_TMUX_SOCKET SPAWN_PSQL
+export SPAWN_HERDR_SESSION SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -110,6 +124,25 @@ databases=""
 serve_pid=""
 guarded_pid=""
 part=""
+hc() {
+    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
+        HC_SESSION="$SPAWN_HERDR_SESSION" \
+        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
+        "$SPAWN_HC" "$@"
+}
+stop_herdr() {
+    [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ] || return 0
+    for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
+        jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
+        hc kill "$addr" >/dev/null 2>&1 || true
+    done
+    hc server stop >/dev/null 2>&1 || true
+    hc_wait=0
+    while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
+        hc_wait=$((hc_wait + 1))
+        sleep 0.1
+    done
+}
 finish() {
     rc=$?
     trap - EXIT
@@ -129,7 +162,7 @@ finish() {
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    stop_herdr
     for db in $databases; do
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$db" >/dev/null 2>&1 || true
@@ -153,6 +186,16 @@ WORK=$J
 export WORK
 . "$controller/scripts/blackbox/assertions.sh"
 
+terminal() {
+    hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
+        jq -r '[.terminals[]? | select(.state == "live") | .address][0] // empty'
+}
+pane() {
+    t=$(terminal)
+    [ -n "$t" ] || return 1
+    hc read --lines 80 "$t"
+}
+
 # An assertion exits 1, unless the database is gone: then nothing the
 # journey read can be trusted, and that is the harness's failure.
 fail() {
@@ -165,7 +208,10 @@ fail() {
 }
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
-    SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_SERVE_TOKEN SPAWN_SERVE_DATABASE_URL; do
+    SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_SERVE_TOKEN SPAWN_SERVE_DATABASE_URL \
+    SPAWN_TERMINAL_BACKEND SPAWN_HERDR_MODE SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM \
+    SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM TMUX TMUX_PANE TMUX_TMPDIR \
+    HERDR_SOCKET_PATH HERDR_SESSION HERDR_PANE_ID HC_SOCKET HC_SESSION; do
     unset "$name" 2>/dev/null || true
 done
 
@@ -201,20 +247,11 @@ done
 FAKE
 chmod 755 "$J/claude"
 
-# The local tmux host runs the program named by SPAWN_TMUX_PROGRAM and adds no
-# socket of its own, while assertions.sh reads SPAWN_TMUX_SOCKET: one wrapper
-# pins the journey's private socket (030's and 100's, shared).
-cat >"$J/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$J/tmux"
-
 SPAWN_GIT_REPO=$repo
 SPAWN_CLAUDE_PROGRAM=$J/claude
-SPAWN_TMUX_PROGRAM=$J/tmux
+SPAWN_HERDR_CORE_PROGRAM=$SPAWN_HC
 SPAWN_WORKER=worker-bb
-export SPAWN_GIT_REPO SPAWN_CLAUDE_PROGRAM SPAWN_TMUX_PROGRAM SPAWN_WORKER
+export SPAWN_GIT_REPO SPAWN_CLAUDE_PROGRAM SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER
 
 # database <word>: a new empty database, its scratch directory and workspace
 # root, for the parts that follow.
@@ -801,13 +838,13 @@ assert_eq "$(tick_count commands)" 0 "second tick handles no command"
 assert_eq "$(tick_count sessions)" 1 "second tick still counts the session"
 assert_eq "$(scalar 'select count(*) from agent_executions')" 1 \
     "second tick starts no second execution"
-assert_eq "$(tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{session_name}' | wc -l | tr -d ' ')" \
+assert_eq "$(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" | jq '[.terminals[]? | select(.state == "live")] | length')" \
     1 "one terminal for one execution"
 
 assert_file "$workspace/README.md"
 assert_eq "$(cat "$workspace/README.md")" "base" "workspace still holds the base content"
-# 030's terminal is done with: 100's tick below shares the socket.
-tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+# 030's terminal is done with: 100's tick below shares the Herdr session.
+stop_herdr
 
 # ================================================================================
 # Database D: blackbox 100, then 017 (4) on the same loopback server

@@ -28,9 +28,9 @@
 # directory and processes, each the scenario's own world, helpers and checks
 # as written:
 #   030 runs a loop (restarted as 030 restarts it), a fake model judge,
-#       `spawn serve` and `spawn alerts --follow` on its own database and tmux
-#       socket;
-#   031 has no loop, no tmux and no timing bound: only `spawn backup` runs,
+#       `spawn serve` and `spawn alerts --follow` on its own database and Herdr
+#       session;
+#   031 has no loop, no terminal backend and no timing bound: only `spawn backup` runs,
 #       against its own R2 stand-in. It shares nothing with 030, so it runs
 #       beside it from the start.
 #   Both run to their end, a failing one too.
@@ -44,7 +44,7 @@
 #
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh), from the root of the
 # tree under test: needs SPAWN_BIN and SPAWN_TEST_DATABASE_URL, creates and
-# drops its own databases, uses private tmux sockets and loopback ports, no
+# drops its own databases, uses private Herdr sessions and loopback ports, no
 # network. Every wait is bounded in time.
 set -eu
 
@@ -58,9 +58,9 @@ harness() {
 
 # =================================================================================
 # Section 030, the alerts: 030.sh from its first line of code to its last
-# check, in a subshell. Its own database, tmux socket, fake judge, loop
+# check, in a subshell. Its own database, Herdr session, fake judge, loop
 # (restarted as 030 restarts it), serve and `spawn alerts --follow`.
-# Edits: the database and socket names (j12's), the assertion prefix
+# Edits: the database and session names (j12's), the assertion prefix
 # `blackbox: [030]`, `j12: ` before 030's own lines, and BB_030_MEASURE
 # not carried: today() and its calls (they did nothing without it), the
 # measure blocks of (7), (8) and the end are gone; no check went with them.
@@ -74,44 +74,58 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
+SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
+if [ -z "$SPAWN_HC" ]; then
+    spawn_dir=$(dirname "$SPAWN_BIN")
+    if [ -x "$spawn_dir/spawn-hc" ]; then
+        SPAWN_HC=$spawn_dir/spawn-hc
+    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
+        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
+    elif command -v spawn-hc >/dev/null 2>&1; then
+        SPAWN_HC=$(command -v spawn-hc)
+    fi
+fi
+[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
+    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 MEASURE="" # BB_030_MEASURE is not carried: every check fails here, as in the gate
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed curl python3 dd awk sha256sum; do
+for tool in psql git jq od bash sed curl python3 dd awk sha256sum; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
+# A scratch HOME, and isolated XDG dirs, in WORK: nothing here reads
 # or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
-# launch's environment file, its terminals' leaders) stays in WORK, never
+# launch's environment file, herdr-core sockets/state) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
 real_runtime=${XDG_RUNTIME_DIR-}
 if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
+XDG_RUNTIME_DIR=$WORK/r
+XDG_STATE_HOME=$WORK/state
+XDG_CONFIG_HOME=$WORK/config
+mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
+export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 SPAWN_DB_NAME="bb_j12_030_alerts_$run"
-SPAWN_TMUX_SOCKET="bb-j12-030-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+SPAWN_HERDR_SESSION="bb-j12-$hc_id"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -142,12 +156,31 @@ stop_pid() { # <pid>: TERM, then KILL after 30 s; only our own children
     done
     wait "$1" 2>/dev/null || true
 }
+hc() {
+    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
+        HC_SESSION="$SPAWN_HERDR_SESSION" \
+        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
+        "$SPAWN_HC" "$@"
+}
+stop_herdr() {
+    [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ] || return 0
+    for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
+        jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
+        hc kill "$addr" >/dev/null 2>&1 || true
+    done
+    hc server stop >/dev/null 2>&1 || true
+    hc_wait=0
+    while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
+        hc_wait=$((hc_wait + 1))
+        sleep 0.1
+    done
+}
 cleanup() {
     stop_pid "$follow_pid"
     stop_pid "$serve_pid"
     stop_pid "$loop_pid"
     stop_pid "$judge_pid"
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    stop_herdr
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -261,6 +294,7 @@ chmod 755 "$WORK/fake-gate.sh"
 # turn changes nothing.
 bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
+[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 while [ $# -gt 0 ]; do
   case "$1" in --resume | --session-id) native=$2 ;; esac
@@ -316,12 +350,6 @@ while :; do
 done
 ENGINE
 chmod 755 "$WORK/claude"
-
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
 
 # The fake model judge (crates/spawn-jev's wire shape), in a directory of
 # its own.
@@ -429,7 +457,10 @@ for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SP
     SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS \
     SPAWN_ALERT_MEMORY_LOW_MB SPAWN_ALERT_MEMORY_OK_MB SPAWN_ALERT_TMPFS_PATH \
     SPAWN_ALERT_TMPFS_HIGH_MB SPAWN_ALERT_TMPFS_OK_MB SPAWN_ALERT_WINDOW_SECS \
-    SPAWN_ALERT_PG_QUIET_SECS; do
+    SPAWN_ALERT_PG_QUIET_SECS SPAWN_TERMINAL_BACKEND SPAWN_HERDR_MODE \
+    SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM \
+    TMUX TMUX_PANE TMUX_TMPDIR HERDR_SOCKET_PATH HERDR_SESSION HERDR_PANE_ID \
+    HC_SOCKET HC_SESSION; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -439,7 +470,8 @@ SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
+BB_PATH=$PATH
+SPAWN_HERDR_CORE_PROGRAM=$SPAWN_HC
 SPAWN_WORKER=worker-bb
 SPAWN_SUPERVISOR=1
 SPAWN_MISSION_FILE=$WORK/mission.md
@@ -457,7 +489,7 @@ SPAWN_TEST_DATABASE_LOG=$testlog
 SPAWN_DATABASE_LOG=$livelog
 SPAWN_ALERT_TMPFS_PATH=${ram:-$WORK/ram}
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER \
     SPAWN_SUPERVISOR SPAWN_MISSION_FILE SPAWN_LOOP_INTERVAL_MS SPAWN_JUDGE_URL \
     SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_ALERT_CHECK_SECS \
     SPAWN_ALERT_UNDELIVERED_SECS SPAWN_ALERT_ADMISSION_SECS \
@@ -1084,25 +1116,25 @@ done
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
+# A scratch HOME, and isolated XDG dirs, in WORK: nothing here reads
 # or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
-# The runtime directory too (backlog S20): what Spawn keeps there (a
-# launch's environment file, its terminals' leaders) stays in WORK, never
-# in the real one. systemd's user manager stays reachable by its bus.
+export HOME
+# The runtime directory too (backlog S20): what Spawn keeps there stays
+# in WORK, never in the real one. systemd's user manager stays reachable by its bus.
 real_runtime=${XDG_RUNTIME_DIR-}
 if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
+XDG_RUNTIME_DIR=$WORK/r
+XDG_STATE_HOME=$WORK/state
+XDG_CONFIG_HOME=$WORK/config
+mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
+export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_j12_031_backup_$run"
