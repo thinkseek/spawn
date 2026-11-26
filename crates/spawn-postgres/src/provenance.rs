@@ -14,6 +14,12 @@
 //! it (forward) or that it depends on (backward), up to a depth, each
 //! expanded once (a breadth-first walk), so diamonds, cliques and cycles
 //! cost what they hold, not their paths.
+//!
+//! Data refs (PV3b, `spawn prov snapshot`): a ref is the domain
+//! `data:<ref>` of the same tables, and its head the domain's newest
+//! revision ([`PostgresStore::prov_head`], [`PostgresStore::prov_heads`]);
+//! [`PostgresStore::prov_changes_using`] reads the edges that name a commit
+//! or a snapshot directly. No table, column or event is added.
 
 use std::collections::HashMap;
 use std::fmt;

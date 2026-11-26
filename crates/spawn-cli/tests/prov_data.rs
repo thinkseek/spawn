@@ -35,7 +35,17 @@ impl Scratch {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let path = std::env::temp_dir().join(format!(
+        // A data root is never under a workspace root (a directory holding
+        // the transcript archive): a temporary directory that is goes to
+        // /tmp instead.
+        let mut base = std::env::temp_dir();
+        if base
+            .ancestors()
+            .any(|above| above.join(".transcripts").exists())
+        {
+            base = PathBuf::from("/tmp");
+        }
+        let path = base.join(format!(
             "spawn-prov-data-{case}-{}-{nanos:x}",
             std::process::id()
         ));
