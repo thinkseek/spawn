@@ -1,6 +1,6 @@
 # Local IPC Protocol Contract (`spawn-ipc-v1`, Option B2)
 
-> **Status**: Phase 0 Frozen Contract (Master Issue [#113](https://github.com/thinkseek/spawn/issues/113) Decision D3, Engineering Fine Item 1, Option B2).
+> **Status**: Frozen Wire Contract, Live Split Deployment (Master Issue [#113](https://github.com/thinkseek/spawn/issues/113) Decision D3, Option B2 — deployed via `spawn-core.service`, `spawn-node-edge.service`, `spawn-node-gw.service`, and `spawn-node-out.service`).
 > **Golden Fixtures**: [`crates/spawn-core/testdata/spawn-ipc-v1/`](../crates/spawn-core/testdata/spawn-ipc-v1/).
 > **API Byte Contract**: Every `/api/*` route's response schema and status semantics remain solely owned by [`docs/api.md`](./api.md) and Rust `serve`.
 
@@ -21,9 +21,11 @@ Option B2 uses **HTTP/1.1 over a UNIX domain stream socket (`AF_UNIX`, `SOCK_STR
   - **Dialer (Go)**: Calls `Lstat` on `core.sock` before dialing; refuses symlinks, non-sockets, wrong UID, or any group/world permission bits (`mode & 0o077 != 0`).
   - **Listener (Rust Linux)**: Checks `SO_PEERCRED` (`rustix::net::sockopt::socket_peercred`) on accepted connections and verifies `peer_uid == geteuid()`, closing mismatched connections immediately.
 - **No `ActorContext` Over IPC**: IPC requests carry no database role header or `ActorContext`. PostgreSQL `by` / principal attribution is enforced strictly by the database connection's login role selected via the static Route → PG Role table (§4).
-- **Least-Privilege Startup Discipline**:
-  - `spawn-core` derives scoped URLs for `spawn_reader`, `spawn_human`, and `spawn_node_gateway` once at startup (via `role_url`), then **drops the owner `SPAWN_DATABASE_URL`** from the IPC server state.
-  - All Go systemd units (`spawn-node-edge`, `spawn-node-gw`, `spawn-node-out`) **must not** load `spawn.env` and **must have zero `*DATABASE_URL*` variables** in `os.Environ()`.
+- **Least-Privilege Startup & Split Systemd Discipline**:
+  - `deploy/systemd/spawn-core.service` runs `spawn serve --ipc --ipc-sock %t/spawn/core.sock --cas ...`, deriving scoped URLs for `spawn_reader`, `spawn_human`, and `spawn_node_gateway` once at startup (via `role_url`), then **dropping the owner `SPAWN_DATABASE_URL`** from the IPC server state.
+  - `deploy/systemd/spawn-node-edge.service` runs `spawn-node front --serve edge --core-sock %t/spawn/core.sock --listen ${SPAWN_SERVE_ADDRESS} --web ${SPAWN_WEB_DIR}` (serving the edge HTTP/SSE front and externalized PWA assets), and `deploy/systemd/spawn-node-gw.service` runs `spawn-node front --serve node --core-sock %t/spawn/core.sock ...` (the signed node gateway).
+  - `deploy/systemd/spawn-node-out.service` runs `spawn-node front --serve outbound --out-sock %t/spawn/out.sock`, holding the Jev upstream key only via `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key` (`RestartPreventExitStatus=243 78`, `SPAWN_OUT_ALLOWLIST=https://api.typesafe.ai/v1/systemone`) and exposing local unary `POST /out/v1/jev/call` on `$XDG_RUNTIME_DIR/spawn/out.sock` (`0600`). `spawn-jev`'s `validate_out_sock` checks UID/socket mode (`0600`, rejecting symlinks, foreign UIDs, and `mode & 0o077 != 0`) before dialing `SPAWN_OUT_SOCK`.
+  - All Go systemd units (`spawn-node-edge.service`, `spawn-node-gw.service`, `spawn-node-out.service`) **must not** load `spawn.env` and **must have zero `*DATABASE_URL*` variables** in `os.Environ()`. `scripts/keep/credential-health.sh` permanently checks this via `go_unit_pg_isolation` and supports `unix://<socket>|<http-path>` UDS health probes (expanding `%t/` and `~/`).
 
 ---
 
@@ -45,7 +47,7 @@ To guarantee dashboard read storms or SSE catch-ups never starve node heartbeats
 
 | Pool | Max Concurrency / Slots | Used By |
 | --- | --- | --- |
-| `reads` | **`16`** | All 33 canonical `GET /api/*` routes (excluding live stream upgrades if served separately) + `GET /ipc/v1/hello` (no DB pool needed or `spawn_reader`) |
+| `reads` | **`16`** | All 33 canonical `GET /api/*` routes + out-of-table read-only `GET\|HEAD /api/features/truth` and `/api/episodes` + `GET /ipc/v1/hello` (`spawn_reader`) |
 | `writes` | **`4`** | All 9 `POST /api/*` routes (`spawn_human` for 7 SQL writes; `none` for 2 feature-map routes) |
 | `node` | **`16`** | All 6 `POST /ipc/v1/node/*` routes (`spawn_node_gateway`) |
 | `events` | **`2`** | `GET /ipc/v1/events` long-lived NDJSON upstream subscription (`spawn_reader`) |
@@ -73,6 +75,7 @@ Liveness, schema/protocol version, and event-stream baseline probe:
 Exact HTTP byte passthrough (`docs/api.md` contract preserved 1-to-1; Go `front` forwards via `httputil.ReverseProxy` over `net/http.Transport` UDS dialer):
 
 - **33 Canonical `GET` routes** (same status, `ETag`, `Cache-Control`, JSON bytes).
+- **2 Out-of-Table Read-Only `GET|HEAD` routes** (`/api/features/truth` and `/api/episodes`, intentionally outside `routes.json` / `docs/api.md` while contract-locked in `crates/spawn-core/tests/spawn_ipc_v1.rs`): dispatched on `reads_gate` (`reads` pool) under `spawn_reader`, rejecting any non-`GET`/`HEAD` method with `405 Method Not Allowed` (`Allow: GET`).
 - **9 Canonical `POST` routes** (`/api/sessions/<id>/{input,key,restart,reassign}`, `/api/missions/<id>/resume`, `/api/master/message`, `/api/approvals/<session_id>/act`, `/api/features/{scan,associate}`).
 - Legacy aliases (14 patterns) are handled/retired according to Phase 2a policy and never alter canonical behavior.
 
@@ -118,6 +121,7 @@ This table is locked by compile/unit tests (`crates/spawn-cli/src/serve.rs::ipc_
 | --- | --- | --- | --- | --- |
 | `/ipc/v1/hello` | `GET` | `reads` (`16`) | `spawn_reader` | Not required |
 | All 33 canonical `GET /api/*` routes (`docs/api.md`) | `GET` | `reads` (`16`) | `spawn_reader` | Not required |
+| `/api/features/truth`, `/api/episodes` (out-of-table contract) | `GET` \| `HEAD` | `reads` (`16`) | `spawn_reader` | Not required (`405 Allow: GET` otherwise) |
 | `/ipc/v1/events` | `GET` | `events` (`2`) | `spawn_reader` | Not required |
 | `/api/sessions/<id>/input` | `POST` | `writes` (`4`) | `spawn_human` | **Mandatory** |
 | `/api/sessions/<id>/key` | `POST` | `writes` (`4`) | `spawn_human` | **Mandatory** |

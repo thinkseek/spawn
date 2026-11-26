@@ -1051,6 +1051,94 @@ pub(crate) fn read_package_json(text: &str) -> Result<PackageJson, String> {
 /// One `compilerOptions.paths` entry: pattern and its ordered target list.
 pub(crate) type TsPathEntry = (String, Vec<String>);
 
+/// Indexed `compilerOptions.paths` mappings preserving written order.
+///
+/// Shared via [`Arc`] across `extends` chains so deep directory hierarchies do
+/// not copy inherited alias tables while keeping specifier lookup sublinear
+/// for exact patterns.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TsPathMap {
+    entries: Vec<TsPathEntry>,
+    /// First written entry index for each exact pattern.
+    exact: BTreeMap<String, usize>,
+    /// Single-`*` wildcard rules `(prefix_len, entry_idx)` in written order.
+    wildcards: Vec<(usize, usize)>,
+}
+
+impl PartialEq for TsPathMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for TsPathMap {}
+
+impl TsPathMap {
+    /// Build an indexed path map from entries in written order.
+    pub(crate) fn from_entries(entries: Vec<TsPathEntry>) -> Self {
+        let mut exact = BTreeMap::new();
+        let mut wildcards = Vec::new();
+        for (idx, (pattern, _)) in entries.iter().enumerate() {
+            exact.entry(pattern.clone()).or_insert(idx);
+            if let Some((prefix, suffix)) = pattern.split_once('*')
+                && !suffix.contains('*')
+            {
+                wildcards.push((prefix.len(), idx));
+            }
+        }
+        Self {
+            entries,
+            exact,
+            wildcards,
+        }
+    }
+
+    /// Returns `true` when the map contains zero path entries.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Underlying `(pattern, targets)` slice in written order.
+    #[cfg(test)]
+    pub(crate) fn as_entries(&self) -> &[TsPathEntry] {
+        &self.entries
+    }
+
+    /// Match a bare specifier against `compilerOptions.paths`.
+    ///
+    /// Preserves TypeScript / original resolver precedence: exact pattern
+    /// matches have rank `usize::MAX` (first occurrence wins), otherwise the
+    /// matching wildcard with the longest prefix wins (first written wins ties).
+    pub(crate) fn match_specifier<'a>(
+        &'a self,
+        spec: &'a str,
+    ) -> Option<(usize, &'a [String], &'a str)> {
+        if let Some(&idx) = self.exact.get(spec) {
+            return Some((usize::MAX, &self.entries[idx].1, ""));
+        }
+        let mut best: Option<(usize, &'a [String], &'a str)> = None;
+        for &(rank, idx) in &self.wildcards {
+            let (pattern, targets) = &self.entries[idx];
+            let Some((prefix, suffix)) = pattern.split_once('*') else {
+                continue;
+            };
+            if spec.len() < prefix.len() + suffix.len() {
+                continue;
+            }
+            let Some(star) = spec
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(suffix))
+            else {
+                continue;
+            };
+            if best.is_none_or(|(best_rank, _, _)| rank > best_rank) {
+                best = Some((rank, targets, star));
+            }
+        }
+        best
+    }
+}
+
 /// What the resolver needs from one `tsconfig.json` / `jsconfig.json`,
 /// before its `extends` chain is merged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1058,10 +1146,10 @@ pub(crate) struct TsConfig {
     /// `extends` (a string or, since TypeScript 5, an array), as written.
     pub extends: Vec<String>,
     pub base_url: Option<String>,
-    /// `compilerOptions.paths`: pattern to targets, in written order;
-    /// `None` when the file does not set it. Shared via [`Arc`] so deep
+    /// `compilerOptions.paths`: indexed pattern-to-targets map in written
+    /// order; `None` when the file does not set it. Shared via [`Arc`] so deep
     /// `extends` chains do not clone inherited path maps per level.
-    pub paths: Option<Arc<[TsPathEntry]>>,
+    pub paths: Option<Arc<TsPathMap>>,
 }
 
 /// Read a `tsconfig.json` or `jsconfig.json` (comments and trailing commas
@@ -1083,7 +1171,7 @@ pub(crate) fn read_tsconfig(text: &str) -> Result<TsConfig, String> {
     let base_url = options.and_then(|options| json_string(options, "baseUrl"));
     let paths = match options.and_then(|options| options.get("paths")) {
         Some(Json::Obj(entries)) => {
-            let collected: Vec<(String, Vec<String>)> = entries
+            let collected: Vec<TsPathEntry> = entries
                 .iter()
                 .map(|(pattern, targets)| {
                     let targets = match targets {
@@ -1097,7 +1185,7 @@ pub(crate) fn read_tsconfig(text: &str) -> Result<TsConfig, String> {
                     (pattern.clone(), targets)
                 })
                 .collect();
-            Some(Arc::from(collected))
+            Some(Arc::new(TsPathMap::from_entries(collected)))
         }
         _ => None,
     };
@@ -1643,7 +1731,7 @@ fx-test = { path = "../test" }
         assert_eq!(config.extends, vec!["./a", "pkg/tsconfig"]);
         assert_eq!(config.base_url.as_deref(), Some("src"));
         assert_eq!(
-            config.paths.as_deref(),
+            config.paths.as_deref().map(TsPathMap::as_entries),
             Some(
                 [
                     (
@@ -1656,6 +1744,97 @@ fx-test = { path = "../test" }
             )
         );
         assert_eq!(read_tsconfig("{}").expect("empty"), TsConfig::default());
+    }
+
+    fn linear_path_match<'a>(
+        entries: &'a [TsPathEntry],
+        spec: &'a str,
+    ) -> Option<(usize, &'a [String], &'a str)> {
+        let mut best: Option<(usize, &'a [String], &'a str)> = None;
+        for (pattern, targets) in entries {
+            let candidate = if pattern == spec {
+                Some((usize::MAX, ""))
+            } else {
+                pattern
+                    .split_once('*')
+                    .filter(|(_, suffix)| !suffix.contains('*'))
+                    .and_then(|(prefix, suffix)| {
+                        spec.len()
+                            .ge(&(prefix.len() + suffix.len()))
+                            .then(|| {
+                                spec.strip_prefix(prefix)
+                                    .and_then(|rest| rest.strip_suffix(suffix))
+                                    .map(|star| (prefix.len(), star))
+                            })
+                            .flatten()
+                    })
+            };
+            if let Some((rank, star)) = candidate
+                && best.is_none_or(|(best_rank, _, _)| rank > best_rank)
+            {
+                best = Some((rank, targets.as_slice(), star));
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn tsconfig_paths_arc_shares_and_indexes_large_maps() {
+        let mut raw_paths: Vec<String> = (0..256)
+            .map(|idx| format!("\"alias-{idx}\": [\"src/exact/{idx}.ts\"]"))
+            .collect();
+        // Equal-prefix wildcard tie: first written rule (`./first/*`) must win.
+        raw_paths.push("\"@tie/*\": [\"src/first/*\"]".to_string());
+        raw_paths.push("\"@tie/*\": [\"src/second/*\"]".to_string());
+        raw_paths.push("\"*\": [\"src/fallback/*\"]".to_string());
+        raw_paths.push("\"dup\": [\"src/dup-first.ts\"]".to_string());
+        raw_paths.push("\"dup\": [\"src/dup-second.ts\"]".to_string());
+        raw_paths.push("\"@pkg/exact/*\": [\"src/wildcard/*\"]".to_string());
+
+        let text = format!(
+            "{{ \"compilerOptions\": {{ \"baseUrl\": \".\", \"paths\": {{ {} }} }} }}",
+            raw_paths.join(", ")
+        );
+        let config = read_tsconfig(&text).expect("large tsconfig");
+        let paths_arc = config.paths.clone().expect("paths");
+        let cloned_arc = Arc::clone(&paths_arc);
+        assert!(
+            Arc::ptr_eq(&paths_arc, &cloned_arc),
+            "cloning inherited TsConfig.paths must share the same Arc allocation"
+        );
+
+        for spec in [
+            "alias-0",
+            "alias-127",
+            "alias-255",
+            "dup",
+            "@tie/mod",
+            "@pkg/exact/*",
+            "@pkg/exact/item",
+            "catchall",
+        ] {
+            assert_eq!(
+                paths_arc.match_specifier(spec),
+                linear_path_match(paths_arc.as_entries(), spec),
+                "specifier={spec}"
+            );
+        }
+        assert_eq!(
+            paths_arc.match_specifier("dup").map(|(r, t, _)| (r, t)),
+            Some((usize::MAX, &["src/dup-first.ts".to_string()][..]))
+        );
+        assert_eq!(
+            paths_arc
+                .match_specifier("@tie/mod")
+                .map(|(_, t, star)| (t, star)),
+            Some((&["src/first/*".to_string()][..], "mod"))
+        );
+        assert_eq!(
+            paths_arc
+                .match_specifier("catchall")
+                .map(|(r, _, s)| (r, s)),
+            Some((0, "catchall"))
+        );
     }
 
     #[test]

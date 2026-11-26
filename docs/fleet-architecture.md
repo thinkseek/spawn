@@ -496,6 +496,19 @@ destination is checked in the CLI and again in the writer, and every string
 of a record is masked. Spawn changes no ssh configuration, key or file on a
 node.
 
+- **WebCrypto browser E2E (`spawn-e2e-v2`) & Phase 2 systemd split topology.**
+  For browser clients without native `ring`, `web/src/e2e.ts` implements
+  `spawn-e2e-v2` (and `pkcs8-ed25519-v2` key parsing) purely over standard
+  WebCrypto (`crypto.subtle`) with X25519 + HKDF-SHA256 + AEAD and the 120 s
+  clock-skew and replay guard (`docs/spawn-e2e-v2.md`). On the host, production
+  control-plane units run split across `deploy/systemd/spawn-core.service`
+  (`spawn serve --ipc --ipc-sock %t/spawn/core.sock`),
+  `spawn-node-edge.service` (Go HTTP/SSE edge & externalized PWA assets from
+  `SPAWN_WEB_DIR`), `spawn-node-gw.service` (Go signed node gateway), and
+  `spawn-node-out.service` (Go outbound unary RPC relay on `%t/spawn/out.sock`),
+  with zero `spawn.env` / `*DATABASE_URL*` credentials in any Go unit
+  ([spawn-ipc-v1.md](./spawn-ipc-v1.md)).
+
 ## 2. Observation: rules first, Jev on ambiguity
 
 The Observer folds facts per session (transcript events, executions, screen
@@ -526,7 +539,11 @@ facts. It answers in one request:
 - `needs_human` (yes/no): probability that a human must answer or decide;
 - `stuck` (yes/no): probability that the agent loops or makes no progress.
 
-Without a Jev URL (`SPAWN_JUDGE_URL` or `--judge-url`), the Observer judges
+Without a Jev URL (`SPAWN_JUDGE_URL` or `--judge-url`) or a local outbound UDS
+(`SPAWN_OUT_SOCK`, pointing to `spawn-node-out.service`'s `%t/spawn/out.sock`
+and serving `POST /out/v1/jev/call` with `LoadCredential=typesafe.api-key`,
+validated by `spawn-jev`'s `validate_out_sock` against symlinks, foreign UIDs,
+and non-`0600` modes), the Observer judges
 by the rules alone. A case they cannot settle goes the way of a judge that is
 down (below): the rules' guess with its ambiguity, `reason =
 JudgeUnavailable`, `judge: "none"`, and attention, so the dispatcher
@@ -1771,6 +1788,12 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   cleared it; nothing rests on the step's memory, on absence, or on time
   without a record. Evidence never holds a secret: no database URL with its
   password, no environment, process names without their arguments.
+- **Credential health & UDS isolation (`scripts/keep/credential-health.sh`).**
+  Keep checks manifest health endpoints over `http(s)://` or local UDS
+  (`unix://<socket>|<http-path>`, expanding `%t/` and `~/`), and enforces host-wide
+  `go_unit_pg_isolation` (`subject: spawn-units`): asserting zero `spawn.env` or
+  `*DATABASE_URL*` references across `spawn-node-{edge,gw,out}.service` and
+  their systemd drop-ins.
 
 #### Messages: each one tracked by its id (objective 045)
 
@@ -2557,14 +2580,16 @@ The Scorecard's "How the fleet decides" reads it over the page's window;
 | Human interventions (Home) | The north star (§0) for the last 24 h and 7 days: interventions per agent-hour, how many, the retries left out, and on request the list behind each figure (kind, agent, line, its commands and tries, outcome) |
 | Fleet board | The rest of the fleet in groups: on a task (escalated first, by the escalations queue, then the quietest), idle, ended (folded, newest end first); each row its state, the mission and task it holds, what it does now, its last event; the sidebar's session list uses the same groups |
 | Agent detail | A box to type to its session, with what was sent there and whether it was typed or waits for the agent's turn; live terminal; the Jev panel (distribution, needs_human, stuck, the judge's attention flag and its reason, evidence, rules-vs-Jev); the commands into it (an input waiting for the turn says so); state timeline; event timeline |
-| Missions | Missions with open tasks first, then idle active ones, then closed ones (folded); each mission's tasks in flight (oldest first), landed or accepted, sent back, cancelled (folded), an objective's retries nested under its latest attempt; residents waiting for a human's approval |
+| Missions | Missions with open tasks first, then idle active ones, then closed ones (folded); each mission's tasks in flight (oldest first), landed or accepted, sent back, cancelled (folded), an objective's retries nested under its latest attempt; grading difficulty/preset/step-up badges in `MissionsView` and `TaskPanel`; residents waiting for a human's approval |
+| Grading & Episodes (`#/grading`) | `GradingView` renders Top-Down 3-tier grading presets and calibration/upkeep state (`GET /api/grading`) alongside the "Control-stream Episode Replay & Sync Points" panel (`GET /api/episodes`, SQL parity status, difficulty/rework/reroute and review/gate sync points) |
+| Features (`#/features`) | `FeatureMapView` renders planned/implemented/verified/live capability graph (`GET /api/features`) enriched with read-only code dependency truth and semantic purity findings (`GET /api/features/truth`) |
 | RSI | Objective missions: the backlog's objectives, tasks, gate verdicts and logs, metrics, the resident's terminal |
 
 Every route the API answers, with its method, what it answers, its CLI twin
-and who reads it, is listed once in [docs/api.md](./api.md): 29 GET route
+and who reads it, is listed once in [docs/api.md](./api.md): 33 canonical GET route
 patterns and 9 POST routes on `main`, all from one table, `ROUTES` in
-`crates/spawn-cli/src/serve.rs`, which the router dispatches on and a unit
-test (`routes_match_docs_api_md`) holds equal to docs/api.md. The paths name
+`crates/spawn-cli/src/serve.rs`, which the router dispatches on and unit
+tests (`routes_match_docs_api_md` and `crates/spawn-core/tests/spawn_ipc_v1.rs`) hold equal to docs/api.md. In addition, two contract-locked out-of-table read-only `GET|HEAD` routes (`/api/features/truth` and `/api/episodes`, also enforced by `spawn_ipc_v1.rs`) run on `reads_gate` (`reads` pool) as `spawn_reader` and reject non-`GET`/`HEAD` requests with `405 Allow: GET`. Fronted by `spawn-node-edge.service`, the PWA shell serves externalized static assets from `SPAWN_WEB_DIR` (`web/public/{manifest.webmanifest,sw.js,icon.svg}`). The paths name
 the record's nouns (issue 98): a session's reads and writes are under
 `/api/sessions/<id>`, a task's under `/api/tasks/<n>`, the objective
 missions' under `/api/objectives`, a mission's resume under
@@ -2737,7 +2762,9 @@ Known edges, each with its rule:
 - `EventKind` stays closed; observation fields are additive.
 - Facts > rules > Jev; observation never acts; Jev alone triggers only reversible, bounded actions.
 - Worker panes hold no database login. The Bridge reads what an engine does from files it writes anyway and from its screen: the Claude transcript (the Bridge names the session with `--session-id`, so it knows the path before the engine starts), the pane read every tick, and the exit file the runner writes. The supervisor's pane gets `spawn_supervisor`, which reads the fleet and submits commands through the gateway but appends no events of its own. The Bridge, the Observer and the controllers run as the owner. `spawn serve` reads as `spawn_reader`, which can write nothing, and types a person's input as `spawn_human`, which can call `spawn_human_input` and nothing else (an input, principal `human`, to the session's own agent); it binds loopback, and on any other address needs `SPAWN_SERVE_TOKEN`. Roles belong to the whole cluster, so each database has its own set, named after it (`spawn_supervisor_<db>`, `spawn_reader_<db>`, `spawn_human_<db>`, SQL `spawn_login_role`); grants, commands and records still name the principals `spawn_supervisor`, `spawn_reader` and `human` (`spawn_principal`). Two installs on one cluster thus share no privileges and set none of each other's passwords. The cluster-wide `spawn_supervisor`, `spawn_reader` and `spawn_terminal` of earlier installs lose every privilege in the schema and act as nobody; a migration warns while one can still log in, for a human to drop it. A login's password is PBKDF2-HMAC-SHA256 of the owner's password (600,000 rounds), salted with a random salt kept in the login's role comment and its name (`spawn_postgres::role_url`), and set by every migration: nothing secret is stored, only a holder of the owner's password can form it, and a login that knows its own password and salt pays the rounds for every guess at the owner's. The owner's password is percent-decoded first, so every spelling of it agrees. An owner URL without a password derives nothing: `role_url` refuses, and such a migration turns the logins off (no login, no password, with a warning) until a migration that has the owner's password.
-- No model key in Spawn: the DeepSeek key stays in the model relay's process, the gateway token in Claude Code's own settings (§3.3).
+- No model key in Spawn: the DeepSeek key stays in the model relay's process (or `spawn-node-out.service`'s `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key`, never in Spawn's own environment), the gateway token in Claude Code's own settings (§3.3).
+- Audited core/data safety boundary: `crates/spawn-core/tests/dependency_guard.rs` (`pure_crates_forbid_unsafe_code`) permanently enforces `#![forbid(unsafe_code)]`, `#![warn(missing_docs)]`, and zero non-test `unsafe` tokens across `spawn-core`, `spawn-postgres`, `spawn-cas`, `spawn-kdf`, `spawn-codegraph`, and `spawn-jev`, alongside the Phase 2d `std::net` ratchet.
+- Workspace backend isolation (D6): opt-in `SPAWN_WORKSPACE_BACKEND=d6-shadow` runs a dual-track oracle compatible with authoritative `git` roots, while opt-in `d6` runs pure-Rust `D6Workspace` (zero `git` subprocesses) and is strictly refused on `git`/`cow`/`overlay`/`d6-shadow` roots without explicit cutover (`SPAWN_D6_{CAS_DIR,TMPFS_ROOT,TMPFS_BUDGET_MB,STRICT_FAIL_CLOSED}`, see [d6-cas-v1.md](./d6-cas-v1.md)).
 - Every landing goes through the black-box gate, a host-side commit, a compare-and-swap move of the baseline, and the halt rules (§10).
 
 ## 7. The closed loop
@@ -2807,10 +2834,7 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 
 ## 9. Not built
 
-- **Outcome labels for episodes**: the experience views (§4) count
-  decisions, interventions, outcomes and escalations over any window, but
-  nothing labels a judgement with what followed it, exports the episodes
-  or replays them.
+- **Outcome labels for episodes**: task episode replay and SQL projection parity (`spawn mission episodes [--mission <id>] [--strict] [--verify-parity] [--json]`, `GET /api/episodes`, and the episodes panel in `#/grading`) are built, reconstructing per-task rework and review/gate sync points from `control.recorded`. What remains unbuilt is labelling each Observer judgement with its downstream outcome or replaying the playbook against exported corpora.
 - **RSI objectives over the corpus**, judged by black-box replay through the
   candidate's `spawn` binary on a corpus snapshot the candidate cannot edit:
   rules coverage (share of episodes decided by rules up, agreement with the
@@ -2818,8 +2842,7 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
   outcome accuracy kept), playbook reach (interventions in the corpus the
   playbook would have resolved, up), and human interventions per agent-hour
   on live runs. Nothing replays the playbook over recorded episodes.
-- **A write endpoint in the UI** (an input box to the supervisor). Humans
-  act with `spawn submit --principal human`.
+- **UI write endpoints (now built in `§5`)**: human inputs (`POST /api/sessions/<id>/input`), named keys (`POST /api/sessions/<id>/key`), worker restart/reassign, mission resume, supervisor Master Control (`POST /api/master/message`), and approval actions (`POST /api/approvals/<session_id>/act`) all dispatch as `spawn_human` on the record; `spawn submit --principal human` remains the CLI equivalent.
 - **More dispatcher rules:** stopping a COMPLETED one-shot task (it
   escalates). (`restart` and `reassign` are built: §3.2, "Restart and
   reassign".) Retrying after a
@@ -2904,8 +2927,13 @@ controller. Missions, tasks, residents and landings are events in
   restricted logins write no events at all: `spawn_append` refuses them.
 - **The tables are a projection.** `spawn_control_apply(record)` is the only
   writer of `mission_*`, and it runs in the same transaction as the append.
+  Every control record variant (67 variants) and grading record variant is
+  modeled as a statically typed ADT (`ControlRecord`, `ControlRecordKind`,
+  `GradingRecord`, `ControlRecordError`) in `crates/spawn-core/src/control.rs`.
   `spawn_control_refold()` rebuilds the tables from the log, and a test
-  checks that the rebuilt tables equal the live ones.
+  checks that the rebuilt tables equal the live ones; `spawn mission episodes
+  [--mission <id>] [--strict] [--verify-parity] [--json]` replays per-task
+  `TaskEpisode` timelines and checks projection parity against live SQL tables.
 - **It is not an agent.** It is left out of the session projection, and the
   Bridge and the Observer skip it.
 
@@ -2942,8 +2970,10 @@ the tree's own:
   task-only scenarios (`# rsi: task-only`: run only as their own task's
   scenario, never on the base for another gate nor as a regression; 029,
   which no gate's sandbox can judge) and objective scenarios (`<digits>.sh`)
-  the base fails too. The checks are scenarios, among them `check-clippy`,
-  `check-tests`, `check-e2e`, `check-blackbox`, `check-web` and
+  The checks are scenarios, among them `check-clippy`,
+  `check-tests`, `check-e2e`, `check-blackbox`, `check-web`,
+  `check-features` (`spawn features check`, plus `--deps` / `--purity` backed
+  by `spawn-codegraph` and `spawn-core::feature_deps`) and
   `check-model-relay` (the relay in front of stub upstreams: the route by
   model, the model mapping, a stream asked for again before its first
   event, the cut signal, the body cap). The halt rule on the scenario count (§10.3) protects them.
@@ -3930,7 +3960,9 @@ are per-agent uids or a mount per engine.
     last yield, then the lowest id. With no failures this is the lowest open
     objective, as before. `spawn_objective_assign` checks both rules again
     under the append lock, so a second integrator or a stale read cannot
-    oversubscribe.
+    oversubscribe, while routing objective assignments through the agent
+    grading catalog (`brief-v3` classification on objective title/prompt and
+    continuation/rework preservation; see [agent-grading.md](./agent-grading.md)).
   - **No objective holds a slot for ever.** A failed attempt is an outcome
     that is evidence against the work, and only that: the gate's `rejected`
     or `incompatible` (the work, as delivered, failed a check or failed
