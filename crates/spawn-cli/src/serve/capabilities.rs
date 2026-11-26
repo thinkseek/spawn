@@ -1165,11 +1165,15 @@ mod tests {
             &bases,
             Box::new(move |_| Ok(made as std::sync::Arc<dyn spawn_core::port::EngineView>)),
         );
-        let Boxed::Inside { words, _scratch } = boxed else {
+        let Boxed::Inside {
+            words,
+            _scratch: scratch,
+        } = boxed
+        else {
             panic!("inside the view");
         };
         assert_eq!(words, ["/usr/bin/bwrap", "--unshare-pid", "--"]);
-        let scratch = _scratch.expect("a scratch workspace");
+        let scratch = scratch.expect("a scratch workspace");
         let workspace = scratch.path().to_path_buf();
         assert!(
             workspace.is_dir() && workspace.starts_with(&base),

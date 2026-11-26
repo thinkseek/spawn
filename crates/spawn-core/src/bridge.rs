@@ -3165,9 +3165,8 @@ impl Bridge {
         session: &SessionId,
         active: &mut Active,
     ) -> Result<Option<String>, StoreError> {
-        let reading = match self.terminals.agent(&active.terminal(), &active.workspace) {
-            Ok(reading) => reading,
-            Err(_) => return Ok(None),
+        let Ok(reading) = self.terminals.agent(&active.terminal(), &active.workspace) else {
+            return Ok(None);
         };
         // Another agent in the engine's pane: nothing is known.
         if reading
