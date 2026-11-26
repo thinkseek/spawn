@@ -534,7 +534,8 @@ fn m3a_judges_a_rejection_again_here_and_m3b_believes_it() {
 
 /// A node's valid-looking run for [`valid_run_on_two_strikes`]: exit 0,
 /// a verdict `stated` with `reason`, its `stdout`, self-fenced or not, on a
-/// node `degraded` or not, judged with `test_database` as given.
+/// node whose `(strikes, degraded)` are `start` once it holds its lease,
+/// judged with `test_database` as given.
 struct ValidRun {
     case: &'static str,
     believe_reject: bool,
@@ -542,7 +543,7 @@ struct ValidRun {
     reason: &'static str,
     stdout: &'static str,
     self_fenced: bool,
-    degraded: bool,
+    start: (i32, bool),
     test_database: bool,
 }
 
@@ -555,7 +556,7 @@ impl ValidRun {
             reason: "r",
             stdout: "| no\n",
             self_fenced: false,
-            degraded: false,
+            start: (2, false),
             test_database: false,
         }
     }
@@ -573,8 +574,8 @@ const WORK_STDOUT: &str = "| == regression: check-tests.sh must still pass\n\
      | FAILED api::tests::two: assertion `left == right` failed: the landing moved main\n\
      | stage gate rejected 1200ms regression: check-tests.sh must still pass\n";
 
-/// A node with 2 strikes (and `degraded` as given, set once it holds its
-/// lease) finishes the primary path's job as `run` says: the outcome, the
+/// A node (2 strikes, `degraded` as `run.start` says, set once it holds
+/// its lease) finishes the primary path's job as `run` says: the outcome, the
 /// node's strikes and `degraded` after it, and the job's row.
 fn valid_run_on_two_strikes(
     run: &ValidRun,
@@ -584,20 +585,20 @@ fn valid_run_on_two_strikes(
     let mut node = world.node("n1");
     let results = world.results();
     let mut admin = world.ledger.admin();
-    let (stated, reason, stdout, self_fenced, degraded) = (
+    let (stated, reason, stdout, self_fenced, (strikes, degraded)) = (
         run.stated,
         run.reason,
         run.stdout,
         run.self_fenced,
-        run.degraded,
+        run.start,
     );
     let ran = std::thread::spawn(move || {
         let grant = node.lease(Duration::from_secs(30)).expect("a grant");
         admin
             .execute(
-                "update spawn_node_state set host_fault_strikes = 2, degraded = $1
+                "update spawn_node_state set host_fault_strikes = $1, degraded = $2
                   where name = 'n1'",
-                &[&degraded],
+                &[&strikes, &degraded],
             )
             .expect("two strikes");
         let given = granted_inputs(&grant);
@@ -653,7 +654,7 @@ fn a_valid_run_resets_the_nodes_strikes_and_a_self_fenced_one_does_not() {
     );
     // A degraded node: its strikes go, `degraded` stays.
     let (outcome, strikes, _) = valid_run_on_two_strikes(&ValidRun {
-        degraded: true,
+        start: (2, true),
         ..ValidRun::new("valid_degraded", true, "accepted")
     });
     assert!(believed(outcome).verdict.accepted);
