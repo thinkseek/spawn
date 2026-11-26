@@ -462,6 +462,39 @@ itself has no hold to take (the live binary predates it): stop
    systemctl --user restart spawn-loop spawn-integrate spawn-serve spawn-node-gateway spawn-jev-relay.path spawn-jev-relay
    ```
 
+## Keep Credential Migration Matrix (`#98` Item 3)
+
+Keep (`~/.keep` on the owner host, delivered to `/run/keep/<id>` mode `0600`) keeps plaintext credentials out of process environments and `EnvironmentFile=` units. Remaining `EnvironmentFile=` references are being migrated unit-by-unit (`#98` Item 3):
+
+> **Production safety rule:** NEVER append a new credential ID to `scripts/keep/credentials.manifest` until `/run/keep/<id>` is actively delivered on the VM, or the 5-minute `spawn-credential-health.timer` will immediately raise `delivery_missing` alerts. Keep `scripts/keep/credential-health.sh` read-only with respect to secret bytes (inspect unit directives, filenames, HTTP codes, and mode bits only).
+
+| Service / Group | Current Status | Current Source | Target Keep ID(s) | Target Integration |
+| --- | --- | --- | --- | --- |
+| `spawn-jev-relay.service` | `keep_managed` | `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key` | `typesafe.api-key` | Delivered (`RestartPreventExitStatus=243 78`, `http://127.0.0.1:8790/healthz`) |
+| `spawn-node-out.service` | `keep_managed` | `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key` (`EnvironmentFile=-%h/.config/spawn/node-out.env` optional non-secret override only) | `typesafe.api-key` | Delivered (`RestartPreventExitStatus=243 78`, probe `unix://%t/spawn/out.sock\|/out/v1/health`: HTTP `200` healthy, `503` -> `service_down`) |
+| `spawn-agent-presence.service`, `spawn-agent-presence-upload.service`, `spawn-fleet-test-db.service`, `spawn-shadow-observe.service` | `no_secrets` | None (`spawn-agent-presence-upload` reads its own optional token file when enabled) | None | No `EnvironmentFile=` / `LoadCredential=` needed |
+| `spawn-model-relay.service` | `pending_migration` | `EnvironmentFile=%h/.config/spawn/model-relay.env` (`DEEPSEEK_API_KEY`) | `deepseek.api-key` | `LoadCredential=deepseek.api-key:/run/keep/deepseek.api-key` |
+| `spawn-node-gateway.service` | `pending_migration` | `EnvironmentFile=%h/.config/spawn/node-gateway.env` (`SPAWN_NODE_GATEWAY_DATABASE_URL`) | `spawn-node-gateway.database-url` | `LoadCredential=spawn-node-gateway.database-url:/run/keep/spawn-node-gateway.database-url` |
+| `spawn-node-edge.service`, `spawn-node-gw.service` | `pending_migration` | `EnvironmentFile=-%h/.config/spawn/node-{edge,gw}.env` (zero `spawn.env` / `*DATABASE_URL*`) | `spawn-serve.token` (edge, if auth token needed); none for gw | Optional host overrides today; zero Postgres credentials allowed |
+| `spawn-serve.service`, `spawn-core.service` | `pending_migration` | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` | `spawn.database-url`, `spawn-serve.token` | `LoadCredential=` or restricted config + `SPAWN_SERVE_TOKEN` delivery |
+| `spawn-backup.service`, `spawn-backup-bundle.service`, `spawn-backup-verify.service`, `spawn-backup-restore-drill*.service` | `pending_migration` | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` | `spawn.database-url`, `backup.encryption-key`, `r2.credentials` | `LoadCredential=` delivery per backup/R2 secret |
+| `spawn-loop.service`, `spawn-integrate.service`, `spawn-credential-health.service`, `spawn-deploy-on-landing.service`, `spawn-maintenance.service`, `spawn-nightly*.service` | `pending_migration` | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` | `spawn.database-url` | Role-scoped `LoadCredential=` delivery replacing `spawn.env` |
+
+### Read-Only Audit & Pre-Cutover Validation
+
+Inspect the live migration status without opening any `.env` file, touching Postgres, or emitting alerts:
+
+```sh
+bash scripts/keep/credential-health.sh --audit-keep-migration
+bash scripts/keep/credential-health.sh --audit-keep-migration --json | jq .
+```
+
+Validate a staged multi-row manifest (including `unix://%t/spawn/out.sock|/out/v1/health`) offline before cutting over `scripts/keep/credentials.manifest`:
+
+```sh
+bash scripts/keep/credential-health.sh --validate-manifest /path/to/staged.manifest
+```
+
 ## The controller
 
 `~/.local/share/spawn-rsi/controllers/<name>` is a symlink to
