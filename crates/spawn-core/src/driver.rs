@@ -962,8 +962,14 @@ mod tests {
     fn row_claude_trust_dialog_is_the_bridges_startup_answer_and_escalates_at_run_time() {
         use super::{Answer, table_answer};
         let shown = dialog(None, "trust", None, &[], &[]);
-        assert!(matches!(table_answer("claude", &shown, &ws()), Answer::Escalate(_)));
-        assert!(matches!(ClaudeDriver.dialog_answer(&shown, &ws()), Answer::Escalate(_)));
+        assert!(matches!(
+            table_answer("claude", &shown, &ws()),
+            Answer::Escalate(_)
+        ));
+        assert!(matches!(
+            ClaudeDriver.dialog_answer(&shown, &ws()),
+            Answer::Escalate(_)
+        ));
         // The Bridge's own startup answer is unchanged.
         let trust = "Do you trust the files in this folder?\n\ny. Yes, I trust this folder\n\
                      n. No, exit\nEnter y/n:\nEnter to confirm · Esc to cancel\n";
@@ -974,7 +980,11 @@ mod tests {
     fn row_claude_numbered_permission_not_captured_escalates() {
         use super::{Answer, table_answer};
         let yes = strings(&["Yes", "Yes, and don't ask again", "No"]);
-        for rule in [None, Some("bash_permission_prompt"), Some("generic_permission_prompt")] {
+        for rule in [
+            None,
+            Some("bash_permission_prompt"),
+            Some("generic_permission_prompt"),
+        ] {
             let shown = dialog(rule, "permission", Some("Yes"), &yes, &[]);
             assert!(
                 matches!(table_answer("claude", &shown, &ws()), Answer::Escalate(_)),

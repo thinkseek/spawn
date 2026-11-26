@@ -4853,9 +4853,9 @@ impl Bridge {
     /// the session was recorded `pressed` or `typed` since this one was
     /// accepted. A pane that cannot be read is no dialog.
     fn answer_still_due(&self, claimed: &Claimed, active: &Active) -> bool {
-        let Ok(pane) = self
-            .terminals
-            .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
+        let Ok(pane) =
+            self.terminals
+                .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
         else {
             return false;
         };
@@ -9611,7 +9611,11 @@ mod tests {
         (clock, store, host, terminal, bridge)
     }
 
-    fn n12_bridge(clock: &Arc<ManualClock>, store: &Arc<MemoryStore>, host: &Arc<Witnessed>) -> Bridge {
+    fn n12_bridge(
+        clock: &Arc<ManualClock>,
+        store: &Arc<MemoryStore>,
+        host: &Arc<Witnessed>,
+    ) -> Bridge {
         let mut bridge = Bridge::new(
             store.clone(),
             store.clone(),
@@ -9625,7 +9629,9 @@ mod tests {
     }
 
     fn agy_drafted() -> String {
-        format!("Antigravity CLI 1.5.14\n{AGY_RULE}\n> half a thought\n{AGY_RULE}\n? for shortcuts\n")
+        format!(
+            "Antigravity CLI 1.5.14\n{AGY_RULE}\n> half a thought\n{AGY_RULE}\n? for shortcuts\n"
+        )
     }
 
     /// Carry list N12 (a): ready (keyed by `seq` 1), then a draft under the
@@ -9672,7 +9678,11 @@ mod tests {
         restarted.poll().expect("poll");
         let after = screens_with_keys(&store);
         assert!(after.len() <= before.len() + 1, "{after:?}");
-        let keyed: Vec<&Option<String>> = after.iter().map(|(_, key)| key).filter(|key| key.is_some()).collect();
+        let keyed: Vec<&Option<String>> = after
+            .iter()
+            .map(|(_, key)| key)
+            .filter(|key| key.is_some())
+            .collect();
         let mut unique = keyed.clone();
         unique.dedup();
         assert_eq!(keyed, unique, "no keyed duplicate: {after:?}");
@@ -9686,7 +9696,11 @@ mod tests {
         drop(bridge);
         let mut restarted = n12_bridge(&clock, &store, &host);
         store.set_pane(&terminal, &agy_working());
-        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Working, 2));
+        host.set(agy_reading(
+            Some("agy"),
+            crate::port::AgentStatus::Working,
+            2,
+        ));
         restarted.poll().expect("poll");
         assert_eq!(
             screens_with_keys(&store).last(),
@@ -10988,7 +11002,9 @@ mod tests {
         assert!(host.keys().is_empty(), "nothing pressed");
         assert_eq!(command_outcome(&store, id), None, "still waiting");
         store.set_pane(&terminal, READY);
-        drive_work(&mut bridge, &store, || command_outcome(&store, id).is_some());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
         assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
         assert!(host.keys().is_empty(), "still nothing pressed");
         let resolver_commands = records(&store)
@@ -10999,10 +11015,15 @@ mod tests {
 
         // Never answered: the wait fails naming the dialog and the switch.
         let other = submit_resumable_start(&store, 2, "work", TRUST);
-        drive_work(&mut bridge, &store, || command_outcome(&store, other).is_some());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, other).is_some()
+        });
         match command_outcome(&store, other) {
             Some(Outcome::Failed(why)) => {
-                assert!(why.contains("trust dialog") && why.contains("SPAWN_AUTO_APPROVE=off"), "{why}");
+                assert!(
+                    why.contains("trust dialog") && why.contains("SPAWN_AUTO_APPROVE=off"),
+                    "{why}"
+                );
             }
             outcome => panic!("a failed wait, not {outcome:?}"),
         }
@@ -11054,24 +11075,25 @@ mod tests {
             &format!("resolve:{execution}:session_1:0000000000000002:1:1"),
             NamedKey::Digit1,
         );
-        drive_work(&mut bridge, &store, || command_outcome(&store, gone).is_some());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, gone).is_some()
+        });
         assert_eq!(
             command_outcome(&store, gone),
             Some(Outcome::Failed(super::GONE_DIALOG.to_string()))
         );
         assert!(host.keys().is_empty());
         assert!(steps_of(&store, gone).is_empty());
-        store.set_pane(
-            &TerminalName::for_execution(&execution),
-            PROCEED,
-        );
+        store.set_pane(&TerminalName::for_execution(&execution), PROCEED);
         let shown = submit_key(
             &store,
             RESOLVE_PRINCIPAL,
             &format!("resolve:{execution}:session_1:0000000000000003:1:1"),
             NamedKey::Digit1,
         );
-        drive_work(&mut bridge, &store, || command_outcome(&store, shown).is_some());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, shown).is_some()
+        });
         assert_eq!(command_outcome(&store, shown), Some(Outcome::Succeeded));
         assert_eq!(host.keys(), vec!["1".to_string()]);
         assert_eq!(
@@ -11099,13 +11121,20 @@ mod tests {
             BridgeConfig::new("tester"),
         )
         .with_clock(clock);
-        drive_work(&mut bridge, &store, || command_outcome(&store, id).is_some());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
         assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
         store.set_pane(&terminal, pane);
         (store, host, bridge, ExecutionId::for_command(id))
     }
 
-    fn submit_key(store: &Arc<MemoryStore>, principal: &str, key: &str, named: NamedKey) -> CommandId {
+    fn submit_key(
+        store: &Arc<MemoryStore>,
+        principal: &str,
+        key: &str,
+        named: NamedKey,
+    ) -> CommandId {
         store
             .submit(
                 &Principal::new(principal).expect("principal"),
@@ -11125,9 +11154,9 @@ mod tests {
             .expect("read")
             .into_iter()
             .filter_map(|record| match record.event.kind {
-                EventKind::CommandStepped { command_id, step, .. } if command_id == command => {
-                    Some(step)
-                }
+                EventKind::CommandStepped {
+                    command_id, step, ..
+                } if command_id == command => Some(step),
                 _ => None,
             })
             .collect()

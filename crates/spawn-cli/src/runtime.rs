@@ -543,7 +543,10 @@ mod tests {
             let mode = Mode::parse(value).expect("mode");
             assert_eq!(auto_trust(mode), answers, "{value:?}");
         }
-        assert!(spawn_core::bridge::BridgeConfig::new("w").auto_trust, "on by default");
+        assert!(
+            spawn_core::bridge::BridgeConfig::new("w").auto_trust,
+            "on by default"
+        );
     }
     use spawn_core::bridge::LaunchEnvironment;
 

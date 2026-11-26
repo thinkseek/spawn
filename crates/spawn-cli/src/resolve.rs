@@ -527,7 +527,10 @@ impl Resolver {
                 pressed.join(" ")
             )));
         }
-        let age = now - ledger.get(first).map_or(now, |answered| answered.created_at_ms);
+        let age = now
+            - ledger
+                .get(first)
+                .map_or(now, |answered| answered.created_at_ms);
         if age < STILL_SHOWS_MS {
             return Ok(None);
         }
@@ -670,8 +673,7 @@ impl World for Fleet<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGAIN_AFTER_MS, Decision, Ledger, Live, Mode, PRINCIPAL, Resolver, STILL_SHOWS_MS, World,
-        auto_for, decide,
+        Decision, Ledger, Live, Mode, PRINCIPAL, Resolver, STILL_SHOWS_MS, World, auto_for, decide,
     };
     use serde_json::json;
     use spawn_core::command::NamedKey;
@@ -679,24 +681,54 @@ mod tests {
     use spawn_core::port::{AgentReading, AgentStatus};
     use std::cell::{Cell, RefCell};
 
+    /// Thirty seconds: once a second answer was allowed from then (Rev 0);
+    /// never now.
+    const AGAIN_AFTER_MS: i64 = 30_000;
+
+    /// agy 1.5.14's trust dialog (captured), for the workspace below.
+    const TRUST: &str = "Accessing workspace:\n\n/tmp/ws/agent_a\n\n\
+                         Do you trust the contents of this project?\n\n\
+                         Antigravity CLI requires permission to read, edit, and execute files here.\n\n\
+                         > Yes, I trust this folder\n  No, exit\n\n  ↑/↓ Navigate · enter Confirm\n";
+    const RULE: &str = "──────────────────────────────";
+
+    fn agy_idle() -> String {
+        format!("{RULE}\n>\n{RULE}\n? for shortcuts\n")
+    }
+
     /// Claude Code's numbered permission dialog at its prompt.
     const PERMISSION: &str = "Bash command\n  cargo test\nDo you want to proceed?\n\
                               ❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\n";
-    const READY: &str = "╭────╮\n│ > │\n╰────╯\n";
+
+    fn workspace() -> WorkspaceId {
+        WorkspaceId::new("agent_a:/tmp/ws/agent_a").expect("workspace")
+    }
+
+    fn blocked(rule: &str) -> AgentReading {
+        AgentReading {
+            agent: Some("agy".to_string()),
+            status: AgentStatus::Blocked,
+            rule: Some(rule.to_string()),
+            blocker_visible: true,
+            session: None,
+            seq: 1,
+            manifest: Some("2026.10.05.1".to_string()),
+        }
+    }
 
     fn live(session: &str, busy: bool) -> Live {
         Live {
             session: session.to_string(),
-            agent: session.replace("session_", "agent_"),
+            agent: "agent_a".to_string(),
             execution: format!("exec_{session}"),
-            engine: "claude".to_string(),
+            engine: "agy".to_string(),
             started_ms: 0,
             busy,
         }
     }
 
-    /// A world in memory: panes, a clock, a command table with
-    /// `submit`'s idempotency, and every call counted.
+    /// A world in memory: one agy pane and Herdr's reading of it, a clock,
+    /// a command table with `submit`'s idempotency, and every read counted.
     struct Fake {
         now: Cell<i64>,
         lives: Vec<Live>,
@@ -712,7 +744,7 @@ mod tests {
                 now: Cell::new(1_000_000),
                 lives,
                 pane: RefCell::new(pane.to_string()),
-                reading: None,
+                reading: Some(blocked("trust_prompt")),
                 commands: RefCell::new(Vec::new()),
                 reads: Cell::new(0),
             }
@@ -725,33 +757,42 @@ mod tests {
                 .map(|(key, ..)| key.clone())
                 .collect()
         }
+
+        fn read(&self) {
+            self.reads.set(self.reads.get() + 1);
+        }
     }
 
     impl World for Fake {
         fn now_ms(&self) -> Result<i64, String> {
-            self.reads.set(self.reads.get() + 1);
+            self.read();
             Ok(self.now.get())
         }
         fn ledger(&self) -> Result<Ledger, String> {
-            self.reads.set(self.reads.get() + 1);
+            self.read();
             let commands: Vec<serde_json::Value> = self
                 .commands
                 .borrow()
                 .iter()
                 .rev()
-                .map(|(_, session, id, at)| json!({"id": id, "session_id": session, "created_at_ms": at}))
+                .map(|(_, session, id, at)| {
+                    json!({"id": id, "session_id": session, "created_at_ms": at})
+                })
                 .collect();
             Ok(Ledger::from_json(&json!(commands)))
         }
         fn live(&self) -> Result<Vec<Live>, String> {
-            self.reads.set(self.reads.get() + 1);
+            self.read();
             Ok(self.lives.clone())
         }
         fn capture(&self, _live: &Live) -> Result<String, String> {
-            self.reads.set(self.reads.get() + 1);
+            self.read();
             Ok(self.pane.borrow().clone())
         }
         fn pause(&self) {}
+        fn workspace(&self, _live: &Live) -> Result<WorkspaceId, String> {
+            Ok(workspace())
+        }
         fn reading(&self, _live: &Live) -> Option<AgentReading> {
             self.reading.clone()
         }
@@ -783,7 +824,7 @@ mod tests {
     #[test]
     fn with_the_switch_unset_the_resolver_submits_nothing() {
         for value in [None, Some("off"), Some("startup")] {
-            let world = Fake::new(vec![live("session_a", false)], PERMISSION);
+            let world = Fake::new(vec![live("session_a", false)], TRUST);
             let mut resolver = Resolver::new(Mode::parse(value).expect("mode"));
             assert!(!resolver.runs());
             assert!(resolver.step(&world).expect("step").is_empty());
@@ -794,7 +835,7 @@ mod tests {
 
     #[test]
     fn under_all_a_table_row_is_answered_once_keyed_by_execution_and_dialog() {
-        let world = Fake::new(vec![live("session_a", false)], PERMISSION);
+        let world = Fake::new(vec![live("session_a", false)], TRUST);
         let mut resolver = Resolver::new(Mode::All);
         let lines = resolver.step(&world).expect("step");
         let keys = world.keys();
@@ -813,32 +854,30 @@ mod tests {
     }
 
     /// The breaker is folded from the log: a new resolver (a restarted
-    /// loop) over the same command table opens it exactly as the first.
+    /// loop) over the same command table reads the same answer. One answer
+    /// per dialog per execution, never a second: still showing after it,
+    /// the dialog is escalated once and never pressed again.
     #[test]
     fn the_breaker_counts_from_the_log_and_survives_a_restart() {
-        let world = Fake::new(vec![live("session_a", false)], PERMISSION);
+        let world = Fake::new(vec![live("session_a", false)], TRUST);
         Resolver::new(Mode::All).step(&world).expect("step");
-        // Still showing after STILL_SHOWS_MS: open for that dialog, nothing
-        // pressed, said once.
         world.now.set(world.now.get() + STILL_SHOWS_MS);
         let mut restarted = Resolver::new(Mode::All);
         let lines = restarted.step(&world).expect("step");
-        assert!(lines[0].contains("breaker open"), "{lines:?}");
-        assert!(
-            restarted.step(&world).expect("step").is_empty(),
-            "said once"
-        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("still shows"), "{lines:?}");
         assert_eq!(world.keys().len(), 1);
-        // From AGAIN_AFTER_MS on: one second answer, then never a third.
-        world.now.set(world.now.get() + AGAIN_AFTER_MS);
+        for later in [AGAIN_AFTER_MS, 10 * AGAIN_AFTER_MS] {
+            world.now.set(1_000_000 + later);
+            assert!(
+                restarted.step(&world).expect("step").is_empty(),
+                "said once"
+            );
+            assert_eq!(world.keys().len(), 1, "never a second answer");
+        }
+        // Another restart re-reads the same answer: still no second key.
         Resolver::new(Mode::All).step(&world).expect("step");
-        let keys = world.keys();
-        assert_eq!(keys.len(), 2);
-        assert!(keys[1].ends_with(":2:1"), "{keys:?}");
-        world.now.set(world.now.get() + 10 * AGAIN_AFTER_MS);
-        let lines = Resolver::new(Mode::All).step(&world).expect("step");
-        assert!(lines[0].contains("never a third"), "{lines:?}");
-        assert_eq!(world.keys().len(), 2);
+        assert_eq!(world.keys().len(), 1);
     }
 
     #[test]
@@ -881,34 +920,57 @@ mod tests {
         assert_eq!(one.answers(Some("s"), 0), 1);
     }
 
+    /// An open breaker escalates the proven row too: nothing submitted.
+    #[test]
+    fn an_open_breaker_presses_nothing() {
+        let world = Fake::new(vec![live("session_a", false)], TRUST);
+        for n in 0..5 {
+            world.commands.borrow_mut().push((
+                format!("earlier-{n}"),
+                "session_a".to_string(),
+                100 + n,
+                world.now.get() - 60_000 + n * 2_000,
+            ));
+        }
+        let lines = Resolver::new(Mode::All).step(&world).expect("step");
+        assert!(lines[0].contains("breaker open"), "{lines:?}");
+        assert!(world.keys().iter().all(|key| key.starts_with("earlier-")));
+    }
+
     /// A person's answer in flight (any unfinished command of the session)
     /// holds the resolver off; once the dialog is gone it presses nothing.
     #[test]
     fn a_session_with_a_command_in_flight_or_no_dialog_gets_nothing() {
-        let busy = Fake::new(vec![live("session_a", true)], PERMISSION);
+        let busy = Fake::new(vec![live("session_a", true)], TRUST);
         Resolver::new(Mode::All).step(&busy).expect("step");
         assert!(busy.keys().is_empty());
-        let ready = Fake::new(vec![live("session_a", false)], READY);
+        let mut ready = Fake::new(vec![live("session_a", false)], &agy_idle());
+        ready.reading = Some(AgentReading {
+            status: AgentStatus::Idle,
+            rule: None,
+            blocker_visible: false,
+            ..blocked("trust_prompt")
+        });
         Resolver::new(Mode::All).step(&ready).expect("step");
         assert!(ready.keys().is_empty());
     }
 
     #[test]
     fn decide_needs_two_equal_reads_and_escalates_rows_without_keys() {
-        let workspace = WorkspaceId::new("agent_a:/tmp/agent_a").expect("workspace");
-        let answer = decide("s", "claude", &workspace, PERMISSION, PERMISSION, None);
-        assert!(
-            matches!(&answer, Decision::Answer { keys, .. } if keys == &vec![NamedKey::Digit1]),
-            "{answer:?}"
-        );
+        let claude = WorkspaceId::new("agent_a:/tmp/agent_a").expect("workspace");
+        // Claude Code's numbered permission: not captured, escalated.
+        assert!(matches!(
+            decide("s", "claude", &claude, PERMISSION, PERMISSION, None),
+            Decision::Escalate { .. }
+        ));
         let other = PERMISSION.replace("cargo test", "rm -rf target");
         assert_eq!(
-            decide("s", "claude", &workspace, PERMISSION, &other, None),
+            decide("s", "claude", &claude, PERMISSION, &other, None),
             Decision::Nothing("two reads in a row show two dialogs")
         );
         let limited = format!("Claude usage limit reached\n{PERMISSION}");
         assert!(matches!(
-            decide("s", "claude", &workspace, &limited, &limited, None),
+            decide("s", "claude", &claude, &limited, &limited, None),
             Decision::Escalate { .. }
         ));
         // agy's permission prompt: blocked by its rule, still escalated
@@ -916,46 +978,60 @@ mod tests {
         let perm = "Run command?\n  cargo test\n> 1. Yes\n  2. No\n\
                     ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\nesc to cancel\n";
         assert_eq!(
-            decide("s", "agy", &workspace, perm, perm, None),
+            decide("s", "agy", &workspace(), perm, perm, None),
             Decision::Nothing("the host does not read the agent blocked by a named rule")
         );
-        let blocked = AgentReading {
-            agent: Some("agy".to_string()),
-            status: AgentStatus::Blocked,
-            rule: Some("permission_prompt".to_string()),
-            blocker_visible: true,
-            session: None,
-            seq: 1,
-            manifest: Some("2026.10.05.1".to_string()),
-        };
         assert!(matches!(
-            decide("s", "agy", &workspace, perm, perm, Some(&blocked)),
+            decide(
+                "s",
+                "agy",
+                &workspace(),
+                perm,
+                perm,
+                Some(&blocked("permission_prompt"))
+            ),
             Decision::Escalate { .. }
         ));
     }
 
     #[test]
     fn decide_answers_agys_trust_dialog_for_its_workspace_only() {
-        let workspace = WorkspaceId::new("agent_a:/tmp/ws/agent_a").expect("workspace");
-        let trust = "Accessing workspace:\n\n/tmp/ws/agent_a\n\nDo you trust the contents of this project?\n\n\
-                     > Yes, I trust this folder\n  No, exit\n\n  ↑/↓ Navigate · enter Confirm\n";
-        let reading = AgentReading {
-            agent: Some("agy".to_string()),
-            status: AgentStatus::Blocked,
-            rule: Some("trust_prompt".to_string()),
-            blocker_visible: true,
-            session: None,
-            seq: 1,
-            manifest: None,
-        };
+        let reading = blocked("trust_prompt");
         assert!(matches!(
-            decide("s", "agy", &workspace, trust, trust, Some(&reading)),
+            decide("s", "agy", &workspace(), TRUST, TRUST, Some(&reading)),
             Decision::Answer { keys, .. } if keys == vec![NamedKey::Enter]
         ));
         let elsewhere = WorkspaceId::new("agent_b:/tmp/ws/agent_b").expect("workspace");
         assert!(matches!(
-            decide("s", "agy", &elsewhere, trust, trust, Some(&reading)),
+            decide("s", "agy", &elsewhere, TRUST, TRUST, Some(&reading)),
             Decision::Escalate { .. }
+        ));
+        let mut hidden = reading.clone();
+        hidden.blocker_visible = false;
+        assert!(matches!(
+            decide("s", "agy", &workspace(), TRUST, TRUST, Some(&hidden)),
+            Decision::Nothing(_)
+        ));
+    }
+
+    /// Guard 3 on agy's trust path (M6): Herdr's `trust_prompt` rule alone
+    /// is not enough; the driver's own reading of the trust dialog must
+    /// agree on both reads. A screen with the folder and the trusting
+    /// choice but not the dialog's question gets no answer.
+    #[test]
+    fn a_trust_rule_without_the_drivers_own_trust_reading_gets_no_answer() {
+        let reading = blocked("trust_prompt");
+        let partial = "Accessing workspace:\n\n/tmp/ws/agent_a\n\n\
+                       > Yes, I trust this folder\n  No, exit\n\n  ↑/↓ Navigate · enter Confirm\n";
+        let decided = decide("s", "agy", &workspace(), partial, partial, Some(&reading));
+        assert_eq!(
+            decided,
+            Decision::Nothing("the engine's own reading shows no trust dialog")
+        );
+        // One read of the dialog and one without it: nothing either.
+        assert!(!matches!(
+            decide("s", "agy", &workspace(), TRUST, partial, Some(&reading)),
+            Decision::Answer { .. }
         ));
     }
 
