@@ -146,7 +146,7 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn features associate --path <file> --feature <id> [--feature <id>]... [--root <dir>] [--registry <file>] [--json]\n       \
      spawn features graph [--root <dir>] [--registry <file>] [--level file|unit|feature] [--from <id|path>] [--to <id|path>] [--feature <id>] [--json]\n       \
      spawn grade register|list|exam|onboard|lock-grade|unlock-grade|enable|disable|calibrate|upkeep ...   (the grading catalog: spawn grade --help for each verb's flags)\n       \
-     spawn prov index|who|show|blast|revert|split|compose|snapshot|refs|rollback ...   (file provenance: spawn prov --help for each verb's flags)";
+     spawn prov index|who|show|blast|revert|split|compose|snapshot|refs|rollback|durability ...   (file provenance: spawn prov --help for each verb's flags)";
 
 /// What the whole usage says last, after the commands.
 const HELP_HINT: &str =

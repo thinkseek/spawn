@@ -462,3 +462,675 @@ mod data_domain {
         );
     }
 }
+
+/// PV4: the dispatcher's directive lines, and the durability report's rules
+/// (decisions B6, D4) on rows made by hand.
+mod pv4 {
+    use serde_json::{Value, json};
+    use spawn_postgres::provenance::{
+        ProvAttributionSource, ProvBoundary, ProvChangeKind, ProvChangeRecord, ProvEdgeKind,
+        ProvEdgeRecord, ProvEntryClass, ProvEntryRecord, ProvSupersedes,
+    };
+
+    use super::super::durability::{Input, Window, tally, text};
+    use super::super::index::{Directive, DirectiveKind, SupersedeReason, directives};
+
+    #[test]
+    fn only_whole_directive_lines_of_a_brief_are_directives() {
+        let brief = "Objective 7: undo the bad change\n\
+                     \n\
+                     Reverts: task 11\n\
+                     - fixes: task #12.\n\
+                     * SUPERSEDES:  TASK 13 (Refactor)\n\
+                     supersedes: task 14 (planned)\n\
+                     supersedes: task 15 (requirement)\n\
+                     supersedes: task 16 (format)\n\
+                     reverts: task 11\n\
+                     supersedes: task 17\n\
+                     supersedes: task 18 (defect)\n\
+                     The worker said `reverts: task 19` in its report.\n\
+                     reverts: task 20 and 21\n\
+                     fixes: task 0\n\
+                     fixes: task 22x\n\
+                     fixes: tasks 23\n\
+                     reverts task 24\n\
+                     > reverts: task 25\n";
+        let found = directives(brief);
+        assert_eq!(
+            found,
+            [
+                Directive {
+                    kind: DirectiveKind::Reverts,
+                    task: 11
+                },
+                Directive {
+                    kind: DirectiveKind::Fixes,
+                    task: 12
+                },
+                Directive {
+                    kind: DirectiveKind::Supersedes(SupersedeReason::Refactor),
+                    task: 13
+                },
+                Directive {
+                    kind: DirectiveKind::Supersedes(SupersedeReason::Planned),
+                    task: 14
+                },
+                Directive {
+                    kind: DirectiveKind::Supersedes(SupersedeReason::Requirement),
+                    task: 15
+                },
+                Directive {
+                    kind: DirectiveKind::Supersedes(SupersedeReason::Format),
+                    task: 16
+                },
+            ],
+            "a repeat is once; no reason, a defect reason, prose and junk are none"
+        );
+        assert!(directives("").is_empty());
+        assert!(directives("reverts:").is_empty());
+        assert!(directives("reverts: task").is_empty());
+    }
+
+    const DOMAIN: &str = "git:/srv/durability.git";
+
+    fn change(
+        id: i64,
+        kind: ProvChangeKind,
+        task: Option<i64>,
+        preset: Option<&str>,
+    ) -> ProvChangeRecord {
+        ProvChangeRecord {
+            id,
+            change_id: format!("c{id}"),
+            rev: 1,
+            kind,
+            domain: DOMAIN.to_string(),
+            agent_id: format!("agent_{}", task.unwrap_or(0)),
+            execution_id: None,
+            task_id: task,
+            preset_id: preset.map(str::to_string),
+            model_label: None,
+            transcript_ref: None,
+            attributed: ProvAttributionSource::Host,
+            base: "git1:b".to_string(),
+            result: format!("git1:{id}"),
+            boundary: if kind == ProvChangeKind::Land {
+                ProvBoundary::Land
+            } else {
+                ProvBoundary::Checkpoint
+            },
+            at_ms: id * 1000,
+        }
+    }
+
+    fn land(id: i64, task: i64, preset: &str) -> ProvChangeRecord {
+        change(id, ProvChangeKind::Land, Some(task), Some(preset))
+    }
+
+    fn entry(change: i64, path: &str, origin: Option<i64>) -> ProvEntryRecord {
+        ProvEntryRecord {
+            change,
+            path: path.to_string(),
+            before: None,
+            after: Some(format!("git1:{change}{path}")),
+            size: Some(1),
+            class: ProvEntryClass::Content,
+            origin,
+        }
+    }
+
+    fn edge(id: i64, src: &ProvChangeRecord, detail: Value) -> ProvSupersedes {
+        ProvSupersedes {
+            edge: ProvEdgeRecord {
+                id,
+                kind: ProvEdgeKind::Supersedes,
+                src: src.id,
+                dst: "c0".to_string(),
+                detail,
+                at_ms: src.at_ms,
+            },
+            src: src.clone(),
+        }
+    }
+
+    fn defect(target: i64, evidence: &str) -> Value {
+        json!({"reason": "defect", "evidence": evidence, "target_task": target})
+    }
+
+    fn row<'a>(report: &'a Value, preset: &str) -> &'a Value {
+        report["presets"]
+            .as_array()
+            .expect("presets")
+            .iter()
+            .find(|row| row["preset_id"] == preset)
+            .unwrap_or_else(|| panic!("no row for {preset}: {report}"))
+    }
+
+    /// Rules 1 to 4 and 6: the task is the unit, charged to the preset of
+    /// its landing; at most one liability per task; only level 1 and 2
+    /// count, `fixes:` is reported apart, non-defect reasons and unverified
+    /// reverts never count; a task's own edge is no liability.
+    #[test]
+    fn only_confirmed_defects_count_once_per_task_on_the_preset_of_its_landing() {
+        let l11 = land(1, 11, "opus");
+        let l12 = land(2, 12, "sonnet");
+        let l13 = land(3, 13, "sonnet");
+        let l20 = land(4, 20, "opus");
+        let l21 = land(5, 21, "haiku");
+        let l22 = land(6, 22, "haiku");
+        let mut input = Input {
+            lands: vec![
+                l11.clone(),
+                l12.clone(),
+                l13.clone(),
+                l20.clone(),
+                l21.clone(),
+                l22.clone(),
+            ],
+            ..Input::default()
+        };
+        input
+            .entries
+            .insert(1, vec![entry(1, "a.rs", None), entry(1, "b.rs", None)]);
+        input.entries.insert(2, vec![entry(2, "c.rs", None)]);
+        input.entries.insert(3, vec![entry(3, "d.rs", None)]);
+        input.supersedes = vec![
+            // Task 11: reverted (level 1) twice and bisected once: one.
+            edge(1, &l20, defect(11, "level1_revert")),
+            edge(2, &l21, defect(11, "level1_revert")),
+            edge(3, &l22, defect(11, "level2_bisect")),
+            // Task 12: a level-2 defect, and a fixes: reported apart.
+            edge(4, &l20, defect(12, "level2_bisect")),
+            edge(5, &l21, defect(12, "dispatcher_fixes")),
+            // Task 13: fixes only, a refactor, an unverified revert.
+            edge(6, &l20, defect(13, "dispatcher_fixes")),
+            edge(
+                7,
+                &l21,
+                json!({"reason": "refactor", "evidence": "dispatcher_supersedes", "target_task": 13}),
+            ),
+            edge(8, &l22, defect(13, "unverified_revert")),
+            // A task's own: nothing.
+            edge(9, &l22, defect(22, "level1_revert")),
+        ];
+        let report = tally(&input, Window::default());
+        assert_eq!(report["shadow"], true);
+        assert_eq!(report["window"], json!({"landings": 50, "days": 14}));
+        let opus = row(&report, "opus");
+        assert_eq!(
+            (
+                &opus["landed_tasks"],
+                &opus["confirmed_defects"],
+                &opus["reverted_tasks"],
+                &opus["fixes_reported"]
+            ),
+            (&json!(2), &json!(1), &json!(1), &json!(0)),
+            "{report}"
+        );
+        let sonnet = row(&report, "sonnet");
+        assert_eq!(
+            (
+                &sonnet["landed_tasks"],
+                &sonnet["confirmed_defects"],
+                &sonnet["reverted_tasks"],
+                &sonnet["fixes_reported"]
+            ),
+            (&json!(2), &json!(1), &json!(0), &json!(2)),
+            "{report}"
+        );
+        let haiku = row(&report, "haiku");
+        assert_eq!(haiku["confirmed_defects"], 0, "{report}");
+        assert_eq!(report["unattributed"], 0);
+        assert_eq!(
+            report["not_scored"],
+            json!({"refactor": 1, "unverified_revert": 1, "same_task": 1})
+        );
+        assert_eq!(report["defects"].as_array().map(Vec::len), Some(4));
+        // No score of lines, files or Changes, and no survival.
+        for row in report["presets"].as_array().expect("rows") {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .expect("a row")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "confirmed_defects",
+                    "fixes_reported",
+                    "landed_tasks",
+                    "preset_id",
+                    "reverted_tasks"
+                ]
+            );
+        }
+        assert!(text(&report).contains("shadow only"));
+    }
+
+    /// D4: 50 landings or 14 days after the task's landing, whichever ends
+    /// first; both are flags.
+    #[test]
+    fn the_window_is_fifty_landings_or_fourteen_days_whichever_ends_first() {
+        let day = 86_400_000;
+        let target = land(1, 11, "opus");
+        let mut lands = vec![target.clone()];
+        for id in 2..=60 {
+            lands.push(land(id, 100 + id, "other"));
+        }
+        let late = {
+            let mut late = land(3, 103, "other");
+            late.at_ms = target.at_ms + 15 * day;
+            late
+        };
+        lands[2] = late.clone();
+        let mut input = Input {
+            lands: lands.clone(),
+            ..Input::default()
+        };
+        input.entries.insert(1, vec![entry(1, "a.rs", None)]);
+        // The 51st landing after it: out; the 15th day: out.
+        input.supersedes = vec![
+            edge(1, &lands[51], defect(11, "level1_revert")),
+            edge(2, &late, defect(11, "level1_revert")),
+        ];
+        let report = tally(&input, Window::default());
+        assert_eq!(row(&report, "opus")["confirmed_defects"], 0, "{report}");
+        assert_eq!(report["not_scored"], json!({"out_of_window": 2}));
+        // The 50th landing, on day 1: in.
+        input.supersedes = vec![edge(1, &lands[50], defect(11, "level1_revert"))];
+        let report = tally(&input, Window::default());
+        assert_eq!(row(&report, "opus")["confirmed_defects"], 1, "{report}");
+        // A narrower window by flag.
+        let report = tally(
+            &input,
+            Window {
+                landings: 10,
+                days: 14,
+            },
+        );
+        assert_eq!(row(&report, "opus")["confirmed_defects"], 0, "{report}");
+        let report = tally(
+            &input,
+            Window {
+                landings: 100,
+                days: 20,
+            },
+        );
+        assert_eq!(row(&report, "opus")["confirmed_defects"], 1);
+        let mut later = input;
+        later.supersedes = vec![edge(2, &late, defect(11, "level1_revert"))];
+        let report = tally(
+            &later,
+            Window {
+                landings: 50,
+                days: 20,
+            },
+        );
+        assert_eq!(row(&report, "opus")["confirmed_defects"], 1, "{report}");
+    }
+
+    /// Rule 5: a composed landing's liability follows `origin` to the task
+    /// whose revision the content came from; when the paths name more than
+    /// one task (or a revision with no task), nobody is charged and the
+    /// event is unattributed.
+    #[test]
+    fn a_composed_landing_is_charged_through_origin_or_to_nobody() {
+        let edit_31 = change(10, ProvChangeKind::Edit, Some(31), Some("sonnet"));
+        let edit_32 = change(11, ProvChangeKind::Edit, Some(32), Some("haiku"));
+        let edit_none = change(12, ProvChangeKind::Edit, None, None);
+        let composed = land(20, 30, "opus");
+        let mixed = land(21, 33, "opus");
+        let orphan = land(22, 34, "opus");
+        let fixer = land(23, 40, "opus");
+        let mut input = Input {
+            lands: vec![
+                composed.clone(),
+                mixed.clone(),
+                orphan.clone(),
+                fixer.clone(),
+            ],
+            ..Input::default()
+        };
+        for change in [&edit_31, &edit_32, &edit_none] {
+            input.origins.insert(change.id, change.clone());
+        }
+        // Task 30 composed task 31's revision alone: charged to 31, whose
+        // preset its revision captured (31 never landed itself).
+        input.entries.insert(20, vec![entry(20, "x.rs", Some(10))]);
+        // Task 33 holds 31's and 32's: ambiguous.
+        input.entries.insert(
+            21,
+            vec![entry(21, "x.rs", Some(10)), entry(21, "y.rs", Some(11))],
+        );
+        // Task 34 holds a revision with no task: ambiguous.
+        input.entries.insert(22, vec![entry(22, "z.rs", Some(12))]);
+        input.supersedes = vec![
+            edge(1, &fixer, defect(30, "level1_revert")),
+            edge(2, &fixer, defect(33, "level1_revert")),
+            edge(3, &fixer, defect(34, "level2_bisect")),
+        ];
+        let report = tally(&input, Window::default());
+        assert_eq!(report["unattributed"], 2, "{report}");
+        let defects = report["defects"].as_array().expect("defects");
+        assert_eq!(defects.len(), 1);
+        assert_eq!(defects[0]["charged_task"], 31);
+        assert_eq!(defects[0]["preset_id"], "sonnet");
+        assert_eq!(row(&report, "sonnet")["confirmed_defects"], 1);
+        assert_eq!(
+            row(&report, "opus")["confirmed_defects"],
+            0,
+            "nobody else is charged"
+        );
+        assert_eq!(row(&report, "opus")["landed_tasks"], 4);
+    }
+}
+
+/// PV4 at landing: the hook (`record_land`, its workspace root found from
+/// the mirror's place under `<root>/.sources/`) writes the very rows
+/// `spawn prov index --root` writes, `supersedes` edges and the files over
+/// the cap included; a second index run records nothing.
+mod pv4_hook {
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::{Path, PathBuf};
+
+    use postgres::{Client, NoTls};
+    use serde_json::{Value, json};
+    use spawn_postgres::testing::TestSchema;
+
+    use super::super::index::{self, Repo};
+    use super::super::{Landed, mirror_root, record_land};
+
+    const SOURCE: &str = "/srv/prov-pv4-hook.git";
+
+    fn git(dir: &Path, clock: i64, arguments: &[&str]) -> String {
+        let date = format!("{clock} +0000");
+        let output = spawn_host::test_git_command()
+            .arg("-C")
+            .arg(dir)
+            .args(arguments)
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn owner(schema: &TestSchema) -> Client {
+        let mut client = Client::connect(schema.url(), NoTls).expect("the owner");
+        client
+            .batch_execute(&format!("set search_path to {}", schema.name()))
+            .expect("the schema");
+        client
+    }
+
+    fn facts(client: &mut Client) {
+        client
+            .batch_execute(
+                "insert into mission_missions (id, text, origin, created_at_ms, updated_at_ms)
+                 overriding system value values (1, 'prov', 'human', 0, 0);
+                 insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
+                                            created_by, created_at_ms, updated_at_ms)
+                 overriding system value
+                 values (11, 1, 'ephemeral', 'agent_a', 'session_a', 'a', 'human', 1000, 1000),
+                        (12, 1, 'ephemeral', 'agent_b', 'session_b', 'b', 'human', 1000, 1000);",
+            )
+            .expect("the mission layer");
+        client
+            .execute(
+                "insert into spawn_events (agent_id, session_id, source, kind, session_seq,
+                                           recorded_at_ms)
+                 values ('spawn_supervisor', 'session_control', 'control', $1, 1, 1000)",
+                &[&json!({"name": "control.recorded", "detail": {"record": {
+                    "type": "task.assigned", "id": 12, "brief": "Undo 11\n\nreverts: task 11\nfixes: task 11"}}})],
+            )
+            .expect("a task.assigned record");
+    }
+
+    fn canonical(client: &mut Client) -> BTreeMap<String, Value> {
+        let names: HashMap<i64, String> = client
+            .query("select id, change_id || '#' || rev from prov_changes", &[])
+            .expect("the changes")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        client
+            .query(
+                "select change_id || '#' || rev, spawn_prov_canonical(id) from prov_changes",
+                &[],
+            )
+            .expect("the canonical values")
+            .iter()
+            .map(|row| {
+                let mut value: Value = row.get(1);
+                for entry in value["entries"].as_array_mut().into_iter().flatten() {
+                    if let Some(origin) = entry["origin"].as_i64() {
+                        entry["origin"] = json!(names[&origin]);
+                    }
+                }
+                (row.get(0), value)
+            })
+            .collect()
+    }
+
+    /// A merge of `branch` into main, with the integrator's trailers.
+    fn land(work: &Path, clock: i64, task: i64, branch: &str) -> String {
+        let head = git(work, clock, &["rev-parse", branch]);
+        git(
+            work,
+            clock,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                &format!(
+                    "Task {task}\n\nreverts: task 11\n\nSpawn-Task: {task}\nSpawn-Head: {head}\n"
+                ),
+                branch,
+            ],
+        );
+        git(work, clock, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn the_hook_writes_the_supersedes_edges_and_oversized_entries_the_indexer_writes() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let scratch = std::env::temp_dir().join(format!(
+            "spawn-prov-pv4-hook-{}-{nanos:x}",
+            std::process::id()
+        ));
+        let work = scratch.join("work");
+        std::fs::create_dir_all(&work).expect("the work tree");
+        let result = std::panic::catch_unwind(|| run(&scratch, &work));
+        let _ = std::fs::remove_dir_all(&scratch);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn run(scratch: &Path, work: &Path) {
+        let mut clock = 1_700_000_000;
+        let mut tick = || {
+            clock += 1;
+            clock
+        };
+        git(work, tick(), &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("a.rs"), "one\n").expect("write");
+        git(work, tick(), &["add", "-A"]);
+        git(work, tick(), &["commit", "-qm", "Initial import"]);
+        // Branches outside `spawn/`: no walk meets them before they land.
+        git(work, tick(), &["checkout", "-q", "-b", "agent_a"]);
+        std::fs::write(work.join("a.rs"), "one\nbad\n").expect("write");
+        git(work, tick(), &["commit", "-qam", "spawn checkpoint exec_a"]);
+        git(work, tick(), &["checkout", "-q", "main"]);
+        let l11 = land(work, tick(), 11, "agent_a");
+        git(work, tick(), &["checkout", "-q", "-b", "agent_b"]);
+        std::fs::write(work.join("a.rs"), "one\n").expect("write");
+        git(work, tick(), &["commit", "-qam", "spawn checkpoint exec_b"]);
+        git(work, tick(), &["checkout", "-q", "main"]);
+        let l12 = land(work, tick(), 12, "agent_b");
+
+        // The mirror, where the integrator keeps it, at the first landing.
+        let root = scratch.join("root");
+        let mirror: PathBuf = root.join(".sources").join("prov.git");
+        std::fs::create_dir_all(root.join(".sources")).expect("sources");
+        git(
+            scratch,
+            tick(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &work.display().to_string(),
+                &mirror.display().to_string(),
+            ],
+        );
+        assert_eq!(mirror_root(&mirror), Some(root.as_path()));
+        assert_eq!(mirror_root(work), None);
+        let mirror_text = mirror.display().to_string();
+        git(&mirror, tick(), &["update-ref", "refs/heads/main", &l11]);
+        // Task 12's agent left a file over the cap out of its checkpoint.
+        let big = b"a large file's bytes".to_vec();
+        let digest = format!(
+            "sha256:{}",
+            spawn_cas::sha256_reader(&mut &big[..]).expect("hash").hex()
+        );
+        std::fs::create_dir_all(root.join(".oversized")).expect("the records");
+        std::fs::write(
+            root.join(".oversized/agent_b"),
+            format!("untold\0{} {digest}\0model.bin\0", big.len()),
+        )
+        .expect("the record");
+
+        let domain = index::domain_of(SOURCE);
+        let hooked = TestSchema::new("prov_pv4_hook");
+        let indexed = TestSchema::new("prov_pv4_indexed");
+        let hooked_store = hooked.store();
+        let indexed_store = indexed.store();
+        let mut hooked_client = owner(&hooked);
+        let mut indexed_client = owner(&indexed);
+        facts(&mut hooked_client);
+        facts(&mut indexed_client);
+        // Main up to task 11's landing, as the integrator's earlier hook
+        // or index left it.
+        let mut repo = Repo::open(&mirror_text).expect("the mirror");
+        index::index(&hooked_store, &mut repo, &domain).expect("main indexed");
+        drop(repo);
+
+        // Task 12 lands: the push moves main, then the hook.
+        git(&mirror, tick(), &["update-ref", "refs/heads/main", &l12]);
+        let recorded = record_land(&hooked_store, &mirror, SOURCE, &l12);
+        assert!(matches!(recorded, Ok(Landed::Recorded(_))), "{recorded:?}");
+
+        // The indexer, on a database of its own, with the root.
+        let mut repo = Repo::open(&mirror_text).expect("the mirror");
+        index::index_with(&indexed_store, &mut repo, &domain, Some(&root)).expect("indexed");
+        let hooked_rows = canonical(&mut hooked_client);
+        assert_eq!(hooked_rows, canonical(&mut indexed_client));
+        // And again: nothing.
+        let again = index::index_with(&hooked_store, &mut repo, &domain, Some(&root))
+            .expect("indexed again");
+        assert_eq!(again.recorded(), 0);
+        assert_eq!(canonical(&mut hooked_client), hooked_rows);
+
+        check_rows(&hooked_rows, &digest, big.len());
+        drop((hooked_store, indexed_store));
+    }
+
+    /// What the hook's rows say: level 1 and the fixes, from the brief
+    /// alone, and the file over the cap.
+    fn check_rows(hooked_rows: &BTreeMap<String, Value>, digest: &str, size: usize) {
+        // What the rows say: level 1 and the fixes, from the brief alone
+        // (the landing messages' "reverts: task 11" is the agent's text);
+        // task 11's landing has no edge of the kind.
+        let land12 = hooked_rows
+            .values()
+            .find(|row| row["change"]["kind"] == "land" && row["change"]["task_id"] == 12)
+            .expect("task 12's landing");
+        let edges: Vec<&Value> = land12["edges"]
+            .as_array()
+            .expect("edges")
+            .iter()
+            .filter(|edge| edge["kind"] == "supersedes")
+            .collect();
+        let details: Vec<&Value> = edges.iter().map(|edge| &edge["detail"]).collect();
+        assert_eq!(
+            details,
+            [
+                &json!({"reason": "defect", "evidence": "dispatcher_fixes", "target_task": 11}),
+                &json!({"reason": "defect", "evidence": "level1_revert", "target_task": 11}),
+            ]
+        );
+        let land11 = hooked_rows
+            .values()
+            .find(|row| row["change"]["kind"] == "land" && row["change"]["task_id"] == 11)
+            .expect("task 11's landing");
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge["dst"] == land11["change"]["change_id"]),
+            "{edges:?}"
+        );
+        assert!(
+            land11["edges"]
+                .as_array()
+                .expect("edges")
+                .iter()
+                .all(|edge| edge["kind"] != "supersedes")
+        );
+        let model = land12["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .find(|entry| entry["path"] == "model.bin")
+            .expect("the file over the cap");
+        assert_eq!(
+            (
+                &model["after"],
+                &model["size"],
+                &model["class"],
+                &model["before"]
+            ),
+            (
+                &json!(digest),
+                &json!(size),
+                &json!("content"),
+                &Value::Null
+            )
+        );
+    }
+}
+
+/// PV4 `restores()`: a landing touches a task's paths whether either side
+/// folded its entries into top-level `tree` rows.
+#[test]
+fn a_revert_touches_the_paths_whether_either_side_is_folded() {
+    use super::index::touches_any;
+    // Unfolded on both sides.
+    assert!(touches_any(["src/a.rs"], &["src/a.rs"]));
+    assert!(!touches_any(["src/a.rs"], &["src/b.rs"]));
+    // The task's file under the landing's folded directory.
+    assert!(touches_any(["src/a.rs"], &["src"]));
+    // The task's folded directory over the landing's file.
+    assert!(touches_any(["src"], &["src/deep/a.rs"]));
+    // Folded on both sides.
+    assert!(touches_any(["src"], &["src"]));
+    // A top-level file is no directory of a like-named prefix.
+    assert!(!touches_any(["src"], &["srcx/a.rs"]));
+    assert!(!touches_any(["src/a.rs"], &["srcx"]));
+    assert!(!touches_any(["README.md"], &["docs/README.md"]));
+    assert!(!touches_any(std::iter::empty(), &["src"]));
+}

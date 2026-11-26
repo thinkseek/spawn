@@ -820,6 +820,7 @@
         "crates/spawn-cli/src/disk.rs",
         "crates/spawn-cli/src/provenance.rs",
         "crates/spawn-cli/src/provenance/data.rs",
+        "crates/spawn-cli/src/provenance/durability.rs",
         "crates/spawn-cli/src/provenance/index.rs",
         "crates/spawn-cli/src/provenance/land_tests.rs",
         "crates/spawn-cli/src/provenance/plan.rs",
@@ -839,6 +840,7 @@
         "crates/spawn-cli/src/storage_bytes.rs",
         "crates/spawn-cli/src/storage_bytes/tests.rs",
         "crates/spawn-cli/tests/prov_data.rs",
+        "crates/spawn-cli/tests/prov_durability.rs",
         "crates/spawn-cli/tests/prov_index.rs",
         "crates/spawn-host/src/scratch.rs",
         "crates/spawn-postgres/src/commit_map.rs",
@@ -963,6 +965,7 @@
           "crates/spawn-cas/tests/manifest.rs",
           "crates/spawn-cli/src/scratch_sweep/tests.rs",
           "crates/spawn-cli/tests/prov_data.rs",
+          "crates/spawn-cli/tests/prov_durability.rs",
           "scripts/test-storage-extents.py"
         ],
         "deploys": [],
