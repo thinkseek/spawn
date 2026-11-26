@@ -160,6 +160,22 @@ const LAUNCH_SETTLE: Duration = Duration::from_secs(1);
 /// often it looks.
 const LAUNCH_CLEAR_LIMIT: Duration = Duration::from_secs(3);
 const LAUNCH_CLEAR_POLL: Duration = Duration::from_millis(20);
+const LAUNCH_CLEAR_MIN_MS: u64 = 100;
+const LAUNCH_CLEAR_MAX_MS: u64 = 10_000;
+
+/// Maximum number of Herdr server shards a single [`HerdrPool`] manages.
+pub const MAX_SHARDS: usize = 64;
+
+fn launch_clear_limit_from(value: Option<&str>) -> Duration {
+    value
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|ms| (LAUNCH_CLEAR_MIN_MS..=LAUNCH_CLEAR_MAX_MS).contains(ms))
+        .map_or(LAUNCH_CLEAR_LIMIT, Duration::from_millis)
+}
+
+fn launch_clear_limit() -> Duration {
+    launch_clear_limit_from(std::env::var("SPAWN_HERDR_LAUNCH_CLEAR_MS").ok().as_deref())
+}
 
 /// Lines of the pane read while waiting for that clear: more than a reader
 /// of the pane's tail reads ([`spawn_core::screen::TAIL_LINES`]).
@@ -1090,7 +1106,7 @@ impl HerdrHost {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let deadline = Instant::now() + LAUNCH_CLEAR_LIMIT;
+        let deadline = Instant::now() + launch_clear_limit();
         loop {
             if !script.exists() {
                 let Ok(read) = self.call(
@@ -1892,6 +1908,302 @@ fn runner_of(terminal: &TerminalName, record: &Record) -> Runner {
     }
 }
 
+/// Deterministic 64-bit FNV-1a hash of `terminal`, used to assign terminals to
+/// shards identically across `spawn loop`, `spawn serve`, and restarts.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3_u64);
+    }
+    hash
+}
+
+/// A sharded pool of independent `herdr` daemons (`<session>-s0`, `<session>-s1`, ...)
+/// distributing terminals deterministically by terminal name so high-concurrency
+/// fleets avoid saturating a single `herdr` process.
+pub struct HerdrPool {
+    shards: Vec<HerdrHost>,
+}
+
+impl HerdrPool {
+    /// Open a pool of `shards` independent Herdr sessions (`1..=MAX_SHARDS`).
+    ///
+    /// With `shards == 1`, runs on `base_session` directly; with `shards > 1`,
+    /// runs on `{base_session}-s0` through `{base_session}-s{shards - 1}`.
+    ///
+    /// # Errors
+    ///
+    /// When `shards` is outside `1..=MAX_SHARDS`, or `base_session` cannot name
+    /// Spawn's herdr session.
+    pub fn on_session(
+        program: &str,
+        base_session: &str,
+        shards: usize,
+    ) -> Result<Self, TerminalError> {
+        if !(1..=MAX_SHARDS).contains(&shards) {
+            return Err(TerminalError(format!(
+                "herdr shard count must be between 1 and {MAX_SHARDS}, not {shards}"
+            )));
+        }
+        if shards == 1 {
+            return Ok(Self {
+                shards: vec![HerdrHost::on_session(program, base_session)?],
+            });
+        }
+        let mut hosts = Vec::with_capacity(shards);
+        for index in 0..shards {
+            let session = format!("{base_session}-s{index}");
+            hosts.push(HerdrHost::on_session(program, &session)?);
+        }
+        Ok(Self { shards: hosts })
+    }
+
+    /// Pin host-side transcript and project file operations beneath `projects`
+    /// (handled on shard 0 because file access is host-local).
+    #[must_use]
+    pub fn with_files_beneath(mut self, projects: crate::beneath::Beneath) -> Self {
+        if let Some(first) = self.shards.first_mut() {
+            let shard = std::mem::replace(
+                first,
+                HerdrHost::on_session("herdr", DEFAULT_SESSION).expect("DEFAULT_SESSION is valid"),
+            );
+            *first = shard.with_files_beneath(projects);
+        }
+        self
+    }
+
+    /// Route every shard's runtime state, records, and server configs beneath `base`.
+    #[must_use]
+    pub fn with_runtime_under(mut self, base: &Path) -> Self {
+        self.shards = self
+            .shards
+            .into_iter()
+            .map(|shard| shard.with_runtime_under(base.to_path_buf()))
+            .collect();
+        self
+    }
+
+    /// Number of shards in this pool.
+    #[must_use]
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Primary shard (`s0`) in the pool.
+    #[must_use]
+    pub fn primary(&self) -> &HerdrHost {
+        &self.shards[0]
+    }
+
+    /// Deterministic shard index for `terminal`.
+    #[must_use]
+    pub fn shard_index(&self, terminal: &TerminalName) -> usize {
+        let len = u64::try_from(self.shards.len()).unwrap_or(1).max(1);
+        usize::try_from(fnv1a_64(terminal.as_str().as_bytes()) % len).unwrap_or(0)
+    }
+
+    /// The shard [`HerdrHost`] owning `terminal`.
+    fn shard(&self, terminal: &TerminalName) -> &HerdrHost {
+        &self.shards[self.shard_index(terminal)]
+    }
+}
+
+impl TerminalHost for HerdrPool {
+    fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+        self.shard(&launch.terminal).start(launch)
+    }
+
+    fn stage_text(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        text: &str,
+    ) -> Result<(), TerminalError> {
+        self.shard(terminal).stage_text(terminal, workspace, text)
+    }
+
+    fn submit_staged(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<(), TerminalError> {
+        self.shard(terminal).submit_staged(terminal, workspace)
+    }
+
+    fn submit_text(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        text: &str,
+    ) -> Result<(), TerminalError> {
+        self.shard(terminal).submit_text(terminal, workspace, text)
+    }
+
+    fn send_keys(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        keys: &[&str],
+    ) -> Result<(), TerminalError> {
+        self.shard(terminal).send_keys(terminal, workspace, keys)
+    }
+
+    fn is_alive(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<bool, TerminalError> {
+        self.shard(terminal).is_alive(terminal, workspace)
+    }
+
+    fn server(&self) -> ServerSeen {
+        if self.shards.len() == 1 {
+            return self.shards[0].server();
+        }
+        let any_answering = self
+            .shards
+            .iter()
+            .any(|shard| !matches!(shard.server(), ServerSeen::Gone));
+        if any_answering {
+            ServerSeen::Answers(None)
+        } else {
+            ServerSeen::Gone
+        }
+    }
+
+    fn runner(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<Runner, TerminalError> {
+        self.shard(terminal).runner(terminal, workspace)
+    }
+
+    fn runners(
+        &self,
+        terminals: &[(TerminalName, WorkspaceId)],
+    ) -> Result<Vec<(TerminalName, Runner)>, TerminalError> {
+        if terminals.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.shards.len() == 1 {
+            return self.shards[0].runners(terminals);
+        }
+        let mut buckets: Vec<Vec<(usize, TerminalName, WorkspaceId)>> =
+            vec![Vec::new(); self.shards.len()];
+        for (orig_idx, (terminal, workspace)) in terminals.iter().enumerate() {
+            let shard_idx = self.shard_index(terminal);
+            buckets[shard_idx].push((orig_idx, terminal.clone(), workspace.clone()));
+        }
+        let mut collected: Vec<(usize, TerminalName, Runner)> = Vec::with_capacity(terminals.len());
+        std::thread::scope(|scope| -> Result<(), TerminalError> {
+            let mut handles = Vec::new();
+            for (shard_idx, items) in buckets.into_iter().enumerate() {
+                if items.is_empty() {
+                    continue;
+                }
+                let shard = &self.shards[shard_idx];
+                handles.push(scope.spawn(move || {
+                    let query: Vec<(TerminalName, WorkspaceId)> = items
+                        .iter()
+                        .map(|(_, terminal, workspace)| (terminal.clone(), workspace.clone()))
+                        .collect();
+                    let results = shard.runners(&query)?;
+                    let mapped: Vec<(usize, TerminalName, Runner)> = items
+                        .into_iter()
+                        .zip(results)
+                        .map(|((orig_idx, _, _), (terminal, runner))| (orig_idx, terminal, runner))
+                        .collect();
+                    Ok::<_, TerminalError>(mapped)
+                }));
+            }
+            for handle in handles {
+                let part = handle.join().map_err(|_| {
+                    TerminalError("herdr pool runners thread panicked".to_string())
+                })??;
+                collected.extend(part);
+            }
+            Ok(())
+        })?;
+        collected.sort_by_key(|(orig_idx, _, _)| *orig_idx);
+        Ok(collected
+            .into_iter()
+            .map(|(_, terminal, runner)| (terminal, runner))
+            .collect())
+    }
+
+    fn capture_tail(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        lines: usize,
+    ) -> Result<String, TerminalError> {
+        self.shard(terminal)
+            .capture_tail(terminal, workspace, lines)
+    }
+
+    fn terminate(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<(), TerminalError> {
+        self.shard(terminal).terminate(terminal, workspace)
+    }
+
+    fn terminate_waits(&self) -> bool {
+        true
+    }
+
+    fn agent(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<Option<AgentReading>, TerminalError> {
+        self.shard(terminal).agent(terminal, workspace)
+    }
+
+    fn agent_changes(&self) -> Vec<TerminalName> {
+        let mut changed = Vec::new();
+        for shard in &self.shards {
+            changed.extend(shard.agent_changes());
+        }
+        changed
+    }
+
+    fn read_from(
+        &self,
+        workspace: &WorkspaceId,
+        path: &str,
+        offset: u64,
+    ) -> Result<Option<Vec<u8>>, TerminalError> {
+        self.shards[0].read_from(workspace, path, offset)
+    }
+
+    fn list_dirs(&self, workspace: &WorkspaceId, dir: &str) -> Result<Vec<String>, TerminalError> {
+        self.shards[0].list_dirs(workspace, dir)
+    }
+
+    fn write_new(
+        &self,
+        workspace: &WorkspaceId,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<bool, TerminalError> {
+        self.shards[0].write_new(workspace, path, bytes)
+    }
+
+    fn replace_grown(
+        &self,
+        workspace: &WorkspaceId,
+        path: &str,
+        bytes: &[u8],
+        current: &[u8],
+    ) -> Result<bool, TerminalError> {
+        self.shards[0].replace_grown(workspace, path, bytes, current)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2421,5 +2733,50 @@ mod tests {
             server,
         };
         assert_eq!(Record::pending_server(&full.to_text()), None);
+    }
+
+    #[test]
+    fn herdr_pool_shards_deterministically_and_validates_bounds() {
+        use super::{HerdrPool, MAX_SHARDS, launch_clear_limit_from};
+        assert!(HerdrPool::on_session("herdr", "spawn-test", 0).is_err());
+        assert!(HerdrPool::on_session("herdr", "spawn-test", MAX_SHARDS + 1).is_err());
+
+        let single = HerdrPool::on_session("herdr", "spawn-test", 1).expect("single shard");
+        assert_eq!(single.shard_count(), 1);
+        assert_eq!(single.shards[0].session(), "spawn-test");
+
+        let pool = HerdrPool::on_session("herdr", "spawn-test", 8).expect("8 shards");
+        assert_eq!(pool.shard_count(), 8);
+        assert_eq!(pool.shards[0].session(), "spawn-test-s0");
+        assert_eq!(pool.shards[7].session(), "spawn-test-s7");
+
+        let mut counts = [0usize; 8];
+        for i in 0..64 {
+            let term = TerminalName::new(format!("spawn-exec-{i:04}")).expect("terminal");
+            let idx = pool.shard_index(&term);
+            assert_eq!(idx, pool.shard_index(&term));
+            counts[idx] += 1;
+        }
+        assert!(
+            counts.iter().all(|&c| c > 0),
+            "all shards should be hit: {counts:?}"
+        );
+
+        assert_eq!(
+            launch_clear_limit_from(None),
+            std::time::Duration::from_secs(3)
+        );
+        assert_eq!(
+            launch_clear_limit_from(Some("500")),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            launch_clear_limit_from(Some("50")),
+            std::time::Duration::from_secs(3)
+        );
+        assert_eq!(
+            launch_clear_limit_from(Some("99999")),
+            std::time::Duration::from_secs(3)
+        );
     }
 }

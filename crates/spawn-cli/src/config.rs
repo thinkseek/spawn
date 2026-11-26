@@ -750,10 +750,26 @@ pub(crate) fn terminal_backend(value: Option<&str>) -> Result<TerminalBackend, S
     }
 }
 
+/// How many Herdr server shards `SPAWN_HERDR_SHARDS` configures (`1` when unset
+/// or empty; `1..=spawn_host::herdr::MAX_SHARDS`).
+pub(crate) fn herdr_shards(value: Option<&str>) -> Result<usize, String> {
+    let Some(text) = value.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Ok(1);
+    };
+    match text.parse::<usize>() {
+        Ok(shards) if (1..=spawn_host::herdr::MAX_SHARDS).contains(&shards) => Ok(shards),
+        _ => Err(format!(
+            "SPAWN_HERDR_SHARDS={text:?} must be a whole number from 1 to {}",
+            spawn_host::herdr::MAX_SHARDS
+        )),
+    }
+}
+
 /// The terminal host the environment describes: tmux on this machine, on
 /// the server of `SPAWN_TMUX_SOCKET` when it is set; or, with
 /// `SPAWN_TERMINAL_BACKEND=herdr`, Herdr (`SPAWN_HERDR_PROGRAM`, `herdr` by
-/// default) on the session `SPAWN_HERDR_SESSION` (`spawn` by default).
+/// default) on the session `SPAWN_HERDR_SESSION` (`spawn` by default),
+/// sharded across `SPAWN_HERDR_SHARDS` independent servers when greater than 1.
 pub(crate) fn terminal_host() -> Result<spawn_host::LocalTerminalHost, String> {
     Ok(
         match terminal_backend(env_value("SPAWN_TERMINAL_BACKEND").as_deref())? {
@@ -763,13 +779,22 @@ pub(crate) fn terminal_host() -> Result<spawn_host::LocalTerminalHost, String> {
                     env_value("SPAWN_TMUX_SOCKET"),
                 ))
             }
-            TerminalBackend::Herdr => spawn_host::LocalTerminalHost::Herdr(
-                spawn_host::HerdrHost::on_session(
-                    &env_or("SPAWN_HERDR_PROGRAM", "herdr"),
-                    &env_or("SPAWN_HERDR_SESSION", spawn_host::herdr::DEFAULT_SESSION),
-                )
-                .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
-            ),
+            TerminalBackend::Herdr => {
+                let program = env_or("SPAWN_HERDR_PROGRAM", "herdr");
+                let session = env_or("SPAWN_HERDR_SESSION", spawn_host::herdr::DEFAULT_SESSION);
+                let shards = herdr_shards(env_value("SPAWN_HERDR_SHARDS").as_deref())?;
+                if shards <= 1 {
+                    spawn_host::LocalTerminalHost::Herdr(
+                        spawn_host::HerdrHost::on_session(&program, &session)
+                            .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
+                    )
+                } else {
+                    spawn_host::LocalTerminalHost::HerdrPool(
+                        spawn_host::HerdrPool::on_session(&program, &session, shards)
+                            .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
+                    )
+                }
+            }
         },
     )
 }
@@ -1057,5 +1082,16 @@ mod workspace_tests {
         cow.claim(&root).expect("the root is free");
         assert_eq!(spawn_host::root_backend(&root).unwrap(), Some(Engine::Cow));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn herdr_shards_parses_bounds_and_defaults() {
+        use super::herdr_shards;
+        assert_eq!(herdr_shards(None), Ok(1));
+        assert_eq!(herdr_shards(Some("")), Ok(1));
+        assert_eq!(herdr_shards(Some(" 16 ")), Ok(16));
+        assert!(herdr_shards(Some("0")).is_err());
+        assert!(herdr_shards(Some("65")).is_err());
+        assert!(herdr_shards(Some("abc")).is_err());
     }
 }

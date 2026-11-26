@@ -89,6 +89,18 @@ pub struct EngineHome {
     /// told one at launch (agy, `SPAWN_AGY_MODEL`); Claude Code takes its
     /// models from its settings.
     pub model: Option<String>,
+    /// Redirected runtime/transcript data root (`SPAWN_AGY_DATA_DIR`), when
+    /// transcripts and volatile state are stored outside the user's home.
+    pub data_dir: Option<String>,
+}
+
+impl EngineHome {
+    /// Directory under which engine transcripts and session logs are scanned
+    /// (`data_dir` when redirected off `$HOME`, else `sessions`).
+    #[must_use]
+    pub fn transcript_root(&self) -> &str {
+        self.data_dir.as_deref().unwrap_or(&self.sessions)
+    }
 }
 
 /// What one launch asks of an engine, decided by the Bridge.
@@ -539,7 +551,7 @@ impl AgentDriver for AgyDriver {
     fn transcript_path(&self, home: &EngineHome, _workspace: &WorkspaceId, native: &str) -> String {
         format!(
             "{}/brain/{native}/.system_generated/logs/transcript_full.jsonl",
-            home.sessions.trim_end_matches('/')
+            home.transcript_root().trim_end_matches('/')
         )
     }
 
@@ -550,7 +562,10 @@ impl AgentDriver for AgyDriver {
 
     /// `<home>/brain`: one directory per conversation.
     fn session_scan_dir(&self, home: &EngineHome) -> Option<String> {
-        Some(format!("{}/brain", home.sessions.trim_end_matches('/')))
+        Some(format!(
+            "{}/brain",
+            home.transcript_root().trim_end_matches('/')
+        ))
     }
 
     fn read_line(&self, line: &str, cursor: &mut LineCursor) -> LineFacts {
@@ -714,6 +729,7 @@ mod tests {
             program: "/usr/local/bin/claude".to_string(),
             sessions: "/root/.claude/projects/".to_string(),
             model: None,
+            data_dir: None,
         }
     }
 
@@ -794,6 +810,7 @@ mod tests {
                 program: "claude".to_string(),
                 sessions: sessions.to_string(),
                 model: None,
+                data_dir: None,
             };
             assert_eq!(
                 ClaudeDriver.transcript_path(&home, &workspace, "abc"),
@@ -882,6 +899,7 @@ mod tests {
             program: "/opt/agy/bin/agy".to_string(),
             sessions: "/home/a/.gemini/antigravity-cli/".to_string(),
             model: Some("gemini-3.8-flash-low".to_string()),
+            data_dir: None,
         }
     }
 

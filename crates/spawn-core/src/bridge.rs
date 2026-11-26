@@ -306,6 +306,15 @@ pub struct BridgeConfig {
     /// if nobody does, the start fails naming the dialog and the switch
     /// ([`TRUST_OFF`]).
     pub auto_trust: bool,
+    /// Maximum workspace mounts allowed to run concurrently (`SPAWN_MAX_CONCURRENT_MOUNTS`).
+    pub max_concurrent_mounts: usize,
+    /// Maximum checkpoint commits allowed in parallel (`SPAWN_MAX_CONCURRENT_CHECKPOINTS`).
+    pub max_concurrent_checkpoints: usize,
+    /// Maximum idle backstop screen captures per pass (`SPAWN_BRIDGE_BACKSTOPS_PER_PASS`).
+    pub backstops_per_pass: usize,
+    /// Maximum session directories inspected when fallback-binding a reported session
+    /// (`SPAWN_LIST_DIRS_LIMIT`).
+    pub session_scan_limit: usize,
     /// Whether an engine with no deny rules of its own
     /// ([`crate::driver::Guard::Sandbox`]) runs inside a filesystem view
     /// (decision C2, N6; `SPAWN_ENGINE_VIEW`). Required by default, and
@@ -371,6 +380,10 @@ impl BridgeConfig {
             launch_environment: None,
             recover_worker_leases: true,
             auto_trust: true,
+            max_concurrent_mounts: MAX_CONCURRENT_MOUNTS,
+            max_concurrent_checkpoints: MAX_CONCURRENT_CHECKPOINTS,
+            backstops_per_pass: BACKSTOPS_PER_PASS,
+            session_scan_limit: crate::port::LIST_DIRS_LIMIT,
             engine_view: EngineViewPolicy::unconfigured(),
         }
     }
@@ -384,6 +397,7 @@ impl BridgeConfig {
                 program: self.claude_program.clone(),
                 sessions: self.claude_projects.clone(),
                 model: None,
+                data_dir: None,
             });
         }
         self.engines
@@ -398,6 +412,7 @@ impl BridgeConfig {
             program: self.claude_program.clone(),
             sessions: self.claude_projects.clone(),
             model: None,
+            data_dir: None,
         })
     }
 }
@@ -2325,7 +2340,9 @@ impl Bridge {
             }
         }
         let precommitted = if commit_jobs.len() >= 2 {
-            let workers = commit_jobs.len().min(MAX_CONCURRENT_CHECKPOINTS);
+            let workers = commit_jobs
+                .len()
+                .min(self.config.max_concurrent_checkpoints.max(1));
             let workspaces = &self.workspaces;
             let next = std::sync::atomic::AtomicUsize::new(0);
             let results = std::sync::Mutex::new(HashMap::with_capacity(commit_jobs.len()));
@@ -3112,7 +3129,7 @@ impl Bridge {
                 let taken = self
                     .backstops
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                taken < BACKSTOPS_PER_PASS
+                taken < self.config.backstops_per_pass
             }
         }
     }
@@ -3355,7 +3372,7 @@ impl Bridge {
         let driver = active.driver;
         let workspace = active.workspace.clone();
         let home = self.config.home_of(driver);
-        let root = format!("{}/", home.sessions.trim_end_matches('/'));
+        let root = format!("{}/", home.transcript_root().trim_end_matches('/'));
         let not_before = active.started_at.saturating_sub(BIND_SKEW_MS);
         // The transcript of `native`, when it is below the engine's home and
         // a prompt in it, written since this execution started, holds a
@@ -3401,7 +3418,7 @@ impl Bridge {
                 .filter(|native| plain_session_id(native))
                 .filter(|native| reported.as_deref() != Some(native.as_str()))
                 .filter(|native| !active.preexisting_natives.contains(native.as_str()))
-                .take(crate::port::LIST_DIRS_LIMIT)
+                .take(self.config.session_scan_limit.max(1))
                 .find_map(|native| proven(native).map(|path| (native.clone(), path)));
         }
         let Some((native, path)) = bound else {
@@ -4607,7 +4624,7 @@ impl Bridge {
             return Ok(progress);
         }
         if !self.mounting.contains_key(&claimed.command_id) {
-            if self.mounting.len() >= MAX_CONCURRENT_MOUNTS
+            if self.mounting.len() >= self.config.max_concurrent_mounts.max(1)
                 || self
                     .mounting
                     .values()
@@ -9761,6 +9778,7 @@ mod tests {
                 program: "/opt/agy/bin/agy".to_string(),
                 sessions: AGY_HOME.to_string(),
                 model: model.map(str::to_string),
+                data_dir: None,
             },
         )];
         config.engine_view = EngineViewPolicy::Required(Ok(Arc::new(FakeView::default())));

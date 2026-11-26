@@ -984,6 +984,7 @@
       "files": [
         "crates/spawn-cli/src/commit_now.rs",
         "crates/spawn-cli/src/main_merge.rs",
+        "crates/spawn-cli/src/managed_sources.rs",
         "crates/spawn-cli/src/push.rs",
         "crates/spawn-cli/src/recover.rs",
         "crates/spawn-cli/src/rewrite_guard.rs",
@@ -1086,6 +1087,7 @@
         "crates/spawn-host/tests/engine_view.rs",
         "crates/spawn-host/tests/herdr.rs",
         "crates/spawn-host/tests/runner.rs",
+        "crates/spawn-host/tests/undumpable_auxv.rs",
         "crates/spawn-postgres/tests/zombie.rs",
         "rsi/backlog/025.json",
         "rsi/backlog/028.json",
@@ -1734,7 +1736,8 @@
         "scripts/timing/shim-spawn.bash",
         "scripts/timing/shim-tmux.bash",
         "scripts/timing/timing.sh",
-        "scripts/timing/with.sh"
+        "scripts/timing/with.sh",
+        "scripts/universal-gate.sh"
       ],
       "relations": [
         {

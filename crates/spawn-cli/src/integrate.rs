@@ -745,17 +745,41 @@ pub(crate) const DEFAULT_GATES: usize = 1;
 /// gate gets a test database server of its own.
 pub(crate) const PER_GATE_SERVER: &str = "SPAWN_TEST_DATABASE_PER_GATE";
 
+/// Cluster-wide opt-out of the shared test database (`SPAWN_GATE_NO_DB=1`),
+/// allowing concurrent multi-gate judging when gates need no Postgres server.
+pub(crate) const GATE_NO_DB: &str = "SPAWN_GATE_NO_DB";
+
 /// The most gates `--gates` allows: each holds two trees, their builds and
 /// a share of the test database.
-pub(crate) const MAX_GATES: usize = 8;
+pub(crate) const MAX_GATES: usize = 64;
 
 /// How many gates may run at once: `--gates`, else `SPAWN_INTEGRATE_GATES`,
 /// else [`DEFAULT_GATES`]; a whole number from 1 to [`MAX_GATES`], and more
-/// than one only with [`PER_GATE_SERVER`]`=1` (`per_gate`).
+/// than one only with [`PER_GATE_SERVER`]`=1` (`per_gate`) or [`GATE_NO_DB`]`=1`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn gate_slots(
     flag: Option<String>,
     env: Option<String>,
     per_gate: Option<&str>,
+) -> Result<usize, String> {
+    gate_slots_with(flag, env, per_gate, None)
+}
+
+pub(crate) fn gate_slots_from(flags: &Flags) -> Result<usize, String> {
+    gate_slots_with(
+        flags.get("gates"),
+        crate::config::env_value("SPAWN_INTEGRATE_GATES"),
+        crate::config::env_value(PER_GATE_SERVER).as_deref(),
+        crate::config::env_value(GATE_NO_DB).as_deref(),
+    )
+    .map_err(|error| format!("{error}\n{USAGE}"))
+}
+
+pub(crate) fn gate_slots_with(
+    flag: Option<String>,
+    env: Option<String>,
+    per_gate: Option<&str>,
+    no_db: Option<&str>,
 ) -> Result<usize, String> {
     let Some((name, text)) = flag
         .map(|text| ("--gates", text))
@@ -763,16 +787,18 @@ pub(crate) fn gate_slots(
     else {
         return Ok(DEFAULT_GATES);
     };
+    let concurrent_safe = per_gate.map(str::trim) == Some("1") || no_db.map(str::trim) == Some("1");
     match text.trim().parse::<usize>() {
         Ok(1) => Ok(1),
         Ok(slots) if (2..=MAX_GATES).contains(&slots) => {
-            if per_gate.map(str::trim) == Some("1") {
+            if concurrent_safe {
                 Ok(slots)
             } else {
                 Err(format!(
                     "{name}={slots}: more than one gate at once is unsafe while the gates share \
                      one test database server (its gate login is a superuser); set \
-                     {PER_GATE_SERVER}=1 only once each gate has a server of its own"
+                     {PER_GATE_SERVER}=1 only once each gate has a server of its own, or \
+                     {GATE_NO_DB}=1 when gates need no test database"
                 ))
             }
         }
@@ -1420,12 +1446,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
             gate::GATE_ENV_FILE
         );
     }
-    let gates = gate_slots(
-        flags.get("gates"),
-        crate::config::env_value("SPAWN_INTEGRATE_GATES"),
-        crate::config::env_value(PER_GATE_SERVER).as_deref(),
-    )
-    .map_err(|error| format!("{error}\n{USAGE}"))?;
+    let gates = gate_slots_from(&flags)?;
     // What the host must have before a gate starts, read once like the
     // gate's environment (gate::Room).
     let host_room = gate::Room::from_env(|name| std::env::var(name).ok());
@@ -2230,12 +2251,19 @@ struct Running {
 pub(crate) const NO_TEST_DATABASE: &str = "no-test-database";
 
 /// Whether the gate of a mission whose scenarios are `scenarios` gets
-/// SPAWN_TEST_DATABASE_URL: yes unless its owner put [`NO_TEST_DATABASE`]
-/// there. One that does not get it cannot reach the shared server, whose gate
-/// login is a superuser, so its judging does not count against `--gates`:
-/// it may run beside one that does (still one per mission and per source).
+/// SPAWN_TEST_DATABASE_URL: yes unless `SPAWN_GATE_NO_DB=1` is set globally
+/// or its owner put [`NO_TEST_DATABASE`] there. One that does not get it
+/// cannot reach the shared server, whose gate login is a superuser, so its
+/// judging does not count against `--gates`: it may run beside one that does
+/// (still one per mission and per source).
 pub(crate) fn needs_test_database(scenarios: &Path) -> bool {
-    !scenarios.join(NO_TEST_DATABASE).exists()
+    let global_no_db =
+        crate::config::env_value(GATE_NO_DB).is_some_and(|value| value.trim() == "1");
+    needs_test_database_with(scenarios, global_no_db)
+}
+
+pub(crate) fn needs_test_database_with(scenarios: &Path, global_no_db: bool) -> bool {
+    !global_no_db && !scenarios.join(NO_TEST_DATABASE).exists()
 }
 
 /// The gate's variables a mission marked [`NO_TEST_DATABASE`] does not get:
@@ -3580,7 +3608,7 @@ impl Integrator {
             &self.judge.root,
             &json!({"kind": "owner", "mission": mission_id, "request": id, "source": source,
                     "shares_server": shares_server, "jobs": jobs,
-                    "gate": pinned(&self.judge.gate), "scenarios": gated.gate}),
+                    "gate": pinned(&resolve_gate_script(&self.judge.gate, Path::new(&gated.gate))), "scenarios": gated.gate}),
             self.judge.units,
         ) {
             Ok(judging) => judging,
@@ -3908,7 +3936,7 @@ impl Integrator {
             &json!({"kind": "task", "mission": mission_id, "task": task_id,
                     "revision": task.revisions, "source": source, "base": main,
                     "count": count, "shares_server": shares_server, "jobs": jobs,
-                    "gate": pinned(&self.judge.gate), "scenarios": gated.gate,
+                    "gate": pinned(&resolve_gate_script(&self.judge.gate, Path::new(&gated.gate))), "scenarios": gated.gate,
                     "scenario_names": gated.scenarios_now,
                     "probe": probe}),
             self.judge.units,
@@ -4622,7 +4650,7 @@ impl Judge {
         if let Some(red) = &mission.red {
             gate_env.push(("SPAWN_GATE_BASE_CHECK".to_string(), red.scenario.clone()));
         }
-        let gate_path = pinned(&self.gate);
+        let gate_path = pinned(&resolve_gate_script(&self.gate, scenarios));
         // The head's re-judgings ([`rejection`]) run on an older base, where
         // the red check says nothing about main: they are not given it.
         let head_env: Vec<(String, String)> = gate_env
@@ -5827,6 +5855,17 @@ fn kept_work(store: &PostgresStore, mission: &Mission, task: &Task) -> Result<Ke
 /// resolve stays as named; the step that reads it reports it.
 fn pinned(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Per-mission gate script override (`<scenarios>/gate.sh`) when present,
+/// falling back to the integrator's default gate script.
+pub(crate) fn resolve_gate_script(default_gate: &Path, scenarios: &Path) -> PathBuf {
+    let local = scenarios.join("gate.sh");
+    if local.is_file() {
+        local
+    } else {
+        default_gate.to_path_buf()
+    }
 }
 
 /// The scenario that judges an objective task: its file (`<objective>.sh`,

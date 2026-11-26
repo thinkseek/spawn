@@ -1851,6 +1851,8 @@ alter table mission_tasks add column if not exists difficulty smallint not null 
 alter table mission_tasks add column if not exists preset_id text;
 alter table mission_tasks add column if not exists first_preset_id text;
 alter table mission_tasks add column if not exists quality_rejections integer not null default 0;
+alter table mission_tasks add column if not exists engine text;
+alter table mission_tasks add column if not exists model_label text;
 
 -- Agent grading: a grade or difficulty's rank from its wire name (`l1` to
 -- `l3`), or from a bare rank (`1` to `3`) as a record might hold it; null
@@ -2743,7 +2745,7 @@ begin
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model, reissue_of,
                                    continues, reassign_of, pinned, difficulty, preset_id,
-                                   first_preset_id, quality_rejections,
+                                   first_preset_id, quality_rejections, engine, model_label,
                                    created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
@@ -2761,6 +2763,8 @@ begin
                 p_record ->> 'preset_id',
                 coalesce(p_record ->> 'first_preset_id', p_record ->> 'preset_id'),
                 coalesce((p_record ->> 'quality_rejections')::integer, 0),
+                p_record ->> 'engine',
+                p_record ->> 'model_label',
                 p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
@@ -3651,6 +3655,8 @@ drop function if exists spawn_task_assign(bigint, text, text, text, text, boolea
 drop function if exists spawn_task_assign(bigint, text, text, text, text, boolean, boolean);
 drop function if exists spawn_task_assign(bigint, text, text, text, text, boolean, boolean,
                                           integer, text);
+drop function if exists spawn_task_assign(bigint, text, text, text, text, boolean, boolean,
+                                          integer, text, jsonb);
 -- `p_pin` (objective 239, `--pin`): the task stays with its worker, never
 -- stolen; the record names `pinned` true, and nothing otherwise.
 -- Agent grading (docs/agent-grading.md): `p_difficulty` (1 to 3, `l1` to
@@ -3674,7 +3680,9 @@ create or replace function spawn_task_assign(p_mission bigint, p_kind text, p_wo
                                              p_pin boolean default false,
                                              p_difficulty integer default 2,
                                              p_preset text default null,
-                                             p_classification jsonb default null)
+                                             p_classification jsonb default null,
+                                             p_engine text default null,
+                                             p_model_label text default null)
 returns bigint language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
@@ -3709,6 +3717,15 @@ begin
             or jsonb_typeof(p_classification -> 'signals') is distinct from 'array') then
         raise exception 'a classification is an object naming its difficulty and signals, not %',
             p_classification;
+    end if;
+    if p_engine is not null and (p_engine !~ '^[a-z][a-z0-9_-]*$') then
+        raise exception 'an engine is a registered lowercase driver name, not %', p_engine;
+    end if;
+    if p_model_label is not null and coalesce(trim(p_model_label), '') = '' then
+        raise exception 'a model label cannot be blank';
+    end if;
+    if p_model_label is not null and p_engine = 'claude' then
+        raise exception 'claude takes no direct --model-label (%)', p_model_label;
     end if;
     if p_preset is not null then
         select * into v_preset from grading_presets where preset_id = p_preset;
@@ -3776,6 +3793,10 @@ begin
                 else '{}'::jsonb end
         || case when p_classification is not null
                 then jsonb_build_object('classification', p_classification)
+                else '{}'::jsonb end
+        || case when p_engine is not null or p_model_label is not null
+                then jsonb_strip_nulls(jsonb_build_object('engine', p_engine,
+                                                          'model_label', nullif(trim(p_model_label), '')))
                 else '{}'::jsonb end);
     return v_id;
 end $$;
@@ -4873,9 +4894,10 @@ begin
     -- The worker limit: how many objective tasks may be in flight at once.
     if p_objectives ? 'workers'
        and (jsonb_typeof(p_objectives -> 'workers') is distinct from 'number'
-            or (p_objectives ->> 'workers')::numeric not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-                                                              11, 12, 13, 14, 15, 16)) then
-        raise exception 'an objective mission''s workers is a whole number from 1 to 16, not %',
+            or (p_objectives ->> 'workers')::numeric < 1
+            or (p_objectives ->> 'workers')::numeric > 128
+            or (p_objectives ->> 'workers')::numeric <> trunc((p_objectives ->> 'workers')::numeric)) then
+        raise exception 'an objective mission''s workers is a whole number from 1 to 128, not %',
             p_objectives -> 'workers';
     end if;
     -- Agents' branches reach only a directory on this host (the pusher's
@@ -9147,7 +9169,7 @@ declare
 begin
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean, integer, text, jsonb)',
+        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean, integer, text, jsonb, text, text)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_reissue(bigint, jsonb)',
         'spawn_task_restart(bigint, text)', 'spawn_task_reassign(bigint, text)',
@@ -9188,7 +9210,7 @@ begin
     end loop;
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean, integer, text, jsonb)',
+        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean, integer, text, jsonb, text, text)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_restart(bigint, text)',
         'spawn_task_reassign(bigint, text)', 'spawn_resident_propose(text, text, text)',

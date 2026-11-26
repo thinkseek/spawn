@@ -764,6 +764,12 @@ pub(crate) struct Engines {
     /// Each enabled engine that cannot start here, and why (not installed,
     /// its probe failed).
     pub(crate) down: BTreeMap<String, String>,
+    /// Cluster-wide default engine for tasks without a preset/task override
+    /// (`SPAWN_DEFAULT_ENGINE`).
+    pub(crate) default_engine: Option<String>,
+    /// Cluster-wide default model label paired with `default_engine`
+    /// (`SPAWN_DEFAULT_MODEL_LABEL`).
+    pub(crate) default_model_label: Option<String>,
 }
 
 /// One engine the probe found ready.
@@ -824,23 +830,43 @@ impl Engines {
     }
 }
 
-/// The engine and model label `task`'s preset names (design 7.1): its
-/// `engine_label`'s driver with its `model_label`, Claude Code with none
-/// for a task on no preset or on one whose label names no registered
-/// driver (`label_only`). Claude Code takes its models from the profile.
-fn task_engine(task: &TaskRow) -> (&'static str, Option<&str>) {
-    let driver = task.preset_engine.as_deref().map_or(DEFAULT, |label| {
-        spawn_core::grading::preset_driver(label).driver
-    });
-    if driver == DEFAULT {
-        return (DEFAULT, None);
+/// The engine and model label `task` runs on: its explicit/preset
+/// `engine_label` driver with its `model_label`, else the cluster default
+/// (`SPAWN_DEFAULT_ENGINE` / `SPAWN_DEFAULT_MODEL_LABEL`) when configured,
+/// else Claude Code with none. Claude Code takes its models from the profile.
+fn task_engine<'a>(task: &'a TaskRow, engines: &'a Engines) -> (&'a str, Option<&'a str>) {
+    if let Some(label) = task.preset_engine.as_deref() {
+        let driver = spawn_core::grading::preset_driver(label).driver;
+        if driver == DEFAULT {
+            return (DEFAULT, None);
+        }
+        return (
+            driver,
+            task.preset_model_label
+                .as_deref()
+                .filter(|label| !label.is_empty()),
+        );
     }
-    (
-        driver,
-        task.preset_model_label
+    if let Some(default_engine) = engines
+        .default_engine
+        .as_deref()
+        .and_then(spawn_core::driver::driver)
+        .map(spawn_core::driver::AgentDriver::id)
+        .filter(|id| *id != DEFAULT)
+    {
+        let label = task
+            .preset_model_label
             .as_deref()
-            .filter(|label| !label.is_empty()),
-    )
+            .filter(|label| !label.is_empty())
+            .or_else(|| {
+                engines
+                    .default_model_label
+                    .as_deref()
+                    .filter(|label| !label.is_empty())
+            });
+        return (default_engine, label);
+    }
+    (DEFAULT, None)
 }
 
 /// The engine of the worker's latest execution, when it ran.
@@ -856,8 +882,8 @@ fn worker_engine(facts: &Facts) -> Option<&str> {
 /// engine (besides Claude Code) with another model label than the task's
 /// preset names, so its preset is never credited with a model it did not
 /// run (a resident keeps its one engine and label).
-fn switches_engine(task: &TaskRow, found: Option<&Facts>) -> bool {
-    let (engine, label) = task_engine(task);
+fn switches_engine(task: &TaskRow, found: Option<&Facts>, engines: &Engines) -> bool {
+    let (engine, label) = task_engine(task, engines);
     task.kind == "ephemeral"
         && found.is_some_and(|facts| {
             worker_engine(facts).is_some_and(|worker| {
@@ -875,8 +901,8 @@ fn switches_engine(task: &TaskRow, found: Option<&Facts>) -> bool {
 /// own engine on the label its last execution was launched on (the host's
 /// when that recorded none), checked as a start's is.
 pub(crate) fn delivery_runs(task: &TaskRow, found: Option<&Facts>, engines: &Engines) -> Runs {
-    let (engine, label) = task_engine(task);
-    if switches_engine(task, found) {
+    let (engine, label) = task_engine(task, engines);
+    if switches_engine(task, found, engines) {
         return engines.runs(engine, label);
     }
     match found.and_then(|facts| worker_engine(facts).map(|worker| (facts, worker))) {
@@ -1099,7 +1125,7 @@ fn delivery(
                 let key = format!("switch-model-{}-{}", task.id, task.revisions);
                 return Some(task.command(key, CommandAction::Stop));
             }
-            if switches_engine(task, found) {
+            if switches_engine(task, found, engines) {
                 // An ephemeral worker on another engine: stopped, then
                 // started afresh on the task's, which a later pass does
                 // once it no longer runs (a resume would keep the old one).
@@ -1116,7 +1142,7 @@ fn delivery(
         }
         // Ran before: resume, so a resident keeps its context (and its
         // engine).
-        Some(facts) if facts.execution_id.is_some() && !switches_engine(task, found) => {
+        Some(facts) if facts.execution_id.is_some() && !switches_engine(task, found, engines) => {
             Some(task.delivery(
                 key,
                 CommandAction::Resume {
@@ -3093,6 +3119,21 @@ mod tests {
             assert_eq!(action["engine"], "claude", "{label:?}");
             assert!(action.get("model_label").is_none(), "{label:?}: {action}");
         }
+        // Cluster default (`SPAWN_DEFAULT_ENGINE`) routes unflagged tasks to agy.
+        let mut default_agy = agy_ready(&["gemini-3.8-flash-low"]);
+        default_agy.default_engine = Some("agy".to_string());
+        default_agy.default_model_label = Some("gemini-3.8-flash-low".to_string());
+        let default_task = task(6, TaskState::Assigned, "ephemeral");
+        let plan = orders(
+            &Work {
+                engines: default_agy,
+                ..work(vec![default_task])
+            },
+            &[],
+        );
+        let action = serde_json::to_value(&plan[0].action).expect("serializes");
+        assert_eq!(action["engine"], "agy");
+        assert_eq!(action["model_label"], "gemini-3.8-flash-low");
     }
 
     /// No silent fall back: an engine this host cannot run, or a label its

@@ -75,12 +75,12 @@ fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, O
         std::path::PathBuf::from(&root),
         std::path::PathBuf::from(&config.claude_projects),
     ];
-    roots.extend(
-        config
-            .engines
-            .iter()
-            .map(|(_, home)| std::path::PathBuf::from(&home.sessions)),
-    );
+    for (_, home) in &config.engines {
+        roots.push(std::path::PathBuf::from(&home.sessions));
+        if let Some(data_dir) = &home.data_dir {
+            roots.push(std::path::PathBuf::from(data_dir));
+        }
+    }
     let (archive_mask, stand_in) = spawn_host::archive_mask::CollectorMask::from_env(&roots);
     if let Some(stand_in) = &stand_in {
         eprintln!("{}", stand_in.said());
@@ -143,6 +143,25 @@ fn auto_trust(mode: crate::resolve::Mode) -> bool {
     mode != crate::resolve::Mode::Off
 }
 
+fn parse_bounded_usize(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    var: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize, String> {
+    let Some(raw) = lookup(var).filter(|text| !text.trim().is_empty()) else {
+        return Ok(default);
+    };
+    let trimmed = raw.trim();
+    match trimmed.parse::<usize>() {
+        Ok(value) if (min..=max).contains(&value) => Ok(value),
+        _ => Err(format!(
+            "{var}={trimmed:?} must be a whole number from {min} to {max}"
+        )),
+    }
+}
+
 /// Programs and environment the Bridge puts into every terminal it starts.
 fn bridge_config() -> Result<BridgeConfig, String> {
     let mut config = BridgeConfig::new(&env_or("SPAWN_WORKER", "spawn-worker"));
@@ -150,6 +169,18 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.claude_projects = claude_projects();
     config.engines = engines(env_value)?;
+    config.max_commands_per_tick =
+        parse_bounded_usize(&env_value, "SPAWN_BRIDGE_MAX_COMMANDS", 16, 1, 512)?;
+    config.ready_attempts =
+        parse_bounded_usize(&env_value, "SPAWN_BRIDGE_READY_ATTEMPTS", 40, 1, 240)?;
+    config.max_concurrent_mounts =
+        parse_bounded_usize(&env_value, "SPAWN_MAX_CONCURRENT_MOUNTS", 8, 1, 128)?;
+    config.max_concurrent_checkpoints =
+        parse_bounded_usize(&env_value, "SPAWN_MAX_CONCURRENT_CHECKPOINTS", 8, 1, 128)?;
+    config.backstops_per_pass =
+        parse_bounded_usize(&env_value, "SPAWN_BRIDGE_BACKSTOPS_PER_PASS", 2, 1, 64)?;
+    config.session_scan_limit =
+        parse_bounded_usize(&env_value, "SPAWN_LIST_DIRS_LIMIT", 64, 64, 4096)?;
     // An engine with no deny rules of its own runs only inside the host's
     // filesystem view (decision C2, N6; SPAWN_ENGINE_VIEW).
     let (policy, said) = engine_view(&env_value, &config.engines, |lookup| {
@@ -479,12 +510,30 @@ pub(crate) fn engines(
                 spawn_core::driver::AGY_HOME
             )
         });
+        let data_dir = match lookup("SPAWN_AGY_DATA_DIR") {
+            Some(dir) if !dir.trim().is_empty() => {
+                let trimmed = dir.trim();
+                if !trimmed.starts_with('/') {
+                    return Err(format!(
+                        "SPAWN_AGY_DATA_DIR must be an absolute path, not {dir:?}"
+                    ));
+                }
+                let cleaned = trimmed.trim_end_matches('/');
+                Some(if cleaned.is_empty() {
+                    trimmed.to_string()
+                } else {
+                    cleaned.to_string()
+                })
+            }
+            _ => None,
+        };
         engines.push((
             name.to_string(),
             spawn_core::driver::EngineHome {
                 program: lookup("SPAWN_AGY_PROGRAM").unwrap_or_else(|| "agy".to_string()),
                 sessions: home,
                 model: lookup("SPAWN_AGY_MODEL"),
+                data_dir,
             },
         ));
     }
@@ -1024,7 +1073,36 @@ mod tests {
         assert_eq!(named[0].1.sessions, "/srv/agy");
         assert_eq!(named[0].1.program, "/opt/agy/bin/agy");
         assert_eq!(named[0].1.model.as_deref(), Some("gemini-3.8-flash-low"));
+        assert_eq!(named[0].1.data_dir, None);
+        let with_data = engines(lookup(&[
+            ("SPAWN_ENGINES", "agy"),
+            ("SPAWN_AGY_DATA_DIR", " /data01/agy-data/ "),
+        ]))
+        .expect("agy data dir");
+        assert_eq!(with_data[0].1.data_dir.as_deref(), Some("/data01/agy-data"));
+        assert!(
+            engines(lookup(&[
+                ("SPAWN_ENGINES", "agy"),
+                ("SPAWN_AGY_DATA_DIR", "relative/dir"),
+            ]))
+            .is_err()
+        );
         let refused = engines(lookup(&[("SPAWN_ENGINES", "claude,codex")])).expect_err("codex");
         assert!(refused.contains("codex"), "{refused}");
+    }
+
+    #[test]
+    fn parse_bounded_usize_handles_defaults_and_bounds() {
+        use super::parse_bounded_usize;
+        let none = |_: &str| None;
+        assert_eq!(parse_bounded_usize(&none, "V", 8, 1, 128), Ok(8));
+        let empty = |_: &str| Some("  ".to_string());
+        assert_eq!(parse_bounded_usize(&empty, "V", 8, 1, 128), Ok(8));
+        let valid = |_: &str| Some(" 32 ".to_string());
+        assert_eq!(parse_bounded_usize(&valid, "V", 8, 1, 128), Ok(32));
+        let zero = |_: &str| Some("0".to_string());
+        assert!(parse_bounded_usize(&zero, "V", 8, 1, 128).is_err());
+        let high = |_: &str| Some("129".to_string());
+        assert!(parse_bounded_usize(&high, "V", 8, 1, 128).is_err());
     }
 }

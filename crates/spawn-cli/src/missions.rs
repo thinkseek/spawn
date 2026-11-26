@@ -41,7 +41,7 @@ pub(crate) const USAGE: &str = "usage:
                 mission without objectives)
                 (--features: the mission's feature map, a JSON file of capabilities and
                 their provenance sources; identities and links only, never a status)
-                (--workers: objective tasks in flight at once, 1 to 16, default 1: the
+                (--workers: objective tasks in flight at once, 1 to 128, default 1: the
                 resident takes one, per-task workers the rest)
                 (--daily-usd: what the mission's model calls may cost in a UTC day; the
                 loop raises one cost_budget alert the day it is reached)
@@ -119,12 +119,14 @@ pub(crate) const USAGE: &str = "usage:
       diagnostics, and shell-quoted read-only checks. Prints JSON and creates nothing)
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
-                    [--model default|cheap] [--again] [--pin]   (cheap: every model on DeepSeek)
+                    [--model default|cheap] [--engine <claude|agy>] [--model-label <label>] [--again] [--pin]
                     [--difficulty l1|l2|l3] [--preset <preset_id>]
       (the supervisor's brief that a task of the mission in flight already has, trimmed of
        space, tab, CR and LF, is refused, naming that task; --again assigns it on purpose.
        Every duplicate assigned names the task it repeats in its record: duplicate_of.
        --pin keeps the task with its worker: it is never stolen.
+       --engine selects an enabled engine directly (bypassing grading catalog routing);
+       --model-label sets that engine's launch model label (e.g. gemini-3.8-flash-low for agy).
        Agent grading (docs/agent-grading.md): --difficulty or --preset routes the task
        through the grading catalog (spawn grade): to --preset, or to the cheapest routable
        preset graded for the difficulty (l2 unless given), on that preset's --model profile;
@@ -633,6 +635,36 @@ fn model(flags: &Flags) -> Result<ModelProfile, String> {
         .ok_or_else(|| format!("--model is default or cheap, not {text}\n{USAGE}"))
 }
 
+fn direct_engine(flags: &Flags) -> Result<Option<String>, String> {
+    let Some(raw) = flags.get("engine") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    let known = spawn_core::driver::driver(trimmed).ok_or_else(|| {
+        format!("--engine must be a registered engine (claude, agy), not {raw:?}")
+    })?;
+    Ok(Some(known.id().to_string()))
+}
+
+fn direct_model_label(flags: &Flags, engine: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = flags.get("model-label") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || !spawn_core::command::is_model_label(trimmed) {
+        return Err(format!(
+            "--model-label {raw:?} is not a valid engine model label"
+        ));
+    }
+    if engine == Some(spawn_core::driver::DEFAULT) {
+        return Err("claude uses --model default|cheap and takes no --model-label".to_string());
+    }
+    if engine.is_none() {
+        return Err("--model-label requires --engine (e.g. --engine agy)".to_string());
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 /// How `spawn task assign` places a task (docs/agent-grading.md,
 /// "Assigning").
 enum Placement {
@@ -654,6 +686,39 @@ pub(crate) fn assign(
     flags: &Flags,
 ) -> Result<Value, String> {
     let err = |error: spawn_core::port::StoreError| error.to_string();
+    let direct_engine = direct_engine(flags)?;
+    let direct_label = direct_model_label(flags, direct_engine.as_deref())?;
+    if direct_engine.is_some() || direct_label.is_some() {
+        if flags.get("difficulty").is_some() || flags.get("preset").is_some() {
+            return Err(
+                "--engine / --model-label bypasses the grading catalog: do not combine with \
+                 --difficulty or --preset"
+                    .to_string(),
+            );
+        }
+        let model = model(flags)?;
+        let task = store
+            .task_assign_direct(
+                id(flags, "mission")?,
+                &text(flags, "kind")?,
+                &flags.get("worker").unwrap_or_default(),
+                &text(flags, "brief")?,
+                model.as_str(),
+                flags.switch("again"),
+                flags.switch("pin"),
+                direct_engine.as_deref(),
+                direct_label.as_deref(),
+            )
+            .map_err(err)?;
+        let mut answer = json!({ "task": task, "model": model.as_str() });
+        if let Some(engine) = direct_engine {
+            answer["engine"] = json!(engine);
+        }
+        if let Some(label) = direct_label {
+            answer["model_label"] = json!(label);
+        }
+        return Ok(answer);
+    }
     let (decision, classified) = match placement(store, flags)? {
         Placement::Routed(decision, classified) => (decision, classified),
         Placement::Model { fallback } => {

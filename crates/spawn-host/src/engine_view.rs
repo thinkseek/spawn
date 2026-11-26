@@ -92,6 +92,44 @@ const CHECK_LIMIT: Duration = Duration::from_secs(10);
 /// The directory below the engine's home that is its `TMPDIR` in the view.
 pub const TMP_FALLBACK: &str = ".spawn-tmp";
 
+/// Shared `agy` subdirectory under `SPAWN_AGY_DATA_DIR`: conversation
+/// transcript folders (`brain/<conversation>/.system_generated/logs/...`),
+/// separated by unique conversation UUIDs so Spawn's host reader scans one
+/// `<data_dir>/brain` root.
+const AGY_SHARED_SUBDIRS: [&str; 1] = ["brain"];
+
+/// Per-worker isolated `agy` subdirectories created inside
+/// `<SPAWN_AGY_DATA_DIR>/workers/<ws_key>/home/` so per-worker SQLite stores
+/// (`conversation_summaries.db`), logs, caches, presence, and conversations
+/// never contend across concurrent workers.
+const AGY_ISOLATED_SUBDIRS: [&str; 8] = [
+    "cache",
+    "conversations",
+    "log",
+    "implicit",
+    "crashes",
+    "presence",
+    "annotations",
+    "updater",
+];
+
+/// Small non-secret `agy` state/config files copied once from `engine_home`
+/// into an isolated worker home when present on host and missing in the worker.
+const AGY_SEED_FILES: [&str; 4] = [
+    "installation_id",
+    "jetski_state.pbtxt",
+    "settings.json",
+    "cache/onboarding.json",
+];
+
+/// Read-only shared static subdirectories mounted from `engine_home` into each
+/// isolated worker home when present on host.
+const AGY_RO_DIRS: [&str; 2] = ["bin", "builtin"];
+
+/// Read-only shared credential files mounted from `engine_home` into each
+/// isolated worker home without copying secret bytes into `SPAWN_AGY_DATA_DIR`.
+const AGY_RO_FILES: [&str; 1] = ["antigravity-oauth-token"];
+
 /// The engines' homes masked below the user's home: the only masked
 /// directories an engine's own home may lie below (re-bound writable into
 /// the mask's tmpfs, `~/.gemini/antigravity-cli`), never equal to.
@@ -151,6 +189,14 @@ pub struct ViewConfig {
     /// empty file a regular file is masked by is kept. No writable bind
     /// may reach it.
     pub private_dir: PathBuf,
+    /// Additional host directories explicitly bound writable inside the view
+    /// (`SPAWN_ENGINE_VIEW_WRITABLE`, comma- or colon-separated). Must lie
+    /// outside `$HOME` and never overlap any mask or `private_dir`.
+    pub extra_writable: Vec<PathBuf>,
+    /// Optional off-home runtime/transcript directory (`SPAWN_AGY_DATA_DIR`),
+    /// sharing `brain/` while isolating volatile subdirs & `TMPDIR` per
+    /// worker workspace.
+    pub agy_data_dir: Option<PathBuf>,
 }
 
 impl ViewConfig {
@@ -166,6 +212,17 @@ impl ViewConfig {
             .filter(|dir| dir.starts_with('/'))
             .map_or_else(|| PathBuf::from(format!("/run/user/{uid}")), PathBuf::from);
         let private_dir = runtime_dir.join(format!("spawn-engine-view-{uid}"));
+        let extra_writable = lookup("SPAWN_ENGINE_VIEW_WRITABLE")
+            .unwrap_or_default()
+            .split([',', ':'])
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        let agy_data_dir = lookup("SPAWN_AGY_DATA_DIR")
+            .map(|dir| dir.trim().to_string())
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from);
         Self {
             xdg_config_home: lookup("XDG_CONFIG_HOME")
                 .filter(|dir| dir.starts_with('/'))
@@ -177,6 +234,8 @@ impl ViewConfig {
                 .filter(|dir| dir.starts_with('/'))
                 .map(PathBuf::from),
             private_dir,
+            extra_writable,
+            agy_data_dir,
             runtime_dir,
             home,
         }
@@ -451,6 +510,8 @@ impl BwrapView {
         &self,
         workspace: &Path,
         engine_home: &Path,
+        extra_writable: &[PathBuf],
+        agy_data_dir: Option<&Path>,
         private: &Path,
         masked: &[&PathBuf],
     ) -> Result<(), String> {
@@ -512,6 +573,36 @@ impl BwrapView {
                 target.display()
             ));
         }
+        let refuse_extra = |bound: &Path, what: &str| -> Result<(), String> {
+            if bound == Path::new("/") || home.starts_with(bound) || bound.starts_with(&home) {
+                return Err(format!(
+                    "{what} {} lies in or holds the user's home {}",
+                    bound.display(),
+                    home.display()
+                ));
+            }
+            if reaches_private(bound) {
+                return Err(format!(
+                    "{what} {} overlaps the view's private directory {}",
+                    bound.display(),
+                    private.display()
+                ));
+            }
+            if let Some(target) = overlap(bound) {
+                return Err(format!(
+                    "{what} {} overlaps {}, which the view masks",
+                    bound.display(),
+                    target.display()
+                ));
+            }
+            Ok(())
+        };
+        for extra in extra_writable {
+            refuse_extra(extra, "the extra writable directory")?;
+        }
+        if let Some(data_dir) = agy_data_dir {
+            refuse_extra(data_dir, "the agy data directory")?;
+        }
         Ok(())
     }
 
@@ -524,16 +615,45 @@ impl BwrapView {
         let private = self.private_dir()?;
         let (all_directories, all_files, skipped) = self.targets();
         let masked: Vec<&PathBuf> = all_directories.iter().chain(all_files.iter()).collect();
+        let extra_writable: Vec<PathBuf> = self
+            .config
+            .extra_writable
+            .iter()
+            .map(|dir| canonical_directory(dir, "the extra writable directory"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let agy_data_dir = if launch.engine == "agy" {
+            self.config
+                .agy_data_dir
+                .as_deref()
+                .map(|dir| canonical_directory(dir, "the agy data directory"))
+                .transpose()?
+        } else {
+            None
+        };
         // The engine's home is checked where it would resolve before
         // anything is made on disk: a refused one is never created.
         let wanted = Path::new(launch.engine_home);
         let prospective = prospective_canonical(wanted)
             .map_err(|why| format!("the engine's home {}: {why}", wanted.display()))?;
-        self.refuse_binds(&workspace, &prospective, &private, &masked)?;
+        self.refuse_binds(
+            &workspace,
+            &prospective,
+            &extra_writable,
+            agy_data_dir.as_deref(),
+            &private,
+            &masked,
+        )?;
         let engine_home = make_engine_home(wanted, &prospective)?;
         // Made: checked again where it does resolve.
-        self.refuse_binds(&workspace, &engine_home, &private, &masked)?;
-        let tmpdir = engine_tmpdir(&engine_home)?;
+        self.refuse_binds(
+            &workspace,
+            &engine_home,
+            &extra_writable,
+            agy_data_dir.as_deref(),
+            &private,
+            &masked,
+        )?;
+        let agy = prepare_agy_data(&engine_home, &workspace, agy_data_dir.as_deref())?;
         let (directories, files) = prune_nested(&all_directories, &all_files);
 
         let mut words = vec![
@@ -564,21 +684,33 @@ impl BwrapView {
         // that bind: bound again, its path would be resolved anew when
         // `bwrap` runs, after a writer outside the view could swap it.
         let mut bound: Vec<&Path> = Vec::new();
-        for path in [workspace.as_path(), engine_home.as_path(), tmpdir.as_path()] {
+        for path in [workspace.as_path()]
+            .into_iter()
+            .chain((!agy.replace_engine_home).then_some(engine_home.as_path()))
+            .chain([agy.tmpdir.as_path()])
+            .chain(extra_writable.iter().map(PathBuf::as_path))
+        {
             if bound.iter().any(|done| path.starts_with(done)) {
                 continue;
             }
             bound.push(path);
             words.extend(["--bind".to_string(), path_word(path), path_word(path)]);
         }
+        for (src, dst) in &agy.writable_binds {
+            words.extend(["--bind".to_string(), path_word(src), path_word(dst)]);
+        }
+        for (src, dst) in &agy.readonly_binds {
+            words.extend(["--ro-bind".to_string(), path_word(src), path_word(dst)]);
+        }
         words.extend([
             "--setenv".to_string(),
             "TMPDIR".to_string(),
-            path_word(&tmpdir),
+            path_word(&agy.tmpdir),
             "--chdir".to_string(),
             path_word(&workspace),
             "--".to_string(),
         ]);
+        let tmpdir = agy.tmpdir;
         Ok(Plan {
             words,
             masks,
@@ -586,6 +718,109 @@ impl BwrapView {
             skipped,
         })
     }
+}
+
+struct AgyIsolation {
+    tmpdir: PathBuf,
+    replace_engine_home: bool,
+    writable_binds: Vec<(PathBuf, PathBuf)>,
+    readonly_binds: Vec<(PathBuf, PathBuf)>,
+}
+
+fn copy_seed_file(src: &Path, dst: &Path) -> Result<(), String> {
+    if dst.exists() || !std::fs::metadata(src).is_ok_and(|meta| meta.is_file()) {
+        return Ok(());
+    }
+    let bytes = std::fs::read(src).map_err(|error| format!("read {}: {error}", src.display()))?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dst)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(&bytes)
+                .map_err(|error| format!("write {}: {error}", dst.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(format!("create {}: {error}", dst.display())),
+    }
+}
+
+fn ensure_empty_mount_file(path: &Path) -> Result<(), String> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(format!("create {}: {error}", path.display())),
+    }
+}
+
+fn prepare_agy_data(
+    engine_home: &Path,
+    workspace: &Path,
+    agy_data_dir: Option<&Path>,
+) -> Result<AgyIsolation, String> {
+    let Some(data_dir) = agy_data_dir else {
+        return Ok(AgyIsolation {
+            tmpdir: engine_tmpdir(engine_home)?,
+            replace_engine_home: false,
+            writable_binds: Vec::new(),
+            readonly_binds: Vec::new(),
+        });
+    };
+    let pool_root = ensure_sub_dir(data_dir, "workers")?;
+    let worker_key = worker_dir_key(workspace);
+    let isolated = ensure_sub_dir(&pool_root, &worker_key)?;
+    let isolated_home = ensure_sub_dir(&isolated, "home")?;
+    let data_tmp = ensure_sub_dir(&isolated, "tmp")?;
+
+    let mut writable_binds = Vec::with_capacity(1 + AGY_SHARED_SUBDIRS.len());
+    writable_binds.push((isolated_home.clone(), engine_home.to_path_buf()));
+
+    for sub in AGY_SHARED_SUBDIRS {
+        let src = ensure_sub_dir(data_dir, sub)?;
+        let _mountpoint = ensure_sub_dir(&isolated_home, sub)?;
+        writable_binds.push((src, engine_home.join(sub)));
+    }
+    for sub in AGY_ISOLATED_SUBDIRS {
+        let _dir = ensure_sub_dir(&isolated_home, sub)?;
+    }
+    for rel in AGY_SEED_FILES {
+        copy_seed_file(&engine_home.join(rel), &isolated_home.join(rel))?;
+    }
+
+    let mut readonly_binds = Vec::new();
+    for dir in AGY_RO_DIRS {
+        let host_dir = engine_home.join(dir);
+        if std::fs::metadata(&host_dir).is_ok_and(|meta| meta.is_dir()) {
+            let _mountpoint = ensure_sub_dir(&isolated_home, dir)?;
+            let src = std::fs::canonicalize(&host_dir)
+                .map_err(|error| format!("{}: {error}", host_dir.display()))?;
+            readonly_binds.push((src, host_dir));
+        }
+    }
+    for file in AGY_RO_FILES {
+        let host_file = engine_home.join(file);
+        if std::fs::metadata(&host_file).is_ok_and(|meta| meta.is_file()) {
+            ensure_empty_mount_file(&isolated_home.join(file))?;
+            let src = std::fs::canonicalize(&host_file)
+                .map_err(|error| format!("{}: {error}", host_file.display()))?;
+            readonly_binds.push((src, host_file));
+        }
+    }
+
+    Ok(AgyIsolation {
+        tmpdir: data_tmp,
+        replace_engine_home: true,
+        writable_binds,
+        readonly_binds,
+    })
 }
 
 impl EngineView for BwrapView {
@@ -621,7 +856,13 @@ impl EngineView for BwrapView {
 /// when missing, and still below that home once resolved (a link out of
 /// it is refused). Never the loop's shared `TMPDIR`.
 fn engine_tmpdir(engine_home: &Path) -> Result<PathBuf, String> {
-    let dir = engine_home.join(TMP_FALLBACK);
+    ensure_sub_dir(engine_home, TMP_FALLBACK)
+}
+
+/// Create `parent/name` (mode `0700`) if missing, canonicalize it, and verify
+/// it remains strictly inside `parent` so symlinks cannot escape.
+fn ensure_sub_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    let dir = parent.join(name);
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -629,15 +870,42 @@ fn engine_tmpdir(engine_home: &Path) -> Result<PathBuf, String> {
     }
     let canonical =
         std::fs::canonicalize(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-    if canonical.is_dir() && canonical.starts_with(engine_home) && canonical != engine_home {
+    if canonical.is_dir() && canonical.starts_with(parent) && canonical != parent {
         Ok(canonical)
     } else {
         Err(format!(
-            "the engine's TMPDIR {} leaves its home {}",
+            "{} resolves outside its parent {}",
             dir.display(),
-            engine_home.display()
+            parent.display()
         ))
     }
+}
+
+/// Deterministic worker isolation directory key derived from `workspace`:
+/// sanitized basename + 64-bit FNV-1a hash of the canonical workspace path.
+fn worker_dir_key(workspace: &Path) -> String {
+    let raw_name = workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("ws");
+    let prefix: String = raw_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(32)
+        .collect();
+    let prefix = if prefix.is_empty() { "ws" } else { &prefix };
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in workspace.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3_u64);
+    }
+    format!("{prefix}-{hash:016x}")
 }
 
 /// The masks the words carry: `directories` and `files` less every one
@@ -802,6 +1070,8 @@ mod tests {
             extra_files: Vec::new(),
             host_tmpdir: None,
             private_dir: runtime.join("spawn-engine-view-test"),
+            extra_writable: Vec::new(),
+            agy_data_dir: None,
         };
         let view = BwrapView {
             program: PathBuf::from("/usr/bin/bwrap"),
@@ -964,5 +1234,121 @@ mod tests {
             PathBuf::from(format!("/run/user/{}", crate::current_uid()))
         );
         assert_eq!(config.xdg_config_home, None);
+    }
+
+    #[test]
+    fn extra_writable_parses_comma_and_colon_and_refuses_home_or_masked() {
+        let parsed = ViewConfig::from_env(&lookup(&[
+            ("HOME", "/home/u"),
+            ("SPAWN_ENGINE_VIEW_WRITABLE", " /data01/deps , :/opt/cache "),
+            ("SPAWN_AGY_DATA_DIR", " /data01/agy-data "),
+        ]));
+        assert_eq!(
+            parsed.extra_writable,
+            vec![PathBuf::from("/data01/deps"), PathBuf::from("/opt/cache")]
+        );
+        assert_eq!(parsed.agy_data_dir, Some(PathBuf::from("/data01/agy-data")));
+
+        let scratch = crate::Scratch::new("spawn-view-extra");
+        let (mut view, workspace, engine_home) = view_in(&scratch);
+        let staging = scratch.join("shared-deps");
+        std::fs::create_dir_all(&staging).expect("staging");
+        view.config.extra_writable = vec![staging.clone()];
+        let planned = plan(&view, &workspace, &engine_home).expect("outside home allowed");
+        assert!(
+            planned
+                .words
+                .windows(3)
+                .any(|w| { w[0] == "--bind" && w[1] == staging.to_string_lossy() && w[2] == w[1] })
+        );
+
+        let bad_in_home = view.config.home.join(".ssh");
+        std::fs::create_dir_all(&bad_in_home).expect("ssh");
+        view.config.extra_writable = vec![bad_in_home];
+        assert!(plan(&view, &workspace, &engine_home).is_err());
+    }
+
+    #[test]
+    fn agy_data_dir_shares_brain_and_isolates_per_worker_dirs() {
+        let scratch = crate::Scratch::new("spawn-view-agy-iso");
+        let (mut view, ws1, engine_home) = view_in(&scratch);
+        let host_home = PathBuf::from(&engine_home);
+        for dir in ["cache", "bin", "builtin"] {
+            std::fs::create_dir_all(host_home.join(dir)).expect("host dir");
+        }
+        let seeds = [
+            ("cache/onboarding.json", r#"{"onboardingComplete":true}"#),
+            ("settings.json", r#"{"trustedWorkspaces":[]}"#),
+            ("jetski_state.pbtxt", "installation_uuid: \"x\"\n"),
+            ("installation_id", "id-123"),
+        ];
+        for (rel, body) in seeds {
+            std::fs::write(host_home.join(rel), body).expect("seed");
+        }
+        std::fs::write(
+            host_home.join("antigravity-oauth-token"),
+            "top-secret-token",
+        )
+        .expect("oauth");
+
+        let ws2 = scratch.join("ws-two");
+        std::fs::create_dir_all(&ws2).expect("ws2");
+        let data_dir = scratch.join("agy-data");
+        std::fs::create_dir_all(&data_dir).expect("data_dir");
+        view.config.agy_data_dir = Some(data_dir.clone());
+
+        let plan1 = plan(&view, &ws1, &engine_home).expect("plan ws1");
+        let plan2 = plan(&view, &ws2, &engine_home).expect("plan ws2");
+        assert_ne!(plan1.tmpdir, plan2.tmpdir);
+        assert!(plan1.tmpdir.starts_with(&data_dir));
+        assert!(plan2.tmpdir.starts_with(&data_dir));
+
+        let bind_of = |words: &[String], flag: &str, dst: &Path| -> Option<String> {
+            let dst_str = dst.to_string_lossy();
+            words
+                .windows(3)
+                .filter(|w| w[0] == flag && w[2] == dst_str)
+                .map(|w| w[1].clone())
+                .next_back()
+        };
+        let home1 = bind_of(&plan1.words, "--bind", &host_home).expect("isolated home1");
+        let home2 = bind_of(&plan2.words, "--bind", &host_home).expect("isolated home2");
+        assert_ne!(home1, home2);
+        assert!(home1.contains("/workers/") && home1.ends_with("/home"));
+        assert!(home2.contains("/workers/") && home2.ends_with("/home"));
+
+        let shared_brain = data_dir.join("brain").to_string_lossy().into_owned();
+        assert_eq!(
+            bind_of(&plan1.words, "--bind", &host_home.join("brain")),
+            Some(shared_brain.clone())
+        );
+        assert_eq!(
+            bind_of(&plan2.words, "--bind", &host_home.join("brain")),
+            Some(shared_brain)
+        );
+
+        let home1_path = PathBuf::from(&home1);
+        for (rel, body) in seeds {
+            assert_eq!(
+                std::fs::read_to_string(home1_path.join(rel)).expect("seeded"),
+                body
+            );
+        }
+        assert_eq!(
+            std::fs::read(home1_path.join("antigravity-oauth-token")).expect("empty mountpoint"),
+            Vec::<u8>::new()
+        );
+        for rel in ["antigravity-oauth-token", "bin", "builtin"] {
+            let target = host_home.join(rel);
+            assert_eq!(
+                bind_of(&plan1.words, "--ro-bind", &target),
+                Some(
+                    std::fs::canonicalize(&target)
+                        .expect("canon")
+                        .to_string_lossy()
+                        .into_owned()
+                )
+            );
+        }
     }
 }

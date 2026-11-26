@@ -147,6 +147,8 @@ impl Fixture {
             extra_files: Vec::new(),
             host_tmpdir: Some(self.host_tmp()),
             private_dir: self.private(),
+            extra_writable: Vec::new(),
+            agy_data_dir: None,
         }
     }
 
@@ -619,13 +621,18 @@ const STUB_CLAUDE: &str = "#!/bin/sh\nprintf '> \\r\\n'\nwhile IFS= read -r line
 
 /// The installed `herdr`, if any answers `--version`.
 fn herdr_program() -> Option<String> {
+    let from_env = std::env::var_os("SPAWN_HERDR_PROGRAM")
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.trim().is_empty());
     let home = std::env::var_os("HOME").map(|home| {
         Path::new(&home)
             .join(".local/bin/herdr")
             .display()
             .to_string()
     });
-    home.into_iter()
+    from_env
+        .into_iter()
+        .chain(home)
         .chain(["herdr".to_string()])
         .find(|program| {
             Command::new(program)
