@@ -1054,12 +1054,34 @@ pub(crate) fn step(
         });
     }
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
-    for mut order in plan.orders {
+    persist_accepted_worker_commits(store, root, &work, &mut lines);
+    run_orders(store, &principal, root, &work, plan.orders, &mut lines)?;
+    // A `recovered` disk record stops being a digest item after its day
+    // without a record of its own: that moment is a time this step waits for.
+    let at = now_ms();
+    let due_ms = match disk.due_in(at) {
+        Some(left) if left > 0 => Some(due_ms.map_or(at.saturating_add(left), |due| {
+            due.min(at.saturating_add(left))
+        })),
+        _ => due_ms,
+    };
+    Ok((lines, due_ms))
+}
+
+fn run_orders(
+    store: &std::sync::Arc<PostgresStore>,
+    principal: &Principal,
+    root: Option<&Path>,
+    work: &Work,
+    orders: Vec<Order>,
+    lines: &mut Vec<String>,
+) -> Result<(), String> {
+    for mut order in orders {
         // A cancelled task's work is set aside before its resident is told
         // ([`crate::set_aside`]); a set-aside that fails holds the notice,
         // and so the resident's next task, until a later pass.
         if let Some(task) = deliver::notice_task(&order.key) {
-            match set_aside_before(store, root, &work, task, &mut order) {
+            match set_aside_before(store, root, work, task, &mut order) {
                 Ok(line) => lines.extend(line),
                 Err(error) => {
                     lines.push(format!("deliver: {error}"));
@@ -1102,19 +1124,56 @@ pub(crate) fn step(
         {
             lines.push(format!("deliver: {error}"));
         }
-        submit(store, &principal, order)?;
+        submit(store, principal, order)?;
         lines.push(line);
     }
-    // A `recovered` disk record stops being a digest item after its day
-    // without a record of its own: that moment is a time this step waits for.
-    let at = now_ms();
-    let due_ms = match disk.due_in(at) {
-        Some(left) if left > 0 => Some(due_ms.map_or(at.saturating_add(left), |due| {
-            due.min(at.saturating_add(left))
-        })),
-        _ => due_ms,
+    Ok(())
+}
+
+fn persist_accepted_worker_commits(
+    store: &PostgresStore,
+    root: Option<&Path>,
+    work: &Work,
+    lines: &mut Vec<String>,
+) {
+    let Some(root) = root else {
+        return;
     };
-    Ok((lines, due_ms))
+    let default_repo = crate::config::env_value("SPAWN_GIT_REPO").map(std::path::PathBuf::from);
+    for task in work
+        .tasks
+        .iter()
+        .filter(|task| task.state == spawn_core::mission::TaskState::Accepted)
+    {
+        if crate::sources::task_worker_head_pinned(
+            store,
+            default_repo.as_deref(),
+            root,
+            &task.agent_id,
+            task.id,
+            "accepted",
+        ) {
+            continue;
+        }
+        match crate::sources::persist_task_worker_commits(
+            store,
+            default_repo.as_deref(),
+            root,
+            &task.agent_id,
+            task.id,
+            "accepted",
+        ) {
+            Ok(Some(sha)) => lines.push(format!(
+                "dispatch: task #{} preserved accepted worker HEAD {sha}",
+                task.id
+            )),
+            Ok(None) => {}
+            Err(error) => lines.push(format!(
+                "dispatch: task #{} worker HEAD preserve: {error}",
+                task.id
+            )),
+        }
+    }
 }
 
 /// Set aside the work of the cancelled task `task` before `order`, its

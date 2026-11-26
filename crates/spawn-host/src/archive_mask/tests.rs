@@ -332,7 +332,7 @@ fn fake_home(world: &World) -> Home {
 fn refused_with(mask: &CollectorMask) -> Option<String> {
     match &mask.tool {
         Tool::Refused(why) => Some(why.clone()),
-        Tool::Run(_) => None,
+        Tool::Run(_) | Tool::Collector(_) => None,
     }
 }
 
@@ -439,4 +439,121 @@ fn the_live_loop_s_roots_refuse_a_stand_in() {
         );
         assert_eq!(stand_in.is_some(), home.tmpfs, "{}", root.display());
     }
+}
+
+/// Issue #102: when no stand-in is given, resolution prefers installed
+/// `emit-locations.py`, then installed `secret-values.py` (`Collector`), then
+/// `exe_dir`'s copies, falling back to `INSTALLED_TOOL`. Both `Collector` and
+/// `preflight` work cleanly without printing values or needing `__pycache__`.
+#[test]
+fn configured_with_dirs_prefers_emitter_then_collector_then_exe_dir() {
+    let world = World::new("mask-resolve");
+    let home = fake_home(&world);
+    let roots = [world.path("ws"), world.path("projects")];
+    let installed = world.path("installed");
+    let exe = world.path("exe");
+    std::fs::create_dir_all(&installed).expect("installed dir");
+    std::fs::create_dir_all(&exe).expect("exe dir");
+
+    // 1. Neither directory has any script: falls back to installed/emit-locations.py
+    let (mask, stand_in) =
+        CollectorMask::configured_with_dirs(None, None, &roots, &home, &installed, Some(&exe));
+    assert_eq!(stand_in, None);
+    assert_eq!(mask.tool, Tool::Run(installed.join("emit-locations.py")));
+    assert!(
+        mask.preflight()
+            .unwrap_err()
+            .contains("missing or not a regular file")
+    );
+
+    // 2. Exe dir has secret-values.py only: selects Tool::Collector from exe_dir
+    let exe_collector = exe.join("secret-values.py");
+    std::fs::write(
+        &exe_collector,
+        "def locate(home, root='/'):\n    return {}\n",
+    )
+    .expect("exe collector");
+    let (mask, _) =
+        CollectorMask::configured_with_dirs(None, None, &roots, &home, &installed, Some(&exe));
+    assert_eq!(mask.tool, Tool::Collector(exe_collector.clone()));
+    mask.preflight().expect("exe collector preflight passes");
+
+    // 3. Exe dir gains emit-locations.py: prefers emit-locations.py over secret-values.py
+    let exe_emitter = exe.join("emit-locations.py");
+    std::fs::write(&exe_emitter, "print('{}')\n").expect("exe emitter");
+    let (mask, _) =
+        CollectorMask::configured_with_dirs(None, None, &roots, &home, &installed, Some(&exe));
+    assert_eq!(mask.tool, Tool::Run(exe_emitter));
+
+    // 4. Installed dir has secret-values.py: wins over exe dir
+    let inst_collector = installed.join("secret-values.py");
+    std::fs::write(
+        &inst_collector,
+        "def locate(home, root='/'):\n    return {}\n",
+    )
+    .expect("inst collector");
+    let (mask, _) =
+        CollectorMask::configured_with_dirs(None, None, &roots, &home, &installed, Some(&exe));
+    assert_eq!(mask.tool, Tool::Collector(inst_collector));
+
+    // 5. Installed dir gains emit-locations.py: highest priority
+    let inst_emitter = installed.join("emit-locations.py");
+    std::fs::write(&inst_emitter, "print('{}')\n").expect("inst emitter");
+    let (mask, _) =
+        CollectorMask::configured_with_dirs(None, None, &roots, &home, &installed, Some(&exe));
+    assert_eq!(mask.tool, Tool::Run(inst_emitter));
+}
+
+#[test]
+fn with_collector_invokes_secret_values_locate_and_masks_values() {
+    let world = World::new("mask-collector");
+    let cred = world.path("cred.env");
+    std::fs::write(&cred, format!("API_TOKEN={TOKEN}\n")).expect("cred");
+    let collector = world.path("secret-values.py");
+    let cred_json = serde_json::to_string(&cred.display().to_string()).expect("path json");
+    let script = format!(
+        r#"import os
+def locate(home, root="/"):
+    path = {cred_json}
+    with open(path, "rb") as f:
+        st = os.fstat(f.fileno())
+        f.read()
+    return {{
+        "sources": [{{"path": path, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+                      "dev": st.st_dev, "ino": st.st_ino, "ctime_ns": st.st_ctime_ns}}],
+        "entries": [{{"path": path, "line": 0, "ptr": None, "t": "raw",
+                      "span": [10, {end}], "name": "cred.env:API_TOKEN"}}],
+        "missing": [],
+        "unreadable": [],
+        "accepted": [],
+        "accepted_paths": [],
+        "watch": [],
+        "probe": [],
+    }}
+"#,
+        end = 10 + TOKEN.len(),
+    );
+    std::fs::write(&collector, script).expect("collector module");
+    let source = CollectorMask::with_collector(collector);
+    source.preflight().expect("collector preflight");
+    let out = masked(&source, &format!("header {TOKEN} footer"));
+    assert!(out.contains("[REDACTED:cred.env:API_TOKEN]"), "{out}");
+    assert!(!out.contains(TOKEN), "{out}");
+}
+
+#[test]
+fn preflight_detects_syntax_errors_and_refused_stand_in() {
+    let world = World::new("mask-preflight-err");
+    let bad = world.path("broken.py");
+    std::fs::write(&bad, "def broken(:\n").expect("broken script");
+    let bad_mask = CollectorMask::with_tool(bad);
+    assert!(bad_mask.preflight().unwrap_err().contains("syntax check"));
+
+    let (refused, _) = CollectorMask::configured(
+        Some(world.tool()),
+        Some("0"),
+        &[world.path("ws")],
+        &fake_home(&world),
+    );
+    assert_eq!(refused.preflight().unwrap_err(), SANDBOX_ONLY);
 }

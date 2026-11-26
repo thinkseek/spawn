@@ -62,6 +62,20 @@ pub(crate) fn pushed_ref(branch: &str) -> String {
 /// Push one branch's head from a mirror to its source, without force.
 pub(crate) fn push_branch(mirror: &Path, source: &str, branch: &str) -> Pushed {
     let refspec = format!("refs/heads/{branch}:{}", pushed_ref(branch));
+    push_refspec(mirror, source, &refspec)
+}
+
+/// Force-push a dedicated `refs/spawn/*` reference from `mirror` to `source`.
+/// Refuses any target outside `refs/spawn/` so `refs/heads/*` is never overwritten.
+pub(crate) fn push_ref(mirror: &Path, source: &str, local_ref: &str, remote_ref: &str) -> Pushed {
+    if !remote_ref.starts_with("refs/spawn/") {
+        return Pushed::Rejected(format!("refusing to push non-spawn ref {remote_ref}"));
+    }
+    let refspec = format!("+{local_ref}:{remote_ref}");
+    push_refspec(mirror, source, &refspec)
+}
+
+fn push_refspec(mirror: &Path, source: &str, refspec: &str) -> Pushed {
     // Not a source git may be given: no push can ever succeed, so it is not
     // retried.
     if let Err(error) = crate::sources::MissionSource::parse(source) {
@@ -70,7 +84,7 @@ pub(crate) fn push_branch(mirror: &Path, source: &str, branch: &str) -> Pushed {
     let output = crate::sources::controller_git()
         .arg("--git-dir")
         .arg(mirror)
-        .args(["push", "--porcelain", "--", source, &refspec])
+        .args(["push", "--porcelain", "--", source, refspec])
         .output();
     let output = match output {
         Ok(output) => output,
@@ -678,5 +692,17 @@ mod tests {
         assert!(others.iter().all(|other| Arc::ptr_eq(&first, other)));
         assert!(!Arc::ptr_eq(&first, &super::shared("/another-source")));
         assert_eq!(first.threads(), 0, "no thread before the first push");
+    }
+
+    #[test]
+    fn push_ref_only_pushes_spawn_namespace_refs() {
+        let mirror = Path::new("/tmp/nonexistent-mirror.git");
+        let rejected = super::push_ref(
+            mirror,
+            "/tmp/nonexistent-source.git",
+            "refs/spawn/workers/a/head",
+            "refs/heads/main",
+        );
+        assert!(matches!(rejected, Pushed::Rejected(ref why) if why.contains("non-spawn")));
     }
 }

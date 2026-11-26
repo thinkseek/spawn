@@ -52,8 +52,21 @@ use spawn_core::transcripts::ARCHIVE_MARKER;
 
 use crate::home::Home;
 
+/// The default directory where the lead installs redaction helpers.
+pub const INSTALLED_DIR: &str = "/usr/local/lib/spawn/redact";
+
 /// The value collector's location tool, installed by the lead.
 pub const INSTALLED_TOOL: &str = "/usr/local/lib/spawn/redact/emit-locations.py";
+
+/// The standalone collector module used as a fallback when `emit-locations.py` is absent.
+pub const INSTALLED_COLLECTOR: &str = "/usr/local/lib/spawn/redact/secret-values.py";
+
+/// Inline loader invoked only when `secret-values.py` is present without `emit-locations.py`.
+const COLLECTOR_LOADER: &str = "import importlib.util, json, os, sys\n\
+spec = importlib.util.spec_from_file_location('secret_values', sys.argv[1])\n\
+mod = importlib.util.module_from_spec(spec)\n\
+spec.loader.exec_module(mod)\n\
+print(json.dumps(mod.locate(os.path.expanduser('~'))))\n";
 
 /// How long one run of the tool may take.
 pub const TOOL_LIMIT: Duration = Duration::from_secs(30);
@@ -170,10 +183,31 @@ struct Kept {
 }
 
 /// Which tool runs, or why none does.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Tool {
     Run(PathBuf),
+    Collector(PathBuf),
     Refused(String),
+}
+
+fn current_exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+}
+
+fn resolve_installed_tool(installed_dir: &Path, exe_dir: Option<&Path>) -> Tool {
+    for candidate_dir in std::iter::once(installed_dir).chain(exe_dir) {
+        let emitter = candidate_dir.join("emit-locations.py");
+        if emitter.is_file() {
+            return Tool::Run(emitter);
+        }
+        let collector = candidate_dir.join("secret-values.py");
+        if collector.is_file() {
+            return Tool::Collector(collector);
+        }
+    }
+    Tool::Run(installed_dir.join("emit-locations.py"))
 }
 
 /// The credential mask the value collector's places give (module docs).
@@ -204,8 +238,35 @@ impl CollectorMask {
         roots: &[PathBuf],
         home: &Home,
     ) -> (Self, Option<StandIn>) {
+        Self::configured_with_dirs(
+            tool,
+            sandbox,
+            roots,
+            home,
+            Path::new(INSTALLED_DIR),
+            current_exe_dir().as_deref(),
+        )
+    }
+
+    /// Like [`Self::configured`], with explicit `installed_dir` and `exe_dir`
+    /// fallback search roots.
+    #[must_use]
+    pub fn configured_with_dirs(
+        tool: Option<PathBuf>,
+        sandbox: Option<&str>,
+        roots: &[PathBuf],
+        home: &Home,
+        installed_dir: &Path,
+        exe_dir: Option<&Path>,
+    ) -> (Self, Option<StandIn>) {
         let Some(tool) = tool else {
-            return (Self::with_tool(PathBuf::from(INSTALLED_TOOL)), None);
+            return (
+                Self {
+                    tool: resolve_installed_tool(installed_dir, exe_dir),
+                    kept: Mutex::new(None),
+                },
+                None,
+            );
         };
         if sandbox != Some("1") {
             return (Self::refused(SANDBOX_ONLY.to_string()), None);
@@ -238,6 +299,61 @@ impl CollectorMask {
         }
     }
 
+    /// The mask a standalone `secret-values.py` collector module gives by
+    /// invoking `locate(os.path.expanduser("~"))` in-process.
+    #[must_use]
+    pub fn with_collector(collector: PathBuf) -> Self {
+        Self {
+            tool: Tool::Collector(collector),
+            kept: Mutex::new(None),
+        }
+    }
+
+    /// Verifies that the configured location tool is permitted, exists as a
+    /// regular file, and parses cleanly under `python3 -I -B`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic message when a stand-in was refused, the tool script
+    /// is missing, or `python3` cannot parse the script.
+    pub fn preflight(&self) -> Result<(), String> {
+        let path = match &self.tool {
+            Tool::Refused(why) => return Err(why.clone()),
+            Tool::Run(path) | Tool::Collector(path) => path,
+        };
+        if !path.is_file() {
+            return Err(format!(
+                "archive mask location tool {} is missing or not a regular file",
+                path.display()
+            ));
+        }
+        let status = Command::new("python3")
+            .args([
+                "-I",
+                "-B",
+                "-c",
+                "import ast, sys; ast.parse(open(sys.argv[1], 'rb').read(), filename=sys.argv[1])",
+            ])
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| {
+                format!(
+                    "archive mask preflight could not run python3 on {}: {error}",
+                    path.display()
+                )
+            })?;
+        if !status.success() {
+            return Err(format!(
+                "archive mask location tool {} failed python3 syntax check ({status})",
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+
     /// A mask that is never had, saying `why`.
     fn refused(why: String) -> Self {
         Self {
@@ -260,10 +376,9 @@ impl CollectorMask {
 
 impl ArchiveMask for CollectorMask {
     fn mask(&self) -> Result<Arc<Mask>, String> {
-        let tool = match &self.tool {
-            Tool::Run(tool) => tool,
-            Tool::Refused(why) => return Err(why.clone()),
-        };
+        if let Tool::Refused(why) = &self.tool {
+            return Err(why.clone());
+        }
         let mut kept = self.lock();
         if let Some(held) = kept.as_ref()
             && Self::fresh(held)
@@ -272,7 +387,7 @@ impl ArchiveMask for CollectorMask {
         }
         // Stale, never built, or the last call failed: built again.
         *kept = None;
-        let answer = run(tool)?;
+        let answer = run(&self.tool)?;
         let (values, stamps) = build(&answer)?;
         let mask = Arc::new(Mask::new(&values, ARCHIVE_MARKER));
         *kept = Some(Kept {
@@ -344,14 +459,24 @@ fn judged(root: &Path) -> PathBuf {
     judged
 }
 
-/// The tool's answer: `python3 -I -B <tool>`, no stdin, bounded by
-/// [`TOOL_LIMIT`]. Its stderr is never shown (only how it ended).
-fn run(tool: &Path) -> Result<Value, String> {
-    let shown = tool.display();
-    let mut child = Command::new("python3")
-        .arg("-I")
-        .arg("-B")
-        .arg(tool)
+/// The tool's answer: `python3 -I -B <tool>` (or inline loader calling
+/// `secret-values.py::locate`), no stdin, bounded by [`TOOL_LIMIT`].
+/// Its stderr is never shown (only how it ended).
+fn run(tool: &Tool) -> Result<Value, String> {
+    let mut cmd = Command::new("python3");
+    cmd.arg("-I").arg("-B");
+    let shown = match tool {
+        Tool::Run(path) => {
+            cmd.arg(path);
+            path.display().to_string()
+        }
+        Tool::Collector(path) => {
+            cmd.arg("-c").arg(COLLECTOR_LOADER).arg(path);
+            path.display().to_string()
+        }
+        Tool::Refused(why) => return Err(why.clone()),
+    };
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

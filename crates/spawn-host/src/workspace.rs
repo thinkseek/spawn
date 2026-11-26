@@ -371,6 +371,22 @@ impl LocalWorkspaceStore {
         }
     }
 
+    /// Persists worker-authored `.git` commits in `directory` into
+    /// `refs/spawn/workers/<branch>/head` and `target_refs` (`#103`, `#110`).
+    pub fn pin_worker_head(
+        &self,
+        branch: &str,
+        directory: Option<&Path>,
+        target_refs: &[&str],
+    ) -> Result<Option<CommitId>, WorkspaceError> {
+        match self {
+            Self::Git(store) => store.pin_worker_head(branch, directory, target_refs),
+            Self::Cow(store) => store.pin_worker_head(branch, directory, target_refs),
+            #[cfg(target_os = "linux")]
+            Self::Overlay(_) => Ok(None),
+        }
+    }
+
     /// The directory where the host reads and writes `workspace`'s files:
     /// the workspace's own path for Git and Cow; for an overlay, its merged
     /// view through the holder ([`OverlayWorkspace::host_path`]).

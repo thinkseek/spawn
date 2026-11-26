@@ -452,11 +452,15 @@ deploy
 check "succeeded (status $status)" [ "$status" -eq 0 ]
 check "the value collector is installed beside the binary" \
   cmp -s "$checkout/scripts/redact/secret-values.py" "$live/bin/secret-values.py"
+check "the location emitter is installed beside the binary" \
+  cmp -s "$checkout/scripts/redact/emit-locations.py" "$live/bin/emit-locations.py"
 check "the push scan's older copy is replaced" \
   cmp -s "$checkout/scripts/redact/secret-values.py" "$scratch/scanner/secret-values.py"
 check "the redaction's root-owned copy is only said to differ" \
   bash -c 'grep -q "redact/secret-values.py differs from the deployed collector" "$1" && grep -qx "# an older collector" "$2"' \
   _ "$out" "$scratch/redact/secret-values.py"
+check "the missing root-owned emitter is advised without failing deploy" \
+  grep -q "redact/emit-locations.py is missing" "$out"
 check "released the owner's hold" [ -z "$(missions_hold)" ]
 check "says so" grep -q "released the owner's hold $held on $missions" "$out"
 check "says the relay unit is not installed" grep -q "installed model-relay.py (unit spawn-model-relay is not installed" "$out"
