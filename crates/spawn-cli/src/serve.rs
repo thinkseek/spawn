@@ -1206,6 +1206,16 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
             let if_none_match = header(&request, "If-None-Match").map(str::to_string);
             return answers::respond(request, &answer, if_none_match.as_deref());
         }
+        if path == "/api/episodes" {
+            if !matches!(request.method(), Method::Get | Method::Head) {
+                return request
+                    .respond(not_allowed("GET"))
+                    .map_err(|error| error.to_string());
+            }
+            let answer = episodes_answer(query);
+            let if_none_match = header(&request, "If-None-Match").map(str::to_string);
+            return answers::respond(request, &answer, if_none_match.as_deref());
+        }
         let Some((method, pattern, values)) = route(path) else {
             return static_file(request, &shared.web, path);
         };
@@ -2483,6 +2493,48 @@ fn mission_task(task: &str) -> Result<Value, String> {
         .task_texts(id)
         .map_err(err)?
         .ok_or_else(|| format!("task {id} does not exist"))
+}
+
+fn parse_episodes_mission_query(query: &str) -> Result<Option<i64>, String> {
+    let Some(raw) = mission_query(query) else {
+        return Ok(None);
+    };
+    raw.parse::<i64>()
+        .map(Some)
+        .map_err(|_| format!("{BAD_REQUEST}bad mission {raw}"))
+}
+
+pub(in crate::serve) fn episodes_payload(
+    mission_id: Option<i64>,
+    episodes: &[spawn_core::control::TaskEpisode],
+    summary: &Value,
+    parity_ok: bool,
+    drifts: &[Value],
+) -> Value {
+    json!({
+        "mission": mission_id,
+        "episodes": episodes,
+        "summary": summary,
+        "parity_ok": parity_ok,
+        "warnings": summary["warnings"].as_u64().unwrap_or(0),
+        "drift_count": drifts.len(),
+    })
+}
+
+/// Read-only `GET|HEAD /api/episodes[?mission=<id>]` JSON answer with weak ETag
+/// validation (no wall clock in the body so identical snapshots yield `304`).
+pub(in crate::serve) fn episodes_answer(query: &str) -> answers::Answer {
+    let read = (|| -> Result<Value, String> {
+        let mission_id = parse_episodes_mission_query(query)?;
+        let store = open_store()?;
+        let (episodes, summary, parity_ok, drifts) = store
+            .episode_parity_report(mission_id, false)
+            .map_err(err)?;
+        Ok(episodes_payload(
+            mission_id, &episodes, &summary, parity_ok, &drifts,
+        ))
+    })();
+    answers::answer("/api/episodes", read, BAD_REQUEST)
 }
 
 /// Put each task's last gate verdict from `gates` (keyed by task id) on the

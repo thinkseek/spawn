@@ -117,6 +117,9 @@ pub(crate) const USAGE: &str = "usage:
       (one mission by id, including one outside list's window: its resolved source and mirror,
       actual landing repository, gate and backlog paths, per-open-task delivery/report/gate
       diagnostics, and shell-quoted read-only checks. Prints JSON and creates nothing)
+      (also: spawn mission episodes [--mission N] [--strict] [--verify-parity] [--json]:
+       replay session_control into typed TaskEpisodes and optionally verify 100% parity
+       against mission_tasks SQL projections; --verify-parity exits 0 on match, 1 on drift)
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> (--brief <text|-> | --brief-file <path>)
                     [--model default|cheap] [--engine <claude|agy>] [--model-label <label>] [--again] [--pin]
@@ -1207,6 +1210,8 @@ fn split_mission(rest: &[String]) -> Result<(&str, Flags), String> {
         &["gated", "urgent"]
     } else if verb == "list" {
         &["json", "table"]
+    } else if verb == "episodes" {
+        &["strict", "verify-parity", "json"]
     } else {
         &[]
     };
@@ -1669,6 +1674,7 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             print(&store.source_release(&source).map_err(err)?);
         }
         "objectives" => print(&list_objectives(&store, &flags)?),
+        "episodes" => return episodes_cmd(&store, &flags),
         "show" => print(&show(&store, &flags)?),
         "list" => {
             if flags.switch("json") && flags.switch("table") {
@@ -1697,6 +1703,144 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             print(&json!({ "mission": mission, "closed": true }));
         }
         _ => return Err(USAGE.to_string()),
+    }
+    Ok(0)
+}
+
+fn parse_optional_mission_id(flags: &Flags) -> Result<Option<i64>, String> {
+    flags
+        .get("mission")
+        .map(|raw| {
+            raw.parse::<i64>()
+                .map_err(|_| format!("--mission must be a number, not {raw}"))
+        })
+        .transpose()
+}
+
+fn build_episodes_cli_payload(
+    mission_id: Option<i64>,
+    strict: bool,
+    episodes: &[spawn_core::control::TaskEpisode],
+    summary: &Value,
+    parity: Option<(bool, &[Value])>,
+) -> Value {
+    let mut payload = json!({
+        "mission": mission_id,
+        "strict": strict,
+        "episodes": episodes,
+        "summary": summary,
+        "warnings": summary["warnings"].as_u64().unwrap_or(0),
+    });
+    if let Some((parity_ok, drifts)) = parity
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert("parity_ok".to_string(), json!(parity_ok));
+        obj.insert("drift_count".to_string(), json!(drifts.len()));
+        obj.insert("drifts".to_string(), json!(drifts));
+    }
+    payload
+}
+
+fn format_episodes_text(
+    episodes: &[spawn_core::control::TaskEpisode],
+    summary: &Value,
+    parity: Option<(bool, &[Value])>,
+) -> String {
+    let mut lines = vec![format!(
+        "episodes: total={} landed={} accepted={} in_flight={} rejected={} cancelled={} aborted={} over_budget={} rework={} reroutes={} reviews={} gates={} warnings={}",
+        summary["total"].as_u64().unwrap_or(0),
+        summary["landed"].as_u64().unwrap_or(0),
+        summary["accepted"].as_u64().unwrap_or(0),
+        summary["in_flight"].as_u64().unwrap_or(0),
+        summary["rejected"].as_u64().unwrap_or(0),
+        summary["cancelled"].as_u64().unwrap_or(0),
+        summary["aborted"].as_u64().unwrap_or(0),
+        summary["over_budget"].as_u64().unwrap_or(0),
+        summary["total_rework"].as_u64().unwrap_or(0),
+        summary["total_reroutes"].as_u64().unwrap_or(0),
+        summary["review_sync_points"].as_u64().unwrap_or(0),
+        summary["gate_verdicts"].as_u64().unwrap_or(0),
+        summary["warnings"].as_u64().unwrap_or(0),
+    )];
+
+    for ep in episodes {
+        let preset = ep.preset_id.as_deref().unwrap_or("-");
+        lines.push(format!(
+            "  task=#{} mission=#{} state={} outcome={:?} diff={} preset={} rework={} rej={} reroutes={} reviews={} gates={}",
+            ep.task_id,
+            ep.mission_id,
+            ep.state.as_str(),
+            ep.outcome,
+            ep.difficulty.as_str(),
+            preset,
+            ep.rework,
+            ep.quality_rejections,
+            ep.reroutes,
+            ep.review_sync_points.len(),
+            ep.gate_verdicts.len(),
+        ));
+    }
+
+    if let Some((parity_ok, drifts)) = parity {
+        if parity_ok {
+            lines.push(format!(
+                "parity: OK ({} task(s) matched mission_tasks)",
+                episodes.len()
+            ));
+        } else {
+            lines.push(format!("parity: DRIFT ({} mismatch(es)):", drifts.len()));
+            for d in drifts {
+                lines.push(format!(
+                    "  task=#{} mission=#{} field={} replayed={} sql={}",
+                    d["task_id"],
+                    d["mission_id"],
+                    d["field"].as_str().unwrap_or("?"),
+                    d["replayed"],
+                    d["sql"]
+                ));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// `spawn mission episodes [--mission N] [--strict] [--verify-parity] [--json]`
+fn episodes_cmd(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i32, String> {
+    let mission_id = parse_optional_mission_id(flags)?;
+    let strict = flags.switch("strict");
+    let verify_parity = flags.switch("verify-parity");
+    let as_json = flags.switch("json");
+    let err = |error: spawn_core::port::StoreError| error.to_string();
+
+    if verify_parity {
+        let (episodes, summary, parity_ok, drifts) = store
+            .episode_parity_report(mission_id, strict)
+            .map_err(err)?;
+        if as_json {
+            let payload = build_episodes_cli_payload(
+                mission_id,
+                strict,
+                &episodes,
+                &summary,
+                Some((parity_ok, &drifts)),
+            );
+            print(&payload);
+        } else {
+            println!(
+                "{}",
+                format_episodes_text(&episodes, &summary, Some((parity_ok, &drifts)))
+            );
+        }
+        return Ok(i32::from(!parity_ok));
+    }
+
+    let (episodes, summary) = store.replay_episodes(mission_id, strict).map_err(err)?;
+    if as_json {
+        let payload = build_episodes_cli_payload(mission_id, strict, &episodes, &summary, None);
+        print(&payload);
+    } else {
+        println!("{}", format_episodes_text(&episodes, &summary, None));
     }
     Ok(0)
 }
@@ -3500,6 +3644,245 @@ mod tests {
             ),
             "{table}"
         );
+    }
+
+    #[test]
+    fn episodes_flags_parse_switches_and_reject_bad_mission_id() {
+        let args: Vec<String> = [
+            "episodes",
+            "--mission",
+            "4",
+            "--strict",
+            "--verify-parity",
+            "--json",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let (verb, parsed) = super::split_mission(&args).expect("episodes flags");
+        assert_eq!(verb, "episodes");
+        assert_eq!(super::parse_optional_mission_id(&parsed), Ok(Some(4)));
+        assert!(parsed.switch("strict"));
+        assert!(parsed.switch("verify-parity"));
+        assert!(parsed.switch("json"));
+
+        let default_args = [String::from("episodes")];
+        let (_, plain) = super::split_mission(&default_args).expect("plain episodes");
+        assert_eq!(super::parse_optional_mission_id(&plain), Ok(None));
+        assert!(!plain.switch("strict"));
+        assert!(!plain.switch("verify-parity"));
+        assert!(!plain.switch("json"));
+
+        let bad_args: Vec<String> = ["episodes", "--mission", "abc"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let (_, bad) = super::split_mission(&bad_args).expect("flags");
+        assert!(
+            super::parse_optional_mission_id(&bad)
+                .unwrap_err()
+                .contains("--mission must be a number")
+        );
+    }
+
+    #[test]
+    fn episodes_usage_preserves_mission_contract_help() {
+        assert!(super::USAGE.contains(
+            "spawn mission episodes [--mission N] [--strict] [--verify-parity] [--json]"
+        ));
+        for line in super::USAGE.lines() {
+            if line.trim_start().starts_with("spawn mission ") {
+                let verb = line.split_whitespace().nth(2).unwrap_or_default();
+                assert_ne!(
+                    verb, "episodes",
+                    "episodes must stay a note line so main.rs contract verb list remains unchanged"
+                );
+            }
+        }
+    }
+
+    fn sample_parity_episodes() -> Vec<spawn_core::control::TaskEpisode> {
+        use spawn_core::control::{ControlRecord, replay_task_episodes};
+
+        let events = [
+            (
+                1,
+                1000,
+                ControlRecord::from_value_strict(&json!({
+                    "type": "mission.added",
+                    "id": 10,
+                    "text": "ship",
+                    "origin": "human",
+                    "sources": []
+                }))
+                .unwrap(),
+            ),
+            (
+                2,
+                1001,
+                ControlRecord::from_value_strict(&json!({
+                    "type": "task.assigned",
+                    "id": 50,
+                    "mission_id": 10,
+                    "kind": "ephemeral",
+                    "agent_id": "agent_w_50",
+                    "session_id": "session_w_50",
+                    "brief": "fix parser",
+                    "model": "cheap",
+                    "difficulty": "l1",
+                    "preset_id": "cheap-l1"
+                }))
+                .unwrap(),
+            ),
+            (
+                3,
+                1002,
+                ControlRecord::from_value_strict(&json!({
+                    "type": "task.delivered",
+                    "id": 50,
+                    "command_id": 7
+                }))
+                .unwrap(),
+            ),
+            (
+                4,
+                1003,
+                ControlRecord::from_value_strict(&json!({
+                    "type": "task.reported",
+                    "id": 50,
+                    "report": "draft"
+                }))
+                .unwrap(),
+            ),
+            (
+                5,
+                1004,
+                ControlRecord::from_value_strict(&json!({
+                    "type": "task.reviewed",
+                    "id": 50,
+                    "accepted": false,
+                    "note": "edge case",
+                    "revision": 0
+                }))
+                .unwrap(),
+            ),
+            (
+                6,
+                1005,
+                ControlRecord::from_value_strict(&json!({
+                    "type": "task.rerouted",
+                    "id": 50,
+                    "preset_id": "neon-l2",
+                    "model": "default",
+                    "from_preset_id": "cheap-l1",
+                    "revision": 1
+                }))
+                .unwrap(),
+            ),
+        ];
+        replay_task_episodes(&events)
+    }
+
+    #[test]
+    fn episodes_parity_matches_and_detects_every_field_drift() {
+        let episodes = sample_parity_episodes();
+        let matching_row = json!({
+            "id": 50,
+            "mission_id": 10,
+            "state": "revise",
+            "revisions": 1,
+            "quality_rejections": 1,
+            "difficulty": 1,
+            "preset_id": "neon-l2",
+            "first_preset_id": "cheap-l1",
+            "model": "default",
+            "agent_id": "agent_w_50",
+            "session_id": "session_w_50",
+        });
+
+        let (ok, drifts) = spawn_postgres::PostgresStore::compare_episode_parity(
+            &episodes,
+            std::slice::from_ref(&matching_row),
+        );
+        assert!(ok, "expected parity match, got {drifts:?}");
+        assert!(drifts.is_empty());
+
+        let summary = json!({
+            "total": 1,
+            "landed": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "cancelled": 0,
+            "aborted": 0,
+            "over_budget": 0,
+            "in_flight": 1,
+            "total_rework": 1,
+            "total_reroutes": 1,
+            "review_sync_points": 1,
+            "gate_verdicts": 0,
+            "warnings": 0,
+        });
+        let ok_payload = super::build_episodes_cli_payload(
+            Some(10),
+            true,
+            &episodes,
+            &summary,
+            Some((ok, &drifts)),
+        );
+        assert_eq!(ok_payload["parity_ok"], json!(true));
+        assert_eq!(ok_payload["drift_count"], json!(0));
+        let ok_text = super::format_episodes_text(&episodes, &summary, Some((ok, &drifts)));
+        assert!(ok_text.contains("parity: OK (1 task(s) matched mission_tasks)"));
+
+        for (sql_key, drift_field, bad_val) in [
+            ("state", "state", json!("delivered")),
+            ("revisions", "rework", json!(9)),
+            ("quality_rejections", "quality_rejections", json!(0)),
+            ("difficulty", "difficulty", json!(3)),
+            ("preset_id", "preset_id", json!("other-preset")),
+            ("first_preset_id", "first_preset_id", json!(null)),
+            ("model", "model", json!("cheap")),
+            ("agent_id", "agent_id", json!("agent_other")),
+            ("session_id", "session_id", json!("session_other")),
+        ] {
+            let mut mutated = matching_row.clone();
+            mutated[sql_key] = bad_val;
+            let (is_ok, field_drifts) =
+                spawn_postgres::PostgresStore::compare_episode_parity(&episodes, &[mutated]);
+            assert!(!is_ok, "expected drift on {sql_key}");
+            assert_eq!(field_drifts.len(), 1);
+            assert_eq!(field_drifts[0]["field"], json!(drift_field));
+            let drift_text =
+                super::format_episodes_text(&episodes, &summary, Some((is_ok, &field_drifts)));
+            assert!(drift_text.contains("parity: DRIFT (1 mismatch(es))"));
+            assert!(drift_text.contains(&format!("field={drift_field}")));
+        }
+
+        let (missing_sql_ok, missing_sql_drifts) =
+            spawn_postgres::PostgresStore::compare_episode_parity(&episodes, &[]);
+        assert!(!missing_sql_ok);
+        assert_eq!(missing_sql_drifts[0]["field"], json!("sql_row"));
+
+        let extra_row = json!({
+            "id": 999,
+            "mission_id": 10,
+            "state": "assigned",
+            "revisions": 0,
+            "quality_rejections": 0,
+            "difficulty": 2,
+            "preset_id": null,
+            "first_preset_id": null,
+            "model": "default",
+            "agent_id": "agent_w_999",
+            "session_id": "session_w_999",
+        });
+        let (extra_ok, extra_drifts) = spawn_postgres::PostgresStore::compare_episode_parity(
+            &episodes,
+            &[matching_row, extra_row],
+        );
+        assert!(!extra_ok);
+        assert_eq!(extra_drifts[0]["field"], json!("episode"));
+        assert_eq!(extra_drifts[0]["task_id"], json!(999));
     }
 }
 

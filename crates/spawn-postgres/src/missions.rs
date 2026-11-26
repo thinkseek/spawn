@@ -5,7 +5,12 @@
 //! restricted login and the owner's CLI share one set of rules. The
 //! dispatcher's delivery bookkeeping (delivered, reported) runs as the owner.
 
-use serde_json::Value;
+use std::collections::BTreeMap;
+
+use serde_json::{Value, json};
+use spawn_core::control::{
+    CompatControlRecord, ControlRecord, EpisodeOutcome, TaskEpisode, replay_task_episodes,
+};
 use spawn_core::port::StoreError;
 
 use crate::PostgresStore;
@@ -3034,6 +3039,273 @@ impl PostgresStore {
         Ok(self
             .query_opt(REPORTED_COMMIT, &[&task.to_string()])?
             .and_then(|row| row.get::<_, Option<String>>(0)))
+    }
+
+    /// Read the typed `session_control` stream (`control.recorded` rows
+    /// ordered by `(session_seq, id)`).
+    ///
+    /// When `strict` is `true`, every row must validate against
+    /// [`ControlRecord::from_value_strict`]. When `strict` is `false`, rows
+    /// decode via [`ControlRecord::from_value_compat`], skipping unknown or
+    /// unparseable historical variants while accumulating structured warning
+    /// counts in the returned metadata JSON.
+    #[allow(clippy::type_complexity)]
+    pub fn control_record_stream(
+        &self,
+        strict: bool,
+    ) -> Result<(Vec<(i64, i64, ControlRecord)>, Value), StoreError> {
+        let rows = self.query(CONTROL_RECORD_STREAM, &[])?;
+        let mut records = Vec::with_capacity(rows.len());
+        let mut total_rows: u64 = 0;
+        let mut warnings: u64 = 0;
+        let mut unknown_variants: u64 = 0;
+        let mut parse_errors: u64 = 0;
+        let mut by_kind: BTreeMap<String, u64> = BTreeMap::new();
+
+        for row in &rows {
+            total_rows += 1;
+            let seq: i64 = row.get(0);
+            let at_ms: i64 = row.get(1);
+            let raw: Option<Value> = row.get(2);
+            match (strict, raw) {
+                (true, None) => {
+                    return Err(StoreError::Backend(format!(
+                        "control.recorded at seq {seq} is missing record payload"
+                    )));
+                }
+                (true, Some(val)) => {
+                    let rec = ControlRecord::from_value_strict(&val).map_err(|err| {
+                        StoreError::Backend(format!(
+                            "strict control record parse failed at seq {seq}: {err}"
+                        ))
+                    })?;
+                    records.push((seq, at_ms, rec));
+                }
+                (false, None) => {
+                    warnings += 1;
+                    parse_errors += 1;
+                    *by_kind.entry("<null>".to_string()).or_default() += 1;
+                }
+                (false, Some(val)) => match ControlRecord::from_value_compat(&val) {
+                    Ok(CompatControlRecord::Known(rec)) => records.push((seq, at_ms, *rec)),
+                    Ok(CompatControlRecord::Unknown { kind, .. }) => {
+                        warnings += 1;
+                        unknown_variants += 1;
+                        *by_kind.entry(kind).or_default() += 1;
+                    }
+                    Err(_) => {
+                        warnings += 1;
+                        parse_errors += 1;
+                        let tag = val
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<malformed>")
+                            .to_string();
+                        *by_kind.entry(tag).or_default() += 1;
+                    }
+                },
+            }
+        }
+
+        let meta = json!({
+            "total_rows": total_rows,
+            "parsed_rows": records.len(),
+            "warnings": warnings,
+            "unknown_variants": unknown_variants,
+            "parse_errors": parse_errors,
+            "by_kind": by_kind,
+        });
+        Ok((records, meta))
+    }
+
+    /// Replay `session_control` into deterministic [`TaskEpisode`] projections
+    /// and summary counts, optionally filtered to `mission_id` after full
+    /// stream folding so mission and resident closure rules remain exact.
+    pub fn replay_episodes(
+        &self,
+        mission_id: Option<i64>,
+        strict: bool,
+    ) -> Result<(Vec<TaskEpisode>, Value), StoreError> {
+        let (records, stream_meta) = self.control_record_stream(strict)?;
+        let mut episodes = replay_task_episodes(&records);
+        if let Some(mid) = mission_id {
+            episodes.retain(|ep| ep.mission_id == mid);
+        }
+        let summary = summarize_episodes(&episodes, &stream_meta);
+        Ok((episodes, summary))
+    }
+
+    /// Compare replayed [`TaskEpisode`] projections against `mission_tasks` SQL
+    /// row JSON objects (`{id, mission_id, state, revisions, quality_rejections,
+    /// difficulty, preset_id, first_preset_id, model, agent_id, session_id}`).
+    ///
+    /// Returns `(parity_ok, drifts)`.
+    pub fn compare_episode_parity(
+        episodes: &[TaskEpisode],
+        sql_rows: &[Value],
+    ) -> (bool, Vec<Value>) {
+        let ep_map: BTreeMap<i64, &TaskEpisode> =
+            episodes.iter().map(|ep| (ep.task_id, ep)).collect();
+        let sql_map: BTreeMap<i64, &Value> = sql_rows
+            .iter()
+            .filter_map(|row| row.get("id").and_then(Value::as_i64).map(|id| (id, row)))
+            .collect();
+
+        let all_ids: std::collections::BTreeSet<i64> =
+            ep_map.keys().chain(sql_map.keys()).copied().collect();
+        let mut drifts = Vec::new();
+
+        for task_id in all_ids {
+            match (ep_map.get(&task_id), sql_map.get(&task_id)) {
+                (Some(ep), Some(sql)) => compare_task_fields(ep, sql, &mut drifts),
+                (None, Some(sql)) => drifts.push(json!({
+                    "task_id": task_id,
+                    "mission_id": sql["mission_id"],
+                    "field": "episode",
+                    "replayed": Value::Null,
+                    "sql": "present",
+                })),
+                (Some(ep), None) => drifts.push(json!({
+                    "task_id": task_id,
+                    "mission_id": ep.mission_id,
+                    "field": "sql_row",
+                    "replayed": "present",
+                    "sql": Value::Null,
+                })),
+                (None, None) => {}
+            }
+        }
+        (drifts.is_empty(), drifts)
+    }
+
+    /// Replay `session_control` into [`TaskEpisode`] projections and verify
+    /// parity against `mission_tasks` SQL rows (readable by both `owner` and
+    /// `spawn_reader`).
+    pub fn episode_parity_report(
+        &self,
+        mission_id: Option<i64>,
+        strict: bool,
+    ) -> Result<(Vec<TaskEpisode>, Value, bool, Vec<Value>), StoreError> {
+        let (episodes, summary) = self.replay_episodes(mission_id, strict)?;
+        let rows = self.query(EPISODE_PARITY_TASKS, &[&mission_id])?;
+        let sql_rows: Vec<Value> = rows.iter().map(parity_sql_row).collect();
+        let (parity_ok, drifts) = Self::compare_episode_parity(&episodes, &sql_rows);
+        Ok((episodes, summary, parity_ok, drifts))
+    }
+}
+
+const CONTROL_RECORD_STREAM: &str = r"
+select session_seq, recorded_at_ms, kind -> 'detail' -> 'record'
+  from spawn_events
+ where session_id = 'session_control'
+   and event_name = 'control.recorded'
+ order by session_seq, id";
+
+const EPISODE_PARITY_TASKS: &str = r"
+select id, mission_id, state, revisions, quality_rejections, difficulty,
+       preset_id, first_preset_id, model, agent_id, session_id
+  from mission_tasks
+ where ($1::bigint is null or mission_id = $1)
+ order by id";
+
+fn summarize_episodes(episodes: &[TaskEpisode], stream_meta: &Value) -> Value {
+    let mut landed: u64 = 0;
+    let mut accepted: u64 = 0;
+    let mut rejected: u64 = 0;
+    let mut cancelled: u64 = 0;
+    let mut aborted: u64 = 0;
+    let mut over_budget: u64 = 0;
+    let mut in_flight: u64 = 0;
+    let mut total_rework: u64 = 0;
+    let mut total_reroutes: u64 = 0;
+    let mut review_sync_points: u64 = 0;
+    let mut gate_verdicts: u64 = 0;
+
+    for ep in episodes {
+        match ep.outcome {
+            EpisodeOutcome::Landed => landed += 1,
+            EpisodeOutcome::Accepted => accepted += 1,
+            EpisodeOutcome::Rejected => rejected += 1,
+            EpisodeOutcome::Cancelled => cancelled += 1,
+            EpisodeOutcome::Aborted => aborted += 1,
+            EpisodeOutcome::OverBudget => over_budget += 1,
+            EpisodeOutcome::InFlight => in_flight += 1,
+        }
+        total_rework += u64::from(ep.rework);
+        total_reroutes += u64::from(ep.reroutes);
+        review_sync_points += u64::try_from(ep.review_sync_points.len()).unwrap_or(u64::MAX);
+        gate_verdicts += u64::try_from(ep.gate_verdicts.len()).unwrap_or(u64::MAX);
+    }
+
+    json!({
+        "total": episodes.len(),
+        "landed": landed,
+        "accepted": accepted,
+        "rejected": rejected,
+        "cancelled": cancelled,
+        "aborted": aborted,
+        "over_budget": over_budget,
+        "in_flight": in_flight,
+        "total_rework": total_rework,
+        "total_reroutes": total_reroutes,
+        "review_sync_points": review_sync_points,
+        "gate_verdicts": gate_verdicts,
+        "warnings": stream_meta["warnings"].as_u64().unwrap_or(0),
+        "warning_details": stream_meta,
+    })
+}
+
+fn parity_sql_row(row: &postgres::Row) -> Value {
+    json!({
+        "id": row.get::<_, i64>(0),
+        "mission_id": row.get::<_, i64>(1),
+        "state": row.get::<_, String>(2),
+        "revisions": row.get::<_, i32>(3),
+        "quality_rejections": row.get::<_, i32>(4),
+        "difficulty": row.get::<_, i16>(5),
+        "preset_id": row.get::<_, Option<String>>(6),
+        "first_preset_id": row.get::<_, Option<String>>(7),
+        "model": row.get::<_, String>(8),
+        "agent_id": row.get::<_, String>(9),
+        "session_id": row.get::<_, String>(10),
+    })
+}
+
+fn compare_task_fields(ep: &TaskEpisode, sql: &Value, drifts: &mut Vec<Value>) {
+    let checks: [(&str, Value, &Value); 10] = [
+        ("mission_id", json!(ep.mission_id), &sql["mission_id"]),
+        ("state", json!(ep.state.as_str()), &sql["state"]),
+        ("rework", json!(ep.rework), &sql["revisions"]),
+        (
+            "quality_rejections",
+            json!(ep.quality_rejections),
+            &sql["quality_rejections"],
+        ),
+        (
+            "difficulty",
+            json!(ep.difficulty.rank()),
+            &sql["difficulty"],
+        ),
+        ("preset_id", json!(ep.preset_id), &sql["preset_id"]),
+        (
+            "first_preset_id",
+            json!(ep.first_preset_id),
+            &sql["first_preset_id"],
+        ),
+        ("model", json!(ep.model), &sql["model"]),
+        ("agent_id", json!(ep.agent_id), &sql["agent_id"]),
+        ("session_id", json!(ep.session_id), &sql["session_id"]),
+    ];
+    for (field, replayed, expected) in checks {
+        if &replayed != expected {
+            drifts.push(json!({
+                "task_id": ep.task_id,
+                "mission_id": ep.mission_id,
+                "field": field,
+                "replayed": replayed,
+                "sql": expected,
+            }));
+        }
     }
 }
 

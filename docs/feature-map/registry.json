@@ -1643,7 +1643,9 @@
         "rsi/scenarios/nightly/check-j08-stuck.sh",
         "rsi/scenarios/nightly/check-j09-stall-cancel.sh",
         "rsi/scenarios/nightly/013.sh",
-        "rsi/scenarios/nightly/032.sh"
+        "rsi/scenarios/nightly/032.sh",
+        "web/src/episodes.ts",
+        "web/test/episodes.test.ts"
       ],
       "relations": [
         {
