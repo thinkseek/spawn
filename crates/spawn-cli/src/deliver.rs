@@ -2549,6 +2549,27 @@ pub(crate) fn collect_reports(
                 match store.task_reported_with(task.id, report.trim(), facts.checkpoint.as_deref())
                 {
                     Ok(true) => {
+                        let default_repo = crate::config::env_value("SPAWN_GIT_REPO")
+                            .map(std::path::PathBuf::from);
+                        match crate::sources::persist_task_worker_commits(
+                            store,
+                            default_repo.as_deref(),
+                            root,
+                            &task.agent_id,
+                            task.id,
+                            "head",
+                        ) {
+                            Ok(Some(sha)) => lines.push(format!(
+                                "deliver: task #{} preserved worker HEAD {sha} in {}",
+                                task.id,
+                                spawn_host::git::task_head_ref(task.id, "head")
+                            )),
+                            Ok(None) => {}
+                            Err(error) => lines.push(format!(
+                                "deliver: task #{} worker HEAD preserve: {error}",
+                                task.id
+                            )),
+                        }
                         put_aside(&workspace, task.id);
                         let _ = spawn_host::agent_files::remove(&workspace, &delivery_mark(&key));
                         lines.push(format!("deliver: task #{} reported", task.id));

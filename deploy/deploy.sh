@@ -891,10 +891,20 @@ fi
 # difference is said with the command that installs it. Only the install beside the binary can
 # stop the deploy (as storage-extents.py's can); the other two are said, never fatal.
 collector=$export_dir/scripts/redact/secret-values.py
+emitter=$export_dir/scripts/redact/emit-locations.py
 if [ -f "$collector" ]; then
   if ! cmp -s "$collector" "$live/bin/secret-values.py"; then
     install -m 644 "$collector" "$live/bin/secret-values.py"
     say "installed secret-values.py"
+  fi
+  if [ -f "$emitter" ] && ! cmp -s "$emitter" "$live/bin/emit-locations.py"; then
+    install -m 755 "$emitter" "$live/bin/emit-locations.py"
+    say "installed emit-locations.py"
+  fi
+  if ! python3 -I -B -c 'import ast, sys; [ast.parse(open(p, "rb").read(), filename=p) for p in sys.argv[1:]]' \
+    "$live/bin/secret-values.py" "$live/bin/emit-locations.py" >/dev/null 2>&1; then
+    echo "deploy: installed redact scripts in $live/bin failed python3 syntax check" >&2
+    exit 1
   fi
   scanner_dir=${SPAWN_DEPLOY_SCANNER_DIR-/var/tmp/spawn}
   if [ -f "$scanner_dir/secret-values.py" ] && ! cmp -s "$collector" "$scanner_dir/secret-values.py"; then
@@ -908,6 +918,15 @@ if [ -f "$collector" ]; then
   redact_dir=${SPAWN_DEPLOY_REDACT_DIR-/usr/local/lib/spawn/redact}
   if [ -f "$redact_dir/secret-values.py" ] && ! cmp -s "$collector" "$redact_dir/secret-values.py"; then
     say "$redact_dir/secret-values.py differs from the deployed collector; as root: install -m 644 $live/bin/secret-values.py $redact_dir/secret-values.py"
+  fi
+  if [ -f "$emitter" ]; then
+    if [ -f "$redact_dir/emit-locations.py" ]; then
+      if ! cmp -s "$emitter" "$redact_dir/emit-locations.py"; then
+        say "$redact_dir/emit-locations.py differs from the deployed emitter; as root: install -m 755 $live/bin/emit-locations.py $redact_dir/emit-locations.py"
+      fi
+    elif [ -d "$redact_dir" ]; then
+      say "$redact_dir/emit-locations.py is missing (fallback uses secret-values.py / $live/bin); as root: install -m 755 $live/bin/emit-locations.py $redact_dir/emit-locations.py"
+    fi
   fi
 fi
 # The relays run from the live bin directory too; restart one only when its

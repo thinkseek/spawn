@@ -106,5 +106,26 @@ print(f"{fails} failed (secret-values)")
 sys.exit(1 if fails else 0)
 PY
 
+emitter=$here/emit-locations.py
+if [ -f "$emitter" ]; then
+  emit_out=$(python3 -I -B "$emitter" --home "$scratch/home" --root "$scratch/root" 2>&1) || {
+    echo "FAIL emit-locations.py exited non-zero"
+    fails=$((fails + 1))
+  }
+  python3 -I -B - "$emit_out" <<'PY' || fails=$((fails + 1))
+import json, sys
+
+doc = json.loads(sys.argv[1])
+assert "sources" in doc and "entries" in doc and "accepted_paths" in doc
+assert "watch" in doc and "probe" in doc
+assert "synthetic-keep-value-0001" not in sys.argv[1]
+assert "synthetic-plain-value-0002" not in sys.argv[1]
+print("ok   emit-locations.py prints metadata/spans JSON without values")
+PY
+else
+  echo "FAIL emit-locations.py missing at $emitter"
+  fails=$((fails + 1))
+fi
+
 echo "$fails failed"
 [ "$fails" -eq 0 ]

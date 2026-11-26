@@ -2787,6 +2787,8 @@ impl CowWorkspace {
         let meta = present(&directory)?
             .ok_or_else(|| unavailable(format!("{} is gone", directory.display())))?;
         Self::owned(&directory, &meta, &previous)?;
+        self.git
+            .preserve_worker_head_best_effort(branch, &directory);
         let mut tally = CowStats::default();
         let (tree, mut state, oversized) =
             self.snapshot(branch, &directory, &previous, &mut tally)?;
@@ -2888,6 +2890,8 @@ impl CowWorkspace {
                 let _admission = self.quiesce(branch)?;
                 self.refuse_busy(&directory)?;
                 Self::preflight(&directory)?;
+                self.git
+                    .preserve_worker_head_best_effort(branch, &directory);
                 self.retire(branch, &directory)?;
             }
         }
@@ -2972,6 +2976,17 @@ impl CowWorkspace {
             take_back()?;
         }
         self.commit_locked(workspace, message)
+    }
+
+    /// Persists any worker-authored `.git` commits in `directory` via the
+    /// underlying bare [`GitWorkspace`] (`#103`, `#110`).
+    pub fn pin_worker_head(
+        &self,
+        branch: &str,
+        directory: Option<&Path>,
+        target_refs: &[&str],
+    ) -> Result<Option<CommitId>, WorkspaceError> {
+        self.git.pin_worker_head(branch, directory, target_refs)
     }
 
     /// [`WorkspaceStore::set_aside`] of this store, only while `ready` says

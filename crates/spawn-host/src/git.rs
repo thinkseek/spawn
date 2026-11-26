@@ -524,6 +524,109 @@ fn shown_paths(paths: &[TreePath]) -> Vec<String> {
     paths.iter().map(TreePath::shown).collect()
 }
 
+/// Bare-repo reference pinning the latest worker-authored `HEAD` commit
+/// graph preserved from `branch`'s mounted workspace (`#103`, `#110`).
+#[must_use]
+pub fn worker_head_ref(branch: &str) -> String {
+    format!("refs/spawn/workers/{branch}/head")
+}
+
+/// Bare-repo reference pinning a task's worker-authored `HEAD` commit graph
+/// at `stage` (`"head"` at report, `"accepted"` at task acceptance).
+#[must_use]
+pub fn task_head_ref(task_id: i64, stage: &str) -> String {
+    format!("refs/spawn/tasks/{task_id}/{stage}")
+}
+
+/// Resolves the worker's inner `.git` repository directory inside `directory`,
+/// if one exists, without dereferencing symlinks or `gitdir:` paths escaping `directory`.
+fn worker_git_dir(directory: &Path) -> Result<Option<PathBuf>, WorkspaceError> {
+    let dot_git = directory.join(".git");
+    let meta = match std::fs::symlink_metadata(&dot_git) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(WorkspaceError::Unavailable(format!(
+                "stat {}: {error}",
+                dot_git.display()
+            )));
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return Err(WorkspaceError::Unavailable(format!(
+            "refusing symlink .git in worker workspace {}",
+            directory.display()
+        )));
+    }
+    let canon_dir = std::fs::canonicalize(directory).map_err(|error| {
+        WorkspaceError::Unavailable(format!("canonicalize {}: {error}", directory.display()))
+    })?;
+    let candidate = if meta.is_dir() {
+        dot_git
+    } else if meta.is_file() {
+        let raw = std::fs::read(&dot_git).map_err(|error| {
+            WorkspaceError::Unavailable(format!("read {}: {error}", dot_git.display()))
+        })?;
+        let text = std::str::from_utf8(&raw).map_err(|_| {
+            WorkspaceError::Unavailable(format!("non-UTF-8 .git file {}", dot_git.display()))
+        })?;
+        let target = text
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("gitdir:"))
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                WorkspaceError::Unavailable(format!("malformed gitdir file {}", dot_git.display()))
+            })?;
+        let path = Path::new(target);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            directory.join(path)
+        }
+    } else {
+        return Err(WorkspaceError::Unavailable(format!(
+            "refusing non-directory .git in worker workspace {}",
+            directory.display()
+        )));
+    };
+    let canon_git = std::fs::canonicalize(&candidate).map_err(|error| {
+        WorkspaceError::Unavailable(format!(
+            "resolve worker git dir {}: {error}",
+            candidate.display()
+        ))
+    })?;
+    if !canon_git.starts_with(&canon_dir) {
+        return Err(WorkspaceError::Unavailable(format!(
+            "refusing worker .git escaping workspace {}: {}",
+            directory.display(),
+            canon_git.display()
+        )));
+    }
+    Ok(Some(canon_git))
+}
+
+/// Reads the resolved commit SHA of `HEAD` in `worker_git` without host git config.
+fn read_worker_head(git: &str, worker_git: &Path) -> Option<String> {
+    let output = git_command(git)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .arg(format!("--git-dir={}", worker_git.display()))
+        .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    CommitId::new(sha.clone()).ok()?;
+    Some(sha)
+}
+
 /// First field of a pending merge's file.
 const PENDING_TAG: &str = "pending-merge";
 
@@ -1663,6 +1766,7 @@ impl GitWorkspace {
             let kept = self.keep_stale(&branch, &directory)?;
             return Err(stale_refusal(&branch, Some(&kept)));
         }
+        self.preserve_worker_head_best_effort(&branch, &directory);
         let reference = format!("refs/heads/{branch}");
         let mut parent = self.commit_and_tree(&reference)?;
         if parent.is_none() {
@@ -1924,6 +2028,7 @@ impl WorkspaceStore for GitWorkspace {
         let directory = self.checked_path(workspace)?;
         let _lock = self.lock_branch(branch)?;
         ready()?;
+        self.preserve_worker_head_best_effort(branch, &directory);
         // Not even a discard removes a stale directory before it is kept.
         self.keep_stale_locked(branch, &directory)?;
         // A pending merge stays only when the branch carries its markers.
@@ -3119,6 +3224,86 @@ impl GitWorkspace {
     /// the returned file is dropped.
     fn lock_branch(&self, branch: &str) -> Result<std::fs::File, WorkspaceError> {
         lock_file(&self.index(branch).with_extension("spawn-lock"))
+    }
+
+    /// Persists the worker-authored commit graph reachable from `directory`'s
+    /// inner `.git` `HEAD` into `refs/spawn/workers/<branch>/head` (and every
+    /// `refs/spawn/...` target ref in `target_refs`) without modifying `refs/heads/*`.
+    /// When `directory` is absent or holds no `.git` commits, falls back to an
+    /// existing `refs/spawn/workers/<branch>/head` ref in this bare repo.
+    pub fn pin_worker_head(
+        &self,
+        branch: &str,
+        directory: Option<&Path>,
+        target_refs: &[&str],
+    ) -> Result<Option<CommitId>, WorkspaceError> {
+        if branch.is_empty() || branch.starts_with('-') {
+            return Err(WorkspaceError::Unavailable(format!(
+                "invalid branch name {branch:?}"
+            )));
+        }
+        for target in target_refs {
+            if !target.starts_with("refs/spawn/") {
+                return Err(WorkspaceError::Unavailable(format!(
+                    "refusing to pin worker HEAD outside refs/spawn/: {target}"
+                )));
+            }
+        }
+        let worker_ref = worker_head_ref(branch);
+        let mut resolved: Option<String> = None;
+        if let Some(dir) = directory
+            && dir.is_dir()
+            && let Some(worker_git) = worker_git_dir(dir)?
+            && let Some(head_sha) = read_worker_head(&self.git, &worker_git)
+        {
+            if self.commit_id_of(&worker_ref).ok().as_deref() != Some(head_sha.as_str()) {
+                let refspec = format!("+HEAD:{worker_ref}");
+                let output = self
+                    .command()
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env_remove("GIT_CONFIG_COUNT")
+                    .env_remove("GIT_CONFIG_PARAMETERS")
+                    .env("GIT_ALLOW_PROTOCOL", "file")
+                    .env("GIT_PROTOCOL_FROM_USER", "0")
+                    .args(["fetch", "--no-tags", "--quiet", "--"])
+                    .arg(&worker_git)
+                    .arg(&refspec)
+                    .stdin(Stdio::null())
+                    .output();
+                report(
+                    output,
+                    &format!("fetch worker HEAD from {}", worker_git.display()),
+                )?;
+                let fetched = self.commit_id_of(&worker_ref)?;
+                if fetched != head_sha {
+                    return Err(WorkspaceError::Unavailable(format!(
+                        "fetched worker HEAD {fetched} did not match workspace HEAD {head_sha}"
+                    )));
+                }
+            }
+            resolved = Some(head_sha);
+        }
+        if resolved.is_none() {
+            resolved = self.commit_id_of(&worker_ref).ok();
+        }
+        let Some(head_sha) = resolved else {
+            return Ok(None);
+        };
+        for target in target_refs {
+            if self.commit_id_of(target).ok().as_deref() != Some(head_sha.as_str()) {
+                self.git_output(&["update-ref", target, &head_sha])?;
+            }
+        }
+        CommitId::new(head_sha)
+            .map(Some)
+            .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
+    }
+
+    pub(crate) fn preserve_worker_head_best_effort(&self, branch: &str, directory: &Path) {
+        if let Err(error) = self.pin_worker_head(branch, Some(directory), &[]) {
+            eprintln!("spawn: worker commit preservation skipped for {branch}: {error}");
+        }
     }
 
     /// Whether a merge of `main` into `branch` waits for its conflict
@@ -5043,6 +5228,161 @@ mod tests {
             !leftover_idx,
             "cancelled prewarmed index must be cleaned up"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #103 & #110: multi-commit worker history inside workspace `.git`
+    /// is preserved across checkpoints, report/accept pins, unmount, and
+    /// aggressive `git gc`, with original authors/messages intact and
+    /// strictly separate from synthetic `refs/heads/<agent>` checkpoints.
+    fn run_worker_git(ws_dir: &Path, args: &[&str]) -> String {
+        let out = super::test_git_command()
+            .current_dir(ws_dir)
+            .env("GIT_AUTHOR_NAME", "Worker Alice")
+            .env("GIT_AUTHOR_EMAIL", "alice@worker.local")
+            .args(args)
+            .output()
+            .expect("run worker git");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn worker_inner_git_commits_survive_unmount_and_gc_and_can_cherry_pick() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-worker-commits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (checkout, work) = (base.join("repo"), base.join("work"));
+        std::fs::create_dir_all(&checkout).expect("create repo");
+        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(checkout.join("README.md"), "base\n").expect("write base");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "base commit"]);
+        let store = GitWorkspace::new(checkout.join(".git"), &work);
+        let branch = BranchName::new("agent_worker_w1").expect("valid branch");
+        store.ensure_branch(&branch, None).expect("ensure branch");
+        let ws = store.mount(&branch).expect("mount");
+        let ws_dir = PathBuf::from(ws.path());
+        run_worker_git(&ws_dir, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(ws_dir.join("README.md"), "base\n").expect("base");
+        std::fs::write(ws_dir.join("feature.rs"), "pub fn one() -> i32 { 1 }\n").expect("f1");
+        run_worker_git(&ws_dir, &["add", "-A"]);
+        run_worker_git(&ws_dir, &["commit", "-qm", "worker commit one"]);
+        let sha1 = run_worker_git(&ws_dir, &["rev-parse", "HEAD"]);
+        std::fs::write(ws_dir.join("feature.rs"), "pub fn two() -> i32 { 2 }\n").expect("f2");
+        run_worker_git(&ws_dir, &["add", "-A"]);
+        run_worker_git(&ws_dir, &["commit", "-qm", "worker commit two"]);
+        let sha2 = run_worker_git(&ws_dir, &["rev-parse", "HEAD"]);
+        assert!(matches!(
+            store
+                .commit(&ws, "spawn checkpoint exec_1")
+                .expect("commit"),
+            Commit::Created(_)
+        ));
+        let head_ref = super::task_head_ref(42, "head");
+        let pinned = store
+            .pin_worker_head(branch.as_str(), Some(&ws_dir), &[&head_ref])
+            .expect("pin head")
+            .expect("some commit");
+        assert_eq!(pinned.as_str(), sha2);
+        store.unmount(&ws).expect("unmount");
+        assert!(!ws_dir.exists(), "workspace deleted on unmount");
+        let accepted_ref = super::task_head_ref(42, "accepted");
+        let accepted = store
+            .pin_worker_head(branch.as_str(), None, &[&accepted_ref])
+            .expect("pin accepted post-unmount")
+            .expect("still pinned in bare repo");
+        assert_eq!(accepted.as_str(), sha2);
+        git(&checkout, &["gc", "--prune=now", "--aggressive", "-q"]);
+        for sha in [&sha1, &sha2] {
+            let cat = run_worker_git(&checkout, &["cat-file", "-t", sha]);
+            assert_eq!(cat, "commit", "{sha}");
+        }
+        let meta = run_worker_git(&checkout, &["log", "-1", "--format=%an <%ae> %s", &sha2]);
+        assert_eq!(meta, "Worker Alice <alice@worker.local> worker commit two");
+        assert_ne!(
+            store
+                .commit_id_of(&format!("refs/heads/{branch}"))
+                .expect("branch"),
+            sha2
+        );
+        run_worker_git(&checkout, &["cherry-pick", &sha1, &sha2]);
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("feature.rs")).expect("picked"),
+            "pub fn two() -> i32 { 2 }\n"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worker_head_refuses_symlinks_gitdir_escapes_and_non_spawn_refs_and_handles_unborn_repo() {
+        let base = std::env::temp_dir().join(format!("spawn-worker-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let checkout = base.join("repo");
+        let work = base.join("work");
+        let outside = base.join("outside.git");
+        std::fs::create_dir_all(&checkout).expect("create repo");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(checkout.join("README.md"), "base\n").expect("write base");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "base commit"]);
+        git(&outside, &["init", "--bare", "-q"]);
+
+        let store = GitWorkspace::new(checkout.join(".git"), &work);
+        let branch = BranchName::new("agent_worker_guard").expect("valid branch");
+        store.ensure_branch(&branch, None).expect("ensure branch");
+        let ws = store.mount(&branch).expect("mount");
+        let ws_dir = PathBuf::from(ws.path());
+
+        // Refuses non-refs/spawn/ targets.
+        let err = store
+            .pin_worker_head(branch.as_str(), Some(&ws_dir), &["refs/heads/main"])
+            .unwrap_err();
+        assert!(err.to_string().contains("refs/spawn/"), "{err}");
+
+        // Unborn .git yields None cleanly.
+        let init = super::test_git_command()
+            .current_dir(&ws_dir)
+            .args(["init", "-q"])
+            .output()
+            .expect("init");
+        assert!(init.status.success());
+        assert_eq!(
+            store
+                .pin_worker_head(
+                    branch.as_str(),
+                    Some(&ws_dir),
+                    &[&super::task_head_ref(1, "head")]
+                )
+                .expect("unborn ok"),
+            None
+        );
+        std::fs::remove_dir_all(ws_dir.join(".git")).expect("rm .git");
+
+        // Escaping gitdir file is refused.
+        std::fs::write(
+            ws_dir.join(".git"),
+            format!("gitdir: {}\n", outside.display()),
+        )
+        .expect("write gitdir");
+        let err = store
+            .pin_worker_head(branch.as_str(), Some(&ws_dir), &[])
+            .unwrap_err();
+        assert!(err.to_string().contains("escaping workspace"), "{err}");
+        std::fs::remove_file(ws_dir.join(".git")).expect("rm .git file");
+
+        // Symlink .git is refused cleanly, yet unmount still succeeds.
+        std::os::unix::fs::symlink(&outside, ws_dir.join(".git")).expect("symlink");
+        let err = store
+            .pin_worker_head(branch.as_str(), Some(&ws_dir), &[])
+            .unwrap_err();
+        assert!(err.to_string().contains("symlink .git"), "{err}");
+        store.unmount(&ws).expect("unmount tolerates symlink .git");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

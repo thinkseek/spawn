@@ -1082,6 +1082,19 @@ impl WorkspaceStore for MissionWorkspaces {
     ) -> Result<(), WorkspaceError> {
         let routed = self.route(workspace.sandbox())?;
         routed.store.unmount_when(workspace, ready)?;
+        if let Some((repo, source)) = &routed.mirror
+            && receives_branches(source)
+        {
+            let worker_ref = spawn_host::git::worker_head_ref(workspace.sandbox());
+            if ref_commit(repo, &worker_ref).is_some() {
+                match crate::push::push_ref(repo, source, &worker_ref, &worker_ref) {
+                    Pushed::Done => {}
+                    Pushed::Rejected(why) | Pushed::Failed(why) => {
+                        eprintln!("sources: push {worker_ref}: {why}");
+                    }
+                }
+            }
+        }
         self.unmounted(&routed.store);
         Ok(())
     }
@@ -1156,6 +1169,97 @@ impl WorkspaceStore for MissionWorkspaces {
         }
         Ok(merged)
     }
+}
+
+/// Resolves the bare repository (and optional mission source) that backs `agent_id`.
+fn resolve_task_repo(
+    store: &PostgresStore,
+    default_repo: Option<&Path>,
+    root: &Path,
+    agent_id: &str,
+) -> Result<Option<(PathBuf, Option<String>)>, String> {
+    match store
+        .agent_source(agent_id)
+        .map_err(|error| format!("mission source of {agent_id}: {error}"))?
+    {
+        Some(source) => {
+            let repo = ensure_mirror(root, source.as_deref()).map_err(|error| error.to_string())?;
+            Ok(Some((repo, source)))
+        }
+        None => Ok(default_repo
+            .filter(|repo| repo.exists())
+            .map(|repo| (repo.to_path_buf(), None))),
+    }
+}
+
+/// Pins worker-authored `.git` commits inside `<root>/<agent_id>` (or already
+/// preserved on `refs/spawn/workers/<agent_id>/head`) onto `refs/spawn/tasks/<task_id>/<stage>`,
+/// pushing both refs to `source` when `source` receives branches.
+pub(crate) fn persist_worker_commits_to_repo(
+    repo: &Path,
+    source: Option<&str>,
+    root: &Path,
+    agent_id: &str,
+    task_id: i64,
+    stage: &str,
+) -> Result<Option<String>, String> {
+    let worker_ref = spawn_host::git::worker_head_ref(agent_id);
+    let task_ref = spawn_host::git::task_head_ref(task_id, stage);
+    let workspace_dir = root.join(agent_id);
+    let dir_opt = workspace_dir.is_dir().then_some(workspace_dir.as_path());
+    let git_store = spawn_host::GitWorkspace::new(repo, root);
+    let pinned = git_store
+        .pin_worker_head(agent_id, dir_opt, &[&task_ref])
+        .map_err(|error| format!("pin {task_ref}: {error}"))?;
+    let Some(commit) = pinned else {
+        return Ok(None);
+    };
+    if let Some(source) = source
+        && receives_branches(source)
+    {
+        for reference in [&worker_ref, &task_ref] {
+            match crate::push::push_ref(repo, source, reference, reference) {
+                Pushed::Done => {}
+                Pushed::Rejected(why) | Pushed::Failed(why) => {
+                    eprintln!("sources: push {reference}: {why}");
+                }
+            }
+        }
+    }
+    Ok(Some(commit.as_str().to_string()))
+}
+
+/// Returns whether `refs/spawn/tasks/<task_id>/<stage>` is already pinned in the
+/// bare repository backing `agent_id`.
+pub(crate) fn task_worker_head_pinned(
+    store: &PostgresStore,
+    default_repo: Option<&Path>,
+    root: &Path,
+    agent_id: &str,
+    task_id: i64,
+    stage: &str,
+) -> bool {
+    let Ok(Some((repo, _))) = resolve_task_repo(store, default_repo, root, agent_id) else {
+        return false;
+    };
+    let task_ref = spawn_host::git::task_head_ref(task_id, stage);
+    ref_commit(&repo, &task_ref).is_some()
+}
+
+/// Persists worker-authored commits for `task_id` (`stage`: `"head"` or
+/// `"accepted"`) into the agent's bare repo (and mission source if configured).
+pub(crate) fn persist_task_worker_commits(
+    store: &PostgresStore,
+    default_repo: Option<&Path>,
+    root: &Path,
+    agent_id: &str,
+    task_id: i64,
+    stage: &str,
+) -> Result<Option<String>, String> {
+    let Some((repo, source)) = resolve_task_repo(store, default_repo, root, agent_id)? else {
+        return Ok(None);
+    };
+    persist_worker_commits_to_repo(&repo, source.as_deref(), root, agent_id, task_id, stage)
 }
 
 impl Drop for MissionWorkspaces {
@@ -2485,6 +2589,112 @@ mod tests {
             ])
             .expect("clean up");
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worker_commits_persist_through_mirror_to_source_across_unmount_and_gc() {
+        use super::{persist_worker_commits_to_repo, ref_commit};
+        use std::path::PathBuf;
+
+        let base = std::env::temp_dir().join(format!(
+            "spawn-sources-worker-commits-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let source = base.join("source.git");
+        let work = base.join("work");
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&work).expect("work");
+        std::fs::create_dir_all(&seed).expect("seed");
+        git(&["init", "--bare", "-q", &source.to_string_lossy()]).expect("init bare source");
+        git(&[
+            "-C",
+            &seed.to_string_lossy(),
+            "init",
+            "-q",
+            "--initial-branch=main",
+        ])
+        .expect("init seed");
+        std::fs::write(seed.join("README.md"), "root\n").expect("write readme");
+        git(&["-C", &seed.to_string_lossy(), "add", "-A"]).expect("add seed");
+        git(&["-C", &seed.to_string_lossy(), "commit", "-qm", "root"]).expect("commit seed");
+        git(&[
+            "-C",
+            &seed.to_string_lossy(),
+            "push",
+            "-q",
+            &source.to_string_lossy(),
+            "HEAD:refs/heads/main",
+        ])
+        .expect("push main");
+
+        let source_str = source.to_string_lossy().to_string();
+        let mirror = ensure_mirror(&work, Some(&source_str)).expect("ensure mirror");
+        let store = spawn_host::GitWorkspace::new(&mirror, &work);
+        let branch = BranchName::new("agent_worker_m").expect("branch");
+        store.ensure_branch(&branch, None).expect("ensure branch");
+        let ws = store.mount(&branch).expect("mount");
+        let ws_dir = PathBuf::from(ws.path());
+
+        let ws_str = ws_dir.to_string_lossy().to_string();
+        git(&["-C", &ws_str, "init", "-q", "--initial-branch=main"]).expect("worker init");
+        std::fs::write(ws_dir.join("work.txt"), "one\n").expect("write work");
+        git(&["-C", &ws_str, "add", "-A"]).expect("worker add");
+        git(&["-C", &ws_str, "commit", "-qm", "authored work"]).expect("worker commit");
+        let sha = git(&["-C", &ws_str, "rev-parse", "HEAD"]).expect("worker head");
+
+        let pinned = persist_worker_commits_to_repo(
+            &mirror,
+            Some(&source_str),
+            &work,
+            branch.as_str(),
+            77,
+            "head",
+        )
+        .expect("persist head")
+        .expect("sha returned");
+        assert_eq!(pinned, sha);
+
+        store.unmount(&ws).expect("unmount");
+        assert!(!ws_dir.exists());
+
+        let accepted = persist_worker_commits_to_repo(
+            &mirror,
+            Some(&source_str),
+            &work,
+            branch.as_str(),
+            77,
+            "accepted",
+        )
+        .expect("persist accepted")
+        .expect("sha returned post unmount");
+        assert_eq!(accepted, sha);
+
+        git(&[
+            "--git-dir",
+            &source_str,
+            "gc",
+            "--prune=now",
+            "--aggressive",
+            "-q",
+        ])
+        .expect("source gc");
+        for r in [
+            spawn_host::git::worker_head_ref(branch.as_str()),
+            spawn_host::git::task_head_ref(77, "head"),
+            spawn_host::git::task_head_ref(77, "accepted"),
+        ] {
+            assert_eq!(
+                ref_commit(&source, &r).as_deref(),
+                Some(sha.as_str()),
+                "{r}"
+            );
+        }
+        assert_eq!(
+            git(&["--git-dir", &source_str, "cat-file", "-t", &sha]).expect("cat-file"),
+            "commit"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -88,6 +88,12 @@ fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, O
     if let Some(stand_in) = &stand_in {
         eprintln!("{}", stand_in.said());
     }
+    if let Err(why) = archive_mask.preflight() {
+        if crate::config::env_value("SPAWN_ARCHIVE_MASK_STRICT").as_deref() == Some("1") {
+            return Err(format!("archive mask preflight failed: {why}"));
+        }
+        eprintln!("spawn loop WARNING: archive mask preflight: {why}");
+    }
     let pinned = spawn_host::archive_mask::loop_roots(
         stand_in.as_ref(),
         &roots[0],
