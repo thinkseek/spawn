@@ -112,14 +112,6 @@ fn empty_snapshot() -> Digest {
     Manifest::default().digest()
 }
 
-fn cas_error(error: CasError) -> String {
-    error.to_string()
-}
-
-fn store_error(error: spawn_core::port::StoreError) -> String {
-    error.to_string()
-}
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -150,9 +142,8 @@ fn resolved(path: &Path) -> PathBuf {
     if let Ok(path) = std::fs::canonicalize(path) {
         return path;
     }
-    let absolute = std::env::current_dir()
-        .map(|here| here.join(path))
-        .unwrap_or_else(|_| path.to_path_buf());
+    let absolute =
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |here| here.join(path));
     match (absolute.parent(), absolute.file_name()) {
         (Some(parent), Some(name)) if parent != absolute => resolved(parent).join(name),
         _ => absolute,
@@ -444,7 +435,7 @@ fn attribution(
     kind: ProvChangeKind,
 ) -> Result<Attribution, String> {
     if let Some(task) = task {
-        let facts = store.prov_task_facts(&[task]).map_err(store_error)?;
+        let facts = store.prov_task_facts(&[task]).map_err(|error| error.to_string())?;
         let facts = facts
             .get(&task)
             .ok_or_else(|| format!("task {task} is unknown"))?;
@@ -499,7 +490,7 @@ fn used_edges(store: &PostgresStore, args: &SnapshotArgs) -> Result<Vec<ProvEdge
         check_ref(input)?;
         let head = store
             .prov_head(&domain_of(input))
-            .map_err(store_error)?
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("--input {input}: data:{input} has no snapshot"))?;
         push(
             head.result.clone(),
@@ -571,7 +562,7 @@ pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Val
         other => other.to_string(),
     })?;
     check_no_transcripts(&root, &manifest)?;
-    let cas = Store::open(&cas_path).map_err(cas_error)?;
+    let cas = Store::open(&cas_path).map_err(|error| error.to_string())?;
     let snapshot = cas
         .put_snapshot(&root, &manifest, args.digest_only)
         .map_err(|error| {
@@ -586,7 +577,7 @@ pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Val
         })?;
     let domain = domain_of(&args.name);
     let change_id = change_id_of(&args.name);
-    let mut changes = store.prov_domain_changes(&domain).map_err(store_error)?;
+    let mut changes = store.prov_domain_changes(&domain).map_err(|error| error.to_string())?;
     let head = changes.first().cloned();
     let mut recorded = None;
     if head.as_ref().map(|head| head.result.as_str()) != Some(snapshot.to_string().as_str()) {
@@ -621,28 +612,28 @@ pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Val
         };
         store
             .record_change(&change, &rows, &edges)
-            .map_err(store_error)?;
+            .map_err(|error| error.to_string())?;
         recorded = Some((
             change.rev,
             kind,
             rows.len(),
             rows.iter().any(|row| row.class == ProvEntryClass::Tree),
         ));
-        changes = store.prov_domain_changes(&domain).map_err(store_error)?;
+        changes = store.prov_domain_changes(&domain).map_err(|error| error.to_string())?;
     }
     let kept = cas
         .keep_snapshots(&args.name, &newest_results(&changes))
-        .map_err(cas_error)?;
+        .map_err(|error| error.to_string())?;
     // A snapshot another ref's pin dropped meanwhile may have taken a
     // shared object: store what is missing again.
     if !args.digest_only
         && !cas
             .snapshot_missing(&snapshot)
-            .map_err(cas_error)?
+            .map_err(|error| error.to_string())?
             .is_empty()
     {
         cas.put_snapshot(&root, &manifest, false)
-            .map_err(cas_error)?;
+            .map_err(|error| error.to_string())?;
     }
     let digests = |list: &[Digest]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
     Ok(json!({
@@ -668,7 +659,7 @@ pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Val
 /// snapshots its pin keeps.
 pub(crate) fn refs(store: &PostgresStore, cas: Option<&Store>) -> Result<Value, String> {
     let mut out = Vec::new();
-    for head in store.prov_heads(DOMAIN_PREFIX).map_err(store_error)? {
+    for head in store.prov_heads(DOMAIN_PREFIX).map_err(|error| error.to_string())? {
         let name = head
             .head
             .domain
@@ -678,7 +669,7 @@ pub(crate) fn refs(store: &PostgresStore, cas: Option<&Store>) -> Result<Value, 
         let kept = match cas {
             Some(cas) if check_ref(&name).is_ok() => Some(
                 cas.kept_snapshots(&name)
-                    .map_err(cas_error)?
+                    .map_err(|error| error.to_string())?
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>(),
@@ -722,7 +713,7 @@ fn prepare_rollback(
     check_ref(name)?;
     let target = parse_digest(word)?;
     let domain = domain_of(name);
-    let changes = store.prov_domain_changes(&domain).map_err(store_error)?;
+    let changes = store.prov_domain_changes(&domain).map_err(|error| error.to_string())?;
     let head = changes
         .first()
         .cloned()
@@ -735,7 +726,7 @@ fn prepare_rollback(
     if head.result == target.to_string() {
         return Ok(None);
     }
-    let kept = cas.kept_snapshots(name).map_err(cas_error)?;
+    let kept = cas.kept_snapshots(name).map_err(|error| error.to_string())?;
     let mut refused = None;
     if !kept.contains(&target) {
         refused = Some(format!(
@@ -860,10 +851,10 @@ pub(crate) fn rollback(
     };
     store
         .record_change(&change, &rollback.rows, &[])
-        .map_err(store_error)?;
+        .map_err(|error| error.to_string())?;
     let mut newest = vec![rollback.target.clone()];
     newest.extend(newest_results(&rollback.changes));
-    let kept = cas.keep_snapshots(name, &newest).map_err(cas_error)?;
+    let kept = cas.keep_snapshots(name, &newest).map_err(|error| error.to_string())?;
     answer["recorded"] = json!(true);
     answer["kept"] = json!(
         kept.kept

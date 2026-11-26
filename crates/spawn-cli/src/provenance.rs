@@ -838,7 +838,7 @@ fn later_on_paths(
 struct Radius {
     /// The start Changes, never in their own radius.
     start: HashSet<i64>,
-    radius: BTreeMap<i64, Value>,
+    nodes: BTreeMap<i64, Value>,
     depths: HashMap<i64, i64>,
     used: BTreeMap<i64, Value>,
 }
@@ -854,7 +854,7 @@ impl Radius {
         } else {
             self.used.remove(&id);
         }
-        self.radius.insert(id, shown);
+        self.nodes.insert(id, shown);
     }
 }
 
@@ -939,7 +939,7 @@ fn dependents(
             found.add(node.id, depth, shown, by_used);
         }
     }
-    Ok((found.radius, found.used))
+    Ok((found.nodes, found.used))
 }
 
 /// The arguments of a plan: its words, whether `--plan` was given, and
