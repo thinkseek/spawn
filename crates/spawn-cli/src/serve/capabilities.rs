@@ -376,14 +376,8 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
                 continue;
             }
         };
-        let run = |arguments: &[&str], limit: Duration| match prefix.split_first() {
-            None => (host.run)(&program, arguments, limit),
-            Some((view, words)) => {
-                let mut all: Vec<&str> = words.to_vec();
-                all.push(&program);
-                all.extend_from_slice(arguments);
-                (host.run)(view, &all, limit)
-            }
+        let run = |arguments: &[&str], limit: Duration| {
+            run_in(host.run, &prefix, &program, arguments, limit)
         };
         let answer = run(&["--version"], VERSION_LIMIT);
         let version = answer
@@ -429,6 +423,26 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
         drop(boxed);
     }
     Probe { at_ms, engines }
+}
+
+/// `run` of `program` with `arguments` within `limit`, after `prefix` (a
+/// view's words ending in `--`) when there is one.
+fn run_in(
+    run: Run<'_>,
+    prefix: &[&str],
+    program: &str,
+    arguments: &[&str],
+    limit: Duration,
+) -> Result<String, String> {
+    match prefix.split_first() {
+        None => run(program, arguments, limit),
+        Some((view, words)) => {
+            let mut all: Vec<&str> = words.to_vec();
+            all.push(program);
+            all.extend_from_slice(arguments);
+            run(view, &all, limit)
+        }
+    }
 }
 
 /// What delivery may start, from `probe`: every enabled engine besides
