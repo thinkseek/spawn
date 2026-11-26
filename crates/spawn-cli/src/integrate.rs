@@ -5040,15 +5040,16 @@ impl Judge {
                 given,
                 env,
                 base_check,
-                ..
+                job_id,
+                belief,
             } => {
                 if !verdict.accepted
                     && test_database
                     && host::host_fault(&verdict.reason, &verdict.output, Vec::new).is_some()
                 {
                     println!(
-                        "integrate: task {}: the node's rejection reads as its test database's \
-                         fault: judged on this host",
+                        "integrate: task {}: the node's rejection on {job_id} reads as its test \
+                         database's fault ({belief} not applied): judged on this host",
                         task.id
                     );
                     return None;
