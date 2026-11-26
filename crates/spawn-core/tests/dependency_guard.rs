@@ -624,54 +624,252 @@ fn production_std_net_ratchet_matches_phase2d_allowlist() {
     }
 }
 
-/// Issue #98 boundary guard: all eight audited core/data/host/protocol
-/// library crates explicitly declare `#![forbid(unsafe_code)]`,
-/// `#![warn(missing_docs)]`, and contain zero non-test `unsafe` tokens in
-/// `src/`.
-#[test]
-fn pure_crates_forbid_unsafe_code() {
-    const AUDITED_SAFE_CRATES: [&str; 8] = [
-        "spawn-core",
-        "spawn-postgres",
-        "spawn-host",
-        "spawn-node-proto",
-        "spawn-cas",
-        "spawn-kdf",
-        "spawn-codegraph",
-        "spawn-jev",
-    ];
+struct SafeCratePolicy {
+    name: &'static str,
+    entry_files: &'static [&'static str],
+    require_missing_docs: bool,
+}
 
-    let root = repo_root();
-    for krate in AUDITED_SAFE_CRATES {
-        let src_root = root.join("crates").join(krate).join("src");
-        let lib_rs = fs::read_to_string(src_root.join("lib.rs")).expect("read crate lib.rs");
-        assert!(
-            lib_rs
-                .lines()
-                .any(|line| line.trim() == "#![forbid(unsafe_code)]"),
-            "{krate}/src/lib.rs must declare #![forbid(unsafe_code)]"
-        );
-        assert!(
-            lib_rs
-                .lines()
-                .any(|line| line.trim() == "#![warn(missing_docs)]"),
-            "{krate}/src/lib.rs must declare #![warn(missing_docs)]"
-        );
-        let mut files = Vec::new();
-        collect_rs_files(&src_root, &mut files);
-        files.sort();
-        assert!(!files.is_empty(), "expected files under {krate}/src");
-        for path in files {
-            if is_test_only_src_file(&src_root, &path) {
+const SAFE_WORKSPACE_CRATES: [SafeCratePolicy; 11] = [
+    SafeCratePolicy {
+        name: "spawn-core",
+        entry_files: &["lib.rs"],
+        require_missing_docs: true,
+    },
+    SafeCratePolicy {
+        name: "spawn-postgres",
+        entry_files: &["lib.rs"],
+        require_missing_docs: true,
+    },
+    SafeCratePolicy {
+        name: "spawn-host",
+        entry_files: &["lib.rs"],
+        require_missing_docs: true,
+    },
+    SafeCratePolicy {
+        name: "spawn-node-proto",
+        entry_files: &["lib.rs"],
+        require_missing_docs: true,
+    },
+    SafeCratePolicy {
+        name: "spawn-cas",
+        entry_files: &["lib.rs"],
+        require_missing_docs: true,
+    },
+    SafeCratePolicy {
+        name: "spawn-kdf",
+        entry_files: &["lib.rs"],
+        require_missing_docs: true,
+    },
+    SafeCratePolicy {
+        name: "spawn-codegraph",
+        entry_files: &["lib.rs"],
+        require_missing_docs: true,
+    },
+    SafeCratePolicy {
+        name: "spawn-jev",
+        entry_files: &["lib.rs"],
+        require_missing_docs: true,
+    },
+    SafeCratePolicy {
+        name: "spawn-node-gateway",
+        entry_files: &["lib.rs", "main.rs"],
+        require_missing_docs: true,
+    },
+    SafeCratePolicy {
+        name: "spawn-hc",
+        entry_files: &["main.rs"],
+        require_missing_docs: true,
+    },
+    SafeCratePolicy {
+        name: "spawn-cli",
+        entry_files: &["main.rs"],
+        require_missing_docs: false,
+    },
+];
+
+const UNSAFE_EXEMPT_WORKSPACE_CRATES: [&str; 1] = ["ghostty-vt"];
+
+fn parse_workspace_member_crates(manifest: &str) -> BTreeSet<String> {
+    let mut members = BTreeSet::new();
+    let mut in_workspace = false;
+    let mut in_members = false;
+    for raw_line in manifest.lines() {
+        let trimmed = raw_line.split('#').next().unwrap_or("").trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let chunk = if in_members {
+            trimmed
+        } else if trimmed.starts_with('[') {
+            in_workspace = trimmed == "[workspace]";
+            continue;
+        } else if in_workspace
+            && let Some((key, rhs)) = trimmed.split_once('=')
+            && key.trim() == "members"
+        {
+            let after_open = rhs
+                .trim()
+                .strip_prefix('[')
+                .expect("workspace members must be a TOML array");
+            in_members = true;
+            after_open
+        } else {
+            continue;
+        };
+
+        let (body, closed) = if let Some((before_close, _)) = chunk.split_once(']') {
+            (before_close, true)
+        } else {
+            (chunk, false)
+        };
+        for item in body.split(',') {
+            let entry = item.trim();
+            if entry.is_empty() {
                 continue;
             }
-            let text = fs::read_to_string(&path).expect("read src file");
-            let prod = strip_cfg_test_blocks(&text);
+            let unquoted = entry
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .expect("quoted workspace member path");
+            let krate = unquoted
+                .strip_prefix("crates/")
+                .expect("workspace member must live under crates/");
             assert!(
-                !contains_unsafe_token(&prod),
-                "{} must contain zero non-test unsafe blocks/items",
-                rel_path_unix(&root, &path)
+                !krate.is_empty() && !krate.contains('/'),
+                "unexpected workspace member path {unquoted}"
+            );
+            assert!(
+                members.insert(krate.to_string()),
+                "duplicate workspace member {krate}"
+            );
+        }
+        if closed {
+            in_members = false;
+            break;
+        }
+    }
+    assert!(!in_members, "unterminated workspace members array");
+    assert!(!members.is_empty(), "expected non-empty workspace members");
+    members
+}
+
+fn discover_crates_dir_packages(root: &Path) -> BTreeSet<String> {
+    let mut crates = BTreeSet::new();
+    for entry in fs::read_dir(root.join("crates")).expect("read crates directory") {
+        let entry = entry.expect("crates dir entry");
+        let path = entry.path();
+        if entry.file_type().expect("crates entry file type").is_dir()
+            && path.join("Cargo.toml").is_file()
+        {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("utf-8 crate directory name")
+                .to_string();
+            crates.insert(name);
+        }
+    }
+    crates
+}
+
+fn assert_safe_crate_policy(root: &Path, policy: &SafeCratePolicy) {
+    let krate = policy.name;
+    let src_root = root.join("crates").join(krate).join("src");
+    for root_file in ["lib.rs", "main.rs"] {
+        if src_root.join(root_file).exists() {
+            assert!(
+                policy.entry_files.contains(&root_file),
+                "{krate}/src/{root_file} exists and must be listed in SAFE_WORKSPACE_CRATES"
             );
         }
     }
+    for entry in policy.entry_files {
+        let entry_src = fs::read_to_string(src_root.join(entry)).expect("read crate entry file");
+        assert!(
+            entry_src
+                .lines()
+                .any(|line| line.trim() == "#![forbid(unsafe_code)]"),
+            "{krate}/src/{entry} must declare #![forbid(unsafe_code)]"
+        );
+        if policy.require_missing_docs {
+            assert!(
+                entry_src
+                    .lines()
+                    .any(|line| line.trim() == "#![warn(missing_docs)]"),
+                "{krate}/src/{entry} must declare #![warn(missing_docs)]"
+            );
+        }
+    }
+    let mut files = Vec::new();
+    collect_rs_files(&src_root, &mut files);
+    files.sort();
+    assert!(!files.is_empty(), "expected files under {krate}/src");
+    for path in files {
+        if is_test_only_src_file(&src_root, &path) {
+            continue;
+        }
+        let text = fs::read_to_string(&path).expect("read src file");
+        let prod = strip_cfg_test_blocks(&text);
+        assert!(
+            !contains_unsafe_token(&prod),
+            "{} must contain zero non-test unsafe blocks/items",
+            rel_path_unix(root, &path)
+        );
+    }
+}
+
+/// Issue #98 boundary guard: all 11 safe workspace crates (8 library crates,
+/// `spawn-node-gateway` lib + bin, `spawn-hc`, and `spawn-cli`) declare
+/// `#![forbid(unsafe_code)]`, `#![warn(missing_docs)]` where required, and
+/// contain zero non-test `unsafe` tokens in `src/`.
+#[test]
+fn pure_crates_forbid_unsafe_code() {
+    let root = repo_root();
+    for policy in &SAFE_WORKSPACE_CRATES {
+        assert_safe_crate_policy(&root, policy);
+    }
+}
+
+/// Issue #98 completeness guard: every workspace member crate under `crates/`
+/// except `ghostty-vt` (explicit C FFI bridge) is covered by
+/// [`SAFE_WORKSPACE_CRATES`], preventing future crates from bypassing the lock.
+#[test]
+fn workspace_safe_crate_guard_covers_all_non_exempt_members() {
+    let root = repo_root();
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("read root Cargo.toml");
+    let manifest_members = parse_workspace_member_crates(&manifest);
+    let dir_packages = discover_crates_dir_packages(&root);
+    assert_eq!(
+        manifest_members, dir_packages,
+        "workspace Cargo.toml members must match crate directories under crates/"
+    );
+
+    let mut guarded = BTreeSet::new();
+    for policy in &SAFE_WORKSPACE_CRATES {
+        assert!(
+            guarded.insert(policy.name.to_string()),
+            "duplicate entry in SAFE_WORKSPACE_CRATES: {}",
+            policy.name
+        );
+    }
+
+    let exempt: BTreeSet<String> = UNSAFE_EXEMPT_WORKSPACE_CRATES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    assert!(
+        guarded.is_disjoint(&exempt),
+        "guarded and exempt crate sets must be disjoint"
+    );
+    assert!(
+        exempt.is_subset(&manifest_members),
+        "exempt crates must exist in workspace members"
+    );
+
+    let expected_safe: BTreeSet<String> = manifest_members.difference(&exempt).cloned().collect();
+    assert_eq!(
+        guarded, expected_safe,
+        "every non-exempt workspace crate must be covered by SAFE_WORKSPACE_CRATES"
+    );
 }
