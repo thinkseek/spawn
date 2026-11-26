@@ -397,7 +397,8 @@ fn herdr_required() -> bool {
 /// draws each state agy draws (as agy 1.5.14 does, CR LF line ends; open
 /// work as its task panel of `●` entries and a closing rule between the
 /// prompt box and a footer counting `subagent(s)` and `task(s)`), reads
-/// a line per state change (bash `read -t`, Enter as CR or LF), turns
+/// a line per state change (bash `read -t`, Enter as CR or LF, a bracketed
+/// paste's markers dropped, as `agent.prompt` writes one), turns
 /// bracketed paste on as agy does and off again when it exits (`EXIT`
 /// trap), so the pane is left clean. The banner names a made-up account.
 const STUB_AGY: &str = r#"#!/bin/bash
@@ -432,6 +433,8 @@ draw "$state"
 while true; do
   if IFS= read -r -t 1 line; then
     line=${line%$'\r'}
+    # A bracketed paste (agent.prompt's write) arrives between its markers.
+    line=${line#$'\e[200~'}; line=${line%$'\e[201~'}
     case "$line" in
       "") [ "$state" = trust ] && state=idle ;;
       exit) exit 0 ;;
@@ -660,7 +663,23 @@ fn the_agent_witness_reads_a_stub_agy_through_every_manifest_state() {
     ];
     let mut last = trust;
     for (typed, status, rule, screen) in steps {
-        host.submit_text(&agy, &workspace, typed).expect("typed");
+        if last.status == AgentStatus::Blocked {
+            // Herdr's `agent.prompt` (PR 3's `submit_staged`) may refuse a
+            // blocked agent (`agent_blocked`, nothing typed), depending on
+            // when its own status catches up: the stub is driven past its
+            // dialog through the pane itself, as a person's keyboard would.
+            let pane = session.pane_of(&agy);
+            session.call(
+                "pane.send_text",
+                &serde_json::json!({ "pane_id": pane, "text": typed }),
+            );
+            session.call(
+                "pane.send_keys",
+                &serde_json::json!({ "pane_id": pane, "keys": ["enter"] }),
+            );
+        } else {
+            host.submit_text(&agy, &workspace, typed).expect("typed");
+        }
         let reading = reading_within(&host, &agy, &workspace, |reading| {
             // Herdr counts status changes only: permission to question
             // (blocked to blocked) keeps its seq, and changes its rule.
@@ -695,8 +714,17 @@ fn the_agent_witness_reads_a_stub_agy_through_every_manifest_state() {
         .expect("read");
     assert_eq!(none.agent, None);
 
-    // The stub exits: its EXIT trap turned bracketed paste off again.
-    host.submit_text(&agy, &workspace, "exit").expect("typed");
+    // The stub exits: its EXIT trap turned bracketed paste off again. It
+    // shows its question (blocked), so through the pane as above.
+    let pane = session.pane_of(&agy);
+    session.call(
+        "pane.send_text",
+        &serde_json::json!({ "pane_id": pane, "text": "exit" }),
+    );
+    session.call(
+        "pane.send_keys",
+        &serde_json::json!({ "pane_id": pane, "keys": ["enter"] }),
+    );
     assert_eq!(
         runner_within(&host, &agy, &workspace, &Runner::Gone),
         Runner::Gone
@@ -833,4 +861,105 @@ fn a_server_of_another_protocol_is_refused_naming_both() {
     right
         .terminate(&one, &session.workspace())
         .expect("terminate");
+}
+
+/// Carry list N8: a server whose active detection manifests differ from
+/// the ones the host is pinned to is refused before anything starts,
+/// naming the pinned and the actual version; the host pinned to what the
+/// server has (Herdr 0.9.5's bundled manifests) starts there.
+#[test]
+fn a_server_of_other_detection_manifests_is_refused_naming_both() {
+    let _serial = exclusive();
+    let Some(session) = Session::new() else {
+        return;
+    };
+    let host = session
+        .host()
+        .expecting_manifests(&[("agy", "1999.01.01.1"), ("claude", "2026.10.11.1")]);
+    let one = terminal("spawn-exec_a6");
+    let error = host
+        .start(&session.launch(&one, "exec cat"))
+        .expect_err("other manifests");
+    assert!(
+        error
+            .0
+            .contains("agy pinned 1999.01.01.1, actual 2026.10.05.1"),
+        "{error}"
+    );
+    let right = session.host();
+    right
+        .start(&session.launch(&one, "exec cat"))
+        .expect("start");
+    right
+        .terminate(&one, &session.workspace())
+        .expect("terminate");
+}
+
+/// A process the engine detached from its session (`setsid`, as agy's
+/// background updater does) is still beneath the workspace once the pane
+/// is closed: terminate ends it by pid before it returns.
+#[test]
+fn a_detached_daemon_beneath_the_workspace_is_ended_by_terminate() {
+    let _serial = exclusive();
+    let Some(session) = Session::new() else {
+        return;
+    };
+    let host = session.host();
+    let workspace = session.workspace();
+    let one = terminal("spawn-exec_a7");
+    let pidfile = session.cwd().join("daemon.pid");
+    let script = format!(
+        "setsid sh -c 'echo $$ > {}; exec sleep 60' </dev/null >/dev/null 2>&1 & echo started; exec cat",
+        pidfile.display()
+    );
+    host.start(&session.launch(&one, &script)).expect("start");
+    screen_with(&host, &one, &workspace, "started");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid: u32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the daemon never started");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(Path::new(&format!("/proc/{pid}")).exists());
+    host.terminate(&one, &workspace).expect("terminate");
+    let gone = |pid: u32| {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            stat.split(") ")
+                .nth(1)
+                .is_some_and(|rest| rest.starts_with('Z'))
+        })
+    };
+    assert!(gone(pid), "the detached daemon {pid} outlived terminate");
+}
+
+/// `submit_staged` hands a staged text to the pane's detected agent (the
+/// stub agy) through `agent.prompt`, which submits it: the stub reads the
+/// line and draws the state it names. A pane with no agent Herdr detects
+/// takes chunked `pane.send_text` instead (`agent_not_found`): the plain
+/// shell panes of the tests above type their staged texts that way. Only
+/// the choice of the path for a text past the request line cap is tested,
+/// by `prompt_fits`'s unit test in `src/herdr.rs`.
+#[test]
+fn a_staged_text_reaches_a_detected_agent_through_agent_prompt() {
+    let _serial = exclusive();
+    let Some(session) = Session::new() else {
+        return;
+    };
+    let host = session.host();
+    let workspace = session.workspace();
+    let agy = terminal("spawn-exec_a8");
+    host.start(&session.agy_launch(&agy, "idle"))
+        .expect("start");
+    reading_within(&host, &agy, &workspace, |reading| {
+        reading.agent.as_deref() == Some("agy") && reading.status == AgentStatus::Idle
+    });
+    host.stage_text(&agy, &workspace, "work").expect("stage");
+    host.submit_staged(&agy, &workspace).expect("submit");
+    screen_with(&host, &agy, &workspace, "esc to cancel");
+    host.terminate(&agy, &workspace).expect("terminate");
 }

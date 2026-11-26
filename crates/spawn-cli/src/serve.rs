@@ -145,7 +145,7 @@
 //! [`answers`]'s.
 
 mod answers;
-mod approvals;
+pub(crate) mod approvals;
 pub(crate) mod attention;
 pub(crate) mod core_lines;
 mod digest;

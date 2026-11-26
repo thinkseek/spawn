@@ -128,6 +128,18 @@ These are not about process lifetime. They break when two versions meet.
    `SPAWN_ENGINES` names `agy`, which is unset (`claude`) by default. Landing
    the change enables nothing.
 
+   The `[update]` pin holds only for a server Spawn started itself (Herdr PR
+   3, carry list N8). So every server, whoever started it, is also checked
+   against the agent detection manifests in `MANIFESTS`
+   (`crates/spawn-host/src/herdr.rs`): agy `2026.10.05.1` and claude
+   `2026.10.11.1`. A server whose active version of either differs, or that
+   has none, is refused before anything starts, with a message naming the
+   pinned and the actual version. To move a pin:
+   1. run `herdr server update-agent-manifests`;
+   2. re-run the fixtures and `SPAWN_REQUIRE_HERDR=1 cargo test -p spawn-host
+      --test herdr`;
+   3. edit `MANIFESTS`.
+
 ## What the loop may improve by itself
 
 - Integrator and dispatcher logic.
