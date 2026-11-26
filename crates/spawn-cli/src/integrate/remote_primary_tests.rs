@@ -578,7 +578,7 @@ fn unequal_inputs_strike_and_the_job_goes_to_another_node() {
 /// all). A job sent to another node with none to take it is taken back
 /// once its wait is over (the only node is excluded from it).
 #[test]
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_lines)]
 fn every_fault_row_is_settled_on_the_ledger_and_judged_here() {
     let world = Fixture::new("fault_rows", false, Duration::from_millis(400));
     let red = r#"{"v":1,"host_fault":true,"on":"main","scenario":"check-tests.sh","runs":"1, 1","failures":[{"test":"a::b","message":"m"}]}"#;
@@ -1265,7 +1265,7 @@ fn accepting(
     word: &'static str,
 ) -> std::thread::JoinHandle<Value> {
     std::thread::spawn(move || {
-        let grant = node.lease(Duration::from_secs(60)).expect("a grant");
+        let grant = node.lease(Duration::from_mins(1)).expect("a grant");
         let verdict = verdict_for(word, &grant);
         node.finish(
             &results,
@@ -1393,7 +1393,7 @@ fn a_nodes_trouble_spends_nothing_of_the_missions_budget() {
         let mut node = world.node("n1");
         let results = world.results.clone();
         let ran = std::thread::spawn(move || {
-            let grant = node.lease(Duration::from_secs(60)).expect("a grant");
+            let grant = node.lease(Duration::from_mins(1)).expect("a grant");
             node.finish(&results, &grant, Some(exit), None, "| boom\n", |_| {});
         });
         world.pass();
@@ -1419,7 +1419,7 @@ fn an_urgent_landing_discards_a_judging_waiting_for_a_node() {
     let world = World::new(
         "urgent",
         &noting_gate("accepted"),
-        Some((false, Duration::from_secs(60))),
+        Some((false, Duration::from_mins(1))),
     );
     world
         .integrator

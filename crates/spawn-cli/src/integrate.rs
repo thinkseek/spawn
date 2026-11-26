@@ -1473,12 +1473,9 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         Ok(None) => {}
         Err(error) => eprintln!("integrate: {error}; no shadow judging"),
     }
-    // The shadow judging on spawn-node v1 (shadow.rs, remote.rs), beside
-    // the runner's when both are on; then the candidates' gates on a node
-    // first (SPAWN_GATE_REMOTE=node, remote.rs; unset: all local).
-    integrator = integrator
-        .with_node_shadow_from_env()
-        .with_remote_primary_from_env();
+    // The shadow judging on spawn-node v1 (shadow.rs, remote.rs) beside the
+    // runner's, and the candidates' gates on a node first (remote.rs).
+    integrator = integrator.with_nodes_from_env();
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -2826,6 +2823,15 @@ impl Integrator {
                 self
             }
         }
+    }
+
+    /// What this integrator does with spawn-node v1, from the environment:
+    /// its node shadows ([`Self::with_node_shadow_from_env`]) and the
+    /// primary path ([`Self::with_remote_primary_from_env`]), each its own
+    /// switch.
+    fn with_nodes_from_env(self) -> Self {
+        self.with_node_shadow_from_env()
+            .with_remote_primary_from_env()
     }
 
     /// This integrator judging the candidates' gates on spawn-node v1 first
