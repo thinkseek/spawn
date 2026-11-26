@@ -395,7 +395,12 @@ mod data_domain {
         // Past FOLD_OVER: one tree row per top-level directory, its digests
         // the directory's own manifests.
         let names: Vec<(String, String)> = (0..=FOLD_OVER)
-            .map(|n| (format!("{}/{n}", if n % 2 == 0 { "even" } else { "odd" }), n.to_string()))
+            .map(|n| {
+                (
+                    format!("{}/{n}", if n % 2 == 0 { "even" } else { "odd" }),
+                    n.to_string(),
+                )
+            })
             .collect();
         let mut files: Vec<(&str, &str)> = names
             .iter()
