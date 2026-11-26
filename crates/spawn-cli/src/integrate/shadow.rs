@@ -1899,6 +1899,58 @@ mod tests {
         assert_eq!(world.ledger.records("task.shadow_gated").len(), 1);
     }
 
+    /// The node source's `controller_pack` is cached under a key covering
+    /// what it packs: the same controller is served from the cache, a
+    /// changed `scripts/` (contents or executable bit) or web lockfile is
+    /// packed afresh, never a stale pack.
+    #[test]
+    fn the_node_sources_controller_pack_follows_scripts_and_the_web_lock() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let world = NodeWorld::new("node-pack-key");
+        let mut nodes = world.nodes();
+        let mut offered = 0;
+        let mut pack = |nodes: &mut super::NodeShadows| -> String {
+            let task = world.task();
+            nodes.offer(&world.ledger.store, world.want(task));
+            let waiting = nodes.waiting();
+            offered += 1;
+            assert_eq!(waiting.len(), offered, "{waiting:?}");
+            let row = world
+                .ledger
+                .store
+                .remote_job(waiting.last().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.task_id, Some(task));
+            row.spec["artifact_urls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|url| url["role"] == "controller_pack")
+                .unwrap()["digest"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let gate = world.ctl.join("scripts/gate.sh");
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let first = pack(&mut nodes);
+        assert_eq!(pack(&mut nodes), first, "the same controller, the same pack");
+        std::fs::write(&gate, "exit 1\n").unwrap();
+        let edited = pack(&mut nodes);
+        assert_ne!(edited, first, "an edited gate.sh");
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let executable = pack(&mut nodes);
+        assert!(![&first, &edited].contains(&&executable), "an executable gate.sh");
+        std::fs::write(world.ctl.join("web/package-lock.json"), "{}\n").unwrap();
+        let locked = pack(&mut nodes);
+        assert!(
+            ![&first, &edited, &executable].contains(&&locked),
+            "another web lock"
+        );
+        assert_eq!(pack(&mut nodes), locked);
+    }
+
     /// A node shadow's valid verdict puts the node's strikes back to 0
     /// (`spawn_remote_job_valid`) and leaves `degraded` as it was.
     #[test]
