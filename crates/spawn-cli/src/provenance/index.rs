@@ -1432,7 +1432,9 @@ fn restores(
 /// directory over a touched file. Folding is by top-level directory only,
 /// so comparing each path's top-level directory is exact.
 pub(crate) fn touches_any<'a>(landed: impl IntoIterator<Item = &'a str>, touched: &[&str]) -> bool {
-    let top = |path: &'a str| path.split_once('/').map_or(path, |(top, _)| top);
+    fn top(path: &str) -> &str {
+        path.split_once('/').map_or(path, |(top, _)| top)
+    }
     let paths: HashSet<&str> = touched.iter().copied().collect();
     let tops: HashSet<&str> = touched
         .iter()
