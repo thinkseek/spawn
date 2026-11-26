@@ -294,7 +294,7 @@ capture "$SPAWN_BIN" nonsense
 assert_eq "$status" 1 "unknown subcommand exit"
 assert_contains "$(err)" "unknown command nonsense" "unknown subcommand message"
 
-for gone in status dispatch charter hook corpus judge; do
+for gone in dispatch charter hook corpus judge; do
     capture "$SPAWN_BIN" "$gone"
     assert_eq "$status" 1 "$gone exit"
     assert_contains "$(err)" "unknown command $gone" "$gone is not a command"
@@ -308,14 +308,56 @@ assert_eq "$(out | grep -c '^spawn ')" 1 "001: lines of spawn version starting w
 
 echo "j05: [bb010 cli contract] a missing or invalid flag fails before the store"
 capture "$SPAWN_BIN" submit --agent agent_x --session session_x
-assert_eq "$status" 1 "missing --key exit"
-assert_contains "$(err)" "--key" "missing --key message"
+assert_eq "$status" 1 "missing --action exit"
+assert_contains "$(err)" "--action" "missing --action message"
 
 capture "$SPAWN_BIN" submit --agent agent_x --session session_x --key k1 --action 'nope'
 assert_eq "$status" 1 "invalid action exit"
 assert_contains "$(err)" "--action" "invalid action message"
 
+echo "j05: [bb010 cli contract] spawn say validates arguments before the store"
+capture "$SPAWN_BIN" say
+assert_eq "$status" 1 "say missing args exit"
+assert_contains "$(err)" "say expects <agent> and <message> (got 0 positional arguments)" \
+    "say missing args message"
+
+capture "$SPAWN_BIN" say agent_x
+assert_eq "$status" 1 "say missing message exit"
+assert_contains "$(err)" "say expects <agent> and <message> (got 1 positional arguments)" \
+    "say missing message message"
+
+capture "$SPAWN_BIN" say agent_x "   "
+assert_eq "$status" 1 "say blank message exit"
+assert_contains "$(err)" "message must not be empty" "say blank message message"
+
 assert_eq "$(scalar 'select count(*) from spawn_commands')" 0 "no command was written"
+
+echo "j05: [bb010 cli contract] spawn status and spawn status --json"
+capture "$SPAWN_BIN" status --bogus 1
+assert_eq "$status" 1 "status unknown flag exit"
+assert_contains "$(err)" "unknown flag --bogus" "status unknown flag message"
+
+capture "$SPAWN_BIN" status --json
+assert_eq "$status" 0 "status --json exit"
+out | jq -e '
+    .schema_version == 1 and
+    (.generated_at_ms | type == "number") and
+    (.summary | type == "object") and
+    (.summary.sessions_total == 0) and
+    (.summary.sessions_live == 0) and
+    (.summary.sessions_attention == 0) and
+    (.summary.open_tasks == 0) and
+    (.summary.open_alerts == 0) and
+    (.sessions | type == "array" and length == 0) and
+    (.tasks | type == "array" and length == 0) and
+    (.alerts | type == "array" and length == 0)
+' >/dev/null || fail "status --json payload did not match schema v1: [$(out)]"
+
+capture "$SPAWN_BIN" status
+assert_eq "$status" 0 "status table exit"
+assert_contains "$(out)" "SPAWN STATUS" "status table header"
+assert_eq "$(scalar 'select count(*) from spawn_commands')" 0 "status writes no command"
+assert_eq "$(scalar 'select count(*) from spawn_events')" 0 "status writes no event"
 
 # --- blackbox 060: spawn run -------------------------------------------------------
 part=bb060
@@ -504,9 +546,9 @@ assert_eq "$status" 1 "invalid action exit"
 assert_contains "$(err)" "--action is not a command action" "invalid action message"
 
 capture "$SPAWN_BIN" submit --agent agent_001 --session session_001 \
-    --action '{"type":"stop"}'
-assert_eq "$status" 1 "missing key exit"
-assert_contains "$(err)" "--key is required" "missing key message"
+    --key key-6
+assert_eq "$status" 1 "missing action exit"
+assert_contains "$(err)" "--action is required" "missing action message"
 
 assert_eq "$(scalar 'select count(*) from spawn_commands')" 3 \
     "rejections add no command row"
