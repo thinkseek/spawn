@@ -70,36 +70,32 @@ harness() {
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed grep awk curl python3; do
+for tool in psql git jq od bash sed grep awk curl python3; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 real_runtime=${XDG_RUNTIME_DIR-}
 if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "206"
 SPAWN_DB_NAME="bb_206_runs_$run"
-SPAWN_TMUX_SOCKET="bb-206-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -125,9 +121,9 @@ stop_world() {
         wait "$pid" 2>/dev/null || true
     done
     loop_pid="" serve_pid="" relay_pid=""
-    sessions=$(tmux -L "$SPAWN_TMUX_SOCKET" list-panes -a -F '#{pane_pid}' 2>/dev/null || true)
-    server=$(tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{pid}' 2>/dev/null | head -n 1 || true)
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    sessions=$(herdr_pane_pids)
+    server=$(herdr_server_pid)
+    herdr_kill_server
     i=0
     while :; do
         left=""
@@ -153,6 +149,7 @@ stop_world() {
 }
 cleanup() {
     stop_world
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -272,11 +269,6 @@ while :; do
 done
 ENGINE
 chmod 755 "$WORK/claude"
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_CHEAP_MODEL SPAWN_SMALL_MODEL \
@@ -291,7 +283,6 @@ SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
 # The alert step reads every 2 s (default 30 s).
@@ -312,7 +303,7 @@ SPAWN_DISK_FLOOR_GB=0
 # The supervisor runs, as on the host: its engine is one the Bridge starts.
 SPAWN_SUPERVISOR=1
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_ALERT_CHECK_SECS SPAWN_ALERT_MISSION_IDLE_SECS \
     SPAWN_RECOVER_BACKOFF_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_DELIVERY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \

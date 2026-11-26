@@ -47,22 +47,20 @@ tree=$(pwd)
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed awk curl node; do
+for tool in psql git jq od bash sed awk curl node python3; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
-real_tmux=$(command -v tmux)
 
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -71,16 +69,13 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "214"
 SPAWN_DB_NAME="bb_214_queued_$run"
-SPAWN_TMUX_SOCKET="bb-214-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -118,7 +113,7 @@ stop_serve() {
 cleanup() {
     stop_serve
     stop_loop
-    "$real_tmux" -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -288,24 +283,9 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-# Spawn's tmux, on the private socket. While `refuse` names a terminal, the
-# load of its paste buffer (`spawn-<terminal>`) fails: nothing is typed.
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-if [ -s '$WORK/refuse' ]; then
-    held=\$(cat '$WORK/refuse')
-    load=""
-    for arg in "\$@"; do
-        [ "\$arg" = load-buffer ] && load=1
-        if [ -n "\$load" ] && [ "\$arg" = "spawn-\$held" ]; then
-            echo "bb refuse: the pane of \$held does not take a paste" >&2
-            exit 1
-        fi
-    done
-fi
-exec '$real_tmux' -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
+# herdr-core proxy: while `refuse` names a terminal, staging for that
+# terminal fails before typing (`agent_not_ready`).
+herdr_use_fault_proxy "$WORK" --refuse-stage-file "$WORK/refuse"
 
 # `spawn loop` as systemd runs spawn-loop.service: started again 5 s after
 # it exits (Restart=always, RestartSec=5).
@@ -338,7 +318,6 @@ SPAWN_CLAUDE_PROJECTS=$WORK/projects
 CLAUDE_CONFIG_DIR=$WORK/claude-config
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_MESSAGE_TAKEN_SECS=12
 SPAWN_ALERT_CHECK_SECS=1
@@ -351,7 +330,7 @@ SPAWN_STALL_LANDING_SECS=1800
 SPAWN_STALL_STOP_SECS=1800
 SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL BB_REPO SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS CLAUDE_CONFIG_DIR BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS CLAUDE_CONFIG_DIR BB_PROJECTS BB_WORK SPAWN_WORKER \
     SPAWN_MESSAGE_TAKEN_SECS SPAWN_ALERT_CHECK_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS \
     SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS

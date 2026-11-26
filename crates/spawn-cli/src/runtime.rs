@@ -245,6 +245,7 @@ fn bridge_config_for(herdr_backend: bool) -> Result<BridgeConfig, String> {
     // A workspace builds against the deps store at SUPPLY_PA_DEPS
     // (`gate/scenarios/build`); the pane's engine runs the build, so it gets
     // the path. Unset, the store's default under $HOME stands.
+    config.environment.extend(path_env(env_value));
     config.environment.extend(supply_pa_env(env_value));
     // Engines on a Claude Code directory of their own, when the loop names
     // one (SPAWN_CLAUDE_CONFIG_DIR, issue #79); else the user's own.
@@ -277,14 +278,25 @@ fn bridge_config_for(herdr_backend: bool) -> Result<BridgeConfig, String> {
     Ok(config)
 }
 
+/// Forward a non-empty environment variable verbatim to engine panes.
+fn passthrough_env(lookup: impl Fn(&str) -> Option<String>, name: &str) -> Vec<(String, String)> {
+    lookup(name)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![(name.to_string(), value)])
+        .unwrap_or_default()
+}
+
+/// The caller's `PATH` so engines keep toolchain and scenario wrapper directories
+/// even when the terminal daemon spawns clean or login shells.
+fn path_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    passthrough_env(lookup, "PATH")
+}
+
 /// The deps store's path for engines that build a tree's dependencies
 /// (SUPPLY_PA_DEPS, `gate/scenarios/build`): a path, never a login, and only
 /// what the integrator has.
 fn supply_pa_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
-    lookup("SUPPLY_PA_DEPS")
-        .filter(|value| !value.is_empty())
-        .map(|value| vec![("SUPPLY_PA_DEPS".to_string(), value)])
-        .unwrap_or_default()
+    passthrough_env(lookup, "SUPPLY_PA_DEPS")
 }
 
 /// The variable a test reads its database from.
@@ -758,7 +770,7 @@ fn judge(flags: &Flags) -> Option<Arc<dyn StateJudge>> {
 mod tests {
     use super::{
         FleetTestDatabase, auto_trust, claude_config_env, engine_view, engines, engines_for,
-        resolve_claude_projects, resolve_model_relay, supply_pa_env,
+        path_env, resolve_claude_projects, resolve_model_relay, supply_pa_env,
     };
     use std::sync::Arc;
 
@@ -822,6 +834,12 @@ mod tests {
         );
         assert!(supply_pa_env(environment(&[("SUPPLY_PA_DEPS", "")])).is_empty());
         assert!(supply_pa_env(environment(&[])).is_empty());
+        assert_eq!(
+            path_env(environment(&[("PATH", "/work/bin:/usr/bin")])),
+            [("PATH".to_string(), "/work/bin:/usr/bin".to_string())]
+        );
+        assert!(path_env(environment(&[("PATH", "")])).is_empty());
+        assert!(path_env(environment(&[])).is_empty());
     }
 
     #[test]

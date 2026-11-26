@@ -45,19 +45,6 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
-SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
-if [ -z "$SPAWN_HC" ]; then
-    spawn_dir=$(dirname "$SPAWN_BIN")
-    if [ -x "$spawn_dir/spawn-hc" ]; then
-        SPAWN_HC=$spawn_dir/spawn-hc
-    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
-        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
-    elif command -v spawn-hc >/dev/null 2>&1; then
-        SPAWN_HC=$(command -v spawn-hc)
-    fi
-fi
-[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
-    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
@@ -69,33 +56,28 @@ done
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and isolated XDG dirs, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
 mkdir -p "$HOME"
-[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home";; esac
 export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
-# launch's environment file, herdr-core sockets/state) stays in WORK, never
+# launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
 real_runtime=${XDG_RUNTIME_DIR-}
 if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/r
-XDG_STATE_HOME=$WORK/state
-XDG_CONFIG_HOME=$WORK/config
-mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
-export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
-hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 SPAWN_DB_NAME="bb_j03_human_$run"
-SPAWN_HERDR_SESSION="bb-j03-$hc_id"
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "j03"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 # The 038 part's own directory: its engine log, captures and markers.
 KWORK=$WORK/k
 mkdir -p "$KWORK"
@@ -116,25 +98,6 @@ stop_loop() {
         loop_pid=""
     fi
 }
-hc() {
-    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
-        HC_SESSION="$SPAWN_HERDR_SESSION" \
-        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
-        "$SPAWN_HC" "$@"
-}
-stop_herdr() {
-    [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ] || return 0
-    for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
-        jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
-        hc kill "$addr" >/dev/null 2>&1 || true
-    done
-    hc server stop >/dev/null 2>&1 || true
-    hc_wait=0
-    while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
-        hc_wait=$((hc_wait + 1))
-        sleep 0.1
-    done
-}
 cleanup() {
     if [ -n "$k_pid" ]; then
         kill "$k_pid" 2>/dev/null || true
@@ -146,7 +109,7 @@ cleanup() {
         kill "$serve_pid" 2>/dev/null || true
     fi
     stop_loop
-    stop_herdr
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -245,10 +208,9 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # `note-end <time> <tag>` at its end), or anything else (4 s, like a note).
 cat >"$WORK/claude-echo" <<'ENGINE'
 #!/usr/bin/env bash
-[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 while [ $# -gt 0 ]; do
-  case "$1" in --resume | --session-id) native=$2 ;; esac
+  case "$1" in --resume | --session-id) native=$2;; esac
   shift
 done
 dir=$BB_PROJECTS/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
@@ -315,8 +277,8 @@ while :; do
     fi
     pending=1
     case "$typed" in
-    *"BB:BUSY "*) [ -n "$job" ] || job="busy ${typed#*BB:BUSY }" ;;
-    *"BB:NOTE "*) [ -n "$job" ] || job="note ${typed#*BB:NOTE }" ;;
+    *"BB:BUSY "*) [ -n "$job" ] || job="busy ${typed#*BB:BUSY }";;
+    *"BB:NOTE "*) [ -n "$job" ] || job="note ${typed#*BB:NOTE }";;
     esac
   elif [ "$pending" = 1 ] && [ -z "$partial" ]; then
     # Quiet, and no line half read: the turn starts.
@@ -327,11 +289,11 @@ while :; do
       log busy-start "$3"
       run_turn "$2" "t$turns"
       log busy-end "$3"
-      ;;
+;;
     note)
       run_turn 4 "t$turns"
       log note-end "$2"
-      ;;
+;;
     esac
     job=
     pending=0
@@ -350,10 +312,9 @@ chmod 755 "$WORK/claude-echo"
 # logged `during <time> <text>` and ignored.
 cat >"$WORK/claude-keys" <<'ENGINE'
 #!/usr/bin/env bash
-[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 while [ $# -gt 0 ]; do
-  case "$1" in --resume | --session-id) native=$2 ;; esac
+  case "$1" in --resume | --session-id) native=$2;; esac
   shift
 done
 dir=$BB_PROJECTS/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
@@ -390,12 +351,12 @@ end_turn() {
     # the prompt.
     unspin
     printf '  ⎿  Interrupted · What should Claude do instead?\r\n\r\n❯ '
-    ;;
+;;
   *)
     line '"type":"system","subtype":"turn_duration","durationMs":1'
     unspin
     printf '✻ Churned for 4s · done\r\n❯ '
-    ;;
+;;
   esac
   turn_end=
 }
@@ -420,8 +381,8 @@ text() {
     set -- ${1#*BB:BUSY }
     turn_end=$(($(date +%s) + $1)) tag=$2 kind=busy
     log busy-start "$tag"
-    ;;
-  *) turn_end=$(($(date +%s) + 4)) tag=$1 kind=note ;;
+;;
+  *) turn_end=$(($(date +%s) + 4)) tag=$1 kind=note;;
   esac
   next_tool=0
   spinner
@@ -429,7 +390,7 @@ text() {
 # A lone y or n waits for what follows: a CR makes it text, anything else
 # (or quiet) makes it the key.
 flush() {
-  case "$buf" in y | n) key "$buf"; buf= ;; esac
+  case "$buf" in y | n) key "$buf"; buf=;; esac
 }
 printf 'Welcome to Claude Code\r\n\r\n❯ '
 buf=
@@ -458,21 +419,21 @@ while :; do
       IFS= read -r -s -n 2 -d '' -t 0.05 rest || true
       flush
       case "$rest" in
-      '') key escape ;;
-      '[A') key up ;;
-      '[B') key down ;;
-      '[C') key right ;;
-      '[D') key left ;;
-      *) key "other-$(printf '%s' "$rest" | od -An -tx1 | tr -d ' ')" ;;
+      '') key escape;;
+      '[A') key up;;
+      '[B') key down;;
+      '[C') key right;;
+      '[D') key left;;
+      *) key "other-$(printf '%s' "$rest" | od -An -tx1 | tr -d ' ')";;
       esac
-      ;;
+;;
     $'\r' | $'\n')
       if [ -z "$buf" ]; then key enter; else text "$buf"; buf=; fi
-      ;;
+;;
     *)
       flush
       buf=$buf$c
-      ;;
+;;
     esac
   else
     quiet=$((quiet + 1))
@@ -491,16 +452,15 @@ session_resident_keys)
     BB_WORK='$KWORK'
     export BB_WORK
     exec '$WORK/claude-keys' "\$@"
-    ;;
-*) exec '$WORK/claude-echo' "\$@" ;;
+;;
+*) exec '$WORK/claude-echo' "\$@";;
 esac
 EOF
 chmod 755 "$WORK/claude"
 
+
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
-    SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_TERMINAL_BACKEND \
-    SPAWN_HERDR_MODE SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM SPAWN_TMUX_SOCKET \
-    SPAWN_TMUX_PROGRAM TMUX TMUX_PANE TMUX_TMPDIR; do
+    SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -510,15 +470,13 @@ SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-BB_PATH=$PATH
-SPAWN_HERDR_CORE_PROGRAM=$SPAWN_HC
 SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
 # Free disk is not what this journey is about: no warning, no floor.
 SPAWN_DISK_WARN_GB=0
 SPAWN_DISK_FLOOR_GB=0
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB
 mkdir -p "$SPAWN_WORKSPACE_ROOT"
 : >"$WORK/engine.log"
@@ -573,6 +531,7 @@ say() { send "$1" "$2" "{\"type\":\"input\",\"text\":\"$3\"}"; }
 state_of() { q "select state || ':' || coalesce(succeeded::text, '-') from spawn_commands where id = $1"; }
 error_of() { q "select coalesce(error, '') from spawn_commands where id = $1"; }
 finished() { [ "$(q "select state from spawn_commands where id = $1")" = finished ]; }
+terminal() { [ "$(q "select state in ('finished', 'failed', 'cancelled') from spawn_commands where id = $1")" = t ]; }
 succeeded() { [ "$(state_of "$1")" = finished:true ]; }
 # The Bridge's `command.step` records of command `$1` with step `$2`.
 steps() {
@@ -806,8 +765,8 @@ keys_part() {
     assert_eq "$(q "select count(*) from spawn_commands where session_id = '$SESSION'")" "$commands_before" "(4) commands after the refused key"
     press spawn_supervisor bb-key-stopped escape
     late=$pressed
-    wait_until 30 finished "$late" || fail "(4) the supervisor's key to the stopped session did not finish ($(state_of "$late"))"
-    assert_eq "$(state_of "$late")" finished:false "(4) the supervisor's key to the stopped session"
+    wait_until 30 terminal "$late" || fail "(4) the supervisor's key to the stopped session did not finish ($(state_of "$late"))"
+    assert_eq "$(state_of "$late")" failed:false "(4) the supervisor's key to the stopped session"
     error_of "$late" | grep -q 'runs no execution' ||
         fail "(4) its error does not say the session runs no execution: $(error_of "$late")"
     assert_eq "$(steps "$late" pressing)" 0 "(4) 'pressing' steps of the key to the stopped session"
@@ -963,7 +922,7 @@ DELIVERIES="from spawn_commands where session_id = '$SESSION' and principal = 's
               and action ->> 'type' = 'input' and idempotency_key like 'deliver-$task-%'"
 assert_eq "$(q "select count(*) $DELIVERIES and state = 'finished' and succeeded")" 1 \
     "(4) deliveries of task #$task that succeeded"
-refused=$(q "select count(*) $DELIVERIES and state = 'finished' and not succeeded
+refused=$(q "select count(*) $DELIVERIES and state in ('finished', 'failed') and not succeeded
               and coalesce(error, '') not like '%does not accept input%'")
 [ "$refused" -eq 0 ] ||
     fail "(4) a delivery attempt of task #$task failed otherwise than as refused at once: $(q "select string_agg(idempotency_key || ': ' || error, '; ') $DELIVERIES and not succeeded")"

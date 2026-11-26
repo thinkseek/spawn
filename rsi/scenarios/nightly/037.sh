@@ -94,7 +94,7 @@ harness() {
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed grep awk date; do
+for tool in psql git jq od bash sed grep awk date; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 [ -r /proc/self/stat ] || harness "no /proc: a gate's process cannot be seen"
@@ -102,14 +102,13 @@ done
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
-[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+mkdir -p "$HOME"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home";; esac
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -118,16 +117,13 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_037_drain_$run"
-SPAWN_TMUX_SOCKET="bb-037-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "037"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 TEST_URL=$SPAWN_TEST_DATABASE_URL
 
 # shellcheck source=scripts/pg-url.sh
@@ -157,7 +153,7 @@ cleanup() {
         pid=$(cat "$file" 2>/dev/null) || continue
         kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
     done
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -304,7 +300,7 @@ bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
-  case "$1" in --resume | --session-id) native=$2 ;; esac
+  case "$1" in --resume | --session-id) native=$2;; esac
   shift
 done
 dir=$BB_PROJECTS/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
@@ -344,7 +340,7 @@ while :; do
     session_resident_*"BB:WRITE:"*)
       job=${typed#*BB:WRITE:}
       job=${job%%[!a-z]*}
-      ;;
+;;
     esac
   elif [ "$pending" = 1 ]; then
     if [ -n "$job" ]; then
@@ -369,11 +365,6 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH CLAUDE_CONFIG_DIR SPAWN_GATE_MIN_FREE_GB SPAWN_GATE_JOBS \
@@ -391,7 +382,6 @@ SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
 SPAWN_DISK_WARN_GB=0
@@ -409,7 +399,7 @@ SPAWN_STALL_HALTED_SECS=1800
 # The base warm is on (the default), its pid file and logs under $WORK.
 XDG_CACHE_HOME=$WORK/cache
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_SUPERVISOR \
     SPAWN_MISSION_FILE SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \

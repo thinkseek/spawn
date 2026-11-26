@@ -73,7 +73,7 @@ harness() {
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed grep date; do
+for tool in psql git jq od bash sed grep date; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
@@ -82,24 +82,20 @@ trap 'rm -rf "$WORK"' EXIT
 # A scratch HOME, and the tmux server's socket, in WORK (cc-rules (a)).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
-[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+mkdir -p "$HOME"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home";; esac
+export HOME
 real_runtime=${XDG_RUNTIME_DIR-}
 if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_239_steal_$run"
-SPAWN_TMUX_SOCKET="bb-239-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "239"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -118,7 +114,7 @@ stop_loop() {
 }
 cleanup() {
     stop_loop
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -191,7 +187,7 @@ bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
-  case "$1" in --resume | --session-id) native=$2 ;; esac
+  case "$1" in --resume | --session-id) native=$2;; esac
   shift
 done
 dir=$BB_PROJECTS/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
@@ -221,11 +217,11 @@ while :; do
     fi
     pending=1
     case "$typed" in
-    *"BB:HOLD"*) hold=1 ;;
+    *"BB:HOLD"*) hold=1;;
     *"BB:WRITE:"*)
       job=${typed#*BB:WRITE:}
       job=${job%%[!a-z]*}
-      ;;
+;;
     esac
   elif [ "$pending" = 1 ]; then
     if [ -n "$hold" ]; then
@@ -247,11 +243,6 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH CLAUDE_CONFIG_DIR SPAWN_WORK_STEALING SPAWN_SUPERVISOR SPAWN_STALL_DELIVERY_SECS \
@@ -265,7 +256,6 @@ SPAWN_WORKSPACE_ROOT=$WORK/ws
 SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
 SPAWN_DISK_WARN_GB=0
@@ -281,7 +271,7 @@ SPAWN_STALL_LANDING_SECS=1800
 SPAWN_STALL_STOP_SECS=1800
 SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB \
     SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_REVIEW_SECS \
     SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS
@@ -463,10 +453,10 @@ wait "$d_pid" || true
 ann_rc=$(cat "$WORK/ann.rc")
 dee_rc=$(cat "$WORK/dee.rc")
 case "$ann_rc:$dee_rc" in
-0:0) fail "(2) both takers won T2: ann and dee exited 0" ;;
-0:*) winner=ann loser=dee ;;
-*:0) winner=dee loser=ann ;;
-*) fail "(2) neither taker won T2: ann $ann_rc ($(head -c 200 "$WORK/ann.err")), dee $dee_rc ($(head -c 200 "$WORK/dee.err"))" ;;
+0:0) fail "(2) both takers won T2: ann and dee exited 0";;
+0:*) winner=ann loser=dee;;
+*:0) winner=dee loser=ann;;
+*) fail "(2) neither taker won T2: ann $ann_rc ($(head -c 200 "$WORK/ann.err")), dee $dee_rc ($(head -c 200 "$WORK/dee.err"))";;
 esac
 grep -q -- "spawn: task steal: task $t2 " "$WORK/$loser.err" ||
     fail "(2) the loser's refusal does not start [spawn: task steal: task $t2 ]: $(head -c 300 "$WORK/$loser.err")"
@@ -530,7 +520,7 @@ expect_eq "$(stolen_count "$t2")" 1 "(6) T2 is not moved again after the restart
 
 # --- (7) delivered once, to the taker --------------------------------------------------
 
-delivered_or_after() { case "$(state_of "$1")" in delivered | reported) return 0 ;; *) return 1 ;; esac; }
+delivered_or_after() { case "$(state_of "$1")" in delivered | reported) return 0;; *) return 1;; esac; }
 wait_until 120 delivered_or_after "$t3" || fail "(7) T3 was not delivered: $(state_of "$t3")"
 expect_eq "$(deliveries "$t3" "$ben")" 0 "(7) delivery commands of T3 into ben's session"
 expect_eq "$(deliveries "$t3" "session_resident_$loser")" "$(all_deliveries "$t3")" \

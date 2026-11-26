@@ -84,19 +84,6 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
-SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
-if [ -z "$SPAWN_HC" ]; then
-    spawn_dir=$(dirname "$SPAWN_BIN")
-    if [ -x "$spawn_dir/spawn-hc" ]; then
-        SPAWN_HC=$spawn_dir/spawn-hc
-    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
-        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
-    elif command -v spawn-hc >/dev/null 2>&1; then
-        SPAWN_HC=$(command -v spawn-hc)
-    fi
-fi
-[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
-    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
@@ -108,12 +95,12 @@ done
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
 mkdir -p "$HOME"
-[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home";; esac
 export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
@@ -123,18 +110,13 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/r
-XDG_STATE_HOME=$WORK/state
-XDG_CONFIG_HOME=$WORK/config
-mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
-export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
-hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 SPAWN_DB_NAME="bb_j06_recover_$run"
-SPAWN_HERDR_SESSION="bb-j06-$hc_id"
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "j06"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -164,28 +146,9 @@ stop_loop() {
     wait "$wrapper_pid" 2>/dev/null || true
     wrapper_pid=""
 }
-hc() {
-    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
-        HC_SESSION="$SPAWN_HERDR_SESSION" \
-        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
-        "$SPAWN_HC" "$@"
-}
-stop_herdr() {
-    [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ] || return 0
-    for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
-        jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
-        hc kill "$addr" >/dev/null 2>&1 || true
-    done
-    hc server stop >/dev/null 2>&1 || true
-    hc_wait=0
-    while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
-        hc_wait=$((hc_wait + 1))
-        sleep 0.1
-    done
-}
 cleanup() {
     stop_loop
-    stop_herdr
+    herdr_cleanup
     for pid in $relay_pid $watch_pid; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
@@ -395,15 +358,14 @@ EOF
 # `edit-large` does. Both are logged in engine.log (`wrote`, `edited`).
 bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
-[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 mode=new
 settings=
 while [ $# -gt 0 ]; do
   case "$1" in
-  --resume) native=${2-}; mode=resume; shift ;;
-  --session-id) native=${2-}; mode=new; shift ;;
-  --settings) settings=${2-}; shift ;;
+  --resume) native=${2-}; mode=resume; shift;;
+  --session-id) native=${2-}; mode=new; shift;;
+  --settings) settings=${2-}; shift;;
   esac
   shift
 done
@@ -452,11 +414,11 @@ step() {
   fi
   ask
   case "$code" in
-  200) ;;
-  529) api_error overloaded 529 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'; return 1 ;;
-  401) api_error authentication_failed 401 'API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired. Please obtain a new token or refresh your existing token."}} · Please run /login'; return 1 ;;
-  400) api_error invalid_request 400 'Prompt is too long'; return 1 ;;
-  *) api_error unknown null "API Error: Connection error. (HTTP $code)"; return 1 ;;
+  200);;
+  529) api_error overloaded 529 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'; return 1;;
+  401) api_error authentication_failed 401 'API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired. Please obtain a new token or refresh your existing token."}} · Please run /login'; return 1;;
+  400) api_error invalid_request 400 'Prompt is too long'; return 1;;
+  *) api_error unknown null "API Error: Connection error. (HTTP $code)"; return 1;;
   esac
   n=0
   if [ -f work.txt ]; then n=$(wc -l <work.txt); fi
@@ -504,7 +466,7 @@ while :; do
       line '"type":"user","message":{"role":"user","content":"prompt"}'
     fi
     pending=1
-    case "$typed" in *BB:WORK*) : >"$BB_WORK/working-$agent" ;; esac
+    case "$typed" in *BB:WORK*) : >"$BB_WORK/working-$agent";; esac
   elif [ "$pending" = 1 ]; then
     pending=0
     if [ -f "$BB_WORK/working-$agent" ]; then
@@ -559,9 +521,7 @@ for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_GATE SPAWN_DIS
     SPAWN_LOOP_INTERVAL_MS SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
     SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS SPAWN_CHEAP_MODEL SPAWN_SMALL_MODEL \
-    SPAWN_EXEC_IMAGE SPAWN_SUPERVISED http_proxy https_proxy HTTP_PROXY HTTPS_PROXY SPAWN_TERMINAL_BACKEND SPAWN_HERDR_MODE \
-    SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM TMUX \
-    TMUX_PANE TMUX_TMPDIR; do
+    SPAWN_EXEC_IMAGE SPAWN_SUPERVISED http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -576,8 +536,6 @@ CLAUDE_CONFIG_DIR=$WORK/claude-config
 SPAWN_MODEL_RELAY=http://127.0.0.1:$relay_port
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-BB_PATH=$PATH
-SPAWN_HERDR_CORE_PROGRAM=$SPAWN_HC
 SPAWN_WORKER=worker-bb
 SPAWN_SUPERVISOR=1
 SPAWN_MISSION_FILE=$WORK/mission.md
@@ -602,7 +560,7 @@ SPAWN_STALL_STOP_SECS=1800
 SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL BB_LOOP_DATABASE_URL BB_REPO SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT \
     SPAWN_CLAUDE_PROGRAM SPAWN_CLAUDE_PROJECTS CLAUDE_CONFIG_DIR SPAWN_MODEL_RELAY BB_PROJECTS \
-    BB_WORK BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER SPAWN_SUPERVISOR SPAWN_MISSION_FILE \
+    BB_WORK SPAWN_WORKER SPAWN_SUPERVISOR SPAWN_MISSION_FILE \
     SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_RECOVER_BACKOFF_SECS \
     SPAWN_RECOVER_MODEL_BACKOFF_SECS SPAWN_RECOVER_AUTH_RETRY_SECS SPAWN_RECOVER_PROBE_SECS \
     SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_REVIEW_SECS \
@@ -686,7 +644,7 @@ revival_key() { # the command with the key `recover-<execution>-<attempt>`: `id|
 turn_after() { awk -v a="$1" -v t="$2" '$2 == a && $1 > t { print; exit }' "$WORK/turns.log"; }
 last_line() { # the last line an agent's engine wrote: `ms n` ("0 0" before its first)
     _l=$(cat "$WORK/last-$1" 2>/dev/null) || _l=""
-    case "$_l" in [0-9]*\ [0-9]*) echo "$_l" ;; *) echo "0 0" ;; esac
+    case "$_l" in [0-9]*\ [0-9]*) echo "$_l";; *) echo "0 0";; esac
 }
 working() { # the agent's engine wrote a line within the last 3 s
     set -- "$(last_line "$1")"
@@ -1016,9 +974,9 @@ else
         [ "$step" -le 4 ] || step=4
         turn=$(printf '%s' "$body" | jq -r '.evidence.event_id // empty')
         case "$turn" in
-        '' | *[!0-9]*) turn_at="" ;;
+        '' | *[!0-9]*) turn_at="";;
         *) turn_at=$(sql "select recorded_at_ms from spawn_events
-                             where id = $turn and event_name = 'turn.failed'") ;;
+                             where id = $turn and event_name = 'turn.failed'");;
         esac
         if [ -z "$turn_at" ]; then
             measured_fail "(4) $agent's retry $j names no turn.failed as its evidence: $body"
@@ -1114,10 +1072,10 @@ command_ok() { # <key> <what>: the command finished and succeeded
     state=$(scalar "select state || ' ' || coalesce(succeeded::text, '') || ' ' || coalesce(error, '')
                     from spawn_commands where idempotency_key = '$1'")
     case "$state" in
-    "finished true "*) ;;
+    "finished true "*);;
     *"pane never became ready"* | *"does not accept input"* | *"terminal disappeared"*)
-        harness "$2: $state" ;;
-    *) fail "$2: $state" ;;
+        harness "$2: $state";;
+    *) fail "$2: $state";;
     esac
 }
 # sha256 of a mount's large file, or "missing".

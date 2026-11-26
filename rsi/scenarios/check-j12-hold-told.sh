@@ -457,7 +457,8 @@ for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SP
     SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS \
     SPAWN_ALERT_MEMORY_LOW_MB SPAWN_ALERT_MEMORY_OK_MB SPAWN_ALERT_TMPFS_PATH \
     SPAWN_ALERT_TMPFS_HIGH_MB SPAWN_ALERT_TMPFS_OK_MB SPAWN_ALERT_WINDOW_SECS \
-    SPAWN_ALERT_PG_QUIET_SECS SPAWN_TERMINAL_BACKEND SPAWN_HERDR_MODE \
+    SPAWN_ALERT_PG_QUIET_SECS SPAWN_ALERT_STUCK_IDLE_DWELL_SECS \
+    SPAWN_ALERT_STUCK_QUIET_DWELL_SECS SPAWN_TERMINAL_BACKEND SPAWN_HERDR_MODE \
     SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM \
     TMUX TMUX_PANE TMUX_TMPDIR HERDR_SOCKET_PATH HERDR_SESSION HERDR_PANE_ID \
     HC_SOCKET HC_SESSION; do
@@ -485,6 +486,8 @@ SPAWN_ALERT_UNDELIVERED_SECS=3
 SPAWN_ALERT_ADMISSION_SECS=3
 SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS=4
 SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS=4
+SPAWN_ALERT_STUCK_IDLE_DWELL_SECS=0
+SPAWN_ALERT_STUCK_QUIET_DWELL_SECS=0
 SPAWN_TEST_DATABASE_LOG=$testlog
 SPAWN_DATABASE_LOG=$livelog
 SPAWN_ALERT_TMPFS_PATH=${ram:-$WORK/ram}
@@ -494,6 +497,7 @@ export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGR
     SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_ALERT_CHECK_SECS \
     SPAWN_ALERT_UNDELIVERED_SECS SPAWN_ALERT_ADMISSION_SECS \
     SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS \
+    SPAWN_ALERT_STUCK_IDLE_DWELL_SECS SPAWN_ALERT_STUCK_QUIET_DWELL_SECS \
     SPAWN_TEST_DATABASE_LOG SPAWN_DATABASE_LOG SPAWN_ALERT_TMPFS_PATH
 # Host thresholds the host never crosses (the usual run) and ones it always
 # does (the restarted loop of (6)).
@@ -954,6 +958,7 @@ stuck_from=$(now_ms)
 poke stuck-1
 if fired 30 agent_stuck session_resident_r1 "(7) r1 stuck" "r1 was judged stuck (0.9) after a turn"; then
     obs=$(field '.evidence.event_id // empty')
+    stuck1_key=$key
     [ -n "$obs" ] && [ "$(field '.evidence.stuck >= 0.5')" = true ] ||
         measured_fail "(7) r1's agent_stuck alert names no judgement (evidence.event_id) with stuck >= 0.5: $alert"
     if [ -n "$obs" ]; then within "(7) r1 judged stuck" "$(event_at "$obs")" 5000; fi
@@ -961,16 +966,55 @@ fi
 [ "$(grep -c 'session_resident_r1 0.9' "$WORK/judge.log" || true)" -ge 1 ] ||
     harness "the fake judge was never asked about r1 after its turn"
 if [ -z "$missing" ]; then
-    poke stuck-2
-    pause 8
+    pause 3
     refresh
-    one agent_stuck session_resident_r1 "(7) r1 stuck again after another turn" || true
+    one agent_stuck session_resident_r1 "(7) r1 stays one alert within the same stuck stretch" || true
+    # Starting another working turn (#111 / PR #133) clears the open stuck
+    # alert on rules/progress; finishing that new turn still stuck (0.9)
+    # opens one new stuck alert.
+    poke stuck-2
+    deadline=$(($(now) + 20))
+    while :; do
+        refresh
+        stuck1_state=$(matching agent_stuck session_resident_r1 | jq -r --arg k "$stuck1_key" 'map(select(.key == $k)) | .[0].state // empty')
+        open_stuck=$(matching agent_stuck session_resident_r1 | jq '[.[] | select(.state == "open")] | length')
+        [ "$stuck1_state" = cleared ] && [ "$open_stuck" -eq 1 ] && break
+        [ "$(now)" -lt "$deadline" ] || break
+        ping_supervisor
+        sleep 0.5
+    done
+    alert=$(matching agent_stuck session_resident_r1 | jq -c --arg k "$stuck1_key" 'map(select(.key == $k)) | .[0] // {}')
+    key=$stuck1_key
+    [ "$(field '.state // empty')" = cleared ] &&
+        [ "$(field '(.cleared_evidence.judge == "rules") or (.cleared_evidence.progress_event != null)')" = true ] ||
+        measured_fail "(7) r1's first agent_stuck ($stuck1_key) was not cleared by working/progress after stuck-2: $alert"
+    provoked cleared
+    open_list=$(matching agent_stuck session_resident_r1 | jq -c '[.[] | select(.state == "open")]')
+    [ "$(printf '%s' "$open_list" | jq length)" -eq 1 ] ||
+        measured_fail "(7) expected 1 open agent_stuck for r1 after stuck-2, got $(matching agent_stuck session_resident_r1)"
+    alert=$(printf '%s' "$open_list" | jq -c '.[0]')
+    key=$(printf '%s' "$alert" | jq -r '.key')
+    stuck2_key=$key
     : >"$WORK/stuck-sessions"
     poke unstuck
-    if cleared 30 agent_stuck session_resident_r1 "(7) r1 no longer stuck"; then
-        [ "$(field '.cleared_evidence.stuck < 0.5')" = true ] ||
-            measured_fail "(7) r1's agent_stuck clearing names no judgement with stuck < 0.5: $(field '.cleared_evidence | tostring')"
+    deadline=$(($(now) + 30))
+    while :; do
+        refresh
+        stuck2_state=$(matching agent_stuck session_resident_r1 | jq -r --arg k "$stuck2_key" 'map(select(.key == $k)) | .[0].state // empty')
+        open_stuck=$(matching agent_stuck session_resident_r1 | jq '[.[] | select(.state == "open")] | length')
+        [ "$stuck2_state" = cleared ] && [ "$open_stuck" -eq 0 ] && break
+        [ "$(now)" -lt "$deadline" ] || break
+        ping_supervisor
+        sleep 0.5
+    done
+    alert=$(matching agent_stuck session_resident_r1 | jq -c --arg k "$stuck2_key" 'map(select(.key == $k)) | .[0] // {}')
+    key=$stuck2_key
+    if [ "$(field '.state // empty')" = cleared ]; then
+        [ "$(field '((.cleared_evidence.stuck // 1) < 0.5) or (.cleared_evidence.judge == "rules") or (.cleared_evidence.progress_event != null)')" = true ] ||
+            measured_fail "(7) r1's agent_stuck clearing names no not-stuck or working evidence: $(field '.cleared_evidence | tostring')"
         provoked cleared
+    else
+        measured_fail "(7) r1 no longer stuck: $stuck2_key was not cleared within 30 s: $alert"
     fi
 fi
 

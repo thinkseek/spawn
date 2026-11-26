@@ -75,7 +75,7 @@ harness() {
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed grep awk date df cut sha1sum; do
+for tool in psql git jq od bash sed grep awk date df cut sha1sum; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 real_git=$(command -v git)
@@ -111,14 +111,14 @@ export SPAWN_INTEGRATE_WARM
 
 # --- shared by both lanes ---------------------------------------------------------
 
-# Set by each lane (in its own subshell): WORK, SPAWN_DB_NAME, SPAWN_TMUX_SOCKET,
+# Set by each lane (in its own subshell): WORK, SPAWN_DB_NAME, HC_SESSION,
 # lane, loop_pid, database_made, asserted, P (the part running).
 lane_cleanup() {
     if [ -n "${loop_pid-}" ]; then
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
     fi
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "${database_made-}" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -176,14 +176,13 @@ lane_world() {
     WORK=$(mktemp -d) || harness "mktemp failed"
     # Gone again if a check below refuses, before the cleanup is set.
     trap 'rm -rf "$WORK"' EXIT
-    # A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-    # or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+    # A scratch HOME in WORK: nothing here reads or writes the real home, nor
+    # is left outside it (cc-rules (a), 2026-11-12).
     real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
     HOME=$WORK/home
-    TMUX_TMPDIR=$WORK/tmux-sock
-    mkdir -p "$HOME" "$TMUX_TMPDIR"
+    mkdir -p "$HOME"
     [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-    export HOME TMUX_TMPDIR
+    export HOME
     # The runtime directory too (backlog S20): what Spawn keeps there (a
     # launch's environment file, its terminals' leaders) stays in WORK, never
     # in the real one. systemd's user manager stays reachable by its bus.
@@ -192,15 +191,12 @@ lane_world() {
         DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
         export DBUS_SESSION_BUS_ADDRESS
     fi
-    XDG_RUNTIME_DIR=$WORK/runtime
-    mkdir -m 700 "$XDG_RUNTIME_DIR"
-    export XDG_RUNTIME_DIR
     # Not $$ alone: the gate's PID namespace makes it the same small number.
     run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+    . "$controller/scripts/blackbox/lib-herdr.sh"
+    herdr_setup "$WORK" "j10$lane"
     SPAWN_DB_NAME="bb_j10${lane}_verdicts_$run"
-    SPAWN_TMUX_SOCKET="bb-j10${lane}-$run"
-    export SPAWN_TERMINAL_BACKEND=tmux
-    export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET
+    export WORK SPAWN_DB_NAME
     trap lane_finish EXIT
     trap 'exit 130' INT TERM
     # Logins of this lane's databases that a run killed before its cleanup
@@ -239,12 +235,6 @@ lane_world() {
 EOF
     GIT_CONFIG_GLOBAL=$WORK/gitconfig
     export GIT_CONFIG_GLOBAL
-
-    cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-    chmod 755 "$WORK/tmux"
 }
 
 # The loop's environment (020's, 033's: the supervisor on, every stall bound
@@ -257,7 +247,6 @@ lane_loop_env() {
     SPAWN_CLAUDE_PROJECTS=$WORK/projects
     BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
     BB_WORK=$WORK
-    SPAWN_TMUX_PROGRAM=$WORK/tmux
     SPAWN_WORKER=worker-bb
     SPAWN_LOOP_INTERVAL_MS=300
     # Free disk is not what this journey is about: no warning, no floor.
@@ -273,7 +262,7 @@ lane_loop_env() {
     SPAWN_STALL_STOP_SECS=1800
     SPAWN_STALL_HALTED_SECS=1800
     export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-        SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+        SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_WORKER \
         SPAWN_LOOP_INTERVAL_MS SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_SUPERVISOR \
         SPAWN_MISSION_FILE SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
         SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
@@ -1684,10 +1673,9 @@ EOF
     SPAWN_GIT_REPO=$default
     SPAWN_CLAUDE_PROGRAM=$P/claude
     SPAWN_CLAUDE_PROJECTS=$P/projects
-    SPAWN_TMUX_PROGRAM=$WORK/tmux
     SPAWN_WORKER=worker-bb
     export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_CLAUDE_PROGRAM \
-        SPAWN_CLAUDE_PROJECTS SPAWN_TMUX_PROGRAM SPAWN_WORKER
+        SPAWN_CLAUDE_PROJECTS SPAWN_WORKER
     host=$P/host
     integrator=$WORK/integrator
     mkdir -p "$host" "$integrator"
@@ -1774,6 +1762,7 @@ EOF
     assert_eq "$(main_file X.txt)" from-x "(b) X.txt on the source's main" #@ 008:352
     assert_eq "$(main_file OTHER.txt)" other "(b) main's own change kept by the landing" #@ 008:353
     echo "j10: 008 (b): a merge git could not run was an error, not a conflict, and landed once git could"
+    herdr_kill_server
 }
 
 # --- 033: a base that disagrees with itself ---------------------------------------------

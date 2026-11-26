@@ -58,13 +58,15 @@
 #       T1 is assigned to alpha (whose engine then stays busy and quiet) and
 #       T2 to frail, whose text the tmux wrapper refuses to stage while
 #       $WORK/broken exists (`command too long`: refused before typing, so
-#       retried after NOT_READY_RETRY_MS, 5 s, by deliver.rs); the host is
+#       retried with exponential backoff starting at NOT_READY_RETRY_MS, 5 s,
+#       by deliver.rs `not_ready_wait_ms`); the host is
 #       fixed 32 s in. The supervisor is pinged now and then, as 013's and
 #       019's scenarios do, so its judgements cover its facts.
 #       - T1 is delivered within DELIVER_MAX_MS (4000) of its assignment;
-#       - every retry of T2's delivery is made no sooner than 5 s and no later
-#         than 5 s + RETRY_SLACK_MS (1500) after the attempt before it
-#         finished, and the first after the fix succeeds, by the same rule;
+#       - each retry k of T2's delivery is made no sooner than expected
+#         not_ready_wait_ms(k) (5s, 10s, 20s, capped at 60s) and no later than
+#         due + RETRY_SLACK_MS (1500) after the attempt before it finished,
+#         and the first after the fix succeeds, by the same rule;
 #       - T1's activity stall reaches the supervisor once (a digest tagged
 #         `session_resident_alpha stall-T1-activity-<n>`), no sooner than 20 s
 #         and no later than 20 s + STALL_SLACK_MS (2500) after alpha's last
@@ -141,7 +143,7 @@ harness() {
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed grep awk; do
+for tool in psql git jq od bash sed grep awk python3; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
@@ -156,14 +158,13 @@ STALL_SLACK_MS=2500
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -172,16 +173,13 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "023"
 SPAWN_DB_NAME="bb_023_wake_$run"
-SPAWN_TMUX_SOCKET="bb-023-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -196,7 +194,7 @@ cleanup() {
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
     fi
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -326,25 +324,9 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-# tmux on the private socket. While $WORK/broken exists, a text naming
-# `BB:FRAIL` cannot be staged: `load-buffer` (the Bridge stages every text
-# from a file) fails as tmux fails a command over its message size. Nothing
-# reaches the pane.
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-stage=
-for argument in "\$@"; do
-  [ "\$argument" = load-buffer ] && stage=1
-  last=\$argument
-done
-if [ -n "\$stage" ] && [ -f "\$last" ] && [ -e '$WORK/broken' ] &&
-    grep -q "BB:FRAIL" "\$last" 2>/dev/null; then
-  echo "command too long" >&2
-  exit 1
-fi
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
+# herdr-core proxy: while $WORK/broken exists, staging text for `frail` fails
+# before typing (`agent_not_ready`, nothing reaches the pane).
+herdr_use_fault_proxy "$WORK" --refuse-stage-agent "$WORK/broken:agent_resident_frail"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH CLAUDE_CONFIG_DIR SPAWN_LOOP_INTERVAL_MS SPAWN_STALL_DELIVERY_SECS \
@@ -359,7 +341,6 @@ SPAWN_WORKSPACE_ROOT=$WORK/ws
 SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_SUPERVISOR=1
 SPAWN_MISSION_FILE=$WORK/mission.md
@@ -374,7 +355,7 @@ SPAWN_STALL_LANDING_SECS=1800
 SPAWN_STALL_STOP_SECS=1800
 SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS SPAWN_TMUX_PROGRAM SPAWN_WORKER SPAWN_SUPERVISOR \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS SPAWN_WORKER SPAWN_SUPERVISOR \
     SPAWN_MISSION_FILE SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS \
     SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS
@@ -512,7 +493,7 @@ deadline=$(($(now) + 90))
 while :; do
     sleep 1
     latest=$(q "select coalesce(max(id), 0) from spawn_events")
-    open=$(q "select count(*) from spawn_commands where state <> 'finished'")
+    open=$(q "select count(*) from spawn_commands where state not in ('finished', 'failed', 'cancelled')")
     if [ "$latest" != "$last_seen" ] || [ "$open" -ne 0 ]; then
         last_seen=$latest
         quiet_since=$(now)
@@ -613,13 +594,16 @@ gaps=$(awk -F'|' 'NR > 1 { printf "%s ", $1 - finished } { finished = $2 }' "$WO
 echo "023: task #$t2's attempts, each after the one before finished (ms): $gaps"
 prev_finished=""
 ok_at=""
+expected_wait_ms=5000
 while IFS='|' read -r created finished outcome; do
     if [ -n "$prev_finished" ]; then
         gap=$((created - prev_finished))
-        [ "$gap" -ge 4900 ] ||
-            fail "(3) a retry of task #$t2's delivery was made $gap ms after the attempt before it finished, sooner than NOT_READY_RETRY_MS (5000)"
-        [ "$gap" -le $((5000 + RETRY_SLACK_MS)) ] ||
-            fail "(3) a retry of task #$t2's delivery was made $gap ms after the attempt before it finished: due at 5000 ms, late by more than $RETRY_SLACK_MS ms"
+        [ "$gap" -ge $((expected_wait_ms - 100)) ] ||
+            fail "(3) a retry of task #$t2's delivery was made $gap ms after the attempt before it finished, sooner than not_ready_wait_ms ($expected_wait_ms ms)"
+        [ "$gap" -le $((expected_wait_ms + RETRY_SLACK_MS)) ] ||
+            fail "(3) a retry of task #$t2's delivery was made $gap ms after the attempt before it finished: due at $expected_wait_ms ms, late by more than $RETRY_SLACK_MS ms"
+        expected_wait_ms=$((expected_wait_ms * 2))
+        [ "$expected_wait_ms" -le 60000 ] || expected_wait_ms=60000
     fi
     prev_finished=$finished
     if [ "$outcome" = true ] && [ -z "$ok_at" ]; then ok_at=$created; fi

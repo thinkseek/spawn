@@ -1790,6 +1790,8 @@
         "rsi/scenarios/web-dependencies-reviewed",
         "scripts/blackbox/assertions.sh",
         "scripts/blackbox/drop-logins.sql",
+        "scripts/blackbox/herdr-fault-proxy.py",
+        "scripts/blackbox/lib-herdr.sh",
         "scripts/blackbox/phase.sh",
         "scripts/blackbox/run-scenarios.sh",
         "scripts/blackbox/scenario-db.sh",

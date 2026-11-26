@@ -57,19 +57,6 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
-SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
-if [ -z "$SPAWN_HC" ]; then
-    spawn_dir=$(dirname "$SPAWN_BIN")
-    if [ -x "$spawn_dir/spawn-hc" ]; then
-        SPAWN_HC=$spawn_dir/spawn-hc
-    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
-        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
-    elif command -v spawn-hc >/dev/null 2>&1; then
-        SPAWN_HC=$(command -v spawn-hc)
-    fi
-fi
-[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
-    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 # The candidate's tree: the gate runs a scenario from inside it, and its
 # web/src is what the page would run (the controller holds main's copy).
@@ -85,12 +72,12 @@ done
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
 mkdir -p "$HOME"
-[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home";; esac
 export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
@@ -100,18 +87,13 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/r
-XDG_STATE_HOME=$WORK/state
-XDG_CONFIG_HOME=$WORK/config
-mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
-export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
-hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 SPAWN_DB_NAME="bb_057_runs_$run"
-SPAWN_HERDR_SESSION="bb-057-$hc_id"
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "057"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -123,32 +105,13 @@ database_made=""
 loop_pid=""
 serve_pid=""
 judge_pid=""
-hc() {
-    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
-        HC_SESSION="$SPAWN_HERDR_SESSION" \
-        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
-        "$SPAWN_HC" "$@"
-}
-stop_herdr() {
-    [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ] || return 0
-    for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
-        jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
-        hc kill "$addr" >/dev/null 2>&1 || true
-    done
-    hc server stop >/dev/null 2>&1 || true
-    hc_wait=0
-    while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
-        hc_wait=$((hc_wait + 1))
-        sleep 0.1
-    done
-}
 cleanup() {
     for pid in "$loop_pid" "$serve_pid" "$judge_pid"; do
         [ -n "$pid" ] || continue
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
-    stop_herdr
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -231,10 +194,9 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # the turn's end), so the Observer judges the session after each turn.
 bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
-[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 while [ $# -gt 0 ]; do
-  case "$1" in --resume | --session-id) native=${2-}; shift ;; esac
+  case "$1" in --resume | --session-id) native=${2-}; shift;; esac
   shift
 done
 dir=$BB_PROJECTS/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
@@ -331,9 +293,7 @@ judge_port=$(cat "$WORK/judge.port")
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_CHEAP_MODEL SPAWN_SMALL_MODEL \
-    SPAWN_MODEL_PRICES SPAWN_API_TOKEN SPAWN_SERVE_TOKEN http_proxy https_proxy HTTP_PROXY HTTPS_PROXY SPAWN_TERMINAL_BACKEND SPAWN_HERDR_MODE \
-    SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM TMUX \
-    TMUX_PANE TMUX_TMPDIR; do
+    SPAWN_MODEL_PRICES SPAWN_API_TOKEN SPAWN_SERVE_TOKEN http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -342,14 +302,14 @@ SPAWN_WORKSPACE_ROOT=$WORK/ws
 SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
-BB_PATH=$PATH
-SPAWN_HERDR_CORE_PROGRAM=$SPAWN_HC
 SPAWN_WORKER=worker-bb
 SPAWN_SUPERVISOR=1
 SPAWN_JUDGE_URL=http://127.0.0.1:$judge_port
 SPAWN_LOOP_INTERVAL_MS=300
-# The alert step reads every 2 s (default 30 s).
+# The alert step reads every 2 s (default 30 s) with zero stuck dwell.
 SPAWN_ALERT_CHECK_SECS=2
+SPAWN_ALERT_STUCK_IDLE_DWELL_SECS=0
+SPAWN_ALERT_STUCK_QUIET_DWELL_SECS=0
 # No stall is under test: the judge's score alone.
 SPAWN_STALL_ACTIVITY_SECS=1800
 SPAWN_STALL_DELIVERY_SECS=1800
@@ -362,8 +322,9 @@ SPAWN_MISSION_FILE=$WORK/mission.md
 SPAWN_DISK_WARN_GB=0
 SPAWN_DISK_FLOOR_GB=0
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER SPAWN_SUPERVISOR \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS SPAWN_WORKER SPAWN_SUPERVISOR \
     SPAWN_JUDGE_URL SPAWN_LOOP_INTERVAL_MS SPAWN_ALERT_CHECK_SECS \
+    SPAWN_ALERT_STUCK_IDLE_DWELL_SECS SPAWN_ALERT_STUCK_QUIET_DWELL_SECS \
     SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_REVIEW_SECS \
     SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS \
     SPAWN_STALL_HALTED_SECS SPAWN_MISSION_FILE SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB
@@ -396,7 +357,7 @@ wait_until() { # <seconds> <command...>
 }
 record() { # <JSON>: written as the integrator writes it; prints the event id
     id=$(psql -d "$SPAWN_DB_NAME" -tA -v ON_ERROR_STOP=1 -c "select spawn_control_record('$1'::jsonb)" 2>"$WORK/rec.err" | head -n 1)
-    case "$id" in '' | *[!0-9]*) harness "writing $1 failed: $(head -c 300 "$WORK/rec.err")" ;; esac
+    case "$id" in '' | *[!0-9]*) harness "writing $1 failed: $(head -c 300 "$WORK/rec.err")";; esac
     echo "$id"
 }
 C=$(printf 'bb-057-candidate' | sha1sum | cut -c1-40)

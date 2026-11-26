@@ -20,8 +20,8 @@
 #   019 (3) the re-issue goes through: the host fixed, T2 is delivered
 #           within 60 s; the only re-issue of T1, never escalated.
 #   019 (4) escalated only when the re-issue is spent too: T3 (frail2,
-#           broken for good) is re-issued as T4 within 100 s (019: 200 s), T4
-#           is spent within 75 s (019: 150 s); then, within 60 s, the
+#           broken for good) is re-issued as T4 within 185 s, T4
+#           is spent within 160 s; then, within 60 s, the
 #           supervisor gets T4's delivery failure naming task #T4 and #T3,
 #           never T3's; T4 is not re-issued (watched 7.5 s, 019: 15 s).
 #   019 (5) after a deploy, tried once more: `spawn mission moved` records
@@ -36,8 +36,9 @@
 #
 # Shortened waits (design §3): 019's re-issue chain runs at half the values
 # 019 sets: SPAWN_DELIVERY_RETRY_SECS 1 (019: 2), SPAWN_REISSUE_AFTER_SECS 5
-# (019: 10), SPAWN_DELIVERY_NOT_READY_MS 250 (019: 500; the product's floor
-# is 100 ms). Every bound derived from them is halved with them (above, and
+# (019: 10), SPAWN_DELIVERY_NOT_READY_MS 100 (the product's floor; exponential
+# backoff in `not_ready_wait_ms` takes 102.3 s for 10 free refusals + 15 s
+# retries). Every bound derived from them scales with them (above, and
 # marked `rewritten` in the trace); the bounds that do not derive from them
 # (the 60 s deliveries and escalation, the 120/90 s waits for a judged
 # prompt) are 019's.
@@ -81,25 +82,24 @@ harness() {
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed grep; do
+for tool in psql git jq od bash sed grep python3; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
-# 019's 150 s, halved with its retry and not-ready waits (design §3).
-SPENT_WITHIN=${BB_019_SPENT_WITHIN:-75}
+# PR #133 exponential not_ready_wait_ms at 100 ms floor takes ~117 s + loop latency.
+SPENT_WITHIN=${BB_019_SPENT_WITHIN:-160}
 case "$SPENT_WITHIN" in '' | *[!0-9]*) harness "BB_019_SPENT_WITHIN is a number of seconds" ;; esac
 
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -108,16 +108,13 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "j08"
 SPAWN_DB_NAME="bb_j08_stuck_$run"
-SPAWN_TMUX_SOCKET="bb-j08-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -137,7 +134,7 @@ cleanup() {
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
     fi
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -291,32 +288,10 @@ chmod 755 "$WORK/claude"
 # 019: while $WORK/broken-<n> exists, a text naming `BB:FRAIL<n>` cannot be
 # staged: `load-buffer` (the Bridge stages every text from a file) fails as
 # tmux fails a command over its message size. Nothing reaches the pane.
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-if [ -e '$WORK/refuse-kill' ]; then
-  for argument in "\$@"; do
-    if [ "\$argument" = kill-session ]; then
-      echo "kill-session refused by the scenario" >&2
-      exit 1
-    fi
-  done
-fi
-stage=
-for argument in "\$@"; do
-  [ "\$argument" = load-buffer ] && stage=1
-  last=\$argument
-done
-if [ -n "\$stage" ] && [ -f "\$last" ]; then
-  for n in 1 2; do
-    if [ -e '$WORK'/broken-\$n ] && grep -q "BB:FRAIL\$n" "\$last" 2>/dev/null; then
-      echo "command too long" >&2
-      exit 1
-    fi
-  done
-fi
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
+herdr_use_fault_proxy "$WORK" \
+    --refuse-kill-file "$WORK/refuse-kill" \
+    --refuse-stage-agent "$WORK/broken-1:agent_resident_frail1" \
+    --refuse-stage-agent "$WORK/broken-2:agent_resident_frail2"
 : >"$WORK/refuse-kill"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
@@ -333,7 +308,6 @@ SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
 SPAWN_SUPERVISOR=1
@@ -347,7 +321,7 @@ RETRY_SECS=1
 REISSUE_AFTER=5
 SPAWN_DELIVERY_RETRY_SECS=$RETRY_SECS
 SPAWN_REISSUE_AFTER_SECS=$REISSUE_AFTER
-SPAWN_DELIVERY_NOT_READY_MS=250
+SPAWN_DELIVERY_NOT_READY_MS=100
 SPAWN_STALL_DELIVERY_SECS=1800
 SPAWN_STALL_ACTIVITY_SECS=1800
 SPAWN_STALL_REVIEW_SECS=1800
@@ -356,7 +330,7 @@ SPAWN_STALL_LANDING_SECS=1800
 SPAWN_STALL_STOP_SECS=1800
 SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_SUPERVISOR SPAWN_MISSION_FILE SPAWN_DISK_WARN_GB \
     SPAWN_DISK_FLOOR_GB SPAWN_DELIVERY_RETRY_SECS SPAWN_REISSUE_AFTER_SECS SPAWN_DELIVERY_NOT_READY_MS \
     SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_REVIEW_SECS \
@@ -505,12 +479,12 @@ part_006() {
     stop_finished() {
         [ "$(q "select count(*) from spawn_commands
                 where session_id = '$session' and action ->> 'type' = 'stop'
-                  and state = 'finished'")" -ge 1 ]
+                  and state in ('finished', 'failed')")" -ge 1 ]
     }
     stops_failed() {
         q "select count(*) from spawn_commands
             where session_id = '$session' and principal = 'spawn-dispatch'
-              and action ->> 'type' = 'stop' and state = 'finished' and not succeeded"
+              and action ->> 'type' = 'stop' and state in ('finished', 'failed') and not succeeded"
     }
     # Every failed Stop of the session happened two hours earlier: any retry
     # wait of an hour or less is over.
@@ -519,7 +493,7 @@ part_006() {
                 set created_at_ms = created_at_ms - 7200000,
                     finished_at_ms = finished_at_ms - 7200000
               where session_id = '$session' and action ->> 'type' = 'stop'
-                and state = 'finished' and not succeeded
+                and state in ('finished', 'failed') and not succeeded
                 and finished_at_ms > (extract(epoch from clock_timestamp()) * 1000)::bigint - 3600000" \
             >/dev/null
     }
@@ -639,7 +613,7 @@ attempts_of() { # <task> <select list>
 spent_state() {
     line=$(attempts_of "$1" "count(*) || ' ' ||
         count(*) filter (where succeeded) || ' ' ||
-        count(*) filter (where state <> 'finished') || ' ' ||
+        count(*) filter (where state not in ('finished', 'failed', 'cancelled')) || ' ' ||
         count(*) filter (where error like '%does not accept input%') || ' ' ||
         count(*) filter (where error like '%may have been typed%')")
     set -- $line
@@ -779,7 +753,7 @@ assert_eq "$(reissue_of "$t1")" "$t2" "(3) the re-issues of task #$t1"
 # --- (4) a spent re-issue is escalated ----------------------------------------------------------
 
 echo "j08: [019 (4)] task #$t3 re-issued, the re-issue spent, then escalated naming both; never re-issued again"
-# 019: SPENT_WITHIN + REISSUE_AFTER + 40 (200 s); halved: 75 + 5 + 20 = 100 s.
+# With SPENT_WITHIN=160 and REISSUE_AFTER=5: 160 + 5 + 20 = 185 s.
 wait_until $((SPENT_WITHIN + REISSUE_AFTER + 20)) reissued "$t3" ||
     fail "(4) task #$t3 was not re-issued within $((SPENT_WITHIN + REISSUE_AFTER + 20)) s: $(spent_state "$t3")"
 t4=$(reissue_of "$t3")

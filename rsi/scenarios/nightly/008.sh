@@ -43,7 +43,7 @@ tree=$(pwd)
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od sed; do
+for tool in psql git jq od sed; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 real_git=$(command -v git)
@@ -56,14 +56,13 @@ set -- $real_version
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
-[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+mkdir -p "$HOME"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home";; esac
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -72,16 +71,13 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_008_git_$run"
-SPAWN_TMUX_SOCKET="bb-008-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "008"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -91,7 +87,7 @@ server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 
 database_made=""
 cleanup() {
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -169,8 +165,8 @@ attr=""
 merge=""
 for argument in "\$@"; do
   case "\$argument" in
-  --attr-source=*) attr=\$argument ;;
-  merge-tree) merge=1 ;;
+  --attr-source=*) attr=\$argument;;
+  merge-tree) merge=1;;
   esac
 done
 if [ -n "\$attr" ] && [ -n "\$merge" ]; then
@@ -217,19 +213,14 @@ while IFS= read -r line; do
     printf '%s\n' "\$2" >"\$1" || exit 3
     printf '%s %s\n' "\$1" "\$2" >>'$WORK/engine.log'
     [ "\$3" = exit ] && exit 0
-    printf '\nwrote %s\n❯ ' "\$1" ;;
+    printf '\nwrote %s\n❯ ' "\$1";;
   *)
-    printf '\n%s\n❯ ' "echo: \$line" ;;
+    printf '\n%s\n❯ ' "echo: \$line";;
   esac
 done
 EOF
 chmod 755 "$WORK/claude"
 
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_SUPERVISOR SPAWN_GATE \
     CLAUDE_CONFIG_DIR; do
@@ -239,10 +230,9 @@ SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
 SPAWN_GIT_REPO=$default
 SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS SPAWN_TMUX_PROGRAM SPAWN_WORKER
+    SPAWN_CLAUDE_PROJECTS SPAWN_WORKER
 
 host=$WORK/host
 integrator=$WORK/integrator
