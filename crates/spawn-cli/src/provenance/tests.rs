@@ -1113,3 +1113,24 @@ mod pv4_hook {
         );
     }
 }
+
+/// PV4 `restores()`: a landing touches a task's paths whether either side
+/// folded its entries into top-level `tree` rows.
+#[test]
+fn a_revert_touches_the_paths_whether_either_side_is_folded() {
+    use super::index::touches_any;
+    // Unfolded on both sides.
+    assert!(touches_any(["src/a.rs"], &["src/a.rs"]));
+    assert!(!touches_any(["src/a.rs"], &["src/b.rs"]));
+    // The task's file under the landing's folded directory.
+    assert!(touches_any(["src/a.rs"], &["src"]));
+    // The task's folded directory over the landing's file.
+    assert!(touches_any(["src"], &["src/deep/a.rs"]));
+    // Folded on both sides.
+    assert!(touches_any(["src"], &["src"]));
+    // A top-level file is no directory of a like-named prefix.
+    assert!(!touches_any(["src"], &["srcx/a.rs"]));
+    assert!(!touches_any(["src/a.rs"], &["srcx"]));
+    assert!(!touches_any(["README.md"], &["docs/README.md"]));
+    assert!(!touches_any(std::iter::empty(), &["src"]));
+}

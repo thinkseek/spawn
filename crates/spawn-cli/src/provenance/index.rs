@@ -1409,13 +1409,8 @@ fn restores(
     if before.is_empty() {
         return Ok(false);
     }
-    let touched: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-    if !before.keys().any(|path| {
-        touched.contains(path.as_str())
-            || path
-                .split_once('/')
-                .is_some_and(|(top, _)| touched.contains(top))
-    }) {
+    let touched: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    if !touches_any(before.keys().map(String::as_str), &touched) {
         return Ok(false);
     }
     for (path, digest) in &before {
@@ -1428,6 +1423,27 @@ fn restores(
         }
     }
     Ok(true)
+}
+
+/// Whether one of the paths `landed` (a task's entries) is one of the
+/// paths `touched` (a landing's entries), where either side may be folded
+/// (a `tree` row is a top-level directory, [`FOLD_OVER`]): the same path;
+/// a landed file under a folded touched directory; or a landed folded
+/// directory over a touched file. Folding is by top-level directory only,
+/// so comparing each path's top-level directory is exact.
+pub(crate) fn touches_any<'a>(landed: impl IntoIterator<Item = &'a str>, touched: &[&str]) -> bool {
+    let top = |path: &'a str| path.split_once('/').map_or(path, |(top, _)| top);
+    let paths: HashSet<&str> = touched.iter().copied().collect();
+    let tops: HashSet<&str> = touched
+        .iter()
+        .filter(|path| path.contains('/'))
+        .map(|path| top(path))
+        .collect();
+    landed.into_iter().any(|path| {
+        paths.contains(path)
+            || (path.contains('/') && paths.contains(top(path)))
+            || (!path.contains('/') && tops.contains(path))
+    })
 }
 
 /// The entries of the files over the cap (decision D6) that the workspace
