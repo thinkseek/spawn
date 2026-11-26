@@ -31,6 +31,9 @@ export interface Approval {
   kind: ApprovalKind;
   session_id: string | null;
   agent_id: string | null;
+  /** Active terminal backend is `"herdr"` (`herdr-core` / `spawn-hc`); `null`
+   * for `mission_halted`. Kept as an open string to preserve defensive parsing
+   * of historical payloads. */
   backend: string | null;
   label: string;
   summary: string | null;

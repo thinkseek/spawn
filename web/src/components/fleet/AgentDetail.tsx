@@ -839,9 +839,10 @@ function formatFactMs(value: string): string {
 type ScreenView = "live" | "judged";
 
 /**
- * The agent's tmux pane, once: "Live" is the 3 s capture (not stored), and
- * "As judged" is the screen tail stored with the judgement shown beside it
- * (the latest, or the one pinned from the history).
+ * The agent's Herdr (`herdr-core` / `spawn-hc`) terminal pane, once: "Live"
+ * is the 3 s capture (not stored), and "As judged" is the screen tail stored
+ * with the judgement shown beside it (the latest, or the one pinned from the
+ * history).
  */
 function AgentScreen({
   sessionId,
@@ -921,7 +922,7 @@ function AgentScreen({
           onKeyDown={onTabKey}
           className="flex shrink-0 items-center gap-1"
         >
-          {tab("live", "Live", data?.terminal ? `tmux ${data.terminal}` : undefined)}
+          {tab("live", "Live", data?.terminal ? `herdr ${data.terminal}` : undefined)}
           {tab(
             "judged",
             <span className="tnum whitespace-nowrap">
@@ -951,7 +952,7 @@ function AgentScreen({
         live ? (
           <>
             <span className="hidden text-micro text-faint-foreground sm:inline">
-              tmux capture, not stored
+              herdr capture, not stored
             </span>
             {data?.captured_at_ms ? (
               <span className="tnum text-caption text-faint-foreground">

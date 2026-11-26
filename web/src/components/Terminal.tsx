@@ -62,7 +62,7 @@ interface TerminalPanelProps {
   tabs?: ReactNode;
   /** With `tabs`: the body is their tabpanel (its id, and the selected tab's id). */
   panel?: { id: string; labelledBy: string };
-  /** Short identifier shown beside the title, e.g. the tmux session. */
+  /** Short identifier shown beside the title, e.g. the Herdr terminal name. */
   tag?: string | null;
   /** Right side of the header: freshness, live badge. */
   status?: ReactNode;

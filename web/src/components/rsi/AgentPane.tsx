@@ -6,8 +6,9 @@ import { LiveBadge, TerminalPanel } from "../Terminal";
 import { useNow } from "./Phase";
 
 /**
- * Tail of the objective mission's resident's tmux pane. Mounted only while
- * the RSI view is visible, so the 1 s poll stops with it.
+ * Tail of the objective mission's resident's Herdr (`herdr-core` / `spawn-hc`)
+ * terminal pane. Mounted only while the RSI view is visible, so the 1 s poll
+ * stops with it.
  */
 export function AgentPane({
   mission,
