@@ -75,6 +75,42 @@ waits, and one `engine_unavailable` escalation names the engine and the
 label. Never a silent fall back to Claude Code. Before the loop's first
 probe, a task on another engine waits without an escalation.
 
+## Top-Down 3-Tier Grading Stack
+
+Agent grading uses a **top-down strong mainline** strategy instead of defaulting
+routine tasks to weak models and waiting for failures:
+
+| Tier | Grade | Role (`tier_role`) | Default preset (`spawn grade init-topdown`) | Engine / Model label | Execution profile | Cost rank | Initial lock / calibration |
+|---|---|---|---|---|---|---|---|
+| **T3** | `l3` | `top-decision` | `topdown-l3-fable` | `claude` / `claude-fable-5-2` | `fable-5-2` | `30` | Locked `l3` (`default`): architectural decisions, security/credentials/sandbox/migrations, and final escalation fallback from `l2` rework |
+| **T2** | `l2` | `mainline` | `topdown-l2-neon` | `agy` / `gemini-pro-orchestrator-neon` | `neon-mainline` | `20` | Locked `l2` (`default`): supervisor & default strong mainline execution |
+| **T1** | `l1` | `mechanical-offload` | `topdown-l1-mechanical` *(opt-in `--with-l1`)* | `claude` / `deepseek-v4` *(or `deepseek-v4.1-flash`, `kimi` via `--l1-model`)* | `mechanical-l1` | `10` | Onboarded `l1` (`cheap`), unlocked: strictly deterministic, zero-ambiguity mechanical tasks only; demoted/disabled cleanly on failure |
+
+### Top-Down Guarantees
+
+- **Idempotent seeding (`spawn grade init-topdown [--with-l1] [--l1-model <label>] [--json]`):**
+  seeds `T3` (`topdown-l3-fable`) and `T2` (`topdown-l2-neon`) as active locked
+  tiers, and optionally seeds and onboards `T1` (`topdown-l1-mechanical`) when
+  `--with-l1` is given, leaving any existing catalog entries untouched.
+- **Upward-only fallback (`resolve_routing_difficulty`):** when a task classifies
+  as `l1` and no routable `l1` preset exists, routing falls back **upward** to
+  `l2` (`topdown-l2-neon`). When a task classifies as `l3` and no routable `l3`
+  preset exists, routing **never silently downgrades `l3` to `l2`**; it falls
+  back to `--model default` with an explicit `routing_fallback` noting the refusal
+  to downgrade `l3`.
+- **Active over Demoted:** within the same `SkillGrade`, `route_preset` prefers
+  `PresetState::Active` presets over `Demoted` ones before comparing `cost_rank`
+  and `preset_id`.
+- **Strict L1 offload gate (`can_offload_to_l1` + `brief-v3`):** only strictly
+  deterministic `l1` work with an `Active` `l1` preset offloads to `T1`; the first
+  quality rejection at `l1` immediately escalates rework to `l2` (`for_rework(1)`).
+- **`model_label` / `engine_label` propagation:** `RoutingDecision` carries
+  `engine_label` and `model_label`, and `spawn task assign` includes them in its
+  JSON output alongside `execution_profile`.
+- **Re-probe opt-in (off by default):** `SPAWN_GRADING_REPROBE_SECS` defaults to
+  `0` (disabled / `i64::MAX` ms) so unflagged tasks do not unexpectedly shift to
+  non-optimal starved presets unless an operator sets `SPAWN_GRADING_REPROBE_SECS > 0`.
+
 ## Rules (`spawn_core::grading`, pure, integer-only)
 
 - **Rework step-up** (`TaskDifficulty::for_rework`): after `q` quality
@@ -206,6 +242,7 @@ phase 1 only a review did.
 ## Commands
 
 ```
+spawn grade init-topdown [--with-l1] [--l1-model <label>] [--json]
 spawn grade register <preset_id> --engine-label <e> --model-label <m> --cost-rank <n> [--model-profile default|cheap]
 spawn grade list [--json]
 spawn grade exam --workspaces <dir> [--suite evals/onboarding]    # no store; prints results JSON
@@ -213,9 +250,23 @@ spawn grade onboard <preset_id> --results <json file>
 spawn grade lock-grade <preset_id> --grade l1|l2|l3  |  unlock-grade <preset_id>
 spawn grade enable|disable <preset_id>
 spawn grade calibrate [--apply] [--json]
-spawn task assign ... [--difficulty l1|l2|l3] [--preset <preset_id>]
+spawn grade upkeep [--apply] [--json]
+spawn task assign ... (--brief <text|-> | --brief-file <path>) [--difficulty l1|l2|l3] [--preset <preset_id>]
+spawn task reassign --id N [--reason <text|-> | --reason-file <path>]
 spawn task reject --id N --note <text>        # reroutes stepped-up rework in the same statement
 ```
+
+## Brief-file and Stdin Dispatch (`#119`)
+
+- `spawn task assign` accepts `--brief-file <path>` and `--brief -` (read from
+  stdin), and `spawn task reassign` accepts `--reason-file <path>` and
+  `--reason -`. Passing both inline and `-file`, or empty/whitespace-only inputs,
+  is refused.
+- Supervisors write non-trivial or multi-line briefs to plain `.md`/`.txt` files
+  and invoke `--brief-file <path>` (or pipe `--brief - <<'EOF'`) rather than
+  passing multi-line text or `permissions.deny`-triggering shell command lists
+  through `--brief "..."`. Spawn enforces credential and sandbox denials via
+  `--settings`.
 
 ## Onboarding suite
 
@@ -232,7 +283,7 @@ must not see `evals/`: see `evals/onboarding/README.md`.
 Every phase-1 call, record, answer and test is unchanged: each addition is
 named only when it says something.
 
-### Difficulty classifier (`classify_difficulty`, rules `brief-v2`)
+### Difficulty classifier (`classify_difficulty`, rules `brief-v3`)
 
 An unflagged ephemeral `spawn task assign` (no `--difficulty`, `--preset`
 or `--model`; never a resident) with a non-empty catalog has its
@@ -242,15 +293,16 @@ and deterministic, and every rule that matched is kept as evidence:
 
 | rule | points | matches |
 |---|---|---|
-| `security` | +4 | security, vulnerab*, exploit, authenticat*, authoriz*, credential, password, privilege, injection, csrf, xss, sandbox, secret |
-| `migration` | +4 | migrat*, schema, backfill, refold, "alter table", "data loss", "breaking change" |
-| `concurrency` | +2 | deadlock, concurren*, transaction, atomic, "race condition", "advisory lock" |
-| `cross_cutting` | +2 | refactor, redesign, architect*, rewrite, "across crates", "every crate", "backwards compat" |
-| `multi_step` | +1/+2, +1 | 3 (6) or more enumerated steps; a multi-step marker (phase, pipeline, end-to-end) |
+| `security` | +4 | English stems (`security`, `vulnerab*`, `exploit`, `cve-`, `authenticat*`, `authoriz*`, `credential`, `password`, `privilege`, `injection`, `csrf`, `xss`, `sandbox`, `secret`) and Chinese markers (`安全`, `凭据`, `密钥`, `权限`, `沙箱`, `鉴权`, `认证`, `提权`, `漏洞`, `注入`) |
+| `migration` | +4 | `migrat*`, `schema`, `backfill`, `refold`, `"alter table"`, `"data loss"`, `"breaking change"`, and Chinese (`迁移`, `数据库表`, `不可逆`, `破坏性变更`) |
+| `architecture` | +3 | `architecture`, `architectural`, `rfc`, `adr`, `protocol`, `consensus`, `"threat model"`, `"key rotation"`, and Chinese (`重大决策`, `架构设计`, `架构重构`, `核心架构`, `协议设计`, `分级重构`, `全局重构`, `顶层设计`, `共识`) |
+| `concurrency` | +2 | `deadlock`, `concurren*`, `transaction`, `atomic`, `"race condition"`, `"advisory lock"`, and Chinese (`并发`, `死锁`, `竞态`, `锁顺序`, `原子性`) |
+| `cross_cutting` | +2 | `refactor`, `redesign`, `architect*`, `rewrite`, `"across crates"`, `"every crate"`, `"backwards compat"`, and Chinese (`架构重构`, `全局重构`, `分级重构`, `跨模块`, `跨crate`, `全局改造`) |
+| `multi_step` | +1/+2, +1 | 3 (6) or more enumerated steps; a multi-step marker (`phase`, `pipeline`, `end-to-end`, `multi-step`) |
 | `file_scope` | +1/+2 | 3 (6) or more distinct paths |
 | `crate_scope` | +1/+2 | 2 (3) or more distinct crates |
 | `long_brief` | +1 | above 2000 characters |
-| `low_risk` | -2 | mechanical, repetitive or tagging work only: typo\*, spelling\*, formatting\*, whitespace\*, rustfmt\*, mechanical\*, repetitive\*, "cargo fmt", "registry entry" anywhere; `tag` or `label` only as the brief's first word followed by a determiner (the, a, an, all, its, their, our, this, these: "Tag the open tasks", never "Tag matching is ..." or "Tag release v1.2"), `bulk-*` only as its first word ("Bulk-label ...", never "Tags ..." or "Bulk import ..."); regenerat\* only when its object, past a determiner, is a generated artifact (fixture\*, snapshot\*, lockfile\*, golden\*, generated\*). Only when no risk rule matched and no broadening word is there: widening (every\*, whatever\*, caller\*, implement\*, support\*, feature\*), authoring (writ\*, rewrit\*, draft\*, document\*, explain\*, explan\*, describ\*, summar\*, clarif\*, reword\*, rephras\*, comment\*), code to build (filter\*, render\*, pars\*, endpoint\*, api\*, display\*), or a defect, performance or behaviour (bug\*, crash\*, debug\*, hang\*, cause\*, speed\*, optimi\*, perf\*, slow\*, retry\*, validat\*, dedup\*, automat\*, handl\*, fail\*, lost\*, lose\*, wrong\*, missing\*, vanish\*, broke\*, corrupt\*). Every keyword here is a prefix (`*`). Generic words such as comment, rename and bump are deliberately not markers: "add comment support", "rename X and update every caller" and "bump tokio and fix whatever breaks" are real work |
+| `low_risk` | -2 | mechanical, repetitive or tagging work only: `typo*`, `spelling*`, `formatting*`, `whitespace*`, `rustfmt*`, `mechanical*`, `repetitive*`, `"cargo fmt"`, `"registry entry"`, and Chinese mechanical markers (`拼写`, `错别字`, `格式化`, `排版`, `注释`, `重命名`) anywhere; `tag` or `label` only as the brief's first word followed by a determiner (`the`, `a`, `an`, `all`, `its`, `their`, `our`, `this`, `these`), `bulk-*` only as its first word; `regenerat*` only when its object, past a determiner, is a generated artifact (`fixture*`, `snapshot*`, `lockfile*`, `golden*`, `generated*`). Cancelled whenever any `security`, `migration`, `architecture`, or `concurrency` rule matched or any broadening stem/Chinese blocker is present (`every*`, `whatever*`, `caller*`, `implement*`, `support*`, `feature*`, authoring, code to build, defect/perf, `delete*`, `remove*`, `drop*`, `replace*`, `change*`, `redesign*`, `删除`, `移除`, `修复`, `实现`, `设计`, `重构`, `优化`, `修改`, `新增`, `逻辑`, `架构`). |
 
 L1 means deterministic, repetitive or tagging work, never semantic
 writing. `brief-v2` (replacing `brief-v1`) dropped `wording`, `readme`,
@@ -279,20 +331,20 @@ no rule matches is `l2`, exactly as phase 1 routed it. The evidence is the
 rule's own vocabulary (a keyword of its list, a count), never text of the
 brief.
 
-The brief is classified before the catalog's coverage is checked. The
-task is routed at the classified difficulty when some routable preset is
-graded for it, else at `l2` when some is graded `l2` or above. Otherwise
-it is assigned on `--model default` with `routing_fallback`. This means
-an `l1` task still reaches an `l1` preset when nothing covers `l2`: for
-example, the sole preset demoted `l2 → l1` keeps taking `l1` work, refills
-its window and can be restored. The `task.assigned` record carries the
-decision as `classification` {difficulty, score, rules, signals,
-rationale, routed_at (only when it ran at another difficulty)}, through
-`spawn_task_assign`'s new last parameter `p_classification jsonb default
-null`. The answer carries `classification` when a rule matched, and says
-so on stderr. `--difficulty`, `--preset`, `--model` and `--again` behave
-exactly as before. An empty catalog still means `--model default`
-without a word.
+The brief is classified before the catalog's coverage is checked, using
+top-down upward-only fallback (`resolve_routing_difficulty`):
+- If the catalog covers the classified difficulty, route there (with active
+  presets preferred over demoted ones at equal grade).
+- If classified `l1` and no routable `l1` preset exists, fall back upward to `l2`.
+- If classified `l3` and no routable `l3` preset exists, **never downgrade `l3`
+  to `l2`**; fall back to `--model default` with `routing_fallback` noting the
+  missing `l3` coverage.
+
+The `task.assigned` record carries the decision as `classification`
+`{difficulty, score, rules, signals, rationale, routed_at (only when it ran at another difficulty)}`,
+and the answer carries `classification` when a rule matched, beside `engine_label`,
+`model_label`, and optional `execution_profile`. An empty catalog still means
+`--model default` without a word.
 
 ### Gate step-up
 
@@ -314,7 +366,7 @@ phase 1.
 - **Re-probe** (`reprobe_due`, `route_with_reprobe`): a routable preset
   whose grade is not locked, with no task first assigned to it at its
   calibrated grade's difficulty for `SPAWN_GRADING_REPROBE_SECS` (default
-  21600; `0`: never), counted from the later of that task and its
+  `0`: off / opt-in; set positive whole seconds to enable), counted from the later of that task and its
   `window_start_ms`, is *due*. The next unflagged assignment routed at
   exactly that difficulty goes to it instead of the minimum-sufficient
   preset: the longest-starved first, then cost rank, then id. The answer
@@ -354,7 +406,7 @@ the API now tell apart as many profiles as presets name.
   `execution_profile`, and `task.assigned` / `task.rerouted` carry it when
   the preset has one.
 - `GET /api/grading`: `{presets: [... every catalog field, routing_grade,
-  profile, reprobe_due], profiles: [sorted names]}`, read-only.
+  profile, driver, label_only, tier_role, reprobe_due], profiles: [sorted names]}`, read-only.
 
 ## Known limits
 
@@ -407,18 +459,18 @@ the API now tell apart as many profiles as presets name.
   `cheap`). `spawn mission list` and the web UI do not yet show a task's
   difficulty, preset, classification or step-up history, and no page
   reads `/api/grading`. This change does not close issue #99 on its own.
-- The classifier reads only the brief's words and structure. A low-risk
-  marker in a brief that names consequential work still reads `l1`: for
-  example, "Run cargo fmt and delete the old dispatcher" classifies `l1`
-  on "cargo fmt". (Under `brief-v1`, "One-line fix: make the dispatcher
-  retry forever" read `l1` on `one-line`; under `brief-v2` it is `l2`.)
-  Name `--difficulty` when the wording understates the change.
+- The classifier reads only the brief's words and structure. Under `brief-v3`,
+  destructive verbs such as `delete`, `remove`, `drop`, `replace`, and `change`
+  (along with Chinese equivalents `删除`, `修改`, `修复`, `设计`, etc.) cancel
+  `low_risk`, so `"Run cargo fmt and delete the old dispatcher"` now classifies
+  `l2`. Name `--difficulty` when phrasing still understates the change.
 - A malformed `SPAWN_GRADING_REPROBE_SECS` is warned about once per
-  process (on stderr), and the default is used. It does not
+  process (on stderr), and re-probe stays off. The classifier does not
   read the code a task will touch.
-- A re-probe gives a starved preset real work at its grade: work it is
-  graded for, though possibly dearer than the cheapest choice. Set
-  `SPAWN_GRADING_REPROBE_SECS=0` to turn it off.
+- A re-probe gives a starved preset real work at its grade when enabled:
+  work it is graded for, though possibly dearer than the cheapest choice.
+  `SPAWN_GRADING_REPROBE_SECS` defaults to `0` (off / opt-in); set positive
+  whole seconds to enable it.
 - An execution profile is not run by the dispatcher. It is a name the
   catalog, routing and records carry, and the worker runs on its
   `model_profile`.

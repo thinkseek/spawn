@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use spawn_core::event::ModelProfile;
 use spawn_core::grading::{
     DifficultyClassification, GradedPreset, RoutingDecision, RoutingError, TaskDifficulty,
-    catalog_covers, classify_difficulty, route_preset, route_with_reprobe,
+    classify_difficulty, route_preset, route_with_reprobe,
 };
 
 use crate::{Flags, open_store};
@@ -118,27 +118,29 @@ pub(crate) const USAGE: &str = "usage:
       actual landing repository, gate and backlog paths, per-open-task delivery/report/gate
       diagnostics, and shell-quoted read-only checks. Prints JSON and creates nothing)
   spawn mission close --id N --state done|dropped [--summary <text>]
-  spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
+  spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> (--brief <text|-> | --brief-file <path>)
                     [--model default|cheap] [--engine <claude|agy>] [--model-label <label>] [--again] [--pin]
                     [--difficulty l1|l2|l3] [--preset <preset_id>]
-      (the supervisor's brief that a task of the mission in flight already has, trimmed of
-       space, tab, CR and LF, is refused, naming that task; --again assigns it on purpose.
-       Every duplicate assigned names the task it repeats in its record: duplicate_of.
+      (--brief - reads the brief from stdin; --brief-file reads it from a file cleanly off the
+       command line. The supervisor's brief that a task of the mission in flight already has,
+       trimmed of space, tab, CR and LF, is refused, naming that task; --again assigns it on
+       purpose. Every duplicate assigned names the task it repeats in its record: duplicate_of.
        --pin keeps the task with its worker: it is never stolen.
        --engine selects an enabled engine directly (bypassing grading catalog routing);
-       --model-label sets that engine's launch model label (e.g. gemini-3.8-flash-low for agy).
+       --model-label sets that engine's launch model label (e.g. gemini-pro-orchestrator-neon for agy).
        Agent grading (docs/agent-grading.md): --difficulty or --preset routes the task
        through the grading catalog (spawn grade): to --preset, or to the cheapest routable
-       preset graded for the difficulty (l2 unless given), on that preset's --model profile;
+       active preset graded for the difficulty (l2 unless given), on that preset's --model profile;
        no such preset is an error. Without either, an ephemeral task's difficulty is
-       classified from its brief (security or migration work, many files or crates, many
-       steps: l3; a small low-risk change: l1; otherwise l2; the rules and their evidence
-       are recorded on task.assigned as classification, and answered when any matched) and
-       routed there when some routable preset is graded for it, else at l2; a preset that
-       has had no task at its grade for SPAWN_GRADING_REPROBE_SECS (default 21600, 0: never)
-       is given one as a re-probe (reprobe). With nothing graded for it nor l2 it is
-       assigned on --model default as before, saying so (routing_fallback); a resident
-       task, or one made from an objective, stays on --model. --model keeps the catalog out, and is refused with --difficulty or --preset)
+       classified from its brief (brief-v3: security, architecture or migration work, many files or
+       crates, many steps: l3; strictly deterministic low-risk mechanical work: l1; otherwise l2;
+       the rules and their evidence are recorded on task.assigned as classification, and answered
+       when any matched) and routed top-down: at l3/l2 when covered, and at l1 when an active l1
+       preset exists, else falling back upward to l2 (never downgrading l3 to l2); an opt-in
+       anti-starvation re-probe runs only when SPAWN_GRADING_REPROBE_SECS is set > 0 (default 0:
+       off). With nothing covering it, it is assigned on --model default, saying so
+       (routing_fallback); a resident task, or one made from an objective, stays on --model.
+       --model keeps the catalog out, and is refused with --difficulty or --preset)
   spawn task accept --id N [--revision R]
   spawn task reject --id N [--revision R] --note <what to fix>
       (R: the report's revision as read; refused once the task has moved on. A task routed
@@ -157,7 +159,7 @@ pub(crate) const USAGE: &str = "usage:
       (a delivered task's worker gets a fresh execution: its running one is stopped, its final
        checkpoint kept, and its native session resumed on its workspace. Prints the task and
        worker that carry the work; any task not delivered is refused, naming its state)
-  spawn task reassign --id N [--reason <text>]
+  spawn task reassign --id N [--reason <text|-> | --reason-file <path>]
       (a delivered task moves to a fresh ephemeral worker whose branch starts from the old
        worker's last checkpoint: the task is cancelled, a new one assigned, the old worker
        stopped. Prints the new task and its worker; any task not delivered is refused)
@@ -614,6 +616,63 @@ fn text(flags: &Flags, name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("--{name} is required\n{USAGE}"))
 }
 
+/// Resolve `--<value_flag> <text|->` or `--<file_flag> <path>`, refusing
+/// conflicting flags and empty or whitespace-only text.
+fn resolve_text_or_file(
+    flags: &Flags,
+    value_flag: &str,
+    file_flag: &str,
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, String> {
+    let inline = flags.get(value_flag);
+    let path = flags.get(file_flag);
+    match (inline, path) {
+        (Some(_), Some(_)) => Err(format!(
+            "use either --{value_flag} or --{file_flag}, not both\n{USAGE}"
+        )),
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|error| format!("read --{file_flag} {path}: {error}"))?;
+            if content.trim().is_empty() {
+                return Err(format!("{value_flag} file {path} is empty"));
+            }
+            Ok(content)
+        }
+        (Some(text), None) if text == "-" => {
+            let mut content = String::new();
+            stdin
+                .read_to_string(&mut content)
+                .map_err(|error| format!("read --{value_flag} - from stdin: {error}"))?;
+            if content.trim().is_empty() {
+                return Err(format!("--{value_flag} - read empty input from stdin"));
+            }
+            Ok(content)
+        }
+        (Some(text), None) => {
+            if text.trim().is_empty() {
+                return Err(format!("--{value_flag} must not be empty"));
+            }
+            Ok(text)
+        }
+        (None, None) => Err(format!(
+            "--{value_flag} <text|-> or --{file_flag} <path> is required\n{USAGE}"
+        )),
+    }
+}
+
+/// Optional variant of [`resolve_text_or_file`] for flags like `--reason`.
+fn resolve_optional_text_or_file(
+    flags: &Flags,
+    value_flag: &str,
+    file_flag: &str,
+    stdin: &mut impl std::io::BufRead,
+) -> Result<Option<String>, String> {
+    if flags.get(value_flag).is_none() && flags.get(file_flag).is_none() {
+        return Ok(None);
+    }
+    resolve_text_or_file(flags, value_flag, file_flag, stdin).map(Some)
+}
+
 /// The `--revision` of the report a review judged, if named: without it,
 /// the report as it is now.
 fn revision(flags: &Flags) -> Result<Option<i32>, String> {
@@ -685,7 +744,27 @@ pub(crate) fn assign(
     store: &spawn_postgres::PostgresStore,
     flags: &Flags,
 ) -> Result<Value, String> {
+    let stdin = std::io::stdin();
+    let mut lock = stdin.lock();
+    assign_with_reader(store, flags, &mut lock)
+}
+
+pub(crate) fn assign_with_reader(
+    store: &spawn_postgres::PostgresStore,
+    flags: &Flags,
+    reader: &mut impl std::io::BufRead,
+) -> Result<Value, String> {
+    assign_with_options(store, flags, reader, crate::grading::reprobe_interval_ms())
+}
+
+pub(crate) fn assign_with_options(
+    store: &spawn_postgres::PostgresStore,
+    flags: &Flags,
+    reader: &mut impl std::io::BufRead,
+    reprobe_interval_ms: i64,
+) -> Result<Value, String> {
     let err = |error: spawn_core::port::StoreError| error.to_string();
+    let brief = resolve_text_or_file(flags, "brief", "brief-file", reader)?;
     let direct_engine = direct_engine(flags)?;
     let direct_label = direct_model_label(flags, direct_engine.as_deref())?;
     if direct_engine.is_some() || direct_label.is_some() {
@@ -702,7 +781,7 @@ pub(crate) fn assign(
                 id(flags, "mission")?,
                 &text(flags, "kind")?,
                 &flags.get("worker").unwrap_or_default(),
-                &text(flags, "brief")?,
+                &brief,
                 model.as_str(),
                 flags.switch("again"),
                 flags.switch("pin"),
@@ -719,7 +798,7 @@ pub(crate) fn assign(
         }
         return Ok(answer);
     }
-    let (decision, classified) = match placement(store, flags)? {
+    let (decision, classified) = match placement(store, flags, &brief, reprobe_interval_ms)? {
         Placement::Routed(decision, classified) => (decision, classified),
         Placement::Model { fallback } => {
             let model = model(flags)?;
@@ -728,7 +807,7 @@ pub(crate) fn assign(
                     id(flags, "mission")?,
                     &text(flags, "kind")?,
                     &flags.get("worker").unwrap_or_default(),
-                    &text(flags, "brief")?,
+                    &brief,
                     model.as_str(),
                     flags.switch("again"),
                     flags.switch("pin"),
@@ -750,7 +829,7 @@ pub(crate) fn assign(
             id(flags, "mission")?,
             &text(flags, "kind")?,
             &flags.get("worker").unwrap_or_default(),
-            &text(flags, "brief")?,
+            &brief,
             decision.model_profile.as_str(),
             flags.switch("again"),
             flags.switch("pin"),
@@ -762,6 +841,12 @@ pub(crate) fn assign(
     let mut answer = json!({ "task": task, "model": decision.model_profile.as_str(),
                              "difficulty": decision.difficulty, "preset_id": decision.preset_id,
                              "preset_grade": decision.preset_grade });
+    if let Some(engine_label) = &decision.engine_label {
+        answer["engine_label"] = json!(engine_label);
+    }
+    if let Some(model_label) = &decision.model_label {
+        answer["model_label"] = json!(model_label);
+    }
     // Phase 2's additions, each only when it says something, so a phase-1
     // answer reads as it did.
     if let Some(profile) = &decision.execution_profile {
@@ -798,7 +883,12 @@ pub(crate) fn assign(
 ///   and when the catalog holds presets, saying why. An unflagged
 ///   assignment (the supervisor's) is never stopped by what the catalog
 ///   holds.
-fn placement(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Placement, String> {
+fn placement(
+    store: &spawn_postgres::PostgresStore,
+    flags: &Flags,
+    brief: &str,
+    reprobe_interval_ms: i64,
+) -> Result<Placement, String> {
     let difficulty = flags
         .get("difficulty")
         .map(|text| {
@@ -833,11 +923,7 @@ fn placement(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Pla
         .map_err(|error| format!("agent grading: {error}"));
     }
     Ok(
-        match route_unflagged(
-            store,
-            &flags.get("brief").unwrap_or_default(),
-            "--model default",
-        )? {
+        match route_unflagged_with_reprobe(store, brief, "--model default", reprobe_interval_ms)? {
             CatalogRoute::Routed(decision, classified) => {
                 Placement::Routed(decision, Some(classified))
             }
@@ -872,23 +958,45 @@ pub(crate) fn route_unflagged(
     text: &str,
     unrouted_as: &str,
 ) -> Result<CatalogRoute, String> {
+    route_unflagged_with_reprobe(
+        store,
+        text,
+        unrouted_as,
+        crate::grading::reprobe_interval_ms(),
+    )
+}
+
+fn route_unflagged_with_reprobe(
+    store: &spawn_postgres::PostgresStore,
+    text: &str,
+    unrouted_as: &str,
+    reprobe_interval_ms: i64,
+) -> Result<CatalogRoute, String> {
     let catalog = store.grading_catalog().map_err(|error| error.to_string())?;
     if catalog.is_empty() {
         return Ok(CatalogRoute::Unrouted { fallback: None });
     }
-    // Classified first: an `l1` task reaches an `l1` preset (a demoted one
-    // included, refilling its window) even when nothing covers `l2`.
     let classified = classify_difficulty(text);
-    let Some(target) = routed_difficulty(&catalog, classified.difficulty) else {
-        return Ok(CatalogRoute::Unrouted {
-            fallback: Some(format!(
+    let Some(target) =
+        spawn_core::grading::resolve_routing_difficulty(&catalog, classified.difficulty)
+    else {
+        let reason = if classified.difficulty == TaskDifficulty::L3 {
+            format!(
+                "no routable preset in the grading catalog is graded l3 (refusing to downgrade l3 to l2): \
+                 assigned on {unrouted_as}, as without the catalog"
+            )
+        } else {
+            format!(
                 "no routable preset in the grading catalog is graded {} or above: \
                  assigned on {unrouted_as}, as without the catalog",
                 classified
                     .difficulty
                     .max(TaskDifficulty::default())
                     .required_grade()
-            )),
+            )
+        };
+        return Ok(CatalogRoute::Unrouted {
+            fallback: Some(reason),
         });
     };
     let activity = store
@@ -899,29 +1007,10 @@ pub(crate) fn route_unflagged(
         &catalog,
         &activity,
         crate::grading::now_ms(),
-        crate::grading::reprobe_interval_ms(),
+        reprobe_interval_ms,
     )
     .map(|decision| CatalogRoute::Routed(decision, classified))
     .map_err(|error| format!("agent grading: {error}"))
-}
-
-/// The difficulty an unflagged task `classified` at is routed at: its own
-/// when the catalog covers it, else the default (`l2`) when that is
-/// covered, as phase 1 routed every unflagged task (the record keeps what
-/// the classifier said beside the difficulty it ran at); none when neither
-/// is.
-fn routed_difficulty(
-    catalog: &[GradedPreset],
-    classified: TaskDifficulty,
-) -> Option<TaskDifficulty> {
-    let default = TaskDifficulty::default();
-    if catalog_covers(catalog, classified) {
-        Some(classified)
-    } else if catalog_covers(catalog, default) {
-        Some(default)
-    } else {
-        None
-    }
 }
 
 /// What a routed assignment says of its route on stderr (`subject`: `task
@@ -1900,7 +1989,9 @@ pub(crate) fn task(rest: &[String]) -> Result<i32, String> {
         }
         "reassign" => {
             let task = id(&flags, "id")?;
-            let reason = flags.get("reason");
+            let stdin = std::io::stdin();
+            let mut lock = stdin.lock();
+            let reason = resolve_optional_text_or_file(&flags, "reason", "reason-file", &mut lock)?;
             print(&store.task_reassign(task, reason.as_deref()).map_err(err)?);
         }
         // Work stealing (objective 239): the owner's move, by `human`.
@@ -3090,5 +3181,320 @@ mod tests {
         }
         drop(sup_store);
         drop(store);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn resolve_text_or_file_handles_inline_stdin_file_and_rejects_bad_inputs() {
+        use std::io::Cursor;
+
+        // 1. --brief <inline>
+        let inline = super::resolve_text_or_file(
+            &flags(&["--brief", "Fix typo"]),
+            "brief",
+            "brief-file",
+            &mut Cursor::new(b""),
+        )
+        .unwrap();
+        assert_eq!(inline, "Fix typo");
+
+        // 2. --brief - from stdin with multiline & special characters verbatim
+        let special =
+            "Line 1: $HOME `whoami` $(id) \"quotes\" 'single'\nLine 2: 重大决策 & chmod\n";
+        let from_stdin = super::resolve_text_or_file(
+            &flags(&["--brief", "-"]),
+            "brief",
+            "brief-file",
+            &mut Cursor::new(special.as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(from_stdin, special);
+
+        // 3. --brief-file <path> with >8KB long UTF-8 text verbatim
+        let tmp = std::env::temp_dir().join(format!("spawn-brief-test-{}.md", std::process::id()));
+        let long_brief = format!(
+            "# Brief\n{}{}",
+            "架构设计与安全校验 --flag=\"val\" $VAR\n",
+            "x".repeat(9000)
+        );
+        std::fs::write(&tmp, &long_brief).unwrap();
+        let tmp_str = tmp.to_string_lossy().to_string();
+        let from_file = super::resolve_text_or_file(
+            &flags(&["--brief-file", &tmp_str]),
+            "brief",
+            "brief-file",
+            &mut Cursor::new(b""),
+        )
+        .unwrap();
+        assert_eq!(from_file, long_brief);
+
+        // 4. Reject mutually exclusive flags
+        let conflict = super::resolve_text_or_file(
+            &flags(&["--brief", "a", "--brief-file", &tmp_str]),
+            "brief",
+            "brief-file",
+            &mut Cursor::new(b""),
+        )
+        .unwrap_err();
+        assert!(conflict.contains("not both"), "{conflict}");
+
+        // 5. Reject missing brief / missing file / whitespace-only file / empty stdin
+        assert!(
+            super::resolve_text_or_file(&flags(&[]), "brief", "brief-file", &mut Cursor::new(b""))
+                .unwrap_err()
+                .contains("is required")
+        );
+        assert!(
+            super::resolve_text_or_file(
+                &flags(&["--brief-file", "/nonexistent/spawn-brief-missing.md"]),
+                "brief",
+                "brief-file",
+                &mut Cursor::new(b""),
+            )
+            .is_err()
+        );
+        std::fs::write(&tmp, "   \n\t  ").unwrap();
+        assert!(
+            super::resolve_text_or_file(
+                &flags(&["--brief-file", &tmp_str]),
+                "brief",
+                "brief-file",
+                &mut Cursor::new(b""),
+            )
+            .unwrap_err()
+            .contains("is empty")
+        );
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(
+            super::resolve_text_or_file(
+                &flags(&["--brief", "-"]),
+                "brief",
+                "brief-file",
+                &mut Cursor::new(b"   \n"),
+            )
+            .unwrap_err()
+            .contains("empty input")
+        );
+
+        // 6. Optional --reason / --reason-file for reassign
+        assert_eq!(
+            super::resolve_optional_text_or_file(
+                &flags(&[]),
+                "reason",
+                "reason-file",
+                &mut Cursor::new(b""),
+            )
+            .unwrap(),
+            None
+        );
+        let reason_stdin = super::resolve_optional_text_or_file(
+            &flags(&["--reason", "-"]),
+            "reason",
+            "reason-file",
+            &mut Cursor::new(b"worker stalled on OOM"),
+        )
+        .unwrap();
+        assert_eq!(reason_stdin.as_deref(), Some("worker stalled on OOM"));
+        assert!(
+            super::resolve_optional_text_or_file(
+                &flags(&["--reason", "x", "--reason-file", "/tmp/r.txt"]),
+                "reason",
+                "reason-file",
+                &mut Cursor::new(b""),
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod database_tests {
+    use std::io::Cursor;
+
+    use serde_json::json;
+    use spawn_postgres::testing::TestSchema;
+
+    use crate::Flags;
+
+    fn flags(words: &[&str]) -> Flags {
+        Flags::parse_with_switches(
+            &words.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            &["again", "pin"],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn assign_with_brief_file_and_stdin_routes_topdown_without_downgrading_l3() {
+        let schema = TestSchema::new("cli_missions_topdown_brief_file");
+        let store = schema.store();
+        let mission = store.mission_add("TopDown", &json!([]), "human").unwrap();
+
+        // Seed default 2-tier stack (L3 Fable 5.2 locked, L2 Neon locked; no L1).
+        crate::grading::init_topdown(&store, false, None).unwrap();
+
+        // 1. L3 brief via --brief-file -> routes to claude / claude-fable-5-2.
+        let brief_path =
+            std::env::temp_dir().join(format!("spawn-topdown-l3-{}.md", std::process::id()));
+        let l3_brief = "重大决策：架构重构与跨模块安全沙箱隔离\n保留 $HOME 和 `backticks` 原样";
+        std::fs::write(&brief_path, l3_brief).unwrap();
+        let path_str = brief_path.to_string_lossy().to_string();
+        let mission_id = mission.to_string();
+        let l3 = super::assign_with_reader(
+            &store,
+            &Flags::parse_with_switches(
+                &[
+                    "--mission".into(),
+                    mission_id.clone(),
+                    "--kind".into(),
+                    "ephemeral".into(),
+                    "--worker".into(),
+                    "w-l3".into(),
+                    "--brief-file".into(),
+                    path_str,
+                ],
+                &["again", "pin"],
+            )
+            .unwrap(),
+            &mut Cursor::new(b""),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&brief_path);
+        assert_eq!(l3["difficulty"], json!("l3"));
+        assert_eq!(
+            l3["preset_id"],
+            json!(spawn_core::grading::TOPDOWN_L3_PRESET_ID)
+        );
+        assert_eq!(l3["engine_label"], json!("claude"));
+        assert_eq!(l3["model_label"], json!("claude-fable-5-2"));
+        let stored_mission = store.mission_by_id(mission).unwrap().unwrap();
+        let stored_task = stored_mission["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == l3["task"])
+            .unwrap();
+        assert_eq!(stored_task["brief"], json!(l3_brief));
+
+        // 2. Neutral L2 brief via --brief - -> routes to agy / gemini-pro-orchestrator-neon.
+        let l2 = super::assign_with_reader(
+            &store,
+            &Flags::parse_with_switches(
+                &[
+                    "--mission".into(),
+                    mission_id.clone(),
+                    "--kind".into(),
+                    "ephemeral".into(),
+                    "--worker".into(),
+                    "w-l2".into(),
+                    "--brief".into(),
+                    "-".into(),
+                ],
+                &["again", "pin"],
+            )
+            .unwrap(),
+            &mut Cursor::new(b"Adjust button padding in dashboard panel"),
+        )
+        .unwrap();
+        assert_eq!(l2["difficulty"], json!("l2"));
+        assert_eq!(
+            l2["preset_id"],
+            json!(spawn_core::grading::TOPDOWN_L2_PRESET_ID)
+        );
+        assert_eq!(l2["engine_label"], json!("agy"));
+        assert_eq!(l2["model_label"], json!("gemini-pro-orchestrator-neon"));
+
+        // 3. Deterministic L1 brief with no L1 preset -> upward fallback to L2 Neon.
+        let l1_up = super::assign_with_reader(
+            &store,
+            &flags(&[
+                "--mission",
+                &mission_id,
+                "--kind",
+                "ephemeral",
+                "--worker",
+                "w-l1-up",
+                "--brief",
+                "Fix the typo in README.md",
+            ]),
+            &mut Cursor::new(b""),
+        )
+        .unwrap();
+        assert_eq!(l1_up["difficulty"], json!("l1"));
+        assert_eq!(
+            l1_up["preset_id"],
+            json!(spawn_core::grading::TOPDOWN_L2_PRESET_ID)
+        );
+        assert_eq!(l1_up["preset_grade"], json!("l2"));
+
+        // 4. Enable L1 preset (`deepseek-v4.1-flash`) -> deterministic L1 now offloads to T1.
+        let second_schema = TestSchema::new("cli_missions_topdown_with_l1");
+        let second_store = second_schema.store();
+        let second_mission = second_store
+            .mission_add("WithL1", &json!([]), "human")
+            .unwrap();
+        let second_mission_id = second_mission.to_string();
+        crate::grading::init_topdown(&second_store, true, Some("deepseek-v4.1-flash")).unwrap();
+        let l1_offload = super::assign_with_reader(
+            &second_store,
+            &flags(&[
+                "--mission",
+                &second_mission_id,
+                "--kind",
+                "ephemeral",
+                "--worker",
+                "w-l1",
+                "--brief",
+                "Fix the typo in README.md",
+            ]),
+            &mut Cursor::new(b""),
+        )
+        .unwrap();
+        assert_eq!(l1_offload["difficulty"], json!("l1"));
+        assert_eq!(
+            l1_offload["preset_id"],
+            json!(spawn_core::grading::TOPDOWN_L1_PRESET_ID)
+        );
+        assert_eq!(l1_offload["model"], json!("cheap"));
+        assert_eq!(l1_offload["model_label"], json!("deepseek-v4.1-flash"));
+
+        // 5. Disable L3 preset -> L3 brief MUST NOT silently downgrade to L2 Neon!
+        second_store
+            .grading_record(&json!({
+                "type": "preset.state_changed",
+                "preset_id": spawn_core::grading::TOPDOWN_L3_PRESET_ID,
+                "from_state": "active",
+                "to_state": "disabled"
+            }))
+            .unwrap();
+        let l3_no_downgrade = super::assign_with_reader(
+            &second_store,
+            &flags(&[
+                "--mission",
+                &second_mission_id,
+                "--kind",
+                "ephemeral",
+                "--worker",
+                "w-l3-fb",
+                "--brief",
+                "Harden authentication against SQL injection",
+            ]),
+            &mut Cursor::new(b""),
+        )
+        .unwrap();
+        assert!(
+            l3_no_downgrade.get("preset_id").is_none(),
+            "{l3_no_downgrade}"
+        );
+        assert_eq!(l3_no_downgrade["model"], json!("default"));
+        assert!(
+            l3_no_downgrade["routing_fallback"]
+                .as_str()
+                .unwrap()
+                .contains("refusing to downgrade l3 to l2"),
+            "{l3_no_downgrade}"
+        );
     }
 }

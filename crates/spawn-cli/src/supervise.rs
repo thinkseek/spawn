@@ -175,7 +175,11 @@ You work for missions, not for repositories. Missions arrive in the inbox (human
 How work flows: you decide, Spawn delivers. Briefs and send-backs go through tasks; the only \
 input you type into a worker yourself is a nudge or a `continue` (see Tools).
 1. Plan: split a mission into tasks. Each task gets a self-contained brief: goal, inputs (paths, \
-repos, facts it needs), done criteria. Never paste your own conversation into a brief.
+repos, facts it needs), done criteria. Never paste your own conversation into a brief. Write \
+any non-trivial or multi-line brief to a plain file (for example `.md` or `.txt`) and pass \
+`--brief-file <path>`, or pipe it on stdin via `--brief - <<'EOF'`, keeping briefs off the Bash \
+command line. Do not repeat security/credential blacklists or forbidden shell command strings inside \
+a brief: Spawn enforces credential and sandbox rules via `--settings`.
 2. Route each task, keeping every context about one concern:
    - to a resident (`--kind resident --worker <name>`) only if the task is inside that resident's \
 charter;
@@ -184,9 +188,11 @@ for that task only.
    If a concern keeps coming back and no resident owns it, propose one: `{spawn} resident propose \
 --name <name> --charter <one paragraph>`. Only the owner approves it: say so in a \"For the \
 owner:\" line and route the work to ephemeral workers meanwhile.
-   Add `--model cheap` to run a task entirely on a cheaper model (DeepSeek) when it is simple and \
-fully specified: docs, mechanical edits, adding tests for behaviour the brief states. Keep the \
-default for design, concurrency, security, debugging, and anything a gate judges as hard.
+   Top-down grading routes tasks automatically from a strong `l2` mainline (and `l3` for \
+architecture, concurrency, security, migrations, and rework). Pass `--model cheap` only when a task \
+is strictly deterministic, simple and fully specified: typo/formatting fixes, mechanical edits, \
+tagging. Keep the default for design, concurrency, security, debugging, and anything a gate judges \
+as hard.
 3. Review: each worker ends with a report; you get it in a digest, with its revision. Accept \
 (`{spawn} task accept --id N --revision R`) or send it back with what to fix (`{spawn} task reject \
 --id N --revision R --note ...`). Always name the revision you read: if the task has moved on \
@@ -224,7 +230,8 @@ reverse a decision of yours), never as the answer to a pending question: you lea
 
 Tools (run them with Bash; they go through your restricted login):
 - `{spawn} mission list` — missions with their tasks, states and reports; the resident roster.
-- `{spawn} task assign --mission N --kind ephemeral|resident --worker <label|name> --brief <text> [--model cheap]`
+- `{spawn} task assign --mission N --kind ephemeral|resident --worker <label|name> --brief-file <path> [--model cheap]` \
+(or `--brief -` via stdin, or a short single-line `--brief <text>`)
 - `{spawn} task accept|reject --id N --revision R` (reject also `--note ...`), `{spawn} task cancel --id N`
 - `{spawn} task restart --id N --reason <why>` — a stalled worker of a delivered task gets a fresh \
 execution of its own session on its workspace (its work kept); `{spawn} task reassign --id N \
@@ -506,6 +513,49 @@ mod tests {
         assert!(text.contains("--model cheap"));
         assert!(text.contains("simple and fully specified"));
         assert!(text.contains("security"));
+    }
+
+    #[test]
+    fn the_charter_prefers_brief_file_and_avoids_credential_deny_boilerplate() {
+        fn wildcard_matches(pattern: &str, text: &str) -> bool {
+            let parts: Vec<&str> = pattern.split('*').collect();
+            if parts.len() == 1 {
+                return text == pattern;
+            }
+            let Some(mut rest) = text.strip_prefix(parts[0]) else {
+                return false;
+            };
+            let Some(tail) = parts.last() else {
+                return false;
+            };
+            for mid in &parts[1..parts.len() - 1] {
+                let Some(pos) = rest.find(mid) else {
+                    return false;
+                };
+                rest = &rest[pos + mid.len()..];
+            }
+            rest.ends_with(tail)
+        }
+
+        let text = charter("spawn", "mission.md");
+        assert!(text.contains("--brief-file <path>"), "{text}");
+        assert!(text.contains("--brief -"), "{text}");
+        assert!(text.contains("--settings"), "{text}");
+        assert!(!text.contains("permissions.deny"), "{text}");
+
+        for line in text.lines() {
+            if !line.contains("task assign") {
+                continue;
+            }
+            for rule in spawn_core::bridge::CREDENTIAL_DENY {
+                if let Some(body) = rule.strip_prefix("Bash(").and_then(|s| s.strip_suffix(')')) {
+                    assert!(
+                        !wildcard_matches(body, line),
+                        "charter line `{line}` triggered credential deny `{rule}`"
+                    );
+                }
+            }
+        }
     }
 
     /// The owner, 2026-11-06: "no human but can input". The supervisor
