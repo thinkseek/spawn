@@ -535,6 +535,11 @@ struct Follow {
     first_seen: Option<i64>,
     /// Whether the execution's native session is known ([`Binding`]).
     binding: Binding,
+    /// When [`Bridge::bind_reported`] last scanned the engine's
+    /// conversations for this execution's, by the Bridge's clock: at most
+    /// once per [`SCAN_INTERVAL_MS`], since each scan may read up to
+    /// [`crate::port::LIST_DIRS_LIMIT`] transcripts.
+    scanned_at: Option<i64>,
     /// The host's agent reading (its `seq`) a recorded screen was last
     /// keyed by: a reading recorded once is never keyed again.
     keyed_seq: Option<u64>,
@@ -594,6 +599,10 @@ struct Follow {
 /// replaced, as the archive's copier does with its copies
 /// (transcripts.rs `OVERLAP`).
 const FOLLOW_OVERLAP: usize = 4096;
+
+/// The least time between two scans of an engine's conversations for an
+/// execution's own ([`Bridge::bind_reported`]), in milliseconds.
+const SCAN_INTERVAL_MS: i64 = 2_000;
 
 impl Follow {
     /// The log records the execution's native session: it is known, as
@@ -3195,18 +3204,18 @@ impl Bridge {
                         .is_some_and(|steps| steps.typing_at.is_some())
                 })
         };
-        let home = self.config.home_of(active.driver);
+        let driver = active.driver;
+        let workspace = active.workspace.clone();
+        let home = self.config.home_of(driver);
         let root = format!("{}/", home.sessions.trim_end_matches('/'));
         // The transcript of `native`, when it is below the engine's home and
         // a prompt in it holds a marker typed into this execution.
         let proven = |native: &str| -> Option<String> {
-            let path = active
-                .driver
-                .transcript_path(&home, &active.workspace, native);
+            let path = driver.transcript_path(&home, &workspace, native);
             if !path.starts_with(&root) {
                 return None;
             }
-            let Ok(Some(bytes)) = self.terminals.read_from(&active.workspace, &path, 0) else {
+            let Ok(Some(bytes)) = self.terminals.read_from(&workspace, &path, 0) else {
                 return None;
             };
             let typed = String::from_utf8_lossy(&bytes).lines().any(|line| {
@@ -3222,15 +3231,21 @@ impl Bridge {
         let mut bound = reported
             .as_deref()
             .and_then(|native| proven(native).map(|path| (native.to_string(), path)));
+        let now = self.clock.now().0;
         if bound.is_none()
-            && let Some(dir) = active.driver.session_scan_dir(&home)
+            && let Some(dir) = driver.session_scan_dir(&home)
             && view.is_some_and(|view| {
                 view.steps
                     .iter()
                     .any(|(command, steps)| command.0 >= first && steps.typing_at.is_some())
             })
-            && let Ok(names) = self.terminals.list_dirs(&active.workspace, &dir)
+            && active
+                .follow
+                .scanned_at
+                .is_none_or(|at| now.saturating_sub(at) >= SCAN_INTERVAL_MS)
+            && let Ok(names) = self.terminals.list_dirs(&workspace, &dir)
         {
+            active.follow.scanned_at = Some(now);
             bound = names
                 .iter()
                 .filter(|native| plain_session_id(native))
