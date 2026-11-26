@@ -171,52 +171,68 @@ A dialog an engine shows can be answered without a person by
 [`crates/spawn-cli/src/resolve.rs`](../crates/spawn-cli/src/resolve.rs), a
 step of `spawn loop` (Herdr PR 3, design section 6.3). Every answer is an
 ordinary `key` command of the principal `spawn-resolve`, pressed by the
-Bridge as a person's is. For each answer the record shows:
-`screen.observed permission`, `command.accepted` (principal `spawn-resolve`,
-idempotency key `resolve:<execution>:<dialog id>:<n>:<k>`: the dialog's
-approvals id, its `n`-th answer, the answer's `k`-th key),
+Bridge as a person's is. For each answer the record shows `command.accepted`
+(principal `spawn-resolve`, idempotency key
+`resolve:<execution>:<dialog id>:1:1`, the dialog's approvals id), then
 `command.step pressing`, `pressed`, `command.finished`, then the next
-`screen.observed`. The Bridge's own answer to an engine's startup trust
-dialog takes the same path, keyed `resolve:<execution>:trust:1:<k>`. Its
-keys are recorded `pressing` and `pressed` while the start waits, finished
-once the start is done, and never pressed twice.
+`screen.observed`.
+
+The Bridge records `screen.observed permission` on its own pass, normally
+before the answer. The resolver does not wait for that record: it reads the
+pane twice itself.
+
+The Bridge's own answer to an engine's startup trust dialog takes the same
+path, keyed `resolve:<execution>:trust:1:<k>`. Its keys are recorded
+`pressing` and `pressed` while the start waits, finished once the start is
+done, and never pressed twice.
 
 - **Switch:** `SPAWN_AUTO_APPROVE = off | startup | all`, default `startup`.
-  Only `all` makes the resolver read panes and submit. `startup` is the
-  Bridge's startup trust answer alone, as before. An unknown value is warned
-  about and read as `startup`.
-- **Table** (`spawn_core::driver::table_answer`):
-  - agy's `trust_prompt` for the execution's own workspace, cursor on trust:
-    Enter (probed);
-  - Claude Code's trust dialog: `y` Enter (in production);
-  - Claude Code's numbered permission whose first choice is "Yes": `1`
-    (approvals fixtures).
+  - `all`: the resolver reads panes and submits.
+  - `startup`: only the Bridge's startup trust answer, as before.
+  - `off`: no automatic answer at all, the startup trust dialog included. A
+    start that shows it waits for a person; if nobody answers, it fails
+    naming the dialog and the switch.
 
-  Every other row escalates, and so does any dialog no row covers: agy's
-  permission and question prompts, Claude Code's question forms, Codex,
-  OpenCode. Nothing is pressed for them until a later change adds the
-  captured screen as a test.
+  An unknown value is warned about and read as `startup`.
+- **Table** (`spawn_core::driver::table_answer`): only answers someone has
+  seen work, each one key. Today that is one row: agy's `trust_prompt` for
+  the execution's own workspace, cursor on trust → Enter (probed).
+  Everything else escalates, and nothing is pressed for it until a later
+  change adds the captured screen as a test:
+  - Claude Code's numbered permission, whose only screens are hand-written
+    approvals fixtures;
+  - Claude Code's trust dialog, which the Bridge answers at startup;
+  - agy's permission and question prompts, Claude Code's question forms,
+    Codex, OpenCode, and any dialog no row covers.
 - **Hard blocks** (`spawn_core::driver::hard_block`): a login required or
   expired, a quota or rate limit, an update the engine needs, or exit-only
   choices. Each is escalated at once and never pressed. Their texts come from
   the engines' strings and docs; none is captured yet.
-- **Guards:** every one must hold before a key goes.
+- **Guards:** every one must hold before a key is submitted.
   - Two pane reads in a row show the same dialog id.
   - On Herdr, for an engine other than Claude Code, the agent reads
     `blocked` by a named rule, with the blocker visible.
-  - The driver reads the pane as `Permission`.
+  - The driver's own reading of both panes shows the dialog: `Permission`,
+    or, for `trust_prompt`, its startup trust dialog.
   - The row's own guard holds.
   - No command of the session is unfinished: a person's answer in flight
     holds the resolver off.
   - The breaker is closed.
+- **The Bridge checks again before it presses** a key of `spawn-resolve`:
+  - the driver still reads the dialog on the pane;
+  - no other command of the session was recorded `pressed` or `typed` since
+    this key was accepted.
+
+  Otherwise the command ends `Failed` ("the dialog this answer was for is
+  gone: nothing pressed"), with no `pressing` step.
 - **Breaker:** folded from the log, so a restart keeps it. The counts come
   from the commands of `spawn-resolve`; the per-dialog count comes from
-  `submit`'s idempotency. It opens:
-  - for a dialog that still shows 5 s to 30 s after its answer;
-  - for a dialog on its third answer (a second answer comes only 30 s after
-    the first);
-  - for an execution after 5 answers within 10 minutes;
-  - for the host after 20 answers across the fleet within a minute.
+  `submit`'s idempotency.
+  - A dialog gets at most one automatic answer per execution. If it still
+    shows 5 s after its answer, it is escalated once and never pressed
+    again.
+  - An execution with 5 answers within 10 minutes gets no more.
+  - The host gets no more after 20 answers across the fleet within a minute.
 
   Open means no more keys there and one line in the loop's log. The item
   stays in `/api/approvals` for a person.
