@@ -9,19 +9,26 @@
 //! - Warm Layer 0 baselines under `<root>/.d6/layers/<tree_hex>` never hard-link against
 //!   `<cas>/objects`, and mounted writable workspaces are isolated via `clone_or_copy`.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) type ScannedWorkspaceTree = (Digest, Vec<(TreePath, u64)>, Option<Digest>);
-type FilteredScan = (Vec<ScannedEntry>, Vec<(TreePath, u64)>);
+type ScannedWithMeta = (ScannedEntry, Option<fs::Metadata>);
+type FilteredScanWithMeta = (Vec<ScannedWithMeta>, Vec<(TreePath, u64)>);
+type BranchAndMain = (Option<LedgerSnapshot>, Option<LedgerSnapshot>);
+type FlatTreeMap = Arc<BTreeMap<Vec<u8>, TreeEntry>>;
+type ScannedTreeWithBytes = (Digest, Vec<(TreePath, u64)>, Option<Digest>, u64);
+type FilteredScanWithBytes = (Vec<ScannedWithMeta>, Vec<(TreePath, u64)>, u64);
+type FlattenCacheEntry = (Digest, FlatTreeMap);
+type StatCacheKey = (String, PathBuf);
 
 use spawn_cas::{
     Algo, Digest, GitOid, JournalEntry, Snapshot, TreeEntry, TreeEntryKind, TreeMutation,
@@ -65,8 +72,293 @@ const PENDING_TAG: &str = "pending-merge";
 const COPIES_TAG: &str = "main-copies";
 const OVERSIZED_RECORD_LIMIT: u64 = 64 << 20;
 const CONFLICT_READ_LIMIT: u64 = 64 << 20;
+const FLATTEN_CACHE_CAP: usize = 16;
+const VERIFIED_CLEAN_CAP: usize = 64;
+
+/// Minimum host RAM reserved before admitting D6 L1 `tmpfs` workspaces (`64 GiB`).
+pub const DEFAULT_L1_MIN_HOST_RESERVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Default percentage of total host RAM reserved before admitting D6 L1 `tmpfs` workspaces (`15%`).
+pub const DEFAULT_L1_HOST_RESERVE_PCT: u8 = 15;
+/// Default L1 usage pressure threshold (%) that triggers flush and disk reclamation (`80%`).
+pub const DEFAULT_L1_FLUSH_THRESHOLD_PCT: u8 = 80;
+/// Default interval (ms) after which dirty/idle L1 workspaces trigger CAS+PG flush (`60s`).
+pub const DEFAULT_L1_FLUSH_INTERVAL_MS: i64 = 60_000;
 
 static D6_STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Sample of host memory & `tmpfs` free capacity used by [`L1TmpfsPolicy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMemorySample {
+    /// Total physical host memory in bytes (`MemTotal`).
+    pub total_bytes: u64,
+    /// Available host memory in bytes (`MemAvailable`).
+    pub available_bytes: u64,
+    /// Free bytes available on `tmpfs_root`'s filesystem (`statvfs`), if known.
+    pub tmpfs_available_bytes: Option<u64>,
+}
+
+/// Bounded L1 `tmpfs` upperdir admission, pressure flush, and automatic disk-fallback policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L1TmpfsPolicy {
+    /// Root directory mounted on `tmpfs` where admitted active workspaces live (`<tmpfs_root>/<branch>`).
+    pub tmpfs_root: PathBuf,
+    /// Hard global L1 RAM budget across all admitted branches (in MiB).
+    pub tmpfs_budget_mb: u64,
+    /// Optional per-workspace byte quota (defaults to [`Self::budget_bytes`]).
+    pub per_workspace_quota_bytes: Option<u64>,
+    /// Percentage (`1..=100`, default `80`) at which L1 workspace triggers CAS+PG flush and disk demotion.
+    pub flush_threshold_pct: u8,
+    /// Periodic interval (ms, default `60_000`) after which mounted L1 workspaces flush dirty state to CAS+PG.
+    pub flush_interval_ms: i64,
+    /// Absolute host RAM reserve floor in bytes (default `64 GiB`).
+    pub min_host_reserve_bytes: u64,
+    /// Percentage of total host RAM reserved (`default 15%`); effective floor is `max(min, total * pct / 100)`.
+    pub host_reserve_pct: u8,
+}
+
+impl L1TmpfsPolicy {
+    /// Create an L1 policy backed by `tmpfs_root` with a `tmpfs_budget_mb` global cap and default thresholds
+    /// (`80%` flush threshold, `60s` flush interval, `max(64 GiB, 15% total RAM)` host reserve).
+    pub fn new(tmpfs_root: impl AsRef<Path>, tmpfs_budget_mb: u64) -> Self {
+        Self {
+            tmpfs_root: canonical_root(tmpfs_root.as_ref()),
+            tmpfs_budget_mb,
+            per_workspace_quota_bytes: None,
+            flush_threshold_pct: DEFAULT_L1_FLUSH_THRESHOLD_PCT,
+            flush_interval_ms: DEFAULT_L1_FLUSH_INTERVAL_MS,
+            min_host_reserve_bytes: DEFAULT_L1_MIN_HOST_RESERVE_BYTES,
+            host_reserve_pct: DEFAULT_L1_HOST_RESERVE_PCT,
+        }
+    }
+
+    /// Cap each admitted workspace at `bytes` (clamped by global `budget_bytes()`).
+    #[must_use]
+    pub const fn with_per_workspace_quota_bytes(mut self, bytes: u64) -> Self {
+        self.per_workspace_quota_bytes = Some(bytes);
+        self
+    }
+
+    /// Override the usage-pressure flush percentage (`1..=100`).
+    #[must_use]
+    pub fn with_flush_threshold_pct(mut self, pct: u8) -> Self {
+        self.flush_threshold_pct = pct.clamp(1, 100);
+        self
+    }
+
+    /// Override the periodic flush interval in milliseconds.
+    #[must_use]
+    pub const fn with_flush_interval_ms(mut self, interval_ms: i64) -> Self {
+        self.flush_interval_ms = interval_ms;
+        self
+    }
+
+    /// Override host memory reservation floor parameters (`max(min_bytes, total * pct / 100)`).
+    #[must_use]
+    pub fn with_host_reserve(mut self, min_bytes: u64, pct: u8) -> Self {
+        self.min_host_reserve_bytes = min_bytes;
+        self.host_reserve_pct = pct.min(100);
+        self
+    }
+
+    /// Total L1 budget in bytes (`tmpfs_budget_mb * 1 MiB`).
+    pub const fn budget_bytes(&self) -> u64 {
+        self.tmpfs_budget_mb.saturating_mul(1024 * 1024)
+    }
+
+    /// Effective per-workspace quota in bytes.
+    pub fn workspace_quota_bytes(&self) -> u64 {
+        self.per_workspace_quota_bytes
+            .map_or_else(|| self.budget_bytes(), |q| q.min(self.budget_bytes()))
+    }
+
+    /// Effective host RAM reserve floor `max(min_host_reserve_bytes, total_ram_bytes * host_reserve_pct / 100)`.
+    pub fn host_reserve_bytes(&self, total_ram_bytes: u64) -> u64 {
+        let pct_bytes = u64::try_from(
+            u128::from(total_ram_bytes).saturating_mul(u128::from(self.host_reserve_pct)) / 100,
+        )
+        .unwrap_or(u64::MAX);
+        self.min_host_reserve_bytes.max(pct_bytes)
+    }
+}
+
+/// Reason an L1 `tmpfs` mount automatically fell back to the persistent disk directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum L1FallbackReason {
+    /// Policy budget is 0 or host memory could not be probed safely.
+    Disabled,
+    /// Host available memory minus request would fall below `max(64 GiB, 15% total RAM)`.
+    HostMemoryBelowReserve {
+        /// Observed host `MemAvailable` in bytes.
+        available_bytes: u64,
+        /// Required host reserve floor in bytes.
+        reserve_floor_bytes: u64,
+        /// Estimated workspace requirement in bytes.
+        requested_bytes: u64,
+    },
+    /// Global or per-workspace L1 `tmpfs` byte budget would be exceeded.
+    BudgetExceeded {
+        /// Bytes already reserved across active L1 workspaces.
+        used_bytes: u64,
+        /// Bytes requested for this workspace.
+        requested_bytes: u64,
+        /// Applicable budget/quota limit in bytes.
+        budget_bytes: u64,
+    },
+    /// Underlying `tmpfs` filesystem reported insufficient free space.
+    TmpfsFreeSpaceInsufficient {
+        /// Free bytes reported by `statvfs`.
+        available_bytes: u64,
+        /// Bytes requested for this workspace.
+        requested_bytes: u64,
+    },
+    /// Runtime IO failure while staging onto `tmpfs` (e.g. `ENOSPC`); demoted transparently to disk.
+    TmpfsUnavailable {
+        /// Underlying error diagnostic.
+        detail: String,
+    },
+}
+
+/// Result recorded for each workspace mount when [`L1TmpfsPolicy`] is active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum L1Admission {
+    /// Mounted onto bounded `tmpfs` under `workspace_dir`.
+    AdmittedTmpfs {
+        /// Mounted `tmpfs` directory (`<tmpfs_root>/<branch>`).
+        workspace_dir: PathBuf,
+        /// Assigned workspace quota in bytes.
+        quota_bytes: u64,
+        /// Initial baseline tree estimate in bytes.
+        estimated_bytes: u64,
+    },
+    /// Automatically fell back to on-disk workspace directory `workspace_dir`.
+    FallbackDisk {
+        /// Mounted on-disk directory (`<root>/<branch>`).
+        workspace_dir: PathBuf,
+        /// Deterministic fallback cause.
+        reason: L1FallbackReason,
+    },
+}
+
+/// Reason an L1 workspace requires flush into CAS Merkle + [`RefLedger`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum L1FlushReason {
+    /// Workspace `used_bytes / quota_bytes` reached `flush_threshold_pct` (default `80%`).
+    UsageThreshold {
+        /// Measured L1 directory bytes.
+        used_bytes: u64,
+        /// Assigned L1 workspace quota in bytes.
+        quota_bytes: u64,
+        /// Integer percentage used.
+        usage_pct: u8,
+        /// Configured trigger percentage.
+        threshold_pct: u8,
+    },
+    /// Elapsed wall-clock time since `last_flush_ms` reached `flush_interval_ms` (default `60s`).
+    IntervalElapsed {
+        /// Elapsed milliseconds since last flush.
+        elapsed_ms: i64,
+        /// Configured interval in milliseconds.
+        interval_ms: i64,
+    },
+}
+
+/// Per-branch L1 `tmpfs` byte & flush accounting state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L1WorkspaceAccounting {
+    /// Mounted branch name.
+    pub branch: String,
+    /// Path on `tmpfs` (`<tmpfs_root>/<branch>`).
+    pub workspace_dir: PathBuf,
+    /// Per-workspace quota in bytes.
+    pub quota_bytes: u64,
+    /// Bytes reserved/present right after mount or most recent clean flush.
+    pub baseline_bytes: u64,
+    /// Latest measured/tracked L1 byte usage.
+    pub used_bytes: u64,
+    /// Excess dirty bytes accumulated above `baseline_bytes`.
+    pub dirty_bytes: u64,
+    /// Timestamp (ms) of mount or last flush.
+    pub last_flush_ms: i64,
+    /// Cumulative L1 flushes completed on this mount.
+    pub flush_count: u64,
+}
+
+impl L1WorkspaceAccounting {
+    /// Integer usage percentage relative to `quota_bytes` (`0..=100`).
+    pub fn usage_pct(&self) -> u8 {
+        if self.quota_bytes == 0 {
+            return 100;
+        }
+        let pct = (u128::from(self.used_bytes).saturating_mul(100)) / u128::from(self.quota_bytes);
+        u8::try_from(pct.min(100)).unwrap_or(100)
+    }
+
+    /// Evaluate whether pressure threshold (`>= flush_threshold_pct`) or interval (`>= flush_interval_ms`)
+    /// requires flushing dirty state to CAS + `RefLedger`.
+    pub fn needs_flush(&self, now_ms: i64, policy: &L1TmpfsPolicy) -> Option<L1FlushReason> {
+        let threshold_pct = policy.flush_threshold_pct.clamp(1, 100);
+        if self.quota_bytes > 0
+            && u128::from(self.used_bytes).saturating_mul(100)
+                >= u128::from(self.quota_bytes).saturating_mul(u128::from(threshold_pct))
+        {
+            return Some(L1FlushReason::UsageThreshold {
+                used_bytes: self.used_bytes,
+                quota_bytes: self.quota_bytes,
+                usage_pct: self.usage_pct(),
+                threshold_pct,
+            });
+        }
+        let elapsed_ms = now_ms.saturating_sub(self.last_flush_ms);
+        if policy.flush_interval_ms > 0 && elapsed_ms >= policy.flush_interval_ms {
+            return Some(L1FlushReason::IntervalElapsed {
+                elapsed_ms,
+                interval_ms: policy.flush_interval_ms,
+            });
+        }
+        None
+    }
+}
+
+/// Result returned by [`D6Workspace::flush_l1_workspace`] / [`D6Workspace::flush_l1_if_needed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L1FlushOutcome {
+    /// CAS Merkle + [`RefLedger`] commit created (or `Commit::Unchanged` if already clean).
+    pub commit: Commit,
+    /// Trigger reason that initiated the flush.
+    pub reason: L1FlushReason,
+    /// Bytes freed from L1 `tmpfs` (`> 0` when workspace was demoted to disk on pressure).
+    pub reclaimed_bytes: u64,
+    /// New on-disk [`WorkspaceId`] when `UsageThreshold` demoted the workspace off `tmpfs`.
+    pub demoted_to_disk: Option<WorkspaceId>,
+}
+
+#[derive(Default)]
+struct L1RuntimeState {
+    admissions: HashMap<String, L1Admission>,
+    active: HashMap<String, L1WorkspaceAccounting>,
+}
+
+impl L1RuntimeState {
+    fn total_reserved_bytes(&self) -> u64 {
+        self.active.values().fold(0_u64, |acc, a| {
+            acc.saturating_add(a.used_bytes.max(a.baseline_bytes))
+        })
+    }
+}
+
+#[derive(Clone)]
+struct CachedStatEntry {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    kind: TreeEntryKind,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    blob_id: [u8; 32],
+    fence: (i64, i64),
+}
+
+type L1MemoryProbe = Arc<dyn Fn(&Path) -> Option<HostMemorySample> + Send + Sync>;
 
 /// Pure-Rust CAS + transactional [`RefLedger`] workspace backend (`#113` Phase 4 Step 5).
 ///
@@ -85,6 +377,12 @@ pub struct D6Workspace<L: RefLedger> {
     extra_exclude_files: Vec<PathBuf>,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     last_layer0: Mutex<Option<Layer0MaterializeReport>>,
+    l1_policy: Option<L1TmpfsPolicy>,
+    l1_memory_probe: L1MemoryProbe,
+    l1_state: Mutex<L1RuntimeState>,
+    stat_cache: Mutex<HashMap<StatCacheKey, HashMap<Vec<u8>, CachedStatEntry>>>,
+    flatten_cache: Mutex<VecDeque<FlattenCacheEntry>>,
+    verified_clean: Mutex<VecDeque<(Digest, Option<Digest>)>>,
 }
 
 impl<L: RefLedger> D6Workspace<L> {
@@ -106,6 +404,12 @@ impl<L: RefLedger> D6Workspace<L> {
             extra_exclude_files: Vec::new(),
             clock: Arc::new(system_now_ms),
             last_layer0: Mutex::new(None),
+            l1_policy: None,
+            l1_memory_probe: Arc::new(probe_host_memory),
+            l1_state: Mutex::new(L1RuntimeState::default()),
+            stat_cache: Mutex::new(HashMap::new()),
+            flatten_cache: Mutex::new(VecDeque::new()),
+            verified_clean: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -148,6 +452,53 @@ impl<L: RefLedger> D6Workspace<L> {
     pub fn with_clock_ms(mut self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Enable bounded L1 `tmpfs` upperdir admission, pressure flushing, and automatic disk fallback.
+    #[must_use]
+    pub fn with_l1_policy(mut self, policy: L1TmpfsPolicy) -> Self {
+        self.l1_policy = Some(policy);
+        self
+    }
+
+    /// Override the host RAM / `tmpfs` capacity probe (primarily for deterministic unit/integration tests).
+    #[must_use]
+    pub fn with_l1_memory_probe(mut self, probe: L1MemoryProbe) -> Self {
+        self.l1_memory_probe = probe;
+        self
+    }
+
+    /// Configured L1 `tmpfs` policy, if enabled.
+    pub const fn l1_policy(&self) -> Option<&L1TmpfsPolicy> {
+        self.l1_policy.as_ref()
+    }
+
+    /// Most recent L1 admission decision recorded when mounting `branch`.
+    pub fn l1_admission(&self, branch: &str) -> Option<L1Admission> {
+        self.l1_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admissions
+            .get(branch)
+            .cloned()
+    }
+
+    /// Current L1 accounting snapshot for an active `tmpfs`-mounted `branch`, if any.
+    pub fn l1_accounting(&self, branch: &str) -> Option<L1WorkspaceAccounting> {
+        self.l1_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .get(branch)
+            .cloned()
+    }
+
+    /// Total L1 bytes currently reserved across active `tmpfs`-mounted branches.
+    pub fn l1_total_reserved_bytes(&self) -> u64 {
+        self.l1_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .total_reserved_bytes()
     }
 
     /// Canonicalized workspace root directory.
@@ -385,7 +736,7 @@ impl<L: RefLedger> D6Workspace<L> {
         let branch = workspace.sandbox().to_string();
         let directory = self.checked_path(workspace)?;
         let _lock = self.lock_branch(&branch)?;
-        let created_at_ms = self.now_ms();
+        let created_at_ms = self.commit_now_ms();
         let commit_body = self.format_body_ms(created_at_ms, message);
         self.commit_locked_inner(
             &branch,
@@ -409,22 +760,124 @@ impl<L: RefLedger> D6Workspace<L> {
         self.set_aside_since(branch.as_str(), start, message, ready)
     }
 
+    /// Refresh L1 `used_bytes` / `dirty_bytes` for `workspace` on `tmpfs` and report whether
+    /// usage (`>= flush_threshold_pct`) or interval (`>= flush_interval_ms`) requires flushing.
+    pub fn l1_needs_flush(
+        &self,
+        workspace: &WorkspaceId,
+    ) -> Result<Option<L1FlushReason>, WorkspaceError> {
+        let Some(policy) = &self.l1_policy else {
+            return Ok(None);
+        };
+        let branch = workspace.sandbox();
+        let directory = self.checked_path(workspace)?;
+        if !self.is_l1_dir(&directory) {
+            return Ok(None);
+        }
+        let measured = measure_dir_bytes(&directory)?;
+        let now_ms = self.now_ms();
+        let mut guard = self
+            .l1_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = guard.active.get_mut(branch) else {
+            return Ok(None);
+        };
+        entry.used_bytes = measured;
+        entry.dirty_bytes = measured.saturating_sub(entry.baseline_bytes);
+        Ok(entry.needs_flush(now_ms, policy))
+    }
+
+    /// Flush dirty state of an L1-mounted `workspace` into CAS Merkle + [`RefLedger`] and reclaim L1
+    /// space (demoting the mounted directory to disk on `UsageThreshold` pressure).
+    pub fn flush_l1_workspace(
+        &self,
+        workspace: &WorkspaceId,
+        message: &str,
+        reason: L1FlushReason,
+    ) -> Result<L1FlushOutcome, WorkspaceError>
+    where
+        L: Send + Sync,
+    {
+        let Some(policy) = &self.l1_policy else {
+            return Err(WorkspaceError::Unavailable(
+                "L1 tmpfs policy is not configured".to_string(),
+            ));
+        };
+        let branch = workspace.sandbox().to_string();
+        let directory = self.checked_path(workspace)?;
+        if !self.is_l1_dir(&directory) {
+            return Err(WorkspaceError::Unavailable(format!(
+                "workspace {} is not mounted on L1 tmpfs",
+                directory.display()
+            )));
+        }
+
+        let commit = self.checkpoint(workspace, message)?;
+        let used_after = measure_dir_bytes(&directory)?;
+        let quota_bytes = policy.workspace_quota_bytes();
+        let threshold_pct = policy.flush_threshold_pct.clamp(1, 100);
+        let demote = matches!(reason, L1FlushReason::UsageThreshold { .. })
+            || (quota_bytes > 0
+                && u128::from(used_after).saturating_mul(100)
+                    >= u128::from(quota_bytes).saturating_mul(u128::from(threshold_pct)));
+
+        if demote {
+            let disk_ws = self.demote_l1_dir_to_disk(&branch, &directory)?;
+            return Ok(L1FlushOutcome {
+                commit,
+                reason,
+                reclaimed_bytes: used_after,
+                demoted_to_disk: Some(disk_ws),
+            });
+        }
+
+        let now_ms = self.now_ms();
+        let mut guard = self
+            .l1_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = guard.active.get_mut(&branch) {
+            entry.baseline_bytes = used_after;
+            entry.used_bytes = used_after;
+            entry.dirty_bytes = 0;
+            entry.last_flush_ms = now_ms;
+            entry.flush_count = entry.flush_count.saturating_add(1);
+        }
+        Ok(L1FlushOutcome {
+            commit,
+            reason,
+            reclaimed_bytes: 0,
+            demoted_to_disk: None,
+        })
+    }
+
+    /// Check [`Self::l1_needs_flush`] and flush + reclaim L1 space automatically if triggered.
+    pub fn flush_l1_if_needed(
+        &self,
+        workspace: &WorkspaceId,
+        message: &str,
+    ) -> Result<Option<L1FlushOutcome>, WorkspaceError>
+    where
+        L: Send + Sync,
+    {
+        let Some(reason) = self.l1_needs_flush(workspace)? else {
+            return Ok(None);
+        };
+        self.flush_l1_workspace(workspace, message, reason)
+            .map(Some)
+    }
+
     /// Discard a branch's local mounted workspace directory and sidecar state under its lock,
     /// leaving committed ledger snapshots/history intact.
     pub fn discard(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
         let branch = workspace.sandbox();
         let directory = self.checked_path(workspace)?;
         let _lock = self.lock_branch(branch)?;
-        match fs::remove_dir_all(&directory) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(WorkspaceError::Unavailable(format!(
-                    "discard remove {}: {err}",
-                    directory.display()
-                )));
-            }
-        }
+        Self::remove_workspace_tree(&directory, "discard remove")?;
+        self.remove_counterpart_dir_if_exists(branch, &directory)?;
+        self.invalidate_stat_cache(branch, Some(&directory));
+        self.release_l1_branch(branch);
         self.clear_pending(branch);
         self.clear_main_copies(branch);
         self.clear_stale(branch);
@@ -441,28 +894,48 @@ impl<L: RefLedger> D6Workspace<L> {
         extra_excludes: &[PathBuf],
         simulate_unfiltered: bool,
     ) -> Result<ScannedWorkspaceTree, WorkspaceError> {
-        let head = self.branch_snapshot(branch)?;
+        let (head, main_snap) = self.branch_and_main_snapshots(branch)?;
+        let (tree, oversized, resolved, _) = self.scan_directory_tree_with_heads(
+            branch,
+            directory,
+            head.as_ref(),
+            main_snap.as_ref(),
+            extra_excludes,
+            simulate_unfiltered,
+        )?;
+        Ok((tree, oversized, resolved))
+    }
+
+    fn scan_directory_tree_with_heads(
+        &self,
+        branch: &str,
+        directory: &Path,
+        head: Option<&LedgerSnapshot>,
+        main_snap: Option<&LedgerSnapshot>,
+        extra_excludes: &[PathBuf],
+        simulate_unfiltered: bool,
+    ) -> Result<ScannedTreeWithBytes, WorkspaceError> {
         let pending = self.pending_merge(branch);
         let pending_main_id = pending.as_ref().map(|p| p.main.clone());
         let resolved_merge_main = pending.as_ref().and_then(|p| {
-            let main_snap = p.main.clone();
-            if let Some(head_snap) = &head
-                && matches!(self.is_ancestor(&main_snap, &head_snap.id), Ok(true))
+            let main_id = p.main.clone();
+            if let Some(head_snap) = head
+                && matches!(self.is_ancestor(&main_id, &head_snap.id), Ok(true))
             {
                 return None;
             }
             let shortest = self
-                .shortest_markers(std::slice::from_ref(&main_snap), &p.files)
+                .shortest_markers(std::slice::from_ref(&main_id), &p.files)
                 .ok()?;
-            (!unresolved_conflicts(directory, &shortest)).then_some(main_snap)
+            (!unresolved_conflicts(directory, &shortest)).then_some(main_id)
         });
 
-        let main_tree = self.main_snapshot()?.map(|s| s.tree);
+        let main_tree = main_snap.map(|s| s.tree.clone());
         let pending_main_tree = match pending_main_id.as_ref() {
             Some(id) => Some(self.snapshot_tree(id)?),
             None => None,
         };
-        let base_tree = head.as_ref().map(|s| s.tree.clone());
+        let base_tree = head.map(|s| s.tree.clone());
 
         let mut merged_excludes = self.extra_exclude_files.clone();
         for path in extra_excludes {
@@ -470,13 +943,13 @@ impl<L: RefLedger> D6Workspace<L> {
                 merged_excludes.push(path.clone());
             }
         }
-
         let policy = TrackedSetPolicy {
             base_tree: base_tree.as_ref(),
             main_tree: main_tree.as_ref(),
             extra_exclude_files: merged_excludes,
         };
 
+        let scan_fence = self.probe_fs_fence_for(directory);
         let scanned = if simulate_unfiltered {
             scan_without_gitignore(
                 directory,
@@ -490,60 +963,42 @@ impl<L: RefLedger> D6Workspace<L> {
                 .map_err(map_store_err)?
         };
 
-        let mut kept_in_source = Vec::new();
-        if let Some(ref mt) = main_tree {
-            kept_in_source.push(mt.clone());
-        }
-        if let Some(ref pt) = pending_main_tree
-            && !kept_in_source.contains(pt)
-        {
-            kept_in_source.push(pt.clone());
-        }
-        let mut source_maps = Vec::with_capacity(kept_in_source.len());
-        for t in &kept_in_source {
-            source_maps.push(self.store.flatten_tree(t).map_err(map_store_err)?);
-        }
-
-        let mut oversized = Vec::new();
-        let mut filtered = Vec::with_capacity(scanned.len());
-        for entry in scanned {
-            if matches!(entry.kind, ScannedKind::File | ScannedKind::Executable) {
-                let full_path = directory.join(entry.path.as_path());
-                let meta = fs::symlink_metadata(&full_path).map_err(|err| {
-                    WorkspaceError::Unavailable(format!("stat {}: {err}", full_path.display()))
-                })?;
-                if meta.file_type().is_file() && meta.len() > self.max_file_bytes {
-                    let key = entry.path.as_bytes();
-                    let in_source = source_maps.iter().any(|m| {
-                        m.get(key).is_some_and(|te| {
-                            matches!(te.kind, TreeEntryKind::File | TreeEntryKind::Executable)
-                        })
-                    });
-                    if !in_source {
-                        oversized.push((entry.path, meta.len()));
-                        continue;
-                    }
-                }
-            }
-            filtered.push(entry);
-        }
-        oversized.sort();
-        oversized.dedup_by(|a, b| a.0 == b.0);
+        let (filtered, oversized, measured_bytes) = self.filter_oversized_collecting_meta(
+            directory,
+            scanned,
+            main_tree.as_ref(),
+            pending_main_tree.as_ref(),
+        )?;
 
         let base_digest = base_tree.clone().unwrap_or_else(empty_tree_digest);
-        let mutations = self.build_mutations_from_scanned(directory, &base_digest, &filtered)?;
-        let next_tree = self
-            .store
-            .apply_mutations(&base_digest, &mutations)
-            .map_err(map_store_err)?;
+        let mutations = self.build_mutations_with_stat_cache(
+            branch,
+            directory,
+            &base_digest,
+            &filtered,
+            scan_fence,
+        )?;
+        let next_tree = if mutations.is_empty() {
+            base_digest
+        } else {
+            self.store
+                .apply_mutations(&base_digest, &mutations)
+                .map_err(map_store_err)?
+        };
 
         if !simulate_unfiltered {
-            self.store
-                .verify_no_ignored_untracked_leaks(directory, &next_tree, &policy)
-                .map_err(map_store_err)?;
+            let skip_leak_check = mutations.is_empty()
+                && resolved_merge_main.is_none()
+                && self.is_verified_clean(&next_tree, main_tree.as_ref());
+            if !skip_leak_check {
+                self.store
+                    .verify_no_ignored_untracked_leaks(directory, &next_tree, &policy)
+                    .map_err(map_store_err)?;
+                self.mark_verified_clean(&next_tree, main_tree.as_ref());
+            }
         }
 
-        Ok((next_tree, oversized, resolved_merge_main))
+        Ok((next_tree, oversized, resolved_merge_main, measured_bytes))
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -715,7 +1170,7 @@ impl<L: RefLedger> D6Workspace<L> {
         &self,
         branch: &str,
     ) -> Result<WorkspaceId, WorkspaceError> {
-        let dir = self.root.join(branch);
+        let dir = self.active_workspace_dir(branch);
         WorkspaceId::new(format!("{branch}:{}", dir.display()))
             .map_err(|err| WorkspaceError::Unavailable(err.to_string()))
     }
@@ -811,22 +1266,16 @@ impl<L: RefLedger + Send + Sync> WorkspaceStore for D6Workspace<L> {
             .first()
             .and_then(|pid| self.snapshot_tree(pid).ok());
         let (layer_dir, _) = self.ensure_warm_layer(&head.tree, parent_tree.as_ref())?;
-        let staged = self.staging_path(branch.as_str(), "staged")?;
-        if let Err(err) = clone_layer_to_writable(&layer_dir, &staged) {
-            let _ = fs::remove_dir_all(&staged);
-            return Err(err);
-        }
-
-        let res = self.install_staged_mount(branch.as_str(), &head.id, &staged, ready);
-        if res.is_err() {
-            let _ = fs::remove_dir_all(&staged);
-        }
-        res
+        self.mount_layer_with_l1_fallback(branch.as_str(), &head, &layer_dir, ready)
     }
 
     fn canonical(&self, workspace: &WorkspaceId) -> WorkspaceId {
         let directory = Path::new(workspace.path());
-        if directory.starts_with(&self.root) {
+        if directory.starts_with(&self.root)
+            || self
+                .l1_branch_dir_if_matches(workspace.sandbox(), directory)
+                .is_some()
+        {
             return workspace.clone();
         }
         legacy_workspace(&self.root, workspace.sandbox(), directory)
@@ -855,20 +1304,12 @@ impl<L: RefLedger + Send + Sync> WorkspaceStore for D6Workspace<L> {
         ready()?;
         self.keep_stale_locked(branch, &directory)?;
         self.settle_pending(branch);
-        match fs::remove_dir_all(&directory) {
-            Ok(()) => {
-                self.clear_stale(branch);
-                Ok(())
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                self.clear_stale(branch);
-                Ok(())
-            }
-            Err(err) => Err(WorkspaceError::Unavailable(format!(
-                "remove {}: {err}",
-                directory.display()
-            ))),
-        }
+        Self::remove_workspace_tree(&directory, "remove")?;
+        self.remove_counterpart_dir_if_exists(branch, &directory)?;
+        self.invalidate_stat_cache(branch, Some(&directory));
+        self.release_l1_branch(branch);
+        self.clear_stale(branch);
+        Ok(())
     }
 
     fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
@@ -906,7 +1347,7 @@ impl<L: RefLedger + Send + Sync> WorkspaceStore for D6Workspace<L> {
         }
 
         let files = self.diff_tree_paths(&head.tree, &report.tree)?;
-        let now_ms = self.now_ms();
+        let now_ms = self.commit_now_ms();
         let ident = self.git_ident_line_ms(now_ms);
         let msg = format!("spawn: merge main {} into {branch}", main_snap.git_oid);
         let built = build_merge_snapshot(
@@ -995,6 +1436,12 @@ impl<L: RefLedger> D6Workspace<L> {
         (self.clock)()
     }
 
+    fn commit_now_ms(&self) -> i64 {
+        // Commit headers store Unix seconds; floor created_at_ms to the same second so
+        // identical snapshots written concurrently within one second share identical PG metadata.
+        self.now_ms().div_euclid(1000).saturating_mul(1000)
+    }
+
     fn git_ident_line_ms(&self, at_ms: i64) -> String {
         let secs = at_ms.div_euclid(1000);
         format!("{} <{}> {secs} +0000", self.author_name, self.author_email)
@@ -1027,6 +1474,9 @@ impl<L: RefLedger> D6Workspace<L> {
         if directory.starts_with(&self.root) {
             return Ok(directory);
         }
+        if let Some(dir) = self.l1_branch_dir_if_matches(workspace.sandbox(), &directory) {
+            return Ok(dir);
+        }
         if let Some(dir) = legacy_workspace(&self.root, workspace.sandbox(), &directory) {
             return Ok(dir);
         }
@@ -1035,6 +1485,47 @@ impl<L: RefLedger> D6Workspace<L> {
             directory.display(),
             self.root.display()
         )))
+    }
+
+    fn branch_and_main_snapshots(&self, branch: &str) -> Result<BranchAndMain, WorkspaceError> {
+        let refs = self
+            .ledger
+            .list_refs(Some(&self.project))
+            .map_err(map_store_err)?;
+        let branch_ref = refs.iter().find(|r| r.name == branch);
+        let main_ref = refs.iter().find(|r| r.name == BASE_BRANCH);
+        let head = match branch_ref {
+            Some(r) => Some(self.fetch_snapshot_required(branch, &r.snapshot)?),
+            None => None,
+        };
+        let main = match main_ref {
+            Some(mr) => {
+                if let Some(h) = &head
+                    && h.id == mr.snapshot
+                {
+                    Some(h.clone())
+                } else {
+                    Some(self.fetch_snapshot_required(BASE_BRANCH, &mr.snapshot)?)
+                }
+            }
+            None => None,
+        };
+        Ok((head, main))
+    }
+
+    fn fetch_snapshot_required(
+        &self,
+        ref_name: &str,
+        id: &Digest,
+    ) -> Result<LedgerSnapshot, WorkspaceError> {
+        self.ledger
+            .get_snapshot(id)
+            .map_err(map_store_err)?
+            .ok_or_else(|| {
+                WorkspaceError::Unavailable(format!(
+                    "ref {ref_name} points to missing snapshot {id}"
+                ))
+            })
     }
 
     fn find_ref(
@@ -1052,8 +1543,12 @@ impl<L: RefLedger> D6Workspace<L> {
         if let Some(existing) = self.main_snapshot()? {
             return Ok(existing);
         }
+        let _base_lock = lock_file(&self.locks_dir().join("main.lock"))?;
+        if let Some(existing) = self.main_snapshot()? {
+            return Ok(existing);
+        }
         let empty_tree = self.store.cas().put_empty_tree().map_err(map_cas_err)?;
-        let at_ms = self.now_ms();
+        let at_ms = self.commit_now_ms();
         let body = self.format_body_ms(at_ms, "spawn: base");
         let published = self
             .store
@@ -1187,8 +1682,12 @@ impl<L: RefLedger> D6Workspace<L> {
             .map_err(|err| WorkspaceError::Unavailable(format!("rename nearest pointer: {err}")))
     }
 
-    fn staging_path(&self, branch: &str, what: &str) -> Result<PathBuf, WorkspaceError> {
-        let staging = self.d6_meta_dir().join(MOUNT_SUBDIR);
+    fn staging_path_in(
+        base_root: &Path,
+        branch: &str,
+        what: &str,
+    ) -> Result<PathBuf, WorkspaceError> {
+        let staging = base_root.join(D6_META_DIR).join(MOUNT_SUBDIR);
         fs::create_dir_all(&staging).map_err(|err| {
             WorkspaceError::Unavailable(format!("create {}: {err}", staging.display()))
         })?;
@@ -1213,8 +1712,9 @@ impl<L: RefLedger> D6Workspace<L> {
         )))
     }
 
-    fn install_staged_mount(
+    fn install_staged_mount_in(
         &self,
+        base_root: &Path,
         branch: &str,
         expected_head: &Digest,
         staged: &Path,
@@ -1235,26 +1735,28 @@ impl<L: RefLedger> D6Workspace<L> {
             });
         }
 
-        let directory = self.root.join(branch);
+        let directory = base_root.join(branch);
         self.keep_stale_locked(branch, &directory)?;
+        self.remove_counterpart_dir_if_exists(branch, &directory)?;
         self.settle_pending(branch);
         self.restore_main_copies(branch, staged)?;
-        self.replace_workspace(branch, staged, &directory)?;
+        Self::replace_workspace_in(base_root, branch, staged, &directory)?;
         self.clear_stale(branch);
+        self.invalidate_stat_cache(branch, Some(&directory));
 
         WorkspaceId::new(format!("{branch}:{}", directory.display()))
             .map_err(|err| WorkspaceError::Unavailable(err.to_string()))
     }
 
-    fn replace_workspace(
-        &self,
+    fn replace_workspace_in(
+        base_root: &Path,
         branch: &str,
         staged: &Path,
         directory: &Path,
     ) -> Result<(), WorkspaceError> {
         let replaced = match fs::symlink_metadata(directory) {
             Ok(_) => {
-                let aside = self.staging_path(branch, "replaced")?;
+                let aside = Self::staging_path_in(base_root, branch, "replaced")?;
                 fs::rename(directory, &aside).map_err(|err| {
                     WorkspaceError::Unavailable(format!(
                         "move {} aside: {err}",
@@ -1299,17 +1801,25 @@ impl<L: RefLedger> D6Workspace<L> {
             let kept = self.keep_stale(branch, directory)?;
             return Err(stale_refusal(branch, Some(&kept)));
         }
-        if self.branch_snapshot(branch)?.is_none() {
+        let (mut head_opt, mut main_opt) = self.branch_and_main_snapshots(branch)?;
+        if head_opt.is_none() {
             take_back()?;
+            (head_opt, main_opt) = self.branch_and_main_snapshots(branch)?;
         }
-        let head = self.branch_snapshot(branch)?;
-        if head.is_none() {
+        let Some(head) = head_opt else {
             return self.recreate(branch, directory, commit_body, created_at_ms, reason);
-        }
-        let head = head.expect("checked Some");
+        };
 
-        let (next_tree, oversized, resolved_merge_main) =
-            self.scan_directory_tree(branch, directory, &[], false)?;
+        let (next_tree, oversized, resolved_merge_main, measured_bytes) = self
+            .scan_directory_tree_with_heads(
+                branch,
+                directory,
+                Some(&head),
+                main_opt.as_ref(),
+                &[],
+                false,
+            )?;
+        self.update_l1_usage_from_scan(branch, directory, measured_bytes);
         self.record_oversized(branch, directory, &oversized);
 
         let merged_second = resolved_merge_main.clone().filter(|m| m != &head.id);
@@ -1421,47 +1931,85 @@ impl<L: RefLedger> D6Workspace<L> {
         Ok(Commit::Recreated { commit, parent })
     }
 
-    fn filter_oversized(
+    fn filter_oversized_collecting_meta(
         &self,
         directory: &Path,
         scanned: Vec<ScannedEntry>,
         main_tree: Option<&Digest>,
         pending_main_tree: Option<&Digest>,
-    ) -> Result<FilteredScan, WorkspaceError> {
-        let mut source_maps = Vec::new();
-        if let Some(mt) = main_tree {
-            source_maps.push(self.store.flatten_tree(mt).map_err(map_store_err)?);
-        }
-        if let Some(pt) = pending_main_tree
-            && main_tree != Some(pt)
-        {
-            source_maps.push(self.store.flatten_tree(pt).map_err(map_store_err)?);
-        }
+    ) -> Result<FilteredScanWithBytes, WorkspaceError> {
+        let mut source_maps: Option<Vec<FlatTreeMap>> = None;
         let mut oversized = Vec::new();
         let mut filtered = Vec::with_capacity(scanned.len());
+        let mut measured_bytes = 0_u64;
+
         for entry in scanned {
             if matches!(entry.kind, ScannedKind::File | ScannedKind::Executable) {
                 let full_path = directory.join(entry.path.as_path());
                 let meta = fs::symlink_metadata(&full_path).map_err(|err| {
                     WorkspaceError::Unavailable(format!("stat {}: {err}", full_path.display()))
                 })?;
-                if meta.file_type().is_file() && meta.len() > self.max_file_bytes {
-                    let key = entry.path.as_bytes();
-                    let in_source = source_maps.iter().any(|m| {
-                        m.get(key).is_some_and(|te| {
-                            matches!(te.kind, TreeEntryKind::File | TreeEntryKind::Executable)
-                        })
-                    });
-                    if !in_source {
-                        oversized.push((entry.path, meta.len()));
-                        continue;
+                if meta.file_type().is_file() {
+                    measured_bytes = measured_bytes.saturating_add(meta.len());
+                    if meta.len() > self.max_file_bytes {
+                        let maps = if let Some(cached) = &source_maps {
+                            cached
+                        } else {
+                            let loaded = self.load_source_maps(main_tree, pending_main_tree)?;
+                            source_maps.insert(loaded)
+                        };
+                        let key = entry.path.as_bytes();
+                        let in_source = maps.iter().any(|m| {
+                            m.get(key).is_some_and(|te| {
+                                matches!(te.kind, TreeEntryKind::File | TreeEntryKind::Executable)
+                            })
+                        });
+                        if !in_source {
+                            oversized.push((entry.path, meta.len()));
+                            continue;
+                        }
                     }
                 }
+                filtered.push((entry, Some(meta)));
+            } else {
+                filtered.push((entry, None));
             }
-            filtered.push(entry);
         }
         oversized.sort();
         oversized.dedup_by(|a, b| a.0 == b.0);
+        Ok((filtered, oversized, measured_bytes))
+    }
+
+    fn load_source_maps(
+        &self,
+        main_tree: Option<&Digest>,
+        pending_main_tree: Option<&Digest>,
+    ) -> Result<Vec<FlatTreeMap>, WorkspaceError> {
+        let mut maps = Vec::new();
+        if let Some(mt) = main_tree {
+            maps.push(self.flatten_tree_cached(mt)?);
+        }
+        if let Some(pt) = pending_main_tree
+            && main_tree != Some(pt)
+        {
+            maps.push(self.flatten_tree_cached(pt)?);
+        }
+        Ok(maps)
+    }
+
+    fn filter_oversized(
+        &self,
+        directory: &Path,
+        scanned: Vec<ScannedEntry>,
+        main_tree: Option<&Digest>,
+        pending_main_tree: Option<&Digest>,
+    ) -> Result<FilteredScanWithMeta, WorkspaceError> {
+        let (filtered, oversized, _) = self.filter_oversized_collecting_meta(
+            directory,
+            scanned,
+            main_tree,
+            pending_main_tree,
+        )?;
         Ok((filtered, oversized))
     }
 
@@ -1469,18 +2017,27 @@ impl<L: RefLedger> D6Workspace<L> {
         &self,
         directory: &Path,
         base_tree: &Digest,
-        scanned: &[ScannedEntry],
+        scanned: &[ScannedWithMeta],
     ) -> Result<Vec<TreeMutation>, WorkspaceError> {
-        let base_map = self.store.flatten_tree(base_tree).map_err(map_store_err)?;
+        let scan_fence = self.probe_fs_fence_for(directory);
+        let base_map = self.flatten_tree_cached(base_tree)?;
         let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
         let mut mutations = Vec::new();
 
-        for item in scanned {
+        for (item, meta_opt) in scanned {
             let rel = item.path.as_bytes().to_vec();
             seen.insert(rel.clone());
-            if let Some(mutation) =
-                self.mutation_for_scanned_item(directory, &rel, item, base_map.get(&rel))?
-            {
+            let mut next_cached = None;
+            if let Some(mutation) = self.mutation_for_scanned_item(
+                directory,
+                &rel,
+                item,
+                meta_opt.as_ref(),
+                base_map.get(&rel),
+                None,
+                scan_fence,
+                &mut next_cached,
+            )? {
                 mutations.push(mutation);
             }
         }
@@ -1492,57 +2049,89 @@ impl<L: RefLedger> D6Workspace<L> {
                 });
             }
         }
-
         Ok(mutations)
     }
 
+    fn build_mutations_with_stat_cache(
+        &self,
+        branch: &str,
+        directory: &Path,
+        base_tree: &Digest,
+        scanned: &[ScannedWithMeta],
+        scan_fence: (i64, i64),
+    ) -> Result<Vec<TreeMutation>, WorkspaceError> {
+        let base_map = self.flatten_tree_cached(base_tree)?;
+        let prev_cache = self
+            .stat_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(branch.to_string(), directory.to_path_buf()))
+            .unwrap_or_default();
+
+        let mut next_cache = HashMap::with_capacity(scanned.len());
+        let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut mutations = Vec::new();
+
+        for (item, meta_opt) in scanned {
+            let rel = item.path.as_bytes().to_vec();
+            seen.insert(rel.clone());
+            let mut updated_entry = None;
+            if let Some(mutation) = self.mutation_for_scanned_item(
+                directory,
+                &rel,
+                item,
+                meta_opt.as_ref(),
+                base_map.get(&rel),
+                prev_cache.get(&rel),
+                scan_fence,
+                &mut updated_entry,
+            )? {
+                mutations.push(mutation);
+            }
+            if let Some(entry) = updated_entry {
+                next_cache.insert(rel, entry);
+            }
+        }
+
+        for existing_path in base_map.keys() {
+            if !seen.contains(existing_path) && !has_ancestor_path(&seen, existing_path) {
+                mutations.push(TreeMutation::Remove {
+                    path: split_rel_segments(existing_path),
+                });
+            }
+        }
+
+        self.stat_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((branch.to_string(), directory.to_path_buf()), next_cache);
+        Ok(mutations)
+    }
+
+    #[expect(clippy::too_many_arguments)]
     fn mutation_for_scanned_item(
         &self,
         directory: &Path,
         rel: &[u8],
         item: &ScannedEntry,
+        meta_opt: Option<&fs::Metadata>,
         prev: Option<&TreeEntry>,
+        cached: Option<&CachedStatEntry>,
+        scan_fence: (i64, i64),
+        out_cache: &mut Option<CachedStatEntry>,
     ) -> Result<Option<TreeMutation>, WorkspaceError> {
         let disk_path = directory.join(item.path.as_path());
         match &item.kind {
-            ScannedKind::File | ScannedKind::Executable => {
-                let want_kind = if item.kind == ScannedKind::Executable {
-                    TreeEntryKind::Executable
-                } else {
-                    TreeEntryKind::File
-                };
-                let mut file = open_regular_file_nofollow(&disk_path)?;
-                let size = file
-                    .metadata()
-                    .map_err(|err| {
-                        WorkspaceError::Unavailable(format!("stat {}: {err}", disk_path.display()))
-                    })?
-                    .len();
-                let reuse = prev.is_some_and(|e| {
-                    e.kind == want_kind
-                        && e.size == size
-                        && e.digest().is_some_and(|d| self.store.cas().has_blob(&d))
-                });
-                if reuse {
-                    let digest = sha256_reader(&mut file).map_err(|err| {
-                        WorkspaceError::Unavailable(format!("hash {}: {err}", disk_path.display()))
-                    })?;
-                    if prev.is_some_and(|e| e.id == digest.as_bytes()) {
-                        return Ok(None);
-                    }
-                }
-                drop(file);
-                let (digest, stored_size) = self
-                    .store
-                    .put_file_blob(&disk_path)
-                    .map_err(map_store_err)?;
-                Ok(Some(TreeMutation::Upsert {
-                    path: split_rel_segments(rel),
-                    kind: want_kind,
-                    id: digest.as_bytes(),
-                    size: stored_size,
-                }))
-            }
+            ScannedKind::File | ScannedKind::Executable => self.mutation_for_regular_file(
+                rel,
+                &disk_path,
+                item.kind == ScannedKind::Executable,
+                meta_opt,
+                prev,
+                cached,
+                scan_fence,
+                out_cache,
+            ),
             ScannedKind::Symlink => {
                 let target = fs::read_link(&disk_path).map_err(|err| {
                     WorkspaceError::Unavailable(format!("readlink {}: {err}", disk_path.display()))
@@ -1588,6 +2177,91 @@ impl<L: RefLedger> D6Workspace<L> {
                 }))
             }
         }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn mutation_for_regular_file(
+        &self,
+        rel: &[u8],
+        disk_path: &Path,
+        is_exec: bool,
+        meta_opt: Option<&fs::Metadata>,
+        prev: Option<&TreeEntry>,
+        cached: Option<&CachedStatEntry>,
+        scan_fence: (i64, i64),
+        out_cache: &mut Option<CachedStatEntry>,
+    ) -> Result<Option<TreeMutation>, WorkspaceError> {
+        let want_kind = if is_exec {
+            TreeEntryKind::Executable
+        } else {
+            TreeEntryKind::File
+        };
+        if let (Some(meta), Some(hit), Some(prev_ent)) = (meta_opt, cached, prev) {
+            let mtime = (meta.mtime(), meta.mtime_nsec());
+            let ctime = (meta.ctime(), meta.ctime_nsec());
+            let stamp_clean = mtime.max(ctime) < hit.fence;
+            if stamp_clean
+                && hit.dev == meta.dev()
+                && hit.ino == meta.ino()
+                && hit.size == meta.len()
+                && hit.kind == want_kind
+                && hit.mtime == mtime
+                && hit.ctime == ctime
+                && prev_ent.kind == want_kind
+                && prev_ent.size == hit.size
+                && prev_ent.id == hit.blob_id
+            {
+                *out_cache = Some(hit.clone());
+                return Ok(None);
+            }
+        }
+
+        let mut file = open_regular_file_nofollow(disk_path)?;
+        let fmeta = file.metadata().map_err(|err| {
+            WorkspaceError::Unavailable(format!("stat {}: {err}", disk_path.display()))
+        })?;
+        let size = fmeta.len();
+        let reuse = prev.is_some_and(|e| {
+            e.kind == want_kind
+                && e.size == size
+                && e.digest().is_some_and(|d| self.store.cas().has_blob(&d))
+        });
+        if reuse {
+            let digest = sha256_reader(&mut file).map_err(|err| {
+                WorkspaceError::Unavailable(format!("hash {}: {err}", disk_path.display()))
+            })?;
+            if prev.is_some_and(|e| e.id == digest.as_bytes()) {
+                *out_cache = Some(CachedStatEntry {
+                    dev: fmeta.dev(),
+                    ino: fmeta.ino(),
+                    size,
+                    kind: want_kind,
+                    mtime: (fmeta.mtime(), fmeta.mtime_nsec()),
+                    ctime: (fmeta.ctime(), fmeta.ctime_nsec()),
+                    blob_id: digest.as_bytes(),
+                    fence: scan_fence,
+                });
+                return Ok(None);
+            }
+        }
+        drop(file);
+        let (digest, stored_size) = self.store.put_file_blob(disk_path).map_err(map_store_err)?;
+        *out_cache = Some(CachedStatEntry {
+            dev: fmeta.dev(),
+            ino: fmeta.ino(),
+            size: stored_size,
+            kind: want_kind,
+            mtime: (fmeta.mtime(), fmeta.mtime_nsec()),
+            ctime: (fmeta.ctime(), fmeta.ctime_nsec()),
+            blob_id: digest.as_bytes(),
+            fence: scan_fence,
+        });
+        Ok(Some(TreeMutation::Upsert {
+            path: split_rel_segments(rel),
+            kind: want_kind,
+            id: digest.as_bytes(),
+            size: stored_size,
+        }))
     }
 
     fn merge_main(
@@ -1639,6 +2313,7 @@ impl<L: RefLedger> D6Workspace<L> {
             conflict_paths.dedup();
             let marked = is_pure_content_conflicts(&report.conflicts);
             if marked {
+                self.invalidate_stat_cache(&branch, Some(&directory));
                 apply_two_tree_update(&self.store, &directory, &head.tree, &report.tree)?;
                 if let Err(err) =
                     self.write_pending(&branch, &main_snap.id, &head.id, &conflict_paths)
@@ -1674,9 +2349,10 @@ impl<L: RefLedger> D6Workspace<L> {
         main_snap: &LedgerSnapshot,
         merged_tree: &Digest,
     ) -> Result<BaseMerge, WorkspaceError> {
+        self.invalidate_stat_cache(branch, Some(directory));
         let changed_files = apply_two_tree_update(&self.store, directory, &head.tree, merged_tree)?;
 
-        let now_ms = self.now_ms();
+        let now_ms = self.commit_now_ms();
         let ident = self.git_ident_line_ms(now_ms);
         let msg = format!("spawn: merge main {} into {branch}", main_snap.git_oid);
         let built = build_merge_snapshot(
@@ -1736,7 +2412,7 @@ impl<L: RefLedger> D6Workspace<L> {
             WorkspaceError::Unavailable(format!("branch {branch} has no snapshot"))
         })?;
         let start_snap = self.set_aside_start(branch, &head, start)?;
-        let directory = self.root.join(branch);
+        let directory = self.active_workspace_dir(branch);
         let mounted = directory.is_dir();
 
         if mounted {
@@ -1758,12 +2434,13 @@ impl<L: RefLedger> D6Workspace<L> {
         }
 
         let files = if mounted {
+            self.invalidate_stat_cache(branch, Some(&directory));
             apply_two_tree_update(&self.store, &directory, &head.tree, &start_snap.tree)?
         } else {
             self.diff_tree_paths(&head.tree, &start_snap.tree)?
         };
 
-        let now_ms = self.now_ms();
+        let now_ms = self.commit_now_ms();
         let body = self.format_body_ms(now_ms, message);
         let snapshot = Snapshot {
             tree: start_snap.tree.clone(),
@@ -1835,7 +2512,7 @@ impl<L: RefLedger> D6Workspace<L> {
             .map_err(map_store_err)?;
 
         if work_tree != head.tree {
-            let now_ms = self.now_ms();
+            let now_ms = self.commit_now_ms();
             let kept_body =
                 self.format_body_ms(now_ms, &crate::git::set_aside_kept_message(branch));
             let published = self
@@ -2050,6 +2727,7 @@ impl<L: RefLedger> D6Workspace<L> {
         merged_tree: &Digest,
         lost: &WorkspaceError,
     ) -> WorkspaceError {
+        self.invalidate_stat_cache(branch, Some(directory));
         let followed = self.branch_snapshot(branch).and_then(|opt| {
             let now = opt.ok_or_else(|| {
                 WorkspaceError::Unavailable(format!("branch {branch} disappeared"))
@@ -2191,7 +2869,7 @@ impl<L: RefLedger> D6Workspace<L> {
         {
             parents.push(prev_snap.id.clone());
         }
-        let now_ms = self.now_ms();
+        let now_ms = self.commit_now_ms();
         let body = self.format_body_ms(
             now_ms,
             &format!("spawn: stale workspace of {branch}, kept off the branch"),
@@ -2522,6 +3200,9 @@ impl<L: RefLedger> D6Workspace<L> {
     }
 
     fn record_oversized(&self, branch: &str, directory: &Path, oversized: &[(TreePath, u64)]) {
+        if oversized.is_empty() && fs::symlink_metadata(self.oversized_path(branch)).is_err() {
+            return;
+        }
         let before = self.read_oversized(branch);
         let written = fs::metadata(self.oversized_path(branch))
             .and_then(|meta| meta.modified())
@@ -2596,6 +3277,545 @@ struct OversizedEntry {
     size: u64,
     told: bool,
     digest: Option<String>,
+}
+
+impl<L: RefLedger> D6Workspace<L> {
+    fn is_l1_dir(&self, directory: &Path) -> bool {
+        self.l1_policy
+            .as_ref()
+            .is_some_and(|p| directory.starts_with(&p.tmpfs_root))
+    }
+
+    fn l1_branch_dir_if_matches(&self, branch: &str, directory: &Path) -> Option<PathBuf> {
+        let policy = self.l1_policy.as_ref()?;
+        if !is_plain_name(branch) {
+            return None;
+        }
+        let expected = canonical_root(&policy.tmpfs_root).join(branch);
+        (directory == expected).then_some(expected)
+    }
+
+    fn active_workspace_dir(&self, branch: &str) -> PathBuf {
+        if let Some(acc) = self.l1_accounting(branch)
+            && acc.workspace_dir.is_dir()
+        {
+            return acc.workspace_dir;
+        }
+        let disk_dir = self.root.join(branch);
+        if disk_dir.is_dir() {
+            return disk_dir;
+        }
+        if let Some(policy) = &self.l1_policy {
+            let l1_dir = canonical_root(&policy.tmpfs_root).join(branch);
+            if l1_dir.is_dir() {
+                return l1_dir;
+            }
+        }
+        disk_dir
+    }
+
+    fn remove_workspace_tree(directory: &Path, label: &str) -> Result<(), WorkspaceError> {
+        match fs::remove_dir_all(directory) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(WorkspaceError::Unavailable(format!(
+                "{label} {}: {err}",
+                directory.display()
+            ))),
+        }
+    }
+
+    fn remove_counterpart_dir_if_exists(
+        &self,
+        branch: &str,
+        installed_dir: &Path,
+    ) -> Result<(), WorkspaceError> {
+        let Some(policy) = &self.l1_policy else {
+            return Ok(());
+        };
+        let disk_dir = self.root.join(branch);
+        let l1_dir = canonical_root(&policy.tmpfs_root).join(branch);
+        let other = if installed_dir == l1_dir {
+            disk_dir
+        } else {
+            l1_dir
+        };
+        Self::remove_workspace_tree(&other, "clean counterpart")
+    }
+
+    fn mount_layer_with_l1_fallback(
+        &self,
+        branch: &str,
+        head: &LedgerSnapshot,
+        layer_dir: &Path,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<WorkspaceId, WorkspaceError> {
+        if let Some((tmpfs_base, est_bytes, quota_bytes)) =
+            self.try_reserve_l1_for_mount(branch, &head.tree)?
+        {
+            match self.stage_and_install_in_base(&tmpfs_base, branch, &head.id, layer_dir, ready) {
+                Ok(ws_id) => {
+                    let actual_used =
+                        measure_dir_bytes(Path::new(ws_id.path())).unwrap_or(est_bytes);
+                    self.confirm_l1_mounted(
+                        branch,
+                        PathBuf::from(ws_id.path()),
+                        quota_bytes,
+                        actual_used.max(est_bytes),
+                        actual_used,
+                    );
+                    return Ok(ws_id);
+                }
+                Err(WorkspaceError::Refused { code, message }) => {
+                    self.release_l1_branch(branch);
+                    return Err(WorkspaceError::Refused { code, message });
+                }
+                Err(err) => {
+                    self.record_l1_tmpfs_failure_fallback(branch, err.to_string());
+                }
+            }
+        }
+        self.stage_and_install_in_base(&self.root.clone(), branch, &head.id, layer_dir, ready)
+    }
+
+    fn stage_and_install_in_base(
+        &self,
+        base_root: &Path,
+        branch: &str,
+        expected_head: &Digest,
+        layer_dir: &Path,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<WorkspaceId, WorkspaceError> {
+        let staged = Self::staging_path_in(base_root, branch, "staged")?;
+        if let Err(err) = clone_layer_to_writable(layer_dir, &staged) {
+            let _ = fs::remove_dir_all(&staged);
+            return Err(err);
+        }
+        let res = self.install_staged_mount_in(base_root, branch, expected_head, &staged, ready);
+        if res.is_err() {
+            let _ = fs::remove_dir_all(&staged);
+        }
+        res
+    }
+
+    fn try_reserve_l1_for_mount(
+        &self,
+        branch: &str,
+        tree: &Digest,
+    ) -> Result<Option<(PathBuf, u64, u64)>, WorkspaceError> {
+        let Some(policy) = &self.l1_policy else {
+            return Ok(None);
+        };
+        let tmpfs_root = canonical_root(&policy.tmpfs_root);
+        let disk_dir = self.root.join(branch);
+        let budget_bytes = policy.budget_bytes();
+        let quota_bytes = policy.workspace_quota_bytes();
+        if budget_bytes == 0 || quota_bytes == 0 {
+            self.record_l1_fallback(branch, disk_dir, L1FallbackReason::Disabled);
+            return Ok(None);
+        }
+
+        let estimated = self.estimate_tree_bytes(tree)?;
+        let requested = estimated.max(1);
+        if !self.check_l1_host_and_quota(
+            policy,
+            branch,
+            &tmpfs_root,
+            &disk_dir,
+            estimated,
+            requested,
+            quota_bytes,
+        ) {
+            return Ok(None);
+        }
+
+        let mut guard = self
+            .l1_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev_for_branch = guard
+            .active
+            .get(branch)
+            .map_or(0, |a| a.used_bytes.max(a.baseline_bytes));
+        let other_used = guard.total_reserved_bytes().saturating_sub(prev_for_branch);
+        if other_used.saturating_add(estimated) > budget_bytes {
+            guard.active.remove(branch);
+            guard.admissions.insert(
+                branch.to_string(),
+                L1Admission::FallbackDisk {
+                    workspace_dir: disk_dir,
+                    reason: L1FallbackReason::BudgetExceeded {
+                        used_bytes: other_used,
+                        requested_bytes: estimated,
+                        budget_bytes,
+                    },
+                },
+            );
+            return Ok(None);
+        }
+
+        let now_ms = self.now_ms();
+        let workspace_dir = tmpfs_root.join(branch);
+        guard.active.insert(
+            branch.to_string(),
+            L1WorkspaceAccounting {
+                branch: branch.to_string(),
+                workspace_dir: workspace_dir.clone(),
+                quota_bytes,
+                baseline_bytes: estimated,
+                used_bytes: estimated,
+                dirty_bytes: 0,
+                last_flush_ms: now_ms,
+                flush_count: 0,
+            },
+        );
+        guard.admissions.insert(
+            branch.to_string(),
+            L1Admission::AdmittedTmpfs {
+                workspace_dir,
+                quota_bytes,
+                estimated_bytes: estimated,
+            },
+        );
+        Ok(Some((tmpfs_root, estimated, quota_bytes)))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn check_l1_host_and_quota(
+        &self,
+        policy: &L1TmpfsPolicy,
+        branch: &str,
+        tmpfs_root: &Path,
+        disk_dir: &Path,
+        estimated: u64,
+        requested: u64,
+        quota_bytes: u64,
+    ) -> bool {
+        let Some(sample) = (self.l1_memory_probe)(tmpfs_root) else {
+            self.record_l1_fallback(branch, disk_dir.to_path_buf(), L1FallbackReason::Disabled);
+            return false;
+        };
+        let reserve_floor = policy.host_reserve_bytes(sample.total_bytes);
+        if sample.available_bytes < reserve_floor
+            || sample.available_bytes.saturating_sub(requested) < reserve_floor
+        {
+            self.record_l1_fallback(
+                branch,
+                disk_dir.to_path_buf(),
+                L1FallbackReason::HostMemoryBelowReserve {
+                    available_bytes: sample.available_bytes,
+                    reserve_floor_bytes: reserve_floor,
+                    requested_bytes: requested,
+                },
+            );
+            return false;
+        }
+        if let Some(fs_avail) = sample.tmpfs_available_bytes
+            && fs_avail < requested
+        {
+            self.record_l1_fallback(
+                branch,
+                disk_dir.to_path_buf(),
+                L1FallbackReason::TmpfsFreeSpaceInsufficient {
+                    available_bytes: fs_avail,
+                    requested_bytes: requested,
+                },
+            );
+            return false;
+        }
+        if estimated > quota_bytes {
+            self.record_l1_fallback(
+                branch,
+                disk_dir.to_path_buf(),
+                L1FallbackReason::BudgetExceeded {
+                    used_bytes: 0,
+                    requested_bytes: estimated,
+                    budget_bytes: quota_bytes,
+                },
+            );
+            return false;
+        }
+        true
+    }
+
+    fn record_l1_fallback(&self, branch: &str, disk_dir: PathBuf, reason: L1FallbackReason) {
+        let mut guard = self
+            .l1_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.active.remove(branch);
+        guard.admissions.insert(
+            branch.to_string(),
+            L1Admission::FallbackDisk {
+                workspace_dir: disk_dir,
+                reason,
+            },
+        );
+    }
+
+    fn confirm_l1_mounted(
+        &self,
+        branch: &str,
+        workspace_dir: PathBuf,
+        quota_bytes: u64,
+        reserved_baseline: u64,
+        actual_used: u64,
+    ) {
+        let now_ms = self.now_ms();
+        let mut guard = self
+            .l1_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = guard.active.get_mut(branch) {
+            entry.workspace_dir = workspace_dir;
+            entry.quota_bytes = quota_bytes;
+            entry.baseline_bytes = reserved_baseline;
+            entry.used_bytes = actual_used;
+            entry.dirty_bytes = actual_used.saturating_sub(reserved_baseline);
+            entry.last_flush_ms = now_ms;
+        }
+    }
+
+    fn record_l1_tmpfs_failure_fallback(&self, branch: &str, detail: String) {
+        let disk_dir = self.root.join(branch);
+        self.record_l1_fallback(
+            branch,
+            disk_dir,
+            L1FallbackReason::TmpfsUnavailable { detail },
+        );
+    }
+
+    fn release_l1_branch(&self, branch: &str) {
+        self.l1_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .remove(branch);
+    }
+
+    fn update_l1_usage_from_scan(&self, branch: &str, directory: &Path, measured_bytes: u64) {
+        if !self.is_l1_dir(directory) {
+            return;
+        }
+        let mut guard = self
+            .l1_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = guard.active.get_mut(branch) {
+            entry.used_bytes = measured_bytes;
+            entry.dirty_bytes = measured_bytes.saturating_sub(entry.baseline_bytes);
+        }
+    }
+
+    fn demote_l1_dir_to_disk(
+        &self,
+        branch: &str,
+        l1_dir: &Path,
+    ) -> Result<WorkspaceId, WorkspaceError> {
+        let _lock = self.lock_branch(branch)?;
+        let disk_dir = self.root.join(branch);
+        let disk_staged = Self::staging_path_in(&self.root, branch, "demote")?;
+        if let Err(err) = clone_layer_to_writable(l1_dir, &disk_staged) {
+            let _ = fs::remove_dir_all(&disk_staged);
+            return Err(err);
+        }
+        if let Err(err) = Self::replace_workspace_in(&self.root, branch, &disk_staged, &disk_dir) {
+            let _ = fs::remove_dir_all(&disk_staged);
+            return Err(err);
+        }
+        Self::remove_workspace_tree(l1_dir, "reclaim l1")?;
+        self.invalidate_stat_cache(branch, Some(l1_dir));
+        self.record_l1_fallback(
+            branch,
+            disk_dir.clone(),
+            L1FallbackReason::TmpfsUnavailable {
+                detail: "demoted from L1 tmpfs to disk after pressure flush".to_string(),
+            },
+        );
+        WorkspaceId::new(format!("{branch}:{}", disk_dir.display()))
+            .map_err(|err| WorkspaceError::Unavailable(err.to_string()))
+    }
+
+    fn estimate_tree_bytes(&self, tree: &Digest) -> Result<u64, WorkspaceError> {
+        let map = self.flatten_tree_cached(tree)?;
+        Ok(map.values().fold(0_u64, |acc, entry| {
+            acc.saturating_add(match entry.kind {
+                TreeEntryKind::File | TreeEntryKind::Executable | TreeEntryKind::Symlink => {
+                    entry.size
+                }
+                TreeEntryKind::Dir | TreeEntryKind::Gitlink => 0,
+            })
+        }))
+    }
+
+    fn flatten_tree_cached(&self, tree: &Digest) -> Result<FlatTreeMap, WorkspaceError> {
+        if let Some(hit) = self
+            .flatten_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(d, _)| d == tree)
+            .map(|(_, map)| map.clone())
+        {
+            return Ok(hit);
+        }
+        let flat = Arc::new(self.store.flatten_tree(tree).map_err(map_store_err)?);
+        let mut cache = self
+            .flatten_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !cache.iter().any(|(d, _)| d == tree) {
+            if cache.len() >= FLATTEN_CACHE_CAP {
+                cache.pop_front();
+            }
+            cache.push_back((tree.clone(), flat.clone()));
+        }
+        Ok(flat)
+    }
+
+    fn is_verified_clean(&self, tree: &Digest, main_tree: Option<&Digest>) -> bool {
+        let key = (tree.clone(), main_tree.cloned());
+        self.verified_clean
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|item| item == &key)
+    }
+
+    fn mark_verified_clean(&self, tree: &Digest, main_tree: Option<&Digest>) {
+        let key = (tree.clone(), main_tree.cloned());
+        let mut cache = self
+            .verified_clean
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !cache.contains(&key) {
+            if cache.len() >= VERIFIED_CLEAN_CAP {
+                cache.pop_front();
+            }
+            cache.push_back(key);
+        }
+    }
+
+    fn invalidate_stat_cache(&self, branch: &str, directory: Option<&Path>) {
+        let mut cache = self
+            .stat_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match directory {
+            Some(dir) => {
+                cache.remove(&(branch.to_string(), dir.to_path_buf()));
+            }
+            None => cache.retain(|(b, _), _| b != branch),
+        }
+    }
+
+    fn probe_fs_fence_for(&self, directory: &Path) -> (i64, i64) {
+        let probe_dir = if let Some(policy) = &self.l1_policy
+            && directory.starts_with(&policy.tmpfs_root)
+        {
+            policy.tmpfs_root.join(D6_META_DIR).join(LOCKS_SUBDIR)
+        } else {
+            self.locks_dir()
+        };
+        let _ = fs::create_dir_all(&probe_dir);
+        let probe = probe_dir.join(format!(
+            ".fence-{}-{}",
+            std::process::id(),
+            D6_STAGE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        if fs::write(&probe, b"").is_ok() {
+            let meta_ts = fs::symlink_metadata(&probe)
+                .map(|m| (m.ctime(), m.ctime_nsec()).max((m.mtime(), m.mtime_nsec())));
+            let _ = fs::remove_file(&probe);
+            if let Ok(ts) = meta_ts {
+                return ts;
+            }
+        }
+        let dur = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        (
+            i64::try_from(dur.as_secs()).unwrap_or(i64::MAX),
+            i64::from(dur.subsec_nanos()),
+        )
+    }
+}
+
+/// Probe current host RAM (`MemTotal` / `MemAvailable` from `/proc/meminfo`) and `tmpfs_root`
+/// available capacity (`statvfs`).
+pub fn probe_host_memory(tmpfs_root: &Path) -> Option<HostMemorySample> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    let (total_bytes, available_bytes) = parse_proc_meminfo_bytes(&meminfo)?;
+    let tmpfs_available_bytes = probe_fs_available_bytes(tmpfs_root);
+    Some(HostMemorySample {
+        total_bytes,
+        available_bytes,
+        tmpfs_available_bytes,
+    })
+}
+
+/// Parse `(MemTotal, MemAvailable)` in bytes from `/proc/meminfo` contents.
+pub fn parse_proc_meminfo_bytes(contents: &str) -> Option<(u64, u64)> {
+    let mut total_kb = None;
+    let mut avail_kb = None;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            total_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok());
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            avail_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok());
+        }
+    }
+    Some((
+        total_kb?.saturating_mul(1024),
+        avail_kb?.saturating_mul(1024),
+    ))
+}
+
+#[expect(clippy::useless_conversion)]
+fn probe_fs_available_bytes(path: &Path) -> Option<u64> {
+    let existing = path.ancestors().find(|a| a.exists())?;
+    let stat = rustix::fs::statvfs(existing).ok()?;
+    let bavail = u64::try_from(stat.f_bavail).ok()?;
+    let frsize = u64::try_from(stat.f_frsize).ok()?;
+    Some(bavail.saturating_mul(frsize))
+}
+
+fn measure_dir_bytes(root: &Path) -> Result<u64, WorkspaceError> {
+    let mut total = 0_u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(it) => it,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(WorkspaceError::Unavailable(format!(
+                    "read {}: {err}",
+                    dir.display()
+                )));
+            }
+        };
+        for entry_res in entries {
+            let entry = entry_res.map_err(|err| {
+                WorkspaceError::Unavailable(format!("read entry {}: {err}", dir.display()))
+            })?;
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).map_err(|err| {
+                WorkspaceError::Unavailable(format!("stat {}: {err}", path.display()))
+            })?;
+            if meta.file_type().is_dir() {
+                stack.push(path);
+            } else if meta.file_type().is_file() || meta.file_type().is_symlink() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(total)
 }
 
 fn system_now_ms() -> i64 {
@@ -3549,5 +4769,85 @@ mod tests {
 
         store.unmount(ws2).expect("unmount ws2");
         assert!(!store.is_mounted(ws2));
+    }
+
+    #[test]
+    fn l1_meminfo_reserve_floor_and_flush_thresholds() {
+        let parsed = parse_proc_meminfo_bytes(
+            "MemTotal:       2113187020 kB
+MemFree:        146260292 kB
+MemAvailable:   2087943188 kB
+",
+        )
+        .expect("parse meminfo");
+        assert_eq!(parsed.0, 2_113_187_020_u64 * 1024);
+        assert_eq!(parsed.1, 2_087_943_188_u64 * 1024);
+
+        let policy =
+            L1TmpfsPolicy::new("/dev/shm/d6-test", 512).with_per_workspace_quota_bytes(1000);
+        // 128 GiB host -> max(64 GiB, 19.2 GiB) = 64 GiB
+        assert_eq!(
+            policy.host_reserve_bytes(128 * 1024 * 1024 * 1024),
+            DEFAULT_L1_MIN_HOST_RESERVE_BYTES
+        );
+        // 1 TiB host -> max(64 GiB, 153.6 GiB) = 15% of 1 TiB
+        let one_tib = 1024_u64 * 1024 * 1024 * 1024;
+        assert_eq!(
+            policy.host_reserve_bytes(one_tib),
+            u64::try_from(u128::from(one_tib) * 15 / 100).unwrap()
+        );
+
+        let mut acc = L1WorkspaceAccounting {
+            branch: "b".to_string(),
+            workspace_dir: PathBuf::from("/dev/shm/d6-test/b"),
+            quota_bytes: 1000,
+            baseline_bytes: 200,
+            used_bytes: 799,
+            dirty_bytes: 599,
+            last_flush_ms: 10_000,
+            flush_count: 0,
+        };
+        assert_eq!(acc.needs_flush(69_999, &policy), None);
+        assert!(matches!(
+            acc.needs_flush(70_000, &policy),
+            Some(L1FlushReason::IntervalElapsed {
+                elapsed_ms: 60_000,
+                interval_ms: 60_000
+            })
+        ));
+        acc.used_bytes = 800;
+        assert!(matches!(
+            acc.needs_flush(20_000, &policy),
+            Some(L1FlushReason::UsageThreshold {
+                usage_pct: 80,
+                threshold_pct: 80,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn stat_cache_catches_racy_same_tick_modification() {
+        let (_scratch, _cas, _ledger, store, _clock) = test_workspace();
+        let b = BranchName::new("stat_racy").expect("branch");
+        store.ensure_branch(&b, None).expect("ensure");
+        let ws = store.mount(&b).expect("mount");
+        let file = PathBuf::from(ws.path()).join("data.txt");
+
+        fs::write(&file, b"aaaa").expect("write 1");
+        assert!(matches!(
+            store.checkpoint(&ws, "c1").expect("c1"),
+            Commit::Created(_)
+        ));
+        // Overwrite with identical length inside same/next tick and confirm checkpoint still sees change
+        fs::write(&file, b"bbbb").expect("write 2");
+        assert!(matches!(
+            store.checkpoint(&ws, "c2").expect("c2"),
+            Commit::Created(_)
+        ));
+        assert_eq!(
+            store.checkpoint(&ws, "noop").expect("noop"),
+            Commit::Unchanged
+        );
     }
 }
