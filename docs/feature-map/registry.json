@@ -1853,7 +1853,7 @@
       "title": "Fleet Node Registry, Heartbeats & Drain",
       "kind": "capability",
       "parent": "domain-missions-fleet",
-      "summary": "Owned machines as fleet nodes (M7 #555): `spawn node add|list|probe|drain|undrain|remove`, the heartbeat worker, tcp/udp transports with multi-hop relays and upward registration (`spawn node serve|register`, issue 85), the global E2E-encrypted mesh of issue 87 (Ed25519 node identities, spawn-e2e-v1 sealed envelopes, AEAD-sealed tcp/udp wire, a pure sync WebSocket+TLS client and server, `spawn node coord|connect` with a recursive coordinator tree, STUN/punch and blind relays), the PostgreSQL node store and the Fleet page's node rows. Issue 91 P1a: macOS (Darwin) inventory and heartbeat, battery/AC power telemetry and the low-battery soft drain (`SPAWN_NODE_LOW_BATTERY_PCT`). spawn-node v1 (design §§2–3, §7; PR S2): the shared `spawn-node-proto` crate (signed request envelope and response, size caps, strict JSON, the heartbeat/spec/grant/result/enroll bodies, `tree_sha256_v1` behind `integrate/inputs.rs::scenarios_sha256`) and its golden fixtures `testdata/node-protocol-v1/` (Probe P6). PR S4 (M2): `integrate/remote.rs` (content-addressed artifacts for the gateway: delta/baseline git bundles, the deterministic controller pack, the registry manifest; the grant env as GATE_ENV minus node-owned names and any database URL; enqueue, lease wait and `take_local` fallback; a stored node result read back into `gate.rs::decide` and routed by the §6.2 outcomes matrix with strikes, exclusion, degraded and the poison-pill refund; the nodes' sweep from the integrator's pass), the `SPAWN_GATE_SHADOW_NODE=1` shadow source beside the runner's (`task.shadow_gated` with `runner: node:<name>`), and `nodes/v1.rs` (`spawn node enroll-token|revoke`, `list|drain|undrain` over P1 and v1 nodes).",
+      "summary": "Owned machines as fleet nodes (M7 #555): `spawn node add|list|probe|drain|undrain|remove`, the heartbeat worker, tcp/udp transports with multi-hop relays and upward registration (`spawn node serve|register`, issue 85), the global E2E-encrypted mesh of issue 87 (Ed25519 node identities, spawn-e2e-v1 sealed envelopes, AEAD-sealed tcp/udp wire, a pure sync WebSocket+TLS client and server, `spawn node coord|connect` with a recursive coordinator tree, STUN/punch and blind relays), the PostgreSQL node store and the Fleet page's node rows. Issue 91 P1a: macOS (Darwin) inventory and heartbeat, battery/AC power telemetry and the low-battery soft drain (`SPAWN_NODE_LOW_BATTERY_PCT`). spawn-node v1 (design §§2–3, §7; PR S2): the shared `spawn-node-proto` crate (signed request envelope and response, size caps, strict JSON, the heartbeat/spec/grant/result/enroll bodies, `tree_sha256_v1` behind `integrate/inputs.rs::scenarios_sha256`) and its golden fixtures `testdata/node-protocol-v1/` (Probe P6). PR S3: the synchronous `spawn-node-gateway` binary (std-only HTTP/1.1, restricted `spawn_node_gateway` login, verify-then-commit `spawn_node_gw_*` calls, 120 s key cache, per-source/per-node pacing, signed responses and grants, streamed results, ranged artifacts) and the protocol text `docs/node-protocol-v1.md`. PR S4 (M2): `integrate/remote.rs` (content-addressed artifacts for the gateway: delta/baseline git bundles, the deterministic controller pack, the registry manifest; the grant env as GATE_ENV minus node-owned names and any database URL; enqueue, lease wait and `take_local` fallback; a stored node result read back into `gate.rs::decide` and routed by the §6.2 outcomes matrix with strikes, exclusion, degraded and the poison-pill refund; the nodes' sweep from the integrator's pass), the `SPAWN_GATE_SHADOW_NODE=1` shadow source beside the runner's (`task.shadow_gated` with `runner: node:<name>`), and `nodes/v1.rs` (`spawn node enroll-token|revoke`, `list|drain|undrain` over P1 and v1 nodes).",
       "files": [
         "crates/spawn-cli/src/nodes.rs",
         "crates/spawn-cli/src/nodes/auth.rs",
@@ -1876,6 +1876,21 @@
         "crates/spawn-cli/src/nodes/ws/tests.rs",
         "crates/spawn-cli/src/nodes/v1.rs",
         "crates/spawn-cli/src/integrate/remote.rs",
+        "crates/spawn-node-gateway/Cargo.toml",
+        "crates/spawn-node-gateway/src/artifacts.rs",
+        "crates/spawn-node-gateway/src/cache.rs",
+        "crates/spawn-node-gateway/src/config.rs",
+        "crates/spawn-node-gateway/src/gateway.rs",
+        "crates/spawn-node-gateway/src/http.rs",
+        "crates/spawn-node-gateway/src/lib.rs",
+        "crates/spawn-node-gateway/src/limits.rs",
+        "crates/spawn-node-gateway/src/main.rs",
+        "crates/spawn-node-gateway/src/primary.rs",
+        "crates/spawn-node-gateway/src/results.rs",
+        "crates/spawn-node-gateway/src/span.rs",
+        "crates/spawn-node-gateway/tests/common/mod.rs",
+        "crates/spawn-node-gateway/tests/fixtures.rs",
+        "crates/spawn-node-gateway/tests/ledger.rs",
         "crates/spawn-node-proto/Cargo.toml",
         "crates/spawn-node-proto/src/artifact.rs",
         "crates/spawn-node-proto/src/codec.rs",
@@ -1921,6 +1936,7 @@
         "crates/spawn-postgres/tests/nodes.rs",
         "crates/spawn-postgres/tests/remote_jobs.rs",
         "docs/fleet-architecture.md",
+        "docs/node-protocol-v1.md",
         "web/src/components/fleet/NodeRows.tsx",
         "web/src/nodes.ts",
         "web/test/nodes.test.ts"
@@ -1952,13 +1968,16 @@
           "crates/spawn-cli/src/nodes/power/tests.rs",
           "crates/spawn-cli/src/nodes/tests.rs",
           "crates/spawn-cli/src/nodes/ws/tests.rs",
+          "crates/spawn-node-gateway/tests/fixtures.rs",
+          "crates/spawn-node-gateway/tests/ledger.rs",
           "crates/spawn-node-proto/tests/node_protocol_v1.rs",
           "crates/spawn-postgres/tests/nodes.rs",
           "web/test/nodes.test.ts"
         ],
         "deploys": [],
         "artifacts": [
-          "docs/fleet-architecture.md"
+          "docs/fleet-architecture.md",
+          "docs/node-protocol-v1.md"
         ],
         "discussions": []
       }

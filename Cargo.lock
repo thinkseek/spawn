@@ -785,6 +785,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "spawn-node-gateway"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "spawn-node-proto",
+ "spawn-postgres",
+ "zeroize",
+]
+
+[[package]]
 name = "spawn-node-proto"
 version = "0.1.0"
 dependencies = [

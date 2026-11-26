@@ -1,0 +1,34 @@
+[package]
+name = "spawn-node-gateway"
+description = "spawn-node v1's gateway: the signed HTTP front of the node ledger (enroll, heartbeat, spec, result, artifacts), synchronous, logged in as the restricted spawn_node_gateway login."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "spawn-node-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# The wire: envelope, response signature, refusals, bodies, grants.
+spawn-node-proto.workspace = true
+# The four spawn_node_gw_* calls, verify-then-commit.
+spawn-postgres.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The primary's PKCS#8 Ed25519 key (generated on first start).
+ring.workspace = true
+# A result's log hashed while it streams to disk.
+sha2.workspace = true
+# The ledger hands a node's key back in standard base64.
+base64.workspace = true
+# The key file's bytes and the seed are wiped once the key is built.
+zeroize.workspace = true
+
+[dev-dependencies]
+spawn-postgres = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true
