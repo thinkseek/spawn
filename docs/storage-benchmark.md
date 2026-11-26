@@ -247,3 +247,45 @@ The runner best-effort stops all known executions on success or failure and
 closes its temporary mission as dropped. The golden repository and event history
 remain for inspection; mounted workspaces are removed by Spawn's normal stop
 path. Start with `--agents 2 --iterations 2` as a pilot before a large run.
+
+## #97 Chaos & Recovery Baseline Matrix
+
+In addition to throughput micro-benchmarks and cluster runs, the test suite
+exercises high-concurrency contention, idempotency storms, abrupt worker
+failures, workspace lifecycle races, and L1 `tmpfs` exhaustion recovery against
+PostgreSQL and git borders.
+
+### Test Coverage Matrix
+
+| Test | Location | Concurrency / Chaos Class | Invariants Verified |
+| --- | --- | --- | --- |
+| `pg_concurrency_idempotency_replay_storm_claim_contention_and_event_monotonicity` | `crates/spawn-postgres/tests/recovery.rs` | 16-thread `Idempotency-Key` replay storm (`submit` + `claim` contention + `append` + `finish`) | 384 submits deduplicate to 264 unique commands; single live claim per command; idempotent duplicate `EventLog::append`; 792 strictly monotonic global events |
+| `pg_worker_crash_lease_expiry_and_reconnect_takeover_zero_duplicate_side_effects` | `crates/spawn-postgres/tests/recovery.rs` | Abrupt worker connection/advisory-lock drop (`SIGKILL`) & lease TTL expiry takeover | Live worker fencing (`Rejected`); immediate takeover recovers 4 abandoned leases + 4 TTL-expired leases; `StoreError::LeaseLost` on active attempt-2 collision; zero duplicate `execution.terminal_started` events (`12/12` finished, `36` monotonic events) |
+| `concurrent_workspace_lifecycle_races_git_d6_shadow_and_d6_with_border_fsck` | `crates/spawn-host/tests/d6_layer0_cutover.rs` | 8-thread `LocalWorkspaceStore` lifecycle contention across `git`, `d6-shadow`, and `d6` | Sibling sentinel isolation; zero orphan dirs or `.d6-layer0-stage*` leftovers; zero `d6-shadow` divergences; `.gc-fence` + `reconcile_refs_journal` clean (`entries_replayed == 0`); border `git fsck --full --strict` clean |
+| `d6_l1_tmpfs_budget_exhaustion_backpressure_fallback_and_recovery` | `crates/spawn-host/tests/d6_layer0_cutover.rs` | L1 `tmpfs` quota (`BudgetExceeded`), low free-space (`TmpfsFreeSpaceInsufficient`), and 80% `UsageThreshold` flush | Clean fallback to L0 disk workspace; pressure demotion reclaims `921600` bytes; automatic L1 re-admission after headroom recovery; border `git fsck --full --strict` clean |
+
+### Reproduction Commands
+
+Set `SPAWN_TEST_DATABASE_URL` to a disposable local PostgreSQL 16 test database
+and run both integration targets:
+
+```bash
+export SPAWN_TEST_DATABASE_URL="postgres://<user>:<pass>@127.0.0.1:<port>/<db>"
+cargo test --locked --offline -p spawn-postgres --test recovery -- --nocapture
+cargo test --locked --offline -p spawn-host --test d6_layer0_cutover -- --nocapture
+```
+
+### Measured N252 Baseline Latency Metrics
+
+Observed on Linux (PG 16 isolated schema) across `6/6` passing `recovery` tests
+and `8/8` passing `d6_layer0_cutover` tests:
+
+| Suite / Backend | Workload Shape | Measured Latency / Recovery Metrics |
+| --- | --- | --- |
+| `pg_replay_storm` | 16 threads, 384 submits -> 264 unique cmds, 792 events | `submit_ms=(52.45/333.58/405.33)` · `claim_ms=(2.57/9.26/19.59)` · `append_ms=(11.48/60.74/113.74)` · `finish_ms=(11.95/54.76/113.13)` (p50/p95/max) |
+| `pg_crash_recovery` | 4 `SIGKILL` abandoned leases + 4 TTL-expired leases (`12` cmds) | `recover_ms=6.69` · `ttl_takeover_ms=107.15` |
+| `ws_lifecycle_storm` (`git`) | 8 threads, 26 lifecycle cycles | `p50_ms=81.06` · `p95_ms=126.29` · `max_ms=174.75` |
+| `ws_lifecycle_storm` (`d6-shadow`) | 8 threads, 24 lifecycle cycles (strict oracle, 0 divergences) | `p50_ms=392.72` · `p95_ms=504.69` · `max_ms=525.59` |
+| `ws_lifecycle_storm` (`d6`) | 8 threads, 26 lifecycle cycles (border `fsck` clean) | `p50_ms=250.37` · `p95_ms=272.53` · `max_ms=274.96` |
+| `d6_l1_backpressure` | L1 quota/space fallback -> demote (`921600` B) -> recover | `fallback_ms=4.07` · `demote_ms=31.21` · `recover_ms=21.16` |
+

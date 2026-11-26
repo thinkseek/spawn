@@ -14,17 +14,19 @@ use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Barrier, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::json;
 use spawn_cas::{
-    DEFAULT_PERSISTENT_GC_GRACE, Digest, GIT_POINTER_THRESHOLD, GitOid, JournalEntry, NS_BLOB,
-    Snapshot, Store, Tree, TreeEntry, TreeEntryKind, TreeMutation,
+    DEFAULT_PERSISTENT_GC_GRACE, Digest, GIT_POINTER_THRESHOLD, GcFenceBinding, GitOid,
+    JournalEntry, NS_BLOB, Snapshot, Store, Tree, TreeEntry, TreeEntryKind, TreeMutation,
 };
 use spawn_core::id::BranchName;
 use spawn_core::port::{BaseMerge, Commit, SetAside, WorkspaceStore};
-use spawn_host::d6_workspace::L1TmpfsPolicy;
+use spawn_host::d6_workspace::{
+    D6Workspace, HostMemorySample, L1Admission, L1FallbackReason, L1FlushReason, L1TmpfsPolicy,
+};
 use spawn_host::workspace::{D6ShadowOptions, D6StoreOptions, DynRefLedger};
 use spawn_host::{
     CasMerkleStore, CutoverPhase, D6RefKind, D6StoreError, ExistingDestPolicy, GitBorderAdapter,
@@ -2026,4 +2028,548 @@ fn pg_reversible_cutover_shadow_d6_l1_and_border_roundtrip_drill() {
     git_in(&work, &["add", "AFTER_ROLLBACK.txt"]);
     git_in(&work, &["commit", "-m", "post rollback commit"]);
     git_in(&work, &["push", "origin", "HEAD:refs/heads/post-rollback"]);
+}
+
+fn summarize_us(samples_us: &[u64]) -> (f64, f64, f64) {
+    if samples_us.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut sorted = samples_us.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    let idx = |pct: usize| -> usize { ((n - 1) * pct) / 100 };
+    let to_ms = |us: u64| f64::from(u32::try_from(us).unwrap_or(u32::MAX)) / 1000.0;
+    (
+        to_ms(sorted[idx(50)]),
+        to_ms(sorted[idx(95)]),
+        to_ms(sorted[n - 1]),
+    )
+}
+
+fn seed_bare_repo_for_storm(scratch: &Scratch, tag: &str) -> PathBuf {
+    let work = scratch.join(&format!("seed-work-{tag}"));
+    fs::create_dir_all(work.join("src")).expect("mkdir src");
+    git_in(&work, &["init", "-b", "main"]);
+    fs::write(work.join(".gitignore"), "*.tmp.log\n").expect("gitignore");
+    fs::write(work.join("README.md"), "# Chaos Lifecycle Repo\n").expect("readme");
+    fs::write(work.join("src/lib.rs"), "pub fn v() -> u32 { 1 }\n").expect("lib");
+    git_in(&work, &["add", "-A"]);
+    git_in(&work, &["commit", "-m", "initial main"]);
+
+    let bare = scratch.join(&format!("bare-{tag}.git"));
+    git_in(
+        &scratch.0,
+        &[
+            "clone",
+            "--bare",
+            work.to_str().expect("utf8"),
+            bare.to_str().expect("utf8"),
+        ],
+    );
+    bare
+}
+
+fn assert_clean_workspace_root(root: &Path) {
+    if !root.exists() {
+        return;
+    }
+    for entry in fs::read_dir(root).expect("read store root") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        assert!(
+            name_str.starts_with('.'),
+            "orphan workspace entry left in {}: {name_str}",
+            root.display()
+        );
+    }
+    let layers = root.join(".d6/layers");
+    if layers.is_dir() {
+        for entry in fs::read_dir(&layers).expect("read layers") {
+            let name = entry.expect("layer entry").file_name();
+            let name_str = name.to_string_lossy();
+            assert!(
+                !name_str.starts_with(".d6-layer0-stage"),
+                "leftover stage dir in {}: {name_str}",
+                layers.display()
+            );
+        }
+    }
+}
+
+fn assert_git_fsck_clean(bare_repo: &Path) {
+    let fsck = test_git_command()
+        .arg("--git-dir")
+        .arg(bare_repo)
+        .args(["fsck", "--full", "--strict"])
+        .output()
+        .expect("run git fsck");
+    assert!(
+        fsck.status.success(),
+        "git fsck --full --strict failed on {}: {}",
+        bare_repo.display(),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+fn run_slot_worker_rounds(store: &LocalWorkspaceStore, slot_id: usize, rounds: usize) -> Vec<u64> {
+    let branch = BranchName::new(format!("worker_slot_{slot_id}")).expect("branch");
+    let mut cycle_us = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        let started = Instant::now();
+        store.ensure_branch(&branch, None).expect("ensure_branch");
+        let ws = store.mount_when(&branch, &|| Ok(())).expect("mount_when");
+        let ws_dir = PathBuf::from(ws.path());
+        fs::write(
+            ws_dir.join(format!("slot_{slot_id}_r{round}.txt")),
+            format!("slot={slot_id} round={round}\n"),
+        )
+        .expect("write slot file");
+        assert!(matches!(
+            store
+                .checkpoint(&ws, &format!("slot {slot_id} round {round}"))
+                .expect("checkpoint"),
+            Commit::Created(_)
+        ));
+        fs::write(ws_dir.join(format!("dirty_{round}.txt")), "unsaved\n").expect("write dirty");
+        store
+            .set_aside_when(&branch, None, &format!("aside-{slot_id}-{round}"), &|| {
+                Ok(())
+            })
+            .expect("set_aside_when");
+        fs::write(
+            ws_dir.join(format!("after_{slot_id}_r{round}.txt")),
+            format!("after={slot_id} round={round}\n"),
+        )
+        .expect("write after file");
+        assert!(matches!(
+            store
+                .checkpoint(&ws, &format!("post-aside {slot_id} round {round}"))
+                .expect("post-aside checkpoint"),
+            Commit::Created(_)
+        ));
+        if round % 2 == 0 {
+            store.unmount_when(&ws, &|| Ok(())).expect("unmount_when");
+        } else {
+            store.discard(&ws).expect("discard");
+        }
+        assert!(!store.is_mounted(&ws));
+        cycle_us.push(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+    }
+    cycle_us
+}
+
+fn run_destructive_contention_round(
+    store: &LocalWorkspaceStore,
+    thread_id: usize,
+    rounds: usize,
+) -> Vec<u64> {
+    let shared = BranchName::new("worker_race_shared").expect("shared branch");
+    let mut lat_us = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        let started = Instant::now();
+        let _ = store.ensure_branch(&shared, None);
+        if let Ok(ws) = store.mount_when(&shared, &|| Ok(())) {
+            let ws_dir = PathBuf::from(ws.path());
+            let _ = fs::write(
+                ws_dir.join(format!("race_t{thread_id}_r{round}.txt")),
+                format!("race {thread_id}-{round}\n"),
+            );
+            let _ = store.checkpoint(&ws, &format!("race {thread_id}-{round}"));
+            let _ = store.set_aside_when(
+                &shared,
+                None,
+                &format!("race-aside-{thread_id}-{round}"),
+                &|| Ok(()),
+            );
+            if round % 2 == 0 {
+                let _ = store.unmount(&ws);
+            } else {
+                let _ = store.discard(&ws);
+            }
+        }
+        lat_us.push(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+    }
+    lat_us
+}
+
+fn run_shadow_safe_contention_round(
+    store: &LocalWorkspaceStore,
+    slot_id: usize,
+    rounds: usize,
+) -> Vec<u64> {
+    let branch = BranchName::new(format!("worker_guard_{slot_id}")).expect("guard branch");
+    let mut lat_us = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        let started = Instant::now();
+        store
+            .ensure_branch(&branch, None)
+            .expect("ensure guard branch");
+        let cancelled = store.mount_when(&branch, &|| Err("cancelled before mount".to_string()));
+        assert!(
+            cancelled.is_err(),
+            "mount_when must fail closed when ready errs"
+        );
+        let ws = store.mount_when(&branch, &|| Ok(())).expect("mount guard");
+        let held = store.hold(&ws).expect("hold guard");
+        fs::write(
+            Path::new(ws.path()).join(format!("guarded_{slot_id}_{round}.txt")),
+            "guarded\n",
+        )
+        .expect("write guarded");
+        drop(held);
+        assert!(matches!(
+            store.checkpoint(&ws, "guarded ckpt").expect("ckpt"),
+            Commit::Created(_)
+        ));
+        let busy_merge =
+            store.set_aside_when(&branch, None, "busy", &|| Err("agent typing".to_string()));
+        assert!(busy_merge.is_err());
+        store.discard(&ws).expect("discard guard");
+        lat_us.push(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+    }
+    lat_us
+}
+
+fn run_store_storm_harness(
+    store: &LocalWorkspaceStore,
+    backend_label: &str,
+    destructive_shared_race: bool,
+) -> (f64, f64, f64, usize) {
+    let sentinel = BranchName::new("worker_sentinel").expect("sentinel branch");
+    store
+        .ensure_branch(&sentinel, None)
+        .expect("ensure sentinel");
+    let sentinel_ws = store.mount(&sentinel).expect("mount sentinel");
+    let sentinel_file = PathBuf::from(sentinel_ws.path()).join("sentinel_alive.txt");
+    fs::write(&sentinel_file, "do-not-delete\n").expect("write sentinel");
+
+    let threads = 8usize;
+    let barrier = Arc::new(Barrier::new(threads));
+    let samples = Arc::new(Mutex::new(Vec::new()));
+
+    std::thread::scope(|scope| {
+        for tid in 0..threads {
+            let barrier = Arc::clone(&barrier);
+            let samples = Arc::clone(&samples);
+            scope.spawn(move || {
+                barrier.wait();
+                let local = if tid < 6 {
+                    run_slot_worker_rounds(store, tid, 3)
+                } else if destructive_shared_race {
+                    run_destructive_contention_round(store, tid, 4)
+                } else {
+                    run_shadow_safe_contention_round(store, tid, 3)
+                };
+                samples.lock().expect("samples").extend(local);
+            });
+        }
+    });
+
+    if destructive_shared_race {
+        let shared = BranchName::new("worker_race_shared").expect("shared");
+        if store.ensure_branch(&shared, None).is_ok()
+            && let Ok(ws) = store.mount(&shared)
+        {
+            store.discard(&ws).expect("cleanup shared ws");
+        }
+    }
+
+    assert!(
+        store.is_mounted(&sentinel_ws),
+        "{backend_label}: sibling sentinel workspace was wrongly removed!"
+    );
+    assert_eq!(
+        fs::read_to_string(&sentinel_file).expect("read sentinel"),
+        "do-not-delete\n",
+        "{backend_label}: sibling sentinel content corrupted!"
+    );
+    assert!(matches!(
+        store
+            .checkpoint(&sentinel_ws, "sentinel survives storm")
+            .expect("sentinel ckpt"),
+        Commit::Created(_)
+    ));
+    store.unmount(&sentinel_ws).expect("unmount sentinel");
+    assert_clean_workspace_root(store.root());
+
+    let collected = samples.lock().expect("samples").clone();
+    let (p50, p95, max) = summarize_us(&collected);
+    eprintln!(
+        "N252_METRIC ws_lifecycle_storm backend={backend_label} threads={threads} cycles={} \
+         p50_ms={p50:.2} p95_ms={p95:.2} max_ms={max:.2}",
+        collected.len()
+    );
+    (p50, p95, max, collected.len())
+}
+
+#[test]
+fn concurrent_workspace_lifecycle_races_git_d6_shadow_and_d6_with_border_fsck() {
+    let scratch = Scratch::new("ws_lifecycle_chaos");
+    let adapter = GitBorderAdapter::new();
+
+    // 1. Git backend concurrent storm.
+    let git_bare = seed_bare_repo_for_storm(&scratch, "git");
+    let git_store = LocalWorkspaceStore::git(&git_bare, scratch.join("ws-git"));
+    git_store.claim().expect("claim git");
+    let _git_m = run_store_storm_harness(&git_store, "git", true);
+    assert_git_fsck_clean(&git_bare);
+
+    // 2. D6Shadow backend concurrent storm (strict parity oracle).
+    let shadow_bare = seed_bare_repo_for_storm(&scratch, "shadow");
+    let shadow_cas =
+        Arc::new(CasMerkleStore::open(scratch.join("shadow-cas")).expect("shadow cas"));
+    let shadow_ledger = Arc::new(PgRefLedger::connect_isolated("chaos_ws_shadow"));
+    let shadow_dyn: DynRefLedger = shadow_ledger.clone();
+    let shadow_opts = D6ShadowOptions::new(scratch.join("shadow-d6-work"), shadow_cas, shadow_dyn)
+        .with_strict_fail_closed(true);
+    let shadow_store =
+        LocalWorkspaceStore::d6_shadow(&shadow_bare, scratch.join("ws-shadow"), shadow_opts);
+    shadow_store.claim().expect("claim d6-shadow");
+    let _shadow_m = run_store_storm_harness(&shadow_store, "d6-shadow", false);
+    let shadow_metrics = shadow_store.shadow_metrics().expect("shadow metrics");
+    assert_eq!(shadow_metrics.tree_mismatches, 0, "{shadow_metrics:?}");
+    assert_eq!(shadow_metrics.tracked_set_leaks, 0, "{shadow_metrics:?}");
+    assert_eq!(shadow_metrics.shadow_errors, 0, "{shadow_metrics:?}");
+    assert!(!shadow_metrics.has_divergences(), "{shadow_metrics:?}");
+    assert_git_fsck_clean(&shadow_bare);
+
+    // 3. Pure D6 backend concurrent storm + .gc-fence + refs.journal + border git fsck.
+    let d6_bare = seed_bare_repo_for_storm(&scratch, "d6");
+    let d6_cas = Arc::new(CasMerkleStore::open(scratch.join("d6-cas")).expect("d6 cas"));
+    let d6_ledger = Arc::new(PgRefLedger::connect_isolated("chaos_ws_d6"));
+    let ident = d6_ledger.pg.database_identity().expect("db ident");
+    let binding = GcFenceBinding {
+        db_system_id: ident.db_system_id,
+        db_oid: ident.db_oid,
+        schema_name: ident.schema_name,
+    };
+    bind_store_gc_fence(&d6_cas, &binding).expect("bind gc fence");
+
+    let cutover_root = scratch.join("d6-cutover-staging");
+    fs::create_dir_all(&cutover_root).expect("mkdir cutover staging");
+    let mut cutover = ProjectCutover::new("chaos-d6-proj", &d6_bare, &cutover_root);
+    cutover
+        .step1_backfill_history(&d6_cas, d6_ledger.as_ref())
+        .expect("step1");
+    cutover
+        .step2_pause_dispatch_and_verify_clean(&d6_cas)
+        .expect("step2");
+    cutover
+        .step3_import_tail_commits(&d6_cas, d6_ledger.as_ref())
+        .expect("step3");
+    cutover
+        .step4_commit_refs_and_flip_mode(&d6_cas, d6_ledger.as_ref(), &adapter, "chaos")
+        .expect("step4");
+    cutover
+        .step5_verify_parity(&d6_cas, d6_ledger.as_ref())
+        .expect("step5");
+    cutover
+        .step6_configure_readonly_border(&adapter)
+        .expect("step6");
+    cutover.step7_resume_dispatch().expect("step7");
+
+    let d6_dyn: DynRefLedger = d6_ledger.clone();
+    let d6_opts = D6StoreOptions::new(d6_cas.clone(), d6_dyn);
+    let d6_store = LocalWorkspaceStore::d6("chaos-d6-proj", scratch.join("ws-d6"), d6_opts);
+    d6_store.claim().expect("claim d6");
+    let _d6_m = run_store_storm_harness(&d6_store, "d6", true);
+
+    let pg_seq = d6_ledger.pg.latest_ref_log_seq().expect("pg seq");
+    let fence = check_gc_fence(&d6_cas, &binding, pg_seq).expect("gc fence intact");
+    assert_eq!(fence.pg_latest_ref_seq, fence.journal_latest_seq);
+    let rec = reconcile_refs_journal(&d6_cas, d6_ledger.as_ref(), pg_seq, "chaos")
+        .expect("reconcile refs.journal clean");
+    assert_eq!(rec.entries_replayed, 0);
+
+    let exported = scratch.join("d6-exported-storm.git");
+    adapter
+        .export_project(&d6_cas, d6_ledger.as_ref(), "chaos-d6-proj", &exported)
+        .expect("export storm project");
+    verify_cutover_parity(&d6_cas, d6_ledger.as_ref(), "chaos-d6-proj", &exported)
+        .expect("border parity");
+    assert_git_fsck_clean(&exported);
+}
+
+#[test]
+#[expect(clippy::too_many_lines)]
+fn d6_l1_tmpfs_budget_exhaustion_backpressure_fallback_and_recovery() {
+    let scratch = Scratch::new("d6_l1_backpressure");
+    let tmpfs_guard = DevShmGuard::new("chaos_l1_budget");
+    let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("cas"));
+    let ledger = Arc::new(PgRefLedger::connect_isolated("chaos_l1_budget"));
+    let adapter = GitBorderAdapter::new();
+    let disk_root = scratch.join("d6-disk");
+
+    let gib = 1024_u64 * 1024 * 1024;
+    let tmpfs_avail_bytes = Arc::new(AtomicU64::new(64 * 1024 * 1024));
+    let avail_probe = tmpfs_avail_bytes.clone();
+
+    let policy = L1TmpfsPolicy::new(&tmpfs_guard.0, 1)
+        .with_per_workspace_quota_bytes(800 * 1024)
+        .with_flush_threshold_pct(80);
+    let d6 = D6Workspace::new("l1-chaos-proj", &disk_root, cas.clone(), ledger.clone())
+        .with_l1_policy(policy.clone())
+        .with_l1_memory_probe(Arc::new(move |_| {
+            Some(HostMemorySample {
+                total_bytes: 512 * gib,
+                available_bytes: 400 * gib,
+                tmpfs_available_bytes: Some(avail_probe.load(Ordering::Relaxed)),
+            })
+        }));
+
+    // Seed 600 KiB main snapshot in CAS + PG ledger.
+    let seed_payload = vec![0x4B_u8; 600 * 1024];
+    let (seed_id, seed_sz) = cas.put_bytes_blob(&seed_payload).expect("put seed");
+    let seed_tree = cas
+        .put_tree_cached(
+            &Tree::from_entries(vec![TreeEntry::file(
+                b"seed.bin".to_vec(),
+                &seed_id,
+                seed_sz,
+            )])
+            .expect("seed tree"),
+        )
+        .expect("store seed tree");
+    let body = format_commit_body(
+        "Alice <alice@spawn.local> 1700010000 +0000",
+        "Alice <alice@spawn.local> 1700010000 +0000",
+        "Seed L1 backpressure main",
+    );
+    cas.publish_snapshot(
+        ledger.as_ref(),
+        &PublishRequest {
+            project: "l1-chaos-proj",
+            ref_name: "main",
+            kind: D6RefKind::Main,
+            expected_ref: None,
+            tree: &seed_tree,
+            parents: &[],
+            commit_body: &body,
+            created_at_ms: 1_700_010_000_000,
+            reason: "seed l1 main",
+            landing_task_id: None,
+        },
+    )
+    .expect("publish seed main");
+
+    let ba = BranchName::new("agent_l1_a").expect("ba");
+    let bb = BranchName::new("agent_l1_b").expect("bb");
+    let bc = BranchName::new("agent_l1_c").expect("bc");
+    let bd = BranchName::new("agent_l1_d").expect("bd");
+    for b in [&ba, &bb, &bc, &bd] {
+        d6.ensure_branch(b, None).expect("ensure");
+    }
+
+    // Phase 1: Admits branch A on tmpfs; branch B exceeds 1 MiB global budget -> clean disk fallback.
+    let ws_a = d6.mount(&ba).expect("mount a");
+    assert!(matches!(
+        d6.l1_admission("agent_l1_a"),
+        Some(L1Admission::AdmittedTmpfs { .. })
+    ));
+    let ws_a_dir = PathBuf::from(ws_a.path());
+    assert!(ws_a_dir.starts_with(&policy.tmpfs_root));
+    assert!(d6.l1_total_reserved_bytes() >= 600 * 1024);
+
+    let fb_started = Instant::now();
+    let ws_b = d6.mount(&bb).expect("mount b fallback");
+    let fallback_ms =
+        f64::from(u32::try_from(fb_started.elapsed().as_micros()).unwrap_or(u32::MAX)) / 1000.0;
+    assert!(matches!(
+        d6.l1_admission("agent_l1_b"),
+        Some(L1Admission::FallbackDisk {
+            reason: L1FallbackReason::BudgetExceeded { .. },
+            ..
+        })
+    ));
+    assert!(Path::new(ws_b.path()).starts_with(d6.root()));
+    assert!(!policy.tmpfs_root.join("agent_l1_b").exists());
+    fs::write(Path::new(ws_b.path()).join("fallback_ok.txt"), "disk ok\n").expect("write fallback");
+    assert!(matches!(
+        d6.checkpoint(&ws_b, "fallback ckpt")
+            .expect("fallback ckpt"),
+        Commit::Created(_)
+    ));
+    d6.unmount(&ws_b).expect("unmount b");
+
+    // Phase 2: tmpfs free space drops below workspace size -> clean TmpfsFreeSpaceInsufficient fallback.
+    tmpfs_avail_bytes.store(64 * 1024, Ordering::Relaxed);
+    let ws_c = d6.mount(&bc).expect("mount c low tmpfs");
+    assert!(matches!(
+        d6.l1_admission("agent_l1_c"),
+        Some(L1Admission::FallbackDisk {
+            reason: L1FallbackReason::TmpfsFreeSpaceInsufficient { .. },
+            ..
+        })
+    ));
+    fs::write(Path::new(ws_c.path()).join("low_space.txt"), "safe disk\n").expect("write c");
+    assert!(matches!(
+        d6.checkpoint(&ws_c, "low space ckpt").expect("c ckpt"),
+        Commit::Created(_)
+    ));
+    d6.unmount(&ws_c).expect("unmount c");
+
+    // Phase 3: Active tmpfs branch exceeds 80% quota -> flush + disk demotion + zero L1 leftover.
+    let demote_started = Instant::now();
+    let pressure_bytes = vec![0x50_u8; 300 * 1024];
+    fs::write(ws_a_dir.join("pressure_300k.bin"), &pressure_bytes).expect("write pressure");
+    assert!(matches!(
+        d6.l1_needs_flush(&ws_a).expect("needs flush"),
+        Some(L1FlushReason::UsageThreshold { .. })
+    ));
+    let outcome = d6
+        .flush_l1_if_needed(&ws_a, "pressure flush and demote")
+        .expect("flush")
+        .expect("triggered");
+    let demote_ms =
+        f64::from(u32::try_from(demote_started.elapsed().as_micros()).unwrap_or(u32::MAX)) / 1000.0;
+    assert!(matches!(outcome.commit, Commit::Created(_)));
+    assert!(outcome.reclaimed_bytes >= 900 * 1024);
+    let demoted_ws = outcome.demoted_to_disk.expect("demoted to disk");
+    assert!(!policy.tmpfs_root.join("agent_l1_a").exists());
+    assert_eq!(d6.l1_total_reserved_bytes(), 0);
+    assert_eq!(
+        fs::read(Path::new(demoted_ws.path()).join("pressure_300k.bin")).expect("read demoted"),
+        pressure_bytes
+    );
+    d6.unmount(&demoted_ws).expect("unmount demoted");
+
+    // Phase 4: Space recovers -> branch D mounts onto tmpfs immediately, zero hanging locks.
+    tmpfs_avail_bytes.store(64 * 1024 * 1024, Ordering::Relaxed);
+    let rec_started = Instant::now();
+    let ws_d = d6.mount(&bd).expect("mount d recovered");
+    assert!(matches!(
+        d6.l1_admission("agent_l1_d"),
+        Some(L1Admission::AdmittedTmpfs { .. })
+    ));
+    fs::write(
+        Path::new(ws_d.path()).join("recovered.txt"),
+        "l1 restored\n",
+    )
+    .expect("write d");
+    assert!(matches!(
+        d6.checkpoint(&ws_d, "recovered l1").expect("d ckpt"),
+        Commit::Created(_)
+    ));
+    d6.unmount(&ws_d).expect("unmount d");
+    let recover_ms =
+        f64::from(u32::try_from(rec_started.elapsed().as_micros()).unwrap_or(u32::MAX)) / 1000.0;
+    assert_eq!(d6.l1_total_reserved_bytes(), 0);
+
+    // Immediate re-mount confirms zero stuck lock files; border export passes git fsck --full --strict.
+    let remount_d = d6.mount(&bd).expect("remount d cleanly");
+    d6.discard(&remount_d).expect("discard remount d");
+    assert_clean_workspace_root(&disk_root);
+
+    let exported = scratch.join("l1-exported.git");
+    adapter
+        .export_project(&cas, ledger.as_ref(), "l1-chaos-proj", &exported)
+        .expect("export l1 project");
+    assert_git_fsck_clean(&exported);
+
+    eprintln!(
+        "N252_METRIC d6_l1_backpressure fallback_ms={fallback_ms:.2} demote_ms={demote_ms:.2} \
+         recover_ms={recover_ms:.2} reclaimed_bytes={}",
+        outcome.reclaimed_bytes
+    );
 }
