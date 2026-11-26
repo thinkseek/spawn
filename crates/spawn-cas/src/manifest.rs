@@ -19,14 +19,17 @@
 //!
 //! # Snapshot pins
 //!
-//! `pins/prov/<ref>` keeps the [`KEEP_SNAPSHOTS`] newest snapshots of a data
-//! ref: for each, newest first, a `# snapshot <digest>` line (a comment:
-//! [`Store::pinned`] reads only lines that are digests) followed by the
-//! manifest's digest and every file's. A pin file is replaced whole
-//! (temporary file and `rename`, no fsync: class B, crash-only), under the
-//! pin/GC lock. The objects of a snapshot that leaves the pin, which no pin
-//! names any more and which no namespace but `data` records, are removed
-//! right away ([`Store::keep_snapshots`]).
+//! `pins/prov/<ref>` keeps the file bytes of the [`KEEP_SNAPSHOTS`] newest
+//! snapshots of a data ref: for each, newest first, a `# snapshot <digest>`
+//! line (a comment: [`Store::pinned`] reads only lines that are digests)
+//! followed by the manifest's digest and every file's. Then a `# manifests`
+//! line and the manifest of every snapshot the ref ever had: manifests are
+//! pinned forever (decision D3, class A), only file bytes are capped. A pin
+//! file is replaced whole (temporary file and `rename`, no fsync:
+//! crash-only), under the pin/GC lock. The file objects of a snapshot that
+//! leaves the newest three, which no pin names any more and which no
+//! namespace but `data` records, are removed right away
+//! ([`Store::keep_snapshots`]); its manifest stays.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -50,6 +53,18 @@ pub const KEEP_SNAPSHOTS: usize = 3;
 
 /// The comment line that opens a snapshot in a pin file.
 const SNAPSHOT_LINE: &str = "# snapshot ";
+
+/// The comment line that opens the manifests section of a pin file.
+const MANIFESTS_LINE: &str = "# manifests";
+
+/// A data ref's pin, as read back.
+#[derive(Debug, Default)]
+struct SnapshotPin {
+    /// The kept snapshots, newest first, each with what is pinned for it.
+    snapshots: Vec<(Digest, Vec<Digest>)>,
+    /// Every manifest pinned forever.
+    manifests: Vec<Digest>,
+}
 
 /// One regular file of a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,47 +436,69 @@ impl Store {
         Ok(manifest)
     }
 
-    /// The snapshots `pins/prov/<name>` keeps, newest first.
+    /// The snapshots `pins/prov/<name>` keeps whole (their manifests and
+    /// their files' bytes), newest first: at most [`KEEP_SNAPSHOTS`].
     pub fn kept_snapshots(&self, name: &str) -> Result<Vec<Digest>, CasError> {
         Ok(self
             .snapshot_pin(name)?
+            .snapshots
             .into_iter()
             .map(|(snapshot, _)| snapshot)
             .collect())
     }
 
-    /// The pin of `name`: each snapshot with every digest pinned for it.
-    fn snapshot_pin(&self, name: &str) -> Result<Vec<(Digest, Vec<Digest>)>, CasError> {
+    /// Every manifest `pins/prov/<name>` pins: the manifest of every
+    /// snapshot the ref ever kept, pinned forever (D3), sorted.
+    pub fn kept_manifests(&self, name: &str) -> Result<Vec<Digest>, CasError> {
+        let pin = self.snapshot_pin(name)?;
+        let mut manifests: BTreeSet<Digest> = pin.manifests.into_iter().collect();
+        manifests.extend(pin.snapshots.into_iter().map(|(snapshot, _)| snapshot));
+        Ok(manifests.into_iter().collect())
+    }
+
+    /// The pin of `name`: each kept snapshot with every digest pinned for
+    /// it, and the manifests section.
+    fn snapshot_pin(&self, name: &str) -> Result<SnapshotPin, CasError> {
         check_name("pin name", name)?;
         let path = self.root().join("pins").join(PROV_PIN_OWNER).join(name);
         let mut text = String::new();
+        let mut pin = SnapshotPin::default();
         match open_nofollow(&path).and_then(|mut file| file.read_to_string(&mut text)) {
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(pin),
             Err(error) => return Err(error.into()),
         }
-        let mut pin: Vec<(Digest, Vec<Digest>)> = Vec::new();
+        let mut in_manifests = false;
         for line in text.lines() {
-            if let Some(snapshot) = line.strip_prefix(SNAPSHOT_LINE) {
-                pin.push((Digest::parse(snapshot.trim())?, Vec::new()));
-            } else if let (Some((_, digests)), Ok(digest)) =
-                (pin.last_mut(), Digest::parse(line.trim()))
-            {
-                digests.push(digest);
+            if line == MANIFESTS_LINE {
+                in_manifests = true;
+            } else if let Some(snapshot) = line.strip_prefix(SNAPSHOT_LINE) {
+                in_manifests = false;
+                pin.snapshots
+                    .push((Digest::parse(snapshot.trim())?, Vec::new()));
+            } else if let Ok(digest) = Digest::parse(line.trim()) {
+                if in_manifests {
+                    pin.manifests.push(digest);
+                } else if let Some((_, digests)) = pin.snapshots.last_mut() {
+                    digests.push(digest);
+                }
             }
         }
         Ok(pin)
     }
 
     /// Make `pins/prov/<name>` keep the [`KEEP_SNAPSHOTS`] first of
-    /// `snapshots` (newest first; a digest twice counts once): each one's
-    /// manifest and, when its manifest is here, its files. The pin is
-    /// replaced whole under the pin/GC lock. Then the objects of the
-    /// snapshots that left it, which no pin names any more and which no
+    /// `snapshots` (newest first; a digest twice counts once) whole: each
+    /// one's manifest and, when its manifest is here, its files. Every
+    /// manifest the pin ever named, and every one of `snapshots`, stays
+    /// pinned forever in its manifests section (D3: a manifest is class A;
+    /// only file bytes are capped). The pin is replaced whole under the
+    /// pin/GC lock. Then the file objects of the snapshots that left the
+    /// newest [`KEEP_SNAPSHOTS`], which no pin names any more and which no
     /// namespace but `data` records, are removed (object first, record
-    /// second). A run killed at any instant leaves the old pin or the new
-    /// one, and at worst objects no pin names (a later run with a `data`
-    /// quota, [`Store::gc`], collects them).
+    /// second); their manifests stay. A run killed at any instant leaves
+    /// the old pin or the new one, and at worst objects no pin names (a
+    /// later run with a `data` quota, [`Store::gc`], collects them).
     pub fn keep_snapshots(&self, name: &str, snapshots: &[Digest]) -> Result<KeepReport, CasError> {
         check_name("pin name", name)?;
         let mut kept: Vec<Digest> = Vec::new();
@@ -473,15 +510,19 @@ impl Store {
                 kept.push(snapshot.clone());
             }
         }
+        let lock = self.lock_gc()?;
+        let before = self.snapshot_pin(name)?;
+        let mut manifests: BTreeSet<Digest> = before.manifests.iter().cloned().collect();
+        manifests.extend(before.snapshots.iter().map(|(snapshot, _)| snapshot.clone()));
+        manifests.extend(snapshots.iter().cloned());
         let mut text = format!("# {MANIFEST_V1} snapshots of {name}, newest first\n");
-        let mut pinned_now: BTreeSet<Digest> = BTreeSet::new();
+        let mut pinned_now: BTreeSet<Digest> = manifests.clone();
         for snapshot in &kept {
             text.push_str(SNAPSHOT_LINE);
             text.push_str(&snapshot.to_string());
             text.push('\n');
             text.push_str(&snapshot.to_string());
             text.push('\n');
-            pinned_now.insert(snapshot.clone());
             let objects = match self.snapshot_manifest(snapshot) {
                 Ok(manifest) => manifest.object_digests(),
                 Err(error) if error.is_not_found() => BTreeSet::new(),
@@ -493,8 +534,12 @@ impl Store {
                 pinned_now.insert(digest);
             }
         }
-        let lock = self.lock_gc()?;
-        let before = self.snapshot_pin(name)?;
+        text.push_str(MANIFESTS_LINE);
+        text.push('\n');
+        for manifest in &manifests {
+            text.push_str(&manifest.to_string());
+            text.push('\n');
+        }
         let directory = self.root().join("pins").join(PROV_PIN_OWNER);
         plain_dir(&directory)?;
         let (mut file, staged) = loop {
@@ -515,16 +560,14 @@ impl Store {
             kept: kept.clone(),
             ..KeepReport::default()
         };
+        // Only file objects are candidates: a manifest is never removed.
         let mut candidates: BTreeSet<Digest> = BTreeSet::new();
-        for (snapshot, digests) in before {
+        for (snapshot, digests) in before.snapshots {
             if kept.contains(&snapshot) {
                 continue;
             }
             report.dropped.push(snapshot.clone());
-            candidates.insert(snapshot);
-            for digest in digests {
-                candidates.insert(digest);
-            }
+            candidates.extend(digests.into_iter().filter(|digest| *digest != snapshot));
         }
         if !candidates.is_empty() {
             let pinned = self.pinned()?;
