@@ -295,7 +295,13 @@ pub(crate) fn decide(
         .filter(|_| driver.id() != "claude")
         .and_then(|reading| reading.rule.as_deref());
     let trust_rule = herdr_rule == Some("trust_prompt");
-    if screen.state != ScreenState::Permission && !trust_rule {
+    if trust_rule {
+        // An independent reading of the trust dialog, on both reads: the
+        // host's rule alone is never enough.
+        if driver.startup_answer(first).is_none() || driver.startup_answer(second).is_none() {
+            return Decision::Nothing("the engine's own reading shows no trust dialog");
+        }
+    } else if screen.state != ScreenState::Permission {
         return Decision::Nothing("the engine's own reading shows no dialog");
     }
     let prompts: (Option<Prompt>, Option<Prompt>) = (detect(first), detect(second));
@@ -387,6 +393,8 @@ pub(crate) trait World {
     fn capture(&self, live: &Live) -> Result<String, String>;
     /// The pause between the two reads.
     fn pause(&self);
+    /// The workspace the execution runs in.
+    fn workspace(&self, live: &Live) -> Result<WorkspaceId, String>;
     /// The host's reading of the agent, if it has one.
     fn reading(&self, live: &Live) -> Option<AgentReading>;
     /// Submit a key command; its id (the first one for a key used before).
@@ -450,7 +458,7 @@ impl Resolver {
                 continue;
             };
             let reading = world.reading(&live);
-            let workspace = workspace_of(&live.agent)?;
+            let workspace = world.workspace(&live)?;
             match decide(
                 &live.session,
                 &live.engine,
@@ -627,6 +635,10 @@ impl World for Fleet<'_> {
 
     fn pause(&self) {
         std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    fn workspace(&self, live: &Live) -> Result<WorkspaceId, String> {
+        workspace_of(&live.agent)
     }
 
     fn reading(&self, live: &Live) -> Option<AgentReading> {
