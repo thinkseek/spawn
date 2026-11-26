@@ -262,6 +262,118 @@ fn head_of(refs: &Value, name: &str) -> Value {
         .unwrap_or_else(|| panic!("no ref {name}: {refs}"))
 }
 
+/// The blast of the corrupted snapshot names exactly the merge output that
+/// read it; the code commit reaches every data snapshot made with it.
+fn check_blast(schema: &str, bad: &str) {
+    // blast of the bad snapshot: exactly merge-3's output that read it.
+    let blast = spawn_json(schema, &["prov", "blast", bad]);
+    let snapshots = blast["snapshots"].as_array().expect("snapshots");
+    let named: Vec<(String, i64)> = snapshots
+        .iter()
+        .map(|row| {
+            (
+                row["ref"].as_str().expect("ref").to_string(),
+                row["rev"].as_i64().expect("rev"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named,
+        [("clean".to_string(), 2), ("merge-3".to_string(), 2)],
+        "{blast}"
+    );
+    assert_eq!(snapshots[1]["via"], "used");
+    let used: Vec<&Value> = blast["used"].as_array().expect("used").iter().collect();
+    assert_eq!(used.len(), 1, "{blast}");
+    // From the code commit (indexed in no Git domain): every data snapshot
+    // made with it.
+    let from_code = spawn_json(schema, &["prov", "blast", CODE]);
+    let reached: BTreeSet<String> = from_code["snapshots"]
+        .as_array()
+        .expect("snapshots")
+        .iter()
+        .map(|row| row["ref"].as_str().expect("ref").to_string())
+        .collect();
+    assert_eq!(reached.len(), 1 + SHARDS / GROUP, "{from_code}");
+    assert!(reached.contains("clean") && reached.contains("merge-9"));
+}
+
+/// After the rollback: the affected shard and merge rerun, and the
+/// validator passes.
+fn rerun_and_validate(schema: &str, scratch: &Scratch, pipeline: &Pipeline, good: &str) {
+    // Rerun the affected shard: the directory is the head again, so the
+    // snapshot records nothing; rerun the affected merge: it records.
+    pipeline.clean_shard(37);
+    let rerun = snapshot_clean(schema, scratch, pipeline);
+    assert_eq!(rerun["recorded"], false, "{rerun}");
+    assert_eq!(rerun["snapshot"], good);
+    pipeline.merge_group(3);
+    let merged = snapshot_group(schema, scratch, pipeline, 3);
+    assert_eq!(
+        (&merged["recorded"], &merged["rev"]),
+        (&json!(true), &json!(3))
+    );
+    assert!(pipeline.invalid_groups().is_empty(), "the validator passes");
+    let refs = refs_of(schema, scratch);
+    assert_eq!(
+        refs["refs"].as_array().map(Vec::len),
+        Some(2 + SHARDS / GROUP)
+    );
+    // Its third revision holds what its first held: two snapshots, each
+    // kept once.
+    let merge_three = head_of(&refs, "merge-3");
+    assert_eq!(merge_three["kept"].as_array().map(Vec::len), Some(2), "{merge_three}");
+    assert_eq!(merge_three["revisions"], 3);
+    let cas = Store::open(scratch.join("cas")).expect("the store");
+    cas.verify_snapshot(&spawn_cas::Digest::parse(good).expect("digest"))
+        .expect("the good snapshot is whole");
+}
+
+/// A kept snapshot rolls back; one never the ref's, or stored digest-only,
+/// is refused.
+fn other_rollbacks(schema: &str, scratch: &Scratch, data: &Path, snapshots: &[String]) {
+    let cas_dir = scratch.cas();
+    // A kept one rolls back.
+    let moved = spawn_json(
+        schema,
+        &[
+            "prov",
+            "rollback",
+            "model",
+            &snapshots[1],
+            "--cas",
+            &cas_dir,
+        ],
+    );
+    assert_eq!(
+        (&moved["recorded"], &moved["rev"]),
+        (&json!(true), &json!(5))
+    );
+    // Never a snapshot of the ref: refused too.
+    let other = sha256_of(b"something else").to_string();
+    assert!(
+        refused(&spawn(
+            schema,
+            &["prov", "rollback", "model", &other, "--cas", &cas_dir]
+        ))
+        .contains("never a snapshot")
+    );
+    // A digest-only snapshot never stored its bytes: a rollback to it is
+    // refused while it is kept.
+    write(&data.join("weights.bin"), "version 5");
+    let light = snapshot(schema, scratch, data, "model", &["--digest-only"]);
+    write(&data.join("weights.bin"), "version 6");
+    snapshot(schema, scratch, data, "model", &[]);
+    let light = light["snapshot"].as_str().expect("snapshot");
+    assert!(
+        refused(&spawn(
+            schema,
+            &["prov", "rollback", "model", light, "--cas", &cas_dir]
+        ))
+        .contains("digest-only")
+    );
+}
+
 #[test]
 fn the_toy_pipeline_blast_names_the_affected_merge_and_rollback_repairs_it() {
     let schema = TestSchema::new("prov_data_pipeline");
@@ -322,37 +434,7 @@ fn the_toy_pipeline_blast_names_the_affected_merge_and_rollback_repairs_it() {
     }
     assert_eq!(pipeline.invalid_groups(), [3]);
 
-    // blast of the bad snapshot: exactly merge-3's output that read it.
-    let blast = spawn_json(&schema, &["prov", "blast", &bad]);
-    let snapshots = blast["snapshots"].as_array().expect("snapshots");
-    let named: Vec<(String, i64)> = snapshots
-        .iter()
-        .map(|row| {
-            (
-                row["ref"].as_str().expect("ref").to_string(),
-                row["rev"].as_i64().expect("rev"),
-            )
-        })
-        .collect();
-    assert_eq!(
-        named,
-        [("clean".to_string(), 2), ("merge-3".to_string(), 2)],
-        "{blast}"
-    );
-    assert_eq!(snapshots[1]["via"], "used");
-    let used: Vec<&Value> = blast["used"].as_array().expect("used").iter().collect();
-    assert_eq!(used.len(), 1, "{blast}");
-    // From the code commit (indexed in no Git domain): every data snapshot
-    // made with it.
-    let from_code = spawn_json(&schema, &["prov", "blast", CODE]);
-    let reached: BTreeSet<String> = from_code["snapshots"]
-        .as_array()
-        .expect("snapshots")
-        .iter()
-        .map(|row| row["ref"].as_str().expect("ref").to_string())
-        .collect();
-    assert_eq!(reached.len(), 1 + SHARDS / GROUP, "{from_code}");
-    assert!(reached.contains("clean") && reached.contains("merge-9"));
+    check_blast(&schema, &bad);
 
     // The plan writes nothing.
     let before = rows(&mut client);
@@ -397,32 +479,7 @@ fn the_toy_pipeline_blast_names_the_affected_merge_and_rollback_repairs_it() {
     );
     assert_eq!(again["recorded"], false, "the head already: {again}");
 
-    // Rerun the affected shard: the directory is the head again, so the
-    // snapshot records nothing; rerun the affected merge: it records.
-    pipeline.clean_shard(37);
-    let rerun = snapshot_clean(&schema, &scratch, &pipeline);
-    assert_eq!(rerun["recorded"], false, "{rerun}");
-    assert_eq!(rerun["snapshot"], good.as_str());
-    pipeline.merge_group(3);
-    let merged = snapshot_group(&schema, &scratch, &pipeline, 3);
-    assert_eq!(
-        (&merged["recorded"], &merged["rev"]),
-        (&json!(true), &json!(3))
-    );
-    assert!(pipeline.invalid_groups().is_empty(), "the validator passes");
-    let refs = refs_of(&schema, &scratch);
-    assert_eq!(
-        refs["refs"].as_array().map(Vec::len),
-        Some(2 + SHARDS / GROUP)
-    );
-    // Its third revision holds what its first held: two snapshots, each
-    // kept once.
-    let merge3 = head_of(&refs, "merge-3");
-    assert_eq!(merge3["kept"].as_array().map(Vec::len), Some(2), "{merge3}");
-    assert_eq!(merge3["revisions"], 3);
-    let cas = Store::open(scratch.join("cas")).expect("the store");
-    cas.verify_snapshot(&spawn_cas::Digest::parse(&good).expect("digest"))
-        .expect("the good snapshot is whole");
+    rerun_and_validate(&schema, &scratch, &pipeline, &good);
     drop(store);
 }
 
@@ -616,46 +673,9 @@ fn the_pin_keeps_three_snapshots_and_a_rollback_to_the_fourth_is_refused() {
         before,
         "a refused rollback records nothing"
     );
-    // A kept one rolls back.
-    let moved = spawn_json(
-        &schema,
-        &[
-            "prov",
-            "rollback",
-            "model",
-            &snapshots[1],
-            "--cas",
-            &cas_dir,
-        ],
-    );
-    assert_eq!(
-        (&moved["recorded"], &moved["rev"]),
-        (&json!(true), &json!(5))
-    );
-    // Never a snapshot of the ref: refused too.
-    let other = sha256_of(b"something else").to_string();
-    assert!(
-        refused(&spawn(
-            &schema,
-            &["prov", "rollback", "model", &other, "--cas", &cas_dir]
-        ))
-        .contains("never a snapshot")
-    );
-    // A digest-only snapshot never stored its bytes: a rollback to it is
-    // refused while it is kept.
-    write(&data.join("weights.bin"), "version 5");
-    let light = snapshot(&schema, &scratch, &data, "model", &["--digest-only"]);
-    write(&data.join("weights.bin"), "version 6");
-    snapshot(&schema, &scratch, &data, "model", &[]);
-    let light = light["snapshot"].as_str().expect("snapshot");
-    assert!(
-        refused(&spawn(
-            &schema,
-            &["prov", "rollback", "model", light, "--cas", &cas_dir]
-        ))
-        .contains("digest-only")
-    );
+    other_rollbacks(&schema, &scratch, &data, &snapshots);
     drop(store);
+}    drop(store);
 }
 
 #[test]
