@@ -170,6 +170,15 @@ pub(crate) const USAGE: &str = "usage:
       (owner: a queued, unstarted task of a busy resident moves to an idle resident of the
        same pool, recorded as task.stolen; refused, naming the rule, otherwise)
   spawn task stages --id N   (each stage with its verdict, time, and how long since the one before)
+  spawn task commits <id> [--json]
+      (lists commits ahead of main on the task's preserved ref, distinguishing author vs
+       synthetic checkpoint commits; readable table by default, stable JSON with --json)
+  spawn task diff <id> [--stat]
+      (shows git diff main...<resolved_ref> in the mission bare repository; --stat for summary)
+  spawn task land <id> [--ff-only | --squash] [--dry-run] [--json]
+      (lands the task's preserved ref onto refs/heads/main in the mission bare repository;
+       defaults to --ff-only, --squash creates one clean commit without checkpoint history,
+       --dry-run validates without updating refs/heads/main)
   spawn resident propose --name <name> --charter <text> [--pool <pool>]
   spawn resident approve --name <name>
   spawn resident retire --name <name>";
@@ -2196,6 +2205,14 @@ fn put_in_source(source: &str, repo: &str, wanted: &str) -> Result<(String, Stri
 
 /// `spawn task ...`
 pub(crate) fn task(rest: &[String]) -> Result<i32, String> {
+    if let Some((verb, tail)) = rest.split_first() {
+        match verb.as_str() {
+            "commits" => return task_commits_cmd(tail),
+            "diff" => return task_diff_cmd(tail),
+            "land" => return task_land_cmd(tail),
+            _ => {}
+        }
+    }
     let (verb, flags) = split_task(rest)?;
     let store = open_store()?;
     let err = |error: spawn_core::port::StoreError| error.to_string();
@@ -2294,6 +2311,920 @@ pub(crate) fn resident(rest: &[String]) -> Result<i32, String> {
         _ => return Err(USAGE.to_string()),
     }
     print(&json!({ "resident": name, verb: true }));
+    Ok(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LandMode {
+    FfOnly,
+    Squash,
+}
+
+impl LandMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FfOnly => "ff-only",
+            Self::Squash => "squash",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TaskCommitsArgs {
+    task_id: i64,
+    json: bool,
+    root: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TaskDiffArgs {
+    task_id: i64,
+    stat: bool,
+    root: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TaskLandArgs {
+    task_id: i64,
+    mode: LandMode,
+    dry_run: bool,
+    json: bool,
+    root: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewCommit {
+    sha: String,
+    short_sha: String,
+    author_name: String,
+    author_email: String,
+    authored_at: String,
+    subject: String,
+    is_checkpoint: bool,
+}
+
+struct TaskRepoContext {
+    task_id: i64,
+    mission_id: i64,
+    agent_id: String,
+    brief: String,
+    git_dir: std::path::PathBuf,
+    is_bare: bool,
+    landable: bool,
+}
+
+struct TempDirGuard {
+    path: std::path::PathBuf,
+}
+
+impl TempDirGuard {
+    fn create(prefix: &str) -> Result<Self, String> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path)
+            .map_err(|error| format!("create temporary directory {}: {error}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn parse_positive_task_id(raw: &str, flag_hint: &str) -> Result<i64, String> {
+    match raw.parse::<i64>() {
+        Ok(value) if value > 0 => Ok(value),
+        _ => Err(format!("{flag_hint} must be a positive number, not {raw}")),
+    }
+}
+
+fn parse_task_review_common(
+    rest: &[String],
+    synopsis: &str,
+    allowed_switches: &[&str],
+) -> Result<(i64, Option<String>, std::collections::BTreeSet<String>), String> {
+    let mut positional_id: Option<i64> = None;
+    let mut flag_id: Option<i64> = None;
+    let mut root: Option<String> = None;
+    let mut switches = std::collections::BTreeSet::new();
+
+    let mut iter = rest.iter();
+    while let Some(word) = iter.next() {
+        match word.as_str() {
+            flag @ ("--id" | "--root") => {
+                let Some(value) = iter.next() else {
+                    return Err(format!("{flag} needs a value\n{synopsis}"));
+                };
+                if value.starts_with("--") {
+                    return Err(format!("{flag} needs a value, found {value}\n{synopsis}"));
+                }
+                if flag == "--id" {
+                    flag_id = Some(parse_positive_task_id(value, "--id")?);
+                } else {
+                    root = Some(value.clone());
+                }
+            }
+            word if word.starts_with("--") => {
+                let name = &word[2..];
+                if allowed_switches.contains(&name) {
+                    switches.insert(name.to_string());
+                } else {
+                    return Err(format!("unknown flag {word}\n{synopsis}"));
+                }
+            }
+            word if word.starts_with('-') => {
+                return Err(format!("unknown flag {word}\n{synopsis}"));
+            }
+            positional => {
+                if positional_id.is_some() {
+                    return Err(format!(
+                        "unexpected positional argument {positional}\n{synopsis}"
+                    ));
+                }
+                positional_id = Some(parse_positive_task_id(positional, "<id>")?);
+            }
+        }
+    }
+
+    let task_id = match (positional_id, flag_id) {
+        (Some(_), Some(_)) => {
+            return Err(format!("give <id> once (positional or --id)\n{synopsis}"));
+        }
+        (Some(value), None) | (None, Some(value)) => value,
+        (None, None) => return Err(format!("task <id> is required\n{synopsis}")),
+    };
+    Ok((task_id, root, switches))
+}
+
+fn parse_task_commits_args(rest: &[String]) -> Result<TaskCommitsArgs, String> {
+    let synopsis = "usage: spawn task commits <id> [--json]";
+    let (task_id, root, switches) = parse_task_review_common(rest, synopsis, &["json"])?;
+    Ok(TaskCommitsArgs {
+        task_id,
+        json: switches.contains("json"),
+        root,
+    })
+}
+
+fn parse_task_diff_args(rest: &[String]) -> Result<TaskDiffArgs, String> {
+    let synopsis = "usage: spawn task diff <id> [--stat]";
+    let (task_id, root, switches) = parse_task_review_common(rest, synopsis, &["stat"])?;
+    Ok(TaskDiffArgs {
+        task_id,
+        stat: switches.contains("stat"),
+        root,
+    })
+}
+
+fn parse_task_land_args(rest: &[String]) -> Result<TaskLandArgs, String> {
+    let synopsis = "usage: spawn task land <id> [--ff-only | --squash] [--dry-run] [--json]";
+    let (task_id, root, switches) =
+        parse_task_review_common(rest, synopsis, &["ff-only", "squash", "dry-run", "json"])?;
+    let ff_only = switches.contains("ff-only");
+    let squash = switches.contains("squash");
+    if ff_only && squash {
+        return Err(format!(
+            "use either --ff-only or --squash, not both\n{synopsis}"
+        ));
+    }
+    let mode = if squash {
+        LandMode::Squash
+    } else {
+        LandMode::FfOnly
+    };
+    Ok(TaskLandArgs {
+        task_id,
+        mode,
+        dry_run: switches.contains("dry-run"),
+        json: switches.contains("json"),
+        root,
+    })
+}
+
+fn run_git_raw(git_dir: &std::path::Path, args: &[&str], context: &str) -> Result<String, String> {
+    let output = crate::sources::controller_git()
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(args)
+        .output()
+        .map_err(|error| format!("run git {context}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {context} in {}: {}",
+            git_dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn run_work_git(
+    work_dir: &std::path::Path,
+    args: &[&str],
+    context: &str,
+) -> Result<String, String> {
+    let output = crate::sources::controller_git()
+        .arg("-C")
+        .arg(work_dir)
+        .args(args)
+        .output()
+        .map_err(|error| format!("run git {context}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {context}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn verify_bare_repo(path: &std::path::Path) -> Result<bool, String> {
+    let out = run_git_raw(
+        path,
+        &["rev-parse", "--is-bare-repository"],
+        "rev-parse --is-bare-repository",
+    )?;
+    Ok(out.trim() == "true")
+}
+
+fn resolve_local_source_repo(
+    source_path: &std::path::Path,
+) -> Result<(std::path::PathBuf, bool), String> {
+    if !source_path.exists() {
+        return Err(format!(
+            "mission repository {} does not exist",
+            source_path.display()
+        ));
+    }
+    let git_dir = if source_path.join("HEAD").is_file() && source_path.join("objects").is_dir() {
+        source_path.to_path_buf()
+    } else if source_path.join(".git").exists() {
+        source_path.join(".git")
+    } else {
+        source_path.to_path_buf()
+    };
+    let is_bare = verify_bare_repo(&git_dir)?;
+    Ok((git_dir, is_bare))
+}
+
+fn load_task_repo(
+    store: &spawn_postgres::PostgresStore,
+    task_id: i64,
+    root_override: Option<&str>,
+) -> Result<TaskRepoContext, String> {
+    let err = |error: spawn_core::port::StoreError| error.to_string();
+    let task = store
+        .objective_task(task_id)
+        .map_err(err)?
+        .ok_or_else(|| format!("task #{task_id} not found"))?;
+    let mission_id = task["mission_id"]
+        .as_i64()
+        .ok_or_else(|| format!("task #{task_id} has no mission_id"))?;
+    let agent_id = task["agent_id"].as_str().unwrap_or_default().to_string();
+    let brief = task["brief"].as_str().unwrap_or_default().to_string();
+    let mission = store
+        .mission_by_id(mission_id)
+        .map_err(err)?
+        .ok_or_else(|| format!("mission #{mission_id} for task #{task_id} not found"))?;
+    let source = mission["sources"]
+        .as_array()
+        .and_then(|sources| sources.first())
+        .and_then(Value::as_str);
+
+    let (git_dir, is_bare, landable) = match source {
+        Some(path) if path.starts_with('/') && !path.contains("://") => {
+            let (dir, bare) = resolve_local_source_repo(std::path::Path::new(path))?;
+            (dir, bare, bare)
+        }
+        other_source => {
+            let root = root_override
+                .map(str::to_string)
+                .or_else(|| crate::config::env_value("SPAWN_WORKSPACE_ROOT"))
+                .ok_or_else(|| {
+                    format!(
+                        "mission #{mission_id} has no local source directory; pass --root <dir> or set SPAWN_WORKSPACE_ROOT"
+                    )
+                })?;
+            let mirror = crate::sources::mirror_path(std::path::Path::new(&root), other_source)
+                .map_err(|error| error.to_string())?;
+            if !mirror.exists() {
+                return Err(format!(
+                    "mission bare repository {} does not exist",
+                    mirror.display()
+                ));
+            }
+            let bare = verify_bare_repo(&mirror)?;
+            (mirror, bare, bare && other_source.is_none())
+        }
+    };
+
+    Ok(TaskRepoContext {
+        task_id,
+        mission_id,
+        agent_id,
+        brief,
+        git_dir,
+        is_bare,
+        landable,
+    })
+}
+
+fn candidate_task_refs(task_id: i64, agent_id: &str) -> Vec<String> {
+    let mut refs = vec![spawn_host::git::task_head_ref(task_id, "head")];
+    if !agent_id.is_empty() {
+        refs.push(spawn_host::git::worker_head_ref(agent_id));
+        refs.push(format!("refs/heads/spawn/{agent_id}"));
+    }
+    refs
+}
+
+fn rev_parse_commit(git_dir: &std::path::Path, rev: &str) -> Result<Option<String>, String> {
+    let target = format!("{rev}^{{commit}}");
+    let output = crate::sources::controller_git()
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &target,
+        ])
+        .output()
+        .map_err(|error| format!("run git rev-parse: {error}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(is_commit(&sha).then_some(sha))
+}
+
+fn resolve_main_sha(git_dir: &std::path::Path) -> Result<String, String> {
+    rev_parse_commit(git_dir, "refs/heads/main")?.ok_or_else(|| {
+        format!(
+            "refs/heads/main not found in mission repository {}",
+            git_dir.display()
+        )
+    })
+}
+
+fn resolve_preserved_ref(
+    git_dir: &std::path::Path,
+    task_id: i64,
+    agent_id: &str,
+) -> Result<(String, String), String> {
+    let candidates = candidate_task_refs(task_id, agent_id);
+    for reference in &candidates {
+        if let Some(sha) = rev_parse_commit(git_dir, reference)? {
+            return Ok((reference.clone(), sha));
+        }
+    }
+    Err(format!(
+        "no preserved ref found for task #{task_id} in {} (checked: {})",
+        git_dir.display(),
+        candidates.join(", ")
+    ))
+}
+
+fn is_checkpoint_subject(subject: &str) -> bool {
+    let trimmed = subject.trim();
+    crate::provenance::index::checkpoint_execution(trimmed).is_some()
+        || trimmed.eq_ignore_ascii_case("spawn checkpoint")
+        || trimmed
+            .to_ascii_lowercase()
+            .starts_with("spawn checkpoint ")
+}
+
+fn list_commits_ahead(
+    git_dir: &std::path::Path,
+    base_sha: &str,
+    head_sha: &str,
+) -> Result<Vec<ReviewCommit>, String> {
+    let range = format!("{base_sha}..{head_sha}");
+    let raw = run_git_raw(
+        git_dir,
+        &[
+            "log",
+            "-z",
+            "--format=%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s",
+            &range,
+            "--",
+        ],
+        "log",
+    )?;
+    let mut commits = Vec::new();
+    for entry in raw.split('\0') {
+        let trimmed = entry.trim_matches(|ch| ch == '\n' || ch == '\r');
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut fields = trimmed.splitn(6, '\x1f');
+        let sha = fields.next().unwrap_or_default().to_string();
+        let short_sha = fields.next().unwrap_or_default().to_string();
+        let author_name = fields.next().unwrap_or_default().to_string();
+        let author_email = fields.next().unwrap_or_default().to_string();
+        let authored_at = fields.next().unwrap_or_default().to_string();
+        let subject = fields.next().unwrap_or_default().to_string();
+        let is_checkpoint = is_checkpoint_subject(&subject);
+        commits.push(ReviewCommit {
+            sha,
+            short_sha,
+            author_name,
+            author_email,
+            authored_at,
+            subject,
+            is_checkpoint,
+        });
+    }
+    Ok(commits)
+}
+
+fn commit_counts(commits: &[ReviewCommit]) -> (usize, usize, usize) {
+    let total = commits.len();
+    let checkpoints = commits.iter().filter(|commit| commit.is_checkpoint).count();
+    let authors = total.saturating_sub(checkpoints);
+    (total, authors, checkpoints)
+}
+
+fn short_sha_prefix(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+fn is_ancestor(
+    git_dir: &std::path::Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, String> {
+    let status = crate::sources::controller_git()
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .status()
+        .map_err(|error| format!("run git merge-base: {error}"))?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        other => Err(format!("git merge-base exited unexpectedly ({other:?})")),
+    }
+}
+
+fn commits_json_payload(
+    ctx: &TaskRepoContext,
+    resolved_ref: &str,
+    base_sha: &str,
+    head_sha: &str,
+    commits: &[ReviewCommit],
+) -> Value {
+    let (total, authors, checkpoints) = commit_counts(commits);
+    let rows: Vec<Value> = commits
+        .iter()
+        .map(|commit| {
+            json!({
+                "sha": commit.sha,
+                "short_sha": commit.short_sha,
+                "kind": if commit.is_checkpoint { "checkpoint" } else { "author" },
+                "is_checkpoint": commit.is_checkpoint,
+                "author_name": commit.author_name,
+                "author_email": commit.author_email,
+                "authored_at": commit.authored_at,
+                "subject": commit.subject,
+            })
+        })
+        .collect();
+    json!({
+        "schema_version": 1,
+        "task_id": ctx.task_id,
+        "mission_id": ctx.mission_id,
+        "agent_id": if ctx.agent_id.is_empty() { Value::Null } else { json!(ctx.agent_id) },
+        "resolved_ref": resolved_ref,
+        "base_ref": "refs/heads/main",
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "commit_count": total,
+        "author_commit_count": authors,
+        "checkpoint_commit_count": checkpoints,
+        "commits": rows,
+    })
+}
+
+fn format_task_commits_table(
+    task_id: i64,
+    resolved_ref: &str,
+    base_sha: &str,
+    head_sha: &str,
+    commits: &[ReviewCommit],
+) -> String {
+    use std::fmt::Write as _;
+
+    let (total, authors, checkpoints) = commit_counts(commits);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "TASK #{task_id}  ref={resolved_ref}  base={}..{}  commits: {total} ({authors} author, {checkpoints} checkpoint)",
+        short_sha_prefix(base_sha),
+        short_sha_prefix(head_sha)
+    );
+    if commits.is_empty() {
+        out.push_str("  (no commits ahead of refs/heads/main)\n");
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "  {:<12} {:<11} {:<22} SUBJECT",
+        "SHA", "KIND", "AUTHOR"
+    );
+    for commit in commits {
+        let kind = if commit.is_checkpoint {
+            "checkpoint"
+        } else {
+            "author"
+        };
+        let _ = writeln!(
+            out,
+            "  {:<12} {:<11} {:<22} {}",
+            short_sha_prefix(&commit.sha),
+            kind,
+            commit.author_name,
+            commit.subject
+        );
+    }
+    out
+}
+
+fn task_commits_cmd(rest: &[String]) -> Result<i32, String> {
+    let args = parse_task_commits_args(rest)?;
+    let store = open_store()?;
+    let ctx = load_task_repo(&store, args.task_id, args.root.as_deref())?;
+    let base_sha = resolve_main_sha(&ctx.git_dir)?;
+    let (resolved_ref, head_sha) = resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id)?;
+    let commits = list_commits_ahead(&ctx.git_dir, &base_sha, &head_sha)?;
+    if args.json {
+        print(&commits_json_payload(
+            &ctx,
+            &resolved_ref,
+            &base_sha,
+            &head_sha,
+            &commits,
+        ));
+    } else {
+        print!(
+            "{}",
+            format_task_commits_table(ctx.task_id, &resolved_ref, &base_sha, &head_sha, &commits)
+        );
+    }
+    Ok(0)
+}
+
+fn task_diff_cmd(rest: &[String]) -> Result<i32, String> {
+    let args = parse_task_diff_args(rest)?;
+    let store = open_store()?;
+    let ctx = load_task_repo(&store, args.task_id, args.root.as_deref())?;
+    let base_sha = resolve_main_sha(&ctx.git_dir)?;
+    let (_resolved_ref, head_sha) =
+        resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id)?;
+    let range = format!("{base_sha}...{head_sha}");
+    let mut git_args = vec!["diff", "--no-ext-diff"];
+    if args.stat {
+        git_args.push("--stat");
+    }
+    git_args.push(&range);
+    git_args.push("--");
+    let diff = run_git_raw(&ctx.git_dir, &git_args, "diff")?;
+    print!("{diff}");
+    Ok(0)
+}
+
+fn build_clean_squash_message(
+    task_id: i64,
+    brief: &str,
+    head_sha: &str,
+    commits: &[ReviewCommit],
+) -> String {
+    use std::fmt::Write as _;
+
+    let author_commits: Vec<&ReviewCommit> = commits
+        .iter()
+        .filter(|commit| !commit.is_checkpoint && !commit.subject.trim().is_empty())
+        .collect();
+    let brief_title = brief
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !is_checkpoint_subject(line));
+    let subject = if author_commits.len() == 1 {
+        author_commits[0].subject.trim().to_string()
+    } else if let Some(title) = brief_title {
+        format!("{title} (task #{task_id})")
+    } else if let Some(first) = author_commits.first() {
+        first.subject.trim().to_string()
+    } else {
+        format!("Land task #{task_id}")
+    };
+
+    let mut msg = format!("{subject}\n\n");
+    if author_commits.len() > 1 {
+        for commit in &author_commits {
+            let _ = writeln!(
+                msg,
+                "- {} {}",
+                short_sha_prefix(&commit.sha),
+                commit.subject.trim()
+            );
+        }
+        msg.push('\n');
+    }
+    let _ = writeln!(msg, "Spawn-Task: {task_id}");
+    let _ = write!(msg, "Spawn-Head: {head_sha}");
+    msg
+}
+
+fn squash_author_identity(commits: &[ReviewCommit]) -> (&str, &str) {
+    let mut unique: Vec<(&str, &str)> = commits
+        .iter()
+        .filter(|commit| {
+            !commit.is_checkpoint
+                && !commit.author_name.is_empty()
+                && !commit.author_email.is_empty()
+        })
+        .map(|commit| (commit.author_name.as_str(), commit.author_email.as_str()))
+        .collect();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() == 1 {
+        unique[0]
+    } else {
+        ("spawn", "spawn@localhost")
+    }
+}
+
+fn prepare_squash_worktree(
+    repo_git_dir: &std::path::Path,
+    base_sha: &str,
+    head_sha: &str,
+    task_id: i64,
+) -> Result<(TempDirGuard, std::path::PathBuf, String), String> {
+    let guard = TempDirGuard::create("spawn-task-land")?;
+    let work = guard.path.join("work");
+    let init = crate::sources::controller_git()
+        .args(["init", "--quiet"])
+        .arg(&work)
+        .output()
+        .map_err(|error| format!("run git init: {error}"))?;
+    if !init.status.success() {
+        return Err(format!(
+            "git init: {}",
+            String::from_utf8_lossy(&init.stderr).trim()
+        ));
+    }
+    let canonical_objects = std::fs::canonicalize(repo_git_dir.join("objects"))
+        .map_err(|error| format!("canonicalize repo objects: {error}"))?;
+    std::fs::write(
+        work.join(".git/objects/info/alternates"),
+        format!("{}\n", canonical_objects.display()),
+    )
+    .map_err(|error| format!("write git alternates: {error}"))?;
+
+    run_work_git(
+        &work,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "checkout",
+            "--quiet",
+            "-B",
+            "land",
+            base_sha,
+        ],
+        "checkout base commit",
+    )?;
+    let merge = crate::sources::controller_git()
+        .arg("-C")
+        .arg(&work)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "merge",
+            "--squash",
+            "--no-commit",
+            head_sha,
+        ])
+        .env("GIT_AUTHOR_NAME", "spawn")
+        .env("GIT_AUTHOR_EMAIL", "spawn@localhost")
+        .env("GIT_COMMITTER_NAME", "spawn")
+        .env("GIT_COMMITTER_EMAIL", "spawn@localhost")
+        .output()
+        .map_err(|error| format!("run git merge --squash: {error}"))?;
+    if !merge.status.success() {
+        let conflicts = run_work_git(
+            &work,
+            &["diff", "--name-only", "--diff-filter=U"],
+            "list conflicts",
+        )
+        .unwrap_or_default();
+        let detail = if conflicts.trim().is_empty() {
+            String::from_utf8_lossy(&merge.stderr).trim().to_string()
+        } else {
+            format!(
+                "conflicting files: {}",
+                conflicts.lines().collect::<Vec<_>>().join(", ")
+            )
+        };
+        return Err(format!(
+            "cannot squash-land task #{task_id}: merge conflict against refs/heads/main ({detail})"
+        ));
+    }
+
+    let tree_oid = run_work_git(&work, &["write-tree"], "write-tree")?;
+    let base_tree = run_git_raw(
+        repo_git_dir,
+        &["rev-parse", &format!("{base_sha}^{{tree}}")],
+        "rev-parse base tree",
+    )?;
+    if tree_oid == base_tree.trim() {
+        return Err(format!(
+            "nothing to squash for task #{task_id}: merged tree matches refs/heads/main"
+        ));
+    }
+    Ok((guard, work, tree_oid))
+}
+
+fn commit_squash_and_update_main(
+    ctx: &TaskRepoContext,
+    base_sha: &str,
+    head_sha: &str,
+    commits: &[ReviewCommit],
+    work: &std::path::Path,
+    tree_oid: &str,
+) -> Result<String, String> {
+    let message = build_clean_squash_message(ctx.task_id, &ctx.brief, head_sha, commits);
+    let (author_name, author_email) = squash_author_identity(commits);
+    let commit_out = crate::sources::controller_git()
+        .arg("-C")
+        .arg(work)
+        .args([
+            "commit-tree",
+            "--no-gpg-sign",
+            tree_oid,
+            "-p",
+            base_sha,
+            "-m",
+            &message,
+        ])
+        .env("GIT_AUTHOR_NAME", author_name)
+        .env("GIT_AUTHOR_EMAIL", author_email)
+        .env("GIT_COMMITTER_NAME", "spawn")
+        .env("GIT_COMMITTER_EMAIL", "spawn@localhost")
+        .output()
+        .map_err(|error| format!("run git commit-tree: {error}"))?;
+    if !commit_out.status.success() {
+        return Err(format!(
+            "git commit-tree: {}",
+            String::from_utf8_lossy(&commit_out.stderr).trim()
+        ));
+    }
+    let new_commit = String::from_utf8_lossy(&commit_out.stdout)
+        .trim()
+        .to_string();
+    run_work_git(
+        work,
+        &["update-ref", "refs/heads/squash-land", &new_commit],
+        "update temp ref",
+    )?;
+    let work_str = work.to_string_lossy().to_string();
+    run_git_raw(
+        &ctx.git_dir,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            &work_str,
+            "refs/heads/squash-land",
+        ],
+        "fetch squash commit into mission repo",
+    )?;
+    run_git_raw(
+        &ctx.git_dir,
+        &["update-ref", "refs/heads/main", &new_commit, base_sha],
+        "update-ref refs/heads/main",
+    )?;
+    Ok(new_commit)
+}
+
+fn task_land_payload(
+    ctx: &TaskRepoContext,
+    resolved_ref: &str,
+    base_sha: &str,
+    head_sha: &str,
+    new_main_sha: Option<&str>,
+    args: &TaskLandArgs,
+    commits: &[ReviewCommit],
+) -> Value {
+    let (total, authors, checkpoints) = commit_counts(commits);
+    json!({
+        "schema_version": 1,
+        "task_id": ctx.task_id,
+        "mission_id": ctx.mission_id,
+        "resolved_ref": resolved_ref,
+        "base_ref": "refs/heads/main",
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "new_main_sha": new_main_sha,
+        "mode": args.mode.as_str(),
+        "dry_run": args.dry_run,
+        "landed": !args.dry_run,
+        "can_land": true,
+        "commit_count": total,
+        "author_commit_count": authors,
+        "checkpoint_commit_count": checkpoints,
+    })
+}
+
+fn task_land_cmd(rest: &[String]) -> Result<i32, String> {
+    let args = parse_task_land_args(rest)?;
+    let store = open_store()?;
+    let ctx = load_task_repo(&store, args.task_id, args.root.as_deref())?;
+    if !ctx.landable || !ctx.is_bare {
+        return Err(format!(
+            "cannot land task #{}: mission repository {} must be a local bare repository",
+            ctx.task_id,
+            ctx.git_dir.display()
+        ));
+    }
+    let base_sha = resolve_main_sha(&ctx.git_dir)?;
+    let (resolved_ref, head_sha) = resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id)?;
+    if head_sha == base_sha || is_ancestor(&ctx.git_dir, &head_sha, &base_sha)? {
+        return Err(format!(
+            "nothing to land for task #{}: {} ({}) is already in refs/heads/main ({})",
+            ctx.task_id,
+            resolved_ref,
+            short_sha_prefix(&head_sha),
+            short_sha_prefix(&base_sha)
+        ));
+    }
+    let commits = list_commits_ahead(&ctx.git_dir, &base_sha, &head_sha)?;
+
+    let new_main_sha: Option<String> = match args.mode {
+        LandMode::FfOnly => {
+            if !is_ancestor(&ctx.git_dir, &base_sha, &head_sha)? {
+                return Err(format!(
+                    "cannot fast-forward refs/heads/main ({}) to {} ({}): branch has diverged; use --squash",
+                    short_sha_prefix(&base_sha),
+                    resolved_ref,
+                    short_sha_prefix(&head_sha)
+                ));
+            }
+            if !args.dry_run {
+                run_git_raw(
+                    &ctx.git_dir,
+                    &["update-ref", "refs/heads/main", &head_sha, &base_sha],
+                    "update-ref refs/heads/main",
+                )?;
+            }
+            Some(head_sha.clone())
+        }
+        LandMode::Squash => {
+            let (_guard, work, tree_oid) =
+                prepare_squash_worktree(&ctx.git_dir, &base_sha, &head_sha, ctx.task_id)?;
+            if args.dry_run {
+                None
+            } else {
+                Some(commit_squash_and_update_main(
+                    &ctx, &base_sha, &head_sha, &commits, &work, &tree_oid,
+                )?)
+            }
+        }
+    };
+
+    if args.json {
+        print(&task_land_payload(
+            &ctx,
+            &resolved_ref,
+            &base_sha,
+            &head_sha,
+            new_main_sha.as_deref(),
+            &args,
+            &commits,
+        ));
+    } else if args.dry_run {
+        println!(
+            "task #{} dry-run OK (mode={} base={} head={} ref={resolved_ref})",
+            ctx.task_id,
+            args.mode.as_str(),
+            short_sha_prefix(&base_sha),
+            short_sha_prefix(&head_sha)
+        );
+    } else {
+        println!(
+            "task #{} landed onto refs/heads/main at {} (mode={} ref={resolved_ref})",
+            ctx.task_id,
+            short_sha_prefix(new_main_sha.as_deref().unwrap_or(&head_sha)),
+            args.mode.as_str()
+        );
+    }
     Ok(0)
 }
 
@@ -4189,5 +5120,196 @@ mod database_tests {
         assert!(table.contains("topdown-l3-fable"), "{table}");
         assert!(table.contains("top-decision"), "{table}");
         assert!(table.contains("step-up l1->l2, 1 rej"), "{table}");
+    }
+
+    #[test]
+    fn parse_task_commits_diff_and_land_args_validate_correctly() {
+        let commits = super::parse_task_commits_args(&["42".to_string(), "--json".to_string()])
+            .expect("commits positional");
+        assert_eq!(commits.task_id, 42);
+        assert!(commits.json);
+
+        let diff = super::parse_task_diff_args(&[
+            "--id".to_string(),
+            "7".to_string(),
+            "--stat".to_string(),
+        ])
+        .expect("diff --id");
+        assert_eq!(diff.task_id, 7);
+        assert!(diff.stat);
+
+        let land_default = super::parse_task_land_args(&["9".to_string()]).expect("default land");
+        assert_eq!(land_default.mode, super::LandMode::FfOnly);
+        assert!(!land_default.dry_run);
+        assert!(!land_default.json);
+
+        let land_squash = super::parse_task_land_args(&[
+            "9".to_string(),
+            "--squash".to_string(),
+            "--dry-run".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("squash dry run");
+        assert_eq!(land_squash.mode, super::LandMode::Squash);
+        assert!(land_squash.dry_run);
+        assert!(land_squash.json);
+
+        let conflict = super::parse_task_land_args(&[
+            "9".to_string(),
+            "--ff-only".to_string(),
+            "--squash".to_string(),
+        ])
+        .expect_err("ff-only + squash must fail");
+        assert!(conflict.contains("not both"), "{conflict}");
+
+        assert!(super::parse_task_commits_args(&[]).is_err());
+        assert!(super::parse_task_commits_args(&["0".to_string()]).is_err());
+        assert!(super::parse_task_diff_args(&["5".to_string(), "--bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn checkpoint_detection_and_clean_squash_message_strip_synthetic_checkpoints() {
+        assert!(super::is_checkpoint_subject("spawn checkpoint"));
+        assert!(super::is_checkpoint_subject("spawn checkpoint exec_123"));
+        assert!(super::is_checkpoint_subject("  Spawn Checkpoint exec_9  "));
+        assert!(!super::is_checkpoint_subject("Add operator review CLI"));
+
+        let commits = vec![
+            super::ReviewCommit {
+                sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                short_sha: "bbbbbbb".to_string(),
+                author_name: "spawn".to_string(),
+                author_email: "spawn@localhost".to_string(),
+                authored_at: "2026-11-26T12:01:00Z".to_string(),
+                subject: "spawn checkpoint exec_1".to_string(),
+                is_checkpoint: true,
+            },
+            super::ReviewCommit {
+                sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                short_sha: "aaaaaaa".to_string(),
+                author_name: "Alice".to_string(),
+                author_email: "alice@example.com".to_string(),
+                authored_at: "2026-11-26T12:00:00Z".to_string(),
+                subject: "Implement widget".to_string(),
+                is_checkpoint: false,
+            },
+        ];
+        let msg = super::build_clean_squash_message(
+            15,
+            "Build widget\nDetails",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &commits,
+        );
+        assert!(msg.starts_with("Implement widget\n\n"), "{msg}");
+        assert!(!msg.contains("spawn checkpoint"), "{msg}");
+        assert!(msg.contains("Spawn-Task: 15"), "{msg}");
+        assert!(
+            msg.contains("Spawn-Head: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "{msg}"
+        );
+        assert_eq!(
+            super::squash_author_identity(&commits),
+            ("Alice", "alice@example.com")
+        );
+
+        let table = super::format_task_commits_table(
+            15,
+            "refs/spawn/tasks/15/head",
+            "1111111111111111111111111111111111111111",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &commits,
+        );
+        assert!(table.contains("1 author, 1 checkpoint"), "{table}");
+        assert!(
+            table.contains("checkpoint") && table.contains("author"),
+            "{table}"
+        );
+    }
+
+    #[test]
+    fn resolve_preserved_ref_prefers_task_head_then_worker_head_then_spawn_branch() {
+        let dir = super::TempDirGuard::create("spawn-task-ref-order").expect("temp dir");
+        let bare = dir.path.join("mission.git");
+        let work = dir.path.join("work");
+        let run_test_git = |cwd: Option<&std::path::Path>, args: &[&str]| -> String {
+            let mut cmd = spawn_host::test_git_command();
+            if let Some(path) = cwd {
+                cmd.arg("-C").arg(path);
+            }
+            let out = cmd.args(args).output().expect("run test git");
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        run_test_git(None, &["init", "--bare", bare.to_str().expect("utf8")]);
+        run_test_git(
+            None,
+            &[
+                "clone",
+                bare.to_str().expect("utf8"),
+                work.to_str().expect("utf8"),
+            ],
+        );
+        run_test_git(Some(&work), &["checkout", "-B", "main"]);
+        std::fs::write(work.join("README.md"), "base\n").expect("write");
+        run_test_git(Some(&work), &["add", "README.md"]);
+        run_test_git(Some(&work), &["commit", "-m", "base"]);
+        run_test_git(Some(&work), &["push", "origin", "main:refs/heads/main"]);
+
+        std::fs::write(work.join("a.txt"), "branch\n").expect("write a");
+        run_test_git(Some(&work), &["add", "a.txt"]);
+        run_test_git(Some(&work), &["commit", "-m", "branch commit"]);
+        let sha_branch = run_test_git(Some(&work), &["rev-parse", "HEAD"]);
+        run_test_git(
+            Some(&work),
+            &[
+                "push",
+                "origin",
+                &format!("{sha_branch}:refs/heads/spawn/agent_w1"),
+            ],
+        );
+        let (r3, s3) = super::resolve_preserved_ref(&bare, 7, "agent_w1").expect("branch fallback");
+        assert_eq!(r3, "refs/heads/spawn/agent_w1");
+        assert_eq!(s3, sha_branch);
+
+        std::fs::write(work.join("b.txt"), "worker\n").expect("write b");
+        run_test_git(Some(&work), &["add", "b.txt"]);
+        run_test_git(Some(&work), &["commit", "-m", "worker head"]);
+        let sha_worker = run_test_git(Some(&work), &["rev-parse", "HEAD"]);
+        run_test_git(
+            Some(&work),
+            &[
+                "push",
+                "origin",
+                &format!("{sha_worker}:refs/spawn/workers/agent_w1/head"),
+            ],
+        );
+        let (r2, s2) = super::resolve_preserved_ref(&bare, 7, "agent_w1").expect("worker fallback");
+        assert_eq!(r2, "refs/spawn/workers/agent_w1/head");
+        assert_eq!(s2, sha_worker);
+
+        std::fs::write(work.join("c.txt"), "task\n").expect("write c");
+        run_test_git(Some(&work), &["add", "c.txt"]);
+        run_test_git(Some(&work), &["commit", "-m", "task head"]);
+        let sha_task = run_test_git(Some(&work), &["rev-parse", "HEAD"]);
+        run_test_git(
+            Some(&work),
+            &[
+                "push",
+                "origin",
+                &format!("{sha_task}:refs/spawn/tasks/7/head"),
+            ],
+        );
+        let (r1, s1) = super::resolve_preserved_ref(&bare, 7, "agent_w1").expect("task primary");
+        assert_eq!(r1, "refs/spawn/tasks/7/head");
+        assert_eq!(s1, sha_task);
+
+        let missing =
+            super::resolve_preserved_ref(&bare, 99, "agent_none").expect_err("missing ref");
+        assert!(missing.contains("refs/spawn/tasks/99/head"), "{missing}");
     }
 }
