@@ -91,7 +91,9 @@ impl Fixture {
         write(&fixture.runtime().join("credentials/keep"), "secret");
         write(&fixture.keep().join("api-key"), "secret");
         std::fs::create_dir_all(fixture.workspace()).expect("ws");
-        std::fs::create_dir_all(fixture.tmpdir()).expect("tmp");
+        // The loop's shared TMPDIR (as `/var/tmp/spawn` is on a fleet
+        // host), holding another host job's scratch.
+        write(&fixture.host_tmp().join("spawn-backup-1/dump"), "secret");
         fixture
     }
 
@@ -113,8 +115,19 @@ impl Fixture {
         self.scratch.join("ws")
     }
 
+    /// The engine's own TMPDIR, which the view makes below its home.
     fn tmpdir(&self) -> PathBuf {
-        self.scratch.join("tmp")
+        self.engine_home().join(TMP_FALLBACK)
+    }
+
+    /// The loop's shared TMPDIR.
+    fn host_tmp(&self) -> PathBuf {
+        self.scratch.join("vartmp")
+    }
+
+    /// The view's private directory, inside the masked runtime directory.
+    fn private(&self) -> PathBuf {
+        self.runtime().join("spawn-engine-view-test")
     }
 
     fn engine_home(&self) -> PathBuf {
@@ -132,8 +145,8 @@ impl Fixture {
             host_directories,
             loop_dirs: vec![self.home().join(".local/share/spawn-rsi")],
             extra_files: Vec::new(),
-            tmpdir: None,
-            private_dir: self.scratch.join("private"),
+            host_tmpdir: Some(self.host_tmp()),
+            private_dir: self.private(),
         }
     }
 
@@ -213,7 +226,6 @@ fn inside_the_view_the_masks_are_empty_and_only_the_three_binds_write() {
             engine: "agy",
             workspace: &workspace,
             engine_home: &engine_home,
-            tmpdir: Some(&tmpdir),
         })
         .expect("wrap");
     let home = fixture.home();
@@ -328,6 +340,26 @@ fn inside_the_view_the_masks_are_empty_and_only_the_three_binds_write() {
         "secret"
     );
 
+    // The view's private directory (and its empty file) is not there
+    // inside, so it can be neither written nor swapped; the loop's shared
+    // TMPDIR shows nothing of the host's jobs.
+    let empty = fixture.private().join("empty");
+    assert!(empty.is_file(), "the empty file is made");
+    fails(&words, &format!("ls -A '{}'", fixture.private().display()));
+    fails(&words, &format!("echo x > '{}'", empty.display()));
+    fails(&words, &format!("ln -sf /etc/passwd '{}'", empty.display()));
+    assert_eq!(
+        ok(&words, &format!("ls -A '{}'", fixture.host_tmp().display())),
+        ""
+    );
+    fails(
+        &words,
+        &format!("cat '{}'", fixture.host_tmp().join("spawn-backup-1/dump").display()),
+    );
+    let meta = std::fs::symlink_metadata(&empty).expect("empty");
+    assert!(meta.is_file() && meta.len() == 0);
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o444);
+
     // No host process can be signalled: its own pid namespace.
     let mut sleeper = Command::new("sleep")
         .arg("30")
@@ -369,7 +401,6 @@ fn missing_and_odd_targets_are_skipped_and_said_without_aborting() {
             engine: "agy",
             workspace: &workspace,
             engine_home: &engine_home,
-            tmpdir: Some(&tmpdir),
         })
         .expect("plan");
     let why = |path: &Path| {
@@ -409,7 +440,6 @@ fn the_argv_keeps_its_invariants() {
             engine: "agy",
             workspace: &workspace,
             engine_home: &engine_home,
-            tmpdir: Some(&tmpdir),
         })
         .expect("plan");
     let words = &plan.words;
@@ -500,51 +530,76 @@ fn the_argv_keeps_its_invariants() {
     assert_eq!(meta.permissions().mode() & 0o777, 0o444);
 }
 
-/// A workspace or an engine home whose bind would uncover a mask is
-/// refused; a TMPDIR that would is passed over for one below the engine's
-/// home (said).
+/// A writable bind that would uncover a mask, lie in one, or reach the
+/// view's private directory is refused, whatever it is: a misconfigured
+/// engine home (`SPAWN_AGY_HOME`) equal to or holding a masked path is
+/// refused, never unmasked. Only a home below another engine's masked
+/// home is re-bound. The engine's TMPDIR is its own, never the loop's.
 #[test]
-fn a_bind_that_would_uncover_a_mask_is_refused_or_passed_over() {
+fn a_bind_that_would_uncover_a_mask_is_refused() {
     let _serial = exclusive();
     let fixture = Fixture::new();
     let Some(view) = view(fixture.config()) else {
         return;
     };
-    let (workspace, engine_home, _) = fixture.launch();
-    let home = fixture.home().display().to_string();
-    let refused = view
-        .plan(&ViewedLaunch {
+    let (workspace, engine_home, tmpdir) = fixture.launch();
+    let home = fixture.home();
+    let plan_for = |workspace: &str, engine_home: &str| {
+        view.plan(&ViewedLaunch {
             engine: "agy",
-            workspace: &home,
-            engine_home: &engine_home,
-            tmpdir: None,
+            workspace,
+            engine_home,
         })
-        .expect_err("a workspace holding masks");
-    assert!(refused.contains("which the view masks"), "{refused}");
-    let refused = view
-        .plan(&ViewedLaunch {
-            engine: "agy",
-            workspace: &workspace,
-            engine_home: &home,
-            tmpdir: None,
-        })
-        .expect_err("an engine home holding the user's home");
+    };
+    let shown = |path: PathBuf| path.display().to_string();
+
+    for bad in [
+        shown(home.clone()),
+        shown(home.join(".claude")),
+        shown(fixture.runtime()),
+        shown(fixture.private()),
+        shown(fixture.host_tmp()),
+    ] {
+        std::fs::create_dir_all(&bad).expect("dir");
+        let refused = plan_for(&bad, &engine_home).expect_err(&bad);
+        assert!(refused.contains("overlaps"), "{bad}: {refused}");
+    }
+    let refused = plan_for(&workspace, &shown(home.clone())).expect_err("home");
     assert!(refused.contains("holds the user's home"), "{refused}");
-    let plan = view
-        .plan(&ViewedLaunch {
-            engine: "agy",
-            workspace: &workspace,
-            engine_home: &engine_home,
-            tmpdir: Some("/tmp"),
-        })
-        .expect("plan");
-    assert_eq!(plan.tmpdir, fixture.engine_home().join(TMP_FALLBACK));
+    for bad in [
+        shown(home.join(".gemini")),
+        shown(home.join(".claude")),
+        shown(home.join(".claude/projects")),
+        shown(home.join(".ssh")),
+        shown(home.join(".config/herdr")),
+        shown(home.join("cfg/herdr")),
+        shown(fixture.keep()),
+        shown(fixture.runtime()),
+        shown(fixture.private()),
+        shown(fixture.host_tmp()),
+        "/tmp".to_string(),
+    ] {
+        let refused = plan_for(&workspace, &bad).expect_err(&bad);
+        assert!(refused.contains("overlaps"), "{bad}: {refused}");
+    }
+    // The real /run/keep, when the host has it, is refused the same way
+    // (only canonicalized, never read).
+    if Path::new("/run/keep").is_dir() {
+        assert!(plan_for(&workspace, "/run/keep").is_err());
+    }
+    // Below another engine's masked home: re-bound.
+    let codex = shown(home.join(".codex/agy"));
+    let plan = plan_for(&workspace, &codex).expect("below ~/.codex");
+    assert_eq!(plan.tmpdir, home.join(".codex/agy").join(TMP_FALLBACK));
+    // The engine's own TMPDIR, made 0700 below its home.
+    let plan = plan_for(&workspace, &engine_home).expect("plan");
+    assert_eq!(shown(plan.tmpdir.clone()), tmpdir);
+    let meta = std::fs::metadata(&plan.tmpdir).expect("tmpdir");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o700);
     assert!(
-        plan.skipped
-            .iter()
-            .any(|(path, why)| path == Path::new("/tmp") && why.contains("TMPDIR holds")),
+        plan.masks.contains(&Mask::Directory(fixture.host_tmp())),
         "{:?}",
-        plan.skipped
+        plan.masks
     );
     ok(&plan.words, "touch \"$TMPDIR/x\" && [ ! -e /tmp/x ]");
 }
@@ -660,7 +715,6 @@ fn herdr_detects_an_agent_inside_the_view_that_cannot_reach_its_socket() {
             engine: "agy",
             workspace: &workspace,
             engine_home: &engine_home,
-            tmpdir: Some(&tmpdir),
         })
         .expect("wrap");
     assert!(!words.iter().any(|word| word == "--new-session"));
@@ -707,7 +761,6 @@ fn herdr_detects_an_agent_inside_the_view_that_cannot_reach_its_socket() {
             engine: "agy",
             workspace: &workspace,
             engine_home: &engine_home,
-            tmpdir: Some(&tmpdir),
         })
         .expect("wrap");
     fails(&check, &format!("ls '{}'", socket.display()));
