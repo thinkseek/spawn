@@ -9423,6 +9423,10 @@ mod tests {
         inner: Arc<MemoryStore>,
         reading: Mutex<Option<crate::port::AgentReading>>,
         asked: AtomicUsize,
+        /// What [`TerminalHost::list_dirs`] answers for each directory
+        /// (newest first, as a host orders them), and the directories asked.
+        dirs: Mutex<HashMap<String, Vec<String>>>,
+        listed: Mutex<Vec<String>>,
     }
 
     impl Witnessed {
@@ -9431,11 +9435,20 @@ mod tests {
                 inner,
                 reading: Mutex::new(None),
                 asked: AtomicUsize::new(0),
+                dirs: Mutex::new(HashMap::new()),
+                listed: Mutex::new(Vec::new()),
             })
         }
 
         fn set(&self, reading: crate::port::AgentReading) {
             *self.reading.lock().expect("reading") = Some(reading);
+        }
+
+        fn set_dirs(&self, dir: &str, names: &[&str]) {
+            self.dirs.lock().expect("dirs").insert(
+                dir.to_string(),
+                names.iter().map(|name| (*name).to_string()).collect(),
+            );
         }
     }
 
@@ -9513,6 +9526,20 @@ mod tests {
             workspace: &WorkspaceId,
         ) -> Result<(), TerminalError> {
             self.inner.terminate(terminal, workspace)
+        }
+        fn list_dirs(
+            &self,
+            _workspace: &WorkspaceId,
+            dir: &str,
+        ) -> Result<Vec<String>, TerminalError> {
+            self.listed.lock().expect("listed").push(dir.to_string());
+            Ok(self
+                .dirs
+                .lock()
+                .expect("dirs")
+                .get(dir)
+                .cloned()
+                .unwrap_or_default())
         }
         fn agent(
             &self,
