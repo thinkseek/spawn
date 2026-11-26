@@ -139,19 +139,50 @@ wait_for() {
     return 1
 }
 
+_bb_hc() {
+    bb_hc=${SPAWN_HERDR_CORE_PROGRAM-}
+    if [ -z "$bb_hc" ] && [ -n "${SPAWN_BIN-}" ]; then
+        bb_hc_dir=$(dirname "$SPAWN_BIN")
+        if [ -x "$bb_hc_dir/spawn-hc" ]; then
+            bb_hc=$bb_hc_dir/spawn-hc
+        elif [ -x "$(dirname "$bb_hc_dir")/spawn-hc" ]; then
+            bb_hc=$(dirname "$bb_hc_dir")/spawn-hc
+        fi
+    fi
+    if [ -z "$bb_hc" ]; then
+        bb_hc=$(command -v spawn-hc 2>/dev/null || true)
+    fi
+    [ -n "$bb_hc" ] && [ -x "$bb_hc" ] || return 1
+    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
+        HC_SESSION="$SPAWN_HERDR_SESSION" \
+        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
+        "$bb_hc" "$@"
+}
+
 # Last lines of the only terminal of this scenario.
 pane() {
-    tmux -L "$SPAWN_TMUX_SOCKET" capture-pane -p -t "=$(terminal):" -S -80
+    if [ -n "${SPAWN_HERDR_SESSION-}" ]; then
+        bb_t=$(terminal)
+        [ -n "$bb_t" ] || return 1
+        _bb_hc read --lines 80 "$bb_t"
+    else
+        tmux -L "$SPAWN_TMUX_SOCKET" capture-pane -p -t "=$(terminal):" -S -80
+    fi
 }
 
 terminal() {
-    tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{session_name}' | head -1
+    if [ -n "${SPAWN_HERDR_SESSION-}" ]; then
+        _bb_hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
+            jq -r '[.terminals[]? | select(.state == "live") | .address][0] // empty'
+    else
+        tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{session_name}' | head -1
+    fi
 }
 
 # What a scenario prints to stderr when it gives up waiting for a
 # supervisor's turn, so the gate log shows where the line stopped: the
 # commands submitted, the newest events, and every pane on the scenario's
-# own tmux socket. Everything comes from the scenario's own database and
+# own terminal server. Everything comes from the scenario's own database and
 # socket, never a live one. The credentials of any URL are masked.
 supervisor_turn_dump() { # <what the scenario waited for>
     {
@@ -165,20 +196,39 @@ supervisor_turn_dump() { # <what the scenario waited for>
         echo "-- spawn_events, newest 40, oldest first:"
         sql "select concat_ws(' | ', e.id, e.recorded_at_ms, e.session_id, e.event_name, left(e.kind::text, 300))
                from (select * from spawn_events order by id desc limit 40) e order by e.id" 2>&1
-        # Panes only from a named socket under the scenario's own
-        # TMUX_TMPDIR: `tmux -L ""`, or no TMUX_TMPDIR, is the host's own
-        # server, whose panes must never reach a gate log.
-        case "${WORK:+w}:${SPAWN_TMUX_SOCKET-}:${TMUX_TMPDIR-}/" in
-            :*) echo "-- panes skipped: WORK is not set" ;;
-            w::* | w:*:/) echo "-- panes skipped: no scenario tmux socket (SPAWN_TMUX_SOCKET and TMUX_TMPDIR under \$WORK)" ;;
-            w:*:"$WORK"/*)
-                for session in $(tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{session_name}' 2>/dev/null); do
-                    echo "-- pane $session, last 30 lines:"
-                    tmux -L "$SPAWN_TMUX_SOCKET" capture-pane -p -t "=$session:" -S -30 2>&1 | tail -n 30
-                done
-                ;;
-            *) echo "-- panes skipped: TMUX_TMPDIR is not under \$WORK" ;;
-        esac
+        if [ -n "${SPAWN_HERDR_SESSION-}" ]; then
+            case "${WORK:+w}:${XDG_RUNTIME_DIR-}/" in
+                :*) echo "-- panes skipped: WORK is not set" ;;
+                w:"$WORK"/*)
+                    bb_sock="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock"
+                    if [ ! -S "$bb_sock" ]; then
+                        echo "-- panes skipped: no herdr socket ($bb_sock)"
+                    else
+                        for bb_addr in $(_bb_hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
+                            jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
+                            echo "-- pane $bb_addr, last 30 lines:"
+                            _bb_hc read --lines 30 "$bb_addr" 2>&1 | tail -n 30
+                        done
+                    fi
+                    ;;
+                *) echo "-- panes skipped: XDG_RUNTIME_DIR is not under \$WORK" ;;
+            esac
+        else
+            # Panes only from a named socket under the scenario's own
+            # TMUX_TMPDIR: `tmux -L ""`, or no TMUX_TMPDIR, is the host's own
+            # server, whose panes must never reach a gate log.
+            case "${WORK:+w}:${SPAWN_TMUX_SOCKET-}:${TMUX_TMPDIR-}/" in
+                :*) echo "-- panes skipped: WORK is not set" ;;
+                w::* | w:*:/) echo "-- panes skipped: no scenario tmux socket (SPAWN_TMUX_SOCKET and TMUX_TMPDIR under \$WORK)" ;;
+                w:*:"$WORK"/*)
+                    for session in $(tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{session_name}' 2>/dev/null); do
+                        echo "-- pane $session, last 30 lines:"
+                        tmux -L "$SPAWN_TMUX_SOCKET" capture-pane -p -t "=$session:" -S -30 2>&1 | tail -n 30
+                    done
+                    ;;
+                *) echo "-- panes skipped: TMUX_TMPDIR is not under \$WORK" ;;
+            esac
+        fi
     } 2>&1 | sed -E 's#(://)[^@[:space:]]*@#\1***@#g' >&2 || true
 }
 
