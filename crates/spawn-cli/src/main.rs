@@ -1,6 +1,6 @@
 //! The `spawn` binary: assembles stores, host adapters and the Bridge.
 //!
-//! Subcommands, all 29, one row each of [`COMMANDS`] (`spawn <command>
+//! Subcommands, all 30, one row each of [`COMMANDS`] (`spawn <command>
 //! --help` prints a command's verbs and flags, from its module's own usage):
 //!
 //! - `init-db` installs the SQL schema.
@@ -33,6 +33,8 @@
 //! - `features` scans and checks the feature registry
 //!   (docs/feature-map/registry.json) and associates files with it.
 //! - `grade` keeps the grading catalog (docs/agent-grading.md).
+//! - `prov` indexes the Git history into file provenance and reads it back
+//!   (docs/provenance.md).
 //! - `scratch` claims, renews, releases and sweeps scratch directories.
 //! - `run` starts the engine inside the terminal, records its exit, and
 //!   forwards its exit code.
@@ -72,6 +74,7 @@ mod memory;
 mod missions;
 mod nodes;
 mod objectives;
+mod provenance;
 mod push;
 mod recover;
 mod resolve;
@@ -140,7 +143,8 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn features scan|check [--root <dir>] [--registry <file>] [--json]\n       \
      spawn features associate --path <file> --feature <id> [--feature <id>]... [--root <dir>] [--registry <file>] [--json]\n       \
      spawn features graph [--root <dir>] [--registry <file>] [--level file|unit|feature] [--from <id|path>] [--to <id|path>] [--feature <id>] [--json]\n       \
-     spawn grade register|list|exam|onboard|lock-grade|unlock-grade|enable|disable|calibrate|upkeep ...   (the grading catalog: spawn grade --help for each verb's flags)";
+     spawn grade register|list|exam|onboard|lock-grade|unlock-grade|enable|disable|calibrate|upkeep ...   (the grading catalog: spawn grade --help for each verb's flags)\n       \
+     spawn prov index|who|show ...   (file provenance: spawn prov --help for each verb's flags)";
 
 /// What the whole usage says last, after the commands.
 const HELP_HINT: &str =
@@ -331,6 +335,12 @@ const COMMANDS: &[Command] = &[
         aliases: &[],
         usage: &[grading::USAGE],
         run: grading::command,
+    },
+    Command {
+        name: "prov",
+        aliases: &[],
+        usage: &[provenance::USAGE],
+        run: provenance::command,
     },
     Command {
         name: "scratch",
@@ -829,7 +839,7 @@ mod tests {
                 "{removed} stays an unknown command"
             );
         }
-        assert_eq!(COMMANDS.len(), 29, "the commands: {words:?}");
+        assert_eq!(COMMANDS.len(), 30, "the commands: {words:?}");
     }
 
     #[test]

@@ -567,7 +567,7 @@ fn cas_dedup_converges_three_workers_on_one_extent() {
         assert!(app.with_file_name("run.jsonl").exists());
     }
     if linux_extents {
-        let blob = fs::read_dir(base.join("cas"))
+        let blob = fs::read_dir(base.join("cas/objects/sha256"))
             .expect("cas")
             .flatten()
             .filter(|shard| shard.file_name().len() == 2)
@@ -742,7 +742,7 @@ fn cas_dedup_refuses_a_tampered_blob() {
     config.min_age = Duration::ZERO;
 
     // Planted before any pass: the root is not a CAS, nothing is used.
-    let shard = base.join("cas").join(&hash[..2]);
+    let shard = base.join("cas/objects/sha256").join(&hash[..2]);
     fs::create_dir_all(&shard).expect("mkdir");
     fs::write(shard.join(&hash), vec![2_u8; 100_000]).expect("plant");
     assert!(matches!(
@@ -790,10 +790,16 @@ fn prune_refuses_a_foreign_root_and_keeps_foreign_names() {
     assert!(root.join("ab/session.jsonl").exists());
     assert!(root.join("tmp/notes.txt").exists());
 
-    // Marked: still only `<hh>/<hash>` and `tmp/<hash>.<pid>-<n>` go.
+    // Marked: still only `objects/sha256/<hh>/<hash>` and
+    // `tmp/<hash>.<pid>-<n>` go.
     fs::write(root.join(CAS_MARKER), "spawn\n").expect("marker");
     let hash = format!("ab{}", "0".repeat(62));
-    fs::write(root.join("ab").join(&hash), "blob").expect("write");
+    let objects = root.join("objects/sha256");
+    fs::create_dir_all(objects.join("ab")).expect("mkdir");
+    fs::write(objects.join("ab").join(&hash), "blob").expect("write");
+    fs::write(objects.join("ab/session.jsonl"), "{}\n").expect("write");
+    fs::create_dir_all(objects.join("cd")).expect("mkdir");
+    fs::write(objects.join("cd").join(&hash), "wrong shard").expect("write");
     fs::write(root.join("ab").join(format!("{hash}.jsonl")), "{}\n").expect("write");
     fs::write(root.join("cd").with_extension("jsonl"), "{}\n").expect("write");
     fs::create_dir_all(root.join("cd")).expect("mkdir");
@@ -802,8 +808,10 @@ fn prune_refuses_a_foreign_root_and_keeps_foreign_names() {
     let report = prune_unused(&root, Duration::ZERO).expect("prune");
     assert_eq!(report.blobs_removed, 1, "{report:?}");
     assert_eq!(report.temporaries_removed, 1, "{report:?}");
-    assert!(!root.join("ab").join(&hash).exists());
+    assert!(!objects.join("ab").join(&hash).exists());
     for kept in [
+        objects.join("ab/session.jsonl"),
+        objects.join("cd").join(&hash),
         root.join("ab/session.jsonl"),
         root.join("ab").join(format!("{hash}.jsonl")),
         root.join("cd.jsonl"),
@@ -812,6 +820,197 @@ fn prune_refuses_a_foreign_root_and_keeps_foreign_names() {
     ] {
         assert!(kept.exists(), "{} was deleted", kept.display());
     }
+}
+
+/// A CAS made before `spawn-cas` (blobs at `<cas>/<hh>/<hash>`): the first
+/// pass adopts its blobs into `objects/sha256/` by a rename, the same
+/// inode, never rehashed, and deduplicates against them; foreign names stay.
+#[test]
+fn cas_dedup_adopts_a_legacy_store_without_rehashing() {
+    let base = scratch("cow-dedup-legacy");
+    if !cow_clone_supported(&base) {
+        eprintln!("no copy-on-write clones on this file system: test skipped");
+        return;
+    }
+    let work = base.join("w0/target");
+    fs::create_dir_all(&work).expect("mkdir");
+    let content = noise(21, 100_000);
+    fs::write(work.join("f.bin"), &content).expect("write");
+    let hash = sha256_file(&work.join("f.bin")).expect("hash");
+    let cas = base.join("cas");
+    fs::create_dir_all(cas.join(&hash[..2])).expect("mkdir");
+    fs::write(cas.join(CAS_MARKER), "spawn content-addressed store 1\n").expect("marker");
+    let legacy = cas.join(&hash[..2]).join(&hash);
+    fs::write(&legacy, &content).expect("legacy blob");
+    set_mode(&legacy, 0o444);
+    let legacy_inode = fs::metadata(&legacy).expect("stat").ino();
+    // A legacy blob whose bytes are not its name: adopted as it is (a
+    // rehash would have refused it).
+    let unhashed = format!("ee{}", "1".repeat(62));
+    fs::create_dir_all(cas.join("ee")).expect("mkdir");
+    fs::write(cas.join("ee").join(&unhashed), "not its digest").expect("write");
+    let foreign = [
+        cas.join("ee/session.jsonl"),
+        cas.join("ee").join(format!("{unhashed}.jsonl")),
+        cas.join("ff").join(&unhashed),
+        cas.join("ff.jsonl"),
+    ];
+    fs::create_dir_all(cas.join("ff")).expect("mkdir");
+    for path in &foreign {
+        fs::write(path, "foreign").expect("write");
+    }
+
+    let mut config = DedupConfig::new(&cas);
+    config.min_age = Duration::ZERO;
+    let report = dedup(&config, &[&work]).expect("dedup");
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(report.blobs_created, 0, "{report:?}");
+    assert_eq!(report.deduplicated, 1, "{report:?}");
+    assert_eq!(fs::read(work.join("f.bin")).expect("read"), content);
+
+    let adopted = cas.join("objects/sha256").join(&hash[..2]).join(&hash);
+    let meta = fs::metadata(&adopted).expect("adopted");
+    assert_eq!(meta.ino(), legacy_inode, "renamed, not copied");
+    assert_eq!(meta.mode() & 0o777, 0o444);
+    assert!(!legacy.exists());
+    assert!(!cas.join(&hash[..2]).exists(), "the emptied shard went");
+    assert_eq!(
+        fs::read(cas.join("objects/sha256/ee").join(&unhashed)).expect("adopted"),
+        b"not its digest"
+    );
+    for path in &foreign {
+        assert_eq!(
+            fs::read(path).expect("kept"),
+            b"foreign",
+            "{}",
+            path.display()
+        );
+    }
+    // The existing index still names the blob: a second pass reads nothing.
+    let again = dedup(&config, &[&work]).expect("dedup");
+    assert_eq!(again.already_shared, 1, "{again:?}");
+}
+
+/// Prune adopts legacy blobs the same way (no clone file system needed),
+/// keeps what a `spawn-cas` pin names, and a root without the marker is
+/// neither adopted nor pruned.
+#[test]
+fn prune_adopts_legacy_blobs_and_keeps_pinned_ones() {
+    let base = scratch("cow-prune-legacy");
+    let foreign_root = base.join("project");
+    let hash = format!("ab{}", "2".repeat(62));
+    fs::create_dir_all(foreign_root.join("ab")).expect("mkdir");
+    fs::write(foreign_root.join("ab").join(&hash), "not a cas").expect("write");
+    assert!(prune_unused(&foreign_root, Duration::ZERO).is_err());
+    assert!(foreign_root.join("ab").join(&hash).exists());
+    assert!(!foreign_root.join("objects").exists());
+
+    let cas = base.join("cas");
+    let pinned_hash = format!("cd{}", "3".repeat(62));
+    for hash in [&hash, &pinned_hash] {
+        fs::create_dir_all(cas.join(&hash[..2])).expect("mkdir");
+        fs::write(cas.join(&hash[..2]).join(hash), hash.as_bytes()).expect("write");
+    }
+    fs::write(cas.join(CAS_MARKER), "spawn\n").expect("marker");
+    let inode = fs::metadata(cas.join("ab").join(&hash))
+        .expect("stat")
+        .ino();
+    // Within the grace period: adopted, nothing removed.
+    let pruned = prune_unused(&cas, Duration::from_hours(1)).expect("prune");
+    assert_eq!(pruned.blobs_removed, 0, "{pruned:?}");
+    assert_eq!(pruned.blobs_kept, 2, "{pruned:?}");
+    let adopted = cas.join("objects/sha256/ab").join(&hash);
+    assert_eq!(fs::metadata(&adopted).expect("adopted").ino(), inode);
+    assert!(!cas.join("ab").exists());
+
+    let store = spawn_cas::Store::open(&cas).expect("store");
+    let digest = spawn_cas::Digest::parse(&format!("sha256:{pinned_hash}")).expect("digest");
+    store.pin("lease", "gate-1.1", &[digest]).expect("pin");
+    let pruned = prune_unused(&cas, Duration::ZERO).expect("prune");
+    assert_eq!(pruned.blobs_removed, 1, "{pruned:?}");
+    assert!(!adopted.exists());
+    assert!(
+        cas.join("objects/sha256/cd").join(&pinned_hash).exists(),
+        "a pinned blob is never pruned"
+    );
+}
+
+/// Review O55 F1: a unified store holds the objects of spawn-cas
+/// namespaces (`data`, `artifacts`, ...) beside the dedup blobs. Prune
+/// removes neither those objects nor any access record, at zero grace; an
+/// un-namespaced, unreferenced, unpinned blob still goes.
+#[test]
+fn prune_keeps_namespaced_objects_and_their_access_records() {
+    let base = scratch("cow-prune-namespaced");
+    let cas = base.join("cas");
+    let store = spawn_cas::Store::open(&cas).expect("store");
+    let data = store
+        .put_bytes(spawn_cas::NS_DATA, b"a data snapshot chunk")
+        .expect("put");
+    let artifact = store
+        .put_bytes(spawn_cas::NS_ARTIFACTS, b"a controller pack")
+        .expect("put");
+    // A dedup blob: an object no namespace records and no index entry holds.
+    let orphan = spawn_cas::sha256_of(b"an orphaned dedup blob");
+    let orphan_path = store.object_path(&orphan);
+    fs::create_dir_all(orphan_path.parent().expect("shard")).expect("mkdir");
+    fs::write(&orphan_path, b"an orphaned dedup blob").expect("write");
+
+    let pruned = prune_unused(&cas, Duration::ZERO).expect("prune");
+    assert!(pruned.errors.is_empty(), "{pruned:?}");
+    assert_eq!(pruned.blobs_removed, 1, "{pruned:?}");
+    assert_eq!(pruned.blobs_kept, 2, "{pruned:?}");
+    assert!(!orphan_path.exists());
+    for (namespace, digest) in [
+        (spawn_cas::NS_DATA, &data),
+        (spawn_cas::NS_ARTIFACTS, &artifact),
+    ] {
+        assert!(store.has(digest), "{namespace}'s object was pruned");
+        assert!(
+            store.access_path(namespace, digest).is_file(),
+            "{namespace}'s access record was removed"
+        );
+        store.verify(digest).expect("intact");
+    }
+}
+
+/// Review O55 F2: legacy names left behind by a crash mid-adoption (the
+/// same inode at both names) or duplicating an object are removed by the
+/// next adoption, emptied shards with them, and a prune then sees one
+/// object per address.
+#[test]
+fn prune_finishes_a_crashed_adoption_and_drops_duplicate_legacy_names() {
+    let base = scratch("cow-prune-readopt");
+    let cas = base.join("cas");
+    let store = spawn_cas::Store::open(&cas).expect("store");
+    let crashed = spawn_cas::sha256_of(b"half adopted");
+    let duplicate = spawn_cas::sha256_of(b"held twice");
+    for (digest, bytes) in [
+        (&crashed, &b"half adopted"[..]),
+        (&duplicate, b"held twice"),
+    ] {
+        let object = store.object_path(digest);
+        fs::create_dir_all(object.parent().expect("shard")).expect("mkdir");
+        fs::write(&object, bytes).expect("write");
+        fs::create_dir_all(cas.join(digest.shard())).expect("mkdir");
+    }
+    let crashed_legacy = cas.join(crashed.shard()).join(crashed.hex());
+    fs::hard_link(store.object_path(&crashed), &crashed_legacy).expect("link");
+    let duplicate_legacy = cas.join(duplicate.shard()).join(duplicate.hex());
+    fs::write(&duplicate_legacy, b"held twice").expect("write");
+    // Within the grace period: only the adoption is done.
+    let pruned = prune_unused(&cas, Duration::from_hours(1)).expect("prune");
+    assert_eq!(pruned.blobs_removed, 0, "{pruned:?}");
+    assert_eq!(pruned.blobs_kept, 2, "{pruned:?}");
+    for (legacy, digest) in [(&crashed_legacy, &crashed), (&duplicate_legacy, &duplicate)] {
+        assert!(!legacy.exists(), "{} kept", legacy.display());
+        assert!(!cas.join(digest.shard()).exists(), "emptied shard kept");
+        assert!(store.has(digest));
+    }
+    // Unreferenced and un-namespaced: a zero-grace prune removes both.
+    let pruned = prune_unused(&cas, Duration::ZERO).expect("prune");
+    assert_eq!(pruned.blobs_removed, 2, "{pruned:?}");
+    assert!(!store.has(&crashed) && !store.has(&duplicate));
 }
 
 /// A tree object made by `git mktree` from `listing`.

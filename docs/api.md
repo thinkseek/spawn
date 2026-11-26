@@ -6,7 +6,7 @@ Every route `spawn serve` answers under `/api/`, on one page. The router is
 dispatch on one table, `ROUTES`; what each answer holds is documented on its
 handler there. Words are as in the [glossary](./glossary.md).
 
-`main` serves 29 GET route patterns and 9 POST routes. (Before issue 98's
+`main` serves 31 GET route patterns and 9 POST routes. (Before issue 98's
 canonical names it was 28 GET patterns: a session's commands and
 judgements were one pattern, `/api/fleet/<session>/<view>`, and are two
 routes now.) A `<name>` in a path is one non-empty segment: `<id>` a
@@ -70,6 +70,8 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | GET | `/api/stream` | The log as Server-Sent Events, live: `event: ready`, then one frame per event (its `/api/events` row), a comment probe `:` every 500 ms of quiet (a page gone, a reset included, frees its slot within a few probes) and `: keepalive` in its place every 15 s; catch-up of at most 500 events after `Last-Event-ID` or `?after=<id>`, else `event: resync`; on 64 slots of its own, at most 16 per client address that is not loopback (503 when all are taken, or that address's are), no `ETag` ([`serve/stream.rs`](../crates/spawn-cli/src/serve/stream.rs)) | – | web (`stream.ts`: live invalidation of Home's boards, one stream shared among tabs) |
 | GET | `/api/approvals` | The prompts a person must answer, read from the live panes (numbered choices, permission buttons, yes/no, confirm), sessions whose judgement asks for a person, and halted missions; each item's `id` is its `approval_id` ([`serve/approvals.rs`](../crates/spawn-cli/src/serve/approvals.rs)); a session's item also carries `auto: {state, answered, breaker}`, what the run-time resolver did and may do there ("Automatic answers" below) | – | web (Home, `approvals.ts`: the approvals queue) |
 | GET | `/api/context/digest` | The fleet in one small answer: states, nodes with power and the low-battery soft drain, open missions with their last gate failure, pending approvals, the supervisor's notes for the owner, and a Markdown `digest_text` under 4000 bytes ([`serve/digest.rs`](../crates/spawn-cli/src/serve/digest.rs)) | – | web (Home, `digest.ts`: the digest line and drawer) |
+| GET | `/api/prov/who` | Who made a file as the last recorded first-parent commit of `main` that touched it left it: that `land` or `import` Change, its entry, the `edit` revision the content came from (`origin`) and the path's history, oldest first; `?path=` (required), `?source=` (the domain `git:<source>`; every domain when empty); a `line` is 400 (a line's blame needs the repository) ([`serve/prov.rs`](../crates/spawn-cli/src/serve/prov.rs), [provenance](./provenance.md)) | `spawn prov who <path>[:<line>] --source <source>` (file-level from git's `main`, and a line's blame) | no web page yet |
+| GET | `/api/prov/change/<id>` | Every revision of a Change (`<id>` its `change_id`), every Change of a task (digits) or the Change recorded for a commit (40 hex characters, read through the commit map both ways), each with its entries and edges; `{changes: []}` when none is recorded | `spawn prov show <id>`: the same JSON | no web page yet |
 
 ## Writes
 
