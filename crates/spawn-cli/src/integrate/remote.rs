@@ -2755,6 +2755,107 @@ pub(super) mod tests {
         assert_eq!(web_lock(&dir.0), None);
     }
 
+    /// Pack `ctl` keyed as `Primary::publish` and `NodeShadows::publish`
+    /// key it; the key and what was served.
+    fn keyed_pack(artifacts: &Artifacts, ctl: &Path, at: &Path) -> (String, Published) {
+        let scenarios = ctl.join("rsi/scenarios");
+        let digest = super::super::inputs::scenarios_sha256(&scenarios).unwrap();
+        let key = controller_pack_key(ctl, CONTROLLER, at, &digest).unwrap();
+        let published = artifacts
+            .controller_pack(ctl, &scenarios, at, Some(&key))
+            .unwrap();
+        (key, published)
+    }
+
+    #[test]
+    fn the_controller_pack_key_covers_scripts_modes_links_the_web_lock_and_the_scenarios_place() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = Scratch::new("pack-key");
+        let ctl = controller(&dir.0);
+        let artifacts = Artifacts::new(dir.0.join("artifacts"));
+        let at = Path::new("rsi/scenarios");
+        let chmod = |file: &str, mode: u32| {
+            std::fs::set_permissions(ctl.join(file), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        };
+        chmod("scripts/rsi/gate.sh", 0o644);
+        std::os::unix::fs::symlink("gate.sh", ctl.join("scripts/rsi/link")).unwrap();
+        // The same inputs: the same key, a cache hit (the cache entry is
+        // what serves it: a planted entry is returned as is).
+        let (key, first) = keyed_pack(&artifacts, &ctl, at);
+        assert_eq!(key.len(), 64);
+        let (again, hit) = keyed_pack(&artifacts, &ctl, at);
+        assert_eq!((&again, &hit), (&key, &first));
+        let entry = artifacts.cache_path("controller", &key);
+        assert!(entry.is_file());
+        let mut seen = vec![key.clone()];
+        let mut last = first;
+        // Each change: a new key and a fresh pack, never the stale one.
+        let mut changed = |what: &str, at: &Path| {
+            let (key, published) = keyed_pack(&artifacts, &ctl, at);
+            assert!(!seen.contains(&key), "{what}: a key already seen");
+            assert_ne!(published, last, "{what}: a stale pack");
+            let fresh = artifacts
+                .controller_pack(&ctl, &ctl.join("rsi/scenarios"), at, None)
+                .unwrap();
+            assert_eq!(published, fresh, "{what}: not what packing gives");
+            seen.push(key);
+            last = published;
+        };
+        std::fs::write(ctl.join("scripts/rsi/gate.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+        changed("gate.sh's contents", at);
+        chmod("scripts/rsi/gate.sh", 0o755);
+        changed("gate.sh's executable bit", at);
+        std::fs::write(ctl.join("scripts/rsi/other.sh"), "exit 0\n").unwrap();
+        std::fs::remove_file(ctl.join("scripts/rsi/link")).unwrap();
+        std::os::unix::fs::symlink("other.sh", ctl.join("scripts/rsi/link")).unwrap();
+        changed("a link's target (and a new script)", at);
+        std::fs::write(
+            ctl.join("web/package-lock.json"),
+            "{\"lockfileVersion\":2}\n",
+        )
+        .unwrap();
+        changed("the web lock's contents", at);
+        std::fs::remove_file(ctl.join("web/package-lock.json")).unwrap();
+        changed("the web lock removed", at);
+        std::fs::write(ctl.join("web/package-lock.json"), "{}\n").unwrap();
+        changed("the web lock added", at);
+        changed("the scenarios' place", Path::new("rsi/elsewhere"));
+
+        // No scripts at all: a key of its own too.
+        let bare = dir.0.join("bare");
+        std::fs::create_dir_all(bare.join("rsi/scenarios")).unwrap();
+        std::fs::write(bare.join("rsi/scenarios/check-ok.sh"), "exit 0\n").unwrap();
+        let with = controller_pack_key(&ctl, CONTROLLER, at, "d").unwrap();
+        let without = controller_pack_key(&bare, CONTROLLER, at, "d").unwrap();
+        assert_ne!(with, without);
+        // Fields cannot run into each other.
+        assert_ne!(
+            controller_pack_key(&bare, "ab", Path::new("c"), "d").unwrap(),
+            controller_pack_key(&bare, "a", Path::new("bc"), "d").unwrap()
+        );
+        // An entry that cannot be read: no key (packed uncached), not a
+        // stale hit.
+        let fifo = ctl.join("scripts/fifo");
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        assert!(controller_pack_key(&ctl, CONTROLLER, at, "d").is_err());
+        std::fs::remove_file(&fifo).unwrap();
+        if !nix_is_root() {
+            chmod("scripts/rsi/gate.sh", 0o000);
+            assert!(controller_pack_key(&ctl, CONTROLLER, at, "d").is_err());
+            chmod("scripts/rsi/gate.sh", 0o644);
+        }
+    }
+
+    /// Root reads files whatever their mode.
+    fn nix_is_root() -> bool {
+        Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
+    }
+
     #[test]
     fn the_registry_manifest_is_the_tree_of_registry_and_git_without_cargos_locks() {
         let dir = Scratch::new("registry");
