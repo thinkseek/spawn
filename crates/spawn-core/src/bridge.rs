@@ -9550,6 +9550,123 @@ mod tests {
         );
     }
 
+    /// Review 589, must-fix 1: a resumed agy session runs the model label
+    /// its last execution started on (its `execution.started` launch
+    /// model), over the host's `SPAWN_AGY_MODEL` and with it unset: a
+    /// revision stays on its preset's model.
+    #[test]
+    fn a_resumed_agy_session_runs_the_label_it_last_started_on() {
+        for host_model in [None, Some("gemini-3.8-flash-low")] {
+            let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+            let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+            let host = Witnessed::over(store.clone());
+            host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+            let agent = AgentId::new("agent_agy").expect("agent");
+            let session = SessionId::new("session_agy").expect("session");
+            let earlier = ExecutionId::for_command(CommandId(900));
+            let event = |key: &str, kind: EventKind| NewEvent {
+                agent_id: agent.clone(),
+                session_id: session.clone(),
+                execution_id: Some(earlier.clone()),
+                source: Source::Bridge,
+                source_event_id: Some(format!("{earlier}:{key}")),
+                kind,
+            };
+            store
+                .append(event(
+                    "started",
+                    EventKind::ExecutionStarted {
+                        engine: "agy".to_string(),
+                        workspace: WorkspaceId::new("agent_agy:/workspaces/agent_agy")
+                            .expect("workspace"),
+                        command_id: CommandId(900),
+                        fork: None,
+                        model: ModelProfile::Default,
+                        transcript_from: None,
+                        launch: Some(LaunchSummary {
+                            model: Some("gemini-3.8-pro".to_string()),
+                            ..LaunchSummary::default()
+                        }),
+                    },
+                ))
+                .expect("started");
+            store
+                .append(event(
+                    "native",
+                    EventKind::NativeSessionStarted {
+                        engine: "agy".to_string(),
+                        native_session_id: "conv-1".to_string(),
+                        transcript_path: None,
+                        engine_version: None,
+                    },
+                ))
+                .expect("native");
+            store
+                .append(event(
+                    "ended",
+                    EventKind::ExecutionEnded {
+                        cause: EndCause::Stopped,
+                        exit_code: Some(0),
+                        signal: None,
+                        evidence: None,
+                    },
+                ))
+                .expect("ended");
+            let id = store
+                .submit(
+                    &Principal::new("tester").expect("principal"),
+                    &Submission {
+                        agent_id: agent.clone(),
+                        session_id: session.clone(),
+                        idempotency_key: IdempotencyKey::new("resume-agy").expect("key"),
+                        action: CommandAction::Resume {
+                            prompt: None,
+                            model: None,
+                        },
+                    },
+                )
+                .expect("submit");
+            store.set_pane(
+                &TerminalName::for_execution(&ExecutionId::for_command(id)),
+                &agy_idle(),
+            );
+            let mut bridge = Bridge::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                host.clone(),
+                agy_config(host_model),
+            )
+            .with_clock(clock);
+            drive_work(&mut bridge, &store, || {
+                command_outcome(&store, id).is_some()
+            });
+            assert_eq!(
+                command_outcome(&store, id),
+                Some(Outcome::Succeeded),
+                "{host_model:?}"
+            );
+            let launch = store.launches().pop().expect("launched");
+            let arguments = launch.arguments.join(" ");
+            assert!(
+                arguments.contains("--conversation conv-1 --model gemini-3.8-pro --dangerously"),
+                "{host_model:?}: {arguments}"
+            );
+            // The resume records the label it ran on, so the next resume
+            // runs it too.
+            let resumed = records(&store)
+                .into_iter()
+                .filter_map(|record| match record.event.kind {
+                    EventKind::ExecutionStarted { launch, .. } => launch,
+                    _ => None,
+                })
+                .last()
+                .expect("a launch summary");
+            assert_eq!(resumed.model.as_deref(), Some("gemini-3.8-pro"));
+            assert_eq!(resumed.relay_url, None);
+        }
+    }
+
     fn records(store: &Arc<MemoryStore>) -> Vec<crate::event::EventRecord> {
         store.read_global(GlobalPosition(0), 10_000).expect("read")
     }
