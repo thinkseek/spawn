@@ -9581,11 +9581,11 @@ mod tests {
                             .expect("workspace"),
                         command_id: CommandId(900),
                         fork: None,
-                        model: ModelProfile::Default,
+                        model: crate::event::ModelProfile::Default,
                         transcript_from: None,
-                        launch: Some(LaunchSummary {
+                        launch: Some(crate::event::LaunchSummary {
                             model: Some("gemini-3.8-pro".to_string()),
-                            ..LaunchSummary::default()
+                            ..crate::event::LaunchSummary::default()
                         }),
                     },
                 ))
@@ -9605,7 +9605,7 @@ mod tests {
                 .append(event(
                     "ended",
                     EventKind::ExecutionEnded {
-                        cause: EndCause::Stopped,
+                        cause: crate::event::EndCause::Stopped,
                         exit_code: Some(0),
                         signal: None,
                         evidence: None,
