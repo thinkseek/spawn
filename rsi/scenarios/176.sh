@@ -186,6 +186,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/lines.json" ]; then
             echo "176: the last answer (first 4000 bytes):" >&2

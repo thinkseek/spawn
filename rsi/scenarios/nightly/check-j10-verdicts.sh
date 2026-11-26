@@ -128,6 +128,7 @@ lane_cleanup() {
 lane_finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ]; then
         echo "j10: lane $lane failed in part ${P##*/}" >&2
         if [ -s "$WORK/loop.log" ]; then
@@ -2152,7 +2153,7 @@ stop_lanes() {
     done
     rm -rf "$lanes"
 }
-trap 'trap - EXIT; stop_lanes' EXIT
+trap 'trap - EXIT; set +e; stop_lanes' EXIT
 trap 'exit 130' INT TERM
 
 (lane_a) &

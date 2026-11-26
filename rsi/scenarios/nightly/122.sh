@@ -72,6 +72,7 @@ export TMPDIR
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     [ -z "${bgpid-}" ] || kill -9 "$bgpid" 2>/dev/null || true
     rm -rf "$WORK"
     if [ "$rc" -eq 0 ]; then exit 0; fi

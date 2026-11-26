@@ -109,6 +109,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ] && [ -s "$WORK/out.txt" ]; then
         echo "212: the last output (first 60 lines):" >&2
         head -n 60 "$WORK/out.txt" >&2

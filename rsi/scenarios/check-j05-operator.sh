@@ -146,6 +146,7 @@ stop_herdr() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ]; then
         echo "j05: failed in part $part" >&2
         if [ "$part" = 027 ] && [ -n "${SPAWN_DB_NAME-}" ]; then

@@ -145,6 +145,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "j08: the loop's last lines:" >&2
@@ -443,6 +444,7 @@ part_006() {
     p006_finish() {
         rc=$?
         trap - EXIT
+        set +e
         if [ "$rc" -eq 0 ]; then exit 0; fi
         if [ "$rc" -eq 1 ] && [ -n "$asserted" ]; then exit 1; fi
         [ "$rc" -eq 2 ] || echo "j08: [006] harness: unexpected exit $rc" >&2

@@ -279,7 +279,7 @@ herdr_kill_server() {
         if [ -n "$hs_ppid" ]; then
             kill -KILL "$hs_ppid" 2>/dev/null || true
         fi
-        rm -f "$HERDR_PROXY_PIDFILE"
+        rm -f "$HERDR_PROXY_PIDFILE" 2>/dev/null || true
     fi
     for hs_sock in "${HERDR_UPSTREAM_SOCKET-}" "${HC_SOCKET-}"; do
         [ -n "$hs_sock" ] || continue
@@ -308,15 +308,38 @@ herdr_kill_server() {
                 kill -KILL "$hs_p" 2>/dev/null || true
             done
         fi
-        rm -f "$hs_sock"
+        rm -f "$hs_sock" 2>/dev/null || true
+        if [ -n "${XDG_RUNTIME_DIR-}" ] && [ -n "$hs_sess" ]; then
+            rm -f "$XDG_RUNTIME_DIR/herdr-core/$hs_sess".* 2>/dev/null || true
+        fi
     done
+    # Fallback reap by /proc/*/environ in case a daemon's socket disappeared before teardown.
+    for hs_sess in "${HERDR_UPSTREAM_NAME-}" "${HC_SESSION-}" "${SPAWN_HERDR_SESSION-}"; do
+        [ -n "$hs_sess" ] || continue
+        for hs_env in /proc/[0-9]*/environ; do
+            [ -r "$hs_env" ] || continue
+            hs_p=${hs_env#/proc/}
+            hs_p=${hs_p%/environ}
+            [ "$hs_p" != "$$" ] || continue
+            if tr '\0' '\n' <"$hs_env" 2>/dev/null | grep -qx "HC_SESSION=$hs_sess"; then
+                hs_cmd=$(tr '\0' ' ' <"/proc/$hs_p/cmdline" 2>/dev/null || true)
+                case " $hs_cmd " in
+                *spawn-hc* | *herdr-fault-proxy.py*)
+                    kill -KILL "$hs_p" 2>/dev/null || true
+                    ;;
+                esac
+            fi
+        done
+    done
+    return 0
 }
 
 herdr_cleanup() {
     herdr_kill_server >/dev/null 2>&1 || true
     if [ -n "${HERDR_SHORT_RUNTIME-}" ] && [ -d "$HERDR_SHORT_RUNTIME" ]; then
         chmod -R u+rwX "$HERDR_SHORT_RUNTIME" 2>/dev/null || true
-        rm -rf "$HERDR_SHORT_RUNTIME"
+        rm -rf "$HERDR_SHORT_RUNTIME" 2>/dev/null || true
         HERDR_SHORT_RUNTIME=""
     fi
+    return 0
 }

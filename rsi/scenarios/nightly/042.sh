@@ -160,6 +160,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "042: the loop's last lines:" >&2
@@ -542,7 +543,7 @@ assert_eq "$(jq -r --arg e "$first" '.executions[] | select(.execution_id == $e)
 
 # --- (2) reassign from the page -------------------------------------------------------------
 
-code=$(page_post "$session_moved" reassign '{"reason":"stuck on the tests"}')
+code=$(page_post "$session_moved" reassign '{"reason":"stuck on the tests","key":"bb-042-reassign-1"}')
 [ "$code" = 202 ] || fail "(2) POST /api/session/$session_moved/reassign answered $code: $(head -c 300 "$WORK/post.json")"
 new_task=$(jq -r '.task' "$WORK/post.json")
 new_session=$(jq -r '.session_id' "$WORK/post.json")
@@ -592,7 +593,7 @@ printf '%s %s' "$(out)" "$(err)" | grep -q reported ||
     fail "(3) spawn task restart of the reported task did not name its state: $(err | head -c 300)"
 supervisor_before=$(q "select count(*) from spawn_commands where session_id = 'session_supervisor' and principal = 'human'")
 records_before=$(q "select count(*) from spawn_events where event_name = 'control.recorded' and $RECORD ->> 'type' like 'task.%'")
-code=$(page_post session_supervisor restart '{"reason":"no task"}')
+code=$(page_post session_supervisor restart '{"reason":"no task","key":"bb-042-sup-restart-1"}')
 assert_eq "$code" 409 "(3) the page's restart of the supervisor (no delivered task): $(head -c 200 "$WORK/post.json")"
 sleep 5
 assert_eq "$(commands_into "$session_restarted")" "$before" "(3) commands into the reported task's worker after the refused restart"

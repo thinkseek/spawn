@@ -88,6 +88,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ] && [ -s "$WORK/api.json" ]; then
         echo "185: the last answer's storage line:" >&2
         jq -c '.lines[] | select(.line == "storage")' "$WORK/api.json" >&2 2>/dev/null || true

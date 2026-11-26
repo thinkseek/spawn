@@ -77,6 +77,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         echo "172: the gate runs:" >&2
         cat "$WORK/judged.log" >&2 2>/dev/null || true

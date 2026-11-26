@@ -76,7 +76,7 @@ cleanup() {
     chmod -R u+rwX "$WORK" 2>/dev/null || true
     rm -rf "$WORK"
 }
-trap 'status=$?; cleanup; case $status in 0 | 1 | 2) exit "$status" ;; *) echo "107: harness: unexpected exit $status" >&2; exit 2 ;; esac' EXIT
+trap 'status=$?; set +e; cleanup; case $status in 0 | 1 | 2) exit "$status" ;; *) echo "107: harness: unexpected exit $status" >&2; exit 2 ;; esac' EXIT
 trap 'exit 130' INT TERM
 
 # The build, outside what is judged.

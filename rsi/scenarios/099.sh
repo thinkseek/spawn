@@ -202,6 +202,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
+    set +e
     if [ "$rc" -ne 0 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "099: the loop's last lines:" >&2

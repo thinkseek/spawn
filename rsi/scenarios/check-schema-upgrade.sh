@@ -93,6 +93,7 @@ fresh="${db}_fresh"
 made=""
 made_fresh=""
 cleanup() {
+    set +e
     if [ -n "$made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$db" >/dev/null 2>&1 || true
     fi
