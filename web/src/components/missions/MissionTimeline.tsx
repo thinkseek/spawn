@@ -31,7 +31,7 @@ import type {
   VerdictReasons,
 } from "../../missionTimeline";
 import type { SourceHold } from "../../attention";
-import type { Mission } from "../../missions";
+import { formatTaskGrading, type Mission } from "../../missions";
 import type { TaskSection } from "../../ordering";
 import { SECTION_LABEL, groupTasks, missionClass, taskTitle } from "../../ordering";
 import { TODAY_MS } from "../../home";
@@ -63,6 +63,7 @@ import {
 import { EmptyState, FOCUS_RING, FOCUS_RING_INSET, chip, cx } from "../ui";
 import { useStoredChoice } from "../ViewToggle";
 import { TaskPanel } from "./TaskPanel";
+import { TaskGradingCompact } from "./parts";
 import { PHASE_COLOR, PHASE_LEGEND, verdictColor } from "./timelineStyle";
 
 const LANE_H = 40;
@@ -1150,6 +1151,13 @@ function TaskLabel({
 }) {
   const { bar } = row;
   const nested = row.depth === 1;
+  const grading = formatTaskGrading(bar.task);
+  const labelText = row.title
+    ? `${bar.label} · ${row.title}`
+    : row.outcome
+      ? `${bar.label} · ${row.outcome}`
+      : bar.label;
+  const buttonTitle = grading?.tooltipLine ? `${labelText}\n${grading.tooltipLine}` : row.title || row.outcome ? labelText : undefined;
   return (
     <div
       role="treeitem"
@@ -1168,7 +1176,7 @@ function TaskLabel({
         tabIndex={-1}
         onClick={onSelect}
         onPointerDown={(event) => event.stopPropagation()}
-        title={row.title ? `${bar.label} · ${row.title}` : row.outcome ? `${bar.label} · ${row.outcome}` : undefined}
+        title={buttonTitle}
         className={cx(
           "flex h-full shrink-0 items-center gap-2 pr-3 text-left outline-none",
           nested ? "pl-12" : "pl-9",
@@ -1207,6 +1215,7 @@ function TaskLabel({
             )}
           </>
         )}
+        {grading && <TaskGradingCompact grading={grading} showPreset={!nested && labelW >= 300} />}
         {!nested && row.retries > 1 && (
           <span
             className="tnum flex shrink-0 items-center gap-0.5 text-micro text-muted-foreground"
@@ -1504,6 +1513,7 @@ function TaskTip({
   }
   const segment = phaseAt(bar, time, now);
   const total = (bar.end ?? now) - bar.start;
+  const grading = formatTaskGrading(bar.task);
   return (
     <>
       <div className="flex items-center gap-2">
@@ -1514,6 +1524,13 @@ function TaskTip({
         </span>
       </div>
       {title && <div className="mt-0.5 line-clamp-2 text-white/85">{title}</div>}
+      {grading && (
+        <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-white/80">
+          {grading.difficultyBadge && <span className="font-medium">{grading.difficultyBadge}</span>}
+          {grading.presetBadge && <span className="font-mono text-white/65">{grading.presetBadge}</span>}
+          {grading.reworkBadge && <span className="text-white/75">{grading.reworkBadge}</span>}
+        </div>
+      )}
       {segment && (
         <div className="mt-0.5 flex items-center gap-1.5">
           <span className="h-1.5 w-2.5 rounded-full" style={{ background: PHASE_COLOR[segment.phase] }} />

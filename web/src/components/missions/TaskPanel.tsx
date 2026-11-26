@@ -5,14 +5,12 @@ import type { ReactNode } from "react";
 import { clockTime, formatDuration, relativeTime, stageDuration } from "../../format";
 import { PHASE_LABEL } from "../../missionTimeline";
 import type { Lane, TaskBar } from "../../missionTimeline";
-import { stageStep } from "../../missions";
+import { formatTaskGrading, stageStep } from "../../missions";
 import { taskTitle } from "../../ordering";
 import { VerdictBadge } from "../rsi/Phase";
 import { cx } from "../ui";
-import { Badge } from "../ui/badge";
-import { gradeTone, taskGradingSummary } from "../../grading.ts";
 import { TaskText, useTaskTexts } from "./TaskTexts";
-import { AgentLink, Collapsible } from "./parts";
+import { AgentLink, Collapsible, TaskGradingDetails } from "./parts";
 import { TaskActivityLine } from "./TaskActivity";
 import { PHASE_COLOR, verdictColor } from "./timelineStyle";
 
@@ -42,7 +40,7 @@ export function TaskPanel({
   onZoom: () => void;
 }) {
   const task = bar.task;
-  const grading = taskGradingSummary(task);
+  const grading = formatTaskGrading(task);
   // Opened, the task's texts are read in full (the board sends their first
   // lines).
   const texts = useTaskTexts(task, true);
@@ -143,71 +141,7 @@ export function TaskPanel({
             </Field>
           )}
           {task.model === "cheap" && <Field label="Model">cheap (DeepSeek)</Field>}
-          {(grading?.difficulty || grading?.routedDifficulty) &&
-            (() => {
-              const activeDifficulty = grading.routedDifficulty ?? grading.difficulty;
-              return (
-                <Field label="Difficulty">
-                  <span className="inline-flex flex-wrap items-center gap-1.5">
-                    <Badge tone={grading.steppedUp ? "warning" : gradeTone(activeDifficulty)}>
-                      {grading.steppedUp && grading.difficulty && grading.routedDifficulty
-                        ? `${grading.difficulty} → ${grading.routedDifficulty}`
-                        : activeDifficulty}
-                    </Badge>
-                    {grading.tierRole && (
-                      <span className="font-mono text-caption text-muted-foreground">
-                        {grading.tierRole}
-                      </span>
-                    )}
-                  </span>
-                </Field>
-              );
-            })()}
-          {(grading?.presetId || grading?.modelLabel || grading?.executionProfile) && (
-            <Field label={grading.presetId ? "Preset" : "Model"}>
-              {grading.presetId && (
-                <span className="font-mono text-caption">
-                  {grading.rerouted
-                    ? `${grading.firstPresetId} → ${grading.presetId}`
-                    : grading.presetId}
-                </span>
-              )}
-              {grading.executionProfile && (
-                <span
-                  className={cx(
-                    "text-caption text-muted-foreground",
-                    grading.presetId && "ml-1.5",
-                  )}
-                >
-                  ({grading.executionProfile})
-                </span>
-              )}
-              {grading.modelLabel && (
-                <span
-                  className={cx(
-                    "font-mono text-caption text-muted-foreground",
-                    (grading.presetId || grading.executionProfile) && "ml-1.5",
-                  )}
-                >
-                  {grading.engineLabel
-                    ? `${grading.engineLabel}/${grading.modelLabel}`
-                    : grading.modelLabel}
-                </span>
-              )}
-            </Field>
-          )}
-          {grading && grading.qualityRejections > 0 && (
-            <Field label="Quality rej">
-              <span className="inline-flex flex-wrap items-center gap-1.5">
-                <Badge tone="warning">{grading.qualityRejections}</Badge>
-                {grading.steppedUp && grading.difficulty && grading.routedDifficulty && (
-                  <span className="text-caption text-warning">
-                    stepped up {grading.difficulty} → {grading.routedDifficulty}
-                  </span>
-                )}
-              </span>
-            </Field>
-          )}
+          {grading && <TaskGradingDetails grading={grading} />}
         </dl>
 
         {lastVerdict && (
