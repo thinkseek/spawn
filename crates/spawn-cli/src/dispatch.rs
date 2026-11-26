@@ -260,6 +260,10 @@ pub(crate) struct Facts {
     /// The model profile of the session's latest execution.
     #[serde(default)]
     pub(crate) model: ModelProfile,
+    /// The engine of the session's latest execution (`claude`, `agy`);
+    /// none when it never ran (or a record names none: Claude Code's).
+    #[serde(default)]
+    pub(crate) engine: Option<String>,
     /// Executions the dispatcher's resumes started that were lost (or
     /// exited non-zero) within a minute, since the session's last execution
     /// that stayed up.
@@ -506,6 +510,11 @@ pub(crate) enum Why {
     /// a transient error whose retries are spent (`model_unavailable`)
     /// ([`digest::model_finals`], told once).
     ModelFinal,
+    /// A task's delivery would run on an engine, or a model label, this
+    /// host cannot run (`engine_unavailable`, [`deliver`]'s
+    /// `engine_unavailable`): no command is made, and the task waits. A
+    /// condition while the engine stays unavailable.
+    EngineUnavailable,
 }
 
 impl Why {
