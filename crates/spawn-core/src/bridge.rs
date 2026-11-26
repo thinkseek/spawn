@@ -305,6 +305,36 @@ pub struct BridgeConfig {
     /// if nobody does, the start fails naming the dialog and the switch
     /// ([`TRUST_OFF`]).
     pub auto_trust: bool,
+    /// Whether an engine with no deny rules of its own
+    /// ([`crate::driver::Guard::Sandbox`]) runs inside a filesystem view
+    /// (decision C2, N6; `SPAWN_ENGINE_VIEW`). Required by default, and
+    /// with no view: such an engine is refused (`engine_unavailable`)
+    /// until the host hands one over. Claude Code never runs in one.
+    pub engine_view: EngineViewPolicy,
+}
+
+/// The prefix of the reason a start of an engine this host cannot run
+/// safely is refused with: the delivery's escalation names the same.
+pub const ENGINE_UNAVAILABLE: &str = "engine_unavailable";
+
+/// Whether a [`crate::driver::Guard::Sandbox`] engine runs inside a
+/// filesystem view ([`BridgeConfig::engine_view`]).
+#[derive(Debug, Clone)]
+pub enum EngineViewPolicy {
+    /// Only inside this view (`SPAWN_ENGINE_VIEW=required`, the default);
+    /// the error says why this host has none, and such an engine does not
+    /// start.
+    Required(Result<Arc<dyn EngineView>, String>),
+    /// Without one (`SPAWN_ENGINE_VIEW=off`, the owner's explicit choice):
+    /// the engine sees whatever its uid sees, as before N6.
+    Off,
+}
+
+impl EngineViewPolicy {
+    /// Required, with no view yet: the default of a [`BridgeConfig`].
+    pub fn unconfigured() -> Self {
+        Self::Required(Err("no filesystem view is configured".to_string()))
+    }
 }
 
 /// Environment an engine gets only when it is safe at its launch (see
@@ -340,6 +370,7 @@ impl BridgeConfig {
             launch_environment: None,
             recover_worker_leases: true,
             auto_trust: true,
+            engine_view: EngineViewPolicy::unconfigured(),
         }
     }
 
@@ -4194,6 +4225,26 @@ impl Bridge {
         self.launch_and_prompt(claimed, &active, native, &prepared, prompt, report)
     }
 
+    /// Why `driver`'s engine cannot start on this host for want of a
+    /// filesystem view: it has no deny rules of its own
+    /// ([`crate::driver::Guard::Sandbox`]), the host requires a view for
+    /// it ([`BridgeConfig::engine_view`]) and has none. Checked before
+    /// anything is mounted; the view of the launch itself is made at the
+    /// launch ([`Self::launch`]).
+    fn no_engine_view(&self, driver: &dyn AgentDriver) -> Option<String> {
+        if driver.traits().guard != crate::driver::Guard::Sandbox {
+            return None;
+        }
+        match &self.config.engine_view {
+            EngineViewPolicy::Required(Err(why)) => Some(format!(
+                "{ENGINE_UNAVAILABLE}: engine {} has no deny rules of its own and runs only inside \
+                 a filesystem view (SPAWN_ENGINE_VIEW=required), which this host has none of: {why}",
+                driver.id()
+            )),
+            EngineViewPolicy::Required(Ok(_)) | EngineViewPolicy::Off => None,
+        }
+    }
+
     /// Why `driver`'s engine cannot run on this terminal host: an engine
     /// other than Claude Code is followed through the host's own agent
     /// readings (its session, its state), which a host with none (tmux)
@@ -4285,6 +4336,9 @@ impl Bridge {
                     }
                 },
             }
+        }
+        if let Some(why) = self.no_engine_view(driver) {
+            return Ok(Err(why));
         }
         let model = model.unwrap_or_else(|| {
             self.sessions
@@ -5014,7 +5068,7 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<Handled, StoreError> {
         let fresh = self.name_session(claimed, native, active)?;
-        let launch = self.launch(
+        let launched = self.launch(
             claimed,
             active,
             &EngineLaunch {
@@ -5027,6 +5081,14 @@ impl Bridge {
                 model: prepared.model_label.as_deref(),
             },
         );
+        let launch = match launched {
+            Ok(launch) => launch,
+            Err(why) => {
+                return self
+                    .abandon(claimed, active, why, true)
+                    .map(Handled::Finished);
+            }
+        };
         if let Err(error) = self.terminals.start(&launch) {
             return self
                 .abandon(claimed, active, format!("start terminal: {error}"), true)
@@ -5989,10 +6051,21 @@ impl Bridge {
             .filter(|dir| !dir.is_empty())
     }
 
-    fn launch(&self, claimed: &Claimed, active: &Active, run: &EngineLaunch<'_>) -> Launch {
-        let plan = active
-            .driver
-            .launch(&self.config.home_of(active.driver), run);
+    /// The terminal launch of `active`'s engine: the runner (`spawn run`)
+    /// of the engine's program, with the environment of the host, the
+    /// session and the engine. An engine with no deny rules of its own
+    /// ([`crate::driver::Guard::Sandbox`]) runs inside the host's
+    /// filesystem view ([`BridgeConfig::engine_view`]): the launch's
+    /// program is the view's (`bwrap`), and the runner is what it runs.
+    /// Why the view cannot be made is the error, and nothing starts.
+    fn launch(
+        &self,
+        claimed: &Claimed,
+        active: &Active,
+        run: &EngineLaunch<'_>,
+    ) -> Result<Launch, String> {
+        let home = self.config.home_of(active.driver);
+        let plan = active.driver.launch(&home, run);
         let mut arguments = vec!["run".to_string(), "--".to_string(), plan.program];
         arguments.extend(plan.arguments);
         let mut environment = self.config.environment.clone();
@@ -6035,14 +6108,62 @@ impl Bridge {
             "SPAWN_WORKSPACE".to_string(),
             active.workspace.path().to_string(),
         ));
-        Launch {
+        let mut program = self.config.spawn_program.clone();
+        if active.driver.traits().guard == crate::driver::Guard::Sandbox {
+            match &self.config.engine_view {
+                EngineViewPolicy::Off => {}
+                EngineViewPolicy::Required(Err(why)) => {
+                    return Err(format!(
+                        "{ENGINE_UNAVAILABLE}: engine {} runs only inside a filesystem view, \
+                         which this host has none of: {why}",
+                        active.driver.id()
+                    ));
+                }
+                EngineViewPolicy::Required(Ok(view)) => {
+                    let tmpdir = environment
+                        .iter()
+                        .rev()
+                        .find(|(name, _)| name == "TMPDIR")
+                        .map(|(_, value)| value.as_str());
+                    let words = view
+                        .wrap(&ViewedLaunch {
+                            engine: active.driver.id(),
+                            workspace: active.workspace.path(),
+                            engine_home: &home.sessions,
+                            tmpdir,
+                        })
+                        .map_err(|why| {
+                            format!(
+                                "{ENGINE_UNAVAILABLE}: engine {}: its filesystem view ({}) \
+                                 cannot be made: {why}",
+                                active.driver.id(),
+                                view.name()
+                            )
+                        })?;
+                    let Some((view_program, view_arguments)) = words.split_first() else {
+                        return Err(format!(
+                            "{ENGINE_UNAVAILABLE}: engine {}: its filesystem view ({}) gave \
+                             no program",
+                            active.driver.id(),
+                            view.name()
+                        ));
+                    };
+                    let mut wrapped = view_arguments.to_vec();
+                    wrapped.push(program);
+                    wrapped.extend(arguments);
+                    arguments = wrapped;
+                    program = view_program.clone();
+                }
+            }
+        }
+        Ok(Launch {
             terminal: active.terminal(),
             workspace: active.workspace.clone(),
             cwd: active.workspace.path().to_string(),
-            program: self.config.spawn_program.clone(),
+            program,
             arguments,
             environment,
-        }
+        })
     }
 
     /// Advance the wait for the engine's input box by one capture, then type
