@@ -123,7 +123,17 @@ fn at_prompt(input: &JudgeInput) -> bool {
 /// it waits on its own job, which is work, not idleness. However long the
 /// job runs: its bound is the control layer's (`SPAWN_JOB_BOUND_SECS`).
 pub(super) fn waits_on_own_job(input: &JudgeInput) -> bool {
-    input.execution_active && input.open_jobs > 0 && at_prompt(input)
+    input.execution_active
+        && input.stalled_end.is_none()
+        && !input.permission_pending
+        && input.open_tools == 0
+        && input.open_jobs > 0
+        && input.turn != Some(TurnFact::Failed)
+        && !matches!(
+            input.screen,
+            Some(ScreenState::Busy | ScreenState::Error | ScreenState::Permission)
+        )
+        && at_prompt(input)
 }
 
 /// Rules for a session with no running execution.
@@ -338,5 +348,51 @@ mod tests {
             wait_reason(SemanticState::Waiting, &idle_at_prompt),
             Some(WaitReason::WaitingForUserInput)
         );
+    }
+
+    #[test]
+    fn waits_on_own_job_requires_clean_prompt_with_open_jobs() {
+        let base = JudgeInput {
+            agent_id: "agent_a".into(),
+            session_id: "session_a".into(),
+            engine: Some("agy".into()),
+            execution_active: true,
+            stalled_end: None,
+            last_end: None,
+            exit_code: None,
+            open_tools: 0,
+            open_jobs: 1,
+            oldest_job_ms: Some(1_000),
+            last_tool: Some("run_command".into()),
+            permission_pending: false,
+            screen: Some(ScreenState::Ready),
+            turn: Some(TurnFact::Stopped),
+            last_error: None,
+            evidence_seq: crate::event::SessionSeq(1),
+            ambiguity: None,
+            quiet_ms: Some(1_000),
+            progress_ms: Some(1_000),
+            task: None,
+            screen_tail: None,
+            reply: None,
+            perpetual: false,
+        };
+        assert!(waits_on_own_job(&base));
+        assert!(!waits_on_own_job(&JudgeInput {
+            open_jobs: 0,
+            ..base.clone()
+        }));
+        assert!(!waits_on_own_job(&JudgeInput {
+            open_tools: 1,
+            ..base.clone()
+        }));
+        assert!(!waits_on_own_job(&JudgeInput {
+            screen: Some(ScreenState::Busy),
+            ..base.clone()
+        }));
+        assert!(!waits_on_own_job(&JudgeInput {
+            turn: Some(TurnFact::Failed),
+            ..base
+        }));
     }
 }

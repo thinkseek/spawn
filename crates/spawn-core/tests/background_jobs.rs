@@ -621,3 +621,302 @@ fn the_bridge_records_the_jobs_of_an_execution_from_its_transcript() {
     let after = judge(&mut fixture);
     assert_eq!(after.ambiguity, Some(Ambiguity::TurnStoppedIdle));
 }
+
+fn agy_execution_started(store: &MemoryStore, execution: u64) {
+    append(
+        store,
+        execution,
+        None,
+        EventKind::ExecutionStarted {
+            engine: "agy".to_string(),
+            workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+            command_id: CommandId(execution),
+            fork: None,
+            model: ModelProfile::Default,
+            transcript_from: None,
+            launch: None,
+        },
+    );
+}
+
+fn read_agy_line(
+    store: &MemoryStore,
+    execution: u64,
+    cursor: &mut spawn_core::driver::LineCursor,
+    line: &str,
+) {
+    use spawn_core::driver::{AgentDriver, AgyDriver};
+    for event in AgyDriver.read_line(line, cursor).events {
+        append(
+            store,
+            execution,
+            event.source_event_id.as_deref(),
+            event.kind,
+        );
+    }
+}
+
+fn set_screen_ready(store: &MemoryStore, execution: u64) {
+    append(
+        store,
+        execution,
+        None,
+        EventKind::ScreenObserved {
+            state: spawn_core::screen::ScreenState::Ready,
+            evidence: "prompt".to_string(),
+        },
+    );
+}
+
+#[test]
+fn agy_background_task_killed_via_manage_task_transitions_from_working_to_waiting() {
+    use spawn_core::driver::LineCursor;
+
+    const CONV: &str = "11111111-2222-4333-8444-555555555555";
+    let mut fixture = fixture();
+    let store = fixture.store.clone();
+    agy_execution_started(&store, 1);
+    let mut cursor = LineCursor {
+        native: CONV.to_string(),
+        ..LineCursor::default()
+    };
+
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"run background command"}"#,
+    );
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"sleep 60"}}]}"#,
+    );
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        &format!(
+            r#"{{"step_index":2,"source":"MODEL","type":"GENERIC","status":"RUNNING","content":"Tool is running as a background task with task id: {CONV}/task-2"}}"#
+        ),
+    );
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting on task."}"#,
+    );
+    set_screen_ready(&store, 1);
+    waits_on_its_job(&judge(&mut fixture));
+    assert_eq!(fixture.judge.calls(), 0);
+
+    // Failed kill must NOT close the task: session stays WAITING_FOR_BACKGROUND_JOB.
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        &format!(
+            r#"{{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{{"name":"manage_task","args":{{"Action":"kill","TaskId":"{CONV}/task-2"}}}}]}}"#
+        ),
+    );
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        &format!(
+            r#"{{"step_index":5,"source":"MODEL","type":"GENERIC","status":"ERROR","error":"cannot kill task \"{CONV}/task-2\"","content":"Encountered error in step execution: cannot kill task \"{CONV}/task-2\": busy"}}"#
+        ),
+    );
+    set_screen_ready(&store, 1);
+    waits_on_its_job(&judge(&mut fixture));
+    assert_eq!(fixture.judge.calls(), 0);
+
+    // Successful kill closes the task and following prose emits TurnStopped -> WAITING.
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        &format!(
+            r#"{{"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{{"name":"manage_task","args":{{"Action":"kill","TaskId":"{CONV}/task-2"}}}}]}}"#
+        ),
+    );
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        &format!(
+            r#"{{"step_index":7,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Task \"{CONV}/task-2\" cancelled."}}"#
+        ),
+    );
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Killed the task and ready for next steps."}"#,
+    );
+    let after = judge(&mut fixture);
+    assert_eq!(after.state, SemanticState::Waiting, "{after:?}");
+    assert_eq!(after.reason, Some(WaitReason::WaitingForUserInput));
+    assert_eq!(after.ambiguity, Some(Ambiguity::TurnStoppedIdle));
+    assert_eq!(after.judge, "jev");
+    assert!(!after.waits_on_own_job());
+}
+
+#[test]
+fn agy_subagent_kill_and_kill_all_clear_waiting_for_background_job() {
+    use spawn_core::driver::LineCursor;
+
+    const CONV: &str = "22222222-3333-4444-8555-666666666666";
+    const SUB1: &str = "66666666-7777-4888-8999-aaaaaaaaaaa1";
+    const SUB2: &str = "66666666-7777-4888-8999-aaaaaaaaaaa2";
+    let mut fixture = fixture();
+    let store = fixture.store.clone();
+    agy_execution_started(&store, 1);
+    let mut cursor = LineCursor {
+        native: CONV.to_string(),
+        ..LineCursor::default()
+    };
+
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"invoke_subagent","args":{"Prompt":"one"}},{"name":"invoke_subagent","args":{"Prompt":"two"}}]}"#,
+    );
+    for (step, sub) in [(2, SUB1), (3, SUB2)] {
+        read_agy_line(
+            &store,
+            1,
+            &mut cursor,
+            &format!(
+                r#"{{"step_index":{step},"type":"GENERIC","status":"DONE","content":"Created the following subagent:\n{{\n  \"conversationId\": \"{sub}\"\n}}"}}"#
+            ),
+        );
+    }
+    set_screen_ready(&store, 1);
+    waits_on_its_job(&judge(&mut fixture));
+
+    // Kill first subagent: second stays open -> still WaitingForBackgroundJob.
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        &format!(
+            r#"{{"step_index":4,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{{"name":"manage_subagents","args":{{"Action":"kill","ConversationIds":["{SUB1}"]}}}}]}}"#
+        ),
+    );
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":5,"type":"GENERIC","status":"DONE","content":"Killed subagent."}"#,
+    );
+    set_screen_ready(&store, 1);
+    waits_on_its_job(&judge(&mut fixture));
+
+    // kill_all clears remaining subagent; prose emits TurnStopped -> Waiting.
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":6,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"manage_subagents","args":{"Action":"kill_all"}}]}"#,
+    );
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":7,"type":"GENERIC","status":"DONE","content":"All subagents killed."}"#,
+    );
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":8,"type":"PLANNER_RESPONSE","status":"DONE","content":"Ready."}"#,
+    );
+    let after = judge(&mut fixture);
+    assert_eq!(after.state, SemanticState::Waiting, "{after:?}");
+    assert_eq!(after.reason, Some(WaitReason::WaitingForUserInput));
+    assert_eq!(after.ambiguity, Some(Ambiguity::TurnStoppedIdle));
+}
+
+#[test]
+fn agy_generic_system_message_and_force_cancel_clear_open_jobs() {
+    use spawn_core::driver::LineCursor;
+
+    const CONV: &str = "33333333-4444-4555-8666-777777777777";
+    let mut fixture = fixture();
+    let store = fixture.store.clone();
+    agy_execution_started(&store, 1);
+    let mut cursor = LineCursor {
+        native: CONV.to_string(),
+        ..LineCursor::default()
+    };
+
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"a"}},{"name":"run_command","args":{"CommandLine":"b"}},{"name":"run_command","args":{"CommandLine":"c"}}]}"#,
+    );
+    for task in [2_u64, 3, 4] {
+        read_agy_line(
+            &store,
+            1,
+            &mut cursor,
+            &format!(
+                r#"{{"step_index":{task},"type":"GENERIC","status":"RUNNING","content":"Tool is running as a background task with task id: {CONV}/task-{task}"}}"#
+            ),
+        );
+    }
+    set_screen_ready(&store, 1);
+    waits_on_its_job(&judge(&mut fixture));
+
+    // Close task-2 via GENERIC CANCELLED.
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"manage_task","args":{"Action":"list"}}]}"#,
+    );
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        &format!(
+            r#"{{"step_index":6,"type":"GENERIC","status":"CANCELLED","content":"{CONV}/task-2 cancelled"}}"#
+        ),
+    );
+    set_screen_ready(&store, 1);
+    waits_on_its_job(&judge(&mut fixture));
+
+    // Close task-3 via SYSTEM_MESSAGE cancellation.
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        &format!(
+            r#"{{"step_index":7,"type":"SYSTEM_MESSAGE","status":"DONE","content":"[Message] timestamp=x sender={CONV}/task-3 priority=HIGH content=Task id \"{CONV}/task-3\" was canceled with result:\nTool execution was canceled"}}"#
+        ),
+    );
+    set_screen_ready(&store, 1);
+    waits_on_its_job(&judge(&mut fixture));
+
+    // Close remaining task-4 via user force cancellation system notice.
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":8,"type":"SYSTEM_MESSAGE","status":"DONE","content":"[Message] timestamp=x sender=system priority=LOW content=[Notice] All your subagents and background tasks have been stopped due to user force cancellation."}"#,
+    );
+    read_agy_line(
+        &store,
+        1,
+        &mut cursor,
+        r#"{"step_index":9,"type":"PLANNER_RESPONSE","status":"DONE","content":"Ready after cancel."}"#,
+    );
+    let after = judge(&mut fixture);
+    assert_eq!(after.state, SemanticState::Waiting, "{after:?}");
+    assert_eq!(after.ambiguity, Some(Ambiguity::TurnStoppedIdle));
+    assert!(!after.waits_on_own_job());
+}
