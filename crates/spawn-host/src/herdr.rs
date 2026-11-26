@@ -441,7 +441,10 @@ pub(crate) fn herdr_key(key: &str) -> Result<Press, TerminalError> {
 /// and every `HERDR_*` one. Spawn run inside a Herdr pane has that pane's
 /// `HERDR_SOCKET_PATH`, which would aim a call at the user's own session.
 pub(crate) fn scrub(name: &std::ffi::OsStr) -> bool {
-    crate::tmux::scrub(name) || name.to_str().is_some_and(|name| name.starts_with("HERDR_"))
+    crate::tmux::scrub(name)
+        || name
+            .to_str()
+            .is_some_and(|name| name.starts_with("HERDR_") || name.starts_with("HC_"))
 }
 
 /// Whether `name` may name the host's Herdr session: a plain word that is
@@ -1487,7 +1490,7 @@ fn socket_of_status(status: &str) -> Option<PathBuf> {
 }
 
 /// Whether a failed connect says nothing listens there.
-fn no_listener(error: &std::io::Error) -> bool {
+pub(crate) fn no_listener(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
@@ -1496,7 +1499,7 @@ fn no_listener(error: &std::io::Error) -> bool {
 
 /// `path` is a directory only this user may enter, or the error that says
 /// it is not ([`crate::process::private_to_us`]).
-fn private(path: &Path) -> Result<(), TerminalError> {
+pub(crate) fn private(path: &Path) -> Result<(), TerminalError> {
     if crate::process::private_to_us(path) {
         Ok(())
     } else {
@@ -1510,7 +1513,7 @@ fn private(path: &Path) -> Result<(), TerminalError> {
 /// The server at the other end of `stream`, when it is this user's: its pid
 /// and its start time, wall clock.
 #[cfg(target_os = "linux")]
-fn peer_server(stream: &std::os::unix::net::UnixStream) -> Option<TerminalServer> {
+pub(crate) fn peer_server(stream: &std::os::unix::net::UnixStream) -> Option<TerminalServer> {
     let peer = rustix::net::sockopt::socket_peercred(stream).ok()?;
     if peer.uid.as_raw() != crate::process::current_uid() {
         return None;
@@ -1525,7 +1528,7 @@ fn peer_server(stream: &std::os::unix::net::UnixStream) -> Option<TerminalServer
 /// No `SO_PEERCRED` (nor `/proc`) off Linux: the peer cannot be told to be
 /// this user's server, so it never is, and every caller refuses it.
 #[cfg(not(target_os = "linux"))]
-fn peer_server(_stream: &std::os::unix::net::UnixStream) -> Option<TerminalServer> {
+pub(crate) fn peer_server(_stream: &std::os::unix::net::UnixStream) -> Option<TerminalServer> {
     None
 }
 
@@ -1919,15 +1922,87 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// A sharded pool of independent `herdr` daemons (`<session>-s0`, `<session>-s1`, ...)
-/// distributing terminals deterministically by terminal name so high-concurrency
-/// fleets avoid saturating a single `herdr` process.
+enum PoolShard {
+    Legacy(HerdrHost),
+    Core(crate::HerdrCoreHost),
+}
+
+impl PoolShard {
+    fn host(&self) -> &dyn TerminalHost {
+        match self {
+            Self::Legacy(host) => host,
+            Self::Core(host) => host,
+        }
+    }
+
+    fn session(&self) -> &str {
+        match self {
+            Self::Legacy(host) => host.session(),
+            Self::Core(host) => host.session(),
+        }
+    }
+
+    fn with_files_beneath(self, projects: crate::beneath::Beneath) -> Self {
+        match self {
+            Self::Legacy(host) => Self::Legacy(host.with_files_beneath(projects)),
+            Self::Core(host) => Self::Core(host.with_files_beneath(projects)),
+        }
+    }
+
+    fn with_runtime_under(self, base: &Path) -> Self {
+        match self {
+            Self::Legacy(host) => Self::Legacy(host.with_runtime_under(base.to_path_buf())),
+            Self::Core(host) => Self::Core(host.with_runtime_under(base.to_path_buf())),
+        }
+    }
+
+    fn as_legacy(&self) -> Option<&HerdrHost> {
+        match self {
+            Self::Legacy(host) => Some(host),
+            Self::Core(_) => None,
+        }
+    }
+
+    fn as_core(&self) -> Option<&crate::HerdrCoreHost> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Core(host) => Some(host),
+        }
+    }
+}
+
+fn build_shards<T>(
+    shards: usize,
+    base_session: &str,
+    make: impl Fn(&str) -> Result<T, TerminalError>,
+    wrap: impl Fn(T) -> PoolShard,
+) -> Result<Vec<PoolShard>, TerminalError> {
+    if !(1..=MAX_SHARDS).contains(&shards) {
+        return Err(TerminalError(format!(
+            "herdr shard count must be between 1 and {MAX_SHARDS}, not {shards}"
+        )));
+    }
+    if shards == 1 {
+        return Ok(vec![wrap(make(base_session)?)]);
+    }
+    let mut hosts = Vec::with_capacity(shards);
+    for index in 0..shards {
+        let session = format!("{base_session}-s{index}");
+        hosts.push(wrap(make(&session)?));
+    }
+    Ok(hosts)
+}
+
+/// A sharded pool of independent `herdr` or embedded `spawn-hc` (`herdr-core`)
+/// daemons (`<session>-s0`, `<session>-s1`, ...) distributing terminals
+/// deterministically by terminal name so high-concurrency fleets avoid saturating
+/// a single server process.
 pub struct HerdrPool {
-    shards: Vec<HerdrHost>,
+    shards: Vec<PoolShard>,
 }
 
 impl HerdrPool {
-    /// Open a pool of `shards` independent Herdr sessions (`1..=MAX_SHARDS`).
+    /// Open a pool of `shards` independent legacy Herdr sessions (`1..=MAX_SHARDS`).
     ///
     /// With `shards == 1`, runs on `base_session` directly; with `shards > 1`,
     /// runs on `{base_session}-s0` through `{base_session}-s{shards - 1}`.
@@ -1941,34 +2016,50 @@ impl HerdrPool {
         base_session: &str,
         shards: usize,
     ) -> Result<Self, TerminalError> {
-        if !(1..=MAX_SHARDS).contains(&shards) {
-            return Err(TerminalError(format!(
-                "herdr shard count must be between 1 and {MAX_SHARDS}, not {shards}"
-            )));
-        }
-        if shards == 1 {
-            return Ok(Self {
-                shards: vec![HerdrHost::on_session(program, base_session)?],
-            });
-        }
-        let mut hosts = Vec::with_capacity(shards);
-        for index in 0..shards {
-            let session = format!("{base_session}-s{index}");
-            hosts.push(HerdrHost::on_session(program, &session)?);
-        }
-        Ok(Self { shards: hosts })
+        Ok(Self {
+            shards: build_shards(
+                shards,
+                base_session,
+                |session| HerdrHost::on_session(program, session),
+                PoolShard::Legacy,
+            )?,
+        })
+    }
+
+    /// Open a pool of `shards` independent embedded `herdr-core` sessions (`1..=MAX_SHARDS`).
+    ///
+    /// With `shards == 1`, runs `spawn-hc` on `base_session` directly; with
+    /// `shards > 1`, runs on `{base_session}-s0` through `{base_session}-s{shards - 1}`.
+    ///
+    /// # Errors
+    ///
+    /// When `shards` is outside `1..=MAX_SHARDS`, or `base_session` cannot name
+    /// a `herdr-core` session.
+    pub fn on_core_session(
+        program: &str,
+        base_session: &str,
+        shards: usize,
+    ) -> Result<Self, TerminalError> {
+        Ok(Self {
+            shards: build_shards(
+                shards,
+                base_session,
+                |session| crate::HerdrCoreHost::on_session(program, session),
+                PoolShard::Core,
+            )?,
+        })
     }
 
     /// Pin host-side transcript and project file operations beneath `projects`
     /// (handled on shard 0 because file access is host-local).
     #[must_use]
     pub fn with_files_beneath(mut self, projects: crate::beneath::Beneath) -> Self {
-        if let Some(first) = self.shards.first_mut() {
-            let shard = std::mem::replace(
-                first,
-                HerdrHost::on_session("herdr", DEFAULT_SESSION).expect("DEFAULT_SESSION is valid"),
-            );
-            *first = shard.with_files_beneath(projects);
+        let mut iter = std::mem::take(&mut self.shards).into_iter();
+        if let Some(first) = iter.next() {
+            let mut updated = Vec::with_capacity(1 + iter.len());
+            updated.push(first.with_files_beneath(projects));
+            updated.extend(iter);
+            self.shards = updated;
         }
         self
     }
@@ -1979,7 +2070,7 @@ impl HerdrPool {
         self.shards = self
             .shards
             .into_iter()
-            .map(|shard| shard.with_runtime_under(base.to_path_buf()))
+            .map(|shard| shard.with_runtime_under(base))
             .collect();
         self
     }
@@ -1990,10 +2081,28 @@ impl HerdrPool {
         self.shards.len()
     }
 
-    /// Primary shard (`s0`) in the pool.
+    /// Whether this pool wraps embedded `herdr-core` shards (`spawn-hc`).
     #[must_use]
-    pub fn primary(&self) -> &HerdrHost {
-        &self.shards[0]
+    pub fn is_core(&self) -> bool {
+        self.shards[0].as_core().is_some()
+    }
+
+    /// Primary legacy shard (`s0`), when backed by legacy `herdr`.
+    #[must_use]
+    pub fn primary_legacy(&self) -> Option<&HerdrHost> {
+        self.shards[0].as_legacy()
+    }
+
+    /// Primary embedded `herdr-core` shard (`s0`), when backed by `spawn-hc`.
+    #[must_use]
+    pub fn primary_core(&self) -> Option<&crate::HerdrCoreHost> {
+        self.shards[0].as_core()
+    }
+
+    /// Session names of every shard in index order.
+    #[must_use]
+    pub fn shard_sessions(&self) -> Vec<&str> {
+        self.shards.iter().map(PoolShard::session).collect()
     }
 
     /// Deterministic shard index for `terminal`.
@@ -2003,15 +2112,15 @@ impl HerdrPool {
         usize::try_from(fnv1a_64(terminal.as_str().as_bytes()) % len).unwrap_or(0)
     }
 
-    /// The shard [`HerdrHost`] owning `terminal`.
-    fn shard(&self, terminal: &TerminalName) -> &HerdrHost {
+    /// The shard [`PoolShard`] owning `terminal`.
+    fn shard(&self, terminal: &TerminalName) -> &PoolShard {
         &self.shards[self.shard_index(terminal)]
     }
 }
 
 impl TerminalHost for HerdrPool {
     fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
-        self.shard(&launch.terminal).start(launch)
+        self.shard(&launch.terminal).host().start(launch)
     }
 
     fn stage_text(
@@ -2020,7 +2129,9 @@ impl TerminalHost for HerdrPool {
         workspace: &WorkspaceId,
         text: &str,
     ) -> Result<(), TerminalError> {
-        self.shard(terminal).stage_text(terminal, workspace, text)
+        self.shard(terminal)
+            .host()
+            .stage_text(terminal, workspace, text)
     }
 
     fn submit_staged(
@@ -2028,7 +2139,9 @@ impl TerminalHost for HerdrPool {
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
-        self.shard(terminal).submit_staged(terminal, workspace)
+        self.shard(terminal)
+            .host()
+            .submit_staged(terminal, workspace)
     }
 
     fn submit_text(
@@ -2037,7 +2150,9 @@ impl TerminalHost for HerdrPool {
         workspace: &WorkspaceId,
         text: &str,
     ) -> Result<(), TerminalError> {
-        self.shard(terminal).submit_text(terminal, workspace, text)
+        self.shard(terminal)
+            .host()
+            .submit_text(terminal, workspace, text)
     }
 
     fn send_keys(
@@ -2046,7 +2161,9 @@ impl TerminalHost for HerdrPool {
         workspace: &WorkspaceId,
         keys: &[&str],
     ) -> Result<(), TerminalError> {
-        self.shard(terminal).send_keys(terminal, workspace, keys)
+        self.shard(terminal)
+            .host()
+            .send_keys(terminal, workspace, keys)
     }
 
     fn is_alive(
@@ -2054,17 +2171,17 @@ impl TerminalHost for HerdrPool {
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<bool, TerminalError> {
-        self.shard(terminal).is_alive(terminal, workspace)
+        self.shard(terminal).host().is_alive(terminal, workspace)
     }
 
     fn server(&self) -> ServerSeen {
         if self.shards.len() == 1 {
-            return self.shards[0].server();
+            return self.shards[0].host().server();
         }
         let any_answering = self
             .shards
             .iter()
-            .any(|shard| !matches!(shard.server(), ServerSeen::Gone));
+            .any(|shard| !matches!(shard.host().server(), ServerSeen::Gone));
         if any_answering {
             ServerSeen::Answers(None)
         } else {
@@ -2077,7 +2194,7 @@ impl TerminalHost for HerdrPool {
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<Runner, TerminalError> {
-        self.shard(terminal).runner(terminal, workspace)
+        self.shard(terminal).host().runner(terminal, workspace)
     }
 
     fn runners(
@@ -2088,7 +2205,7 @@ impl TerminalHost for HerdrPool {
             return Ok(Vec::new());
         }
         if self.shards.len() == 1 {
-            return self.shards[0].runners(terminals);
+            return self.shards[0].host().runners(terminals);
         }
         let mut buckets: Vec<Vec<(usize, TerminalName, WorkspaceId)>> =
             vec![Vec::new(); self.shards.len()];
@@ -2103,7 +2220,7 @@ impl TerminalHost for HerdrPool {
                 if items.is_empty() {
                     continue;
                 }
-                let shard = &self.shards[shard_idx];
+                let shard = self.shards[shard_idx].host();
                 handles.push(scope.spawn(move || {
                     let query: Vec<(TerminalName, WorkspaceId)> = items
                         .iter()
@@ -2140,6 +2257,7 @@ impl TerminalHost for HerdrPool {
         lines: usize,
     ) -> Result<String, TerminalError> {
         self.shard(terminal)
+            .host()
             .capture_tail(terminal, workspace, lines)
     }
 
@@ -2148,7 +2266,7 @@ impl TerminalHost for HerdrPool {
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
-        self.shard(terminal).terminate(terminal, workspace)
+        self.shard(terminal).host().terminate(terminal, workspace)
     }
 
     fn terminate_waits(&self) -> bool {
@@ -2160,13 +2278,13 @@ impl TerminalHost for HerdrPool {
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<Option<AgentReading>, TerminalError> {
-        self.shard(terminal).agent(terminal, workspace)
+        self.shard(terminal).host().agent(terminal, workspace)
     }
 
     fn agent_changes(&self) -> Vec<TerminalName> {
         let mut changed = Vec::new();
         for shard in &self.shards {
-            changed.extend(shard.agent_changes());
+            changed.extend(shard.host().agent_changes());
         }
         changed
     }
@@ -2177,11 +2295,11 @@ impl TerminalHost for HerdrPool {
         path: &str,
         offset: u64,
     ) -> Result<Option<Vec<u8>>, TerminalError> {
-        self.shards[0].read_from(workspace, path, offset)
+        self.shards[0].host().read_from(workspace, path, offset)
     }
 
     fn list_dirs(&self, workspace: &WorkspaceId, dir: &str) -> Result<Vec<String>, TerminalError> {
-        self.shards[0].list_dirs(workspace, dir)
+        self.shards[0].host().list_dirs(workspace, dir)
     }
 
     fn write_new(
@@ -2190,7 +2308,7 @@ impl TerminalHost for HerdrPool {
         path: &str,
         bytes: &[u8],
     ) -> Result<bool, TerminalError> {
-        self.shards[0].write_new(workspace, path, bytes)
+        self.shards[0].host().write_new(workspace, path, bytes)
     }
 
     fn replace_grown(
@@ -2200,7 +2318,9 @@ impl TerminalHost for HerdrPool {
         bytes: &[u8],
         current: &[u8],
     ) -> Result<bool, TerminalError> {
-        self.shards[0].replace_grown(workspace, path, bytes, current)
+        self.shards[0]
+            .host()
+            .replace_grown(workspace, path, bytes, current)
     }
 }
 
@@ -2777,6 +2897,40 @@ mod tests {
         assert_eq!(
             launch_clear_limit_from(Some("99999")),
             std::time::Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn herdr_pool_core_shards_deterministically_and_validates_bounds() {
+        use super::{HerdrPool, MAX_SHARDS};
+        assert!(HerdrPool::on_core_session("spawn-hc", "hc-test", 0).is_err());
+        assert!(HerdrPool::on_core_session("spawn-hc", "hc-test", MAX_SHARDS + 1).is_err());
+
+        let single = HerdrPool::on_core_session("spawn-hc", "hc-test", 1).expect("single shard");
+        assert!(single.is_core());
+        assert_eq!(single.shard_count(), 1);
+        assert_eq!(single.shard_sessions(), vec!["hc-test"]);
+        assert!(single.primary_core().is_some());
+        assert!(single.primary_legacy().is_none());
+
+        let pool = HerdrPool::on_core_session("spawn-hc", "hc-test", 4).expect("4 shards");
+        assert!(pool.is_core());
+        assert_eq!(pool.shard_count(), 4);
+        assert_eq!(
+            pool.shard_sessions(),
+            vec!["hc-test-s0", "hc-test-s1", "hc-test-s2", "hc-test-s3"]
+        );
+
+        let mut counts = [0usize; 4];
+        for i in 0..32 {
+            let term = TerminalName::new(format!("spawn-core-{i:04}")).expect("terminal");
+            let idx = pool.shard_index(&term);
+            assert_eq!(idx, pool.shard_index(&term));
+            counts[idx] += 1;
+        }
+        assert!(
+            counts.iter().all(|&c| c > 0),
+            "all core shards should be hit: {counts:?}"
         );
     }
 }

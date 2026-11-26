@@ -4426,6 +4426,54 @@ expect "an entry whose binary line is not a sha256 is a miss" \
     "$(reuse_judge "$reuse_a" "$reuse_docs")" 'exit=0 {"verdict":"accepted","reused":["401.sh","402.sh"]}'
 expect "judged again on the base" "$(cat "$work/gate.out")" \
     '| == base: 401.sh: its cache entry cannot be read; judged again'
+
+# Sibling spawn-hc binary snapshot and joint binary_hash invalidation.
+rdir_hc_ctrl=$work/reuse-hc
+rdir_hc=$rdir_hc_ctrl/rsi/scenarios
+mkdir -p "$rdir_hc"
+cp "$scenarios/protected" "$rdir_hc/"
+cat >"$rdir_hc/build" <<'EOF_REUSE_HC'
+#!/bin/sh
+mkdir -p target/debug
+{ printf '#!/bin/sh\n'; printf 'echo "%s"\n' "$(cat src/main.txt)"; printf '"$(dirname "$0")/spawn-hc"\n'; } >target/debug/spawn
+{ printf '#!/bin/sh\n'; printf 'echo "hc:%s"\n' "$(cat src/hc.txt)"; } >target/debug/spawn-hc
+chmod 755 target/debug/spawn target/debug/spawn-hc
+EOF_REUSE_HC
+reuse_scenario_hc() {
+    {
+        printf '#!/bin/sh\n'
+        printf '# reads: binary\n'
+        printf 'echo "401hc ran in $(basename "$PWD")"\n'
+        printf 'out=$("$SPAWN_BIN") || exit 1\n'
+        printf 'echo "$out"\n'
+        printf 'case "$out" in *"hc:"*) ;; *) exit 1 ;; esac\n'
+    } >"$rdir_hc/401.sh"
+}
+reuse_scenario_hc
+git -C "$seed" checkout -q -B reuse-hc-base "$reuse_a"
+printf 'hc-v1\n' >"$seed/src/hc.txt"
+cp "$rdir_hc/401.sh" "$seed/rsi/scenarios/401.sh"
+reuse_hc_base=$(commit reuse-hc-base)
+reuse_hc_docs=$(reuse_candidate reuse-hc-docs docs/notes.md 'more hc notes' "$reuse_hc_base")
+reuse_hc_changed=$(reuse_candidate reuse-hc-changed src/hc.txt 'hc-v2' "$reuse_hc_base")
+reuse_hc_judge() {
+    (
+        export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$work/caches/reuse-hc"
+        base=$reuse_hc_base
+        judge "$1" "" "$rdir_hc"
+    )
+}
+expect "sibling spawn-hc is snapshotted and docs-only candidate reuses 401.sh" \
+    "$(reuse_hc_judge "$reuse_hc_docs")" 'exit=0 {"verdict":"accepted","reused":["401.sh"]}'
+expect "baseline ran with sibling spawn-hc snapshotted in target/gate" \
+    "$(cat "$work/gate.out")" '| hc:hc-v1'
+expect "changing only sibling spawn-hc invalidates # reads: binary even when spawn itself is unchanged" \
+    "$(reuse_hc_judge "$reuse_hc_changed")" 'exit=0 {"verdict":"accepted"}'
+hc_changed_log=$(cat "$work/gate.out")
+expect "401hc re-ran on candidate after spawn-hc change" "$hc_changed_log" '| 401hc ran in candidate'
+expect "candidate ran updated sibling spawn-hc" "$hc_changed_log" '| hc:hc-v2'
+expect "reason notes binary hash changed" "$hc_changed_log" '| 401.sh declares what it reads and is run all the same: the candidate'\''s spawn (sha256 '
+
 git -C "$seed" checkout -q main 2>/dev/null || git -C "$seed" checkout -q -B main "$base"
 
 # 28. What is never cached (GitHub issue #29): a base run that could not

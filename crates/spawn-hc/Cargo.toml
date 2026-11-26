@@ -1,0 +1,18 @@
+[package]
+name = "spawn-hc"
+description = "Isolated companion daemon binary (`herdr-core`) launched out-of-process by Spawn."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "spawn-hc"
+path = "src/main.rs"
+
+[dependencies]
+herdr-core.workspace = true
+
+[lints]
+workspace = true

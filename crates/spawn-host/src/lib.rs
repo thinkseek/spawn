@@ -1,4 +1,4 @@
-//! Host adapters: Herdr (default) and tmux terminals, the workspace stores (Git, the opt-in
+//! Host adapters: embedded `herdr-core` / legacy `herdr` (default) and tmux terminals, the workspace stores (Git, the opt-in
 //! copy-on-write and overlay stores, behind one [`LocalWorkspaceStore`]),
 //! the artifact deduplicator, the local transcript archive, and the
 //! filesystem view (`bwrap`) an engine without deny rules runs in.
@@ -23,6 +23,8 @@ pub mod cow;
 pub mod engine_view;
 pub mod git;
 pub mod herdr;
+pub mod herdr_core;
+pub mod herdr_witness;
 pub mod home;
 #[cfg(target_os = "linux")]
 pub mod overlay;
@@ -55,6 +57,7 @@ pub use git::{
     max_file_bytes, names_files_outside_git,
 };
 pub use herdr::{HerdrHost, HerdrPool};
+pub use herdr_core::HerdrCoreHost;
 #[cfg(target_os = "linux")]
 pub use overlay::{OverlayWorkspace, Swept, overlay_supported, overlay_supported_in, sweep_probes};
 pub use process::{current_uid, undumpable};
@@ -68,11 +71,13 @@ pub use workspace::{
     BACKEND_MARKER, CAS_DIRECTORY, LocalWorkspaceStore, WorkspaceBackend, claim_root, root_backend,
 };
 
-/// The terminal host of this machine Spawn runs on: Herdr (the default) or
-/// tmux (`SPAWN_TERMINAL_BACKEND=tmux`), told apart only here.
+/// The terminal host of this machine Spawn runs on: embedded `herdr-core`
+/// (`spawn-hc`), legacy `herdr`, pooled shards, or `tmux`
+/// (`SPAWN_TERMINAL_BACKEND=tmux`), told apart only here.
 pub enum LocalTerminalHost {
     Tmux(TmuxHost),
     Herdr(HerdrHost),
+    HerdrCore(HerdrCoreHost),
     HerdrPool(HerdrPool),
 }
 
@@ -84,6 +89,7 @@ impl LocalTerminalHost {
         match self {
             Self::Tmux(host) => Self::Tmux(host.with_files_beneath(projects)),
             Self::Herdr(host) => Self::Herdr(host.with_files_beneath(projects)),
+            Self::HerdrCore(host) => Self::HerdrCore(host.with_files_beneath(projects)),
             Self::HerdrPool(pool) => Self::HerdrPool(pool.with_files_beneath(projects)),
         }
     }
@@ -92,6 +98,7 @@ impl LocalTerminalHost {
         match self {
             Self::Tmux(host) => host,
             Self::Herdr(host) => host,
+            Self::HerdrCore(host) => host,
             Self::HerdrPool(pool) => pool,
         }
     }

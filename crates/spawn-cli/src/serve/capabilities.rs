@@ -715,6 +715,33 @@ fn herdr_backend(herdr: &spawn_host::HerdrHost, shards: Option<usize>) -> Value 
     answer
 }
 
+fn herdr_core_backend(hc: &spawn_host::HerdrCoreHost, shards: Option<usize>) -> Value {
+    let version = run_bounded(hc.program(), &["--version"], VERSION_LIMIT);
+    let mut answer = json!({
+        "backend": "herdr",
+        "engine": "herdr-core",
+        "program": hc.program(),
+        "session": hc.session(),
+        "version": version.as_ref().ok().map(|text| text.trim().to_string()),
+        "version_error": version.err(),
+        "expected_generation": spawn_host::herdr_core::EXPECTED_GENERATION,
+        "witness": "host",
+    });
+    if let Some(count) = shards {
+        answer["shards"] = json!(count);
+    }
+    match hc.server_facts() {
+        Ok(facts) => {
+            answer["server"] = facts;
+        }
+        Err(error) => {
+            answer["server"] = Value::Null;
+            answer["server_error"] = json!(error.0);
+        }
+    }
+    answer
+}
+
 fn terminal_backend() -> Value {
     let host = match crate::config::terminal_host() {
         Ok(host) => host,
@@ -723,8 +750,15 @@ fn terminal_backend() -> Value {
     match host {
         spawn_host::LocalTerminalHost::Tmux(_) => json!({ "backend": "tmux" }),
         spawn_host::LocalTerminalHost::Herdr(herdr) => herdr_backend(&herdr, None),
+        spawn_host::LocalTerminalHost::HerdrCore(hc) => herdr_core_backend(&hc, None),
         spawn_host::LocalTerminalHost::HerdrPool(pool) => {
-            herdr_backend(pool.primary(), Some(pool.shard_count()))
+            if let Some(hc) = pool.primary_core() {
+                herdr_core_backend(hc, Some(pool.shard_count()))
+            } else if let Some(herdr) = pool.primary_legacy() {
+                herdr_backend(herdr, Some(pool.shard_count()))
+            } else {
+                json!({ "backend": "herdr", "shards": pool.shard_count() })
+            }
         }
     }
 }

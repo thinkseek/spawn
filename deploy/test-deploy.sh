@@ -390,6 +390,9 @@ check "the live binary is untouched" cmp -s "$live/bin/spawn" "$scratch/stand-in
 check "no rollback copy was written" [ ! -e "$live/bin/spawn.prev" ]
 check "no UI was installed" [ ! -e "$live/web" ]
 check "nothing is left staged" bash -c '[ ! -e "$1/bin/spawn.staged" ] && [ ! -e "$1/web.staged" ]' _ "$live"
+check "no spawn-hc binary was installed" [ ! -e "$live/bin/spawn-hc" ]
+check "no spawn-hc rollback copy was written" [ ! -e "$live/bin/spawn-hc.prev" ]
+check "no spawn-hc binary is left staged" [ ! -e "$live/bin/spawn-hc.staged" ]
 check "no node gateway binary was installed" [ ! -e "$live/bin/spawn-node-gateway" ]
 check "no node gateway rollback copy was written" [ ! -e "$live/bin/spawn-node-gateway.prev" ]
 check "no node gateway binary is left staged" [ ! -e "$live/bin/spawn-node-gateway.staged" ]
@@ -417,6 +420,11 @@ check "the node gateway binary is installed" \
 check "the untracked .cargo/config.toml did not reach spawn-node-gateway" \
   bash -c '! readelf -n "$1" | grep -qi "$2"' _ "$live/bin/spawn-node-gateway" "$build_id"
 check "first install of spawn-node-gateway writes no .prev" [ ! -e "$live/bin/spawn-node-gateway.prev" ]
+check "the spawn-hc binary is installed" \
+  bash -c '"$1" --version | grep -q "^hc "' _ "$live/bin/spawn-hc"
+check "the untracked .cargo/config.toml did not reach spawn-hc" \
+  bash -c '! readelf -n "$1" | grep -qi "$2"' _ "$live/bin/spawn-hc" "$build_id"
+check "first install of spawn-hc writes no .prev" [ ! -e "$live/bin/spawn-hc.prev" ]
 check "the controller is HEAD's tree" \
   bash -c '[ "$(cat "$1/controllers/spawn/.controller")" = "$2" ] && [ -f "$1/controllers/spawn/scripts/rsi/gate.sh" ]' _ "$live" "$head"
 check "the controller has the UI's node_modules" [ -x "$live/controllers/spawn/web/node_modules/.bin/vite" ]
@@ -466,6 +474,7 @@ check "the export is removed" bash -c '! compgen -G "$1/spawn-deploy-export-*" >
 check "the same node gateway again is not restarted" \
   bash -c '! grep -q "try-restart spawn-node-gateway" "$1"' _ "$SYSTEMCTL_LOG"
 check "the same node gateway again writes no .prev" [ ! -e "$live/bin/spawn-node-gateway.prev" ]
+check "the same spawn-hc again writes no .prev" [ ! -e "$live/bin/spawn-hc.prev" ]
 
 echo "== the node gateway: its binary installed, its unit try-restarted when installed"
 # Main is HEAD and the verdict is over it: each deploy below builds the same
@@ -481,6 +490,7 @@ deploy
 check "changed gateway, unit not installed: succeeded (status $status)" [ "$status" -eq 0 ]
 check "the gateway binary is replaced by the build" cmp -s "$live/bin/spawn-node-gateway" "$scratch/real-gw"
 check "spawn-node-gateway.prev holds the replaced copy" cmp -s "$live/bin/spawn-node-gateway.prev" "$scratch/old-gw"
+check "no spawn-hc binary is left staged" [ ! -e "$live/bin/spawn-hc.staged" ]
 check "no node gateway binary is left staged" [ ! -e "$live/bin/spawn-node-gateway.staged" ]
 check "try-restart was asked once" [ "$(grep -cx -- "--user try-restart spawn-node-gateway" "$SYSTEMCTL_LOG")" -eq 1 ]
 check "says unit spawn-node-gateway is not installed" \
@@ -515,6 +525,23 @@ check "the services were restarted once, before it" \
   [ "$(grep -cx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG")" -eq 1 ]
 check "main stays HEAD" [ "$(main)" = "$head" ]
 rm -f "$scratch/real-gw" "$scratch/old-gw"
+
+echo "== spawn-hc: installed with .prev rotation on change"
+cp "$live/bin/spawn-hc" "$scratch/real-hc"
+printf '#!/bin/sh\necho old-hc\n' >"$scratch/old-hc"
+chmod 755 "$scratch/old-hc"
+cp "$scratch/old-hc" "$live/bin/spawn-hc"
+: >"$SYSTEMCTL_LOG"
+deploy
+check "changed spawn-hc: succeeded (status $status)" [ "$status" -eq 0 ]
+check "the spawn-hc binary is replaced by the build" cmp -s "$live/bin/spawn-hc" "$scratch/real-hc"
+check "spawn-hc.prev holds the replaced copy" cmp -s "$live/bin/spawn-hc.prev" "$scratch/old-hc"
+check "no spawn-hc binary is left staged" [ ! -e "$live/bin/spawn-hc.staged" ]
+: >"$SYSTEMCTL_LOG"
+deploy
+check "same spawn-hc: succeeded (status $status)" [ "$status" -eq 0 ]
+check "same spawn-hc keeps spawn-hc.prev" cmp -s "$live/bin/spawn-hc.prev" "$scratch/old-hc"
+rm -f "$scratch/real-hc" "$scratch/old-hc"
 
 echo "== a deploy failing after its push completes it on exit"
 git --git-dir="$missions" update-ref refs/heads/main "$base"
@@ -860,6 +887,7 @@ check "says main moved" grep -q "the missions main moved during the deploy" "$ou
 check "main is where the landing left it" [ "$(main)" = "$other" ]
 check "nothing is pending" [ ! -e "$live/deploy.pending" ]
 check "nothing is left staged" bash -c '[ ! -e "$1/bin/spawn.staged" ] && [ ! -e "$1/web.staged" ]' _ "$live"
+check "no spawn-hc binary is left staged" [ ! -e "$live/bin/spawn-hc.staged" ]
 check "no node gateway binary is left staged" [ ! -e "$live/bin/spawn-node-gateway.staged" ]
 check "stopped the integrator, then restarted the services" \
   bash -c 'grep -x -A99 -- "--user stop spawn-integrate" "$1" | grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve"' _ "$SYSTEMCTL_LOG"

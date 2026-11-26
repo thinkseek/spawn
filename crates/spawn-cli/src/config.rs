@@ -767,12 +767,50 @@ pub(crate) fn herdr_shards(value: Option<&str>) -> Result<usize, String> {
     }
 }
 
-/// The terminal host the environment describes: Herdr (`SPAWN_HERDR_PROGRAM`,
-/// `herdr` by default) on the session `SPAWN_HERDR_SESSION` (`spawn` by
-/// default), sharded across `SPAWN_HERDR_SHARDS` independent servers when
-/// greater than 1; or, with `SPAWN_TERMINAL_BACKEND=tmux`, tmux on this
-/// machine on the server of `SPAWN_TMUX_SOCKET` when set
-/// (`SPAWN_TMUX_PROGRAM`, `tmux` by default).
+/// Which Herdr implementation backs `SPAWN_TERMINAL_BACKEND=herdr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HerdrMode {
+    /// Embedded `herdr-core` daemon via `spawn-hc` (the default).
+    Core,
+    /// Explicit fallback to external legacy `herdr 0.9.5`.
+    Legacy,
+}
+
+/// Selects [`HerdrMode`] from `SPAWN_HERDR_MODE` (`core` by default).
+pub(crate) fn herdr_mode(value: Option<&str>) -> Result<HerdrMode, String> {
+    match value.map(str::trim) {
+        None | Some("" | "core") => Ok(HerdrMode::Core),
+        Some("legacy") => Ok(HerdrMode::Legacy),
+        Some(other) => Err(format!(
+            "SPAWN_HERDR_MODE={other:?} names no herdr engine: use core (the default) or legacy"
+        )),
+    }
+}
+
+fn sibling_spawn_hc() -> String {
+    if let Some(program) = env_value("SPAWN_HERDR_CORE_PROGRAM") {
+        return program;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for dir in [exe.parent(), exe.parent().and_then(std::path::Path::parent)]
+            .into_iter()
+            .flatten()
+        {
+            let candidate = dir.join("spawn-hc");
+            if candidate.is_file() {
+                return candidate.display().to_string();
+            }
+        }
+    }
+    "spawn-hc".to_string()
+}
+
+/// The terminal host the environment describes: by default embedded `herdr-core`
+/// via `spawn-hc` (or external legacy `herdr 0.9.5` with `SPAWN_HERDR_MODE=legacy`)
+/// on the session `SPAWN_HERDR_SESSION` (`spawn` by default), sharded across
+/// `SPAWN_HERDR_SHARDS` independent servers when greater than 1; or, with
+/// `SPAWN_TERMINAL_BACKEND=tmux`, tmux on this machine on the server of
+/// `SPAWN_TMUX_SOCKET` when set (`SPAWN_TMUX_PROGRAM`, `tmux` by default).
 pub(crate) fn terminal_host() -> Result<spawn_host::LocalTerminalHost, String> {
     Ok(
         match terminal_backend(env_value("SPAWN_TERMINAL_BACKEND").as_deref())? {
@@ -783,19 +821,37 @@ pub(crate) fn terminal_host() -> Result<spawn_host::LocalTerminalHost, String> {
                 ))
             }
             TerminalBackend::Herdr => {
-                let program = env_or("SPAWN_HERDR_PROGRAM", "herdr");
+                let mode = herdr_mode(env_value("SPAWN_HERDR_MODE").as_deref())?;
                 let session = env_or("SPAWN_HERDR_SESSION", spawn_host::herdr::DEFAULT_SESSION);
                 let shards = herdr_shards(env_value("SPAWN_HERDR_SHARDS").as_deref())?;
-                if shards <= 1 {
-                    spawn_host::LocalTerminalHost::Herdr(
-                        spawn_host::HerdrHost::on_session(&program, &session)
+                match (mode, shards) {
+                    (HerdrMode::Core, 1) => spawn_host::LocalTerminalHost::HerdrCore(
+                        spawn_host::HerdrCoreHost::on_session(&sibling_spawn_hc(), &session)
                             .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
-                    )
-                } else {
-                    spawn_host::LocalTerminalHost::HerdrPool(
-                        spawn_host::HerdrPool::on_session(&program, &session, shards)
-                            .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
-                    )
+                    ),
+                    (HerdrMode::Core, count) => spawn_host::LocalTerminalHost::HerdrPool(
+                        spawn_host::HerdrPool::on_core_session(
+                            &sibling_spawn_hc(),
+                            &session,
+                            count,
+                        )
+                        .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
+                    ),
+                    (HerdrMode::Legacy, 1) => spawn_host::LocalTerminalHost::Herdr(
+                        spawn_host::HerdrHost::on_session(
+                            &env_or("SPAWN_HERDR_PROGRAM", "herdr"),
+                            &session,
+                        )
+                        .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
+                    ),
+                    (HerdrMode::Legacy, count) => spawn_host::LocalTerminalHost::HerdrPool(
+                        spawn_host::HerdrPool::on_session(
+                            &env_or("SPAWN_HERDR_PROGRAM", "herdr"),
+                            &session,
+                            count,
+                        )
+                        .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
+                    ),
                 }
             }
         },
@@ -1096,5 +1152,15 @@ mod workspace_tests {
         assert!(herdr_shards(Some("0")).is_err());
         assert!(herdr_shards(Some("65")).is_err());
         assert!(herdr_shards(Some("abc")).is_err());
+    }
+
+    #[test]
+    fn herdr_mode_defaults_to_core_and_allows_legacy() {
+        use super::{HerdrMode, herdr_mode};
+        assert_eq!(herdr_mode(None), Ok(HerdrMode::Core));
+        assert_eq!(herdr_mode(Some("")), Ok(HerdrMode::Core));
+        assert_eq!(herdr_mode(Some(" core ")), Ok(HerdrMode::Core));
+        assert_eq!(herdr_mode(Some("legacy")), Ok(HerdrMode::Legacy));
+        assert!(herdr_mode(Some("other")).is_err());
     }
 }
