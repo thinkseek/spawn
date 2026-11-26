@@ -1,25 +1,93 @@
 // Read model of missions: `/api/missions`. Every field is normalized, so a
 // server that omits one (or sends null) renders an empty value instead of
 // crashing. Read-only: this module only ever issues GET requests.
+//
+// Pure at module load (no static React/DOM imports) so `node --test` executes
+// this module directly and `cap-web-missions-view` avoids cross-capability
+// static edges into `cap-agent-grading`.
 
-import { readApi } from "./api";
+import type { RsiSummary } from "./api.ts";
 import type { Labels } from "./label.ts";
 import { labels } from "./label.ts";
 import { normalizeActivity } from "./taskActivity.ts";
 import type { TaskActivity } from "./taskActivity.ts";
-import type { RsiSummary } from "./api";
-import { normalizeHolds } from "./attention";
-import type { SourceHold } from "./attention";
-import {
-  normalizeSkillGrade,
-  normalizeTaskReworkStepUp,
-  normalizeTierRole,
-  type SkillGrade,
-  type TaskReworkStepUp,
-  type TierRole,
-} from "./grading.ts";
+import { normalizeHolds } from "./attention.ts";
+import type { SourceHold } from "./attention.ts";
 
-export type { SourceHold } from "./attention";
+export type { SourceHold } from "./attention.ts";
+
+export type TaskDifficulty = "l1" | "l2" | "l3";
+export type TaskTierRole = "top-decision" | "mainline" | "mechanical-offload";
+export type GradingBadgeTone = "neutral" | "info" | "success" | "warning" | "danger" | "purple";
+
+/** Rework escalation and preset reroute metadata projected by `MISSION_BOARD`. */
+export interface TaskReworkStepUp {
+  quality_rejections: number;
+  from_difficulty: TaskDifficulty | null;
+  routed_difficulty: TaskDifficulty | null;
+  stepped_up: boolean;
+  first_preset_id: string | null;
+  preset_id: string | null;
+}
+
+/** Input shape accepted by `formatTaskGrading` for live or legacy task rows. */
+export interface TaskGradingInput {
+  difficulty?: TaskDifficulty | null;
+  routed_difficulty?: TaskDifficulty | null;
+  preset_id?: string | null;
+  first_preset_id?: string | null;
+  tier_role?: TaskTierRole | null;
+  quality_rejections?: number | null;
+  engine_label?: string | null;
+  model_label?: string | null;
+  execution_profile?: string | null;
+  rework_step_up?: TaskReworkStepUp | null;
+}
+
+/** Formatted display view of a task's grading, preset routing, and step-up state. */
+export interface TaskGradingView {
+  difficulty: TaskDifficulty | null;
+  routedDifficulty: TaskDifficulty | null;
+  difficultyLabel: "L1" | "L2" | "L3" | null;
+  routedDifficultyLabel: "L1" | "L2" | "L3" | null;
+  initialDifficultyTone: GradingBadgeTone;
+  difficultyTone: GradingBadgeTone;
+  /** Uppercase difficulty display: "L1", "L2", "L3", or "L1 → L2" when stepped up. */
+  difficultyBadge: string | null;
+  /** Tight badge for timeline rows: "L1", "L2", "L3", or "L1→L2". */
+  compactDifficultyBadge: string | null;
+  /** Non-null when stepped up with both grades known: "L1 → L2". */
+  stepUpLabel: string | null;
+  steppedUp: boolean;
+  tierRole: TaskTierRole | null;
+  presetId: string | null;
+  firstPresetId: string | null;
+  rerouted: boolean;
+  /** Non-null when `first_preset_id !== preset_id` (both non-null): "first → current". */
+  presetTrajectory: string | null;
+  /** For list/card preset pill: `presetTrajectory` when rerouted, else `presetId`. */
+  presetBadge: string | null;
+  engineLabel: string | null;
+  modelLabel: string | null;
+  /** `"engine/model"`, or whichever one is present, else null. */
+  engineModelLabel: string | null;
+  executionProfile: string | null;
+  qualityRejections: number;
+  hasReworkHistory: boolean;
+  /** Compact rework/step-up indicator badge for cards/lists. */
+  reworkBadge: string | null;
+  /** Ultra-compact marker for timeline rows ("↑", "↑1", "1r", "⇄", or null). */
+  compactReworkBadge: string | null;
+  /** Short context note next to `quality_rejections` in `TaskPanel`. */
+  reworkNote: string | null;
+  /** Tooltip descriptions for each badge group. */
+  difficultyTitle: string;
+  presetTitle: string;
+  reworkTitle: string;
+  /** Single-line summary for row and hover tooltips. */
+  tooltipLine: string;
+  reworkStepUp: TaskReworkStepUp | null;
+}
 
 export const TASK_STATES = [
   "assigned",
@@ -150,11 +218,11 @@ export interface MissionTask extends Labels {
   /** The models the worker runs on: "default", or "cheap" (all DeepSeek). */
   model: string | null;
   /** Optional grading metadata, projected by `MISSION_BOARD` and omitted gracefully by older servers. */
-  difficulty?: SkillGrade | null;
-  routed_difficulty?: SkillGrade | null;
+  difficulty?: TaskDifficulty | null;
+  routed_difficulty?: TaskDifficulty | null;
   preset_id?: string | null;
   first_preset_id?: string | null;
-  tier_role?: TierRole | null;
+  tier_role?: TaskTierRole | null;
   quality_rejections?: number | null;
   engine_label?: string | null;
   model_label?: string | null;
@@ -262,6 +330,46 @@ function optionalNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function optionalNonNegativeInt(value: unknown): number | null {
+  const raw = optionalNumber(value);
+  return raw === null ? null : Math.max(0, Math.trunc(raw));
+}
+
+/** Normalize a task skill difficulty string (`"l1" | "l2" | "l3"`). */
+export function normalizeTaskDifficulty(value: unknown): TaskDifficulty | null {
+  if (typeof value !== "string") return null;
+  const key = value.toLowerCase();
+  return key === "l1" || key === "l2" || key === "l3" ? key : null;
+}
+
+/** Normalize a task tier role string (`"top-decision" | "mainline" | "mechanical-offload"`). */
+export function normalizeTaskTierRole(value: unknown): TaskTierRole | null {
+  if (typeof value !== "string") return null;
+  const key = value.toLowerCase();
+  return key === "top-decision" || key === "mainline" || key === "mechanical-offload" ? key : null;
+}
+
+/** Normalize `rework_step_up` payload from `MISSION_BOARD` / `MISSION_BY_ID`. */
+export function normalizeTaskReworkStepUp(value: unknown): TaskReworkStepUp | null {
+  if (!isObject(value)) return null;
+  const from_difficulty = normalizeTaskDifficulty(value.from_difficulty);
+  const routed_difficulty = normalizeTaskDifficulty(value.routed_difficulty);
+  const first_preset_id = optionalText(value.first_preset_id);
+  const preset_id = optionalText(value.preset_id);
+  const quality_rejections = optionalNonNegativeInt(value.quality_rejections) ?? 0;
+  const stepped_up =
+    value.stepped_up === true ||
+    (from_difficulty !== null && routed_difficulty !== null && from_difficulty !== routed_difficulty);
+  return {
+    quality_rejections,
+    from_difficulty,
+    routed_difficulty,
+    stepped_up,
+    first_preset_id,
+    preset_id,
+  };
+}
+
 function taskState(value: unknown): TaskState {
   if (typeof value !== "string") return "unknown";
   const key = value.toLowerCase();
@@ -335,12 +443,12 @@ function normalizeTask(value: unknown): MissionTask | null {
       .map(normalizeStage)
       .filter((stage): stage is TaskStage => stage !== null),
     model: optionalText(value.model),
-    difficulty: normalizeSkillGrade(value.difficulty),
-    routed_difficulty: normalizeSkillGrade(value.routed_difficulty),
+    difficulty: normalizeTaskDifficulty(value.difficulty),
+    routed_difficulty: normalizeTaskDifficulty(value.routed_difficulty),
     preset_id: optionalText(value.preset_id),
     first_preset_id: optionalText(value.first_preset_id),
-    tier_role: normalizeTierRole(value.tier_role),
-    quality_rejections: optionalNumber(value.quality_rejections),
+    tier_role: normalizeTaskTierRole(value.tier_role),
+    quality_rejections: optionalNonNegativeInt(value.quality_rejections),
     engine_label: optionalText(value.engine_label),
     model_label: optionalText(value.model_label),
     execution_profile: optionalText(value.execution_profile),
@@ -467,6 +575,7 @@ export function normalizeMissions(value: unknown): Missions {
 }
 
 export async function fetchMissions(signal: AbortSignal): Promise<Missions> {
+  const { readApi } = await import("./api.ts");
   return readApi("/api/missions", signal, normalizeMissions);
 }
 
@@ -493,6 +602,7 @@ export function normalizeTaskTexts(value: unknown): TaskTexts {
 /** GET /api/tasks/<n>: a task's brief, report and review note in
  * full, read when the task is opened. */
 export async function fetchTaskTexts(task: number, signal: AbortSignal): Promise<TaskTexts> {
+  const { readApi } = await import("./api.ts");
   return readApi(`/api/tasks/${task}`, signal, normalizeTaskTexts);
 }
 
@@ -571,4 +681,231 @@ export function sessionTaskLabel(
 /** The exact CLI command a human runs to approve a proposed resident. */
 export function approveCommand(name: string | null): string {
   return `spawn resident approve --name ${name ?? "<name>"}`;
+}
+
+/** Format a canonical task difficulty (`"l1" | "l2" | "l3"`) as `"L1" | "L2" | "L3"`. */
+export function formatDifficultyLabel(
+  grade: TaskDifficulty | null | undefined,
+): "L1" | "L2" | "L3" | null {
+  switch (grade) {
+    case "l1":
+      return "L1";
+    case "l2":
+      return "L2";
+    case "l3":
+      return "L3";
+    default:
+      return null;
+  }
+}
+
+/** Badge tone for a skill difficulty level (`l3` purple, `l2` info, `l1` neutral). */
+export function taskDifficultyTone(
+  grade: TaskDifficulty | null | undefined,
+): GradingBadgeTone {
+  switch (grade) {
+    case "l3":
+      return "purple";
+    case "l2":
+      return "info";
+    default:
+      return "neutral";
+  }
+}
+
+/** Map a canonical difficulty grade to its top-down stack tier role. */
+export function tierRoleForDifficulty(
+  grade: TaskDifficulty | null | undefined,
+): TaskTierRole | null {
+  switch (grade) {
+    case "l3":
+      return "top-decision";
+    case "l2":
+      return "mainline";
+    case "l1":
+      return "mechanical-offload";
+    default:
+      return null;
+  }
+}
+
+/** Normalize and format a task's native grading, preset, and rework step-up history.
+ * Returns `null` when a task has no grading metadata or carries only the historical
+ * unrouted database default (`difficulty='l2'`, zero rejections, no preset/profile). */
+export function formatTaskGrading(task: TaskGradingInput): TaskGradingView | null {
+  const reworkStepUp = normalizeTaskReworkStepUp(task.rework_step_up);
+  const difficulty =
+    normalizeTaskDifficulty(task.difficulty) ?? reworkStepUp?.from_difficulty ?? null;
+  const routedDifficulty =
+    normalizeTaskDifficulty(task.routed_difficulty) ??
+    reworkStepUp?.routed_difficulty ??
+    difficulty;
+  const presetId = optionalText(task.preset_id) ?? reworkStepUp?.preset_id ?? null;
+  const firstPresetId =
+    optionalText(task.first_preset_id) ?? reworkStepUp?.first_preset_id ?? null;
+  const qualityRejections =
+    optionalNonNegativeInt(task.quality_rejections) ??
+    reworkStepUp?.quality_rejections ??
+    0;
+  const engineLabel = optionalText(task.engine_label);
+  const modelLabel = optionalText(task.model_label);
+  const executionProfile = optionalText(task.execution_profile);
+  const rawTierRole = normalizeTaskTierRole(task.tier_role);
+
+  // `mission_tasks.difficulty` defaults to 2 ('l2') and `rework_step_up` is
+  // `null` for historical or unrouted default rows. Suppress badges for pure
+  // default unrouted rows so legacy tasks do not show synthetic `L2 · mainline` pills.
+  const isPlainDefaultUnrouted =
+    presetId === null &&
+    firstPresetId === null &&
+    qualityRejections === 0 &&
+    difficulty === "l2" &&
+    (routedDifficulty === null || routedDifficulty === "l2") &&
+    reworkStepUp === null &&
+    executionProfile === null &&
+    engineLabel === null &&
+    modelLabel === null;
+  if (isPlainDefaultUnrouted) {
+    return null;
+  }
+
+  const activeDifficulty = routedDifficulty ?? difficulty;
+  const tierRole = rawTierRole ?? tierRoleForDifficulty(activeDifficulty);
+  if (
+    difficulty === null &&
+    routedDifficulty === null &&
+    presetId === null &&
+    firstPresetId === null &&
+    tierRole === null &&
+    engineLabel === null &&
+    modelLabel === null &&
+    executionProfile === null &&
+    qualityRejections === 0 &&
+    reworkStepUp === null
+  ) {
+    return null;
+  }
+
+  const steppedUp =
+    reworkStepUp?.stepped_up === true ||
+    (difficulty !== null && routedDifficulty !== null && difficulty !== routedDifficulty);
+  const rerouted = firstPresetId !== null && presetId !== null && firstPresetId !== presetId;
+
+  const difficultyLabel = formatDifficultyLabel(difficulty);
+  const routedDifficultyLabel = formatDifficultyLabel(routedDifficulty);
+  const initialDifficultyTone = taskDifficultyTone(difficulty ?? routedDifficulty);
+  const difficultyTone: GradingBadgeTone = steppedUp
+    ? "warning"
+    : taskDifficultyTone(activeDifficulty);
+  const stepUpLabel =
+    steppedUp && difficultyLabel && routedDifficultyLabel
+      ? `${difficultyLabel} → ${routedDifficultyLabel}`
+      : null;
+  const difficultyBadge = stepUpLabel ?? formatDifficultyLabel(activeDifficulty);
+  const compactDifficultyBadge =
+    steppedUp && difficultyLabel && routedDifficultyLabel
+      ? `${difficultyLabel}→${routedDifficultyLabel}`
+      : formatDifficultyLabel(activeDifficulty);
+
+  const presetTrajectory = rerouted ? `${firstPresetId} → ${presetId}` : null;
+  const presetBadge = presetTrajectory ?? presetId;
+  const engineModelLabel =
+    engineLabel && modelLabel ? `${engineLabel}/${modelLabel}` : (engineLabel ?? modelLabel ?? null);
+  const hasReworkHistory =
+    steppedUp || rerouted || qualityRejections > 0 || reworkStepUp !== null;
+
+  let reworkBadge: string | null = null;
+  if (steppedUp && qualityRejections > 0) reworkBadge = `step-up · ${qualityRejections} rej`;
+  else if (steppedUp) reworkBadge = "step-up";
+  else if (rerouted && qualityRejections > 0) reworkBadge = `rerouted · ${qualityRejections} rej`;
+  else if (rerouted) reworkBadge = "rerouted";
+  else if (qualityRejections > 0) reworkBadge = `${qualityRejections} quality rej`;
+
+  let compactReworkBadge: string | null = null;
+  if (steppedUp) compactReworkBadge = qualityRejections > 0 ? `↑${qualityRejections}` : "↑";
+  else if (qualityRejections > 0) compactReworkBadge = `${qualityRejections}r`;
+  else if (rerouted) compactReworkBadge = "⇄";
+
+  let reworkNote: string | null = null;
+  if (stepUpLabel) reworkNote = `stepped up ${stepUpLabel}`;
+  else if (steppedUp) reworkNote = "stepped up";
+  else if (qualityRejections > 0 && routedDifficultyLabel) {
+    reworkNote = `same tier (${routedDifficultyLabel})`;
+  } else if (rerouted && routedDifficultyLabel) {
+    reworkNote = `rerouted (${routedDifficultyLabel})`;
+  }
+
+  const difficultyTitle =
+    steppedUp && difficultyLabel && routedDifficultyLabel
+      ? `Stepped up ${difficultyLabel} → ${routedDifficultyLabel}${tierRole ? ` · tier ${tierRole}` : ""}`
+      : difficultyBadge
+        ? `Difficulty ${difficultyBadge}${tierRole ? ` · tier ${tierRole}` : ""}`
+        : tierRole
+          ? `Tier ${tierRole}`
+          : "";
+
+  const presetTitle = [
+    rerouted
+      ? `Rerouted ${firstPresetId} → ${presetId}`
+      : presetId
+        ? `Preset ${presetId}`
+        : null,
+    executionProfile ? `profile ${executionProfile}` : null,
+    engineModelLabel,
+  ]
+    .filter((part): part is string => part !== null && part !== "")
+    .join(" · ");
+
+  const reworkTitle = [
+    qualityRejections > 0
+      ? `${qualityRejections} quality rejection${qualityRejections === 1 ? "" : "s"}`
+      : null,
+    stepUpLabel ? `stepped up ${stepUpLabel}` : steppedUp ? "stepped up" : null,
+    rerouted ? `rerouted ${firstPresetId} → ${presetId}` : null,
+  ]
+    .filter((part): part is string => part !== null && part !== "")
+    .join(" · ");
+
+  const tooltipLine = [
+    difficultyBadge,
+    tierRole,
+    presetBadge,
+    engineModelLabel,
+    reworkBadge,
+  ]
+    .filter((part): part is string => part !== null && part !== "")
+    .join(" · ");
+
+  return {
+    difficulty,
+    routedDifficulty,
+    difficultyLabel,
+    routedDifficultyLabel,
+    initialDifficultyTone,
+    difficultyTone,
+    difficultyBadge,
+    compactDifficultyBadge,
+    stepUpLabel,
+    steppedUp,
+    tierRole,
+    presetId,
+    firstPresetId,
+    rerouted,
+    presetTrajectory,
+    presetBadge,
+    engineLabel,
+    modelLabel,
+    engineModelLabel,
+    executionProfile,
+    qualityRejections,
+    hasReworkHistory,
+    reworkBadge,
+    compactReworkBadge,
+    reworkNote,
+    difficultyTitle,
+    presetTitle,
+    reworkTitle,
+    tooltipLine,
+    reworkStepUp,
+  };
 }

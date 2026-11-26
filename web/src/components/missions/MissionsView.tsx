@@ -27,6 +27,7 @@ import type {
 import {
   approveCommand,
   endedWell,
+  formatTaskGrading,
   pipelineOf,
   slowStages,
   stageStep,
@@ -45,12 +46,10 @@ import { Fact, SectionLabel } from "../fleet/bits";
 import { VerdictBadge, useNow } from "../rsi/Phase";
 import { TaskActivityLine } from "./TaskActivity";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING, GroupHeader, LiveStatus, PageHeader, cx } from "../ui";
-import { Badge } from "../ui/badge";
-import { gradeTone, taskGradingSummary } from "../../grading.ts";
 import { HeldSources } from "./HeldSources";
 import { Markdown } from "./Markdown";
 import { TaskText, useTaskTexts } from "./TaskTexts";
-import { AgentLink, Collapsible } from "./parts";
+import { AgentLink, Collapsible, TaskGradingBadges, TaskGradingCompact } from "./parts";
 import { ViewToggle, useStoredChoice } from "../ViewToggle";
 import type { ViewOption } from "../ViewToggle";
 
@@ -613,33 +612,37 @@ function EarlierAttempts({ group, missionName }: { group: TaskGroup<MissionTask>
         Earlier attempt{group.earlier.length === 1 ? "" : "s"} · {group.earlier.length}
       </SectionLabel>
       <ul className="mt-1 space-y-1">
-        {group.earlier.map((attempt, index) => (
-          <li
-            key={attempt.task.id ?? `attempt-${index}`}
-            className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 border-l border-border-strong pl-2.5 text-caption"
-          >
-            <span className="tnum shrink-0 font-mono text-micro text-faint-foreground">
-              T{attempt.task.id ?? "?"}
-            </span>
-            <span
-              className={cx(
-                "shrink-0 font-medium",
-                attempt.outcome === "landed" || attempt.outcome === "accepted"
-                  ? "text-success"
-                  : attempt.outcome.startsWith("aborted")
-                    ? "text-destructive"
-                    : "text-warning",
-              )}
+        {group.earlier.map((attempt, index) => {
+          const attemptGrading = formatTaskGrading(attempt.task);
+          return (
+            <li
+              key={attempt.task.id ?? `attempt-${index}`}
+              className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 border-l border-border-strong pl-2.5 text-caption"
             >
-              {attempt.outcome}
-            </span>
-            <span className="min-w-0 flex-1 truncate text-muted-foreground">
-              {taskTitle(attempt.task, { missionName }) ?? ""}
-            </span>
-            <AgentLink sessionId={attempt.task.session_id} agentId={attempt.task.agent_id} />
-            <Ago ms={attempt.task.updated_at_ms} className="text-micro text-faint-foreground" />
-          </li>
-        ))}
+              <span className="tnum shrink-0 font-mono text-micro text-faint-foreground">
+                T{attempt.task.id ?? "?"}
+              </span>
+              <span
+                className={cx(
+                  "shrink-0 font-medium",
+                  attempt.outcome === "landed" || attempt.outcome === "accepted"
+                    ? "text-success"
+                    : attempt.outcome.startsWith("aborted")
+                      ? "text-destructive"
+                      : "text-warning",
+                )}
+              >
+                {attempt.outcome}
+              </span>
+              {attemptGrading && <TaskGradingCompact grading={attemptGrading} showPreset />}
+              <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                {taskTitle(attempt.task, { missionName }) ?? ""}
+              </span>
+              <AgentLink sessionId={attempt.task.session_id} agentId={attempt.task.agent_id} />
+              <Ago ms={attempt.task.updated_at_ms} className="text-micro text-faint-foreground" />
+            </li>
+          );
+        })}
       </ul>
     </div>
   );
@@ -673,7 +676,7 @@ function TaskRow({
   group: TaskGroup<MissionTask>;
 }) {
   const title = taskTitle(task, { missionName });
-  const grading = taskGradingSummary(task);
+  const grading = formatTaskGrading(task);
   // The board sends the texts' first lines; the whole is read when asked
   // (the brief opened, a "show the whole" pressed), one GET for the three.
   const texts = useTaskTexts(task, false);
@@ -719,58 +722,7 @@ function TaskRow({
         {task.model === "cheap" && (
           <Pill className="bg-muted text-muted-foreground">cheap model</Pill>
         )}
-        {(grading?.difficulty || grading?.routedDifficulty) &&
-          (() => {
-            const activeDifficulty = grading.routedDifficulty ?? grading.difficulty;
-            const difficultyLabel =
-              grading.steppedUp && grading.difficulty && grading.routedDifficulty
-                ? `${grading.difficulty} → ${grading.routedDifficulty}`
-                : activeDifficulty;
-            return (
-              <Badge
-                tone={grading.steppedUp ? "warning" : gradeTone(activeDifficulty)}
-                title={
-                  grading.steppedUp
-                    ? `Stepped up ${grading.difficulty} -> ${grading.routedDifficulty}${grading.tierRole ? ` · tier ${grading.tierRole}` : ""}`
-                    : grading.tierRole
-                      ? `Difficulty ${difficultyLabel} · tier ${grading.tierRole}`
-                      : `Difficulty ${difficultyLabel}`
-                }
-              >
-                {difficultyLabel}
-                {grading.tierRole ? ` · ${grading.tierRole}` : ""}
-              </Badge>
-            );
-          })()}
-        {grading?.presetId && (
-          <Badge
-            tone={grading.rerouted ? "warning" : "neutral"}
-            title={[
-              grading.rerouted
-                ? `Rerouted ${grading.firstPresetId} -> ${grading.presetId}`
-                : `Preset ${grading.presetId}`,
-              grading.executionProfile ? `profile ${grading.executionProfile}` : null,
-              grading.modelLabel
-                ? grading.engineLabel
-                  ? `${grading.engineLabel} / ${grading.modelLabel}`
-                  : grading.modelLabel
-                : null,
-            ]
-              .filter(Boolean)
-              .join(" · ")}
-          >
-            <span className="font-mono">
-              {grading.rerouted
-                ? `${grading.firstPresetId} → ${grading.presetId}`
-                : grading.presetId}
-            </span>
-          </Badge>
-        )}
-        {grading && grading.qualityRejections > 0 && (
-          <Badge tone="warning" title="Quality-rejection rework count">
-            {grading.qualityRejections} quality rej
-          </Badge>
-        )}
+        {grading && <TaskGradingBadges grading={grading} />}
         <AgentLink sessionId={task.session_id} agentId={task.agent_id} />
         <span className="tnum ml-auto text-micro text-faint-foreground">
           {task.created_by && <>by {task.created_by} · </>}
