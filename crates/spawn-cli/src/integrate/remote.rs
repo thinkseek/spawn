@@ -1299,15 +1299,16 @@ pub(super) enum PrimaryOutcome {
 }
 
 /// A node's verdict the primary path believed: `given` is what the node
-/// judged, `env` where (`runner` `node:<name>`), `base_check` the red check
-/// it found passing on the base, `belief` the rule (`M3a`, `M3b`).
+/// judged, `env` where (`runner` `node:<name>`), `belief` the rule (`M3a`,
+/// `M3b`). No red check is ever run on a node (a grant cannot carry
+/// `SPAWN_GATE_BASE_CHECK`): a gate on a red main is judged here
+/// (integrate.rs `Judge::remote_primary`).
 #[derive(Debug)]
 pub(super) struct Believed {
     pub(super) job_id: String,
     pub(super) verdict: gate::Verdict,
     pub(super) given: Value,
     pub(super) env: Value,
-    pub(super) base_check: Option<String>,
     pub(super) belief: &'static str,
 }
 
@@ -1356,23 +1357,6 @@ pub(super) fn look(
         RemoteJobState::Completed => Look::Completed,
         other => Look::Ended(other),
     })
-}
-
-/// The red check a node's gate found passing on the base
-/// (`SPAWN_GATE_BASE_CHECK`), from its verdict file: a check's name only.
-fn base_check_of(verdict: Option<&str>) -> Option<String> {
-    let value: Value = serde_json::from_str(verdict?.trim()).ok()?;
-    value
-        .get("base_check")
-        .and_then(Value::as_str)
-        .filter(|name| {
-            name.strip_prefix("check-")
-                .and_then(|rest| rest.strip_suffix(".sh"))
-                .is_some_and(|stem| !stem.is_empty())
-                && name.len() <= 100
-                && !name.contains('/')
-        })
-        .map(str::to_string)
 }
 
 /// The name of the node that ran `row`: the ledger's, else what the node
@@ -1775,7 +1759,6 @@ impl Primary {
                     );
                     Settled::Believed(PrimaryOutcome::Believed(Box::new(Believed {
                         job_id: job_id.clone(),
-                        base_check: base_check_of(stored.meta.verdict_raw.as_deref()),
                         env: node_env(&stored, &node),
                         given: given.clone(),
                         verdict,

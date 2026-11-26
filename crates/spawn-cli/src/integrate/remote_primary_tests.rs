@@ -422,11 +422,9 @@ fn m3a_an_acceptance_on_the_jobs_own_inputs_is_believed() {
         env,
         belief,
         job_id,
-        base_check,
     } = believed(outcome);
     assert!(verdict.accepted);
     assert_eq!(belief, "M3a");
-    assert_eq!(base_check, None);
     assert_eq!(job_id, grant["job_id"]);
     assert_eq!(given, granted_inputs(&grant));
     assert_eq!(given["base"], world.base.as_str());

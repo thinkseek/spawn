@@ -2045,11 +2045,11 @@ struct Judge {
 }
 
 /// What the primary path gives the judging in place of a local run of the
-/// candidate's gate ([`Judge::remote_primary`]): the outcome to judge, the
-/// red check found passing on the base, and what was judged where.
+/// candidate's gate ([`Judge::remote_primary`]): the outcome to judge, and
+/// what was judged where. Never a red check's pass on the base: a gate on a
+/// red main is judged here.
 struct RemoteJudged {
     judged: Result<gate::Verdict, GateFailure>,
-    base_check: Option<String>,
     given: Value,
     env: Value,
 }
@@ -4679,7 +4679,7 @@ impl Judge {
         );
         let (judged, base_check) = if let Some(remote) = remote {
             bound.replace(Some((remote.given, remote.env)));
-            (remote.judged, remote.base_check)
+            (remote.judged, None)
         } else {
             let (judged, base_check) = gate::judge_seeing_base_check(
                 &gate_path,
@@ -5029,6 +5029,22 @@ impl Judge {
         if self.adopted.is_some() {
             return None;
         }
+        // A red main's check runs on the base before the candidate
+        // (SPAWN_GATE_BASE_CHECK): a grant cannot carry it (it is not in
+        // GATE_ENV, and a node refuses it), so a node would judge the
+        // candidate as if main were green, and nothing would say main is
+        // green again. Such a gate is judged here.
+        if let Some((_, check)) = gate_env
+            .iter()
+            .find(|(name, _)| name == "SPAWN_GATE_BASE_CHECK")
+        {
+            println!(
+                "integrate: task {}: judged on this host (fallback_local): main is red on \
+                 {check}; the base check runs here",
+                task.id
+            );
+            return None;
+        }
         let request = remote::PrimaryRequest {
             task: task.id,
             judging_id: judging::current_id(),
@@ -5046,13 +5062,20 @@ impl Judge {
                     verdict,
                     given,
                     env,
-                    base_check,
                     job_id,
                     belief,
                 } = *believed;
+                // A rejection with no failure of the work's (connection or
+                // database errors only) is judged here: the crash window
+                // the host-fault rule reads is this host's test server's,
+                // which says nothing of the node's, so the sentinel stands
+                // for "maybe the node's server crashed".
                 if !verdict.accepted
                     && test_database
-                    && host::host_fault(&verdict.reason, &verdict.output, Vec::new).is_some()
+                    && host::host_fault(&verdict.reason, &verdict.output, || {
+                        vec!["the node's test server (not this host's log)".to_string()]
+                    })
+                    .is_some()
                 {
                     println!(
                         "integrate: task {}: the node's rejection on {job_id} reads as its test \
@@ -5063,7 +5086,6 @@ impl Judge {
                 }
                 Some(RemoteJudged {
                     judged: Ok(verdict),
-                    base_check,
                     given,
                     env,
                 })
@@ -5080,7 +5102,6 @@ impl Judge {
                     reason: gate::STOPPED.to_string(),
                     log: String::new(),
                 }),
-                base_check: None,
                 given: inputs::known(Some(main), Some(candidate)),
                 env: Value::Null,
             }),
