@@ -2361,23 +2361,29 @@ run_stage() {
     stage_emit gate "${1%%|*}" "$2" "${1#*|}"
 }
 
-# snapshot_bin <tree>: the binary the scenarios run (SPAWN_BIN), copied
-# to target/gate/spawn, where no cargo command writes, as soon as the build
-# hook has built the tree, and before anything else of the gate runs cargo
-# in it. `cargo test` links target/debug/spawn again with the test build's
-# features: the dev-dependencies turn on spawn-core's and spawn-host's
-# `testing`. That covers check-tests while other scenarios run, and also the
-# candidate's test listing, which runs before its scenarios. Until
-# 2026-11-09 the candidate's copy was taken after that listing, so the
-# candidate's scenarios ran a testing-featured binary and the base's ran
-# the build hook's (rev-f, design-gate-time.md 3a). Both trees now run the
-# build hook's binary. Copied inside the sandbox: the tree is the
-# candidate's. A tree with no such binary keeps the path its build would
-# have made.
+# snapshot_bin <tree>: the binaries the scenarios run (`spawn` as SPAWN_BIN and
+# its sibling `spawn-hc` when built), copied to target/gate/, where no cargo
+# command writes, as soon as the build hook has built the tree, and before
+# anything else of the gate runs cargo in it. `cargo test` links
+# target/debug/spawn again with the test build's features: the dev-dependencies
+# turn on spawn-core's and spawn-host's `testing`. That covers check-tests while
+# other scenarios run, and also the candidate's test listing, which runs before
+# its scenarios. Until 2026-11-09 the candidate's copy was taken after that
+# listing, so the candidate's scenarios ran a testing-featured binary and the
+# base's ran the build hook's (rev-f, design-gate-time.md 3a). Both trees now
+# run the build hook's binaries. Copied inside the sandbox: the tree is the
+# candidate's. A tree with no such binary keeps the path its build would have
+# made.
 snapshot_bin() {
     sandbox "$1" sh -c '[ -f target/debug/spawn ] || exit 0
         mkdir -p target/gate && cp target/debug/spawn target/gate/spawn.new &&
-        mv -f target/gate/spawn.new target/gate/spawn' >"$work/snapshot.log" 2>&1 || {
+        mv -f target/gate/spawn.new target/gate/spawn &&
+        if [ -f target/debug/spawn-hc ] && [ ! -L target/debug/spawn-hc ]; then
+            cp target/debug/spawn-hc target/gate/spawn-hc.new &&
+            mv -f target/gate/spawn-hc.new target/gate/spawn-hc
+        else
+            rm -f target/gate/spawn-hc
+        fi' >"$work/snapshot.log" 2>&1 || {
         bar '| snapshot: ' "$work/snapshot.log" | tail -n 5
         return 1
     }
@@ -2390,16 +2396,27 @@ spawn_bin() {
     fi
 }
 
-# binary_hash <tree>: the sha256 of the binary the tree's scenarios run, the
-# copy snapshot_bin made (target/gate/spawn), or nothing: a tree whose build
-# made no `spawn`, or a path that is no plain file. Read by the gate itself,
-# outside the sandbox. It is what "the same binary" means for a result
-# reused from the base: the build hook builds `spawn` alone (`cargo build
-# --bin spawn`), SPAWN_BIN is this copy, and a scenario that runs anything
-# else of target/ may not declare `# reads: binary`.
+# binary_hash <tree>: the sha256 of the binary pair the tree's scenarios run,
+# the copies snapshot_bin made (target/gate/spawn and, when built, sibling
+# target/gate/spawn-hc), or nothing: a tree whose build made no `spawn`, or a
+# path that is a symlink / unreadable file. Read by the gate itself, outside
+# the sandbox. It is what "the same binary" means for a result reused from the
+# base: the build hook builds `spawn` and `spawn-hc`, SPAWN_BIN runs
+# target/gate/spawn alongside target/gate/spawn-hc, and changing either binary
+# invalidates `# reads: binary`.
 binary_hash() {
     [ -f "$1/target/gate/spawn" ] && [ ! -L "$1/target/gate/spawn" ] || return 0
-    sha256sum <"$1/target/gate/spawn" 2>/dev/null | cut -d' ' -f1
+    bh_spawn=$(sha256sum <"$1/target/gate/spawn" 2>/dev/null | cut -d' ' -f1) || return 0
+    [ -n "$bh_spawn" ] || return 0
+    if [ -L "$1/target/gate/spawn-hc" ]; then
+        return 0
+    elif [ -f "$1/target/gate/spawn-hc" ]; then
+        bh_hc=$(sha256sum <"$1/target/gate/spawn-hc" 2>/dev/null | cut -d' ' -f1) || return 0
+        [ -n "$bh_hc" ] || return 0
+        printf 'spawn %s\nspawn-hc %s\n' "$bh_spawn" "$bh_hc" | sha256sum | cut -d' ' -f1
+    else
+        printf '%s\n' "$bh_spawn"
+    fi
 }
 
 serial_list=""

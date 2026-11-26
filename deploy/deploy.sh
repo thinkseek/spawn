@@ -91,17 +91,19 @@
 #      network, $HOME hidden, writable only the export and the target
 #      directory): proc-macros and the UI's build tools run the candidate's
 #      code, not the owner's. The binaries and UI are staged in $live
-#      (spawn.staged, spawn-node-gateway.staged, web.staged), not installed;
-#      the export and anything still staged are removed on every exit;
+#      (spawn.staged, spawn-hc.staged, spawn-node-gateway.staged, web.staged),
+#      not installed; the export and anything still staged are removed on
+#      every exit;
 #   6. the integrator is stopped, its gates left running in their units
 #      (below, "Gates outlive the integrator"), or drained and stopped
 #      (below, "Draining") when its binary runs them as children, main is
 #      read again (it must still be the
 #      verdict's base), the staged binary migrates the schema, and only then
 #      binaries and UI are installed: the replaced copies become spawn.prev,
-#      spawn-node-gateway.prev and web.prev, unless the live copy already is
-#      this build (a deploy run again keeps its rollback copies; a first
-#      install of the node gateway writes no .prev), and the controller switches to
+#      spawn-hc.prev, spawn-node-gateway.prev and web.prev, unless the live
+#      copy already is this build (a deploy run again keeps its rollback
+#      copies; a first install of spawn-hc or the node gateway writes no
+#      .prev), and the controller switches to
 #      HEAD's (one atomic rename; the one it replaces stays as
 #      controllers/spawn.prev, older ones are removed unless a process
 #      still uses them). Then $live/deploy.pending is written
@@ -397,7 +399,7 @@ stopped=0
 completing_at_start=0
 on_exit() {
   local status=$?
-  rm -rf "$export_dir" "$live/bin/spawn.staged" "$live/bin/spawn-node-gateway.staged" "$live/web.staged"
+  rm -rf "$export_dir" "$live/bin/spawn.staged" "$live/bin/spawn-hc.staged" "$live/bin/spawn-node-gateway.staged" "$live/web.staged"
   if [ "$status" -ne 0 ] && [ "$stopped" = 1 ]; then
     printf "deploy: failed (exit %s); restarting the services\n" "$status" >&2
     [ "$completing_at_start" = 1 ] || (complete_pending) || printf "deploy: the pending deploy is not complete: %s\n" "$pending" >&2
@@ -585,10 +587,11 @@ complete_pending() {
 }
 
 # install_build: the staged binaries and UI become the live ones. The copies
-# they replace become spawn.prev, spawn-node-gateway.prev and web.prev, unless
-# the live copy already is this build (a deploy run again): then the rollback
-# copies stay. The node gateway's first install has nothing to keep. A
-# gateway binary that changed sets gateway_changed (its restart, step 8).
+# they replace become spawn.prev, spawn-hc.prev, spawn-node-gateway.prev and
+# web.prev, unless the live copy already is this build (a deploy run again):
+# then the rollback copies stay. First installs of spawn-hc or the node
+# gateway have nothing to keep. A gateway binary that changed sets
+# gateway_changed (its restart, step 8).
 gateway_changed=0
 install_build() {
   if cmp -s "$live/bin/spawn.staged" "$live/bin/spawn"; then
@@ -596,6 +599,13 @@ install_build() {
   else
     cp "$live/bin/spawn" "$live/bin/spawn.prev"
     mv "$live/bin/spawn.staged" "$live/bin/spawn"
+  fi
+  if [ -f "$live/bin/spawn-hc" ] &&
+    cmp -s "$live/bin/spawn-hc.staged" "$live/bin/spawn-hc"; then
+    rm -f "$live/bin/spawn-hc.staged"
+  else
+    [ ! -f "$live/bin/spawn-hc" ] || cp "$live/bin/spawn-hc" "$live/bin/spawn-hc.prev"
+    mv "$live/bin/spawn-hc.staged" "$live/bin/spawn-hc"
   fi
   if [ -f "$live/bin/spawn-node-gateway" ] &&
     cmp -s "$live/bin/spawn-node-gateway.staged" "$live/bin/spawn-node-gateway"; then
@@ -706,6 +716,7 @@ sandbox_run "$export_dir/web" sh -c './node_modules/.bin/tsc --noEmit &&
 # Staged, not installed: the live binary and UI change only once every
 # step before the push has passed (init-db runs the staged binary).
 cp "$target/release/spawn" "$live/bin/spawn.staged"
+cp "$target/release/spawn-hc" "$live/bin/spawn-hc.staged"
 cp "$target/release/spawn-node-gateway" "$live/bin/spawn-node-gateway.staged"
 rm -rf "$live/web.staged"
 cp -r "$export_dir/web-dist" "$live/web.staged"
