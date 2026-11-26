@@ -68,6 +68,9 @@
 //! its working directory, an open file or a mapping inside it
 //! ([`directory_occupancy`], [`WORKSPACE_BUSY`]).
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -336,7 +339,7 @@ pub fn cow_clone_supported(directory: &Path) -> bool {
 /// The guard every deletion of this module goes through: a tree holding one
 /// is kept, never removed. Fails closed: a directory or entry that cannot
 /// be read (a mode-000 directory included) is an error, never a zero.
-pub fn count_jsonl(directory: &Path) -> io::Result<usize> {
+fn count_jsonl(directory: &Path) -> io::Result<usize> {
     let mut count = 0;
     for entry in fs::read_dir(directory)? {
         let entry = entry?;

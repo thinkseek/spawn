@@ -8,6 +8,9 @@
 //! - Depends strictly on `spawn-host` + `spawn-cas` (zero database dependencies, zero forbidden OS code).
 //! - All Git commands go exclusively through [`crate::git::git_command`].
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::{self, Write as _};
 use std::fs;

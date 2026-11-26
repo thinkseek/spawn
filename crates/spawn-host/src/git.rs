@@ -30,6 +30,9 @@
 //! part before the colon, so every call rebuilds the mapping from the
 //! identifier alone.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -59,7 +62,7 @@ const BUILD_OUTPUT: [&str; 2] = ["target", ".spawn"];
 /// checkpoints, its mailbox), never the project's. No checkpoint adds one,
 /// whatever the project's `.gitignore` says; the rest of `.claude/` (the
 /// settings, agents and commands a project commits) is committed as usual
-/// ([`GitWorkspace::track_runtime_files`], docs/storage.md).
+/// (`GitWorkspace::track_runtime_files`, docs/storage.md).
 ///
 /// An entry that ends in `/` is a directory; any other is a file, or a
 /// directory, and everything under it. Claude Code is the only engine
@@ -151,7 +154,7 @@ fn runtime_pathspecs(magic: &str) -> Vec<OsString> {
 /// way markers cannot show is copied, relative to the workspace (under
 /// `.spawn/`, never committed), for a worker that cannot run git. Every
 /// mount puts the copies back while the conflict is open
-/// ([`GitWorkspace::restore_main_copies`]).
+/// (`GitWorkspace::restore_main_copies`).
 pub const MAIN_COPIES: &str = ".spawn/main";
 
 /// Where a set-aside moves a file over the cap that was in the way of a
@@ -1737,7 +1740,7 @@ impl GitWorkspace {
     /// (a mission's store takes it back from what this host published);
     /// the branch is then read again. Made, the commit goes on it as on any
     /// branch. Still absent, the store makes it again from the workspace
-    /// ([`Self::recreate`]). An error from `take_back` is the commit's, and
+    /// (`Self::recreate`). An error from `take_back` is the commit's, and
     /// nothing is written.
     pub fn commit_or_take_back(
         &self,
@@ -1967,7 +1970,7 @@ impl WorkspaceStore for GitWorkspace {
     }
 
     /// Export the branch head as the workspace. The whole new tree is built
-    /// beside the workspace first ([`GitWorkspace::stage_mount_commit`]): a
+    /// beside the workspace first (`GitWorkspace::stage_mount_commit`): a
     /// mount that fails (no commit, a head that names files outside git)
     /// leaves the existing workspace, uncommitted files and all, as it was.
     /// Only then, under the branch's lock and if `ready` still wants it, is
@@ -2087,7 +2090,7 @@ impl WorkspaceStore for GitWorkspace {
     }
 
     /// What checkpoints of the workspace left out and the agent was not
-    /// told of yet ([`GitWorkspace::record_oversized`]).
+    /// told of yet (`GitWorkspace::record_oversized`).
     fn notices(&self, workspace: &WorkspaceId) -> Vec<String> {
         self.untold_oversized(workspace.sandbox())
     }
@@ -2115,7 +2118,7 @@ impl WorkspaceStore for GitWorkspace {
 impl GitWorkspace {
     /// The commit a start's `from` names: another agent's branch head or a
     /// full commit id present in the repository. Anything else is refused.
-    pub fn resolve_from(&self, from: &str) -> Result<String, WorkspaceError> {
+    fn resolve_from(&self, from: &str) -> Result<String, WorkspaceError> {
         let refused = |message: String| WorkspaceError::Refused {
             code: "NoSuchFrom".to_string(),
             message,
@@ -3398,8 +3401,8 @@ pub(crate) fn lock_file(lock_path: &Path) -> Result<std::fs::File, WorkspaceErro
 /// `<meta>\t<path>`, an entry of a `-z` tree listing: the meta fields
 /// (ASCII) and the path as bytes.
 /// Where the state of a stale workspace of `branch` is kept
-/// ([`GitWorkspace::keep_stale`]): never pushed and never landed.
-pub fn stale_ref(branch: &str) -> String {
+/// (`GitWorkspace::keep_stale`): never pushed and never landed.
+fn stale_ref(branch: &str) -> String {
     format!("refs/spawn-stale/{branch}")
 }
 
@@ -3523,7 +3526,7 @@ fn clear_dead_lock(index: &Path) {
 const CONFLICT_READ_LIMIT: u64 = 64 << 20;
 
 /// The length of the conflict markers git writes by default.
-pub const CONFLICT_MARKER_SIZE: usize = 7;
+pub(crate) const CONFLICT_MARKER_SIZE: usize = 7;
 
 /// Whether `bytes` hold a whole conflict marker block of git's default
 /// marker size or longer ([`has_conflict_block_sized`]).

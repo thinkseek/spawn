@@ -19,8 +19,8 @@
 //! no stat, age threshold or advisory lock taken by this pass can see such
 //! a writer. So [`dedup_dirs`] runs only over [`ArtifactRoot`]s:
 //!
-//! - a disposable build-artifact directory ([`ARTIFACT_DIRECTORIES`]:
-//!   `target`, `node_modules`), never a source tree or an arbitrary root;
+//! - a disposable build-artifact directory (`target`, `node_modules`),
+//!   never a source tree or an arbitrary root;
 //! - held offline: an [`ArtifactRoot`] borrows the exclusive side of its
 //!   owning workspace's admission lock ([`WorkspaceLease::exclusive`], or
 //!   [`crate::CowWorkspace::offline`]) for the whole pass, so no managed
@@ -78,6 +78,9 @@
 //! existing index stays valid. [`prune_unused`] never removes a blob that
 //! a `spawn-cas` pin names.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -94,14 +97,14 @@ use crate::cow::{
 };
 
 /// The default smallest file worth deduplicating.
-pub const DEFAULT_MIN_SIZE: u64 = 64 * 1024;
+const DEFAULT_MIN_SIZE: u64 = 64 * 1024;
 
 /// The file that marks a directory as a CAS root.
 pub const CAS_MARKER: &str = spawn_cas::CAS_MARKER;
 
 /// The names of the disposable build-artifact directories a pass may
 /// deduplicate ([`ArtifactRoot`]).
-pub const ARTIFACT_DIRECTORIES: [&str; 2] = ["target", "node_modules"];
+pub(crate) const ARTIFACT_DIRECTORIES: [&str; 2] = ["target", "node_modules"];
 
 /// A build-artifact directory held offline for a pass: see the module
 /// documentation. It borrows the exclusive side of the admission lock of
@@ -118,8 +121,8 @@ pub struct ArtifactRoot<'a> {
 
 impl<'a> ArtifactRoot<'a> {
     /// `directory`, which must resolve to `<workspace>/<name>` of the
-    /// workspace `offline` guards, with `<name>` one of
-    /// [`ARTIFACT_DIRECTORIES`], and be a plain directory: a link to
+    /// workspace `offline` guards, with `<name>` one of `target` or
+    /// `node_modules`, and be a plain directory: a link to
     /// another workspace's artifacts, or a path through one, is refused
     /// ([`DedupError::NotArtifact`]). `offline` must be the exclusive side
     /// held for the workspace directory there now
@@ -201,7 +204,7 @@ pub enum DedupError {
     /// The CAS root is a non-empty directory without [`CAS_MARKER`].
     NotCas(PathBuf),
     /// The directory is not a plain build-artifact directory
-    /// ([`ARTIFACT_DIRECTORIES`]).
+    /// (`target`, `node_modules`).
     NotArtifact(PathBuf),
     /// The admission given for the directory is a worker's lease, not the
     /// exclusive side: its workspace is not offline.

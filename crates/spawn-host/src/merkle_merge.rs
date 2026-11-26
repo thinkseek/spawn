@@ -3,6 +3,9 @@
 //! `diff3` three-way text merge, exact-content rename resolution, `Spawn-Head`
 //! merge snapshot builder, and shadow gate divergence classifier.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::error::Error;

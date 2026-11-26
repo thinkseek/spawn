@@ -40,6 +40,9 @@
 //! `index=on` over the same workdir inode is refused `EBUSY` while it is),
 //! see `docs/layerfs-v2-overlay.md`, "The in-use proof".
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -62,7 +65,7 @@ use crate::git::{GitWorkspace, git_command, pathspec_batches, report, report_lis
 /// output, installed dependencies and Spawn's own runtime files. They may
 /// still be pre-warmed as read-only lower layers
 /// ([`OverlayWorkspace::with_lower_layers`]).
-pub const DEFAULT_DERIVED_DIRS: &[&str] = &["target", "node_modules", ".spawn"];
+const DEFAULT_DERIVED_DIRS: &[&str] = &["target", "node_modules", ".spawn"];
 
 /// The overlayfs mount options besides the directories. `userxattr` keeps
 /// whiteout and opaque markers in `user.overlay.*`, which a user namespace
@@ -71,7 +74,7 @@ pub const DEFAULT_DERIVED_DIRS: &[&str] = &["target", "node_modules", ".spawn"];
 /// follow. (`redirect_dir=off` is refused inside a user namespace.)
 /// `metacopy=off` means a changed file is always copied up whole, and
 /// `index=off` means no hard-link index is kept.
-pub const MOUNT_OPTIONS: &str = "userxattr,redirect_dir=nofollow,metacopy=off,index=off";
+const MOUNT_OPTIONS: &str = "userxattr,redirect_dir=nofollow,metacopy=off,index=off";
 
 /// The [`WorkspaceError::Refused`] code of an unmount that found a
 /// transcript (`*.jsonl`) in the upperdir. Transcripts belong outside the
@@ -132,7 +135,7 @@ pub const LAUNCH_STALE: i32 = 76;
 /// Whether this host can mount an overlay without privileges: a user and
 /// mount namespace, an overlay mount in it, a write that copies up, a
 /// delete that leaves a whiteout the host can read, and the kernel's
-/// workdir exclusion that teardown asks ([`probe_work_lock`]): a probe
+/// workdir exclusion that teardown asks (`probe_work_lock`): a probe
 /// overlay over the busy workdir must be refused with the busy error
 /// (nothing else will do), and one over the same workdir, once free, must
 /// be taken. Probed under [`std::env::temp_dir`].
@@ -423,7 +426,7 @@ impl OverlayWorkspace {
     }
 
     /// The same store leaving out these directory names, at any depth,
-    /// instead of [`DEFAULT_DERIVED_DIRS`].
+    /// instead of `["target", "node_modules", ".spawn"]`.
     #[must_use]
     pub fn with_derived_dirs<S: AsRef<OsStr>>(
         mut self,

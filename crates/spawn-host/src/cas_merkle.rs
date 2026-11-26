@@ -4,10 +4,13 @@
 //! (`cas.sync_store` -> PG `spawn_snapshots`/`spawn_refs` -> `fsync` `refs.journal`),
 //! and Layer 0 materialization without `0444` CAS hard-links.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::ffi::OsStr;
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::fs;
 use std::io::{self, BufReader, Read};
 use std::os::unix::ffi::OsStrExt;
@@ -606,7 +609,7 @@ impl CasMerkleStore {
     }
 
     /// Store a workspace file opened `O_NOFOLLOW | O_NONBLOCK` into `NS_BLOB`.
-    pub fn put_file_blob(&self, path: &Path) -> Result<(Digest, u64), D6StoreError> {
+    pub(crate) fn put_file_blob(&self, path: &Path) -> Result<(Digest, u64), D6StoreError> {
         let file = open_regular_nofollow(path)?;
         let mut reader = BufReader::new(file);
         let stored = self.cas.put_blob(NS_BLOB, &mut reader)?;
@@ -1919,16 +1922,9 @@ fn match_char_class(pat: &[u8], start: usize, ch: u8) -> Option<usize> {
 }
 
 /// Inspect pointer blob cap constant alignment (`D6 Fine Item 7.3`).
-pub fn is_pointer_sized(entry: &TreeEntry) -> bool {
+pub(crate) fn is_pointer_sized(entry: &TreeEntry) -> bool {
     entry.kind != TreeEntryKind::Symlink
         && entry.kind != TreeEntryKind::Dir
         && entry.kind != TreeEntryKind::Gitlink
         && entry.size > GIT_POINTER_THRESHOLD
-}
-
-/// Format an error helper preserving full Git path display context.
-pub fn describe_tree_summary(tree: &Tree) -> String {
-    let mut out = String::new();
-    let _ = write!(out, "Tree(entries={})", tree.entries.len());
-    out
 }
