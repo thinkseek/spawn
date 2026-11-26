@@ -627,6 +627,103 @@ pub(super) fn web_lock(controller: &Path) -> Option<String> {
         .map(|(digest, _)| digest)
 }
 
+/// The cache key of a `controller_pack` ([`Artifacts::controller_pack`]):
+/// a sha256 over everything the pack holds, so no change the pack would
+/// carry can be served from a stale cache entry. Fields, each
+/// length-prefixed: the controller's commit, `scenarios_at`, the set's
+/// `scenarios_sha256`, a digest of the controller's `scripts/` (kinds,
+/// modes, contents and link targets, walked in bytewise path order;
+/// absent marked as such) and the sha256 of `web/package-lock.json`
+/// (absent marked as such). An entry that cannot be read is an error:
+/// the caller packs uncached then.
+pub(super) fn controller_pack_key(
+    controller: &Path,
+    controller_commit: &str,
+    scenarios_at: &Path,
+    scenarios_sha256: &str,
+) -> Result<String, String> {
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    let mut key = Sha256::new();
+    field(&mut key, b"controller-pack-key-v1");
+    field(&mut key, controller_commit.as_bytes());
+    field(&mut key, scenarios_at.as_os_str().as_bytes());
+    field(&mut key, scenarios_sha256.as_bytes());
+    let scripts = controller.join("scripts");
+    // As `stage_and_pack` decides: packed when it is (or leads to) a
+    // directory.
+    if scripts.is_dir() {
+        field(&mut key, b"scripts:present");
+        field(&mut key, scripts_digest(&scripts)?.as_bytes());
+    } else {
+        field(&mut key, b"scripts:absent");
+    }
+    let lock = controller.join("web/package-lock.json");
+    if lock.is_file() {
+        let (digest, _) = hash_file(&lock).map_err(|error| format!("{}: {error}", lock.display()))?;
+        field(&mut key, b"web-lock:present");
+        field(&mut key, digest.as_bytes());
+    } else {
+        field(&mut key, b"web-lock:absent");
+    }
+    Ok(hex(&key.finalize()))
+}
+
+/// A deterministic digest of the tree at `scripts` (not following links):
+/// one length-prefixed record per entry, sorted bytewise by relative path,
+/// of its kind, its permission bits and its content's sha256 (a file),
+/// its target (a link) or nothing more (a directory). Any other kind of
+/// entry, or one that cannot be read, is an error.
+fn scripts_digest(scripts: &Path) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fn collect(
+        path: &Path,
+        relative: &Path,
+        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        let fail = |error: std::io::Error| format!("{}: {error}", path.display());
+        let meta = std::fs::symlink_metadata(path).map_err(fail)?;
+        let kind = meta.file_type();
+        let mode = meta.permissions().mode() & 0o7777;
+        let mut record = Vec::new();
+        if kind.is_symlink() {
+            record.extend_from_slice(b"link\0");
+            record.extend_from_slice(std::fs::read_link(path).map_err(fail)?.as_os_str().as_bytes());
+        } else if kind.is_file() {
+            let (digest, size) = hash_file(path).map_err(fail)?;
+            record.extend_from_slice(format!("file\0{mode:o}\0{size}\0{digest}").as_bytes());
+        } else if kind.is_dir() {
+            record.extend_from_slice(format!("dir\0{mode:o}").as_bytes());
+        } else {
+            return Err(format!(
+                "{} is neither a file, a directory nor a link",
+                path.display()
+            ));
+        }
+        out.push((relative.as_os_str().as_bytes().to_vec(), record));
+        if kind.is_dir() {
+            for entry in std::fs::read_dir(path).map_err(fail)? {
+                let entry = entry.map_err(fail)?;
+                collect(&entry.path(), &relative.join(entry.file_name()), out)?;
+            }
+        }
+        Ok(())
+    }
+    let mut entries = Vec::new();
+    collect(scripts, Path::new("scripts"), &mut entries)?;
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut all = Sha256::new();
+    for (relative, record) in entries {
+        all.update((relative.len() as u64).to_be_bytes());
+        all.update(&relative);
+        all.update((record.len() as u64).to_be_bytes());
+        all.update(&record);
+    }
+    Ok(hex(&all.finalize()))
+}
+
 /// A fresh job id: `<prefix>-<the candidate's first 12 hex>-<8 random
 /// lower-case letters and digits>` (`^[a-z0-9][a-z0-9._-]{7,63}$`).
 pub(super) fn job_id(prefix: &str, candidate: &str) -> String {
