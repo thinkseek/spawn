@@ -999,7 +999,7 @@ mod pv4_hook {
             ],
         );
         assert_eq!(mirror_root(&mirror), Some(root.as_path()));
-        assert_eq!(mirror_root(&work), None);
+        assert_eq!(mirror_root(work), None);
         let mirror_text = mirror.display().to_string();
         git(&mirror, tick(), &["update-ref", "refs/heads/main", &l11]);
         // Task 12's agent left a file over the cap out of its checkpoint.
@@ -1046,6 +1046,13 @@ mod pv4_hook {
         assert_eq!(again.recorded(), 0);
         assert_eq!(canonical(&mut hooked_client), hooked_rows);
 
+        check_rows(&hooked_rows, &digest, big.len());
+        drop((hooked_store, indexed_store));
+    }
+
+    /// What the hook's rows say: level 1 and the fixes, from the brief
+    /// alone, and the file over the cap.
+    fn check_rows(hooked_rows: &BTreeMap<String, Value>, digest: &str, size: usize) {
         // What the rows say: level 1 and the fixes, from the brief alone
         // (the landing messages' "reverts: task 11" is the agent's text);
         // task 11's landing has no edge of the kind.
@@ -1104,6 +1111,5 @@ mod pv4_hook {
                 &Value::Null
             )
         );
-        drop((hooked_store, indexed_store));
     }
 }
