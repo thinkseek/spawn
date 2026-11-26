@@ -427,20 +427,35 @@ struct Active {
     unmounting: bool,
     /// What the Bridge has read of the engine's files and screen.
     follow: Follow,
+    /// When its `execution.started` was recorded (the record's time, epoch
+    /// ms), the same after a restart: a prompt of an engine that names its
+    /// own session ([`Bridge::bind_reported`]) older than this (less
+    /// [`BIND_SKEW_MS`]) was not typed into this execution.
+    started_at: u64,
+    /// The conversations below the engine's home
+    /// ([`AgentDriver::session_scan_dir`]) that were there before a fresh
+    /// start launched it: none of them is this execution's, so the scan
+    /// never binds one. Empty after a restart (the start's listing is gone)
+    /// and for a resume.
+    preexisting_natives: HashSet<String>,
 }
 
 impl Active {
-    /// An execution as its `execution.started` record has it.
+    /// An execution as its `execution.started` record has it, recorded at
+    /// `started_at`.
     fn started(
         execution_id: ExecutionId,
         workspace: WorkspaceId,
         transcript_from: Option<u64>,
         driver: &'static dyn AgentDriver,
+        started_at: Timestamp,
     ) -> Self {
         Self {
             execution_id,
             workspace,
             driver,
+            started_at: u64::try_from(started_at.0).unwrap_or(0),
+            preexisting_natives: HashSet::new(),
             checkpoint: None,
             reported_end: None,
             unmounting: false,
@@ -857,6 +872,9 @@ struct SessionView {
     /// The native session the latest execution ran, which a resume
     /// continues.
     native: Option<String>,
+    /// Every native session an execution of this session was bound to: a
+    /// fresh start never binds one of them again ([`Bridge::bind_reported`]).
+    natives: HashSet<String>,
     /// The log holds events read from that session's transcript: it
     /// existed, and a resume must not start without it.
     transcript_read: bool,
@@ -1002,6 +1020,7 @@ impl SessionView {
             agent_id: event.agent_id.clone(),
             unfinished: HashSet::new(),
             native: None,
+            natives: HashSet::new(),
             transcript_read: false,
             model: ModelProfile::Default,
             engine: crate::driver::DEFAULT.to_string(),
@@ -1432,6 +1451,10 @@ pub struct Bridge {
     prepared: HashMap<CommandId, PreparedStart>,
     /// Prompt readiness retained per command between claims.
     prompting: HashMap<CommandId, PromptProgress>,
+    /// The conversations a fresh start found below its engine's home before
+    /// the launch, until its `execution.started` is folded into the view
+    /// ([`Active::preexisting_natives`]).
+    preexisting: HashMap<ExecutionId, HashSet<String>>,
     /// Workspace mounts running off the Bridge thread, bounded by
     /// [`MAX_CONCURRENT_MOUNTS`].
     mounting: HashMap<CommandId, PendingMount>,
@@ -1598,6 +1621,7 @@ impl Bridge {
             runners: None,
             prepared: HashMap::new(),
             prompting: HashMap::new(),
+            preexisting: HashMap::new(),
             mounting: HashMap::new(),
             abandoned_mounts: Vec::new(),
             kill_threads: std::sync::Mutex::new(Vec::new()),
@@ -1709,6 +1733,7 @@ impl Bridge {
         }
         self.cursor = GlobalPosition(0);
         self.sessions.clear();
+        self.preexisting.clear();
         self.catch_up()?;
         self.recover_archives();
         self.rederive_unrecorded();
@@ -2043,12 +2068,19 @@ impl Bridge {
                     // As the store names it now: a record from before the
                     // root was resolved names the same directory.
                     let workspace = self.workspaces.canonical(workspace);
-                    view.active = Some(Active::started(
+                    let mut active = Active::started(
                         execution_id,
                         workspace,
                         *transcript_from,
                         driver_or_default(engine),
-                    ));
+                        record.recorded_at,
+                    );
+                    // A fresh start of this Bridge's own listed what was
+                    // there before its launch; a restart has no such list.
+                    if let Some(names) = self.preexisting.remove(&active.execution_id) {
+                        active.preexisting_natives = names;
+                    }
+                    view.active = Some(active);
                 }
             }
             // After a restart, the last recorded screen. The Bridge's own
@@ -2099,6 +2131,7 @@ impl Bridge {
                     view.transcript_read = false;
                 }
                 view.native = Some(native_session_id.clone());
+                view.natives.insert(native_session_id.clone());
                 if current && let Some(active) = view.active.as_mut() {
                     active.follow.recorded_binding();
                 }
@@ -4067,6 +4100,7 @@ impl Bridge {
             self.workspaces.canonical(workspace),
             *transcript_from,
             driver_or_default(engine),
+            record.recorded_at,
         );
         if let Some(view) = self.sessions.get_mut(session) {
             view.active = Some(active.clone());
@@ -4246,7 +4280,23 @@ impl Bridge {
                 binding: Binding::resumed(native.is_some()),
                 ..Follow::default()
             },
+            started_at: u64::try_from(self.clock.now().0).unwrap_or(0),
+            preexisting_natives: HashSet::new(),
         };
+        // A fresh start of an engine that names its own session: the
+        // conversations already below its home are none of this
+        // execution's ([`Self::bind_reported`]). Listed before the launch,
+        // handed to the view's execution when its record is folded.
+        if native.is_none()
+            && prepared.driver.traits().session == SessionBinding::Reported
+            && let Some(dir) = prepared
+                .driver
+                .session_scan_dir(&self.config.home_of(prepared.driver))
+            && let Ok(names) = self.terminals.list_dirs(&active.workspace, &dir)
+        {
+            self.preexisting
+                .insert(active.execution_id.clone(), names.into_iter().collect());
+        }
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
         let recorded = self.append(
