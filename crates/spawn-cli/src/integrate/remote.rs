@@ -627,6 +627,109 @@ pub(super) fn web_lock(controller: &Path) -> Option<String> {
         .map(|(digest, _)| digest)
 }
 
+/// The cache key of a `controller_pack` ([`Artifacts::controller_pack`]):
+/// a sha256 over everything the pack holds, so no change the pack would
+/// carry can be served from a stale cache entry. Fields, each
+/// length-prefixed: the controller's commit, `scenarios_at`, the set's
+/// `scenarios_sha256`, a digest of the controller's `scripts/` (kinds,
+/// modes, contents and link targets, walked in bytewise path order;
+/// absent marked as such) and the sha256 of `web/package-lock.json`
+/// (absent marked as such). An entry that cannot be read is an error:
+/// the caller packs uncached then.
+pub(super) fn controller_pack_key(
+    controller: &Path,
+    controller_commit: &str,
+    scenarios_at: &Path,
+    scenarios_sha256: &str,
+) -> Result<String, String> {
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    let mut key = Sha256::new();
+    field(&mut key, b"controller-pack-key-v1");
+    field(&mut key, controller_commit.as_bytes());
+    field(&mut key, scenarios_at.as_os_str().as_bytes());
+    field(&mut key, scenarios_sha256.as_bytes());
+    let scripts = controller.join("scripts");
+    // As `stage_and_pack` decides: packed when it is (or leads to) a
+    // directory.
+    if scripts.is_dir() {
+        field(&mut key, b"scripts:present");
+        field(&mut key, scripts_digest(&scripts)?.as_bytes());
+    } else {
+        field(&mut key, b"scripts:absent");
+    }
+    let lock = controller.join("web/package-lock.json");
+    if lock.is_file() {
+        let (digest, _) =
+            hash_file(&lock).map_err(|error| format!("{}: {error}", lock.display()))?;
+        field(&mut key, b"web-lock:present");
+        field(&mut key, digest.as_bytes());
+    } else {
+        field(&mut key, b"web-lock:absent");
+    }
+    Ok(hex(&key.finalize()))
+}
+
+/// A deterministic digest of the tree at `scripts` (not following links):
+/// one length-prefixed record per entry, sorted bytewise by relative path,
+/// of its kind, its permission bits and its content's sha256 (a file),
+/// its target (a link) or nothing more (a directory). Any other kind of
+/// entry, or one that cannot be read, is an error.
+fn scripts_digest(scripts: &Path) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fn collect(
+        path: &Path,
+        relative: &Path,
+        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        let fail = |error: std::io::Error| format!("{}: {error}", path.display());
+        let meta = std::fs::symlink_metadata(path).map_err(fail)?;
+        let kind = meta.file_type();
+        let mode = meta.permissions().mode() & 0o7777;
+        let mut record = Vec::new();
+        if kind.is_symlink() {
+            record.extend_from_slice(b"link\0");
+            record.extend_from_slice(
+                std::fs::read_link(path)
+                    .map_err(fail)?
+                    .as_os_str()
+                    .as_bytes(),
+            );
+        } else if kind.is_file() {
+            let (digest, size) = hash_file(path).map_err(fail)?;
+            record.extend_from_slice(format!("file\0{mode:o}\0{size}\0{digest}").as_bytes());
+        } else if kind.is_dir() {
+            record.extend_from_slice(format!("dir\0{mode:o}").as_bytes());
+        } else {
+            return Err(format!(
+                "{} is neither a file, a directory nor a link",
+                path.display()
+            ));
+        }
+        out.push((relative.as_os_str().as_bytes().to_vec(), record));
+        if kind.is_dir() {
+            for entry in std::fs::read_dir(path).map_err(fail)? {
+                let entry = entry.map_err(fail)?;
+                collect(&entry.path(), &relative.join(entry.file_name()), out)?;
+            }
+        }
+        Ok(())
+    }
+    let mut entries = Vec::new();
+    collect(scripts, Path::new("scripts"), &mut entries)?;
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut all = Sha256::new();
+    for (relative, record) in entries {
+        all.update((relative.len() as u64).to_be_bytes());
+        all.update(&relative);
+        all.update((record.len() as u64).to_be_bytes());
+        all.update(&record);
+    }
+    Ok(hex(&all.finalize()))
+}
+
 /// A fresh job id: `<prefix>-<the candidate's first 12 hex>-<8 random
 /// lower-case letters and digits>` (`^[a-z0-9][a-z0-9._-]{7,63}$`).
 pub(super) fn job_id(prefix: &str, candidate: &str) -> String {
@@ -1563,7 +1666,9 @@ impl Primary {
             &scenarios_at,
             scenarios_sha256
                 .as_deref()
-                .map(|digest| format!("{controller_commit}-{digest}"))
+                .and_then(|digest| {
+                    controller_pack_key(&controller, &controller_commit, &scenarios_at, digest).ok()
+                })
                 .as_deref(),
         );
         super::shadow::remove_tree(&snapshot);
@@ -2653,6 +2758,107 @@ pub(super) mod tests {
         assert_eq!(toolchain_channel(&ctl).as_deref(), Some("1.95.0"));
         assert_eq!(web_lock(&ctl).unwrap().len(), 64);
         assert_eq!(web_lock(&dir.0), None);
+    }
+
+    /// Pack `ctl` keyed as `Primary::publish` and `NodeShadows::publish`
+    /// key it; the key and what was served.
+    fn keyed_pack(artifacts: &Artifacts, ctl: &Path, at: &Path) -> (String, Published) {
+        let scenarios = ctl.join("rsi/scenarios");
+        let digest = super::super::inputs::scenarios_sha256(&scenarios).unwrap();
+        let key = controller_pack_key(ctl, CONTROLLER, at, &digest).unwrap();
+        let published = artifacts
+            .controller_pack(ctl, &scenarios, at, Some(&key))
+            .unwrap();
+        (key, published)
+    }
+
+    #[test]
+    fn the_controller_pack_key_covers_scripts_modes_links_the_web_lock_and_the_scenarios_place() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = Scratch::new("pack-key");
+        let ctl = controller(&dir.0);
+        let artifacts = Artifacts::new(dir.0.join("artifacts"));
+        let at = Path::new("rsi/scenarios");
+        let chmod = |file: &str, mode: u32| {
+            std::fs::set_permissions(ctl.join(file), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        };
+        chmod("scripts/rsi/gate.sh", 0o644);
+        std::os::unix::fs::symlink("gate.sh", ctl.join("scripts/rsi/link")).unwrap();
+        // The same inputs: the same key, a cache hit (the cache entry is
+        // what serves it: a planted entry is returned as is).
+        let (key, first) = keyed_pack(&artifacts, &ctl, at);
+        assert_eq!(key.len(), 64);
+        let (again, hit) = keyed_pack(&artifacts, &ctl, at);
+        assert_eq!((&again, &hit), (&key, &first));
+        let entry = artifacts.cache_path("controller", &key);
+        assert!(entry.is_file());
+        let mut seen = vec![key.clone()];
+        let mut last = first;
+        // Each change: a new key and a fresh pack, never the stale one.
+        let mut changed = |what: &str, at: &Path| {
+            let (key, published) = keyed_pack(&artifacts, &ctl, at);
+            assert!(!seen.contains(&key), "{what}: a key already seen");
+            assert_ne!(published, last, "{what}: a stale pack");
+            let fresh = artifacts
+                .controller_pack(&ctl, &ctl.join("rsi/scenarios"), at, None)
+                .unwrap();
+            assert_eq!(published, fresh, "{what}: not what packing gives");
+            seen.push(key);
+            last = published;
+        };
+        std::fs::write(ctl.join("scripts/rsi/gate.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+        changed("gate.sh's contents", at);
+        chmod("scripts/rsi/gate.sh", 0o755);
+        changed("gate.sh's executable bit", at);
+        std::fs::write(ctl.join("scripts/rsi/other.sh"), "exit 0\n").unwrap();
+        std::fs::remove_file(ctl.join("scripts/rsi/link")).unwrap();
+        std::os::unix::fs::symlink("other.sh", ctl.join("scripts/rsi/link")).unwrap();
+        changed("a link's target (and a new script)", at);
+        std::fs::write(
+            ctl.join("web/package-lock.json"),
+            "{\"lockfileVersion\":2}\n",
+        )
+        .unwrap();
+        changed("the web lock's contents", at);
+        std::fs::remove_file(ctl.join("web/package-lock.json")).unwrap();
+        changed("the web lock removed", at);
+        std::fs::write(ctl.join("web/package-lock.json"), "{}\n").unwrap();
+        changed("the web lock added", at);
+        changed("the scenarios' place", Path::new("rsi/elsewhere"));
+
+        // No scripts at all: a key of its own too.
+        let bare = dir.0.join("bare");
+        std::fs::create_dir_all(bare.join("rsi/scenarios")).unwrap();
+        std::fs::write(bare.join("rsi/scenarios/check-ok.sh"), "exit 0\n").unwrap();
+        let with = controller_pack_key(&ctl, CONTROLLER, at, "d").unwrap();
+        let without = controller_pack_key(&bare, CONTROLLER, at, "d").unwrap();
+        assert_ne!(with, without);
+        // Fields cannot run into each other.
+        assert_ne!(
+            controller_pack_key(&bare, "ab", Path::new("c"), "d").unwrap(),
+            controller_pack_key(&bare, "a", Path::new("bc"), "d").unwrap()
+        );
+        // An entry that cannot be read: no key (packed uncached), not a
+        // stale hit.
+        let fifo = ctl.join("scripts/fifo");
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        assert!(controller_pack_key(&ctl, CONTROLLER, at, "d").is_err());
+        std::fs::remove_file(&fifo).unwrap();
+        if !nix_is_root() {
+            chmod("scripts/rsi/gate.sh", 0o000);
+            assert!(controller_pack_key(&ctl, CONTROLLER, at, "d").is_err());
+            chmod("scripts/rsi/gate.sh", 0o644);
+        }
+    }
+
+    /// Root reads files whatever their mode.
+    fn nix_is_root() -> bool {
+        Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
     }
 
     #[test]
