@@ -1318,8 +1318,12 @@ fn unread_version(verdict: Option<&str>) -> Option<String> {
 /// an abort with the whole record, the gate's stdout then its stderr marked
 /// `! `: the pair with any other exit, a base run that exited 2 or `1, then
 /// 2`, and a nested gate's line (`| | …`) in a scenario's log.
+///
+/// It reads only the run and the verdict file, so a run stored by a node
+/// (spawn-node v1, `integrate/remote.rs`) is judged by this same reader:
+/// nothing here measures the host it runs on.
 #[allow(clippy::too_many_lines)] // one ordered list of the gate's outcomes
-fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
+pub(crate) fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
     // The record: stdout, then stderr marked `! ` so no line of it can pass
     // for a verdict or a section header. An abort keeps all of it.
     let record = |stdout: &str| {
