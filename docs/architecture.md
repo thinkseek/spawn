@@ -2,7 +2,11 @@
 
 [English README](../README.md) · [中文 README](../README.zh-CN.md) · [技术方案与接口契约](./design.md) · [视图层设计](./view-architecture.md) · [舰队架构](./fleet-architecture.md) · [存储](./storage.md) · [RSI](./rsi.md) · [升级](./upgrading.md)
 
+<<<<<<< b80be79318a700057d81d403b4b1d749e3ac3ca1
+结论：Spawn 用 9 个 Rust crate（`spawn-core`、`spawn-postgres`、`spawn-host`、`spawn-cas`、`spawn-jev`、`spawn-kdf`、`spawn-codegraph`、`spawn-node-proto`、`spawn-cli`）连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件、对外提供 SQL 视图并以 `LISTEN/NOTIFY` 发出变更提示，Jev 判定语义状态，`spawn` 二进制做装配并提供 Thin Web + PWA 控制面（`spawn serve`）。Spawn 自己的源码全部同步阻塞，不写 async（见第 10 节：`postgres` 驱动内部链接了 `tokio`）。
+=======
 结论：Spawn 用 9 个 Rust crate（`spawn-core`、`spawn-postgres`、`spawn-host`、`spawn-jev`、`spawn-kdf`、`spawn-codegraph`、`spawn-node-proto`、`spawn-node-gateway`、`spawn-cli`）连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件、对外提供 SQL 视图并以 `LISTEN/NOTIFY` 发出变更提示，Jev 判定语义状态，`spawn` 二进制做装配并提供 Thin Web + PWA 控制面（`spawn serve`）。Spawn 自己的源码全部同步阻塞，不写 async（见第 10 节：`postgres` 驱动内部链接了 `tokio`）。
+>>>>>>> a1a306fd97bb40d6dac8092e151d3eab6ae04bda
 
 ## 1. 能力与边界
 
@@ -18,7 +22,7 @@
 
 Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎。
 
-`spawn serve` 提供 Thin Web + PWA 控制面（默认绑 127.0.0.1，非回环地址必须设 `SPAWN_SERVE_TOKEN`；`SPAWN_SERVE_OPEN_NETWORKS` 列出的内网网段内、以该网段 IP 地址访问的客户端免 token）：29 个 GET 路由模式和 9 个 POST 路由。GET 包括看板、事件查询、`GET /api/stream` 的 SSE 实时事件流，以及把任务、落地、验证和部署分成 planned / implemented / verified / live 四态的能力图（`/api/features`、`#/features`，见 [feature-map.md](./feature-map.md)）。POST 中 7 个是人的写入，都以 `spawn_human` 登录调用对应的 `spawn_human_*` 函数：对会话的输入、按键、给 supervisor 的消息、对审批提示的回答（`spawn_human_input`、`spawn_human_key`、`spawn_human_master_message`）经 `spawn_submit` 提交 principal 为 `human` 的命令；停滞 worker 的重启与改派（`spawn_human_task`）调用 `spawn_task_restart_as` / `spawn_task_reassign_as`，写 `task.restarted` 等控制记录，`by` 为 `human`；停摆任务的恢复（`spawn_human_resume`）写一条 `mission.resumed` 记录。另 2 个是能力图的重新扫描与文件关联。完整路由表、方法与 CLI 对应见 [api.md](./api.md)（`serve.rs` 的测试保持两者一致）。发给 agent 会话的命令仍只经 `spawn_submit` 入队、由 Bridge 执行。
+`spawn serve` 提供 Thin Web + PWA 控制面（默认绑 127.0.0.1，非回环地址必须设 `SPAWN_SERVE_TOKEN`；`SPAWN_SERVE_OPEN_NETWORKS` 列出的内网网段内、以该网段 IP 地址访问的客户端免 token）：31 个 GET 路由模式和 9 个 POST 路由。GET 包括看板、事件查询、`GET /api/stream` 的 SSE 实时事件流，以及把任务、落地、验证和部署分成 planned / implemented / verified / live 四态的能力图（`/api/features`、`#/features`，见 [feature-map.md](./feature-map.md)）。POST 中 7 个是人的写入，都以 `spawn_human` 登录调用对应的 `spawn_human_*` 函数：对会话的输入、按键、给 supervisor 的消息、对审批提示的回答（`spawn_human_input`、`spawn_human_key`、`spawn_human_master_message`）经 `spawn_submit` 提交 principal 为 `human` 的命令；停滞 worker 的重启与改派（`spawn_human_task`）调用 `spawn_task_restart_as` / `spawn_task_reassign_as`，写 `task.restarted` 等控制记录，`by` 为 `human`；停摆任务的恢复（`spawn_human_resume`）写一条 `mission.resumed` 记录。另 2 个是能力图的重新扫描与文件关联。完整路由表、方法与 CLI 对应见 [api.md](./api.md)（`serve.rs` 的测试保持两者一致）。发给 agent 会话的命令仍只经 `spawn_submit` 入队、由 Bridge 执行。
 
 ## 2. crate 结构
 
@@ -26,7 +30,8 @@ Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎�
 | --- | --- | --- |
 | `spawn-core` | 类型、端口、事件归一、Bridge、Observer、能力图模型；内存实现与一致性套件在 `testing` feature 后。零 IO | serde、serde_json、sha2、thiserror |
 | `spawn-postgres` | EventLog + CommandQueue 的 PG 实现、`sql/schema.sql`、读方法、`LISTEN spawn_events` 连接（`wake.rs`） | spawn-core、spawn-kdf、postgres、postgres-protocol、fallible-iterator、serde、serde_json、whoami |
-| `spawn-host` | 终端（`TerminalHost`：`TmuxHost` 默认，`HerdrHost` 由 `SPAWN_TERMINAL_BACKEND=herdr` 显式选择）、工作区存储（`LocalWorkspaceStore`：`git`、`cow`、`overlay` 三种引擎加 `auto` 选择，同一 `WorkspaceStore` 契约；`cas_dedup` 对 Cow 工作区的 `target/`、`node_modules/` 去重）、transcript 归档、inotify | spawn-core、libc、rustix、serde_json、sha2 |
+| `spawn-host` | 终端（`TerminalHost`：`TmuxHost` 默认，`HerdrHost` 由 `SPAWN_TERMINAL_BACKEND=herdr` 显式选择）、工作区存储（`LocalWorkspaceStore`：`git`、`cow`、`overlay` 三种引擎加 `auto` 选择，同一 `WorkspaceStore` 契约；`cas_dedup` 对 Cow 工作区的 `target/`、`node_modules/` 去重，块存于 `spawn-cas`）、transcript 归档、inotify | spawn-core、spawn-cas、libc、rustix、serde_json |
+| `spawn-cas` | 统一内容寻址存储：带算法前缀的摘要（`sha256:<64 hex>`）、`objects/<algo>/<2 hex>/<hex>`（0444）、`pins/<owner>/<name>`、按命名空间的 LRU GC（`access/<ns>/`）、`tmp/` 暂存；crash-only，不 fsync；与 Go `spawn-node/cas` 同一磁盘布局；旧 `cas_dedup` 的 `<2 hex>/<hex>` 原地改名收编，不重算哈希 | sha2、thiserror、libc |
 | `spawn-jev` | 判定 HTTP 客户端，端口在 core，实现在此 | spawn-core、serde、serde_json |
 | `spawn-kdf` | 受限登录口令的 PBKDF2-HMAC-SHA256 派生（单独一个 crate，开发构建也以 `opt-level = 3` 编译） | sha2、hmac |
 | `spawn-codegraph` | 能力图的代码依赖事实：从仓库文件抽取代码图 | spawn-core、syn、proc-macro2 |
@@ -41,6 +46,7 @@ flowchart LR
   pg[spawn-postgres]
   jev[spawn-jev]
   host[spawn-host]
+  cas[spawn-cas]
   graph[spawn-codegraph]
   proto[spawn-node-proto]
   gw[spawn-node-gateway]
@@ -49,6 +55,7 @@ flowchart LR
   pg --> kdf
   jev --> core
   host --> core
+  host --> cas
   graph --> core
   cli --> pg
   cli --> jev
@@ -59,7 +66,11 @@ flowchart LR
   gw --> pg
 ```
 
+<<<<<<< b80be79318a700057d81d403b4b1d749e3ac3ca1
+依赖单向：只有 `spawn-cli` 同时依赖各实现层；实现层之间的依赖只有两条：`spawn-postgres` 用 `spawn-kdf` 派生登录口令，`spawn-host` 的 `cas_dedup` 把块存进 `spawn-cas`。
+=======
 依赖单向：只有 `spawn-cli` 同时依赖各实现层；实现层之间唯一的依赖是 `spawn-postgres` 用 `spawn-kdf` 派生登录口令。`spawn-node-gateway` 是另一个二进制，只依赖 `spawn-node-proto` 与 `spawn-postgres`。
+>>>>>>> a1a306fd97bb40d6dac8092e151d3eab6ae04bda
 
 ## 3. 一次任务的链路
 
@@ -154,7 +165,7 @@ spawn fleet
 | `run` | 在终端内启动引擎，退出时把退出码写入 `SPAWN_EXIT_FILE`（Bridge 读到后写 `execution.ended{Exited}`），转发退出码；不连数据库 |
 | `loop` | 常驻：每 500 ms 跑一轮 Bridge、Observer、派发与存活规则（`SPAWN_LOOP_INTERVAL_MS`） |
 | `integrate` | 常驻：对已验收任务跑黑盒门禁，宿主机提交并以 CAS 前移来源基线 |
-| `serve` | 常驻：Thin Web + PWA 控制面，29 个 GET 路由模式和 9 个 POST 路由（[api.md](./api.md)） |
+| `serve` | 常驻：Thin Web + PWA 控制面，31 个 GET 路由模式和 9 个 POST 路由（[api.md](./api.md)） |
 | `scorecard` | 只读记录，一次量出八个维度（吞吐、前导时间、一次通过率、返工、自主、可靠、成本、门禁耗时），带 n、方向、上一窗口与趋势（[design.md](design.md) §15） |
 | `mission` / `task` / `resident` | 任务域控制流：添加、配置、关闭、恢复任务，分派与验收子任务，提议、批准、退役常驻 worker |
 | `fleet` / `tail` | 舰队概览（每个会话及其判定）、单个会话的判定与事件尾随 |

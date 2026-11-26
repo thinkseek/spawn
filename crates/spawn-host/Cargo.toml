@@ -12,9 +12,8 @@ spawn-core.workspace = true
 libc.workspace = true
 rustix.workspace = true
 serde_json.workspace = true
-# Content addresses of deduplicated build artifacts (`cas_dedup`); already
-# linked through the PostgreSQL driver's SCRAM login.
-sha2.workspace = true
+# The content-addressed store of deduplicated build artifacts (`cas_dedup`).
+spawn-cas.workspace = true
 
 [features]
 # The git a test runs for itself (`test_git_command`), for tests only.
