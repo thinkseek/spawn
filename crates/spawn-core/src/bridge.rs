@@ -1987,22 +1987,7 @@ impl Bridge {
             // readings keep its own clock, which the refresh is timed by.
             EventKind::ScreenObserved { state, .. } if current => {
                 if let Some(active) = view.active.as_mut() {
-                    if active.follow.screen.map(|(known, _)| known) != Some(*state) {
-                        active.follow.screen = Some((*state, record.recorded_at.0));
-                    }
-                    // The host reading the newest keyed screen was keyed by
-                    // (carry list N12): a restarted Bridge never keys that
-                    // reading again, so a screen recorded unkeyed under it
-                    // before the restart (a draft over a ready pane, the same
-                    // `seq`) is followed by one recorded unkeyed after it,
-                    // not by a keyed one the log refuses as a repeat.
-                    if let Some(seq) = event
-                        .source_event_id
-                        .as_deref()
-                        .and_then(|key| keyed_screen_seq(key, &active.execution_id))
-                    {
-                        active.follow.keyed_seq = Some(seq);
-                    }
+                    fold_screen(active, *state, record);
                 }
             }
             EventKind::ExecutionEnded { .. } if current && event.source == Source::Bridge => {
@@ -6678,6 +6663,27 @@ pub fn trust_answer_key(execution: &ExecutionId, n: usize) -> String {
 /// refused while the pane cannot take it.
 pub fn waits(principal: &str) -> bool {
     !LOOP_PRINCIPALS.contains(&principal)
+}
+
+/// A `screen.observed` of the running execution, read back after a
+/// restart: the last recorded screen, and the host reading the newest keyed
+/// screen was keyed by (carry list N12). A restarted Bridge never keys that
+/// reading again, so a screen recorded unkeyed under it before the restart
+/// (a draft over a ready pane, the same `seq`) is followed by one recorded
+/// unkeyed after it, not by a keyed one the log refuses as a repeat. The
+/// Bridge's own readings keep its own clock, which the refresh is timed by.
+fn fold_screen(active: &mut Active, state: ScreenState, record: &EventRecord) {
+    if active.follow.screen.map(|(known, _)| known) != Some(state) {
+        active.follow.screen = Some((state, record.recorded_at.0));
+    }
+    if let Some(seq) = record
+        .event
+        .source_event_id
+        .as_deref()
+        .and_then(|key| keyed_screen_seq(key, &active.execution_id))
+    {
+        active.follow.keyed_seq = Some(seq);
+    }
 }
 
 /// The host reading's `seq` a keyed `screen.observed` of `execution` was
