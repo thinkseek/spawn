@@ -61,6 +61,7 @@ fn worker(state: SemanticState, idle: bool) -> Facts {
         jobs: Vec::new(),
         recovered: None,
         failed_resume: None,
+        engine: None,
     }
 }
 

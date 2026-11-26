@@ -178,6 +178,7 @@ mod tests {
             stops,
             charter: None,
             jobs: Vec::new(),
+            engine: None,
         }
     }
 

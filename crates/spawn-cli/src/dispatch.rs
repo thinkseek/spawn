@@ -1407,6 +1407,7 @@ mod tests {
             charter: None,
             jobs: Vec::new(),
             recovered: None,
+            engine: None,
         }
     }
 
@@ -1554,6 +1555,7 @@ mod tests {
             charter: None,
             jobs: Vec::new(),
             recovered: None,
+            engine: None,
         }
     }
 

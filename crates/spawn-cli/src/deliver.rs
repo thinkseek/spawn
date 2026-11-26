@@ -2705,6 +2705,9 @@ mod tests {
             reassigned_to_session: None,
             restart: None,
             pinned: false,
+            preset_id: None,
+            preset_engine: None,
+            preset_model_label: None,
         }
     }
 
@@ -2748,6 +2751,7 @@ mod tests {
             charter: None,
             jobs: Vec::new(),
             recovered: None,
+            engine: None,
         }
     }
 

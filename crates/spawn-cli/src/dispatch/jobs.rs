@@ -198,6 +198,7 @@ mod tests {
             recovered: None,
             charter: None,
             jobs,
+            engine: None,
         }
     }
 
