@@ -2485,21 +2485,19 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
     let data_fs = df_filesystem_info(data_fs_target).ok();
     let other_mounts = other_persistent_mounts();
 
-    let mut warnings = Vec::new();
-    if let Some((_, cfg)) = &loaded_config {
-        collect_config_warnings(cfg, &mut warnings);
-    } else if let Some(fs_info) = &data_fs
-        && fs_info.on_root_filesystem
-        && !other_mounts.is_empty()
-    {
-        warnings.push(format!(
-            "target path {} sits on the '/' filesystem while dedicated mounts exist ({})",
-            data_fs_target.display(),
-            other_mounts.join(", ")
-        ));
-    }
+    let mut warnings = collect_doctor_target_warnings(
+        loaded_config.as_ref().map(|(_, cfg)| cfg),
+        data_fs.as_ref(),
+        data_fs_target,
+        &other_mounts,
+    );
 
     let storage_probes = probe_storage(&workspaces_or_root);
+    let (shared_build_caches, shared_cache_warnings) = probe_shared_build_caches(
+        explicit_root.as_deref(),
+        loaded_config.as_ref().map(|(_, cfg)| cfg),
+    );
+    warnings.extend(shared_cache_warnings);
     let (model_endpoints, model_warnings) = probe_model_endpoints();
     warnings.extend(model_warnings);
 
@@ -2528,6 +2526,7 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
             "other_mounts": other_mounts,
         },
         "storage_probes": storage_probes,
+        "shared_build_caches": shared_build_caches,
         "model_endpoints": model_endpoints,
         "warnings": warnings,
     });
@@ -2540,6 +2539,28 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
         print_doctor_human(&report);
     }
     Ok(0)
+}
+
+fn collect_doctor_target_warnings(
+    loaded_config: Option<&SpawnConfig>,
+    data_fs: Option<&FilesystemInfo>,
+    data_fs_target: &Path,
+    other_mounts: &[String],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(cfg) = loaded_config {
+        collect_config_warnings(cfg, &mut warnings);
+    } else if let Some(fs_info) = data_fs
+        && fs_info.on_root_filesystem
+        && !other_mounts.is_empty()
+    {
+        warnings.push(format!(
+            "target path {} sits on the '/' filesystem while dedicated mounts exist ({})",
+            data_fs_target.display(),
+            other_mounts.join(", ")
+        ));
+    }
+    warnings
 }
 
 fn probe_bwrap_capability(bwrap_tool: &Value) -> Value {
@@ -2756,6 +2777,352 @@ fn probe_storage(probe_dir: &Path) -> Value {
     })
 }
 
+fn print_doctor_shared_build_caches(caches: &Value) {
+    let status = caches["status"].as_str().unwrap_or("disabled");
+    let vars = caches["managed_env_vars"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    if caches["enabled"].as_bool().unwrap_or(false) {
+        println!(
+            "shared_build_caches: {status} (path={}, exists={}, writable={}, vars={vars})",
+            caches["path"].as_str().unwrap_or("<none>"),
+            caches["exists"].as_bool().unwrap_or(false),
+            caches["writable"].as_bool().unwrap_or(false),
+        );
+    } else if status == "invalid" {
+        println!(
+            "shared_build_caches: invalid ({}, vars={vars})",
+            caches["error"].as_str().unwrap_or("invalid configuration"),
+        );
+    } else {
+        println!("shared_build_caches: disabled (vars={vars})");
+    }
+}
+
+fn print_doctor_model_endpoints(endpoints: &Value) {
+    println!(
+        "model_endpoints: preflight={}",
+        endpoints["preflight_mode"].as_str().unwrap_or("warn")
+    );
+    for slot in ["model_relay", "judge"] {
+        let entry = &endpoints[slot];
+        let status = entry["status"].as_str().unwrap_or("not_configured");
+        match status {
+            "not_configured" => println!("  {slot}: not_configured"),
+            "ok" => println!(
+                "  {slot}: ok (target={}, latency_ms={})",
+                entry["target"].as_str().unwrap_or("unknown"),
+                entry["latency_ms"]
+                    .as_u64()
+                    .map_or_else(|| "unknown".to_string(), |ms| ms.to_string()),
+            ),
+            _ => {
+                println!(
+                    "  {slot}: {status} (target={}, latency_ms={}, detail={})",
+                    entry["target"].as_str().unwrap_or("<invalid-endpoint>"),
+                    entry["latency_ms"]
+                        .as_u64()
+                        .map_or_else(|| "unknown".to_string(), |ms| ms.to_string()),
+                    entry["detail"].as_str().unwrap_or("unreachable"),
+                );
+                if let Some(hint) = entry["remediation"].as_str() {
+                    println!("    remediation: {hint}");
+                }
+            }
+        }
+    }
+    let slots = &endpoints["model_slots"];
+    println!(
+        "  model_slots: default={}, cheap={}, small={}",
+        slots["default"].as_str().unwrap_or("<unset>"),
+        slots["cheap"].as_str().unwrap_or("<unset>"),
+        slots["small"].as_str().unwrap_or("<unset>"),
+    );
+}
+
+fn sanitize_shared_cache_error(raw: &str) -> String {
+    let redacted = spawn_core::redact::redact(raw);
+    let lower = redacted.to_ascii_lowercase();
+    if redacted.contains("://")
+        || redacted.contains('@')
+        || lower.contains("token=")
+        || lower.contains("api_key=")
+        || lower.contains("apikey=")
+        || lower.contains("secret=")
+        || lower.contains("password=")
+    {
+        return REDACTED.to_string();
+    }
+    redacted
+}
+
+fn probe_shared_build_caches(
+    explicit_root: Option<&Path>,
+    loaded_config: Option<&SpawnConfig>,
+) -> (Value, Vec<String>) {
+    let env_ws = std::env::var("SPAWN_WORKSPACE_ROOT")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .map(PathBuf::from);
+    let derived_ws = loaded_config.map(|cfg| cfg.derived_paths().workspaces);
+    let ws_root = explicit_root
+        .map(Path::to_path_buf)
+        .or(derived_ws)
+        .or(env_ws);
+    probe_shared_build_caches_with(ws_root.as_deref(), &|name| std::env::var(name).ok())
+}
+
+const DOCTOR_SHARED_BUILD_CACHE_VARS: &[&str] = &[
+    "ZIG_GLOBAL_CACHE_DIR",
+    "CCACHE_DIR",
+    "UV_CACHE_DIR",
+    "SCCACHE_DIR",
+    "PIP_CACHE_DIR",
+    "NPM_CONFIG_CACHE",
+    "GOMODCACHE",
+    "GOCACHE",
+];
+
+const DOCTOR_SHARED_CACHE_SENSITIVE_SUBTREES: &[&str] = &[
+    "/etc",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/boot",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/usr",
+    "/run/keep",
+    "/run/keep-test",
+    "/var/run/keep",
+    "/var/run/keep-test",
+];
+
+fn normalize_doctor_cache_path(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        if !matches!(component, Component::CurDir) {
+            normal.push(component.as_os_str());
+        }
+    }
+    if normal.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normal
+    }
+}
+
+fn reject_doctor_cache_path(path: &Path, var_name: &str, home: Option<&str>) -> Result<(), String> {
+    let text = path.to_string_lossy();
+    if BARE_SYSTEM_DIRS.contains(&text.as_ref()) {
+        return Err(format!(
+            "{var_name} cannot target bare system directory {text:?}"
+        ));
+    }
+    for prefix in DOCTOR_SHARED_CACHE_SENSITIVE_SUBTREES {
+        let prefix_path = Path::new(prefix);
+        if path == prefix_path || path.starts_with(prefix_path) {
+            return Err(format!(
+                "{var_name} cannot target sensitive system directory {text:?}"
+            ));
+        }
+    }
+    if let Some(home_raw) = home.map(str::trim).filter(|raw| !raw.is_empty()) {
+        let home_path = Path::new(home_raw);
+        if home_path.is_absolute() {
+            let home_norm = normalize_doctor_cache_path(home_path);
+            if path == home_norm
+                || fs::canonicalize(&home_norm)
+                    .ok()
+                    .is_some_and(|canon| path == canon)
+            {
+                return Err(format!(
+                    "{var_name} cannot target $HOME directly ({text:?}); use a subdirectory"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_doctor_cache_dir(
+    raw: &str,
+    var_name: &str,
+    home: Option<&str>,
+) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return Err(format!(
+            "{var_name} must be a non-empty clean path, not {raw:?}"
+        ));
+    }
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return Err(format!(
+            "{var_name} must be an absolute path, not {trimmed:?}"
+        ));
+    }
+    if has_parent_dir(path) {
+        return Err(format!(
+            "{var_name} must not contain '..' segments, got {trimmed:?}"
+        ));
+    }
+    let normalized = normalize_doctor_cache_path(path);
+    reject_doctor_cache_path(&normalized, var_name, home)?;
+    if let Ok(canonical) = fs::canonicalize(&normalized) {
+        reject_doctor_cache_path(&canonical, var_name, home)?;
+    }
+    Ok(normalized)
+}
+
+fn resolve_doctor_shared_build_cache(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    workspace_root: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    let raw_toggle = lookup("SPAWN_SHARED_BUILD_CACHES");
+    let toggle = match raw_toggle
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        None => None,
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => {
+                return Err(format!(
+                    "SPAWN_SHARED_BUILD_CACHES={value:?} must be 1|true|yes|on or 0|false|no|off"
+                ));
+            }
+        },
+    };
+    if toggle == Some(false) {
+        return Ok(None);
+    }
+    let home = lookup("HOME");
+    if let Some(dir) = lookup("SPAWN_SHARED_BUILD_CACHE_DIR")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return validate_doctor_cache_dir(&dir, "SPAWN_SHARED_BUILD_CACHE_DIR", home.as_deref())
+            .map(Some);
+    }
+    if toggle == Some(true) {
+        let Some(ws) = workspace_root else {
+            return Err(
+                "SPAWN_SHARED_BUILD_CACHES=1 requires a workspace root (set --root / SPAWN_WORKSPACE_ROOT or SPAWN_SHARED_BUILD_CACHE_DIR)"
+                    .to_string(),
+            );
+        };
+        if !ws.is_absolute()
+            || has_parent_dir(ws)
+            || normalize_doctor_cache_path(ws) == Path::new("/")
+        {
+            return Err(format!(
+                "SPAWN_SHARED_BUILD_CACHES requires a valid non-root workspace path, not {:?}",
+                ws.display()
+            ));
+        }
+        let default_dir = normalize_doctor_cache_path(ws).join(".caches");
+        return validate_doctor_cache_dir(
+            &default_dir.display().to_string(),
+            "SPAWN_SHARED_BUILD_CACHES",
+            home.as_deref(),
+        )
+        .map(Some);
+    }
+    Ok(None)
+}
+
+fn probe_shared_build_caches_with(
+    workspace_root: Option<&Path>,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> (Value, Vec<String>) {
+    let managed_env_vars = DOCTOR_SHARED_BUILD_CACHE_VARS;
+    match resolve_doctor_shared_build_cache(lookup, workspace_root) {
+        Ok(None) => (
+            json!({
+                "enabled": false,
+                "status": "disabled",
+                "path": Value::Null,
+                "exists": false,
+                "writable": false,
+                "managed_env_vars": managed_env_vars,
+                "error": Value::Null,
+            }),
+            Vec::new(),
+        ),
+        Ok(Some(path)) => {
+            let exists = fs::symlink_metadata(&path).is_ok();
+            let is_dir = path.is_dir();
+            let writable = if is_dir {
+                path_writable(&path)
+            } else if exists {
+                false
+            } else {
+                let anchor = nearest_existing_ancestor(&path);
+                anchor.is_dir() && path_writable(&anchor)
+            };
+            let mut warnings = Vec::new();
+            let status = if exists && !is_dir {
+                warnings.push(format!(
+                    "shared build cache path {} exists and is not a directory",
+                    path.display()
+                ));
+                "not_a_directory"
+            } else if writable {
+                "ok"
+            } else {
+                warnings.push(format!(
+                    "shared build cache path {} is not writable by current user",
+                    path.display()
+                ));
+                "not_writable"
+            };
+            (
+                json!({
+                    "enabled": true,
+                    "status": status,
+                    "path": path.display().to_string(),
+                    "exists": exists,
+                    "writable": writable,
+                    "managed_env_vars": managed_env_vars,
+                    "error": Value::Null,
+                }),
+                warnings,
+            )
+        }
+        Err(error) => {
+            let sanitized = sanitize_shared_cache_error(&error);
+            let warnings = vec![format!(
+                "shared build caches configuration invalid: {sanitized}"
+            )];
+            (
+                json!({
+                    "enabled": false,
+                    "status": "invalid",
+                    "path": Value::Null,
+                    "exists": false,
+                    "writable": false,
+                    "managed_env_vars": managed_env_vars,
+                    "error": sanitized,
+                }),
+                warnings,
+            )
+        }
+    }
+}
+
 fn print_doctor_human(report: &Value) {
     println!(
         "kernel: {}",
@@ -2810,45 +3177,8 @@ fn print_doctor_human(report: &Value) {
         report["storage_probes"]["cow_clone_supported"],
         report["storage_probes"]["overlay_supported"],
     );
-    let endpoints = &report["model_endpoints"];
-    println!(
-        "model_endpoints: preflight={}",
-        endpoints["preflight_mode"].as_str().unwrap_or("warn")
-    );
-    for slot in ["model_relay", "judge"] {
-        let entry = &endpoints[slot];
-        let status = entry["status"].as_str().unwrap_or("not_configured");
-        match status {
-            "not_configured" => println!("  {slot}: not_configured"),
-            "ok" => println!(
-                "  {slot}: ok (target={}, latency_ms={})",
-                entry["target"].as_str().unwrap_or("unknown"),
-                entry["latency_ms"]
-                    .as_u64()
-                    .map_or_else(|| "unknown".to_string(), |ms| ms.to_string()),
-            ),
-            _ => {
-                println!(
-                    "  {slot}: {status} (target={}, latency_ms={}, detail={})",
-                    entry["target"].as_str().unwrap_or("<invalid-endpoint>"),
-                    entry["latency_ms"]
-                        .as_u64()
-                        .map_or_else(|| "unknown".to_string(), |ms| ms.to_string()),
-                    entry["detail"].as_str().unwrap_or("unreachable"),
-                );
-                if let Some(hint) = entry["remediation"].as_str() {
-                    println!("    remediation: {hint}");
-                }
-            }
-        }
-    }
-    let slots = &endpoints["model_slots"];
-    println!(
-        "  model_slots: default={}, cheap={}, small={}",
-        slots["default"].as_str().unwrap_or("<unset>"),
-        slots["cheap"].as_str().unwrap_or("<unset>"),
-        slots["small"].as_str().unwrap_or("<unset>"),
-    );
+    print_doctor_shared_build_caches(&report["shared_build_caches"]);
+    print_doctor_model_endpoints(&report["model_endpoints"]);
     if let Some(warnings) = report["warnings"].as_array() {
         for warning in warnings {
             if let Some(text) = warning.as_str() {
@@ -3075,5 +3405,88 @@ mod tests {
         for secret in ["RelayPass55", "RelayTok66", "JudgePass77", "JudgeTok88"] {
             assert!(!combined.contains(secret), "secret leaked: {combined}");
         }
+    }
+
+    #[test]
+    fn probe_shared_build_caches_reports_disabled_ok_invalid_and_redacts_secrets() {
+        use super::probe_shared_build_caches_with;
+
+        let base = std::env::temp_dir().join(format!("spawn-doctor-cache-{}", std::process::id()));
+        let ws = base.join("ws");
+        std::fs::create_dir_all(&ws).expect("mkdir ws");
+
+        let (disabled, warnings) = probe_shared_build_caches_with(Some(&ws), &|_| None);
+        assert!(warnings.is_empty());
+        assert_eq!(disabled["enabled"], false);
+        assert_eq!(disabled["status"], "disabled");
+        assert!(disabled["path"].is_null());
+        assert_eq!(disabled["writable"], false);
+        let vars = disabled["managed_env_vars"].as_array().expect("vars array");
+        assert_eq!(vars.len(), 8);
+        assert!(vars.iter().any(|v| v == "ZIG_GLOBAL_CACHE_DIR"));
+        assert!(vars.iter().any(|v| v == "GOCACHE"));
+
+        // Opt-in via SPAWN_SHARED_BUILD_CACHES=1 must stay read-only and never mkdir `.caches`.
+        let (enabled_default, warnings) = probe_shared_build_caches_with(Some(&ws), &|key| {
+            (key == "SPAWN_SHARED_BUILD_CACHES").then(|| "1".to_string())
+        });
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(enabled_default["enabled"], true);
+        assert_eq!(enabled_default["status"], "ok");
+        assert_eq!(
+            enabled_default["path"],
+            ws.join(".caches").display().to_string()
+        );
+        assert_eq!(enabled_default["exists"], false);
+        assert_eq!(enabled_default["writable"], true);
+        assert!(
+            !ws.join(".caches").exists(),
+            "spawn doctor must remain strictly read-only"
+        );
+
+        // Existing custom cache dir vs file collision.
+        let custom_dir = base.join("custom");
+        std::fs::create_dir_all(&custom_dir).expect("mkdir custom");
+        let (custom_ok, warnings) = probe_shared_build_caches_with(Some(&ws), &|key| {
+            (key == "SPAWN_SHARED_BUILD_CACHE_DIR").then(|| custom_dir.display().to_string())
+        });
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(custom_ok["enabled"], true);
+        assert_eq!(custom_ok["status"], "ok");
+        assert_eq!(custom_ok["exists"], true);
+        assert_eq!(custom_ok["writable"], true);
+
+        let blocking_file = base.join("not-a-dir");
+        std::fs::write(&blocking_file, "file\n").expect("write file");
+        let (not_dir, warnings) = probe_shared_build_caches_with(Some(&ws), &|key| {
+            (key == "SPAWN_SHARED_BUILD_CACHE_DIR").then(|| blocking_file.display().to_string())
+        });
+        assert_eq!(not_dir["enabled"], true);
+        assert_eq!(not_dir["status"], "not_a_directory");
+        assert_eq!(not_dir["exists"], true);
+        assert_eq!(not_dir["writable"], false);
+        assert_eq!(warnings.len(), 1);
+
+        // Invalid paths and secret-bearing values never leak secrets.
+        let (invalid, warnings) = probe_shared_build_caches_with(Some(&ws), &|key| match key {
+            "SPAWN_SHARED_BUILD_CACHE_DIR" => {
+                Some("http://user:CacheSecret99@127.0.0.1/cache?token=CacheTok00".to_string())
+            }
+            "SPAWN_DATABASE_URL" => Some("postgres://u:DbSecret11@127.0.0.1:5432/db".to_string()),
+            _ => None,
+        });
+        assert_eq!(invalid["enabled"], false);
+        assert_eq!(invalid["status"], "invalid");
+        assert!(invalid["path"].is_null());
+        assert_eq!(warnings.len(), 1);
+        let serialized = format!("{invalid}\n{}", warnings.join("\n"));
+        for secret in ["CacheSecret99", "CacheTok00", "DbSecret11"] {
+            assert!(
+                !serialized.contains(secret),
+                "secret {secret} leaked: {serialized}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
