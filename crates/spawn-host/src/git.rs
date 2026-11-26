@@ -228,9 +228,15 @@ fn is_sha256_digest(text: &str) -> bool {
 }
 
 /// A record of files over the cap, by path ([`oversized_record`] for the
-/// format). An entry that does not parse is left out.
+/// format). An entry that does not parse is left out, an empty path
+/// included: fields are split on every NUL (an empty field keeps its
+/// place), so one bad entry never shifts the ones after it.
 fn parse_oversized(bytes: &[u8]) -> BTreeMap<TreePath, Oversized> {
-    let fields: Vec<&[u8]> = nul_fields(bytes).collect();
+    let bytes = bytes.strip_suffix(b"\0").unwrap_or(bytes);
+    if bytes.is_empty() {
+        return BTreeMap::new();
+    }
+    let fields: Vec<&[u8]> = bytes.split(|byte| *byte == 0).collect();
     fields
         .chunks_exact(3)
         .filter_map(|entry| {
