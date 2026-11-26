@@ -161,6 +161,24 @@ These are not about process lifetime. They break when two versions meet.
     Spawn cannot read reads `Unknown`, which types nothing. After checking
     its screens and transcript, add its `major.minor` to `AGY_TESTED`.
 
+12. **The filesystem view of agy** (H5, decision C2 N6;
+    docs/fleet-architecture.md §3.9). From this version an engine with no
+    deny rules of its own (agy) starts only inside a `bwrap` view
+    (`SPAWN_ENGINE_VIEW=required`, the default). A host that enables agy
+    needs `bwrap` (bubblewrap 0.9.0 was checked) on the loop's `PATH`;
+    without a working one every agy start is refused (`engine_unavailable:`
+    in the start's outcome) and Claude Code runs on. `SPAWN_ENGINE_VIEW=off`
+    restores the old behaviour, on the owner's explicit choice. Inside the
+    view `~/.gemini` holds only agy's home (`SPAWN_AGY_HOME`): anything agy
+    reads elsewhere below `~/.gemini` is gone for it. agy's `TMPDIR` is
+    `<agy home>/.spawn-tmp`, not the loop's (`/var/tmp/spawn` is masked).
+    A `SPAWN_AGY_HOME` that is, or holds, a masked path (`~/.gemini`
+    itself, `~/.claude`, `/run/keep`, …) refuses every agy start. The view is resolved
+    at each launch, so an agy already running keeps the view it started
+    with; and a masked path missing at its launch that appears later is
+    visible to it (`--ro-bind / /` is live) until its next launch. A
+    rollback to a Spawn without the view simply starts agy without one.
+
 ## What the loop may improve by itself
 
 - Integrator and dispatcher logic.
@@ -189,7 +207,9 @@ only where they exercise it.
 A deploy that enables agy (`SPAWN_ENGINES=claude,agy`) also needs, in the
 loop's environment, `SPAWN_TERMINAL_BACKEND=herdr` and `SPAWN_AGY_MODEL`
 (optionally `SPAWN_AGY_PROGRAM`, `SPAWN_AGY_HOME`), and on the host herdr
-0.9.5 with its antigravity-cli integration and a logged-in agy. Without them,
+0.9.5 with its antigravity-cli integration, a logged-in agy and a working
+`bwrap` on the loop's `PATH` (agy runs only inside its filesystem view,
+`SPAWN_ENGINE_VIEW=required` by default; item 12 above). Without them,
 an agy start is refused before launch, saying what is missing. Claude Code
 is unaffected. The loop probes the engines at its start and hourly
 (`<program> --version`, `agy models`; bounded, no shell, login files only

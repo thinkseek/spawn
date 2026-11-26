@@ -1,6 +1,7 @@
 //! Host adapters: tmux terminals, the workspace stores (Git, the opt-in
 //! copy-on-write and overlay stores, behind one [`LocalWorkspaceStore`]),
-//! the artifact deduplicator, and the local transcript archive.
+//! the artifact deduplicator, the local transcript archive, and the
+//! filesystem view (`bwrap`) an engine without deny rules runs in.
 //!
 //! The tmux and git adapters call an external program and read its exit
 //! code, so they share the same failure rules as the programs they wrap.
@@ -19,6 +20,7 @@ pub mod archive_mask;
 pub mod beneath;
 pub mod cas_dedup;
 pub mod cow;
+pub mod engine_view;
 pub mod git;
 pub mod herdr;
 pub mod home;
@@ -44,6 +46,7 @@ pub use cow::{
     CloneKind, CowStats, CowWorkspace, DirectoryOccupancy, WorkspaceLease, clone_or_copy,
     cow_clone_supported, directory_occupancy, live_users, reflink_file,
 };
+pub use engine_view::{BwrapView, ViewConfig};
 #[cfg(any(test, feature = "testing"))]
 pub use git::test_git_command;
 pub use git::{

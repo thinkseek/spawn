@@ -116,9 +116,10 @@ use crate::id::{
 };
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
-    AgentReading, AgentStatus, BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch,
-    Launch, MOUNT_CANCELLED, READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError,
-    TerminalHost, TranscriptArchive, UNMOUNT_IN_USE, WatchError, WorkspaceError, WorkspaceStore,
+    AgentReading, AgentStatus, BaseMerge, Branch, CommandQueue, Commit, EngineView, EventLog,
+    FileWatch, Launch, MOUNT_CANCELLED, READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError,
+    TerminalHost, TranscriptArchive, UNMOUNT_IN_USE, ViewedLaunch, WatchError, WorkspaceError,
+    WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES};
 use crate::time::{Clock, SystemClock};
@@ -305,6 +306,36 @@ pub struct BridgeConfig {
     /// if nobody does, the start fails naming the dialog and the switch
     /// ([`TRUST_OFF`]).
     pub auto_trust: bool,
+    /// Whether an engine with no deny rules of its own
+    /// ([`crate::driver::Guard::Sandbox`]) runs inside a filesystem view
+    /// (decision C2, N6; `SPAWN_ENGINE_VIEW`). Required by default, and
+    /// with no view: such an engine is refused (`engine_unavailable`)
+    /// until the host hands one over. Claude Code never runs in one.
+    pub engine_view: EngineViewPolicy,
+}
+
+/// The prefix of the reason a start of an engine this host cannot run
+/// safely is refused with: the delivery's escalation names the same.
+pub const ENGINE_UNAVAILABLE: &str = "engine_unavailable";
+
+/// Whether a [`crate::driver::Guard::Sandbox`] engine runs inside a
+/// filesystem view ([`BridgeConfig::engine_view`]).
+#[derive(Debug, Clone)]
+pub enum EngineViewPolicy {
+    /// Only inside this view (`SPAWN_ENGINE_VIEW=required`, the default);
+    /// the error says why this host has none, and such an engine does not
+    /// start.
+    Required(Result<Arc<dyn EngineView>, String>),
+    /// Without one (`SPAWN_ENGINE_VIEW=off`, the owner's explicit choice):
+    /// the engine sees whatever its uid sees, as before N6.
+    Off,
+}
+
+impl EngineViewPolicy {
+    /// Required, with no view yet: the default of a [`BridgeConfig`].
+    pub fn unconfigured() -> Self {
+        Self::Required(Err("no filesystem view is configured".to_string()))
+    }
 }
 
 /// Environment an engine gets only when it is safe at its launch (see
@@ -340,6 +371,7 @@ impl BridgeConfig {
             launch_environment: None,
             recover_worker_leases: true,
             auto_trust: true,
+            engine_view: EngineViewPolicy::unconfigured(),
         }
     }
 
@@ -4194,6 +4226,26 @@ impl Bridge {
         self.launch_and_prompt(claimed, &active, native, &prepared, prompt, report)
     }
 
+    /// Why `driver`'s engine cannot start on this host for want of a
+    /// filesystem view: it has no deny rules of its own
+    /// ([`crate::driver::Guard::Sandbox`]), the host requires a view for
+    /// it ([`BridgeConfig::engine_view`]) and has none. Checked before
+    /// anything is mounted; the view of the launch itself is made at the
+    /// launch ([`Self::launch`]).
+    fn no_engine_view(&self, driver: &dyn AgentDriver) -> Option<String> {
+        if driver.traits().guard != crate::driver::Guard::Sandbox {
+            return None;
+        }
+        match &self.config.engine_view {
+            EngineViewPolicy::Required(Err(why)) => Some(format!(
+                "{ENGINE_UNAVAILABLE}: engine {} has no deny rules of its own and runs only inside \
+                 a filesystem view (SPAWN_ENGINE_VIEW=required), which this host has none of: {why}",
+                driver.id()
+            )),
+            EngineViewPolicy::Required(Ok(_)) | EngineViewPolicy::Off => None,
+        }
+    }
+
     /// Why `driver`'s engine cannot run on this terminal host: an engine
     /// other than Claude Code is followed through the host's own agent
     /// readings (its session, its state), which a host with none (tmux)
@@ -4285,6 +4337,9 @@ impl Bridge {
                     }
                 },
             }
+        }
+        if let Some(why) = self.no_engine_view(driver) {
+            return Ok(Err(why));
         }
         let model = model.unwrap_or_else(|| {
             self.sessions
@@ -5014,7 +5069,7 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<Handled, StoreError> {
         let fresh = self.name_session(claimed, native, active)?;
-        let launch = self.launch(
+        let launched = self.launch(
             claimed,
             active,
             &EngineLaunch {
@@ -5027,6 +5082,14 @@ impl Bridge {
                 model: prepared.model_label.as_deref(),
             },
         );
+        let launch = match launched {
+            Ok(launch) => launch,
+            Err(why) => {
+                return self
+                    .abandon(claimed, active, why, true)
+                    .map(Handled::Finished);
+            }
+        };
         if let Err(error) = self.terminals.start(&launch) {
             return self
                 .abandon(claimed, active, format!("start terminal: {error}"), true)
@@ -5989,10 +6052,21 @@ impl Bridge {
             .filter(|dir| !dir.is_empty())
     }
 
-    fn launch(&self, claimed: &Claimed, active: &Active, run: &EngineLaunch<'_>) -> Launch {
-        let plan = active
-            .driver
-            .launch(&self.config.home_of(active.driver), run);
+    /// The terminal launch of `active`'s engine: the runner (`spawn run`)
+    /// of the engine's program, with the environment of the host, the
+    /// session and the engine. An engine with no deny rules of its own
+    /// ([`crate::driver::Guard::Sandbox`]) runs inside the host's
+    /// filesystem view ([`BridgeConfig::engine_view`]): the launch's
+    /// program is the view's (`bwrap`), and the runner is what it runs.
+    /// Why the view cannot be made is the error, and nothing starts.
+    fn launch(
+        &self,
+        claimed: &Claimed,
+        active: &Active,
+        run: &EngineLaunch<'_>,
+    ) -> Result<Launch, String> {
+        let home = self.config.home_of(active.driver);
+        let plan = active.driver.launch(&home, run);
         let mut arguments = vec!["run".to_string(), "--".to_string(), plan.program];
         arguments.extend(plan.arguments);
         let mut environment = self.config.environment.clone();
@@ -6035,14 +6109,56 @@ impl Bridge {
             "SPAWN_WORKSPACE".to_string(),
             active.workspace.path().to_string(),
         ));
-        Launch {
+        let mut program = self.config.spawn_program.clone();
+        if active.driver.traits().guard == crate::driver::Guard::Sandbox {
+            match &self.config.engine_view {
+                EngineViewPolicy::Off => {}
+                EngineViewPolicy::Required(Err(why)) => {
+                    return Err(format!(
+                        "{ENGINE_UNAVAILABLE}: engine {} runs only inside a filesystem view, \
+                         which this host has none of: {why}",
+                        active.driver.id()
+                    ));
+                }
+                EngineViewPolicy::Required(Ok(view)) => {
+                    let words = view
+                        .wrap(&ViewedLaunch {
+                            engine: active.driver.id(),
+                            workspace: active.workspace.path(),
+                            engine_home: &home.sessions,
+                        })
+                        .map_err(|why| {
+                            format!(
+                                "{ENGINE_UNAVAILABLE}: engine {}: its filesystem view ({}) \
+                                 cannot be made: {why}",
+                                active.driver.id(),
+                                view.name()
+                            )
+                        })?;
+                    let Some((view_program, view_arguments)) = words.split_first() else {
+                        return Err(format!(
+                            "{ENGINE_UNAVAILABLE}: engine {}: its filesystem view ({}) gave \
+                             no program",
+                            active.driver.id(),
+                            view.name()
+                        ));
+                    };
+                    let mut wrapped = view_arguments.to_vec();
+                    wrapped.push(std::mem::take(&mut program));
+                    wrapped.extend(arguments);
+                    arguments = wrapped;
+                    program.clone_from(view_program);
+                }
+            }
+        }
+        Ok(Launch {
             terminal: active.terminal(),
             workspace: active.workspace.clone(),
             cwd: active.workspace.path().to_string(),
-            program: self.config.spawn_program.clone(),
+            program,
             arguments,
             environment,
-        }
+        })
     }
 
     /// Advance the wait for the engine's input box by one capture, then type
@@ -7892,6 +8008,7 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex};
 
     use super::{Bridge, BridgeConfig, RESOLVE_PRINCIPAL, mounted_key, trust_answer_key, waits};
+    use super::{ENGINE_UNAVAILABLE, EngineViewPolicy, ViewedLaunch};
     use crate::command::{CommandAction, NamedKey, Outcome, Submission};
     use crate::event::{CommandStep, ENGINE, EventKind, GlobalPosition, NewEvent, Source};
     use crate::id::{
@@ -9401,7 +9518,133 @@ mod tests {
                 model: model.map(str::to_string),
             },
         )];
+        config.engine_view = EngineViewPolicy::Required(Ok(Arc::new(FakeView::default())));
         config
+    }
+
+    /// A filesystem view that wraps every launch in a made-up `bwrap`
+    /// (or refuses it), and keeps what it was asked.
+    #[derive(Debug, Default)]
+    struct FakeView {
+        refuse: Option<String>,
+        asked: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl crate::port::EngineView for FakeView {
+        fn name(&self) -> &'static str {
+            "bwrap"
+        }
+
+        fn wrap(&self, launch: &ViewedLaunch<'_>) -> Result<Vec<String>, String> {
+            self.asked.lock().expect("asked").push((
+                launch.engine.to_string(),
+                launch.workspace.to_string(),
+                launch.engine_home.to_string(),
+            ));
+            if let Some(why) = &self.refuse {
+                return Err(why.clone());
+            }
+            Ok([
+                "/usr/bin/bwrap",
+                "--unshare-pid",
+                "--chdir",
+                launch.workspace,
+                "--",
+            ]
+            .map(str::to_string)
+            .to_vec())
+        }
+    }
+
+    /// agy has no deny rules of its own (`Guard::Sandbox`): with the view
+    /// required (the default) and none on the host, its start is refused
+    /// as `engine_unavailable` before anything is mounted or launched.
+    #[test]
+    fn agy_without_a_filesystem_view_is_refused_as_engine_unavailable() {
+        let mut config = agy_config(Some("gemini-3.8-flash-low"));
+        config.engine_view = EngineViewPolicy::unconfigured();
+        let why = agy_failure(config, true);
+        assert!(why.starts_with(ENGINE_UNAVAILABLE), "{why}");
+        assert!(why.contains("filesystem view"), "{why}");
+        let mut config = agy_config(Some("gemini-3.8-flash-low"));
+        config.engine_view = EngineViewPolicy::Required(Err("bwrap is not installed".to_string()));
+        let why = agy_failure(config, true);
+        assert!(why.contains("bwrap is not installed"), "{why}");
+    }
+
+    /// A view that cannot be made for one launch fails that start as
+    /// `engine_unavailable`: the terminal is never started.
+    #[test]
+    fn a_view_refused_at_the_launch_starts_nothing() {
+        let mut config = agy_config(Some("gemini-3.8-flash-low"));
+        config.engine_view = EngineViewPolicy::Required(Ok(Arc::new(FakeView {
+            refuse: Some("the workspace holds a mask".to_string()),
+            ..FakeView::default()
+        })));
+        let why = agy_failure(config, true);
+        assert!(why.starts_with(ENGINE_UNAVAILABLE), "{why}");
+        assert!(why.contains("the workspace holds a mask"), "{why}");
+    }
+
+    /// agy runs inside the view: the launch's program is the view's, and
+    /// the runner with agy's own words follows its `--`; the view is asked
+    /// for agy's workspace and home. Under `SPAWN_ENGINE_VIEW=off` it runs
+    /// as before, with no view.
+    #[test]
+    fn agy_runs_inside_the_filesystem_view_unless_it_is_off() {
+        for off in [false, true] {
+            let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+            let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+            let host = Witnessed::over(store.clone());
+            host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+            let id = submit_agy_start_on(&store, "hello", Some("gemini-3.8-pro"));
+            let view = Arc::new(FakeView::default());
+            let mut config = agy_config(None);
+            config.engine_view = if off {
+                EngineViewPolicy::Off
+            } else {
+                EngineViewPolicy::Required(Ok(view.clone()))
+            };
+            let mut bridge = Bridge::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                host.clone(),
+                config,
+            )
+            .with_clock(clock);
+            drive_work(&mut bridge, &store, || {
+                command_outcome(&store, id).is_some()
+            });
+            assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+            let launch = store.launches().pop().expect("launched");
+            if off {
+                assert_eq!(launch.program, "spawn");
+                assert_eq!(launch.arguments[..3], ["run", "--", "/opt/agy/bin/agy"]);
+                assert!(view.asked.lock().expect("asked").is_empty());
+                continue;
+            }
+            assert_eq!(launch.program, "/usr/bin/bwrap");
+            assert_eq!(
+                launch.arguments[..7],
+                [
+                    "--unshare-pid",
+                    "--chdir",
+                    launch.cwd.as_str(),
+                    "--",
+                    "spawn",
+                    "run",
+                    "--"
+                ]
+            );
+            assert_eq!(launch.arguments[7], "/opt/agy/bin/agy");
+            assert!(!launch.arguments.iter().any(|word| word == "--new-session"));
+            let asked = view.asked.lock().expect("asked").clone();
+            assert_eq!(
+                asked,
+                vec![("agy".to_string(), launch.cwd.clone(), AGY_HOME.to_string())]
+            );
+        }
     }
 
     fn submit_agy_start(store: &Arc<MemoryStore>, prompt: &str) -> CommandId {
@@ -11435,6 +11678,39 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Claude Code keeps its deny rules (`Guard::Settings`) and never runs
+    /// in the filesystem view, whatever the host's view policy: with no
+    /// view at all (the default) it still starts, as the plain runner.
+    #[test]
+    fn claude_code_never_runs_in_the_filesystem_view() {
+        let policies = [
+            EngineViewPolicy::unconfigured(),
+            EngineViewPolicy::Required(Ok(Arc::new(FakeView::default()))),
+        ];
+        for (number, policy) in (1_u64..).zip(policies) {
+            let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+            let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+            let id = submit_resumable_start(&store, number, "hello", READY);
+            let mut config = BridgeConfig::new("tester");
+            config.engine_view = policy;
+            let mut bridge = Bridge::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                config,
+            )
+            .with_clock(clock);
+            drive_work(&mut bridge, &store, || {
+                command_outcome(&store, id).is_some()
+            });
+            assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+            let launch = store.launches().pop().expect("launched");
+            assert_eq!(launch.program, "spawn");
+            assert_eq!(launch.arguments[..2], ["run", "--"]);
+        }
     }
 
     #[test]
