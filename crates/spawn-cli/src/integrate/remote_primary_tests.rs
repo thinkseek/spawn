@@ -336,9 +336,9 @@ fn the_primary_path_is_off_unless_node_and_refuses_what_it_does_not_know() {
                 ("SPAWN_NODE_RESULTS", "/r"),
                 ("CARGO_HOME", "/c"),
             ]))
-                .expect("settings")
-                .expect("on")
-                .believe_reject
+            .expect("settings")
+            .expect("on")
+            .believe_reject
         );
     }
     assert!(
@@ -522,13 +522,12 @@ fn unequal_inputs_strike_and_the_job_goes_to_another_node() {
     let ran = std::thread::spawn(move || {
         let grant = first.lease(Duration::from_secs(30)).expect("a grant");
         let given = granted_inputs(&grant);
-        let other = fixtures::verdict_on(
-            "accepted",
-            given["base"].as_str().unwrap(),
-            &"9".repeat(40),
-        );
+        let other =
+            fixtures::verdict_on("accepted", given["base"].as_str().unwrap(), &"9".repeat(40));
         first.finish(&results, &grant, Some(0), Some(&other), "", |_| {});
-        let again = second.lease(Duration::from_secs(30)).expect("granted again");
+        let again = second
+            .lease(Duration::from_secs(30))
+            .expect("granted again");
         assert_eq!(again["job_id"], grant["job_id"]);
         let verdict = verdict_for("accepted", &again);
         second.finish(&results, &again, Some(0), Some(&verdict), "", |_| {});
@@ -566,8 +565,10 @@ fn every_fault_row_is_settled_on_the_ledger_and_judged_here() {
     let world = Fixture::new("fault_rows", false, Duration::from_millis(400));
     let red = r#"{"v":1,"host_fault":true,"on":"main","scenario":"check-tests.sh","runs":"1, 1","failures":[{"test":"a::b","message":"m"}]}"#;
     let cannot = r#"{"v":1,"cannot_judge":true,"scenario":"t029.sh","reason":"no user scopes"}"#;
-    let disk = r#"{"v":1,"no_room":true,"free_kb":10,"min_gb":8,"tmpdir":"/data01/spawn-node/w/0/t"}"#;
-    let base = r#"{"v":1,"host_fault":true,"scenario":"check-a.sh","on":"base","runs":"2","reason":"r"}"#;
+    let disk =
+        r#"{"v":1,"no_room":true,"free_kb":10,"min_gb":8,"tmpdir":"/data01/spawn-node/w/0/t"}"#;
+    let base =
+        r#"{"v":1,"host_fault":true,"scenario":"check-a.sh","on":"base","runs":"2","reason":"r"}"#;
     let pair = "| check-x.sh exited 1, then 0 on the base: a harness error, not a verdict; \
                 the gate aborts\n| stage gate aborted 12ms base: check-x.sh again \
                 (unsolved needs two runs that agree)\n";
@@ -763,14 +764,7 @@ fn every_fault_row_is_settled_on_the_ledger_and_judged_here() {
                     fact
                 }
             });
-            node.finish(
-                &results,
-                &grant,
-                exit,
-                verdict.as_deref(),
-                &stdout,
-                tweak,
-            );
+            node.finish(&results, &grant, exit, verdict.as_deref(), &stdout, tweak);
             grant["job_id"].as_str().unwrap().to_string()
         });
         let outcome = world
@@ -824,7 +818,9 @@ fn a_poison_pill_gives_the_first_node_its_strike_back_and_is_judged_here() {
     let ran = std::thread::spawn(move || {
         let grant = first.lease(Duration::from_secs(30)).expect("a grant");
         first.finish(&results, &grant, Some(2), None, "", |_| {});
-        let again = second.lease(Duration::from_secs(30)).expect("granted again");
+        let again = second
+            .lease(Duration::from_secs(30))
+            .expect("granted again");
         second.finish(&results, &again, Some(137), None, "", |_| {});
     });
     let outcome = world
@@ -925,11 +921,17 @@ fn a_judging_stopped_while_it_waits_takes_its_queued_job_back() {
         .primary
         .follow(&world.ledger.store, 7, &job.job_id, &job.inputs, &stop);
     assert!(matches!(outcome, PrimaryOutcome::Stopped), "{outcome:?}");
-    assert!(since.elapsed() < Duration::from_secs(10), "not the whole wait");
+    assert!(
+        since.elapsed() < Duration::from_secs(10),
+        "not the whole wait"
+    );
     assert_eq!(world.job().state, RemoteJobState::FallbackLocal);
 
     let leased = Fixture::new("stopped_leased", false, Duration::from_secs(30));
-    let job = leased.primary.publish(&leased.request()).expect("published");
+    let job = leased
+        .primary
+        .publish(&leased.request())
+        .expect("published");
     remote::enqueue(&leased.ledger.store, &job).expect("queued");
     let mut node = leased.node("n1");
     assert_eq!(node.beat().len(), 1);
@@ -1017,7 +1019,11 @@ fn a_predecessors_queued_gate_job_is_taken_back_at_the_first_pass() {
         .expect("the job");
     assert_eq!(row.state, RemoteJobState::FallbackLocal);
     // Once: a job queued later is this integrator's own business.
-    let later = remote::enqueue(&world.ledger.store, &world.primary.publish(&world.request()).expect("published")).expect("queued");
+    let later = remote::enqueue(
+        &world.ledger.store,
+        &world.primary.publish(&world.request()).expect("published"),
+    )
+    .expect("queued");
     on.pass_on(&world.ledger.store).expect("the next pass");
     assert_eq!(
         world
@@ -1029,7 +1035,10 @@ fn a_predecessors_queued_gate_job_is_taken_back_at_the_first_pass() {
             .state,
         RemoteJobState::Queued
     );
-    assert_eq!(remote::next_for(RemoteJobKind::Gate, FaultNext::FallbackLocal), FaultNext::FallbackLocal);
+    assert_eq!(
+        remote::next_for(RemoteJobKind::Gate, FaultNext::FallbackLocal),
+        FaultNext::FallbackLocal
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -1234,11 +1243,22 @@ impl World {
 }
 
 /// A node that accepts the job it is granted, on its own inputs.
-fn accepting(mut node: NodeSim, results: PathBuf, word: &'static str) -> std::thread::JoinHandle<Value> {
+fn accepting(
+    mut node: NodeSim,
+    results: PathBuf,
+    word: &'static str,
+) -> std::thread::JoinHandle<Value> {
     std::thread::spawn(move || {
         let grant = node.lease(Duration::from_secs(60)).expect("a grant");
         let verdict = verdict_for(word, &grant);
-        node.finish(&results, &grant, Some(0), Some(&verdict), "| node gate\n", |_| {});
+        node.finish(
+            &results,
+            &grant,
+            Some(0),
+            Some(&verdict),
+            "| node gate\n",
+            |_| {},
+        );
         grant
     })
 }
@@ -1385,7 +1405,10 @@ fn an_urgent_landing_discards_a_judging_waiting_for_a_node() {
         &noting_gate("accepted"),
         Some((false, Duration::from_secs(60))),
     );
-    world.integrator.pass_on(&world.ledger.store).expect("a pass");
+    world
+        .integrator
+        .pass_on(&world.ledger.store)
+        .expect("a pass");
     let deadline = Instant::now() + Duration::from_secs(30);
     while world.gate_jobs().is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -1416,7 +1439,11 @@ fn the_node_shadow_is_orthogonal_to_the_primary_path() {
         _ => None,
     };
     assert_eq!(shadow::node_settings(lookup), Ok(None));
-    assert!(remote::primary_settings(lookup).expect("settings").is_some());
+    assert!(
+        remote::primary_settings(lookup)
+            .expect("settings")
+            .is_some()
+    );
     let both = |name: &str| {
         if name == "SPAWN_GATE_SHADOW_NODE" {
             Some("1".to_string())

@@ -1400,9 +1400,9 @@ fn node_env(stored: &Stored, node: &str) -> Value {
     let meta = &stored.meta;
     let said = |name: &str| meta.env.as_ref().and_then(|env| env.get(name).cloned());
     let toolchain = said("toolchain").or_else(|| {
-        meta.streams(&stored.log).ok().and_then(|(stdout, _)| {
-            super::inputs::toolchain_of(&String::from_utf8_lossy(stdout))
-        })
+        meta.streams(&stored.log)
+            .ok()
+            .and_then(|(stdout, _)| super::inputs::toolchain_of(&String::from_utf8_lossy(stdout)))
     });
     json!({"host": said("host"), "toolchain": toolchain, "runner": format!("node:{node}")})
 }
@@ -1471,7 +1471,9 @@ impl Primary {
         {
             return Ok(manifest.clone());
         }
-        let manifest = self.artifacts.registry_manifest(&self.settings.cargo_home)?;
+        let manifest = self
+            .artifacts
+            .registry_manifest(&self.settings.cargo_home)?;
         *cached = Some((Instant::now(), manifest.clone()));
         Ok(manifest)
     }
@@ -1512,13 +1514,12 @@ impl Primary {
         let scenarios = request.scenarios;
         let controller = super::inputs::controller_of(scenarios)
             .ok_or_else(|| format!("{} has no controller above it", scenarios.display()))?;
-        let controller_commit =
-            super::inputs::controller_commit(&controller).ok_or_else(|| {
-                format!(
-                    "{} names no controller commit: a node could not say what it judged",
-                    controller.join(".controller").display()
-                )
-            })?;
+        let controller_commit = super::inputs::controller_commit(&controller).ok_or_else(|| {
+            format!(
+                "{} names no controller commit: a node could not say what it judged",
+                controller.join(".controller").display()
+            )
+        })?;
         let scenarios_at = scenarios
             .strip_prefix(&controller)
             .map_err(|_| format!("{} is not inside its controller", scenarios.display()))?
