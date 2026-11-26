@@ -1028,8 +1028,14 @@ fn the_launch_echo_is_cleared_before_the_program_draws() {
     ))
     .expect("start");
     let screen = screen_with(&host, &dialog, &workspace, "Esc to cancel");
-    assert!(!screen.contains("exec /bin/sh"), "the echo stayed:\n{screen}");
-    assert!(!screen.contains(".sh"), "the script's path stayed:\n{screen}");
+    assert!(
+        !screen.contains("exec /bin/sh"),
+        "the echo stayed:\n{screen}"
+    );
+    assert!(
+        !screen.contains(".sh"),
+        "the script's path stayed:\n{screen}"
+    );
     assert!(is_trust_dialog(&screen), "{screen}");
     let reading = read_claude_screen(&screen);
     assert_eq!(reading.state, ScreenState::Unknown, "{reading:?}\n{screen}");

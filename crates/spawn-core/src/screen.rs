@@ -1244,19 +1244,24 @@ mod claude_2_1_330_tests {
         );
         let tail: Vec<&str> = herdr.lines().collect();
         let region = activity_region(&tail, tail.len() - 1);
-        assert_eq!(region.first(), Some(&"bypass permissions on · esc to interrupt"));
+        assert_eq!(
+            region.first(),
+            Some(&"bypass permissions on · esc to interrupt")
+        );
         assert_eq!(region.len(), 2, "{region:?}");
         let reading = read_claude_screen(&herdr);
         assert_eq!(reading.state, ScreenState::Busy, "{reading:?}");
         assert!(!reading.state.accepts_input());
         // The hint alone, no spinner line: still running.
-        let hint = format!("you: run the tests\n{STATUS}\nbypass permissions on · esc to interrupt\n$ ");
+        let hint =
+            format!("you: run the tests\n{STATUS}\nbypass permissions on · esc to interrupt\n$ ");
         assert_eq!(read_claude_screen(&hint).state, ScreenState::Busy);
         // The spinner alone, no hint: running.
         let spinner = format!("you: run the tests\nBeboppin'…\n{STATUS}\n{MODE}\n$ ");
         assert_eq!(read_claude_screen(&spinner).state, ScreenState::Busy);
         // The turn done, the hint gone: ready.
-        let done = format!("you: run the tests\n✻ Bebopped for 12s · done 9:20 PM\n{STATUS}\n{MODE}\n$ ");
+        let done =
+            format!("you: run the tests\n✻ Bebopped for 12s · done 9:20 PM\n{STATUS}\n{MODE}\n$ ");
         assert_eq!(read_claude_screen(&done).state, ScreenState::Ready);
     }
 }

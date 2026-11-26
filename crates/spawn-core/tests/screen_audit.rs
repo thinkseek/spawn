@@ -146,10 +146,7 @@ mod claude_2_1_330 {
         let cleared = format!("{TRUST}\n\n\n");
         assert!(is_trust_dialog(&cleared));
         assert_eq!(read_claude_screen(&cleared).state, ScreenState::Unknown);
-        assert_eq!(
-            ClaudeDriver.startup_answer(&cleared),
-            Some(&TRUST_KEYS[..])
-        );
+        assert_eq!(ClaudeDriver.startup_answer(&cleared), Some(&TRUST_KEYS[..]));
     }
 
     /// R2: a draft drawn with a no-break space after `$`.
