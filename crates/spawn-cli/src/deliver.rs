@@ -13,6 +13,20 @@
 //! - a task runs on its own model profile: a start or resume names it, and a
 //!   live worker on another profile is stopped first, then resumed on the
 //!   task's (a running engine keeps the models it started with);
+//! - **a task runs on its graded preset's engine** (design 7.1): a start
+//!   names the preset's engine ([`spawn_core::grading::preset_driver`]:
+//!   Claude Code for a label that names no registered driver) and, for an
+//!   engine told its model at launch (agy), the preset's `model_label`. An
+//!   ephemeral worker that ran on another engine is stopped, then started
+//!   afresh on the task's (a resume would keep the old one); a resident
+//!   keeps the one engine it ran on. A resume runs the host's model label
+//!   for its engine (`SPAWN_AGY_MODEL`). When the engine cannot run here
+//!   (not enabled, not installed, its probe failed, or the label is not one
+//!   `agy models` lists: [`Engines`], from the capability probe), **no
+//!   command is made**: the task waits and one `engine_unavailable`
+//!   escalation names the engine and the label. Never a silent fall back
+//!   to Claude Code. Before the first probe a task on another engine waits
+//!   silently;
 //! - a worker whose stop is under way gets nothing typed in; a Stop that
 //!   fails (this module's, or anyone's) is pursued and escalated by the
 //!   dispatcher (`dispatch::stops`), and the task keeps waiting;
@@ -133,7 +147,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use spawn_core::bridge::{MAY_HAVE_TYPED, PANE_NOT_READY};
 use spawn_core::command::CommandAction;
-use spawn_core::event::{ENGINE, ModelProfile};
+use spawn_core::driver::DEFAULT;
+use spawn_core::event::ModelProfile;
 use spawn_core::mission::TaskState;
 use spawn_core::observation::Ambiguity;
 use spawn_host::tree_path::TreePath;
@@ -387,6 +402,17 @@ pub(crate) struct TaskRow {
     /// never stolen.
     #[serde(default)]
     pub(crate) pinned: bool,
+    /// The graded preset it runs on, if any.
+    #[serde(default)]
+    pub(crate) preset_id: Option<String>,
+    /// That preset's `engine_label`: the engine its worker runs when it
+    /// names a registered driver ([`task_engine`]).
+    #[serde(default)]
+    pub(crate) preset_engine: Option<String>,
+    /// That preset's `model_label`: the model an engine told its model at
+    /// launch runs (the start's `model_label`).
+    #[serde(default)]
+    pub(crate) preset_model_label: Option<String>,
 }
 
 /// A resident of the roster (objective 239): its state and pool.
@@ -716,6 +742,136 @@ pub(crate) struct Work {
     pub(crate) pauses: Vec<PausedMission>,
     /// The delivery waits (the defaults, unless the loop set its settings).
     pub(crate) waits: Waits,
+    /// The engines this host can start, as its capability probe found them
+    /// (none probed yet, unless the loop set them).
+    pub(crate) engines: Engines,
+}
+
+/// What the capability probe (`crate::serve::capabilities`) found of the
+/// engines other than Claude Code: what delivery may start them on. Claude
+/// Code always runs; a probe failure takes down only the engine it probed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Engines {
+    /// Whether a probe has run: before it, a task on another engine waits,
+    /// silently.
+    pub(crate) probed: bool,
+    /// Each engine besides Claude Code this host can start.
+    pub(crate) ready: BTreeMap<String, EngineReady>,
+    /// Each enabled engine that cannot start here, and why (not installed,
+    /// its probe failed).
+    pub(crate) down: BTreeMap<String, String>,
+}
+
+/// One engine the probe found ready.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EngineReady {
+    /// The model labels its listing names (`agy models`).
+    pub(crate) known: BTreeSet<String>,
+    /// The host's own label for it (`SPAWN_AGY_MODEL`): what a resume and
+    /// a start that names none runs.
+    pub(crate) default_label: Option<String>,
+}
+
+/// What a delivery may run its worker on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Runs {
+    /// This engine, on this model label (none for Claude Code, and none
+    /// needed to type into an engine that runs).
+    On(String, Option<String>),
+    /// Not known yet (no probe has run): wait, silently.
+    Unknown,
+    /// Not on this host, why: no command, an `engine_unavailable`.
+    Unavailable(String),
+}
+
+impl Engines {
+    /// Whether `engine` can run here on `label` (none: the host's label for
+    /// it).
+    pub(crate) fn runs(&self, engine: &str, label: Option<&str>) -> Runs {
+        if engine == DEFAULT {
+            return Runs::On(DEFAULT.to_string(), None);
+        }
+        if !self.probed {
+            return Runs::Unknown;
+        }
+        if let Some(why) = self.down.get(engine) {
+            return Runs::Unavailable(format!(
+                "engine {engine} is not available on this host: {why}"
+            ));
+        }
+        let Some(ready) = self.ready.get(engine) else {
+            return Runs::Unavailable(format!(
+                "engine {engine} is not enabled on this host (SPAWN_ENGINES does not name it)"
+            ));
+        };
+        let Some(label) = label.or(ready.default_label.as_deref()) else {
+            return Runs::Unavailable(format!(
+                "engine {engine} has no model label: none is named for it and SPAWN_{}_MODEL is \
+                 unset",
+                engine.to_ascii_uppercase()
+            ));
+        };
+        if !ready.known.contains(label) {
+            return Runs::Unavailable(format!(
+                "{engine} model label {label} is not one `{engine} models` lists on this host"
+            ));
+        }
+        Runs::On(engine.to_string(), Some(label.to_string()))
+    }
+}
+
+/// The engine and model label `task`'s preset names (design 7.1): its
+/// `engine_label`'s driver with its `model_label`, Claude Code with none
+/// for a task on no preset or on one whose label names no registered
+/// driver (`label_only`). Claude Code takes its models from the profile.
+fn task_engine(task: &TaskRow) -> (&'static str, Option<&str>) {
+    let driver = task
+        .preset_engine
+        .as_deref()
+        .map_or(DEFAULT, |label| spawn_core::grading::preset_driver(label).driver);
+    if driver == DEFAULT {
+        return (DEFAULT, None);
+    }
+    (
+        driver,
+        task.preset_model_label
+            .as_deref()
+            .filter(|label| !label.is_empty()),
+    )
+}
+
+/// The engine of the worker's latest execution, when it ran.
+fn worker_engine(facts: &Facts) -> Option<&str> {
+    facts
+        .execution_id
+        .is_some()
+        .then(|| facts.engine.as_deref().unwrap_or(DEFAULT))
+}
+
+/// Whether `task`'s delivery switches its worker's engine: an ephemeral
+/// worker that ran on another engine than the task's (a resident keeps
+/// its one engine).
+fn switches_engine(task: &TaskRow, found: Option<&Facts>) -> bool {
+    task.kind == "ephemeral"
+        && found
+            .and_then(worker_engine)
+            .is_some_and(|worker| worker != task_engine(task).0)
+}
+
+/// What `task`'s delivery to its worker (`found`) runs on: a live worker's
+/// own engine for the same engine (nothing to check, it runs), the task's
+/// for a worker that never ran or switches, the worker's own on the host's
+/// label for a resume.
+pub(crate) fn delivery_runs(task: &TaskRow, found: Option<&Facts>, engines: &Engines) -> Runs {
+    let (engine, label) = task_engine(task);
+    if switches_engine(task, found) {
+        return engines.runs(engine, label);
+    }
+    match found.and_then(|facts| worker_engine(facts).map(|worker| (facts.live, worker))) {
+        Some((true, worker)) => Runs::On(worker.to_string(), None),
+        Some((false, worker)) => engines.runs(worker, None),
+        None => engines.runs(engine, label),
+    }
 }
 
 enum LoadFailure {
@@ -777,6 +933,7 @@ impl Work {
             moved: load_table(store.latest_source_moved(), "latest source.moved")?,
             pauses: load_table(store.mission_pauses(), "mission pauses")?,
             waits: Waits::default(),
+            engines: Engines::default(),
         })
     }
 
@@ -890,8 +1047,19 @@ fn last_delivery_closed(work: &Work, facts: &Facts) -> bool {
 
 /// How a waiting task reaches its worker, given the worker's facts.
 /// `settled`: the worker's last task is closed (see [`last_delivery_closed`]).
-fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -> Option<Order> {
+fn delivery(
+    task: &TaskRow,
+    found: Option<&Facts>,
+    settled: bool,
+    key: String,
+    engines: &Engines,
+) -> Option<Order> {
     let model = Some(task.model);
+    // An engine this host cannot run makes no command at all (the task
+    // waits; `engine_unavailable` says why), never one on Claude Code.
+    let Runs::On(engine, model_label) = delivery_runs(task, found, engines) else {
+        return None;
+    };
     match found {
         // A worker whose stop is under way (a model switch's included) gets
         // nothing typed: the stop is pursued, and escalated if it keeps
@@ -919,6 +1087,13 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -
                 let key = format!("switch-model-{}-{}", task.id, task.revisions);
                 return Some(task.command(key, CommandAction::Stop));
             }
+            if switches_engine(task, found) {
+                // An ephemeral worker on another engine: stopped, then
+                // started afresh on the task's, which a later pass does
+                // once it no longer runs (a resume would keep the old one).
+                let key = format!("switch-engine-{}-{}", task.id, task.revisions);
+                return Some(task.command(key, CommandAction::Stop));
+            }
             Some(task.delivery(
                 key,
                 CommandAction::Input {
@@ -927,24 +1102,27 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -
                 },
             ))
         }
-        // Ran before: resume, so a resident keeps its context.
-        Some(facts) if facts.execution_id.is_some() => Some(task.delivery(
+        // Ran before: resume, so a resident keeps its context (and its
+        // engine).
+        Some(facts) if facts.execution_id.is_some() && !switches_engine(task, found) => {
+            Some(task.delivery(
             key,
-            CommandAction::Resume {
-                prompt: Some(resume_prompt(task)),
-                model,
-            },
-        )),
+                CommandAction::Resume {
+                    prompt: Some(resume_prompt(task)),
+                    model,
+                },
+            ))
+        }
         _ => Some(task.delivery(
             key,
             CommandAction::Start {
-                engine: ENGINE.to_string(),
+                engine,
                 prompt: task_prompt(task),
                 parent_session_id: None,
                 from: None,
                 model,
                 charter: None,
-                model_label: None,
+                model_label,
             },
         )),
     }
@@ -1487,7 +1665,7 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
                     | Attempts::Failed { .. } => continue,
                 };
                 let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
-                orders.extend(delivery(task, found, settled, key));
+                orders.extend(delivery(task, found, settled, key, &work.engines));
             }
             TaskState::Delivered => {
                 // A paused mission's worker is not resumed by a restart.
@@ -2010,6 +2188,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             since_ms: None,
         });
     }
+    items.extend(engine_unavailable(work, rows));
     for (task, facts, attempts) in waiting_attempts(work, rows) {
         let Attempts::Failed { why, spent, .. } = attempts else {
             continue;
@@ -2029,6 +2208,44 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             line,
             since_ms: None,
         });
+    }
+    items
+}
+
+/// One `engine_unavailable` escalation for each task whose turn it is
+/// ([`next_up`]) and whose delivery would run on an engine, or a model
+/// label, this host cannot run ([`delivery_runs`]): no command is made for
+/// it, and it waits. A condition: it holds while the engine stays
+/// unavailable, keyed by the task's delivery.
+fn engine_unavailable(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
+    let facts: BTreeMap<&str, &Facts> = rows
+        .iter()
+        .map(|facts| (facts.session_id.as_str(), facts))
+        .collect();
+    let next = next_up(work);
+    let mut items = Vec::new();
+    for task in &work.tasks {
+        if !matches!(task.state, TaskState::Assigned | TaskState::Revise)
+            || !next.contains(&task.id)
+            || reassign_held(task, &facts)
+        {
+            continue;
+        }
+        let found = facts.get(task.session_id.as_str()).copied();
+        if let Runs::Unavailable(why) = delivery_runs(task, found, &work.engines) {
+            let preset = task.preset_id.as_deref().unwrap_or("none");
+            items.push(Escalation {
+                session_id: task.session_id.clone(),
+                id: format!("engine_unavailable-{}-{}", task.id, task.revisions),
+                why: Why::EngineUnavailable,
+                line: format!(
+                    "task #{} (preset {preset}): {why}; no start is made and the task waits \
+                     (never on Claude Code instead): enable the engine, or reroute the task",
+                    task.id
+                ),
+                since_ms: None,
+            });
+        }
     }
     items
 }
