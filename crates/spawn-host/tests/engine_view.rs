@@ -186,7 +186,11 @@ fn ok(words: &[String], script: &str) -> String {
 /// `script` inside the view must fail; what it said.
 fn fails(words: &[String], script: &str) -> String {
     let output = inside(words, script);
-    assert!(!output.status.success(), "{script} succeeded: {}", text(&output));
+    assert!(
+        !output.status.success(),
+        "{script} succeeded: {}",
+        text(&output)
+    );
     text(&output)
 }
 
@@ -239,8 +243,14 @@ fn inside_the_view_the_masks_are_empty_and_only_the_three_binds_write() {
         assert_eq!(ok(&words, &format!("ls -A '{dir}'")), "", "{dir}");
     }
     // ~/.gemini holds only agy's own home, which keeps its contents.
-    assert_eq!(ok(&words, &format!("ls -A '{}'", h(".gemini"))), "antigravity-cli");
-    assert_eq!(ok(&words, &format!("cat '{engine_home}/brain/old'")), "mine");
+    assert_eq!(
+        ok(&words, &format!("ls -A '{}'", h(".gemini"))),
+        "antigravity-cli"
+    );
+    assert_eq!(
+        ok(&words, &format!("cat '{engine_home}/brain/old'")),
+        "mine"
+    );
     fails(&words, &format!("cat '{}'", h(".gemini/oauth_creds.json")));
     // The real /run/keep and /run/keep-test, when the host has them, are
     // empty inside (they are never read outside).
@@ -257,7 +267,10 @@ fn inside_the_view_the_masks_are_empty_and_only_the_three_binds_write() {
     fails(&words, &format!("ls -A /tmp/tmux-{uid}"));
     assert_eq!(ok(&words, "ls -A /tmp"), "");
     // Herdr's session socket place is gone.
-    fails(&words, &format!("ls '{}'", h(".config/herdr/sessions/spawn")));
+    fails(
+        &words,
+        &format!("ls '{}'", h(".config/herdr/sessions/spawn")),
+    );
 
     // Masked regular files read 0 bytes and refuse a write: the loop's
     // environment files, the home's credential files, the symlinked one.
@@ -276,7 +289,10 @@ fn inside_the_view_the_masks_are_empty_and_only_the_three_binds_write() {
         assert!(said.contains("Read-only file system"), "{file}: {said}");
     }
     assert_eq!(
-        ok(&words, &format!("cat '{}'", h(".local/share/spawn-rsi/bin/kept"))),
+        ok(
+            &words,
+            &format!("cat '{}'", h(".local/share/spawn-rsi/bin/kept"))
+        ),
         "visible"
     );
 
@@ -293,12 +309,24 @@ fn inside_the_view_the_masks_are_empty_and_only_the_three_binds_write() {
              echo tmp > \"$TMPDIR/t\" && [ \"$TMPDIR\" = '{tmpdir}' ] && [ \"$PWD\" = '{workspace}' ]"
         ),
     );
-    assert_eq!(std::fs::read_to_string(fixture.workspace().join("w")).expect("w"), "ws\n");
-    assert_eq!(std::fs::read_to_string(fixture.engine_home().join("h")).expect("h"), "home\n");
-    assert_eq!(std::fs::read_to_string(fixture.tmpdir().join("t")).expect("t"), "tmp\n");
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace().join("w")).expect("w"),
+        "ws\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.engine_home().join("h")).expect("h"),
+        "home\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.tmpdir().join("t")).expect("t"),
+        "tmp\n"
+    );
     // Nothing reached the host's masked places.
     assert!(!home.join(".claude/w").exists());
-    assert_eq!(std::fs::read_to_string(home.join(".claude.json")).expect("json"), "secret");
+    assert_eq!(
+        std::fs::read_to_string(home.join(".claude.json")).expect("json"),
+        "secret"
+    );
 
     // No host process can be signalled: its own pid namespace.
     let mut sleeper = Command::new("sleep")
@@ -321,12 +349,17 @@ fn missing_and_odd_targets_are_skipped_and_said_without_aborting() {
     // A fifo: neither a directory nor a regular file (a socket's path
     // would be too long here).
     let socket_path = fixture.scratch.join("odd.fifo");
-    let made = Command::new("mkfifo").arg(&socket_path).status().expect("mkfifo");
+    let made = Command::new("mkfifo")
+        .arg(&socket_path)
+        .status()
+        .expect("mkfifo");
     assert!(made.success());
     let missing = fixture.scratch.join("missing.env");
     let mut config = fixture.config();
     config.extra_files = vec![missing.clone(), socket_path.clone()];
-    config.host_directories.push(fixture.scratch.join("no-such-dir"));
+    config
+        .host_directories
+        .push(fixture.scratch.join("no-such-dir"));
     let Some(view) = view(config) else {
         return;
     };
@@ -396,10 +429,21 @@ fn the_argv_keeps_its_invariants() {
             "--unshare-pid"
         ]
     );
-    for never in ["--new-session", "--unshare-net", "--unshare-all", "--as-pid-1"] {
-        assert!(!words.iter().any(|word| word == never), "{never}: {words:?}");
+    for never in [
+        "--new-session",
+        "--unshare-net",
+        "--unshare-all",
+        "--as-pid-1",
+    ] {
+        assert!(
+            !words.iter().any(|word| word == never),
+            "{never}: {words:?}"
+        );
     }
-    let first_bind = words.iter().position(|word| word == "--bind").expect("bind");
+    let first_bind = words
+        .iter()
+        .position(|word| word == "--bind")
+        .expect("bind");
     let last_mask = words
         .iter()
         .rposition(|word| word == "--tmpfs" || word == "--ro-bind")
@@ -421,7 +465,11 @@ fn the_argv_keeps_its_invariants() {
     // The symlinked canaries are masked at what they resolve to.
     let aws = fixture.scratch.join("real-aws");
     let netrc = fixture.scratch.join("real-netrc");
-    assert!(plan.masks.contains(&Mask::Directory(aws)), "{:?}", plan.masks);
+    assert!(
+        plan.masks.contains(&Mask::Directory(aws)),
+        "{:?}",
+        plan.masks
+    );
     assert!(plan.masks.contains(&Mask::File(netrc)), "{:?}", plan.masks);
     assert!(!plan.masks.iter().any(|mask| matches!(
         mask,
@@ -429,7 +477,10 @@ fn the_argv_keeps_its_invariants() {
     )));
     // agy's own home is never masked; ~/.gemini is.
     assert!(!plan.masks.contains(&Mask::Directory(fixture.engine_home())));
-    assert!(plan.masks.contains(&Mask::Directory(fixture.home().join(".gemini"))));
+    assert!(
+        plan.masks
+            .contains(&Mask::Directory(fixture.home().join(".gemini")))
+    );
     // Every regular-file mask binds the one private empty 0444 file, never
     // /dev/null.
     let sources: Vec<&str> = words
@@ -439,7 +490,10 @@ fn the_argv_keeps_its_invariants() {
         .map(|three| three[1].as_str())
         .collect();
     assert!(!sources.is_empty());
-    assert!(sources.iter().all(|source| *source == sources[0]), "{sources:?}");
+    assert!(
+        sources.iter().all(|source| *source == sources[0]),
+        "{sources:?}"
+    );
     assert_ne!(sources[0], "/dev/null");
     let meta = std::fs::metadata(sources[0]).expect("empty");
     assert_eq!(meta.len(), 0);
@@ -502,15 +556,21 @@ const STUB_CLAUDE: &str = "#!/bin/sh\nprintf '> \\r\\n'\nwhile IFS= read -r line
 
 /// The installed `herdr`, if any answers `--version`.
 fn herdr_program() -> Option<String> {
-    let home = std::env::var_os("HOME")
-        .map(|home| Path::new(&home).join(".local/bin/herdr").display().to_string());
-    home.into_iter().chain(["herdr".to_string()]).find(|program| {
-        Command::new(program)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .output()
-            .is_ok_and(|output| output.status.success())
-    })
+    let home = std::env::var_os("HOME").map(|home| {
+        Path::new(&home)
+            .join(".local/bin/herdr")
+            .display()
+            .to_string()
+    });
+    home.into_iter()
+        .chain(["herdr".to_string()])
+        .find(|program| {
+            Command::new(program)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
 }
 
 /// A Herdr session of the test's own, stopped and deleted on drop.
@@ -562,7 +622,10 @@ impl Drop for HerdrSession {
 fn herdr_detects_an_agent_inside_the_view_that_cannot_reach_its_socket() {
     let _serial = exclusive();
     let Some(program) = herdr_program() else {
-        assert!(!required(), "SPAWN_REQUIRE_HERDR=1 and no herdr is installed");
+        assert!(
+            !required(),
+            "SPAWN_REQUIRE_HERDR=1 and no herdr is installed"
+        );
         eprintln!("skipped: no herdr installed");
         return;
     };
@@ -570,7 +633,9 @@ fn herdr_detects_an_agent_inside_the_view_that_cannot_reach_its_socket() {
     // The real Herdr session directory of this user is masked too.
     let real_home = PathBuf::from(std::env::var("HOME").expect("HOME"));
     let mut config = fixture.config();
-    config.host_directories.push(real_home.join(".config/herdr"));
+    config
+        .host_directories
+        .push(real_home.join(".config/herdr"));
     let Some(view) = view(config) else {
         return;
     };
@@ -614,7 +679,10 @@ fn herdr_detects_an_agent_inside_the_view_that_cannot_reach_its_socket() {
     .expect("start");
     let deadline = Instant::now() + Duration::from_secs(15);
     let reading = loop {
-        let reading = host.agent(&terminal, &id).expect("agent").expect("herdr reads agents");
+        let reading = host
+            .agent(&terminal, &id)
+            .expect("agent")
+            .expect("herdr reads agents");
         if reading.agent.is_some() || Instant::now() >= deadline {
             break reading;
         }
@@ -622,7 +690,10 @@ fn herdr_detects_an_agent_inside_the_view_that_cannot_reach_its_socket() {
     };
     assert_eq!(reading.agent.as_deref(), Some("claude"), "{reading:?}");
     // The session's socket, as the host found it, is not there inside.
-    let socket = real_home.join(format!(".config/herdr/sessions/{}/herdr.sock", session.name));
+    let socket = real_home.join(format!(
+        ".config/herdr/sessions/{}/herdr.sock",
+        session.name
+    ));
     assert!(socket.exists(), "the host's socket: {}", socket.display());
     let check = view
         .wrap(&ViewedLaunch {

@@ -46,6 +46,7 @@ pub use cow::{
     CloneKind, CowStats, CowWorkspace, DirectoryOccupancy, WorkspaceLease, clone_or_copy,
     cow_clone_supported, directory_occupancy, live_users, reflink_file,
 };
+pub use engine_view::{BwrapView, ViewConfig};
 #[cfg(any(test, feature = "testing"))]
 pub use git::test_git_command;
 pub use git::{
@@ -53,7 +54,6 @@ pub use git::{
     SET_ASIDE_FILES, SET_ASIDE_WAITS, git_command, has_conflict_block, has_conflict_block_sized,
     max_file_bytes, names_files_outside_git,
 };
-pub use engine_view::{BwrapView, ViewConfig};
 pub use herdr::HerdrHost;
 #[cfg(target_os = "linux")]
 pub use overlay::{OverlayWorkspace, Swept, overlay_supported, overlay_supported_in, sweep_probes};

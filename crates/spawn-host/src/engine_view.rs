@@ -172,7 +172,8 @@ impl ViewConfig {
     /// The regular-file targets, as written: the fixed ones and every
     /// environment file in the loop's directories now.
     fn file_targets(&self) -> Vec<PathBuf> {
-        let mut targets: Vec<PathBuf> = HOME_FILES.iter().map(|file| self.home.join(file)).collect();
+        let mut targets: Vec<PathBuf> =
+            HOME_FILES.iter().map(|file| self.home.join(file)).collect();
         for dir in &self.loop_dirs {
             targets.push(dir.join("spawn.env"));
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -423,11 +424,7 @@ impl BwrapView {
         if !files.is_empty() {
             let empty = self.empty_file()?;
             for file in &files {
-                words.extend([
-                    "--ro-bind".to_string(),
-                    path_word(&empty),
-                    path_word(file),
-                ]);
+                words.extend(["--ro-bind".to_string(), path_word(&empty), path_word(file)]);
                 masks.push(Mask::File(file.clone()));
             }
         }
@@ -564,8 +561,8 @@ fn canonical_directory(path: &Path, what: &str, create: bool) -> Result<PathBuf,
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
             .map_err(|error| format!("chmod {what} {}: {error}", path.display()))?;
     }
-    let canonical =
-        std::fs::canonicalize(path).map_err(|error| format!("{what} {}: {error}", path.display()))?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("{what} {}: {error}", path.display()))?;
     if canonical.is_dir() {
         Ok(canonical)
     } else {

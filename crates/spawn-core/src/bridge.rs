@@ -9542,20 +9542,23 @@ mod tests {
         }
 
         fn wrap(&self, launch: &ViewedLaunch<'_>) -> Result<Vec<String>, String> {
-            self.asked
-                .lock()
-                .expect("asked")
-                .push((
-                    launch.engine.to_string(),
-                    launch.workspace.to_string(),
-                    launch.engine_home.to_string(),
-                ));
+            self.asked.lock().expect("asked").push((
+                launch.engine.to_string(),
+                launch.workspace.to_string(),
+                launch.engine_home.to_string(),
+            ));
             if let Some(why) = &self.refuse {
                 return Err(why.clone());
             }
-            Ok(["/usr/bin/bwrap", "--unshare-pid", "--chdir", launch.workspace, "--"]
-                .map(str::to_string)
-                .to_vec())
+            Ok([
+                "/usr/bin/bwrap",
+                "--unshare-pid",
+                "--chdir",
+                launch.workspace,
+                "--",
+            ]
+            .map(str::to_string)
+            .to_vec())
         }
     }
 
@@ -9570,8 +9573,7 @@ mod tests {
         assert!(why.starts_with(ENGINE_UNAVAILABLE), "{why}");
         assert!(why.contains("filesystem view"), "{why}");
         let mut config = agy_config(Some("gemini-3.8-flash-low"));
-        config.engine_view =
-            EngineViewPolicy::Required(Err("bwrap is not installed".to_string()));
+        config.engine_view = EngineViewPolicy::Required(Err("bwrap is not installed".to_string()));
         let why = agy_failure(config, true);
         assert!(why.contains("bwrap is not installed"), "{why}");
     }
