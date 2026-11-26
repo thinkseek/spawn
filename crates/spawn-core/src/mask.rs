@@ -113,7 +113,7 @@ fn base64_interior(value: &[u8], shift: usize, alphabet: &[u8; 64]) -> Vec<u8> {
     encoded[skip.min(keep)..keep].to_vec()
 }
 
-/// Every form of `value`, each once, none under [`SHORTEST_FORM`] bytes.
+/// Every form of `value`, each once, none under `SHORTEST_FORM` bytes.
 pub fn forms(value: &[u8]) -> Vec<Vec<u8>> {
     let mut all: Vec<Vec<u8>> = vec![value.to_vec()];
     if let Ok(text) = std::str::from_utf8(value) {

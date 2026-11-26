@@ -136,11 +136,11 @@ fn input_text<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 /// A tool call's key input in a few words, read from its `input` by tool,
-/// held to words that cannot be a credential ([`plain_word`]): the store
+/// held to words that cannot be a credential (`plain_word`): the store
 /// must never keep a secret, and a list of secret shapes is never complete.
 ///
-/// - Bash: the leading words of its first command, after its set-up (`cd
-///   <dir> &&`, `NAME=value;`), at most [`COMMAND_WORDS`], stopping at the
+/// - Bash: the leading words of its first command, after its set-up
+///   (`cd <dir> &&`, `NAME=value;`), at most `COMMAND_WORDS`, stopping at the
 ///   first flag, the first word holding `@ : = ' " ` $ \`, the first long
 ///   mix of letters and digits, and the command's end (`&&`, `|`, `;`):
 ///   `cargo test -p spawn-cli` keeps `cargo test …`. A variable the set-up
@@ -165,7 +165,7 @@ pub fn tool_summary(tool: &str, input: Option<&Value>) -> Option<String> {
 }
 
 /// The most words a summary keeps of a command, a description or a query.
-pub const COMMAND_WORDS: usize = 4;
+const COMMAND_WORDS: usize = 4;
 
 /// A word at least this long that mixes letters and digits can be a token.
 const WORD_MIX_CHARS: usize = 8;
@@ -440,11 +440,11 @@ fn whole_fields(tool: &str, input: &Value) -> bool {
 }
 
 /// Is a tool call's summary its whole input? Only when the summary leaves
-/// no field out ([`whole_fields`]), no word of it was left out (a command's
+/// no field out (`whole_fields`), no word of it was left out (a command's
 /// set-up included), and neither the redactor nor the cut changed it: then
 /// two calls with the same summary are the same call. Edit, Write, Task,
 /// WebFetch and TodoWrite summaries never are.
-pub fn tool_summary_whole(tool: &str, input: Option<&Value>) -> bool {
+fn tool_summary_whole(tool: &str, input: Option<&Value>) -> bool {
     let Some(input) = input else { return false };
     let Some((text, complete)) = summary_text(tool, input) else {
         return false;
@@ -905,14 +905,14 @@ fn user_turn(content: &Value, uuid: &str) -> Vec<Normalized> {
 ///
 /// - a tool result that started one: a Bash's `backgroundTaskId`, a
 ///   Monitor's `taskId`, a background Agent's `agentId`, or a `SendMessage`
-///   that resumed a finished Agent ([`tool_job`]), keyed by the job's id and
+///   that resumed a finished Agent (`tool_job`), keyed by the job's id and
 ///   the call; one that stopped one: a `TaskStop` that succeeded;
 /// - the engine's notification that one ended (`<task-notification>` with a
 ///   `<status>`, or a Monitor's expiry event; not an Agent's pause), as the
 ///   engine gave it to the agent: mid-turn (an `attachment` of type
 ///   `queued_command`) or as the prompt of a turn of its own (a user line).
 ///   Each is keyed by the job's id and a digest of the notification
-///   ([`notification_key`]), so a second copy adds nothing.
+///   (`notification_key`), so a second copy adds nothing.
 ///
 /// The engine's queue (`queue-operation`) is not read. What it queues for
 /// the agent comes back as one of those copies, after the tool result that
@@ -1072,7 +1072,7 @@ pub fn claude_usage(line: &str) -> Option<Normalized> {
 /// The engine version a Claude Code transcript line names (its `version`
 /// field). Like [`claude_line`], the caller reads only the execution's part
 /// of the file.
-pub fn claude_version(line: &str) -> Option<String> {
+pub(crate) fn claude_version(line: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(line).ok()?;
     let version = value.get("version").and_then(Value::as_str)?.trim();
     (!version.is_empty() && version.len() <= 64).then(|| version.to_string())

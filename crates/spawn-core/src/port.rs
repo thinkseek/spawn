@@ -239,8 +239,11 @@ pub enum SetAside {
     /// holds the work set aside; `files` are the paths the two trees differ
     /// in.
     Created {
+        /// Newly recorded clean commit SHA carrying the start's tree.
         commit: CommitId,
+        /// Commit SHA holding the dirty or conflicting work set aside.
         kept: CommitId,
+        /// Repository-relative paths that differ between `commit` and `kept`.
         files: Vec<String>,
     },
 }

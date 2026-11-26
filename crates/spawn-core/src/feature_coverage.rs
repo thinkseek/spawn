@@ -17,9 +17,13 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// project feature coverage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExclusionRule {
+    /// Stable rule identifier (e.g. `target-build-output`).
     pub id: String,
+    /// Repository-relative glob pattern matched against candidate paths.
     pub pattern: String,
+    /// Exclusion category label (e.g. `build-artifact`, `generated`).
     pub category: String,
+    /// Human-readable rationale for keeping matching paths out of scope.
     pub reason: String,
 }
 
@@ -28,9 +32,13 @@ pub struct ExclusionRule {
 /// counted as covered or listed as unassociated wild files).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundaryPolicy {
+    /// Repository or project name.
     pub project_name: String,
+    /// High-level summary of what belongs inside the feature coverage boundary.
     pub description: String,
+    /// Categories of files included in coverage accounting.
     pub included_categories: Vec<String>,
+    /// Ordered exclusion rules applied before scoping coverage checks.
     pub exclusions: Vec<ExclusionRule>,
 }
 
@@ -279,11 +287,17 @@ fn spawn_exclusions() -> Vec<ExclusionRule> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FeatureKind {
+    /// Top-level functional domain grouping related capabilities.
     Domain,
+    /// User- or system-facing capability.
     Capability,
+    /// Cohesive delivery initiative spanning capabilities or slices.
     Initiative,
+    /// Vertical delivery slice within an initiative or capability.
     Slice,
+    /// Research/exploration initiative.
     ResearchInitiative,
+    /// Technical subsystem component.
     Subsystem,
 }
 
@@ -302,22 +316,34 @@ impl FeatureKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationKind {
+    /// Source depends on target at build, data, code, process, or runtime boundary.
     DependsOn,
+    /// Source blocks target.
     Blocks,
+    /// Source implements target.
     Implements,
+    /// Source extends target.
     Extends,
+    /// Non-directional informational link to target.
     RelatesTo,
+    /// Source supersedes target.
     Supersedes,
+    /// Source verifies target (test/gate coverage).
     Verifies,
+    /// Source is documented by target.
     DocumentedBy,
+    /// Hierarchical containment of target feature node.
     Contains,
 }
 
 /// One typed edge from a feature node to another feature node by ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureRelation {
+    /// Relation semantic kind.
     pub kind: RelationKind,
+    /// Target feature node identifier.
     pub target: String,
+    /// Optional clarifying note (e.g. non-code dependency justification).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -325,20 +351,28 @@ pub struct FeatureRelation {
 /// Provenance evidence attached to a feature node.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureProvenance {
+    /// Linked objective identifiers.
     #[serde(default)]
     pub objectives: Vec<String>,
+    /// Linked task identifiers.
     #[serde(default)]
     pub tasks: Vec<String>,
+    /// Linked agent identifiers.
     #[serde(default)]
     pub agents: Vec<String>,
+    /// Linked commit SHAs or references.
     #[serde(default)]
     pub commits: Vec<String>,
+    /// Linked test files or scenario names.
     #[serde(default)]
     pub tests: Vec<String>,
+    /// Linked deployment unit or rollout references.
     #[serde(default)]
     pub deploys: Vec<String>,
+    /// Linked artifact identifiers or paths.
     #[serde(default)]
     pub artifacts: Vec<String>,
+    /// Linked design discussion or issue references.
     #[serde(default)]
     pub discussions: Vec<String>,
 }
@@ -346,18 +380,27 @@ pub struct FeatureProvenance {
 /// One genuine feature node in the project feature map.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureNode {
+    /// Unique kebab-case feature identifier.
     pub id: String,
+    /// Human-readable display title.
     pub title: String,
+    /// Architectural kind of this node.
     pub kind: FeatureKind,
+    /// Optional parent feature ID forming the containment hierarchy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// Concise summary of the feature's responsibility.
     pub summary: String,
+    /// Optional status note recorded for operators.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_note: Option<String>,
+    /// Repository-relative paths or globs owned by this feature.
     #[serde(default)]
     pub files: Vec<String>,
+    /// Directed typed relations from this node to other feature nodes.
     #[serde(default)]
     pub relations: Vec<FeatureRelation>,
+    /// Provenance metadata supporting this node.
     #[serde(default)]
     pub provenance: FeatureProvenance,
 }
@@ -365,18 +408,26 @@ pub struct FeatureNode {
 /// Versioned, JSON-serializable project feature-map registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureRegistry {
+    /// Registry schema format version (currently [`SCHEMA_VERSION`]).
     pub schema_version: u32,
+    /// Initiative identifier owning this registry.
     pub initiative_id: String,
+    /// Explicit inclusion/exclusion boundary policy.
     pub boundary: BoundaryPolicy,
+    /// Registered feature nodes.
     pub features: Vec<FeatureNode>,
 }
 
 /// One file observed by the IO adapter inside the project root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryEntry {
+    /// Repository-relative Unix path.
     pub path: String,
+    /// Whether the file is tracked in version control.
     pub tracked: bool,
+    /// File size in bytes.
     pub size_bytes: u64,
+    /// Optional hex SHA-256 content digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
 }
@@ -384,25 +435,40 @@ pub struct InventoryEntry {
 /// Strictly separated coverage and consistency metrics from a scan.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanCounts {
+    /// Total inventory entries examined before exclusions.
     pub total_seen: usize,
+    /// Non-excluded files subject to feature coverage requirements.
     pub in_scope: usize,
+    /// In-scope files associated with at least one feature node.
     pub covered: usize,
+    /// In-scope files with zero feature associations.
     pub unassociated_wild: usize,
+    /// File references in the registry that no longer exist in inventory.
     pub stale_references: usize,
+    /// Inventory files matched by explicit [`BoundaryPolicy`] exclusions.
     pub explicit_exclusions: usize,
+    /// In-scope files associated with two or more feature nodes.
     pub multi_feature_files: usize,
+    /// Non-root feature nodes lacking a parent or incoming `contains` relation.
     pub orphan_features: usize,
+    /// Structural consistency errors (dangling links, self-links, cycles, duplicates, invalid paths).
     pub invalid_relations: usize,
 }
 
 /// One in-scope existing file with zero feature associations ("野文件").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WildFileFinding {
+    /// Repository-relative path of the unassociated file.
     pub path: String,
+    /// Whether the file is tracked in Git.
     pub tracked: bool,
+    /// File size in bytes.
     pub size_bytes: u64,
+    /// Explanation of why the file was flagged.
     pub reason: String,
+    /// Diagnostic clues supporting association or investigation.
     pub evidence: Vec<String>,
+    /// Candidate feature IDs heuristically suggested for attachment.
     pub suggested_features: Vec<String>,
 }
 
@@ -410,8 +476,11 @@ pub struct WildFileFinding {
 /// current project inventory. Kept strictly separate from existing wild files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StaleFileReference {
+    /// Missing repository-relative file path referenced by a feature.
     pub path: String,
+    /// Feature IDs still listing `path`.
     pub referencing_features: Vec<String>,
+    /// Existing inventory paths suggested as likely rename targets.
     pub rename_candidates: Vec<String>,
 }
 
@@ -419,27 +488,39 @@ pub struct StaleFileReference {
 /// separately and never counted as covered or unassociated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExcludedFileEntry {
+    /// Excluded repository-relative path.
     pub path: String,
+    /// Identifier of the matching [`ExclusionRule`].
     pub rule_id: String,
+    /// Category inherited from the matching exclusion rule.
     pub category: String,
+    /// Reason inherited from the matching exclusion rule.
     pub reason: String,
 }
 
 /// Bidirectional many-to-many index between genuine features and in-scope files.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BidirectionalIndex {
+    /// Mapping from feature ID to sorted associated file paths.
     pub feature_to_files: BTreeMap<String, Vec<String>>,
+    /// Mapping from in-scope file path to sorted owning feature IDs.
     pub file_to_features: BTreeMap<String, Vec<String>>,
 }
 
 /// Graph and path consistency findings over a [`FeatureRegistry`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsistencyReport {
+    /// Feature IDs missing required parent/containment links.
     pub orphan_features: Vec<String>,
+    /// Relations pointing to unknown target feature IDs or parents.
     pub dangling_relations: Vec<String>,
+    /// Features whose parent or relation points to themselves.
     pub self_links: Vec<String>,
+    /// Formatted descriptions of detected hierarchy or dependency cycles.
     pub cycle_errors: Vec<String>,
+    /// Feature IDs appearing more than once in the registry.
     pub duplicate_feature_ids: Vec<String>,
+    /// Registry file patterns failing path normalization checks.
     pub invalid_paths: Vec<String>,
 }
 
@@ -458,15 +539,25 @@ impl ConsistencyReport {
 /// Complete result of a one-click unassociated-file and consistency scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanReport {
+    /// Schema format version of the scan report.
     pub schema_version: u32,
+    /// Scan timestamp in Unix epoch milliseconds.
     pub scanned_at_ms: i64,
+    /// Initiative identifier from the scanned registry.
     pub initiative_id: String,
+    /// Boundary policy applied during scanning.
     pub boundary: BoundaryPolicy,
+    /// Aggregate coverage and consistency counters.
     pub counts: ScanCounts,
+    /// In-scope files lacking any feature association.
     pub unassociated_files: Vec<WildFileFinding>,
+    /// Stale paths referenced by features but absent from inventory.
     pub stale_references: Vec<StaleFileReference>,
+    /// Inventory paths excluded by explicit boundary rules.
     pub excluded_files: Vec<ExcludedFileEntry>,
+    /// Computed bidirectional index between features and in-scope files.
     pub bidirectional_index: BidirectionalIndex,
+    /// Graph and path consistency report.
     pub consistency: ConsistencyReport,
 }
 
@@ -484,9 +575,13 @@ impl ScanReport {
 /// genuine feature nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssociationUpdate {
+    /// Normalized file path targeted by the association update.
     pub path: String,
+    /// Feature IDs newly linked to `path`.
     pub added_to_features: Vec<String>,
+    /// Feature IDs that already owned `path`.
     pub already_associated_features: Vec<String>,
+    /// Complete sorted list of features now referencing `path`.
     pub all_associated_features: Vec<String>,
 }
 
@@ -578,7 +673,7 @@ pub fn match_directory_exclusion<'a>(
 ///
 /// Patterns ending in `/**` also match the directory itself (e.g., `target/**`
 /// matches `target`, `target/`, and `target/debug/app`).
-pub fn glob_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, path: &str) -> bool {
     let pattern = pattern.trim_end_matches('/');
     let path = path.trim_end_matches('/');
     if let Some(prefix) = pattern.strip_suffix("/**")

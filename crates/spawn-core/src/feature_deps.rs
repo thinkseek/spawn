@@ -40,8 +40,11 @@ pub const EVIDENCE_LIMIT: usize = 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitKind {
+    /// Rust Cargo package (`Cargo.toml`).
     CargoPackage,
+    /// JavaScript/TypeScript npm package (`package.json`).
     NpmPackage,
+    /// Python distribution package (`pyproject.toml`).
     PythonPackage,
 }
 
@@ -50,6 +53,7 @@ pub enum UnitKind {
 pub struct Unit {
     /// `cargo:spawn-core`, `npm:@acme/domain`, `py:acme`.
     pub id: String,
+    /// Build ecosystem kind of this package.
     pub kind: UnitKind,
     /// Repository-relative directory (empty for the repository root).
     pub root: String,
@@ -75,12 +79,19 @@ pub enum EdgeKind {
     Reexport,
     /// `include!`, `include_str!`, `include_bytes!`.
     Include,
+    /// ES module value `import`.
     Import,
+    /// TypeScript type-only `import type`.
     ImportType,
+    /// Dynamic `import("...")` call with a literal specifier.
     DynamicImport,
+    /// CommonJS `require("...")` call.
     Require,
+    /// Python `import module` or `importlib.import_module("...")` statement.
     PyImport,
+    /// Python `from module import ...` statement.
     PyFrom,
+    /// Non-code asset import (e.g., CSS, SVG, JSON).
     Asset,
 }
 
@@ -114,8 +125,11 @@ impl EdgeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
+    /// Production runtime or library code.
     Prod,
+    /// Test code or test-only module.
     Test,
+    /// Build script (`build.rs`) or build-only dependency edge.
     Build,
 }
 
@@ -147,6 +161,7 @@ pub enum Precision {
 }
 
 impl Precision {
+    /// The JSON spelling.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Item => "item",
@@ -160,15 +175,20 @@ impl Precision {
 /// One file-to-file edge, with the line it starts on.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct FileEdge {
+    /// Source repository-relative path initiating the reference.
     pub from: String,
+    /// Target repository-relative path resolved by the extractor.
     pub to: String,
+    /// Syntactic construct producing this reference.
     pub kind: EdgeKind,
+    /// Build/runtime scope of the source edge.
     pub scope: Scope,
     /// 1-based line in `from`.
     pub line: u32,
     /// The re-exporting file the reference passed through, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// Resolution granularity achieved for `to`.
     pub precision: Precision,
 }
 
@@ -176,9 +196,13 @@ pub struct FileEdge {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Language {
+    /// Rust source file (`.rs`).
     Rust,
+    /// TypeScript source or declaration file.
     Typescript,
+    /// JavaScript source file.
     Javascript,
+    /// Python source or stub file (`.py`, `.pyi`).
     Python,
 }
 
@@ -198,22 +222,31 @@ impl Language {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileClass {
+    /// Regular library/binary production source file.
     Source,
+    /// Automated test file or test module.
     Test,
+    /// Documentation file.
     Doc,
+    /// Configuration or manifest file.
     Config,
+    /// Static data or fixture file.
     Data,
+    /// Automation or shell script.
     Script,
+    /// Non-code media/style asset.
     Asset,
 }
 
 /// What the extractor learned about one source file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileInfo {
+    /// Language attributed to this file.
     pub language: Language,
     /// The [`Unit::id`] the file belongs to, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    /// Semantic role classification of the file.
     pub class: FileClass,
     /// A target root (binary, library, test, build script).
     pub is_entry: bool,
@@ -255,19 +288,27 @@ pub enum DiagnosticCode {
 /// One extractor diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Diagnostic {
+    /// Machine-readable diagnostic category.
     pub code: DiagnosticCode,
+    /// Repository-relative file path associated with the diagnostic.
     pub path: String,
+    /// 1-based line number when localized to a statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+    /// Human-readable diagnostic explanation.
     pub message: String,
 }
 
 /// The whole code graph of one repository.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeGraph {
+    /// Packages/units discovered from manifests.
     pub units: Vec<Unit>,
+    /// Resolved file-to-file edges across the repository.
     pub edges: Vec<FileEdge>,
+    /// Per-file metadata keyed by repository-relative path.
     pub files: BTreeMap<String, FileInfo>,
+    /// Parser and resolver diagnostics sorted deterministically.
     pub diagnostics: Vec<Diagnostic>,
     /// References that resolved outside the repository (`std`, crates.io).
     #[serde(default)]
@@ -293,20 +334,29 @@ pub enum Role {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum Basis {
+    /// Direct source-code reference (verified statically against the code graph).
     #[default]
     Code,
+    /// Runtime service or RPC coupling without a static source import.
     Runtime,
+    /// Shared persistent data schema or file contract.
     Data,
+    /// Build-time tooling or artifact coupling.
     Build,
+    /// Process lifecycle / operational orchestration coupling.
     Process,
 }
 
 /// The basis of one declared `from depends_on to`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationBasis {
+    /// Dependent feature ID.
     pub from: String,
+    /// Target dependency feature ID.
     pub to: String,
+    /// Nature of the dependency relation.
     pub basis: Basis,
+    /// Supporting rationale (required for non-`code` bases).
     #[serde(default)]
     pub note: String,
 }
@@ -314,6 +364,7 @@ pub struct RelationBasis {
 /// A finding kept in the report but kept out of the verdict.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Waiver {
+    /// Finding code matched by this waiver.
     pub code: FindingCode,
     /// Every one of these must be named by the finding.
     #[serde(default)]
@@ -334,10 +385,13 @@ pub struct Waiver {
 /// The per-project inputs of [`truth`] besides the registry and the graph.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TruthPolicy {
+    /// Explicit feature role classifications (`feature_id -> Role`).
     #[serde(default)]
     pub roles: BTreeMap<String, Role>,
+    /// Declared dependency bases overriding the default `code` basis.
     #[serde(default)]
     pub bases: Vec<RelationBasis>,
+    /// Active finding waivers with mandatory rationale and optional expiry.
     #[serde(default)]
     pub waivers: Vec<Waiver>,
 }
@@ -346,8 +400,11 @@ pub struct TruthPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
+    /// Structural/policy violation blocking `--deps enforce`.
     Error,
+    /// Warning-level finding (e.g. advisory mismatch).
     Warn,
+    /// Informational note (e.g. implied dependency path).
     Info,
 }
 
@@ -414,20 +471,27 @@ impl FindingCode {
 /// One dependency-truth finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
+    /// Classification code identifying this finding kind.
     pub code: FindingCode,
+    /// Fixed severity implied by `code`.
     pub severity: Severity,
+    /// Whether an active [`Waiver`] excludes this finding from blocking enforcement.
     pub waived: bool,
+    /// Candidate owning features of the source side.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub from_any_of: Vec<String>,
+    /// Candidate owning features of the target side.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub to_any_of: Vec<String>,
     /// The members of a cycle, or the features a waiver names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// Total count of underlying file edges supporting this finding.
     pub evidence_total: usize,
     /// At most [`EVIDENCE_LIMIT`] edges, except a cycle's closing edges,
     /// which are all kept.
     pub evidence: Vec<FileEdge>,
+    /// Actionable remediation summary for operators.
     pub fix: String,
     /// `static_cycle` only: the edge groups it keeps out of
     /// `under_declared` and `implied_only` because no declaration can settle
@@ -444,15 +508,20 @@ pub struct Suppressed {
     pub total: usize,
     /// How many production file edges they hold.
     pub file_edges: usize,
+    /// Detailed suppressed owner pairs grouped by cycle-closing reason.
     pub pairs: Vec<SuppressedPair>,
 }
 
 /// One edge group no declaration can settle.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SuppressedPair {
+    /// Candidate source feature owners.
     pub from_any_of: Vec<String>,
+    /// Candidate target feature owners.
     pub to_any_of: Vec<String>,
+    /// Why a `depends_on` declaration cannot resolve this direction.
     pub reason: SuppressionReason,
+    /// Number of production file edges represented by this pair.
     pub prod_edges: usize,
 }
 
@@ -484,10 +553,15 @@ pub enum EdgeStatus {
 /// All file edges between one pair of owner sets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureEdge {
+    /// Candidate owning features of the source files.
     pub from_any_of: Vec<String>,
+    /// Candidate owning features of the target files.
     pub to_any_of: Vec<String>,
+    /// Declaration coverage status (`declared`, `implied`, or `undeclared`).
     pub status: EdgeStatus,
+    /// Count of production-scope file edges in this group.
     pub prod_edges: usize,
+    /// Count of non-production (`test` or `build`) file edges in this group.
     pub other_edges: usize,
     /// Every file edge behind this feature edge, sorted.
     pub evidence: Vec<FileEdge>,
@@ -496,6 +570,7 @@ pub struct FeatureEdge {
 /// Where each file edge went in the projection (counts of file edges).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectionSummary {
+    /// Total file edges evaluated from the code graph.
     pub file_edges: usize,
     /// `mod` and re-export edges: kept, not dependencies.
     pub structural: usize,
@@ -506,24 +581,33 @@ pub struct ProjectionSummary {
     /// An owner of one end is an ancestor or descendant of an owner of the
     /// other.
     pub hierarchy: usize,
+    /// Edges covered by a direct `depends_on` declaration.
     pub declared: usize,
+    /// Edges reachable transitively through declared `depends_on` chains.
     pub implied: usize,
+    /// Cross-feature edges with no declared or implied coverage.
     pub undeclared: usize,
 }
 
 /// File edges projected onto features.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureGraph {
+    /// Edge disposition counts across all projected edges.
     pub summary: ProjectionSummary,
+    /// Grouped cross-feature edges.
     pub edges: Vec<FeatureEdge>,
 }
 
 /// Finding counts. `error`, `warn` and `info` count unwaived findings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TruthCounts {
+    /// Unwaived error-severity findings.
     pub error: usize,
+    /// Unwaived warning-severity findings.
     pub warn: usize,
+    /// Unwaived info-severity findings.
     pub info: usize,
+    /// Findings suppressed by an active waiver.
     pub waived: usize,
     /// Every finding, waived or not, by code.
     pub by_code: BTreeMap<String, usize>,
@@ -555,9 +639,13 @@ impl TruthCounts {
 /// The dependency-truth report of one registry against one code graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TruthReport {
+    /// Output schema version matching [`TRUTH_SCHEMA_VERSION`].
     pub schema_version: u32,
+    /// ISO `YYYY-MM-DD` evaluation date used for waiver expiry checks.
     pub today: String,
+    /// Summary counts of code-graph edge projection onto features.
     pub projection: ProjectionSummary,
+    /// Aggregated finding counts by severity and code.
     pub counts: TruthCounts,
     /// Sorted by severity, code, then ids.
     pub findings: Vec<Finding>,
@@ -657,10 +745,7 @@ impl FeatureIndex {
     }
 
     /// `ids` and all their ancestors.
-    pub fn with_ancestors<'a>(
-        &self,
-        ids: impl IntoIterator<Item = &'a String>,
-    ) -> BTreeSet<String> {
+    fn with_ancestors<'a>(&self, ids: impl IntoIterator<Item = &'a String>) -> BTreeSet<String> {
         let mut all = BTreeSet::new();
         for id in ids {
             all.insert(id.clone());
@@ -673,7 +758,7 @@ impl FeatureIndex {
     /// declaration on a feature's ancestor counts as the feature's own.
     /// The starting features are included only when a chain returns to
     /// them.
-    pub fn declared_reach(&self, from: &BTreeSet<String>) -> BTreeSet<String> {
+    fn declared_reach(&self, from: &BTreeSet<String>) -> BTreeSet<String> {
         let mut reached = BTreeSet::new();
         let mut queue: VecDeque<String> = VecDeque::new();
         let push_targets = |id: &str, queue: &mut VecDeque<String>| {
@@ -698,7 +783,7 @@ impl FeatureIndex {
 
     /// Whether `from` reaches `to` through declared `depends_on` alone (the
     /// graph `validate_registry` keeps acyclic).
-    pub fn declared_path(&self, from: &str, to: &str) -> bool {
+    fn declared_path(&self, from: &str, to: &str) -> bool {
         let mut seen = BTreeSet::new();
         let mut queue: VecDeque<&str> = VecDeque::from([from]);
         while let Some(id) = queue.pop_front() {
@@ -1521,7 +1606,7 @@ fn waiver_matches(waiver: &Waiver, finding: &Finding) -> bool {
 /// `entrypoint_imported`) plus expired waivers (`waiver_unused` naming
 /// expiration). `implied_only`, `test_only_undeclared`, `unverifiable`, and
 /// active/non-expired unused waivers are advisory only.
-pub fn is_enforced_truth_finding(finding: &Finding) -> bool {
+fn is_enforced_truth_finding(finding: &Finding) -> bool {
     if finding.waived {
         return false;
     }
@@ -1553,9 +1638,13 @@ pub fn enforced_truth_violations(report: &TruthReport) -> Vec<&Finding> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PurityCode {
+    /// High-level `domain` feature directly claims source files instead of delegating to slices.
     DomainDirectFiles,
+    /// Feature claims an overly broad catch-all glob pattern (`**`, `*`).
     GlobCatchAll,
+    /// Catch-all bucket feature accumulating unrelated files across the repo.
     CatchAllBucket,
+    /// Single feature spans multiple unrelated top-level directories.
     UnrelatedDirectorySpan,
 }
 
@@ -1579,20 +1668,29 @@ impl PurityCode {
 /// One semantic purity finding against a registry feature node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurityFinding {
+    /// Semantic purity rule violated.
     pub code: PurityCode,
+    /// Fixed severity of this finding.
     pub severity: Severity,
+    /// Identifier of the offending feature node.
     pub feature_id: String,
+    /// Explanation of the structural smell.
     pub detail: String,
+    /// Representative file paths illustrating the span/glob violation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sample_paths: Vec<String>,
+    /// Suggested refactoring step to restore cohesive ownership.
     pub fix: String,
 }
 
 /// Counts of semantic purity findings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurityCounts {
+    /// Error-severity purity findings.
     pub error: usize,
+    /// Warning-severity purity findings.
     pub warn: usize,
+    /// Finding totals keyed by purity rule code.
     pub by_code: BTreeMap<String, usize>,
 }
 
@@ -1617,8 +1715,11 @@ impl PurityCounts {
 /// Semantic purity report for `spawn features check --purity`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurityReport {
+    /// Purity report schema format version.
     pub schema_version: u32,
+    /// Aggregated counts by severity and rule code.
     pub counts: PurityCounts,
+    /// Detected semantic purity findings.
     pub findings: Vec<PurityFinding>,
 }
 

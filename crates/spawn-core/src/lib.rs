@@ -1,6 +1,12 @@
 //! Spawn domain: types, ports, event normalization, Agent Bridge and
 //! Observer logic. This crate performs no IO.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+// `bridge.rs` carries 5 pre-existing private intra-doc links and is locked by
+// concurrent PRs (#126/#150); clean up inside `bridge.rs` after those merge.
+#[allow(rustdoc::private_intra_doc_links)]
 pub mod bridge;
 pub mod command;
 #[cfg(feature = "testing")]

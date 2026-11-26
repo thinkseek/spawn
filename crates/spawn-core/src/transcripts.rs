@@ -6,9 +6,9 @@
 //! `cleanupPeriodDays` sweep runs at every engine start, over the shared
 //! projects directory), and the format is the engine's. So the Bridge copies what the
 //! engine appended since the last copy into a [`TranscriptArchive`] at each
-//! turn end and at the end of the execution ([`archive`]), and before a
+//! turn end and at the end of the execution (`archive`), and before a
 //! resume puts a missing file back from it, or one that lost its head
-//! ([`restore`]).
+//! (`restore`).
 //!
 //! The file is append-only. A file that shrank, or whose bytes before the
 //! end of the last copy changed (rewritten, replaced), is copied whole as
@@ -25,7 +25,7 @@
 //!
 //! Masked (objective 175): an engine that prints a credential it read
 //! writes the value into its transcript, and the archive keeps what it
-//! copies for good. So the Bridge copies through a [`Masking`]: every value
+//! copies for good. So the Bridge copies through a `Masking`: every value
 //! the value collector places is replaced by `[REDACTED:<name>]`
 //! ([`ARCHIVE_MARKER`]) in each of its forms before a line is copied; only
 //! whole lines are copied (a line the engine is still writing waits for the
@@ -56,14 +56,18 @@ pub const MASK_CHANGED: &str =
 /// Where a copy stands in the transcript (objective 175), replaced whole
 /// after each append: the copy's length when it was written
 /// (`archive_length`), the transcript's offset its bytes reach
-/// (`source_offset`), the sha256 of the transcript's [`OVERLAP`] bytes
+/// (`source_offset`), the sha256 of the transcript's `OVERLAP` bytes
 /// before that offset (fewer at the start), and whether any of its bytes
 /// went through a mask.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CopySource {
+    /// Byte length of the archived copy file when this record was written.
     pub archive_length: u64,
+    /// Byte offset reached in the live engine transcript file.
     pub source_offset: u64,
+    /// Hex SHA-256 of up to the trailing `OVERLAP` source bytes before `source_offset`.
     pub tail_sha256: String,
+    /// Whether any copied byte in this copy passed through a credential mask.
     pub masked: bool,
 }
 
@@ -82,13 +86,13 @@ impl CopySource {
 /// The mask a copy goes through, and whether it is still the one its
 /// sources give ([`crate::port::ArchiveMask::current`]), asked before each
 /// append.
-pub struct Masking<'a> {
+pub(crate) struct Masking<'a> {
     pub mask: Arc<Mask>,
     pub current: &'a dyn Fn() -> bool,
 }
 
-/// The sha256, in hex, of the last [`OVERLAP`] bytes of `bytes`.
-pub fn tail_sha256(bytes: &[u8]) -> String {
+/// The sha256, in hex, of the last `OVERLAP` bytes of `bytes`.
+pub(crate) fn tail_sha256(bytes: &[u8]) -> String {
     let width = usize::try_from(OVERLAP)
         .unwrap_or(usize::MAX)
         .min(bytes.len());
@@ -111,8 +115,11 @@ pub fn tail_sha256(bytes: &[u8]) -> String {
 /// transcript since `until`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveProgress {
+    /// Agent that owns the archived native transcript.
     pub agent: AgentId,
+    /// Engine-assigned native session identifier.
     pub native: String,
+    /// Spawn session associated with the transcript.
     pub session: SessionId,
     /// The execution that ran the session last.
     pub execution: ExecutionId,
@@ -163,7 +170,7 @@ pub fn settling(progress: &[ArchiveProgress], until_ms: i64) -> bool {
 /// may delete it), which copies nothing and says nothing of lines the
 /// archive may lack (objective 179 R3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Archived {
+pub(crate) struct Archived {
     pub copied: u64,
     pub length: Option<u64>,
     pub offset: Option<u64>,
@@ -177,7 +184,8 @@ const OVERLAP: u64 = 4096;
 /// Copy what the transcript at `path` gained since the latest copy of
 /// `native` into the archive, unmasked: the bytes copied (0 when the file is
 /// missing or has nothing new).
-pub fn archive(
+#[cfg(test)]
+fn archive(
     host: &dyn TerminalHost,
     archive: &dyn TranscriptArchive,
     workspace: &WorkspaceId,
@@ -268,10 +276,10 @@ fn standing(
 /// is still current (if not, nothing more is copied this pass and the copy
 /// fails with [`MASK_CHANGED`]), and each append followed by its record.
 /// Without a mask, the bytes are copied as they are. The file is
-/// append-only: one that shrank, or whose [`OVERLAP`] bytes before the
+/// append-only: one that shrank, or whose `OVERLAP` bytes before the
 /// latest copy's offset are not its record's, is copied whole as the next
 /// copy, so archived bytes are never overwritten.
-pub fn archive_to(
+pub(crate) fn archive_to(
     host: &dyn TerminalHost,
     archive: &dyn TranscriptArchive,
     masking: Option<&Masking<'_>>,
@@ -371,7 +379,7 @@ pub fn archive_to(
 /// falls inside counts, as its end is not archived): `None` when the file
 /// holds nothing from `offset` on, `i64::MIN` when what it holds has no
 /// time that reads (a reader must take it as earlier than anything).
-pub fn first_line_ms(
+pub(crate) fn first_line_ms(
     host: &dyn TerminalHost,
     workspace: &WorkspaceId,
     path: &str,
@@ -406,7 +414,7 @@ pub fn first_line_ms(
 /// Epoch milliseconds of an RFC 3339 time (`2026-11-10T08:00:00.123Z`, an
 /// offset instead of `Z`, any digits of fraction), as a transcript line's
 /// `timestamp` is written.
-pub fn parse_rfc3339_ms(text: &str) -> Option<i64> {
+fn parse_rfc3339_ms(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     let number = |from: usize, to: usize| -> Option<i64> {
         let part = text.get(from..to)?;
@@ -471,7 +479,7 @@ pub fn parse_rfc3339_ms(text: &str) -> Option<i64> {
 
 /// What [`restore`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Restored {
+pub(crate) enum Restored {
     /// The file was missing, and `bytes` were put back.
     Written { bytes: u64 },
     /// The file held `had` bytes and the archive more: it was replaced by
@@ -489,7 +497,7 @@ pub enum Restored {
 /// The archive [`restore`] puts a transcript back from, and the mask a
 /// present file is archived through first: `Ok(None)` copies unmasked (no
 /// mask is configured), `Err` says why the mask cannot be had.
-pub struct Keeper<'a> {
+pub(crate) struct Keeper<'a> {
     pub archive: &'a dyn TranscriptArchive,
     pub mask: Result<Option<Masking<'a>>, &'a str>,
 }
@@ -499,7 +507,7 @@ pub struct Keeper<'a> {
 /// is put back; so is one the archive holds more than (S16: it lost its
 /// head, as when the projects directory was removed under a running engine
 /// and the engine went on writing a new file). What is put back is the
-/// archive's whole transcript ([`whole`]): its copies, joined, as they are
+/// archive's whole transcript (`whole`): its copies, joined, as they are
 /// (masked, when they are). A gone file put back is the transcript from
 /// then on: the latest copy's record says so (its length, the join's
 /// length and the sha256 of the join's tail), so the next pass goes on from
@@ -520,7 +528,7 @@ pub struct Keeper<'a> {
 /// when no engine of the session is running: an engine that wrote after the
 /// read is refused, not raced, but one writing during the rename would
 /// write to the file it replaced.
-pub fn restore(
+pub(crate) fn restore(
     host: &dyn TerminalHost,
     keeper: Option<Keeper<'_>>,
     workspace: &WorkspaceId,
@@ -746,7 +754,7 @@ fn read_file(
 ///   came before ended inside a line).
 ///
 /// So no line is dropped but one the engine itself wrote again.
-pub fn whole(copies: &[Vec<u8>]) -> Vec<u8> {
+fn whole(copies: &[Vec<u8>]) -> Vec<u8> {
     let mut joined: Vec<u8> = Vec::new();
     for copy in copies {
         if copy.starts_with(&joined) {
@@ -794,7 +802,7 @@ fn uuids(bytes: &[u8]) -> std::collections::HashSet<String> {
 
 /// Whether `event` was read from a native transcript: what tells a session
 /// whose transcript went missing from one that never wrote any.
-pub fn read_from_transcript(event: &NewEvent) -> bool {
+pub(crate) fn read_from_transcript(event: &NewEvent) -> bool {
     event.source == Source::Claude
         && matches!(
             event.kind,

@@ -1,6 +1,6 @@
 //! Pure data model for job grants (`spawn-node-grant-v1`).
 //!
-//! Cryptographic signing and opening ([`SignedGrant`] / `open_grant`) remain
+//! Cryptographic signing and opening (`SignedGrant` / `open_grant`) remain
 //! in `spawn-node-proto` so `spawn-core` stays free of `ring` and `base64`.
 
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,7 @@ pub fn grant_signing_input(grant: &[u8]) -> Vec<u8> {
 
 /// Validates `sha256:<64 lowercase hex>` digest syntax without requiring
 /// `spawn-cas` inside `spawn-core`.
-pub fn check_digest_syntax(text: &str) -> Result<(), Error> {
+fn check_digest_syntax(text: &str) -> Result<(), Error> {
     let hex = text.strip_prefix("sha256:").ok_or(Error::Digest)?;
     if !is_lower_hex(hex, 64) {
         return Err(Error::Digest);

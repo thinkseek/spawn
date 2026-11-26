@@ -329,7 +329,7 @@ fn finished_line<'a>(tail: &[&'a str], index: usize) -> Option<&'a str> {
 /// resumes the agent when they finish. Read only from the line the engine
 /// draws right above its prompt ([`read_claude_screen`]), never from the
 /// transcript.
-pub fn shows_background_shells(evidence: &str) -> bool {
+fn shows_background_shells(evidence: &str) -> bool {
     let trimmed = evidence.trim();
     trimmed.starts_with(SPINNERS)
         && trimmed.contains(FINISHED)
@@ -503,7 +503,7 @@ const AGY_TRUST: [&str; 3] = [
 
 /// Keys that accept the agy trust dialog: its first choice (trust) is
 /// selected, Enter confirms it.
-pub const AGY_TRUST_KEYS: [&str; 1] = ["Enter"];
+pub(crate) const AGY_TRUST_KEYS: [&str; 1] = ["Enter"];
 
 /// The lowest non-empty lines of a pane, ANSI stripped, trimmed, at most
 /// [`TAIL_LINES`] of them, oldest first.
@@ -560,9 +560,9 @@ pub fn drop_agy_account_lines(pane: &str) -> String {
 
 /// What agy prints when `--model` names a model it does not know (it then
 /// goes on, silently, on its own default, which may be its costliest).
-pub const AGY_UNKNOWN_MODEL: &str = "is not recognized as a known model";
+const AGY_UNKNOWN_MODEL: &str = "is not recognized as a known model";
 
-/// agy's unknown-model warning line ([`AGY_UNKNOWN_MODEL`]), trimmed and
+/// agy's unknown-model warning line (`AGY_UNKNOWN_MODEL`), trimmed and
 /// cut to 200 characters, when the pane shows one: the start that shows it
 /// fails, never runs on a model nobody chose. Never an account line
 /// ([`drop_agy_account_lines`]).
@@ -714,7 +714,7 @@ fn agy_spinner(line: &str) -> bool {
 ///   when it holds text. A banner above it (an announcement, a warning, the
 ///   line of an interrupted turn) is no dialog. The footer is the pane's
 ///   last line, below the box and an optional task panel (`●` entries and
-///   a closing rule, [`agy_footer`]). A footer that counts open background
+///   a closing rule, `agy_footer`). A footer that counts open background
 ///   work (`· 1 subagent(s) · 2 task(s) · /tasks`) is [`ScreenState::Busy`]:
 ///   agy is at its prompt, but the turn goes on when that work reports
 ///   back.
