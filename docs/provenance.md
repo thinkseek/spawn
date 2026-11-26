@@ -33,6 +33,11 @@ three append-only tables, filled from git and the event log.
   [`crates/spawn-cas/src/manifest.rs`](../crates/spawn-cas/src/manifest.rs).
   No table, column or event is added: a data ref is a domain of the same
   three tables.
+- PV4 (this page): `supersedes` edges at landing from the dispatcher's
+  brief, the files over the cap a workspace left out (decision D6), and
+  the shadow report `spawn prov durability` (decisions D4, B6;
+  [`provenance/durability.rs`](../crates/spawn-cli/src/provenance/durability.rs)).
+  No table, column or event is added.
 
 ## The model
 
@@ -50,6 +55,8 @@ three append-only tables, filled from git and the event log.
 - **Edge** (`prov_edges`): a typed relation from a Change to a
   `change_id` or a digest. PV2 writes `includes`: a landing includes the
   `edit` Changes of the checkpoints it brought in, `{"select": "all"}`.
+  PV4 writes `supersedes`: a landing supersedes an earlier task's landing
+  its dispatcher's brief names (below).
 
 | Kind | Written by PV2 for | Boundary | Attribution |
 | --- | --- | --- | --- |
@@ -419,6 +426,108 @@ and no separate chunk format, GC or port of their own; and a data root is
 never inside a workspace, so no checkpoint ever holds, or leaves out,
 data. Losing the store loses data bytes, never a commit.
 
+## PV4: what a landing supersedes, files over the cap, durability
+
+### `supersedes` from the dispatcher's brief
+
+A landing's `land` Change gets one `supersedes` edge per directive line of
+its task's brief, as the dispatcher wrote it: the `brief` of the task's
+first `task.assigned` control record (`PostgresStore::prov_task_briefs`).
+Never from what an agent wrote: a report, a commit message, a landing's
+message (a `reverts: task 11` there is ignored, tested). A directive is a
+whole line, any case, an optional list marker (`-`, `*`) and final `.`,
+an optional `#` before the number:
+
+| Line | `detail` |
+| --- | --- |
+| `reverts: task N` | `{"reason": "defect", "evidence": "level1_revert", "target_task": N}` when the landing restores N's paths, else `"evidence": "unverified_revert"` |
+| `fixes: task N` | `{"reason": "defect", "evidence": "dispatcher_fixes", "target_task": N}`: reported, never scored |
+| `supersedes: task N (refactor\|format\|planned\|requirement)` | `{"reason": "<that>", "evidence": "dispatcher_supersedes", "target_task": N}`: never a liability |
+
+The edge's `dst` is the `change_id` of task N's `land` Change in the same
+domain (one edge per such Change). A line naming the task itself, a task
+with no `land` Change in the domain, a `supersedes:` without one of the
+four reasons, and a line with anything else on it are no directive.
+
+**Level 1 (decisions B6, item 2).** A `reverts:` landing is `level1_revert`
+when, for every path N's `land` Changes touched (`content`, `mechanical`
+or folded `tree` rows; `generated` paths such as `Cargo.lock` are made
+again, not restored), the landing's commit holds what N's earliest landing
+found there (absent where it was absent), and the landing itself touched
+at least one of them. A path stored quoted cannot be read back and makes
+it `unverified_revert`. Level 2 (`level2_bisect`, a regression test
+bisected on first parents) has no writer yet; the report counts it.
+
+The edges are part of the `land` Change, written by the walk itself
+(`provenance/index.rs`), so the landing hook and `spawn prov index` write
+the same rows (tested: the hook's database equals an indexer run's, and a
+second run records nothing). The edges depend only on the store's rows of
+earlier landings and the repository.
+
+### Files over the cap (decision D6)
+
+The Git and copy-on-write stores record each file a checkpoint leaves out
+for its size in `<root>/.oversized/<agent>`: NUL-separated, three fields
+each, `told` or `untold`, the size, the path. PV4 appends to the size field
+a space and the file's `sha256:<64 hex>` digest (read without following a
+symlink, and read again only when the file's size changed or it was
+modified after the record was written). Its bytes stay out of git and out
+of every store. A record without a digest (written before) still reads,
+and an older reader drops an entry it cannot parse, which at worst tells
+the agent of it again. The overlay store sets no cap and is not touched
+(its missing cap is its own issue).
+
+With a workspace root (`spawn prov index --root <dir>`, else
+`SPAWN_WORKSPACE_ROOT`; the hook takes the root its mirror is under,
+`<root>/.sources/<name>`), the landing that is main's newest commit gets
+one entry per file of its task's agent's record that has a digest: `before`
+null, `after` the `sha256:` digest, `size` its bytes, class `content`, no
+origin; a path the landing's own entries hold is left out. The record is
+the workspace as it is now, which is true of the newest landing only, so
+the hook and an indexer run right after it write the same rows.
+
+### `spawn prov durability` (decisions D4, B6)
+
+`spawn prov durability [--source <source>] [--window-landings 50]
+[--window-days 14] [--json]` is a **shadow report**: it reads and prints,
+and nothing routes on it (`calibrate_preset` and grading are untouched;
+the switch is PV5, on D4's trigger). Without `--source` it reads every
+Git domain. Its rules, binding:
+
+1. The unit is the **task**: a liability goes to the task whose landing
+   introduced the content and, through the `preset_id` its `land` Change
+   captured, to that preset. Never to an agent's name, a reviewer or a
+   later editor.
+2. Only a `supersedes` edge with `reason: "defect"` and evidence
+   `level1_revert` or `level2_bisect` is a **confirmed defect**. A
+   `dispatcher_fixes` edge is counted apart in `fixes_reported`; an
+   `unverified_revert` is neither.
+3. **Window (D4)**: the superseding landing is at most 50 landings after
+   the task's first landing (by `prov_changes.id`, in the same domain) and
+   at most 14 days after it (`at_ms`), whichever ends first. **At most one
+   liability per task.**
+4. `refactor`, `format`, `planned`, `requirement`, a `redacts` edge (only
+   `supersedes` edges are read) and a task's edge to itself are never a
+   liability; a fix inside the same `change_id` before landing is no edge
+   at all.
+5. A composed landing: the liability follows each path's `origin` to the
+   task of the revision its content came from; a path without one is the
+   landing's own (its task, through its second parent). When that names
+   more than one task, or a revision with no task, nobody is charged and
+   the event is counted in `unattributed`.
+6. No survival score and no count of lines, files or Changes in any
+   column.
+
+The JSON: `shadow: true`, `window`, `domain`, `landings`, `presets` (one
+row per preset: `preset_id`, `landed_tasks`, `confirmed_defects`,
+`reverted_tasks`, `fixes_reported`), `unattributed` (a count) and
+`unattributed_events`, `defects` and `fixes` (each event: the edge, the
+target and charged task, the superseding task and Change, the evidence and
+how far after the landing it came, for a reader's check of the
+attribution), and `not_scored` (edges read and why they count for
+nothing: a non-defect reason, `unverified_revert`, `out_of_window`,
+`same_task`, ...). Without `--json`, one line per preset.
+
 ## Limits
 
 - The domain is the `--source` text: index each source under the name its
@@ -438,7 +547,15 @@ data. Losing the store loses data bytes, never a commit.
   checkpoint that reached `main`'s first-parent line by a fast-forward is
   found by `spawn prov who`, which reads git.
 - Large files left out of a checkpoint (`SPAWN_MAX_FILE_MB`) are in no
-  commit and so in no entry (decision D6, PV4).
+  commit. PV4 records them (digest and size) on the landing that is main's
+  newest commit when it is recorded, from the record as the workspace
+  holds it then: a landing indexed later, or a file the record no longer
+  holds (the workspace was unmounted, the file shrank), gets no entry, and
+  a record written before PV4 has no digest and gives none.
+- `supersedes` edges are written when the landing is recorded, so a
+  landing the hook or an earlier version recorded without them keeps its
+  rows (provenance is append-only); a directive naming a task with no
+  `land` Change in the domain (not landed, another source) writes nothing.
 - Data snapshots: no route answers `refs` yet (the commands do, and `GET
   /api/prov/blast` and `/api/prov/change/<id>` read data Changes like
   any other). A rollback moves the head and does not rewrite the
