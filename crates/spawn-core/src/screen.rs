@@ -25,9 +25,10 @@
 //!
 //! - Busy: a spinner or a running-turn hint in the activity region.
 //! - Error: an `API Error` (or a hook error) in the activity region.
-//! - Permission: a choice at the prompt position (`$ 1. …`). Every engine
-//!   runs with `bypassPermissions`, so no tool-permission dialog is drawn;
-//!   the choices of a question the engine asks sit at the prompt.
+//! - Permission: a choice at the prompt position (`$ 1. …`), or the footer
+//!   Claude Code 2.1.330 ends a question (`AskUserQuestion`) or a
+//!   tool-permission dialog with, as the pane's last lines
+//!   ([`is_choice_footer`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -176,13 +177,15 @@ fn is_rule(line: &str) -> bool {
 /// Prompt text after the marker, trimmed.
 ///
 /// `$` needs a following space: pasted shell output contains `$VAR` lines.
+/// Any whitespace counts: Claude Code 2.1.330 draws a draft as `$`, a
+/// no-break space (U+00A0), a space, then the text.
 fn prompt_body(line: &str) -> Option<&str> {
     let trimmed = line.trim();
     for marker in PROMPTS {
         let Some(rest) = trimmed.strip_prefix(marker) else {
             continue;
         };
-        if rest.is_empty() || rest.starts_with(' ') {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
             return Some(rest.trim());
         }
     }
@@ -216,20 +219,27 @@ fn is_mode_tag(line: &str) -> bool {
 }
 
 /// The screen-reader spinner: one word with an ellipsis (`Nucleating…`),
-/// maybe followed by a parenthesis (`Running…  (16s)`).
+/// maybe followed by a parenthesis (`Running…  (16s)`). The word starts
+/// with a letter and may hold an apostrophe or a hyphen (`Beboppin'…`,
+/// `Hullaballooing…`, `Topsy-turvying…`).
 fn spinner_word(line: &str) -> bool {
     let Some((word, rest)) = line.split_once('…') else {
         return false;
     };
     let rest = rest.trim();
-    !word.is_empty()
-        && word.chars().all(char::is_alphabetic)
+    word.starts_with(char::is_alphabetic)
+        && word
+            .chars()
+            .all(|character| character.is_alphabetic() || matches!(character, '\'' | '’' | '-'))
         && (rest.is_empty() || rest.starts_with('('))
 }
 
+/// The running-turn hint Claude Code may draw on a status line.
+const INTERRUPT_HINT: &str = "esc to interrupt";
+
 fn busy_line(line: &str) -> bool {
     let trimmed = line.trim();
-    if trimmed.contains("esc to interrupt")
+    if trimmed.contains(INTERRUPT_HINT)
         || SCREEN_READER_BUSY
             .iter()
             .any(|marker| trimmed.contains(marker))
@@ -254,6 +264,13 @@ fn error_line(line: &str) -> bool {
 /// The activity region above the prompt at `index`, lowest line first: up
 /// to [`ACTIVITY_LINES`] lines above the status lines, ending at a
 /// transcript line or a finished turn's line.
+///
+/// A status line that says a turn runs ([`INTERRUPT_HINT`]) comes first:
+/// it is checked before the status lines are passed over. Under tmux the
+/// engine draws a line of its own (`tmux focus-events off`) between that
+/// hint and the status lines below it, so the hint stayed in the region;
+/// under Herdr it does not, the hint's line reads as a status line, and
+/// passing it over read a running turn as `Ready`.
 fn activity_region<'a>(tail: &[&'a str], index: usize) -> Vec<&'a str> {
     let above: Vec<&str> = tail[..index]
         .iter()
@@ -261,6 +278,7 @@ fn activity_region<'a>(tail: &[&'a str], index: usize) -> Vec<&'a str> {
         .filter(|line| !is_rule(line) && !line.trim().is_empty())
         .collect();
     let mut end = above.len();
+    let mut region = Vec::new();
     // The mode tags sit lowest, then the status lines.
     let mut tags = true;
     while end > 0 {
@@ -268,16 +286,19 @@ fn activity_region<'a>(tail: &[&'a str], index: usize) -> Vec<&'a str> {
         if tags && is_mode_tag(line) {
             end -= 1;
         } else if is_status(line) {
+            if line.contains(INTERRUPT_HINT) {
+                region.push(line);
+            }
             tags = false;
             end -= 1;
         } else {
             break;
         }
     }
-    let mut region = Vec::new();
+    let hints = region.len();
     for line in above[..end].iter().rev() {
         let trimmed = line.trim();
-        if region.len() == ACTIVITY_LINES
+        if region.len() - hints == ACTIVITY_LINES
             || trimmed.contains(FINISHED)
             || SPEAKERS.iter().any(|speaker| trimmed.starts_with(speaker))
         {
@@ -352,6 +373,61 @@ pub fn is_trust_dialog(pane: &str) -> bool {
 /// Keys that accept the trust dialog.
 pub const TRUST_KEYS: [&str; 2] = ["y", "Enter"];
 
+/// The start of the footer Claude Code 2.1.330 ends a question
+/// (`AskUserQuestion`) or a tool-permission dialog with, in the
+/// screen-reader layout: `Select with numbers [1-3]. Then Enter to submit
+/// or Escape to cancel:`. Those dialogs draw no `$ 1.` line.
+const CHOICE_FOOTER_START: &str = "Select with numbers [";
+
+/// The end of that footer, after the range in brackets.
+const CHOICE_FOOTER_END: &str = "]. Then Enter to submit or Escape to cancel:";
+
+/// The key hint a tool-permission dialog may draw after the footer.
+const CHOICE_CANCEL_HINT: &str = "Esc to cancel";
+
+/// Whether `line` is the choice footer: its start, a range in brackets,
+/// its end, then nothing or the cancel hint.
+fn choice_footer_line(line: &str) -> bool {
+    let Some(rest) = line.trim().strip_prefix(CHOICE_FOOTER_START) else {
+        return false;
+    };
+    let Some((range, after)) = rest.split_once(CHOICE_FOOTER_END) else {
+        return false;
+    };
+    let after = after.trim();
+    !range.trim().is_empty()
+        && !range.contains(']')
+        && (after.is_empty() || after.contains(CHOICE_CANCEL_HINT))
+}
+
+/// The choice footer of a question or a tool-permission dialog, when it is
+/// the last non-empty line of the pane, or the line above a last line that
+/// is only the cancel hint (`Esc to cancel`, maybe with other key hints).
+/// Like the trust dialog ([`is_trust_dialog`]), it is the dialog only at
+/// the bottom of the pane: the same words in the transcript, with the
+/// prompt and status lines drawn below them, are history.
+fn choice_footer<'a>(lines: &[&'a str]) -> Option<&'a str> {
+    let mut rows = lines.iter().rev().filter(|line| !line.trim().is_empty());
+    let last = rows.next()?;
+    if choice_footer_line(last) {
+        return Some(last);
+    }
+    let above = rows.next()?;
+    let hint = last.trim();
+    (hint.contains(CHOICE_CANCEL_HINT) && hint.len() <= 80 && choice_footer_line(above))
+        .then_some(*above)
+}
+
+/// Whether the pane ends with the choice footer of a question or a
+/// tool-permission dialog Claude Code 2.1.330 draws (`Select with numbers
+/// [1-3]. Then Enter to submit or Escape to cancel:`), never the trust
+/// dialog: [`read_claude_screen`] reads it as [`ScreenState::Permission`].
+pub fn is_choice_footer(pane: &str) -> bool {
+    let stripped: Vec<String> = pane.lines().map(strip_ansi).collect();
+    let lines: Vec<&str> = stripped.iter().map(String::as_str).collect();
+    choice_footer(&lines).is_some()
+}
+
 /// Parse the pane tail.
 pub fn read_claude_screen(pane: &str) -> ScreenReading {
     let mut stripped: Vec<String> = pane.lines().map(strip_ansi).collect();
@@ -364,6 +440,12 @@ pub fn read_claude_screen(pane: &str) -> ScreenReading {
     let tail: Vec<&str> = stripped[start..].iter().map(String::as_str).collect();
     if tail.is_empty() {
         return ScreenReading::unknown();
+    }
+
+    // A question or a tool-permission dialog of Claude Code 2.1.330: no
+    // `$ 1.` line, its footer at the bottom of the pane.
+    if let Some(footer) = choice_footer(&tail) {
+        return ScreenReading::new(ScreenState::Permission, footer);
     }
 
     let prompt_index = tail.iter().rposition(|line| prompt_body(line).is_some());
@@ -1026,5 +1108,160 @@ mod background_shell_tests {
         let reading = read_claude_screen(&pane);
         assert_eq!(reading.state, ScreenState::Ready);
         assert!(!shows_background_shells(&reading.evidence));
+    }
+}
+
+/// Claude Code 2.1.330 in the screen-reader layout, under tmux and Herdr
+/// (PR H3-screen-fix, R2–R4 of the C2 capture gate). The panes are
+/// sanitized captures: paths, models and the drafted text made up.
+#[cfg(test)]
+mod claude_2_1_330_tests {
+    use super::{
+        ScreenState, activity_region, is_choice_footer, is_trust_dialog, prompt_body,
+        read_claude_screen, spinner_word,
+    };
+
+    const STATUS: &str = "deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 318 tok/s";
+    const MODE: &str = "bypass permissions on (shift+tab to cycle)";
+
+    /// R2: a draft is `$`, a no-break space, a space, then the text.
+    #[test]
+    fn a_draft_after_a_no_break_space_reads_drafted() {
+        assert_eq!(prompt_body("$\u{a0} fix the tests"), Some("fix the tests"));
+        assert_eq!(prompt_body("❯\u{a0} fix the tests"), Some("fix the tests"));
+        assert_eq!(prompt_body("$\u{a0}"), Some(""));
+        // Still no prompt: a shell variable.
+        assert_eq!(prompt_body("$HOME/bin"), None);
+        for pane in [
+            format!("{STATUS}\n{MODE}\n$\u{a0} fix the tests"),
+            format!("you: hi\nclaude: hello\n{STATUS}\n$\u{a0} fix the tests\n{MODE}\n"),
+        ] {
+            let reading = read_claude_screen(&pane);
+            assert_eq!(reading.state, ScreenState::Drafted, "{pane:?}");
+            assert!(reading.evidence.ends_with("fix the tests"), "{reading:?}");
+        }
+        let empty = format!("{STATUS}\n{MODE}\n$\u{a0}");
+        assert_eq!(read_claude_screen(&empty).state, ScreenState::Ready);
+    }
+
+    /// R3: a question (`AskUserQuestion`) at the bottom of the pane.
+    const QUESTION: &str = "claude: I need a choice.\n\
+                            Which database should the service use?\n\
+                            1. PostgreSQL\n\
+                            2. SQLite\n\
+                            3. Type something.\n\
+                            Select with numbers [1-3]. Then Enter to submit or Escape to cancel:\n";
+
+    /// R3: a tool-permission dialog at the bottom of the pane.
+    const TOOL: &str = "Bash command\n\
+                        rm -rf target/tmp\n\
+                        Do you want to proceed?\n\
+                        1. Yes\n\
+                        2. Yes, and don't ask again for rm commands\n\
+                        3. No, and tell Claude what to do differently\n\
+                        Select with numbers [1-3]. Then Enter to submit or Escape to cancel:\n\
+                        Esc to cancel\n";
+
+    #[test]
+    fn a_question_or_tool_dialog_footer_is_a_permission() {
+        for pane in [
+            QUESTION.to_string(),
+            TOOL.to_string(),
+            format!("{QUESTION}\n\n\n"),
+            "Select with numbers [1-2]. Then Enter to submit or Escape to cancel: Esc to cancel\n"
+                .to_string(),
+        ] {
+            assert!(is_choice_footer(&pane), "{pane:?}");
+            assert!(!is_trust_dialog(&pane), "{pane:?}");
+            let reading = read_claude_screen(&pane);
+            assert_eq!(reading.state, ScreenState::Permission, "{pane:?}");
+            assert!(
+                reading.evidence.starts_with("Select with numbers ["),
+                "{reading:?}"
+            );
+            assert!(!reading.state.accepts_input());
+        }
+    }
+
+    #[test]
+    fn the_footers_words_elsewhere_are_no_permission() {
+        // Quoted in the transcript, the input box drawn below: history.
+        let quoted = format!(
+            "claude: It ends with Select with numbers [1-3]. Then Enter to submit or Escape \
+             to cancel:\nSelect with numbers [1-3]. Then Enter to submit or Escape to cancel:\n\
+             {STATUS}\n{MODE}\n$ "
+        );
+        assert!(!is_choice_footer(&quoted));
+        assert_eq!(read_claude_screen(&quoted).state, ScreenState::Ready);
+        // Ordinary prose as the last line.
+        for prose in [
+            "Select with numbers or letters, then press Enter.\n",
+            "claude: Select with numbers [1-3]. Then Enter to submit or Escape to cancel:\n",
+            "Select with numbers []. Then Enter to submit or Escape to cancel:\n",
+            "Select with numbers [1-3]. Then Enter to submit or Escape to cancel: and more\n",
+            "Select with numbers [1-3]. Then Enter to submit or Escape to cancel:\nplain text\n",
+        ] {
+            assert!(!is_choice_footer(prose), "{prose:?}");
+            assert_ne!(
+                read_claude_screen(prose).state,
+                ScreenState::Permission,
+                "{prose:?}"
+            );
+        }
+        // The trust dialog is no question.
+        let trust = "Quick safety check: Is this a project you created or one you trust?\n\
+                     y. Yes, I trust this folder\nn. No, exit\nEnter y/n:\n\
+                     Enter to confirm · Esc to cancel\n";
+        assert!(is_trust_dialog(trust));
+        assert!(!is_choice_footer(trust));
+        assert_eq!(read_claude_screen(trust).state, ScreenState::Unknown);
+    }
+
+    /// R4: spinner words with an apostrophe or a hyphen.
+    #[test]
+    fn spinner_words_may_hold_an_apostrophe_or_a_hyphen() {
+        for line in [
+            "Beboppin'…",
+            "Beboppin'… (12s)",
+            "Beboppin’…",
+            "Topsy-turvying…",
+            "Nucleating…",
+        ] {
+            assert!(spinner_word(line), "{line}");
+        }
+        for line in ["'…", "-…", "…", "two words…", "Beboppin'… and more", "1st…"] {
+            assert!(!spinner_word(line), "{line}");
+        }
+    }
+
+    /// R4: under Herdr the `esc to interrupt` hint sits on a status line
+    /// right above the prompt, no `tmux focus-events off` line between them.
+    #[test]
+    fn an_interrupt_hint_on_a_status_line_is_a_running_turn() {
+        let herdr = format!(
+            "you: run the tests\nBeboppin'… (12s)\n{STATUS}\n\
+             bypass permissions on · esc to interrupt\n$ "
+        );
+        let tail: Vec<&str> = herdr.lines().collect();
+        let region = activity_region(&tail, tail.len() - 1);
+        assert_eq!(
+            region.first(),
+            Some(&"bypass permissions on · esc to interrupt")
+        );
+        assert_eq!(region.len(), 2, "{region:?}");
+        let reading = read_claude_screen(&herdr);
+        assert_eq!(reading.state, ScreenState::Busy, "{reading:?}");
+        assert!(!reading.state.accepts_input());
+        // The hint alone, no spinner line: still running.
+        let hint =
+            format!("you: run the tests\n{STATUS}\nbypass permissions on · esc to interrupt\n$ ");
+        assert_eq!(read_claude_screen(&hint).state, ScreenState::Busy);
+        // The spinner alone, no hint: running.
+        let spinner = format!("you: run the tests\nBeboppin'…\n{STATUS}\n{MODE}\n$ ");
+        assert_eq!(read_claude_screen(&spinner).state, ScreenState::Busy);
+        // The turn done, the hint gone: ready.
+        let done =
+            format!("you: run the tests\n✻ Bebopped for 12s · done 9:20 PM\n{STATUS}\n{MODE}\n$ ");
+        assert_eq!(read_claude_screen(&done).state, ScreenState::Ready);
     }
 }

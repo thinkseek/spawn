@@ -1002,3 +1002,118 @@ fn a_staged_text_reaches_a_detected_agent_through_agent_prompt() {
     screen_with(&host, &agy, &workspace, "esc to cancel");
     host.terminate(&agy, &workspace).expect("terminate");
 }
+
+/// R1 of PR H3-screen-fix: Herdr's pane shell echoes the line that runs the
+/// launch script (`$ exec /bin/sh '<script>'`). Left on the screen above a
+/// trust dialog, it read as a drafted prompt, so the Bridge took the input
+/// box for drawn and never answered the dialog. The launch script clears
+/// the screen first: the tail holds the dialog alone, which reads as
+/// nothing yet and gets the trust keys.
+#[test]
+fn the_launch_echo_is_cleared_before_the_program_draws() {
+    use spawn_core::screen::{ScreenState, TRUST_KEYS, is_trust_dialog, read_claude_screen};
+
+    let _serial = exclusive();
+    let Some(session) = Session::new() else {
+        return;
+    };
+    let host = session.host();
+    let workspace = session.workspace();
+    let dialog = terminal("spawn-exec_h5");
+    host.start(&session.launch(
+        &dialog,
+        "printf 'Quick safety check: Is this a project you created or one you trust?\\n\
+         y. Yes, I trust this folder\\nn. No, exit\\nEnter y/n:\\n\
+         Enter to confirm \\302\\267 Esc to cancel\\n'; exec cat",
+    ))
+    .expect("start");
+    let screen = screen_with(&host, &dialog, &workspace, "Esc to cancel");
+    assert!(
+        !screen.contains("exec /bin/sh"),
+        "the echo stayed:\n{screen}"
+    );
+    assert!(
+        !screen.contains(".sh"),
+        "the script's path stayed:\n{screen}"
+    );
+    assert!(is_trust_dialog(&screen), "{screen}");
+    let reading = read_claude_screen(&screen);
+    assert_eq!(reading.state, ScreenState::Unknown, "{reading:?}\n{screen}");
+    assert_eq!(TRUST_KEYS, ["y", "Enter"]);
+    host.terminate(&dialog, &workspace).expect("terminate");
+}
+
+/// R1 of PR H3-screen-fix, Rev 1: the start returns only once the launch
+/// script cleared the line that ran it. The Bridge reads the pane right
+/// after the start; a reading of the echo (`Drafted`) there marks the
+/// prompt seen, and a trust dialog drawn next goes unanswered. Five warm
+/// starts against one running server, each read at once: never the echo,
+/// the script's name, a draft or a ready prompt before the program draws.
+#[test]
+fn the_first_read_after_a_warm_start_never_shows_the_launch_echo() {
+    use spawn_core::screen::{ScreenState, read_claude_screen};
+
+    let _serial = exclusive();
+    let Some(session) = Session::new() else {
+        return;
+    };
+    let host = session.host();
+    let workspace = session.workspace();
+    // A first start brings the server up: the starts below are warm.
+    let warm = terminal("spawn-exec_w0");
+    host.start(&session.launch(&warm, "exec cat"))
+        .expect("start");
+    assert!(matches!(host.server(), ServerSeen::Answers(Some(_))));
+    for ordinal in 1..=5 {
+        let launched = terminal(&format!("spawn-exec_w{ordinal}"));
+        host.start(&session.launch(
+            &launched,
+            "sleep 1; printf 'y. Yes, I trust this folder\\nn. No, exit\\nEnter y/n:\\n\\
+             Enter to confirm \\302\\267 Esc to cancel\\n'; exec cat",
+        ))
+        .expect("start");
+        let first = host
+            .capture_tail(&launched, &workspace, 40)
+            .expect("capture");
+        let joined: String = first.lines().collect();
+        assert!(!first.contains("exec /bin/sh"), "start {ordinal}:\n{first}");
+        assert!(
+            !joined.contains("spawn-launch-"),
+            "start {ordinal}:\n{first}"
+        );
+        assert!(!joined.contains(".sh'"), "start {ordinal}:\n{first}");
+        let reading = read_claude_screen(&first);
+        assert!(
+            !matches!(reading.state, ScreenState::Drafted | ScreenState::Ready),
+            "start {ordinal}: {reading:?}\n{first}"
+        );
+        host.terminate(&launched, &workspace).expect("terminate");
+    }
+    host.terminate(&warm, &workspace).expect("terminate");
+}
+
+/// A program that exits at once: the start neither hangs on the clear nor
+/// fails.
+#[test]
+fn a_start_whose_program_exits_at_once_returns_promptly() {
+    let _serial = exclusive();
+    let Some(session) = Session::new() else {
+        return;
+    };
+    let host = session.host();
+    let workspace = session.workspace();
+    let brief = terminal("spawn-exec_w9");
+    let began = Instant::now();
+    host.start(&session.launch(&brief, "exit 0"))
+        .expect("start");
+    assert!(
+        began.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(
+        runner_within(&host, &brief, &workspace, &Runner::Gone),
+        Runner::Gone
+    );
+    host.terminate(&brief, &workspace).expect("terminate");
+}
