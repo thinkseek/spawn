@@ -10159,6 +10159,250 @@ mod tests {
         assert_eq!(taken(&store).len(), 1);
     }
 
+    /// One `USER_INPUT` line of agy's full transcript holding `text`.
+    fn agy_user_line(text: &str) -> String {
+        format!(
+            "{{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":\"2026-11-25T14:25:59Z\",\"content\":{}}}\n",
+            serde_json::to_string(&format!("<USER_REQUEST>\n{text}\n</USER_REQUEST>"))
+                .expect("json")
+        )
+    }
+
+    fn agy_transcript(conversation: &str) -> String {
+        format!("{AGY_HOME}/brain/{conversation}/.system_generated/logs/transcript_full.jsonl")
+    }
+
+    fn agy_natives(store: &Arc<MemoryStore>) -> Vec<(String, String, Option<String>)> {
+        records(store)
+            .into_iter()
+            .filter_map(|record| match record.event.kind {
+                EventKind::NativeSessionStarted {
+                    engine,
+                    native_session_id,
+                    transcript_path,
+                    ..
+                } => Some((engine, native_session_id, transcript_path)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn submit_agy(store: &Arc<MemoryStore>, key: &str, action: CommandAction) -> CommandId {
+        store
+            .submit(
+                &Principal::new("tester").expect("principal"),
+                &Submission {
+                    agent_id: AgentId::new("agent_agy").expect("agent"),
+                    session_id: SessionId::new("session_agy").expect("session"),
+                    idempotency_key: IdempotencyKey::new(key).expect("key"),
+                    action,
+                },
+            )
+            .expect("submit")
+    }
+
+    /// F5 (O55): inside its filesystem view agy's hooks and the host's
+    /// socket stay masked, so the host reports `agent=agy, session=None`.
+    /// The Bridge then scans `<agy_home>/brain` itself, newest first, and
+    /// binds the one conversation whose full transcript holds the marker
+    /// Spawn typed into this execution, passing over a newer conversation of
+    /// someone else's, one that quotes a marker this session never typed,
+    /// one with no transcript and a name that is not a plain id. Bound, the
+    /// transcript is read from its start (usage, the turn's end), and the
+    /// session resumes on that conversation.
+    #[allow(clippy::too_many_lines)] // one fallback binding, read, then resumed
+    #[test]
+    fn agy_with_no_reported_session_binds_the_brain_conversation_it_typed_into() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let id = submit_agy_start(&store, "hello");
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            agy_config(Some("gemini-3.8-flash-low")),
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        bridge.poll().expect("poll");
+        assert!(agy_natives(&store).is_empty(), "no conversation yet");
+
+        let brain = format!("{AGY_HOME}/brain");
+        let conversation = "11111111-2222-4333-8444-555555555555";
+        let stale = "99999999-0000-4000-8000-000000000000";
+        let forged = "88888888-0000-4000-8000-000000000000";
+        store.append_file(&agy_transcript(stale), &agy_user_line("someone else's prompt"));
+        store.append_file(
+            &agy_transcript(forged),
+            &agy_user_line(&crate::message::marked(
+                "forged",
+                CommandId(id.0 + 50),
+                true,
+            )),
+        );
+        store.append_file(
+            &format!("{AGY_HOME}/evil/.system_generated/logs/transcript_full.jsonl"),
+            &agy_user_line(&crate::message::marked("hello", id, true)),
+        );
+        // Typed into this execution, but its transcript not written yet.
+        host.set_dirs(&brain, &[stale, "..", "../evil", forged, "empty-0", conversation]);
+        bridge.poll().expect("poll");
+        bridge.poll().expect("poll");
+        assert!(agy_natives(&store).is_empty(), "no transcript of ours yet");
+        assert!(
+            host.listed.lock().expect("listed").iter().all(|dir| *dir == brain),
+            "only agy's brain is scanned"
+        );
+        let path = agy_transcript(conversation);
+        store.append_file(&path, &agy_user_line(&crate::message::marked("hello", id, true)));
+        bridge.poll().expect("poll");
+        assert_eq!(
+            agy_natives(&store),
+            vec![(
+                "agy".to_string(),
+                conversation.to_string(),
+                Some(path.clone())
+            )]
+        );
+        store.append_file(
+            &path,
+            "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-11-25T14:26:00Z\",\"model\":\"gemini-3.8-flash-low\",\"input_tokens\":10,\"output_tokens\":2,\"cache_read_tokens\":0,\"content\":\"hi\"}\n",
+        );
+        bridge.poll().expect("poll");
+        bridge.poll().expect("poll");
+        let usage = records(&store)
+            .into_iter()
+            .filter(|record| matches!(record.event.kind, EventKind::ModelUsage { .. }))
+            .count();
+        assert_eq!(usage, 1, "the transcript's usage is ingested");
+        let stopped: Vec<_> = records(&store)
+            .into_iter()
+            .filter(|record| matches!(record.event.kind, EventKind::TurnStopped { .. }))
+            .map(|record| record.event.source_event_id)
+            .collect();
+        assert_eq!(stopped, vec![Some(format!("{conversation}:1:stopped"))]);
+        // Nothing of the decoys was bound or read, and it stays one binding.
+        bridge.poll().expect("poll");
+        assert_eq!(agy_natives(&store).len(), 1);
+
+        // Stopped, the session resumes on the conversation found.
+        let stop = submit_agy(&store, "stop-agy", CommandAction::Stop);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, stop).is_some()
+        });
+        assert_eq!(command_outcome(&store, stop), Some(Outcome::Succeeded));
+        let resume = submit_agy(
+            &store,
+            "resume-agy",
+            CommandAction::Resume {
+                prompt: None,
+                model: None,
+            },
+        );
+        store.set_pane(
+            &TerminalName::for_execution(&ExecutionId::for_command(resume)),
+            &agy_idle(),
+        );
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, resume).is_some()
+        });
+        assert_eq!(command_outcome(&store, resume), Some(Outcome::Succeeded));
+        let arguments = store.launches().pop().expect("launched").arguments.join(" ");
+        assert!(
+            arguments.contains(&format!("--conversation {conversation} --model")),
+            "{arguments}"
+        );
+    }
+
+    /// F5's anti-forgery: a conversation below agy's brain binds only on a
+    /// marker typed into this session for this execution. Conversations
+    /// that hold someone else's prompt, a marker of a command never typed,
+    /// or a marker of an earlier execution's command, bind nothing; nor
+    /// does this execution's own conversation while the host says another
+    /// agent holds the pane.
+    #[test]
+    fn agy_brain_conversations_without_this_executions_marker_never_bind() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let id = submit_agy_start(&store, "hello");
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            agy_config(Some("gemini-3.8-flash-low")),
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        let brain = format!("{AGY_HOME}/brain");
+        let decoys = [
+            ("aaaaaaaa-0000-4000-8000-000000000001", agy_user_line("someone else's prompt")),
+            (
+                "aaaaaaaa-0000-4000-8000-000000000002",
+                agy_user_line(&crate::message::marked("forged", CommandId(id.0 + 50), true)),
+            ),
+            (
+                "aaaaaaaa-0000-4000-8000-000000000003",
+                agy_user_line(&crate::message::marked("earlier", CommandId(id.0 - 1), true)),
+            ),
+            // This execution's marker, but not in a prompt line.
+            (
+                "aaaaaaaa-0000-4000-8000-000000000004",
+                format!(
+                    "{{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"content\":{}}}\n",
+                    serde_json::to_string(&crate::message::marked("quoted", id, true))
+                        .expect("json")
+                ),
+            ),
+        ];
+        for (conversation, line) in &decoys {
+            store.append_file(&agy_transcript(conversation), line);
+        }
+        let names: Vec<&str> = decoys.iter().map(|(name, _)| *name).collect();
+        host.set_dirs(&brain, &names);
+        for _ in 0..4 {
+            bridge.poll().expect("poll");
+        }
+        assert!(agy_natives(&store).is_empty(), "no decoy binds");
+        assert!(!host.listed.lock().expect("listed").is_empty(), "the brain was scanned");
+
+        // Its own conversation, while the host says Claude Code holds the
+        // pane: nothing is known, nothing is scanned or bound.
+        let ours = "bbbbbbbb-0000-4000-8000-000000000000";
+        store.append_file(
+            &agy_transcript(ours),
+            &agy_user_line(&crate::message::marked("hello", id, true)),
+        );
+        let mut all = names.clone();
+        all.push(ours);
+        host.set_dirs(&brain, &all);
+        host.set(agy_reading(Some("claude"), crate::port::AgentStatus::Idle, 2));
+        host.listed.lock().expect("listed").clear();
+        for _ in 0..4 {
+            bridge.poll().expect("poll");
+        }
+        assert!(agy_natives(&store).is_empty(), "a foreign agent's pane binds nothing");
+        assert!(host.listed.lock().expect("listed").is_empty(), "nor is scanned");
+        // The engine's own pane again: its conversation binds.
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 3));
+        bridge.poll().expect("poll");
+        assert_eq!(
+            agy_natives(&store),
+            vec![("agy".to_string(), ours.to_string(), Some(agy_transcript(ours)))]
+        );
+    }
+
     fn screens_with_keys(store: &Arc<MemoryStore>) -> Vec<(ScreenState, Option<String>)> {
         records(store)
             .into_iter()
