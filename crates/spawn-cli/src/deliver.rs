@@ -3181,26 +3181,49 @@ mod tests {
             "{:?}",
             plan[0].action
         );
-        // Already on agy: resumed on it, on the host's label.
+        // Already on agy, on its preset's label: resumed on it, with
+        // SPAWN_AGY_MODEL unset (review 589, must-fix 1 (b)).
         let on_agy = Facts {
             engine: Some("agy".to_string()),
+            model_label: Some("gemini-3.8-flash-low".to_string()),
             ..worker(false, false)
         };
-        let mut hosted = engines.clone();
-        hosted.ready.get_mut("agy").expect("agy").default_label =
-            Some("gemini-3.8-flash-low".to_string());
-        let resumed = Work {
-            engines: hosted,
-            ..work(vec![agy_task(4, "ephemeral", "gemini-3.8-flash-low")])
-        };
-        let plan = orders(&resumed, std::slice::from_ref(&on_agy));
+        let plan = orders(&planned, std::slice::from_ref(&on_agy));
         assert!(
             matches!(plan[0].action, CommandAction::Resume { .. }),
             "{:?}",
             plan[0].action
         );
-        // A resume whose host label agy does not list is no resume either.
-        assert!(orders(&planned, &[on_agy]).is_empty());
+        assert!(unavailable(&planned, std::slice::from_ref(&on_agy)).is_empty());
+        // A label the listing no longer names is no resume: escalated.
+        let gone = Work {
+            engines: agy_ready(&["gemini-3.8-pro"]),
+            ..work(vec![agy_task(4, "ephemeral", "gemini-3.8-flash-low")])
+        };
+        assert!(orders(&gone, std::slice::from_ref(&on_agy)).is_empty());
+        assert_eq!(unavailable(&gone, std::slice::from_ref(&on_agy)).len(), 1);
+        // Ran on agy on another label (or on the host's, recorded none): an
+        // ephemeral worker is stopped and started afresh on its preset's,
+        // never resumed on a model its preset did not name.
+        for recorded in [Some("gemini-3.8-pro"), None] {
+            let other = Facts {
+                engine: Some("agy".to_string()),
+                model_label: recorded.map(str::to_string),
+                ..worker(true, true)
+            };
+            let plan = orders(&planned, &[other.clone()]);
+            assert_eq!(plan[0].key, "switch-engine-4-0", "{recorded:?}");
+            assert_eq!(plan[0].action, CommandAction::Stop);
+            let stopped = Facts {
+                live: false,
+                ..other
+            };
+            let plan = orders(&planned, &[stopped]);
+            let CommandAction::Start { model_label, .. } = &plan[0].action else {
+                panic!("{recorded:?}: a start, not {:?}", plan[0].action);
+            };
+            assert_eq!(model_label.as_deref(), Some("gemini-3.8-flash-low"));
+        }
         // A resident on Claude Code keeps it: the task is typed in.
         let resident = Work {
             engines,
@@ -3213,6 +3236,52 @@ mod tests {
             plan[0].action
         );
         assert!(unavailable(&resident, &[worker(true, true)]).is_empty());
+    }
+
+    /// Review 589, must-fix 1 (a): a revision of an agy task whose preset
+    /// label differs from SPAWN_AGY_MODEL resumes on the preset's label
+    /// (the one its worker was launched on), even where the host's own
+    /// label is not one `agy models` lists.
+    #[test]
+    fn a_revision_of_an_agy_task_resumes_on_its_presets_label_not_the_hosts() {
+        let mut engines = agy_ready(&["gemini-3.8-pro"]);
+        engines.ready.get_mut("agy").expect("agy").default_label =
+            Some("gemini-3.8-flash-low".to_string());
+        let revise = TaskRow {
+            state: TaskState::Revise,
+            revisions: 1,
+            ..agy_task(4, "ephemeral", "gemini-3.8-pro")
+        };
+        let planned = Work {
+            engines,
+            ..work(vec![revise])
+        };
+        let ran = Facts {
+            engine: Some("agy".to_string()),
+            model_label: Some("gemini-3.8-pro".to_string()),
+            ..worker(false, false)
+        };
+        let plan = orders(&planned, std::slice::from_ref(&ran));
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].key, "deliver-4-1");
+        assert!(
+            matches!(plan[0].action, CommandAction::Resume { .. }),
+            "{:?}",
+            plan[0].action
+        );
+        assert!(unavailable(&planned, &[ran]).is_empty());
+        assert_eq!(
+            super::delivery_runs(
+                &planned.tasks[0],
+                Some(&Facts {
+                    engine: Some("agy".to_string()),
+                    model_label: Some("gemini-3.8-pro".to_string()),
+                    ..worker(false, false)
+                }),
+                &planned.engines
+            ),
+            super::Runs::On("agy".to_string(), Some("gemini-3.8-pro".to_string()))
+        );
     }
 
     #[test]
