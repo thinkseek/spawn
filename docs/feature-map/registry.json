@@ -3877,7 +3877,7 @@
       "kind": "capability",
       "parent": "t559u-feature-map-initiative",
       "summary": "Checks the registry's depends_on against the real code graph: file edges projected onto many-to-many owner sets, declared reachability, and findings for under-declared, implied-only, ghost, inverted and unverifiable dependencies, static cycles, kernel and entrypoint roles, and waivers.",
-      "status_note": "PR 1 (pure model and findings in spawn-core::feature_deps), PR 2 (spawn-codegraph Rust extractor and spawn features graph) and PR 3 (TypeScript / JavaScript extractor: ecma.rs lexer, package.json and tsconfig.json manifests, relative / paths / workspace / #imports resolution with barrel following) of the issue #100 design; check integration and schema 2 follow.",
+      "status_note": "PR 1 (pure model and findings in spawn-core::feature_deps), PR 2 (spawn-codegraph Rust extractor and spawn features graph), PR 3 (TypeScript / JavaScript extractor: ecma.rs lexer, package.json and tsconfig.json manifests, relative / paths / workspace / #imports resolution with barrel following) and PR 4 (Python extractor: python.rs iterative lexer, pyproject.toml manifests, relative / unit / script-sibling / __init__.py barrel resolution, TYPE_CHECKING & importlib.import_module + N1 export_targets cache and N2 Arc<TsPaths> sharing) of the issue #100 design; check integration and schema 2 follow.",
       "files": [
         "Cargo.lock",
         "Cargo.toml",
@@ -3887,10 +3887,12 @@
         "crates/spawn-codegraph/src/ecma.rs",
         "crates/spawn-codegraph/src/lib.rs",
         "crates/spawn-codegraph/src/manifest.rs",
+        "crates/spawn-codegraph/src/python.rs",
         "crates/spawn-codegraph/src/resolve.rs",
         "crates/spawn-codegraph/src/rust.rs",
         "crates/spawn-codegraph/tests/ecma_graph.rs",
         "crates/spawn-codegraph/tests/fixtures/mod.rs",
+        "crates/spawn-codegraph/tests/python_graph.rs",
         "crates/spawn-codegraph/tests/rust_graph.rs",
         "crates/spawn-core/src/feature_deps.rs"
       ],
@@ -3908,6 +3910,7 @@
         "tests": [
           "crates/spawn-cli/tests/features_graph.rs",
           "crates/spawn-codegraph/tests/ecma_graph.rs",
+          "crates/spawn-codegraph/tests/python_graph.rs",
           "crates/spawn-codegraph/tests/rust_graph.rs"
         ],
         "deploys": [],

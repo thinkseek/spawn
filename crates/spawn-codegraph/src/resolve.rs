@@ -9,7 +9,10 @@
 //! is given and never probes a disk, so it cannot read an excluded or
 //! secret file and is testable from string tables.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::rc::Rc;
+use std::sync::Arc;
 
 use spawn_core::feature_deps::{
     CodeGraph, Diagnostic, DiagnosticCode, EdgeKind, FileClass, FileEdge, FileInfo, Language,
@@ -179,13 +182,14 @@ struct Graph<'a> {
 
 /// Build the code graph of every source and manifest in `sources` (path
 /// to text): Rust and `Cargo.toml`, JavaScript / TypeScript and
-/// `package.json` / `tsconfig.json`. References resolve only to paths in
-/// `inventory`, the in-scope file set.
+/// `package.json` / `tsconfig.json`, and Python and `pyproject.toml`.
+/// References resolve only to paths in `inventory`, the in-scope file set.
 pub fn build(inventory: &BTreeSet<String>, sources: &BTreeMap<String, String>) -> CodeGraph {
-    merge(
+    let rust_ecma = merge(
         build_rust(inventory, sources),
         build_ecma(inventory, sources),
-    )
+    );
+    merge(rust_ecma, build_python(inventory, sources))
 }
 
 /// Build the code graph of the Rust sources and `Cargo.toml` manifests in
@@ -1038,6 +1042,9 @@ const EXPORT_CONDITIONS: [&str; 4] = ["import", "default", "require", "types"];
 /// Nested condition objects are read at most this deep.
 const MAX_CONDITION_DEPTH: usize = 16;
 
+/// Maximum distinct export/import targets collected per key.
+const MAX_EXPORT_TARGETS: usize = 64;
+
 /// The TypeScript files a `.js`-family specifier may stand for.
 fn ts_counterparts(path: &str) -> Vec<String> {
     let pairs: [(&str, &[&str]); 4] = [
@@ -1076,7 +1083,7 @@ struct NpmManifest {
 #[derive(Debug, Clone, Default)]
 struct TsPaths {
     base_url: Option<String>,
-    paths: Vec<(String, Vec<String>)>,
+    paths: Arc<[manifest::TsPathEntry]>,
     /// The directory `paths` targets are relative to without a `baseUrl`.
     paths_dir: String,
 }
@@ -1102,6 +1109,9 @@ enum Follow {
     TooDeep,
 }
 
+type ExportCacheKey = (String, bool, String);
+type ExportCache = RefCell<BTreeMap<ExportCacheKey, Rc<[String]>>>;
+
 struct EcmaGraph<'a> {
     inventory: &'a BTreeSet<String>,
     facts: BTreeMap<String, crate::ecma::EcmaFacts>,
@@ -1111,7 +1121,9 @@ struct EcmaGraph<'a> {
     by_name: BTreeMap<String, String>,
     /// Directory of each `tsconfig.json` / `jsconfig.json` to its merged
     /// paths.
-    tsconfigs: BTreeMap<String, TsPaths>,
+    tsconfigs: BTreeMap<String, Arc<TsPaths>>,
+    /// Per `(package_root, is_imports, key)` memoized `export_targets`.
+    export_cache: ExportCache,
     edges: BTreeSet<FileEdge>,
     diagnostics: Vec<Diagnostic>,
     external_imports: usize,
@@ -1127,6 +1139,7 @@ pub fn build_ecma(inventory: &BTreeSet<String>, sources: &BTreeMap<String, Strin
         packages: BTreeMap::new(),
         by_name: BTreeMap::new(),
         tsconfigs: BTreeMap::new(),
+        export_cache: RefCell::new(BTreeMap::new()),
         edges: BTreeSet::new(),
         diagnostics: Vec::new(),
         external_imports: 0,
@@ -1254,17 +1267,17 @@ impl EcmaGraph<'_> {
         path: &str,
         depth: usize,
         chain: &mut Vec<String>,
-        memo: &mut BTreeMap<String, TsPaths>,
-    ) -> TsPaths {
+        memo: &mut BTreeMap<String, Arc<TsPaths>>,
+    ) -> Arc<TsPaths> {
         if let Some(done) = memo.get(path) {
-            return done.clone();
+            return Arc::clone(done);
         }
         let mut merged = TsPaths {
             paths_dir: dir_of(path).to_string(),
             ..TsPaths::default()
         };
         let Some(config) = configs.get(path) else {
-            return merged;
+            return Arc::new(merged);
         };
         chain.push(path.to_string());
         let mut seen = BTreeSet::new();
@@ -1314,11 +1327,11 @@ impl EcmaGraph<'_> {
             }
             let parent = self.merge_tsconfig(configs, &target, depth + 1, chain, memo);
             if parent.base_url.is_some() {
-                merged.base_url = parent.base_url;
+                merged.base_url.clone_from(&parent.base_url);
             }
             if !parent.paths.is_empty() {
-                merged.paths = parent.paths;
-                merged.paths_dir = parent.paths_dir;
+                merged.paths = Arc::clone(&parent.paths);
+                merged.paths_dir.clone_from(&parent.paths_dir);
             }
         }
         chain.pop();
@@ -1326,11 +1339,12 @@ impl EcmaGraph<'_> {
             merged.base_url = normalize(&join(dir_of(path), base_url));
         }
         if let Some(paths) = &config.paths {
-            merged.paths.clone_from(paths);
+            merged.paths = Arc::clone(paths);
             merged.paths_dir = dir_of(path).to_string();
         }
-        memo.insert(path.to_string(), merged.clone());
-        merged
+        let shared = Arc::new(merged);
+        memo.insert(path.to_string(), Arc::clone(&shared));
+        shared
     }
 
     /// The nearest directory at or above `dir` that has an entry in `map`.
@@ -1395,6 +1409,24 @@ impl EcmaGraph<'_> {
             .or_else(|| self.index(&path))
     }
 
+    fn cached_export_targets(
+        &self,
+        root: &str,
+        is_imports: bool,
+        map: &manifest::Json,
+        key: &str,
+    ) -> Rc<[String]> {
+        let cache_key = (root.to_string(), is_imports, key.to_string());
+        if let Some(cached) = self.export_cache.borrow().get(&cache_key) {
+            return Rc::clone(cached);
+        }
+        let targets: Rc<[String]> = Rc::from(export_targets(map, key));
+        self.export_cache
+            .borrow_mut()
+            .insert(cache_key, Rc::clone(&targets));
+        targets
+    }
+
     /// The file package `root` gives for `subpath` (`None`: the package
     /// itself). A target that is not in scope (a `dist/` build) falls back
     /// to `<root>/src/index.*`, then to the package's `package.json`, both
@@ -1404,7 +1436,7 @@ impl EcmaGraph<'_> {
         let found = if let Some(exports) = &package.exports {
             let key = subpath.map_or_else(|| ".".to_string(), |sub| format!("./{sub}"));
             // Every condition's target in order: the first in scope wins.
-            export_targets(exports, &key)
+            self.cached_export_targets(root, false, exports, &key)
                 .iter()
                 .find_map(|target| self.in_package(root, target))
                 .or_else(|| subpath.and_then(|sub| self.in_package(root, sub)))
@@ -1447,10 +1479,10 @@ impl EcmaGraph<'_> {
                 .manifest
                 .imports
                 .as_ref()
-                .map(|imports| export_targets(imports, spec))
+                .map(|imports| self.cached_export_targets(root, true, imports, spec))
                 .unwrap_or_default();
             // The first target that is in scope, in condition order.
-            for target in &targets {
+            for target in targets.iter() {
                 if target.starts_with("./") {
                     if let Some(file) = self.in_package(root, target) {
                         return Target::File(file, Precision::Module);
@@ -1472,8 +1504,8 @@ impl EcmaGraph<'_> {
     fn bare(&self, dir: &str, spec: &str) -> Target {
         let mut matched = false;
         if let Some((_, config)) = Self::nearest(&self.tsconfigs, dir) {
-            let mut best: Option<(usize, &Vec<String>, &str)> = None;
-            for (pattern, targets) in &config.paths {
+            let mut best: Option<(usize, &[String], &str)> = None;
+            for (pattern, targets) in config.paths.iter() {
                 let candidate = if pattern == spec {
                     Some((usize::MAX, ""))
                 } else {
@@ -1812,21 +1844,32 @@ fn export_targets(map: &manifest::Json, key: &str) -> Vec<String> {
 /// value is visited once.
 fn conditions(value: &manifest::Json, depth: usize, out: &mut Vec<String>) {
     use manifest::Json;
-    if depth > MAX_CONDITION_DEPTH {
+    if depth > MAX_CONDITION_DEPTH || out.len() >= MAX_EXPORT_TARGETS {
         return;
     }
     match value {
         Json::Str(target) if !out.contains(target) => out.push(target.clone()),
-        Json::Arr(items) => items
-            .iter()
-            .for_each(|item| conditions(item, depth + 1, out)),
+        Json::Arr(items) => {
+            for item in items {
+                if out.len() >= MAX_EXPORT_TARGETS {
+                    break;
+                }
+                conditions(item, depth + 1, out);
+            }
+        }
         Json::Obj(entries) => {
             for condition in EXPORT_CONDITIONS {
+                if out.len() >= MAX_EXPORT_TARGETS {
+                    break;
+                }
                 if let Some(v) = value.get(condition) {
                     conditions(v, depth + 1, out);
                 }
             }
             for (key, v) in entries {
+                if out.len() >= MAX_EXPORT_TARGETS {
+                    break;
+                }
                 if !EXPORT_CONDITIONS.contains(&key.as_str()) {
                     conditions(v, depth + 1, out);
                 }
@@ -1854,19 +1897,852 @@ fn export_leaves(value: &manifest::Json, depth: usize, out: &mut Vec<String>) {
     }
 }
 
-/// The Rust and the JavaScript / TypeScript graphs as one.
-fn merge(mut rust: CodeGraph, ecma: CodeGraph) -> CodeGraph {
-    rust.units.extend(ecma.units);
-    rust.units
+// ---------------------------------------------------------------------
+// Python resolution: `pyproject.toml` units (`src/` / setuptools /
+// poetry / hatch source roots), relative and absolute imports, standalone
+// sibling scripts without `__init__.py`, `__init__.py` barrel re-exports,
+// `TYPE_CHECKING`, and constant `importlib.import_module(...)`.
+
+struct PyUnit {
+    id: Option<String>,
+    root: String,
+    manifest: manifest::PyProjectManifest,
+    source_roots: Vec<String>,
+    package_dirs: Vec<(String, String)>,
+}
+
+struct PythonGraph<'a> {
+    inventory: &'a BTreeSet<String>,
+    facts: BTreeMap<String, crate::python::PyFacts>,
+    units: BTreeMap<String, PyUnit>,
+    by_name: BTreeMap<String, String>,
+    pkg_dirs: BTreeSet<String>,
+    known_top_modules: BTreeSet<String>,
+    edges: BTreeSet<FileEdge>,
+    diagnostics: Vec<Diagnostic>,
+    external_imports: usize,
+}
+
+enum PyModuleTarget {
+    File(String),
+    OutOfRoot,
+    Missing,
+}
+
+/// Build the code graph of the Python sources (`.py` / `.pyi`) and
+/// `pyproject.toml` manifests in `sources`.
+pub fn build_python(inventory: &BTreeSet<String>, sources: &BTreeMap<String, String>) -> CodeGraph {
+    let mut pkg_dirs = BTreeSet::new();
+    for path in inventory {
+        if crate::python::is_package_init(path) {
+            pkg_dirs.insert(dir_of(path).to_string());
+        }
+    }
+
+    let mut graph = PythonGraph {
+        inventory,
+        facts: BTreeMap::new(),
+        units: BTreeMap::new(),
+        by_name: BTreeMap::new(),
+        pkg_dirs,
+        known_top_modules: BTreeSet::new(),
+        edges: BTreeSet::new(),
+        diagnostics: Vec::new(),
+        external_imports: 0,
+    };
+
+    graph.read_manifests(sources);
+    graph.collect_known_top_modules();
+
+    for (path, text) in sources
+        .iter()
+        .filter(|(path, _)| crate::python::is_python_source(path))
+    {
+        let parsed = std::panic::catch_unwind(|| crate::python::parse(text))
+            .unwrap_or_else(|_| Err("the lexer panicked on this file".to_string()));
+        match parsed {
+            Ok(facts) => {
+                graph.facts.insert(path.clone(), facts);
+            }
+            Err(error) => {
+                graph
+                    .diagnostics
+                    .push(diagnostic(DiagnosticCode::Unparsed, path, None, error));
+            }
+        }
+    }
+
+    graph.resolve_all();
+    graph.finish(sources)
+}
+
+impl PythonGraph<'_> {
+    fn read_manifests(&mut self, sources: &BTreeMap<String, String>) {
+        let mut names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (path, text) in sources
+            .iter()
+            .filter(|(path, _)| crate::is_pyproject_toml(path))
+        {
+            match manifest::read_pyproject(text) {
+                Ok(manifest) => {
+                    let root = dir_of(path).to_string();
+                    if let Some(name) = &manifest.name {
+                        names.entry(name.clone()).or_default().push(root.clone());
+                    }
+                    let mut source_roots = Vec::new();
+                    let push_root = |roots: &mut Vec<String>, rel: String| {
+                        if !roots.contains(&rel) {
+                            roots.push(rel);
+                        }
+                    };
+                    for explicit_root in &manifest.source_roots {
+                        if let Some(norm) = normalize(&join(&root, explicit_root)) {
+                            push_root(&mut source_roots, norm);
+                        }
+                    }
+                    if let Some(src_root) = normalize(&join(&root, "src")) {
+                        push_root(&mut source_roots, src_root);
+                    }
+                    push_root(&mut source_roots, root.clone());
+
+                    let package_dirs = manifest
+                        .package_dirs
+                        .iter()
+                        .filter_map(|(pkg, rel_dir)| {
+                            normalize(&join(&root, rel_dir)).map(|norm| (pkg.clone(), norm))
+                        })
+                        .collect();
+
+                    self.units.insert(
+                        root.clone(),
+                        PyUnit {
+                            id: None,
+                            root,
+                            manifest,
+                            source_roots,
+                            package_dirs,
+                        },
+                    );
+                }
+                Err(error) => self.diagnostics.push(diagnostic(
+                    DiagnosticCode::ManifestUnsupported,
+                    path,
+                    (error.line > 0).then_some(error.line),
+                    format!("not read, no unit made: {}", error.message),
+                )),
+            }
+        }
+
+        for (name, roots) in names {
+            if let [root] = roots.as_slice() {
+                if let Some(unit) = self.units.get_mut(root) {
+                    unit.id = Some(format!("py:{name}"));
+                }
+                self.by_name.insert(name, root.clone());
+            } else {
+                for root in roots {
+                    self.diagnostics.push(diagnostic(
+                        DiagnosticCode::ManifestUnsupported,
+                        &join(&root, "pyproject.toml"),
+                        None,
+                        format!(
+                            "package name {name} is not unique in the repository: no unit made"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn collect_known_top_modules(&mut self) {
+        let mut roots: BTreeSet<&str> = BTreeSet::from([""]);
+        for unit in self.units.values() {
+            for root in &unit.source_roots {
+                roots.insert(root.as_str());
+            }
+            for (pkg, _) in &unit.package_dirs {
+                if let Some(first) = pkg.split('.').next()
+                    && !first.is_empty()
+                {
+                    self.known_top_modules.insert(first.to_string());
+                }
+            }
+        }
+
+        for path in self.inventory {
+            if !crate::python::is_python_source(path) {
+                continue;
+            }
+            for root in &roots {
+                let rel = if root.is_empty() {
+                    Some(path.as_str())
+                } else {
+                    path.strip_prefix(&format!("{root}/"))
+                };
+                let Some(rel) = rel else {
+                    continue;
+                };
+                if let Some((first, _)) = rel.split_once('/') {
+                    // Only count repo-root subdirs if they are packages (`__init__`) or belong
+                    // to a non-empty `pyproject` source root (avoiding false positives on arbitrary dirs).
+                    if !root.is_empty() || self.pkg_dirs.contains(first) {
+                        self.known_top_modules.insert(first.to_string());
+                    }
+                } else if !root.is_empty() || crate::python::is_package_init(rel) {
+                    let stem = rel
+                        .strip_suffix(".py")
+                        .or_else(|| rel.strip_suffix(".pyi"))
+                        .unwrap_or(rel);
+                    if !stem.is_empty() && stem != "__init__" {
+                        self.known_top_modules.insert(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    fn nearest_unit(&self, dir: &str) -> Option<(&str, &PyUnit)> {
+        let mut dir = dir;
+        loop {
+            if let Some((key, value)) = self.units.get_key_value(dir) {
+                return Some((key.as_str(), value));
+            }
+            if dir.is_empty() {
+                return None;
+            }
+            dir = dir_of(dir);
+        }
+    }
+
+    fn lookup_in_dir(&self, base: &str, segments: &[&str]) -> Option<String> {
+        if segments.is_empty() || segments.iter().any(|s| s.is_empty()) {
+            return None;
+        }
+        let path_base = join(base, &segments.join("/"));
+        [
+            format!("{path_base}.py"),
+            format!("{path_base}.pyi"),
+            format!("{path_base}/__init__.py"),
+            format!("{path_base}/__init__.pyi"),
+        ]
+        .into_iter()
+        .find(|candidate| self.inventory.contains(candidate))
+    }
+
+    fn lookup_in_unit(&self, unit: &PyUnit, segments: &[&str]) -> Option<String> {
+        for (pkg_name, dir_path) in &unit.package_dirs {
+            let pkg_parts: Vec<&str> = pkg_name.split('.').collect();
+            if segments.starts_with(&pkg_parts) {
+                let rem = &segments[pkg_parts.len()..];
+                let hit = if rem.is_empty() {
+                    [
+                        format!("{dir_path}/__init__.py"),
+                        format!("{dir_path}/__init__.pyi"),
+                        format!("{dir_path}.py"),
+                        format!("{dir_path}.pyi"),
+                    ]
+                    .into_iter()
+                    .find(|candidate| self.inventory.contains(candidate))
+                } else {
+                    self.lookup_in_dir(dir_path, rem)
+                };
+                if hit.is_some() {
+                    return hit;
+                }
+            }
+        }
+        unit.source_roots
+            .iter()
+            .find_map(|root| self.lookup_in_dir(root, segments))
+    }
+
+    fn lookup_absolute(&self, from: &str, segments: &[&str]) -> Option<String> {
+        let from_dir = dir_of(from);
+        let owner = self.nearest_unit(from_dir);
+        if let Some((_, unit)) = owner
+            && let Some(hit) = self.lookup_in_unit(unit, segments)
+        {
+            return Some(hit);
+        }
+        // Standalone scripts (directory without `__init__.py` / `__init__.pyi`)
+        // commonly import sibling scripts on `sys.path[0]`.
+        if !self.pkg_dirs.contains(from_dir)
+            && let Some(hit) = self.lookup_in_dir(from_dir, segments)
+        {
+            return Some(hit);
+        }
+        for (root, unit) in &self.units {
+            if owner.is_some_and(|(owner_root, _)| owner_root == root) {
+                continue;
+            }
+            if let Some(hit) = self.lookup_in_unit(unit, segments) {
+                return Some(hit);
+            }
+        }
+        self.lookup_in_dir("", segments)
+    }
+
+    fn resolve_relative_base(&self, from: &str, imp: &crate::python::PyImport) -> Option<String> {
+        let from_dir = dir_of(from);
+        let start_dir = if let Some(pkg) = &imp.package_arg {
+            let segs: Vec<&str> = pkg.split('.').collect();
+            let resolved = self.lookup_absolute(from, &segs)?;
+            if crate::python::is_package_init(&resolved) {
+                dir_of(&resolved).to_string()
+            } else {
+                // Non-__init__ file cannot act as a package for relative import.
+                return None;
+            }
+        } else {
+            from_dir.to_string()
+        };
+
+        let unit_root = self.nearest_unit(from_dir).map_or("", |(root, _)| root);
+        let mut dir = start_dir;
+        for _ in 1..imp.level {
+            if dir.is_empty() || dir == unit_root {
+                return None;
+            }
+            dir = dir_of(&dir).to_string();
+        }
+        Some(dir)
+    }
+
+    fn resolve_module_for_import(
+        &self,
+        from: &str,
+        imp: &crate::python::PyImport,
+    ) -> PyModuleTarget {
+        if imp.level == 0 {
+            let segs: Vec<&str> = imp.module.split('.').collect();
+            return match self.lookup_absolute(from, &segs) {
+                Some(file) => PyModuleTarget::File(file),
+                None => PyModuleTarget::Missing,
+            };
+        }
+        let Some(base) = self.resolve_relative_base(from, imp) else {
+            return PyModuleTarget::OutOfRoot;
+        };
+        if imp.module.is_empty() {
+            return match [join(&base, "__init__.py"), join(&base, "__init__.pyi")]
+                .into_iter()
+                .find(|candidate| self.inventory.contains(candidate))
+            {
+                Some(init_file) => PyModuleTarget::File(init_file),
+                None => PyModuleTarget::Missing,
+            };
+        }
+        let segs: Vec<&str> = imp.module.split('.').collect();
+        match self.lookup_in_dir(&base, &segs) {
+            Some(file) => PyModuleTarget::File(file),
+            None => PyModuleTarget::Missing,
+        }
+    }
+
+    fn follow_py_named(
+        &self,
+        file: &str,
+        imp: &crate::python::PyImport,
+        explicit_all: &BTreeSet<String>,
+        item: &crate::python::PyImported,
+        depth: u8,
+        seen: &mut BTreeSet<(String, String)>,
+    ) -> Option<Follow> {
+        let crate::python::PyImported::Named {
+            orig,
+            alias,
+            explicit_alias,
+        } = item
+        else {
+            return None;
+        };
+        let is_init = crate::python::is_package_init(file);
+        let allowed_reexport = (*explicit_alias && orig == alias)
+            || explicit_all.contains(alias)
+            || (is_init && (explicit_all.is_empty() || explicit_all.contains(alias)));
+        if !allowed_reexport {
+            return None;
+        }
+        if depth >= MAX_REEXPORT_DEPTH {
+            return Some(Follow::TooDeep);
+        }
+        // Handle `from . import sub` when target directory has no `__init__.py`
+        // or directly names a sibling submodule in the same package directory.
+        if imp.level > 0
+            && imp.module.is_empty()
+            && let Some(base) = self.resolve_relative_base(file, imp)
+        {
+            let pkg_init = [join(&base, "__init__.py"), join(&base, "__init__.pyi")]
+                .into_iter()
+                .find(|c| self.inventory.contains(c));
+            if let Some(ref init_file) = pkg_init
+                && init_file != file
+            {
+                match self.follow_py(init_file, orig, depth + 1, seen) {
+                    found @ Follow::Found(..) => return Some(found),
+                    Follow::TooDeep => return Some(Follow::TooDeep),
+                    Follow::NotFound => {}
+                }
+            }
+            if let Some(sub_file) = self.lookup_in_dir(&base, &[orig]) {
+                return Some(Follow::Found(sub_file, true));
+            }
+            if let Some(init_file) = pkg_init
+                && init_file != file
+            {
+                return Some(Follow::Found(init_file, false));
+            }
+            return None;
+        }
+        let PyModuleTarget::File(next_file) = self.resolve_module_for_import(file, imp) else {
+            return Some(Follow::NotFound);
+        };
+        match self.follow_py(&next_file, orig, depth + 1, seen) {
+            found @ Follow::Found(_, true) => Some(found),
+            Follow::TooDeep => Some(Follow::TooDeep),
+            Follow::NotFound | Follow::Found(_, false) => {
+                if crate::python::is_package_init(&next_file)
+                    && let Some(sub_file) = self.lookup_in_dir(dir_of(&next_file), &[orig])
+                {
+                    return Some(Follow::Found(sub_file, true));
+                }
+                Some(Follow::Found(next_file, false))
+            }
+        }
+    }
+
+    fn follow_py(
+        &self,
+        file: &str,
+        name: &str,
+        depth: u8,
+        seen: &mut BTreeSet<(String, String)>,
+    ) -> Follow {
+        let Some(facts) = self.facts.get(file) else {
+            return Follow::NotFound;
+        };
+        if !seen.insert((file.to_string(), name.to_string())) {
+            return Follow::NotFound;
+        }
+        let is_init = crate::python::is_package_init(file);
+        let mut too_deep = false;
+
+        for imp in &facts.imports {
+            if !imp.top_level || imp.type_checking {
+                continue;
+            }
+            for item in &imp.names {
+                match item {
+                    crate::python::PyImported::Named { alias, .. } if alias == name => {
+                        if let Some(res) =
+                            self.follow_py_named(file, imp, &facts.explicit_all, item, depth, seen)
+                        {
+                            return res;
+                        }
+                    }
+                    crate::python::PyImported::Star => {
+                        let allowed_star = is_init
+                            && (facts.explicit_all.is_empty() || facts.explicit_all.contains(name))
+                            || facts.explicit_all.contains(name);
+                        if !allowed_star {
+                            continue;
+                        }
+                        if depth >= MAX_REEXPORT_DEPTH {
+                            too_deep = true;
+                            continue;
+                        }
+                        let PyModuleTarget::File(next_file) =
+                            self.resolve_module_for_import(file, imp)
+                        else {
+                            continue;
+                        };
+                        match self.follow_py(&next_file, name, depth + 1, seen) {
+                            found @ Follow::Found(_, true) => return found,
+                            Follow::TooDeep => too_deep = true,
+                            _ => {}
+                        }
+                    }
+                    crate::python::PyImported::Named { .. } => {}
+                }
+            }
+        }
+
+        if facts.exports.contains(name) {
+            return Follow::Found(file.to_string(), true);
+        }
+        if too_deep {
+            Follow::TooDeep
+        } else {
+            Follow::NotFound
+        }
+    }
+
+    fn edge(
+        &mut self,
+        from: &str,
+        to: String,
+        kind: EdgeKind,
+        line: u32,
+        via: Option<String>,
+        precision: Precision,
+    ) {
+        if to == from {
+            return;
+        }
+        self.edges.insert(FileEdge {
+            from: from.to_string(),
+            to,
+            kind,
+            scope: crate::python::scope_of(from),
+            line,
+            via,
+            precision,
+        });
+    }
+
+    fn resolve_missing_import(
+        &mut self,
+        from: &str,
+        caller_all: &BTreeSet<String>,
+        imp: &crate::python::PyImport,
+    ) {
+        // Relative `from . import a, b` in a directory without `__init__.py`,
+        // or `from ns import sub` into a namespace package without `__init__.py`.
+        if matches!(imp.kind, EdgeKind::PyFrom | EdgeKind::ImportType)
+            && self.try_resolve_namespace_from(from, caller_all, imp) == Some(true)
+        {
+            return;
+        }
+        if imp.level > 0 {
+            self.diagnostics.push(diagnostic(
+                DiagnosticCode::Unresolved,
+                from,
+                Some(imp.line),
+                format!(
+                    "relative import '.{}' names no in-scope file",
+                    ".".repeat(imp.level - 1) + &imp.module
+                ),
+            ));
+        } else {
+            let first_seg = imp.module.split('.').next().unwrap_or("");
+            let first_in_repo = !first_seg.is_empty() && self.known_top_modules.contains(first_seg);
+            if first_in_repo {
+                self.diagnostics.push(diagnostic(
+                    DiagnosticCode::Unresolved,
+                    from,
+                    Some(imp.line),
+                    format!("{} names no in-scope file", imp.module),
+                ));
+            } else {
+                self.external_imports += 1;
+            }
+        }
+    }
+
+    fn resolve_from_names(
+        &mut self,
+        from: &str,
+        caller_all: &BTreeSet<String>,
+        target: &str,
+        imp: &crate::python::PyImport,
+    ) {
+        let from_init = crate::python::is_package_init(from);
+        let is_structural_star = from_init && imp.top_level && !imp.type_checking;
+        for item in &imp.names {
+            match item {
+                crate::python::PyImported::Star => {
+                    let kind = if is_structural_star {
+                        EdgeKind::Reexport
+                    } else {
+                        imp.kind
+                    };
+                    self.edge(
+                        from,
+                        target.to_string(),
+                        kind,
+                        imp.line,
+                        None,
+                        Precision::Module,
+                    );
+                }
+                crate::python::PyImported::Named {
+                    orig,
+                    alias,
+                    explicit_alias,
+                } => {
+                    let kind = if from_init
+                        && imp.top_level
+                        && !imp.type_checking
+                        && ((*explicit_alias && orig == alias) || caller_all.contains(alias))
+                    {
+                        EdgeKind::Reexport
+                    } else {
+                        imp.kind
+                    };
+                    match self.follow_py(target, orig, 0, &mut BTreeSet::new()) {
+                        Follow::Found(file, is_item) => {
+                            let via = (file != target).then(|| target.to_string());
+                            let precision = if is_item {
+                                Precision::Item
+                            } else {
+                                Precision::Module
+                            };
+                            self.edge(from, file, kind, imp.line, via, precision);
+                        }
+                        Follow::TooDeep => self.diagnostics.push(diagnostic(
+                            DiagnosticCode::ReexportTooDeep,
+                            from,
+                            Some(imp.line),
+                            format!(
+                                "{orig} from {}: re-exports past {MAX_REEXPORT_DEPTH} hops, no edge claimed",
+                                imp.module
+                            ),
+                        )),
+                        Follow::NotFound => {
+                            if crate::python::is_package_init(target)
+                                && let Some(sub_file) = self.lookup_in_dir(dir_of(target), &[orig])
+                            {
+                                self.edge(from, sub_file, kind, imp.line, None, Precision::Module);
+                            } else {
+                                self.edge(
+                                    from,
+                                    target.to_string(),
+                                    kind,
+                                    imp.line,
+                                    None,
+                                    Precision::Module,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn resolve_all(&mut self) {
+        let facts = std::mem::take(&mut self.facts);
+        for (from, file_facts) in &facts {
+            for line in &file_facts.dynamic_unresolved {
+                self.diagnostics.push(diagnostic(
+                    DiagnosticCode::DynamicUnresolved,
+                    from,
+                    Some(*line),
+                    "importlib.import_module of a non-literal or unanchored relative name: \
+                     counted, not guessed"
+                        .to_string(),
+                ));
+            }
+        }
+        self.facts = facts;
+
+        let pending: Vec<(String, BTreeSet<String>, crate::python::PyImport)> =
+            self.facts
+                .iter()
+                .flat_map(|(from, file_facts)| {
+                    file_facts.imports.iter().map(move |imp| {
+                        (from.clone(), file_facts.explicit_all.clone(), imp.clone())
+                    })
+                })
+                .collect();
+
+        for (from, caller_all, imp) in pending {
+            let target = match self.resolve_module_for_import(&from, &imp) {
+                PyModuleTarget::File(to) => to,
+                PyModuleTarget::OutOfRoot => {
+                    self.diagnostics.push(diagnostic(
+                        DiagnosticCode::Unresolved,
+                        &from,
+                        Some(imp.line),
+                        format!(
+                            "relative import (level {}) climbs past package root",
+                            imp.level
+                        ),
+                    ));
+                    continue;
+                }
+                PyModuleTarget::Missing => {
+                    self.resolve_missing_import(&from, &caller_all, &imp);
+                    continue;
+                }
+            };
+
+            if imp.names.is_empty() {
+                self.edge(&from, target, imp.kind, imp.line, None, Precision::Module);
+            } else {
+                self.resolve_from_names(&from, &caller_all, &target, &imp);
+            }
+        }
+    }
+
+    fn try_resolve_namespace_from(
+        &mut self,
+        from: &str,
+        caller_all: &BTreeSet<String>,
+        imp: &crate::python::PyImport,
+    ) -> Option<bool> {
+        if imp.names.is_empty() {
+            return None;
+        }
+        let from_init = crate::python::is_package_init(from);
+        let base_dir = if imp.level > 0 {
+            Some(self.resolve_relative_base(from, imp)?)
+        } else {
+            None
+        };
+        let mod_segs: Vec<&str> = if imp.module.is_empty() {
+            Vec::new()
+        } else {
+            imp.module.split('.').collect()
+        };
+
+        let mut any_resolved = false;
+        let mut unresolved_any = false;
+        for item in &imp.names {
+            let crate::python::PyImported::Named {
+                orig,
+                alias,
+                explicit_alias,
+            } = item
+            else {
+                unresolved_any = true;
+                continue;
+            };
+            let mut full_segs = mod_segs.clone();
+            full_segs.push(orig.as_str());
+            let hit = if let Some(ref base) = base_dir {
+                self.lookup_in_dir(base, &full_segs)
+            } else {
+                self.lookup_absolute(from, &full_segs)
+            };
+            if let Some(file) = hit {
+                any_resolved = true;
+                let kind = if from_init
+                    && imp.top_level
+                    && !imp.type_checking
+                    && ((*explicit_alias && orig == alias) || caller_all.contains(alias))
+                {
+                    EdgeKind::Reexport
+                } else {
+                    imp.kind
+                };
+                self.edge(from, file, kind, imp.line, None, Precision::Module);
+            } else {
+                unresolved_any = true;
+            }
+        }
+        if any_resolved {
+            if unresolved_any {
+                self.diagnostics.push(diagnostic(
+                    DiagnosticCode::Unresolved,
+                    from,
+                    Some(imp.line),
+                    format!("{} names missing in-scope submodules", imp.module),
+                ));
+            }
+            Some(true)
+        } else {
+            Some(false)
+        }
+    }
+
+    fn finish(self, sources: &BTreeMap<String, String>) -> CodeGraph {
+        let mut units = Vec::new();
+        let names: BTreeSet<&str> = self.by_name.keys().map(String::as_str).collect();
+        for py_unit in self.units.values() {
+            let Some(id) = &py_unit.id else {
+                continue;
+            };
+            let mut entries = BTreeSet::new();
+            for script_mod in &py_unit.manifest.script_modules {
+                let segs: Vec<&str> = script_mod.split('.').collect();
+                if let Some(file) = self.lookup_in_unit(py_unit, &segs) {
+                    entries.insert(file);
+                }
+            }
+            for path in self.inventory {
+                if !crate::python::is_python_source(path) {
+                    continue;
+                }
+                if path.rsplit('/').next() == Some("__main__.py") {
+                    let in_unit = self
+                        .nearest_unit(dir_of(path))
+                        .is_some_and(|(owner_root, _)| owner_root == py_unit.root);
+                    if in_unit {
+                        entries.insert(path.clone());
+                    }
+                }
+            }
+            let declared_units = py_unit
+                .manifest
+                .dependencies
+                .iter()
+                .filter(|dep| {
+                    names.contains(dep.as_str()) && Some(format!("py:{dep}")) != py_unit.id
+                })
+                .map(|dep| format!("py:{dep}"))
+                .collect();
+            units.push(Unit {
+                id: id.clone(),
+                kind: UnitKind::PythonPackage,
+                root: py_unit.root.clone(),
+                entry_files: entries.into_iter().collect(),
+                declared_units,
+            });
+        }
+        let entry_files: BTreeSet<&String> = units.iter().flat_map(|u| &u.entry_files).collect();
+        let mut files = BTreeMap::new();
+        for path in sources
+            .keys()
+            .filter(|path| crate::python::is_python_source(path))
+        {
+            let unit = self
+                .nearest_unit(dir_of(path))
+                .and_then(|(_, py_unit)| py_unit.id.clone());
+            files.insert(
+                path.clone(),
+                FileInfo {
+                    language: crate::python::language(),
+                    unit,
+                    class: if crate::python::is_test_path(path) {
+                        FileClass::Test
+                    } else {
+                        FileClass::Source
+                    },
+                    is_entry: entry_files.contains(path),
+                    in_module_tree: false,
+                    parsed: self.facts.contains_key(path),
+                },
+            );
+        }
+        units.sort_by(|a, b| (&a.id, &a.root).cmp(&(&b.id, &b.root)));
+        let mut diagnostics = self.diagnostics;
+        diagnostics.sort();
+        diagnostics.dedup();
+        CodeGraph {
+            units,
+            edges: self.edges.into_iter().collect(),
+            files,
+            diagnostics,
+            external_imports: self.external_imports,
+        }
+    }
+}
+
+/// Merge two language graphs into one.
+fn merge(mut first: CodeGraph, second: CodeGraph) -> CodeGraph {
+    first.units.extend(second.units);
+    first
+        .units
         .sort_by(|a, b| (&a.id, &a.root).cmp(&(&b.id, &b.root)));
-    let edges: BTreeSet<FileEdge> = rust.edges.into_iter().chain(ecma.edges).collect();
-    rust.edges = edges.into_iter().collect();
-    rust.files.extend(ecma.files);
-    rust.diagnostics.extend(ecma.diagnostics);
-    rust.diagnostics.sort();
-    rust.diagnostics.dedup();
-    rust.external_imports += ecma.external_imports;
-    rust
+    let edges: BTreeSet<FileEdge> = first.edges.into_iter().chain(second.edges).collect();
+    first.edges = edges.into_iter().collect();
+    first.files.extend(second.files);
+    first.diagnostics.extend(second.diagnostics);
+    first.diagnostics.sort();
+    first.diagnostics.dedup();
+    first.external_imports += second.external_imports;
+    first
 }
 
 #[cfg(test)]
