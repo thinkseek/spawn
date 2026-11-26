@@ -597,8 +597,13 @@ fn bwrap_view_hides_herdr_core_paths_while_host_witness_sees_sandboxed_agy() {
         extra_files: Vec::new(),
         host_tmpdir: None,
         private_dir: runtime.join("hcr/spawn-engine-view-test"),
-        extra_writable: Vec::new(),
+        canonical_workspace: None,
+        home_isolation: spawn_host::HomeIsolation::Blacklist,
+        extra_mounts: Vec::new(),
         agy_data_dir: None,
+        isolate_workers: false,
+        isolate_brain: false,
+        agy_program: None,
     };
     let Ok(view) = BwrapView::new("bwrap", config) else {
         assert!(!required(), "SPAWN_REQUIRE_HERDR=1 and bwrap unavailable");
@@ -614,6 +619,8 @@ fn bwrap_view_hides_herdr_core_paths_while_host_witness_sees_sandboxed_agy() {
             engine: "agy",
             workspace: &session.cwd().display().to_string(),
             engine_home: &engine_home.display().to_string(),
+            worker_id: None,
+            exit_file: None,
         })
         .expect("wrap");
 

@@ -89,9 +89,43 @@ pub struct EngineHome {
     /// told one at launch (agy, `SPAWN_AGY_MODEL`); Claude Code takes its
     /// models from its settings.
     pub model: Option<String>,
-    /// Redirected runtime/transcript data root (`SPAWN_AGY_DATA_DIR`), when
-    /// transcripts and volatile state are stored outside the user's home.
+    /// Optional off-home data root (`SPAWN_AGY_DATA_DIR`) where per-worker
+    /// isolated engine state and/or shared `brain/` storage live.
     pub data_dir: Option<String>,
+    /// Whether each worker gets an isolated `brain/` directory under
+    /// [`Self::data_dir`] (`SPAWN_AGY_ISOLATE_BRAIN=1|true|yes|on` when
+    /// `data_dir` is set; default `false`).
+    pub isolate_brain: bool,
+}
+
+/// Sanitize a worker id or workspace basename into a safe single path
+/// component keeping only `[A-Za-z0-9._-]`.
+#[must_use]
+pub fn sanitize_worker_key(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        "worker".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn clean_root_path(raw: &str) -> std::path::PathBuf {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty() && raw.starts_with('/') {
+        std::path::PathBuf::from("/")
+    } else {
+        std::path::PathBuf::from(trimmed)
+    }
 }
 
 impl EngineHome {
@@ -100,6 +134,74 @@ impl EngineHome {
     #[must_use]
     pub fn transcript_root(&self) -> &str {
         self.data_dir.as_deref().unwrap_or(&self.sessions)
+    }
+
+    /// The deterministic per-worker `brain/` directory under [`Self::data_dir`]
+    /// when both `data_dir` and [`Self::isolate_brain`] are enabled.
+    #[must_use]
+    pub fn worker_brain_dir(&self, worker_id: &str) -> Option<std::path::PathBuf> {
+        let root = self
+            .data_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())?;
+        if !self.isolate_brain {
+            return None;
+        }
+        Some(
+            clean_root_path(root)
+                .join("workers")
+                .join(sanitize_worker_key(worker_id))
+                .join("home")
+                .join("brain"),
+        )
+    }
+
+    /// The shared `brain/` directory under [`Self::data_dir`] when `data_dir`
+    /// is set and [`Self::isolate_brain`] is false.
+    #[must_use]
+    pub fn shared_brain_dir(&self) -> Option<std::path::PathBuf> {
+        let root = self
+            .data_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())?;
+        (!self.isolate_brain).then(|| clean_root_path(root).join("brain"))
+    }
+
+    /// All transcript roots associated with this engine home, for credential
+    /// masking (`CollectorMask`) and archive path checks.
+    #[must_use]
+    pub fn transcript_roots(&self, worker_id: Option<&str>) -> Vec<std::path::PathBuf> {
+        let mut roots = vec![std::path::PathBuf::from(&self.sessions)];
+        if let Some(root) = self
+            .data_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+        {
+            let root_path = clean_root_path(root);
+            let extra = if let Some(worker_id) = worker_id {
+                if self.isolate_brain {
+                    vec![
+                        root_path
+                            .join("workers")
+                            .join(sanitize_worker_key(worker_id))
+                            .join("home"),
+                    ]
+                } else {
+                    vec![root_path.join("brain")]
+                }
+            } else {
+                vec![root_path.join("workers"), root_path.join("brain")]
+            };
+            for path in extra {
+                if !roots.contains(&path) {
+                    roots.push(path);
+                }
+            }
+        }
+        roots
     }
 }
 
@@ -209,6 +311,18 @@ pub trait AgentDriver: Send + Sync + std::fmt::Debug {
     /// `workspace`.
     fn transcript_path(&self, home: &EngineHome, workspace: &WorkspaceId, native: &str) -> String;
 
+    /// Where the transcript of `native` lies for an engine of `worker_id`
+    /// started in `workspace`.
+    fn transcript_path_for(
+        &self,
+        home: &EngineHome,
+        workspace: &WorkspaceId,
+        _worker_id: Option<&str>,
+        native: &str,
+    ) -> String {
+        self.transcript_path(home, workspace, native)
+    }
+
     /// The native session a line of output names, when the engine names its
     /// own ([`SessionBinding::Reported`]).
     fn reported_session(&self, line: &str) -> Option<String>;
@@ -222,6 +336,12 @@ pub trait AgentDriver: Send + Sync + std::fmt::Debug {
     /// engine whose sessions are not found that way.
     fn session_scan_dir(&self, _home: &EngineHome) -> Option<String> {
         None
+    }
+
+    /// The conversation scan directory for `worker_id`, falling back to
+    /// [`Self::session_scan_dir`] when no per-worker directory applies.
+    fn session_scan_dir_for(&self, home: &EngineHome, _worker_id: Option<&str>) -> Option<String> {
+        self.session_scan_dir(home)
     }
 
     /// What one transcript line says.
@@ -548,10 +668,23 @@ impl AgentDriver for AgyDriver {
     }
 
     /// `<home>/brain/<conversation>/.system_generated/logs/transcript_full.jsonl`.
-    fn transcript_path(&self, home: &EngineHome, _workspace: &WorkspaceId, native: &str) -> String {
+    fn transcript_path(&self, home: &EngineHome, workspace: &WorkspaceId, native: &str) -> String {
+        self.transcript_path_for(home, workspace, None, native)
+    }
+
+    fn transcript_path_for(
+        &self,
+        home: &EngineHome,
+        _workspace: &WorkspaceId,
+        worker_id: Option<&str>,
+        native: &str,
+    ) -> String {
+        let brain = self
+            .session_scan_dir_for(home, worker_id)
+            .unwrap_or_else(|| format!("{}/brain", home.sessions.trim_end_matches('/')));
         format!(
-            "{}/brain/{native}/.system_generated/logs/transcript_full.jsonl",
-            home.transcript_root().trim_end_matches('/')
+            "{}/{native}/.system_generated/logs/transcript_full.jsonl",
+            brain.trim_end_matches('/')
         )
     }
 
@@ -560,12 +693,22 @@ impl AgentDriver for AgyDriver {
         None
     }
 
-    /// `<home>/brain`: one directory per conversation.
+    /// `<home>/brain` (or `<data_dir>/brain` when shared `data_dir` is used):
+    /// one directory per conversation.
     fn session_scan_dir(&self, home: &EngineHome) -> Option<String> {
-        Some(format!(
-            "{}/brain",
-            home.transcript_root().trim_end_matches('/')
-        ))
+        if let Some(shared) = home.shared_brain_dir() {
+            return Some(shared.display().to_string());
+        }
+        Some(format!("{}/brain", home.sessions.trim_end_matches('/')))
+    }
+
+    fn session_scan_dir_for(&self, home: &EngineHome, worker_id: Option<&str>) -> Option<String> {
+        if let Some(worker_id) = worker_id
+            && let Some(worker_brain) = home.worker_brain_dir(worker_id)
+        {
+            return Some(worker_brain.display().to_string());
+        }
+        self.session_scan_dir(home)
     }
 
     fn read_line(&self, line: &str, cursor: &mut LineCursor) -> LineFacts {
@@ -730,6 +873,7 @@ mod tests {
             sessions: "/root/.claude/projects/".to_string(),
             model: None,
             data_dir: None,
+            isolate_brain: false,
         }
     }
 
@@ -811,6 +955,7 @@ mod tests {
                 sessions: sessions.to_string(),
                 model: None,
                 data_dir: None,
+                isolate_brain: false,
             };
             assert_eq!(
                 ClaudeDriver.transcript_path(&home, &workspace, "abc"),
@@ -900,6 +1045,7 @@ mod tests {
             sessions: "/home/a/.gemini/antigravity-cli/".to_string(),
             model: Some("gemini-3.8-flash-low".to_string()),
             data_dir: None,
+            isolate_brain: false,
         }
     }
 
@@ -1416,5 +1562,111 @@ mod tests {
         // Only the tail counts: a limit far above it is history.
         let old = format!("Rate limit reached\n{}", "line\n".repeat(60));
         assert_eq!(super::hard_block(&old, &[]), None);
+    }
+
+    #[test]
+    fn sanitize_worker_key_keeps_safe_chars_and_rejects_dot_segments() {
+        assert_eq!(super::sanitize_worker_key("agent_1-a.b"), "agent_1-a.b");
+        assert_eq!(super::sanitize_worker_key("../evil/id:9"), ".._evil_id_9");
+        assert_eq!(super::sanitize_worker_key("."), "worker");
+        assert_eq!(super::sanitize_worker_key(".."), "worker");
+        assert_eq!(super::sanitize_worker_key(""), "worker");
+    }
+
+    #[test]
+    fn engine_home_and_agy_driver_resolve_isolated_and_shared_brain_paths() {
+        use std::path::PathBuf;
+
+        let ws = WorkspaceId::new("local:/tmp/ws").unwrap();
+
+        let plain = agy_home();
+        assert_eq!(plain.worker_brain_dir("agent_1"), None);
+        assert_eq!(plain.shared_brain_dir(), None);
+        assert_eq!(
+            plain.transcript_roots(None),
+            vec![PathBuf::from("/home/a/.gemini/antigravity-cli/")]
+        );
+        assert_eq!(
+            AgyDriver
+                .session_scan_dir_for(&plain, Some("agent_1"))
+                .as_deref(),
+            Some("/home/a/.gemini/antigravity-cli/brain")
+        );
+        assert_eq!(
+            AgyDriver.transcript_path_for(&plain, &ws, Some("agent_1"), "conv-1"),
+            "/home/a/.gemini/antigravity-cli/brain/conv-1/.system_generated/logs/transcript_full.jsonl"
+        );
+
+        let isolated = EngineHome {
+            data_dir: Some("/data01/agy/".to_string()),
+            isolate_brain: true,
+            ..agy_home()
+        };
+        assert_eq!(
+            isolated.worker_brain_dir("agent_1"),
+            Some(PathBuf::from("/data01/agy/workers/agent_1/home/brain"))
+        );
+        assert_eq!(isolated.shared_brain_dir(), None);
+        assert_eq!(
+            isolated.transcript_roots(Some("agent_1")),
+            vec![
+                PathBuf::from("/home/a/.gemini/antigravity-cli/"),
+                PathBuf::from("/data01/agy/workers/agent_1/home"),
+            ]
+        );
+        assert_eq!(
+            isolated.transcript_roots(None),
+            vec![
+                PathBuf::from("/home/a/.gemini/antigravity-cli/"),
+                PathBuf::from("/data01/agy/workers"),
+                PathBuf::from("/data01/agy/brain"),
+            ]
+        );
+        assert_eq!(
+            AgyDriver
+                .session_scan_dir_for(&isolated, Some("agent_1"))
+                .as_deref(),
+            Some("/data01/agy/workers/agent_1/home/brain")
+        );
+        assert_eq!(
+            AgyDriver.transcript_path_for(&isolated, &ws, Some("agent_1"), "conv-1"),
+            "/data01/agy/workers/agent_1/home/brain/conv-1/.system_generated/logs/transcript_full.jsonl"
+        );
+        assert_eq!(
+            AgyDriver.transcript_path_for(&isolated, &ws, None, "conv-1"),
+            "/home/a/.gemini/antigravity-cli/brain/conv-1/.system_generated/logs/transcript_full.jsonl"
+        );
+
+        let shared = EngineHome {
+            data_dir: Some("/data01/agy".to_string()),
+            isolate_brain: false,
+            ..agy_home()
+        };
+        assert_eq!(shared.worker_brain_dir("agent_1"), None);
+        assert_eq!(
+            shared.shared_brain_dir(),
+            Some(PathBuf::from("/data01/agy/brain"))
+        );
+        assert_eq!(
+            shared.transcript_roots(Some("agent_1")),
+            vec![
+                PathBuf::from("/home/a/.gemini/antigravity-cli/"),
+                PathBuf::from("/data01/agy/brain"),
+            ]
+        );
+        assert_eq!(
+            AgyDriver.session_scan_dir(&shared).as_deref(),
+            Some("/data01/agy/brain")
+        );
+        assert_eq!(
+            AgyDriver
+                .session_scan_dir_for(&shared, Some("agent_1"))
+                .as_deref(),
+            Some("/data01/agy/brain")
+        );
+        assert_eq!(
+            AgyDriver.transcript_path_for(&shared, &ws, Some("agent_1"), "conv-1"),
+            "/data01/agy/brain/conv-1/.system_generated/logs/transcript_full.jsonl"
+        );
     }
 }

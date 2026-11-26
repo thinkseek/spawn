@@ -902,6 +902,12 @@ pub struct ViewedLaunch<'a> {
     /// engine's `TMPDIR` is a directory of its own below it, never the
     /// loop's shared one.
     pub engine_home: &'a str,
+    /// The agent/worker id, used to derive per-worker isolated storage paths
+    /// when configured.
+    pub worker_id: Option<&'a str>,
+    /// Host path of `SPAWN_EXIT_FILE`, rewritten inside the view when
+    /// canonical workspace mounting is enabled.
+    pub exit_file: Option<&'a str>,
 }
 
 /// The filesystem view an engine with no deny rules of its own
@@ -913,6 +919,13 @@ pub struct ViewedLaunch<'a> {
 pub trait EngineView: Send + Sync + std::fmt::Debug {
     /// Its mechanism's name (`bwrap`).
     fn name(&self) -> &'static str;
+
+    /// The canonical workspace path inside the view when the host workspace
+    /// is mounted at a fixed path (such as `/workspace`), or `None` when
+    /// mounted at its host path.
+    fn canonical_workspace(&self) -> Option<&std::path::Path> {
+        None
+    }
 
     /// The words that run a program inside the view for `launch`: the
     /// view's program and its arguments, ending in `--`, after which the

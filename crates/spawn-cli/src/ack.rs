@@ -109,7 +109,14 @@ fn pane_workspace(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, Strin
             workspace.display()
         )));
     }
-    if workspace.file_name().and_then(|name| name.to_str()) != Some(agent.as_str()) {
+    let canonical_match = env("SPAWN_SANDBOX_CANONICAL_WORKSPACE")
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("off"))
+        .is_some_and(|canonical| workspace == Path::new(canonical));
+    if !canonical_match
+        && workspace.file_name().and_then(|name| name.to_str()) != Some(agent.as_str())
+    {
         return Err(outside(&format!(
             "SPAWN_WORKSPACE {} is not {agent}'s workspace",
             workspace.display()
@@ -403,9 +410,36 @@ mod tests {
         let mut none = pane.clone();
         none.pop();
         assert!(pane_workspace(&given(none)).is_err());
-        let mut missing = pane;
+        let mut missing = pane.clone();
         missing[2].1 = root.join("agent_worker_gone").display().to_string();
         assert!(pane_workspace(&given(missing)).is_err());
+
+        // Canonical workspace mount accepts SPAWN_WORKSPACE matching SPAWN_SANDBOX_CANONICAL_WORKSPACE.
+        let canonical_ws = root.join("workspace");
+        std::fs::create_dir_all(&canonical_ws).expect("canonical workspace");
+        let canonical_pane = vec![
+            ("SPAWN_AGENT_ID", "agent_worker_a_1".to_string()),
+            ("SPAWN_EXECUTION_ID", "exec_1".to_string()),
+            ("SPAWN_WORKSPACE", canonical_ws.display().to_string()),
+            (
+                "SPAWN_SANDBOX_CANONICAL_WORKSPACE",
+                canonical_ws.display().to_string(),
+            ),
+        ];
+        assert_eq!(
+            pane_workspace(&given(canonical_pane)),
+            Ok(canonical_ws.clone())
+        );
+        let mismatch_canonical = vec![
+            ("SPAWN_AGENT_ID", "agent_worker_a_1".to_string()),
+            ("SPAWN_EXECUTION_ID", "exec_1".to_string()),
+            ("SPAWN_WORKSPACE", canonical_ws.display().to_string()),
+            (
+                "SPAWN_SANDBOX_CANONICAL_WORKSPACE",
+                root.join("other_canonical").display().to_string(),
+            ),
+        ];
+        assert!(pane_workspace(&given(mismatch_canonical)).is_err());
 
         // Written whole, where the loop lists it.
         let ack = parse(&words("5 declined not now")).expect("an ack");

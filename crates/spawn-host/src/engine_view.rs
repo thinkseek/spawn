@@ -79,9 +79,11 @@
 //! visible to the engine already running (`--ro-bind / /` is live); the
 //! next launch masks it.
 
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use spawn_core::port::{EngineView, ViewedLaunch};
@@ -91,44 +93,6 @@ const CHECK_LIMIT: Duration = Duration::from_secs(10);
 
 /// The directory below the engine's home that is its `TMPDIR` in the view.
 pub const TMP_FALLBACK: &str = ".spawn-tmp";
-
-/// Shared `agy` subdirectory under `SPAWN_AGY_DATA_DIR`: conversation
-/// transcript folders (`brain/<conversation>/.system_generated/logs/...`),
-/// separated by unique conversation UUIDs so Spawn's host reader scans one
-/// `<data_dir>/brain` root.
-const AGY_SHARED_SUBDIRS: [&str; 1] = ["brain"];
-
-/// Per-worker isolated `agy` subdirectories created inside
-/// `<SPAWN_AGY_DATA_DIR>/workers/<ws_key>/home/` so per-worker SQLite stores
-/// (`conversation_summaries.db`), logs, caches, presence, and conversations
-/// never contend across concurrent workers.
-const AGY_ISOLATED_SUBDIRS: [&str; 8] = [
-    "cache",
-    "conversations",
-    "log",
-    "implicit",
-    "crashes",
-    "presence",
-    "annotations",
-    "updater",
-];
-
-/// Small non-secret `agy` state/config files copied once from `engine_home`
-/// into an isolated worker home when present on host and missing in the worker.
-const AGY_SEED_FILES: [&str; 4] = [
-    "installation_id",
-    "jetski_state.pbtxt",
-    "settings.json",
-    "cache/onboarding.json",
-];
-
-/// Read-only shared static subdirectories mounted from `engine_home` into each
-/// isolated worker home when present on host.
-const AGY_RO_DIRS: [&str; 2] = ["bin", "builtin"];
-
-/// Read-only shared credential files mounted from `engine_home` into each
-/// isolated worker home without copying secret bytes into `SPAWN_AGY_DATA_DIR`.
-const AGY_RO_FILES: [&str; 1] = ["antigravity-oauth-token"];
 
 /// The engines' homes masked below the user's home: the only masked
 /// directories an engine's own home may lie below (re-bound writable into
@@ -163,6 +127,28 @@ pub const HOST_DIRECTORIES: &[&str] = &["/run/keep", "/run/keep-test", "/tmp"];
 /// (`*.env*`, `env.sh`) are masked.
 pub const LOOP_DIRECTORY: &str = ".local/share/spawn-rsi";
 
+/// How `$HOME` is isolated inside the filesystem view
+/// (`SPAWN_SANDBOX_HOME_ISOLATION`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HomeIsolation {
+    /// Mask known credential and sibling-engine paths below `$HOME` (default).
+    #[default]
+    Blacklist,
+    /// Mask the entire `$HOME` with an empty tmpfs and re-bind only allowed
+    /// paths (`SPAWN_SANDBOX_HOME_ISOLATION=whitelist`).
+    Whitelist,
+}
+
+/// An extra host path bound into the filesystem view
+/// (`SPAWN_ENGINE_VIEW_WRITABLE`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraMount {
+    /// Host path to bind at the same path inside the view.
+    pub path: PathBuf,
+    /// `true` for `--bind` (`:rw`, the default); `false` for `--ro-bind` (`:ro`).
+    pub writable: bool,
+}
+
 /// What a view hides and where it keeps its own empty file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewConfig {
@@ -191,14 +177,69 @@ pub struct ViewConfig {
     /// empty file a regular file is masked by is kept. No writable bind
     /// may reach it.
     pub private_dir: PathBuf,
-    /// Additional host directories explicitly bound writable inside the view
-    /// (`SPAWN_ENGINE_VIEW_WRITABLE`, comma- or colon-separated). Must lie
-    /// outside `$HOME` and never overlap any mask or `private_dir`.
-    pub extra_writable: Vec<PathBuf>,
-    /// Optional off-home runtime/transcript directory (`SPAWN_AGY_DATA_DIR`),
-    /// sharing `brain/` while isolating volatile subdirs & `TMPDIR` per
-    /// worker workspace.
+    /// Optional fixed workspace mount path inside the sandbox (e.g.
+    /// `/workspace`, `SPAWN_SANDBOX_CANONICAL_WORKSPACE`).
+    pub canonical_workspace: Option<PathBuf>,
+    /// `$HOME` isolation policy (`SPAWN_SANDBOX_HOME_ISOLATION`).
+    pub home_isolation: HomeIsolation,
+    /// Additional mounts from `SPAWN_ENGINE_VIEW_WRITABLE`.
+    pub extra_mounts: Vec<ExtraMount>,
+    /// Optional off-home data root for `agy` (`SPAWN_AGY_DATA_DIR`).
     pub agy_data_dir: Option<PathBuf>,
+    /// Whether per-worker `agy` homes and temp dirs are isolated under
+    /// `agy_data_dir` (`SPAWN_AGY_ISOLATE_WORKERS != "0"` when `agy_data_dir`
+    /// is set).
+    pub isolate_workers: bool,
+    /// Whether each worker's `agy` `brain/` directory is isolated per worker
+    /// under `agy_data_dir` (`SPAWN_AGY_ISOLATE_BRAIN=1|true|yes|on` when
+    /// `agy_data_dir` is set; default `false` so `brain/` is shared).
+    pub isolate_brain: bool,
+    /// Executable path of the sandboxed engine (`SPAWN_AGY_PROGRAM` else
+    /// `agy` on `PATH`), RO-bound in whitelist mode if located under `$HOME`.
+    pub agy_program: Option<PathBuf>,
+}
+
+fn trim_trailing_slash(raw: &str) -> &str {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty() && raw.starts_with('/') {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+/// Parse `SPAWN_ENGINE_VIEW_WRITABLE` entries separated by `,` (or legacy `:`
+/// when neither `:ro` nor `:rw` suffix is given), defaulting to `:rw`.
+#[must_use]
+pub fn parse_extra_mounts(raw: &str) -> Vec<ExtraMount> {
+    let mut mounts = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(path) = entry.strip_suffix(":ro") {
+            let trimmed = trim_trailing_slash(path.trim());
+            if !trimmed.is_empty() {
+                mounts.push(ExtraMount {
+                    path: PathBuf::from(trimmed),
+                    writable: false,
+                });
+            }
+        } else if let Some(path) = entry.strip_suffix(":rw") {
+            let trimmed = trim_trailing_slash(path.trim());
+            if !trimmed.is_empty() {
+                mounts.push(ExtraMount {
+                    path: PathBuf::from(trimmed),
+                    writable: true,
+                });
+            }
+        } else {
+            for part in entry.split(':').map(str::trim).filter(|s| !s.is_empty()) {
+                mounts.push(ExtraMount {
+                    path: PathBuf::from(trim_trailing_slash(part)),
+                    writable: true,
+                });
+            }
+        }
+    }
+    mounts
 }
 
 impl ViewConfig {
@@ -214,17 +255,43 @@ impl ViewConfig {
             .filter(|dir| dir.starts_with('/'))
             .map_or_else(|| PathBuf::from(format!("/run/user/{uid}")), PathBuf::from);
         let private_dir = runtime_dir.join(format!("spawn-engine-view-{uid}"));
-        let extra_writable = lookup("SPAWN_ENGINE_VIEW_WRITABLE")
-            .unwrap_or_default()
-            .split([',', ':'])
+        let canonical_workspace = lookup("SPAWN_SANDBOX_CANONICAL_WORKSPACE")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("off"))
+            .map(|value| PathBuf::from(trim_trailing_slash(&value)));
+        let home_isolation = match lookup("SPAWN_SANDBOX_HOME_ISOLATION")
+            .as_deref()
             .map(str::trim)
-            .filter(|dir| !dir.is_empty())
-            .map(PathBuf::from)
-            .collect();
+        {
+            Some(value) if value.eq_ignore_ascii_case("whitelist") => HomeIsolation::Whitelist,
+            _ => HomeIsolation::Blacklist,
+        };
+        let extra_mounts = lookup("SPAWN_ENGINE_VIEW_WRITABLE")
+            .map(|raw| parse_extra_mounts(&raw))
+            .unwrap_or_default();
         let agy_data_dir = lookup("SPAWN_AGY_DATA_DIR")
-            .map(|dir| dir.trim().to_string())
-            .filter(|dir| !dir.is_empty())
-            .map(PathBuf::from);
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| PathBuf::from(trim_trailing_slash(&value)));
+        let isolate_workers = agy_data_dir.is_some()
+            && lookup("SPAWN_AGY_ISOLATE_WORKERS")
+                .as_deref()
+                .map(str::trim)
+                != Some("0");
+        let isolate_brain = agy_data_dir.is_some()
+            && matches!(
+                lookup("SPAWN_AGY_ISOLATE_BRAIN")
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("1" | "true" | "yes" | "on")
+            );
+        let agy_cmd = lookup("SPAWN_AGY_PROGRAM")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "agy".to_string());
+        let agy_program = find_program_entry(&agy_cmd, lookup("PATH").as_deref());
         Self {
             xdg_config_home: lookup("XDG_CONFIG_HOME")
                 .filter(|dir| dir.starts_with('/'))
@@ -239,10 +306,15 @@ impl ViewConfig {
                 .filter(|dir| dir.starts_with('/'))
                 .map(PathBuf::from),
             private_dir,
-            extra_writable,
-            agy_data_dir,
             runtime_dir,
             home,
+            canonical_workspace,
+            home_isolation,
+            extra_mounts,
+            agy_data_dir,
+            isolate_workers,
+            isolate_brain,
+            agy_program,
         }
     }
 
@@ -367,6 +439,7 @@ impl BwrapView {
         let program = find_program(program)
             .ok_or_else(|| format!("{program} is not installed (not found on PATH)"))?;
         let view = Self { program, config };
+        view.validate_config()?;
         let private = view.private_dir()?;
         view.check(&private)?;
         Ok(view)
@@ -491,6 +564,103 @@ impl BwrapView {
         }
     }
 
+    /// Validate [`ViewConfig`] invariants (`canonical_workspace`,
+    /// `extra_mounts`, `agy_data_dir`, and whitelist `$HOME`).
+    fn validate_config(&self) -> Result<(), String> {
+        let home_norm =
+            prospective_canonical(&self.config.home).unwrap_or_else(|_| self.config.home.clone());
+        let private_norm = prospective_canonical(&self.config.private_dir)
+            .unwrap_or_else(|_| self.config.private_dir.clone());
+        if self.config.home_isolation == HomeIsolation::Whitelist
+            && (self.config.home == Path::new("/") || home_norm == Path::new("/"))
+        {
+            return Err("HOME cannot be / in whitelist mode".to_string());
+        }
+        if let Some(target) = &self.config.canonical_workspace {
+            validate_abs_clean(target, "canonical workspace")?;
+            let target_norm = prospective_canonical(target).unwrap_or_else(|_| target.clone());
+            if target_norm == Path::new("/") {
+                return Err("canonical workspace cannot resolve to /".to_string());
+            }
+            for (other, label) in [
+                (self.config.home.as_path(), "$HOME"),
+                (home_norm.as_path(), "$HOME"),
+                (Path::new("/run"), "/run"),
+                (Path::new("/tmp"), "/tmp"),
+                (
+                    self.config.private_dir.as_path(),
+                    "the view's private directory",
+                ),
+                (private_norm.as_path(), "the view's private directory"),
+                (self.config.runtime_dir.as_path(), "XDG_RUNTIME_DIR"),
+            ] {
+                if paths_overlap(target, other) || paths_overlap(&target_norm, other) {
+                    return Err(format!(
+                        "canonical workspace {} overlaps {label} ({})",
+                        target.display(),
+                        other.display()
+                    ));
+                }
+            }
+        }
+        if let Some(root) = &self.config.agy_data_dir {
+            validate_abs_clean(root, "SPAWN_AGY_DATA_DIR")?;
+            let root_norm = prospective_canonical(root).unwrap_or_else(|_| root.clone());
+            if root_norm == Path::new("/") {
+                return Err("SPAWN_AGY_DATA_DIR cannot resolve to /".to_string());
+            }
+            if paths_overlap(root, &self.config.private_dir)
+                || paths_overlap(&root_norm, &private_norm)
+            {
+                return Err(format!(
+                    "SPAWN_AGY_DATA_DIR {} overlaps the view's private directory {}",
+                    root.display(),
+                    self.config.private_dir.display()
+                ));
+            }
+            if self.config.home_isolation == HomeIsolation::Whitelist
+                && (paths_overlap(root, &self.config.home) || paths_overlap(&root_norm, &home_norm))
+            {
+                return Err(format!(
+                    "SPAWN_AGY_DATA_DIR {} overlaps $HOME {} in whitelist mode",
+                    root.display(),
+                    self.config.home.display()
+                ));
+            }
+        }
+        for mount in &self.config.extra_mounts {
+            validate_abs_clean(&mount.path, "extra mount")?;
+            let mount_norm =
+                prospective_canonical(&mount.path).unwrap_or_else(|_| mount.path.clone());
+            if mount_norm == Path::new("/") {
+                return Err(format!(
+                    "extra mount {} cannot resolve to /",
+                    mount.path.display()
+                ));
+            }
+            if paths_overlap(&mount.path, &self.config.private_dir)
+                || paths_overlap(&mount_norm, &private_norm)
+            {
+                return Err(format!(
+                    "extra mount {} overlaps the view's private directory {}",
+                    mount.path.display(),
+                    self.config.private_dir.display()
+                ));
+            }
+            if self.config.home_isolation == HomeIsolation::Whitelist
+                && (paths_overlap(&mount.path, &self.config.home)
+                    || paths_overlap(&mount_norm, &home_norm))
+            {
+                return Err(format!(
+                    "extra mount {} overlaps $HOME {} in whitelist mode",
+                    mount.path.display(),
+                    self.config.home.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Every target resolved now: the directories and the regular files to
     /// mask, and what was skipped and why. All of them, a target inside
     /// another masked directory included: the writable binds are checked
@@ -499,10 +669,31 @@ impl BwrapView {
     /// the engine's sake: an engine home equal to, or holding, a target is
     /// refused.
     fn targets(&self) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, String)>) {
-        let home = std::fs::canonicalize(&self.config.home).unwrap_or(self.config.home.clone());
+        let home =
+            std::fs::canonicalize(&self.config.home).unwrap_or_else(|_| self.config.home.clone());
         let mut skipped = Vec::new();
         let mut directories: Vec<PathBuf> = Vec::new();
         let mut files: Vec<PathBuf> = Vec::new();
+        if self.config.home_isolation == HomeIsolation::Whitelist {
+            match resolve(&self.config.home) {
+                Ok(Resolved::Directory(path)) if path != Path::new("/") => {
+                    directories.push(path);
+                }
+                Ok(Resolved::Directory(_)) => {
+                    skipped.push((
+                        self.config.home.clone(),
+                        "holds the user's home".to_string(),
+                    ));
+                }
+                Ok(Resolved::File(path)) => {
+                    skipped.push((
+                        self.config.home.clone(),
+                        format!("is a file ({})", path.display()),
+                    ));
+                }
+                Err(why) => skipped.push((self.config.home.clone(), why)),
+            }
+        }
         let targets = self
             .config
             .directory_targets()
@@ -510,9 +701,15 @@ impl BwrapView {
             .chain(self.config.file_targets());
         for target in targets {
             match resolve(&target) {
-                // A directory holding the home (a host TMPDIR of `/`) would
-                // hide everything: said, not masked.
-                Ok(Resolved::Directory(path)) if home.starts_with(&path) => {
+                // A directory strictly holding the home (a host TMPDIR of `/`)
+                // would hide everything: said, not masked. In whitelist mode,
+                // `$HOME` itself is already masked above.
+                Ok(Resolved::Directory(path))
+                    if match self.config.home_isolation {
+                        HomeIsolation::Blacklist => home.starts_with(&path),
+                        HomeIsolation::Whitelist => home.starts_with(&path) && path != home,
+                    } =>
+                {
                     skipped.push((target, "holds the user's home".to_string()));
                 }
                 Ok(Resolved::Directory(path)) => {
@@ -525,47 +722,91 @@ impl BwrapView {
                         files.push(path);
                     }
                 }
+                Err(why)
+                    if self.config.home_isolation == HomeIsolation::Whitelist
+                        && why == "missing"
+                        && prospective_canonical(&target)
+                            .is_ok_and(|path| path.starts_with(&home)) => {}
                 Err(why) => skipped.push((target, why)),
             }
         }
         (directories, files, skipped)
     }
 
+    fn canonical_engine_homes(&self) -> Vec<PathBuf> {
+        ENGINE_HOMES
+            .iter()
+            .flat_map(|dir| self.config.below_home(dir))
+            .filter_map(|dir| {
+                std::fs::canonicalize(&dir)
+                    .ok()
+                    .or_else(|| prospective_canonical(&dir).ok())
+            })
+            .collect()
+    }
+
+    fn forbidden_home_targets(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for dir in HOME_DIRECTORIES
+            .iter()
+            .copied()
+            .filter(|dir| !ENGINE_HOMES.contains(dir))
+        {
+            paths.extend(self.config.below_home(dir));
+        }
+        paths.extend(self.config.below_home(".config/herdr"));
+        paths.extend(self.config.below_home(".config/herdr-core"));
+        paths.push(self.config.home.join(".local/state/herdr-core"));
+        if let Some(state) = &self.config.xdg_state_home {
+            paths.push(state.join("herdr-core"));
+        }
+        paths.extend(HOME_FILES.iter().map(|file| self.config.home.join(file)));
+        paths.extend(self.config.loop_dirs.iter().cloned());
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                std::fs::canonicalize(&path)
+                    .ok()
+                    .or_else(|| prospective_canonical(&path).ok())
+            })
+            .collect()
+    }
+
     /// Why a writable bind of `workspace` or `engine_home` is refused:
     /// it would uncover a mask, lie in one, or reach the view's `private`
     /// directory (see the module's documentation).
-    fn refuse_binds(
-        &self,
-        workspace: &Path,
-        engine_home: &Path,
-        extra_writable: &[PathBuf],
-        agy_data_dir: Option<&Path>,
-        private: &Path,
-        masked: &[&PathBuf],
-    ) -> Result<(), String> {
-        let home = std::fs::canonicalize(&self.config.home).unwrap_or(self.config.home.clone());
-        // A writable bind may hold no mask (its bind would uncover it) and
-        // lie in none (it would open a hole in it), nor reach the view's
-        // private directory either way.
-        let overlap = |bound: &Path| {
-            masked
-                .iter()
-                .find(|target| target.starts_with(bound) || bound.starts_with(target))
-        };
-        let reaches_private =
-            |bound: &Path| private.starts_with(bound) || bound.starts_with(private);
-        if reaches_private(workspace) {
+    fn refuse_binds(&self, ctx: &BindContext<'_>, engine_home: &Path) -> Result<(), String> {
+        let home =
+            std::fs::canonicalize(&self.config.home).unwrap_or_else(|_| self.config.home.clone());
+        let whitelist = self.config.home_isolation == HomeIsolation::Whitelist;
+        let reaches_private = |bound: &Path| paths_overlap(bound, ctx.private);
+        if reaches_private(ctx.workspace_src) || reaches_private(ctx.workspace_dest) {
             return Err(format!(
                 "the workspace {} overlaps the view's private directory {}",
-                workspace.display(),
-                private.display()
+                ctx.workspace_src.display(),
+                ctx.private.display()
             ));
         }
-        if let Some(target) = overlap(workspace) {
+        if let Some(target) = ctx.masked.iter().find(|target| {
+            target.starts_with(ctx.workspace_src)
+                || paths_overlap(ctx.workspace_dest, target)
+                || (ctx.workspace_src.starts_with(target)
+                    && (***target != home || self.config.canonical_workspace.is_none()))
+        }) {
             return Err(format!(
                 "the workspace {} overlaps {}, which the view masks",
-                workspace.display(),
+                ctx.workspace_src.display(),
                 target.display()
+            ));
+        }
+        if self.config.canonical_workspace.is_none()
+            && whitelist
+            && (ctx.workspace_src.starts_with(&home) || home.starts_with(ctx.workspace_src))
+        {
+            return Err(format!(
+                "the workspace {} overlaps $HOME {}, which the view masks",
+                ctx.workspace_src.display(),
+                home.display()
             ));
         }
         if engine_home == Path::new("/") || home.starts_with(engine_home) {
@@ -578,21 +819,38 @@ impl BwrapView {
             return Err(format!(
                 "the engine's home {} overlaps the view's private directory {}",
                 engine_home.display(),
-                private.display()
+                ctx.private.display()
             ));
         }
         // The engine's home may lie below another engine's masked home
-        // (`~/.gemini/antigravity-cli` below `~/.gemini`), and nowhere else
-        // a mask covers; it may never be a masked path, nor hold one.
-        let engine_homes: Vec<PathBuf> = ENGINE_HOMES
-            .iter()
-            .flat_map(|dir| self.config.below_home(dir))
-            .filter_map(|dir| std::fs::canonicalize(dir).ok())
-            .collect();
-        let refused = masked.iter().find(|target| {
+        // (`~/.gemini/antigravity-cli` below `~/.gemini`), or directly below
+        // `$HOME` in whitelist mode outside forbidden directories, and
+        // nowhere else a mask covers; it may never equal a masked path nor
+        // hold one.
+        let engine_homes = self.canonical_engine_homes();
+        if let Some(conflict) = engine_homes.iter().find(|dir| dir.starts_with(engine_home)) {
+            return Err(format!(
+                "the engine's home {} overlaps {}, which the view masks",
+                engine_home.display(),
+                conflict.display()
+            ));
+        }
+        if whitelist {
+            for forbidden in self.forbidden_home_targets() {
+                if paths_overlap(engine_home, &forbidden) {
+                    return Err(format!(
+                        "the engine's home {} overlaps {}, which the view masks",
+                        engine_home.display(),
+                        forbidden.display()
+                    ));
+                }
+            }
+        }
+        let refused = ctx.masked.iter().find(|target| {
             target.starts_with(engine_home)
                 || (engine_home.starts_with(target)
-                    && !engine_homes.iter().any(|dir| dir == **target))
+                    && !engine_homes.iter().any(|dir| dir == **target)
+                    && !(whitelist && target.as_path() == home.as_path()))
         });
         if let Some(target) = refused {
             return Err(format!(
@@ -601,37 +859,398 @@ impl BwrapView {
                 target.display()
             ));
         }
-        let refuse_extra = |bound: &Path, what: &str| -> Result<(), String> {
-            if bound == Path::new("/") || home.starts_with(bound) || bound.starts_with(&home) {
-                return Err(format!(
-                    "{what} {} lies in or holds the user's home {}",
-                    bound.display(),
-                    home.display()
-                ));
-            }
-            if reaches_private(bound) {
-                return Err(format!(
-                    "{what} {} overlaps the view's private directory {}",
-                    bound.display(),
-                    private.display()
-                ));
-            }
-            if let Some(target) = overlap(bound) {
-                return Err(format!(
-                    "{what} {} overlaps {}, which the view masks",
-                    bound.display(),
-                    target.display()
-                ));
-            }
-            Ok(())
-        };
-        for extra in extra_writable {
-            refuse_extra(extra, "the extra writable directory")?;
+        Ok(())
+    }
+
+    fn refuse_extra_target(
+        path: &Path,
+        what: &str,
+        ctx: &BindContext<'_>,
+        home: &Path,
+    ) -> Result<(), String> {
+        if paths_overlap(path, ctx.private) {
+            return Err(format!(
+                "{what} {} overlaps the view's private directory {}",
+                path.display(),
+                ctx.private.display()
+            ));
         }
-        if let Some(data_dir) = agy_data_dir {
-            refuse_extra(data_dir, "the agy data directory")?;
+        if let Some(target) = ctx.masked.iter().find(|target| paths_overlap(path, target)) {
+            return Err(format!(
+                "{what} {} overlaps {}, which the view masks",
+                path.display(),
+                target.display()
+            ));
+        }
+        if paths_overlap(path, home) {
+            return Err(format!(
+                "{what} {} lies in or holds the user's home {}",
+                path.display(),
+                home.display()
+            ));
+        }
+        if paths_overlap(path, ctx.workspace_dest) {
+            return Err(format!(
+                "{what} {} overlaps workspace mount {}",
+                path.display(),
+                ctx.workspace_dest.display()
+            ));
         }
         Ok(())
+    }
+
+    /// Prepare off-home per-worker directories, one-time non-secret seeding,
+    /// static read-only overlays, and `brain/` binding plan when
+    /// `SPAWN_AGY_DATA_DIR` is enabled for `agy`.
+    fn prepare_agy_data(
+        &self,
+        root: &Path,
+        launch: &ViewedLaunch<'_>,
+        host_engine_home: &Path,
+        ctx: &BindContext<'_>,
+        home: &Path,
+    ) -> Result<AgyDataPlan, String> {
+        let canonical_root = ensure_dir_0700(root, "SPAWN_AGY_DATA_DIR")?;
+        let raw_key = launch
+            .worker_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map_or_else(
+                || {
+                    ctx.workspace_src
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("worker")
+                        .to_string()
+                },
+                str::to_string,
+            );
+        let worker_key = spawn_core::driver::sanitize_worker_key(&raw_key);
+        let workers_dir = ensure_dir_0700(&canonical_root.join("workers"), "workers dir")?;
+        let worker_base = ensure_dir_0700(&workers_dir.join(&worker_key), "worker dir")?;
+        let worker_home = ensure_dir_0700(&worker_base.join("home"), "worker home")?;
+        ensure_dir_0700(&worker_home.join("brain"), "worker brain")?;
+        let worker_tmp = ensure_dir_0700(&worker_base.join("tmp"), "worker tmp")?;
+        for (path, label) in [(&worker_home, "worker home"), (&worker_tmp, "worker tmp")] {
+            Self::refuse_extra_target(path, label, ctx, home)?;
+        }
+        let mut overlays = Vec::new();
+        if self.config.isolate_workers {
+            for rel in [
+                "installation_id",
+                "jetski_state.pbtxt",
+                "settings.json",
+                "cache/onboarding.json",
+            ] {
+                let src = host_engine_home.join(rel);
+                let dst = worker_home.join(rel);
+                if std::fs::metadata(&src).is_ok_and(|meta| meta.is_file()) {
+                    if let Some(parent) = dst.parent()
+                        && parent != worker_home
+                    {
+                        ensure_dir_0700(parent, "worker cache dir")?;
+                    }
+                    copy_file_atomic_noclobber(&src, &dst, 0o600)?;
+                }
+            }
+            let worker_bin = ensure_dir_0700(&worker_home.join("bin"), "worker bin")?;
+            let host_bin = host_engine_home.join("bin");
+            if let Ok(entries) = std::fs::read_dir(&host_bin) {
+                for entry in entries.flatten() {
+                    let src = entry.path();
+                    let Ok(meta) = std::fs::symlink_metadata(&src) else {
+                        continue;
+                    };
+                    if !meta.file_type().is_file() {
+                        continue;
+                    }
+                    let dst = worker_bin.join(entry.file_name());
+                    let mode = (meta.permissions().mode() & 0o700) | 0o600;
+                    copy_file_atomic_noclobber(&src, &dst, mode)?;
+                }
+            }
+            ensure_dir_0700(&worker_home.join("xdg-cache"), "worker xdg-cache")?;
+            let builtin = host_engine_home.join("builtin");
+            if std::fs::metadata(&builtin).is_ok_and(|meta| meta.is_dir()) {
+                let canonical = std::fs::canonicalize(&builtin)
+                    .map_err(|error| format!("{}: {error}", builtin.display()))?;
+                overlays.push((canonical, "builtin"));
+            }
+            let oauth = host_engine_home.join("antigravity-oauth-token");
+            if std::fs::metadata(&oauth).is_ok_and(|meta| meta.is_file()) {
+                let canonical = std::fs::canonicalize(&oauth)
+                    .map_err(|error| format!("{}: {error}", oauth.display()))?;
+                ensure_empty_mount_file(&worker_home.join("antigravity-oauth-token"))?;
+                overlays.push((canonical, "antigravity-oauth-token"));
+            }
+        }
+        let shared_brain = if self.config.isolate_brain {
+            None
+        } else {
+            let shared = ensure_dir_0700(&canonical_root.join("brain"), "shared brain")?;
+            Self::refuse_extra_target(&shared, "shared brain", ctx, home)?;
+            Some(shared)
+        };
+        Ok(AgyDataPlan {
+            worker_home,
+            worker_tmp,
+            overlays,
+            shared_brain,
+        })
+    }
+
+    fn resolve_engine_ro_binaries(
+        &self,
+        launch: &ViewedLaunch<'_>,
+        home: &Path,
+        engine_home: &Path,
+        ctx: &BindContext<'_>,
+    ) -> Vec<(PathBuf, PathBuf)> {
+        if self.config.home_isolation != HomeIsolation::Whitelist || launch.engine != "agy" {
+            return Vec::new();
+        }
+        let Some(prog) = self.config.agy_program.as_deref() else {
+            return Vec::new();
+        };
+        let Ok(canon) = std::fs::canonicalize(prog) else {
+            return Vec::new();
+        };
+        if !std::fs::symlink_metadata(&canon).is_ok_and(|meta| meta.is_file()) {
+            return Vec::new();
+        }
+        let forbidden = self.forbidden_home_targets();
+        let safe = |dest: &Path| {
+            dest.starts_with(home)
+                && dest != home
+                && !paths_overlap(dest, ctx.private)
+                && !paths_overlap(dest, engine_home)
+                && !forbidden.iter().any(|bad| paths_overlap(dest, bad))
+        };
+        let mut binds = Vec::new();
+        if safe(&canon) {
+            binds.push((canon.clone(), canon.clone()));
+        }
+        if let Ok(prosp) = prospective_canonical(prog)
+            && prosp != canon
+            && safe(&prosp)
+        {
+            binds.push((canon, prosp));
+        }
+        binds
+    }
+
+    fn resolve_extra_mounts(
+        &self,
+        ctx: &BindContext<'_>,
+        home: &Path,
+        engine_home: &Path,
+    ) -> Result<Vec<(PathBuf, bool)>, String> {
+        let mut extra_binds = Vec::new();
+        for mount in &self.config.extra_mounts {
+            let resolved = std::fs::canonicalize(&mount.path)
+                .map_err(|error| format!("extra mount {}: {error}", mount.path.display()))?;
+            let meta = std::fs::symlink_metadata(&resolved)
+                .map_err(|error| format!("extra mount {}: {error}", resolved.display()))?;
+            if !meta.is_dir() && !meta.is_file() {
+                return Err(format!(
+                    "extra mount {} is neither a directory nor a regular file",
+                    resolved.display()
+                ));
+            }
+            Self::refuse_extra_target(&resolved, "extra mount", ctx, home)?;
+            if paths_overlap(&resolved, engine_home) {
+                return Err(format!(
+                    "extra mount {} overlaps the engine's home {}",
+                    resolved.display(),
+                    engine_home.display()
+                ));
+            }
+            extra_binds.push((resolved, mount.writable));
+        }
+        Ok(extra_binds)
+    }
+
+    /// Build the root filesystem prefix and namespace flags.
+    ///
+    /// Host network namespace MUST remain shared (never pass `--unshare-net`)
+    /// so sandboxed agents retain loopback access to `127.0.0.1:8791`
+    /// (`model-relay` / local control plane per `#113`).
+    fn append_root_prefix(&self, words: &mut Vec<String>) -> Result<(), String> {
+        if let Some(target) = &self.config.canonical_workspace {
+            match std::fs::symlink_metadata(target) {
+                Ok(meta) if meta.is_dir() => {
+                    words.extend(["--ro-bind".to_string(), "/".to_string(), "/".to_string()]);
+                }
+                Ok(_) => {
+                    return Err(format!(
+                        "canonical workspace {} exists on host and is not a directory",
+                        target.display()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    emit_root_mirror_for_target(words, target)?;
+                }
+                Err(error) => {
+                    return Err(format!("canonical workspace {}: {error}", target.display()));
+                }
+            }
+        } else {
+            words.extend(["--ro-bind".to_string(), "/".to_string(), "/".to_string()]);
+        }
+        words.extend([
+            "--dev".to_string(),
+            "/dev".to_string(),
+            "--proc".to_string(),
+            "/proc".to_string(),
+            "--die-with-parent".to_string(),
+            "--unshare-pid".to_string(),
+        ]);
+        Ok(())
+    }
+
+    fn append_default_engine_binds<'a>(
+        words: &mut Vec<String>,
+        bound_dests: &mut Vec<&'a Path>,
+        engine_home: &'a Path,
+        tmpdir: &'a Path,
+    ) {
+        // The TMPDIR below the engine's home is already writable through
+        // that bind: bound again, its path would be resolved anew when
+        // `bwrap` runs, after a writer outside the view could swap it.
+        for path in [engine_home, tmpdir] {
+            if bound_dests.iter().any(|done| path.starts_with(done)) {
+                continue;
+            }
+            bound_dests.push(path);
+            words.extend(["--bind".to_string(), path_word(path), path_word(path)]);
+        }
+    }
+
+    fn append_canonical_env(
+        &self,
+        words: &mut Vec<String>,
+        launch: &ViewedLaunch<'_>,
+        binds: &PlannedBinds<'_>,
+    ) {
+        let Some(target) = &self.config.canonical_workspace else {
+            return;
+        };
+        words.extend([
+            "--setenv".to_string(),
+            "SPAWN_WORKSPACE".to_string(),
+            path_word(target),
+            "--setenv".to_string(),
+            "SPAWN_SANDBOX_CANONICAL_WORKSPACE".to_string(),
+            path_word(target),
+            "--setenv".to_string(),
+            "PWD".to_string(),
+            path_word(target),
+        ]);
+        if let Some(ef) = launch.exit_file {
+            let ef_path = Path::new(ef);
+            if let Some(rel) = ef_path
+                .strip_prefix(Path::new(launch.workspace))
+                .ok()
+                .or_else(|| ef_path.strip_prefix(binds.workspace_src).ok())
+                .filter(|rel| !rel.as_os_str().is_empty())
+            {
+                words.extend([
+                    "--setenv".to_string(),
+                    "SPAWN_EXIT_FILE".to_string(),
+                    path_word(&target.join(rel)),
+                ]);
+            }
+        }
+    }
+
+    fn append_binds_and_env(
+        &self,
+        words: &mut Vec<String>,
+        launch: &ViewedLaunch<'_>,
+        binds: &PlannedBinds<'_>,
+    ) {
+        let mut bound_dests: Vec<&Path> = vec![binds.workspace_dest];
+        words.extend([
+            "--bind".to_string(),
+            path_word(binds.workspace_src),
+            path_word(binds.workspace_dest),
+        ]);
+
+        if let Some(plan) = binds.agy_plan {
+            if self.config.isolate_workers {
+                bound_dests.push(binds.engine_home);
+                words.extend([
+                    "--bind".to_string(),
+                    path_word(&plan.worker_home),
+                    path_word(binds.engine_home),
+                ]);
+                for (src, rel) in &plan.overlays {
+                    words.extend([
+                        "--ro-bind".to_string(),
+                        path_word(src),
+                        path_word(&binds.engine_home.join(rel)),
+                    ]);
+                }
+                if let Some(shared_brain) = &plan.shared_brain {
+                    words.extend([
+                        "--bind".to_string(),
+                        path_word(shared_brain),
+                        path_word(&binds.engine_home.join("brain")),
+                    ]);
+                }
+                words.extend([
+                    "--bind".to_string(),
+                    path_word(binds.tmpdir),
+                    path_word(binds.tmpdir),
+                    "--setenv".to_string(),
+                    "XDG_CACHE_HOME".to_string(),
+                    path_word(&binds.engine_home.join("xdg-cache")),
+                ]);
+            } else {
+                Self::append_default_engine_binds(
+                    words,
+                    &mut bound_dests,
+                    binds.engine_home,
+                    binds.tmpdir,
+                );
+                let brain_src = plan
+                    .shared_brain
+                    .clone()
+                    .unwrap_or_else(|| plan.worker_home.join("brain"));
+                words.extend([
+                    "--bind".to_string(),
+                    path_word(&brain_src),
+                    path_word(&binds.engine_home.join("brain")),
+                ]);
+            }
+        } else {
+            Self::append_default_engine_binds(
+                words,
+                &mut bound_dests,
+                binds.engine_home,
+                binds.tmpdir,
+            );
+        }
+
+        for (resolved, writable) in binds.extra_binds {
+            let flag = if *writable { "--bind" } else { "--ro-bind" };
+            words.extend([flag.to_string(), path_word(resolved), path_word(resolved)]);
+        }
+        for (src, dest) in binds.engine_ro_binaries {
+            words.extend(["--ro-bind".to_string(), path_word(src), path_word(dest)]);
+        }
+
+        words.extend([
+            "--setenv".to_string(),
+            "TMPDIR".to_string(),
+            path_word(binds.tmpdir),
+        ]);
+        self.append_canonical_env(words, launch, binds);
+        words.extend([
+            "--chdir".to_string(),
+            path_word(binds.workspace_dest),
+            "--".to_string(),
+        ]);
     }
 
     /// The view of one launch: every target resolved now, the masks first
@@ -639,63 +1258,69 @@ impl BwrapView {
     /// or the engine's home cannot be bound without uncovering a mask, or
     /// cannot be made.
     pub fn plan(&self, launch: &ViewedLaunch<'_>) -> Result<Plan, String> {
+        self.validate_config()?;
         let workspace = canonical_directory(Path::new(launch.workspace), "the workspace")?;
+        let workspace_dest = self
+            .config
+            .canonical_workspace
+            .as_deref()
+            .unwrap_or(&workspace);
+        let home =
+            std::fs::canonicalize(&self.config.home).unwrap_or_else(|_| self.config.home.clone());
         let private = self.private_dir()?;
         let (all_directories, all_files, skipped) = self.targets();
         let masked: Vec<&PathBuf> = all_directories.iter().chain(all_files.iter()).collect();
-        let extra_writable: Vec<PathBuf> = self
-            .config
-            .extra_writable
-            .iter()
-            .map(|dir| canonical_directory(dir, "the extra writable directory"))
-            .collect::<Result<Vec<_>, _>>()?;
-        let agy_data_dir = if launch.engine == "agy" {
-            self.config
-                .agy_data_dir
-                .as_deref()
-                .map(|dir| canonical_directory(dir, "the agy data directory"))
-                .transpose()?
-        } else {
-            None
+        let ctx = BindContext {
+            workspace_src: &workspace,
+            workspace_dest,
+            private: &private,
+            masked: &masked,
         };
+        let (directories, files) = prune_nested(&all_directories, &all_files);
+
         // The engine's home is checked where it would resolve before
         // anything is made on disk: a refused one is never created.
         let wanted = Path::new(launch.engine_home);
         let prospective = prospective_canonical(wanted)
             .map_err(|why| format!("the engine's home {}: {why}", wanted.display()))?;
-        self.refuse_binds(
-            &workspace,
-            &prospective,
-            &extra_writable,
-            agy_data_dir.as_deref(),
-            &private,
-            &masked,
-        )?;
-        let engine_home = make_engine_home(wanted, &prospective)?;
-        // Made: checked again where it does resolve.
-        self.refuse_binds(
-            &workspace,
-            &engine_home,
-            &extra_writable,
-            agy_data_dir.as_deref(),
-            &private,
-            &masked,
-        )?;
-        let agy = prepare_agy_data(&engine_home, &workspace, agy_data_dir.as_deref())?;
-        let (directories, files) = prune_nested(&all_directories, &all_files);
+        self.refuse_binds(&ctx, &prospective)?;
 
-        let mut words = vec![
-            self.program.display().to_string(),
-            "--ro-bind".to_string(),
-            "/".to_string(),
-            "/".to_string(),
-            "--dev".to_string(),
-            "/dev".to_string(),
-            "--proc".to_string(),
-            "/proc".to_string(),
-            "--die-with-parent".to_string(),
-            "--unshare-pid".to_string(),
-        ];
+        let data_root = (launch.engine == "agy")
+            .then_some(self.config.agy_data_dir.as_deref())
+            .flatten();
+        let isolate_workers = data_root.is_some() && self.config.isolate_workers;
+        let covered_by_tmpfs = directories
+            .iter()
+            .any(|mask| prospective.starts_with(mask) && prospective != *mask);
+
+        let engine_home = if isolate_workers && std::fs::symlink_metadata(wanted).is_ok() {
+            let made = canonical_directory(wanted, "the engine's home")?;
+            self.refuse_binds(&ctx, &made)?;
+            made
+        } else if isolate_workers && covered_by_tmpfs {
+            // Covered by a parent `--tmpfs` mask (`$HOME` or `~/.gemini`):
+            // `bwrap` creates the mountpoint inside the tmpfs with zero host writes.
+            prospective
+        } else {
+            let made = make_engine_home(wanted, &prospective)?;
+            self.refuse_binds(&ctx, &made)?;
+            made
+        };
+
+        let agy_plan = match data_root {
+            Some(root) => Some(self.prepare_agy_data(root, launch, &engine_home, &ctx, &home)?),
+            None => None,
+        };
+        let tmpdir = match &agy_plan {
+            Some(plan) if self.config.isolate_workers => plan.worker_tmp.clone(),
+            _ => engine_tmpdir(&engine_home)?,
+        };
+        let extra_binds = self.resolve_extra_mounts(&ctx, &home, &engine_home)?;
+        let engine_ro_binaries = self.resolve_engine_ro_binaries(launch, &home, &engine_home, &ctx);
+
+        let mut words = vec![self.program.display().to_string()];
+        self.append_root_prefix(&mut words)?;
+
         let mut masks = Vec::new();
         for dir in &directories {
             words.extend(["--tmpfs".to_string(), path_word(dir)]);
@@ -708,37 +1333,20 @@ impl BwrapView {
                 masks.push(Mask::File(file.clone()));
             }
         }
-        // The TMPDIR below the engine's home is already writable through
-        // that bind: bound again, its path would be resolved anew when
-        // `bwrap` runs, after a writer outside the view could swap it.
-        let mut bound: Vec<&Path> = Vec::new();
-        for path in [workspace.as_path()]
-            .into_iter()
-            .chain((!agy.replace_engine_home).then_some(engine_home.as_path()))
-            .chain([agy.tmpdir.as_path()])
-            .chain(extra_writable.iter().map(PathBuf::as_path))
-        {
-            if bound.iter().any(|done| path.starts_with(done)) {
-                continue;
-            }
-            bound.push(path);
-            words.extend(["--bind".to_string(), path_word(path), path_word(path)]);
-        }
-        for (src, dst) in &agy.writable_binds {
-            words.extend(["--bind".to_string(), path_word(src), path_word(dst)]);
-        }
-        for (src, dst) in &agy.readonly_binds {
-            words.extend(["--ro-bind".to_string(), path_word(src), path_word(dst)]);
-        }
-        words.extend([
-            "--setenv".to_string(),
-            "TMPDIR".to_string(),
-            path_word(&agy.tmpdir),
-            "--chdir".to_string(),
-            path_word(&workspace),
-            "--".to_string(),
-        ]);
-        let tmpdir = agy.tmpdir;
+
+        self.append_binds_and_env(
+            &mut words,
+            launch,
+            &PlannedBinds {
+                workspace_src: &workspace,
+                workspace_dest,
+                engine_home: &engine_home,
+                tmpdir: &tmpdir,
+                agy_plan: agy_plan.as_ref(),
+                extra_binds: &extra_binds,
+                engine_ro_binaries: &engine_ro_binaries,
+            },
+        );
         Ok(Plan {
             words,
             masks,
@@ -748,31 +1356,107 @@ impl BwrapView {
     }
 }
 
-struct AgyIsolation {
-    tmpdir: PathBuf,
-    replace_engine_home: bool,
-    writable_binds: Vec<(PathBuf, PathBuf)>,
-    readonly_binds: Vec<(PathBuf, PathBuf)>,
+struct PlannedBinds<'a> {
+    workspace_src: &'a Path,
+    workspace_dest: &'a Path,
+    engine_home: &'a Path,
+    tmpdir: &'a Path,
+    agy_plan: Option<&'a AgyDataPlan>,
+    extra_binds: &'a [(PathBuf, bool)],
+    engine_ro_binaries: &'a [(PathBuf, PathBuf)],
 }
 
-fn copy_seed_file(src: &Path, dst: &Path) -> Result<(), String> {
-    if dst.exists() || !std::fs::metadata(src).is_ok_and(|meta| meta.is_file()) {
+struct BindContext<'a> {
+    workspace_src: &'a Path,
+    workspace_dest: &'a Path,
+    private: &'a Path,
+    masked: &'a [&'a PathBuf],
+}
+
+struct AgyDataPlan {
+    worker_home: PathBuf,
+    worker_tmp: PathBuf,
+    overlays: Vec<(PathBuf, &'static str)>,
+    shared_brain: Option<PathBuf>,
+}
+
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+fn validate_abs_clean(path: &Path, what: &str) -> Result<(), String> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(format!("{what} {} is not absolute", path.display()));
+    }
+    if path == Path::new("/") {
+        return Err(format!("{what} cannot be /"));
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+    {
+        return Err(format!(
+            "{what} {} cannot contain `.` or `..`",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_dir_0700(path: &Path, what: &str) -> Result<PathBuf, String> {
+    if std::fs::symlink_metadata(path).is_err() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(|error| format!("create {what} {}: {error}", path.display()))?;
+    }
+    canonical_directory(path, what)
+}
+
+static ATOMIC_SEED_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn copy_file_atomic_noclobber(src: &Path, dst: &Path, mode: u32) -> Result<(), String> {
+    if std::fs::symlink_metadata(dst).is_ok() {
         return Ok(());
     }
     let bytes = std::fs::read(src).map_err(|error| format!("read {}: {error}", src.display()))?;
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(dst)
-    {
-        Ok(mut file) => {
-            use std::io::Write;
-            file.write_all(&bytes)
-                .map_err(|error| format!("write {}: {error}", dst.display()))
+    let parent = dst
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", dst.display()))?;
+    let (tmp_path, mut tmp_file) = loop {
+        let seq = ATOMIC_SEED_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".seed-{}-{seq}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!("create temp seed {}: {error}", candidate.display()));
+            }
         }
+    };
+    let write_res = tmp_file.write_all(&bytes);
+    drop(tmp_file);
+    if let Err(error) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("write {}: {error}", dst.display()));
+    }
+    if let Err(error) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode)) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("chmod {}: {error}", dst.display()));
+    }
+    let link_res = std::fs::hard_link(&tmp_path, dst);
+    let _ = std::fs::remove_file(&tmp_path);
+    match link_res {
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(format!("create {}: {error}", dst.display())),
+        Err(error) => Err(format!("publish {}: {error}", dst.display())),
     }
 }
 
@@ -783,77 +1467,104 @@ fn ensure_empty_mount_file(path: &Path) -> Result<(), String> {
         .mode(0o600)
         .open(path)
     {
-        Ok(_) => Ok(()),
+        Ok(file) => {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("chmod {}: {error}", path.display()))?;
+            Ok(())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(format!("create {}: {error}", path.display())),
     }
 }
 
-fn prepare_agy_data(
-    engine_home: &Path,
-    workspace: &Path,
-    agy_data_dir: Option<&Path>,
-) -> Result<AgyIsolation, String> {
-    let Some(data_dir) = agy_data_dir else {
-        return Ok(AgyIsolation {
-            tmpdir: engine_tmpdir(engine_home)?,
-            replace_engine_home: false,
-            writable_binds: Vec::new(),
-            readonly_binds: Vec::new(),
-        });
-    };
-    let pool_root = ensure_sub_dir(data_dir, "workers")?;
-    let worker_key = worker_dir_key(workspace);
-    let isolated = ensure_sub_dir(&pool_root, &worker_key)?;
-    let isolated_home = ensure_sub_dir(&isolated, "home")?;
-    let data_tmp = ensure_sub_dir(&isolated, "tmp")?;
+fn emit_root_mirror_for_target(words: &mut Vec<String>, target: &Path) -> Result<(), String> {
+    use std::path::Component;
+    let parts: Vec<std::ffi::OsString> = target
+        .components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    let refs: Vec<&std::ffi::OsStr> = parts.iter().map(std::ffi::OsString::as_os_str).collect();
+    mirror_dir_for_target(words, Path::new("/"), &refs)
+}
 
-    let mut writable_binds = Vec::with_capacity(1 + AGY_SHARED_SUBDIRS.len());
-    writable_binds.push((isolated_home.clone(), engine_home.to_path_buf()));
-
-    for sub in AGY_SHARED_SUBDIRS {
-        let src = ensure_sub_dir(data_dir, sub)?;
-        let _mountpoint = ensure_sub_dir(&isolated_home, sub)?;
-        writable_binds.push((src, engine_home.join(sub)));
+fn mirror_dir_for_target(
+    words: &mut Vec<String>,
+    dir: &Path,
+    remaining: &[&std::ffi::OsStr],
+) -> Result<(), String> {
+    if remaining.is_empty() {
+        words.extend(["--dir".to_string(), path_word(dir)]);
+        return Ok(());
     }
-    for sub in AGY_ISOLATED_SUBDIRS {
-        let _dir = ensure_sub_dir(&isolated_home, sub)?;
+    if dir != Path::new("/") {
+        words.extend(["--dir".to_string(), path_word(dir)]);
     }
-    for rel in AGY_SEED_FILES {
-        copy_seed_file(&engine_home.join(rel), &isolated_home.join(rel))?;
-    }
-
-    let mut readonly_binds = Vec::new();
-    for dir in AGY_RO_DIRS {
-        let host_dir = engine_home.join(dir);
-        if std::fs::metadata(&host_dir).is_ok_and(|meta| meta.is_dir()) {
-            let _mountpoint = ensure_sub_dir(&isolated_home, dir)?;
-            let src = std::fs::canonicalize(&host_dir)
-                .map_err(|error| format!("{}: {error}", host_dir.display()))?;
-            readonly_binds.push((src, host_dir));
+    words.extend(["--tmpfs".to_string(), path_word(dir)]);
+    let is_root = dir == Path::new("/");
+    let mut entries: Vec<(std::ffi::OsString, PathBuf)> = std::fs::read_dir(dir)
+        .map_err(|error| format!("read {}: {error}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| (entry.file_name(), entry.path()))
+        .collect();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let head = remaining[0];
+    for (name, path) in entries {
+        if name.as_os_str() == head || (is_root && (name == "dev" || name == "proc")) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            if let Ok(link_target) = std::fs::read_link(&path) {
+                words.extend([
+                    "--symlink".to_string(),
+                    path_word(&link_target),
+                    path_word(&path),
+                ]);
+            }
+        } else {
+            words.extend([
+                "--ro-bind-try".to_string(),
+                path_word(&path),
+                path_word(&path),
+            ]);
         }
     }
-    for file in AGY_RO_FILES {
-        let host_file = engine_home.join(file);
-        if std::fs::metadata(&host_file).is_ok_and(|meta| meta.is_file()) {
-            ensure_empty_mount_file(&isolated_home.join(file))?;
-            let src = std::fs::canonicalize(&host_file)
-                .map_err(|error| format!("{}: {error}", host_file.display()))?;
-            readonly_binds.push((src, host_file));
+    let next = dir.join(head);
+    if is_root {
+        words.extend([
+            "--dir".to_string(),
+            "/dev".to_string(),
+            "--dir".to_string(),
+            "/proc".to_string(),
+        ]);
+    }
+    if remaining.len() == 1 {
+        words.extend(["--dir".to_string(), path_word(&next)]);
+    } else if std::fs::symlink_metadata(&next).is_ok_and(|meta| meta.is_dir()) {
+        mirror_dir_for_target(words, &next, &remaining[1..])?;
+    } else {
+        let mut cur = dir.to_path_buf();
+        for comp in remaining {
+            cur.push(comp);
+            words.extend(["--dir".to_string(), path_word(&cur)]);
         }
     }
-
-    Ok(AgyIsolation {
-        tmpdir: data_tmp,
-        replace_engine_home: true,
-        writable_binds,
-        readonly_binds,
-    })
+    words.extend(["--remount-ro".to_string(), path_word(dir)]);
+    Ok(())
 }
 
 impl EngineView for BwrapView {
     fn name(&self) -> &'static str {
         "bwrap"
+    }
+
+    fn canonical_workspace(&self) -> Option<&Path> {
+        self.config.canonical_workspace.as_deref()
     }
 
     /// [`BwrapView::plan`]'s words; each skipped target said on the
@@ -884,13 +1595,7 @@ impl EngineView for BwrapView {
 /// when missing, and still below that home once resolved (a link out of
 /// it is refused). Never the loop's shared `TMPDIR`.
 fn engine_tmpdir(engine_home: &Path) -> Result<PathBuf, String> {
-    ensure_sub_dir(engine_home, TMP_FALLBACK)
-}
-
-/// Create `parent/name` (mode `0700`) if missing, canonicalize it, and verify
-/// it remains strictly inside `parent` so symlinks cannot escape.
-fn ensure_sub_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
-    let dir = parent.join(name);
+    let dir = engine_home.join(TMP_FALLBACK);
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -898,42 +1603,15 @@ fn ensure_sub_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
     }
     let canonical =
         std::fs::canonicalize(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-    if canonical.is_dir() && canonical.starts_with(parent) && canonical != parent {
+    if canonical.is_dir() && canonical.starts_with(engine_home) && canonical != engine_home {
         Ok(canonical)
     } else {
         Err(format!(
-            "{} resolves outside its parent {}",
+            "the engine's TMPDIR {} leaves its home {}",
             dir.display(),
-            parent.display()
+            engine_home.display()
         ))
     }
-}
-
-/// Deterministic worker isolation directory key derived from `workspace`:
-/// sanitized basename + 64-bit FNV-1a hash of the canonical workspace path.
-fn worker_dir_key(workspace: &Path) -> String {
-    let raw_name = workspace
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("ws");
-    let prefix: String = raw_name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .take(32)
-        .collect();
-    let prefix = if prefix.is_empty() { "ws" } else { &prefix };
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in workspace.to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3_u64);
-    }
-    format!("{prefix}-{hash:016x}")
 }
 
 /// The masks the words carry: `directories` and `files` less every one
@@ -1057,18 +1735,23 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.mode() & 0o111 != 0)
 }
 
+fn find_program_entry(program: &str, path_env: Option<&str>) -> Option<PathBuf> {
+    if program.contains('/') {
+        let path = PathBuf::from(program);
+        return is_executable(&path).then_some(path);
+    }
+    let path_os = path_env
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"))?;
+    std::env::split_paths(&path_os)
+        .map(|dir| dir.join(program))
+        .find(|candidate| is_executable(candidate))
+}
+
 /// `program` as a path: itself when it names one, else the first
 /// executable of that name on `PATH`, canonical.
 fn find_program(program: &str) -> Option<PathBuf> {
-    if program.contains('/') {
-        let path = PathBuf::from(program);
-        return is_executable(&path).then(|| std::fs::canonicalize(&path).unwrap_or(path));
-    }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| is_executable(candidate))
-        .map(|found| std::fs::canonicalize(&found).unwrap_or(found))
+    find_program_entry(program, None).map(|found| std::fs::canonicalize(&found).unwrap_or(found))
 }
 
 #[cfg(test)]
@@ -1099,8 +1782,13 @@ mod tests {
             extra_files: Vec::new(),
             host_tmpdir: None,
             private_dir: runtime.join("spawn-engine-view-test"),
-            extra_writable: Vec::new(),
+            canonical_workspace: None,
+            home_isolation: super::HomeIsolation::Blacklist,
+            extra_mounts: Vec::new(),
             agy_data_dir: None,
+            isolate_workers: false,
+            isolate_brain: false,
+            agy_program: None,
         };
         let view = BwrapView {
             program: PathBuf::from("/usr/bin/bwrap"),
@@ -1114,6 +1802,8 @@ mod tests {
             engine: "agy",
             workspace: &workspace.display().to_string(),
             engine_home: &engine_home.display().to_string(),
+            worker_id: None,
+            exit_file: None,
         })
     }
 
@@ -1268,121 +1958,239 @@ mod tests {
             PathBuf::from(format!("/run/user/{}", crate::current_uid()))
         );
         assert_eq!(config.xdg_config_home, None);
+        assert_eq!(config.canonical_workspace, None);
+        assert_eq!(config.home_isolation, super::HomeIsolation::Blacklist);
+        assert!(config.extra_mounts.is_empty());
+        assert_eq!(config.agy_data_dir, None);
+        assert!(!config.isolate_workers);
+        assert!(!config.isolate_brain);
     }
 
     #[test]
-    fn extra_writable_parses_comma_and_colon_and_refuses_home_or_masked() {
-        let parsed = ViewConfig::from_env(&lookup(&[
+    fn parse_extra_mounts_handles_ro_rw_and_default() {
+        use super::{ExtraMount, parse_extra_mounts};
+        assert_eq!(
+            parse_extra_mounts(" /opt/tools:ro , /data/cache/:rw , /var/lib/ref:/var/lib/two "),
+            vec![
+                ExtraMount {
+                    path: PathBuf::from("/opt/tools"),
+                    writable: false,
+                },
+                ExtraMount {
+                    path: PathBuf::from("/data/cache"),
+                    writable: true,
+                },
+                ExtraMount {
+                    path: PathBuf::from("/var/lib/ref"),
+                    writable: true,
+                },
+                ExtraMount {
+                    path: PathBuf::from("/var/lib/two"),
+                    writable: true,
+                },
+            ]
+        );
+        assert!(parse_extra_mounts(" , ").is_empty());
+    }
+
+    #[test]
+    fn from_env_reads_canonical_workspace_whitelist_extra_mounts_and_agy_data_dir() {
+        let enabled = ViewConfig::from_env(&lookup(&[
             ("HOME", "/home/u"),
-            ("SPAWN_ENGINE_VIEW_WRITABLE", " /data01/deps , :/opt/cache "),
-            ("SPAWN_AGY_DATA_DIR", " /data01/agy-data "),
+            ("SPAWN_SANDBOX_CANONICAL_WORKSPACE", "/workspace/"),
+            ("SPAWN_SANDBOX_HOME_ISOLATION", "whitelist"),
+            ("SPAWN_ENGINE_VIEW_WRITABLE", "/opt/a:ro,/opt/b"),
+            ("SPAWN_AGY_DATA_DIR", "/data01/agy/"),
         ]));
         assert_eq!(
-            parsed.extra_writable,
-            vec![PathBuf::from("/data01/deps"), PathBuf::from("/opt/cache")]
+            enabled.canonical_workspace,
+            Some(PathBuf::from("/workspace"))
         );
-        assert_eq!(parsed.agy_data_dir, Some(PathBuf::from("/data01/agy-data")));
+        assert_eq!(enabled.home_isolation, super::HomeIsolation::Whitelist);
+        assert_eq!(enabled.extra_mounts.len(), 2);
+        assert!(!enabled.extra_mounts[0].writable);
+        assert!(enabled.extra_mounts[1].writable);
+        assert_eq!(enabled.agy_data_dir, Some(PathBuf::from("/data01/agy")));
+        assert!(enabled.isolate_workers);
+        assert!(!enabled.isolate_brain);
 
-        let scratch = crate::Scratch::new("spawn-view-extra");
+        let isolated_brain = ViewConfig::from_env(&lookup(&[
+            ("HOME", "/home/u"),
+            ("SPAWN_AGY_DATA_DIR", "/data01/agy"),
+            ("SPAWN_AGY_ISOLATE_BRAIN", "1"),
+        ]));
+        assert!(isolated_brain.isolate_workers);
+        assert!(isolated_brain.isolate_brain);
+
+        let disabled = ViewConfig::from_env(&lookup(&[
+            ("HOME", "/home/u"),
+            ("SPAWN_SANDBOX_CANONICAL_WORKSPACE", "OFF"),
+            ("SPAWN_AGY_DATA_DIR", "/data01/agy"),
+            ("SPAWN_AGY_ISOLATE_WORKERS", "0"),
+            ("SPAWN_AGY_ISOLATE_BRAIN", "0"),
+        ]));
+        assert_eq!(disabled.canonical_workspace, None);
+        assert!(!disabled.isolate_workers);
+        assert!(!disabled.isolate_brain);
+    }
+
+    #[test]
+    fn canonical_workspace_validation_rejects_invalid_and_overlapping_paths() {
+        let scratch = crate::Scratch::new("spawn-view-unit");
         let (mut view, workspace, engine_home) = view_in(&scratch);
-        let staging = scratch.join("shared-deps");
-        std::fs::create_dir_all(&staging).expect("staging");
-        view.config.extra_writable = vec![staging.clone()];
-        let planned = plan(&view, &workspace, &engine_home).expect("outside home allowed");
+        let canon_home = std::fs::canonicalize(&view.config.home).expect("home");
+        for bad in [
+            PathBuf::from("relative/ws"),
+            PathBuf::from("/"),
+            PathBuf::from("/ws/../other"),
+            canon_home.join("ws"),
+            PathBuf::from("/run/ws"),
+            PathBuf::from("/tmp/ws"),
+            view.config.private_dir.clone(),
+        ] {
+            view.config.canonical_workspace = Some(bad.clone());
+            let err = plan(&view, &workspace, &engine_home).expect_err(&format!("{bad:?}"));
+            assert!(err.contains("canonical workspace"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn whitelist_mode_masks_home_keeps_host_masks_and_refuses_home_binds() {
+        let scratch = crate::Scratch::new("spawn-view-unit");
+        let (mut view, workspace, engine_home) = view_in(&scratch);
+        view.config.home_isolation = super::HomeIsolation::Whitelist;
+        let host_tmp = scratch.join("host-tmp");
+        std::fs::create_dir_all(&host_tmp).expect("host tmp");
+        view.config.host_tmpdir = Some(host_tmp.clone());
+
+        let planned = plan(&view, &workspace, &engine_home).expect("whitelist plan");
+        let canon_home = std::fs::canonicalize(&view.config.home).expect("home");
+        let canon_host_tmp = std::fs::canonicalize(&host_tmp).expect("host tmp");
+        assert!(
+            planned
+                .masks
+                .contains(&super::Mask::Directory(canon_home.clone()))
+        );
+        assert!(
+            planned
+                .masks
+                .contains(&super::Mask::Directory(canon_host_tmp))
+        );
+        // Nested ~/.ssh inside $HOME is pruned from emitted masks.
+        let canon_ssh = std::fs::canonicalize(view.config.home.join(".ssh")).expect("ssh");
+        assert!(!planned.masks.contains(&super::Mask::Directory(canon_ssh)));
+        // Missing files inside $HOME are already covered by --tmpfs $HOME, not skipped.
+        assert!(
+            !planned
+                .skipped
+                .iter()
+                .any(|(path, _)| path.starts_with(&view.config.home)),
+            "{:?}",
+            planned.skipped
+        );
+
+        // Workspace inside $HOME without canonical_workspace is refused.
+        let ws_in_home = view.config.home.join("proj");
+        std::fs::create_dir_all(&ws_in_home).expect("proj");
+        let err = plan(&view, &ws_in_home, &engine_home).expect_err("ws in home");
+        assert!(err.contains("overlaps"), "{err}");
+
+        // With canonical_workspace=/workspace, ~/proj mounts outside $HOME cleanly.
+        view.config.canonical_workspace = Some(PathBuf::from("/workspace"));
+        let err_extra = {
+            view.config.extra_mounts = vec![super::ExtraMount {
+                path: view.config.home.join("extra"),
+                writable: true,
+            }];
+            plan(&view, &workspace, &engine_home).expect_err("extra in home")
+        };
+        assert!(err_extra.contains("overlaps $HOME"), "{err_extra}");
+        view.config.extra_mounts.clear();
+
+        // Engine home == $HOME or inside ~/.ssh is refused even in whitelist mode.
+        assert!(plan(&view, &workspace, &view.config.home).is_err());
+        let missing_ssh = view.config.home.join(".ssh/sub");
+        assert!(plan(&view, &workspace, &missing_ssh).is_err());
+    }
+
+    #[test]
+    fn canonical_workspace_rewrites_bind_chdir_pwd_and_exit_file() {
+        let scratch = crate::Scratch::new("spawn-view-unit");
+        let (mut view, workspace, engine_home) = view_in(&scratch);
+        view.config.canonical_workspace = Some(PathBuf::from("/workspace"));
+        let canon_ws = std::fs::canonicalize(&workspace).expect("ws");
+        let ef = workspace.join(".spawn/exit/exec_1");
+        let planned = view
+            .plan(&ViewedLaunch {
+                engine: "agy",
+                workspace: &workspace.display().to_string(),
+                engine_home: &engine_home.display().to_string(),
+                worker_id: Some("agent_1"),
+                exit_file: Some(&ef.display().to_string()),
+            })
+            .expect("plan");
+        let ws_src = canon_ws.display().to_string();
         assert!(
             planned
                 .words
                 .windows(3)
-                .any(|w| { w[0] == "--bind" && w[1] == staging.to_string_lossy() && w[2] == w[1] })
+                .any(|w| w == ["--bind", ws_src.as_str(), "/workspace"])
         );
-
-        let bad_in_home = view.config.home.join(".ssh");
-        std::fs::create_dir_all(&bad_in_home).expect("ssh");
-        view.config.extra_writable = vec![bad_in_home];
-        assert!(plan(&view, &workspace, &engine_home).is_err());
-    }
-
-    #[test]
-    fn agy_data_dir_shares_brain_and_isolates_per_worker_dirs() {
-        let scratch = crate::Scratch::new("spawn-view-agy-iso");
-        let (mut view, ws1, engine_home) = view_in(&scratch);
-        let host_home = PathBuf::from(&engine_home);
-        for dir in ["cache", "bin", "builtin"] {
-            std::fs::create_dir_all(host_home.join(dir)).expect("host dir");
-        }
-        let seeds = [
-            ("cache/onboarding.json", r#"{"onboardingComplete":true}"#),
-            ("settings.json", r#"{"trustedWorkspaces":[]}"#),
-            ("jetski_state.pbtxt", "installation_uuid: \"x\"\n"),
-            ("installation_id", "id-123"),
-        ];
-        for (rel, body) in seeds {
-            std::fs::write(host_home.join(rel), body).expect("seed");
-        }
-        std::fs::write(
-            host_home.join("antigravity-oauth-token"),
-            "top-secret-token",
-        )
-        .expect("oauth");
-
-        let ws2 = scratch.join("ws-two");
-        std::fs::create_dir_all(&ws2).expect("ws2");
-        let data_dir = scratch.join("agy-data");
-        std::fs::create_dir_all(&data_dir).expect("data_dir");
-        view.config.agy_data_dir = Some(data_dir.clone());
-
-        let plan1 = plan(&view, &ws1, &engine_home).expect("plan ws1");
-        let plan2 = plan(&view, &ws2, &engine_home).expect("plan ws2");
-        assert_ne!(plan1.tmpdir, plan2.tmpdir);
-        assert!(plan1.tmpdir.starts_with(&data_dir));
-        assert!(plan2.tmpdir.starts_with(&data_dir));
-
-        let bind_of = |words: &[String], flag: &str, dst: &Path| -> Option<String> {
-            let dst_str = dst.to_string_lossy();
-            words
+        assert!(
+            !planned
+                .words
                 .windows(3)
-                .filter(|w| w[0] == flag && w[2] == dst_str)
-                .map(|w| w[1].clone())
-                .next_back()
-        };
-        let home1 = bind_of(&plan1.words, "--bind", &host_home).expect("isolated home1");
-        let home2 = bind_of(&plan2.words, "--bind", &host_home).expect("isolated home2");
-        assert_ne!(home1, home2);
-        assert!(home1.contains("/workers/") && home1.ends_with("/home"));
-        assert!(home2.contains("/workers/") && home2.ends_with("/home"));
+                .any(|w| w == ["--bind", ws_src.as_str(), ws_src.as_str()])
+        );
+        assert!(
+            planned
+                .words
+                .windows(2)
+                .any(|w| w == ["--chdir", "/workspace"])
+        );
+        assert!(
+            planned
+                .words
+                .windows(3)
+                .any(|w| w == ["--setenv", "SPAWN_WORKSPACE", "/workspace"])
+        );
+        assert!(planned.words.windows(3).any(|w| w
+            == [
+                "--setenv",
+                "SPAWN_SANDBOX_CANONICAL_WORKSPACE",
+                "/workspace"
+            ]));
+        assert!(
+            planned
+                .words
+                .windows(3)
+                .any(|w| w == ["--setenv", "PWD", "/workspace"])
+        );
+        assert!(planned.words.windows(3).any(|w| w
+            == [
+                "--setenv",
+                "SPAWN_EXIT_FILE",
+                "/workspace/.spawn/exit/exec_1"
+            ]));
+        assert!(
+            !planned.words.iter().any(|w| w == "--unshare-net"),
+            "host netns must stay shared: {:?}",
+            planned.words
+        );
 
-        let shared_brain = data_dir.join("brain").to_string_lossy().into_owned();
-        assert_eq!(
-            bind_of(&plan1.words, "--bind", &host_home.join("brain")),
-            Some(shared_brain.clone())
+        view.config.home_isolation = super::HomeIsolation::Whitelist;
+        let whitelist_plan = view
+            .plan(&ViewedLaunch {
+                engine: "agy",
+                workspace: &workspace.display().to_string(),
+                engine_home: &engine_home.display().to_string(),
+                worker_id: Some("agent_1"),
+                exit_file: Some(&ef.display().to_string()),
+            })
+            .expect("whitelist plan");
+        assert!(
+            !whitelist_plan.words.iter().any(|w| w == "--unshare-net"),
+            "host netns must stay shared in whitelist mode"
         );
-        assert_eq!(
-            bind_of(&plan2.words, "--bind", &host_home.join("brain")),
-            Some(shared_brain)
-        );
-
-        let home1_path = PathBuf::from(&home1);
-        for (rel, body) in seeds {
-            assert_eq!(
-                std::fs::read_to_string(home1_path.join(rel)).expect("seeded"),
-                body
-            );
-        }
-        assert_eq!(
-            std::fs::read(home1_path.join("antigravity-oauth-token")).expect("empty mountpoint"),
-            Vec::<u8>::new()
-        );
-        for rel in ["antigravity-oauth-token", "bin", "builtin"] {
-            let target = host_home.join(rel);
-            assert_eq!(
-                bind_of(&plan1.words, "--ro-bind", &target),
-                Some(
-                    std::fs::canonicalize(&target)
-                        .expect("canon")
-                        .to_string_lossy()
-                        .into_owned()
-                )
-            );
-        }
     }
 }
