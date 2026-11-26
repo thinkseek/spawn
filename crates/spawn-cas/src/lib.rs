@@ -65,8 +65,8 @@ pub use gc::{
     TMP_MAX_AGE, default_quotas,
 };
 pub use git_oid::{
-    GIT_POINTER_THRESHOLD, GitOid, git_blob_oid_of_bytes, git_pointer_bytes, project_blob_oid,
-    project_snapshot_oid, project_tree_oid,
+    GIT_POINTER_THRESHOLD, GitOid, GitOidCache, git_blob_oid_of_bytes, git_pointer_bytes,
+    project_blob_oid, project_snapshot_oid, project_tree_oid,
 };
 pub use legacy::AdoptReport;
 pub use manifest::{
@@ -77,7 +77,8 @@ pub use merkle::{
     empty_tree_digest, is_valid_entry_name,
 };
 pub use store::{
-    CAS_MARKER, Clock, GcLock, ObjectEntry, Publish, Store, is_valid_name, system_clock,
+    CAS_MARKER, Clock, GcLock, GcSharedLock, ObjectEntry, Publish, Store, is_valid_name,
+    system_clock,
 };
 
 /// What a store operation refused, or the I/O error that stopped it.

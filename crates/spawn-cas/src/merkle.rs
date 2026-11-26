@@ -4,7 +4,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::chunker::CHUNK_MAX;
-use crate::store::plain_dir;
 use crate::{CasError, Digest, NS_TREE, Store, sha256_of};
 
 /// Magic header for `spawn-tree-v1` canonical tree objects.
@@ -702,11 +701,5 @@ impl Store {
         };
         let digest = self.put_tree(&tree)?;
         Ok(Some(digest))
-    }
-
-    /// Helper to check or create the `index/` directory root if called after `Store::open`.
-    #[allow(dead_code)]
-    pub(crate) fn ensure_index_root(&self) -> Result<(), CasError> {
-        plain_dir(&self.root().join("index"))
     }
 }

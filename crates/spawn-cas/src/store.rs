@@ -131,6 +131,14 @@ pub struct GcLock {
     _file: fs::File,
 }
 
+/// The shared side of the pin/GC lock ([`Store::lock_gc_shared`]), held
+/// concurrently by persistent-namespace writes/reuses to serialize against
+/// [`Store::gc`]'s exclusive lock.
+#[derive(Debug)]
+pub struct GcSharedLock {
+    _file: fs::File,
+}
+
 /// One spawn-cas root.
 pub struct Store {
     root: PathBuf,
@@ -344,6 +352,18 @@ impl Store {
         want: &Digest,
     ) -> Result<PathBuf, CasError> {
         check_name("namespace", namespace)?;
+        let _gc_guard = crate::gc::is_persistent_namespace(namespace)
+            .then(|| self.lock_gc_shared())
+            .transpose()?;
+        self.commit_unlocked(namespace, staged, want)
+    }
+
+    fn commit_unlocked(
+        &self,
+        namespace: &str,
+        staged: &Path,
+        want: &Digest,
+    ) -> Result<PathBuf, CasError> {
         let verified = (|| {
             let mut file = open_nofollow(staged)?;
             if !file.metadata()?.is_file() {
@@ -374,6 +394,9 @@ impl Store {
         want: &Digest,
     ) -> Result<PathBuf, CasError> {
         check_name("namespace", namespace)?;
+        let _gc_guard = crate::gc::is_persistent_namespace(namespace)
+            .then(|| self.lock_gc_shared())
+            .transpose()?;
         if self.has(want) {
             self.touch(namespace, want)?;
             return Ok(self.object_path(want));
@@ -385,7 +408,7 @@ impl Store {
             remove_missing_ok(&staged)?;
             return Err(error.into());
         }
-        self.commit(namespace, &staged, want)
+        self.commit_unlocked(namespace, &staged, want)
     }
 
     /// Store `bytes` under their SHA-256 digest.
@@ -415,6 +438,7 @@ impl Store {
         }
         file.set_permissions(fs::Permissions::from_mode(0o444))?;
         let digest = verified.digest();
+        let _gc_guard = self.lock_gc_shared()?;
         self.object_dir(digest)?;
         match fs::hard_link(staged, self.object_path(digest)) {
             Ok(()) => Ok(Publish::Created),
@@ -446,6 +470,9 @@ impl Store {
         digest: &Digest,
     ) -> Result<PathBuf, CasError> {
         check_name("namespace", namespace)?;
+        let _gc_guard = crate::gc::is_persistent_namespace(namespace)
+            .then(|| self.lock_gc_shared())
+            .transpose()?;
         if self.has(digest) {
             self.touch(namespace, digest)?;
             return Ok(self.object_path(digest));
@@ -594,21 +621,36 @@ impl Store {
         Ok(found)
     }
 
-    /// The exclusive side of the pin/GC lock: held by [`Store::pin`] and
-    /// [`Store::gc`], and by any other caller that deletes objects by what
-    /// is pinned (read the pins after taking it).
-    pub fn lock_gc(&self) -> Result<GcLock, CasError> {
+    fn open_gc_lock(&self) -> Result<fs::File, CasError> {
         let pins = self.root.join("pins");
         plain_dir(&pins)?;
         let file = fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(pins.join(GC_LOCK))?;
+        Ok(file)
+    }
+
+    /// The exclusive side of the pin/GC lock: held by [`Store::pin`] and
+    /// [`Store::gc`], and by any other caller that deletes objects by what
+    /// is pinned (read the pins after taking it).
+    pub fn lock_gc(&self) -> Result<GcLock, CasError> {
+        let file = self.open_gc_lock()?;
         file.lock()?;
         Ok(GcLock { _file: file })
+    }
+
+    /// The shared side of the pin/GC lock: held concurrently by persistent
+    /// write/reuse operations so [`Store::gc`] cannot delete a shared object
+    /// between existence check and persistent access-record publication.
+    pub fn lock_gc_shared(&self) -> Result<GcSharedLock, CasError> {
+        let file = self.open_gc_lock()?;
+        file.lock_shared()?;
+        Ok(GcSharedLock { _file: file })
     }
 
     /// Write `pins/<owner>/<name>`: one digest per line, replaced whole

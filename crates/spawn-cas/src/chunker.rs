@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use sha2::{Digest as _, Sha256};
 
-use crate::digest::{Hasher, decode_hex_32};
+use crate::digest::Hasher;
 use crate::store::remove_missing_ok;
 use crate::{CasError, Digest, Store, sha256_of};
 
@@ -423,12 +423,6 @@ impl Store {
         let mut out = Vec::new();
         self.stream_blob(digest, &mut out)?;
         Ok(out)
-    }
-
-    /// Expose hex decoding cleanly for internal tests/modules.
-    #[allow(dead_code)]
-    pub(crate) fn decode_sha256_hex(hex: &str) -> Option<[u8; 32]> {
-        decode_hex_32(hex)
     }
 }
 

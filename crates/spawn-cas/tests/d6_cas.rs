@@ -2,7 +2,7 @@
 //! trees/snapshots, persistent `O(|diff| + depth)` mutations, Git OID
 //! projection, and cross-language golden fixture verification.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use spawn_cas::{
     CHUNK_AVG, CHUNK_MAX, CHUNK_MIN, CHUNKER_FASTCDC_V1, CasError, ChunkIndex, ChunkRef, Digest,
-    GIT_POINTER_THRESHOLD, GitOid, NS_ARTIFACTS, NS_BASE_CACHE, NS_BLOB, NS_TREE, Quotas, Snapshot,
-    Store, Tree, TreeEntry, TreeEntryKind, TreeMutation, empty_tree_digest, fastcdc_gear_table,
-    git_blob_oid_of_bytes, git_pointer_bytes, next_chunk_len, project_blob_oid,
+    GIT_POINTER_THRESHOLD, GitOid, GitOidCache, NS_ARTIFACTS, NS_BASE_CACHE, NS_BLOB, NS_TREE,
+    Quotas, Snapshot, Store, Tree, TreeEntry, TreeEntryKind, TreeMutation, empty_tree_digest,
+    fastcdc_gear_table, git_blob_oid_of_bytes, git_pointer_bytes, next_chunk_len, project_blob_oid,
     project_snapshot_oid, project_tree_oid, sha256_of,
 };
 
@@ -237,7 +237,7 @@ fn verify_golden_merkle_and_pointer(dir: &Path, manifest: &serde_json::Value, st
         snap
     );
 
-    let mut oid_cache = HashMap::new();
+    let mut oid_cache = GitOidCache::new();
     let child_oid = project_tree_oid(store, &child_tree_digest, &mut oid_cache).expect("child");
     assert_eq!(
         child_oid.to_hex(),
@@ -409,6 +409,59 @@ fn persistent_namespaces_survive_zero_quotas_and_sync_store_succeeds() {
     assert!(store.has(&tree_digest));
     assert!(store.has(&blob.digest));
     assert_eq!(report.kept_pinned, 0);
+}
+
+#[test]
+fn ephemeral_gc_never_deletes_object_shared_with_persistent_namespaces() {
+    let scratch = Scratch::new("gc-shared-persist");
+    let store = Store::open(scratch.join("cas")).expect("open");
+
+    let shared_blob_bytes = b"shared artifact and persistent blob content";
+    let shared_blob = store
+        .put_bytes(NS_ARTIFACTS, shared_blob_bytes)
+        .expect("artifact shared blob");
+    let blob_res = store
+        .put_blob(NS_BLOB, &mut shared_blob_bytes.as_slice())
+        .expect("persistent shared blob");
+    assert_eq!(blob_res.digest, shared_blob);
+
+    let shared_empty = store.put_bytes(NS_ARTIFACTS, b"").expect("artifact empty");
+    let persistent_empty = store
+        .put_blob(NS_BLOB, &mut &b""[..])
+        .expect("persistent empty");
+    assert_eq!(persistent_empty.digest, shared_empty);
+
+    let empty_tree_bytes = Tree { entries: vec![] }.encode().expect("encode tree");
+    let shared_tree = store.put_empty_tree().expect("persistent empty tree");
+    let artifact_tree = store
+        .put_bytes(NS_ARTIFACTS, &empty_tree_bytes)
+        .expect("artifact same bytes as tree");
+    assert_eq!(artifact_tree, shared_tree);
+
+    let ephemeral_only = store
+        .put_bytes(NS_ARTIFACTS, b"only in artifacts")
+        .expect("ephemeral only");
+
+    let report = store
+        .gc(&Quotas::from([(NS_ARTIFACTS.to_string(), 0)]))
+        .expect("gc artifacts=0");
+    assert_eq!(report.namespace_use.get(NS_ARTIFACTS), Some(&0));
+    assert!(!store.has(&ephemeral_only));
+    assert!(!store.access_path(NS_ARTIFACTS, &shared_blob).exists());
+    assert!(!store.access_path(NS_ARTIFACTS, &shared_empty).exists());
+    assert!(!store.access_path(NS_ARTIFACTS, &shared_tree).exists());
+
+    for (digest, expected) in [
+        (&shared_blob, shared_blob_bytes.as_slice()),
+        (&shared_empty, &b""[..]),
+        (&shared_tree, empty_tree_bytes.as_slice()),
+    ] {
+        assert!(store.has(digest), "shared object {digest} lost during gc");
+        assert_eq!(store.read(digest).expect("read shared object"), expected);
+    }
+    assert!(store.access_path(NS_BLOB, &shared_blob).is_file());
+    assert!(store.access_path(NS_BLOB, &shared_empty).is_file());
+    assert!(store.access_path(NS_TREE, &shared_tree).is_file());
 }
 
 #[test]
@@ -729,10 +782,145 @@ fn verify_repo_head_oid(repo_root: &Path) {
             .collect(),
         commit_body,
     };
-    let mut cache = HashMap::new();
+    let mut cache = GitOidCache::new();
     let projected =
         project_snapshot_oid(&store, &snapshot, &parent_oids, &mut cache).expect("project");
     assert_eq!(projected.to_hex(), head_oid);
+}
+
+fn setup_domain_collision_roots(
+    store: &Store,
+    bare: &Path,
+) -> (Digest, Digest, Digest, String, String) {
+    let leaf_bytes = b"hello\n";
+    let leaf_blob = store
+        .put_blob(NS_BLOB, &mut leaf_bytes.as_slice())
+        .expect("leaf blob");
+    let child_tree = Tree {
+        entries: vec![TreeEntry {
+            kind: TreeEntryKind::File,
+            name: b"hello.txt".to_vec(),
+            id: leaf_blob.digest.as_bytes(),
+            size: leaf_blob.size,
+        }],
+    };
+    let child_bytes = child_tree.encode().expect("encode child tree");
+    let child_tree_digest = store.put_tree(&child_tree).expect("put child tree");
+    let child_file_blob = store
+        .put_blob(NS_BLOB, &mut child_bytes.as_slice())
+        .expect("put file with identical bytes");
+    assert_eq!(child_file_blob.digest, child_tree_digest);
+
+    let root_dir_first = store
+        .put_tree(&Tree {
+            entries: vec![
+                TreeEntry::dir(b"a_dir".to_vec(), &child_tree_digest),
+                TreeEntry {
+                    kind: TreeEntryKind::File,
+                    name: b"z_child_tree.bin".to_vec(),
+                    id: child_file_blob.digest.as_bytes(),
+                    size: child_file_blob.size,
+                },
+            ],
+        })
+        .expect("root dir first");
+    let root_file_first = store
+        .put_tree(&Tree {
+            entries: vec![
+                TreeEntry {
+                    kind: TreeEntryKind::File,
+                    name: b"a_child_tree.bin".to_vec(),
+                    id: child_file_blob.digest.as_bytes(),
+                    size: child_file_blob.size,
+                },
+                TreeEntry::dir(b"z_dir".to_vec(), &child_tree_digest),
+            ],
+        })
+        .expect("root file first");
+
+    let git_hello = git_stdout_stdin(bare, &["hash-object", "-w", "--stdin"], leaf_bytes);
+    let git_same_blob = git_stdout_stdin(bare, &["hash-object", "-w", "--stdin"], &child_bytes);
+    let git_child_tree = git_stdout_stdin(
+        bare,
+        &["mktree"],
+        format!("100644 blob {git_hello}\thello.txt\n").as_bytes(),
+    );
+    let git_dir_first = git_stdout_stdin(
+        bare,
+        &["mktree"],
+        format!(
+            "040000 tree {git_child_tree}\ta_dir\n100644 blob {git_same_blob}\tz_child_tree.bin\n"
+        )
+        .as_bytes(),
+    );
+    let git_file_first = git_stdout_stdin(
+        bare,
+        &["mktree"],
+        format!(
+            "100644 blob {git_same_blob}\ta_child_tree.bin\n040000 tree {git_child_tree}\tz_dir\n"
+        )
+        .as_bytes(),
+    );
+    (
+        child_tree_digest,
+        root_dir_first,
+        root_file_first,
+        git_dir_first,
+        git_file_first,
+    )
+}
+
+#[test]
+fn git_oid_projection_separates_tree_and_blob_cache_domains() {
+    let scratch = Scratch::new("oid-domain-cache");
+    let bare = scratch.join("repo.git");
+    fs::create_dir_all(&bare).expect("mkdir");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare)
+            .env("LC_ALL", "C")
+            .stdout(Stdio::null())
+            .status()
+            .expect("git init")
+            .success()
+    );
+
+    let store = Store::open(scratch.join("cas")).expect("open");
+    let (child_digest, root_dir_first, root_file_first, git_dir_first, git_file_first) =
+        setup_domain_collision_roots(&store, &bare);
+
+    let mut cache_a = GitOidCache::new();
+    assert_eq!(
+        project_tree_oid(&store, &root_dir_first, &mut cache_a)
+            .expect("dir first")
+            .to_hex(),
+        git_dir_first
+    );
+    assert_eq!(
+        project_tree_oid(&store, &root_file_first, &mut cache_a)
+            .expect("file first after dir")
+            .to_hex(),
+        git_file_first
+    );
+    assert_ne!(
+        cache_a.trees.get(&child_digest),
+        cache_a.blobs.get(&child_digest)
+    );
+
+    let mut cache_b = GitOidCache::new();
+    assert_eq!(
+        project_tree_oid(&store, &root_file_first, &mut cache_b)
+            .expect("file first")
+            .to_hex(),
+        git_file_first
+    );
+    assert_eq!(
+        project_tree_oid(&store, &root_dir_first, &mut cache_b)
+            .expect("dir first after file")
+            .to_hex(),
+        git_dir_first
+    );
 }
 
 fn verify_two_parent_merge_commit_oid() {
@@ -771,7 +959,7 @@ fn verify_two_parent_merge_commit_oid() {
         parents: vec![sha256_of(p1.as_bytes()), sha256_of(p2.as_bytes())],
         commit_body,
     };
-    let mut cache = HashMap::new();
+    let mut cache = GitOidCache::new();
     let projected =
         project_snapshot_oid(&store, &snap, &parent_oids, &mut cache).expect("project merge");
     assert_eq!(projected.to_hex(), merge);

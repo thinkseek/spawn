@@ -156,14 +156,35 @@ const fn git_mode_str(kind: TreeEntryKind) -> &'static [u8] {
     }
 }
 
+/// Domain-separated memoization cache for Git OID projection.
+///
+/// Trees (`sha1("tree ...")`) and blobs (`sha1("blob ...")`) occupy distinct
+/// maps so a regular file whose raw bytes happen to equal a `spawn-tree-v1`
+/// object can never collide with that directory's projected Git tree OID.
+#[derive(Debug, Default, Clone)]
+pub struct GitOidCache {
+    /// Cached `spawn-tree-v1` digest -> Git tree OID.
+    pub trees: HashMap<Digest, GitOid>,
+    /// Cached CAS blob digest (`<= GIT_POINTER_THRESHOLD`) -> Git blob OID.
+    pub blobs: HashMap<Digest, GitOid>,
+}
+
+impl GitOidCache {
+    /// Create an empty domain-separated Git OID cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Project a canonical `spawn-tree-v1` DAG to its exact Git tree 40-hex OID,
 /// memoizing subtree and leaf blob OIDs in `cache`.
-pub fn project_tree_oid<S: ::std::hash::BuildHasher>(
+pub fn project_tree_oid(
     store: &Store,
     tree_digest: &Digest,
-    cache: &mut HashMap<Digest, GitOid, S>,
+    cache: &mut GitOidCache,
 ) -> Result<GitOid, CasError> {
-    if let Some(&cached) = cache.get(tree_digest) {
+    if let Some(&cached) = cache.trees.get(tree_digest) {
         return Ok(cached);
     }
     let tree = store.read_tree(tree_digest)?;
@@ -180,11 +201,11 @@ pub fn project_tree_oid<S: ::std::hash::BuildHasher>(
             TreeEntryKind::File | TreeEntryKind::Executable | TreeEntryKind::Symlink => {
                 let blob = Digest::from_raw_sha256(entry.id);
                 if entry.size <= GIT_POINTER_THRESHOLD {
-                    if let Some(&cached) = cache.get(&blob) {
+                    if let Some(&cached) = cache.blobs.get(&blob) {
                         cached
                     } else {
                         let computed = project_blob_oid(store, &blob, entry.size)?;
-                        cache.insert(blob, computed);
+                        cache.blobs.insert(blob, computed);
                         computed
                     }
                 } else {
@@ -215,18 +236,18 @@ pub fn project_tree_oid<S: ::std::hash::BuildHasher>(
     hasher.update(header.as_bytes());
     hasher.update(&body);
     let oid = GitOid(hasher.finalize().into());
-    cache.insert(tree_digest.clone(), oid);
+    cache.trees.insert(tree_digest.clone(), oid);
     Ok(oid)
 }
 
 /// Project a canonical `spawn-snapshot-v1` commit envelope into its exact
 /// deterministic 40-hex Git commit OID, given its projected `parent_oids` in
 /// first-parent order.
-pub fn project_snapshot_oid<S: ::std::hash::BuildHasher>(
+pub fn project_snapshot_oid(
     store: &Store,
     snapshot: &Snapshot,
     parent_oids: &[GitOid],
-    cache: &mut HashMap<Digest, GitOid, S>,
+    cache: &mut GitOidCache,
 ) -> Result<GitOid, CasError> {
     if parent_oids.len() != snapshot.parents.len() {
         return Err(CasError::BadFormat(
