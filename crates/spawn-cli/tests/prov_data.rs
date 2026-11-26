@@ -606,6 +606,25 @@ fn over_ten_thousand_entries_fold_into_one_tree_row_per_top_level_directory() {
         (&next["entries"], &next["folded"]),
         (&json!(1), &json!(false))
     );
+
+    // A flat directory over the cap: one tree row of the root, whose
+    // digest is the snapshot.
+    let flat = scratch.join("data/flat");
+    for n in 0..10_005 {
+        write(&flat.join(format!("f{n:05}")), &n.to_string());
+    }
+    let shot = snapshot(&schema, &scratch, &flat, "flat", &["--digest-only"]);
+    assert_eq!(
+        (&shot["entries"], &shot["folded"]),
+        (&json!(1), &json!(true)),
+        "{shot}"
+    );
+    let shown = spawn_json(&schema, &["prov", "show", "data:flat"]);
+    let entry = &shown["changes"][0]["entries"][0];
+    assert_eq!(
+        (&entry["path"], &entry["class"], &entry["after"]),
+        (&json!("."), &json!("tree"), &shot["snapshot"])
+    );
     drop(store);
 }
 
@@ -642,9 +661,23 @@ fn the_pin_keeps_three_snapshots_and_a_rollback_to_the_fourth_is_refused() {
         ]
     );
     let first = spawn_cas::Digest::parse(&snapshots[0]).expect("digest");
-    assert!(!cas.has(&first), "the fourth newest is dropped");
-    assert!(!cas.has(&sha256_of(b"version 1")));
+    // The fourth newest loses its file bytes, never its manifest (D3),
+    // even to a data quota of 0.
+    assert!(!cas.has(&sha256_of(b"version 1")), "its bytes are dropped");
     assert!(cas.has(&sha256_of(b"the same in every version")));
+    cas.gc(&spawn_cas::Quotas::from([(
+        spawn_cas::NS_DATA.to_string(),
+        0,
+    )]))
+    .expect("gc");
+    assert!(cas.has(&first), "its manifest is pinned forever");
+    cas.snapshot_manifest(&first).expect("its manifest reads");
+    assert!(
+        cas.kept_manifests("model")
+            .expect("manifests")
+            .contains(&first)
+    );
+    assert!(!cas.has(&sha256_of(b"version 1")));
 
     let before = rows(&mut client);
     let cas_dir = scratch.cas();
