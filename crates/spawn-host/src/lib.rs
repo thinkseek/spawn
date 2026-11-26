@@ -183,6 +183,10 @@ impl spawn_core::port::TerminalHost for LocalTerminalHost {
         self.inner().read_from(workspace, path, offset)
     }
 
+    fn list_dirs(&self, workspace: &WorkspaceId, dir: &str) -> Result<Vec<String>, TerminalError> {
+        self.inner().list_dirs(workspace, dir)
+    }
+
     fn write_new(
         &self,
         workspace: &WorkspaceId,

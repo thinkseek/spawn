@@ -1853,6 +1853,10 @@ impl TerminalHost for HerdrHost {
         crate::tmux::read_from_files(self.beneath.as_ref(), workspace, path, offset)
     }
 
+    fn list_dirs(&self, _workspace: &WorkspaceId, dir: &str) -> Result<Vec<String>, TerminalError> {
+        crate::tmux::list_dirs_files(self.beneath.as_ref(), dir)
+    }
+
     fn write_new(
         &self,
         _workspace: &WorkspaceId,
