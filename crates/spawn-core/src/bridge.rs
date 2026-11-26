@@ -10935,14 +10935,82 @@ mod tests {
     }
 
     /// A person and the resolver both answer one dialog (design section 8,
-    /// PR 3 pitfall 2), on the in-memory host: each key is pressed once, in
-    /// the order submitted, a resolver key never between a person's; the
-    /// resolver's key resubmitted (a restarted resolver) presses nothing
-    /// again. Inputs of `spawn-resolve` would be refused like any loop's,
-    /// but a key never waits for a turn: listing it changes no input rule.
+    /// PR 3 pitfall 2), on the in-memory host: the person's key, pressed
+    /// first, moves the dialog on, so the resolver's key, submitted after
+    /// it, presses nothing (`Failed`, no `pressing`), although the pane
+    /// still draws the dialog. Inputs of `spawn-resolve` would be refused
+    /// like any loop's, but a key never waits for a turn: listing it changes
+    /// no input rule.
     #[test]
     fn a_human_and_the_resolver_answering_one_dialog_each_press_once_in_order() {
-        const DIALOG: &str = "Do you want to proceed?\n❯ 1. Yes\n  2. No\n\nEsc to cancel\n";
+        let (store, host, mut bridge, execution) = resolver_rig(DIALOG);
+        let human = submit_key(&store, "human", "approve-1:1", NamedKey::Digit1);
+        let resolver_key = format!("resolve:{execution}:session_1:0000000000000001:1:1");
+        let resolver = submit_key(&store, RESOLVE_PRINCIPAL, &resolver_key, NamedKey::Digit1);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, resolver).is_some()
+        });
+        assert_eq!(command_outcome(&store, human), Some(Outcome::Succeeded));
+        assert_eq!(
+            command_outcome(&store, resolver),
+            Some(Outcome::Failed(super::GONE_DIALOG.to_string()))
+        );
+        assert_eq!(host.keys(), vec!["1".to_string()], "the person's key only");
+        assert!(steps_of(&store, resolver).is_empty(), "no pressing");
+        assert_eq!(
+            submit_key(&store, RESOLVE_PRINCIPAL, &resolver_key, NamedKey::Digit1),
+            resolver
+        );
+        bridge.work().expect("one more claim");
+        assert_eq!(host.keys().len(), 1, "a resubmitted answer presses nothing");
+        assert!(!waits(RESOLVE_PRINCIPAL), "a loop principal");
+        assert!(waits("human"));
+    }
+
+    /// A resolver's key whose dialog is gone (the pane is at its prompt)
+    /// presses nothing and records no `pressing`; one whose dialog still
+    /// shows, with nothing pressed since, is pressed.
+    #[test]
+    fn a_resolver_key_whose_dialog_is_gone_presses_nothing() {
+        let (store, host, mut bridge, execution) = resolver_rig(READY);
+        let gone = submit_key(
+            &store,
+            RESOLVE_PRINCIPAL,
+            &format!("resolve:{execution}:session_1:0000000000000002:1:1"),
+            NamedKey::Digit1,
+        );
+        drive_work(&mut bridge, &store, || command_outcome(&store, gone).is_some());
+        assert_eq!(
+            command_outcome(&store, gone),
+            Some(Outcome::Failed(super::GONE_DIALOG.to_string()))
+        );
+        assert!(host.keys().is_empty());
+        assert!(steps_of(&store, gone).is_empty());
+        store.set_pane(
+            &TerminalName::for_execution(&execution),
+            DIALOG,
+        );
+        let shown = submit_key(
+            &store,
+            RESOLVE_PRINCIPAL,
+            &format!("resolve:{execution}:session_1:0000000000000003:1:1"),
+            NamedKey::Digit1,
+        );
+        drive_work(&mut bridge, &store, || command_outcome(&store, shown).is_some());
+        assert_eq!(command_outcome(&store, shown), Some(Outcome::Succeeded));
+        assert_eq!(host.keys(), vec!["1".to_string()]);
+        assert_eq!(
+            steps_of(&store, shown),
+            vec![CommandStep::Pressing, CommandStep::Pressed]
+        );
+    }
+
+    /// Claude Code's numbered dialog at its prompt position.
+    const DIALOG: &str = "Do you want to proceed?\n$ 1. Yes\n  2. No\n";
+
+    /// A started Claude Code execution (session 1) whose pane then shows
+    /// `pane`, and the execution.
+    fn resolver_rig(pane: &str) -> (Arc<MemoryStore>, Arc<Counted>, Bridge, ExecutionId) {
         let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
         let store = Arc::new(MemoryStore::new("shop", clock.clone()));
         let host = Counted::over(store.clone());
@@ -10956,60 +11024,38 @@ mod tests {
             BridgeConfig::new("tester"),
         )
         .with_clock(clock);
-        drive_work(&mut bridge, &store, || {
-            command_outcome(&store, id).is_some()
-        });
+        drive_work(&mut bridge, &store, || command_outcome(&store, id).is_some());
         assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
-        store.set_pane(&terminal, DIALOG);
-        let execution = ExecutionId::for_command(id);
-        let key = |principal: &str, idempotency: String, key: NamedKey| {
-            store
-                .submit(
-                    &Principal::new(principal).expect("principal"),
-                    &Submission {
-                        agent_id: resumable_agent(1),
-                        session_id: resumable_session(1),
-                        idempotency_key: IdempotencyKey::new(idempotency).expect("key"),
-                        action: CommandAction::Key { key },
-                    },
-                )
-                .expect("submit")
-        };
-        let resolver_key = format!("resolve:{execution}:session_1:0000000000000001:1:1");
-        let human = key("human", "approve-1:1".to_string(), NamedKey::Digit1);
-        let resolver = key(RESOLVE_PRINCIPAL, resolver_key.clone(), NamedKey::Digit1);
-        drive_work(&mut bridge, &store, || {
-            command_outcome(&store, resolver).is_some()
-        });
-        assert_eq!(command_outcome(&store, human), Some(Outcome::Succeeded));
-        assert_eq!(command_outcome(&store, resolver), Some(Outcome::Succeeded));
-        assert_eq!(host.keys(), vec!["1".to_string(), "1".to_string()]);
-        let order: Vec<CommandId> = store
+        store.set_pane(&terminal, pane);
+        (store, host, bridge, ExecutionId::for_command(id))
+    }
+
+    fn submit_key(store: &Arc<MemoryStore>, principal: &str, key: &str, named: NamedKey) -> CommandId {
+        store
+            .submit(
+                &Principal::new(principal).expect("principal"),
+                &Submission {
+                    agent_id: resumable_agent(1),
+                    session_id: resumable_session(1),
+                    idempotency_key: IdempotencyKey::new(key).expect("key"),
+                    action: CommandAction::Key { key: named },
+                },
+            )
+            .expect("submit")
+    }
+
+    fn steps_of(store: &Arc<MemoryStore>, command: CommandId) -> Vec<CommandStep> {
+        store
             .read_global(GlobalPosition(0), 100_000)
             .expect("read")
             .into_iter()
             .filter_map(|record| match record.event.kind {
-                EventKind::CommandStepped {
-                    command_id,
-                    step: CommandStep::Pressed,
-                    ..
-                } => Some(command_id),
+                EventKind::CommandStepped { command_id, step, .. } if command_id == command => {
+                    Some(step)
+                }
                 _ => None,
             })
-            .collect();
-        assert_eq!(
-            order,
-            vec![human, resolver],
-            "pressed in the order submitted"
-        );
-        assert_eq!(
-            key(RESOLVE_PRINCIPAL, resolver_key, NamedKey::Digit1),
-            resolver
-        );
-        bridge.work().expect("one more claim");
-        assert_eq!(host.keys().len(), 2, "a resubmitted answer presses nothing");
-        assert!(!waits(RESOLVE_PRINCIPAL), "a loop principal");
-        assert!(waits("human"));
+            .collect()
     }
 
     #[test]
