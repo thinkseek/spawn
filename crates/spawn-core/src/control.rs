@@ -1,0 +1,3472 @@
+//! Strongly-typed `ControlRecord` ADT, strict/compatible parsers, and the
+//! pure RSI Episode Replay engine over `session_control` records.
+//!
+//! SQL (`crates/spawn-postgres/sql/schema.sql`) is the source of truth:
+//! - [`ControlRecord`] covers every `control.recorded` `'type'` folded or
+//!   accepted by `spawn_control_apply` / `spawn_control_record` (67 variants).
+//! - [`GradingRecord`] covers every `grading.recorded` `'type'` folded by
+//!   `spawn_grading_apply` / `spawn_grading_record` (`preset.*`, 5 variants).
+//! - Spawn's restore drills are emitted under `backup.drilled.*`; there are no
+//!   separate `restore.*` event types in `schema.sql`.
+//!
+//! `spawn-postgres` pins [`ControlRecord::ALL_KINDS`] and
+//! [`GradingRecord::ALL_KINDS`] bidirectionally against `sql/schema.sql` in
+//! `crates/spawn-postgres/tests/control_records.rs`.
+//!
+//! This module performs no IO and uses zero `unsafe` code.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+use serde::de::Error as DeError;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+use thiserror::Error;
+
+use crate::mission::TaskState;
+
+/// Wire grade rank (`l1`..`l3`) carried on task assignments, reroutes, and
+/// grading records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GradeWire {
+    L1 = 1,
+    L2 = 2,
+    L3 = 3,
+}
+
+impl GradeWire {
+    /// Wire name (`"l1"`, `"l2"`, or `"l3"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::L1 => "l1",
+            Self::L2 => "l2",
+            Self::L3 => "l3",
+        }
+    }
+
+    /// Integer rank (`1..=3`), matching `mission_tasks.difficulty`.
+    #[must_use]
+    pub const fn rank(self) -> i16 {
+        self as i16
+    }
+
+    /// Parse either `"l1".."l3"` or historical numeric `"1".."3"`.
+    pub fn parse_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "l1" | "1" => Some(Self::L1),
+            "l2" | "2" => Some(Self::L2),
+            "l3" | "3" => Some(Self::L3),
+            _ => None,
+        }
+    }
+
+    /// Construct from an integer rank (`1..=3`).
+    pub const fn from_rank(rank: i64) -> Option<Self> {
+        match rank {
+            1 => Some(Self::L1),
+            2 => Some(Self::L2),
+            3 => Some(Self::L3),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for GradeWire {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn deserialize_opt_grade_wire<'de, D>(deserializer: D) -> Result<Option<GradeWire>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    match raw {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => GradeWire::parse_wire(&text)
+            .map(Some)
+            .ok_or_else(|| D::Error::custom(format!("invalid wire grade {text:?}"))),
+        Some(Value::Number(num)) => num
+            .as_i64()
+            .and_then(GradeWire::from_rank)
+            .map(Some)
+            .ok_or_else(|| D::Error::custom(format!("invalid numeric grade {num}"))),
+        Some(other) => Err(D::Error::custom(format!(
+            "expected grade wire, got {other}"
+        ))),
+    }
+}
+
+/// Deserialize an optional list of `i64` IDs accepting either JSON integers
+/// (`[1, 2]`, e.g. from `spawn_integrator_record`) or base-10 integer strings
+/// (`["1", "2"]`, e.g. from `spawn_source_moved` via `jsonb_array_elements_text`).
+fn deserialize_opt_vec_i64<'de, D>(deserializer: D) -> Result<Option<Vec<i64>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<Vec<Value>>::deserialize(deserializer)?;
+    let Some(items) = raw else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let id = match item {
+            Value::Number(num) => num.as_i64().ok_or_else(|| {
+                D::Error::custom(format!("expected integer mission id, got {num}"))
+            })?,
+            Value::String(text) => text.trim().parse::<i64>().map_err(|_| {
+                D::Error::custom(format!("expected integer string mission id, got {text:?}"))
+            })?,
+            other => {
+                return Err(D::Error::custom(format!(
+                    "expected integer or numeric string id, got {other}"
+                )));
+            }
+        };
+        out.push(id);
+    }
+    Ok(Some(out))
+}
+
+/// Worker kind on `task.assigned` (`resident` or `ephemeral`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    Resident,
+    Ephemeral,
+}
+
+impl TaskKind {
+    /// Wire string representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+}
+
+/// Terminal state of a closed mission (`done` or `dropped`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionCloseState {
+    Done,
+    Dropped,
+}
+
+/// How a gated mission accepts tasks (`review` or `gate`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptMode {
+    #[default]
+    Review,
+    Gate,
+}
+
+/// Integrator gate verdict on `task.gated` and `task.shadow_gated`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateVerdict {
+    Accepted,
+    Rejected,
+    Conflict,
+    Incompatible,
+    Aborted,
+    Stale,
+    NoRoom,
+    HostFault,
+}
+
+impl GateVerdict {
+    /// SQL wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Conflict => "conflict",
+            Self::Incompatible => "incompatible",
+            Self::Aborted => "aborted",
+            Self::Stale => "stale",
+            Self::NoRoom => "no_room",
+            Self::HostFault => "host_fault",
+        }
+    }
+
+    /// Verdict class pinned by `spawn_integrator_record` (`schema.sql`).
+    pub const fn expected_class(self) -> GateVerdictClass {
+        match self {
+            Self::Accepted | Self::Rejected | Self::Conflict | Self::Incompatible => {
+                GateVerdictClass::Code
+            }
+            Self::Aborted | Self::HostFault | Self::NoRoom => GateVerdictClass::Infrastructure,
+            Self::Stale => GateVerdictClass::Superseded,
+        }
+    }
+}
+
+/// Responsibility class of a gate verdict (`code`, `infrastructure`, `superseded`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateVerdictClass {
+    Code,
+    Infrastructure,
+    Superseded,
+}
+
+/// Reason category for `objective.retired`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ObjectiveRetireKind {
+    #[serde(rename = "on-main")]
+    OnMain,
+    #[serde(rename = "renumbered")]
+    Renumbered,
+    #[serde(rename = "obsolete")]
+    Obsolete,
+}
+
+/// Result of `objective.verified` (`pass` or `fail`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationResult {
+    Pass,
+    Fail,
+}
+
+/// Originator of `deploy.finished` (`landing` or `owner`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployBy {
+    Landing,
+    Owner,
+}
+
+/// Human verdict on `alert.judged`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertVerdict {
+    Right,
+    False,
+    Stale,
+    Duplicate,
+}
+
+/// Threshold crossing state on `host.disk`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostDiskState {
+    Low,
+    Recovered,
+}
+
+/// Health crossing state on `host.judge`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostJudgeState {
+    Down,
+    Up,
+}
+
+/// Execution interruption causes allowed by `spawn_host_record`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptionCause {
+    Exited,
+    Crashed,
+    MemoryLimit,
+    ContextExhausted,
+    ModelUnavailable,
+    ModelAuth,
+    ModelError,
+    HostRestart,
+    DatabaseUnavailable,
+    DiskFull,
+    Budget,
+    Stopped,
+    Restarted,
+    Reassigned,
+}
+
+/// Recovery paths allowed by `spawn_host_record`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPath {
+    Resume,
+    Handoff,
+    Wait,
+    Final,
+}
+
+/// Storage area on `backup.stored`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupArea {
+    Transcripts,
+    Sessions,
+}
+
+/// Table imported by `legacy.imported`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LegacyTable {
+    #[serde(rename = "mission_missions")]
+    MissionMissions,
+    #[serde(rename = "mission_residents")]
+    MissionResidents,
+    #[serde(rename = "mission_tasks")]
+    MissionTasks,
+}
+
+/// Error returned when parsing or strictly validating a control/grading record.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ControlRecordError {
+    #[error("control record must be a JSON object")]
+    NotAnObject,
+    #[error("control record is missing string field `type`")]
+    MissingType,
+    #[error("unknown control record type `{0}`")]
+    UnknownKind(String),
+    #[error("invalid payload for `{kind}`: {message}")]
+    Deserialize { kind: String, message: String },
+    #[error("invariant violation for `{kind}`: {message}")]
+    Invariant { kind: String, message: String },
+    #[error("unexpected extra fields for fixed-schema `{kind}`: {fields:?}")]
+    UnexpectedFields { kind: String, fields: Vec<String> },
+    #[error("failed to serialize control record: {0}")]
+    Serialize(String),
+}
+
+// ---------------------------------------------------------------------------
+// ControlRecord payloads (67 variants)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionAddedRecord {
+    pub id: i64,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionConfiguredRecord {
+    pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept: Option<AcceptMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objectives: Option<Value>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionClosedRecord {
+    pub id: i64,
+    pub state: MissionCloseState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionHaltedRecord {
+    pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gone: Option<Vec<String>>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionResumedRecord {
+    pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionPausedRecord {
+    pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionUnpausedRecord {
+    pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_event: Option<i64>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskAssignedRecord {
+    pub id: i64,
+    pub mission_id: i64,
+    pub kind: TaskKind,
+    pub agent_id: String,
+    pub session_id: String,
+    pub brief: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reissue_of: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reassign_of: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_of: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_grade_wire",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub difficulty: Option<GradeWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_preset_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_rejections: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_label: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskDeliveredRecord {
+    pub id: i64,
+    pub command_id: i64,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskReportedRecord {
+    pub id: i64,
+    pub report: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskReportUnfinishedRecord {
+    pub id: i64,
+    pub revision: u32,
+    pub digest: String,
+    pub markers: Value,
+    pub note: String,
+    pub command_id: i64,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskForkFailedRecord {
+    pub id: i64,
+    pub from: i64,
+    pub commit: String,
+    pub error: String,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskReviewedRecord {
+    pub id: i64,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u32>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskReroutedRecord {
+    pub id: i64,
+    pub preset_id: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_preset_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u32>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_grade_wire",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub routed_difficulty: Option<GradeWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskRestartedRecord {
+    /// SQL `spawn_task_restart_as` writes `task` (not `id`).
+    pub task: i64,
+    pub session_id: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskCancelledRecord {
+    pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reissued_as: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reassigned_as: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yielded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solved: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskStolenRecord {
+    pub id: i64,
+    pub from_session: String,
+    pub from_agent: String,
+    pub to_session: String,
+    pub to_agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    pub by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_since_ms: Option<i64>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskAbortedRecord {
+    pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judging: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskOverBudgetRecord {
+    pub id: i64,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskGatedRecord {
+    pub id: i64,
+    pub verdict: GateVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<GateVerdictClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judging: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalate: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenarios: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario_names: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitive: Option<Vec<String>>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskShadowGatedRecord {
+    pub id: i64,
+    pub runner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<GateVerdict>,
+    pub inputs: Value,
+    #[serde(default)]
+    pub unequal: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agrees: Option<bool>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskHeldRecord {
+    pub id: i64,
+    pub hold: i64,
+    pub source: String,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskReleasedRecord {
+    pub id: i64,
+    pub by: String,
+    pub reason: String,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskLandedRecord {
+    pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_vec_i64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub missions: Option<Vec<i64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judging: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResidentProposedRecord {
+    pub name: String,
+    pub charter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResidentNamedRecord {
+    pub name: String,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectiveSolvedRecord {
+    pub id: i64,
+    pub objective: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<i64>,
+    pub scenario: String,
+    pub base: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectiveVerifiedRecord {
+    pub mission: i64,
+    pub objective: i32,
+    pub by: String,
+    pub how: String,
+    pub result: VerificationResult,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectiveRetiredRecord {
+    pub id: i64,
+    pub objective: i32,
+    pub kind: ObjectiveRetireKind,
+    pub by: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceMovedRecord {
+    pub source: String,
+    pub from: String,
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<i64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_vec_i64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub missions: Option<Vec<i64>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_vec_i64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub clear: Option<Vec<i64>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_vec_i64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub without_baseline: Option<Vec<i64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judging: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceHeldRecord {
+    pub source: String,
+    pub main: String,
+    pub by: String,
+    pub bound_s: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renews: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceReleasedRecord {
+    pub source: String,
+    pub hold: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceHoldExpiredRecord {
+    pub source: String,
+    pub hold: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<Vec<i64>>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourcePushRequestedRecord {
+    pub source: String,
+    pub commit: String,
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urgent: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourcePushRefusedRecord {
+    pub request: i64,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judging: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourcePushNoVerdictRecord {
+    pub request: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judging: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceMainRedRecord {
+    pub source: String,
+    pub main: String,
+    pub scenario: String,
+    pub failures: Vec<Value>,
+    pub task: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert: Option<bool>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceMainProbeRecord {
+    pub source: String,
+    pub main: String,
+    pub task: i64,
+    pub probe_ms: i64,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceMainGreenRecord {
+    pub source: String,
+    pub scenario: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub red_main: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessAncestor {
+    pub pid: u64,
+    pub comm: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntegratorStartedRecord {
+    pub pid: u64,
+    pub ppid: u64,
+    #[serde(default)]
+    pub parent_comm: Option<String>,
+    pub ancestors: Vec<ProcessAncestor>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub cgroup: Option<String>,
+    pub gate: String,
+    pub gate_from_env: bool,
+    pub root: String,
+    pub once: bool,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntegratorDrainRecord {
+    pub bound_s: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gates: Option<Vec<i64>>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostDiskRecord {
+    pub path: String,
+    pub state: HostDiskState,
+    pub free_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostStorageRecord {
+    pub archive_bytes: u64,
+    pub archive_files: u64,
+    pub projects_bytes: u64,
+    pub projects_files: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_bytes: Option<u64>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostCoreLinesRecord {
+    pub values: BTreeMap<String, Value>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostStorageBytesRecord {
+    pub sources: BTreeMap<String, Value>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostJudgeRecord {
+    pub judge: String,
+    pub state: HostJudgeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_failed_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_calls: Option<u64>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostMessagesMarkedRecord {
+    pub started_at_ms: i64,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostLoopStartedRecord {
+    pub boot_id: String,
+    pub started_at_ms: i64,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionInterruptedRecord {
+    pub agent_id: String,
+    pub session_id: String,
+    pub execution_id: String,
+    pub cause: InterruptionCause,
+    pub path: RecoveryPath,
+    pub attempt: u64,
+    pub evidence: Value,
+    #[serde(default)]
+    pub due_ms: Option<i64>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionClearedRecord {
+    pub execution_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<InterruptionCause>,
+    pub waited_ms: i64,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertFiredRecord {
+    pub key: String,
+    pub kind: String,
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Value>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertUpdatedRecord {
+    pub key: String,
+    pub kind: String,
+    pub subject: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Value>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertJudgedRecord {
+    pub key: String,
+    pub verdict: AlertVerdict,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertClearedRecord {
+    pub key: String,
+    pub kind: String,
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Value>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeployFinishedRecord {
+    pub ok: bool,
+    pub head: String,
+    pub by: DeployBy,
+    pub reason: String,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupDumpedRecord {
+    #[serde(default)]
+    pub keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_with: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupBundledRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_event_id: Option<i64>,
+    #[serde(default)]
+    pub keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_with: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupVerifiedRecord {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupStoredRecord {
+    pub area: BackupArea,
+    pub host: String,
+    pub account: String,
+    pub manifest: String,
+    pub files: u64,
+    pub unchanged: u64,
+    pub grown: u64,
+    pub whole: u64,
+    pub segments_written: u64,
+    pub segments_found: u64,
+    pub bytes_written: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_with: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupDrillRecord {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_event_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mismatches: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupDrilledControllersRecord {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_event_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mismatches: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missions: Option<Vec<i64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_out: Option<Vec<String>>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegacyImportedRecord {
+    pub table: LegacyTable,
+    pub row: Value,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Discriminant for every `control.recorded` variant handled by
+/// `spawn_control_apply`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ControlRecordKind {
+    MissionAdded,
+    MissionConfigured,
+    MissionClosed,
+    MissionHalted,
+    MissionResumed,
+    MissionPaused,
+    MissionUnpaused,
+    TaskAssigned,
+    TaskDelivered,
+    TaskReported,
+    TaskReportUnfinished,
+    TaskForkFailed,
+    TaskReviewed,
+    TaskRerouted,
+    TaskRestarted,
+    TaskCancelled,
+    TaskStolen,
+    TaskAborted,
+    TaskOverBudget,
+    TaskGated,
+    TaskShadowGated,
+    TaskHeld,
+    TaskReleased,
+    TaskLanded,
+    ResidentProposed,
+    ResidentApproved,
+    ResidentRetired,
+    ObjectiveSolved,
+    ObjectiveVerified,
+    ObjectiveRetired,
+    SourceMoved,
+    SourceHeld,
+    SourceReleased,
+    SourceHoldExpired,
+    SourcePushRequested,
+    SourcePushRefused,
+    SourcePushNoVerdict,
+    SourceMainRed,
+    SourceMainProbe,
+    SourceMainGreen,
+    IntegratorStarted,
+    IntegratorDraining,
+    IntegratorDrained,
+    IntegratorDrainExpired,
+    HostDisk,
+    HostStorage,
+    HostCoreLines,
+    HostStorageBytes,
+    HostJudge,
+    HostMessagesMarked,
+    HostLoopStarted,
+    ExecutionInterrupted,
+    ExecutionCleared,
+    AlertFired,
+    AlertUpdated,
+    AlertJudged,
+    AlertCleared,
+    DeployFinished,
+    BackupDumped,
+    BackupBundled,
+    BackupVerified,
+    BackupStored,
+    BackupDrilledTranscripts,
+    BackupDrilledMissions,
+    BackupDrilledControllers,
+    BackupDrilledSync,
+    LegacyImported,
+}
+
+impl ControlRecordKind {
+    /// Every `ControlRecordKind` in canonical declaration order (67 variants).
+    pub const ALL: [Self; 67] = [
+        Self::MissionAdded,
+        Self::MissionConfigured,
+        Self::MissionClosed,
+        Self::MissionHalted,
+        Self::MissionResumed,
+        Self::MissionPaused,
+        Self::MissionUnpaused,
+        Self::TaskAssigned,
+        Self::TaskDelivered,
+        Self::TaskReported,
+        Self::TaskReportUnfinished,
+        Self::TaskForkFailed,
+        Self::TaskReviewed,
+        Self::TaskRerouted,
+        Self::TaskRestarted,
+        Self::TaskCancelled,
+        Self::TaskStolen,
+        Self::TaskAborted,
+        Self::TaskOverBudget,
+        Self::TaskGated,
+        Self::TaskShadowGated,
+        Self::TaskHeld,
+        Self::TaskReleased,
+        Self::TaskLanded,
+        Self::ResidentProposed,
+        Self::ResidentApproved,
+        Self::ResidentRetired,
+        Self::ObjectiveSolved,
+        Self::ObjectiveVerified,
+        Self::ObjectiveRetired,
+        Self::SourceMoved,
+        Self::SourceHeld,
+        Self::SourceReleased,
+        Self::SourceHoldExpired,
+        Self::SourcePushRequested,
+        Self::SourcePushRefused,
+        Self::SourcePushNoVerdict,
+        Self::SourceMainRed,
+        Self::SourceMainProbe,
+        Self::SourceMainGreen,
+        Self::IntegratorStarted,
+        Self::IntegratorDraining,
+        Self::IntegratorDrained,
+        Self::IntegratorDrainExpired,
+        Self::HostDisk,
+        Self::HostStorage,
+        Self::HostCoreLines,
+        Self::HostStorageBytes,
+        Self::HostJudge,
+        Self::HostMessagesMarked,
+        Self::HostLoopStarted,
+        Self::ExecutionInterrupted,
+        Self::ExecutionCleared,
+        Self::AlertFired,
+        Self::AlertUpdated,
+        Self::AlertJudged,
+        Self::AlertCleared,
+        Self::DeployFinished,
+        Self::BackupDumped,
+        Self::BackupBundled,
+        Self::BackupVerified,
+        Self::BackupStored,
+        Self::BackupDrilledTranscripts,
+        Self::BackupDrilledMissions,
+        Self::BackupDrilledControllers,
+        Self::BackupDrilledSync,
+        Self::LegacyImported,
+    ];
+
+    /// Exact SQL `'type'` wire name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissionAdded => "mission.added",
+            Self::MissionConfigured => "mission.configured",
+            Self::MissionClosed => "mission.closed",
+            Self::MissionHalted => "mission.halted",
+            Self::MissionResumed => "mission.resumed",
+            Self::MissionPaused => "mission.paused",
+            Self::MissionUnpaused => "mission.unpaused",
+            Self::TaskAssigned => "task.assigned",
+            Self::TaskDelivered => "task.delivered",
+            Self::TaskReported => "task.reported",
+            Self::TaskReportUnfinished => "task.report_unfinished",
+            Self::TaskForkFailed => "task.fork_failed",
+            Self::TaskReviewed => "task.reviewed",
+            Self::TaskRerouted => "task.rerouted",
+            Self::TaskRestarted => "task.restarted",
+            Self::TaskCancelled => "task.cancelled",
+            Self::TaskStolen => "task.stolen",
+            Self::TaskAborted => "task.aborted",
+            Self::TaskOverBudget => "task.over_budget",
+            Self::TaskGated => "task.gated",
+            Self::TaskShadowGated => "task.shadow_gated",
+            Self::TaskHeld => "task.held",
+            Self::TaskReleased => "task.released",
+            Self::TaskLanded => "task.landed",
+            Self::ResidentProposed => "resident.proposed",
+            Self::ResidentApproved => "resident.approved",
+            Self::ResidentRetired => "resident.retired",
+            Self::ObjectiveSolved => "objective.solved",
+            Self::ObjectiveVerified => "objective.verified",
+            Self::ObjectiveRetired => "objective.retired",
+            Self::SourceMoved => "source.moved",
+            Self::SourceHeld => "source.held",
+            Self::SourceReleased => "source.released",
+            Self::SourceHoldExpired => "source.hold_expired",
+            Self::SourcePushRequested => "source.push_requested",
+            Self::SourcePushRefused => "source.push_refused",
+            Self::SourcePushNoVerdict => "source.push_no_verdict",
+            Self::SourceMainRed => "source.main_red",
+            Self::SourceMainProbe => "source.main_probe",
+            Self::SourceMainGreen => "source.main_green",
+            Self::IntegratorStarted => "integrator.started",
+            Self::IntegratorDraining => "integrator.draining",
+            Self::IntegratorDrained => "integrator.drained",
+            Self::IntegratorDrainExpired => "integrator.drain_expired",
+            Self::HostDisk => "host.disk",
+            Self::HostStorage => "host.storage",
+            Self::HostCoreLines => "host.core_lines",
+            Self::HostStorageBytes => "host.storage_bytes",
+            Self::HostJudge => "host.judge",
+            Self::HostMessagesMarked => "host.messages_marked",
+            Self::HostLoopStarted => "host.loop_started",
+            Self::ExecutionInterrupted => "execution.interrupted",
+            Self::ExecutionCleared => "execution.cleared",
+            Self::AlertFired => "alert.fired",
+            Self::AlertUpdated => "alert.updated",
+            Self::AlertJudged => "alert.judged",
+            Self::AlertCleared => "alert.cleared",
+            Self::DeployFinished => "deploy.finished",
+            Self::BackupDumped => "backup.dumped",
+            Self::BackupBundled => "backup.bundled",
+            Self::BackupVerified => "backup.verified",
+            Self::BackupStored => "backup.stored",
+            Self::BackupDrilledTranscripts => "backup.drilled.transcripts",
+            Self::BackupDrilledMissions => "backup.drilled.missions",
+            Self::BackupDrilledControllers => "backup.drilled.controllers",
+            Self::BackupDrilledSync => "backup.drilled.sync",
+            Self::LegacyImported => "legacy.imported",
+        }
+    }
+
+    /// Parse a SQL `'type'` wire name.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == raw)
+    }
+}
+
+impl fmt::Display for ControlRecordKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Strongly-typed ADT covering every `control.recorded` record folded or
+/// stored through `spawn_control_apply` / `spawn_control_record`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ControlRecord {
+    #[serde(rename = "mission.added")]
+    MissionAdded(MissionAddedRecord),
+    #[serde(rename = "mission.configured")]
+    MissionConfigured(MissionConfiguredRecord),
+    #[serde(rename = "mission.closed")]
+    MissionClosed(MissionClosedRecord),
+    #[serde(rename = "mission.halted")]
+    MissionHalted(Box<MissionHaltedRecord>),
+    #[serde(rename = "mission.resumed")]
+    MissionResumed(MissionResumedRecord),
+    #[serde(rename = "mission.paused")]
+    MissionPaused(MissionPausedRecord),
+    #[serde(rename = "mission.unpaused")]
+    MissionUnpaused(MissionUnpausedRecord),
+
+    #[serde(rename = "task.assigned")]
+    TaskAssigned(Box<TaskAssignedRecord>),
+    #[serde(rename = "task.delivered")]
+    TaskDelivered(TaskDeliveredRecord),
+    #[serde(rename = "task.reported")]
+    TaskReported(TaskReportedRecord),
+    #[serde(rename = "task.report_unfinished")]
+    TaskReportUnfinished(Box<TaskReportUnfinishedRecord>),
+    #[serde(rename = "task.fork_failed")]
+    TaskForkFailed(TaskForkFailedRecord),
+    #[serde(rename = "task.reviewed")]
+    TaskReviewed(TaskReviewedRecord),
+    #[serde(rename = "task.rerouted")]
+    TaskRerouted(Box<TaskReroutedRecord>),
+    #[serde(rename = "task.restarted")]
+    TaskRestarted(Box<TaskRestartedRecord>),
+    #[serde(rename = "task.cancelled")]
+    TaskCancelled(Box<TaskCancelledRecord>),
+    #[serde(rename = "task.stolen")]
+    TaskStolen(Box<TaskStolenRecord>),
+    #[serde(rename = "task.aborted")]
+    TaskAborted(TaskAbortedRecord),
+    #[serde(rename = "task.over_budget")]
+    TaskOverBudget(Box<TaskOverBudgetRecord>),
+    #[serde(rename = "task.gated")]
+    TaskGated(Box<TaskGatedRecord>),
+    #[serde(rename = "task.shadow_gated")]
+    TaskShadowGated(Box<TaskShadowGatedRecord>),
+    #[serde(rename = "task.held")]
+    TaskHeld(TaskHeldRecord),
+    #[serde(rename = "task.released")]
+    TaskReleased(TaskReleasedRecord),
+    #[serde(rename = "task.landed")]
+    TaskLanded(Box<TaskLandedRecord>),
+
+    #[serde(rename = "resident.proposed")]
+    ResidentProposed(ResidentProposedRecord),
+    #[serde(rename = "resident.approved")]
+    ResidentApproved(ResidentNamedRecord),
+    #[serde(rename = "resident.retired")]
+    ResidentRetired(ResidentNamedRecord),
+
+    #[serde(rename = "objective.solved")]
+    ObjectiveSolved(Box<ObjectiveSolvedRecord>),
+    #[serde(rename = "objective.verified")]
+    ObjectiveVerified(ObjectiveVerifiedRecord),
+    #[serde(rename = "objective.retired")]
+    ObjectiveRetired(ObjectiveRetiredRecord),
+
+    #[serde(rename = "source.moved")]
+    SourceMoved(Box<SourceMovedRecord>),
+    #[serde(rename = "source.held")]
+    SourceHeld(Box<SourceHeldRecord>),
+    #[serde(rename = "source.released")]
+    SourceReleased(SourceReleasedRecord),
+    #[serde(rename = "source.hold_expired")]
+    SourceHoldExpired(SourceHoldExpiredRecord),
+    #[serde(rename = "source.push_requested")]
+    SourcePushRequested(Box<SourcePushRequestedRecord>),
+    #[serde(rename = "source.push_refused")]
+    SourcePushRefused(Box<SourcePushRefusedRecord>),
+    #[serde(rename = "source.push_no_verdict")]
+    SourcePushNoVerdict(SourcePushNoVerdictRecord),
+    #[serde(rename = "source.main_red")]
+    SourceMainRed(Box<SourceMainRedRecord>),
+    #[serde(rename = "source.main_probe")]
+    SourceMainProbe(SourceMainProbeRecord),
+    #[serde(rename = "source.main_green")]
+    SourceMainGreen(Box<SourceMainGreenRecord>),
+
+    #[serde(rename = "integrator.started")]
+    IntegratorStarted(Box<IntegratorStartedRecord>),
+    #[serde(rename = "integrator.draining")]
+    IntegratorDraining(IntegratorDrainRecord),
+    #[serde(rename = "integrator.drained")]
+    IntegratorDrained(IntegratorDrainRecord),
+    #[serde(rename = "integrator.drain_expired")]
+    IntegratorDrainExpired(IntegratorDrainRecord),
+
+    #[serde(rename = "host.disk")]
+    HostDisk(Box<HostDiskRecord>),
+    #[serde(rename = "host.storage")]
+    HostStorage(HostStorageRecord),
+    #[serde(rename = "host.core_lines")]
+    HostCoreLines(HostCoreLinesRecord),
+    #[serde(rename = "host.storage_bytes")]
+    HostStorageBytes(HostStorageBytesRecord),
+    #[serde(rename = "host.judge")]
+    HostJudge(Box<HostJudgeRecord>),
+    #[serde(rename = "host.messages_marked")]
+    HostMessagesMarked(HostMessagesMarkedRecord),
+    #[serde(rename = "host.loop_started")]
+    HostLoopStarted(HostLoopStartedRecord),
+
+    #[serde(rename = "execution.interrupted")]
+    ExecutionInterrupted(Box<ExecutionInterruptedRecord>),
+    #[serde(rename = "execution.cleared")]
+    ExecutionCleared(ExecutionClearedRecord),
+
+    #[serde(rename = "alert.fired")]
+    AlertFired(Box<AlertFiredRecord>),
+    #[serde(rename = "alert.updated")]
+    AlertUpdated(Box<AlertUpdatedRecord>),
+    #[serde(rename = "alert.judged")]
+    AlertJudged(AlertJudgedRecord),
+    #[serde(rename = "alert.cleared")]
+    AlertCleared(Box<AlertClearedRecord>),
+
+    #[serde(rename = "deploy.finished")]
+    DeployFinished(DeployFinishedRecord),
+
+    #[serde(rename = "backup.dumped")]
+    BackupDumped(Box<BackupDumpedRecord>),
+    #[serde(rename = "backup.bundled")]
+    BackupBundled(Box<BackupBundledRecord>),
+    #[serde(rename = "backup.verified")]
+    BackupVerified(Box<BackupVerifiedRecord>),
+    #[serde(rename = "backup.stored")]
+    BackupStored(Box<BackupStoredRecord>),
+    #[serde(rename = "backup.drilled.transcripts")]
+    BackupDrilledTranscripts(Box<BackupDrillRecord>),
+    #[serde(rename = "backup.drilled.missions")]
+    BackupDrilledMissions(Box<BackupDrillRecord>),
+    #[serde(rename = "backup.drilled.controllers")]
+    BackupDrilledControllers(Box<BackupDrilledControllersRecord>),
+    #[serde(rename = "backup.drilled.sync")]
+    BackupDrilledSync(Box<BackupDrillRecord>),
+
+    #[serde(rename = "legacy.imported")]
+    LegacyImported(LegacyImportedRecord),
+}
+
+/// Legacy/forward-compatible parse result for `control.recorded` rows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CompatControlRecord {
+    Known(Box<ControlRecord>),
+    Unknown { kind: String, payload: Value },
+}
+
+impl ControlRecord {
+    /// Every `'type'` wire name in `ControlRecord`, pinned against `schema.sql`.
+    pub const ALL_KINDS: &'static [&'static str] = &[
+        "mission.added",
+        "mission.configured",
+        "mission.closed",
+        "mission.halted",
+        "mission.resumed",
+        "mission.paused",
+        "mission.unpaused",
+        "task.assigned",
+        "task.delivered",
+        "task.reported",
+        "task.report_unfinished",
+        "task.fork_failed",
+        "task.reviewed",
+        "task.rerouted",
+        "task.restarted",
+        "task.cancelled",
+        "task.stolen",
+        "task.aborted",
+        "task.over_budget",
+        "task.gated",
+        "task.shadow_gated",
+        "task.held",
+        "task.released",
+        "task.landed",
+        "resident.proposed",
+        "resident.approved",
+        "resident.retired",
+        "objective.solved",
+        "objective.verified",
+        "objective.retired",
+        "source.moved",
+        "source.held",
+        "source.released",
+        "source.hold_expired",
+        "source.push_requested",
+        "source.push_refused",
+        "source.push_no_verdict",
+        "source.main_red",
+        "source.main_probe",
+        "source.main_green",
+        "integrator.started",
+        "integrator.draining",
+        "integrator.drained",
+        "integrator.drain_expired",
+        "host.disk",
+        "host.storage",
+        "host.core_lines",
+        "host.storage_bytes",
+        "host.judge",
+        "host.messages_marked",
+        "host.loop_started",
+        "execution.interrupted",
+        "execution.cleared",
+        "alert.fired",
+        "alert.updated",
+        "alert.judged",
+        "alert.cleared",
+        "deploy.finished",
+        "backup.dumped",
+        "backup.bundled",
+        "backup.verified",
+        "backup.stored",
+        "backup.drilled.transcripts",
+        "backup.drilled.missions",
+        "backup.drilled.controllers",
+        "backup.drilled.sync",
+        "legacy.imported",
+    ];
+
+    /// Strong kind enum for this record.
+    pub const fn kind(&self) -> ControlRecordKind {
+        match self {
+            Self::MissionAdded(_) => ControlRecordKind::MissionAdded,
+            Self::MissionConfigured(_) => ControlRecordKind::MissionConfigured,
+            Self::MissionClosed(_) => ControlRecordKind::MissionClosed,
+            Self::MissionHalted(_) => ControlRecordKind::MissionHalted,
+            Self::MissionResumed(_) => ControlRecordKind::MissionResumed,
+            Self::MissionPaused(_) => ControlRecordKind::MissionPaused,
+            Self::MissionUnpaused(_) => ControlRecordKind::MissionUnpaused,
+            Self::TaskAssigned(_) => ControlRecordKind::TaskAssigned,
+            Self::TaskDelivered(_) => ControlRecordKind::TaskDelivered,
+            Self::TaskReported(_) => ControlRecordKind::TaskReported,
+            Self::TaskReportUnfinished(_) => ControlRecordKind::TaskReportUnfinished,
+            Self::TaskForkFailed(_) => ControlRecordKind::TaskForkFailed,
+            Self::TaskReviewed(_) => ControlRecordKind::TaskReviewed,
+            Self::TaskRerouted(_) => ControlRecordKind::TaskRerouted,
+            Self::TaskRestarted(_) => ControlRecordKind::TaskRestarted,
+            Self::TaskCancelled(_) => ControlRecordKind::TaskCancelled,
+            Self::TaskStolen(_) => ControlRecordKind::TaskStolen,
+            Self::TaskAborted(_) => ControlRecordKind::TaskAborted,
+            Self::TaskOverBudget(_) => ControlRecordKind::TaskOverBudget,
+            Self::TaskGated(_) => ControlRecordKind::TaskGated,
+            Self::TaskShadowGated(_) => ControlRecordKind::TaskShadowGated,
+            Self::TaskHeld(_) => ControlRecordKind::TaskHeld,
+            Self::TaskReleased(_) => ControlRecordKind::TaskReleased,
+            Self::TaskLanded(_) => ControlRecordKind::TaskLanded,
+            Self::ResidentProposed(_) => ControlRecordKind::ResidentProposed,
+            Self::ResidentApproved(_) => ControlRecordKind::ResidentApproved,
+            Self::ResidentRetired(_) => ControlRecordKind::ResidentRetired,
+            Self::ObjectiveSolved(_) => ControlRecordKind::ObjectiveSolved,
+            Self::ObjectiveVerified(_) => ControlRecordKind::ObjectiveVerified,
+            Self::ObjectiveRetired(_) => ControlRecordKind::ObjectiveRetired,
+            Self::SourceMoved(_) => ControlRecordKind::SourceMoved,
+            Self::SourceHeld(_) => ControlRecordKind::SourceHeld,
+            Self::SourceReleased(_) => ControlRecordKind::SourceReleased,
+            Self::SourceHoldExpired(_) => ControlRecordKind::SourceHoldExpired,
+            Self::SourcePushRequested(_) => ControlRecordKind::SourcePushRequested,
+            Self::SourcePushRefused(_) => ControlRecordKind::SourcePushRefused,
+            Self::SourcePushNoVerdict(_) => ControlRecordKind::SourcePushNoVerdict,
+            Self::SourceMainRed(_) => ControlRecordKind::SourceMainRed,
+            Self::SourceMainProbe(_) => ControlRecordKind::SourceMainProbe,
+            Self::SourceMainGreen(_) => ControlRecordKind::SourceMainGreen,
+            Self::IntegratorStarted(_) => ControlRecordKind::IntegratorStarted,
+            Self::IntegratorDraining(_) => ControlRecordKind::IntegratorDraining,
+            Self::IntegratorDrained(_) => ControlRecordKind::IntegratorDrained,
+            Self::IntegratorDrainExpired(_) => ControlRecordKind::IntegratorDrainExpired,
+            Self::HostDisk(_) => ControlRecordKind::HostDisk,
+            Self::HostStorage(_) => ControlRecordKind::HostStorage,
+            Self::HostCoreLines(_) => ControlRecordKind::HostCoreLines,
+            Self::HostStorageBytes(_) => ControlRecordKind::HostStorageBytes,
+            Self::HostJudge(_) => ControlRecordKind::HostJudge,
+            Self::HostMessagesMarked(_) => ControlRecordKind::HostMessagesMarked,
+            Self::HostLoopStarted(_) => ControlRecordKind::HostLoopStarted,
+            Self::ExecutionInterrupted(_) => ControlRecordKind::ExecutionInterrupted,
+            Self::ExecutionCleared(_) => ControlRecordKind::ExecutionCleared,
+            Self::AlertFired(_) => ControlRecordKind::AlertFired,
+            Self::AlertUpdated(_) => ControlRecordKind::AlertUpdated,
+            Self::AlertJudged(_) => ControlRecordKind::AlertJudged,
+            Self::AlertCleared(_) => ControlRecordKind::AlertCleared,
+            Self::DeployFinished(_) => ControlRecordKind::DeployFinished,
+            Self::BackupDumped(_) => ControlRecordKind::BackupDumped,
+            Self::BackupBundled(_) => ControlRecordKind::BackupBundled,
+            Self::BackupVerified(_) => ControlRecordKind::BackupVerified,
+            Self::BackupStored(_) => ControlRecordKind::BackupStored,
+            Self::BackupDrilledTranscripts(_) => ControlRecordKind::BackupDrilledTranscripts,
+            Self::BackupDrilledMissions(_) => ControlRecordKind::BackupDrilledMissions,
+            Self::BackupDrilledControllers(_) => ControlRecordKind::BackupDrilledControllers,
+            Self::BackupDrilledSync(_) => ControlRecordKind::BackupDrilledSync,
+            Self::LegacyImported(_) => ControlRecordKind::LegacyImported,
+        }
+    }
+
+    /// SQL `'type'` string for this record.
+    pub const fn kind_str(&self) -> &'static str {
+        self.kind().as_str()
+    }
+
+    /// Deserialize a `Value` into a strongly-typed [`ControlRecord`]. Refuses
+    /// any unknown `'type'` rather than silently falling back.
+    pub fn from_value(value: &Value) -> Result<Self, ControlRecordError> {
+        let kind = extract_record_type(value)?;
+        if ControlRecordKind::parse(kind).is_none() {
+            return Err(ControlRecordError::UnknownKind(kind.to_string()));
+        }
+        serde_json::from_value(value.clone()).map_err(|err| ControlRecordError::Deserialize {
+            kind: kind.to_string(),
+            message: err.to_string(),
+        })
+    }
+
+    /// Parse with [`Self::from_value`] and enforce closed-schema & SQL domain
+    /// invariants.
+    pub fn from_value_strict(value: &Value) -> Result<Self, ControlRecordError> {
+        let record = Self::from_value(value)?;
+        validate_control_record_strict(&record)?;
+        Ok(record)
+    }
+
+    /// Legacy- and forward-compatible parser: normalizes older string-encoded
+    /// fields when decoding known types, and preserves unrecognized future
+    /// `'type'` records in [`CompatControlRecord::Unknown`].
+    pub fn from_value_compat(value: &Value) -> Result<CompatControlRecord, ControlRecordError> {
+        let kind = extract_record_type(value)?;
+        if ControlRecordKind::parse(kind).is_none() {
+            return Ok(CompatControlRecord::Unknown {
+                kind: kind.to_string(),
+                payload: value.clone(),
+            });
+        }
+        let normalized = normalize_legacy_json(value);
+        let parsed = Self::from_value(&normalized)?;
+        Ok(CompatControlRecord::Known(Box::new(parsed)))
+    }
+
+    /// Serialize to `serde_json::Value` preserving the exact wire format.
+    pub fn to_value(&self) -> Result<Value, ControlRecordError> {
+        serde_json::to_value(self).map_err(|err| ControlRecordError::Serialize(err.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sibling GradingRecord ADT (`grading.recorded` preset.* stream, 5 variants)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresetRegisteredRecord {
+    pub preset_id: String,
+    pub engine_label: String,
+    pub model_label: String,
+    pub model_profile: String,
+    pub cost_rank: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresetOnboardedRecord {
+    pub preset_id: String,
+    pub from_state: String,
+    pub to_state: String,
+    #[serde(default, deserialize_with = "deserialize_opt_grade_wire")]
+    pub to_grade: Option<GradeWire>,
+    pub passed: u32,
+    pub total: u32,
+    #[serde(default)]
+    pub failed_cases: Vec<Value>,
+    pub suite: Value,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresetRegradedRecord {
+    pub preset_id: String,
+    pub decision: String,
+    #[serde(default, deserialize_with = "deserialize_opt_grade_wire")]
+    pub from_grade: Option<GradeWire>,
+    #[serde(default, deserialize_with = "deserialize_opt_grade_wire")]
+    pub to_grade: Option<GradeWire>,
+    pub from_state: String,
+    pub to_state: String,
+    pub first_pass: u32,
+    pub total: u32,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresetGradeLockedRecord {
+    pub preset_id: String,
+    #[serde(default, deserialize_with = "deserialize_opt_grade_wire")]
+    pub from_grade: Option<GradeWire>,
+    #[serde(default, deserialize_with = "deserialize_opt_grade_wire")]
+    pub to_grade: Option<GradeWire>,
+    pub from_state: String,
+    pub to_state: String,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresetStateChangedRecord {
+    pub preset_id: String,
+    pub from_state: String,
+    pub to_state: String,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Discriminant for every `grading.recorded` variant in `spawn_grading_apply`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum GradingRecordKind {
+    PresetRegistered,
+    PresetOnboarded,
+    PresetRegraded,
+    PresetGradeLocked,
+    PresetStateChanged,
+}
+
+impl GradingRecordKind {
+    /// Every `GradingRecordKind` (5 variants).
+    pub const ALL: [Self; 5] = [
+        Self::PresetRegistered,
+        Self::PresetOnboarded,
+        Self::PresetRegraded,
+        Self::PresetGradeLocked,
+        Self::PresetStateChanged,
+    ];
+
+    /// Exact SQL `'type'` wire name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PresetRegistered => "preset.registered",
+            Self::PresetOnboarded => "preset.onboarded",
+            Self::PresetRegraded => "preset.regraded",
+            Self::PresetGradeLocked => "preset.grade_locked",
+            Self::PresetStateChanged => "preset.state_changed",
+        }
+    }
+
+    /// Parse a SQL `'type'` wire name.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == raw)
+    }
+}
+
+/// Strongly-typed ADT covering every `grading.recorded` (`preset.*`) record
+/// folded by `spawn_grading_apply` in `schema.sql`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum GradingRecord {
+    #[serde(rename = "preset.registered")]
+    PresetRegistered(PresetRegisteredRecord),
+    #[serde(rename = "preset.onboarded")]
+    PresetOnboarded(Box<PresetOnboardedRecord>),
+    #[serde(rename = "preset.regraded")]
+    PresetRegraded(Box<PresetRegradedRecord>),
+    #[serde(rename = "preset.grade_locked")]
+    PresetGradeLocked(PresetGradeLockedRecord),
+    #[serde(rename = "preset.state_changed")]
+    PresetStateChanged(PresetStateChangedRecord),
+}
+
+impl GradingRecord {
+    /// Every `'type'` wire name in `GradingRecord`, pinned against `schema.sql`.
+    pub const ALL_KINDS: &'static [&'static str] = &[
+        "preset.registered",
+        "preset.onboarded",
+        "preset.regraded",
+        "preset.grade_locked",
+        "preset.state_changed",
+    ];
+
+    /// Strong kind enum for this record.
+    pub const fn kind(&self) -> GradingRecordKind {
+        match self {
+            Self::PresetRegistered(_) => GradingRecordKind::PresetRegistered,
+            Self::PresetOnboarded(_) => GradingRecordKind::PresetOnboarded,
+            Self::PresetRegraded(_) => GradingRecordKind::PresetRegraded,
+            Self::PresetGradeLocked(_) => GradingRecordKind::PresetGradeLocked,
+            Self::PresetStateChanged(_) => GradingRecordKind::PresetStateChanged,
+        }
+    }
+
+    /// SQL `'type'` string for this record.
+    pub const fn kind_str(&self) -> &'static str {
+        self.kind().as_str()
+    }
+
+    /// Deserialize a `Value` into a strongly-typed [`GradingRecord`].
+    pub fn from_value(value: &Value) -> Result<Self, ControlRecordError> {
+        let kind = extract_record_type(value)?;
+        if GradingRecordKind::parse(kind).is_none() {
+            return Err(ControlRecordError::UnknownKind(kind.to_string()));
+        }
+        serde_json::from_value(value.clone()).map_err(|err| ControlRecordError::Deserialize {
+            kind: kind.to_string(),
+            message: err.to_string(),
+        })
+    }
+
+    /// Deserialize and verify closed-schema (`extra.is_empty()`) invariants.
+    pub fn from_value_strict(value: &Value) -> Result<Self, ControlRecordError> {
+        let record = Self::from_value(value)?;
+        let extra = match &record {
+            Self::PresetRegistered(r) => &r.extra,
+            Self::PresetOnboarded(r) => &r.extra,
+            Self::PresetRegraded(r) => &r.extra,
+            Self::PresetGradeLocked(r) => &r.extra,
+            Self::PresetStateChanged(r) => &r.extra,
+        };
+        reject_extra(record.kind_str(), extra)?;
+        Ok(record)
+    }
+
+    /// Serialize to `serde_json::Value`.
+    pub fn to_value(&self) -> Result<Value, ControlRecordError> {
+        serde_json::to_value(self).map_err(|err| ControlRecordError::Serialize(err.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parsing & strict validation helpers
+// ---------------------------------------------------------------------------
+
+fn extract_record_type(value: &Value) -> Result<&str, ControlRecordError> {
+    let map = value.as_object().ok_or(ControlRecordError::NotAnObject)?;
+    map.get("type")
+        .and_then(Value::as_str)
+        .ok_or(ControlRecordError::MissingType)
+}
+
+fn reject_extra(kind: &str, extra: &BTreeMap<String, Value>) -> Result<(), ControlRecordError> {
+    if extra.is_empty() {
+        return Ok(());
+    }
+    Err(ControlRecordError::UnexpectedFields {
+        kind: kind.to_string(),
+        fields: extra.keys().cloned().collect(),
+    })
+}
+
+fn invariant_err(kind: &str, message: impl Into<String>) -> ControlRecordError {
+    ControlRecordError::Invariant {
+        kind: kind.to_string(),
+        message: message.into(),
+    }
+}
+
+fn validate_control_record_strict(record: &ControlRecord) -> Result<(), ControlRecordError> {
+    let kind = record.kind_str();
+    match record {
+        ControlRecord::TaskAssigned(r) => {
+            if r.brief.trim().is_empty() {
+                return Err(invariant_err(kind, "`brief` must not be blank"));
+            }
+            if r.agent_id.is_empty() || r.session_id.is_empty() {
+                return Err(invariant_err(kind, "`agent_id` and `session_id` required"));
+            }
+        }
+        ControlRecord::TaskGated(r) => {
+            if let Some(class) = r.class
+                && class != r.verdict.expected_class()
+            {
+                return Err(invariant_err(
+                    kind,
+                    format!(
+                        "verdict `{}` expects class `{}`, not `{class:?}`",
+                        r.verdict.as_str(),
+                        serde_json::to_string(&r.verdict.expected_class()).unwrap_or_default()
+                    ),
+                ));
+            }
+        }
+        ControlRecord::TaskReviewed(r)
+            if !r.accepted && r.note.as_deref().is_none_or(|n| n.trim().is_empty()) =>
+        {
+            return Err(invariant_err(
+                kind,
+                "sending a task back requires a non-blank `note`",
+            ));
+        }
+        ControlRecord::ExecutionInterrupted(r) => validate_execution_interrupted(kind, r)?,
+        ControlRecord::HostJudge(r) => validate_host_judge(kind, r)?,
+        ControlRecord::DeployFinished(r) => {
+            reject_extra(kind, &r.extra)?;
+            let valid_hex = r.head.len() == 40
+                && r.head
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if !valid_hex {
+                return Err(invariant_err(
+                    kind,
+                    "`head` must be a 40-char lowercase commit",
+                ));
+            }
+        }
+        ControlRecord::ObjectiveVerified(r) => reject_extra(kind, &r.extra)?,
+        ControlRecord::AlertJudged(r) => reject_extra(kind, &r.extra)?,
+        ControlRecord::IntegratorStarted(r) => validate_integrator_started(kind, r)?,
+        ControlRecord::BackupStored(r) => reject_extra(kind, &r.extra)?,
+        ControlRecord::BackupDrilledTranscripts(r)
+        | ControlRecord::BackupDrilledMissions(r)
+        | ControlRecord::BackupDrilledSync(r) => reject_extra(kind, &r.extra)?,
+        ControlRecord::BackupDrilledControllers(r) => reject_extra(kind, &r.extra)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_execution_interrupted(
+    kind: &str,
+    r: &ExecutionInterruptedRecord,
+) -> Result<(), ControlRecordError> {
+    if r.attempt < 1 {
+        return Err(invariant_err(kind, "`attempt` must be >= 1"));
+    }
+    match (r.path, r.due_ms) {
+        (RecoveryPath::Final, Some(_)) => Err(invariant_err(
+            kind,
+            "`final` recovery must have null `due_ms`",
+        )),
+        (RecoveryPath::Resume | RecoveryPath::Handoff | RecoveryPath::Wait, None) => Err(
+            invariant_err(kind, "non-final recovery path requires `due_ms`"),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn validate_host_judge(kind: &str, r: &HostJudgeRecord) -> Result<(), ControlRecordError> {
+    match r.state {
+        HostJudgeState::Down if r.error.is_none() || r.first_failed_ms.is_none() => Err(
+            invariant_err(kind, "`down` state requires `error` and `first_failed_ms`"),
+        ),
+        HostJudgeState::Up if r.failed_calls.is_none() => {
+            Err(invariant_err(kind, "`up` state requires `failed_calls`"))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_integrator_started(
+    kind: &str,
+    r: &IntegratorStartedRecord,
+) -> Result<(), ControlRecordError> {
+    reject_extra(kind, &r.extra)?;
+    if r.pid < 1 || r.gate.is_empty() || r.root.is_empty() {
+        return Err(invariant_err(
+            kind,
+            "`pid >= 1`, `gate`, and `root` required",
+        ));
+    }
+    Ok(())
+}
+
+/// Normalize legacy string-encoded integers/booleans into JSON primitives for
+/// [`ControlRecord::from_value_compat`].
+fn normalize_legacy_json(value: &Value) -> Value {
+    const INT_FIELDS: &[&str] = &[
+        "id",
+        "mission_id",
+        "command_id",
+        "revision",
+        "objective",
+        "task",
+        "hold",
+        "from",
+        "reissue_of",
+        "continues",
+        "reassign_of",
+        "duplicate_of",
+        "reissued_as",
+        "reassigned_as",
+        "pause_event",
+        "halt",
+        "request",
+        "bound_s",
+        "expires_ms",
+        "renews",
+        "mission",
+    ];
+    let Some(map) = value.as_object() else {
+        return value.clone();
+    };
+    let mut out = map.clone();
+    for key in INT_FIELDS {
+        if let Some(Value::String(s)) = out.get(*key)
+            && let Ok(n) = s.trim().parse::<i64>()
+        {
+            out.insert((*key).to_string(), Value::from(n));
+        }
+    }
+    Value::Object(out)
+}
+
+// ---------------------------------------------------------------------------
+// Pure Functional RSI Episode Replay & Attribution Engine
+// ---------------------------------------------------------------------------
+
+/// Terminal or active attribution outcome of a replayed [`TaskEpisode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeOutcome {
+    /// Gated task landed onto the mission's target branch (`task.landed`).
+    Landed,
+    /// Review-only task accepted (`task.reviewed` `accepted: true`).
+    Accepted,
+    /// Task or objective rejected/exhausted via yield (`task.cancelled` `yielded: true`).
+    Rejected,
+    /// Aborted due to budget overrun/stale limit with work dropped (`task.aborted`).
+    Aborted,
+    /// Ended over budget with branch work kept for continuation (`task.over_budget`).
+    OverBudget,
+    /// Explicitly cancelled or closed by closure rule (`task.cancelled`).
+    Cancelled,
+    /// Still open (`assigned`, `delivered`, `reported`, `revise`, gated `accepted`, `landing`).
+    InFlight,
+}
+
+/// Synchronized review checkpoint recorded against a specific report revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSyncPoint {
+    pub event_seq: i64,
+    pub at_ms: i64,
+    pub revision: u32,
+    pub accepted: bool,
+    pub note: Option<String>,
+}
+
+/// Gate verdict checkpoint recorded during episode replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateSyncPoint {
+    pub event_seq: i64,
+    pub at_ms: i64,
+    pub revision: u32,
+    pub verdict: GateVerdict,
+    pub class: Option<GateVerdictClass>,
+    pub base: Option<String>,
+    pub candidate: Option<String>,
+    pub note: Option<String>,
+}
+
+/// Ordered control record timeline entry on an episode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpisodeStage {
+    pub event_seq: i64,
+    pub at_ms: i64,
+    pub kind: ControlRecordKind,
+}
+
+/// Deterministic projection of a single task's lifecycle from `control.recorded`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEpisode {
+    pub task_id: i64,
+    pub mission_id: i64,
+    pub kind: TaskKind,
+    pub agent_id: String,
+    pub session_id: String,
+    pub brief: String,
+    pub created_by: Option<String>,
+    pub objective: Option<i32>,
+    pub scenario: Option<String>,
+    pub model: String,
+    pub difficulty: GradeWire,
+    pub preset_id: Option<String>,
+    pub first_preset_id: Option<String>,
+    pub engine: Option<String>,
+    pub model_label: Option<String>,
+    pub pinned: bool,
+    pub reissue_of: Option<i64>,
+    pub continues: Option<i64>,
+    pub reassign_of: Option<i64>,
+
+    pub state: TaskState,
+    pub outcome: EpisodeOutcome,
+    /// Total revision loops (`mission_tasks.revisions`): quality rejections
+    /// plus merge conflicts / incompatible heads.
+    pub rework: u32,
+    /// Quality-only sends-back (`mission_tasks.quality_rejections`).
+    pub quality_rejections: u32,
+    pub reroutes: u32,
+    pub restarts: u32,
+    pub steals: u32,
+    pub deliveries: u32,
+    pub reports: u32,
+
+    pub last_command_id: Option<i64>,
+    pub last_report: Option<String>,
+    pub last_report_commit: Option<String>,
+    pub review_note: Option<String>,
+    pub base: Option<String>,
+    pub candidate: Option<String>,
+    pub metric: Option<String>,
+    pub last_gate_verdict: Option<GateVerdict>,
+    pub review_sync_points: Vec<ReviewSyncPoint>,
+    pub gate_verdicts: Vec<GateSyncPoint>,
+    pub terminal_by: Option<String>,
+    pub terminal_reason: Option<String>,
+
+    pub assigned_seq: i64,
+    pub assigned_at_ms: i64,
+    pub delivered_at_ms: Option<i64>,
+    pub closed_seq: Option<i64>,
+    pub closed_at_ms: Option<i64>,
+    pub updated_at_ms: i64,
+    pub stages: Vec<EpisodeStage>,
+}
+
+impl TaskEpisode {
+    /// Alias for [`Self::rework`] matching SQL `mission_tasks.revisions`.
+    pub const fn revisions(&self) -> u32 {
+        self.rework
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissionTrackState {
+    Open,
+    Active,
+    Done,
+    Dropped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MissionMeta {
+    gated: bool,
+    accept: AcceptMode,
+    state: MissionTrackState,
+}
+
+impl Default for MissionMeta {
+    fn default() -> Self {
+        Self {
+            gated: false,
+            accept: AcceptMode::Review,
+            state: MissionTrackState::Open,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidentTrackState {
+    Proposed,
+    Approved,
+    Retired,
+}
+
+#[derive(Default)]
+struct ReplayState {
+    missions: BTreeMap<i64, MissionMeta>,
+    residents: BTreeMap<String, ResidentTrackState>,
+    episodes: BTreeMap<i64, TaskEpisode>,
+}
+
+/// Replay an ordered slice of `(event_seq, recorded_at_ms, ControlRecord)`
+/// entries into deterministic [`TaskEpisode`] projections matching SQL
+/// `spawn_control_apply` & `spawn_task_spans`.
+pub fn replay_task_episodes(records: &[(i64, i64, ControlRecord)]) -> Vec<TaskEpisode> {
+    let mut state = ReplayState::default();
+    for (seq, at_ms, record) in records {
+        state.apply(*seq, *at_ms, record);
+    }
+    let mut out: Vec<TaskEpisode> = state.episodes.into_values().collect();
+    out.sort_by_key(|ep| (ep.assigned_seq, ep.task_id));
+    out
+}
+
+impl ReplayState {
+    fn apply(&mut self, seq: i64, at_ms: i64, record: &ControlRecord) {
+        match record {
+            ControlRecord::MissionAdded(r) => {
+                self.missions.insert(r.id, MissionMeta::default());
+            }
+            ControlRecord::MissionConfigured(r) => {
+                let meta = self.missions.entry(r.id).or_default();
+                meta.gated = r.gate.is_some();
+                meta.accept = r.accept.unwrap_or(AcceptMode::Review);
+            }
+            ControlRecord::MissionClosed(r) => self.on_mission_closed(seq, at_ms, r),
+            ControlRecord::ResidentProposed(r) => {
+                self.residents
+                    .entry(format!("agent_resident_{}", r.name))
+                    .or_insert(ResidentTrackState::Proposed);
+            }
+            ControlRecord::ResidentApproved(r) => {
+                self.residents.insert(
+                    format!("agent_resident_{}", r.name),
+                    ResidentTrackState::Approved,
+                );
+            }
+            ControlRecord::ResidentRetired(r) => self.on_resident_retired(seq, at_ms, &r.name),
+            ControlRecord::TaskAssigned(r) => self.on_task_assigned(seq, at_ms, r),
+            ControlRecord::TaskDelivered(r) => self.on_task_delivered(seq, at_ms, r),
+            ControlRecord::TaskReported(r) => self.on_task_reported(seq, at_ms, r),
+            ControlRecord::TaskReviewed(r) => self.on_task_reviewed(seq, at_ms, r),
+            ControlRecord::TaskRerouted(r) => self.on_task_rerouted(seq, at_ms, r),
+            ControlRecord::TaskRestarted(r) => self.on_task_restarted(seq, at_ms, r),
+            ControlRecord::TaskStolen(r) => self.on_task_stolen(seq, at_ms, r),
+            ControlRecord::TaskGated(r) => self.on_task_gated(seq, at_ms, r),
+            ControlRecord::TaskLanded(r) => self.on_task_landed(seq, at_ms, r.id),
+            ControlRecord::TaskAborted(r) => self.on_task_aborted(seq, at_ms, r),
+            ControlRecord::TaskOverBudget(r) => self.on_task_over_budget(seq, at_ms, r),
+            ControlRecord::TaskCancelled(r) => self.on_task_cancelled(seq, at_ms, r),
+            ControlRecord::TaskReportUnfinished(r) => {
+                self.record_stage(r.id, seq, at_ms, record.kind());
+            }
+            ControlRecord::TaskForkFailed(r) => self.record_stage(r.id, seq, at_ms, record.kind()),
+            ControlRecord::TaskShadowGated(r) => self.record_stage(r.id, seq, at_ms, record.kind()),
+            ControlRecord::TaskHeld(r) => self.record_stage(r.id, seq, at_ms, record.kind()),
+            ControlRecord::TaskReleased(r) => self.record_stage(r.id, seq, at_ms, record.kind()),
+            ControlRecord::LegacyImported(r) => self.on_legacy_imported(seq, at_ms, r),
+            _ => {}
+        }
+    }
+
+    fn record_stage(&mut self, task_id: i64, seq: i64, at_ms: i64, kind: ControlRecordKind) {
+        if let Some(ep) = self.episodes.get_mut(&task_id) {
+            ep.updated_at_ms = at_ms;
+            ep.stages.push(EpisodeStage {
+                event_seq: seq,
+                at_ms,
+                kind,
+            });
+        }
+    }
+
+    fn on_mission_closed(&mut self, seq: i64, at_ms: i64, r: &MissionClosedRecord) {
+        let meta = self.missions.entry(r.id).or_default();
+        meta.state = match r.state {
+            MissionCloseState::Done => MissionTrackState::Done,
+            MissionCloseState::Dropped => MissionTrackState::Dropped,
+        };
+        let meta_copy = *meta;
+        for ep in self.episodes.values_mut() {
+            if ep.mission_id != r.id {
+                continue;
+            }
+            let resident = self.residents.get(&ep.agent_id).copied();
+            if !task_may_continue(ep.state, meta_copy, resident) && ep.state != TaskState::Cancelled
+            {
+                ep.state = TaskState::Cancelled;
+                ep.outcome = EpisodeOutcome::Cancelled;
+                ep.updated_at_ms = at_ms;
+                ep.closed_seq.get_or_insert(seq);
+                ep.closed_at_ms.get_or_insert(at_ms);
+            }
+        }
+    }
+
+    fn on_resident_retired(&mut self, seq: i64, at_ms: i64, name: &str) {
+        let agent_id = format!("agent_resident_{name}");
+        self.residents
+            .insert(agent_id.clone(), ResidentTrackState::Retired);
+        for ep in self.episodes.values_mut() {
+            if ep.agent_id != agent_id {
+                continue;
+            }
+            let meta = self
+                .missions
+                .get(&ep.mission_id)
+                .copied()
+                .unwrap_or_default();
+            if !task_may_continue(ep.state, meta, Some(ResidentTrackState::Retired))
+                && ep.state != TaskState::Cancelled
+            {
+                ep.state = TaskState::Cancelled;
+                ep.outcome = EpisodeOutcome::Cancelled;
+                ep.updated_at_ms = at_ms;
+                ep.closed_seq.get_or_insert(seq);
+                ep.closed_at_ms.get_or_insert(at_ms);
+            }
+        }
+    }
+
+    fn on_task_assigned(&mut self, seq: i64, at_ms: i64, r: &TaskAssignedRecord) {
+        let meta = self.missions.entry(r.mission_id).or_default();
+        if meta.state == MissionTrackState::Open {
+            meta.state = MissionTrackState::Active;
+        }
+        let first_preset_id = r.first_preset_id.clone().or_else(|| r.preset_id.clone());
+        let ep = TaskEpisode {
+            task_id: r.id,
+            mission_id: r.mission_id,
+            kind: r.kind,
+            agent_id: r.agent_id.clone(),
+            session_id: r.session_id.clone(),
+            brief: r.brief.clone(),
+            created_by: r.created_by.clone(),
+            objective: r.objective,
+            scenario: r.scenario.clone(),
+            model: r.model.clone().unwrap_or_else(|| "default".to_string()),
+            difficulty: r.difficulty.unwrap_or(GradeWire::L2),
+            preset_id: r.preset_id.clone(),
+            first_preset_id,
+            engine: r.engine.clone(),
+            model_label: r.model_label.clone(),
+            pinned: r.pinned.unwrap_or(false),
+            reissue_of: r.reissue_of,
+            continues: r.continues,
+            reassign_of: r.reassign_of,
+            state: TaskState::Assigned,
+            outcome: EpisodeOutcome::InFlight,
+            rework: 0,
+            quality_rejections: r.quality_rejections.unwrap_or(0),
+            reroutes: 0,
+            restarts: 0,
+            steals: 0,
+            deliveries: 0,
+            reports: 0,
+            last_command_id: None,
+            last_report: None,
+            last_report_commit: None,
+            review_note: None,
+            base: None,
+            candidate: None,
+            metric: None,
+            last_gate_verdict: None,
+            review_sync_points: Vec::new(),
+            gate_verdicts: Vec::new(),
+            terminal_by: None,
+            terminal_reason: None,
+            assigned_seq: seq,
+            assigned_at_ms: at_ms,
+            delivered_at_ms: None,
+            closed_seq: None,
+            closed_at_ms: None,
+            updated_at_ms: at_ms,
+            stages: vec![EpisodeStage {
+                event_seq: seq,
+                at_ms,
+                kind: ControlRecordKind::TaskAssigned,
+            }],
+        };
+        self.episodes.insert(r.id, ep);
+    }
+
+    fn on_task_delivered(&mut self, seq: i64, at_ms: i64, r: &TaskDeliveredRecord) {
+        if let Some(ep) = self.episodes.get_mut(&r.id) {
+            ep.state = TaskState::Delivered;
+            ep.deliveries += 1;
+            ep.last_command_id = Some(r.command_id);
+            ep.delivered_at_ms = Some(at_ms);
+            ep.updated_at_ms = at_ms;
+            ep.stages.push(EpisodeStage {
+                event_seq: seq,
+                at_ms,
+                kind: ControlRecordKind::TaskDelivered,
+            });
+        }
+    }
+
+    fn on_task_reported(&mut self, seq: i64, at_ms: i64, r: &TaskReportedRecord) {
+        if let Some(ep) = self.episodes.get_mut(&r.id) {
+            ep.state = TaskState::Reported;
+            ep.reports += 1;
+            ep.last_report = Some(r.report.clone());
+            ep.last_report_commit.clone_from(&r.commit);
+            ep.updated_at_ms = at_ms;
+            ep.stages.push(EpisodeStage {
+                event_seq: seq,
+                at_ms,
+                kind: ControlRecordKind::TaskReported,
+            });
+        }
+    }
+
+    fn on_task_reviewed(&mut self, seq: i64, at_ms: i64, r: &TaskReviewedRecord) {
+        let Some(ep) = self.episodes.get_mut(&r.id) else {
+            return;
+        };
+        ep.stages.push(EpisodeStage {
+            event_seq: seq,
+            at_ms,
+            kind: ControlRecordKind::TaskReviewed,
+        });
+        if let Some(expected_rev) = r.revision
+            && ep.rework != expected_rev
+        {
+            return;
+        }
+        let reviewed_revision = ep.rework;
+        ep.review_sync_points.push(ReviewSyncPoint {
+            event_seq: seq,
+            at_ms,
+            revision: reviewed_revision,
+            accepted: r.accepted,
+            note: r.note.clone(),
+        });
+        ep.updated_at_ms = at_ms;
+        if r.accepted {
+            ep.state = TaskState::Accepted;
+            let gated = self.missions.get(&ep.mission_id).is_some_and(|m| m.gated);
+            if !gated {
+                ep.outcome = EpisodeOutcome::Accepted;
+                ep.closed_seq.get_or_insert(seq);
+                ep.closed_at_ms.get_or_insert(at_ms);
+            }
+        } else {
+            ep.state = TaskState::Revise;
+            ep.review_note.clone_from(&r.note);
+            ep.rework += 1;
+            ep.quality_rejections += 1;
+        }
+    }
+
+    fn on_task_rerouted(&mut self, seq: i64, at_ms: i64, r: &TaskReroutedRecord) {
+        if let Some(ep) = self.episodes.get_mut(&r.id) {
+            ep.preset_id = Some(r.preset_id.clone());
+            ep.model.clone_from(&r.model);
+            ep.reroutes += 1;
+            ep.updated_at_ms = at_ms;
+            ep.stages.push(EpisodeStage {
+                event_seq: seq,
+                at_ms,
+                kind: ControlRecordKind::TaskRerouted,
+            });
+        }
+    }
+
+    fn on_task_restarted(&mut self, seq: i64, at_ms: i64, r: &TaskRestartedRecord) {
+        if let Some(ep) = self.episodes.get_mut(&r.task) {
+            ep.restarts += 1;
+            ep.updated_at_ms = at_ms;
+            ep.stages.push(EpisodeStage {
+                event_seq: seq,
+                at_ms,
+                kind: ControlRecordKind::TaskRestarted,
+            });
+        }
+    }
+
+    fn on_task_stolen(&mut self, seq: i64, at_ms: i64, r: &TaskStolenRecord) {
+        if let Some(ep) = self.episodes.get_mut(&r.id) {
+            ep.session_id.clone_from(&r.to_session);
+            ep.agent_id.clone_from(&r.to_agent);
+            ep.steals += 1;
+            ep.updated_at_ms = at_ms;
+            ep.stages.push(EpisodeStage {
+                event_seq: seq,
+                at_ms,
+                kind: ControlRecordKind::TaskStolen,
+            });
+        }
+    }
+
+    fn on_task_gated(&mut self, seq: i64, at_ms: i64, r: &TaskGatedRecord) {
+        let Some(ep) = self.episodes.get_mut(&r.id) else {
+            return;
+        };
+        ep.stages.push(EpisodeStage {
+            event_seq: seq,
+            at_ms,
+            kind: ControlRecordKind::TaskGated,
+        });
+        if let Some(expected_rev) = r.revision
+            && ep.rework != expected_rev
+        {
+            return;
+        }
+        let accept_mode = self
+            .missions
+            .get(&ep.mission_id)
+            .map_or(AcceptMode::Review, |m| m.accept);
+        let judged_revision = ep.rework;
+        ep.gate_verdicts.push(GateSyncPoint {
+            event_seq: seq,
+            at_ms,
+            revision: judged_revision,
+            verdict: r.verdict,
+            class: r.class,
+            base: r.base.clone(),
+            candidate: r.candidate.clone(),
+            note: r.note.clone(),
+        });
+        if let Some(base) = &r.base {
+            ep.base = Some(base.clone());
+        }
+        ep.last_gate_verdict = Some(r.verdict);
+        ep.updated_at_ms = at_ms;
+        apply_gate_verdict(ep, r, accept_mode);
+    }
+
+    fn on_task_landed(&mut self, seq: i64, at_ms: i64, task_id: i64) {
+        if let Some(ep) = self.episodes.get_mut(&task_id) {
+            ep.state = TaskState::Landed;
+            ep.outcome = EpisodeOutcome::Landed;
+            ep.updated_at_ms = at_ms;
+            ep.closed_seq.get_or_insert(seq);
+            ep.closed_at_ms.get_or_insert(at_ms);
+            ep.stages.push(EpisodeStage {
+                event_seq: seq,
+                at_ms,
+                kind: ControlRecordKind::TaskLanded,
+            });
+        }
+    }
+
+    fn on_task_aborted(&mut self, seq: i64, at_ms: i64, r: &TaskAbortedRecord) {
+        if let Some(ep) = self.episodes.get_mut(&r.id) {
+            ep.state = TaskState::Cancelled;
+            ep.outcome = EpisodeOutcome::Aborted;
+            ep.review_note.clone_from(&r.reason);
+            ep.terminal_reason.clone_from(&r.reason);
+            ep.updated_at_ms = at_ms;
+            ep.closed_seq.get_or_insert(seq);
+            ep.closed_at_ms.get_or_insert(at_ms);
+            ep.stages.push(EpisodeStage {
+                event_seq: seq,
+                at_ms,
+                kind: ControlRecordKind::TaskAborted,
+            });
+        }
+    }
+
+    fn on_task_over_budget(&mut self, seq: i64, at_ms: i64, r: &TaskOverBudgetRecord) {
+        if let Some(ep) = self.episodes.get_mut(&r.id) {
+            ep.state = TaskState::Cancelled;
+            ep.outcome = EpisodeOutcome::OverBudget;
+            ep.review_note = Some(r.reason.clone());
+            ep.terminal_reason = Some(r.reason.clone());
+            ep.updated_at_ms = at_ms;
+            ep.closed_seq.get_or_insert(seq);
+            ep.closed_at_ms.get_or_insert(at_ms);
+            ep.stages.push(EpisodeStage {
+                event_seq: seq,
+                at_ms,
+                kind: ControlRecordKind::TaskOverBudget,
+            });
+        }
+    }
+
+    fn on_task_cancelled(&mut self, seq: i64, at_ms: i64, r: &TaskCancelledRecord) {
+        if let Some(ep) = self.episodes.get_mut(&r.id) {
+            ep.state = TaskState::Cancelled;
+            ep.outcome = if r.yielded == Some(true) {
+                EpisodeOutcome::Rejected
+            } else {
+                EpisodeOutcome::Cancelled
+            };
+            if ep.terminal_by.is_none() {
+                ep.terminal_by.clone_from(&r.by);
+            }
+            if ep.terminal_reason.is_none() {
+                ep.terminal_reason.clone_from(&r.reason);
+            }
+            ep.updated_at_ms = at_ms;
+            ep.closed_seq.get_or_insert(seq);
+            ep.closed_at_ms.get_or_insert(at_ms);
+            ep.stages.push(EpisodeStage {
+                event_seq: seq,
+                at_ms,
+                kind: ControlRecordKind::TaskCancelled,
+            });
+        }
+    }
+
+    fn on_legacy_imported(&mut self, seq: i64, at_ms: i64, r: &LegacyImportedRecord) {
+        match r.table {
+            LegacyTable::MissionMissions => self.import_legacy_mission(&r.row),
+            LegacyTable::MissionResidents => self.import_legacy_resident(&r.row),
+            LegacyTable::MissionTasks => self.import_legacy_task(seq, at_ms, &r.row),
+        }
+    }
+
+    fn import_legacy_mission(&mut self, row: &Value) {
+        let Some(id) = row.get("id").and_then(Value::as_i64) else {
+            return;
+        };
+        let state = match row.get("state").and_then(Value::as_str) {
+            Some("active") => MissionTrackState::Active,
+            Some("done") => MissionTrackState::Done,
+            Some("dropped") => MissionTrackState::Dropped,
+            _ => MissionTrackState::Open,
+        };
+        let accept = match row.get("accept").and_then(Value::as_str) {
+            Some("gate") => AcceptMode::Gate,
+            _ => AcceptMode::Review,
+        };
+        self.missions.insert(
+            id,
+            MissionMeta {
+                gated: row.get("gate").is_some_and(|g| !g.is_null()),
+                accept,
+                state,
+            },
+        );
+    }
+
+    fn import_legacy_resident(&mut self, row: &Value) {
+        let Some(agent_id) = row.get("agent_id").and_then(Value::as_str) else {
+            return;
+        };
+        let st = match row.get("state").and_then(Value::as_str) {
+            Some("approved") => ResidentTrackState::Approved,
+            Some("retired") => ResidentTrackState::Retired,
+            _ => ResidentTrackState::Proposed,
+        };
+        self.residents.insert(agent_id.to_string(), st);
+    }
+
+    fn import_legacy_task(&mut self, seq: i64, at_ms: i64, row: &Value) {
+        let Some(id) = row.get("id").and_then(Value::as_i64) else {
+            return;
+        };
+        let Some(mission_id) = row.get("mission_id").and_then(Value::as_i64) else {
+            return;
+        };
+        let state = legacy_opt_str(row, "state")
+            .and_then(|s| s.parse::<TaskState>().ok())
+            .unwrap_or(TaskState::Assigned);
+        let gated = self.missions.get(&mission_id).is_some_and(|m| m.gated);
+        let outcome = match state {
+            TaskState::Landed => EpisodeOutcome::Landed,
+            TaskState::Cancelled => EpisodeOutcome::Cancelled,
+            TaskState::Accepted if !gated => EpisodeOutcome::Accepted,
+            _ => EpisodeOutcome::InFlight,
+        };
+        let preset_id = legacy_opt_str(row, "preset_id");
+        let first_preset_id = legacy_opt_str(row, "first_preset_id").or_else(|| preset_id.clone());
+        let ep = build_legacy_episode(
+            seq,
+            at_ms,
+            id,
+            mission_id,
+            state,
+            outcome,
+            preset_id,
+            first_preset_id,
+            row,
+        );
+        self.episodes.insert(id, ep);
+    }
+}
+
+fn legacy_opt_str(row: &Value, key: &str) -> Option<String> {
+    row.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn legacy_opt_u32(row: &Value, key: &str) -> Option<u32> {
+    row.get(key)
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_legacy_episode(
+    seq: i64,
+    at_ms: i64,
+    id: i64,
+    mission_id: i64,
+    state: TaskState,
+    outcome: EpisodeOutcome,
+    preset_id: Option<String>,
+    first_preset_id: Option<String>,
+    row: &Value,
+) -> TaskEpisode {
+    let kind = match row.get("kind").and_then(Value::as_str) {
+        Some("resident") => TaskKind::Resident,
+        _ => TaskKind::Ephemeral,
+    };
+    let difficulty = row
+        .get("difficulty")
+        .and_then(Value::as_i64)
+        .and_then(GradeWire::from_rank)
+        .unwrap_or(GradeWire::L2);
+    let updated_at_ms = row
+        .get("updated_at_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(at_ms);
+    TaskEpisode {
+        task_id: id,
+        mission_id,
+        kind,
+        agent_id: legacy_opt_str(row, "agent_id").unwrap_or_default(),
+        session_id: legacy_opt_str(row, "session_id").unwrap_or_default(),
+        brief: legacy_opt_str(row, "brief").unwrap_or_default(),
+        created_by: legacy_opt_str(row, "created_by"),
+        objective: row
+            .get("objective")
+            .and_then(Value::as_i64)
+            .and_then(|n| i32::try_from(n).ok()),
+        scenario: legacy_opt_str(row, "scenario"),
+        model: legacy_opt_str(row, "model").unwrap_or_else(|| "default".to_string()),
+        difficulty,
+        preset_id,
+        first_preset_id,
+        engine: legacy_opt_str(row, "engine"),
+        model_label: legacy_opt_str(row, "model_label"),
+        pinned: row.get("pinned").and_then(Value::as_bool).unwrap_or(false),
+        reissue_of: row.get("reissue_of").and_then(Value::as_i64),
+        continues: row.get("continues").and_then(Value::as_i64),
+        reassign_of: row.get("reassign_of").and_then(Value::as_i64),
+        state,
+        outcome,
+        rework: legacy_opt_u32(row, "revisions").unwrap_or(0),
+        quality_rejections: legacy_opt_u32(row, "quality_rejections").unwrap_or(0),
+        reroutes: 0,
+        restarts: 0,
+        steals: 0,
+        deliveries: u32::from(row.get("delivered_at_ms").is_some_and(|v| !v.is_null())),
+        reports: u32::from(row.get("report").is_some_and(|v| !v.is_null())),
+        last_command_id: row.get("command_id").and_then(Value::as_i64),
+        last_report: legacy_opt_str(row, "report"),
+        last_report_commit: None,
+        review_note: legacy_opt_str(row, "review_note"),
+        base: legacy_opt_str(row, "base"),
+        candidate: legacy_opt_str(row, "candidate"),
+        metric: legacy_opt_str(row, "metric"),
+        last_gate_verdict: None,
+        review_sync_points: Vec::new(),
+        gate_verdicts: Vec::new(),
+        terminal_by: None,
+        terminal_reason: None,
+        assigned_seq: seq,
+        assigned_at_ms: row
+            .get("created_at_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(at_ms),
+        delivered_at_ms: row.get("delivered_at_ms").and_then(Value::as_i64),
+        closed_seq: (outcome != EpisodeOutcome::InFlight).then_some(seq),
+        closed_at_ms: (outcome != EpisodeOutcome::InFlight).then_some(updated_at_ms),
+        updated_at_ms,
+        stages: Vec::new(),
+    }
+}
+
+fn apply_gate_verdict(ep: &mut TaskEpisode, r: &TaskGatedRecord, accept_mode: AcceptMode) {
+    match r.verdict {
+        GateVerdict::Accepted => {
+            ep.state = TaskState::Landing;
+            ep.candidate.clone_from(&r.candidate);
+            if let Some(metric) = &r.metric {
+                ep.metric = Some(metric.clone());
+            }
+        }
+        GateVerdict::Rejected => {
+            ep.state = TaskState::Revise;
+            ep.candidate = None;
+            ep.review_note.clone_from(&r.note);
+            ep.rework += 1;
+            ep.quality_rejections += 1;
+        }
+        GateVerdict::Conflict | GateVerdict::Incompatible => {
+            ep.state = TaskState::Revise;
+            ep.candidate = None;
+            ep.review_note.clone_from(&r.note);
+            ep.rework += 1;
+        }
+        GateVerdict::Stale => {
+            ep.state = match accept_mode {
+                AcceptMode::Gate => TaskState::Reported,
+                AcceptMode::Review => TaskState::Accepted,
+            };
+            ep.candidate = None;
+        }
+        GateVerdict::Aborted | GateVerdict::NoRoom | GateVerdict::HostFault => {}
+    }
+}
+
+/// Closure rule matching SQL `spawn_task_may_continue` (`schema.sql`).
+const fn task_may_continue(
+    state: TaskState,
+    mission: MissionMeta,
+    resident: Option<ResidentTrackState>,
+) -> bool {
+    let resident_retired = matches!(resident, Some(ResidentTrackState::Retired));
+    let mission_open = matches!(
+        mission.state,
+        MissionTrackState::Open | MissionTrackState::Active
+    );
+    match state {
+        TaskState::Cancelled | TaskState::Landed => true,
+        TaskState::Accepted if !mission.gated => true,
+        _ if mission_open && !resident_retired => true,
+        TaskState::Accepted | TaskState::Landing
+            if mission.gated && !matches!(mission.state, MissionTrackState::Dropped) =>
+        {
+            true
+        }
+        TaskState::Delivered | TaskState::Reported
+            if mission.gated
+                && matches!(mission.state, MissionTrackState::Done)
+                && !resident_retired =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Helper for tests & tooling verifying [`ControlRecord::ALL_KINDS`] and
+/// [`ControlRecordKind::ALL`] uniqueness and bijective alignment.
+pub fn control_kind_set() -> BTreeSet<&'static str> {
+    ControlRecord::ALL_KINDS.iter().copied().collect()
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use serde_json::{Value, json};
+
+    use super::{
+        ControlRecord, ControlRecordError, ControlRecordKind, EpisodeOutcome, GateVerdict,
+        GradeWire, GradingRecord, GradingRecordKind, replay_task_episodes,
+    };
+    use crate::mission::TaskState;
+
+    fn sample_control_payloads() -> Vec<Value> {
+        let sha_a = "a".repeat(40);
+        let sha_b = "b".repeat(40);
+        vec![
+            json!({"type": "mission.added", "id": 1, "text": "ship", "origin": "human", "sources": ["/tmp/repo"]}),
+            json!({"type": "mission.configured", "id": 1, "gate": "/tmp/gate.sh", "accept": "gate", "budget": {"tool_calls": 5}, "objectives": null}),
+            json!({"type": "mission.closed", "id": 1, "state": "done", "summary": "ok"}),
+            json!({"type": "mission.halted", "id": 1, "reason": "main moved", "cause": "main_moved", "source": "/tmp/repo", "from": sha_a, "to": sha_b}),
+            json!({"type": "mission.resumed", "id": 1, "by": "human", "halt": 42, "key": "res-1"}),
+            json!({"type": "mission.paused", "id": 1, "reason": "maintenance"}),
+            json!({"type": "mission.unpaused", "id": 1, "pause_event": 99}),
+            json!({"type": "task.assigned", "id": 10, "mission_id": 1, "kind": "ephemeral", "agent_id": "agent_w_10", "session_id": "session_w_10", "brief": "do it", "model": "default", "created_by": "human", "difficulty": "l2", "preset_id": "neon"}),
+            json!({"type": "task.delivered", "id": 10, "command_id": 50}),
+            json!({"type": "task.reported", "id": 10, "report": "done", "commit": sha_a}),
+            json!({"type": "task.report_unfinished", "id": 10, "revision": 0, "digest": "deadbeef", "markers": [{"line": 3}], "note": "finish todo", "command_id": 51}),
+            json!({"type": "task.fork_failed", "id": 10, "from": 9, "commit": sha_a, "error": "git error"}),
+            json!({"type": "task.reviewed", "id": 10, "accepted": false, "note": "fix bug", "revision": 0}),
+            json!({"type": "task.rerouted", "id": 10, "preset_id": "fibble", "model": "default", "from_preset_id": "neon", "revision": 1, "routed_difficulty": "l3", "execution_profile": "heavy"}),
+            json!({"type": "task.restarted", "task": 10, "session_id": "session_w_10", "agent_id": "agent_w_10", "execution_id": "exec-1", "by": "human", "reason": "wedged", "n": 1}),
+            json!({"type": "task.cancelled", "id": 10, "by": "human", "reason": "no longer needed"}),
+            json!({"type": "task.stolen", "id": 10, "from_session": "session_r_a", "from_agent": "agent_r_a", "to_session": "session_r_b", "to_agent": "agent_r_b", "pool": "workers", "by": "spawn-dispatch", "queued_since_ms": 1000}),
+            json!({"type": "task.aborted", "id": 10, "reason": "stale limit"}),
+            json!({"type": "task.over_budget", "id": 10, "reason": "exceeded", "tool_calls": 6, "budget": {"tool_calls": 5}}),
+            json!({"type": "task.gated", "id": 10, "verdict": "accepted", "class": "code", "revision": 1, "base": sha_a, "candidate": sha_b}),
+            json!({"type": "task.shadow_gated", "id": 10, "runner": "shadow-1", "revision": 1, "verdict": "accepted", "inputs": {"base": sha_a}, "unequal": [], "agrees": true}),
+            json!({"type": "task.held", "id": 10, "hold": 77, "source": "/tmp/repo"}),
+            json!({"type": "task.released", "id": 10, "by": "human", "reason": "flaky fixed"}),
+            json!({"type": "task.landed", "id": 10, "from": sha_a, "to": sha_b, "missions": [2]}),
+            json!({"type": "resident.proposed", "name": "core", "charter": "own core", "proposed_by": "human", "pool": "workers"}),
+            json!({"type": "resident.approved", "name": "core"}),
+            json!({"type": "resident.retired", "name": "core"}),
+            json!({"type": "objective.solved", "id": 1, "objective": 12, "task": 10, "scenario": "012.sh", "base": sha_a}),
+            json!({"type": "objective.verified", "mission": 1, "objective": 12, "by": "owner", "how": "live curl", "result": "pass"}),
+            json!({"type": "objective.retired", "id": 1, "objective": 13, "kind": "obsolete", "by": "owner", "reason": "superseded"}),
+            json!({"type": "source.moved", "source": "/tmp/repo", "from": sha_a, "to": sha_b, "by": "human", "missions": [1]}),
+            json!({"type": "source.held", "source": "/tmp/repo", "main": sha_a, "by": "human", "bound_s": 60, "expires_ms": 9000}),
+            json!({"type": "source.released", "source": "/tmp/repo", "hold": 77, "by": "human"}),
+            json!({"type": "source.hold_expired", "source": "/tmp/repo", "hold": 77, "expires_ms": 9000, "waiting": [10]}),
+            json!({"type": "source.push_requested", "source": "/tmp/repo", "commit": sha_b, "ref": format!("refs/spawn-owner/{sha_b}"), "by": "human", "gated": true}),
+            json!({"type": "source.push_refused", "request": 88, "reason": "conflict", "source": "/tmp/repo", "commit": sha_b}),
+            json!({"type": "source.push_no_verdict", "request": 88, "reason": "host fault"}),
+            json!({"type": "source.main_red", "source": "/tmp/repo", "main": sha_a, "scenario": "check-a.sh", "failures": ["001"], "task": 10, "alert": true}),
+            json!({"type": "source.main_probe", "source": "/tmp/repo", "main": sha_a, "task": 10, "probe_ms": 60000}),
+            json!({"type": "source.main_green", "source": "/tmp/repo", "scenario": "check-a.sh", "main": sha_b, "since_ms": 1000, "red_main": sha_a}),
+            json!({"type": "integrator.started", "pid": 123, "ppid": 1, "parent_comm": "init", "ancestors": [{"pid": 1, "comm": "init"}], "cwd": "/tmp", "cgroup": "/user.slice", "gate": "/tmp/g.sh", "gate_from_env": false, "root": "/tmp", "once": true}),
+            json!({"type": "integrator.draining", "bound_s": 300, "gates": [10]}),
+            json!({"type": "integrator.drained", "bound_s": 300}),
+            json!({"type": "integrator.drain_expired", "bound_s": 300, "gates": [10]}),
+            json!({"type": "host.disk", "path": "/tmp", "state": "low", "free_bytes": 1024}),
+            json!({"type": "host.storage", "archive_bytes": 10, "archive_files": 1, "projects_bytes": 20, "projects_files": 2}),
+            json!({"type": "host.core_lines", "values": {"spawn_core": 500}}),
+            json!({"type": "host.storage_bytes", "sources": {"pg": {"bytes": 4096}}}),
+            json!({"type": "host.judge", "judge": "jev", "state": "down", "error": "timeout", "first_failed_ms": 100}),
+            json!({"type": "host.messages_marked", "started_at_ms": 100}),
+            json!({"type": "host.loop_started", "boot_id": "boot-1", "started_at_ms": 100}),
+            json!({"type": "execution.interrupted", "agent_id": "a", "session_id": "s", "execution_id": "e", "cause": "stopped", "path": "final", "attempt": 1, "evidence": {}, "due_ms": null}),
+            json!({"type": "execution.cleared", "execution_id": "e", "session_id": "s", "cause": "model_unavailable", "waited_ms": 500}),
+            json!({"type": "alert.fired", "key": "k1", "kind": "disk_low", "subject": "host", "text": "low"}),
+            json!({"type": "alert.updated", "key": "k1", "kind": "unverified_landings", "subject": "host", "text": "2"}),
+            json!({"type": "alert.judged", "key": "k1", "verdict": "right"}),
+            json!({"type": "alert.cleared", "key": "k1", "kind": "disk_low", "subject": "host"}),
+            json!({"type": "deploy.finished", "ok": true, "head": sha_a, "by": "owner", "reason": ""}),
+            json!({"type": "backup.dumped", "keys": ["pg/a.dump"], "bytes": 100}),
+            json!({"type": "backup.bundled", "kind": "full", "base_event_id": null, "keys": []}),
+            json!({"type": "backup.verified", "ok": true, "reason": ""}),
+            json!({"type": "backup.stored", "area": "sessions", "host": "h", "account": "a", "manifest": "m", "files": 1, "unchanged": 0, "grown": 0, "whole": 1, "segments_written": 1, "segments_found": 0, "bytes_written": 10}),
+            json!({"type": "backup.drilled.transcripts", "ok": true, "reason": "", "bundle": "b", "bundle_event_id": 1, "mismatches": 0, "duration_ms": 5}),
+            json!({"type": "backup.drilled.missions", "ok": true, "reason": "", "bundle": "b", "bundle_event_id": 1, "mismatches": 0, "duration_ms": 5}),
+            json!({"type": "backup.drilled.controllers", "ok": false, "reason": "fail", "bundle": "b", "bundle_event_id": 1, "mismatches": 1, "duration_ms": 5}),
+            json!({"type": "backup.drilled.sync", "ok": true, "reason": "", "bundle": "b", "bundle_event_id": 1, "mismatches": 0, "duration_ms": 5}),
+            json!({"type": "legacy.imported", "table": "mission_missions", "row": {"id": 1, "text": "old"}}),
+        ]
+    }
+
+    #[test]
+    fn every_control_and_grading_variant_round_trips_and_covers_all_kinds() {
+        let samples = sample_control_payloads();
+        assert_eq!(ControlRecord::ALL_KINDS.len(), ControlRecordKind::ALL.len());
+        let mut seen = BTreeSet::new();
+        for payload in &samples {
+            let parsed = ControlRecord::from_value_strict(payload).expect("strict parse");
+            seen.insert(parsed.kind_str());
+            let wire = parsed.to_value().expect("serialize");
+            let reparsed = ControlRecord::from_value(&wire).expect("reparse");
+            assert_eq!(reparsed, parsed);
+        }
+        let expected: BTreeSet<&str> = ControlRecord::ALL_KINDS.iter().copied().collect();
+        assert_eq!(seen, expected, "every ControlRecord kind must be covered");
+
+        let grading_samples = [
+            json!({"type": "preset.registered", "preset_id": "neon", "engine_label": "agy", "model_label": "neon", "model_profile": "default", "cost_rank": 1, "execution_profile": "standard"}),
+            json!({"type": "preset.onboarded", "preset_id": "neon", "from_state": "unexamined", "to_state": "active", "to_grade": "l2", "passed": 4, "total": 4, "failed_cases": [], "suite": "evals"}),
+            json!({"type": "preset.regraded", "preset_id": "neon", "decision": "demote", "from_grade": "l3", "to_grade": "l2", "from_state": "active", "to_state": "demoted", "first_pass": 1, "total": 5}),
+            json!({"type": "preset.grade_locked", "preset_id": "neon", "from_grade": null, "to_grade": "l2", "from_state": "active", "to_state": "active"}),
+            json!({"type": "preset.state_changed", "preset_id": "neon", "from_state": "active", "to_state": "disabled"}),
+        ];
+        let mut seen_grading = BTreeSet::new();
+        for payload in &grading_samples {
+            let parsed = GradingRecord::from_value_strict(payload).expect("strict grading parse");
+            seen_grading.insert(parsed.kind_str());
+            let wire = parsed.to_value().expect("serialize grading");
+            assert_eq!(GradingRecord::from_value(&wire).expect("reparse"), parsed);
+        }
+        assert_eq!(seen_grading.len(), GradingRecordKind::ALL.len());
+        let expected_grading: BTreeSet<&str> = GradingRecord::ALL_KINDS.iter().copied().collect();
+        assert_eq!(seen_grading, expected_grading);
+    }
+
+    #[test]
+    fn invalid_and_invariant_violating_records_are_rejected() {
+        assert_eq!(
+            ControlRecord::from_value(&json!(42)),
+            Err(ControlRecordError::NotAnObject)
+        );
+        assert_eq!(
+            ControlRecord::from_value(&json!({"id": 1})),
+            Err(ControlRecordError::MissingType)
+        );
+        assert_eq!(
+            ControlRecord::from_value(&json!({"type": "future.unknown"})),
+            Err(ControlRecordError::UnknownKind(
+                "future.unknown".to_string()
+            ))
+        );
+        assert!(matches!(
+            ControlRecord::from_value(
+                &json!({"type": "task.delivered", "id": "not-an-int", "command_id": 1})
+            ),
+            Err(ControlRecordError::Deserialize { .. })
+        ));
+        assert!(matches!(
+            ControlRecord::from_value_strict(&json!({
+                "type": "task.gated", "id": 1, "verdict": "accepted", "class": "infrastructure"
+            })),
+            Err(ControlRecordError::Invariant { .. })
+        ));
+        assert!(matches!(
+            ControlRecord::from_value_strict(&json!({
+                "type": "deploy.finished", "ok": true, "head": "a".repeat(40),
+                "by": "owner", "reason": "", "unexpected": 1
+            })),
+            Err(ControlRecordError::UnexpectedFields { .. })
+        ));
+        assert!(matches!(
+            ControlRecord::from_value_strict(&json!({
+                "type": "execution.interrupted", "agent_id": "a", "session_id": "s",
+                "execution_id": "e", "cause": "stopped", "path": "final",
+                "attempt": 1, "evidence": {}, "due_ms": 123
+            })),
+            Err(ControlRecordError::Invariant { .. })
+        ));
+    }
+
+    #[test]
+    fn compat_parser_preserves_legacy_strings_and_future_kinds() {
+        let legacy = json!({"type": "task.delivered", "id": "77", "command_id": "9"});
+        assert!(ControlRecord::from_value(&legacy).is_err());
+        let compat = ControlRecord::from_value_compat(&legacy).expect("compat parse");
+        let super::CompatControlRecord::Known(rec) = compat else {
+            panic!("expected Known, got {compat:?}");
+        };
+        let ControlRecord::TaskDelivered(d) = *rec else {
+            panic!("unexpected variant: {rec:?}");
+        };
+        assert_eq!(d.id, 77);
+        assert_eq!(d.command_id, 9);
+
+        let future =
+            ControlRecord::from_value_compat(&json!({"type": "restore.drilled", "ok": true}))
+                .expect("unknown future allowed only in compat mode");
+        assert!(matches!(future, super::CompatControlRecord::Unknown { .. }));
+
+        let sha_a = "a".repeat(40);
+        let sha_b = "b".repeat(40);
+        let moved_ints = json!({"type": "source.moved", "source": "/s", "from": sha_a, "to": sha_b, "missions": [1, 2]});
+        let moved_strs = json!({"type": "source.moved", "source": "/s", "from": sha_a, "to": sha_b, "missions": ["1", "2"], "clear": ["3"]});
+        let p_ints = ControlRecord::from_value(&moved_ints).expect("int missions");
+        let p_strs = ControlRecord::from_value(&moved_strs).expect("str missions");
+        assert!(
+            matches!(p_ints, ControlRecord::SourceMoved(ref m) if m.missions.as_deref() == Some(&[1, 2]))
+        );
+        assert!(
+            matches!(p_strs, ControlRecord::SourceMoved(ref m) if m.missions.as_deref() == Some(&[1, 2]) && m.clear.as_deref() == Some(&[3]))
+        );
+    }
+
+    fn parse_stream(entries: &[(i64, i64, Value)]) -> Vec<(i64, i64, ControlRecord)> {
+        entries
+            .iter()
+            .map(|(s, t, v)| (*s, *t, ControlRecord::from_value(v).expect("parse")))
+            .collect()
+    }
+
+    #[test]
+    fn replay_review_mission_tracks_sync_points_rework_reroutes_and_restart() {
+        let stream = parse_stream(&[
+            (
+                1,
+                100,
+                json!({"type": "mission.added", "id": 1, "text": "review", "sources": []}),
+            ),
+            (
+                2,
+                110,
+                json!({"type": "task.assigned", "id": 10, "mission_id": 1, "kind": "ephemeral", "agent_id": "agent_a", "session_id": "session_a", "brief": "task A", "model": "cheap", "created_by": "human", "difficulty": "l1", "preset_id": "cheap-l1"}),
+            ),
+            (
+                3,
+                120,
+                json!({"type": "task.delivered", "id": 10, "command_id": 1}),
+            ),
+            (
+                4,
+                130,
+                json!({"type": "task.reported", "id": 10, "report": "v0"}),
+            ),
+            (
+                5,
+                135,
+                json!({"type": "task.reviewed", "id": 10, "accepted": true, "note": "stale", "revision": 99}),
+            ),
+            (
+                6,
+                140,
+                json!({"type": "task.reviewed", "id": 10, "accepted": false, "note": "needs tests", "revision": 0}),
+            ),
+            (
+                7,
+                145,
+                json!({"type": "task.rerouted", "id": 10, "preset_id": "neon-l2", "model": "default", "from_preset_id": "cheap-l1", "revision": 1, "routed_difficulty": "l2"}),
+            ),
+            (
+                8,
+                150,
+                json!({"type": "task.delivered", "id": 10, "command_id": 2}),
+            ),
+            (
+                9,
+                160,
+                json!({"type": "task.restarted", "task": 10, "session_id": "session_a", "agent_id": "agent_a"}),
+            ),
+            (
+                10,
+                170,
+                json!({"type": "task.reported", "id": 10, "report": "v1"}),
+            ),
+            (
+                11,
+                180,
+                json!({"type": "task.reviewed", "id": 10, "accepted": true, "note": "", "revision": 1}),
+            ),
+        ]);
+
+        let episodes = replay_task_episodes(&stream);
+        assert_eq!(episodes.len(), 1);
+        let ep10 = &episodes[0];
+        assert_eq!(ep10.task_id, 10);
+        assert_eq!(ep10.state, TaskState::Accepted);
+        assert_eq!(ep10.outcome, EpisodeOutcome::Accepted);
+        assert_eq!(ep10.rework, 1);
+        assert_eq!(ep10.quality_rejections, 1);
+        assert_eq!(ep10.reroutes, 1);
+        assert_eq!(ep10.restarts, 1);
+        assert_eq!(ep10.first_preset_id.as_deref(), Some("cheap-l1"));
+        assert_eq!(ep10.preset_id.as_deref(), Some("neon-l2"));
+        assert_eq!(ep10.difficulty, GradeWire::L1);
+        assert_eq!(ep10.review_sync_points.len(), 2);
+        assert!(!ep10.review_sync_points[0].accepted);
+        assert_eq!(ep10.review_sync_points[0].revision, 0);
+        assert!(ep10.review_sync_points[1].accepted);
+        assert_eq!(ep10.review_sync_points[1].revision, 1);
+    }
+
+    fn gated_mission_stream() -> Vec<(i64, i64, ControlRecord)> {
+        parse_stream(&[
+            (
+                1,
+                200,
+                json!({"type": "mission.added", "id": 2, "text": "gated", "sources": ["/tmp/r"]}),
+            ),
+            (
+                2,
+                210,
+                json!({"type": "mission.configured", "id": 2, "gate": "/tmp/g.sh", "accept": "gate"}),
+            ),
+            (
+                3,
+                220,
+                json!({"type": "resident.proposed", "name": "w1", "charter": "c", "pool": "p"}),
+            ),
+            (4, 225, json!({"type": "resident.approved", "name": "w1"})),
+            (
+                5,
+                230,
+                json!({"type": "resident.proposed", "name": "w2", "charter": "c", "pool": "p"}),
+            ),
+            (6, 235, json!({"type": "resident.approved", "name": "w2"})),
+            (
+                7,
+                240,
+                json!({"type": "task.assigned", "id": 20, "mission_id": 2, "kind": "resident", "agent_id": "agent_resident_w1", "session_id": "session_resident_w1", "brief": "gated task", "created_by": "spawn-integrate", "objective": 5}),
+            ),
+            (
+                8,
+                250,
+                json!({"type": "task.stolen", "id": 20, "from_session": "session_resident_w1", "from_agent": "agent_resident_w1", "to_session": "session_resident_w2", "to_agent": "agent_resident_w2", "pool": "p", "by": "spawn-dispatch"}),
+            ),
+            (
+                9,
+                260,
+                json!({"type": "task.delivered", "id": 20, "command_id": 3}),
+            ),
+            (
+                10,
+                270,
+                json!({"type": "task.reported", "id": 20, "report": "g0", "commit": "c0"}),
+            ),
+            (
+                11,
+                280,
+                json!({"type": "task.gated", "id": 20, "verdict": "host_fault", "revision": 0, "base": "b0"}),
+            ),
+            (
+                12,
+                290,
+                json!({"type": "task.gated", "id": 20, "verdict": "rejected", "revision": 0, "note": "fail"}),
+            ),
+            (
+                13,
+                300,
+                json!({"type": "task.delivered", "id": 20, "command_id": 4}),
+            ),
+            (
+                14,
+                310,
+                json!({"type": "task.reported", "id": 20, "report": "g1", "commit": "c1"}),
+            ),
+            (
+                15,
+                320,
+                json!({"type": "task.gated", "id": 20, "verdict": "conflict", "revision": 1, "note": "rebase"}),
+            ),
+            (
+                16,
+                330,
+                json!({"type": "task.delivered", "id": 20, "command_id": 5}),
+            ),
+            (
+                17,
+                340,
+                json!({"type": "task.reported", "id": 20, "report": "g2", "commit": "c2"}),
+            ),
+            (
+                18,
+                350,
+                json!({"type": "task.gated", "id": 20, "verdict": "accepted", "revision": 2, "base": "b0", "candidate": "c2"}),
+            ),
+            (
+                19,
+                360,
+                json!({"type": "task.landed", "id": 20, "from": "b0", "to": "b1"}),
+            ),
+        ])
+    }
+
+    #[test]
+    fn replay_gated_mission_tracks_steal_verdicts_and_landing() {
+        let stream = gated_mission_stream();
+        let episodes = replay_task_episodes(&stream);
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].state, TaskState::Landed);
+        assert_eq!(episodes[0].outcome, EpisodeOutcome::Landed);
+        assert_eq!(episodes[0].steals, 1);
+        assert_eq!(episodes[0].agent_id, "agent_resident_w2");
+        assert_eq!(episodes[0].rework, 2);
+        assert_eq!(episodes[0].quality_rejections, 1);
+        assert_eq!(episodes[0].last_gate_verdict, Some(GateVerdict::Accepted));
+        assert_eq!(episodes[0].gate_verdicts.len(), 4);
+    }
+
+    #[test]
+    fn replay_tracks_over_budget_yield_and_mission_drop_closure() {
+        let stream = parse_stream(&[
+            (
+                1,
+                200,
+                json!({"type": "mission.added", "id": 2, "text": "gated", "sources": ["/tmp/r"]}),
+            ),
+            (
+                2,
+                210,
+                json!({"type": "mission.configured", "id": 2, "gate": "/tmp/g.sh", "accept": "gate"}),
+            ),
+            (
+                3,
+                370,
+                json!({"type": "task.assigned", "id": 21, "mission_id": 2, "kind": "ephemeral", "agent_id": "agent_w_21", "session_id": "session_w_21", "brief": "over", "created_by": "spawn-integrate", "objective": 6}),
+            ),
+            (
+                4,
+                380,
+                json!({"type": "task.delivered", "id": 21, "command_id": 6}),
+            ),
+            (
+                5,
+                390,
+                json!({"type": "task.over_budget", "id": 21, "reason": "tool cap"}),
+            ),
+            (
+                6,
+                400,
+                json!({"type": "task.assigned", "id": 22, "mission_id": 2, "kind": "ephemeral", "agent_id": "agent_w_22", "session_id": "session_w_22", "brief": "yield", "continues": 21, "created_by": "spawn-integrate", "objective": 6}),
+            ),
+            (
+                7,
+                410,
+                json!({"type": "task.cancelled", "id": 22, "by": "spawn-integrate", "yielded": true}),
+            ),
+            (
+                8,
+                420,
+                json!({"type": "task.assigned", "id": 23, "mission_id": 2, "kind": "ephemeral", "agent_id": "agent_w_23", "session_id": "session_w_23", "brief": "open at drop", "created_by": "human"}),
+            ),
+            (
+                9,
+                430,
+                json!({"type": "mission.closed", "id": 2, "state": "dropped", "summary": "drop"}),
+            ),
+        ]);
+
+        let episodes = replay_task_episodes(&stream);
+        assert_eq!(episodes.len(), 3);
+        assert_eq!(episodes[0].state, TaskState::Cancelled);
+        assert_eq!(episodes[0].outcome, EpisodeOutcome::OverBudget);
+        assert_eq!(episodes[1].state, TaskState::Cancelled);
+        assert_eq!(episodes[1].outcome, EpisodeOutcome::Rejected);
+        assert_eq!(episodes[1].continues, Some(21));
+        assert_eq!(episodes[2].state, TaskState::Cancelled);
+        assert_eq!(episodes[2].outcome, EpisodeOutcome::Cancelled);
+    }
+}
