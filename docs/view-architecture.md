@@ -14,7 +14,7 @@
 | 投影与视图 | 同上，`spawn_session_state`、`agent_*`、`spawn_read_*` | 读模型 |
 | 端口定义 | [port.rs](../crates/spawn-core/src/port.rs) | `EventLog`、`CommandQueue`、`WorkspaceStore`、`TerminalHost` |
 | 一致性套件 | [contract.rs](../crates/spawn-core/src/contract.rs) | 四个端口（日志、队列、工作区、终端）的共用断言，内存实现与 PG 实现都跑 |
-| 查询子命令 | [inspect.rs](../crates/spawn-cli/src/commands/inspect.rs) | `fleet`、`tail` 经 grant 过滤的 `spawn_read_*` 读舰队与单个会话 |
+| 查询子命令 | [inspect.rs](../crates/spawn-cli/src/commands/inspect.rs) | `status`（`spawn status [--json]` 单命令总览）、`fleet`、`tail` 经 grant 过滤的 `spawn_read_*` 读舰队与单个会话 |
 | 门禁 | [gate.sh](../scripts/rsi/gate.sh) 与 [rsi/scenarios](../rsi/scenarios) | 构建、clippy、测试、e2e、黑盒、web |
 | 测试 | [spawn-postgres/tests/api.rs](../crates/spawn-postgres/tests/api.rs)、[spawn-core/tests/api.rs](../crates/spawn-core/tests/api.rs) | 断言落点 |
 | 事件与 SQL 口径 | [design.md 第 9 节](./design.md) | 表、函数、视图的描述 |

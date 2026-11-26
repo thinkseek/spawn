@@ -1,28 +1,30 @@
 # Spawn 技术方案与接口契约
 
-结论：Spawn 用 5 个 crate 连接现成组件。`spawn-core` 不碰 IO，只定义类型、端口与编排逻辑；实现层分别是 PostgreSQL、HTTP 判定、tmux 与 git 子进程；`spawn-cli` 做装配。全部代码同步阻塞。本文描述 crate 边界、ADT、端口契约、SQL 对象与验收口径。
+结论：Spawn 用 12 个 Rust crate（见 [architecture.md](./architecture.md) §2）与同仓 Go `spawn-node` 控制面单元连接现成组件：`spawn-core` 不碰 IO，只定义类型、端口与编排逻辑；实现层分别是 PostgreSQL、HTTP/UDS 判定（`spawn-jev`）、Herdr（`spawn-hc` 内置 `herdr-core` 或可选外置 `herdr`）与 git / opt-in D6 CAS 工作区、`BwrapView`/`ContainerView` 沙箱视图（`spawn-host`）；`spawn-cli` 做装配，配套二进制 `spawn-hc` 将 `herdr-core` 的异步运行时进程外隔离（Spawn 自身源码同步阻塞，不写 `async`）。本文描述 crate 边界、ADT、端口契约、SQL 对象与验收口径。
 
 ## 1. 模块边界
 
 | crate | 职责 | 不允许 |
 | --- | --- | --- |
-| `spawn-core` | ADT、端口、事件归一、Bridge、Observer、内存实现、一致性套件 | 文件、网络、进程 IO；依赖驱动 |
+| `spawn-core` | ADT、端口、控制流 episode 回放、分级路由、能力图纯度校验、事件归一、Bridge、Observer、内存实现、一致性套件 | 文件、网络、进程 IO；依赖驱动 |
 | `spawn-postgres` | `EventLog` 与 `CommandQueue` 实现、`schema.sql` | 编排逻辑、投影规则 |
-| `spawn-jev` | 判定 HTTP 客户端 | 持有会话状态 |
-| `spawn-host` | tmux、git 工作区与块存储适配 | 解释事件内容 |
-| `spawn-cli` | 子命令与配置装配 | 业务规则 |
+| `spawn-jev` | 判定 HTTP 客户端（直连或 `SPAWN_OUT_SOCK` UDS） | 持有会话状态 |
+| `spawn-host` | 嵌入式 `herdr-core`（`spawn-hc`）/ `HerdrPool` / legacy `herdr`（已移除并拒绝 `tmux`）、`herdr_witness`、`BwrapView`/`ContainerView`（`inherit_host=auto`）、`git`/`cow`/`overlay`/`d6-shadow`/`d6` 工作区与 transcript 归档适配 | 解释事件内容 |
+| `spawn-cas` / `spawn-kdf` / `spawn-codegraph` / `spawn-node-proto` / `spawn-node-gateway` / `ghostty-vt` / `spawn-hc` | CAS/Merkle 存储、KDF、代码图、v1 线协议与签名网关、VT 仿真、进程外 `herdr-core` 守护进程（完整 12 crate 清单见 [architecture.md](./architecture.md) §2） | 越权跨越控制核或持有主库直连（`spawn-node-gateway` 仅限受限网关角色） |
+| `spawn-cli` | 子命令、本地 IPC / 控制面服务端与配置装配 | 越过 `spawn-core` 端口边界解释内部业务规则 |
 
-依赖单向：
+依赖单向（`spawn-hc` 仅链接 `herdr-core` 与 `ghostty-vt`，与 `spawn` 二进制完全进程外隔离）：
 
 ```text
 spawn-core
-  ├─ spawn-postgres
+  ├─ spawn-postgres (──> spawn-kdf)
   ├─ spawn-jev
-  └─ spawn-host
-        ↑ 只有 spawn-cli 依赖全部实现层
+  ├─ spawn-host (──> spawn-cas)
+  └─ spawn-codegraph
+        ↑ 只有 spawn-cli 依赖上述全部同步实现层及 spawn-node-proto
 ```
 
-`spawn-core` 的 16 个模块：`bridge`、`command`、`contract`、`event`、`id`、`ingest`、`memory`、`mission`、`observation`、`observe`、`port`、`redact`、`screen`、`shell`、`time`、`transcripts`。
+`spawn-core` 的 24 个模块（`crates/spawn-core/src/`）：`bridge`、`command`、`contract`、`control`、`driver`、`event`、`feature_coverage`、`feature_deps`、`grading`、`id`、`ingest`、`mask`、`memory`、`message`、`mission`、`node_proto`、`observation`、`observe`、`port`、`redact`、`screen`、`shell`、`time`、`transcripts`。
 
 ## 2. 身份与 ID
 
@@ -33,7 +35,7 @@ spawn-core
 | `AgentId` | `agent_` | 长期逻辑身份 |
 | `SessionId` | `session_` | 连续历史，跨引擎与终端存活 |
 | `ExecutionId` | `exec_` | 一次计算，绑定一个终端与工作区 |
-| `TerminalName` | `spawn-` | tmux 会话名，由 `ExecutionId` 派生 |
+| `TerminalName` | `spawn-` | Herdr 终端名（`spawn-hc` / `herdr`），由 `ExecutionId` 派生 |
 | `CommandId` | 数字 | 命令序号，PG 自增 |
 | `Principal`、`IdempotencyKey`、`BranchName`、`CommitId` | 无 | 外部原文包装 |
 | `WorkspaceId` | 无 | 必须形如 `<sandbox>:/<path>` |
@@ -107,7 +109,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | | `finish(claimed, outcome)` | 记录结果并写 `command.finished` |
 | `WorkspaceStore` | `ensure_branch(branch, from)`、`mount`、`commit`、`unmount` | 工作区的四个动作；`ensure_branch` 返回 `Existing` 或 `Created(Fork)`，新分支建在 `from`（另一个 agent 的分支头或完整 commit id，`ForkFrom::parse` 校验）或基线，已有分支忽略 `from`；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
 | | `merge_base(workspace)` | 把基线（源的 `main`）合进已挂载、处于两轮之间空闲的工作区的分支（Bridge 不调用；集成器判 `conflict` 时、调度器给活着的 worker 键入任务前调用，见 spawn-cli 的 `main_merge`）：`Current`、`Merged{commit,files}` 或 `Conflicted{files,marked}`；内容冲突把带冲突标记的合并写进目录（`marked`），等标记解决后的 checkpoint 提交合并；目录与分支不符、或标记表达不了的冲突什么都不改。默认实现返回 `Current`（内存实现可配置结果） |
-| `TerminalHost` | `start`、`submit_text`、`send_keys`、`is_alive`、`runner`、`capture_tail`、`read_from`、`write_new`、`terminate`、`terminate_waits` | 终端生命周期、屏尾读取与读写引擎的文件（`write_new` 只建不改：路径上已有东西时返回 false，文件整体出现或不出现；`terminate_waits` 为真的实现（tmux）其 `terminate` 要等进程退出，Bridge 把它放到自己的线程上跑，不占串行循环）；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
+| `TerminalHost` | `start`、`stage_text`、`submit_staged`、`submit_text`、`send_keys`、`is_alive`、`runner`、`capture_tail`、`read_from`、`write_new`、`terminate`、`terminate_waits` | 终端生命周期、两阶段输入（`stage_text` / `submit_staged`）、屏尾读取与读写引擎文件（`write_new` 只建不改：路径上已有东西时返回 false，文件整体出现或不出现；`terminate_waits` 为真的实现（`HerdrCoreHost` / `HerdrHost` / `HerdrPool`）其 `terminate` 交由后台线程等待进程退出，不占串行循环）；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
 | `TranscriptArchive` | `copies`、`read`、`append(copy, at, bytes)`、`put_progress`、`progress` | 原生会话记录的存档（见 [storage.md](./storage.md#the-transcript-archive)）：每个 agent 的每个原生会话有编号的副本，副本只增长，`at` 不等于副本当前长度的追加被拒，已存的字节从不改写；每个原生会话一条进度记录（归档到哪、何时读过、缺的第一行的时间），本地实现在 `<root>/.transcripts`，进度记录在 `<root>/.transcripts-progress` |
 
 错误类型：
@@ -141,13 +143,13 @@ Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` �
 
 引擎模型（[fleet-architecture.md §3.3](fleet-architecture.md#33-engine-models)）：`Start`/`Resume` 的可选 `model` 是模型档位，`default` 或 `cheap`；不写就沿用该会话上一次执行的档位（从 `execution.started` 的 `model` 折叠，默认档位不写进记录），从没跑过的会话用 `default`。内联 `--settings` 由 `claude_settings(relay, profile)` 生成：Claude Code 把它合并在用户 settings 之上，键以内联为准，`env` 按名字逐个合并（2.1.318 实测：内联 `env` 只写基址和 haiku 槽位时，主模型和 `ANTHROPIC_AUTH_TOKEN` 仍来自 `~/.claude/settings.json`），所以网关 token 不经过 Spawn。配置了模型中继（`SPAWN_MODEL_RELAY`，跑 `spawn-model-relay` 的主机设为 `http://127.0.0.1:8791`；不设或 `off` 即不用中继，两档都不写 `env`，`cheap` 启动失败）时 `env` 写 `ANTHROPIC_BASE_URL` 指向中继、`ANTHROPIC_DEFAULT_HAIKU_MODEL` 为小模型（`SPAWN_SMALL_MODEL`，默认 `deepseek-flash`）；`cheap` 另把 `ANTHROPIC_MODEL` 与 opus、sonnet 槽位设为 `SPAWN_CHEAP_MODEL`（默认 `deepseek-flash`）。每次启动前 Bridge 先连一下中继：连不上时 `default` 不写 `env`、照 Claude Code 自己的设置跑并在 tick 报告里警告，`cheap` 直接失败。
 
-凭证：引擎以主机用户身份运行、处于 bypass 模式，内联 settings 的 `permissions.deny` 写入 `CREDENTIAL_DENY`（`bridge.rs`，2026-11-08 起：一个 fleet worker 读过 loop 的环境文件）。文件：`~/.local/share/spawn-rsi/*.env*`、`env.sh`、`backups/`、`fleet-pg/`，`~/.config/spawn/**`、`~/.config/cloudflare/**`、`~/.hermes/**`、整个 `~/.claude/**`（设置、登录、以及记录了会话打印过的一切的转录）和 `~/.claude.json`、`~/.ssh/**`、`~/.gnupg/**`、`/data/tmp/ccd/**`、`/data/tmp/ccd-pg/**`、`/var/tmp/spawn/**/*.sh`，各有 `Read(…)`、`Edit(…)` 规则；另有 `Bash(*…*)` 规则拒绝命令文本里写出这些路径或文件名的调用，以及替调用者读取凭证的程序（owner 在 `/var/tmp/spawn` 的辅助脚本——那里也是 fleet 的 `TMPDIR`，所以只拒 `*.sh`——以及任何 Spawn 检出里的 `deploy/hold.sh`、`deploy/deploy.sh`、`test-deploy.sh`、`cutover-controller.sh`、`deploy/backup`），，别的进程的环境（`*/environ*`、`ps …e`），以及按名字或模式杀进程（`pkill`、`killall`、`kill $(pgrep …)`、`pgrep … | kill`：会杀到别的 agent 和 gate 的进程，2026-11-08 一个 resident 的 `pkill -f 'cargo test'` 杀了一个 ccd 的测试；`kill <pid>` 保留，用来停自己的后台任务）。Claude Code 2.1.319 实测：deny 规则在 bypass 模式下照样生效；`Read` 规则拦住 Read/Grep/Glob 工具和 cat、head、tail、grep、sed、awk、cp、base64、od、`<` 重定向，拦不住 `source`、`.`、`less`、`xargs cat`、`bash -c`、python 的 `open()`，这些由 `Bash(*…*)` 规则拦住；`~/.claude/**` 全部拒绝时，引擎照常工作、写转录、读全局指令、`--resume` 照常（这些是它的内部读写，不是工具调用）。`spawn loop`、`spawn integrate`、`spawn serve` 启动时调用 `prctl(PR_SET_DUMPABLE, 0)`（`spawn_host::undumpable`）：同一用户的进程读不到它们的 `/proc/<pid>/environ`；它们 exec 的程序（引擎、gate、git）从 exec 起重新可转储。因此 `deploy.sh` 不再读集成器的 environ，改读集成器启动时写的 `~/.config/spawn/gate-env`（`SPAWN_GATE_ENV_FILE`，0600，首条记录是它的 pid）。仍然拦不住的：不写出路径的命令（变量拼接、通配、先 `cd` 再相对路径交给解释器）、读取命令没写出的文件的程序、gate 进程的环境（gate 由 exec 启动，可转储，带 gate 共用测试库的 URL），以及引擎自身环境里的变量（网关的 `ANTHROPIC_*` 来自用户 settings）。这是规则，不是边界；边界要靠 Claude Code 的 sandbox（Linux 上需要 bubblewrap 和 socat）。
+凭证：引擎以主机用户身份运行、处于 bypass 模式，内联 settings 的 `permissions.deny` 写入 `CREDENTIAL_DENY`（`bridge.rs`，2026-11-08 起：一个 fleet worker 读过 loop 的环境文件）。文件：`~/.local/share/spawn-rsi/*.env*`、`env.sh`、`backups/`、`fleet-pg/`，`~/.config/spawn/**`、`~/.config/cloudflare/**`、`~/.hermes/**`、整个 `~/.claude/**`（设置、登录、以及记录了会话打印过的一切的转录）和 `~/.claude.json`、`~/.ssh/**`、`~/.gnupg/**`、`/data/tmp/ccd/**`、`/data/tmp/ccd-pg/**`、`/var/tmp/spawn/**/*.sh`，各有 `Read(…)`、`Edit(…)` 规则；另有 `Bash(*…*)` 规则拒绝命令文本里写出这些路径或文件名的调用，以及替调用者读取凭证的程序（owner 在 `/var/tmp/spawn` 的辅助脚本——那里也是 fleet 的 `TMPDIR`，所以只拒 `*.sh`——以及任何 Spawn 检出里的 `deploy/hold.sh`、`deploy/deploy.sh`、`test-deploy.sh`、`cutover-controller.sh`、`deploy/backup`），，别的进程的环境（`*/environ*`、`ps …e`），以及按名字或模式杀进程（`pkill`、`killall`、`kill $(pgrep …)`、`pgrep … | kill`：会杀到别的 agent 和 gate 的进程，2026-11-08 一个 resident 的 `pkill -f 'cargo test'` 杀了一个 ccd 的测试；`kill <pid>` 保留，用来停自己的后台任务）。Claude Code 2.1.319 实测：deny 规则在 bypass 模式下照样生效；`Read` 规则拦住 Read/Grep/Glob 工具和 cat、head、tail、grep、sed、awk、cp、base64、od、`<` 重定向，拦不住 `source`、`.`、`less`、`xargs cat`、`bash -c`、python 的 `open()`，这些由 `Bash(*…*)` 规则拦住；`~/.claude/**` 全部拒绝时，引擎照常工作、写转录、读全局指令、`--resume` 照常（这些是它的内部读写，不是工具调用）。`spawn loop`、`spawn integrate`、`spawn serve` 启动时调用 `prctl(PR_SET_DUMPABLE, 0)`（`spawn_host::undumpable`）：同一用户的进程读不到它们的 `/proc/<pid>/environ`；它们 exec 的程序（引擎、gate、git）从 exec 起重新可转储。因此 `deploy.sh` 不再读集成器的 environ，改读集成器启动时写的 `~/.config/spawn/gate-env`（`SPAWN_GATE_ENV_FILE`，0600，首条记录是它的 pid）。仍然拦不住的：不写出路径的命令（变量拼接、通配、先 `cd` 再相对路径交给解释器）、读取命令没写出的文件的程序、gate 进程的环境（gate 由 exec 启动，可转储，带 gate 共用测试库的 URL），以及引擎自身环境里的变量（网关的 `ANTHROPIC_*` 来自用户 settings）。这是规则，不是边界；系统边界靠 `BwrapView`（无内置 deny 规则的引擎默认启用，Claude Code 可通过 `SPAWN_CLAUDE_SANDBOX=1` 启用，Linux 上需要 `bwrap`）与 `ContainerView`（容器内通过 `SPAWN_ENGINE_VIEW=container` 启用，在裸宿主机 fail-closed 拒绝且 `bwrap` 缺失时绝不静默降级），默认 `SPAWN_SANDBOX_INHERIT_HOST=auto`（`[sandbox].inherit_host = "auto"`）安全只读白名单继承宿主工具链。
 
 不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 监视 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl`（`SPAWN_CLAUDE_PROJECTS`）和 runner 的退出文件，文件变了才读新增整行，以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`；终端里没有数据库登录。测试库例外：loop 设了 `SPAWN_FLEET_TEST_DATABASE_URL`（fleet 自己的测试服务器，`deploy/fleet-test-db.sh`、`spawn-fleet-test-db` 单元）时，引擎的环境里 `SPAWN_TEST_DATABASE_URL` 就是它，但只在核对通过之后（`BridgeConfig.launch_environment`，每次启动时询问）：fleet 的服务器和配置的其他服务器（loop 自己的 `SPAWN_TEST_DATABASE_URL`，即 gate 共用的测试服务器，以及 `SPAWN_DATABASE_URL`）都读得到 `system_identifier`，且 fleet 的与每个都不同。失败即关闭：读不到、写法相同或身份相同，这次启动就不给，原因在 loop 日志里每种说一次，下次启动再查；通过之后不再查。不设就没有测试库，绝不给 gate 的。每个任务的提示（`task_prompt` 和新任务的输入）在 brief 之后带 `CREDENTIALS_LINE` 和 `PROCESSES_LINE`（"Never kill a process you did not start; stop your own background jobs by their id."）两行，`CREDENTIALS_LINE`："Your test database is $SPAWN_TEST_DATABASE_URL; never read any credential file, never put a URL on a command line."
 
 **Bridge 读什么，什么时候读。** 监视走 `FileWatch` 端口：Linux 上是 inotify（`spawn_host::InotifyWatch`），一个描述符、每个文件一条目录监视；路径还不存在时监视它上面最深的已存在目录，目录随引擎出现时监视跟着往下走（transcript 在 `<projects>/<工作目录转义>/`，退出文件在 `<工作区>/.spawn/`，两者都由引擎稍后创建）。设不了监视的执行（系统调用出错、文件系统不支持、`max_user_watches` 到顶）退回每个 pass 都读，并在循环输出里告警一次。读的偏移规则不变：只读整行，读到一半的行留到下一次变化或下一个 pass，绝不丢；一次 checkpoint 没提交的行同样留到下一个 pass。
 
-一个 pass 对空闲的 agent 不花钱。没有命令在飞（Bridge 拿着在等，`held`）、transcript 没有变化、屏幕知道得够新的执行，这个 pass 不抓屏、不读任何文件、也不为它单独问一次 runner（`list-panes`）。屏幕只在能改变决定时抓：
+一个 pass 对空闲的 agent 不花钱。没有命令在飞（Bridge 拿着在等，`held`）、transcript 没有变化、屏幕知道得够新的执行，这个 pass 不抓屏、不读任何文件、也不为它单独问一次 runner。屏幕只在能改变决定时抓：
 
 | 何时 | 出处 |
 | --- | --- |
@@ -156,7 +158,7 @@ Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` �
 | 距上次抓屏满 `screen_refresh`（30 s）的兜底 | transcript 不动而屏幕变了：对话框、掉回 shell |
 | transcript 里刚读到一轮的结束（`turn.stopped`、`turn.failed`），而屏幕还没回到提示符：之后的 pass 接着读，直到某次读数接受输入（提示符回来了），或距这一轮的结束满 `screen_refresh` | 引擎在结束这一轮的那一行之后才画提示符；那份读数正是投递在等的，不能留给兜底 |
 
-忙碌的屏幕仍每 30 秒重记一次。兜底抓屏一个 pass 最多 `BACKSTOPS_PER_PASS` （2）个，同时到期的屏幕分摊到后面几个 pass：一个 pass 抓完整个舰队会把下一条命令挡在后面。“引擎还在不在”不靠每个执行的 `runner`：有监视时，`TerminalHost::runners` 一个 pass 问一次终端服务器（tmux 一次 `list-panes -a`，整个舰队一次调用），终端不在或不再托管本主机的 runner 的执行，下一个 pass 就按 `lost` 结束，和以前一样快；没有监视时（`spawn tick`、测试）仍然逐个问。引擎自己退出照旧由退出文件的变化在半秒级发现。因果（§14）：屏幕状态只从抓屏来、一轮的结束只从 transcript 的行来；没抓屏、transcript 没变化都不算状态，transcript 静止只说明什么时候该再看屏幕。
+忙碌的屏幕仍每 30 秒重记一次。兜底抓屏一个 pass 最多 `BACKSTOPS_PER_PASS` （2）个，同时到期的屏幕分摊到后面几个 pass：一个 pass 抓完整个舰队会把下一条命令挡在后面。“引擎还在不在”不靠每个执行的 `runner`：有监视时，`TerminalHost::runners` 一个 pass 问一次终端守护进程（`spawn-hc` / `herdr` 单次列表查询整个会话），终端不在或不再托管本主机的 runner 的执行，下一个 pass 就按 `lost` 结束，和以前一样快；没有监视时（`spawn tick`、测试）仍然逐个问。引擎自己退出照旧由退出文件的变化在半秒级发现。因果（§14）：屏幕状态只从抓屏来、一轮的结束只从 transcript 的行来；没抓屏、transcript 没变化都不算状态，transcript 静止只说明什么时候该再看屏幕。
 
 启动参数超过 7 个时按 `Run { engine, native, prompt }` 结构体传引用，保持签名可读。
 
@@ -180,7 +182,7 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 
 每会话一个活跃执行由日志保证，不只靠 Bridge 的内存：`Start`/`Resume` 先追上日志再查内存，日志的追加再查一次（`spawn_append_trusted`，内存实现同样）：会话最近一次执行还没有 Bridge 写的结束时拒绝 `execution.started`。被拒的启动以日志给的原因失败，卸载自己刚挂的工作区（那正是另一个执行的工作区时不卸载），不启动终端。runner 的退出报告不算结束；丢失的执行由下一个 tick 写 `execution.ended`（cause `lost`）后，会话即可再启动或恢复。
 
-“丢失”指没有 Bridge 自己启动的 runner 在跑它（issue #15）：`TerminalHost::runner` 回答 `Running`（窗格活着，且由本主机的启动拉起：tmux 的 `pane_start_command` 带有本次启动的环境文件名 `spawn-launch-<终端>-`）、`Gone`（终端不在）或 `Untracked`（终端在，但不托管那个 runner：窗格已死，或重启后终端管理器恢复出、停在 shell 提示符的同名会话）。只有 `Running` 算在运行；其余先再读一次退出文件，没有就按 `lost` 结束，`evidence` 记下主机所见。`Start`、`Resume`、`Input` 动手前先处理会话里这样的执行（`Bridge::settle`，走正常的结束流程），而不是因为它失败、等以后的 tick：start/resume 接着做，input 失败一次（需要运行中的引擎），之后照常 resume；`Stop` 写下日志在等的结束（`stopped`，同样带 evidence）。Bridge 的视图只随折叠日志改变（它写的结束被读回后，执行才离开视图）；视图里会话没有执行时，命令向日志查询（`EventLog::open_execution`，与守卫同一规则：最近一次 `execution.started` 之后没有 Bridge 写的结束），查到就重新跟踪并警告。重启时，视图没读到其启动、但日志仍认为未结束的执行所用的挂载不算孤儿，不卸载。不受跟踪的引擎从不被静默收编：它被结束，终端被杀。
+“丢失”指没有 Bridge 自己启动的 runner 在跑它（issue #15）：`TerminalHost::runner` 回答 `Running`（终端活着，且由本主机的启动拉起：`HerdrCoreHost` / `HerdrHost` 结合守护进程终端列表、宿主机私有记录与启动命令行中的环境文件名 `spawn-launch-<终端>-` 核验归属）、`Gone`（终端不在）或 `Untracked`（终端在，但不托管那个 runner：窗格已死，或重启后同会话里未关联当前启动记录与 leader PID）。只有 `Running` 算在运行；其余先再读一次退出文件，没有就按 `lost` 结束，`evidence` 记下主机所见。`Start`、`Resume`、`Input` 动手前先处理会话里这样的执行（`Bridge::settle`，走正常的结束流程），而不是因为它失败、等以后的 tick：start/resume 接着做，input 失败一次（需要运行中的引擎），之后照常 resume；`Stop` 写下日志在等的结束（`stopped`，同样带 evidence）。Bridge 的视图只随折叠日志改变（它写的结束被读回后，执行才离开视图）；视图里会话没有执行时，命令向日志查询（`EventLog::open_execution`，与守卫同一规则：最近一次 `execution.started` 之后没有 Bridge 写的结束），查到就重新跟踪并警告。重启时，视图没读到其启动、但日志仍认为未结束的执行所用的挂载不算孤儿，不卸载。不受跟踪的引擎从不被静默收编：它被结束，终端被杀。
 
 恢复：每次 `spawn tick` 是新进程，从位置 0 折叠全部事件得到活跃执行、原生会话 id 与待提交的 checkpoint。`Resume` 复用最新原生会话 id，新开 Execution 与 mount，优先 `--resume`；逻辑 Session 不变。
 
@@ -287,16 +289,16 @@ Observer 每次 tick：
 
 `agent_commands` 上挂 `instead of insert` 触发器 `spawn_gateway_insert`，`security definer`，查 `spawn_grants`，无授权 raise `42501`。
 
-## 10. tmux 与 git 契约
+## 10. Herdr（spawn-hc）与 git 契约
 
-tmux：
+Herdr（唯一终端后端，PR #150 已彻底移除 `tmux` 并显式拒绝 `SPAWN_TERMINAL_BACKEND=tmux` 与 `spawn.toml` `[terminal].backend = "tmux"`）：
 
-| 调用 | 要点 |
+| 部件 / 模式 | 要点 |
 | --- | --- |
-| `new-session -d -s <name> -x 200 -y 50 -c <cwd> [-e K=V] -- prog …` | 每次执行一个会话，`-c` 设置起始目录 |
-| `has-session`、`kill-session` | 会话 target：`=<name>` |
-| `send-keys`、`capture-pane` | pane target：`=<name>:`，即当前窗口的活跃 pane；裸 `=<name>` 会被当作 pane 规格而报错，`:.0` 在 `pane-base-index 1` 下失效 |
-| 重复会话 | stderr 为 `duplicate session: …`，适配层归一为 `already exists` |
+| 默认嵌入式 `herdr-core`（`HerdrCoreHost` + `spawn-hc`） | 默认 `SPAWN_HERDR_MODE=core` 驱动同级二进制 `spawn-hc`（独立进程外守护进程，UDS JSON-RPC 2.0，校验 `EXPECTED_GENERATION = 1`），宿主机侧 `herdr_witness` 检测 agent 状态；`spawn-hc serve` / `hold` 脱离 `spawn-loop` 存活 |
+| 分片与 legacy 模式 | `SPAWN_HERDR_SHARDS=1..=64`（`HerdrPool` 按终端名确定性路由到 `<session>-s0..N`）；显式 `SPAWN_HERDR_MODE=legacy` 使用外置 `herdr 0.9.5`（protocol 22 + `MANIFESTS` 钉死） |
+| 两阶段输入与生命周期 | `stage_text`（暂存未打字前失败可安全重试）+ `submit_staged`（真按 Enter）、`send_keys`、`capture_tail`、`terminate`（`terminate_waits() == true`，交由后台线程 wait 进程组退出）；共享进程与私钥文件辅助在 `terminal_support` |
+| 沙箱视图（`engine_view`） | `BwrapView`（默认）与容器运行时专用的 `ContainerView`（`SPAWN_ENGINE_VIEW=container`，裸宿主机 fail-closed、`bwrap` 缺失绝不静默降级）；默认 `SPAWN_SANDBOX_INHERIT_HOST=auto`（`[sandbox].inherit_host = "auto"`）安全只读继承宿主工具链 |
 
 git：一个裸仓库持有全部基线 commit，每个分支一份工作树。工作树由 `git archive` 导出，**不含 `.git`**，引擎读不到历史、其他分支和控制器的 ref。
 
@@ -339,7 +341,7 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | crate | 覆盖 |
 | --- | --- |
 | `spawn-core` | ID 校验、事件往返、去重、双序号、租约过期、屏尾六态、Bridge 事件序、每 tick 新进程折叠下的 Start→Stop→Start→Lost、Observer 跨进程不重复写 |
-| `spawn-host` | git 分支创建、archive 导出、无变更判定、分支前移、tmux 精确名匹配与跨进程调用、真实 tmux 生命周期 |
+| `spawn-host` | git / cow / d6-shadow / d6 工作区、嵌入式 `herdr-core`（`spawn-hc`）生命周期与跨进程恢复、`herdr_witness`、`BwrapView` / `ContainerView`（`inherit_host=auto`）、transcript 归档与 `inotify` |
 | `spawn-jev` | 请求体结构与 criteria 顺序、真实响应往返、缺失字段回退、错误降级、chunked |
 | `spawn-postgres` | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图与读方法（列集快照、投影等于日志折叠、状态、时间线分页、判定、执行时长、未闭合工具、新鲜度、祖先链、命令事件、任务）、`spawn_finish` 四态、授权拒绝、非 owner 直查视图被拒、有授权写入与读函数过滤、共享一致性套件 |
 
@@ -350,12 +352,12 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | 步骤 | 命令 |
 | --- | --- |
 | 唯一门禁 | `scripts/rsi/gate.sh <repo> <base> <candidate> rsi/scenarios`：`rsi/scenarios/build` 构建，`check-clippy`、`check-tests`（需 `SPAWN_TEST_DATABASE_URL`）、`check-e2e`、`check-blackbox`、`check-web` 逐个必过 |
-| 端到端 | `scripts/e2e.sh`：真 PG、真 git、真 tmux、脚本化引擎，覆盖整条决策链、任务、落地与目标任务 |
+| 端到端 | `scripts/e2e.sh`：真 PG、真 git、嵌入式 `herdr-core`（`scripts/blackbox/lib-herdr.sh` 与 `scripts/blackbox/herdr-fault-proxy.py`）、脚本化引擎，覆盖整条决策链、任务、落地与目标任务 |
 | 黑盒 | `scripts/blackbox/run-scenarios.sh`：CLI 契约、工作区导出（不含 `.git`）、提示落屏、视图与授权 |
 
 缺少 `SPAWN_TEST_DATABASE_URL` 时 PG 测试显式 panic，不静默跳过。
 
-门禁在 base 上的 objective 结果（solved，或两次一致的 unsolved）缓存在沙箱看不到的 `~/.cache/spawn/gate-base`，键恰好是这些：base commit；场景文件的 blob；`gate.sh` 与它引入的 `pg-url.sh` 的 blob；场景目录里除场景（`*.sh`）、`protected`、`retired-tests` 以外的文件（构建钩子、`bind` 列表的文本、场景旁的帮助脚本）；`bind` 列表里每个目录的指纹（有 `.modules.yaml` 或 `.pnpm/lock.yaml` 时取它们的 blob，否则取目录下全部条目的路径、类型、大小、修改时间与链接目标，不跟随符号链接）；场景代码行（不含注释）点名的文件及它们再点名的文件（控制器的 `scripts/...`、同目录的 `<name>.sh`；经变量或 `cd` 间接进入 `scripts/` 时取整个 `scripts/`）；沙箱里在 base 树内问到的 `rustc -vV`、`cargo -V`、`node --version`、`psql -V`、`git --version`、`tmux -V`、`python3 -V`、`jq --version` 与测试服务器的 `server_version_num`。不在键里的：有安装记录的目录里未经安装的单个文件改动；候选代码留在共享测试服务器上的状态（角色、库、设置）——每个门禁一个一次性测试服务器是 GitHub issue #6，在那之前集成器一次只跑一个门禁。只有门禁在一次完整的 base 运行后写条目；读不出的条目算未命中；候选的运行从不缓存；命中会 touch 条目，`spawn-maintenance` 删除 14 天没用过的条目。
+门禁在 base 上的 objective 结果（solved，或两次一致的 unsolved）缓存在沙箱看不到的 `~/.cache/spawn/gate-base`，键恰好是这些：base commit；场景文件的 blob；`gate.sh` 与它引入的 `pg-url.sh` 的 blob；场景目录里除场景（`*.sh`）、`protected`、`retired-tests` 以外的文件（构建钩子、`bind` 列表的文本、场景旁的帮助脚本）；`bind` 列表里每个目录的指纹（有 `.modules.yaml` 或 `.pnpm/lock.yaml` 时取它们的 blob，否则取目录下全部条目的路径、类型、大小、修改时间与链接目标，不跟随符号链接）；场景代码行（不含注释）点名的文件及它们再点名的文件（控制器的 `scripts/...`、同目录的 `<name>.sh`；经变量或 `cd` 间接进入 `scripts/` 时取整个 `scripts/`）；沙箱里在 base 树内通过 `rsi/scenarios/build` 构建 `spawn` 与同级 `spawn-hc`（二者二进制哈希共同参与缓存键），并采集工具链版本（如 `rustc -vV`、`cargo -V`、`node --version`、`psql -V`、`git --version`、`python3 -V`、`jq --version` 等，完整探针清单见 `scripts/rsi/gate.sh`；运行时已移除 `tmux`）与测试服务器的 `server_version_num`。不在键里的：有安装记录的目录里未经安装的单个文件改动；候选代码留在共享测试服务器上的状态（角色、库、设置）——每个门禁一个一次性测试服务器是 GitHub issue #6，在那之前集成器一次只跑一个门禁。只有门禁在一次完整的 base 运行后写条目；读不出的条目算未命中；候选的运行从不缓存；命中会 touch 条目，`spawn-maintenance` 删除 14 天没用过的条目。
 
 ## 13. 已知限制
 
@@ -365,14 +367,13 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | 租约续期 | Bridge 不续租；单条命令超过 `lease_ttl`（2 分钟）会被别的 worker 重取 | tick 内续租，或缩短单命令时长 |
 | 重试上限 | `spawn_claim` 无最大 attempt，坏命令会被反复领取 | 加 `max_attempts`，超限直接 `finish(failed)` |
 | schema 版本 | `migrate` 每次整体执行 `schema.sql`，无版本表 | 编号迁移文件与版本表 |
-| 子进程超时 | `git`、`tmux` 调用没有超时 | `wait_timeout` 或独立线程计时 |
+| 子进程超时 | `git` 子进程调用没有统一超时（Herdr RPC 已按 `CALL_LIMIT` / `CAPTURE_LIMIT` / `SEND_LIMIT` 限时） | `wait_timeout` 或独立线程计时 |
 | 屏尾报错 | `Error` 状态靠关键字匹配，误判可能 | 只用会话记录的 `turn.failed` |
 | 视图读取 | 状态与新鲜度读投影表，其余视图读时折叠；迁移每次按会话聚合全量日志 | 日志很大时加迁移版本号，只跑一次，见 [view-architecture.md](./view-architecture.md) |
-| 订阅 | 读取 `spawn_events` 增量；`LISTEN/NOTIFY` 未接入 | 接入 `LISTEN/NOTIFY` |
+| 订阅（已缓解） | `LISTEN/NOTIFY`（`pg_notify('spawn_events', <id>)`）已接入 `spawn loop` 与 `GET /api/stream`，长连接中断时自动轮询兜底 | 见 §14 与 [architecture.md](./architecture.md) §6 |
 | 写入串行 | `spawn_append` 用一把全局 advisory lock | 按会话分锁 |
 | 判定入参 | `JudgeInput` 的 serde 输出与真实服务入参是否语义等价未验证 | 用真实服务做契约测试 |
 | 大文件 | 超过 `SPAWN_MAX_FILE_MB`（默认 100）的文件不进 checkpoint，卸载即丢 | 需要时再加外部存储（见 [storage.md](./storage.md)） |
-| tmux 输入 | `submit_text` 逐行发送，空串不发送任何内容 | `paste-buffer` |
 | mount 泄漏 | mount 与 `execution.started` 之间崩溃会遗留一个 mount | 启动时清扫未记录的 mount |
 
 ## 14. 跨循环的因果不变式
