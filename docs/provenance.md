@@ -478,7 +478,7 @@ and an older reader drops an entry it cannot parse, which at worst tells
 the agent of it again. An entry with an empty path is dropped without
 shifting the rest. The reader (`spawn_host::git::oversized_record`) reads
 only a regular file directly under `<root>/.oversized/`: the agent name
-must be one plain path component (no `/`, `\\`, `.`, `..`, root), and no
+must be one plain path component (no `/`, `\`, `.`, `..`, root), and no
 symbolic link is followed on the way. The overlay store sets no cap and is not touched
 (its missing cap is its own issue).
 
