@@ -47,7 +47,7 @@ pub(super) fn controller_commit(controller: &Path) -> Option<String> {
 /// spawn-node v1's `tree_sha256_v1`, shared with the node so that a remote
 /// gate's `inputs` compare equal to a local one's.
 pub(super) fn scenarios_sha256(dir: &Path) -> Option<String> {
-    spawn_node_proto::scenarios_sha256(dir)
+    spawn_cas::scenarios_sha256(dir)
 }
 
 /// The text after `| base cache: toolchain ` on the first such line of a

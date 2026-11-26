@@ -3210,7 +3210,12 @@ fn restore_and_compare(
         });
     }
     drilled.database = Some(database.clone());
-    let outcome = restore_into(settings, &url, &base, &database, &raw, &scratch);
+    let outcome = restore_into(settings, &url, &base, &database, &raw, &scratch).and_then(
+        |(events, max_event_id)| {
+            verify_restored_events(drill_url, &database)?;
+            Ok((events, max_event_id))
+        },
+    );
     // The database the drill made goes on every path.
     let dropped = drop_database(settings, &url, &base, &database);
     match outcome {
@@ -3680,6 +3685,70 @@ fn record_verified(
     let _ = store.backup_record(&record);
 }
 
+/// Rewrite `drill_url` (`postgres://...` or `postgresql://...`) so its target
+/// database is `database` while keeping host, port, credentials and other query
+/// options intact. Error text never echoes the URL because it carries the
+/// password.
+pub(crate) fn url_for_database(drill_url: &str, database: &str) -> Result<String, String> {
+    let (scheme, rest) = drill_url
+        .split_once("://")
+        .ok_or_else(|| "the drill database URL is not a postgres:// URL".to_string())?;
+    if scheme != "postgres" && scheme != "postgresql" {
+        return Err("the drill database URL is not a postgres:// URL".to_string());
+    }
+    let (head, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let authority = head.split_once('/').map_or(head, |(auth, _)| auth);
+    let kept_query: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty() && !pair.starts_with("dbname="))
+        .collect();
+    if kept_query.is_empty() {
+        Ok(format!("{scheme}://{authority}/{database}"))
+    } else {
+        Ok(format!(
+            "{scheme}://{authority}/{database}?{}",
+            kept_query.join("&")
+        ))
+    }
+}
+
+/// Decode every row of `spawn_events` in the restored scratch database through
+/// `PostgresStore` so schema or payload corruption is caught before the scratch
+/// database is dropped.
+pub(crate) fn verify_restored_events(drill_url: &str, database: &str) -> Result<usize, String> {
+    let url = url_for_database(drill_url, database)?;
+    let store = PostgresStore::connect(&url)
+        .map_err(|error| format!("connect restored database {database}: {error}"))?;
+    verify_store_events(&store, 1000)
+}
+
+/// Read every global event batch from `store`, failing on the first corrupt row.
+pub(crate) fn verify_store_events(
+    store: &dyn spawn_core::port::EventLog,
+    batch_size: usize,
+) -> Result<usize, String> {
+    use spawn_core::event::GlobalPosition;
+
+    let mut after = GlobalPosition(0);
+    let mut decoded = 0usize;
+    loop {
+        let batch = store
+            .read_global(after, batch_size)
+            .map_err(|error| format!("decode restored spawn_events: {error}"))?;
+        decoded += batch.len();
+        if batch.len() < batch_size {
+            return Ok(decoded);
+        }
+        let Some(last) = batch.last() else {
+            return Ok(decoded);
+        };
+        if last.position <= after {
+            return Err("decode restored spawn_events: cursor did not advance".to_string());
+        }
+        after = last.position;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3716,6 +3785,106 @@ mod tests {
                 "{bad:?} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn url_for_database_rewrites_target_without_leaking_credentials() {
+        assert_eq!(
+            super::url_for_database(
+                "postgres://spawn:secret@127.0.0.1:65432/postgres?sslmode=disable&dbname=old",
+                "spawn_drill_42"
+            )
+            .expect("valid url"),
+            "postgres://spawn:secret@127.0.0.1:65432/spawn_drill_42?sslmode=disable"
+        );
+        assert_eq!(
+            super::url_for_database("postgresql://127.0.0.1:65432", "spawn_drill_42")
+                .expect("url without path"),
+            "postgresql://127.0.0.1:65432/spawn_drill_42"
+        );
+        let err = super::url_for_database("https://secret_pass@example.com/db", "x").unwrap_err();
+        assert!(
+            !err.contains("secret_pass"),
+            "error leaked URL secret: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_restored_events_allows_retired_rows_and_rejects_corrupt_rows() {
+        let Ok(base_url) = std::env::var("SPAWN_TEST_DATABASE_URL") else {
+            return;
+        };
+        let scratch_db = format!(
+            "spawn_backup_verify_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let url = parse_pg_url(&base_url).expect("valid SPAWN_TEST_DATABASE_URL");
+        let base_db = if url.database.is_empty() {
+            "postgres".to_string()
+        } else {
+            url.database.clone()
+        };
+        let mut admin = postgres::Client::connect(&base_url, postgres::NoTls).expect("admin pg");
+        admin
+            .batch_execute(&format!("create database \"{scratch_db}\""))
+            .expect("create scratch db");
+        let scratch_url = super::url_for_database(&base_url, &scratch_db).expect("scratch url");
+        let scoped = super::PostgresStore::connect(&scratch_url).expect("scoped connect");
+        let setup = (|| -> Result<(), String> {
+            scoped.migrate().map_err(|e| format!("migrate: {e}"))?;
+            let agent = spawn_core::id::AgentId::new("agent_b").expect("agent");
+            let session = spawn_core::id::SessionId::new("session_b").expect("session");
+            spawn_core::port::EventLog::append(
+                &scoped,
+                spawn_core::event::NewEvent {
+                    agent_id: agent.clone(),
+                    session_id: session.clone(),
+                    execution_id: None,
+                    source: spawn_core::event::Source::Bridge,
+                    source_event_id: Some("k1".to_string()),
+                    kind: spawn_core::event::EventKind::MessageReceived,
+                },
+            )
+            .map_err(|e| format!("append: {e}"))?;
+            let mut db_client = postgres::Client::connect(&scratch_url, postgres::NoTls)
+                .map_err(|e| e.to_string())?;
+            db_client
+                .execute(
+                    "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms)
+                     values ($1, $2, 'claude', '{\"name\":\"notice.received\"}'::jsonb, 2, 2000)",
+                    &[&agent.as_str(), &session.as_str()],
+                )
+                .map_err(|e| format!("insert retired: {e}"))?;
+            let decoded = super::verify_restored_events(&base_url, &scratch_db)?;
+            if decoded != 1 {
+                return Err(format!("expected 1 active decoded row, got {decoded}"));
+            }
+            db_client
+                .execute(
+                    "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms)
+                     values ($1, $2, 'claude', '{\"name\":\"bogus.unknown\",\"detail\":{}}'::jsonb, 3, 2000)",
+                    &[&agent.as_str(), &session.as_str()],
+                )
+                .map_err(|e| format!("insert bogus: {e}"))?;
+            match super::verify_restored_events(&base_url, &scratch_db) {
+                Ok(n) => Err(format!("unexpected success decoding bogus row ({n})")),
+                Err(msg) if msg.contains("decode restored spawn_events") => Ok(()),
+                Err(msg) => Err(format!("unexpected error: {msg}")),
+            }
+        })();
+        drop(scoped);
+        let _ = admin.batch_execute(&format!(
+            "select pg_terminate_backend(pid) from pg_stat_activity where datname = '{scratch_db}' and pid <> pg_backend_pid()"
+        ));
+        admin
+            .batch_execute(&format!("drop database if exists \"{scratch_db}\""))
+            .expect("drop scratch db");
+        let _ = base_db;
+        setup.expect("backup verify full-table check");
     }
     use serde_json::json;
     use std::fs;

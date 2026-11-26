@@ -1,162 +1,19 @@
-//! The grant (section 3.1): signed apart from the response, over
-//! `"spawn-node-grant-v1\n" + hex(SHA-256(grant bytes)) + "\n"`, so it can
-//! be stored on disk and re-verified after a crash. The daemon verifies,
-//! then parses those same bytes, and refuses a grant for another node or
-//! one whose `expires_ms` has passed.
+//! The grant (section 3.1): pure data model in `spawn_core::node_proto::grant`,
+//! signed envelopes (`SignedGrant` / `open_grant`) here.
 
-use serde::{Deserialize, Serialize};
-
-use crate::artifact::ContentDigest;
-use crate::codec::{b64u, is_lower_hex, sha256_hex};
-use crate::envelope::{check_target, is_job_id};
-use crate::json::{self, OrderedMap};
+use crate::codec::b64u;
+use crate::json;
 use crate::keys::{PublicKey, SigningKey, decode_signature};
-use crate::spec::Holds;
-use crate::{Error, Limit, VERSION};
+use crate::{Error, Limit};
 
-/// The first line of the grant signing input.
-pub const GRANT_PREFIX: &str = "spawn-node-grant-v1";
-
-/// Variables a grant's `env` may not name: the node sets them itself, and
-/// it never receives a database URL.
-pub const NODE_OWNED_ENV: [&str; 8] = [
-    "PATH",
-    "HOME",
-    "TMPDIR",
-    "CARGO_HOME",
-    "RUSTUP_HOME",
-    "SPAWN_TEST_DATABASE_URL",
-    "SPAWN_GATE_PG_IMAGE",
-    "SPAWN_GATE_PG_BIN",
-];
-
-/// The signed bytes of a grant.
-pub fn grant_signing_input(grant: &[u8]) -> Vec<u8> {
-    format!("{GRANT_PREFIX}\n{}\n", sha256_hex(grant)).into_bytes()
-}
-
-/// What a job is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobKind {
-    Gate,
-    Build,
-    DeBatch,
-}
-
-/// The immutable inputs of a gate.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GrantInputs {
-    pub repo: String,
-    pub base: String,
-    pub candidate: String,
-    pub controller: String,
-    pub scenarios_sha256: String,
-    pub scenario: Option<String>,
-}
-
-/// What an artifact is to the job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactRole {
-    DeltaBundle,
-    BaselineBundle,
-    ControllerPack,
-}
-
-/// One artifact to fetch: a gateway path (`/node/v1/…`, with the envelope)
-/// or an absolute `https://` URL (without it); believed only if the bytes
-/// hash to `digest`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArtifactUrl {
-    pub role: ArtifactRole,
-    pub digest: String,
-    pub size: u64,
-    pub url: String,
-}
-
-impl ArtifactUrl {
-    pub fn digest(&self) -> Result<ContentDigest, Error> {
-        ContentDigest::parse(&self.digest)
-    }
-
-    /// True when the URL is fetched from the gateway with the envelope.
-    pub fn is_gateway_path(&self) -> bool {
-        self.url.starts_with('/')
-    }
-}
-
-/// A grant's JSON. Fields after `expires_ms` are absent from a minimal
-/// grant and are not written when `None`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Grant {
-    pub v: u64,
-    pub job_id: String,
-    pub lease_epoch: u64,
-    pub node_id: String,
-    pub kind: JobKind,
-    pub expires_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attempt: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost: Option<OrderedMap<u64>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_s: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inputs: Option<GrantInputs>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub env: Option<OrderedMap<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requires: Option<Holds>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_urls: Option<Vec<ArtifactUrl>>,
-}
-
-impl Grant {
-    /// The checks that do not depend on who reads the grant.
-    pub fn validate(&self) -> Result<(), Error> {
-        if self.v != VERSION {
-            return Err(Error::Grant("v"));
-        }
-        if !is_job_id(&self.job_id) {
-            return Err(Error::Grant("job_id"));
-        }
-        if !is_lower_hex(&self.node_id, 64) {
-            return Err(Error::Grant("node_id"));
-        }
-        if let Some(name) = self
-            .env
-            .iter()
-            .flat_map(OrderedMap::keys)
-            .find(|name| NODE_OWNED_ENV.contains(name))
-        {
-            return Err(Error::ForbiddenEnv(name.to_string()));
-        }
-        for artifact in self.artifact_urls.iter().flatten() {
-            artifact
-                .digest()
-                .map_err(|_| Error::Grant("artifact digest"))?;
-            let url_ok = if artifact.is_gateway_path() {
-                check_target(&artifact.url).is_ok()
-            } else {
-                artifact.url.starts_with("https://")
-            };
-            if !url_ok {
-                return Err(Error::Grant("artifact url"));
-            }
-        }
-        Ok(())
-    }
-
-    /// The exact bytes the gateway signs.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        json::to_vec(self)
-    }
-}
+pub use spawn_core::node_proto::grant::{
+    ArtifactRole, ArtifactUrl, GRANT_PREFIX, Grant, GrantInputs, JobKind, NODE_OWNED_ENV,
+    grant_signing_input,
+};
 
 /// A grant as an answer carries it: the base64url of its exact JSON bytes
 /// and the primary's signature.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SignedGrant {
     pub grant: String,
     pub sig: String,
@@ -239,6 +96,7 @@ fn decode_grant_bytes(text: &str) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::Holds;
 
     const NODE: &str = "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c";
 

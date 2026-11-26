@@ -17,6 +17,7 @@ pub mod mask;
 pub mod memory;
 pub mod message;
 pub mod mission;
+pub mod node_proto;
 pub mod observation;
 pub mod observe;
 pub mod port;

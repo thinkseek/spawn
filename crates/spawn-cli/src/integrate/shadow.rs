@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use spawn_node_proto::grant::ArtifactRole;
+use spawn_core::node_proto::grant::ArtifactRole;
 use spawn_postgres::PostgresStore;
 
 use super::inputs;
@@ -823,7 +823,7 @@ impl NodeShadows {
             let published = self
                 .artifacts
                 .put_copy(&controller.join("web/package-lock.json"))?;
-            if published.digest.hex != lock {
+            if published.digest.hex() != lock {
                 return Err("web/package-lock.json changed while it was published".to_string());
             }
             requires.insert("web_lock".to_string(), lock);
@@ -1167,7 +1167,7 @@ pub(super) fn node_record_of(
         .and_then(|inputs| serde_json::to_value(inputs).ok())
         .unwrap_or_else(|| json!({}));
     let exit = meta.exit_code.unwrap_or_else(|| match &meta.signal {
-        Some(spawn_node_proto::result::Signal::Number(number)) => {
+        Some(spawn_core::node_proto::result::Signal::Number(number)) => {
             128 + i64::try_from(*number).unwrap_or(0)
         }
         _ => -1,
@@ -1731,12 +1731,12 @@ mod tests {
             )
         }
 
-        fn artifact(&self, digest: &spawn_node_proto::ContentDigest) -> PathBuf {
+        fn artifact(&self, digest: &spawn_cas::Digest) -> PathBuf {
             self.dir
                 .0
                 .join("artifacts/sha256")
-                .join(&digest.hex[..2])
-                .join(&digest.hex)
+                .join(digest.shard())
+                .join(digest.hex())
         }
 
         /// The inputs a job granted, as a node says it judged them.
@@ -1809,11 +1809,9 @@ mod tests {
             ["delta_bundle", "baseline_bundle", "controller_pack"]
         );
         for url in row.spec["artifact_urls"].as_array().unwrap() {
-            let digest =
-                spawn_node_proto::ContentDigest::parse(url["digest"].as_str().unwrap()).unwrap();
-            digest
-                .verify(&std::fs::read(world.artifact(&digest)).unwrap())
-                .unwrap();
+            let digest = spawn_cas::Digest::parse(url["digest"].as_str().unwrap()).unwrap();
+            let bytes = std::fs::read(world.artifact(&digest)).unwrap();
+            spawn_cas::verify_reader(&mut bytes.as_slice(), &digest).unwrap();
         }
         assert!(
             world
@@ -1827,7 +1825,7 @@ mod tests {
         assert_eq!(row.requires["toolchain"], json!(null));
         // The lockfile the node installs from, fetchable by its digest.
         let lock = row.requires["web_lock"].as_str().expect("a web_lock");
-        let digest = spawn_node_proto::ContentDigest::parse(&format!("sha256:{lock}")).unwrap();
+        let digest = spawn_cas::Digest::parse(&format!("sha256:{lock}")).unwrap();
         assert_eq!(
             std::fs::read(world.artifact(&digest)).unwrap(),
             std::fs::read(world.ctl.join("web/package-lock.json")).unwrap()
@@ -2322,7 +2320,7 @@ mod tests {
             "editing scripts/rsi/gate.sh must invalidate controller_pack cache for node shadow"
         );
 
-        let parsed = spawn_node_proto::ContentDigest::parse(&pack2).unwrap();
+        let parsed = spawn_cas::Digest::parse(&pack2).unwrap();
         let extracted = std::process::Command::new("tar")
             .args(["-xOf"])
             .arg(world.artifact(&parsed))

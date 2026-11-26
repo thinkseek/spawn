@@ -15,7 +15,7 @@ use postgres::Client;
 use postgres::error::SqlState;
 use serde_json::{Value, json};
 use spawn_core::event::{ArtifactRef, CheckpointReason, EventKind, NewEvent, Source};
-use spawn_core::id::{AgentId, BranchName, CommitId, SessionId};
+use spawn_core::id::{AgentId, BranchName, CommitId, IdempotencyKey, SessionId};
 use spawn_core::port::EventLog;
 use spawn_postgres::{HumanTask, PostgresStore, role_url};
 
@@ -254,12 +254,18 @@ fn the_page_restarts_and_reassigns_through_its_own_function_alone() {
     let mut client = admin(&schema);
     let (_, task) = delivered(&store, "paged");
     let session = SessionId::new(format!("session_worker_paged_{task}")).expect("session");
+    let key = |value: &str| IdempotencyKey::new(value.to_string()).expect("valid key");
     let page = PostgresStore::connect(
         &role_url(&schema_url(&schema), "spawn_human").expect("the human login's URL"),
     )
     .expect("the human login connects");
     let HumanTask::Moved(answer) = page
-        .human_task(&session, "restart", Some("from the page"))
+        .human_task(
+            &session,
+            "restart",
+            Some("from the page"),
+            &key("k-restart-1"),
+        )
         .expect("restarted")
     else {
         panic!("the session holds a delivered task");
@@ -270,17 +276,19 @@ fn the_page_restarts_and_reassigns_through_its_own_function_alone() {
         .expect("the restart");
     assert_eq!(restart["by"], "human");
     assert_eq!(restart["reason"], "from the page");
+    assert_eq!(restart["key"], "k-restart-1");
 
     let supervisor = SessionId::new("session_supervisor").expect("session");
     let HumanTask::Refused(why) = page
-        .human_task(&supervisor, "restart", Some("no task"))
+        .human_task(&supervisor, "restart", Some("no task"), &key("k-no-task"))
         .expect("answered")
     else {
         panic!("the supervisor holds no delivered task");
     };
     assert!(why.contains("holds no delivered task"), "{why}");
     assert!(
-        page.human_task(&session, "stop", None).is_err(),
+        page.human_task(&session, "stop", None, &key("k-bad-action"))
+            .is_err(),
         "a closed set of actions"
     );
     assert_eq!(records(&mut client, "task.restarted").len(), 1);
@@ -296,16 +304,28 @@ fn the_page_restarts_and_reassigns_through_its_own_function_alone() {
         .query_one("select spawn_task_restart($1, $2)", &[&task, &"x"])
         .expect_err("not the page's");
     assert_eq!(error.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
+    let error = raw
+        .query_one(
+            "select spawn_human_task($1, $2, $3, $4)",
+            &[&session.as_str(), &"restart", &"x", &""],
+        )
+        .expect_err("empty key refused");
+    assert_eq!(error.code(), Some(&SqlState::INVALID_PARAMETER_VALUE));
     let error = client
         .query_one(
-            "select spawn_human_task($1, $2, $3)",
-            &[&session.as_str(), &"restart", &"x"],
+            "select spawn_human_task($1, $2, $3, $4)",
+            &[&session.as_str(), &"restart", &"x", &"k-owner"],
         )
         .expect_err("only the page");
     assert_eq!(error.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
 
     let HumanTask::Moved(answer) = page
-        .human_task(&session, "reassign", Some("moved from the page"))
+        .human_task(
+            &session,
+            "reassign",
+            Some("moved from the page"),
+            &key("k-reassign-1"),
+        )
         .expect("reassigned")
     else {
         panic!("the session holds a delivered task");
@@ -316,6 +336,103 @@ fn the_page_restarts_and_reassigns_through_its_own_function_alone() {
         .expect("the cancel");
     assert_eq!(cancelled["by"], "human");
     assert_eq!(cancelled["reassigned_as"], answer["task"]);
+    assert_eq!(cancelled["key"], "k-reassign-1");
+}
+
+#[test]
+fn human_restart_and_reassign_enforce_idempotency_replay_and_conflict() {
+    let (store, schema) = store("restart_human_idem");
+    let mut client = admin(&schema);
+    let (_, task) = delivered(&store, "paged");
+    let (_, other_task) = delivered(&store, "other_paged");
+    let session = SessionId::new(format!("session_worker_paged_{task}")).expect("session");
+    let other_session =
+        SessionId::new(format!("session_worker_other_paged_{other_task}")).expect("other session");
+    let key = |value: &str| IdempotencyKey::new(value.to_string()).expect("valid key");
+    let page = PostgresStore::connect(
+        &role_url(&schema_url(&schema), "spawn_human").expect("the human login's URL"),
+    )
+    .expect("the human login connects");
+
+    let HumanTask::Moved(answer) = page
+        .human_task(
+            &session,
+            "restart",
+            Some("from the page"),
+            &key("k-restart-1"),
+        )
+        .expect("restarted")
+    else {
+        panic!("the session holds a delivered task");
+    };
+    let HumanTask::Moved(replayed) = page
+        .human_task(
+            &session,
+            "restart",
+            Some(" from the page "),
+            &key("k-restart-1"),
+        )
+        .expect("replayed restart")
+    else {
+        panic!("replay returns first result");
+    };
+    assert_eq!(replayed, answer);
+    assert_eq!(records(&mut client, "task.restarted").len(), 1);
+
+    for (target_session, action, reason, label) in [
+        (&session, "reassign", "from the page", "cross-action"),
+        (&other_session, "restart", "from the page", "cross-session"),
+        (&session, "restart", "different reason", "different reason"),
+    ] {
+        let HumanTask::Refused(conflict) = page
+            .human_task(target_session, action, Some(reason), &key("k-restart-1"))
+            .expect("conflict answered")
+        else {
+            panic!("{label} reuse refused");
+        };
+        assert!(conflict.contains("already used"), "{label}: {conflict}");
+    }
+    assert_eq!(records(&mut client, "task.restarted").len(), 1);
+
+    let HumanTask::Moved(reassigned) = page
+        .human_task(
+            &session,
+            "reassign",
+            Some("moved from the page"),
+            &key("k-reassign-1"),
+        )
+        .expect("reassigned")
+    else {
+        panic!("the session holds a delivered task");
+    };
+    let HumanTask::Moved(replayed_reassign) = page
+        .human_task(
+            &session,
+            "reassign",
+            Some("moved from the page"),
+            &key("k-reassign-1"),
+        )
+        .expect("replayed reassign")
+    else {
+        panic!("replayed reassign returns the created replacement task");
+    };
+    assert_eq!(replayed_reassign, reassigned);
+    assert_eq!(records(&mut client, "task.cancelled").len(), 1);
+    assert_eq!(records(&mut client, "task.assigned").len(), 3);
+
+    for (action, reason, label) in [
+        ("reassign", "changed reason", "different reassign reason"),
+        ("restart", "moved from the page", "reassign-as-restart"),
+    ] {
+        let HumanTask::Refused(conflict) = page
+            .human_task(&session, action, Some(reason), &key("k-reassign-1"))
+            .expect("conflict answered")
+        else {
+            panic!("{label} refused");
+        };
+        assert!(conflict.contains("already used"), "{label}: {conflict}");
+    }
+    assert_eq!(records(&mut client, "task.cancelled").len(), 1);
 }
 
 /// The supervisor's login restarts and reassigns, named as it is.

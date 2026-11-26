@@ -5,16 +5,15 @@
 
 use crate::codec::{is_lower_hex, parse_decimal, sha256_hex};
 use crate::keys::{PublicKey, SigningKey, decode_signature};
-use crate::{Error, Limit, artifact::ContentDigest, json, result};
+use crate::{Error, Limit, json, result};
+use spawn_cas::Digest;
 
 /// The first line of the request signing input.
 pub const REQUEST_PREFIX: &str = "spawn-node-req-v1";
 /// Every target starts with this.
-pub const PATH_PREFIX: &str = "/node/v1/";
-/// The longest path part after [`PATH_PREFIX`].
-pub const MAX_PATH_TAIL: usize = 220;
-/// The longest query after `?`.
-pub const MAX_QUERY: usize = 200;
+pub use spawn_core::node_proto::target::{
+    MAX_PATH_TAIL, MAX_QUERY, PATH_PREFIX, check_target, is_job_id, strip_public_prefix,
+};
 /// The largest `|ts_ms − server_time_ms|` the gateway takes (`409 clock_skew`).
 pub const MAX_SKEW_MS: u64 = 120_000;
 
@@ -57,50 +56,6 @@ impl Method {
     }
 }
 
-/// Checks a request target (path and query, exactly as sent) against
-/// rule 3: `^/node/v1/[A-Za-z0-9._:/-]{1,220}(\?[A-Za-z0-9._=&-]{1,200})?$`,
-/// no `%`, no `//`, no `.` or `..` segment.
-pub fn check_target(target: &str) -> Result<(), Error> {
-    let tail = target.strip_prefix(PATH_PREFIX).ok_or(Error::Target)?;
-    let (path, query) = match tail.split_once('?') {
-        Some((path, query)) => (path, Some(query)),
-        None => (tail, None),
-    };
-    let path_ok = (1..=MAX_PATH_TAIL).contains(&path.len())
-        && path
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'/' | b'-'));
-    let query_ok = query.is_none_or(|query| {
-        (1..=MAX_QUERY).contains(&query.len())
-            && query
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'=' | b'&' | b'-'))
-    });
-    // The prefix ends in `/`, so a tail starting with `/` makes a `//`.
-    let segments_ok = !path.starts_with('/')
-        && !path.contains("//")
-        && path
-            .split('/')
-            .all(|segment| segment != "." && segment != "..");
-    if path_ok && query_ok && segments_ok {
-        Ok(())
-    } else {
-        Err(Error::Target)
-    }
-}
-
-/// A raw target with the gateway's `--public-prefix` removed; `None` when
-/// the target does not start with it.
-pub fn strip_public_prefix<'a>(target: &'a str, prefix: &str) -> Option<&'a str> {
-    let prefix = prefix.trim_end_matches('/');
-    if prefix.is_empty() {
-        return Some(target);
-    }
-    target
-        .strip_prefix(prefix)
-        .filter(|rest| rest.starts_with('/'))
-}
-
 /// What a request asks for, from its method and target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verb {
@@ -111,7 +66,7 @@ pub enum Verb {
     /// `POST /node/v1/spec`.
     Spec,
     /// `GET /node/v1/artifacts/<algo:hex>`.
-    Artifact(ContentDigest),
+    Artifact(Digest),
     /// `GET /node/v1/registry-manifest`.
     RegistryManifest,
     /// `POST /node/v1/jobs/<job_id>/result`.
@@ -132,7 +87,7 @@ impl Verb {
             "registry-manifest" => Self::RegistryManifest,
             _ => {
                 if let Some(digest) = tail.strip_prefix("artifacts/") {
-                    Self::Artifact(ContentDigest::parse(digest).map_err(|_| Error::Target)?)
+                    Self::Artifact(Digest::parse(digest).map_err(|_| Error::Target)?)
                 } else if let Some(job_id) = tail
                     .strip_prefix("jobs/")
                     .and_then(|rest| rest.strip_suffix("/result"))
@@ -170,17 +125,6 @@ impl Verb {
             Self::Result { .. } => Limit::ResultMeta.bytes() + 1 + Limit::ResultLog.bytes(),
         }
     }
-}
-
-/// A job id as a path segment: 1 to 128 of `A-Z a-z 0-9 . _ -`, not `.` or
-/// `..`.
-pub fn is_job_id(text: &str) -> bool {
-    (1..=128).contains(&text.len())
-        && text != "."
-        && text != ".."
-        && text
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// The five header values of one request.

@@ -10,8 +10,7 @@ use std::fs::File;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use spawn_node_proto::ContentDigest;
-use spawn_node_proto::artifact::Algo;
+use spawn_cas::{Algo, Digest};
 
 use crate::http::{Body, Response};
 
@@ -64,7 +63,7 @@ pub fn manifest_body(path: &Path, now: u64) -> Result<Vec<u8>, ManifestError> {
     let digest_ok = pack
         .get("digest")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|digest| ContentDigest::parse(digest).is_ok());
+        .is_some_and(|digest| Digest::parse(digest).is_ok());
     if !digest_ok
         || pack
             .get("size")
@@ -81,22 +80,19 @@ pub fn manifest_body(path: &Path, now: u64) -> Result<Vec<u8>, ManifestError> {
 /// Why no file is served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Miss {
-    /// A digest algorithm v1 serves no file of (`blake3`): `400`.
-    Unsupported,
     /// No such regular file: `404`.
     NotFound,
 }
 
-/// The file of a content address: `sha256` only.
-pub fn artifact_path(root: &Path, digest: &ContentDigest) -> Result<PathBuf, Miss> {
-    match digest.algo {
-        // The hex is 64 lowercase hex digits (ContentDigest::parse): no
+/// The file of a content address (`sha256` only in D6 v1).
+pub fn artifact_path(root: &Path, digest: &Digest) -> PathBuf {
+    match digest.algo() {
+        // The hex is 64 lowercase hex digits (Digest::parse): no
         // separator, no dot, nothing to escape.
-        Algo::Sha256 => Ok(root
-            .join(digest.algo.as_str())
-            .join(&digest.hex[..2])
-            .join(&digest.hex)),
-        Algo::Blake3 => Err(Miss::Unsupported),
+        Algo::Sha256 => root
+            .join(digest.algo().name())
+            .join(digest.shard())
+            .join(digest.hex()),
     }
 }
 
@@ -240,18 +236,17 @@ mod tests {
 
     #[test]
     fn only_sha256_has_files() {
-        let digest = ContentDigest::sha256_of(b"abc");
-        let path = artifact_path(Path::new("/a"), &digest).unwrap();
+        let digest = spawn_cas::sha256_of(b"abc");
+        let path = artifact_path(Path::new("/a"), &digest);
         assert_eq!(
             path,
             Path::new("/a/sha256")
-                .join(&digest.hex[..2])
-                .join(&digest.hex)
+                .join(digest.shard())
+                .join(digest.hex())
         );
-        let blake = ContentDigest::parse(&format!("blake3:{}", digest.hex)).unwrap();
-        assert_eq!(
-            artifact_path(Path::new("/a"), &blake),
-            Err(Miss::Unsupported)
+        assert!(
+            Digest::parse(&format!("blake3:{}", digest.hex())).is_err(),
+            "blake3 digests must be refused at parse time"
         );
     }
 
@@ -264,7 +259,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(REGISTRY_MANIFEST);
         assert_eq!(manifest_body(&path, 7), Err(ManifestError::Missing));
-        let digest = ContentDigest::sha256_of(b"pack");
+        let digest = spawn_cas::sha256_of(b"pack");
         let registry = "a".repeat(64);
         std::fs::write(
             &path,

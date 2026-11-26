@@ -54,11 +54,25 @@ pub(crate) fn execution_id(row: &Row) -> Result<Option<ExecutionId>, StoreError>
 /// Source names this process has warned it skips.
 static SKIPPED_SOURCES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
+/// Event names retired from [`EventKind`] (#113 item 4) that may still
+/// exist in historical `spawn_events` rows or R2 archives. [`event_record`]
+/// skips them cleanly with one warning per name instead of deleting rows or
+/// stalling readers; unlisted unknown names remain [`StoreError::Corrupt`].
+pub const RETIRED_EVENTS: &[&str] = &[
+    "session.native_ended",
+    "notice.typed",
+    "notice.received",
+    "notification.received",
+];
+
+/// Retired event names this process has warned it skips.
+static SKIPPED_EVENTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
 /// One `spawn_events` row selected with `event_record_columns!`, or `None`
-/// for an event whose source this build does not know: the history may hold
-/// writers since removed, and one of their records must not stop every
-/// reader of the log. The source is read first, so such a record's kind is
-/// never decoded.
+/// for an event whose source or retired name this build skips: the history
+/// may hold writers or event kinds since removed, and one of their records
+/// must not stop every reader of the log. The source is read first, then
+/// retired event names are checked before deserializing [`EventKind`].
 pub(crate) fn event_record(row: &Row) -> Result<Option<EventRecord>, StoreError> {
     let text: String = row.get("source");
     let Some(source) = Source::parse(&text) else {
@@ -75,7 +89,24 @@ pub(crate) fn event_record(row: &Row) -> Result<Option<EventRecord>, StoreError>
         }
         return Ok(None);
     };
-    let kind: EventKind = serde_json::from_value(row.get("kind")).map_err(corrupt)?;
+    let kind_value: serde_json::Value = row.get("kind");
+    if let Some(name) = kind_value.get("name").and_then(serde_json::Value::as_str)
+        && RETIRED_EVENTS.contains(&name)
+    {
+        let first = SKIPPED_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_string());
+        if first {
+            eprintln!(
+                "spawn: skipping retired event kind {name}, which this build does not read \
+                 (the first at position {})",
+                row.get::<_, i64>("id")
+            );
+        }
+        return Ok(None);
+    }
+    let kind: EventKind = serde_json::from_value(kind_value).map_err(corrupt)?;
     Ok(Some(EventRecord {
         position: global_position(row, "id"),
         session_seq: session_seq(row, "session_seq"),

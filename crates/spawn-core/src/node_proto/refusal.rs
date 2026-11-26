@@ -56,6 +56,7 @@ pub enum Reaction {
 pub const REVOKED_EXIT_CODE: i32 = 78;
 
 impl Refusal {
+    /// Every refusal variant.
     pub const ALL: [Self; 12] = [
         Self::BadRequest,
         Self::BadSignature,
@@ -71,6 +72,7 @@ impl Refusal {
         Self::Unavailable,
     ];
 
+    /// HTTP status code.
     pub fn status(self) -> u16 {
         match self {
             Self::BadRequest => 400,
@@ -111,6 +113,7 @@ impl Refusal {
             .find(|refusal| refusal.status() == status && refusal.error() == error)
     }
 
+    /// Daemon reaction required for this refusal.
     pub fn reaction(self) -> Reaction {
         match self {
             Self::BadRequest => Reaction::DropRequest,

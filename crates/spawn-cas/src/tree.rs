@@ -1,16 +1,16 @@
-//! `tree_sha256_v1` (section 7): the digest of a directory, shared by the
-//! integrator's `scenarios_sha256` (`integrate/inputs.rs`) and the node's
-//! `registry` key. Every regular file under the directory (symbolic links
-//! are not followed), its path relative to the directory, sorted bytewise;
-//! the digest is the SHA-256 of the lines `<hex SHA-256 of the file>
-//! <path>\n` (sha256sum's format, two spaces).
+//! `tree_sha256_v1`: the deterministic digest of a directory, shared by the
+//! integrator's `scenarios_sha256` and the node's `registry` key. Every
+//! regular file under the directory (symbolic links are not followed), its
+//! path relative to the directory, sorted bytewise; the digest is the
+//! SHA-256 of the lines `<hex SHA-256 of the file>  <path>\n` (sha256sum's
+//! format, two spaces).
 
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
 
-use crate::codec::hex;
+use crate::digest::to_hex;
 
 /// The file names skipped for `registry` only: cargo's lock files, which
 /// change while gates run.
@@ -24,12 +24,12 @@ pub fn tree_sha256_v1(dir: &Path, skip: &[&str]) -> std::io::Result<String> {
     let mut all = Sha256::new();
     for (relative, path) in files {
         let bytes = std::fs::read(&path)?;
-        all.update(hex(&Sha256::digest(&bytes)).as_bytes());
+        all.update(to_hex(&Sha256::digest(&bytes)).as_bytes());
         all.update(b"  ");
         all.update(&relative);
         all.update(b"\n");
     }
-    Ok(hex(&all.finalize()))
+    Ok(to_hex(&all.finalize()))
 }
 
 /// The scenario set's digest (`inputs.scenarios_sha256`); `None` when the

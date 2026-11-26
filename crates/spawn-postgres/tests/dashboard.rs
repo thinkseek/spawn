@@ -275,16 +275,17 @@ fn the_board_reads_the_live_turn_open_from_its_start_and_end_records_only() {
     );
     append(
         "n1",
-        Source::Claude,
-        EventKind::NotificationReceived {
-            notification_type: "idle_prompt".to_string(),
+        Source::Bridge,
+        EventKind::ScreenObserved {
+            state: spawn_core::screen::ScreenState::Ready,
+            evidence: "❯".to_string(),
         },
     );
     let activity = board(&store);
-    assert_eq!(activity["last_event_name"], "notification.received");
+    assert_eq!(activity["last_event_name"], "screen.observed");
     assert_eq!(
         activity["turn_open"], false,
-        "a notice after the stop: {activity}"
+        "a screen read after the stop: {activity}"
     );
 
     append("f1", Source::Claude, failed());

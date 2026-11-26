@@ -797,6 +797,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "spawn-cas",
+ "spawn-core",
  "spawn-node-proto",
  "spawn-postgres",
  "zeroize",
@@ -811,6 +813,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "spawn-cas",
+ "spawn-core",
  "thiserror",
 ]
 

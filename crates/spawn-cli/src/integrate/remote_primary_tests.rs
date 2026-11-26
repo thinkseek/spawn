@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use spawn_node_proto::result::{ResultMeta, Signal};
+use spawn_core::node_proto::result::{ResultMeta, Signal};
 use spawn_postgres::{FaultNext, PostgresStore, RemoteJobKind, RemoteJobState};
 
 use super::remote::tests::{self as fixtures, Ledger, Scratch};
@@ -80,7 +80,7 @@ impl NodeSim {
         fixtures::store_result(results, &meta, &log);
         let line = meta.to_bytes();
         let mut result = serde_json::to_value(&meta).expect("the result");
-        result["result_sha256"] = json!(spawn_node_proto::codec::sha256_hex(&line));
+        result["result_sha256"] = json!(spawn_core::node_proto::codec::sha256_hex(&line));
         result["log_bytes"] = json!(meta.log_bytes.to_string());
         let done = self
             .store
@@ -466,10 +466,9 @@ fn m3a_an_acceptance_on_the_jobs_own_inputs_is_believed() {
     );
     let artifacts = remote::Artifacts::new(world.primary.settings.artifacts.clone());
     for url in grant["spec"]["artifact_urls"].as_array().expect("urls") {
-        let digest = spawn_node_proto::ContentDigest::parse(url["digest"].as_str().unwrap())
-            .expect("a digest");
+        let digest = spawn_cas::Digest::parse(url["digest"].as_str().unwrap()).expect("a digest");
         let bytes = std::fs::read(artifacts.path_of(&digest)).expect("published");
-        digest.verify(&bytes).expect("whole");
+        spawn_cas::verify_reader(&mut bytes.as_slice(), &digest).expect("whole");
     }
     let manifest: Value = serde_json::from_slice(
         &std::fs::read(
@@ -1731,7 +1730,7 @@ fn primary_publish_repacks_when_gate_script_changes_with_same_controller_commit(
     let pack_digest = |job: &remote::GateJob| -> String {
         job.artifacts
             .iter()
-            .find(|url| url.role == spawn_node_proto::grant::ArtifactRole::ControllerPack)
+            .find(|url| url.role == spawn_core::node_proto::grant::ArtifactRole::ControllerPack)
             .expect("controller_pack")
             .digest
             .clone()
@@ -1757,7 +1756,7 @@ fn primary_publish_repacks_when_gate_script_changes_with_same_controller_commit(
         "editing scripts/rsi/gate.sh must invalidate controller_pack cache"
     );
 
-    let parsed = spawn_node_proto::ContentDigest::parse(&second_pack).expect("digest");
+    let parsed = spawn_cas::Digest::parse(&second_pack).expect("digest");
     let pack_path =
         remote::Artifacts::new(world.primary.settings.artifacts.clone()).path_of(&parsed);
     let extracted = std::process::Command::new("tar")

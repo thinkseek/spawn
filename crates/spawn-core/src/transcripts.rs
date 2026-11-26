@@ -800,7 +800,6 @@ pub fn read_from_transcript(event: &NewEvent) -> bool {
             event.kind,
             EventKind::MessageReceived
                 | EventKind::MessageTaken { .. }
-                | EventKind::NoticeReceived
                 | EventKind::ToolStarted { .. }
                 | EventKind::ToolCompleted { .. }
                 | EventKind::ToolFailed { .. }

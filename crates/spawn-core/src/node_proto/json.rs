@@ -15,8 +15,8 @@ use serde::de::{DeserializeOwned, MapAccess, Visitor};
 use serde::ser::SerializeMap as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::Error;
-use crate::codec::MAX_SAFE;
+use super::Error;
+use super::codec::MAX_SAFE;
 
 /// Deepest nesting a wire body may have.
 const MAX_DEPTH: usize = 32;
@@ -268,10 +268,12 @@ impl<V> OrderedMap<V> {
         self.0.iter().map(|(name, _)| name.as_str())
     }
 
+    /// True when no entry is present.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// Number of entries.
     pub fn len(&self) -> usize {
         self.0.len()
     }

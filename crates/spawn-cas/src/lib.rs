@@ -49,6 +49,7 @@ mod legacy;
 mod manifest;
 mod merkle;
 mod store;
+pub mod tree;
 
 use std::io;
 use std::path::PathBuf;
@@ -80,6 +81,7 @@ pub use store::{
     CAS_MARKER, Clock, GcLock, GcSharedLock, ObjectEntry, Publish, Store, is_valid_name,
     system_clock,
 };
+pub use tree::{TREE_SKIP_REGISTRY, registry_sha256, scenarios_sha256, tree_sha256_v1};
 
 /// What a store operation refused, or the I/O error that stopped it.
 #[derive(Debug, thiserror::Error)]

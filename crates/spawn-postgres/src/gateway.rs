@@ -79,9 +79,11 @@ pub(crate) const HUMAN_KEY: &str = "select spawn_human_key($1, $2, $3)";
 
 /// A person's restart or reassign from the agent page, through
 /// `spawn_human_task`: `{task, session_id, agent_id}`, the task and worker
-/// that now carry the work, or SQLSTATE 55000 when the session holds no
-/// delivered task. `$1` session, `$2` `restart` or `reassign`, `$3` reason.
-pub(crate) const HUMAN_TASK: &str = "select spawn_human_task($1, $2, $3)";
+/// that now carry the work (the same answer for the same key again),
+/// SQLSTATE 55000 when the session holds no delivered task, or 23505 when the
+/// key was already used for another action, session or reason. `$1` session,
+/// `$2` `restart` or `reassign`, `$3` reason, `$4` idempotency key.
+pub(crate) const HUMAN_TASK: &str = "select spawn_human_task($1, $2, $3, $4)";
 
 /// A person's resume of a halted mission from the page, through
 /// `spawn_human_resume`: the `mission.resumed` record's event id (a new one,
@@ -337,24 +339,28 @@ impl PostgresStore {
     }
 
     /// Restart (`restart`) or reassign (`reassign`) the delivered task of
-    /// `session` as a person, through `spawn_human_task`, with `by` `human`.
-    /// Only a store connected as the `spawn_human` login may call it. A
-    /// session that holds no delivered task is refused
-    /// ([`HumanTask::Refused`]) and nothing is recorded.
+    /// `session` as a person, through `spawn_human_task`, with `by` `human`
+    /// and idempotency key `key`. Only a store connected as the `spawn_human`
+    /// login may call it. A session that holds no delivered task, or a key
+    /// already used for another move, is refused ([`HumanTask::Refused`]) and
+    /// nothing is recorded.
     pub fn human_task(
         &self,
         session: &SessionId,
         action: &str,
         reason: Option<&str>,
+        key: &IdempotencyKey,
     ) -> Result<HumanTask, StoreError> {
-        let answer = self
-            .lock()
-            .query_one(HUMAN_TASK, &[&session.as_str(), &action, &reason]);
+        let answer = self.lock().query_one(
+            HUMAN_TASK,
+            &[&session.as_str(), &action, &reason, &key.as_str()],
+        );
         match answer {
             Ok(row) => Ok(HumanTask::Moved(row.get::<_, serde_json::Value>(0))),
             Err(error)
                 if error.as_db_error().is_some_and(|db| {
                     *db.code() == postgres::error::SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
+                        || *db.code() == postgres::error::SqlState::UNIQUE_VIOLATION
                 }) =>
             {
                 let message = error

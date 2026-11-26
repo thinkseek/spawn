@@ -651,7 +651,7 @@ const HUMAN_FUNCTIONS: [&str; 5] = [
     "spawn_human_key(text,text,text) EXECUTE",
     "spawn_human_master_message(text,text,text) EXECUTE",
     "spawn_human_resume(bigint,bigint,text) EXECUTE",
-    "spawn_human_task(text,text,text) EXECUTE",
+    "spawn_human_task(text,text,text,text) EXECUTE",
 ];
 
 /// The functions granted to a database's reader login (schema.sql).
