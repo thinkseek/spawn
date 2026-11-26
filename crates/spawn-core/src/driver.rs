@@ -57,7 +57,12 @@ pub enum Guard {
     /// Deny rules the engine enforces, handed over at launch (Claude Code's
     /// inline `--settings`).
     Settings,
-    /// Nothing of the engine's own: the sandbox alone.
+    /// Nothing of the engine's own: the sandbox alone, which is a
+    /// filesystem view (decision C2, N6): the Bridge starts such an engine
+    /// only inside the host's view ([`crate::port::EngineView`], `bwrap`),
+    /// and refuses it (`engine_unavailable`) on a host that requires one
+    /// (`SPAWN_ENGINE_VIEW=required`, the default) and has none
+    /// ([`crate::bridge::EngineViewPolicy`]).
     Sandbox,
 }
 
@@ -440,7 +445,8 @@ pub const AGY_HOME: &str = ".gemini/antigravity-cli";
 /// (`transcript_full.jsonl`, never the short one, which cuts long contents
 /// at about 4 KB) says what it did ([`agy_line`]). Its permissions are
 /// skipped and its workspace trusted at launch; nothing of its own keeps
-/// it off the host's credentials, so the sandbox does ([`Guard::Sandbox`]).
+/// it off the host's credentials, so the sandbox does ([`Guard::Sandbox`]):
+/// it runs inside the host's filesystem view, or not at all.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AgyDriver;
 
