@@ -6071,6 +6071,11 @@ impl Bridge {
                         return Ok(self.prompt_retry(&progress));
                     }
                 };
+            // The engine says it will not run what it was started on (agy's
+            // unknown model): the start fails now, never waits on it.
+            if let Some(why) = active.driver.start_refusal(&pane) {
+                return Ok(Handled::Finished(Outcome::Failed(why)));
+            }
             let reading = active.driver.read_screen(&pane);
             progress.prompt_seen |= reading.state != ScreenState::Unknown;
             // The Bridge exported this directory itself, so it trusts it,

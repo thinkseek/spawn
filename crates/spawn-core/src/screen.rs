@@ -127,7 +127,7 @@ impl ScreenReading {
 
 /// Remove ANSI escape sequences: CSI (`ESC [ ... final`), OSC
 /// (`ESC ] ... BEL|ST`) and two-byte escapes.
-fn strip_ansi(text: &str) -> String {
+pub(crate) fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(character) = chars.next() {

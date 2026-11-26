@@ -580,7 +580,7 @@ impl AgyDriver {
     pub fn known_models(listing: &str) -> Vec<String> {
         let mut known = std::collections::BTreeSet::new();
         for line in listing.lines() {
-            let line = crate::screen::strip_ansi_text(line);
+            let line = crate::screen::strip_ansi(line);
             let line = line
                 .trim()
                 .trim_start_matches(['-', '*', '•', '>', '│', '|'])
