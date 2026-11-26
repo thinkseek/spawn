@@ -1195,7 +1195,7 @@ const PRIMARY_EVERY: Duration = Duration::from_secs(1);
 /// How long past a remote gate's own wall clock ([`GATE_TIMEOUT_S`]) the
 /// primary path waits for a leased job's result before it judges here
 /// (the sweep fences a silent lease long before).
-const PRIMARY_GRACE: Duration = Duration::from_secs(900);
+const PRIMARY_GRACE: Duration = Duration::from_mins(15);
 
 /// Ledger reads that may fail in a row before the primary path gives the
 /// job up and judges here.
@@ -1285,17 +1285,8 @@ pub(super) struct PrimaryRequest<'a> {
 pub(super) enum PrimaryOutcome {
     /// A node's verdict on the job's own inputs, believed (M3a: an
     /// acceptance; M3b: a rejection too): judged as a local run's verdict
-    /// is. `given` is what the node judged, `env` where (`runner`
-    /// `node:<name>`), `base_check` the red check it found passing on the
-    /// base, `belief` the rule (`M3a`, `M3b`).
-    Believed {
-        job_id: String,
-        verdict: gate::Verdict,
-        given: Value,
-        env: Value,
-        base_check: Option<String>,
-        belief: &'static str,
-    },
+    /// is.
+    Believed(Box<Believed>),
     /// Judged here instead (fallback_local), for `why`: no node leased the
     /// job in time and the primary took it back, the node's run was its
     /// fault or skew, a rejection M3a does not believe, or the job could
@@ -1305,6 +1296,19 @@ pub(super) enum PrimaryOutcome {
     /// waited: a job still queued is taken back, a leased one's result is
     /// never read.
     Stopped,
+}
+
+/// A node's verdict the primary path believed: `given` is what the node
+/// judged, `env` where (`runner` `node:<name>`), `base_check` the red check
+/// it found passing on the base, `belief` the rule (`M3a`, `M3b`).
+#[derive(Debug)]
+pub(super) struct Believed {
+    pub(super) job_id: String,
+    pub(super) verdict: gate::Verdict,
+    pub(super) given: Value,
+    pub(super) env: Value,
+    pub(super) base_check: Option<String>,
+    pub(super) belief: &'static str,
 }
 
 /// Where one look at a job leaves it ([`look`]).
@@ -1643,11 +1647,11 @@ impl Primary {
         let mut failures = 0u32;
         loop {
             if stopped() {
-                self.abandon(store, job_id);
+                Self::abandon(store, job_id);
                 return PrimaryOutcome::Stopped;
             }
             if started.elapsed() >= self.settings.limit {
-                self.abandon(store, job_id);
+                Self::abandon(store, job_id);
                 return PrimaryOutcome::Local {
                     why: format!(
                         "no node's result for {job_id} within {} s",
@@ -1677,7 +1681,7 @@ impl Primary {
                     failures += 1;
                     eprintln!("integrate: task {task}'s node gate {job_id}: {error}");
                     if failures >= PRIMARY_READ_FAILURES {
-                        self.abandon(store, job_id);
+                        Self::abandon(store, job_id);
                         return PrimaryOutcome::Local {
                             why: format!("the ledger cannot be read: {error}"),
                         };
@@ -1724,7 +1728,7 @@ impl Primary {
     /// A job this judging no longer waits for: taken back while still
     /// queued, so no node runs it for nothing (a node that won the race
     /// keeps it, and its result is never read).
-    fn abandon(&self, store: &PostgresStore, job_id: &str) {
+    fn abandon(store: &PostgresStore, job_id: &str) {
         if let Ok(Some(row)) = store.remote_job(job_id)
             && row.state == RemoteJobState::Queued
         {
@@ -1769,14 +1773,14 @@ impl Primary {
                         "integrate: task {task}: node {node}'s verdict on {job_id} believed \
                          ({rule}): {word}"
                     );
-                    Settled::Believed(PrimaryOutcome::Believed {
+                    Settled::Believed(PrimaryOutcome::Believed(Box::new(Believed {
                         job_id: job_id.clone(),
                         base_check: base_check_of(stored.meta.verdict_raw.as_deref()),
                         env: node_env(&stored, &node),
                         given: given.clone(),
                         verdict,
                         belief: rule,
-                    })
+                    })))
                 }
                 None => Settled::Local(format!(
                     "node {node} rejected it on {job_id}, a valid run (M3a believes only an \

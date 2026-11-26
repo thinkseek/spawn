@@ -1474,11 +1474,11 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         Err(error) => eprintln!("integrate: {error}; no shadow judging"),
     }
     // The shadow judging on spawn-node v1 (shadow.rs, remote.rs), beside
-    // the runner's when both are on.
-    integrator = integrator.with_node_shadow_from_env();
-    // The candidates' gates on spawn-node v1 first (SPAWN_GATE_REMOTE=node,
-    // remote.rs); unset or `local`, every gate is this host's as before.
-    integrator = integrator.with_remote_primary_from_env();
+    // the runner's when both are on; then the candidates' gates on a node
+    // first (SPAWN_GATE_REMOTE=node, remote.rs; unset: all local).
+    integrator = integrator
+        .with_node_shadow_from_env()
+        .with_remote_primary_from_env();
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -5035,14 +5035,15 @@ impl Judge {
         };
         let stopped = || self.stop.as_ref().is_some_and(|stop| stop.by().is_some());
         match primary.judge(store, &request, &stopped) {
-            remote::PrimaryOutcome::Believed {
-                verdict,
-                given,
-                env,
-                base_check,
-                job_id,
-                belief,
-            } => {
+            remote::PrimaryOutcome::Believed(believed) => {
+                let remote::Believed {
+                    verdict,
+                    given,
+                    env,
+                    base_check,
+                    job_id,
+                    belief,
+                } = *believed;
                 if !verdict.accepted
                     && test_database
                     && host::host_fault(&verdict.reason, &verdict.output, Vec::new).is_some()
