@@ -179,6 +179,7 @@ mod tests {
             charter: None,
             jobs: Vec::new(),
             engine: None,
+            model_label: None,
         }
     }
 

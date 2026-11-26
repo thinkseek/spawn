@@ -62,6 +62,7 @@ fn worker(state: SemanticState, idle: bool) -> Facts {
         recovered: None,
         failed_resume: None,
         engine: None,
+        model_label: None,
     }
 }
 

@@ -434,6 +434,7 @@ mod tests {
             jobs: Vec::new(),
             recovered: None,
             engine: None,
+            model_label: None,
         }
     }
 
