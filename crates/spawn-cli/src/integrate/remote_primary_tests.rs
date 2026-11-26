@@ -1718,3 +1718,54 @@ fn a_gate_on_a_red_main_is_judged_here_and_finds_it_green() {
     assert_eq!(gated[0]["probe"], true);
     assert_eq!(gated[0]["env"]["runner"], Value::Null, "judged here");
 }
+
+/// Editing `scripts/rsi/gate.sh` without touching `.controller` or
+/// `rsi/scenarios` invalidates the `controller_pack` cache on `Primary::publish`.
+#[test]
+fn primary_publish_repacks_when_gate_script_changes_with_same_controller_commit() {
+    let world = Fixture::new("repack_gate_script", false, Duration::from_secs(30));
+    let first = world
+        .primary
+        .publish(&world.request())
+        .expect("first publish");
+    let pack_digest = |job: &remote::GateJob| -> String {
+        job.artifacts
+            .iter()
+            .find(|url| url.role == spawn_node_proto::grant::ArtifactRole::ControllerPack)
+            .expect("controller_pack")
+            .digest
+            .clone()
+    };
+    let first_pack = pack_digest(&first);
+
+    let gate = world.controller.join("scripts/rsi/gate.sh");
+    let updated_gate = "#!/bin/sh\necho wavef-v2\nexit 0\n";
+    std::fs::write(&gate, updated_gate).expect("update gate.sh");
+
+    let second = world
+        .primary
+        .publish(&world.request())
+        .expect("second publish");
+    let second_pack = pack_digest(&second);
+    assert_eq!(first.inputs["controller"], second.inputs["controller"]);
+    assert_eq!(
+        first.inputs["scenarios_sha256"],
+        second.inputs["scenarios_sha256"]
+    );
+    assert_ne!(
+        first_pack, second_pack,
+        "editing scripts/rsi/gate.sh must invalidate controller_pack cache"
+    );
+
+    let parsed = spawn_node_proto::ContentDigest::parse(&second_pack).expect("digest");
+    let pack_path =
+        remote::Artifacts::new(world.primary.settings.artifacts.clone()).path_of(&parsed);
+    let extracted = std::process::Command::new("tar")
+        .args(["-xOf"])
+        .arg(&pack_path)
+        .arg("scripts/rsi/gate.sh")
+        .output()
+        .expect("tar");
+    assert!(extracted.status.success(), "{extracted:?}");
+    assert_eq!(String::from_utf8_lossy(&extracted.stdout), updated_gate);
+}

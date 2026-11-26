@@ -892,6 +892,7 @@ impl NodeShadows {
                     remote::controller_pack_key(
                         &controller,
                         &controller_commit,
+                        &snapshot,
                         &scenarios_at,
                         digest,
                     )
@@ -2268,5 +2269,67 @@ mod tests {
         assert_eq!(record["verdict"], Value::Null);
         assert_eq!(record["agrees"], Value::Null);
         assert_eq!(record["exit"], 6);
+    }
+
+    #[test]
+    fn node_shadow_repacks_when_gate_script_changes_with_same_controller_commit() {
+        let world = NodeWorld::new("node-repack");
+        let gate = world.ctl.join("scripts/rsi/gate.sh");
+        std::fs::create_dir_all(gate.parent().unwrap()).unwrap();
+        std::fs::write(&gate, "#!/bin/sh\necho shadow-v1\nexit 0\n").unwrap();
+
+        let pack_digest = |job_id: &str| -> (spawn_postgres::RemoteJob, String) {
+            let row = world.ledger.store.remote_job(job_id).unwrap().unwrap();
+            let digest = row.spec["artifact_urls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|url| url["role"] == "controller_pack")
+                .expect("controller_pack")["digest"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            (row, digest)
+        };
+
+        let mut nodes1 = world.nodes();
+        let task1 = world.task();
+        nodes1.offer(&world.ledger.store, world.want(task1));
+        assert_eq!(nodes1.waiting().len(), 1);
+        let (job1, pack1) = pack_digest(&nodes1.waiting()[0]);
+
+        let updated_gate = "#!/bin/sh\necho shadow-v2\nexit 0\n";
+        std::fs::write(&gate, updated_gate).unwrap();
+
+        let mut nodes2 = world.nodes();
+        let task2 = world.task();
+        let mut want2 = world.want(task2);
+        want2.judging_id = Some("fedcba9876543210fedcba987654".to_string());
+        nodes2.offer(&world.ledger.store, want2);
+        assert_eq!(nodes2.waiting().len(), 1);
+        let (job2, pack2) = pack_digest(&nodes2.waiting()[0]);
+
+        assert_eq!(
+            job1.spec["inputs"]["controller"],
+            job2.spec["inputs"]["controller"]
+        );
+        assert_eq!(
+            job1.spec["inputs"]["scenarios_sha256"],
+            job2.spec["inputs"]["scenarios_sha256"]
+        );
+        assert_ne!(
+            pack1, pack2,
+            "editing scripts/rsi/gate.sh must invalidate controller_pack cache for node shadow"
+        );
+
+        let parsed = spawn_node_proto::ContentDigest::parse(&pack2).unwrap();
+        let extracted = std::process::Command::new("tar")
+            .args(["-xOf"])
+            .arg(world.artifact(&parsed))
+            .arg("scripts/rsi/gate.sh")
+            .output()
+            .unwrap();
+        assert!(extracted.status.success(), "{extracted:?}");
+        assert_eq!(String::from_utf8_lossy(&extracted.stdout), updated_gate);
     }
 }
