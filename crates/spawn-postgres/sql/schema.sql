@@ -7057,7 +7057,6 @@ declare
     v_grants jsonb := '[]'::jsonb;
     v_granted integer := 0;
     v_need_sync jsonb := '{}'::jsonb;
-    v_busy boolean;
     v_facts jsonb := '[]'::jsonb;
 begin
     select * into v_n from spawn_node_state where node_id = p_node_id for update;
@@ -7206,10 +7205,6 @@ begin
         end loop;
     end if;
 
-    v_busy := v_granted > 0 or jsonb_array_length(v_held) > 0 or jsonb_array_length(v_pending) > 0
-              or exists (select 1 from spawn_remote_jobs j
-                          where j.state = 'queued' and j.cell_id = v_n.cell_id);
-
     update spawn_node_state
        set boot_id = p_boot_id,
            boot_seen_ms = case when v_new_boot then v_now else boot_seen_ms end,
@@ -7237,7 +7232,9 @@ begin
 
     return jsonb_build_object(
         'ok', true, 'pubkey', v_pub, 'name', v_n.name, 'server_time_ms', v_now,
-        'next_beat_ms', case when v_busy then 5000 else 30000 end,
+        -- 5 s busy or idle: an idle node must lease newly queued work well
+        -- inside the 30 s default queue wait, even with ±20% node jitter.
+        'next_beat_ms', 5000,
         'lease_ttl_s', c_ttl_ms / 1000, 'need_spec', v_need_spec, 'need_sync', v_need_sync,
         'renewed', v_renewed, 'fenced', v_fenced, 'acked_results', v_acked,
         'grants', v_grants, 'drain', v_n.drained);
