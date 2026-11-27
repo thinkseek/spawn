@@ -8034,10 +8034,20 @@ pub fn claude_dir_rules(path: &str) -> Vec<String> {
 /// profile pins every slot (issue #79): the top-level `model`, the main,
 /// sonnet, opus and subagent slots to its main model, so neither a model
 /// the user's own settings name nor a subagent's leaves the cheap
-/// provider. The default profile pins only what the relay names
-/// ([`ModelRelay::default_model`] and the per-slot overrides): with none,
-/// Claude Code's own main model stands. Without a relay nothing about
-/// models is set: the cheap profile needs one, and the Bridge refuses to
+/// provider. The default profile names every env slot too
+/// ([`MODEL_SLOTS`]): the models the relay names
+/// ([`ModelRelay::default_model`] and the per-slot overrides), and an
+/// empty value for each slot it does not name. Claude Code reads an empty
+/// slot as unset (read in Claude Code 2.1.322: the main model is
+/// `ANTHROPIC_MODEL || settings.model || built-in`, and an empty
+/// `CLAUDE_CODE_SUBAGENT_MODEL` inherits the main one), so no slot takes a
+/// value from the env of `~/.claude/settings.json` (issue #79: a host file
+/// rewritten to a raw provider model took the fleet down). The top-level
+/// `model` is pinned only with a main model to pin: without
+/// `SPAWN_DEFAULT_MODEL`, a `model` key in the user's own file still names
+/// the default profile's main model; `SPAWN_CLAUDE_CONFIG_DIR` keeps that
+/// file out entirely. Without a relay nothing about models is set: the
+/// cheap profile needs one, and the Bridge refuses to
 /// start it without.
 ///
 /// No credential is ever set here: `ANTHROPIC_AUTH_TOKEN` stays the one
@@ -8051,6 +8061,18 @@ pub fn claude_dir_rules(path: &str) -> Vec<String> {
 pub fn claude_settings(relay: Option<&ModelRelay>, profile: ModelProfile) -> String {
     claude_settings_in(relay, profile, None)
 }
+
+/// Every model slot [`claude_settings`] names whenever an engine goes
+/// through a relay (issue #79), whatever its profile: a slot left out of
+/// the inline `env` is a slot `~/.claude/settings.json` decides.
+pub const MODEL_SLOTS: [&str; 6] = [
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+];
 
 /// [`claude_settings`] for an engine whose Claude Code directory is
 /// `config_dir` (`CLAUDE_CONFIG_DIR`, issue #79) rather than `~/.claude`:
@@ -8078,10 +8100,11 @@ pub fn claude_settings_in(
     });
     if let Some(relay) = relay {
         let mut env = serde_json::Map::new();
+        // Every slot is named (issue #79): one the relay does not name is
+        // pinned empty, which Claude Code reads as unset, so the host's
+        // `~/.claude/settings.json` cannot fill it.
         let mut pin = |slot: &str, model: Option<&str>| {
-            if let Some(model) = model {
-                env.insert(slot.to_string(), json!(model));
-            }
+            env.insert(slot.to_string(), json!(model.unwrap_or_default()));
         };
         pin("ANTHROPIC_BASE_URL", Some(&relay.url));
         let main = relay.main_model(profile);
@@ -13253,6 +13276,63 @@ mod tests {
         assert!(
             transcript.contains("/-workspace/sess-1.jsonl"),
             "expected canonical /workspace hash in {transcript}"
+        );
+    }
+
+    /// Issue #79: with a fleet-owned Claude Code directory
+    /// (`SPAWN_CLAUDE_CONFIG_DIR`, handed over as `CLAUDE_CONFIG_DIR`), the
+    /// sandboxed engine's view is built from that directory, not from
+    /// `~/.claude`, and the engine gets it in its environment and its deny
+    /// rules.
+    #[test]
+    fn claude_sandbox_views_the_fleet_owned_claude_directory() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let id = submit_resumable_start(&store, 1, "hello fleet claude", READY);
+        let view = Arc::new(FakeView {
+            canonical_workspace: Some(std::path::PathBuf::from("/workspace")),
+            ..Default::default()
+        });
+        let mut config = BridgeConfig::new("tester");
+        config.claude_projects = "/srv/fleet-claude/projects".to_string();
+        config.claude_sandbox = true;
+        config.environment.push((
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/srv/fleet-claude".to_string(),
+        ));
+        config.engine_view = EngineViewPolicy::Required(Ok(view.clone()));
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            config,
+        )
+        .with_clock(clock);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        let launch = store.launches().pop().expect("launched");
+        assert_eq!(launch.program, "/usr/bin/bwrap");
+        let asked = view.asked.lock().expect("asked");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].2, "/srv/fleet-claude");
+        assert!(
+            launch
+                .environment
+                .iter()
+                .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == "/srv/fleet-claude"),
+            "{:?}",
+            launch.environment
+        );
+        assert!(
+            launch
+                .arguments
+                .iter()
+                .any(|arg| arg.contains("/srv/fleet-claude/.credentials")),
+            "{:?}",
+            launch.arguments
         );
     }
 

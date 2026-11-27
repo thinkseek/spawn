@@ -6,10 +6,11 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use spawn_core::bridge::{
     Bridge, BridgeConfig, CLAUDE_DIR_SENSITIVE, CREDENTIAL_DENY, CROSS_SESSION_INBOUND,
-    LaunchEnvironment, ModelRelay, TickReport, claude_dir_deny, claude_dir_rules, claude_settings,
+    LaunchEnvironment, MODEL_SLOTS, ModelRelay, TickReport, claude_dir_deny, claude_dir_rules,
+    claude_settings,
 };
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::event::{ENGINE, EventKind, GlobalPosition, LaunchSummary, ModelProfile, NewEvent};
@@ -78,17 +79,26 @@ fn without_a_relay_the_settings_name_no_models() {
 }
 
 /// With none of its own models named, the default profile moves only the
-/// small model (the haiku slot and `ANTHROPIC_SMALL_FAST_MODEL`): Claude
-/// Code's own main model, and its token, stand.
+/// small model (the haiku slot and `ANTHROPIC_SMALL_FAST_MODEL`); every
+/// other slot is pinned empty (issue #79), so Claude Code's built-in model
+/// stands rather than one `~/.claude/settings.json` names. Its token stands.
 #[test]
 fn the_default_profile_moves_only_the_small_model() {
     let relay = relay("http://127.0.0.1:8791");
     let settings = claude_settings(Some(&relay), ModelProfile::Default);
     let env = env(&settings).expect("an env");
-    assert_eq!(env.len(), 3, "{env:?}");
+    assert_eq!(env.len(), 7, "{env:?}");
     assert_eq!(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8791");
     assert_eq!(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "deepseek-flash");
     assert_eq!(env["ANTHROPIC_SMALL_FAST_MODEL"], "deepseek-flash");
+    for slot in [
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+    ] {
+        assert_eq!(env[slot], "", "{slot}");
+    }
     assert_eq!(top_level_model(&settings), None, "{settings}");
     // The gateway's token comes from the user's own settings, which the
     // inline env merges over name by name: never set, so never emptied.
@@ -123,7 +133,7 @@ fn the_default_profile_pins_the_slots_the_relay_names() {
             .all(|name| !name.contains("TOKEN") && !name.contains("KEY"))
     );
 
-    // Slots alone, no main model: those slots, Claude Code's own main.
+    // Slots alone, no main model: those slots, Claude Code's built-in main.
     let slots = ModelRelay {
         default_model: None,
         opus_model: Some("claude-opus-5-5".to_string()),
@@ -132,7 +142,7 @@ fn the_default_profile_pins_the_slots_the_relay_names() {
     let settings = claude_settings(Some(&slots), ModelProfile::Default);
     let env = self::env(&settings).expect("an env");
     assert_eq!(top_level_model(&settings), None, "{settings}");
-    assert!(env.get("ANTHROPIC_MODEL").is_none(), "{env:?}");
+    assert_eq!(env["ANTHROPIC_MODEL"], "", "{env:?}");
     assert_eq!(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-sonnet-5-5");
     assert_eq!(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-5-5");
     assert_eq!(env["CLAUDE_CODE_SUBAGENT_MODEL"], "claude-haiku-5-5");
@@ -176,6 +186,61 @@ fn the_cheap_profile_moves_every_slot() {
         env.keys()
             .all(|name| !name.contains("TOKEN") && !name.contains("KEY"))
     );
+}
+
+/// Issue #79: whenever an engine goes through a relay, its inline
+/// `--settings` names every model slot, for every profile and every mix of
+/// configured names. Claude Code merges inline `env` over the user's
+/// `~/.claude/settings.json` name by name, so a slot named here is one an
+/// ambient edit of that file (an Ark base URL and a raw provider model)
+/// cannot take over; the merge is modelled here as Claude Code does it.
+#[test]
+fn every_model_slot_is_pinned_so_the_host_settings_cannot_drift_them() {
+    let ambient: serde_json::Map<String, Value> = [
+        (
+            "ANTHROPIC_BASE_URL",
+            "https://ark.cn-beijing.volces.com/api/compatible",
+        ),
+        ("ANTHROPIC_MODEL", "kimi-k3-1-pro-261024"),
+        ("ANTHROPIC_DEFAULT_OPUS_MODEL", "kimi-k3-1-pro-261024"),
+        ("ANTHROPIC_DEFAULT_SONNET_MODEL", "kimi-k3-1-pro-261024"),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "kimi-k3-1-pro-261024"),
+        ("ANTHROPIC_SMALL_FAST_MODEL", "kimi-k3-1-pro-261024"),
+        ("CLAUDE_CODE_SUBAGENT_MODEL", "kimi-k3-1-pro-261024"),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_string(), json!(value)))
+    .collect();
+    let relays = [
+        relay("http://127.0.0.1:8791"),
+        configured_relay("http://127.0.0.1:8791"),
+        ModelRelay {
+            default_model: None,
+            opus_model: Some("claude-opus-5-5".to_string()),
+            ..configured_relay("http://127.0.0.1:8791")
+        },
+    ];
+    for relay in &relays {
+        for profile in [ModelProfile::Default, ModelProfile::Cheap] {
+            let settings = claude_settings(Some(relay), profile);
+            let pinned = env(&settings).expect("an env");
+            for slot in MODEL_SLOTS {
+                assert!(pinned.contains_key(slot), "{slot} unpinned: {settings}");
+            }
+            let mut merged = ambient.clone();
+            merged.extend(pinned.clone());
+            assert_eq!(merged["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8791");
+            for slot in MODEL_SLOTS {
+                assert_ne!(merged[slot], "kimi-k3-1-pro-261024", "{slot}: {settings}");
+            }
+            // Still no credential: the token is the user's, never Spawn's.
+            assert!(
+                pinned
+                    .keys()
+                    .all(|name| !name.contains("TOKEN") && !name.contains("KEY"))
+            );
+        }
+    }
 }
 
 #[test]
@@ -337,7 +402,8 @@ impl Fleet {
         launch.arguments[at + 1].clone()
     }
 
-    /// The main model slot each launch set, in order (`None`: not set).
+    /// The main model slot each launch set, in order (`None`: not set, or
+    /// pinned empty for Claude Code's built-in model).
     fn main_models(&self) -> Vec<Option<String>> {
         self.store
             .launches()
@@ -346,6 +412,7 @@ impl Fleet {
                 env(&Self::settings(launch)).and_then(|env| {
                     env.get("ANTHROPIC_MODEL")
                         .and_then(Value::as_str)
+                        .filter(|model| !model.is_empty())
                         .map(str::to_string)
                 })
             })
@@ -593,7 +660,7 @@ fn every_launch_refuses_cross_session_peer_messages() {
     assert_eq!(cheap["ANTHROPIC_MODEL"], "deepseek-v4-pro");
     let default = env(&Fleet::settings(&through_relay[1])).expect("an env");
     assert_eq!(default["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "deepseek-flash");
-    assert!(default.get("ANTHROPIC_MODEL").is_none());
+    assert_eq!(default["ANTHROPIC_MODEL"], "");
     for launch in &launches[2..] {
         assert!(env(&Fleet::settings(launch)).is_none());
     }
