@@ -1003,13 +1003,14 @@ both_failed "(12)" "" "the x-amz-meta-spawn-seal of $bkey3 is not a backup key n
 # --- (10) a record whose key name is no name ---------------------------------------------------
 forged=$(rec_of "$bun3" | jq -c --arg key "${bkey3%.gpg}-114-forged.gpg" --arg bad "$not_a_name" '.sealed_with = $bad | .keys = [$key]')
 forged_event=$(sql "begin;
-    select pg_advisory_xact_lock(1399957335);
+    select pg_advisory_xact_lock(1399957401, hashtext('session_control'));
     insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
-                              kind, session_seq, recorded_at_ms)
+                              kind, session_seq, recorded_at_ms, commit_xid)
     values ('agent_control', 'session_control', null, 'control', null,
             jsonb_build_object('name', 'control.recorded', 'detail', jsonb_build_object('record', '$forged'::jsonb)),
             (select coalesce(max(session_seq), 0) + 1 from spawn_events where session_id = 'session_control'),
-            (floor(extract(epoch from clock_timestamp()) * 1000))::bigint)
+            (floor(extract(epoch from clock_timestamp()) * 1000))::bigint,
+            pg_current_xact_id())
     returning id;
     commit;" | grep -E '^[0-9]+$' | head -n 1)
 case "$forged_event" in '' | *[!0-9]*) harness "the forged record was not inserted: [$forged_event]" ;; esac

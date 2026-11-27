@@ -31,7 +31,175 @@ use spawn_core::time::SystemClock;
 use spawn_postgres::PostgresStore;
 
 mod common;
-use common::{admin, store, url};
+use common::{admin, url};
+
+/// Process-wide connection and cluster-snapshot budget for `tests/api.rs`.
+/// Keeps peak active PG connections strictly under `max_connections=30` (and
+/// its 27 non-superuser slots) under `--test-threads=12`, and isolates tests
+/// that hold cluster-wide shared-catalog DDL XIDs (`CREATE/DROP DATABASE|ROLE`)
+/// or deliberate fail-closed watermark probes so they cannot mask sibling tests'
+/// one-shot `read_global` assertions.
+const MAX_CONCURRENT_API_CASES: usize = 4;
+
+struct ApiBudgetState {
+    active_cases: usize,
+    exclusive: bool,
+    waiting_exclusive: usize,
+}
+
+static API_BUDGET: (std::sync::Mutex<ApiBudgetState>, std::sync::Condvar) = (
+    std::sync::Mutex::new(ApiBudgetState {
+        active_cases: 0,
+        exclusive: false,
+        waiting_exclusive: 0,
+    }),
+    std::sync::Condvar::new(),
+);
+
+#[derive(Clone, Copy)]
+struct ThreadBudget {
+    depth: usize,
+    exclusive: bool,
+}
+
+std::thread_local! {
+    static THREAD_BUDGET: std::cell::Cell<ThreadBudget> =
+        const { std::cell::Cell::new(ThreadBudget { depth: 0, exclusive: false }) };
+}
+
+struct ApiBudgetGuard {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl ApiBudgetGuard {
+    fn shared() -> Self {
+        let current = THREAD_BUDGET.get();
+        if current.depth > 0 {
+            THREAD_BUDGET.set(ThreadBudget {
+                depth: current.depth + 1,
+                exclusive: current.exclusive,
+            });
+            return Self {
+                _not_send: std::marker::PhantomData,
+            };
+        }
+        let (lock, cvar) = &API_BUDGET;
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.exclusive
+            || state.waiting_exclusive > 0
+            || state.active_cases >= MAX_CONCURRENT_API_CASES
+        {
+            state = cvar
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.active_cases += 1;
+        drop(state);
+        THREAD_BUDGET.set(ThreadBudget {
+            depth: 1,
+            exclusive: false,
+        });
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    fn exclusive() -> Self {
+        assert_eq!(
+            THREAD_BUDGET.get().depth,
+            0,
+            "exclusive API budget guard cannot nest inside another API budget guard"
+        );
+        let (lock, cvar) = &API_BUDGET;
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.waiting_exclusive += 1;
+        while state.exclusive || state.active_cases > 0 {
+            state = cvar
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.waiting_exclusive -= 1;
+        state.exclusive = true;
+        drop(state);
+        THREAD_BUDGET.set(ThreadBudget {
+            depth: 1,
+            exclusive: true,
+        });
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for ApiBudgetGuard {
+    fn drop(&mut self) {
+        let current = THREAD_BUDGET.get();
+        let remaining = current.depth.saturating_sub(1);
+        THREAD_BUDGET.set(ThreadBudget {
+            depth: remaining,
+            exclusive: if remaining == 0 {
+                false
+            } else {
+                current.exclusive
+            },
+        });
+        if remaining == 0 {
+            let (lock, cvar) = &API_BUDGET;
+            let mut state = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current.exclusive {
+                state.exclusive = false;
+            } else {
+                state.active_cases = state.active_cases.saturating_sub(1);
+            }
+            drop(state);
+            cvar.notify_all();
+        }
+    }
+}
+
+struct ApiSchema {
+    inner: common::Schema,
+    // Field drop order runs `common::Schema::drop` (`DROP SCHEMA`) before releasing `_budget`.
+    _budget: ApiBudgetGuard,
+}
+
+impl ApiSchema {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+}
+
+impl std::ops::Deref for ApiSchema {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::fmt::Display for ApiSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+fn store(case: &str) -> (PostgresStore, ApiSchema) {
+    let budget = ApiBudgetGuard::shared();
+    let (store, schema) = common::store(case);
+    (
+        store,
+        ApiSchema {
+            inner: schema,
+            _budget: budget,
+        },
+    )
+}
 
 fn agent() -> AgentId {
     AgentId::new("agent_one").expect("valid agent")
@@ -152,8 +320,11 @@ fn committed_duplicates_do_not_wait_for_the_append_lock() {
     let mut holder = admin(&schema);
     let mut holding = holder.transaction().expect("begin");
     holding
-        .execute("select pg_advisory_xact_lock(1399957335)", &[])
-        .expect("hold the append lock");
+        .execute(
+            "select pg_advisory_xact_lock(1399957401, hashtext('session_one'))",
+            &[],
+        )
+        .expect("hold session_one L3 append lock");
 
     let worker_schema = schema.to_string();
     let worker = std::thread::spawn(move || -> Result<_, postgres::Error> {
@@ -256,8 +427,11 @@ fn two_commands_of_a_session_are_never_leased_at_once_when_their_submissions_rac
     let mut holder = admin(&schema);
     let mut holding = holder.transaction().expect("begin");
     holding
-        .execute("select pg_advisory_xact_lock(1399957335)", &[])
-        .expect("hold the append lock");
+        .execute(
+            "select pg_advisory_xact_lock(1399957401, hashtext('session_one'))",
+            &[],
+        )
+        .expect("hold session_one L3 append lock");
 
     // A submission starts and waits for it, in a transaction it keeps open.
     let (submitted_tx, submitted) = std::sync::mpsc::channel::<(i32, Option<i64>)>();
@@ -1616,6 +1790,7 @@ fn a_gateway_submission_returns_its_own_command() {
 
 #[test]
 fn views_are_closed_to_other_roles() {
+    let _budget = ApiBudgetGuard::exclusive();
     let (_store, schema) = store("revoke");
     let mut client = admin(&schema);
     // Roles are the server's, not the schema's: named by the schema, which
@@ -1659,6 +1834,7 @@ fn views_are_closed_to_other_roles() {
 
 #[test]
 fn a_login_without_grants_reads_no_command_ids() {
+    let _budget = ApiBudgetGuard::exclusive();
     let (store, schema) = store("public_ids");
     store
         .submit(
@@ -2981,6 +3157,7 @@ fn respelling_moves_any_host_to_the_parameters() {
 
 #[test]
 fn a_cluster_is_known_by_its_identity_not_its_spelling() {
+    let _budget = ApiBudgetGuard::shared();
     let url = common::url();
     let identity = spawn_postgres::cluster_identity(&url).expect("identity");
     assert!(!identity.is_empty());
@@ -3077,6 +3254,7 @@ fn sweep(maintenance: &mut Client, prefix: &str) -> String {
 
 #[test]
 fn a_sweep_drops_only_the_logins_of_gone_databases_under_its_prefix() {
+    let _budget = ApiBudgetGuard::exclusive();
     let base = url();
     let (server, _) = base.rsplit_once('/').expect("a database URL");
     let nanos = std::time::SystemTime::now()
@@ -3317,6 +3495,7 @@ fn logins_of(client: &mut Client, name: &str) -> i64 {
 /// took (a live 007 lost its database and failed: review of task 154).
 #[test]
 fn a_sweep_drops_a_leftover_database_only_once_it_is_older_than_its_setting() {
+    let _budget = ApiBudgetGuard::exclusive();
     let base = url();
     let (server, _) = base.rsplit_once('/').expect("a database URL");
     let nanos = std::time::SystemTime::now()
@@ -3405,6 +3584,7 @@ fn a_sweep_drops_a_leftover_database_only_once_it_is_older_than_its_setting() {
 
 #[test]
 fn migrations_racing_on_one_server_all_succeed() {
+    let _budget = ApiBudgetGuard::exclusive();
     // Roles and grants are shared by the whole server: parallel migrations of
     // separate databases used to fail with "tuple concurrently updated".
     let base = url();
@@ -4078,4 +4258,1171 @@ fn the_reader_reads_the_whole_log_from_a_time_without_screen_text() {
     assert_eq!(before(1_030_000), GlobalPosition(2));
     assert_eq!(before(1_035_000), GlobalPosition(3));
     assert_eq!(before(9_000_000), GlobalPosition(4), "nothing that recent");
+}
+
+#[derive(Clone)]
+enum StressOp {
+    Submit {
+        agent: AgentId,
+        session: SessionId,
+        key: IdempotencyKey,
+    },
+    Append {
+        agent: AgentId,
+        session: SessionId,
+    },
+}
+
+struct StressReport {
+    total_ops: usize,
+    total_events: usize,
+    elapsed_ms: f64,
+    ops_per_sec: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+}
+
+fn percentile_ms(sorted_us: &[u64], numerator: usize, denominator: usize) -> f64 {
+    if sorted_us.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted_us.len() - 1) * numerator) / denominator;
+    f64::from(u32::try_from(sorted_us[idx]).unwrap_or(u32::MAX)) / 1000.0
+}
+
+fn build_stress_queue(
+    case: &str,
+    sessions: usize,
+    appends_per_session: usize,
+) -> std::collections::VecDeque<StressOp> {
+    let mut queue = std::collections::VecDeque::with_capacity(sessions * (1 + appends_per_session));
+    for round in 0..=appends_per_session {
+        for s in 0..sessions {
+            let agent = AgentId::new(format!("agent_{case}_{s}")).expect("valid agent");
+            let session = SessionId::new(format!("session_{case}_{s}")).expect("valid session");
+            if round == 0 {
+                let key = IdempotencyKey::new(format!("k_{case}_{s}_0")).expect("valid key");
+                queue.push_back(StressOp::Submit {
+                    agent,
+                    session,
+                    key,
+                });
+            } else {
+                queue.push_back(StressOp::Append { agent, session });
+            }
+        }
+    }
+    queue
+}
+
+fn record_consumed_batch(
+    batch: Vec<spawn_core::event::EventRecord>,
+    seen_ids: &mut std::collections::BTreeSet<u64>,
+    per_session: &mut std::collections::BTreeMap<String, Vec<u64>>,
+    duplicates: &mut usize,
+) {
+    for record in batch {
+        if !seen_ids.insert(record.position.0) {
+            *duplicates += 1;
+        }
+        per_session
+            .entry(record.event.session_id.as_str().to_string())
+            .or_default()
+            .push(record.session_seq.0);
+    }
+}
+
+type ReaderOutcome = (
+    usize,
+    usize,
+    std::collections::BTreeMap<String, Vec<u64>>,
+    usize,
+);
+
+fn spawn_stress_reader(
+    reader: PostgresStore,
+    done: Arc<std::sync::atomic::AtomicBool>,
+    barrier: Arc<std::sync::Barrier>,
+    read_batch: usize,
+    expected_events: usize,
+) -> std::thread::JoinHandle<ReaderOutcome> {
+    std::thread::spawn(move || {
+        let mut cursor = GlobalPosition(0);
+        let mut seen_ids = std::collections::BTreeSet::new();
+        let mut duplicates = 0usize;
+        let mut per_session = std::collections::BTreeMap::new();
+        let mut read_errors = 0usize;
+
+        barrier.wait();
+        loop {
+            let drained_hint = done.load(std::sync::atomic::Ordering::Acquire);
+            if let Ok(batch) = reader.read_global(cursor, read_batch) {
+                if let Some(last) = batch.last() {
+                    cursor = last.position;
+                }
+                let count = batch.len();
+                record_consumed_batch(batch, &mut seen_ids, &mut per_session, &mut duplicates);
+                if drained_hint && count < read_batch && seen_ids.len() >= expected_events {
+                    let extra = reader.read_global(cursor, read_batch).expect("final read");
+                    record_consumed_batch(extra, &mut seen_ids, &mut per_session, &mut duplicates);
+                    break;
+                }
+                if count == 0 {
+                    std::thread::yield_now();
+                }
+            } else {
+                read_errors += 1;
+                if drained_hint {
+                    break;
+                }
+            }
+        }
+        (seen_ids.len(), duplicates, per_session, read_errors)
+    })
+}
+
+fn spawn_stress_writer(
+    client: PostgresStore,
+    work: Arc<std::sync::Mutex<std::collections::VecDeque<StressOp>>>,
+    barrier: Arc<std::sync::Barrier>,
+    principal: Principal,
+) -> std::thread::JoinHandle<(Vec<u64>, Vec<String>)> {
+    std::thread::spawn(move || {
+        let mut latencies_us = Vec::new();
+        let mut errors = Vec::new();
+        barrier.wait();
+        loop {
+            let next = work.lock().expect("work lock").pop_front();
+            let Some(op) = next else {
+                break;
+            };
+            let t0 = std::time::Instant::now();
+            let res = match op {
+                StressOp::Submit {
+                    agent,
+                    session,
+                    key,
+                } => client
+                    .submit(
+                        &principal,
+                        &Submission {
+                            agent_id: agent,
+                            session_id: session,
+                            idempotency_key: key,
+                            action: CommandAction::Stop,
+                        },
+                    )
+                    .map(|_| ()),
+                StressOp::Append { agent, session } => client
+                    .append(NewEvent {
+                        agent_id: agent,
+                        session_id: session,
+                        execution_id: None,
+                        source: Source::Observer,
+                        source_event_id: None,
+                        kind: EventKind::MessageReceived,
+                    })
+                    .map(|_| ()),
+            };
+            let elapsed_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+            match res {
+                Ok(()) => latencies_us.push(elapsed_us),
+                Err(err) => errors.push(err.to_string()),
+            }
+        }
+        (latencies_us, errors)
+    })
+}
+
+static STRESS_WORKLOAD_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn run_concurrent_session_workload(
+    case: &str,
+    sessions: usize,
+    appends_per_session: usize,
+    writer_pool_size: usize,
+    read_batch: usize,
+) -> StressReport {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Barrier, Mutex};
+    use std::time::Instant;
+
+    let _stress_gate = STRESS_WORKLOAD_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _budget = ApiBudgetGuard::exclusive();
+
+    let (setup_store, schema) = store(case);
+    drop(setup_store);
+    let schema_conn = common::schema_url(&schema);
+
+    let queue = build_stress_queue(case, sessions, appends_per_session);
+    let total_ops = queue.len();
+    let expected_events = sessions * (1 + appends_per_session);
+    let work = Arc::new(Mutex::new(queue));
+
+    // Pre-open bounded writer pool + 1 continuous reader (= writer_pool_size + 1 <= max_connections).
+    let writers: Vec<_> = (0..writer_pool_size)
+        .map(|_| PostgresStore::connect(&schema_conn).expect("writer connect"))
+        .collect();
+    let reader = PostgresStore::connect(&schema_conn).expect("reader connect");
+
+    let writers_done = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(writer_pool_size + 2));
+    let reader_handle = spawn_stress_reader(
+        reader,
+        Arc::clone(&writers_done),
+        Arc::clone(&barrier),
+        read_batch,
+        expected_events,
+    );
+
+    let principal = Principal::new("tester").expect("valid principal");
+    let writer_handles: Vec<_> = writers
+        .into_iter()
+        .map(|client| {
+            spawn_stress_writer(
+                client,
+                Arc::clone(&work),
+                Arc::clone(&barrier),
+                principal.clone(),
+            )
+        })
+        .collect();
+
+    barrier.wait();
+    let wall_start = Instant::now();
+    let mut all_latencies_us = Vec::with_capacity(total_ops);
+    let mut write_errors = Vec::new();
+    for handle in writer_handles {
+        let (mut lats, mut errs) = handle.join().expect("writer thread");
+        all_latencies_us.append(&mut lats);
+        write_errors.append(&mut errs);
+    }
+    writers_done.store(true, Ordering::Release);
+    let (consumed, duplicates, per_session, read_errors) =
+        reader_handle.join().expect("reader thread");
+    let total_elapsed = wall_start.elapsed();
+
+    assert!(
+        write_errors.is_empty(),
+        "{case}: expected 0 write/deadlock/serialization errors, got: {:?}",
+        &write_errors[..write_errors.len().min(5)]
+    );
+    assert_eq!(read_errors, 0, "{case}: expected 0 read errors");
+    assert_eq!(duplicates, 0, "{case}: expected 0 duplicate events");
+    assert_eq!(
+        consumed, expected_events,
+        "{case}: expected {expected_events} consumed events, got {consumed}"
+    );
+    assert_eq!(
+        per_session.len(),
+        sessions,
+        "{case}: expected all {sessions} sessions"
+    );
+    let want_seqs: Vec<u64> = (1..=u64::try_from(1 + appends_per_session).expect("u64")).collect();
+    for (sess, seqs) in &per_session {
+        assert_eq!(
+            seqs, &want_seqs,
+            "{case}: session {sess} lost or reordered events: {seqs:?}"
+        );
+    }
+
+    all_latencies_us.sort_unstable();
+    let elapsed_ms = total_elapsed.as_secs_f64() * 1000.0;
+    let ops_per_sec =
+        f64::from(u32::try_from(total_ops).unwrap_or(u32::MAX)) / total_elapsed.as_secs_f64();
+    let report = StressReport {
+        total_ops,
+        total_events: expected_events,
+        elapsed_ms,
+        ops_per_sec,
+        p50_ms: percentile_ms(&all_latencies_us, 50, 100),
+        p95_ms: percentile_ms(&all_latencies_us, 95, 100),
+        p99_ms: percentile_ms(&all_latencies_us, 99, 100),
+    };
+    eprintln!(
+        "STRESS_RESULT {case}: sessions={sessions} ops={} events={} elapsed_ms={:.2} tps={:.1} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3}",
+        report.total_ops,
+        report.total_events,
+        report.elapsed_ms,
+        report.ops_per_sec,
+        report.p50_ms,
+        report.p95_ms,
+        report.p99_ms,
+    );
+    report
+}
+
+#[test]
+fn stress_100_concurrent_sessions_mixed_submit_append_and_read_global() {
+    let report = run_concurrent_session_workload("stress100", 100, 5, 6, 64);
+    assert_eq!(report.total_ops, 600);
+    assert_eq!(report.total_events, 600);
+}
+
+#[test]
+fn stress_1000_session_burst_writes_and_concurrent_consumption() {
+    let report = run_concurrent_session_workload("stress1000", 1000, 2, 6, 128);
+    assert_eq!(report.total_ops, 3000);
+    assert_eq!(report.total_events, 3000);
+}
+
+#[test]
+fn different_sessions_and_missions_append_concurrently_without_blocking() {
+    let (store, schema) = store("sharded_locks");
+    let m1 = store
+        .mission_add("M1", &serde_json::json!([]), "human")
+        .expect("m1");
+    let m2 = store
+        .mission_add("M2", &serde_json::json!([]), "human")
+        .expect("m2");
+
+    let mut holder = admin(&schema);
+    let mut hold = holder.transaction().expect("begin");
+    hold.execute(
+        "select pg_advisory_xact_lock(1399957401, hashtext('session_one')),
+                pg_advisory_xact_lock(1399957402, spawn_mission_lock_key($1))",
+        &[&m1],
+    )
+    .expect("hold session_one L3 and mission m1 L2 locks");
+
+    let worker_schema = schema.to_string();
+    let handle = std::thread::spawn(move || -> Result<(), postgres::Error> {
+        let mut other = admin(&worker_schema);
+        other.execute("set lock_timeout = '1s'", &[])?;
+        other.query_one(
+            "select out_id from spawn_submit('human', 'k_s2', 'agent_two', 'session_two', '{\"type\":\"stop\"}')",
+            &[],
+        )?;
+        other.query_one(
+            "select out_id from spawn_append('agent_two', 'session_two', null, 'observer', 'obs:1', '{\"name\":\"message.received\"}'::jsonb)",
+            &[],
+        )?;
+        other.query_one(
+            "select spawn_task_assign($1, 'ephemeral', 'worker', 'parallel mission task')",
+            &[&m2],
+        )?;
+        Ok(())
+    });
+    let outcome = handle.join().expect("worker thread joins");
+    hold.commit().expect("release holder locks");
+    outcome.expect("unrelated session and mission must not wait behind L3/L2 holds");
+}
+
+#[test]
+fn xid8_watermark_recovers_out_of_order_lower_id_commit_without_gaps_or_duplicates() {
+    let (store, schema) = store("xid8_ooo_lower_id");
+    let reader_url =
+        spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader").expect("reader url");
+    let reader = PostgresStore::connect(&reader_url).expect("reader connect");
+
+    let anchor = store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_anchor").expect("agent"),
+            session_id: SessionId::new("session_anchor").expect("session"),
+            execution_id: None,
+            source: Source::Observer,
+            source_event_id: None,
+            kind: EventKind::MessageReceived,
+        })
+        .expect("anchor append");
+    let mut cursor = anchor.record.position;
+
+    // T1 reserves lower event id via nextval BEFORE acquiring an XID (so XID is not yet assigned).
+    let mut t1_conn = admin(&schema);
+    let mut t1 = t1_conn.transaction().expect("begin t1");
+    let id_t1: i64 = t1
+        .query_one(
+            "select nextval(pg_get_serial_sequence('spawn_events', 'id'))",
+            &[],
+        )
+        .expect("reserve lower id")
+        .get(0);
+    let xid_before: Option<String> = t1
+        .query_one("select pg_current_xact_id_if_assigned()::text", &[])
+        .expect("check unassigned xid")
+        .get(0);
+    assert!(xid_before.is_none(), "nextval must not assign an XID yet");
+
+    // T2 takes higher id (id_t1 + 1) and earlier commit_xid, and commits first.
+    let mut t2_conn = admin(&schema);
+    let mut t2 = t2_conn.transaction().expect("begin t2");
+    let id_t2: i64 = t2
+        .query_one(
+            "select out_id from spawn_append(
+                 'agent_b', 'session_b', null, 'observer', 'ooo_b_1',
+                 '{\"name\":\"message.received\"}'::jsonb)",
+            &[],
+        )
+        .expect("t2 append")
+        .get(0);
+    t2.commit().expect("t2 commit");
+    assert!(id_t1 < id_t2, "expected T1 id {id_t1} < T2 id {id_t2}");
+
+    // Global reader reads once after T2 commits -> MUST get id_t2 cleanly.
+    let g1 = store.read_global(cursor, 100).expect("read_global 1");
+    let l1 = reader.log_after(cursor, 100).expect("log_after 1");
+    let pos_t2 = GlobalPosition(u64::try_from(id_t2).expect("u64"));
+    assert_eq!(g1.iter().map(|r| r.position).collect::<Vec<_>>(), [pos_t2]);
+    assert_eq!(l1.iter().map(|e| e.position).collect::<Vec<_>>(), [pos_t2]);
+    cursor = pos_t2;
+
+    // Now T1 assigns commit_xid > T2's commit_xid, inserts the lower id_t1 row, and commits.
+    t1.execute(
+        "select pg_advisory_xact_lock(1399957401, hashtext('session_a'))",
+        &[],
+    )
+    .expect("t1 session lock");
+    t1.execute(
+        "insert into spawn_agent_sessions (agent_id, session_id)
+         values ('agent_a', 'session_a') on conflict do nothing",
+        &[],
+    )
+    .expect("t1 agent session");
+    t1.execute(
+        "insert into spawn_events
+             (id, agent_id, session_id, execution_id, source, source_event_id,
+              kind, session_seq, recorded_at_ms, commit_xid)
+         values
+             ($1, 'agent_a', 'session_a', null, 'observer', 'ooo_a_1',
+              '{\"name\":\"message.received\"}'::jsonb, 1,
+              spawn_now_ms(), pg_current_xact_id())",
+        &[&id_t1],
+    )
+    .expect("t1 insert lower id");
+    t1.execute("select spawn_session_fold('session_a')", &[])
+        .expect("t1 fold");
+    t1.commit().expect("t1 commit");
+
+    // Global reader reads again after T1 commits -> MUST recover lower id_t1 with zero misses.
+    let pos_t1 = GlobalPosition(u64::try_from(id_t1).expect("u64"));
+    let g2 = store.read_global(cursor, 100).expect("read_global 2");
+    let l2 = reader.log_after(cursor, 100).expect("log_after 2");
+    assert_eq!(g2.iter().map(|r| r.position).collect::<Vec<_>>(), [pos_t1]);
+    assert_eq!(l2.iter().map(|e| e.position).collect::<Vec<_>>(), [pos_t1]);
+    cursor = pos_t1;
+
+    // Subsequent read must return empty -> zero duplicates.
+    assert!(
+        store
+            .read_global(cursor, 100)
+            .expect("read_global 3")
+            .is_empty()
+    );
+    assert!(
+        reader
+            .log_after(cursor, 100)
+            .expect("log_after 3")
+            .is_empty()
+    );
+}
+
+#[test]
+fn xid8_watermark_holds_back_higher_xid_while_lower_xid_is_uncommitted() {
+    let (store, schema) = store("xid8_xmin_barrier");
+    let reader_url =
+        spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader").expect("reader url");
+    let reader = PostgresStore::connect(&reader_url).expect("reader connect");
+
+    let anchor = store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_base").expect("agent"),
+            session_id: SessionId::new("session_base").expect("session"),
+            execution_id: None,
+            source: Source::Observer,
+            source_event_id: None,
+            kind: EventKind::MessageReceived,
+        })
+        .expect("anchor append");
+    let cursor = anchor.record.position;
+
+    // T1 takes lower xid + lower id and pauses BEFORE commit.
+    let mut t1_conn = admin(&schema);
+    let mut t1 = t1_conn.transaction().expect("begin t1");
+    let id_1: i64 = t1
+        .query_one(
+            "select out_id from spawn_append(
+                 'agent_x1', 'session_x1', null, 'observer', 'k_x1',
+                 '{\"name\":\"message.received\"}'::jsonb)",
+            &[],
+        )
+        .expect("t1 append")
+        .get(0);
+
+    // T2 takes higher xid + higher id and commits immediately while T1 stays open.
+    let mut t2_conn = admin(&schema);
+    let mut t2 = t2_conn.transaction().expect("begin t2");
+    let id_2: i64 = t2
+        .query_one(
+            "select out_id from spawn_append(
+                 'agent_x2', 'session_x2', null, 'observer', 'k_x2',
+                 '{\"name\":\"message.received\"}'::jsonb)",
+            &[],
+        )
+        .expect("t2 append")
+        .get(0);
+    t2.commit().expect("t2 commit");
+    assert!(id_1 < id_2);
+
+    // Watermark must NOT advance past uncommitted T1!
+    assert!(
+        store
+            .read_global(cursor, 100)
+            .expect("read_global")
+            .is_empty()
+    );
+    assert!(reader.log_after(cursor, 100).expect("log_after").is_empty());
+    assert_eq!(
+        reader
+            .position_before(spawn_core::time::Timestamp(i64::MAX))
+            .expect("last position"),
+        cursor
+    );
+
+    t1.commit().expect("t1 commit");
+
+    let p1 = GlobalPosition(u64::try_from(id_1).expect("u64"));
+    let p2 = GlobalPosition(u64::try_from(id_2).expect("u64"));
+    let g = store
+        .read_global(cursor, 100)
+        .expect("read_global after commit");
+    let l = reader
+        .log_after(cursor, 100)
+        .expect("log_after after commit");
+    assert_eq!(g.iter().map(|r| r.position).collect::<Vec<_>>(), [p1, p2]);
+    assert_eq!(l.iter().map(|e| e.position).collect::<Vec<_>>(), [p1, p2]);
+    assert!(store.read_global(p2, 100).expect("tail empty").is_empty());
+}
+
+fn assert_early_xid_watermark_held_and_recovered<A, F>(
+    store: &PostgresStore,
+    reader: &PostgresStore,
+    schema: &str,
+    cursor0: GlobalPosition,
+    key_suffix: &str,
+    acquire_xa: A,
+    finish_ta: F,
+) where
+    A: FnOnce(&mut postgres::Transaction<'_>),
+    F: FnOnce(&mut postgres::Transaction<'_>) -> i64,
+{
+    let mut ca = admin(schema);
+    let mut ta = ca.transaction().expect("begin ta");
+    acquire_xa(&mut ta);
+    let xa: Option<String> = ta
+        .query_one("select pg_current_xact_id_if_assigned()::text", &[])
+        .expect("xa")
+        .get(0);
+    assert!(xa.is_some(), "T_a must hold an assigned xid");
+
+    // T_b appends in another session with x_b > x_a and commits while T_a stays open.
+    let mut cb = admin(schema);
+    let mut tb = cb.transaction().expect("begin tb");
+    let key_b = format!("k_{key_suffix}_b");
+    let id_b: i64 = tb
+        .query_one(
+            "select out_id from spawn_append(
+                 'agent_b', 'session_b', null, 'observer', $1,
+                 '{\"name\":\"message.received\"}'::jsonb)",
+            &[&key_b],
+        )
+        .expect("tb append")
+        .get(0);
+    tb.commit().expect("tb commit");
+
+    // Readers MUST hold back id_b while x_a is in flight (fail-closed watermark).
+    assert!(
+        store
+            .read_global(cursor0, 100)
+            .expect("rg empty")
+            .is_empty()
+    );
+    assert!(reader.log_after(cursor0, 100).expect("la empty").is_empty());
+    assert_eq!(
+        reader
+            .position_before(spawn_core::time::Timestamp(i64::MAX))
+            .expect("last position held back"),
+        cursor0
+    );
+
+    let id_a = finish_ta(&mut ta);
+    ta.commit().expect("ta commit");
+    assert!(id_a > id_b);
+
+    let pos_a = GlobalPosition(u64::try_from(id_a).expect("u64"));
+    let pos_b = GlobalPosition(u64::try_from(id_b).expect("u64"));
+    let g = store.read_global(cursor0, 100).expect("rg after commit");
+    let l = reader.log_after(cursor0, 100).expect("la after commit");
+    assert_eq!(
+        g.iter().map(|r| r.position).collect::<Vec<_>>(),
+        [pos_a, pos_b]
+    );
+    assert_eq!(
+        l.iter().map(|e| e.position).collect::<Vec<_>>(),
+        [pos_a, pos_b]
+    );
+    assert!(store.read_global(pos_b, 100).expect("rg tail").is_empty());
+    assert!(reader.log_after(pos_b, 100).expect("la tail").is_empty());
+}
+
+fn setup_anchor_and_reader(
+    case: &str,
+) -> (PostgresStore, PostgresStore, ApiSchema, GlobalPosition) {
+    let (store, schema) = store(case);
+    let reader_url =
+        spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader").expect("reader url");
+    let reader = PostgresStore::connect(&reader_url).expect("reader connect");
+    let anchor = store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_anchor").expect("agent"),
+            session_id: SessionId::new("session_anchor").expect("session"),
+            execution_id: None,
+            source: Source::Observer,
+            source_event_id: None,
+            kind: EventKind::MessageReceived,
+        })
+        .expect("anchor append");
+    let cursor0 = anchor.record.position;
+    (store, reader, schema, cursor0)
+}
+
+#[test]
+fn xid8_watermark_holds_back_commit_during_for_update_row_lock_on_spawn_events() {
+    let (store, reader, schema, cursor0) = setup_anchor_and_reader("xid8_for_update_events");
+    let cursor0_i64 = i64::try_from(cursor0.0).expect("cursor0 fits i64");
+
+    assert_early_xid_watermark_held_and_recovered(
+        &store,
+        &reader,
+        &schema,
+        cursor0,
+        "for_upd_events",
+        |ta| {
+            let locked: i64 = ta
+                .query_one(
+                    "select id from spawn_events where id = $1 for update",
+                    &[&cursor0_i64],
+                )
+                .expect("for update")
+                .get(0);
+            assert_eq!(locked, cursor0_i64);
+        },
+        |ta| {
+            ta.query_one(
+                "select out_id from spawn_append(
+                     'agent_a', 'session_a', null, 'observer', 'k_for_upd_a',
+                     '{\"name\":\"message.received\"}'::jsonb)",
+                &[],
+            )
+            .expect("ta append")
+            .get(0)
+        },
+    );
+}
+
+#[test]
+fn xid8_watermark_holds_back_commit_during_spawn_commands_for_update_and_spawn_finish() {
+    let (store, schema) = store("xid8_for_update_commands");
+    let reader_url =
+        spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader").expect("reader url");
+    let reader = PostgresStore::connect(&reader_url).expect("reader connect");
+
+    let mut setup = admin(&schema);
+    let cmd_a: i64 = setup
+        .query_one(
+            "select out_id from spawn_submit(
+                 'human', 'k_cmd_for_upd_a', 'agent_a', 'session_a',
+                 '{\"type\":\"stop\"}'::jsonb)",
+            &[],
+        )
+        .expect("submit cmd_a")
+        .get(0);
+    let accepted_key = format!("cmd_{cmd_a}:accepted");
+    let accepted_id: i64 = setup
+        .query_one(
+            "select id from spawn_events where source_event_id = $1",
+            &[&accepted_key],
+        )
+        .expect("accepted event id")
+        .get(0);
+    let cursor0 = GlobalPosition(u64::try_from(accepted_id).expect("u64"));
+    drop(setup);
+
+    assert_early_xid_watermark_held_and_recovered(
+        &store,
+        &reader,
+        &schema,
+        cursor0,
+        "for_upd_commands",
+        |ta| {
+            let locked: i64 = ta
+                .query_one(
+                    "select id from spawn_commands where id = $1 for update",
+                    &[&cmd_a],
+                )
+                .expect("commands for update")
+                .get(0);
+            assert_eq!(locked, cmd_a);
+        },
+        |ta| {
+            let finished: String = ta
+                .query_one("select spawn_finish($1, 0, true, null)", &[&cmd_a])
+                .expect("spawn_finish")
+                .get(0);
+            assert_eq!(finished, "done");
+            let finished_key = format!("cmd_{cmd_a}:finished");
+            ta.query_one(
+                "select id from spawn_events where source_event_id = $1",
+                &[&finished_key],
+            )
+            .expect("finished event id")
+            .get(0)
+        },
+    );
+}
+
+#[test]
+fn xid8_watermark_holds_back_commit_during_bare_pg_current_xact_id_without_relation_locks() {
+    let _budget = ApiBudgetGuard::exclusive();
+    let (store, reader, schema, cursor0) = setup_anchor_and_reader("xid8_bare_xact_id");
+
+    assert_early_xid_watermark_held_and_recovered(
+        &store,
+        &reader,
+        &schema,
+        cursor0,
+        "bare_xact_id",
+        |ta| {
+            let _: String = ta
+                .query_one("select pg_current_xact_id()::text", &[])
+                .expect("assign bare xid")
+                .get(0);
+            let rel_locks: i64 = ta
+                .query_one(
+                    "select count(*)
+                       from pg_locks
+                      where pid = pg_backend_pid()
+                        and locktype = 'relation'
+                        and mode <> 'AccessShareLock'",
+                    &[],
+                )
+                .expect("count relation locks")
+                .get(0);
+            assert_eq!(
+                rel_locks, 0,
+                "bare pg_current_xact_id must hold zero non-AccessShare relation locks"
+            );
+        },
+        |ta| {
+            ta.query_one(
+                "select out_id from spawn_append(
+                     'agent_a', 'session_a', null, 'observer', 'k_bare_xact_a',
+                     '{\"name\":\"message.received\"}'::jsonb)",
+                &[],
+            )
+            .expect("ta append")
+            .get(0)
+        },
+    );
+}
+
+#[test]
+fn xid8_watermark_holds_back_commit_during_create_temp_table_and_insert_before_append() {
+    let _budget = ApiBudgetGuard::exclusive();
+    let (store, reader, schema, cursor0) = setup_anchor_and_reader("xid8_temp_table");
+
+    assert_early_xid_watermark_held_and_recovered(
+        &store,
+        &reader,
+        &schema,
+        cursor0,
+        "temp_table",
+        |ta| {
+            ta.batch_execute(
+                "create temp table tt (id int) on commit drop;
+                 insert into tt values (1);",
+            )
+            .expect("create temp table and insert");
+        },
+        |ta| {
+            ta.query_one(
+                "select out_id from spawn_append(
+                     'agent_a', 'session_a', null, 'observer', 'k_temp_table_a',
+                     '{\"name\":\"message.received\"}'::jsonb)",
+                &[],
+            )
+            .expect("ta append")
+            .get(0)
+        },
+    );
+}
+
+#[test]
+fn xid8_watermark_holds_back_commit_during_create_table_in_schema_before_append() {
+    let _budget = ApiBudgetGuard::exclusive();
+    let (store, reader, schema, cursor0) = setup_anchor_and_reader("xid8_new_table");
+
+    assert_early_xid_watermark_held_and_recovered(
+        &store,
+        &reader,
+        &schema,
+        cursor0,
+        "new_table",
+        |ta| {
+            ta.batch_execute(
+                "create table if not exists review_new_feature (id bigint primary key, note text);",
+            )
+            .expect("create uncommitted table in schema");
+        },
+        |ta| {
+            ta.query_one(
+                "select out_id from spawn_append(
+                     'agent_a', 'session_a', null, 'observer', 'k_new_table_a',
+                     '{\"name\":\"message.received\"}'::jsonb)",
+                &[],
+            )
+            .expect("ta append")
+            .get(0)
+        },
+    );
+}
+
+#[test]
+fn init_db_migration_lock_excludes_concurrent_append_without_blocking_other_schemas() {
+    let (store_a, reader_a, schema_a, cursor_a) = setup_anchor_and_reader("l0_mig_a");
+    let (store_b, reader_b, schema_b, cursor_b) = setup_anchor_and_reader("l0_mig_b");
+
+    let mut mig_conn = admin(&schema_a);
+    let mut mig_tx = mig_conn.transaction().expect("mig tx");
+    mig_tx
+        .batch_execute(
+            "select pg_advisory_xact_lock(
+                 1399957400,
+                 (
+                     ((quote_ident(current_schema())::regnamespace)::oid::bigint
+                      - case when (quote_ident(current_schema())::regnamespace)::oid::bigint >= 2147483648
+                             then 4294967296 else 0 end)::integer
+                 )
+             );
+             create table if not exists l0_probe_table (id int);",
+        )
+        .expect("acquire L0 exclusive and assign xid in schema_a");
+
+    let appended_b = store_b
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_b").expect("agent"),
+            session_id: SessionId::new("session_b").expect("session"),
+            execution_id: None,
+            source: Source::Observer,
+            source_event_id: Some("k_l0_other_schema".to_string()),
+            kind: EventKind::MessageReceived,
+        })
+        .expect("schema_b append must not block on schema_a L0");
+    let pos_b = appended_b.record.position;
+    let g_b = store_b.read_global(cursor_b, 100).expect("rg schema_b");
+    let l_b = reader_b.log_after(cursor_b, 100).expect("la schema_b");
+    assert_eq!(g_b.iter().map(|r| r.position).collect::<Vec<_>>(), [pos_b]);
+    assert_eq!(l_b.iter().map(|e| e.position).collect::<Vec<_>>(), [pos_b]);
+    drop(reader_b);
+    drop(store_b);
+    drop(schema_b);
+
+    let schema_a_name = schema_a.to_string();
+    let schema_a_for_thread = schema_a_name.clone();
+    let appender = std::thread::spawn(move || -> i64 {
+        let mut conn = admin(&schema_a_for_thread);
+        conn.query_one(
+            "select out_id from spawn_append(
+                 'agent_a', 'session_a', null, 'observer', 'k_l0_blocked_a',
+                 '{\"name\":\"message.received\"}'::jsonb)",
+            &[],
+        )
+        .expect("schema_a append after L0 release")
+        .get(0)
+    });
+
+    let mut watcher = admin(&schema_a_name);
+    let started = std::time::Instant::now();
+    loop {
+        let waiting: bool = watcher
+            .query_one(
+                "select exists (
+                     select 1 from pg_locks l
+                      where l.locktype = 'advisory'
+                        and l.database = (select oid from pg_database where datname = current_database())
+                        and l.classid = 1399957400::oid
+                        and l.objsubid = 2
+                        and l.objid = quote_ident($1)::regnamespace
+                        and l.mode = 'ShareLock'
+                        and not l.granted
+                 )",
+                &[&schema_a_name],
+            )
+            .expect("poll L0 waiter")
+            .get(0);
+        if waiting {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "concurrent spawn_append never waited on L0 exclusive lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        !appender.is_finished(),
+        "concurrent spawn_append must remain blocked until L0 migration commits"
+    );
+
+    mig_tx.commit().expect("commit L0 migration");
+    let id_a = appender.join().expect("join blocked appender");
+    let pos_a = GlobalPosition(u64::try_from(id_a).expect("u64"));
+    let g_a = store_a.read_global(cursor_a, 100).expect("rg schema_a");
+    let l_a = reader_a.log_after(cursor_a, 100).expect("la schema_a");
+    assert_eq!(g_a.iter().map(|r| r.position).collect::<Vec<_>>(), [pos_a]);
+    assert_eq!(l_a.iter().map(|e| e.position).collect::<Vec<_>>(), [pos_a]);
+}
+
+fn collect_rs_paths(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("read source dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            collect_rs_paths(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+fn normalize_sql_whitespace(raw: &str) -> String {
+    let mut no_comments = String::with_capacity(raw.len());
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("--") {
+            no_comments.push_str(line);
+            no_comments.push('\n');
+        }
+    }
+    no_comments
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+struct ParsedSchemaSql {
+    top_level_normalized: String,
+    first_create_table_offset: usize,
+    function_bodies: Vec<String>,
+    do_blocks: Vec<(usize, String)>,
+}
+
+fn find_dollar_tag(bytes: &[u8], pos: usize) -> Option<&str> {
+    if bytes.get(pos) != Some(&b'$') {
+        return None;
+    }
+    let mut end = pos + 1;
+    while end < bytes.len() {
+        let b = bytes[end];
+        if b == b'$' {
+            return std::str::from_utf8(&bytes[pos..=end]).ok();
+        }
+        if !(b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        end += 1;
+    }
+    None
+}
+
+fn parse_schema_sql_blocks(schema_sql: &str) -> ParsedSchemaSql {
+    let bytes = schema_sql.as_bytes();
+    let mut top_level_raw = String::with_capacity(schema_sql.len());
+    let mut function_bodies = Vec::new();
+    let mut do_blocks = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            top_level_raw.push('\'');
+            i += 1;
+            while i < bytes.len() {
+                let ch = schema_sql[i..].chars().next().expect("char");
+                top_level_raw.push(ch);
+                i += ch.len_utf8();
+                if ch == '\'' {
+                    if bytes.get(i) == Some(&b'\'') {
+                        top_level_raw.push('\'');
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(tag) = find_dollar_tag(bytes, i) {
+            let block_start = i;
+            let body_start = i + tag.len();
+            let rest = &schema_sql[body_start..];
+            let end_rel = rest.find(tag).expect("matching closing dollar quote tag");
+            let body = &rest[..end_rel];
+            let stmt_prefix = top_level_raw
+                .rsplit(';')
+                .next()
+                .unwrap_or("")
+                .trim_start()
+                .to_ascii_lowercase();
+            let norm_body = normalize_sql_whitespace(body);
+            if stmt_prefix.starts_with("create function")
+                || stmt_prefix.starts_with("create or replace function")
+            {
+                function_bodies.push(norm_body);
+            } else {
+                do_blocks.push((block_start, norm_body));
+            }
+            top_level_raw.push(' ');
+            i = body_start + end_rel + tag.len();
+            continue;
+        }
+        let ch = schema_sql[i..].chars().next().expect("char");
+        top_level_raw.push(ch);
+        i += ch.len_utf8();
+    }
+
+    let lower_raw = schema_sql.to_ascii_lowercase();
+    let first_create_table_offset = lower_raw
+        .find("\ncreate table ")
+        .expect("expected top-level create table in schema.sql");
+    ParsedSchemaSql {
+        top_level_normalized: normalize_sql_whitespace(&top_level_raw),
+        first_create_table_offset,
+        function_bodies,
+        do_blocks,
+    }
+}
+
+fn strip_comments_and_normalize_rust(source: &str) -> String {
+    let mut without_blocks = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("/*") {
+        without_blocks.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("*/") else {
+            rest = "";
+            break;
+        };
+        rest = &after_start[end + 2..];
+    }
+    without_blocks.push_str(rest);
+
+    without_blocks
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+#[test]
+fn watermark_writers_never_use_temp_tables_or_early_pg_current_xact_id() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src_dirs = [
+        manifest_dir.join("src"),
+        manifest_dir.join("../spawn-cli/src"),
+    ];
+    for dir in &src_dirs {
+        assert!(dir.is_dir(), "expected source dir {}", dir.display());
+        let mut files = Vec::new();
+        collect_rs_paths(dir, &mut files);
+        files.sort();
+        for path in files {
+            let text = std::fs::read_to_string(&path).expect("read rs file");
+            let normalized = strip_comments_and_normalize_rust(&text);
+            for forbidden in ["temp table", "temporary table", "pg_current_xact_id"] {
+                assert!(
+                    !normalized.contains(forbidden),
+                    "{} must not contain `{forbidden}` in production SQL/code",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    let schema_sql =
+        std::fs::read_to_string(manifest_dir.join("sql/schema.sql")).expect("read schema.sql");
+    let parsed = parse_schema_sql_blocks(&schema_sql);
+    assert!(
+        parsed.function_bodies.len() >= 50,
+        "expected >= 50 SQL functions in schema.sql, got {}",
+        parsed.function_bodies.len()
+    );
+    for (idx, body) in parsed.function_bodies.iter().enumerate() {
+        for forbidden in ["temp table", "temporary table"] {
+            assert!(
+                !body.contains(forbidden),
+                "schema.sql function #{idx} must never use `{forbidden}` at runtime"
+            );
+        }
+    }
+
+    let (first_do_offset, first_do_body) = parsed
+        .do_blocks
+        .first()
+        .expect("top schema/migration lock DO block");
+    assert!(
+        first_do_body.contains("pg_advisory_xact_lock(1399957400, v_ns_key)")
+            && *first_do_offset < parsed.first_create_table_offset,
+        "schema.sql must acquire exclusive L0 lock (1399957400) before its first CREATE TABLE"
+    );
+
+    for forbidden in ["temp table", "temporary table"] {
+        assert!(
+            !parsed.top_level_normalized.contains(forbidden),
+            "schema.sql top-level DDL outside DO blocks must not contain `{forbidden}`"
+        );
+    }
+
+    let mut legacy_temp_blocks = 0;
+    for (offset, body) in &parsed.do_blocks {
+        if body.contains("temp table") || body.contains("temporary table") {
+            assert!(
+                *offset > *first_do_offset
+                    && body.contains("create temporary table spawn_legacy_rows")
+                    && body.contains("pg_advisory_xact_lock(1399957402, 0)"),
+                "unexpected temporary table in schema.sql DO block at byte {offset}"
+            );
+            legacy_temp_blocks += 1;
+        }
+    }
+    assert_eq!(
+        legacy_temp_blocks, 1,
+        "expected exactly one legacy backfill DO block using spawn_legacy_rows under L0_exclusive"
+    );
+
+    for (idx, line) in schema_sql.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("--") {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("pg_current_xact_id") {
+            assert!(
+                lower.contains("commit_xid")
+                    || lower.contains("column_default is distinct from 'pg_current_xact_id()'")
+                    || lower.contains("v_seq, v_at, pg_current_xact_id()"),
+                "schema.sql:{} must only invoke pg_current_xact_id() on spawn_events commit_xid assignment: {trimmed}",
+                idx + 1
+            );
+        }
+    }
 }

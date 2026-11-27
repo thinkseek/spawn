@@ -705,7 +705,7 @@ fn on_main_reads_the_gates_recorded_while_it_waits_for_the_lock() {
 }
 
 /// The retire of mission 1's `objective` as on-main while another
-/// connection holds the append lock: `meanwhile` records what it records
+/// connection holds mission 1's L2 lock: `meanwhile` records what it records
 /// once the retire waits on the lock, then the holder commits.
 fn retire_while_held(
     schema: &str,
@@ -714,8 +714,8 @@ fn retire_while_held(
 ) -> Result<i64, String> {
     let mut holder = admin(schema);
     let mut hold = holder.transaction().expect("a transaction");
-    hold.execute("select pg_advisory_xact_lock(1399957335)", &[])
-        .expect("the append lock");
+    hold.execute("select pg_advisory_xact_lock(1399957402, 1)", &[])
+        .expect("the mission L2 lock");
     let mut retirer = admin(schema);
     let pid: i32 = retirer
         .query_one("select pg_backend_pid()", &[])

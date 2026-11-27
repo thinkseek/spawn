@@ -13,7 +13,7 @@ use spawn_core::control::{
 };
 use spawn_core::port::StoreError;
 
-use crate::PostgresStore;
+use crate::{PostgresStore, backend};
 
 /// Free text a SQL function writes into a control record from its
 /// parameters (objective 171: a mission's text, a brief, a report, a note,
@@ -2630,18 +2630,27 @@ impl PostgresStore {
     pub fn task_release(&self, task: i64, by: &str, reason: &str) -> Result<Value, StoreError> {
         let record = crate::control_mask::masked(&serde_json::json!({"type": "task.released",
             "id": task, "by": by, "reason": reason}));
-        self.query_json(
-            "with parked as (
-                 select gate_parked_pushed, gate_load_sensitive_scenarios
-                   from mission_tasks where id = $1 for update)
-             select jsonb_build_object(
-                      'task', $1::bigint,
-                      'pushed', parked.gate_parked_pushed,
-                      'scenarios', parked.gate_load_sensitive_scenarios,
-                      'event', spawn_integrator_record($2))
-               from (select 1) one left join parked on true",
-            &[&task, &record],
-        )
+        let mut client = self.lock();
+        let mut tx = client.transaction().map_err(|error| backend(&error))?;
+        tx.execute("select spawn_lock_migrate_shared()", &[])
+            .map_err(|error| backend(&error))?;
+        let row = tx
+            .query_one(
+                "with parked as (
+                     select gate_parked_pushed, gate_load_sensitive_scenarios
+                       from mission_tasks where id = $1 for update)
+                 select jsonb_build_object(
+                          'task', $1::bigint,
+                          'pushed', parked.gate_parked_pushed,
+                          'scenarios', parked.gate_load_sensitive_scenarios,
+                          'event', spawn_integrator_record($2))
+                   from (select 1) one left join parked on true",
+                &[&task as &(dyn postgres::types::ToSql + Sync), &record],
+            )
+            .map_err(|error| backend(&error))?;
+        let result: Value = row.get(0);
+        tx.commit().map_err(|error| backend(&error))?;
+        Ok(result)
     }
 
     /// Cancel a task still in flight: assigned, delivered, reported or sent

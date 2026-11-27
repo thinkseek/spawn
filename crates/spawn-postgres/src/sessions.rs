@@ -48,26 +48,88 @@ pub(crate) const TIMELINE: &str =
                   order by session_seq
                   limit $3";
 
-/// Log entries after a position, store-wide, in log order. A screen
-/// observation's evidence (the pane's text) is left out: the readers of
-/// the whole log draw what happened, not what a pane said.
+/// Log entries after a position, store-wide, in `(commit_xid, id)` commit
+/// watermark order (skipping uncommitted / in-flight writes in this schema).
+/// A screen observation's evidence (the pane's text) is left out: the readers
+/// of the whole log draw what happened, not what a pane said.
 /// `$1` after, `$2` limit.
-pub(crate) const LOG_AFTER: &str =
-    "select id, agent_id, session_id, execution_id, source, event_name,
-            case when event_name = 'screen.observed' then (kind->'detail') - 'evidence'
-                 else kind->'detail' end as detail,
-            recorded_at_ms
-       from spawn_events
-      where id > $1
-      order by id
-      limit $2";
+pub(crate) const LOG_AFTER: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    "
+      select wm.wm_raced, e.id, e.agent_id, e.session_id, e.execution_id,
+             e.source, e.event_name, e.detail, e.recorded_at_ms
+        from wm
+        left join lateral (
+            select id, agent_id, session_id, execution_id, source, event_name,
+                   case when event_name = 'screen.observed' then (kind->'detail') - 'evidence'
+                        else kind->'detail' end as detail,
+                   recorded_at_ms
+              from spawn_events
+             where commit_xid < wm.safe_xid
+               and (commit_xid, id) > (
+                       case
+                           when $1::bigint <= 0::bigint then '0'::xid8
+                           else coalesce(
+                               (select w.commit_xid from spawn_events w where w.id = $1::bigint),
+                               (select w.commit_xid
+                                  from spawn_events w
+                                 where w.id < $1::bigint
+                                   and w.commit_xid < wm.safe_xid
+                                 order by w.commit_xid desc, w.id desc
+                                 limit 1),
+                               '0'::xid8
+                           )
+                       end,
+                       greatest($1::bigint, 0::bigint)
+                   )
+             order by commit_xid, id
+             limit $2
+        ) e on true"
+);
 
-/// The first event at or after a position. `$1` position.
-pub(crate) const FIRST_FROM: &str =
-    "select id, recorded_at_ms from spawn_events where id >= $1 order by id limit 1";
+/// The first committed event at or after a position. `$1` position.
+pub(crate) const FIRST_FROM: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    "
+      select wm.wm_raced, e.id, e.recorded_at_ms
+        from wm
+        left join lateral (
+            select id, recorded_at_ms
+              from spawn_events
+             where id >= $1
+               and commit_xid < wm.safe_xid
+             order by id
+             limit 1
+        ) e on true"
+);
 
-/// The last position in the log.
-pub(crate) const LAST_POSITION: &str = "select coalesce(max(id), 0) as id from spawn_events";
+/// The last committed position in the log under `(commit_xid, id)` order.
+pub(crate) const LAST_POSITION: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    "
+      select coalesce(
+                 (select id from spawn_events
+                   where commit_xid < (select safe_xid from wm)
+                   order by commit_xid desc, id desc
+                   limit 1),
+                 0
+             ) as id,
+             (select wm_raced from wm) as wm_raced"
+);
+
+/// The highest committed event id in the log (upper bound for id binary search).
+const LAST_COMMITTED_ID: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    "
+      select coalesce(max(id), 0) as id,
+             (select wm_raced from wm) as wm_raced
+        from spawn_events
+       where commit_xid < (select safe_xid from wm)"
+);
 
 /// Everything the supervisor's liveness rule decides from.
 /// `$1` session, `$2` principal of the reviver.
@@ -374,8 +436,18 @@ impl PostgresStore {
         after: GlobalPosition,
         limit: usize,
     ) -> Result<Vec<LogEntry>, StoreError> {
-        self.query(LOG_AFTER, &[&bigint(after.0), &bigint(limit)])?
-            .iter()
+        let mut rows = Vec::new();
+        for attempt in 0..crate::WATERMARK_RACE_ATTEMPTS {
+            rows = self.query(LOG_AFTER, &[&bigint(after.0), &bigint(limit)])?;
+            let raced = rows
+                .first()
+                .is_some_and(|row| row.get::<_, bool>("wm_raced"));
+            if !raced || attempt + 1 == crate::WATERMARK_RACE_ATTEMPTS {
+                break;
+            }
+        }
+        rows.iter()
+            .filter(|row| row.get::<_, Option<i64>>("id").is_some())
             .map(|row| {
                 Ok(LogEntry {
                     position: global_position(row, "id"),
@@ -393,6 +465,26 @@ impl PostgresStore {
             .collect()
     }
 
+    fn query_wm_id(&self, sql: &str) -> Result<i64, StoreError> {
+        for attempt in 0..crate::WATERMARK_RACE_ATTEMPTS {
+            let row = self.query_one(sql, &[])?;
+            if !row.get::<_, bool>("wm_raced") || attempt + 1 == crate::WATERMARK_RACE_ATTEMPTS {
+                return Ok(row.get("id"));
+            }
+        }
+        Ok(0)
+    }
+
+    fn query_first_from(&self, middle: i64) -> Result<Option<Row>, StoreError> {
+        for attempt in 0..crate::WATERMARK_RACE_ATTEMPTS {
+            let row = self.query_one(FIRST_FROM, &[&middle])?;
+            if !row.get::<_, bool>("wm_raced") || attempt + 1 == crate::WATERMARK_RACE_ATTEMPTS {
+                return Ok(row.get::<_, Option<i64>>("id").map(|_| row));
+            }
+        }
+        Ok(None)
+    }
+
     /// The position just before the first event recorded at or after `at`:
     /// reading the log after it starts at that time. The last position when
     /// nothing is that recent.
@@ -401,13 +493,17 @@ impl PostgresStore {
     /// them; a binary search over the primary key finds the boundary in a
     /// few dozen index reads, with no index on the time.
     pub fn position_before(&self, at: Timestamp) -> Result<GlobalPosition, StoreError> {
-        let last = self.query_one(LAST_POSITION, &[])?.get::<_, i64>("id");
+        if at.0 == i64::MAX {
+            let last = self.query_wm_id(LAST_POSITION)?;
+            return Ok(GlobalPosition(u64::try_from(last.max(0)).unwrap_or(0)));
+        }
+        let last = self.query_wm_id(LAST_COMMITTED_ID)?;
         // Every position below `low` was recorded before `at`; every one
         // from `high` on at or after it.
         let (mut low, mut high) = (0_i64, last.saturating_add(1));
         while low < high {
             let middle = low + (high - low) / 2;
-            match self.query_opt(FIRST_FROM, &[&middle])? {
+            match self.query_first_from(middle)? {
                 Some(row)
                     if row.get::<_, i64>("id") < high
                         && row.get::<_, i64>("recorded_at_ms") < at.0 =>

@@ -166,18 +166,18 @@ case "$seed_now" in '' | *[!0-9]*) harness "no time from the database: [$seed_no
 cat >"$WORK/seed.sql" <<SQL
 \set ON_ERROR_STOP 1
 begin;
--- The store's own append lock, held to commit, as every writer of
+-- session_control's L3 append lock, held to commit, as every writer of
 -- session_control takes it.
-select pg_advisory_xact_lock(1399957335);
+select pg_advisory_xact_lock(1399957401, hashtext('session_control'));
 create function pg_temp.ms(h numeric) returns bigint language sql as \$\$
     select $seed_now::bigint + round(h * 3600000)::bigint \$\$;
 create temp sequence seed_seq start 100000;
 create function pg_temp.rec(h numeric, r jsonb) returns void language sql as \$\$
     insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
-                              kind, session_seq, recorded_at_ms)
+                              kind, session_seq, recorded_at_ms, commit_xid)
     values ('agent_control', 'session_control', null, 'control', null,
             jsonb_build_object('name', 'control.recorded', 'detail', jsonb_build_object('record', r)),
-            nextval('seed_seq'), pg_temp.ms(h)) \$\$;
+            nextval('seed_seq'), pg_temp.ms(h), pg_current_xact_id()) \$\$;
 -- A database drill as backup.rs records it (record_verified).
 create function pg_temp.verified(h numeric, ok boolean) returns void language sql as \$\$
     select pg_temp.rec(h, jsonb_build_object('type', 'backup.verified', 'ok', ok,

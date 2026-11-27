@@ -505,17 +505,18 @@ done
 cat >"$WORK/seed.sql" <<SQL
 \\set ON_ERROR_STOP 1
 begin;
--- The store's own append lock (spawn_append_trusted's advisory lock),
--- held to commit: no append can take a session_seq between the max
+-- This session's L3 append lock (spawn_append_trusted's per-session advisory
+-- lock), held to commit: no append can take a session_seq between the max
 -- read below and these inserts.
-select pg_advisory_xact_lock(1399957335);
+select pg_advisory_xact_lock(1399957401, hashtext('$(get take session)'));
 create function pg_temp.event(at_ms bigint, src text, key text, kind jsonb) returns void
 language sql as \$\$
     insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
-                              kind, session_seq, recorded_at_ms)
+                              kind, session_seq, recorded_at_ms, commit_xid)
     values ('$(get take agent)', '$(get take session)', null, src, key, kind,
             coalesce((select max(session_seq) from spawn_events
-                       where session_id = '$(get take session)'), 0) + 1, at_ms) \$\$;
+                       where session_id = '$(get take session)'), 0) + 1, at_ms,
+            pg_current_xact_id()) \$\$;
 create function pg_temp.old(k text, text_ text, ago_ms bigint) returns void
 language plpgsql as \$\$
 declare

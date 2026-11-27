@@ -541,11 +541,75 @@ fn run_storm_claim_append_finish_phase(
     )
 }
 
+fn verify_storm_event_order(client: &mut Client, all_events: &[spawn_core::event::EventRecord]) {
+    use std::collections::{HashMap, HashSet};
+
+    let xids_by_id: HashMap<u64, u64> = client
+        .query("select id, commit_xid::text from spawn_events", &[])
+        .expect("read commit_xids")
+        .into_iter()
+        .map(|row| {
+            let id = u64::try_from(row.get::<_, i64>(0)).expect("positive id");
+            let xid: u64 = row.get::<_, String>(1).parse().expect("u64 xid8");
+            (id, xid)
+        })
+        .collect();
+
+    let mut seen_positions = HashSet::with_capacity(all_events.len());
+    let mut prev_key: Option<(u64, u64)> = None;
+    let mut prev_pos_by_session: HashMap<String, u64> = HashMap::new();
+    let mut seq_by_session: HashMap<String, i64> = HashMap::new();
+    for rec in all_events {
+        let pos = rec.position.0;
+        assert!(
+            seen_positions.insert(pos),
+            "duplicate global position {pos}"
+        );
+        let xid = *xids_by_id.get(&pos).expect("commit_xid for position");
+        let key = (xid, pos);
+        if let Some(prev) = prev_key {
+            assert!(
+                key > prev,
+                "global (commit_xid, id) order not strictly monotonic: {key:?} <= {prev:?}"
+            );
+        }
+        prev_key = Some(key);
+        let sess = rec.event.session_id.as_str().to_string();
+        if let Some(&prev_sess_pos) = prev_pos_by_session.get(&sess) {
+            assert!(
+                pos > prev_sess_pos,
+                "session {sess} event position not monotonic: {pos} <= {prev_sess_pos}"
+            );
+        }
+        prev_pos_by_session.insert(sess.clone(), pos);
+        let entry = seq_by_session.entry(sess).or_insert(0);
+        *entry += 1;
+        assert_eq!(
+            i64::try_from(rec.session_seq.0).expect("seq fits i64"),
+            *entry,
+            "session seq must arrive in dense 1..=count order"
+        );
+    }
+    for (sess, count) in seq_by_session {
+        let row = client
+            .query_one(
+                "select count(*), min(session_seq), max(session_seq) from spawn_events where session_id = $1",
+                &[&sess],
+            )
+            .expect("session seq check");
+        let n: i64 = row.get(0);
+        let min_seq: i64 = row.get(1);
+        let max_seq: i64 = row.get(2);
+        assert_eq!(n, count, "session {sess} row count mismatch");
+        assert_eq!(min_seq, 1, "session {sess} min seq must be 1");
+        assert_eq!(max_seq, count, "session {sess} max seq must equal count");
+    }
+}
+
 #[test]
 fn pg_concurrency_idempotency_replay_storm_claim_contention_and_event_monotonicity() {
     use spawn_core::event::GlobalPosition;
     use spawn_core::port::EventLog;
-    use std::collections::HashMap;
 
     const THREADS: usize = 16;
     const SHARED_KEYS: usize = 8;
@@ -597,36 +661,7 @@ fn pg_concurrency_idempotency_replay_storm_claim_contention_and_event_monotonici
     }
     assert_eq!(all_events.len(), EXPECTED_UNIQUE * 3);
 
-    let mut prev_pos: Option<u64> = None;
-    let mut seq_by_session: HashMap<String, i64> = HashMap::new();
-    for rec in &all_events {
-        let pos = rec.position.0;
-        if let Some(prev) = prev_pos {
-            assert!(
-                pos > prev,
-                "global position not strictly monotonic: {pos} <= {prev}"
-            );
-        }
-        prev_pos = Some(pos);
-        let entry = seq_by_session
-            .entry(rec.event.session_id.as_str().to_string())
-            .or_insert(0);
-        *entry += 1;
-    }
-    for (sess, count) in seq_by_session {
-        let row = client
-            .query_one(
-                "select count(*), min(session_seq), max(session_seq) from spawn_events where session_id = $1",
-                &[&sess],
-            )
-            .expect("session seq check");
-        let n: i64 = row.get(0);
-        let min_seq: i64 = row.get(1);
-        let max_seq: i64 = row.get(2);
-        assert_eq!(n, count, "session {sess} row count mismatch");
-        assert_eq!(min_seq, 1, "session {sess} min seq must be 1");
-        assert_eq!(max_seq, count, "session {sess} max seq must equal count");
-    }
+    verify_storm_event_order(&mut client, &all_events);
 
     let (s50, s95, smax) = summarize_latency_ms(&submit_us);
     let (c50, c95, cmax) = summarize_latency_ms(&claim_us);
