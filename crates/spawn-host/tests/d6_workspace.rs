@@ -2059,3 +2059,704 @@ fn d6_workspace_pg_host_and_pg_restart_recovery_with_gc_fence_and_journal() {
     );
     restored_store.unmount(&ws3).expect("unmount restored");
 }
+
+struct PinTestFixture {
+    scratch: Scratch,
+    cas_dir: PathBuf,
+    cas: Arc<CasMerkleStore>,
+    ledger_pg: Arc<PgRefLedger>,
+    store: LocalWorkspaceStore,
+    main0_snap: Snapshot,
+    main0_digest: Digest,
+    branch: BranchName,
+    project: String,
+}
+
+fn seed_bootstrap_main_and_agent(
+    scratch_prefix: &str,
+    schema_name: &str,
+    project: &str,
+    branch_name: &str,
+) -> PinTestFixture {
+    let scratch = Scratch::new(scratch_prefix);
+    let cas_dir = scratch.join("cas");
+    let cas = Arc::new(CasMerkleStore::open(&cas_dir).expect("open cas"));
+    let ledger_pg = Arc::new(PgRefLedger::connect_isolated(schema_name));
+    let binding = binding_from_pg(&ledger_pg.pg);
+    bind_store_gc_fence(&cas, &binding).expect("bind gc fence");
+
+    let dyn_ledger: DynRefLedger = ledger_pg.clone();
+    let store = LocalWorkspaceStore::d6(
+        project,
+        scratch.join("work"),
+        D6StoreOptions::new(cas.clone(), dyn_ledger),
+    );
+    let d6 = store.d6_workspace().expect("d6 inner");
+
+    let (base_id, base_sz) = cas.put_bytes_blob(b"base v0\n").expect("base blob");
+    let main0_tree = cas
+        .put_tree_cached(
+            &Tree::from_entries(vec![TreeEntry::file(
+                b"README.md".to_vec(),
+                &base_id,
+                base_sz,
+            )])
+            .expect("main0 tree"),
+        )
+        .expect("store main0 tree");
+    let main0_snap = Snapshot {
+        tree: main0_tree,
+        parents: Vec::new(),
+        commit_body: format_commit_body(
+            "Spawn <spawn@localhost> 1700000100 +0000",
+            "Spawn <spawn@localhost> 1700000100 +0000",
+            "Bootstrap main\n",
+        ),
+    };
+    let main0_digest = cas
+        .cas()
+        .put_merkle_snapshot(&main0_snap)
+        .expect("put main0");
+    cas.cas().sync_store().expect("sync main0");
+    let seq1 = d6
+        .land_main_snapshot(None, &main0_digest, None, "bootstrap main")
+        .expect("bootstrap main");
+    assert_eq!(seq1, 1);
+
+    let branch = BranchName::new(branch_name).expect("branch");
+    store.ensure_branch(&branch, None).expect("ensure_branch");
+    PinTestFixture {
+        scratch,
+        cas_dir,
+        cas,
+        ledger_pg,
+        store,
+        main0_snap,
+        main0_digest,
+        branch,
+        project: project.to_string(),
+    }
+}
+
+fn replay_journal_into_fresh_pg(
+    fx: &PinTestFixture,
+    schema_name: &str,
+) -> Vec<spawn_host::LedgerRef> {
+    let restored_cas_dir = fx.scratch.join("cas-restored");
+    copy_cas_dir_excluding_fence_and_journal(&fx.cas_dir, &restored_cas_dir);
+    let journal_bytes = fs::read(fx.cas.cas().refs_journal_path()).expect("read journal");
+    fs::write(restored_cas_dir.join("refs.journal"), journal_bytes).expect("copy journal");
+    let restored_cas =
+        Arc::new(CasMerkleStore::open(&restored_cas_dir).expect("open restored cas"));
+    let restored_pg = Arc::new(PgRefLedger::connect_isolated(schema_name));
+    let restored_binding = binding_from_pg(&restored_pg.pg);
+    bind_store_gc_fence(&restored_cas, &restored_binding).expect("bind restored fence");
+    restored_pg
+        .record_snapshot(
+            &fx.main0_digest,
+            &main0_snap_oid(&fx.cas, &fx.main0_snap),
+            &fx.main0_snap.tree,
+            &[],
+            &fx.project,
+            1_700_000_100_000,
+        )
+        .expect("record restored main0");
+    restored_pg
+        .land_main_ref(
+            &fx.project,
+            "main",
+            None,
+            &fx.main0_digest,
+            None,
+            "bootstrap",
+        )
+        .expect("seed restored main");
+
+    reconcile_refs_journal(&restored_cas, restored_pg.as_ref(), 1, "test_pin_reconcile")
+        .expect("reconcile pinned refs");
+    restored_pg
+        .list_refs(Some(&fx.project))
+        .expect("restored refs")
+}
+
+fn assert_pinned_refs_survive_gc_and_reconcile(
+    fx: &PinTestFixture,
+    pinned_digest: &Digest,
+    accepted_ref: &str,
+    committed_digest: &Digest,
+) {
+    let binding = binding_from_pg(&fx.ledger_pg.pg);
+    let seq_now = fx.ledger_pg.pg.latest_ref_log_seq().expect("seq now");
+    let gc1 = run_persistent_gc_for_ledger(
+        &fx.cas,
+        fx.ledger_pg.as_ref(),
+        &binding,
+        seq_now,
+        Duration::ZERO,
+    )
+    .expect("gc sweep 1");
+    let gc2 = run_persistent_gc_for_ledger(
+        &fx.cas,
+        fx.ledger_pg.as_ref(),
+        &binding,
+        seq_now,
+        Duration::ZERO,
+    )
+    .expect("gc sweep 2");
+    assert_eq!(gc1.roots, 3);
+    assert_eq!(gc2.roots, 3);
+    assert!(fx.cas.cas().has(pinned_digest));
+
+    let restored_refs = replay_journal_into_fresh_pg(fx, "d6_pin_worker_reconcile");
+    assert!(
+        restored_refs
+            .iter()
+            .any(|r| r.name == accepted_ref && r.snapshot == *committed_digest)
+    );
+}
+
+#[test]
+fn pg_d6_pin_worker_head_unmount_remount_roundtrip() {
+    let fx = seed_bootstrap_main_and_agent(
+        "pin_worker_roundtrip",
+        "d6_pin_worker_roundtrip",
+        "proj-pin-rt",
+        "agent_worker_rt",
+    );
+    let binding = binding_from_pg(&fx.ledger_pg.pg);
+    let d6 = fx.store.d6_workspace().expect("d6 inner");
+
+    let branch_before = fx
+        .store
+        .branch_head(&fx.branch)
+        .expect("branch_head before")
+        .expect("seeded branch head");
+
+    let ws = fx.store.mount(&fx.branch).expect("mount");
+    let ws_dir = PathBuf::from(ws.path());
+    fs::write(ws_dir.join("README.md"), "worker modified\n").expect("modify README");
+    fs::write(ws_dir.join("feature.rs"), "pub fn work() -> i32 { 42 }\n").expect("write feature");
+
+    let head_ref = spawn_host::workspace_rules::task_head_ref(77, "head");
+    let worker_ref = spawn_host::workspace_rules::worker_head_ref(fx.branch.as_str());
+
+    let pinned1 = fx
+        .store
+        .pin_worker_head(fx.branch.as_str(), Some(&ws_dir), &[&head_ref])
+        .expect("pin dirty workspace")
+        .expect("some commit id");
+    assert_eq!(
+        fx.store
+            .branch_head(&fx.branch)
+            .expect("branch_head after")
+            .expect("branch head"),
+        branch_before
+    );
+    let worker_snap = d6
+        .branch_snapshot(&worker_ref)
+        .expect("worker_ref lookup")
+        .expect("worker_ref exists");
+    let task_snap = d6
+        .branch_snapshot(&head_ref)
+        .expect("task_ref lookup")
+        .expect("task_ref exists");
+    assert_eq!(worker_snap.git_oid.to_hex(), pinned1.as_str());
+    assert_eq!(task_snap.git_oid.to_hex(), pinned1.as_str());
+
+    let seq_after_pin = fx.ledger_pg.pg.latest_ref_log_seq().expect("seq after pin");
+    let fence_status =
+        check_gc_fence(&fx.cas, &binding, seq_after_pin).expect("gc fence aligned after pin");
+    assert_eq!(
+        fence_status.pg_latest_ref_seq,
+        fence_status.journal_latest_seq
+    );
+
+    let pinned_repeat = fx
+        .store
+        .pin_worker_head(fx.branch.as_str(), Some(&ws_dir), &[&head_ref])
+        .expect("repeat pin")
+        .expect("some commit id");
+    assert_eq!(pinned_repeat, pinned1);
+    assert_eq!(
+        fx.ledger_pg.pg.latest_ref_log_seq().expect("seq unchanged"),
+        seq_after_pin
+    );
+
+    let Commit::Created(committed_oid) = fx
+        .store
+        .checkpoint(&ws, "worker commit checkpoint")
+        .expect("checkpoint")
+    else {
+        panic!("expected new checkpoint commit");
+    };
+    fx.store.unmount(&ws).expect("unmount");
+    assert!(!ws_dir.exists());
+
+    let accepted_ref = spawn_host::workspace_rules::task_head_ref(77, "accepted");
+    let pinned_post_unmount = fx
+        .store
+        .pin_worker_head(fx.branch.as_str(), None, &[&accepted_ref])
+        .expect("post-unmount pin matches branch head")
+        .expect("branch head retained after unmount");
+    assert_eq!(pinned_post_unmount, committed_oid);
+
+    let reviewer = BranchName::new("agent_reviewer").expect("reviewer branch");
+    fx.store
+        .ensure_branch(&reviewer, Some(pinned1.as_str()))
+        .expect("fork from earlier worker CommitId");
+    let review_ws = fx.store.mount(&reviewer).expect("mount reviewer");
+    let review_dir = PathBuf::from(review_ws.path());
+    assert_eq!(
+        fs::read_to_string(review_dir.join("README.md")).expect("read remounted README"),
+        "worker modified\n"
+    );
+    assert_eq!(
+        fs::read_to_string(review_dir.join("feature.rs")).expect("read remounted feature"),
+        "pub fn work() -> i32 { 42 }\n"
+    );
+    fx.store.unmount(&review_ws).expect("unmount reviewer");
+
+    let committed_snap = d6
+        .branch_snapshot(fx.branch.as_str())
+        .expect("branch snap")
+        .expect("branch exists");
+    assert_pinned_refs_survive_gc_and_reconcile(
+        &fx,
+        &worker_snap.id,
+        &accepted_ref,
+        &committed_snap.id,
+    );
+}
+
+fn main0_snap_oid(cas: &CasMerkleStore, snap: &Snapshot) -> GitOid {
+    cas.project_snapshot_oid(snap, &[]).expect("main0 oid")
+}
+
+fn seed_inner_git_repo(ws_dir: &Path) {
+    let run_git = |args: &[&str]| {
+        let out = test_git_command()
+            .current_dir(ws_dir)
+            .args(args)
+            .output()
+            .expect("run test_git_command");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run_git(&["init", "-q", "-b", "work"]);
+    run_git(&["config", "user.name", "Worker"]);
+    run_git(&["config", "user.email", "worker@spawn.local"]);
+    fs::write(ws_dir.join("committed.rs"), "pub fn a() -> i32 { 1 }\n").expect("write committed");
+    run_git(&["add", "committed.rs"]);
+    run_git(&["commit", "-qm", "worker inner commit"]);
+    fs::write(ws_dir.join("uncommitted.rs"), "pub fn b() -> i32 { 2 }\n").expect("write dirty");
+    fs::write(ws_dir.join(".git/info/exclude"), "scratch.tmp\n").expect("write info exclude");
+    fs::write(ws_dir.join("scratch.tmp"), "ignore me\n").expect("write scratch.tmp");
+}
+
+#[test]
+fn pg_d6_pin_worker_head_local_git_boundary() {
+    let scratch = Scratch::new("pin_worker_git_boundary");
+    let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("open cas"));
+    let ledger_pg = Arc::new(PgRefLedger::connect_isolated("d6_pin_worker_git_boundary"));
+    let binding = binding_from_pg(&ledger_pg.pg);
+    bind_store_gc_fence(&cas, &binding).expect("bind gc fence");
+
+    let dyn_ledger: DynRefLedger = ledger_pg;
+    let store = LocalWorkspaceStore::d6(
+        "proj-pin-boundary",
+        scratch.join("work"),
+        D6StoreOptions::new(cas.clone(), dyn_ledger),
+    );
+    let d6 = store.d6_workspace().expect("d6 inner");
+
+    let branch = BranchName::new("agent_git_bound").expect("branch");
+    store.ensure_branch(&branch, None).expect("ensure_branch");
+    let ws = store.mount(&branch).expect("mount");
+    let ws_dir = PathBuf::from(ws.path());
+
+    let outside = scratch.join("outside.git");
+    fs::create_dir_all(&outside).expect("mkdir outside");
+    fs::write(outside.join("secret.txt"), "do not leak into CAS\n").expect("write outside secret");
+    seed_inner_git_repo(&ws_dir);
+
+    let task_ref = spawn_host::workspace_rules::task_head_ref(88, "head");
+    let commit = store
+        .pin_worker_head(branch.as_str(), Some(&ws_dir), &[&task_ref])
+        .expect("pin with inner .git dir")
+        .expect("pinned commit");
+    let worker_snap = d6
+        .branch_snapshot(&spawn_host::workspace_rules::worker_head_ref(
+            branch.as_str(),
+        ))
+        .expect("worker snap")
+        .expect("present");
+    assert_eq!(worker_snap.git_oid.to_hex(), commit.as_str());
+
+    let flat = cas.flatten_tree(&worker_snap.tree).expect("flatten tree");
+    assert!(flat.contains_key(b"committed.rs".as_slice()));
+    assert!(flat.contains_key(b"uncommitted.rs".as_slice()));
+    assert!(!flat.contains_key(b"scratch.tmp".as_slice()));
+    assert!(
+        flat.keys()
+            .all(|p| p != b".git" && !p.starts_with(b".git/"))
+    );
+
+    // Replace inner `.git` with an arbitrary `gitdir:` file: D6 never follows `.git` pointers,
+    // so both checkpoint and pin_worker_head treat workspace files identically without leaking `.git`.
+    fs::remove_dir_all(ws_dir.join(".git")).expect("remove inner .git dir");
+    fs::write(
+        ws_dir.join(".git"),
+        format!("gitdir: {}\n", outside.display()),
+    )
+    .expect("gitdir");
+    fs::write(ws_dir.join("after_gitfile.rs"), "pub fn c() -> i32 { 3 }\n")
+        .expect("write after gitdir");
+    store
+        .checkpoint(&ws, "checkpoint ignores gitdir file")
+        .expect("checkpoint succeeds with gitdir pointer file");
+    let pin_with_gitfile = store
+        .pin_worker_head(branch.as_str(), Some(&ws_dir), &[&task_ref])
+        .expect("pin_worker_head matches checkpoint behavior on gitdir file")
+        .expect("pinned commit");
+    let after_snap = d6
+        .branch_snapshot(&task_ref)
+        .expect("task snap")
+        .expect("present");
+    assert_eq!(after_snap.git_oid.to_hex(), pin_with_gitfile.as_str());
+    let flat_after = cas.flatten_tree(&after_snap.tree).expect("flatten after");
+    assert!(flat_after.contains_key(b"after_gitfile.rs".as_slice()));
+    assert!(!flat_after.contains_key(b"secret.txt".as_slice()));
+    assert!(
+        flat_after
+            .keys()
+            .all(|p| p != b".git" && !p.starts_with(b".git/"))
+    );
+
+    // Symlink `.git` is still refused fail-closed by the workspace scanner, while unmount cleans up.
+    fs::remove_file(ws_dir.join(".git")).expect("remove gitdir file");
+    std::os::unix::fs::symlink(&outside, ws_dir.join(".git")).expect("symlink .git");
+    let sym_err = store
+        .pin_worker_head(branch.as_str(), Some(&ws_dir), &[])
+        .unwrap_err();
+    assert!(
+        sym_err.to_string().contains(".git") && sym_err.to_string().contains("symlink"),
+        "{sym_err}"
+    );
+    store
+        .unmount(&ws)
+        .expect("unmount tolerates symlink .git cleanup");
+}
+
+#[test]
+fn pg_d6_pin_worker_head_discard_does_not_leak_previous_task_into_new_task() {
+    let fx = seed_bootstrap_main_and_agent(
+        "pin_worker_discard",
+        "d6_pin_worker_discard",
+        "proj-pin-discard",
+        "agent_reuse",
+    );
+    let d6 = fx.store.d6_workspace().expect("d6 inner");
+    let main_snap = d6.main_snapshot().expect("main").expect("main seeded");
+    assert_eq!(main_snap.id, fx.main0_digest);
+
+    // Task 601 runs on agent_reuse and pins old_task.rs without landing to branch.
+    let ws1 = fx.store.mount(&fx.branch).expect("mount task 601");
+    let dir1 = PathBuf::from(ws1.path());
+    fs::write(dir1.join("old_task.rs"), "pub fn old_work() -> i32 { 1 }\n")
+        .expect("write old_task.rs");
+    let old_ref = spawn_host::workspace_rules::task_head_ref(601, "head");
+    let old_pin = fx
+        .store
+        .pin_worker_head(fx.branch.as_str(), Some(&dir1), &[&old_ref])
+        .expect("pin task 601")
+        .expect("old pin commit");
+    let worker_ref = spawn_host::workspace_rules::worker_head_ref(fx.branch.as_str());
+    let worker_after_601 = d6
+        .branch_snapshot(&worker_ref)
+        .expect("worker snap")
+        .expect("exists");
+    assert_eq!(worker_after_601.git_oid.to_hex(), old_pin.as_str());
+
+    // Discard resets worker ref back to branch head and drops the old workspace.
+    d6.discard(&ws1).expect("discard task 601");
+    assert_eq!(
+        d6.branch_snapshot(&worker_ref)
+            .expect("worker after discard")
+            .expect("present")
+            .id,
+        fx.main0_digest
+    );
+
+    // Even with a stale worker ref left behind, `directory=None` MUST pin branch head (`main0`).
+    fx.ledger_pg
+        .cas_ref(
+            &fx.project,
+            &worker_ref,
+            spawn_host::D6RefKind::Branch,
+            Some(&fx.main0_digest),
+            &worker_after_601.id,
+            "simulate stale worker ref",
+        )
+        .expect("set stale worker ref");
+    let stale_acc_ref = spawn_host::workspace_rules::task_head_ref(602, "accepted");
+    let no_dir_pin = fx
+        .store
+        .pin_worker_head(fx.branch.as_str(), None, &[&stale_acc_ref])
+        .expect("pin 602 without directory")
+        .expect("commit");
+    assert_eq!(no_dir_pin.as_str(), main_snap.git_oid.to_hex());
+    let snap_602_acc = d6
+        .branch_snapshot(&stale_acc_ref)
+        .expect("602 acc")
+        .expect("exists");
+    assert_eq!(snap_602_acc.id, fx.main0_digest);
+    assert!(
+        !fx.cas
+            .flatten_tree(&snap_602_acc.tree)
+            .expect("flatten 602")
+            .contains_key(b"old_task.rs".as_slice())
+    );
+
+    // With a live directory too, the new commit must parent from `branch` (`main0`), never task 601.
+    fx.ledger_pg
+        .cas_ref(
+            &fx.project,
+            &worker_ref,
+            spawn_host::D6RefKind::Branch,
+            Some(&fx.main0_digest),
+            &worker_after_601.id,
+            "simulate stale worker ref before mounted task",
+        )
+        .expect("set stale worker ref 2");
+
+    let ws2 = fx.store.mount(&fx.branch).expect("mount task 603");
+    let dir2 = PathBuf::from(ws2.path());
+    assert!(!dir2.join("old_task.rs").exists());
+    fs::write(dir2.join("new_task.rs"), "pub fn new_work() -> i32 { 2 }\n")
+        .expect("write new_task.rs");
+    let ref_603 = spawn_host::workspace_rules::task_head_ref(603, "head");
+    let pin_603 = fx
+        .store
+        .pin_worker_head(fx.branch.as_str(), Some(&dir2), &[&ref_603])
+        .expect("pin task 603")
+        .expect("603 commit");
+    let snap_603 = d6
+        .branch_snapshot(&ref_603)
+        .expect("603 snap")
+        .expect("exists");
+    assert_eq!(snap_603.git_oid.to_hex(), pin_603.as_str());
+    assert_eq!(snap_603.parents, vec![fx.main0_digest.clone()]);
+    let flat_603 = fx.cas.flatten_tree(&snap_603.tree).expect("flatten 603");
+    assert!(flat_603.contains_key(b"new_task.rs".as_slice()));
+    assert!(!flat_603.contains_key(b"old_task.rs".as_slice()));
+    fx.store.unmount(&ws2).expect("unmount task 603");
+}
+
+fn run_with_blocked_journal_once<F: FnOnce()>(journal_path: &Path, backup_path: &Path, op: F) {
+    fs::copy(journal_path, backup_path).expect("backup refs.journal");
+    fs::remove_file(journal_path).expect("rm refs.journal");
+    fs::create_dir_all(journal_path).expect("inject directory at refs.journal");
+    op();
+    fs::remove_dir_all(journal_path).expect("remove blocker dir");
+    fs::copy(backup_path, journal_path).expect("restore refs.journal");
+}
+
+#[test]
+fn pg_d6_pin_worker_head_retries_heal_missing_refs_journal_entry() {
+    let fx = seed_bootstrap_main_and_agent(
+        "pin_worker_half_write",
+        "d6_pin_worker_half_write",
+        "proj-pin-heal",
+        "agent_heal",
+    );
+    let binding = binding_from_pg(&fx.ledger_pg.pg);
+    let d6 = fx.store.d6_workspace().expect("d6 inner");
+    let journal_path = fx.cas.cas().refs_journal_path();
+    let journal_backup = fx.scratch.join("refs.journal.bak");
+
+    let task_ref_none = spawn_host::workspace_rules::task_head_ref(901, "accepted");
+    run_with_blocked_journal_once(&journal_path, &journal_backup, || {
+        let half_err = fx
+            .store
+            .pin_worker_head(fx.branch.as_str(), None, &[&task_ref_none])
+            .unwrap_err();
+        assert!(!half_err.to_string().is_empty());
+    });
+
+    let worker_ref = spawn_host::workspace_rules::worker_head_ref(fx.branch.as_str());
+    assert!(
+        d6.branch_snapshot(&worker_ref)
+            .expect("pg worker")
+            .is_some()
+    );
+    assert!(
+        !fx.cas
+            .cas()
+            .read_ref_journal()
+            .expect("read journal")
+            .iter()
+            .any(|e| e.name == worker_ref)
+    );
+
+    let healed_commit = fx
+        .store
+        .pin_worker_head(fx.branch.as_str(), None, &[&task_ref_none])
+        .expect("retry heals refs.journal")
+        .expect("commit");
+    assert_eq!(
+        healed_commit.as_str(),
+        main0_snap_oid(&fx.cas, &fx.main0_snap).to_hex()
+    );
+    let seq_healed = fx.ledger_pg.pg.latest_ref_log_seq().expect("seq healed");
+    check_gc_fence(&fx.cas, &binding, seq_healed).expect("gc fence aligned after heal");
+
+    fx.store
+        .pin_worker_head(fx.branch.as_str(), None, &[&task_ref_none])
+        .expect("repeat after heal");
+    assert_eq!(
+        fx.ledger_pg.pg.latest_ref_log_seq().expect("seq unchanged"),
+        seq_healed
+    );
+
+    // Dirty publish half-write retry also heals worker_ref + task_ref_dirty cleanly.
+    let ws = fx.store.mount(&fx.branch).expect("mount heal dirty");
+    let ws_dir = PathBuf::from(ws.path());
+    fs::write(ws_dir.join("heal_dirty.rs"), "pub fn heal() -> i32 { 7 }\n").expect("write dirty");
+    let task_ref_dirty = spawn_host::workspace_rules::task_head_ref(902, "head");
+    run_with_blocked_journal_once(&journal_path, &journal_backup, || {
+        let _err = fx
+            .store
+            .pin_worker_head(fx.branch.as_str(), Some(&ws_dir), &[&task_ref_dirty])
+            .unwrap_err();
+    });
+
+    let dirty_commit = fx
+        .store
+        .pin_worker_head(fx.branch.as_str(), Some(&ws_dir), &[&task_ref_dirty])
+        .expect("dirty retry heals refs.journal")
+        .expect("dirty commit");
+    let dirty_snap = d6
+        .branch_snapshot(&worker_ref)
+        .expect("worker dirty snap")
+        .expect("present");
+    assert_eq!(dirty_snap.git_oid.to_hex(), dirty_commit.as_str());
+    check_gc_fence(
+        &fx.cas,
+        &binding,
+        fx.ledger_pg.pg.latest_ref_log_seq().expect("seq healed 2"),
+    )
+    .expect("gc fence aligned after dirty heal");
+    fx.store.unmount(&ws).expect("unmount heal dirty");
+
+    let restored_refs = replay_journal_into_fresh_pg(&fx, "d6_pin_worker_heal_restore");
+    for (ref_name, expected_snap) in [
+        (worker_ref.as_str(), &dirty_snap.id),
+        (task_ref_none.as_str(), &fx.main0_digest),
+        (task_ref_dirty.as_str(), &dirty_snap.id),
+    ] {
+        assert!(
+            restored_refs
+                .iter()
+                .any(|r| r.name == ref_name && r.snapshot == *expected_snap),
+            "missing healed {ref_name} after reconcile"
+        );
+    }
+}
+
+#[test]
+fn pg_d6_pin_worker_head_half_write_then_branch_move_keeps_journal_chain_valid() {
+    let fx = seed_bootstrap_main_and_agent(
+        "pin_worker_half_write_move",
+        "d6_pin_worker_half_write_move",
+        "proj-pin-move",
+        "agent_move",
+    );
+    let d6 = fx.store.d6_workspace().expect("d6 inner");
+    let ws = fx.store.mount(&fx.branch).expect("mount agent_move");
+    let ws_dir = PathBuf::from(ws.path());
+    let worker_ref = spawn_host::workspace_rules::worker_head_ref(fx.branch.as_str());
+    let task_ref = spawn_host::workspace_rules::task_head_ref(910, "accepted");
+
+    fs::write(ws_dir.join("step.txt"), "b0\n").expect("write b0");
+    let Commit::Created(b0) = fx.store.checkpoint(&ws, "ckpt b0").expect("ckpt b0") else {
+        panic!("expected Created b0");
+    };
+    let b0_snap = d6
+        .branch_snapshot(fx.branch.as_str())
+        .expect("b0 snap")
+        .expect("present");
+    let p0 = fx
+        .store
+        .pin_worker_head(fx.branch.as_str(), None, &[&task_ref])
+        .expect("pin b0")
+        .expect("commit b0");
+    assert_eq!(p0, b0);
+
+    fs::write(ws_dir.join("step.txt"), "b1\n").expect("write b1");
+    let Commit::Created(b1) = fx.store.checkpoint(&ws, "ckpt b1").expect("ckpt b1") else {
+        panic!("expected Created b1");
+    };
+    let b1_snap = d6
+        .branch_snapshot(fx.branch.as_str())
+        .expect("b1 snap")
+        .expect("present");
+    // Simulate a half-write crash between PG `cas_ref` (B0 -> B1) and `refs.journal` append.
+    for ref_name in [&worker_ref, &task_ref] {
+        fx.ledger_pg
+            .cas_ref(
+                &fx.project,
+                ref_name,
+                D6RefKind::Branch,
+                Some(&b0_snap.id),
+                &b1_snap.id,
+                "d6:pin_worker_head",
+            )
+            .expect("simulate pg half-write B0 -> B1");
+        assert_eq!(
+            d6.branch_snapshot(ref_name)
+                .expect("snap after half write")
+                .expect("present")
+                .id,
+            b1_snap.id
+        );
+    }
+
+    fs::write(ws_dir.join("step.txt"), "b2\n").expect("write b2");
+    let Commit::Created(b2) = fx.store.checkpoint(&ws, "ckpt b2").expect("ckpt b2") else {
+        panic!("expected Created b2");
+    };
+    let b2_snap = d6
+        .branch_snapshot(fx.branch.as_str())
+        .expect("b2 snap")
+        .expect("present");
+    assert_ne!(b1, b2);
+
+    let p2 = fx
+        .store
+        .pin_worker_head(fx.branch.as_str(), None, &[&task_ref])
+        .expect("retry pin at b2 heals journal before advancing")
+        .expect("commit b2");
+    assert_eq!(p2, b2);
+    fx.store.unmount(&ws).expect("unmount agent_move");
+
+    let suffix = fx
+        .cas
+        .cas()
+        .reconcile_entries_after(1)
+        .expect("reconcile_entries_after(1) must keep valid fast-forward chain");
+    assert!(!suffix.is_empty());
+
+    let restored_refs = replay_journal_into_fresh_pg(&fx, "d6_pin_worker_move_restore");
+    for expected_ref in [worker_ref.as_str(), task_ref.as_str()] {
+        assert!(
+            restored_refs
+                .iter()
+                .any(|r| r.name == expected_ref && r.snapshot == b2_snap.id),
+            "expected {expected_ref} at B2 in replayed PG ledger"
+        );
+    }
+}

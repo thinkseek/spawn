@@ -65,7 +65,7 @@ use crate::workspace_rules::{
     OVERSIZED_RECORD_LIMIT, Oversized, SET_ASIDE_FILES, SET_ASIDE_WAITS, encode_oversized,
     has_conflict_block_sized, is_plain_name, lock_file, max_file_bytes, names_files_outside_git,
     oversized_digest, oversized_file, oversized_notice_message, parse_oversized,
-    set_aside_kept_message,
+    set_aside_kept_message, worker_head_ref,
 };
 
 const BASE_BRANCH: &str = "main";
@@ -464,7 +464,66 @@ impl<L: RefLedger> std::fmt::Debug for D6Workspace<L> {
     }
 }
 
+struct BranchRefUpdate<'a> {
+    ref_name: &'a str,
+    expected: Option<&'a Digest>,
+    journal_old: Option<&'a Digest>,
+    new_snapshot: &'a Digest,
+    git_oid: GitOid,
+    at_ms: i64,
+    reason: &'a str,
+}
+
+fn resolve_ledger_worker_pin(
+    branch_snap: Option<&LedgerSnapshot>,
+    existing_worker_snap: Option<&LedgerSnapshot>,
+) -> Option<(Digest, GitOid, bool)> {
+    branch_snap
+        .or(existing_worker_snap)
+        .map(|snap| (snap.id.clone(), snap.git_oid, false))
+}
+
 impl<L: RefLedger> D6Workspace<L> {
+    fn append_ref_journal_entry(&self, entry: &JournalEntry) -> Result<(), WorkspaceError> {
+        self.store
+            .cas()
+            .append_ref_journal(entry)
+            .map_err(map_cas_err)
+    }
+
+    fn cas_branch_ref_and_journal(
+        &self,
+        update: &BranchRefUpdate<'_>,
+        synced: &mut bool,
+    ) -> Result<u64, WorkspaceError> {
+        if !*synced {
+            self.store.cas().sync_store().map_err(map_cas_err)?;
+            *synced = true;
+        }
+        let seq = self
+            .ledger
+            .cas_ref(
+                &self.project,
+                update.ref_name,
+                D6RefKind::Branch,
+                update.expected,
+                update.new_snapshot,
+                update.reason,
+            )
+            .map_err(map_store_err)?;
+        self.append_ref_journal_entry(&JournalEntry {
+            seq,
+            project: self.project.clone(),
+            name: update.ref_name.to_string(),
+            kind: D6RefKind::Branch.as_str().to_string(),
+            old_snapshot: update.journal_old.cloned(),
+            new_snapshot: update.new_snapshot.clone(),
+            git_oid: update.git_oid,
+            at_ms: update.at_ms,
+        })?;
+        Ok(seq)
+    }
+
     /// Construct a `D6Workspace` backed by `store` and `ledger` with workspaces rooted at `root`.
     pub fn new(
         project: impl Into<String>,
@@ -923,19 +982,16 @@ impl<L: RefLedger> D6Workspace<L> {
                 reason,
             )
             .map_err(map_store_err)?;
-        self.store
-            .cas()
-            .append_ref_journal(&JournalEntry {
-                seq,
-                project: self.project.clone(),
-                name: BASE_BRANCH.to_string(),
-                kind: D6RefKind::Main.as_str().to_string(),
-                old_snapshot: expected_base.cloned(),
-                new_snapshot: new_snapshot.clone(),
-                git_oid,
-                at_ms,
-            })
-            .map_err(map_cas_err)?;
+        self.append_ref_journal_entry(&JournalEntry {
+            seq,
+            project: self.project.clone(),
+            name: BASE_BRANCH.to_string(),
+            kind: D6RefKind::Main.as_str().to_string(),
+            old_snapshot: expected_base.cloned(),
+            new_snapshot: new_snapshot.clone(),
+            git_oid,
+            at_ms,
+        })?;
         Ok(seq)
     }
 
@@ -1002,6 +1058,248 @@ impl<L: RefLedger> D6Workspace<L> {
         ready: &dyn Fn() -> Result<(), String>,
     ) -> Result<SetAside, WorkspaceError> {
         self.set_aside_since(branch.as_str(), start, message, ready)
+    }
+
+    /// Persists worker workspace changes/HEAD into `refs/spawn/workers/<branch>/head` (and every
+    /// `refs/spawn/...` target ref in `target_refs`) without modifying `refs/heads/*`.
+    ///
+    /// Unlike external Git subprocess adapters, this pure-Rust D6 implementation never reads
+    /// through `.git` pointer files; it scans working-tree files directly into CAS (`NS_BLOB` +
+    /// `NS_TREE` + `spawn-snapshot-v1`), recording snapshots and advancing refs in `RefLedger` and
+    /// `refs.journal` (with retry self-healing if a journal append failed after a PG write). Changes
+    /// checked out inside the working tree are captured while `.git/` metadata stays excluded and
+    /// `.git/info/exclude` (for a regular `.git` directory) is honored; symlinked `.git` entries are
+    /// refused fail-closed by the workspace scanner.
+    ///
+    /// Always derives from the live `branch` snapshot when present (ignoring stale worker refs left
+    /// behind by prior discarded tasks) and falls back to `refs/spawn/workers/<branch>/head` only
+    /// when `directory` is `None`/absent and no `branch` snapshot exists.
+    pub fn pin_worker_head(
+        &self,
+        branch: &str,
+        directory: Option<&Path>,
+        target_refs: &[&str],
+    ) -> Result<Option<CommitId>, WorkspaceError> {
+        let valid_targets = validate_pin_worker_head_args(branch, target_refs)?;
+        let _lock = self.lock_branch(branch)?;
+        let worker_ref = worker_head_ref(branch);
+        let (branch_snap, main_snap) = self.branch_and_main_snapshots(branch)?;
+        let existing_worker_snap = self.branch_snapshot(&worker_ref)?;
+
+        let mut dir_target = None;
+        if let Some(dir) = directory {
+            match fs::symlink_metadata(dir) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(WorkspaceError::Unavailable(format!(
+                            "refusing symlink workspace directory: {}",
+                            dir.display()
+                        )));
+                    }
+                    if !meta.is_dir() {
+                        return Err(WorkspaceError::Unavailable(format!(
+                            "workspace path is not a directory: {}",
+                            dir.display()
+                        )));
+                    }
+                    dir_target = Some(dir);
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(WorkspaceError::Unavailable(format!(
+                        "stat workspace directory {}: {err}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
+
+        let Some((snapshot_digest, commit_oid, worker_ref_already_updated)) =
+            (if let Some(dir) = dir_target {
+                self.resolve_dir_worker_pin(
+                    branch,
+                    &worker_ref,
+                    dir,
+                    branch_snap.as_ref(),
+                    existing_worker_snap.as_ref(),
+                    main_snap.as_ref(),
+                )?
+            } else {
+                resolve_ledger_worker_pin(branch_snap.as_ref(), existing_worker_snap.as_ref())
+            })
+        else {
+            return Ok(None);
+        };
+
+        let mut synced = false;
+        let mut seen_refs = BTreeSet::new();
+        if !worker_ref_already_updated && seen_refs.insert(worker_ref.as_str()) {
+            self.pin_ref_to_snapshot(&worker_ref, &snapshot_digest, commit_oid, &mut synced)?;
+        } else {
+            seen_refs.insert(worker_ref.as_str());
+        }
+        for target in valid_targets {
+            if seen_refs.insert(target.as_str()) {
+                self.pin_ref_to_snapshot(
+                    target.as_str(),
+                    &snapshot_digest,
+                    commit_oid,
+                    &mut synced,
+                )?;
+            }
+        }
+
+        CommitId::new(commit_oid.to_hex())
+            .map(Some)
+            .map_err(|err| WorkspaceError::Unavailable(err.to_string()))
+    }
+
+    fn resolve_dir_worker_pin(
+        &self,
+        branch: &str,
+        worker_ref: &str,
+        dir: &Path,
+        branch_snap: Option<&LedgerSnapshot>,
+        existing_worker_snap: Option<&LedgerSnapshot>,
+        main_snap: Option<&LedgerSnapshot>,
+    ) -> Result<Option<(Digest, GitOid, bool)>, WorkspaceError> {
+        let base_head = branch_snap.or(existing_worker_snap);
+
+        let (next_tree, oversized, resolved_merge_main, _measured_bytes) =
+            self.scan_directory_tree_with_heads(branch, dir, base_head, main_snap, &[], false)?;
+        if !oversized.is_empty() {
+            self.record_oversized(branch, dir, &oversized);
+        }
+
+        let parent_snap = base_head.or(main_snap);
+        let merged_second = resolved_merge_main.filter(|m| parent_snap.map(|p| &p.id) != Some(m));
+
+        if let Some(b) = branch_snap
+            && next_tree == b.tree
+            && merged_second.is_none()
+        {
+            return Ok(Some((b.id.clone(), b.git_oid, false)));
+        }
+        let mut parents: Vec<Digest> = parent_snap.map(|p| vec![p.id.clone()]).unwrap_or_default();
+        if let Some(m) = merged_second {
+            parents.push(m);
+        }
+        if let Some(w) = existing_worker_snap
+            && next_tree == w.tree
+            && w.parents == parents
+        {
+            return Ok(Some((w.id.clone(), w.git_oid, false)));
+        }
+        if branch_snap.is_none()
+            && existing_worker_snap.is_none()
+            && next_tree == empty_tree_digest()
+        {
+            return Ok(None);
+        }
+
+        if let Some(w) = existing_worker_snap {
+            let mut synced = false;
+            self.ensure_ref_journal_healed(worker_ref, &w.id, w.git_oid, &mut synced)?;
+        }
+
+        let at_ms = self.commit_now_ms();
+        let commit_body =
+            self.format_body_ms(at_ms, &format!("spawn: pin worker head for {branch}"));
+        let published = self
+            .store
+            .publish_snapshot(
+                self.ledger.as_ref(),
+                &PublishRequest {
+                    project: &self.project,
+                    ref_name: worker_ref,
+                    kind: D6RefKind::Branch,
+                    expected_ref: existing_worker_snap.map(|s| &s.id),
+                    tree: &next_tree,
+                    parents: &parents,
+                    commit_body: &commit_body,
+                    created_at_ms: at_ms,
+                    reason: "d6:pin_worker_head",
+                    landing_task_id: None,
+                },
+            )
+            .map_err(map_store_err)?;
+
+        Ok(Some((published.snapshot, published.git_oid, true)))
+    }
+
+    fn latest_journal_snapshot_for_ref(
+        &self,
+        ref_name: &str,
+    ) -> Result<Option<Digest>, WorkspaceError> {
+        let entries = self.store.cas().read_ref_journal().map_err(map_cas_err)?;
+        Ok(entries
+            .into_iter()
+            .rev()
+            .find(|entry| entry.project == self.project && entry.name == ref_name)
+            .map(|entry| entry.new_snapshot))
+    }
+
+    fn ensure_ref_journal_healed(
+        &self,
+        ref_name: &str,
+        snapshot: &Digest,
+        git_oid: GitOid,
+        synced: &mut bool,
+    ) -> Result<(), WorkspaceError> {
+        let journal_snap = self.latest_journal_snapshot_for_ref(ref_name)?;
+        if journal_snap.as_ref() == Some(snapshot) {
+            return Ok(());
+        }
+        self.cas_branch_ref_and_journal(
+            &BranchRefUpdate {
+                ref_name,
+                expected: Some(snapshot),
+                journal_old: journal_snap.as_ref(),
+                new_snapshot: snapshot,
+                git_oid,
+                at_ms: self.now_ms(),
+                reason: "d6:pin_worker_head:heal_journal",
+            },
+            synced,
+        )?;
+        Ok(())
+    }
+
+    fn pin_ref_to_snapshot(
+        &self,
+        ref_name: &str,
+        snapshot: &Digest,
+        git_oid: GitOid,
+        synced: &mut bool,
+    ) -> Result<(), WorkspaceError> {
+        let existing = self.branch_snapshot(ref_name)?;
+        if let Some(existing_snap) = &existing {
+            if existing_snap.id == *snapshot {
+                return self.ensure_ref_journal_healed(ref_name, snapshot, git_oid, synced);
+            }
+            // If PG advanced on a prior half-write without appending refs.journal, heal the
+            // missing transition up to `existing_snap.id` before appending `existing -> snapshot`.
+            self.ensure_ref_journal_healed(
+                ref_name,
+                &existing_snap.id,
+                existing_snap.git_oid,
+                synced,
+            )?;
+        }
+        let old_snapshot = existing.map(|s| s.id);
+        self.cas_branch_ref_and_journal(
+            &BranchRefUpdate {
+                ref_name,
+                expected: old_snapshot.as_ref(),
+                journal_old: old_snapshot.as_ref(),
+                new_snapshot: snapshot,
+                git_oid,
+                at_ms: self.now_ms(),
+                reason: "d6:pin_worker_head",
+            },
+            synced,
+        )?;
+        Ok(())
     }
 
     /// Refresh L1 `used_bytes` / `dirty_bytes` for `workspace` on `tmpfs` and report whether
@@ -1126,6 +1424,32 @@ impl<L: RefLedger> D6Workspace<L> {
         self.clear_main_copies(branch);
         self.clear_stale(branch);
         let _ = fs::remove_file(self.oversized_path(branch));
+        let worker_ref = worker_head_ref(branch);
+        if let (Some(worker_snap), Some(branch_snap)) = (
+            self.branch_snapshot(&worker_ref)?,
+            self.branch_snapshot(branch)?,
+        ) && worker_snap.id != branch_snap.id
+        {
+            let mut synced = false;
+            self.ensure_ref_journal_healed(
+                &worker_ref,
+                &worker_snap.id,
+                worker_snap.git_oid,
+                &mut synced,
+            )?;
+            self.cas_branch_ref_and_journal(
+                &BranchRefUpdate {
+                    ref_name: &worker_ref,
+                    expected: Some(&worker_snap.id),
+                    journal_old: Some(&worker_snap.id),
+                    new_snapshot: &branch_snap.id,
+                    git_oid: branch_snap.git_oid,
+                    at_ms: self.now_ms(),
+                    reason: "d6:discard_reset_worker_head",
+                },
+                &mut synced,
+            )?;
+        }
         Ok(())
     }
 
@@ -1453,31 +1777,19 @@ impl<L: RefLedger + Send + Sync> WorkspaceStore for D6Workspace<L> {
         };
 
         let at_ms = self.now_ms();
-        self.store.cas().sync_store().map_err(map_cas_err)?;
-        let seq = self
-            .ledger
-            .cas_ref(
-                &self.project,
-                branch.as_str(),
-                D6RefKind::Branch,
-                None,
-                &target.id,
-                "d6:ensure_branch",
-            )
-            .map_err(map_store_err)?;
-        self.store
-            .cas()
-            .append_ref_journal(&JournalEntry {
-                seq,
-                project: self.project.clone(),
-                name: branch.as_str().to_string(),
-                kind: D6RefKind::Branch.as_str().to_string(),
-                old_snapshot: None,
-                new_snapshot: target.id.clone(),
+        let mut synced = false;
+        self.cas_branch_ref_and_journal(
+            &BranchRefUpdate {
+                ref_name: branch.as_str(),
+                expected: None,
+                journal_old: None,
+                new_snapshot: &target.id,
                 git_oid: target.git_oid,
                 at_ms,
-            })
-            .map_err(map_cas_err)?;
+                reason: "d6:ensure_branch",
+            },
+            &mut synced,
+        )?;
 
         Ok(Branch::Created(Fork {
             from: label,
@@ -2938,32 +3250,19 @@ impl<L: RefLedger> D6Workspace<L> {
             .ledger
             .record_snapshot(snap_id, git_oid, tree, parents, &self.project, at_ms)
             .map_err(map_store_err)?;
-        let snap_id = &canonical;
-        let seq = self
-            .ledger
-            .cas_ref(
-                &self.project,
-                branch,
-                D6RefKind::Branch,
-                Some(expected_old),
-                snap_id,
-                reason,
-            )
-            .map_err(map_store_err)?;
-        self.store
-            .cas()
-            .append_ref_journal(&JournalEntry {
-                seq,
-                project: self.project.clone(),
-                name: branch.to_string(),
-                kind: D6RefKind::Branch.as_str().to_string(),
-                old_snapshot: Some(expected_old.clone()),
-                new_snapshot: snap_id.clone(),
+        let mut synced = true;
+        self.cas_branch_ref_and_journal(
+            &BranchRefUpdate {
+                ref_name: branch,
+                expected: Some(expected_old),
+                journal_old: Some(expected_old),
+                new_snapshot: &canonical,
                 git_oid: *git_oid,
                 at_ms,
-            })
-            .map_err(map_cas_err)?;
-        Ok(seq)
+                reason,
+            },
+            &mut synced,
+        )
     }
 
     fn follow_moved_branch(
@@ -4708,6 +5007,76 @@ fn is_engine_runtime(rel: &[u8]) -> bool {
     })
 }
 
+#[derive(Clone, Copy)]
+struct ValidSpawnRef<'a>(&'a str);
+
+impl<'a> ValidSpawnRef<'a> {
+    fn parse(target: &'a str) -> Result<Self, WorkspaceError> {
+        let Some(suffix) = target.strip_prefix("refs/spawn/") else {
+            return Err(WorkspaceError::Unavailable(format!(
+                "refusing to pin worker HEAD outside refs/spawn/: {target}"
+            )));
+        };
+        if suffix.is_empty()
+            || suffix.starts_with('/')
+            || suffix.ends_with('/')
+            || suffix.contains("//")
+            || suffix.contains("..")
+            || suffix.contains("@{")
+            || !suffix.split('/').all(is_valid_git_ref_component)
+        {
+            return Err(WorkspaceError::Unavailable(format!(
+                "invalid spawn target ref {target:?}"
+            )));
+        }
+        Ok(Self(target))
+    }
+
+    const fn as_str(self) -> &'a str {
+        self.0
+    }
+}
+
+fn is_valid_git_ref_component(seg: &str) -> bool {
+    if seg.is_empty()
+        || seg == "@"
+        || seg.starts_with('.')
+        || seg.starts_with('-')
+        || seg.ends_with('.')
+        || seg.contains("..")
+        || seg.contains("@{")
+        || Path::new(seg)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("lock"))
+    {
+        return false;
+    }
+    seg.bytes().all(|b| {
+        (0x21..=0x7e).contains(&b) && !matches!(b, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+    })
+}
+
+fn validate_pin_worker_head_args<'a>(
+    branch: &str,
+    target_refs: &[&'a str],
+) -> Result<Vec<ValidSpawnRef<'a>>, WorkspaceError> {
+    let worker_ref = worker_head_ref(branch);
+    if branch.is_empty()
+        || !is_plain_name(branch)
+        || !is_valid_git_ref_component(branch)
+        || ValidSpawnRef::parse(&worker_ref).is_err()
+    {
+        return Err(WorkspaceError::Unavailable(format!(
+            "invalid branch name {branch:?}"
+        )));
+    }
+    target_refs
+        .iter()
+        .copied()
+        .map(ValidSpawnRef::parse)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::MetadataExt;
@@ -5091,6 +5460,161 @@ MemAvailable:   2087943188 kB
         assert_eq!(
             store.head_clean_merge("agent_work"),
             Some((commit.as_str().to_string(), files))
+        );
+    }
+
+    #[test]
+    fn pin_worker_head_validates_args_boundaries_and_unborn_workspace() {
+        let (scratch, _cas, _ledger, store, _clock) = test_workspace();
+
+        let bad_branch_empty = store.pin_worker_head("", None, &[]).unwrap_err();
+        assert!(bad_branch_empty.to_string().contains("invalid branch name"));
+
+        for bad_branch in [
+            "-evil",
+            "a:b",
+            "x.lock",
+            "café",
+            "a~1",
+            "a..b",
+            "a@{b",
+            "foo..bar",
+            "foo@{0}",
+            "@",
+            "trailing.",
+        ] {
+            let err = store.pin_worker_head(bad_branch, None, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid branch name"),
+                "{bad_branch}: {err}"
+            );
+        }
+
+        let bad_target = store
+            .pin_worker_head("agent_1", None, &["refs/heads/main"])
+            .unwrap_err();
+        assert!(bad_target.to_string().contains("refs/spawn/"));
+
+        for bad_spawn_ref in [
+            "refs/spawn/",
+            "refs/spawn//x",
+            "refs/spawn/tasks/../x",
+            "refs/spawn/tasks/42/",
+            "refs/spawn/tasks/42/with space",
+            "refs/spawn/tasks/42\0x",
+            "refs/spawn/a:b",
+            "refs/spawn/a~1",
+            "refs/spawn/@{x}",
+            "refs/spawn/a*",
+            "refs/spawn/x.lock",
+            "refs/spawn/-x",
+            "refs/spawn/a\\b",
+            "refs/spawn/a^b",
+            "refs/spawn/a?b",
+            "refs/spawn/a[b",
+            "refs/spawn/.hidden",
+            "refs/spawn/trailing.",
+            "refs/spawn/@",
+            "refs/spawn/café",
+            "refs/spawn/a\x7fb",
+        ] {
+            let err = store
+                .pin_worker_head("agent_1", None, &[bad_spawn_ref])
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid spawn target ref"),
+                "{bad_spawn_ref}: {err}"
+            );
+        }
+
+        // Absent branch and None directory -> Ok(None).
+        assert_eq!(
+            store
+                .pin_worker_head("agent_missing", None, &["refs/spawn/tasks/1/head"])
+                .expect("none"),
+            None
+        );
+
+        // Unborn empty workspace directory -> Ok(None) without publishing refs.
+        let unborn_dir = scratch.join("unborn");
+        fs::create_dir_all(unborn_dir.join(".git")).expect("mkdir unborn .git");
+        assert_eq!(
+            store
+                .pin_worker_head(
+                    "agent_unborn",
+                    Some(&unborn_dir),
+                    &["refs/spawn/tasks/2/head"]
+                )
+                .expect("unborn ok"),
+            None
+        );
+        assert_eq!(
+            store
+                .branch_snapshot("refs/spawn/workers/agent_unborn/head")
+                .expect("worker ref"),
+            None
+        );
+
+        // Symlink workspace directory -> fail closed.
+        let ws_link = scratch.join("ws-symlink");
+        std::os::unix::fs::symlink(&unborn_dir, &ws_link).expect("symlink dir");
+        let link_err = store
+            .pin_worker_head("agent_unborn", Some(&ws_link), &[])
+            .unwrap_err();
+        assert!(link_err.to_string().contains("symlink"), "{link_err}");
+    }
+
+    #[test]
+    fn pin_worker_head_ignores_gitdir_pointer_files_like_checkpoint() {
+        let (scratch, cas, _ledger, store, _clock) = test_workspace();
+        let outside = scratch.join("outside.git");
+        fs::create_dir_all(&outside).expect("mkdir outside");
+        fs::write(outside.join("secret.txt"), "secret\n").expect("write secret");
+        let branch = BranchName::new("agent_gitfile").expect("branch");
+        store.ensure_branch(&branch, None).expect("ensure_branch");
+        let ws = store.mount(&branch).expect("mount");
+        let ws_dir = PathBuf::from(ws.path());
+        fs::write(ws_dir.join("work.rs"), "pub fn ok() -> bool { true }\n").expect("write work");
+        fs::write(
+            ws_dir.join(".git"),
+            format!("gitdir: {}\n", outside.display()),
+        )
+        .expect("write gitdir");
+        assert!(store.checkpoint(&ws, "ckpt with gitdir file").is_ok());
+        let task_ref = "refs/spawn/tasks/99/head";
+        let pinned = store
+            .pin_worker_head(branch.as_str(), Some(&ws_dir), &[task_ref])
+            .expect("pin ignores gitdir file")
+            .expect("pinned commit");
+        let pinned_snap = store
+            .branch_snapshot(task_ref)
+            .expect("task lookup")
+            .expect("present");
+        assert_eq!(pinned_snap.git_oid.to_hex(), pinned.as_str());
+        let flat = cas.flatten_tree(&pinned_snap.tree).expect("flatten");
+        assert!(flat.contains_key(b"work.rs".as_slice()));
+        assert!(!flat.contains_key(b".git".as_slice()));
+        assert!(!flat.contains_key(b"secret.txt".as_slice()));
+
+        // Empty `.git` file likewise succeeds just like `checkpoint`.
+        fs::write(ws_dir.join(".git"), "").expect("empty .git");
+        assert!(store.checkpoint(&ws, "ckpt empty gitfile").is_ok());
+        assert!(
+            store
+                .pin_worker_head(branch.as_str(), Some(&ws_dir), &[task_ref])
+                .is_ok()
+        );
+
+        // Symlink .git -> fail closed via workspace scanner.
+        fs::remove_file(ws_dir.join(".git")).expect("rm .git");
+        std::os::unix::fs::symlink(&outside, ws_dir.join(".git")).expect("symlink .git");
+        let sym_dot_git_err = store
+            .pin_worker_head(branch.as_str(), Some(&ws_dir), &[])
+            .unwrap_err();
+        assert!(
+            sym_dot_git_err.to_string().contains(".git")
+                && sym_dot_git_err.to_string().contains("symlink"),
+            "{sym_dot_git_err}"
         );
     }
 }
