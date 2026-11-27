@@ -9,7 +9,7 @@ use std::thread;
 
 use serde_json::Value;
 use spawn_core::observation::{Confidence, SemanticState};
-use spawn_core::observe::{JudgeError, JudgeInput, StateJudge};
+use spawn_core::observe::{ExecutionPhase, JudgeError, JudgeInput, StateJudge};
 use spawn_jev::{JevConfig, JevJudge, build_request, endpoint, parse_reply};
 
 /// The answer body observed from the running service.
@@ -20,10 +20,7 @@ fn input() -> JudgeInput {
         agent_id: "agent_one".to_string(),
         session_id: "session_one".to_string(),
         engine: Some(spawn_core::event::ENGINE.to_string()),
-        execution_active: true,
-        stalled_end: None,
-        last_end: None,
-        exit_code: None,
+        phase: ExecutionPhase::Running,
         open_tools: 1,
         open_jobs: 0,
         oldest_job_ms: None,

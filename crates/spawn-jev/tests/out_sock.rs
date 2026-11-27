@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use spawn_core::observation::SemanticState;
-use spawn_core::observe::{JudgeError, JudgeInput, StateJudge};
+use spawn_core::observe::{ExecutionPhase, JudgeError, JudgeInput, StateJudge};
 use spawn_jev::{JevConfig, JevJudge, OUT_SOCK_ENV, parse_reply, validate_out_sock};
 
 const THREE_ANSWERS: &str = r#"{"model":"jev-1.14.0","answers":{"semantic_state":{"type":"choice","choice":"BLOCKED","confidence":0.77,"probabilities":{"WORKING":0.0,"WAITING":0.18,"BLOCKED":0.82,"COMPLETED":0.0,"UNKNOWN":0.0}},"needs_human":{"type":"noul","noul":0.96},"stuck":{"type":"noul","noul":0.22}},"usage":{"input_tokens":550,"output_tokens":98}}"#;
@@ -63,10 +63,7 @@ fn sample_input() -> JudgeInput {
         agent_id: "agent_one".to_string(),
         session_id: "session_one".to_string(),
         engine: Some(spawn_core::event::ENGINE.to_string()),
-        execution_active: true,
-        stalled_end: None,
-        last_end: None,
-        exit_code: None,
+        phase: ExecutionPhase::Running,
         open_tools: 1,
         open_jobs: 0,
         oldest_job_ms: None,

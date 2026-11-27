@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use super::classify::{
     RulesVerdict, attention_reason, exited_failing, fold_completed, narrow, rules, wait_reason,
 };
-use super::judge::{JudgeInput, StateJudge};
+use super::judge::{ExecutionPhase, JudgeInput, StateJudge};
 use super::snapshot::Snapshot;
 use super::{RECHECK_EVERY, RETRY_BASE, RETRY_MAX, SETTLE};
 use crate::event::{EventKind, EventRecord, GlobalPosition, NewEvent, SessionSeq, Source};
@@ -140,7 +140,7 @@ impl Tracked {
         if self.failures > 0 {
             elapsed(retry_after(self.failures))
         } else {
-            self.snapshot.execution_active && elapsed(RECHECK_EVERY)
+            self.snapshot.phase.is_live() && elapsed(RECHECK_EVERY)
         }
     }
 
@@ -170,7 +170,7 @@ impl Tracked {
         }
         match self.judged_at {
             Some(at) if self.failures > 0 => soonest(at.plus(retry_after(self.failures))),
-            Some(at) if self.snapshot.execution_active => soonest(at.plus(RECHECK_EVERY)),
+            Some(at) if self.snapshot.phase.is_live() => soonest(at.plus(RECHECK_EVERY)),
             Some(_) => {}
             None => soonest(now),
         }
@@ -421,7 +421,7 @@ impl Observer {
         );
         observation.attention = state == SemanticState::Blocked;
         if observation.attention {
-            let reason = if input.stalled_end.is_some() {
+            let reason = if matches!(input.phase, ExecutionPhase::EndStalled(_)) {
                 "end_stalled"
             } else {
                 "permission"
@@ -669,10 +669,13 @@ fn fingerprint_of(input: &JudgeInput, progress: SessionSeq) -> String {
             .filter(|c| !c.is_ascii_digit())
             .collect::<String>()
     });
+    // The phase counts as its wire fields, in the places they always had,
+    // so a fingerprint stored before the phase was one value still matches.
+    let phase = input.phase.wire();
     let shown = serde_json::json!([
         input.ambiguity,
         progress.0,
-        input.exit_code,
+        phase.exit_code,
         screen,
         input.task,
         input.perpetual,
@@ -680,9 +683,9 @@ fn fingerprint_of(input: &JudgeInput, progress: SessionSeq) -> String {
         input.turn,
         input.open_tools,
         input.permission_pending,
-        input.execution_active,
-        input.stalled_end,
-        input.last_end,
+        phase.execution_active,
+        phase.stalled_end,
+        phase.last_end,
     ]);
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in shown.to_string().bytes() {
@@ -737,5 +740,53 @@ mod tests {
         assert!(!asks_human("a human should look at the HUMAN: tag docs"));
         assert!(asks_human("Done.\nHUMAN: which region?\n\n  "));
         assert!(!asks_human("HUMAN: which region?\nI will use us-east."));
+    }
+
+    /// Fingerprints are stored and compared after a restart: each phase
+    /// digests to what its loose fields digested to (captured from
+    /// 69d618e5), so no session asks the model again for unchanged evidence.
+    #[test]
+    fn a_phase_keeps_the_fingerprint_its_loose_fields_had() {
+        use crate::event::{EndCause, SessionSeq};
+        use crate::observe::{ExecutionPhase, JudgeInput};
+
+        let input = |phase| JudgeInput {
+            agent_id: "agent_a".into(),
+            session_id: "session_a".into(),
+            engine: Some("claude".into()),
+            phase,
+            open_tools: 1,
+            evidence_seq: SessionSeq(7),
+            ..JudgeInput::default()
+        };
+        let cases = [
+            (ExecutionPhase::NeverRan, "21eb29b9be43afa4"),
+            (ExecutionPhase::Running, "fdd1b26f59d79249"),
+            (
+                ExecutionPhase::EndStalled(EndCause::Stopped),
+                "ba2f2f1bd58d6a93",
+            ),
+            (
+                ExecutionPhase::Ended {
+                    cause: EndCause::Exited,
+                    exit_code: Some(1),
+                },
+                "aebcbc9613f01188",
+            ),
+            (
+                ExecutionPhase::Ended {
+                    cause: EndCause::Lost,
+                    exit_code: None,
+                },
+                "4f261e0c13d52b41",
+            ),
+        ];
+        for (phase, golden) in cases {
+            assert_eq!(
+                super::fingerprint_of(&input(phase), SessionSeq(3)),
+                golden,
+                "{phase:?}"
+            );
+        }
     }
 }

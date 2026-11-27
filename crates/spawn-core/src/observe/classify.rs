@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use super::judge::{JudgeInput, Judgement, TurnFact};
+use super::judge::{ExecutionPhase, JudgeInput, Judgement, TurnFact};
 use super::{CONFIDENT, LIKELY, LONG_TOOL, QUIET_AFTER};
 use crate::event::EndCause;
 use crate::observation::{Ambiguity, Confidence, SemanticState, WaitReason};
@@ -31,17 +31,17 @@ pub enum RulesVerdict {
 
 /// The rules tier: decide what the facts settle, mark the rest ambiguous.
 pub fn rules(input: &JudgeInput) -> RulesVerdict {
-    // Work that exists only in a mounted workspace, which nothing can
-    // commit: someone has to look, whatever else the facts say.
-    if input.stalled_end.is_some() {
-        return RulesVerdict::Certain {
+    match input.phase {
+        // Work that exists only in a mounted workspace, which nothing can
+        // commit: someone has to look, whatever else the facts say.
+        ExecutionPhase::EndStalled(_) => RulesVerdict::Certain {
             state: SemanticState::Blocked,
-        };
-    }
-    if input.execution_active {
-        live_execution(input)
-    } else {
-        ended_execution(input)
+        },
+        ExecutionPhase::Running => live_execution(input),
+        ExecutionPhase::NeverRan => RulesVerdict::Certain {
+            state: SemanticState::Waiting,
+        },
+        ExecutionPhase::Ended { cause, .. } => ended_execution(cause, input),
     }
 }
 
@@ -123,8 +123,7 @@ fn at_prompt(input: &JudgeInput) -> bool {
 /// it waits on its own job, which is work, not idleness. However long the
 /// job runs: its bound is the control layer's (`SPAWN_JOB_BOUND_SECS`).
 pub(super) fn waits_on_own_job(input: &JudgeInput) -> bool {
-    input.execution_active
-        && input.stalled_end.is_none()
+    input.phase == ExecutionPhase::Running
         && !input.permission_pending
         && input.open_tools == 0
         && input.open_jobs > 0
@@ -136,15 +135,15 @@ pub(super) fn waits_on_own_job(input: &JudgeInput) -> bool {
         && at_prompt(input)
 }
 
-/// Rules for a session with no running execution.
-fn ended_execution(input: &JudgeInput) -> RulesVerdict {
+/// Rules for a session whose latest execution ended with `cause`.
+fn ended_execution(cause: EndCause, input: &JudgeInput) -> RulesVerdict {
     use RulesVerdict::{Ambiguous, Certain};
-    match input.last_end {
-        Some(EndCause::Stopped) => Certain {
+    match cause {
+        EndCause::Stopped => Certain {
             state: SemanticState::Completed,
         },
         // A failing exit status makes "it got stuck" the safer guess.
-        Some(EndCause::Exited) => Ambiguous {
+        EndCause::Exited => Ambiguous {
             ambiguity: Ambiguity::ExitedOnItsOwn,
             guess: if exited_failing(input) {
                 SemanticState::Blocked
@@ -152,19 +151,22 @@ fn ended_execution(input: &JudgeInput) -> RulesVerdict {
                 SemanticState::Completed
             },
         },
-        Some(EndCause::Lost) => Ambiguous {
+        EndCause::Lost => Ambiguous {
             ambiguity: Ambiguity::Lost,
             guess: SemanticState::Unknown,
-        },
-        None => Certain {
-            state: SemanticState::Waiting,
         },
     }
 }
 
 /// Whether the latest execution reported a failing exit status.
 pub(super) fn exited_failing(input: &JudgeInput) -> bool {
-    input.exit_code.is_some_and(|code| code != 0)
+    matches!(
+        input.phase,
+        ExecutionPhase::Ended {
+            exit_code: Some(code),
+            ..
+        } if code != 0
+    )
 }
 
 /// Why a session in `state` waits, as far as the facts tell.
@@ -176,7 +178,7 @@ pub(super) fn wait_reason(state: SemanticState, input: &JudgeInput) -> Option<Wa
         SemanticState::Waiting => {
             // Suppress false WaitingForUserInput on active executions unless
             // no tool is open and the session is genuinely at its prompt (#104).
-            let truly_waiting = !input.execution_active
+            let truly_waiting = !input.phase.is_live()
                 || (!input.permission_pending
                     && input.open_tools == 0
                     && input.screen != Some(ScreenState::Busy)
@@ -315,10 +317,7 @@ mod tests {
             agent_id: "agent_a".into(),
             session_id: "session_a".into(),
             engine: Some("claude".into()),
-            execution_active: true,
-            stalled_end: None,
-            last_end: None,
-            exit_code: None,
+            phase: ExecutionPhase::Running,
             open_tools: 1,
             open_jobs: 0,
             oldest_job_ms: None,
@@ -356,10 +355,7 @@ mod tests {
             agent_id: "agent_a".into(),
             session_id: "session_a".into(),
             engine: Some("agy".into()),
-            execution_active: true,
-            stalled_end: None,
-            last_end: None,
-            exit_code: None,
+            phase: ExecutionPhase::Running,
             open_tools: 0,
             open_jobs: 1,
             oldest_job_ms: Some(1_000),
