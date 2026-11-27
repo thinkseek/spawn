@@ -737,6 +737,16 @@ wait_for 90 "the supervisor back after its herdr-core daemon was killed" new_liv
 pass "herdr-core daemon killed -> supervisor resumed"
 
 before=$(execution_of session_supervisor)
+# new_live becomes true on ExecutionStarted while Bridge::prompt_engine still
+# holds the Resume command lease with Typing::Unknown; SIGKILLing the loop
+# mid-prompt causes Bridge::go_on_starting to intentionally abandon the
+# execution on restart rather than risk double-typing.
+exec_cmd_finished() {
+  local cmd_id=${1#exec_}
+  case "$cmd_id" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$(e2e_psql -q -At -c "select 1 from spawn_commands where id = $cmd_id and state = 'finished' and succeeded = true")" = "1" ]
+}
+wait_for 30 "the supervisor's resume command ($before) to finish" exec_cmd_finished "$before"
 kill -KILL "$loop_pid"; wait "$loop_pid" 2>/dev/null || true
 start_loop
 sleep 5
