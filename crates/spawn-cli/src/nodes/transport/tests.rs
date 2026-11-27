@@ -1,74 +1,10 @@
-//! The transports' rules without a socket: what an endpoint is, the hops
-//! and modes a join may say, the route the membership gives, the loops
-//! refused, the nonces and the forward's bounds.
+//! The SSH transport's rules without a host: the hops a join may say, the
+//! route the membership gives, the loops refused, and retired transport
+//! handling.
 
-use super::{
-    Endpoint, MAX_HOPS, Mode, Route, Transport, accepted, forward, hop_names, loops_back, nonce,
-    route, valid_nonce,
-};
+use super::{MAX_HOPS, Member, Op, Route, hop_names, loops_back, probe_route, route};
 use serde_json::{Value, json};
 use std::time::Duration;
-
-#[test]
-fn an_endpoint_is_host_and_port_with_its_transport_and_nothing_else() {
-    for (text, transport, url) in [
-        (
-            "gw.example:7000",
-            Some(Transport::Tcp),
-            "tcp://gw.example:7000",
-        ),
-        ("tcp://gw:1", Some(Transport::Tcp), "tcp://gw:1"),
-        ("udp://10.0.0.1:65535", None, "udp://10.0.0.1:65535"),
-        ("[::1]:9", Some(Transport::Udp), "udp://[::1]:9"),
-        ("tcp://[2001:db8::7]:7001", None, "tcp://[2001:db8::7]:7001"),
-    ] {
-        let endpoint = Endpoint::parse(text, transport).expect(text);
-        assert_eq!(endpoint.url(), url);
-    }
-    let long = format!("{}:1", "a".repeat(260));
-    for (text, transport) in [
-        ("gw", Some(Transport::Tcp)),
-        ("gw:0", Some(Transport::Tcp)),
-        ("gw:65536", Some(Transport::Tcp)),
-        ("gw:123456", Some(Transport::Tcp)),
-        ("gw:", Some(Transport::Tcp)),
-        ("user@gw:22", Some(Transport::Tcp)),
-        ("tcp://user:pw@gw:22", None),
-        ("-oProxyCommand=sh:22", Some(Transport::Tcp)),
-        ("gw x:22", Some(Transport::Tcp)),
-        ("gw\n:22", Some(Transport::Tcp)),
-        ("udp://gw:1", Some(Transport::Tcp)),
-        ("ssh://gw:22", None),
-        ("http://gw:80", None),
-        ("gw:1", None),
-        ("gw:1", Some(Transport::Ssh)),
-        ("[::1:22", Some(Transport::Tcp)),
-        ("[zz]:22", Some(Transport::Tcp)),
-        ("::1:22", Some(Transport::Tcp)),
-        ("_gw:1", Some(Transport::Tcp)),
-        (long.as_str(), Some(Transport::Tcp)),
-    ] {
-        assert!(
-            Endpoint::parse(text, transport).is_err(),
-            "{text:?} taken as an endpoint"
-        );
-    }
-    assert!(
-        Endpoint::parse("tcp://0.0.0.0:7", None)
-            .expect("bind")
-            .unspecified()
-    );
-    assert!(
-        Endpoint::parse("udp://[::]:7", None)
-            .expect("bind")
-            .unspecified()
-    );
-    assert!(
-        !Endpoint::parse("tcp://127.0.0.1:7", None)
-            .expect("an address")
-            .unspecified()
-    );
-}
 
 #[test]
 fn hops_are_at_most_eight_names_none_twice_never_the_node_itself() {
@@ -88,18 +24,8 @@ fn hops_are_at_most_eight_names_none_twice_never_the_node_itself() {
     }
 }
 
-#[test]
-fn a_mode_defaults_to_relay_with_hops_and_direct_without() {
-    assert_eq!(Mode::or_default(None, 0), Ok(Mode::Direct));
-    assert_eq!(Mode::or_default(None, 2), Ok(Mode::Relay));
-    assert_eq!(Mode::or_default(Some("hole_punch"), 0), Ok(Mode::HolePunch));
-    assert_eq!(Mode::or_default(Some("relay"), 0), Ok(Mode::Relay));
-    assert!(Mode::or_default(Some("direct"), 1).is_err());
-    assert!(Mode::or_default(Some("mesh"), 0).is_err());
-}
-
-/// The store's membership: ssh nodes (one an old join, without transport),
-/// tcp and udp nodes, one relayed.
+/// The store's membership: SSH nodes (one an old join without `transport`)
+/// and historical non-SSH joins (`tcp`, `udp`, `coord`) from before Phase 2d.
 fn members() -> Value {
     json!([
         {"name": "jump", "ssh": "ckl@jump", "join": 1},
@@ -109,66 +35,54 @@ fn members() -> Value {
          "via": [], "join": 3},
         {"name": "relay-hk", "ssh": null, "transport": "udp", "endpoint": "udp://[2001:db8::7]:7001",
          "via": ["gw"], "join": 4},
+        {"name": "mesh-node", "ssh": null, "transport": "coord", "endpoint": "wss://c.example/mesh",
+         "via": [], "join": 5},
     ])
 }
 
 #[test]
-fn the_route_resolves_each_hop_from_the_membership_by_its_transport() {
+fn the_route_resolves_ssh_hops_and_rejects_retired_or_invalid_routes() {
     let hops = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
     assert_eq!(
-        route(
-            Transport::Ssh,
-            "ckl@deep",
-            &hops(&["jump", "bastion"]),
-            &members()
-        ),
+        route("ckl@deep", &hops(&["jump", "bastion"]), &members()),
         Ok(Route::Ssh {
             destination: "ckl@deep".into(),
             jumps: vec!["ckl@jump".into(), "ssh://ops@bastion:2222".into()],
         })
     );
-    let Ok(Route::Net(path)) = route(
-        Transport::Udp,
-        "udp://edge:9",
-        &hops(&["gw", "relay-hk"]),
-        &members(),
-    ) else {
-        panic!("a path");
-    };
-    assert_eq!(
-        path.iter().map(Endpoint::url).collect::<Vec<_>>(),
-        ["tcp://gw:7000", "udp://[2001:db8::7]:7001", "udp://edge:9"]
-    );
-    assert_eq!(
-        route(Transport::Tcp, "tcp://edge:9", &[], &members()),
-        Ok(Route::Net(vec![
-            Endpoint::parse("tcp://edge:9", None).expect("an endpoint")
-        ]))
-    );
-    for (transport, endpoint, via, why) in [
-        (Transport::Ssh, "deep", hops(&["gw"]), "reached over tcp"),
-        (
-            Transport::Tcp,
-            "edge:9",
-            hops(&["jump"]),
-            "reached over ssh",
-        ),
-        (
-            Transport::Tcp,
-            "edge:9",
-            hops(&["nowhere"]),
-            "hop nowhere is not joined",
-        ),
-        (
-            Transport::Ssh,
-            "-oProxyCommand=x",
-            hops(&[]),
-            "not an ssh destination",
-        ),
+    for (destination, via, why) in [
+        ("deep", hops(&["gw"]), "reached over tcp"),
+        ("deep", hops(&["mesh-node"]), "reached over coord"),
+        ("deep", hops(&["nowhere"]), "hop nowhere is not joined"),
+        ("-oProxyCommand=x", hops(&[]), "not an ssh destination"),
     ] {
-        let error = route(transport, endpoint, &via, &members()).expect_err(why);
+        let error = route(destination, &via, &members()).expect_err(why);
         assert!(error.contains(why), "{why}: {error}");
     }
+}
+
+#[test]
+fn historical_non_ssh_members_report_retired_transport_without_panicking() {
+    let all = members();
+    for (name, expected_transport) in [("gw", "tcp"), ("relay-hk", "udp"), ("mesh-node", "coord")] {
+        let entry = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == name)
+            .expect(name);
+        let member = Member::of(entry);
+        let error = member.route(&all).expect_err("retired transport");
+        assert!(
+            error.contains("retired") && error.contains(expected_transport),
+            "{name}: {error}"
+        );
+    }
+    let broken_ssh = json!({"name": "broken", "transport": "ssh", "ssh": null, "endpoint": null});
+    let error = Member::of(&broken_ssh)
+        .route(&all)
+        .expect_err("missing ssh destination");
+    assert!(error.contains("ssh destination"), "{error}");
 }
 
 #[test]
@@ -180,100 +94,28 @@ fn a_hop_reached_through_the_node_itself_is_a_loop() {
     assert!(!loops_back(&members(), &hops(&[]), "gw"));
     // Deeper: a via b via c; c may not join via a.
     let chain = json!([
-        {"name": "a", "transport": "tcp", "endpoint": "a:1", "via": ["b"]},
-        {"name": "b", "transport": "tcp", "endpoint": "b:1", "via": ["c"]},
+        {"name": "a", "transport": "ssh", "ssh": "a", "via": ["b"]},
+        {"name": "b", "transport": "ssh", "ssh": "b", "via": ["c"]},
     ]);
     assert!(loops_back(&chain, &hops(&["a"]), "c"));
 }
 
 #[test]
-fn every_nonce_is_new_and_a_message_carries_only_a_plain_one() {
-    let mut seen = std::collections::BTreeSet::new();
-    for _ in 0..1000 {
-        let nonce = nonce();
-        assert!(valid_nonce(&nonce), "{nonce}");
-        assert!(seen.insert(nonce), "a nonce twice");
-    }
-    for bad in [
-        "",
-        "short",
-        "has space in it ok ok",
-        "{\"a\":1}xxxxxxxxxxxxxx",
-    ] {
-        assert!(!valid_nonce(bad), "{bad:?}");
-    }
-    assert!(!valid_nonce(&"a".repeat(81)));
-}
-
-#[test]
-fn a_forward_is_bounded_in_hops_and_passes_on_less_time() {
-    let hop = Endpoint::parse("tcp://h:1", None).expect("an endpoint");
-    let envelope = forward(
-        std::slice::from_ref(&hop),
-        &json!({"nonce": nonce(), "op": "beat"}),
-        Duration::from_secs(5),
-        None,
-    )
-    .expect("a forward");
-    assert_eq!(envelope["op"], "forward");
-    assert_eq!(envelope["ttl"], 1);
-    assert_eq!(envelope["hops"], json!(["tcp://h:1"]));
-    assert!(envelope["timeout_ms"].as_u64() < Some(5000));
-    assert!(forward(&[], &json!({}), Duration::from_secs(5), None).is_err());
-    assert!(
-        forward(
-            &vec![hop.clone(); MAX_HOPS + 1],
-            &json!({}),
-            Duration::from_secs(5),
-            None
-        )
-        .is_err()
+fn probe_route_rejects_unsafe_ssh_destinations_or_jumps() {
+    let bad_dest = Route::Ssh {
+        destination: "-oProxyCommand=sh".into(),
+        jumps: Vec::new(),
+    };
+    assert_eq!(
+        probe_route(&bad_dest, Op::Beat, Duration::from_secs(1)),
+        Err("not an ssh destination".to_string())
     );
-    assert!(
-        forward(&[hop], &json!({}), Duration::from_millis(500), None).is_err(),
-        "no time left"
+    let bad_jump = Route::Ssh {
+        destination: "ckl@deep".into(),
+        jumps: vec!["-oProxyCommand=sh".into()],
+    };
+    assert_eq!(
+        probe_route(&bad_jump, Op::Beat, Duration::from_secs(1)),
+        Err("not an ssh destination".to_string())
     );
-}
-
-#[test]
-fn a_refusal_is_said_in_one_masked_line() {
-    let error = accepted(json!({"ok": false,
-                                "error": "fatal: postgres://spawn:hunter2secret@db/spawn"}))
-    .expect_err("refused");
-    assert!(error.starts_with("the node refused"), "{error}");
-    assert!(!error.contains("hunter2secret"), "{error}");
-    assert!(accepted(json!({"ok": true, "output": "x"})).is_ok());
-    assert!(accepted(json!({"ok": "true"})).is_err());
-}
-
-#[test]
-fn a_relay_counts_loopback_link_local_and_their_mapped_forms_forbidden() {
-    for ip in [
-        "127.0.0.1",
-        "127.255.0.9",
-        "0.0.0.0",
-        "169.254.169.254",
-        "255.255.255.255",
-        "224.0.0.1",
-        "::1",
-        "::",
-        "fe80::1",
-        "febf::1",
-        "::ffff:127.0.0.1",
-        "::ffff:0.0.0.0",
-        "::ffff:169.254.1.1",
-        "ff02::1",
-    ] {
-        assert!(super::forbidden(ip.parse().expect(ip)), "{ip}");
-    }
-    for ip in [
-        "10.0.0.1",
-        "192.168.1.9",
-        "203.0.113.9",
-        "2001:db8::7",
-        "fec0::1",
-        "::ffff:10.0.0.1",
-    ] {
-        assert!(!super::forbidden(ip.parse().expect(ip)), "{ip}");
-    }
 }

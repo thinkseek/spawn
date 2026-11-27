@@ -731,7 +731,7 @@ fn ssh_through_hops_hardens_every_jump_host_with_a_nested_proxy_command() {
         jumps: vec!["-oProxyCommand=sh".into()],
     };
     assert_eq!(
-        super::transport::probe_route(&route, super::Op::Beat, Duration::from_secs(1), None),
+        super::transport::probe_route(&route, super::Op::Beat, Duration::from_secs(1)),
         Err("not an ssh destination".to_string())
     );
 }
@@ -773,41 +773,30 @@ fn words(text: &str) -> Vec<String> {
 }
 
 #[test]
-fn node_add_takes_one_transport_its_hops_and_a_mode() {
+fn node_add_takes_ssh_its_hops_and_rejects_retired_flags() {
     use super::commands::add_target;
-    use super::transport::{Mode, Transport};
     let target =
         |text: &str| add_target("edge", &crate::Flags::parse(&words(text)).expect("flags"));
-    let read = target("--udp 203.0.113.9:7001 --via gw,relay-hk").expect("a target");
-    assert_eq!(
-        (read.transport, read.endpoint.as_str(), read.mode),
-        (Transport::Udp, "udp://203.0.113.9:7001", Mode::Relay)
-    );
-    assert_eq!(read.via, ["gw", "relay-hk"]);
-    let read = target("--ssh ckl@deep --via jump").expect("ssh through a jump host");
-    assert_eq!(
-        (read.transport, read.endpoint.as_str()),
-        (Transport::Ssh, "ckl@deep")
-    );
-    let read = target("--tcp tcp://[::1]:7000 --mode hole_punch").expect("a target");
-    assert_eq!(
-        (read.endpoint.as_str(), read.mode),
-        ("tcp://[::1]:7000", Mode::HolePunch)
-    );
-    assert_eq!(target("--tcp gw:1").expect("a target").mode, Mode::Direct);
+    let read = target("--ssh ckl@deep --via jump,bastion --note rack4").expect("ssh through jumps");
+    assert_eq!(read.destination, "ckl@deep");
+    assert_eq!(read.via, ["jump", "bastion"]);
+    let read = target("--ssh ssh://ops@host:2222").expect("direct ssh");
+    assert_eq!(read.destination, "ssh://ops@host:2222");
+    assert!(read.via.is_empty());
+
     for (text, why) in [
-        ("--note x", "exactly one of --ssh, --tcp, --udp"),
-        ("--ssh a --tcp b:1", "exactly one"),
-        ("--tcp udp://gw:1", "--tcp"),
-        ("--tcp gw", "--tcp"),
-        ("--udp 0.0.0.0:7", "name no node"),
+        ("--note x", "requires --ssh"),
         ("--ssh -oProxyCommand=sh", "--ssh is"),
-        ("--tcp gw:1 --via edge", "its own via"),
-        ("--tcp gw:1 --via a,a", "twice"),
-        ("--tcp gw:1 --via a,b,c,d,e,f,g,h,i", "at most 8"),
-        ("--tcp gw:1 --via a --mode direct", "--mode"),
-        ("--tcp gw:1 --mode mesh", "--mode"),
-        ("--tcp gw:1 --port 7", "no --port"),
+        ("--ssh host --via edge", "its own via"),
+        ("--ssh host --via a,a", "twice"),
+        ("--ssh host --via a,b,c,d,e,f,g,h,i", "at most 8"),
+        ("--ssh host --port 7", "no --port"),
+        ("--ssh host --mode relay", "no --mode"),
+        ("--tcp gw:1", "retired"),
+        ("--udp 203.0.113.9:7001", "retired"),
+        ("--coord wss://c.example/mesh --peer edge", "retired"),
+        ("--ssh host --node-id deadbeef", "retired"),
+        ("--ssh host --peer edge", "retired"),
     ] {
         let error = target(text).expect_err(text);
         assert!(error.contains(why), "{text}: {error}");
@@ -815,12 +804,12 @@ fn node_add_takes_one_transport_its_hops_and_a_mode() {
 }
 
 #[test]
-fn a_join_over_tcp_records_its_endpoint_and_one_over_ssh_its_destination() {
+fn a_join_over_ssh_records_its_destination_and_hops() {
     use super::commands::{add_target, joined_record};
     let facts = inventory(DESKTOP).expect("an inventory");
-    let flags = crate::Flags::parse(&words("--tcp gw:7000 --via relay")).expect("flags");
-    let target = add_target("edge", &flags).expect("a target");
-    let record = joined_record("edge", &target, facts.clone(), Some("rack 4"));
+    let flags = crate::Flags::parse(&words("--ssh ckl@deep --via jump")).expect("flags");
+    let target = add_target("deep", &flags).expect("a target");
+    let record = joined_record("deep", &target, facts.clone(), Some("rack 4"));
     assert_eq!(
         json!([
             record["type"],
@@ -834,10 +823,10 @@ fn a_join_over_tcp_records_its_endpoint_and_one_over_ssh_its_destination() {
         ]),
         json!([
             "node.joined",
+            "ckl@deep",
+            "ssh",
             null,
-            "tcp",
-            "tcp://gw:7000",
-            ["relay"],
+            ["jump"],
             "relay",
             "rack 4",
             16
@@ -859,142 +848,30 @@ fn a_join_over_tcp_records_its_endpoint_and_one_over_ssh_its_destination() {
 }
 
 #[test]
-fn node_serve_takes_registrations_only_with_a_token() {
-    use super::commands::serve_config;
-    // Registrations only with a token: fail closed.
-    let error =
-        serve_config(&words("--tcp 0.0.0.0:7 --register-store"), None).expect_err("no token");
-    assert!(
-        error.contains("--register-store requires SPAWN_NODE_TOKEN"),
-        "{error}"
-    );
-    assert!(
-        serve_config(
-            &words("--tcp 0.0.0.0:7 --register-store"),
-            Some(String::new())
-        )
-        .is_err()
-    );
-    let config = serve_config(
-        &words("--tcp 0.0.0.0:7 --register-store --allow-loopback-forward"),
-        Some("k".into()),
-    )
-    .expect("a token");
-    assert!(config.register_store && config.allow_loopback_forward);
-    assert!(
-        !serve_config(&words("--tcp 0.0.0.0:7"), None)
-            .expect("no store")
-            .allow_loopback_forward
-    );
-}
-
-#[test]
-fn node_serve_listens_on_tcp_udp_or_both_and_register_goes_up_its_hops() {
-    use super::commands::{registration, serve_config};
-    let binds = |text: &str| {
-        serve_config(&words(text), None).map(|config| {
-            config
-                .binds
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-    };
-    assert_eq!(
-        binds("--listen tcp://0.0.0.0:7000,udp://0.0.0.0:7000"),
-        Ok(vec![
-            "tcp://0.0.0.0:7000".into(),
-            "udp://0.0.0.0:7000".into()
-        ])
-    );
-    assert_eq!(
-        binds("--tcp 127.0.0.1:0 --udp [::]:7001"),
-        Ok(vec!["tcp://127.0.0.1:0".into(), "udp://[::]:7001".into()])
-    );
-    assert!(binds("").is_err());
-    assert!(
-        binds("--listen 0.0.0.0:7000").is_err(),
-        "a scheme to listen with"
-    );
-    assert!(binds("--tcp udp://h:1").is_err());
-
-    let read = |text: &str| registration(&crate::Flags::parse(&words(text)).expect("flags"));
-    let up = read(
-        "--to coord:7000 --name edge --listen udp://203.0.113.9:7001 \
-         --via gw=tcp://gw:7000,hk=udp://hk:7001 --note behind-nat",
-    )
-    .expect("a registration");
-    assert_eq!(
-        up.path.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        ["udp://hk:7001", "tcp://gw:7000", "udp://coord:7000"],
-        "up from the nearest hop; --to takes --listen's scheme"
-    );
-    assert_eq!(
-        json!([
-            up.message["op"],
-            up.message["name"],
-            up.message["transport"],
-            up.message["endpoint"],
-            up.message["via"],
-            up.message["mode"]
-        ]),
-        json!([
-            "register",
-            "edge",
-            "udp",
-            "udp://203.0.113.9:7001",
-            ["gw", "hk"],
-            "relay"
-        ])
-    );
-    let direct = read("--to tcp://coord:7000 --name edge --listen udp://edge:1 --via gw")
-        .expect("hops named, the way up straight");
-    assert_eq!(
-        direct
-            .path
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        ["tcp://coord:7000"]
-    );
-    for (text, why) in [
-        (
-            "--to c:1 --name edge --listen udp://0.0.0.0:1",
-            "not 0.0.0.0",
-        ),
-        ("--to c:1 --name -e --listen udp://e:1", "--name"),
-        ("--to c:1 --name e --listen e:1", "--listen"),
-        (
-            "--to c:1 --name e --listen udp://e:1 --via a=tcp://a:1,b",
-            "every hop",
-        ),
-        (
-            "--to c:1 --name e --listen udp://e:1 --via e",
-            "its own via",
-        ),
-        (
-            "--to c:1 --name e --listen udp://e:1 --via a --mode direct",
-            "--mode",
-        ),
-        ("--name e --listen udp://e:1", "--to is required"),
-    ] {
-        let error = read(text).expect_err(text);
-        assert!(error.contains(why), "{text}: {error}");
+fn retired_mesh_commands_point_to_go_spawn_node() {
+    for verb in ["serve", "register", "coord", "connect"] {
+        let error = super::command(&words(verb)).expect_err(verb);
+        assert!(
+            error.contains("retired") && error.contains("spawn-node"),
+            "{verb}: {error}"
+        );
     }
 }
 
 #[test]
-fn the_heartbeat_probes_each_node_over_its_own_transport_and_hops() {
+fn the_heartbeat_probes_ssh_nodes_and_handles_historical_non_ssh_records_gracefully() {
     let members = json!([
         {"name": "gw", "ssh": null, "transport": "tcp", "endpoint": "tcp://gw:7000", "via": [],
          "join": 1, "lost": null, "beat_ms": null},
         {"name": "edge", "ssh": null, "transport": "udp", "endpoint": "udp://edge:7001",
          "via": ["gw"], "join": 2, "lost": null, "beat_ms": null},
-        {"name": "orphan", "ssh": null, "transport": "udp", "endpoint": "udp://o:7001",
-         "via": ["removed"], "join": 3, "lost": null, "beat_ms": null},
-        {"name": "deep", "ssh": "ckl@deep", "transport": "ssh", "endpoint": "ckl@deep",
-         "via": ["jump"], "join": 4, "lost": null, "beat_ms": null},
-        {"name": "jump", "ssh": "ckl@jump", "join": 5, "lost": null, "beat_ms": null},
+        {"name": "mesh", "ssh": null, "transport": "coord", "endpoint": "wss://c.example/mesh",
+         "via": [], "join": 3, "lost": null, "beat_ms": null},
+        {"name": "orphan", "ssh": "ckl@orphan", "transport": "ssh", "endpoint": null,
+         "via": ["removed"], "join": 4, "lost": null, "beat_ms": null},
+        {"name": "deep", "ssh": "ckl@deep", "transport": "ssh", "endpoint": null,
+         "via": ["jump"], "join": 5, "lost": null, "beat_ms": null},
+        {"name": "jump", "ssh": "ckl@jump", "join": 6, "lost": null, "beat_ms": null},
     ]);
     let mut watch = HeartbeatScheduler::new(60_000);
     watch.sync(&members, at(0));
@@ -1006,12 +883,13 @@ fn the_heartbeat_probes_each_node_over_its_own_transport_and_hops() {
             .map(|probe| probe.route.clone())
             .expect(name)
     };
-    let path = |route: Result<super::Route, String>| match route {
-        Ok(super::Route::Net(path)) => path.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(path(route("gw")), ["tcp://gw:7000"]);
-    assert_eq!(path(route("edge")), ["tcp://gw:7000", "udp://edge:7001"]);
+    assert_eq!(
+        route("jump"),
+        Ok(super::Route::Ssh {
+            destination: "ckl@jump".into(),
+            jumps: Vec::new()
+        })
+    );
     assert_eq!(
         route("deep"),
         Ok(super::Route::Ssh {
@@ -1021,6 +899,34 @@ fn the_heartbeat_probes_each_node_over_its_own_transport_and_hops() {
     );
     let error = route("orphan").expect_err("its hop is gone");
     assert!(error.contains("hop removed is not joined"), "{error}");
+
+    // Historical non-SSH records produce retired-transport Err routes and
+    // start() reports them on the outcome channel without panicking.
+    let (done, ends) = std::sync::mpsc::channel();
+    let origin = Instant::now();
+    for (name, expected_transport) in [("gw", "tcp"), ("edge", "udp"), ("mesh", "coord")] {
+        let err = route(name).expect_err(name);
+        assert!(
+            err.contains("retired") && err.contains(expected_transport),
+            "{name}: {err}"
+        );
+        let job = probes
+            .iter()
+            .find(|probe| probe.name == name)
+            .cloned()
+            .expect(name);
+        super::start(job, &done, origin);
+        let outcome = ends
+            .recv_timeout(Duration::from_secs(1))
+            .expect("immediate retired outcome");
+        assert_eq!(outcome.name, name);
+        let why = outcome
+            .answer
+            .as_ref()
+            .expect_err("retired route fails cleanly");
+        assert!(why.contains("retired"), "{name}: {why}");
+        watch.take(outcome);
+    }
 }
 
 /// [`INVENTORY`]'s output on a MacBook (darwin/arm64, issue #91), as its
