@@ -19,7 +19,7 @@ main, changes nothing live until that commit is gated and deployed.
 | `spawn-model-relay` (and `.path` staged) | `scripts/model-relay.py` on 127.0.0.1:8791 (`GET /healthz` -> `{"ok":true}`): the engines' model calls, `deepseek-*` to DeepSeek with `DEEPSEEK_API_KEY` (dual-mode ready for Keep `$CREDENTIALS_DIRECTORY/deepseek.api-key`, exit `78` fail-closed; currently still fed by `~/.config/spawn/model-relay.env`, 0600, until operator Wave K1 cutover), everything else to the gateway of `~/.claude/settings.json` with the engine's own auth ([fleet-architecture.md §3.3](../../docs/fleet-architecture.md#33-engine-models)) | never (`RestartPreventExitStatus=243 78` once cut over to Keep) |
 | `spawn-node-gateway` | `spawn-node-gateway` on `SPAWN_NODE_GATEWAY_LISTEN` (default 127.0.0.1:18096): the signed HTTP front of the node ledger for spawn-node v1 ([node-protocol-v1.md](../../docs/node-protocol-v1.md)), logged in as the restricted `spawn_node_gateway` login from `~/.config/spawn/node-gateway.env` (0600), never `spawn.env`; installed by hand (below) | never (`Restart=always`) |
 | `spawn-core` | **Phase 2 opt-in** (`SPAWN_DEPLOY_EDGE_MODE=go-uds`): `spawn serve --ipc --ipc-sock %t/spawn/core.sock`, the local UDS IPC control core with zero direct TCP edge exposure ([spawn-ipc-v1.md](../../docs/spawn-ipc-v1.md)) | never (`Restart=always`) |
-| `spawn-node-edge` | **Phase 2 opt-in** (`SPAWN_DEPLOY_EDGE_MODE=go-uds`): `spawn-node front --serve edge --core-sock %t/spawn/core.sock --listen ${SPAWN_SERVE_ADDRESS} --web ${SPAWN_WEB_DIR}` HTTP/SSE & PWA front (zero `spawn.env` / `*DATABASE_URL*`) | never (`Restart=always`) |
+| `spawn-node-edge` (and `.path` staged) | **Phase 2 opt-in** (`SPAWN_DEPLOY_EDGE_MODE=go-uds`): `spawn-node front --serve edge --core-sock %t/spawn/core.sock --listen ${SPAWN_SERVE_ADDRESS} --web ${SPAWN_WEB_DIR}` HTTP/SSE & PWA front (dual-mode ready for Keep `$CREDENTIALS_DIRECTORY/spawn-serve.token` + `--require-serve-token-credential` fail-closed exit `78` per `thinkseek/spawn-node#12`; currently retains optional `EnvironmentFile=-%h/.config/spawn/node-edge.env` until Wave K2 cutover; zero `spawn.env` / `*DATABASE_URL*`) | never (`RestartPreventExitStatus=243 78` once cut over to Keep) |
 | `spawn-node-gw` | **Phase 2 opt-in** (`SPAWN_DEPLOY_EDGE_MODE=go-uds`): `spawn-node front --serve node --core-sock %t/spawn/core.sock` signed node gateway front (zero `spawn.env` / `*DATABASE_URL*`) | never (`Restart=always`) |
 | `spawn-node-out` | **Phase 2 opt-in** (`SPAWN_DEPLOY_EDGE_MODE=go-uds`): `spawn-node front --serve outbound --out-sock %t/spawn/out.sock` outbound Jev relay with `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key`, `RestartPreventExitStatus=243 78`, and zero `spawn.env` / `*DATABASE_URL*` | never; stays stopped while Keep key is absent or empty |
 | `spawn-fleet-test-db` | PostgreSQL 16 on a Unix socket only (`~/.local/share/spawn-rsi/fleet-pg`): the fleet's test server, which engines get as `SPAWN_TEST_DATABASE_URL` once it checks out (below) | never (`Restart=on-failure`) |
@@ -474,7 +474,7 @@ Keep (`~/.keep` on the owner host, delivered to `/run/keep/<id>` mode `0600`) ke
 | `spawn-node-out.service` | `keep_managed` | `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key` (`EnvironmentFile=-%h/.config/spawn/node-out.env` optional non-secret override only) | `typesafe.api-key` | Delivered (`RestartPreventExitStatus=243 78`, probe `unix://%t/spawn/out.sock\|/out/v1/health`: HTTP `200` healthy, `503` -> `service_down`) |
 | `spawn-agent-presence.service`, `spawn-agent-presence-upload.service`, `spawn-fleet-test-db.service`, `spawn-shadow-observe.service` | `no_secrets` | None (`spawn-agent-presence-upload` reads its own optional token file when enabled) | None | No `EnvironmentFile=` / `LoadCredential=` needed |
 | `spawn-node-gw.service` | `no_secrets` | Optional `EnvironmentFile=-%h/.config/spawn/node-gw.env` non-secret host overrides only (zero `spawn.env` / `*DATABASE_URL*`) | None | `go_unit_pg_isolation` enforced continuously |
-| `spawn-node-edge.service` | `pending_migration` | Optional `EnvironmentFile=-%h/.config/spawn/node-edge.env` (holds `SPAWN_SERVE_TOKEN` when serving off loopback; zero `spawn.env` / `*DATABASE_URL*`) | `spawn-serve.token` | `LoadCredential=spawn-serve.token:/run/keep/spawn-serve.token` (`go_unit_pg_isolation` enforced continuously) |
+| `spawn-node-edge.service` | `pending_migration` (Wave K2 prepared) | Optional `EnvironmentFile=-%h/.config/spawn/node-edge.env` (`SPAWN_SERVE_TOKEN` off loopback; zero `spawn.env` / `*DATABASE_URL*`); `spawn-node` (`thinkseek/spawn-node#12`) supports `$CREDENTIALS_DIRECTORY/spawn-serve.token` + `--require-serve-token-credential` (exit `78` fail-closed), and `spawn-node-edge.path` is staged | `spawn-serve.token` | `LoadCredential=spawn-serve.token:/run/keep/spawn-serve.token` + `RestartPreventExitStatus=243 78` + `--require-serve-token-credential` (`go_units_pg_isolation` enforced continuously) |
 | `spawn-model-relay.service` | `pending_migration` (Wave K1 prepared) | `EnvironmentFile=%h/.config/spawn/model-relay.env` (`DEEPSEEK_API_KEY`); `model-relay.py` supports `$CREDENTIALS_DIRECTORY/deepseek.api-key` + `GET /healthz`, and `spawn-model-relay.path` is staged | `deepseek.api-key` | `LoadCredential=deepseek.api-key:/run/keep/deepseek.api-key` + `RestartPreventExitStatus=243 78` (once Keep delivers `/run/keep/deepseek.api-key`) |
 | `spawn-node-gateway.service` | `pending_migration` | `EnvironmentFile=%h/.config/spawn/node-gateway.env` (`SPAWN_NODE_GATEWAY_DATABASE_URL`) | `spawn-node-gateway.database-url` | `LoadCredential=spawn-node-gateway.database-url:/run/keep/spawn-node-gateway.database-url` |
 | `spawn-serve.service`, `spawn-core.service` | `pending_migration` | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` | `spawn.database-url`, `spawn-serve.token` | `LoadCredential=` or restricted config + `SPAWN_SERVE_TOKEN` delivery |
@@ -524,6 +524,37 @@ Wave K1 ships dual-mode support safely before Keep delivers `deepseek.api-key`:
      bash scripts/keep/credential-health.sh
      ```
   4. **Rollback**: restore `~/.config/spawn/model-relay.env` (`0600`) and `EnvironmentFile=%h/.config/spawn/model-relay.env`, disable `spawn-model-relay.path`, `systemctl --user daemon-reload`, and `systemctl --user restart spawn-model-relay.service`.
+
+### Wave K2 Cutover Procedure (Node Edge -> Keep)
+
+Wave K2 prepares `spawn-node-edge.service` for Keep delivery of `spawn-serve.token` safely before `/run/keep/spawn-serve.token` exists on live hosts:
+
+- **Pre-cutover safety (safe on live VMs now)**:
+  - Merged `thinkseek/spawn-node#12` (`spawn-node front --serve edge`) resolves `$CREDENTIALS_DIRECTORY/spawn-serve.token` (stripping at most one trailing `\n` and validating `1..=256` visible ASCII bytes), fails closed with exit `78` (`EX_CONFIG`) without echoing secret bytes or falling back to `SPAWN_SERVE_TOKEN` whenever the credential file is unreadable/empty/invalid or `--require-serve-token-credential` is passed, preserves transitional fallback to `SPAWN_SERVE_TOKEN` when `CREDENTIALS_DIRECTORY` is unset (and `--require-serve-token-credential` is omitted), and enforces `CheckZeroDatabaseEnv` before credential loading.
+  - `deploy/systemd/spawn-node-edge.path` (`PathChanged=/run/keep/spawn-serve.token` -> `Unit=spawn-node-edge.service`) is committed and ignored by `deploy/sync-units.sh` while uninstalled.
+  - `deploy/systemd/spawn-node-edge.service` intentionally retains `EnvironmentFile=-%h/.config/spawn/node-edge.env` (and omits `LoadCredential=` / `--require-serve-token-credential`), and `scripts/keep/credentials.manifest` omits `spawn-serve.token` until Keep actively delivers `/run/keep/spawn-serve.token`.
+- **Operator cutover steps** (only after `thinkseek/spawn-node#12` is deployed to `~/.local/share/spawn-rsi/bin/spawn-node` and Keep delivers `/run/keep/spawn-serve.token` mode `0600`):
+  1. Confirm delivery, verify `go_units_pg_isolation=ok`, and dry-run validate a 3-row staged manifest (`typesafe.api-key`, `deepseek.api-key`, and `spawn-serve.token` -> `spawn-node-edge.service`):
+     ```sh
+     test -s /run/keep/spawn-serve.token && [ "$(stat -c %a /run/keep/spawn-serve.token)" = 600 ]
+     bash scripts/keep/credential-health.sh --audit-keep-migration
+     bash scripts/keep/credential-health.sh --validate-manifest /path/to/wave-k2-staged.manifest
+     ```
+  2. Cut over unit, redaction map, and health manifest in the follow-up cutover commit (preserving `go_units_pg_isolation` across unit and `~/.config/systemd/user/spawn-node-edge.service.d/*.conf` with zero `spawn.env` / `*DATABASE_URL*`):
+     - In `deploy/systemd/spawn-node-edge.service`, remove `EnvironmentFile=-%h/.config/spawn/node-edge.env` (keep any non-secret host overrides such as `SPAWN_SERVE_ADDRESS` in a host-local drop-in listed in `deploy/systemd/host-local`, since `credential-health.sh` flags any `EnvironmentFile=` on a Keep-managed unit), add `LoadCredential=spawn-serve.token:/run/keep/spawn-serve.token` and `RestartPreventExitStatus=243 78`, and append `--require-serve-token-credential` to `ExecStart` so missing or malformed credentials fail closed with exit `78` (`EX_CONFIG`).
+     - Add `"spawn-serve.token": ".config/spawn/node-edge.env"` to `KEEP` in `scripts/redact/secret-values.py` before retiring `~/.config/spawn/node-edge.env`.
+     - Append the `spawn-serve.token` row (`spawn-serve.token | spawn-node-edge.service | - | - | ~/.config/spawn/node-edge.env | SPAWN_SERVE_TOKEN | -`) to `scripts/keep/credentials.manifest`.
+  3. Install and enable the `.path` unit, restart `spawn-node-edge.service`, retire `~/.config/spawn/node-edge.env` (recording any retired value if rotating), and verify:
+     ```sh
+     cp deploy/systemd/spawn-node-edge.path deploy/systemd/spawn-node-edge.service ~/.config/systemd/user/
+     systemctl --user daemon-reload
+     systemctl --user enable --now spawn-node-edge.path
+     systemctl --user restart spawn-node-edge.service
+     systemctl --user is-active spawn-node-edge.service
+     bash scripts/keep/credential-health.sh --audit-keep-migration
+     bash scripts/keep/credential-health.sh
+     ```
+  4. **Rollback**: restore `~/.config/spawn/node-edge.env` (`0600`, zero Postgres credentials), revert `deploy/systemd/spawn-node-edge.service` to `EnvironmentFile=-%h/.config/spawn/node-edge.env` without `LoadCredential=`, `RestartPreventExitStatus=243 78`, or `--require-serve-token-credential`, disable `spawn-node-edge.path`, run `systemctl --user daemon-reload`, and restart `spawn-node-edge.service`.
 
 ## The controller
 

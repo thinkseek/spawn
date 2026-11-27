@@ -1453,5 +1453,8 @@ fn spawn_reader_reads_nodes_v1_with_build_sha_and_node_version_without_secrets()
     assert!(node.last_beat_ms.is_some());
     assert_eq!(node.build_sha.as_deref(), Some(sha));
     assert_eq!(node.node_version.as_deref(), Some("0.1.0"));
-    assert_eq!(node.power.as_ref().and_then(|p| p["on_ac"].as_bool()), Some(true));
+    assert_eq!(
+        node.power.as_ref().and_then(|p| p["on_ac"].as_bool()),
+        Some(true)
+    );
 }
