@@ -19,7 +19,7 @@ use spawn_core::feature_deps::{
     Precision, Scope, Unit, UnitKind,
 };
 
-use crate::manifest::{self, CargoManifest};
+use crate::manifest::{self, CargoManifest, GoModManifest};
 use crate::rust::{self, FileFacts, ModuleFacts, UseEntry};
 
 /// Maximum number of re-export hops followed through Rust `pub use`,
@@ -183,14 +183,16 @@ struct Graph<'a> {
 
 /// Build the code graph of every source and manifest in `sources` (path
 /// to text): Rust and `Cargo.toml`, JavaScript / TypeScript and
-/// `package.json` / `tsconfig.json`, and Python and `pyproject.toml`.
-/// References resolve only to paths in `inventory`, the in-scope file set.
+/// `package.json` / `tsconfig.json`, Python and `pyproject.toml`, and Go
+/// and `go.mod`. References resolve only to paths in `inventory`, the
+/// in-scope file set.
 pub(crate) fn build(inventory: &BTreeSet<String>, sources: &BTreeMap<String, String>) -> CodeGraph {
     let rust_ecma = merge(
         build_rust(inventory, sources),
         build_ecma(inventory, sources),
     );
-    merge(rust_ecma, build_python(inventory, sources))
+    let with_py = merge(rust_ecma, build_python(inventory, sources));
+    merge(with_py, build_go(inventory, sources))
 }
 
 /// Build the code graph of the Rust sources and `Cargo.toml` manifests in
@@ -2844,6 +2846,362 @@ fn merge(mut first: CodeGraph, second: CodeGraph) -> CodeGraph {
     first
 }
 
+/// Build the code graph of the Go sources and `go.mod` manifests in
+/// `sources`.
+pub(crate) fn build_go(
+    inventory: &BTreeSet<String>,
+    sources: &BTreeMap<String, String>,
+) -> CodeGraph {
+    let mut graph = GoGraph {
+        inventory,
+        units: BTreeMap::new(),
+        by_module: BTreeMap::new(),
+        modules_by_len: Vec::new(),
+        pkg_prod_files: BTreeMap::new(),
+        facts: BTreeMap::new(),
+        edges: BTreeSet::new(),
+        diagnostics: Vec::new(),
+        external_imports: 0,
+    };
+    graph.read_manifests(sources);
+    graph.index_packages();
+    graph.parse_sources(sources);
+    graph.resolve_all();
+    graph.finish(sources)
+}
+
+#[derive(Debug, Clone)]
+struct GoUnit {
+    id: Option<String>,
+    root: String,
+    manifest: GoModManifest,
+    /// `(old_module_prefix, resolved_repo_dir)` sorted longest prefix first.
+    local_replaces: Vec<(String, String)>,
+}
+
+enum GoImportTarget {
+    InRepoDir(String),
+    KnownUnresolved,
+    External,
+}
+
+struct GoGraph<'a> {
+    inventory: &'a BTreeSet<String>,
+    units: BTreeMap<String, GoUnit>,
+    by_module: BTreeMap<String, String>,
+    modules_by_len: Vec<(String, String)>,
+    pkg_prod_files: BTreeMap<String, Vec<String>>,
+    facts: BTreeMap<String, crate::go::GoFileFacts>,
+    edges: BTreeSet<FileEdge>,
+    diagnostics: Vec<Diagnostic>,
+    external_imports: usize,
+}
+
+fn match_go_module_prefix<'a>(import_path: &'a str, prefix: &str) -> Option<&'a str> {
+    if import_path == prefix {
+        return Some("");
+    }
+    import_path
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/'))
+}
+
+fn is_relative_go_import(spec: &str) -> bool {
+    spec == "." || spec == ".." || spec.starts_with("./") || spec.starts_with("../")
+}
+
+impl GoGraph<'_> {
+    fn read_manifests(&mut self, sources: &BTreeMap<String, String>) {
+        let mut module_roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (path, text) in sources {
+            if !crate::is_go_mod(path) {
+                continue;
+            }
+            let root = dir_of(path).to_string();
+            match manifest::read_go_mod(text) {
+                Ok(parsed) => {
+                    let mod_path = parsed.module_path.clone().unwrap_or_default();
+                    let mut local_replaces: Vec<(String, String)> = parsed
+                        .local_replaces
+                        .iter()
+                        .filter_map(|rep| {
+                            normalize(&join(&root, &rep.new_local_path))
+                                .map(|target| (rep.old_path.clone(), target))
+                        })
+                        .collect();
+                    local_replaces.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
+                    module_roots.entry(mod_path).or_default().push(root.clone());
+                    self.units.insert(
+                        root.clone(),
+                        GoUnit {
+                            id: None,
+                            root,
+                            manifest: parsed,
+                            local_replaces,
+                        },
+                    );
+                }
+                Err(error) => self.diagnostics.push(diagnostic(
+                    DiagnosticCode::ManifestUnsupported,
+                    path,
+                    (error.line > 0).then_some(error.line),
+                    format!("not read, no unit made: {}", error.message),
+                )),
+            }
+        }
+
+        for (mod_path, roots) in module_roots {
+            if let [root] = roots.as_slice() {
+                if let Some(unit) = self.units.get_mut(root) {
+                    unit.id = Some(format!("go:{mod_path}"));
+                }
+                self.by_module.insert(mod_path, root.clone());
+            } else {
+                for root in roots {
+                    self.diagnostics.push(diagnostic(
+                        DiagnosticCode::ManifestUnsupported,
+                        &join(&root, "go.mod"),
+                        None,
+                        format!(
+                            "module path {mod_path} is not unique in the repository: no unit made"
+                        ),
+                    ));
+                }
+            }
+        }
+        self.modules_by_len = self
+            .by_module
+            .iter()
+            .map(|(mod_path, root)| (mod_path.clone(), root.clone()))
+            .collect();
+        self.modules_by_len
+            .sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
+    }
+
+    fn index_packages(&mut self) {
+        for path in self.inventory {
+            if crate::go::is_go_source(path) && !crate::go::is_test_path(path) {
+                self.pkg_prod_files
+                    .entry(dir_of(path).to_string())
+                    .or_default()
+                    .push(path.clone());
+            }
+        }
+    }
+
+    fn parse_sources(&mut self, sources: &BTreeMap<String, String>) {
+        for (path, text) in sources {
+            if !crate::go::is_go_source(path) {
+                continue;
+            }
+            let facts = crate::go::parse(text);
+            if let Some(reason) = facts.unparsed {
+                self.diagnostics
+                    .push(diagnostic(DiagnosticCode::Unparsed, path, None, reason));
+            } else {
+                self.facts.insert(path.clone(), facts);
+            }
+        }
+    }
+
+    fn nearest_unit(&self, dir: &str) -> Option<&GoUnit> {
+        let mut cur = dir;
+        loop {
+            if let Some(unit) = self.units.get(cur) {
+                return Some(unit);
+            }
+            if cur.is_empty() {
+                return None;
+            }
+            cur = dir_of(cur);
+        }
+    }
+
+    fn resolve_target(&self, from: &str, import_path: &str) -> GoImportTarget {
+        if is_relative_go_import(import_path) {
+            return match normalize(&join(dir_of(from), import_path)) {
+                Some(dir) if self.pkg_prod_files.contains_key(&dir) => {
+                    GoImportTarget::InRepoDir(dir)
+                }
+                _ => GoImportTarget::KnownUnresolved,
+            };
+        }
+
+        if let Some(unit) = self.nearest_unit(dir_of(from)) {
+            for (old_prefix, target_root) in &unit.local_replaces {
+                if let Some(suffix) = match_go_module_prefix(import_path, old_prefix) {
+                    let candidate = join(target_root, suffix);
+                    if let Some(norm) = normalize(&candidate)
+                        && self.pkg_prod_files.contains_key(&norm)
+                    {
+                        return GoImportTarget::InRepoDir(norm);
+                    }
+                    return GoImportTarget::KnownUnresolved;
+                }
+            }
+        }
+
+        for (mod_path, unit_root) in &self.modules_by_len {
+            if let Some(suffix) = match_go_module_prefix(import_path, mod_path) {
+                let candidate = join(unit_root, suffix);
+                if let Some(norm) = normalize(&candidate)
+                    && self.pkg_prod_files.contains_key(&norm)
+                {
+                    return GoImportTarget::InRepoDir(norm);
+                }
+                return GoImportTarget::KnownUnresolved;
+            }
+        }
+
+        GoImportTarget::External
+    }
+
+    fn resolve_all(&mut self) {
+        let sources: Vec<(String, Vec<crate::go::GoImport>)> = self
+            .facts
+            .iter()
+            .map(|(path, facts)| (path.clone(), facts.imports.clone()))
+            .collect();
+
+        for (from, imports) in sources {
+            let scope = crate::go::scope_of(&from);
+            let mut emitted_targets = BTreeSet::new();
+            for imp in imports {
+                match self.resolve_target(&from, &imp.path) {
+                    GoImportTarget::InRepoDir(dir) => {
+                        let Some(targets) = self.pkg_prod_files.get(&dir) else {
+                            continue;
+                        };
+                        for to in targets {
+                            if to == &from || !emitted_targets.insert(to.clone()) {
+                                continue;
+                            }
+                            self.edges.insert(FileEdge {
+                                from: from.clone(),
+                                to: to.clone(),
+                                kind: EdgeKind::GoImport,
+                                scope,
+                                line: imp.line,
+                                via: None,
+                                precision: Precision::Package,
+                            });
+                        }
+                    }
+                    GoImportTarget::KnownUnresolved => {
+                        self.diagnostics.push(diagnostic(
+                            DiagnosticCode::Unresolved,
+                            &from,
+                            Some(imp.line),
+                            format!("{} names no in-scope Go package", imp.path),
+                        ));
+                    }
+                    GoImportTarget::External => {
+                        self.external_imports += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_unit_entries(&self, unit_root: &str) -> Vec<String> {
+        let mut by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (path, facts) in &self.facts {
+            if crate::go::is_test_path(path) || facts.package_name.as_deref() != Some("main") {
+                continue;
+            }
+            let dir = dir_of(path).to_string();
+            let owned = self
+                .nearest_unit(&dir)
+                .is_some_and(|owner| owner.root == unit_root && owner.id.is_some());
+            if owned {
+                by_dir.entry(dir).or_default().push(path.clone());
+            }
+        }
+        let mut entries = Vec::new();
+        for (dir, mut files) in by_dir {
+            files.sort();
+            let main_go = join(&dir, "main.go");
+            if files.contains(&main_go) {
+                entries.push(main_go);
+            } else {
+                entries.extend(files);
+            }
+        }
+        entries.sort();
+        entries.dedup();
+        entries
+    }
+
+    fn collect_declared_units(&self, go_unit: &GoUnit) -> Vec<String> {
+        let mut declared = BTreeSet::new();
+        for req in &go_unit.manifest.requires {
+            if let Some(target_root) = self.by_module.get(req)
+                && target_root != &go_unit.root
+            {
+                declared.insert(format!("go:{req}"));
+            }
+        }
+        for (_, target_root) in &go_unit.local_replaces {
+            if let Some(target_unit) = self.nearest_unit(target_root)
+                && target_unit.root != go_unit.root
+                && let Some(dep_id) = &target_unit.id
+            {
+                declared.insert(dep_id.clone());
+            }
+        }
+        declared.into_iter().collect()
+    }
+
+    fn finish(self, sources: &BTreeMap<String, String>) -> CodeGraph {
+        let mut units = Vec::new();
+        for go_unit in self.units.values() {
+            let Some(id) = &go_unit.id else {
+                continue;
+            };
+            units.push(Unit {
+                id: id.clone(),
+                kind: UnitKind::GoModule,
+                root: go_unit.root.clone(),
+                entry_files: self.collect_unit_entries(&go_unit.root),
+                declared_units: self.collect_declared_units(go_unit),
+            });
+        }
+        let entry_files: BTreeSet<&String> = units.iter().flat_map(|u| &u.entry_files).collect();
+        let mut files = BTreeMap::new();
+        for path in sources.keys().filter(|path| crate::go::is_go_source(path)) {
+            let unit = self
+                .nearest_unit(dir_of(path))
+                .and_then(|owner| owner.id.clone());
+            files.insert(
+                path.clone(),
+                FileInfo {
+                    language: Language::Go,
+                    unit,
+                    class: if crate::go::is_test_path(path) {
+                        FileClass::Test
+                    } else {
+                        FileClass::Source
+                    },
+                    is_entry: entry_files.contains(path),
+                    in_module_tree: false,
+                    parsed: self.facts.contains_key(path),
+                },
+            );
+        }
+        units.sort_by(|a, b| (&a.id, &a.root).cmp(&(&b.id, &b.root)));
+        let mut diagnostics = self.diagnostics;
+        diagnostics.sort();
+        diagnostics.dedup();
+        CodeGraph {
+            units,
+            edges: self.edges.into_iter().collect(),
+            files,
+            diagnostics,
+            external_imports: self.external_imports,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3151,6 +3509,236 @@ mod tests {
                 && edge.to == "deep/l0/src/mod2.ts"
                 && edge.kind == EdgeKind::Import
                 && edge.line == 1
+        }));
+    }
+
+    const GO_MULTI_PKG_FIXTURE: &[(&str, &str)] = &[
+        (
+            "libs/common/go.mod",
+            "module github.com/acme/common\n\ngo 1.26\n",
+        ),
+        (
+            "libs/common/codec/codec.go",
+            "package codec\n\nimport \"crypto/sha256\"\n\nfunc Hash() { _ = sha256.New }\n",
+        ),
+        (
+            "svc/go.mod",
+            concat!(
+                "module github.com/acme/svc\n\n",
+                "go 1.26\n\n",
+                "require (\n",
+                "    github.com/acme/common v0.0.0\n",
+                "    example.com/thirdparty v1.0.0\n",
+                ")\n\n",
+                "replace github.com/acme/common => ../libs/common\n",
+            ),
+        ),
+        (
+            "svc/internal/config/config.go",
+            "package config\n\nfunc Port() int { return 8080 }\n",
+        ),
+        (
+            "svc/internal/hub/hub.go",
+            concat!(
+                "// comment mentioning import \"github.com/acme/svc/internal/missing\"\n",
+                "/* block comment\n",
+                "   import \"github.com/acme/svc/internal/missing\"\n",
+                "*/\n",
+                "package hub\n",
+                "\n",
+                "import (\n",
+                "    \"fmt\"\n",
+                "    cfg \"github.com/acme/svc/internal/config\"\n",
+                "    _ \"github.com/acme/common/codec\"\n",
+                "    \"C\"\n",
+                ")\n",
+                "import dup \"github.com/acme/svc/internal/config\"\n",
+                "\n",
+                "var decoy = `import \"github.com/acme/svc/internal/missing\"`\n",
+                "var decoy2 = \"import \\\"github.com/acme/svc/internal/missing\\\"\"\n",
+            ),
+        ),
+        (
+            "svc/internal/hub/helper.go",
+            "package hub\n\nfunc Helper() {}\n",
+        ),
+        (
+            "svc/internal/hub/hub_test.go",
+            concat!(
+                "package hub_test\n",
+                "\n",
+                "import (\n",
+                "    \"testing\"\n",
+                "    \"github.com/acme/svc/internal/hub\"\n",
+                "    \"github.com/acme/svc/internal/config\"\n",
+                ")\n",
+            ),
+        ),
+        (
+            "svc/cmd/node/main.go",
+            concat!(
+                "package main\n",
+                "\n",
+                "import (\n",
+                "    \"github.com/acme/svc/internal/hub\"\n",
+                "    \"example.com/thirdparty/pkg\"\n",
+                ")\n",
+                "\n",
+                "func main() {}\n",
+            ),
+        ),
+        (
+            "svc/broken/missing.go",
+            "package broken\n\nimport \"github.com/acme/svc/internal/does_not_exist\"\n",
+        ),
+    ];
+
+    #[test]
+    fn go_multi_package_units_and_file_metadata() {
+        let graph = crate::build_from_table(GO_MULTI_PKG_FIXTURE);
+        assert_eq!(graph.units.len(), 2);
+
+        let common_unit = graph
+            .units
+            .iter()
+            .find(|u| u.id == "go:github.com/acme/common")
+            .expect("common unit");
+        assert_eq!(common_unit.kind, UnitKind::GoModule);
+        assert_eq!(common_unit.root, "libs/common");
+        assert!(common_unit.entry_files.is_empty());
+        assert!(common_unit.declared_units.is_empty());
+
+        let svc_unit = graph
+            .units
+            .iter()
+            .find(|u| u.id == "go:github.com/acme/svc")
+            .expect("svc unit");
+        assert_eq!(svc_unit.kind, UnitKind::GoModule);
+        assert_eq!(svc_unit.root, "svc");
+        assert_eq!(svc_unit.entry_files, vec!["svc/cmd/node/main.go"]);
+        assert_eq!(
+            svc_unit.declared_units,
+            vec!["go:github.com/acme/common".to_string()]
+        );
+
+        let main_info = &graph.files["svc/cmd/node/main.go"];
+        assert_eq!(main_info.language, Language::Go);
+        assert_eq!(main_info.class, FileClass::Source);
+        assert!(main_info.is_entry && main_info.parsed);
+        assert_eq!(main_info.unit.as_deref(), Some("go:github.com/acme/svc"));
+
+        let test_info = &graph.files["svc/internal/hub/hub_test.go"];
+        assert_eq!(test_info.language, Language::Go);
+        assert_eq!(test_info.class, FileClass::Test);
+        assert!(!test_info.is_entry && test_info.parsed);
+    }
+
+    #[test]
+    fn go_multi_package_resolution_replace_tests_and_dedup() {
+        let graph = crate::build_from_table(GO_MULTI_PKG_FIXTURE);
+        let got_edges: Vec<(&str, &str, EdgeKind, Scope, Precision)> = graph
+            .edges
+            .iter()
+            .map(|e| (e.from.as_str(), e.to.as_str(), e.kind, e.scope, e.precision))
+            .collect();
+        assert_eq!(
+            got_edges,
+            vec![
+                (
+                    "svc/cmd/node/main.go",
+                    "svc/internal/hub/helper.go",
+                    EdgeKind::GoImport,
+                    Scope::Prod,
+                    Precision::Package,
+                ),
+                (
+                    "svc/cmd/node/main.go",
+                    "svc/internal/hub/hub.go",
+                    EdgeKind::GoImport,
+                    Scope::Prod,
+                    Precision::Package,
+                ),
+                (
+                    "svc/internal/hub/hub.go",
+                    "libs/common/codec/codec.go",
+                    EdgeKind::GoImport,
+                    Scope::Prod,
+                    Precision::Package,
+                ),
+                (
+                    "svc/internal/hub/hub.go",
+                    "svc/internal/config/config.go",
+                    EdgeKind::GoImport,
+                    Scope::Prod,
+                    Precision::Package,
+                ),
+                (
+                    "svc/internal/hub/hub_test.go",
+                    "svc/internal/config/config.go",
+                    EdgeKind::GoImport,
+                    Scope::Test,
+                    Precision::Package,
+                ),
+                (
+                    "svc/internal/hub/hub_test.go",
+                    "svc/internal/hub/helper.go",
+                    EdgeKind::GoImport,
+                    Scope::Test,
+                    Precision::Package,
+                ),
+                (
+                    "svc/internal/hub/hub_test.go",
+                    "svc/internal/hub/hub.go",
+                    EdgeKind::GoImport,
+                    Scope::Test,
+                    Precision::Package,
+                ),
+            ]
+        );
+
+        // External/stdlib imports: crypto/sha256, fmt, C, testing, example.com/thirdparty/pkg.
+        assert_eq!(graph.external_imports, 5);
+        assert_eq!(graph.diagnostics.len(), 1);
+        assert_eq!(graph.diagnostics[0].code, DiagnosticCode::Unresolved);
+        assert_eq!(graph.diagnostics[0].path, "svc/broken/missing.go");
+        assert_eq!(graph.diagnostics[0].line, Some(3));
+    }
+
+    #[test]
+    fn polyglot_rust_python_and_go_merge_deterministically() {
+        let graph = crate::build_from_table(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"fx-core\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub mod sub;\n"),
+            ("src/sub.rs", "pub fn ok() {}\n"),
+            ("go/go.mod", "module github.com/acme/node\n"),
+            (
+                "go/cmd/app/main.go",
+                "package main\n\nimport \"github.com/acme/node/pkg\"\n\nfunc main() {}\n",
+            ),
+            ("go/pkg/pkg.go", "package pkg\n\nfunc Hello() {}\n"),
+        ]);
+        assert!(
+            graph
+                .units
+                .iter()
+                .any(|u| u.id == "cargo:fx-core" && u.kind == UnitKind::CargoPackage)
+        );
+        assert!(
+            graph
+                .units
+                .iter()
+                .any(|u| u.id == "go:github.com/acme/node" && u.kind == UnitKind::GoModule)
+        );
+        assert!(graph.edges.iter().any(|e| {
+            e.from == "go/cmd/app/main.go"
+                && e.to == "go/pkg/pkg.go"
+                && e.kind == EdgeKind::GoImport
+        }));
+        assert!(graph.edges.iter().any(|e| {
+            e.from == "src/lib.rs" && e.to == "src/sub.rs" && e.kind == EdgeKind::Mod
         }));
     }
 }
