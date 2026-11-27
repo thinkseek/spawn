@@ -15,7 +15,8 @@ use postgres::Client;
 use serde_json::{Value, json};
 use spawn_core::port::StoreError;
 use spawn_postgres::{
-    FaultNext, NodeAction, NodeEnroll, PostgresStore, RemoteJobKind, RemoteJobSpec, RemoteJobState,
+    FaultNext, FaultOutcome, FaultStrike, NodeAction, NodeEnroll, NodeStatus, PostgresStore,
+    RemoteJobKind, RemoteJobProgress, RemoteJobSpec, RemoteJobState,
 };
 
 /// The schema's own text, and its S1 block's markers.
@@ -312,10 +313,13 @@ fn the_ledger_behaves_as_the_design_measured_it() {
         json!([{"job_id": jobs[0], "lease_epoch": 3}])
     );
     assert_eq!(grants(&rebooted), [], "a draining node takes nothing");
-    assert_eq!(state(&store, &jobs[1]).state, RemoteJobState::ResultPending);
+    assert_eq!(
+        state(&store, &jobs[1]).state(),
+        RemoteJobState::ResultPending
+    );
     let fenced = state(&store, &jobs[2]);
     assert_eq!(
-        (fenced.state, fenced.lease_epoch),
+        (fenced.state(), fenced.lease_epoch),
         (RemoteJobState::Queued, 2)
     );
     let stale = beat_once(&store, &node, &b1, 9, &json!({}));
@@ -323,14 +327,21 @@ fn the_ledger_behaves_as_the_design_measured_it() {
 
     assert!(!store.remote_job_take_local(&jobs[2], 0).expect("take"));
     assert!(store.remote_job_take_local(&jobs[2], 2).expect("take"));
-    assert_eq!(state(&store, &jobs[2]).state, RemoteJobState::FallbackLocal);
+    assert_eq!(
+        state(&store, &jobs[2]).state(),
+        RemoteJobState::FallbackLocal
+    );
 
     let fault = store
         .remote_job_fault(&jobs[0], 3, "sandbox_never_started", true, FaultNext::Keep)
         .expect("a fault");
     assert_eq!(
-        (fault.ok, fault.strikes, fault.degraded),
-        (true, Some(1), Some(false))
+        fault,
+        FaultOutcome::Applied {
+            next: FaultNext::Keep,
+            poison: false,
+            strike: FaultStrike::new(1),
+        }
     );
 
     client
@@ -397,7 +408,7 @@ fn a_call_the_gateway_does_not_commit_changes_nothing() {
         .expect("a beat");
     assert!(!refused.committed);
     assert_eq!(
-        state(&store, "gate-rollback-0001").state,
+        state(&store, "gate-rollback-0001").state(),
         RemoteJobState::Queued
     );
     let seq: i64 = admin(&schema)
@@ -487,12 +498,12 @@ fn two_concurrent_beats_of_two_nodes_grant_each_job_once() {
                             && connection
                                 .remote_job(&format!("gate-pair-{:04}", JOBS - 1))
                                 .expect("a job")
-                                .is_some_and(|job| job.state != RemoteJobState::Queued)
+                                .is_some_and(|job| job.state() != RemoteJobState::Queued)
                             && (0..JOBS).all(|n| {
                                 connection
                                     .remote_job(&format!("gate-pair-{n:04}"))
                                     .expect("a job")
-                                    .is_some_and(|job| job.state != RemoteJobState::Queued)
+                                    .is_some_and(|job| job.state() != RemoteJobState::Queued)
                             });
                         held.extend(new);
                         if done {
@@ -515,7 +526,7 @@ fn two_concurrent_beats_of_two_nodes_grant_each_job_once() {
     for (node, held) in nodes.iter().zip(&granted) {
         for (job_id, epoch) in held {
             let job = state(&store, job_id);
-            assert_eq!(job.node_id.as_deref(), Some(node.as_str()), "{job_id}");
+            assert_eq!(job.node_id(), Some(node.as_str()), "{job_id}");
             assert_eq!((job.lease_epoch, job.attempts), (*epoch, 1), "{job_id}");
         }
     }
@@ -615,8 +626,12 @@ fn a_job_faulting_on_two_nodes_is_the_poison_and_refunds_the_strike() {
         .remote_job_fault(id, 1, "host_fault", true, FaultNext::Queued)
         .expect("a fault");
     assert_eq!(
-        (fault.next, fault.poison, fault.strikes),
-        (Some(FaultNext::Queued), Some(false), Some(1))
+        fault,
+        FaultOutcome::Applied {
+            next: FaultNext::Queued,
+            poison: false,
+            strike: FaultStrike::new(1),
+        }
     );
     let excluded = grants(&beat_once(
         &store,
@@ -639,8 +654,12 @@ fn a_job_faulting_on_two_nodes_is_the_poison_and_refunds_the_strike() {
         .remote_job_fault(id, 3, "host_fault", true, FaultNext::Queued)
         .expect("a fault");
     assert_eq!(
-        (poison.ok, poison.poison, poison.next, poison.strikes),
-        (true, Some(true), Some(FaultNext::FallbackLocal), None)
+        poison,
+        FaultOutcome::Applied {
+            next: FaultNext::FallbackLocal,
+            poison: true,
+            strike: None,
+        }
     );
     let strikes = |name: &str| {
         store
@@ -655,7 +674,7 @@ fn a_job_faulting_on_two_nodes_is_the_poison_and_refunds_the_strike() {
         "neither node is blamed"
     );
     let job = state(&store, id);
-    assert_eq!(job.state, RemoteJobState::FallbackLocal);
+    assert_eq!(job.state(), RemoteJobState::FallbackLocal);
     assert_eq!(job.fault_nodes, [first.clone(), second.clone()]);
 }
 
@@ -690,12 +709,18 @@ fn three_strikes_degrade_a_node_and_an_undrain_clears_them() {
         let fault = store
             .remote_job_fault(&id, 1, "wrapper_error", true, FaultNext::Keep)
             .expect("a fault");
-        assert_eq!(fault.strikes, Some(n + 1));
-        assert_eq!(fault.degraded, Some(n == 2));
+        assert_eq!(
+            fault.strike().map(|s| (s.strikes(), s.degraded())),
+            Some((n + 1, n == 2))
+        );
         let again = store
             .remote_job_fault(&id, 1, "wrapper_error", true, FaultNext::Keep)
             .expect("a second judging");
-        assert!(!again.ok, "a completion is judged once");
+        assert_eq!(
+            again,
+            FaultOutcome::NotApplied,
+            "a completion is judged once"
+        );
     }
     let row = store.node_v1("nd").expect("a node").expect("the node");
     assert!(row.degraded);
@@ -766,7 +791,7 @@ fn a_valid_run_resets_the_strikes_once_and_leaves_degraded() {
                 FaultNext::Keep,
             )
             .expect("a fault");
-        assert_eq!(fault.strikes, Some(n + 1));
+        assert_eq!(fault.strike().map(FaultStrike::strikes), Some(n + 1));
     }
     let node_row = |store: &PostgresStore| store.node_v1("nv").expect("a node").expect("the node");
     assert_eq!(node_row(&store).host_fault_strikes, 2);
@@ -800,9 +825,9 @@ fn a_valid_run_resets_the_strikes_once_and_leaves_degraded() {
     let row = node_row(&store);
     assert_eq!((row.host_fault_strikes, row.degraded), (0, false));
     let judged = state(&store, "gate-valid-0002");
-    assert_eq!(judged.state, RemoteJobState::Completed);
+    assert_eq!(judged.state(), RemoteJobState::Completed);
     assert_eq!(judged.lease_epoch, 2);
-    assert!(judged.finished_at_ms.is_some());
+    assert!(judged.completion().is_some());
     // Once only: neither a second valid nor a stale fault at the old epoch.
     assert!(
         !store.remote_job_valid("gate-valid-0002", 1).expect("again"),
@@ -811,7 +836,11 @@ fn a_valid_run_resets_the_strikes_once_and_leaves_degraded() {
     let stale = store
         .remote_job_fault("gate-valid-0002", 1, "wrapper_error", true, FaultNext::Keep)
         .expect("a stale fault");
-    assert!(!stale.ok, "a fault after a valid judging is refused");
+    assert_eq!(
+        stale,
+        FaultOutcome::NotApplied,
+        "a fault after a valid judging is refused"
+    );
     assert_eq!(node_row(&store).host_fault_strikes, 0);
 
     // A degraded node's valid run clears its strikes, never `degraded`.
@@ -897,10 +926,10 @@ fn a_result_upload_racing_take_local_has_exactly_one_winner() {
         let job = state(&store, &id);
         if node_won {
             remote += 1;
-            assert_eq!(job.state, RemoteJobState::Completed);
+            assert_eq!(job.state(), RemoteJobState::Completed);
         } else {
             local += 1;
-            assert_eq!(job.state, RemoteJobState::FallbackLocal);
+            assert_eq!(job.state(), RemoteJobState::FallbackLocal);
             assert!(
                 !store
                     .node_gw_result(&node, &id, read_epoch + 1, &result(0, 'd'), |_| true)
@@ -1448,7 +1477,7 @@ fn spawn_reader_reads_nodes_v1_with_build_sha_and_node_version_without_secrets()
     let reader = PostgresStore::connect(&reader_url).expect("connect as spawn_reader");
     let listed = reader.nodes_v1().expect("spawn_reader nodes_v1");
     let node = listed.iter().find(|n| n.name == "n252").expect("n252");
-    assert_eq!(node.status, "active");
+    assert_eq!(node.status, NodeStatus::Active);
     assert_eq!(node.host_fault_strikes, 0);
     assert!(node.last_beat_ms.is_some());
     assert_eq!(node.build_sha.as_deref(), Some(sha));
@@ -1457,4 +1486,82 @@ fn spawn_reader_reads_nodes_v1_with_build_sha_and_node_version_without_secrets()
         node.power.as_ref().and_then(|p| p["on_ac"].as_bool()),
         Some(true)
     );
+}
+
+#[test]
+fn adt_decoders_enforce_node_status_and_remote_job_progress_invariants() {
+    let (store, schema) = store("rj_adt_invariants");
+    let mut client = admin(&schema);
+    let token: [u8; 32] = [9u8; 32];
+    store
+        .node_enroll_token("n_pending", Some("c0"), &token, 60_000)
+        .expect("enroll token");
+    let pending = store.node_v1("n_pending").unwrap().unwrap();
+    assert_eq!(
+        (pending.status, &pending.node_id),
+        (NodeStatus::Pending, &None)
+    );
+
+    let n1 = enroll(&store, "n_active", 21, &json!({}));
+    assert_eq!(
+        store.node_v1("n_active").unwrap().unwrap().status,
+        NodeStatus::Active
+    );
+
+    let shadow_id = "shadow-adt-0001";
+    let mut spec = job(shadow_id, &[], &[("gate_sandbox", 1)]);
+    spec.kind = RemoteJobKind::GateShadow;
+    spec.max_attempts = Some(1);
+    store.remote_job_enqueue(&spec).expect("enqueue shadow");
+    assert!(matches!(
+        state(&store, shadow_id).progress,
+        RemoteJobProgress::Queued { .. }
+    ));
+
+    let grants_out = grants(&beat_once(&store, &n1, &boot(1), 1, &beat(&[], &[], 1, 0)));
+    assert_eq!(grants_out, [(shadow_id.to_string(), 1)]);
+    assert!(matches!(
+        state(&store, shadow_id).progress,
+        RemoteJobProgress::Leased { .. }
+    ));
+
+    // Expire -> ResultPending -> Cancelled on fence because gate_shadow max_attempts == 1.
+    client
+        .batch_execute(&format!(
+            "update spawn_remote_jobs set lease_expires_ms = 1 where job_id = '{shadow_id}';"
+        ))
+        .unwrap();
+    store.node_sweep().unwrap();
+    assert!(matches!(
+        state(&store, shadow_id).progress,
+        RemoteJobProgress::ResultPending { .. }
+    ));
+    client
+        .batch_execute(&format!(
+            "update spawn_remote_jobs set grace_until_ms = 1 where job_id = '{shadow_id}';"
+        ))
+        .unwrap();
+    store.node_sweep().unwrap();
+    assert_eq!(state(&store, shadow_id).state(), RemoteJobState::Cancelled);
+
+    store.node_admin("n_pending", NodeAction::Revoke).unwrap();
+    assert_eq!(
+        store.node_v1("n_pending").unwrap().unwrap().status,
+        NodeStatus::Revoked
+    );
+
+    // Inject an illegal queued row carrying stale lease_expires_ms and verify decode fails closed.
+    let bad_id = "gate-adt-bad-01";
+    store
+        .remote_job_enqueue(&job(bad_id, &[], &[("gate_sandbox", 1)]))
+        .unwrap();
+    client
+        .batch_execute(&format!(
+            "update spawn_remote_jobs set lease_expires_ms = 999 where job_id = '{bad_id}';"
+        ))
+        .unwrap();
+    assert!(matches!(
+        store.remote_job(bad_id),
+        Err(StoreError::Backend(_))
+    ));
 }

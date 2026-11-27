@@ -975,7 +975,7 @@ pub(super) fn step(
     else {
         return Ok(Waited::Ended(None));
     };
-    Ok(match job.state {
+    Ok(match job.state() {
         RemoteJobState::Queued if since.elapsed() < wait => Waited::Queued,
         RemoteJobState::Queued => {
             if store
@@ -1581,7 +1581,7 @@ pub(super) fn look(
     since: Instant,
     wait: Duration,
 ) -> Result<Look, String> {
-    Ok(match row.state {
+    Ok(match row.state() {
         RemoteJobState::Queued if since.elapsed() < wait => Look::Queued,
         RemoteJobState::Queued => {
             if store
@@ -1602,7 +1602,7 @@ pub(super) fn look(
 /// The name of the node that ran `row`: the ledger's, else what the node
 /// said, else its id's first 12 digits.
 pub(super) fn node_name_of(store: &PostgresStore, row: &RemoteJob, stored: &Stored) -> String {
-    let id = row.node_id.clone().unwrap_or_default();
+    let id = row.node_id().unwrap_or_default().to_string();
     store
         .nodes_v1()
         .ok()
@@ -2008,7 +2008,7 @@ impl Primary {
     /// keeps it, and its result is never read).
     fn abandon(store: &PostgresStore, job_id: &str) {
         if let Ok(Some(row)) = store.remote_job(job_id)
-            && row.state == RemoteJobState::Queued
+            && row.state() == RemoteJobState::Queued
         {
             let _ = store.remote_job_take_local(job_id, row.lease_epoch);
         }
@@ -2080,26 +2080,27 @@ impl Primary {
         }
         let settled = settle(store, row, &judged);
         match &settled {
-            Ok(Some(outcome)) => println!(
+            Ok(Some(FaultOutcome::Applied { next, poison, .. })) => println!(
                 "integrate: task {task}'s node gate {job_id} on {node}: {} ({}): strike {}, \
                  next {:?}{}",
                 judged.evidence,
                 judged.reason,
                 judged.strike,
-                outcome.next,
-                if outcome.poison == Some(true) {
+                next,
+                if *poison {
                     ", the job is the poison"
                 } else {
                     ""
                 }
             ),
-            Ok(None) => {}
+            Ok(Some(FaultOutcome::NotApplied) | None) => {}
             Err(error) => eprintln!("integrate: task {task}'s node gate {job_id}: {error}"),
         }
         match settled {
-            Ok(Some(outcome)) if outcome.ok && outcome.next == Some(FaultNext::Queued) => {
-                Settled::Requeued
-            }
+            Ok(Some(FaultOutcome::Applied {
+                next: FaultNext::Queued,
+                ..
+            })) => Settled::Requeued,
             _ => Settled::Local(format!(
                 "node {node} gave no verdict to believe on {job_id}: {} ({})",
                 judged.evidence, judged.reason
@@ -2144,7 +2145,7 @@ pub(super) mod tests {
     use spawn_core::node_proto::json::OrderedMap;
     use spawn_core::node_proto::result::ResultInputs;
     use spawn_core::node_proto::{check_target, is_job_id};
-    use spawn_postgres::NodeEnroll;
+    use spawn_postgres::{FaultStrike, NodeEnroll};
     use std::cell::RefCell;
     use std::collections::HashMap;
 
@@ -3425,7 +3426,7 @@ pub(super) mod tests {
         assert!(outcome.is_none());
         assert_eq!(ledger.strikes("n252"), (0, false));
         let after = ledger.store.remote_job(&accepted).unwrap().unwrap();
-        assert_eq!(after.state, RemoteJobState::Completed);
+        assert_eq!(after.state(), RemoteJobState::Completed);
         assert_eq!(after.judging_id.as_deref(), Some(JUDGING));
 
         // A scenario the node cannot judge: excluded, unstruck, local.
@@ -3439,11 +3440,16 @@ pub(super) mod tests {
             Some(r#"{"v":1,"cannot_judge":true,"scenario":"t029.sh"}"#),
         );
         assert_eq!(judged.evidence, "cannot_judge");
-        let outcome = outcome.unwrap();
-        assert!(outcome.ok);
-        assert_eq!(outcome.next, Some(FaultNext::FallbackLocal));
+        assert_eq!(
+            outcome.unwrap(),
+            FaultOutcome::Applied {
+                next: FaultNext::FallbackLocal,
+                poison: false,
+                strike: None,
+            }
+        );
         let job = ledger.store.remote_job(&cannot).unwrap().unwrap();
-        assert_eq!(job.state, RemoteJobState::FallbackLocal);
+        assert_eq!(job.state(), RemoteJobState::FallbackLocal);
         assert_eq!(job.excluded_nodes, vec![node.clone()]);
         assert!(job.fault_nodes.is_empty());
         assert_eq!(ledger.strikes("n252"), (0, false));
@@ -3459,7 +3465,7 @@ pub(super) mod tests {
             Some(r#"{"v":2,"verdict":"accepted"}"#),
         );
         assert_eq!(judged.evidence, "unread_version");
-        assert_eq!(outcome.unwrap().next, Some(FaultNext::FallbackLocal));
+        assert_eq!(outcome.unwrap().next(), Some(FaultNext::FallbackLocal));
         assert_eq!(ledger.strikes("n252"), (0, false));
         for record in ledger.records("remote_job.host_fault") {
             assert!(record.get("judging").is_none(), "{record}");
@@ -3486,27 +3492,30 @@ pub(super) mod tests {
             ("aborted", true, Some(FaultNext::FallbackLocal))
         );
         assert!(matches!(judged.failure, Some(GateFailure::Aborted { .. })));
-        let outcome = outcome.unwrap();
-        assert_eq!((outcome.strikes, outcome.degraded), (Some(1), Some(false)));
+        assert_eq!(outcome.unwrap().strike(), FaultStrike::new(1));
         assert_eq!(
-            ledger.store.remote_job(&room).unwrap().unwrap().state,
+            ledger.store.remote_job(&room).unwrap().unwrap().state(),
             RemoteJobState::FallbackLocal
         );
 
         // Exit 2, then exit 3: the second and the third strike; degraded.
         let two = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
         let (_, outcome) = run_on(&ledger, &results.0, &node, &two, Some(2), None);
-        let outcome = outcome.unwrap();
-        assert_eq!((outcome.strikes, outcome.degraded), (Some(2), Some(false)));
+        assert_eq!(outcome.unwrap().strike(), FaultStrike::new(2));
         // Back in the queue, never to this node again.
         let job = ledger.store.remote_job(&two).unwrap().unwrap();
-        assert_eq!(job.state, RemoteJobState::Queued);
+        assert_eq!(job.state(), RemoteJobState::Queued);
         assert_eq!(job.excluded_nodes, vec![node.clone()]);
         let three = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
         let (_, outcome) = run_on(&ledger, &results.0, &node, &three, Some(3), None);
-        let outcome = outcome.unwrap();
-        assert_eq!((outcome.strikes, outcome.degraded), (Some(3), Some(true)));
-        assert_eq!(outcome.next, Some(FaultNext::FallbackLocal));
+        assert_eq!(
+            outcome.unwrap(),
+            FaultOutcome::Applied {
+                next: FaultNext::FallbackLocal,
+                poison: false,
+                strike: FaultStrike::new(3),
+            }
+        );
         assert_eq!(ledger.strikes("n252"), (3, true));
         // A degraded node is granted nothing, until the owner's undrain.
         enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
@@ -3544,20 +3553,30 @@ pub(super) mod tests {
         let job = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
         let (judged, outcome) = run_on(&ledger, &results.0, &first, &job, Some(2), None);
         assert!(judged.strike);
-        let outcome = outcome.unwrap();
-        assert_eq!(outcome.next, Some(FaultNext::Queued));
-        assert_eq!(outcome.poison, Some(false));
+        assert_eq!(
+            outcome.unwrap(),
+            FaultOutcome::Applied {
+                next: FaultNext::Queued,
+                poison: false,
+                strike: FaultStrike::new(1),
+            }
+        );
         assert_eq!(ledger.strikes("na"), (1, false));
         // Never back to the first node.
         assert!(ledger.beat(&first).is_empty());
         let (_, outcome) = run_on(&ledger, &results.0, &second, &job, Some(137), None);
-        let outcome = outcome.unwrap();
-        assert_eq!(outcome.poison, Some(true));
-        assert_eq!(outcome.next, Some(FaultNext::FallbackLocal));
+        assert_eq!(
+            outcome.unwrap(),
+            FaultOutcome::Applied {
+                next: FaultNext::FallbackLocal,
+                poison: true,
+                strike: None,
+            }
+        );
         assert_eq!(ledger.strikes("na"), (0, false));
         assert_eq!(ledger.strikes("nb"), (0, false));
         let row = ledger.store.remote_job(&job).unwrap().unwrap();
-        assert_eq!(row.state, RemoteJobState::FallbackLocal);
+        assert_eq!(row.state(), RemoteJobState::FallbackLocal);
         assert_eq!(row.fault_nodes, vec![first, second]);
         let faults = ledger.records("remote_job.host_fault");
         assert_eq!(faults.last().unwrap()["poison"], true);
@@ -3583,7 +3602,7 @@ pub(super) mod tests {
         .unwrap();
         assert_eq!(waited, Waited::TakenLocal);
         let row = ledger.store.remote_job(&job).unwrap().unwrap();
-        assert_eq!(row.state, RemoteJobState::FallbackLocal);
+        assert_eq!(row.state(), RemoteJobState::FallbackLocal);
         assert_eq!(
             step(&ledger.store, &job, Instant::now(), Duration::ZERO).unwrap(),
             Waited::Ended(Some(RemoteJobState::FallbackLocal))

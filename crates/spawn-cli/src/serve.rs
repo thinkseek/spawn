@@ -2496,18 +2496,19 @@ fn grading() -> Result<Value, String> {
 const NODE_V1_LOST_AFTER_MS: i64 = 90_000;
 
 fn v1_node_is_lost(node: &spawn_postgres::NodeV1, now: i64) -> bool {
-    node.status == "active"
+    node.status == spawn_postgres::NodeStatus::Active
         && node
             .last_beat_ms
             .is_none_or(|beat| now.saturating_sub(beat) > NODE_V1_LOST_AFTER_MS)
 }
 
 fn v1_node_state(node: &spawn_postgres::NodeV1, now: i64) -> String {
-    let mut state = if node.status == "active" && v1_node_is_lost(node, now) {
-        "lost".to_string()
-    } else {
-        node.status.clone()
-    };
+    let mut state =
+        if node.status == spawn_postgres::NodeStatus::Active && v1_node_is_lost(node, now) {
+            "lost".to_string()
+        } else {
+            node.status.as_str().to_string()
+        };
     if node.drained {
         state.push_str(",drained");
     }
@@ -2559,7 +2560,7 @@ fn merge_nodes_with_v1(
                     let mut obj = v1_node_json(node, now);
                     let mapped = if node.drained {
                         "drained"
-                    } else if node.status == "active"
+                    } else if node.status == spawn_postgres::NodeStatus::Active
                         && !v1_node_is_lost(node, now)
                         && !node.degraded
                     {
@@ -9768,7 +9769,7 @@ mod tests {
             name: name.to_string(),
             node_id: Some("a".repeat(64)),
             cell_id: "c0".to_string(),
-            status: "active".to_string(),
+            status: spawn_postgres::NodeStatus::Active,
             drained: false,
             degraded: false,
             lost_recorded: false,
@@ -9847,6 +9848,7 @@ mod tests {
         let r_n252 = &rows[1];
         assert_eq!(r_n252["name"], "n252");
         assert_eq!(r_n252["proto"], "node-v1");
+        assert_eq!(r_n252["status"], "active");
         assert_eq!(r_n252["build_sha"], sha);
         assert_eq!(r_n252["node_version"], "0.1.0");
         assert_eq!(r_n252["state"], "active");
