@@ -1443,4 +1443,396 @@ mod tests {
         std::fs::remove_dir_all(&tmpfs).expect("clean tmpfs");
         std::fs::remove_dir_all(&custom).expect("clean custom");
     }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn workspace_disk_classification_d6_shadow_zero_byte_and_symlinks() {
+        let root = scratch("ws_disk_d6_shadow");
+        let projects = scratch("ws_disk_d6_shadow_proj");
+        let tmpfs = scratch("ws_disk_d6_shadow_tmpfs");
+        let outside = scratch("ws_disk_d6_shadow_outside");
+
+        // External payload in outside dir
+        file(&outside.join("secret_data.bin"), 54_321);
+
+        // 1. Root-level hidden dirs and files that must NOT be counted as workspaces:
+        // .d6-shadow (cas and work dirs with chunk blobs and zero-byte marker files)
+        file(&root.join(".d6-shadow/cas/chunk_01.bin"), 8192);
+        file(&root.join(".d6-shadow/cas/zero_chunk.bin"), 0);
+        file(&root.join(".d6-shadow/work/lock"), 0);
+        file(&root.join(".d6-shadow/work/staging/tree.bin"), 4096);
+        // Other root-level dot dirs & metadata files
+        file(&root.join(".transcripts/agent_1/t1.jsonl"), 1200);
+        file(&root.join(".caches/shared/obj.o"), 3000);
+        file(&root.join("test-schemas-seen.json"), 450);
+
+        // 2. Top-level symlink pointing outside: must NOT be traversed or counted as workspace
+        std::os::unix::fs::symlink(&outside, root.join("agent_symlink_outside"))
+            .expect("create top symlink");
+
+        // 3. Workspaces with distinct classifications and zero-byte files:
+        // ws_alpha: regular repo file + zero-byte repo file + git objects + build cache (target)
+        file(&root.join("ws_alpha/src/lib.rs"), 500);
+        file(&root.join("ws_alpha/src/empty.rs"), 0);
+        file(&root.join("ws_alpha/.git/HEAD"), 25);
+        file(&root.join("ws_alpha/.git/objects/pack/zero.idx"), 0);
+        file(&root.join("ws_alpha/target/debug/app"), 1500);
+        file(&root.join("ws_alpha/target/debug/zero.d"), 0);
+        // Internal symlink pointing outside workspace: must NOT be traversed
+        std::os::unix::fs::symlink(
+            outside.join("secret_data.bin"),
+            root.join("ws_alpha/link_out"),
+        )
+        .expect("create inside symlink");
+
+        // ws_beta: build caches (node_modules + .venv), README, zero-byte file
+        file(&root.join("ws_beta/node_modules/pkg/index.js"), 800);
+        file(&root.join("ws_beta/.venv/bin/python"), 400);
+        file(&root.join("ws_beta/README.md"), 100);
+        file(&root.join("ws_beta/zero_repo.txt"), 0);
+
+        // ws_empty: an empty workspace directory (0 bytes, 0 files)
+        std::fs::create_dir_all(root.join("ws_empty")).expect("mkdir ws_empty");
+
+        let walked = Walked::read_with_env(Some(&root), projects.clone(), &tmpfs, &|k| match k {
+            "SPAWN_SHARED_BUILD_CACHES" => Some("1".to_string()),
+            _ => None,
+        });
+
+        let breakdown = walked
+            .workspace_breakdown
+            .as_ref()
+            .expect("breakdown present");
+
+        // .d6-shadow is ignored! Only non-dot directories are candidates.
+        // agent_symlink_outside is ignored because symlink is not a directory.
+        assert_eq!(breakdown.workspace_count, 3, "ws_alpha, ws_beta, ws_empty");
+        assert!(!breakdown.truncated);
+
+        // ws_alpha breakdown:
+        // repo_bytes: 500 (lib.rs) + 0 (empty.rs) = 500
+        // git_bytes: 25 (HEAD) + 0 (zero.idx) = 25
+        // build_cache_bytes: 1500 (app) + 0 (zero.d) = 1500
+        // total_bytes: 500 + 25 + 1500 = 2025
+        // files: 2 repo + 2 git + 2 cache = 6 files (zero-byte files counted in files)
+        let ws_alpha = breakdown
+            .workspaces
+            .iter()
+            .find(|ws| ws.name == "ws_alpha")
+            .expect("ws_alpha");
+        assert_eq!(ws_alpha.repo_bytes, 500);
+        assert_eq!(ws_alpha.git_bytes, 25);
+        assert_eq!(ws_alpha.build_cache_bytes, 1500);
+        assert_eq!(ws_alpha.total_bytes, 2025);
+        assert_eq!(ws_alpha.files, 6);
+        assert!(!ws_alpha.truncated);
+
+        // ws_beta breakdown:
+        // repo_bytes: 100 (README.md) + 0 (zero_repo.txt) = 100
+        // git_bytes: 0
+        // build_cache_bytes: 800 + 400 = 1200
+        // total_bytes: 100 + 1200 = 1300
+        // files: 2 repo + 2 cache = 4 files
+        let ws_beta = breakdown
+            .workspaces
+            .iter()
+            .find(|ws| ws.name == "ws_beta")
+            .expect("ws_beta");
+        assert_eq!(ws_beta.repo_bytes, 100);
+        assert_eq!(ws_beta.git_bytes, 0);
+        assert_eq!(ws_beta.build_cache_bytes, 1200);
+        assert_eq!(ws_beta.total_bytes, 1300);
+        assert_eq!(ws_beta.files, 4);
+
+        // ws_empty breakdown:
+        let ws_empty = breakdown
+            .workspaces
+            .iter()
+            .find(|ws| ws.name == "ws_empty")
+            .expect("ws_empty");
+        assert_eq!(ws_empty.total_bytes, 0);
+        assert_eq!(ws_empty.repo_bytes, 0);
+        assert_eq!(ws_empty.git_bytes, 0);
+        assert_eq!(ws_empty.build_cache_bytes, 0);
+        assert_eq!(ws_empty.files, 0);
+
+        // Order is descending by total_bytes: ws_alpha (2025), ws_beta (1300), ws_empty (0)
+        assert_eq!(breakdown.workspaces[0].name, "ws_alpha");
+        assert_eq!(breakdown.workspaces[1].name, "ws_beta");
+        assert_eq!(breakdown.workspaces[2].name, "ws_empty");
+
+        // Aggregates:
+        assert_eq!(breakdown.total_bytes, 2025 + 1300);
+        assert_eq!(breakdown.repo_bytes, 500 + 100);
+        assert_eq!(breakdown.git_bytes, 25);
+        assert_eq!(breakdown.build_cache_bytes, 1500 + 1200);
+        assert_eq!(breakdown.files, 6 + 4);
+
+        // Outside symlinks were not traversed
+        let payload = with_free(
+            sizes(
+                2000,
+                &walked,
+                &json!({"oldest": null, "carrying": null, "before": null}),
+                &json!({"bytes": 100}),
+                &json!([]),
+            ),
+            Some(999_999),
+        );
+        let serialized = payload.to_string();
+        assert!(!serialized.contains("secret_data.bin"));
+        assert!(!serialized.contains("54321"));
+
+        // JSON field stability for workspace_breakdown
+        let wb_json = &payload["workspace_breakdown"];
+        assert_eq!(wb_json["workspace_count"], 3);
+        assert_eq!(wb_json["total_bytes"], 3325);
+        assert_eq!(wb_json["repo_bytes"], 600);
+        assert_eq!(wb_json["git_bytes"], 25);
+        assert_eq!(wb_json["build_cache_bytes"], 2700);
+        assert_eq!(wb_json["files"], 10);
+        assert_eq!(wb_json["truncated"], false);
+
+        std::fs::remove_dir_all(&root).expect("clean root");
+        std::fs::remove_dir_all(&projects).expect("clean projects");
+        std::fs::remove_dir_all(&tmpfs).expect("clean tmpfs");
+        std::fs::remove_dir_all(&outside).expect("clean outside");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn shared_build_caches_missing_empty_zero_byte_symlinks_and_json_stability() {
+        let root = scratch("shared_cache_edge");
+        let projects = scratch("shared_cache_edge_proj");
+        let tmpfs = scratch("shared_cache_edge_tmpfs");
+        let outside = scratch("shared_cache_edge_outside");
+
+        file(&outside.join("large.bin"), 25_000);
+
+        // 1. Missing cache directory when enabled: SPAWN_SHARED_BUILD_CACHES=1
+        let walked_missing =
+            Walked::read_with_env(Some(&root), projects.clone(), &tmpfs, &|k| match k {
+                "SPAWN_SHARED_BUILD_CACHES" => Some("1".to_string()),
+                _ => None,
+            });
+        let payload_missing = sizes(
+            1000,
+            &walked_missing,
+            &json!({"oldest": null, "carrying": null, "before": null}),
+            &Value::Null,
+            &json!([]),
+        );
+        assert_eq!(
+            payload_missing["shared_build_cache"],
+            json!({
+                "path": root.join(".caches").display().to_string(),
+                "bytes": 0,
+                "files": 0,
+                "enabled": true,
+            }),
+            "missing cache dir with enabled=true returns 0 bytes, 0 files"
+        );
+
+        // 2. Missing cache directory when disabled: returns null
+        let walked_disabled_missing =
+            Walked::read_with_env(Some(&root), projects.clone(), &tmpfs, &|_| None);
+        let payload_disabled_missing = sizes(
+            1000,
+            &walked_disabled_missing,
+            &json!({"oldest": null, "carrying": null, "before": null}),
+            &Value::Null,
+            &json!([]),
+        );
+        assert_eq!(payload_disabled_missing["shared_build_cache"], Value::Null);
+
+        // 3. Empty cache directory when enabled: create empty .caches
+        let cache_dir = root.join(".caches");
+        std::fs::create_dir_all(&cache_dir).expect("mkdir .caches");
+        let walked_empty =
+            Walked::read_with_env(Some(&root), projects.clone(), &tmpfs, &|k| match k {
+                "SPAWN_SHARED_BUILD_CACHES" => Some("1".to_string()),
+                _ => None,
+            });
+        let payload_empty = sizes(
+            1000,
+            &walked_empty,
+            &json!({"oldest": null, "carrying": null, "before": null}),
+            &Value::Null,
+            &json!([]),
+        );
+        assert_eq!(
+            payload_empty["shared_build_cache"],
+            json!({
+                "path": cache_dir.display().to_string(),
+                "bytes": 0,
+                "files": 0,
+                "enabled": true,
+            })
+        );
+
+        // 4. Empty cache directory when disabled (residual .caches directory on disk)
+        let walked_disabled_empty =
+            Walked::read_with_env(Some(&root), projects.clone(), &tmpfs, &|_| None);
+        let payload_disabled_empty = sizes(
+            1000,
+            &walked_disabled_empty,
+            &json!({"oldest": null, "carrying": null, "before": null}),
+            &Value::Null,
+            &json!([]),
+        );
+        assert_eq!(
+            payload_disabled_empty["shared_build_cache"],
+            json!({
+                "path": cache_dir.display().to_string(),
+                "bytes": 0,
+                "files": 0,
+                "enabled": false,
+            })
+        );
+
+        // 5. Zero-byte files in cache directory: bytes: 0, files: 2
+        file(&cache_dir.join("zero1.bin"), 0);
+        file(&cache_dir.join("sub/zero2.bin"), 0);
+        let walked_zero =
+            Walked::read_with_env(Some(&root), projects.clone(), &tmpfs, &|k| match k {
+                "SPAWN_SHARED_BUILD_CACHES" => Some("1".to_string()),
+                _ => None,
+            });
+        let payload_zero = sizes(
+            1000,
+            &walked_zero,
+            &json!({"oldest": null, "carrying": null, "before": null}),
+            &Value::Null,
+            &json!([]),
+        );
+        assert_eq!(
+            payload_zero["shared_build_cache"],
+            json!({
+                "path": cache_dir.display().to_string(),
+                "bytes": 0,
+                "files": 2,
+                "enabled": true,
+            })
+        );
+
+        // 6. Symlink boundary safety:
+        // Inside .caches, a symlink to outside directory must NOT be traversed
+        std::os::unix::fs::symlink(&outside, cache_dir.join("symlink_outside"))
+            .expect("symlink outside");
+        let walked_symlink_inside =
+            Walked::read_with_env(Some(&root), projects.clone(), &tmpfs, &|k| match k {
+                "SPAWN_SHARED_BUILD_CACHES" => Some("1".to_string()),
+                _ => None,
+            });
+        let payload_symlink_inside = sizes(
+            1000,
+            &walked_symlink_inside,
+            &json!({"oldest": null, "carrying": null, "before": null}),
+            &Value::Null,
+            &json!([]),
+        );
+        assert_eq!(
+            payload_symlink_inside["shared_build_cache"]["bytes"], 0,
+            "symlink to outside large file is not traversed"
+        );
+        assert_eq!(
+            payload_symlink_inside["shared_build_cache"]["files"], 2,
+            "symlink itself is not counted as a file"
+        );
+
+        // .caches itself as a symlink to outside directory:
+        std::fs::remove_dir_all(&cache_dir).expect("remove cache dir");
+        std::os::unix::fs::symlink(&outside, &cache_dir).expect("symlink cache root");
+        // Disabled: symlink_metadata check fails is_dir -> returns None
+        let walked_symlink_root_disabled =
+            Walked::read_with_env(Some(&root), projects.clone(), &tmpfs, &|_| None);
+        assert_eq!(walked_symlink_root_disabled.shared_build_cache, None);
+        // Enabled: shared_cache_sizes checks symlink_metadata -> returns default Sizes(0, 0)
+        let walked_symlink_root_enabled =
+            Walked::read_with_env(Some(&root), projects.clone(), &tmpfs, &|k| match k {
+                "SPAWN_SHARED_BUILD_CACHES" => Some("1".to_string()),
+                _ => None,
+            });
+        let payload_symlink_root = sizes(
+            1000,
+            &walked_symlink_root_enabled,
+            &json!({"oldest": null, "carrying": null, "before": null}),
+            &Value::Null,
+            &json!([]),
+        );
+        assert_eq!(
+            payload_symlink_root["shared_build_cache"],
+            json!({
+                "path": cache_dir.display().to_string(),
+                "bytes": 0,
+                "files": 0,
+                "enabled": true,
+            })
+        );
+
+        // 7. Full JSON schema stability check on all fields
+        let figures = with_free(payload_zero, Some(1024 * 1024));
+        let obj = figures.as_object().expect("root object");
+        let expected_fields = [
+            "read_at_ms",
+            "archive",
+            "projects",
+            "workspaces",
+            "workspace_breakdown",
+            "shared_build_cache",
+            "database",
+            "test_databases",
+            "growth_bytes_per_day",
+            "growth_from_ms",
+            "persistent_growth_bytes_per_day",
+            "persistent_from_ms",
+            "growth_parts",
+            "growth_from_parts",
+            "growth_excluded",
+            "tmpfs_build_targets",
+            "free_bytes",
+            "days_left",
+        ];
+        for key in expected_fields {
+            assert!(
+                obj.contains_key(key),
+                "missing key in health.storage payload: {key}"
+            );
+        }
+
+        // Exact type assertions
+        assert!(figures["read_at_ms"].is_i64());
+        assert!(figures["projects"].is_object());
+        assert!(figures["projects"]["bytes"].is_u64());
+        assert!(figures["projects"]["files"].is_u64());
+        assert!(figures["workspace_breakdown"].is_object());
+        assert!(figures["shared_build_cache"].is_object());
+        assert!(figures["shared_build_cache"]["bytes"].is_u64());
+        assert!(figures["shared_build_cache"]["files"].is_u64());
+        assert!(figures["shared_build_cache"]["enabled"].is_boolean());
+        assert!(figures["growth_parts"].is_object());
+        assert!(figures["growth_from_parts"].is_object());
+        assert!(figures["growth_excluded"].is_array());
+        assert!(figures["tmpfs_build_targets"].is_object());
+        assert!(figures["free_bytes"].is_u64());
+
+        // When root is None, both workspace_breakdown and shared_build_cache are null
+        let unrooted = Walked::read_with_env(None, projects.clone(), &tmpfs, &|_| None);
+        let unrooted_payload = sizes(
+            1000,
+            &unrooted,
+            &json!({"oldest": null, "carrying": null, "before": null}),
+            &Value::Null,
+            &json!([]),
+        );
+        assert_eq!(unrooted_payload["workspace_breakdown"], Value::Null);
+        assert_eq!(unrooted_payload["shared_build_cache"], Value::Null);
+        assert_eq!(unrooted_payload["archive"], Value::Null);
+        assert_eq!(unrooted_payload["workspaces"], Value::Null);
+
+        std::fs::remove_dir_all(&root).expect("clean root");
+        std::fs::remove_dir_all(&projects).expect("clean projects");
+        std::fs::remove_dir_all(&tmpfs).expect("clean tmpfs");
+        std::fs::remove_dir_all(&outside).expect("clean outside");
+    }
 }

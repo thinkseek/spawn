@@ -782,3 +782,59 @@ export function backupAge(ageMs: number | null): string {
   const hours = Math.round(minutes / 60);
   return hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} d`;
 }
+
+export type WorkspaceBackendTone = "accent" | "neutral" | "warning";
+
+/** Compact badge view model for `/api/fleet` `health.workspace_backend`. */
+export interface WorkspaceBackendView {
+  backend: string;
+  label: string;
+  title: string;
+  tone: WorkspaceBackendTone;
+}
+
+function trimmedString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed !== "" ? trimmed : null;
+}
+
+/** Normalize `health.workspace_backend` from either a plain string (e.g.
+ * `"d6-shadow"`, `"d6"`, `"git"`) or a peek object (`{ active, root, configured }`);
+ * returns null when omitted or unusable. */
+export function normalizeWorkspaceBackend(value: unknown): string | null {
+  const direct = trimmedString(value);
+  if (direct !== null) return direct;
+  const raw = object(value);
+  if (!raw) return null;
+  for (const key of ["active", "name", "backend", "root", "configured"] as const) {
+    const candidate = trimmedString(raw[key]);
+    if (candidate !== null) return candidate;
+  }
+  return null;
+}
+
+const WORKSPACE_BACKEND_META: Record<string, { tone: WorkspaceBackendTone; note?: string }> = {
+  d6: { tone: "accent" },
+  "d6-shadow": { tone: "accent", note: "D6 shadow mode" },
+  overlay: { tone: "warning", note: "experimental" },
+  cow: { tone: "neutral", note: "copy-on-write" },
+  git: { tone: "neutral" },
+};
+
+/** View model for the compact workspace backend badge in `HealthStrip`;
+ * accepts a backend string, a peek object, or a health-shaped object with
+ * `workspace_backend`. Returns null when absent for clean omission. */
+export function workspaceBackendView(value: unknown): WorkspaceBackendView | null {
+  const obj = object(value);
+  const raw = obj && "workspace_backend" in obj ? obj.workspace_backend : value;
+  const backend = normalizeWorkspaceBackend(raw);
+  if (backend === null) return null;
+  const meta = WORKSPACE_BACKEND_META[backend.toLowerCase()];
+  return {
+    backend,
+    label: backend,
+    title: meta?.note ? `Workspace backend: ${backend} (${meta.note})` : `Workspace backend: ${backend}`,
+    tone: meta?.tone ?? "neutral",
+  };
+}

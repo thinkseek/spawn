@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import type { DiskPlace, FleetHealth, LadderStep } from "../../fleet";
 import { absoluteTitle, clockTime, formatDuration } from "../../format";
 import type { CoreMark } from "../../coreLines";
-import type { Backups, DiskBucketShares, GateRoom, Memory, Storage } from "../../resources";
+import type { Backups, DiskBucketShares, GateRoom, Memory, Storage, WorkspaceBackendView } from "../../resources";
 import {
   backupAge,
   backupView,
@@ -11,6 +11,7 @@ import {
   sharedBuildCacheView,
   storageView,
   waitingGates,
+  workspaceBackendView,
   workspaceBreakdownView,
 } from "../../resources";
 import { cx } from "../ui";
@@ -61,17 +62,20 @@ export const LIVENESS = {
 
 export function Cell({
   label,
+  trailing,
   children,
   className,
 }: {
   label: ReactNode;
+  trailing?: ReactNode;
   children: ReactNode;
   className?: string;
 }) {
   return (
     <div className={cx("min-w-0 rounded-card bg-surface px-4 py-3 shadow-card", className)}>
-      <div className="mb-1.5 truncate text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
-        {label}
+      <div className="mb-1.5 flex items-center gap-2 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
+        <span className="truncate">{label}</span>
+        {trailing && <span className="ml-auto shrink-0 normal-case tracking-normal">{trailing}</span>}
       </div>
       {children}
     </div>
@@ -552,6 +556,25 @@ export interface Liveness {
 export const HUMAN_RATE_HINT =
   "Human per agent-hour: each time a person stepped in (a command, a pause, a resume, a task they assigned, a cancel and reassign) in the last 24 h, divided by the hours agents ran in that time; the Home card's figure. Lower is better; 0 means the fleet ran without anyone.";
 
+/** Compact badge for `health.workspace_backend` when reported by the server. */
+function WorkspaceBackendBadge({ view }: { view: WorkspaceBackendView }) {
+  const toneClass =
+    view.tone === "accent"
+      ? "bg-muted text-info"
+      : view.tone === "warning"
+        ? "bg-wait-tint text-warning"
+        : "bg-muted text-muted-foreground";
+  return (
+    <span
+      className={cx("inline-flex items-center gap-1 rounded px-1.5 py-px text-micro font-medium", toneClass)}
+      title={view.title}
+    >
+      <span className="text-faint-foreground">workspace</span>
+      <span className="font-mono">{view.label}</span>
+    </span>
+  );
+}
+
 export function HealthStrip({
   health,
   liveness,
@@ -564,6 +587,10 @@ export function HealthStrip({
 }) {
   const restarts = health.ladder_24h.liveness;
   const down = liveness.total - liveness.up;
+  const workspaceBackend = workspaceBackendView(health.workspace_backend);
+  const workspaceBackendBadge = workspaceBackend ? (
+    <WorkspaceBackendBadge view={workspaceBackend} />
+  ) : null;
 
   return (
     <section
@@ -638,7 +665,7 @@ export function HealthStrip({
         </div>
       </Cell>
 
-      <Cell label="Storage" className="sm:col-span-2">
+      <Cell label="Storage" className="sm:col-span-2" trailing={workspaceBackendBadge}>
         <StorageCard storage={health.storage} backups={health.backups} diagnostics={diagnostics} />
       </Cell>
 

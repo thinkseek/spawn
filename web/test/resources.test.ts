@@ -75,10 +75,12 @@ import {
   normalizeBackups,
   normalizeSharedBuildCache,
   normalizeStorage,
+  normalizeWorkspaceBackend,
   normalizeWorkspaceBreakdown,
   sharedBuildCacheView,
   storageSize,
   storageView,
+  workspaceBackendView,
   workspaceBreakdownView,
 } from "../src/resources.ts";
 
@@ -580,6 +582,74 @@ test("HealthStrip renders WorkspaceBreakdownSection and SharedBuildCacheRow from
     "SharedBuildCacheRow",
     "Shared build cache",
     "rebuildable",
+  ]) {
+    assert.ok(strip.includes(needle), `HealthStrip.tsx includes ${needle}`);
+  }
+  assert.equal(strip.includes("/api/"), false);
+});
+
+test("workspace_backend normalizes string or object payloads and omits absent/invalid values cleanly", () => {
+  assert.equal(normalizeWorkspaceBackend("d6-shadow"), "d6-shadow");
+  assert.equal(normalizeWorkspaceBackend(" d6 "), "d6");
+  assert.equal(normalizeWorkspaceBackend("git"), "git");
+  assert.equal(normalizeWorkspaceBackend({ active: "d6-shadow", configured: "auto", root: "git" }), "d6-shadow");
+  assert.equal(normalizeWorkspaceBackend({ active: null, root: "git", configured: "auto" }), "git");
+  assert.equal(normalizeWorkspaceBackend({ active: null, root: null, configured: "d6" }), "d6");
+  assert.equal(normalizeWorkspaceBackend({ name: "cow" }), "cow");
+
+  for (const missing of [null, undefined, "", "   ", 42, false, [], {}, { active: null }, { error: "mismatch" }]) {
+    assert.equal(normalizeWorkspaceBackend(missing), null);
+    assert.equal(workspaceBackendView(missing), null);
+  }
+});
+
+test("workspaceBackendView formats known and custom backends and accepts health-shaped objects", () => {
+  assert.deepEqual(workspaceBackendView("d6-shadow"), {
+    backend: "d6-shadow",
+    label: "d6-shadow",
+    title: "Workspace backend: d6-shadow (D6 shadow mode)",
+    tone: "accent",
+  });
+  assert.deepEqual(workspaceBackendView("d6"), {
+    backend: "d6",
+    label: "d6",
+    title: "Workspace backend: d6",
+    tone: "accent",
+  });
+  assert.deepEqual(workspaceBackendView("git"), {
+    backend: "git",
+    label: "git",
+    title: "Workspace backend: git",
+    tone: "neutral",
+  });
+  assert.deepEqual(workspaceBackendView("overlay"), {
+    backend: "overlay",
+    label: "overlay",
+    title: "Workspace backend: overlay (experimental)",
+    tone: "warning",
+  });
+  assert.deepEqual(workspaceBackendView({ workspace_backend: "cow" }), {
+    backend: "cow",
+    label: "cow",
+    title: "Workspace backend: cow (copy-on-write)",
+    tone: "neutral",
+  });
+  assert.deepEqual(workspaceBackendView("custom-fs"), {
+    backend: "custom-fs",
+    label: "custom-fs",
+    title: "Workspace backend: custom-fs",
+    tone: "neutral",
+  });
+  assert.equal(workspaceBackendView({ workspace_backend: null }), null);
+  assert.equal(workspaceBackendView({ workspace_backend: "" }), null);
+});
+
+test("HealthStrip wires workspaceBackendView and compact WorkspaceBackendBadge", () => {
+  const strip = readFileSync(new URL("../src/components/fleet/HealthStrip.tsx", import.meta.url), "utf8");
+  for (const needle of [
+    "workspaceBackendView(health.workspace_backend)",
+    "WorkspaceBackendBadge",
+    "trailing={workspaceBackendBadge}",
   ]) {
     assert.ok(strip.includes(needle), `HealthStrip.tsx includes ${needle}`);
   }

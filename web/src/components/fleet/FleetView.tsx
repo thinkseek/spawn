@@ -215,7 +215,7 @@ export function FleetView({
               liveness={liveness}
               diagnostics={coreLines.data ? coreLinesView(coreLines.data).diagnostics : []}
             />
-            <NodeRows />
+            <NodeRows fleetNodes={data.nodes} />
             <FleetBoard
               groups={groups}
               total={data.agents}

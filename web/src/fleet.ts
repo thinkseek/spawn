@@ -7,8 +7,16 @@ import type { Labels } from "./label.ts";
 import type { CommandMessage, MessageActed } from "./messages.ts";
 import { labels } from "./label.ts";
 import { readApi } from "./api";
+import type { NodeRow } from "./nodes";
+import { normalizeNodeList } from "./nodes";
 import type { Backups, GateRoom, Memory, Storage } from "./resources";
-import { normalizeBackups, normalizeGateRoom, normalizeMemory, normalizeStorage } from "./resources";
+import {
+  normalizeBackups,
+  normalizeGateRoom,
+  normalizeMemory,
+  normalizeStorage,
+  normalizeWorkspaceBackend,
+} from "./resources";
 import type { RsiPane } from "./rsi";
 import { normalizePane } from "./rsi";
 
@@ -149,6 +157,8 @@ export interface FleetHealth {
   storage: Storage | null;
   /** The newest database copy and bundle uploaded; null when not reported. */
   backups: Backups | null;
+  /** Active workspace backend (e.g. `d6-shadow`, `d6`, `git`); null when omitted. */
+  workspace_backend: string | null;
 }
 
 export interface DiskPlace {
@@ -166,6 +176,8 @@ export interface DiskPlace {
 export interface Fleet {
   agents: FleetAgent[];
   health: FleetHealth;
+  /** Optional node payloads when `/api/fleet` includes them; empty when omitted. */
+  nodes: NodeRow[];
 }
 
 export interface JudgementRecord {
@@ -458,6 +470,9 @@ function normalizeHealth(value: unknown, agents: FleetAgent[]): FleetHealth {
     gate_room: normalizeGateRoom(health.gate_room),
     storage: normalizeStorage(health.storage),
     backups: normalizeBackups(health.backups),
+    workspace_backend: normalizeWorkspaceBackend(
+      health.workspace_backend ?? object(health.storage).workspace_backend,
+    ),
   };
 }
 
@@ -472,7 +487,9 @@ export function normalizeFleet(value: unknown): Fleet {
         left.agent_id.localeCompare(right.agent_id) ||
         left.session_id.localeCompare(right.session_id),
     );
-  return { agents, health: normalizeHealth(raw.health, agents) };
+  const health = normalizeHealth(raw.health, agents);
+  const nodes = normalizeNodeList(raw.nodes ?? object(raw.health).nodes);
+  return { agents, health, nodes };
 }
 
 export function normalizeJudgements(value: unknown): JudgementRecord[] {
