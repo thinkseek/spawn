@@ -40,6 +40,8 @@
 //! - `scratch` claims, renews, releases and sweeps scratch directories.
 //! - `run` starts the engine inside the terminal, records its exit, and
 //!   forwards its exit code.
+//! - `auth` manages unified decoupled auth profiles (`relay`, `native_login`,
+//!   `cloud_iam`, `local`) across engines without storing plaintext secrets.
 //! - `version` prints `spawn <crate version>`.
 //!
 //! The nouns are as in docs/glossary.md.
@@ -56,6 +58,7 @@
 
 mod ack;
 mod alerts;
+mod auth;
 mod backup;
 mod commands;
 mod commit_map;
@@ -155,7 +158,11 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn config docker-plan [--config <path>] [--data-dir <dir>] [--image <image>] [--json]\n       \
      spawn doctor [--config <path>] [--root <dir>] [--json]\n       \
      spawn status [--json]\n       \
-     spawn say <agent> <message> [--session <sid>] [--key <idempotency-key>] [--json]";
+     spawn say <agent> <message> [--session <sid>] [--key <idempotency-key>] [--json]\n       \
+     spawn auth list [--config <path>] [--json]\n       \
+     spawn auth add-relay <name> --url <url> (--key-env <VAR> | --key-file <PATH>) [--engines claude,codex] [--tiers L1,L2,L3] [--config <path>] [--json]\n       \
+     spawn auth login <agy|claude|codex> [--profile <name>] [--config <path>]\n       \
+     spawn auth check [--config <path>] [--json]";
 
 /// What the whole usage says last, after the commands.
 const HELP_HINT: &str =
@@ -400,6 +407,12 @@ const COMMANDS: &[Command] = &[
         aliases: &[],
         usage: &[config_file::DOCTOR_USAGE],
         run: |rest| config_file::doctor_command(None, rest),
+    },
+    Command {
+        name: "auth",
+        aliases: &[],
+        usage: &[auth::USAGE],
+        run: auth::command,
     },
     Command {
         name: "version",
@@ -665,6 +678,9 @@ pub(crate) fn dispatch() -> Result<i32, String> {
             }
             if row.name == "doctor" {
                 return config_file::doctor_command(cli_config.as_deref(), &rest);
+            }
+            if row.name == "auth" {
+                return auth::command_with_config(cli_config.as_deref(), &rest);
             }
             let effective_config = cli_config.or_else(|| env_value("SPAWN_CONFIG"));
             if let Some(config_path) = effective_config
@@ -943,7 +959,23 @@ mod tests {
                 "{removed} stays an unknown command"
             );
         }
-        assert_eq!(COMMANDS.len(), 35, "the commands: {words:?}");
+        assert_eq!(COMMANDS.len(), 36, "the commands: {words:?}");
+    }
+
+    #[test]
+    fn the_usage_names_the_auth_command_after_the_contracts_line() {
+        for line in [
+            "spawn auth list [--config <path>] [--json]",
+            "spawn auth add-relay <name> --url <url>",
+            "spawn auth login <agy|claude|codex>",
+            "spawn auth check [--config <path>] [--json]",
+        ] {
+            assert!(MORE_USAGE.contains(line), "{line}: {MORE_USAGE}");
+        }
+        assert!(
+            !USAGE.contains("auth"),
+            "the contract's line stays as it was: {USAGE}"
+        );
     }
 
     #[test]
