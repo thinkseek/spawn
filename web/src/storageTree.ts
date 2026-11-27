@@ -1,9 +1,22 @@
 import type { BadgeTone } from "./components/ui/badge.tsx";
 
+export type StorageRefKind = "main" | "task" | "worker" | "wip" | "tag";
+
+export type RefLogAction =
+  | "created"
+  | "merged"
+  | "fast-forwarded"
+  | "rolled-back"
+  | "retired"
+  | "moved";
+
+export type StorageBackend = "d6" | "cow" | "overlay" | "git";
+
+export type SnapshotState = "live" | "collected";
+
 export interface StorageRefBadge {
   name: string;
-  kind: string;
-  ref_kind: string;
+  kind: StorageRefKind;
   updated_at_ms: number;
 }
 
@@ -17,21 +30,23 @@ export interface StorageTreeNode {
   tree_oid: string;
   created_at_ms: number;
   git_oid: string;
-  state: string;
-  is_merge: boolean;
+  state: SnapshotState;
   refs: StorageRefBadge[];
+}
+
+export function isMergeSnapshot(node: { parent_ids: readonly string[] }): boolean {
+  return node.parent_ids.length >= 2;
 }
 
 export interface StorageHistoryEntry {
   seq: number;
   project: string;
   name: string;
-  kind: string;
-  ref_kind: string;
+  kind: StorageRefKind;
   old_snapshot: string | null;
   new_snapshot: string;
   reason: string;
-  action: string;
+  action: RefLogAction;
   at_ms: number;
 }
 
@@ -42,7 +57,7 @@ export interface StorageTreeSummary {
   active_refs: number;
   history_entries: number;
   truncated: boolean;
-  backend: string;
+  backend: StorageBackend;
   mode_note: string;
 }
 
@@ -60,7 +75,7 @@ export interface StorageAncestor {
   git_oid: string;
   tree_oid: string;
   parent_ids: string[];
-  state: string;
+  state: SnapshotState;
   created_at_ms: number;
   depth: number;
 }
@@ -70,7 +85,7 @@ export interface StorageChildSnapshot {
   git_oid: string;
   tree_oid: string;
   parent_ids: string[];
-  state: string;
+  state: SnapshotState;
   created_at_ms: number;
 }
 
@@ -159,15 +174,56 @@ function asStrArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === "string");
 }
 
+function normalizeRefKind(value: unknown): StorageRefKind {
+  switch (value) {
+    case "main":
+    case "task":
+    case "worker":
+    case "wip":
+    case "tag":
+      return value;
+    default:
+      return "worker";
+  }
+}
+
+function normalizeRefLogAction(value: unknown): RefLogAction {
+  switch (value) {
+    case "created":
+    case "merged":
+    case "fast-forwarded":
+    case "rolled-back":
+    case "retired":
+    case "moved":
+      return value;
+    default:
+      return "moved";
+  }
+}
+
+function normalizeStorageBackend(value: unknown): StorageBackend {
+  switch (value) {
+    case "d6":
+    case "cow":
+    case "overlay":
+    case "git":
+      return value;
+    default:
+      return "git";
+  }
+}
+
+function normalizeSnapshotState(value: unknown): SnapshotState {
+  return value === "collected" ? "collected" : "live";
+}
+
 function normalizeRefBadge(raw: unknown): StorageRefBadge | null {
   const o = asObj(raw);
   const name = asStr(o.name);
   if (!name) return null;
-  const refKind = asStr(o.ref_kind, "branch");
   return {
     name,
-    kind: asStr(o.kind, refKind),
-    ref_kind: refKind,
+    kind: normalizeRefKind(o.kind),
     updated_at_ms: asNum(o.updated_at_ms, 0),
   };
 }
@@ -195,8 +251,7 @@ function normalizeNode(raw: unknown): StorageTreeNode | null {
     tree_oid: asStr(o.tree_oid),
     created_at_ms: asNum(o.created_at_ms, 0),
     git_oid: asStr(o.git_oid),
-    state: asStr(o.state, "live"),
-    is_merge: asBool(o.is_merge, parentIds.length >= 2),
+    state: normalizeSnapshotState(o.state),
     refs,
   };
 }
@@ -206,17 +261,15 @@ function normalizeHistoryEntry(raw: unknown): StorageHistoryEntry | null {
   const name = asStr(o.name);
   const newSnapshot = asStr(o.new_snapshot);
   if (!name || !newSnapshot) return null;
-  const refKind = asStr(o.ref_kind, "branch");
   return {
     seq: asNum(o.seq, 0),
     project: asStr(o.project),
     name,
-    kind: asStr(o.kind, refKind),
-    ref_kind: refKind,
+    kind: normalizeRefKind(o.kind),
     old_snapshot: asNullableStr(o.old_snapshot),
     new_snapshot: newSnapshot,
     reason: asStr(o.reason),
-    action: asStr(o.action, "advanced"),
+    action: normalizeRefLogAction(o.action),
     at_ms: asNum(o.at_ms, 0),
   };
 }
@@ -245,7 +298,7 @@ export function normalizeStorageTree(raw: unknown): StorageTreeResponse {
       active_refs: asNum(summaryObj.active_refs, refs.length),
       history_entries: asNum(summaryObj.history_entries, history.length),
       truncated: asBool(summaryObj.truncated, false),
-      backend: asStr(summaryObj.backend, "git"),
+      backend: normalizeStorageBackend(summaryObj.backend),
       mode_note: asStr(
         summaryObj.mode_note,
         "No D6 snapshots recorded yet.",
@@ -281,7 +334,7 @@ export function normalizeStorageSnapshot(raw: unknown): StorageSnapshotDetail | 
             git_oid: asStr(a.git_oid),
             tree_oid: asStr(a.tree_oid),
             parent_ids: asStrArray(a.parent_ids),
-            state: asStr(a.state, "live"),
+            state: normalizeSnapshotState(a.state),
             created_at_ms: asNum(a.created_at_ms, 0),
             depth: asNum(a.depth, 1),
           };
@@ -299,7 +352,7 @@ export function normalizeStorageSnapshot(raw: unknown): StorageSnapshotDetail | 
             git_oid: asStr(c.git_oid),
             tree_oid: asStr(c.tree_oid),
             parent_ids: asStrArray(c.parent_ids),
-            state: asStr(c.state, "live"),
+            state: normalizeSnapshotState(c.state),
             created_at_ms: asNum(c.created_at_ms, 0),
           };
         })
@@ -344,10 +397,10 @@ export function normalizeStorageSnapshot(raw: unknown): StorageSnapshotDetail | 
 export function shortOid(id: string | null | undefined, length = 8): string {
   if (!id) return "—";
   const stripped = id.startsWith("sha256:") ? id.slice(7) : id;
-  return stripped.slice(0, Math.max(4, length));
+  return Array.from(stripped).slice(0, Math.max(4, length)).join("");
 }
 
-export function refKindMeta(kind: string): {
+export function refKindMeta(kind: StorageRefKind): {
   label: string;
   tone: BadgeTone;
 } {
@@ -362,12 +415,10 @@ export function refKindMeta(kind: string): {
       return { label: "wip", tone: "warning" };
     case "tag":
       return { label: "tag", tone: "neutral" };
-    default:
-      return { label: kind || "branch", tone: "info" };
   }
 }
 
-export function historyActionMeta(action: string): {
+export function historyActionMeta(action: RefLogAction): {
   label: string;
   tone: BadgeTone;
 } {
@@ -376,11 +427,23 @@ export function historyActionMeta(action: string): {
       return { label: "created", tone: "info" };
     case "merged":
       return { label: "merged", tone: "success" };
-    case "rollback":
-      return { label: "rollback", tone: "danger" };
-    default:
-      return { label: action || "advanced", tone: "neutral" };
+    case "fast-forwarded":
+      return { label: "fast-forwarded", tone: "success" };
+    case "rolled-back":
+      return { label: "rolled-back", tone: "danger" };
+    case "retired":
+      return { label: "retired", tone: "warning" };
+    case "moved":
+      return { label: "moved", tone: "neutral" };
   }
+}
+
+export function shellToken(value: string): string {
+  const clean = value.replace(/\0/g, "");
+  if (clean.length > 0 && /^[A-Za-z0-9_./:@%+=,-]+$/.test(clean)) {
+    return clean;
+  }
+  return `'${clean.replace(/'/g, "'\\''")}'`;
 }
 
 export function fallbackRecoveryCommands(
@@ -390,40 +453,44 @@ export function fallbackRecoveryCommands(
   const shortId = shortOid(node.snapshot_id, 12);
   const proj = project && project.length > 0 ? project : "default";
   const gitTarget = node.git_oid || shortId;
+  const safeProj = shellToken(proj);
+  const safeGitTarget = shellToken(gitTarget);
+  const safeRecoverBranch = shellToken(`recover/${shortId}`);
+  const safeRollbackReason = shellToken(`time-machine rollback to ${shortId}`);
   return [
     {
       id: "verify_status",
       label: "Inspect D6 cutover status",
       description: "Read-only inspection of current D6/Git cutover phase and ref ledger.",
-      command: `spawn storage cutover --status --project ${proj} --json`,
+      command: `spawn storage cutover --status --project ${safeProj} --json`,
       risk: "read_only",
     },
     {
       id: "verify_parity",
       label: "Verify CAS parity",
       description: "Read-only parity check between D6 Merkle snapshots and Git border.",
-      command: `spawn storage cutover --verify --project ${proj} --json`,
+      command: `spawn storage cutover --verify --project ${safeProj} --json`,
       risk: "read_only",
     },
     {
       id: "inspect_commit",
       label: "Inspect projected commit",
       description: "Read commit metadata and diff stat for the projected Git OID.",
-      command: `git show --stat ${gitTarget}`,
+      command: `git show --stat ${safeGitTarget}`,
       risk: "read_only",
     },
     {
       id: "create_branch",
       label: "Create recovery branch",
       description: "Non-destructive branch at this snapshot to explore or cherry-pick.",
-      command: `git checkout -b recover/${shortId} ${gitTarget}`,
+      command: `git checkout -b ${safeRecoverBranch} ${safeGitTarget}`,
       risk: "branch",
     },
     {
       id: "rollback_git",
       label: "Rollback project to writable Git",
       description: "Retires active D6 refs while preserving immutable audit history.",
-      command: `spawn storage cutover --rollback git --project ${proj} --reason "time-machine rollback to ${shortId}"`,
+      command: `spawn storage cutover --rollback git --project ${safeProj} --reason ${safeRollbackReason}`,
       risk: "rollback",
     },
   ];
@@ -490,7 +557,7 @@ export function buildGraphLayout(
   const mainSpine = new Set<string>();
 
   const mainRef =
-    refs.find((r) => r.kind === "main" || r.name === "main" || r.ref_kind === "main") ??
+    refs.find((r) => r.kind === "main" || r.name === "main") ??
     null;
   let cursor =
     mainRef?.snapshot_id ??
@@ -575,7 +642,7 @@ export function buildGraphLayout(
       x,
       y,
       isMainLane: lane === 0,
-      isMerge: node.is_merge || node.parent_ids.length >= 2,
+      isMerge: isMergeSnapshot(node),
       node,
     };
   });

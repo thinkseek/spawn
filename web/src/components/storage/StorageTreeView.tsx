@@ -24,6 +24,8 @@ import {
   type StorageHistoryEntry,
   type StorageRecoveryCommand,
   type StorageSnapshotDetail,
+  isMergeSnapshot,
+  type StorageBackend,
   type StorageTreeNode,
   type StorageTreeResponse,
 } from "../../storageTree.ts";
@@ -51,10 +53,16 @@ function laneStroke(lane: number, isMergeEdge: boolean): string {
   return LANE_COLORS[1 + ((lane - 1) % (LANE_COLORS.length - 1))];
 }
 
-function backendTone(backend: string): BadgeTone {
-  if (backend === "d6") return "success";
-  if (backend === "cow" || backend === "overlay") return "info";
-  return "neutral";
+function backendTone(backend: StorageBackend): BadgeTone {
+  switch (backend) {
+    case "d6":
+      return "success";
+    case "cow":
+    case "overlay":
+      return "info";
+    case "git":
+      return "neutral";
+  }
 }
 
 function riskBadgeMeta(risk: StorageRecoveryCommand["risk"]): {
@@ -326,7 +334,7 @@ export function StorageTreeView() {
 }
 
 function SummaryStrip({ data }: { data: StorageTreeResponse }) {
-  const merges = data.nodes.filter((n) => n.is_merge).length;
+  const merges = data.nodes.filter((n) => isMergeSnapshot(n)).length;
   return (
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
       <Card className="p-3.5">
@@ -543,12 +551,12 @@ function SnapshotRow({
               git:{shortOid(node.git_oid, 7)}
             </span>
           )}
-          {node.is_merge && (
+          {isMergeSnapshot(node) && (
             <Badge tone="info" icon={<GitMerge size={11} />}>
               Merge ({node.parent_ids.length}p)
             </Badge>
           )}
-          {isMainLane && !node.is_merge && node.refs.length === 0 && (
+          {isMainLane && !isMergeSnapshot(node) && node.refs.length === 0 && (
             <Badge tone="neutral">spine</Badge>
           )}
           {node.state !== "live" && (
@@ -776,7 +784,7 @@ function SnapshotDrawer({
           <span className="truncate font-mono text-body font-semibold text-foreground">
             Snapshot {shortOid(snap.snapshot_id, 12)}
           </span>
-          {snap.is_merge && (
+          {isMergeSnapshot(snap) && (
             <Badge tone="info" icon={<GitMerge size={11} />}>
               Merge
             </Badge>
