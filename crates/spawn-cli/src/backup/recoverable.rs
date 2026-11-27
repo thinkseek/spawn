@@ -3670,6 +3670,276 @@ fn cmd_key_of(flags: &Flags) -> Result<i32, String> {
     Ok(0)
 }
 
+struct TempExportDir {
+    path: PathBuf,
+}
+
+impl TempExportDir {
+    fn create(parent: Option<&Path>, label: &str) -> Result<Self, String> {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let base = parent.map_or_else(std::env::temp_dir, Path::to_path_buf);
+        let path = base.join(format!("spawn-{label}-{}-{seq}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).map_err(|error| {
+            format!("create temporary D6 export dir {}: {error}", path.display())
+        })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempExportDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+struct BorrowedPgRefLedger<'a>(&'a spawn_postgres::PostgresStore);
+
+fn pg_kind_to_d6(kind: spawn_postgres::RefKind) -> spawn_host::D6RefKind {
+    match kind {
+        spawn_postgres::RefKind::Main => spawn_host::D6RefKind::Main,
+        spawn_postgres::RefKind::Branch => spawn_host::D6RefKind::Branch,
+        spawn_postgres::RefKind::Wip => spawn_host::D6RefKind::Wip,
+        spawn_postgres::RefKind::Tag => spawn_host::D6RefKind::Tag,
+    }
+}
+
+fn pg_snapshot_to_ledger(
+    row: spawn_postgres::SnapshotRow,
+) -> Result<spawn_host::LedgerSnapshot, spawn_host::D6StoreError> {
+    let parents = row
+        .parents
+        .iter()
+        .map(|parent| spawn_cas::Digest::parse(parent))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(spawn_host::LedgerSnapshot {
+        id: spawn_cas::Digest::parse(&row.id)?,
+        git_oid: spawn_cas::GitOid::parse_hex(&row.git_oid)?,
+        tree: spawn_cas::Digest::parse(&row.tree)?,
+        parents,
+        project: row.project,
+        created_at_ms: row.created_at_ms,
+    })
+}
+
+impl spawn_host::RefLedger for BorrowedPgRefLedger<'_> {
+    fn record_snapshot(
+        &self,
+        _id: &spawn_cas::Digest,
+        _git_oid: &spawn_cas::GitOid,
+        _tree: &spawn_cas::Digest,
+        _parents: &[spawn_cas::Digest],
+        _project: &str,
+        _created_at_ms: i64,
+    ) -> Result<spawn_cas::Digest, spawn_host::D6StoreError> {
+        Err(spawn_host::D6StoreError::Ledger(
+            "backup export ledger is read-only".to_string(),
+        ))
+    }
+
+    fn get_snapshot(
+        &self,
+        id: &spawn_cas::Digest,
+    ) -> Result<Option<spawn_host::LedgerSnapshot>, spawn_host::D6StoreError> {
+        self.0
+            .get_snapshot(&id.to_string())
+            .map_err(|error| spawn_host::D6StoreError::Ledger(error.to_string()))?
+            .map(pg_snapshot_to_ledger)
+            .transpose()
+    }
+
+    fn get_snapshot_by_oid(
+        &self,
+        git_oid: &spawn_cas::GitOid,
+    ) -> Result<Option<spawn_host::LedgerSnapshot>, spawn_host::D6StoreError> {
+        self.0
+            .get_snapshot_by_oid(&git_oid.to_hex())
+            .map_err(|error| spawn_host::D6StoreError::Ledger(error.to_string()))?
+            .map(pg_snapshot_to_ledger)
+            .transpose()
+    }
+
+    fn cas_ref(
+        &self,
+        _project: &str,
+        _name: &str,
+        _kind: spawn_host::D6RefKind,
+        _expected: Option<&spawn_cas::Digest>,
+        _new_snapshot: &spawn_cas::Digest,
+        _reason: &str,
+    ) -> Result<u64, spawn_host::D6StoreError> {
+        Err(spawn_host::D6StoreError::Ledger(
+            "backup export ledger is read-only".to_string(),
+        ))
+    }
+
+    fn land_main_ref(
+        &self,
+        _project: &str,
+        _name: &str,
+        _expected_base: Option<&spawn_cas::Digest>,
+        _new_snapshot: &spawn_cas::Digest,
+        _task_id: Option<i64>,
+        _reason: &str,
+    ) -> Result<u64, spawn_host::D6StoreError> {
+        Err(spawn_host::D6StoreError::Ledger(
+            "backup export ledger is read-only".to_string(),
+        ))
+    }
+
+    fn list_refs(
+        &self,
+        project: Option<&str>,
+    ) -> Result<Vec<spawn_host::LedgerRef>, spawn_host::D6StoreError> {
+        let rows = self
+            .0
+            .list_refs(project)
+            .map_err(|error| spawn_host::D6StoreError::Ledger(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(spawn_host::LedgerRef {
+                    project: row.project,
+                    name: row.name,
+                    kind: pg_kind_to_d6(row.kind),
+                    snapshot: spawn_cas::Digest::parse(&row.snapshot)?,
+                    updated_at_ms: row.updated_at_ms,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Prepared repository path ready for `heads_of` / `git bundle create` / live
+/// restore-drill comparison, backed either directly by the on-disk Git source
+/// or by a temporary `GitBorderAdapter::export_project` materialization in D6 mode.
+pub(super) struct PreparedBundleSource {
+    git_dir: String,
+    d6_exported: bool,
+    _scratch: Option<TempExportDir>,
+}
+
+impl PreparedBundleSource {
+    pub(super) fn git_dir(&self) -> &str {
+        &self.git_dir
+    }
+
+    pub(super) const fn is_d6(&self) -> bool {
+        self.d6_exported
+    }
+}
+
+fn push_unique_candidate(candidates: &mut Vec<String>, value: &str) {
+    if !value.is_empty() && !candidates.iter().any(|existing| existing == value) {
+        candidates.push(value.to_string());
+    }
+}
+
+fn push_path_candidates(candidates: &mut Vec<String>, path: &Path) {
+    push_unique_candidate(candidates, &path.to_string_lossy());
+    if let Ok(canonical) = fs::canonicalize(path) {
+        push_unique_candidate(candidates, &canonical.to_string_lossy());
+    }
+}
+
+fn d6_source_project_candidates(root: &Path, source: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    push_unique_candidate(&mut candidates, source);
+    let trimmed = source.trim_end_matches('/');
+    push_unique_candidate(&mut candidates, trimmed);
+    if source.starts_with('/') && !source.contains("://") {
+        let src_path = Path::new(source);
+        push_path_candidates(&mut candidates, src_path);
+        let dot_git = src_path.join(".git");
+        if dot_git.is_dir() {
+            push_path_candidates(&mut candidates, &dot_git);
+        }
+    }
+    if let Ok(mirror) = crate::sources::mirror_path(root, Some(source)) {
+        push_path_candidates(&mut candidates, &mirror);
+    }
+    candidates
+}
+
+fn find_live_non_wip_d6_project(
+    store: &spawn_postgres::PostgresStore,
+    root: &Path,
+    source: &str,
+) -> Result<Option<(String, usize)>, String> {
+    for project in d6_source_project_candidates(root, source) {
+        let rows = store
+            .list_refs(Some(&project))
+            .map_err(|error| format!("list D6 refs for {project}: {error}"))?;
+        let live_non_wip = rows
+            .iter()
+            .filter(|row| !matches!(row.kind, spawn_postgres::RefKind::Wip))
+            .count();
+        if live_non_wip > 0 {
+            return Ok(Some((project, live_non_wip)));
+        }
+    }
+    Ok(None)
+}
+
+fn prepare_source_for_bundle_with_cas(
+    store: &spawn_postgres::PostgresStore,
+    root: &Path,
+    source: &str,
+    cas_dir_override: Option<&Path>,
+    export_parent: Option<&Path>,
+) -> Result<PreparedBundleSource, String> {
+    let Some((project, live_count)) = find_live_non_wip_d6_project(store, root, source)? else {
+        return Ok(PreparedBundleSource {
+            git_dir: source.to_string(),
+            d6_exported: false,
+            _scratch: None,
+        });
+    };
+
+    let cas_dir = match cas_dir_override {
+        Some(dir) => dir.to_path_buf(),
+        None => crate::config::D6RuntimeConfig::from_env()?
+            .effective_cas_dir(root, spawn_host::WorkspaceBackend::D6),
+    };
+    if !cas_dir.is_dir() || !cas_dir.join(spawn_cas::CAS_MARKER).is_file() {
+        return Err(format!(
+            "D6 CAS store missing or uninitialized at {} while project {project} has {live_count} live non-WIP ref(s) in Postgres",
+            cas_dir.display()
+        ));
+    }
+
+    let cas = spawn_host::CasMerkleStore::open(&cas_dir)
+        .map_err(|error| format!("open D6 CAS store at {}: {error}", cas_dir.display()))?;
+    let scratch = TempExportDir::create(export_parent, "backup-d6-export")?;
+    let export_dir = scratch.path.join("repo.git");
+    let ledger = BorrowedPgRefLedger(store);
+    spawn_host::GitBorderAdapter::new()
+        .export_project(&cas, &ledger, &project, &export_dir)
+        .map_err(|error| {
+            format!(
+                "export D6 project {project} from CAS at {} via Git border adapter: {error}",
+                cas_dir.display()
+            )
+        })?;
+    Ok(PreparedBundleSource {
+        git_dir: export_dir.to_string_lossy().into_owned(),
+        d6_exported: true,
+        _scratch: Some(scratch),
+    })
+}
+
+/// Prepare `source` for Git-based bundling or live drill comparison: when
+/// Postgres holds live non-WIP D6 refs for `source`, materialize a scratch bare
+/// repository via [`spawn_host::GitBorderAdapter::export_project`] from CAS,
+/// failing closed if CAS is missing or cannot be exported; otherwise pass `source`
+/// through unchanged for Git mode.
+pub(super) fn prepare_source_for_bundle(
+    store: &spawn_postgres::PostgresStore,
+    root: &Path,
+    source: &str,
+) -> Result<PreparedBundleSource, String> {
+    prepare_source_for_bundle_with_cas(store, root, source, None, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4776,5 +5046,224 @@ mod tests {
             fs::read_dir(&pre_empty).unwrap().next().is_none(),
             "pre-existing dir contents are cleaned on rollback"
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn d6_backup_source_preparation_supports_full_incremental_and_fails_closed_on_missing_cas() {
+        use spawn_cas::{Tree, TreeEntry, TreeEntryKind};
+        use spawn_host::{CasMerkleStore, D6RefKind, PublishRequest, format_commit_body};
+
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("backup_d6_export");
+        let store = Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+                .expect("isolated schema store"),
+        );
+        let ledger = crate::sources::PostgresRefLedger::new(Arc::clone(&store));
+
+        let temp = TempDir::new("d6-backup-bundle");
+        let root = temp.path().join("ws-root");
+        fs::create_dir_all(&root).expect("root");
+        let cas_dir = root.join(".cas");
+        let cas = CasMerkleStore::open(&cas_dir).expect("cas");
+
+        // Pure D6 source with NO bare repo directory on disk at all.
+        let project_path = temp.path().join("pure-d6-mission.git");
+        let project = project_path.to_string_lossy().into_owned();
+
+        let (b1, b1_len) = cas.put_bytes_blob(b"day1 content\n").expect("b1");
+        let t1 = cas
+            .put_tree_cached(
+                &Tree::from_entries(vec![TreeEntry {
+                    kind: TreeEntryKind::File,
+                    name: b"state.txt".to_vec(),
+                    id: b1.as_bytes(),
+                    size: b1_len,
+                }])
+                .expect("t1"),
+            )
+            .expect("put t1");
+        let c1_body = format_commit_body(
+            "Backup Test <backup@spawn.local> 1700001000 +0000",
+            "Backup Test <backup@spawn.local> 1700001000 +0000",
+            "day 1 main commit\n",
+        );
+        let p1 = cas
+            .publish_snapshot(
+                &ledger,
+                &PublishRequest {
+                    project: &project,
+                    ref_name: "main",
+                    kind: D6RefKind::Main,
+                    expected_ref: None,
+                    tree: &t1,
+                    parents: &[],
+                    commit_body: &c1_body,
+                    created_at_ms: 1_700_001_000_000,
+                    reason: "bootstrap main",
+                    landing_task_id: None,
+                },
+            )
+            .expect("publish p1");
+
+        let full_prepared = super::prepare_source_for_bundle_with_cas(
+            &store,
+            &root,
+            &project,
+            Some(&cas_dir),
+            Some(temp.path()),
+        )
+        .expect("prepare full d6");
+        assert!(full_prepared.is_d6());
+        let heads1 = super::super::heads_of(full_prepared.git_dir()).expect("heads1");
+        assert_eq!(
+            heads1.get("refs/heads/main").map(String::as_str),
+            Some(p1.git_oid.to_hex().as_str())
+        );
+        let full_bundle = temp.path().join("full.bundle");
+        super::super::git_bundle(full_prepared.git_dir(), &full_bundle, &[])
+            .expect("create full d6 bundle");
+        drop(full_prepared);
+
+        // Day 2: publish a D6 branch commit absent from any disk bare repo.
+        let (b2, b2_len) = cas.put_bytes_blob(b"day2 increment\n").expect("b2");
+        let t2 = cas
+            .put_tree_cached(
+                &Tree::from_entries(vec![TreeEntry {
+                    kind: TreeEntryKind::File,
+                    name: b"state.txt".to_vec(),
+                    id: b2.as_bytes(),
+                    size: b2_len,
+                }])
+                .expect("t2"),
+            )
+            .expect("put t2");
+        let c2_body = format_commit_body(
+            "Backup Test <backup@spawn.local> 1700002000 +0000",
+            "Backup Test <backup@spawn.local> 1700002000 +0000",
+            "day 2 branch commit\n",
+        );
+        let p2 = cas
+            .publish_snapshot(
+                &ledger,
+                &PublishRequest {
+                    project: &project,
+                    ref_name: "feat/d6-inc",
+                    kind: D6RefKind::Branch,
+                    expected_ref: None,
+                    tree: &t2,
+                    parents: std::slice::from_ref(&p1.snapshot),
+                    commit_body: &c2_body,
+                    created_at_ms: 1_700_002_000_000,
+                    reason: "advance branch in d6",
+                    landing_task_id: None,
+                },
+            )
+            .expect("publish p2");
+
+        let incr_prepared = super::prepare_source_for_bundle_with_cas(
+            &store,
+            &root,
+            &project,
+            Some(&cas_dir),
+            Some(temp.path()),
+        )
+        .expect("prepare incr d6");
+        assert!(incr_prepared.is_d6());
+        let heads2 = super::super::heads_of(incr_prepared.git_dir()).expect("heads2");
+        assert_eq!(
+            heads2.get("refs/heads/main").map(String::as_str),
+            Some(p1.git_oid.to_hex().as_str())
+        );
+        assert_eq!(
+            heads2.get("refs/heads/feat/d6-inc").map(String::as_str),
+            Some(p2.git_oid.to_hex().as_str())
+        );
+        let not = vec![p1.git_oid.to_hex()];
+        assert!(super::super::holds(incr_prepared.git_dir(), &not[0]));
+        assert!(
+            super::super::bundle_would_write(incr_prepared.git_dir(), &not)
+                .expect("bundle would write")
+        );
+        let incr_bundle = temp.path().join("incr.bundle");
+        super::super::git_bundle(incr_prepared.git_dir(), &incr_bundle, &not)
+            .expect("create incremental d6 bundle");
+        drop(incr_prepared);
+
+        // Restore chain (full clone + incremental fetch) and verify both refs & blob bytes.
+        let restored = temp.path().join("restored.git");
+        let clone = crate::sources::controller_git()
+            .args(["clone", "--mirror"])
+            .arg(&full_bundle)
+            .arg(&restored)
+            .output()
+            .expect("clone full bundle");
+        assert!(clone.status.success(), "{clone:?}");
+        let fetch = crate::sources::controller_git()
+            .arg("-C")
+            .arg(&restored)
+            .arg("fetch")
+            .arg(&incr_bundle)
+            .arg("refs/heads/*:refs/heads/*")
+            .output()
+            .expect("fetch incr bundle");
+        assert!(fetch.status.success(), "{fetch:?}");
+        let restored_heads = super::super::heads_of(&restored.to_string_lossy()).expect("restored");
+        assert_eq!(restored_heads, heads2);
+
+        // Fail closed when live non-WIP PG refs exist and CAS directory is missing/uninitialized.
+        let missing_cas = temp.path().join("missing-cas");
+        let err = super::prepare_source_for_bundle_with_cas(
+            &store,
+            &root,
+            &project,
+            Some(&missing_cas),
+            Some(temp.path()),
+        )
+        .err()
+        .expect("missing cas must fail closed");
+        assert!(err.contains("D6 CAS store missing"), "{err}");
+        assert!(!missing_cas.join(spawn_cas::CAS_MARKER).exists());
+
+        // WIP-only / zero non-WIP PG refs pass through unchanged in Git mode even without CAS.
+        let wip_project = temp
+            .path()
+            .join("wip-only.git")
+            .to_string_lossy()
+            .into_owned();
+        let wip_body = format_commit_body(
+            "Backup Test <backup@spawn.local> 1700003000 +0000",
+            "Backup Test <backup@spawn.local> 1700003000 +0000",
+            "wip scratch commit\n",
+        );
+        cas.publish_snapshot(
+            &ledger,
+            &PublishRequest {
+                project: &wip_project,
+                ref_name: "wip/scratch",
+                kind: D6RefKind::Wip,
+                expected_ref: None,
+                tree: &t1,
+                parents: &[],
+                commit_body: &wip_body,
+                created_at_ms: 1_700_003_000_000,
+                reason: "wip only",
+                landing_task_id: None,
+            },
+        )
+        .expect("publish wip ref");
+        let git_pass = super::prepare_source_for_bundle_with_cas(
+            &store,
+            &root,
+            &wip_project,
+            Some(&missing_cas),
+            Some(temp.path()),
+        )
+        .expect("wip-only passes through");
+        assert!(!git_pass.is_d6());
+        assert_eq!(git_pass.git_dir(), wip_project);
     }
 }

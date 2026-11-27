@@ -1127,7 +1127,7 @@ fn run(
             mismatches: &mut missions,
             unknown: &mut unknown,
         };
-        restore_repos(store, newest, &unpacked, drill, found)?;
+        restore_repos(store, &settings.root, newest, &unpacked, drill, found)?;
         return Ok(Report {
             key,
             event_id: newest.event_id,
@@ -1179,7 +1179,7 @@ fn run(
         mismatches: &mut missions,
         unknown: &mut unknown,
     };
-    restore_repos(store, newest, &unpacked, drill, found)?;
+    restore_repos(store, &settings.root, newest, &unpacked, drill, found)?;
     Ok(Report {
         key,
         event_id: newest.event_id,
@@ -1200,6 +1200,7 @@ fn run(
 /// the map nor live is an unknown commit.
 fn restore_repos(
     store: &spawn_postgres::PostgresStore,
+    root: &Path,
     newest: &BundleRecord,
     unpacked: &[(PathBuf, Value)],
     drill: &Path,
@@ -1234,7 +1235,19 @@ fn restore_repos(
             mismatches.push(format!("{source}: not restored: {error}"));
             continue;
         }
-        let live_heads = match heads_of(source) {
+        let prepared = match super::recoverable::prepare_source_for_bundle(store, root, source) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                lines.push(format!(
+                    "restore-drill: missions {source}: {} refs restored; live cannot be read: {error}",
+                    heads.len()
+                ));
+                mismatches.push(format!("{source}: live cannot be read: {error}"));
+                continue;
+            }
+        };
+        let live_git_dir = prepared.git_dir();
+        let live_heads = match heads_of(live_git_dir) {
             Ok(live_heads) => live_heads,
             Err(error) => {
                 lines.push(format!(
@@ -1252,7 +1265,7 @@ fn restore_repos(
                 crate::commit_now::commit_now(store, Path::new(source), commit)
                     .map_err(|error| error.to_string())
             },
-            |old, new| descends(source, old, new),
+            |old, new| descends(live_git_dir, old, new),
         );
         let refs = match refs {
             Ok(refs) => refs,

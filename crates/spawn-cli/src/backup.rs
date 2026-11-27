@@ -2421,9 +2421,17 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         let Some(source) = source.as_str() else {
             continue;
         };
-        let Ok(heads) = heads_of(source) else {
-            missing.push(source.to_string());
-            continue;
+        let prepared = recoverable::prepare_source_for_bundle(&store, &settings.root, source)?;
+        let git_dir = prepared.git_dir();
+        let heads = match heads_of(git_dir) {
+            Ok(heads) => heads,
+            Err(error) => {
+                if prepared.is_d6() {
+                    return Err(format!("read exported D6 refs for {source}: {error}"));
+                }
+                missing.push(source.to_string());
+                continue;
+            }
         };
         // A source with no branches and no tags has nothing of the mission in
         // the archive, and `git bundle create` refuses to make an empty one:
@@ -2456,7 +2464,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
             base_heads
                 .values()
                 .filter_map(Value::as_str)
-                .filter(|commit| holds(source, commit))
+                .filter(|commit| holds(git_dir, commit))
                 .map(str::to_string)
                 .collect()
         };
@@ -2509,7 +2517,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         // run says it by name instead: the entry names the refs that changed
         // (the delta) and no file, so a reader can tell "the source moved in
         // a way that needs no bytes" from "the bundle failed".
-        if !full && !bundle_would_write(source, &not)? {
+        if !full && !bundle_would_write(git_dir, &not)? {
             repos_record.push(json!({
                 "source": source, "file": Value::Null, "heads": heads, "refs": refs,
                 "bytes": 0, "unchanged": false, "delta": delta, "bundled": [],
@@ -2522,7 +2530,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         }
         let name = source_name(source, &mut taken, index);
         let file = scratch.join(format!("{name}.bundle"));
-        git_bundle(source, &file, &not)?;
+        git_bundle(git_dir, &file, &not)?;
         // What the bundle actually holds. An increment says it by name:
         // `--not` leaves out a ref whose tip the base has, so the manifest's
         // `heads` is not the same as its ref list, and the drill compares the

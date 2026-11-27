@@ -2399,6 +2399,9 @@ struct TaskRepoContext {
     git_dir: std::path::PathBuf,
     is_bare: bool,
     landable: bool,
+    has_local_git: bool,
+    root: Option<std::path::PathBuf>,
+    source: Option<String>,
 }
 
 struct TempDirGuard {
@@ -2621,31 +2624,61 @@ fn load_task_repo(
         .as_array()
         .and_then(|sources| sources.first())
         .and_then(Value::as_str);
+    let resolved_root = root_override
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::config::env_value("SPAWN_WORKSPACE_ROOT").map(std::path::PathBuf::from));
 
-    let (git_dir, is_bare, landable) = match source {
+    let (git_dir, is_bare, landable, has_local_git) = match source {
         Some(path) if path.starts_with('/') && !path.contains("://") => {
-            let (dir, bare) = resolve_local_source_repo(std::path::Path::new(path))?;
-            (dir, bare, bare)
+            match resolve_local_source_repo(std::path::Path::new(path)) {
+                Ok((dir, bare)) => (dir, bare, bare, true),
+                Err(local_err) => {
+                    let probe = std::path::Path::new(path);
+                    let candidates =
+                        d6_project_candidates(Some(path), Some(probe), resolved_root.as_deref());
+                    if load_d6_project_refs(store, &candidates)?.is_some() {
+                        (probe.to_path_buf(), true, true, false)
+                    } else {
+                        return Err(local_err);
+                    }
+                }
+            }
         }
         other_source => {
-            let root = root_override
-                .map(str::to_string)
-                .or_else(|| crate::config::env_value("SPAWN_WORKSPACE_ROOT"))
-                .ok_or_else(|| {
-                    format!(
-                        "mission #{mission_id} has no local source directory; pass --root <dir> or set SPAWN_WORKSPACE_ROOT"
+            if let Some(root_path) = resolved_root.as_deref() {
+                let mirror = crate::sources::mirror_path(root_path, other_source)
+                    .map_err(|error| error.to_string())?;
+                if mirror.exists() {
+                    let bare = verify_bare_repo(&mirror)?;
+                    (mirror, bare, bare && other_source.is_none(), true)
+                } else {
+                    let candidates =
+                        d6_project_candidates(other_source, Some(&mirror), Some(root_path));
+                    if load_d6_project_refs(store, &candidates)?.is_some() {
+                        (mirror, true, other_source.is_none(), false)
+                    } else {
+                        return Err(format!(
+                            "mission bare repository {} does not exist",
+                            mirror.display()
+                        ));
+                    }
+                }
+            } else {
+                let candidates = d6_project_candidates(other_source, None, None);
+                if !candidates.is_empty() && load_d6_project_refs(store, &candidates)?.is_some() {
+                    let label = other_source.unwrap_or("default");
+                    (
+                        std::path::PathBuf::from(label),
+                        true,
+                        other_source.is_none(),
+                        false,
                     )
-                })?;
-            let mirror = crate::sources::mirror_path(std::path::Path::new(&root), other_source)
-                .map_err(|error| error.to_string())?;
-            if !mirror.exists() {
-                return Err(format!(
-                    "mission bare repository {} does not exist",
-                    mirror.display()
-                ));
+                } else {
+                    return Err(format!(
+                        "mission #{mission_id} has no local source directory; pass --root <dir> or set SPAWN_WORKSPACE_ROOT"
+                    ));
+                }
             }
-            let bare = verify_bare_repo(&mirror)?;
-            (mirror, bare, bare && other_source.is_none())
         }
     };
 
@@ -2657,16 +2690,368 @@ fn load_task_repo(
         git_dir,
         is_bare,
         landable,
+        has_local_git,
+        root: resolved_root,
+        source: source.map(str::to_string),
     })
 }
 
 fn candidate_task_refs(task_id: i64, agent_id: &str) -> Vec<String> {
-    let mut refs = vec![spawn_host::git::task_head_ref(task_id, "head")];
-    if !agent_id.is_empty() {
-        refs.push(spawn_host::git::worker_head_ref(agent_id));
-        refs.push(format!("refs/heads/spawn/{agent_id}"));
+    spawn_host::workspace_rules::candidate_task_refs(task_id, agent_id)
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedTaskRefs {
+    base_sha: String,
+    resolved_ref: String,
+    head_sha: String,
+    d6_mode: bool,
+    base_snapshot: Option<spawn_cas::Digest>,
+    head_snapshot: Option<spawn_cas::Digest>,
+}
+
+fn push_unique_project(candidates: &mut Vec<String>, value: &str) {
+    if !value.is_empty() && !candidates.iter().any(|existing| existing == value) {
+        candidates.push(value.to_string());
     }
-    refs
+}
+
+fn push_path_candidates(candidates: &mut Vec<String>, path: &std::path::Path) {
+    push_unique_project(candidates, &path.to_string_lossy());
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        push_unique_project(candidates, &canonical.to_string_lossy());
+    }
+}
+
+fn d6_project_candidates(
+    source: Option<&str>,
+    git_dir: Option<&std::path::Path>,
+    root: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = git_dir {
+        push_path_candidates(&mut candidates, dir);
+    }
+    if let Some(src) = source {
+        push_unique_project(&mut candidates, src);
+        let trimmed = src.trim_end_matches('/');
+        push_unique_project(&mut candidates, trimmed);
+        if src.starts_with('/') && !src.contains("://") {
+            push_path_candidates(&mut candidates, std::path::Path::new(src));
+        }
+        if let Some(root_dir) = root
+            && let Ok(mirror) = crate::sources::mirror_path(root_dir, Some(src))
+        {
+            push_path_candidates(&mut candidates, &mirror);
+        }
+    } else if let Some(root_dir) = root
+        && let Ok(mirror) = crate::sources::mirror_path(root_dir, None)
+    {
+        push_path_candidates(&mut candidates, &mirror);
+    }
+    candidates
+}
+
+fn load_d6_project_refs(
+    store: &spawn_postgres::PostgresStore,
+    candidates: &[String],
+) -> Result<Option<(String, Vec<spawn_postgres::RefRow>)>, String> {
+    for project in candidates {
+        let rows = store
+            .list_refs(Some(project))
+            .map_err(|error| format!("list D6 refs for {project}: {error}"))?;
+        if !rows.is_empty() {
+            return Ok(Some((project.clone(), rows)));
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_snapshot_target(
+    store: &spawn_postgres::PostgresStore,
+    row: &spawn_postgres::RefRow,
+) -> Result<(String, spawn_cas::Digest), String> {
+    let snapshot = store
+        .get_snapshot(&row.snapshot)
+        .map_err(|error| format!("read D6 snapshot {}: {error}", row.snapshot))?
+        .ok_or_else(|| {
+            format!(
+                "D6 ref '{}' points to missing snapshot {}",
+                row.name, row.snapshot
+            )
+        })?;
+    if !is_commit(&snapshot.git_oid) {
+        return Err(format!(
+            "D6 snapshot {} has invalid git_oid {:?}",
+            snapshot.id, snapshot.git_oid
+        ));
+    }
+    let digest = spawn_cas::Digest::parse(&row.snapshot)
+        .map_err(|error| format!("invalid D6 snapshot digest {}: {error}", row.snapshot))?;
+    Ok((snapshot.git_oid, digest))
+}
+
+fn resolve_main_from_d6_ledger(
+    store: &spawn_postgres::PostgresStore,
+    project: &str,
+    rows: &[spawn_postgres::RefRow],
+) -> Result<(String, spawn_cas::Digest), String> {
+    let main_row = rows
+        .iter()
+        .find(|row| {
+            matches!(row.kind, spawn_postgres::RefKind::Main)
+                || row.name == "main"
+                || row.name == "refs/heads/main"
+        })
+        .ok_or_else(|| format!("main ref not found in D6 ledger for project {project}"))?;
+    resolve_snapshot_target(store, main_row)
+}
+
+fn match_d6_ref<'a>(
+    rows: &'a [spawn_postgres::RefRow],
+    aliases: &[&str],
+) -> Option<&'a spawn_postgres::RefRow> {
+    for alias in aliases {
+        if let Some(row) = rows
+            .iter()
+            .find(|row| !matches!(row.kind, spawn_postgres::RefKind::Wip) && row.name == *alias)
+        {
+            return Some(row);
+        }
+    }
+    None
+}
+
+fn resolve_preserved_ref_from_d6_ledger(
+    store: &spawn_postgres::PostgresStore,
+    rows: &[spawn_postgres::RefRow],
+    task_id: i64,
+    agent_id: &str,
+) -> Result<Option<(String, String, spawn_cas::Digest)>, String> {
+    let candidates = candidate_task_refs(task_id, agent_id);
+    for display_ref in candidates {
+        let short_ref = display_ref.strip_prefix("refs/").unwrap_or(&display_ref);
+        let row = if let Some(branch_name) =
+            display_ref.strip_prefix(spawn_host::workspace_rules::SPAWN_BRANCH_REF_PREFIX)
+        {
+            let short_branch = format!("spawn/{branch_name}");
+            match_d6_ref(
+                rows,
+                &[display_ref.as_str(), short_branch.as_str(), branch_name],
+            )
+        } else {
+            match_d6_ref(rows, &[display_ref.as_str(), short_ref])
+        };
+        if let Some(row) = row {
+            let (git_oid, digest) = resolve_snapshot_target(store, row)?;
+            return Ok(Some((display_ref, git_oid, digest)));
+        }
+    }
+    Ok(None)
+}
+
+fn is_d6_mode_for_task(ctx: &TaskRepoContext, has_d6_refs: bool) -> bool {
+    let root_d6 = ctx.root.as_deref().is_some_and(|root| {
+        matches!(
+            spawn_host::root_backend(root).ok().flatten(),
+            Some(spawn_host::WorkspaceBackend::D6)
+        )
+    });
+    let border_ro =
+        ctx.has_local_git && spawn_host::is_readonly_border(&ctx.git_dir).unwrap_or(false);
+    let env_d6 = crate::config::env_value("SPAWN_WORKSPACE_BACKEND")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("d6"));
+    root_d6 || border_ro || env_d6 || (!ctx.has_local_git && has_d6_refs)
+}
+
+fn lookup_snapshot_digest_by_oid(
+    store: &spawn_postgres::PostgresStore,
+    git_oid: &str,
+) -> Result<Option<spawn_cas::Digest>, String> {
+    let Some(row) = store
+        .get_snapshot_by_oid(git_oid)
+        .map_err(|error| format!("lookup D6 snapshot for commit {git_oid}: {error}"))?
+    else {
+        return Ok(None);
+    };
+    spawn_cas::Digest::parse(&row.id)
+        .map(Some)
+        .map_err(|error| format!("invalid D6 snapshot digest {}: {error}", row.id))
+}
+
+fn resolve_task_refs(
+    store: &spawn_postgres::PostgresStore,
+    ctx: &TaskRepoContext,
+) -> Result<ResolvedTaskRefs, String> {
+    let candidates = d6_project_candidates(
+        ctx.source.as_deref(),
+        Some(ctx.git_dir.as_path()),
+        ctx.root.as_deref(),
+    );
+    let d6_project_refs = load_d6_project_refs(store, &candidates)?;
+    let d6_mode = is_d6_mode_for_task(ctx, d6_project_refs.is_some());
+
+    let (base_sha, base_snapshot) = match &d6_project_refs {
+        Some((project, rows)) if d6_mode || !ctx.has_local_git => {
+            match resolve_main_from_d6_ledger(store, project, rows) {
+                Ok((oid, digest)) => (oid, Some(digest)),
+                Err(_) if ctx.has_local_git => (resolve_main_sha(&ctx.git_dir)?, None),
+                Err(err) => return Err(err),
+            }
+        }
+        Some((project, rows)) => {
+            if let Ok(oid) = resolve_main_sha(&ctx.git_dir) {
+                (oid, None)
+            } else {
+                let (oid, digest) = resolve_main_from_d6_ledger(store, project, rows)?;
+                (oid, Some(digest))
+            }
+        }
+        None => {
+            if !ctx.has_local_git {
+                return Err(format!(
+                    "no D6 ledger refs or local repository found for task #{}",
+                    ctx.task_id
+                ));
+            }
+            (resolve_main_sha(&ctx.git_dir)?, None)
+        }
+    };
+
+    let (resolved_ref, head_sha, head_snapshot) = match &d6_project_refs {
+        Some((_, rows)) if d6_mode || !ctx.has_local_git => {
+            if let Some((r, oid, digest)) =
+                resolve_preserved_ref_from_d6_ledger(store, rows, ctx.task_id, &ctx.agent_id)?
+            {
+                (r, oid, Some(digest))
+            } else if ctx.has_local_git {
+                let (r, oid) = resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id)?;
+                (r, oid, None)
+            } else {
+                let checked = candidate_task_refs(ctx.task_id, &ctx.agent_id).join(", ");
+                return Err(format!(
+                    "no preserved commits found in D6 ledger for task #{} (checked: {checked})",
+                    ctx.task_id
+                ));
+            }
+        }
+        Some((_, rows)) => {
+            if let Ok((r, oid)) = resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id) {
+                (r, oid, None)
+            } else if let Some((r, oid, digest)) =
+                resolve_preserved_ref_from_d6_ledger(store, rows, ctx.task_id, &ctx.agent_id)?
+            {
+                (r, oid, Some(digest))
+            } else {
+                let (r, oid) = resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id)?;
+                (r, oid, None)
+            }
+        }
+        None => {
+            let (r, oid) = resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id)?;
+            (r, oid, None)
+        }
+    };
+
+    Ok(ResolvedTaskRefs {
+        base_sha,
+        resolved_ref,
+        head_sha,
+        d6_mode,
+        base_snapshot,
+        head_snapshot,
+    })
+}
+
+fn resolve_d6_cas_dir(
+    ctx: &TaskRepoContext,
+    cas_dir_override: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(dir) = cas_dir_override {
+        return Ok(dir.to_path_buf());
+    }
+    let cfg = crate::config::D6RuntimeConfig::from_env()?;
+    if let Some(root) = ctx.root.as_deref() {
+        return Ok(cfg.effective_cas_dir(root, spawn_host::WorkspaceBackend::D6));
+    }
+    cfg.cas_dir.ok_or_else(|| {
+        format!(
+            "cannot export D6 commits for task #{}: pass --root <dir> or set SPAWN_WORKSPACE_ROOT / SPAWN_D6_CAS_DIR",
+            ctx.task_id
+        )
+    })
+}
+
+fn materialize_review_repo(
+    store: &std::sync::Arc<spawn_postgres::PostgresStore>,
+    ctx: &TaskRepoContext,
+    resolved: &ResolvedTaskRefs,
+    cas_dir_override: Option<&std::path::Path>,
+) -> Result<(Option<TempDirGuard>, std::path::PathBuf), String> {
+    let local_has_both = ctx.has_local_git
+        && rev_parse_commit(&ctx.git_dir, &resolved.base_sha)?
+            .as_deref()
+            .is_some_and(|oid| oid == resolved.base_sha)
+        && rev_parse_commit(&ctx.git_dir, &resolved.head_sha)?
+            .as_deref()
+            .is_some_and(|oid| oid == resolved.head_sha);
+    if local_has_both {
+        return Ok((None, ctx.git_dir.clone()));
+    }
+
+    let base_snap = match resolved.base_snapshot.clone() {
+        Some(digest) => Some(digest),
+        None => lookup_snapshot_digest_by_oid(store, &resolved.base_sha)?,
+    }
+    .ok_or_else(|| {
+        format!(
+            "D6 base commit {} for task #{} has no snapshot record for border export",
+            resolved.base_sha, ctx.task_id
+        )
+    })?;
+    let head_snap = match resolved.head_snapshot.clone() {
+        Some(digest) => Some(digest),
+        None => lookup_snapshot_digest_by_oid(store, &resolved.head_sha)?,
+    }
+    .ok_or_else(|| {
+        format!(
+            "D6 task commit {} for task #{} has no snapshot record for border export",
+            resolved.head_sha, ctx.task_id
+        )
+    })?;
+
+    let cas_dir = resolve_d6_cas_dir(ctx, cas_dir_override)?;
+    if !cas_dir.is_dir() || !cas_dir.join(spawn_cas::CAS_MARKER).is_file() {
+        return Err(format!(
+            "D6 CAS store missing or uninitialized at {} while materializing task #{}",
+            cas_dir.display(),
+            ctx.task_id
+        ));
+    }
+    let cas = spawn_host::CasMerkleStore::open(&cas_dir)
+        .map_err(|error| format!("open D6 CAS store at {}: {error}", cas_dir.display()))?;
+    let ledger = crate::sources::PostgresRefLedger::new(std::sync::Arc::clone(store));
+    let guard = TempDirGuard::create("spawn-task-d6")?;
+    let bare_dir = guard.path.join("repo.git");
+    let mut targets = vec![spawn_host::BorderRefTarget {
+        git_ref: "refs/heads/main".to_string(),
+        snapshot: base_snap,
+    }];
+    if resolved.resolved_ref != "refs/heads/main" {
+        targets.push(spawn_host::BorderRefTarget {
+            git_ref: resolved.resolved_ref.clone(),
+            snapshot: head_snap,
+        });
+    }
+    spawn_host::GitBorderAdapter::new()
+        .export_refs(&cas, Some(&ledger), &bare_dir, &targets)
+        .map_err(|error| {
+            format!(
+                "export D6 commits for task #{} via Git border adapter: {error}",
+                ctx.task_id
+            )
+        })?;
+    Ok((Some(guard), bare_dir))
 }
 
 fn rev_parse_commit(git_dir: &std::path::Path, rev: &str) -> Result<Option<String>, String> {
@@ -2884,23 +3269,29 @@ fn format_task_commits_table(
 
 fn task_commits_cmd(rest: &[String]) -> Result<i32, String> {
     let args = parse_task_commits_args(rest)?;
-    let store = open_store()?;
+    let store = std::sync::Arc::new(open_store()?);
     let ctx = load_task_repo(&store, args.task_id, args.root.as_deref())?;
-    let base_sha = resolve_main_sha(&ctx.git_dir)?;
-    let (resolved_ref, head_sha) = resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id)?;
-    let commits = list_commits_ahead(&ctx.git_dir, &base_sha, &head_sha)?;
+    let resolved = resolve_task_refs(&store, &ctx)?;
+    let (_guard, review_dir) = materialize_review_repo(&store, &ctx, &resolved, None)?;
+    let commits = list_commits_ahead(&review_dir, &resolved.base_sha, &resolved.head_sha)?;
     if args.json {
         print(&commits_json_payload(
             &ctx,
-            &resolved_ref,
-            &base_sha,
-            &head_sha,
+            &resolved.resolved_ref,
+            &resolved.base_sha,
+            &resolved.head_sha,
             &commits,
         ));
     } else {
         print!(
             "{}",
-            format_task_commits_table(ctx.task_id, &resolved_ref, &base_sha, &head_sha, &commits)
+            format_task_commits_table(
+                ctx.task_id,
+                &resolved.resolved_ref,
+                &resolved.base_sha,
+                &resolved.head_sha,
+                &commits,
+            )
         );
     }
     Ok(0)
@@ -2908,19 +3299,18 @@ fn task_commits_cmd(rest: &[String]) -> Result<i32, String> {
 
 fn task_diff_cmd(rest: &[String]) -> Result<i32, String> {
     let args = parse_task_diff_args(rest)?;
-    let store = open_store()?;
+    let store = std::sync::Arc::new(open_store()?);
     let ctx = load_task_repo(&store, args.task_id, args.root.as_deref())?;
-    let base_sha = resolve_main_sha(&ctx.git_dir)?;
-    let (_resolved_ref, head_sha) =
-        resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id)?;
-    let range = format!("{base_sha}...{head_sha}");
+    let resolved = resolve_task_refs(&store, &ctx)?;
+    let (_guard, review_dir) = materialize_review_repo(&store, &ctx, &resolved, None)?;
+    let range = format!("{}...{}", resolved.base_sha, resolved.head_sha);
     let mut git_args = vec!["diff", "--no-ext-diff"];
     if args.stat {
         git_args.push("--stat");
     }
     git_args.push(&range);
     git_args.push("--");
-    let diff = run_git_raw(&ctx.git_dir, &git_args, "diff")?;
+    let diff = run_git_raw(&review_dir, &git_args, "diff")?;
     print!("{diff}");
     Ok(0)
 }
@@ -3171,10 +3561,18 @@ fn task_land_payload(
     })
 }
 
-fn task_land_cmd(rest: &[String]) -> Result<i32, String> {
-    let args = parse_task_land_args(rest)?;
-    let store = open_store()?;
-    let ctx = load_task_repo(&store, args.task_id, args.root.as_deref())?;
+fn d6_land_refusal(task_id: i64, mission_id: i64) -> String {
+    format!(
+        "cannot land task #{task_id}: mission #{mission_id} uses D6 storage (read-only Git border / CAS+PG ledger); use `spawn ship` (lands `main` via `spawn_ref_land_main`) instead of `spawn task land`, or pass --dry-run to preview"
+    )
+}
+
+fn execute_task_land(
+    store: &std::sync::Arc<spawn_postgres::PostgresStore>,
+    args: &TaskLandArgs,
+    cas_dir_override: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let ctx = load_task_repo(store, args.task_id, args.root.as_deref())?;
     if !ctx.landable || !ctx.is_bare {
         return Err(format!(
             "cannot land task #{}: mission repository {} must be a local bare repository",
@@ -3182,9 +3580,22 @@ fn task_land_cmd(rest: &[String]) -> Result<i32, String> {
             ctx.git_dir.display()
         ));
     }
-    let base_sha = resolve_main_sha(&ctx.git_dir)?;
-    let (resolved_ref, head_sha) = resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id)?;
-    if head_sha == base_sha || is_ancestor(&ctx.git_dir, &head_sha, &base_sha)? {
+    if !args.dry_run && is_d6_mode_for_task(&ctx, false) {
+        return Err(d6_land_refusal(ctx.task_id, ctx.mission_id));
+    }
+    let resolved = resolve_task_refs(store, &ctx)?;
+    if !args.dry_run
+        && (resolved.d6_mode
+            || resolved.base_snapshot.is_some()
+            || resolved.head_snapshot.is_some())
+    {
+        return Err(d6_land_refusal(ctx.task_id, ctx.mission_id));
+    }
+    let (_guard, review_dir) = materialize_review_repo(store, &ctx, &resolved, cas_dir_override)?;
+    let base_sha = resolved.base_sha;
+    let resolved_ref = resolved.resolved_ref;
+    let head_sha = resolved.head_sha;
+    if head_sha == base_sha || is_ancestor(&review_dir, &head_sha, &base_sha)? {
         return Err(format!(
             "nothing to land for task #{}: {} ({}) is already in refs/heads/main ({})",
             ctx.task_id,
@@ -3193,11 +3604,11 @@ fn task_land_cmd(rest: &[String]) -> Result<i32, String> {
             short_sha_prefix(&base_sha)
         ));
     }
-    let commits = list_commits_ahead(&ctx.git_dir, &base_sha, &head_sha)?;
+    let commits = list_commits_ahead(&review_dir, &base_sha, &head_sha)?;
 
     let new_main_sha: Option<String> = match args.mode {
         LandMode::FfOnly => {
-            if !is_ancestor(&ctx.git_dir, &base_sha, &head_sha)? {
+            if !is_ancestor(&review_dir, &base_sha, &head_sha)? {
                 return Err(format!(
                     "cannot fast-forward refs/heads/main ({}) to {} ({}): branch has diverged; use --squash",
                     short_sha_prefix(&base_sha),
@@ -3205,18 +3616,20 @@ fn task_land_cmd(rest: &[String]) -> Result<i32, String> {
                     short_sha_prefix(&head_sha)
                 ));
             }
-            if !args.dry_run {
+            if args.dry_run {
+                Some(head_sha.clone())
+            } else {
                 run_git_raw(
                     &ctx.git_dir,
                     &["update-ref", "refs/heads/main", &head_sha, &base_sha],
                     "update-ref refs/heads/main",
                 )?;
+                Some(head_sha.clone())
             }
-            Some(head_sha.clone())
         }
         LandMode::Squash => {
-            let (_guard, work, tree_oid) =
-                prepare_squash_worktree(&ctx.git_dir, &base_sha, &head_sha, ctx.task_id)?;
+            let (_squash_guard, work, tree_oid) =
+                prepare_squash_worktree(&review_dir, &base_sha, &head_sha, ctx.task_id)?;
             if args.dry_run {
                 None
             } else {
@@ -3234,7 +3647,7 @@ fn task_land_cmd(rest: &[String]) -> Result<i32, String> {
             &base_sha,
             &head_sha,
             new_main_sha.as_deref(),
-            &args,
+            args,
             &commits,
         ));
     } else if args.dry_run {
@@ -3253,6 +3666,13 @@ fn task_land_cmd(rest: &[String]) -> Result<i32, String> {
             args.mode.as_str()
         );
     }
+    Ok(())
+}
+
+fn task_land_cmd(rest: &[String]) -> Result<i32, String> {
+    let args = parse_task_land_args(rest)?;
+    let store = std::sync::Arc::new(open_store()?);
+    execute_task_land(&store, &args, None)?;
     Ok(0)
 }
 
@@ -5358,5 +5778,226 @@ mod database_tests {
         let missing =
             super::resolve_preserved_ref(&bare, 99, "agent_none").expect_err("missing ref");
         assert!(missing.contains("refs/spawn/tasks/99/head"), "{missing}");
+    }
+
+    #[test]
+    fn missions_rs_has_zero_spawn_host_git_references() {
+        let src = include_str!("missions.rs");
+        let forbidden = format!("spawn_host{}git", "::");
+        assert!(
+            !src.contains(&forbidden),
+            "missions.rs must not reference {forbidden}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn d6_task_commits_diff_and_land_dry_run_and_refusal_work_against_pg_and_cas() {
+        use spawn_cas::{Tree, TreeEntry, TreeEntryKind};
+        use spawn_host::{CasMerkleStore, D6RefKind, PublishRequest, format_commit_body};
+
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("missions_d6_review");
+        let store = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+                .expect("isolated test schema"),
+        );
+
+        let guard = super::TempDirGuard::create("missions-d6-review").expect("temp dir");
+        let root = guard.path.join("ws-root");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join(".spawn-backend"), "d6\n").expect("write backend marker");
+
+        // Intentional non-existent source repo path on disk (pure D6 mode).
+        let project_repo = guard.path.join("pure-d6-source.git");
+        let project = project_repo.to_string_lossy().into_owned();
+        let cas_dir = root.join(".cas");
+        let cas = CasMerkleStore::open(&cas_dir).expect("open cas");
+        let ledger = crate::sources::PostgresRefLedger::new(std::sync::Arc::clone(&store));
+
+        let (b1, b1_len) = cas.put_bytes_blob(b"base line\n").expect("put base blob");
+        let base_tree = cas
+            .put_tree_cached(
+                &Tree::from_entries(vec![TreeEntry {
+                    kind: TreeEntryKind::File,
+                    name: b"hello.txt".to_vec(),
+                    id: b1.as_bytes(),
+                    size: b1_len,
+                }])
+                .expect("base tree"),
+            )
+            .expect("store base tree");
+        let base_body = format_commit_body(
+            "Spawn Test <test@spawn.local> 1700000000 +0000",
+            "Spawn Test <test@spawn.local> 1700000000 +0000",
+            "initial base commit\n",
+        );
+        let base_pub = cas
+            .publish_snapshot(
+                &ledger,
+                &PublishRequest {
+                    project: &project,
+                    ref_name: "main",
+                    kind: D6RefKind::Main,
+                    expected_ref: None,
+                    tree: &base_tree,
+                    parents: &[],
+                    commit_body: &base_body,
+                    created_at_ms: 1_700_000_000_000,
+                    reason: "bootstrap main",
+                    landing_task_id: None,
+                },
+            )
+            .expect("publish main");
+
+        let mission_id = store
+            .mission_add(
+                "D6 task inspection mission",
+                &serde_json::json!([project]),
+                "human",
+            )
+            .expect("mission add");
+        let task_id = store
+            .task_assign(
+                mission_id,
+                "ephemeral",
+                "agent_d6",
+                "d6 change brief",
+                "default",
+            )
+            .expect("task assign");
+
+        let (b2, b2_len) = cas
+            .put_bytes_blob(b"updated line\nsecond line\n")
+            .expect("put task blob");
+        let task_tree = cas
+            .put_tree_cached(
+                &Tree::from_entries(vec![TreeEntry {
+                    kind: TreeEntryKind::File,
+                    name: b"hello.txt".to_vec(),
+                    id: b2.as_bytes(),
+                    size: b2_len,
+                }])
+                .expect("task tree"),
+            )
+            .expect("store task tree");
+        let task_body = format_commit_body(
+            "Agent D6 <d6@spawn.local> 1700000100 +0000",
+            "Agent D6 <d6@spawn.local> 1700000100 +0000",
+            "implement d6 change\n",
+        );
+        let task_ref = spawn_host::workspace_rules::task_head_ref(task_id, "head");
+        let task_pub = cas
+            .publish_snapshot(
+                &ledger,
+                &PublishRequest {
+                    project: &project,
+                    ref_name: &task_ref,
+                    kind: D6RefKind::Branch,
+                    expected_ref: None,
+                    tree: &task_tree,
+                    parents: std::slice::from_ref(&base_pub.snapshot),
+                    commit_body: &task_body,
+                    created_at_ms: 1_700_000_100_000,
+                    reason: "preserve task head",
+                    landing_task_id: None,
+                },
+            )
+            .expect("publish task head");
+
+        let root_str = root.to_string_lossy().into_owned();
+        let ctx = super::load_task_repo(&store, task_id, Some(&root_str)).expect("load d6 ctx");
+        assert!(!ctx.has_local_git);
+        assert!(ctx.landable);
+
+        let resolved = super::resolve_task_refs(&store, &ctx).expect("resolve d6 refs");
+        assert!(resolved.d6_mode);
+        assert_eq!(resolved.resolved_ref, task_ref);
+        assert_eq!(resolved.base_sha, base_pub.git_oid.to_hex());
+        assert_eq!(resolved.head_sha, task_pub.git_oid.to_hex());
+
+        let (_review_guard, review_dir) =
+            super::materialize_review_repo(&store, &ctx, &resolved, Some(&cas_dir))
+                .expect("materialize d6 review repo");
+        let commits =
+            super::list_commits_ahead(&review_dir, &resolved.base_sha, &resolved.head_sha)
+                .expect("list d6 commits ahead");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].sha, task_pub.git_oid.to_hex());
+        assert_eq!(commits[0].subject, "implement d6 change");
+
+        let range = format!("{}...{}", resolved.base_sha, resolved.head_sha);
+        let diff = super::run_git_raw(
+            &review_dir,
+            &["diff", "--no-ext-diff", &range, "--"],
+            "diff",
+        )
+        .expect("d6 diff");
+        assert!(diff.contains("+updated line"), "{diff}");
+
+        // `--dry-run` works cleanly for both --ff-only and --squash in D6 mode.
+        super::execute_task_land(
+            &store,
+            &super::TaskLandArgs {
+                task_id,
+                mode: super::LandMode::FfOnly,
+                dry_run: true,
+                json: false,
+                root: Some(root_str.clone()),
+            },
+            Some(&cas_dir),
+        )
+        .expect("d6 ff-only dry-run");
+        super::execute_task_land(
+            &store,
+            &super::TaskLandArgs {
+                task_id,
+                mode: super::LandMode::Squash,
+                dry_run: true,
+                json: false,
+                root: Some(root_str.clone()),
+            },
+            Some(&cas_dir),
+        )
+        .expect("d6 squash dry-run");
+
+        // Live `task land` (non-dry-run) fails closed without mutating main.
+        for mode in [super::LandMode::FfOnly, super::LandMode::Squash] {
+            let err = super::execute_task_land(
+                &store,
+                &super::TaskLandArgs {
+                    task_id,
+                    mode,
+                    dry_run: false,
+                    json: false,
+                    root: Some(root_str.clone()),
+                },
+                Some(&cas_dir),
+            )
+            .expect_err("live d6 task land must fail closed");
+            assert!(err.contains("spawn ship"), "{err}");
+            assert!(err.contains("spawn_ref_land_main"), "{err}");
+        }
+        let main_after = store
+            .list_refs(Some(&project))
+            .expect("list refs")
+            .into_iter()
+            .find(|r| matches!(r.kind, spawn_postgres::RefKind::Main))
+            .expect("main remains");
+        assert_eq!(main_after.snapshot, base_pub.snapshot.to_string());
+
+        // Missing CAS store fails closed and never creates `.spawn-cas`.
+        let missing_cas = guard.path.join("missing-cas");
+        let missing_err =
+            super::materialize_review_repo(&store, &ctx, &resolved, Some(&missing_cas))
+                .err()
+                .expect("missing cas fails closed");
+        assert!(
+            missing_err.contains("D6 CAS store missing"),
+            "{missing_err}"
+        );
+        assert!(!missing_cas.join(spawn_cas::CAS_MARKER).exists());
     }
 }
