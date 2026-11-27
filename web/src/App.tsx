@@ -18,6 +18,7 @@ import { GradingView } from "./components/grading/GradingView";
 import { MissionsView } from "./components/missions/MissionsView";
 import { RsiView } from "./components/rsi/RsiView";
 import { ScorecardView } from "./components/scorecard/ScorecardView";
+import { StorageTreeView } from "./components/storage/StorageTreeView";
 import { Button, Drawer, LiveStatus, PageHeader } from "./components/ui";
 import type { Fleet } from "./fleet";
 import { fetchFleet } from "./fleet";
@@ -42,6 +43,7 @@ export type View =
   | "alerts"
   | "scorecard"
   | "cost"
+  | "storage"
   | "show"
   | "sessions";
 
@@ -62,6 +64,7 @@ function routeFromHash(): Route {
   if (hash.startsWith("#/alerts")) return { view: "alerts", agent: null };
   if (hash.startsWith("#/scorecard")) return { view: "scorecard", agent: null };
   if (hash.startsWith("#/cost")) return { view: "cost", agent: null };
+  if (hash.startsWith("#/storage")) return { view: "storage", agent: null };
   if (hash.startsWith("#/show")) return { view: "show", agent: null };
   const match = /^#\/fleet\/(.+)$/.exec(hash);
   let agent: string | null = null;
@@ -88,6 +91,7 @@ function hashFor(route: Route): string {
   if (route.view === "alerts") return "#/alerts";
   if (route.view === "scorecard") return "#/scorecard";
   if (route.view === "cost") return "#/cost";
+  if (route.view === "storage") return "#/storage";
   // The Show view keeps its options (`?present`, `?replay`) in its hash.
   if (route.view === "show") {
     return window.location.hash.startsWith("#/show") ? window.location.hash : "#/show";
@@ -277,6 +281,7 @@ export default function App() {
         onShowAlerts={() => setView("alerts")}
         onShowScorecard={() => setView("scorecard")}
         onShowCost={() => setView("cost")}
+        onShowStorage={() => setView("storage")}
         onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
       />
@@ -299,6 +304,7 @@ export default function App() {
         openAlerts={openAlerts}
         onShowScorecard={() => setView("scorecard")}
         onShowCost={() => setView("cost")}
+        onShowStorage={() => setView("storage")}
         onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
         onSelect={(id) => {
@@ -347,6 +353,8 @@ export default function App() {
         <ScorecardView missions={missions.data} health={fleetPoll.data?.health ?? null} />
       ) : view === "cost" ? (
         <CostView />
+      ) : view === "storage" ? (
+        <StorageTreeView />
       ) : view === "show" ? (
         <Suspense fallback={<div className="flex-1 bg-page-canvas" />}>
           <ShowView fleet={fleet} present={false} />

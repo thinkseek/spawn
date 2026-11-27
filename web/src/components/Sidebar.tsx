@@ -1,4 +1,4 @@
-import { Activity, BellRing, Boxes, CircleDollarSign, FolderSearch, Gauge, House, Layers, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
+import { Activity, BellRing, Boxes, CircleDollarSign, FolderSearch, Gauge, GitBranch, House, Layers, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
@@ -48,6 +48,7 @@ interface SidebarProps {
   onShowAlerts: () => void;
   onShowScorecard: () => void;
   onShowCost: () => void;
+  onShowStorage: () => void;
   onShowShow: () => void;
   onShowSessions: () => void;
   onSelect: (sessionId: string) => void;
@@ -85,6 +86,7 @@ export function Sidebar({
   onShowAlerts,
   onShowScorecard,
   onShowCost,
+  onShowStorage,
   onShowShow,
   onSelect,
 }: SidebarProps) {
@@ -191,6 +193,12 @@ export function Sidebar({
           onClick={onShowCost}
           icon={<CircleDollarSign size={15} />}
           label="Cost"
+        />
+        <NavItem
+          active={view === "storage"}
+          onClick={onShowStorage}
+          icon={<GitBranch size={15} />}
+          label="Storage tree"
         />
         <NavItem
           active={view === "show"}
@@ -572,6 +580,7 @@ export function MobileNav({
   onShowAlerts,
   onShowScorecard,
   onShowCost,
+  onShowStorage,
   onShowShow,
   onShowSessions,
 }: Pick<
@@ -588,6 +597,7 @@ export function MobileNav({
   | "onShowAlerts"
   | "onShowScorecard"
   | "onShowCost"
+  | "onShowStorage"
   | "onShowShow"
   | "onShowSessions"
 >) {
@@ -606,6 +616,7 @@ export function MobileNav({
             ["alerts", "Alerts", <BellRing key="b" size={13} />, onShowAlerts],
             ["scorecard", "Score", <Gauge key="g" size={13} />, onShowScorecard],
             ["cost", "Cost", <CircleDollarSign key="c" size={13} />, onShowCost],
+            ["storage", "Storage", <GitBranch key="st" size={13} />, onShowStorage],
             ["show", "Show", <Waypoints key="w" size={13} />, onShowShow],
             ["sessions", "Sessions", <Rows3 key="s" size={13} />, onShowSessions],
           ] as const
