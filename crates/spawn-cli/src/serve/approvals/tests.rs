@@ -5,8 +5,8 @@
 //! them.
 
 use super::{
-    ATTENTION_NEEDS_HUMAN, Asked, Choice, Pane, Prompt, Send, action_of, detect, excerpt, fnv1a,
-    items, what_to_send,
+    ATTENTION_NEEDS_HUMAN, Act, ActRequest, Answer, Choice, ChoiceAction, KeysAct, Pane, Prompt,
+    Send, action_of, detect, excerpt, fnv1a, items, what_to_send,
 };
 use serde_json::{Value, json};
 use spawn_core::command::NamedKey;
@@ -43,7 +43,7 @@ const OPENCODE: &str = "\
   Allow once   Allow always   Reject
 ";
 
-fn keys(prompt: &Prompt, action: &str) -> Vec<NamedKey> {
+fn keys(prompt: &Prompt, action: ChoiceAction) -> Vec<NamedKey> {
     prompt
         .choices
         .iter()
@@ -63,9 +63,9 @@ fn claude_codes_numbered_permission_dialog_is_three_digit_answers() {
         .map(|choice| choice.id.as_str())
         .collect();
     assert_eq!(ids, ["choice1", "choice2", "choice3"]);
-    assert_eq!(keys(&prompt, "allow"), [NamedKey::Digit1]);
-    assert_eq!(keys(&prompt, "allow_always"), [NamedKey::Digit2]);
-    assert_eq!(keys(&prompt, "deny"), [NamedKey::Digit3]);
+    assert_eq!(keys(&prompt, ChoiceAction::Allow), [NamedKey::Digit1]);
+    assert_eq!(keys(&prompt, ChoiceAction::AllowAlways), [NamedKey::Digit2]);
+    assert_eq!(keys(&prompt, ChoiceAction::Deny), [NamedKey::Digit3]);
     let danger: Vec<bool> = prompt.choices.iter().map(|choice| choice.danger).collect();
     assert_eq!(danger, [false, true, false], "always is the risky one");
 }
@@ -75,21 +75,21 @@ fn codex_clis_selection_is_numbered_before_its_enter_hint() {
     let prompt = detect(CODEX).expect("a prompt");
     assert_eq!(prompt.kind, "permission");
     assert_eq!(prompt.summary.as_deref(), Some("Allow command?"));
-    assert_eq!(keys(&prompt, "allow"), [NamedKey::Digit1]);
-    assert_eq!(keys(&prompt, "allow_always"), [NamedKey::Digit2]);
-    assert_eq!(keys(&prompt, "deny"), [NamedKey::Digit3]);
+    assert_eq!(keys(&prompt, ChoiceAction::Allow), [NamedKey::Digit1]);
+    assert_eq!(keys(&prompt, ChoiceAction::AllowAlways), [NamedKey::Digit2]);
+    assert_eq!(keys(&prompt, ChoiceAction::Deny), [NamedKey::Digit3]);
 }
 
 #[test]
 fn opencodes_buttons_are_enter_right_enter_and_escape() {
     let prompt = detect(OPENCODE).expect("a prompt");
     assert_eq!(prompt.kind, "permission");
-    assert_eq!(keys(&prompt, "allow"), [NamedKey::Enter]);
+    assert_eq!(keys(&prompt, ChoiceAction::Allow), [NamedKey::Enter]);
     assert_eq!(
-        keys(&prompt, "allow_always"),
+        keys(&prompt, ChoiceAction::AllowAlways),
         [NamedKey::Right, NamedKey::Enter]
     );
-    assert_eq!(keys(&prompt, "deny"), [NamedKey::Escape]);
+    assert_eq!(keys(&prompt, ChoiceAction::Deny), [NamedKey::Escape]);
     assert_eq!(prompt.choices[2].label, "Reject");
 }
 
@@ -98,16 +98,22 @@ fn a_yes_no_question_and_a_confirm_are_found_at_the_bottom_only() {
     let shell = "Removing 3 files.\nContinue? [y/N] ";
     let prompt = detect(shell).expect("a yes/no");
     assert_eq!(prompt.kind, "yes_no");
-    assert_eq!(keys(&prompt, "allow"), [NamedKey::Y, NamedKey::Enter]);
-    assert_eq!(keys(&prompt, "deny"), [NamedKey::N, NamedKey::Enter]);
+    assert_eq!(
+        keys(&prompt, ChoiceAction::Allow),
+        [NamedKey::Y, NamedKey::Enter]
+    );
+    assert_eq!(
+        keys(&prompt, ChoiceAction::Deny),
+        [NamedKey::N, NamedKey::Enter]
+    );
     for mark in ["(y/n)", "[Y/n]", "(yes/no)", "( y / N )"] {
         assert!(detect(&format!("Go on? {mark}")).is_some(), "{mark}");
     }
     let confirm = "Select a model\n  Sonnet\n  Opus\nEnter to confirm · Esc to cancel";
     let prompt = detect(confirm).expect("a confirm");
     assert_eq!(prompt.kind, "confirm");
-    assert_eq!(keys(&prompt, "allow"), [NamedKey::Enter]);
-    assert_eq!(keys(&prompt, "deny"), [NamedKey::Escape]);
+    assert_eq!(keys(&prompt, ChoiceAction::Allow), [NamedKey::Enter]);
+    assert_eq!(keys(&prompt, ChoiceAction::Deny), [NamedKey::Escape]);
     // A question answered long ago, scrolled up past the tail's bottom, is none.
     let old = format!("Continue? [y/N] y\n{}", "working...\n".repeat(10));
     assert_eq!(detect(&old), None);
@@ -164,28 +170,45 @@ fn a_prose_list_on_an_idle_pane_is_no_permission_prompt() {
 /// Review L6: an answer's action is read by whole words, never a prefix.
 #[test]
 fn an_answers_action_is_read_by_whole_words() {
-    for (label, action) in [
-        ("Node 18", "keys"),
-        ("Normal mode", "keys"),
-        ("Okta login", "keys"),
-        ("Runtime only", "keys"),
-        ("Continue without saving", "keys"),
-        ("Nothing", "keys"),
-        ("Yesterday's build", "keys"),
-        ("Yes", "allow"),
-        ("Yes, proceed", "allow"),
-        ("OK", "allow"),
-        ("Allow once", "allow"),
-        ("No", "deny"),
-        ("No, and tell Claude what to do differently", "deny"),
-        ("Deny", "deny"),
-        ("Cancel", "deny"),
-        ("Yes, and don't ask again for this command", "allow_always"),
-        ("Yes, always allow", "allow_always"),
-        ("Allow all edits during this session", "allow_always"),
-        ("Hallways", "keys"),
+    for (label, action, wire) in [
+        ("Node 18", ChoiceAction::Keys, "keys"),
+        ("Normal mode", ChoiceAction::Keys, "keys"),
+        ("Okta login", ChoiceAction::Keys, "keys"),
+        ("Runtime only", ChoiceAction::Keys, "keys"),
+        ("Continue without saving", ChoiceAction::Keys, "keys"),
+        ("Nothing", ChoiceAction::Keys, "keys"),
+        ("Yesterday's build", ChoiceAction::Keys, "keys"),
+        ("Yes", ChoiceAction::Allow, "allow"),
+        ("Yes, proceed", ChoiceAction::Allow, "allow"),
+        ("OK", ChoiceAction::Allow, "allow"),
+        ("Allow once", ChoiceAction::Allow, "allow"),
+        ("No", ChoiceAction::Deny, "deny"),
+        (
+            "No, and tell Claude what to do differently",
+            ChoiceAction::Deny,
+            "deny",
+        ),
+        ("Deny", ChoiceAction::Deny, "deny"),
+        ("Cancel", ChoiceAction::Deny, "deny"),
+        (
+            "Yes, and don't ask again for this command",
+            ChoiceAction::AllowAlways,
+            "allow_always",
+        ),
+        (
+            "Yes, always allow",
+            ChoiceAction::AllowAlways,
+            "allow_always",
+        ),
+        (
+            "Allow all edits during this session",
+            ChoiceAction::AllowAlways,
+            "allow_always",
+        ),
+        ("Hallways", ChoiceAction::Keys, "keys"),
     ] {
         assert_eq!(action_of(label), action, "{label:?}");
+        assert_eq!(action_of(label).as_str(), wire, "{label:?}");
     }
 }
 
@@ -331,32 +354,23 @@ fn shown(prompt: Option<Prompt>) -> impl Fn(&SessionId) -> Result<Option<Prompt>
     move |_| Ok(prompt.clone())
 }
 
-fn ask(
-    action: &str,
-    approval_id: Option<&str>,
-    keys: Option<Vec<&str>>,
-    text: Option<&str>,
-) -> Asked {
-    Asked {
-        action: action.to_string(),
-        approval_id: approval_id.map(str::to_string),
-        choice_id: None,
-        keys: keys.map(|keys| keys.into_iter().map(str::to_string).collect()),
-        text: text.map(str::to_string),
+fn answer_id(approval_id: &str, choice_id: Option<&str>) -> Answer {
+    Answer {
+        approval_id: approval_id.to_string(),
+        choice_id: choice_id.map(str::to_string),
     }
 }
 
-/// [`ask`] naming the option the button stood for (`choice_id`).
-fn ask_choice(
-    action: &str,
-    approval_id: Option<&str>,
+fn keys_for_choice(
+    approval_id: &str,
     choice_id: &str,
-    keys: Option<Vec<&str>>,
-) -> Asked {
-    Asked {
-        choice_id: Some(choice_id.to_string()),
-        ..ask(action, approval_id, keys, None)
-    }
+    expected_keys: Option<Vec<NamedKey>>,
+) -> Act {
+    Act::Keys(KeysAct::ForChoice {
+        approval_id: approval_id.to_string(),
+        choice_id: choice_id.to_string(),
+        expected_keys,
+    })
 }
 
 /// A dialog whose three answers are all "Yes" (all `allow`), drawn as
@@ -382,49 +396,44 @@ const THREE_YES: &str = "\
 fn the_option_clicked_is_pressed_and_a_shared_action_needs_its_choice() {
     let session = SessionId::new("session_worker_a").expect("session");
     let prompt = detect(THREE_YES).expect("a prompt");
-    let actions: Vec<&str> = prompt.choices.iter().map(|choice| choice.action).collect();
-    assert_eq!(actions, ["allow", "allow", "allow"]);
+    let actions: Vec<ChoiceAction> = prompt.choices.iter().map(|choice| choice.action).collect();
+    assert_eq!(
+        actions,
+        [
+            ChoiceAction::Allow,
+            ChoiceAction::Allow,
+            ChoiceAction::Allow
+        ]
+    );
     let id = prompt.id(session.as_str());
     let now = shown(Some(prompt));
     assert_eq!(
-        what_to_send(
-            ask_choice("allow", Some(&id), "choice3", None),
-            &session,
-            &now
-        ),
+        what_to_send(Act::Allow(answer_id(&id, Some("choice3"))), &session, &now),
         Ok(Send::Keys(vec![NamedKey::Digit3]))
     );
     assert_eq!(
-        what_to_send(
-            ask_choice("allow", Some(&id), "choice2", None),
-            &session,
-            &now
-        ),
+        what_to_send(Act::Allow(answer_id(&id, Some("choice2"))), &session, &now),
         Ok(Send::Keys(vec![NamedKey::Digit2]))
     );
     let ambiguous =
-        what_to_send(ask("allow", Some(&id), None, None), &session, &now).expect_err("ambiguous");
+        what_to_send(Act::Allow(answer_id(&id, None)), &session, &now).expect_err("ambiguous");
     assert_eq!(ambiguous.0, 409, "{ambiguous:?}");
     assert!(ambiguous.1.contains("choice_id"), "{ambiguous:?}");
-    for (asked, why) in [
+    for (act, why) in [
+        (Act::Deny(answer_id(&id, Some("choice3"))), "another action"),
         (
-            ask_choice("deny", Some(&id), "choice3", None),
-            "another action",
-        ),
-        (
-            ask_choice("allow", Some(&id), "choice9", None),
+            Act::Allow(answer_id(&id, Some("choice9"))),
             "no such option",
         ),
     ] {
-        let refused = what_to_send(asked, &session, &now).expect_err(why);
+        let refused = what_to_send(act, &session, &now).expect_err(why);
         assert_eq!(refused.0, 409, "{why}: {refused:?}");
     }
-    // Claude's dialog: each option its own action, named or not.
     let claude = shown(detect(CLAUDE));
     let claude_id = detect(CLAUDE).expect("a prompt").id(session.as_str());
     assert_eq!(
         what_to_send(
-            ask_choice("deny", Some(&claude_id), "choice3", None),
+            Act::Deny(answer_id(&claude_id, Some("choice3"))),
             &session,
             &claude
         ),
@@ -432,7 +441,7 @@ fn the_option_clicked_is_pressed_and_a_shared_action_needs_its_choice() {
     );
     assert_eq!(
         what_to_send(
-            ask_choice("allow", Some(&claude_id), "choice3", None),
+            Act::Allow(answer_id(&claude_id, Some("choice3"))),
             &session,
             &claude
         )
@@ -453,39 +462,49 @@ fn keys_for_an_approval_are_pressed_only_while_it_shows() {
     let now = shown(Some(prompt));
     let stale = shown(detect(CLAUDE));
     let nothing = shown(None);
-    for (asked, pane, why) in [
+    for (act, pane, why) in [
         (
-            ask("keys", Some(&id), Some(vec!["digit3"]), None),
+            Act::Keys(KeysAct::ForApproval {
+                approval_id: id.clone(),
+                keys: vec![NamedKey::Digit3],
+            }),
             &stale,
             "stale approval",
         ),
         (
-            ask_choice("keys", Some(&id), "choice3", None),
+            keys_for_choice(&id, "choice3", None),
             &stale,
             "stale with its choice",
         ),
         (
-            ask("keys", Some(&id), Some(vec!["digit3"]), None),
+            Act::Keys(KeysAct::ForApproval {
+                approval_id: id.clone(),
+                keys: vec![NamedKey::Digit3],
+            }),
             &nothing,
             "no prompt",
         ),
         (
-            ask_choice("keys", Some(&id), "choice7", None),
+            keys_for_choice(&id, "choice7", None),
             &now,
             "no such option",
         ),
         (
-            ask_choice("keys", Some(&id), "choice3", Some(vec!["digit1"])),
+            keys_for_choice(&id, "choice3", Some(vec![NamedKey::Digit1])),
             &now,
             "another option's keys",
         ),
     ] {
-        let refused = what_to_send(asked, &session, pane).expect_err(why);
+        let refused = what_to_send(act, &session, pane).expect_err(why);
         assert_eq!(refused.0, 409, "{why}: {refused:?}");
     }
     assert_eq!(
+        what_to_send(keys_for_choice(&id, "choice3", None), &session, &now),
+        Ok(Send::Keys(vec![NamedKey::Digit3]))
+    );
+    assert_eq!(
         what_to_send(
-            ask_choice("keys", Some(&id), "choice3", None),
+            keys_for_choice(&id, "choice3", Some(vec![NamedKey::Digit3])),
             &session,
             &now
         ),
@@ -493,28 +512,23 @@ fn keys_for_an_approval_are_pressed_only_while_it_shows() {
     );
     assert_eq!(
         what_to_send(
-            ask_choice("keys", Some(&id), "choice3", Some(vec!["digit3"])),
-            &session,
-            &now
-        ),
-        Ok(Send::Keys(vec![NamedKey::Digit3]))
-    );
-    assert_eq!(
-        what_to_send(
-            ask("keys", Some(&id), Some(vec!["enter"]), None),
+            Act::Keys(KeysAct::ForApproval {
+                approval_id: id,
+                keys: vec![NamedKey::Enter],
+            }),
             &session,
             &now
         ),
         Ok(Send::Keys(vec![NamedKey::Enter]))
     );
-    // A choice without its approval is the caller's mistake.
-    let refused = what_to_send(ask_choice("keys", None, "choice3", None), &session, &now)
-        .expect_err("no approval");
+    let refused = ActRequest::parse(br#"{"action":"keys","choice_id":"choice3"}"#)
+        .expect_err("choice without approval");
     assert_eq!(refused.0, 400, "{refused:?}");
-    // Bare keys read no pane: pressed even with nothing showing.
     assert_eq!(
         what_to_send(
-            ask("keys", None, Some(vec!["digit3"]), None),
+            Act::Keys(KeysAct::Bare {
+                keys: vec![NamedKey::Digit3],
+            }),
             &session,
             &nothing
         ),
@@ -527,31 +541,28 @@ fn an_answer_presses_the_keys_of_the_prompt_showing_now() {
     let session = SessionId::new("session_worker_a").expect("session");
     let claude = shown(detect(CLAUDE));
     let id = detect(CLAUDE).expect("a prompt").id(session.as_str());
-    let send = |asked: Asked, prompt: &dyn Fn(&SessionId) -> Result<Option<Prompt>, String>| {
-        what_to_send(asked, &session, prompt)
+    let send = |act: Act, prompt: &dyn Fn(&SessionId) -> Result<Option<Prompt>, String>| {
+        what_to_send(act, &session, prompt)
     };
     assert_eq!(
-        send(ask("allow", Some(&id), None, None), &claude),
+        send(Act::Allow(answer_id(&id, None)), &claude),
         Ok(Send::Keys(vec![NamedKey::Digit1]))
     );
     assert_eq!(
-        send(ask("allow_always", Some(&id), None, None), &claude),
+        send(Act::AllowAlways(answer_id(&id, None)), &claude),
         Ok(Send::Keys(vec![NamedKey::Digit2]))
     );
     assert_eq!(
-        send(ask("deny", Some(&id), None, None), &claude),
+        send(Act::Deny(answer_id(&id, None)), &claude),
         Ok(Send::Keys(vec![NamedKey::Digit3]))
     );
-    // An answer without the approval it answers: 400.
-    let refused = send(ask("allow", None, None, None), &claude).expect_err("no id");
+    let refused = ActRequest::parse(br#"{"action":"allow"}"#).expect_err("no id");
     assert_eq!(refused.0, 400);
     assert!(refused.1.contains("approval_id"), "{refused:?}");
-    // Nothing shows: 409, nothing pressed.
     let nothing = shown(None);
-    let refused = send(ask("allow", Some(&id), None, None), &nothing).expect_err("no prompt");
+    let refused = send(Act::Allow(answer_id(&id, None)), &nothing).expect_err("no prompt");
     assert_eq!(refused.0, 409);
     assert!(refused.1.contains("no approval prompt"), "{refused:?}");
-    // A prompt without that answer: 409 too.
     let only_yes = shown(Some(Prompt {
         kind: "confirm",
         label: "x".to_string(),
@@ -561,7 +572,7 @@ fn an_answer_presses_the_keys_of_the_prompt_showing_now() {
             label: "Confirm".to_string(),
             keys: vec![NamedKey::Enter],
             danger: false,
-            action: "allow",
+            action: ChoiceAction::Allow,
         }],
         cursor: None,
         body: Vec::new(),
@@ -571,50 +582,37 @@ fn an_answer_presses_the_keys_of_the_prompt_showing_now() {
         .expect("shown")
         .id(session.as_str());
     assert_eq!(
-        send(
-            ask("allow_always", Some(&confirm_id), None, None),
-            &only_yes
-        )
-        .expect_err("none")
-        .0,
+        send(Act::AllowAlways(answer_id(&confirm_id, None)), &only_yes)
+            .expect_err("none")
+            .0,
         409
     );
-    // Keys and text need no approval id, and are checked.
     assert_eq!(
-        send(ask("keys", None, Some(vec!["5", "enter"]), None), &nothing),
+        send(
+            Act::Keys(KeysAct::Bare {
+                keys: vec![NamedKey::Digit5, NamedKey::Enter],
+            }),
+            &nothing
+        ),
         Ok(Send::Keys(vec![NamedKey::Digit5, NamedKey::Enter]))
     );
     assert_eq!(
         send(
-            ask("text", None, None, Some("use the main branch")),
+            Act::Text {
+                text: "use the main branch".to_string(),
+            },
             &nothing
         ),
         Ok(Send::Text("use the main branch".to_string()))
     );
-    for (asked, why) in [
-        (ask("keys", None, Some(vec![]), None), "no keys"),
-        (
-            ask("keys", None, Some(vec!["f1"]), None),
-            "a key outside the set",
-        ),
-        (ask("keys", None, Some(vec!["y"; 9]), None), "too many keys"),
-        (
-            ask("keys", None, Some(vec!["y"]), Some("y")),
-            "keys with a text",
-        ),
-        (ask("text", None, None, Some("   ")), "a blank text"),
-        (ask("text", None, None, Some("a\u{1b}[2J")), "an escape"),
-        (
-            ask("text", None, Some(vec!["y"]), Some("y")),
-            "a text with keys",
-        ),
-        (
-            ask("allow", Some(&id), Some(vec!["y"]), None),
-            "an answer with keys",
-        ),
-        (ask("approve", None, None, None), "an unknown action"),
-    ] {
-        let refused = send(asked, &claude).expect_err(why);
+    for (text, why) in [("   ", "a blank text"), ("a\u{1b}[2J", "an escape")] {
+        let refused = send(
+            Act::Text {
+                text: text.to_string(),
+            },
+            &claude,
+        )
+        .expect_err(why);
         assert_eq!(refused.0, 400, "{why}: {refused:?}");
     }
 }
@@ -633,16 +631,19 @@ fn a_stale_click_on_a_replaced_prompt_presses_nothing() {
         )
         .replace("rm commands", "git commands");
     let now = shown(detect(&replaced));
-    for action in ["allow", "allow_always", "deny"] {
-        let refused = what_to_send(ask(action, Some(&shown_then), None, None), &session, &now)
-            .expect_err("stale");
-        assert_eq!(refused.0, 409, "{action}: {refused:?}");
+    for act in [
+        Act::Allow(answer_id(&shown_then, None)),
+        Act::AllowAlways(answer_id(&shown_then, None)),
+        Act::Deny(answer_id(&shown_then, None)),
+    ] {
+        let label = act.action_name();
+        let refused = what_to_send(act, &session, &now).expect_err("stale");
+        assert_eq!(refused.0, 409, "{label}: {refused:?}");
         assert!(refused.1.contains("not approval"), "{refused:?}");
     }
-    // The prompt the page shows now is answered.
     let fresh = detect(&replaced).expect("a prompt").id(session.as_str());
     assert_eq!(
-        what_to_send(ask("allow", Some(&fresh), None, None), &session, &now),
+        what_to_send(Act::Allow(answer_id(&fresh, None)), &session, &now),
         Ok(Send::Keys(vec![NamedKey::Digit1]))
     );
 }
@@ -807,14 +808,14 @@ fn the_same_question_over_another_command_is_another_prompt() {
         let shown_then = then.id(session.as_str());
         assert_ne!(shown_then, later.id(session.as_str()), "{engine}");
         let showing = shown(Some(later));
-        for action in ["allow", "allow_always", "deny"] {
-            let refused = what_to_send(
-                ask(action, Some(&shown_then), None, None),
-                &session,
-                &showing,
-            )
-            .expect_err("stale");
-            assert_eq!(refused.0, 409, "{engine} {action}: {refused:?}");
+        for act in [
+            Act::Allow(answer_id(&shown_then, None)),
+            Act::AllowAlways(answer_id(&shown_then, None)),
+            Act::Deny(answer_id(&shown_then, None)),
+        ] {
+            let label = act.action_name();
+            let refused = what_to_send(act, &session, &showing).expect_err("stale");
+            assert_eq!(refused.0, 409, "{engine} {label}: {refused:?}");
         }
     }
     // The command is in the id; what is above the dialog is not.
@@ -883,7 +884,316 @@ fn a_commands_case_is_part_of_its_prompt() {
     let shown_then = safe.id(session.as_str());
     assert_ne!(shown_then, forced.id(session.as_str()));
     let now = shown(Some(forced));
-    let refused = what_to_send(ask("allow", Some(&shown_then), None, None), &session, &now)
-        .expect_err("stale");
+    let refused =
+        what_to_send(Act::Allow(answer_id(&shown_then, None)), &session, &now).expect_err("stale");
     assert_eq!(refused.0, 409, "{refused:?}");
+}
+
+#[test]
+fn wire_contract_valid_payloads_parse_and_resolve() {
+    let session = SessionId::new("session_worker_a").expect("session");
+    let claude = detect(CLAUDE).expect("a prompt");
+    let id = claude.id(session.as_str());
+    let pane = shown(Some(claude));
+    assert_eq!(
+        ActRequest::parse(br#"{"probe":true}"#),
+        Ok(ActRequest::Probe)
+    );
+    assert_eq!(
+        ActRequest::parse(
+            br#"{"probe":true,"action":null,"approval_id":null,"choice_id":null,"keys":null,"text":null,"key":null}"#
+        ),
+        Ok(ActRequest::Probe)
+    );
+    let cases = [
+        (
+            format!(r#"{{"action":"allow","approval_id":"{id}","key":"k1"}}"#),
+            Some("k1"),
+            "allow",
+            Send::Keys(vec![NamedKey::Digit1]),
+        ),
+        (
+            format!(r#"{{"action":"allow","approval_id":"{id}","choice_id":null,"key":null}}"#),
+            None,
+            "allow",
+            Send::Keys(vec![NamedKey::Digit1]),
+        ),
+        (
+            format!(r#"{{"action":"allow","approval_id":"{id}","choice_id":"choice1"}}"#),
+            None,
+            "allow",
+            Send::Keys(vec![NamedKey::Digit1]),
+        ),
+        (
+            format!(r#"{{"action":"allow_always","approval_id":"{id}","key":"k2"}}"#),
+            Some("k2"),
+            "allow_always",
+            Send::Keys(vec![NamedKey::Digit2]),
+        ),
+        (
+            format!(r#"{{"action":"deny","approval_id":"{id}","key":"k3"}}"#),
+            Some("k3"),
+            "deny",
+            Send::Keys(vec![NamedKey::Digit3]),
+        ),
+        (
+            r#"{"probe":false,"action":"keys","keys":["5","enter"],"key":"k4"}"#.to_string(),
+            Some("k4"),
+            "keys",
+            Send::Keys(vec![NamedKey::Digit5, NamedKey::Enter]),
+        ),
+        (
+            format!(r#"{{"action":"keys","approval_id":"{id}","keys":["enter"],"key":"k5"}}"#),
+            Some("k5"),
+            "keys",
+            Send::Keys(vec![NamedKey::Enter]),
+        ),
+        (
+            format!(r#"{{"action":"keys","approval_id":"{id}","choice_id":"choice3"}}"#),
+            None,
+            "keys",
+            Send::Keys(vec![NamedKey::Digit3]),
+        ),
+        (
+            format!(
+                r#"{{"action":"keys","approval_id":"{id}","choice_id":"choice3","keys":["digit3"]}}"#
+            ),
+            None,
+            "keys",
+            Send::Keys(vec![NamedKey::Digit3]),
+        ),
+        (
+            r#"{"action":"text","text":"use main","key":"k6"}"#.to_string(),
+            Some("k6"),
+            "text",
+            Send::Text("use main".to_string()),
+        ),
+    ];
+    for (raw, expected_key, expected_action, expected_send) in cases {
+        let parsed = ActRequest::parse(raw.as_bytes()).expect(&raw);
+        let ActRequest::Perform { key, act } = parsed else {
+            panic!("expected Perform for {raw}");
+        };
+        assert_eq!(key.as_deref(), expected_key, "{raw}");
+        assert_eq!(act.action_name(), expected_action, "{raw}");
+        assert_eq!(
+            what_to_send(act, &session, &pane),
+            Ok(expected_send),
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn wire_contract_rejects_cross_variant_and_unknown_fields_with_400() {
+    for (raw, why) in [
+        (
+            r#"{"action":"allow","approval_id":"a:1","keys":["y"]}"#,
+            "allow + keys",
+        ),
+        (
+            r#"{"action":"allow","approval_id":"a:1","keys":null}"#,
+            "allow + null keys",
+        ),
+        (
+            r#"{"action":"allow","approval_id":"a:1","text":"hi"}"#,
+            "allow + text",
+        ),
+        (
+            r#"{"action":"allow_always","approval_id":"a:1","keys":["y"]}"#,
+            "allow_always + keys",
+        ),
+        (
+            r#"{"action":"allow_always","approval_id":"a:1","text":"hi"}"#,
+            "allow_always + text",
+        ),
+        (
+            r#"{"action":"deny","approval_id":"a:1","keys":["n"]}"#,
+            "deny + keys",
+        ),
+        (
+            r#"{"action":"deny","approval_id":"a:1","text":"no"}"#,
+            "deny + text",
+        ),
+        (
+            r#"{"action":"keys","keys":["y"],"text":"hi"}"#,
+            "keys + text",
+        ),
+        (
+            r#"{"action":"keys","approval_id":"a:1","choice_id":"c1","text":"hi"}"#,
+            "keys choice + text",
+        ),
+        (
+            r#"{"action":"text","text":"hi","keys":["y"]}"#,
+            "text + keys",
+        ),
+        (
+            r#"{"action":"text","text":"hi","choice_id":"c1"}"#,
+            "text + choice_id",
+        ),
+        (
+            r#"{"action":"text","text":"hi","approval_id":"a:1"}"#,
+            "text + approval_id",
+        ),
+        (
+            r#"{"action":"allow","approval_id":"a:1","extra":1}"#,
+            "allow + unknown field",
+        ),
+        (
+            r#"{"action":"keys","keys":["y"],"extra":1}"#,
+            "keys + unknown field",
+        ),
+        (
+            r#"{"action":"text","text":"hi","extra":1}"#,
+            "text + unknown field",
+        ),
+        (r#"{"probe":true,"extra":1}"#, "probe + unknown field"),
+        (
+            r#"{"probe":true,"extra":null}"#,
+            "probe + null unknown field",
+        ),
+        (
+            r#"{"action":"approve","approval_id":"a:1"}"#,
+            "unknown action",
+        ),
+        (r#"{"action":123,"approval_id":"a:1"}"#, "non-string action"),
+    ] {
+        let err = ActRequest::parse(raw.as_bytes()).expect_err(why);
+        assert_eq!(err.0, 400, "{why}: {err:?}");
+    }
+}
+
+#[test]
+fn wire_contract_rejects_missing_duplicate_probe_and_bad_values_with_400() {
+    for (raw, why) in [
+        (r"{}", "empty object"),
+        (r#"{"probe":false}"#, "probe false without action"),
+        (r#"{"action":null,"keys":["y"]}"#, "null action"),
+        (r#"{"action":"allow"}"#, "allow missing approval_id"),
+        (
+            r#"{"action":"allow","approval_id":null}"#,
+            "allow null approval_id",
+        ),
+        (
+            r#"{"action":"allow_always"}"#,
+            "allow_always missing approval_id",
+        ),
+        (r#"{"action":"deny"}"#, "deny missing approval_id"),
+        (r#"{"action":"keys"}"#, "keys with nothing"),
+        (
+            r#"{"action":"keys","approval_id":"a:1"}"#,
+            "keys with only approval_id",
+        ),
+        (
+            r#"{"action":"keys","choice_id":"c3"}"#,
+            "keys choice without approval_id",
+        ),
+        (
+            r#"{"action":"keys","choice_id":"c3","keys":["digit3"]}"#,
+            "keys choice+keys without approval_id",
+        ),
+        (r#"{"action":"keys","keys":[]}"#, "empty keys"),
+        (
+            r#"{"action":"keys","keys":["y","y","y","y","y","y","y","y","y"]}"#,
+            "9 keys > max",
+        ),
+        (r#"{"action":"keys","keys":["f1"]}"#, "unknown key name"),
+        (
+            r#"{"action":"keys","approval_id":"a:1","choice_id":"c3","keys":[]}"#,
+            "empty expected keys",
+        ),
+        (
+            r#"{"action":"keys","approval_id":"a:1","choice_id":"c3","keys":["f1"]}"#,
+            "unknown expected key",
+        ),
+        (r#"{"action":"text"}"#, "text missing text"),
+        (r#"{"action":"text","text":null}"#, "text null"),
+        (r#"{"action":"keys","action":"text"}"#, "duplicate action"),
+        (r#"{"probe":true,"probe":false}"#, "duplicate probe"),
+        (
+            r#"{"action":"keys","keys":["y"],"key":"a","key":"b"}"#,
+            "duplicate key",
+        ),
+        (
+            r#"{"action":"allow","approval_id":"a:1","approval_id":"a:2"}"#,
+            "duplicate approval_id",
+        ),
+        (r"[]", "json array"),
+        (r"null", "json null"),
+        (r"{bad", "malformed json"),
+        (r#"{"probe":"yes"}"#, "wrong type for probe"),
+        (
+            r#"{"probe":null,"action":"keys","keys":["y"]}"#,
+            "null probe",
+        ),
+        (
+            r#"{"action":"keys","keys":["y"],"key":123}"#,
+            "wrong type for key",
+        ),
+        (r#"{"probe":true,"action":"allow"}"#, "probe + action"),
+        (
+            r#"{"probe":true,"approval_id":"a:1"}"#,
+            "probe + approval_id",
+        ),
+        (r#"{"probe":true,"choice_id":"c1"}"#, "probe + choice_id"),
+        (r#"{"probe":true,"keys":["y"]}"#, "probe + keys"),
+        (r#"{"probe":true,"text":"hi"}"#, "probe + text"),
+        (r#"{"probe":true,"key":"k"}"#, "probe + key"),
+    ] {
+        let err = ActRequest::parse(raw.as_bytes()).expect_err(why);
+        assert_eq!(err.0, 400, "{why}: {err:?}");
+        if why == "allow missing approval_id" {
+            assert!(err.1.contains("approval_id"), "{err:?}");
+        }
+    }
+}
+
+#[test]
+fn wire_contract_conflicts_return_409() {
+    let session = SessionId::new("session_worker_a").expect("session");
+    let three_yes = detect(THREE_YES).expect("prompt");
+    let id = three_yes.id(session.as_str());
+    let pane = shown(Some(three_yes));
+    let nothing = shown(None);
+    for (raw, use_pane, why) in [
+        (
+            format!(r#"{{"action":"allow","approval_id":"{id}"}}"#),
+            true,
+            "ambiguous allow",
+        ),
+        (
+            format!(r#"{{"action":"deny","approval_id":"{id}","choice_id":"choice3"}}"#),
+            true,
+            "wrong action for choice",
+        ),
+        (
+            format!(r#"{{"action":"allow","approval_id":"{id}","choice_id":"choice9"}}"#),
+            true,
+            "missing choice",
+        ),
+        (
+            r#"{"action":"allow","approval_id":"session_worker_a:0000000000000000"}"#.to_string(),
+            true,
+            "stale allow",
+        ),
+        (
+            format!(
+                r#"{{"action":"keys","approval_id":"{id}","choice_id":"choice3","keys":["digit1"]}}"#
+            ),
+            true,
+            "mismatched expected keys",
+        ),
+        (
+            format!(r#"{{"action":"keys","approval_id":"{id}","keys":["digit1"]}}"#),
+            false,
+            "no prompt showing",
+        ),
+    ] {
+        let ActRequest::Perform { act, .. } = ActRequest::parse(raw.as_bytes()).expect(&raw) else {
+            panic!("expected Perform");
+        };
+        let target = if use_pane { &pane } else { &nothing };
+        let err = what_to_send(act, &session, target).expect_err(why);
+        assert_eq!(err.0, 409, "{why}: {err:?}");
+    }
 }
