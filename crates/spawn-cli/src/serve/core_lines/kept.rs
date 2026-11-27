@@ -20,7 +20,10 @@
 //! its stale line is stale: shown as stale, never as current.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::{Arc, Condvar};
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -82,11 +85,13 @@ impl Status {
 }
 
 /// What a reading is served: the kept group, if any, and when it was read.
+#[cfg(test)]
 pub(crate) struct Served<T> {
     pub(crate) value: Option<Arc<T>>,
     pub(crate) as_of_ms: Option<i64>,
 }
 
+#[cfg(test)]
 struct State<T> {
     kept: Option<(i64, Arc<T>)>,
     refreshing: bool,
@@ -99,6 +104,7 @@ struct State<T> {
 }
 
 /// One kept group.
+#[cfg(test)]
 pub(crate) struct Group<T> {
     name: &'static str,
     every_ms: i64,
@@ -113,6 +119,7 @@ trait Report: Sync {
     fn status(&self) -> Status;
 }
 
+#[cfg(test)]
 impl<T: Send + Sync + 'static> Report for Group<T> {
     fn status(&self) -> Status {
         Group::status(self)
@@ -134,12 +141,14 @@ pub(crate) fn statuses() -> Vec<Status> {
 
 /// Clears `refreshing` however the refresh ends (a panic too, said as the
 /// error), and wakes whoever waits.
+#[cfg(test)]
 struct Refreshing<T: Send + Sync + 'static> {
     group: &'static Group<T>,
     begun: Instant,
     ended: bool,
 }
 
+#[cfg(test)]
 impl<T: Send + Sync + 'static> Drop for Refreshing<T> {
     fn drop(&mut self) {
         let mut state = self.group.lock();
@@ -159,10 +168,12 @@ impl<T: Send + Sync + 'static> Drop for Refreshing<T> {
     }
 }
 
+#[cfg(test)]
 fn millis(took: Duration) -> u64 {
     u64::try_from(took.as_millis()).unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
 impl<T: Send + Sync + 'static> Group<T> {
     /// A group named `group`, refreshed when older than `every_ms`, stale
     /// past `stale_ms`, its first refresh waited for at most `first_wait`.

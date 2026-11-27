@@ -34,7 +34,7 @@ pub(crate) const ARCHIVE: &str = ".transcripts";
 pub(crate) const PROGRESS: &str = ".transcripts-progress";
 
 /// Opt-in shared host build caches under the workspace root (`#105`):
-/// tracked independently via [`shared_caches`] and excluded from single
+/// tracked independently via [`shared_caches_with`] and excluded from single
 /// workspace disk totals in [`workspaces`].
 pub(crate) const SHARED_CACHES: &str = ".caches";
 
@@ -229,12 +229,6 @@ pub(crate) fn shared_caches_with(
             path: default_dir,
             enabled: false,
         })
-}
-
-/// Current-process wrapper around [`shared_caches_with`].
-#[allow(dead_code)]
-pub(crate) fn shared_caches(root: Option<&Path>) -> Option<SharedCacheSizes> {
-    shared_caches_with(root, &crate::env_value)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

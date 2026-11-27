@@ -1082,21 +1082,18 @@ mod tests {
 
     #[test]
     fn the_terminal_backend_is_herdr_only_and_refuses_tmux() {
-        assert_eq!(terminal_backend(None), Ok(TerminalBackend::Herdr));
-        assert_eq!(terminal_backend(Some("")), Ok(TerminalBackend::Herdr));
-        assert_eq!(terminal_backend(Some("herdr")), Ok(TerminalBackend::Herdr));
-        assert_eq!(
-            terminal_backend(Some(" herdr ")),
-            Ok(TerminalBackend::Herdr)
-        );
+        assert_eq!(check_terminal_backend(None), Ok(()));
+        assert_eq!(check_terminal_backend(Some("")), Ok(()));
+        assert_eq!(check_terminal_backend(Some("herdr")), Ok(()));
+        assert_eq!(check_terminal_backend(Some(" herdr ")), Ok(()));
         for removed in ["tmux", " tmux "] {
-            let error = terminal_backend(Some(removed)).expect_err(removed);
+            let error = check_terminal_backend(Some(removed)).expect_err(removed);
             assert!(error.contains("SPAWN_TERMINAL_BACKEND"), "{error}");
             assert!(error.contains("tmux"), "{error}");
             assert!(error.contains("removed"), "{error}");
         }
         for unknown in ["screen", "Herdr", "TMUX", "zellij"] {
-            let error = terminal_backend(Some(unknown)).expect_err(unknown);
+            let error = check_terminal_backend(Some(unknown)).expect_err(unknown);
             assert!(error.contains("SPAWN_TERMINAL_BACKEND"), "{error}");
             assert!(error.contains(unknown), "{error}");
             assert!(error.contains("herdr (the default)"), "{error}");
@@ -1187,18 +1184,11 @@ impl Flags {
     }
 }
 
-/// The terminal backends `SPAWN_TERMINAL_BACKEND` names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TerminalBackend {
-    Herdr,
-}
-
-/// The backend `value` (`SPAWN_TERMINAL_BACKEND`) names: Herdr when it is
-/// unset, empty, or `"herdr"`; `"tmux"` (removed) and anything else are
-/// refused.
-pub(crate) fn terminal_backend(value: Option<&str>) -> Result<TerminalBackend, String> {
+/// Rejects removed (`tmux`) or unknown `SPAWN_TERMINAL_BACKEND` values; only
+/// unset, empty, or `"herdr"` is accepted.
+fn check_terminal_backend(value: Option<&str>) -> Result<(), String> {
     match value.map(str::trim) {
-        None | Some("" | "herdr") => Ok(TerminalBackend::Herdr),
+        None | Some("" | "herdr") => Ok(()),
         Some("tmux") => Err(
             "SPAWN_TERMINAL_BACKEND=\"tmux\" is no longer supported: tmux has been removed; \
              use herdr (the default)"
@@ -1270,7 +1260,7 @@ fn sibling_spawn_hc() -> String {
 /// default), sharded across `SPAWN_HERDR_SHARDS` independent servers when
 /// greater than 1.
 pub(crate) fn terminal_host() -> Result<spawn_host::LocalTerminalHost, String> {
-    let TerminalBackend::Herdr = terminal_backend(env_value("SPAWN_TERMINAL_BACKEND").as_deref())?;
+    check_terminal_backend(env_value("SPAWN_TERMINAL_BACKEND").as_deref())?;
     let mode = herdr_mode(env_value("SPAWN_HERDR_MODE").as_deref())?;
     let session = env_or("SPAWN_HERDR_SESSION", spawn_host::herdr::DEFAULT_SESSION);
     let shards = herdr_shards(env_value("SPAWN_HERDR_SHARDS").as_deref())?;

@@ -23,7 +23,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -42,8 +41,6 @@ const DOMAIN_SYMLINK: &[u8] = b"spawn.cas.v1.symlink\0";
 const DOMAIN_LOGICAL: &[u8] = b"spawn.cas.v1.logical\0";
 const DOMAIN_FM_GRAPH: &[u8] = b"spawn.cas.v1.fm-graph\0";
 const DOMAIN_SNAPSHOT: &[u8] = b"spawn.cas.v1.snapshot\0";
-#[allow(dead_code)]
-const DOMAIN_TRANSPORT: &[u8] = b"spawn.cas.v1.transport\0";
 
 const PREFIX_BLOB: &str = "fm-cas/v1/blob/sha256/";
 const PREFIX_CHUNK: &str = "fm-cas/v1/chunk/sha256/";
@@ -308,20 +305,6 @@ pub(crate) fn logical_file_id(canonical_posix_path: &str) -> Result<String, CasE
         "{PREFIX_LOGICAL}{}",
         sha256_domain(DOMAIN_LOGICAL, canonical.as_bytes())
     ))
-}
-
-/// Optional blinded remote transport key:
-/// `HMAC-SHA256(master_key, "spawn.cas.v1.transport\0" || canonical_key)`.
-///
-/// Bridges `fm-cas/v1` deterministic inner keys with `spawn store`'s
-/// zero-plaintext-oracle R2 naming.
-#[allow(dead_code)]
-pub(crate) fn transport_key(master_key: &[u8], canonical_key: &str) -> String {
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(master_key).expect("HMAC-SHA256 accepts any key length");
-    mac.update(DOMAIN_TRANSPORT);
-    mac.update(canonical_key.as_bytes());
-    encode_hex(&mac.finalize().into_bytes())
 }
 
 /// Recursively serialize any serde value to canonical compact UTF-8 JSON bytes
@@ -1163,7 +1146,6 @@ impl CasStore {
     /// Never follows symlinks and skips staging files whose owning `<pid>`
     /// is still running on this host so concurrent active writers are never
     /// disturbed.
-    #[allow(dead_code)]
     pub(crate) fn sweep_staging(&self) -> Result<usize, CasError> {
         let staging = self.staging_dir();
         match fs::symlink_metadata(&staging) {
@@ -3548,6 +3530,7 @@ fn cmd_snapshot(flags: &Flags) -> Result<i32, String> {
     let summary = store
         .create_snapshot(&source, fm_graph_opt.as_ref(), parent.as_deref())
         .map_err(|error| error.to_string())?;
+    let _ = store.sweep_staging();
 
     if flags.switch("json") {
         println!(
@@ -4070,16 +4053,6 @@ mod tests {
         assert!(id1.starts_with(PREFIX_LOGICAL));
         assert_ne!(id1, id2);
         assert_eq!(id1, logical_file_id("src/lib.rs").expect("deterministic"));
-
-        // Transport key is deterministic per master key and distinct across keys.
-        let t1 = transport_key(b"master-key-alpha", &b_key);
-        let t2 = transport_key(b"master-key-alpha", &b_key);
-        let t3 = transport_key(b"master-key-beta", &b_key);
-        assert_eq!(t1.len(), 64);
-        assert_eq!(t1, t2);
-        assert_ne!(t1, t3);
-        // Must not reveal inner digest.
-        assert!(!b_key.ends_with(&t1));
     }
 
     #[test]

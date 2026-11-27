@@ -98,17 +98,6 @@ use serde_json::{Map, Value, json};
 
 mod disk;
 mod drills;
-// The groups are used by objectives 2 and 3 (performance.rs, storage.rs;
-// sync/design-core-lines-kept-figures.md), which land after this one: until
-// then nothing but the tests makes a group. `expect`, so the first of them
-// to use it must take this line out.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "kept groups land before the groups that use them (objectives 2 and 3)"
-    )
-)]
 pub(crate) mod kept;
 mod observability;
 mod performance;

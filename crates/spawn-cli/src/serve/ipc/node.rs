@@ -311,8 +311,8 @@ fn handle_node_result(body: &[u8], state: &IpcState) -> IpcResponse {
 }
 
 enum CasLock {
-    Shared(#[allow(dead_code)] spawn_cas::GcSharedLock),
-    Exclusive(#[allow(dead_code)] spawn_cas::GcLock),
+    Shared { _lock: spawn_cas::GcSharedLock },
+    Exclusive { _lock: spawn_cas::GcLock },
 }
 
 pub(super) fn handle_node_cas(body: &[u8], cas_root: &Path) -> IpcResponse {
@@ -341,9 +341,13 @@ pub(super) fn handle_node_cas(body: &[u8], cas_root: &Path) -> IpcResponse {
         Err(e) => return err_json(500, "internal", format!("open CAS store: {e}")),
     };
     let lock_guard = if action == "stat" {
-        store.lock_gc_shared().map(CasLock::Shared)
+        store
+            .lock_gc_shared()
+            .map(|lock| CasLock::Shared { _lock: lock })
     } else {
-        store.lock_gc().map(CasLock::Exclusive)
+        store
+            .lock_gc()
+            .map(|lock| CasLock::Exclusive { _lock: lock })
     };
     let Ok(_guard) = lock_guard else {
         return err_json(500, "internal", "failed to acquire CAS lock");
