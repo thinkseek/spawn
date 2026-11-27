@@ -440,6 +440,199 @@ check "rollback stopped fronts/core before restarting legacy services" \
              r_gw > r_srv && r_jev > r_srv && r_path > r_srv)
     }" "$1"' _ "$P2_SYSTEMCTL_LOG"
 
+# 7. Read-only --check-phase2-cutover with SPAWN_SERVE_TOKEN in spawn.env creates no node-edge.env and leaks zero secrets.
+mkdir -p "$p2_home/.config/spawn"
+cat >"$p2_live/spawn.env" <<'EOF'
+SPAWN_DATABASE_URL=postgres://u:P2_DB_LEAK_SENTINEL@127.0.0.1:5432/spawn
+SPAWN_SERVE_TOKEN=P2_TOK_LEAK_SENTINEL
+SPAWN_OTHER_VAR=stay_out
+EOF
+chmod 600 "$p2_live/spawn.env"
+rm -f "$p2_home/.config/spawn/node-edge.env"
+set +e
+(
+  cd "$repo"
+  HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    bash "$repo/deploy/deploy.sh" --check-phase2-cutover "$repo/deploy/systemd"
+) >"$p2/precheck-auth.out" 2>&1
+p2_status=$?
+set -e
+check "--check-phase2-cutover passes when spawn.env has SPAWN_SERVE_TOKEN and node-edge.env is absent (status $p2_status)" \
+  [ "$p2_status" -eq 0 ]
+check "--check-phase2-cutover stays read-only (creates no node-edge.env)" \
+  [ ! -e "$p2_home/.config/spawn/node-edge.env" ]
+check "--check-phase2-cutover prints zero secret sentinels with spawn.env token" \
+  bash -c '! grep -qE "P2_DB_LEAK_SENTINEL|P2_TOK_LEAK_SENTINEL" "$1"' _ "$p2/precheck-auth.out"
+
+# 8. --check-phase2-cutover fails closed on DATABASE_URL in node-edge.env, symlink node-edge.env, or unwritable config dir.
+printf 'SPAWN_DATABASE_URL=P2_DB_LEAK_SENTINEL\n' >"$p2_home/.config/spawn/node-edge.env"
+set +e
+(
+  cd "$repo"
+  HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    bash "$repo/deploy/deploy.sh" --check-phase2-cutover "$repo/deploy/systemd"
+) >"$p2/precheck-bad-db.out" 2>&1
+p2_status=$?
+set -e
+check "--check-phase2-cutover rejects DATABASE_URL in node-edge.env (status $p2_status)" [ "$p2_status" -ne 0 ]
+check "--check-phase2-cutover prints zero secret sentinels on node-edge.env DB leak" \
+  bash -c '! grep -qE "P2_DB_LEAK_SENTINEL|P2_TOK_LEAK_SENTINEL" "$1"' _ "$p2/precheck-bad-db.out"
+
+rm -f "$p2_home/.config/spawn/node-edge.env"
+ln -s /dev/null "$p2_home/.config/spawn/node-edge.env"
+set +e
+(
+  cd "$repo"
+  HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    bash "$repo/deploy/deploy.sh" --check-phase2-cutover "$repo/deploy/systemd"
+) >"$p2/precheck-symlink.out" 2>&1
+p2_status=$?
+set -e
+check "--check-phase2-cutover rejects symlink node-edge.env (status $p2_status)" [ "$p2_status" -ne 0 ]
+rm -f "$p2_home/.config/spawn/node-edge.env"
+
+if [ "$(id -u)" -ne 0 ]; then
+  chmod 555 "$p2_home/.config/spawn"
+  set +e
+  (
+    cd "$repo"
+    HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+      XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+      bash "$repo/deploy/deploy.sh" --check-phase2-cutover "$repo/deploy/systemd"
+  ) >"$p2/precheck-ro-dir.out" 2>&1
+  p2_status=$?
+  set -e
+  chmod 755 "$p2_home/.config/spawn"
+  check "--check-phase2-cutover rejects unwritable config dir when sync needed (status $p2_status)" \
+    [ "$p2_status" -ne 0 ]
+fi
+
+# 9. go-uds cutover provisions node-edge.env with 0600 and ONLY SPAWN_SERVE_TOKEN.
+p2_reset_state
+for u in spawn-loop spawn-integrate spawn-serve.service spawn-node-gateway.service spawn-jev-relay.service spawn-jev-relay.path; do
+  : >"$p2_state/$u.active"
+done
+set +e
+(
+  cd "$repo"
+  export HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    P2_STATE_DIR=$p2_state P2_SYSTEMCTL_LOG=$P2_SYSTEMCTL_LOG P2_CORE_SOCK=$P2_CORE_SOCK P2_CORE_PID=$P2_CORE_PID \
+    P2_CREATE_CORE_SOCK=1 SPAWN_DEPLOY_EDGE_MODE=go-uds SPAWN_PHASE2_CORE_SOCK_TIMEOUT_SECS=5
+  # shellcheck source=deploy/deploy.sh
+  . "$repo/deploy/deploy.sh"
+  check_phase2_cutover "$repo/deploy/systemd" &&
+    sync_units_for_deploy "$repo/deploy/systemd" &&
+    restart
+  rc=$?
+  if [ -f "$P2_CORE_PID" ]; then
+    kill "$(cat "$P2_CORE_PID" 2>/dev/null || true)" >/dev/null 2>&1 || true
+    rm -f "$P2_CORE_PID"
+  fi
+  exit "$rc"
+) >"$p2/cutover-auth.out" 2>&1
+p2_status=$?
+set -e
+check "go-uds cutover with SPAWN_SERVE_TOKEN succeeds (status $p2_status)" [ "$p2_status" -eq 0 ]
+check "go-uds cutover created regular node-edge.env" \
+  bash -c '[ -f "$1" ] && [ ! -L "$1" ]' _ "$p2_home/.config/spawn/node-edge.env"
+p2_edge_mode=""
+if [ -e "$p2_home/.config/spawn/node-edge.env" ]; then
+  p2_edge_mode=$(stat -c %a "$p2_home/.config/spawn/node-edge.env" 2>/dev/null || stat -f %Lp "$p2_home/.config/spawn/node-edge.env")
+fi
+check "node-edge.env has strict 0600 permissions (got $p2_edge_mode)" [ "$p2_edge_mode" = "600" ]
+check "node-edge.env contains SPAWN_SERVE_TOKEN" \
+  grep -qx "SPAWN_SERVE_TOKEN=P2_TOK_LEAK_SENTINEL" "$p2_home/.config/spawn/node-edge.env"
+check "node-edge.env excludes DATABASE_URL and unrelated spawn.env vars" \
+  bash -c '! grep -qiE "DATABASE_URL|SPAWN_OTHER_VAR|P2_DB_LEAK_SENTINEL|spawn\.env" "$1"' _ "$p2_home/.config/spawn/node-edge.env"
+check "go-uds cutover log prints zero secrets" \
+  bash -c '! grep -qE "P2_DB_LEAK_SENTINEL|P2_TOK_LEAK_SENTINEL" "$1"' _ "$p2/cutover-auth.out"
+
+# 10. Token rotation updates SPAWN_SERVE_TOKEN in place, preserves host edge overrides, and is idempotent.
+printf 'SPAWN_SERVE_ADDRESS=0.0.0.0:8787\n' >>"$p2_home/.config/spawn/node-edge.env"
+cat >"$p2_live/spawn.env" <<'EOF'
+SPAWN_DATABASE_URL=postgres://u:P2_DB_LEAK_SENTINEL@127.0.0.1:5432/spawn
+SPAWN_SERVE_TOKEN=P2_TOK_ROTATED_SENTINEL
+EOF
+chmod 600 "$p2_live/spawn.env"
+set +e
+(
+  cd "$repo"
+  export HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    SPAWN_DEPLOY_EDGE_MODE=go-uds
+  # shellcheck source=deploy/deploy.sh
+  . "$repo/deploy/deploy.sh"
+  sync_node_edge_env
+) >"$p2/sync-rotate.out" 2>&1
+p2_status=$?
+set -e
+check "sync_node_edge_env rotates token cleanly (status $p2_status)" [ "$p2_status" -eq 0 ]
+set +e
+(
+  cd "$repo"
+  export HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    SPAWN_DEPLOY_EDGE_MODE=go-uds
+  # shellcheck source=deploy/deploy.sh
+  . "$repo/deploy/deploy.sh"
+  sync_node_edge_env
+) >"$p2/sync-idempotent.out" 2>&1
+p2_status=$?
+set -e
+check "sync_node_edge_env second run is idempotent (status $p2_status)" [ "$p2_status" -eq 0 ]
+check "sync_node_edge_env idempotent message reported" grep -q "already in sync (mode 0600)" "$p2/sync-idempotent.out"
+check "node-edge.env preserves safe host override SPAWN_SERVE_ADDRESS" \
+  grep -qx "SPAWN_SERVE_ADDRESS=0.0.0.0:8787" "$p2_home/.config/spawn/node-edge.env"
+check "node-edge.env updated to rotated token once" \
+  bash -c 'grep -qx "SPAWN_SERVE_TOKEN=P2_TOK_ROTATED_SENTINEL" "$1" && [ "$(grep -c "^SPAWN_SERVE_TOKEN=" "$1")" -eq 1 ]' _ "$p2_home/.config/spawn/node-edge.env"
+check "node-edge.env rotation prints zero secrets" \
+  bash -c '! grep -qE "P2_DB_LEAK_SENTINEL|P2_TOK_LEAK_SENTINEL|P2_TOK_ROTATED_SENTINEL" "$1" "$2"' _ "$p2/sync-rotate.out" "$p2/sync-idempotent.out"
+
+# 11. Fail-closed when node-edge.env carries DATABASE_URL, and no-op when spawn.env has no token.
+p2_reset_state
+printf 'SPAWN_DATABASE_URL=P2_DB_LEAK_SENTINEL\n' >"$p2_home/.config/spawn/node-edge.env"
+set +e
+(
+  cd "$repo"
+  export HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    P2_STATE_DIR=$p2_state P2_SYSTEMCTL_LOG=$P2_SYSTEMCTL_LOG P2_CORE_SOCK=$P2_CORE_SOCK P2_CORE_PID=$P2_CORE_PID \
+    SPAWN_DEPLOY_EDGE_MODE=go-uds
+  # shellcheck source=deploy/deploy.sh
+  . "$repo/deploy/deploy.sh"
+  restart
+) >"$p2/sync-refused.out" 2>&1
+p2_status=$?
+set -e
+check "go-uds restart refuses DATABASE_URL in node-edge.env before calling systemctl (status $p2_status)" \
+  bash -c '[ "$1" -ne 0 ] && [ ! -s "$2" ]' _ "$p2_status" "$P2_SYSTEMCTL_LOG"
+check "refusal prints zero secrets" \
+  bash -c '! grep -qE "P2_DB_LEAK_SENTINEL|P2_TOK_ROTATED_SENTINEL" "$1"' _ "$p2/sync-refused.out"
+
+rm -f "$p2_home/.config/spawn/node-edge.env"
+cat >"$p2_live/spawn.env" <<'EOF'
+SPAWN_DATABASE_URL=postgres://u:P2_DB_LEAK_SENTINEL@127.0.0.1:5432/spawn
+EOF
+chmod 600 "$p2_live/spawn.env"
+set +e
+(
+  cd "$repo"
+  export HOME=$p2_home XDG_CONFIG_HOME=$p2_home/.config XDG_CACHE_HOME=$p2_home/.cache XDG_DATA_HOME=$p2_home/.local/share \
+    XDG_RUNTIME_DIR=$p2_runtime SPAWN_UNIT_DIR=$p2_units SPAWN_LIVE=$p2_live PATH="$p2_bin:$PATH" \
+    SPAWN_DEPLOY_EDGE_MODE=go-uds
+  # shellcheck source=deploy/deploy.sh
+  . "$repo/deploy/deploy.sh"
+  sync_node_edge_env
+) >"$p2/sync-notoken.out" 2>&1
+p2_status=$?
+set -e
+check "sync_node_edge_env is a no-op when spawn.env has no SPAWN_SERVE_TOKEN (status $p2_status)" \
+  bash -c '[ "$1" -eq 0 ] && [ ! -e "$2" ]' _ "$p2_status" "$p2_home/.config/spawn/node-edge.env"
+
 rm -rf "$p2"
 
 # SPAWN_DEPLOY_TEST_URL_FILE names another file holding the test server's URL

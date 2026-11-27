@@ -1425,3 +1425,33 @@ fn v1_beat_build_sha_and_node_version_project_into_node_v1_and_nodes_v1() {
     let row = store.node_v1("nbld1").expect("node_v1").expect("row");
     assert_eq!((row.build_sha, row.node_version), (None, None));
 }
+
+#[test]
+fn spawn_reader_reads_nodes_v1_with_build_sha_and_node_version_without_secrets() {
+    let (store, schema) = store("rj_reader_nodes_v1");
+    let n1 = enroll(&store, "n252", 61, &json!({}));
+    let b1 = boot(1);
+    let sha = "abcdef0123456789abcdef0123456789abcdef01";
+    let mut with_telemetry = beat(&[], &[], 4, 2048);
+    with_telemetry["build_sha"] = json!(sha);
+    with_telemetry["node_version"] = json!("0.1.0");
+    with_telemetry["power"] = json!({
+        "on_ac": true,
+        "battery_pct": 100,
+        "charging": false,
+        "remaining_mins": null
+    });
+    assert_eq!(beat_once(&store, &n1, &b1, 1, &with_telemetry)["ok"], true);
+
+    let reader_url = spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader")
+        .expect("spawn_reader url");
+    let reader = PostgresStore::connect(&reader_url).expect("connect as spawn_reader");
+    let listed = reader.nodes_v1().expect("spawn_reader nodes_v1");
+    let node = listed.iter().find(|n| n.name == "n252").expect("n252");
+    assert_eq!(node.status, "active");
+    assert_eq!(node.host_fault_strikes, 0);
+    assert!(node.last_beat_ms.is_some());
+    assert_eq!(node.build_sha.as_deref(), Some(sha));
+    assert_eq!(node.node_version.as_deref(), Some("0.1.0"));
+    assert_eq!(node.power.as_ref().and_then(|p| p["on_ac"].as_bool()), Some(true));
+}
