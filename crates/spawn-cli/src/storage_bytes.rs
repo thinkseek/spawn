@@ -914,4 +914,341 @@ mod shared_cache_tests {
         let _ = std::fs::remove_dir_all(&base);
         let _: Vec<PathBuf> = Vec::new();
     }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn shared_cache_roots_empty_missing_zero_byte_and_symlink_boundaries() {
+        let base = std::env::temp_dir().join(format!(
+            "spawn-sb-edge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let ws = base.join("ws");
+        let xdg = base.join("xdg");
+        let empty_cache = base.join("empty-cache");
+        let zero_byte_cache = base.join("zero-byte-cache");
+        let outside_target = base.join("outside-target");
+        let broken_link = base.join("broken-link");
+        let file_as_cache = base.join("regular-file.txt");
+
+        std::fs::create_dir_all(&ws).expect("mkdir ws");
+        std::fs::create_dir_all(&xdg).expect("mkdir xdg");
+        std::fs::create_dir_all(&empty_cache).expect("mkdir empty_cache");
+        std::fs::create_dir_all(&zero_byte_cache).expect("mkdir zero_byte_cache");
+        std::fs::create_dir_all(&outside_target).expect("mkdir outside_target");
+        std::fs::write(zero_byte_cache.join("zero.bin"), b"").expect("write zero.bin");
+        std::fs::write(outside_target.join("data.bin"), b"outside").expect("write data.bin");
+        std::fs::write(&file_as_cache, b"not a directory").expect("write file");
+
+        // Symlink pointing to a missing destination (broken symlink)
+        std::os::unix::fs::symlink(base.join("non-existent-target"), &broken_link)
+            .expect("broken symlink");
+
+        // 1. Missing cache directory: SPAWN_SHARED_BUILD_CACHE_DIR pointing to non-existent path is omitted
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&ws),
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    (
+                        "SPAWN_SHARED_BUILD_CACHE_DIR",
+                        base.join("does-not-exist").to_str().expect("utf8")
+                    ),
+                ])
+            ),
+            vec![xdg.clone()]
+        );
+
+        // 2. Missing default .caches directory with SPAWN_SHARED_BUILD_CACHES=1 is omitted
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&ws),
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    ("SPAWN_SHARED_BUILD_CACHES", "1"),
+                ])
+            ),
+            vec![xdg.clone()]
+        );
+
+        // 3. Empty cache directory: directory exists but has 0 files -> counted as a valid root
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&ws),
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    (
+                        "SPAWN_SHARED_BUILD_CACHE_DIR",
+                        empty_cache.to_str().expect("utf8")
+                    ),
+                ])
+            ),
+            vec![xdg.clone(), empty_cache.clone()]
+        );
+
+        // 4. Zero-byte files in cache directory: counted as valid root
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&ws),
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    (
+                        "SPAWN_SHARED_BUILD_CACHE_DIR",
+                        zero_byte_cache.to_str().expect("utf8")
+                    ),
+                ])
+            ),
+            vec![xdg.clone(), zero_byte_cache.clone()]
+        );
+
+        // 5. Broken symlink: is_dir() is false, safely omitted without error
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&ws),
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    (
+                        "SPAWN_SHARED_BUILD_CACHE_DIR",
+                        broken_link.to_str().expect("utf8")
+                    ),
+                ])
+            ),
+            vec![xdg.clone()]
+        );
+
+        // 6. Regular file passed as cache root: is_dir() is false, safely omitted
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&ws),
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    (
+                        "SPAWN_SHARED_BUILD_CACHE_DIR",
+                        file_as_cache.to_str().expect("utf8")
+                    ),
+                ])
+            ),
+            vec![xdg.clone()]
+        );
+
+        // 7. Symlink loop / cycle safety: recursive symlink
+        let loop_link = base.join("loop-link");
+        std::os::unix::fs::symlink(&loop_link, &loop_link).expect("symlink cycle");
+        assert_eq!(
+            build_cache_roots_for(
+                Some(&ws),
+                env_of(&[
+                    ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                    (
+                        "SPAWN_SHARED_BUILD_CACHE_DIR",
+                        loop_link.to_str().expect("utf8")
+                    ),
+                ])
+            ),
+            vec![xdg.clone()]
+        );
+
+        // 8. Symlink pointing to outside target: resolved and deduplicated
+        let symlink_to_outside = ws.join(".caches");
+        std::os::unix::fs::symlink(&outside_target, &symlink_to_outside).expect("symlink outside");
+        let roots = build_cache_roots_for(
+            Some(&ws),
+            env_of(&[
+                ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                ("SPAWN_SHARED_BUILD_CACHES", "1"),
+            ]),
+        );
+        assert_eq!(roots, vec![xdg.clone(), symlink_to_outside]);
+
+        // If another cache names the same canonical directory, it is deduplicated
+        let dup_roots = build_cache_roots_for(
+            Some(&ws),
+            env_of(&[
+                ("XDG_CACHE_HOME", xdg.to_str().expect("utf8")),
+                (
+                    "BUN_INSTALL_CACHE_DIR",
+                    outside_target.to_str().expect("utf8"),
+                ),
+                ("SPAWN_SHARED_BUILD_CACHES", "1"),
+            ]),
+        );
+        assert_eq!(
+            dup_roots,
+            vec![xdg.clone(), outside_target.clone()],
+            "symlink pointing to outside_target is dropped since bun already resolved to it"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn storage_bytes_json_field_stability_and_zero_byte_accounting() {
+        use super::{
+            BUILD_CACHE, LIVE_DATABASE, SCRATCH, SESSION_BACKUPS, Source, TEST_DATABASES,
+            TRANSCRIPTS, live_database, script_input, script_sources, session_backups,
+            test_databases,
+        };
+        use serde_json::json;
+
+        let src_transcripts = Source {
+            name: TRANSCRIPTS,
+            roots: vec![PathBuf::from("/srv/transcripts")],
+            exclude: Vec::new(),
+        };
+        let src_build_cache = Source {
+            name: BUILD_CACHE,
+            roots: vec![PathBuf::from("/srv/cache")],
+            exclude: Vec::new(),
+        };
+        let src_scratch = Source {
+            name: SCRATCH,
+            roots: Vec::new(),
+            exclude: Vec::new(),
+        };
+        let sources_list = vec![
+            src_transcripts.clone(),
+            src_build_cache.clone(),
+            src_scratch.clone(),
+        ];
+
+        // 1. Script input schema stability
+        let input = script_input(&sources_list, 1200);
+        assert_eq!(input["bound_secs"], 1200);
+        let src_arr = input["sources"].as_array().expect("sources array");
+        assert_eq!(src_arr.len(), 2, "scratch with empty roots is omitted");
+        assert_eq!(src_arr[0]["name"], "transcripts");
+        assert_eq!(src_arr[0]["roots"], json!(["/srv/transcripts"]));
+        assert_eq!(src_arr[0]["exclude"], json!([]));
+        assert_eq!(src_arr[1]["name"], "build_cache");
+        assert_eq!(src_arr[1]["roots"], json!(["/srv/cache"]));
+
+        // 2. Script answer handling: zero-byte files & empty dirs
+        let answer_zero = Ok(json!({
+            "sources": [
+                {
+                    "name": "transcripts",
+                    "bytes": 0,
+                    "files": 0,
+                    "unreadable": 0,
+                    "seconds": 0.05
+                },
+                {
+                    "name": "build_cache",
+                    "bytes": 0,
+                    "files": 4,
+                    "unreadable": 0,
+                    "seconds": 0.12
+                }
+            ]
+        }));
+        let sources_map = script_sources(&sources_list, &answer_zero);
+        assert_eq!(
+            sources_map["transcripts"],
+            json!({"bytes": 0, "files": 0, "unreadable": 0, "seconds": 0.05})
+        );
+        assert_eq!(
+            sources_map["build_cache"],
+            json!({"bytes": 0, "files": 4, "unreadable": 0, "seconds": 0.12})
+        );
+        assert_eq!(
+            sources_map["scratch"],
+            json!({"not_measured": "no root to read"})
+        );
+
+        // 3. Script error & over_bound stability
+        let answer_err = Err("killed by signal".to_string());
+        let err_map = script_sources(&sources_list, &answer_err);
+        assert_eq!(
+            err_map["transcripts"],
+            json!({"not_measured": "the extents script: killed by signal"})
+        );
+        assert_eq!(
+            err_map["scratch"],
+            json!({"not_measured": "no root to read"})
+        );
+
+        let answer_over_bound = Ok(json!({
+            "sources": [
+                {
+                    "name": "transcripts",
+                    "over_bound": true,
+                    "files": 999
+                }
+            ]
+        }));
+        let ob_map = script_sources(&sources_list, &answer_over_bound);
+        assert_eq!(
+            ob_map["transcripts"],
+            json!({"not_measured": "over its bound of 1200 s (999 files read)"})
+        );
+        assert_eq!(
+            ob_map["build_cache"],
+            json!({"not_measured": "the extents script gave no answer for it"})
+        );
+
+        // 4. Session backups & test databases & live database field stability
+        let tmp = std::env::temp_dir().join(format!("spawn-sb-session-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let status_file = tmp.join("status.json");
+        std::fs::write(&status_file, r#"{"estimated_bytes": 0}"#).expect("write status");
+
+        let sb_zero = session_backups(Some(&status_file));
+        assert_eq!(sb_zero, json!({"bytes": 0}));
+
+        let sb_none = session_backups(None);
+        assert_eq!(
+            sb_none,
+            json!({"not_measured": "no status file is configured"})
+        );
+
+        let db_entry = live_database(Ok(json!({"bytes": 0})));
+        assert_eq!(db_entry, json!({"bytes": 0}));
+
+        let test_db_entry = test_databases(
+            &[
+                ("role1".to_string(), "url1".to_string()),
+                ("role2".to_string(), "url2".to_string()),
+            ],
+            |url| {
+                if url == "url1" {
+                    Ok(json!({"name": "db_test", "bytes": 0}))
+                } else {
+                    Ok(json!({"name": "db_test", "bytes": 100}))
+                }
+            },
+        );
+        assert_eq!(test_db_entry, json!({"bytes": 0, "databases": 1}));
+
+        // 5. Complete host.storage_bytes record schema stability
+        let mut full_sources = sources_map;
+        full_sources.insert(SESSION_BACKUPS.to_string(), sb_zero);
+        full_sources.insert(TEST_DATABASES.to_string(), test_db_entry);
+        full_sources.insert(LIVE_DATABASE.to_string(), db_entry);
+
+        let record = json!({
+            "type": "host.storage_bytes",
+            "sources": full_sources,
+        });
+        assert_eq!(record["type"], "host.storage_bytes");
+        let rec_sources = record["sources"].as_object().expect("sources object");
+        for expected_key in [
+            TRANSCRIPTS,
+            BUILD_CACHE,
+            SCRATCH,
+            SESSION_BACKUPS,
+            TEST_DATABASES,
+            LIVE_DATABASE,
+        ] {
+            assert!(
+                rec_sources.contains_key(expected_key),
+                "missing key: {expected_key}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
