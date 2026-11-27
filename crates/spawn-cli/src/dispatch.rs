@@ -311,6 +311,48 @@ fn stopped_at_prompt(observation: &Observation) -> bool {
 }
 
 impl Facts {
+    /// Refuses facts no row of `dispatch_facts` has, so nothing read from
+    /// them is a guess (each rule is the query's own, `DISPATCH_FACTS`):
+    /// - a live session has its execution (`agent_status.live` is
+    ///   `execution_id is not null and ended_at_ms is null`);
+    /// - stops and open jobs are read for a live session only (`s.live`);
+    /// - a turn's end and its position (`turn_ended`, `turn_seq`) are one
+    ///   row's two columns, so an end has its position; that row and the
+    ///   recovery's interruption are joined on the session's execution, so
+    ///   they need one;
+    /// - `model_label` is read only for an engine that is not `claude`;
+    /// - the charter is read for the supervisor, and for no other session;
+    /// - the latest judgement's event id and time are one event's
+    ///   (`spawn_session_state`), and a judgement has them.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        let session = &self.session_id;
+        let refuse = |why: &str| Err(format!("{session}: {why}"));
+        if self.turn_ended && self.turn_seq.is_none() {
+            return refuse("`turn_ended` without the `turn_seq` of its end");
+        }
+        if self.live && self.execution_id.is_none() {
+            return refuse("live without an `execution_id`");
+        }
+        if !self.live && (!self.stops.is_empty() || !self.jobs.is_empty()) {
+            return refuse("`stops` and `jobs` belong to a live execution");
+        }
+        if self.execution_id.is_none() && (self.turn_seq.is_some() || self.recovered.is_some()) {
+            return refuse("`turn_seq` and `recovered` belong to an execution");
+        }
+        if self.model_label.is_some() && self.engine.as_deref().is_none_or(|e| e == "claude") {
+            return refuse("`model_label` belongs to an engine besides claude");
+        }
+        if self.charter.is_some() != (session == SUPERVISOR_SESSION) {
+            return refuse("`charter` is the supervisor's, and only the supervisor's");
+        }
+        if self.observation_event_id.is_some() != self.observation_at_ms.is_some()
+            || (self.observation.is_some() && self.observation_event_id.is_none())
+        {
+            return refuse("a judgement's event id and time are one event's");
+        }
+        Ok(())
+    }
+
     /// The command the dispatcher sent under `key`, if any.
     pub(crate) fn sent(&self, key: &str) -> Option<&Sent> {
         self.dispatched.iter().find(|sent| sent.key == key)
@@ -717,14 +759,24 @@ pub(crate) fn decide_with(
     plan
 }
 
+/// The rows of `dispatch_facts`, each checked ([`Facts::check`]): a row
+/// the query never yields fails the pass rather than being read on a guess.
+fn parse_facts(raw: serde_json::Value) -> Result<Vec<Facts>, String> {
+    let rows: Vec<Facts> =
+        serde_json::from_value(raw).map_err(|error| format!("dispatch facts: {error}"))?;
+    for row in &rows {
+        row.check()
+            .map_err(|error| format!("dispatch facts: {error}"))?;
+    }
+    Ok(rows)
+}
+
 /// Facts and mission rows, read once, delivering with `waits`.
 pub(crate) fn load(
     store: &PostgresStore,
     waits: deliver::Waits,
 ) -> Result<(Vec<Facts>, Work), String> {
-    let rows: Vec<Facts> =
-        serde_json::from_value(store.dispatch_facts().map_err(|error| error.to_string())?)
-            .map_err(|error| format!("dispatch facts: {error}"))?;
+    let rows = parse_facts(store.dispatch_facts().map_err(|error| error.to_string())?)?;
     let mut work = Work::load(store)?;
     work.waits = waits;
     // What the capability probe found (`spawn loop` probes at its start and
@@ -744,8 +796,7 @@ pub(crate) fn load_if_permitted(
         Err(spawn_core::port::StoreError::Rejected(_)) => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
-    let rows: Vec<Facts> =
-        serde_json::from_value(raw).map_err(|error| format!("dispatch facts: {error}"))?;
+    let rows = parse_facts(raw)?;
     let Some(mut work) = Work::load_if_permitted(store)? else {
         return Ok(None);
     };
@@ -3705,5 +3756,140 @@ mod tests {
         assert_eq!(digest_rows().len(), 2);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `dispatch_facts` row as the query writes it (every key, null
+    /// where it names nothing): a live worker mid-turn, with `fields` over
+    /// it.
+    fn facts_row(fields: &serde_json::Value) -> serde_json::Value {
+        let mut row = serde_json::json!({
+            "session_id": "session_worker_a", "agent_id": "agent_worker_a", "live": true,
+            "execution_id": "exec_1", "end_cause": null, "observation": null,
+            "observation_event_id": null, "observation_at_ms": null, "evidence_seq": 12,
+            "turn_ended": false, "turn_seq": 11, "checkpoint": null, "jobs": [],
+            "episode": 4, "episode_action": "input", "open_command": false,
+            "last_liveness_recovery_ms": null, "model": "default", "engine": "claude",
+            "model_label": null, "dispatched": [], "stops": [], "told": [],
+            "last_delivery": null, "resumed_young": 0, "charter": null, "recovered": null,
+            "failed_resume": null});
+        for (key, value) in fields.as_object().expect("fields") {
+            row[key] = value.clone();
+        }
+        row
+    }
+
+    /// The rows `dispatch_facts` writes read and pass: a live worker mid
+    /// turn or at its turn's end, judged, on agy with its label, with a
+    /// stop, a job and a recovery; a session that never ran; one whose
+    /// execution ended; and the supervisor with its charter.
+    #[test]
+    fn the_rows_dispatch_facts_writes_pass_the_check() {
+        let observation = serde_json::to_value(judged(SemanticState::Waiting, 0.9)).expect("json");
+        let stop = serde_json::json!({"id": 3, "key": "cancel-stop-7-exec_1", "principal": "spawn-dispatch",
+                                      "action": "stop", "created_at_ms": 1, "finished_at_ms": null,
+                                      "succeeded": null, "error": null});
+        let job = serde_json::json!({"id": "b1", "kind": "bash", "event_id": 5, "started_at_ms": 1, "age_ms": 2});
+        let rows = serde_json::Value::Array(vec![
+            facts_row(&serde_json::json!({})),
+            facts_row(
+                &serde_json::json!({"turn_ended": true, "observation": observation,
+                                          "observation_event_id": 40, "observation_at_ms": 9}),
+            ),
+            facts_row(
+                &serde_json::json!({"engine": "agy", "model_label": "gemini-pro",
+                                          "stops": [stop], "jobs": [job], "recovered": 77}),
+            ),
+            facts_row(
+                &serde_json::json!({"live": false, "execution_id": null, "turn_seq": null,
+                                          "engine": null, "episode": null}),
+            ),
+            facts_row(&serde_json::json!({"live": false, "end_cause": "lost", "turn_ended": true})),
+            facts_row(&serde_json::json!({"session_id": "session_supervisor",
+                                          "agent_id": "agent_supervisor",
+                                          "charter": {"start": 2, "given": "abc", "inputs": []}})),
+        ]);
+        let read = super::parse_facts(rows).expect("every row the query writes passes");
+        assert_eq!(read.len(), 6);
+        assert!(read[5].charter.is_some());
+    }
+
+    /// Each combination `dispatch_facts` never writes fails the pass's
+    /// read, naming its session and its rule.
+    #[test]
+    fn a_facts_row_the_query_never_writes_fails_the_read() {
+        let stop = serde_json::json!({"id": 3, "key": "k", "principal": "human", "action": "stop",
+                                      "created_at_ms": 1});
+        let job = serde_json::json!({"id": "b1", "kind": "bash", "event_id": 5, "started_at_ms": 1, "age_ms": 2});
+        let ended = serde_json::json!({"live": false, "execution_id": null, "turn_seq": null});
+        let with = |extra: serde_json::Value| {
+            let mut fields = ended.clone();
+            for (key, value) in extra.as_object().expect("fields") {
+                fields[key] = value.clone();
+            }
+            fields
+        };
+        for (fields, says) in [
+            (
+                serde_json::json!({"turn_ended": true, "turn_seq": null}),
+                "`turn_ended` without the `turn_seq`",
+            ),
+            (
+                serde_json::json!({"execution_id": null, "turn_seq": null}),
+                "live without an `execution_id`",
+            ),
+            (
+                serde_json::json!({"live": false, "stops": [stop]}),
+                "belong to a live execution",
+            ),
+            (
+                serde_json::json!({"live": false, "jobs": [job]}),
+                "belong to a live execution",
+            ),
+            (
+                with(serde_json::json!({"turn_seq": 3})),
+                "belong to an execution",
+            ),
+            (
+                with(serde_json::json!({"recovered": 9})),
+                "belong to an execution",
+            ),
+            (
+                serde_json::json!({"model_label": "gemini-pro"}),
+                "an engine besides claude",
+            ),
+            (
+                serde_json::json!({"engine": null, "model_label": "gemini-pro"}),
+                "an engine besides claude",
+            ),
+            (
+                serde_json::json!({"charter": {"inputs": []}}),
+                "only the supervisor's",
+            ),
+            (
+                serde_json::json!({"session_id": "session_supervisor", "charter": null}),
+                "only the supervisor's",
+            ),
+            (
+                serde_json::json!({"observation_event_id": 40}),
+                "one event's",
+            ),
+            (serde_json::json!({"observation_at_ms": 9}), "one event's"),
+            (
+                serde_json::json!({"observation": serde_json::to_value(judged(SemanticState::Working, 0.9)).expect("json")}),
+                "one event's",
+            ),
+        ] {
+            let row = facts_row(&fields);
+            let session = row["session_id"].as_str().expect("session").to_string();
+            let error = super::parse_facts(serde_json::Value::Array(vec![
+                facts_row(&serde_json::json!({})),
+                row,
+            ]))
+            .expect_err("refused");
+            assert!(
+                error.starts_with(&format!("dispatch facts: {session}: ")) && error.contains(says),
+                "{fields}: {error}"
+            );
+        }
     }
 }
