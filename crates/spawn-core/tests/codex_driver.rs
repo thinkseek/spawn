@@ -2,13 +2,15 @@
 
 use serde_json::json;
 use spawn_core::driver::{
-    AgentDriver, Answer, CODEX_DIALOG_RULES, CODEX_ENV_ALLOWLIST, CODEX_HARD_BLOCK_RULES,
-    CODEX_HOME, CodexDriver, Dialog, DriverTraits, EngineHome, EngineLaunch, Guard, LineCursor,
-    SessionBinding, TurnSource, codex_arguments, codex_line, driver, drivers, excerpt_for,
-    read_codex_screen, table_answer,
+    AGY_DIALOG_RULES, AgentDriver, AgyDriver, Answer, CLAUDE_DIALOG_RULES, CODEX_DIALOG_RULES,
+    CODEX_ENV_ALLOWLIST, CODEX_HARD_BLOCK_RULES, CODEX_HOME, ClaudeDriver, CodexDriver,
+    DIALOG_RULES, Dialog, DriverTraits, EngineHome, EngineLaunch, Guard, LineCursor,
+    NativeSessionHook, SessionBinding, TurnSource, codex_arguments, codex_line, driver, drivers,
+    excerpt_for, hard_block_for, parse_cli_version, read_codex_screen, table_answer,
+    version_matches_tested,
 };
 use spawn_core::driver_codex::{
-    CODEX_ID, CODEX_TESTED, CODEX_TITLE, filter_codex_env, is_codex_trust_dialog,
+    CODEX_ID, CODEX_SPEC, CODEX_TESTED, CODEX_TITLE, filter_codex_env, is_codex_trust_dialog,
     is_safe_codex_model, is_safe_codex_session_id,
 };
 use spawn_core::event::{EventKind, ModelProfile};
@@ -165,16 +167,17 @@ fn launch_builds_fresh_and_resume_args_and_strict_env_allowlist() {
 #[test]
 fn transcript_path_session_scan_and_reported_session_validation() {
     let home = codex_home();
+    let codex = driver(CODEX_ID).expect("codex registered");
     assert_eq!(
-        CodexDriver.session_scan_dir(&home).as_deref(),
+        codex.session_scan_dir(&home).as_deref(),
         Some("/home/u/.codex/sessions")
     );
     assert_eq!(
-        CodexDriver.transcript_path(&home, &ws(), "0194b1e2-7c4d-7000-8000-000000000001"),
+        codex.transcript_path(&home, &ws(), "0194b1e2-7c4d-7000-8000-000000000001"),
         "/home/u/.codex/sessions/0194b1e2-7c4d-7000-8000-000000000001.jsonl"
     );
     // Traversal cannot escape `<sessions>/sessions/`.
-    let escaped = CodexDriver.transcript_path(&home, &ws(), "../etc/passwd");
+    let escaped = codex.transcript_path(&home, &ws(), "../etc/passwd");
     assert!(!escaped.contains(".."), "{escaped}");
 
     for bad in ["", "../x", "a/b", "-flag", ".hidden", "word"] {
@@ -182,27 +185,27 @@ fn transcript_path_session_scan_and_reported_session_validation() {
     }
 
     assert_eq!(
-        CodexDriver.reported_session(
+        codex.reported_session(
             r#"{"type":"thread.started","thread_id":"0194b1e2-7c4d-7000-8000-000000000001"}"#
         ),
         Some("0194b1e2-7c4d-7000-8000-000000000001".to_string())
     );
     assert_eq!(
-        CodexDriver.reported_session(r#"{"type":"session_meta","payload":{"id":"thr_0194b1e2"}}"#),
+        codex.reported_session(r#"{"type":"session_meta","payload":{"id":"thr_0194b1e2"}}"#),
         Some("thr_0194b1e2".to_string())
     );
     assert_eq!(
-        CodexDriver
+        codex
             .reported_session("\u{1b}[2mSession id: 0194b1e2-7c4d-7000-8000-000000000001\u{1b}[0m"),
         Some("0194b1e2-7c4d-7000-8000-000000000001".to_string())
     );
     assert_eq!(
-        CodexDriver.reported_session("Resume this session with codex resume thr_0194b1e2,"),
+        codex.reported_session("Resume this session with codex resume thr_0194b1e2,"),
         Some("thr_0194b1e2".to_string())
     );
-    assert_eq!(CodexDriver.reported_session("Session id: none"), None);
+    assert_eq!(codex.reported_session("Session id: none"), None);
     assert_eq!(
-        CodexDriver.reported_session("Session id: ../escape-attempt"),
+        codex.reported_session("Session id: ../escape-attempt"),
         None
     );
 }
@@ -355,7 +358,8 @@ fn screen_classification_and_pii_masking_cover_all_codex_states() {
 \n\
 › \n\
   gpt-5.4 high · 92% context left · ? for shortcuts\n";
-    assert_eq!(CodexDriver.read_screen(ready).state, ScreenState::Ready);
+    let codex = driver(CODEX_ID).expect("codex registered");
+    assert_eq!(codex.read_screen(ready).state, ScreenState::Ready);
 
     let placeholder_ready = "\
 › Ask Codex to do anything\n\
@@ -400,7 +404,7 @@ Do you trust the contents of this directory?\n\
 2. No, quit\n";
     assert!(is_codex_trust_dialog(trust));
     assert_eq!(read_codex_screen(trust).state, ScreenState::Unknown);
-    assert_eq!(CodexDriver.startup_answer(trust), None);
+    assert_eq!(codex.startup_answer(trust), None);
 
     // Unrecognized plain output stays fail-closed Unknown (never Ready).
     assert_eq!(
@@ -424,6 +428,7 @@ checking disk-usage and ok output\n";
 
 #[test]
 fn dialog_hard_block_start_refusal_and_version_checks() {
+    let codex = driver(CODEX_ID).expect("codex registered");
     let dialog = Dialog {
         rule: Some("trust_directory"),
         kind: "trust",
@@ -432,7 +437,7 @@ fn dialog_hard_block_start_refusal_and_version_checks() {
         body: &[],
     };
     assert!(matches!(
-        CodexDriver.dialog_answer(&dialog, &ws()),
+        codex.dialog_answer(&dialog, &ws()),
         Answer::Escalate(_)
     ));
     assert!(matches!(
@@ -451,16 +456,16 @@ fn dialog_hard_block_start_refusal_and_version_checks() {
         Some("login required")
     );
     assert!(
-        CodexDriver
+        codex
             .start_refusal("Error: The model `gpt-99` does not exist or you do not have access")
             .is_some()
     );
     assert!(
-        CodexDriver
+        codex
             .start_refusal("Error: missing OPENAI_API_KEY")
             .is_some()
     );
-    assert_eq!(CodexDriver.start_refusal("Ready."), None);
+    assert_eq!(codex.start_refusal("Ready."), None);
 
     assert_eq!(
         CodexDriver::version("codex-cli 0.171.0\n").as_deref(),
@@ -469,4 +474,150 @@ fn dialog_hard_block_start_refusal_and_version_checks() {
     assert!(CodexDriver::version_tested("0.171.0"));
     assert!(!CodexDriver::version_tested("0.99.0"));
     assert_eq!(CODEX_TESTED, ["0.171"]);
+}
+
+#[test]
+fn three_hook_contract_holds_for_all_registered_drivers() {
+    let exec = ExecutionId::for_command(CommandId(77));
+    for d in drivers() {
+        let spec = d.spec();
+        assert_eq!(d.id(), spec.id);
+        assert_eq!(d.title(), spec.title);
+        assert_eq!(d.traits(), spec.traits);
+        assert_eq!(d.tested_versions(), spec.tested_versions);
+        let hook = d.session_binding();
+        assert_eq!(hook.binding(), spec.traits.session, "{}", d.id());
+        match spec.traits.session {
+            SessionBinding::Assigned => {
+                assert!(matches!(hook, NativeSessionHook::Assigned { .. }));
+                assert!(d.new_session_id(&exec).is_some());
+                assert_eq!(d.reported_session("{}"), None);
+            }
+            SessionBinding::Reported => {
+                assert!(matches!(hook, NativeSessionHook::Reported { .. }));
+                assert_eq!(d.new_session_id(&exec), None);
+            }
+        }
+    }
+
+    assert_eq!(driver(CODEX_ID).unwrap().spec().id, CODEX_SPEC.id);
+    assert_eq!(
+        parse_cli_version("codex-cli v0.171.2\n").as_deref(),
+        Some("0.171.2")
+    );
+    assert!(version_matches_tested("0.171.2", &CODEX_TESTED));
+    assert!(!version_matches_tested("0.172.0", &CODEX_TESTED));
+    assert_eq!(
+        hard_block_for(Some("codex"), "Rate limit reached · codex login", &[]),
+        Some("login required")
+    );
+    assert_eq!(
+        hard_block_for(Some("agy"), "Quota exceeded", &[]),
+        Some("quota reached")
+    );
+
+    // Ensure master DIALOG_RULES table stays a strict superset of each engine's static table.
+    for row in CLAUDE_DIALOG_RULES
+        .iter()
+        .chain(AGY_DIALOG_RULES)
+        .chain(CODEX_DIALOG_RULES)
+    {
+        assert!(
+            DIALOG_RULES.contains(row),
+            "missing row in DIALOG_RULES: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn driver_isolation_contracts_enforced_across_all_three_engines() {
+    let claude = driver("claude").unwrap();
+    let agy = driver("agy").unwrap();
+    let codex = driver("codex").unwrap();
+
+    // 1. Claude enforces Guard::Settings with crossSessionInbound: refuse + managed config deny.
+    assert_eq!(claude.traits().guard, Guard::Settings);
+    let claude_home = EngineHome {
+        program: "/usr/bin/claude".to_string(),
+        sessions: "/srv/claude-config/projects".to_string(),
+        model: None,
+        data_dir: None,
+        isolate_brain: false,
+    };
+    let claude_plan = claude.launch(
+        &claude_home,
+        &EngineLaunch {
+            native: None,
+            resume: false,
+            relay: None,
+            profile: ModelProfile::Default,
+            config_dir: Some("/srv/claude-config"),
+            cwd: Some("/workspaces/w1"),
+            model: None,
+        },
+    );
+    let settings_json: serde_json::Value =
+        serde_json::from_str(&claude_plan.settings).expect("json");
+    assert_eq!(settings_json["crossSessionInbound"], "refuse");
+    let deny = settings_json["permissions"]["deny"]
+        .as_array()
+        .expect("deny");
+    assert!(
+        deny.iter()
+            .any(|v| v == "Read(//srv/claude-config/settings*)")
+    );
+    assert!(deny.iter().any(|v| v == "Bash(*CLAUDE_CONFIG_DIR*)"));
+
+    // 2. Both non-Settings engines require kernel bwrap sandbox isolation.
+    assert_eq!(agy.traits().guard, Guard::Sandbox);
+    assert_eq!(codex.traits().guard, Guard::Sandbox);
+
+    // 3. Codex launch & env filter scrub secrets and sibling engine environment variables.
+    let scrubbed = filter_codex_env(&[
+        ("CODEX_HOME", "/srv/codex-w1"),
+        ("OPENAI_API_KEY", "sk-secret"),
+        ("ANTHROPIC_AUTH_TOKEN", "anth-secret"),
+        ("CLAUDE_CONFIG_DIR", "/home/u/.claude"),
+        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+        ("SPAWN_TEST_DATABASE_URL", "postgres://invalid"),
+        ("SPAWN_AGY_DATA_DIR", "/srv/agy"),
+    ]);
+    assert_eq!(
+        scrubbed,
+        vec![("CODEX_HOME".to_string(), "/srv/codex-w1".to_string())]
+    );
+    assert_eq!(
+        ClaudeDriver
+            .launch(
+                &claude_home,
+                &EngineLaunch {
+                    native: None,
+                    resume: false,
+                    relay: None,
+                    profile: ModelProfile::Default,
+                    config_dir: None,
+                    cwd: None,
+                    model: None,
+                }
+            )
+            .environment,
+        Vec::<(String, String)>::new()
+    );
+    assert_eq!(
+        AgyDriver
+            .launch(
+                &codex_home(),
+                &EngineLaunch {
+                    native: None,
+                    resume: false,
+                    relay: None,
+                    profile: ModelProfile::Default,
+                    config_dir: None,
+                    cwd: Some("/workspaces/w2"),
+                    model: Some("gemini-3.8-flash-low"),
+                }
+            )
+            .environment,
+        Vec::<(String, String)>::new()
+    );
 }

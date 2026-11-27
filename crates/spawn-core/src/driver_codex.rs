@@ -9,16 +9,17 @@ use serde_json::{Value, json};
 
 use crate::command::is_model_label;
 use crate::driver::{
-    AgentDriver, DialogGuard, DialogOutcome, DialogRule, DriverTraits, EngineHome, EngineLaunch,
-    Guard, HardBlockRule, LaunchPlan, LineCursor, LineFacts, RuleMatch, SessionBinding, TurnSource,
-    plain_session_id, sanitize_worker_key,
+    AgentDriver, DialogGuard, DialogOutcome, DialogRule, DriverSpec, DriverTraits, EngineHome,
+    EngineLaunch, Guard, HardBlockRule, LaunchPlan, LineCursor, LineFacts, NativeSessionHook,
+    RuleMatch, ScreenSpec, SessionBinding, StartRefusalRule, TurnSource, parse_cli_version,
+    plain_session_id, sanitize_worker_key, tail_non_empty_lines, version_matches_tested,
 };
 use crate::event::EventKind;
-use crate::id::{ExecutionId, WorkspaceId};
+use crate::id::WorkspaceId;
 use crate::ingest::{Normalized, tool_summary, utc_ms};
 use crate::message::markers;
 use crate::redact::redact;
-use crate::screen::{ScreenReading, ScreenState, TAIL_LINES, drop_agy_account_lines, strip_ansi};
+use crate::screen::{ScreenReading, ScreenState, drop_agy_account_lines, strip_ansi};
 
 /// Wire identifier for the Codex CLI driver.
 pub const CODEX_ID: &str = "codex";
@@ -298,21 +299,61 @@ pub fn codex_arguments(
     args
 }
 
-impl AgentDriver for CodexDriver {
-    fn id(&self) -> &'static str {
-        CODEX_ID
-    }
-
-    fn title(&self) -> &'static str {
-        CODEX_TITLE
-    }
-
-    fn traits(&self) -> DriverTraits {
-        DriverTraits {
-            session: SessionBinding::Reported,
-            turns: TurnSource::Transcript,
-            guard: Guard::Sandbox,
+fn codex_transcript_for(
+    home: &EngineHome,
+    _workspace: &WorkspaceId,
+    _worker_id: Option<&str>,
+    native: &str,
+) -> String {
+    let safe = if is_safe_codex_session_id(native) {
+        native.to_string()
+    } else {
+        let cleaned: String = sanitize_worker_key(native)
+            .chars()
+            .map(|c| if c == '.' { '_' } else { c })
+            .collect();
+        if cleaned.is_empty() {
+            "invalid".to_string()
+        } else {
+            cleaned
         }
+    };
+    let base = home.sessions.trim().trim_end_matches('/');
+    format!("{base}/sessions/{safe}.jsonl")
+}
+
+fn codex_scan_dir_for(home: &EngineHome, _worker_id: Option<&str>) -> Option<String> {
+    let base = home.sessions.trim().trim_end_matches('/');
+    (!base.is_empty()).then(|| format!("{base}/sessions"))
+}
+
+/// Declarative specification for [`CodexDriver`].
+pub const CODEX_SPEC: DriverSpec = DriverSpec {
+    id: CODEX_ID,
+    title: CODEX_TITLE,
+    traits: DriverTraits {
+        session: SessionBinding::Reported,
+        turns: TurnSource::Transcript,
+        guard: Guard::Sandbox,
+    },
+    tested_versions: &CODEX_TESTED,
+    screen: ScreenSpec {
+        read_screen: read_codex_screen,
+        startup_dialog: None,
+        excerpt_mask: Some(mask_codex_pane),
+        start_refusal: StartRefusalRule::TailNeedles {
+            needles: &CODEX_START_REFUSALS,
+            prefix: "codex refused to start",
+            max_chars: MAX_EVIDENCE_CHARS,
+        },
+        dialog_rules: CODEX_DIALOG_RULES,
+        hard_block_rules: CODEX_HARD_BLOCK_RULES,
+    },
+};
+
+impl AgentDriver for CodexDriver {
+    fn spec(&self) -> &'static DriverSpec {
+        &CODEX_SPEC
     }
 
     fn launch(&self, home: &EngineHome, launch: &EngineLaunch<'_>) -> LaunchPlan {
@@ -332,101 +373,28 @@ impl AgentDriver for CodexDriver {
         }
     }
 
-    fn new_session_id(&self, _execution: &ExecutionId) -> Option<String> {
-        None
-    }
-
-    fn transcript_path(&self, home: &EngineHome, _workspace: &WorkspaceId, native: &str) -> String {
-        let safe = if is_safe_codex_session_id(native) {
-            native.to_string()
-        } else {
-            let cleaned: String = sanitize_worker_key(native)
-                .chars()
-                .map(|c| if c == '.' { '_' } else { c })
-                .collect();
-            if cleaned.is_empty() {
-                "invalid".to_string()
-            } else {
-                cleaned
-            }
-        };
-        let base = home.sessions.trim().trim_end_matches('/');
-        format!("{base}/sessions/{safe}.jsonl")
-    }
-
-    fn reported_session(&self, line: &str) -> Option<String> {
-        reported_session_from_line(line)
-    }
-
-    fn session_scan_dir(&self, home: &EngineHome) -> Option<String> {
-        let base = home.sessions.trim().trim_end_matches('/');
-        (!base.is_empty()).then(|| format!("{base}/sessions"))
-    }
-
     fn read_line(&self, line: &str, cursor: &mut LineCursor) -> LineFacts {
         codex_line(line, cursor)
     }
 
-    fn read_screen(&self, pane: &str) -> ScreenReading {
-        read_codex_screen(pane)
-    }
-
-    fn startup_answer(&self, _pane: &str) -> Option<&'static [&'static str]> {
-        None
-    }
-
-    fn excerpt_source(&self, pane: &str) -> String {
-        mask_codex_pane(pane)
-    }
-
-    fn start_refusal(&self, pane: &str) -> Option<String> {
-        let masked = mask_codex_pane(pane);
-        let lines = tail_non_empty_lines(&masked);
-        lines
-            .into_iter()
-            .find(|line| {
-                let lower = line.to_lowercase();
-                CODEX_START_REFUSALS
-                    .iter()
-                    .any(|needle| lower.contains(needle))
-            })
-            .map(|line| {
-                let trimmed: String = line.trim().chars().take(MAX_EVIDENCE_CHARS).collect();
-                format!("codex refused to start: {trimmed}")
-            })
-    }
-
-    fn dialog_rules(&self) -> &'static [DialogRule] {
-        CODEX_DIALOG_RULES
-    }
-
-    fn hard_block_rules(&self) -> &'static [HardBlockRule] {
-        CODEX_HARD_BLOCK_RULES
+    fn session_binding(&self) -> NativeSessionHook {
+        NativeSessionHook::Reported {
+            transcript_path: codex_transcript_for,
+            reported_session: reported_session_from_line,
+            scan_dir: codex_scan_dir_for,
+        }
     }
 }
 
 impl CodexDriver {
     /// Parse a version from `codex --version` output (`codex-cli 0.171.0`).
     pub fn version(answer: &str) -> Option<String> {
-        answer
-            .split_whitespace()
-            .map(|word| word.trim_start_matches('v'))
-            .find(|word| {
-                word.contains('.')
-                    && word
-                        .split('.')
-                        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-            })
-            .map(str::to_string)
+        parse_cli_version(answer)
     }
 
     /// Whether `version`'s `major.minor` matches [`CODEX_TESTED`].
     pub fn version_tested(version: &str) -> bool {
-        let mut parts = version.split('.');
-        let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
-            return false;
-        };
-        CODEX_TESTED.contains(&format!("{major}.{minor}").as_str())
+        version_matches_tested(version, &CODEX_TESTED)
     }
 }
 
@@ -1080,23 +1048,6 @@ fn has_key_assignment(lower: &str, needle: &str) -> bool {
         rest = &rest[at + needle.len()..];
     }
     false
-}
-
-fn tail_non_empty_lines(pane: &str) -> Vec<String> {
-    let all: Vec<String> = pane
-        .lines()
-        .map(|line| strip_ansi(line).trim_end().to_string())
-        .collect();
-    let end = all
-        .iter()
-        .rposition(|line| !line.trim().is_empty())
-        .map_or(0, |at| at + 1);
-    let start = end.saturating_sub(TAIL_LINES);
-    all[start..end]
-        .iter()
-        .filter(|line| !line.trim().is_empty())
-        .cloned()
-        .collect()
 }
 
 /// Whether the pane shows Codex's interactive directory trust prompt with no prompt below.

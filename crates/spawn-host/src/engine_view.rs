@@ -54,13 +54,13 @@
 //!   the whole `$XDG_RUNTIME_DIR`, the whole `/tmp` (the fleet's tmux
 //!   sockets), the loop's shared `TMPDIR`, the Herdr session directory (`$XDG_CONFIG_HOME/herdr`, by
 //!   default `~/.config/herdr`, which holds its socket: a client in the view
-//!   could otherwise ask Herdr for a pane outside it), `~/.claude`, every
-//!   other engine's home (`~/.gemini` but for the engine's own home below
-//!   it, `~/.config/antigravity`, `~/.codex`, `~/.hermes`), `~/.ssh`,
-//!   `~/.gnupg`, `~/.config/gh`, `~/.aws`, `~/.config/anthropic`,
-//!   `~/.config/spawn`, `~/.config/cloudflare` and
-//!   `~/.config/observe3-private` (each `~/.config/<x>` also below
-//!   `$XDG_CONFIG_HOME` when that is set elsewhere);
+//!   could otherwise ask Herdr for a pane outside it), `~/.cc-socks` (and
+//!   `$XDG_STATE_HOME/cc-socks` plus per-sandbox `<claude_home>/cc-socks`),
+//!   `~/.claude`, every other engine's home (`~/.gemini` but for the engine's
+//!   own home below it, `~/.config/antigravity`, `~/.codex`, `~/.hermes`),
+//!   `~/.ssh`, `~/.gnupg`, `~/.config/gh`, `~/.aws`, `~/.config/anthropic`,
+//!   `~/.config/spawn`, `~/.config/cloudflare` and `~/.config/observe3-private`
+//!   (each `~/.config/<x>` also below `$XDG_CONFIG_HOME` when set elsewhere);
 //! - regular files, each read-only bound over by a private empty 0444 file
 //!   (never `/dev/null`, whose bind answers `EACCES` instead of reading
 //!   empty), kept in a 0700 directory inside the masked runtime directory
@@ -107,6 +107,7 @@ const ENGINE_HOMES: &[&str] = &[".gemini", ".config/antigravity", ".codex", ".he
 const HOME_DIRECTORIES: &[&str] = &[
     ".claude",
     ".local/state/spawn/claude-config",
+    ".cc-socks",
     ".gemini",
     ".config/antigravity",
     ".codex",
@@ -222,6 +223,11 @@ pub struct ViewConfig {
     pub claude_program: Option<PathBuf>,
     /// Optional off-home data root for `claude` (`SPAWN_CLAUDE_DATA_DIR`).
     pub claude_data_dir: Option<PathBuf>,
+    /// Executable path of `codex` (`SPAWN_CODEX_PROGRAM` else `codex` on `PATH`),
+    /// RO-bound in whitelist mode if located under `$HOME`.
+    pub codex_program: Option<PathBuf>,
+    /// Optional off-home data root for `codex` (`SPAWN_CODEX_DATA_DIR`).
+    pub codex_data_dir: Option<PathBuf>,
 }
 
 fn trim_trailing_slash(raw: &str) -> &str {
@@ -231,6 +237,25 @@ fn trim_trailing_slash(raw: &str) -> &str {
     } else {
         trimmed
     }
+}
+
+fn clean_dir_env(lookup: &dyn Fn(&str) -> Option<String>, var: &str) -> Option<PathBuf> {
+    lookup(var)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| PathBuf::from(trim_trailing_slash(&value)))
+}
+
+fn resolve_program_env(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    var: &str,
+    default_cmd: &str,
+) -> Option<PathBuf> {
+    let cmd = lookup(var)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_cmd.to_string());
+    find_program_entry(&cmd, lookup("PATH").as_deref())
 }
 
 /// Parse `SPAWN_ENGINE_VIEW_WRITABLE` entries separated by `,` (or legacy `:`
@@ -306,10 +331,7 @@ impl ViewConfig {
         let extra_mounts = lookup("SPAWN_ENGINE_VIEW_WRITABLE")
             .map(|raw| parse_extra_mounts(&raw))
             .unwrap_or_default();
-        let agy_data_dir = lookup("SPAWN_AGY_DATA_DIR")
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(|value| PathBuf::from(trim_trailing_slash(&value)));
+        let agy_data_dir = clean_dir_env(lookup, "SPAWN_AGY_DATA_DIR");
         let isolate_workers = agy_data_dir.is_some()
             && lookup("SPAWN_AGY_ISOLATE_WORKERS")
                 .as_deref()
@@ -324,11 +346,7 @@ impl ViewConfig {
                     .as_deref(),
                 Some("1" | "true" | "yes" | "on")
             );
-        let agy_cmd = lookup("SPAWN_AGY_PROGRAM")
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "agy".to_string());
-        let agy_program = find_program_entry(&agy_cmd, lookup("PATH").as_deref());
+        let agy_program = resolve_program_env(lookup, "SPAWN_AGY_PROGRAM", "agy");
         let inherit_host = match lookup("SPAWN_SANDBOX_INHERIT_HOST")
             .as_deref()
             .map(str::trim)
@@ -339,15 +357,10 @@ impl ViewConfig {
         let inherit_host_paths = lookup("SPAWN_SANDBOX_INHERIT_HOST_PATHS")
             .map(|raw| parse_inherit_host_paths(&raw))
             .unwrap_or_default();
-        let claude_cmd = lookup("SPAWN_CLAUDE_PROGRAM")
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "claude".to_string());
-        let claude_program = find_program_entry(&claude_cmd, lookup("PATH").as_deref());
-        let claude_data_dir = lookup("SPAWN_CLAUDE_DATA_DIR")
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(|value| PathBuf::from(trim_trailing_slash(&value)));
+        let claude_program = resolve_program_env(lookup, "SPAWN_CLAUDE_PROGRAM", "claude");
+        let claude_data_dir = clean_dir_env(lookup, "SPAWN_CLAUDE_DATA_DIR");
+        let codex_program = resolve_program_env(lookup, "SPAWN_CODEX_PROGRAM", "codex");
+        let codex_data_dir = clean_dir_env(lookup, "SPAWN_CODEX_DATA_DIR");
         Self {
             xdg_config_home: lookup("XDG_CONFIG_HOME")
                 .filter(|dir| dir.starts_with('/'))
@@ -375,6 +388,8 @@ impl ViewConfig {
             inherit_host_paths,
             claude_program,
             claude_data_dir,
+            codex_program,
+            codex_data_dir,
         }
     }
 
@@ -404,7 +419,7 @@ impl ViewConfig {
             }
         }
         if let Some(state) = &self.xdg_state_home {
-            for rel in ["herdr-core", "spawn/claude-config"] {
+            for rel in ["herdr-core", "spawn/claude-config", "cc-socks"] {
                 let target = state.join(rel);
                 if !targets.contains(&target) {
                     targets.push(target);
@@ -645,8 +660,8 @@ impl BwrapView {
     }
 
     /// Validate [`ViewConfig`] invariants (`canonical_workspace`,
-    /// `extra_mounts`, `agy_data_dir`, `claude_data_dir`, `inherit_host_paths`,
-    /// and whitelist `$HOME`).
+    /// `extra_mounts`, `agy_data_dir`, `claude_data_dir`, `codex_data_dir`,
+    /// `inherit_host_paths`, and whitelist `$HOME`).
     fn validate_config(&self) -> Result<(), String> {
         validate_config_for(&self.config)
     }
@@ -682,14 +697,6 @@ impl BwrapView {
                 Err(why) => skipped.push((self.config.home.clone(), why)),
             }
         }
-        let omit_claude_dir = engine == "claude"
-            && self.config.home_isolation == HomeIsolation::Blacklist
-            && self.config.claude_data_dir.is_none();
-        let claude_homes = if omit_claude_dir {
-            self.canonical_claude_homes()
-        } else {
-            Vec::new()
-        };
         let targets = self
             .config
             .directory_targets()
@@ -706,9 +713,7 @@ impl BwrapView {
                     skipped.push((target, "holds the user's home".to_string()));
                 }
                 Ok(Resolved::Directory(path)) => {
-                    let skip_dir = directories.contains(&path)
-                        || (omit_claude_dir && claude_homes.iter().any(|c| c == &path));
-                    if !skip_dir {
+                    if !directories.contains(&path) {
                         directories.push(path);
                     }
                 }
@@ -773,19 +778,21 @@ impl BwrapView {
         }
     }
 
-    fn omit_codex_self_mask(
+    fn omit_self_engine_mask(
         &self,
         engine: &str,
         engine_home: &Path,
         directories: &mut Vec<PathBuf>,
     ) {
-        if engine == "codex"
-            && self.config.home_isolation == HomeIsolation::Blacklist
-            && self
-                .canonical_codex_homes()
-                .iter()
-                .any(|dir| dir == engine_home)
-        {
+        if self.config.home_isolation != HomeIsolation::Blacklist {
+            return;
+        }
+        let allowed = match engine {
+            "claude" if self.config.claude_data_dir.is_none() => self.canonical_claude_homes(),
+            "codex" if self.config.codex_data_dir.is_none() => self.canonical_codex_homes(),
+            _ => return,
+        };
+        if allowed.iter().any(|dir| dir == engine_home) {
             directories.retain(|dir| dir != engine_home);
         }
     }
@@ -820,6 +827,7 @@ impl BwrapView {
         paths.push(self.config.home.join(".local/state/herdr-core"));
         if let Some(state) = &self.config.xdg_state_home {
             paths.push(state.join("herdr-core"));
+            paths.push(state.join("cc-socks"));
             if engine != "claude" {
                 paths.push(state.join("spawn/claude-config"));
             }
@@ -1050,6 +1058,24 @@ impl BwrapView {
         })
     }
 
+    fn collect_ro_file_overlays(
+        host_engine_home: &Path,
+        worker_home: &Path,
+        rels: &[&'static str],
+    ) -> Result<Vec<(PathBuf, &'static str, bool)>, String> {
+        let mut ro_overlays = Vec::new();
+        for &rel in rels {
+            let src = host_engine_home.join(rel);
+            if std::fs::metadata(&src).is_ok_and(|meta| meta.is_file()) {
+                let canonical = std::fs::canonicalize(&src)
+                    .map_err(|error| format!("{}: {error}", src.display()))?;
+                ensure_empty_mount_file(&worker_home.join(rel))?;
+                ro_overlays.push((canonical, rel, false));
+            }
+        }
+        Ok(ro_overlays)
+    }
+
     /// Prepare off-home per-worker directories for Claude Code (`SPAWN_CLAUDE_DATA_DIR`),
     /// sharing only `<host_engine_home>/projects` writable for transcript ingestion
     /// and RO-binding non-mutable settings/plugins/credentials from `host_engine_home`.
@@ -1077,6 +1103,8 @@ impl BwrapView {
             "backups",
             "sessions",
             "projects",
+            "cc-socks",
+            "run",
         ] {
             ensure_dir_0700(&worker_home.join(subdir), "claude worker subdir")?;
         }
@@ -1090,16 +1118,11 @@ impl BwrapView {
         )?;
         ensure_empty_mount_file(&worker_home.join(".claude.json"))?;
 
-        let mut ro_overlays = Vec::new();
-        for rel in ["settings.json", "settings.local.json", ".credentials.json"] {
-            let src = host_engine_home.join(rel);
-            if std::fs::metadata(&src).is_ok_and(|meta| meta.is_file()) {
-                let canonical = std::fs::canonicalize(&src)
-                    .map_err(|error| format!("{}: {error}", src.display()))?;
-                ensure_empty_mount_file(&worker_home.join(rel))?;
-                ro_overlays.push((canonical, rel, false));
-            }
-        }
+        let mut ro_overlays = Self::collect_ro_file_overlays(
+            host_engine_home,
+            &worker_home,
+            &["settings.json", "settings.local.json", ".credentials.json"],
+        )?;
         let plugins = host_engine_home.join("plugins");
         if std::fs::metadata(&plugins).is_ok_and(|meta| meta.is_dir()) {
             let canonical = std::fs::canonicalize(&plugins)
@@ -1117,6 +1140,41 @@ impl BwrapView {
         })
     }
 
+    /// Prepare off-home per-worker directories for Codex (`SPAWN_CODEX_DATA_DIR`),
+    /// sharing `<host_engine_home>/sessions` writable for rollout transcript ingestion
+    /// and RO-binding `config.toml`/credentials from `host_engine_home`.
+    fn prepare_codex_data(
+        root: &Path,
+        launch: &ViewedLaunch<'_>,
+        host_engine_home: &Path,
+        ctx: &BindContext<'_>,
+        home: &Path,
+    ) -> Result<CodexDataPlan, String> {
+        let (_canonical_root, _worker_base, worker_home, worker_tmp) =
+            prepare_worker_dirs(root, "SPAWN_CODEX_DATA_DIR", launch, ctx, home)?;
+        for subdir in ["sessions", "log", "cache", "run"] {
+            ensure_dir_0700(&worker_home.join(subdir), "codex worker subdir")?;
+        }
+        let host_sessions =
+            ensure_dir_0700(&host_engine_home.join("sessions"), "codex host sessions")?;
+        let ro_overlays = Self::collect_ro_file_overlays(
+            host_engine_home,
+            &worker_home,
+            &[
+                "config.toml",
+                "auth.json",
+                "credentials.json",
+                ".credentials.json",
+            ],
+        )?;
+        Ok(CodexDataPlan {
+            worker_home,
+            worker_tmp,
+            host_sessions,
+            ro_overlays,
+        })
+    }
+
     fn resolve_engine_ro_binaries(
         &self,
         launch: &ViewedLaunch<'_>,
@@ -1130,6 +1188,7 @@ impl BwrapView {
         let prog = match launch.engine {
             "agy" => self.config.agy_program.as_deref(),
             "claude" => self.config.claude_program.as_deref(),
+            "codex" => self.config.codex_program.as_deref(),
             _ => None,
         };
         let Some(prog) = prog else {
@@ -1541,6 +1600,8 @@ impl BwrapView {
             "--bind".to_string(),
             path_word(&plan.host_projects),
             path_word(&engine_home.join("projects")),
+            "--tmpfs".to_string(),
+            path_word(&engine_home.join("cc-socks")),
             "--bind".to_string(),
             path_word(&plan.claude_json),
             path_word(&home.join(".claude.json")),
@@ -1554,6 +1615,71 @@ impl BwrapView {
             "CLAUDE_CONFIG_DIR".to_string(),
             path_word(engine_home),
         ]);
+    }
+
+    fn append_codex_binds<'a>(
+        words: &mut Vec<String>,
+        bound_dests: &mut Vec<&'a Path>,
+        engine_home: &'a Path,
+        tmpdir: &Path,
+        plan: &CodexDataPlan,
+    ) {
+        bound_dests.push(engine_home);
+        words.extend([
+            "--bind".to_string(),
+            path_word(&plan.worker_home),
+            path_word(engine_home),
+        ]);
+        for (src, rel, _is_dir) in &plan.ro_overlays {
+            words.extend([
+                "--ro-bind".to_string(),
+                path_word(src),
+                path_word(&engine_home.join(rel)),
+            ]);
+        }
+        words.extend([
+            "--bind".to_string(),
+            path_word(&plan.host_sessions),
+            path_word(&engine_home.join("sessions")),
+            "--bind".to_string(),
+            path_word(tmpdir),
+            path_word(tmpdir),
+            "--setenv".to_string(),
+            "CODEX_HOME".to_string(),
+            path_word(engine_home),
+        ]);
+    }
+
+    fn append_engine_isolation_env(
+        words: &mut Vec<String>,
+        engine: &str,
+        binds: &PlannedBinds<'_>,
+    ) {
+        words.extend([
+            "--setenv".to_string(),
+            "TMPDIR".to_string(),
+            path_word(binds.tmpdir),
+            "--setenv".to_string(),
+            "XDG_RUNTIME_DIR".to_string(),
+            path_word(binds.worker_runtime),
+        ]);
+        match engine {
+            "claude" => {
+                words.extend(["--unsetenv".to_string(), "CODEX_HOME".to_string()]);
+            }
+            "agy" => {
+                words.extend([
+                    "--unsetenv".to_string(),
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "--unsetenv".to_string(),
+                    "CODEX_HOME".to_string(),
+                ]);
+            }
+            "codex" => {
+                words.extend(["--unsetenv".to_string(), "CLAUDE_CONFIG_DIR".to_string()]);
+            }
+            _ => {}
+        }
     }
 
     fn append_binds_and_env(
@@ -1590,6 +1716,14 @@ impl BwrapView {
                 binds.tmpdir,
                 plan,
             );
+        } else if let Some(plan) = binds.codex_plan {
+            Self::append_codex_binds(
+                words,
+                &mut bound_dests,
+                binds.engine_home,
+                binds.tmpdir,
+                plan,
+            );
         } else {
             Self::append_default_engine_binds(
                 words,
@@ -1598,9 +1732,21 @@ impl BwrapView {
                 binds.tmpdir,
             );
             if launch.engine == "claude" {
+                if binds.mask_claude_cc_socks {
+                    words.extend([
+                        "--tmpfs".to_string(),
+                        path_word(&binds.engine_home.join("cc-socks")),
+                    ]);
+                }
                 words.extend([
                     "--setenv".to_string(),
                     "CLAUDE_CONFIG_DIR".to_string(),
+                    path_word(binds.engine_home),
+                ]);
+            } else if launch.engine == "codex" {
+                words.extend([
+                    "--setenv".to_string(),
+                    "CODEX_HOME".to_string(),
                     path_word(binds.engine_home),
                 ]);
             }
@@ -1614,11 +1760,7 @@ impl BwrapView {
             words.extend(["--ro-bind".to_string(), path_word(src), path_word(dest)]);
         }
 
-        words.extend([
-            "--setenv".to_string(),
-            "TMPDIR".to_string(),
-            path_word(binds.tmpdir),
-        ]);
+        Self::append_engine_isolation_env(words, launch.engine, binds);
         self.append_canonical_env(words, launch, binds);
         words.extend([
             "--chdir".to_string(),
@@ -1655,6 +1797,58 @@ impl BwrapView {
         }
     }
 
+    fn resolve_worker_runtime(
+        &self,
+        directories: &[PathBuf],
+        engine_home: &Path,
+        workspace: &Path,
+        tmpdir: &Path,
+    ) -> Result<PathBuf, String> {
+        if let Ok(canon) = std::fs::canonicalize(&self.config.runtime_dir)
+            && directories.contains(&canon)
+            && canon != engine_home
+            && canon != workspace
+        {
+            return Ok(canon);
+        }
+        ensure_dir_0700(&tmpdir.join("run"), "worker runtime dir")
+    }
+}
+
+#[derive(Default)]
+struct DataPlans {
+    agy: Option<AgyDataPlan>,
+    claude: Option<ClaudeDataPlan>,
+    codex: Option<CodexDataPlan>,
+}
+
+impl BwrapView {
+    fn prepare_data_plans(
+        &self,
+        launch: &ViewedLaunch<'_>,
+        engine_home: &Path,
+        ctx: &BindContext<'_>,
+        home: &Path,
+    ) -> Result<DataPlans, String> {
+        Ok(DataPlans {
+            agy: (launch.engine == "agy")
+                .then_some(self.config.agy_data_dir.as_deref())
+                .flatten()
+                .map(|root| self.prepare_agy_data(root, launch, engine_home, ctx, home))
+                .transpose()?,
+            claude: (launch.engine == "claude")
+                .then_some(self.config.claude_data_dir.as_deref())
+                .flatten()
+                .map(|root| Self::prepare_claude_data(root, launch, engine_home, ctx, home))
+                .transpose()?,
+            codex: (launch.engine == "codex")
+                .then_some(self.config.codex_data_dir.as_deref())
+                .flatten()
+                .map(|root| Self::prepare_codex_data(root, launch, engine_home, ctx, home))
+                .transpose()?,
+        })
+    }
+
     /// The view of one launch: every target resolved now, the masks first
     /// and the writable binds last. Refused (an error) when the workspace
     /// or the engine's home cannot be bound without uncovering a mask, or
@@ -1680,13 +1874,9 @@ impl BwrapView {
         };
         let (mut directories, files) = prune_nested(&all_directories, &all_files);
 
-        let agy_data_root = (launch.engine == "agy")
-            .then_some(self.config.agy_data_dir.as_deref())
-            .flatten();
-        let claude_data_root = (launch.engine == "claude")
-            .then_some(self.config.claude_data_dir.as_deref())
-            .flatten();
-        let isolate_agy_workers = agy_data_root.is_some() && self.config.isolate_workers;
+        let isolate_agy_workers = launch.engine == "agy"
+            && self.config.agy_data_dir.is_some()
+            && self.config.isolate_workers;
         let engine_home = self.resolve_engine_home_for_plan(
             launch.engine,
             Path::new(launch.engine_home),
@@ -1694,30 +1884,24 @@ impl BwrapView {
             &directories,
             isolate_agy_workers,
         )?;
-        self.omit_codex_self_mask(launch.engine, &engine_home, &mut directories);
+        self.omit_self_engine_mask(launch.engine, &engine_home, &mut directories);
 
-        let agy_plan = match agy_data_root {
-            Some(root) => Some(self.prepare_agy_data(root, launch, &engine_home, &ctx, &home)?),
-            None => None,
+        let plans = self.prepare_data_plans(launch, &engine_home, &ctx, &home)?;
+        let mask_claude_cc_socks = if launch.engine == "claude" && plans.claude.is_none() {
+            ensure_dir_0700(&engine_home.join("cc-socks"), "claude cc-socks")?;
+            true
+        } else {
+            false
         };
-        let claude_plan = match claude_data_root {
-            Some(root) => Some(Self::prepare_claude_data(
-                root,
-                launch,
-                &engine_home,
-                &ctx,
-                &home,
-            )?),
-            None => None,
-        };
-        let tmpdir = match (&agy_plan, &claude_plan) {
-            (Some(plan), _) if self.config.isolate_workers => plan.worker_tmp.clone(),
-            (_, Some(plan)) => plan.worker_tmp.clone(),
+        let tmpdir = match (&plans.agy, &plans.claude, &plans.codex) {
+            (Some(plan), _, _) if self.config.isolate_workers => plan.worker_tmp.clone(),
+            (_, Some(plan), _) => plan.worker_tmp.clone(),
+            (_, _, Some(plan)) => plan.worker_tmp.clone(),
             _ => engine_tmpdir(&engine_home)?,
         };
+        let worker_runtime =
+            self.resolve_worker_runtime(&directories, &engine_home, &workspace, &tmpdir)?;
         let extra_binds = self.resolve_extra_mounts(&ctx, &home, &engine_home)?;
-        let raw_engine_ro_binaries =
-            self.resolve_engine_ro_binaries(launch, &home, &engine_home, &ctx);
         let host_inherit_binds = self.resolve_host_inherit_ro_binds(
             launch.engine,
             &ctx,
@@ -1725,7 +1909,8 @@ impl BwrapView {
             &engine_home,
             &mut skipped,
         )?;
-        let engine_ro_binaries: Vec<(PathBuf, PathBuf)> = raw_engine_ro_binaries
+        let engine_ro_binaries: Vec<(PathBuf, PathBuf)> = self
+            .resolve_engine_ro_binaries(launch, &home, &engine_home, &ctx)
             .into_iter()
             .filter(|(_, dest)| {
                 !host_inherit_binds
@@ -1747,8 +1932,11 @@ impl BwrapView {
                 workspace_dest,
                 engine_home: &engine_home,
                 tmpdir: &tmpdir,
-                agy_plan: agy_plan.as_ref(),
-                claude_plan: claude_plan.as_ref(),
+                worker_runtime: &worker_runtime,
+                agy_plan: plans.agy.as_ref(),
+                claude_plan: plans.claude.as_ref(),
+                codex_plan: plans.codex.as_ref(),
+                mask_claude_cc_socks,
                 extra_binds: &extra_binds,
                 engine_ro_binaries: &engine_ro_binaries,
                 host_inherit_binds: &host_inherit_binds,
@@ -1790,8 +1978,11 @@ struct PlannedBinds<'a> {
     workspace_dest: &'a Path,
     engine_home: &'a Path,
     tmpdir: &'a Path,
+    worker_runtime: &'a Path,
     agy_plan: Option<&'a AgyDataPlan>,
     claude_plan: Option<&'a ClaudeDataPlan>,
+    codex_plan: Option<&'a CodexDataPlan>,
+    mask_claude_cc_socks: bool,
     extra_binds: &'a [(PathBuf, bool)],
     engine_ro_binaries: &'a [(PathBuf, PathBuf)],
     host_inherit_binds: &'a [(PathBuf, PathBuf)],
@@ -1824,6 +2015,13 @@ struct ClaudeDataPlan {
     worker_tmp: PathBuf,
     host_projects: PathBuf,
     claude_json: PathBuf,
+    ro_overlays: Vec<(PathBuf, &'static str, bool)>,
+}
+
+struct CodexDataPlan {
+    worker_home: PathBuf,
+    worker_tmp: PathBuf,
+    host_sessions: PathBuf,
     ro_overlays: Vec<(PathBuf, &'static str, bool)>,
 }
 
@@ -2106,24 +2304,49 @@ impl EngineView for ContainerView {
                 .then_some(self.config.agy_data_dir.as_deref())
                 .flatten(),
             "claude" => self.config.claude_data_dir.as_deref(),
+            "codex" => self.config.codex_data_dir.as_deref(),
             _ => None,
         };
-        let tmpdir = match data_root {
-            Some(root) => {
-                let canonical_root = ensure_dir_0700(root, "engine data dir")?;
-                let worker_key = worker_key_for(launch, &workspace);
-                let workers_dir = ensure_dir_0700(&canonical_root.join("workers"), "workers dir")?;
-                let worker_base = ensure_dir_0700(&workers_dir.join(&worker_key), "worker dir")?;
-                ensure_dir_0700(&worker_base.join("tmp"), "worker tmp")?
-            }
-            None => engine_tmpdir(&engine_home)?,
+        let worker_key = worker_key_for(launch, &workspace);
+        let (tmpdir, runtime_dir) = if let Some(root) = data_root {
+            let canonical_root = ensure_dir_0700(root, "engine data dir")?;
+            let workers_dir = ensure_dir_0700(&canonical_root.join("workers"), "workers dir")?;
+            let worker_base = ensure_dir_0700(&workers_dir.join(&worker_key), "worker dir")?;
+            (
+                ensure_dir_0700(&worker_base.join("tmp"), "worker tmp")?,
+                ensure_dir_0700(&worker_base.join("run"), "worker runtime dir")?,
+            )
+        } else {
+            let runtime_root =
+                ensure_dir_0700(&engine_home.join(".spawn-run"), "engine runtime root")?;
+            (
+                engine_tmpdir(&engine_home)?,
+                ensure_dir_0700(&runtime_root.join(&worker_key), "worker runtime dir")?,
+            )
         };
+        let unset_stmt = match launch.engine {
+            "claude" => "unset CODEX_HOME;",
+            "agy" => "unset CLAUDE_CONFIG_DIR CODEX_HOME;",
+            "codex" => "unset CLAUDE_CONFIG_DIR;",
+            _ => "",
+        };
+        let extra_set = match launch.engine {
+            "claude" => "CLAUDE_CONFIG_DIR=\"$3\"; export CLAUDE_CONFIG_DIR;",
+            "codex" => "CODEX_HOME=\"$3\"; export CODEX_HOME;",
+            _ => "",
+        };
+        let script = format!(
+            "TMPDIR=\"$1\"; XDG_RUNTIME_DIR=\"$2\"; export TMPDIR XDG_RUNTIME_DIR; \
+             {unset_stmt} {extra_set} shift 4; exec \"$@\""
+        );
         Ok(vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            "TMPDIR=\"$1\"; export TMPDIR; shift 2; exec \"$@\"".to_string(),
+            script,
             "spawn-container-view".to_string(),
             path_word(&tmpdir),
+            path_word(&runtime_dir),
+            path_word(&engine_home),
             "--".to_string(),
         ])
     }
@@ -2206,23 +2429,14 @@ fn validate_config_for(config: &ViewConfig) -> Result<(), String> {
             }
         }
     }
-    if let Some(root) = &config.agy_data_dir {
-        validate_managed_root(
-            root,
-            "SPAWN_AGY_DATA_DIR",
-            config,
-            &private_norm,
-            &home_norm,
-        )?;
-    }
-    if let Some(root) = &config.claude_data_dir {
-        validate_managed_root(
-            root,
-            "SPAWN_CLAUDE_DATA_DIR",
-            config,
-            &private_norm,
-            &home_norm,
-        )?;
+    for (root, label) in [
+        (&config.agy_data_dir, "SPAWN_AGY_DATA_DIR"),
+        (&config.claude_data_dir, "SPAWN_CLAUDE_DATA_DIR"),
+        (&config.codex_data_dir, "SPAWN_CODEX_DATA_DIR"),
+    ] {
+        if let Some(root) = root {
+            validate_managed_root(root, label, config, &private_norm, &home_norm)?;
+        }
     }
     for mount in &config.extra_mounts {
         validate_managed_root(
@@ -2406,6 +2620,7 @@ fn is_secret_candidate(path: &Path) -> bool {
                 | ".aws"
                 | ".kube"
                 | ".docker"
+                | ".codex"
                 | ".git-credentials"
                 | ".pgpass"
                 | ".netrc"
@@ -2429,6 +2644,7 @@ fn is_secret_candidate(path: &Path) -> bool {
         || matches!(
             lower.as_str(),
             "env.sh"
+                | "auth.json"
                 | "credentials"
                 | "credentials.toml"
                 | "credentials.json"
@@ -2709,6 +2925,8 @@ mod tests {
             inherit_host_paths: Vec::new(),
             claude_program: None,
             claude_data_dir: None,
+            codex_program: None,
+            codex_data_dir: None,
         };
         let view = BwrapView {
             program: PathBuf::from("/usr/bin/bwrap"),
@@ -3430,5 +3648,105 @@ mod tests {
                 plan.masks
             );
         }
+    }
+
+    #[test]
+    fn codex_data_dir_program_and_secret_candidates_are_configured_and_validated() {
+        let scratch = crate::Scratch::new("spawn-view-codex-cfg");
+        let bin_dir = scratch.join("bin");
+        let codex_bin = bin_dir.join("codex-bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        std::fs::write(&codex_bin, "#!/bin/sh\nexit 0\n").expect("write bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&codex_bin, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let cfg = ViewConfig::from_env(&|key| match key {
+            "HOME" => Some("/home/u".to_string()),
+            "SPAWN_CODEX_PROGRAM" => Some(codex_bin.display().to_string()),
+            "SPAWN_CODEX_DATA_DIR" => Some("/data01/codex/".to_string()),
+            _ => None,
+        });
+        assert_eq!(cfg.codex_program.as_deref(), Some(codex_bin.as_path()));
+        assert_eq!(cfg.codex_data_dir, Some(PathBuf::from("/data01/codex")));
+        assert!(super::is_secret_candidate(Path::new(
+            "/home/u/.codex/auth.json"
+        )));
+        assert!(super::is_secret_candidate(Path::new("/opt/tmp/auth.json")));
+
+        let mut bad_rel = cfg.clone();
+        bad_rel.codex_data_dir = Some(PathBuf::from("relative/codex"));
+        assert!(super::validate_config_for(&bad_rel).is_err());
+
+        let mut bad_whitelist = cfg;
+        bad_whitelist.home_isolation = super::HomeIsolation::Whitelist;
+        bad_whitelist.codex_data_dir = Some(PathBuf::from("/home/u/codex-data"));
+        let err = super::validate_config_for(&bad_whitelist).expect_err("whitelist overlap");
+        assert!(err.contains("SPAWN_CODEX_DATA_DIR"), "{err}");
+    }
+
+    #[test]
+    fn managed_claude_masks_host_claude_cc_socks_and_scrubs_cross_engine_env() {
+        let scratch = crate::Scratch::new("spawn-view-42-unit");
+        let (mut view, workspace, agy_home) = view_in(&scratch);
+        let host_claude = view.config.home.join(".claude");
+        let managed = view.config.home.join(".local/state/spawn/claude-config");
+        let cc_socks = view.config.home.join(".cc-socks");
+        let codex_home = view.config.home.join(".codex");
+        for dir in [&host_claude, &managed, &cc_socks, &codex_home] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        view.config.host_directories = Vec::new();
+        let ws = workspace.display().to_string();
+        let plan_for = |engine: &str, engine_home: &Path, worker_id: &str| {
+            view.plan(&ViewedLaunch {
+                engine,
+                workspace: &ws,
+                engine_home: &engine_home.display().to_string(),
+                worker_id: Some(worker_id),
+                exit_file: None,
+            })
+            .expect(engine)
+        };
+        let has_pair =
+            |plan: &super::Plan, a: &str, b: &str| plan.words.windows(2).any(|w| w == [a, b]);
+        let canon = |p: &Path| std::fs::canonicalize(p).expect("canon");
+
+        let claude_plan = plan_for("claude", &managed, "w-claude");
+        assert!(
+            claude_plan
+                .masks
+                .contains(&super::Mask::Directory(canon(&host_claude)))
+        );
+        assert!(
+            claude_plan
+                .masks
+                .contains(&super::Mask::Directory(canon(&cc_socks)))
+        );
+        let managed_cc_socks = canon(&managed).join("cc-socks").display().to_string();
+        assert!(has_pair(&claude_plan, "--tmpfs", managed_cc_socks.as_str()));
+        assert!(has_pair(&claude_plan, "--unsetenv", "CODEX_HOME"));
+        assert!(
+            claude_plan
+                .words
+                .windows(3)
+                .any(|w| w[0] == "--setenv" && w[1] == "XDG_RUNTIME_DIR")
+        );
+
+        let agy_plan = plan_for("agy", &agy_home, "w-agy");
+        assert!(has_pair(&agy_plan, "--unsetenv", "CLAUDE_CONFIG_DIR"));
+        assert!(has_pair(&agy_plan, "--unsetenv", "CODEX_HOME"));
+
+        let codex_plan = plan_for("codex", &codex_home, "w-codex");
+        assert!(has_pair(&codex_plan, "--unsetenv", "CLAUDE_CONFIG_DIR"));
+        let canon_codex = canon(&codex_home).display().to_string();
+        assert!(
+            codex_plan
+                .words
+                .windows(3)
+                .any(|w| w == ["--setenv", "CODEX_HOME", canon_codex.as_str()])
+        );
     }
 }
