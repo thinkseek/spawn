@@ -967,16 +967,16 @@ tick_count() {
     out | tr ' ' '\n' | sed -n "s/^$1=//p"
 }
 
-echo "j05: [bb030 tick] an unknown engine, codex, and a tick without a repository"
+echo "j05: [bb030 tick] an unknown engine, opencode, and a tick without a repository"
 capture "$SPAWN_BIN" submit --agent agent_ws --session session_ws --key k_bad \
     --action '{"type":"start","engine":"nope","prompt":"x"}'
 assert_eq "$status" 1 "unknown engine exit"
 assert_contains "$(err)" "--action is not a command action" "unknown engine message"
 
-capture "$SPAWN_BIN" submit --agent agent_ws --session session_ws --key k_codex \
-    --action '{"type":"start","engine":"codex","prompt":"x"}'
-assert_eq "$status" 1 "codex engine exit"
-assert_contains "$(err)" "unknown engine codex" "codex engine message"
+capture "$SPAWN_BIN" submit --agent agent_ws --session session_ws --key k_opencode \
+    --action '{"type":"start","engine":"opencode","prompt":"x"}'
+assert_eq "$status" 1 "opencode engine exit"
+assert_contains "$(err)" "unknown engine opencode" "opencode engine message"
 assert_eq "$(scalar 'select count(*) from spawn_commands')" 0 "no command was written"
 
 capture sh -c 'unset SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT; exec "$0" tick' "$SPAWN_BIN"
