@@ -106,6 +106,16 @@ where
 /// Deserialize an optional list of `i64` IDs accepting either JSON integers
 /// (`[1, 2]`, e.g. from `spawn_integrator_record`) or base-10 integer strings
 /// (`["1", "2"]`, e.g. from `spawn_source_moved` via `jsonb_array_elements_text`).
+/// A field that is present reads as `Some`, `null` included (`Some(Value::Null)`);
+/// only an absent one (through `#[serde(default)]`) is `None`. A round trip
+/// writes `"field": null` back.
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
 fn deserialize_opt_vec_i64<'de, D>(deserializer: D) -> Result<Option<Vec<i64>>, D::Error>
 where
     D: Deserializer<'de>,
@@ -1964,8 +1974,14 @@ pub struct BackupDrilledControllersRecord {
     /// Current controller state snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<Value>,
-    /// Previous controller state snapshot for comparison.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Previous controller state snapshot for comparison: `Some(Value::Null)`
+    /// when the controller has none (`"prev": null`), `None` when the key is
+    /// absent (a run that could not restore the backup).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_value"
+    )]
     pub prev: Option<Value>,
     /// Fields intentionally excluded from parity comparison.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1973,6 +1989,146 @@ pub struct BackupDrilledControllersRecord {
     /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// What a restore drill's verdict on one resource says (`backup.drilled.*`):
+/// its `ok` and `reason` read once, so a pass that names a reason, or a
+/// failure that names none, has no value.
+///
+/// The ledger keeps the records' wire fields unchanged (an append-only log
+/// is never rewritten); this is the one reading of them. Their only writer,
+/// `spawn_backup_record`, has refused from the first drill record on
+/// (`4038ddab`) any record whose `reason` is not a string or whose `ok` is
+/// not exactly "`reason` is empty"; `spawn_control_record` is granted to no
+/// login role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrillOutcome<'a> {
+    /// The drill passed: `ok` true, `reason` empty.
+    Passed,
+    /// The drill failed: `ok` false.
+    Failed {
+        /// Why, never empty.
+        reason: &'a str,
+    },
+}
+
+/// What a `backup.drilled.controllers` record says: a controller compared
+/// with the restored backup, or a run that could not restore the backup at
+/// all, recorded once with the drill record's fields alone.
+///
+/// A field a variant does not carry (`run`, `missions`, `source`, `current`,
+/// `prev`, `left_out`) is read from the record; [`Self::Compared`] means each
+/// is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllersDrillOutcome<'a> {
+    /// The backup was restored and this controller compared with it.
+    Compared {
+        /// The controller compared, never empty.
+        controller: &'a str,
+        /// Its verdict.
+        outcome: DrillOutcome<'a>,
+    },
+    /// The backup could not be restored: a failed record that names no
+    /// controller.
+    Unrestorable {
+        /// Why, never empty.
+        reason: &'a str,
+    },
+}
+
+/// The [`DrillOutcome`] of a drill record of `kind`: refuses an absent
+/// `reason`, a pass with a reason and a failure without one.
+fn drill_outcome<'a>(
+    kind: &str,
+    ok: bool,
+    reason: Option<&'a str>,
+) -> Result<DrillOutcome<'a>, ControlRecordError> {
+    match (ok, reason) {
+        (_, None) => Err(invariant_err(
+            kind,
+            "`reason` is required: empty when the drill passed, why when it failed",
+        )),
+        (true, Some("")) => Ok(DrillOutcome::Passed),
+        (false, Some(reason)) if !reason.is_empty() => Ok(DrillOutcome::Failed { reason }),
+        (true, Some(_)) => Err(invariant_err(
+            kind,
+            "a passed drill (`ok` true) has an empty `reason`",
+        )),
+        (false, Some(_)) => Err(invariant_err(
+            kind,
+            "a failed drill (`ok` false) names its `reason`",
+        )),
+    }
+}
+
+impl BackupDrillRecord {
+    /// What the record says ([`DrillOutcome`]); the error names the three
+    /// kinds this payload is (`transcripts`, `missions`, `sync`).
+    pub fn outcome(&self) -> Result<DrillOutcome<'_>, ControlRecordError> {
+        drill_outcome(
+            "backup.drilled.{transcripts,missions,sync}",
+            self.ok,
+            self.reason.as_deref(),
+        )
+    }
+}
+
+impl BackupDrilledControllersRecord {
+    /// What the record says ([`ControllersDrillOutcome`]). Refuses, besides
+    /// what [`DrillOutcome`] refuses, what `spawn_backup_record` never took:
+    /// a record with only some of the controller's fields (`run`,
+    /// `controller`, `missions`, `source`, `current`, `prev`, `left_out`),
+    /// a passed one with none of them, an empty `controller`, a `current`
+    /// that is not an object, a `prev` that is neither an object nor null.
+    pub fn outcome(&self) -> Result<ControllersDrillOutcome<'_>, ControlRecordError> {
+        let kind = ControlRecordKind::BackupDrilledControllers.as_str();
+        let outcome = drill_outcome(kind, self.ok, self.reason.as_deref())?;
+        let present = [
+            self.run.is_some(),
+            self.controller.is_some(),
+            self.missions.is_some(),
+            self.source.is_some(),
+            self.current.is_some(),
+            self.prev.is_some(),
+            self.left_out.is_some(),
+        ];
+        if present.iter().all(|field| !field) {
+            return match outcome {
+                DrillOutcome::Failed { reason } => {
+                    Ok(ControllersDrillOutcome::Unrestorable { reason })
+                }
+                DrillOutcome::Passed => Err(invariant_err(
+                    kind,
+                    "a passed controllers drill names its controller and what it compared",
+                )),
+            };
+        }
+        if present.iter().any(|field| !field) {
+            return Err(invariant_err(
+                kind,
+                "a compared controller has every one of `run`, `controller`, `missions`, \
+                 `source`, `current`, `prev` and `left_out`",
+            ));
+        }
+        let controller = self.controller.as_deref().unwrap_or_default();
+        if controller.is_empty() {
+            return Err(invariant_err(kind, "`controller` is never empty"));
+        }
+        if !self.current.as_ref().is_some_and(Value::is_object) {
+            return Err(invariant_err(kind, "`current` is an object"));
+        }
+        if !self
+            .prev
+            .as_ref()
+            .is_some_and(|prev| prev.is_object() || prev.is_null())
+        {
+            return Err(invariant_err(kind, "`prev` is an object or null"));
+        }
+        Ok(ControllersDrillOutcome::Compared {
+            controller,
+            outcome,
+        })
+    }
 }
 
 /// Payload for `legacy.imported`.
@@ -3014,8 +3170,14 @@ fn validate_control_record_strict(record: &ControlRecord) -> Result<(), ControlR
         ControlRecord::BackupStored(r) => reject_extra(kind, &r.extra)?,
         ControlRecord::BackupDrilledTranscripts(r)
         | ControlRecord::BackupDrilledMissions(r)
-        | ControlRecord::BackupDrilledSync(r) => reject_extra(kind, &r.extra)?,
-        ControlRecord::BackupDrilledControllers(r) => reject_extra(kind, &r.extra)?,
+        | ControlRecord::BackupDrilledSync(r) => {
+            reject_extra(kind, &r.extra)?;
+            r.outcome()?;
+        }
+        ControlRecord::BackupDrilledControllers(r) => {
+            reject_extra(kind, &r.extra)?;
+            r.outcome()?;
+        }
         _ => {}
     }
     Ok(())
@@ -3984,9 +4146,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ControlRecord, ControlRecordError, ControlRecordKind, EpisodeOutcome, GateOutcome,
-        GateVerdict, GateVerdictClass, GradeWire, GradingRecord, GradingRecordKind, HostRetry,
-        TaskGatedRecord, invariant_err, replay_task_episodes,
+        ControlRecord, ControlRecordError, ControlRecordKind, ControllersDrillOutcome,
+        DrillOutcome, EpisodeOutcome, GateOutcome, GateVerdict, GateVerdictClass, GradeWire,
+        GradingRecord, GradingRecordKind, HostRetry, TaskGatedRecord, invariant_err,
+        replay_task_episodes,
     };
     use crate::mission::TaskState;
 
@@ -4711,5 +4874,209 @@ mod tests {
         let episodes = replay_task_episodes(&stream);
         assert_eq!(episodes[0].state, TaskState::Landing);
         assert_eq!(episodes[0].candidate.as_deref(), Some("c2"));
+    }
+
+    /// What a drill record says, in words, through its closed outcome.
+    fn drill_says(record: &ControlRecord, wire: &Value) -> &'static str {
+        match record {
+            ControlRecord::BackupDrilledTranscripts(r)
+            | ControlRecord::BackupDrilledMissions(r)
+            | ControlRecord::BackupDrilledSync(r) => match r.outcome().expect("reads") {
+                DrillOutcome::Passed => "passed",
+                DrillOutcome::Failed { reason } => {
+                    assert_eq!(reason, wire["reason"]);
+                    "failed"
+                }
+            },
+            ControlRecord::BackupDrilledControllers(r) => match r.outcome().expect("reads") {
+                ControllersDrillOutcome::Compared {
+                    controller,
+                    outcome,
+                } => {
+                    assert_eq!(controller, "spawn");
+                    match outcome {
+                        DrillOutcome::Passed => "compared passed",
+                        DrillOutcome::Failed { .. } => "compared failed",
+                    }
+                }
+                ControllersDrillOutcome::Unrestorable { reason } => {
+                    assert_eq!(reason, "no bundle to restore");
+                    "unrestorable"
+                }
+            },
+            other => panic!("not a drill record: {other:?}"),
+        }
+    }
+
+    /// The drill records exactly as their writers emit them
+    /// (`restore_drill::drill_record` for a pass, a mismatch and a backup
+    /// that cannot be restored; `restore_drill/controllers.rs::record` with
+    /// a previous tree and with none; the unrestorable controllers record of
+    /// the drill fields alone): each reads, says what it says, and writes
+    /// back the same JSON value, `"prev": null` included.
+    #[test]
+    fn drill_records_read_as_their_writers_wrote_them_and_write_back_unchanged() {
+        let fields = |kind: &str, ok: bool, reason: &str, mismatches: u64| {
+            json!({"type": kind, "ok": ok, "reason": reason,
+                   "bundle": "bundles/spawn/full/20261113-040000.tar.zst.gpg",
+                   "bundle_event_id": 41, "mismatches": mismatches, "duration_ms": 1234})
+        };
+        let tree = |commit: &str| {
+            json!({"commit": commit.repeat(5),
+            "live": {"ok": true, "files": 796, "differing": []}})
+        };
+        let controller = |prev: Value| {
+            let mut record = fields("backup.drilled.controllers", true, "", 0);
+            for (key, value) in [
+                ("run", json!(1_763_190_000_000_i64)),
+                ("controller", json!("spawn")),
+                ("missions", json!([4])),
+                (
+                    "source",
+                    json!("/home/spawn/.local/share/spawn-rsi/spawn.git"),
+                ),
+                ("current", tree("8adefdef")),
+                ("prev", prev),
+                (
+                    "left_out",
+                    json!([".controller", ".deps", "web/node_modules"]),
+                ),
+            ] {
+                record[key] = value;
+            }
+            record
+        };
+        let mut failed_controller = controller(Value::Null);
+        failed_controller["ok"] = json!(false);
+        failed_controller["reason"] = json!("spawn: current 8adefdef: 1 of 796 live paths differ");
+        failed_controller["mismatches"] = json!(1);
+        let cases: Vec<(Value, &str)> = vec![
+            (fields("backup.drilled.transcripts", true, "", 0), "passed"),
+            (
+                fields(
+                    "backup.drilled.missions",
+                    false,
+                    "missions: 2 older than bundle",
+                    2,
+                ),
+                "failed",
+            ),
+            (
+                fields("backup.drilled.sync", false, "the chain is broken", 0),
+                "failed",
+            ),
+            (controller(tree("53a3be15")), "compared passed"),
+            (controller(Value::Null), "compared passed"),
+            (failed_controller, "compared failed"),
+            (
+                fields(
+                    "backup.drilled.controllers",
+                    false,
+                    "no bundle to restore",
+                    0,
+                ),
+                "unrestorable",
+            ),
+        ];
+        for (wire, says) in cases {
+            let record = ControlRecord::from_value_strict(&wire)
+                .unwrap_or_else(|error| panic!("{wire}: {error}"));
+            assert_eq!(record.to_value().expect("serializes"), wire, "round trip");
+            assert_eq!(
+                serde_json::to_string(&record.to_value().expect("serializes")).expect("text"),
+                serde_json::to_string(&wire).expect("text"),
+                "the same JSON text"
+            );
+            let read = drill_says(&record, &wire);
+            assert_eq!(read, says, "{wire}");
+        }
+    }
+
+    /// Every `ok` with every kind of `reason` (absent, empty, a text), on
+    /// each of the four kinds: exactly a pass with an empty reason and a
+    /// failure with one read, as `DrillOutcome` and through the strict
+    /// parse; nothing else does.
+    #[test]
+    fn only_a_pass_without_a_reason_or_a_failure_with_one_is_a_drill_outcome() {
+        for kind in [
+            "backup.drilled.transcripts",
+            "backup.drilled.missions",
+            "backup.drilled.sync",
+            "backup.drilled.controllers",
+        ] {
+            for ok in [true, false] {
+                for reason in [None, Some(""), Some("why")] {
+                    let mut wire = json!({"type": kind, "ok": ok, "bundle": "b",
+                        "bundle_event_id": 1, "mismatches": 0, "duration_ms": 5});
+                    if let Some(reason) = reason {
+                        wire["reason"] = json!(reason);
+                    }
+                    let legal = matches!((ok, reason), (true, Some("")) | (false, Some("why")));
+                    // A passed controllers record must also name what it
+                    // compared: the drill fields alone are a failed run.
+                    let legal = legal && !(kind == "backup.drilled.controllers" && ok);
+                    let strict = ControlRecord::from_value_strict(&wire);
+                    assert_eq!(strict.is_ok(), legal, "{wire}: {strict:?}");
+                    let lax = ControlRecord::from_value(&wire).expect("the wire shape reads");
+                    let outcome = match &lax {
+                        ControlRecord::BackupDrilledControllers(r) => r.outcome().map(|_| ()),
+                        ControlRecord::BackupDrilledTranscripts(r)
+                        | ControlRecord::BackupDrilledMissions(r)
+                        | ControlRecord::BackupDrilledSync(r) => r.outcome().map(|_| ()),
+                        other => panic!("{other:?}"),
+                    };
+                    assert_eq!(outcome.is_ok(), legal, "{wire}: {outcome:?}");
+                    if let Err(ControlRecordError::Invariant { message, .. }) = outcome {
+                        assert!(
+                            message.contains("reason") || message.contains("controller"),
+                            "{message}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A controllers record either names every field of the controller it
+    /// compared, or none (a failed run that could not restore the backup):
+    /// one field short, an empty controller, a `current` that is no object
+    /// or a `prev` that is neither an object nor null is refused.
+    #[test]
+    fn a_controllers_drill_names_all_of_its_controller_or_none() {
+        let full = json!({"type": "backup.drilled.controllers", "ok": false,
+            "reason": "spawn: 1 differs", "bundle": "b", "bundle_event_id": 1,
+            "mismatches": 1, "duration_ms": 5, "run": 7, "controller": "spawn",
+            "missions": [4], "source": "/s.git",
+            "current": {"commit": "c", "live": {"ok": false, "files": 1, "differing": ["a"]}},
+            "prev": null, "left_out": []});
+        assert!(ControlRecord::from_value_strict(&full).is_ok());
+        for field in [
+            "run",
+            "controller",
+            "missions",
+            "source",
+            "current",
+            "prev",
+            "left_out",
+        ] {
+            let mut short = full.clone();
+            short.as_object_mut().expect("object").remove(field);
+            let error = ControlRecord::from_value_strict(&short).expect_err(field);
+            assert!(
+                error.to_string().contains("every one of"),
+                "{field}: {error}"
+            );
+        }
+        for (field, value, says) in [
+            ("controller", json!(""), "never empty"),
+            ("current", json!("c"), "`current` is an object"),
+            ("current", Value::Null, "every one of"),
+            ("prev", json!("53a3be15"), "`prev` is an object or null"),
+        ] {
+            let mut bad = full.clone();
+            bad[field] = value;
+            let error = ControlRecord::from_value_strict(&bad).expect_err(field);
+            assert!(error.to_string().contains(says), "{field}: {error}");
+        }
     }
 }

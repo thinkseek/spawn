@@ -496,3 +496,74 @@ fn a_controllers_drill_record_takes_its_own_fields_each_of_its_kind() {
     );
     assert_eq!(control_records(&mut client, "backup.drilled.missions"), 0);
 }
+
+/// Every drill record shape the store takes through spawn_backup_record
+/// (a pass, a failure, a compared controller with a previous tree and with
+/// none, a controllers run that could not restore the backup) reads back
+/// from the ledger through the strict parse, as its closed outcome
+/// (`DrillOutcome`, `ControllersDrillOutcome`): what the store takes, the
+/// typed reading takes.
+#[test]
+fn every_drill_record_the_store_takes_reads_back_strictly_as_its_outcome() {
+    use spawn_core::control::{ControlRecord, ControllersDrillOutcome, DrillOutcome};
+
+    let (store, _schema) = store("backup_drilled_strict");
+    let mut failed = drilled("backup.drilled.missions");
+    failed["ok"] = json!(false);
+    failed["reason"] = json!("missions: 2 older than bundle");
+    failed["mismatches"] = json!(2);
+    let mut no_prev = controllers_drilled();
+    no_prev["prev"] = Value::Null;
+    let unrestorable = json!({
+        "type": "backup.drilled.controllers", "ok": false, "reason": "no bundle to restore",
+        "bundle": "", "bundle_event_id": 0, "mismatches": 0, "duration_ms": 5,
+    });
+    for record in [
+        drilled("backup.drilled.transcripts"),
+        drilled("backup.drilled.sync"),
+        failed,
+        controllers_drilled(),
+        no_prev,
+        unrestorable,
+    ] {
+        store.backup_record(&record).expect("the store takes it");
+    }
+    let (stream, _) = store
+        .control_record_stream(true)
+        .expect("every stored record reads strictly");
+    let says = |outcome: DrillOutcome<'_>| match outcome {
+        DrillOutcome::Passed => "passed".to_string(),
+        DrillOutcome::Failed { reason } => format!("failed: {reason}"),
+    };
+    let read: Vec<String> = stream
+        .iter()
+        .filter_map(|(_, _, record)| match record {
+            ControlRecord::BackupDrilledTranscripts(r)
+            | ControlRecord::BackupDrilledMissions(r)
+            | ControlRecord::BackupDrilledSync(r) => Some(says(r.outcome().expect("reads"))),
+            ControlRecord::BackupDrilledControllers(r) => Some(match r.outcome().expect("reads") {
+                ControllersDrillOutcome::Compared {
+                    controller,
+                    outcome,
+                } => {
+                    format!("{controller} {}", says(outcome))
+                }
+                ControllersDrillOutcome::Unrestorable { reason } => {
+                    format!("unrestorable: {reason}")
+                }
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        read,
+        [
+            "passed",
+            "passed",
+            "failed: missions: 2 older than bundle",
+            "spawn passed",
+            "spawn passed",
+            "unrestorable: no bundle to restore",
+        ]
+    );
+}
