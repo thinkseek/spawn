@@ -729,10 +729,12 @@ fn pg_live_cutover_7_steps_pending_merge_guard_parity_and_lossless_rollback() {
     git_in(&work, &["commit", "-m", "tail branch commit"]);
     git_in(&work, &["push", "--all", "origin"]);
 
-    // Step 2 must fail closed while .merge/feat/alpha exists, leaving phase unchanged.
+    // Step 2 must fail closed while .merge/feat/alpha exists, leaving dispatch paused for cleanup.
     let blocked = cutover.step2_pause_dispatch_and_verify_clean(&cas_store);
     assert!(matches!(blocked, Err(D6StoreError::InvalidInput(_))));
-    assert_eq!(cutover.phase(), CutoverPhase::BackfillImported);
+    assert_eq!(cutover.phase(), CutoverPhase::DispatchPaused);
+    assert!(cutover.dispatch_paused());
+    assert_eq!(cutover.storage_mode(), ProjectStorageMode::Git);
 
     // Clear .merge/* and complete Steps 2 -> 7.
     fs::remove_dir_all(ws_root.join(".merge")).expect("clear .merge");

@@ -34,7 +34,8 @@ use crate::tree_path::{TreePath, nul_fields};
 static CUTOVER_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Active storage backing of a project across cutover (`#113` Comment #5 §三.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProjectStorageMode {
     /// Legacy bare Git + worktree backend.
     Git,
@@ -43,12 +44,15 @@ pub enum ProjectStorageMode {
 }
 
 /// Phase within the lossless 7-step per-project cutover and rollback workflow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CutoverPhase {
     /// Initial state before Step 1 backfill.
     NotStarted,
     /// Step 1 complete: reachable Git commits/trees/blobs backfilled into CAS + `spawn_snapshots`.
     BackfillImported,
+    /// Step 2a: project dispatch paused pending `.merge/*` / `pending` cleanliness verification.
+    DispatchPaused,
     /// Step 2 complete: dispatch paused and zero `.merge/*` / `pending` markers verified.
     DispatchPausedAndDrained,
     /// Step 3 complete: post-Step-1 tail commits imported cleanly.
@@ -65,13 +69,41 @@ pub enum CutoverPhase {
     RolledBack,
 }
 
+impl CutoverPhase {
+    /// Storage mode uniquely determined by this phase.
+    pub const fn storage_mode(self) -> ProjectStorageMode {
+        match self {
+            Self::NotStarted
+            | Self::BackfillImported
+            | Self::DispatchPaused
+            | Self::DispatchPausedAndDrained
+            | Self::TailImported
+            | Self::RolledBack => ProjectStorageMode::Git,
+            Self::RefsCommitted | Self::ParityVerified | Self::BorderReadOnly | Self::Resumed => {
+                ProjectStorageMode::D6Cas
+            }
+        }
+    }
+
+    /// Whether project task dispatch is paused in this phase.
+    pub const fn dispatch_paused(self) -> bool {
+        matches!(
+            self,
+            Self::DispatchPaused
+                | Self::DispatchPausedAndDrained
+                | Self::TailImported
+                | Self::RefsCommitted
+                | Self::ParityVerified
+                | Self::BorderReadOnly
+        )
+    }
+}
+
 /// Recorded transition audit event emitted during [`ProjectCutover`] steps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CutoverEvent {
     /// Resulting phase after transition.
     pub phase: CutoverPhase,
-    /// Project storage mode active at transition time.
-    pub storage_mode: ProjectStorageMode,
     /// Human-readable audit summary.
     pub detail: String,
 }
@@ -360,8 +392,6 @@ pub struct ProjectCutover {
     bare_repo: PathBuf,
     workspace_root: PathBuf,
     phase: CutoverPhase,
-    storage_mode: ProjectStorageMode,
-    dispatch_paused: bool,
     default_tree: Option<Digest>,
     export_attributes: Option<ExportAttributesAudit>,
     parity: Option<CutoverParityReport>,
@@ -375,18 +405,7 @@ impl ProjectCutover {
         bare_repo: impl Into<PathBuf>,
         workspace_root: impl Into<PathBuf>,
     ) -> Self {
-        Self {
-            project: project.into(),
-            bare_repo: bare_repo.into(),
-            workspace_root: workspace_root.into(),
-            phase: CutoverPhase::NotStarted,
-            storage_mode: ProjectStorageMode::Git,
-            dispatch_paused: false,
-            default_tree: None,
-            export_attributes: None,
-            parity: None,
-            events: Vec::new(),
-        }
+        Self::from_state(project, bare_repo, workspace_root, CutoverPhase::NotStarted)
     }
 
     /// Resume a cutover coordinator from persisted cross-process state (e.g. CLI rollback).
@@ -395,16 +414,12 @@ impl ProjectCutover {
         bare_repo: impl Into<PathBuf>,
         workspace_root: impl Into<PathBuf>,
         phase: CutoverPhase,
-        storage_mode: ProjectStorageMode,
-        dispatch_paused: bool,
     ) -> Self {
         Self {
             project: project.into(),
             bare_repo: bare_repo.into(),
             workspace_root: workspace_root.into(),
             phase,
-            storage_mode,
-            dispatch_paused,
             default_tree: None,
             export_attributes: None,
             parity: None,
@@ -422,14 +437,14 @@ impl ProjectCutover {
         self.phase
     }
 
-    /// Active project storage mode (`Git` or `D6Cas`).
+    /// Active project storage mode (`Git` or `D6Cas`), derived from [`Self::phase`].
     pub const fn storage_mode(&self) -> ProjectStorageMode {
-        self.storage_mode
+        self.phase.storage_mode()
     }
 
-    /// Whether project task dispatch is currently paused for cutover.
+    /// Whether project task dispatch is currently paused for cutover, derived from [`Self::phase`].
     pub const fn dispatch_paused(&self) -> bool {
-        self.dispatch_paused
+        self.phase.dispatch_paused()
     }
 
     /// Ordered transition events recorded so far.
@@ -460,7 +475,6 @@ impl ProjectCutover {
     fn push_event(&mut self, detail: impl Into<String>) {
         self.events.push(CutoverEvent {
             phase: self.phase,
-            storage_mode: self.storage_mode,
             detail: detail.into(),
         });
     }
@@ -491,11 +505,16 @@ impl ProjectCutover {
         &mut self,
         store: &CasMerkleStore,
     ) -> Result<PreCutoverCleanReport, D6StoreError> {
-        self.require_phase(
-            CutoverPhase::BackfillImported,
-            "step2_pause_dispatch_and_verify_clean",
-        )?;
-        self.dispatch_paused = true;
+        if !matches!(
+            self.phase,
+            CutoverPhase::BackfillImported | CutoverPhase::DispatchPaused
+        ) {
+            return Err(D6StoreError::InvalidInput(format!(
+                "step2_pause_dispatch_and_verify_clean requires phase BackfillImported or DispatchPaused, current phase is {:?}",
+                self.phase
+            )));
+        }
+        self.phase = CutoverPhase::DispatchPaused;
         let pending_audit = verify_zero_pending_merges(&self.workspace_root)?;
         if !pending_audit.is_clean() {
             assert_zero_pending_merges(&self.workspace_root)?;
@@ -553,7 +572,6 @@ impl ProjectCutover {
         let bridge = DynLedgerBridge(ledger);
         let report =
             adapter.import_bare_repo(store, &bridge, &self.project, &self.bare_repo, reason)?;
-        self.storage_mode = ProjectStorageMode::D6Cas;
         self.phase = CutoverPhase::RefsCommitted;
         self.push_event(format!(
             "committed {} refs to RefLedger and flipped mode to D6Cas",
@@ -598,7 +616,6 @@ impl ProjectCutover {
     /// **Step 7**: Resume project dispatch on [`ProjectStorageMode::D6Cas`].
     pub fn step7_resume_dispatch(&mut self) -> Result<(), D6StoreError> {
         self.require_phase(CutoverPhase::BorderReadOnly, "step7_resume_dispatch")?;
-        self.dispatch_paused = false;
         self.phase = CutoverPhase::Resumed;
         self.push_event("resumed dispatch on D6Cas");
         Ok(())
@@ -643,8 +660,6 @@ impl ProjectCutover {
 
         let retired_refs = ledger.retire_project_refs(&self.project, "rollback to git")?;
 
-        self.storage_mode = ProjectStorageMode::Git;
-        self.dispatch_paused = false;
         self.parity.clone_from(&parity);
         self.phase = CutoverPhase::RolledBack;
         self.push_event(format!(
@@ -2143,19 +2158,104 @@ mod tests {
         );
 
         let initial = ProjectCutover::new("proj-cutover-roundtrip", &bare, &root);
+        assert_eq!(initial.phase(), CutoverPhase::NotStarted);
+        assert_eq!(initial.storage_mode(), ProjectStorageMode::Git);
+        assert!(!initial.dispatch_paused());
+
         let restored = ProjectCutover::from_state(
             "proj-cutover-roundtrip",
             &bare,
             &root,
-            initial.phase(),
-            initial.storage_mode(),
-            true,
+            CutoverPhase::DispatchPaused,
         );
-        assert_eq!(restored.phase(), initial.phase());
-        assert_eq!(restored.storage_mode(), initial.storage_mode());
+        assert_eq!(restored.phase(), CutoverPhase::DispatchPaused);
+        assert_eq!(restored.storage_mode(), ProjectStorageMode::Git);
         assert!(restored.dispatch_paused());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cutover_phase_derives_mode_pause_and_serde() {
+        for (phase, wire, mode, paused) in [
+            (
+                CutoverPhase::NotStarted,
+                "\"not_started\"",
+                ProjectStorageMode::Git,
+                false,
+            ),
+            (
+                CutoverPhase::BackfillImported,
+                "\"backfill_imported\"",
+                ProjectStorageMode::Git,
+                false,
+            ),
+            (
+                CutoverPhase::DispatchPaused,
+                "\"dispatch_paused\"",
+                ProjectStorageMode::Git,
+                true,
+            ),
+            (
+                CutoverPhase::DispatchPausedAndDrained,
+                "\"dispatch_paused_and_drained\"",
+                ProjectStorageMode::Git,
+                true,
+            ),
+            (
+                CutoverPhase::TailImported,
+                "\"tail_imported\"",
+                ProjectStorageMode::Git,
+                true,
+            ),
+            (
+                CutoverPhase::RefsCommitted,
+                "\"refs_committed\"",
+                ProjectStorageMode::D6Cas,
+                true,
+            ),
+            (
+                CutoverPhase::ParityVerified,
+                "\"parity_verified\"",
+                ProjectStorageMode::D6Cas,
+                true,
+            ),
+            (
+                CutoverPhase::BorderReadOnly,
+                "\"border_read_only\"",
+                ProjectStorageMode::D6Cas,
+                true,
+            ),
+            (
+                CutoverPhase::Resumed,
+                "\"resumed\"",
+                ProjectStorageMode::D6Cas,
+                false,
+            ),
+            (
+                CutoverPhase::RolledBack,
+                "\"rolled_back\"",
+                ProjectStorageMode::Git,
+                false,
+            ),
+        ] {
+            assert_eq!(phase.storage_mode(), mode, "{phase:?}");
+            assert_eq!(phase.dispatch_paused(), paused, "{phase:?}");
+            assert_eq!(serde_json::to_string(&phase).unwrap(), wire, "{phase:?}");
+            assert_eq!(
+                serde_json::from_str::<CutoverPhase>(wire).unwrap(),
+                phase,
+                "{phase:?}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&ProjectStorageMode::D6Cas).unwrap(),
+            "\"d6_cas\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ProjectStorageMode>("\"git\"").unwrap(),
+            ProjectStorageMode::Git
+        );
     }
 
     fn test_git(dir: &Path, args: &[&str]) {

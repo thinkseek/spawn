@@ -2425,17 +2425,55 @@ struct ReviewCommit {
     is_checkpoint: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TaskRepo {
+    LocalGit {
+        git_dir: std::path::PathBuf,
+        bare: bool,
+    },
+    D6Ledger {
+        project: String,
+    },
+}
+
+impl TaskRepo {
+    fn local_git_dir(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::LocalGit { git_dir, .. } => Some(git_dir.as_path()),
+            Self::D6Ledger { .. } => None,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::LocalGit { git_dir, .. } => format!("local repository {}", git_dir.display()),
+            Self::D6Ledger { project } => format!("D6 ledger project {project:?}"),
+        }
+    }
+}
+
 struct TaskRepoContext {
     task_id: i64,
     mission_id: i64,
     agent_id: String,
     brief: String,
-    git_dir: std::path::PathBuf,
-    is_bare: bool,
-    landable: bool,
-    has_local_git: bool,
+    repo: TaskRepo,
     root: Option<std::path::PathBuf>,
     source: Option<String>,
+}
+
+impl TaskRepoContext {
+    fn is_landable(&self) -> bool {
+        let allowed_source = self.source.is_none()
+            || self
+                .source
+                .as_deref()
+                .is_some_and(|path| path.starts_with('/') && !path.contains("://"));
+        match &self.repo {
+            TaskRepo::LocalGit { bare, .. } => *bare && allowed_source,
+            TaskRepo::D6Ledger { .. } => allowed_source,
+        }
+    }
 }
 
 struct TempDirGuard {
@@ -2662,16 +2700,16 @@ fn load_task_repo(
         .map(std::path::PathBuf::from)
         .or_else(|| crate::config::env_value("SPAWN_WORKSPACE_ROOT").map(std::path::PathBuf::from));
 
-    let (git_dir, is_bare, landable, has_local_git) = match source {
+    let repo = match source {
         Some(path) if path.starts_with('/') && !path.contains("://") => {
             match resolve_local_source_repo(std::path::Path::new(path)) {
-                Ok((dir, bare)) => (dir, bare, bare, true),
+                Ok((git_dir, bare)) => TaskRepo::LocalGit { git_dir, bare },
                 Err(local_err) => {
                     let probe = std::path::Path::new(path);
                     let candidates =
                         d6_project_candidates(Some(path), Some(probe), resolved_root.as_deref());
-                    if load_d6_project_refs(store, &candidates)?.is_some() {
-                        (probe.to_path_buf(), true, true, false)
+                    if let Some((project, _)) = load_d6_project_refs(store, &candidates)? {
+                        TaskRepo::D6Ledger { project }
                     } else {
                         return Err(local_err);
                     }
@@ -2684,12 +2722,15 @@ fn load_task_repo(
                     .map_err(|error| error.to_string())?;
                 if mirror.exists() {
                     let bare = verify_bare_repo(&mirror)?;
-                    (mirror, bare, bare && other_source.is_none(), true)
+                    TaskRepo::LocalGit {
+                        git_dir: mirror,
+                        bare,
+                    }
                 } else {
                     let candidates =
                         d6_project_candidates(other_source, Some(&mirror), Some(root_path));
-                    if load_d6_project_refs(store, &candidates)?.is_some() {
-                        (mirror, true, other_source.is_none(), false)
+                    if let Some((project, _)) = load_d6_project_refs(store, &candidates)? {
+                        TaskRepo::D6Ledger { project }
                     } else {
                         return Err(format!(
                             "mission bare repository {} does not exist",
@@ -2699,14 +2740,10 @@ fn load_task_repo(
                 }
             } else {
                 let candidates = d6_project_candidates(other_source, None, None);
-                if !candidates.is_empty() && load_d6_project_refs(store, &candidates)?.is_some() {
-                    let label = other_source.unwrap_or("default");
-                    (
-                        std::path::PathBuf::from(label),
-                        true,
-                        other_source.is_none(),
-                        false,
-                    )
+                if !candidates.is_empty()
+                    && let Some((project, _)) = load_d6_project_refs(store, &candidates)?
+                {
+                    TaskRepo::D6Ledger { project }
                 } else {
                     return Err(format!(
                         "mission #{mission_id} has no local source directory; pass --root <dir> or set SPAWN_WORKSPACE_ROOT"
@@ -2721,10 +2758,7 @@ fn load_task_repo(
         mission_id,
         agent_id,
         brief,
-        git_dir,
-        is_bare,
-        landable,
-        has_local_git,
+        repo,
         root: resolved_root,
         source: source.map(str::to_string),
     })
@@ -2891,11 +2925,14 @@ fn is_d6_mode_for_task(ctx: &TaskRepoContext, has_d6_refs: bool) -> bool {
             Some(spawn_host::WorkspaceBackend::D6)
         )
     });
-    let border_ro =
-        ctx.has_local_git && spawn_host::is_readonly_border(&ctx.git_dir).unwrap_or(false);
+    let border_ro = ctx
+        .repo
+        .local_git_dir()
+        .is_some_and(|dir| spawn_host::is_readonly_border(dir).unwrap_or(false));
     let env_d6 = crate::config::env_value("SPAWN_WORKSPACE_BACKEND")
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("d6"));
-    root_d6 || border_ro || env_d6 || (!ctx.has_local_git && has_d6_refs)
+    let no_local_git = matches!(ctx.repo, TaskRepo::D6Ledger { .. });
+    root_d6 || border_ro || env_d6 || (no_local_git && has_d6_refs)
 }
 
 fn lookup_snapshot_digest_by_oid(
@@ -2913,54 +2950,70 @@ fn lookup_snapshot_digest_by_oid(
         .map_err(|error| format!("invalid D6 snapshot digest {}: {error}", row.id))
 }
 
+fn lookup_task_repo_d6_refs(
+    store: &spawn_postgres::PostgresStore,
+    ctx: &TaskRepoContext,
+) -> Result<Option<(String, Vec<spawn_postgres::RefRow>)>, String> {
+    match &ctx.repo {
+        TaskRepo::D6Ledger { project } => {
+            let rows = store
+                .list_refs(Some(project))
+                .map_err(|error| format!("list D6 refs for {project}: {error}"))?;
+            Ok((!rows.is_empty()).then(|| (project.clone(), rows)))
+        }
+        TaskRepo::LocalGit { git_dir, .. } => {
+            let candidates = d6_project_candidates(
+                ctx.source.as_deref(),
+                Some(git_dir.as_path()),
+                ctx.root.as_deref(),
+            );
+            load_d6_project_refs(store, &candidates)
+        }
+    }
+}
+
 fn resolve_task_refs(
     store: &spawn_postgres::PostgresStore,
     ctx: &TaskRepoContext,
 ) -> Result<ResolvedTaskRefs, String> {
-    let candidates = d6_project_candidates(
-        ctx.source.as_deref(),
-        Some(ctx.git_dir.as_path()),
-        ctx.root.as_deref(),
-    );
-    let d6_project_refs = load_d6_project_refs(store, &candidates)?;
+    let d6_project_refs = lookup_task_repo_d6_refs(store, ctx)?;
+    let local_git_dir = ctx.repo.local_git_dir();
     let d6_mode = is_d6_mode_for_task(ctx, d6_project_refs.is_some());
 
-    let (base_sha, base_snapshot) = match &d6_project_refs {
-        Some((project, rows)) if d6_mode || !ctx.has_local_git => {
+    let (base_sha, base_snapshot) = match (&d6_project_refs, local_git_dir) {
+        (Some((project, rows)), None) => {
+            let (oid, digest) = resolve_main_from_d6_ledger(store, project, rows)?;
+            (oid, Some(digest))
+        }
+        (Some((project, rows)), Some(dir)) if d6_mode => {
             match resolve_main_from_d6_ledger(store, project, rows) {
                 Ok((oid, digest)) => (oid, Some(digest)),
-                Err(_) if ctx.has_local_git => (resolve_main_sha(&ctx.git_dir)?, None),
-                Err(err) => return Err(err),
+                Err(_) => (resolve_main_sha(dir)?, None),
             }
         }
-        Some((project, rows)) => {
-            if let Ok(oid) = resolve_main_sha(&ctx.git_dir) {
+        (Some((project, rows)), Some(dir)) => {
+            if let Ok(oid) = resolve_main_sha(dir) {
                 (oid, None)
             } else {
                 let (oid, digest) = resolve_main_from_d6_ledger(store, project, rows)?;
                 (oid, Some(digest))
             }
         }
-        None => {
-            if !ctx.has_local_git {
-                return Err(format!(
-                    "no D6 ledger refs or local repository found for task #{}",
-                    ctx.task_id
-                ));
-            }
-            (resolve_main_sha(&ctx.git_dir)?, None)
+        (None, Some(dir)) => (resolve_main_sha(dir)?, None),
+        (None, None) => {
+            return Err(format!(
+                "no D6 ledger refs or local repository found for task #{}",
+                ctx.task_id
+            ));
         }
     };
 
-    let (resolved_ref, head_sha, head_snapshot) = match &d6_project_refs {
-        Some((_, rows)) if d6_mode || !ctx.has_local_git => {
+    let (resolved_ref, head_sha, head_snapshot) = match (&d6_project_refs, local_git_dir) {
+        (Some((_, rows)), None) => {
             if let Some((r, oid, digest)) =
                 resolve_preserved_ref_from_d6_ledger(store, rows, ctx.task_id, &ctx.agent_id)?
             {
                 (r, oid, Some(digest))
-            } else if ctx.has_local_git {
-                let (r, oid) = resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id)?;
-                (r, oid, None)
             } else {
                 let checked = candidate_task_refs(ctx.task_id, &ctx.agent_id).join(", ");
                 return Err(format!(
@@ -2969,21 +3022,37 @@ fn resolve_task_refs(
                 ));
             }
         }
-        Some((_, rows)) => {
-            if let Ok((r, oid)) = resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id) {
+        (Some((_, rows)), Some(dir)) if d6_mode => {
+            if let Some((r, oid, digest)) =
+                resolve_preserved_ref_from_d6_ledger(store, rows, ctx.task_id, &ctx.agent_id)?
+            {
+                (r, oid, Some(digest))
+            } else {
+                let (r, oid) = resolve_preserved_ref(dir, ctx.task_id, &ctx.agent_id)?;
+                (r, oid, None)
+            }
+        }
+        (Some((_, rows)), Some(dir)) => {
+            if let Ok((r, oid)) = resolve_preserved_ref(dir, ctx.task_id, &ctx.agent_id) {
                 (r, oid, None)
             } else if let Some((r, oid, digest)) =
                 resolve_preserved_ref_from_d6_ledger(store, rows, ctx.task_id, &ctx.agent_id)?
             {
                 (r, oid, Some(digest))
             } else {
-                let (r, oid) = resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id)?;
+                let (r, oid) = resolve_preserved_ref(dir, ctx.task_id, &ctx.agent_id)?;
                 (r, oid, None)
             }
         }
-        None => {
-            let (r, oid) = resolve_preserved_ref(&ctx.git_dir, ctx.task_id, &ctx.agent_id)?;
+        (None, Some(dir)) => {
+            let (r, oid) = resolve_preserved_ref(dir, ctx.task_id, &ctx.agent_id)?;
             (r, oid, None)
+        }
+        (None, None) => {
+            return Err(format!(
+                "no D6 ledger refs or local repository found for task #{}",
+                ctx.task_id
+            ));
         }
     };
 
@@ -3022,15 +3091,15 @@ fn materialize_review_repo(
     resolved: &ResolvedTaskRefs,
     cas_dir_override: Option<&std::path::Path>,
 ) -> Result<(Option<TempDirGuard>, std::path::PathBuf), String> {
-    let local_has_both = ctx.has_local_git
-        && rev_parse_commit(&ctx.git_dir, &resolved.base_sha)?
+    if let Some(git_dir) = ctx.repo.local_git_dir()
+        && rev_parse_commit(git_dir, &resolved.base_sha)?
             .as_deref()
             .is_some_and(|oid| oid == resolved.base_sha)
-        && rev_parse_commit(&ctx.git_dir, &resolved.head_sha)?
+        && rev_parse_commit(git_dir, &resolved.head_sha)?
             .as_deref()
-            .is_some_and(|oid| oid == resolved.head_sha);
-    if local_has_both {
-        return Ok((None, ctx.git_dir.clone()));
+            .is_some_and(|oid| oid == resolved.head_sha)
+    {
+        return Ok((None, git_dir.to_path_buf()));
     }
 
     let base_snap = match resolved.base_snapshot.clone() {
@@ -3506,6 +3575,7 @@ fn prepare_squash_worktree(
 
 fn commit_squash_and_update_main(
     ctx: &TaskRepoContext,
+    git_dir: &std::path::Path,
     base_sha: &str,
     head_sha: &str,
     commits: &[ReviewCommit],
@@ -3548,7 +3618,7 @@ fn commit_squash_and_update_main(
     )?;
     let work_str = work.to_string_lossy().to_string();
     run_git_raw(
-        &ctx.git_dir,
+        git_dir,
         &[
             "fetch",
             "--quiet",
@@ -3559,7 +3629,7 @@ fn commit_squash_and_update_main(
         "fetch squash commit into mission repo",
     )?;
     run_git_raw(
-        &ctx.git_dir,
+        git_dir,
         &["update-ref", "refs/heads/main", &new_commit, base_sha],
         "update-ref refs/heads/main",
     )?;
@@ -3607,14 +3677,16 @@ fn execute_task_land(
     cas_dir_override: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let ctx = load_task_repo(store, args.task_id, args.root.as_deref())?;
-    if !ctx.landable || !ctx.is_bare {
+    if !ctx.is_landable() {
         return Err(format!(
-            "cannot land task #{}: mission repository {} must be a local bare repository",
+            "cannot land task #{}: {} must be a local bare repository",
             ctx.task_id,
-            ctx.git_dir.display()
+            ctx.repo.describe()
         ));
     }
-    if !args.dry_run && is_d6_mode_for_task(&ctx, false) {
+    if !args.dry_run
+        && (matches!(ctx.repo, TaskRepo::D6Ledger { .. }) || is_d6_mode_for_task(&ctx, false))
+    {
         return Err(d6_land_refusal(ctx.task_id, ctx.mission_id));
     }
     let resolved = resolve_task_refs(store, &ctx)?;
@@ -3653,8 +3725,11 @@ fn execute_task_land(
             if args.dry_run {
                 Some(head_sha.clone())
             } else {
+                let Some(git_dir) = ctx.repo.local_git_dir() else {
+                    return Err(d6_land_refusal(ctx.task_id, ctx.mission_id));
+                };
                 run_git_raw(
-                    &ctx.git_dir,
+                    git_dir,
                     &["update-ref", "refs/heads/main", &head_sha, &base_sha],
                     "update-ref refs/heads/main",
                 )?;
@@ -3667,40 +3742,63 @@ fn execute_task_land(
             if args.dry_run {
                 None
             } else {
+                let Some(git_dir) = ctx.repo.local_git_dir() else {
+                    return Err(d6_land_refusal(ctx.task_id, ctx.mission_id));
+                };
                 Some(commit_squash_and_update_main(
-                    &ctx, &base_sha, &head_sha, &commits, &work, &tree_oid,
+                    &ctx, git_dir, &base_sha, &head_sha, &commits, &work, &tree_oid,
                 )?)
             }
         }
     };
 
+    print_task_land_result(
+        &ctx,
+        &resolved_ref,
+        &base_sha,
+        &head_sha,
+        new_main_sha.as_deref(),
+        args,
+        &commits,
+    );
+    Ok(())
+}
+
+fn print_task_land_result(
+    ctx: &TaskRepoContext,
+    resolved_ref: &str,
+    base_sha: &str,
+    head_sha: &str,
+    new_main_sha: Option<&str>,
+    args: &TaskLandArgs,
+    commits: &[ReviewCommit],
+) {
     if args.json {
         print(&task_land_payload(
-            &ctx,
-            &resolved_ref,
-            &base_sha,
-            &head_sha,
-            new_main_sha.as_deref(),
+            ctx,
+            resolved_ref,
+            base_sha,
+            head_sha,
+            new_main_sha,
             args,
-            &commits,
+            commits,
         ));
     } else if args.dry_run {
         println!(
             "task #{} dry-run OK (mode={} base={} head={} ref={resolved_ref})",
             ctx.task_id,
             args.mode.as_str(),
-            short_sha_prefix(&base_sha),
-            short_sha_prefix(&head_sha)
+            short_sha_prefix(base_sha),
+            short_sha_prefix(head_sha)
         );
     } else {
         println!(
             "task #{} landed onto refs/heads/main at {} (mode={} ref={resolved_ref})",
             ctx.task_id,
-            short_sha_prefix(new_main_sha.as_deref().unwrap_or(&head_sha)),
+            short_sha_prefix(new_main_sha.unwrap_or(head_sha)),
             args.mode.as_str()
         );
     }
-    Ok(())
 }
 
 fn task_land_cmd(rest: &[String]) -> Result<i32, String> {
@@ -5943,8 +6041,10 @@ mod database_tests {
 
         let root_str = root.to_string_lossy().into_owned();
         let ctx = super::load_task_repo(&store, task_id, Some(&root_str)).expect("load d6 ctx");
-        assert!(!ctx.has_local_git);
-        assert!(ctx.landable);
+        assert!(matches!(ctx.repo, super::TaskRepo::D6Ledger { .. }));
+        assert!(ctx.is_landable());
+        let described = ctx.repo.describe();
+        assert!(described.starts_with("D6 ledger project "), "{described}");
 
         let resolved = super::resolve_task_refs(&store, &ctx).expect("resolve d6 refs");
         assert!(resolved.d6_mode);
@@ -6033,6 +6133,172 @@ mod database_tests {
             "{missing_err}"
         );
         assert!(!missing_cas.join(spawn_cas::CAS_MARKER).exists());
+    }
+
+    fn publish_d6_main_and_task_head_pair(
+        cas: &spawn_host::CasMerkleStore,
+        ledger: &crate::sources::PostgresRefLedger,
+        project: &str,
+        task_ref: &str,
+        tag: &str,
+    ) -> (String, String) {
+        use spawn_cas::{Tree, TreeEntry, TreeEntryKind};
+        use spawn_host::{D6RefKind, PublishRequest, format_commit_body};
+
+        let (b1, l1) = cas
+            .put_bytes_blob(format!("base-{tag}\n").as_bytes())
+            .unwrap();
+        let t1 = cas
+            .put_tree_cached(
+                &Tree::from_entries(vec![TreeEntry {
+                    kind: TreeEntryKind::File,
+                    name: b"file.txt".to_vec(),
+                    id: b1.as_bytes(),
+                    size: l1,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let body1 = format_commit_body(
+            "T <t@s> 1700000000 +0000",
+            "T <t@s> 1700000000 +0000",
+            &format!("base {tag}\n"),
+        );
+        let p1 = cas
+            .publish_snapshot(
+                ledger,
+                &PublishRequest {
+                    project,
+                    ref_name: "main",
+                    kind: D6RefKind::Main,
+                    expected_ref: None,
+                    tree: &t1,
+                    parents: &[],
+                    commit_body: &body1,
+                    created_at_ms: 1_700_000_000_000,
+                    reason: "main",
+                    landing_task_id: None,
+                },
+            )
+            .unwrap();
+        let (b2, l2) = cas
+            .put_bytes_blob(format!("head-{tag}\n").as_bytes())
+            .unwrap();
+        let t2 = cas
+            .put_tree_cached(
+                &Tree::from_entries(vec![TreeEntry {
+                    kind: TreeEntryKind::File,
+                    name: b"file.txt".to_vec(),
+                    id: b2.as_bytes(),
+                    size: l2,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let body2 = format_commit_body(
+            "T <t@s> 1700000100 +0000",
+            "T <t@s> 1700000100 +0000",
+            &format!("head {tag}\n"),
+        );
+        let p2 = cas
+            .publish_snapshot(
+                ledger,
+                &PublishRequest {
+                    project,
+                    ref_name: task_ref,
+                    kind: D6RefKind::Branch,
+                    expected_ref: None,
+                    tree: &t2,
+                    parents: std::slice::from_ref(&p1.snapshot),
+                    commit_body: &body2,
+                    created_at_ms: 1_700_000_100_000,
+                    reason: "head",
+                    landing_task_id: None,
+                },
+            )
+            .unwrap();
+        (p1.git_oid.to_hex(), p2.git_oid.to_hex())
+    }
+
+    #[test]
+    fn d6_ledger_task_refs_read_only_selected_project_when_mirror_and_source_url_both_exist() {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("missions_d6_two_names");
+        let store = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+                .expect("isolated schema"),
+        );
+
+        let guard = super::TempDirGuard::create("missions-d6-two-names").expect("temp dir");
+        let root = guard.path.join("ws-root");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join(".spawn-backend"), "d6\n").expect("backend marker");
+        let source_url = "https://example.invalid/thinkseek/spawn.git";
+        let mirror_project = crate::sources::mirror_path(&root, Some(source_url))
+            .expect("mirror path")
+            .to_string_lossy()
+            .into_owned();
+        let cas = spawn_host::CasMerkleStore::open(root.join(".cas")).expect("open cas");
+        let ledger = crate::sources::PostgresRefLedger::new(std::sync::Arc::clone(&store));
+
+        let mission_id = store
+            .mission_add(
+                "Remote D6 mission",
+                &serde_json::json!([source_url]),
+                "human",
+            )
+            .expect("mission add");
+        let task_id = store
+            .task_assign(
+                mission_id,
+                "ephemeral",
+                "agent_d6",
+                "two-name brief",
+                "default",
+            )
+            .expect("task assign");
+        let task_ref = spawn_host::workspace_rules::task_head_ref(task_id, "head");
+
+        let (mirror_base, mirror_head) =
+            publish_d6_main_and_task_head_pair(&cas, &ledger, &mirror_project, &task_ref, "mirror");
+        let (url_base, url_head) =
+            publish_d6_main_and_task_head_pair(&cas, &ledger, source_url, &task_ref, "url");
+        assert_ne!(mirror_base, url_base);
+        assert_ne!(mirror_head, url_head);
+
+        let root_str = root.to_string_lossy().into_owned();
+        let mut ctx = super::load_task_repo(&store, task_id, Some(&root_str)).expect("load d6 ctx");
+        assert_eq!(
+            ctx.repo,
+            super::TaskRepo::D6Ledger {
+                project: mirror_project
+            }
+        );
+
+        let resolved = super::resolve_task_refs(&store, &ctx).expect("resolve mirror refs");
+        assert_eq!(
+            (resolved.base_sha.as_str(), resolved.head_sha.as_str()),
+            (mirror_base.as_str(), mirror_head.as_str())
+        );
+
+        ctx.repo = super::TaskRepo::D6Ledger {
+            project: source_url.to_string(),
+        };
+        let resolved_url = super::resolve_task_refs(&store, &ctx).expect("resolve url refs");
+        assert_eq!(
+            (
+                resolved_url.base_sha.as_str(),
+                resolved_url.head_sha.as_str()
+            ),
+            (url_base.as_str(), url_head.as_str())
+        );
+
+        ctx.repo = super::TaskRepo::D6Ledger {
+            project: "missing-ledger-project".to_string(),
+        };
+        assert!(super::resolve_task_refs(&store, &ctx).is_err());
     }
 
     #[test]
@@ -6247,5 +6513,71 @@ mod database_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn task_repo_landability_and_description_match_adt() {
+        let mk_ctx = |repo: super::TaskRepo, source: Option<&str>| super::TaskRepoContext {
+            task_id: 1,
+            mission_id: 1,
+            agent_id: "w_1".to_string(),
+            brief: "test".to_string(),
+            repo,
+            root: None,
+            source: source.map(str::to_string),
+        };
+
+        let bare_local = mk_ctx(
+            super::TaskRepo::LocalGit {
+                git_dir: std::path::PathBuf::from("/tmp/origin.git"),
+                bare: true,
+            },
+            None,
+        );
+        assert!(bare_local.is_landable());
+        assert_eq!(
+            bare_local.repo.describe(),
+            "local repository /tmp/origin.git"
+        );
+
+        let work_local = mk_ctx(
+            super::TaskRepo::LocalGit {
+                git_dir: std::path::PathBuf::from("/tmp/work"),
+                bare: false,
+            },
+            Some("/tmp/work"),
+        );
+        assert!(!work_local.is_landable());
+
+        let remote_mirror = mk_ctx(
+            super::TaskRepo::LocalGit {
+                git_dir: std::path::PathBuf::from("/tmp/mirror.git"),
+                bare: true,
+            },
+            Some("https://github.com/org/repo.git"),
+        );
+        assert!(!remote_mirror.is_landable());
+
+        let d6_default = mk_ctx(
+            super::TaskRepo::D6Ledger {
+                project: "default".to_string(),
+            },
+            None,
+        );
+        assert!(d6_default.is_landable());
+        assert!(d6_default.repo.local_git_dir().is_none());
+        assert_eq!(d6_default.repo.describe(), "D6 ledger project \"default\"");
+
+        let d6_remote = mk_ctx(
+            super::TaskRepo::D6Ledger {
+                project: "https://github.com/org/repo.git".to_string(),
+            },
+            Some("https://github.com/org/repo.git"),
+        );
+        assert!(!d6_remote.is_landable());
+        assert_eq!(
+            d6_remote.repo.describe(),
+            "D6 ledger project \"https://github.com/org/repo.git\""
+        );
     }
 }
