@@ -30,7 +30,7 @@ pub mod reply;
 mod snapshot;
 
 pub use classify::{RulesVerdict, attention_reason, narrow, rules};
-pub use judge::{JudgeError, JudgeInput, Judgement, StateJudge, TurnFact};
+pub use judge::{ExecutionPhase, JudgeError, JudgeInput, Judgement, StateJudge, TurnFact};
 pub use observer::{NO_JUDGE, ObservationContext, Observer};
 
 /// A live execution with no open tool and no fact for this long is ambiguous.

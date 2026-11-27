@@ -11,7 +11,8 @@ use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
 use spawn_core::memory::MemoryStore;
 use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState, WaitReason};
 use spawn_core::observe::{
-    JudgeError, JudgeInput, Judgement, ObservationContext, Observer, StateJudge, narrow,
+    ExecutionPhase, JudgeError, JudgeInput, Judgement, ObservationContext, Observer, StateJudge,
+    narrow,
 };
 use spawn_core::port::EventLog;
 use spawn_core::screen::ScreenState;
@@ -547,7 +548,14 @@ fn a_failing_exit_asks_for_attention_whatever_the_model_says() {
     );
     fixture.observer.tick().expect("tick");
     let seen = judge.seen.lock().expect("lock").clone().expect("input");
-    assert_eq!(seen.exit_code, Some(1), "the model sees the status");
+    assert_eq!(
+        seen.phase,
+        ExecutionPhase::Ended {
+            cause: EndCause::Exited,
+            exit_code: Some(1)
+        },
+        "the model sees the status"
+    );
     let last = observations(&fixture.store).pop().expect("an observation");
     assert_eq!(last.rules_state, Some(SemanticState::Blocked));
     assert!(last.attention);

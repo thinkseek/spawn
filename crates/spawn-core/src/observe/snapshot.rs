@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use super::SCREEN_STALE;
-use super::judge::{JudgeInput, TurnFact};
-use crate::event::{CommandStep, EndCause, EventKind, EventRecord, JobKind, SessionSeq, Source};
+use super::judge::{ExecutionPhase, JudgeInput, TurnFact};
+use crate::event::{CommandStep, EventKind, EventRecord, JobKind, SessionSeq, Source};
 use crate::id::{AgentId, ExecutionId, SessionId, WorkspaceId};
 use crate::screen::ScreenState;
 use crate::time::Timestamp;
@@ -19,11 +19,8 @@ pub(super) struct Snapshot {
     workspace: Option<WorkspaceId>,
     /// The session's transcript, as its engine reported it.
     transcript: Option<String>,
-    pub(super) execution_active: bool,
-    /// The current execution's end, whose final checkpoint keeps failing:
-    /// its workspace stays mounted until someone acts.
-    stalled_end: Option<EndCause>,
-    last_end: Option<EndCause>,
+    /// Where the newest execution is in its life.
+    pub(super) phase: ExecutionPhase,
     open_tools: HashSet<String>,
     /// The background jobs the current execution started and that have not
     /// ended, by id, with their kind and when they started. A turn's end
@@ -41,7 +38,6 @@ pub(super) struct Snapshot {
     /// to a clean end, where the judge read it as the turn's (live
     /// dogfooding, mission #7: false WAITING alerts on finished tasks).
     last_error: Option<String>,
-    exit_code: Option<i32>,
     pub(super) evidence_seq: SessionSeq,
     last_fact_at: Option<Timestamp>,
     /// When the engine last moved: its latest transcript fact, or the
@@ -114,10 +110,10 @@ impl Snapshot {
             EventKind::ExecutionEnded {
                 cause, exit_code, ..
             } => {
-                self.execution_active = false;
-                self.stalled_end = None;
-                self.last_end = Some(*cause);
-                self.exit_code = *exit_code;
+                self.phase = ExecutionPhase::Ended {
+                    cause: *cause,
+                    exit_code: *exit_code,
+                };
                 self.open_tools.clear();
                 self.open_jobs.clear();
                 // The pane is gone with the execution; nothing on it is a
@@ -125,11 +121,14 @@ impl Snapshot {
                 self.screen = None;
                 self.permission_pending = false;
             }
+            // Only a live execution's end can stall: the Bridge writes the
+            // stall while it still holds the execution, before its end.
             EventKind::ExecutionEndStalled { cause, .. }
-                if record.event.execution_id.is_none()
-                    || record.event.execution_id == self.execution =>
+                if self.phase.is_live()
+                    && (record.event.execution_id.is_none()
+                        || record.event.execution_id == self.execution) =>
             {
-                self.stalled_end = Some(*cause);
+                self.phase = ExecutionPhase::EndStalled(*cause);
                 // The Bridge killed the terminal: nothing on it is current.
                 self.screen = None;
                 self.permission_pending = false;
@@ -215,7 +214,7 @@ impl Snapshot {
         let same_execution =
             record.event.execution_id.is_none() || record.event.execution_id == self.execution;
         match &record.event.kind {
-            EventKind::JobStarted { job_id, kind } if self.execution_active && same_execution => {
+            EventKind::JobStarted { job_id, kind } if self.phase.is_live() && same_execution => {
                 self.open_jobs
                     .insert(job_id.clone(), (*kind, record.recorded_at));
             }
@@ -231,10 +230,7 @@ impl Snapshot {
         self.engine = Some(engine.to_string());
         self.workspace = Some(workspace.clone());
         self.execution = execution.cloned();
-        self.execution_active = true;
-        self.stalled_end = None;
-        self.last_end = None;
-        self.exit_code = None;
+        self.phase = ExecutionPhase::Running;
         self.open_tools.clear();
         self.open_jobs.clear();
         self.permission_pending = false;
@@ -246,7 +242,7 @@ impl Snapshot {
     /// The running execution's workspace and the session's transcript:
     /// where the model's latest reply is read.
     pub(super) fn transcript(&self) -> Option<(&WorkspaceId, &str)> {
-        if !self.execution_active {
+        if !self.phase.is_live() {
             return None;
         }
         Some((self.workspace.as_ref()?, self.transcript.as_deref()?))
@@ -272,10 +268,7 @@ impl Snapshot {
             agent_id: agent_id.to_string(),
             session_id: session_id.to_string(),
             engine: self.engine.clone(),
-            execution_active: self.execution_active,
-            stalled_end: self.stalled_end,
-            last_end: self.last_end,
-            exit_code: self.exit_code,
+            phase: self.phase,
             open_tools: self.open_tools.len(),
             open_jobs: self.open_jobs.len(),
             oldest_job_ms: self.open_jobs.values().map(|(_, at)| since(*at)).max(),
@@ -621,5 +614,180 @@ mod tests {
             Timestamp(10_000),
         );
         assert_eq!(input.open_jobs, 0);
+    }
+
+    type Step = (Option<ExecutionId>, EventKind);
+
+    fn exec(id: &str) -> Option<ExecutionId> {
+        ExecutionId::new(id).ok()
+    }
+
+    fn start(id: &str) -> Step {
+        (exec(id), started().1)
+    }
+
+    fn stall(id: Option<ExecutionId>, cause: crate::event::EndCause) -> Step {
+        (
+            id,
+            EventKind::ExecutionEndStalled {
+                cause,
+                exit_code: None,
+                failures: 3,
+                error: "checkpoint failed".to_string(),
+            },
+        )
+    }
+
+    fn end(id: Option<ExecutionId>, cause: crate::event::EndCause, exit_code: Option<i32>) -> Step {
+        (
+            id,
+            EventKind::ExecutionEnded {
+                cause,
+                exit_code,
+                signal: None,
+                evidence: None,
+            },
+        )
+    }
+
+    /// The phase a fresh snapshot is in after `steps`, all from the Bridge.
+    fn phase_after(steps: Vec<Step>) -> super::ExecutionPhase {
+        let mut snapshot = Snapshot::default();
+        for (n, (execution_id, kind)) in (1_u64..).zip(steps) {
+            snapshot.apply(&EventRecord {
+                position: GlobalPosition(n),
+                session_seq: SessionSeq(n),
+                recorded_at: Timestamp(i64::try_from(n).expect("small") * 1_000),
+                event: NewEvent {
+                    agent_id: AgentId::new("agent_w").expect("valid agent"),
+                    session_id: SessionId::new("session_w").expect("valid session"),
+                    execution_id,
+                    source: Source::Bridge,
+                    source_event_id: None,
+                    kind,
+                },
+            });
+        }
+        snapshot.phase
+    }
+
+    /// Every phase, under every event that moves one, ends where the log
+    /// says it must: a start runs, an end of the current (or an unnamed)
+    /// execution ends, a stall stalls only a live execution, and a report
+    /// of another execution changes nothing.
+    #[test]
+    fn every_phase_moves_only_as_the_log_allows() {
+        use super::ExecutionPhase::{self, EndStalled, Ended, NeverRan, Running};
+        use crate::event::EndCause;
+
+        for id in ["exec_1", "exec_2", "exec_9"] {
+            assert!(exec(id).is_some(), "{id} is a valid execution id");
+        }
+
+        let ended_before = Ended {
+            cause: EndCause::Exited,
+            exit_code: Some(3),
+        };
+        // How each phase is reached, all on `exec_1`.
+        let reach = |phase: ExecutionPhase| match phase {
+            NeverRan => vec![],
+            Running => vec![start("exec_1")],
+            EndStalled(_) => vec![start("exec_1"), stall(exec("exec_1"), EndCause::Stopped)],
+            Ended { .. } => vec![
+                start("exec_1"),
+                end(exec("exec_1"), EndCause::Exited, Some(3)),
+            ],
+        };
+        let stalled_before = EndStalled(EndCause::Stopped);
+        let starts = [NeverRan, Running, stalled_before, ended_before];
+        for (name, starting) in starts.into_iter().enumerate() {
+            assert_eq!(phase_after(reach(starting)), starting, "reaching {name}");
+        }
+        let lost = EndStalled(EndCause::Lost);
+        let clean = Ended {
+            cause: EndCause::Stopped,
+            exit_code: Some(0),
+        };
+        // (event, phase after it from NeverRan, Running, EndStalled, Ended)
+        let table = [
+            ("start of a new execution", start("exec_2"), [Running; 4]),
+            (
+                "stall of the current execution",
+                stall(exec("exec_1"), EndCause::Lost),
+                [NeverRan, lost, lost, ended_before],
+            ),
+            (
+                "stall with no execution",
+                stall(None, EndCause::Lost),
+                [NeverRan, lost, lost, ended_before],
+            ),
+            (
+                "stall of another execution",
+                stall(exec("exec_9"), EndCause::Lost),
+                [NeverRan, Running, stalled_before, ended_before],
+            ),
+            (
+                "end of the current execution",
+                end(exec("exec_1"), EndCause::Stopped, Some(0)),
+                [clean; 4],
+            ),
+            (
+                "end with no execution",
+                end(None, EndCause::Stopped, Some(0)),
+                [clean; 4],
+            ),
+            (
+                "end of another execution",
+                end(exec("exec_9"), EndCause::Stopped, Some(0)),
+                [clean, Running, stalled_before, ended_before],
+            ),
+        ];
+        for (what, step, after) in table {
+            for (starting, expected) in starts.into_iter().zip(after) {
+                let mut events = reach(starting);
+                events.push(step.clone());
+                assert_eq!(phase_after(events), expected, "{what} from {starting:?}");
+            }
+        }
+    }
+
+    /// The jobs and transcript of an execution whose end stalled still
+    /// count: it holds its terminal's workspace until the end gets through.
+    #[test]
+    fn a_stalled_execution_is_still_live() {
+        use crate::event::{EndCause, JobKind};
+
+        let mut snapshot = Snapshot::default();
+        apply_ev(&mut snapshot, 1, Source::Bridge, started().1);
+        apply_ev(
+            &mut snapshot,
+            2,
+            Source::Bridge,
+            EventKind::ExecutionEndStalled {
+                cause: EndCause::Stopped,
+                exit_code: Some(0),
+                failures: 3,
+                error: "checkpoint failed".to_string(),
+            },
+        );
+        apply_ev(
+            &mut snapshot,
+            3,
+            Source::Claude,
+            EventKind::JobStarted {
+                job_id: "job_1".to_string(),
+                kind: JobKind::Bash,
+            },
+        );
+        let input = snapshot.input(
+            &AgentId::new("agent_w").expect("valid"),
+            &SessionId::new("session_w").expect("valid"),
+            Timestamp(10_000),
+        );
+        assert_eq!(
+            input.phase,
+            super::ExecutionPhase::EndStalled(EndCause::Stopped)
+        );
+        assert_eq!(input.open_jobs, 1);
     }
 }
