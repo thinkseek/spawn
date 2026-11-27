@@ -1,14 +1,19 @@
-import { Crosshair, RotateCcw, X } from "lucide-react";
+import { Check, Copy, Crosshair, RotateCcw, X } from "lucide-react";
 import { motion } from "motion/react";
-import type { ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { clockTime, formatDuration, relativeTime, stageDuration } from "../../format";
 import { PHASE_LABEL } from "../../missionTimeline";
 import type { Lane, TaskBar } from "../../missionTimeline";
-import { formatTaskGrading, stageStep } from "../../missions";
+import {
+  formatTaskGrading,
+  stageStep,
+  taskReviewCommands,
+  type TaskReviewCommand,
+} from "../../missions";
 import { taskTitle } from "../../ordering";
 import { VerdictBadge } from "../rsi/Phase";
-import { cx } from "../ui";
+import { FOCUS_RING, cx } from "../ui";
 import { TaskText, useTaskTexts } from "./TaskTexts";
 import { AgentLink, Collapsible, TaskGradingDetails } from "./parts";
 import { TaskActivityLine } from "./TaskActivity";
@@ -41,6 +46,7 @@ export function TaskPanel({
 }) {
   const task = bar.task;
   const grading = formatTaskGrading(task);
+  const reviewCommands = taskReviewCommands(task.id);
   // Opened, the task's texts are read in full (the board sends their first
   // lines).
   const texts = useTaskTexts(task, true);
@@ -246,6 +252,8 @@ export function TaskPanel({
           )}
         </section>
 
+        <TaskReviewCliPanel commands={reviewCommands} />
+
         {task.brief && (
           <Collapsible label="Brief">
             <TaskText
@@ -273,6 +281,112 @@ export function TaskPanel({
       </div>
     </motion.aside>
   );
+}
+
+function TaskReviewCliPanel({ commands }: { commands: readonly TaskReviewCommand[] }) {
+  const [feedback, setFeedback] = useState<{ command: string; state: "copied" | "failed" } | null>(
+    null,
+  );
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    setFeedback(null);
+    return () => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [commands]);
+
+  if (commands.length === 0) return null;
+
+  const copyCommand = (command: string) => {
+    const show = (state: "copied" | "failed") => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+      }
+      setFeedback({ command, state });
+      timerRef.current = window.setTimeout(() => {
+        setFeedback(null);
+        timerRef.current = null;
+      }, 1_500);
+    };
+    if (navigator.clipboard) {
+      void navigator.clipboard.writeText(command).then(
+        () => show("copied"),
+        () => show(copyCommandText(command) ? "copied" : "failed"),
+      );
+    } else {
+      show(copyCommandText(command) ? "copied" : "failed");
+    }
+  };
+
+  return (
+    <Collapsible label="Review & land CLI">
+      <ul className="space-y-1.5">
+        {commands.map((item) => {
+          const state = feedback?.command === item.command ? feedback.state : null;
+          return (
+            <li key={item.command} className="space-y-0.5">
+              <div className="text-micro text-muted-foreground">{item.label}</div>
+              <div className="flex min-w-0 items-center gap-1.5">
+                <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded bg-muted/60 px-2 py-1 font-mono text-micro text-foreground select-all">
+                  {item.command}
+                </code>
+                <button
+                  type="button"
+                  onClick={() => copyCommand(item.command)}
+                  title={
+                    state === "failed"
+                      ? `Could not copy; select command: ${item.command}`
+                      : `Copy command: ${item.command}`
+                  }
+                  aria-label={`Copy ${item.command}`}
+                  className={cx(
+                    "inline-flex h-6 shrink-0 items-center gap-1 rounded-chip px-1.5 text-micro text-faint-foreground hover:bg-surface-hover hover:text-foreground",
+                    FOCUS_RING,
+                  )}
+                >
+                  {state === "copied" ? (
+                    <Check size={11} aria-hidden="true" />
+                  ) : (
+                    <Copy size={11} aria-hidden="true" />
+                  )}
+                  {state === "copied" ? (
+                    <span>Copied</span>
+                  ) : state === "failed" ? (
+                    <span className="text-destructive">Not copied</span>
+                  ) : (
+                    <span>Copy</span>
+                  )}
+                </button>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </Collapsible>
+  );
+}
+
+/** Plain-HTTP clipboard fallback for environments where `navigator.clipboard` is unavailable. */
+function copyCommandText(text: string): boolean {
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch {
+    copied = false;
+  }
+  document.body.removeChild(area);
+  return copied;
 }
 
 function Label({ children }: { children: ReactNode }) {
