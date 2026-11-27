@@ -174,7 +174,13 @@ pub struct LedgerRef {
 /// Hexagonal transactional ref & snapshot ledger abstraction (implemented over
 /// `spawn-postgres` in callers/tests, keeping `spawn-host` decoupled from PG drivers).
 pub trait RefLedger {
-    /// Idempotently record a snapshot row (`spawn_snapshots`).
+    /// Idempotently record a snapshot row (`spawn_snapshots`) and return the
+    /// canonical snapshot id.
+    ///
+    /// The returned id may differ from `id` when a concurrent writer already
+    /// recorded the same Git commit (`git_oid`, `tree`, `parents`, `project`)
+    /// under another digest; callers must reference the returned id in
+    /// subsequent ref moves so `spawn_refs.snapshot` foreign keys hold.
     fn record_snapshot(
         &self,
         id: &Digest,
@@ -260,11 +266,11 @@ impl RefLedger for InMemoryRefLedger {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = guard.snapshots.get(id) {
+            // `created_at_ms` is first-writer-wins metadata (mirrors SQL).
             if existing.git_oid == *git_oid
                 && existing.tree == *tree
                 && existing.parents == parents
                 && existing.project == project
-                && existing.created_at_ms == created_at_ms
             {
                 return Ok(existing.id.clone());
             }
@@ -273,6 +279,13 @@ impl RefLedger for InMemoryRefLedger {
             )));
         }
         if let Some(other) = guard.by_oid.get(git_oid) {
+            if let Some(existing) = guard.snapshots.get(other)
+                && existing.tree == *tree
+                && existing.parents == parents
+                && existing.project == project
+            {
+                return Ok(existing.id.clone());
+            }
             return Err(D6StoreError::Ledger(format!(
                 "git_oid {git_oid} already mapped to snapshot {other}"
             )));
@@ -1015,7 +1028,7 @@ impl CasMerkleStore {
         snapshot_id: &Digest,
         git_oid: &GitOid,
     ) -> Result<u64, D6StoreError> {
-        let _ = ledger.record_snapshot(
+        let canonical = ledger.record_snapshot(
             snapshot_id,
             git_oid,
             req.tree,
@@ -1023,6 +1036,7 @@ impl CasMerkleStore {
             req.project,
             req.created_at_ms,
         )?;
+        let snapshot_id = &canonical;
         let ref_seq = match req.kind {
             D6RefKind::Main => ledger.land_main_ref(
                 req.project,

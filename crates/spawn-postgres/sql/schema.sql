@@ -9722,10 +9722,18 @@ create trigger spawn_ref_log_untruncated
     before truncate on spawn_ref_log
     for each statement execute function spawn_ref_log_unchanged();
 
--- Record a snapshot idempotently (owner only). Returns `p_id` when newly
--- inserted or already recorded with identical `(git_oid, tree, parents,
--- project, created_at_ms)`; raises `23505` if `p_id` exists with different
--- metadata or `p_git_oid` collides with another snapshot.
+-- Record a snapshot idempotently (owner only) and return the canonical
+-- snapshot id callers must reference afterwards (`spawn_ref_cas`,
+-- `spawn_ref_land_main`). Returns `p_id` when newly inserted. When a row is
+-- already recorded (also by a concurrent writer: `on conflict do nothing`
+-- covers both the `id` primary key and `spawn_snapshots_git_oid_key`):
+--   * same `id`: returns it when `(git_oid, tree, parents, project)` match.
+--     `created_at_ms` is first-writer-wins metadata: concurrent writers of
+--     the same content-addressed snapshot stamp it with their own clocks;
+--   * same `git_oid`, other `id`: returns the existing (canonical) id when
+--     `(tree, parents, project)` match: the same Git commit content recorded
+--     concurrently under another digest.
+-- Anything else raises `23505`.
 create or replace function spawn_snapshot_record(
     p_id text,
     p_git_oid text,
@@ -9750,7 +9758,7 @@ begin
 
     insert into spawn_snapshots (id, git_oid, tree, parents, project, state, created_at_ms)
     values (p_id, p_git_oid, p_tree, v_parents, p_project, 'live', p_created_at_ms)
-    on conflict (id) do nothing
+    on conflict do nothing
     returning id into v_inserted;
 
     if v_inserted is not null then
@@ -9758,15 +9766,30 @@ begin
     end if;
 
     select * into v_existing from spawn_snapshots where id = p_id;
-    if v_existing.git_oid = p_git_oid
-       and v_existing.tree = p_tree
-       and v_existing.parents is not distinct from v_parents
-       and v_existing.project = p_project
-       and v_existing.created_at_ms = p_created_at_ms then
-        return v_existing.id;
+    if found then
+        if v_existing.git_oid = p_git_oid
+           and v_existing.tree = p_tree
+           and v_existing.parents is not distinct from v_parents
+           and v_existing.project = p_project then
+            return v_existing.id;
+        end if;
+        raise exception 'snapshot % is recorded already with different content', p_id
+            using errcode = '23505';
     end if;
 
-    raise exception 'snapshot % is recorded already with different content', p_id
+    select * into v_existing from spawn_snapshots where git_oid = p_git_oid;
+    if found then
+        if v_existing.tree = p_tree
+           and v_existing.parents is not distinct from v_parents
+           and v_existing.project = p_project then
+            return v_existing.id;
+        end if;
+        raise exception 'git_oid % is recorded already as snapshot % with different content',
+            p_git_oid, v_existing.id
+            using errcode = '23505';
+    end if;
+
+    raise exception 'snapshot % conflicts with a row that is not visible', p_id
         using errcode = '23505';
 end $$;
 

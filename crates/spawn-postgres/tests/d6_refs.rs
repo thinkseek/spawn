@@ -149,6 +149,140 @@ fn snapshot_record_is_idempotent_and_rejects_conflicts_or_direct_mutations() {
     assert_eq!(store.get_snapshot(&snap1).expect("read"), Some(got));
 }
 
+/// Regression: concurrent workers commit identical synthetic trees within the
+/// same 1 s Git timestamp, so they project the same `git_oid` under distinct
+/// ids / `created_at_ms`. `spawn_snapshot_record` used `on conflict (id)`, so
+/// the `spawn_snapshots_git_oid_key` collision surfaced as a raw `23505`.
+/// Now every writer gets the canonical id back and can move a ref through it.
+#[test]
+fn snapshot_record_returns_canonical_id_for_concurrent_same_git_oid() {
+    let schema = common::Schema::new("d6_snap_race");
+    let tree = sha256_of_hex("2a");
+    let parent = sha256_of_hex("2b");
+    let oid = oid_of_hex("c7");
+    let first = schema.store();
+    let parent_oid = oid_of_hex("c6");
+    first
+        .record_snapshot(&parent, &parent_oid, &tree, &[], "proj-race", 1)
+        .expect("parent");
+
+    let writers = 8_u8;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(usize::from(writers)));
+    let handles: Vec<_> = (0..writers)
+        .map(|i| {
+            let store = schema.store();
+            let barrier = barrier.clone();
+            let (tree, parent, oid) = (tree.clone(), parent.clone(), oid.clone());
+            std::thread::spawn(move || {
+                let id = format!("sha256:{:02x}{}", i, "e".repeat(62));
+                barrier.wait();
+                let got = store
+                    .record_snapshot(
+                        &id,
+                        &oid,
+                        &tree,
+                        std::slice::from_ref(&parent),
+                        "proj-race",
+                        1_700_000_000_000 + i64::from(i),
+                    )
+                    .expect("same commit recorded concurrently returns canonical id");
+                store
+                    .cas_ref(
+                        "proj-race",
+                        &format!("w/{i}"),
+                        RefKind::Branch,
+                        None,
+                        &got,
+                        "race",
+                    )
+                    .expect("canonical id satisfies the snapshot FK");
+                got
+            })
+        })
+        .collect();
+    let ids: Vec<String> = handles
+        .into_iter()
+        .map(|h| h.join().expect("writer thread"))
+        .collect();
+    assert!(
+        ids.windows(2).all(|w| w[0] == w[1]),
+        "one canonical id: {ids:?}"
+    );
+    let row = first
+        .get_snapshot_by_oid(&oid)
+        .expect("by oid")
+        .expect("row present");
+    assert_eq!(row.id, ids[0]);
+
+    // Sequential replay under yet another id and timestamp is idempotent too.
+    let late = sha256_of_hex("9f");
+    assert_eq!(
+        first
+            .record_snapshot(
+                &late,
+                &oid,
+                &tree,
+                std::slice::from_ref(&parent),
+                "proj-race",
+                7
+            )
+            .expect("late replay"),
+        ids[0]
+    );
+    // Same id, other timestamp: first writer's created_at_ms wins.
+    assert_eq!(
+        first
+            .record_snapshot(
+                &ids[0],
+                &oid,
+                &tree,
+                std::slice::from_ref(&parent),
+                "proj-race",
+                42
+            )
+            .expect("same id, other timestamp"),
+        ids[0]
+    );
+    assert_eq!(
+        first.get_snapshot(&ids[0]).expect("read").expect("row"),
+        row
+    );
+    assert!(first.get_snapshot(&late).expect("read").is_none());
+}
+
+#[test]
+fn snapshot_record_still_refuses_conflicting_git_oid_content() {
+    let (store, _schema) = store("d6_snap_conflict");
+    let first = sha256_of_hex("51");
+    let other = sha256_of_hex("52");
+    let tree = sha256_of_hex("53");
+    let oid = oid_of_hex("d1");
+    store
+        .record_snapshot(&first, &oid, &tree, &[], "proj-c", 10)
+        .expect("first");
+
+    let mismatches: [(String, Vec<String>, &str); 3] = [
+        (sha256_of_hex("54"), vec![], "proj-c"),
+        (tree.clone(), vec![], "proj-other"),
+        (tree.clone(), vec![first.clone()], "proj-c"),
+    ];
+    for (t, parents, project) in &mismatches {
+        let err = store
+            .record_snapshot(&other, &oid, t, parents, project, 11)
+            .expect_err("conflicting git_oid content refused");
+        assert!(
+            matches!(err, StoreError::Backend(ref msg) if msg.contains("23505")),
+            "{err:?}"
+        );
+    }
+    // Same id, different git_oid: still refused.
+    let err = store
+        .record_snapshot(&first, &oid_of_hex("d2"), &tree, &[], "proj-c", 10)
+        .expect_err("same id, other git_oid refused");
+    assert!(matches!(err, StoreError::Backend(ref msg) if msg.contains("23505")));
+    assert!(store.get_snapshot(&other).expect("read").is_none());
+}
+
 fn record_three_snapshots(store: &PostgresStore, project: &str) -> (String, String, String) {
     let tree = sha256_of_hex("aa");
     let snap1 = sha256_of_hex("11");
