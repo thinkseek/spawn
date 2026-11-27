@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::is_lower_hex;
+use crate::codec::{is_build_sha, is_lower_hex, is_node_version};
 use crate::envelope::is_job_id;
 use crate::grant::SignedGrant;
 use crate::json::{self, OrderedMap};
@@ -166,6 +166,13 @@ pub struct Beat {
     pub power: Option<PowerTelemetry>,
     /// Event that triggered this beat.
     pub edge: Edge,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The commit the daemon was built at: 7 to 64 lowercase hex digits
+    /// (absent: an older daemon, or a build that does not know it).
+    pub build_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The daemon's version string: 1 to 64 bytes of printable ASCII.
+    pub node_version: Option<String>,
 }
 
 impl Beat {
@@ -182,7 +189,8 @@ impl Beat {
         Ok(beat)
     }
 
-    /// Validates beat version, hashes, warm bases, job ids, and power telemetry.
+    /// Validates beat version, hashes, warm bases, job ids, power telemetry,
+    /// and the optional `build_sha` and `node_version`.
     pub fn validate(&self) -> Result<(), Error> {
         if self.v != VERSION {
             return Err(Error::Body("v"));
@@ -205,6 +213,20 @@ impl Beat {
         }
         if let Some(power) = &self.power {
             power.validate()?;
+        }
+        if self
+            .build_sha
+            .as_deref()
+            .is_some_and(|sha| !is_build_sha(sha))
+        {
+            return Err(Error::Body("build_sha"));
+        }
+        if self
+            .node_version
+            .as_deref()
+            .is_some_and(|version| !is_node_version(version))
+        {
+            return Err(Error::Body("node_version"));
         }
         Ok(())
     }
@@ -324,7 +346,61 @@ mod tests {
             mem_available_mb: None,
             power: None,
             edge: Edge::Timer,
+            build_sha: None,
+            node_version: None,
         }
+    }
+
+    #[test]
+    fn a_beat_without_build_fields_omits_them_and_parses() {
+        let bytes = beat(0).to_bytes().unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(!text.contains("build_sha") && !text.contains("node_version"));
+        let parsed = Beat::parse(&bytes).unwrap();
+        assert_eq!(parsed.build_sha, None);
+        assert_eq!(parsed.node_version, None);
+    }
+
+    #[test]
+    fn a_beat_build_sha_and_node_version_roundtrip() {
+        let mut with = beat(0);
+        with.build_sha = Some("0123456789abcdef0123456789abcdef01234567".into());
+        with.node_version = Some("0.1.0".into());
+        let bytes = with.to_bytes().unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.ends_with(
+            r#""edge":"timer","build_sha":"0123456789abcdef0123456789abcdef01234567","node_version":"0.1.0"}"#
+        ));
+        assert_eq!(Beat::parse(&bytes).unwrap(), with);
+    }
+
+    #[test]
+    fn a_beat_with_a_bad_build_sha_or_node_version_is_refused() {
+        for sha in ["abc12", "ABCDEF0123", &"a".repeat(65), "xyz1234", ""] {
+            let mut bad = beat(0);
+            bad.build_sha = Some(sha.into());
+            assert_eq!(bad.validate(), Err(Error::Body("build_sha")), "{sha:?}");
+            let bytes = json::to_vec(&bad);
+            assert_eq!(
+                Beat::parse(&bytes),
+                Err(Error::Body("build_sha")),
+                "{sha:?}"
+            );
+        }
+        for version in ["0.1\u{0}", &"1".repeat(65), "ver\u{e9}", "", "a\nb"] {
+            let mut bad = beat(0);
+            bad.node_version = Some(version.into());
+            assert_eq!(
+                bad.validate(),
+                Err(Error::Body("node_version")),
+                "{version:?}"
+            );
+        }
+        // A non-string value is a shape error, not a silent drop.
+        let text = String::from_utf8(beat(0).to_bytes().unwrap())
+            .unwrap()
+            .replace(r#""edge":"timer""#, r#""edge":"timer","build_sha":1234567"#);
+        assert!(matches!(Beat::parse(text.as_bytes()), Err(Error::Shape(_))));
     }
 
     #[test]

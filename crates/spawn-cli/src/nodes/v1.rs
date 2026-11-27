@@ -247,7 +247,24 @@ pub(super) fn json_of(node: &NodeV1, now: i64) -> Value {
         "spec_sha256": node.spec_sha256,
         "warm_bases": node.warm_bases,
         "power": node.power,
+        "build_sha": node.build_sha,
+        "node_version": node.node_version,
     })
+}
+
+/// A v1 node's build in a word: `<node_version>@<first 12 of build_sha>`,
+/// either half alone when the other is unknown, none when both are.
+fn build_summary(node: &NodeV1) -> Option<String> {
+    let sha = node
+        .build_sha
+        .as_deref()
+        .map(|sha| sha.chars().take(12).collect::<String>());
+    match (node.node_version.as_deref(), sha) {
+        (Some(version), Some(sha)) => Some(format!("{version}@{sha}")),
+        (Some(version), None) => Some(version.to_string()),
+        (None, Some(sha)) => Some(format!("@{sha}")),
+        (None, None) => None,
+    }
 }
 
 fn power_summary(power: &Value, low_battery_drain: bool) -> Option<String> {
@@ -302,6 +319,10 @@ fn lines_with_threshold(nodes: &[NodeV1], now: i64, threshold: u8) -> Vec<String
         {
             beat.push_str("  ");
             beat.push_str(&summary);
+        }
+        if let Some(build) = build_summary(node) {
+            beat.push_str("  ");
+            beat.push_str(&build);
         }
         let id: String = node
             .node_id
@@ -447,7 +468,47 @@ mod tests {
             spec: None,
             warm_bases: Vec::new(),
             power: None,
+            build_sha: None,
+            node_version: None,
         }
+    }
+
+    #[test]
+    fn a_v1_nodes_build_sha_and_node_version_show_in_the_list_and_json() {
+        let now = 1_050_000;
+        let mut built = node("n1");
+        built.build_sha = Some("e3f8ca5a66214f0a47f80878c2ceb97a76301dbb".into());
+        built.node_version = Some("0.1.0".into());
+        let mut version_only = node("n2");
+        version_only.node_version = Some("0.1.0".into());
+        let mut sha_only = node("n3");
+        sha_only.build_sha = Some("abc1234".into());
+        let legacy = node("n4");
+        let v1 = vec![built, version_only, sha_only, legacy];
+
+        let table = lines(&v1, now);
+        assert!(
+            table[3].ends_with("50 s ago  0.1.0@e3f8ca5a6621"),
+            "{}",
+            table[3]
+        );
+        assert!(table[4].ends_with("50 s ago  0.1.0"), "{}", table[4]);
+        assert!(table[5].ends_with("50 s ago  @abc1234"), "{}", table[5]);
+        assert!(table[6].ends_with("50 s ago"), "{}", table[6]);
+
+        let merged = merged_json(Value::Null, &v1, now);
+        let merged = merged.as_array().unwrap();
+        assert_eq!(
+            merged[0]["build_sha"],
+            "e3f8ca5a66214f0a47f80878c2ceb97a76301dbb"
+        );
+        assert_eq!(merged[0]["node_version"], "0.1.0");
+        assert_eq!(merged[1]["build_sha"], Value::Null);
+        assert_eq!(merged[2]["node_version"], Value::Null);
+        // A node whose daemon sends neither still carries both keys, null.
+        let legacy = merged[3].as_object().unwrap();
+        assert_eq!(legacy.get("build_sha"), Some(&Value::Null));
+        assert_eq!(legacy.get("node_version"), Some(&Value::Null));
     }
 
     /// The fixture's primary key (design §7, keys.json).

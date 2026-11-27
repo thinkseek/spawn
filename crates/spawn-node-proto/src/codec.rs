@@ -5,7 +5,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 pub use spawn_core::node_proto::codec::{
-    EMPTY_SHA256, MAX_SAFE, hex, is_lower_hex, parse_decimal, sha256, sha256_hex, unhex,
+    EMPTY_SHA256, MAX_BUILD_SHA_LEN, MAX_NODE_VERSION_LEN, MAX_SAFE, MIN_BUILD_SHA_LEN, hex,
+    is_build_sha, is_lower_hex, is_node_version, parse_decimal, sha256, sha256_hex, unhex,
 };
 
 use crate::Error;

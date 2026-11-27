@@ -243,7 +243,34 @@ pub struct NodeV1 {
     /// Power/thermal telemetry reported in heartbeats, if available.
     #[serde(default)]
     pub power: Option<Value>,
+    /// The commit the node's daemon was built at, from its last beat's
+    /// `build_sha` (7 to 64 lowercase hex); none from a daemon that does
+    /// not send it, or before its first beat.
+    #[serde(default)]
+    pub build_sha: Option<String>,
+    /// The node's daemon version, from its last beat's `node_version`
+    /// (printable ASCII, at most 64 bytes); none when not sent.
+    #[serde(default)]
+    pub node_version: Option<String>,
 }
+
+/// The fields `nodes_v1`/`node_v1` read out of a node's last beat
+/// (`spawn_node_state.beat`), each null unless well formed: `power` an
+/// object, `build_sha` 7 to 64 lowercase hex, `node_version` 1 to 64
+/// printable ASCII characters. The gateway refuses a beat with a malformed
+/// one; the checks here keep a row written another way from reaching the
+/// readers.
+const NODE_V1_BEAT_FIELDS: &str = "jsonb_build_object(
+        'power',
+        case when jsonb_typeof(n.beat -> 'power') = 'object' then n.beat -> 'power' end,
+        'build_sha',
+        case when jsonb_typeof(n.beat -> 'build_sha') = 'string'
+                  and n.beat ->> 'build_sha' ~ '^[0-9a-f]{7,64}$'
+             then n.beat -> 'build_sha' end,
+        'node_version',
+        case when jsonb_typeof(n.beat -> 'node_version') = 'string'
+                  and n.beat ->> 'node_version' ~ '^[\x20-\x7e]{1,64}$'
+             then n.beat -> 'node_version' end)";
 
 /// `POST /node/v1/enroll`'s call: the token's digest, the node's new key,
 /// its boot id and its spec (hashed by the gateway).
@@ -560,17 +587,12 @@ impl PostgresStore {
     /// `spawn node list` beside the P1 nodes (PR S4).
     pub fn nodes_v1(&self) -> Result<Vec<NodeV1>, StoreError> {
         decode(self.query_json(
-            "select coalesce(jsonb_agg(
-                              (to_jsonb(n) - 'pubkey' - 'enroll_token_sha256')
-                              || jsonb_build_object(
-                                   'power',
-                                   case when jsonb_typeof(n.beat -> 'power') = 'object'
-                                        then n.beat -> 'power'
-                                        else null
-                                   end
-                                 )
-                              order by n.name), '[]'::jsonb)
-               from spawn_node_state n",
+            &format!(
+                "select coalesce(jsonb_agg(
+                                  (to_jsonb(n) - 'pubkey' - 'enroll_token_sha256') || {NODE_V1_BEAT_FIELDS}
+                                  order by n.name), '[]'::jsonb)
+                   from spawn_node_state n"
+            ),
             &[],
         )?)
     }
@@ -593,15 +615,10 @@ impl PostgresStore {
     /// One v1 node by name, or `None`.
     pub fn node_v1(&self, name: &str) -> Result<Option<NodeV1>, StoreError> {
         self.query_opt_json(
-            "select (to_jsonb(n) - 'pubkey' - 'enroll_token_sha256')
-                    || jsonb_build_object(
-                         'power',
-                         case when jsonb_typeof(n.beat -> 'power') = 'object'
-                              then n.beat -> 'power'
-                              else null
-                         end
-                       )
-               from spawn_node_state n where n.name = $1",
+            &format!(
+                "select (to_jsonb(n) - 'pubkey' - 'enroll_token_sha256') || {NODE_V1_BEAT_FIELDS}
+                   from spawn_node_state n where n.name = $1"
+            ),
             &[&name],
         )?
         .map(decode)
