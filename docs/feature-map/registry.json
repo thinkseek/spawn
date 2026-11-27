@@ -1473,6 +1473,7 @@
         "crates/spawn-host/tests/cow.rs",
         "crates/spawn-host/tests/d6_border.rs",
         "crates/spawn-host/tests/d6_layer0_cutover.rs",
+        "crates/spawn-host/tests/d6_ledger_canonical.rs",
         "crates/spawn-host/tests/d6_merge_oracle.rs",
         "crates/spawn-host/tests/d6_workspace.rs",
         "docs/cross-os-cow-storage.md",
@@ -1513,7 +1514,8 @@
           "crates/spawn-cas/tests/store.rs",
           "crates/spawn-host/tests/cow.rs",
           "crates/spawn-host/tests/d6_layer0_cutover.rs",
-          "crates/spawn-host/tests/d6_workspace.rs"
+          "crates/spawn-host/tests/d6_workspace.rs",
+          "crates/spawn-host/tests/d6_ledger_canonical.rs"
         ],
         "deploys": [],
         "artifacts": [
@@ -2958,9 +2960,11 @@
         "rsi/scenarios/nightly/149.sh",
         "rsi/scenarios/nightly/238.sh",
         "scripts/check-runtime-dir.sh",
+        "scripts/fleet-sync-node.sh",
         "scripts/maintenance.sh",
         "scripts/sandbox.sh",
         "scripts/stage.sh",
+        "scripts/test-fleet-sync-node.sh",
         "scripts/test-maintenance.sh"
       ],
       "relations": [],
@@ -2981,7 +2985,8 @@
           "deploy/test-on-landing.sh",
           "scripts/test-web-install.sh",
           "deploy/test-sync-units.sh",
-          "rsi/scenarios/check-sync-units.sh"
+          "rsi/scenarios/check-sync-units.sh",
+          "scripts/test-fleet-sync-node.sh"
         ],
         "deploys": [],
         "artifacts": [
