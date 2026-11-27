@@ -283,6 +283,236 @@ validate_edge_mode() {
   fi
 }
 
+# node_edge_env_path: host environment file read optionally by spawn-node-edge.service.
+node_edge_env_path() {
+  printf '%s' "${SPAWN_NODE_EDGE_ENV:-$HOME/.config/spawn/node-edge.env}"
+}
+
+# file_mode_octal <path>: GNU or BSD octal permissions (e.g. 600), empty if missing.
+file_mode_octal() {
+  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null || true
+}
+
+# nearest_existing_path <path>: walk upward until an existing path or root/dot.
+nearest_existing_path() {
+  local dir=$1
+  while [ ! -e "$dir" ] && [ "$dir" != / ] && [ "$dir" != . ]; do
+    dir=$(dirname "$dir")
+  done
+  printf '%s' "$dir"
+}
+
+# read_env_var_from_file <file> <key> <out_var>: pure-bash assignment reader
+# (never sources the file and never prints its value; last match wins).
+read_env_var_from_file() {
+  local file=$1 key=$2 out_var=$3 val="" line="" found=0
+  if [ -f "$file" ] && [ -r "$file" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=${line%$'\r'}
+      line=${line#"${line%%[![:space:]]*}"}
+      case $line in
+      "" | \#*) continue ;;
+      export[[:space:]]*)
+        line=${line#export}
+        line=${line#"${line%%[![:space:]]*}"}
+        ;;
+      esac
+      case $line in
+      "${key}="*)
+        val=${line#*=}
+        if [ "${#val}" -ge 2 ]; then
+          case $val in
+          \"*\")
+            val=${val#\"}
+            val=${val%\"}
+            ;;
+          \'*\')
+            val=${val#\'}
+            val=${val%\'}
+            ;;
+          esac
+        fi
+        found=1
+        ;;
+      esac
+    done <"$file"
+  fi
+  if [ "$found" -eq 1 ]; then
+    printf -v "$out_var" '%s' "$val"
+  else
+    printf -v "$out_var" '%s' ""
+  fi
+}
+
+# valid_serve_token <token>: visible ASCII only (no spaces, newlines, or control bytes).
+valid_serve_token() {
+  local tok=$1 LC_ALL=C
+  [ -n "$tok" ] && [[ $tok =~ ^[!-~]+$ ]]
+}
+
+# format_serve_token_line <token> <out_var>: format SPAWN_SERVE_TOKEN=... without printing.
+format_serve_token_line() {
+  local tok=$1 out_var=$2 escaped=""
+  case $tok in
+  *\'* | *\"* | *\\* | *\#*)
+    if [[ $tok != *\'* ]]; then
+      printf -v "$out_var" "SPAWN_SERVE_TOKEN='%s'" "$tok"
+    else
+      escaped=${tok//\\/\\\\}
+      escaped=${escaped//\"/\\\"}
+      printf -v "$out_var" 'SPAWN_SERVE_TOKEN="%s"' "$escaped"
+    fi
+    ;;
+  *)
+    printf -v "$out_var" 'SPAWN_SERVE_TOKEN=%s' "$tok"
+    ;;
+  esac
+}
+
+# check_node_edge_env_clean <edge_env> <prefix>: enforce regular-file and zero-DB boundary.
+check_node_edge_env_clean() {
+  local edge_env=$1 prefix=$2
+  if [ -L "$edge_env" ]; then
+    printf '%s %s must be a regular file, not a symlink\n' "$prefix" "$edge_env" >&2
+    return 1
+  fi
+  if [ -e "$edge_env" ] && [ ! -f "$edge_env" ]; then
+    printf '%s %s must be a regular file\n' "$prefix" "$edge_env" >&2
+    return 1
+  fi
+  if [ -f "$edge_env" ]; then
+    if [ ! -r "$edge_env" ]; then
+      printf '%s %s is not readable\n' "$prefix" "$edge_env" >&2
+      return 1
+    fi
+    if grep -qiE 'DATABASE_URL|spawn\.env' "$edge_env"; then
+      printf '%s %s references DATABASE_URL or spawn.env (zero-DB boundary violated; contents not printed)\n' "$prefix" "$edge_env" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# check_phase2_edge_auth: pure read-only preflight for SPAWN_SERVE_TOKEN sync into
+# node-edge.env (zero disk writes, zero secret echo).
+check_phase2_edge_auth() {
+  local spawn_env=$live/spawn.env edge_env edge_dir parent spawn_tok="" edge_tok=""
+  edge_env=$(node_edge_env_path)
+  edge_dir=$(dirname "$edge_env")
+  check_node_edge_env_clean "$edge_env" "deploy: precheck failed:" || return 1
+  if [ -e "$spawn_env" ] && [ ! -r "$spawn_env" ]; then
+    printf 'deploy: precheck failed: %s is not readable\n' "$spawn_env" >&2
+    return 1
+  fi
+  read_env_var_from_file "$spawn_env" SPAWN_SERVE_TOKEN spawn_tok
+  if [ -n "$spawn_tok" ]; then
+    if ! valid_serve_token "$spawn_tok"; then
+      printf 'deploy: precheck failed: SPAWN_SERVE_TOKEN in %s contains invalid whitespace or control characters (not printed)\n' "$spawn_env" >&2
+      return 1
+    fi
+    if [ -f "$edge_env" ]; then
+      read_env_var_from_file "$edge_env" SPAWN_SERVE_TOKEN edge_tok
+      if [ "$edge_tok" != "$spawn_tok" ] || [ "$(file_mode_octal "$edge_env")" != "600" ]; then
+        if [ ! -w "$edge_dir" ] || [ ! -w "$edge_env" ]; then
+          printf 'deploy: precheck failed: cannot sync SPAWN_SERVE_TOKEN into %s (not writable)\n' "$edge_env" >&2
+          return 1
+        fi
+        say "phase2 cutover precheck note: SPAWN_SERVE_TOKEN in $spawn_env will be synced into $edge_env (mode 0600) on go-uds deploy"
+      fi
+    else
+      if [ -L "$edge_dir" ] && [ ! -d "$edge_dir" ]; then
+        printf 'deploy: precheck failed: %s is a broken symlink\n' "$edge_dir" >&2
+        return 1
+      fi
+      if [ -e "$edge_dir" ]; then
+        if [ ! -d "$edge_dir" ] || [ ! -w "$edge_dir" ]; then
+          printf 'deploy: precheck failed: cannot create %s (%s not writable directory)\n' "$edge_env" "$edge_dir" >&2
+          return 1
+        fi
+      else
+        parent=$(nearest_existing_path "$edge_dir")
+        if [ ! -d "$parent" ] || [ ! -w "$parent" ]; then
+          printf 'deploy: precheck failed: cannot create %s (parent %s not writable)\n' "$edge_env" "$parent" >&2
+          return 1
+        fi
+      fi
+      say "phase2 cutover precheck note: $edge_env is absent; SPAWN_SERVE_TOKEN from $spawn_env will be provisioned into $edge_env (mode 0600) on go-uds deploy"
+    fi
+  elif [ -f "$edge_env" ]; then
+    read_env_var_from_file "$edge_env" SPAWN_SERVE_TOKEN edge_tok
+    if [ -n "$edge_tok" ] && ! valid_serve_token "$edge_tok"; then
+      printf 'deploy: precheck failed: SPAWN_SERVE_TOKEN in %s contains invalid whitespace or control characters (not printed)\n' "$edge_env" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# sync_node_edge_env: if spawn.env defines SPAWN_SERVE_TOKEN, atomically sync ONLY
+# SPAWN_SERVE_TOKEN into node-edge.env with strict 0600 permissions and zero DB vars.
+sync_node_edge_env() {
+  local spawn_env=$live/spawn.env edge_env edge_dir spawn_tok="" token_line="" mode="" rc=0
+  edge_env=$(node_edge_env_path)
+  edge_dir=$(dirname "$edge_env")
+  check_node_edge_env_clean "$edge_env" "deploy: error:" ||
+    die "phase2 edge auth refused: $edge_env failed safety check (zero-DB boundary / regular file required)"
+  if [ -e "$spawn_env" ] && [ ! -r "$spawn_env" ]; then
+    die "phase2 edge auth refused: $spawn_env is not readable"
+  fi
+  read_env_var_from_file "$spawn_env" SPAWN_SERVE_TOKEN spawn_tok
+  if [ -z "$spawn_tok" ]; then
+    return 0
+  fi
+  valid_serve_token "$spawn_tok" ||
+    die "phase2 edge auth refused: SPAWN_SERVE_TOKEN in $spawn_env contains invalid whitespace or control characters (not printed)"
+  format_serve_token_line "$spawn_tok" token_line
+  (
+    set -euo pipefail
+    umask 077
+    mkdir -p "$edge_dir"
+    tmp=$(mktemp "$edge_dir/.node-edge.env.XXXXXX")
+    cleanup_tmp() { rm -f "$tmp"; }
+    trap cleanup_tmp EXIT
+    if [ -f "$edge_env" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        if [[ $line =~ ^[[:space:]]*(export[[:space:]]+)?SPAWN_SERVE_TOKEN= ]]; then
+          continue
+        fi
+        printf '%s\n' "$line" >>"$tmp"
+      done <"$edge_env"
+    fi
+    printf '%s\n' "$token_line" >>"$tmp"
+    chmod 0600 "$tmp"
+    if grep -qiE 'DATABASE_URL|spawn\.env' "$tmp"; then
+      exit 1
+    fi
+    if [ -f "$edge_env" ] && cmp -s "$tmp" "$edge_env"; then
+      rm -f "$tmp"
+      chmod 0600 "$edge_env"
+      exit 0
+    fi
+    mv -f "$tmp" "$edge_env"
+    chmod 0600 "$edge_env"
+    exit 10
+  ) || rc=$?
+  case $rc in
+  0 | 10) ;;
+  *) die "phase2 edge auth refused: failed to sync SPAWN_SERVE_TOKEN into $edge_env cleanly" ;;
+  esac
+  mode=$(file_mode_octal "$edge_env")
+  if [ ! -f "$edge_env" ] || [ -L "$edge_env" ] ||
+    grep -qiE 'DATABASE_URL|spawn\.env' "$edge_env" ||
+    [ "$mode" != "600" ]; then
+    die "phase2 edge auth failed post-sync verification for $edge_env (mode ${mode:-unknown})"
+  fi
+  if [ "$rc" -eq 10 ]; then
+    say "phase2 edge auth: synced SPAWN_SERVE_TOKEN into $edge_env (mode 0600)"
+  else
+    say "phase2 edge auth: $edge_env already in sync (mode 0600)"
+  fi
+}
+
 # check_phase2_cutover [<units-dir>]: pure read-only preflight before opt-in
 # go-uds cutover (zero lock, zero systemctl calls, zero host modifications,
 # zero secret/line echo).
@@ -332,6 +562,7 @@ check_phase2_cutover() {
       bad=1
     fi
   fi
+  check_phase2_edge_auth || bad=1
   [ "$bad" -eq 0 ] || return 1
   say "phase2 cutover precheck ok (spawn-node: $node_bin; units: $units_dir)"
   return 0
@@ -385,6 +616,7 @@ restart_legacy() {
 
 restart_go_uds() {
   local runtime_dir core_sock legacy_u p2_u
+  sync_node_edge_env
   runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
   core_sock=${SPAWN_CORE_SOCK:-$runtime_dir/spawn/core.sock}
   say "phase2 cutover: starting spawn-core.service and waiting for $core_sock (timeout ${core_sock_timeout_secs}s)"

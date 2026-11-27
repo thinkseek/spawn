@@ -1972,17 +1972,21 @@ pub(super) fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Val
     Ok((root, registry))
 }
 
+/// A query parameter as given (`None` when absent, `Some("")` for bare
+/// `?name` or `?name=`).
+fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| match pair.split_once('=') {
+        Some((key, value)) => (key == name).then_some(value),
+        None => (pair == name).then_some(""),
+    })
+}
+
 /// The `mission` of a coverage request's query as given: `None` when the
 /// query names none, `Some("")` for a bare `mission` or an empty
 /// `mission=` (refused as a bad mission, never read as the default
 /// project).
 pub(super) fn mission_query(query: &str) -> Option<&str> {
-    query
-        .split('&')
-        .find_map(|pair| match pair.split_once('=') {
-            Some((key, value)) => (key == "mission").then_some(value),
-            None => (pair == "mission").then_some(""),
-        })
+    query_param(query, "mission")
 }
 
 /// 400 `not_a_coverage_registry` when mission `id`'s `--features` file is
@@ -2451,18 +2455,130 @@ fn grading() -> Result<Value, String> {
     ))
 }
 
-/// `/api/nodes`: every node joined and not removed (multi-host P1, crate
-/// nodes.rs), `{nodes: [...]}`, each as the store lists it ([`public_nodes`]),
-/// read through the reader login like every other read. No clock in it, so
-/// an unchanged list keeps its ETag. Each node carries its `power` (null
-/// without a battery or AC sensor) and the low-battery soft drain at
-/// `SPAWN_NODE_LOW_BATTERY_PCT` (issue #91, crate nodes/power.rs):
+/// Matches `nodes::v1::LOST_AFTER_MS` (`spawn_node_sweep` lease window).
+const NODE_V1_LOST_AFTER_MS: i64 = 90_000;
+
+fn v1_node_is_lost(node: &spawn_postgres::NodeV1, now: i64) -> bool {
+    node.status == "active"
+        && node
+            .last_beat_ms
+            .is_none_or(|beat| now.saturating_sub(beat) > NODE_V1_LOST_AFTER_MS)
+}
+
+fn v1_node_state(node: &spawn_postgres::NodeV1, now: i64) -> String {
+    let mut state = if node.status == "active" && v1_node_is_lost(node, now) {
+        "lost".to_string()
+    } else {
+        node.status.clone()
+    };
+    if node.drained {
+        state.push_str(",drained");
+    }
+    if node.degraded {
+        state.push_str(",degraded");
+    }
+    state
+}
+
+fn v1_node_json(node: &spawn_postgres::NodeV1, now: i64) -> Value {
+    json!({
+        "name": node.name,
+        "proto": "node-v1",
+        "node_id": node.node_id,
+        "cell_id": node.cell_id,
+        "status": node.status,
+        "state": v1_node_state(node, now),
+        "drained": node.drained,
+        "degraded": node.degraded,
+        "lost": v1_node_is_lost(node, now),
+        "host_fault_strikes": node.host_fault_strikes,
+        "last_beat_ms": node.last_beat_ms,
+        "spec_sha256": node.spec_sha256,
+        "warm_bases": node.warm_bases,
+        "power": node.power,
+        "build_sha": node.build_sha,
+        "node_version": node.node_version,
+    })
+}
+
+fn merge_nodes_with_v1(
+    mut p1: Value,
+    v1: &[spawn_postgres::NodeV1],
+    now: i64,
+    threshold: u8,
+) -> Value {
+    crate::nodes::power::with_soft_drain(&mut p1, threshold);
+    let mut all = match p1 {
+        Value::Array(items) => items,
+        Value::Null => Vec::new(),
+        other => vec![other],
+    };
+    if !v1.is_empty() {
+        let originals: Vec<String> = v1.iter().map(|node| v1_node_state(node, now)).collect();
+        let mut v1_array = Value::Array(
+            v1.iter()
+                .zip(&originals)
+                .map(|(node, original_state)| {
+                    let mut obj = v1_node_json(node, now);
+                    let mapped = if node.drained {
+                        "drained"
+                    } else if node.status == "active"
+                        && !v1_node_is_lost(node, now)
+                        && !node.degraded
+                    {
+                        "live"
+                    } else {
+                        original_state.as_str()
+                    };
+                    if let Some(fields) = obj.as_object_mut() {
+                        fields.insert("state".to_string(), Value::String(mapped.to_string()));
+                    }
+                    obj
+                })
+                .collect(),
+        );
+        crate::nodes::power::with_soft_drain(&mut v1_array, threshold);
+        if let Value::Array(mut items) = v1_array {
+            for (entry, original_state) in items.iter_mut().zip(originals) {
+                if let Some(fields) = entry.as_object_mut() {
+                    fields.insert("state".to_string(), Value::String(original_state));
+                }
+            }
+            all.extend(items);
+        }
+    }
+    public_nodes(Value::Array(all))
+}
+
+/// `/api/nodes`: every legacy P1 node joined and not removed (multi-host P1,
+/// crate nodes.rs) plus every enrolled `spawn-node` v1 node (`spawn_node_state`),
+/// `{nodes: [...]}`, read through the reader login like every other read. No
+/// clock in it, so an unchanged list keeps its ETag. Each node carries its
+/// `power` (null without a battery or AC sensor) and the low-battery soft drain
+/// at `SPAWN_NODE_LOW_BATTERY_PCT` (issue #91, crate nodes/power.rs):
 /// `low_battery_drain`, `effective_drained` and `schedulable`, which leave
 /// its `state` and the owner's drain as they are.
 fn nodes() -> Result<Value, String> {
-    let mut nodes = open_store()?.nodes().map_err(|error| error.to_string())?;
-    crate::nodes::power::with_soft_drain(&mut nodes, crate::nodes::power::low_battery_from_env());
-    Ok(json!({ "nodes": public_nodes(nodes) }))
+    let store = open_store()?;
+    let p1 = store.nodes().map_err(|error| error.to_string())?;
+    let v1 = match store.nodes_v1() {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("spawn_node_state") && message.contains("does not exist") {
+                Vec::new()
+            } else {
+                return Err(message);
+            }
+        }
+    };
+    let merged = merge_nodes_with_v1(
+        p1,
+        &v1,
+        now_ms(),
+        crate::nodes::power::low_battery_from_env(),
+    );
+    Ok(json!({ "nodes": merged }))
 }
 
 /// The store's nodes as the web reads them: without where each is reached
@@ -2495,6 +2611,11 @@ fn mission_task(task: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("task {id} does not exist"))
 }
 
+const EPISODES_DEFAULT_LIMIT: usize = 50;
+const EPISODES_MAX_LIMIT: usize = 200;
+/// Safe JSON body ceiling well below `spawn-node-edge`'s 4 MiB (`4_194_304`) IPC cap.
+const EPISODES_MAX_BODY_BYTES: usize = 3_500_000;
+
 fn parse_episodes_mission_query(query: &str) -> Result<Option<i64>, String> {
     let Some(raw) = mission_query(query) else {
         return Ok(None);
@@ -2502,6 +2623,39 @@ fn parse_episodes_mission_query(query: &str) -> Result<Option<i64>, String> {
     raw.parse::<i64>()
         .map(Some)
         .map_err(|_| format!("{BAD_REQUEST}bad mission {raw}"))
+}
+
+fn parse_episodes_limit_query(query: &str) -> Result<usize, String> {
+    let Some(raw) = query_param(query, "limit") else {
+        return Ok(EPISODES_DEFAULT_LIMIT);
+    };
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{BAD_REQUEST}bad limit {raw}"));
+    }
+    Ok(raw
+        .parse::<usize>()
+        .unwrap_or(EPISODES_MAX_LIMIT)
+        .min(EPISODES_MAX_LIMIT))
+}
+
+pub(in crate::serve) fn bound_episodes(
+    mut episodes: Vec<spawn_core::control::TaskEpisode>,
+    limit: usize,
+) -> Vec<spawn_core::control::TaskEpisode> {
+    episodes.sort_by_key(|ep| std::cmp::Reverse((ep.updated_at_ms, ep.assigned_seq, ep.task_id)));
+    episodes.truncate(limit);
+    episodes
+}
+
+fn truncate_utf8(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 pub(in crate::serve) fn episodes_payload(
@@ -2521,17 +2675,92 @@ pub(in crate::serve) fn episodes_payload(
     })
 }
 
-/// Read-only `GET|HEAD /api/episodes[?mission=<id>]` JSON answer with weak ETag
+fn bounded_episodes_payload_with_cap(
+    mission_id: Option<i64>,
+    episodes: Vec<spawn_core::control::TaskEpisode>,
+    limit: usize,
+    summary: &Value,
+    parity_ok: bool,
+    drifts: &[Value],
+    max_bytes: usize,
+) -> Value {
+    let bounded = bound_episodes(episodes, limit);
+    let payload = episodes_payload(mission_id, &bounded, summary, parity_ok, drifts);
+    if payload.to_string().len() <= max_bytes {
+        return payload;
+    }
+    let mut lo = 1usize;
+    let mut hi = bounded.len();
+    let mut best = 0usize;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let candidate = episodes_payload(mission_id, &bounded[..mid], summary, parity_ok, drifts);
+        if candidate.to_string().len() <= max_bytes {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if best > 0 {
+        return episodes_payload(mission_id, &bounded[..best], summary, parity_ok, drifts);
+    }
+    if let Some(first) = bounded.first() {
+        let mut trimmed = first.clone();
+        trimmed.brief = truncate_utf8(&trimmed.brief, 4096);
+        trimmed.last_report = trimmed
+            .last_report
+            .as_deref()
+            .map(|text| truncate_utf8(text, 4096));
+        trimmed.review_note = trimmed
+            .review_note
+            .as_deref()
+            .map(|text| truncate_utf8(text, 4096));
+        let candidate = episodes_payload(
+            mission_id,
+            std::slice::from_ref(&trimmed),
+            summary,
+            parity_ok,
+            drifts,
+        );
+        if candidate.to_string().len() <= max_bytes {
+            return candidate;
+        }
+    }
+    episodes_payload(mission_id, &[], summary, parity_ok, drifts)
+}
+
+pub(in crate::serve) fn bounded_episodes_payload(
+    mission_id: Option<i64>,
+    episodes: Vec<spawn_core::control::TaskEpisode>,
+    limit: usize,
+    summary: &Value,
+    parity_ok: bool,
+    drifts: &[Value],
+) -> Value {
+    bounded_episodes_payload_with_cap(
+        mission_id,
+        episodes,
+        limit,
+        summary,
+        parity_ok,
+        drifts,
+        EPISODES_MAX_BODY_BYTES,
+    )
+}
+
+/// Read-only `GET|HEAD /api/episodes[?mission=<id>&limit=<n>]` JSON answer with weak ETag
 /// validation (no wall clock in the body so identical snapshots yield `304`).
 pub(in crate::serve) fn episodes_answer(query: &str) -> answers::Answer {
     let read = (|| -> Result<Value, String> {
         let mission_id = parse_episodes_mission_query(query)?;
+        let limit = parse_episodes_limit_query(query)?;
         let store = open_store()?;
         let (episodes, summary, parity_ok, drifts) = store
             .episode_parity_report(mission_id, false)
             .map_err(err)?;
-        Ok(episodes_payload(
-            mission_id, &episodes, &summary, parity_ok, &drifts,
+        Ok(bounded_episodes_payload(
+            mission_id, episodes, limit, &summary, parity_ok, &drifts,
         ))
     })();
     answers::answer("/api/episodes", read, BAD_REQUEST)
@@ -8031,5 +8260,365 @@ mod tests {
             super::ROUTES.len(),
             "routes.json /api/* count must match serve::ROUTES exactly"
         );
+    }
+
+    fn sample_episode(
+        task_id: i64,
+        mission_id: i64,
+        updated_at_ms: i64,
+        assigned_seq: i64,
+        brief: &str,
+    ) -> spawn_core::control::TaskEpisode {
+        use spawn_core::control::{EpisodeOutcome, GradeWire, TaskEpisode, TaskKind};
+        use spawn_core::mission::TaskState;
+        TaskEpisode {
+            task_id,
+            mission_id,
+            kind: TaskKind::Ephemeral,
+            agent_id: format!("agent_worker_{task_id}"),
+            session_id: format!("session_{task_id}"),
+            brief: brief.to_string(),
+            created_by: Some("supervisor".to_string()),
+            objective: None,
+            scenario: None,
+            model: "default".to_string(),
+            difficulty: GradeWire::L2,
+            preset_id: None,
+            first_preset_id: None,
+            engine: None,
+            model_label: None,
+            pinned: false,
+            reissue_of: None,
+            continues: None,
+            reassign_of: None,
+            state: TaskState::Landed,
+            outcome: EpisodeOutcome::Landed,
+            rework: 0,
+            quality_rejections: 0,
+            reroutes: 0,
+            restarts: 0,
+            steals: 0,
+            deliveries: 1,
+            reports: 1,
+            last_command_id: Some(task_id),
+            last_report: Some("done".to_string()),
+            last_report_commit: None,
+            review_note: None,
+            base: None,
+            candidate: None,
+            metric: None,
+            last_gate_verdict: None,
+            review_sync_points: Vec::new(),
+            gate_verdicts: Vec::new(),
+            terminal_by: None,
+            terminal_reason: None,
+            assigned_seq,
+            assigned_at_ms: updated_at_ms - 10,
+            delivered_at_ms: Some(updated_at_ms - 5),
+            closed_seq: Some(assigned_seq + 1),
+            closed_at_ms: Some(updated_at_ms),
+            updated_at_ms,
+            stages: Vec::new(),
+        }
+    }
+
+    fn sample_episodes_summary(total: usize) -> serde_json::Value {
+        json!({
+            "total": total,
+            "landed": total,
+            "accepted": 0,
+            "rejected": 0,
+            "cancelled": 0,
+            "aborted": 0,
+            "over_budget": 0,
+            "in_flight": 0,
+            "total_rework": 0,
+            "total_reroutes": 0,
+            "review_sync_points": 0,
+            "gate_verdicts": 0,
+            "warnings": 0,
+        })
+    }
+
+    #[test]
+    fn episodes_limit_query_parses_defaults_caps_and_rejects_bad_values() {
+        assert_eq!(
+            super::parse_episodes_limit_query(""),
+            Ok(super::EPISODES_DEFAULT_LIMIT)
+        );
+        assert_eq!(
+            super::parse_episodes_limit_query("mission=7"),
+            Ok(super::EPISODES_DEFAULT_LIMIT)
+        );
+        assert_eq!(super::parse_episodes_limit_query("limit=5"), Ok(5));
+        assert_eq!(
+            super::parse_episodes_limit_query("mission=4&limit=5"),
+            Ok(5)
+        );
+        assert_eq!(super::parse_episodes_limit_query("limit=0"), Ok(0));
+        assert_eq!(super::parse_episodes_limit_query("limit=200"), Ok(200));
+        assert_eq!(
+            super::parse_episodes_limit_query("limit=500"),
+            Ok(super::EPISODES_MAX_LIMIT)
+        );
+        assert_eq!(
+            super::parse_episodes_limit_query("limit=99999999999999999999999"),
+            Ok(super::EPISODES_MAX_LIMIT)
+        );
+        for bad in [
+            "limit=",
+            "limit",
+            "limit=-1",
+            "limit=abc",
+            "limit=+5",
+            "mission=4&limit=ten",
+        ] {
+            let err = super::parse_episodes_limit_query(bad).expect_err(bad);
+            assert!(err.starts_with(BAD_REQUEST), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn bounded_episodes_payload_limits_sorts_newest_first_and_preserves_keys() {
+        let episodes = vec![
+            sample_episode(1, 4, 100, 10, "t1"),
+            sample_episode(5, 4, 300, 11, "t5"),
+            sample_episode(2, 4, 200, 15, "t2"),
+            sample_episode(4, 4, 200, 20, "t4"),
+            sample_episode(3, 4, 200, 20, "t3"),
+            sample_episode(6, 4, 50, 1, "t6"),
+            sample_episode(7, 4, 400, 1, "t7"),
+            sample_episode(8, 4, 350, 2, "t8"),
+        ];
+        let summary = sample_episodes_summary(episodes.len());
+        let payload = super::bounded_episodes_payload(Some(4), episodes, 5, &summary, true, &[]);
+        let keys: Vec<&str> = payload
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "drift_count",
+                "episodes",
+                "mission",
+                "parity_ok",
+                "summary",
+                "warnings",
+            ]
+        );
+        assert_eq!(payload["mission"], 4);
+        assert_eq!(payload["summary"]["total"], 8);
+        assert_eq!(payload["parity_ok"], true);
+        assert_eq!(payload["warnings"], 0);
+        assert_eq!(payload["drift_count"], 0);
+        let ids: Vec<i64> = payload["episodes"]
+            .as_array()
+            .expect("episodes array")
+            .iter()
+            .filter_map(|ep| ep["task_id"].as_i64())
+            .collect();
+        assert_eq!(ids, [7, 8, 5, 4, 3]);
+
+        // Default limit (50) and hard upper cap (200).
+        let many: Vec<_> = (1..=250)
+            .map(|i| sample_episode(i, 9, i * 10, i, "brief"))
+            .collect();
+        let many_summary = sample_episodes_summary(many.len());
+        let default_limit = super::parse_episodes_limit_query("").unwrap();
+        let default_payload = super::bounded_episodes_payload(
+            Some(9),
+            many.clone(),
+            default_limit,
+            &many_summary,
+            true,
+            &[],
+        );
+        let default_ids: Vec<i64> = default_payload["episodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|ep| ep["task_id"].as_i64())
+            .collect();
+        assert_eq!(default_ids.len(), 50);
+        assert_eq!(default_ids.first(), Some(&250));
+        assert_eq!(default_ids.last(), Some(&201));
+
+        let capped_limit = super::parse_episodes_limit_query("limit=500").unwrap();
+        let capped_payload =
+            super::bounded_episodes_payload(Some(9), many, capped_limit, &many_summary, true, &[]);
+        let capped_ids: Vec<i64> = capped_payload["episodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|ep| ep["task_id"].as_i64())
+            .collect();
+        assert_eq!(capped_ids.len(), 200);
+        assert_eq!(capped_ids.first(), Some(&250));
+        assert_eq!(capped_ids.last(), Some(&51));
+    }
+
+    #[test]
+    fn bounded_episodes_payload_respects_byte_budget() {
+        const { assert!(super::EPISODES_MAX_BODY_BYTES < 4_194_304) };
+
+        let large_brief = "x".repeat(10_000);
+        let episodes: Vec<_> = (1..=10)
+            .map(|i| sample_episode(i, 1, i * 100, i, &large_brief))
+            .collect();
+        let summary = sample_episodes_summary(episodes.len());
+        let payload =
+            super::bounded_episodes_payload_with_cap(Some(1), episodes, 10, &summary, true, &[], 35_000);
+        let encoded_len = payload.to_string().len();
+        assert!(encoded_len <= 35_000, "encoded_len={encoded_len}");
+        let kept = payload["episodes"].as_array().unwrap();
+        assert!(!kept.is_empty() && kept.len() < 10, "kept={}", kept.len());
+        assert_eq!(kept[0]["task_id"], 10);
+
+        let huge_utf8 = "€".repeat(40_000);
+        let mut single = sample_episode(99, 2, 500, 99, &huge_utf8);
+        single.last_report = Some(huge_utf8.clone());
+        let single_summary = sample_episodes_summary(1);
+        let trimmed = super::bounded_episodes_payload_with_cap(
+            Some(2),
+            vec![single],
+            5,
+            &single_summary,
+            true,
+            &[],
+            20_000,
+        );
+        assert!(trimmed.to_string().len() <= 20_000);
+        assert_eq!(trimmed["episodes"].as_array().unwrap().len(), 1);
+        assert!(
+            trimmed["episodes"][0]["brief"]
+                .as_str()
+                .unwrap()
+                .len()
+                <= 4096
+        );
+        assert!(super::truncate_utf8(&huge_utf8, 4096).len() <= 4096);
+    }
+
+    fn sample_v1_node(name: &str) -> spawn_postgres::NodeV1 {
+        spawn_postgres::NodeV1 {
+            name: name.to_string(),
+            node_id: Some("a".repeat(64)),
+            cell_id: "c0".to_string(),
+            status: "active".to_string(),
+            drained: false,
+            degraded: false,
+            lost_recorded: false,
+            host_fault_strikes: 0,
+            boot_id: Some("0".repeat(32)),
+            beat_seq: 1,
+            last_beat_ms: Some(1_000_000),
+            spec_sha256: Some("b".repeat(64)),
+            spec: None,
+            warm_bases: Vec::new(),
+            power: None,
+            build_sha: None,
+            node_version: None,
+        }
+    }
+
+    #[test]
+    fn merge_nodes_with_v1_surfaces_enrolled_v1_nodes_with_telemetry_and_no_secrets() {
+        let now = 1_000_000;
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let p1 = json!([
+            {
+                "name": "legacy-ssh",
+                "ssh": "owner@legacy.local",
+                "endpoint": null,
+                "note": "keep private",
+                "pubkey": "secret-pubkey",
+                "transport": "ssh",
+                "mode": "direct",
+                "via": [],
+                "state": "live",
+                "power": null
+            }
+        ]);
+
+        let mut n252 = sample_v1_node("n252");
+        n252.build_sha = Some(sha.to_string());
+        n252.node_version = Some("0.1.0".to_string());
+        n252.power = Some(json!({
+            "on_ac": true,
+            "battery_pct": 100,
+            "charging": false,
+            "remaining_mins": null
+        }));
+
+        let mut nlost = sample_v1_node("nlost");
+        nlost.last_beat_ms = Some(now - 200_000);
+
+        let mut nbatt = sample_v1_node("nbatt");
+        nbatt.power = Some(json!({
+            "on_ac": false,
+            "battery_pct": 15,
+            "charging": false,
+            "remaining_mins": 30
+        }));
+
+        let mut ndrained = sample_v1_node("ndrained");
+        ndrained.drained = true;
+
+        let mut ndegraded = sample_v1_node("ndegraded");
+        ndegraded.degraded = true;
+        ndegraded.host_fault_strikes = 3;
+
+        let merged =
+            super::merge_nodes_with_v1(p1, &[n252, nlost, nbatt, ndrained, ndegraded], now, 20);
+        let rows = merged.as_array().expect("merged array");
+        assert_eq!(rows.len(), 6);
+
+        let p1_row = &rows[0];
+        assert_eq!(p1_row["name"], "legacy-ssh");
+        assert_eq!(p1_row["transport"], "ssh");
+        for hidden in ["ssh", "endpoint", "note", "pubkey"] {
+            assert!(p1_row.get(hidden).is_none(), "{hidden}");
+        }
+
+        let r_n252 = &rows[1];
+        assert_eq!(r_n252["name"], "n252");
+        assert_eq!(r_n252["proto"], "node-v1");
+        assert_eq!(r_n252["build_sha"], sha);
+        assert_eq!(r_n252["node_version"], "0.1.0");
+        assert_eq!(r_n252["state"], "active");
+        assert_eq!(r_n252["lost"], false);
+        assert_eq!(r_n252["schedulable"], true);
+        assert_eq!(r_n252["low_battery_drain"], false);
+        assert_eq!(r_n252["effective_drained"], false);
+        assert_eq!(r_n252["host_fault_strikes"], 0);
+        assert_eq!(r_n252["last_beat_ms"], now);
+        assert_eq!(r_n252["power"]["on_ac"], true);
+        for hidden in ["ssh", "endpoint", "note", "pubkey"] {
+            assert!(r_n252.get(hidden).is_none(), "{hidden}");
+        }
+
+        let r_lost = &rows[2];
+        assert_eq!(r_lost["state"], "lost");
+        assert_eq!(r_lost["lost"], true);
+        assert_eq!(r_lost["schedulable"], false);
+
+        let r_batt = &rows[3];
+        assert_eq!(r_batt["state"], "active");
+        assert_eq!(r_batt["low_battery_drain"], true);
+        assert_eq!(r_batt["effective_drained"], true);
+        assert_eq!(r_batt["schedulable"], false);
+
+        let r_drained = &rows[4];
+        assert_eq!(r_drained["state"], "active,drained");
+        assert_eq!(r_drained["effective_drained"], true);
+        assert_eq!(r_drained["schedulable"], false);
+
+        let r_degraded = &rows[5];
+        assert_eq!(r_degraded["state"], "active,degraded");
+        assert_eq!(r_degraded["host_fault_strikes"], 3);
+        assert_eq!(r_degraded["schedulable"], false);
     }
 }

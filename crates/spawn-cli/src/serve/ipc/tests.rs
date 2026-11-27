@@ -392,4 +392,71 @@ fn verify_e2e_routes_and_events(sock_path: &std::path::Path, store: &PostgresSto
     let event_val: Value = serde_json::from_str(&event_line).unwrap();
     assert_eq!(event_val["type"], "event");
     assert_eq!(event_val["session_id"], "session_ipc_1");
+
+    verify_e2e_nodes_and_episodes(sock_path);
+}
+
+fn verify_e2e_nodes_and_episodes(sock_path: &std::path::Path) {
+    // Record a beat carrying build_sha, node_version, and power over IPC, then
+    // confirm GET /api/nodes surfaces enrolled v1 node n252 without pubkey and
+    // GET /api/episodes?limit=5 returns the bounded contract JSON payload.
+    let mut beat_req: Value = serde_json::from_slice(
+        &std::fs::read(ipc_fixture_dir().join("node.beat.req.json")).unwrap(),
+    )
+    .unwrap();
+    let beat_sha = "0123456789abcdef0123456789abcdef01234567";
+    beat_req["beat"]["build_sha"] = json!(beat_sha);
+    beat_req["beat"]["node_version"] = json!("0.1.0");
+    beat_req["beat"]["power"] = json!({
+        "on_ac": true,
+        "battery_pct": 100,
+        "charging": false,
+        "remaining_mins": null
+    });
+    let beat_bytes = beat_req.to_string();
+    let full_beat = format!(
+        "POST /ipc/v1/node/beat HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nIdempotency-Key: beat-1\r\n\r\n{}",
+        beat_bytes.len(),
+        beat_bytes
+    );
+    let (st, _, body) = exchange_raw(sock_path, full_beat.as_bytes());
+    assert_eq!(st, 200);
+    let beat_ans: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(beat_ans["ok"], true, "{beat_ans}");
+
+    let (st, _, body) = exchange_raw(
+        sock_path,
+        b"GET /api/nodes HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_eq!(st, 200);
+    let nodes_ans: Value = serde_json::from_slice(&body).unwrap();
+    let n252 = nodes_ans["nodes"]
+        .as_array()
+        .expect("nodes array")
+        .iter()
+        .find(|n| n["name"] == "n252")
+        .expect("n252 surfaced in /api/nodes");
+    assert_eq!(n252["proto"], "node-v1");
+    assert_eq!(n252["build_sha"], beat_sha);
+    assert_eq!(n252["node_version"], "0.1.0");
+    assert_eq!(n252["state"], "active");
+    assert_eq!(n252["lost"], false);
+    assert_eq!(n252["schedulable"], true);
+    assert_eq!(n252["host_fault_strikes"], 0);
+    assert!(n252["last_beat_ms"].as_i64().is_some_and(|ms| ms > 0));
+    assert_eq!(n252["power"]["on_ac"], true);
+    assert!(n252.get("pubkey").is_none());
+
+    let (st, _, body) = exchange_raw(
+        sock_path,
+        b"GET /api/episodes?limit=5 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_eq!(st, 200);
+    let ep_ans: Value = serde_json::from_slice(&body).unwrap();
+    assert!(ep_ans["mission"].is_null());
+    assert!(ep_ans["episodes"].is_array());
+    assert!(ep_ans["summary"].is_object());
+    assert_eq!(ep_ans["parity_ok"], true);
+    assert_eq!(ep_ans["warnings"], 0);
+    assert_eq!(ep_ans["drift_count"], 0);
 }

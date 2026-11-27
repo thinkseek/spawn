@@ -938,18 +938,18 @@ mod truth_tests {
         assert_eq!(busy.status, 503);
         drop(permits);
 
-        let bad_query = dispatch_buffered(
-            &ipc_request("GET", "/api/episodes", "mission=abc", vec![]),
-            &state,
-        );
-        assert_eq!(bad_query.status, 400);
+        for bad in ["mission=abc", "limit=abc", "limit=-1", "limit=", "limit"] {
+            let bad_query =
+                dispatch_buffered(&ipc_request("GET", "/api/episodes", bad, vec![]), &state);
+            assert_eq!(bad_query.status, 400, "{bad}");
+        }
 
-        let bad_head = dispatch_buffered(
-            &ipc_request("HEAD", "/api/episodes", "mission=", vec![]),
-            &state,
-        );
-        assert_eq!(bad_head.status, 400);
-        assert!(bad_head.body.is_empty());
+        for bad in ["mission=", "limit=abc"] {
+            let bad_head =
+                dispatch_buffered(&ipc_request("HEAD", "/api/episodes", bad, vec![]), &state);
+            assert_eq!(bad_head.status, 400, "{bad}");
+            assert!(bad_head.body.is_empty(), "{bad}");
+        }
     }
 
     #[test]
