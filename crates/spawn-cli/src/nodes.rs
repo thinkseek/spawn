@@ -1,31 +1,28 @@
 //! The nodes (multi-host P1; docs/fleet-architecture.md §1.2): the
-//! machines Spawn may use, and whether they answer. A node does no work yet.
+//! machines Spawn may use, and whether they answer. A node does no work yet
+//! (for remote gate execution, see `spawn-node` v1 in [`v1`]).
 //!
-//! - `spawn node add|list|drain|undrain|remove` ([`command`]): `add` runs
-//!   the read-only [`INVENTORY`] once over the node's transport and records
-//!   `node.joined`: over ssh (through jump hosts with `--via`), or over tcp
-//!   or udp to the node's `spawn node serve`, directly or relayed by the
-//!   nodes `--via` names, tcp and udp mixed (issue #85, [`transport`]).
-//! - `spawn node serve` is a node's own end of tcp and udp: it answers the
-//!   probes, relays `forward`s, and with `--register-store` takes the
-//!   `register` of a node that joins itself (`spawn node register`, from
-//!   behind a NAT or a firewall, directly or relayed) ([`relay`]).
+//! - `spawn node add|list|drain|undrain|remove|probe` ([`command`]): `add`
+//!   runs the read-only [`INVENTORY`] once over SSH (through jump hosts
+//!   with `--via`) and records `node.joined` ([`transport`]). The Issue
+//!   #85/#87 Rust sync TCP/UDP/coordinator mesh (`serve`, `register`,
+//!   `coord`, `connect`) was retired in Phase 2d in favor of Go
+//!   `spawn-node` (`enroll-token`, `revoke`).
 //! - `spawn loop` keeps a [`Heartbeat`]: a worker thread with a database
 //!   connection of its own (every statement bounded), so a pass never
 //!   waits on a node, its records or its alerts. Every [`PROBE_EVERY_MS`]
-//!   (monotonic) it runs the small [`BEAT`] on each node (one bounded probe
-//!   in flight per node, on a thread of its own), records `node.heartbeat`
-//!   every [`RECORD_EVERY_MS`] while the node answers, `node.lost` after
-//!   `SPAWN_NODE_LOST_SECS` (60) without an answer, and `node.back` at the
-//!   next one. Each names its `join`, the event of the node's current
-//!   `node.joined`, which the writer compares under the append lock: a
-//!   probe of a join since removed records nothing. At each read of the
-//!   membership it fires and clears `node_lost` alerts as each node's
+//!   (monotonic) it runs the small [`BEAT`] on each SSH node (one bounded
+//!   probe in flight per node, on a thread of its own), records
+//!   `node.heartbeat` every [`RECORD_EVERY_MS`] while the node answers,
+//!   `node.lost` after `SPAWN_NODE_LOST_SECS` (60) without an answer, and
+//!   `node.back` at the next one. Each names its `join`, the event of the
+//!   node's current `node.joined`, which the writer compares under the append
+//!   lock: a probe of a join since removed records nothing. At each read of
+//!   the membership it fires and clears `node_lost` alerts as each node's
 //!   latest `node.lost` asks ([`alert_plan`]).
 //!
 //! The trust boundary: the primary sends a node nothing but [`INVENTORY`]
-//! or [`BEAT`], fixed texts of read-only commands (over tcp and udp, only
-//! their names: the node runs its own copy). ssh runs with an
+//! or [`BEAT`], fixed texts of read-only commands. ssh runs with an
 //! environment of `PATH`, `HOME`, `USER`, `LOGNAME` and `SSH_AUTH_SOCK`
 //! alone (no `SendEnv` can carry the database URL or a token), in batch
 //! mode against an already trusted host key, without a shared connection,
@@ -44,15 +41,10 @@ use spawn_postgres::{PostgresStore, StoreConnector};
 use crate::verify::now_ms;
 use crate::{Flags, open_store};
 
-mod auth;
 mod commands;
-mod coord;
-mod crypto;
 pub(crate) mod power;
-mod relay;
 mod transport;
 mod v1;
-mod ws;
 
 use transport::{Op, Route};
 
@@ -140,7 +132,7 @@ const OUTPUT_LIMIT: u64 = 256 * 1024;
 /// The longest text of a node (an arch, a GPU's name, an error) kept.
 const TEXT_CHARS: usize = 200;
 
-pub(crate) const USAGE: &str = "usage: spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]> [--note <text>]   (owner only)\n       spawn node add <name> --tcp <[tcp://]host:port>|--udp <[udp://]host:port>|--ssh <dest> [--via <hop>[,<hop>...]] [--mode direct|relay|hole_punch] [--note <text>]\n       spawn node list [--json]\n       spawn node drain|undrain|remove <name>   (owner only)\n       spawn node enroll-token <name> [--cell <cell>] [--primary-pubkey <base64url> | --primary-pubkey-file <path>]   (owner only; spawn-node v1)\n       spawn node revoke <name>   (owner only; spawn-node v1)\n       spawn node serve --listen <tcp://bind|udp://bind>[,...] | --tcp <bind> | --udp <bind> [--register-store] [--allow-loopback-forward] [--allow-unauthenticated]\n       spawn node register --to <[tcp://|udp://]host:port> --name <name> --listen <tcp://host:port|udp://host:port> [--via <hop>[=<endpoint>][,...]] [--mode direct|relay|hole_punch] [--note <text>]\n       spawn node add <name> --coord <ws://|wss://|tcp://...> --node-id <hex>|--peer <name> [--mode relay|hole_punch] [--note <text>]\n       spawn node probe <name> [--op inventory|beat] [--json]\n       spawn node coord --ws <bind>|--tcp <bind> [--udp <bind>] [--zone <name>] [--parent <ws://|wss://|tcp://...>] [--key-file <path>] [--lease-secs <n>] [--allow-unauthenticated]\n       spawn node connect --coord <ws://|wss://|tcp://...> --name <name> [--role worker|peer] [--zone <name>] [--key-file <path>] [--udp-stun <host:port>] [--register-to <primary>] [--register-store] [--note <text>] [--allow-unauthenticated]";
+pub(crate) const USAGE: &str = "usage: spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]> [--via <hop>[,<hop>...]] [--note <text>]   (owner only)\n       spawn node list [--json]\n       spawn node drain|undrain|remove <name>   (owner only)\n       spawn node enroll-token <name> [--cell <cell>] [--primary-pubkey <base64url> | --primary-pubkey-file <path>]   (owner only; spawn-node v1)\n       spawn node revoke <name>   (owner only; spawn-node v1)\n       spawn node probe <name> [--op inventory|beat] [--json]";
 
 /// One line of text from a node, kept only when printable, and short.
 fn clean_text(text: &str) -> Option<String> {
@@ -715,10 +707,9 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
     };
     match verb.as_str() {
         "add" => commands::add(words),
-        "serve" => commands::serve(words),
-        "register" => commands::register(words),
-        "coord" => commands::coord(words),
-        "connect" => commands::connect(words),
+        "serve" | "register" | "coord" | "connect" => Err(format!(
+            "spawn node {verb} has been retired in favor of Go `spawn-node` (use `spawn node enroll-token` for v1 nodes or `spawn node add --ssh`)\n{USAGE}"
+        )),
         "probe" => commands::probe(words),
         // spawn-node v1 (nodes/v1.rs): its own two verbs, and `list`,
         // `drain` and `undrain` over both kinds of node.
@@ -902,13 +893,11 @@ impl HeartbeatScheduler {
     pub(crate) fn sync(&mut self, members: &Value, now: ProbeClock) {
         let mut nodes = BTreeMap::new();
         for member in members.as_array().into_iter().flatten() {
-            let (Some(name), Some(reached), Some(join)) = (
-                member["name"].as_str(),
-                transport::Member::of(member),
-                member["join"].as_i64(),
-            ) else {
+            let (Some(name), Some(join)) = (member["name"].as_str(), member["join"].as_i64())
+            else {
                 continue;
             };
+            let reached = transport::Member::of(member);
             // Resolved again at each read: a hop removed, or joined again
             // elsewhere, changes the way, never the join.
             let route = reached.route(members);
@@ -1173,18 +1162,26 @@ impl Heartbeat {
 }
 
 /// Start `item`'s probe on a thread of its own; its end comes on `done`.
+/// Retired or invalid routes fail immediately without spawning a probe.
 fn start(item: ProbeJob, done: &Sender<ProbeOutcome>, origin: Instant) {
     let (name, join) = (item.name.clone(), item.join);
+    let route = match item.route {
+        Ok(route) => route,
+        Err(why) => {
+            let _ = done.send(ProbeOutcome {
+                name,
+                join,
+                at: ProbeClock::now(origin),
+                answer: Err(why),
+            });
+            return;
+        }
+    };
     let send = done.clone();
     let spawned = std::thread::Builder::new()
         .name("node-probe".to_string())
         .spawn(move || {
-            let answer = item
-                .route
-                .and_then(|route| {
-                    let token = crate::config::env_value("SPAWN_NODE_TOKEN");
-                    transport::probe_route(&route, Op::Beat, PROBE_TIMEOUT, token.as_deref())
-                })
+            let answer = transport::probe_route(&route, Op::Beat, PROBE_TIMEOUT)
                 .and_then(|output| beat(&output));
             let _ = send.send(ProbeOutcome {
                 name: item.name,

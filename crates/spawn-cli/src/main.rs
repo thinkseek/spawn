@@ -113,18 +113,12 @@ const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|residen
 /// summary of its verbs (`spawn grade a|b|c ...`), as the tests below hold
 /// it to [`COMMANDS`].
 const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       \
-     spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]> [--note <text>]\n       \
+     spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]> [--via <hop>[,<hop>...]] [--note <text>]\n       \
      spawn node list [--json]\n       \
-     spawn node add <name> --tcp <[tcp://]host:port>|--udp <[udp://]host:port>|--ssh <dest> [--via <hop>[,<hop>...]] [--mode direct|relay|hole_punch] [--note <text>]\n       \
      spawn node drain|undrain|remove <name>\n       \
      spawn node enroll-token <name> [--cell <cell>] [--primary-pubkey <base64url> | --primary-pubkey-file <path>]\n       \
      spawn node revoke <name>\n       \
-     spawn node serve --listen <tcp://bind|udp://bind>[,...] | --tcp <bind> | --udp <bind> [--register-store] [--allow-loopback-forward] [--allow-unauthenticated]\n       \
-     spawn node register --to <[tcp://|udp://]host:port> --name <name> --listen <tcp://host:port|udp://host:port> [--via <hop>[=<endpoint>][,...]] [--mode direct|relay|hole_punch] [--note <text>]\n       \
-     spawn node add <name> --coord <ws://|wss://|tcp://...> --node-id <hex>|--peer <name> [--mode relay|hole_punch] [--note <text>]\n       \
      spawn node probe <name> [--op inventory|beat] [--json]\n       \
-     spawn node coord --ws <bind>|--tcp <bind> [--udp <bind>] [--zone <name>] [--parent <ws://|wss://|tcp://...>] [--key-file <path>] [--lease-secs <n>] [--allow-unauthenticated]\n       \
-     spawn node connect --coord <ws://|wss://|tcp://...> --name <name> [--role worker|peer] [--zone <name>] [--key-file <path>] [--udp-stun <host:port>] [--register-to <primary>] [--register-store] [--note <text>] [--allow-unauthenticated]\n       \
      spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       \
      spawn alerts --follow [--json] [--since <event id>]\n       \
      spawn alert judge <key> [<key>...] right|false|stale|duplicate\n       \
@@ -742,15 +736,22 @@ mod tests {
             "spawn node add <name> --ssh",
             "spawn node list [--json]",
             "spawn node drain|undrain|remove <name>",
-            "spawn node add <name> --tcp <[tcp://]host:port>|--udp",
-            "spawn node serve --listen",
-            "spawn node register --to",
-            "spawn node add <name> --coord",
+            "spawn node enroll-token <name>",
+            "spawn node revoke <name>",
             "spawn node probe <name>",
-            "spawn node coord --ws",
-            "spawn node connect --coord",
         ] {
             assert!(MORE_USAGE.contains(line), "{line}: {MORE_USAGE}");
+        }
+        for retired in [
+            "spawn node serve",
+            "spawn node register",
+            "spawn node coord",
+            "spawn node connect",
+            "--tcp",
+            "--udp",
+            "--coord",
+        ] {
+            assert!(!MORE_USAGE.contains(retired), "{retired}: {MORE_USAGE}");
         }
         assert!(
             !USAGE.contains("node"),
@@ -1045,7 +1046,6 @@ mod tests {
             "spawn backup cas snapshot|restore|verify|key-of",
             "spawn store plan --area",
             "[--only missions|controllers|transcripts|sync]",
-            "[--allow-loopback-forward] [--allow-unauthenticated]",
             "spawn features associate --path <file> --feature <id>",
         ] {
             assert!(MORE_USAGE.contains(line), "{line}: {MORE_USAGE}");

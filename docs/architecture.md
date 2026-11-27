@@ -35,7 +35,7 @@ Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎�
 | `spawn-node-gateway` | 二进制 `spawn-node-gateway`：spawn-node v1 网关，节点与账本之间唯一的门。同步的 std HTTP/1.1 服务（16 个 worker，各持一条 PG 连接），以受限登录 `spawn_node_gateway` 调用四个 `spawn_node_gw_*` 函数（先验签再提交），签名每个应答与 grant，流式落盘 result，按 Range 提供 artifact；协议见 `docs/node-protocol-v1.md` | spawn-node-proto、spawn-postgres、ring、sha2、base64、serde、serde_json、zeroize |
 | `ghostty-vt` | 供 `[patch."https://github.com/herdrdev/herdr-core"]` 使用的纯 Rust VT100/xterm/OSC-7501 仿真替代层（实现 `Terminal`、`StatusReport`、`Rgb`，零 Zig / 零 C FFI / 零 `build.rs`） | serde、serde_json |
 | `spawn-hc` | 独立配套二进制 `spawn-hc`：封装 `herdr-core` CLI/守护进程与 OpenRPC Unix socket 入口，将 `herdr-core` 及其 tokio 运行时与主 `spawn` 二进制进程外隔离 | herdr-core（及patched `ghostty-vt`） |
-| `spawn-cli` | 二进制 `spawn`，装配上述实现（不含 `herdr-core`/`ghostty-vt`，通过子进程与 Unix socket 驱动 `spawn-hc`）；`spawn serve` 的 HTTP 服务、节点网格 | 上述 core/host/pg 等实现层，以及 tiny_http、rustix、ring、rustls 等 |
+| `spawn-cli` | 二进制 `spawn`，装配上述实现（不含 `herdr-core`/`ghostty-vt`，通过子进程与 Unix socket 驱动 `spawn-hc`）；`spawn serve` 的 HTTP 服务、SSH 节点管理与 `spawn-node` v1 运维命令 | 上述 core/host/pg 等实现层，以及 tiny_http、rustix、ring 等 |
 
 ```mermaid
 flowchart LR

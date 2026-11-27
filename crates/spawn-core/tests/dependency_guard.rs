@@ -589,17 +589,7 @@ fn production_std_net_ratchet_matches_phase2d_allowlist() {
     );
 
     let exact_allowlist: [(&str, &[&str]); 4] = [
-        (
-            "spawn-cli",
-            &[
-                "crates/spawn-cli/src/nodes/commands.rs",
-                "crates/spawn-cli/src/nodes/coord.rs",
-                "crates/spawn-cli/src/nodes/relay.rs",
-                "crates/spawn-cli/src/nodes/transport.rs",
-                "crates/spawn-cli/src/nodes/ws.rs",
-                "crates/spawn-cli/src/serve.rs",
-            ],
-        ),
+        ("spawn-cli", &["crates/spawn-cli/src/serve.rs"]),
         ("spawn-jev", &["crates/spawn-jev/src/lib.rs"]),
         (
             "spawn-node-gateway",
