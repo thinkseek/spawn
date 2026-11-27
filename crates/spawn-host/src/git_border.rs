@@ -705,15 +705,22 @@ impl GitBorderAdapter {
         store.cas().sync_store()?;
 
         for commit_oid in &commit_order {
-            let (snap_id, tree_digest, parents, at_ms) = &commit_map[commit_oid];
-            let _ = ledger.record_snapshot(
-                snap_id,
-                commit_oid,
-                tree_digest,
-                parents,
-                project,
-                *at_ms,
-            )?;
+            let canonical_id = {
+                let (snap_id, tree_digest, parents, at_ms) = &commit_map[commit_oid];
+                ledger.record_snapshot(
+                    snap_id,
+                    commit_oid,
+                    tree_digest,
+                    parents,
+                    project,
+                    *at_ms,
+                )?
+            };
+            if let Some(entry) = commit_map.get_mut(commit_oid)
+                && entry.0 != canonical_id
+            {
+                entry.0 = canonical_id;
+            }
         }
 
         let imported_refs = self.publish_imported_refs(

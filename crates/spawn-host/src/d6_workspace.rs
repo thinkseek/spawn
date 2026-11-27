@@ -44,7 +44,7 @@ use spawn_core::port::{
     WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
 };
 
-use crate::agent_files::{AgentFileError, open_regular, read_regular, rename_within, replace_with};
+use crate::agent_files::{AgentFileError, read_regular, rename_within, replace_with};
 use crate::cas_merkle::{
     BUILD_OUTPUT as D6_BUILD_OUTPUT, CasMerkleStore, D6RefKind, D6StoreError, LedgerRef,
     LedgerSnapshot, PublishRequest, PublishedSnapshot, RefLedger, ScannedEntry, ScannedKind,
@@ -54,16 +54,19 @@ use crate::cow::clone_or_copy;
 use crate::d6_layer0::{
     ExistingDestPolicy, Layer0MaterializeReport, Layer0Options, materialize_layer0,
 };
-use crate::git::{
-    CONFLICT_MARKER_SIZE, ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER, MAIN_COPIES, SET_ASIDE_FILES,
-    SET_ASIDE_WAITS, has_conflict_block_sized, lock_file, max_file_bytes, names_files_outside_git,
-};
 use crate::merkle_merge::{
     ConflictKind, GitAttributes, MergeBaseError, MergeSnapshotSpec, build_merge_snapshot,
     find_single_merge_base, merge_snapshots,
 };
 use crate::root::{canonical_root, legacy_workspace};
 use crate::tree_path::{TreePath, nul_fields};
+use crate::workspace_rules::{
+    CONFLICT_MARKER_SIZE, ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER, MAIN_COPIES,
+    OVERSIZED_RECORD_LIMIT, Oversized, SET_ASIDE_FILES, SET_ASIDE_WAITS, encode_oversized,
+    has_conflict_block_sized, is_plain_name, lock_file, max_file_bytes, names_files_outside_git,
+    oversized_digest, oversized_file, oversized_notice_message, parse_oversized,
+    set_aside_kept_message,
+};
 
 const BASE_BRANCH: &str = "main";
 const D6_META_DIR: &str = ".d6";
@@ -73,7 +76,6 @@ const MOUNT_SUBDIR: &str = "mount";
 const NEAREST_POINTER_FILE: &str = ".nearest";
 const PENDING_TAG: &str = "pending-merge";
 const COPIES_TAG: &str = "main-copies";
-const OVERSIZED_RECORD_LIMIT: u64 = 64 << 20;
 const CONFLICT_READ_LIMIT: u64 = 64 << 20;
 const FLATTEN_CACHE_CAP: usize = 16;
 const VERIFIED_CLEAN_CAP: usize = 64;
@@ -444,6 +446,10 @@ impl<T: RefLedger + ?Sized> RefLedger for Arc<T> {
 
     fn list_refs(&self, project: Option<&str>) -> Result<Vec<LedgerRef>, D6StoreError> {
         (**self).list_refs(project)
+    }
+
+    fn retire_project_refs(&self, project: &str, reason: &str) -> Result<usize, D6StoreError> {
+        (**self).retire_project_refs(project, reason)
     }
 }
 
@@ -2588,8 +2594,7 @@ impl<L: RefLedger> D6Workspace<L> {
 
         if work_tree != head.tree {
             let now_ms = self.commit_now_ms();
-            let kept_body =
-                self.format_body_ms(now_ms, &crate::git::set_aside_kept_message(branch));
+            let kept_body = self.format_body_ms(now_ms, &set_aside_kept_message(branch));
             let published = self
                 .store
                 .publish_snapshot(
@@ -3233,10 +3238,10 @@ impl<L: RefLedger> D6Workspace<L> {
     // ---- Oversized tracking & notices ----
 
     fn oversized_path(&self, branch: &str) -> PathBuf {
-        self.root.join(".oversized").join(branch)
+        oversized_file(&self.root, branch)
     }
 
-    fn read_oversized(&self, branch: &str) -> BTreeMap<TreePath, OversizedEntry> {
+    fn read_oversized(&self, branch: &str) -> BTreeMap<TreePath, Oversized> {
         if !is_plain_name(branch) {
             return BTreeMap::new();
         }
@@ -3249,25 +3254,13 @@ impl<L: RefLedger> D6Workspace<L> {
         parse_oversized(&bytes)
     }
 
-    fn write_oversized(&self, branch: &str, record: &BTreeMap<TreePath, OversizedEntry>) {
+    fn write_oversized(&self, branch: &str, record: &BTreeMap<TreePath, Oversized>) {
         let path = self.oversized_path(branch);
         if record.is_empty() {
             let _ = fs::remove_file(&path);
             return;
         }
-        let mut bytes = Vec::new();
-        for (file, entry) in record {
-            bytes.extend_from_slice(if entry.told { b"told" } else { b"untold" });
-            bytes.push(0);
-            bytes.extend_from_slice(entry.size.to_string().as_bytes());
-            if let Some(digest) = &entry.digest {
-                bytes.push(b' ');
-                bytes.extend_from_slice(digest.as_bytes());
-            }
-            bytes.push(0);
-            bytes.extend_from_slice(file.as_bytes());
-            bytes.push(0);
-        }
+        let bytes = encode_oversized(record);
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -3285,15 +3278,15 @@ impl<L: RefLedger> D6Workspace<L> {
         let written = fs::metadata(self.oversized_path(branch))
             .and_then(|meta| meta.modified())
             .ok();
-        let record: BTreeMap<TreePath, OversizedEntry> = oversized
+        let record: BTreeMap<TreePath, Oversized> = oversized
             .iter()
             .map(|(path, size)| {
                 let earlier = before.get(path);
                 let told = earlier.is_some_and(|e| e.told);
-                let digest = compute_oversized_digest(directory, path, *size, earlier, written);
+                let digest = oversized_digest(directory, path, *size, earlier, written);
                 (
                     path.clone(),
-                    OversizedEntry {
+                    Oversized {
                         size: *size,
                         told,
                         digest,
@@ -3307,14 +3300,7 @@ impl<L: RefLedger> D6Workspace<L> {
     }
 
     fn oversized_notice(&self, path: &TreePath, size: u64) -> String {
-        format!(
-            "{path} ({} MiB) is over the {} MiB cap for one file in a checkpoint \
-             (SPAWN_MAX_FILE_MB), so checkpoints leave it out: it is not on your branch, \
-             and it is lost when this workspace is unmounted. Make it smaller, split it, \
-             or make sure it can be generated again from what is committed.",
-            size.div_ceil(1 << 20),
-            self.max_file_bytes >> 20
-        )
+        oversized_notice_message(path, size, self.max_file_bytes)
     }
 
     fn untold_oversized(&self, branch: &str) -> Vec<String> {
@@ -3348,13 +3334,6 @@ struct D6PendingMerge {
     main: Digest,
     written_over: Digest,
     files: Vec<TreePath>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OversizedEntry {
-    size: u64,
-    told: bool,
-    digest: Option<String>,
 }
 
 impl<L: RefLedger> D6Workspace<L> {
@@ -3918,18 +3897,6 @@ fn map_cas_err(err: spawn_cas::CasError) -> WorkspaceError {
     WorkspaceError::Unavailable(err.to_string())
 }
 
-fn is_plain_name(name: &str) -> bool {
-    use std::path::Component;
-    if name.is_empty() || name.contains(['/', '\\', '\0']) {
-        return false;
-    }
-    let mut comps = Path::new(name).components();
-    matches!(
-        (comps.next(), comps.next()),
-        (Some(Component::Normal(part)), None) if part == OsStr::new(name)
-    )
-}
-
 fn extract_commit_message(commit_body: &[u8]) -> String {
     if let Some(pos) = commit_body.windows(2).position(|w| w == b"\n\n") {
         String::from_utf8_lossy(&commit_body[pos + 2..]).into_owned()
@@ -4005,74 +3972,6 @@ fn unresolved_conflicts(directory: &Path, files: &[(TreePath, usize)]) -> bool {
             Err(AgentFileError::Failed(_)) => true,
         },
     )
-}
-
-fn parse_oversized(bytes: &[u8]) -> BTreeMap<TreePath, OversizedEntry> {
-    let bytes = bytes.strip_suffix(b"\0").unwrap_or(bytes);
-    if bytes.is_empty() {
-        return BTreeMap::new();
-    }
-    let fields: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
-    fields
-        .chunks_exact(3)
-        .filter_map(|entry| {
-            let told = match entry[0] {
-                b"told" => true,
-                b"untold" => false,
-                _ => return None,
-            };
-            let sized = std::str::from_utf8(entry[1]).ok()?;
-            let (size, digest) = match sized.split_once(' ') {
-                Some((s, d)) => (s, is_sha256_str(d).then_some(d)),
-                None => (sized, None),
-            };
-            let size = size.parse().ok()?;
-            if entry[2].is_empty() {
-                return None;
-            }
-            Some((
-                TreePath::from_bytes(entry[2]),
-                OversizedEntry {
-                    size,
-                    told,
-                    digest: digest.map(str::to_string),
-                },
-            ))
-        })
-        .collect()
-}
-
-fn is_sha256_str(text: &str) -> bool {
-    text.strip_prefix("sha256:").is_some_and(|hex| {
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
-}
-
-fn compute_oversized_digest(
-    directory: &Path,
-    path: &TreePath,
-    size: u64,
-    earlier: Option<&OversizedEntry>,
-    written: Option<SystemTime>,
-) -> Option<String> {
-    let opened = open_regular(directory, path).ok()??;
-    if opened.metadata.len() != size {
-        return None;
-    }
-    if let (Some(earlier), Some(written), Ok(modified)) =
-        (earlier, written, opened.metadata.modified())
-        && earlier.size == size
-        && earlier.digest.is_some()
-        && modified < written
-    {
-        return earlier.digest.clone();
-    }
-    let mut file = opened.file;
-    let digest = sha256_reader(&mut file).ok()?;
-    Some(format!("sha256:{}", digest.hex()))
 }
 
 fn clone_layer_to_writable(layer_dir: &Path, staged_dir: &Path) -> Result<(), WorkspaceError> {

@@ -234,6 +234,15 @@ impl RefLedger for PgRefLedger {
             })
             .collect()
     }
+
+    fn retire_project_refs(&self, project: &str, reason: &str) -> Result<usize, D6StoreError> {
+        let count = self
+            .pg
+            .retire_project_refs(project, reason)
+            .map_err(|e| D6StoreError::Ledger(e.to_string()))?;
+        usize::try_from(count)
+            .map_err(|_| D6StoreError::Ledger(format!("negative retired ref count: {count}")))
+    }
 }
 
 fn setup_accepted_task(
@@ -2569,4 +2578,319 @@ fn d6_l1_tmpfs_budget_exhaustion_backpressure_fallback_and_recovery() {
          recover_ms={recover_ms:.2} reclaimed_bytes={}",
         outcome.reclaimed_bytes
     );
+}
+
+struct RecutoverCtx<'a> {
+    project: &'a str,
+    bare_repo: &'a Path,
+    ws_root: &'a Path,
+    cas_store: &'a CasMerkleStore,
+    ledger: &'a PgRefLedger,
+    adapter: &'a GitBorderAdapter,
+}
+
+fn complete_cutover_steps(
+    ctx: &RecutoverCtx<'_>,
+    reason: &str,
+) -> (ProjectCutover, spawn_host::CutoverParityReport) {
+    let mut cutover = ProjectCutover::new(ctx.project, ctx.bare_repo, ctx.ws_root);
+    cutover
+        .step1_backfill_history(ctx.cas_store, ctx.ledger)
+        .expect("step1 backfill");
+    cutover
+        .step2_pause_dispatch_and_verify_clean(ctx.cas_store)
+        .expect("step2 clean");
+    cutover
+        .step3_import_tail_commits(ctx.cas_store, ctx.ledger)
+        .expect("step3 tail");
+    cutover
+        .step4_commit_refs_and_flip_mode(ctx.cas_store, ctx.ledger, ctx.adapter, reason)
+        .expect("step4 commit refs");
+    let parity = cutover
+        .step5_verify_parity(ctx.cas_store, ctx.ledger)
+        .expect("step5 parity");
+    cutover
+        .step6_configure_readonly_border(ctx.adapter)
+        .expect("step6 readonly");
+    cutover.step7_resume_dispatch().expect("step7 resume");
+    (cutover, parity)
+}
+
+fn publish_main_change_via_gate(
+    ctx: &RecutoverCtx<'_>,
+    base_snap_id: &Digest,
+    base_oid: &GitOid,
+    file_name: &str,
+    content: &[u8],
+    reason: &str,
+) -> spawn_host::PublishedSnapshot {
+    let base_snap = ctx
+        .cas_store
+        .cas()
+        .read_merkle_snapshot(base_snap_id)
+        .expect("read base snapshot");
+    let (blob_id, blob_sz) = ctx.cas_store.put_bytes_blob(content).expect("put blob");
+    let next_tree = ctx
+        .cas_store
+        .apply_mutations(
+            &base_snap.tree,
+            &[TreeMutation::Upsert {
+                path: vec![file_name.as_bytes().to_vec()],
+                kind: TreeEntryKind::File,
+                id: blob_id.as_bytes(),
+                size: blob_sz,
+            }],
+        )
+        .expect("apply mutation");
+    let commit_body = format_commit_body(
+        "D6 Gate <gate@spawn.local> 1700002000 +0000",
+        "D6 Gate <gate@spawn.local> 1700002000 +0000",
+        reason,
+    );
+    let draft = Snapshot {
+        tree: next_tree.clone(),
+        parents: vec![base_snap_id.clone()],
+        commit_body: commit_body.clone(),
+    };
+    let cand_oid = ctx
+        .cas_store
+        .project_snapshot_oid(&draft, &[*base_oid])
+        .expect("project candidate oid");
+    let task_id = setup_accepted_task(
+        &ctx.ledger.pg,
+        ctx.bare_repo.to_str().expect("utf8"),
+        base_oid,
+        &cand_oid,
+    );
+    ctx.cas_store
+        .publish_snapshot(
+            ctx.ledger,
+            &PublishRequest {
+                project: ctx.project,
+                ref_name: "main",
+                kind: D6RefKind::Main,
+                expected_ref: Some(base_snap_id),
+                tree: &next_tree,
+                parents: std::slice::from_ref(base_snap_id),
+                commit_body: &commit_body,
+                created_at_ms: 1_700_002_000_000,
+                reason,
+                landing_task_id: Some(task_id),
+            },
+        )
+        .expect("publish accepted main snapshot")
+}
+
+fn seed_recutover_repo(scratch: &Scratch) -> (PathBuf, PathBuf, PathBuf) {
+    let work = scratch.join("work");
+    let bare = scratch.join("origin.git");
+    let ws_root = scratch.join("workspaces");
+    fs::create_dir_all(&work).expect("mkdir work");
+    fs::create_dir_all(&ws_root).expect("mkdir ws_root");
+
+    git_in(&work, &["init", "-b", "main"]);
+    fs::write(work.join("README.md"), "# Blocker 10 Test\n").expect("write readme");
+    git_in(&work, &["add", "README.md"]);
+    git_in(&work, &["commit", "-m", "initial main"]);
+
+    for (branch, file) in [("feat/keep", "keep.txt"), ("feat/drop", "drop.txt")] {
+        git_in(&work, &["checkout", "-b", branch, "main"]);
+        fs::write(work.join(file), format!("{branch}\n")).expect("write branch file");
+        git_in(&work, &["add", file]);
+        git_in(&work, &["commit", "-m", branch]);
+    }
+    git_in(&work, &["checkout", "main"]);
+    git_in(&work, &["tag", "v1.0"]);
+    git_in(
+        &scratch.0,
+        &[
+            "clone",
+            "--bare",
+            work.to_str().expect("utf8"),
+            bare.to_str().expect("utf8"),
+        ],
+    );
+    git_in(
+        &work,
+        &["remote", "add", "origin", bare.to_str().expect("utf8")],
+    );
+    (work, bare, ws_root)
+}
+
+fn advance_git_after_rollback(work: &Path) -> GitOid {
+    git_in(work, &["fetch", "origin"]);
+    git_in(work, &["reset", "--hard", "origin/main"]);
+    assert_eq!(
+        fs::read_to_string(work.join("PRE_ROLLBACK_D6.txt")).expect("read d6 commit"),
+        "landed in d6 before rollback\n"
+    );
+
+    fs::write(work.join("POST_ROLLBACK_GIT_1.txt"), "git commit 1\n").expect("write git 1");
+    git_in(work, &["add", "POST_ROLLBACK_GIT_1.txt"]);
+    git_in(work, &["commit", "-m", "post-rollback main 1"]);
+
+    fs::write(work.join("POST_ROLLBACK_GIT_2.txt"), "git commit 2\n").expect("write git 2");
+    git_in(work, &["add", "POST_ROLLBACK_GIT_2.txt"]);
+    git_in(work, &["commit", "-m", "post-rollback main 2"]);
+    git_in(work, &["push", "origin", "main"]);
+
+    git_in(work, &["checkout", "-b", "feat/post-rollback", "main"]);
+    fs::write(work.join("post_branch.txt"), "after rollback\n").expect("write post branch");
+    git_in(work, &["add", "post_branch.txt"]);
+    git_in(work, &["commit", "-m", "post rollback branch"]);
+    git_in(work, &["push", "origin", "feat/post-rollback"]);
+    git_in(work, &["checkout", "main"]);
+    git_in(work, &["tag", "v2.0"]);
+    git_in(work, &["push", "origin", "refs/tags/v2.0"]);
+    git_in(work, &["push", "origin", ":refs/heads/feat/drop"]);
+
+    let rev = git_in(work, &["rev-parse", "HEAD"]);
+    GitOid::parse_hex(String::from_utf8_lossy(&rev).trim()).expect("git oid")
+}
+
+fn verify_recutover_state_and_guard(
+    ctx: &RecutoverCtx<'_>,
+    binding: &GcFenceBinding,
+    advanced_git_main: GitOid,
+    stale_snap: &Digest,
+) {
+    let (_recutover, second_parity) = complete_cutover_steps(ctx, "re-cutover after git advance");
+    assert_eq!(second_parity.refs.len(), 5);
+    assert_eq!(
+        second_parity.refs["refs/heads/main"].git_oid,
+        advanced_git_main
+    );
+    assert!(!second_parity.refs.contains_key("refs/heads/feat/drop"));
+    assert!(
+        second_parity
+            .refs
+            .contains_key("refs/heads/feat/post-rollback")
+    );
+    assert!(second_parity.refs.contains_key("refs/tags/v2.0"));
+    assert!(spawn_host::is_readonly_border(ctx.bare_repo).expect("readonly"));
+
+    let verified = verify_cutover_parity(ctx.cas_store, ctx.ledger, ctx.project, ctx.bare_repo)
+        .expect("verify parity");
+    assert_eq!(verified.refs["refs/heads/main"].git_oid, advanced_git_main);
+    let pg_seq = ctx.ledger.pg.latest_ref_log_seq().expect("pg seq");
+    check_gc_fence(ctx.cas_store, binding, pg_seq).expect("gc fence ok");
+
+    // Runtime main-ref gate guard must remain enforced after re-cutover.
+    let re_main = &verified.refs["refs/heads/main"];
+    assert!(
+        ctx.ledger
+            .land_main_ref(
+                ctx.project,
+                "main",
+                Some(&re_main.snapshot),
+                stale_snap,
+                None,
+                "rogue"
+            )
+            .is_err(),
+        "advancing main without task_id must stay forbidden after re-cutover"
+    );
+    let post = publish_main_change_via_gate(
+        ctx,
+        &re_main.snapshot,
+        &re_main.git_oid,
+        "AFTER_RECUTOVER.txt",
+        b"gated after re-cutover\n",
+        "post-recutover d6 land",
+    );
+    assert_ne!(post.git_oid, re_main.git_oid);
+}
+
+#[test]
+fn pg_cutover_rollback_git_advance_main_recutover_and_verify() {
+    let scratch = Scratch::new("pg_recutover_b10");
+    let cas_store = CasMerkleStore::open(scratch.join("cas")).expect("open cas");
+    let ledger = PgRefLedger::connect_isolated("d6_b10_recutover");
+    let adapter = GitBorderAdapter::new();
+    let ident = ledger.pg.database_identity().expect("db identity");
+    let binding = GcFenceBinding {
+        db_system_id: ident.db_system_id,
+        db_oid: ident.db_oid,
+        schema_name: ident.schema_name,
+    };
+    bind_store_gc_fence(&cas_store, &binding).expect("bind gc fence");
+
+    let (work, bare_repo, ws_root) = seed_recutover_repo(&scratch);
+    let ctx = RecutoverCtx {
+        project: "recutover-b10-proj",
+        bare_repo: &bare_repo,
+        ws_root: &ws_root,
+        cas_store: &cas_store,
+        ledger: &ledger,
+        adapter: &adapter,
+    };
+    let unrelated_snap = Digest::parse(&format!("sha256:{}", "d".repeat(64))).unwrap();
+    let unrelated_git_oid = GitOid::parse_hex(&"e".repeat(40)).unwrap();
+    let unrelated_tree = Digest::parse(&format!("sha256:{}", "c".repeat(64))).unwrap();
+    ledger
+        .record_snapshot(
+            &unrelated_snap,
+            &unrelated_git_oid,
+            &unrelated_tree,
+            &[],
+            "unrelated-proj",
+            1,
+        )
+        .expect("unrelated snap");
+    ledger
+        .land_main_ref(
+            "unrelated-proj",
+            "main",
+            None,
+            &unrelated_snap,
+            None,
+            "init unrelated",
+        )
+        .expect("unrelated main");
+
+    let (mut cutover, initial_parity) = complete_cutover_steps(&ctx, "initial cutover");
+    let init_main = &initial_parity.refs["refs/heads/main"];
+    let landed = publish_main_change_via_gate(
+        &ctx,
+        &init_main.snapshot,
+        &init_main.git_oid,
+        "PRE_ROLLBACK_D6.txt",
+        b"landed in d6 before rollback\n",
+        "pre-rollback d6 land",
+    );
+    assert!(
+        ledger
+            .land_main_ref(
+                ctx.project,
+                "main",
+                Some(&landed.snapshot),
+                &init_main.snapshot,
+                None,
+                "no task"
+            )
+            .is_err()
+    );
+
+    let rollback = cutover
+        .rollback_to_git(&cas_store, &ledger, &adapter)
+        .expect("rollback to git");
+    assert_eq!(rollback.exported_refs, 4);
+    assert!(
+        ledger
+            .list_refs(Some(ctx.project))
+            .expect("retired")
+            .is_empty()
+    );
+    assert_eq!(
+        ledger
+            .list_refs(Some("unrelated-proj"))
+            .expect("unrelated")
+            .len(),
+        1
+    );
+    assert!(!spawn_host::is_readonly_border(&bare_repo).expect("writable"));
+
+    let advanced_git_main = advance_git_after_rollback(&work);
+    assert_git_fsck_clean(&bare_repo);
+    verify_recutover_state_and_guard(&ctx, &binding, advanced_git_main, &init_main.snapshot);
 }

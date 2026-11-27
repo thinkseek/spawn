@@ -43,6 +43,7 @@ pub mod transcripts;
 pub mod tree_path;
 pub mod watch;
 pub mod workspace;
+pub mod workspace_rules;
 
 #[cfg(test)]
 mod audit;
@@ -83,11 +84,7 @@ pub use engine_view::{
 };
 #[cfg(any(test, feature = "testing"))]
 pub use git::test_git_command;
-pub use git::{
-    DEFAULT_MAX_FILE_MB, ENGINE_RUNTIME_FILES, GitWorkspace, LARGE_FILE_TRAILER, MAIN_COPIES,
-    SET_ASIDE_FILES, SET_ASIDE_WAITS, git_command, has_conflict_block, has_conflict_block_sized,
-    max_file_bytes, names_files_outside_git,
-};
+pub use git::{GitWorkspace, git_command};
 pub use git_border::{BorderRefTarget, ExportReport, GitBorderAdapter, ImportReport, ImportedRef};
 pub use herdr::{HerdrHost, HerdrPool};
 pub use herdr_core::HerdrCoreHost;
@@ -108,6 +105,11 @@ pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};
 pub use watch::InotifyWatch;
 pub use workspace::{
     BACKEND_MARKER, CAS_DIRECTORY, LocalWorkspaceStore, WorkspaceBackend, claim_root, root_backend,
+};
+pub use workspace_rules::{
+    DEFAULT_MAX_FILE_MB, ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER, MAIN_COPIES, OversizedFile,
+    SET_ASIDE_FILES, SET_ASIDE_WAITS, has_conflict_block, has_conflict_block_sized, max_file_bytes,
+    names_files_outside_git, oversized_record,
 };
 
 /// The terminal host of this machine Spawn runs on: embedded `herdr-core`

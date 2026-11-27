@@ -224,6 +224,15 @@ impl RefLedger for PgRefLedger {
             })
             .collect()
     }
+
+    fn retire_project_refs(&self, project: &str, reason: &str) -> Result<usize, D6StoreError> {
+        let count = self
+            .pg
+            .retire_project_refs(project, reason)
+            .map_err(|e| D6StoreError::Ledger(e.to_string()))?;
+        usize::try_from(count)
+            .map_err(|_| D6StoreError::Ledger(format!("negative retired ref count: {count}")))
+    }
 }
 
 fn setup_accepted_task(
