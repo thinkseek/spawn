@@ -189,6 +189,19 @@ At `2,048` files (`c=8`), `d6` (`disk`) reached `97.46` cyc/s (`+116.8%` vs `git
 
 On `45093817`, `spawn_snapshot_record` in [`crates/spawn-postgres/sql/schema.sql`](../crates/spawn-postgres/sql/schema.sql) guards `INSERT INTO spawn_snapshots` with `ON CONFLICT (id) DO NOTHING`, which handles collisions on the primary key `id` but does not serialize or swallow concurrent unique conflicts on the secondary unique constraint `spawn_snapshots_git_oid_key` under PostgreSQL `READ COMMITTED`. When `storage_benchmark` runs `c=8` workers with identical synthetic payloads inside the same 1-second timestamp bucket, `d6` can intermittently fail with SQLSTATE `23505` (`spawn_snapshots_git_oid_key`), observed once on initial `d6` (`512`, `c=8`, disk) before passing cleanly on retry and `3/3` times on `d6` (`2,048`, `c=8`, L1 `tmpfs`). All values tabulated above come from clean passing runs (`integrity=passed`, `git_fsck=passed`, `shadow_oracle.has_divergences=false`); making `spawn_snapshot_record` idempotent across both `(id)` and `(git_oid)` is a tracked follow-up (`#97`/`#113`).
 
+## Post-PR #190 (`0b0396d0`) `--release` `2,048`-file `c=8` Results
+
+Measured on real Linux against revision `0b0396d02fd76776b0e3a69b96de6bc861e4ada9` using an isolated disposable PostgreSQL 16 instance (normal durable settings via `SPAWN_BENCH_DATABASE_URL`) and a bounded `/dev/shm` L1 `tmpfs` upperdir (`--tmpfs-budget-mb 512`), with `40` measured iterations, `5` warmup cycles, `4` edits per cycle, `4,096` B/file, and `16,384` B transcript appends:
+
+| Config | Wall (ms) | Agg (cyc/s) | ck p50 / p95 (ms) | noop p50 / p95 (ms) | merge p50 / p95 (ms) | cycle p50 / p95 (ms) | Disk (B) | Amp |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `git` (`c=8`) | 7385.7 | 43.33 | 63.30 / 92.90 | 50.45 / 85.80 | 93.60 / 112.48 | 130.60 / 180.65 | 74,678,903 | 1.113 |
+| `d6` (`c=8`, disk) | 3890.4 | 82.25 | 37.41 / 55.67 | 17.67 / 26.87 | 40.05 / 44.43 | 70.54 / 102.90 | 74,810,948 (`cas=1,803,122`) | 1.115 |
+| `d6` (`c=8`, L1 `tmpfs` 512 MiB) | 3569.3 | 89.65 | 34.72 / 41.31 | 16.21 / 20.48 | 38.84 / 48.01 | 66.41 / 78.33 | 74,812,480 (`l1_reserved=67,109,072`, `cas=1,804,654`) | 1.115 |
+| `shadow` (`c=8`) | 17447.5 | 18.34 | 173.63 / 201.89 | 156.79 / 182.72 | 116.67 / 141.40 | 345.27 / 383.02 | 76,516,496 (`cas=1,832,239`) | 1.140 |
+
+All four runs completed with `integrity=passed` and zero SQLSTATE `23505` errors. The shadow oracle reported `checkpoints_agreed=728`, `merge_agree_clean=32`, `merge_agree_conflict=0`, `tree_mismatches=0`, `tracked_set_leaks=0`, `shadow_errors=0`, `merge_blockers=0`, and `has_divergences=false` (`git_fsck=passed`).
+
 ### Sanitized Reproduction Commands
 
 ```sh
