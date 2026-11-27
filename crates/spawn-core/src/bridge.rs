@@ -103,8 +103,8 @@ use serde_json::json;
 
 use crate::command::{Claimed, CommandAction, NamedKey, Outcome, Submission};
 use crate::driver::{
-    AgentDriver, EngineHome, EngineLaunch, LineCursor, SessionBinding, driver_or_default,
-    plain_session_id,
+    AgentDriver, EngineHome, EngineLaunch, LineCursor, NativeSession, SessionBinding,
+    driver_or_default, plain_session_id,
 };
 use crate::event::{
     ARCHIVE_REASON_MAX, ArtifactRef, CheckpointReason, CommandStep, EndCause, EventKind,
@@ -5528,12 +5528,16 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<Handled, StoreError> {
         let fresh = self.name_session(claimed, native, active)?;
+        let session = match (native, fresh.as_deref()) {
+            (Some(id), _) => NativeSession::Resume(id),
+            (None, Some(id)) => NativeSession::New(id),
+            (None, None) => NativeSession::Unnamed,
+        };
         let launched = self.launch(
             claimed,
             active,
             &EngineLaunch {
-                native: fresh.as_deref().or(native),
-                resume: native.is_some(),
+                session,
                 relay: prepared.relay.as_ref(),
                 profile: prepared.model,
                 config_dir: prepared.config_dir.as_deref(),
@@ -8142,10 +8146,11 @@ pub fn claude_settings_in(
 /// unchanged. Claude Code enforces it; Spawn only hands it over.
 pub const CROSS_SESSION_INBOUND: &str = "refuse";
 
-/// Claude arguments for the session `native`: a new one with that id, or
-/// the earlier one resumed, with `settings` from [`claude_settings`]. The
-/// prompt is typed into the pane, never passed here.
-pub fn claude_arguments(native: Option<&str>, resume: bool, settings: &str) -> Vec<String> {
+/// Claude arguments for `session`: unnamed, a new one with that id
+/// (`--session-id`), or the earlier one resumed (`--resume`), with
+/// `settings` from [`claude_settings`]. The prompt is typed into the pane,
+/// never passed here.
+pub fn claude_arguments(session: NativeSession<'_>, settings: &str) -> Vec<String> {
     // The engine runs in a container with no credentials of its own, so the
     // permission prompts have nowhere to go. The sandbox is the boundary.
     let mut arguments = vec![
@@ -8154,9 +8159,10 @@ pub fn claude_arguments(native: Option<&str>, resume: bool, settings: &str) -> V
         "--settings".to_string(),
         settings.to_string(),
     ];
-    if let Some(native) = native {
-        arguments.push(if resume { "--resume" } else { "--session-id" }.to_string());
-        arguments.push(native.to_string());
+    match session {
+        NativeSession::Unnamed => {}
+        NativeSession::New(id) => arguments.extend(["--session-id".to_string(), id.to_string()]),
+        NativeSession::Resume(id) => arguments.extend(["--resume".to_string(), id.to_string()]),
     }
     arguments
 }

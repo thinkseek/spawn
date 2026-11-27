@@ -206,13 +206,40 @@ impl EngineHome {
     }
 }
 
+/// The engine's native session for one launch: exactly one of three, so a
+/// resume always names the session it resumes.
+///
+/// ```compile_fail,E0308
+/// use spawn_core::driver::NativeSession;
+/// let resume_nothing: NativeSession<'static> = NativeSession::Resume;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeSession<'a> {
+    /// A new session the engine names itself (agy, Codex) or, for an
+    /// engine the Bridge names, none named yet.
+    Unnamed,
+    /// A new session with the id the Bridge assigned ([`AgentDriver::new_session_id`]).
+    New(&'a str),
+    /// The earlier session with this id, resumed.
+    Resume(&'a str),
+}
+
+impl<'a> NativeSession<'a> {
+    /// The id of the session resumed, for an engine that only takes an id
+    /// to resume (agy, Codex): a new session, named or not, passes none.
+    pub fn resumed(self) -> Option<&'a str> {
+        match self {
+            NativeSession::Resume(id) => Some(id),
+            NativeSession::Unnamed | NativeSession::New(_) => None,
+        }
+    }
+}
+
 /// What one launch asks of an engine, decided by the Bridge.
 #[derive(Debug, Clone, Copy)]
 pub struct EngineLaunch<'a> {
-    /// The native session: a new one with that id, or the one resumed.
-    pub native: Option<&'a str>,
-    /// `native` names an earlier session to resume, not a new one.
-    pub resume: bool,
+    /// The native session: unnamed, new with an assigned id, or resumed.
+    pub session: NativeSession<'a>,
     /// The model relay the engine goes through: the reachable one, or none.
     pub relay: Option<&'a ModelRelay>,
     /// The models it runs on.
@@ -1144,7 +1171,7 @@ impl AgentDriver for ClaudeDriver {
         let settings = claude_settings_in(launch.relay, launch.profile, launch.config_dir);
         LaunchPlan {
             program: home.program.clone(),
-            arguments: claude_arguments(launch.native, launch.resume, &settings),
+            arguments: claude_arguments(launch.session, &settings),
             environment: Vec::new(),
             settings,
         }
@@ -1292,7 +1319,7 @@ impl AgentDriver for AgyDriver {
         let arguments = agy_arguments(
             launch.model.or(home.model.as_deref()).unwrap_or_default(),
             launch.cwd.unwrap_or_default(),
-            launch.native.filter(|_| launch.resume),
+            launch.session.resumed(),
         );
         let settings = arguments.last().cloned().unwrap_or_default();
         LaunchPlan {
@@ -1427,8 +1454,8 @@ pub fn driver_or_default(id: &str) -> &'static dyn AgentDriver {
 mod tests {
     use super::{
         AgentDriver, AgyDriver, ClaudeDriver, DEFAULT, DriverTraits, EngineHome, EngineLaunch,
-        Guard, LineCursor, SessionBinding, TurnSource, agy_arguments, driver, driver_or_default,
-        drivers, excerpt_for, plain_session_id,
+        Guard, LineCursor, NativeSession, SessionBinding, TurnSource, agy_arguments, driver,
+        driver_or_default, drivers, excerpt_for, plain_session_id,
     };
     use crate::bridge::{
         ModelRelay, claude_arguments, claude_session_id, claude_settings, claude_settings_in,
@@ -1476,16 +1503,15 @@ mod tests {
         for relay in relays() {
             for profile in [ModelProfile::Default, ModelProfile::Cheap] {
                 for config_dir in [None, Some("/home/agent/.claude-7")] {
-                    for (native, resume) in [
-                        (None, false),
-                        (Some("4f1c2b3a-0000-4000-8000-000000000001"), false),
-                        (Some("4f1c2b3a-0000-4000-8000-000000000001"), true),
+                    for session in [
+                        NativeSession::Unnamed,
+                        NativeSession::New("4f1c2b3a-0000-4000-8000-000000000001"),
+                        NativeSession::Resume("4f1c2b3a-0000-4000-8000-000000000001"),
                     ] {
                         let plan = driver.launch(
                             &home(),
                             &EngineLaunch {
-                                native,
-                                resume,
+                                session,
                                 relay: relay.as_ref(),
                                 profile,
                                 config_dir,
@@ -1495,7 +1521,7 @@ mod tests {
                         );
                         let settings = claude_settings_in(relay.as_ref(), profile, config_dir);
                         assert_eq!(plan.settings, settings);
-                        assert_eq!(plan.arguments, claude_arguments(native, resume, &settings));
+                        assert_eq!(plan.arguments, claude_arguments(session, &settings));
                         assert_eq!(plan.program, "/usr/local/bin/claude");
                         assert!(plan.environment.is_empty(), "no new variables for Claude");
                         if config_dir.is_none() {
@@ -1663,16 +1689,15 @@ mod tests {
             "--settings",
             settings,
         ];
-        for (native, resume) in [
-            (None, false),
-            (Some("conv-1"), true),
-            (Some("conv-1"), false),
+        for session in [
+            NativeSession::Unnamed,
+            NativeSession::Resume("conv-1"),
+            NativeSession::New("conv-1"),
         ] {
             let plan = AgyDriver.launch(
                 &agy_home(),
                 &EngineLaunch {
-                    native,
-                    resume,
+                    session,
                     relay: None,
                     profile: ModelProfile::Cheap,
                     config_dir: Some("/x"),
@@ -1682,8 +1707,11 @@ mod tests {
             );
             assert_eq!(plan.program, "/opt/agy/bin/agy");
             let mut expected: Vec<String> = Vec::new();
-            if resume {
-                expected.extend(["--conversation".to_string(), "conv-1".to_string()]);
+            match session {
+                NativeSession::Resume(id) => {
+                    expected.extend(["--conversation".to_string(), id.to_string()]);
+                }
+                NativeSession::Unnamed | NativeSession::New(_) => {}
             }
             expected.extend(flags.iter().map(|flag| (*flag).to_string()));
             assert_eq!(plan.arguments, expected);
@@ -1704,8 +1732,7 @@ mod tests {
         let plan = AgyDriver.launch(
             &agy_home(),
             &EngineLaunch {
-                native: None,
-                resume: false,
+                session: NativeSession::Unnamed,
                 relay: None,
                 profile: ModelProfile::Default,
                 config_dir: None,

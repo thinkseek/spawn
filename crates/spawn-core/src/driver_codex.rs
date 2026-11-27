@@ -358,7 +358,7 @@ impl AgentDriver for CodexDriver {
 
     fn launch(&self, home: &EngineHome, launch: &EngineLaunch<'_>) -> LaunchPlan {
         let model = launch.model.or(home.model.as_deref());
-        let resume = launch.native.filter(|_| launch.resume);
+        let resume = launch.session.resumed();
         let codex_home = home.sessions.trim().trim_end_matches('/');
         let environment = if codex_home.is_empty() {
             Vec::new()
