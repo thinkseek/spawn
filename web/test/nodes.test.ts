@@ -1,15 +1,21 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import {
+  buildShaBadge,
   coresText,
   cpuLimit,
   gibText,
+  mergeNodeRows,
+  nodeVersionText,
+  normalizeNodeList,
   normalizeNodes,
   powerOf,
   powerText,
   powerTone,
   reachText,
+  shortBuildSha,
   viaText,
 } from "../src/nodes.ts";
 
@@ -70,6 +76,8 @@ test("the server's nodes become rows by name, each with its state and sample as 
       low_battery_drain: false,
       effective_drained: false,
       schedulable: null,
+      build_sha: null,
+      node_version: null,
     },
     {
       name: "runner",
@@ -89,6 +97,8 @@ test("the server's nodes become rows by name, each with its state and sample as 
       low_battery_drain: false,
       effective_drained: false,
       schedulable: null,
+      build_sha: null,
+      node_version: null,
     },
   ]);
   assert.deepEqual(normalizeNodes({ nodes: [] }), []);
@@ -219,4 +229,198 @@ test("the power reads as the CLI says it, with its tone", () => {
     charging: false,
     remaining_mins: null,
   });
+});
+
+test("node build_sha and node_version are normalized from top-level or heartbeat, with null fallbacks", () => {
+  const fullSha = "e3f8ca5a66214f0a47f80878c2ceb97a76301dbb";
+  const rows = Object.fromEntries(
+    normalizeNodes({
+      nodes: [
+        { name: "v1-full", state: "live", build_sha: `  ${fullSha}  `, node_version: " 0.1.0 " },
+        {
+          name: "v1-beat",
+          state: "live",
+          build_sha: null,
+          node_version: "",
+          heartbeat: { at_ms: 1000, build_sha: "abcdef123456", node_version: "v0.2.1" },
+        },
+        { name: "v1-empty", state: "live", build_sha: "   ", node_version: 123 },
+        { name: "legacy", state: "drained" },
+      ],
+    }).map((row) => [row.name, row]),
+  );
+
+  assert.equal(rows["v1-full"]?.build_sha, fullSha);
+  assert.equal(rows["v1-full"]?.node_version, "0.1.0");
+  assert.equal(rows["v1-beat"]?.build_sha, "abcdef123456");
+  assert.equal(rows["v1-beat"]?.node_version, "v0.2.1");
+  assert.equal(rows["v1-empty"]?.build_sha, null);
+  assert.equal(rows["v1-empty"]?.node_version, null);
+  assert.equal(rows.legacy?.build_sha, null);
+  assert.equal(rows.legacy?.node_version, null);
+
+  assert.deepEqual(normalizeNodeList(undefined), []);
+  assert.deepEqual(normalizeNodeList(null), []);
+  assert.equal(normalizeNodeList([{ name: "fleet-only", state: "live", build_sha: fullSha }]).length, 1);
+});
+
+test("shortBuildSha, buildShaBadge, and nodeVersionText format telemetry and handle missing/null fields", () => {
+  const fullSha = "e3f8ca5a66214f0a47f80878c2ceb97a76301dbb";
+  assert.equal(shortBuildSha(fullSha), "e3f8ca5a");
+  assert.equal(shortBuildSha(fullSha, 12), "e3f8ca5a6621");
+  assert.equal(shortBuildSha("abc1234"), "abc1234");
+  assert.equal(shortBuildSha("  9f8e7d6c5b4a  "), "9f8e7d6c");
+  assert.equal(shortBuildSha(null), null);
+  assert.equal(shortBuildSha(undefined), null);
+  assert.equal(shortBuildSha(""), null);
+  assert.equal(shortBuildSha("   "), null);
+
+  assert.deepEqual(buildShaBadge({ build_sha: fullSha }), {
+    short: "e3f8ca5a",
+    full: fullSha,
+  });
+  assert.deepEqual(buildShaBadge({ build_sha: "abc1234" }), {
+    short: "abc1234",
+    full: "abc1234",
+  });
+  assert.equal(buildShaBadge({ build_sha: null }), null);
+  assert.equal(buildShaBadge({ build_sha: "" }), null);
+  assert.equal(buildShaBadge({ build_sha: "  " }), null);
+
+  assert.equal(nodeVersionText({ node_version: "0.1.0" }), "v0.1.0");
+  assert.equal(nodeVersionText({ node_version: " 1.4.2-rc1 " }), "v1.4.2-rc1");
+  assert.equal(nodeVersionText({ node_version: "v0.3.0" }), "v0.3.0");
+  assert.equal(nodeVersionText({ node_version: "dev-build" }), "dev-build");
+  assert.equal(nodeVersionText({ node_version: null }), null);
+  assert.equal(nodeVersionText({ node_version: "" }), null);
+  assert.equal(nodeVersionText({ node_version: "   " }), null);
+});
+
+test("mergeNodeRows combines /api/nodes and /api/fleet node payloads without losing telemetry", () => {
+  const apiNodes = normalizeNodeList([
+    { name: "alpha", state: "live", build_sha: null, node_version: null },
+    { name: "beta", state: "live", build_sha: "1111222233334444", node_version: "0.2.0" },
+  ]);
+  const fleetNodes = normalizeNodeList([
+    { name: "alpha", state: "live", build_sha: "aaaa1111bbbb2222", node_version: "0.1.0" },
+    { name: "beta", state: "live", build_sha: "9999888877776666", node_version: "0.1.0" },
+    { name: "gamma", state: "drained", build_sha: "cccc3333dddd4444", node_version: "0.1.5" },
+  ]);
+
+  const merged = mergeNodeRows(apiNodes, fleetNodes);
+  assert.deepEqual(
+    merged.map((row) => [row.name, row.build_sha, row.node_version]),
+    [
+      ["alpha", "aaaa1111bbbb2222", "0.1.0"],
+      ["beta", "1111222233334444", "0.2.0"],
+      ["gamma", "cccc3333dddd4444", "0.1.5"],
+    ],
+  );
+  assert.deepEqual(mergeNodeRows(null, fleetNodes).map((row) => row.name), ["alpha", "beta", "gamma"]);
+  assert.deepEqual(mergeNodeRows(apiNodes, undefined).map((row) => row.name), ["alpha", "beta"]);
+  assert.deepEqual(mergeNodeRows(null, null), []);
+});
+
+test("NodeRows and FleetView wire build_sha monospace badge tooltip and node_version", () => {
+  const nodeRows = readFileSync(new URL("../src/components/fleet/NodeRows.tsx", import.meta.url), "utf8");
+  const fleetView = readFileSync(new URL("../src/components/fleet/FleetView.tsx", import.meta.url), "utf8");
+  for (const needle of [
+    "mergeNodeRows(data, fleetNodes)",
+    "buildShaBadge(node)",
+    "nodeVersionText(node)",
+    "title={sha.full}",
+    "{sha.short}",
+    "font-mono",
+  ]) {
+    assert.ok(nodeRows.includes(needle), `NodeRows.tsx includes ${needle}`);
+  }
+  assert.ok(fleetView.includes("<NodeRows fleetNodes={data.nodes} />"), "FleetView passes /api/fleet nodes to NodeRows");
+});
+
+test("enrolled v1 nodes from PR #203 /api/nodes normalize state, last_beat_ms, drained, and telemetry", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const rows = Object.fromEntries(
+    normalizeNodes({
+      nodes: [
+        {
+          name: "n252",
+          proto: "node-v1",
+          state: "active",
+          drained: false,
+          degraded: false,
+          lost: false,
+          last_beat_ms: 1_000_000,
+          build_sha: sha,
+          node_version: "0.1.0",
+          effective_drained: false,
+          schedulable: true,
+        },
+        {
+          name: "n-drained",
+          proto: "node-v1",
+          state: "active,drained",
+          drained: true,
+          last_beat_ms: 1_000_100,
+          effective_drained: true,
+          schedulable: false,
+        },
+        {
+          name: "n-degraded",
+          proto: "node-v1",
+          state: "active,degraded",
+          drained: false,
+          degraded: true,
+          last_beat_ms: 1_000_200,
+          effective_drained: false,
+          schedulable: false,
+        },
+        {
+          name: "n-lost",
+          proto: "node-v1",
+          state: "lost",
+          drained: false,
+          lost: true,
+          last_beat_ms: 800_000,
+          schedulable: false,
+        },
+        {
+          name: "n-lost-drained",
+          proto: "node-v1",
+          state: "lost,drained",
+          drained: true,
+          lost: true,
+          last_beat_ms: 700_000,
+          effective_drained: true,
+          schedulable: false,
+        },
+        {
+          name: "n-revoked",
+          proto: "node-v1",
+          state: "revoked",
+        },
+      ],
+    }).map((row) => [row.name, row]),
+  );
+
+  assert.equal(rows.n252?.state, "live");
+  assert.equal(rows.n252?.sampled_ms, 1_000_000);
+  assert.equal(rows.n252?.build_sha, sha);
+  assert.equal(rows.n252?.node_version, "0.1.0");
+  assert.equal(rows.n252?.effective_drained, false);
+  assert.equal(rows.n252?.schedulable, true);
+
+  assert.equal(rows["n-drained"]?.state, "drained");
+  assert.equal(rows["n-drained"]?.effective_drained, true);
+  assert.equal(rows["n-drained"]?.sampled_ms, 1_000_100);
+
+  assert.equal(rows["n-degraded"]?.state, "live");
+  assert.equal(rows["n-degraded"]?.schedulable, false);
+
+  assert.equal(rows["n-lost"]?.state, "lost");
+  assert.equal(rows["n-lost"]?.sampled_ms, 800_000);
+
+  assert.equal(rows["n-lost-drained"]?.state, "lost");
+  assert.equal(rows["n-lost-drained"]?.effective_drained, true);
+
+  assert.equal(rows["n-revoked"], undefined);
 });

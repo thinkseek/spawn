@@ -44,6 +44,16 @@ export interface NodeRow {
   effective_drained: boolean;
   /** Whether work may be placed on it; null from a server that does not say. */
   schedulable: boolean | null;
+  /** Commit SHA the node daemon was built at (PR #196 / spawn-node #9); null when absent. */
+  build_sha: string | null;
+  /** Node daemon version (PR #196 / spawn-node #9); null when absent. */
+  node_version: string | null;
+}
+
+/** Short/full pair for rendering a node's `build_sha` monospace badge with full SHA tooltip. */
+export interface BuildShaBadge {
+  short: string;
+  full: string;
 }
 
 /** A node's power, as its probes read it (crate nodes/power.rs). */
@@ -64,9 +74,28 @@ const number = (value: unknown): number | null =>
 
 const text = (value: unknown): string | null => (typeof value === "string" && value !== "" ? value : null);
 
+const trimmedText = (value: unknown): string | null => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed !== "" ? trimmed : null;
+};
+
 const STATES: readonly string[] = ["live", "lost", "drained"];
 const TRANSPORTS: readonly string[] = ["ssh", "tcp", "udp"];
 const MODES: readonly string[] = ["direct", "relay", "hole_punch"];
+
+/** Normalize either P1 node states (`live`, `lost`, `drained`) or v1 node states
+ * (`active`, `active,drained`, `active,degraded`, `lost`, `lost,drained`, ...) into a
+ * `NodeState`; returns null for unknown or revoked states so callers drop them. */
+function normalizeNodeState(node: JsonObject): NodeState | null {
+  if (typeof node.state !== "string") return null;
+  if (STATES.includes(node.state)) return node.state as NodeState;
+  const [base, ...flags] = node.state.split(",");
+  if (!flags.every((flag) => flag === "drained" || flag === "degraded")) return null;
+  if (base === "lost") return "lost";
+  if (base === "active") return flags.includes("drained") || node.drained === true ? "drained" : "live";
+  return null;
+}
 
 /** A node's hops: the names of a list, anything else dropped. */
 function hops(via: unknown): string[] {
@@ -90,38 +119,75 @@ function gpuText(gpu: unknown): string | null {
   return mb === null ? name : `${name} ${Math.round(mb / 1024)}G`;
 }
 
+/** Normalize an array of node payloads (from `/api/nodes` or `/api/fleet`),
+ * sorted by name. Returns `[]` when `raw` is not an array; entries without a
+ * name or a known state are dropped. */
+export function normalizeNodeList(raw: unknown): NodeRow[] {
+  if (!Array.isArray(raw)) return [];
+  const rows: NodeRow[] = [];
+  for (const entry of raw) {
+    const node = object(entry);
+    const name = text(node?.name);
+    const state = node ? normalizeNodeState(node) : null;
+    if (!node || name === null || state === null) continue;
+    const beat = object(node.heartbeat);
+    const total = number(node.mem_total);
+    const max = number(node.mem_max);
+    rows.push({
+      name,
+      state,
+      arch: text(node.arch),
+      cores: number(node.cores),
+      cpu_limit: cpuLimit(node.cpu_max),
+      mem_bytes: total !== null && max !== null ? Math.min(total, max) : total,
+      disk_free_bytes: number(beat?.disk_free) ?? number(node.disk_free),
+      gpu: gpuText(node.gpu),
+      sampled_ms: number(beat?.at_ms) ?? number(node.last_beat_ms),
+      lost_since_ms: number(node.lost_since_ms),
+      ...reach(node),
+      power: powerOf(node.power),
+      low_battery_drain: node.low_battery_drain === true,
+      effective_drained: node.effective_drained === true || node.drained === true || state === "drained",
+      schedulable: typeof node.schedulable === "boolean" ? node.schedulable : null,
+      build_sha: trimmedText(node.build_sha) ?? trimmedText(beat?.build_sha),
+      node_version: trimmedText(node.node_version) ?? trimmedText(beat?.node_version),
+    });
+  }
+  return rows.sort((left, right) => left.name.localeCompare(right.name));
+}
+
 /** `/api/nodes`' answer as rows, by name. One without a name or a known
  * state is left out; an answer that is not `{nodes: [...]}` throws, so the
  * page says the read failed rather than showing no node. */
 export function normalizeNodes(raw: unknown): NodeRow[] {
   const nodes = object(raw)?.nodes;
   if (!Array.isArray(nodes)) throw new Error("not a list of nodes");
-  return nodes
-    .map(object)
-    .filter((node): node is JsonObject => text(node?.name) !== null && STATES.includes(node?.state as string))
-    .map((node) => {
-      const beat = object(node.heartbeat);
-      const total = number(node.mem_total);
-      const max = number(node.mem_max);
-      return {
-        name: node.name as string,
-        state: node.state as NodeState,
-        arch: text(node.arch),
-        cores: number(node.cores),
-        cpu_limit: cpuLimit(node.cpu_max),
-        mem_bytes: total !== null && max !== null ? Math.min(total, max) : total,
-        disk_free_bytes: number(beat?.disk_free) ?? number(node.disk_free),
-        gpu: gpuText(node.gpu),
-        sampled_ms: number(beat?.at_ms),
-        lost_since_ms: number(node.lost_since_ms),
-        ...reach(node),
-        power: powerOf(node.power),
-        low_battery_drain: node.low_battery_drain === true,
-        effective_drained: node.effective_drained === true || node.state === "drained",
-        schedulable: typeof node.schedulable === "boolean" ? node.schedulable : null,
-      };
-    })
-    .sort((left, right) => left.name.localeCompare(right.name));
+  return normalizeNodeList(nodes);
+}
+
+/** Merge node rows from `/api/nodes` (`primary`) with optional `/api/fleet`
+ * node payloads (`fallback`), filling absent telemetry fields by node name. */
+export function mergeNodeRows(
+  primary: readonly NodeRow[] | null | undefined,
+  fallback: readonly NodeRow[] | null | undefined,
+): NodeRow[] {
+  const main = primary ?? [];
+  const extra = fallback ?? [];
+  if (extra.length === 0) return [...main];
+  if (main.length === 0) return [...extra].sort((left, right) => left.name.localeCompare(right.name));
+  const byName = new Map(extra.map((row) => [row.name, row]));
+  const merged = main.map((row) => {
+    const peer = byName.get(row.name);
+    if (!peer) return row;
+    byName.delete(row.name);
+    return {
+      ...row,
+      build_sha: row.build_sha ?? peer.build_sha,
+      node_version: row.node_version ?? peer.node_version,
+    };
+  });
+  for (const remaining of byName.values()) merged.push(remaining);
+  return merged.sort((left, right) => left.name.localeCompare(right.name));
 }
 
 /** A node's `power`, or null: not an object, or no `on_ac` said. */
@@ -194,4 +260,25 @@ export function coresText(row: Pick<NodeRow, "cores" | "cpu_limit">): string {
   if (row.cores === null) return "—";
   if (row.cpu_limit !== null && row.cpu_limit < row.cores) return `${row.cores} (${row.cpu_limit} allowed)`;
   return String(row.cores);
+}
+
+/** First `length` characters (default 8) of a node's `build_sha`; null when absent. */
+export function shortBuildSha(sha: string | null | undefined, length = 8): string | null {
+  const full = trimmedText(sha);
+  if (full === null) return null;
+  return full.slice(0, Math.max(1, length));
+}
+
+/** Short 8-char badge label and full SHA tooltip for a node's `build_sha`; null when absent. */
+export function buildShaBadge(row: Pick<NodeRow, "build_sha">): BuildShaBadge | null {
+  const full = trimmedText(row.build_sha);
+  if (full === null) return null;
+  return { short: shortBuildSha(full, 8) ?? full, full };
+}
+
+/** Formatted daemon version (`v0.1.0` for numeric semver, as-is otherwise); null when absent. */
+export function nodeVersionText(row: Pick<NodeRow, "node_version">): string | null {
+  const version = trimmedText(row.node_version);
+  if (version === null) return null;
+  return /^\d/.test(version) ? `v${version}` : version;
 }
