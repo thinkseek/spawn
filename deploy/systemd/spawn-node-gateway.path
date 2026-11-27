@@ -1,0 +1,24 @@
+[Unit]
+Description=Spawn: start the node gateway when Keep delivers its PostgreSQL URL
+
+[Path]
+# After a reboot /run/keep is empty until Keep delivers again (Wave K3):
+# once spawn-node-gateway.service is cut over to LoadCredential, it
+# starts at boot without the file, fails with 243 (or 78 on empty/invalid
+# credential) and stays stopped. When Keep then writes
+# /run/keep/spawn-node-gateway.database-url (closed after a write, or
+# renamed into place), this unit starts spawn-node-gateway.service; it
+# does nothing while the gateway runs. PathChanged alone, not PathExists:
+# with PathExists systemd starts the gateway again each time it stops
+# while the file is there, so an empty or malformed file (exit 78 /
+# EX_CONFIG) would be retried until the start limit, which leaves this
+# unit failed and a later good write unheard. PathChanged hits that limit
+# too (5 starts in 10 s) only if Keep writes a bad file over and over;
+# then `systemctl --user reset-failed` and start this unit again.
+# /run/keep itself may be absent at first: systemd watches the nearest
+# parent that exists.
+PathChanged=/run/keep/spawn-node-gateway.database-url
+Unit=spawn-node-gateway.service
+
+[Install]
+WantedBy=default.target

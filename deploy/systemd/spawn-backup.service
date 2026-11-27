@@ -25,9 +25,9 @@ Restart=on-failure
 RestartSec=15min
 # 3 = the dump failed the plausibility check and went to postgres/suspect/
 # (a retry would upload the same suspect dump); 4 = the R2 limit stopped the
-# hourly copy (nothing written, and a retry changes nothing either): both
-# are the record's job, and `systemctl --user --failed` names the unit.
-RestartPreventExitStatus=3 4
+# hourly copy (nothing written, and a retry changes nothing either); 78/243 =
+# Keep LoadCredential file missing or invalid (Wave K3): none are retried.
+RestartPreventExitStatus=3 4 78 243
 TimeoutStartSec=30min
 Nice=10
 IOSchedulingClass=idle

@@ -476,9 +476,9 @@ Keep (`~/.keep` on the owner host, delivered to `/run/keep/<id>` mode `0600`) ke
 | `spawn-node-gw.service` | `no_secrets` | Optional `EnvironmentFile=-%h/.config/spawn/node-gw.env` non-secret host overrides only (zero `spawn.env` / `*DATABASE_URL*`) | None | `go_unit_pg_isolation` enforced continuously |
 | `spawn-node-edge.service` | `pending_migration` (Wave K2 prepared) | Optional `EnvironmentFile=-%h/.config/spawn/node-edge.env` (`SPAWN_SERVE_TOKEN` off loopback; zero `spawn.env` / `*DATABASE_URL*`); `spawn-node` (`thinkseek/spawn-node#12`) supports `$CREDENTIALS_DIRECTORY/spawn-serve.token` + `--require-serve-token-credential` (exit `78` fail-closed), and `spawn-node-edge.path` is staged | `spawn-serve.token` | `LoadCredential=spawn-serve.token:/run/keep/spawn-serve.token` + `RestartPreventExitStatus=243 78` + `--require-serve-token-credential` (`go_units_pg_isolation` enforced continuously) |
 | `spawn-model-relay.service` | `pending_migration` (Wave K1 prepared) | `EnvironmentFile=%h/.config/spawn/model-relay.env` (`DEEPSEEK_API_KEY`); `model-relay.py` supports `$CREDENTIALS_DIRECTORY/deepseek.api-key` + `GET /healthz`, and `spawn-model-relay.path` is staged | `deepseek.api-key` | `LoadCredential=deepseek.api-key:/run/keep/deepseek.api-key` + `RestartPreventExitStatus=243 78` (once Keep delivers `/run/keep/deepseek.api-key`) |
-| `spawn-node-gateway.service` | `pending_migration` | `EnvironmentFile=%h/.config/spawn/node-gateway.env` (`SPAWN_NODE_GATEWAY_DATABASE_URL`) | `spawn-node-gateway.database-url` | `LoadCredential=spawn-node-gateway.database-url:/run/keep/spawn-node-gateway.database-url` |
-| `spawn-serve.service`, `spawn-core.service` | `pending_migration` | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` | `spawn.database-url`, `spawn-serve.token` | `LoadCredential=` or restricted config + `SPAWN_SERVE_TOKEN` delivery |
-| `spawn-backup.service`, `spawn-backup-bundle.service`, `spawn-backup-verify.service`, `spawn-backup-restore-drill*.service` | `pending_migration` | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` | `spawn.database-url`, `backup.encryption-key`, `r2.credentials` | `LoadCredential=` delivery per backup/R2 secret |
+| `spawn-node-gateway.service` (and `.path` staged) | `pending_migration` (Wave K3 prepared) | `EnvironmentFile=%h/.config/spawn/node-gateway.env` (`SPAWN_NODE_GATEWAY_DATABASE_URL`); binary supports `$CREDENTIALS_DIRECTORY/spawn-node-gateway.database-url` (exit `78` fail-closed), and `spawn-node-gateway.path` is staged | `spawn-node-gateway.database-url` | `LoadCredential=spawn-node-gateway.database-url:/run/keep/spawn-node-gateway.database-url` + `RestartPreventExitStatus=243 78` |
+| `spawn-serve.service`, `spawn-core.service` | `pending_migration` | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` (`spawn serve` also reads `$CREDENTIALS_DIRECTORY/spawn.database-url` & `spawn-serve.token`) | `spawn.database-url`, `spawn-serve.token` | `LoadCredential=` or restricted config + `SPAWN_SERVE_TOKEN` delivery |
+| `spawn-backup.service`, `spawn-backup-bundle.service`, `spawn-backup-verify.service`, `spawn-backup-restore-drill*.service` | `pending_migration` (Wave K3 prepared) | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` retained on live hosts (units add `RestartPreventExitStatus=78 243`; `spawn backup`/`store`/`lib.sh` support `$CREDENTIALS_DIRECTORY/{r2.credentials,r2-store.credentials,backup.key.k1,backup.encryption-key,spawn.database-url,spawn.backup-drill-database-url}`) | `spawn.database-url`, `backup.encryption-key`, `r2.credentials` | `LoadCredential=` delivery per backup/R2 secret |
 | `spawn-loop.service`, `spawn-integrate.service`, `spawn-credential-health.service`, `spawn-deploy-on-landing.service`, `spawn-maintenance.service`, `spawn-nightly*.service` | `pending_migration` | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` | `spawn.database-url` | Role-scoped `LoadCredential=` delivery replacing `spawn.env` |
 
 ### Read-Only Audit & Pre-Cutover Validation
@@ -555,6 +555,24 @@ Wave K2 prepares `spawn-node-edge.service` for Keep delivery of `spawn-serve.tok
      bash scripts/keep/credential-health.sh
      ```
   4. **Rollback**: restore `~/.config/spawn/node-edge.env` (`0600`, zero Postgres credentials), revert `deploy/systemd/spawn-node-edge.service` to `EnvironmentFile=-%h/.config/spawn/node-edge.env` without `LoadCredential=`, `RestartPreventExitStatus=243 78`, or `--require-serve-token-credential`, disable `spawn-node-edge.path`, run `systemctl --user daemon-reload`, and restart `spawn-node-edge.service`.
+
+### Wave K3 Cutover Procedure (Backup Suite & Node Gateway -> Keep)
+
+Wave K3 prepares `spawn backup` / `spawn store` / `deploy/backup/lib.sh`, `spawn serve` (`spawn-serve.token`), and `spawn-node-gateway` for Keep delivery safely while active timers (including Vultr SG `spawn-backup.timer`) continue reading `~/.config/spawn/*` and `spawn.env`:
+
+- **Pre-cutover safety (safe on live VMs now)**:
+  - `crates/spawn-cli/src/{config.rs,backup.rs,backup/store.rs,serve.rs}` and `deploy/backup/lib.sh` prefer `$CREDENTIALS_DIRECTORY/{spawn.database-url,spawn.backup-drill-database-url,r2.credentials,r2-store.credentials,backup.key.k1,backup.encryption-key,spawn-serve.token}` when present (failing closed with exit `78` / `EX_CONFIG` on symlinks, empty files, bad permissions, or missing required keys without falling back to `.env`), and fall back smoothly when Keep files are absent.
+  - All 8 `spawn-backup*.service` units retain `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` while adding `78 243` to `RestartPreventExitStatus=`.
+  - `crates/spawn-node-gateway` prefers `$CREDENTIALS_DIRECTORY/spawn-node-gateway.database-url` (exit `78` fail-closed) and `deploy/systemd/spawn-node-gateway.path` (`PathChanged=/run/keep/spawn-node-gateway.database-url`) is staged and ignored by `deploy/sync-units.sh` while uninstalled.
+- **Operator cutover steps** (only after Keep delivers the corresponding `/run/keep/*` files mode `0600`):
+  1. Confirm delivery and run the dry-run manifest validator across Wave K1 + K2 + K3 rows:
+     ```sh
+     bash scripts/keep/credential-health.sh --audit-keep-migration
+     bash scripts/keep/credential-health.sh --validate-manifest /path/to/wave-k3-staged.manifest
+     ```
+  2. In the follow-up cutover commit, move non-secret host overrides (e.g. `SPAWN_WORKSPACE_ROOT`, `SPAWN_R2_ENDPOINT`, `SPAWN_R2_BUCKET`, `SPAWN_NODE_GATEWAY_LISTEN`, `SPAWN_NODE_GATEWAY_CELLS`) out of secret `.env` files, replace `EnvironmentFile=` on each cut-over unit with explicit `LoadCredential=` lines (`spawn.database-url`, `r2.credentials`, `backup.encryption-key` / `backup.key.k1`, `spawn.backup-drill-database-url`, `spawn-node-gateway.database-url`), update `KEEP` in `scripts/redact/secret-values.py`, and append the cut-over rows to `scripts/keep/credentials.manifest`.
+  3. Reload units (`systemctl --user daemon-reload`), enable `spawn-node-gateway.path`, verify oneshot runs (`systemctl --user start spawn-backup.service`), and run `bash scripts/keep/credential-health.sh`.
+  4. **Rollback**: restore private `0600` `.env` / key files, restore `EnvironmentFile=` (dropping `LoadCredential=`), disable `spawn-node-gateway.path`, `systemctl --user daemon-reload`, and restart services.
 
 ## The controller
 

@@ -182,7 +182,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
         Ok(settings) => settings,
         Err(error) => {
             eprintln!("spawn backup restore-drill: {error}");
-            return Ok(2);
+            return Ok(super::config_exit_code(&error));
         }
     };
     let parent = match parent_of(flags, &settings) {
@@ -229,6 +229,10 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
         Ok(name) => match reading_key(&name, "the bundle chain") {
             Ok(seal) => seal,
             Err(reason) => {
+                if super::is_credential_error(&reason) {
+                    eprintln!("spawn backup restore-drill: {reason}");
+                    return Ok(crate::config::CREDENTIAL_EXIT_CODE);
+                }
                 return Ok(fail_both(&store, &records, &reason, started, 2, resources));
             }
         },

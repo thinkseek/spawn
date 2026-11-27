@@ -24,7 +24,9 @@ bin=$scratch/bin; mkdir -p "$bin" "$scratch/keep" "$scratch/units" "$scratch/hom
 cat >"$bin/systemctl" <<'EOF'
 #!/bin/bash
 case "$*" in
-  *is-active*) echo "$FAKE_ACTIVE" ;;
+  *is-active*) u=${!#}; if [ -n "${FAKE_UNIT_STATES-}" ] && [ -f "$FAKE_UNIT_STATES/$u" ]; then cat "$FAKE_UNIT_STATES/$u"; else echo "$FAKE_ACTIVE"; fi ;;
+  *is-failed*) u=${!#}; if [ -n "${FAKE_UNIT_FAILED-}" ] && [ -f "$FAKE_UNIT_FAILED/$u" ]; then cat "$FAKE_UNIT_FAILED/$u"; else echo "${FAKE_FAILED-}"; fi ;;
+  *" -p Type "*) echo "${FAKE_TYPE-}" ;;
   *ExecMainStartTimestamp*) echo "$FAKE_STARTED" ;;
   *InvocationID*) echo "${FAKE_INV-}" ;;
   # FAKE_UNITS (unset in the first cases): a folder of spawn-* unit texts, drop-ins included, as
@@ -434,6 +436,65 @@ node_edge_svc=$repo_root/deploy/systemd/spawn-node-edge.service
   pass "Wave K2 spawn-node-edge.path staged and spawn-node-edge.service preserves live node-edge.env safety and zero-PG isolation" ||
   fail "Wave K2 spawn-node-edge unit/path static audit"
 
+# Wave K3 static audit: spawn-node-gateway.path staged (PathChanged only) + backup RestartPreventExitStatus=78 243 + live unit safety.
+gw_path=$repo_root/deploy/systemd/spawn-node-gateway.path
+gw_svc=$repo_root/deploy/systemd/spawn-node-gateway.service
+k3_static_ok=1
+[ -f "$gw_path" ] &&
+  grep -qxF 'PathChanged=/run/keep/spawn-node-gateway.database-url' "$gw_path" &&
+  ! grep -q '^PathExists=' "$gw_path" &&
+  grep -qxF 'Unit=spawn-node-gateway.service' "$gw_path" &&
+  grep -qxF 'WantedBy=default.target' "$gw_path" &&
+  grep -qxF 'EnvironmentFile=%h/.config/spawn/node-gateway.env' "$gw_svc" &&
+  ! grep -q '^LoadCredential=' "$gw_svc" || k3_static_ok=""
+backup_checked=0
+for bu in "$repo_root"/deploy/systemd/spawn-backup*.service; do
+  [ -f "$bu" ] || continue
+  backup_checked=$((backup_checked + 1))
+  grep -qxF 'Type=oneshot' "$bu" &&
+    grep -qxF 'EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env' "$bu" &&
+    ! grep -q '^LoadCredential=' "$bu" &&
+    grep -qE '^RestartPreventExitStatus=.*\b78\b.*\b243\b|^RestartPreventExitStatus=.*\b243\b.*\b78\b' "$bu" || k3_static_ok=""
+done
+[ "$backup_checked" -eq 8 ] && [ -n "$k3_static_ok" ] &&
+  pass "Wave K3 spawn-node-gateway.path staged and 8 spawn-backup*.service units prepare 78/243 while preserving live timer safety" ||
+  fail "Wave K3 static unit/path audit (checked=$backup_checked)"
+
+# Wave K3 oneshot & multi-unit monitoring check (inactive oneshot is healthy; failed fires service_down; missing LoadCredential in 1 of 2 units fires legacy_env).
+k3_dir=$scratch/k3-live
+mkdir -p "$k3_dir/keep" "$k3_dir/home" "$k3_dir/units" "$k3_dir/fakeunits"
+printf 'made-up-k3-r2-secret' >"$k3_dir/keep/r2.credentials"; chmod 600 "$k3_dir/keep/r2.credentials"
+touch -d '-10 min' "$k3_dir/keep/r2.credentials"
+printf '[Unit]\n[Service]\nType=oneshot\nLoadCredential=r2.credentials:/run/keep/r2.credentials\n' >"$k3_dir/fakeunits/spawn-backup.service"
+printf '[Unit]\n[Service]\nType=oneshot\nLoadCredential=r2.credentials:/run/keep/r2.credentials\n' >"$k3_dir/fakeunits/spawn-backup-bundle.service"
+cat >"$k3_dir/manifest" <<'EOF'
+r2.credentials | spawn-backup.service,spawn-backup-bundle.service | - | - | ~/.config/spawn/r2.env | SPAWN_R2_ACCESS_KEY_ID,SPAWN_R2_SECRET_ACCESS_KEY | -
+EOF
+rm -f "$scratch/alerts"
+k3_live_out=$(PATH="$bin:$PATH" HOME="$k3_dir/home" FAKE_ACTIVE=inactive FAKE_FAILED="" FAKE_UNITS="$k3_dir/fakeunits" \
+  FAKE_UNIT="$scratch/unit" FAKE_JOURNAL="$scratch/journal" CH_KEEP_DIR="$k3_dir/keep" CH_UNIT_DIR="$k3_dir/units" \
+  CH_MANIFEST="$k3_dir/manifest" CH_FAKE_ALERTS="$scratch/alerts" CH_UPTIME_S=100000 bash "$check")
+[ "$?" -eq 0 ] && [ ! -s "$scratch/alerts" ] && grep -q 'ok: r2.credentials delivered' <<<"$k3_live_out" &&
+  pass "Wave K3 oneshot multi-unit row: inactive resting state is healthy with zero alerts" || fail "Wave K3 oneshot inactive ($k3_live_out)"
+
+mkdir -p "$k3_dir/states"
+printf 'inactive\n' >"$k3_dir/states/spawn-backup.service"
+printf 'failed\n' >"$k3_dir/states/spawn-backup-bundle.service"
+PATH="$bin:$PATH" HOME="$k3_dir/home" FAKE_ACTIVE=inactive FAKE_UNIT_STATES="$k3_dir/states" FAKE_UNITS="$k3_dir/fakeunits" \
+  FAKE_UNIT="$scratch/unit" FAKE_JOURNAL="$scratch/journal" CH_KEEP_DIR="$k3_dir/keep" CH_UNIT_DIR="$k3_dir/units" \
+  CH_MANIFEST="$k3_dir/manifest" CH_FAKE_ALERTS="$scratch/alerts" CH_UPTIME_S=100000 bash "$check" >/dev/null
+grep -q '"type":"alert.fired".*credential_health:r2.credentials:service_down:' "$scratch/alerts" &&
+  pass "Wave K3 failed oneshot unit in multi-unit row fires service_down" || fail "Wave K3 failed oneshot"
+
+printf '[Unit]\n[Service]\nType=oneshot\nExecStart=/bin/true\n' >"$k3_dir/fakeunits/spawn-backup-bundle.service"
+rm -f "$scratch/alerts"
+PATH="$bin:$PATH" HOME="$k3_dir/home" FAKE_ACTIVE=inactive FAKE_UNITS="$k3_dir/fakeunits" \
+  FAKE_UNIT="$scratch/unit" FAKE_JOURNAL="$scratch/journal" CH_KEEP_DIR="$k3_dir/keep" CH_UNIT_DIR="$k3_dir/units" \
+  CH_MANIFEST="$k3_dir/manifest" CH_FAKE_ALERTS="$scratch/alerts" CH_UPTIME_S=100000 bash "$check" >/dev/null
+grep -q '"type":"alert.fired".*credential_health:r2.credentials:legacy_env:' "$scratch/alerts" &&
+  ! grep -q 'made-up-k3-r2-secret' "$scratch/alerts" &&
+  pass "Wave K3 multi-unit LoadCredential check catches missing LoadCredential in one unit with zero secret leak" || fail "Wave K3 multi-unit LoadCredential"
+
 # --- --validate-manifest dry-run validation (multi-row + unix://%t/..., exit 2 on invalid, zero alerts) ---
 rm -f "$scratch/alerts"
 cat >"$scratch/valid-multi.manifest" <<'EOF'
@@ -465,6 +526,19 @@ EOF
 k2_out=$(CH_FAKE_ALERTS="$scratch/alerts" bash "$check" --validate-manifest "$scratch/wave-k2.manifest" 2>&1)
 [ "$?" -eq 0 ] && grep -q 'manifest ok: 3 row(s) valid' <<<"$k2_out" && [ ! -e "$scratch/alerts" ] &&
   pass "--validate-manifest accepts Wave K2 3-row manifest (typesafe + deepseek + spawn-serve.token) with zero alerts" || fail "--validate-manifest Wave K2 ($k2_out)"
+
+# Wave K3 staged manifest (Wave K1 + K2 + K3 gateway & multi-unit backup rows) dry-run validation.
+cat >"$scratch/wave-k3.manifest" <<'EOF'
+typesafe.api-key                | spawn-jev-relay.service                                                                                                    | http://127.0.0.1:8790/healthz | jev-relay   | ~/.config/spawn/typesafe.env     | TYPESAFE_API_KEY                            | -
+deepseek.api-key                | spawn-model-relay.service                                                                                                  | http://127.0.0.1:8791/healthz | model-relay | ~/.config/spawn/model-relay.env  | DEEPSEEK_API_KEY                            | -
+spawn-serve.token               | spawn-node-edge.service                                                                                                    | -                             | -           | ~/.config/spawn/node-edge.env    | SPAWN_SERVE_TOKEN                           | -
+spawn-node-gateway.database-url | spawn-node-gateway.service                                                                                                 | -                             | -           | ~/.config/spawn/node-gateway.env | SPAWN_NODE_GATEWAY_DATABASE_URL             | -
+r2.credentials                  | spawn-backup.service,spawn-backup-bundle.service,spawn-backup-verify.service,spawn-backup-restore-drill.service            | -                             | -           | ~/.config/spawn/r2.env           | SPAWN_R2_ACCESS_KEY_ID,SPAWN_R2_SECRET_ACCESS_KEY | -
+backup.encryption-key           | spawn-backup.service,spawn-backup-bundle.service,spawn-backup-verify.service,spawn-backup-restore-drill.service            | -                             | -           | ~/.config/spawn/backup.key       | -                                           | -
+EOF
+k3_out=$(CH_FAKE_ALERTS="$scratch/alerts" bash "$check" --validate-manifest "$scratch/wave-k3.manifest" 2>&1)
+[ "$?" -eq 0 ] && grep -q 'manifest ok: 6 row(s) valid' <<<"$k3_out" && [ ! -e "$scratch/alerts" ] &&
+  pass "--validate-manifest accepts Wave K3 6-row multi-unit backup manifest with zero alerts" || fail "--validate-manifest Wave K3 ($k3_out)"
 
 printf 'bad.row|only-three-fields|-\n' >"$scratch/invalid.manifest"
 val_bad_out=$(CH_FAKE_ALERTS="$scratch/alerts" bash "$check" --validate-manifest "$scratch/invalid.manifest" 2>&1); st=$?
@@ -498,7 +572,11 @@ st=$?
   (.units | map(select(.unit == "spawn-node-gw.service" and .status == "no_secrets" and (.suggested_keep_ids | length == 0))) | length == 1) and
   (.units | map(select(.unit == "spawn-node-edge.service" and .status == "pending_migration" and (.suggested_keep_ids | index("spawn-serve.token")) != null)) | length == 1) and
   (.units | map(select(.unit == "spawn-model-relay.service" and .status == "pending_migration" and (.suggested_keep_ids | index("deepseek.api-key")) != null)) | length == 1) and
-  (.units | map(select(.unit == "spawn-loop.service" and .status == "pending_migration" and (.env_files | length > 0))) | length == 1)
+  (.units | map(select(.unit == "spawn-loop.service" and .status == "pending_migration" and (.env_files | length > 0))) | length == 1) and
+  (.backup_units.total == 8 and .backup_units.restart_guard_ready == 8 and .backup_units.keep_managed == 0 and .backup_units.pending_migration == 8) and
+  (.units | map(select(.unit == "spawn-backup-verify.service" and .unit_type == "oneshot" and .restart_guard_ready == true and (.suggested_keep_ids | index("spawn.backup-drill-database-url")) != null)) | length == 1) and
+  (.staged_path_units.total == 4 and .staged_path_units.ok == true and (.staged_path_units.path_exists_violations | length == 0) and (.staged_path_units.units | map(select(.unit == "spawn-node-gateway.path" and .safe == true)) | length == 1)) and
+  (.system_units_audit.checked == true and .system_units_audit.total == 2 and .system_units_audit.ok == true and (.system_units_audit.violations | length == 0))
 ' <<<"$real_audit_json" >/dev/null &&
   pass "--audit-keep-migration --json accurately classifies real repo deploy/systemd units" || fail "--audit-keep-migration --json real ($real_audit_json)"
 
@@ -509,6 +587,7 @@ grep -q 'keep_managed.*spawn-jev-relay\.service' <<<"$real_audit_human" &&
   grep -q 'pending_migration.*spawn-node-edge\.service' <<<"$real_audit_human" &&
   grep -q 'pending_migration.*spawn-model-relay\.service' <<<"$real_audit_human" &&
   grep -q 'go_units_pg_isolation=ok' <<<"$real_audit_human" &&
+  grep -q 'summary_k3: backup_units=0/8(restart_guard_ready=8) staged_path_units=4(ok) system_units=2(ok)' <<<"$real_audit_human" &&
   pass "--audit-keep-migration human output summarizes repo units and PG isolation" || fail "--audit-keep-migration human"
 
 # Synthetic sandbox audit directory with canary secret inside referenced .env files.

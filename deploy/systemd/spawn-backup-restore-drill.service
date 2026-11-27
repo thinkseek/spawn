@@ -18,7 +18,7 @@ Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
 # cannot run (settings, the key file, the store): neither is a retry's.
 Restart=on-failure
 RestartSec=1h
-RestartPreventExitStatus=1 2
+RestartPreventExitStatus=1 2 78 243
 TimeoutStartSec=1h
 # Each bundle of the chain is fetched into memory before it is decrypted and
 # unpacked (a full one ~90 MB); the restored files go to disk.

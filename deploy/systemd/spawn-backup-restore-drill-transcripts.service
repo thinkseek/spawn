@@ -24,7 +24,7 @@ Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
 # retry's.
 Restart=on-failure
 RestartSec=1h
-RestartPreventExitStatus=1 2
+RestartPreventExitStatus=1 2 78 243
 TimeoutStartSec=1h
 MemoryMax=1G
 Nice=15

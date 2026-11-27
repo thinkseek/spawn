@@ -11,12 +11,19 @@ SPAWN_R2_ENV_FILE=${SPAWN_R2_ENV_FILE:-$HOME/.config/spawn/r2.env}
 # The encryption keys have names (k1, k2, ...), one file each in the key
 # directory: backup.key.<name>. These scripts know k1 only, the key of every
 # object from before the keys had names. Its file, in this order:
-# SPAWN_BACKUP_KEY_FILE when set; else backup.key.k1 in the key directory;
-# else backup.key there, on a host that has not renamed it.
+# SPAWN_BACKUP_KEY_FILE when set; else $CREDENTIALS_DIRECTORY/backup.key.k1
+# or backup.encryption-key when Keep delivered it; else backup.key.k1 in
+# the key directory; else backup.key there, on a host that has not renamed it.
 SPAWN_BACKUP_KEY_DIR=${SPAWN_BACKUP_KEY_DIR:-$HOME/.config/spawn}
 if [ -z "${SPAWN_BACKUP_KEY_FILE-}" ]; then
-  SPAWN_BACKUP_KEY_FILE=$SPAWN_BACKUP_KEY_DIR/backup.key.k1
-  [ -e "$SPAWN_BACKUP_KEY_FILE" ] || SPAWN_BACKUP_KEY_FILE=$SPAWN_BACKUP_KEY_DIR/backup.key
+  if [ -n "${CREDENTIALS_DIRECTORY-}" ] && { [ -e "$CREDENTIALS_DIRECTORY/backup.key.k1" ] || [ -L "$CREDENTIALS_DIRECTORY/backup.key.k1" ]; }; then
+    SPAWN_BACKUP_KEY_FILE=$CREDENTIALS_DIRECTORY/backup.key.k1
+  elif [ -n "${CREDENTIALS_DIRECTORY-}" ] && { [ -e "$CREDENTIALS_DIRECTORY/backup.encryption-key" ] || [ -L "$CREDENTIALS_DIRECTORY/backup.encryption-key" ]; }; then
+    SPAWN_BACKUP_KEY_FILE=$CREDENTIALS_DIRECTORY/backup.encryption-key
+  else
+    SPAWN_BACKUP_KEY_FILE=$SPAWN_BACKUP_KEY_DIR/backup.key.k1
+    [ -e "$SPAWN_BACKUP_KEY_FILE" ] || SPAWN_BACKUP_KEY_FILE=$SPAWN_BACKUP_KEY_DIR/backup.key
+  fi
 fi
 SPAWN_BACKUP_DIR=${SPAWN_BACKUP_DIR:-$HOME/.local/share/spawn-rsi/backups}
 # The live server's container: its image supplies a pg_dump/pg_restore of the
@@ -87,6 +94,22 @@ check_private() {
   esac
 }
 
+# keep_cred_path ID: echoes $CREDENTIALS_DIRECTORY/<ID> when present (regular or symlink).
+keep_cred_path() {
+  local p
+  [ -n "${CREDENTIALS_DIRECTORY-}" ] || return 1
+  p="$CREDENTIALS_DIRECTORY/$1"
+  [ -e "$p" ] || [ -L "$p" ] || return 1
+  printf '%s' "$p"
+}
+
+# check_private_credential FILE: Keep credential must be non-symlink, non-empty, owner-only.
+check_private_credential() {
+  [ ! -L "$1" ] || die "credential $1 must not be a symlink"
+  [ -s "$1" ] || die "credential $1 is empty"
+  check_private "$1"
+}
+
 # env_value FILE KEY: prints the value of KEY=VALUE in FILE (quotes stripped).
 # Returns 1 when the key is absent. The file is parsed, not sourced.
 env_value() {
@@ -101,6 +124,20 @@ env_value() {
 }
 
 load_r2() {
+  local r2_file
+  if r2_file=$(keep_cred_path r2.credentials); then
+    check_private_credential "$r2_file"
+    R2_ENDPOINT=$(env_value "$r2_file" SPAWN_R2_ENDPOINT) || R2_ENDPOINT=${SPAWN_R2_ENDPOINT-}
+    R2_BUCKET=$(env_value "$r2_file" SPAWN_R2_BUCKET) || R2_BUCKET=${SPAWN_R2_BUCKET-}
+    [ -n "$R2_ENDPOINT" ] || die "SPAWN_R2_ENDPOINT not in $r2_file"
+    [ -n "$R2_BUCKET" ] || die "SPAWN_R2_BUCKET not in $r2_file"
+    R2_ACCESS_KEY_ID=$(env_value "$r2_file" SPAWN_R2_ACCESS_KEY_ID) || die "SPAWN_R2_ACCESS_KEY_ID not in $r2_file"
+    R2_SECRET_ACCESS_KEY=$(env_value "$r2_file" SPAWN_R2_SECRET_ACCESS_KEY) || die "SPAWN_R2_SECRET_ACCESS_KEY not in $r2_file"
+    [ -n "$R2_ACCESS_KEY_ID" ] || die "SPAWN_R2_ACCESS_KEY_ID is empty in $r2_file"
+    [ -n "$R2_SECRET_ACCESS_KEY" ] || die "SPAWN_R2_SECRET_ACCESS_KEY is empty in $r2_file"
+    R2_ENDPOINT=${R2_ENDPOINT%/}
+    return 0
+  fi
   check_private "$SPAWN_R2_ENV_FILE"
   R2_ENDPOINT=$(env_value "$SPAWN_R2_ENV_FILE" SPAWN_R2_ENDPOINT) || die "SPAWN_R2_ENDPOINT not in $SPAWN_R2_ENV_FILE"
   R2_BUCKET=$(env_value "$SPAWN_R2_ENV_FILE" SPAWN_R2_BUCKET) || die "SPAWN_R2_BUCKET not in $SPAWN_R2_ENV_FILE"
@@ -110,6 +147,19 @@ load_r2() {
 }
 
 load_live_url() {
+  local cred_file extra="" eof=0
+  if cred_file=$(keep_cred_path spawn.database-url); then
+    check_private_credential "$cred_file"
+    {
+      IFS= read -r LIVE_URL || eof=1
+      if [ "$eof" -eq 0 ] && IFS= read -r extra; then
+        die "credential spawn.database-url must be a single line"
+      fi
+    } <"$cred_file"
+    LIVE_URL=${LIVE_URL%$'\r'}
+    [ -n "$LIVE_URL" ] || die "credential spawn.database-url is empty"
+    return 0
+  fi
   check_private "$SPAWN_ENV_FILE"
   LIVE_URL=$(env_value "$SPAWN_ENV_FILE" SPAWN_DATABASE_URL) || die "SPAWN_DATABASE_URL not in $SPAWN_ENV_FILE"
   [ -n "$LIVE_URL" ] || die "SPAWN_DATABASE_URL is empty in $SPAWN_ENV_FILE"

@@ -11,8 +11,25 @@
 //! | `SPAWN_NODE_GATEWAY_CELLS` | `c0` | the cells served, comma separated |
 //! | `SPAWN_NODE_GATEWAY_PUBLIC_PREFIX` | empty | a path prefix a reverse proxy keeps |
 
+use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Environment variable holding the systemd `LoadCredential=` runtime directory.
+pub const ENV_CREDENTIALS_DIRECTORY: &str = "CREDENTIALS_DIRECTORY";
+/// Keep credential file ID for the restricted `spawn_node_gateway` PostgreSQL URL.
+pub const CREDENTIAL_DATABASE_URL: &str = "spawn-node-gateway.database-url";
+/// Exit status (`EX_CONFIG`) returned when a Keep credential file fails validation.
+pub const CREDENTIAL_EXIT_CODE: u8 = 78;
+
+/// Configuration error carrying a process exit status (`78` on Keep credential faults, `1` otherwise).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError {
+    /// Human-readable error diagnostic (never contains secret bytes).
+    pub message: String,
+    /// Exit status code for the gateway process.
+    pub exit_code: u8,
+}
 
 /// Environment variable holding the restricted `spawn_node_gateway` PostgreSQL connection URL.
 pub const ENV_DATABASE_URL: &str = "SPAWN_NODE_GATEWAY_DATABASE_URL";
@@ -71,10 +88,48 @@ impl Config {
     /// The configuration of `env` (a variable's value by name) and the
     /// command line's arguments after the program name.
     pub fn from_env(env: impl Fn(&str) -> Option<String>, args: &[String]) -> Result<Self, String> {
+        Self::parse_with_db_override(env, None, args)
+    }
+
+    /// Parse gateway configuration using `env` and `args`, preferring a Keep
+    /// `$CREDENTIALS_DIRECTORY/spawn-node-gateway.database-url` file when present.
+    ///
+    /// If `$CREDENTIALS_DIRECTORY/spawn-node-gateway.database-url` exists and is
+    /// empty, unreadable, non-UTF-8, group/world-accessible, contains embedded
+    /// newlines/NULs, or is a symlink, this fails closed with [`CREDENTIAL_EXIT_CODE`]
+    /// (`78`) without falling back to [`ENV_DATABASE_URL`].
+    pub fn from_env_with_credentials(
+        env: impl Fn(&str) -> Option<String>,
+        args: &[String],
+    ) -> Result<Self, ConfigError> {
+        let db_override =
+            match env(ENV_CREDENTIALS_DIRECTORY).filter(|dir| !dir.trim().is_empty()) {
+                Some(dir) => read_credential_value(Path::new(&dir), CREDENTIAL_DATABASE_URL)
+                    .map_err(|message| ConfigError {
+                        message,
+                        exit_code: CREDENTIAL_EXIT_CODE,
+                    })?,
+                None => None,
+            };
+        Self::parse_with_db_override(env, db_override, args).map_err(|message| ConfigError {
+            message,
+            exit_code: 1,
+        })
+    }
+
+    fn parse_with_db_override(
+        env: impl Fn(&str) -> Option<String>,
+        db_override: Option<String>,
+        args: &[String],
+    ) -> Result<Self, String> {
         let required = |name: &str| {
             env(name)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| format!("{name} is not set"))
+        };
+        let database_url = match db_override {
+            Some(url) => url,
+            None => required(ENV_DATABASE_URL)?,
         };
         let mut public_prefix = env(ENV_PUBLIC_PREFIX).unwrap_or_default();
         let mut rest = args.iter();
@@ -107,7 +162,7 @@ impl Config {
             ));
         }
         Ok(Self {
-            database_url: required(ENV_DATABASE_URL)?,
+            database_url,
             key_file: required(ENV_KEY_FILE)?.into(),
             listen,
             artifacts: required(ENV_ARTIFACTS)?.into(),
@@ -116,6 +171,48 @@ impl Config {
             public_prefix: normalize_prefix(&public_prefix)?,
         })
     }
+}
+
+fn read_credential_value(cred_dir: &Path, id: &str) -> Result<Option<String>, String> {
+    let path = cred_dir.join(id);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("credential {id}: {error}")),
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(format!("credential {id} must be a regular file"));
+    }
+    if meta.len() == 0 {
+        return Err(format!("credential {id} is empty"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "credential {id} has mode {mode:o}: must be 0400 or 0600"
+            ));
+        }
+    }
+    let bytes = fs::read(&path).map_err(|error| format!("credential {id}: {error}"))?;
+    let raw =
+        String::from_utf8(bytes).map_err(|_| format!("credential {id} is not valid UTF-8"))?;
+    let trimmed = if let Some(rest) = raw.strip_suffix('\n') {
+        rest.strip_suffix('\r').unwrap_or(rest)
+    } else {
+        &raw
+    };
+    if trimmed.is_empty() {
+        return Err(format!("credential {id} is empty"));
+    }
+    if trimmed.contains(['\n', '\r', '\0']) {
+        return Err(format!(
+            "credential {id} contains embedded newline or NUL byte"
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn is_cell_id(cell: &str) -> bool {
@@ -199,5 +296,63 @@ mod tests {
         pairs.push((ENV_CELLS, "c0,"));
         assert!(Config::from_env(env(&pairs), &[]).is_err());
         assert!(Config::from_env(env(&BASE), &["--listen".into()]).is_err());
+    }
+
+    #[test]
+    fn load_credential_database_url_and_fail_closed_checks() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("spawn-gw-cred-test-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let cred_dir = dir.to_string_lossy().to_string();
+
+        // When CREDENTIALS_DIRECTORY has no credential file, fall back gracefully to env.
+        let mut pairs = BASE.to_vec();
+        pairs.push((ENV_CREDENTIALS_DIRECTORY, &cred_dir));
+        let cfg = Config::from_env_with_credentials(env(&pairs), &[]).expect("fallback");
+        assert_eq!(cfg.database_url, "postgres://gw:pw@localhost/spawn");
+
+        // When credential file exists (0400), it takes precedence over ENV_DATABASE_URL.
+        let keep_pw = "keep_secret_pass_4921";
+        let keep_url = format!("postgres://gw:{keep_pw}@127.0.0.1/keep_db");
+        let cred_path = dir.join(CREDENTIAL_DATABASE_URL);
+        fs::write(&cred_path, format!("{keep_url}\n")).expect("write");
+        fs::set_permissions(&cred_path, fs::Permissions::from_mode(0o400)).expect("chmod 400");
+        let cfg = Config::from_env_with_credentials(env(&pairs), &[]).expect("keep url");
+        assert_eq!(cfg.database_url, keep_url);
+        assert!(!format!("{cfg:?}").contains(keep_pw));
+
+        // Fail-closed cases exit 78 (never falling back to ENV_DATABASE_URL and never leaking value).
+        fs::set_permissions(&cred_path, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        let err_mode = Config::from_env_with_credentials(env(&pairs), &[]).unwrap_err();
+        assert_eq!(err_mode.exit_code, CREDENTIAL_EXIT_CODE);
+        assert!(err_mode.message.contains(CREDENTIAL_DATABASE_URL));
+        assert!(!err_mode.message.contains(keep_pw));
+
+        fs::set_permissions(&cred_path, fs::Permissions::from_mode(0o600)).expect("chmod 600");
+        fs::write(&cred_path, "\n").expect("write empty newline");
+        let err_empty = Config::from_env_with_credentials(env(&pairs), &[]).unwrap_err();
+        assert_eq!(err_empty.exit_code, CREDENTIAL_EXIT_CODE);
+
+        fs::write(&cred_path, "postgres://a\npostgres://b\n").expect("write multi");
+        let err_multi = Config::from_env_with_credentials(env(&pairs), &[]).unwrap_err();
+        assert_eq!(err_multi.exit_code, CREDENTIAL_EXIT_CODE);
+
+        fs::remove_file(&cred_path).expect("rm");
+        let target = dir.join("sym-target");
+        fs::write(&target, &keep_url).expect("target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("chmod");
+        std::os::unix::fs::symlink(&target, &cred_path).expect("symlink");
+        let err_sym = Config::from_env_with_credentials(env(&pairs), &[]).unwrap_err();
+        assert_eq!(err_sym.exit_code, CREDENTIAL_EXIT_CODE);
+        assert!(!err_sym.message.contains(keep_pw));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
