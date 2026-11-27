@@ -94,6 +94,7 @@ mod set_aside;
 mod sources;
 mod storage;
 mod storage_bytes;
+mod storage_cutover;
 mod supervise;
 mod toml_parser;
 mod verify;
@@ -130,6 +131,7 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn store plan --area <area> [--from <dir>] [--root <dir>] [--list <file>]\n       \
      spawn store get --area <area> --path <file> --into <dir> [--root <dir>]\n       \
      spawn store list|verify --area <area> [--root <dir>]\n       \
+     spawn storage cutover --status|--to d6|--rollback git|--verify [--project <name>] [--repo <bare repo>] [--root <dir>] [--cas-dir <dir>] [--reason <text>] [--json]\n       \
      spawn ack <command id> done|declined [<why>]\n       \
      spawn mask --values <file>\n       \
      spawn mask-hook --values <file>\n       \
@@ -302,6 +304,12 @@ const COMMANDS: &[Command] = &[
         aliases: &[],
         usage: &[backup::STORE_USAGE],
         run: backup::store_command,
+    },
+    Command {
+        name: "storage",
+        aliases: &[],
+        usage: &[storage_cutover::USAGE],
+        run: storage_cutover::command,
     },
     Command {
         name: "ack",
@@ -935,7 +943,7 @@ mod tests {
                 "{removed} stays an unknown command"
             );
         }
-        assert_eq!(COMMANDS.len(), 34, "the commands: {words:?}");
+        assert_eq!(COMMANDS.len(), 35, "the commands: {words:?}");
     }
 
     #[test]

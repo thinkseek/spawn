@@ -64,9 +64,9 @@ pub use d6_cutover::{
     BackfillReport, BundleDrillReport, CutoverEvent, CutoverParityReport, CutoverPhase,
     CutoverRefParity, GcFenceStatus, LocalOnlyLargeFile, PendingMergeAudit, PreCutoverCleanReport,
     ProjectCutover, ProjectStorageMode, ReconcileReport, RollbackReport,
-    assert_zero_pending_merges, bind_store_gc_fence, check_gc_fence, reconcile_refs_journal,
-    run_persistent_gc_for_ledger, verify_bundle_snapshot_roundtrip, verify_cutover_parity,
-    verify_zero_pending_merges,
+    assert_zero_pending_merges, bind_store_gc_fence, check_gc_fence, is_readonly_border,
+    reconcile_refs_journal, run_persistent_gc_for_ledger, verify_bundle_snapshot_roundtrip,
+    verify_cutover_parity, verify_zero_pending_merges,
 };
 pub use d6_layer0::{
     EolPathFinding, ExistingDestPolicy, ExportAttrRuleFinding, ExportAttributesAudit,
