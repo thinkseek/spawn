@@ -2,168 +2,143 @@
 
 English · [简体中文](./README.zh-CN.md)
 
-Spawn runs Claude Code agents in isolated workspaces and records everything they do in one PostgreSQL event log.
+Spawn runs coding agents (Claude Code, and optionally agy) in isolated workspaces and records everything they do in one PostgreSQL event log. The log is the only state: every process rebuilds its view from it, so a crash loses nothing.
 
-- A caller submits a command (start, input, resume, stop) to a queue in PostgreSQL.
-- `spawn tick` claims the command, forks a git branch, exports it into a working tree and starts the engine in a Herdr session (embedded `herdr-core` via sibling `spawn-hc` by default, or legacy `herdr` with `SPAWN_HERDR_MODE=legacy`).
-- Claude Code's transcript, the terminal screen and the engine's exit status become typed events in the log. The engine's terminal holds no database login.
-- An Observer judges each session (ready, working, blocked, failed) and writes the result back as an event.
+## The Spawn ecosystem
 
-The log is the only state. Each `spawn tick` is a new process that rebuilds its view from the log, so a crash loses no state.
+| Repository | Role |
+| --- | --- |
+| [`thinkseek/spawn`](https://github.com/thinkseek/spawn) (this repo) | Rust core: the `spawn` CLI, event log, Bridge/Observer, missions, landing gate, dashboard and HTTP API |
+| [`thinkseek/spawn-node`](https://github.com/thinkseek/spawn-node) | Go `spawn-node`: worker-node daemon plus the database-free edge, node-gateway and outbound fronts that talk to `spawn serve --ipc` over a local socket |
+| [`thinkseek/spawn-android`](https://github.com/thinkseek/spawn-android) | Android client for the dashboard API: briefing, feature map, nodes, read-only agent views |
+
+## How it works
+
+- A caller queues a command (`start`, `input`, `resume`, `stop`) in PostgreSQL.
+- The **Bridge** (`spawn tick` / `spawn loop`) claims it, prepares the agent's workspace and starts the engine in a Herdr terminal (embedded `herdr-core` via the sibling `spawn-hc` binary).
+- Transcripts, terminal screens and exit status become typed events. The engine's terminal holds no database login.
+- The **Observer** judges each session (ready, working, blocked, failed) and writes the judgement back as an event.
+- Above that, **missions** split work into tasks for workers; `spawn integrate` lands accepted work through one gate.
+
+## Core capabilities
+
+| Area | What Spawn provides |
+| --- | --- |
+| Engines | `claude` (default) and `agy`, enabled with `SPAWN_ENGINES=claude,agy`; a start action or `spawn task assign --engine` picks one |
+| Sandbox | Engines without their own deny rules (agy) run only inside a `bwrap` filesystem view (`SPAWN_ENGINE_VIEW=required`, the default); `SPAWN_CLAUDE_SANDBOX=1` puts Claude Code in it too |
+| Workspaces | Pluggable backends: `git`, `cow`, `auto`, `overlay`, `d6-shadow`, `d6` (see [Storage](#storage-backends)) |
+| Missions & landing | Supervisor plans and assigns tasks; `spawn integrate` judges each candidate with `scripts/rsi/gate.sh` and lands it with a compare-and-swap push |
+| Task grading | Three tiers (`l1`/`l2`/`l3`): tasks route to the cheapest preset graded for their difficulty and step up on repeated rework ([docs/agent-grading.md](./docs/agent-grading.md)) |
+| Feature map | `spawn features` keeps `docs/feature-map/registry.json` in sync with the code; `check --deps enforce` checks declared feature dependencies against a Rust/TypeScript/Python/Go code graph |
+| Nodes | `spawn node` adds, enrolls, drains and revokes machines; `spawn-node` workers join with an enroll token |
+| Dashboard & API | `spawn serve`: web UI plus HTTP API ([docs/api.md](./docs/api.md)); `--ipc` serves the same API over a `0600` Unix socket for `spawn-node front` |
 
 ## Requirements
 
 | Tool | Version | Used for |
 | --- | --- | --- |
-| Rust | 1.95 or later | Build |
-| PostgreSQL | 16 or later | Event log, command queue, views |
-| `spawn-hc` | in-repo (`crates/spawn-hc`) | Default embedded `herdr-core` terminal daemon (`SPAWN_TERMINAL_BACKEND=herdr`, `SPAWN_HERDR_MODE=core`) |
-| herdr | 0.9.5 (protocol 22) | Optional legacy terminals (`SPAWN_HERDR_MODE=legacy`) |
-| git | 2.43 or later (`git --attr-source`, checked at start) | Branches and workspaces |
-| Claude Code | current | Engine |
+| Rust | 1.95 | Build (`rust-toolchain.toml`) |
+| PostgreSQL | 16+ | Event log, command queue, views |
+| git | 2.43+ (checked at start) | Branches and workspaces |
+| Claude Code | current | Default engine |
+| `agy`, `bwrap` | optional | Second engine and its sandbox |
+| herdr | 0.9.5 (optional) | Only with `SPAWN_HERDR_MODE=legacy` |
 
 ## Install
 
 ```bash
-cargo install --path crates/spawn-cli
-cargo install --path crates/spawn-hc
+cargo install --path crates/spawn-cli   # spawn
+cargo install --path crates/spawn-hc    # spawn-hc, installed beside spawn
 ```
-
-The binaries are `spawn` and its sibling terminal daemon `spawn-hc` (placed beside `spawn`).
 
 ## Quick start
 
-Install the schema:
-
 ```bash
-# The password is required: the restricted logins (supervisor, dashboard)
-# derive theirs from it; without one they cannot log in.
+# The password is required: restricted logins derive theirs from it.
 export SPAWN_DATABASE_URL=postgres://spawn:PASSWORD@localhost/spawn
 spawn init-db
+
+spawn submit --agent agent_demo --session session_demo --key demo-1 \
+  --action '{"type":"start","engine":"claude","prompt":"say hello"}'
+spawn tick --repo /data/spawn/repo.git --root /data/spawn/ws   # one Bridge + Observer pass
+spawn status                                                   # sessions, open tasks, alerts
+spawn say agent_demo "please also add a test"                  # type into the live session
 ```
 
-Submit a start command:
-
-```bash
-spawn submit --agent agent_demo --session session_demo --key demo-1 --action '{"type":"start","engine":"claude","prompt":"say hello"}'
-```
-
-Run one pass of the Bridge and the Observer:
-
-```bash
-spawn tick --repo /data/spawn/repo.git --root /data/spawn/ws
-```
-
-Print every session with its latest judgement, and one session's events:
-
-```bash
-spawn fleet
-spawn tail --session session_demo
-```
-
-Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `spawn loop` running: it ticks the Bridge and the Observer and keeps the supervisor alive. Landing and RSI run separately as `spawn integrate` (docs/fleet-architecture.md §10): it lands gated missions' work through the gate, and RSI is an objective mission whose tasks come from `rsi/backlog`.
-
-## Commands
-
-`spawn --help` lists every command; `spawn <command> --help` (or `spawn help <command>`) prints that command's verbs and flags, opening no store.
-
-| Command | What it does |
-| --- | --- |
-| `init-db` | Installs or updates the SQL schema. Safe to run again. |
-| `submit` | Writes one command to the queue. Flags: `--agent`, `--session`, `--key`, `--action`, `--principal` (default `spawn`). |
-| `tick` | Claims and runs queued commands, advances live executions, records observations. Flags: `--repo`, `--root`, `--judge-url`. |
-| `loop` | Runs the fleet until killed: Bridge, Observer, dispatcher, and (with `SPAWN_SUPERVISOR=1`) the supervisor's liveness rule. |
-| `integrate [--once] [--root <dir>] [--gates <n>]` | The one landing path: for each mission with a gate, judges ready work with `scripts/rsi/gate.sh` (one gate at a time: `--gates` above 1 is refused until each gate has a test database server of its own, `SPAWN_TEST_DATABASE_PER_GATE=1`), lands it on the source with a compare-and-swap push, halts a mission on the halt rules, and gives objective missions (RSI) their next backlog tasks, up to the mission's worker limit (`--workers`, default 1) in flight at once. |
-| `fleet` | Every session the login may read, with its judgement, as JSON. |
-| `tail --session <id>` | One session's latest judgement, recent events, judgements and commands, as JSON. |
-| `serve` | Dashboard and API (fleet, judgements, commands, live panes, RSI, and the escalations `/api/attention`: the dispatcher's own escalations and what the supervisor asks), read as `spawn_reader`; a person's writes (an input to a session, `POST /api/sessions/<id>/input`, the input `spawn submit --principal human` makes, typed when the agent's turn ends; a named key; a restart or reassign of a stalled worker; the resume of a halted mission) run as the `spawn_human` login, which may do nothing else, from the clients that may read, with the page's own `Origin` unless it carries the token. Every route, with its method and CLI twin, is in [docs/api.md](./docs/api.md). Binds `127.0.0.1:8787`; on any other address it needs `SPAWN_SERVE_TOKEN`, and every API request then carries it (`Authorization: Bearer <token>` or `?token=<token>`). Open the UI once as `http://<host>:8787/?token=<token>`. |
-| `scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]` | Every dimension at once, from the record alone: throughput, lead time, first-pass quality, rework, autonomy, reliability, cost and gate time, each with its n, direction, previous window and trend, for the fleet, each mission and each UTC day (docs/design.md §15). `<time>` is RFC 3339 or a span back (`36h`, `7d`); the window defaults to the last 7 days. Below 3 landings a dimension says `not enough data`. The dashboard's Scorecard view reads the same JSON from `/api/scorecard`. |
-| `mission`, `task`, `resident` | The mission layer: add, configure, close and resume missions; assign, accept and reject tasks; propose, approve and retire residents. Every command prints JSON. |
-| `task stages --id N` | A task's stages from the control stream, oldest first: `[{stage, verdict, at_ms, took_ms}]`, `took_ms` the time since the task's previous stage. `mission list` and the dashboard's missions page carry the same list on every task. |
-| `run` | Runs the engine inside the terminal and writes its exit status to a file the Bridge reads. Spawn configures this; you do not call it. |
-| `version` | Prints `spawn <version>`; so do `spawn --version` and `spawn -V`. |
-
-Actions for `--action`:
-
-| `type` | Fields |
-| --- | --- |
-| `start` | `prompt`, optional `engine` (`claude`, the only engine), optional `parent_session_id`, optional `from` (another agent of the same mission source, meaning its branch head, or a full commit id: where a new branch starts instead of `main`) |
-| `input` | `text` |
-| `resume` | optional `prompt` |
-| `stop` | none |
-
-Missions: `spawn mission add --text ... [--source <repo>]` (a human), then the supervisor plans
-and routes tasks (`spawn task assign`), workers report in `.spawn/report.md`, the supervisor
-accepts or sends back. Worker branches live in the mission's mirror under
-`$SPAWN_WORKSPACE_ROOT/.sources/`.
-
-One gate judges every landing, RSI or fleet:
-`scripts/rsi/gate.sh <bare repo> <base> <candidate> $PWD/rsi/scenarios [<task scenario>]`.
-It refuses changes to the paths in `rsi/scenarios/protected` and to build-time code, builds
-each tree with `rsi/scenarios/build`, wants the task scenario red on the base and green on the
-candidate, and runs every other non-ratchet scenario on the candidate: clippy, the tests, the
-e2e, the black-box CLI scenarios and the web build are scenarios (`rsi/scenarios/check-*.sh`).
-Its own tests: `scripts/rsi/test-gate.sh`.
-
-End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s):
-`SPAWN_DATABASE_URL=postgres://.../spawn_test scripts/e2e.sh`.
+In production run the long-lived processes instead of `tick`: `spawn loop` (Bridge, Observer, dispatcher; `SPAWN_SUPERVISOR=1` adds the supervisor), `spawn integrate` (gate and landing) and `spawn serve`. Matching user units live in [`deploy/systemd/`](./deploy/systemd/).
 
 ## Configuration
+
+Configuration is environment first. A `spawn.toml` can supply the same settings: `spawn config init --data-dir <dir>` writes one, `spawn config check` validates it, and `spawn --config spawn.toml <command>` (or `SPAWN_CONFIG`) applies it. Secrets in it must be `{ from_env = "..." }` or `{ from_file = "..." }`. `spawn doctor` probes the host (kernel, git, herdr, bwrap, …) and the configuration.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SPAWN_DATABASE_URL` | required | PostgreSQL connection string |
-| `SPAWN_GIT_REPO` | required | Bare repository for agents no mission owns (the supervisor, ad hoc workers) |
-| `SPAWN_WORKSPACE_ROOT` | required | Directory holding one working tree per branch; `--root` overrides it for `tick` and `loop` |
-| `SPAWN_WORKER` | `spawn-worker` | Worker name on claimed commands |
-| `SPAWN_TERMINAL_BACKEND` | `herdr` | Sole terminal backend (`herdr`; `tmux` has been removed and is explicitly refused) |
-| `SPAWN_HERDR_MODE` | `core` | Herdr runtime mode: `core` (default embedded `herdr-core` via sibling `spawn-hc`) or `legacy` (external `herdr`) |
-| `SPAWN_HERDR_CORE_PROGRAM` | sibling `spawn-hc` | `spawn-hc` path override when `SPAWN_HERDR_MODE=core` |
-| `SPAWN_HERDR_SHARDS` | `1` | Herdr daemon shard count (`1..=64`; routes terminals to `<session>-s0..N` when `> 1`) |
-| `SPAWN_HERDR_PROGRAM` | `herdr` | Legacy `herdr` binary path when `SPAWN_HERDR_MODE=legacy` |
-| `SPAWN_HERDR_SESSION` | `spawn` | `spawn-hc` / legacy `herdr` `--session` name |
-| `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code path |
-| `SPAWN_CLAUDE_PROJECTS` | `$SPAWN_CLAUDE_CONFIG_DIR/projects`, else `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects` | Where Claude Code writes its transcripts |
-| `SPAWN_CLAUDE_CONFIG_DIR` | unset | Opt-in Claude Code directory (an absolute path; anything else stops `spawn loop`) for engines (their `CLAUDE_CONFIG_DIR`); its `settings.json` must hold the gateway token. Unset, engines use `~/.claude` as before (docs/config.md) |
-| `SPAWN_MAX_FILE_MB` | `100` | Largest file a Git or Cow checkpoint commits, in MiB; a larger one is left out of the checkpoint and the agent is told once (an overlay checkpoint has no cap) |
-| `SPAWN_WORKSPACE_BACKEND` | `git` | Workspace engine for every store under the root: `git`, `cow` (copy-on-write clones), `auto` (Cow where the file system clones, else Git) or `overlay` (opt-in, Linux; `spawn loop` refuses it until it serves overlay workspaces). Anything else, or a root another engine claimed (`<root>/.spawn-workspace-backend`), stops `spawn loop` (docs/storage.md, "Workspace backends") |
-| `SPAWN_CAS_DEDUP` | unset | `1`: deduplicate a Cow workspace's `target/` and `node_modules/` against `<root>/.cas` at each mount (never a transcript), pruned after unmounts; `0` or unset: off; anything else stops `spawn loop` |
-| `SPAWN_PROGRAM` | current binary, else `spawn` | `spawn` path used inside the terminal, in the commands the dispatcher submits, and in the supervisor's charter. When unset: the path of the running executable, or plain `spawn` if that path cannot be determined |
-| `SPAWN_JUDGE_URL` | unset | Jev judge service; without it the rules judge alone, and a case they cannot settle asks for attention |
-| `SPAWN_LOOP_INTERVAL_MS` | `500` | Pause between `spawn loop` passes |
-| `SPAWN_MODEL_PRICES` | built-in table | US dollars per million tokens by model, `{"<model>": {"input", "output", "cache_write", "cache_read"}}`, each a number not below zero: what each model call is priced at when it is recorded (the Cost page, `GET /api/cost`, a mission's `--daily-usd` budget). A model it does not price counts its tokens as unpriced, no cost. Set, it replaces the built-in table whole (docs/fleet-architecture.md §3.5); a value that is not such an object stops `spawn loop` and `spawn serve` at start |
-| `SPAWN_SCREEN_QUIET_MS` | `500` | How long a live execution's transcript must hold still before its pane is read for what the transcript cannot say (the prompt is back); shorter is readier sooner and costs more captures |
-| `SPAWN_INTEGRATE_GATES` | `1` | Gates `spawn integrate` runs at once, across missions (one per mission; `--gates` overrides it). More than 1 (up to 8) is refused unless `SPAWN_TEST_DATABASE_PER_GATE=1`: the gates share one test database server today |
-| `SPAWN_INTEGRATE_DRAIN_SECS` | `7200` | Bound of a `spawn integrate` drain (SIGUSR1, or `spawn integrate --drain` with the same root): the running gates record and land, none starts, then it exits 0; at the bound the gates still running are stopped and `integrator.drain_expired` names them. A whole number from 1 to 86400; anything else refuses to start |
-| `SPAWN_TEST_DATABASE_LOG` | unset | The test database server's log (`log_line_prefix` `%m [%p] `), read by `spawn integrate` for a crash during a gate: database errors then make a check-tests.sh failure a host fault (`host_fault`), not a rejection. Unset, only connection errors do |
-| `SPAWN_GATE_HOST_FAULT_BACKOFF_SECS` | `300` | Wait after the first host fault in a row before the task is judged again; doubled per host fault in a row, at most an hour |
-| `SPAWN_SERVE_ADDRESS` | `127.0.0.1:8787` | Address `spawn serve` binds (`--address` overrides it) |
-| `SPAWN_SERVE_TOKEN` | unset | Token every `spawn serve` API request must carry; required off loopback |
-| `SPAWN_SERVE_OPEN_NETWORKS` | unset | Comma-separated CIDRs (e.g. `192.168.31.0/24`) whose clients read without the token, and type into a session from the page itself (its own `Origin`), when they name the server by its address in that network (`http://192.168.31.112:8787/`); a name in `Host` (DNS rebinding) or a foreign `Origin` still needs it; `/0` is refused |
+| `SPAWN_GIT_REPO` | required | Bare repository for agents no mission owns |
+| `SPAWN_WORKSPACE_ROOT` | required | Root for workspaces (`--root` overrides) |
+| `SPAWN_ENGINES` | `claude` | Enabled engines: `claude`, `agy` |
+| `SPAWN_AGY_MODEL` | unset | Model for agy; a start of agy is refused without it |
+| `SPAWN_ENGINE_VIEW` | `required` | Sandbox policy: `required`, `container` or `off` |
+| `SPAWN_WORKSPACE_BACKEND` | `git` | `git`, `cow`, `auto`, `overlay`, `d6-shadow` or `d6` |
+| `SPAWN_HERDR_MODE` | `core` | `core` (sibling `spawn-hc`) or `legacy` (external `herdr`) |
+| `SPAWN_JUDGE_URL` | unset | Optional judge service; without it the rules judge alone |
+| `SPAWN_SERVE_ADDRESS` | `127.0.0.1:8787` | `spawn serve` bind address |
+| `SPAWN_SERVE_TOKEN` | unset | Bearer token; required off loopback |
+
+`SPAWN_TERMINAL_BACKEND` accepts only `herdr`; `tmux` is refused. Every other variable is documented where it is read: [docs/fleet-architecture.md](./docs/fleet-architecture.md), [docs/storage.md](./docs/storage.md), [docs/upgrading.md](./docs/upgrading.md).
+
+## Storage backends
+
+| Backend | What it is |
+| --- | --- |
+| `git` (default) | A Git working copy per branch |
+| `cow` | Copy-on-write clones of a per-commit baseline |
+| `auto` | `cow` where the file system clones, else `git` |
+| `overlay` | Unprivileged overlay per workspace (Linux, opt-in) |
+| `d6-shadow` | `git` stays authoritative; `d6` runs beside it as a checked shadow |
+| `d6` | Content-addressed store: SHA-256 objects, FastCDC chunking for large files, Merkle trees, refs in PostgreSQL, optional bounded `tmpfs` layer (`SPAWN_D6_TMPFS_ROOT`) ([docs/d6-cas-v1.md](./docs/d6-cas-v1.md)) |
+
+A workspace root records the backend that claimed it; an incompatible backend is refused. Opt-ins: `SPAWN_CAS_DEDUP=1` deduplicates `target/` and `node_modules/` in Cow workspaces; `SPAWN_SHARED_BUILD_CACHES=1` shares npm, pip, uv, Go, ccache, sccache and zig caches across workspaces.
+
+## Commands
+
+`spawn --help` lists every command; `spawn <command> --help` prints its verbs and flags without opening a store.
+
+| Group | Commands |
+| --- | --- |
+| Setup & health | `init-db`, `config`, `doctor`, `version` |
+| Run the fleet | `tick`, `loop`, `integrate`, `serve [--ipc]` |
+| Talk to agents | `submit`, `say`, `ack` |
+| Inspect | `status`, `fleet`, `tail`, `alerts`, `alert`, `scorecard` |
+| Missions | `mission`, `task` (incl. `task commits`, `task diff`, `task land`), `resident`, `objective`, `verify` |
+| Grading & code map | `grade`, `features`, `prov` |
+| Nodes & storage | `node`, `backup`, `store`, `source`, `scratch`, `commit-map`, `mask` |
+
+`scripts/fleet-sync-node.sh` pulls a published `spawn-node` (or full Spawn) build onto a node: verifies checksums, swaps binaries, restarts units and rolls back on a failed health check.
 
 ## Development
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace            # PostgreSQL tests need SPAWN_TEST_DATABASE_URL
+spawn features check --deps enforce
 ```
 
-The PostgreSQL tests need `SPAWN_TEST_DATABASE_URL` set to a disposable database; they do not skip. All checks on one tree, through the same gate that lands work: `scripts/rsi/gate.sh $PWD/.git HEAD HEAD $PWD/rsi/scenarios` (build, clippy, tests, `scripts/e2e.sh`, the black-box scenarios in `scripts/blackbox/`, the web build).
+The landing gate runs every check on one tree: `scripts/rsi/gate.sh $PWD/.git HEAD HEAD $PWD/rsi/scenarios` (build, clippy, tests, `scripts/e2e.sh`, black-box scenarios, web build).
 
 ## Documentation
 
 | Document | Content |
 | --- | --- |
-| [docs/architecture.md](./docs/architecture.md) | Architecture overview (Chinese) |
-| [docs/design.md](./docs/design.md) | Design, event protocol, port contracts, known limits (Chinese) |
-| [docs/view-architecture.md](./docs/view-architecture.md) | Read views (Chinese) |
-| [docs/fleet-architecture.md](./docs/fleet-architecture.md) | The fleet: observation, control, missions, landing |
-| [docs/api.md](./docs/api.md) | Every HTTP route `spawn serve` answers, with its CLI twin |
-| [docs/glossary.md](./docs/glossary.md) | The nouns the CLI, the API, the web and the docs share |
-| [docs/storage.md](./docs/storage.md) | Where each kind of object is stored; branching and merging |
-| [docs/rsi.md](./docs/rsi.md) | RSI: the objective mission and its gate (Chinese) |
-| [docs/upgrading.md](./docs/upgrading.md) | Replacing processes of a running Spawn |
+| [docs/architecture.md](./docs/architecture.md), [docs/design.md](./docs/design.md) | Architecture and design (Chinese) |
+| [docs/fleet-architecture.md](./docs/fleet-architecture.md) | Observation, control, missions, landing, nodes, alerts |
+| [docs/api.md](./docs/api.md) | Every HTTP route and its CLI twin |
+| [docs/storage.md](./docs/storage.md), [docs/d6-cas-v1.md](./docs/d6-cas-v1.md) | Storage, workspace backends, CAS format |
+| [docs/agent-grading.md](./docs/agent-grading.md) | Task grading and routing |
+| [docs/feature-map.md](./docs/feature-map.md) | Feature registry and dependency checks |
+| [docs/node-protocol-v1.md](./docs/node-protocol-v1.md), [docs/spawn-ipc-v1.md](./docs/spawn-ipc-v1.md) | `spawn-node` wire protocol and local IPC contract |
+| [docs/rsi.md](./docs/rsi.md), [docs/upgrading.md](./docs/upgrading.md), [docs/glossary.md](./docs/glossary.md) | Self-improvement loop (Chinese), upgrades, shared vocabulary |
 
 ## License
 
