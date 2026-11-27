@@ -19,7 +19,7 @@
 
 use serde_json::Value;
 
-use crate::event::{EventKind, JobEnd, JobKind};
+use crate::event::{BackgroundJobKind, EventKind, JobEnd};
 
 /// Maximum characters kept from engine error text.
 const MAX_ERROR_CHARS: usize = 2000;
@@ -625,7 +625,7 @@ fn leading_id(text: &str) -> Option<&str> {
 /// A start of job `id`, keyed by the tool call whose result started it
 /// (`by`, its `tool_use_id`): a background Agent resumed under its id runs
 /// again, and that run's start is a record of its own.
-fn job_started(id: &str, kind: JobKind, by: &str) -> Normalized {
+fn job_started(id: &str, kind: BackgroundJobKind, by: &str) -> Normalized {
     keyed(
         EventKind::JobStarted {
             job_id: id.to_string(),
@@ -750,24 +750,24 @@ fn tool_job(structured: Option<&Value>, text: &str, by: &str) -> Option<Normaliz
         let field = |name: &str| result.get(name).and_then(Value::as_str).and_then(job_id);
         let flag = |name: &str| result.get(name).and_then(Value::as_bool) == Some(true);
         if let Some(id) = field("backgroundTaskId") {
-            return Some(job_started(id, JobKind::Bash, by));
+            return Some(job_started(id, BackgroundJobKind::Bash, by));
         }
         if result.get("timeoutMs").is_some()
             && let Some(id) = field("taskId")
         {
-            return Some(job_started(id, JobKind::Monitor, by));
+            return Some(job_started(id, BackgroundJobKind::Monitor, by));
         }
         let status = result.get("status").and_then(Value::as_str);
         if (flag("isAsync") && status == Some("async_launched")
             || flag("background") && status == Some("forked"))
             && let Some(id) = field("agentId")
         {
-            return Some(job_started(id, JobKind::Agent, by));
+            return Some(job_started(id, BackgroundJobKind::Agent, by));
         }
         if flag("success")
             && let Some(id) = field("resumedAgentId")
         {
-            return Some(job_started(id, JobKind::Agent, by));
+            return Some(job_started(id, BackgroundJobKind::Agent, by));
         }
         let stopped = result
             .get("message")
@@ -790,17 +790,17 @@ fn tool_job(structured: Option<&Value>, text: &str, by: &str) -> Option<Normaliz
         .strip_prefix("Command running in background with ID: ")
         .or_else(|| text.strip_prefix("Command was moved to the background (ID: "))
     {
-        return leading_id(rest).map(|id| job_started(id, JobKind::Bash, by));
+        return leading_id(rest).map(|id| job_started(id, BackgroundJobKind::Bash, by));
     }
     if let Some(rest) = text.strip_prefix("Monitor started (task ") {
-        return leading_id(rest).map(|id| job_started(id, JobKind::Monitor, by));
+        return leading_id(rest).map(|id| job_started(id, BackgroundJobKind::Monitor, by));
     }
     if text.starts_with("Async agent launched successfully") {
         return text
             .lines()
             .find_map(|line| line.strip_prefix("agentId: "))
             .and_then(leading_id)
-            .map(|id| job_started(id, JobKind::Agent, by));
+            .map(|id| job_started(id, BackgroundJobKind::Agent, by));
     }
     if text.starts_with('{') {
         let parsed = serde_json::from_str::<Value>(&text).ok()?;
@@ -901,7 +901,7 @@ fn user_turn(content: &Value, uuid: &str) -> Vec<Normalized> {
 ///
 /// Sub-agent (`isSidechain`) lines are the sub-agent's, not the session's.
 ///
-/// Background jobs ([`JobKind`]) are read from the same lines:
+/// Background jobs ([`BackgroundJobKind`]) are read from the same lines:
 ///
 /// - a tool result that started one: a Bash's `backgroundTaskId`, a
 ///   Monitor's `taskId`, a background Agent's `agentId`, or a `SendMessage`
@@ -1405,7 +1405,7 @@ mod tests {
     /// (taken from worker transcripts of 2026-11-06).
     mod jobs {
         use super::kinds;
-        use crate::event::{EventKind, JobEnd, JobKind};
+        use crate::event::{BackgroundJobKind, EventKind, JobEnd};
         use crate::ingest::claude_line;
 
         fn jobs(line: &str) -> Vec<EventKind> {
@@ -1421,7 +1421,7 @@ mod tests {
                 .collect()
         }
 
-        fn started(id: &str, kind: JobKind) -> EventKind {
+        fn started(id: &str, kind: BackgroundJobKind) -> EventKind {
             EventKind::JobStarted {
                 job_id: id.to_string(),
                 kind,
@@ -1479,7 +1479,10 @@ mod tests {
                 ],
                 "keyed by the job and the call that started it"
             );
-            assert_eq!(jobs(BASH_RESULT), [started("b8w03og7k", JobKind::Bash)]);
+            assert_eq!(
+                jobs(BASH_RESULT),
+                [started("b8w03og7k", BackgroundJobKind::Bash)]
+            );
             // Queued when it ended: the engine's queue is not read
             // (`the_engines_queue_is_not_read`). Given to the agent mid-turn,
             // or as the prompt of a turn of its own: the same notification,
@@ -1504,9 +1507,15 @@ mod tests {
         #[test]
         fn a_command_moved_to_the_background_is_a_bash_job() {
             let timed_out = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_02","type":"tool_result","content":"cli=0\nCommand did not complete within its 600s timeout and was moved to the background (ID: bq1n7c2x4). Output is being written to: /tmp/x/tasks/bq1n7c2x4.output.","is_error":false}]},"uuid":"u3","toolUseResult":{"stdout":"cli=0","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"bq1n7c2x4","timedOutAfterMs":600000},"version":"2.1.318"}"#;
-            assert_eq!(jobs(timed_out), [started("bq1n7c2x4", JobKind::Bash)]);
+            assert_eq!(
+                jobs(timed_out),
+                [started("bq1n7c2x4", BackgroundJobKind::Bash)]
+            );
             let for_a_message = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_03","type":"tool_result","content":"Command was moved to the background (ID: bcc6zkquw) so that a message that arrived while it was running can reach you; it was not interrupted.","is_error":false}]},"uuid":"u4","toolUseResult":{"stdout":"","stderr":"","interrupted":false,"backgroundTaskId":"bcc6zkquw","backgroundedToDeliverMessage":true},"version":"2.1.318"}"#;
-            assert_eq!(jobs(for_a_message), [started("bcc6zkquw", JobKind::Bash)]);
+            assert_eq!(
+                jobs(for_a_message),
+                [started("bcc6zkquw", BackgroundJobKind::Bash)]
+            );
         }
 
         const MONITOR_RESULT: &str = r#"{"parentUuid":"f1","isSidechain":false,"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01BD","type":"tool_result","content":"Monitor started (task bv41gl0hm, expires in 30m unless the source ends first; you get one notice at expiry — re-arm if you still need the watch). You will be notified on each event. Keep working — do not poll or sleep."}]},"uuid":"u5","timestamp":"2026-11-06T10:14:21.356Z","toolUseResult":{"taskId":"bv41gl0hm","timeoutMs":1800000,"persistent":false},"version":"2.1.318"}"#;
@@ -1515,7 +1524,7 @@ mod tests {
         fn a_monitor_runs_through_its_events_until_it_expires_or_its_command_ends() {
             assert_eq!(
                 jobs(MONITOR_RESULT),
-                [started("bv41gl0hm", JobKind::Monitor)]
+                [started("bv41gl0hm", BackgroundJobKind::Monitor)]
             );
             // Its events end nothing, however they reach the agent.
             let event = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>bv41gl0hm</task-id>\n<summary>Monitor event: \"test-gate v1 failures or completion\"</summary>\n<event>gate: all cases pass\nexit=0 seconds=849</event>\n</task-notification>"},"uuid":"u6","origin":{"kind":"task-notification","producer":"session-task"},"version":"2.1.318"}"#;
@@ -1599,7 +1608,7 @@ mod tests {
         #[test]
         fn a_background_agent_runs_from_its_launch_to_its_notification_and_again_when_resumed() {
             const ID: &str = "a2adacaabc9f9b048";
-            assert_eq!(jobs(AGENT_LAUNCH), [started(ID, JobKind::Agent)]);
+            assert_eq!(jobs(AGENT_LAUNCH), [started(ID, BackgroundJobKind::Agent)]);
             assert_eq!(
                 keys(AGENT_LAUNCH),
                 ["job:a2adacaabc9f9b048:started:toolu_018hgmBWFMc3fomfMC4sgXBo"]
@@ -1618,7 +1627,7 @@ mod tests {
             // A message resumes it: a new run, started by that call, ended by
             // a notification of its own (another result and usage), which
             // the first end's key does not swallow.
-            assert_eq!(jobs(AGENT_RESUMED), [started(ID, JobKind::Agent)]);
+            assert_eq!(jobs(AGENT_RESUMED), [started(ID, BackgroundJobKind::Agent)]);
             assert_eq!(
                 keys(AGENT_RESUMED),
                 ["job:a2adacaabc9f9b048:started:toolu_01C8SfVsFL53ceFvQyhH19yS"]
@@ -1640,7 +1649,10 @@ mod tests {
             // A Skill forked to run in the background is an Agent too: it
             // notifies under its agentId ("Agent \"/code-review …\" finished").
             let forked = r#"{"type":"user","isSidechain":false,"uuid":"7da83220","timestamp":"2026-10-28T09:49:33.065Z","version":"2.1.312","toolUseResult":{"success":true,"commandName":"code-review","status":"forked","background":true,"agentId":"aea25189ec7ec0cb0","result":"Running in the background as @code-review"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_863cd0d956c042169b9daf2732efa1e7","content":"Skill \"code-review\" launched (forked execution, running in the background).\n\nRunning in the background as @code-review"}]}}"#;
-            assert_eq!(jobs(forked), [started("aea25189ec7ec0cb0", JobKind::Agent)]);
+            assert_eq!(
+                jobs(forked),
+                [started("aea25189ec7ec0cb0", BackgroundJobKind::Agent)]
+            );
         }
 
         #[test]
@@ -1678,7 +1690,7 @@ mod tests {
             assert_ne!(launch, AGENT_LAUNCH);
             assert_eq!(
                 jobs(&launch),
-                [started("a2adacaabc9f9b048", JobKind::Agent)]
+                [started("a2adacaabc9f9b048", BackgroundJobKind::Agent)]
             );
             let resumed = AGENT_RESUMED.replace(
                 r#""toolUseResult":{"success":true,"message":"Resuming agent a2adaca","resumedAgentId":"a2adacaabc9f9b048","revivedAgentId":"a2adacaabc9f9b048","pin":{"id":"a2adacaabc9f9b048","name":"a2adacaabc9f9b048","ref":"6d82fa"}},"#,
@@ -1687,7 +1699,7 @@ mod tests {
             assert_ne!(resumed, AGENT_RESUMED);
             assert_eq!(
                 jobs(&resumed),
-                [started("a2adacaabc9f9b048", JobKind::Agent)]
+                [started("a2adacaabc9f9b048", BackgroundJobKind::Agent)]
             );
         }
 
@@ -1710,7 +1722,7 @@ mod tests {
                 )
                 .replace(r#"</task-notification>"}"#, r#"</task-notification>"}}"#);
             assert!(kinds(early).is_empty());
-            assert_eq!(jobs(start), [started("bf1cus1ov", JobKind::Bash)]);
+            assert_eq!(jobs(start), [started("bf1cus1ov", BackgroundJobKind::Bash)]);
             assert_eq!(jobs(&given), [ended("bf1cus1ov", JobEnd::Failed)]);
         }
 
@@ -1748,12 +1760,15 @@ mod tests {
         #[test]
         fn a_line_without_the_structured_copy_is_read_from_the_engines_words() {
             let bash = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_06","type":"tool_result","content":"Shell cwd was reset to /w\nCommand running in background with ID: b437vogks. Output is being written to: /tmp/b437vogks.output.","is_error":false}]},"uuid":"u14","version":"2.1.311"}"#;
-            assert_eq!(jobs(bash), [started("b437vogks", JobKind::Bash)]);
+            assert_eq!(jobs(bash), [started("b437vogks", BackgroundJobKind::Bash)]);
             let monitor = MONITOR_RESULT.replace(
                 r#","toolUseResult":{"taskId":"bv41gl0hm","timeoutMs":1800000,"persistent":false}"#,
                 "",
             );
-            assert_eq!(jobs(&monitor), [started("bv41gl0hm", JobKind::Monitor)]);
+            assert_eq!(
+                jobs(&monitor),
+                [started("bv41gl0hm", BackgroundJobKind::Monitor)]
+            );
         }
     }
 
@@ -3252,7 +3267,7 @@ fn agy_generic(
         events.push(keyed(
             EventKind::JobStarted {
                 job_id: id.to_string(),
-                kind: JobKind::Bash,
+                kind: BackgroundJobKind::Bash,
             },
             key(&format!("job:{id}:started")),
         ));
@@ -3267,7 +3282,7 @@ fn agy_generic(
         events.push(keyed(
             EventKind::JobStarted {
                 job_id: id.clone(),
-                kind: JobKind::Agent,
+                kind: BackgroundJobKind::Agent,
             },
             key(&format!("job:{id}:started")),
         ));
@@ -3358,7 +3373,7 @@ fn agy_generic_close_tracked(
 mod agy_tests {
     use super::{Normalized, agy_line};
     use crate::driver::LineCursor;
-    use crate::event::{EventKind, JobEnd, JobKind};
+    use crate::event::{BackgroundJobKind, EventKind, JobEnd};
     use crate::id::CommandId;
 
     const CONV: &str = "11111111-2222-4333-8444-555555555555";
@@ -3495,7 +3510,7 @@ mod agy_tests {
                 events[1].kind,
                 EventKind::JobStarted {
                     job_id: format!("{CONV}/task-{task}"),
-                    kind: JobKind::Bash
+                    kind: BackgroundJobKind::Bash
                 }
             );
         }
@@ -3515,7 +3530,7 @@ mod agy_tests {
             events[1].kind,
             EventKind::JobStarted {
                 job_id: SUB.to_string(),
-                kind: JobKind::Agent
+                kind: BackgroundJobKind::Agent
             }
         );
         assert!(cursor.pending_tools.is_empty());
