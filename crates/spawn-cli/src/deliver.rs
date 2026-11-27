@@ -572,7 +572,55 @@ pub(crate) fn reassign_stop_key(task: i64) -> String {
     format!("reassign-{task}-stop")
 }
 
+/// The earlier task a [`TaskRow`]'s delivery acts on: its re-issue or
+/// reassign fields read once. Each comes from the one lineage field its
+/// `task.assigned` names (`spawn_core::control::TaskOrigin`: a record names
+/// at most one), with what `DELIVERY_TASKS` joins for it alone: a re-issue's
+/// spent attempts (read only when `reissue_of` is set), a reassign's old
+/// worker (the session of the `reassign_of` task). A duplicate's or a
+/// continuation's earlier task changes nothing in delivery, and the row
+/// does not read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Predecessor<'a> {
+    /// Re-issues task `of`, whose delivery was spent with these attempts
+    /// (as its `task.cancelled` keeps them; none on a record without them).
+    Reissue { of: i64, attempts: &'a [Attempt] },
+    /// Takes over task `of` ([`reassign_held`]), whose worker ran in
+    /// `from_session` (none when no such task row is left).
+    Reassign {
+        of: i64,
+        from_session: Option<&'a str>,
+    },
+}
+
 impl TaskRow {
+    /// The earlier task its delivery acts on ([`Predecessor`]). Refuses
+    /// what `DELIVERY_TASKS` never yields: both lineage fields, a re-issue's
+    /// attempts without `reissue_of`, or an old worker without `reassign_of`.
+    pub(crate) fn predecessor(&self) -> Result<Option<Predecessor<'_>>, String> {
+        let attempts = self.reissued_attempts.as_deref();
+        let from_session = self.reassign_from_session.as_deref();
+        match (self.reissue_of, self.reassign_of) {
+            (Some(_), Some(_)) => Err(format!(
+                "task {}: `reissue_of` and `reassign_of` name two earlier tasks",
+                self.id
+            )),
+            (Some(of), None) if from_session.is_none() => Ok(Some(Predecessor::Reissue {
+                of,
+                attempts: attempts.unwrap_or_default(),
+            })),
+            (None, Some(of)) if attempts.is_none() => {
+                Ok(Some(Predecessor::Reassign { of, from_session }))
+            }
+            (None, None) if attempts.is_none() && from_session.is_none() => Ok(None),
+            _ => Err(format!(
+                "task {}: `reissued_attempts` belongs to a re-issue and \
+                 `reassign_from_session` to a reassign",
+                self.id
+            )),
+        }
+    }
+
     /// Sent back by the supervisor, waiting to be delivered again.
     fn is_revision(&self) -> bool {
         self.state == TaskState::Revise
@@ -588,7 +636,12 @@ impl TaskRow {
     /// A spent delivery of this task is re-issued, not escalated: its first
     /// delivery (assigned, never sent back), and it is no re-issue itself.
     fn reissuable(&self) -> bool {
-        self.state == TaskState::Assigned && self.revisions == 0 && self.reissue_of.is_none()
+        self.state == TaskState::Assigned
+            && self.revisions == 0
+            && matches!(
+                self.predecessor(),
+                Ok(None | Some(Predecessor::Reassign { .. }))
+            )
     }
 
     /// Idempotency key of this task's current delivery.
@@ -658,7 +711,44 @@ pub(crate) struct Cancelled {
     pub(crate) reassigned_to_session: Option<String>,
 }
 
+/// Who cancelled a [`Cancelled`] task, as its notice tells it: the loose
+/// fields of its last control record (`closed_by`, `reason`, `yielded`,
+/// `yield_reason`) and its reassign, read once. `yielded` is written by
+/// the integrator alone: on the `task.cancelled` of a yield
+/// (`objectives::yields`, always with its `reason`), and on a budget
+/// abort's `task.aborted`, with its `yield_reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelledBy<'a> {
+    /// The integrator aborted it (`task.aborted`), for `reason`; with
+    /// `yield_reason` when the abort yielded its objective's slot as well.
+    Abort {
+        reason: Option<&'a str>,
+        yield_reason: Option<&'a str>,
+    },
+    /// The integrator cancelled it to yield its objective's slot
+    /// (`task.cancelled` with `yielded`), for `reason`.
+    Yield { reason: &'a str },
+    /// Anyone else (a person, the supervisor), whose reason the notice
+    /// does not give; reassigned to a fresh worker as task `reassigned_as`,
+    /// or not.
+    Other { reassigned_as: Option<i64> },
+}
+
 impl Cancelled {
+    /// Who cancelled it ([`CancelledBy`]).
+    pub(crate) fn cancelled_by(&self) -> CancelledBy<'_> {
+        match (self.closed_by.as_deref(), self.reason.as_deref()) {
+            (Some("task.aborted"), reason) => CancelledBy::Abort {
+                reason,
+                yield_reason: self.yield_reason.as_deref().filter(|_| self.yielded),
+            },
+            (Some("task.cancelled"), Some(reason)) if self.yielded => CancelledBy::Yield { reason },
+            _ => CancelledBy::Other {
+                reassigned_as: self.reassigned_as,
+            },
+        }
+    }
+
     /// Key prefix of the notice's attempts: `cancel-notice-<task>-<n>`.
     fn notice_prefix(&self) -> String {
         format!("cancel-notice-{}-", self.id)
@@ -688,30 +778,32 @@ pub(crate) fn notice_task(key: &str) -> Option<i64> {
 /// that it is cancelled, and what to do now. Where its work went is added
 /// when the work is set aside ([`crate::set_aside::note`]).
 pub(crate) fn cancel_notice(cancelled: &Cancelled) -> String {
-    let by = match (cancelled.closed_by.as_deref(), cancelled.reason.as_deref()) {
-        (Some("task.aborted"), Some(reason)) => {
-            format!(" by the integrator ({})", one_line(reason, 300))
+    let by = match cancelled.cancelled_by() {
+        CancelledBy::Abort {
+            reason,
+            yield_reason,
+        } => {
+            let why = reason.map_or_else(String::new, |reason| {
+                format!(" ({})", one_line(reason, 300))
+            });
+            let also = yield_reason.map_or_else(String::new, |why| {
+                format!(
+                    "; it also yields its objective's slot ({})",
+                    one_line(why, 400)
+                )
+            });
+            format!(" by the integrator{why}{also}")
         }
-        (Some("task.aborted"), None) => " by the integrator".to_string(),
-        (Some("task.cancelled"), Some(reason)) if cancelled.yielded => format!(
+        CancelledBy::Yield { reason } => format!(
             " by the integrator, to yield its objective's slot ({})",
             one_line(reason, 400)
         ),
-        _ => match cancelled.reassigned_as {
-            Some(new) => format!(", and reassigned to a fresh worker as task #{new}"),
-            None => String::new(),
-        },
-    };
-    let by = match cancelled.yield_reason.as_deref() {
-        Some(why)
-            if cancelled.yielded && cancelled.closed_by.as_deref() == Some("task.aborted") =>
-        {
-            format!(
-                "{by}; it also yields its objective's slot ({})",
-                one_line(why, 400)
-            )
-        }
-        _ => by,
+        CancelledBy::Other {
+            reassigned_as: Some(new),
+        } => format!(", and reassigned to a fresh worker as task #{new}"),
+        CancelledBy::Other {
+            reassigned_as: None,
+        } => String::new(),
     };
     format!(
         "[Task #{id} was cancelled — this is not a new task]\nTask #{id} of mission #{mission} \
@@ -1055,6 +1147,43 @@ fn load_table<T: serde::de::DeserializeOwned>(
     serde_json::from_value(value).map_err(|error| LoadFailure::Fatal(format!("{what}: {error}")))
 }
 
+/// Refuses a row its query never yields, so no reading of one is a
+/// guess: a task's [`Predecessor`] fields that do not read as one
+/// ([`TaskRow::predecessor`]), and a reassign named by half
+/// (`reassigned_as` and `reassigned_to_session` are one row's id and
+/// session, `DELIVERY_TASKS` and `CANCELLED_DELIVERIES` alike).
+fn check_rows(tasks: &[TaskRow], cancelled: &[Cancelled]) -> Result<(), String> {
+    let reassigned = |what: &str, id: i64, task: Option<i64>, session: Option<&str>| {
+        if task.is_some() == session.is_some() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{what}: task {id}: `reassigned_as` and `reassigned_to_session` name one \
+                 reassign, both or neither"
+            ))
+        }
+    };
+    for task in tasks {
+        task.predecessor()
+            .map_err(|error| format!("delivery rows: {error}"))?;
+        reassigned(
+            "delivery rows",
+            task.id,
+            task.reassigned_as,
+            task.reassigned_to_session.as_deref(),
+        )?;
+    }
+    for row in cancelled {
+        reassigned(
+            "cancelled deliveries",
+            row.id,
+            row.reassigned_as,
+            row.reassigned_to_session.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
 impl Work {
     /// Read the mission layer's rows.
     pub(crate) fn load(store: &PostgresStore) -> Result<Self, String> {
@@ -1081,12 +1210,16 @@ impl Work {
             .filter(|resident| resident.state == "retired")
             .map(|resident| (resident.agent_id.clone(), resident.session_id.clone()))
             .collect();
+        let tasks: Vec<TaskRow> = load_table(store.delivery_rows(), "delivery rows")?;
+        let cancelled: Vec<Cancelled> =
+            load_table(store.cancelled_deliveries(), "cancelled deliveries")?;
+        check_rows(&tasks, &cancelled).map_err(LoadFailure::Fatal)?;
         Ok(Self {
-            tasks: load_table(store.delivery_rows(), "delivery rows")?,
+            tasks,
             news: load_table(store.mission_news(), "mission news")?,
             retired,
             residents,
-            cancelled: load_table(store.cancelled_deliveries(), "cancelled deliveries")?,
+            cancelled,
             moved: load_table(store.latest_source_moved(), "latest source.moved")?,
             pauses: load_table(store.mission_pauses(), "mission pauses")?,
             waits: Waits::default(),
@@ -1999,13 +2132,16 @@ pub(crate) fn unpause_prompt(mission: i64, task: Option<&TaskRow>) -> String {
 /// new task no longer: it starts from the old worker's last recorded
 /// checkpoint, so the task is never left with nobody carrying it).
 fn reassign_held(task: &TaskRow, facts: &BTreeMap<&str, &Facts>) -> bool {
-    let Some(old) = task.reassign_from_session.as_deref() else {
+    let Ok(Some(Predecessor::Reassign {
+        from_session: Some(old),
+        ..
+    })) = task.predecessor()
+    else {
         return false;
     };
-    task.reassign_of.is_some()
-        && facts
-            .get(old)
-            .is_some_and(|old| old.live && !crate::dispatch::stop_spent(old))
+    facts
+        .get(old)
+        .is_some_and(|old| old.live && !crate::dispatch::stop_spent(old))
 }
 
 /// The next step of a delivered task's latest restart ([`Restart`]), its
@@ -2301,8 +2437,7 @@ fn normalize_brief(text: &str) -> String {
 pub(crate) fn duplicate_in_flight<'a>(work: &'a Work, task: &TaskRow) -> Option<&'a TaskRow> {
     if task.state != TaskState::Assigned
         || task.is_revision()
-        || task.reassign_of.is_some()
-        || task.reissue_of.is_some()
+        || !matches!(task.predecessor(), Ok(None))
     {
         return None;
     }
@@ -2419,8 +2554,10 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
         if spent && task.reissuable() {
             continue;
         }
-        let line = match task.reissue_of {
-            Some(old) if spent => reissue_spent(task, facts, old),
+        let line = match task.predecessor() {
+            Ok(Some(Predecessor::Reissue { of, attempts })) if spent => {
+                reissue_spent(task, facts, of, attempts)
+            }
             _ => format!("task #{} {why}", task.id),
         };
         items.push(Escalation {
@@ -2474,9 +2611,8 @@ fn engine_unavailable(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
 
 /// The escalation of a re-issue whose delivery is spent too: it names the
 /// task and the task it re-issued, and the attempts of both.
-fn reissue_spent(task: &TaskRow, facts: &Facts, old: i64) -> String {
+fn reissue_spent(task: &TaskRow, facts: &Facts, old: i64, before: &[Attempt]) -> String {
     let own = attempt_records(task, facts);
-    let before = task.reissued_attempts.as_deref().unwrap_or_default();
     format!(
         "task #{id} (a re-issue of task #{old}) never reached its worker; nor did task #{old} \
          before it, so nothing was typed and the host likely refuses it. Task #{id}'s attempts: \
@@ -2625,7 +2761,17 @@ impl InspectedReport {
     }
 }
 
-/// Inspect a report once for both collection and operator diagnostics, scanning
+/// The report in `workspace` written for the delivery `key`, if there is
+/// one: written at or after the delivery's mark, by the same filesystem
+/// clock. Without a mark the workspace was mounted after the delivery was
+/// sent (a start or resume mounts a fresh one), so everything in it is
+/// newer. The agent writes both files, so each is opened the safe way
+/// ([`spawn_host::agent_files`]): a symlink is not followed, a FIFO is not
+/// waited on, the times are the opened files' own, and at most
+/// [`REPORT_LIMIT`] bytes are read. A report that cannot be read that way
+/// is never new.
+///
+/// Inspected once for both collection and operator diagnostics, scanning
 /// [`unfinished::markers`] at most once so collection reuses the parsed markers.
 fn inspect_report(workspace: &Path, key: &str) -> InspectedReport {
     use spawn_host::agent_files::{open_regular, read_regular};
@@ -2667,20 +2813,6 @@ fn inspect_report(workspace: &Path, key: &str) -> InspectedReport {
 /// same safe opens, delivery-mark comparison and draft rules as collection.
 pub(crate) fn report_status(workspace: &Path, key: &str) -> ReportStatus {
     inspect_report(workspace, key).status()
-}
-
-/// The report in `workspace` written for the delivery `key`, if there is
-/// one: written at or after the delivery's mark, by the same filesystem
-/// clock. Without a mark the workspace was mounted after the delivery was
-/// sent (a start or resume mounts a fresh one), so everything in it is
-/// newer. The agent writes both files, so each is opened the safe way
-/// ([`spawn_host::agent_files`]): a symlink is not followed, a FIFO is not
-/// waited on, the times are the opened files' own, and at most
-/// [`REPORT_LIMIT`] bytes are read. A report that cannot be read that way
-/// is never new.
-#[cfg(test)]
-fn new_report(workspace: &Path, key: &str) -> Option<String> {
-    inspect_report(workspace, key).into_text()
 }
 
 /// Collect the reports of delivered tasks whose worker's turn stopped at an
@@ -2922,10 +3054,11 @@ fn send_note(
 #[cfg(test)]
 mod tests {
     use super::{
-        CREDENTIALS_LINE, Cancelled, DELIVERY_RETRIES, NOT_READY_RETRY_MS, News, PROCESSES_LINE,
-        PausedMission, PausedWorker, REPORT, ReportStatus, Restart, TaskRow, Work, delivered,
-        delivery_mark, mark_delivery, new_report, news_items, next_due, next_up, notice_task,
-        put_aside, report_contract, report_due, report_status, retry_wait_ms, task_prompt, typed,
+        CREDENTIALS_LINE, Cancelled, CancelledBy, DELIVERY_RETRIES, NOT_READY_RETRY_MS, News,
+        PROCESSES_LINE, PausedMission, PausedWorker, Predecessor, REPORT, ReportStatus, Restart,
+        TaskRow, Work, delivered, delivery_mark, inspect_report, mark_delivery, news_items,
+        next_due, next_up, notice_task, put_aside, report_contract, report_due, report_status,
+        retry_wait_ms, task_prompt, typed,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -4337,7 +4470,7 @@ mod tests {
         set_modified(&mark, sent);
         set_modified(&report, sent - std::time::Duration::from_secs(10));
         assert_eq!(
-            new_report(&workspace, "deliver-4-0"),
+            inspect_report(&workspace, "deliver-4-0").into_text(),
             None,
             "left over from before"
         );
@@ -4347,7 +4480,9 @@ mod tests {
         );
         set_modified(&report, sent + std::time::Duration::from_secs(10));
         assert_eq!(
-            new_report(&workspace, "deliver-4-0").as_deref(),
+            inspect_report(&workspace, "deliver-4-0")
+                .into_text()
+                .as_deref(),
             Some("## Outcome\ndone")
         );
         assert_eq!(
@@ -4367,11 +4502,13 @@ mod tests {
             ReportStatus::Draft
         );
         assert!(
-            new_report(&workspace, "deliver-4-0").is_some(),
+            inspect_report(&workspace, "deliver-4-0")
+                .into_text()
+                .is_some(),
             "the collector still applies the existing draft path"
         );
         std::fs::remove_file(&report).expect("remove the report");
-        assert_eq!(new_report(&workspace, "deliver-4-0"), None);
+        assert_eq!(inspect_report(&workspace, "deliver-4-0").into_text(), None);
         assert_eq!(
             report_status(&workspace, "deliver-4-0"),
             ReportStatus::Absent
@@ -4384,7 +4521,7 @@ mod tests {
         let (root, workspace, order) = marked_workspace("skewed");
         let report = workspace.join(REPORT);
         let mark = workspace.join(delivery_mark(&order.key).as_path());
-        let is_new = || new_report(&workspace, &order.key).is_some();
+        let is_new = || inspect_report(&workspace, &order.key).into_text().is_some();
         // The host's clock is a day behind the database's (or ahead: the
         // database is never asked): the mark and the report share it.
         let host = std::time::SystemTime::now() - std::time::Duration::from_hours(24);
@@ -4421,7 +4558,11 @@ mod tests {
         std::fs::write(&secret, "owner only\n").expect("secret");
         std::fs::remove_file(&report).expect("remove the report");
         std::os::unix::fs::symlink(&secret, &report).expect("symlink");
-        assert_eq!(new_report(&workspace, &order.key), None, "not followed");
+        assert_eq!(
+            inspect_report(&workspace, &order.key).into_text(),
+            None,
+            "not followed"
+        );
         assert_eq!(
             report_status(&workspace, &order.key),
             ReportStatus::Unreadable
@@ -4435,7 +4576,7 @@ mod tests {
         assert!(made.success());
         let started = std::time::Instant::now();
         assert_eq!(
-            new_report(&workspace, &order.key),
+            inspect_report(&workspace, &order.key).into_text(),
             None,
             "a FIFO is no report"
         );
@@ -6480,5 +6621,237 @@ PENDING_ISSUES\n";
         assert!(super::duplicate_in_flight(&resolved_work, &dup).is_none());
         let resolved_orders = orders(&resolved_work, &[]);
         assert!(resolved_orders.iter().any(|order| order.task == Some(11)));
+    }
+
+    /// A delivery row as `DELIVERY_TASKS` writes it (every key present,
+    /// null where it names nothing), with `fields` over it.
+    fn delivery_row(fields: &serde_json::Value) -> TaskRow {
+        let mut row = json!({"id": 9, "mission_id": 1, "kind": "ephemeral",
+                             "agent_id": "agent_worker_task_9", "session_id": "session_worker_task_9",
+                             "brief": "b", "state": "assigned", "revisions": 0,
+                             "review_note": null, "delivered_at_ms": null, "model": "default",
+                             "reissue_of": null, "reassign_of": null, "pinned": false,
+                             "preset_id": null, "preset_engine": null, "preset_model_label": null,
+                             "reassign_from_session": null, "reassigned_as": null,
+                             "reassigned_to_session": null, "restart": null,
+                             "reissued_attempts": null, "mission_text": "m", "gated": false,
+                             "mission_state": "open", "mission_halted": false,
+                             "charter": null, "resident": null});
+        for (key, value) in fields.as_object().expect("fields") {
+            row[key] = value.clone();
+        }
+        serde_json::from_value(row).expect("a delivery row reads")
+    }
+
+    /// A first assignment, a re-issue (with its attempts, or a record
+    /// without them) and a reassign (with its old worker, or none left)
+    /// each read as their [`Predecessor`], and the readers follow it.
+    #[test]
+    fn a_delivery_row_reads_as_its_predecessor() {
+        let attempt = json!({"command": 3, "key": "deliver-8-0", "error": "busy"});
+        let first = delivery_row(&json!({}));
+        assert_eq!(first.predecessor(), Ok(None));
+        assert!(first.reissuable());
+
+        let reissue = delivery_row(&json!({"reissue_of": 8, "reissued_attempts": [attempt]}));
+        let Ok(Some(Predecessor::Reissue { of: 8, attempts })) = reissue.predecessor() else {
+            panic!("a re-issue: {:?}", reissue.predecessor());
+        };
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].key, "deliver-8-0");
+        assert!(!reissue.reissuable(), "a re-issue is not re-issued again");
+        let bare = delivery_row(&json!({"reissue_of": 8}));
+        assert_eq!(
+            bare.predecessor(),
+            Ok(Some(Predecessor::Reissue {
+                of: 8,
+                attempts: &[]
+            }))
+        );
+
+        let reassign = delivery_row(&json!({"reassign_of": 7,
+                                           "reassign_from_session": "session_worker_task_7"}));
+        assert_eq!(
+            reassign.predecessor(),
+            Ok(Some(Predecessor::Reassign {
+                of: 7,
+                from_session: Some("session_worker_task_7")
+            }))
+        );
+        assert!(
+            reassign.reissuable(),
+            "a reassign is no re-issue itself: its spent first delivery is re-issued"
+        );
+        let gone = delivery_row(&json!({"reassign_of": 7}));
+        assert_eq!(
+            gone.predecessor(),
+            Ok(Some(Predecessor::Reassign {
+                of: 7,
+                from_session: None
+            }))
+        );
+        assert!(
+            !super::reassign_held(&gone, &std::collections::BTreeMap::new()),
+            "no old worker to wait for"
+        );
+        let work = Work {
+            tasks: vec![delivery_row(&json!({"id": 5, "state": "delivered"}))],
+            ..Work::default()
+        };
+        for row in [&reissue, &reassign] {
+            assert!(
+                super::duplicate_in_flight(&work, row).is_none(),
+                "a task with a predecessor is never held as a duplicate"
+            );
+        }
+        assert_eq!(
+            super::duplicate_in_flight(&work, &first).map(|task| task.id),
+            Some(5)
+        );
+    }
+
+    /// What `DELIVERY_TASKS` never yields reads as no predecessor: both
+    /// lineage fields, attempts without a re-issue, an old worker without a
+    /// reassign; and the load refuses it, as it refuses a reassign named by
+    /// half, in either table.
+    #[test]
+    fn a_delivery_row_no_query_yields_is_refused() {
+        let attempts = json!([{"key": "deliver-8-0"}]);
+        for (fields, says) in [
+            (
+                json!({"reissue_of": 8, "reassign_of": 7}),
+                "name two earlier tasks",
+            ),
+            (
+                json!({"reissued_attempts": attempts}),
+                "belongs to a re-issue",
+            ),
+            (
+                json!({"reassign_from_session": "s"}),
+                "belongs to a re-issue",
+            ),
+            (
+                json!({"reassign_of": 7, "reissued_attempts": attempts}),
+                "belongs to a re-issue",
+            ),
+            (
+                json!({"reissue_of": 8, "reassign_from_session": "s"}),
+                "belongs to a re-issue",
+            ),
+        ] {
+            let row = delivery_row(&fields);
+            let error = row.predecessor().expect_err("refused");
+            assert!(error.contains(says), "{fields}: {error}");
+            assert!(!row.reissuable(), "{fields}: never re-issued on a guess");
+            let error = super::check_rows(&[row], &[]).expect_err("the load refuses it");
+            assert!(error.starts_with("delivery rows: task 9"), "{error}");
+        }
+        for (task, session) in [(Some(10), None), (None, Some("session_worker_task_10"))] {
+            let row =
+                delivery_row(&json!({"reassigned_as": task, "reassigned_to_session": session}));
+            let error = super::check_rows(&[row], &[]).expect_err("half a reassign");
+            assert!(error.contains("both or neither"), "{error}");
+            let mut half = cancelled(false);
+            half.reassigned_as = task;
+            half.reassigned_to_session = session.map(str::to_string);
+            let error = super::check_rows(&[], &[half]).expect_err("half a reassign");
+            assert!(error.starts_with("cancelled deliveries: task 7"), "{error}");
+        }
+        let mut whole = cancelled(false);
+        whole.reassigned_as = Some(10);
+        whole.reassigned_to_session = Some("session_worker_task_10".to_string());
+        let reassigned = delivery_row(&json!({"reassigned_as": 10,
+                                             "reassigned_to_session": "session_worker_task_10"}));
+        assert_eq!(
+            super::check_rows(
+                &[reassigned, delivery_row(&json!({}))],
+                &[whole, cancelled(true)]
+            ),
+            Ok(())
+        );
+    }
+
+    /// Every combination of a cancelled task's last record, reason,
+    /// `yielded` and `yield_reason` reads as one [`CancelledBy`], the same
+    /// one its notice tells.
+    #[test]
+    fn a_cancelled_task_reads_as_who_cancelled_it() {
+        let read = |closed_by: Option<&str>,
+                    reason: Option<&str>,
+                    yielded: bool,
+                    yield_reason: Option<&str>| {
+            let mut row = cancelled(false);
+            row.closed_by = closed_by.map(str::to_string);
+            row.reason = reason.map(str::to_string);
+            row.yielded = yielded;
+            row.yield_reason = yield_reason.map(str::to_string);
+            row.reassigned_as = Some(12);
+            row.reassigned_to_session = Some("session_worker_task_12".to_string());
+            let by = row.cancelled_by();
+            let owned = match by {
+                CancelledBy::Abort {
+                    reason,
+                    yield_reason,
+                } => (
+                    "abort",
+                    reason.map(str::to_string),
+                    yield_reason.map(str::to_string),
+                    None,
+                ),
+                CancelledBy::Yield { reason } => ("yield", Some(reason.to_string()), None, None),
+                CancelledBy::Other { reassigned_as } => ("other", None, None, reassigned_as),
+            };
+            (owned, super::cancel_notice(&row))
+        };
+        let abort = Some("task.aborted");
+        let cancel = Some("task.cancelled");
+        let cases = [
+            (
+                (abort, Some("over"), false, None),
+                ("abort", Some("over"), None, None),
+            ),
+            ((abort, None, false, None), ("abort", None, None, None)),
+            (
+                (abort, Some("over"), true, Some("slot")),
+                ("abort", Some("over"), Some("slot"), None),
+            ),
+            (
+                (abort, Some("over"), false, Some("slot")),
+                ("abort", Some("over"), None, None),
+            ),
+            (
+                (cancel, Some("slot"), true, None),
+                ("yield", Some("slot"), None, None),
+            ),
+            ((cancel, None, true, None), ("other", None, None, Some(12))),
+            (
+                (cancel, Some("not needed"), false, None),
+                ("other", None, None, Some(12)),
+            ),
+            (
+                (Some("task.over_budget"), Some("cost"), true, None),
+                ("other", None, None, Some(12)),
+            ),
+            ((None, None, false, None), ("other", None, None, Some(12))),
+        ];
+        for ((closed_by, reason, yielded, yield_reason), (kind, why, also, new)) in cases {
+            let (read, notice) = read(closed_by, reason, yielded, yield_reason);
+            let expected = (kind, why.map(str::to_string), also.map(str::to_string), new);
+            assert_eq!(
+                read, expected,
+                "{closed_by:?} {reason:?} {yielded} {yield_reason:?}"
+            );
+            let says = match kind {
+                "abort" => "by the integrator",
+                "yield" => "to yield its objective's slot (slot)",
+                _ => "reassigned to a fresh worker as task #12",
+            };
+            assert!(notice.contains(says), "{notice}");
+            assert_eq!(
+                notice.contains("it also yields"),
+                also.is_some(),
+                "{notice}"
+            );
+        }
     }
 }
