@@ -7,6 +7,7 @@ import type { MasterMode } from "../../master";
 import { MASTER_MODES, MODE_HELP, expired, isMode, masterBody, masterVerdict } from "../../master";
 import type { OutboxEntry, SendOutcome } from "../../outbox";
 import { Outbox, openOutboxStore } from "../../outbox";
+import { KeyCap, PixelGridLoader, ShimmerLabel } from "../BeautifulPrimitives";
 import { cx } from "../ui";
 
 /** The page's one outbox (outbox.ts): IndexedDB when it opens, else memory. */
@@ -217,28 +218,26 @@ export function MasterComposer() {
     <section aria-label="Master Control" className="rounded-card bg-surface px-4 py-3 shadow-card">
       <div className="mb-2 flex flex-wrap items-center gap-2 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
         <label htmlFor={id}>To the supervisor</label>
-        <div role="radiogroup" aria-label="Mode" className="ml-auto flex gap-1 normal-case tracking-normal">
-          {MASTER_MODES.map((option) => (
-            <button
-              key={option}
-              type="button"
-              role="radio"
-              aria-checked={mode === option}
-              title={MODE_HELP[option]}
-              onClick={() => setMode(option)}
-              className={cx(
-                "rounded-control px-2 py-0.5 text-caption font-medium transition-colors focus-visible:outline-2 focus-visible:outline-ring",
-                mode === option
-                  ? "bg-surface-raised text-foreground shadow-hairline"
-                  : "text-muted-foreground hover:bg-surface-hover",
-              )}
-            >
-              {option}
-            </button>
-          ))}
-        </div>
+        {writable.state === "checking" && (
+          <span className="inline-flex items-center gap-1.5 normal-case tracking-normal text-muted-foreground">
+            <PixelGridLoader tone="accent" size="xs" />
+            <ShimmerLabel>Probing access…</ShimmerLabel>
+          </span>
+        )}
+        {ready && (
+          <span className="ml-auto rounded-chip bg-inset px-1.5 py-0.5 text-micro font-medium normal-case tracking-normal text-muted-foreground shadow-hairline">
+            Master prompt
+          </span>
+        )}
       </div>
-      <div className="flex items-end gap-2">
+
+      {/* Beautiful UI 08 Prompt Bar: unified inset composer + integrated mode & send toolbar */}
+      <div
+        className={cx(
+          "rounded-control bg-inset shadow-inset-field ring-1 ring-inset ring-line transition-[background-color,box-shadow] focus-within:bg-surface focus-within:shadow-raised focus-within:ring-ring",
+          !ready && "opacity-75",
+        )}
+      >
         <textarea
           id={id}
           rows={2}
@@ -248,7 +247,7 @@ export function MasterComposer() {
             writable.state === "checking"
               ? "Checking whether this page may write…"
               : ready
-                ? `Message the supervisor (${mode}): ${MODE_HELP[mode]}. Ctrl+Enter sends`
+                ? `Message the supervisor (${mode}): ${MODE_HELP[mode]}`
                 : "Read-only here"
           }
           onChange={(event) => {
@@ -261,31 +260,71 @@ export function MasterComposer() {
               void send();
             }
           }}
-          className="min-h-12 min-w-0 flex-1 resize-y rounded-md border border-surface-border bg-background px-3 py-1.5 text-label leading-5 text-foreground placeholder:text-faint-foreground focus-visible:border-border-strong focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-60"
+          className="block min-h-12 w-full resize-y bg-transparent px-3 pt-2.5 pb-1.5 text-label leading-5 text-foreground placeholder:text-faint-foreground focus:outline-none disabled:cursor-not-allowed"
         />
-        <button
-          type="button"
-          onClick={() => void send()}
-          disabled={!ready || busy || text.trim() === ""}
-          className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-border-strong bg-surface-raised px-3 text-caption font-medium text-foreground transition-colors hover:bg-surface-hover focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {busy ? <LoaderCircle size={13} className="animate-spin" /> : <SendHorizontal size={13} />}
-          Send
-        </button>
+
+        <div className="flex flex-wrap items-center gap-2 border-t border-surface-border px-2.5 py-1.5">
+          <div role="radiogroup" aria-label="Mode" className="flex flex-wrap items-center gap-1">
+            {MASTER_MODES.map((option) => (
+              <button
+                key={option}
+                type="button"
+                role="radio"
+                aria-checked={mode === option}
+                title={MODE_HELP[option]}
+                onClick={() => setMode(option)}
+                className={cx(
+                  "rounded-chip px-2 py-0.5 text-caption font-medium transition-[color,background-color,box-shadow] focus-visible:outline-2 focus-visible:outline-ring",
+                  mode === option
+                    ? option === "restart"
+                      ? "bg-surface text-destructive shadow-btn"
+                      : "bg-surface text-foreground shadow-btn"
+                    : "text-muted-foreground hover:bg-surface-hover hover:text-foreground",
+                )}
+              >
+                {option}
+              </button>
+            ))}
+          </div>
+
+          <div className="ml-auto flex items-center gap-2">
+            <KeyCap className="hidden sm:inline-flex">Ctrl↵</KeyCap>
+            <button
+              type="button"
+              onClick={() => void send()}
+              disabled={!ready || busy || text.trim() === ""}
+              className={cx(
+                "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-chip px-2.5 text-caption font-medium transition-[color,background-color,box-shadow,opacity] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-45",
+                ready && text.trim() !== ""
+                  ? "bg-primary text-primary-foreground shadow-btn hover:opacity-90"
+                  : "bg-surface text-muted-foreground shadow-hairline",
+              )}
+            >
+              {busy ? <LoaderCircle size={13} className="animate-spin" /> : <SendHorizontal size={13} />}
+              Send
+            </button>
+          </div>
+        </div>
       </div>
-      {writable.state === "no" && <p className="mt-1 text-caption text-muted-foreground">{writable.reason}</p>}
-      {problem && <p className="mt-1 text-caption text-destructive">{problem}</p>}
+      {writable.state === "no" && <p className="mt-1.5 text-caption text-muted-foreground">{writable.reason}</p>}
+      {problem && <p className="mt-1.5 text-caption text-destructive">{problem}</p>}
       {trouble && (
-        <p role="alert" className="mt-1 text-caption text-destructive">
+        <p role="alert" className="mt-1.5 text-caption text-destructive">
           {trouble}
         </p>
       )}
       {(waiting.length > 0 || shown.length > 0) && (
-        <ul className="mt-1.5 space-y-1 text-caption" aria-label="Messages to the supervisor">
+        <ul className="mt-2 space-y-1.5 text-caption" aria-label="Messages to the supervisor">
           {waiting.map((entry) => {
             const held = expired(entry.mode, entry.created_at_ms, now);
             return (
-              <li key={entry.key} className={cx("flex min-w-0 items-center gap-2", held ? "text-destructive" : "text-warning")}>
+              <li
+                key={entry.key}
+                className={cx(
+                  "flex min-w-0 items-center gap-2 rounded-control bg-inset px-2.5 py-1.5 shadow-hairline",
+                  held ? "text-destructive" : "text-warning",
+                )}
+              >
                 {held ? <Clock size={12} className="shrink-0" /> : <CloudOff size={12} className="shrink-0" />}
                 <span className="shrink-0 font-medium">
                   {held ? `Expired ${entry.mode}: not sent by itself` : "Waiting to send"}
@@ -305,7 +344,7 @@ export function MasterComposer() {
                       disabled={!ready}
                       onClick={() => void sendAnyway(entry.key)}
                       title={`Send this ${entry.mode} now, as if written now`}
-                      className="rounded-control border border-border-strong px-1.5 text-micro font-medium text-foreground hover:bg-surface-hover disabled:opacity-50"
+                      className="rounded-chip bg-surface px-1.5 py-0.5 text-micro font-medium text-foreground shadow-btn hover:bg-surface-hover disabled:opacity-50"
                     >
                       Send anyway
                     </button>
@@ -315,7 +354,7 @@ export function MasterComposer() {
                     onClick={() => void discard(entry.key)}
                     title="Discard: never send this message"
                     aria-label="Discard"
-                    className="inline-flex items-center gap-0.5 rounded-control px-1.5 text-micro font-medium text-muted-foreground hover:bg-surface-hover hover:text-foreground"
+                    className="inline-flex items-center gap-0.5 rounded-chip px-1.5 py-0.5 text-micro font-medium text-muted-foreground hover:bg-surface-hover hover:text-foreground"
                   >
                     <Trash2 size={11} aria-hidden="true" />
                     Discard
@@ -327,7 +366,10 @@ export function MasterComposer() {
           {shown.map((row) => (
             <li
               key={row.key}
-              className={cx("flex min-w-0 items-baseline gap-2", row.state === "sent" ? "text-success" : "text-destructive")}
+              className={cx(
+                "flex min-w-0 items-baseline gap-2 rounded-control bg-inset px-2.5 py-1.5 shadow-hairline",
+                row.state === "sent" ? "text-success" : "text-destructive",
+              )}
             >
               {row.state === "sent" ? (
                 <CircleCheck size={12} className="shrink-0 self-center" />

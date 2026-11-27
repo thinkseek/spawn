@@ -45,8 +45,41 @@ body {
   animation: spawn-pulse 2.6s ease-in-out infinite;
 }
 
+/* Beautiful UI 3x3 pixel-grid loader wave and subtle status shimmer. */
+@keyframes bui-pixel {
+  0%,
+  100% {
+    opacity: 0.22;
+    transform: scale(0.84);
+  }
+  40% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.bui-pixel-cell {
+  animation: bui-pixel 1.25s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes bui-shimmer {
+  0%,
+  100% {
+    opacity: 0.65;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.bui-shimmer-text {
+  animation: bui-shimmer 1.8s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .animate-spawn-pulse {
+  .animate-spawn-pulse,
+  .bui-pixel-cell,
+  .bui-shimmer-text {
     animation: none;
   }
 }

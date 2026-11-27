@@ -10,6 +10,7 @@ import type { AgentsNow, Digest, MissionsToday, NeedItem, NoteRow, NotesShown } 
 import { awayFrom, needsSummary, noWorkText, quietText } from "../../home";
 import { HomeCard } from "../aui/HomeCard";
 import { Badge, Button, Card, EmptyState } from "../aui/kit";
+import { PixelGridLoader, ToolChip } from "../BeautifulPrimitives";
 import { FOCUS_RING, FOCUS_RING_INSET, cx, sinceText } from "../ui";
 
 // The home page's sections (design-ui-information.md §3, layout A): what
@@ -204,7 +205,9 @@ export function MissionsTodayCard({ model, onOpen }: { model: MissionsToday; onO
                 <ul className="mt-1 space-y-0.5">
                   {row.inFlight.map((task) => (
                     <li key={task.task_id ?? task.title} className="flex min-w-0 items-baseline gap-2 text-caption">
-                      <span className="tnum w-10 shrink-0 font-mono text-micro text-faint-foreground">T{task.task_id}</span>
+                      <span className="tnum shrink-0 rounded-chip bg-inset px-1.5 py-px font-mono text-micro text-muted-foreground shadow-hairline">
+                        T{task.task_id}
+                      </span>
                       <span className="min-w-0 flex-1 truncate text-foreground">{task.title ?? "untitled"}</span>
                       {task.conflictText && (
                         <span className="shrink-0 font-medium text-warning" title="Each conflict spent a worker round and a gate run again">
@@ -262,14 +265,17 @@ export function AgentsNowCard({ model, onOpenAgent }: { model: AgentsNow; onOpen
                   FOCUS_RING_INSET,
                 )}
               >
-                <span className="truncate text-label font-medium text-foreground">{agent.name}</span>
+                <span className="inline-flex min-w-0 items-center gap-2">
+                  <PixelGridLoader tone="success" size="xs" />
+                  <span className="truncate text-label font-medium text-foreground">{agent.name}</span>
+                </span>
                 <span className="truncate text-caption text-muted-foreground" title={agent.task ?? undefined}>
                   {agent.task ?? "no task"}
                 </span>
-                <span className="tnum truncate text-caption text-foreground sm:text-right">
-                  {agent.doing}
+                <span className="tnum flex min-w-0 items-center gap-1.5 text-caption text-foreground sm:justify-end">
+                  <ToolChip label={agent.doing} tone="active" />
                   {agent.since_ms !== null && (
-                    <span className="text-faint-foreground"> · {sinceText(agent.since_ms)}</span>
+                    <span className="shrink-0 text-faint-foreground">{sinceText(agent.since_ms)}</span>
                   )}
                 </span>
               </button>
