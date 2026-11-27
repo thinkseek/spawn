@@ -128,6 +128,37 @@ export interface StoragePlace {
   files: number | null;
 }
 
+/** Disk usage for one workspace directory (PR #184). */
+export interface WorkspaceDiskUsage {
+  name: string;
+  total_bytes: number;
+  repo_bytes: number;
+  git_bytes: number;
+  build_cache_bytes: number;
+  files: number;
+  truncated: boolean;
+}
+
+/** Aggregate and bounded top-32 workspace disk breakdown (PR #184). */
+export interface WorkspaceBreakdown {
+  workspace_count: number;
+  total_bytes: number;
+  repo_bytes: number;
+  git_bytes: number;
+  build_cache_bytes: number;
+  files: number;
+  truncated: boolean;
+  workspaces: WorkspaceDiskUsage[];
+}
+
+/** Opt-in shared host build cache usage, or residual `.caches` when disabled. */
+export interface SharedBuildCache {
+  path: string;
+  bytes: number;
+  files: number;
+  enabled: boolean;
+}
+
 export interface Storage {
   /** Free bytes on the workspace root's file system; null when unread. */
   free_bytes: number | null;
@@ -138,8 +169,12 @@ export interface Storage {
   /** Claude Code's projects directory, with the count of the newest sample
    * at least an hour old (`before`), null without one. */
   projects: (StoragePlace & { before: number | null }) | null;
-  /** Everything under the root outside the archive; null without a root. */
+  /** Everything under the root outside the archive and shared cache; null without a root. */
   workspaces: StoragePlace | null;
+  /** Bounded workspace disk breakdown by bucket (PR #184); null when omitted. */
+  workspace_breakdown: WorkspaceBreakdown | null;
+  /** Opt-in shared build cache usage (PR #184); null when off and absent. */
+  shared_build_cache: SharedBuildCache | null;
   /** The live database: its size, its event log's bytes (what the data
    * justifies; null from an older server) and its largest tables. */
   database: {
@@ -218,7 +253,87 @@ function place(value: unknown): StoragePlace | null {
   return { path: typeof raw.path === "string" ? raw.path : "", bytes, files: optionalNumber(raw.files) };
 }
 
-/** The health's `storage`; null when the server reports none (an older one). */
+function nonNegativeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+const WORKSPACE_BREAKDOWN_MAX_ENTRIES = 32;
+
+/** Bounded per-workspace disk breakdown (PR #184); null when omitted or unusable. */
+export function normalizeWorkspaceBreakdown(value: unknown): WorkspaceBreakdown | null {
+  const raw = object(value);
+  if (!raw) return null;
+  const hasCount = nonNegativeNumber(raw.workspace_count) !== null;
+  const hasTotal = nonNegativeNumber(raw.total_bytes) !== null;
+  const hasWorkspaces = Array.isArray(raw.workspaces);
+  if (!hasCount && !hasTotal && !hasWorkspaces) return null;
+
+  const normalizedEntries = (hasWorkspaces ? (raw.workspaces as unknown[]) : [])
+    .flatMap((entry): WorkspaceDiskUsage[] => {
+      const row = object(entry);
+      const name = typeof row?.name === "string" ? row.name.trim() : "";
+      if (!row || name === "") return [];
+      const repo_bytes = nonNegativeNumber(row.repo_bytes) ?? 0;
+      const git_bytes = nonNegativeNumber(row.git_bytes) ?? 0;
+      const build_cache_bytes = nonNegativeNumber(row.build_cache_bytes) ?? 0;
+      const total_bytes =
+        nonNegativeNumber(row.total_bytes) ?? repo_bytes + git_bytes + build_cache_bytes;
+      return [
+        {
+          name,
+          total_bytes,
+          repo_bytes,
+          git_bytes,
+          build_cache_bytes,
+          files: nonNegativeNumber(row.files) ?? 0,
+          truncated: row.truncated === true,
+        },
+      ];
+    })
+    .sort((left, right) => right.total_bytes - left.total_bytes || left.name.localeCompare(right.name))
+    .slice(0, WORKSPACE_BREAKDOWN_MAX_ENTRIES);
+
+  const summedTotal = normalizedEntries.reduce((sum, entry) => sum + entry.total_bytes, 0);
+  const summedRepo = normalizedEntries.reduce((sum, entry) => sum + entry.repo_bytes, 0);
+  const summedGit = normalizedEntries.reduce((sum, entry) => sum + entry.git_bytes, 0);
+  const summedBuildCache = normalizedEntries.reduce((sum, entry) => sum + entry.build_cache_bytes, 0);
+  const summedFiles = normalizedEntries.reduce((sum, entry) => sum + entry.files, 0);
+
+  const repo_bytes = nonNegativeNumber(raw.repo_bytes) ?? summedRepo;
+  const git_bytes = nonNegativeNumber(raw.git_bytes) ?? summedGit;
+  const build_cache_bytes = nonNegativeNumber(raw.build_cache_bytes) ?? summedBuildCache;
+  const total_bytes =
+    nonNegativeNumber(raw.total_bytes) ??
+    (hasWorkspaces ? Math.max(summedTotal, repo_bytes + git_bytes + build_cache_bytes) : repo_bytes + git_bytes + build_cache_bytes);
+
+  return {
+    workspace_count: nonNegativeNumber(raw.workspace_count) ?? normalizedEntries.length,
+    total_bytes,
+    repo_bytes,
+    git_bytes,
+    build_cache_bytes,
+    files: nonNegativeNumber(raw.files) ?? summedFiles,
+    truncated: raw.truncated === true,
+    workspaces: normalizedEntries,
+  };
+}
+
+/** Shared host build cache usage (PR #184); null when disabled and absent or omitted. */
+export function normalizeSharedBuildCache(value: unknown): SharedBuildCache | null {
+  const raw = object(value);
+  if (!raw) return null;
+  const hasPath = typeof raw.path === "string";
+  const hasBytes = nonNegativeNumber(raw.bytes) !== null;
+  const hasEnabled = typeof raw.enabled === "boolean";
+  if (!hasPath && !hasBytes && !hasEnabled) return null;
+  return {
+    path: typeof raw.path === "string" ? raw.path.trim() : "",
+    bytes: nonNegativeNumber(raw.bytes) ?? 0,
+    files: nonNegativeNumber(raw.files) ?? 0,
+    enabled: raw.enabled === true,
+  };
+}
+
 /** `growth_from_parts`, each part a number or null; null without the object. */
 function fromParts(value: unknown): Record<string, number | null> | null {
   const parts = object(value);
@@ -226,6 +341,7 @@ function fromParts(value: unknown): Record<string, number | null> | null {
   return Object.fromEntries(Object.entries(parts).map(([part, at]) => [part, optionalNumber(at)]));
 }
 
+/** The health's `storage`; null when the server reports none (an older one). */
 export function normalizeStorage(value: unknown): Storage | null {
   const raw = object(value);
   if (!raw) return null;
@@ -238,6 +354,8 @@ export function normalizeStorage(value: unknown): Storage | null {
     archive: place(raw.archive),
     projects: projects && { ...projects, before: optionalNumber(object(raw.projects)?.before) },
     workspaces: place(raw.workspaces),
+    workspace_breakdown: normalizeWorkspaceBreakdown(raw.workspace_breakdown),
+    shared_build_cache: normalizeSharedBuildCache(raw.shared_build_cache),
     database: database && {
       bytes: optionalNumber(database.bytes),
       log_bytes: optionalNumber(database.log_bytes),
@@ -268,12 +386,196 @@ export function normalizeStorage(value: unknown): Storage | null {
 
 const MB = 1024 ** 2;
 
+function formatCount(n: number): string {
+  return n.toLocaleString("en-US");
+}
+
 /** "12.0 MB" under 1024 MB, "3.0 GB" from there (1 MB is 1024 * 1024
  * bytes); "—" when unread. */
 export function storageSize(bytes: number | null | undefined): string {
   if (bytes == null || !Number.isFinite(bytes)) return "—";
   const mb = bytes / MB;
   return mb < 1024 ? `${mb.toFixed(1)} MB` : `${(mb / 1024).toFixed(1)} GB`;
+}
+
+export interface DiskBucketShares {
+  repo_pct: number;
+  git_pct: number;
+  rebuildable_pct: number;
+}
+
+export interface WorkspaceUsageRow {
+  name: string;
+  total: string;
+  repo: string;
+  git: string;
+  rebuildable: string;
+  files: number;
+  truncated: boolean;
+  shares: DiskBucketShares;
+  summary: string;
+}
+
+export interface WorkspaceBreakdownView {
+  workspace_count: number;
+  shown_count: number;
+  hidden_count: number;
+  total: string;
+  repo: string;
+  git: string;
+  rebuildable: string;
+  files: number;
+  truncated: boolean;
+  shares: DiskBucketShares;
+  workspaces: WorkspaceUsageRow[];
+}
+
+export interface SharedBuildCacheView {
+  status: "enabled" | "disabled" | "off";
+  badge: string;
+  size: string | null;
+  files: number | null;
+  path: string | null;
+  note: string;
+}
+
+/** Compute bounded non-negative percentage shares (`<= 100` total) for workspace buckets. */
+export function bucketShares(
+  total: number,
+  repo: number,
+  git: number,
+  rebuildable: number,
+): DiskBucketShares {
+  const safeRepo = Number.isFinite(repo) && repo > 0 ? repo : 0;
+  const safeGit = Number.isFinite(git) && git > 0 ? git : 0;
+  const safeRebuild = Number.isFinite(rebuildable) && rebuildable > 0 ? rebuildable : 0;
+  const partsSum = safeRepo + safeGit + safeRebuild;
+  const safeTotal = Number.isFinite(total) && total > 0 ? total : 0;
+  const denom = Math.max(safeTotal, partsSum);
+  if (denom <= 0 || partsSum <= 0) {
+    return { repo_pct: 0, git_pct: 0, rebuildable_pct: 0 };
+  }
+  const raw = [safeRepo, safeGit, safeRebuild].map((part) => (part / denom) * 100);
+  const floored = raw.map((pct) => Math.floor(pct));
+  const target = Math.min(100, Math.round((partsSum / denom) * 100));
+  let remainder = Math.max(0, target - (floored[0] + floored[1] + floored[2]));
+  const order = [0, 1, 2].sort((a, b) => raw[b] - floored[b] - (raw[a] - floored[a]) || a - b);
+  for (const index of order) {
+    if (remainder <= 0) break;
+    floored[index] += 1;
+    remainder -= 1;
+  }
+  return { repo_pct: floored[0], git_pct: floored[1], rebuildable_pct: floored[2] };
+}
+
+function formatBucketSummary(
+  repo: string,
+  git: string,
+  rebuildable: string,
+  shares: DiskBucketShares,
+): string {
+  return `repo ${repo} (${shares.repo_pct}%) · .git ${git} (${shares.git_pct}%) · rebuildable ${rebuildable} (${shares.rebuildable_pct}%)`;
+}
+
+/** Compact view model for `health.storage.workspace_breakdown`; accepts either
+ * a `Storage` object (raw or normalized) or a `WorkspaceBreakdown` directly. */
+export function workspaceBreakdownView(value: unknown): WorkspaceBreakdownView | null {
+  const obj = object(value);
+  if (!obj) return null;
+  const rawBreakdown =
+    "workspace_breakdown" in obj || "workspaces" in obj && object(obj.workspaces) !== null || "free_bytes" in obj
+      ? obj.workspace_breakdown
+      : value;
+  const breakdown = normalizeWorkspaceBreakdown(rawBreakdown);
+  if (!breakdown) return null;
+
+  const shares = bucketShares(
+    breakdown.total_bytes,
+    breakdown.repo_bytes,
+    breakdown.git_bytes,
+    breakdown.build_cache_bytes,
+  );
+  const workspaces: WorkspaceUsageRow[] = breakdown.workspaces.map((ws) => {
+    const wsShares = bucketShares(
+      ws.total_bytes,
+      ws.repo_bytes,
+      ws.git_bytes,
+      ws.build_cache_bytes,
+    );
+    const repo = storageSize(ws.repo_bytes);
+    const git = storageSize(ws.git_bytes);
+    const rebuildable = storageSize(ws.build_cache_bytes);
+    return {
+      name: ws.name,
+      total: storageSize(ws.total_bytes),
+      repo,
+      git,
+      rebuildable,
+      files: ws.files,
+      truncated: ws.truncated,
+      shares: wsShares,
+      summary: formatBucketSummary(repo, git, rebuildable, wsShares),
+    };
+  });
+
+  return {
+    workspace_count: breakdown.workspace_count,
+    shown_count: workspaces.length,
+    hidden_count: Math.max(0, breakdown.workspace_count - workspaces.length),
+    total: storageSize(breakdown.total_bytes),
+    repo: storageSize(breakdown.repo_bytes),
+    git: storageSize(breakdown.git_bytes),
+    rebuildable: storageSize(breakdown.build_cache_bytes),
+    files: breakdown.files,
+    truncated: breakdown.truncated,
+    shares,
+    workspaces,
+  };
+}
+
+/** Compact view model for `health.storage.shared_build_cache`; accepts either a
+ * `Storage` object (raw or normalized) or a `SharedBuildCache | null` directly. */
+export function sharedBuildCacheView(value: unknown): SharedBuildCacheView {
+  const obj = object(value);
+  const rawCache =
+    obj &&
+    ("shared_build_cache" in obj ||
+      "workspace_breakdown" in obj ||
+      "workspaces" in obj ||
+      "archive" in obj ||
+      "free_bytes" in obj)
+      ? obj.shared_build_cache
+      : value;
+  const cache = normalizeSharedBuildCache(rawCache);
+  if (!cache) {
+    return {
+      status: "off",
+      badge: "off",
+      size: null,
+      files: null,
+      path: null,
+      note: "Disabled or not reported",
+    };
+  }
+  const filesLabel = `${formatCount(cache.files)} ${cache.files === 1 ? "file" : "files"}`;
+  if (!cache.enabled) {
+    return {
+      status: "disabled",
+      badge: "disabled",
+      size: storageSize(cache.bytes),
+      files: cache.files,
+      path: cache.path || null,
+      note: `residual cache · ${filesLabel}`,
+    };
+  }
+  return {
+    status: "enabled",
+    badge: "enabled",
+    size: storageSize(cache.bytes),
+    files: cache.files,
+    path: cache.path || null,
+    note: filesLabel,
+  };
 }
 
 /** The storage rows' names of the test databases, by role. */
