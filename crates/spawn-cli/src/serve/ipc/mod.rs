@@ -329,7 +329,15 @@ pub(super) fn verify_peer_uid(stream: &UnixStream) -> Result<(), String> {
     Ok(())
 }
 
+/// Off Linux there is no `SO_PEERCRED` in rustix, and this crate reads no
+/// peer credential through unsafe code: the peer is not checked, and the
+/// socket's mode (0600, set by [`bind_uds`] before it is renamed into
+/// place) is what keeps other users out.
 #[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Linux check's signature, so the caller is one for both"
+)]
 pub(super) fn verify_peer_uid(_stream: &UnixStream) -> Result<(), String> {
     Ok(())
 }

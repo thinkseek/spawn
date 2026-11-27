@@ -546,22 +546,20 @@ impl LocalWorkspaceStore {
     /// when the baselines or layers could not be pruned (a state that cannot
     /// be read prunes nothing).
     pub fn prune_unused(&self) -> Result<(usize, Vec<String>), String> {
-        let mut warnings = Vec::new();
         #[cfg(target_os = "linux")]
-        let swept = match crate::overlay::sweep_probes(self.root()) {
-            Ok(swept) => {
-                for (probe, why) in &swept.kept {
-                    warnings.push(format!("overlay probe {} kept: {why}", probe.display()));
-                }
-                swept.removed
-            }
-            Err(error) => {
-                warnings.push(format!("sweep overlay probes: {error}"));
-                0
-            }
+        let (swept, warnings) = match crate::overlay::sweep_probes(self.root()) {
+            Ok(swept) => (
+                swept.removed,
+                swept
+                    .kept
+                    .iter()
+                    .map(|(probe, why)| format!("overlay probe {} kept: {why}", probe.display()))
+                    .collect(),
+            ),
+            Err(error) => (0, vec![format!("sweep overlay probes: {error}")]),
         };
         #[cfg(not(target_os = "linux"))]
-        let swept = 0;
+        let (swept, warnings) = (0, Vec::new());
         let pruned = match self {
             Self::Git(_) | Self::D6Shadow(_) | Self::D6(_) => 0,
             Self::Cow(store) => store
