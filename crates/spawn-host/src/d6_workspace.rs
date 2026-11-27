@@ -781,6 +781,50 @@ impl<L: RefLedger> D6Workspace<L> {
         self.branch_snapshot(BASE_BRANCH)
     }
 
+    /// Inspect `branch`'s head snapshot as a clean merge of `main` (`"spawn: merge main ..."`
+    /// with two parents), returning `(commit_git_oid_hex, changed_files)`.
+    pub fn head_clean_merge(&self, branch: &str) -> Option<(String, Vec<String>)> {
+        let snap = self.branch_snapshot(branch).ok().flatten()?;
+        let full = self.store.cas().read_merkle_snapshot(&snap.id).ok()?;
+        if full.parents.len() != 2 {
+            return None;
+        }
+        let body = std::str::from_utf8(&full.commit_body).ok()?;
+        let msg = body.split_once("\n\n").map(|(_, msg)| msg)?;
+        let subject = msg.lines().next()?;
+        if !subject.starts_with("spawn: merge main ") {
+            return None;
+        }
+        let parent_tree = self.snapshot_tree(&full.parents[0]).ok()?;
+        let files = self.diff_tree_paths(&parent_tree, &snap.tree).ok()?;
+        Some((snap.git_oid.to_hex(), files))
+    }
+
+    /// Whether `prior_commit` (40-hex Git OID in the D6 `RefLedger`) introduces any tree
+    /// changes relative to its merge base with `main`.
+    pub fn prior_has_work(&self, prior_commit: &str) -> Result<bool, WorkspaceError> {
+        let Some(main_snap) = self.main_snapshot()? else {
+            return Err(WorkspaceError::Unavailable(
+                "project has no main snapshot in D6 ledger".to_string(),
+            ));
+        };
+        let prior_oid = GitOid::parse_hex(prior_commit)
+            .map_err(|e| WorkspaceError::Unavailable(e.to_string()))?;
+        let prior_snap = self
+            .ledger
+            .get_snapshot_by_oid(&prior_oid)
+            .map_err(map_store_err)?
+            .ok_or_else(|| {
+                WorkspaceError::Unavailable(format!(
+                    "prior commit {prior_commit} missing from D6 ledger"
+                ))
+            })?;
+        let base_id = find_single_merge_base(&self.store, &main_snap.id, &prior_snap.id)
+            .map_err(|e| WorkspaceError::Unavailable(e.to_string()))?;
+        let base_tree = self.snapshot_tree(&base_id)?;
+        Ok(base_tree != prior_snap.tree)
+    }
+
     /// Materialize or reuse an immutable warm Layer 0 cache directory `<root>/.d6/layers/<tree_hex>`.
     ///
     /// Incremental hard-link reuse via `Layer0Options::nearest` is strictly limited to an already
@@ -4950,6 +4994,103 @@ MemAvailable:   2087943188 kB
         assert_eq!(
             store.checkpoint(&ws, "noop").expect("noop"),
             Commit::Unchanged
+        );
+    }
+
+    #[test]
+    fn head_clean_merge_and_prior_has_work_inspect_merkle_history() {
+        let (_scratch, cas, _ledger, store, _clock) = test_workspace();
+        let seed_branch = BranchName::new("seed_branch").expect("branch");
+        store.ensure_branch(&seed_branch, None).expect("seed");
+        let main0 = store.main_snapshot().expect("main0").expect("present");
+
+        let (readme_d, readme_len) = cas.put_bytes_blob(b"base\n").expect("put blob");
+        let t0 = cas
+            .put_tree_cached(
+                &Tree::from_entries(vec![TreeEntry::file(
+                    b"README.md".to_vec(),
+                    &readme_d,
+                    readme_len,
+                )])
+                .expect("tree"),
+            )
+            .expect("put tree");
+        let body1 = format_commit_body(
+            "spawn <s@l> 1700000010 +0000",
+            "spawn <s@l> 1700000010 +0000",
+            "seed files\n",
+        );
+        let snap1 = cas
+            .cas()
+            .put_merkle_snapshot(&Snapshot {
+                tree: t0.clone(),
+                parents: vec![main0.id.clone()],
+                commit_body: body1,
+            })
+            .expect("put snap1");
+        store
+            .land_main_snapshot(Some(&main0.id), &snap1, Some(1), "test seed")
+            .expect("land snap1");
+
+        let main1 = store.main_snapshot().expect("main1").expect("present");
+        assert!(
+            !store
+                .prior_has_work(&main1.git_oid.to_hex())
+                .expect("main has no extra work")
+        );
+        assert!(store.prior_has_work("not-hex").is_err());
+
+        let work_branch = BranchName::new("agent_work").expect("work branch");
+        store.ensure_branch(&work_branch, None).expect("ensure");
+        let ws = store.mount(&work_branch).expect("mount");
+        fs::write(PathBuf::from(ws.path()).join("README.md"), "worker edit\n").expect("write");
+        let Commit::Created(work_commit) = store.commit(&ws, "worker commit").expect("commit")
+        else {
+            panic!("expected created commit");
+        };
+        assert!(
+            store
+                .prior_has_work(work_commit.as_str())
+                .expect("worker has work")
+        );
+        assert_eq!(store.head_clean_merge("agent_work"), None);
+
+        let (other_d, other_len) = cas.put_bytes_blob(b"from main\n").expect("put other");
+        let t_main2 = cas
+            .apply_mutations(
+                &t0,
+                &[TreeMutation::Upsert {
+                    path: vec![b"OTHER.txt".to_vec()],
+                    kind: TreeEntryKind::File,
+                    id: other_d.as_bytes(),
+                    size: other_len,
+                }],
+            )
+            .expect("apply mutation");
+        let body2 = format_commit_body(
+            "spawn <s@l> 1700000020 +0000",
+            "spawn <s@l> 1700000020 +0000",
+            "advance main\n",
+        );
+        let snap2 = cas
+            .cas()
+            .put_merkle_snapshot(&Snapshot {
+                tree: t_main2,
+                parents: vec![snap1.clone()],
+                commit_body: body2,
+            })
+            .expect("put snap2");
+        store
+            .land_main_snapshot(Some(&snap1), &snap2, Some(2), "advance main")
+            .expect("land snap2");
+
+        let BaseMerge::Merged { commit, files } = store.merge_base(&ws).expect("merge_base") else {
+            panic!("expected clean merge");
+        };
+        assert_eq!(files, vec!["OTHER.txt".to_string()]);
+        assert_eq!(
+            store.head_clean_merge("agent_work"),
+            Some((commit.as_str().to_string(), files))
         );
     }
 }

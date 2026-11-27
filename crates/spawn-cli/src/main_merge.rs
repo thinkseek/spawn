@@ -61,11 +61,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use spawn_cas::GitOid;
 use spawn_core::event::{ArtifactRef, CheckpointReason, EventKind, NewEvent, Source};
 use spawn_core::id::{AgentId, BranchName, CommitId, SessionId, WorkspaceId};
 use spawn_core::port::{BaseMerge, Commit, EventLog, MERGE_WAITS, WorkspaceError, WorkspaceStore};
-use spawn_host::{LocalWorkspaceStore, RefLedger as _};
 use spawn_postgres::PostgresStore;
 
 use crate::dispatch::Facts;
@@ -279,7 +277,7 @@ pub(crate) fn merge_main_with_settings(
     let Some(workspace) = mounted_for_settings(Some(settings), root, agent) else {
         return Merge::NotMounted;
     };
-    let is_d6 = settings.active == spawn_host::WorkspaceBackend::D6;
+    let is_d6 = settings.is_d6();
     let mirror = if is_d6 {
         match sources::mirror_path(root, Some(&source)) {
             Ok(mirror) => mirror,
@@ -296,7 +294,9 @@ pub(crate) fn merge_main_with_settings(
     // A merge whose record failed (here, or the Bridge's at a start) is
     // recorded from the branch now; one already recorded is a no-op.
     let earlier = if is_d6 {
-        head_merge_d6(&workspaces, agent)
+        workspaces
+            .d6_head_clean_merge(agent)
+            .map(|(commit, files)| Merge::Merged { commit, files })
     } else {
         head_merge(&mirror, agent)
     };
@@ -337,43 +337,6 @@ pub(crate) struct PriorWork {
     /// (`spawn_task_reassign`), not an objective's earlier task.
     #[serde(default)]
     pub(crate) reassign: bool,
-}
-
-fn d6_prior_has_work(
-    workspaces: &sources::MissionWorkspaces,
-    agent: &str,
-    prior_commit: &str,
-) -> Result<bool, String> {
-    let routed = workspaces.routed_store(agent).map_err(|e| e.to_string())?;
-    let Some(d6) = routed.d6_workspace() else {
-        return Err("expected D6 workspace backend".to_string());
-    };
-    let Some(main_snap) = d6.main_snapshot().map_err(|e| e.to_string())? else {
-        return Err("project has no main snapshot in D6 ledger".to_string());
-    };
-    let prior_oid = GitOid::parse_hex(prior_commit).map_err(|e| e.to_string())?;
-    let prior_snap = d6
-        .ledger()
-        .get_snapshot_by_oid(&prior_oid)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("prior commit {prior_commit} missing from D6 ledger"))?;
-    let base_id =
-        spawn_host::merkle_merge::find_single_merge_base(d6.store(), &main_snap.id, &prior_snap.id)
-            .map_err(|e| e.to_string())?;
-    let base_tree = if let Some(snap) = d6
-        .ledger()
-        .get_snapshot(&base_id)
-        .map_err(|e| e.to_string())?
-    {
-        snap.tree
-    } else {
-        d6.store()
-            .cas()
-            .read_merkle_snapshot(&base_id)
-            .map_err(|e| e.to_string())?
-            .tree
-    };
-    Ok(base_tree != prior_snap.tree)
 }
 
 /// Create `agent`'s branch at `prior`'s checkpoint and merge main into it,
@@ -421,7 +384,7 @@ pub(crate) fn fork_from_prior_with_settings(
         Ok(_) => return Ok(Fork::NoSource),
         Err(failure) => return Err(error("its mission source", &failure)),
     };
-    let is_d6 = settings.active == spawn_host::WorkspaceBackend::D6;
+    let is_d6 = settings.is_d6();
     let mirror = if is_d6 {
         sources::mirror_path(root, Some(&source)).map_err(|e| error("mirror", &e))?
     } else {
@@ -429,7 +392,8 @@ pub(crate) fn fork_from_prior_with_settings(
     };
     let workspaces = settings.one_shot(&mirror, root, Arc::clone(store));
     if is_d6 {
-        if !d6_prior_has_work(&workspaces, agent, &prior.commit)
+        if !workspaces
+            .d6_prior_has_work(agent, &prior.commit)
             .map_err(|e| error("its base with main", &e))?
         {
             return Ok(Fork::NoWork);
@@ -584,35 +548,7 @@ pub(crate) fn branch_head_with_settings(
     root: &Path,
     agent: &str,
 ) -> Option<String> {
-    let Ok(Some(Some(source))) = store.agent_source(agent) else {
-        return None;
-    };
-    let branch = BranchName::new(agent).ok()?;
-    if settings.active == spawn_host::WorkspaceBackend::D6 {
-        let cas_dir = settings
-            .d6
-            .effective_cas_dir(root, spawn_host::WorkspaceBackend::D6);
-        if !cas_dir.exists() {
-            return None;
-        }
-        let mirror = sources::mirror_path(root, Some(&source)).ok()?;
-        let d6 = sources::open_d6_workspace_borrowed(&mirror, root, &settings.d6, store).ok()?;
-        return d6
-            .branch_head(&branch)
-            .ok()
-            .flatten()
-            .map(|commit| commit.as_str().to_string());
-    }
-    let mirror = sources::ensure_mirror(root, Some(&source)).ok()?;
-    let local = match settings.active {
-        spawn_host::WorkspaceBackend::D6Shadow => LocalWorkspaceStore::git(&mirror, root),
-        _ => sources::open_non_d6_store(settings, &mirror, root).ok()?,
-    };
-    local
-        .branch_head(&branch)
-        .ok()
-        .flatten()
-        .map(|commit| commit.as_str().to_string())
+    sources::agent_branch_head_with_settings(store, settings, root, agent)
 }
 
 /// What a task is told when its fork from `prior`'s work kept failing
@@ -695,50 +631,6 @@ fn publish_merge(mirror: &Path, source: &str, agent: &str, head: &str) {
             eprintln!("merge main into {agent}: the source refused {head}: {why}");
         }
     }
-}
-
-/// D6 native equivalent of [`head_merge`]: inspect the branch snapshot in
-/// CAS + `RefLedger` without calling `git log` / `git diff`.
-fn head_merge_d6(workspaces: &sources::MissionWorkspaces, agent: &str) -> Option<Merge> {
-    let routed = workspaces.routed_store(agent).ok()?;
-    let d6 = routed.d6_workspace()?;
-    let snap = d6.branch_snapshot(agent).ok().flatten()?;
-    let full = d6.store().cas().read_merkle_snapshot(&snap.id).ok()?;
-    if full.parents.len() != 2 {
-        return None;
-    }
-    let body = std::str::from_utf8(&full.commit_body).ok()?;
-    let msg = body.split_once("\n\n").map(|(_, msg)| msg)?;
-    let subject = msg.lines().next()?;
-    if !subject.starts_with("spawn: merge main ") {
-        return None;
-    }
-    let parent_tree = match d6.ledger().get_snapshot(&full.parents[0]).ok().flatten() {
-        Some(parent) => parent.tree,
-        None => {
-            d6.store()
-                .cas()
-                .read_merkle_snapshot(&full.parents[0])
-                .ok()?
-                .tree
-        }
-    };
-    let a_map = d6.store().flatten_tree(&parent_tree).ok()?;
-    let b_map = d6.store().flatten_tree(&snap.tree).ok()?;
-    let mut files = Vec::new();
-    for key in a_map
-        .keys()
-        .chain(b_map.keys())
-        .collect::<std::collections::BTreeSet<_>>()
-    {
-        if a_map.get(key) != b_map.get(key) {
-            files.push(spawn_host::tree_path::TreePath::from_bytes(key.clone()).shown());
-        }
-    }
-    Some(Merge::Merged {
-        commit: snap.git_oid.to_hex(),
-        files,
-    })
 }
 
 /// The head of `agent`'s branch in `mirror` as a clean merge of main, when it

@@ -1041,16 +1041,35 @@ impl MissionWorkspaces {
         }
     }
 
-    pub(crate) fn routed_store(
-        &self,
-        agent: &str,
-    ) -> Result<Arc<LocalWorkspaceStore>, WorkspaceError> {
+    fn routed_store(&self, agent: &str) -> Result<Arc<LocalWorkspaceStore>, WorkspaceError> {
         self.route(agent).map(|routed| routed.store)
     }
 
     pub(crate) fn main_copies(&self, agent: &str) -> Option<(String, Vec<String>)> {
         let routed = self.route(agent).ok()?;
         routed.store.main_copies(agent)
+    }
+
+    /// Inspect `agent`'s head snapshot as a clean merge of `main` when backed by D6.
+    pub(crate) fn d6_head_clean_merge(&self, agent: &str) -> Option<(String, Vec<String>)> {
+        self.routed_store(agent)
+            .ok()?
+            .d6_workspace()?
+            .head_clean_merge(agent)
+    }
+
+    /// Whether `prior_commit` introduces any tree changes relative to its merge base with `main`
+    /// in the D6 backend routed for `agent`.
+    pub(crate) fn d6_prior_has_work(
+        &self,
+        agent: &str,
+        prior_commit: &str,
+    ) -> Result<bool, String> {
+        let routed = self.routed_store(agent).map_err(|e| e.to_string())?;
+        let Some(d6) = routed.d6_workspace() else {
+            return Err("expected D6 workspace backend".to_string());
+        };
+        d6.prior_has_work(prior_commit).map_err(|e| e.to_string())
     }
 
     /// The same store deduplicating build artifacts when `on`
@@ -2066,6 +2085,44 @@ pub(crate) fn persist_task_worker_commits_with_settings(
         task_id,
         stage,
     )
+}
+
+/// Current head commit of `agent`'s branch across all configured workspace backends.
+pub(crate) fn agent_branch_head_with_settings(
+    store: &PostgresStore,
+    settings: &crate::config::WorkspaceSettings,
+    root: &Path,
+    agent: &str,
+) -> Option<String> {
+    let Ok(Some(Some(source))) = store.agent_source(agent) else {
+        return None;
+    };
+    let branch = BranchName::new(agent).ok()?;
+    if settings.active == HostWorkspaceBackend::D6 {
+        let cas_dir = settings
+            .d6
+            .effective_cas_dir(root, HostWorkspaceBackend::D6);
+        if !cas_dir.exists() {
+            return None;
+        }
+        let mirror = mirror_path(root, Some(&source)).ok()?;
+        let d6 = open_d6_workspace_borrowed(&mirror, root, &settings.d6, store).ok()?;
+        return d6
+            .branch_head(&branch)
+            .ok()
+            .flatten()
+            .map(|commit| commit.as_str().to_string());
+    }
+    let mirror = ensure_mirror(root, Some(&source)).ok()?;
+    let local = match settings.active {
+        HostWorkspaceBackend::D6Shadow => LocalWorkspaceStore::git(&mirror, root),
+        _ => open_non_d6_store(settings, &mirror, root).ok()?,
+    };
+    local
+        .branch_head(&branch)
+        .ok()
+        .flatten()
+        .map(|commit| commit.as_str().to_string())
 }
 
 /// Persists worker-authored commits for `task_id` (`stage`: `"head"` or
