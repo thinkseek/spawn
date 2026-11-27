@@ -1,12 +1,12 @@
-//! [`LocalWorkspaceStore`]: the Git, Cow and (on Linux) overlay engines run
-//! through one type, and every engine answers the same
+//! [`LocalWorkspaceStore`]: the Git, Cow and (on Linux) overlay backends run
+//! through one type, and every backend answers the same
 //! [`WorkspaceStore`] contract the same way: `mount_when` / `unmount_when`
 //! asked under the branch's lock, `is_mounted`, `hold`, and a set-aside
 //! (`set_aside_when`) that keeps the work in the branch's history and moves
 //! the mounted workspace back to the start's tree, the same commits and the
 //! same answers in every store.
 //!
-//! The overlay engine runs for real (an unprivileged user and mount
+//! The overlay backend runs for real (an unprivileged user and mount
 //! namespace) wherever the kernel allows it, and is skipped, saying why,
 //! anywhere else.
 
@@ -76,7 +76,7 @@ fn code<T: std::fmt::Debug>(result: Result<T, WorkspaceError>) -> String {
     }
 }
 
-/// Every engine this host runs, each over a root of its own under `base`.
+/// Every backend this host runs, each over a root of its own under `base`.
 fn engines(base: &Path, repo: &Path) -> Vec<LocalWorkspaceStore> {
     let mut stores = vec![
         LocalWorkspaceStore::git(repo, base.join("git-root")),
@@ -84,7 +84,7 @@ fn engines(base: &Path, repo: &Path) -> Vec<LocalWorkspaceStore> {
     ];
     match LocalWorkspaceStore::overlay(repo, base.join("overlay-root")) {
         Ok(store) => stores.push(store),
-        Err(why) => eprintln!("overlay engine skipped: {why}"),
+        Err(why) => eprintln!("overlay backend skipped: {why}"),
     }
     stores
 }
@@ -169,7 +169,7 @@ fn constructors_name_their_engine_and_auto_picks_the_cheapest_supported() {
 
 /// The whole contract, engine by engine: the same calls, the same answers.
 #[test]
-#[allow(clippy::too_many_lines)] // one engine's whole run, step by step
+#[allow(clippy::too_many_lines)] // one backend's whole run, step by step
 fn every_engine_mounts_sets_aside_and_unmounts_alike() {
     let scratch = Scratch::new("local-store-parity");
     let repo = seed(&scratch);
@@ -302,7 +302,7 @@ fn every_engine_mounts_sets_aside_and_unmounts_alike() {
     assert!(seen.starts_with(&["git", "cow"]), "{seen:?}");
     #[cfg(target_os = "linux")]
     if spawn_host::overlay_supported_in(&scratch).is_ok() {
-        assert_eq!(seen, ["git", "cow", "overlay"], "the overlay engine ran");
+        assert_eq!(seen, ["git", "cow", "overlay"], "the overlay backend ran");
     }
 }
 
@@ -471,7 +471,7 @@ fn cas_dedup_shares_artifacts_and_never_touches_transcripts() {
     assert!(other.dedup_artifacts(&plain).unwrap().is_none());
 }
 
-/// Whether this host must run the overlay engine (the kernel mounts one
+/// Whether this host must run the overlay backend (the kernel mounts one
 /// under `base`): then a test asserts it ran, never skips it.
 fn overlay_here(base: &Path) -> bool {
     #[cfg(target_os = "linux")]
@@ -485,7 +485,7 @@ fn overlay_here(base: &Path) -> bool {
 
 /// The shared `WorkspaceStore` contract the memory fake and the Git store
 /// pass, run against the Cow store itself and every [`LocalWorkspaceStore`]
-/// engine: the overlay too wherever the kernel mounts one.
+/// backend: the overlay too wherever the kernel mounts one.
 #[test]
 fn every_engine_passes_the_shared_workspace_contract() {
     let scratch = Scratch::new("local-store-contract");
@@ -511,8 +511,8 @@ fn every_engine_passes_the_shared_workspace_contract() {
     }
 }
 
-/// A root runs one engine: the first claim writes the marker, the same
-/// engine is let in again, another is refused with nothing written; a root
+/// A root runs one backend: the first claim writes the marker, the same
+/// backend is let in again, another is refused with nothing written; a root
 /// from before the marker is read by what is in it.
 #[test]
 fn a_root_is_claimed_by_one_engine_and_refuses_another() {
@@ -527,8 +527,8 @@ fn a_root_is_claimed_by_one_engine_and_refuses_another() {
         "cow\n"
     );
     cow.claim().unwrap();
-    let error = claim_root(&root, WorkspaceBackend::Git).expect_err("another engine");
-    assert!(error.contains("cow engine"), "{error}");
+    let error = claim_root(&root, WorkspaceBackend::Git).expect_err("another backend");
+    assert!(error.contains("cow backend"), "{error}");
     assert!(error.contains("SPAWN_WORKSPACE_BACKEND=cow"), "{error}");
     assert!(
         error.contains(BACKEND_MARKER),
@@ -553,7 +553,7 @@ fn a_root_is_claimed_by_one_engine_and_refuses_another() {
     git.mount(&b).unwrap();
     assert_eq!(root_backend(&legacy).unwrap(), Some(WorkspaceBackend::Git));
     let error = claim_root(&legacy, WorkspaceBackend::Cow).expect_err("Git's root");
-    assert!(error.contains("git engine"), "{error}");
+    assert!(error.contains("git backend"), "{error}");
     assert!(
         error.contains("by what the root holds") && !error.contains(BACKEND_MARKER),
         "no marker is named where there is none: {error}"
@@ -625,7 +625,7 @@ fn without_src(store: &LocalWorkspaceStore, agent: &str) -> (spawn_core::id::Wor
     (workspace, view)
 }
 
-/// A special file (a FIFO, which no engine's checkpoint takes) where the
+/// A special file (a FIFO, which no backend's checkpoint takes) where the
 /// start needs a directory refuses the set-aside before anything moves.
 #[test]
 fn a_set_aside_blocked_by_a_special_file_changes_nothing_and_is_retried() {
@@ -669,8 +669,8 @@ fn a_cow_set_aside_blocked_by_a_file_over_the_cap_changes_nothing_and_is_retried
     store.unmount(&workspace).unwrap();
 }
 
-/// A directory at `<root>/<branch>` this engine did not make (another
-/// engine's workspace) is never taken for one it set aside: refused, the
+/// A directory at `<root>/<branch>` this backend did not make (another
+/// backend's workspace) is never taken for one it set aside: refused, the
 /// branch unmoved.
 #[test]
 fn a_set_aside_over_another_engines_directory_is_refused() {

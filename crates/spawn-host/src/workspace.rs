@@ -1,15 +1,16 @@
 //! The workspace store of the machine Spawn runs on: one type over the
-//! three engines ([`GitWorkspace`], [`CowWorkspace`] and, on Linux,
-//! [`OverlayWorkspace`]), told apart only here, as [`crate::LocalTerminalHost`]
-//! tells the terminal hosts apart.
+//! five workspace backends ([`GitWorkspace`], [`CowWorkspace`], on Linux
+//! [`OverlayWorkspace`], [`ShadowD6Workspace`] and [`D6Workspace`]), told
+//! apart only here, as [`crate::LocalTerminalHost`] tells the terminal hosts
+//! apart.
 //!
-//! Every engine obeys the same [`WorkspaceStore`] contract (the branch lock
+//! Every backend obeys the same [`WorkspaceStore`] contract (the branch lock
 //! under `mount_when`, `unmount_when`, `hold` and `set_aside_when`, the
 //! `is_mounted` the Bridge's recovery asks), so a caller holds a
-//! [`LocalWorkspaceStore`] and never asks which engine it is, except to say
+//! [`LocalWorkspaceStore`] and never asks which backend it is, except to say
 //! it ([`LocalWorkspaceStore::backend_name`]) or to launch a process into an
-//! overlay ([`LocalWorkspaceStore::launch_arguments`]). An engine is chosen
-//! in one place ([`WorkspaceBackend`]), and a root runs one engine only
+//! overlay ([`LocalWorkspaceStore::launch_arguments`]). A backend is chosen
+//! in one place ([`WorkspaceBackend`]), and a root runs one backend only
 //! ([`claim_root`]).
 //!
 //! Build-artifact deduplication ([`crate::cas_dedup`]) is a helper of the
@@ -156,12 +157,12 @@ impl std::fmt::Debug for D6ShadowOptions {
 /// build artifacts ([`LocalWorkspaceStore::cas_root`]).
 pub const CAS_DIRECTORY: &str = ".cas";
 
-/// The file under a workspace root that names the one engine its
+/// The file under a workspace root that names the one backend its
 /// workspaces run on ([`claim_root`]).
 pub const BACKEND_MARKER: &str = ".spawn-workspace-backend";
 
-/// The five engines a [`LocalWorkspaceStore`] can be, by name. The one
-/// place an engine is chosen ([`WorkspaceBackend::auto_with`]): the
+/// The five backends a [`LocalWorkspaceStore`] can be, by name. The one
+/// place a backend is chosen ([`WorkspaceBackend::auto_with`]): the
 /// constructors here and `spawn`'s `SPAWN_WORKSPACE_BACKEND` both use it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkspaceBackend {
@@ -189,7 +190,7 @@ impl WorkspaceBackend {
         }
     }
 
-    /// The engine `name` names ([`Self::name`]), exactly.
+    /// The backend `name` names ([`Self::name`]), exactly.
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "git" => Some(Self::Git),
@@ -201,7 +202,7 @@ impl WorkspaceBackend {
         }
     }
 
-    /// The engine "the cheapest supported" means, given whether the root's
+    /// The backend "the cheapest supported" means, given whether the root's
     /// file system clones copy-on-write: Cow where it does, else Git. Never
     /// the overlay and never opt-in `d6`/`d6-shadow`.
     pub fn auto_with(clones: bool) -> Self {
@@ -234,11 +235,11 @@ pub const fn backends_compatible(existing: WorkspaceBackend, requested: Workspac
     )
 }
 
-/// The engine `root`'s workspaces run on, read and never written: the one
+/// The backend `root`'s workspaces run on, read and never written: the one
 /// its [`BACKEND_MARKER`] names, else the one what is there shows (a root
 /// from before the marker: `.cow/` is Cow's, `.overlay/` the overlay's, `.d6/`
 /// native D6's, `.d6-shadow/` shadow D6's, any workspace directory Git's),
-/// else `None` (a new or empty root). A marker that names no engine is an error.
+/// else `None` (a new or empty root). A marker that names no backend is an error.
 pub fn root_backend(root: &Path) -> std::io::Result<Option<WorkspaceBackend>> {
     match std::fs::read_to_string(root.join(BACKEND_MARKER)) {
         Ok(text) => {
@@ -248,7 +249,7 @@ pub fn root_backend(root: &Path) -> std::io::Result<Option<WorkspaceBackend>> {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "{} names no workspace engine: {:?}",
+                            "{} names no workspace backend: {:?}",
                             root.join(BACKEND_MARKER).display(),
                             text.trim()
                         ),
@@ -286,8 +287,8 @@ pub fn root_backend(root: &Path) -> std::io::Result<Option<WorkspaceBackend>> {
 /// Claim `root` for `backend`: the first store of any process to use the
 /// root writes its [`BACKEND_MARKER`] (made beside it and linked into
 /// place, so two processes racing to claim it see one winner), and every
-/// later one must ask for a compatible engine ([`backends_compatible`]). Refused,
-/// with nothing written, when the root belongs to an incompatible engine
+/// later one must ask for a compatible backend ([`backends_compatible`]). Refused,
+/// with nothing written, when the root belongs to an incompatible backend
 /// ([`root_backend`]): pure `git` and pure `d6` never share a root without
 /// an explicit cutover, while `d6-shadow` can safely run over a `git` root.
 pub fn claim_root(root: &Path, backend: WorkspaceBackend) -> Result<(), String> {
@@ -315,7 +316,7 @@ pub fn claim_root(root: &Path, backend: WorkspaceBackend) -> Result<(), String> 
             " or use another SPAWN_WORKSPACE_ROOT"
         };
         format!(
-            "workspace root {} is the {} engine's ({why}); refusing to run the {} engine on \
+            "workspace root {} is the {} backend's ({why}); refusing to run the {} backend on \
              it: set SPAWN_WORKSPACE_BACKEND={} (or auto, which follows the root){cutover_hint}",
             root.display(),
             there.name(),
@@ -478,7 +479,7 @@ impl LocalWorkspaceStore {
         }
     }
 
-    /// Which engine this is.
+    /// Which backend this is.
     pub fn backend(&self) -> WorkspaceBackend {
         match self {
             Self::Git(_) => WorkspaceBackend::Git,
@@ -490,7 +491,7 @@ impl LocalWorkspaceStore {
         }
     }
 
-    /// Which engine this is: `"git"`, `"cow"`, `"overlay"`, `"d6-shadow"` or `"d6"`.
+    /// Which backend this is: `"git"`, `"cow"`, `"overlay"`, `"d6-shadow"` or `"d6"`.
     pub fn backend_name(&self) -> &'static str {
         self.backend().name()
     }
@@ -530,7 +531,7 @@ impl LocalWorkspaceStore {
         }
     }
 
-    /// Claim this store's root for its engine ([`claim_root`]).
+    /// Claim this store's root for its backend ([`claim_root`]).
     pub fn claim(&self) -> Result<(), String> {
         claim_root(self.root(), self.backend())
     }

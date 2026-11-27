@@ -67,7 +67,7 @@ pub(crate) const PRUNE_EVERY: Duration = Duration::from_mins(10);
 pub(crate) const CAS_GRACE: Duration = Duration::from_hours(1);
 
 /// Builds a store for one bare repository: every store of a process is
-/// the one engine `SPAWN_WORKSPACE_BACKEND` chose for the root
+/// the one backend `SPAWN_WORKSPACE_BACKEND` chose for the root
 /// ([`crate::config::WorkspaceSettings`]).
 pub(crate) type Factory = Arc<dyn Fn(&Path) -> LocalWorkspaceStore + Send + Sync>;
 
@@ -530,7 +530,7 @@ pub(crate) fn workspace_settings_readonly(
         && !spawn_host::workspace::backends_compatible(there, settings.active)
     {
         return Err(format!(
-            "workspace root {} is claimed by {} engine, refusing {}",
+            "workspace root {} is claimed by {} backend, refusing {}",
             root.display(),
             there.name(),
             settings.active.name()
@@ -1160,7 +1160,7 @@ impl MissionWorkspaces {
     /// [`WorkspaceStore::set_aside`] through the routed store, only while
     /// `ready` says the agent is idle, asked under the branch's lock
     /// ([`LocalWorkspaceStore::set_aside_when`], the same rule in every
-    /// engine).
+    /// backend).
     pub(crate) fn set_aside_when(
         &self,
         branch: &BranchName,
@@ -3215,7 +3215,7 @@ mod tests {
     }
 
     /// A bare repository whose `main` holds a README and a source file.
-    fn engine_repo(base: &Path) -> std::path::PathBuf {
+    fn backend_repo(base: &Path) -> std::path::PathBuf {
         let seed = base.join("seed");
         std::fs::create_dir_all(seed.join("src")).expect("seed directory");
         let seed_path = seed.to_string_lossy().to_string();
@@ -3229,28 +3229,28 @@ mod tests {
         repo
     }
 
-    /// Every engine through [`MissionWorkspaces`], for an agent no mission
+    /// Every backend through [`MissionWorkspaces`], for an agent no mission
     /// owns (routed to the default store): the same mount, cancelled mount,
     /// hold, checkpoint, set-aside (waiting, then made, then the same
     /// answer again) and unmount, with the CAS helper on. Cow and the
     /// overlay run for real where this host supports them.
     #[test]
-    #[allow(clippy::too_many_lines)] // one engine's whole run, step by step
+    #[allow(clippy::too_many_lines)] // one backend's whole run, step by step
     fn every_engine_runs_alike_through_the_mission_store() {
         use crate::config::{Probes, WorkspaceBackend, WorkspaceSettings};
         use spawn_core::port::{MOUNT_CANCELLED, SetAside, UNMOUNT_IN_USE};
         let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
             "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
         );
-        let schema = spawn_postgres::testing::TestSchema::new("engines");
+        let schema = spawn_postgres::testing::TestSchema::new("backends");
         let store = std::sync::Arc::new(
             spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
                 .expect("connect and migrate"),
         );
         let base =
-            std::env::temp_dir().join(format!("spawn-sources-engines-{}", std::process::id()));
+            std::env::temp_dir().join(format!("spawn-sources-backends-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let repo = engine_repo(&base);
+        let repo = backend_repo(&base);
         let main = git(&["--git-dir", &repo.to_string_lossy(), "rev-parse", "main"]).expect("main");
         let mut ran = Vec::new();
         for configured in [
@@ -3270,7 +3270,7 @@ mod tests {
             let name = settings.active.name();
             ran.push(name);
             let workspaces = settings.one_shot(&repo, &root, store.clone());
-            let agent = format!("agent_engine_{name}");
+            let agent = format!("agent_backend_{name}");
             let branch = BranchName::new(agent.as_str()).expect("branch");
             workspaces.ensure_branch(&branch, None).expect("branch");
             let cancelled = workspaces.mount_when(&branch, &|| Err("not now".to_string()));
@@ -3419,20 +3419,20 @@ mod tests {
         assert!(ran.starts_with(&["git", "cow"]), "{ran:?}");
         #[cfg(target_os = "linux")]
         if spawn_host::overlay_supported_in(&base).is_ok() {
-            assert_eq!(ran, ["git", "cow", "overlay"], "the overlay engine ran");
+            assert_eq!(ran, ["git", "cow", "overlay"], "the overlay backend ran");
         }
         let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The commit of a mission's agent runs through the routed store's
-    /// commit-or-take-back in every engine: a branch gone under the
+    /// commit-or-take-back in every backend: a branch gone under the
     /// mounted workspace is taken back (or made again) under its lock.
     #[test]
     fn a_gone_branch_is_made_again_by_every_engine_through_the_routed_commit() {
         use crate::config::{Probes, WorkspaceBackend, WorkspaceSettings};
         let base = std::env::temp_dir().join(format!("spawn-sources-gone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let repo = engine_repo(&base);
+        let repo = backend_repo(&base);
         for configured in [WorkspaceBackend::Cow, WorkspaceBackend::Overlay] {
             let root = base.join(format!("{configured:?}").to_lowercase());
             let Ok(settings) =
@@ -3591,7 +3591,7 @@ mod tests {
         let pg = std::sync::Arc::new(
             spawn_postgres::PostgresStore::connect_in_schema(url, &schema).expect("connect"),
         );
-        let strict_repo = engine_repo(&base.join("strict-src"));
+        let strict_repo = backend_repo(&base.join("strict-src"));
         let root = base.join("shadow-strict-root");
         let cas =
             std::sync::Arc::new(CasMerkleStore::open(root.join(".d6-shadow/cas")).expect("cas"));
@@ -3644,7 +3644,7 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&base);
-        let repo = engine_repo(&base);
+        let repo = backend_repo(&base);
         let root = base.join("shadow-root");
         let settings =
             WorkspaceSettings::resolve(WorkspaceBackend::D6Shadow, false, &root, &Probes::host())

@@ -1217,7 +1217,7 @@ pub struct CowStats {
 /// The default store stays [`crate::GitWorkspace`]; this one is opt-in
 /// (`SPAWN_WORKSPACE_BACKEND=cow` or `auto` on a file system that clones,
 /// through [`crate::LocalWorkspaceStore`]), on a root of its own: a root
-/// runs one engine ([`crate::claim_root`]). Its git plumbing, branch
+/// runs one backend ([`crate::claim_root`]). Its git plumbing, branch
 /// creation and resolution are the Git store's ([`GitWorkspace`] on the same
 /// repository), and so are the rules of what a checkpoint takes: git's
 /// ignore rules, the engine's runtime files and the size cap
