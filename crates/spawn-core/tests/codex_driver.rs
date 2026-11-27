@@ -4,7 +4,7 @@ use serde_json::json;
 use spawn_core::driver::{
     AGY_DIALOG_RULES, AgentDriver, AgyDriver, Answer, CLAUDE_DIALOG_RULES, CODEX_DIALOG_RULES,
     CODEX_ENV_ALLOWLIST, CODEX_HARD_BLOCK_RULES, CODEX_HOME, ClaudeDriver, CodexDriver,
-    DIALOG_RULES, Dialog, DriverTraits, EngineHome, EngineLaunch, Guard, LineCursor,
+    DIALOG_RULES, Dialog, DriverTraits, EngineHome, EngineLaunch, Guard, LineCursor, NativeSession,
     NativeSessionHook, SessionBinding, TurnSource, codex_arguments, codex_line, driver, drivers,
     excerpt_for, hard_block_for, parse_cli_version, read_codex_screen, table_answer,
     version_matches_tested,
@@ -61,8 +61,7 @@ fn launch_builds_fresh_and_resume_args_and_strict_env_allowlist() {
     let fresh = CodexDriver.launch(
         &home,
         &EngineLaunch {
-            native: Some("should_not_appear_without_resume"),
-            resume: false,
+            session: NativeSession::New("should_not_appear_without_resume"),
             relay: None,
             profile: ModelProfile::Default,
             config_dir: None,
@@ -92,8 +91,7 @@ fn launch_builds_fresh_and_resume_args_and_strict_env_allowlist() {
     let resumed = CodexDriver.launch(
         &home,
         &EngineLaunch {
-            native: Some("0194b1e2-7c4d-7000-8000-000000000001"),
-            resume: true,
+            session: NativeSession::Resume("0194b1e2-7c4d-7000-8000-000000000001"),
             relay: None,
             profile: ModelProfile::Default,
             config_dir: None,
@@ -547,8 +545,7 @@ fn driver_isolation_contracts_enforced_across_all_three_engines() {
     let claude_plan = claude.launch(
         &claude_home,
         &EngineLaunch {
-            native: None,
-            resume: false,
+            session: NativeSession::Unnamed,
             relay: None,
             profile: ModelProfile::Default,
             config_dir: Some("/srv/claude-config"),
@@ -591,8 +588,7 @@ fn driver_isolation_contracts_enforced_across_all_three_engines() {
             .launch(
                 &claude_home,
                 &EngineLaunch {
-                    native: None,
-                    resume: false,
+                    session: NativeSession::Unnamed,
                     relay: None,
                     profile: ModelProfile::Default,
                     config_dir: None,
@@ -608,8 +604,7 @@ fn driver_isolation_contracts_enforced_across_all_three_engines() {
             .launch(
                 &codex_home(),
                 &EngineLaunch {
-                    native: None,
-                    resume: false,
+                    session: NativeSession::Unnamed,
                     relay: None,
                     profile: ModelProfile::Default,
                     config_dir: None,
@@ -620,4 +615,83 @@ fn driver_isolation_contracts_enforced_across_all_three_engines() {
             .environment,
         Vec::<(String, String)>::new()
     );
+}
+
+/// Each [`NativeSession`] gives every driver the arguments the launch gave
+/// before `(native, resume)` became one closed type, read from the base
+/// (0d400b2e) and written out here. The old `(None, true)`, which no longer
+/// has a value, launched exactly like `Unnamed` in all three.
+#[test]
+fn native_session_launch_arguments_match_the_pre_refactor_launch() {
+    let home = |program: &str| EngineHome {
+        program: program.to_string(),
+        sessions: "/h/s".to_string(),
+        model: Some("m-1".to_string()),
+        data_dir: None,
+        isolate_brain: false,
+    };
+    let launch = |driver: &dyn AgentDriver, session| {
+        driver
+            .launch(
+                &home(driver.id()),
+                &EngineLaunch {
+                    session,
+                    relay: None,
+                    profile: ModelProfile::Default,
+                    config_dir: Some("/cfg"),
+                    cwd: Some("/w"),
+                    model: None,
+                },
+            )
+            .arguments
+    };
+    let settings =
+        spawn_core::bridge::claude_settings_in(None, ModelProfile::Default, Some("/cfg"));
+    let claude_base = [
+        "--ax-screen-reader",
+        "--allow-dangerously-skip-permissions",
+        "--settings",
+        settings.as_str(),
+    ];
+    let agy_flags = [
+        "--model",
+        "m-1",
+        "--dangerously-skip-permissions",
+        "--settings",
+        r#"{"toolPermission":"always-proceed","trustedWorkspaces":["/w"]}"#,
+    ];
+    let codex_flags = [
+        "--model",
+        "m-1",
+        "--cd",
+        "/w",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--no-alt-screen",
+        "--no-daemon",
+    ];
+    let cases = [
+        (
+            NativeSession::Unnamed,
+            claude_base.to_vec(),
+            agy_flags.to_vec(),
+            codex_flags.to_vec(),
+        ),
+        (
+            NativeSession::New("sid-1"),
+            [&claude_base[..], &["--session-id", "sid-1"]].concat(),
+            agy_flags.to_vec(),
+            codex_flags.to_vec(),
+        ),
+        (
+            NativeSession::Resume("sid-1"),
+            [&claude_base[..], &["--resume", "sid-1"]].concat(),
+            [&["--conversation", "sid-1"][..], &agy_flags].concat(),
+            [&["resume"][..], &codex_flags, &["sid-1"]].concat(),
+        ),
+    ];
+    for (session, claude, agy, codex) in cases {
+        assert_eq!(launch(&ClaudeDriver, session), claude, "claude {session:?}");
+        assert_eq!(launch(&AgyDriver, session), agy, "agy {session:?}");
+        assert_eq!(launch(&CodexDriver, session), codex, "codex {session:?}");
+    }
 }

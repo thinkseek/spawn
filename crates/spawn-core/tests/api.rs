@@ -8,6 +8,7 @@ use spawn_core::bridge::{
 };
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
+use spawn_core::driver::NativeSession;
 use spawn_core::event::{
     CommandStep, ENGINE, EndCause, EventKind, GlobalPosition, ModelProfile, NewEvent, SessionSeq,
     Source,
@@ -264,8 +265,7 @@ fn screen_reads_the_tail_not_the_history() {
 #[test]
 fn claude_arguments_name_the_session_and_install_no_hooks() {
     let arguments = claude_arguments(
-        Some("native-1"),
-        true,
+        NativeSession::Resume("native-1"),
         &claude_settings(None, ModelProfile::Default),
     );
     assert_eq!(arguments[0], "--ax-screen-reader");
@@ -283,7 +283,7 @@ fn claude_arguments_name_the_session_and_install_no_hooks() {
         arguments[4..],
         ["--resume".to_string(), "native-1".to_string()]
     );
-    let fresh = claude_arguments(Some("native-2"), false, settings);
+    let fresh = claude_arguments(NativeSession::New("native-2"), settings);
     assert_eq!(
         fresh[4..],
         ["--session-id".to_string(), "native-2".to_string()]
