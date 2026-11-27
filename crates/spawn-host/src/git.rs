@@ -51,11 +51,11 @@ pub(crate) use crate::workspace_rules::{CONFLICT_MARKER_SIZE, lock_file, set_asi
 pub use crate::workspace_rules::{
     DEFAULT_MAX_FILE_MB, ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER, MAIN_COPIES, OversizedFile,
     SET_ASIDE_FILES, SET_ASIDE_WAITS, has_conflict_block, has_conflict_block_sized, max_file_bytes,
-    names_files_outside_git, oversized_record,
+    names_files_outside_git, oversized_record, task_head_ref, worker_head_ref,
 };
 use crate::workspace_rules::{
     Oversized, encode_oversized, oversized_digest, oversized_file, oversized_notice_message,
-    parse_oversized,
+    parse_oversized, stale_ref,
 };
 
 /// Distinguishes the staged mounts of one process ([`GitWorkspace::staging_path`]).
@@ -277,20 +277,6 @@ fn listed_paths(listing: &[u8]) -> Vec<TreePath> {
 /// UTF-8 replaced.
 fn shown_paths(paths: &[TreePath]) -> Vec<String> {
     paths.iter().map(TreePath::shown).collect()
-}
-
-/// Bare-repo reference pinning the latest worker-authored `HEAD` commit
-/// graph preserved from `branch`'s mounted workspace (`#103`, `#110`).
-#[must_use]
-pub fn worker_head_ref(branch: &str) -> String {
-    format!("refs/spawn/workers/{branch}/head")
-}
-
-/// Bare-repo reference pinning a task's worker-authored `HEAD` commit graph
-/// at `stage` (`"head"` at report, `"accepted"` at task acceptance).
-#[must_use]
-pub fn task_head_ref(task_id: i64, stage: &str) -> String {
-    format!("refs/spawn/tasks/{task_id}/{stage}")
 }
 
 /// Resolves the worker's inner `.git` repository directory inside `directory`,
@@ -3108,12 +3094,6 @@ pub(crate) type CheckpointPaths = (Vec<TreePath>, Vec<(TreePath, u64)>);
 
 /// `<meta>\t<path>`, an entry of a `-z` tree listing: the meta fields
 /// (ASCII) and the path as bytes.
-/// Where the state of a stale workspace of `branch` is kept
-/// (`GitWorkspace::keep_stale`): never pushed and never landed.
-fn stale_ref(branch: &str) -> String {
-    format!("refs/spawn-stale/{branch}")
-}
-
 /// The refusal of a stale workspace's checkpoint or merge, naming the
 /// snapshot that keeps its state when there is one.
 fn stale_refusal(branch: &str, kept: Option<&str>) -> WorkspaceError {

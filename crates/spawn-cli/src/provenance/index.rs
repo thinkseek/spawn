@@ -1450,7 +1450,7 @@ pub(crate) fn touches_any<'a>(landed: impl IntoIterator<Item = &'a str>, touched
 
 /// The entries of the files over the cap (decision D6) that the workspace
 /// of `agent` left out, as `<root>/.oversized/<agent>` records them
-/// ([`spawn_host::git::oversized_record`]): one `content` entry for each
+/// ([`spawn_host::workspace_rules::oversized_record`]): one `content` entry for each
 /// file recorded with its digest, `after` its `sha256:` digest, `size` its
 /// bytes, no `before` (git never held it) and no origin. A path the
 /// landing's own entries hold, or one recorded without a digest (a record
@@ -1461,7 +1461,7 @@ pub(crate) fn oversized_entries(
     entries: &[ProvEntryInput],
 ) -> Vec<ProvEntryInput> {
     let taken: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-    spawn_host::git::oversized_record(root, agent)
+    spawn_host::workspace_rules::oversized_record(root, agent)
         .into_iter()
         .filter_map(|file| {
             let digest = file.digest?;

@@ -374,6 +374,76 @@ pub fn has_conflict_block_sized(bytes: &[u8], shortest: usize) -> bool {
     false
 }
 
+/// Ref prefix where Spawn preserves the latest worker-authored `HEAD` for a branch.
+pub const WORKER_HEAD_REF_PREFIX: &str = "refs/spawn/workers/";
+
+/// Ref prefix where Spawn pins task-scoped worker `HEAD` commits by stage.
+pub const TASK_HEAD_REF_PREFIX: &str = "refs/spawn/tasks/";
+
+/// Ref prefix for worker-scoped branch refs under `refs/heads/`.
+pub const SPAWN_BRANCH_REF_PREFIX: &str = "refs/heads/spawn/";
+
+/// Ref prefix where stale workspace checkpoints are preserved.
+pub const STALE_REF_PREFIX: &str = "refs/spawn-stale/";
+
+/// Bare-repo or D6 reference pinning the latest worker-authored `HEAD` commit
+/// graph preserved from `branch`'s mounted workspace (`#103`, `#110`).
+#[must_use]
+pub fn worker_head_ref(branch: &str) -> String {
+    format!("{WORKER_HEAD_REF_PREFIX}{branch}/head")
+}
+
+/// Bare-repo or D6 reference pinning a task's worker-authored `HEAD` commit
+/// graph at `stage` (`"head"` at report, `"accepted"` at task acceptance).
+#[must_use]
+pub fn task_head_ref(task_id: i64, stage: &str) -> String {
+    format!("{TASK_HEAD_REF_PREFIX}{task_id}/{stage}")
+}
+
+/// Worker branch reference under `refs/heads/spawn/`.
+#[must_use]
+pub fn spawn_branch_ref(branch: &str) -> String {
+    format!("{SPAWN_BRANCH_REF_PREFIX}{branch}")
+}
+
+/// Reference where a stale workspace's diverged work is kept (`never pushed`,
+/// `never landed`).
+#[must_use]
+pub fn stale_ref(branch: &str) -> String {
+    format!("{STALE_REF_PREFIX}{branch}")
+}
+
+/// Candidate full ref names checked in priority order when resolving a task's
+/// preserved commits for review, diff, or landing.
+#[must_use]
+pub fn candidate_task_refs(task_id: i64, agent_id: &str) -> Vec<String> {
+    let mut refs = vec![task_head_ref(task_id, "head")];
+    if !agent_id.is_empty() {
+        refs.push(worker_head_ref(agent_id));
+        refs.push(spawn_branch_ref(agent_id));
+    }
+    refs
+}
+
+/// Whether `ref_name` is a protected per-task durable ref (`refs/spawn/tasks/<id>/*`).
+#[must_use]
+pub fn is_protected_task_ref(ref_name: &str) -> bool {
+    ref_name.starts_with(TASK_HEAD_REF_PREFIX)
+}
+
+/// Whether `ref_name` is an internal Spawn coordination, preservation, or
+/// staging reference outside user-facing branches and tags.
+#[must_use]
+pub fn is_spawn_internal_ref(ref_name: &str) -> bool {
+    ref_name.starts_with(TASK_HEAD_REF_PREFIX)
+        || ref_name.starts_with(WORKER_HEAD_REF_PREFIX)
+        || ref_name.starts_with(STALE_REF_PREFIX)
+        || ref_name.starts_with("refs/spawn-integrate/")
+        || ref_name.starts_with("refs/spawn-restore/")
+        || ref_name.starts_with("refs/spawn-owner/")
+        || ref_name.starts_with("refs/d6-stage/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +494,48 @@ mod tests {
         for bad in ["", ".", "..", "../secret", "a/b", "agent_a/"] {
             assert!(oversized_record(&root, bad).is_empty(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn pure_ref_naming_helpers_preserve_contract() {
+        assert_eq!(worker_head_ref("w-1"), "refs/spawn/workers/w-1/head");
+        assert_eq!(task_head_ref(42, "head"), "refs/spawn/tasks/42/head");
+        assert_eq!(
+            task_head_ref(42, "accepted"),
+            "refs/spawn/tasks/42/accepted"
+        );
+        assert_eq!(spawn_branch_ref("w-1"), "refs/heads/spawn/w-1");
+        assert_eq!(stale_ref("w-1"), "refs/spawn-stale/w-1");
+
+        assert_eq!(
+            candidate_task_refs(42, "w-1"),
+            vec![
+                "refs/spawn/tasks/42/head",
+                "refs/spawn/workers/w-1/head",
+                "refs/heads/spawn/w-1",
+            ]
+        );
+        assert_eq!(
+            candidate_task_refs(42, ""),
+            vec!["refs/spawn/tasks/42/head"]
+        );
+
+        assert!(is_protected_task_ref("refs/spawn/tasks/42/head"));
+        assert!(!is_protected_task_ref("refs/spawn/workers/w-1/head"));
+
+        for internal in [
+            "refs/spawn/tasks/42/head",
+            "refs/spawn/workers/w-1/head",
+            "refs/spawn-stale/w-1",
+            "refs/spawn-integrate/w-1",
+            "refs/spawn-restore/w-1",
+            "refs/spawn-owner/push-1",
+            "refs/d6-stage/run-1",
+        ] {
+            assert!(is_spawn_internal_ref(internal), "{internal}");
+        }
+        assert!(!is_spawn_internal_ref("refs/heads/main"));
+        assert!(!is_spawn_internal_ref("refs/heads/spawn/w-1"));
+        assert!(!is_spawn_internal_ref("refs/tags/v1.0"));
     }
 }
