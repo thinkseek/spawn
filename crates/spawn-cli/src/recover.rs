@@ -65,11 +65,12 @@
 use std::collections::BTreeMap;
 use std::path::Path as FsPath;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Map, Value, json};
 
 use spawn_core::command::CommandAction;
-use spawn_core::event::ENGINE;
+pub(crate) use spawn_core::control::{InterruptionCause as Cause, RecoveryPath as Path};
+use spawn_core::event::{ENGINE, EndCause};
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
 use spawn_core::port::{CommandQueue, ServerSeen, TerminalHost, TerminalServer};
 use spawn_postgres::PostgresStore;
@@ -182,35 +183,15 @@ pub(crate) fn model_retries(value: Option<&str>) -> Result<u32, String> {
         })
 }
 
-/// One cause of an interruption: the whole vocabulary, and the only one the
-/// record's schema accepts (`spawn_host_record`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Cause {
-    Exited,
-    Crashed,
-    MemoryLimit,
-    ContextExhausted,
-    ModelUnavailable,
-    ModelAuth,
-    /// The model refused the request in a way no retry changes (a 400 of
-    /// another kind than an exhausted context, a 404, a 413): the engine
-    /// ended after it with no progress.
-    ModelError,
-    HostRestart,
-    DatabaseUnavailable,
-    DiskFull,
-    Budget,
-    Stopped,
-    /// A restart's Stop ended it (`spawn task restart`): the dispatcher,
-    /// not the recovery, resumes the session.
-    Restarted,
-    /// A reassign's Stop ended it (`spawn task reassign`): its task went to
-    /// a fresh worker, and nothing revives this one.
-    Reassigned,
+/// Wire names and default recovery paths for [`Cause`]
+/// (`spawn_host_record`'s interruption cause vocabulary).
+pub(crate) trait CauseExt {
+    fn name(self) -> &'static str;
+    fn path(self) -> Path;
 }
 
-impl Cause {
-    pub(crate) fn name(self) -> &'static str {
+impl CauseExt for Cause {
+    fn name(self) -> &'static str {
         match self {
             Self::Exited => "exited",
             Self::Crashed => "crashed",
@@ -230,7 +211,7 @@ impl Cause {
     }
 
     /// The way back this cause takes.
-    pub(crate) fn path(self) -> Path {
+    fn path(self) -> Path {
         match self {
             Self::Exited | Self::Crashed | Self::MemoryLimit | Self::HostRestart => Path::Resume,
             Self::ContextExhausted | Self::Budget => Path::Handoff,
@@ -243,17 +224,13 @@ impl Cause {
     }
 }
 
-/// The way back from an interruption.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Path {
-    Resume,
-    Handoff,
-    Wait,
-    Final,
+/// Wire names for [`Path`] (`spawn_host_record`'s recovery path vocabulary).
+pub(crate) trait PathExt {
+    fn name(self) -> &'static str;
 }
 
-impl Path {
-    pub(crate) fn name(self) -> &'static str {
+impl PathExt for Path {
+    fn name(self) -> &'static str {
         match self {
             Self::Resume => "resume",
             Self::Handoff => "handoff",
@@ -372,20 +349,56 @@ impl ToolFailure {
     }
 }
 
+/// Cause read from a persisted `execution.ended` event: the Bridge's three
+/// current [`EndCause`] variants plus the historical `memory_limit` variant
+/// emitted on 2026-11-08 (`4492e363..47717497`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecordedEndCause {
+    Exited,
+    Stopped,
+    Lost,
+    MemoryLimit,
+}
+
+impl From<EndCause> for RecordedEndCause {
+    fn from(cause: EndCause) -> Self {
+        match cause {
+            EndCause::Exited => Self::Exited,
+            EndCause::Stopped => Self::Stopped,
+            EndCause::Lost => Self::Lost,
+        }
+    }
+}
+
 /// The engine's end, as `execution.ended` recorded it.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct End {
-    #[serde(default)]
     pub(crate) event_id: i64,
-    /// `exited`, `stopped` or `lost` (the Bridge's three).
-    #[serde(default)]
-    pub(crate) cause: String,
-    #[serde(default)]
+    pub(crate) ended_at_ms: i64,
+    /// `exited`, `stopped` or `lost` (the Bridge's three), plus legacy
+    /// `memory_limit` written on 2026-11-08.
+    pub(crate) cause: RecordedEndCause,
     pub(crate) exit_code: Option<i32>,
-    #[serde(default)]
     pub(crate) signal: Option<i32>,
-    #[serde(default)]
     pub(crate) evidence: Option<String>,
+}
+
+/// Lifecycle state of an execution from `RECOVERY_FACTS`: either live
+/// (`ended_at_ms` and all `execution.ended` fields absent) or ended with
+/// its full `execution.ended` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExecutionState {
+    Running,
+    Ended(End),
+}
+
+/// The stop-like command action returned by `RECOVERY_FACTS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StopAction {
+    Stop,
+    Discard,
 }
 
 /// A Stop or Discard into the session during the execution.
@@ -396,9 +409,7 @@ pub(crate) struct Stop {
     pub(crate) principal: String,
     #[serde(default)]
     pub(crate) key: String,
-    /// `stop` or `discard`.
-    #[serde(default)]
-    pub(crate) action: String,
+    pub(crate) action: StopAction,
     #[serde(default)]
     pub(crate) created_at_ms: i64,
     #[serde(default)]
@@ -440,9 +451,10 @@ impl Stop {
 pub(crate) struct Facts<'a> {
     /// The end of the execution, when it ended.
     pub(crate) end: Option<&'a End>,
-    /// A Stop or Discard from a person, the supervisor or a cancelled task
-    /// (never the recovery's own).
-    pub(crate) stop: Option<&'a Stop>,
+    /// A Stop or Discard from a person, the supervisor, a cancelled task, or
+    /// the dispatcher's restart/reassign (never the recovery's own),
+    /// paired with its attribution.
+    pub(crate) stop: Option<StopFact<'a>>,
     /// The integrator's over-budget record of the task
     /// (`{"event_id", "record": {"budget", ...}}`).
     pub(crate) over_budget: Option<&'a Value>,
@@ -459,19 +471,31 @@ pub(crate) struct Facts<'a> {
     /// The failed turn the engine ended after, with no progress since, when
     /// the model refused it for good ([`Turn::model_error`]).
     pub(crate) model_error: Option<&'a Turn>,
-    /// Whether the session is a retired resident, or its task cancelled:
-    /// how a `stopped` end came about, in its evidence.
+    /// Whether the session is a retired resident: how a `stopped` end came
+    /// about, in its evidence.
     pub(crate) retired: bool,
-    pub(crate) task_cancelled: bool,
-    /// The Stop that ended it was a restart's or a reassign's, the
-    /// dispatcher's own, as its record names it ([`moved`]).
-    pub(crate) moved: Option<Moved>,
 }
 
-/// What a restart or a reassign did to an execution: its Stop, the
-/// dispatcher's own, keyed as the record gives it.
+impl Facts<'_> {
+    pub(crate) fn task_cancelled(&self) -> bool {
+        matches!(
+            self.stop,
+            Some(StopFact {
+                kind: StopKind::CancelledTask,
+                ..
+            })
+        )
+    }
+}
+
+/// How the dispatcher attributed the reaching external Stop that ended an
+/// execution, when the dispatcher sent it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Moved {
+pub(crate) enum StopKind {
+    /// A person's, the supervisor's, or an unattributed Stop/Discard.
+    Other,
+    /// The dispatcher's cancel-stop (`cancel-stop-<task>-<execution>`).
+    CancelledTask,
     /// `restart-<task>-<n>-stop`, of the task's latest `task.restarted`
     /// (`n`).
     Restarted { task: i64, n: i64 },
@@ -484,48 +508,49 @@ pub(crate) enum Moved {
     },
 }
 
+/// The reaching external Stop (never the recovery's own) paired with its
+/// dispatcher attribution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StopFact<'a> {
+    pub(crate) stop: &'a Stop,
+    pub(crate) kind: StopKind,
+}
+
 /// The evidence of a `restarted` or `reassigned` end: the Stop that ended
 /// it (its command, principal, action and key) and what moved the work
 /// (the task and its `n`; the task, the new one and its worker's session,
 /// `to_session`).
-fn moved_evidence(facts: &Facts<'_>, evidence: &mut Map<String, Value>) {
-    if let Some(stop) = facts.stop {
-        evidence.insert("command_id".to_string(), json!(stop.command_id));
-        evidence.insert("principal".to_string(), json!(stop.principal));
-        evidence.insert("command".to_string(), json!(stop.action));
-        evidence.insert("key".to_string(), json!(stop.key));
-    }
-    match &facts.moved {
-        Some(Moved::Restarted { task, n }) => {
+fn moved_evidence(stop_fact: &StopFact<'_>, evidence: &mut Map<String, Value>) {
+    let stop = stop_fact.stop;
+    evidence.insert("command_id".to_string(), json!(stop.command_id));
+    evidence.insert("principal".to_string(), json!(stop.principal));
+    evidence.insert("command".to_string(), json!(stop.action));
+    evidence.insert("key".to_string(), json!(stop.key));
+    match &stop_fact.kind {
+        StopKind::Restarted { task, n } => {
             evidence.insert("task".to_string(), json!(task));
             evidence.insert("n".to_string(), json!(n));
         }
-        Some(Moved::Reassigned {
+        StopKind::Reassigned {
             task,
             to_task,
             to_session,
-        }) => {
+        } => {
             evidence.insert("task".to_string(), json!(task));
             evidence.insert("to_task".to_string(), json!(to_task));
             evidence.insert("to_session".to_string(), json!(to_session));
         }
-        None => {}
+        StopKind::Other | StopKind::CancelledTask => {}
     }
 }
 
-/// The dispatcher's Stop an execution ended on, by its purpose, from its
-/// Stops (`stops`, oldest first): the latest Stop that may have stopped it,
-/// the recovery's own aside, when it is the dispatcher's; a retry of the
-/// dispatcher's Stop (`stop-<execution>-retry-<n>`, [`crate::dispatch`]'s
-/// pursuit of a Stop that failed) stands for the first Stop it retries, the
-/// dispatcher's first that is not a retry. `None` when the latest is anyone
-/// else's.
-fn dispatchers_stop(stops: &[Stop]) -> Option<&Stop> {
+/// The dispatcher's original Stop when `last` (the latest Stop that may
+/// have stopped the execution, excluding the recovery's own) was sent by
+/// the dispatcher; a retry of the dispatcher's Stop
+/// (`stop-<execution>-retry-<n>`) stands for the first non-retry Stop it
+/// retries. `None` when `last` is anyone else's.
+fn dispatchers_stop<'a>(stops: &'a [Stop], last: &'a Stop) -> Option<&'a Stop> {
     let dispatcher = crate::dispatch::DISPATCHER;
-    let last = stops
-        .iter()
-        .rev()
-        .find(|stop| !stop.ours() && stop.reached())?;
     if last.principal != dispatcher {
         return None;
     }
@@ -538,23 +563,7 @@ fn dispatchers_stop(stops: &[Stop]) -> Option<&Stop> {
     }
 }
 
-/// Whether the execution whose Stops are `stops` ended on the dispatcher's
-/// stop of a cancelled task's turn ([`Stop::cancelled_task`]), sent first
-/// or reached only by its retry ([`dispatchers_stop`]).
-pub(crate) fn task_cancelled(stops: &[Stop]) -> bool {
-    dispatchers_stop(stops).is_some_and(Stop::cancelled_task)
-}
-
-/// The restart or reassign that ended an execution of `session`, from its
-/// Stops (`stops`, oldest first) and the mission rows: the latest Stop that
-/// may have stopped it, the recovery's own aside, is the dispatcher's
-/// (principal `spawn-dispatch`), keyed by a restart of the task's latest
-/// `task.restarted` or by the reassign its `task.cancelled` names; a retry
-/// of the dispatcher's Stop (`stop-<execution>-retry-<n>`) carries the
-/// purpose of the first Stop it retries. A Stop from anyone else, whatever
-/// its key, is none: that end is `stopped`.
-pub(crate) fn moved(stops: &[Stop], session: &str, work: &Work) -> Option<Moved> {
-    let stop = dispatchers_stop(stops)?;
+fn moved_from_stop(stop: &Stop, session: &str, work: &Work) -> Option<StopKind> {
     if let Some((task, n)) = stop
         .key
         .strip_prefix("restart-")
@@ -570,7 +579,7 @@ pub(crate) fn moved(stops: &[Stop], session: &str, work: &Work) -> Option<Moved>
                     && row.session_id == session
                     && row.restart.as_ref().is_some_and(|restart| restart.n == n)
             })
-            .then_some(Moved::Restarted { task, n });
+            .then_some(StopKind::Restarted { task, n });
     }
     let task = stop
         .key
@@ -597,11 +606,32 @@ pub(crate) fn moved(stops: &[Stop], session: &str, work: &Work) -> Option<Moved>
         })
     };
     let (to_task, to_session) = from_rows.or_else(from_cancelled)?;
-    Some(Moved::Reassigned {
+    Some(StopKind::Reassigned {
         task,
         to_task,
         to_session,
     })
+}
+
+/// The latest Stop or Discard that may have stopped an execution of
+/// `session` (never the recovery's own), paired with its dispatcher
+/// attribution (`cancel-stop-`, `restart-`, or `reassign-`) backed by the
+/// mission rows when the dispatcher sent it.
+pub(crate) fn stop_fact<'a>(stops: &'a [Stop], session: &str, work: &Work) -> Option<StopFact<'a>> {
+    let last = stops
+        .iter()
+        .rev()
+        .find(|stop| !stop.ours() && stop.reached())?;
+    let kind = if let Some(origin) = dispatchers_stop(stops, last) {
+        if origin.cancelled_task() {
+            StopKind::CancelledTask
+        } else {
+            moved_from_stop(origin, session, work).unwrap_or(StopKind::Other)
+        }
+    } else {
+        StopKind::Other
+    };
+    Some(StopFact { stop: last, kind })
 }
 
 /// Whether the terminal server that ran an execution is gone, `now` being
@@ -642,13 +672,17 @@ pub(crate) fn server_gone(
 /// memory kill before a host restart, a full disk before a database outage,
 /// a signal before a clean exit.
 pub(crate) fn classify(facts: &Facts<'_>) -> Cause {
-    let end = facts.end.cloned().unwrap_or_default();
-    match (&facts.moved, facts.stop) {
-        (Some(Moved::Restarted { .. }), Some(_)) => return Cause::Restarted,
-        (Some(Moved::Reassigned { .. }), Some(_)) => return Cause::Reassigned,
-        _ => {}
+    if let Some(stop) = &facts.stop {
+        return match stop.kind {
+            StopKind::Restarted { .. } => Cause::Restarted,
+            StopKind::Reassigned { .. } => Cause::Reassigned,
+            StopKind::Other | StopKind::CancelledTask => Cause::Stopped,
+        };
     }
-    if facts.stop.is_some() || end.cause == "stopped" {
+    if facts
+        .end
+        .is_some_and(|end| end.cause == RecordedEndCause::Stopped)
+    {
         return Cause::Stopped;
     }
     if facts.over_budget.is_some() {
@@ -668,12 +702,20 @@ pub(crate) fn classify(facts: &Facts<'_>) -> Cause {
     }
     // The engine's own end after a request the model will never accept:
     // resuming it sends the same request again.
-    if facts.model_error.is_some() && end.cause != "lost" {
+    if facts.model_error.is_some()
+        && facts
+            .end
+            .is_none_or(|end| end.cause != RecordedEndCause::Lost)
+    {
         return Cause::ModelError;
     }
     // A signal, a non-zero code, or a terminal gone while its server lived:
     // the engine did not exit by itself.
-    if end.exit_code.is_some_and(|code| code != 0) || end.signal.is_some() || end.cause == "lost" {
+    if facts.end.is_some_and(|end| {
+        end.exit_code.is_some_and(|code| code != 0)
+            || end.signal.is_some()
+            || end.cause == RecordedEndCause::Lost
+    }) {
         return Cause::Crashed;
     }
     Cause::Exited
@@ -775,7 +817,7 @@ pub(crate) fn model_resumes(executions: &[Executed], current: &str) -> u32 {
         let before = &executions[at - 1];
         if !execution.key.starts_with(KEY_PREFIX)
             || execution.progress
-            || before.last_cause.as_deref() != Some(Cause::ModelUnavailable.name())
+            || before.last_cause != Some(Cause::ModelUnavailable)
         {
             break;
         }
@@ -906,34 +948,11 @@ pub(crate) fn stopped_path(
     }
 }
 
-/// The way back the interruption `last` recorded, its cause's own when it
-/// names none: a cancelled task's Stop is recorded as `resume` where its
-/// cause's default is `final` (GitHub #76), and a wait made final (a
-/// transient model error's retries spent) is never revived, whatever its
-/// cause's own path.
-fn recorded_path(last: &Recorded, cause: Cause) -> Path {
-    match last.path() {
-        Some("resume") => Path::Resume,
-        Some("handoff") => Path::Handoff,
-        Some("wait") => Path::Wait,
-        Some("final") => Path::Final,
-        _ => cause.path(),
-    }
-}
-
-/// Whether `last` is a cancelled task's Stop (its evidence says
-/// `task_cancelled`): its revival must not tell the worker to go on with
-/// the cancelled task.
-fn cancelled_stop(last: &Recorded) -> bool {
-    last.cause() == Some(Cause::Stopped.name())
-        && last.record["evidence"]["task_cancelled"].as_bool() == Some(true)
-}
-
-/// What a handoff's new native session is told of the interruption `last`
-/// of `cause`, after its role or brief; `head` names the branch's head. The
-/// handoff after a cancelled task's Stop does not tell it to carry on.
-fn handoff_interruption(last: &Recorded, cause: Cause, head: &str) -> String {
-    let then = if cancelled_stop(last) {
+/// What a handoff's new native session is told of the interruption `last`,
+/// after its role or brief; `head` names the branch's head. The handoff
+/// after a cancelled task's Stop does not tell it to carry on.
+fn handoff_interruption(last: &Interrupted, head: &str) -> String {
+    let then = if last.is_cancelled_stop() {
         "Your last turn was stopped because its task was cancelled. Do not continue that task \
          and do not write a report for it. Wait at your prompt: Spawn's notice of the cancel \
          and your next task come next."
@@ -943,7 +962,7 @@ fn handoff_interruption(last: &Recorded, cause: Cause, head: &str) -> String {
     format!(
         "\n\nYour previous native session could not go on: {} ({}). This is a new native \
          session in the same Spawn session, workspace and branch{head}. {then}",
-        cause.name(),
+        last.cause.name(),
         describe(last)
     )
 }
@@ -996,96 +1015,342 @@ pub(crate) fn counts_as_failure(errors: &[String]) -> bool {
 
 // --- the facts, as the store returns them -----------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+/// The session's latest execution from `RECOVERY_FACTS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Execution {
     pub(crate) id: String,
-    #[serde(default)]
     pub(crate) started_at_ms: i64,
-    #[serde(default)]
-    pub(crate) ended_at_ms: Option<i64>,
-    #[serde(default)]
-    pub(crate) cause: Option<String>,
-    #[serde(default)]
-    pub(crate) exit_code: Option<i32>,
-    #[serde(default)]
-    pub(crate) signal: Option<i32>,
-    #[serde(default)]
-    pub(crate) evidence: Option<String>,
-    #[serde(default)]
     pub(crate) workspace: Option<String>,
-    #[serde(default)]
-    pub(crate) end_event_id: Option<i64>,
     /// The terminal server its terminal started on, as the Bridge recorded
     /// it (`execution.terminal_started`): none for an execution started
     /// before it was kept, or whose record failed.
-    #[serde(default)]
     pub(crate) terminal_server: Option<TerminalServer>,
+    pub(crate) state: ExecutionState,
 }
 
 impl Execution {
+    pub(crate) fn is_live(&self) -> bool {
+        matches!(self.state, ExecutionState::Running)
+    }
+
     /// The end, as the classification reads it.
-    fn end(&self) -> Option<End> {
-        self.ended_at_ms.map(|_| End {
-            event_id: self.end_event_id.unwrap_or(0),
-            cause: self.cause.clone().unwrap_or_default(),
-            exit_code: self.exit_code,
-            signal: self.signal,
-            evidence: self.evidence.clone(),
+    pub(crate) fn end(&self) -> Option<&End> {
+        match &self.state {
+            ExecutionState::Running => None,
+            ExecutionState::Ended(end) => Some(end),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawExecution {
+    id: String,
+    #[serde(default)]
+    started_at_ms: i64,
+    #[serde(default)]
+    ended_at_ms: Option<i64>,
+    #[serde(default)]
+    cause: Option<RecordedEndCause>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    signal: Option<i32>,
+    #[serde(default)]
+    evidence: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    end_event_id: Option<i64>,
+    #[serde(default)]
+    terminal_server: Option<TerminalServer>,
+}
+
+impl<'de> Deserialize<'de> for Execution {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawExecution::deserialize(deserializer)?;
+        let state = match raw.ended_at_ms {
+            None => {
+                if raw.cause.is_some()
+                    || raw.exit_code.is_some()
+                    || raw.signal.is_some()
+                    || raw.evidence.is_some()
+                    || raw.end_event_id.is_some()
+                {
+                    return Err(de::Error::custom(
+                        "running execution cannot carry execution.ended fields",
+                    ));
+                }
+                ExecutionState::Running
+            }
+            Some(ended_at_ms) => {
+                let cause = raw.cause.ok_or_else(|| {
+                    de::Error::custom("ended execution is missing execution.ended cause")
+                })?;
+                let event_id = raw.end_event_id.filter(|id| *id > 0).ok_or_else(|| {
+                    de::Error::custom("ended execution requires positive end_event_id")
+                })?;
+                ExecutionState::Ended(End {
+                    event_id,
+                    ended_at_ms,
+                    cause,
+                    exit_code: raw.exit_code,
+                    signal: raw.signal,
+                    evidence: raw.evidence,
+                })
+            }
+        };
+        Ok(Self {
+            id: raw.id,
+            started_at_ms: raw.started_at_ms,
+            workspace: raw.workspace,
+            terminal_server: raw.terminal_server,
+            state,
         })
     }
 }
 
-/// A record the recovery wrote about the execution.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Recorded {
-    pub(crate) event_id: i64,
-    #[serde(default)]
-    pub(crate) at_ms: i64,
-    pub(crate) record: Value,
+/// Coupled `(path, due_ms)` contract enforced by `spawn_host_record`:
+/// `final` never carries a numeric `due_ms`; every revival path (`resume`,
+/// `handoff`, `wait`) requires a `due_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoverySchedule {
+    Resume { due_ms: i64 },
+    Handoff { due_ms: i64 },
+    Wait { due_ms: i64 },
+    Final,
 }
 
-impl Recorded {
-    fn is_type(&self, what: &str) -> bool {
-        self.record["type"].as_str() == Some(what)
+impl RecoverySchedule {
+    pub(crate) fn path(self) -> Path {
+        match self {
+            Self::Resume { .. } => Path::Resume,
+            Self::Handoff { .. } => Path::Handoff,
+            Self::Wait { .. } => Path::Wait,
+            Self::Final => Path::Final,
+        }
     }
 
-    fn path(&self) -> Option<&str> {
-        self.record["path"].as_str()
+    pub(crate) fn due_ms(self) -> Option<i64> {
+        match self {
+            Self::Resume { due_ms } | Self::Handoff { due_ms } | Self::Wait { due_ms } => {
+                Some(due_ms)
+            }
+            Self::Final => None,
+        }
+    }
+}
+
+/// Schedule parsed from a persisted `execution.interrupted` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordedSchedule {
+    Explicit(RecoverySchedule),
+    /// Historical record that omitted `path`, or a historical 2026-11-08
+    /// non-`final` record (`4492e363..47717497`) written before
+    /// `spawn_host_record` required numeric `due_ms`.
+    Legacy {
+        path: Option<Path>,
+        due_ms: Option<i64>,
+    },
+}
+
+/// A parsed `execution.interrupted` record from the control stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Interrupted {
+    pub(crate) event_id: i64,
+    pub(crate) at_ms: i64,
+    pub(crate) cause: Cause,
+    pub(crate) schedule: RecordedSchedule,
+    pub(crate) attempt: u32,
+    pub(crate) fact_event_id: i64,
+    pub(crate) evidence: Value,
+}
+
+impl Interrupted {
+    pub(crate) fn explicit_path(&self) -> Option<Path> {
+        match self.schedule {
+            RecordedSchedule::Explicit(schedule) => Some(schedule.path()),
+            RecordedSchedule::Legacy { path, .. } => path,
+        }
     }
 
-    fn cause(&self) -> Option<&str> {
-        self.record["cause"].as_str()
+    /// The way back recorded for this interruption, or its cause's own path
+    /// when a legacy record omitted `path` (GitHub #76).
+    pub(crate) fn effective_path(&self) -> Path {
+        match self.schedule {
+            RecordedSchedule::Explicit(schedule) => schedule.path(),
+            RecordedSchedule::Legacy { path, .. } => path.unwrap_or_else(|| self.cause.path()),
+        }
     }
 
-    fn attempt(&self) -> u32 {
-        self.record["attempt"]
-            .as_u64()
-            .and_then(|attempt| u32::try_from(attempt).ok())
-            .unwrap_or(0)
+    pub(crate) fn due_ms(&self) -> Option<i64> {
+        match self.schedule {
+            RecordedSchedule::Explicit(schedule) => schedule.due_ms(),
+            RecordedSchedule::Legacy { due_ms, .. } => due_ms,
+        }
     }
 
-    fn due_ms(&self) -> Option<i64> {
-        self.record["due_ms"].as_i64()
+    /// Whether this interruption is a cancelled task's Stop (`task_cancelled`
+    /// in evidence): its revival must not tell the worker to continue.
+    pub(crate) fn is_cancelled_stop(&self) -> bool {
+        self.cause == Cause::Stopped && self.evidence["task_cancelled"].as_bool() == Some(true)
+    }
+}
+
+/// A record the recovery wrote about the execution (`execution.interrupted`
+/// or `execution.cleared`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Recorded {
+    Interrupted(Interrupted),
+    Cleared { event_id: i64, at_ms: i64 },
+}
+
+#[derive(Deserialize)]
+struct RawRecorded {
+    event_id: i64,
+    #[serde(default)]
+    at_ms: i64,
+    record: Value,
+}
+
+#[derive(Deserialize)]
+struct RawInterruptedPayload {
+    cause: Cause,
+    #[serde(default)]
+    path: Option<Path>,
+    attempt: u32,
+    #[serde(default)]
+    due_ms: Option<i64>,
+    #[serde(default)]
+    fact_event_id: i64,
+    #[serde(default)]
+    evidence: Value,
+}
+
+impl<'de> Deserialize<'de> for Recorded {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawRecorded::deserialize(deserializer)?;
+        let Some(record_type) = raw.record.get("type").and_then(Value::as_str) else {
+            return Err(de::Error::custom(
+                "recovery record is missing string field `type`",
+            ));
+        };
+        match record_type {
+            "execution.cleared" => Ok(Self::Cleared {
+                event_id: raw.event_id,
+                at_ms: raw.at_ms,
+            }),
+            "execution.interrupted" => {
+                let payload: RawInterruptedPayload =
+                    serde_json::from_value(raw.record).map_err(de::Error::custom)?;
+                if payload.attempt < 1 {
+                    return Err(de::Error::custom(
+                        "execution.interrupted requires attempt >= 1",
+                    ));
+                }
+                let schedule = match (payload.path, payload.due_ms) {
+                    (Some(Path::Final), None) => {
+                        RecordedSchedule::Explicit(RecoverySchedule::Final)
+                    }
+                    (Some(Path::Final), Some(_)) => {
+                        return Err(de::Error::custom(
+                            "final execution.interrupted cannot carry due_ms",
+                        ));
+                    }
+                    (Some(Path::Resume), Some(due_ms)) => {
+                        RecordedSchedule::Explicit(RecoverySchedule::Resume { due_ms })
+                    }
+                    (Some(Path::Handoff), Some(due_ms)) => {
+                        RecordedSchedule::Explicit(RecoverySchedule::Handoff { due_ms })
+                    }
+                    (Some(Path::Wait), Some(due_ms)) => {
+                        RecordedSchedule::Explicit(RecoverySchedule::Wait { due_ms })
+                    }
+                    (Some(path), None) => RecordedSchedule::Legacy {
+                        path: Some(path),
+                        due_ms: None,
+                    },
+                    (None, due_ms) => RecordedSchedule::Legacy { path: None, due_ms },
+                };
+                Ok(Self::Interrupted(Interrupted {
+                    event_id: raw.event_id,
+                    at_ms: raw.at_ms,
+                    cause: payload.cause,
+                    schedule,
+                    attempt: payload.attempt,
+                    fact_event_id: payload.fact_event_id,
+                    evidence: payload.evidence,
+                }))
+            }
+            other => Err(de::Error::custom(format!(
+                "unexpected recovery record type `{other}`"
+            ))),
+        }
+    }
+}
+
+/// Lifecycle outcome of a recovery command in `spawn_commands`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SentOutcome {
+    Pending,
+    Cancelled { finished_at_ms: i64 },
+    Succeeded { finished_at_ms: i64 },
+    Failed { finished_at_ms: i64 },
+}
+
+impl SentOutcome {
+    pub(crate) fn is_failed(self) -> bool {
+        matches!(self, Self::Failed { .. })
     }
 
-    /// The log event the interruption rests on: the `turn.failed` or the
-    /// end it was told from, so the next fact is the next one after it and
-    /// a restarted loop records nothing twice.
-    fn fact_event_id(&self) -> i64 {
-        self.record["fact_event_id"].as_i64().unwrap_or(0)
+    pub(crate) fn finished_at_ms(self) -> Option<i64> {
+        match self {
+            Self::Pending => None,
+            Self::Cancelled { finished_at_ms }
+            | Self::Succeeded { finished_at_ms }
+            | Self::Failed { finished_at_ms } => Some(finished_at_ms),
+        }
     }
 }
 
 /// A command into the session (the recovery's, or anyone's).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Sent {
     pub(crate) key: String,
-    #[serde(default)]
     pub(crate) created_at_ms: i64,
+    pub(crate) outcome: SentOutcome,
+}
+
+#[derive(Deserialize)]
+struct RawSent {
+    key: String,
     #[serde(default)]
-    pub(crate) finished_at_ms: Option<i64>,
+    created_at_ms: i64,
     #[serde(default)]
-    pub(crate) succeeded: Option<bool>,
+    finished_at_ms: Option<i64>,
+    #[serde(default)]
+    succeeded: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for Sent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawSent::deserialize(deserializer)?;
+        let outcome = match (raw.finished_at_ms, raw.succeeded) {
+            (None, None) => SentOutcome::Pending,
+            (None, Some(_)) => {
+                return Err(de::Error::custom(
+                    "pending command cannot carry a succeeded outcome without finished_at_ms",
+                ));
+            }
+            (Some(finished_at_ms), None) => SentOutcome::Cancelled { finished_at_ms },
+            (Some(finished_at_ms), Some(true)) => SentOutcome::Succeeded { finished_at_ms },
+            (Some(finished_at_ms), Some(false)) => SentOutcome::Failed { finished_at_ms },
+        };
+        Ok(Self {
+            key: raw.key,
+            created_at_ms: raw.created_at_ms,
+            outcome,
+        })
+    }
 }
 
 /// One session's facts (`spawn_postgres::RECOVERY_FACTS`).
@@ -1094,7 +1359,7 @@ pub(crate) struct FactsRow {
     pub(crate) session_id: String,
     pub(crate) agent_id: String,
     #[serde(default)]
-    pub(crate) execution: Option<Value>,
+    pub(crate) execution: Option<Execution>,
     #[serde(default)]
     pub(crate) native_session_id: Option<String>,
     #[serde(default)]
@@ -1130,27 +1395,55 @@ struct Candidate {
 
 /// One execution of a session, as the resume rule reads it: when it ran,
 /// whether a revival started it, and whether it made any progress.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Executed {
     pub(crate) id: String,
     pub(crate) started_at_ms: i64,
-    #[serde(default)]
     pub(crate) ended_at_ms: Option<i64>,
-    /// How long it ran, when it ended.
-    #[serde(default)]
-    pub(crate) duration_ms: Option<i64>,
     /// A tool call completed or a turn ended after it started.
-    #[serde(default)]
     pub(crate) progress: bool,
     /// The key of the command that started it: a revival's when it starts
     /// with [`KEY_PREFIX`].
-    #[serde(default)]
     pub(crate) key: String,
     /// The cause of the latest interruption the recovery recorded for it,
     /// if any: an execution that ended on a transient model error reads
-    /// `model_unavailable` ([`model_resumes`]).
+    /// [`Cause::ModelUnavailable`] ([`model_resumes`]).
+    pub(crate) last_cause: Option<Cause>,
+}
+
+#[derive(Deserialize)]
+struct RawExecuted {
+    id: String,
+    started_at_ms: i64,
     #[serde(default)]
-    pub(crate) last_cause: Option<String>,
+    ended_at_ms: Option<i64>,
+    #[serde(default)]
+    duration_ms: Option<i64>,
+    #[serde(default)]
+    progress: bool,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    last_cause: Option<Cause>,
+}
+
+impl<'de> Deserialize<'de> for Executed {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawExecuted::deserialize(deserializer)?;
+        if raw.ended_at_ms.is_none() && raw.duration_ms.is_some() {
+            return Err(de::Error::custom(
+                "running executed entry cannot carry duration_ms",
+            ));
+        }
+        Ok(Self {
+            id: raw.id,
+            started_at_ms: raw.started_at_ms,
+            ended_at_ms: raw.ended_at_ms,
+            progress: raw.progress,
+            key: raw.key,
+            last_cause: raw.last_cause,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1161,25 +1454,27 @@ pub(crate) struct Progress {
     pub(crate) at_ms: i64,
 }
 
-impl FactsRow {
-    pub(crate) fn execution(&self) -> Option<Execution> {
-        self.execution
-            .clone()
-            .and_then(|value| serde_json::from_value(value).ok())
-    }
-}
-
 // --- the loop's state -------------------------------------------------------
+
+/// Whether this loop process has recorded its `host.loop_started` record,
+/// together with the earlier loop's `boot_id` read right before writing it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum LoopStart {
+    #[default]
+    Pending,
+    Recorded {
+        earlier_boot_id: Option<String>,
+    },
+}
 
 /// What the loop knows between passes: the outage it is in, the loop before
 /// it, and when an open wait last re-read its cause. Everything the
 /// decisions rest on is in the log; this is only what no record holds yet.
 #[derive(Debug, Default)]
 pub(crate) struct Recovery {
-    /// This process recorded its `host.loop_started`.
-    started: bool,
-    /// The loop before this one, as it recorded its start.
-    earlier: Option<Value>,
+    /// Whether `host.loop_started` has been written, paired with the
+    /// earlier loop's `boot_id`.
+    start: LoopStart,
     /// The outage in progress, or the one since this pass reached the
     /// database.
     outage: Option<Outage>,
@@ -1188,7 +1483,7 @@ pub(crate) struct Recovery {
     /// Whether this pass left a wait open: its cause (a model that refuses,
     /// a login that expires, a full disk) is cleared by an observation no
     /// append announces, so the loop must run the step again every probe,
-    /// not only when the log moves ([`Self::probing`]).
+    /// not only when the log moves.
     open_waits: bool,
     /// The earliest time a revival this pass left pending is due (a resume
     /// or a handoff behind its backoff): the step must run then, whether
@@ -1199,6 +1494,13 @@ pub(crate) struct Recovery {
 impl Recovery {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    fn earlier_boot_id(&self) -> Option<&str> {
+        match &self.start {
+            LoopStart::Pending => None,
+            LoopStart::Recorded { earlier_boot_id } => earlier_boot_id.as_deref(),
+        }
     }
 
     /// A pass that failed, `error` being one line of why: an outage while
@@ -1313,23 +1615,24 @@ pub(crate) fn step(state: &mut Recovery, world: &World<'_>) -> Result<Vec<String
         .into_iter()
         .map(|(_, session)| session)
         .collect();
-    for Candidate {
-        session_id,
-        agent_id,
-    } in sessions
-    {
-        let (session, agent) = (session_id, agent_id);
-        if !kept(&agent, &session, work, &residents) {
-            continue;
-        }
-        let facts = store
-            .recovery_facts(&SessionId::new(&session).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
-        let row: FactsRow = serde_json::from_value(facts)
-            .map_err(|error| format!("recovery facts of {session}: {error}"))?;
-        if row.execution().is_none() {
-            continue;
-        }
+    let rows = sessions.into_iter().filter_map(
+        |Candidate {
+             session_id,
+             agent_id,
+         }| {
+            if !kept(&agent_id, &session_id, work, &residents) {
+                return None;
+            }
+            let fetched = SessionId::new(&session_id)
+                .map_err(|error| error.to_string())
+                .and_then(|id| store.recovery_facts(&id).map_err(|error| error.to_string()));
+            Some((session_id, fetched))
+        },
+    );
+    visit_pass_rows(rows, &mut lines, |row| {
+        let Some(execution) = row.execution.as_ref() else {
+            return Ok(Vec::new());
+        };
         let records = row.records.clone();
         let mut one = One {
             state,
@@ -1342,14 +1645,15 @@ pub(crate) fn step(state: &mut Recovery, world: &World<'_>) -> Result<Vec<String
             now_ms,
             spawn,
             row: &row,
+            execution,
             records,
             residents: &residents,
             retired: &retired,
             lines: Vec::new(),
         };
         one.run(outage.as_ref())?;
-        lines.extend(one.lines);
-    }
+        Ok(one.lines)
+    })?;
     // The database answered every session this pass read: the outage is
     // over, its records written.
     if outage.is_some() {
@@ -1358,13 +1662,108 @@ pub(crate) fn step(state: &mut Recovery, world: &World<'_>) -> Result<Vec<String
     Ok(lines)
 }
 
+fn redact_delimited_after(
+    text: &str,
+    marker: &str,
+    open: char,
+    close: char,
+    replacement: &str,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(marker) {
+        let prefix_end = pos + marker.len();
+        out.push_str(&rest[..prefix_end]);
+        let after = &rest[prefix_end..];
+        if let Some(after_open) = after.strip_prefix(open) {
+            let mut escaped = false;
+            let mut end_idx = None;
+            for (idx, ch) in after_open.char_indices() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if open == '"' && ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == close {
+                    end_idx = Some(idx + ch.len_utf8());
+                    break;
+                }
+            }
+            if let Some(end) = end_idx {
+                out.push_str(replacement);
+                rest = &after_open[end..];
+                continue;
+            }
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Strip literal unexpected field/variant/string values echoed by serde before
+/// logging malformed `RECOVERY_FACTS` rows.
+fn sanitize_parse_error(raw: &str) -> String {
+    let mut cleaned = redact_delimited_after(raw, "unknown variant ", '`', '`', "`<redacted>`");
+    cleaned = redact_delimited_after(
+        &cleaned,
+        "unexpected recovery record type ",
+        '`',
+        '`',
+        "`<redacted>`",
+    );
+    cleaned = redact_delimited_after(&cleaned, "unknown field ", '`', '`', "`<redacted>`");
+    cleaned = redact_delimited_after(&cleaned, "string ", '"', '"', "\"<redacted>\"");
+    crate::deliver::one_line(&cleaned, 200)
+}
+
+fn parse_session_facts(session: &str, facts: Value) -> Result<FactsRow, String> {
+    serde_json::from_value(facts).map_err(|error| {
+        format!(
+            "recover: skipping {session}: malformed recovery facts ({})",
+            sanitize_parse_error(&error.to_string())
+        )
+    })
+}
+
+/// Stream kept session rows through recovery while isolating malformed `FactsRow`
+/// payloads to their own session; transport/store errors still fail the pass.
+fn visit_pass_rows<I>(
+    rows: I,
+    lines: &mut Vec<String>,
+    mut on_row: impl FnMut(FactsRow) -> Result<Vec<String>, String>,
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = (String, Result<Value, String>)>,
+{
+    for (session, facts_result) in rows {
+        let facts = facts_result?;
+        let row = match parse_session_facts(&session, facts) {
+            Ok(row) => row,
+            Err(skip_line) => {
+                lines.push(skip_line);
+                continue;
+            }
+        };
+        let more = on_row(row)?;
+        lines.extend(more);
+    }
+    Ok(())
+}
+
 impl Recovery {
     /// Record this loop's start once, keeping the loop before it.
     fn record_start(&mut self, store: &PostgresStore, now_ms: i64) -> Result<(), String> {
-        if self.started {
+        if matches!(self.start, LoopStart::Recorded { .. }) {
             return Ok(());
         }
-        self.earlier = store.loop_started().map_err(|error| error.to_string())?;
+        let earlier_boot_id = store
+            .loop_started()
+            .map_err(|error| error.to_string())?
+            .and_then(|earlier| earlier["boot_id"].as_str().map(str::to_string));
         let record = json!({
             "type": "host.loop_started",
             "boot_id": boot_id(),
@@ -1373,7 +1772,7 @@ impl Recovery {
         store
             .host_record(&record)
             .map_err(|error| format!("host.loop_started: {error}"))?;
-        self.started = true;
+        self.start = LoopStart::Recorded { earlier_boot_id };
         Ok(())
     }
 }
@@ -1423,6 +1822,7 @@ struct One<'a> {
     now_ms: i64,
     spawn: &'a str,
     row: &'a FactsRow,
+    execution: &'a Execution,
     /// The execution's recovery records as this pass knows them: what was
     /// read, and what this pass recorded.
     records: Vec<Recorded>,
@@ -1433,8 +1833,8 @@ struct One<'a> {
 
 /// The fact an interruption is told from.
 enum Fact {
-    Turn(Turn),
-    Tool(ToolFailure),
+    Turn { turn: Turn, cause: Cause },
+    Tool { tool: ToolFailure, cause: Cause },
     End(End),
 }
 
@@ -1484,14 +1884,14 @@ struct RevivalEnv<'a> {
     live: bool,
 }
 
-fn resume_text_for(execution_id: &str, last: &Recorded, cause: Cause) -> String {
-    if cancelled_stop(last) {
+fn resume_text_for(execution_id: &str, last: &Interrupted) -> String {
+    if last.is_cancelled_stop() {
         return CANCELLED_REVIVAL.to_string();
     }
     format!(
         "Spawn restarted your engine: execution {execution_id} {} ({}). Continue your task from where \
          you were; what you did is in your workspace.",
-        cause.name(),
+        last.cause.name(),
         describe(last)
     )
 }
@@ -1514,6 +1914,15 @@ fn start_handoff_action(prompt: String, charter: Option<String>) -> CommandActio
     }
 }
 
+fn schedule_for_path(path: Path, due_ms: impl FnOnce() -> i64) -> RecoverySchedule {
+    match path {
+        Path::Resume => RecoverySchedule::Resume { due_ms: due_ms() },
+        Path::Handoff => RecoverySchedule::Handoff { due_ms: due_ms() },
+        Path::Wait => RecoverySchedule::Wait { due_ms: due_ms() },
+        Path::Final => RecoverySchedule::Final,
+    }
+}
+
 /// Plan the next `<key>-r<n>` retry after a failed revival command, preserving
 /// `build_action` so a failed handoff `Start` retries as `Start` rather than `Resume`.
 fn plan_retry_action(
@@ -1528,7 +1937,7 @@ fn plan_retry_action(
         .iter()
         .filter(|sent| is_retry_key(&sent.key, &retry_prefix))
         .collect();
-    if retries.iter().any(|sent| sent.succeeded != Some(false)) {
+    if retries.iter().any(|sent| !sent.outcome.is_failed()) {
         return RevivalPlan::Idle;
     }
     let failures = u32::try_from(retries.len())
@@ -1537,7 +1946,7 @@ fn plan_retry_action(
     let failed_at = commands
         .iter()
         .filter(|sent| sent.key == key || is_retry_key(&sent.key, &retry_prefix))
-        .filter_map(|sent| sent.finished_at_ms)
+        .filter_map(|sent| sent.outcome.finished_at_ms())
         .max()
         .unwrap_or(now_ms);
     let due = resume_due(config.resume_backoff, failures, Some(failed_at), now_ms);
@@ -1556,10 +1965,10 @@ fn plan_retry_action(
 /// failure as `CommandAction::Start`) a new native session once stopped.
 fn plan_handoff(
     env: &RevivalEnv<'_>,
-    last: &Recorded,
+    last: &Interrupted,
     handoff_prompt: impl FnOnce() -> (String, Option<String>),
 ) -> RevivalPlan {
-    let key = key(env.execution_id, last.attempt());
+    let key = key(env.execution_id, last.attempt);
     let stop = format!("{key}-stop");
     if env.live {
         if env.commands.iter().any(|sent| sent.key == stop) {
@@ -1572,12 +1981,16 @@ fn plan_handoff(
         }));
     }
     if let Some(sent) = env.commands.iter().find(|sent| sent.key == key) {
-        return match sent.succeeded {
-            None | Some(true) => RevivalPlan::Idle,
-            Some(false) => plan_retry_action(env.commands, env.config, env.now_ms, &key, || {
-                let (prompt, charter) = handoff_prompt();
-                start_handoff_action(prompt, charter)
-            }),
+        return match sent.outcome {
+            SentOutcome::Pending
+            | SentOutcome::Cancelled { .. }
+            | SentOutcome::Succeeded { .. } => RevivalPlan::Idle,
+            SentOutcome::Failed { .. } => {
+                plan_retry_action(env.commands, env.config, env.now_ms, &key, || {
+                    let (prompt, charter) = handoff_prompt();
+                    start_handoff_action(prompt, charter)
+                })
+            }
         };
     }
     let due = last.due_ms().unwrap_or(env.now_ms);
@@ -1595,12 +2008,12 @@ fn plan_handoff(
 /// Plan one periodic retry of an expired login while the credentials file holds.
 fn plan_auth_retry(
     env: &RevivalEnv<'_>,
-    last: &Recorded,
+    last: &Interrupted,
     native_bound: bool,
     failed_resumes: u32,
     handoff_prompt: impl FnOnce() -> (String, Option<String>),
 ) -> RevivalPlan {
-    let prefix = key(env.execution_id, last.attempt());
+    let prefix = key(env.execution_id, last.attempt);
     let auth_prefix = format!("{prefix}-auth-");
     let tried = env
         .commands
@@ -1622,7 +2035,7 @@ fn plan_auth_retry(
         AuthRetry::Input => RevivalPlan::Submit(Box::new(PlannedCommand {
             key: retry_key,
             action: CommandAction::Input {
-                text: One::input_text(last, Cause::ModelAuth),
+                text: One::input_text(last),
                 tags: Vec::new(),
             },
             note: "retrying the expired login",
@@ -1630,7 +2043,7 @@ fn plan_auth_retry(
         AuthRetry::Resume => RevivalPlan::Submit(Box::new(PlannedCommand {
             key: retry_key,
             action: CommandAction::Resume {
-                prompt: Some(resume_text_for(env.execution_id, last, Cause::ModelAuth)),
+                prompt: Some(resume_text_for(env.execution_id, last)),
                 model: None,
             },
             note: "resuming its native session to retry the expired login",
@@ -1660,47 +2073,44 @@ impl One<'_> {
         self.resume_path()
     }
 
-    fn execution(&self) -> Execution {
-        self.row
-            .execution()
-            .expect("the pass is only run for a session with an execution")
-    }
-
     fn live(&self) -> bool {
-        self.execution().ended_at_ms.is_none()
+        self.execution.is_live()
     }
 
     /// The interruptions recorded for the execution, oldest first.
-    fn interruptions(&self) -> Vec<&Recorded> {
+    fn interruptions(&self) -> Vec<&Interrupted> {
         self.records
             .iter()
-            .filter(|record| record.is_type("execution.interrupted"))
+            .filter_map(|record| match record {
+                Recorded::Interrupted(interrupted) => Some(interrupted),
+                Recorded::Cleared { .. } => None,
+            })
             .collect()
     }
 
-    /// The clear that answers `record`, if the wait is over.
-    fn cleared_after(&self, record: &Recorded) -> Option<&Recorded> {
-        self.records
-            .iter()
-            .find(|later| later.is_type("execution.cleared") && later.event_id > record.event_id)
+    /// Whether a clear answering `record` has already been recorded.
+    fn cleared_after(&self, record: &Interrupted) -> bool {
+        self.records.iter().any(|later| {
+            matches!(later, Recorded::Cleared { event_id, .. } if *event_id > record.event_id)
+        })
     }
 
     /// Whether the execution ran through the outage: it started before the
     /// first failed pass and had not ended by it.
     fn ran_through(&self, outage: &Outage) -> bool {
-        let execution = self.execution();
-        execution.started_at_ms < outage.from_ms
-            && execution
-                .ended_at_ms
-                .is_none_or(|ended| ended > outage.from_ms)
+        self.execution.started_at_ms < outage.from_ms
+            && self
+                .execution
+                .end()
+                .is_none_or(|end| end.ended_at_ms > outage.from_ms)
     }
 
     /// Whether this outage is already recorded for the execution: its record
     /// names the window's start.
     fn recorded_outage(&self, outage: &Outage) -> bool {
         self.interruptions().iter().any(|record| {
-            record.cause() == Some(Cause::DatabaseUnavailable.name())
-                && record.record["evidence"]["from_ms"].as_i64() == Some(outage.from_ms)
+            record.cause == Cause::DatabaseUnavailable
+                && record.evidence["from_ms"].as_i64() == Some(outage.from_ms)
         })
     }
 
@@ -1715,20 +2125,10 @@ impl One<'_> {
             &self.records,
             &self.row.turns,
             &self.row.failed_tools,
-            &self.execution(),
+            self.execution,
             &self.row.stops,
             &self.row.commands,
         )
-    }
-
-    /// The latest Stop or Discard that may have stopped the execution, not
-    /// the recovery's own.
-    fn last_stop(&self) -> Option<&Stop> {
-        self.row
-            .stops
-            .iter()
-            .rev()
-            .find(|stop| !stop.ours() && stop.reached())
     }
 
     /// The failed turn the engine ended after when the model refused it for
@@ -1737,12 +2137,12 @@ impl One<'_> {
         let after = self
             .interruptions()
             .last()
-            .map_or(0, |record| record.fact_event_id());
+            .map_or(0, |record| record.fact_event_id);
         refused(
             &self.row.turns,
             self.row.progress.event_id,
             after,
-            (end.event_id > 0).then_some(end.event_id),
+            Some(end.event_id),
         )
     }
 
@@ -1751,12 +2151,13 @@ impl One<'_> {
     /// holds every workspace (the same filesystem, on this host).
     fn disk_reading(&self) -> Option<disk::Reading> {
         let mounted = self
-            .execution()
+            .execution
             .workspace
+            .as_deref()
             .map(|workspace| {
                 workspace
                     .split_once(':')
-                    .map_or(workspace.as_str(), |(_, path)| path)
+                    .map_or(workspace, |(_, path)| path)
                     .to_string()
             })
             .map(std::path::PathBuf::from)
@@ -1777,27 +2178,29 @@ impl One<'_> {
     }
 
     /// Record one interruption of the execution: once, with its cause, its
-    /// evidence, its path and its due time.
+    /// evidence, and its coupled `(path, due_ms)` schedule.
     fn record(
         &mut self,
         cause: Cause,
         evidence: Map<String, Value>,
         fact_event_id: i64,
-        path: Path,
-        due_ms: Option<i64>,
+        schedule: RecoverySchedule,
         note: &str,
-    ) -> Result<Recorded, String> {
-        let execution = self.execution();
+    ) -> Result<Interrupted, String> {
+        let execution_id = self.execution.id.as_str();
         let attempt = u32::try_from(self.interruptions().len())
             .unwrap_or(u32::MAX)
             .saturating_add(1);
+        let path = schedule.path();
+        let due_ms = schedule.due_ms();
+        let evidence_val = Value::Object(evidence);
         let record = json!({
             "type": "execution.interrupted",
             "agent_id": self.row.agent_id,
             "session_id": self.row.session_id,
-            "execution_id": execution.id,
+            "execution_id": execution_id,
             "cause": cause.name(),
-            "evidence": Value::Object(evidence),
+            "evidence": &evidence_val,
             "path": path.name(),
             "attempt": attempt,
             "due_ms": due_ms,
@@ -1808,40 +2211,39 @@ impl One<'_> {
             .host_record(&record)
             .map_err(|error| format!("execution.interrupted: {error}"))?;
         self.lines.push(format!(
-            "recover: {} {} of execution {} (attempt {attempt}, {}): {note}",
+            "recover: {} {} of execution {execution_id} (attempt {attempt}, {}): {note}",
             self.row.session_id,
             cause.name(),
-            execution.id,
             path.name()
         ));
-        let recorded = Recorded {
+        let interrupted = Interrupted {
             event_id,
             at_ms: self.now_ms,
-            record,
+            cause,
+            schedule: RecordedSchedule::Explicit(schedule),
+            attempt,
+            fact_event_id,
+            evidence: evidence_val,
         };
-        self.records.push(recorded.clone());
-        Ok(recorded)
+        self.records
+            .push(Recorded::Interrupted(interrupted.clone()));
+        Ok(interrupted)
     }
 
     /// Record the clear of the wait `record` opened.
-    fn clear(
-        &mut self,
-        record: &Recorded,
-        cause: Cause,
-        evidence: Map<String, Value>,
-    ) -> Result<(), String> {
+    fn clear(&mut self, record: &Interrupted, evidence: Map<String, Value>) -> Result<(), String> {
         let wait_start = self
             .interruptions()
             .iter()
             .rev()
-            .take_while(|older| older.path() == Some(Path::Wait.name()))
+            .take_while(|older| older.explicit_path() == Some(Path::Wait))
             .last()
             .map_or(record.at_ms, |first| first.at_ms);
         let cleared = json!({
             "type": "execution.cleared",
-            "execution_id": self.execution().id,
+            "execution_id": self.execution.id,
             "session_id": self.row.session_id,
-            "cause": cause.name(),
+            "cause": record.cause.name(),
             "evidence": Value::Object(evidence),
             "waited_ms": self.now_ms.saturating_sub(wait_start),
         });
@@ -1853,12 +2255,11 @@ impl One<'_> {
             "recover: {} {cause_name} cleared after {} s",
             self.row.session_id,
             self.now_ms.saturating_sub(wait_start) / 1000,
-            cause_name = cause.name()
+            cause_name = record.cause.name()
         ));
-        self.records.push(Recorded {
+        self.records.push(Recorded::Cleared {
             event_id,
             at_ms: self.now_ms,
-            record: cleared,
         });
         Ok(())
     }
@@ -1868,27 +2269,29 @@ impl One<'_> {
     /// The interruption an outage makes for an execution that lived through
     /// it, and its clear: the pass that reads this reached the database.
     fn interrupt_outage(&mut self, outage: &Outage) -> Result<(), String> {
-        let execution = self.execution();
         let mut evidence = outage.evidence();
-        if let Some(code) = execution.exit_code {
-            evidence.insert("exit_code".to_string(), json!(code));
-        }
-        if let Some(signal) = execution.signal {
-            evidence.insert("signal".to_string(), json!(signal));
+        if let Some(end) = self.execution.end() {
+            if let Some(code) = end.exit_code {
+                evidence.insert("exit_code".to_string(), json!(code));
+            }
+            if let Some(signal) = end.signal {
+                evidence.insert("signal".to_string(), json!(signal));
+            }
         }
         // What the log already knew of the execution is explained by this
         // record: the next fact it waits for is the one after it.
         let explained = self.row.progress.event_id.max(
             self.interruptions()
                 .last()
-                .map_or(0, |record| record.fact_event_id()),
+                .map_or(0, |record| record.fact_event_id),
         );
         let record = self.record(
             Cause::DatabaseUnavailable,
             evidence,
             explained,
-            Path::Wait,
-            Some(outage.to_ms),
+            RecoverySchedule::Wait {
+                due_ms: outage.to_ms,
+            },
             "the loop could not reach its database while the execution ran",
         )?;
         let mut cleared = Map::new();
@@ -1900,22 +2303,19 @@ impl One<'_> {
             "checkpoint".to_string(),
             self.row.head.clone().map_or(Value::Null, Value::String),
         );
-        self.clear(&record, Cause::DatabaseUnavailable, cleared)
+        self.clear(&record, cleared)
     }
 
     /// The interruption a fact makes.
     fn interrupt(&mut self, fact: Fact) -> Result<(), String> {
         match fact {
-            Fact::Turn(turn) => self.interrupt_turn(&turn),
-            Fact::Tool(tool) => self.interrupt_tool(&tool),
+            Fact::Turn { turn, cause } => self.interrupt_turn(&turn, cause),
+            Fact::Tool { tool, cause } => self.interrupt_tool(&tool, cause),
             Fact::End(end) => self.interrupt_end(&end),
         }
     }
 
-    fn interrupt_turn(&mut self, turn: &Turn) -> Result<(), String> {
-        let Some(cause) = turn.cause() else {
-            return Ok(());
-        };
+    fn interrupt_turn(&mut self, turn: &Turn, cause: Cause) -> Result<(), String> {
         let mut evidence = turn.evidence();
         let mut due = self.now_ms;
         match cause {
@@ -1958,8 +2358,7 @@ impl One<'_> {
             cause,
             evidence,
             turn.event_id,
-            path,
-            Some(due),
+            schedule_for_path(path, || due),
             "its turn failed with a model cause and its engine waits at its prompt",
         )?;
         Ok(())
@@ -1969,10 +2368,7 @@ impl One<'_> {
     /// and leaves the engine at its prompt, waiting for room. The wait is
     /// the disk's: every probe reads the free space again, and the clear is
     /// the reading at or above the floor.
-    fn interrupt_tool(&mut self, tool: &ToolFailure) -> Result<(), String> {
-        let Some(cause) = tool.cause() else {
-            return Ok(());
-        };
+    fn interrupt_tool(&mut self, tool: &ToolFailure, cause: Cause) -> Result<(), String> {
         let mut evidence = Map::new();
         evidence.insert("event_id".to_string(), json!(tool.event_id));
         evidence.insert(
@@ -2000,8 +2396,7 @@ impl One<'_> {
             cause,
             evidence,
             tool.event_id,
-            path,
-            Some(self.now_ms),
+            schedule_for_path(path, || self.now_ms),
             "its tool call failed on a full disk and its engine waits at its prompt",
         )?;
         Ok(())
@@ -2019,44 +2414,48 @@ impl One<'_> {
             .as_ref()
             .filter(|reading| reading.free < Self::floor_bytes())
             .cloned();
-        let execution = self.execution();
+        let stop = stop_fact(&self.row.stops, &self.row.session_id, self.work);
         let facts = Facts {
             end: Some(end),
-            stop: self.last_stop(),
+            stop,
             over_budget: self.row.over_budget.as_ref(),
             memory: None,
             terminal_server_gone: server_gone(
-                execution.terminal_server.as_ref(),
-                execution.started_at_ms,
+                self.execution.terminal_server.as_ref(),
+                self.execution.started_at_ms,
                 self.terminals.server(),
             ),
             disk: below.as_ref(),
             outage: None,
             retired: self.retired.contains(&self.row.session_id),
-            task_cancelled: task_cancelled(&self.row.stops),
             model_error: self.refused_turn(end),
-            moved: moved(&self.row.stops, &self.row.session_id, self.work),
         };
         let cause = classify(&facts);
         let mut evidence = self.end_evidence(cause, end, &facts);
         let (path, mut gains) = stopped_path(
             cause,
-            facts.task_cancelled,
+            facts.task_cancelled(),
             self.row.native_session_id.is_some(),
             self.failures_in_a_row(),
         );
         evidence.append(&mut gains);
-        let due = match path {
-            Path::Final => None,
-            Path::Resume | Path::Handoff => Some(self.resume_due()),
-            Path::Wait => Some(self.now_ms),
+        let schedule = match path {
+            Path::Final => RecoverySchedule::Final,
+            Path::Resume => RecoverySchedule::Resume {
+                due_ms: self.resume_due(),
+            },
+            Path::Handoff => RecoverySchedule::Handoff {
+                due_ms: self.resume_due(),
+            },
+            Path::Wait => RecoverySchedule::Wait {
+                due_ms: self.now_ms,
+            },
         };
         self.record(
             cause,
             evidence,
             end.event_id,
-            path,
-            due,
+            schedule,
             "its execution ended",
         )?;
         Ok(())
@@ -2068,21 +2467,25 @@ impl One<'_> {
         let mut evidence = Map::new();
         match cause {
             Cause::Stopped => {
-                if let Some(stop) = facts.stop {
-                    evidence.insert("command_id".to_string(), json!(stop.command_id));
-                    evidence.insert("principal".to_string(), json!(stop.principal));
-                    evidence.insert("command".to_string(), json!(stop.action));
+                if let Some(stop_fact) = &facts.stop {
+                    evidence.insert("command_id".to_string(), json!(stop_fact.stop.command_id));
+                    evidence.insert("principal".to_string(), json!(stop_fact.stop.principal));
+                    evidence.insert("command".to_string(), json!(stop_fact.stop.action));
                 }
                 if facts.retired {
                     evidence.insert("retired".to_string(), json!(true));
                 }
-                if facts.task_cancelled {
+                if facts.task_cancelled() {
                     evidence.insert("task_cancelled".to_string(), json!(true));
                 }
             }
-            Cause::Restarted | Cause::Reassigned => moved_evidence(facts, &mut evidence),
+            Cause::Restarted | Cause::Reassigned => {
+                if let Some(stop_fact) = &facts.stop {
+                    moved_evidence(stop_fact, &mut evidence);
+                }
+            }
             Cause::Budget => {
-                if let Some(over) = self.row.over_budget.as_ref() {
+                if let Some(over) = facts.over_budget {
                     evidence.insert("event_id".to_string(), over["event_id"].clone());
                     evidence.insert("budget".to_string(), over["record"]["budget"].clone());
                     evidence.insert("task".to_string(), over["record"]["id"].clone());
@@ -2102,9 +2505,7 @@ impl One<'_> {
                 evidence.insert(
                     "earlier_boot_id".to_string(),
                     self.state
-                        .earlier
-                        .as_ref()
-                        .and_then(|earlier| earlier["boot_id"].as_str())
+                        .earlier_boot_id()
                         .map_or(Value::Null, |id| json!(id)),
                 );
             }
@@ -2229,7 +2630,7 @@ impl One<'_> {
                 .iter()
                 .filter(|sent| {
                     sent.key.starts_with(&prefix)
-                        && sent.succeeded == Some(false)
+                        && sent.outcome.is_failed()
                         && sent.key.starts_with(KEY_PREFIX)
                 })
                 .count(),
@@ -2253,7 +2654,7 @@ impl One<'_> {
             self.interruptions()
                 .iter()
                 .rev()
-                .take_while(|record| record.cause() == Some(cause.name()))
+                .take_while(|record| record.cause == cause)
                 .count(),
         )
         .unwrap_or(u32::MAX)
@@ -2262,8 +2663,8 @@ impl One<'_> {
     // --- the way back -----------------------------------------------------
 
     /// The key of an interruption's revival: `recover-<execution>-<attempt>`.
-    fn key_prefix(&self, record: &Recorded) -> String {
-        key(&self.execution().id, record.attempt())
+    fn key_prefix(&self, record: &Interrupted) -> String {
+        key(&self.execution.id, record.attempt)
     }
 
     /// Take the way back from the execution's latest interruption, if it is
@@ -2272,55 +2673,54 @@ impl One<'_> {
         let Some(last) = self.interruptions().last().copied().cloned() else {
             return Ok(());
         };
-        let Some(cause) = Cause::from_name(last.cause().unwrap_or_default()) else {
-            return Ok(());
-        };
-        match recorded_path(&last, cause) {
+        match last.effective_path() {
             Path::Final => Ok(()),
-            Path::Wait => self.wait_path(&last, cause),
-            Path::Resume | Path::Handoff => self.revive(&last, cause, false),
+            Path::Wait => self.wait_path(&last),
+            Path::Resume | Path::Handoff => self.revive(&last, false),
         }
     }
 
     /// A wait: nothing while the cause holds. When it clears, one
     /// `execution.cleared` record and then the revival.
-    fn wait_path(&mut self, last: &Recorded, cause: Cause) -> Result<(), String> {
-        if self.cleared_after(last).is_some() {
+    fn wait_path(&mut self, last: &Interrupted) -> Result<(), String> {
+        if self.cleared_after(last) {
             // Cleared: the revival is due now.
-            return self.revive(last, cause, true);
+            return self.revive(last, true);
         }
         // The cause still holds: no append may announce its clearing, so the
         // loop re-reads it every probe until it does.
         self.state.open_waits = true;
-        match cause {
+        match last.cause {
             Cause::ModelUnavailable => {
                 // The retry is the revival; the clear is the model's answer
                 // to it.
-                if self.row.progress.event_id > last.fact_event_id() {
+                if self.row.progress.event_id > last.fact_event_id {
                     let mut evidence = Map::new();
                     evidence.insert(
                         "answer_event_id".to_string(),
                         json!(self.row.progress.event_id),
                     );
                     evidence.insert("answer_at_ms".to_string(), json!(self.row.progress.at_ms));
-                    self.clear(last, cause, evidence)?;
-                    return self.revive(last, cause, true);
+                    self.clear(last, evidence)?;
+                    return self.revive(last, true);
                 }
                 // An engine that ended on it is resumed a bounded number
                 // of times in a row; past that, its end is final and the
                 // supervisor is told (the dispatcher's digest).
-                if !self.live() && !self.revived(last) {
-                    let resumes = model_resumes(&self.row.executions, &self.execution().id);
+                if let Some(end) = self.execution.end()
+                    && !self.revived(last)
+                {
+                    let resumes = model_resumes(&self.row.executions, &self.execution.id);
                     if resumes >= self.config.model_retries {
-                        return self.retries_spent(last, resumes);
+                        return self.retries_spent(last, end, resumes);
                     }
                 }
-                self.revive(last, cause, false)
+                self.revive(last, false)
             }
             Cause::ModelAuth => {
                 if let Some(changed) = self.credentials_changed(last) {
-                    self.clear(last, cause, changed)?;
-                    return self.revive(last, cause, true);
+                    self.clear(last, changed)?;
+                    return self.revive(last, true);
                 }
                 // One retry every `auth_retry` while the file holds: a
                 // long outage of a login must not leave the agent down for
@@ -2329,14 +2729,14 @@ impl One<'_> {
             }
             Cause::DiskFull => {
                 if let Some(evidence) = self.disk_clear(last) {
-                    self.clear(last, cause, evidence)?;
-                    return self.revive(last, cause, true);
+                    self.clear(last, evidence)?;
+                    return self.revive(last, true);
                 }
                 Ok(())
             }
             // The pass that reads this reached the database: the clear was
             // recorded with the interruption.
-            Cause::DatabaseUnavailable => self.revive(last, cause, true),
+            Cause::DatabaseUnavailable => self.revive(last, true),
             _ => Ok(()),
         }
     }
@@ -2344,12 +2744,9 @@ impl One<'_> {
     /// Whether the terminal host says the execution's runner is no longer
     /// there (its pane dead or gone); a host that cannot tell says nothing.
     fn runner_gone(&self) -> bool {
-        let execution = self.execution();
         let (Ok(id), Ok(workspace)) = (
-            spawn_core::id::ExecutionId::new(execution.id.as_str()),
-            spawn_core::id::WorkspaceId::new(
-                execution.workspace.unwrap_or_else(|| "0:/".to_string()),
-            ),
+            spawn_core::id::ExecutionId::new(self.execution.id.as_str()),
+            spawn_core::id::WorkspaceId::new(self.execution.workspace.as_deref().unwrap_or("0:/")),
         ) else {
             return false;
         };
@@ -2362,7 +2759,7 @@ impl One<'_> {
 
     /// Whether the revival of `last` was already submitted (its key, or a
     /// retry of it).
-    fn revived(&self, last: &Recorded) -> bool {
+    fn revived(&self, last: &Interrupted) -> bool {
         let key = self.key_prefix(last);
         self.row
             .commands
@@ -2374,30 +2771,25 @@ impl One<'_> {
     /// `resumes` times in a row already: recorded once, `model_unavailable`
     /// on the final path, with the failed turn and the setting, and never
     /// revived (a person or the supervisor may resume it).
-    fn retries_spent(&mut self, last: &Recorded, resumes: u32) -> Result<(), String> {
-        let execution = self.execution();
+    fn retries_spent(&mut self, last: &Interrupted, end: &End, resumes: u32) -> Result<(), String> {
         let mut evidence = Map::new();
         for field in ["event_id", "status", "error", "text"] {
-            evidence.insert(field.to_string(), last.record["evidence"][field].clone());
+            evidence.insert(field.to_string(), last.evidence[field].clone());
         }
         evidence.insert("retries".to_string(), json!(self.config.model_retries));
         evidence.insert("resumes".to_string(), json!(resumes));
-        if let Some(code) = execution.exit_code {
+        if let Some(code) = end.exit_code {
             evidence.insert("exit_code".to_string(), json!(code));
         }
-        if let Some(signal) = execution.signal {
+        if let Some(signal) = end.signal {
             evidence.insert("signal".to_string(), json!(signal));
         }
-        let fact = execution
-            .end_event_id
-            .unwrap_or(0)
-            .max(last.fact_event_id());
+        let fact = end.event_id.max(last.fact_event_id);
         self.record(
             Cause::ModelUnavailable,
             evidence,
             fact,
-            Path::Final,
-            None,
+            RecoverySchedule::Final,
             "its engine ended on a transient model error again and its retries are spent",
         )?;
         Ok(())
@@ -2405,8 +2797,8 @@ impl One<'_> {
 
     /// Whether the credentials file changed since the interruption read it;
     /// the evidence when it did.
-    fn credentials_changed(&mut self, last: &Recorded) -> Option<Map<String, Value>> {
-        let recorded = last.record["evidence"]["credentials"].clone();
+    fn credentials_changed(&mut self, last: &Interrupted) -> Option<Map<String, Value>> {
+        let recorded = &last.evidence["credentials"];
         let path = recorded["path"]
             .as_str()
             .map(str::to_string)
@@ -2427,7 +2819,7 @@ impl One<'_> {
     }
 
     /// The disk has room again; the evidence when it does.
-    fn disk_clear(&mut self, last: &Recorded) -> Option<Map<String, Value>> {
+    fn disk_clear(&mut self, last: &Interrupted) -> Option<Map<String, Value>> {
         let key = self.probe_key(last);
         if !self.probe_due(&key) {
             return None;
@@ -2458,21 +2850,18 @@ impl One<'_> {
         }
     }
 
-    fn probe_key(&self, last: &Recorded) -> String {
+    fn probe_key(&self, last: &Interrupted) -> String {
         format!(
             "{}:{}:{}",
-            self.row.session_id,
-            self.execution().id,
-            last.attempt()
+            self.row.session_id, self.execution.id, last.attempt
         )
     }
 
     /// One retry of an expired login, every `auth_retry` while the
     /// credentials file does not change.
-    fn auth_retry(&mut self, last: &Recorded) -> Result<(), String> {
-        let execution_id = self.execution().id;
+    fn auth_retry(&mut self, last: &Interrupted) -> Result<(), String> {
         let env = RevivalEnv {
-            execution_id: &execution_id,
+            execution_id: &self.execution.id,
             commands: &self.row.commands,
             config: self.config,
             now_ms: self.now_ms,
@@ -2483,7 +2872,7 @@ impl One<'_> {
             last,
             self.row.native_session_id.is_some(),
             self.failures_in_a_row(),
-            || self.handoff_prompt(last, Cause::ModelAuth),
+            || self.handoff_prompt(last),
         );
         self.apply_plan(plan)
     }
@@ -2491,24 +2880,21 @@ impl One<'_> {
     /// Take the interruption's way back: `input` into the live engine,
     /// `resume` if the execution ended, a `start` for a handoff (its `stop`
     /// first while the execution runs).
-    fn revive(&mut self, last: &Recorded, cause: Cause, cleared: bool) -> Result<(), String> {
-        if cause.path() == Path::Handoff || last.path() == Some(Path::Handoff.name()) {
-            return self.handoff(last, cause);
+    fn revive(&mut self, last: &Interrupted, cleared: bool) -> Result<(), String> {
+        let cause = last.cause;
+        if cause.path() == Path::Handoff || last.explicit_path() == Some(Path::Handoff) {
+            return self.handoff(last);
         }
         let key = self.key_prefix(last);
         // A wait revives once (after its clear); a resume's command is its
         // revival whether or not the wait was cleared.
-        let sent = self
-            .row
-            .commands
-            .iter()
-            .find(|sent| sent.key == key)
-            .cloned();
-        if let Some(sent) = &sent {
-            return match sent.succeeded {
-                // In flight, or done.
-                None | Some(true) => Ok(()),
-                Some(false) => self.retry(last, cause, &key),
+        if let Some(sent) = self.row.commands.iter().find(|sent| sent.key == key) {
+            return match sent.outcome {
+                // In flight, cancelled, or done.
+                SentOutcome::Pending
+                | SentOutcome::Cancelled { .. }
+                | SentOutcome::Succeeded { .. } => Ok(()),
+                SentOutcome::Failed { .. } => self.retry(last, &key),
             };
         }
         // A wait that cleared is due now: its record's due_ms is when its
@@ -2548,7 +2934,7 @@ impl One<'_> {
             self.submit(
                 &key,
                 CommandAction::Input {
-                    text: Self::input_text(last, cause),
+                    text: Self::input_text(last),
                     tags: Vec::new(),
                 },
                 "nudging the engine at its prompt",
@@ -2557,7 +2943,7 @@ impl One<'_> {
             self.submit(
                 &key,
                 CommandAction::Resume {
-                    prompt: Some(self.resume_text(last, cause)),
+                    prompt: Some(self.resume_text(last)),
                     model: None,
                 },
                 "resuming its native session",
@@ -2567,18 +2953,18 @@ impl One<'_> {
 
     /// A revival whose command failed: again after the resume's backoff,
     /// under a key of its own.
-    fn retry(&mut self, last: &Recorded, cause: Cause, key: &str) -> Result<(), String> {
-        let execution_id = self.execution().id;
+    fn retry(&mut self, last: &Interrupted, key: &str) -> Result<(), String> {
+        let execution_id = &self.execution.id;
         let live = self.live();
         let plan = plan_retry_action(&self.row.commands, self.config, self.now_ms, key, || {
             if live {
                 CommandAction::Input {
-                    text: Self::input_text(last, cause),
+                    text: Self::input_text(last),
                     tags: Vec::new(),
                 }
             } else {
                 CommandAction::Resume {
-                    prompt: Some(resume_text_for(&execution_id, last, cause)),
+                    prompt: Some(resume_text_for(execution_id, last)),
                     model: None,
                 }
             }
@@ -2588,16 +2974,15 @@ impl One<'_> {
 
     /// A handoff: stop the execution if it still runs, then start a new
     /// native session in the same Spawn session, workspace and branch.
-    fn handoff(&mut self, last: &Recorded, cause: Cause) -> Result<(), String> {
-        let execution_id = self.execution().id;
+    fn handoff(&mut self, last: &Interrupted) -> Result<(), String> {
         let env = RevivalEnv {
-            execution_id: &execution_id,
+            execution_id: &self.execution.id,
             commands: &self.row.commands,
             config: self.config,
             now_ms: self.now_ms,
             live: self.live(),
         };
-        let plan = plan_handoff(&env, last, || self.handoff_prompt(last, cause));
+        let plan = plan_handoff(&env, last, || self.handoff_prompt(last));
         self.apply_plan(plan)
     }
 
@@ -2650,18 +3035,18 @@ impl One<'_> {
     /// What the agent is told when its engine is resumed or nudged: the
     /// interruption, by its cause and evidence, and that its work is where
     /// it left it.
-    fn resume_text(&self, last: &Recorded, cause: Cause) -> String {
-        resume_text_for(&self.execution().id, last, cause)
+    fn resume_text(&self, last: &Interrupted) -> String {
+        resume_text_for(&self.execution.id, last)
     }
 
-    fn input_text(last: &Recorded, cause: Cause) -> String {
-        if cancelled_stop(last) {
+    fn input_text(last: &Interrupted) -> String {
+        if last.is_cancelled_stop() {
             return CANCELLED_REVIVAL.to_string();
         }
         format!(
             "Spawn: the {} that stopped your last turn is over ({}). Continue your task from \
              where you were; the work is in your workspace.",
-            cause.name().replace('_', " "),
+            last.cause.name().replace('_', " "),
             describe(last)
         )
     }
@@ -2669,13 +3054,13 @@ impl One<'_> {
     /// The prompt of a handoff: the task's brief (a resident's role, the
     /// supervisor's charter and summary), the interruption, the branch's
     /// head, and that the work is in the workspace to continue.
-    fn handoff_prompt(&self, last: &Recorded, cause: Cause) -> (String, Option<String>) {
+    fn handoff_prompt(&self, last: &Interrupted) -> (String, Option<String>) {
         let head = self
             .row
             .head
             .as_ref()
             .map_or_else(String::new, |head| format!(" (its head is {head})"));
-        let interruption = handoff_interruption(last, cause, &head);
+        let interruption = handoff_interruption(last, &head);
         if self.row.session_id == supervise::SUPERVISOR_SESSION {
             let supervise::Charter { text, hash } = supervise::Charter::deployed(self.spawn);
             let summary = supervise::handoff(self.store);
@@ -2710,8 +3095,8 @@ impl One<'_> {
 
 /// The event details of the interruption `record`, one line: what the agent
 /// is told and the log shows.
-fn describe(record: &Recorded) -> String {
-    let evidence = &record.record["evidence"];
+fn describe(record: &Interrupted) -> String {
+    let evidence = &record.evidence;
     let parts: Vec<String> = [
         "exit_code",
         "signal",
@@ -2726,7 +3111,7 @@ fn describe(record: &Recorded) -> String {
         (!value.is_null()).then(|| format!("{key} {value}"))
     })
     .collect();
-    let cause = record.cause().unwrap_or("interruption");
+    let cause = record.cause.name();
     if parts.is_empty() {
         cause.to_string()
     } else {
@@ -2772,41 +3157,61 @@ fn pending(
     stops: &[Stop],
     commands: &[Sent],
 ) -> Option<Fact> {
-    let interruptions: Vec<&Recorded> = records
+    let interruptions: Vec<&Interrupted> = records
         .iter()
-        .filter(|record| record.is_type("execution.interrupted"))
+        .filter_map(|record| match record {
+            Recorded::Interrupted(interrupted) => Some(interrupted),
+            Recorded::Cleared { .. } => None,
+        })
         .collect();
     let last = interruptions.last().copied();
-    let after = last.map_or(0, Recorded::fact_event_id);
-    let cleared = |record: &Recorded| {
-        records
-            .iter()
-            .any(|later| later.is_type("execution.cleared") && later.event_id > record.event_id)
+    let after = last.map_or(0, |record| record.fact_event_id);
+    let cleared = |record: &Interrupted| {
+        records.iter().any(|later| {
+            matches!(later, Recorded::Cleared { event_id, .. } if *event_id > record.event_id)
+        })
     };
     let open_wait =
-        last.is_some_and(|record| record.path() == Some(Path::Wait.name()) && !cleared(record));
-    let turn = turns
-        .iter()
-        .find(|turn| turn.event_id > after && turn.cause().is_some());
-    let tool = tools
-        .iter()
-        .find(|tool| tool.event_id > after && tool.cause().is_some());
+        last.is_some_and(|record| record.explicit_path() == Some(Path::Wait) && !cleared(record));
+    let turn = turns.iter().find_map(|turn| {
+        turn.cause()
+            .filter(|_| turn.event_id > after)
+            .map(|cause| (turn, cause))
+    });
+    let tool = tools.iter().find_map(|tool| {
+        tool.cause()
+            .filter(|_| tool.event_id > after)
+            .map(|cause| (tool, cause))
+    });
     match (turn, tool) {
         // The first of the two in the log: a disk's tool failure and a
         // model's turn failure can sit in the same stretch of work.
-        (Some(turn), Some(tool)) if tool.event_id < turn.event_id => {
-            return Some(Fact::Tool(tool.clone()));
+        (Some((turn, _)), Some((tool, tool_cause))) if tool.event_id < turn.event_id => {
+            return Some(Fact::Tool {
+                tool: tool.clone(),
+                cause: tool_cause,
+            });
         }
-        (Some(turn), _) => return Some(Fact::Turn(turn.clone())),
-        (None, Some(tool)) => return Some(Fact::Tool(tool.clone())),
+        (Some((turn, turn_cause)), _) => {
+            return Some(Fact::Turn {
+                turn: turn.clone(),
+                cause: turn_cause,
+            });
+        }
+        (None, Some((tool, tool_cause))) => {
+            return Some(Fact::Tool {
+                tool: tool.clone(),
+                cause: tool_cause,
+            });
+        }
         (None, None) => {}
     }
     // A handoff ends the execution with its own Stop.
     if last.is_some_and(|record| {
-        record.path() == Some(Path::Handoff.name())
+        record.explicit_path() == Some(Path::Handoff)
             && commands
                 .iter()
-                .any(|sent| sent.key == format!("{}-stop", key(&execution.id, record.attempt())))
+                .any(|sent| sent.key == format!("{}-stop", key(&execution.id, record.attempt)))
     }) {
         return None;
     }
@@ -2821,31 +3226,7 @@ fn pending(
     if open_wait && !stopped {
         return None;
     }
-    Some(Fact::End(end))
-}
-
-impl Cause {
-    /// [`Cause::name`] read back, for a recorded interruption.
-    fn from_name(name: &str) -> Option<Self> {
-        [
-            Self::Exited,
-            Self::Crashed,
-            Self::MemoryLimit,
-            Self::ContextExhausted,
-            Self::ModelUnavailable,
-            Self::ModelAuth,
-            Self::ModelError,
-            Self::HostRestart,
-            Self::DatabaseUnavailable,
-            Self::DiskFull,
-            Self::Budget,
-            Self::Stopped,
-            Self::Restarted,
-            Self::Reassigned,
-        ]
-        .into_iter()
-        .find(|cause| cause.name() == name)
-    }
+    Some(Fact::End(end.clone()))
 }
 
 #[cfg(test)]
@@ -2909,13 +3290,15 @@ mod credentials_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthRetry, Cause, CommandAction, Config, Credentials, ENGINE, End, Executed, Execution,
-        Facts, Outage, Path, PlannedCommand, Recorded, Recovery, RevivalEnv, RevivalPlan, Sent,
-        Stop, ToolFailure, Turn, auth_retry_action, auth_retry_due, classify, counts_as_failure,
+        AuthRetry, Cause, CauseExt, CommandAction, Config, Credentials, ENGINE, End, EndCause,
+        Executed, Execution, ExecutionState, Facts, FactsRow, Interrupted, LoopStart, Outage, Path,
+        PlannedCommand, Recorded, RecordedEndCause, RecordedSchedule, Recovery, RecoverySchedule,
+        RevivalEnv, RevivalPlan, Sent, SentOutcome, Stop, StopAction, StopFact, StopKind,
+        ToolFailure, Turn, auth_retry_action, auth_retry_due, classify, counts_as_failure,
         disk_cleared, key, model_due, model_resumes, model_retries, pending, plan_auth_retry,
-        refused, resume_due, resume_failed, retry_at, server_gone, way,
+        refused, resume_due, resume_failed, retry_at, server_gone, stop_fact, visit_pass_rows, way,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     /// A cancelled task's stop is the dispatcher's interrupt: the notice's
     /// resume follows it, so the recovery must not record it as `final`
@@ -2927,7 +3310,7 @@ mod tests {
             command_id: 1,
             principal: principal.to_string(),
             key: key.to_string(),
-            action: "stop".to_string(),
+            action: StopAction::Stop,
             created_at_ms: 0,
             succeeded: Some(true),
             error: None,
@@ -2945,10 +3328,13 @@ mod tests {
         // stop's end stays final.
         let cancelled = stop(dispatcher, "cancel-stop-63-exec_482");
         let facts = Facts {
-            stop: Some(&cancelled),
-            task_cancelled: cancelled.cancelled_task(),
+            stop: Some(StopFact {
+                stop: &cancelled,
+                kind: StopKind::CancelledTask,
+            }),
             ..Facts::default()
         };
+        assert!(facts.task_cancelled());
         let cause = classify(&facts);
         assert_eq!(cause, Cause::Stopped);
         let (path, evidence) = super::stopped_path(cause, true, true, 0);
@@ -2973,20 +3359,44 @@ mod tests {
             !retried[1].cancelled_task(),
             "the retry's own key says nothing"
         );
-        assert!(super::task_cancelled(&retried));
-        assert!(super::task_cancelled(std::slice::from_ref(&cancelled)));
+        let empty_work = crate::deliver::Work::default();
+        assert_eq!(
+            stop_fact(&retried, "session", &empty_work),
+            Some(StopFact {
+                stop: &retried[1],
+                kind: StopKind::CancelledTask,
+            })
+        );
+        assert_eq!(
+            stop_fact(std::slice::from_ref(&cancelled), "session", &empty_work),
+            Some(StopFact {
+                stop: &cancelled,
+                kind: StopKind::CancelledTask,
+            })
+        );
         // A retry of a restart's stop, a person's stop after the cancel
         // stop, or nothing that reached the engine: not a cancelled task's.
-        assert!(!super::task_cancelled(&[
+        let restart_retried = [
             stop(dispatcher, "restart-18-1-stop"),
             stop(dispatcher, "stop-exec_482-retry-1"),
-        ]));
-        assert!(!super::task_cancelled(&[
-            cancelled.clone(),
-            stop("bb-person", "person-stop-1"),
-        ]));
-        assert!(!super::task_cancelled(&[failed]));
-        assert!(!super::task_cancelled(&[]));
+        ];
+        assert_eq!(
+            stop_fact(&restart_retried, "session", &empty_work),
+            Some(StopFact {
+                stop: &restart_retried[1],
+                kind: StopKind::Other,
+            })
+        );
+        let person_after = [cancelled.clone(), stop("bb-person", "person-stop-1")];
+        assert_eq!(
+            stop_fact(&person_after, "session", &empty_work),
+            Some(StopFact {
+                stop: &person_after[1],
+                kind: StopKind::Other,
+            })
+        );
+        assert_eq!(stop_fact(&[failed], "session", &empty_work), None);
+        assert_eq!(stop_fact(&[], "session", &empty_work), None);
     }
 
     /// A cancelled task's stop resumes under `way`'s bounds: with no native
@@ -3015,21 +3425,24 @@ mod tests {
         );
 
         // The handoff's new native session is not told to carry on.
-        let record = |evidence: serde_json::Value| Recorded {
+        let record = |evidence: Value| Interrupted {
             event_id: 1,
             at_ms: 1_000,
-            record: json!({"type": "execution.interrupted", "cause": "stopped",
-                           "path": "handoff", "attempt": 1, "evidence": evidence}),
+            cause: Cause::Stopped,
+            schedule: RecordedSchedule::Explicit(RecoverySchedule::Handoff { due_ms: 1_000 }),
+            attempt: 1,
+            fact_event_id: 0,
+            evidence,
         };
         let cancelled = record(
             json!({"principal": "spawn-dispatch", "task_cancelled": true,
                                       "native": "none"}),
         );
-        let text = super::handoff_interruption(&cancelled, Cause::Stopped, "");
+        let text = super::handoff_interruption(&cancelled, "");
         assert!(text.contains("Do not continue that task"), "{text}");
         assert!(!text.contains("carry on"), "{text}");
         let other = record(json!({"principal": "spawn-dispatch"}));
-        assert!(super::handoff_interruption(&other, Cause::Stopped, "").contains("carry on"));
+        assert!(super::handoff_interruption(&other, "").contains("carry on"));
     }
 
     /// `resume_path` takes the record's own path (GitHub #76): a `stopped`
@@ -3038,41 +3451,52 @@ mod tests {
     /// its cause's own.
     #[test]
     fn the_way_back_is_the_recorded_path_and_a_final_one_is_never_revived() {
-        let stopped = |path: Option<&str>| Recorded {
-            event_id: 1,
-            at_ms: 1_000,
-            record: match path {
-                Some(path) => json!({"type": "execution.interrupted", "cause": "stopped",
-                                     "path": path, "attempt": 1}),
-                None => json!({"type": "execution.interrupted", "cause": "stopped",
-                               "attempt": 1}),
-            },
+        let parse_interrupted = |cause: &str, path: Option<&str>| -> Interrupted {
+            let record = match path {
+                Some("final") => json!({"type": "execution.interrupted", "cause": cause,
+                                        "path": "final", "attempt": 1, "due_ms": null}),
+                Some(path) => json!({"type": "execution.interrupted", "cause": cause,
+                                     "path": path, "attempt": 1, "due_ms": 1_000}),
+                None => json!({"type": "execution.interrupted", "cause": cause, "attempt": 1}),
+            };
+            let parsed: Recorded = serde_json::from_value(json!({
+                "event_id": 1,
+                "at_ms": 1_000,
+                "record": record,
+            }))
+            .expect("valid interrupted record");
+            match parsed {
+                Recorded::Interrupted(interrupted) => interrupted,
+                Recorded::Cleared { .. } => panic!("expected interrupted"),
+            }
         };
-        let recorded_path = super::recorded_path;
         assert_eq!(
-            recorded_path(&stopped(Some("resume")), Cause::Stopped),
+            parse_interrupted("stopped", Some("resume")).effective_path(),
             Path::Resume
         );
         assert_eq!(
-            recorded_path(&stopped(Some("final")), Cause::Stopped),
+            parse_interrupted("stopped", Some("final")).effective_path(),
             Path::Final
         );
-        assert_eq!(recorded_path(&stopped(None), Cause::Stopped), Path::Final);
         assert_eq!(
-            recorded_path(&stopped(Some("handoff")), Cause::Stopped),
+            parse_interrupted("stopped", None).effective_path(),
+            Path::Final
+        );
+        assert_eq!(
+            parse_interrupted("stopped", Some("handoff")).effective_path(),
             Path::Handoff
         );
         assert_eq!(
-            recorded_path(&stopped(Some("wait")), Cause::Stopped),
+            parse_interrupted("stopped", Some("wait")).effective_path(),
             Path::Wait
         );
         // A model wait whose retries are spent is recorded final: skipped.
         assert_eq!(
-            recorded_path(&stopped(Some("final")), Cause::ModelUnavailable),
+            parse_interrupted("model_unavailable", Some("final")).effective_path(),
             Path::Final
         );
         assert_eq!(
-            recorded_path(&stopped(None), Cause::ModelUnavailable),
+            parse_interrupted("model_unavailable", None).effective_path(),
             Path::Wait
         );
     }
@@ -3081,28 +3505,28 @@ mod tests {
     /// continue: its task is cancelled. Any other revival still does.
     #[test]
     fn the_revival_after_a_cancelled_tasks_stop_does_not_continue_it() {
-        let record = |cause: &str, evidence: serde_json::Value| Recorded {
+        let record = |cause: Cause, evidence: Value| Interrupted {
             event_id: 1,
             at_ms: 1_000,
-            record: json!({"type": "execution.interrupted", "cause": cause,
-                           "path": "resume", "attempt": 1, "evidence": evidence}),
+            cause,
+            schedule: RecordedSchedule::Explicit(RecoverySchedule::Resume { due_ms: 1_000 }),
+            attempt: 1,
+            fact_event_id: 0,
+            evidence,
         };
         let cancelled = record(
-            "stopped",
+            Cause::Stopped,
             json!({"principal": "spawn-dispatch", "task_cancelled": true}),
         );
-        assert!(super::cancelled_stop(&cancelled));
-        let text = super::One::input_text(&cancelled, Cause::Stopped);
+        assert!(cancelled.is_cancelled_stop());
+        let text = super::One::input_text(&cancelled);
         assert_eq!(text, super::CANCELLED_REVIVAL);
         assert!(text.contains("Do not continue that task"), "{text}");
         assert!(!text.contains("Continue your task"), "{text}");
-        let crashed = record("crashed", json!({"exit_code": 1}));
-        assert!(!super::cancelled_stop(&crashed));
-        assert!(super::One::input_text(&crashed, Cause::Crashed).contains("Continue your task"));
-        assert!(!super::cancelled_stop(&record(
-            "stopped",
-            json!({"principal": "bb-person"})
-        )));
+        let crashed = record(Cause::Crashed, json!({"exit_code": 1}));
+        assert!(!crashed.is_cancelled_stop());
+        assert!(super::One::input_text(&crashed).contains("Continue your task"));
+        assert!(!record(Cause::Stopped, json!({"principal": "bb-person"})).is_cancelled_stop());
     }
     use spawn_core::port::{ServerSeen, TerminalServer};
 
@@ -3185,6 +3609,7 @@ mod tests {
             "terminal_server": {"pid": 812, "started_at_ms": 2_000},
         }))
         .expect("an execution with its server");
+        assert!(row.is_live());
         assert_eq!(
             row.terminal_server,
             Some(TerminalServer {
@@ -3198,6 +3623,7 @@ mod tests {
             "terminal_server": null,
         }))
         .expect("an execution from before the record");
+        assert!(old.is_live());
         assert_eq!(old.terminal_server, None);
     }
 
@@ -3229,10 +3655,11 @@ mod tests {
         assert_eq!(state.next_due(10_000, 2_000), Some(2_000), "at once");
     }
 
-    fn end(cause: &str, exit_code: Option<i32>, signal: Option<i32>) -> End {
+    fn end(cause: EndCause, exit_code: Option<i32>, signal: Option<i32>) -> End {
         End {
             event_id: 90,
-            cause: cause.to_string(),
+            ended_at_ms: 2_000,
+            cause: cause.into(),
             exit_code,
             signal,
             evidence: None,
@@ -3254,7 +3681,7 @@ mod tests {
             command_id,
             principal: "bb-person".to_string(),
             key: key.to_string(),
-            action: "stop".to_string(),
+            action: StopAction::Stop,
             created_at_ms: 0,
             succeeded: Some(true),
             error: None,
@@ -3271,24 +3698,24 @@ mod tests {
 
     #[test]
     fn a_signal_is_a_crash_and_a_clean_exit_is_an_exit() {
-        let crashed = end("exited", None, Some(9));
+        let crashed = end(EndCause::Exited, None, Some(9));
         assert_eq!(classify(&facts(Some(&crashed))), Cause::Crashed);
-        let nonzero = end("exited", Some(1), None);
+        let nonzero = end(EndCause::Exited, Some(1), None);
         assert_eq!(classify(&facts(Some(&nonzero))), Cause::Crashed);
-        let clean = end("exited", Some(0), None);
+        let clean = end(EndCause::Exited, Some(0), None);
         assert_eq!(classify(&facts(Some(&clean))), Cause::Exited);
         // A terminal that disappeared while its server lives on is a crash.
-        let gone = end("lost", None, None);
+        let gone = end(EndCause::Lost, None, None);
         assert_eq!(classify(&facts(Some(&gone))), Cause::Crashed);
         // A stop the Bridge recorded on its own (a workspace kept off its
         // branch) ends the session: nothing revives it.
-        let stopped = end("stopped", None, None);
+        let stopped = end(EndCause::Stopped, None, None);
         assert_eq!(classify(&facts(Some(&stopped))), Cause::Stopped);
     }
 
     #[test]
     fn the_more_specific_fact_wins() {
-        let nonzero = end("exited", Some(1), None);
+        let nonzero = end(EndCause::Exited, Some(1), None);
         // A non-zero exit under the disk floor is a full disk, not a crash.
         let reading = crate::disk::Reading {
             place: crate::disk::Place {
@@ -3311,7 +3738,10 @@ mod tests {
         // A person's Stop outranks everything.
         let stopped = stop("bb-stop-1", 7);
         let by_person = Facts {
-            stop: Some(&stopped),
+            stop: Some(StopFact {
+                stop: &stopped,
+                kind: StopKind::Other,
+            }),
             terminal_server_gone: true,
             ..facts(Some(&nonzero))
         };
@@ -3344,7 +3774,7 @@ mod tests {
         };
         assert_eq!(classify(&dark), Cause::DatabaseUnavailable);
         // An end found at recovery with its terminal server gone.
-        let lost_end = end("lost", None, None);
+        let lost_end = end(EndCause::Lost, None, None);
         let lost = Facts {
             terminal_server_gone: true,
             ..facts(Some(&lost_end))
@@ -3524,46 +3954,44 @@ mod tests {
         Execution {
             id: "exec_7".to_string(),
             started_at_ms: 1_000,
-            ended_at_ms: ended,
-            cause: ended.map(|_| "exited".to_string()),
-            exit_code: Some(0),
-            signal: None,
-            evidence: None,
             workspace: None,
-            end_event_id: ended.map(|_| 90),
             terminal_server: None,
+            state: match ended {
+                None => ExecutionState::Running,
+                Some(ended_at_ms) => ExecutionState::Ended(End {
+                    event_id: 90,
+                    ended_at_ms,
+                    cause: RecordedEndCause::Exited,
+                    exit_code: Some(0),
+                    signal: None,
+                    evidence: None,
+                }),
+            },
         }
     }
 
-    fn recorded(what: &str, path: &str, attempt: u32, fact: i64, event_id: i64) -> Recorded {
-        Recorded {
+    fn recorded_interrupted(
+        schedule: RecoverySchedule,
+        attempt: u32,
+        fact: i64,
+        event_id: i64,
+    ) -> Recorded {
+        Recorded::Interrupted(Interrupted {
             event_id,
             at_ms: 1_000,
-            record: json!({
-                "type": what,
-                "cause": "crashed",
-                "path": path,
-                "attempt": attempt,
-                "fact_event_id": fact,
-                "due_ms": 1_000,
-            }),
-        }
+            cause: Cause::Crashed,
+            schedule: RecordedSchedule::Explicit(schedule),
+            attempt,
+            fact_event_id: fact,
+            evidence: Value::Null,
+        })
     }
 
-    /// The clear of the wait `wait` answers: what shows its cause gone,
-    /// recorded after it.
-    fn cleared_after(wait: &Recorded, event_id: i64) -> Recorded {
-        Recorded {
+    /// The clear of an interruption: what shows its cause gone, recorded after it.
+    fn cleared_after(_wait: &Recorded, event_id: i64) -> Recorded {
+        Recorded::Cleared {
             event_id,
             at_ms: 1_400,
-            record: json!({
-                "type": "execution.cleared",
-                "execution_id": "exec_1",
-                "session_id": "session_worker_recovery",
-                "cause": wait.record["cause"],
-                "evidence": {},
-                "waited_ms": 400,
-            }),
         }
     }
 
@@ -3586,11 +4014,14 @@ mod tests {
         ];
         // Nothing recorded: the first failed turn is the next fact.
         match pending(&[], &turns, &[], &execution, &[], &[]) {
-            Some(super::Fact::Turn(turn)) => assert_eq!(turn.event_id, 50),
+            Some(super::Fact::Turn { turn, cause }) => {
+                assert_eq!(turn.event_id, 50);
+                assert_eq!(cause, Cause::ModelUnavailable);
+            }
             _ => panic!("the first failed turn"),
         }
         // That turn recorded: the second one.
-        let first = recorded("execution.interrupted", "wait", 1, 50, 10);
+        let first = recorded_interrupted(RecoverySchedule::Wait { due_ms: 1_000 }, 1, 50, 10);
         match pending(
             std::slice::from_ref(&first),
             &turns,
@@ -3599,11 +4030,14 @@ mod tests {
             &[],
             &[],
         ) {
-            Some(super::Fact::Turn(turn)) => assert_eq!(turn.event_id, 60),
+            Some(super::Fact::Turn { turn, cause }) => {
+                assert_eq!(turn.event_id, 60);
+                assert_eq!(cause, Cause::ModelUnavailable);
+            }
             _ => panic!("the second failed turn"),
         }
         // Both, their wait cleared, and the end after them.
-        let second = recorded("execution.interrupted", "wait", 2, 60, 11);
+        let second = recorded_interrupted(RecoverySchedule::Wait { due_ms: 1_000 }, 2, 60, 11);
         let clear = cleared_after(&second, 12);
         match pending(
             &[first.clone(), second.clone(), clear.clone()],
@@ -3630,7 +4064,7 @@ mod tests {
             "an open wait's end is its revival's, not a new interruption"
         );
         // The end recorded: nothing, however often the loop reads it.
-        let ended = recorded("execution.interrupted", "resume", 3, 90, 13);
+        let ended = recorded_interrupted(RecoverySchedule::Resume { due_ms: 1_000 }, 3, 90, 13);
         assert!(
             pending(
                 &[first, second, clear, ended],
@@ -3668,7 +4102,10 @@ mod tests {
         let execution = execution(Some(2_000));
         // The disk's failure is the next fact, ahead of the end at 90.
         match pending(&[], &[], std::slice::from_ref(&full), &execution, &[], &[]) {
-            Some(super::Fact::Tool(tool)) => assert_eq!(tool.event_id, 55),
+            Some(super::Fact::Tool { tool, cause }) => {
+                assert_eq!(tool.event_id, 55);
+                assert_eq!(cause, Cause::DiskFull);
+            }
             _ => panic!("the disk's tool failure"),
         }
         // An ordinary failed tool explains nothing: the end is next.
@@ -3691,7 +4128,7 @@ mod tests {
                 &[],
                 &[]
             ),
-            Some(super::Fact::Turn(_))
+            Some(super::Fact::Turn { .. })
         ));
         let later = Turn {
             event_id: 60,
@@ -3706,7 +4143,7 @@ mod tests {
                 &[],
                 &[]
             ),
-            Some(super::Fact::Tool(_))
+            Some(super::Fact::Tool { .. })
         ));
     }
 
@@ -3728,7 +4165,7 @@ mod tests {
     #[test]
     fn an_open_wait_explains_its_execution_until_a_person_stops_it() {
         let execution = execution(Some(2_000));
-        let waiting = recorded("execution.interrupted", "wait", 1, 50, 10);
+        let waiting = recorded_interrupted(RecoverySchedule::Wait { due_ms: 1_000 }, 1, 50, 10);
         // The wait is open: the end is its revival's, not a new interruption.
         assert!(
             pending(
@@ -3755,12 +4192,11 @@ mod tests {
             Some(super::Fact::End(_))
         ));
         // A handoff's own Stop explains the end it made.
-        let handoff = recorded("execution.interrupted", "handoff", 1, 50, 10);
+        let handoff = recorded_interrupted(RecoverySchedule::Handoff { due_ms: 1_000 }, 1, 50, 10);
         let sent = Sent {
             key: "recover-exec_7-1-stop".to_string(),
             created_at_ms: 1,
-            finished_at_ms: Some(2),
-            succeeded: Some(true),
+            outcome: SentOutcome::Succeeded { finished_at_ms: 2 },
         };
         assert!(
             pending(&[handoff], &[], &[], &execution, &[], &[sent]).is_none(),
@@ -3857,28 +4293,31 @@ mod tests {
         }
     }
 
+    fn auth_wait_interrupted() -> Interrupted {
+        Interrupted {
+            event_id: 1,
+            at_ms: 1_000,
+            cause: Cause::ModelAuth,
+            schedule: RecordedSchedule::Explicit(RecoverySchedule::Wait { due_ms: 1_801_000 }),
+            attempt: 1,
+            fact_event_id: 0,
+            evidence: Value::Null,
+        }
+    }
+
     /// A failed `Start` from `AuthRetry::Handoff` with no native session must
     /// wait its resume backoff and then retry under `-r1` as `CommandAction::Start`
     /// (preserving the handoff prompt and charter), never `CommandAction::Resume`.
     #[test]
     fn a_failed_model_auth_handoff_without_native_session_retries_as_start() {
         let config = Config::default();
-        let last = Recorded {
-            event_id: 1,
-            at_ms: 1_000,
-            record: json!({
-                "type": "execution.interrupted",
-                "cause": "model_auth",
-                "path": "wait",
-                "attempt": 1,
-                "due_ms": 1_801_000,
-            }),
-        };
+        let last = auth_wait_interrupted();
         let commands = vec![Sent {
             key: "recover-exec_7-1".to_string(),
             created_at_ms: 1_801_000,
-            finished_at_ms: Some(1_802_000),
-            succeeded: Some(false),
+            outcome: SentOutcome::Failed {
+                finished_at_ms: 1_802_000,
+            },
         }];
         let expected_due = resume_due(config.resume_backoff, 1, Some(1_802_000), 1_810_000);
 
@@ -3922,22 +4361,13 @@ mod tests {
     #[test]
     fn a_failed_model_auth_handoff_after_spent_resumes_retries_as_start() {
         let config = Config::default();
-        let last = Recorded {
-            event_id: 1,
-            at_ms: 1_000,
-            record: json!({
-                "type": "execution.interrupted",
-                "cause": "model_auth",
-                "path": "wait",
-                "attempt": 1,
-                "due_ms": 1_801_000,
-            }),
-        };
+        let last = auth_wait_interrupted();
         let commands = vec![Sent {
             key: "recover-exec_7-1".to_string(),
             created_at_ms: 1_801_000,
-            finished_at_ms: Some(1_802_000),
-            succeeded: Some(false),
+            outcome: SentOutcome::Failed {
+                finished_at_ms: 1_802_000,
+            },
         }];
         let expected_due = resume_due(config.resume_backoff, 1, Some(1_802_000), 1_802_000);
         let env = RevivalEnv {
@@ -3968,31 +4398,29 @@ mod tests {
     #[test]
     fn a_pending_or_succeeded_handoff_retry_emits_nothing_and_a_failed_r1_schedules_r2_as_start() {
         let config = Config::default();
-        let last = Recorded {
-            event_id: 1,
-            at_ms: 1_000,
-            record: json!({
-                "type": "execution.interrupted",
-                "cause": "model_auth",
-                "path": "wait",
-                "attempt": 1,
-                "due_ms": 1_801_000,
-            }),
-        };
+        let last = auth_wait_interrupted();
         let base_failed = Sent {
             key: "recover-exec_7-1".to_string(),
             created_at_ms: 1_801_000,
-            finished_at_ms: Some(1_802_000),
-            succeeded: Some(false),
+            outcome: SentOutcome::Failed {
+                finished_at_ms: 1_802_000,
+            },
         };
-        for outcome in [None, Some(true)] {
+        for outcome in [
+            SentOutcome::Pending,
+            SentOutcome::Cancelled {
+                finished_at_ms: 1_825_000,
+            },
+            SentOutcome::Succeeded {
+                finished_at_ms: 1_825_000,
+            },
+        ] {
             let commands = vec![
                 base_failed.clone(),
                 Sent {
                     key: "recover-exec_7-1-r1".to_string(),
                     created_at_ms: 1_822_000,
-                    finished_at_ms: outcome.map(|_| 1_825_000),
-                    succeeded: outcome,
+                    outcome,
                 },
             ];
             let env = RevivalEnv {
@@ -4016,8 +4444,9 @@ mod tests {
             Sent {
                 key: "recover-exec_7-1-r1".to_string(),
                 created_at_ms: 1_822_000,
-                finished_at_ms: Some(1_825_000),
-                succeeded: Some(false),
+                outcome: SentOutcome::Failed {
+                    finished_at_ms: 1_825_000,
+                },
             },
         ];
         let due_r2 = resume_due(config.resume_backoff, 2, Some(1_825_000), 1_825_000);
@@ -4148,7 +4577,10 @@ mod tests {
         }
         assert_eq!(Cause::ModelError.name(), "model_error");
         assert_eq!(Cause::ModelError.path(), Path::Final);
-        assert_eq!(Cause::from_name("model_error"), Some(Cause::ModelError));
+        assert_eq!(
+            serde_json::from_value::<Cause>(json!("model_error")).expect("cause deserialize"),
+            Cause::ModelError
+        );
 
         // The latest failed turn before the end, with no progress after it.
         let turns = [invalid.clone()];
@@ -4167,13 +4599,13 @@ mod tests {
             "a transient failure after it is the latest"
         );
 
-        let nonzero = end("exited", Some(1), None);
+        let nonzero = end(EndCause::Exited, Some(1), None);
         let after_refusal = Facts {
             model_error: Some(&invalid),
             ..facts(Some(&nonzero))
         };
         assert_eq!(classify(&after_refusal), Cause::ModelError);
-        let clean = end("exited", Some(0), None);
+        let clean = end(EndCause::Exited, Some(0), None);
         assert_eq!(
             classify(&Facts {
                 model_error: Some(&invalid),
@@ -4184,7 +4616,10 @@ mod tests {
         let stopped = stop("bb-stop-1", 7);
         assert_eq!(
             classify(&Facts {
-                stop: Some(&stopped),
+                stop: Some(StopFact {
+                    stop: &stopped,
+                    kind: StopKind::Other,
+                }),
                 ..after_refusal
             }),
             Cause::Stopped,
@@ -4195,15 +4630,14 @@ mod tests {
         assert_eq!(path, Path::Final);
     }
 
-    fn executed(id: &str, key: &str, progress: bool, last_cause: Option<&str>) -> Executed {
+    fn executed(id: &str, key: &str, progress: bool, last_cause: Option<Cause>) -> Executed {
         Executed {
             id: id.to_string(),
             started_at_ms: 0,
             ended_at_ms: Some(5_000),
-            duration_ms: Some(5_000),
             progress,
             key: key.to_string(),
-            last_cause: last_cause.map(str::to_string),
+            last_cause,
         }
     }
 
@@ -4213,7 +4647,7 @@ mod tests {
     /// progress, or one a person started, ends the run.
     #[test]
     fn model_resumes_count_the_run_of_revivals_after_transient_ends() {
-        let unavailable = Some("model_unavailable");
+        let unavailable = Some(Cause::ModelUnavailable);
         let chain = [
             executed("exec_1", "dispatch-task-7", false, unavailable),
             executed("exec_2", "recover-exec_1-1", false, unavailable),
@@ -4246,7 +4680,7 @@ mod tests {
         assert_eq!(model_resumes(&by_person, "exec_3"), 1);
         // A crash's resume is no model retry.
         let crashed = [
-            executed("exec_1", "dispatch-task-7", false, Some("crashed")),
+            executed("exec_1", "dispatch-task-7", false, Some(Cause::Crashed)),
             executed("exec_2", "recover-exec_1-1", false, unavailable),
         ];
         assert_eq!(model_resumes(&crashed, "exec_2"), 0);
@@ -4258,7 +4692,6 @@ mod tests {
             id: "exec_1".to_string(),
             started_at_ms: 1_000,
             ended_at_ms: Some(4_000),
-            duration_ms: Some(3_000),
             progress: false,
             key: "recover-exec_1-1".to_string(),
             last_cause: None,
@@ -4317,81 +4750,106 @@ mod tests {
     /// from anyone else, or one no record gives, is `stopped`.
     #[test]
     fn a_restart_or_reassign_is_told_from_its_record_and_the_dispatchers_stop() {
-        use super::{Moved, moved};
         let work = moved_work();
+        let assert_fact = |stops: &[Stop], session: &str, expected: &Stop, kind: StopKind| {
+            assert_eq!(
+                stop_fact(stops, session, &work),
+                Some(StopFact {
+                    stop: expected,
+                    kind,
+                })
+            );
+        };
         let restart = dispatcher_stop("restart-7-1-stop", 40);
-        assert_eq!(
-            moved(std::slice::from_ref(&restart), "session_worker_a_7", &work),
-            Some(Moved::Restarted { task: 7, n: 1 })
+        assert_fact(
+            std::slice::from_ref(&restart),
+            "session_worker_a_7",
+            &restart,
+            StopKind::Restarted { task: 7, n: 1 },
         );
         let reassign = dispatcher_stop("reassign-8-stop", 41);
-        assert_eq!(
-            moved(std::slice::from_ref(&reassign), "session_worker_b_8", &work),
-            Some(Moved::Reassigned {
-                task: 8,
-                to_task: 9,
-                to_session: Some("session_worker_b_9".to_string()),
-            })
+        let expected_reassigned = StopKind::Reassigned {
+            task: 8,
+            to_task: 9,
+            to_session: Some("session_worker_b_9".to_string()),
+        };
+        assert_fact(
+            std::slice::from_ref(&reassign),
+            "session_worker_b_8",
+            &reassign,
+            expected_reassigned.clone(),
         );
         // A retry of the dispatcher's Stop carries its purpose.
         let retry = dispatcher_stop("stop-exec_b-retry-1", 42);
-        assert!(matches!(
-            moved(&[reassign.clone(), retry], "session_worker_b_8", &work),
-            Some(Moved::Reassigned { task: 8, .. })
-        ));
+        assert_fact(
+            &[reassign.clone(), retry.clone()],
+            "session_worker_b_8",
+            &retry,
+            expected_reassigned,
+        );
         // A person's Stop with the dispatcher's key is a person's.
-        assert_eq!(
-            moved(&[stop("restart-7-1-stop", 43)], "session_worker_a_7", &work),
-            None
+        let fake = stop("restart-7-1-stop", 43);
+        assert_fact(
+            std::slice::from_ref(&fake),
+            "session_worker_a_7",
+            &fake,
+            StopKind::Other,
         );
         // A restart no record gives (another n), or another session's.
-        assert_eq!(
-            moved(
-                &[dispatcher_stop("restart-7-2-stop", 44)],
-                "session_worker_a_7",
-                &work
-            ),
-            None
+        let wrong_n = dispatcher_stop("restart-7-2-stop", 44);
+        assert_fact(
+            std::slice::from_ref(&wrong_n),
+            "session_worker_a_7",
+            &wrong_n,
+            StopKind::Other,
         );
-        assert_eq!(
-            moved(std::slice::from_ref(&restart), "session_worker_b_8", &work),
-            None
+        assert_fact(
+            std::slice::from_ref(&restart),
+            "session_worker_b_8",
+            &restart,
+            StopKind::Other,
         );
         // A later person's Stop is the one that ended it.
-        assert_eq!(
-            moved(
-                &[restart.clone(), stop("bb-stop", 45)],
-                "session_worker_a_7",
-                &work
-            ),
-            None
+        let later_person = stop("bb-stop", 45);
+        assert_fact(
+            &[restart.clone(), later_person.clone()],
+            "session_worker_a_7",
+            &later_person,
+            StopKind::Other,
         );
 
-        let ended = end("stopped", None, None);
+        let ended = end(EndCause::Stopped, None, None);
         let told = Facts {
-            stop: Some(&restart),
-            moved: moved(std::slice::from_ref(&restart), "session_worker_a_7", &work),
+            stop: stop_fact(std::slice::from_ref(&restart), "session_worker_a_7", &work),
             ..facts(Some(&ended))
         };
         assert_eq!(classify(&told), Cause::Restarted);
         assert_eq!(way(Cause::Restarted, true, 0).0, Path::Final);
         let reassigned = Facts {
-            stop: Some(&reassign),
-            moved: moved(std::slice::from_ref(&reassign), "session_worker_b_8", &work),
+            stop: stop_fact(std::slice::from_ref(&reassign), "session_worker_b_8", &work),
             ..facts(Some(&ended))
         };
         assert_eq!(classify(&reassigned), Cause::Reassigned);
         assert_eq!(way(Cause::Reassigned, true, 0).0, Path::Final);
         assert_eq!(
             classify(&Facts {
-                stop: Some(&restart),
+                stop: Some(StopFact {
+                    stop: &restart,
+                    kind: StopKind::Other,
+                }),
                 ..facts(Some(&ended))
             }),
             Cause::Stopped,
             "without the record it is a Stop like any other"
         );
-        assert_eq!(Cause::from_name("restarted"), Some(Cause::Restarted));
-        assert_eq!(Cause::from_name("reassigned"), Some(Cause::Reassigned));
+        assert_eq!(
+            serde_json::from_value::<Cause>(json!("restarted")).expect("restarted cause"),
+            Cause::Restarted
+        );
+        assert_eq!(
+            serde_json::from_value::<Cause>(json!("reassigned")).expect("reassigned cause"),
+            Cause::Reassigned
+        );
     }
 
     /// The recovery keeps a reassigned ephemeral worker (to record its end)
@@ -4420,5 +4878,390 @@ mod tests {
             &work,
             &none
         ));
+    }
+
+    #[test]
+    fn execution_boundary_rejects_impossible_states_and_facts_row_fails_closed() {
+        for end_cause in ["exited", "stopped", "lost"] {
+            let parsed: Execution = serde_json::from_value(json!({
+                "id": "exec_1",
+                "started_at_ms": 1_000,
+                "ended_at_ms": 2_000,
+                "cause": end_cause,
+                "exit_code": 1,
+                "signal": 9,
+                "evidence": "pane gone",
+                "end_event_id": 42,
+            }))
+            .expect("valid ended execution");
+            assert!(!parsed.is_live());
+            assert_eq!(parsed.end().expect("ended").event_id, 42);
+        }
+
+        // Running execution with any execution.ended field is rejected.
+        for bad in [
+            json!({"id": "exec_1", "started_at_ms": 1_000, "cause": "exited"}),
+            json!({"id": "exec_1", "started_at_ms": 1_000, "exit_code": 0}),
+            json!({"id": "exec_1", "started_at_ms": 1_000, "signal": 9}),
+            json!({"id": "exec_1", "started_at_ms": 1_000, "evidence": "lost"}),
+            json!({"id": "exec_1", "started_at_ms": 1_000, "end_event_id": 90}),
+            // Ended execution missing cause, unknown cause, or non-positive/missing end_event_id.
+            json!({"id": "exec_1", "started_at_ms": 1_000, "ended_at_ms": 2_000, "end_event_id": 90}),
+            json!({"id": "exec_1", "started_at_ms": 1_000, "ended_at_ms": 2_000, "cause": "bogus", "end_event_id": 90}),
+            json!({"id": "exec_1", "started_at_ms": 1_000, "ended_at_ms": 2_000, "cause": "exited"}),
+            json!({"id": "exec_1", "started_at_ms": 1_000, "ended_at_ms": 2_000, "cause": "exited", "end_event_id": 0}),
+        ] {
+            assert!(
+                serde_json::from_value::<Execution>(bad.clone()).is_err(),
+                "expected illegal execution rejected: {bad}"
+            );
+        }
+
+        // FactsRow with execution: null succeeds (never ran); malformed execution fails closed.
+        let never_ran: FactsRow = serde_json::from_value(json!({
+            "session_id": "session_worker_1",
+            "agent_id": "agent_worker_1",
+            "execution": null,
+        }))
+        .expect("null execution is legal");
+        assert!(never_ran.execution.is_none());
+
+        let malformed_row = serde_json::from_value::<FactsRow>(json!({
+            "session_id": "session_worker_1",
+            "agent_id": "agent_worker_1",
+            "execution": {"id": "exec_1", "started_at_ms": 1_000, "ended_at_ms": 2_000},
+        }));
+        assert!(
+            malformed_row.is_err(),
+            "malformed execution in FactsRow must fail closed instead of swallowing"
+        );
+    }
+
+    #[test]
+    fn recorded_boundary_enforces_schedule_and_rejects_illegal_combinations() {
+        for (path, due_ms, expected) in [
+            (
+                "resume",
+                json!(1_000),
+                RecoverySchedule::Resume { due_ms: 1_000 },
+            ),
+            (
+                "handoff",
+                json!(2_000),
+                RecoverySchedule::Handoff { due_ms: 2_000 },
+            ),
+            (
+                "wait",
+                json!(3_000),
+                RecoverySchedule::Wait { due_ms: 3_000 },
+            ),
+            ("final", Value::Null, RecoverySchedule::Final),
+        ] {
+            let parsed: Recorded = serde_json::from_value(json!({
+                "event_id": 10,
+                "at_ms": 500,
+                "record": {
+                    "type": "execution.interrupted",
+                    "cause": "crashed",
+                    "path": path,
+                    "attempt": 1,
+                    "due_ms": due_ms,
+                    "fact_event_id": 7,
+                    "evidence": {},
+                }
+            }))
+            .expect("valid schedule");
+            match parsed {
+                Recorded::Interrupted(interrupted) => {
+                    assert_eq!(interrupted.schedule, RecordedSchedule::Explicit(expected));
+                    assert_eq!(interrupted.explicit_path(), Some(expected.path()));
+                    assert_eq!(interrupted.effective_path(), expected.path());
+                }
+                Recorded::Cleared { .. } => panic!("expected Interrupted"),
+            }
+        }
+
+        let cleared: Recorded = serde_json::from_value(json!({
+            "event_id": 11,
+            "at_ms": 600,
+            "record": {"type": "execution.cleared", "cause": "disk_full", "waited_ms": 100}
+        }))
+        .expect("valid cleared record");
+        assert_eq!(
+            cleared,
+            Recorded::Cleared {
+                event_id: 11,
+                at_ms: 600
+            }
+        );
+
+        for bad_record in [
+            json!({"type": "execution.interrupted", "cause": "stopped", "path": "final", "attempt": 1, "due_ms": 1_000}),
+            json!({"type": "execution.interrupted", "cause": "crashed", "path": "resume", "attempt": 1, "due_ms": "soon"}),
+            json!({"type": "execution.interrupted", "cause": "crashed", "path": "resume", "attempt": 0, "due_ms": 1_000}),
+            json!({"type": "execution.interrupted", "cause": "unknown_cause", "path": "final", "attempt": 1}),
+            json!({"type": "execution.interrupted", "cause": "crashed", "path": "loop_forever", "attempt": 1, "due_ms": 1_000}),
+            json!({"type": "host.disk", "state": "low"}),
+            json!({"cause": "crashed"}),
+            json!(42),
+        ] {
+            let err = serde_json::from_value::<Recorded>(json!({
+                "event_id": 1,
+                "at_ms": 1_000,
+                "record": bad_record,
+            }));
+            assert!(
+                err.is_err(),
+                "expected illegal recovery record rejected: {bad_record}"
+            );
+        }
+    }
+
+    #[test]
+    fn sent_boundary_enforces_outcome_invariants() {
+        let pending: Sent = serde_json::from_value(json!({
+            "key": "recover-exec_1-1",
+            "created_at_ms": 100,
+            "finished_at_ms": null,
+            "succeeded": null,
+        }))
+        .expect("pending sent");
+        assert_eq!(pending.outcome, SentOutcome::Pending);
+
+        let cancelled: Sent = serde_json::from_value(json!({
+            "key": "recover-exec_1-1",
+            "created_at_ms": 100,
+            "finished_at_ms": 200,
+            "succeeded": null,
+        }))
+        .expect("cancelled sent");
+        assert_eq!(
+            cancelled.outcome,
+            SentOutcome::Cancelled {
+                finished_at_ms: 200
+            }
+        );
+
+        for (ok, expected) in [
+            (
+                true,
+                SentOutcome::Succeeded {
+                    finished_at_ms: 300,
+                },
+            ),
+            (
+                false,
+                SentOutcome::Failed {
+                    finished_at_ms: 300,
+                },
+            ),
+        ] {
+            let parsed: Sent = serde_json::from_value(json!({
+                "key": "recover-exec_1-1",
+                "created_at_ms": 100,
+                "finished_at_ms": 300,
+                "succeeded": ok,
+            }))
+            .expect("finished sent");
+            assert_eq!(parsed.outcome, expected);
+        }
+
+        for succeeded in [true, false] {
+            assert!(
+                serde_json::from_value::<Sent>(json!({
+                    "key": "recover-exec_1-1",
+                    "created_at_ms": 100,
+                    "finished_at_ms": null,
+                    "succeeded": succeeded,
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn executed_stop_action_and_loop_start_enforce_invariants() {
+        // Executed: legal running, legal ended with last_cause, reject duration without ended_at_ms & invalid cause.
+        let ok_exec: Executed = serde_json::from_value(json!({
+            "id": "exec_1",
+            "started_at_ms": 100,
+            "ended_at_ms": 500,
+            "duration_ms": 400,
+            "progress": true,
+            "key": "recover-exec_0-1",
+            "last_cause": "model_unavailable",
+        }))
+        .expect("valid executed");
+        assert_eq!(ok_exec.last_cause, Some(Cause::ModelUnavailable));
+        assert!(
+            serde_json::from_value::<Executed>(json!({
+                "id": "exec_1",
+                "started_at_ms": 100,
+                "ended_at_ms": null,
+                "duration_ms": 400,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<Executed>(json!({
+                "id": "exec_1",
+                "started_at_ms": 100,
+                "last_cause": "bogus",
+            }))
+            .is_err()
+        );
+
+        // StopAction: stop & discard allowed, others rejected.
+        for (action, expected) in [("stop", StopAction::Stop), ("discard", StopAction::Discard)] {
+            let stop: Stop = serde_json::from_value(json!({
+                "command_id": 1,
+                "principal": "human",
+                "key": "human-1",
+                "action": action,
+            }))
+            .expect("valid stop action");
+            assert_eq!(stop.action, expected);
+        }
+        assert!(
+            serde_json::from_value::<Stop>(json!({
+                "command_id": 1,
+                "principal": "human",
+                "key": "human-1",
+                "action": "input",
+            }))
+            .is_err()
+        );
+
+        // Recovery LoopStart invariants.
+        let mut recovery = Recovery::new();
+        assert_eq!(recovery.earlier_boot_id(), None);
+        recovery.start = LoopStart::Recorded {
+            earlier_boot_id: Some("boot-abc".to_string()),
+        };
+        assert_eq!(recovery.earlier_boot_id(), Some("boot-abc"));
+    }
+
+    #[test]
+    fn historical_2026_11_08_shapes_decode_cleanly() {
+        // 1. Historical `execution.ended` with `cause: "memory_limit"` (4492e363..47717497).
+        let legacy_exec: Execution = serde_json::from_value(json!({
+            "id": "exec_1436",
+            "started_at_ms": 1_762_560_000_000_i64,
+            "ended_at_ms": 1_762_560_005_000_i64,
+            "cause": "memory_limit",
+            "exit_code": null,
+            "signal": 9,
+            "evidence": "systemd oom-kill",
+            "end_event_id": 77,
+        }))
+        .expect("historical memory_limit execution.ended must decode");
+        let ended = legacy_exec.end().expect("ended");
+        assert_eq!(ended.cause, RecordedEndCause::MemoryLimit);
+        assert_eq!(json!(ended.cause), json!("memory_limit"));
+        assert_eq!(
+            classify(&Facts {
+                end: Some(ended),
+                ..Facts::default()
+            }),
+            Cause::Crashed
+        );
+
+        // 2. Historical non-`final` `execution.interrupted` without `due_ms` (or `due_ms: null`).
+        for (path, due_field, expected_path) in [
+            ("resume", None, Path::Resume),
+            ("handoff", Some(Value::Null), Path::Handoff),
+            ("wait", None, Path::Wait),
+        ] {
+            let mut rec = json!({
+                "type": "execution.interrupted",
+                "cause": "memory_limit",
+                "path": path,
+                "attempt": 1,
+                "fact_event_id": 77,
+                "evidence": {},
+            });
+            if let Some(due) = due_field {
+                rec["due_ms"] = due;
+            }
+            let parsed: Recorded = serde_json::from_value(json!({
+                "event_id": 88,
+                "at_ms": 1_762_560_006_000_i64,
+                "record": rec,
+            }))
+            .expect("historical non-final record without due_ms must decode");
+            match parsed {
+                Recorded::Interrupted(interrupted) => {
+                    assert_eq!(
+                        interrupted.schedule,
+                        RecordedSchedule::Legacy {
+                            path: Some(expected_path),
+                            due_ms: None,
+                        }
+                    );
+                    assert_eq!(interrupted.explicit_path(), Some(expected_path));
+                    assert_eq!(interrupted.effective_path(), expected_path);
+                    assert_eq!(interrupted.due_ms(), None);
+                }
+                Recorded::Cleared { .. } => panic!("expected Interrupted"),
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_facts_row_skips_only_affected_session_with_sanitized_log() {
+        let healthy = |session: &str| {
+            Ok(json!({
+                "session_id": session,
+                "agent_id": format!("agent_{session}"),
+                "execution": {
+                    "id": format!("exec_{session}"),
+                    "started_at_ms": 1_000,
+                },
+            }))
+        };
+        let malformed = Ok(json!({
+            "session_id": "bad_session",
+            "agent_id": "agent_bad",
+            "execution": {
+                "id": "exec_bad",
+                "started_at_ms": 1_000,
+                "ended_at_ms": 2_000,
+                "cause": "sk-live-secret-do-not-echo",
+                "end_event_id": 55,
+            },
+        }));
+        let mut lines = Vec::new();
+        let mut visited = Vec::new();
+        let outcome = visit_pass_rows(
+            vec![
+                ("healthy_1".to_string(), healthy("healthy_1")),
+                ("bad_session".to_string(), malformed),
+                ("healthy_2".to_string(), healthy("healthy_2")),
+            ],
+            &mut lines,
+            |row| {
+                visited.push(row.session_id.clone());
+                Ok(vec![format!("ok: {}", row.session_id)])
+            },
+        );
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(visited, ["healthy_1", "healthy_2"]);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "ok: healthy_1");
+        assert!(
+            lines[1].contains("bad_session") && !lines[1].contains("sk-live-secret-do-not-echo"),
+            "skip line must name session and redact raw value: {}",
+            lines[1]
+        );
+        assert_eq!(lines[2], "ok: healthy_2");
+
+        // Store/transport failures still propagate for outage backoff and handling.
+        let mut err_lines = Vec::new();
+        let transport_err = visit_pass_rows(
+            vec![("s1".to_string(), Err("connection refused".to_string()))],
+            &mut err_lines,
+            |_row| Ok(Vec::new()),
+        );
+        assert_eq!(transport_err, Err("connection refused".to_string()));
     }
 }
