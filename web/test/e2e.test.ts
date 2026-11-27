@@ -1,7 +1,9 @@
 // Pure WebCrypto verification of `docs/spawn-e2e-v2.md` against the frozen
-// golden & reject fixtures in `crates/spawn-node-proto/testdata/`.
+// golden & reject fixtures vendored in `web/test/fixtures/` (mirrored
+// byte-for-byte from `crates/spawn-node-proto/testdata/` so `web/` tests stay
+// self-contained in isolated runs such as `rsi/scenarios/120.sh`).
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import {
@@ -37,8 +39,9 @@ import {
   type RequestEnvelope,
 } from "../src/e2e.ts";
 
-const pkcs8Dir = new URL("../../crates/spawn-node-proto/testdata/pkcs8-ed25519-v2/", import.meta.url);
-const e2eDir = new URL("../../crates/spawn-node-proto/testdata/spawn-e2e-v2/", import.meta.url);
+const pkcs8Dir = new URL("./fixtures/pkcs8-ed25519-v2/", import.meta.url);
+const e2eDir = new URL("./fixtures/spawn-e2e-v2/", import.meta.url);
+const canonicalTestdataDir = new URL("../../crates/spawn-node-proto/testdata/", import.meta.url);
 
 const readBytes = (dir: URL, name: string): Uint8Array =>
   new Uint8Array(readFileSync(new URL(name, dir)));
@@ -383,4 +386,59 @@ test("spawn-e2e-v2 enforces strict unpadded base64url, clock skew, replay cache,
       ),
     (err: unknown) => err instanceof E2EError && err.code === "invalid_envelope",
   );
+});
+
+test("vendored web/test/fixtures/ match MANIFEST.sha256 and stay byte-for-byte identical to crates/spawn-node-proto/testdata/", async () => {
+  const suites = ["pkcs8-ed25519-v2", "spawn-e2e-v2"] as const;
+  const listRegularFiles = (dir: URL): string[] => {
+    const entries = readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      assert.equal(entry.isFile(), true, `unexpected non-file entry ${entry.name} in ${dir.pathname}`);
+    }
+    return entries.map((entry) => entry.name).sort();
+  };
+
+  for (const suite of suites) {
+    const vendoredDir = new URL(`./fixtures/${suite}/`, import.meta.url);
+    const vendoredFiles = listRegularFiles(vendoredDir);
+    assert.ok(vendoredFiles.includes("MANIFEST.sha256"), `${suite} missing MANIFEST.sha256`);
+
+    // Always verify vendored fixture integrity against MANIFEST.sha256 (works in isolated web runs too).
+    const manifestLines = readFileSync(new URL("MANIFEST.sha256", vendoredDir), "utf8")
+      .trim()
+      .split(/\r?\n/);
+    const manifestFiles: string[] = [];
+    for (const line of manifestLines) {
+      const match = /^([0-9a-f]{64})  (.+)$/.exec(line);
+      assert.ok(match && match[1] && match[2], `invalid MANIFEST.sha256 line in ${suite}: ${line}`);
+      const [, expectedHex, name] = match;
+      manifestFiles.push(name);
+      assert.equal(
+        bytesToHex(await sha256(readBytes(vendoredDir, name))),
+        expectedHex,
+        `sha256 mismatch for vendored ${suite}/${name}`,
+      );
+    }
+    assert.deepEqual(
+      vendoredFiles.filter((f) => f !== "MANIFEST.sha256"),
+      manifestFiles.sort(),
+      `vendored file list vs MANIFEST.sha256 for ${suite}`,
+    );
+
+    // When running inside the full repository, enforce exact byte-for-byte parity
+    // with the canonical fixtures in `crates/spawn-node-proto/testdata/` (zero missing/extra files).
+    if (existsSync(canonicalTestdataDir)) {
+      const canonicalDir = new URL(`${suite}/`, canonicalTestdataDir);
+      assert.equal(existsSync(canonicalDir), true, `missing canonical dir ${canonicalDir.pathname}`);
+      const canonicalFiles = listRegularFiles(canonicalDir);
+      assert.deepEqual(vendoredFiles, canonicalFiles, `fixture file list parity for ${suite}`);
+      for (const name of canonicalFiles) {
+        assert.deepEqual(
+          readBytes(vendoredDir, name),
+          readBytes(canonicalDir, name),
+          `byte-for-byte parity for ${suite}/${name}`,
+        );
+      }
+    }
+  }
 });
