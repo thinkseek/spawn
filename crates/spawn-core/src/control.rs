@@ -211,17 +211,6 @@ impl GateVerdict {
             Self::HostFault => "host_fault",
         }
     }
-
-    /// Verdict class pinned by `spawn_integrator_record` (`schema.sql`).
-    const fn expected_class(self) -> GateVerdictClass {
-        match self {
-            Self::Accepted | Self::Rejected | Self::Conflict | Self::Incompatible => {
-                GateVerdictClass::Code
-            }
-            Self::Aborted | Self::HostFault | Self::NoRoom => GateVerdictClass::Infrastructure,
-            Self::Stale => GateVerdictClass::Superseded,
-        }
-    }
 }
 
 /// Responsibility class of a gate verdict (`code`, `infrastructure`, `superseded`).
@@ -937,6 +926,174 @@ pub struct TaskGatedRecord {
     /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// What a `task.gated` record says, one variant per verdict: the record's
+/// loose fields read once, so a class that is not its verdict's, or a host
+/// fault's retry on another verdict, has no value.
+///
+/// The ledger keeps [`TaskGatedRecord`]'s wire fields unchanged (an
+/// append-only log is never rewritten); this is the one reading of them.
+/// A field a variant does not carry says nothing more about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateOutcome<'a> {
+    /// The gate passed the candidate: it may land.
+    Accepted {
+        /// The candidate commit the gate judged.
+        candidate: Option<&'a str>,
+        /// The gate's metric.
+        metric: Option<&'a str>,
+    },
+    /// The work failed its checks (a code fault).
+    Rejected {
+        /// Why, for the worker.
+        note: Option<&'a str>,
+    },
+    /// The work conflicts with main (a code fault).
+    Conflict {
+        /// Why, for the worker.
+        note: Option<&'a str>,
+    },
+    /// The work is incompatible with the baseline (a code fault).
+    Incompatible {
+        /// Why, for the worker.
+        note: Option<&'a str>,
+    },
+    /// The gate stopped before it could judge (infrastructure).
+    Aborted,
+    /// The host had no room to judge (infrastructure).
+    NoRoom {
+        /// This shortage was escalated to the supervisor.
+        escalate: bool,
+    },
+    /// The host could not judge (infrastructure); judged again later.
+    HostFault {
+        /// When it is judged again; none on a record from before backoffs.
+        retry: Option<HostRetry>,
+        /// This fault was escalated to the supervisor.
+        escalate: bool,
+        /// It parked the task (the load-sensitive bound).
+        parked: bool,
+    },
+    /// Newer work or a newer main superseded the candidate.
+    Stale,
+}
+
+/// When a host fault is judged again: `backoff_ms` after its record, at
+/// `due_ms` (which the store writes as the record's time plus the backoff).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostRetry {
+    /// The wait, in milliseconds.
+    pub backoff_ms: i64,
+    /// When the wait ends, in Unix epoch milliseconds, once the store wrote it.
+    pub due_ms: Option<i64>,
+}
+
+impl GateOutcome<'_> {
+    /// The verdict this outcome is.
+    pub const fn verdict(self) -> GateVerdict {
+        match self {
+            Self::Accepted { .. } => GateVerdict::Accepted,
+            Self::Rejected { .. } => GateVerdict::Rejected,
+            Self::Conflict { .. } => GateVerdict::Conflict,
+            Self::Incompatible { .. } => GateVerdict::Incompatible,
+            Self::Aborted => GateVerdict::Aborted,
+            Self::NoRoom { .. } => GateVerdict::NoRoom,
+            Self::HostFault { .. } => GateVerdict::HostFault,
+            Self::Stale => GateVerdict::Stale,
+        }
+    }
+
+    /// Whose the verdict is, as `spawn_integrator_record` (`schema.sql`)
+    /// pins it: the work's, the host's, or no one's (superseded).
+    pub const fn class(self) -> GateVerdictClass {
+        match self {
+            Self::Accepted { .. }
+            | Self::Rejected { .. }
+            | Self::Conflict { .. }
+            | Self::Incompatible { .. } => GateVerdictClass::Code,
+            Self::Aborted | Self::NoRoom { .. } | Self::HostFault { .. } => {
+                GateVerdictClass::Infrastructure
+            }
+            Self::Stale => GateVerdictClass::Superseded,
+        }
+    }
+}
+
+impl TaskGatedRecord {
+    /// What the record says ([`GateOutcome`]). Refuses only what no writer
+    /// ever recorded (`spawn_integrator_record` and the integrator, read
+    /// through their history): a `class` that is not its verdict's (a record
+    /// from before classes names none, and reads as its verdict's); a host
+    /// fault's own field (`backoff_ms`, `due_ms`, `parked`, `alert`) on
+    /// another verdict; a `due_ms` without its `backoff_ms`; a negative
+    /// `backoff_ms`.
+    pub fn outcome(&self) -> Result<GateOutcome<'_>, ControlRecordError> {
+        let kind = ControlRecordKind::TaskGated.as_str();
+        let escalate = self.escalate.unwrap_or(false);
+        let outcome = match self.verdict {
+            GateVerdict::Accepted => GateOutcome::Accepted {
+                candidate: self.candidate.as_deref(),
+                metric: self.metric.as_deref(),
+            },
+            GateVerdict::Rejected => GateOutcome::Rejected {
+                note: self.note.as_deref(),
+            },
+            GateVerdict::Conflict => GateOutcome::Conflict {
+                note: self.note.as_deref(),
+            },
+            GateVerdict::Incompatible => GateOutcome::Incompatible {
+                note: self.note.as_deref(),
+            },
+            GateVerdict::Aborted => GateOutcome::Aborted,
+            GateVerdict::NoRoom => GateOutcome::NoRoom { escalate },
+            GateVerdict::Stale => GateOutcome::Stale,
+            GateVerdict::HostFault => GateOutcome::HostFault {
+                retry: match (self.backoff_ms, self.due_ms) {
+                    (Some(backoff_ms), _) if backoff_ms < 0 => {
+                        return Err(invariant_err(kind, "`backoff_ms` must not be negative"));
+                    }
+                    (Some(backoff_ms), due_ms) => Some(HostRetry { backoff_ms, due_ms }),
+                    (None, Some(_)) => {
+                        return Err(invariant_err(kind, "`due_ms` without `backoff_ms`"));
+                    }
+                    (None, None) => None,
+                },
+                escalate,
+                parked: self.parked.unwrap_or(false),
+            },
+        };
+        if let Some(class) = self.class
+            && class != outcome.class()
+        {
+            return Err(invariant_err(
+                kind,
+                format!(
+                    "verdict `{}` expects class `{}`, not `{class:?}`",
+                    self.verdict.as_str(),
+                    serde_json::to_string(&outcome.class()).unwrap_or_default()
+                ),
+            ));
+        }
+        if !matches!(outcome, GateOutcome::HostFault { .. }) {
+            let host_fields = [
+                ("backoff_ms", self.backoff_ms.is_some()),
+                ("due_ms", self.due_ms.is_some()),
+                ("parked", self.parked.is_some()),
+                ("alert", self.alert.is_some()),
+            ];
+            if let Some((field, _)) = host_fields.iter().find(|(_, set)| *set) {
+                return Err(invariant_err(
+                    kind,
+                    format!(
+                        "`{field}` belongs to a host_fault verdict, not `{}`",
+                        self.verdict.as_str()
+                    ),
+                ));
+            }
+        }
+        Ok(outcome)
+    }
 }
 
 /// Payload for `task.shadow_gated`.
@@ -2826,18 +2983,7 @@ fn validate_control_record_strict(record: &ControlRecord) -> Result<(), ControlR
             }
         }
         ControlRecord::TaskGated(r) => {
-            if let Some(class) = r.class
-                && class != r.verdict.expected_class()
-            {
-                return Err(invariant_err(
-                    kind,
-                    format!(
-                        "verdict `{}` expects class `{}`, not `{class:?}`",
-                        r.verdict.as_str(),
-                        serde_json::to_string(&r.verdict.expected_class()).unwrap_or_default()
-                    ),
-                ));
-            }
+            r.outcome()?;
         }
         ControlRecord::TaskReviewed(r)
             if !r.accepted && r.note.as_deref().is_none_or(|n| n.trim().is_empty()) =>
@@ -3485,6 +3631,11 @@ impl ReplayState {
         {
             return;
         }
+        // A record the strict parser refuses (no writer made one) moves
+        // nothing: it is a stage, never a verdict.
+        let Ok(outcome) = r.outcome() else {
+            return;
+        };
         let accept_mode = self
             .missions
             .get(&ep.mission_id)
@@ -3494,7 +3645,7 @@ impl ReplayState {
             event_seq: seq,
             at_ms,
             revision: judged_revision,
-            verdict: r.verdict,
+            verdict: outcome.verdict(),
             class: r.class,
             base: r.base.clone(),
             candidate: r.candidate.clone(),
@@ -3503,9 +3654,9 @@ impl ReplayState {
         if let Some(base) = &r.base {
             ep.base = Some(base.clone());
         }
-        ep.last_gate_verdict = Some(r.verdict);
+        ep.last_gate_verdict = Some(outcome.verdict());
         ep.updated_at_ms = at_ms;
-        apply_gate_verdict(ep, r, accept_mode);
+        apply_gate_verdict(ep, outcome, accept_mode);
     }
 
     fn on_task_landed(&mut self, seq: i64, at_ms: i64, task_id: i64) {
@@ -3752,36 +3903,36 @@ fn build_legacy_episode(
     }
 }
 
-fn apply_gate_verdict(ep: &mut TaskEpisode, r: &TaskGatedRecord, accept_mode: AcceptMode) {
-    match r.verdict {
-        GateVerdict::Accepted => {
+fn apply_gate_verdict(ep: &mut TaskEpisode, outcome: GateOutcome<'_>, accept_mode: AcceptMode) {
+    match outcome {
+        GateOutcome::Accepted { candidate, metric } => {
             ep.state = TaskState::Landing;
-            ep.candidate.clone_from(&r.candidate);
-            if let Some(metric) = &r.metric {
-                ep.metric = Some(metric.clone());
+            ep.candidate = candidate.map(str::to_string);
+            if let Some(metric) = metric {
+                ep.metric = Some(metric.to_string());
             }
         }
-        GateVerdict::Rejected => {
+        GateOutcome::Rejected { note } => {
             ep.state = TaskState::Revise;
             ep.candidate = None;
-            ep.review_note.clone_from(&r.note);
+            ep.review_note = note.map(str::to_string);
             ep.rework += 1;
             ep.quality_rejections += 1;
         }
-        GateVerdict::Conflict | GateVerdict::Incompatible => {
+        GateOutcome::Conflict { note } | GateOutcome::Incompatible { note } => {
             ep.state = TaskState::Revise;
             ep.candidate = None;
-            ep.review_note.clone_from(&r.note);
+            ep.review_note = note.map(str::to_string);
             ep.rework += 1;
         }
-        GateVerdict::Stale => {
+        GateOutcome::Stale => {
             ep.state = match accept_mode {
                 AcceptMode::Gate => TaskState::Reported,
                 AcceptMode::Review => TaskState::Accepted,
             };
             ep.candidate = None;
         }
-        GateVerdict::Aborted | GateVerdict::NoRoom | GateVerdict::HostFault => {}
+        GateOutcome::Aborted | GateOutcome::NoRoom { .. } | GateOutcome::HostFault { .. } => {}
     }
 }
 
@@ -3833,8 +3984,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ControlRecord, ControlRecordError, ControlRecordKind, EpisodeOutcome, GateVerdict,
-        GradeWire, GradingRecord, GradingRecordKind, replay_task_episodes,
+        ControlRecord, ControlRecordError, ControlRecordKind, EpisodeOutcome, GateOutcome,
+        GateVerdict, GateVerdictClass, GradeWire, GradingRecord, GradingRecordKind, HostRetry,
+        TaskGatedRecord, invariant_err, replay_task_episodes,
     };
     use crate::mission::TaskState;
 
@@ -4277,5 +4429,287 @@ mod tests {
         assert_eq!(episodes[1].continues, Some(21));
         assert_eq!(episodes[2].state, TaskState::Cancelled);
         assert_eq!(episodes[2].outcome, EpisodeOutcome::Cancelled);
+    }
+
+    /// A `task.gated` record, parsed loosely (as replay reads the log).
+    fn gated(value: Value) -> TaskGatedRecord {
+        let mut value = value;
+        value["type"] = json!("task.gated");
+        match ControlRecord::from_value(&value).expect("parse") {
+            ControlRecord::TaskGated(record) => *record,
+            other => panic!("not task.gated: {other:?}"),
+        }
+    }
+
+    const ALL_VERDICTS: [(&str, GateVerdictClass); 8] = [
+        ("accepted", GateVerdictClass::Code),
+        ("rejected", GateVerdictClass::Code),
+        ("conflict", GateVerdictClass::Code),
+        ("incompatible", GateVerdictClass::Code),
+        ("aborted", GateVerdictClass::Infrastructure),
+        ("no_room", GateVerdictClass::Infrastructure),
+        ("host_fault", GateVerdictClass::Infrastructure),
+        ("stale", GateVerdictClass::Superseded),
+    ];
+
+    const ALL_CLASSES: [GateVerdictClass; 3] = [
+        GateVerdictClass::Code,
+        GateVerdictClass::Infrastructure,
+        GateVerdictClass::Superseded,
+    ];
+
+    /// Each verdict reads as its own variant, with no class (a record from
+    /// before classes) or its own; every other class is refused, by
+    /// `outcome` and the strict parser alike: 8 of the 32 pairs plus the 8
+    /// classless records read, the other 16 do not.
+    #[test]
+    fn every_verdict_reads_as_its_variant_and_refuses_every_other_class() {
+        let mut read = 0;
+        for (verdict, class) in ALL_VERDICTS {
+            let bare = gated(json!({"id": 1, "verdict": verdict}));
+            let outcome = bare.outcome().expect("a classless record reads");
+            assert_eq!(outcome.verdict().as_str(), verdict);
+            assert_eq!(outcome.class(), class, "{verdict}");
+            read += 1;
+            for other in ALL_CLASSES {
+                let value =
+                    json!({"type": "task.gated", "id": 1, "verdict": verdict, "class": other});
+                let record = gated(value.clone());
+                if other == class {
+                    assert_eq!(record.outcome(), Ok(outcome), "{verdict}");
+                    ControlRecord::from_value_strict(&value).expect("strict");
+                    read += 1;
+                } else {
+                    let want = format!(
+                        "verdict `{verdict}` expects class `{}`, not `{other:?}`",
+                        serde_json::to_string(&class).unwrap()
+                    );
+                    assert_eq!(
+                        record.outcome(),
+                        Err(invariant_err("task.gated", want.clone()))
+                    );
+                    assert_eq!(
+                        ControlRecord::from_value_strict(&value),
+                        Err(invariant_err("task.gated", want))
+                    );
+                }
+            }
+        }
+        assert_eq!(read, 16);
+    }
+
+    #[test]
+    fn each_variant_carries_what_its_readers_use() {
+        let accepted = gated(
+            json!({"id": 1, "verdict": "accepted", "candidate": "c2", "metric": "7", "note": "ignored"}),
+        );
+        assert_eq!(
+            accepted.outcome(),
+            Ok(GateOutcome::Accepted {
+                candidate: Some("c2"),
+                metric: Some("7")
+            })
+        );
+        for (verdict, want) in [
+            ("rejected", GateOutcome::Rejected { note: Some("why") }),
+            ("conflict", GateOutcome::Conflict { note: Some("why") }),
+            (
+                "incompatible",
+                GateOutcome::Incompatible { note: Some("why") },
+            ),
+        ] {
+            assert_eq!(
+                gated(json!({"id": 1, "verdict": verdict, "note": "why"})).outcome(),
+                Ok(want)
+            );
+        }
+        assert_eq!(
+            gated(json!({"id": 1, "verdict": "aborted", "evidence": "parameter_error"})).outcome(),
+            Ok(GateOutcome::Aborted)
+        );
+        assert_eq!(
+            gated(json!({"id": 1, "verdict": "stale", "scenario_names": ["a.sh"]})).outcome(),
+            Ok(GateOutcome::Stale)
+        );
+        assert_eq!(
+            gated(json!({"id": 1, "verdict": "no_room"})).outcome(),
+            Ok(GateOutcome::NoRoom { escalate: false })
+        );
+        assert_eq!(
+            gated(json!({"id": 1, "verdict": "no_room", "escalate": true})).outcome(),
+            Ok(GateOutcome::NoRoom { escalate: true })
+        );
+        // `escalate` was written on host faults and no_room only, but other
+        // records never relied on its absence: it is read, not refused.
+        assert!(
+            gated(json!({"id": 1, "verdict": "accepted", "escalate": false}))
+                .outcome()
+                .is_ok()
+        );
+    }
+
+    /// A host fault's retry: none on a record from before backoffs, the
+    /// backoff alone before the store adds `due_ms`, both after; `due_ms`
+    /// alone or a negative backoff are refused.
+    #[test]
+    fn a_host_faults_retry_reads_and_its_impossible_shapes_are_refused() {
+        let host = |extra: Value| {
+            let mut value = json!({"id": 1, "verdict": "host_fault"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            gated(value)
+        };
+        let fault = |retry, escalate, parked| GateOutcome::HostFault {
+            retry,
+            escalate,
+            parked,
+        };
+        assert_eq!(host(json!({})).outcome(), Ok(fault(None, false, false)));
+        assert_eq!(
+            host(json!({"backoff_ms": 600_000})).outcome(),
+            Ok(fault(
+                Some(HostRetry {
+                    backoff_ms: 600_000,
+                    due_ms: None
+                }),
+                false,
+                false
+            ))
+        );
+        assert_eq!(
+            host(json!({"backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64, "escalate": true}))
+                .outcome(),
+            Ok(fault(
+                Some(HostRetry {
+                    backoff_ms: 600_000,
+                    due_ms: Some(1_793_930_000_000)
+                }),
+                true,
+                false
+            ))
+        );
+        assert_eq!(
+            host(
+                json!({"backoff_ms": 0, "parked": true, "escalate": true, "evidence": "load_sensitive_parked"})
+            )
+            .outcome(),
+            Ok(fault(
+                Some(HostRetry {
+                    backoff_ms: 0,
+                    due_ms: None
+                }),
+                true,
+                true
+            ))
+        );
+        assert_eq!(
+            host(json!({"due_ms": 5})).outcome(),
+            Err(invariant_err("task.gated", "`due_ms` without `backoff_ms`"))
+        );
+        assert_eq!(
+            host(json!({"backoff_ms": -1})).outcome(),
+            Err(invariant_err(
+                "task.gated",
+                "`backoff_ms` must not be negative"
+            ))
+        );
+    }
+
+    /// `backoff_ms`, `due_ms`, `parked` and `alert` were only ever written on
+    /// a host fault (`integrate/verdicts.rs`, `spawn_integrator_record`): on
+    /// any other verdict the record is refused.
+    #[test]
+    fn a_host_faults_own_fields_on_another_verdict_are_refused() {
+        let fields = [
+            ("backoff_ms", json!(1000)),
+            ("due_ms", json!(5)),
+            ("parked", json!(true)),
+            ("alert", json!(false)),
+        ];
+        let mut refused = 0;
+        for (verdict, _) in ALL_VERDICTS.iter().filter(|(v, _)| *v != "host_fault") {
+            for (field, value) in &fields {
+                let mut record = json!({"type": "task.gated", "id": 1, "verdict": verdict});
+                record[*field] = value.clone();
+                let want = invariant_err(
+                    "task.gated",
+                    format!("`{field}` belongs to a host_fault verdict, not `{verdict}`"),
+                );
+                assert_eq!(gated(record.clone()).outcome(), Err(want.clone()));
+                assert_eq!(ControlRecord::from_value_strict(&record), Err(want));
+                refused += 1;
+            }
+        }
+        assert_eq!(refused, 7 * 4);
+    }
+
+    /// Records shaped as the integrator writes them (`integrate/verdicts.rs`)
+    /// pass the strict parser, and their wire bytes round-trip unchanged.
+    #[test]
+    fn records_as_the_integrator_writes_them_read_and_round_trip() {
+        let records = [
+            json!({"type": "task.gated", "id": 7, "verdict": "accepted", "class": "code", "revision": 0,
+                   "base": "b", "candidate": "c", "metric": "12", "scenarios": 2, "scenario_names": ["a.sh", "b.sh"]}),
+            json!({"type": "task.gated", "id": 7, "verdict": "rejected", "class": "code", "revision": 0,
+                   "note": "regression", "log": "/l"}),
+            json!({"type": "task.gated", "id": 7, "verdict": "host_fault", "class": "infrastructure",
+                   "revision": 0, "evidence": "base_disagrees", "scenario": "011.sh", "exits": [1, 0],
+                   "base_disagrees": 1, "alert": false, "escalate": false, "backoff_ms": 16_000,
+                   "due_ms": 1_793_930_000_000_i64}),
+            json!({"type": "task.gated", "id": 7, "verdict": "host_fault", "class": "infrastructure",
+                   "revision": 0, "evidence": "load_sensitive_parked", "scenario": "x.sh",
+                   "pushed": "0123abc", "sensitive": ["x.sh"], "parked": true, "escalate": true,
+                   "backoff_ms": 0}),
+            json!({"type": "task.gated", "id": 7, "verdict": "no_room", "class": "infrastructure",
+                   "revision": 0, "check": "disk", "measured": "1", "threshold": "2", "free_kb": 1,
+                   "min_gb": 2, "tmpdir": "/data/tmp", "log": "! gate: short", "escalate": true}),
+            json!({"type": "task.gated", "id": 7, "verdict": "aborted", "class": "infrastructure",
+                   "revision": 0, "reason": "the gate failed: x", "evidence": "parameter_error"}),
+            json!({"type": "task.gated", "id": 7, "verdict": "stale", "class": "superseded",
+                   "revision": 0, "found": "discarded", "scenario_names": []}),
+        ];
+        for value in records {
+            let parsed = ControlRecord::from_value_strict(&value).expect("strict");
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap(),
+                value,
+                "wire unchanged"
+            );
+            let ControlRecord::TaskGated(record) = parsed else {
+                panic!()
+            };
+            assert_eq!(record.outcome().unwrap().verdict(), record.verdict);
+        }
+    }
+
+    /// Replay moves an episode only on a record that reads: a refused one
+    /// (no writer made one) is a stage, never a verdict.
+    #[test]
+    fn replay_moves_nothing_on_a_record_that_does_not_read() {
+        let mut stream = gated_mission_stream();
+        let index = stream.iter().position(|(seq, _, _)| *seq == 18).unwrap();
+        let mut accepted = json!({"type": "task.gated", "id": 20, "verdict": "accepted", "revision": 2,
+                                  "base": "b0", "candidate": "c2", "class": "infrastructure"});
+        stream[index].2 = ControlRecord::from_value(&accepted).expect("loose parse");
+        stream.truncate(index + 1);
+        let episodes = replay_task_episodes(&stream);
+        assert_eq!(
+            episodes[0].state,
+            TaskState::Reported,
+            "not moved to landing"
+        );
+        assert_eq!(episodes[0].last_gate_verdict, Some(GateVerdict::Conflict));
+        assert_eq!(episodes[0].gate_verdicts.len(), 3);
+        assert_eq!(
+            episodes[0].stages.last().unwrap().kind,
+            ControlRecordKind::TaskGated
+        );
+        accepted["class"] = json!("code");
+        stream[index].2 = ControlRecord::from_value(&accepted).unwrap();
+        let episodes = replay_task_episodes(&stream);
+        assert_eq!(episodes[0].state, TaskState::Landing);
+        assert_eq!(episodes[0].candidate.as_deref(), Some("c2"));
     }
 }
