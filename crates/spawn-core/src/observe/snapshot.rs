@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::SCREEN_STALE;
 use super::judge::{ExecutionPhase, JudgeInput, TurnFact};
-use crate::event::{CommandStep, EventKind, EventRecord, JobKind, SessionSeq, Source};
+use crate::event::{BackgroundJobKind, CommandStep, EventKind, EventRecord, SessionSeq, Source};
 use crate::id::{AgentId, ExecutionId, SessionId, WorkspaceId};
 use crate::screen::ScreenState;
 use crate::time::Timestamp;
@@ -25,7 +25,7 @@ pub(super) struct Snapshot {
     /// The background jobs the current execution started and that have not
     /// ended, by id, with their kind and when they started. A turn's end
     /// leaves them open; the execution's end or the next start closes them.
-    open_jobs: BTreeMap<String, (JobKind, Timestamp)>,
+    open_jobs: BTreeMap<String, (BackgroundJobKind, Timestamp)>,
     last_tool: Option<String>,
     permission_pending: bool,
     screen: Option<ScreenState>,
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn agy_turn_stopped_clears_residual_open_jobs_while_claude_keeps_them() {
-        use crate::event::{JobEnd, JobKind};
+        use crate::event::{BackgroundJobKind, JobEnd};
 
         let run = |engine: &str| {
             let mut snapshot = Snapshot::default();
@@ -543,7 +543,7 @@ mod tests {
                 Source::Claude,
                 EventKind::JobStarted {
                     job_id: "job_1".to_string(),
-                    kind: JobKind::Bash,
+                    kind: BackgroundJobKind::Bash,
                 },
             );
             apply_ev(&mut snapshot, 3, Source::Claude, turn_stopped().1);
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn late_job_started_after_execution_ended_does_not_reopen_jobs() {
-        use crate::event::{EndCause, JobKind};
+        use crate::event::{BackgroundJobKind, EndCause};
 
         let mut snapshot = Snapshot::default();
         apply_ev(&mut snapshot, 1, Source::Bridge, started().1);
@@ -605,7 +605,7 @@ mod tests {
             Source::Claude,
             EventKind::JobStarted {
                 job_id: "late_job".to_string(),
-                kind: JobKind::Bash,
+                kind: BackgroundJobKind::Bash,
             },
         );
         let input = snapshot.input(
@@ -755,7 +755,7 @@ mod tests {
     /// count: it holds its terminal's workspace until the end gets through.
     #[test]
     fn a_stalled_execution_is_still_live() {
-        use crate::event::{EndCause, JobKind};
+        use crate::event::{BackgroundJobKind, EndCause};
 
         let mut snapshot = Snapshot::default();
         apply_ev(&mut snapshot, 1, Source::Bridge, started().1);
@@ -776,7 +776,7 @@ mod tests {
             Source::Claude,
             EventKind::JobStarted {
                 job_id: "job_1".to_string(),
-                kind: JobKind::Bash,
+                kind: BackgroundJobKind::Bash,
             },
         );
         let input = snapshot.input(

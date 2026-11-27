@@ -286,7 +286,7 @@ impl LaunchSummary {
 /// own job").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum JobKind {
+pub enum BackgroundJobKind {
     /// A shell command in the background: a Bash call with
     /// `run_in_background`, or one the engine moved there (its timeout ran
     /// out, or a message had to reach the agent).
@@ -300,7 +300,7 @@ pub enum JobKind {
     Agent,
 }
 
-impl JobKind {
+impl BackgroundJobKind {
     /// Wire name.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -516,7 +516,7 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_kind: Option<String>,
     },
-    /// The agent started a background job ([`JobKind`]), read from its
+    /// The agent started a background job ([`BackgroundJobKind`]), read from its
     /// transcript: the job's id as the engine named it. When it started is
     /// the record's time. A job is open only within its execution: the
     /// execution's end (or the start of the next, a resume) closes it. An
@@ -527,7 +527,7 @@ pub enum EventKind {
         /// The engine's task id (`b8w03og7k`, an Agent's `a5e451ae390ad7923`).
         job_id: String,
         /// Bash, Monitor or Agent.
-        kind: JobKind,
+        kind: BackgroundJobKind,
     },
     /// A background job ended, read from the transcript: the engine's
     /// notification of it, or the agent's `TaskStop` that succeeded. When it
@@ -919,8 +919,31 @@ pub struct Appended {
 
 #[cfg(test)]
 mod tests {
-    use super::EventKind;
+    use super::{BackgroundJobKind, EventKind};
     use serde_json::json;
+
+    /// A background job's kind keeps its wire name (`job.started`'s
+    /// `kind`, which `/api/attention` shows): `bash`, `monitor`, `agent`,
+    /// read back to the same kind and named the same by `as_str`.
+    #[test]
+    fn a_background_job_kind_keeps_its_wire_name() {
+        for (kind, wire) in [
+            (BackgroundJobKind::Bash, "bash"),
+            (BackgroundJobKind::Monitor, "monitor"),
+            (BackgroundJobKind::Agent, "agent"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).expect("writes"), json!(wire));
+            assert_eq!(kind.as_str(), wire);
+            assert_eq!(
+                serde_json::from_value::<BackgroundJobKind>(json!(wire)).expect("reads"),
+                kind
+            );
+        }
+        let started =
+            json!({"name": "job.started", "detail": {"job_id": "b8w03og7k", "kind": "bash"}});
+        let kind: EventKind = serde_json::from_value(started.clone()).expect("job.started reads");
+        assert_eq!(serde_json::to_value(&kind).expect("writes"), started);
+    }
 
     #[test]
     fn a_node_record_decodes_as_a_control_session_event() {

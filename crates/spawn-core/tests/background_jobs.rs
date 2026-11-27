@@ -11,7 +11,7 @@ use std::time::Duration;
 use spawn_core::bridge::{Bridge, BridgeConfig};
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::event::{
-    ENGINE, EventKind, GlobalPosition, JobEnd, JobKind, ModelProfile, NewEvent, Source,
+    BackgroundJobKind, ENGINE, EventKind, GlobalPosition, JobEnd, ModelProfile, NewEvent, Source,
 };
 use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
@@ -166,7 +166,7 @@ fn turn_stopped(store: &MemoryStore, execution: u64) {
     );
 }
 
-fn job(id: &str, kind: JobKind) -> EventKind {
+fn job(id: &str, kind: BackgroundJobKind) -> EventKind {
     EventKind::JobStarted {
         job_id: id.to_string(),
         kind,
@@ -196,7 +196,12 @@ fn waits_on_its_job(observation: &Observation) {
 fn a_stopped_turn_with_a_job_open_is_working_on_it_without_a_model_call() {
     let mut fixture = fixture();
     execution_started(&fixture.store, 1);
-    append(&fixture.store, 1, None, job("b8w03og7k", JobKind::Bash));
+    append(
+        &fixture.store,
+        1,
+        None,
+        job("b8w03og7k", BackgroundJobKind::Bash),
+    );
     turn_stopped(&fixture.store, 1);
     waits_on_its_job(&judge(&mut fixture));
     assert_eq!(fixture.judge.calls(), 0, "no Jev call");
@@ -228,8 +233,18 @@ fn a_stopped_turn_with_a_job_open_is_working_on_it_without_a_model_call() {
 fn a_monitor_whose_events_start_short_turns_keeps_the_worker_working() {
     let mut fixture = fixture();
     execution_started(&fixture.store, 1);
-    append(&fixture.store, 1, None, job("bv41gl0hm", JobKind::Monitor));
-    append(&fixture.store, 1, None, job("b6yqlx30i", JobKind::Bash));
+    append(
+        &fixture.store,
+        1,
+        None,
+        job("bv41gl0hm", BackgroundJobKind::Monitor),
+    );
+    append(
+        &fixture.store,
+        1,
+        None,
+        job("b6yqlx30i", BackgroundJobKind::Bash),
+    );
     turn_stopped(&fixture.store, 1);
     waits_on_its_job(&judge(&mut fixture));
     // Each event wakes the agent for a short turn; the jobs stay open.
@@ -267,7 +282,12 @@ fn a_monitor_whose_events_start_short_turns_keeps_the_worker_working() {
 fn a_job_is_open_only_within_its_execution() {
     let mut fixture = fixture();
     execution_started(&fixture.store, 1);
-    append(&fixture.store, 1, None, job("b8w03og7k", JobKind::Bash));
+    append(
+        &fixture.store,
+        1,
+        None,
+        job("b8w03og7k", BackgroundJobKind::Bash),
+    );
     turn_stopped(&fixture.store, 1);
     waits_on_its_job(&judge(&mut fixture));
     // The engine was lost and resumed: the earlier process's jobs died
@@ -288,7 +308,12 @@ fn a_job_is_open_only_within_its_execution() {
     let resumed = judge(&mut fixture);
     assert_eq!(resumed.ambiguity, Some(Ambiguity::TurnStoppedIdle));
     // A late record of the earlier execution opens nothing in this one.
-    append(&fixture.store, 1, None, job("bq1n7c2x4", JobKind::Bash));
+    append(
+        &fixture.store,
+        1,
+        None,
+        job("bq1n7c2x4", BackgroundJobKind::Bash),
+    );
     fixture.clock.advance(Duration::from_secs(31));
     let late = judge(&mut fixture);
     assert_ne!(late.reason, Some(WaitReason::WaitingForBackgroundJob));
@@ -369,7 +394,12 @@ fn a_background_agent_is_open_for_each_run_until_that_run_ends() {
 fn a_failed_turn_with_a_job_open_is_still_the_judges_and_it_sees_the_job() {
     let mut fixture = fixture();
     execution_started(&fixture.store, 1);
-    append(&fixture.store, 1, None, job("b8w03og7k", JobKind::Bash));
+    append(
+        &fixture.store,
+        1,
+        None,
+        job("b8w03og7k", BackgroundJobKind::Bash),
+    );
     append(
         &fixture.store,
         1,
@@ -573,8 +603,8 @@ fn the_bridge_records_the_jobs_of_an_execution_from_its_transcript() {
     assert_eq!(
         job_records(&store),
         vec![
-            (first.clone(), job("b8w03og7k", JobKind::Bash)),
-            (first.clone(), job("bv41gl0hm", JobKind::Monitor)),
+            (first.clone(), job("b8w03og7k", BackgroundJobKind::Bash)),
+            (first.clone(), job("bv41gl0hm", BackgroundJobKind::Monitor)),
         ]
     );
     waits_on_its_job(&judge(&mut fixture));

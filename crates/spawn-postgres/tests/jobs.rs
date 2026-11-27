@@ -10,7 +10,7 @@
 
 use serde_json::Value;
 use spawn_core::event::{
-    ENGINE, EndCause, EventKind, JobEnd, JobKind, ModelProfile, NewEvent, Source,
+    BackgroundJobKind, ENGINE, EndCause, EventKind, JobEnd, ModelProfile, NewEvent, Source,
 };
 use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
 use spawn_core::port::EventLog;
@@ -53,13 +53,13 @@ fn started(store: &PostgresStore, execution: u64) {
     );
 }
 
-fn job(store: &PostgresStore, execution: u64, id: &str, kind: JobKind) {
+fn job(store: &PostgresStore, execution: u64, id: &str, kind: BackgroundJobKind) {
     job_by(store, execution, id, kind, "toolu_1");
 }
 
 /// A start of `id` by the tool call `by` (an Agent resumed by a message is
 /// started again, by that call).
-fn job_by(store: &PostgresStore, execution: u64, id: &str, kind: JobKind, by: &str) {
+fn job_by(store: &PostgresStore, execution: u64, id: &str, kind: BackgroundJobKind, by: &str) {
     append(
         store,
         execution,
@@ -129,8 +129,8 @@ fn open(store: &PostgresStore) -> Vec<String> {
 fn an_executions_open_jobs_are_facts_until_they_or_it_end() {
     let (store, _schema) = store("open_jobs");
     started(&store, 1);
-    job(&store, 1, "b8w03og7k", JobKind::Bash);
-    job(&store, 1, "bv41gl0hm", JobKind::Monitor);
+    job(&store, 1, "b8w03og7k", BackgroundJobKind::Bash);
+    job(&store, 1, "bv41gl0hm", BackgroundJobKind::Monitor);
     append(
         &store,
         1,
@@ -171,7 +171,7 @@ fn an_executions_open_jobs_are_facts_until_they_or_it_end() {
     // the new one's are.
     started(&store, 2);
     assert!(open(&store).is_empty());
-    job(&store, 2, "bq1n7c2x4", JobKind::Bash);
+    job(&store, 2, "bq1n7c2x4", BackgroundJobKind::Bash);
     assert_eq!(open(&store), ["bq1n7c2x4"]);
     // An end the engine names for a job no record of this session started
     // (a resume's notice about an earlier engine process) closes nothing.
@@ -184,7 +184,7 @@ fn an_executions_open_jobs_are_facts_until_they_or_it_end() {
         &store,
         2,
         "a2adacaabc9f9b048",
-        JobKind::Agent,
+        BackgroundJobKind::Agent,
         "toolu_launch",
     );
     assert_eq!(open(&store), ["bq1n7c2x4", "a2adacaabc9f9b048"]);
@@ -198,7 +198,7 @@ fn an_executions_open_jobs_are_facts_until_they_or_it_end() {
         &store,
         2,
         "a2adacaabc9f9b048",
-        JobKind::Agent,
+        BackgroundJobKind::Agent,
         "toolu_resume",
     );
     assert_eq!(open(&store), ["bq1n7c2x4", "a2adacaabc9f9b048"]);
