@@ -917,23 +917,33 @@ pub(crate) fn auth_config_read_path_with(
 
 /// Resolve the isolated root directory for `native_login` auth profile directories.
 ///
-/// Precedence: `SPAWN_AUTH_PROFILES_DIR` -> `$XDG_DATA_HOME/spawn/auth-profiles` ->
-/// `$HOME/.local/share/spawn/auth-profiles` -> `<temp>/spawn-auth-profiles`.
-pub(crate) fn auth_profiles_root_dir_with(env_lookup: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+/// Precedence: `SPAWN_AUTH_PROFILES_DIR` -> `$XDG_STATE_HOME/spawn/auth-profiles` ->
+/// `$XDG_DATA_HOME/spawn/auth-profiles` -> `$HOME/.local/state/spawn/auth-profiles`.
+/// Refuses to fall back to shared `/tmp` directories when none of these env vars exist.
+pub(crate) fn auth_profiles_root_dir_with(
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<PathBuf, String> {
     if let Some(dir) = non_empty_env(env_lookup, AUTH_PROFILES_DIR_ENV) {
-        return PathBuf::from(dir);
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(xdg) = non_empty_env(env_lookup, "XDG_STATE_HOME") {
+        return Ok(PathBuf::from(xdg).join("spawn").join("auth-profiles"));
     }
     if let Some(xdg) = non_empty_env(env_lookup, "XDG_DATA_HOME") {
-        return PathBuf::from(xdg).join("spawn").join("auth-profiles");
+        return Ok(PathBuf::from(xdg).join("spawn").join("auth-profiles"));
     }
     if let Some(home) = non_empty_env(env_lookup, "HOME") {
-        return PathBuf::from(home)
+        return Ok(PathBuf::from(home)
             .join(".local")
-            .join("share")
+            .join("state")
             .join("spawn")
-            .join("auth-profiles");
+            .join("auth-profiles"));
     }
-    std::env::temp_dir().join("spawn-auth-profiles")
+    Err(
+        "cannot resolve isolated auth profiles directory: set SPAWN_AUTH_PROFILES_DIR, \
+         XDG_STATE_HOME, XDG_DATA_HOME, or HOME (shared temp fallback is refused)"
+            .to_string(),
+    )
 }
 
 /// Resolve [`auth_config_write_path_with`] against the process environment.
@@ -947,7 +957,7 @@ pub(crate) fn auth_config_read_path(explicit: Option<&Path>) -> PathBuf {
 }
 
 /// Resolve [`auth_profiles_root_dir_with`] against the process environment.
-pub(crate) fn auth_profiles_root_dir() -> PathBuf {
+pub(crate) fn auth_profiles_root_dir() -> Result<PathBuf, String> {
     auth_profiles_root_dir_with(&|name| env_value(name))
 }
 
@@ -1823,18 +1833,33 @@ mod workspace_tests {
         );
 
         assert_eq!(
-            auth_profiles_root_dir_with(&full_env),
+            auth_profiles_root_dir_with(&full_env).unwrap(),
             PathBuf::from("/var/lib/spawn/auth-profiles")
+        );
+        let xdg_state = env(&[
+            ("XDG_STATE_HOME", "/home/u/.xdg-state"),
+            ("XDG_DATA_HOME", "/home/u/.xdg-data"),
+            ("HOME", "/home/u"),
+        ]);
+        assert_eq!(
+            auth_profiles_root_dir_with(&xdg_state).unwrap(),
+            PathBuf::from("/home/u/.xdg-state/spawn/auth-profiles")
         );
         let xdg_data = env(&[("XDG_DATA_HOME", "/home/u/.xdg-data"), ("HOME", "/home/u")]);
         assert_eq!(
-            auth_profiles_root_dir_with(&xdg_data),
+            auth_profiles_root_dir_with(&xdg_data).unwrap(),
             PathBuf::from("/home/u/.xdg-data/spawn/auth-profiles")
         );
         let home_data = env(&[("HOME", "/home/u")]);
         assert_eq!(
-            auth_profiles_root_dir_with(&home_data),
-            PathBuf::from("/home/u/.local/share/spawn/auth-profiles")
+            auth_profiles_root_dir_with(&home_data).unwrap(),
+            PathBuf::from("/home/u/.local/state/spawn/auth-profiles")
+        );
+        let empty_env = env(&[]);
+        assert!(
+            auth_profiles_root_dir_with(&empty_env)
+                .unwrap_err()
+                .contains("refused")
         );
     }
 }

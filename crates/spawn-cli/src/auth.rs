@@ -8,13 +8,18 @@
 //!   != ModelTier (L1 | L2 | L3)
 //! ```
 //!
-//! Illegal combinations (such as `agy` under `relay`, `local`, or `cloud_iam`,
-//! or cross-cloud IAM fields across Vertex / Bedrock / Azure) are unrepresentable
-//! in the type system and rejected fail-closed at parse boundaries.
+//! Security & ADT guarantees:
+//! - Illegal combinations (`agy` under `relay`/`local`/`cloud_iam`, cross-cloud IAM fields)
+//!   are unrepresentable in Rust types and rejected fail-closed at parse boundaries.
+//! - Endpoint URLs strictly forbid `?` queries, `#` fragments, `;` path parameters,
+//!   backslashes, and `@` userinfo (zero secret leakage in config, JSON, or errors).
+//! - Validators never echo rejected credential arguments, URLs, or tokens back to callers.
+//! - `native_login` directories are strictly contained beneath the controlled `profiles_root`
+//!   with zero symlink traversal and zero `chmod` on pre-existing directories.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -62,6 +67,44 @@ const FORBIDDEN_PLAINTEXT_FLAGS: &[&str] = &[
     "password",
     "raw-key",
     "auth-token",
+];
+
+const FORBIDDEN_BARE_ROOTS: &[&str] = &[
+    "/",
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/home",
+    "/lib",
+    "/lib64",
+    "/opt",
+    "/private",
+    "/private/tmp",
+    "/proc",
+    "/root",
+    "/run",
+    "/sbin",
+    "/srv",
+    "/sys",
+    "/tmp",
+    "/usr",
+    "/var",
+    "/var/tmp",
+];
+
+const FORBIDDEN_HOME_SUBDIRS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".config",
+    ".gnupg",
+    ".kube",
+    ".azure",
+    ".claude",
+    ".gemini",
+    ".codex",
+    ".antigravity",
+    ".agy",
 ];
 
 /// Supported coding-agent execution engines (layer 1: Engine).
@@ -140,6 +183,36 @@ impl<'de> Deserialize<'de> for RelayEngine {
     {
         let raw = String::deserialize(deserializer)?;
         Self::parse(&raw).map_err(de::Error::custom)
+    }
+}
+
+/// Closed 2-variant engine subset valid for Azure Cloud IAM (`Codex | OpenCode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AzureEngine {
+    Codex,
+    OpenCode,
+}
+
+impl AzureEngine {
+    pub(crate) const fn into_engine(self) -> Engine {
+        match self {
+            Self::Codex => Engine::Codex,
+            Self::OpenCode => Engine::OpenCode,
+        }
+    }
+
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "codex" => Ok(Self::Codex),
+            "opencode" => Ok(Self::OpenCode),
+            "agy" | "antigravity" => {
+                Err("engine `agy` only supports `native_login` (not `cloud_iam`)".to_string())
+            }
+            other => Err(format!(
+                "cloud_iam provider `azure` only permits [codex,opencode], got `{other}`"
+            )),
+        }
     }
 }
 
@@ -293,14 +366,14 @@ pub(crate) struct RelayProfile {
     pub(crate) engines: BTreeSet<RelayEngine>,
 }
 
-/// Isolated native OAuth / QR login profile with host directory isolation.
+/// Isolated native OAuth / QR login profile with strict containment under `profiles_root`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeLoginProfile {
     pub(crate) provider: NativeLoginProvider,
     pub(crate) profile_dir: PathBuf,
 }
 
-/// Strict 3-variant Sum Type for passwordless cloud IAM providers (zero cross-cloud field bloat).
+/// Strict 3-variant Sum Type for passwordless cloud IAM providers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CloudIamProfile {
     Vertex {
@@ -308,20 +381,18 @@ pub(crate) enum CloudIamProfile {
         project: Option<String>,
         service_account: Option<String>,
         endpoint: Option<String>,
-        credential_chain: Vec<String>,
     },
     Bedrock {
         region: String,
         aws_profile: Option<String>,
         endpoint: Option<String>,
-        credential_chain: Vec<String>,
     },
     Azure {
         region: String,
         resource: Option<String>,
         tenant_id: Option<String>,
         endpoint: Option<String>,
-        credential_chain: Vec<String>,
+        engines: BTreeSet<AzureEngine>,
     },
 }
 
@@ -350,10 +421,10 @@ impl CloudIamProfile {
         }
     }
 
-    pub(crate) const fn engines(&self) -> &'static [Engine] {
+    pub(crate) fn engines(&self) -> Vec<Engine> {
         match self {
-            Self::Vertex { .. } | Self::Bedrock { .. } => &[Engine::Claude],
-            Self::Azure { .. } => &[Engine::Codex, Engine::OpenCode],
+            Self::Vertex { .. } | Self::Bedrock { .. } => vec![Engine::Claude],
+            Self::Azure { engines, .. } => engines.iter().map(|e| e.into_engine()).collect(),
         }
     }
 }
@@ -389,15 +460,8 @@ impl AuthProfile {
         match self {
             Self::Relay(relay) => relay.engines.iter().map(|e| e.into_engine()).collect(),
             Self::NativeLogin(native) => vec![native.provider.engine()],
-            Self::CloudIam(cloud) => cloud.engines().to_vec(),
+            Self::CloudIam(cloud) => cloud.engines(),
             Self::Local(local) => local.engines.iter().map(|e| e.into_engine()).collect(),
-        }
-    }
-
-    pub(crate) fn isolated_dir(&self) -> Option<&Path> {
-        match self {
-            Self::NativeLogin(native) => Some(native.profile_dir.as_path()),
-            Self::Relay(_) | Self::CloudIam(_) | Self::Local(_) => None,
         }
     }
 }
@@ -479,7 +543,7 @@ impl fmt::Debug for EnvPlan {
     }
 }
 
-/// Subprocess invocation plan for `spawn auth login <engine>`.
+/// Subprocess invocation plan for `spawn auth login <agy|claude|codex>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LoginCommandPlan {
     pub(crate) profile: String,
@@ -595,7 +659,6 @@ impl CloudIamProfile {
                 project,
                 service_account,
                 endpoint,
-                ..
             } => {
                 plan.set_public("CLAUDE_CODE_USE_VERTEX", "1");
                 plan.set_public("CLOUD_ML_REGION", region);
@@ -617,7 +680,6 @@ impl CloudIamProfile {
                 region,
                 aws_profile,
                 endpoint,
-                ..
             } => {
                 plan.set_public("CLAUDE_CODE_USE_BEDROCK", "1");
                 plan.set_public("AWS_REGION", region);
@@ -718,22 +780,18 @@ pub(crate) fn validate_profile_name(name: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// Validate an environment variable identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+/// Validate an environment variable identifier without echoing invalid secret-like inputs.
 pub(crate) fn validate_env_var_name(name: &str) -> Result<String, String> {
     let trimmed = name.trim();
     let mut chars = trimmed.chars();
-    let Some(first) = chars.next() else {
-        return Err("environment variable name must not be empty".to_string());
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return Err(format!(
-            "environment variable `{trimmed}` must start with an ASCII letter or `_` (never pass a secret value)"
-        ));
-    }
-    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
-        return Err(format!(
-            "environment variable `{trimmed}` contains invalid characters; expected [A-Za-z_][A-Za-z0-9_]*"
-        ));
+    let valid_first = chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+    if !valid_first || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return Err(
+            "invalid environment variable name: expected [A-Za-z_][A-Za-z0-9_]* (never pass a raw key to --key-env or from_env)"
+                .to_string(),
+        );
     }
     Ok(trimmed.to_string())
 }
@@ -752,47 +810,59 @@ fn validate_safe_identifier(field: &str, raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// Validate an `http://` or `https://` endpoint URL, rejecting embedded credentials.
+/// Strictly validate an `http://` or `https://` endpoint URL without echoing the raw URL.
+///
+/// Rejects case-insensitively non-http(s) schemes, `@` userinfo, `?` query strings,
+/// `#` fragments, `;` path parameters, backslashes, and whitespace/control characters.
 pub(crate) fn validate_endpoint_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.chars().any(char::is_control) || trimmed.contains(' ') {
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
         return Err("endpoint URL must be a single valid http:// or https:// URL".to_string());
     }
-    let rest = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))
-        .ok_or_else(|| format!("endpoint URL `{trimmed}` must start with https:// or http://"))?;
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    if authority.is_empty() {
-        return Err(format!("endpoint URL `{trimmed}` is missing a host"));
+    let Some((raw_scheme, rest)) = trimmed.split_once("://") else {
+        return Err("endpoint URL must start with https:// or http://".to_string());
+    };
+    let scheme = raw_scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err("endpoint URL must use https:// or http:// scheme".to_string());
     }
-    if authority.contains('@') {
+    if rest.contains('\\') {
+        return Err("endpoint URL must not contain backslashes".to_string());
+    }
+    if rest.contains('?') {
         return Err(
-            "endpoint URL must not embed userinfo or credentials before `@`; use SecretRef"
+            "endpoint URL must not contain query parameters (`?`); pass credentials via SecretRef"
                 .to_string(),
         );
     }
-    if let Some((_, query_plus)) = rest[authority_end..].split_once('?') {
-        let query = query_plus.split('#').next().unwrap_or(query_plus);
-        for pair in query.split('&') {
-            let key = pair.split('=').next().unwrap_or("").to_ascii_lowercase();
-            if matches!(
-                key.as_str(),
-                "key" | "api_key" | "apikey" | "token" | "access_token" | "secret" | "password"
-            ) {
-                return Err(format!(
-                    "endpoint URL must not embed credential query parameter `{key}=`; use SecretRef"
-                ));
-            }
-        }
+    if rest.contains('#') {
+        return Err(
+            "endpoint URL must not contain a fragment (`#`); pass credentials via SecretRef"
+                .to_string(),
+        );
     }
-    Ok(trimmed.trim_end_matches('/').to_string())
+    if rest.contains(';') {
+        return Err("endpoint URL must not contain path parameters (`;`)".to_string());
+    }
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return Err("endpoint URL is missing a host".to_string());
+    }
+    if authority.contains('@') {
+        return Err(
+            "endpoint URL must not embed userinfo or credentials (`@`); use SecretRef".to_string(),
+        );
+    }
+    Ok(format!("{scheme}://{}", rest.trim_end_matches('/')))
 }
 
 fn normalize_lexical(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() {
-        return Err(format!("path must be absolute: {}", path.display()));
+        return Err("path must be absolute".to_string());
     }
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -800,18 +870,18 @@ fn normalize_lexical(path: &Path) -> Result<PathBuf, String> {
             Component::RootDir => normalized.push(Component::RootDir),
             Component::CurDir => {}
             Component::Normal(part) => normalized.push(part),
-            Component::ParentDir => {
-                return Err(format!(
-                    "path must not contain `..` traversal: {}",
-                    path.display()
-                ));
-            }
-            Component::Prefix(_) => {
-                return Err(format!("unsupported path prefix: {}", path.display()));
-            }
+            Component::ParentDir => return Err("path must not contain `..` traversal".to_string()),
+            Component::Prefix(_) => return Err("unsupported path prefix".to_string()),
         }
     }
     Ok(normalized)
+}
+
+fn normalize_secret_file_path(path: &Path) -> Result<PathBuf, String> {
+    normalize_lexical(path).map_err(|_| {
+        "secret file path must be an absolute path without `..` traversal (never pass a raw key to --key-file or from_file)"
+            .to_string()
+    })
 }
 
 fn resolve_through_existing_ancestor(path: &Path) -> PathBuf {
@@ -836,79 +906,129 @@ fn resolve_through_existing_ancestor(path: &Path) -> PathBuf {
     resolved
 }
 
-fn forbidden_host_dirs(home: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![home.to_path_buf()];
-    if let Ok(canon) = fs::canonicalize(home)
-        && canon != home
+fn is_forbidden_bare_root(path: &Path) -> bool {
+    FORBIDDEN_BARE_ROOTS
+        .iter()
+        .any(|blocked| path == Path::new(blocked))
+}
+
+fn touches_forbidden_home_path(candidate: &Path, home: Option<&Path>) -> bool {
+    let Some(home_dir) = home else {
+        return false;
+    };
+    let mut home_roots = vec![home_dir.to_path_buf()];
+    if let Ok(canon) = fs::canonicalize(home_dir)
+        && canon != home_dir
     {
-        roots.push(canon);
+        home_roots.push(canon);
     }
-    let mut candidates = Vec::new();
-    for root in roots {
-        candidates.push(root.clone());
-        for rel in [
-            ".claude",
-            ".gemini",
-            ".codex",
-            ".antigravity",
-            ".agy",
-            ".config/claude",
-            ".config/codex",
-            ".config/agy",
-            ".config/antigravity",
-        ] {
-            candidates.push(root.join(rel));
+    for root in home_roots {
+        if candidate == root {
+            return true;
+        }
+        for sub in FORBIDDEN_HOME_SUBDIRS {
+            let blocked = root.join(sub);
+            if candidate == blocked || candidate.starts_with(&blocked) {
+                return true;
+            }
         }
     }
-    candidates
+    false
 }
 
-fn path_touches_forbidden_dir(candidate: &Path, blocked: &Path, home: &Path) -> bool {
-    candidate == home || candidate == blocked || (blocked != home && candidate.starts_with(blocked))
-}
-
-/// Validate that a `native_login` `profile_dir` is strictly isolated from host
-/// `~/.claude`, `~/.gemini`, `~/.codex`, and `$HOME` (even via symlinks).
-pub(crate) fn validate_isolated_profile_dir(
-    dir: &Path,
+/// Validate that the controlled `profiles_root` itself is not a bare system/shared
+/// directory, `$HOME`, a sensitive host directory (`~/.ssh`, `~/.aws`, etc.), or symlink.
+pub(crate) fn validate_profiles_root_dir(
+    root: &Path,
     home: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    let normalized = normalize_lexical(dir)?;
+    let normalized = normalize_lexical(root)?;
     let canonical = resolve_through_existing_ancestor(&normalized);
-    let link_target = fs::symlink_metadata(&normalized)
+    if fs::symlink_metadata(&normalized)
         .ok()
-        .filter(|meta| meta.file_type().is_symlink())
-        .and_then(|_| fs::read_link(&normalized).ok());
-
-    if let Some(home_dir) = home {
-        let home_norm = normalize_lexical(home_dir)?;
-        for blocked in forbidden_host_dirs(&home_norm) {
-            if path_touches_forbidden_dir(&normalized, &blocked, &home_norm)
-                || path_touches_forbidden_dir(&canonical, &blocked, &home_norm)
-            {
-                return Err(format!(
-                    "native_login profile_dir {} refuses host directory {} to prevent host credential pollution",
-                    dir.display(),
-                    blocked.display()
-                ));
-            }
-            if let Some(target) = &link_target {
-                let abs_target = if target.is_absolute() {
-                    target.clone()
-                } else {
-                    normalized.parent().unwrap_or(home_dir).join(target)
-                };
-                if path_touches_forbidden_dir(&abs_target, &blocked, &home_norm) {
-                    return Err(format!(
-                        "native_login profile_dir {} symlinks into forbidden host directory {}",
-                        dir.display(),
-                        blocked.display()
-                    ));
-                }
-            }
-        }
+        .is_some_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(format!(
+            "auth profiles root {} must not be a symlink",
+            root.display()
+        ));
+    }
+    if is_forbidden_bare_root(&normalized)
+        || is_forbidden_bare_root(&canonical)
+        || touches_forbidden_home_path(&normalized, home)
+        || touches_forbidden_home_path(&canonical, home)
+    {
+        return Err(format!(
+            "auth profiles root {} refuses shared/system/sensitive directory {}",
+            root.display(),
+            canonical.display()
+        ));
     }
     Ok(normalized)
+}
+
+fn ensure_no_symlink_tail(root_norm: &Path, dir_norm: &Path) -> Result<(), String> {
+    let Ok(rel) = dir_norm.strip_prefix(root_norm) else {
+        return Err(format!(
+            "native_login profile_dir {} must live strictly inside controlled profiles root {}",
+            dir_norm.display(),
+            root_norm.display()
+        ));
+    };
+    let mut cur = root_norm.to_path_buf();
+    for component in rel.components() {
+        cur.push(component);
+        if let Ok(meta) = fs::symlink_metadata(&cur)
+            && meta.file_type().is_symlink()
+        {
+            return Err(format!(
+                "native_login profile_dir {} contains symlink component {}",
+                dir_norm.display(),
+                cur.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Enforce strict whitelist containment: `dir` must be a proper non-symlink descendant of
+/// validated `profiles_root` (both lexically and canonically) and never touch host dirs.
+pub(crate) fn validate_isolated_profile_dir(
+    dir: &Path,
+    profiles_root: &Path,
+    home: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let root_norm = validate_profiles_root_dir(profiles_root, home)?;
+    let dir_norm = normalize_lexical(dir)?;
+    if dir_norm == root_norm || !dir_norm.starts_with(&root_norm) {
+        return Err(format!(
+            "native_login profile_dir {} must be a subdirectory strictly inside {}",
+            dir.display(),
+            root_norm.display()
+        ));
+    }
+    ensure_no_symlink_tail(&root_norm, &dir_norm)?;
+
+    let canon_root = resolve_through_existing_ancestor(&root_norm);
+    let canon_dir = resolve_through_existing_ancestor(&dir_norm);
+    if canon_dir == canon_root || !canon_dir.starts_with(&canon_root) {
+        return Err(format!(
+            "native_login profile_dir {} escapes controlled profiles root {}",
+            dir.display(),
+            root_norm.display()
+        ));
+    }
+    if is_forbidden_bare_root(&dir_norm)
+        || is_forbidden_bare_root(&canon_dir)
+        || touches_forbidden_home_path(&dir_norm, home)
+        || touches_forbidden_home_path(&canon_dir, home)
+    {
+        return Err(format!(
+            "native_login profile_dir {} refuses forbidden host directory",
+            dir.display()
+        ));
+    }
+    Ok(dir_norm)
 }
 
 fn current_unix_secs() -> i64 {
@@ -938,7 +1058,8 @@ fn resolve_secret_safely(
             Ok((value, Vec::new()))
         }
         SecretRef::FromFile { from_file } => {
-            let normalized = normalize_lexical(from_file).map_err(SecretResolveError::Invalid)?;
+            let normalized =
+                normalize_secret_file_path(from_file).map_err(SecretResolveError::Invalid)?;
             let meta = match fs::symlink_metadata(&normalized) {
                 Ok(meta) => meta,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1051,11 +1172,12 @@ fn inspect_oauth_json(doc: &Value, now_unix_secs: i64) -> Result<(), String> {
 /// Non-destructively probe an isolated `native_login` directory without reading host files.
 pub(crate) fn probe_native_login(
     dir: &Path,
+    profiles_root: &Path,
     provider: NativeLoginProvider,
     home: Option<&Path>,
     now_unix_secs: i64,
 ) -> ProbeOutcome {
-    if let Err(reason) = validate_isolated_profile_dir(dir, home) {
+    if let Err(reason) = validate_isolated_profile_dir(dir, profiles_root, home) {
         return ProbeOutcome {
             readiness: ProfileReadiness::ReauthRequired,
             detail: reason,
@@ -1174,11 +1296,82 @@ fn probe_secret_ref_with(
     }
 }
 
+fn ini_has_section(contents: &str, expected: &str) -> bool {
+    contents.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .is_some_and(|hdr| hdr.trim() == expected)
+    })
+}
+
+fn aws_bedrock_credential_evidence(
+    aws_profile: Option<&str>,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+    file_exists: &dyn Fn(&Path) -> bool,
+    file_reader: &dyn Fn(&Path) -> Option<String>,
+    home: Option<&Path>,
+) -> Option<&'static str> {
+    let has_env = |name: &str| env_lookup(name).is_some_and(|v| !v.trim().is_empty());
+    let env_file = |name: &str| {
+        env_lookup(name)
+            .filter(|p| !p.trim().is_empty())
+            .map(PathBuf::from)
+    };
+
+    if env_file("AWS_WEB_IDENTITY_TOKEN_FILE").is_some_and(|p| file_exists(&p)) {
+        return Some("AWS_WEB_IDENTITY_TOKEN_FILE present");
+    }
+    if has_env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+        || has_env("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+    {
+        return Some("AWS container credentials endpoint detected");
+    }
+    if has_env("AWS_ACCESS_KEY_ID") && has_env("AWS_SECRET_ACCESS_KEY") {
+        return Some("AWS access key env vars present");
+    }
+
+    let cred_path = env_file("AWS_SHARED_CREDENTIALS_FILE")
+        .or_else(|| home.map(|h| h.join(".aws/credentials")));
+    let cfg_path = env_file("AWS_CONFIG_FILE").or_else(|| home.map(|h| h.join(".aws/config")));
+    let active_profile = aws_profile
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| env_lookup("AWS_PROFILE").filter(|s| !s.trim().is_empty()));
+
+    if let Some(prof) = active_profile {
+        if let Some(p) = &cred_path
+            && file_reader(p).is_some_and(|raw| ini_has_section(&raw, &prof))
+        {
+            return Some("matching profile found in AWS credentials file");
+        }
+        let cfg_hdr = if prof == "default" {
+            "default".to_string()
+        } else {
+            format!("profile {prof}")
+        };
+        if let Some(p) = &cfg_path
+            && file_reader(p).is_some_and(|raw| ini_has_section(&raw, &cfg_hdr))
+        {
+            return Some("matching profile found in AWS config file");
+        }
+        return None;
+    }
+
+    if cred_path.is_some_and(|p| file_exists(&p)) || cfg_path.is_some_and(|p| file_exists(&p)) {
+        return Some("local AWS shared config/credentials file present");
+    }
+    None
+}
+
 /// Non-destructively probe whether ambient passwordless Cloud IAM credentials exist.
 pub(crate) fn probe_cloud_iam_with(
     cloud: &CloudIamProfile,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     file_exists: &dyn Fn(&Path) -> bool,
+    file_reader: &dyn Fn(&Path) -> Option<String>,
     home: Option<&Path>,
 ) -> ProbeOutcome {
     let has_env = |name: &str| env_lookup(name).is_some_and(|v| !v.trim().is_empty());
@@ -1203,24 +1396,13 @@ pub(crate) fn probe_cloud_iam_with(
                 None
             }
         }
-        CloudIamProfile::Bedrock { aws_profile, .. } => {
-            if env_file_exists("AWS_WEB_IDENTITY_TOKEN_FILE") {
-                Some("AWS_WEB_IDENTITY_TOKEN_FILE present")
-            } else if has_env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
-                || has_env("AWS_CONTAINER_CREDENTIALS_FULL_URI")
-                || has_env("AWS_ROLE_ARN")
-                || has_env("AWS_PROFILE")
-                || aws_profile.is_some()
-            {
-                Some("AWS IAM profile or container workload identity detected")
-            } else if home.is_some_and(|h| {
-                file_exists(&h.join(".aws/credentials")) || file_exists(&h.join(".aws/config"))
-            }) {
-                Some("local AWS shared config/credentials chain present")
-            } else {
-                None
-            }
-        }
+        CloudIamProfile::Bedrock { aws_profile, .. } => aws_bedrock_credential_evidence(
+            aws_profile.as_deref(),
+            env_lookup,
+            file_exists,
+            file_reader,
+            home,
+        ),
         CloudIamProfile::Azure { .. } => {
             if env_file_exists("AZURE_FEDERATED_TOKEN_FILE") {
                 Some("AZURE_FEDERATED_TOKEN_FILE present")
@@ -1251,7 +1433,7 @@ pub(crate) fn probe_cloud_iam_with(
         ProbeOutcome {
             readiness: ProfileReadiness::Missing,
             detail: format!(
-                "no ambient {} IAM credential chain detected (region={})",
+                "no ambient {} IAM credentials detected (region={})",
                 cloud.provider_str(),
                 cloud.region()
             ),
@@ -1262,17 +1444,25 @@ pub(crate) fn probe_cloud_iam_with(
 
 fn probe_profile_with(
     profile: &AuthProfile,
+    profiles_root: &Path,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     file_exists: &dyn Fn(&Path) -> bool,
+    file_reader: &dyn Fn(&Path) -> Option<String>,
     home: Option<&Path>,
     now_unix_secs: i64,
 ) -> ProbeOutcome {
     match profile {
         AuthProfile::Relay(relay) => probe_secret_ref_with(&relay.api_key, env_lookup),
-        AuthProfile::NativeLogin(native) => {
-            probe_native_login(&native.profile_dir, native.provider, home, now_unix_secs)
+        AuthProfile::NativeLogin(native) => probe_native_login(
+            &native.profile_dir,
+            profiles_root,
+            native.provider,
+            home,
+            now_unix_secs,
+        ),
+        AuthProfile::CloudIam(cloud) => {
+            probe_cloud_iam_with(cloud, env_lookup, file_exists, file_reader, home)
         }
-        AuthProfile::CloudIam(cloud) => probe_cloud_iam_with(cloud, env_lookup, file_exists, home),
         AuthProfile::Local(local) => ProbeOutcome {
             readiness: ProfileReadiness::Ready,
             detail: format!(
@@ -1290,11 +1480,12 @@ pub(crate) fn plan_login_command(
     provider: NativeLoginProvider,
     profile_name: &str,
     profile_dir: &Path,
+    profiles_root: &Path,
     home: Option<&Path>,
     env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<LoginCommandPlan, String> {
     let validated_name = validate_profile_name(profile_name)?;
-    let validated_dir = validate_isolated_profile_dir(profile_dir, home)?;
+    let validated_dir = validate_isolated_profile_dir(profile_dir, profiles_root, home)?;
     let native = NativeLoginProfile {
         provider,
         profile_dir: validated_dir.clone(),
@@ -1360,10 +1551,7 @@ struct RawVertexIam {
     project: Option<String>,
     service_account: Option<String>,
     endpoint: Option<String>,
-    #[serde(default)]
-    credential_chain: Vec<String>,
-    #[serde(default)]
-    engines: Vec<String>,
+    engines: Option<Vec<String>>,
     #[serde(default)]
     tiers: Vec<ModelTier>,
 }
@@ -1376,10 +1564,7 @@ struct RawBedrockIam {
     region: String,
     aws_profile: Option<String>,
     endpoint: Option<String>,
-    #[serde(default)]
-    credential_chain: Vec<String>,
-    #[serde(default)]
-    engines: Vec<String>,
+    engines: Option<Vec<String>>,
     #[serde(default)]
     tiers: Vec<ModelTier>,
 }
@@ -1393,10 +1578,7 @@ struct RawAzureIam {
     resource: Option<String>,
     tenant_id: Option<String>,
     endpoint: Option<String>,
-    #[serde(default)]
-    credential_chain: Vec<String>,
-    #[serde(default)]
-    engines: Vec<String>,
+    engines: Option<Vec<String>>,
     #[serde(default)]
     tiers: Vec<ModelTier>,
 }
@@ -1427,10 +1609,22 @@ fn reject_plaintext_fields_in_json(profile_name: &str, value: &Value) -> Result<
                 "[auth.profiles.{profile_name}]: field `{k}` looks like an inline credential; {PLAINTEXT_ERR}"
             ));
         }
-        if lower == "api_key" && !v.is_object() {
-            return Err(format!(
-                "[auth.profiles.{profile_name}]: `api_key` must be a SecretRef table; {PLAINTEXT_ERR}"
-            ));
+        if lower == "api_key" {
+            let Some(sub) = v.as_object() else {
+                return Err(format!(
+                    "[auth.profiles.{profile_name}]: `api_key` must be a SecretRef table; {PLAINTEXT_ERR}"
+                ));
+            };
+            // Pre-validate `from_env`/`from_file` cleanly before SecretRef deserialization
+            // so mis-pasted plaintext secrets are never echoed in serde error text.
+            if let Some(Value::String(env_name)) = sub.get("from_env") {
+                validate_env_var_name(env_name)
+                    .map_err(|error| format!("[auth.profiles.{profile_name}]: {error}"))?;
+            }
+            if let Some(Value::String(file_path)) = sub.get("from_file") {
+                normalize_secret_file_path(Path::new(file_path))
+                    .map_err(|error| format!("[auth.profiles.{profile_name}]: {error}"))?;
+            }
         }
         if let Some(sub) = v.as_object() {
             for sub_key in sub.keys() {
@@ -1459,35 +1653,55 @@ fn normalize_tiers(tiers: Vec<ModelTier>) -> Vec<ModelTier> {
     }
 }
 
-fn validate_cloud_iam_engines(
+fn validate_claude_only_engines(
     profile_name: &str,
     provider: &str,
-    configured: &[String],
-    allowed: &[Engine],
+    configured: Option<&[String]>,
 ) -> Result<(), String> {
-    for raw in configured {
+    let Some(list) = configured else {
+        return Ok(());
+    };
+    if list.is_empty() {
+        return Err(format!(
+            "[auth.profiles.{profile_name}]: `engines` must not be empty when specified"
+        ));
+    }
+    for raw in list {
         let norm = raw.trim().to_ascii_lowercase();
         if matches!(norm.as_str(), "agy" | "antigravity") {
             return Err(format!(
                 "[auth.profiles.{profile_name}]: engine `agy` only supports `native_login` (not `cloud_iam`)"
             ));
         }
-        if !allowed.iter().any(|e| e.as_str() == norm) {
+        if norm != "claude" {
             return Err(format!(
-                "[auth.profiles.{profile_name}]: cloud_iam provider `{provider}` only permits [{}], got `{raw}`",
-                format_engine_list(allowed)
+                "[auth.profiles.{profile_name}]: cloud_iam provider `{provider}` only permits [claude], got `{raw}`"
             ));
         }
     }
     Ok(())
 }
 
-fn default_chain(raw: Vec<String>, fallback: &[&str]) -> Vec<String> {
-    if raw.is_empty() {
-        fallback.iter().map(|s| (*s).to_string()).collect()
-    } else {
-        raw
+fn parse_azure_engines(
+    profile_name: &str,
+    configured: Option<Vec<String>>,
+) -> Result<BTreeSet<AzureEngine>, String> {
+    let Some(list) = configured else {
+        return Ok([AzureEngine::Codex, AzureEngine::OpenCode]
+            .into_iter()
+            .collect());
+    };
+    if list.is_empty() {
+        return Err(format!(
+            "[auth.profiles.{profile_name}]: `engines` must not be empty when specified"
+        ));
     }
+    list.into_iter()
+        .map(|raw| {
+            AzureEngine::parse(&raw)
+                .map_err(|error| format!("[auth.profiles.{profile_name}]: {error}"))
+        })
+        .collect()
 }
 
 fn parse_single_profile(
@@ -1530,8 +1744,8 @@ fn parse_relay_table(name: String, value: Value) -> Result<NamedAuthProfile, Str
         validate_env_var_name(from_env)
             .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
     } else if let SecretRef::FromFile { ref from_file } = raw.api_key {
-        normalize_lexical(from_file)
-            .map_err(|error| format!("[auth.profiles.{name}]: api_key.from_file {error}"))?;
+        normalize_secret_file_path(from_file)
+            .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
     }
     let engines: BTreeSet<RelayEngine> = raw.engines.into_iter().collect();
     if engines.is_empty() {
@@ -1565,7 +1779,7 @@ fn parse_native_login_table(
     let candidate_dir = raw
         .profile_dir
         .unwrap_or_else(|| default_profiles_root.join(&name));
-    let profile_dir = validate_isolated_profile_dir(&candidate_dir, home)
+    let profile_dir = validate_isolated_profile_dir(&candidate_dir, default_profiles_root, home)
         .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
     Ok(NamedAuthProfile {
         name,
@@ -1608,7 +1822,7 @@ fn parse_cloud_iam_table(name: String, value: Value) -> Result<NamedAuthProfile,
             let raw: RawVertexIam = serde_json::from_value(value)
                 .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
             let _ = (raw.mode, raw.provider);
-            validate_cloud_iam_engines(&name, "vertex", &raw.engines, &[Engine::Claude])?;
+            validate_claude_only_engines(&name, "vertex", raw.engines.as_deref())?;
             let region = validate_safe_identifier("region", &raw.region)
                 .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
             let cloud = CloudIamProfile::Vertex {
@@ -1620,10 +1834,6 @@ fn parse_cloud_iam_table(name: String, value: Value) -> Result<NamedAuthProfile,
                     raw.service_account.as_deref(),
                 )?,
                 endpoint: opt_endpoint(&name, raw.endpoint.as_deref())?,
-                credential_chain: default_chain(
-                    raw.credential_chain,
-                    &["workload_identity", "application_default", "gce_metadata"],
-                ),
             };
             Ok(NamedAuthProfile {
                 name,
@@ -1636,21 +1846,13 @@ fn parse_cloud_iam_table(name: String, value: Value) -> Result<NamedAuthProfile,
             let raw: RawBedrockIam = serde_json::from_value(value)
                 .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
             let _ = (raw.mode, raw.provider);
-            validate_cloud_iam_engines(&name, "bedrock", &raw.engines, &[Engine::Claude])?;
+            validate_claude_only_engines(&name, "bedrock", raw.engines.as_deref())?;
             let region = validate_safe_identifier("region", &raw.region)
                 .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
             let cloud = CloudIamProfile::Bedrock {
                 region,
                 aws_profile: opt_safe_id(&name, "aws_profile", raw.aws_profile.as_deref())?,
                 endpoint: opt_endpoint(&name, raw.endpoint.as_deref())?,
-                credential_chain: default_chain(
-                    raw.credential_chain,
-                    &[
-                        "web_identity_token",
-                        "ecs_container_credentials",
-                        "iam_role_profile",
-                    ],
-                ),
             };
             Ok(NamedAuthProfile {
                 name,
@@ -1663,12 +1865,7 @@ fn parse_cloud_iam_table(name: String, value: Value) -> Result<NamedAuthProfile,
             let raw: RawAzureIam = serde_json::from_value(value)
                 .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
             let _ = (raw.mode, raw.provider);
-            validate_cloud_iam_engines(
-                &name,
-                "azure",
-                &raw.engines,
-                &[Engine::Codex, Engine::OpenCode],
-            )?;
+            let engines = parse_azure_engines(&name, raw.engines)?;
             let region = validate_safe_identifier("region", &raw.region)
                 .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
             let cloud = CloudIamProfile::Azure {
@@ -1676,10 +1873,7 @@ fn parse_cloud_iam_table(name: String, value: Value) -> Result<NamedAuthProfile,
                 resource: opt_safe_id(&name, "resource", raw.resource.as_deref())?,
                 tenant_id: opt_safe_id(&name, "tenant_id", raw.tenant_id.as_deref())?,
                 endpoint: opt_endpoint(&name, raw.endpoint.as_deref())?,
-                credential_chain: default_chain(
-                    raw.credential_chain,
-                    &["federated_token", "managed_identity", "azure_cli_cache"],
-                ),
+                engines,
             };
             Ok(NamedAuthProfile {
                 name,
@@ -1701,8 +1895,9 @@ fn parse_local_table(name: String, value: Value) -> Result<NamedAuthProfile, Str
     if let Some(auth_val) = &raw.auth
         && !auth_val.trim().eq_ignore_ascii_case("none")
     {
+        // Never echo invalid `auth` value in case an operator pasted a raw token.
         return Err(format!(
-            "[auth.profiles.{name}]: local profile `auth` must be \"none\", got `{auth_val}` (use `mode = \"relay\"` with SecretRef for keyed gateways)"
+            "[auth.profiles.{name}]: local profile `auth` must be \"none\" (use `mode = \"relay\"` with SecretRef for keyed gateways)"
         ));
     }
     let base_url = validate_endpoint_url(
@@ -1806,18 +2001,30 @@ fn toml_basic_string(raw: &str) -> String {
     out
 }
 
-fn section_header_name(trimmed_line: &str) -> Option<&str> {
-    let stripped = trimmed_line.strip_prefix('[')?.trim_start();
-    if stripped.starts_with('[') {
+enum TomlHeader<'a> {
+    Table(&'a str),
+    ArrayOfTables,
+}
+
+fn parse_toml_header(trimmed_line: &str) -> Option<TomlHeader<'_>> {
+    if !trimmed_line.starts_with('[') {
         return None;
     }
-    stripped
+    let code = trimmed_line
         .split('#')
         .next()
-        .unwrap_or(stripped)
-        .trim_end()
-        .strip_suffix(']')
+        .unwrap_or(trimmed_line)
+        .trim_end();
+    if let Some(inner) = code.strip_prefix("[[").and_then(|s| s.strip_suffix("]]"))
+        && !inner.trim().is_empty()
+    {
+        return Some(TomlHeader::ArrayOfTables);
+    }
+    code.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
         .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(TomlHeader::Table)
 }
 
 fn belongs_to_profile_section(section: &str, name: &str) -> bool {
@@ -1825,7 +2032,17 @@ fn belongs_to_profile_section(section: &str, name: &str) -> bool {
     section == target || section.starts_with(&format!("{target}."))
 }
 
-/// Upsert `[auth.profiles.<name>]` in `existing` TOML while preserving unrelated sections/comments.
+fn flush_pending_comments<'a>(kept: &mut Vec<&'a str>, pending: &mut Vec<&'a str>) {
+    if kept.is_empty() {
+        while pending.first().is_some_and(|l| l.trim().is_empty()) {
+            pending.remove(0);
+        }
+    }
+    kept.append(pending);
+}
+
+/// Upsert `[auth.profiles.<name>]` in `existing` TOML while preserving all unrelated
+/// `[tables]`, `[[array.of.tables]]`, and comment blocks intact.
 pub(crate) fn upsert_relay_profile_toml(
     existing: &str,
     name: &str,
@@ -1839,17 +2056,40 @@ pub(crate) fn upsert_relay_profile_toml(
     }
 
     let mut kept_lines: Vec<&str> = Vec::new();
+    let mut pending_comments: Vec<&str> = Vec::new();
     let mut skip_section = false;
+
     for line in existing.lines() {
-        if let Some(section) = section_header_name(line.trim()) {
-            skip_section = belongs_to_profile_section(section, &valid_name);
-            if skip_section {
+        let trimmed = line.trim();
+        if let Some(header) = parse_toml_header(trimmed) {
+            let is_target = match header {
+                TomlHeader::Table(section) => belongs_to_profile_section(section, &valid_name),
+                TomlHeader::ArrayOfTables => false,
+            };
+            if is_target {
+                pending_comments.clear();
+                skip_section = true;
                 continue;
             }
+            if skip_section {
+                skip_section = false;
+                flush_pending_comments(&mut kept_lines, &mut pending_comments);
+            }
+            kept_lines.push(line);
+            continue;
         }
-        if !skip_section {
+        if skip_section {
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                pending_comments.push(line);
+            } else {
+                pending_comments.clear();
+            }
+        } else {
             kept_lines.push(line);
         }
+    }
+    if skip_section && pending_comments.iter().any(|l| !l.trim().is_empty()) {
+        flush_pending_comments(&mut kept_lines, &mut pending_comments);
     }
     while kept_lines.last().is_some_and(|line| line.trim().is_empty()) {
         kept_lines.pop();
@@ -1889,7 +2129,7 @@ pub(crate) fn upsert_relay_profile_toml(
         toml_basic_string(&relay.base_url)
     );
 
-    parse_auth_profiles_toml(&out, Path::new("/tmp/spawn-auth-validate"), None).map_err(
+    parse_auth_profiles_toml(&out, Path::new("/var/lib/spawn/auth-profiles"), None).map_err(
         |error| format!("upsert `{valid_name}` conflicts with existing TOML structure: {error}"),
     )?;
     Ok(out)
@@ -1946,23 +2186,87 @@ fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
     write_res
 }
 
+/// Closed serde-tagged secret reference view (never contains plaintext secrets).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum RedactedSecretSource {
+    FromEnv { var: String },
+    FromFile { path: String },
+}
+
+/// Closed serde-tagged Cloud IAM metadata view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub(crate) enum RedactedCloudMeta {
+    Vertex {
+        region: String,
+        project: Option<String>,
+        service_account: Option<String>,
+    },
+    Bedrock {
+        region: String,
+        aws_profile: Option<String>,
+    },
+    Azure {
+        region: String,
+        resource: Option<String>,
+        tenant_id: Option<String>,
+    },
+}
+
+/// Closed serde-tagged mode-specific payload replacing loose `Option` bags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub(crate) enum RedactedProfileDetails {
+    Relay {
+        base_url: String,
+        secret_source: RedactedSecretSource,
+    },
+    NativeLogin {
+        provider: NativeLoginProvider,
+        isolated_dir: String,
+    },
+    CloudIam {
+        base_url: Option<String>,
+        cloud: RedactedCloudMeta,
+    },
+    Local {
+        local_provider: LocalProvider,
+        base_url: String,
+        local_auth: &'static str,
+    },
+}
+
+impl RedactedProfileDetails {
+    const fn mode_str(&self) -> &'static str {
+        match self {
+            Self::Relay { .. } => "relay",
+            Self::NativeLogin { .. } => "native_login",
+            Self::CloudIam { .. } => "cloud_iam",
+            Self::Local { .. } => "local",
+        }
+    }
+
+    fn isolated_dir(&self) -> Option<&str> {
+        match self {
+            Self::NativeLogin { isolated_dir, .. } => Some(isolated_dir.as_str()),
+            Self::Relay { .. } | Self::CloudIam { .. } | Self::Local { .. } => None,
+        }
+    }
+}
+
 /// Redacted metadata entry returned by `list` and `check`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct RedactedProfileView {
     pub(crate) name: String,
     pub(crate) source: ProfileSource,
-    pub(crate) mode: &'static str,
     pub(crate) engines: Vec<Engine>,
     pub(crate) tiers: Vec<ModelTier>,
     pub(crate) readiness: ProfileReadiness,
     pub(crate) detail: String,
     pub(crate) warnings: Vec<String>,
-    pub(crate) isolated_dir: Option<String>,
-    pub(crate) base_url: Option<String>,
-    pub(crate) secret_source: Option<Value>,
-    pub(crate) cloud: Option<Value>,
-    pub(crate) local_provider: Option<LocalProvider>,
-    pub(crate) local_auth: Option<&'static str>,
+    #[serde(flatten)]
+    pub(crate) details: RedactedProfileDetails,
     pub(crate) env_preview: BTreeMap<&'static str, BTreeMap<String, String>>,
 }
 
@@ -1989,12 +2293,14 @@ pub(crate) struct AuthReport {
     pub(crate) profiles: Vec<RedactedProfileView>,
 }
 
-fn secret_source_redacted(secret: &SecretRef) -> Value {
+fn secret_source_redacted(secret: &SecretRef) -> RedactedSecretSource {
     match secret {
-        SecretRef::FromEnv { from_env } => json!({ "kind": "from_env", "var": from_env }),
-        SecretRef::FromFile { from_file } => {
-            json!({ "kind": "from_file", "path": from_file.display().to_string() })
-        }
+        SecretRef::FromEnv { from_env } => RedactedSecretSource::FromEnv {
+            var: from_env.clone(),
+        },
+        SecretRef::FromFile { from_file } => RedactedSecretSource::FromFile {
+            path: from_file.display().to_string(),
+        },
     }
 }
 
@@ -2017,7 +2323,7 @@ fn redacted_env_preview(
             );
         }
         AuthProfile::CloudIam(cloud) => {
-            for &engine in cloud.engines() {
+            for &engine in &cloud.engines() {
                 if let Ok(plan) = cloud.translate_env(engine) {
                     map.insert(engine.as_str(), plan.masked_summary());
                 }
@@ -2034,94 +2340,70 @@ fn redacted_env_preview(
     map
 }
 
-fn cloud_metadata_json(cloud: &CloudIamProfile) -> Value {
+fn redacted_cloud_meta(cloud: &CloudIamProfile) -> RedactedCloudMeta {
     match cloud {
         CloudIamProfile::Vertex {
             region,
             project,
             service_account,
-            credential_chain,
             ..
-        } => json!({
-            "provider": "vertex",
-            "region": region,
-            "project": project,
-            "service_account": service_account,
-            "credential_chain": credential_chain,
-        }),
+        } => RedactedCloudMeta::Vertex {
+            region: region.clone(),
+            project: project.clone(),
+            service_account: service_account.clone(),
+        },
         CloudIamProfile::Bedrock {
             region,
             aws_profile,
-            credential_chain,
             ..
-        } => json!({
-            "provider": "bedrock",
-            "region": region,
-            "aws_profile": aws_profile,
-            "credential_chain": credential_chain,
-        }),
+        } => RedactedCloudMeta::Bedrock {
+            region: region.clone(),
+            aws_profile: aws_profile.clone(),
+        },
         CloudIamProfile::Azure {
             region,
             resource,
             tenant_id,
-            credential_chain,
             ..
-        } => json!({
-            "provider": "azure",
-            "region": region,
-            "resource": resource,
-            "tenant_id": tenant_id,
-            "credential_chain": credential_chain,
-        }),
+        } => RedactedCloudMeta::Azure {
+            region: region.clone(),
+            resource: resource.clone(),
+            tenant_id: tenant_id.clone(),
+        },
     }
 }
 
 fn redact_profile_view(named: &NamedAuthProfile, probe: ProbeOutcome) -> RedactedProfileView {
-    let isolated_dir = named
-        .profile
-        .isolated_dir()
-        .map(|p| p.display().to_string());
     let env_preview = redacted_env_preview(named);
-    let (base_url, secret_source, cloud, local_provider, local_auth) = match &named.profile {
-        AuthProfile::Relay(relay) => (
-            Some(relay.base_url.clone()),
-            Some(secret_source_redacted(&relay.api_key)),
-            None,
-            None,
-            None,
-        ),
-        AuthProfile::NativeLogin(_) => (None, None, None, None, None),
-        AuthProfile::CloudIam(cloud) => (
-            cloud.endpoint().map(str::to_string),
-            None,
-            Some(cloud_metadata_json(cloud)),
-            None,
-            None,
-        ),
-        AuthProfile::Local(local) => (
-            Some(local.base_url.clone()),
-            None,
-            None,
-            Some(local.provider),
-            Some("none"),
-        ),
+    let details = match &named.profile {
+        AuthProfile::Relay(relay) => RedactedProfileDetails::Relay {
+            base_url: relay.base_url.clone(),
+            secret_source: secret_source_redacted(&relay.api_key),
+        },
+        AuthProfile::NativeLogin(native) => RedactedProfileDetails::NativeLogin {
+            provider: native.provider,
+            isolated_dir: native.profile_dir.display().to_string(),
+        },
+        AuthProfile::CloudIam(cloud) => RedactedProfileDetails::CloudIam {
+            base_url: cloud.endpoint().map(str::to_string),
+            cloud: redacted_cloud_meta(cloud),
+        },
+        AuthProfile::Local(local) => RedactedProfileDetails::Local {
+            local_provider: local.provider,
+            base_url: local.base_url.clone(),
+            local_auth: "none",
+        },
     };
 
     RedactedProfileView {
         name: named.name.clone(),
         source: named.source,
-        mode: named.profile.mode_str(),
         engines: named.profile.engines(),
         tiers: named.tiers.clone(),
         readiness: probe.readiness,
         detail: probe.detail,
         warnings: probe.warnings,
-        isolated_dir,
-        base_url,
-        secret_source,
-        cloud,
-        local_provider,
-        local_auth,
+        details,
         env_preview,
     }
 }
@@ -2132,26 +2414,35 @@ pub(crate) fn evaluate_profiles_report_with(
     profiles_root: &Path,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     file_exists: &dyn Fn(&Path) -> bool,
+    file_reader: &dyn Fn(&Path) -> Option<String>,
     home: Option<&Path>,
     now_unix_secs: i64,
 ) -> Result<AuthReport, String> {
+    let validated_root = validate_profiles_root_dir(profiles_root, home)?;
     let config_exists = config_path.is_file();
     let configured = if config_exists {
         let raw = fs::read_to_string(config_path)
             .map_err(|error| format!("read auth config {}: {error}", config_path.display()))?;
-        parse_auth_profiles_toml(&raw, profiles_root, home)?
+        parse_auth_profiles_toml(&raw, &validated_root, home)?
     } else {
         BTreeMap::new()
     };
 
-    let all_profiles = merge_with_default_profiles(configured, profiles_root);
+    let all_profiles = merge_with_default_profiles(configured, &validated_root);
     let mut views = Vec::with_capacity(all_profiles.len());
     let (mut ready, mut missing, mut reauth_required) = (0usize, 0usize, 0usize);
     let (mut configured_count, mut configured_ready) = (0usize, 0usize);
 
     for named in &all_profiles {
-        let probe =
-            probe_profile_with(&named.profile, env_lookup, file_exists, home, now_unix_secs);
+        let probe = probe_profile_with(
+            &named.profile,
+            &validated_root,
+            env_lookup,
+            file_exists,
+            file_reader,
+            home,
+            now_unix_secs,
+        );
         match probe.readiness {
             ProfileReadiness::Ready => {
                 ready += 1;
@@ -2178,7 +2469,7 @@ pub(crate) fn evaluate_profiles_report_with(
         schema_version: 1,
         config_path: config_path.display().to_string(),
         config_exists,
-        profiles_root_dir: profiles_root.display().to_string(),
+        profiles_root_dir: validated_root.display().to_string(),
         ok,
         summary: AuthSummary {
             total: views.len(),
@@ -2217,7 +2508,7 @@ fn format_report_text(report: &AuthReport, heading: &str) -> String {
             .map(|t| t.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        let isolated = p.isolated_dir.as_deref().unwrap_or("-");
+        let isolated = p.details.isolated_dir().unwrap_or("-");
         let src = match p.source {
             ProfileSource::Configured => "configured",
             ProfileSource::Default => "default",
@@ -2228,7 +2519,7 @@ fn format_report_text(report: &AuthReport, heading: &str) -> String {
             p.name,
             p.readiness.as_str(),
             src,
-            p.mode,
+            p.details.mode_str(),
             engines,
             tiers,
             isolated,
@@ -2345,6 +2636,10 @@ fn process_home() -> Option<PathBuf> {
     config::env_value("HOME").map(PathBuf::from)
 }
 
+fn read_optional_file(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok()
+}
+
 /// Dispatch `spawn auth <verb> ...` without global `--config` override.
 pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
     command_with_config(None, rest)
@@ -2375,13 +2670,14 @@ fn run_list_or_check(
     let parsed = parse_auth_args(args, None, &["config"], &["json"])?;
     let explicit = effective_explicit_config(cli_config, &parsed);
     let config_path = config::auth_config_read_path(explicit.as_deref());
-    let profiles_root = config::auth_profiles_root_dir();
+    let profiles_root = config::auth_profiles_root_dir()?;
     let home = process_home();
     let report = evaluate_profiles_report_with(
         &config_path,
         &profiles_root,
         &|name| config::env_value(name),
         &Path::exists,
+        &read_optional_file,
         home.as_deref(),
         current_unix_secs(),
     )?;
@@ -2423,7 +2719,7 @@ fn run_add_relay(cli_config: Option<&str>, args: &[String]) -> Result<i32, Strin
             from_env: validate_env_var_name(var)?,
         },
         (None, Some(path)) => SecretRef::FromFile {
-            from_file: normalize_lexical(Path::new(path))?,
+            from_file: normalize_secret_file_path(Path::new(path))?,
         },
         (None, None) => {
             return Err(format!(
@@ -2501,18 +2797,87 @@ fn run_add_relay(cli_config: Option<&str>, args: &[String]) -> Result<i32, Strin
     Ok(0)
 }
 
-fn ensure_isolated_dirs(dir: &Path) -> Result<(), String> {
-    for sub in [dir, &dir.join("xdg-config"), &dir.join("xdg-data")] {
-        fs::create_dir_all(sub)
-            .map_err(|error| format!("create isolated profile dir {}: {error}", sub.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(sub, fs::Permissions::from_mode(0o700)).map_err(|error| {
-                format!("set permissions on isolated dir {}: {error}", sub.display())
-            })?;
+fn create_private_dir_only_if_new(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(format!(
+                    "isolated auth path {} exists as symlink or non-directory",
+                    path.display()
+                ));
+            }
+            // Never chmod pre-existing directories.
+            Ok(())
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(path) {
+                Ok(()) => Ok(()),
+                Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let meta = fs::symlink_metadata(path).map_err(|e| {
+                        format!("inspect isolated auth path {}: {e}", path.display())
+                    })?;
+                    if meta.file_type().is_symlink() || !meta.is_dir() {
+                        return Err(format!(
+                            "isolated auth path {} exists as symlink or non-directory",
+                            path.display()
+                        ));
+                    }
+                    Ok(())
+                }
+                Err(create_err) => Err(format!(
+                    "create isolated auth dir {}: {create_err}",
+                    path.display()
+                )),
+            }
+        }
+        Err(error) => Err(format!(
+            "stat isolated auth path {}: {error}",
+            path.display()
+        )),
     }
+}
+
+/// Create `profiles_root` -> `dir` -> `xdg-config`/`xdg-data` strictly inside `profiles_root`,
+/// setting `0o700` ONLY on newly created directories (never `chmod`ing existing dirs).
+pub(crate) fn ensure_isolated_dirs(
+    dir: &Path,
+    profiles_root: &Path,
+    home: Option<&Path>,
+) -> Result<(), String> {
+    let valid_dir = validate_isolated_profile_dir(dir, profiles_root, home)?;
+    let valid_root = validate_profiles_root_dir(profiles_root, home)?;
+    if let Some(root_parent) = valid_root.parent()
+        && !root_parent.as_os_str().is_empty()
+        && !root_parent.exists()
+    {
+        fs::create_dir_all(root_parent).map_err(|error| {
+            format!(
+                "create parent of auth profiles root {}: {error}",
+                root_parent.display()
+            )
+        })?;
+    }
+    create_private_dir_only_if_new(&valid_root)?;
+    let rel = valid_dir.strip_prefix(&valid_root).map_err(|_| {
+        format!(
+            "profile_dir {} escapes {}",
+            valid_dir.display(),
+            valid_root.display()
+        )
+    })?;
+    let mut cur = valid_root;
+    for component in rel.components() {
+        cur.push(component);
+        create_private_dir_only_if_new(&cur)?;
+    }
+    create_private_dir_only_if_new(&valid_dir.join("xdg-config"))?;
+    create_private_dir_only_if_new(&valid_dir.join("xdg-data"))?;
     Ok(())
 }
 
@@ -2522,7 +2887,7 @@ fn run_login(cli_config: Option<&str>, args: &[String]) -> Result<i32, String> {
         NativeLoginProvider::parse_provider(parsed.positional.as_deref().unwrap_or_default())?;
     let explicit = effective_explicit_config(cli_config, &parsed);
     let config_path = config::auth_config_read_path(explicit.as_deref());
-    let profiles_root = config::auth_profiles_root_dir();
+    let profiles_root = config::auth_profiles_root_dir()?;
     let home = process_home();
     let configured = if config_path.is_file() {
         let raw = fs::read_to_string(&config_path)
@@ -2542,10 +2907,11 @@ fn run_login(cli_config: Option<&str>, args: &[String]) -> Result<i32, String> {
         provider,
         &profile_name,
         &profile_dir,
+        &profiles_root,
         home.as_deref(),
         &|name| config::env_value(name),
     )?;
-    ensure_isolated_dirs(&plan.profile_dir)?;
+    ensure_isolated_dirs(&plan.profile_dir, &profiles_root, home.as_deref())?;
 
     println!(
         "launching isolated `{}` login for profile `{}` in {}",
@@ -2627,8 +2993,234 @@ mod tests {
     }
 
     #[test]
-    fn adt_forbids_agy_in_relay_local_and_cloud_iam() {
-        let root = Path::new("/tmp/spawn-auth-validate");
+    fn b1_rejects_all_url_queries_fragments_semicolons_and_userinfo_without_echo() {
+        let canary = "sk-b1-canary-never-leak-7741";
+        let args = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let bad_urls = [
+            format!("https://gw.example/v1?api-key={canary}"),
+            format!("https://gw.example/v1?x-api-key={canary}"),
+            format!("https://gw.example/v1?sig={canary}"),
+            format!("https://gw.example/v1?auth={canary}"),
+            format!("https://gw.example/v1?api_key={canary}"),
+            format!("https://gw.example/v1?benign=1&foo={canary}"),
+            format!("https://gw.example/v1;key={canary}"),
+            format!("https://gw.example/v1#token={canary}"),
+            format!("HTTPS://user:{canary}@gw.example/v1"),
+            format!("ftp://user:{canary}@gw.example/v1"),
+            format!("https://gw.example\\path\\{canary}"),
+        ];
+        for bad in &bad_urls {
+            let err = validate_endpoint_url(bad).unwrap_err();
+            assert!(!err.contains(canary), "canary leaked in URL error: {err}");
+            let cli_err = command(&args(&[
+                "add-relay",
+                "leaky",
+                "--url",
+                bad,
+                "--key-env",
+                "GW_KEY",
+            ]))
+            .unwrap_err();
+            assert!(
+                !cli_err.contains(canary),
+                "canary leaked in CLI error: {cli_err}"
+            );
+        }
+        assert_eq!(
+            validate_endpoint_url("HTTPS://gw.example/v1/"),
+            Ok("https://gw.example/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn b2_upsert_preserves_array_of_tables_and_comments_following_replaced_profile() {
+        let initial = r#"# top file comment
+[auth.profiles.foo]
+mode = "relay"
+base_url = "https://old.example/v1"
+engines = ["claude"]
+[auth.profiles.foo.api_key]
+from_env = "OLD_KEY"
+
+# keep this comment above array of tables
+[[hooks]]
+cmd = "keep-me"
+
+[[writable_mounts]]
+source = "/srv/work"
+target = "/work"
+
+# trailing server comment
+[server]
+port = 8080
+"#;
+        let updated = upsert_relay_profile_toml(
+            initial,
+            "foo",
+            &RelayProfile {
+                base_url: "https://new.example/v1".to_string(),
+                api_key: SecretRef::FromEnv {
+                    from_env: "NEW_KEY".to_string(),
+                },
+                engines: [RelayEngine::Claude, RelayEngine::Codex]
+                    .into_iter()
+                    .collect(),
+            },
+            &ModelTier::ALL,
+        )
+        .expect("upsert preserving hooks");
+
+        assert!(updated.contains("# top file comment"), "{updated}");
+        assert!(
+            updated.contains("# keep this comment above array of tables"),
+            "{updated}"
+        );
+        assert!(updated.contains("[[hooks]]"), "{updated}");
+        assert!(updated.contains("cmd = \"keep-me\""), "{updated}");
+        assert!(updated.contains("[[writable_mounts]]"), "{updated}");
+        assert!(updated.contains("# trailing server comment"), "{updated}");
+        assert!(updated.contains("[server]"), "{updated}");
+        assert!(!updated.contains("OLD_KEY"), "{updated}");
+        assert!(updated.contains("NEW_KEY"), "{updated}");
+
+        let doc = toml_parser::parse(&updated).expect("valid TOML");
+        assert_eq!(doc["hooks"][0]["cmd"], json!("keep-me"));
+        assert_eq!(doc["writable_mounts"][0]["target"], json!("/work"));
+        assert_eq!(doc["server"]["port"], json!(8080));
+    }
+
+    #[test]
+    fn b3_enforces_strict_containment_and_never_chmods_existing_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = scratch_dir("b3-isolation");
+        let fake_home = scratch.join("home");
+        let profiles_root = scratch.join("controlled/auth-profiles");
+        fs::create_dir_all(fake_home.join(".ssh")).expect("ssh");
+        fs::create_dir_all(fake_home.join(".aws")).expect("aws");
+        fs::create_dir_all(fake_home.join(".config/gcloud")).expect("gcloud");
+        fs::create_dir_all(fake_home.join(".claude")).expect("claude");
+        fs::create_dir_all(&profiles_root).expect("root");
+
+        let external_dir = scratch.join("external-0755");
+        fs::create_dir_all(&external_dir).expect("external");
+        fs::set_permissions(&external_dir, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+
+        for home in [Some(fake_home.as_path()), None] {
+            for blocked in [
+                PathBuf::from("/"),
+                PathBuf::from("/etc"),
+                PathBuf::from("/tmp"),
+                PathBuf::from("/home"),
+                external_dir.clone(),
+                profiles_root.clone(),
+                fake_home.join(".ssh"),
+                fake_home.join(".aws"),
+                fake_home.join(".config"),
+                fake_home.join(".config/gcloud"),
+                fake_home.join(".claude"),
+                PathBuf::from("/home/other/.claude"),
+                profiles_root.join("../escape"),
+            ] {
+                assert!(
+                    validate_isolated_profile_dir(&blocked, &profiles_root, home).is_err(),
+                    "must reject {} with home={home:?}",
+                    blocked.display()
+                );
+            }
+        }
+
+        // Symlink inside profiles_root pointing to ~/.ssh or /tmp must fail closed.
+        let escape_link = profiles_root.join("escape-ssh");
+        std::os::unix::fs::symlink(fake_home.join(".ssh"), &escape_link).expect("symlink");
+        assert!(
+            validate_isolated_profile_dir(&escape_link, &profiles_root, Some(&fake_home)).is_err()
+        );
+
+        // ensure_isolated_dirs refuses external dir without touching its 0755 permissions.
+        assert!(ensure_isolated_dirs(&external_dir, &profiles_root, Some(&fake_home)).is_err());
+        let mode_after = fs::metadata(&external_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_after, 0o755);
+
+        // Pre-existing dir under profiles_root keeps its existing permissions; new dir gets 0700.
+        let pre_dir = profiles_root.join("pre-existing");
+        fs::create_dir_all(&pre_dir).expect("pre_dir");
+        fs::set_permissions(&pre_dir, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+        ensure_isolated_dirs(&pre_dir, &profiles_root, Some(&fake_home)).expect("ok pre_dir");
+        assert_eq!(
+            fs::metadata(&pre_dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        let brand_new = profiles_root.join("fresh-profile");
+        ensure_isolated_dirs(&brand_new, &profiles_root, Some(&fake_home)).expect("create fresh");
+        assert_eq!(
+            fs::metadata(&brand_new).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn n1_never_echoes_mispasted_secrets_in_cli_or_toml_errors() {
+        let canary = "sk-n1-mispasted-secret-99881";
+        let root = Path::new("/var/lib/spawn/auth-profiles");
+        let args = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        for cli in [
+            args(&[
+                "add-relay",
+                "r",
+                "--url",
+                "https://gw.example",
+                "--key-env",
+                canary,
+            ]),
+            args(&[
+                "add-relay",
+                "r",
+                "--url",
+                "https://gw.example",
+                "--key-file",
+                canary,
+            ]),
+            args(&[
+                "add-relay",
+                "r",
+                "--url",
+                &format!("HTTPS://u:{canary}@gw.example"),
+                "--key-env",
+                "K",
+            ]),
+            args(&[
+                "add-relay",
+                "r",
+                "--url",
+                &format!("https://gw.example?k={canary}"),
+                "--key-env",
+                "K",
+            ]),
+        ] {
+            let err = command(&cli).unwrap_err();
+            assert!(!err.contains(canary), "canary echoed in CLI error: {err}");
+        }
+
+        for toml in [
+            format!(
+                "[auth.profiles.r]\nmode=\"relay\"\nbase_url=\"https://gw.example\"\nengines=[\"claude\"]\napi_key={{from_env=\"{canary}\"}}"
+            ),
+            format!(
+                "[auth.profiles.r]\nmode=\"relay\"\nbase_url=\"https://gw.example\"\nengines=[\"claude\"]\napi_key={{from_file=\"{canary}\"}}"
+            ),
+            format!("[auth.profiles.l]\nmode=\"local\"\nprovider=\"ollama\"\nauth=\"{canary}\""),
+        ] {
+            let err = parse_auth_profiles_toml(&toml, root, None).unwrap_err();
+            assert!(!err.contains(canary), "canary echoed in TOML error: {err}");
+        }
+    }
+
+    #[test]
+    fn adt_forbids_agy_and_cross_cloud_fields_and_unused_credential_chain() {
+        let root = Path::new("/var/lib/spawn/auth-profiles");
         let args = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
 
         for bad_engines in ["agy", "claude,agy"] {
@@ -2646,379 +3238,201 @@ mod tests {
             assert!(err.contains("native_login"), "{bad_engines}: {err}");
         }
 
-        let relay_agy = r#"
-[auth.profiles.r-agy]
-mode = "relay"
-base_url = "https://gw.example.com/v1"
-engines = ["claude", "agy"]
-api_key = { from_env = "GW_KEY" }
-"#;
-        assert!(
-            parse_auth_profiles_toml(relay_agy, root, None)
-                .unwrap_err()
-                .contains("native_login")
-        );
-
-        let local_agy = r#"
-[auth.profiles.l-agy]
-mode = "local"
-provider = "ollama"
-engines = ["agy"]
-"#;
-        assert!(
-            parse_auth_profiles_toml(local_agy, root, None)
-                .unwrap_err()
-                .contains("native_login")
-        );
-
-        let cloud_agy = r#"
-[auth.profiles.v-agy]
-mode = "cloud_iam"
-provider = "vertex"
-region = "us-central1"
-engines = ["agy"]
-"#;
-        assert!(
-            parse_auth_profiles_toml(cloud_agy, root, None)
-                .unwrap_err()
-                .contains("native_login")
-        );
-
-        let vertex_codex = r#"
-[auth.profiles.v-codex]
-mode = "cloud_iam"
-provider = "vertex"
-region = "us-central1"
-engines = ["codex"]
-"#;
-        assert!(parse_auth_profiles_toml(vertex_codex, root, None).is_err());
-
-        let azure_claude = r#"
-[auth.profiles.az-claude]
-mode = "cloud_iam"
-provider = "azure"
-region = "eastus"
-engines = ["claude"]
-"#;
-        assert!(parse_auth_profiles_toml(azure_claude, root, None).is_err());
-    }
-
-    #[test]
-    fn adt_rejects_cross_cloud_iam_fields() {
-        let root = Path::new("/tmp/spawn-auth-validate");
-        let bad_clouds = [
-            r#"
-[auth.profiles.bad_vertex]
-mode = "cloud_iam"
-provider = "vertex"
-region = "us-central1"
-aws_profile = "prod-aws"
-"#,
-            r#"
-[auth.profiles.bad_vertex_tenant]
-mode = "cloud_iam"
-provider = "vertex"
-region = "us-central1"
-tenant_id = "0000-tenant"
-"#,
-            r#"
-[auth.profiles.bad_bedrock]
-mode = "cloud_iam"
-provider = "bedrock"
-region = "us-east-1"
-service_account = "sa@proj.iam.gserviceaccount.com"
-"#,
-            r#"
-[auth.profiles.bad_bedrock_tenant]
-mode = "cloud_iam"
-provider = "bedrock"
-region = "us-east-1"
-tenant_id = "0000-tenant"
-"#,
-            r#"
-[auth.profiles.bad_azure]
-mode = "cloud_iam"
-provider = "azure"
-region = "eastus"
-aws_profile = "prod-aws"
-"#,
-            r#"
-[auth.profiles.bad_azure_sa]
-mode = "cloud_iam"
-provider = "azure"
-region = "eastus"
-service_account = "sa@proj.iam.gserviceaccount.com"
-"#,
-        ];
-        for toml in bad_clouds {
+        for toml in [
+            "[auth.profiles.p]\nmode=\"relay\"\nbase_url=\"https://gw.example\"\nengines=[\"agy\"]\napi_key={from_env=\"K\"}",
+            "[auth.profiles.p]\nmode=\"local\"\nprovider=\"ollama\"\nengines=[\"agy\"]",
+            "[auth.profiles.p]\nmode=\"cloud_iam\"\nprovider=\"vertex\"\nregion=\"us-central1\"\nengines=[\"agy\"]",
+            "[auth.profiles.p]\nmode=\"cloud_iam\"\nprovider=\"vertex\"\nregion=\"us-central1\"\nengines=[\"codex\"]",
+            "[auth.profiles.p]\nmode=\"cloud_iam\"\nprovider=\"azure\"\nregion=\"eastus\"\nengines=[\"claude\"]",
+            "[auth.profiles.p]\nmode=\"cloud_iam\"\nprovider=\"vertex\"\nregion=\"us-central1\"\naws_profile=\"p\"",
+            "[auth.profiles.p]\nmode=\"cloud_iam\"\nprovider=\"bedrock\"\nregion=\"us-east-1\"\nservice_account=\"sa@p\"",
+            "[auth.profiles.p]\nmode=\"cloud_iam\"\nprovider=\"azure\"\nregion=\"eastus\"\naws_profile=\"p\"",
+            // N5: credential_chain removed & refused fail-closed.
+            "[auth.profiles.p]\nmode=\"cloud_iam\"\nprovider=\"vertex\"\nregion=\"us-central1\"\ncredential_chain=[\"adc\"]",
+        ] {
             assert!(
                 parse_auth_profiles_toml(toml, root, None).is_err(),
-                "expected cross-cloud rejection for:\n{toml}"
+                "expected rejection for:\n{toml}"
             );
         }
     }
 
     #[test]
-    fn parses_all_four_modes_from_toml() {
-        let root = scratch_dir("parse-all-four");
-        let isolated_dir = root.join("profiles/claude-work");
-        let toml = format!(
+    fn n2_n3_azure_engine_subset_and_bedrock_probe() {
+        let scratch = scratch_dir("n2-n3");
+        let root = scratch.join("controlled/auth-profiles");
+        fs::create_dir_all(&root).expect("root");
+
+        let cfg_path = scratch.join("auth.toml");
+        fs::write(
+            &cfg_path,
             r#"
-[auth.profiles.openrouter]
-mode = "relay"
-base_url = "https://openrouter.ai/api/"
-engines = ["claude", "codex", "opencode"]
-tiers = ["L1", "L2"]
-[auth.profiles.openrouter.api_key]
-from_env = "OPENROUTER_API_KEY"
-
-[auth.profiles.claude-work]
-mode = "native_login"
-provider = "claude_oauth"
-profile_dir = "{dir}"
-
-[auth.profiles.gcp-vertex]
-mode = "cloud_iam"
-provider = "vertex"
-region = "us-central1"
-project = "my-gcp-project"
-service_account = "runner@my-gcp-project.iam.gserviceaccount.com"
-
-[auth.profiles.aws-bedrock]
-mode = "cloud_iam"
-provider = "bedrock"
-region = "us-east-1"
-aws_profile = "bedrock-prod"
-
-[auth.profiles.az-openai]
+[auth.profiles.az-codex-only]
 mode = "cloud_iam"
 provider = "azure"
 region = "eastus"
 resource = "aoai-prod"
-tenant_id = "tenant-123"
-endpoint = "https://aoai-prod.openai.azure.com"
+engines = ["codex"]
+
+[auth.profiles.aws-prod]
+mode = "cloud_iam"
+provider = "bedrock"
+region = "us-east-1"
+aws_profile = "prod"
+"#,
+        )
+        .expect("write cfg");
+
+        let r_missing = evaluate_profiles_report_with(
+            &cfg_path,
+            &root,
+            &|_| None,
+            &|_| false,
+            &|_| None,
+            Some(&scratch.join("home")),
+            1_750_000_000,
+        )
+        .expect("report missing");
+
+        let az = r_missing
+            .profiles
+            .iter()
+            .find(|p| p.name == "az-codex-only")
+            .unwrap();
+        assert_eq!(az.engines, vec![Engine::Codex]);
+        assert_eq!(
+            az.env_preview.keys().copied().collect::<Vec<_>>(),
+            vec!["codex"]
+        );
+
+        let bedrock = r_missing
+            .profiles
+            .iter()
+            .find(|p| p.name == "aws-prod")
+            .unwrap();
+        assert_eq!(bedrock.readiness, ProfileReadiness::Missing);
+
+        let aws_cfg = scratch.join("home/.aws/config");
+        let r_ready = evaluate_profiles_report_with(
+            &cfg_path,
+            &root,
+            &|_| None,
+            &|p| p == aws_cfg,
+            &|p| (p == aws_cfg).then(|| "[profile prod]\nregion = us-east-1\n".to_string()),
+            Some(&scratch.join("home")),
+            1_750_000_000,
+        )
+        .expect("report ready");
+        assert_eq!(
+            r_ready
+                .profiles
+                .iter()
+                .find(|p| p.name == "aws-prod")
+                .unwrap()
+                .readiness,
+            ProfileReadiness::Ready
+        );
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn n4_tagged_json_view_omits_null_option_bags_and_redacts_canary() {
+        let scratch = scratch_dir("n4-tagged");
+        let root = scratch.join("controlled/auth-profiles");
+        fs::create_dir_all(&root).expect("root");
+
+        let cfg_path = scratch.join("auth.toml");
+        fs::write(
+            &cfg_path,
+            format!(
+                r#"
+[auth.profiles.relay-env]
+mode = "relay"
+base_url = "https://gw.example/v1"
+engines = ["claude"]
+[auth.profiles.relay-env.api_key]
+from_env = "RELAY_KEY"
+
+[auth.profiles.claude-work]
+mode = "native_login"
+provider = "claude_oauth"
+profile_dir = "{pdir}"
 
 [auth.profiles.local-ollama]
 mode = "local"
 provider = "ollama"
 auth = "none"
-engines = ["codex", "opencode"]
 "#,
-            dir = isolated_dir.display()
-        );
-
-        let parsed = parse_auth_profiles_toml(
-            &toml,
-            &root.join("default-profiles"),
-            Some(Path::new("/home/tester")),
+                pdir = root.join("claude-work").display()
+            ),
         )
-        .expect("parse all 4 modes");
-        assert_eq!(parsed.len(), 6);
-        assert_eq!(parsed["openrouter"].profile.mode_str(), "relay");
-        assert_eq!(parsed["claude-work"].profile.mode_str(), "native_login");
-        assert_eq!(parsed["gcp-vertex"].profile.mode_str(), "cloud_iam");
-        assert_eq!(parsed["aws-bedrock"].profile.mode_str(), "cloud_iam");
-        assert_eq!(parsed["az-openai"].profile.mode_str(), "cloud_iam");
-        assert_eq!(parsed["local-ollama"].profile.mode_str(), "local");
-        let _ = fs::remove_dir_all(&root);
+        .expect("write cfg");
+
+        let report = evaluate_profiles_report_with(
+            &cfg_path,
+            &root,
+            &|k| (k == "RELAY_KEY").then(|| "sk-canary-val-5512".to_string()),
+            &|_| false,
+            &|_| None,
+            Some(&scratch.join("home")),
+            1_750_000_000,
+        )
+        .expect("report");
+
+        let json_val = serde_json::to_value(&report).unwrap();
+        let profiles = json_val["profiles"].as_array().unwrap();
+        let relay_obj = profiles
+            .iter()
+            .find(|v| v["name"] == "relay-env")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(relay_obj["mode"], json!("relay"));
+        assert!(!relay_obj.contains_key("isolated_dir"));
+        assert!(!relay_obj.contains_key("cloud"));
+        assert!(!relay_obj.contains_key("local_provider"));
+
+        let native_obj = profiles
+            .iter()
+            .find(|v| v["name"] == "claude-work")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(native_obj["mode"], json!("native_login"));
+        assert!(!native_obj.contains_key("base_url"));
+        assert!(!native_obj.contains_key("secret_source"));
+
+        let local_obj = profiles
+            .iter()
+            .find(|v| v["name"] == "local-ollama")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(local_obj["mode"], json!("local"));
+        assert_eq!(local_obj["local_auth"], json!("none"));
+        assert!(!local_obj.contains_key("secret_source"));
+
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains("sk-canary-val-5512")
+        );
+        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]
-    fn translates_relay_envs_with_secret_redaction() {
-        let canary = "sk-canary-never-leak-debug-4291";
-        let relay = RelayProfile {
-            base_url: "https://openrouter.ai/api".to_string(),
-            api_key: SecretRef::FromEnv {
-                from_env: "OPENROUTER_API_KEY".to_string(),
-            },
-            engines: [
-                RelayEngine::Claude,
-                RelayEngine::Codex,
-                RelayEngine::OpenCode,
-            ]
-            .into_iter()
-            .collect(),
-        };
-        let claude_env = relay
-            .translate_env(RelayEngine::Claude, canary)
-            .expect("claude env");
-        assert_eq!(
-            claude_env.set.get("ANTHROPIC_BASE_URL").map(String::as_str),
-            Some("https://openrouter.ai/api")
-        );
-        assert_eq!(
-            claude_env.set.get("ANTHROPIC_API_KEY").map(String::as_str),
-            Some(canary)
-        );
-        assert!(!format!("{claude_env:?}").contains(canary));
-        assert_eq!(
-            claude_env
-                .masked_summary()
-                .get("ANTHROPIC_API_KEY")
-                .map(String::as_str),
-            Some("<redacted>")
-        );
-
-        let codex_env = relay
-            .translate_env(RelayEngine::Codex, canary)
-            .expect("codex env");
-        assert_eq!(
-            codex_env.set.get("OPENAI_API_KEY").map(String::as_str),
-            Some(canary)
-        );
-        let oc_env = relay
-            .translate_env(RelayEngine::OpenCode, canary)
-            .expect("opencode env");
-        assert!(
-            oc_env.set.contains_key("OPENAI_API_KEY")
-                && oc_env.set.contains_key("ANTHROPIC_API_KEY")
-        );
-    }
-
-    #[test]
-    fn translates_cloud_iam_and_local_envs_cleanly() {
-        let vertex = CloudIamProfile::Vertex {
-            region: "us-central1".to_string(),
-            project: Some("my-gcp-project".to_string()),
-            service_account: None,
-            endpoint: None,
-            credential_chain: vec!["workload_identity".to_string()],
-        };
-        assert_eq!(vertex.engines(), &[Engine::Claude]);
-        let vertex_env = vertex.translate_env(Engine::Claude).expect("vertex env");
-        assert_eq!(
-            vertex_env
-                .set
-                .get("CLAUDE_CODE_USE_VERTEX")
-                .map(String::as_str),
-            Some("1")
-        );
-        assert!(
-            vertex
-                .translate_env(Engine::Agy)
-                .unwrap_err()
-                .contains("native_login")
-        );
-        assert!(vertex.translate_env(Engine::Codex).is_err());
-
-        let bedrock = CloudIamProfile::Bedrock {
-            region: "us-east-1".to_string(),
-            aws_profile: Some("bedrock-prod".to_string()),
-            endpoint: None,
-            credential_chain: vec!["web_identity_token".to_string()],
-        };
-        let bedrock_env = bedrock.translate_env(Engine::Claude).expect("bedrock env");
-        assert_eq!(
-            bedrock_env.set.get("AWS_PROFILE").map(String::as_str),
-            Some("bedrock-prod")
-        );
-
-        let azure = CloudIamProfile::Azure {
-            region: "eastus".to_string(),
-            resource: Some("aoai-prod".to_string()),
-            tenant_id: Some("tenant-123".to_string()),
-            endpoint: Some("https://aoai-prod.openai.azure.com".to_string()),
-            credential_chain: vec!["federated_token".to_string()],
-        };
-        assert_eq!(azure.engines(), &[Engine::Codex, Engine::OpenCode]);
-        let az_env = azure.translate_env(Engine::Codex).expect("azure env");
-        assert_eq!(
-            az_env.set.get("AZURE_TENANT_ID").map(String::as_str),
-            Some("tenant-123")
-        );
-        assert!(azure.translate_env(Engine::Claude).is_err());
-
-        let local = LocalProfile {
-            provider: LocalProvider::Ollama,
-            base_url: LocalProvider::Ollama.default_base_url().to_string(),
-            engines: [RelayEngine::Codex, RelayEngine::OpenCode]
-                .into_iter()
-                .collect(),
-        };
-        let local_env = local.translate_env(RelayEngine::Codex).expect("local env");
-        assert_eq!(
-            local_env.set.get("OPENAI_BASE_URL").map(String::as_str),
-            Some("http://127.0.0.1:11434/v1")
-        );
-        assert_eq!(
-            local_env.set.get("OPENAI_API_KEY").map(String::as_str),
-            Some("not-required")
-        );
-    }
-
-    #[test]
-    fn anti_plaintext_guards_reject_inline_keys_urls_and_local_tokens() {
-        let root = Path::new("/tmp/spawn-auth-validate");
-        let plaintext_toml = r#"
-[auth.profiles.bad]
-mode = "relay"
-base_url = "https://gw.example.com/v1"
-api_key = "sk-plaintext-must-fail"
-engines = ["claude"]
-"#;
-        let err = parse_auth_profiles_toml(plaintext_toml, root, None).unwrap_err();
-        assert!(!err.contains("sk-plaintext-must-fail"), "{err}");
-
-        let smuggled_toml = r#"
-[auth.profiles.bad]
-mode = "relay"
-base_url = "https://gw.example.com/v1"
-key = "sk-plaintext"
-engines = ["claude"]
-[auth.profiles.bad.api_key]
-from_env = "OK_VAR"
-"#;
-        assert!(parse_auth_profiles_toml(smuggled_toml, root, None).is_err());
-
-        assert!(
-            validate_endpoint_url("https://user:secret@gw.example.com/v1")
-                .unwrap_err()
-                .contains("userinfo")
-        );
-        assert!(
-            validate_endpoint_url("https://gw.example.com/v1?api_key=sk-secret")
-                .unwrap_err()
-                .contains("query parameter")
-        );
-
-        let bad_local = r#"
-[auth.profiles.badlocal]
-mode = "local"
-provider = "vllm"
-auth = "sk-local-secret"
-"#;
-        assert!(parse_auth_profiles_toml(bad_local, root, None).is_err());
-    }
-
-    #[test]
-    fn native_login_enforces_host_dir_isolation_and_probes_readiness_states() {
-        let scratch = scratch_dir("native-isolation");
+    fn probes_native_login_states_and_translates_all_mode_envs() {
+        let scratch = scratch_dir("native-and-envs");
+        let profiles_root = scratch.join("controlled/auth-profiles");
         let fake_home = scratch.join("home");
-        fs::create_dir_all(fake_home.join(".claude")).expect("home claude");
-        fs::create_dir_all(fake_home.join(".gemini")).expect("home gemini");
-        fs::create_dir_all(fake_home.join(".codex")).expect("home codex");
+        fs::create_dir_all(&profiles_root).expect("root");
 
-        for blocked in [
-            fake_home.clone(),
-            fake_home.join(".claude"),
-            fake_home.join(".claude/work"),
-            fake_home.join(".gemini"),
-            fake_home.join(".codex"),
-        ] {
-            let err = validate_isolated_profile_dir(&blocked, Some(&fake_home)).unwrap_err();
-            assert!(err.contains("refuses host directory"), "{err}");
-        }
-
-        let escape_link = scratch.join("sneaky-link");
-        std::os::unix::fs::symlink(fake_home.join(".claude"), &escape_link).expect("symlink");
-        assert!(validate_isolated_profile_dir(&escape_link, Some(&fake_home)).is_err());
-        assert!(validate_isolated_profile_dir(Path::new("rel/profile"), Some(&fake_home)).is_err());
-
-        let isolated = scratch.join("isolated/claude-work");
+        let isolated = profiles_root.join("claude-work");
         let now = 1_750_000_000_i64;
         assert_eq!(
             probe_native_login(
                 &isolated,
+                &profiles_root,
                 NativeLoginProvider::ClaudeOauth,
                 Some(&fake_home),
                 now
@@ -3026,7 +3440,6 @@ auth = "sk-local-secret"
             .readiness,
             ProfileReadiness::Missing
         );
-
         fs::create_dir_all(&isolated).expect("isolated");
         let cred = isolated.join(".credentials.json");
         fs::write(
@@ -3036,10 +3449,11 @@ auth = "sk-local-secret"
                 (now + 3600) * 1000
             ),
         )
-        .expect("write ready cred");
+        .expect("ready");
         assert_eq!(
             probe_native_login(
                 &isolated,
+                &profiles_root,
                 NativeLoginProvider::ClaudeOauth,
                 Some(&fake_home),
                 now
@@ -3047,7 +3461,6 @@ auth = "sk-local-secret"
             .readiness,
             ProfileReadiness::Ready
         );
-
         fs::write(
             &cred,
             format!(
@@ -3055,22 +3468,11 @@ auth = "sk-local-secret"
                 (now - 10) * 1000
             ),
         )
-        .expect("write expired cred");
+        .expect("expired");
         assert_eq!(
             probe_native_login(
                 &isolated,
-                NativeLoginProvider::ClaudeOauth,
-                Some(&fake_home),
-                now
-            )
-            .readiness,
-            ProfileReadiness::ReauthRequired
-        );
-
-        fs::write(&cred, "{not-valid-json").expect("write bad json");
-        assert_eq!(
-            probe_native_login(
-                &isolated,
+                &profiles_root,
                 NativeLoginProvider::ClaudeOauth,
                 Some(&fake_home),
                 now
@@ -3082,139 +3484,44 @@ auth = "sk-local-secret"
         let plan = plan_login_command(
             NativeLoginProvider::Agy,
             "agy-work",
-            &scratch.join("isolated/agy-work"),
+            &profiles_root.join("agy-work"),
+            &profiles_root,
             Some(&fake_home),
             &|_| None,
         )
         .expect("plan agy login");
         assert_eq!(plan.engine, Engine::Agy);
         assert!(plan.env.set.contains_key("AGY_HOME"));
-        assert!(plan.env.unset.contains(&"GEMINI_API_KEY".to_string()));
 
-        let _ = fs::remove_dir_all(&scratch);
-    }
-
-    #[test]
-    fn json_and_text_reports_redact_canary_secrets_completely() {
-        let scratch = scratch_dir("redact-json");
-        let env_canary = "sk-env-canary-987654321-never-print";
-        let file_canary = "sk-file-canary-123456789-never-print";
-        let secret_file = scratch.join("relay.key");
-        fs::write(&secret_file, format!("{file_canary}\n")).expect("write secret file");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).expect("chmod");
-        }
-
-        let cfg_path = scratch.join("auth.toml");
-        fs::write(
-            &cfg_path,
-            format!(
-                r#"
-[auth.profiles.relay-env]
-mode = "relay"
-base_url = "https://relay-a.example.com/v1"
-engines = ["claude", "codex"]
-[auth.profiles.relay-env.api_key]
-from_env = "CANARY_RELAY_KEY"
-
-[auth.profiles.relay-file]
-mode = "relay"
-base_url = "https://relay-b.example.com/v1"
-engines = ["codex"]
-[auth.profiles.relay-file.api_key]
-from_file = "{secret_file}"
-"#,
-                secret_file = secret_file.display()
-            ),
-        )
-        .expect("write auth.toml");
-
-        let report = evaluate_profiles_report_with(
-            &cfg_path,
-            &scratch.join("profiles"),
-            &|name| (name == "CANARY_RELAY_KEY").then(|| env_canary.to_string()),
-            &Path::exists,
-            Some(Path::new("/home/tester")),
-            1_750_000_000,
-        )
-        .expect("evaluate report");
-
-        assert!(report.ok);
-        assert_eq!(report.summary.configured, 2);
-        assert_eq!(report.summary.configured_ready, 2);
-
-        let json_out = serde_json::to_string_pretty(&report).expect("json");
-        let text_out = format_report_text(&report, "spawn auth list");
-        for output in [&json_out, &text_out] {
-            assert!(!output.contains(env_canary), "env canary leaked: {output}");
-            assert!(
-                !output.contains(file_canary),
-                "file canary leaked: {output}"
-            );
-        }
-        assert!(json_out.contains("CANARY_RELAY_KEY"));
-        assert!(json_out.contains("env_preview"));
-
-        let _ = fs::remove_dir_all(&scratch);
-    }
-
-    #[test]
-    fn cli_arg_parsing_and_relay_toml_upsert_reject_boundaries_cleanly() {
-        let args = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-
-        let key_flag_err = command(&args(&[
-            "add-relay",
-            "myrelay",
-            "--url",
-            "https://gw.example",
-            "--key",
-            "sk-bad",
-        ]))
-        .unwrap_err();
-        assert!(key_flag_err.contains("forbidden"), "{key_flag_err}");
-        assert!(command(&args(&["login", "opencode"])).is_err());
-        assert!(command(&[]).is_err());
-        assert!(
-            command(&args(&["unknown"]))
-                .unwrap_err()
-                .contains("unknown auth subcommand")
+        let relay = RelayProfile {
+            base_url: "https://gw.example/v1".to_string(),
+            api_key: SecretRef::FromEnv {
+                from_env: "GW_KEY".to_string(),
+            },
+            engines: [RelayEngine::Claude, RelayEngine::OpenCode]
+                .into_iter()
+                .collect(),
+        };
+        let canary = "sk-env-secret-redact-123";
+        let env = relay.translate_env(RelayEngine::Claude, canary).unwrap();
+        assert!(!format!("{env:?}").contains(canary));
+        assert_eq!(
+            env.masked_summary()
+                .get("ANTHROPIC_API_KEY")
+                .map(String::as_str),
+            Some("<redacted>")
         );
 
-        let initial = r#"# fleet auth config
-[auth.profiles.keep-local]
-mode = "local"
-provider = "ollama"
+        let azure = CloudIamProfile::Azure {
+            region: "eastus".to_string(),
+            resource: None,
+            tenant_id: None,
+            endpoint: None,
+            engines: [AzureEngine::Codex].into_iter().collect(),
+        };
+        assert!(azure.translate_env(Engine::Codex).is_ok());
+        assert!(azure.translate_env(Engine::OpenCode).is_err());
 
-[auth.profiles.openrouter]
-mode = "relay"
-base_url = "https://old.example/v1"
-engines = ["claude"]
-[auth.profiles.openrouter.api_key]
-from_env = "OLD_KEY"
-"#;
-        let updated = upsert_relay_profile_toml(
-            initial,
-            "openrouter",
-            &RelayProfile {
-                base_url: "https://openrouter.ai/api".to_string(),
-                api_key: SecretRef::FromEnv {
-                    from_env: "NEW_OPENROUTER_KEY".to_string(),
-                },
-                engines: [RelayEngine::Claude, RelayEngine::Codex]
-                    .into_iter()
-                    .collect(),
-            },
-            &ModelTier::ALL,
-        )
-        .expect("upsert");
-
-        assert!(updated.contains("[auth.profiles.keep-local]"));
-        assert!(!updated.contains("OLD_KEY"));
-        assert!(updated.contains("NEW_OPENROUTER_KEY"));
-        let reparsed =
-            parse_auth_profiles_toml(&updated, Path::new("/tmp/p"), None).expect("reparse");
-        assert_eq!(reparsed.len(), 2);
+        let _ = fs::remove_dir_all(&scratch);
     }
 }
