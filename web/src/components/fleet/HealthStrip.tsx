@@ -3,8 +3,16 @@ import type { ReactNode } from "react";
 import type { DiskPlace, FleetHealth, LadderStep } from "../../fleet";
 import { absoluteTitle, clockTime, formatDuration } from "../../format";
 import type { CoreMark } from "../../coreLines";
-import type { Backups, GateRoom, Memory, Storage } from "../../resources";
-import { backupAge, backupView, memoryBar, storageView, waitingGates } from "../../resources";
+import type { Backups, DiskBucketShares, GateRoom, Memory, Storage } from "../../resources";
+import {
+  backupAge,
+  backupView,
+  memoryBar,
+  sharedBuildCacheView,
+  storageView,
+  waitingGates,
+  workspaceBreakdownView,
+} from "../../resources";
 import { cx } from "../ui";
 
 export const LADDER: Array<{
@@ -269,8 +277,164 @@ export function StorageCard({
           `How long the disk lasts: ${lasts_from !== null ? `measured from ${lasts_from}` : measured_from === null ? "not measured yet" : `measured from ${measured_from}`}`}
       </p>
       {lasts_note !== null && <p className="text-micro text-faint-foreground">{lasts_note}</p>}
+      <WorkspaceBreakdownSection storage={storage} />
+      <SharedBuildCacheRow storage={storage} />
       <BackupRows backups={backups} />
       <DiagnosticRows diagnostics={diagnostics} />
+    </div>
+  );
+}
+
+/** Stacked 3-bucket bar for workspace composition: `repo`, `.git`, `rebuildable`. */
+function CompositionBar({ shares }: { shares: DiskBucketShares }) {
+  return (
+    <div
+      className="flex h-1.5 w-full overflow-hidden rounded-full bg-muted"
+      aria-label={`repo ${shares.repo_pct}%, .git ${shares.git_pct}%, rebuildable ${shares.rebuildable_pct}%`}
+    >
+      {shares.repo_pct > 0 && (
+        <div className="h-full bg-foreground/70" style={{ width: `${shares.repo_pct}%` }} />
+      )}
+      {shares.git_pct > 0 && (
+        <div className="h-full bg-info" style={{ width: `${shares.git_pct}%` }} />
+      )}
+      {shares.rebuildable_pct > 0 && (
+        <div className="h-full bg-warning" style={{ width: `${shares.rebuildable_pct}%` }} />
+      )}
+    </div>
+  );
+}
+
+function CompositionLegend({
+  repo,
+  git,
+  rebuildable,
+  shares,
+}: {
+  repo: string;
+  git: string;
+  rebuildable: string;
+  shares: DiskBucketShares;
+}) {
+  return (
+    <div className="tnum mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-micro text-faint-foreground">
+      <span className="inline-flex items-center gap-1">
+        <span aria-hidden="true" className="size-1.5 rounded-full bg-foreground/70" />
+        repo {repo} ({shares.repo_pct}%)
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span aria-hidden="true" className="size-1.5 rounded-full bg-info" />
+        .git {git} ({shares.git_pct}%)
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span aria-hidden="true" className="size-1.5 rounded-full bg-warning" />
+        rebuildable {rebuildable} ({shares.rebuildable_pct}%)
+      </span>
+    </div>
+  );
+}
+
+/** Per-workspace disk classification (`repo` / `.git` / rebuildable caches). */
+function WorkspaceBreakdownSection({ storage }: { storage: Storage }) {
+  const breakdown = workspaceBreakdownView(storage);
+  if (!breakdown) return null;
+  return (
+    <div className="mt-1.5 border-t border-surface-border pt-1.5">
+      <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="text-muted-foreground">Workspace breakdown</span>
+        <span className="tnum font-medium text-foreground">{breakdown.total}</span>
+        <span className="tnum text-faint-foreground">
+          {breakdown.workspace_count} {breakdown.workspace_count === 1 ? "workspace" : "workspaces"}
+        </span>
+        {breakdown.truncated && (
+          <span className="rounded bg-wait-tint px-1 py-px text-micro text-warning">truncated</span>
+        )}
+      </div>
+      {breakdown.workspace_count === 0 ? (
+        <p className="mt-0.5 text-micro text-faint-foreground">No workspaces on disk.</p>
+      ) : (
+        <>
+          <div className="mt-1">
+            <CompositionBar shares={breakdown.shares} />
+          </div>
+          <CompositionLegend
+            repo={breakdown.repo}
+            git={breakdown.git}
+            rebuildable={breakdown.rebuildable}
+            shares={breakdown.shares}
+          />
+          {breakdown.workspaces.length > 0 && (
+            <details className="mt-1">
+              <summary className="cursor-pointer select-none text-micro text-faint-foreground hover:text-foreground">
+                By workspace ({breakdown.shown_count}
+                {breakdown.hidden_count > 0 ? ` of ${breakdown.workspace_count}` : ""})
+              </summary>
+              <ul className="mt-1 max-h-48 space-y-1.5 overflow-y-auto pr-1">
+                {breakdown.workspaces.map((ws) => (
+                  <li key={ws.name} className="space-y-0.5">
+                    <div className="flex min-w-0 items-baseline gap-2">
+                      <span className="min-w-0 truncate font-mono text-micro text-foreground" title={ws.name}>
+                        {ws.name}
+                      </span>
+                      {ws.truncated && (
+                        <span className="shrink-0 text-micro text-warning">truncated</span>
+                      )}
+                      <span className="tnum ml-auto shrink-0 font-medium text-foreground">
+                        {ws.total}
+                      </span>
+                    </div>
+                    <CompositionBar shares={ws.shares} />
+                    <div className="tnum flex flex-wrap justify-between gap-x-2 text-micro text-faint-foreground">
+                      <span>{ws.summary}</span>
+                      <span>
+                        {ws.files.toLocaleString("en-US")} {ws.files === 1 ? "file" : "files"}
+                      </span>
+                    </div>
+                  </li>
+                ))}
+                {breakdown.hidden_count > 0 && (
+                  <li className="tnum text-micro text-faint-foreground">
+                    +{breakdown.hidden_count} more workspaces not shown
+                  </li>
+                )}
+              </ul>
+            </details>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Shared host build cache status, size, and path (`health.storage.shared_build_cache`). */
+function SharedBuildCacheRow({ storage }: { storage: Storage }) {
+  const cache = sharedBuildCacheView(storage);
+  const badgeClass =
+    cache.status === "enabled"
+      ? "bg-muted text-success"
+      : cache.status === "disabled"
+        ? "bg-wait-tint text-warning"
+        : "bg-muted text-faint-foreground";
+  return (
+    <div className="mt-1.5 border-t border-surface-border pt-1.5">
+      <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="shrink-0 text-muted-foreground">Shared build cache</span>
+        <span className={cx("rounded px-1.5 py-px text-micro font-medium", badgeClass)}>
+          {cache.badge}
+        </span>
+        {cache.size !== null && (
+          <span className="tnum shrink-0 font-medium text-foreground">{cache.size}</span>
+        )}
+        <span className="tnum text-faint-foreground">{cache.note}</span>
+        {cache.path && (
+          <span
+            className="ml-auto min-w-0 truncate font-mono text-micro text-faint-foreground"
+            title={cache.path}
+          >
+            {cache.path}
+          </span>
+        )}
+      </div>
     </div>
   );
 }

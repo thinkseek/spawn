@@ -69,7 +69,18 @@ test("gate room: one row per gated mission, the waiting gates longest first", ()
 import { readFileSync } from "node:fs";
 
 import { localDateTime } from "../src/format.ts";
-import { backupAge, backupView, normalizeBackups, normalizeStorage, storageSize, storageView } from "../src/resources.ts";
+import {
+  backupAge,
+  backupView,
+  normalizeBackups,
+  normalizeSharedBuildCache,
+  normalizeStorage,
+  normalizeWorkspaceBreakdown,
+  sharedBuildCacheView,
+  storageSize,
+  storageView,
+  workspaceBreakdownView,
+} from "../src/resources.ts";
 
 const MB = 1024 ** 2;
 const STORAGE = {
@@ -395,4 +406,182 @@ test("each grower's row carries its own measured_from while its growth is pendin
   assert.deepEqual(lines({ ...STORAGE, growth_parts: nulls }), [null, null, null]);
   assert.equal(normalizeStorage({ ...STORAGE, growth_from_parts: parts })?.growth_from_parts?.database, at + 120_000);
   assert.equal(normalizeStorage(STORAGE)?.growth_from_parts, null);
+});
+
+test("workspace_breakdown and shared_build_cache normalize full PR #184 payloads and compute percentages", () => {
+  const raw = {
+    ...STORAGE,
+    workspaces: { path: "/ws", bytes: 1_000 * MB },
+    workspace_breakdown: {
+      workspace_count: 2,
+      total_bytes: 1_000 * MB,
+      repo_bytes: 500 * MB,
+      git_bytes: 200 * MB,
+      build_cache_bytes: 300 * MB,
+      files: 1420,
+      truncated: false,
+      workspaces: [
+        {
+          name: "alpha",
+          total_bytes: 200 * MB,
+          repo_bytes: 100 * MB,
+          git_bytes: 50 * MB,
+          build_cache_bytes: 50 * MB,
+          files: 300,
+          truncated: false,
+        },
+        {
+          name: "beta",
+          total_bytes: 800 * MB,
+          repo_bytes: 400 * MB,
+          git_bytes: 150 * MB,
+          build_cache_bytes: 250 * MB,
+          files: 1120,
+          truncated: false,
+        },
+      ],
+    },
+    shared_build_cache: {
+      path: "/ws/.caches",
+      bytes: 1.5 * GIB,
+      files: 320,
+      enabled: true,
+    },
+  };
+
+  const storage = normalizeStorage(raw);
+  assert.equal(storage?.workspace_breakdown?.workspace_count, 2);
+  assert.deepEqual(
+    storage?.workspace_breakdown?.workspaces.map((ws) => ws.name),
+    ["beta", "alpha"],
+  );
+  assert.deepEqual(storage?.shared_build_cache, {
+    path: "/ws/.caches",
+    bytes: 1.5 * GIB,
+    files: 320,
+    enabled: true,
+  });
+
+  const breakdown = workspaceBreakdownView(storage);
+  assert.ok(breakdown);
+  assert.equal(breakdown.total, "1000.0 MB");
+  assert.equal(breakdown.shown_count, 2);
+  assert.equal(breakdown.hidden_count, 0);
+  assert.deepEqual(breakdown.shares, { repo_pct: 50, git_pct: 20, rebuildable_pct: 30 });
+  assert.equal(breakdown.workspaces[0].name, "beta");
+  assert.equal(breakdown.workspaces[0].summary, "repo 400.0 MB (50%) · .git 150.0 MB (19%) · rebuildable 250.0 MB (31%)");
+
+  assert.deepEqual(sharedBuildCacheView(storage), {
+    status: "enabled",
+    badge: "enabled",
+    size: "1.5 GB",
+    files: 320,
+    path: "/ws/.caches",
+    note: "320 files",
+  });
+});
+
+test("older server payloads, null shared_build_cache, and disabled residual caches are handled cleanly", () => {
+  const older = normalizeStorage(STORAGE);
+  assert.equal(older?.workspace_breakdown, null);
+  assert.equal(older?.shared_build_cache, null);
+  assert.equal(workspaceBreakdownView(older), null);
+  assert.deepEqual(sharedBuildCacheView(older), {
+    status: "off",
+    badge: "off",
+    size: null,
+    files: null,
+    path: null,
+    note: "Disabled or not reported",
+  });
+
+  const disabledResidual = sharedBuildCacheView({
+    ...STORAGE,
+    shared_build_cache: {
+      path: "/ws/.caches",
+      bytes: 25 * MB,
+      files: 1,
+      enabled: false,
+    },
+  });
+  assert.deepEqual(disabledResidual, {
+    status: "disabled",
+    badge: "disabled",
+    size: "25.0 MB",
+    files: 1,
+    path: "/ws/.caches",
+    note: "residual cache · 1 file",
+  });
+});
+
+test("workspace_breakdown caps at 32 workspaces, handles truncated/zero-byte/malformed data safely", () => {
+  const many = Array.from({ length: 35 }, (_, idx) => ({
+    name: `ws-${String(idx).padStart(2, "0")}`,
+    total_bytes: (idx + 1) * MB,
+    repo_bytes: (idx + 1) * MB,
+    git_bytes: 0,
+    build_cache_bytes: 0,
+    files: 1,
+    truncated: idx === 34,
+  }));
+  const view = workspaceBreakdownView({
+    workspace_count: 35,
+    total_bytes: 630 * MB,
+    repo_bytes: 630 * MB,
+    git_bytes: 0,
+    build_cache_bytes: 0,
+    files: 35,
+    truncated: true,
+    workspaces: [...many, { bad: true }, { name: "" }],
+  });
+  assert.ok(view);
+  assert.equal(view.truncated, true);
+  assert.equal(view.workspace_count, 35);
+  assert.equal(view.shown_count, 32);
+  assert.equal(view.hidden_count, 3);
+  assert.equal(view.workspaces[0].name, "ws-34");
+  assert.equal(view.workspaces[0].truncated, true);
+
+  const emptyZero = workspaceBreakdownView({
+    workspace_count: 1,
+    total_bytes: 0,
+    repo_bytes: 0,
+    git_bytes: 0,
+    build_cache_bytes: 0,
+    files: 0,
+    truncated: false,
+    workspaces: [
+      {
+        name: "empty",
+        total_bytes: 0,
+        repo_bytes: -5,
+        git_bytes: Number.NaN,
+        build_cache_bytes: 0,
+        files: -1,
+        truncated: false,
+      },
+    ],
+  });
+  assert.deepEqual(emptyZero?.shares, { repo_pct: 0, git_pct: 0, rebuildable_pct: 0 });
+  assert.deepEqual(emptyZero?.workspaces[0].shares, { repo_pct: 0, git_pct: 0, rebuildable_pct: 0 });
+
+  assert.equal(normalizeWorkspaceBreakdown({}), null);
+  assert.equal(normalizeWorkspaceBreakdown("invalid"), null);
+  assert.equal(normalizeSharedBuildCache({}), null);
+  assert.equal(normalizeSharedBuildCache(null), null);
+});
+
+test("HealthStrip renders WorkspaceBreakdownSection and SharedBuildCacheRow from resources helpers", () => {
+  const strip = readFileSync(new URL("../src/components/fleet/HealthStrip.tsx", import.meta.url), "utf8");
+  for (const needle of [
+    "workspaceBreakdownView(storage)",
+    "sharedBuildCacheView(storage)",
+    "WorkspaceBreakdownSection",
+    "SharedBuildCacheRow",
+    "Shared build cache",
+    "rebuildable",
+  ]) {
+    assert.ok(strip.includes(needle), `HealthStrip.tsx includes ${needle}`);
+  }
+  assert.equal(strip.includes("/api/"), false);
 });
