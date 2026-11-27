@@ -267,7 +267,7 @@
         },
         {
           "kind": "contains",
-          "target": "cap-tmux-runner"
+          "target": "cap-herdr-runner"
         },
         {
           "kind": "contains",
@@ -617,25 +617,12 @@
       "title": "Bridge, Event Normalization & Sync Runtime",
       "kind": "capability",
       "parent": "domain-core-runtime",
-      "summary": "Pure domain events, commands, idempotency keys, ingest, Bridge state machine, in-memory conformance suite, and CLI loop/queue commands.",
+      "summary": "Pure domain events, commands, idempotency keys, ingest, Bridge state machine, in-memory conformance suite, and the spawn-core records the Bridge carries (screen, observation, transcript and mask types, co-owned with their capabilities).",
       "files": [
         "Cargo.lock",
         "Cargo.toml",
-        "crates/spawn-cli/src/commands/inspect.rs",
-        "crates/spawn-cli/src/commands/loops.rs",
-        "crates/spawn-cli/src/commands/mod.rs",
-        "crates/spawn-cli/src/commands/queue.rs",
         "crates/spawn-cli/src/config.rs",
-        "crates/spawn-cli/src/config_file.rs",
         "crates/spawn-cli/src/runtime.rs",
-        "crates/spawn-cli/src/serve/ipc/events.rs",
-        "crates/spawn-cli/src/serve/ipc/http.rs",
-        "crates/spawn-cli/src/serve/ipc/mod.rs",
-        "crates/spawn-cli/src/serve/ipc/node.rs",
-        "crates/spawn-cli/src/serve/ipc/routes.rs",
-        "crates/spawn-cli/src/serve/ipc/tests.rs",
-        "crates/spawn-cli/src/toml_parser.rs",
-        "crates/spawn-cli/tests/config_toml.rs",
         "crates/spawn-core/Cargo.toml",
         "crates/spawn-core/src/bridge.rs",
         "crates/spawn-core/src/command.rs",
@@ -645,6 +632,7 @@
         "crates/spawn-core/src/id.rs",
         "crates/spawn-core/src/ingest.rs",
         "crates/spawn-core/src/lib.rs",
+        "crates/spawn-core/src/mask.rs",
         "crates/spawn-core/src/memory.rs",
         "crates/spawn-core/src/message.rs",
         "crates/spawn-core/src/node_proto/codec.rs",
@@ -655,8 +643,12 @@
         "crates/spawn-core/src/node_proto/result.rs",
         "crates/spawn-core/src/node_proto/spec.rs",
         "crates/spawn-core/src/node_proto/target.rs",
+        "crates/spawn-core/src/observation.rs",
         "crates/spawn-core/src/port.rs",
+        "crates/spawn-core/src/redact.rs",
+        "crates/spawn-core/src/screen.rs",
         "crates/spawn-core/src/time.rs",
+        "crates/spawn-core/src/transcripts.rs",
         "crates/spawn-core/testdata/spawn-ipc-v1/MANIFEST.sha256",
         "crates/spawn-core/testdata/spawn-ipc-v1/events.ndjson",
         "crates/spawn-core/testdata/spawn-ipc-v1/hello.res.json",
@@ -689,13 +681,13 @@
         "rsi/backlog/214.json",
         "rsi/backlog/241.json",
         "rsi/backlog/243.json",
+        "rsi/scenarios/nightly/023.sh",
+        "rsi/scenarios/nightly/025.sh",
         "rsi/scenarios/nightly/044.sh",
         "rsi/scenarios/nightly/045.sh",
         "rsi/scenarios/nightly/206.sh",
         "rsi/scenarios/nightly/214.sh",
-        "rsi/scenarios/nightly/241.sh",
-        "rsi/scenarios/nightly/023.sh",
-        "rsi/scenarios/nightly/025.sh"
+        "rsi/scenarios/nightly/241.sh"
       ],
       "relations": [],
       "provenance": {
@@ -727,12 +719,21 @@
       "title": "Spawn CLI Binary Entrypoint & Dispatch",
       "kind": "subsystem",
       "parent": "domain-core-runtime",
-      "summary": "Top-level `spawn` CLI command parser, usage contract, undumpable hardening, and crate wiring.",
+      "summary": "Top-level `spawn` CLI command parser, usage contract, undumpable hardening, and crate wiring: the composition root, with the loop/queue/inspect commands, config-file parsing and the shared runtime config every capability reads.",
       "files": [
         "Cargo.lock",
         "Cargo.toml",
         "crates/spawn-cli/Cargo.toml",
+        "crates/spawn-cli/src/commands/inspect.rs",
+        "crates/spawn-cli/src/commands/loops.rs",
+        "crates/spawn-cli/src/commands/mod.rs",
+        "crates/spawn-cli/src/commands/queue.rs",
+        "crates/spawn-cli/src/config.rs",
+        "crates/spawn-cli/src/config_file.rs",
         "crates/spawn-cli/src/main.rs",
+        "crates/spawn-cli/src/runtime.rs",
+        "crates/spawn-cli/src/toml_parser.rs",
+        "crates/spawn-cli/tests/config_toml.rs",
         "crates/spawn-cli/tests/help.rs",
         "crates/spawn-hc/Cargo.toml",
         "crates/spawn-hc/src/main.rs",
@@ -742,6 +743,78 @@
         {
           "kind": "depends_on",
           "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-agent-grading"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-cow-cas-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-herdr-runner"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-jev-judge-relay"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-node-registry"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-overlay-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-scorecard-and-cost"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-semantic-observer"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-serve-http-api"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-storage-lifecycle"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-dashboard"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-alerts-and-acks"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-secrets-and-masking"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-transcript-archive"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-backup-and-drills"
         }
       ],
       "provenance": {
@@ -779,6 +852,7 @@
         "crates/spawn-postgres/src/host.rs",
         "crates/spawn-postgres/src/lib.rs",
         "crates/spawn-postgres/src/passfile.rs",
+        "crates/spawn-postgres/src/remote_jobs.rs",
         "crates/spawn-postgres/src/row.rs",
         "crates/spawn-postgres/src/testing.rs",
         "crates/spawn-postgres/src/wake.rs",
@@ -803,12 +877,12 @@
         "rsi/backlog/170.json",
         "rsi/backlog/171.json",
         "rsi/scenarios/043.sh",
+        "rsi/scenarios/check-schema-upgrade.sh",
+        "rsi/scenarios/nightly/023.sh",
         "rsi/scenarios/nightly/109.sh",
         "rsi/scenarios/nightly/139.sh",
         "rsi/scenarios/nightly/170.sh",
         "rsi/scenarios/nightly/171.sh",
-        "rsi/scenarios/check-schema-upgrade.sh",
-        "rsi/scenarios/nightly/023.sh",
         "scripts/pg-url.sh",
         "scripts/test-pg-url.sh"
       ],
@@ -816,6 +890,10 @@
         {
           "kind": "depends_on",
           "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-secrets-and-masking"
         }
       ],
       "provenance": {
@@ -851,6 +929,7 @@
       "files": [
         "crates/spawn-cas/src/manifest.rs",
         "crates/spawn-cas/tests/manifest.rs",
+        "crates/spawn-cli/src/alerts.rs",
         "crates/spawn-cli/src/backup/recoverable.rs",
         "crates/spawn-cli/src/commit_map.rs",
         "crates/spawn-cli/src/disk.rs",
@@ -865,6 +944,7 @@
         "crates/spawn-cli/src/scratch_owner/tests.rs",
         "crates/spawn-cli/src/scratch_sweep.rs",
         "crates/spawn-cli/src/scratch_sweep/tests.rs",
+        "crates/spawn-cli/src/serve/attention.rs",
         "crates/spawn-cli/src/serve/core_lines/disk.rs",
         "crates/spawn-cli/src/serve/core_lines/schemas.rs",
         "crates/spawn-cli/src/serve/core_lines/scratch.rs",
@@ -921,6 +1001,9 @@
         "rsi/backlog/232.json",
         "rsi/backlog/236.json",
         "rsi/scenarios/065.sh",
+        "rsi/scenarios/177.sh",
+        "rsi/scenarios/180.sh",
+        "rsi/scenarios/check-storage-extents.sh",
         "rsi/scenarios/nightly/074.sh",
         "rsi/scenarios/nightly/083.sh",
         "rsi/scenarios/nightly/085.sh",
@@ -933,9 +1016,7 @@
         "rsi/scenarios/nightly/145.sh",
         "rsi/scenarios/nightly/155.sh",
         "rsi/scenarios/nightly/173.sh",
-        "rsi/scenarios/177.sh",
         "rsi/scenarios/nightly/178.sh",
-        "rsi/scenarios/180.sh",
         "rsi/scenarios/nightly/182.sh",
         "rsi/scenarios/nightly/185.sh",
         "rsi/scenarios/nightly/202.sh",
@@ -947,7 +1028,6 @@
         "rsi/scenarios/nightly/228.sh",
         "rsi/scenarios/nightly/232.sh",
         "rsi/scenarios/nightly/236.sh",
-        "rsi/scenarios/check-storage-extents.sh",
         "scripts/check-test-schemas.sh",
         "scripts/disk.sh",
         "scripts/storage-extents.py",
@@ -961,6 +1041,30 @@
         {
           "kind": "depends_on",
           "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-cow-cas-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-scorecard-and-cost"
+        },
+        {
+          "kind": "depends_on",
+          "target": "t565u-wild-file-scan"
         }
       ],
       "provenance": {
@@ -1021,7 +1125,11 @@
       "parent": "domain-host-execution",
       "summary": "Canonical workspace root resolution, descriptor-safe agent file access, mission workspace materialization, git checkpointing, main-branch merge, background push, and set-aside commits. Overlay and copy-on-write stores: cap-overlay-workspaces, cap-cow-cas-workspaces.",
       "files": [
+        "crates/spawn-cas/src/digest.rs",
         "crates/spawn-cli/src/commit_now.rs",
+        "crates/spawn-cli/src/deliver.rs",
+        "crates/spawn-cli/src/disk.rs",
+        "crates/spawn-cli/src/dispatch.rs",
         "crates/spawn-cli/src/main_merge.rs",
         "crates/spawn-cli/src/managed_sources.rs",
         "crates/spawn-cli/src/push.rs",
@@ -1038,6 +1146,7 @@
         "crates/spawn-host/src/git.rs",
         "crates/spawn-host/src/home.rs",
         "crates/spawn-host/src/lib.rs",
+        "crates/spawn-host/src/process.rs",
         "crates/spawn-host/src/root.rs",
         "crates/spawn-host/src/tree_path.rs",
         "crates/spawn-host/tests/branches.rs",
@@ -1058,9 +1167,9 @@
         "rsi/backlog/178.json",
         "rsi/backlog/194.json",
         "rsi/backlog/205.json",
+        "rsi/scenarios/177.sh",
         "rsi/scenarios/nightly/008.sh",
         "rsi/scenarios/nightly/173.sh",
-        "rsi/scenarios/177.sh",
         "rsi/scenarios/nightly/178.sh",
         "rsi/scenarios/nightly/194.sh",
         "rsi/scenarios/nightly/205.sh",
@@ -1071,6 +1180,10 @@
         {
           "kind": "depends_on",
           "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
         }
       ],
       "provenance": {
@@ -1104,7 +1217,7 @@
       }
     },
     {
-      "id": "cap-tmux-runner",
+      "id": "cap-herdr-runner",
       "title": "Herdr / Embedded herdr-core Terminal Adapter, Runner & Process Lifecycle",
       "kind": "capability",
       "parent": "domain-host-execution",
@@ -1128,6 +1241,7 @@
         "crates/spawn-host/src/herdr.rs",
         "crates/spawn-host/src/herdr_core.rs",
         "crates/spawn-host/src/herdr_witness.rs",
+        "crates/spawn-host/src/lib.rs",
         "crates/spawn-host/src/process.rs",
         "crates/spawn-host/src/terminal_support.rs",
         "crates/spawn-host/src/watch.rs",
@@ -1142,16 +1256,20 @@
         "rsi/backlog/028.json",
         "rsi/backlog/032.json",
         "rsi/backlog/044.json",
+        "rsi/scenarios/nightly/025.sh",
+        "rsi/scenarios/nightly/032.sh",
         "rsi/scenarios/nightly/044.sh",
         "rsi/scenarios/nightly/check-j06-recover-a.sh",
-        "rsi/scenarios/nightly/check-j07-recover-b.sh",
-        "rsi/scenarios/nightly/025.sh",
-        "rsi/scenarios/nightly/032.sh"
+        "rsi/scenarios/nightly/check-j07-recover-b.sh"
       ],
       "relations": [
         {
           "kind": "depends_on",
           "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
         }
       ],
       "provenance": {
@@ -1203,6 +1321,10 @@
         {
           "kind": "depends_on",
           "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
         }
       ],
       "provenance": {
@@ -1239,8 +1361,8 @@
       ],
       "relations": [
         {
-          "kind": "depends_on",
-          "target": "cap-tmux-runner"
+          "kind": "relates_to",
+          "target": "cap-herdr-runner"
         },
         {
           "kind": "relates_to",
@@ -1283,6 +1405,14 @@
         {
           "kind": "relates_to",
           "target": "cap-storage-lifecycle"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-cow-cas-workspaces"
         }
       ],
       "provenance": {
@@ -1339,6 +1469,7 @@
         "crates/spawn-host/src/d6_workspace.rs",
         "crates/spawn-host/src/git_border.rs",
         "crates/spawn-host/src/merkle_merge.rs",
+        "crates/spawn-host/src/workspace.rs",
         "crates/spawn-host/tests/cow.rs",
         "crates/spawn-host/tests/d6_border.rs",
         "crates/spawn-host/tests/d6_layer0_cutover.rs",
@@ -1359,6 +1490,14 @@
         {
           "kind": "relates_to",
           "target": "cap-storage-lifecycle"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-transcript-archive"
         }
       ],
       "provenance": {
@@ -1416,6 +1555,18 @@
         {
           "kind": "relates_to",
           "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-rsi-integration-gate"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-storage-lifecycle"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-serve-http-api"
         }
       ],
       "provenance": {
@@ -1458,8 +1609,8 @@
         "docs/shadow-context.md",
         "rsi/backlog/010.json",
         "rsi/backlog/011.json",
-        "rsi/scenarios/nightly/check-j04-observe.sh",
         "rsi/scenarios/check-shadow-observe.sh",
+        "rsi/scenarios/nightly/check-j04-observe.sh",
         "scripts/shadow/shadow_observe.py",
         "scripts/shadow/test_shadow_observe.py"
       ],
@@ -1513,11 +1664,11 @@
         "docs/observe3-agent-presence.md",
         "docs/observe3-presence-upload.md",
         "rsi/backlog/039.json",
-        "rsi/scenarios/nightly/039.sh",
-        "rsi/scenarios/nightly/201.sh",
         "rsi/scenarios/check-agent-presence.sh",
         "rsi/scenarios/check-model-relay.sh",
         "rsi/scenarios/check-presence-upload.sh",
+        "rsi/scenarios/nightly/039.sh",
+        "rsi/scenarios/nightly/201.sh",
         "scripts/jev-relay-test.py",
         "scripts/jev-relay.py",
         "scripts/model-relay-test.py",
@@ -1531,6 +1682,18 @@
         {
           "kind": "depends_on",
           "target": "cap-semantic-observer"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-storage-lifecycle"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-mission-dispatch"
         }
       ],
       "provenance": {
@@ -1571,8 +1734,12 @@
         "crates/spawn-cli/src/dispatch/steal.rs",
         "crates/spawn-cli/src/dispatch/stops.rs",
         "crates/spawn-cli/src/dispatch/worker.rs",
+        "crates/spawn-cli/src/gate.rs",
+        "crates/spawn-cli/src/integrate.rs",
         "crates/spawn-cli/src/missions.rs",
         "crates/spawn-cli/src/objectives.rs",
+        "crates/spawn-cli/src/recover.rs",
+        "crates/spawn-cli/src/scorecard/time.rs",
         "crates/spawn-cli/src/sources.rs",
         "crates/spawn-cli/src/supervise.rs",
         "crates/spawn-cli/src/verify.rs",
@@ -1629,10 +1796,12 @@
         "rsi/backlog/211.json",
         "rsi/backlog/212.json",
         "rsi/backlog/239.json",
+        "rsi/scenarios/099.sh",
         "rsi/scenarios/nightly/007.sh",
+        "rsi/scenarios/nightly/013.sh",
+        "rsi/scenarios/nightly/032.sh",
         "rsi/scenarios/nightly/039.sh",
         "rsi/scenarios/nightly/042.sh",
-        "rsi/scenarios/099.sh",
         "rsi/scenarios/nightly/102.sh",
         "rsi/scenarios/nightly/133.sh",
         "rsi/scenarios/nightly/135.sh",
@@ -1643,8 +1812,6 @@
         "rsi/scenarios/nightly/check-j07-recover-b.sh",
         "rsi/scenarios/nightly/check-j08-stuck.sh",
         "rsi/scenarios/nightly/check-j09-stall-cancel.sh",
-        "rsi/scenarios/nightly/013.sh",
-        "rsi/scenarios/nightly/032.sh",
         "web/src/episodes.ts",
         "web/test/episodes.test.ts"
       ],
@@ -1656,6 +1823,14 @@
         {
           "kind": "depends_on",
           "target": "cap-git-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-secrets-and-masking"
         }
       ],
       "provenance": {
@@ -1710,6 +1885,7 @@
         "crates/spawn-cli/src/integrate/landing.rs",
         "crates/spawn-cli/src/integrate/main_red_tests.rs",
         "crates/spawn-cli/src/integrate/owner.rs",
+        "crates/spawn-cli/src/integrate/remote.rs",
         "crates/spawn-cli/src/integrate/retained.rs",
         "crates/spawn-cli/src/integrate/shadow.rs",
         "crates/spawn-cli/src/integrate/tests.rs",
@@ -1757,10 +1933,18 @@
         "rsi/backlog/234.json",
         "rsi/backlog/237.json",
         "rsi/backlog/243.json",
+        "rsi/scenarios/052.sh",
+        "rsi/scenarios/build",
+        "rsi/scenarios/check-blackbox.sh",
+        "rsi/scenarios/check-clippy.sh",
+        "rsi/scenarios/check-e2e.sh",
+        "rsi/scenarios/check-j12-hold-told.sh",
+        "rsi/scenarios/check-test-gate.sh",
+        "rsi/scenarios/check-tests.sh",
         "rsi/scenarios/nightly/034.sh",
         "rsi/scenarios/nightly/035.sh",
+        "rsi/scenarios/nightly/036.sh",
         "rsi/scenarios/nightly/037.sh",
-        "rsi/scenarios/052.sh",
         "rsi/scenarios/nightly/053.sh",
         "rsi/scenarios/nightly/096.sh",
         "rsi/scenarios/nightly/129.sh",
@@ -1773,17 +1957,9 @@
         "rsi/scenarios/nightly/223.sh",
         "rsi/scenarios/nightly/234.sh",
         "rsi/scenarios/nightly/237.sh",
-        "rsi/scenarios/build",
-        "rsi/scenarios/check-blackbox.sh",
-        "rsi/scenarios/check-clippy.sh",
-        "rsi/scenarios/check-e2e.sh",
         "rsi/scenarios/nightly/check-j02-lands.sh",
         "rsi/scenarios/nightly/check-j10-verdicts.sh",
         "rsi/scenarios/nightly/check-j11-push-drain.sh",
-        "rsi/scenarios/check-j12-hold-told.sh",
-        "rsi/scenarios/check-test-gate.sh",
-        "rsi/scenarios/check-tests.sh",
-        "rsi/scenarios/nightly/036.sh",
         "rsi/scenarios/protected",
         "rsi/scenarios/retired-tests",
         "rsi/scenarios/serial",
@@ -1820,7 +1996,6 @@
         "scripts/timing/shim-engine-proxy.bash",
         "scripts/timing/shim-git.bash",
         "scripts/timing/shim-spawn.bash",
-        "scripts/timing/shim-tmux.bash",
         "scripts/timing/timing.sh",
         "scripts/timing/with.sh",
         "scripts/universal-gate.sh"
@@ -1829,6 +2004,34 @@
         {
           "kind": "depends_on",
           "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-cow-cas-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-secrets-and-masking"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-storage-lifecycle"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-agent-grading"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
         }
       ],
       "provenance": {
@@ -1884,8 +2087,10 @@
       "parent": "domain-missions-fleet",
       "summary": "Top-down 3-tier agent grading (`T3` `claude-fable-5-2` `l3` top-decision & fallback, `T2` `gemini-pro-orchestrator-neon` `l2` mainline default, optional `T1` `deepseek-v4` / `deepseek-v4.1-flash` / `kimi` `l1` deterministic mechanical offload) seeded idempotently by `spawn grade init-topdown [--with-l1] [--l1-model <label>]`; `brief-v3` multilingual/architecture/destructive-blocker classifier; upward-only fallback (`l1` -> `l2` when uncovered, never downgrading `l3` -> `l2`), `Active`-over-`Demoted` routing preference, `engine_label`/`model_label` propagation on `RoutingDecision`/`task assign`, opt-in re-probe (off by default via `SPAWN_GRADING_REPROBE_SECS`), `tier_role` on `/api/grading`, quality-rejection rework step-up, calibration over `mission_tasks`, `--brief-file` / `--brief -` stdin dispatch (#119), `spawn mission list` grading & step-up history surfacing, and read-only `#/grading` web catalog + Mission/Task grading badges.",
       "files": [
+        "crates/spawn-cli/src/deliver.rs",
         "crates/spawn-cli/src/grading.rs",
         "crates/spawn-cli/src/missions.rs",
+        "crates/spawn-cli/src/objectives.rs",
         "crates/spawn-core/src/grading.rs",
         "crates/spawn-postgres/sql/schema.sql",
         "crates/spawn-postgres/src/grading.rs",
@@ -1936,6 +2141,22 @@
         {
           "kind": "depends_on",
           "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-secrets-and-masking"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-fleet-board"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-shell-design-system"
         }
       ],
       "provenance": {
@@ -1962,6 +2183,8 @@
       "parent": "domain-missions-fleet",
       "summary": "Owned machines as fleet nodes (M7 #555): `spawn node add|list|probe|drain|undrain|remove`, the heartbeat worker, tcp/udp transports with multi-hop relays and upward registration (`spawn node serve|register`, issue 85), the global E2E-encrypted mesh of issue 87 (Ed25519 node identities, spawn-e2e-v1 sealed envelopes, AEAD-sealed tcp/udp wire, a pure sync WebSocket+TLS client and server, `spawn node coord|connect` with a recursive coordinator tree, STUN/punch and blind relays), the PostgreSQL node store and the Fleet page's node rows. Issue 91 P1a: macOS (Darwin) inventory and heartbeat, battery/AC power telemetry and the low-battery soft drain (`SPAWN_NODE_LOW_BATTERY_PCT`). spawn-node v1 (design §§2–3, §7; PR S2): the shared `spawn-node-proto` crate (signed request envelope and response, size caps, strict JSON, the heartbeat/spec/grant/result/enroll bodies, `tree_sha256_v1` behind `integrate/inputs.rs::scenarios_sha256`) and its golden fixtures `testdata/node-protocol-v1/` (Probe P6). PR S3: the synchronous `spawn-node-gateway` binary (std-only HTTP/1.1, restricted `spawn_node_gateway` login, verify-then-commit `spawn_node_gw_*` calls, 120 s key cache, per-source/per-node pacing, signed responses and grants, streamed results, ranged artifacts) and the protocol text `docs/node-protocol-v1.md`. PR S4 (M2): `integrate/remote.rs` (content-addressed artifacts for the gateway: delta/baseline git bundles, the deterministic controller pack, the registry manifest; the grant env as GATE_ENV minus node-owned names and any database URL; enqueue, lease wait and `take_local` fallback; a stored node result read back into `gate.rs::decide` and routed by the §6.2 outcomes matrix with strikes, exclusion, degraded and the poison-pill refund; the nodes' sweep from the integrator's pass), the `SPAWN_GATE_SHADOW_NODE=1` shadow source beside the runner's (`task.shadow_gated` with `runner: node:<name>`), and `nodes/v1.rs` (`spawn node enroll-token|revoke`, `list|drain|undrain` over P1 and v1 nodes). PR S5 (M3a/M3b): the primary remote gate behind `SPAWN_GATE_REMOTE=node` (inert when unset or `local`, refused otherwise): `remote.rs::Primary` publishes and queues a task's candidate gate as a `gate` job, waits `SPAWN_REMOTE_QUEUE_WAIT_SECS` for a lease and judges locally only when its fenced `take_local` wins; a node's exit-0 acceptance on the job's own five inputs is the task's verdict (M3a, `env.runner` `node:<name>`), its rejection is judged again here unless `SPAWN_GATE_REMOTE_BELIEVE_REJECT=1` (M3b); every other §6.2 outcome is settled on the ledger alone and falls back to the local gate (fallback_local), never an abort, host fault or no_room of the task; a gate on a red main (`SPAWN_GATE_BASE_CHECK`) is never queued and runs locally; an urgent owner landing discards a waiting judging and takes its queued job back; a predecessor's queued gate jobs are taken back at the first pass (`integrate/remote_primary_tests.rs`).",
       "files": [
+        "crates/spawn-cli/src/integrate/remote.rs",
+        "crates/spawn-cli/src/integrate/remote_primary_tests.rs",
         "crates/spawn-cli/src/nodes.rs",
         "crates/spawn-cli/src/nodes/auth.rs",
         "crates/spawn-cli/src/nodes/commands.rs",
@@ -1979,11 +2202,9 @@
         "crates/spawn-cli/src/nodes/tests.rs",
         "crates/spawn-cli/src/nodes/transport.rs",
         "crates/spawn-cli/src/nodes/transport/tests.rs",
+        "crates/spawn-cli/src/nodes/v1.rs",
         "crates/spawn-cli/src/nodes/ws.rs",
         "crates/spawn-cli/src/nodes/ws/tests.rs",
-        "crates/spawn-cli/src/nodes/v1.rs",
-        "crates/spawn-cli/src/integrate/remote.rs",
-        "crates/spawn-cli/src/integrate/remote_primary_tests.rs",
         "crates/spawn-node-gateway/Cargo.toml",
         "crates/spawn-node-gateway/src/artifacts.rs",
         "crates/spawn-node-gateway/src/cache.rs",
@@ -2068,6 +2289,22 @@
         {
           "kind": "relates_to",
           "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-secrets-and-masking"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
         }
       ],
       "provenance": {
@@ -2160,13 +2397,14 @@
         "rsi/backlog/181.json",
         "rsi/backlog/195.json",
         "rsi/backlog/207.json",
+        "rsi/scenarios/043.sh",
+        "rsi/scenarios/059.sh",
+        "rsi/scenarios/195.sh",
         "rsi/scenarios/nightly/017.sh",
         "rsi/scenarios/nightly/041.sh",
-        "rsi/scenarios/043.sh",
         "rsi/scenarios/nightly/047.sh",
         "rsi/scenarios/nightly/048.sh",
         "rsi/scenarios/nightly/049.sh",
-        "rsi/scenarios/059.sh",
         "rsi/scenarios/nightly/060.sh",
         "rsi/scenarios/nightly/061.sh",
         "rsi/scenarios/nightly/062.sh",
@@ -2182,7 +2420,6 @@
         "rsi/scenarios/nightly/159.sh",
         "rsi/scenarios/nightly/168.sh",
         "rsi/scenarios/nightly/181.sh",
-        "rsi/scenarios/195.sh",
         "rsi/scenarios/nightly/207.sh"
       ],
       "relations": [
@@ -2193,6 +2430,14 @@
         {
           "kind": "depends_on",
           "target": "cap-transcript-archive"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-mission-dispatch"
         }
       ],
       "provenance": {
@@ -2277,11 +2522,13 @@
         "rsi/backlog/209.json",
         "rsi/backlog/215.json",
         "rsi/backlog/219.json",
+        "rsi/scenarios/056.sh",
+        "rsi/scenarios/check-credential-health.sh",
+        "rsi/scenarios/check-j12-hold-told.sh",
         "rsi/scenarios/nightly/045.sh",
         "rsi/scenarios/nightly/046.sh",
         "rsi/scenarios/nightly/050.sh",
         "rsi/scenarios/nightly/053.sh",
-        "rsi/scenarios/056.sh",
         "rsi/scenarios/nightly/057.sh",
         "rsi/scenarios/nightly/058.sh",
         "rsi/scenarios/nightly/071.sh",
@@ -2302,8 +2549,6 @@
         "rsi/scenarios/nightly/209.sh",
         "rsi/scenarios/nightly/215.sh",
         "rsi/scenarios/nightly/219.sh",
-        "rsi/scenarios/check-credential-health.sh",
-        "rsi/scenarios/check-j12-hold-told.sh",
         "scripts/keep/credential-health.sh",
         "scripts/keep/test-credential-health.sh"
       ],
@@ -2311,6 +2556,26 @@
         {
           "kind": "depends_on",
           "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-scorecard-and-cost"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-secrets-and-masking"
         }
       ],
       "provenance": {
@@ -2362,7 +2627,6 @@
       "summary": "Secret generation/rotation, credential health checks, HMAC fingerprints, transcript/control-stream redaction, and output masking hooks.",
       "files": [
         "crates/spawn-cli/src/mask.rs",
-        "crates/spawn-cli/src/secret.rs",
         "crates/spawn-core/src/mask.rs",
         "crates/spawn-core/src/redact.rs",
         "crates/spawn-kdf/Cargo.toml",
@@ -2386,6 +2650,8 @@
         "rsi/backlog/171.json",
         "rsi/backlog/175.json",
         "rsi/backlog/206.json",
+        "rsi/scenarios/check-credential-health.sh",
+        "rsi/scenarios/check-credential-prints.sh",
         "rsi/scenarios/nightly/108.sh",
         "rsi/scenarios/nightly/109.sh",
         "rsi/scenarios/nightly/113.sh",
@@ -2394,15 +2660,11 @@
         "rsi/scenarios/nightly/116.sh",
         "rsi/scenarios/nightly/117.sh",
         "rsi/scenarios/nightly/121.sh",
-        "rsi/scenarios/nightly/122.sh",
-        "rsi/scenarios/nightly/123.sh",
         "rsi/scenarios/nightly/170.sh",
         "rsi/scenarios/nightly/171.sh",
         "rsi/scenarios/nightly/175.sh",
         "rsi/scenarios/nightly/201.sh",
         "rsi/scenarios/nightly/206.sh",
-        "rsi/scenarios/check-credential-health.sh",
-        "rsi/scenarios/check-credential-prints.sh",
         "scripts/keep/credential-health.sh",
         "scripts/keep/credentials.manifest",
         "scripts/keep/test-credential-health.sh",
@@ -2524,6 +2786,7 @@
         "rsi/backlog/217.json",
         "rsi/backlog/224.json",
         "rsi/backlog/231.json",
+        "rsi/scenarios/186.sh",
         "rsi/scenarios/nightly/082.sh",
         "rsi/scenarios/nightly/087.sh",
         "rsi/scenarios/nightly/093.sh",
@@ -2539,7 +2802,6 @@
         "rsi/scenarios/nightly/146.sh",
         "rsi/scenarios/nightly/149.sh",
         "rsi/scenarios/nightly/167.sh",
-        "rsi/scenarios/186.sh",
         "rsi/scenarios/nightly/198.sh",
         "rsi/scenarios/nightly/199.sh",
         "rsi/scenarios/nightly/200.sh",
@@ -2554,6 +2816,22 @@
         {
           "kind": "depends_on",
           "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-transcript-archive"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-storage-lifecycle"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
         }
       ],
       "provenance": {
@@ -2615,7 +2893,9 @@
         "deploy/gate-runner/setup.sh",
         "deploy/hold.sh",
         "deploy/on-landing.sh",
+        "deploy/sync-units.sh",
         "deploy/systemd/README.md",
+        "deploy/systemd/host-local",
         "deploy/systemd/spawn-agent-presence-upload.service",
         "deploy/systemd/spawn-agent-presence-upload.timer",
         "deploy/systemd/spawn-agent-presence.service",
@@ -2654,9 +2934,9 @@
         "deploy/systemd/spawn-nightly@.service",
         "deploy/systemd/spawn-nightly@.timer",
         "deploy/systemd/spawn-node-edge.service",
+        "deploy/systemd/spawn-node-gateway.service",
         "deploy/systemd/spawn-node-gw.service",
         "deploy/systemd/spawn-node-out.service",
-        "deploy/systemd/spawn-node-gateway.service",
         "deploy/systemd/spawn-serve.service",
         "deploy/systemd/spawn-shadow-observe.service",
         "deploy/systemd/spawn-shadow-observe.timer",
@@ -2667,30 +2947,23 @@
         "deploy/test-controller.sh",
         "deploy/test-deploy.sh",
         "deploy/test-on-landing.sh",
+        "deploy/test-sync-units.sh",
         "docs/upgrading.md",
         "rsi/backlog/149.json",
         "rsi/backlog/186.json",
-        "rsi/scenarios/nightly/149.sh",
         "rsi/scenarios/186.sh",
-        "rsi/scenarios/nightly/238.sh",
         "rsi/scenarios/check-maintenance.sh",
         "rsi/scenarios/check-on-landing.sh",
+        "rsi/scenarios/check-sync-units.sh",
+        "rsi/scenarios/nightly/149.sh",
+        "rsi/scenarios/nightly/238.sh",
         "scripts/check-runtime-dir.sh",
         "scripts/maintenance.sh",
         "scripts/sandbox.sh",
         "scripts/stage.sh",
-        "scripts/test-maintenance.sh",
-        "deploy/sync-units.sh",
-        "deploy/test-sync-units.sh",
-        "deploy/systemd/host-local",
-        "rsi/scenarios/check-sync-units.sh"
+        "scripts/test-maintenance.sh"
       ],
-      "relations": [
-        {
-          "kind": "depends_on",
-          "target": "cap-cli-entrypoint"
-        }
-      ],
+      "relations": [],
       "provenance": {
         "objectives": [
           "4/149",
@@ -2722,11 +2995,13 @@
       "title": "Observer HTTP Server (`spawn serve`) & Auth Guards",
       "kind": "capability",
       "parent": "domain-dashboard-web",
-      "summary": "Read-only observer API, weak ETag/304 validation, shared board caching, host health memory/storage endpoints, bearer/local-open/CIDR guards, and human action endpoints.",
+      "summary": "Read-only observer API, weak ETag/304 validation, shared board caching, host health memory/storage endpoints, bearer/local-open/CIDR guards, human action endpoints, and the spawn-ipc-v1 server (`serve/ipc`).",
       "files": [
+        "crates/spawn-cli/src/dispatch.rs",
         "crates/spawn-cli/src/memory.rs",
         "crates/spawn-cli/src/serve.rs",
         "crates/spawn-cli/src/serve/answers.rs",
+        "crates/spawn-cli/src/serve/approvals.rs",
         "crates/spawn-cli/src/serve/attention.rs",
         "crates/spawn-cli/src/serve/capabilities.rs",
         "crates/spawn-cli/src/serve/core_lines.rs",
@@ -2743,8 +3018,15 @@
         "crates/spawn-cli/src/serve/core_lines/trends.rs",
         "crates/spawn-cli/src/serve/core_lines/unowned.rs",
         "crates/spawn-cli/src/serve/feature_map.rs",
+        "crates/spawn-cli/src/serve/ipc/events.rs",
+        "crates/spawn-cli/src/serve/ipc/http.rs",
+        "crates/spawn-cli/src/serve/ipc/mod.rs",
+        "crates/spawn-cli/src/serve/ipc/node.rs",
+        "crates/spawn-cli/src/serve/ipc/routes.rs",
+        "crates/spawn-cli/src/serve/ipc/tests.rs",
         "crates/spawn-cli/src/serve/labels.rs",
         "crates/spawn-cli/src/serve/storage.rs",
+        "crates/spawn-cli/src/serve/stream.rs",
         "crates/spawn-postgres/sql/schema.sql",
         "crates/spawn-postgres/tests/dashboard.rs",
         "crates/spawn-postgres/tests/human_input.rs",
@@ -2814,6 +3096,42 @@
         {
           "kind": "depends_on",
           "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-agent-grading"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-cow-cas-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-herdr-runner"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-scorecard-and-cost"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-storage-lifecycle"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-semantic-observer"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-alerts-and-acks"
         }
       ],
       "provenance": {
@@ -2867,40 +3185,40 @@
       "parent": "domain-dashboard-web",
       "summary": "The Rust backend of the issue 91 dashboard: `GET /api/stream` (Server-Sent Events on slots of their own, one `LISTEN spawn_events` listener, Last-Event-ID / ?after= catch-up), `POST /api/master/message` (`spawn_human_master_message`: a message to the supervisor that auto-wakes it, in auto/steer/queue/restart modes), the no-ACP approval detector `GET /api/approvals` with its one-click `POST /api/approvals/<session_id>/act` (named keys, the digits of numbered prompts included), and the token-saving `GET /api/context/digest`. The web side (P1b): `web/src/stream.ts` reads `/api/stream` with fetch() and a ReadableStream (the bearer header, never a token in the URL), resumes with Last-Event-ID / ?after=, handles ready and resync, reconnects with jittered backoff, catches up when the page shows again, and is shared among tabs by a Web Lock and a BroadcastChannel (each tab alone without them); its events invalidate Home's polls. Home shows the approvals queue (`approvals.ts`, ApprovalsQueue: one click per answer with approval_id and Idempotency-Key, probed first), Master Control (`master.ts`, MasterComposer: auto/steer/queue/restart with an IndexedDB offline outbox `outbox.ts` that replays idempotently, in memory without IndexedDB) and the digest (`digest.ts`, DigestPanel). Nodes show their power and low-battery soft drain. A dependency-free PWA shell (manifest, icon and a service worker that never caches /api/* or tokens) is embedded in the binary (`serve/pwa.rs`, `web/src/pwa/`) and served by `spawn serve` itself, no-cache. Answers carry the option clicked (`choice_id`), which the server presses and no other; keys for an approval are pressed only while it shows.",
       "files": [
+        "crates/spawn-cli/src/resolve.rs",
         "crates/spawn-cli/src/serve/approvals.rs",
         "crates/spawn-cli/src/serve/approvals/tests.rs",
-        "crates/spawn-cli/src/resolve.rs",
         "crates/spawn-cli/src/serve/digest.rs",
         "crates/spawn-cli/src/serve/digest/tests.rs",
+        "crates/spawn-cli/src/serve/pwa.rs",
         "crates/spawn-cli/src/serve/stream.rs",
         "crates/spawn-cli/src/serve/stream/tests.rs",
         "crates/spawn-postgres/tests/master_message.rs",
-        "web/src/stream.ts",
-        "web/src/approvals.ts",
-        "web/src/master.ts",
-        "web/src/outbox.ts",
-        "web/src/digest.ts",
-        "web/src/components/fleet/ApprovalsQueue.tsx",
-        "web/src/components/fleet/MasterComposer.tsx",
-        "web/src/components/fleet/DigestPanel.tsx",
-        "web/test/stream.test.ts",
-        "web/test/approvals.test.ts",
-        "web/test/master.test.ts",
-        "web/test/outbox.test.ts",
-        "web/test/digest.test.ts",
-        "web/test/pwa.test.ts",
-        "web/src/nodes.ts",
-        "web/src/components/fleet/NodeRows.tsx",
-        "web/test/nodes.test.ts",
         "web/index.html",
-        "web/src/main.tsx",
         "web/src/api.ts",
+        "web/src/approvals.ts",
+        "web/src/components/fleet/ApprovalsQueue.tsx",
+        "web/src/components/fleet/DigestPanel.tsx",
         "web/src/components/fleet/FleetView.tsx",
-        "crates/spawn-cli/src/serve/pwa.rs",
-        "web/src/pwa/sw.js",
-        "web/src/pwa/manifest.webmanifest",
+        "web/src/components/fleet/MasterComposer.tsx",
+        "web/src/components/fleet/NodeRows.tsx",
+        "web/src/digest.ts",
+        "web/src/main.tsx",
+        "web/src/master.ts",
+        "web/src/nodes.ts",
+        "web/src/outbox.ts",
         "web/src/pwa/icon.svg",
+        "web/src/pwa/manifest.webmanifest",
+        "web/src/pwa/sw.js",
+        "web/src/stream.ts",
         "web/src/validated.ts",
+        "web/test/approvals.test.ts",
+        "web/test/digest.test.ts",
+        "web/test/master.test.ts",
+        "web/test/nodes.test.ts",
+        "web/test/outbox.test.ts",
+        "web/test/pwa.test.ts",
+        "web/test/stream.test.ts",
         "web/test/validated.test.ts"
       ],
       "relations": [
@@ -2918,7 +3236,7 @@
         },
         {
           "kind": "relates_to",
-          "target": "cap-tmux-runner"
+          "target": "cap-herdr-runner"
         },
         {
           "kind": "relates_to",
@@ -2927,6 +3245,38 @@
         {
           "kind": "relates_to",
           "target": "cap-web-shell-design-system"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-node-registry"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-fleet-board"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-shell-design-system"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-home-core-lines"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-session-trace-views"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-missions-view"
         }
       ],
       "provenance": {
@@ -2995,6 +3345,22 @@
         {
           "kind": "depends_on",
           "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-shell-design-system"
+        },
+        {
+          "kind": "depends_on",
+          "target": "t565u-wild-file-scan"
         }
       ],
       "provenance": {
@@ -3040,8 +3406,8 @@
         "rsi/backlog/131.json",
         "rsi/scenarios/119.sh",
         "rsi/scenarios/120.sh",
-        "rsi/scenarios/nightly/131.sh",
         "rsi/scenarios/check-web.sh",
+        "rsi/scenarios/nightly/131.sh",
         "scripts/test-web-install.sh",
         "scripts/web-install.sh",
         "web/.gitignore",
@@ -3055,6 +3421,7 @@
         "web/scripts/contrast.mjs",
         "web/src/App.tsx",
         "web/src/api.ts",
+        "web/src/commands.ts",
         "web/src/components/Diff.tsx",
         "web/src/components/Sidebar.tsx",
         "web/src/components/StateDot.tsx",
@@ -3085,11 +3452,14 @@
         "web/src/components/ui/toggle-group.tsx",
         "web/src/components/ui/tool-call-card.tsx",
         "web/src/components/ui/tooltip.tsx",
+        "web/src/coreLines.ts",
         "web/src/format.ts",
         "web/src/index.css",
         "web/src/keys.ts",
         "web/src/label.ts",
         "web/src/main.tsx",
+        "web/src/ordering.ts",
+        "web/src/scorecard.ts",
         "web/src/styles/aui.css",
         "web/src/styles/base.css",
         "web/src/styles/spawn.css",
@@ -3105,12 +3475,7 @@
         "web/tsconfig.json",
         "web/vite.config.ts"
       ],
-      "relations": [
-        {
-          "kind": "depends_on",
-          "target": "cap-serve-http-api"
-        }
-      ],
+      "relations": [],
       "provenance": {
         "objectives": [
           "4/119",
@@ -3170,12 +3535,14 @@
         "rsi/backlog/230.json",
         "rsi/backlog/232.json",
         "rsi/backlog/233.json",
+        "rsi/scenarios/056.sh",
+        "rsi/scenarios/065.sh",
+        "rsi/scenarios/120.sh",
+        "rsi/scenarios/176.sh",
         "rsi/scenarios/nightly/049.sh",
         "rsi/scenarios/nightly/051.sh",
-        "rsi/scenarios/056.sh",
         "rsi/scenarios/nightly/058.sh",
         "rsi/scenarios/nightly/064.sh",
-        "rsi/scenarios/065.sh",
         "rsi/scenarios/nightly/069.sh",
         "rsi/scenarios/nightly/070.sh",
         "rsi/scenarios/nightly/071.sh",
@@ -3194,11 +3561,10 @@
         "rsi/scenarios/nightly/102.sh",
         "rsi/scenarios/nightly/103.sh",
         "rsi/scenarios/nightly/112.sh",
-        "rsi/scenarios/120.sh",
-        "rsi/scenarios/176.sh",
         "rsi/scenarios/nightly/230.sh",
         "rsi/scenarios/nightly/232.sh",
         "rsi/scenarios/nightly/233.sh",
+        "web/src/components/fleet/HealthStrip.tsx",
         "web/src/components/home/CoreLines.tsx",
         "web/src/components/home/Home.tsx",
         "web/src/components/home/HomeView.tsx",
@@ -3226,6 +3592,10 @@
         {
           "kind": "relates_to",
           "target": "cap-storage-lifecycle"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-fleet-board"
         }
       ],
       "provenance": {
@@ -3285,11 +3655,11 @@
         "rsi/backlog/225.json",
         "rsi/backlog/227.json",
         "rsi/scenarios/040.sh",
+        "rsi/scenarios/227.sh",
         "rsi/scenarios/nightly/042.sh",
         "rsi/scenarios/nightly/103.sh",
         "rsi/scenarios/nightly/158.sh",
         "rsi/scenarios/nightly/225.sh",
-        "rsi/scenarios/227.sh",
         "web/src/agentPage.ts",
         "web/src/attention.ts",
         "web/src/commands.ts",
@@ -3303,9 +3673,12 @@
         "web/src/components/fleet/Interventions.tsx",
         "web/src/components/fleet/NodeRows.tsx",
         "web/src/components/fleet/bits.tsx",
+        "web/src/components/missions/HeldSources.tsx",
         "web/src/fleet.ts",
+        "web/src/home.ts",
         "web/src/input.ts",
         "web/src/interventions.ts",
+        "web/src/missions.ts",
         "web/src/nodes.ts",
         "web/src/ordering.ts",
         "web/test/agentPage.test.ts",
@@ -3328,6 +3701,10 @@
         {
           "kind": "relates_to",
           "target": "cap-node-registry"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-session-trace-views"
         }
       ],
       "provenance": {
@@ -3371,6 +3748,14 @@
         {
           "kind": "relates_to",
           "target": "cap-alerts-and-acks"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-session-trace-views"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-fleet-board"
         }
       ],
       "provenance": {
@@ -3403,8 +3788,8 @@
         "rsi/backlog/075.json",
         "rsi/backlog/077.json",
         "rsi/backlog/079.json",
-        "rsi/scenarios/nightly/041.sh",
         "rsi/scenarios/059.sh",
+        "rsi/scenarios/nightly/041.sh",
         "rsi/scenarios/nightly/060.sh",
         "rsi/scenarios/nightly/062.sh",
         "rsi/scenarios/nightly/068.sh",
@@ -3436,6 +3821,18 @@
         {
           "kind": "relates_to",
           "target": "cap-scorecard-and-cost"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-fleet-board"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-home-core-lines"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-missions-view"
         }
       ],
       "provenance": {
@@ -3478,6 +3875,14 @@
         {
           "kind": "depends_on",
           "target": "cap-web-shell-design-system"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-rsi-view"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-session-trace-views"
         }
       ],
       "provenance": {
@@ -3513,6 +3918,7 @@
         "web/src/components/missions/TaskTexts.tsx",
         "web/src/components/missions/parts.tsx",
         "web/src/components/missions/timelineStyle.ts",
+        "web/src/components/rsi/Phase.tsx",
         "web/src/missionTimeline.ts",
         "web/src/missions.ts",
         "web/src/taskActivity.ts",
@@ -3528,6 +3934,14 @@
         {
           "kind": "relates_to",
           "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-fleet-board"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-session-trace-views"
         }
       ],
       "provenance": {
@@ -3565,6 +3979,7 @@
         "web/src/components/rsi/RsiView.tsx",
         "web/src/components/rsi/Verdicts.tsx",
         "web/src/components/rsi/metric.ts",
+        "web/src/fleet.ts",
         "web/src/rsi.ts",
         "web/src/rsiProgress.ts",
         "web/test/rsiProgress.test.ts"
@@ -3577,6 +3992,18 @@
         {
           "kind": "relates_to",
           "target": "cap-rsi-integration-gate"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-missions-view"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-session-trace-views"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-home-core-lines"
         }
       ],
       "provenance": {
@@ -3612,8 +4039,10 @@
         "web/src/eventFormat.ts",
         "web/src/events.ts",
         "web/src/executionFacts.ts",
+        "web/src/fleet.ts",
         "web/src/messages.ts",
         "web/src/sessionWindow.ts",
+        "web/src/show.ts",
         "web/src/timeFold.ts",
         "web/src/timeWindow.ts",
         "web/src/trace.ts",
@@ -3745,6 +4174,14 @@
         {
           "kind": "relates_to",
           "target": "t559u-slice-b-coverage"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-feature-dependency-truth"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-backup-and-drills"
         }
       ],
       "provenance": {
@@ -3808,6 +4245,74 @@
         {
           "kind": "depends_on",
           "target": "cap-serve-http-api"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-agent-grading"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-alerts-view"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-fleet-board"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-home-core-lines"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-missions-view"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-rsi-view"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-scorecard-cost"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-session-trace-views"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-show-view"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-feature-dependency-truth"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-shell-design-system"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-node-registry"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-dashboard"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-feature-map-status"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-backup-and-drills"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
         }
       ],
       "provenance": {
@@ -3927,6 +4432,10 @@
         {
           "kind": "depends_on",
           "target": "t565u-wild-file-scan"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-web-shell-design-system"
         }
       ],
       "provenance": {
@@ -3971,6 +4480,10 @@
         {
           "kind": "relates_to",
           "target": "t559u-slice-b-coverage"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
         }
       ],
       "provenance": {
@@ -4014,11 +4527,11 @@
           "target": "t559u-feature-map-initiative"
         },
         {
-          "kind": "depends_on",
+          "kind": "relates_to",
           "target": "t559u-slice-b-coverage"
         },
         {
-          "kind": "depends_on",
+          "kind": "relates_to",
           "target": "t559u-slice-c-storage-keys"
         },
         {

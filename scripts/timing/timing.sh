@@ -7,14 +7,9 @@
 #                              timing_enable; scripts/timing/run.sh too)
 #   SPAWN_TIMING_SEED=<n>      the seed (default: a random one, printed)
 #   SPAWN_TIMING_KINDS=<list>  comma list of kinds, default all; `-<kind>`
-#                              leaves one out (`all,-flaky`):
+#                              leaves one out (`all,-push`):
 #       checkpoint  git commit-tree and update-ref run late
 #       push        git push runs late (the pusher lags the checkpoint)
-#       tmux        Spawn's tmux calls run late: capture-pane, set-buffer,
-#                   paste-buffer, send-keys (text on screen before its Enter)
-#       flaky       Spawn's tmux calls fail now and then: capture-pane
-#                   empty or refused, set-buffer refused (before anything
-#                   is typed)
 #       screen      the engine's output reaches the pane late, the prompt
 #                   later still (the screen lags the transcript)
 #       transcript  the Bridge reads a mirror of the projects directory that
@@ -23,12 +18,11 @@
 #       integrate   an `integrate` pass starts late
 #   SPAWN_TIMING_SCALE=<pct>   multiply every delay (default 100)
 #
-# timing_enable <dir> writes <dir>/config, <dir>/bin/{git,tmux,spawn,
+# timing_enable <dir> writes <dir>/config, <dir>/bin/{git,spawn,
 # engine-proxy} and puts <dir>/bin first in PATH. Afterwards TIMING_SPAWN is
-# the spawn wrapper to use as SPAWN_BIN. Only calls Spawn makes are
-# perturbed: Spawn starts tmux with every SPAWN_* variable removed, so a
-# tmux call with one (SPAWN_DATABASE_URL, SPAWN_TMUX_SOCKET, SPAWN_BIN) is
-# the harness's own and runs untouched. Git calls are only ever delayed.
+# the spawn wrapper to use as SPAWN_BIN. Git calls are only ever delayed.
+# Spawn's terminal is Herdr alone (the tmux backend is gone), so there is no
+# tmux shim and no tmux or flaky kind.
 # Every perturbation is a line of <dir>/perturbations.log; timing_report
 # <dir> prints the seed and a count per kind and action.
 #
@@ -58,7 +52,6 @@ timing_enable() {
     timing_dir=$(cd "$timing_dir" && pwd)
     # The real tools: the first in PATH that is not a timing shim.
     timing_real_git=$(timing_which git) || return 1
-    timing_real_tmux=$(timing_which tmux) || return 1
     TIMING_SEED=$(timing_seed)
     cat >"$timing_dir/config" <<EOF
 # Adversarial timing profile (scripts/timing/timing.sh). Per mille, ms.
@@ -66,7 +59,6 @@ TIMING_SEED='$TIMING_SEED'
 TIMING_KINDS='${SPAWN_TIMING_KINDS:-all}'
 TIMING_SCALE='${SPAWN_TIMING_SCALE:-100}'
 REAL_GIT='$timing_real_git'
-REAL_TMUX='$timing_real_tmux'
 REAL_SPAWN='$timing_real_spawn'
 P_COMMIT_TREE=500
 COMMIT_TREE_MIN=300
@@ -77,21 +69,6 @@ UPDATE_REF_MAX=1500
 P_PUSH=400
 PUSH_MIN=200
 PUSH_MAX=3000
-P_CAPTURE_EMPTY=40
-P_CAPTURE_REFUSE=30
-P_CAPTURE_SLOW=100
-CAPTURE_MIN=100
-CAPTURE_MAX=1500
-P_SET_BUFFER_REFUSE=80
-P_SET_BUFFER_SLOW=100
-SET_BUFFER_MIN=100
-SET_BUFFER_MAX=800
-P_PASTE_SLOW=150
-PASTE_MIN=100
-PASTE_MAX=1000
-P_SEND_KEYS_SLOW=200
-SEND_KEYS_MIN=100
-SEND_KEYS_MAX=1200
 P_SCREEN_CHUNK=250
 SCREEN_CHUNK_MIN=100
 SCREEN_CHUNK_MAX=1200
@@ -109,7 +86,7 @@ INTEGRATE_MIN=100
 INTEGRATE_MAX=3000
 EOF
     cp "$timing_lib/lib.sh" "$timing_lib/relay.py" "$timing_lib/mirror.py" "$timing_dir/" || return 1
-    for shim in git tmux spawn engine-proxy; do
+    for shim in git spawn engine-proxy; do
         {
             echo '#!/usr/bin/env bash'
             echo "D='$timing_dir'"

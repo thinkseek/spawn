@@ -3208,7 +3208,7 @@ fi
 #   relative path after it) keys all of the controller's scripts/;
 # - the tools the scenarios run, asked in the sandbox inside the base tree
 #   (whose rust-toolchain.toml picks the Rust toolchain): `rustc -vV`,
-#   `cargo -V`, `node --version`, `psql -V`, `git --version`, `tmux -V`,
+#   `cargo -V`, `node --version`, `psql -V`, `git --version`,
 #   `python3 -V`, `jq --version`, and the test server's
 #   `server_version_num`, asked over its socket.
 # An entry is written only here, after a completed base run, and only
@@ -3312,7 +3312,7 @@ toolchain_probe() {
     # URL on psql's command line: it holds the password.
     sandbox "$1" sh -c '
         for tool in "rustc -vV" "cargo -V" "node --version" "psql -V" "git --version" \
-            "tmux -V" "python3 -V" "jq --version"; do
+            "python3 -V" "jq --version"; do
             $tool 2>&1
             echo "${tool%% *}: $?"
         done
