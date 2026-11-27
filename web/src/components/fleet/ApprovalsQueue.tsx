@@ -1,4 +1,4 @@
-import { CircleAlert, CircleCheck, LoaderCircle, ShieldQuestion } from "lucide-react";
+import { CircleAlert, CircleCheck, ShieldQuestion } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { fetchApprovals, postApprovalAct, postResume, usePoll } from "../../api";
@@ -6,6 +6,7 @@ import type { Approval, ApprovalOption } from "../../approvals";
 import { actBody, actVerdict, kindText, probeWritable, resumeVerdict } from "../../approvals";
 import { relativeTime } from "../../format";
 import { newKey } from "../../input";
+import { KeyCap, PixelGridLoader, ShimmerLabel } from "../BeautifulPrimitives";
 import { cx } from "../ui";
 
 type Probe = { state: "checking" } | { state: "yes" } | { state: "no"; reason: string };
@@ -189,9 +190,12 @@ export function ApprovalsQueue({ onOpenAgent }: { onOpenAgent?: (sessionId: stri
             : outcomes.get(item.id);
           const busy = outcome?.state === "sending";
           return (
-            <li key={item.id} className="min-w-0 rounded-md border border-surface-border px-3 py-2">
+            <li
+              key={item.id}
+              className="min-w-0 rounded-control bg-inset px-3.5 py-2.5 shadow-hairline transition-shadow hover:shadow-raised"
+            >
               <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 text-caption">
-                <span className="rounded-sm bg-muted px-1 text-micro font-medium uppercase tracking-[0.04em] text-muted-foreground">
+                <span className="rounded-chip bg-surface px-1.5 py-0.5 text-micro font-medium uppercase tracking-[0.04em] text-muted-foreground shadow-hairline">
                   {kindText(item.kind)}
                 </span>
                 {item.session_id && (
@@ -212,16 +216,16 @@ export function ApprovalsQueue({ onOpenAgent }: { onOpenAgent?: (sessionId: stri
                 )}
               </div>
               {item.summary && item.summary !== item.label && (
-                <p className="mt-1 break-words text-caption text-foreground">{item.summary}</p>
+                <p className="mt-1.5 break-words text-caption text-foreground">{item.summary}</p>
               )}
               {item.excerpt && item.kind !== "mission_halted" && (
-                <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-muted px-2 py-1 font-mono text-micro text-muted-foreground">
+                <pre className="mt-1.5 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-control bg-surface px-2.5 py-2 font-mono text-micro text-muted-foreground shadow-hairline">
                   {item.excerpt}
                 </pre>
               )}
               {item.options.length > 0 ? (
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  {item.options.map((choice) => (
+                <div className="mt-2.5 flex flex-wrap gap-1.5">
+                  {item.options.map((choice, idx) => (
                     <button
                       key={choice.id}
                       type="button"
@@ -229,42 +233,49 @@ export function ApprovalsQueue({ onOpenAgent }: { onOpenAgent?: (sessionId: stri
                       onClick={() => void answer(item, choice)}
                       title={choice.keys.length ? `presses ${choice.keys.join(", ")}` : undefined}
                       className={cx(
-                        "inline-flex h-7 items-center gap-1 rounded-control border px-2.5 text-caption font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50",
+                        "inline-flex h-7 items-center gap-1.5 rounded-control px-2.5 text-caption font-medium transition-[color,background-color,box-shadow] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50",
                         choice.danger || choice.action === "deny"
-                          ? "border-destructive/40 text-destructive hover:bg-fail-tint"
-                          : "border-border-strong bg-surface-raised text-foreground hover:bg-surface-hover",
+                          ? "bg-fail-tint text-destructive shadow-hairline ring-1 ring-destructive/30 ring-inset hover:bg-surface-hover"
+                          : "bg-surface text-foreground shadow-btn hover:bg-surface-hover",
                       )}
                     >
-                      {choice.label}
+                      <KeyCap className="bg-page-canvas text-[10px]">{idx + 1}</KeyCap>
+                      <span>{choice.label}</span>
                     </button>
                   ))}
                 </div>
               ) : (
                 item.session_id && (
-                  <p className="mt-1 text-caption text-faint-foreground">
+                  <p className="mt-1.5 text-caption text-faint-foreground">
                     No prompt on its pane: open the agent and type to it.
                   </p>
                 )
               )}
               {probe.state === "no" && probe.reason && (
-                <p className="mt-1 text-caption text-muted-foreground">Read-only here: {probe.reason}</p>
+                <p className="mt-1.5 text-caption text-muted-foreground">Read-only here: {probe.reason}</p>
               )}
               {outcome && (
                 <p
                   role="status"
                   className={cx(
-                    "mt-1 flex items-center gap-1 text-caption",
+                    "mt-1.5 flex items-center gap-1.5 text-caption",
                     outcome.state === "failed" ? "text-destructive" : "text-muted-foreground",
                   )}
                 >
                   {outcome.state === "sending" ? (
-                    <LoaderCircle size={12} className="animate-spin" />
+                    <PixelGridLoader tone="accent" size="xs" />
                   ) : outcome.state === "done" ? (
                     <CircleCheck size={12} className="text-success" />
                   ) : (
                     <CircleAlert size={12} />
                   )}
-                  {outcome.state === "sending" ? "Sending…" : outcome.state === "done" ? outcome.text : outcome.error}
+                  {outcome.state === "sending" ? (
+                    <ShimmerLabel>Sending…</ShimmerLabel>
+                  ) : outcome.state === "done" ? (
+                    outcome.text
+                  ) : (
+                    outcome.error
+                  )}
                 </p>
               )}
             </li>

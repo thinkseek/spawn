@@ -7,6 +7,7 @@ import type { AgentGroup, AgentGroupId, FleetContext, TaskRef } from "../../orde
 import { AGENT_GROUP_LABEL, heldTask, lastTask } from "../../ordering";
 import { currentToolText } from "../../home";
 import { useStoredChoice } from "../ViewToggle";
+import { ToolChip } from "../BeautifulPrimitives";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, GroupHeader, LabeledId, cx, sinceText } from "../ui";
 import { FleetStateDot, JudgeBadge } from "./bits";
 
@@ -320,16 +321,20 @@ function AgentRow({
 
       {/* Doing now */}
       <div className="flex w-full min-w-0 items-center gap-1.5 pl-4 text-caption lg:w-auto lg:pl-0">
-        <DoingIcon now={now} />
-        <span
-          className={cx(
-            "min-w-0 truncate font-mono",
-            now.tool || now.job ? "text-foreground" : "text-muted-foreground",
-          )}
-          title={now.job ? "Its turn ended while a job it started still runs; the engine wakes it when the job reports" : undefined}
-        >
-          {now.label}
-        </span>
+        {now.tool || now.job ? (
+          <ToolChip
+            icon={<DoingIcon now={now} />}
+            label={now.label}
+            tone="active"
+            title={
+              now.job
+                ? "Its turn ended while a job it started still runs; the engine wakes it when the job reports"
+                : now.label
+            }
+          />
+        ) : (
+          <span className="min-w-0 truncate font-mono text-muted-foreground">{now.label}</span>
+        )}
       </div>
 
       {/* Last event */}

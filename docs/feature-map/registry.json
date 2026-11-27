@@ -3436,7 +3436,9 @@
         "web/scripts/contrast.mjs",
         "web/src/App.tsx",
         "web/src/api.ts",
+        "web/src/beautifulPrimitives.ts",
         "web/src/commands.ts",
+        "web/src/components/BeautifulPrimitives.tsx",
         "web/src/components/Diff.tsx",
         "web/src/components/Sidebar.tsx",
         "web/src/components/StateDot.tsx",
@@ -3482,6 +3484,7 @@
         "web/src/theme.ts",
         "web/src/token.ts",
         "web/src/validated.ts",
+        "web/test/beautifulPrimitives.test.ts",
         "web/test/keys.test.ts",
         "web/test/label.test.ts",
         "web/test/theme.test.ts",
@@ -3501,6 +3504,7 @@
         "agents": [],
         "commits": [],
         "tests": [
+          "web/test/beautifulPrimitives.test.ts",
           "web/test/token.test.ts",
           "web/test/theme.test.ts",
           "web/test/validated.test.ts"
