@@ -182,20 +182,6 @@ function escalation(item: AttentionItem, told: boolean): NeedItem {
  * counted ("and N more") and named in full on expand. */
 export const GONE_SHOWN = 5;
 
-/** A mission's `halt` as read (normalizeMissions, or the answer as it
- * came): null without an event to resume. */
-function haltOf(value: unknown): { event: number; reason: string | null; at_ms: number | null; gone: string[] | null } | null {
-  if (typeof value !== "object" || value === null) return null;
-  const halt = value as { event?: unknown; reason?: unknown; at_ms?: unknown; gone?: unknown };
-  if (typeof halt.event !== "number" || !Number.isFinite(halt.event)) return null;
-  return {
-    event: halt.event,
-    reason: typeof halt.reason === "string" ? halt.reason : null,
-    at_ms: typeof halt.at_ms === "number" ? halt.at_ms : null,
-    gone: Array.isArray(halt.gone) ? halt.gone.filter((name): name is string => typeof name === "string") : null,
-  };
-}
-
 /** A halt's line: the reason, then, when scenarios are gone, at most
  * GONE_SHOWN of their names and "and N more" for the rest; `full` names
  * them all when the line does not. */
@@ -292,8 +278,9 @@ export function needsYou(input: NeedsInput): NeedItem[] {
   for (const mission of missions?.missions ?? []) {
     if (!mission.halted || mission.id === null) continue;
     halted.add(mission.id);
-    const halt = haltOf(mission.halt);
-    const words = haltWords(halt?.reason ?? mission.halted, halt?.gone ?? null);
+    // normalizeMissions read the halt: null without an event to resume.
+    const halt = mission.halt ?? null;
+    const words = haltWords(mission.halted, halt?.gone ?? null);
     items.push({
       key: `halted:${mission.id}`,
       tone: "act",

@@ -45,6 +45,24 @@ const feature = (value: Record<string, unknown>) => ({
   ...value,
 });
 
+test("planned is read as not implemented: the server's planned flag is not a second source", () => {
+  const map = normalizeFeatureMap({
+    generated_at_ms: 1000,
+    missions: [
+      {
+        id: 4,
+        text: "Spawn RSI",
+        // The server writes `planned` as `!implemented` for older readers;
+        // even a contradictory one is not read.
+        features: [feature({ id: "i", state: "implemented", planned: true, implemented: true })],
+      },
+    ],
+  });
+  const read = map.missions[0].features[0];
+  assert.equal(read.implemented, true);
+  assert.equal("planned" in read, false);
+});
+
 test("the four states are normalized as they come, one column each", () => {
   const map = normalizeFeatureMap({
     generated_at_ms: 1000,

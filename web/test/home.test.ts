@@ -38,7 +38,7 @@ import {
   openAlertsLine,
   oneLine,
 } from "../src/home.ts";
-import type { Mission, Missions, MissionTask } from "../src/missions.ts";
+import { normalizeMissions, type Mission, type Missions, type MissionTask } from "../src/missions.ts";
 import { fleetContext, heldTask } from "../src/ordering.ts";
 
 const NOW = 1_794_224_000_000;
@@ -210,6 +210,36 @@ test("a halted mission is one item to act on, with its resume command, and its h
   assert.equal(items[0].tone, "act");
   assert.equal(items[0].command, "spawn mission resume --id 6");
   assert.match(items[0].title, /#6 Supply PA is halted/);
+});
+
+test("a halted mission's item reads its reason from halted and its resume, time and gone scenarios from halt", () => {
+  // As /api/missions writes it: `halt.reason` is the same column as `halted`.
+  const read = normalizeMissions({
+    missions: [
+      {
+        id: 6,
+        text: "Supply PA",
+        state: "active",
+        halted: "scenario floor: 2 scenarios gone",
+        halt: { event: 991, reason: "scenario floor: 2 scenarios gone", at_ms: NOW - 2 * HOUR, gone: ["010.sh", "011.sh"] },
+        tasks: [],
+      },
+      // An old halt with no event to resume: still one item, with its command.
+      { id: 7, text: "Old", state: "active", halted: "3 rejections", halt: { event: null, reason: "3 rejections" }, tasks: [] },
+    ],
+  });
+  assert.equal(read.missions.find((m) => m.id === 6)?.halt?.event, 991);
+  assert.equal(read.missions.find((m) => m.id === 7)?.halt, null);
+  const items = needsYou({ ...base, missions: read });
+  const six = items.find((item) => item.key === "halted:6");
+  assert.deepEqual(six?.resume, { mission: 6, halt: 991 });
+  assert.equal(six?.since_ms, NOW - 2 * HOUR);
+  assert.match(six?.detail ?? "", /^scenario floor: 2 scenarios gone/);
+  assert.match(six?.detail ?? "", /010\.sh, 011\.sh/);
+  const seven = items.find((item) => item.key === "halted:7");
+  assert.equal(seven?.resume, null);
+  assert.equal(seven?.detail, "3 rejections");
+  assert.equal(seven?.command, "spawn mission resume --id 7");
 });
 
 test("a held source asks for the owner when it expires soon or a task waits on it, with the release command", () => {

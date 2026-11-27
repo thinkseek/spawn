@@ -816,6 +816,7 @@ fn roll_up_domains(specs: &[Spec], features: &mut [Value]) {
         let owned = row["owner"].is_object();
         if let Some(fields) = row.as_object_mut() {
             fields.insert("state".to_string(), json!(state));
+            // `!implemented`, as `derive` writes it (spawn-android reads it).
             fields.insert("planned".to_string(), json!(!implemented));
             fields.insert("implemented".to_string(), json!(implemented));
             fields.insert("verified".to_string(), json!(verified));
@@ -1928,7 +1929,9 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
             "label": rel.label,
         })).collect::<Vec<_>>(),
         "state": state,
-        // Four separate pieces of evidence, not synonyms: a live
+        // `planned` is `!implemented`, no evidence of its own: written for
+        // spawn-android's inspector, which reads it (the web derives it).
+        // The other three are separate evidence, not synonyms: a live
         // capability can be unverified, and says so.
         "planned": !implemented,
         "implemented": implemented,
@@ -3564,6 +3567,40 @@ mod tests {
             .find(|feature| feature["id"] == id)
             .cloned()
             .unwrap_or_else(|| panic!("{id} in {answer}"))
+    }
+
+    /// Every row's `planned` is `!implemented`, rolled-up domains included:
+    /// the field is kept only for spawn-android, which reads it, and must
+    /// never say something `implemented` does not.
+    fn assert_planned_is_not_implemented(answer: &Value) {
+        let mut rows = 0;
+        for mission in answer["missions"].as_array().into_iter().flatten() {
+            for row in mission["features"].as_array().into_iter().flatten() {
+                let implemented = row["implemented"].as_bool().expect("implemented is a bool");
+                assert_eq!(row["planned"], json!(!implemented), "{row}");
+                rows += 1;
+            }
+        }
+        assert!(rows > 0, "{answer}");
+    }
+
+    /// `planned` mirrors `implemented` in every row, before and after a
+    /// landing, for capabilities and rolled-up domains alike.
+    #[test]
+    fn planned_is_written_as_not_implemented_in_every_row() {
+        let landed =
+            json!([{"mission": 4, "objective": 3, "task": 30, "landed_ms": 100, "event": 102}]);
+        for (landings, deploys) in [
+            (json!([]), json!([])),
+            (json!([]), json!([deploy_at(OWNER_DEPLOYED_AT_MS)])),
+            (landed.clone(), json!([])),
+            (landed, json!([deploy_at(OWNER_DEPLOYED_AT_MS)])),
+        ] {
+            let answer = rollup_answer(&landings, &deploys);
+            assert_planned_is_not_implemented(&answer);
+            let domain = feature_in(&answer, "domain-rolled");
+            assert!(domain["rollup"].is_object(), "{domain}");
+        }
     }
 
     /// A domain that names no objective is rolled up from its direct
