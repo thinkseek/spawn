@@ -812,15 +812,12 @@ fn validate_safe_identifier(field: &str, raw: &str) -> Result<String, String> {
 
 /// Strictly validate an `http://` or `https://` endpoint URL without echoing the raw URL.
 ///
-/// Rejects case-insensitively non-http(s) schemes, `@` userinfo, `?` query strings,
-/// `#` fragments, `;` path parameters, backslashes, and whitespace/control characters.
+/// Rejects case-insensitively non-http(s) schemes, `@` userinfo, `?`/`&` query syntax,
+/// `#` fragments, `;` path parameters, percent-encoded query/fragment/separator/userinfo
+/// sequences, backslashes, non-ASCII/zero-width characters, and whitespace/control chars.
 pub(crate) fn validate_endpoint_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace())
-    {
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_graphic()) {
         return Err("endpoint URL must be a single valid http:// or https:// URL".to_string());
     }
     let Some((raw_scheme, rest)) = trimmed.split_once("://") else {
@@ -839,6 +836,12 @@ pub(crate) fn validate_endpoint_url(raw: &str) -> Result<String, String> {
                 .to_string(),
         );
     }
+    if rest.contains('&') {
+        return Err(
+            "endpoint URL must not contain query separators (`&`); pass credentials via SecretRef"
+                .to_string(),
+        );
+    }
     if rest.contains('#') {
         return Err(
             "endpoint URL must not contain a fragment (`#`); pass credentials via SecretRef"
@@ -847,6 +850,16 @@ pub(crate) fn validate_endpoint_url(raw: &str) -> Result<String, String> {
     }
     if rest.contains(';') {
         return Err("endpoint URL must not contain path parameters (`;`)".to_string());
+    }
+    let rest_lower = rest.to_ascii_lowercase();
+    if ["%3f", "%23", "%40", "%26", "%3b", "%5c"]
+        .iter()
+        .any(|enc| rest_lower.contains(enc))
+    {
+        return Err(
+            "endpoint URL must not contain percent-encoded query, fragment, separator, or userinfo characters; pass credentials via SecretRef"
+                .to_string(),
+        );
     }
     let authority = rest.split('/').next().unwrap_or("");
     if authority.is_empty() {
@@ -2006,15 +2019,40 @@ enum TomlHeader<'a> {
     ArrayOfTables,
 }
 
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut in_single = false;
+    for (idx, ch) in line.char_indices() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+        } else {
+            match ch {
+                '#' => return &line[..idx],
+                '"' => in_double = true,
+                '\'' => in_single = true,
+                _ => {}
+            }
+        }
+    }
+    line
+}
+
 fn parse_toml_header(trimmed_line: &str) -> Option<TomlHeader<'_>> {
     if !trimmed_line.starts_with('[') {
         return None;
     }
-    let code = trimmed_line
-        .split('#')
-        .next()
-        .unwrap_or(trimmed_line)
-        .trim_end();
+    let code = strip_toml_comment(trimmed_line).trim_end();
     if let Some(inner) = code.strip_prefix("[[").and_then(|s| s.strip_suffix("]]"))
         && !inner.trim().is_empty()
     {
@@ -2048,6 +2086,8 @@ pub(crate) fn upsert_relay_profile_toml(
     name: &str,
     relay: &RelayProfile,
     tiers: &[ModelTier],
+    profiles_root: &Path,
+    home: Option<&Path>,
 ) -> Result<String, String> {
     let valid_name = validate_profile_name(name)?;
     let _ = validate_endpoint_url(&relay.base_url)?;
@@ -2075,6 +2115,12 @@ pub(crate) fn upsert_relay_profile_toml(
                 skip_section = false;
                 flush_pending_comments(&mut kept_lines, &mut pending_comments);
             }
+            kept_lines.push(line);
+            continue;
+        }
+        if skip_section && trimmed.starts_with('[') {
+            skip_section = false;
+            flush_pending_comments(&mut kept_lines, &mut pending_comments);
             kept_lines.push(line);
             continue;
         }
@@ -2129,9 +2175,9 @@ pub(crate) fn upsert_relay_profile_toml(
         toml_basic_string(&relay.base_url)
     );
 
-    parse_auth_profiles_toml(&out, Path::new("/var/lib/spawn/auth-profiles"), None).map_err(
-        |error| format!("upsert `{valid_name}` conflicts with existing TOML structure: {error}"),
-    )?;
+    parse_auth_profiles_toml(&out, profiles_root, home).map_err(|error| {
+        format!("upsert `{valid_name}` conflicts with existing TOML structure: {error}")
+    })?;
     Ok(out)
 }
 
@@ -2761,10 +2807,35 @@ fn run_add_relay(cli_config: Option<&str>, args: &[String]) -> Result<i32, Strin
     } else {
         String::new()
     };
-    let updated = upsert_relay_profile_toml(&existing, &name, &relay, &tiers)?;
+    let profiles_root = config::auth_profiles_root_dir()?;
+    let home = process_home();
+    let updated = upsert_relay_profile_toml(
+        &existing,
+        &name,
+        &relay,
+        &tiers,
+        &profiles_root,
+        home.as_deref(),
+    )?;
     write_text_atomic(&target_path, &updated)?;
+    print_add_relay_output(
+        &name,
+        &target_path,
+        &relay,
+        &tiers,
+        parsed.switches.contains("json"),
+    )?;
+    Ok(0)
+}
 
-    if parsed.switches.contains("json") {
+fn print_add_relay_output(
+    name: &str,
+    target_path: &Path,
+    relay: &RelayProfile,
+    tiers: &[ModelTier],
+    json_output: bool,
+) -> Result<(), String> {
+    if json_output {
         let payload = json!({
             "schema_version": 1,
             "action": "add-relay",
@@ -2774,7 +2845,7 @@ fn run_add_relay(cli_config: Option<&str>, args: &[String]) -> Result<i32, Strin
             "base_url": relay.base_url,
             "engines": relay.engines,
             "tiers": tiers,
-            "secret_source": secret_source_redacted(&api_key),
+            "secret_source": secret_source_redacted(&relay.api_key),
         });
         println!(
             "{}",
@@ -2783,7 +2854,7 @@ fn run_add_relay(cli_config: Option<&str>, args: &[String]) -> Result<i32, Strin
         );
     } else {
         let engine_names: Vec<&str> = relay.engines.iter().map(|e| e.as_str()).collect();
-        let source = match &api_key {
+        let source = match &relay.api_key {
             SecretRef::FromEnv { from_env } => format!("from_env:{from_env}"),
             SecretRef::FromFile { from_file } => format!("from_file:{}", from_file.display()),
         };
@@ -2794,7 +2865,7 @@ fn run_add_relay(cli_config: Option<&str>, args: &[String]) -> Result<i32, Strin
             engine_names.join(",")
         );
     }
-    Ok(0)
+    Ok(())
 }
 
 fn create_private_dir_only_if_new(path: &Path) -> Result<(), String> {
@@ -3008,6 +3079,13 @@ mod tests {
             format!("HTTPS://user:{canary}@gw.example/v1"),
             format!("ftp://user:{canary}@gw.example/v1"),
             format!("https://gw.example\\path\\{canary}"),
+            format!("https://gw.example/v1%3Fapi-key={canary}"),
+            format!("https://gw.example/v1%3fapi-key={canary}"),
+            format!("https://gw.example/v1&api-key={canary}"),
+            format!("https://gw.example/v1%23token={canary}"),
+            format!("https://user%3A{canary}%40gw.example/v1"),
+            "https://gw.example/v1\u{200b}".to_string(),
+            format!("https://gw.example/v1\u{200b}{canary}"),
         ];
         for bad in &bad_urls {
             let err = validate_endpoint_url(bad).unwrap_err();
@@ -3067,6 +3145,8 @@ port = 8080
                     .collect(),
             },
             &ModelTier::ALL,
+            Path::new("/var/lib/spawn/auth-profiles"),
+            None,
         )
         .expect("upsert preserving hooks");
 
@@ -3087,6 +3167,141 @@ port = 8080
         assert_eq!(doc["hooks"][0]["cmd"], json!("keep-me"));
         assert_eq!(doc["writable_mounts"][0]["target"], json!("/work"));
         assert_eq!(doc["server"]["port"], json!(8080));
+    }
+
+    #[test]
+    fn r1_upsert_honors_resolved_profiles_root_with_explicit_native_profile_dir() {
+        let scratch = scratch_dir("r1-explicit-native-dir");
+        let fake_home = scratch.join("home");
+        let profiles_root = fake_home.join(".local/state/spawn/auth-profiles");
+        fs::create_dir_all(&profiles_root).expect("profiles_root");
+        let native_dir = profiles_root.join("claude-work");
+
+        let existing = format!(
+            r#"[auth.profiles.claude-work]
+mode = "native_login"
+provider = "claude"
+profile_dir = "{pdir}"
+"#,
+            pdir = native_dir.display()
+        );
+        let relay = RelayProfile {
+            base_url: "https://relay.example/v1".to_string(),
+            api_key: SecretRef::FromEnv {
+                from_env: "RELAY_KEY".to_string(),
+            },
+            engines: [RelayEngine::Claude, RelayEngine::Codex]
+                .into_iter()
+                .collect(),
+        };
+
+        let updated = upsert_relay_profile_toml(
+            &existing,
+            "r1",
+            &relay,
+            &ModelTier::ALL,
+            &profiles_root,
+            Some(&fake_home),
+        )
+        .expect("upsert with explicit native profile_dir inside profiles_root");
+
+        let parsed =
+            parse_auth_profiles_toml(&updated, &profiles_root, Some(&fake_home)).expect("valid");
+        assert!(parsed.contains_key("claude-work"));
+        assert!(parsed.contains_key("r1"));
+
+        let escaping = r#"[auth.profiles.bad-native]
+mode = "native_login"
+provider = "claude"
+profile_dir = "/tmp"
+"#;
+        assert!(
+            upsert_relay_profile_toml(
+                escaping,
+                "r1",
+                &relay,
+                &ModelTier::ALL,
+                &profiles_root,
+                Some(&fake_home),
+            )
+            .is_err()
+        );
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn r2_upsert_preserves_quoted_hash_table_headers_and_fails_closed_on_malformed_headers() {
+        let initial = r#"[auth.profiles.x]
+mode = "relay"
+base_url = "https://old.example/v1"
+engines = ["claude"]
+[auth.profiles.x.api_key]
+from_env = "OLD_KEY"
+
+# comment above quoted-hash table
+[labels."a#b"]
+keep_me = 1
+also_keep = 2
+
+[labels.'c#d'] # inline comment
+stay = true
+
+[[items."e#f"]]
+name = "ok"
+"#;
+        let relay = RelayProfile {
+            base_url: "https://new.example/v1".to_string(),
+            api_key: SecretRef::FromEnv {
+                from_env: "NEW_KEY".to_string(),
+            },
+            engines: [RelayEngine::Claude].into_iter().collect(),
+        };
+        let root = Path::new("/var/lib/spawn/auth-profiles");
+        let updated = upsert_relay_profile_toml(initial, "x", &relay, &ModelTier::ALL, root, None)
+            .expect("upsert preserving quoted-hash sections");
+
+        assert!(
+            updated.contains("# comment above quoted-hash table"),
+            "{updated}"
+        );
+        assert!(updated.contains(r#"[labels."a#b"]"#), "{updated}");
+        assert!(updated.contains("keep_me = 1"), "{updated}");
+        assert!(updated.contains("also_keep = 2"), "{updated}");
+        assert!(
+            updated.contains(r"[labels.'c#d'] # inline comment"),
+            "{updated}"
+        );
+        assert!(updated.contains("stay = true"), "{updated}");
+        assert!(updated.contains(r#"[[items."e#f"]]"#), "{updated}");
+        assert!(!updated.contains("OLD_KEY"), "{updated}");
+
+        let doc = toml_parser::parse(&updated).expect("valid TOML");
+        assert_eq!(doc["labels"]["a#b"]["keep_me"], json!(1));
+        assert_eq!(doc["labels"]["a#b"]["also_keep"], json!(2));
+        assert_eq!(doc["labels"]["c#d"]["stay"], json!(true));
+        assert_eq!(doc["items"]["e#f"][0]["name"], json!("ok"));
+
+        let malformed_following = r#"[auth.profiles.x]
+mode = "relay"
+base_url = "https://old.example/v1"
+engines = ["claude"]
+[auth.profiles.x.api_key]
+from_env = "OLD_KEY"
+
+[unclosed
+keep_me = 1
+"#;
+        assert!(
+            upsert_relay_profile_toml(
+                malformed_following,
+                "x",
+                &relay,
+                &ModelTier::ALL,
+                root,
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
