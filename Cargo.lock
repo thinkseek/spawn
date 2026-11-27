@@ -884,7 +884,6 @@ name = "spawn-cli"
 version = "0.1.0"
 dependencies = [
  "base64",
- "hmac",
  "postgres",
  "ring",
  "rustix",

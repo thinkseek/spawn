@@ -827,6 +827,11 @@ impl WorkspaceSettings {
             self.cas_state()
         )
     }
+
+    /// Whether this workspace backend is pure-Rust D6 (no bare Git mirror or Git push).
+    pub(crate) fn is_d6(&self) -> bool {
+        self.active == spawn_host::WorkspaceBackend::D6
+    }
 }
 
 /// Environment variable overriding the TOML file searched for `[auth.profiles.<name>]`.
