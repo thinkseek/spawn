@@ -909,3 +909,26 @@ export function formatTaskGrading(task: TaskGradingInput): TaskGradingView | nul
     reworkStepUp,
   };
 }
+
+export interface TaskReviewCommand {
+  /** Short operator-facing purpose label for the command. */
+  label: string;
+  /** Single-line Spawn CLI command string. */
+  command: string;
+}
+
+/** Operator review and dry-run land CLI commands for a task (PR #172).
+ * Validates strictly that `taskId` is a positive safe integer so invalid
+ * values never produce malformed or injected command strings. */
+export function taskReviewCommands(taskId: number | null | undefined): TaskReviewCommand[] {
+  if (typeof taskId !== "number" || !Number.isSafeInteger(taskId) || taskId <= 0) {
+    return [];
+  }
+  const id = String(taskId);
+  return [
+    { label: "Commits ahead of main", command: `spawn task commits ${id}` },
+    { label: "Diff summary", command: `spawn task diff ${id} --stat` },
+    { label: "Land dry-run (ff-only)", command: `spawn task land ${id} --dry-run` },
+    { label: "Land dry-run (squash)", command: `spawn task land ${id} --squash --dry-run` },
+  ];
+}

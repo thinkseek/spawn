@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
+import { taskReviewCommands } from "../src/missions.ts";
 import { QUIET_MS, activityLine, normalizeActivity, spanWords } from "../src/taskActivity.ts";
 
 const MIN = 60_000;
@@ -43,4 +45,55 @@ test("an activity that is null or unreadable is none", () => {
     event: null,
     tool_calls: 0,
   });
+});
+
+test("taskReviewCommands returns exact PR #172 operator CLI commands for positive safe integer task ids", () => {
+  assert.deepEqual(
+    taskReviewCommands(42).map((item) => item.command),
+    [
+      "spawn task commits 42",
+      "spawn task diff 42 --stat",
+      "spawn task land 42 --dry-run",
+      "spawn task land 42 --squash --dry-run",
+    ],
+  );
+
+  for (const id of [1, 42, Number.MAX_SAFE_INTEGER]) {
+    const commands = taskReviewCommands(id);
+    assert.equal(commands.length, 4);
+    for (const item of commands) {
+      assert.ok(item.label.length > 0);
+      assert.ok(!/[\r\n]/.test(item.command));
+      assert.ok(item.command.includes(String(id)));
+    }
+  }
+});
+
+test("taskReviewCommands returns an empty list for non-positive, non-integer, or malformed task ids", () => {
+  const invalid: unknown[] = [
+    0,
+    -1,
+    -99,
+    NaN,
+    Infinity,
+    -Infinity,
+    1.5,
+    Number.MAX_SAFE_INTEGER + 1,
+    null,
+    undefined,
+    "42; rm -rf /",
+  ];
+  for (const id of invalid) {
+    assert.deepEqual(taskReviewCommands(id as number | null | undefined), [], `expected [] for ${String(id)}`);
+  }
+});
+
+test("TaskPanel wires Review & land CLI helper with copy action and zero extra API fetches", () => {
+  const panel = readFileSync(new URL("../src/components/missions/TaskPanel.tsx", import.meta.url), "utf8");
+  assert.ok(panel.includes("taskReviewCommands(task.id)"));
+  assert.ok(panel.includes("TaskReviewCliPanel"));
+  assert.ok(panel.includes('label="Review & land CLI"'));
+  assert.ok(panel.includes("navigator.clipboard"));
+  assert.equal(panel.includes("fetch("), false);
+  assert.equal(panel.includes("/api/"), false);
 });
