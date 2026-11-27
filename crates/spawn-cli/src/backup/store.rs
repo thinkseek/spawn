@@ -1453,14 +1453,16 @@ fn from_dir(settings: &Settings, flags: &Flags, area: &str) -> PathBuf {
     }
 }
 
-/// The engines' Claude Code directory (issue #79): `SPAWN_CLAUDE_CONFIG_DIR`
-/// when `spawn loop` runs them on one of their own, else the account's
-/// `~/.claude` under `home`.
+/// The engines' Claude Code directory (issue #79): `SPAWN_CLAUDE_CONFIG_DIR`,
+/// else the default managed isolated directory under `home`, or the account's
+/// `~/.claude` under `home` when explicitly inherited (`inherit`/`host`).
 pub(super) fn claude_dir(
     lookup: impl Fn(&str) -> Option<String>,
     home: &std::path::Path,
 ) -> PathBuf {
-    match crate::runtime::claude_config_dir(lookup) {
+    let with_home =
+        |name: &str| lookup(name).or_else(|| (name == "HOME").then(|| home.display().to_string()));
+    match crate::runtime::claude_config_dir(with_home) {
         Ok(Some(dir)) => PathBuf::from(dir),
         _ => home.join(".claude"),
     }

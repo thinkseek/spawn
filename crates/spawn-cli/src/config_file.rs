@@ -3293,11 +3293,24 @@ fn probe_single_model_endpoint(
     )
 }
 
+fn clean_abs_claude_dir(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let clean = trimmed.trim_end_matches('/');
+    Some(if clean.is_empty() {
+        "/".to_string()
+    } else {
+        clean.to_string()
+    })
+}
+
 /// Which Claude Code directory the engines run with (issue #79), as far
 /// as it is no secret: where it comes from (`SPAWN_CLAUDE_CONFIG_DIR`,
-/// `[engines.claude].config_dir`, or the user's own `~/.claude`), its
-/// path, and whether a `settings.json` is there. The file is never read:
-/// it holds the gateway's token.
+/// `[engines.claude].config_dir`, `default-isolated`, or `inherit` for the
+/// user's own `~/.claude`), its path, and whether a `settings.json` is
+/// there. Reads only metadata, never file contents: it holds credentials.
 fn probe_claude_config_with(
     lookup: &dyn Fn(&str) -> Option<String>,
     cfg: Option<&SpawnConfig>,
@@ -3307,41 +3320,82 @@ fn probe_claude_config_with(
         .and_then(|cfg| cfg.engines.claude.as_ref())
         .filter(|claude| claude.enabled)
         .and_then(|claude| claude.config_dir.as_ref());
-    // The rule `spawn loop` applies (`runtime::claude_config_dir`): empty
-    // reads as unset, anything but an absolute path stops the loop. This
-    // file is also compiled alone by `tests/config_toml.rs`, so the rule is
-    // restated here rather than called.
-    let from_env = lookup("SPAWN_CLAUDE_CONFIG_DIR").filter(|dir| !dir.trim().is_empty());
-    let (source, dir) = match from_env {
+    // Must stay standalone (compiled directly by `tests/config_toml.rs`), so
+    // it mirrors `runtime::resolve_claude_config` rather than calling it.
+    let from_env = lookup("SPAWN_CLAUDE_CONFIG_DIR")
+        .map(|dir| dir.trim().to_string())
+        .filter(|dir| !dir.is_empty());
+    let (source, dir, isolated) = match from_env {
+        Some(dir) if dir.eq_ignore_ascii_case("inherit") || dir.eq_ignore_ascii_case("host") => {
+            let host_dir = lookup("HOME")
+                .as_deref()
+                .and_then(clean_abs_claude_dir)
+                .map(|home| PathBuf::from(home.trim_end_matches('/')).join(".claude"));
+            warnings.push(format!(
+                "SPAWN_CLAUDE_CONFIG_DIR={dir} disables default config isolation: engines use \
+                 host {} and can drift with host settings.json edits",
+                host_dir
+                    .as_deref()
+                    .unwrap_or(Path::new("~/.claude"))
+                    .display()
+            ));
+            ("inherit", host_dir, false)
+        }
         Some(dir) if dir.starts_with('/') => {
-            let trimmed = dir.trim_end_matches('/');
-            let dir = if trimmed.is_empty() { "/" } else { trimmed };
-            ("SPAWN_CLAUDE_CONFIG_DIR", Some(PathBuf::from(dir)))
+            let clean = clean_abs_claude_dir(&dir).unwrap_or(dir);
+            ("SPAWN_CLAUDE_CONFIG_DIR", Some(PathBuf::from(clean)), true)
         }
         Some(dir) => {
             warnings.push(format!(
-                "SPAWN_CLAUDE_CONFIG_DIR must be an absolute path, not {dir:?}: `spawn loop` \
-                 refuses to start"
+                "SPAWN_CLAUDE_CONFIG_DIR must be an absolute path (or inherit/host), not {dir:?}: \
+                 `spawn loop` refuses to start"
             ));
-            ("SPAWN_CLAUDE_CONFIG_DIR", None)
+            ("SPAWN_CLAUDE_CONFIG_DIR", None, false)
         }
-        None => match from_toml {
-            Some(dir) => match expand_tilde(dir, lookup) {
-                Ok(dir) => ("[engines.claude].config_dir", Some(dir)),
-                Err(error) => {
-                    warnings.push(format!("[engines.claude].config_dir: {error}"));
-                    ("[engines.claude].config_dir", None)
+        None => {
+            if let Some(dir) = from_toml {
+                match expand_tilde(dir, lookup) {
+                    Ok(dir) => ("[engines.claude].config_dir", Some(dir), true),
+                    Err(error) => {
+                        warnings.push(format!("[engines.claude].config_dir: {error}"));
+                        ("[engines.claude].config_dir", None, false)
+                    }
                 }
-            },
-            None => (
-                "default",
-                lookup("HOME")
-                    .filter(|home| !home.is_empty())
-                    .map(|home| PathBuf::from(home).join(".claude")),
-            ),
-        },
+            } else {
+                let managed = lookup("SPAWN_CLAUDE_DATA_DIR")
+                    .as_deref()
+                    .and_then(clean_abs_claude_dir)
+                    .filter(|dir| dir != "/")
+                    .map(|dir| PathBuf::from(dir).join("config"))
+                    .or_else(|| {
+                        cfg.filter(|cfg| {
+                            cfg.engines.claude.as_ref().is_some_and(|claude| {
+                                claude.enabled && claude.sandbox == Some(true)
+                            })
+                        })
+                        .map(|cfg| cfg.derived_paths().claude_data_dir.join("config"))
+                    })
+                    .or_else(|| {
+                        lookup("XDG_STATE_HOME")
+                            .as_deref()
+                            .and_then(clean_abs_claude_dir)
+                            .filter(|dir| dir != "/")
+                            .map(|dir| PathBuf::from(dir).join("spawn/claude-config"))
+                    })
+                    .or_else(|| {
+                        lookup("HOME")
+                            .as_deref()
+                            .and_then(clean_abs_claude_dir)
+                            .map(|home| {
+                                PathBuf::from(home.trim_end_matches('/'))
+                                    .join(".local/state/spawn/claude-config")
+                            })
+                    });
+                let is_isolated = managed.is_some();
+                ("default-isolated", managed, is_isolated)
+            }
+        }
     };
-    let isolated = source != "default" && dir.is_some();
     let settings_json = dir
         .as_ref()
         .is_some_and(|dir| dir.join("settings.json").is_file());
@@ -3487,13 +3541,6 @@ mod tests {
         assert_eq!(toml_report["path"], fleet_str.as_str());
         assert_eq!(toml_report["isolated"], true);
 
-        let (default, warnings) =
-            probe_claude_config_with(&|key| (key == "HOME").then(|| home.clone()), None);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(default["source"], "default");
-        assert_eq!(default["path"], format!("{home}/.claude").as_str());
-        assert_eq!(default["isolated"], false);
-
         let relative = |key: &str| (key == "SPAWN_CLAUDE_CONFIG_DIR").then(|| "rel".to_string());
         let (refused, warnings) = probe_claude_config_with(&relative, None);
         assert_eq!(refused["isolated"], false);
@@ -3509,6 +3556,72 @@ mod tests {
         );
         assert_eq!(no_settings["settings_json_present"], false);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn doctor_reports_default_isolated_and_inherit_claude_config() {
+        use super::probe_claude_config_with;
+
+        let base = std::env::temp_dir().join(format!(
+            "spawn-doctor-claude-default-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home").display().to_string();
+
+        let (default_missing, warnings) =
+            probe_claude_config_with(&|key| (key == "HOME").then(|| home.clone()), None);
+        assert_eq!(default_missing["source"], "default-isolated");
+        assert_eq!(
+            default_missing["path"],
+            format!("{home}/.local/state/spawn/claude-config").as_str()
+        );
+        assert_eq!(default_missing["isolated"], true);
+        assert_eq!(default_missing["settings_json_present"], false);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+        let xdg_state = base.join("state");
+        let xdg_managed = xdg_state.join("spawn/claude-config");
+        std::fs::create_dir_all(&xdg_managed).expect("mkdir xdg managed");
+        std::fs::write(
+            xdg_managed.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"DoctorStateTok"}}"#,
+        )
+        .expect("write xdg settings");
+        let xdg_str = xdg_state.display().to_string();
+        let (default_present, warnings) = probe_claude_config_with(
+            &|key| match key {
+                "HOME" => Some(home.clone()),
+                "XDG_STATE_HOME" => Some(xdg_str.clone()),
+                _ => None,
+            },
+            None,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(default_present["source"], "default-isolated");
+        assert_eq!(
+            default_present["path"],
+            xdg_managed.display().to_string().as_str()
+        );
+        assert_eq!(default_present["isolated"], true);
+        assert_eq!(default_present["settings_json_present"], true);
+        assert!(!default_present.to_string().contains("DoctorStateTok"));
+
+        let (inherited, warnings) = probe_claude_config_with(
+            &|key| match key {
+                "HOME" => Some(home.clone()),
+                "SPAWN_CLAUDE_CONFIG_DIR" => Some("inherit".to_string()),
+                _ => None,
+            },
+            None,
+        );
+        assert_eq!(inherited["source"], "inherit");
+        assert_eq!(inherited["path"], format!("{home}/.claude").as_str());
+        assert_eq!(inherited["isolated"], false);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("drift"), "{warnings:?}");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 

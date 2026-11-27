@@ -99,7 +99,11 @@ fn the_default_profile_moves_only_the_small_model() {
     ] {
         assert_eq!(env[slot], "", "{slot}");
     }
-    assert_eq!(top_level_model(&settings), None, "{settings}");
+    assert_eq!(
+        top_level_model(&settings).as_deref(),
+        Some(""),
+        "{settings}"
+    );
     // The gateway's token comes from the user's own settings, which the
     // inline env merges over name by name: never set, so never emptied.
     assert!(
@@ -141,7 +145,11 @@ fn the_default_profile_pins_the_slots_the_relay_names() {
     };
     let settings = claude_settings(Some(&slots), ModelProfile::Default);
     let env = self::env(&settings).expect("an env");
-    assert_eq!(top_level_model(&settings), None, "{settings}");
+    assert_eq!(
+        top_level_model(&settings).as_deref(),
+        Some(""),
+        "{settings}"
+    );
     assert_eq!(env["ANTHROPIC_MODEL"], "", "{env:?}");
     assert_eq!(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-sonnet-5-5");
     assert_eq!(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-5-5");
@@ -189,11 +197,12 @@ fn the_cheap_profile_moves_every_slot() {
 }
 
 /// Issue #79: whenever an engine goes through a relay, its inline
-/// `--settings` names every model slot, for every profile and every mix of
-/// configured names. Claude Code merges inline `env` over the user's
-/// `~/.claude/settings.json` name by name, so a slot named here is one an
-/// ambient edit of that file (an Ark base URL and a raw provider model)
-/// cannot take over; the merge is modelled here as Claude Code does it.
+/// `--settings` names every model slot and pins top-level `"model"`, for
+/// every profile and every mix of configured names. Claude Code merges inline
+/// `env` and top-level keys over the user's `~/.claude/settings.json` name by
+/// name, so a slot (or top-level `"model"`) named here is one an ambient edit
+/// of that file (an Ark base URL and a raw provider model) cannot take over;
+/// the merge is modelled here as Claude Code does it.
 #[test]
 fn every_model_slot_is_pinned_so_the_host_settings_cannot_drift_them() {
     let ambient: serde_json::Map<String, Value> = [
@@ -227,6 +236,24 @@ fn every_model_slot_is_pinned_so_the_host_settings_cannot_drift_them() {
             for slot in MODEL_SLOTS {
                 assert!(pinned.contains_key(slot), "{slot} unpinned: {settings}");
             }
+            let expected_top = relay.main_model(profile).unwrap_or("");
+            assert_eq!(
+                top_level_model(&settings).as_deref(),
+                Some(expected_top),
+                "{settings}"
+            );
+            let settings_val: Value = serde_json::from_str(&settings).expect("settings are JSON");
+            let mut merged_top = json!({ "model": "kimi-k3-1-pro-261024" });
+            if let Some(obj) = settings_val.as_object() {
+                for (k, v) in obj {
+                    merged_top[k] = v.clone();
+                }
+            }
+            assert_ne!(
+                merged_top.get("model").and_then(Value::as_str),
+                Some("kimi-k3-1-pro-261024"),
+                "top-level model drifted: {merged_top}"
+            );
             let mut merged = ambient.clone();
             merged.extend(pinned.clone());
             assert_eq!(merged["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8791");

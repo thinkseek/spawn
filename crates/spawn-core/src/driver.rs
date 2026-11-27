@@ -216,8 +216,8 @@ pub struct EngineLaunch<'a> {
     pub relay: Option<&'a ModelRelay>,
     /// The models it runs on.
     pub profile: ModelProfile,
-    /// The engine's own configuration directory, when it is not the user's
-    /// default one (`CLAUDE_CONFIG_DIR` for Claude Code).
+    /// The engine's own configuration directory, when resolved (`CLAUDE_CONFIG_DIR`
+    /// for Claude Code — isolated by default, or overridden via `SPAWN_CLAUDE_CONFIG_DIR`).
     pub config_dir: Option<&'a str>,
     /// The directory it starts in (the workspace), which an engine that
     /// asks whether it trusts it is told it does (agy).

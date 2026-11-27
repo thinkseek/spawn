@@ -802,18 +802,19 @@ pub(crate) fn credentials_path() -> Option<String> {
 }
 
 /// [`credentials_path`] over the environment `lookup` reads, in the order
-/// the engines' directory is chosen (`runtime`): the engines' own
-/// (`$SPAWN_CLAUDE_CONFIG_DIR`, absolute), else `$CLAUDE_CONFIG_DIR`, else
-/// `$HOME/.claude`; `.credentials.json` in it.
+/// the engines' directory is chosen (`runtime`): `$SPAWN_CLAUDE_CONFIG_DIR`
+/// (absolute, or `inherit`/`host` for `~/.claude`), else ambient
+/// `$CLAUDE_CONFIG_DIR`, else the default managed isolated directory
+/// (`$SPAWN_CLAUDE_DATA_DIR/config`, `$XDG_STATE_HOME/spawn/claude-config`,
+/// or `$HOME/.local/state/spawn/claude-config`); `.credentials.json` in it.
 fn resolve_credentials_path(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
     let nonempty = |name: &str| lookup(name).filter(|value| !value.is_empty());
-    if let Ok(Some(dir)) = crate::runtime::claude_config_dir(nonempty) {
-        return Some(format!("{dir}/.credentials.json"));
+    match crate::runtime::claude_config_dir(nonempty) {
+        Ok(Some(dir)) => Some(format!("{dir}/.credentials.json")),
+        Ok(None) | Err(_) => {
+            nonempty("HOME").map(|home| format!("{home}/.claude/.credentials.json"))
+        }
     }
-    if let Some(dir) = nonempty("CLAUDE_CONFIG_DIR") {
-        return Some(format!("{dir}/.credentials.json"));
-    }
-    nonempty("HOME").map(|home| format!("{home}/.claude/.credentials.json"))
 }
 
 /// What the credentials file looked like: its path, modification time and
@@ -2885,6 +2886,20 @@ mod credentials_tests {
         let relative = lookup(&[("HOME", "/home/o"), ("SPAWN_CLAUDE_CONFIG_DIR", "fleet")]);
         assert_eq!(
             resolve_credentials_path(relative).as_deref(),
+            Some("/home/o/.claude/.credentials.json")
+        );
+        let default_isolated = lookup(&[("HOME", "/home/o")]);
+        assert_eq!(
+            resolve_credentials_path(default_isolated).as_deref(),
+            Some("/home/o/.local/state/spawn/claude-config/.credentials.json")
+        );
+        let inherited = lookup(&[
+            ("HOME", "/home/o"),
+            ("CLAUDE_CONFIG_DIR", "/cc"),
+            ("SPAWN_CLAUDE_CONFIG_DIR", "inherit"),
+        ]);
+        assert_eq!(
+            resolve_credentials_path(inherited).as_deref(),
             Some("/home/o/.claude/.credentials.json")
         );
         assert_eq!(resolve_credentials_path(lookup(&[])), None);

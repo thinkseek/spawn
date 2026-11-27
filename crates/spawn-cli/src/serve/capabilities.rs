@@ -303,7 +303,8 @@ fn view_now(engine: &str, home: &EngineHome) -> Boxed {
 
 /// The login files of `engine` this host would hold: Claude Code's
 /// `.credentials.json` in its configuration directory
-/// (`SPAWN_CLAUDE_CONFIG_DIR`, else `~/.claude`); agy's file-based login
+/// (`SPAWN_CLAUDE_CONFIG_DIR`, default managed isolated dir, or `~/.claude`
+/// when explicitly inherited); agy's file-based login
 /// token (`<agy home>/antigravity-oauth-token`, where agy 1.5.17 keeps it)
 /// and its home (`SPAWN_AGY_HOME`, else `~/.gemini/antigravity-cli`). Only
 /// their presence is ever read (`symlink_metadata`, never opened).
@@ -311,9 +312,10 @@ fn login_files(engine: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<Pat
     let home = PathBuf::from(lookup("HOME").unwrap_or_else(|| "/root".to_string()));
     match engine {
         DEFAULT => {
-            let dir = lookup("SPAWN_CLAUDE_CONFIG_DIR")
-                .filter(|dir| dir.starts_with('/'))
-                .map_or_else(|| home.join(".claude"), PathBuf::from);
+            let dir = match crate::runtime::claude_config_dir(lookup) {
+                Ok(Some(dir)) => PathBuf::from(dir),
+                _ => home.join(".claude"),
+            };
             vec![dir.join(".credentials.json")]
         }
         "agy" => {
@@ -919,10 +921,21 @@ mod tests {
         assert_eq!(
             *host.stat.borrow(),
             [
-                "/home/a/.claude/.credentials.json",
+                "/home/a/.local/state/spawn/claude-config/.credentials.json",
                 "/home/a/.gemini/antigravity-cli/antigravity-oauth-token",
                 "/home/a/.gemini/antigravity-cli",
             ]
+        );
+        let inherited_login = super::login_files("claude", &|key| match key {
+            "HOME" => Some("/home/a".to_string()),
+            "SPAWN_CLAUDE_CONFIG_DIR" => Some("inherit".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            inherited_login,
+            [std::path::PathBuf::from(
+                "/home/a/.claude/.credentials.json"
+            )]
         );
         let agy = &probe.engines[1];
         assert_eq!(agy.engine, "agy");
