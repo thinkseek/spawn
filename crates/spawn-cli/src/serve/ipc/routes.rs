@@ -413,22 +413,23 @@ fn handle_api_post(pattern: &str, id: &str, req: &IpcRequest, state: &IpcState) 
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IpcActBody {
+struct IpcPromptOption {
+    id: String,
+    action: approvals::ChoiceAction,
     #[serde(default)]
-    action: Option<String>,
-    #[serde(default)]
-    approval_id: Option<String>,
-    #[serde(default)]
-    choice_id: Option<String>,
-    #[serde(default)]
-    keys: Option<Vec<String>>,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    key: Option<String>,
-    #[serde(default)]
-    probe: bool,
+    keys: Vec<String>,
+}
+
+impl IpcPromptOption {
+    fn into_choice(self) -> Result<approvals::Choice, (u16, String)> {
+        Ok(approvals::Choice {
+            id: self.id,
+            label: String::new(),
+            keys: approvals::parse_option_keys(&self.keys)?,
+            danger: false,
+            action: self.action,
+        })
+    }
 }
 
 fn apply_approval_act(
@@ -437,13 +438,22 @@ fn apply_approval_act(
     header_key: Option<String>,
     state: &IpcState,
 ) -> Result<(u16, Value), (u16, String)> {
-    let body: IpcActBody = serde_json::from_slice(raw_body)
-        .map_err(|error| (400, format!("{BAD_REQUEST}the body is not an act: {error}")))?;
+    let req = approvals::ActRequest::parse(raw_body)?;
     let session = serve::session_id(id).map_err(|error| (400, error))?;
-    if body.probe {
-        return probe_approval_act(&body, &session, state);
-    }
-    let key = serve::idempotency(body.key, header_key, "an act")?;
+    let (body_key, act) = match req {
+        approvals::ActRequest::Probe => {
+            if header_key.is_some() {
+                return Err((
+                    400,
+                    format!("{BAD_REQUEST}{}", approvals::PROBE_EXTRA_FIELDS),
+                ));
+            }
+            let _ = state.pools.human.checkout().map_err(|e| (500, e))?;
+            return Ok((200, approvals::probe_response(&session, MAX_INPUT_TEXT)));
+        }
+        approvals::ActRequest::Perform { key, act } => (key, act),
+    };
+    let key = serve::idempotency(body_key, header_key, "an act")?;
     if key.as_str().len() > spawn_postgres::MAX_MASTER_KEY_BYTES {
         return Err((
             400,
@@ -453,73 +463,14 @@ fn apply_approval_act(
             ),
         ));
     }
-    let action = body
-        .action
-        .ok_or_else(|| (400, format!("{BAD_REQUEST}an act names its action")))?;
-    let sending = if body.approval_id.is_some()
-        || matches!(action.as_str(), "allow" | "allow_always" | "deny")
-    {
-        resolve_prompt_act(
-            &session,
-            &action,
-            body.approval_id.as_deref(),
-            body.choice_id.as_deref(),
-            body.keys.as_deref(),
-            body.text.as_deref(),
-            state,
-        )?
-    } else {
-        let asked = approvals::Asked {
-            action: action.clone(),
-            approval_id: None,
-            choice_id: body.choice_id,
-            keys: body.keys,
-            text: body.text,
-        };
-        approvals::what_to_send(asked, &session, &|_| Ok(None))?
-    };
-    submit_approval_sending(&session, &action, &key, sending, state)
-}
-
-fn probe_approval_act(
-    body: &IpcActBody,
-    session: &SessionId,
-    state: &IpcState,
-) -> Result<(u16, Value), (u16, String)> {
-    if body.action.is_some()
-        || body.approval_id.is_some()
-        || body.choice_id.is_some()
-        || body.keys.is_some()
-        || body.text.is_some()
-        || body.key.is_some()
-    {
-        return Err((
-            400,
-            format!("{BAD_REQUEST}a probe carries no action, approval, choice, keys, text or key"),
-        ));
-    }
-    let _ = state.pools.human.checkout().map_err(|e| (500, e))?;
-    let keys: Vec<_> = spawn_core::command::NamedKey::ALL
-        .iter()
-        .copied()
-        .map(spawn_core::command::NamedKey::name)
-        .collect();
-    Ok((
-        200,
-        json!({
-            "writable": true,
-            "session_id": session.as_str(),
-            "actions": ["allow", "allow_always", "deny", "keys", "text"],
-            "keys": keys,
-            "max_keys": 8,
-            "max_text_bytes": MAX_INPUT_TEXT,
-        }),
-    ))
+    let action = act.action_name();
+    let sending = resolve_ipc_act(act, &session, state)?;
+    submit_approval_sending(&session, action, &key, sending, state)
 }
 
 fn submit_approval_sending(
     session: &SessionId,
-    action: &str,
+    action: &'static str,
     key: &IdempotencyKey,
     sending: approvals::Send,
     state: &IpcState,
@@ -581,50 +532,12 @@ fn submit_approval_sending(
     ))
 }
 
-fn parse_named_keys(names: &[String]) -> Result<Vec<spawn_core::command::NamedKey>, (u16, String)> {
-    names
-        .iter()
-        .map(|n| {
-            spawn_core::command::NamedKey::from_name(n)
-                .map_err(|e| (400, format!("{BAD_REQUEST}{e}")))
-        })
-        .collect()
-}
-
-fn parse_option_keys(opt: &Value) -> Result<Vec<spawn_core::command::NamedKey>, (u16, String)> {
-    let names: Vec<String> = opt["keys"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect();
-    parse_named_keys(&names)
-}
-
-fn resolve_prompt_act(
+fn load_ipc_prompt_choices(
     session: &SessionId,
-    action: &str,
-    approval_id: Option<&str>,
-    choice_id: Option<&str>,
-    keys: Option<&[String]>,
-    text: Option<&str>,
+    wanted: &str,
+    doing: &str,
     state: &IpcState,
-) -> Result<approvals::Send, (u16, String)> {
-    if action != "keys" && (keys.is_some() || text.is_some()) {
-        return Err((
-            400,
-            format!("{BAD_REQUEST}{action} carries no keys and no text"),
-        ));
-    }
-    let wanted = approval_id.ok_or_else(|| {
-        (
-            400,
-            format!(
-                "{BAD_REQUEST}{action} names the approval it answers (\"approval_id\", the item's id from GET /api/approvals)"
-            ),
-        )
-    })?;
+) -> Result<Vec<approvals::Choice>, (u16, String)> {
     let payload =
         serve::with_reader_url(&state.urls.reader, approvals::approvals).map_err(|e| (500, e))?;
     let item = payload["items"]
@@ -637,7 +550,7 @@ fn resolve_prompt_act(
             (
                 409,
                 format!(
-                    "no approval prompt shows on {} now: nothing to {action}",
+                    "no approval prompt shows on {} now: nothing to {doing}",
                     session.as_str()
                 ),
             )
@@ -652,78 +565,57 @@ fn resolve_prompt_act(
             ),
         ));
     }
-    let options = item["options"].as_array().cloned().unwrap_or_default();
-    if let Some(cid) = choice_id {
-        return resolve_prompt_choice(session, action, cid, keys, &options);
-    }
-    if action == "keys" {
-        let asked_keys =
-            keys.ok_or_else(|| (400, format!("{BAD_REQUEST}keys names 1 to 8 keys")))?;
-        if asked_keys.is_empty() || asked_keys.len() > 8 {
-            return Err((400, format!("{BAD_REQUEST}keys names 1 to 8 keys")));
-        }
-        return Ok(approvals::Send::Keys(parse_named_keys(asked_keys)?));
-    }
-    let matching: Vec<_> = options
-        .iter()
-        .filter(|opt| opt["action"].as_str() == Some(action))
-        .collect();
-    if matching.is_empty() {
-        return Err((
-            409,
-            format!(
-                "the prompt on {} offers no {action} answer",
-                session.as_str()
-            ),
-        ));
-    }
-    if matching.len() > 1 {
-        return Err((
-            409,
-            format!(
-                "the prompt on {} offers more than one {action} answer: name the one meant (\"choice_id\", the option's id from GET /api/approvals); nothing pressed",
-                session.as_str()
-            ),
-        ));
-    }
-    Ok(approvals::Send::Keys(parse_option_keys(matching[0])?))
+    item["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|opt| serde_json::from_value::<IpcPromptOption>(opt.clone()).ok())
+        .map(IpcPromptOption::into_choice)
+        .collect()
 }
 
-fn resolve_prompt_choice(
+fn resolve_ipc_act(
+    act: approvals::Act,
     session: &SessionId,
-    action: &str,
-    cid: &str,
-    keys: Option<&[String]>,
-    options: &[Value],
+    state: &IpcState,
 ) -> Result<approvals::Send, (u16, String)> {
-    let matched = options
-        .iter()
-        .find(|opt| {
-            opt["id"].as_str() == Some(cid)
-                && (action == "keys" || opt["action"].as_str() == Some(action))
-        })
-        .ok_or_else(|| {
-            (
-                409,
-                format!(
-                    "the prompt on {} offers no answer {cid:?} for {action}: nothing pressed; read GET /api/approvals again",
-                    session.as_str()
-                ),
-            )
-        })?;
-    let parsed = parse_option_keys(matched)?;
-    if let Some(given_keys) = keys
-        && parse_named_keys(given_keys)? != parsed
-    {
-        return Err((
-            409,
-            format!(
-                "answer {cid:?} on {} is not pressed with those keys any more: nothing pressed; read GET /api/approvals again",
-                session.as_str()
-            ),
-        ));
+    let answer_prompt = |action: approvals::ChoiceAction, answer: approvals::Answer| {
+        let choices =
+            load_ipc_prompt_choices(session, &answer.approval_id, action.as_str(), state)?;
+        approvals::answer_keys(&choices, session, action, answer.choice_id.as_deref())
+            .map(approvals::Send::Keys)
+    };
+    match act {
+        approvals::Act::Allow(answer) => answer_prompt(approvals::ChoiceAction::Allow, answer),
+        approvals::Act::AllowAlways(answer) => {
+            answer_prompt(approvals::ChoiceAction::AllowAlways, answer)
+        }
+        approvals::Act::Deny(answer) => answer_prompt(approvals::ChoiceAction::Deny, answer),
+        approvals::Act::Keys(keys) => match keys {
+            approvals::KeysAct::Bare { keys } => Ok(approvals::Send::Keys(keys)),
+            approvals::KeysAct::ForApproval { approval_id, keys } => {
+                let _ = load_ipc_prompt_choices(session, &approval_id, "press", state)?;
+                Ok(approvals::Send::Keys(keys))
+            }
+            approvals::KeysAct::ForChoice {
+                approval_id,
+                choice_id,
+                expected_keys,
+            } => {
+                let choices = load_ipc_prompt_choices(session, &approval_id, "press", state)?;
+                approvals::choice_keys_checked(
+                    &choices,
+                    session,
+                    &choice_id,
+                    expected_keys.as_deref(),
+                )
+                .map(approvals::Send::Keys)
+            }
+        },
+        text_act @ approvals::Act::Text { .. } => {
+            approvals::what_to_send(text_act, session, &|_| Ok(None))
+        }
     }
-    Ok(approvals::Send::Keys(parsed))
 }
 
 #[cfg(test)]

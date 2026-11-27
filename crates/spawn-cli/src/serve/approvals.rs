@@ -117,6 +117,28 @@ pub(super) const MAX_KEYS: usize = 8;
 /// found is an `attention` item.
 pub(super) const ATTENTION_NEEDS_HUMAN: f64 = 0.7;
 
+/// Closed action kind of a detected prompt [`Choice`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ChoiceAction {
+    Allow,
+    AllowAlways,
+    Deny,
+    Keys,
+}
+
+impl ChoiceAction {
+    /// Canonical wire name of this action.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::AllowAlways => "allow_always",
+            Self::Deny => "deny",
+            Self::Keys => "keys",
+        }
+    }
+}
+
 /// One answer a prompt offers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Choice {
@@ -124,8 +146,7 @@ pub(crate) struct Choice {
     pub(crate) label: String,
     pub(crate) keys: Vec<NamedKey>,
     pub(crate) danger: bool,
-    /// `allow`, `allow_always`, `deny`, or `keys` for any other.
-    pub(crate) action: &'static str,
+    pub(crate) action: ChoiceAction,
 }
 
 /// A prompt found on a pane.
@@ -361,7 +382,7 @@ fn has_word(text: &str, phrase: &str) -> bool {
 /// yes, allow, approve, proceed, accept, ok or okay), else `keys`. "Node
 /// 18", "Normal mode", "Okta login", "Runtime only" and "Continue without
 /// saving" are none of them.
-fn action_of(label: &str) -> &'static str {
+fn action_of(label: &str) -> ChoiceAction {
     let lower = label.to_lowercase();
     let first = words(&lower).into_iter().next().unwrap_or_default();
     let always = [
@@ -375,15 +396,15 @@ fn action_of(label: &str) -> &'static str {
     .iter()
     .any(|phrase| has_word(&lower, phrase));
     if always {
-        "allow_always"
+        ChoiceAction::AllowAlways
     } else if ["no", "deny", "reject", "cancel", "decline", "abort"].contains(&first.as_str()) {
-        "deny"
+        ChoiceAction::Deny
     } else if ["yes", "allow", "approve", "proceed", "accept", "ok", "okay"]
         .contains(&first.as_str())
     {
-        "allow"
+        ChoiceAction::Allow
     } else {
-        "keys"
+        ChoiceAction::Keys
     }
 }
 
@@ -391,7 +412,7 @@ fn action_of(label: &str) -> &'static str {
 /// command, bypassing permissions): the page asks again before it.
 fn dangerous(label: &str) -> bool {
     let lower = label.to_lowercase();
-    action_of(label) == "allow_always"
+    action_of(label) == ChoiceAction::AllowAlways
         || has_word(&lower, "bypass")
         || has_word(&lower, "skip permissions")
         || has_word(&lower, "dangerously")
@@ -516,7 +537,9 @@ fn numbered_prompt(lines: &[&str]) -> Option<Prompt> {
         .map(|(_, digit, _, _)| format!("choice{digit}"));
     let asked = question_at(lines, first);
     let summary = question(lines, first);
-    let permission = choices.iter().any(|choice| choice.action != "keys");
+    let permission = choices
+        .iter()
+        .any(|choice| choice.action != ChoiceAction::Keys);
     Some(Prompt {
         kind: if permission { "permission" } else { "choice" },
         label: summary
@@ -554,7 +577,7 @@ fn button_prompt(lines: &[&str]) -> Option<Prompt> {
         label: "Allow once".to_string(),
         keys: vec![NamedKey::Enter],
         danger: false,
-        action: "allow",
+        action: ChoiceAction::Allow,
     }];
     if window.contains("always allow") || window.contains("allow always") {
         choices.push(Choice {
@@ -562,7 +585,7 @@ fn button_prompt(lines: &[&str]) -> Option<Prompt> {
             label: "Always allow".to_string(),
             keys: vec![NamedKey::Right, NamedKey::Enter],
             danger: true,
-            action: "allow_always",
+            action: ChoiceAction::AllowAlways,
         });
     }
     choices.push(Choice {
@@ -575,7 +598,7 @@ fn button_prompt(lines: &[&str]) -> Option<Prompt> {
         .to_string(),
         keys: vec![NamedKey::Escape],
         danger: false,
-        action: "deny",
+        action: ChoiceAction::Deny,
     });
     let summary = question(lines, at);
     Some(Prompt {
@@ -611,14 +634,14 @@ fn yes_no_prompt(lines: &[&str]) -> Option<Prompt> {
                 label: "Yes".to_string(),
                 keys: vec![NamedKey::Y, NamedKey::Enter],
                 danger: false,
-                action: "allow",
+                action: ChoiceAction::Allow,
             },
             Choice {
                 id: "no".to_string(),
                 label: "No".to_string(),
                 keys: vec![NamedKey::N, NamedKey::Enter],
                 danger: false,
-                action: "deny",
+                action: ChoiceAction::Deny,
             },
         ],
         cursor: None,
@@ -646,7 +669,7 @@ fn confirm_prompt(lines: &[&str]) -> Option<Prompt> {
         label: "Confirm (Enter)".to_string(),
         keys: vec![NamedKey::Enter],
         danger: false,
-        action: "allow",
+        action: ChoiceAction::Allow,
     }];
     if has_word(&lower, "esc") {
         choices.push(Choice {
@@ -654,7 +677,7 @@ fn confirm_prompt(lines: &[&str]) -> Option<Prompt> {
             label: "Cancel (Esc)".to_string(),
             keys: vec![NamedKey::Escape],
             danger: false,
-            action: "deny",
+            action: ChoiceAction::Deny,
         });
     }
     let summary = question(lines, at);
@@ -943,38 +966,217 @@ fn prompt_now(session: &SessionId) -> Result<Option<Prompt>, String> {
     Ok(live_tail(&store, &host, session, &agent)?.and_then(|tail| detect(&tail)))
 }
 
-/// The body of `POST /api/approvals/<session_id>/act`.
+/// Target prompt & optional button selection for `allow`, `allow_always`, or `deny`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Answer {
+    pub(super) approval_id: String,
+    #[serde(default)]
+    pub(super) choice_id: Option<String>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ActBody {
-    #[serde(default)]
-    action: Option<String>,
+struct RawKeysAct {
     #[serde(default)]
     approval_id: Option<String>,
     #[serde(default)]
     choice_id: Option<String>,
     #[serde(default)]
     keys: Option<Vec<String>>,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    key: Option<String>,
-    #[serde(default)]
-    probe: bool,
 }
 
-/// What a person asked an act to do, from its body.
-#[derive(Debug, Clone, Default)]
-pub(super) struct Asked {
-    pub(super) action: String,
-    /// The `id` of the item the page showed (`GET /api/approvals`): needed
-    /// for an answer of the prompt (`allow`, `allow_always`, `deny`).
-    pub(super) approval_id: Option<String>,
-    /// The `id` of the option the page's button stood for (`options[].id`):
-    /// the answer pressed is that one, never another of the same action.
-    pub(super) choice_id: Option<String>,
-    pub(super) keys: Option<Vec<String>>,
-    pub(super) text: Option<String>,
+/// Closed 3-variant sub-state for `"action": "keys"` (`choice_id` without
+/// `approval_id` and empty/missing bare `keys` are unrepresentable).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "RawKeysAct")]
+pub(super) enum KeysAct {
+    Bare {
+        keys: Vec<NamedKey>,
+    },
+    ForApproval {
+        approval_id: String,
+        keys: Vec<NamedKey>,
+    },
+    ForChoice {
+        approval_id: String,
+        choice_id: String,
+        expected_keys: Option<Vec<NamedKey>>,
+    },
+}
+
+impl TryFrom<RawKeysAct> for KeysAct {
+    type Error = String;
+
+    fn try_from(raw: RawKeysAct) -> Result<Self, Self::Error> {
+        let parsed = raw.keys.as_deref().map(validate_named_keys).transpose()?;
+        match (raw.approval_id, raw.choice_id, parsed) {
+            (None, None, Some(keys)) => Ok(Self::Bare { keys }),
+            (Some(approval_id), None, Some(keys)) => Ok(Self::ForApproval { approval_id, keys }),
+            (Some(approval_id), Some(choice_id), expected_keys) => Ok(Self::ForChoice {
+                approval_id,
+                choice_id,
+                expected_keys,
+            }),
+            (None, Some(_), _) => Err(
+                "a choice_id names an option of an approval: give its \"approval_id\" too"
+                    .to_string(),
+            ),
+            (_, None, None) => Err(format!("keys names 1 to {MAX_KEYS} keys")),
+        }
+    }
+}
+
+fn validate_named_keys(names: &[String]) -> Result<Vec<NamedKey>, String> {
+    if names.is_empty() || names.len() > MAX_KEYS {
+        return Err(format!("keys names 1 to {MAX_KEYS} keys"));
+    }
+    names.iter().map(|name| NamedKey::from_name(name)).collect()
+}
+
+/// Parse a prompt option's wire `keys` array into typed [`NamedKey`] values.
+pub(super) fn parse_option_keys(names: &[String]) -> Result<Vec<NamedKey>, (u16, String)> {
+    names
+        .iter()
+        .map(|name| {
+            NamedKey::from_name(name).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))
+        })
+        .collect()
+}
+
+/// Closed 5-variant ADT for a non-probe approval act (`POST /api/approvals/<id>/act`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum Act {
+    Allow(Answer),
+    AllowAlways(Answer),
+    Deny(Answer),
+    Keys(KeysAct),
+    Text { text: String },
+}
+
+impl Act {
+    /// Canonical wire name for the `202` response `"action"` field.
+    pub(super) const fn action_name(&self) -> &'static str {
+        match self {
+            Self::Allow(_) => ChoiceAction::Allow.as_str(),
+            Self::AllowAlways(_) => ChoiceAction::AllowAlways.as_str(),
+            Self::Deny(_) => ChoiceAction::Deny.as_str(),
+            Self::Keys(_) => ChoiceAction::Keys.as_str(),
+            Self::Text { .. } => "text",
+        }
+    }
+}
+
+/// Probe extra-field rejection message shared with IPC handlers.
+pub(super) const PROBE_EXTRA_FIELDS: &str =
+    "a probe carries no action, approval, choice, keys, text or key";
+
+/// JSON response payload returned for a valid writable probe.
+pub(super) fn probe_response(session: &SessionId, max_text_bytes: usize) -> Value {
+    json!({
+        "writable": true,
+        "session_id": session.as_str(),
+        "actions": ["allow", "allow_always", "deny", "keys", "text"],
+        "keys": NamedKey::ALL.iter().map(|key| key.name()).collect::<Vec<_>>(),
+        "max_keys": MAX_KEYS,
+        "max_text_bytes": max_text_bytes,
+    })
+}
+
+struct UniqueObject(serde_json::Map<String, Value>);
+
+impl<'de> serde::Deserialize<'de> for UniqueObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct MapVisitor;
+        impl<'de> serde::de::Visitor<'de> for MapVisitor {
+            type Value = UniqueObject;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut map = serde_json::Map::new();
+                while let Some((key, value)) = access.next_entry::<String, Value>()? {
+                    if map.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format_args!(
+                            "duplicate field `{key}`"
+                        )));
+                    }
+                    map.insert(key, value);
+                }
+                Ok(UniqueObject(map))
+            }
+        }
+        deserializer.deserialize_map(MapVisitor)
+    }
+}
+
+/// Closed top-level envelope ADT for `POST /api/approvals/<session_id>/act`:
+/// either a permission probe or a typed [`Act`] with optional body idempotency `key`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ActRequest {
+    Probe,
+    Perform { key: Option<String>, act: Act },
+}
+
+impl ActRequest {
+    /// Parse raw JSON into a closed [`ActRequest`], stripping envelope control
+    /// fields (`probe`, `key`) first so `Act` can deserialize directly with
+    /// `#[serde(tag = "action", deny_unknown_fields)]`.
+    pub(super) fn parse(raw_body: &[u8]) -> Result<Self, (u16, String)> {
+        let bad = |why: String| (400, format!("{BAD_REQUEST}{why}"));
+        let UniqueObject(mut map) = serde_json::from_slice(raw_body)
+            .map_err(|error| bad(format!("the body is not an act: {error}")))?;
+        let probe = match map.remove("probe") {
+            None => false,
+            Some(Value::Bool(flag)) => flag,
+            Some(_) => {
+                return Err(bad(
+                    "the body is not an act: invalid type for `probe`, expected boolean"
+                        .to_string(),
+                ));
+            }
+        };
+        let key = match map.remove("key") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value),
+            Some(_) => {
+                return Err(bad(
+                    "the body is not an act: invalid type for `key`, expected string".to_string(),
+                ));
+            }
+        };
+        if probe {
+            const ALLOWED_PROBE_NULLS: [&str; 5] =
+                ["action", "approval_id", "choice_id", "keys", "text"];
+            if let Some(unknown) = map
+                .keys()
+                .find(|name| !ALLOWED_PROBE_NULLS.contains(&name.as_str()))
+            {
+                return Err(bad(format!(
+                    "the body is not an act: unknown field `{unknown}`"
+                )));
+            }
+            if key.is_some() || map.values().any(|value| !value.is_null()) {
+                return Err(bad(PROBE_EXTRA_FIELDS.to_string()));
+            }
+            return Ok(Self::Probe);
+        }
+        if map.get("action").is_none_or(Value::is_null) {
+            return Err(bad("an act names its action".to_string()));
+        }
+        let act: Act = serde_json::from_value(Value::Object(map))
+            .map_err(|error| bad(format!("the body is not an act: {error}")))?;
+        Ok(Self::Perform { key, act })
+    }
 }
 
 /// What an act sends: keys, or a text.
@@ -1051,33 +1253,29 @@ fn no_choice(session: &SessionId, choice: &str, doing: &str) -> (u16, String) {
     )
 }
 
-/// The keys of `action` (allow, allow_always, deny) on the prompt shown:
-/// the option `choice_id` names, which must be of that action, else the
-/// one option of that action (409 when there is none, or several: name
-/// the one meant).
-fn answer_keys(
-    shown: &Prompt,
+/// Keys of `action` (`allow`, `allow_always`, `deny`) on `choices`: the option
+/// `choice_id` names (which must match `action`), else the unique option of
+/// that action (`409` when absent or ambiguous).
+pub(super) fn answer_keys(
+    choices: &[Choice],
     session: &SessionId,
-    action: &str,
-    choice_id: Option<String>,
+    action: ChoiceAction,
+    choice_id: Option<&str>,
 ) -> Result<Vec<NamedKey>, (u16, String)> {
+    let doing = action.as_str();
     if let Some(choice_id) = choice_id {
-        return shown
-            .choices
+        return choices
             .iter()
             .find(|choice| choice.id == choice_id && choice.action == action)
             .map(|choice| choice.keys.clone())
-            .ok_or_else(|| no_choice(session, &choice_id, action));
+            .ok_or_else(|| no_choice(session, choice_id, doing));
     }
-    let mut matching = shown
-        .choices
-        .iter()
-        .filter(|choice| choice.action == action);
+    let mut matching = choices.iter().filter(|choice| choice.action == action);
     let choice = matching.next().ok_or_else(|| {
         (
             409,
             format!(
-                "the prompt on {} offers no {action} answer",
+                "the prompt on {} offers no {doing} answer",
                 session.as_str()
             ),
         )
@@ -1086,7 +1284,7 @@ fn answer_keys(
         return Err((
             409,
             format!(
-                "the prompt on {} offers more than one {action} answer: name the one meant \
+                "the prompt on {} offers more than one {doing} answer: name the one meant \
                  (\"choice_id\", the option's id from GET /api/approvals); nothing pressed",
                 session.as_str()
             ),
@@ -1095,51 +1293,19 @@ fn answer_keys(
     Ok(choice.keys.clone())
 }
 
-/// What a `keys` act sends: the named keys given, read from no pane; or,
-/// for an approval (`approval_id`, needed with a `choice_id`), only while
-/// that prompt shows, and with a `choice_id` that option's keys (any keys
-/// given must be the same).
-fn keys_to_send(
-    asked: Asked,
+/// Resolve keys for an explicit `choice_id` under `"keys"`, enforcing option
+/// existence and any caller-supplied `expected_keys`.
+pub(super) fn choice_keys_checked(
+    choices: &[Choice],
     session: &SessionId,
-    prompt: &dyn Fn(&SessionId) -> Result<Option<Prompt>, String>,
-) -> Result<Send, (u16, String)> {
-    let bad = |why: String| (400, format!("{BAD_REQUEST}{why}"));
-    let count = || bad(format!("keys names 1 to {MAX_KEYS} keys"));
-    if asked.text.is_some() {
-        return Err(bad("keys carries no text".to_string()));
-    }
-    let given = match &asked.keys {
-        Some(keys) if keys.is_empty() || keys.len() > MAX_KEYS => return Err(count()),
-        Some(keys) => Some(
-            keys.iter()
-                .map(|name| NamedKey::from_name(name).map_err(&bad))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        None => None,
-    };
-    let Some(wanted) = asked.approval_id else {
-        if asked.choice_id.is_some() {
-            return Err(bad(
-                "a choice_id names an option of an approval: give its \"approval_id\" too"
-                    .to_string(),
-            ));
-        }
-        return given.map(Send::Keys).ok_or_else(count);
-    };
-    if asked.choice_id.is_none() && given.is_none() {
-        return Err(count());
-    }
-    let shown = showing(session, prompt, &wanted, "press")?;
-    let Some(choice_id) = asked.choice_id else {
-        return given.map(Send::Keys).ok_or_else(count);
-    };
-    let choice = shown
-        .choices
+    choice_id: &str,
+    expected_keys: Option<&[NamedKey]>,
+) -> Result<Vec<NamedKey>, (u16, String)> {
+    let choice = choices
         .iter()
         .find(|choice| choice.id == choice_id)
-        .ok_or_else(|| no_choice(session, &choice_id, "keys"))?;
-    if given.as_ref().is_some_and(|given| *given != choice.keys) {
+        .ok_or_else(|| no_choice(session, choice_id, ChoiceAction::Keys.as_str()))?;
+    if expected_keys.is_some_and(|given| given != choice.keys) {
         return Err((
             409,
             format!(
@@ -1149,52 +1315,103 @@ fn keys_to_send(
             ),
         ));
     }
-    Ok(Send::Keys(choice.keys.clone()))
+    Ok(choice.keys.clone())
 }
 
-/// What `asked` sends, `prompt` reading the pane when the action names an
-/// answer of its prompt: that answer is pressed only when the prompt
-/// showing now is the item the page showed (its `approval_id`), so a click
-/// on a prompt since answered or replaced presses nothing (409). With a
-/// `choice_id` the answer is that option of the prompt, and it must be of
-/// the action asked (409 otherwise); without one, an action two options
-/// share (three "Yes" lines) is ambiguous, 409, and nothing is pressed.
-/// `keys` with an `approval_id` is guarded the same way ([`keys_to_send`]).
-/// Bare `keys` and `text` read no pane.
-pub(super) fn what_to_send(
-    asked: Asked,
+fn keys_to_send(
+    keys: KeysAct,
     session: &SessionId,
     prompt: &dyn Fn(&SessionId) -> Result<Option<Prompt>, String>,
 ) -> Result<Send, (u16, String)> {
-    let bad = |why: String| (400, format!("{BAD_REQUEST}{why}"));
-    match asked.action.as_str() {
-        action @ ("allow" | "allow_always" | "deny") => {
-            if asked.keys.is_some() || asked.text.is_some() {
-                return Err(bad(format!("{action} carries no keys and no text")));
-            }
-            let wanted = asked.approval_id.as_deref().ok_or_else(|| {
-                bad(format!(
-                    "{action} names the approval it answers (\"approval_id\", the item's id \
-                     from GET /api/approvals)"
-                ))
-            })?;
-            let shown = showing(session, prompt, wanted, action)?;
-            answer_keys(&shown, session, action, asked.choice_id).map(Send::Keys)
+    match keys {
+        KeysAct::Bare { keys } => Ok(Send::Keys(keys)),
+        KeysAct::ForApproval { approval_id, keys } => {
+            let _ = showing(session, prompt, &approval_id, "press")?;
+            Ok(Send::Keys(keys))
         }
-        "keys" => keys_to_send(asked, session, prompt),
-        "text" => {
-            if asked.keys.is_some() {
-                return Err(bad("text carries no keys".to_string()));
-            }
-            if asked.choice_id.is_some() {
-                return Err(bad("text carries no choice_id".to_string()));
-            }
-            typed_text(asked.text).map(Send::Text).map_err(bad)
+        KeysAct::ForChoice {
+            approval_id,
+            choice_id,
+            expected_keys,
+        } => {
+            let shown = showing(session, prompt, &approval_id, "press")?;
+            choice_keys_checked(
+                &shown.choices,
+                session,
+                &choice_id,
+                expected_keys.as_deref(),
+            )
+            .map(Send::Keys)
         }
-        other => Err(bad(format!(
-            "action {other:?} is not one of allow, allow_always, deny, keys, text"
-        ))),
     }
+}
+
+/// What `act` sends, `prompt` reading the pane when the action names an
+/// answer of its prompt: pressed only when the prompt showing now has that
+/// `approval_id` (409 otherwise). Bare `keys` and `text` read no pane.
+pub(super) fn what_to_send(
+    act: Act,
+    session: &SessionId,
+    prompt: &dyn Fn(&SessionId) -> Result<Option<Prompt>, String>,
+) -> Result<Send, (u16, String)> {
+    let answer_prompt = |action: ChoiceAction, answer: Answer| {
+        let shown = showing(session, prompt, &answer.approval_id, action.as_str())?;
+        answer_keys(&shown.choices, session, action, answer.choice_id.as_deref()).map(Send::Keys)
+    };
+    match act {
+        Act::Allow(answer) => answer_prompt(ChoiceAction::Allow, answer),
+        Act::AllowAlways(answer) => answer_prompt(ChoiceAction::AllowAlways, answer),
+        Act::Deny(answer) => answer_prompt(ChoiceAction::Deny, answer),
+        Act::Keys(keys) => keys_to_send(keys, session, prompt),
+        Act::Text { text } => typed_text(Some(text))
+            .map(Send::Text)
+            .map_err(|why| (400, format!("{BAD_REQUEST}{why}"))),
+    }
+}
+
+fn submit_sending(
+    store: &spawn_postgres::PostgresStore,
+    session: &SessionId,
+    key: &IdempotencyKey,
+    sending: &Send,
+) -> Result<Vec<u64>, (u16, String)> {
+    let no_agent = || {
+        (
+            404,
+            format!(
+                "no agent has used {}: there is nothing to answer",
+                session.as_str()
+            ),
+        )
+    };
+    let mut ids = Vec::new();
+    match sending {
+        Send::Keys(keys) => {
+            for (at, name) in keys.iter().enumerate() {
+                let derived = IdempotencyKey::new(format!("{}:{}", key.as_str(), at + 1))
+                    .map_err(|error| (400, format!("{BAD_REQUEST}the key: {error}")))?;
+                match store.submit_human_key(session, &derived, *name) {
+                    Ok(spawn_postgres::HumanKey::Submitted(command)) => ids.push(command.0),
+                    Ok(spawn_postgres::HumanKey::NoAgent) => return Err(no_agent()),
+                    Ok(
+                        spawn_postgres::HumanKey::NotRunning(why)
+                        | spawn_postgres::HumanKey::KeyUsed(why),
+                    ) => return Err((409, why)),
+                    Err(error) => return Err((500, error.to_string())),
+                }
+            }
+        }
+        Send::Text(text) => match store.submit_human_input(session, key, text) {
+            Ok(spawn_postgres::HumanInput::Submitted(command)) => ids.push(command.0),
+            Ok(spawn_postgres::HumanInput::NoAgent) => return Err(no_agent()),
+            Ok(
+                spawn_postgres::HumanInput::NotRunning(why)
+                | spawn_postgres::HumanInput::KeyUsed(why),
+            ) => return Err((409, why)),
+            Err(error) => return Err((500, error.to_string())),
+        },
+    }
+    Ok(ids)
 }
 
 /// The checks of an act after its method, then the commands.
@@ -1206,35 +1423,19 @@ pub(super) fn acted(
     prompt: &dyn Fn(&SessionId) -> Result<Option<Prompt>, String>,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "an act")?;
-    let body: ActBody = serde_json::from_slice(&body)
-        .map_err(|error| (400, format!("{BAD_REQUEST}the body is not an act: {error}")))?;
+    let req = ActRequest::parse(&body)?;
     let session = session_id(id).map_err(|error| (400, error))?;
-    if body.probe {
-        if body.action.is_some()
-            || body.approval_id.is_some()
-            || body.choice_id.is_some()
-            || body.keys.is_some()
-            || body.text.is_some()
-            || body.key.is_some()
-            || header_key.is_some()
-        {
-            return Err((
-                400,
-                format!(
-                    "{BAD_REQUEST}a probe carries no action, approval, choice, keys, text or key"
-                ),
-            ));
+    let (body_key, act) = match req {
+        ActRequest::Probe => {
+            if header_key.is_some() {
+                return Err((400, format!("{BAD_REQUEST}{PROBE_EXTRA_FIELDS}")));
+            }
+            writer(shared).map_err(|error| (500, error))?;
+            return Ok((200, probe_response(&session, super::MAX_INPUT_TEXT)));
         }
-        writer(shared).map_err(|error| (500, error))?;
-        return Ok((
-            200,
-            json!({ "writable": true, "session_id": session.as_str(),
-                    "actions": ["allow", "allow_always", "deny", "keys", "text"],
-                    "keys": NamedKey::ALL.iter().map(|key| key.name()).collect::<Vec<_>>(),
-                    "max_keys": MAX_KEYS, "max_text_bytes": super::MAX_INPUT_TEXT }),
-        ));
-    }
-    let key = idempotency(body.key, header_key, "an act")?;
+        ActRequest::Perform { key, act } => (key, act),
+    };
+    let key = idempotency(body_key, header_key, "an act")?;
     if key.as_str().len() > spawn_postgres::MAX_MASTER_KEY_BYTES {
         return Err((
             400,
@@ -1244,54 +1445,10 @@ pub(super) fn acted(
             ),
         ));
     }
-    let action = body
-        .action
-        .ok_or_else(|| (400, format!("{BAD_REQUEST}an act names its action")))?;
-    let asked = Asked {
-        action: action.clone(),
-        approval_id: body.approval_id,
-        choice_id: body.choice_id,
-        keys: body.keys,
-        text: body.text,
-    };
-    let sending = what_to_send(asked, &session, prompt)?;
+    let action = act.action_name();
+    let sending = what_to_send(act, &session, prompt)?;
     let store = writer(shared).map_err(|error| (500, error))?;
-    let no_agent = || {
-        (
-            404,
-            format!(
-                "no agent has used {}: there is nothing to answer",
-                session.as_str()
-            ),
-        )
-    };
-    let mut ids = Vec::new();
-    match &sending {
-        Send::Keys(keys) => {
-            for (at, name) in keys.iter().enumerate() {
-                let derived = IdempotencyKey::new(format!("{}:{}", key.as_str(), at + 1))
-                    .map_err(|error| (400, format!("{BAD_REQUEST}the key: {error}")))?;
-                match store.submit_human_key(&session, &derived, *name) {
-                    Ok(spawn_postgres::HumanKey::Submitted(command)) => ids.push(command.0),
-                    Ok(spawn_postgres::HumanKey::NoAgent) => return Err(no_agent()),
-                    Ok(
-                        spawn_postgres::HumanKey::NotRunning(why)
-                        | spawn_postgres::HumanKey::KeyUsed(why),
-                    ) => return Err((409, why)),
-                    Err(error) => return Err((500, error.to_string())),
-                }
-            }
-        }
-        Send::Text(text) => match store.submit_human_input(&session, &key, text) {
-            Ok(spawn_postgres::HumanInput::Submitted(command)) => ids.push(command.0),
-            Ok(spawn_postgres::HumanInput::NoAgent) => return Err(no_agent()),
-            Ok(
-                spawn_postgres::HumanInput::NotRunning(why)
-                | spawn_postgres::HumanInput::KeyUsed(why),
-            ) => return Err((409, why)),
-            Err(error) => return Err((500, error.to_string())),
-        },
-    }
+    let ids = submit_sending(&store, &session, &key, &sending)?;
     let (keys, text) = match sending {
         Send::Keys(keys) => (
             json!(keys.iter().map(|key| key.name()).collect::<Vec<_>>()),
