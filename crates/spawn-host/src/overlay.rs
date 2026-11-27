@@ -1765,7 +1765,7 @@ impl OverlayWorkspace {
     /// holder is gone cannot be written and is refused, nothing changed.
     ///
     /// Checked before anything is written, the work's checkpoint included:
-    /// a non-empty `<root>/<branch>` with no overlay state (another engine's
+    /// a non-empty `<root>/<branch>` with no overlay state (another backend's
     /// workspace) is refused ([`crate::cow::WORKSPACE_NOT_OWNED`]), and so
     /// is a workspace that cannot reach `start`'s tree in place
     /// ([`crate::cow::WORKSPACE_DIFFERS`]: a file no checkpoint takes, such
@@ -1811,7 +1811,7 @@ impl OverlayWorkspace {
         };
         if !mounted {
             // A directory there that no overlay of this store made (another
-            // engine's workspace) is never taken for one set aside.
+            // backend's workspace) is never taken for one set aside.
             let foreign =
                 std::fs::read_dir(&merged).is_ok_and(|mut entries| entries.next().is_some());
             if foreign {

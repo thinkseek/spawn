@@ -468,8 +468,8 @@ commit with a key no agent holds cannot hang or fail a test.
 ## Workspace backends
 
 Every workspace a process mounts (the default repository's, every mission's,
-the one-shot stores of a merge of main or a set-aside) runs on one engine,
-chosen once per workspace root by `SPAWN_WORKSPACE_BACKEND`. The engines sit
+the one-shot stores of a merge of main or a set-aside) runs on one backend,
+chosen once per workspace root by `SPAWN_WORKSPACE_BACKEND`. The backends sit
 behind one type, `spawn_host::LocalWorkspaceStore`, and pass the same shared
 `WorkspaceStore` contract (`spawn_core::contract::workspace_store`, run
 against each): `mount_when` and `unmount_when` ask the caller under the
@@ -478,20 +478,20 @@ follows one rule, step by step, in all three ("Work set aside" above: the
 start must be an ancestor; a mounted workspace's work is checkpointed first;
 a new commit with the start's tree goes on top; asked again with the same
 message, the same answer and nothing written; the branch moves by
-compare-and-swap). Every engine commits to the same git branches.
+compare-and-swap). Every backend commits to the same git branches.
 
-| `SPAWN_WORKSPACE_BACKEND` | Engine | A workspace is | Where it fits |
+| `SPAWN_WORKSPACE_BACKEND` | Backend | A workspace is | Where it fits |
 | --- | --- | --- | --- |
 | unset, empty or `git` | Git (the default) | a git working copy | anywhere |
 | `cow` | Cow (`docs/cross-os-cow-storage.md`) | a plain directory cloned extent by extent from a read-only baseline of its commit (`<root>/.cow/`) | btrfs, XFS with reflink, APFS; elsewhere it copies |
-| `auto` | the engine the root already is (its marker, else what it holds); on a root no engine has, Cow where its file system clones, else Git; asked once at start, never the overlay | | |
+| `auto` | the backend the root already is (its marker, else what it holds); on a root no backend has, Cow where its file system clones, else Git; asked once at start, never the overlay | | |
 | `overlay` | overlay (`docs/layerfs-v2-overlay.md`), opt-in by name only | an unprivileged overlayfs over a snapshot layer of its commit, seen inside its holder's mount namespace | Linux with user namespaces; refused elsewhere; not served by `spawn loop` yet (below) |
 
 The choice is made in one place (`spawn_host::WorkspaceBackend::auto_with`),
 which the CLI uses as it is. Anything else in `SPAWN_WORKSPACE_BACKEND` is
 refused at start, naming the setting, never read as `git`; so is `overlay`
 where the kernel mounts none (not Linux, user namespaces off, a file system
-it refuses), with the kernel's reason. `spawn loop` says the engine it runs
+it refuses), with the kernel's reason. `spawn loop` says the backend it runs
 at start (`spawn loop: workspace backend cow under <root>
 (SPAWN_WORKSPACE_BACKEND=auto); cas dedup on`). `spawn mission show` gives
 it as `workspace_backend` (`configured`, `active`, `root`, `cas_dedup`,
@@ -500,18 +500,18 @@ environment and the root's marker alone, and makes nothing (no root, no
 probe file, no probe mount). With `auto` on a root no loop has claimed yet,
 `active` is `null`: it is decided at the first start.
 
-**One engine per root.** The first process that runs workspaces on a root
-claims it: `<root>/.spawn-workspace-backend` names the engine, written beside
+**One backend per root.** The first process that runs workspaces on a root
+claims it: `<root>/.spawn-workspace-backend` names the backend, written beside
 and linked into place, so two racing processes see one winner. Every later
 process (`spawn loop`, `spawn tick`, a set-aside, a merge of main) asking for
-another engine is refused at start with nothing written; the refusal names
+another backend is refused at start with nothing written; the refusal names
 the marker only when there is one. A root from before the marker is read by
 what it holds (`.cow/` is Cow's, `.overlay/` the overlay's, a workspace
 directory Git's), and `auto` follows it: an existing root with workspaces
 (`owner-gates/`, `.transcripts/`, no marker) stays Git's under `auto` even on
 a file system that clones, as `spawn mission show` reports it, and is claimed
 as Git's at the first start. A start refused before it can run (the overlay,
-below) claims nothing. To change engines, unmount every
+below) claims nothing. To change backends, unmount every
 workspace and start on a new `SPAWN_WORKSPACE_ROOT` (the branches carry over
 as they are). A Cow or overlay set-aside also refuses (`WorkspaceNotOwned`) a
 directory at `<root>/<branch>` that it did not make.
@@ -540,9 +540,9 @@ there. Until those go through the holder (`OverlayWorkspace::launch_arguments`,
 `host_path`), `spawn loop` and `spawn tick` refuse `SPAWN_WORKSPACE_BACKEND=overlay`
 at start (`servable: false`); `auto` never chooses it.
 
-**Not shared yet across engines**: a merge of `main` into a mounted workspace
+**Not shared yet across backends**: a merge of `main` into a mounted workspace
 (`merge_base_when`) and the merge at a start (`merge_main_clean`) are the Git
-engine's; Cow and overlay answer `Current` there, so `main` reaches their
+backend's; Cow and overlay answer `Current` there, so `main` reaches their
 agents through the next fork, not mid-session. The size cap
 (`SPAWN_MAX_FILE_MB`, "Files over the cap" below) applies to Git and Cow
 checkpoints; an overlay checkpoint takes its upperdir's files whatever their

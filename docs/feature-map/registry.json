@@ -1539,7 +1539,7 @@
       "title": "Unified Local Workspace Store & Backend Selection",
       "kind": "capability",
       "parent": "domain-host-execution",
-      "summary": "LocalWorkspaceStore: the Git, Cow and opt-in overlay engines behind one WorkspaceStore, each passing the shared contract, with one set-aside rule (pre-checked, no change when refused); SPAWN_WORKSPACE_BACKEND (git default, cow, auto = Cow else Git, overlay by name only and refused by spawn loop until served) chosen in one place and claimed per root (.spawn-workspace-backend); baseline/layer/probe pruning after unmounts; opt-in Cow CAS dedup of target/ and node_modules/ (SPAWN_CAS_DEDUP=1) (Issue #95 part 1).",
+      "summary": "LocalWorkspaceStore: the Git, Cow and opt-in overlay workspace backends behind one WorkspaceStore, each passing the shared contract, with one set-aside rule (pre-checked, no change when refused); SPAWN_WORKSPACE_BACKEND (git default, cow, auto = Cow else Git, overlay by name only and refused by spawn loop until served) chosen in one place and claimed per root (.spawn-workspace-backend); baseline/layer/probe pruning after unmounts; opt-in Cow CAS dedup of target/ and node_modules/ (SPAWN_CAS_DEDUP=1) (Issue #95 part 1).",
       "files": [
         "README.md",
         "crates/spawn-cli/src/config.rs",

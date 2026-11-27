@@ -3820,7 +3820,7 @@ mod tests {
     };
     use crate::Flags;
 
-    /// `spawn mission show` names the engine from the root's marker, and
+    /// `spawn mission show` names the backend from the root's marker, and
     /// reading it makes nothing: no root, no probe file, no probe mount.
     #[test]
     fn mission_show_names_the_workspace_backend_without_writing_anything() {
