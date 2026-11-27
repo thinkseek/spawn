@@ -1,0 +1,25 @@
+[Unit]
+Description=Spawn: start the Go edge front when Keep delivers its serve token
+
+[Path]
+# After a reboot /run/keep is empty until Keep delivers again (Wave K2):
+# once spawn-node-edge.service is cut over to LoadCredential and
+# --require-serve-token-credential (thinkseek/spawn-node#12), it starts
+# at boot without the file, fails with 243 (or 78 on empty/invalid token)
+# and stays stopped. When Keep then writes /run/keep/spawn-serve.token
+# (closed after a write, or renamed into place), this unit starts
+# spawn-node-edge.service; it does nothing while the edge front runs.
+# PathChanged alone, not PathExists: with PathExists systemd starts the
+# edge front again each time it stops while the file is there, so an
+# empty or malformed file (the edge front exits 78 / EX_CONFIG) would be
+# retried until the start limit, which leaves this unit failed and a
+# later good write unheard. PathChanged hits that limit too (5 starts in
+# 10 s) only if Keep writes a bad file over and over; then
+# `systemctl --user reset-failed` and start this unit again. /run/keep
+# itself may be absent at first: systemd watches the nearest parent that
+# exists.
+PathChanged=/run/keep/spawn-serve.token
+Unit=spawn-node-edge.service
+
+[Install]
+WantedBy=default.target

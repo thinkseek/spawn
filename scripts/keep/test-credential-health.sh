@@ -421,6 +421,19 @@ model_relay_svc=$repo_root/deploy/systemd/spawn-model-relay.service
   pass "Wave K1 spawn-model-relay.path staged and spawn-model-relay.service preserves live model-relay.env safety" ||
   fail "Wave K1 spawn-model-relay unit/path static audit"
 
+node_edge_path=$repo_root/deploy/systemd/spawn-node-edge.path
+node_edge_svc=$repo_root/deploy/systemd/spawn-node-edge.service
+[ -f "$node_edge_path" ] &&
+  grep -qxF 'PathChanged=/run/keep/spawn-serve.token' "$node_edge_path" &&
+  ! grep -q '^PathExists=' "$node_edge_path" &&
+  grep -qxF 'Unit=spawn-node-edge.service' "$node_edge_path" &&
+  grep -qxF 'WantedBy=default.target' "$node_edge_path" &&
+  grep -qxF 'EnvironmentFile=-%h/.config/spawn/node-edge.env' "$node_edge_svc" &&
+  ! grep -q '^LoadCredential=' "$node_edge_svc" &&
+  ! grep -qiE 'spawn\.env|DATABASE_URL' "$node_edge_svc" &&
+  pass "Wave K2 spawn-node-edge.path staged and spawn-node-edge.service preserves live node-edge.env safety and zero-PG isolation" ||
+  fail "Wave K2 spawn-node-edge unit/path static audit"
+
 # --- --validate-manifest dry-run validation (multi-row + unix://%t/..., exit 2 on invalid, zero alerts) ---
 rm -f "$scratch/alerts"
 cat >"$scratch/valid-multi.manifest" <<'EOF'
@@ -441,6 +454,17 @@ EOF
 k1_out=$(CH_FAKE_ALERTS="$scratch/alerts" bash "$check" --validate-manifest "$scratch/wave-k1.manifest" 2>&1)
 [ "$?" -eq 0 ] && grep -q 'manifest ok: 2 row(s) valid' <<<"$k1_out" && [ ! -e "$scratch/alerts" ] &&
   pass "--validate-manifest accepts Wave K1 multi-row manifest (spawn-jev-relay + spawn-model-relay) with zero alerts" || fail "--validate-manifest Wave K1 ($k1_out)"
+
+# Wave K2 staged 3-row manifest (jev-relay + model-relay + node-edge) dry-run validation.
+cat >"$scratch/wave-k2.manifest" <<'EOF'
+# Wave K2 staged manifest: active typesafe.api-key + Wave K1 deepseek.api-key + Wave K2 spawn-serve.token
+typesafe.api-key  | spawn-jev-relay.service   | http://127.0.0.1:8790/healthz | jev-relay   | ~/.config/spawn/typesafe.env    | TYPESAFE_API_KEY  | -
+deepseek.api-key  | spawn-model-relay.service | http://127.0.0.1:8791/healthz | model-relay | ~/.config/spawn/model-relay.env | DEEPSEEK_API_KEY  | -
+spawn-serve.token | spawn-node-edge.service   | -                             | -           | ~/.config/spawn/node-edge.env   | SPAWN_SERVE_TOKEN | -
+EOF
+k2_out=$(CH_FAKE_ALERTS="$scratch/alerts" bash "$check" --validate-manifest "$scratch/wave-k2.manifest" 2>&1)
+[ "$?" -eq 0 ] && grep -q 'manifest ok: 3 row(s) valid' <<<"$k2_out" && [ ! -e "$scratch/alerts" ] &&
+  pass "--validate-manifest accepts Wave K2 3-row manifest (typesafe + deepseek + spawn-serve.token) with zero alerts" || fail "--validate-manifest Wave K2 ($k2_out)"
 
 printf 'bad.row|only-three-fields|-\n' >"$scratch/invalid.manifest"
 val_bad_out=$(CH_FAKE_ALERTS="$scratch/alerts" bash "$check" --validate-manifest "$scratch/invalid.manifest" 2>&1); st=$?

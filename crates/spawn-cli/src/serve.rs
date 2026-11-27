@@ -1975,10 +1975,12 @@ pub(super) fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Val
 /// A query parameter as given (`None` when absent, `Some("")` for bare
 /// `?name` or `?name=`).
 fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
-    query.split('&').find_map(|pair| match pair.split_once('=') {
-        Some((key, value)) => (key == name).then_some(value),
-        None => (pair == name).then_some(""),
-    })
+    query
+        .split('&')
+        .find_map(|pair| match pair.split_once('=') {
+            Some((key, value)) => (key == name).then_some(value),
+            None => (pair == name).then_some(""),
+        })
 }
 
 /// The `mission` of a coverage request's query as given: `None` when the
@@ -8469,8 +8471,15 @@ mod tests {
             .map(|i| sample_episode(i, 1, i * 100, i, &large_brief))
             .collect();
         let summary = sample_episodes_summary(episodes.len());
-        let payload =
-            super::bounded_episodes_payload_with_cap(Some(1), episodes, 10, &summary, true, &[], 35_000);
+        let payload = super::bounded_episodes_payload_with_cap(
+            Some(1),
+            episodes,
+            10,
+            &summary,
+            true,
+            &[],
+            35_000,
+        );
         let encoded_len = payload.to_string().len();
         assert!(encoded_len <= 35_000, "encoded_len={encoded_len}");
         let kept = payload["episodes"].as_array().unwrap();
@@ -8492,13 +8501,7 @@ mod tests {
         );
         assert!(trimmed.to_string().len() <= 20_000);
         assert_eq!(trimmed["episodes"].as_array().unwrap().len(), 1);
-        assert!(
-            trimmed["episodes"][0]["brief"]
-                .as_str()
-                .unwrap()
-                .len()
-                <= 4096
-        );
+        assert!(trimmed["episodes"][0]["brief"].as_str().unwrap().len() <= 4096);
         assert!(super::truncate_utf8(&huge_utf8, 4096).len() <= 4096);
     }
 
