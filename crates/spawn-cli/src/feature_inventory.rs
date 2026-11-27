@@ -996,7 +996,8 @@ fn utc_today() -> String {
 /// long building it took. Only the in-scope files
 /// [`spawn_codegraph::wants`] accepts are read (Rust sources and
 /// `Cargo.toml`; TypeScript / JavaScript sources and `package.json`,
-/// `tsconfig*.json`, `jsconfig*.json`), each at most
+/// `tsconfig*.json`, `jsconfig*.json`; Python `.py`/`.pyi` sources and
+/// `pyproject.toml`; Go `.go` sources and `go.mod`), each at most
 /// [`spawn_codegraph::MAX_SOURCE_BYTES`]; a file not read is listed as
 /// `skipped`. Every in-scope path, read or not, is passed as the inventory
 /// references may resolve to (assets, `.vue` files listed `unsupported`).
@@ -1664,6 +1665,7 @@ fn unit_id_seed_and_title(unit_id: &str) -> (String, String) {
         .strip_prefix("cargo:")
         .or_else(|| unit_id.strip_prefix("npm:"))
         .or_else(|| unit_id.strip_prefix("py:"))
+        .or_else(|| unit_id.strip_prefix("go:"))
         .unwrap_or(unit_id);
     let clean = raw.trim_start_matches('@').replace('/', "-");
     let seed = slugify_safe_token(&clean, "unit");
@@ -3387,5 +3389,97 @@ mod tests {
         );
         let err = command(&args(&["--deps", "bogus"])).expect_err("bad deps mode");
         assert!(err.contains("--deps"), "{err}");
+    }
+
+    #[test]
+    fn go_modules_build_inventory_code_graph_and_truth_cleanly() {
+        const GO_PROJECT: &[(&str, &str)] = &[
+            ("go.mod", "module github.com/acme/node\n\ngo 1.26\n"),
+            (
+                "cmd/node/main.go",
+                "package main\n\nimport \"github.com/acme/node/front\"\n\nfunc main() {}\n",
+            ),
+            (
+                "front/edge.go",
+                "// import \"github.com/acme/node/internal/unused\"\npackage front\n\nimport (\n    \"net/http\"\n    \"github.com/acme/node/proto\"\n)\n",
+            ),
+            (
+                "front/edge_test.go",
+                "package front_test\n\nimport (\n    \"testing\"\n    \"github.com/acme/node/front\"\n)\n",
+            ),
+            (
+                "proto/envelope.go",
+                "package proto\n\nvar decoy = `import \"github.com/acme/node/front\"`\n",
+            ),
+        ];
+
+        let project = Project::new("go-codegraph", GO_PROJECT);
+        let node = |id: &str, kind, parent: Option<&str>, files: &[&str]| FeatureNode {
+            id: id.to_string(),
+            title: id.to_string(),
+            kind,
+            parent: parent.map(str::to_string),
+            summary: String::new(),
+            status_note: None,
+            files: files.iter().map(|f| (*f).to_string()).collect(),
+            relations: Vec::new(),
+            provenance: FeatureProvenance::default(),
+        };
+        let reg = FeatureRegistry {
+            schema_version: SCHEMA_VERSION,
+            initiative_id: "go-fx".to_string(),
+            boundary: BoundaryPolicy::default_generic_boundary("go-fx"),
+            features: vec![
+                node("dom-go", FeatureKind::Domain, None, &[]),
+                node(
+                    "cap-cmd",
+                    FeatureKind::Capability,
+                    Some("dom-go"),
+                    &["go.mod", "cmd/node/main.go"],
+                ),
+                node(
+                    "cap-front",
+                    FeatureKind::Capability,
+                    Some("dom-go"),
+                    &["front/edge.go", "front/edge_test.go"],
+                ),
+                node(
+                    "cap-proto",
+                    FeatureKind::Capability,
+                    Some("dom-go"),
+                    &["proto/envelope.go"],
+                ),
+            ],
+        };
+        save_registry_atomic(&project.0.join("registry.json"), &reg).expect("save go registry");
+
+        let opts = parse_graph_opts(&graph_args(&project, &["--json"])).expect("graph opts");
+        let (payload, _) = graph_payload(&opts).expect("graph payload");
+        assert_eq!(payload["graph"]["files_analyzed"], json!(4));
+        assert_eq!(payload["graph"]["files_parsed"], json!(4));
+        assert_eq!(payload["graph"]["languages"]["go"]["files"], json!(4));
+        assert_eq!(payload["graph"]["units"][0]["kind"], json!("go_module"));
+        assert_eq!(
+            payload["graph"]["units"][0]["id"],
+            json!("go:github.com/acme/node")
+        );
+        assert_eq!(
+            payload["graph"]["units"][0]["entry_files"],
+            json!(["cmd/node/main.go"])
+        );
+        assert_eq!(payload["truth"]["counts"]["by_code"]["under_declared"], 2);
+        assert_eq!(
+            unit_id_seed_and_title("go:github.com/acme/node").0,
+            "github-com-acme-node"
+        );
+
+        let (generated, gen_graph) = build_generated_registry(
+            &project.0,
+            &project.0.join("docs/feature-map/registry.json"),
+            false,
+        )
+        .expect("generate go registry");
+        assert_eq!(gen_graph.units.len(), 1);
+        assert!(feature_deps::check_purity(&generated, Some(&gen_graph)).is_clean());
     }
 }

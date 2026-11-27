@@ -46,12 +46,14 @@ pub enum UnitKind {
     NpmPackage,
     /// Python distribution package (`pyproject.toml`).
     PythonPackage,
+    /// Go module (`go.mod`).
+    GoModule,
 }
 
 /// One package the build system knows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unit {
-    /// `cargo:spawn-core`, `npm:@acme/domain`, `py:acme`.
+    /// `cargo:spawn-core`, `npm:@acme/domain`, `py:acme`, `go:github.com/acme/svc`.
     pub id: String,
     /// Build ecosystem kind of this package.
     pub kind: UnitKind,
@@ -91,6 +93,8 @@ pub enum EdgeKind {
     PyImport,
     /// Python `from module import ...` statement.
     PyFrom,
+    /// Go `import` declaration.
+    GoImport,
     /// Non-code asset import (e.g., CSS, SVG, JSON).
     Asset,
 }
@@ -116,6 +120,7 @@ impl EdgeKind {
             Self::Require => "require",
             Self::PyImport => "py_import",
             Self::PyFrom => "py_from",
+            Self::GoImport => "go_import",
             Self::Asset => "asset",
         }
     }
@@ -204,6 +209,8 @@ pub enum Language {
     Javascript,
     /// Python source or stub file (`.py`, `.pyi`).
     Python,
+    /// Go source file (`.go`).
+    Go,
 }
 
 impl Language {
@@ -214,6 +221,7 @@ impl Language {
             Self::Typescript => "typescript",
             Self::Javascript => "javascript",
             Self::Python => "python",
+            Self::Go => "go",
         }
     }
 }
@@ -2689,6 +2697,21 @@ mod tests {
         );
         assert!(EdgeKind::Mod.is_structural() && EdgeKind::Reexport.is_structural());
         assert!(!EdgeKind::Use.is_structural());
+        assert_eq!(
+            serde_json::to_value(UnitKind::GoModule).expect("json"),
+            serde_json::json!("go_module")
+        );
+        assert_eq!(Language::Go.as_str(), "go");
+        assert_eq!(
+            serde_json::to_value(Language::Go).expect("json"),
+            serde_json::json!("go")
+        );
+        assert_eq!(EdgeKind::GoImport.as_str(), "go_import");
+        assert_eq!(
+            serde_json::to_value(EdgeKind::GoImport).expect("json"),
+            serde_json::json!("go_import")
+        );
+        assert!(!EdgeKind::GoImport.is_structural());
         assert!(is_date("2026-01-31") && !is_date("2026-1-31") && !is_date("2026/01/31"));
     }
 

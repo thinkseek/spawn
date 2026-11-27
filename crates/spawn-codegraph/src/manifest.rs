@@ -1518,6 +1518,381 @@ pub(crate) fn read_pyproject(text: &str) -> Result<PyProjectManifest, TomlError>
     Ok(manifest)
 }
 
+/// One local path `replace` directive from a `go.mod` file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GoModReplace {
+    /// Replaced module import path on the left-hand side of `=>`.
+    pub old_path: String,
+    /// Relative filesystem directory path on the right-hand side of `=>`.
+    pub new_local_path: String,
+}
+
+/// Parsed module metadata, `require` targets, and local path `replace` rules
+/// from a `go.mod` manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GoModManifest {
+    /// Canonical module import path declared by `module <path>`.
+    pub module_path: Option<String>,
+    /// Sorted, deduplicated required module paths from `require` directives.
+    pub requires: Vec<String>,
+    /// Deterministic local path replacements (`old_path => ./local`).
+    pub local_replaces: Vec<GoModReplace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GoModTok {
+    Word(String, u32),
+    LParen(u32),
+    RParen(u32),
+    Newline,
+}
+
+fn lex_go_mod_quoted(chars: &[char], idx: &mut usize, line: u32) -> Result<String, TomlError> {
+    *idx += 1;
+    let mut out = String::new();
+    while let Some(&ch) = chars.get(*idx) {
+        *idx += 1;
+        match ch {
+            '"' => return Ok(out),
+            '\n' => {
+                return Err(TomlError {
+                    line,
+                    message: "unterminated string in go.mod".to_string(),
+                });
+            }
+            '\\' => {
+                let Some(&esc) = chars.get(*idx) else {
+                    return Err(TomlError {
+                        line,
+                        message: "unterminated escape in go.mod string".to_string(),
+                    });
+                };
+                *idx += 1;
+                match esc {
+                    '"' | '\\' => out.push(esc),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Err(TomlError {
+        line,
+        message: "unterminated string in go.mod".to_string(),
+    })
+}
+
+fn lex_go_mod_raw(chars: &[char], idx: &mut usize, line: &mut u32) -> Result<String, TomlError> {
+    let start_line = *line;
+    *idx += 1;
+    let mut out = String::new();
+    while let Some(&ch) = chars.get(*idx) {
+        *idx += 1;
+        match ch {
+            '`' => return Ok(out),
+            '\r' => {}
+            '\n' => {
+                *line += 1;
+                out.push('\n');
+            }
+            other => out.push(other),
+        }
+    }
+    Err(TomlError {
+        line: start_line,
+        message: "unterminated raw string in go.mod".to_string(),
+    })
+}
+
+fn lex_go_mod_tokens(text: &str) -> Result<Vec<GoModTok>, TomlError> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut tokens = Vec::new();
+    let mut idx = 0usize;
+    let mut line = 1u32;
+    while let Some(&ch) = chars.get(idx) {
+        match ch {
+            ' ' | '\t' | '\r' => idx += 1,
+            '\n' => {
+                tokens.push(GoModTok::Newline);
+                idx += 1;
+                line += 1;
+            }
+            '/' if chars.get(idx + 1) == Some(&'/') => {
+                while chars.get(idx).is_some_and(|c| *c != '\n') {
+                    idx += 1;
+                }
+            }
+            '(' => {
+                tokens.push(GoModTok::LParen(line));
+                idx += 1;
+            }
+            ')' => {
+                tokens.push(GoModTok::RParen(line));
+                idx += 1;
+            }
+            '"' => {
+                let s = lex_go_mod_quoted(&chars, &mut idx, line)?;
+                tokens.push(GoModTok::Word(s, line));
+            }
+            '`' => {
+                let tok_line = line;
+                let s = lex_go_mod_raw(&chars, &mut idx, &mut line)?;
+                tokens.push(GoModTok::Word(s, tok_line));
+            }
+            '=' if chars.get(idx + 1) == Some(&'>') => {
+                tokens.push(GoModTok::Word("=>".to_string(), line));
+                idx += 2;
+            }
+            _ => {
+                let mut word = String::new();
+                while let Some(&c) = chars.get(idx) {
+                    if matches!(c, ' ' | '\t' | '\r' | '\n' | '(' | ')' | '"' | '`')
+                        || (c == '/' && chars.get(idx + 1) == Some(&'/'))
+                        || (c == '=' && chars.get(idx + 1) == Some(&'>'))
+                    {
+                        break;
+                    }
+                    word.push(c);
+                    idx += 1;
+                }
+                tokens.push(GoModTok::Word(word, line));
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+fn collect_go_mod_block(
+    tokens: &[GoModTok],
+    idx: &mut usize,
+    open_line: u32,
+) -> Result<Vec<(u32, Vec<String>)>, TomlError> {
+    let mut entries = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_line = open_line;
+    while let Some(tok) = tokens.get(*idx) {
+        *idx += 1;
+        match tok {
+            GoModTok::Word(word, ln) => {
+                if current.is_empty() {
+                    current_line = *ln;
+                }
+                current.push(word.clone());
+            }
+            GoModTok::Newline => {
+                if !current.is_empty() {
+                    entries.push((current_line, std::mem::take(&mut current)));
+                }
+            }
+            GoModTok::RParen(_) => {
+                if !current.is_empty() {
+                    entries.push((current_line, current));
+                }
+                return Ok(entries);
+            }
+            GoModTok::LParen(ln) => {
+                return Err(TomlError {
+                    line: *ln,
+                    message: "unexpected '(' inside go.mod block".to_string(),
+                });
+            }
+        }
+    }
+    Err(TomlError {
+        line: open_line,
+        message: "unterminated '(' block in go.mod".to_string(),
+    })
+}
+
+fn is_local_go_replace_target(target: &str) -> bool {
+    !target.is_empty() && !target.starts_with('/') && !target.contains(':')
+}
+
+fn apply_go_mod_replace(
+    line: u32,
+    args: &[String],
+    replaces: &mut BTreeMap<String, String>,
+) -> Result<(), TomlError> {
+    let Some(arrow) = args.iter().position(|tok| tok == "=>") else {
+        return Err(TomlError {
+            line,
+            message: "go.mod replace directive missing '=>'".to_string(),
+        });
+    };
+    let lhs = &args[..arrow];
+    let rhs = &args[arrow + 1..];
+    if !matches!(lhs.len(), 1 | 2) || !matches!(rhs.len(), 1 | 2) {
+        return Err(TomlError {
+            line,
+            message: "invalid go.mod replace syntax".to_string(),
+        });
+    }
+    let old_path = &lhs[0];
+    let new_target = &rhs[0];
+    if old_path.is_empty() || new_target.is_empty() {
+        return Err(TomlError {
+            line,
+            message: "empty path in go.mod replace".to_string(),
+        });
+    }
+    // Local filesystem directory replacements never take a version token.
+    if rhs.len() == 1 && is_local_go_replace_target(new_target) {
+        replaces.insert(old_path.clone(), new_target.clone());
+    }
+    Ok(())
+}
+
+fn apply_go_mod_directive(
+    verb: &str,
+    entries: Vec<(u32, Vec<String>)>,
+    manifest: &mut GoModManifest,
+    replaces: &mut BTreeMap<String, String>,
+) -> Result<(), TomlError> {
+    match verb {
+        "module" => {
+            for (line, args) in entries {
+                if args.len() != 1 || args[0].is_empty() {
+                    return Err(TomlError {
+                        line,
+                        message: "go.mod module directive requires exactly one module path"
+                            .to_string(),
+                    });
+                }
+                if manifest.module_path.is_some() {
+                    return Err(TomlError {
+                        line,
+                        message: "duplicate module directive in go.mod".to_string(),
+                    });
+                }
+                manifest.module_path = Some(args[0].clone());
+            }
+        }
+        "require" => {
+            for (line, args) in entries {
+                if !matches!(args.len(), 1 | 2) || args[0].is_empty() {
+                    return Err(TomlError {
+                        line,
+                        message: "invalid go.mod require entry".to_string(),
+                    });
+                }
+                manifest.requires.push(args[0].clone());
+            }
+        }
+        "replace" => {
+            for (line, args) in entries {
+                apply_go_mod_replace(line, &args, replaces)?;
+            }
+        }
+        "go" | "toolchain" | "exclude" | "retract" | "tool" | "ignore" | "godebug" => {}
+        _ => {
+            let line = entries.first().map_or(0, |(ln, _)| *ln);
+            return Err(TomlError {
+                line,
+                message: format!("unsupported go.mod directive {verb:?}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_go_mod_inline(
+    tokens: &[GoModTok],
+    idx: &mut usize,
+    start_line: u32,
+) -> Result<Vec<(u32, Vec<String>)>, TomlError> {
+    let mut args = Vec::new();
+    while let Some(next) = tokens.get(*idx) {
+        match next {
+            GoModTok::Newline => {
+                *idx += 1;
+                break;
+            }
+            GoModTok::Word(w, _) => {
+                args.push(w.clone());
+                *idx += 1;
+            }
+            GoModTok::LParen(ln) | GoModTok::RParen(ln) => {
+                return Err(TomlError {
+                    line: *ln,
+                    message: "unexpected parenthesis in go.mod directive".to_string(),
+                });
+            }
+        }
+    }
+    if args.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![(start_line, args)])
+    }
+}
+
+/// Read a `go.mod` manifest (zero external crates).
+pub(crate) fn read_go_mod(text: &str) -> Result<GoModManifest, TomlError> {
+    let tokens = lex_go_mod_tokens(text)?;
+    let mut manifest = GoModManifest::default();
+    let mut replaces = BTreeMap::new();
+    let mut idx = 0usize;
+
+    while let Some(tok) = tokens.get(idx) {
+        let (verb, start_line) = match tok {
+            GoModTok::Newline => {
+                idx += 1;
+                continue;
+            }
+            GoModTok::Word(verb, ln) => {
+                idx += 1;
+                (verb.clone(), *ln)
+            }
+            GoModTok::LParen(ln) | GoModTok::RParen(ln) => {
+                return Err(TomlError {
+                    line: *ln,
+                    message: "unexpected parenthesis in go.mod".to_string(),
+                });
+            }
+        };
+
+        let entries = match tokens.get(idx) {
+            Some(GoModTok::LParen(open_line)) => {
+                let open = *open_line;
+                idx += 1;
+                collect_go_mod_block(&tokens, &mut idx, open)?
+            }
+            _ => collect_go_mod_inline(&tokens, &mut idx, start_line)?,
+        };
+
+        if entries.is_empty() && verb == "module" {
+            return Err(TomlError {
+                line: start_line,
+                message: "go.mod module directive requires a module path".to_string(),
+            });
+        }
+        apply_go_mod_directive(&verb, entries, &mut manifest, &mut replaces)?;
+    }
+
+    if manifest.module_path.is_none() {
+        return Err(TomlError {
+            line: 0,
+            message: "go.mod missing module directive".to_string(),
+        });
+    }
+    manifest.requires.sort();
+    manifest.requires.dedup();
+    manifest.local_replaces = replaces
+        .into_iter()
+        .map(|(old_path, new_local_path)| GoModReplace {
+            old_path,
+            new_local_path,
+        })
+        .collect();
+    Ok(manifest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1952,5 +2327,72 @@ packages = ["src/hatch_pkg"]
         ] {
             assert!(parse_json(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn go_mod_reads_module_requires_and_local_replaces() {
+        let text = r#"
+// Top-level comment
+module github.com/acme/svc // inline comment
+
+go 1.26
+toolchain go1.26.0
+
+require (
+    github.com/acme/shared v0.1.0 // local replace target
+    example.com/ext v1.2.3 // indirect
+)
+
+require github.com/acme/single v0.2.0
+
+replace (
+    github.com/acme/shared => ../shared
+    github.com/acme/withver v0.1.0 => "./libs/withver"
+    example.com/ext v1.2.3 => example.com/fork v1.2.4
+    example.com/abs => /opt/vendor/abs
+)
+
+replace github.com/acme/single => ../single
+
+exclude example.com/bad v0.0.1
+retract [v0.0.1, v0.0.2]
+"#;
+        let parsed = read_go_mod(text).expect("read_go_mod");
+        assert_eq!(parsed.module_path.as_deref(), Some("github.com/acme/svc"));
+        assert_eq!(
+            parsed.requires,
+            vec![
+                "example.com/ext",
+                "github.com/acme/shared",
+                "github.com/acme/single",
+            ]
+        );
+        assert_eq!(
+            parsed.local_replaces,
+            vec![
+                GoModReplace {
+                    old_path: "github.com/acme/shared".to_string(),
+                    new_local_path: "../shared".to_string(),
+                },
+                GoModReplace {
+                    old_path: "github.com/acme/single".to_string(),
+                    new_local_path: "../single".to_string(),
+                },
+                GoModReplace {
+                    old_path: "github.com/acme/withver".to_string(),
+                    new_local_path: "./libs/withver".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn go_mod_rejects_malformed_or_missing_module_directives() {
+        assert!(read_go_mod("go 1.26\n").is_err());
+        assert!(read_go_mod("module a\nmodule b\n").is_err());
+        assert!(read_go_mod("module a\nrequire (\n  x v1.0.0\n").is_err());
+        assert!(read_go_mod("module a\nreplace x ./bad\n").is_err());
+        assert!(read_go_mod("module \"unterminated\n").is_err());
+        assert!(read_go_mod("module a\nunknown_kw x\n").is_err());
     }
 }
