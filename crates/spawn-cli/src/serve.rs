@@ -1243,6 +1243,9 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
             let if_none_match = header(&request, "If-None-Match").map(str::to_string);
             return answers::respond(request, &answer, if_none_match.as_deref());
         }
+        if is_storage_read_route(path) {
+            return respond_storage_read(request, path, query);
+        }
         let Some((method, pattern, values)) = route(path) else {
             return static_file(request, &shared.web, path);
         };
@@ -2798,6 +2801,648 @@ pub(in crate::serve) fn episodes_answer(query: &str) -> answers::Answer {
         ))
     })();
     answers::answer("/api/episodes", read, BAD_REQUEST)
+}
+
+const STORAGE_TREE_DEFAULT_LIMIT: usize = 120;
+const STORAGE_TREE_MAX_LIMIT: usize = 500;
+const STORAGE_HISTORY_MAX: usize = 80;
+const SNAPSHOT_ANCESTOR_MAX_DEPTH: usize = 32;
+const SNAPSHOT_CHILDREN_SCAN_MAX: usize = 256;
+
+fn parse_storage_tree_query(query: &str) -> Result<(Option<String>, usize), String> {
+    let project = parameter(query, "project")
+        .map(|text| percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad project {text}")))
+        .transpose()?
+        .filter(|text| !text.is_empty());
+    let limit = match parameter(query, "limit") {
+        None => STORAGE_TREE_DEFAULT_LIMIT,
+        Some(raw) => {
+            if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{BAD_REQUEST}bad limit {raw}"));
+            }
+            let parsed: usize = raw
+                .parse()
+                .map_err(|_| format!("{BAD_REQUEST}bad limit {raw}"))?;
+            if parsed == 0 || parsed > STORAGE_TREE_MAX_LIMIT {
+                return Err(format!(
+                    "{BAD_REQUEST}limit must be between 1 and {STORAGE_TREE_MAX_LIMIT}, got {parsed}"
+                ));
+            }
+            parsed
+        }
+    };
+    Ok((project, limit))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotLookup<'a> {
+    Digest(&'a str),
+    GitOid(&'a str),
+}
+
+fn parse_snapshot_lookup(raw: &str) -> Result<(String, SnapshotLookupKind), String> {
+    let decoded =
+        percent_decoded(raw).ok_or_else(|| format!("{BAD_REQUEST}bad snapshot id {raw}"))?;
+    let normalized = decoded.to_ascii_lowercase();
+    if let Some(hex) = normalized.strip_prefix("sha256:")
+        && hex.len() == 64
+        && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok((normalized, SnapshotLookupKind::Digest));
+    }
+    if normalized.len() == 40 && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok((normalized, SnapshotLookupKind::GitOid));
+    }
+    Err(format!(
+        "{BAD_REQUEST}snapshot id must be sha256:<64 hex> or 40-hex git oid, got {decoded:?}"
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotLookupKind {
+    Digest,
+    GitOid,
+}
+
+impl SnapshotLookupKind {
+    fn as_lookup(self, id: &str) -> SnapshotLookup<'_> {
+        match self {
+            Self::Digest => SnapshotLookup::Digest(id),
+            Self::GitOid => SnapshotLookup::GitOid(id),
+        }
+    }
+}
+
+fn classify_ref_kind(name: &str, db_kind: spawn_postgres::RefKind) -> &'static str {
+    match db_kind {
+        spawn_postgres::RefKind::Main => "main",
+        spawn_postgres::RefKind::Wip => "wip",
+        spawn_postgres::RefKind::Tag => "tag",
+        spawn_postgres::RefKind::Branch => {
+            if name == "main" {
+                "main"
+            } else if name.starts_with("task/")
+                || name.starts_with("spawn/task")
+                || name.contains("task-")
+            {
+                "task"
+            } else if name.starts_with("worker/")
+                || name.starts_with("spawn/agent")
+                || name.contains("worker")
+                || name.contains("agent")
+            {
+                "worker"
+            } else {
+                "branch"
+            }
+        }
+    }
+}
+
+fn classify_ref_log_action(old_snapshot: Option<&str>, reason: &str) -> &'static str {
+    if old_snapshot.is_none() {
+        return "created";
+    }
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("rollback") || lower.contains("retire") {
+        "rollback"
+    } else if lower.contains("land") || lower.contains("merge") {
+        "merged"
+    } else {
+        "advanced"
+    }
+}
+
+fn is_missing_d6_relation(error: &spawn_core::port::StoreError) -> bool {
+    let text = error.to_string();
+    text.contains("does not exist") || text.contains("42P01")
+}
+
+fn list_all_refs_safe(
+    store: &spawn_postgres::PostgresStore,
+) -> Result<Vec<spawn_postgres::RefRow>, String> {
+    match store.list_refs(None) {
+        Ok(rows) => Ok(rows),
+        Err(error) if is_missing_d6_relation(&error) => Ok(Vec::new()),
+        Err(error) => Err(err(error)),
+    }
+}
+
+fn list_all_ref_logs_safe(
+    store: &spawn_postgres::PostgresStore,
+) -> Result<Vec<spawn_postgres::RefLogRow>, String> {
+    match store.list_ref_log_after(0) {
+        Ok(rows) => Ok(rows),
+        Err(error) if is_missing_d6_relation(&error) => Ok(Vec::new()),
+        Err(error) => Err(err(error)),
+    }
+}
+
+fn get_snapshot_safe(
+    store: &spawn_postgres::PostgresStore,
+    lookup: SnapshotLookup<'_>,
+) -> Result<Option<spawn_postgres::SnapshotRow>, String> {
+    let res = match lookup {
+        SnapshotLookup::Digest(id) => store.get_snapshot(id),
+        SnapshotLookup::GitOid(oid) => store.get_snapshot_by_oid(oid),
+    };
+    match res {
+        Ok(row) => Ok(row),
+        Err(error) if is_missing_d6_relation(&error) => Ok(None),
+        Err(error) => Err(err(error)),
+    }
+}
+
+fn detect_storage_backend(has_d6_data: bool) -> (&'static str, String) {
+    let configured = env_value("SPAWN_WORKSPACE_BACKEND")
+        .or_else(|| env_value("SPAWN_STORAGE_BACKEND"))
+        .map(|value| value.trim().to_ascii_lowercase());
+    let root_kind = env_value("SPAWN_WORKSPACE_ROOT")
+        .map(|raw| spawn_host::canonical_root(Path::new(&raw)))
+        .and_then(|root| spawn_host::root_backend(&root).ok().flatten());
+    if has_d6_data {
+        let mode_note = match root_kind {
+            Some(spawn_host::WorkspaceBackend::D6Shadow) => {
+                "D6 shadow ledger active alongside authoritative Git border.".to_string()
+            }
+            _ => "D6 persistent CAS Merkle tree and PostgreSQL ref ledger active.".to_string(),
+        };
+        return ("d6", mode_note);
+    }
+    if matches!(configured.as_deref(), Some("d6" | "d6-shadow" | "cas"))
+        || matches!(
+            root_kind,
+            Some(spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow)
+        )
+    {
+        return (
+            "d6",
+            "D6 storage mode configured, but no D6 snapshots or refs have been recorded yet."
+                .to_string(),
+        );
+    }
+    let backend = match root_kind {
+        Some(spawn_host::WorkspaceBackend::Cow) => "cow",
+        Some(spawn_host::WorkspaceBackend::Overlay) => "overlay",
+        _ => "git",
+    };
+    (
+        backend,
+        format!(
+            "Running in {backend} workspace mode with no D6 CAS snapshots recorded. Run `spawn storage cutover --to d6` to enable D6 snapshot tracking."
+        ),
+    )
+}
+
+fn shell_token(text: &str) -> String {
+    if !text.is_empty()
+        && text.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':')
+        })
+    {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn short_snapshot_id(id: &str) -> &str {
+    let hex = id.strip_prefix("sha256:").unwrap_or(id);
+    &hex[..hex.len().min(12)]
+}
+
+fn ref_json(row: &spawn_postgres::RefRow) -> Value {
+    json!({
+        "name": row.name,
+        "kind": classify_ref_kind(&row.name, row.kind),
+        "ref_kind": row.kind.as_str(),
+        "snapshot_id": row.snapshot,
+        "updated_at_ms": row.updated_at_ms,
+    })
+}
+
+fn ref_badge_json(row: &spawn_postgres::RefRow) -> Value {
+    json!({
+        "name": row.name,
+        "kind": classify_ref_kind(&row.name, row.kind),
+        "ref_kind": row.kind.as_str(),
+        "updated_at_ms": row.updated_at_ms,
+    })
+}
+
+fn ref_log_json(row: &spawn_postgres::RefLogRow) -> Value {
+    json!({
+        "seq": row.seq,
+        "project": row.project,
+        "name": row.name,
+        "kind": classify_ref_kind(&row.name, row.kind),
+        "ref_kind": row.kind.as_str(),
+        "old_snapshot": row.old_snapshot,
+        "new_snapshot": row.new_snapshot,
+        "reason": row.reason,
+        "action": classify_ref_log_action(row.old_snapshot.as_deref(), &row.reason),
+        "at_ms": row.at_ms,
+    })
+}
+
+fn enqueue_snapshot_id(
+    queue: &mut std::collections::VecDeque<String>,
+    queued: &mut std::collections::HashSet<String>,
+    id: &str,
+) {
+    if queued.insert(id.to_string()) {
+        queue.push_back(id.to_string());
+    }
+}
+
+fn collect_project_snapshots(
+    store: &spawn_postgres::PostgresStore,
+    project: &str,
+    project_refs: &[&spawn_postgres::RefRow],
+    project_logs: &[&spawn_postgres::RefLogRow],
+    limit: usize,
+) -> Result<(Vec<spawn_postgres::SnapshotRow>, bool), String> {
+    let mut queue = std::collections::VecDeque::new();
+    let mut queued = std::collections::HashSet::new();
+    for r in project_refs {
+        if classify_ref_kind(&r.name, r.kind) == "main" {
+            enqueue_snapshot_id(&mut queue, &mut queued, &r.snapshot);
+        }
+    }
+    for r in project_refs {
+        enqueue_snapshot_id(&mut queue, &mut queued, &r.snapshot);
+    }
+    for entry in project_logs {
+        enqueue_snapshot_id(&mut queue, &mut queued, &entry.new_snapshot);
+        if let Some(old) = &entry.old_snapshot {
+            enqueue_snapshot_id(&mut queue, &mut queued, old);
+        }
+    }
+
+    let mut nodes = Vec::new();
+    let mut seen_nodes = std::collections::HashSet::new();
+    let mut truncated = false;
+    while let Some(id) = queue.pop_front() {
+        if nodes.len() >= limit {
+            truncated = true;
+            break;
+        }
+        let Some(row) = get_snapshot_safe(store, SnapshotLookup::Digest(&id))? else {
+            continue;
+        };
+        if row.project != project || !seen_nodes.insert(row.id.clone()) {
+            continue;
+        }
+        for parent in &row.parents {
+            enqueue_snapshot_id(&mut queue, &mut queued, parent);
+        }
+        nodes.push(row);
+    }
+    nodes.sort_by(|a, b| {
+        b.created_at_ms
+            .cmp(&a.created_at_ms)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok((nodes, truncated))
+}
+
+fn is_storage_read_route(path: &str) -> bool {
+    path == "/api/storage/tree"
+        || path
+            .strip_prefix("/api/storage/snapshot/")
+            .is_some_and(|raw_id| !raw_id.is_empty() && !raw_id.contains('/'))
+}
+
+fn respond_storage_read(request: Request, path: &str, query: &str) -> Result<(), String> {
+    if !matches!(request.method(), Method::Get | Method::Head) {
+        return request
+            .respond(not_allowed("GET"))
+            .map_err(|error| error.to_string());
+    }
+    let answer = if let Some(raw_id) = path.strip_prefix("/api/storage/snapshot/") {
+        storage_snapshot_answer(raw_id)
+    } else {
+        storage_tree_answer(query)
+    };
+    let if_none_match = header(&request, "If-None-Match").map(str::to_string);
+    answers::respond(request, &answer, if_none_match.as_deref())
+}
+
+fn empty_storage_tree_json(projects: &[String], backend: &str, mode_note: &str) -> Value {
+    json!({
+        "projects": projects,
+        "active_project": Value::Null,
+        "summary": {
+            "total_snapshots": 0,
+            "live_snapshots": 0,
+            "collected_snapshots": 0,
+            "active_refs": 0,
+            "history_entries": 0,
+            "truncated": false,
+            "backend": backend,
+            "mode_note": mode_note,
+        },
+        "nodes": [],
+        "refs": [],
+        "history": [],
+    })
+}
+
+fn storage_tree_for_store(
+    store: &spawn_postgres::PostgresStore,
+    requested_project: Option<&str>,
+    limit: usize,
+) -> Result<Value, String> {
+    let all_refs = list_all_refs_safe(store)?;
+    let all_logs = list_all_ref_logs_safe(store)?;
+    let has_d6_data = !all_refs.is_empty() || !all_logs.is_empty();
+    let (backend, mode_note) = detect_storage_backend(has_d6_data);
+
+    let mut projects_set = BTreeSet::new();
+    for r in &all_refs {
+        projects_set.insert(r.project.clone());
+    }
+    for l in &all_logs {
+        projects_set.insert(l.project.clone());
+    }
+    let projects: Vec<String> = projects_set.into_iter().collect();
+
+    let active_project = requested_project.map(str::to_string).or_else(|| {
+        all_refs
+            .iter()
+            .map(|r| r.project.clone())
+            .min()
+            .or_else(|| projects.first().cloned())
+    });
+
+    let Some(project) = active_project else {
+        return Ok(empty_storage_tree_json(&projects, backend, &mode_note));
+    };
+
+    let mut project_refs: Vec<&spawn_postgres::RefRow> =
+        all_refs.iter().filter(|r| r.project == project).collect();
+    project_refs.sort_by(|a, b| {
+        let a_main = classify_ref_kind(&a.name, a.kind) == "main";
+        let b_main = classify_ref_kind(&b.name, b.kind) == "main";
+        b_main.cmp(&a_main).then_with(|| a.name.cmp(&b.name))
+    });
+
+    let mut project_logs: Vec<&spawn_postgres::RefLogRow> =
+        all_logs.iter().filter(|l| l.project == project).collect();
+    project_logs.sort_by_key(|entry| std::cmp::Reverse(entry.seq));
+
+    let (nodes, truncated) =
+        collect_project_snapshots(store, &project, &project_refs, &project_logs, limit)?;
+
+    let mut refs_by_snap: HashMap<&str, Vec<Value>> = HashMap::new();
+    for r in &project_refs {
+        refs_by_snap
+            .entry(r.snapshot.as_str())
+            .or_default()
+            .push(ref_badge_json(r));
+    }
+
+    let live_snapshots = nodes
+        .iter()
+        .filter(|row| row.state == spawn_postgres::SnapshotState::Live)
+        .count();
+    let collected_snapshots = nodes.len().saturating_sub(live_snapshots);
+
+    let node_values: Vec<Value> = nodes
+        .iter()
+        .map(|row| {
+            let attached = refs_by_snap.remove(row.id.as_str()).unwrap_or_default();
+            json!({
+                "snapshot_id": row.id,
+                "parent_ids": row.parents,
+                "tree_oid": row.tree,
+                "created_at_ms": row.created_at_ms,
+                "git_oid": row.git_oid,
+                "state": row.state.as_str(),
+                "is_merge": row.parents.len() >= 2,
+                "refs": attached,
+            })
+        })
+        .collect();
+    let ref_values: Vec<Value> = project_refs.iter().map(|r| ref_json(r)).collect();
+    let history_values: Vec<Value> = project_logs
+        .iter()
+        .take(STORAGE_HISTORY_MAX)
+        .map(|l| ref_log_json(l))
+        .collect();
+
+    Ok(json!({
+        "projects": projects,
+        "active_project": project,
+        "summary": {
+            "total_snapshots": node_values.len(),
+            "live_snapshots": live_snapshots,
+            "collected_snapshots": collected_snapshots,
+            "active_refs": ref_values.len(),
+            "history_entries": project_logs.len(),
+            "truncated": truncated,
+            "backend": backend,
+            "mode_note": mode_note,
+        },
+        "nodes": node_values,
+        "refs": ref_values,
+        "history": history_values,
+    }))
+}
+
+fn recovery_commands_for_snapshot(snap: &spawn_postgres::SnapshotRow) -> Vec<Value> {
+    let short_id = short_snapshot_id(&snap.id);
+    let proj_arg = shell_token(&snap.project);
+    let git_arg = shell_token(&snap.git_oid);
+    let branch_name = format!("recover/{short_id}");
+    let rollback_reason = shell_token(&format!("time-machine rollback to {short_id}"));
+    vec![
+        json!({
+            "id": "verify_status",
+            "label": "Inspect D6 cutover status",
+            "description": "Read-only inspection of current D6/Git cutover phase, CAS directory, and ref state.",
+            "command": format!("spawn storage cutover --status --project {proj_arg} --json"),
+            "risk": "read_only",
+        }),
+        json!({
+            "id": "verify_parity",
+            "label": "Verify CAS parity",
+            "description": "Read-only parity check between D6 Merkle snapshots and the projected Git border.",
+            "command": format!("spawn storage cutover --verify --project {proj_arg} --json"),
+            "risk": "read_only",
+        }),
+        json!({
+            "id": "inspect_commit",
+            "label": "Inspect projected commit",
+            "description": "Show commit summary and touched paths for this snapshot's projected Git OID.",
+            "command": format!("git show --stat {git_arg}"),
+            "risk": "read_only",
+        }),
+        json!({
+            "id": "create_branch",
+            "label": "Create recovery branch",
+            "description": "Non-destructive branch at this point-in-time snapshot to test or cherry-pick forward.",
+            "command": format!("git checkout -b {branch_name} {git_arg}"),
+            "risk": "branch",
+        }),
+        json!({
+            "id": "rollback_git",
+            "label": "Rollback project to writable Git",
+            "description": "Retires live D6 refs while preserving append-only snapshot/ref audit history.",
+            "command": format!("spawn storage cutover --rollback git --project {proj_arg} --reason {rollback_reason}"),
+            "risk": "rollback",
+        }),
+    ]
+}
+
+fn snapshot_ancestors(
+    store: &spawn_postgres::PostgresStore,
+    root: &spawn_postgres::SnapshotRow,
+) -> Result<Vec<Value>, String> {
+    let mut ancestors = Vec::new();
+    let mut visited = std::collections::HashSet::from([root.id.clone()]);
+    let mut queue = std::collections::VecDeque::new();
+    for parent in &root.parents {
+        if visited.insert(parent.clone()) {
+            queue.push_back((parent.clone(), 1usize));
+        }
+    }
+    while let Some((id, depth)) = queue.pop_front() {
+        let Some(row) = get_snapshot_safe(store, SnapshotLookup::Digest(&id))? else {
+            continue;
+        };
+        ancestors.push(json!({
+            "snapshot_id": row.id,
+            "git_oid": row.git_oid,
+            "tree_oid": row.tree,
+            "parent_ids": row.parents,
+            "state": row.state.as_str(),
+            "created_at_ms": row.created_at_ms,
+            "depth": depth,
+        }));
+        if depth < SNAPSHOT_ANCESTOR_MAX_DEPTH && ancestors.len() < SNAPSHOT_CHILDREN_SCAN_MAX {
+            for next_parent in &row.parents {
+                if visited.insert(next_parent.clone()) {
+                    queue.push_back((next_parent.clone(), depth + 1));
+                }
+            }
+        }
+    }
+    Ok(ancestors)
+}
+
+fn storage_snapshot_for_store(
+    store: &spawn_postgres::PostgresStore,
+    raw_id: &str,
+) -> Result<Option<Value>, String> {
+    let (normalized, kind) = parse_snapshot_lookup(raw_id)?;
+    let Some(snap) = get_snapshot_safe(store, kind.as_lookup(&normalized))? else {
+        return Ok(None);
+    };
+
+    let project_refs = match store.list_refs(Some(&snap.project)) {
+        Ok(rows) => rows,
+        Err(error) if is_missing_d6_relation(&error) => Vec::new(),
+        Err(error) => return Err(err(error)),
+    };
+    let all_logs = list_all_ref_logs_safe(store)?;
+    let mut project_logs: Vec<&spawn_postgres::RefLogRow> = all_logs
+        .iter()
+        .filter(|l| l.project == snap.project)
+        .collect();
+    project_logs.sort_by_key(|entry| std::cmp::Reverse(entry.seq));
+
+    let ref_refs: Vec<&spawn_postgres::RefRow> = project_refs.iter().collect();
+    let (project_nodes, _) = collect_project_snapshots(
+        store,
+        &snap.project,
+        &ref_refs,
+        &project_logs,
+        SNAPSHOT_CHILDREN_SCAN_MAX,
+    )?;
+
+    let attached_refs: Vec<Value> = project_refs
+        .iter()
+        .filter(|r| r.snapshot == snap.id)
+        .map(ref_badge_json)
+        .collect();
+    let children: Vec<Value> = project_nodes
+        .iter()
+        .filter(|candidate| candidate.parents.iter().any(|p| p == &snap.id))
+        .map(|row| {
+            json!({
+                "snapshot_id": row.id,
+                "git_oid": row.git_oid,
+                "tree_oid": row.tree,
+                "parent_ids": row.parents,
+                "state": row.state.as_str(),
+                "created_at_ms": row.created_at_ms,
+            })
+        })
+        .collect();
+    let scoped_history: Vec<Value> = project_logs
+        .into_iter()
+        .filter(|l| {
+            l.new_snapshot == snap.id || l.old_snapshot.as_deref() == Some(snap.id.as_str())
+        })
+        .take(50)
+        .map(ref_log_json)
+        .collect();
+    let ancestors = snapshot_ancestors(store, &snap)?;
+    let recovery_commands = recovery_commands_for_snapshot(&snap);
+
+    Ok(Some(json!({
+        "snapshot": {
+            "snapshot_id": snap.id,
+            "project": snap.project,
+            "parent_ids": snap.parents,
+            "tree_oid": snap.tree,
+            "git_oid": snap.git_oid,
+            "state": snap.state.as_str(),
+            "created_at_ms": snap.created_at_ms,
+            "is_merge": snap.parents.len() >= 2,
+        },
+        "refs": attached_refs,
+        "ancestors": ancestors,
+        "children": children,
+        "history": scoped_history,
+        "recovery_commands": recovery_commands,
+    })))
+}
+
+/// Read-only `GET|HEAD /api/storage/tree[?project=<name>&limit=<N>]` answer
+/// with weak `ETag` validation (graceful empty response in `git` mode / empty ledger).
+pub(in crate::serve) fn storage_tree_answer(query: &str) -> answers::Answer {
+    let read = (|| -> Result<Value, String> {
+        let (project, limit) = parse_storage_tree_query(query)?;
+        let store = open_store()?;
+        storage_tree_for_store(&store, project.as_deref(), limit)
+    })();
+    answers::answer("/api/storage/tree", read, BAD_REQUEST)
+}
+
+/// Read-only `GET|HEAD /api/storage/snapshot/<id>` answer (`400` on malformed id,
+/// `404` when unknown, weak `ETag` / `304` on hit).
+pub(in crate::serve) fn storage_snapshot_answer(raw_id: &str) -> answers::Answer {
+    let read = (|| -> Result<(String, Option<Value>), String> {
+        let (normalized, _) = parse_snapshot_lookup(raw_id)?;
+        let store = open_store()?;
+        let found = storage_snapshot_for_store(&store, &normalized)?;
+        Ok((normalized, found))
+    })();
+    match read {
+        Ok((_, Some(value))) => answers::answer("/api/storage/snapshot/*", Ok(value), BAD_REQUEST),
+        Ok((normalized, None)) => answers::Answer {
+            status: 404,
+            body: json!({
+                "error": format!("snapshot not found: {normalized}"),
+                "code": "snapshot_not_found",
+            })
+            .to_string(),
+            etag: None,
+        },
+        Err(error) => answers::answer("/api/storage/snapshot/*", Err(error), BAD_REQUEST),
+    }
 }
 
 /// Put each task's last gate verdict from `gates` (keyed by task id) on the
@@ -9112,5 +9757,278 @@ mod tests {
         assert_eq!(r_degraded["state"], "active,degraded");
         assert_eq!(r_degraded["host_fault_strikes"], 3);
         assert_eq!(r_degraded["schedulable"], false);
+    }
+
+    #[test]
+    fn storage_tree_and_snapshot_validate_queries_and_ids_before_db() {
+        for bad_query in ["limit=0", "limit=501", "limit=abc", "limit=", "project=%ff"] {
+            let ans = super::storage_tree_answer(bad_query);
+            assert_eq!(ans.status, 400, "{bad_query}: {}", ans.body);
+            let err = super::parse_storage_tree_query(bad_query).expect_err(bad_query);
+            assert!(err.starts_with(super::BAD_REQUEST), "{bad_query}: {err}");
+        }
+        assert_eq!(
+            super::parse_storage_tree_query("project=my%2Dproj&limit=40").expect("valid query"),
+            (Some("my-proj".to_string()), 40)
+        );
+        for bad_id in ["bad", "sha256:1234", "g".repeat(40).as_str(), "%zz"] {
+            let ans = super::storage_snapshot_answer(bad_id);
+            assert_eq!(ans.status, 400, "{bad_id}: {}", ans.body);
+        }
+        assert_eq!(
+            super::classify_ref_kind("worker/agent-1", spawn_postgres::RefKind::Branch),
+            "worker"
+        );
+        assert_eq!(
+            super::classify_ref_kind("task/42", spawn_postgres::RefKind::Branch),
+            "task"
+        );
+        assert_eq!(
+            super::classify_ref_log_action(None, "bootstrap main"),
+            "created"
+        );
+        assert_eq!(
+            super::classify_ref_log_action(Some("sha256:a"), "retire rollback"),
+            "rollback"
+        );
+        assert_eq!(
+            super::classify_ref_log_action(Some("sha256:a"), "land task 42"),
+            "merged"
+        );
+    }
+
+    struct SeededD6Dag {
+        s0: String,
+        s1: String,
+        s3: String,
+        o0: String,
+        o3: String,
+    }
+
+    fn seed_d6_test_dag(store: &spawn_postgres::PostgresStore) -> SeededD6Dag {
+        let hex64 = |b: &str| format!("sha256:{}", b.repeat(32));
+        let oid40 = |b: &str| b.repeat(20);
+        let tree = hex64("aa");
+        let (s0, o0) = (hex64("10"), oid40("10"));
+        let (s1, o1) = (hex64("20"), oid40("20"));
+        let (s2, o2) = (hex64("30"), oid40("30"));
+        let (s3, o3) = (hex64("40"), oid40("40"));
+        let (sb, ob) = (hex64("50"), oid40("50"));
+
+        let s0_ref = std::slice::from_ref(&s0);
+        let merge_parents = [s0.clone(), s1.clone()];
+        let specs: [(&str, &str, &[String], &str, i64); 5] = [
+            (&s0, &o0, &[], "proj-alpha", 1_700_000_000_000),
+            (&s1, &o1, s0_ref, "proj-alpha", 1_700_000_010_000),
+            (&s2, &o2, s0_ref, "proj-alpha", 1_700_000_020_000),
+            (&s3, &o3, &merge_parents, "proj-alpha", 1_700_000_030_000),
+            (&sb, &ob, &[], "proj-beta", 1_700_000_040_000),
+        ];
+        for (id, oid, parents, proj, ts) in specs {
+            store
+                .record_snapshot(id, oid, &tree, parents, proj, ts)
+                .expect(id);
+        }
+
+        store
+            .land_main_ref("proj-alpha", "main", None, &s0, None, "bootstrap main")
+            .expect("bootstrap main");
+        let mission = store
+            .mission_add("D6 serve test", &json!(["/tmp/proj-alpha.git"]), "human")
+            .expect("add mission");
+        store
+            .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+            .expect("configure mission");
+        let task = store
+            .task_assign(mission, "ephemeral", "w_serve", "land d6", "default")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store
+            .integrator_record(&json!({
+                "type": "task.gated",
+                "id": task,
+                "revision": 0,
+                "verdict": "accepted",
+                "base": o0,
+                "candidate": o3,
+            }))
+            .expect("task.gated");
+        store
+            .land_main_ref(
+                "proj-alpha",
+                "main",
+                Some(&s0),
+                &s3,
+                Some(task),
+                "land merge s3",
+            )
+            .expect("advance main");
+
+        for (name, target, msg) in [
+            ("worker/agent-1", &s1, "fork worker"),
+            ("task/42", &s2, "fork task"),
+        ] {
+            store
+                .cas_ref(
+                    "proj-alpha",
+                    name,
+                    spawn_postgres::RefKind::Branch,
+                    None,
+                    target,
+                    msg,
+                )
+                .expect(name);
+        }
+        store
+            .land_main_ref("proj-beta", "main", None, &sb, None, "bootstrap beta")
+            .expect("beta main");
+        SeededD6Dag { s0, s1, s3, o0, o3 }
+    }
+
+    fn send_storage_test_http(reader_url: &str, raw_req: &str) -> Answer {
+        use std::io::{Read, Write};
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let shared = Shared {
+            web: std::env::temp_dir(),
+            token: None,
+            port: Some(port),
+            hosts: server_hosts("127.0.0.1:0", port),
+            open: open_networks(Some("")).expect("networks"),
+            owner_url: None,
+        };
+        let url_for_worker = reader_url.to_string();
+        let worker = std::thread::spawn(move || {
+            let request = server.recv().expect("request");
+            super::with_reader_url(&url_for_worker, || {
+                handle(request, &shared).expect("answered");
+            });
+        });
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        client
+            .write_all(raw_req.replace("PORT", &port.to_string()).as_bytes())
+            .expect("send");
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).expect("read");
+        worker.join().expect("handler");
+        let (head, body) = answer.split_once("\r\n\r\n").unwrap_or((&answer, ""));
+        Answer {
+            status: head
+                .split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse().ok())
+                .expect("status line"),
+            head: head.to_string(),
+            body: serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
+        }
+    }
+
+    #[test]
+    fn storage_tree_and_snapshot_endpoints_work_empty_and_with_d6_dag() {
+        in_test_schema(|owner, store| {
+            let reader_url =
+                spawn_postgres::role_url(owner, "spawn_reader").expect("reader role url");
+            let reader_store =
+                spawn_postgres::PostgresStore::connect(&reader_url).expect("connect reader store");
+
+            let empty = super::storage_tree_for_store(&reader_store, None, 120)
+                .expect("empty tree succeeds");
+            assert_eq!(empty["nodes"].as_array().unwrap().len(), 0);
+            assert_eq!(empty["refs"].as_array().unwrap().len(), 0);
+            assert_eq!(empty["history"].as_array().unwrap().len(), 0);
+            assert_eq!(empty["summary"]["total_snapshots"], 0);
+            assert_eq!(empty["summary"]["backend"], "git");
+            assert!(
+                !empty["summary"]["mode_note"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+
+            let dag = seed_d6_test_dag(store);
+            let tree_json = super::storage_tree_for_store(&reader_store, Some("proj-alpha"), 120)
+                .expect("proj-alpha tree");
+            assert_eq!(tree_json["projects"], json!(["proj-alpha", "proj-beta"]));
+            assert_eq!(tree_json["active_project"], "proj-alpha");
+            assert_eq!(tree_json["summary"]["backend"], "d6");
+            assert_eq!(tree_json["summary"]["total_snapshots"], 4);
+            assert_eq!(tree_json["summary"]["active_refs"], 3);
+            assert_eq!(tree_json["summary"]["history_entries"], 4);
+            assert_eq!(tree_json["summary"]["truncated"], false);
+            assert_eq!(tree_json["nodes"][0]["snapshot_id"], dag.s3);
+            assert_eq!(tree_json["nodes"][0]["is_merge"], true);
+            assert_eq!(tree_json["nodes"][0]["parent_ids"], json!([dag.s0, dag.s1]));
+            assert_eq!(tree_json["nodes"][0]["refs"][0]["name"], "main");
+            assert_eq!(tree_json["history"][0]["name"], "task/42");
+            assert_eq!(tree_json["history"][2]["action"], "merged");
+
+            let snap_s3 = super::storage_snapshot_for_store(&reader_store, &dag.s3)
+                .expect("query s3")
+                .expect("s3 exists");
+            assert_eq!(snap_s3["snapshot"]["snapshot_id"], dag.s3);
+            assert_eq!(snap_s3["ancestors"].as_array().unwrap().len(), 2);
+            assert_eq!(snap_s3["refs"][0]["name"], "main");
+            assert_eq!(snap_s3["recovery_commands"].as_array().unwrap().len(), 5);
+
+            let snap_s0_by_oid = super::storage_snapshot_for_store(&reader_store, &dag.o0)
+                .expect("query o0")
+                .expect("o0 exists");
+            assert_eq!(snap_s0_by_oid["snapshot"]["snapshot_id"], dag.s0);
+            assert_eq!(snap_s0_by_oid["children"].as_array().unwrap().len(), 3);
+
+            let tree_res = send_storage_test_http(
+                &reader_url,
+                "GET /api/storage/tree?project=proj-alpha HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\nConnection: close\r\n\r\n",
+            );
+            assert_eq!(tree_res.status, 200, "{}", tree_res.head);
+            assert_eq!(tree_res.body["summary"]["total_snapshots"], 4);
+            let etag = tree_res
+                .head
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    k.eq_ignore_ascii_case("etag").then(|| v.trim().to_string())
+                })
+                .expect("ETag header");
+            let cached = send_storage_test_http(
+                &reader_url,
+                &format!(
+                    "GET /api/storage/tree?project=proj-alpha HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\nIf-None-Match: {etag}\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            assert_eq!(cached.status, 304, "{}", cached.head);
+
+            let snap_res = send_storage_test_http(
+                &reader_url,
+                &format!(
+                    "GET /api/storage/snapshot/{} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\nConnection: close\r\n\r\n",
+                    dag.s3
+                ),
+            );
+            assert_eq!(snap_res.status, 200, "{}", snap_res.head);
+            assert_eq!(snap_res.body["snapshot"]["git_oid"], dag.o3);
+
+            let missing_id = format!("sha256:{}", "ff".repeat(32));
+            let not_found = send_storage_test_http(
+                &reader_url,
+                &format!(
+                    "GET /api/storage/snapshot/{missing_id} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            assert_eq!(not_found.status, 404, "{}", not_found.head);
+
+            let bad_res = send_storage_test_http(
+                &reader_url,
+                "GET /api/storage/snapshot/not-valid HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\nConnection: close\r\n\r\n",
+            );
+            assert_eq!(bad_res.status, 400, "{}", bad_res.head);
+
+            let method_res = send_storage_test_http(
+                &reader_url,
+                "POST /api/storage/tree HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            assert_eq!(method_res.status, 405, "{}", method_res.head);
+        });
     }
 }

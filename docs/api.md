@@ -77,10 +77,12 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 
 ### Out-of-table read-only endpoints
 
-These two contract-locked read-only endpoints are dispatched directly before `ROUTES` (so `ROUTES` stays 33 GET + 9 POST patterns; both execute on the `reads` pool as `spawn_reader`, return `405` with `Allow: GET` on non-`GET`/`HEAD`, and support local UDS IPC parity — see [spawn-ipc-v1.md](./spawn-ipc-v1.md)):
+These four contract-locked read-only endpoints are dispatched directly before `ROUTES` (so `ROUTES` stays 33 GET + 9 POST patterns; all four execute on the `reads` pool as `spawn_reader`, return `405` with `Allow: GET` on non-`GET`/`HEAD`, and keep weak `ETag` / `304` validation):
 
 - **`GET|HEAD /api/episodes[?mission=<id>]`**: Replays `session_control` into typed `TaskEpisode`s and reports parity against SQL projections: `{mission, episodes, summary, parity_ok, warnings, drift_count}` (weak `ETag` / `304`, no wall clock in body). CLI twin: `spawn mission episodes [--mission N] [--strict] [--verify-parity] [--json]` (`--verify-parity` exits `0` on match, `1` on drift). Read by web (`#/grading` episode replay panel).
 - **`GET|HEAD /api/features/truth[?project=<name>|?mission=<id>]`**: Evaluates real code-graph dependency and purity truth against `docs/feature-map/registry.json` (bounded LRU cache, weak `ETag`): `{root, registry_path, git_head, today, projection, counts, enforced_violations, findings, purity}`. CLI twin: `spawn features check --deps report|enforce --purity report|enforce`. Read by web (`#/features`).
+- **`GET|HEAD /api/storage/tree[?project=<name>&limit=<N>]`**: Reads the D6 CAS snapshot DAG (`spawn_snapshots`), live refs (`spawn_refs`), and append-only transition ledger (`spawn_ref_log`) on the `spawn_reader` login: `{projects, active_project, summary, nodes, refs, history}` (`limit` default `120`, max `500`; `400` on invalid `limit`/`project`; weak `ETag` / `304`, no wall clock in body). Gracefully returns `200` with empty `nodes`/`refs`/`history` and `summary.backend` + `summary.mode_note` when no D6 data is recorded or in `git` mode. CLI twin: `spawn storage cutover --status --json`. Read by web (`#/storage`).
+- **`GET|HEAD /api/storage/snapshot/<id>`**: Reads one D6 snapshot by `sha256:<64 hex>` snapshot ID or `40 hex` projected `git_oid`: `{snapshot, refs, ancestors, children, history, recovery_commands}` (BFS ancestors up to depth `32`, scoped `spawn_ref_log` transitions, and safe read-only / branch / rollback CLI preview commands; `400` on malformed id, `404` when unknown, weak `ETag` / `304`). Read by web (`#/storage` Time-Machine drawer).
 
 ## Writes
 
