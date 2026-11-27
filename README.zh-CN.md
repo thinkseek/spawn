@@ -114,7 +114,7 @@ spawn say agent_demo "please also add a test"                  # 向运行中的
 | 分级与代码图 | `grade`、`features`、`prov` |
 | 节点与存储 | `node`、`backup`、`store`、`source`、`scratch`、`commit-map`、`mask` |
 
-`scripts/fleet-sync-node.sh` 把已发布的 `spawn-node`（或完整 Spawn）构建拉到节点上：校验 checksum、替换二进制、重启 unit，健康检查失败时回滚。
+节点发布：`scripts/fleet-build-manifest.sh` 打包 `spawn-node`（或完整 Spawn）构建并写出带 checksum 的 `release.manifest`；`scripts/fleet-sync-node.sh --manifest <file|url>` 把它拉到节点上：校验 checksum、替换二进制、重启 unit，健康检查失败时回滚。`spawn node list` 显示每个节点上报的版本与构建 SHA（`--json`：`node_version`、`build_sha`）。
 
 ## 开发
 
@@ -134,6 +134,7 @@ spawn features check --deps enforce
 | [docs/architecture.md](./docs/architecture.md)、[docs/design.md](./docs/design.md) | 架构与技术方案 |
 | [docs/fleet-architecture.md](./docs/fleet-architecture.md) | 判定、控制、mission、落地、节点、告警（英文） |
 | [docs/api.md](./docs/api.md) | 每个 HTTP 路由及其对应的 CLI 命令（英文） |
+| [docs/config.md](./docs/config.md) | 引擎配置：模型槽固定与专用 Claude Code 目录（`SPAWN_CLAUDE_CONFIG_DIR`）（英文） |
 | [docs/storage.md](./docs/storage.md)、[docs/d6-cas-v1.md](./docs/d6-cas-v1.md) | 存储、工作区后端、CAS 格式（英文） |
 | [docs/agent-grading.md](./docs/agent-grading.md) | 任务分级与路由（英文） |
 | [docs/feature-map.md](./docs/feature-map.md) | Feature 注册表与依赖检查（英文） |

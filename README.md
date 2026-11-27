@@ -114,7 +114,7 @@ A workspace root records the backend that claimed it; an incompatible backend is
 | Grading & code map | `grade`, `features`, `prov` |
 | Nodes & storage | `node`, `backup`, `store`, `source`, `scratch`, `commit-map`, `mask` |
 
-`scripts/fleet-sync-node.sh` pulls a published `spawn-node` (or full Spawn) build onto a node: verifies checksums, swaps binaries, restarts units and rolls back on a failed health check.
+Node releases: `scripts/fleet-build-manifest.sh` stages a `spawn-node` (or full Spawn) build and writes its checksummed `release.manifest`; `scripts/fleet-sync-node.sh --manifest <file|url>` pulls it onto a node, verifies checksums, swaps binaries, restarts units and rolls back on a failed health check. `spawn node list` shows each node's reported version and build SHA (`--json`: `node_version`, `build_sha`).
 
 ## Development
 
@@ -134,6 +134,7 @@ The landing gate runs every check on one tree: `scripts/rsi/gate.sh $PWD/.git HE
 | [docs/architecture.md](./docs/architecture.md), [docs/design.md](./docs/design.md) | Architecture and design (Chinese) |
 | [docs/fleet-architecture.md](./docs/fleet-architecture.md) | Observation, control, missions, landing, nodes, alerts |
 | [docs/api.md](./docs/api.md) | Every HTTP route and its CLI twin |
+| [docs/config.md](./docs/config.md) | Engine configuration: model pinning and a dedicated Claude Code directory (`SPAWN_CLAUDE_CONFIG_DIR`) |
 | [docs/storage.md](./docs/storage.md), [docs/d6-cas-v1.md](./docs/d6-cas-v1.md) | Storage, workspace backends, CAS format |
 | [docs/agent-grading.md](./docs/agent-grading.md) | Task grading and routing |
 | [docs/feature-map.md](./docs/feature-map.md) | Feature registry and dependency checks |
