@@ -1,0 +1,32 @@
+{
+  "schema": "pkcs8-ed25519-v2",
+  "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "pubkey_b64u": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+  "key_id": "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+  "spki_der_b64u": "MCowBQYDK2VwAyEAA6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+  "message": "spawn-pkcs8-v2-golden-message",
+  "signature_b64u": "UU7WLBzhNEXeMG-SWnOzf51OqReJTIWbKNKn4m6Xz5PU9lWEKhrLWIwDdhF4cA6nCbVJXbI_hyV-XOQi5mUqCQ",
+  "formats": {
+    "v1": {
+      "version": 1,
+      "len": 48,
+      "file": "key.v1.der",
+      "der_b64u": "MC4CAQAwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f",
+      "sha256_hex": "2f8016c2daf584fd694c5a224a51da06386a73fc4b1941d301238d5d8c59c165"
+    },
+    "v2_ring": {
+      "version": 2,
+      "len": 83,
+      "file": "key.v2-ring.der",
+      "der_b64u": "MFECAQEwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fgSEAA6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+      "sha256_hex": "d4a83a77afa9ad8e775058f1b5d950a028bfa0ac910f7b7cad87092b03588bb6"
+    },
+    "v2_rfc8410": {
+      "version": 2,
+      "len": 85,
+      "file": "key.v2-rfc8410.der",
+      "der_b64u": "MFMCAQEwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4foSMDIQADoQe_884Qvh1w3RjnS8CZZ-TWMJulDV8d3IZkElUxuA",
+      "sha256_hex": "9a0b8199e7dc9194155bf17043223fabe95da65cc128dbf7928f5e4818c58a2a"
+    }
+  }
+}

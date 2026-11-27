@@ -2282,6 +2282,16 @@
         "web/src/e2e.ts",
         "web/src/nodes.ts",
         "web/test/e2e.test.ts",
+        "web/test/fixtures/pkcs8-ed25519-v2/MANIFEST.sha256",
+        "web/test/fixtures/pkcs8-ed25519-v2/key.spki.der",
+        "web/test/fixtures/pkcs8-ed25519-v2/key.v1.der",
+        "web/test/fixtures/pkcs8-ed25519-v2/key.v2-rfc8410.der",
+        "web/test/fixtures/pkcs8-ed25519-v2/key.v2-ring.der",
+        "web/test/fixtures/pkcs8-ed25519-v2/reject.json",
+        "web/test/fixtures/pkcs8-ed25519-v2/vectors.json",
+        "web/test/fixtures/spawn-e2e-v2/MANIFEST.sha256",
+        "web/test/fixtures/spawn-e2e-v2/reject.json",
+        "web/test/fixtures/spawn-e2e-v2/vectors.json",
         "web/test/nodes.test.ts"
       ],
       "relations": [
