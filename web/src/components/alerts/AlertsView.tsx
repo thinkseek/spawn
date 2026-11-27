@@ -5,7 +5,7 @@ import { fetchAlerts, usePoll } from "../../api";
 import type { FleetAgent } from "../../fleet";
 import { alertMoot, alertRowWords, alertStale, alertTitle, openAlertsLine } from "../../home";
 import { absoluteTitle, localDateTime, relativeTime } from "../../format";
-import { currentNotices, earlierWords } from "../../notices";
+import { currentNotices, earlierWords, externalMainAdvanceCount, missionListText, noticeTitle, safeNoticeEvidence, sourceMainNotice, type SourceMainNotice } from "../../notices";
 import { LiveStatus, PageHeader, cx } from "../ui";
 import { useNowEvery } from "../timeaxis/useTimeWindow";
 
@@ -19,6 +19,53 @@ function stateClass(state: Alert["state"]): string {
     default:
       return "bg-muted text-muted-foreground ring-surface-border";
   }
+}
+
+function updateKindBadgeClass(notice: SourceMainNotice): string {
+  if (notice.kind === "source_main_synced") {
+    return "bg-muted text-muted-foreground ring-surface-border";
+  }
+  if (notice.updateKind === "non_fast_forward" || notice.updateKind === "rewound") {
+    return "bg-wait-tint text-warning ring-warning/25";
+  }
+  return "bg-muted text-foreground ring-surface-border";
+}
+
+function SourceMainDetails({ notice }: { notice: SourceMainNotice }) {
+  const missionText = missionListText(notice.missions);
+  return (
+    <div className="mt-1.5 space-y-1 rounded border border-surface-border bg-muted/40 px-2.5 py-2 text-micro">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span
+          className={cx(
+            "rounded px-1.5 py-px font-mono font-medium ring-1 ring-inset",
+            updateKindBadgeClass(notice),
+          )}
+        >
+          {notice.badge}
+        </span>
+        <span className="font-mono text-muted-foreground">{notice.ref}</span>
+        {notice.range && <span className="tnum font-mono text-foreground">{notice.range}</span>}
+        {notice.delta && <span className="tnum text-muted-foreground">{notice.delta}</span>}
+        {notice.landingEventId !== null && (
+          <span className="tnum font-mono text-faint-foreground">event #{notice.landingEventId}</span>
+        )}
+        {missionText && <span className="tnum text-faint-foreground">{missionText}</span>}
+      </div>
+      {notice.subjects.length > 0 && (
+        <ul className="space-y-0.5 border-t border-surface-border/70 pt-1 font-mono text-muted-foreground">
+          {notice.subjects.map((subject, index) => (
+            <li key={`${index}:${subject}`} className="truncate">
+              {subject}
+            </li>
+          ))}
+          {notice.moreSubjects > 0 && (
+            <li className="tnum text-faint-foreground">+{notice.moreSubjects} more commits</li>
+          )}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 function Evidence({ label, value }: { label: string; value: unknown }) {
@@ -48,6 +95,7 @@ function AlertRow({
 }) {
   const at =
     alert.state === "cleared" ? (alert.cleared_at_ms ?? alert.fired_at_ms) : alert.fired_at_ms;
+  const mainNotice = sourceMainNotice(alert);
   return (
     <li className="border-b border-surface-border px-4 py-3 last:border-b-0">
       <div className="flex flex-wrap items-baseline gap-2">
@@ -75,14 +123,17 @@ function AlertRow({
           {relativeTime(at)} · {localDateTime(at, true)}
         </span>
       </div>
-      <p className="mt-1 text-caption text-foreground">{alertRowWords(alert, now)}</p>
+      <p className="mt-1 text-caption text-foreground">
+        {mainNotice ? mainNotice.summary : alertRowWords(alert, now)}
+      </p>
+      {mainNotice && <SourceMainDetails notice={mainNotice} />}
       {note && <p className="mt-0.5 text-micro text-warning">{note}</p>}
       {alert.scored_at_ms != null && (
         <p className="tnum mt-0.5 text-micro text-muted-foreground" title={absoluteTitle(alert.scored_at_ms)}>
           last scored {relativeTime(alert.scored_at_ms)}
         </p>
       )}
-      <Evidence label="evidence" value={alert.evidence} />
+      <Evidence label="evidence" value={safeNoticeEvidence(alert)} />
       {alert.state === "cleared" && <Evidence label="cleared by" value={alert.cleared_evidence} />}
     </li>
   );
@@ -110,6 +161,7 @@ export function AlertsView({
   const moot = open.filter((alert) => alertMoot(alert, agents));
   const notices = currentNotices(data);
   const folded = notices.reduce((sum, notice) => sum + notice.earlier, 0);
+  const mainAdvances = externalMainAdvanceCount(notices);
   const cleared = data.filter((alert) => alert.state === "cleared");
 
   return (
@@ -200,6 +252,11 @@ export function AlertsView({
           <details className="border-t border-surface-border">
             <summary className="cursor-pointer select-none px-4 py-2 text-caption text-muted-foreground hover:text-foreground">
               All notices <span className="tnum text-faint-foreground">{notices.length}</span>
+              {mainAdvances > 0 && (
+                <span className="tnum text-warning">
+                  {" "}· {mainAdvances} external main {mainAdvances === 1 ? "move" : "moves"}
+                </span>
+              )}
               {folded > 0 && (
                 <span className="tnum text-faint-foreground"> · {folded} earlier folded</span>
               )}
@@ -209,7 +266,13 @@ export function AlertsView({
             ) : (
               <ul>
                 {notices.map(({ alert, earlier }) => (
-                  <AlertRow key={alert.key} alert={alert} now={now} note={earlierWords(earlier)} />
+                  <AlertRow
+                    key={alert.key}
+                    alert={alert}
+                    now={now}
+                    title={noticeTitle(alert)}
+                    note={earlierWords(earlier)}
+                  />
                 ))}
               </ul>
             )}
