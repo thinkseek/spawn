@@ -236,12 +236,12 @@ export interface MissionTask extends Labels {
 }
 
 /** The halt a mission is in (/api/missions' `halt`): its `mission.halted`
- * record's event (what a resume from the page names), the reason, when,
- * and for a halt on the scenario floor the scenario files gone since the
- * gating that set it (null for any other halt). */
+ * record's event (what a resume from the page names), when, and for a halt
+ * on the scenario floor the scenario files gone since the gating that set
+ * it (null for any other halt). Its reason is the mission's `halted`, the
+ * one value the server writes both from. */
 export interface MissionHalt {
   event: number;
-  reason: string | null;
   at_ms: number | null;
   gone: string[] | null;
 }
@@ -433,7 +433,6 @@ export function normalizeHalt(value: unknown): MissionHalt | null {
   if (event === null) return null;
   return {
     event,
-    reason: optionalText(value.reason),
     at_ms: optionalNumber(value.at_ms),
     gone: Array.isArray(value.gone)
       ? value.gone.filter((name): name is string => typeof name === "string")

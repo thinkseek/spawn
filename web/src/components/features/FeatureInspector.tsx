@@ -213,12 +213,13 @@ function FeatureDetailBody({
         </div>
       )}
 
-      {/* 4 independent state booleans */}
-      <InspectorSection title="State evidence (4 independent flags)">
+      {/* Planned is "not implemented"; implemented, verified and live are
+          independent evidence (live does not imply verified). */}
+      <InspectorSection title="State evidence">
         <div className="grid grid-cols-2 gap-1.5">
           {(
             [
-              ["planned", "Planned", feature.planned],
+              ["planned", "Planned", !feature.implemented],
               ["implemented", "Implemented", feature.implemented],
               ["verified", "Verified", feature.verified],
               ["live", "Live", feature.live],

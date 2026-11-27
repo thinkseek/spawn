@@ -199,7 +199,8 @@ export interface Feature {
   files: string[];
   relations: FeatureRelation[];
   state: FeatureState;
-  planned: boolean;
+  /** Whether a landing exists: planned is its negation, not a fact of its
+   * own (the server still writes `planned` for older readers). */
   implemented: boolean;
   verified: boolean;
   live: boolean;
@@ -493,7 +494,6 @@ function normalizeFeature(value: unknown): Feature {
       .filter((rel): rel is FeatureRelation => rel !== null),
     state,
     // The server's booleans, not the state's: live does not imply verified.
-    planned: bool(raw.planned),
     implemented: bool(raw.implemented),
     verified: bool(raw.verified),
     live: bool(raw.live),
