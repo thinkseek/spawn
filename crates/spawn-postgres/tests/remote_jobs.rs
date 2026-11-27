@@ -1343,3 +1343,81 @@ fn v1_beat_power_projects_into_node_v1_and_nodes_v1() {
         None
     );
 }
+
+#[test]
+fn v1_beat_build_sha_and_node_version_project_into_node_v1_and_nodes_v1() {
+    let (store, schema) = store("rj_beat_build");
+    let n1 = enroll(&store, "nbld1", 51, &json!({}));
+    let n2 = enroll(&store, "nbld2", 52, &json!({}));
+    let b1 = boot(1);
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+
+    // Before any beat, and after a beat from a daemon that sends neither.
+    let row = store.node_v1("nbld1").expect("node_v1").expect("row");
+    assert_eq!((row.build_sha, row.node_version), (None, None));
+    assert_eq!(
+        beat_once(&store, &n1, &b1, 1, &beat(&[], &[], 2, 1024))["ok"],
+        true
+    );
+    let row = store.node_v1("nbld1").expect("node_v1").expect("row");
+    assert_eq!((row.build_sha, row.node_version), (None, None));
+
+    // A beat carrying both projects into node_v1 and nodes_v1.
+    let mut with_build = beat(&[], &[], 2, 1024);
+    with_build["build_sha"] = json!(sha);
+    with_build["node_version"] = json!("0.1.0");
+    assert_eq!(beat_once(&store, &n1, &b1, 2, &with_build)["ok"], true);
+    let row = store.node_v1("nbld1").expect("node_v1").expect("row");
+    assert_eq!(row.build_sha.as_deref(), Some(sha));
+    assert_eq!(row.node_version.as_deref(), Some("0.1.0"));
+    beat_once(&store, &n2, &b1, 1, &beat(&[], &[], 2, 1024));
+    let listed = store.nodes_v1().expect("nodes_v1");
+    let one = listed.iter().find(|n| n.name == "nbld1").expect("nbld1");
+    let two = listed.iter().find(|n| n.name == "nbld2").expect("nbld2");
+    assert_eq!(one.build_sha.as_deref(), Some(sha));
+    assert_eq!(one.node_version.as_deref(), Some("0.1.0"));
+    assert_eq!(
+        (two.build_sha.as_deref(), two.node_version.as_deref()),
+        (None, None)
+    );
+
+    // A stored beat holding malformed values (written around the gateway,
+    // which refuses them) reads as none, never as the bad text.
+    let mut client = admin(&schema);
+    for (bad_sha, bad_version) in [
+        (json!("ABCDEF0"), json!("0.1.0\n")),
+        (json!("abc12"), json!("x".repeat(65))),
+        (json!(1_234_567), json!(["0.1.0"])),
+        (json!("g".repeat(40)), json!("")),
+    ] {
+        client
+            .execute(
+                "update spawn_node_state
+                    set beat = beat || jsonb_build_object('build_sha', $1::jsonb,
+                                                          'node_version', $2::jsonb)
+                  where name = 'nbld1'",
+                &[&bad_sha, &bad_version],
+            )
+            .expect("write a malformed beat");
+        let row = store.node_v1("nbld1").expect("node_v1").expect("row");
+        assert_eq!(
+            (row.build_sha, row.node_version),
+            (None, None),
+            "{bad_sha} {bad_version}"
+        );
+        let listed = store.nodes_v1().expect("nodes_v1");
+        let one = listed.iter().find(|n| n.name == "nbld1").expect("nbld1");
+        assert_eq!(
+            (one.build_sha.as_deref(), one.node_version.as_deref()),
+            (None, None)
+        );
+    }
+
+    // A later beat without them clears them.
+    assert_eq!(
+        beat_once(&store, &n1, &b1, 3, &beat(&[], &[], 2, 1024))["ok"],
+        true
+    );
+    let row = store.node_v1("nbld1").expect("node_v1").expect("row");
+    assert_eq!((row.build_sha, row.node_version), (None, None));
+}

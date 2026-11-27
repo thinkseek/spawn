@@ -2960,10 +2960,12 @@
         "rsi/scenarios/nightly/149.sh",
         "rsi/scenarios/nightly/238.sh",
         "scripts/check-runtime-dir.sh",
+        "scripts/fleet-build-manifest.sh",
         "scripts/fleet-sync-node.sh",
         "scripts/maintenance.sh",
         "scripts/sandbox.sh",
         "scripts/stage.sh",
+        "scripts/test-fleet-build-manifest.sh",
         "scripts/test-fleet-sync-node.sh",
         "scripts/test-maintenance.sh"
       ],
@@ -2986,7 +2988,8 @@
           "scripts/test-web-install.sh",
           "deploy/test-sync-units.sh",
           "rsi/scenarios/check-sync-units.sh",
-          "scripts/test-fleet-sync-node.sh"
+          "scripts/test-fleet-sync-node.sh",
+          "scripts/test-fleet-build-manifest.sh"
         ],
         "deploys": [],
         "artifacts": [
