@@ -100,8 +100,8 @@ pub use workspace::{
     BACKEND_MARKER, CAS_DIRECTORY, LocalWorkspaceStore, WorkspaceBackend, claim_root, root_backend,
 };
 pub use workspace_rules::{
-    ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER, MAIN_COPIES, SET_ASIDE_FILES, SET_ASIDE_WAITS,
-    has_conflict_block, has_conflict_block_sized, names_files_outside_git,
+    ENGINE_RUNTIME_FILES, MAIN_COPIES, SET_ASIDE_FILES, SET_ASIDE_WAITS, has_conflict_block,
+    has_conflict_block_sized, names_files_outside_git,
 };
 
 /// The terminal host of this machine Spawn runs on: embedded `herdr-core`

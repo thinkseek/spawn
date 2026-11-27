@@ -24,8 +24,9 @@ use spawn_cas::{
     project_snapshot_oid, project_tree_oid, sha256_of, sha256_reader,
 };
 
+use crate::canonical_root;
 use crate::tree_path::TreePath;
-use crate::{ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER, canonical_root};
+use crate::workspace_rules::{ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER};
 
 /// Root-level build directories excluded from D6 workspace checkpoints
 /// unless tracked in both `base_tree` and `main_tree`.
