@@ -228,7 +228,7 @@ Invalid paths (relative `SPAWN_D6_CAS_DIR` or `SPAWN_D6_TMPFS_ROOT`), non-positi
 
 When `L1TmpfsPolicy` is active (`SPAWN_D6_TMPFS_ROOT` set):
 
-- **Host Memory Reserve Floor**: `max(64 GiB, 15% total RAM)` (`DEFAULT_L1_MIN_HOST_RESERVE_BYTES = 64 GiB`, `DEFAULT_L1_HOST_RESERVE_PCT = 15`).
+- **Host Memory Reserve Floor**: `max(min(64 GiB, total RAM / 2), 15% total RAM)` (`DEFAULT_L1_MIN_HOST_RESERVE_BYTES = 64 GiB`, `DEFAULT_L1_HOST_RESERVE_PCT = 15`). The absolute minimum is capped at half of host RAM, so a 128 GiB host keeps 64 GiB, a 1 TiB host keeps 15% (153.6 GiB), an 18 GiB host reserves 9 GiB, and a 16 GiB host reserves 8 GiB.
 - **Deterministic Disk Fallback (`L1Admission::FallbackDisk`)**: Mounts transparently under disk `<root>/<branch>` instead of `tmpfs` on `Disabled`, `HostMemoryBelowReserve`, `BudgetExceeded` (over global or per-workspace quota), `TmpfsFreeSpaceInsufficient` (`statvfs`), or runtime `TmpfsUnavailable`.
 - **Pressure & Periodic Flush**:
   - `usage_pct >= 80%` (`DEFAULT_L1_FLUSH_THRESHOLD_PCT = 80`) or elapsed `>= 60_000 ms` (`DEFAULT_L1_FLUSH_INTERVAL_MS = 60s`) triggers `flush_l1_workspace` into CAS Merkle + PostgreSQL `RefLedger`.
