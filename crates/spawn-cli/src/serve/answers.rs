@@ -54,8 +54,8 @@ pub(super) struct Answer {
 }
 
 /// The answer of a read of `path`: 200 with its weak ETag, or the error's
-/// status (400 for a caller's mistake, `bad_request` prefixed, else 500)
-/// and no tag.
+/// status (400 for a caller's mistake, `bad_request` prefixed, 503 when
+/// saturated, else 500) and no tag.
 pub(super) fn answer(path: &str, read: Result<Value, String>, bad_request: &str) -> Answer {
     match read {
         Ok(value) => {
@@ -70,6 +70,8 @@ pub(super) fn answer(path: &str, read: Result<Value, String>, bad_request: &str)
         Err(error) => {
             let status = if error.starts_with(bad_request) {
                 400
+            } else if error.starts_with(super::BUSY) {
+                503
             } else {
                 500
             };

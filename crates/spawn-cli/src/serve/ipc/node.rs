@@ -17,8 +17,8 @@ use spawn_cas::{Digest, Store, is_valid_name};
 use spawn_core::node_proto::codec::{is_lower_hex, unhex};
 use spawn_postgres::NodeEnroll;
 
-use super::IpcState;
 use super::http::{IpcRequest, IpcResponse};
+use super::{IpcState, PoolError, with_read, with_write};
 
 static PIN_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -114,17 +114,26 @@ fn decode_pubkey32(text: &str) -> Result<[u8; 32], IpcResponse> {
         .map_err(|_| err_json(400, "bad_request", "pubkey_b64 must decode to 32 bytes"))
 }
 
+fn pool_err_json(err: PoolError) -> IpcResponse {
+    let (status, msg) = err.status_and_message();
+    let code = if status == 503 { "busy" } else { "internal" };
+    err_json(status, code, msg)
+}
+
 pub(super) fn handle_node_route(pattern: &str, req: &IpcRequest, state: &IpcState) -> IpcResponse {
-    let Some(_permit) = state.pools.node_gate.try_acquire() else {
-        return err_json(503, "busy", "busy: node IPC pool saturated");
-    };
     match pattern {
         "/ipc/v1/node/key" => handle_node_key(&req.body, state),
         "/ipc/v1/node/enroll" => handle_node_enroll(&req.body, state),
         "/ipc/v1/node/beat" => handle_node_beat(&req.body, state),
         "/ipc/v1/node/spec" => handle_node_spec(&req.body, state),
         "/ipc/v1/node/result" => handle_node_result(&req.body, state),
-        "/ipc/v1/node/cas" => handle_node_cas(&req.body, &state.cas_root),
+        "/ipc/v1/node/cas" => {
+            let _slot = match state.pools.node_pool().acquire() {
+                Ok(slot) => slot,
+                Err(err) => return pool_err_json(err),
+            };
+            handle_node_cas(&req.body, &state.cas_root)
+        }
         _ => err_json(404, "not_found", "unknown node IPC route"),
     }
 }
@@ -137,27 +146,30 @@ fn handle_node_key(body: &[u8], state: &IpcState) -> IpcResponse {
     if !is_lower_hex(&parsed.node_id, 64) {
         return err_json(400, "bad_request", "node_id must be 64 lowercase hex");
     }
-    let gw_conn = match state.pools.node.checkout() {
-        Ok(c) => c,
-        Err(e) => return err_json(500, "internal", e),
-    };
     // Probe spawn_node_gw_spec inside a transaction that ALWAYS rolls back
     // (`|_| false`): extracts pubkey (base64) and revoked status using only the
     // restricted `spawn_node_gateway` login without mutating `spawn_node_state`.
-    let mut probed: Option<Value> = None;
     let dummy_boot = "00000000000000000000000000000000";
-    if let Err(e) = gw_conn.node_gw_spec(
-        &parsed.node_id,
-        dummy_boot,
-        "probe-only",
-        &json!({}),
-        |ans| {
-            probed = Some(ans.clone());
-            false
-        },
-    ) {
-        return err_json(500, "internal", e.to_string());
-    }
+    let probed = match with_read(state.pools.node_pool(), |gw_conn| {
+        let mut out: Option<Value> = None;
+        gw_conn.node_gw_spec(
+            &parsed.node_id,
+            dummy_boot,
+            "probe-only",
+            &json!({}),
+            |ans| {
+                out = Some(ans.clone());
+                false
+            },
+        )?;
+        Ok(out)
+    }) {
+        Ok(v) => v,
+        Err((status, msg)) => {
+            let code = if status == 503 { "busy" } else { "internal" };
+            return err_json(status, code, msg);
+        }
+    };
     let Some(ans) = probed else {
         return err_json(404, "unknown_node", "unknown node");
     };
@@ -168,14 +180,14 @@ fn handle_node_key(body: &[u8], state: &IpcState) -> IpcResponse {
         return err_json(404, "unknown_node", "node has no enrolled public key");
     };
     let revoked = ans["error"] == "revoked";
-    let boot_id = state.pools.reader.checkout().ok().and_then(|reader_conn| {
-        reader_conn
-            .nodes_v1()
-            .ok()?
-            .into_iter()
-            .find(|n| n.node_id.as_deref() == Some(&parsed.node_id))
-            .and_then(|n| n.boot_id)
-    });
+    let boot_id = with_read(&state.pools.reader, spawn_postgres::PostgresStore::nodes_v1)
+        .ok()
+        .and_then(|nodes| {
+            nodes
+                .into_iter()
+                .find(|n| n.node_id.as_deref() == Some(&parsed.node_id))
+                .and_then(|n| n.boot_id)
+        });
     IpcResponse::json(
         200,
         &json!({
@@ -203,10 +215,6 @@ fn handle_node_enroll(body: &[u8], state: &IpcState) -> IpcResponse {
     if !is_lower_hex(&parsed.boot_id, 32) || !is_lower_hex(&parsed.spec_sha256, 64) {
         return err_json(400, "bad_request", "invalid boot_id or spec_sha256");
     }
-    let gw_conn = match state.pools.node.checkout() {
-        Ok(c) => c,
-        Err(e) => return err_json(500, "internal", e),
-    };
     let call = NodeEnroll {
         token_sha256: &token_sha256,
         pubkey: &pubkey,
@@ -214,9 +222,14 @@ fn handle_node_enroll(body: &[u8], state: &IpcState) -> IpcResponse {
         spec_sha256: &parsed.spec_sha256,
         spec: &parsed.spec,
     };
-    match gw_conn.node_gw_enroll(&call, |ans| ans["ok"] == true) {
+    match with_write(state.pools.node_pool(), |gw_conn| {
+        gw_conn.node_gw_enroll(&call, |ans| ans["ok"] == true)
+    }) {
         Ok(committed) => IpcResponse::json(200, &committed.answer),
-        Err(e) => err_json(500, "internal", e.to_string()),
+        Err((status, msg)) => {
+            let code = if status == 503 { "busy" } else { "internal" };
+            err_json(status, code, msg)
+        }
     }
 }
 
@@ -228,19 +241,20 @@ fn handle_node_beat(body: &[u8], state: &IpcState) -> IpcResponse {
     if !is_lower_hex(&parsed.node_id, 64) || !is_lower_hex(&parsed.boot_id, 32) || parsed.seq < 1 {
         return err_json(400, "bad_request", "invalid node_id, boot_id, or seq");
     }
-    let gw_conn = match state.pools.node.checkout() {
-        Ok(c) => c,
-        Err(e) => return err_json(500, "internal", e),
-    };
-    match gw_conn.node_gw_beat(
-        &parsed.node_id,
-        &parsed.boot_id,
-        parsed.seq,
-        &parsed.beat,
-        |ans| ans["ok"] == true,
-    ) {
+    match with_write(state.pools.node_pool(), |gw_conn| {
+        gw_conn.node_gw_beat(
+            &parsed.node_id,
+            &parsed.boot_id,
+            parsed.seq,
+            &parsed.beat,
+            |ans| ans["ok"] == true,
+        )
+    }) {
         Ok(committed) => IpcResponse::json(200, &committed.answer),
-        Err(e) => err_json(500, "internal", e.to_string()),
+        Err((status, msg)) => {
+            let code = if status == 503 { "busy" } else { "internal" };
+            err_json(status, code, msg)
+        }
     }
 }
 
@@ -259,19 +273,20 @@ fn handle_node_spec(body: &[u8], state: &IpcState) -> IpcResponse {
             "invalid node_id, boot_id, or spec_sha256",
         );
     }
-    let gw_conn = match state.pools.node.checkout() {
-        Ok(c) => c,
-        Err(e) => return err_json(500, "internal", e),
-    };
-    match gw_conn.node_gw_spec(
-        &parsed.node_id,
-        &parsed.boot_id,
-        &parsed.spec_sha256,
-        &parsed.spec,
-        |ans| ans["ok"] == true,
-    ) {
+    match with_write(state.pools.node_pool(), |gw_conn| {
+        gw_conn.node_gw_spec(
+            &parsed.node_id,
+            &parsed.boot_id,
+            &parsed.spec_sha256,
+            &parsed.spec,
+            |ans| ans["ok"] == true,
+        )
+    }) {
         Ok(committed) => IpcResponse::json(200, &committed.answer),
-        Err(e) => err_json(500, "internal", e.to_string()),
+        Err((status, msg)) => {
+            let code = if status == 503 { "busy" } else { "internal" };
+            err_json(status, code, msg)
+        }
     }
 }
 
@@ -287,17 +302,15 @@ fn handle_node_result(body: &[u8], state: &IpcState) -> IpcResponse {
             "invalid node_id, job_id, or lease_epoch",
         );
     }
-    let gw_conn = match state.pools.node.checkout() {
-        Ok(c) => c,
-        Err(e) => return err_json(500, "internal", e),
-    };
-    match gw_conn.node_gw_result(
-        &parsed.node_id,
-        &parsed.job_id,
-        parsed.lease_epoch,
-        &parsed.result,
-        |done| *done,
-    ) {
+    match with_write(state.pools.node_pool(), |gw_conn| {
+        gw_conn.node_gw_result(
+            &parsed.node_id,
+            &parsed.job_id,
+            parsed.lease_epoch,
+            &parsed.result,
+            |done| *done,
+        )
+    }) {
         Ok(committed) => IpcResponse::json(
             200,
             &json!({
@@ -306,7 +319,10 @@ fn handle_node_result(body: &[u8], state: &IpcState) -> IpcResponse {
                 "lease_fenced": !committed.answer,
             }),
         ),
-        Err(e) => err_json(500, "internal", e.to_string()),
+        Err((status, msg)) => {
+            let code = if status == 503 { "busy" } else { "internal" };
+            err_json(status, code, msg)
+        }
     }
 }
 

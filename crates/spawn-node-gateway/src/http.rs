@@ -34,9 +34,13 @@ const WRITE_TIMEOUT: Duration = Duration::from_mins(1);
 pub const DEFAULT_CACHE_CONTROL: &str = "no-store, no-transform";
 /// Requests served on one kept-alive connection before it is closed.
 const MAX_REQUESTS_PER_CONNECTION: usize = 1000;
-/// Connections waiting for a worker, per worker; past it a new connection
-/// is closed at once.
-const BACKLOG_PER_WORKER: usize = 4;
+/// Connections waiting for a worker, per worker; past the channel bound
+/// (`max(MIN_BACKLOG, workers * BACKLOG_PER_WORKER)`), a new connection is
+/// closed at once.
+const BACKLOG_PER_WORKER: usize = 256;
+/// Minimum socket queue capacity so a 1C/1G gateway (`workers = 6`) absorbs
+/// simultaneous bursts (1,000+ connections) cleanly without dropping sockets.
+const MIN_BACKLOG: usize = 1024;
 
 /// How long a connection may take, so that slow or idle peers cannot hold
 /// the workers: every wait is bounded by a deadline, not only per read.
@@ -269,9 +273,26 @@ where
     H: Handler + 'static,
     F: Fn() -> H,
 {
+    let workers = workers.max(1);
+    let capacity = workers.saturating_mul(BACKLOG_PER_WORKER).max(MIN_BACKLOG);
+    spawn_with_backlog(listener, workers, capacity, timeouts, make)
+}
+
+fn spawn_with_backlog<H, F>(
+    listener: TcpListener,
+    workers: usize,
+    capacity: usize,
+    timeouts: Timeouts,
+    make: F,
+) -> io::Result<SocketAddr>
+where
+    H: Handler + 'static,
+    F: Fn() -> H,
+{
     let addr = listener.local_addr()?;
     let workers = workers.max(1);
-    let (sender, receiver) = sync_channel::<TcpStream>(workers * BACKLOG_PER_WORKER);
+    let capacity = capacity.max(1);
+    let (sender, receiver) = sync_channel::<TcpStream>(capacity);
     let receiver = Arc::new(Mutex::new(receiver));
     for index in 0..workers {
         let receiver = Arc::clone(&receiver);
@@ -286,12 +307,26 @@ where
     Ok(addr)
 }
 
+fn write_overload_503(mut stream: TcpStream) {
+    const BODY: &[u8] = b"{\"error\":\"service unavailable\"}";
+    let head = format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        BODY.len()
+    );
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
+    let _ = stream.set_nodelay(true);
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(BODY);
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+}
+
 fn accept(listener: &TcpListener, sender: &SyncSender<TcpStream>) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => match sender.try_send(stream) {
-                // Every worker busy and the backlog full: closed at once.
-                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Ok(()) => {}
+                Err(TrySendError::Full(stream)) => write_overload_503(stream),
                 Err(TrySendError::Disconnected(_)) => return,
             },
             Err(error) => {
@@ -673,5 +708,100 @@ mod tests {
     #[test]
     fn default_idle_timeout_is_65_seconds() {
         assert_eq!(Timeouts::default().idle, Duration::from_secs(65));
+    }
+
+    #[test]
+    fn backlog_overflow_returns_503_without_stalling_server() {
+        use std::sync::mpsc::sync_channel;
+
+        struct GateHandler {
+            entered: SyncSender<()>,
+            release: Receiver<()>,
+        }
+
+        impl Handler for GateHandler {
+            fn handle(&mut self, request: &mut Request<'_>) -> Response {
+                if request.target == "/block" {
+                    let _ = self.entered.send(());
+                    let _ = self.release.recv();
+                }
+                Response {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Body::Bytes(b"ok".to_vec()),
+                }
+            }
+            fn malformed(&mut self, _peer: IpAddr) -> Response {
+                Response {
+                    status: 400,
+                    headers: Vec::new(),
+                    body: Body::Bytes(Vec::new()),
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let (entered_tx, entered_rx) = sync_channel::<()>(4);
+        let (release_tx, release_rx) = sync_channel::<()>(4);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let addr = spawn_with_backlog(listener, 1, 1, Timeouts::default(), move || GateHandler {
+            entered: entered_tx.clone(),
+            release: {
+                let (tx, rx) = sync_channel::<()>(1);
+                let shared = Arc::clone(&release_rx);
+                std::thread::spawn(move || {
+                    let _ = shared.lock().unwrap().recv();
+                    let _ = tx.send(());
+                });
+                rx
+            },
+        })
+        .expect("spawn server");
+
+        let send = |path: &str| {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            write!(
+                s,
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            s.flush().unwrap();
+            s
+        };
+
+        let mut req1 = send("/block");
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker entered");
+        let mut req2 = send("/queued");
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Backlog (capacity=1) is now full while the sole worker is blocked.
+        // Subsequent connections must receive an explicit 503 immediately.
+        for _ in 0..3 {
+            let mut s = TcpStream::connect(addr).expect("connect overflow");
+            s.set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let _ = write!(
+                s,
+                "GET /overflow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            );
+            let mut raw = String::new();
+            s.read_to_string(&mut raw).expect("read 503");
+            assert!(
+                raw.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+                "expected explicit 503, got {raw:?}"
+            );
+            assert!(raw.contains("\"service unavailable\""), "{raw:?}");
+        }
+
+        release_tx.send(()).unwrap();
+        let mut b1 = String::new();
+        let mut b2 = String::new();
+        req1.read_to_string(&mut b1).unwrap();
+        req2.read_to_string(&mut b2).unwrap();
+        assert!(b1.starts_with("HTTP/1.1 200 OK"), "{b1:?}");
+        assert!(b2.starts_with("HTTP/1.1 200 OK"), "{b2:?}");
     }
 }

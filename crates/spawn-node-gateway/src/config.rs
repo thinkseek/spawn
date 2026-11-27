@@ -10,6 +10,7 @@
 //! | `SPAWN_NODE_RESULTS` | required | `<job>.<epoch>/{log,meta.json}` |
 //! | `SPAWN_NODE_GATEWAY_CELLS` | `c0` | the cells served, comma separated |
 //! | `SPAWN_NODE_GATEWAY_PUBLIC_PREFIX` | empty | a path prefix a reverse proxy keeps |
+//! | `SPAWN_NODE_GATEWAY_WORKERS` | `6` | bounded worker threads & PostgreSQL connections |
 
 use std::fs;
 use std::net::SocketAddr;
@@ -45,11 +46,15 @@ pub const ENV_RESULTS: &str = "SPAWN_NODE_RESULTS";
 pub const ENV_CELLS: &str = "SPAWN_NODE_GATEWAY_CELLS";
 /// Environment variable setting an optional reverse-proxy URL path prefix.
 pub const ENV_PUBLIC_PREFIX: &str = "SPAWN_NODE_GATEWAY_PUBLIC_PREFIX";
+/// Environment variable overriding the worker thread and DB connection pool count.
+pub const ENV_WORKERS: &str = "SPAWN_NODE_GATEWAY_WORKERS";
 
 /// Default listen socket address when [`ENV_LISTEN`] is unset.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:18096";
 /// Default cell name when [`ENV_CELLS`] is unset.
 pub const DEFAULT_CELL: &str = "c0";
+/// Default worker thread (and per-worker DB connection) count safe for 1C/1G.
+pub const DEFAULT_WORKERS: usize = 6;
 
 /// Everything the gateway reads at start.
 #[derive(Clone, PartialEq, Eq)]
@@ -68,6 +73,8 @@ pub struct Config {
     pub cells: Vec<String>,
     /// Empty, or `/` and path characters without a trailing `/`.
     pub public_prefix: String,
+    /// Number of synchronous worker threads (each holds at most one DB connection).
+    pub workers: usize,
 }
 
 impl std::fmt::Debug for Config {
@@ -80,6 +87,7 @@ impl std::fmt::Debug for Config {
             .field("results", &self.results)
             .field("cells", &self.cells)
             .field("public_prefix", &self.public_prefix)
+            .field("workers", &self.workers)
             .finish()
     }
 }
@@ -161,6 +169,15 @@ impl Config {
                 "{ENV_CELLS}: a cell id is 1 to 64 of a-z A-Z 0-9 . _ -"
             ));
         }
+        let workers = match env(ENV_WORKERS) {
+            None => DEFAULT_WORKERS,
+            Some(raw) => raw
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|value| *value >= 1)
+                .ok_or_else(|| format!("{ENV_WORKERS}={raw:?} must be an integer >= 1"))?,
+        };
         Ok(Self {
             database_url,
             key_file: required(ENV_KEY_FILE)?.into(),
@@ -169,6 +186,7 @@ impl Config {
             results: required(ENV_RESULTS)?.into(),
             cells,
             public_prefix: normalize_prefix(&public_prefix)?,
+            workers,
         })
     }
 }
@@ -270,6 +288,8 @@ mod tests {
         assert_eq!(config.listen, DEFAULT_LISTEN.parse().unwrap());
         assert_eq!(config.cells, ["c0"]);
         assert_eq!(config.public_prefix, "");
+        assert_eq!(config.workers, DEFAULT_WORKERS);
+        assert_eq!(DEFAULT_WORKERS, 6);
         assert!(
             !format!("{config:?}").contains("pw@"),
             "the URL is never printed"
@@ -279,11 +299,13 @@ mod tests {
         pairs.push((ENV_CELLS, "c0, c1"));
         pairs.push((ENV_PUBLIC_PREFIX, "/env"));
         pairs.push((ENV_LISTEN, "0.0.0.0:9"));
+        pairs.push((ENV_WORKERS, " 12 "));
         let args = ["--public-prefix".to_string(), "/gw/".to_string()];
         let config = Config::from_env(env(&pairs), &args).unwrap();
         assert_eq!(config.cells, ["c0", "c1"]);
         assert_eq!(config.public_prefix, "/gw");
         assert_eq!(config.listen.port(), 9);
+        assert_eq!(config.workers, 12);
     }
 
     #[test]
@@ -296,6 +318,21 @@ mod tests {
         pairs.push((ENV_CELLS, "c0,"));
         assert!(Config::from_env(env(&pairs), &[]).is_err());
         assert!(Config::from_env(env(&BASE), &["--listen".into()]).is_err());
+
+        for bad_workers in [
+            "",
+            "   ",
+            "0",
+            "-1",
+            "abc",
+            "1.5",
+            "999999999999999999999999",
+        ] {
+            let mut pairs = BASE.to_vec();
+            pairs.push((ENV_WORKERS, bad_workers));
+            let err = Config::from_env(env(&pairs), &[]).expect_err("bad workers");
+            assert!(err.contains(ENV_WORKERS), "{bad_workers:?}: {err}");
+        }
     }
 
     #[test]

@@ -71,11 +71,12 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use spawn_core::event::GlobalPosition;
+use spawn_core::port::StoreError;
 use spawn_postgres::PostgresStore;
 use tiny_http::{Method, Request};
 
@@ -101,7 +102,7 @@ pub(super) const PROBE_FRAME: &str = ":\n\n";
 /// The frames a stream's channel holds before the stream is dropped.
 pub(super) const CLIENT_BUFFER: usize = 256;
 /// The listener's read of the log while anyone streams, notified or not.
-const POLL: Duration = Duration::from_secs(1);
+const POLL: Duration = Duration::from_millis(250);
 /// The longest one write to a page may take: a page that stops reading
 /// (its socket buffer full) ends its stream after this, never holding a
 /// stream slot until the kernel gives up on the connection.
@@ -118,10 +119,10 @@ pub(super) fn is_stream(request: &Request) -> bool {
 
 /// One SSE frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Frame {
-    pub(super) id: Option<i64>,
-    pub(super) event: String,
-    pub(super) data: String,
+pub(crate) struct Frame {
+    pub(crate) id: Option<i64>,
+    pub(crate) event: String,
+    pub(crate) data: String,
 }
 
 impl Frame {
@@ -193,7 +194,7 @@ struct Subscriber {
 /// A stream's end of its channel. Dropping it (the stream ended, however
 /// it ended) marks it gone at once, so the hub prunes it at its next look
 /// rather than at its next frame.
-pub(super) struct Subscription {
+pub(crate) struct Subscription {
     receive: Receiver<Arc<Frame>>,
     alive: Arc<AtomicBool>,
     floor: Arc<AtomicI64>,
@@ -205,11 +206,11 @@ impl Subscription {
     /// event after this stream's catch-up is skipped. The floor is this
     /// stream's own and leaves the hub with it: a stream gone before the
     /// listener read its floor moves no one's start.
-    pub(super) fn floor(&self, sent: i64) {
+    pub(crate) fn floor(&self, sent: i64) {
         self.floor.store(sent.max(0), Ordering::Release);
     }
 
-    pub(super) fn recv_timeout(&self, timeout: Duration) -> Result<Arc<Frame>, RecvTimeoutError> {
+    pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<Arc<Frame>, RecvTimeoutError> {
         self.receive.recv_timeout(timeout)
     }
 
@@ -232,52 +233,85 @@ impl Drop for Subscription {
 
 /// The streams' fan-out: each stream's channel and floor, and the
 /// listener's state.
-pub(super) struct Hub {
+pub(crate) struct Hub {
     subscribers: Mutex<Vec<Subscriber>>,
+    wake: Condvar,
     started: AtomicBool,
+    stopped: AtomicBool,
     buffer: usize,
 }
 
-/// The server's one hub, its listener started by the first stream.
-static HUB: LazyLock<Hub> = LazyLock::new(|| Hub::new(CLIENT_BUFFER));
-
 /// Clears the hub's `started` when the listener's thread ends, a panic
 /// included, so the next stream starts it again.
+#[cfg(test)]
 struct Started<'a>(&'a AtomicBool);
 
+#[cfg(test)]
 impl Drop for Started<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
 }
 
+struct ArcStarted(Arc<Hub>);
+
+impl Drop for ArcStarted {
+    fn drop(&mut self) {
+        self.0.started.store(false, Ordering::Release);
+    }
+}
+
 impl Hub {
-    pub(super) fn new(buffer: usize) -> Self {
+    pub(crate) fn new(buffer: usize) -> Self {
         Self {
             subscribers: Mutex::new(Vec::new()),
+            wake: Condvar::new(),
             started: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             buffer,
         }
     }
 
     /// A new stream's channel.
-    pub(super) fn subscribe(&self) -> Subscription {
+    pub(crate) fn subscribe(&self) -> Subscription {
         let (send, receive) = std::sync::mpsc::sync_channel(self.buffer);
         let alive = Arc::new(AtomicBool::new(true));
         let floor = Arc::new(AtomicI64::new(NO_FLOOR));
-        self.subscribers
+        let mut subscribers = self
+            .subscribers
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(Subscriber {
-                send,
-                alive: Arc::clone(&alive),
-                floor: Arc::clone(&floor),
-            });
+            .unwrap_or_else(PoisonError::into_inner);
+        subscribers.push(Subscriber {
+            send,
+            alive: Arc::clone(&alive),
+            floor: Arc::clone(&floor),
+        });
+        self.wake.notify_all();
         Subscription {
             receive,
             alive,
             floor,
         }
+    }
+
+    pub(crate) fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        let _guard = self
+            .subscribers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.wake.notify_all();
+    }
+
+    fn wait_for_subscriber(&self, timeout: Duration) {
+        let subscribers = self
+            .subscribers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !subscribers.is_empty() || self.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = self.wake.wait_timeout(subscribers, timeout);
     }
 
     /// Where a listener with no cursor starts: the lowest floor of the
@@ -329,9 +363,10 @@ impl Hub {
 
     /// Start the listener once, its connections made by `open`; started
     /// again by a later stream if its thread ever ends.
-    pub(super) fn start(
+    #[cfg(test)]
+    pub(super) fn start<S: StoreHandle + 'static>(
         &'static self,
-        open: impl Fn() -> Result<PostgresStore, String> + Send + 'static,
+        open: impl Fn() -> Result<S, String> + Send + 'static,
     ) {
         if self.started.swap(true, Ordering::AcqRel) {
             return;
@@ -340,7 +375,28 @@ impl Hub {
             .name("serve-stream-listen".to_string())
             .spawn(move || {
                 let _started = Started(&self.started);
-                listen(self, &open, &|| false);
+                listen(self, &open, &|| self.stopped.load(Ordering::Acquire));
+            });
+        if let Err(error) = spawned {
+            eprintln!("serve: the stream's listener did not start: {error}");
+            self.started.store(false, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn start_arc<S: StoreHandle + 'static>(
+        self: &Arc<Self>,
+        open: impl Fn() -> Result<S, String> + Send + 'static,
+    ) {
+        if self.stopped.load(Ordering::Acquire) || self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let hub = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("serve-stream-listen".to_string())
+            .spawn(move || {
+                let guard = ArcStarted(Arc::clone(&hub));
+                listen(&hub, &open, &|| hub.stopped.load(Ordering::Acquire));
+                drop(guard);
             });
         if let Err(error) = spawned {
             eprintln!("serve: the stream's listener did not start: {error}");
@@ -354,9 +410,42 @@ impl Hub {
     }
 }
 
+/// Abstract handle over a [`PostgresStore`] (pooled in production, direct in tests)
+/// so stream listeners and catch-up can evict broken pooled connections on error.
+pub(crate) trait StoreHandle {
+    fn store(&self) -> &PostgresStore;
+    fn mark_broken(&self) {}
+}
+
+impl StoreHandle for PostgresStore {
+    fn store(&self) -> &PostgresStore {
+        self
+    }
+}
+
+impl StoreHandle for super::PooledStore {
+    fn store(&self) -> &PostgresStore {
+        self
+    }
+
+    fn mark_broken(&self) {
+        super::PooledStore::mark_broken(self);
+    }
+}
+
+impl StoreHandle for super::ipc::CheckedOutConn {
+    fn store(&self) -> &PostgresStore {
+        self
+    }
+
+    fn mark_broken(&self) {
+        super::ipc::CheckedOutConn::mark_broken(self);
+    }
+}
+
 /// A `resync` frame: always `{reason, after_event_id, latest_event_id}`,
 /// `latest_event_id` null where it was not read (module doc).
-pub(super) fn resync(reason: &str, after_event_id: i64, latest_event_id: Option<i64>) -> Frame {
+pub(crate) fn resync(reason: &str, after_event_id: i64, latest_event_id: Option<i64>) -> Frame {
     Frame::note(
         "resync",
         &json!({"reason": reason, "after_event_id": after_event_id,
@@ -366,15 +455,14 @@ pub(super) fn resync(reason: &str, after_event_id: i64, latest_event_id: Option<
 
 /// The latest event's id, through the reader (`position_before` the end
 /// of time: the last position).
-fn latest(store: &PostgresStore) -> Result<i64, String> {
+fn latest(store: &PostgresStore) -> Result<i64, StoreError> {
     store
         .position_before(spawn_core::time::Timestamp(i64::MAX))
         .map(|position| i64::try_from(position.0).unwrap_or(i64::MAX))
-        .map_err(|error| error.to_string())
 }
 
 /// Up to `limit` events after `after`.
-fn after(store: &PostgresStore, after: i64, limit: usize) -> Result<Vec<Arc<Frame>>, String> {
+fn after(store: &PostgresStore, after: i64, limit: usize) -> Result<Vec<Arc<Frame>>, StoreError> {
     store
         .log_after(GlobalPosition(after.unsigned_abs()), limit)
         .map(|entries| {
@@ -383,58 +471,67 @@ fn after(store: &PostgresStore, after: i64, limit: usize) -> Result<Vec<Arc<Fram
                 .map(|entry| Arc::new(Frame::of(entry)))
                 .collect()
         })
-        .map_err(|error| error.to_string())
 }
 
 /// The listener (module doc): until `stop` says so (never, in `serve`).
-pub(super) fn listen(
+pub(super) fn listen<S: StoreHandle>(
     hub: &Hub,
-    open: &dyn Fn() -> Result<PostgresStore, String>,
+    open: &dyn Fn() -> Result<S, String>,
     stop: &dyn Fn() -> bool,
 ) {
     let mut cursor: Option<i64> = None;
     let mut backoff = BACKOFF_MIN;
     let mut said: Option<String> = None;
     while !stop() {
+        if hub.subscribers() == 0 {
+            // Release all PG listener/events-pool sockets while zero clients stream.
+            cursor = None;
+            hub.wait_for_subscriber(Duration::from_millis(50));
+            continue;
+        }
         let failed = (|| -> Result<(), String> {
-            let store = open()?;
-            let mut listener = store.listen().map_err(|error| error.to_string())?;
-            (backoff, said) = (BACKOFF_MIN, None);
-            while !stop() {
-                if hub.subscribers() == 0 {
-                    // Nobody streams: nothing is read. The next stream
-                    // catches up itself and hands the listener its cursor.
-                    cursor = None;
-                    listener.wait(POLL).map_err(|error| error.to_string())?;
-                    continue;
+            let handle = open()?;
+            let store = handle.store();
+            let result = (|| -> Result<(), String> {
+                let mut listener = store.listen().map_err(|error| error.to_string())?;
+                (backoff, said) = (BACKOFF_MIN, None);
+                while !stop() {
+                    if hub.subscribers() == 0 {
+                        cursor = None;
+                        return Ok(());
+                    }
+                    let Some(from) = cursor.or_else(|| hub.start_floor()) else {
+                        // A stream subscribed but not caught up yet: its floor
+                        // comes with its catch-up.
+                        listener
+                            .wait(Duration::from_millis(50))
+                            .map_err(|error| error.to_string())?;
+                        continue;
+                    };
+                    cursor = Some(from);
+                    let page = after(store, from, REPLAY_MAX + 1).map_err(|e| e.to_string())?;
+                    if page.len() > REPLAY_MAX {
+                        // Further behind than a catch-up replays (a long
+                        // reconnect): every stream resyncs from now.
+                        let now = latest(store).map_err(|e| e.to_string())?;
+                        hub.publish(&Arc::new(resync("stream_reset", from, Some(now))));
+                        cursor = Some(now);
+                        continue;
+                    }
+                    for frame in &page {
+                        hub.publish(frame);
+                        cursor = frame.id.or(cursor);
+                    }
+                    if page.is_empty() {
+                        listener.wait(POLL).map_err(|error| error.to_string())?;
+                    }
                 }
-                let Some(from) = cursor.or_else(|| hub.start_floor()) else {
-                    // A stream subscribed but not caught up yet: its floor
-                    // comes with its catch-up.
-                    listener
-                        .wait(Duration::from_millis(50))
-                        .map_err(|error| error.to_string())?;
-                    continue;
-                };
-                cursor = Some(from);
-                let page = after(&store, from, REPLAY_MAX + 1)?;
-                if page.len() > REPLAY_MAX {
-                    // Further behind than a catch-up replays (a long
-                    // reconnect): every stream resyncs from now.
-                    let now = latest(&store)?;
-                    hub.publish(&Arc::new(resync("stream_reset", from, Some(now))));
-                    cursor = Some(now);
-                    continue;
-                }
-                for frame in &page {
-                    hub.publish(frame);
-                    cursor = frame.id.or(cursor);
-                }
-                if page.is_empty() {
-                    listener.wait(POLL).map_err(|error| error.to_string())?;
-                }
+                Ok(())
+            })();
+            if result.is_err() {
+                handle.mark_broken();
             }
-            Ok(())
+            result
         })();
         if let Err(error) = failed {
             if said.as_ref() != Some(&error) {
@@ -455,7 +552,7 @@ pub(super) fn listen(
 /// `/api/events` and `/api/sessions/<id>` take it, `?after_event_id=` its
 /// alias. Both query names at once, or a value that is no whole number at
 /// least 0, is the caller's mistake (400).
-pub(super) fn cursor(last_event_id: Option<&str>, query: &str) -> Result<Option<i64>, String> {
+pub(crate) fn cursor(last_event_id: Option<&str>, query: &str) -> Result<Option<i64>, String> {
     let (after, alias) = (
         parameter(query, "after"),
         parameter(query, "after_event_id"),
@@ -487,22 +584,40 @@ pub(super) fn cursor(last_event_id: Option<&str>, query: &str) -> Result<Option<
 
 /// `GET /api/stream` (module doc), past the slots and the read guard
 /// (`handle` refuses a stream exactly as any API read).
-pub(super) fn stream(request: Request, query: &str) -> Result<(), String> {
-    // A stream refused before it subscribes (405, 400) starts no listener.
-    if *request.method() == Method::Get
-        && cursor(super::header(&request, "Last-Event-ID"), query).is_ok()
-    {
-        HUB.start(super::open_store);
+pub(super) fn stream(request: Request, query: &str, shared: &super::Shared) -> Result<(), String> {
+    let pools = super::stream_pools(shared);
+    let open_reader = || -> Result<super::PooledStore, String> {
+        match &pools {
+            Ok(Some(pools)) => super::checkout_pooled(&pools.reader),
+            _ => super::open_store(),
+        }
+    };
+    if let Ok(Some(ref active_pools)) = pools {
+        // Shared hub listener runs strictly on `EVENTS_POOL`, leaving `READS_POOL`
+        // free for transient catch-up and ordinary HTTP/IPC reads.
+        if *request.method() == Method::Get
+            && cursor(super::header(&request, "Last-Event-ID"), query).is_ok()
+        {
+            active_pools.ensure_stream_listener();
+        }
+        return serve_stream(
+            request,
+            query,
+            &active_pools.events_hub,
+            &open_reader,
+            KEEPALIVE,
+        );
     }
-    serve_stream(request, query, &HUB, &super::open_store, KEEPALIVE)
+    let fallback_hub = Hub::new(CLIENT_BUFFER);
+    serve_stream(request, query, &fallback_hub, &open_reader, KEEPALIVE)
 }
 
 /// A stream on `hub`, its catch-up read through `open`.
-pub(super) fn serve_stream(
+pub(super) fn serve_stream<S: StoreHandle>(
     request: Request,
     query: &str,
     hub: &Hub,
-    open: &dyn Fn() -> Result<PostgresStore, String>,
+    open: &dyn Fn() -> Result<S, String>,
     keepalive: Duration,
 ) -> Result<(), String> {
     if *request.method() != Method::Get {
@@ -524,14 +639,20 @@ pub(super) fn serve_stream(
     let store = match open() {
         Ok(store) => store,
         Err(error) => {
+            let status = if error.starts_with(super::BUSY) {
+                503
+            } else {
+                500
+            };
             return request
-                .respond(json_response(500, &json!({ "error": error })))
+                .respond(json_response(status, &json!({ "error": error })))
                 .map_err(|error| error.to_string());
         }
     };
-    let (first, mut sent) = match catch_up(&store, wanted) {
+    let (first, mut sent) = match catch_up(store.store(), wanted) {
         Ok(caught) => caught,
         Err(error) => {
+            store.mark_broken();
             return request
                 .respond(json_response(500, &json!({ "error": error })))
                 .map_err(|error| error.to_string());
@@ -646,10 +767,10 @@ impl TimedWriter {
 /// The frames a stream starts with, and the last event id they carry:
 /// `ready`, after the replay of the events after `wanted` (module doc), or
 /// `resync` first when that is too far behind or past the log's end.
-pub(super) fn catch_up(
+pub(crate) fn catch_up_store(
     store: &PostgresStore,
     wanted: Option<i64>,
-) -> Result<(Vec<Arc<Frame>>, i64), String> {
+) -> Result<(Vec<Arc<Frame>>, i64), StoreError> {
     let now = latest(store)?;
     let mut frames = Vec::new();
     let mut sent = now;
@@ -679,6 +800,13 @@ pub(super) fn catch_up(
         )),
     );
     Ok((frames, sent))
+}
+
+pub(super) fn catch_up(
+    store: &PostgresStore,
+    wanted: Option<i64>,
+) -> Result<(Vec<Arc<Frame>>, i64), String> {
+    catch_up_store(store, wanted).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

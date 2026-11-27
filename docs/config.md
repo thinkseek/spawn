@@ -101,3 +101,22 @@ including managed `claude-config`), because `Whitelist` rejects workspaces insid
 `$HOME` unless `SPAWN_SANDBOX_CANONICAL_WORKSPACE` is configured (as generated
 `spawn.toml` profiles do). Set `SPAWN_SANDBOX_HOME_ISOLATION=whitelist` with a
 canonical workspace mount for strict allowlist isolation.
+
+## 3. Control-plane PostgreSQL connection pools (1C/1G safe defaults)
+
+Both `spawn serve` (TCP & UDS `--ipc`) and `spawn-node-gateway` bound their
+PostgreSQL connection pools at startup. Default pool sizes are tuned so the
+combined control plane stays at **<= 22 connections**, safely below a 1C/1G
+PostgreSQL instance configured with `max_connections = 30`:
+
+| Variable | Default | Component | Role / purpose |
+| --- | --- | --- | --- |
+| `SPAWN_SERVE_READS_POOL` | `6` | `spawn serve` (TCP & `--ipc`) | `spawn_reader` read queries |
+| `SPAWN_SERVE_WRITES_POOL` | `2` | `spawn serve` (TCP & `--ipc`) | `spawn_human` UI/API mutations |
+| `SPAWN_SERVE_NODE_POOL` | `6` | `spawn serve --ipc` | `spawn_node_gateway` / CAS IPC calls |
+| `SPAWN_SERVE_EVENTS_POOL` | `2` | `spawn serve` (TCP & `--ipc`) | Bounded shared event-hub `LISTEN spawn_events` pool (isolated from `READS_POOL`; releases connections when idle) |
+| `SPAWN_NODE_GATEWAY_WORKERS` | `6` | `spawn-node-gateway` | Synchronous worker threads (one warm DB connection per worker) |
+
+On larger database servers, any of these variables can be raised explicitly.
+Values must parse as integers `>= 1`; empty strings, `0`, negative numbers,
+or non-integer values fail closed at process startup before binding sockets.

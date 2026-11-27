@@ -362,7 +362,7 @@ fn a_listener_that_panics_is_started_again_by_the_next_stream() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(!hub.started(), "started is cleared when its thread ends");
-    hub.start(|| Err("no database".to_string()));
+    hub.start(|| Err::<PostgresStore, _>("no database".to_string()));
     assert!(hub.started(), "the next stream starts it again");
 }
 

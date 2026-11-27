@@ -159,11 +159,11 @@ mod pwa;
 mod storage;
 mod stream;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError};
 
 use serde_json::{Value, json};
 use spawn_core::command::NamedKey;
@@ -182,6 +182,9 @@ use crate::{Flags, env_or, env_value};
 
 /// Prefix of an error that answers 400.
 pub(super) const BAD_REQUEST: &str = "bad request: ";
+
+/// Prefix of an error that answers 503.
+pub(super) const BUSY: &str = ipc::POOL_BUSY_PREFIX;
 
 /// A session id from a URL, or a 400.
 pub(super) fn session_id(id: &str) -> Result<SessionId, String> {
@@ -242,6 +245,15 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
     crate::cost::Prices::from_env()?;
     // Read once, here, so a bad value is warned of at start.
     crate::config::message_taken_ms();
+    let pool_config = ipc::PoolConfig::from_process_env()?;
+    let owner_url = env_value("SPAWN_DATABASE_URL");
+    let reader_override = env_value("SPAWN_SERVE_DATABASE_URL");
+    let pools = ipc::ServePools::from_serve_env(
+        owner_url.as_deref(),
+        reader_override.as_deref(),
+        pool_config,
+    )?;
+    drop(owner_url);
     let open = open_networks(env_value("SPAWN_SERVE_OPEN_NETWORKS").as_deref())?;
     let server = Server::http(&address).map_err(|error| format!("listen {address}: {error}"))?;
     let guard = match (&token, open.is_empty()) {
@@ -257,9 +269,12 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
     };
     // The bound address, not the requested one: with port 0 the kernel picks.
     println!(
-        "serve: http://{} web {} auth {guard}",
+        "serve: http://{} web {} auth {guard} pools reads={} writes={} events={}",
         server.server_addr(),
-        web.display()
+        web.display(),
+        pool_config.reads,
+        pool_config.writes,
+        pool_config.events,
     );
     let port = server.server_addr().to_ip().map(|address| address.port());
     let hosts = port
@@ -271,26 +286,34 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         port,
         hosts,
         open,
-        owner_url: env_value("SPAWN_DATABASE_URL"),
+        pools: Ok(pools),
     });
     // Listen again on the bound address, so a client's port stays right.
     let bound = server
         .server_addr()
         .to_ip()
         .map_or_else(|| address.clone(), |address| address.to_string());
-    let slots = Slots::new(MAX_IN_FLIGHT);
     let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
-    // The Core lines reading, once, beside the requests: the first person
-    // after a restart gets the kept figures, not the cold computation. A
-    // request meanwhile waits on the performance figures' lock (archive and
-    // cost, cc-astra A35) and the storage sizes' lock, so those are computed
-    // once; its other parts (health, trends, the backup facts) it computes
-    // itself, as every request does (rev-e N1).
-    std::thread::spawn(|| println!("serve: {}", core_lines::warm()));
+    let warm_pools = shared.pools.as_ref().ok().and_then(Clone::clone);
+    std::thread::spawn(move || {
+        let text = match warm_pools {
+            Some(pools) => run_with_reader_pool_status(
+                &pools.reader,
+                false,
+                core_lines::warm,
+                |_| false,
+                |err| format!("core lines not warmed (pool busy): {err}"),
+            ),
+            None => core_lines::warm(),
+        };
+        println!("serve: {text}");
+    });
     keep_listening(
         server,
         &bound,
-        |server| serve_requests(server, &shared, &slots, &streams),
+        |server| {
+            serve_requests_with_queue(server, &shared, MAX_IN_FLIGHT, MAX_REQUEST_QUEUE, &streams)
+        },
         |address| Server::http(address).map_err(|error| error.to_string()),
         listen_again_pause,
     )
@@ -362,10 +385,12 @@ fn listen_again_pause(stops: u32) -> std::time::Duration {
     std::time::Duration::from_millis(millis.min(5000))
 }
 
-/// Requests served at once. Each runs on its own thread, so a client that
-/// stops reading, a slow query or a slow pane holds one of these, never the
-/// server; one past them is answered 503 at once.
+/// Concurrent worker threads handling non-stream requests in `spawn serve`.
 const MAX_IN_FLIGHT: usize = 16;
+
+/// Bounded waiting queue in front of [`MAX_IN_FLIGHT`] workers for traffic bursts;
+/// requests beyond `MAX_IN_FLIGHT + MAX_REQUEST_QUEUE` answer 503 at once.
+const MAX_REQUEST_QUEUE: usize = 1024;
 
 /// Longest one dashboard statement runs on the reader's connection.
 pub(super) const STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -379,9 +404,19 @@ struct Shared {
     /// Networks whose clients read without the token
     /// (`SPAWN_SERVE_OPEN_NETWORKS`, [`open_network_request`]).
     open: Vec<Network>,
-    /// The owner's database URL (`SPAWN_DATABASE_URL`), from which a
-    /// person's input derives the `spawn_human` login ([`writer`]).
-    owner_url: Option<String>,
+    /// Unified role connection pools (`reads`, `writes`, `node`, `events`)
+    /// derived once at startup; the owner URL is dropped immediately.
+    pools: Result<Option<Arc<ipc::ServePools>>, String>,
+}
+
+impl Shared {
+    #[cfg(test)]
+    fn pools_from_owner(owner_url: Option<String>) -> Result<Option<Arc<ipc::ServePools>>, String> {
+        let Some(url) = owner_url else {
+            return Ok(None);
+        };
+        ipc::ServePools::from_serve_env(Some(&url), None, ipc::PoolConfig::default())
+    }
 }
 
 /// Requests in flight, at most `limit`, and, when `per_peer` is set, at
@@ -415,6 +450,7 @@ enum Busy {
 }
 
 impl Slots {
+    #[cfg(test)]
     fn new(limit: usize) -> Arc<Self> {
         Self::with_per_peer(limit, None)
     }
@@ -442,6 +478,7 @@ impl Slots {
         })
     }
 
+    #[cfg(test)]
     fn take(slots: &Arc<Self>) -> Option<Slot> {
         Self::take_from(slots, None).ok()
     }
@@ -496,54 +533,156 @@ impl Drop for Slot {
     }
 }
 
-/// Serve `server`'s requests until its listener stops: each on a thread of
-/// its own, at most the slots' limit at once, and 503 past them. A stream
-/// (`GET /api/stream`, [`stream`]) takes one of `streams` instead, never
-/// one of `slots`, so pages that stream never starve the other requests.
-/// Returns why it stopped.
+struct RequestQueueState {
+    queue: VecDeque<Request>,
+    active: usize,
+    closed: bool,
+}
+
+struct RequestQueue {
+    workers: usize,
+    queue_cap: usize,
+    state: Mutex<RequestQueueState>,
+    cond: Condvar,
+}
+
+#[cfg(test)]
 fn serve_requests(
     server: &Server,
     shared: &Arc<Shared>,
     slots: &Arc<Slots>,
     streams: &Arc<Slots>,
 ) -> std::io::Error {
+    serve_requests_with_queue(server, shared, slots.limit, 0, streams)
+}
+
+fn spawn_request_worker(
+    idx: usize,
+    rq: &Arc<RequestQueue>,
+    shared: &Arc<Shared>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let rq_worker = Arc::clone(rq);
+    let shared_worker = Arc::clone(shared);
+    match std::thread::Builder::new()
+        .name(format!("serve-request-{idx}"))
+        .spawn(move || {
+            loop {
+                let request = {
+                    let mut guard = rq_worker
+                        .state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    loop {
+                        if let Some(req) = guard.queue.pop_front() {
+                            guard.active += 1;
+                            break req;
+                        }
+                        if guard.closed {
+                            return;
+                        }
+                        guard = rq_worker
+                            .cond
+                            .wait(guard)
+                            .unwrap_or_else(PoisonError::into_inner);
+                    }
+                };
+                if let Err(error) = handle(request, &shared_worker) {
+                    eprintln!("serve: {error}");
+                }
+                let mut guard = rq_worker
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                guard.active = guard.active.saturating_sub(1);
+            }
+        }) {
+        Ok(h) => Some(h),
+        Err(error) => {
+            eprintln!("serve: failed to spawn worker {idx}: {error}");
+            None
+        }
+    }
+}
+
+/// Serve `server`'s requests until its listener stops: streams run on their own
+/// `streams` slots, while regular requests run on `workers` fixed worker threads
+/// fed by a bounded queue of capacity `queue_cap` (answering 503 past it).
+fn serve_requests_with_queue(
+    server: &Server,
+    shared: &Arc<Shared>,
+    workers: usize,
+    queue_cap: usize,
+    streams: &Arc<Slots>,
+) -> std::io::Error {
+    let rq = Arc::new(RequestQueue {
+        workers,
+        queue_cap,
+        state: Mutex::new(RequestQueueState {
+            queue: VecDeque::new(),
+            active: 0,
+            closed: false,
+        }),
+        cond: Condvar::new(),
+    });
+    let worker_handles: Vec<_> = (0..workers)
+        .filter_map(|idx| spawn_request_worker(idx, &rq, shared))
+        .collect();
     loop {
         let request = match server.recv() {
             Ok(request) => request,
-            Err(error) => return error,
+            Err(error) => {
+                {
+                    let mut guard = rq.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.closed = true;
+                    rq.cond.notify_all();
+                }
+                for h in worker_handles {
+                    let _ = h.join();
+                }
+                return error;
+            }
         };
-        let streaming = stream::is_stream(&request);
-        let taken = if streaming {
-            Slots::take_from(streams, request.remote_addr().map(SocketAddr::ip))
-        } else {
-            Slots::take(slots).ok_or(Busy::All)
-        };
-        let Ok(slot) = taken else {
-            let busy = json_response(
-                503,
-                &json!({ "error": match (streaming, taken.err()) {
-                    (true, Some(Busy::Peer)) => "busy: too many streams from this address",
-                    (true, _) => "busy: too many streams at once",
-                    (false, _) => "busy: too many requests at once",
-                } }),
-            );
+        if stream::is_stream(&request) {
+            let taken = Slots::take_from(streams, request.remote_addr().map(SocketAddr::ip));
+            let Ok(slot) = taken else {
+                let busy = json_response(
+                    503,
+                    &json!({ "error": match taken.err() {
+                        Some(Busy::Peer) => "busy: too many streams from this address",
+                        _ => "busy: too many streams at once",
+                    } }),
+                );
+                if let Err(error) = request.respond(busy) {
+                    eprintln!("serve: {error}");
+                }
+                continue;
+            };
+            let shared = Arc::clone(shared);
+            let spawned = std::thread::Builder::new()
+                .name("serve-stream".to_string())
+                .spawn(move || {
+                    let _slot = slot;
+                    if let Err(error) = handle(request, &shared) {
+                        eprintln!("serve: {error}");
+                    }
+                });
+            if let Err(error) = spawned {
+                eprintln!("serve: no thread for a stream: {error}");
+            }
+            continue;
+        }
+        let mut guard = rq.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let max_outstanding = rq.workers.saturating_add(rq.queue_cap);
+        if rq.workers == 0 || guard.active + guard.queue.len() >= max_outstanding {
+            drop(guard);
+            let busy = json_response(503, &json!({ "error": "busy: too many requests at once" }));
             if let Err(error) = request.respond(busy) {
                 eprintln!("serve: {error}");
             }
             continue;
-        };
-        let shared = Arc::clone(shared);
-        let spawned = std::thread::Builder::new()
-            .name("serve-request".to_string())
-            .spawn(move || {
-                let _slot = slot;
-                if let Err(error) = handle(request, &shared) {
-                    eprintln!("serve: {error}");
-                }
-            });
-        if let Err(error) = spawned {
-            eprintln!("serve: no thread for a request: {error}");
         }
+        guard.queue.push_back(request);
+        rq.cond.notify_one();
     }
 }
 
@@ -929,40 +1068,252 @@ fn same_secret(given: &[u8], expected: &[u8]) -> bool {
             == 0
 }
 
-std::thread_local! {
-    static READER_URL_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+enum ReaderContext {
+    Pooled {
+        pool: Arc<ipc::RoleConnPool>,
+        parked: Option<ipc::PoolSlot>,
+        reused_any: bool,
+    },
+    #[cfg(test)]
+    UrlOverride(String),
 }
 
-/// Run `f` with an explicit `spawn_reader` database URL override (used by `serve::ipc`
-/// so worker threads never read `SPAWN_DATABASE_URL`).
-pub(super) fn with_reader_url<T>(url: &str, f: impl FnOnce() -> T) -> T {
-    struct Reset(Option<String>);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            READER_URL_OVERRIDE.with(|slot| *slot.borrow_mut() = self.0.take());
+enum OpenMode {
+    Pooled {
+        pool: Arc<ipc::RoleConnPool>,
+        parked: Option<ipc::PoolSlot>,
+    },
+    #[cfg(test)]
+    Override(String),
+    Ambient,
+}
+
+std::thread_local! {
+    static READER_CONTEXT: std::cell::RefCell<Option<ReaderContext>> = const { std::cell::RefCell::new(None) };
+}
+
+static AMBIENT_READER_POOLS: LazyLock<Mutex<HashMap<String, Arc<ipc::RoleConnPool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(super) struct PooledStore {
+    slot: Option<ipc::PoolSlot>,
+}
+
+impl PooledStore {
+    pub(super) fn mark_broken(&self) {
+        if let Some(slot) = &self.slot {
+            slot.mark_broken();
         }
     }
-    let prev = READER_URL_OVERRIDE.with(|slot| slot.borrow_mut().replace(url.to_string()));
+}
+
+impl std::ops::Deref for PooledStore {
+    type Target = spawn_postgres::PostgresStore;
+
+    fn deref(&self) -> &Self::Target {
+        self.slot
+            .as_ref()
+            .expect("pooled store slot present until drop")
+            .store()
+    }
+}
+
+impl Drop for PooledStore {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            if std::thread::panicking() || slot.is_broken() {
+                drop(slot);
+                return;
+            }
+            READER_CONTEXT.with(|cell| {
+                if let Some(ReaderContext::Pooled { parked, .. }) = cell.borrow_mut().as_mut()
+                    && parked.is_none()
+                {
+                    *parked = Some(slot);
+                    return;
+                }
+                drop(slot);
+            });
+        }
+    }
+}
+
+fn reader_pool_for_url(url: &str) -> Arc<ipc::RoleConnPool> {
+    let mut map = AMBIENT_READER_POOLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(pool) = map.get(url) {
+        return Arc::clone(pool);
+    }
+    let config = ipc::PoolConfig::from_process_env().unwrap_or_default();
+    let pool = ipc::RoleConnPool::new(
+        "reads",
+        zeroize::Zeroizing::new(url.to_string()),
+        config.reads,
+        config.wait_timeout,
+    );
+    if map.len() > 32 {
+        map.clear();
+    }
+    map.insert(url.to_string(), Arc::clone(&pool));
+    pool
+}
+
+pub(super) fn checkout_pooled(pool: &Arc<ipc::RoleConnPool>) -> Result<PooledStore, String> {
+    let mut slot = pool.acquire().map_err(|e| e.to_string())?;
+    slot.ensure_connected().map_err(|e| e.to_string())?;
+    Ok(PooledStore { slot: Some(slot) })
+}
+
+pub(super) fn run_with_reader_pool_status<T>(
+    pool: &Arc<ipc::RoleConnPool>,
+    acquire_upfront: bool,
+    mut f: impl FnMut() -> T,
+    is_backend_failure: impl Fn(&T) -> bool,
+    busy_fallback: impl FnOnce(ipc::PoolError) -> T,
+) -> T {
+    struct Reset(Option<ReaderContext>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            READER_CONTEXT.with(|cell| *cell.borrow_mut() = self.0.take());
+        }
+    }
+    for attempt in 0..2 {
+        let initial_slot = if acquire_upfront {
+            match pool.acquire() {
+                Ok(slot) => Some(slot),
+                Err(err) => return busy_fallback(err),
+            }
+        } else {
+            None
+        };
+        let prev = READER_CONTEXT.with(|cell| {
+            cell.borrow_mut().replace(ReaderContext::Pooled {
+                pool: Arc::clone(pool),
+                parked: initial_slot,
+                reused_any: false,
+            })
+        });
+        let _reset = Reset(prev);
+        let result = f();
+        let (parked, reused_any) = READER_CONTEXT.with(|cell| match cell.borrow_mut().take() {
+            Some(ReaderContext::Pooled {
+                parked, reused_any, ..
+            }) => (parked, reused_any),
+            other => {
+                *cell.borrow_mut() = other;
+                (None, false)
+            }
+        });
+        if is_backend_failure(&result) {
+            let mut can_retry = reused_any;
+            if let Some(slot) = parked {
+                if slot.was_reused() {
+                    can_retry = true;
+                }
+                if slot.is_connected() {
+                    slot.mark_broken();
+                }
+                drop(slot);
+            }
+            if attempt == 0 && can_retry {
+                continue;
+            }
+        } else {
+            drop(parked);
+        }
+        return result;
+    }
+    unreachable!("reader retry loop exits within two attempts")
+}
+
+/// Run `f` with an explicit `spawn_reader` database URL override (used by tests
+/// so worker threads never read ambient `SPAWN_DATABASE_URL`).
+#[cfg(test)]
+pub(super) fn with_reader_url<T>(url: &str, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<ReaderContext>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            READER_CONTEXT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = READER_CONTEXT.with(|slot| {
+        slot.borrow_mut()
+            .replace(ReaderContext::UrlOverride(url.to_string()))
+    });
     let _reset = Reset(prev);
     f()
 }
 
-/// The dashboard's connection: the read-only `spawn_reader` login, never the
-/// controller's.
-fn open_store() -> Result<spawn_postgres::PostgresStore, String> {
-    let overridden = READER_URL_OVERRIDE.with(|slot| slot.borrow().clone());
-    let url = if let Some(url) = overridden {
-        url
-    } else {
-        let controller = env_value("SPAWN_DATABASE_URL")
-            .ok_or_else(|| "SPAWN_DATABASE_URL is not set".to_string())?;
-        match env_value("SPAWN_SERVE_DATABASE_URL") {
-            Some(url) => url,
-            None => spawn_postgres::role_url(&controller, "spawn_reader")?,
+/// The dashboard's connection: checked out from the active unified
+/// `RoleConnPool` as the read-only `spawn_reader` login, never the controller's.
+fn open_store() -> Result<PooledStore, String> {
+    let mode = READER_CONTEXT.with(|cell| match cell.borrow_mut().as_mut() {
+        Some(ReaderContext::Pooled { pool, parked, .. }) => OpenMode::Pooled {
+            pool: Arc::clone(pool),
+            parked: parked.take(),
+        },
+        #[cfg(test)]
+        Some(ReaderContext::UrlOverride(url)) => OpenMode::Override(url.clone()),
+        None => OpenMode::Ambient,
+    });
+    match mode {
+        OpenMode::Pooled { pool, parked } => {
+            let mut slot = match parked {
+                Some(slot) => slot,
+                None => pool.acquire().map_err(|e| e.to_string())?,
+            };
+            slot.ensure_connected().map_err(|e| e.to_string())?;
+            let reused = slot.was_reused();
+            if reused {
+                READER_CONTEXT.with(|cell| {
+                    if let Some(ReaderContext::Pooled { reused_any, .. }) =
+                        cell.borrow_mut().as_mut()
+                    {
+                        *reused_any = true;
+                    }
+                });
+            }
+            Ok(PooledStore { slot: Some(slot) })
         }
-    };
-    spawn_postgres::PostgresStore::connect_with_statement_timeout(&url, STATEMENT_TIMEOUT)
-        .map_err(|error| error.to_string())
+        #[cfg(test)]
+        OpenMode::Override(url) => {
+            if url.trim().is_empty() {
+                return Err("SPAWN_DATABASE_URL is not set".to_string());
+            }
+            checkout_pooled(&reader_pool_for_url(&url))
+        }
+        OpenMode::Ambient => {
+            let controller = env_value("SPAWN_DATABASE_URL")
+                .ok_or_else(|| "SPAWN_DATABASE_URL is not set".to_string())?;
+            let url = match env_value("SPAWN_SERVE_DATABASE_URL") {
+                Some(url) => url,
+                None => spawn_postgres::role_url(&controller, "spawn_reader")?,
+            };
+            checkout_pooled(&reader_pool_for_url(&url))
+        }
+    }
+}
+
+fn stream_pools(shared: &Shared) -> Result<Option<Arc<ipc::ServePools>>, String> {
+    shared.pools.clone()
+}
+
+fn human_pool(shared: &Shared) -> Result<Arc<ipc::RoleConnPool>, (u16, String)> {
+    match &shared.pools {
+        Ok(Some(pools)) => pools
+            .human
+            .clone()
+            .ok_or_else(|| (500, "SPAWN_DATABASE_URL is not set".to_string())),
+        Ok(None) => Err((500, "SPAWN_DATABASE_URL is not set".to_string())),
+        Err(err) => Err((500, err.clone())),
+    }
+}
+
+fn checkout_human(shared: &Shared) -> Result<ipc::CheckedOutConn, (u16, String)> {
+    human_pool(shared)?
+        .checkout_verified()
+        .map_err(ipc::PoolError::status_and_message)
 }
 
 /// What the read guard decided for one API request.
@@ -1202,6 +1553,104 @@ fn log_alias(legacy: &'static str) {
     }
 }
 
+fn with_shared_reader<T>(
+    shared: &Shared,
+    mut f: impl FnMut() -> T,
+    is_backend_failure: impl Fn(&T) -> bool,
+    busy_fallback: impl FnOnce(ipc::PoolError) -> T,
+) -> T {
+    match &shared.pools {
+        Ok(Some(pools)) => {
+            run_with_reader_pool_status(&pools.reader, false, f, is_backend_failure, busy_fallback)
+        }
+        _ => f(),
+    }
+}
+
+fn busy_answer(err: ipc::PoolError) -> answers::Answer {
+    let (status, msg) = err.status_and_message();
+    answers::Answer {
+        status,
+        body: json!({ "error": msg }).to_string(),
+        etag: None,
+    }
+}
+
+fn handle_api_request(
+    request: Request,
+    path: &str,
+    query: &str,
+    shared: &Shared,
+) -> Result<Option<Request>, String> {
+    let access = access(&request, query, shared);
+    if !access.read {
+        return refuse(request, shared.token.is_some()).map(|()| None);
+    }
+    if path == "/api/features/truth" || path == "/api/episodes" {
+        if !matches!(request.method(), Method::Get | Method::Head) {
+            return request
+                .respond(not_allowed("GET"))
+                .map(|()| None)
+                .map_err(|error| error.to_string());
+        }
+        let answer = with_shared_reader(
+            shared,
+            || {
+                if path == "/api/features/truth" {
+                    feature_map::feature_truth_answer(query)
+                } else {
+                    episodes_answer(query)
+                }
+            },
+            |a| a.status == 500,
+            busy_answer,
+        );
+        let if_none_match = header(&request, "If-None-Match").map(str::to_string);
+        return answers::respond(request, &answer, if_none_match.as_deref()).map(|()| None);
+    }
+    if is_storage_read_route(path) {
+        return respond_storage_read(request, path, query, shared).map(|()| None);
+    }
+    let Some((method, pattern, values)) = route(path) else {
+        return static_file(request, &shared.web, path).map(|()| None);
+    };
+    let id = values.first().copied().unwrap_or_default();
+    match pattern {
+        "/api/sessions/<id>/input" => return input(request, id, access, shared).map(|()| None),
+        "/api/sessions/<id>/key" => return key(request, id, access, shared).map(|()| None),
+        "/api/missions/<id>/resume" => return resume(request, id, access, shared).map(|()| None),
+        "/api/sessions/<id>/restart" => {
+            return moved(request, id, "restart", access, shared).map(|()| None);
+        }
+        "/api/sessions/<id>/reassign" => {
+            return moved(request, id, "reassign", access, shared).map(|()| None);
+        }
+        "/api/master/message" => return master_message(request, access, shared).map(|()| None),
+        "/api/stream" => return stream::stream(request, query, shared).map(|()| None),
+        "/api/approvals/<session_id>/act" => {
+            return approvals::act(request, id, access, shared).map(|()| None);
+        }
+        "/api/features/scan" => {
+            return feature_scan_post(request, query, access, shared).map(|()| None);
+        }
+        "/api/features/associate" => {
+            return feature_associate_post(request, query, access, shared).map(|()| None);
+        }
+        _ => {}
+    }
+    debug_assert_eq!(method, "GET", "every POST route is answered above");
+    if !matches!(request.method(), Method::Get | Method::Head) {
+        return request
+            .respond(not_allowed("GET"))
+            .map(|()| None)
+            .map_err(|error| error.to_string());
+    }
+    if path == "/api/features/coverage" && mission_query(query).is_some() {
+        return feature_coverage_mission_get(request, query, shared).map(|()| None);
+    }
+    Ok(Some(request))
+}
+
 fn handle(request: Request, shared: &Shared) -> Result<(), String> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
@@ -1218,82 +1667,37 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
     let path = rewritten
         .as_ref()
         .map_or(path, |(successor, _)| successor.as_str());
-    if path.starts_with("/api/") {
-        let access = access(&request, query, shared);
-        if !access.read {
-            return refuse(request, shared.token.is_some());
-        }
-        if path == "/api/features/truth" {
-            if !matches!(request.method(), Method::Get | Method::Head) {
-                return request
-                    .respond(not_allowed("GET"))
-                    .map_err(|error| error.to_string());
-            }
-            let answer = feature_map::feature_truth_answer(query);
-            let if_none_match = header(&request, "If-None-Match").map(str::to_string);
-            return answers::respond(request, &answer, if_none_match.as_deref());
-        }
-        if path == "/api/episodes" {
-            if !matches!(request.method(), Method::Get | Method::Head) {
-                return request
-                    .respond(not_allowed("GET"))
-                    .map_err(|error| error.to_string());
-            }
-            let answer = episodes_answer(query);
-            let if_none_match = header(&request, "If-None-Match").map(str::to_string);
-            return answers::respond(request, &answer, if_none_match.as_deref());
-        }
-        if is_storage_read_route(path) {
-            return respond_storage_read(request, path, query);
-        }
-        let Some((method, pattern, values)) = route(path) else {
-            return static_file(request, &shared.web, path);
+    let request = if path.starts_with("/api/") {
+        let Some(request) = handle_api_request(request, path, query, shared)? else {
+            return Ok(());
         };
-        let id = values.first().copied().unwrap_or_default();
-        match pattern {
-            "/api/sessions/<id>/input" => return input(request, id, access, shared),
-            "/api/sessions/<id>/key" => return key(request, id, access, shared),
-            "/api/missions/<id>/resume" => return resume(request, id, access, shared),
-            "/api/sessions/<id>/restart" => {
-                return moved(request, id, "restart", access, shared);
-            }
-            "/api/sessions/<id>/reassign" => {
-                return moved(request, id, "reassign", access, shared);
-            }
-            "/api/master/message" => return master_message(request, access, shared),
-            "/api/stream" => return stream::stream(request, query),
-            "/api/approvals/<session_id>/act" => {
-                return approvals::act(request, id, access, shared);
-            }
-            "/api/features/scan" => return feature_scan_post(request, query, access, shared),
-            "/api/features/associate" => {
-                return feature_associate_post(request, query, access, shared);
-            }
-            _ => {}
-        }
-        debug_assert_eq!(method, "GET", "every POST route is answered above");
-        if !matches!(request.method(), Method::Get | Method::Head) {
-            return request
-                .respond(not_allowed("GET"))
-                .map_err(|error| error.to_string());
-        }
-        if path == "/api/features/coverage" && mission_query(query).is_some() {
-            return feature_coverage_mission_get(request, query);
-        }
-    }
+        request
+    } else {
+        request
+    };
     // The PWA shell is the binary's own (serve/pwa.rs), whatever the
     // built directory holds.
     if let Some(asset) = pwa::asset(path) {
         return pwa::respond(request, asset);
     }
-    let Some(read) = reader(path, query) else {
+    if reader(path, query).is_none() {
         return static_file(request, &shared.web, path);
-    };
+    }
     // A board's answer may be one computed for another page this second
     // (answers::SHARE_FOR), when the request accepts one that old; any
     // other is read now. A malformed identifier is the caller's mistake
     // (400), not the server's.
-    let compute = || answers::answer(path, read(), BAD_REQUEST);
+    let compute = || {
+        with_shared_reader(
+            shared,
+            || {
+                let read = reader(path, query).expect("checked");
+                answers::answer(path, read(), BAD_REQUEST)
+            },
+            |a| a.status == 500,
+            busy_answer,
+        )
+    };
     let answer = if answers::shared(path) {
         answers::ANSWERS.get(
             &answers::key(path, query),
@@ -1486,17 +1890,50 @@ fn typed(
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "an input")?;
-    apply_input_body(&body, id, header_key, false, &|| {
-        writer(shared).map(WriterConn::Owned)
-    })
+    let pool = human_pool(shared);
+    apply_input_body_checked(&body, id, header_key, false, pool.as_ref())
 }
 
-pub(super) fn apply_input_body<'a>(
+fn with_human_writer<T>(
+    human: Result<&Arc<ipc::RoleConnPool>, &(u16, String)>,
+    op: impl FnOnce(&spawn_postgres::PostgresStore) -> Result<T, spawn_core::port::StoreError>,
+) -> Result<T, (u16, String)> {
+    let pool = human.map_err(Clone::clone)?;
+    ipc::with_write(pool, op)
+}
+
+fn probe_human_writer(
+    human: Result<&Arc<ipc::RoleConnPool>, &(u16, String)>,
+) -> Result<(), (u16, String)> {
+    let pool = human.map_err(Clone::clone)?;
+    let _ = pool
+        .checkout_verified()
+        .map_err(ipc::PoolError::status_and_message)?;
+    Ok(())
+}
+
+pub(super) fn apply_input_body(
     raw_body: &[u8],
     id: &str,
     header_key: Option<String>,
     allow_header_key_on_probe: bool,
-    open_writer: &dyn Fn() -> Result<WriterConn<'a>, String>,
+    human: &Arc<ipc::RoleConnPool>,
+) -> Result<(u16, Value), (u16, String)> {
+    apply_input_body_checked(
+        raw_body,
+        id,
+        header_key,
+        allow_header_key_on_probe,
+        Ok(human),
+    )
+}
+
+fn apply_input_body_checked(
+    raw_body: &[u8],
+    id: &str,
+    header_key: Option<String>,
+    allow_header_key_on_probe: bool,
+    human: Result<&Arc<ipc::RoleConnPool>, &(u16, String)>,
 ) -> Result<(u16, Value), (u16, String)> {
     let body: InputBody = serde_json::from_slice(raw_body).map_err(|error| {
         (
@@ -1515,7 +1952,7 @@ pub(super) fn apply_input_body<'a>(
                 format!("{BAD_REQUEST}a probe carries no text and no key"),
             ));
         }
-        open_writer().map_err(|error| (500, error))?;
+        probe_human_writer(human)?;
         return Ok((
             200,
             json!({ "writable": true, "session_id": session.as_str(),
@@ -1524,14 +1961,15 @@ pub(super) fn apply_input_body<'a>(
     }
     let key = idempotency(body.key, header_key, "an input")?;
     let text = typed_text(body.text).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
-    let store = open_writer().map_err(|error| (500, error))?;
-    match store.submit_human_input(&session, &key, &text) {
-        Ok(spawn_postgres::HumanInput::Submitted(command)) => Ok((
+    match with_human_writer(human, |store| {
+        store.submit_human_input(&session, &key, &text)
+    })? {
+        spawn_postgres::HumanInput::Submitted(command) => Ok((
             202,
             json!({ "command_id": command.0, "session_id": session.as_str(),
                     "principal": "human" }),
         )),
-        Ok(spawn_postgres::HumanInput::NoAgent) => Err((
+        spawn_postgres::HumanInput::NoAgent => Err((
             404,
             format!(
                 "no agent has used {}: there is nothing to type into",
@@ -1541,10 +1979,9 @@ pub(super) fn apply_input_body<'a>(
         // Nothing runs: refused with the store's reason, before any command
         // is made (objective 040), so the person learns it at once. A key
         // another request used is refused the same way (#16 item 8).
-        Ok(
-            spawn_postgres::HumanInput::NotRunning(why) | spawn_postgres::HumanInput::KeyUsed(why),
-        ) => Err((409, why)),
-        Err(error) => Err((500, error.to_string())),
+        spawn_postgres::HumanInput::NotRunning(why) | spawn_postgres::HumanInput::KeyUsed(why) => {
+            Err((409, why))
+        }
     }
 }
 
@@ -1588,16 +2025,24 @@ fn pressed(
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "a key")?;
-    apply_key_body(&body, id, header_key, &|| {
-        writer(shared).map(WriterConn::Owned)
-    })
+    let pool = human_pool(shared);
+    apply_key_body_checked(&body, id, header_key, pool.as_ref())
 }
 
-pub(super) fn apply_key_body<'a>(
+pub(super) fn apply_key_body(
     raw_body: &[u8],
     id: &str,
     header_key: Option<String>,
-    open_writer: &dyn Fn() -> Result<WriterConn<'a>, String>,
+    human: &Arc<ipc::RoleConnPool>,
+) -> Result<(u16, Value), (u16, String)> {
+    apply_key_body_checked(raw_body, id, header_key, Ok(human))
+}
+
+fn apply_key_body_checked(
+    raw_body: &[u8],
+    id: &str,
+    header_key: Option<String>,
+    human: Result<&Arc<ipc::RoleConnPool>, &(u16, String)>,
 ) -> Result<(u16, Value), (u16, String)> {
     let body: KeyBody = serde_json::from_slice(raw_body)
         .map_err(|error| (400, format!("{BAD_REQUEST}the body is not a key: {error}")))?;
@@ -1608,24 +2053,22 @@ pub(super) fn apply_key_body<'a>(
         .ok_or_else(|| (400, format!("{BAD_REQUEST}a key needs a name")))?;
     let name =
         NamedKey::from_name(&name).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
-    let store = open_writer().map_err(|error| (500, error))?;
-    match store.submit_human_key(&session, &key, name) {
-        Ok(spawn_postgres::HumanKey::Submitted(command)) => Ok((
+    match with_human_writer(human, |store| store.submit_human_key(&session, &key, name))? {
+        spawn_postgres::HumanKey::Submitted(command) => Ok((
             202,
             json!({ "command_id": command.0, "session_id": session.as_str(),
                     "principal": "human", "key": name.name() }),
         )),
-        Ok(spawn_postgres::HumanKey::NoAgent) => Err((
+        spawn_postgres::HumanKey::NoAgent => Err((
             404,
             format!(
                 "no agent has used {}: there is nothing to press keys into",
                 session.as_str()
             ),
         )),
-        Ok(spawn_postgres::HumanKey::NotRunning(why) | spawn_postgres::HumanKey::KeyUsed(why)) => {
+        spawn_postgres::HumanKey::NotRunning(why) | spawn_postgres::HumanKey::KeyUsed(why) => {
             Err((409, why))
         }
-        Err(error) => Err((500, error.to_string())),
     }
 }
 
@@ -1687,17 +2130,26 @@ fn move_task(
         "a reassign"
     };
     let (body, header_key) = write_body(request, access, shared, what)?;
-    apply_move_body(&body, id, action, header_key, &|| {
-        writer(shared).map(WriterConn::Owned)
-    })
+    let pool = human_pool(shared);
+    apply_move_body_checked(&body, id, action, header_key, pool.as_ref())
 }
 
-pub(super) fn apply_move_body<'a>(
+pub(super) fn apply_move_body(
     raw_body: &[u8],
     id: &str,
     action: &str,
     header_key: Option<String>,
-    open_writer: &dyn Fn() -> Result<WriterConn<'a>, String>,
+    human: &Arc<ipc::RoleConnPool>,
+) -> Result<(u16, Value), (u16, String)> {
+    apply_move_body_checked(raw_body, id, action, header_key, Ok(human))
+}
+
+fn apply_move_body_checked(
+    raw_body: &[u8],
+    id: &str,
+    action: &str,
+    header_key: Option<String>,
+    human: Result<&Arc<ipc::RoleConnPool>, &(u16, String)>,
 ) -> Result<(u16, Value), (u16, String)> {
     let what = if action == "restart" {
         "a restart"
@@ -1729,16 +2181,16 @@ pub(super) fn apply_move_body<'a>(
             ));
         }
     }
-    let store = open_writer().map_err(|error| (500, error))?;
-    match store.human_task(&session, action, reason.as_deref(), &key) {
-        Ok(spawn_postgres::HumanTask::Moved(mut moved)) => {
+    match with_human_writer(human, |store| {
+        store.human_task(&session, action, reason.as_deref(), &key)
+    })? {
+        spawn_postgres::HumanTask::Moved(mut moved) => {
             if let Some(fields) = moved.as_object_mut() {
                 fields.insert("principal".to_string(), json!("human"));
             }
             Ok((202, moved))
         }
-        Ok(spawn_postgres::HumanTask::Refused(why)) => Err((409, why)),
-        Err(error) => Err((500, error.to_string())),
+        spawn_postgres::HumanTask::Refused(why) => Err((409, why)),
     }
 }
 
@@ -1788,16 +2240,24 @@ fn messaged(
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "a message")?;
-    apply_master_body(&body, header_key, false, &|| {
-        writer(shared).map(WriterConn::Owned)
-    })
+    let pool = human_pool(shared);
+    apply_master_body_checked(&body, header_key, false, pool.as_ref())
 }
 
-pub(super) fn apply_master_body<'a>(
+pub(super) fn apply_master_body(
     raw_body: &[u8],
     header_key: Option<String>,
     allow_header_key_on_probe: bool,
-    open_writer: &dyn Fn() -> Result<WriterConn<'a>, String>,
+    human: &Arc<ipc::RoleConnPool>,
+) -> Result<(u16, Value), (u16, String)> {
+    apply_master_body_checked(raw_body, header_key, allow_header_key_on_probe, Ok(human))
+}
+
+fn apply_master_body_checked(
+    raw_body: &[u8],
+    header_key: Option<String>,
+    allow_header_key_on_probe: bool,
+    human: Result<&Arc<ipc::RoleConnPool>, &(u16, String)>,
 ) -> Result<(u16, Value), (u16, String)> {
     let body: MasterBody = serde_json::from_slice(raw_body).map_err(|error| {
         (
@@ -1816,7 +2276,7 @@ pub(super) fn apply_master_body<'a>(
                 format!("{BAD_REQUEST}a probe carries no text, no mode and no key"),
             ));
         }
-        open_writer().map_err(|error| (500, error))?;
+        probe_human_writer(human)?;
         return Ok((
             200,
             json!({ "writable": true, "session_id": crate::supervise::SUPERVISOR_SESSION,
@@ -1841,12 +2301,10 @@ pub(super) fn apply_master_body<'a>(
         ));
     }
     let text = typed_text(body.text).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
-    let store = open_writer().map_err(|error| (500, error))?;
-    match store.human_master_message(&key, &text, mode) {
-        Ok(spawn_postgres::HumanMaster::Submitted(answer)) => Ok((202, answer)),
-        Ok(spawn_postgres::HumanMaster::KeyUsed(why)) => Err((409, why)),
-        Ok(spawn_postgres::HumanMaster::Refused(why)) => Err((400, format!("{BAD_REQUEST}{why}"))),
-        Err(error) => Err((500, error.to_string())),
+    match with_human_writer(human, |store| store.human_master_message(&key, &text, mode))? {
+        spawn_postgres::HumanMaster::Submitted(answer) => Ok((202, answer)),
+        spawn_postgres::HumanMaster::KeyUsed(why) => Err((409, why)),
+        spawn_postgres::HumanMaster::Refused(why) => Err((400, format!("{BAD_REQUEST}{why}"))),
     }
 }
 
@@ -1890,17 +2348,32 @@ fn resumed(
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "a resume")?;
-    apply_resume_body(&body, id, header_key, false, &|| {
-        writer(shared).map(WriterConn::Owned)
-    })
+    let pool = human_pool(shared);
+    apply_resume_body_checked(&body, id, header_key, false, pool.as_ref())
 }
 
-pub(super) fn apply_resume_body<'a>(
+pub(super) fn apply_resume_body(
     raw_body: &[u8],
     id: &str,
     header_key: Option<String>,
     allow_header_key_on_probe: bool,
-    open_writer: &dyn Fn() -> Result<WriterConn<'a>, String>,
+    human: &Arc<ipc::RoleConnPool>,
+) -> Result<(u16, Value), (u16, String)> {
+    apply_resume_body_checked(
+        raw_body,
+        id,
+        header_key,
+        allow_header_key_on_probe,
+        Ok(human),
+    )
+}
+
+fn apply_resume_body_checked(
+    raw_body: &[u8],
+    id: &str,
+    header_key: Option<String>,
+    allow_header_key_on_probe: bool,
+    human: Result<&Arc<ipc::RoleConnPool>, &(u16, String)>,
 ) -> Result<(u16, Value), (u16, String)> {
     let body: ResumeBody = serde_json::from_slice(raw_body).map_err(|error| {
         (
@@ -1923,7 +2396,7 @@ pub(super) fn apply_resume_body<'a>(
                 format!("{BAD_REQUEST}a probe carries no halt and no key"),
             ));
         }
-        open_writer().map_err(|error| (500, error))?;
+        probe_human_writer(human)?;
         return Ok((200, json!({ "writable": true, "mission": mission })));
     }
     let key = idempotency(body.key, header_key, "a resume")?;
@@ -1936,15 +2409,13 @@ pub(super) fn apply_resume_body<'a>(
             ),
         )
     })?;
-    let store = open_writer().map_err(|error| (500, error))?;
-    match store.human_resume(mission, halt, &key) {
-        Ok(spawn_postgres::HumanResume::Resumed(event)) => Ok((
+    match with_human_writer(human, |store| store.human_resume(mission, halt, &key))? {
+        spawn_postgres::HumanResume::Resumed(event) => Ok((
             202,
             json!({ "event": event, "mission": mission, "halt": halt, "principal": "human" }),
         )),
-        Ok(spawn_postgres::HumanResume::NoMission(why)) => Err((404, why)),
-        Ok(spawn_postgres::HumanResume::Refused(why)) => Err((409, why)),
-        Err(error) => Err((500, error.to_string())),
+        spawn_postgres::HumanResume::NoMission(why) => Err((404, why)),
+        spawn_postgres::HumanResume::Refused(why) => Err((409, why)),
     }
 }
 
@@ -1970,8 +2441,20 @@ pub(super) fn feature_coverage_for_query(query: &str) -> (u16, Value) {
 
 /// `GET /api/features/coverage?mission=<id>`: [`feature_coverage_get`] for
 /// that mission's project ([`feature_paths`]), its refusals structured.
-fn feature_coverage_mission_get(request: Request, query: &str) -> Result<(), String> {
-    let (status, body) = feature_coverage_for_query(query);
+fn feature_coverage_mission_get(
+    request: Request,
+    query: &str,
+    shared: &Shared,
+) -> Result<(), String> {
+    let (status, body) = with_shared_reader(
+        shared,
+        || feature_coverage_for_query(query),
+        |(st, _)| *st == 500,
+        |err| {
+            let (st, msg) = err.status_and_message();
+            (st, json!({ "error": msg }))
+        },
+    );
     request
         .respond(json_response(status, &body))
         .map_err(|error| error.to_string())
@@ -2139,7 +2622,7 @@ fn feature_scan_post(
     mut request: Request,
     query: &str,
     access: Access,
-    _shared: &Shared,
+    shared: &Shared,
 ) -> Result<(), String> {
     if *request.method() != Method::Post {
         return request
@@ -2155,7 +2638,16 @@ fn feature_scan_post(
             .map_err(|error| error.to_string());
     }
     let _ = read_body(&mut request);
-    let (status, body) = match feature_paths(query) {
+    let paths = with_shared_reader(
+        shared,
+        || feature_paths(query),
+        |res| matches!(res, Err((500, _))),
+        |err| {
+            let (st, msg) = err.status_and_message();
+            Err((st, json!({ "error": msg })))
+        },
+    );
+    let (status, body) = match paths {
         Ok((root, registry)) => {
             match crate::feature_inventory::api_coverage_payload(&root, &registry) {
                 Ok(payload) => (200, payload),
@@ -2223,7 +2715,16 @@ fn feature_associate_checked(
     shared: &Shared,
 ) -> Result<(u16, Value), FeatureAssociateRefusal> {
     let (raw_body, _) = write_body(request, access, shared, "a feature association")?;
-    let (root, registry) = feature_paths(query).map_err(FeatureAssociateRefusal::Structured)?;
+    let (root, registry) = with_shared_reader(
+        shared,
+        || feature_paths(query),
+        |res| matches!(res, Err((500, _))),
+        |err| {
+            let (st, msg) = err.status_and_message();
+            Err((st, json!({ "error": msg })))
+        },
+    )
+    .map_err(FeatureAssociateRefusal::Structured)?;
     feature_associate_at(&root, &registry, &raw_body)
 }
 
@@ -2352,38 +2853,6 @@ fn typed_text(text: Option<String>) -> Result<String, String> {
         );
     }
     Ok(text)
-}
-
-/// A connection checked out either ad-hoc (`Owned`, TCP `serve`) or from a
-/// bounded role pool (`Pooled`, UDS `serve::ipc`), auto-returned on drop.
-pub(super) enum WriterConn<'a> {
-    Owned(spawn_postgres::PostgresStore),
-    Pooled(ipc::CheckedOutConn<'a>),
-}
-
-impl std::ops::Deref for WriterConn<'_> {
-    type Target = spawn_postgres::PostgresStore;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Owned(store) => store,
-            Self::Pooled(conn) => conn,
-        }
-    }
-}
-
-/// A connection as the `spawn_human` login, derived from the owner's URL:
-/// the one login a write uses, which may call the `spawn_human_*`
-/// functions (an input, a key, a restart or reassign, a resume) and nothing
-/// else. A resume, too, is written only through it, never as the owner.
-fn writer(shared: &Shared) -> Result<spawn_postgres::PostgresStore, String> {
-    let owner = shared
-        .owner_url
-        .as_deref()
-        .ok_or_else(|| "SPAWN_DATABASE_URL is not set".to_string())?;
-    let url = spawn_postgres::role_url(owner, "spawn_human")?;
-    spawn_postgres::PostgresStore::connect_with_statement_timeout(&url, STATEMENT_TIMEOUT)
-        .map_err(|error| error.to_string())
 }
 
 fn json_response(status: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -3202,17 +3671,29 @@ fn is_storage_read_route(path: &str) -> bool {
             .is_some_and(|raw_id| !raw_id.is_empty() && !raw_id.contains('/'))
 }
 
-fn respond_storage_read(request: Request, path: &str, query: &str) -> Result<(), String> {
+fn respond_storage_read(
+    request: Request,
+    path: &str,
+    query: &str,
+    shared: &Shared,
+) -> Result<(), String> {
     if !matches!(request.method(), Method::Get | Method::Head) {
         return request
             .respond(not_allowed("GET"))
             .map_err(|error| error.to_string());
     }
-    let answer = if let Some(raw_id) = path.strip_prefix("/api/storage/snapshot/") {
-        storage_snapshot_answer(raw_id)
-    } else {
-        storage_tree_answer(query)
-    };
+    let answer = with_shared_reader(
+        shared,
+        || {
+            if let Some(raw_id) = path.strip_prefix("/api/storage/snapshot/") {
+                storage_snapshot_answer(raw_id)
+            } else {
+                storage_tree_answer(query)
+            }
+        },
+        |a| a.status == 500,
+        busy_answer,
+    );
     let if_none_match = header(&request, "If-None-Match").map(str::to_string);
     answers::respond(request, &answer, if_none_match.as_deref())
 }
@@ -3499,26 +3980,26 @@ fn storage_snapshot_for_store(
 
 enum OptionalStore {
     Unconfigured,
-    Connected(spawn_postgres::PostgresStore),
+    Connected(PooledStore),
 }
 
 fn open_storage_store() -> Result<OptionalStore, String> {
-    let overridden = READER_URL_OVERRIDE.with(|slot| slot.borrow().clone());
-    let url = if let Some(url) = overridden {
-        if url.trim().is_empty() {
-            return Ok(OptionalStore::Unconfigured);
-        }
-        url
-    } else if let Some(url) = env_value("SPAWN_SERVE_DATABASE_URL") {
-        url
-    } else if let Some(controller) = env_value("SPAWN_DATABASE_URL") {
-        spawn_postgres::role_url(&controller, "spawn_reader")?
-    } else {
+    let state = READER_CONTEXT.with(|cell| match cell.borrow().as_ref() {
+        Some(ReaderContext::Pooled { .. }) => (false, true),
+        #[cfg(test)]
+        Some(ReaderContext::UrlOverride(url)) => (url.trim().is_empty(), true),
+        None => (false, false),
+    });
+    if state.0 {
         return Ok(OptionalStore::Unconfigured);
-    };
-    spawn_postgres::PostgresStore::connect_with_statement_timeout(&url, STATEMENT_TIMEOUT)
-        .map(OptionalStore::Connected)
-        .map_err(|error| error.to_string())
+    }
+    if !state.1
+        && env_value("SPAWN_SERVE_DATABASE_URL").is_none()
+        && env_value("SPAWN_DATABASE_URL").is_none()
+    {
+        return Ok(OptionalStore::Unconfigured);
+    }
+    open_store().map(OptionalStore::Connected)
 }
 
 /// Read-only `GET|HEAD /api/storage/tree[?project=<name>&limit=<N>]` answer
@@ -7546,7 +8027,7 @@ mod tests {
             port: Some(port),
             hosts: server_hosts("127.0.0.1:0", port),
             open: open_networks(Some(open)).expect("networks"),
-            owner_url: owner,
+            pools: Shared::pools_from_owner(owner),
         };
         let worker = std::thread::spawn(move || {
             let request = server.recv().expect("request");
@@ -7624,7 +8105,7 @@ mod tests {
             port: Some(port),
             hosts: server_hosts("127.0.0.1:0", port),
             open: Vec::new(),
-            owner_url: None,
+            pools: Ok(None),
         });
         let slots = Slots::new(limit);
         let streams = Slots::new(stream::SSE_SLOTS);
@@ -7703,7 +8184,7 @@ mod tests {
             port: Some(port),
             hosts: server_hosts("127.0.0.1:0", port),
             open: Vec::new(),
-            owner_url: None,
+            pools: Ok(None),
         });
         let address = format!("127.0.0.1:{port}");
         let slots = Slots::new(4);
@@ -8499,7 +8980,7 @@ mod tests {
             port: Some(port),
             hosts: server_hosts("127.0.0.1:0", port),
             open: Vec::new(),
-            owner_url: None,
+            pools: Ok(None),
         });
         std::thread::spawn(move || serve_requests(&server, &shared, &slots, &streams));
         port
@@ -10165,7 +10646,7 @@ mod tests {
             port: Some(port),
             hosts: server_hosts("127.0.0.1:0", port),
             open: open_networks(Some("")).expect("networks"),
-            owner_url: None,
+            pools: Ok(None),
         };
         let url_for_worker = reader_url.to_string();
         let worker = std::thread::spawn(move || {
@@ -10315,6 +10796,373 @@ mod tests {
             let dag = seed_d6_test_dag(store);
             assert_storage_store_queries(&reader_store, &dag);
             assert_storage_http_roundtrips(&reader_url, &dag);
+        });
+    }
+
+    fn percentile_ms(sorted_us: &[u128], num: usize, den: usize) -> f64 {
+        if sorted_us.is_empty() {
+            return 0.0;
+        }
+        let idx = ((sorted_us.len() - 1) * num) / den;
+        std::time::Duration::from_micros(u64::try_from(sorted_us[idx]).unwrap_or(u64::MAX))
+            .as_secs_f64()
+            * 1000.0
+    }
+
+    fn spawn_serve_activity_sampler(
+        mut observer: postgres::Client,
+        sampling: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<(i64, i64)> {
+        use std::sync::atomic::Ordering;
+        let sampling_flag = Arc::clone(sampling);
+        std::thread::spawn(move || {
+            let mut peak_total = 0_i64;
+            let mut peak_role = 0_i64;
+            while sampling_flag.load(Ordering::Acquire) {
+                if let Ok(row) = observer.query_one(
+                    "select count(*)::bigint,
+                            count(*) filter (
+                                where application_name = 'spawn_serve_stress_1000'
+                                  and (usename like 'spawn_reader%' or usename like 'spawn_human%')
+                            )::bigint
+                       from pg_stat_activity
+                      where datname = current_database()",
+                    &[],
+                ) {
+                    peak_total = peak_total.max(row.get::<_, i64>(0));
+                    peak_role = peak_role.max(row.get::<_, i64>(1));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            (peak_total, peak_role)
+        })
+    }
+
+    fn send_stress_http_request(port: u16, idx: usize) -> (u16, u128, String, bool) {
+        use std::io::{Read, Write};
+        let t0 = std::time::Instant::now();
+        let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+            return (
+                0_u16,
+                t0.elapsed().as_micros(),
+                "connect failed".to_string(),
+                false,
+            );
+        };
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+        let is_write = idx.is_multiple_of(7);
+        let req_bytes = if is_write {
+            let body = format!(r#"{{"text":"stress {idx}","key":"stress-in-{idx}"}}"#);
+            format!(
+                "POST /api/sessions/session_supervisor/input HTTP/1.1\r\n\
+                 Host: 127.0.0.1:{port}\r\n\
+                 Authorization: Bearer stress-secret\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+        } else {
+            format!(
+                "GET /api/events?limit=5 HTTP/1.1\r\n\
+                 Host: 127.0.0.1:{port}\r\n\
+                 Authorization: Bearer stress-secret\r\n\
+                 Connection: close\r\n\r\n"
+            )
+        };
+        if let Err(e) = stream.write_all(req_bytes.as_bytes()) {
+            return (0_u16, t0.elapsed().as_micros(), e.to_string(), is_write);
+        }
+        let mut resp = String::new();
+        if let Err(e) = stream.read_to_string(&mut resp) {
+            return (0_u16, t0.elapsed().as_micros(), e.to_string(), is_write);
+        }
+        let status = resp
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        (status, t0.elapsed().as_micros(), resp, is_write)
+    }
+
+    struct ServeBurstResult {
+        latencies_us: Vec<u128>,
+        ok_reads: usize,
+        ok_writes: usize,
+        failures: Vec<(u16, bool, String)>,
+        too_many_clients: usize,
+        elapsed: std::time::Duration,
+    }
+
+    fn run_serve_stress_burst(port: u16, concurrency: usize) -> ServeBurstResult {
+        let barrier = Arc::new(std::sync::Barrier::new(concurrency));
+        let begun = std::time::Instant::now();
+        let handles: Vec<_> = (0..concurrency)
+            .map(|idx| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    send_stress_http_request(port, idx)
+                })
+            })
+            .collect();
+
+        let mut latencies_us = Vec::with_capacity(concurrency);
+        let mut ok_reads = 0usize;
+        let mut ok_writes = 0usize;
+        let mut failures = Vec::new();
+        let mut too_many_clients = 0usize;
+
+        for h in handles {
+            let (status, lat_us, resp, is_write) = h.join().expect("client thread");
+            latencies_us.push(lat_us);
+            if resp
+                .to_ascii_lowercase()
+                .contains("too many clients already")
+            {
+                too_many_clients += 1;
+            }
+            if is_write && status == 202 {
+                ok_writes += 1;
+            } else if !is_write && status == 200 {
+                ok_reads += 1;
+            } else if failures.len() < 10 {
+                failures.push((status, is_write, resp.chars().take(200).collect::<String>()));
+            }
+        }
+        ServeBurstResult {
+            latencies_us,
+            ok_reads,
+            ok_writes,
+            failures,
+            too_many_clients,
+            elapsed: begun.elapsed(),
+        }
+    }
+
+    #[test]
+    fn thousand_concurrent_http_requests_stay_bounded_under_1c1g_pg() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const CONCURRENCY: usize = 1000;
+
+        in_test_schema(|owner, store| {
+            execution_starts(store);
+            let observer_url =
+                std::env::var("SPAWN_TEST_DATABASE_URL").expect("SPAWN_TEST_DATABASE_URL");
+            let observer =
+                postgres::Client::connect(&observer_url, postgres::NoTls).expect("observer pg");
+
+            let config = super::ipc::PoolConfig::default();
+            assert_eq!(
+                (config.reads, config.writes, config.node, config.events),
+                (6, 2, 6, 2)
+            );
+
+            let sep = if owner.contains('?') { '&' } else { '?' };
+            let tagged_owner = format!("{owner}{sep}application_name=spawn_serve_stress_1000");
+            let pools = super::ipc::ServePools::from_serve_env(Some(&tagged_owner), None, config)
+                .expect("serve pools")
+                .expect("configured pools");
+
+            let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("listen"));
+            let port = server.server_addr().to_ip().expect("ip").port();
+            let shared = Arc::new(Shared {
+                web: std::env::temp_dir(),
+                token: Some("stress-secret".to_string()),
+                port: Some(port),
+                hosts: server_hosts("127.0.0.1:0", port),
+                open: Vec::new(),
+                pools: Ok(Some(pools)),
+            });
+            let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
+            let server_for_loop = Arc::clone(&server);
+            let server_shared = Arc::clone(&shared);
+            let server_streams = Arc::clone(&streams);
+            let server_thread = std::thread::spawn(move || {
+                super::serve_requests_with_queue(
+                    &server_for_loop,
+                    &server_shared,
+                    MAX_IN_FLIGHT,
+                    super::MAX_REQUEST_QUEUE,
+                    &server_streams,
+                )
+            });
+
+            let (warm_st, warm_body) = raw_status(
+                port,
+                "/api/events?limit=5",
+                "Authorization: Bearer stress-secret\r\n",
+            );
+            assert_eq!(warm_st, 200, "{warm_body}");
+
+            let sampling = Arc::new(AtomicBool::new(true));
+            let sampler = spawn_serve_activity_sampler(observer, &sampling);
+            let mut burst = run_serve_stress_burst(port, CONCURRENCY);
+            sampling.store(false, Ordering::Release);
+            let (peak_total, peak_role) = sampler.join().expect("sampler thread");
+            server.unblock();
+            let _ = server_thread.join();
+            drop(shared);
+
+            burst.latencies_us.sort_unstable();
+            let p50 = percentile_ms(&burst.latencies_us, 50, 100);
+            let p95 = percentile_ms(&burst.latencies_us, 95, 100);
+            let p99 = percentile_ms(&burst.latencies_us, 99, 100);
+            let rps = f64::from(u32::try_from(CONCURRENCY).unwrap_or(u32::MAX))
+                / burst.elapsed.as_secs_f64();
+
+            eprintln!(
+                "[stress:spawn-serve-1000] reqs={CONCURRENCY} reads={} writes={} \
+                 failures={} too_many_clients={} peak_role_conns={peak_role}/8 \
+                 peak_pg_stat_activity={peak_total}/22 elapsed_ms={:.1} rps={rps:.1} \
+                 p50_ms={p50:.2} p95_ms={p95:.2} p99_ms={p99:.2}",
+                burst.ok_reads,
+                burst.ok_writes,
+                CONCURRENCY - burst.ok_reads - burst.ok_writes,
+                burst.too_many_clients,
+                burst.elapsed.as_secs_f64() * 1000.0
+            );
+
+            assert_eq!(burst.too_many_clients, 0, "must never hit max_connections");
+            assert_eq!(
+                burst.ok_reads + burst.ok_writes,
+                CONCURRENCY,
+                "sample failures: {:?}",
+                burst.failures
+            );
+            assert!(
+                peak_role <= 8,
+                "serve role pool connections exceeded budget 8: {peak_role}"
+            );
+            assert!(
+                peak_total <= 22,
+                "total pg_stat_activity exceeded 22: {peak_total}"
+            );
+        });
+    }
+
+    fn read_tcp_until(client: &mut std::net::TcpStream, needle: &str) -> String {
+        use std::io::Read;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = String::new();
+        let mut buf = [0u8; 4096];
+        while !seen.contains(needle) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for {needle:?}: {seen}"
+            );
+            client.set_read_timeout(Some(remaining)).expect("timeout");
+            let n = client.read(&mut buf).expect("read stream");
+            assert!(n > 0, "EOF before {needle:?}: {seen}");
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        seen
+    }
+
+    fn open_tcp_sse(port: u16, token: &str) -> std::net::TcpStream {
+        use std::io::Write;
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(
+            client,
+            "GET /api/stream HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\r\n"
+        )
+        .unwrap();
+        client.flush().unwrap();
+        let _ = read_tcp_until(&mut client, "event: ready\n");
+        client
+    }
+
+    #[test]
+    fn tcp_sse_and_http_reads_succeed_concurrently_under_reads_pool_one() {
+        use spawn_core::port::EventLog;
+
+        in_test_schema(|owner, store| {
+            execution_starts(store);
+            let config = super::ipc::PoolConfig {
+                reads: 1,
+                writes: 1,
+                node: 1,
+                events: 2,
+                wait_timeout: std::time::Duration::from_millis(400),
+            };
+            let pools = super::ipc::ServePools::from_serve_env(Some(owner), None, config)
+                .expect("pools")
+                .expect("configured");
+            let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("listen"));
+            let port = server.server_addr().to_ip().expect("ip").port();
+            let shared = Arc::new(Shared {
+                web: std::env::temp_dir(),
+                token: Some("reads-one-secret".to_string()),
+                port: Some(port),
+                hosts: server_hosts("127.0.0.1:0", port),
+                open: Vec::new(),
+                pools: Ok(Some(Arc::clone(&pools))),
+            });
+            let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
+            let server_for_loop = Arc::clone(&server);
+            let server_shared = Arc::clone(&shared);
+            let server_streams = Arc::clone(&streams);
+            let server_thread = std::thread::spawn(move || {
+                super::serve_requests_with_queue(
+                    &server_for_loop,
+                    &server_shared,
+                    MAX_IN_FLIGHT,
+                    super::MAX_REQUEST_QUEUE,
+                    &server_streams,
+                )
+            });
+
+            let mut sse1 = open_tcp_sse(port, "reads-one-secret");
+            let mut sse2 = open_tcp_sse(port, "reads-one-secret");
+            assert_eq!(pools.reader.stats().0, 0);
+
+            for _ in 0..8 {
+                let (st, body) = raw_status(
+                    port,
+                    "/api/events?limit=5",
+                    "Authorization: Bearer reads-one-secret\r\n",
+                );
+                assert_eq!(st, 200, "{body}");
+                let (st, body) = raw_status(
+                    port,
+                    "/api/overview",
+                    "Authorization: Bearer reads-one-secret\r\n",
+                );
+                assert_eq!(st, 200, "{body}");
+            }
+
+            let live_id = store
+                .append(spawn_core::event::NewEvent {
+                    agent_id: spawn_core::id::AgentId::new("agent_tcp_reads1").unwrap(),
+                    session_id: spawn_core::id::SessionId::new("session_tcp_reads1").unwrap(),
+                    execution_id: None,
+                    source: spawn_core::event::Source::Bridge,
+                    source_event_id: Some("tcp-reads1-live".to_string()),
+                    kind: spawn_core::event::EventKind::MessageReceived,
+                })
+                .unwrap()
+                .record
+                .position
+                .0;
+            for sse in [&mut sse1, &mut sse2] {
+                let seen = read_tcp_until(sse, &format!("id: {live_id}\n"));
+                assert!(seen.contains("\"session_tcp_reads1\""), "{seen}");
+            }
+
+            drop((sse1, sse2));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while pools.events.stats().0 != 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            assert_eq!(pools.reader.stats().0, 0);
+            assert_eq!(pools.events.stats().0, 0);
+
+            server.unblock();
+            let _ = server_thread.join();
         });
     }
 }

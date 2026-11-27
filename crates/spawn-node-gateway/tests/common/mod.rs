@@ -118,6 +118,16 @@ impl Harness {
     }
 
     pub fn start_with(name: &str, connector: Connector, prefix: &str, timeouts: Timeouts) -> Self {
+        Self::start_with_workers(name, connector, prefix, timeouts, 4)
+    }
+
+    pub fn start_with_workers(
+        name: &str,
+        connector: Connector,
+        prefix: &str,
+        timeouts: Timeouts,
+        workers: usize,
+    ) -> Self {
         let root = scratch(name);
         let artifacts = root.join("artifacts");
         let results = root.join("results");
@@ -138,7 +148,7 @@ impl Harness {
             connector,
         }));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = spawn_with(listener, &gateway, 4, timeouts).unwrap();
+        let addr = spawn_with(listener, &gateway, workers, timeouts).unwrap();
         Self {
             addr,
             gateway,

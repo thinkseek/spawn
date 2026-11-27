@@ -220,7 +220,7 @@ fn ipc_framing_enforces_reject_fixture_and_end_to_end_pg_routes() {
     verify_reject_fixture(&sock_path);
     verify_e2e_routes_and_events(&sock_path, &store);
 
-    let state_only = IpcState::new(
+    let state_only = IpcState::with_test_wait_timeout(
         RoleUrls::from_explicit(
             owner_in_schema.clone(),
             owner_in_schema.clone(),
@@ -228,12 +228,13 @@ fn ipc_framing_enforces_reject_fixture_and_end_to_end_pg_routes() {
         ),
         dir.0.join("cas2"),
         None,
+        std::time::Duration::ZERO,
     );
     let mut permits = Vec::new();
     for _ in 0..super::WRITES_POOL_SIZE {
-        permits.push(state_only.pools.writes_gate.try_acquire().unwrap());
+        permits.push(state_only.pools.human_pool().try_acquire_slot().unwrap());
     }
-    assert!(state_only.pools.writes_gate.try_acquire().is_none());
+    assert!(state_only.pools.human_pool().try_acquire_slot().is_none());
     drop(permits);
 
     drop(state_only);
@@ -459,4 +460,489 @@ fn verify_e2e_nodes_and_episodes(sock_path: &std::path::Path) {
     assert_eq!(ep_ans["parity_ok"], true);
     assert_eq!(ep_ans["warnings"], 0);
     assert_eq!(ep_ans["drift_count"], 0);
+}
+
+#[test]
+fn pool_config_from_env_defaults_overrides_and_fail_closed() {
+    use std::collections::HashMap;
+    let defaults = super::PoolConfig::from_env(|_| None).expect("default config");
+    assert_eq!(defaults.reads, 6);
+    assert_eq!(defaults.writes, 2);
+    assert_eq!(defaults.node, 6);
+    assert_eq!(defaults.events, 2);
+    // Combined default control plane budget: 6 + 2 + 6 + 2 + 6 (gateway) = 22 <= 22.
+    assert!(defaults.reads + defaults.writes + defaults.node + defaults.events + 6 <= 22);
+
+    let custom_env: HashMap<&str, &str> = [
+        (super::ENV_READS_POOL, " 12 "),
+        (super::ENV_WRITES_POOL, "4"),
+        (super::ENV_NODE_POOL, "10"),
+        (super::ENV_EVENTS_POOL, "3"),
+    ]
+    .into_iter()
+    .collect();
+    let custom = super::PoolConfig::from_env(|k| custom_env.get(k).map(|v| (*v).to_string()))
+        .expect("custom");
+    assert_eq!(
+        (custom.reads, custom.writes, custom.node, custom.events),
+        (12, 4, 10, 3)
+    );
+
+    for var in [
+        super::ENV_READS_POOL,
+        super::ENV_WRITES_POOL,
+        super::ENV_NODE_POOL,
+        super::ENV_EVENTS_POOL,
+    ] {
+        for bad in [
+            "",
+            "   ",
+            "0",
+            "-1",
+            "abc",
+            "1.5",
+            "99999999999999999999999",
+        ] {
+            let err = super::PoolConfig::from_env(|k| (k == var).then(|| bad.to_string()))
+                .expect_err("invalid pool size must fail closed");
+            assert!(err.contains(var), "{var}={bad:?}: {err}");
+        }
+    }
+}
+
+#[test]
+fn role_conn_pool_reuses_warm_conns_bounds_queue_and_evicts_broken() {
+    let Ok(base_url) = std::env::var("SPAWN_TEST_DATABASE_URL") else {
+        eprintln!("SPAWN_TEST_DATABASE_URL unset; skipping RoleConnPool PG lifecycle test");
+        return;
+    };
+    let schema = spawn_postgres::testing::TestSchema::new("role_pool_lifecycle");
+    let _owner_store = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
+    let sep = if base_url.contains('?') { '&' } else { '?' };
+    let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
+    let reader_url = spawn_postgres::role_url(&owner_in_schema, "spawn_reader").unwrap();
+
+    // Observer client inspects backend PIDs and terminates idle connections.
+    let mut observer = postgres::Client::connect(&base_url, postgres::NoTls).unwrap();
+
+    let pool = super::RoleConnPool::new(
+        "reads",
+        zeroize::Zeroizing::new(reader_url),
+        2,
+        std::time::Duration::from_millis(80),
+    );
+
+    // 1. Warm reuse: two sequential checkouts reuse the exact same PG backend process.
+    let pid1: i32 = {
+        let conn = pool.checkout().unwrap();
+        assert!(!conn.was_reused_for_test());
+        conn.backend_pid().unwrap()
+    };
+    assert_eq!(pool.stats(), (0, 1));
+    let pid2: i32 = {
+        let conn = pool.checkout().unwrap();
+        assert!(conn.was_reused_for_test());
+        conn.backend_pid().unwrap()
+    };
+    assert_eq!(pid1, pid2, "sequential checkouts reuse warm connection");
+
+    // 2. Bounded concurrency + finite queue wait timeout (503 Busy when full past wait_timeout).
+    let c1 = pool.checkout().unwrap();
+    let c2 = pool.checkout().unwrap();
+    assert_eq!(pool.stats().0, 2);
+
+    let err = pool
+        .checkout()
+        .err()
+        .expect("saturated past 80ms times out");
+    assert_eq!(err.status_and_message().0, 503);
+
+    // Waiter wakes up cleanly when a slot frees before wait_timeout.
+    let pool_bg = std::sync::Arc::clone(&pool);
+    let waiter = std::thread::spawn(move || pool_bg.checkout().map(|c| c.backend_pid().unwrap()));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    drop(c2);
+    let pid_waited = waiter.join().unwrap().unwrap();
+    assert!(pid_waited > 0);
+    drop(c1);
+    assert_eq!(pool.stats().0, 0);
+
+    // 3. Broken connection eviction + transparent 1x reconnect retry on dead backend.
+    let pid_before = {
+        let conn = pool.checkout().unwrap();
+        conn.backend_pid().unwrap()
+    };
+    let terminated: bool = observer
+        .query_one("select pg_terminate_backend($1)", &[&pid_before])
+        .unwrap()
+        .get(0);
+    assert!(terminated, "observer terminated pooled reader backend");
+
+    // First reused checkout fails on dead socket -> run_with_reader_pool_status marks it
+    // broken (evicts it) and retries once on a fresh connection transparently!
+    let mut called = 0usize;
+    let recovered_pid = crate::serve::run_with_reader_pool_status(
+        &pool,
+        false,
+        || -> Result<i32, String> {
+            called += 1;
+            let store = crate::serve::open_store()?;
+            store.backend_pid().map_err(|e| e.to_string())
+        },
+        Result::is_err,
+        |e| Err(e.to_string()),
+    )
+    .expect("transparent reconnect succeeds after terminating pooled backend");
+    assert_eq!(called, 2, "retried once after evicting broken idle conn");
+    assert_ne!(
+        recovered_pid, pid_before,
+        "fresh backend pid after eviction"
+    );
+}
+
+fn set_remaining_read_timeout(
+    stream: &UnixStream,
+    deadline: std::time::Instant,
+    context: &str,
+    seen: &str,
+) {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    assert!(
+        !remaining.is_zero(),
+        "timed out waiting for {context}: {seen}"
+    );
+    stream.set_read_timeout(Some(remaining)).unwrap();
+}
+
+fn read_uds_headers_and_first_frame(
+    sock_path: &std::path::Path,
+    path: &str,
+    marker: &str,
+) -> BufReader<UnixStream> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut stream = UnixStream::connect(sock_path).unwrap();
+    set_remaining_read_timeout(&stream, deadline, &format!("status on {path}"), "");
+    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    stream.flush().unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).unwrap();
+    assert!(status_line.starts_with("HTTP/1.1 200 "), "{status_line}");
+    loop {
+        set_remaining_read_timeout(
+            reader.get_ref(),
+            deadline,
+            &format!("headers on {path}"),
+            "",
+        );
+        let mut h = String::new();
+        let n = reader.read_line(&mut h).unwrap();
+        assert!(n > 0, "unexpected EOF reading headers for {path}");
+        if h == "\r\n" {
+            break;
+        }
+    }
+    let mut seen = String::new();
+    while !seen.contains(marker) {
+        set_remaining_read_timeout(
+            reader.get_ref(),
+            deadline,
+            &format!("{marker:?} on {path}"),
+            &seen,
+        );
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).unwrap();
+        assert!(n > 0, "EOF before {marker:?} on {path}: {seen}");
+        seen.push_str(&line);
+    }
+    reader
+}
+
+fn read_uds_until(reader: &mut BufReader<UnixStream>, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut seen = String::new();
+    while !seen.contains(needle) {
+        set_remaining_read_timeout(reader.get_ref(), deadline, needle, &seen);
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).unwrap();
+        assert!(n > 0, "EOF before {needle:?}: {seen}");
+        seen.push_str(&line);
+    }
+    seen
+}
+
+#[test]
+fn with_write_never_replays_failed_write_and_recovers_stale_idle_before_dispatch() {
+    let Ok(base_url) = std::env::var("SPAWN_TEST_DATABASE_URL") else {
+        eprintln!("SPAWN_TEST_DATABASE_URL unset; skipping with_write test");
+        return;
+    };
+    let schema = spawn_postgres::testing::TestSchema::new("pool_no_write_replay");
+    let _owner = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
+    let sep = if base_url.contains('?') { '&' } else { '?' };
+    let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
+    let node_url = spawn_postgres::role_url(&owner_in_schema, "spawn_node_gateway").unwrap();
+    let mut observer = postgres::Client::connect(&base_url, postgres::NoTls).unwrap();
+
+    let pool = super::RoleConnPool::new(
+        "node",
+        zeroize::Zeroizing::new(node_url),
+        1,
+        std::time::Duration::from_millis(200),
+    );
+
+    // Warm one connection so next checkout reuses it.
+    let pid1 = super::with_write(&pool, PostgresStore::backend_pid).unwrap();
+    assert_eq!(pool.stats(), (0, 1));
+
+    // A write returning Unreachable (simulating lost commit response) must execute AT MOST ONCE.
+    let mut calls = 0usize;
+    let err = super::with_write(
+        &pool,
+        |_store| -> Result<(), spawn_core::port::StoreError> {
+            calls += 1;
+            Err(spawn_core::port::StoreError::Unreachable(
+                "simulated lost commit response".to_string(),
+            ))
+        },
+    )
+    .expect_err("failed write must fail closed without replay");
+    assert_eq!(calls, 1, "write closure must execute at most once");
+    assert_eq!(err.0, 500);
+    assert_eq!(pool.stats(), (0, 0), "failed write connection evicted");
+
+    // Pre-dispatch stale socket termination: checkout_verified replaces dead idle socket
+    // before invoking write closure, so write closure runs exactly once on fresh backend.
+    let pid2 = super::with_write(&pool, PostgresStore::backend_pid).unwrap();
+    assert_ne!(pid1, pid2);
+    let killed: bool = observer
+        .query_one("select pg_terminate_backend($1)", &[&pid2])
+        .unwrap()
+        .get(0);
+    assert!(killed);
+
+    let mut stale_write_calls = 0usize;
+    let pid3 = super::with_write(&pool, |store| {
+        stale_write_calls += 1;
+        store.backend_pid()
+    })
+    .expect("pre-dispatch health check recovers before running write");
+    assert_eq!(stale_write_calls, 1);
+    assert_ne!(pid3, pid2);
+
+    // Contrast: pure read helper transparently retries 1x on Unreachable reused conn.
+    let mut read_calls = 0usize;
+    let pid4 = super::with_read(&pool, |store| {
+        read_calls += 1;
+        if read_calls == 1 {
+            return Err(spawn_core::port::StoreError::Unreachable(
+                "transient read drop".to_string(),
+            ));
+        }
+        store.backend_pid()
+    })
+    .expect("read retries once");
+    assert_eq!(read_calls, 2);
+    assert_ne!(pid4, pid3);
+}
+
+#[test]
+fn pool_slot_drop_evicts_on_panic_and_unmarked_dead_backend_without_leaking_slot() {
+    let Ok(base_url) = std::env::var("SPAWN_TEST_DATABASE_URL") else {
+        eprintln!("SPAWN_TEST_DATABASE_URL unset; skipping panic/dirty eviction test");
+        return;
+    };
+    let schema = spawn_postgres::testing::TestSchema::new("pool_panic_dirty");
+    let _owner = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
+    let sep = if base_url.contains('?') { '&' } else { '?' };
+    let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
+    let reader_url = spawn_postgres::role_url(&owner_in_schema, "spawn_reader").unwrap();
+    let mut observer = postgres::Client::connect(&base_url, postgres::NoTls).unwrap();
+
+    let pool = super::RoleConnPool::new(
+        "reads",
+        zeroize::Zeroizing::new(reader_url),
+        1,
+        std::time::Duration::from_millis(200),
+    );
+
+    let pid1 = super::with_read(&pool, PostgresStore::backend_pid).unwrap();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = super::with_write(
+            &pool,
+            |_store| -> Result<(), spawn_core::port::StoreError> {
+                panic!("simulated panic while holding pooled conn");
+            },
+        );
+    }));
+    assert!(panicked.is_err());
+    assert_eq!(pool.stats(), (0, 0), "panicking slot must not enter idle");
+    assert_eq!(pool.open_conns(), 0, "panicking slot closed PG socket");
+
+    let pid2 = {
+        let conn = pool.checkout().unwrap();
+        let pid = conn.backend_pid().unwrap();
+        assert_ne!(pid, pid1);
+        let killed: bool = observer
+            .query_one("select pg_terminate_backend($1)", &[&pid])
+            .unwrap()
+            .get(0);
+        assert!(killed);
+        // Drop WITHOUT calling mark_broken(): Drop health probe must evict dead backend.
+        pid
+    };
+    assert_eq!(pool.stats(), (0, 0), "dead backend evicted on drop");
+    assert_eq!(pool.open_conns(), 0);
+    let pid3 = pool.checkout().unwrap().backend_pid().unwrap();
+    assert_ne!(pid3, pid2);
+}
+
+#[test]
+fn broken_slot_eviction_closes_socket_before_waking_waiter() {
+    let Ok(base_url) = std::env::var("SPAWN_TEST_DATABASE_URL") else {
+        eprintln!("SPAWN_TEST_DATABASE_URL unset; skipping eviction order test");
+        return;
+    };
+    let schema = spawn_postgres::testing::TestSchema::new("pool_evict_order");
+    let _owner = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
+    let sep = if base_url.contains('?') { '&' } else { '?' };
+    let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
+    let reader_url = spawn_postgres::role_url(&owner_in_schema, "spawn_reader").unwrap();
+
+    let pool = super::RoleConnPool::new(
+        "reads",
+        zeroize::Zeroizing::new(reader_url),
+        1,
+        std::time::Duration::from_secs(2),
+    );
+    for _ in 0..8 {
+        let conn = pool.checkout().unwrap();
+        let pid_old = conn.backend_pid().unwrap();
+        let pool_waiter = std::sync::Arc::clone(&pool);
+        let waiter = std::thread::spawn(move || {
+            let next = pool_waiter.checkout().unwrap();
+            next.backend_pid().unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        conn.mark_broken();
+        drop(conn);
+        let pid_new = waiter.join().unwrap();
+        assert_ne!(pid_new, pid_old);
+        assert_eq!(
+            pool.peak_open_conns(),
+            1,
+            "broken socket must close before waiter opens replacement"
+        );
+    }
+    assert_eq!(pool.stats(), (0, 1));
+    assert_eq!(pool.open_conns(), 1);
+}
+
+#[test]
+fn uds_four_concurrent_streams_under_reads_one_events_two_do_not_starve_reads() {
+    let Ok(base_url) = std::env::var("SPAWN_TEST_DATABASE_URL") else {
+        eprintln!("SPAWN_TEST_DATABASE_URL unset; skipping UDS stream starvation test");
+        return;
+    };
+    let dir = Scratch::new("uds-streams-no-starve");
+    let sock_path = dir.0.join("core.sock");
+    let cas_root = dir.0.join("cas");
+    let _cas = Store::open(&cas_root).unwrap();
+
+    let schema = spawn_postgres::testing::TestSchema::new("ipc_stream_pool");
+    let store = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
+    let sep = if base_url.contains('?') { '&' } else { '?' };
+    let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
+    let urls = RoleUrls::from_owner(&owner_in_schema).unwrap();
+
+    let config = super::PoolConfig {
+        reads: 1,
+        writes: 1,
+        node: 1,
+        events: 2,
+        wait_timeout: std::time::Duration::from_millis(400),
+    };
+    let (_server, pools) =
+        super::spawn_ipc_server_with_config(sock_path.clone(), urls, cas_root, None, config)
+            .unwrap();
+
+    // 4 simultaneous UDS long-lived streams exceed both reads=1 and events=2!
+    let mut n1 =
+        read_uds_headers_and_first_frame(&sock_path, "/ipc/v1/events", "\"type\":\"ready\"");
+    let mut n2 =
+        read_uds_headers_and_first_frame(&sock_path, "/ipc/v1/events", "\"type\":\"ready\"");
+    let mut s1 = read_uds_headers_and_first_frame(&sock_path, "/api/stream", "event: ready\n");
+    let mut s2 = read_uds_headers_and_first_frame(&sock_path, "/api/stream", "event: ready\n");
+
+    assert_eq!(
+        pools.reader.stats().0,
+        0,
+        "streams must release READS_POOL immediately after catch-up"
+    );
+
+    // Concurrent normal reads succeed cleanly without starving on READS_POOL=1.
+    for _ in 0..8 {
+        let (st, _, _) = exchange_raw(
+            &sock_path,
+            b"GET /ipc/v1/hello HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert_eq!(st, 200);
+        let (st, _, _) = exchange_raw(
+            &sock_path,
+            b"GET /api/overview HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert_eq!(st, 200);
+    }
+
+    // Live event fans out to all 4 UDS streams through the single shared hub.
+    let live_id = EventLog::append(
+        &store,
+        NewEvent {
+            agent_id: AgentId::new("agent_uds_fanout").unwrap(),
+            session_id: SessionId::new("session_uds_fanout").unwrap(),
+            execution_id: None,
+            source: spawn_core::event::Source::Bridge,
+            source_event_id: Some("uds-fanout-1".to_string()),
+            kind: EventKind::MessageReceived,
+        },
+    )
+    .unwrap()
+    .record
+    .position
+    .0;
+    let ndjson_needle = format!("\"id\":{live_id}");
+    let sse_id_needle = format!("id: {live_id}\n");
+    for ndjson in [&mut n1, &mut n2] {
+        let seen = read_uds_until(ndjson, &ndjson_needle);
+        assert!(seen.contains("\"session_uds_fanout\""), "{seen}");
+    }
+    for sse in [&mut s1, &mut s2] {
+        let seen = read_uds_until(sse, "\"session_uds_fanout\"");
+        assert!(seen.contains(&sse_id_needle), "{seen}");
+    }
+
+    drop((n1, n2, s1, s2));
+    // Trigger one quiet publish/write failure check or wait briefly for idle listener release.
+    EventLog::append(
+        &store,
+        NewEvent {
+            agent_id: AgentId::new("agent_uds_fanout").unwrap(),
+            session_id: SessionId::new("session_uds_fanout").unwrap(),
+            execution_id: None,
+            source: spawn_core::event::Source::Bridge,
+            source_event_id: Some("uds-fanout-close-probe".to_string()),
+            kind: EventKind::MessageReceived,
+        },
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pools.events.stats().0 != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(pools.reader.stats().0, 0);
+    assert_eq!(
+        pools.events.stats().0,
+        0,
+        "idle shared hub listener must release events pool slot"
+    );
 }
