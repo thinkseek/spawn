@@ -17,8 +17,8 @@ use spawn_cas::{
 };
 
 use crate::cas_merkle::{CasMerkleStore, D6StoreError, format_commit_body};
-use crate::git::{CONFLICT_MARKER_SIZE, LARGE_FILE_TRAILER};
 use crate::tree_path::TreePath;
+use crate::workspace_rules::{CONFLICT_MARKER_SIZE, LARGE_FILE_TRAILER};
 
 /// Errors produced when validating snapshot ancestry for a 3-way D6 merge.
 #[derive(Debug)]

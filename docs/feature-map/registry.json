@@ -1156,6 +1156,7 @@
         "crates/spawn-host/src/process.rs",
         "crates/spawn-host/src/root.rs",
         "crates/spawn-host/src/tree_path.rs",
+        "crates/spawn-host/src/workspace_rules.rs",
         "crates/spawn-host/tests/branches.rs",
         "crates/spawn-host/tests/identity.rs",
         "crates/spawn-host/tests/runtime_files.rs",

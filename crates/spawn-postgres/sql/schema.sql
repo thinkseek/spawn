@@ -10051,6 +10051,55 @@ begin
     return v_seq;
 end $$;
 
+-- Retire all live `spawn_refs` rows for a rolled-back project (owner only)
+-- and append immutable audit rows to `spawn_ref_log`. Preserves
+-- `spawn_snapshots` and `spawn_ref_log` while releasing `spawn_refs` ownership
+-- back to Git so a later re-cutover (`--to d6`) can cleanly re-bootstrap
+-- `main` and all current Git refs without bypassing `spawn_ref_land_main` gate
+-- enforcement.
+create or replace function spawn_ref_retire_project(
+    p_project text,
+    p_reason text default 'rollback'
+) returns integer
+language plpgsql security definer as $$
+declare
+    v_now bigint;
+    v_reason text;
+    v_count integer := 0;
+    v_row spawn_refs%rowtype;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner retires project refs' using errcode = '42501';
+    end if;
+    if p_project is null or length(btrim(p_project)) = 0 then
+        raise exception 'project must be non-empty' using errcode = '22023';
+    end if;
+
+    perform pg_advisory_xact_lock(1399957360);
+
+    v_now := spawn_now_ms();
+    v_reason := coalesce(nullif(btrim(p_reason), ''), 'rollback');
+
+    for v_row in
+        select *
+          from spawn_refs
+         where project = p_project
+         order by name
+           for update
+    loop
+        delete from spawn_refs
+         where project = v_row.project
+           and name = v_row.name;
+
+        insert into spawn_ref_log (project, name, kind, old_snapshot, new_snapshot, reason, at_ms)
+        values (v_row.project, v_row.name, v_row.kind, v_row.snapshot, v_row.snapshot, v_reason, v_now);
+
+        v_count := v_count + 1;
+    end loop;
+
+    return v_count;
+end $$;
+
 -- Mark unreferenced `live` snapshots as `collected` (owner only). Never
 -- collects a snapshot currently referenced by any row in `spawn_refs`.
 create or replace function spawn_snapshot_mark_collected(p_ids text[]) returns integer
@@ -10084,6 +10133,7 @@ begin
         'spawn_snapshot_record(text, text, text, text[], text, bigint)',
         'spawn_ref_cas(text, text, text, text, text, text)',
         'spawn_ref_land_main(text, text, text, text, bigint, text)',
+        'spawn_ref_retire_project(text, text)',
         'spawn_snapshot_mark_collected(text[])'
     ] loop
         execute format('alter function %s set search_path = %I, pg_temp',

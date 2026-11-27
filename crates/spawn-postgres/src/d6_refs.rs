@@ -307,6 +307,21 @@ impl PostgresStore {
             .get(0))
     }
 
+    /// Retire all live `spawn_refs` rows for `project` when rolling back from
+    /// D6 back to Git (`spawn_ref_retire_project`, owner only), appending
+    /// immutable audit rows to `spawn_ref_log`.
+    ///
+    /// Preserves `spawn_snapshots` and `spawn_ref_log`, leaves other projects
+    /// untouched, and returns the number of retired ref rows.
+    pub fn retire_project_refs(&self, project: &str, reason: &str) -> Result<i32, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_ref_retire_project($1, $2)",
+                &[&project, &reason],
+            )?
+            .get(0))
+    }
+
     /// List live refs in `spawn_refs`, optionally filtered to one `project`.
     pub fn list_refs(&self, project: Option<&str>) -> Result<Vec<RefRow>, StoreError> {
         let rows = match project {

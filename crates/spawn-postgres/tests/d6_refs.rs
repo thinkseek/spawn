@@ -506,6 +506,106 @@ fn land_main_ref_requires_exact_accepted_gate_verdict_and_blocks_cas_ref() {
 }
 
 #[test]
+fn retire_project_refs_allows_rebootstrap_while_preserving_main_gate_guard() {
+    let (store, _schema) = store("d6_retire_project");
+    let (s1, s2, s3) = record_three_snapshots(&store, "proj-rb");
+    let other_snap = sha256_of_hex("99");
+    store
+        .record_snapshot(
+            &other_snap,
+            &oid_of_hex("99"),
+            &sha256_of_hex("aa"),
+            &[],
+            "proj-keep",
+            100,
+        )
+        .expect("other snapshot");
+    store
+        .land_main_ref("proj-keep", "main", None, &other_snap, None, "keep main")
+        .expect("bootstrap other project");
+
+    store
+        .land_main_ref("proj-rb", "main", None, &s1, None, "initial cutover")
+        .expect("bootstrap proj-rb main");
+    store
+        .cas_ref("proj-rb", "feat/a", RefKind::Branch, None, &s2, "branch")
+        .expect("cas branch");
+    store
+        .cas_ref("proj-rb", "wip/a", RefKind::Wip, None, &s2, "wip")
+        .expect("cas wip");
+    store
+        .cas_ref("proj-rb", "tags/v1", RefKind::Tag, None, &s1, "tag")
+        .expect("cas tag");
+
+    assert!(matches!(
+        store.land_main_ref("proj-rb", "main", Some(&s1), &s2, None, "no task"),
+        Err(StoreError::Rejected(_))
+    ));
+    assert!(store.retire_project_refs("   ", "rollback").is_err());
+
+    let seq_before = store.latest_ref_log_seq().expect("seq before");
+    let retired = store
+        .retire_project_refs("proj-rb", "rollback to git")
+        .expect("retire project refs");
+    assert_eq!(retired, 4);
+    assert!(store.list_refs(Some("proj-rb")).expect("empty").is_empty());
+    assert_eq!(store.list_refs(Some("proj-keep")).expect("kept").len(), 1);
+    for id in [&s1, &s2, &s3] {
+        assert_eq!(
+            store.get_snapshot(id).expect("snap").expect("exists").state,
+            SnapshotState::Live
+        );
+    }
+
+    let audit = store
+        .list_ref_log_after(i64::try_from(seq_before).expect("seq fits i64"))
+        .expect("audit log");
+    assert_eq!(audit.len(), 4);
+    assert!(
+        audit
+            .iter()
+            .all(|row| row.project == "proj-rb" && row.reason == "rollback to git")
+    );
+    assert_eq!(
+        store
+            .retire_project_refs("proj-rb", "repeat")
+            .expect("repeat"),
+        0
+    );
+
+    // Re-cutover re-bootstraps `main` at the newer Git commit (`s2`) while
+    // retaining full `spawn_ref_land_main` gate protection thereafter.
+    store
+        .land_main_ref("proj-rb", "main", None, &s2, None, "re-cutover")
+        .expect("re-bootstrap main");
+    assert!(matches!(
+        store.land_main_ref("proj-rb", "main", None, &s3, None, "dup bootstrap"),
+        Err(StoreError::Rejected(_))
+    ));
+    assert!(matches!(
+        store.land_main_ref(
+            "proj-rb",
+            "main",
+            Some(&s2),
+            &s3,
+            None,
+            "unapproved advance"
+        ),
+        Err(StoreError::Rejected(_))
+    ));
+
+    let task = setup_accepted_task(
+        &store,
+        "/tmp/proj-rb.git",
+        &oid_of_hex("22"),
+        &oid_of_hex("33"),
+    );
+    store
+        .land_main_ref("proj-rb", "main", Some(&s2), &s3, Some(task), "gated land")
+        .expect("gated advance succeeds after re-cutover");
+}
+
+#[test]
 fn mark_snapshots_collected_skips_referenced_snapshots_and_forbids_reuse() {
     let (store, _schema) = store("d6_collect");
     let tree = sha256_of_hex("cc");
@@ -611,12 +711,14 @@ fn restricted_roles_and_database_identity_obey_least_privilege() {
             "select spawn_snapshot_record($1, $2, $3, '{}'::text[], 'p', 1)",
             "select spawn_ref_cas('p', 'b', 'branch', null, $1, 'r')",
             "select spawn_ref_land_main('p', 'main', null, $1, null, 'r')",
+            "select spawn_ref_retire_project('p', 'rollback')",
             "select spawn_snapshot_mark_collected(array[$1])",
         ] {
             let err = match sql {
                 s if s.contains("spawn_snapshot_record") => {
                     conn.query_one(s, &[&sha256_of_hex("f3"), &oid_of_hex("f3"), &tree])
                 }
+                s if s.contains("spawn_ref_retire_project") => conn.query_one(s, &[]),
                 _ => conn.query_one(sql, &[&snap]),
             }
             .expect_err("restricted login must not execute owner writer");
@@ -647,6 +749,10 @@ fn restricted_roles_and_database_identity_obey_least_privilege() {
                 &[&snap],
             )
             .expect_err("human/node_gateway must not execute owner writer");
+        assert_eq!(err.as_db_error().map(|db| db.code().code()), Some("42501"));
+        let err = conn
+            .query_one("select spawn_ref_retire_project('p', 'rollback')", &[])
+            .expect_err("human/node_gateway must not retire refs");
         assert_eq!(err.as_db_error().map(|db| db.code().code()), Some("42501"));
     }
 }

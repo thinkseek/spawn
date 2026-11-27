@@ -222,6 +222,18 @@ pub trait RefLedger {
 
     /// List live refs, optionally scoped to `project`.
     fn list_refs(&self, project: Option<&str>) -> Result<Vec<LedgerRef>, D6StoreError>;
+
+    /// Retire all live refs for `project` when rolling back from D6 back to Git.
+    ///
+    /// Preserves recorded snapshots and append-only history while releasing
+    /// live ref ownership back to Git so Git may advance `main` (and add/delete
+    /// branches or tags) and a later re-cutover can cleanly re-bootstrap refs
+    /// without weakening runtime [`RefLedger::land_main_ref`] gate enforcement.
+    ///
+    /// Returns the number of retired live refs.
+    fn retire_project_refs(&self, _project: &str, _reason: &str) -> Result<usize, D6StoreError> {
+        Ok(0)
+    }
 }
 
 #[derive(Default)]
@@ -479,6 +491,30 @@ impl RefLedger for InMemoryRefLedger {
             .filter(|r| project.is_none_or(|p| r.project == p))
             .cloned()
             .collect())
+    }
+
+    fn retire_project_refs(&self, project: &str, _reason: &str) -> Result<usize, D6StoreError> {
+        if project.trim().is_empty() {
+            return Err(D6StoreError::Ledger(
+                "project must be non-empty".to_string(),
+            ));
+        }
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let keys: Vec<(String, String)> = guard
+            .refs
+            .keys()
+            .filter(|(p, _)| p == project)
+            .cloned()
+            .collect();
+        let retired = keys.len();
+        for key in keys {
+            guard.refs.remove(&key);
+        }
+        guard.next_seq += u64::try_from(retired).unwrap_or(0);
+        Ok(retired)
     }
 }
 

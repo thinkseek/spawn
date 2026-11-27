@@ -606,7 +606,7 @@ impl ProjectCutover {
 
     /// Losslessly roll back to [`ProjectStorageMode::Git`]: export all live project refs back into
     /// `bare_repo`, remove the read-only `pre-receive` guard & deny configs, verify ref parity,
-    /// flip storage mode to `Git`, and unpause dispatch.
+    /// retire live project refs in `ledger`, flip storage mode to `Git`, and unpause dispatch.
     pub fn rollback_to_git<L: RefLedger + ?Sized>(
         &mut self,
         store: &CasMerkleStore,
@@ -630,6 +630,7 @@ impl ProjectCutover {
             .collect();
 
         let (exported_refs, parity) = if live_non_wip.is_empty() {
+            restore_writable_bare_repo(&self.bare_repo)?;
             (0, None)
         } else {
             let bridge = DynLedgerBridge(ledger);
@@ -639,15 +640,16 @@ impl ProjectCutover {
             let check = verify_cutover_parity(store, ledger, &self.project, &self.bare_repo)?;
             (count, Some(check))
         };
-        if live_non_wip.is_empty() {
-            restore_writable_bare_repo(&self.bare_repo)?;
-        }
+
+        let retired_refs = ledger.retire_project_refs(&self.project, "rollback to git")?;
 
         self.storage_mode = ProjectStorageMode::Git;
         self.dispatch_paused = false;
         self.parity.clone_from(&parity);
         self.phase = CutoverPhase::RolledBack;
-        self.push_event(format!("rolled back {exported_refs} refs to Git"));
+        self.push_event(format!(
+            "rolled back {exported_refs} refs to Git (retired {retired_refs} ledger refs)"
+        ));
         Ok(RollbackReport {
             exported_refs,
             parity,
@@ -716,6 +718,10 @@ impl<L: RefLedger + ?Sized> RefLedger for DynLedgerBridge<'_, L> {
         project: Option<&str>,
     ) -> Result<Vec<crate::cas_merkle::LedgerRef>, D6StoreError> {
         self.0.list_refs(project)
+    }
+
+    fn retire_project_refs(&self, project: &str, reason: &str) -> Result<usize, D6StoreError> {
+        self.0.retire_project_refs(project, reason)
     }
 }
 
@@ -2055,6 +2061,7 @@ impl fmt::Display for ProjectStorageMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cas_merkle::InMemoryRefLedger;
     use crate::scratch::Scratch;
 
     #[test]
@@ -2149,5 +2156,120 @@ mod tests {
         assert!(restored.dispatch_paused());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn test_git(dir: &Path, args: &[&str]) {
+        let out = crate::test_git_command()
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("run test_git_command");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn rollback_retires_refs_so_git_advances_main_and_recutover_succeeds() {
+        let scratch = Scratch::new("cutover_recutover_unit");
+        let work = scratch.join("work");
+        let bare = scratch.join("origin.git");
+        let ws = scratch.join("ws");
+        fs::create_dir_all(&work).expect("mkdir work");
+        fs::create_dir_all(&ws).expect("mkdir ws");
+
+        test_git(&work, &["init", "-b", "main"]);
+        test_git(&work, &["config", "user.name", "Tester"]);
+        test_git(&work, &["config", "user.email", "tester@spawn.local"]);
+        fs::write(work.join("README.md"), "v1\n").expect("write v1");
+        test_git(&work, &["add", "README.md"]);
+        test_git(&work, &["commit", "-m", "v1"]);
+        test_git(
+            &scratch.join("."),
+            &[
+                "clone",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        test_git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+
+        let store = CasMerkleStore::open(scratch.join("cas")).expect("cas");
+        let ledger = InMemoryRefLedger::new();
+        let adapter = GitBorderAdapter::new();
+
+        let mut cutover = ProjectCutover::new("proj-recutover-unit", &bare, &ws);
+        cutover
+            .step1_backfill_history(&store, &ledger)
+            .expect("step1");
+        cutover
+            .step2_pause_dispatch_and_verify_clean(&store)
+            .expect("step2");
+        cutover
+            .step3_import_tail_commits(&store, &ledger)
+            .expect("step3");
+        cutover
+            .step4_commit_refs_and_flip_mode(&store, &ledger, &adapter, "cutover-1")
+            .expect("step4");
+        cutover.step5_verify_parity(&store, &ledger).expect("step5");
+        cutover
+            .step6_configure_readonly_border(&adapter)
+            .expect("step6");
+        cutover.step7_resume_dispatch().expect("step7");
+
+        cutover
+            .rollback_to_git(&store, &ledger, &adapter)
+            .expect("rollback");
+        assert!(
+            ledger
+                .list_refs(Some("proj-recutover-unit"))
+                .expect("refs")
+                .is_empty()
+        );
+
+        fs::write(work.join("README.md"), "v2 from git\n").expect("write v2");
+        test_git(&work, &["add", "README.md"]);
+        test_git(&work, &["commit", "-m", "v2"]);
+        test_git(&work, &["push", "origin", "main"]);
+
+        let mut recutover = ProjectCutover::new("proj-recutover-unit", &bare, &ws);
+        recutover
+            .step1_backfill_history(&store, &ledger)
+            .expect("re-step1");
+        recutover
+            .step2_pause_dispatch_and_verify_clean(&store)
+            .expect("re-step2");
+        recutover
+            .step3_import_tail_commits(&store, &ledger)
+            .expect("re-step3");
+        recutover
+            .step4_commit_refs_and_flip_mode(&store, &ledger, &adapter, "cutover-2")
+            .expect("re-step4");
+        let parity = recutover
+            .step5_verify_parity(&store, &ledger)
+            .expect("re-step5");
+        recutover
+            .step6_configure_readonly_border(&adapter)
+            .expect("re-step6");
+        recutover.step7_resume_dispatch().expect("re-step7");
+
+        let main_snap = parity.refs["refs/heads/main"].snapshot.clone();
+        assert!(
+            ledger
+                .land_main_ref(
+                    "proj-recutover-unit",
+                    "main",
+                    Some(&main_snap),
+                    &main_snap,
+                    None,
+                    "illegal"
+                )
+                .is_err(),
+            "runtime main advancement without accepted task_id must remain rejected"
+        );
     }
 }
