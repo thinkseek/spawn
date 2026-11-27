@@ -24,6 +24,8 @@ ExecStart=%h/.local/share/spawn-rsi/bin/spawn integrate
 # A halt is per mission and recorded in the log; the process keeps running.
 Restart=always
 RestartSec=10
+# 78/243 = Keep LoadCredential file missing or invalid (Wave K4): do not retry-loop.
+RestartPreventExitStatus=78 243
 
 [Install]
 WantedBy=default.target

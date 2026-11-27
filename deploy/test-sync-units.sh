@@ -279,6 +279,68 @@ check "repo spawn-node-out.service declares LoadCredential and RestartPreventExi
   bash -c 'grep -qE "^[[:space:]]*LoadCredential=typesafe\.api-key:/run/keep/typesafe\.api-key[[:space:]]*$" "$1" && grep -qE "^[[:space:]]*RestartPreventExitStatus=243[[:space:]]+78[[:space:]]*$" "$1"' \
   _ "$repo_units/spawn-node-out.service"
 
+# Wave K4 core daemon readiness checks on real deploy/systemd units and sync behavior.
+has_restart_guard() {
+  awk -F= '
+    /^[[:space:]]*RestartPreventExitStatus[[:space:]]*=/ {
+      n = split($2, toks, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        if (toks[i] == "78") has78 = 1
+        if (toks[i] == "243") has243 = 1
+      }
+    }
+    END { exit !(has78 && has243) }
+  ' "$1"
+}
+
+k4_units=(
+  spawn-loop.service
+  spawn-integrate.service
+  spawn-maintenance.service
+  spawn-serve.service
+  spawn-model-relay.service
+  spawn-jev-relay.service
+)
+for u in "${k4_units[@]}"; do
+  check "repo Wave K4 $u is a regular file" bash -c '[ -f "$1/$2" ] && [ ! -L "$1/$2" ]' _ "$repo_units" "$u"
+  check "repo Wave K4 $u declares RestartPreventExitStatus 78 and 243" has_restart_guard "$repo_units/$u"
+done
+for u in spawn-loop.service spawn-integrate.service spawn-maintenance.service spawn-serve.service; do
+  check "repo Wave K4 $u preserves live spawn.env EnvironmentFile" \
+    grep -qE '^[[:space:]]*EnvironmentFile=%h/\.local/share/spawn-rsi/spawn\.env[[:space:]]*$' "$repo_units/$u"
+done
+check "repo Wave K4 spawn-model-relay.service preserves live model-relay.env EnvironmentFile" \
+  grep -qE '^[[:space:]]*EnvironmentFile=%h/\.config/spawn/model-relay\.env[[:space:]]*$' "$repo_units/spawn-model-relay.service"
+check "repo Wave K4 spawn-jev-relay.service preserves LoadCredential and omits EnvironmentFile" \
+  bash -c 'grep -qE "^[[:space:]]*LoadCredential=typesafe\.api-key:/run/keep/typesafe\.api-key[[:space:]]*$" "$1" && ! grep -qE "^[[:space:]]*EnvironmentFile[[:space:]]*=" "$1"' \
+  _ "$repo_units/spawn-jev-relay.service"
+
+k4_src=$scratch/k4-src k4_units_dir=$scratch/k4-units
+mkdir -p "$k4_src" "$k4_units_dir"
+for u in "${k4_units[@]}"; do
+  cp "$repo_units/$u" "$k4_src/$u"
+  grep -vE '^[[:space:]]*RestartPreventExitStatus[[:space:]]*=|Wave K4' "$repo_units/$u" >"$k4_units_dir/$u"
+done
+# Keep spawn-jev-relay.service untouched against an up-to-date copy while upgrading the 5 updated K4 units.
+cp "$repo_units/spawn-jev-relay.service" "$k4_units_dir/spawn-jev-relay.service"
+chmod 0644 "$k4_units_dir"/*.service
+
+rm -f "$SYSTEMCTL_LOG"
+status=0
+SPAWN_UNIT_DIR="$k4_units_dir" bash "$script" --check "$k4_src" >"$scratch/k4-check.out" 2>&1 || status=$?
+check "Wave K4 --check exits 1 when core units lack RestartPreventExitStatus (got $status)" [ "$status" = 1 ]
+status=0
+SPAWN_UNIT_DIR="$k4_units_dir" bash "$script" --apply "$k4_src" >"$scratch/k4-apply.out" 2>&1 || status=$?
+check "Wave K4 --apply exits 0 (got $status)" [ "$status" = 0 ]
+check "Wave K4 --apply daemon-reloaded once" [ "$(grep -cx -- "--user daemon-reload" "$SYSTEMCTL_LOG")" -eq 1 ]
+for u in "${k4_units[@]}"; do
+  check "Wave K4 --apply synced $u (0644)" \
+    bash -c 'cmp -s "$1/$3" "$2/$3" && [ "$(stat -c %a "$2/$3")" = 644 ]' _ "$k4_src" "$k4_units_dir" "$u"
+done
+status=0
+SPAWN_UNIT_DIR="$k4_units_dir" bash "$script" --check "$k4_src" >"$scratch/k4-clean.out" 2>&1 || status=$?
+check "Wave K4 --check exits 0 after --apply (got $status)" [ "$status" = 0 ]
+
 echo "sync-units: $passed passed, $failures failed"
 [ "$failures" = 0 ] && echo "sync-units: all cases pass"
 [ "$failures" = 0 ]

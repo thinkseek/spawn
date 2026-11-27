@@ -22,6 +22,8 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # clock (SPAWN_GATE_WALL_CLOCK_MINUTES) lost its scratch while it ran. The
 # age (the script's default, a day, and never under the wall clock) is only
 # for a scratch that holds no record.
+# 78/243 = Keep LoadCredential file missing or invalid (Wave K4): do not retry-loop.
+RestartPreventExitStatus=78 243
 TimeoutStartSec=1h
 Nice=10
 IOSchedulingClass=idle

@@ -33,6 +33,8 @@ Restart=always
 RestartSec=5
 RestartSteps=5
 RestartMaxDelaySec=60
+# 78/243 = Keep LoadCredential file missing or invalid (Wave K4): do not retry-loop.
+RestartPreventExitStatus=78 243
 
 [Install]
 WantedBy=default.target

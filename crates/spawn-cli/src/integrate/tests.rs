@@ -2969,3 +2969,167 @@ fn the_start_line_says_who_started_it_and_where_its_gate_is_from() {
          /w/scripts/rsi/gate.sh (SPAWN_GATE unset: the default, read from the working directory)"
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn d6_judge_inspects_pending_merge_conflict_markers_and_patch_without_git_mirror() {
+    use spawn_core::id::BranchName;
+    use spawn_core::port::{Commit, WorkspaceStore};
+    use spawn_host::{
+        CasMerkleStore, D6RefKind, InMemoryRefLedger, LocalWorkspaceStore, PublishRequest,
+        WorkspaceBackend, claim_root,
+    };
+    use std::sync::Arc;
+
+    let base_dir = std::env::temp_dir().join(format!(
+        "spawn-int-d6-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&base_dir);
+    let root = base_dir.join("d6-root");
+    claim_root(&root, WorkspaceBackend::D6).expect("claim d6");
+
+    let cas = Arc::new(CasMerkleStore::open(root.join(".d6/cas")).expect("cas"));
+    let ledger = Arc::new(InMemoryRefLedger::new());
+    let opts = spawn_host::workspace::D6StoreOptions::new(Arc::clone(&cas), ledger);
+    let local = LocalWorkspaceStore::d6("d6-judge-proj", &root, opts);
+    let d6 = local.d6_workspace().expect("d6");
+    let d6_ledger = d6.ledger();
+
+    // Seed main at m1 with `.gitattributes` lowering marker threshold in `custom/` and clean file.
+    let (b_attr, s_attr) = cas
+        .put_bytes_blob(b"*.c conflict-marker-size=5\n")
+        .expect("attr");
+    let (b_clean, s_clean) = cas.put_bytes_blob(b"clean\n").expect("clean");
+    let sub_tree = cas
+        .put_tree_cached(
+            &spawn_cas::Tree::from_entries(vec![
+                spawn_cas::TreeEntry::file(b".gitattributes".to_vec(), &b_attr, s_attr),
+                spawn_cas::TreeEntry::file(b"code.c".to_vec(), &b_clean, s_clean),
+            ])
+            .expect("sub"),
+        )
+        .expect("sub tree");
+    let main_tree = cas
+        .put_tree_cached(
+            &spawn_cas::Tree::from_entries(vec![spawn_cas::TreeEntry::dir(
+                b"custom".to_vec(),
+                &sub_tree,
+            )])
+            .expect("main tree"),
+        )
+        .expect("main");
+    let body_main =
+        spawn_host::format_commit_body("t <t@t> 1000 +0000", "t <t@t> 1000 +0000", "main\n");
+    let main_pub = cas
+        .publish_snapshot(
+            d6_ledger.as_ref().as_ref(),
+            &PublishRequest {
+                project: "d6-judge-proj",
+                ref_name: "main",
+                kind: D6RefKind::Main,
+                expected_ref: None,
+                tree: &main_tree,
+                parents: &[],
+                commit_body: &body_main,
+                created_at_ms: 1_000_000,
+                reason: "test:main",
+                landing_task_id: None,
+            },
+        )
+        .expect("publish main");
+    let main_oid = main_pub.git_oid.to_hex();
+
+    // Create worker commit with 5-char conflict markers (caught by custom/.gitattributes).
+    let agent = "agent_d6_judge";
+    let branch = BranchName::new(agent).expect("branch");
+    local.ensure_branch(&branch, None).expect("ensure_branch");
+    let ws = local.mount(&branch).expect("mount");
+    std::fs::write(
+        std::path::Path::new(ws.path()).join("custom/code.c"),
+        "<<<<<\nleft\n=====\nright\n>>>>>\n",
+    )
+    .expect("write marked");
+    let Commit::Created(marked_commit) = local.commit(&ws, "marked").expect("commit marked") else {
+        panic!("expected Created");
+    };
+    let marked_oid = marked_commit.as_str().to_string();
+
+    // Write a D6-format `.merge/<agent>` file (with sha256: digests); verify native detection.
+    let merge_file = spawn_host::canonical_root(&root).join(".merge").join(agent);
+    std::fs::create_dir_all(merge_file.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &merge_file,
+        format!(
+            "pending-merge\0{}\0{}\0custom/code.c\0",
+            main_pub.snapshot, main_pub.snapshot
+        ),
+    )
+    .expect("write pending");
+    assert!(super::Judge::store_has_pending_merge(&local, agent));
+
+    let nonexistent_mirror = base_dir.join("nonexistent-mirror.git");
+    assert_eq!(
+        super::Judge::store_tree_id(&local, &nonexistent_mirror.to_string_lossy(), &main_oid)
+            .expect("tree id"),
+        main_tree.to_string()
+    );
+    let markers =
+        super::Judge::store_conflict_markers(&local, &nonexistent_mirror, &main_oid, &marked_oid)
+            .expect("conflict markers");
+    assert_eq!(markers, vec!["custom/code.c".to_string()]);
+
+    // Resolve markers in small clean commit and test D6 patch length + landing candidate.
+    std::fs::write(
+        std::path::Path::new(ws.path()).join("custom/code.c"),
+        "resolved\n",
+    )
+    .expect("write clean");
+    let Commit::Created(clean_commit) = local.commit(&ws, "resolved").expect("commit clean") else {
+        panic!("expected Created");
+    };
+    let clean_oid = clean_commit.as_str().to_string();
+    assert!(
+        super::Judge::store_conflict_markers(&local, &nonexistent_mirror, &main_oid, &clean_oid)
+            .expect("no markers")
+            .is_empty()
+    );
+    let small_len =
+        super::Judge::store_patch_len(&local, &nonexistent_mirror, &main_oid, &clean_oid)
+            .expect("small patch");
+    assert!(
+        small_len > 0 && small_len < super::MAX_PATCH_BYTES,
+        "{small_len}"
+    );
+
+    let land_msg = "Clean work (task 9)\n\nResolved.\n\nSpawn-Task: 9\nSpawn-Head: deadbeef\n";
+    let cand_oid = super::Judge::d6_landing_candidate(d6, &main_oid, &clean_oid, land_msg)
+        .expect("d6 landing candidate")
+        .expect("clean merge");
+    let cand_snap = d6_ledger
+        .get_snapshot_by_oid(&spawn_cas::GitOid::parse_hex(&cand_oid).expect("hex"))
+        .expect("lookup")
+        .expect("recorded in RefLedger");
+    assert_eq!(cand_snap.parents.len(), 2);
+    // Project main must NOT have moved.
+    assert_eq!(
+        d6.main_snapshot().expect("main").expect("some").id,
+        main_pub.snapshot
+    );
+
+    // Oversized change exceeds MAX_PATCH_BYTES cleanly without touching git.
+    let big = "x".repeat(super::MAX_PATCH_BYTES + 2048);
+    std::fs::write(std::path::Path::new(ws.path()).join("big.txt"), big).expect("write big");
+    let Commit::Created(big_commit) = local.commit(&ws, "oversized").expect("commit big") else {
+        panic!("expected Created");
+    };
+    let big_len =
+        super::Judge::store_patch_len(&local, &nonexistent_mirror, &main_oid, big_commit.as_str())
+            .expect("big patch");
+    assert!(big_len > super::MAX_PATCH_BYTES, "{big_len}");
+    assert!(!nonexistent_mirror.exists());
+
+    local.unmount(&ws).expect("unmount");
+    let _ = std::fs::remove_dir_all(&base_dir);
+}

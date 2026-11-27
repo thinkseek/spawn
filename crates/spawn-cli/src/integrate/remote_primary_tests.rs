@@ -191,6 +191,7 @@ impl Fixture {
             scenario: None,
             gate_env: &[],
             test_database: self.test_database,
+            d6_border: None,
         }
     }
 

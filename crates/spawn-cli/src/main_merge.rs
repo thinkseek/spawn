@@ -61,10 +61,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use spawn_cas::GitOid;
 use spawn_core::event::{ArtifactRef, CheckpointReason, EventKind, NewEvent, Source};
 use spawn_core::id::{AgentId, BranchName, CommitId, SessionId, WorkspaceId};
 use spawn_core::port::{BaseMerge, Commit, EventLog, MERGE_WAITS, WorkspaceError, WorkspaceStore};
-use spawn_host::GitWorkspace;
+use spawn_host::{LocalWorkspaceStore, RefLedger as _};
 use spawn_postgres::PostgresStore;
 
 use crate::dispatch::Facts;
@@ -106,12 +107,28 @@ pub(crate) enum Merge {
 }
 
 /// The workspace of `agent` mounted under `root`, if there is one.
+#[cfg(test)]
 fn mounted(root: &Path, agent: &str) -> Option<WorkspaceId> {
+    mounted_for_settings(None, root, agent)
+}
+
+/// The workspace of `agent` mounted under `root` (or configured D6 L1 `tmpfs_root`).
+fn mounted_for_settings(
+    settings: Option<&crate::config::WorkspaceSettings>,
+    root: &Path,
+    agent: &str,
+) -> Option<WorkspaceId> {
     let directory = root.join(agent);
-    if !directory.is_dir() {
-        return None;
+    if directory.is_dir() {
+        return WorkspaceId::new(format!("{agent}:{}", directory.display())).ok();
     }
-    WorkspaceId::new(format!("{agent}:{}", directory.display())).ok()
+    if let Some(policy) = settings.and_then(|s| s.d6.l1_policy()) {
+        let l1_dir = spawn_host::canonical_root(&policy.tmpfs_root).join(agent);
+        if l1_dir.is_dir() {
+            return WorkspaceId::new(format!("{agent}:{}", l1_dir.display())).ok();
+        }
+    }
+    None
 }
 
 /// Merge main into the workspace of `agent` mounted under `root`, through
@@ -129,14 +146,33 @@ pub(crate) fn into_workspace(
 
 /// [`into_workspace`], only while `ready` says the agent is idle, asked by
 /// the store right before it would write ([`WorkspaceStore::merge_base_when`]).
+#[cfg(test)]
 pub(crate) fn into_workspace_when(
     workspaces: &dyn WorkspaceStore,
-    mirror: &Path,
+    _mirror: &Path,
     root: &Path,
     agent: &str,
     ready: &dyn Fn() -> Result<(), String>,
 ) -> Merge {
-    let Some(workspace) = mounted(root, agent) else {
+    into_workspace_when_with(
+        mounted(root, agent),
+        workspaces,
+        &|a| sources::read_main_copies_at(root, a),
+        agent,
+        ready,
+    )
+}
+
+type MainCopiesReader<'r> = &'r dyn Fn(&str) -> Option<(String, Vec<String>)>;
+
+fn into_workspace_when_with(
+    workspace: Option<WorkspaceId>,
+    workspaces: &dyn WorkspaceStore,
+    read_copies: MainCopiesReader<'_>,
+    agent: &str,
+    ready: &dyn Fn() -> Result<(), String>,
+) -> Merge {
+    let Some(workspace) = workspace else {
         return Merge::NotMounted;
     };
     match workspaces.merge_base_when(&workspace, ready) {
@@ -155,7 +191,7 @@ pub(crate) fn into_workspace_when(
         }) => {
             // The store copied main's versions and recorded which; without
             // the record no file is known to be one main does not have.
-            match GitWorkspace::new(mirror, root).main_copies(agent) {
+            match read_copies(agent) {
                 Some((_, copied)) => Merge::Unmarked { files, copied },
                 None => Merge::Failed(format!(
                     "the record of main's copies for {agent} cannot be read"
@@ -221,41 +257,71 @@ pub(crate) fn merge_main(
     agent: &str,
     session: &str,
 ) -> Merge {
+    let settings = match crate::config::WorkspaceSettings::from_env(root) {
+        Ok(settings) => settings,
+        Err(error) => return Merge::Failed(error),
+    };
+    merge_main_with_settings(store, &settings, root, agent, session)
+}
+
+pub(crate) fn merge_main_with_settings(
+    store: &Arc<PostgresStore>,
+    settings: &crate::config::WorkspaceSettings,
+    root: &Path,
+    agent: &str,
+    session: &str,
+) -> Merge {
     let source = match store.agent_source(agent) {
         Ok(Some(Some(source))) => source,
         Ok(_) => return Merge::NotMounted,
         Err(error) => return Merge::Failed(format!("mission source of {agent}: {error}")),
     };
-    if mounted(root, agent).is_none() {
+    let Some(workspace) = mounted_for_settings(Some(settings), root, agent) else {
         return Merge::NotMounted;
-    }
-    let mirror = match sources::ensure_mirror(root, Some(&source)) {
-        Ok(mirror) => mirror,
-        Err(error) => return Merge::Failed(error.to_string()),
     };
-    let workspaces = match crate::config::WorkspaceSettings::from_env(root) {
-        Ok(settings) => settings.one_shot(&mirror, root, Arc::clone(store)),
-        Err(error) => return Merge::Failed(error),
+    let is_d6 = settings.active == spawn_host::WorkspaceBackend::D6;
+    let mirror = if is_d6 {
+        match sources::mirror_path(root, Some(&source)) {
+            Ok(mirror) => mirror,
+            Err(error) => return Merge::Failed(error.to_string()),
+        }
+    } else {
+        match sources::ensure_mirror(root, Some(&source)) {
+            Ok(mirror) => mirror,
+            Err(error) => return Merge::Failed(error.to_string()),
+        }
     };
+    let workspaces = settings.one_shot(&mirror, root, Arc::clone(store));
     let project = workspaces.project().to_string();
     // A merge whose record failed (here, or the Bridge's at a start) is
     // recorded from the branch now; one already recorded is a no-op.
-    let earlier = head_merge(&mirror, agent);
+    let earlier = if is_d6 {
+        head_merge_d6(&workspaces, agent)
+    } else {
+        head_merge(&mirror, agent)
+    };
     if let Some(earlier) = &earlier
         && let Err(error) = record(store, &project, agent, session, "-", earlier)
     {
         eprintln!("merge main into {agent}: record the earlier merge: {error}");
     }
     let ready = || ready_to_merge(store, session);
-    let merge = into_workspace_when(&workspaces, &mirror, root, agent, &ready);
-    let head = GitWorkspace::new(&mirror, root)
-        .commit_id_of(&format!("refs/heads/{agent}"))
-        .unwrap_or_else(|_| "-".to_string());
+    let merge = into_workspace_when_with(
+        Some(workspace),
+        &workspaces,
+        &|a| workspaces.main_copies(a),
+        agent,
+        &ready,
+    );
+    let head = BranchName::new(agent)
+        .ok()
+        .and_then(|branch| workspaces.branch_head(&branch).ok().flatten())
+        .map_or_else(|| "-".to_string(), |commit| commit.as_str().to_string());
     // Recorded before the push: the published head has its record.
     if let Err(error) = record(store, &project, agent, session, &head, &merge) {
         eprintln!("merge main into {agent}: record (retried at its next merge): {error}");
     }
-    if matches!(merge, Merge::Merged { .. }) || earlier.is_some() {
+    if !is_d6 && (matches!(merge, Merge::Merged { .. }) || earlier.is_some()) {
         publish_merge(&mirror, &source, agent, &head);
     }
     merge
@@ -271,6 +337,43 @@ pub(crate) struct PriorWork {
     /// (`spawn_task_reassign`), not an objective's earlier task.
     #[serde(default)]
     pub(crate) reassign: bool,
+}
+
+fn d6_prior_has_work(
+    workspaces: &sources::MissionWorkspaces,
+    agent: &str,
+    prior_commit: &str,
+) -> Result<bool, String> {
+    let routed = workspaces.routed_store(agent).map_err(|e| e.to_string())?;
+    let Some(d6) = routed.d6_workspace() else {
+        return Err("expected D6 workspace backend".to_string());
+    };
+    let Some(main_snap) = d6.main_snapshot().map_err(|e| e.to_string())? else {
+        return Err("project has no main snapshot in D6 ledger".to_string());
+    };
+    let prior_oid = GitOid::parse_hex(prior_commit).map_err(|e| e.to_string())?;
+    let prior_snap = d6
+        .ledger()
+        .get_snapshot_by_oid(&prior_oid)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("prior commit {prior_commit} missing from D6 ledger"))?;
+    let base_id =
+        spawn_host::merkle_merge::find_single_merge_base(d6.store(), &main_snap.id, &prior_snap.id)
+            .map_err(|e| e.to_string())?;
+    let base_tree = if let Some(snap) = d6
+        .ledger()
+        .get_snapshot(&base_id)
+        .map_err(|e| e.to_string())?
+    {
+        snap.tree
+    } else {
+        d6.store()
+            .cas()
+            .read_merkle_snapshot(&base_id)
+            .map_err(|e| e.to_string())?
+            .tree
+    };
+    Ok(base_tree != prior_snap.tree)
 }
 
 /// Create `agent`'s branch at `prior`'s checkpoint and merge main into it,
@@ -290,6 +393,23 @@ pub(crate) fn fork_from_prior(
     session: &str,
     prior: &PriorWork,
 ) -> Result<Fork, String> {
+    let settings = crate::config::WorkspaceSettings::from_env(root).map_err(|e| {
+        format!(
+            "fork {agent} from task #{}'s work {}: the workspace backend: {e}",
+            prior.task, prior.commit
+        )
+    })?;
+    fork_from_prior_with_settings(store, &settings, root, agent, session, prior)
+}
+
+pub(crate) fn fork_from_prior_with_settings(
+    store: &Arc<PostgresStore>,
+    settings: &crate::config::WorkspaceSettings,
+    root: &Path,
+    agent: &str,
+    session: &str,
+    prior: &PriorWork,
+) -> Result<Fork, String> {
     let error = |what: &str, error: &dyn std::fmt::Display| {
         format!(
             "fork {agent} from task #{}'s work {}: {what}: {error}",
@@ -301,40 +421,51 @@ pub(crate) fn fork_from_prior(
         Ok(_) => return Ok(Fork::NoSource),
         Err(failure) => return Err(error("its mission source", &failure)),
     };
-    let mirror = sources::ensure_mirror(root, Some(&source)).map_err(|e| error("mirror", &e))?;
-    // The work is what the commit changed since its base with main: none
-    // (a checkpoint main already holds) is no work to continue.
-    sources::refresh(&mirror, &source).map_err(|e| error("refresh main", &e))?;
-    let path = mirror.to_string_lossy();
-    // No history from before a rewrite becomes the branch (objective 177).
-    if let Some(reason) = crate::rewrite_guard::why_old(store, &path, &prior.commit)
-        .map_err(|e| error("the commit map", &e))?
-    {
-        return Ok(Fork::Refused(reason));
+    let is_d6 = settings.active == spawn_host::WorkspaceBackend::D6;
+    let mirror = if is_d6 {
+        sources::mirror_path(root, Some(&source)).map_err(|e| error("mirror", &e))?
+    } else {
+        sources::ensure_mirror(root, Some(&source)).map_err(|e| error("mirror", &e))?
+    };
+    let workspaces = settings.one_shot(&mirror, root, Arc::clone(store));
+    if is_d6 {
+        if !d6_prior_has_work(&workspaces, agent, &prior.commit)
+            .map_err(|e| error("its base with main", &e))?
+        {
+            return Ok(Fork::NoWork);
+        }
+    } else {
+        // The work is what the commit changed since its base with main: none
+        // (a checkpoint main already holds) is no work to continue.
+        sources::refresh(&mirror, &source).map_err(|e| error("refresh main", &e))?;
+        let path = mirror.to_string_lossy();
+        // No history from before a rewrite becomes the branch (objective 177).
+        if let Some(reason) = crate::rewrite_guard::why_old(store, &path, &prior.commit)
+            .map_err(|e| error("the commit map", &e))?
+        {
+            return Ok(Fork::Refused(reason));
+        }
+        let base = sources::git(&[
+            "--git-dir",
+            &path,
+            "merge-base",
+            "refs/heads/main",
+            &prior.commit,
+        ])
+        .map_err(|e| error("its base with main", &e))?;
+        let changed = sources::git(&[
+            "--git-dir",
+            &path,
+            "diff",
+            "--name-only",
+            &base,
+            &prior.commit,
+        ])
+        .map_err(|e| error("its changes", &e))?;
+        if changed.trim().is_empty() {
+            return Ok(Fork::NoWork);
+        }
     }
-    let base = sources::git(&[
-        "--git-dir",
-        &path,
-        "merge-base",
-        "refs/heads/main",
-        &prior.commit,
-    ])
-    .map_err(|e| error("its base with main", &e))?;
-    let changed = sources::git(&[
-        "--git-dir",
-        &path,
-        "diff",
-        "--name-only",
-        &base,
-        &prior.commit,
-    ])
-    .map_err(|e| error("its changes", &e))?;
-    if changed.trim().is_empty() {
-        return Ok(Fork::NoWork);
-    }
-    let workspaces = crate::config::WorkspaceSettings::from_env(root)
-        .map_err(|e| error("the workspace backend", &e))?
-        .one_shot(&mirror, root, Arc::clone(store));
     let project = workspaces.project().to_string();
     let branch = BranchName::new(agent).map_err(|e| error("branch", &e))?;
     workspaces
@@ -350,22 +481,24 @@ pub(crate) fn fork_from_prior(
             files,
         },
         BaseMerge::Conflicted { .. } => {
-            let merge =
-                marked_in_workspace(store, &workspaces, &mirror, root, agent, session, prior)
-                    .map_err(|(what, why)| error(what, &why))?;
+            let merge = marked_in_workspace(store, &workspaces, agent, session, prior)
+                .map_err(|(what, why)| error(what, &why))?;
             if let Merge::Failed(why) | Merge::Busy(why) = &merge {
                 return Err(error("merge main into the workspace", why));
             }
             merge
         }
     };
-    let head = GitWorkspace::new(&mirror, root)
-        .commit_id_of(&format!("refs/heads/{agent}"))
-        .unwrap_or_else(|_| "-".to_string());
+    let head = workspaces
+        .branch_head(&branch)
+        .ok()
+        .flatten()
+        .map_or_else(|| "-".to_string(), |commit| commit.as_str().to_string());
     record(store, &project, agent, session, &head, &merge)
         .map_err(|e| error("record the merge", &e))?;
-    if let Some(Pushed::Failed(why) | Pushed::Rejected(why)) =
-        sources::publish(&mirror, &source, agent)
+    if !is_d6
+        && let Some(Pushed::Failed(why) | Pushed::Rejected(why)) =
+            sources::publish(&mirror, &source, agent)
     {
         eprintln!("fork {agent}: the push of {head} failed; it stays queued and is retried: {why}");
     }
@@ -379,8 +512,6 @@ pub(crate) fn fork_from_prior(
 fn marked_in_workspace(
     store: &PostgresStore,
     workspaces: &sources::MissionWorkspaces,
-    mirror: &Path,
-    root: &Path,
     agent: &str,
     session: &str,
     prior: &PriorWork,
@@ -389,7 +520,13 @@ fn marked_in_workspace(
     let workspace = workspaces
         .mount(&branch)
         .map_err(|e| ("mount for the merge", e.to_string()))?;
-    let merge = into_workspace_when(workspaces, mirror, root, agent, &|| Ok(()));
+    let merge = into_workspace_when_with(
+        Some(workspace.clone()),
+        workspaces,
+        &|a| workspaces.main_copies(a),
+        agent,
+        &|| Ok(()),
+    );
     let committed = if matches!(merge, Merge::Marked { .. }) {
         workspaces
             .commit(
@@ -437,13 +574,45 @@ pub(crate) enum Fork {
 /// The head of `agent`'s branch on this host, if it has one: what a
 /// Start finds after a fork that failed partway.
 pub(crate) fn branch_head(store: &PostgresStore, root: &Path, agent: &str) -> Option<String> {
+    let settings = sources::workspace_settings_readonly(root).ok()?;
+    branch_head_with_settings(store, &settings, root, agent)
+}
+
+pub(crate) fn branch_head_with_settings(
+    store: &PostgresStore,
+    settings: &crate::config::WorkspaceSettings,
+    root: &Path,
+    agent: &str,
+) -> Option<String> {
     let Ok(Some(Some(source))) = store.agent_source(agent) else {
         return None;
     };
+    let branch = BranchName::new(agent).ok()?;
+    if settings.active == spawn_host::WorkspaceBackend::D6 {
+        let cas_dir = settings
+            .d6
+            .effective_cas_dir(root, spawn_host::WorkspaceBackend::D6);
+        if !cas_dir.exists() {
+            return None;
+        }
+        let mirror = sources::mirror_path(root, Some(&source)).ok()?;
+        let d6 = sources::open_d6_workspace_borrowed(&mirror, root, &settings.d6, store).ok()?;
+        return d6
+            .branch_head(&branch)
+            .ok()
+            .flatten()
+            .map(|commit| commit.as_str().to_string());
+    }
     let mirror = sources::ensure_mirror(root, Some(&source)).ok()?;
-    GitWorkspace::new(&mirror, root)
-        .commit_id_of(&format!("refs/heads/{agent}"))
+    let local = match settings.active {
+        spawn_host::WorkspaceBackend::D6Shadow => LocalWorkspaceStore::git(&mirror, root),
+        _ => sources::open_non_d6_store(settings, &mirror, root).ok()?,
+    };
+    local
+        .branch_head(&branch)
         .ok()
+        .flatten()
+        .map(|commit| commit.as_str().to_string())
 }
 
 /// What a task is told when its fork from `prior`'s work kept failing
@@ -526,6 +695,50 @@ fn publish_merge(mirror: &Path, source: &str, agent: &str, head: &str) {
             eprintln!("merge main into {agent}: the source refused {head}: {why}");
         }
     }
+}
+
+/// D6 native equivalent of [`head_merge`]: inspect the branch snapshot in
+/// CAS + `RefLedger` without calling `git log` / `git diff`.
+fn head_merge_d6(workspaces: &sources::MissionWorkspaces, agent: &str) -> Option<Merge> {
+    let routed = workspaces.routed_store(agent).ok()?;
+    let d6 = routed.d6_workspace()?;
+    let snap = d6.branch_snapshot(agent).ok().flatten()?;
+    let full = d6.store().cas().read_merkle_snapshot(&snap.id).ok()?;
+    if full.parents.len() != 2 {
+        return None;
+    }
+    let body = std::str::from_utf8(&full.commit_body).ok()?;
+    let msg = body.split_once("\n\n").map(|(_, msg)| msg)?;
+    let subject = msg.lines().next()?;
+    if !subject.starts_with("spawn: merge main ") {
+        return None;
+    }
+    let parent_tree = match d6.ledger().get_snapshot(&full.parents[0]).ok().flatten() {
+        Some(parent) => parent.tree,
+        None => {
+            d6.store()
+                .cas()
+                .read_merkle_snapshot(&full.parents[0])
+                .ok()?
+                .tree
+        }
+    };
+    let a_map = d6.store().flatten_tree(&parent_tree).ok()?;
+    let b_map = d6.store().flatten_tree(&snap.tree).ok()?;
+    let mut files = Vec::new();
+    for key in a_map
+        .keys()
+        .chain(b_map.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if a_map.get(key) != b_map.get(key) {
+            files.push(spawn_host::tree_path::TreePath::from_bytes(key.clone()).shown());
+        }
+    }
+    Some(Merge::Merged {
+        commit: snap.git_oid.to_hex(),
+        files,
+    })
 }
 
 /// The head of `agent`'s branch in `mirror` as a clean merge of main, when it
@@ -2350,6 +2563,291 @@ mod tests {
         };
         assert!(text.contains("Its work was set aside, not lost"), "{text}");
         assert_eq!(head(&mirror, &agent), aside, "no second set-aside");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn d6_main_copies_and_into_workspace_unmarked_conflict_without_git_mirror() {
+        use spawn_host::{
+            CasMerkleStore, D6RefKind, InMemoryRefLedger, LocalWorkspaceStore, PublishRequest,
+            RefLedger, WorkspaceBackend, claim_root,
+        };
+        use std::sync::Arc;
+
+        let base = std::env::temp_dir().join(format!(
+            "spawn-d6-unmarked-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        claim_root(&root, WorkspaceBackend::D6).expect("claim d6");
+
+        let cas = Arc::new(CasMerkleStore::open(root.join(".d6/cas")).expect("cas"));
+        let ledger = Arc::new(InMemoryRefLedger::new());
+        let opts = spawn_host::workspace::D6StoreOptions::new(Arc::clone(&cas), ledger.clone());
+        let store = LocalWorkspaceStore::d6("d6-unmarked-proj", &root, opts);
+        let d6 = store.d6_workspace().expect("d6");
+
+        // Bootstrap main at m1 with notes.txt.
+        let (b1, s1) = cas.put_bytes_blob(b"original notes\n").expect("blob");
+        let t1 = cas
+            .put_tree_cached(
+                &spawn_cas::Tree::from_entries(vec![spawn_cas::TreeEntry::file(
+                    b"notes.txt".to_vec(),
+                    &b1,
+                    s1,
+                )])
+                .expect("tree"),
+            )
+            .expect("put tree");
+        let body1 =
+            spawn_host::format_commit_body("t <t@t> 1000 +0000", "t <t@t> 1000 +0000", "m1\n");
+        let m1 = cas
+            .publish_snapshot(
+                ledger.as_ref(),
+                &PublishRequest {
+                    project: "d6-unmarked-proj",
+                    ref_name: "main",
+                    kind: D6RefKind::Main,
+                    expected_ref: None,
+                    tree: &t1,
+                    parents: &[],
+                    commit_body: &body1,
+                    created_at_ms: 1_000_000,
+                    reason: "test:m1",
+                    landing_task_id: None,
+                },
+            )
+            .expect("publish m1");
+
+        // Agent forks from m1, deletes notes.txt, and commits.
+        let agent = "agent_d6_unmarked";
+        let branch = BranchName::new(agent).expect("branch");
+        store.ensure_branch(&branch, None).expect("ensure_branch");
+        let ws = store.mount(&branch).expect("mount");
+        std::fs::remove_file(Path::new(ws.path()).join("notes.txt")).expect("remove notes");
+        assert!(matches!(
+            store.commit(&ws, "delete notes").expect("commit"),
+            Commit::Created(_)
+        ));
+
+        // Main advances to m2 modifying notes.txt (mod-vs-delete -> unmarked conflict).
+        let (b2, s2) = cas.put_bytes_blob(b"main revised notes\n").expect("blob");
+        let t2 = cas
+            .put_tree_cached(
+                &spawn_cas::Tree::from_entries(vec![spawn_cas::TreeEntry::file(
+                    b"notes.txt".to_vec(),
+                    &b2,
+                    s2,
+                )])
+                .expect("tree"),
+            )
+            .expect("put tree");
+        let body2 =
+            spawn_host::format_commit_body("t <t@t> 1001 +0000", "t <t@t> 1001 +0000", "m2\n");
+        let m2_snap = spawn_cas::Snapshot {
+            tree: t2.clone(),
+            parents: vec![m1.snapshot.clone()],
+            commit_body: body2,
+        };
+        let m2_snap_id = cas.cas().put_merkle_snapshot(&m2_snap).expect("put snap");
+        let m2_oid = cas
+            .project_snapshot_oid(&m2_snap, &[m1.git_oid])
+            .expect("oid");
+        ledger
+            .record_snapshot(
+                &m2_snap_id,
+                &m2_oid,
+                &t2,
+                std::slice::from_ref(&m1.snapshot),
+                "d6-unmarked-proj",
+                1_001_000,
+            )
+            .expect("record m2");
+        d6.land_main_snapshot(Some(&m1.snapshot), &m2_snap_id, Some(1), "test:m2")
+            .expect("land m2");
+
+        let nonexistent_mirror = base.join("no-such-mirror.git");
+        let merge = into_workspace(&store, &nonexistent_mirror, &root, agent);
+        assert_eq!(
+            merge,
+            Merge::Unmarked {
+                files: vec!["notes.txt".to_string()],
+                copied: vec!["notes.txt".to_string()],
+            }
+        );
+        assert_eq!(
+            crate::sources::read_main_copies_at(&root, agent),
+            Some((m2_snap_id.to_string(), vec!["notes.txt".to_string()]))
+        );
+        assert!(!nonexistent_mirror.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn d6_merge_main_fork_and_branch_head_without_git_mirror() {
+        use crate::config::{D6RuntimeConfig, Probes, WorkspaceBackend, WorkspaceSettings};
+        use spawn_host::{CasMerkleStore, D6RefKind, PublishRequest};
+        use std::sync::Arc;
+
+        let db = Db::new("d6_merge_fork");
+        let base = std::env::temp_dir().join(format!(
+            "spawn-d6-merge-fork-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("d6-root");
+        let settings =
+            WorkspaceSettings::resolve(WorkspaceBackend::D6, false, &root, &Probes::host())
+                .expect("resolve d6")
+                .with_d6(D6RuntimeConfig::default());
+        settings.claim(&root).expect("claim d6");
+
+        let source = "https://example.invalid/d6/merge.git";
+        let mission = db
+            .store
+            .mission_add("d6-merge", &serde_json::json!([source]), "human")
+            .expect("mission");
+        let t1 = db
+            .store
+            .task_assign(mission, "ephemeral", "agent_d6_a", "work 1", "default")
+            .expect("t1");
+        let t2 = db
+            .store
+            .task_assign(mission, "ephemeral", "agent_d6_b", "work 2", "default")
+            .expect("t2");
+        let mut client = postgres::Client::connect(&db.url, postgres::NoTls).expect("pg");
+        client
+            .batch_execute(&format!("set search_path to {}", db.schema))
+            .expect("schema");
+        let (a1, s1): (String, String) = {
+            let row = client
+                .query_one(
+                    "select agent_id, session_id from mission_tasks where id = $1",
+                    &[&t1],
+                )
+                .expect("row1");
+            (row.get(0), row.get(1))
+        };
+        let (a2, s2): (String, String) = {
+            let row = client
+                .query_one(
+                    "select agent_id, session_id from mission_tasks where id = $1",
+                    &[&t2],
+                )
+                .expect("row2");
+            (row.get(0), row.get(1))
+        };
+        resident_event(
+            &db,
+            &a1,
+            &s1,
+            spawn_core::event::Source::Observer,
+            spawn_core::event::EventKind::MessageReceived,
+        );
+
+        let mirror = crate::sources::mirror_path(&root, Some(source)).expect("mirror_path");
+        assert!(!mirror.exists());
+        let project = mirror.to_string_lossy().into_owned();
+        let cas = CasMerkleStore::open(root.join(".d6/cas")).expect("cas");
+        let ledger = crate::sources::BorrowedPgRefLedger::new(&db.store);
+        let (blob, sz) = cas.put_bytes_blob(b"base\n").expect("blob");
+        let tree = cas
+            .put_tree_cached(
+                &spawn_cas::Tree::from_entries(vec![spawn_cas::TreeEntry::file(
+                    b"README.md".to_vec(),
+                    &blob,
+                    sz,
+                )])
+                .expect("tree"),
+            )
+            .expect("put_tree");
+        let body =
+            spawn_host::format_commit_body("t <t@t> 1000 +0000", "t <t@t> 1000 +0000", "base\n");
+        let main_pub = cas
+            .publish_snapshot(
+                &ledger,
+                &PublishRequest {
+                    project: &project,
+                    ref_name: "main",
+                    kind: D6RefKind::Main,
+                    expected_ref: None,
+                    tree: &tree,
+                    parents: &[],
+                    commit_body: &body,
+                    created_at_ms: 1_000_000,
+                    reason: "test:seed_main",
+                    landing_task_id: None,
+                },
+            )
+            .expect("seed main");
+        let main_oid = main_pub.git_oid.to_hex();
+
+        let ws_store = settings.one_shot(&mirror, &root, Arc::clone(&db.store));
+        let b1 = BranchName::new(&a1).expect("b1");
+        ws_store.ensure_branch(&b1, None).expect("ensure b1");
+        let ws1 = ws_store.mount(&b1).expect("mount1");
+        std::fs::write(Path::new(ws1.path()).join("work.txt"), "task 1 work\n").expect("write");
+        let Commit::Created(c1) = ws_store.commit(&ws1, "task 1 commit").expect("commit1") else {
+            panic!("expected Created");
+        };
+        let c1_hex = c1.as_str().to_string();
+
+        assert_eq!(
+            super::branch_head_with_settings(&db.store, &settings, &root, &a1),
+            Some(c1_hex.clone())
+        );
+        assert_eq!(
+            super::merge_main_with_settings(&db.store, &settings, &root, &a1, &s1),
+            Merge::Current
+        );
+        ws_store.unmount(&ws1).expect("unmount1");
+
+        // No changes since main -> Fork::NoWork.
+        assert_eq!(
+            super::fork_from_prior_with_settings(
+                &db.store,
+                &settings,
+                &root,
+                &a2,
+                &s2,
+                &super::PriorWork {
+                    task: t1,
+                    commit: main_oid,
+                    reassign: false,
+                },
+            )
+            .expect("no work"),
+            super::Fork::NoWork
+        );
+
+        // Actual work -> Fork::Forked and branch_head reflects c1 without bare git mirror.
+        assert_eq!(
+            super::fork_from_prior_with_settings(
+                &db.store,
+                &settings,
+                &root,
+                &a2,
+                &s2,
+                &super::PriorWork {
+                    task: t1,
+                    commit: c1_hex.clone(),
+                    reassign: false,
+                },
+            )
+            .expect("fork"),
+            super::Fork::Forked(Merge::Current)
+        );
+        assert_eq!(
+            super::branch_head_with_settings(&db.store, &settings, &root, &a2),
+            Some(c1_hex)
+        );
+        assert!(!mirror.exists());
+        assert!(!root.join(".sources").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

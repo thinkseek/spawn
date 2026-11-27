@@ -574,6 +574,13 @@ st=$?
   (.units | map(select(.unit == "spawn-model-relay.service" and .status == "pending_migration" and (.suggested_keep_ids | index("deepseek.api-key")) != null)) | length == 1) and
   (.units | map(select(.unit == "spawn-loop.service" and .status == "pending_migration" and (.env_files | length > 0))) | length == 1) and
   (.backup_units.total == 8 and .backup_units.restart_guard_ready == 8 and .backup_units.keep_managed == 0 and .backup_units.pending_migration == 8) and
+  (.core_daemon_units.total == 6 and .core_daemon_units.keep_managed == 1 and .core_daemon_units.pending_migration == 5 and .core_daemon_units.restart_guard_ready == 6) and
+  (.units | map(select(.unit == "spawn-loop.service" and .status == "pending_migration" and .restart_guard_ready == true and (.env_files | length > 0))) | length == 1) and
+  (.units | map(select(.unit == "spawn-integrate.service" and .status == "pending_migration" and .restart_guard_ready == true and (.env_files | length > 0))) | length == 1) and
+  (.units | map(select(.unit == "spawn-maintenance.service" and .unit_type == "oneshot" and .status == "pending_migration" and .restart_guard_ready == true and (.env_files | length > 0))) | length == 1) and
+  (.units | map(select(.unit == "spawn-serve.service" and .status == "pending_migration" and .restart_guard_ready == true and (.env_files | length > 0))) | length == 1) and
+  (.units | map(select(.unit == "spawn-model-relay.service" and .status == "pending_migration" and .restart_guard_ready == true and (.env_files | length > 0))) | length == 1) and
+  (.units | map(select(.unit == "spawn-jev-relay.service" and .status == "keep_managed" and .restart_guard_ready == true)) | length == 1) and
   (.units | map(select(.unit == "spawn-backup-verify.service" and .unit_type == "oneshot" and .restart_guard_ready == true and (.suggested_keep_ids | index("spawn.backup-drill-database-url")) != null)) | length == 1) and
   (.staged_path_units.total == 4 and .staged_path_units.ok == true and (.staged_path_units.path_exists_violations | length == 0) and (.staged_path_units.units | map(select(.unit == "spawn-node-gateway.path" and .safe == true)) | length == 1)) and
   (.system_units_audit.checked == true and .system_units_audit.total == 2 and .system_units_audit.ok == true and (.system_units_audit.violations | length == 0))
@@ -588,6 +595,7 @@ grep -q 'keep_managed.*spawn-jev-relay\.service' <<<"$real_audit_human" &&
   grep -q 'pending_migration.*spawn-model-relay\.service' <<<"$real_audit_human" &&
   grep -q 'go_units_pg_isolation=ok' <<<"$real_audit_human" &&
   grep -q 'summary_k3: backup_units=0/8(restart_guard_ready=8) staged_path_units=4(ok) system_units=2(ok)' <<<"$real_audit_human" &&
+  grep -q 'summary_k4: core_daemon_units=1/6(restart_guard_ready=6)' <<<"$real_audit_human" &&
   pass "--audit-keep-migration human output summarizes repo units and PG isolation" || fail "--audit-keep-migration human"
 
 # Synthetic sandbox audit directory with canary secret inside referenced .env files.
@@ -670,6 +678,42 @@ jq -e '
 ! grep -q 'made-up-audit-canary-value-9941' <<<"$syn_json$syn_human$syn_gw_json" &&
   ! grep -q 'synthetic-dropin-leak' <<<"$syn_json$syn_human$syn_gw_json" &&
   pass "--audit-keep-migration never reads or echoes env file contents or canary secrets" || fail "canary leaked in audit"
+
+# Wave K4 synthetic core daemon readiness audit (mixed missing-guard, guarded-pending, keep_managed).
+k4_sys=$scratch/audit-k4-units
+mkdir -p "$k4_sys"
+cat >"$k4_sys/spawn-loop.service" <<'EOF'
+[Service]
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+EOF
+cat >"$k4_sys/spawn-serve.service" <<'EOF'
+[Service]
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+RestartPreventExitStatus=78 243
+EOF
+cat >"$k4_sys/spawn-jev-relay.service" <<'EOF'
+[Service]
+LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key
+RestartPreventExitStatus=243 78
+EOF
+
+k4_syn_json=$(HOME="$audit_home" CH_DEPLOY_SYSTEMD_DIR="$k4_sys" CH_FAKE_ALERTS="$scratch/alerts" \
+  bash "$check" --audit-keep-migration --json)
+k4_syn_human=$(HOME="$audit_home" CH_DEPLOY_SYSTEMD_DIR="$k4_sys" CH_FAKE_ALERTS="$scratch/alerts" \
+  bash "$check" --audit-keep-migration)
+
+jq -e '
+  .core_daemon_units.total == 3 and
+  .core_daemon_units.keep_managed == 1 and
+  .core_daemon_units.pending_migration == 2 and
+  .core_daemon_units.restart_guard_ready == 2 and
+  (.units | map(select(.unit == "spawn-loop.service" and .restart_guard_ready == false)) | length == 1) and
+  (.units | map(select(.unit == "spawn-serve.service" and .restart_guard_ready == true and .status == "pending_migration")) | length == 1) and
+  (.units | map(select(.unit == "spawn-jev-relay.service" and .restart_guard_ready == true and .status == "keep_managed")) | length == 1)
+' <<<"$k4_syn_json" >/dev/null &&
+  grep -q 'summary_k4: core_daemon_units=1/3(restart_guard_ready=2)' <<<"$k4_syn_human" &&
+  [ ! -e "$scratch/alerts" ] &&
+  pass "Wave K4 --audit-keep-migration tracks core_daemon_units readiness across synthetic states" || fail "Wave K4 synthetic ($k4_syn_json)"
 
 echo "$fails failed"
 [ "$fails" -eq 0 ]
