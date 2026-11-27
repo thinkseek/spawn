@@ -50,14 +50,18 @@ use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use spawn_cas::{Digest, TREE_SKIP_REGISTRY};
+use spawn_cas::{Digest, GitOid, TREE_SKIP_REGISTRY};
 use spawn_core::node_proto::artifact_path;
 use spawn_core::node_proto::grant::{ArtifactRole, ArtifactUrl, NODE_OWNED_ENV};
 use spawn_core::node_proto::result::{ResultMeta, Signal};
+use spawn_host::git_border::{BorderRefTarget, GitBorderAdapter};
+use spawn_host::workspace::DynRefLedger;
+use spawn_host::{CasMerkleStore, RefLedger};
 use spawn_postgres::{
     FaultNext, FaultOutcome, PostgresStore, RemoteJob, RemoteJobKind, RemoteJobSpec,
     RemoteJobState, SweepOutcome,
@@ -413,6 +417,100 @@ impl Artifacts {
             return Ok(published);
         }
         let published = self.bundle(repo, &[("refs/gate/base", base)], &["refs/gate/base"])?;
+        self.remember("baseline", base, &published);
+        Ok(published)
+    }
+
+    fn refs_repo_from_d6(
+        &self,
+        cas: &CasMerkleStore,
+        ledger: &dyn RefLedger,
+        refs: &[(&str, &str)],
+    ) -> Result<PathBuf, String> {
+        let mut targets = Vec::with_capacity(refs.len());
+        for (git_ref, commit_hex) in refs {
+            let oid = GitOid::parse_hex(commit_hex)
+                .map_err(|error| format!("invalid commit {commit_hex:?} for {git_ref}: {error}"))?;
+            let snap = ledger
+                .get_snapshot_by_oid(&oid)
+                .map_err(|error| format!("ledger lookup {commit_hex}: {error}"))?
+                .ok_or_else(|| format!("commit {commit_hex} missing from D6 RefLedger"))?;
+            targets.push(BorderRefTarget {
+                git_ref: (*git_ref).to_string(),
+                snapshot: snap.id,
+            });
+        }
+        let dir = self.scratch("d6-refs")?;
+        if let Err(error) = GitBorderAdapter::new().export_refs(cas, Some(ledger), &dir, &targets) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(format!("export D6 border refs: {error}"));
+        }
+        Ok(dir)
+    }
+
+    fn bundle_from_d6(
+        &self,
+        cas: &CasMerkleStore,
+        ledger: &dyn RefLedger,
+        refs: &[(&str, &str)],
+        args: &[&str],
+    ) -> Result<Published, String> {
+        let dir = self.refs_repo_from_d6(cas, ledger, refs)?;
+        let out = self.scratch("bundle");
+        let result = out.and_then(|out| {
+            ran(
+                crate::sources::controller_git()
+                    .arg("--git-dir")
+                    .arg(&dir)
+                    .args(["bundle", "create", "-q"])
+                    .arg(&out)
+                    .args(args)
+                    .stdout(Stdio::null()),
+                "git bundle create",
+            )?;
+            self.put_file(&out)
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    /// D6-native `delta_bundle`: export `(base, candidate)` from `CasMerkleStore` + `RefLedger`
+    /// via [`GitBorderAdapter`] without reading a bare mirror on disk.
+    pub(super) fn delta_bundle_from_d6(
+        &self,
+        cas: &CasMerkleStore,
+        ledger: &dyn RefLedger,
+        base: &str,
+        candidate: &str,
+    ) -> Result<Published, String> {
+        if base == candidate {
+            return Err("the candidate is the base: no delta to ship".to_string());
+        }
+        self.bundle_from_d6(
+            cas,
+            ledger,
+            &[("refs/gate/base", base), ("refs/gate/candidate", candidate)],
+            &["refs/gate/candidate", &format!("^{base}")],
+        )
+    }
+
+    /// D6-native `baseline_bundle`: export `base` from `CasMerkleStore` + `RefLedger`
+    /// via [`GitBorderAdapter`] without reading a bare mirror on disk, cached per `base`.
+    pub(super) fn baseline_bundle_from_d6(
+        &self,
+        cas: &CasMerkleStore,
+        ledger: &dyn RefLedger,
+        base: &str,
+    ) -> Result<Published, String> {
+        if let Some(published) = self.cached("baseline", base) {
+            return Ok(published);
+        }
+        let published = self.bundle_from_d6(
+            cas,
+            ledger,
+            &[("refs/gate/base", base)],
+            &["refs/gate/base"],
+        )?;
         self.remember("baseline", base, &published);
         Ok(published)
     }
@@ -1420,6 +1518,9 @@ pub(super) struct PrimaryRequest<'a> {
     /// a rejection naming only its connection or database errors is no
     /// verdict on the work ([`names_no_work_failure`]).
     pub(super) test_database: bool,
+    /// Optional D6 store + ledger handles so primary remote gate bundles export
+    /// natively via [`GitBorderAdapter`] without a bare mirror on disk.
+    pub(super) d6_border: Option<(Arc<CasMerkleStore>, DynRefLedger)>,
 }
 
 /// What the primary path came to.
@@ -1651,6 +1752,30 @@ impl Primary {
         Ok(requires)
     }
 
+    fn publish_bundles(
+        &self,
+        request: &PrimaryRequest<'_>,
+    ) -> Result<(Published, Published), String> {
+        if let Some((cas, ledger)) = &request.d6_border {
+            Ok((
+                self.artifacts.delta_bundle_from_d6(
+                    cas,
+                    ledger.as_ref(),
+                    request.base,
+                    request.candidate,
+                )?,
+                self.artifacts
+                    .baseline_bundle_from_d6(cas, ledger.as_ref(), request.base)?,
+            ))
+        } else {
+            Ok((
+                self.artifacts
+                    .delta_bundle(request.repo, request.base, request.candidate)?,
+                self.artifacts.baseline_bundle(request.repo, request.base)?,
+            ))
+        }
+    }
+
     /// The job for `request`, its artifacts written: the delta and the
     /// baseline bundles, the controller pack of a snapshot of the gate
     /// directory (so `scenarios_sha256` is the set the node receives), the
@@ -1708,10 +1833,7 @@ impl Primary {
         let pack = pack?;
         let scenarios_sha256 = scenarios_sha256
             .ok_or_else(|| format!("{} cannot be read whole", scenarios.display()))?;
-        let delta = self
-            .artifacts
-            .delta_bundle(request.repo, request.base, request.candidate)?;
-        let baseline = self.artifacts.baseline_bundle(request.repo, request.base)?;
+        let (delta, baseline) = self.publish_bundles(request)?;
         let inputs = json!({
             "base": request.base,
             "candidate": request.candidate,
@@ -3555,5 +3677,166 @@ pub(super) mod tests {
         let row = ledger.store.remote_job(&id).unwrap().unwrap();
         assert_eq!(row.requires, holds);
         assert_eq!(row.spec["requires"], row.requires);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn d6_border_baseline_and_delta_bundles_without_bare_mirror() {
+        use spawn_host::{CasMerkleStore, D6RefKind, InMemoryRefLedger, PublishRequest, RefLedger};
+
+        let dir = Scratch::new("d6-border-bundles");
+        let cas = std::sync::Arc::new(CasMerkleStore::open(dir.0.join("cas")).unwrap());
+        let ledger = std::sync::Arc::new(InMemoryRefLedger::new());
+        let artifacts = Artifacts::new(dir.0.join("artifacts"));
+
+        let (blob_a, size_a) = cas.put_bytes_blob(b"base\n").unwrap();
+        let tree_base = cas
+            .put_tree_cached(
+                &spawn_cas::Tree::from_entries(vec![spawn_cas::TreeEntry::file(
+                    b"a.txt".to_vec(),
+                    &blob_a,
+                    size_a,
+                )])
+                .unwrap(),
+            )
+            .unwrap();
+        let body_base =
+            spawn_host::format_commit_body("t <t@t> 1000 +0000", "t <t@t> 1000 +0000", "base\n");
+        let pub_base = cas
+            .publish_snapshot(
+                ledger.as_ref(),
+                &PublishRequest {
+                    project: "d6-remote-proj",
+                    ref_name: "main",
+                    kind: D6RefKind::Main,
+                    expected_ref: None,
+                    tree: &tree_base,
+                    parents: &[],
+                    commit_body: &body_base,
+                    created_at_ms: 1_000_000,
+                    reason: "test:base",
+                    landing_task_id: None,
+                },
+            )
+            .unwrap();
+        let base_oid = pub_base.git_oid.to_hex();
+
+        let (blob_b, size_b) = cas.put_bytes_blob(b"candidate delta\n").unwrap();
+        let tree_cand = cas
+            .put_tree_cached(
+                &spawn_cas::Tree::from_entries(vec![
+                    spawn_cas::TreeEntry::file(b"a.txt".to_vec(), &blob_a, size_a),
+                    spawn_cas::TreeEntry::file(b"b.txt".to_vec(), &blob_b, size_b),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let body_cand = spawn_host::format_commit_body(
+            "t <t@t> 1001 +0000",
+            "t <t@t> 1001 +0000",
+            "candidate\n",
+        );
+        let cand_snap = spawn_cas::Snapshot {
+            tree: tree_cand.clone(),
+            parents: vec![pub_base.snapshot.clone()],
+            commit_body: body_cand,
+        };
+        let cand_snap_id = cas.cas().put_merkle_snapshot(&cand_snap).unwrap();
+        let cand_git_oid = cas
+            .project_snapshot_oid(&cand_snap, &[pub_base.git_oid])
+            .unwrap();
+        ledger
+            .record_snapshot(
+                &cand_snap_id,
+                &cand_git_oid,
+                &tree_cand,
+                std::slice::from_ref(&pub_base.snapshot),
+                "d6-remote-proj",
+                1_001_000,
+            )
+            .unwrap();
+        let cand_oid = cand_git_oid.to_hex();
+
+        let baseline = artifacts
+            .baseline_bundle_from_d6(&cas, ledger.as_ref(), &base_oid)
+            .unwrap();
+        let baseline_path = artifacts.path_of(&baseline.digest);
+        assert!(baseline_path.is_file());
+        // Cached hit returns identical Published metadata.
+        assert_eq!(
+            artifacts
+                .baseline_bundle_from_d6(&cas, ledger.as_ref(), &base_oid)
+                .unwrap(),
+            baseline
+        );
+
+        let delta = artifacts
+            .delta_bundle_from_d6(&cas, ledger.as_ref(), &base_oid, &cand_oid)
+            .unwrap();
+        let delta_path = artifacts.path_of(&delta.digest);
+        assert!(delta_path.is_file());
+        assert!(
+            artifacts
+                .delta_bundle_from_d6(&cas, ledger.as_ref(), &base_oid, &base_oid)
+                .is_err()
+        );
+
+        // Verify both bundles reconstruct the exact commits in an empty git repository.
+        let check_repo = dir.0.join("check.git");
+        ran(
+            crate::sources::controller_git()
+                .args(["init", "-q", "--bare"])
+                .arg(&check_repo),
+            "git init",
+        )
+        .unwrap();
+        let base_heads = String::from_utf8(
+            ran(
+                crate::sources::controller_git()
+                    .arg("--git-dir")
+                    .arg(&check_repo)
+                    .args(["bundle", "list-heads"])
+                    .arg(&baseline_path),
+                "list-heads baseline",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(base_heads.trim(), format!("{base_oid} refs/gate/base"));
+        ran(
+            crate::sources::controller_git()
+                .arg("--git-dir")
+                .arg(&check_repo)
+                .args(["fetch", "-q"])
+                .arg(&baseline_path)
+                .args(["refs/gate/base:refs/gate/base"]),
+            "fetch baseline bundle",
+        )
+        .unwrap();
+        let delta_heads = String::from_utf8(
+            ran(
+                crate::sources::controller_git()
+                    .arg("--git-dir")
+                    .arg(&check_repo)
+                    .args(["bundle", "list-heads"])
+                    .arg(&delta_path),
+                "list-heads delta",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            delta_heads.trim(),
+            format!("{cand_oid} refs/gate/candidate")
+        );
+        ran(
+            crate::sources::controller_git()
+                .arg("--git-dir")
+                .arg(&check_repo)
+                .args(["bundle", "verify", "-q"])
+                .arg(&delta_path),
+            "verify delta bundle",
+        )
+        .unwrap();
     }
 }

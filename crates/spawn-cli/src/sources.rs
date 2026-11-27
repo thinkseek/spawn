@@ -46,10 +46,11 @@ use spawn_cas::{Digest, GitOid};
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{BaseMerge, Branch, Commit, Hold, SetAside, WorkspaceError, WorkspaceStore};
 use spawn_host::d6_workspace::D6Workspace;
+use spawn_host::tree_path::TreePath;
 use spawn_host::workspace::DynRefLedger;
 use spawn_host::{
-    D6RefKind, D6StoreError, LedgerRef, LedgerSnapshot, LocalWorkspaceStore, RefLedger,
-    WorkspaceBackend as HostWorkspaceBackend,
+    CasMerkleStore, D6RefKind, D6StoreError, LedgerRef, LedgerSnapshot, LocalWorkspaceStore,
+    RefLedger, WorkspaceBackend as HostWorkspaceBackend,
 };
 use spawn_postgres::{PostgresStore, RefKind};
 
@@ -394,6 +395,284 @@ impl PostgresRefLedger {
     }
 }
 
+/// Borrowed [`spawn_host::RefLedger`] adapter over `&PostgresStore` for short-lived
+/// read/pin helpers that receive `&PostgresStore` directly.
+pub(crate) struct BorrowedPgRefLedger<'a>(&'a PostgresStore);
+
+impl<'a> BorrowedPgRefLedger<'a> {
+    pub(crate) const fn new(store: &'a PostgresStore) -> Self {
+        Self(store)
+    }
+}
+
+impl RefLedger for BorrowedPgRefLedger<'_> {
+    fn record_snapshot(
+        &self,
+        id: &Digest,
+        git_oid: &GitOid,
+        tree: &Digest,
+        parents: &[Digest],
+        project: &str,
+        created_at_ms: i64,
+    ) -> Result<Digest, D6StoreError> {
+        pg_record_snapshot(self.0, id, git_oid, tree, parents, project, created_at_ms)
+    }
+
+    fn get_snapshot(&self, id: &Digest) -> Result<Option<LedgerSnapshot>, D6StoreError> {
+        self.0
+            .get_snapshot(&id.to_string())
+            .map_err(|e| D6StoreError::Ledger(e.to_string()))?
+            .map(snapshot_row_to_ledger)
+            .transpose()
+    }
+
+    fn get_snapshot_by_oid(
+        &self,
+        git_oid: &GitOid,
+    ) -> Result<Option<LedgerSnapshot>, D6StoreError> {
+        self.0
+            .get_snapshot_by_oid(&git_oid.to_hex())
+            .map_err(|e| D6StoreError::Ledger(e.to_string()))?
+            .map(snapshot_row_to_ledger)
+            .transpose()
+    }
+
+    fn cas_ref(
+        &self,
+        project: &str,
+        name: &str,
+        kind: D6RefKind,
+        expected: Option<&Digest>,
+        new_snapshot: &Digest,
+        reason: &str,
+    ) -> Result<u64, D6StoreError> {
+        pg_cas_ref(self.0, project, name, kind, expected, new_snapshot, reason)
+    }
+
+    fn land_main_ref(
+        &self,
+        project: &str,
+        name: &str,
+        expected_base: Option<&Digest>,
+        new_snapshot: &Digest,
+        task_id: Option<i64>,
+        reason: &str,
+    ) -> Result<u64, D6StoreError> {
+        pg_land_main_ref(
+            self.0,
+            project,
+            name,
+            expected_base,
+            new_snapshot,
+            task_id,
+            reason,
+        )
+    }
+
+    fn list_refs(&self, project: Option<&str>) -> Result<Vec<LedgerRef>, D6StoreError> {
+        pg_list_refs(self.0, project)
+    }
+}
+
+/// Resolve workspace backend settings for `root` without claiming the root on disk
+/// or caching into [`WorkspaceSettings::from_env`]'s process-global `OnceLock`.
+/// When `SPAWN_WORKSPACE_BACKEND` is unset and `root` already carries a `d6` marker,
+/// resolves to `D6` rather than falling back to `Git`.
+pub(crate) fn workspace_settings_readonly(
+    root: &Path,
+) -> Result<crate::config::WorkspaceSettings, String> {
+    #[cfg(target_os = "linux")]
+    fn overlay_probe(r: &Path) -> Result<(), String> {
+        if r.exists() {
+            spawn_host::overlay_supported_in(r)
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn overlay_probe(_r: &Path) -> Result<(), String> {
+        Err("the overlay workspace store needs Linux".to_string())
+    }
+    fn cow_probe(r: &Path) -> bool {
+        r.exists() && HostWorkspaceBackend::auto(r) == HostWorkspaceBackend::Cow
+    }
+    fn marked_probe(r: &Path) -> Result<Option<HostWorkspaceBackend>, String> {
+        spawn_host::root_backend(r).map_err(|error| error.to_string())
+    }
+
+    let raw_backend = crate::config::env_value("SPAWN_WORKSPACE_BACKEND");
+    let existing = spawn_host::root_backend(root)
+        .map_err(|error| format!("read workspace backend under {}: {error}", root.display()))?;
+    let configured = if raw_backend
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && existing == Some(HostWorkspaceBackend::D6)
+    {
+        crate::config::WorkspaceBackend::D6
+    } else {
+        crate::config::workspace_backend(raw_backend.as_deref())?
+    };
+    let cas = crate::config::cas_dedup(crate::config::env_value("SPAWN_CAS_DEDUP").as_deref())?;
+    let d6 = crate::config::D6RuntimeConfig::from_env()?;
+
+    let probes = crate::config::Probes {
+        overlay: &overlay_probe,
+        cow: &cow_probe,
+        marked: &marked_probe,
+    };
+    let settings =
+        crate::config::WorkspaceSettings::resolve(configured, cas, root, &probes)?.with_d6(d6);
+    if let Some(there) = existing
+        && !spawn_host::workspace::backends_compatible(there, settings.active)
+    {
+        return Err(format!(
+            "workspace root {} is claimed by {} engine, refusing {}",
+            root.display(),
+            there.name(),
+            settings.active.name()
+        ));
+    }
+    Ok(settings)
+}
+
+/// Construct a [`LocalWorkspaceStore`] for a non-D6-family backend (`git`, `cow`, `overlay`).
+pub(crate) fn open_non_d6_store(
+    settings: &crate::config::WorkspaceSettings,
+    repo: &Path,
+    root: &Path,
+) -> Result<LocalWorkspaceStore, String> {
+    match settings.active {
+        HostWorkspaceBackend::Git => Ok(LocalWorkspaceStore::git(repo, root)),
+        HostWorkspaceBackend::Cow => Ok(LocalWorkspaceStore::cow(repo, root)),
+        HostWorkspaceBackend::Overlay => LocalWorkspaceStore::overlay(repo, root),
+        other @ (HostWorkspaceBackend::D6 | HostWorkspaceBackend::D6Shadow) => Err(format!(
+            "workspace backend {} requires CAS and RefLedger configuration",
+            other.name()
+        )),
+    }
+}
+
+/// Open a backend-aware [`LocalWorkspaceStore`] bound to `pg` using explicit `settings`.
+pub(crate) fn open_store_readonly_with_settings(
+    settings: &crate::config::WorkspaceSettings,
+    repo: &Path,
+    root: &Path,
+    pg: &Arc<PostgresStore>,
+) -> Result<LocalWorkspaceStore, String> {
+    match settings.active {
+        HostWorkspaceBackend::D6 | HostWorkspaceBackend::D6Shadow => {
+            settings.store_with_pg(repo, root, Arc::clone(pg))
+        }
+        _ => open_non_d6_store(settings, repo, root),
+    }
+}
+
+/// Open a read-only backend-aware [`LocalWorkspaceStore`] resolved from environment + root marker.
+pub(crate) fn open_workspace_store_readonly(
+    repo: &Path,
+    root: &Path,
+    pg: &Arc<PostgresStore>,
+) -> Result<LocalWorkspaceStore, String> {
+    let settings = workspace_settings_readonly(root)?;
+    open_store_readonly_with_settings(&settings, repo, root, pg)
+}
+
+/// Construct a short-lived [`D6Workspace`] bound to a borrowed `&PostgresStore` ledger.
+pub(crate) fn open_d6_workspace_borrowed<'a>(
+    repo: &Path,
+    root: &Path,
+    d6_cfg: &crate::config::D6RuntimeConfig,
+    pg: &'a PostgresStore,
+) -> Result<D6Workspace<BorrowedPgRefLedger<'a>>, String> {
+    let cas_dir = d6_cfg.effective_cas_dir(root, HostWorkspaceBackend::D6);
+    let cas = Arc::new(
+        CasMerkleStore::open(&cas_dir)
+            .map_err(|error| format!("open D6 CAS store at {}: {error}", cas_dir.display()))?,
+    );
+    let ledger = Arc::new(BorrowedPgRefLedger::new(pg));
+    let mut store = D6Workspace::new(repo.to_string_lossy().into_owned(), root, cas, ledger);
+    if let Some(policy) = d6_cfg.l1_policy() {
+        store = store.with_l1_policy(policy);
+    }
+    Ok(store)
+}
+
+/// Read `.main-copies/<agent>` directly under `root`, supporting both Git hex commits
+/// and D6 `sha256:...` digests when `root` is a D6 workspace root.
+pub(crate) fn read_main_copies_at(root: &Path, agent: &str) -> Option<(String, Vec<String>)> {
+    let canonical = spawn_host::canonical_root(root);
+    let bytes = std::fs::read(canonical.join(".main-copies").join(agent)).ok()?;
+    let mut fields = bytes.split(|&b| b == b'\0');
+    if fields.next()? != b"main-copies" {
+        return None;
+    }
+    let main_bytes = fields.next()?;
+    let main = std::str::from_utf8(main_bytes).ok()?.to_string();
+    let is_d6 = matches!(
+        spawn_host::root_backend(&canonical),
+        Ok(Some(HostWorkspaceBackend::D6))
+    );
+    let valid_main = if is_d6 {
+        Digest::parse(&main).is_ok()
+    } else {
+        !main.is_empty() && main.bytes().all(|b| b.is_ascii_hexdigit())
+    };
+    if !valid_main {
+        return None;
+    }
+    // Trailing NUL yields one empty final slice in `.split(...)`.
+    let files = fields
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| TreePath::from_bytes(entry).shown())
+        .collect();
+    Some((main, files))
+}
+
+/// Read non-marker conflict main-copies recorded for `agent` via `store`'s active backend.
+pub(crate) fn main_copies_for_store(
+    store: &LocalWorkspaceStore,
+    agent: &str,
+) -> Option<(String, Vec<String>)> {
+    match store {
+        LocalWorkspaceStore::D6(d6) => d6.main_copies(agent),
+        LocalWorkspaceStore::D6Shadow(oracle) => oracle.primary().main_copies(agent),
+        LocalWorkspaceStore::Git(git) => git.main_copies(agent),
+        LocalWorkspaceStore::Cow(cow) => read_main_copies_at(cow.root(), agent),
+        #[cfg(target_os = "linux")]
+        LocalWorkspaceStore::Overlay(overlay) => read_main_copies_at(overlay.root(), agent),
+    }
+}
+
+fn has_git_pending_merge_at(root: &Path, agent: &str) -> bool {
+    let Ok(bytes) = std::fs::read(spawn_host::canonical_root(root).join(".merge").join(agent))
+    else {
+        return false;
+    };
+    let mut fields = bytes.split(|&b| b == b'\0');
+    let is_hex = |field: &[u8]| !field.is_empty() && field.iter().all(u8::is_ascii_hexdigit);
+    let Some(first) = fields.next() else {
+        return false;
+    };
+    if first == b"pending-merge" {
+        fields.next().is_some_and(is_hex) && fields.next().is_some_and(is_hex)
+    } else {
+        is_hex(first)
+    }
+}
+
+/// Check whether `agent` has an unresolved pending merge via `store`'s active backend.
+pub(crate) fn has_pending_merge_for_store(store: &LocalWorkspaceStore, agent: &str) -> bool {
+    match store {
+        LocalWorkspaceStore::D6(d6) => d6.has_pending_merge(agent),
+        LocalWorkspaceStore::D6Shadow(oracle) => oracle.primary().has_pending_merge(agent),
+        LocalWorkspaceStore::Git(git) => git.has_pending_merge(agent),
+        LocalWorkspaceStore::Cow(cow) => has_git_pending_merge_at(cow.root(), agent),
+        #[cfg(target_os = "linux")]
+        LocalWorkspaceStore::Overlay(overlay) => has_git_pending_merge_at(overlay.root(), agent),
+    }
+}
+
 /// Lazy [`RefLedger`] wrapper used by standalone `WorkspaceSettings::store` calls before a shared
 /// [`PostgresStore`] is injected (resolves via `SPAWN_DATABASE_URL` on first ledger operation).
 pub(crate) struct LazyPgRefLedger {
@@ -734,13 +1013,17 @@ fn rebind_d6_store(local: LocalWorkspaceStore, pg: &Arc<PostgresStore>) -> Local
                 || PathBuf::from(oracle.primary().project()),
                 Path::to_path_buf,
             );
-            let rebuilt_shadow = rebuild_d6_workspace_with_ledger(oracle.shadow(), ledger);
-            let primary = spawn_host::GitWorkspace::new(&repo, oracle.primary().root());
-            LocalWorkspaceStore::D6Shadow(
-                spawn_host::ShadowD6Workspace::with_git_repo(primary, rebuilt_shadow, repo)
-                    .with_strict_fail_closed(oracle.strict_fail_closed())
-                    .with_tracked_set_mode(oracle.tracked_set_mode()),
+            let mut opts = spawn_host::workspace::D6ShadowOptions::new(
+                oracle.shadow().root().to_path_buf(),
+                oracle.shadow().store().clone(),
+                ledger,
             )
+            .with_strict_fail_closed(oracle.strict_fail_closed())
+            .with_tracked_set_mode(oracle.tracked_set_mode());
+            if let Some(policy) = oracle.shadow().l1_policy() {
+                opts = opts.with_l1_policy(policy.clone());
+            }
+            LocalWorkspaceStore::d6_shadow(&repo, oracle.primary().root(), opts)
         }
         other => other,
     }
@@ -775,6 +1058,18 @@ impl MissionWorkspaces {
             cas_dedup: false,
             pruned: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn routed_store(
+        &self,
+        agent: &str,
+    ) -> Result<Arc<LocalWorkspaceStore>, WorkspaceError> {
+        self.route(agent).map(|routed| routed.store)
+    }
+
+    pub(crate) fn main_copies(&self, agent: &str) -> Option<(String, Vec<String>)> {
+        let routed = self.route(agent).ok()?;
+        main_copies_for_store(&routed.store, agent)
     }
 
     /// The same store deduplicating build artifacts when `on`
@@ -1717,31 +2012,89 @@ impl WorkspaceStore for MissionWorkspaces {
     }
 }
 
-/// Resolves the bare repository (and optional mission source) that backs `agent_id`.
-fn resolve_task_repo(
+/// Resolves the repository key (and optional mission source) that backs `agent_id`,
+/// skipping bare Git mirror initialization when `backend` is [`HostWorkspaceBackend::D6`].
+fn resolve_task_repo_for_backend(
     store: &PostgresStore,
     default_repo: Option<&Path>,
     root: &Path,
     agent_id: &str,
+    backend: HostWorkspaceBackend,
 ) -> Result<Option<(PathBuf, Option<String>)>, String> {
     match store
         .agent_source(agent_id)
         .map_err(|error| format!("mission source of {agent_id}: {error}"))?
     {
         Some(source) => {
-            let repo = ensure_mirror(root, source.as_deref()).map_err(|error| error.to_string())?;
+            let repo = if backend == HostWorkspaceBackend::D6 {
+                mirror_path(root, source.as_deref()).map_err(|error| error.to_string())?
+            } else {
+                ensure_mirror(root, source.as_deref()).map_err(|error| error.to_string())?
+            };
             Ok(Some((repo, source)))
         }
         None => Ok(default_repo
-            .filter(|repo| repo.exists())
+            .filter(|repo| backend == HostWorkspaceBackend::D6 || repo.exists())
             .map(|repo| (repo.to_path_buf(), None))),
     }
 }
 
-/// Pins worker-authored `.git` commits inside `<root>/<agent_id>` (or already
-/// preserved on `refs/spawn/workers/<agent_id>/head`) onto `refs/spawn/tasks/<task_id>/<stage>`,
-/// pushing both refs to `source` when `source` receives branches.
-pub(crate) fn persist_worker_commits_to_repo(
+fn d6_pin_worker_head<L: RefLedger + Send + Sync>(
+    d6: &D6Workspace<L>,
+    agent_id: &str,
+    target_refs: &[&str],
+) -> Result<Option<String>, String> {
+    if agent_id.is_empty() || agent_id.starts_with('-') {
+        return Err(format!("invalid branch name {agent_id:?}"));
+    }
+    for target in target_refs {
+        if !target.starts_with("refs/spawn/") {
+            return Err(format!(
+                "refusing to pin worker HEAD outside refs/spawn/: {target}"
+            ));
+        }
+    }
+    let worker_ref = spawn_host::git::worker_head_ref(agent_id);
+    let snap = match d6
+        .branch_snapshot(agent_id)
+        .map_err(|error| error.to_string())?
+    {
+        Some(snap) => snap,
+        None => match d6
+            .branch_snapshot(&worker_ref)
+            .map_err(|error| error.to_string())?
+        {
+            Some(snap) => snap,
+            None => return Ok(None),
+        },
+    };
+    let existing_refs = d6
+        .ledger()
+        .list_refs(Some(d6.project_name()))
+        .map_err(|error| error.to_string())?;
+    for target in std::iter::once(worker_ref.as_str()).chain(target_refs.iter().copied()) {
+        let expected = existing_refs
+            .iter()
+            .find(|r| r.name == target)
+            .map(|r| r.snapshot.clone());
+        if expected.as_ref() != Some(&snap.id) {
+            d6.ledger()
+                .cas_ref(
+                    d6.project_name(),
+                    target,
+                    D6RefKind::Branch,
+                    expected.as_ref(),
+                    &snap.id,
+                    "d6:pin_worker_head",
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(Some(snap.git_oid.to_hex()))
+}
+
+fn persist_worker_commits_with_store(
+    local: &LocalWorkspaceStore,
     repo: &Path,
     source: Option<&str>,
     root: &Path,
@@ -1751,10 +2104,13 @@ pub(crate) fn persist_worker_commits_to_repo(
 ) -> Result<Option<String>, String> {
     let worker_ref = spawn_host::git::worker_head_ref(agent_id);
     let task_ref = spawn_host::git::task_head_ref(task_id, stage);
+    if let Some(d6) = local.d6_workspace() {
+        return d6_pin_worker_head(d6, agent_id, &[&task_ref])
+            .map_err(|error| format!("pin {task_ref}: {error}"));
+    }
     let workspace_dir = root.join(agent_id);
     let dir_opt = workspace_dir.is_dir().then_some(workspace_dir.as_path());
-    let git_store = spawn_host::GitWorkspace::new(repo, root);
-    let pinned = git_store
+    let pinned = local
         .pin_worker_head(agent_id, dir_opt, &[&task_ref])
         .map_err(|error| format!("pin {task_ref}: {error}"))?;
     let Some(commit) = pinned else {
@@ -1775,8 +2131,53 @@ pub(crate) fn persist_worker_commits_to_repo(
     Ok(Some(commit.as_str().to_string()))
 }
 
+/// Pins worker commits for `(agent_id, task_id, stage)` through the configured workspace
+/// backend (`d6` natively in CAS/`RefLedger`; `git`/`cow`/`overlay`/`d6-shadow` via
+/// [`LocalWorkspaceStore::pin_worker_head`]).
+#[cfg(test)]
+pub(crate) fn persist_worker_commits_to_repo(
+    repo: &Path,
+    source: Option<&str>,
+    root: &Path,
+    agent_id: &str,
+    task_id: i64,
+    stage: &str,
+) -> Result<Option<String>, String> {
+    let settings = workspace_settings_readonly(root)?;
+    let local = match settings.active {
+        HostWorkspaceBackend::D6 => settings.store(repo, root),
+        HostWorkspaceBackend::D6Shadow => LocalWorkspaceStore::git(repo, root),
+        _ => open_non_d6_store(&settings, repo, root)?,
+    };
+    persist_worker_commits_with_store(&local, repo, source, root, agent_id, task_id, stage)
+}
+
+pub(crate) fn task_worker_head_pinned_with_settings(
+    store: &PostgresStore,
+    settings: &crate::config::WorkspaceSettings,
+    default_repo: Option<&Path>,
+    root: &Path,
+    agent_id: &str,
+    task_id: i64,
+    stage: &str,
+) -> bool {
+    let Ok(Some((repo, _))) =
+        resolve_task_repo_for_backend(store, default_repo, root, agent_id, settings.active)
+    else {
+        return false;
+    };
+    let task_ref = spawn_host::git::task_head_ref(task_id, stage);
+    if settings.active == HostWorkspaceBackend::D6 {
+        let project = repo.to_string_lossy();
+        return store
+            .list_refs(Some(project.as_ref()))
+            .is_ok_and(|refs| refs.into_iter().any(|r| r.name == task_ref));
+    }
+    ref_commit(&repo, &task_ref).is_some()
+}
+
 /// Returns whether `refs/spawn/tasks/<task_id>/<stage>` is already pinned in the
-/// bare repository backing `agent_id`.
+/// store backing `agent_id`.
 pub(crate) fn task_worker_head_pinned(
     store: &PostgresStore,
     default_repo: Option<&Path>,
@@ -1785,15 +2186,57 @@ pub(crate) fn task_worker_head_pinned(
     task_id: i64,
     stage: &str,
 ) -> bool {
-    let Ok(Some((repo, _))) = resolve_task_repo(store, default_repo, root, agent_id) else {
+    let Ok(settings) = workspace_settings_readonly(root) else {
         return false;
     };
-    let task_ref = spawn_host::git::task_head_ref(task_id, stage);
-    ref_commit(&repo, &task_ref).is_some()
+    task_worker_head_pinned_with_settings(
+        store,
+        &settings,
+        default_repo,
+        root,
+        agent_id,
+        task_id,
+        stage,
+    )
+}
+
+pub(crate) fn persist_task_worker_commits_with_settings(
+    store: &PostgresStore,
+    settings: &crate::config::WorkspaceSettings,
+    default_repo: Option<&Path>,
+    root: &Path,
+    agent_id: &str,
+    task_id: i64,
+    stage: &str,
+) -> Result<Option<String>, String> {
+    let Some((repo, source)) =
+        resolve_task_repo_for_backend(store, default_repo, root, agent_id, settings.active)?
+    else {
+        return Ok(None);
+    };
+    if settings.active == HostWorkspaceBackend::D6 {
+        let task_ref = spawn_host::git::task_head_ref(task_id, stage);
+        let d6 = open_d6_workspace_borrowed(&repo, root, &settings.d6, store)?;
+        return d6_pin_worker_head(&d6, agent_id, &[&task_ref])
+            .map_err(|error| format!("pin {task_ref}: {error}"));
+    }
+    let local = match settings.active {
+        HostWorkspaceBackend::D6Shadow => LocalWorkspaceStore::git(&repo, root),
+        _ => open_non_d6_store(settings, &repo, root)?,
+    };
+    persist_worker_commits_with_store(
+        &local,
+        &repo,
+        source.as_deref(),
+        root,
+        agent_id,
+        task_id,
+        stage,
+    )
 }
 
 /// Persists worker-authored commits for `task_id` (`stage`: `"head"` or
-/// `"accepted"`) into the agent's bare repo (and mission source if configured).
+/// `"accepted"`) into the agent's workspace backend (and mission source if configured).
 pub(crate) fn persist_task_worker_commits(
     store: &PostgresStore,
     default_repo: Option<&Path>,
@@ -1802,10 +2245,16 @@ pub(crate) fn persist_task_worker_commits(
     task_id: i64,
     stage: &str,
 ) -> Result<Option<String>, String> {
-    let Some((repo, source)) = resolve_task_repo(store, default_repo, root, agent_id)? else {
-        return Ok(None);
-    };
-    persist_worker_commits_to_repo(&repo, source.as_deref(), root, agent_id, task_id, stage)
+    let settings = workspace_settings_readonly(root)?;
+    persist_task_worker_commits_with_settings(
+        store,
+        &settings,
+        default_repo,
+        root,
+        agent_id,
+        task_id,
+        stage,
+    )
 }
 
 impl Drop for MissionWorkspaces {
@@ -3606,6 +4055,153 @@ mod tests {
             "{err}"
         );
         assert_eq!(ref_commit(&repo, &task_ref).as_deref(), Some(head.as_str()));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn d6_persist_and_check_task_worker_commits_without_git_mirror() {
+        use crate::config::{D6RuntimeConfig, Probes, WorkspaceBackend, WorkspaceSettings};
+
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("d6_pin_worker");
+        let store = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+        );
+        let base = std::env::temp_dir().join(format!(
+            "spawn-sources-d6-pin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("base");
+
+        let root = base.join("d6-root");
+        let settings =
+            WorkspaceSettings::resolve(WorkspaceBackend::D6, false, &root, &Probes::host())
+                .expect("resolve")
+                .with_d6(D6RuntimeConfig::default());
+        settings.claim(&root).expect("claim d6");
+
+        let source = "https://example.invalid/d6/pin.git";
+        let mission = store
+            .mission_add("d6 pin mission", &serde_json::json!([source]), "human")
+            .expect("mission_add");
+        let task_id = store
+            .task_assign(mission, "ephemeral", "agent_d6_pin", "pin work", "default")
+            .expect("task_assign");
+        let mut pg_client = postgres::Client::connect(&url, postgres::NoTls).expect("pg");
+        pg_client
+            .batch_execute(&format!("set search_path to {schema}"))
+            .expect("schema");
+        let agent_id: String = pg_client
+            .query_one(
+                "select agent_id from mission_tasks where id = $1",
+                &[&task_id],
+            )
+            .expect("task row")
+            .get(0);
+
+        let default_proj = base.join("nonexistent-default.git");
+        let factory = settings.factory(&root);
+        let workspaces =
+            super::MissionWorkspaces::new(factory(&default_proj), &root, store.clone(), factory);
+        let branch = BranchName::new(&agent_id).expect("branch");
+        workspaces
+            .ensure_branch(&branch, None)
+            .expect("ensure_branch");
+        let ws = workspaces.mount(&branch).expect("mount");
+        std::fs::write(Path::new(ws.path()).join("work.txt"), "worker work\n").expect("write");
+        let Commit::Created(head_commit) = workspaces.commit(&ws, "worker commit").expect("commit")
+        else {
+            panic!("expected Commit::Created");
+        };
+        workspaces.unmount(&ws).expect("unmount");
+        let head_hex = head_commit.as_str().to_string();
+
+        assert!(
+            !super::task_worker_head_pinned_with_settings(
+                &store,
+                &settings,
+                Some(&default_proj),
+                &root,
+                &agent_id,
+                task_id,
+                "head",
+            ),
+            "must not be pinned before persist"
+        );
+        assert!(
+            !root.join(".sources").exists(),
+            "d6 task_worker_head_pinned must not clone bare git mirrors"
+        );
+
+        let pinned_head = super::persist_task_worker_commits_with_settings(
+            &store,
+            &settings,
+            Some(&default_proj),
+            &root,
+            &agent_id,
+            task_id,
+            "head",
+        )
+        .expect("persist head")
+        .expect("pinned head");
+        assert_eq!(pinned_head, head_hex);
+        assert!(super::task_worker_head_pinned_with_settings(
+            &store,
+            &settings,
+            Some(&default_proj),
+            &root,
+            &agent_id,
+            task_id,
+            "head",
+        ));
+
+        let pinned_accepted = super::persist_task_worker_commits_with_settings(
+            &store,
+            &settings,
+            Some(&default_proj),
+            &root,
+            &agent_id,
+            task_id,
+            "accepted",
+        )
+        .expect("persist accepted")
+        .expect("pinned accepted");
+        assert_eq!(pinned_accepted, head_hex);
+        assert!(super::task_worker_head_pinned_with_settings(
+            &store,
+            &settings,
+            Some(&default_proj),
+            &root,
+            &agent_id,
+            task_id,
+            "accepted",
+        ));
+
+        let repo_key = super::mirror_path(&root, Some(source))
+            .expect("mirror_path")
+            .to_string_lossy()
+            .into_owned();
+        let refs = store.list_refs(Some(&repo_key)).expect("list_refs");
+        for expected_ref in [
+            spawn_host::git::worker_head_ref(&agent_id),
+            spawn_host::git::task_head_ref(task_id, "head"),
+            spawn_host::git::task_head_ref(task_id, "accepted"),
+        ] {
+            assert!(
+                refs.iter().any(|r| r.name == expected_ref),
+                "missing D6 ledger ref {expected_ref} in {refs:?}"
+            );
+        }
+        assert!(
+            !root.join(".sources").exists(),
+            "native D6 pin must never create bare git mirrors under .sources"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

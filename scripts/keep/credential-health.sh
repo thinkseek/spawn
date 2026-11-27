@@ -253,14 +253,15 @@ audit_keep_migration() {
   local total=0 n_keep=0 n_none=0 n_pending=0
   local go_checked=false go_ok=true
   local backup_total=0 backup_keep=0 backup_pending=0 backup_guard_ready=0
+  local core_total=0 core_keep=0 core_pending=0 core_guard_ready=0
   local path_total=0 path_ok=true ppath pu p_changed p_unit has_pe p_safe
   local sys_checked=false sys_total=0 sys_ok=true spath su
   local -a unit_names=() scan_files=() load_creds=() env_files=() suggested_ids=()
   local -a go_violations=() unit_records=() human_lines=()
-  local -a backup_unit_names=() path_violations=() path_records=()
+  local -a backup_unit_names=() core_unit_names=() path_violations=() path_records=()
   local -a sys_violations=() sys_unit_names=()
   local lc_json ef_json sk_json go_v_json lc_disp ef_disp sk_disp
-  local bu_json pv_json pr_json sv_json su_json
+  local bu_json cu_json pv_json pr_json sv_json su_json
 
   if [ -n "${deploy_units-}" ]; then
     audit_dir=$deploy_units
@@ -367,6 +368,13 @@ audit_keep_migration() {
         [ "$status" = pending_migration ] && backup_pending=$((backup_pending + 1))
         [ "$restart_guard_ready" = true ] && backup_guard_ready=$((backup_guard_ready + 1))
         append_unique_item backup_unit_names "$u"
+        ;;
+      spawn-loop.service|spawn-integrate.service|spawn-maintenance.service|spawn-serve.service|spawn-model-relay.service|spawn-jev-relay.service)
+        core_total=$((core_total + 1))
+        [ "$status" = keep_managed ] && core_keep=$((core_keep + 1))
+        [ "$status" = pending_migration ] && core_pending=$((core_pending + 1))
+        [ "$restart_guard_ready" = true ] && core_guard_ready=$((core_guard_ready + 1))
+        append_unique_item core_unit_names "$u"
         ;;
     esac
 
@@ -492,6 +500,7 @@ audit_keep_migration() {
   if [ "$audit_json" -eq 1 ]; then
     go_v_json=$(json_string_array ${go_violations[@]+"${go_violations[@]}"})
     bu_json=$(json_string_array ${backup_unit_names[@]+"${backup_unit_names[@]}"})
+    cu_json=$(json_string_array ${core_unit_names[@]+"${core_unit_names[@]}"})
     pv_json=$(json_string_array ${path_violations[@]+"${path_violations[@]}"})
     sv_json=$(json_string_array ${sys_violations[@]+"${sys_violations[@]}"})
     su_json=$(json_string_array ${sys_unit_names[@]+"${sys_unit_names[@]}"})
@@ -518,6 +527,11 @@ audit_keep_migration() {
       --argjson backup_pending "$backup_pending" \
       --argjson backup_guard_ready "$backup_guard_ready" \
       --argjson backup_units "$bu_json" \
+      --argjson core_total "$core_total" \
+      --argjson core_keep "$core_keep" \
+      --argjson core_pending "$core_pending" \
+      --argjson core_guard_ready "$core_guard_ready" \
+      --argjson core_units "$cu_json" \
       --argjson path_total "$path_total" \
       --argjson path_ok "$path_ok" \
       --argjson path_exists_violations "$pv_json" \
@@ -547,6 +561,13 @@ audit_keep_migration() {
           restart_guard_ready: $backup_guard_ready,
           units: $backup_units
         },
+        core_daemon_units: {
+          total: $core_total,
+          keep_managed: $core_keep,
+          pending_migration: $core_pending,
+          restart_guard_ready: $core_guard_ready,
+          units: $core_units
+        },
         staged_path_units: {
           total: $path_total,
           ok: $path_ok,
@@ -573,6 +594,8 @@ audit_keep_migration() {
       "$backup_keep" "$backup_total" "$backup_guard_ready" \
       "$path_total" "$([ "$path_ok" = true ] && printf ok || printf violation)" \
       "$sys_total" "$([ "$sys_ok" = true ] && printf ok || printf violation)"
+    printf 'summary_k4: core_daemon_units=%d/%d(restart_guard_ready=%d)\n' \
+      "$core_keep" "$core_total" "$core_guard_ready"
   fi
   return 0
 }
