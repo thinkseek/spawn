@@ -17,7 +17,7 @@
 //!   `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, `SPAWN_TEST_DATABASE_URL`,
 //!   `SPAWN_GATE_PG_IMAGE`, `SPAWN_GATE_PG_BIN`). A node never receives a
 //!   database URL: a value that names one is dropped too.
-//! - **Queue and fallback** ([`step`], [`wait_for_lease`]): a job is queued
+//! - **Queue and fallback** ([`step`], `wait_for_lease`): a job is queued
 //!   with `spawn_remote_job_enqueue`; a job no node leased within
 //!   `SPAWN_REMOTE_QUEUE_WAIT_SECS` (30 s) is taken back with
 //!   `spawn_remote_job_take_local`, the fenced compare-and-set a node's
@@ -999,10 +999,7 @@ pub(super) fn step(
 /// is not `Queued`. The primary path (`SPAWN_GATE_REMOTE=node`, PR S5)
 /// follows its job with [`Primary::follow`] instead, which also sees a stop
 /// and a completion; the shadows look once a pass ([`step`]), never waiting.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "a plain wait for a lease, tested here")
-)]
+#[cfg(test)]
 pub(super) fn wait_for_lease(
     store: &PostgresStore,
     job_id: &str,

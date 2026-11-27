@@ -2562,7 +2562,7 @@ pub(crate) fn mark_delivery(root: &Path, order: &Order) -> Result<(), String> {
         .map_err(|error| format!("mark {}: {error}", workspace.join(mark.as_path()).display()))
 }
 
-/// The most of a report [`new_report`] reads.
+/// The most of a report [`inspect_report`] reads.
 const REPORT_LIMIT: u64 = 1 << 20;
 
 /// What the filesystem says about a delivered task's report. This is a
@@ -2595,7 +2595,7 @@ enum InspectedReport {
     Absent,
     Unreadable,
     OlderThanDelivery,
-    Empty(String),
+    Empty,
     Draft {
         text: String,
         markers: Vec<unfinished::Marker>,
@@ -2609,15 +2609,17 @@ impl InspectedReport {
             Self::Absent => ReportStatus::Absent,
             Self::Unreadable => ReportStatus::Unreadable,
             Self::OlderThanDelivery => ReportStatus::OlderThanDelivery,
-            Self::Empty(_) => ReportStatus::Empty,
+            Self::Empty => ReportStatus::Empty,
             Self::Draft { .. } => ReportStatus::Draft,
             Self::Collectible(_) => ReportStatus::Collectible,
         }
     }
 
+    #[cfg(test)]
     fn into_text(self) -> Option<String> {
         match self {
-            Self::Empty(text) | Self::Draft { text, .. } | Self::Collectible(text) => Some(text),
+            Self::Empty => Some(String::new()),
+            Self::Draft { text, .. } | Self::Collectible(text) => Some(text),
             Self::Absent | Self::Unreadable | Self::OlderThanDelivery => None,
         }
     }
@@ -2651,7 +2653,7 @@ fn inspect_report(workspace: &Path, key: &str) -> InspectedReport {
         return InspectedReport::Unreadable;
     };
     if text.trim().is_empty() {
-        return InspectedReport::Empty(text);
+        return InspectedReport::Empty;
     }
     let markers = unfinished::markers(&text);
     if markers.is_empty() {
@@ -2676,7 +2678,7 @@ pub(crate) fn report_status(workspace: &Path, key: &str) -> ReportStatus {
 /// waited on, the times are the opened files' own, and at most
 /// [`REPORT_LIMIT`] bytes are read. A report that cannot be read that way
 /// is never new.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn new_report(workspace: &Path, key: &str) -> Option<String> {
     inspect_report(workspace, key).into_text()
 }
@@ -2719,7 +2721,7 @@ pub(crate) fn collect_reports(
             InspectedReport::Absent
             | InspectedReport::Unreadable
             | InspectedReport::OlderThanDelivery
-            | InspectedReport::Empty(_) => {}
+            | InspectedReport::Empty => {}
             InspectedReport::Draft { text, markers } => {
                 match refuse_unfinished(store, task, facts, &text, &markers, &work.waits, now_ms) {
                     Ok(line) => lines.extend(line),

@@ -73,13 +73,6 @@ pub enum SecretRef {
 }
 
 impl SecretRef {
-    /// Resolve the secret from the environment variable or file, trimming
-    /// trailing `\r\n` for files and rejecting missing or empty values.
-    #[allow(dead_code)]
-    pub fn resolve(&self) -> Result<String, String> {
-        self.resolve_with(&|name| std::env::var(name).ok())
-    }
-
     /// Resolve the secret using a caller-supplied environment lookup function.
     pub fn resolve_with(
         &self,

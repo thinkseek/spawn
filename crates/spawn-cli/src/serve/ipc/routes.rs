@@ -16,8 +16,8 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum PoolKind {
     Reads,
     Writes,
@@ -37,8 +37,8 @@ impl PoolKind {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum PgRole {
     Reader,
     Human,
@@ -59,12 +59,14 @@ impl PgRole {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct IpcRoute {
     pub(super) method: &'static str,
     pub(super) pattern: &'static str,
+    #[cfg(test)]
     pub(super) pool: PoolKind,
+    #[cfg(test)]
     pub(super) role: PgRole,
+    #[cfg(test)]
     pub(super) idempotency_required: bool,
 }
 
@@ -72,57 +74,81 @@ pub(super) const STATIC_IPC_ROUTES: &[IpcRoute] = &[
     IpcRoute {
         method: "GET",
         pattern: "/ipc/v1/hello",
+        #[cfg(test)]
         pool: PoolKind::Reads,
+        #[cfg(test)]
         role: PgRole::Reader,
+        #[cfg(test)]
         idempotency_required: false,
     },
     IpcRoute {
         method: "GET",
         pattern: "/ipc/v1/events",
+        #[cfg(test)]
         pool: PoolKind::Events,
+        #[cfg(test)]
         role: PgRole::Reader,
+        #[cfg(test)]
         idempotency_required: false,
     },
     IpcRoute {
         method: "POST",
         pattern: "/ipc/v1/node/key",
+        #[cfg(test)]
         pool: PoolKind::Node,
+        #[cfg(test)]
         role: PgRole::NodeGateway,
+        #[cfg(test)]
         idempotency_required: true,
     },
     IpcRoute {
         method: "POST",
         pattern: "/ipc/v1/node/enroll",
+        #[cfg(test)]
         pool: PoolKind::Node,
+        #[cfg(test)]
         role: PgRole::NodeGateway,
+        #[cfg(test)]
         idempotency_required: true,
     },
     IpcRoute {
         method: "POST",
         pattern: "/ipc/v1/node/beat",
+        #[cfg(test)]
         pool: PoolKind::Node,
+        #[cfg(test)]
         role: PgRole::NodeGateway,
+        #[cfg(test)]
         idempotency_required: true,
     },
     IpcRoute {
         method: "POST",
         pattern: "/ipc/v1/node/spec",
+        #[cfg(test)]
         pool: PoolKind::Node,
+        #[cfg(test)]
         role: PgRole::NodeGateway,
+        #[cfg(test)]
         idempotency_required: true,
     },
     IpcRoute {
         method: "POST",
         pattern: "/ipc/v1/node/result",
+        #[cfg(test)]
         pool: PoolKind::Node,
+        #[cfg(test)]
         role: PgRole::NodeGateway,
+        #[cfg(test)]
         idempotency_required: true,
     },
     IpcRoute {
         method: "POST",
         pattern: "/ipc/v1/node/cas",
+        #[cfg(test)]
         pool: PoolKind::Node,
+        #[cfg(test)]
         role: PgRole::None,
+        #[cfg(test)]
         idempotency_required: true,
     },
 ];
