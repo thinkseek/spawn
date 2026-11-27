@@ -152,6 +152,80 @@ Cross-backend comparison (`2048` files × `c=8`, `d6 L1 tmpfs` vs `git`): throug
 
 (Case C uses a uniform synthetic `oversized.bin` payload of `110,000,000` bytes so FastCDC deduplicates repeating chunks inside `<cas>/chunks` to ~5.5 MiB CAS overhead beside the checked-out workspace copy.)
 
+## Latest `main` (`45093817`) `--release` D5 L1 `tmpfs` & Cross-Backend Results
+
+Measured against `origin/main` revision `4509381764fb00c907c8827a28b50d373e4b1d9d` (`git version 2.52.0`, `--release`, offline build of [`crates/spawn-host/examples/storage_benchmark.rs`](../crates/spawn-host/examples/storage_benchmark.rs)) using an isolated disposable PostgreSQL 16 instance (normal durable settings via `SPAWN_BENCH_DATABASE_URL`) and a bounded `/dev/shm` L1 `tmpfs` upperdir (`--tmpfs-budget-mb 512`), with `40` measured iterations, `5` warmup cycles, `4` edits per cycle, `4,096` B/file, and `16,384` B transcript appends:
+
+### 512 files (`c=1` and `c=8`, L1 `tmpfs` budget `512` MiB)
+
+| Config | Wall (ms) | Agg (cyc/s) | ck p50 / p95 (ms) | noop p50 / p95 (ms) | merge p50 / p95 (ms) | cycle p50 / p95 (ms) | Disk (B) | Amp |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `git` (`c=1`) | 2532.8 | 15.79 | 21.48 / 25.30 | 17.64 / 18.30 | 45.63 / 50.85 | 46.16 / 52.05 | 3,014,015 | 1.437 |
+| `d6` (`c=1`, disk) | 1962.9 | 20.38 | 22.92 / 23.77 | 7.65 / 8.40 | 20.81 / 21.01 | 39.99 / 40.30 | 3,876,695 (`cas=1,042,087`) | 1.849 |
+| `d6` (`c=1`, L1 `tmpfs` 512 MiB) | 2071.7 | 19.31 | 23.04 / 23.69 | 7.94 / 8.19 | 27.85 / 28.65 | 39.60 / 40.16 | 3,876,695 (`l1_reserved=2,097,178`, `cas=1,042,087`) | 1.849 |
+| `shadow` (`c=1`) | 8394.2 | 4.77 | 86.71 / 123.96 | 77.48 / 90.80 | 66.69 / 81.06 | 173.66 / 217.60 | 4,059,893 (`cas=1,045,756`) | 1.936 |
+| `git` (`c=8`) | 3498.7 | 91.46 | 25.67 / 42.85 | 20.08 / 36.51 | 52.06 / 65.39 | 57.60 / 86.85 | 23,220,047 | 1.384 |
+| `d6` (`c=8`, disk) | 2717.9 | 117.74 | 21.76 / 25.31 | 8.30 / 8.95 | 30.27 / 33.77 | 50.31 / 57.66 | 23,886,524 (`cas=1,210,346`) | 1.424 |
+| `d6` (`c=8`, L1 `tmpfs` 512 MiB) | 2747.5 | 116.47 | 21.29 / 24.02 | 7.87 / 8.52 | 30.42 / 38.84 | 48.10 / 56.08 | 23,870,108 (`l1_reserved=16,777,424`, `cas=1,193,930`) | 1.423 |
+| `shadow` (`c=8`) | 10002.6 | 31.99 | 99.06 / 113.18 | 82.32 / 92.16 | 81.25 / 90.33 | 192.96 / 211.80 | 24,517,244 (`cas=1,290,103`) | 1.461 |
+
+- **Shadow oracle parity (`c=1` and `c=8`)**:
+  - `c=1`: `checkpoints_agreed=91`, `merge_agree_clean=4`, `merge_agree_conflict=0`, `tree_mismatches=0`, `tracked_set_leaks=0`, `shadow_errors=0`, `merge_blockers=0`, `has_divergences=false` (`git_fsck=passed`).
+  - `c=8`: `checkpoints_agreed=728`, `merge_agree_clean=32`, `merge_agree_conflict=0`, `tree_mismatches=0`, `tracked_set_leaks=0`, `shadow_errors=0`, `merge_blockers=0`, `has_divergences=false` (`git_fsck=passed`).
+- **Comparison highlights (`512` files)**:
+  - At `c=8`, `d6` (`L1 tmpfs`, `512` MiB) improves over `git` (`c=8`) by `+27.3%` aggregate throughput (`116.47` vs `91.46` cyc/s), `-17.1%` / `-43.9%` `checkpoint_changed` p50/p95, `-60.8%` / `-76.7%` `checkpoint_noop` p50/p95, `-41.6%` `merge_base` p50, and `-16.5%` / `-35.4%` cycle p50/p95, while reserving `16,777,424` bytes inside the `512` MiB L1 `tmpfs` budget.
+  - Compared with PR #146 Case A (`c=1`), `d6` (`disk`) improved from `16.85` to `20.38` cyc/s (`-17.3%` wall time), and `shadow` (`c=1`) improved from `4.25` to `4.77` cyc/s with zero divergences at both `c=1` and `c=8`.
+
+### 2,048 files (`c=8` spot-check vs PR #146 Case B)
+
+| Config | Wall (ms) | Agg (cyc/s) | ck p50 / p95 (ms) | noop p50 / p95 (ms) | merge p50 / p95 (ms) | cycle p50 / p95 (ms) | Disk (B) | Amp |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `git` (`c=8`) | 7119.3 | 44.95 | 61.05 / 92.72 | 49.65 / 80.55 | 87.37 / 111.00 | 127.41 / 174.53 | 74,677,338 | 1.113 |
+| `d6` (`c=8`, disk) | 3283.3 | 97.46 | 30.86 / 36.69 | 14.77 / 17.80 | 35.21 / 42.85 | 61.33 / 71.95 | 74,799,101 (`cas=1,791,275`) | 1.115 |
+
+At `2,048` files (`c=8`), `d6` (`disk`) reached `97.46` cyc/s (`+116.8%` vs `git`'s `44.95` cyc/s; `-49.5%` `ck` p50, `-70.3%` `noop` p50, `-59.7%` `merge` p50, `-51.9%` `cycle` p50), up from `68.00` cyc/s in PR #146 Case B. On this revision (`45093817`), the `2,048`-file `d6` (`c=8`, L1 `tmpfs` `512` MiB) run hit the concurrent snapshot key race noted below on `3/3` attempts after finishing `40/40` cycles, so no row is tabulated for it here.
+
+### Observed `c=8` Concurrency Caveat (`spawn_snapshots_git_oid_key`)
+
+On `45093817`, `spawn_snapshot_record` in [`crates/spawn-postgres/sql/schema.sql`](../crates/spawn-postgres/sql/schema.sql) guards `INSERT INTO spawn_snapshots` with `ON CONFLICT (id) DO NOTHING`, which handles collisions on the primary key `id` but does not serialize or swallow concurrent unique conflicts on the secondary unique constraint `spawn_snapshots_git_oid_key` under PostgreSQL `READ COMMITTED`. When `storage_benchmark` runs `c=8` workers with identical synthetic payloads inside the same 1-second timestamp bucket, `d6` can intermittently fail with SQLSTATE `23505` (`spawn_snapshots_git_oid_key`), observed once on initial `d6` (`512`, `c=8`, disk) before passing cleanly on retry and `3/3` times on `d6` (`2,048`, `c=8`, L1 `tmpfs`). All values tabulated above come from clean passing runs (`integrity=passed`, `git_fsck=passed`, `shadow_oracle.has_divergences=false`); making `spawn_snapshot_record` idempotent across both `(id)` and `(git_oid)` is a tracked follow-up (`#97`/`#113`).
+
+### Sanitized Reproduction Commands
+
+```sh
+cargo build --release --locked --offline -p spawn-host --example storage_benchmark
+
+# Start an isolated disposable PostgreSQL 16 instance (durable settings) and export:
+export SPAWN_BENCH_DATABASE_URL="postgres://<user>:<pass>@127.0.0.1:<port>/<db>"
+
+# Run across git, d6 (disk), d6 (L1 tmpfs), and shadow at c=1 and c=8:
+for c in 1 8; do
+  target/release/examples/storage_benchmark \
+    --source-revision 4509381764fb00c907c8827a28b50d373e4b1d9d \
+    --backend git --concurrency "$c" \
+    --files 512 --file-bytes 4096 --iterations 40 --warmup 5 --edits 4 --transcript-bytes 16384 \
+    > "bench-git-c${c}.json"
+
+  target/release/examples/storage_benchmark \
+    --source-revision 4509381764fb00c907c8827a28b50d373e4b1d9d \
+    --backend d6 --concurrency "$c" \
+    --files 512 --file-bytes 4096 --iterations 40 --warmup 5 --edits 4 --transcript-bytes 16384 \
+    > "bench-d6-disk-c${c}.json"
+
+  target/release/examples/storage_benchmark \
+    --source-revision 4509381764fb00c907c8827a28b50d373e4b1d9d \
+    --backend d6 --concurrency "$c" \
+    --files 512 --file-bytes 4096 --iterations 40 --warmup 5 --edits 4 --transcript-bytes 16384 \
+    --tmpfs-root "<shm_dir>/d6-l1-c${c}" --tmpfs-budget-mb 512 \
+    > "bench-d6-l1-c${c}.json"
+
+  target/release/examples/storage_benchmark \
+    --source-revision 4509381764fb00c907c8827a28b50d373e4b1d9d \
+    --backend shadow --concurrency "$c" \
+    --files 512 --file-bytes 4096 --iterations 40 --warmup 5 --edits 4 --transcript-bytes 16384 \
+    > "bench-shadow-c${c}.json"
+done
+```
+
 ## Interpreting the report
 
 This is a warm-cache, single-writer workload with deterministic, compressible

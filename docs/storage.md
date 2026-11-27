@@ -566,6 +566,41 @@ build output through pre-warmed lower layers instead
 (`OverlayWorkspace::with_lower_layers`). `SPAWN_CAS_DEDUP` other than `1`,
 `0` or empty is refused at start.
 
+### Shared host build caches (`SPAWN_SHARED_BUILD_CACHES`, PR #180)
+
+Opt-in and disabled by default (`SPAWN_SHARED_BUILD_CACHES` unset or
+`0|false|no|off`; explicit invalid toggle values are refused fail-closed in
+[`crates/spawn-cli/src/runtime.rs`](../crates/spawn-cli/src/runtime.rs)). When
+enabled via `SPAWN_SHARED_BUILD_CACHES=1|true|yes|on`, Spawn uses
+`<workspace_root>/.caches` (requiring a valid absolute non-root workspace
+root); setting `SPAWN_SHARED_BUILD_CACHE_DIR=<abs-dir>` enables the shared
+cache explicitly at that validated directory unless `SPAWN_SHARED_BUILD_CACHES`
+explicitly turns it off. Path validation rejects relative paths, `..`
+segments, control characters, bare system directories (`/`, `/tmp`, `/var/tmp`,
+`/etc`, `/run`, ...), sensitive subtrees (including `/run/keep*` and
+`/var/run/keep*`), `$HOME` itself, and symlinks resolving into forbidden
+paths.
+
+- **Managed toolchain environment & subdirs:** Eight zero-secret toolchain
+  cache environment variables are materialized and exported to agent panes:
+  `ZIG_GLOBAL_CACHE_DIR` (`zig`), `CCACHE_DIR` (`ccache`), `UV_CACHE_DIR`
+  (`uv`), `SCCACHE_DIR` (`sccache`), `PIP_CACHE_DIR` (`pip`),
+  `NPM_CONFIG_CACHE` (`npm`), `GOMODCACHE` (`go-mod`), and `GOCACHE`
+  (`go-build`). Any non-empty caller-supplied override for an individual tool
+  variable is preserved as-is.
+- **Sandbox mounting:** When active, the validated cache root is added as a
+  deduplicated writable `ExtraMount` in `ViewConfig` for both `BwrapView` and
+  `ContainerView`, without weakening the `$HOME` allowlist or secret masks.
+- **Extent accounting & diagnostics:**
+  [`build_cache_roots_for`](../crates/spawn-cli/src/storage_bytes.rs) includes
+  the active shared cache directory (when present on disk) in `host.storage_bytes`
+  `build_cache` extent measurements, canonically deduplicated against
+  `$XDG_CACHE_HOME` / `$HOME/.cache`, Bun install cache, and pnpm store.
+  `spawn doctor [--json]` checks configuration strictly read-only (never
+  creating directories and redacting secrets in any invalid-config error) and
+  emits `shared_build_caches: {enabled, status, path, exists, writable,
+  managed_env_vars, error}`.
+
 ## Files over the cap
 
 - **The cap.** One file in a checkpoint is at most `SPAWN_MAX_FILE_MB` MiB
@@ -851,7 +886,25 @@ uses the disk:
     2026-11-12 00:34, when a test run removed every one on the host) shows
     as a fall;
   - `workspaces {path, bytes}`: the regular files under the root outside
-    `.transcripts` and `.transcripts-progress`;
+    `.transcripts`, `.transcripts-progress`, `.caches`,
+    `.spawn-workspace-backend`, and `test-schemas-seen.json` (plus
+    `.partial`);
+  - `workspace_breakdown` (`#105` / PR #184; see [`crates/spawn-cli/src/storage.rs`](../crates/spawn-cli/src/storage.rs),
+    [`crates/spawn-cli/src/serve/storage.rs`](../crates/spawn-cli/src/serve/storage.rs), and [api.md](./api.md)):
+    `{workspace_count, total_bytes, repo_bytes, git_bytes, build_cache_bytes,
+    files, truncated, workspaces: [{name, total_bytes, repo_bytes, git_bytes,
+    build_cache_bytes, files, truncated}]}`, scanning all non-`.` real
+    directories under `root` without following symlinks, bounded globally by
+    `200,000` directory entries, classifying `.git` (`git_bytes`), `12` build-cache
+    directory names plus standard `CACHEDIR.TAG` directories (`O_NOFOLLOW |
+    O_NONBLOCK`, `build_cache_bytes`), and remaining regular files
+    (`repo_bytes`), and sorting inline `workspaces` descending by `total_bytes`
+    (capped at top `32` while aggregates cover all `workspace_count`
+    workspaces);
+  - `shared_build_cache` (`#105` / PR #184): `{path, bytes, files, enabled}`
+    when shared host build caches are enabled (`enabled: true`) or a residual
+    real `<root>/.caches` directory exists on disk (`enabled: false`), else
+    `null` (symlink-safe apparent regular-file bytes);
   - `database {name, bytes, schemas, log_bytes, tables}`:
     `pg_database_size`, its schemas other than `pg_*`,
     `information_schema` and `public`, its event log's bytes (the sum of
@@ -917,8 +970,9 @@ uses the disk:
   - `days_left`: `free_bytes` over `persistent_growth_bytes_per_day`,
     rounded down; null when it is null or not above zero.
 
-  Without a workspace root, `archive`, `workspaces`, `free_bytes` and the
-  growth are null.
+  Without a workspace root, `archive`, `workspaces`, `workspace_breakdown`, `free_bytes` and the
+  growth are null; `shared_build_cache` is populated only when an explicit
+  `SPAWN_SHARED_BUILD_CACHE_DIR` is configured.
 - **The Storage card.** Home's host section ("Every agent and the host")
   shows the four rows (web/src/resources.ts `storageView`): "Transcript
   archive" with "grows about <size> a day" (or "not measured yet"), "Claude
