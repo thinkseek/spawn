@@ -2019,7 +2019,7 @@ pub(crate) fn task_worker_head_pinned_with_settings(
         return false;
     };
     let task_ref = spawn_host::workspace_rules::task_head_ref(task_id, stage);
-    if settings.active == HostWorkspaceBackend::D6 {
+    if settings.is_d6() {
         let project = repo.to_string_lossy();
         return store
             .list_refs(Some(project.as_ref()))
@@ -2066,7 +2066,7 @@ pub(crate) fn persist_task_worker_commits_with_settings(
     else {
         return Ok(None);
     };
-    if settings.active == HostWorkspaceBackend::D6 {
+    if settings.is_d6() {
         let task_ref = spawn_host::workspace_rules::task_head_ref(task_id, stage);
         let d6 = open_d6_workspace_borrowed(&repo, root, &settings.d6, store)?;
         return d6_pin_worker_head(&d6, agent_id, &[&task_ref])
@@ -2098,7 +2098,7 @@ pub(crate) fn agent_branch_head_with_settings(
         return None;
     };
     let branch = BranchName::new(agent).ok()?;
-    if settings.active == HostWorkspaceBackend::D6 {
+    if settings.is_d6() {
         let cas_dir = settings
             .d6
             .effective_cas_dir(root, HostWorkspaceBackend::D6);

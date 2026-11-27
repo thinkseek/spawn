@@ -539,16 +539,7 @@ pub(crate) enum Fork {
 /// Start finds after a fork that failed partway.
 pub(crate) fn branch_head(store: &PostgresStore, root: &Path, agent: &str) -> Option<String> {
     let settings = sources::workspace_settings_readonly(root).ok()?;
-    branch_head_with_settings(store, &settings, root, agent)
-}
-
-pub(crate) fn branch_head_with_settings(
-    store: &PostgresStore,
-    settings: &crate::config::WorkspaceSettings,
-    root: &Path,
-    agent: &str,
-) -> Option<String> {
-    sources::agent_branch_head_with_settings(store, settings, root, agent)
+    sources::agent_branch_head_with_settings(store, &settings, root, agent)
 }
 
 /// What a task is told when its fork from `prior`'s work kept failing
@@ -2690,7 +2681,7 @@ mod tests {
         let c1_hex = c1.as_str().to_string();
 
         assert_eq!(
-            super::branch_head_with_settings(&db.store, &settings, &root, &a1),
+            crate::sources::agent_branch_head_with_settings(&db.store, &settings, &root, &a1),
             Some(c1_hex.clone())
         );
         assert_eq!(
@@ -2735,7 +2726,7 @@ mod tests {
             super::Fork::Forked(Merge::Current)
         );
         assert_eq!(
-            super::branch_head_with_settings(&db.store, &settings, &root, &a2),
+            crate::sources::agent_branch_head_with_settings(&db.store, &settings, &root, &a2),
             Some(c1_hex)
         );
         assert!(!mirror.exists());
