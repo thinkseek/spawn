@@ -229,7 +229,7 @@ is_optional_go_override_env_file() {
   raw=${raw#-}
   base=${raw##*/}
   case $base in
-    node-out.env|node-edge.env|node-gw.env) return 0 ;;
+    node-out.env|node-gw.env) return 0 ;;
     *) return 1 ;;
   esac
 }

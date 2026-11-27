@@ -466,12 +466,13 @@ st=$?
   (.go_units_pg_isolation.violations | length == 0) and
   (.counts.total == .counts.keep_managed + .counts.no_secrets + .counts.pending_migration) and
   (.counts.keep_managed >= 2) and
-  (.counts.no_secrets >= 6) and
+  (.counts.no_secrets == 5) and
+  (.counts.pending_migration == 20) and
   (.units | map(select(.unit == "spawn-jev-relay.service" and .status == "keep_managed" and (.load_credentials | index("typesafe.api-key")) != null)) | length == 1) and
   (.units | map(select(.unit == "spawn-node-out.service" and .status == "keep_managed" and (.load_credentials | index("typesafe.api-key")) != null)) | length == 1) and
   (.units | map(select(.unit == "spawn-agent-presence.service" and .status == "no_secrets")) | length == 1) and
   (.units | map(select(.unit == "spawn-node-gw.service" and .status == "no_secrets" and (.suggested_keep_ids | length == 0))) | length == 1) and
-  (.units | map(select(.unit == "spawn-node-edge.service" and .status == "no_secrets" and (.suggested_keep_ids | length == 0))) | length == 1) and
+  (.units | map(select(.unit == "spawn-node-edge.service" and .status == "pending_migration" and (.suggested_keep_ids | index("spawn-serve.token")) != null)) | length == 1) and
   (.units | map(select(.unit == "spawn-model-relay.service" and .status == "pending_migration" and (.suggested_keep_ids | index("deepseek.api-key")) != null)) | length == 1) and
   (.units | map(select(.unit == "spawn-loop.service" and .status == "pending_migration" and (.env_files | length > 0))) | length == 1)
 ' <<<"$real_audit_json" >/dev/null &&
@@ -481,6 +482,7 @@ real_audit_human=$(CH_DEPLOY_SYSTEMD_DIR="" CH_UNIT_DIR="" SPAWN_DATABASE_URL=""
 grep -q 'keep_managed.*spawn-jev-relay\.service' <<<"$real_audit_human" &&
   grep -q 'keep_managed.*spawn-node-out\.service' <<<"$real_audit_human" &&
   grep -q 'no_secrets.*spawn-node-gw\.service' <<<"$real_audit_human" &&
+  grep -q 'pending_migration.*spawn-node-edge\.service' <<<"$real_audit_human" &&
   grep -q 'pending_migration.*spawn-model-relay\.service' <<<"$real_audit_human" &&
   grep -q 'go_units_pg_isolation=ok' <<<"$real_audit_human" &&
   pass "--audit-keep-migration human output summarizes repo units and PG isolation" || fail "--audit-keep-migration human"
@@ -536,13 +538,13 @@ syn_human=$(HOME="$audit_home" CH_DEPLOY_SYSTEMD_DIR="$audit_sys" CH_FAKE_ALERTS
 jq -e '
   .counts.total == 7 and
   .counts.keep_managed == 2 and
-  .counts.no_secrets == 3 and
-  .counts.pending_migration == 2 and
+  .counts.no_secrets == 2 and
+  .counts.pending_migration == 3 and
   .go_units_pg_isolation.checked == true and
   .go_units_pg_isolation.ok == false and
   (.go_units_pg_isolation.violations == ["spawn-node-edge.service"]) and
   (.units | map(select(.unit == "spawn-node-gw.service" and .status == "no_secrets" and (.suggested_keep_ids | length == 0))) | length == 1) and
-  (.units | map(select(.unit == "spawn-node-edge.service" and .status == "no_secrets" and (.suggested_keep_ids | length == 0))) | length == 1) and
+  (.units | map(select(.unit == "spawn-node-edge.service" and .status == "pending_migration" and (.suggested_keep_ids | index("spawn-serve.token")) != null)) | length == 1) and
   (.units | map(select(.unit == "spawn-mixed-pending.service" and .status == "pending_migration")) | length == 1) and
   (.units | map(select(.unit == "spawn-plain-pending.service" and .status == "pending_migration" and (.suggested_keep_ids | index("spawn.database-url")) != null)) | length == 1)
 ' <<<"$syn_json" >/dev/null &&

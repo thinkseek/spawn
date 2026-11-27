@@ -473,7 +473,8 @@ Keep (`~/.keep` on the owner host, delivered to `/run/keep/<id>` mode `0600`) ke
 | `spawn-jev-relay.service` | `keep_managed` | `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key` | `typesafe.api-key` | Delivered (`RestartPreventExitStatus=243 78`, `http://127.0.0.1:8790/healthz`) |
 | `spawn-node-out.service` | `keep_managed` | `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key` (`EnvironmentFile=-%h/.config/spawn/node-out.env` optional non-secret override only) | `typesafe.api-key` | Delivered (`RestartPreventExitStatus=243 78`, probe `unix://%t/spawn/out.sock\|/out/v1/health`: HTTP `200` healthy, `503` -> `service_down`) |
 | `spawn-agent-presence.service`, `spawn-agent-presence-upload.service`, `spawn-fleet-test-db.service`, `spawn-shadow-observe.service` | `no_secrets` | None (`spawn-agent-presence-upload` reads its own optional token file when enabled) | None | No `EnvironmentFile=` / `LoadCredential=` needed |
-| `spawn-node-edge.service`, `spawn-node-gw.service` | `no_secrets` | Optional `EnvironmentFile=-%h/.config/spawn/node-{edge,gw}.env` non-secret host overrides only (zero `spawn.env` / `*DATABASE_URL*`) | None (`spawn-serve.token` only if edge later serves off loopback under Keep) | `go_unit_pg_isolation` enforced continuously |
+| `spawn-node-gw.service` | `no_secrets` | Optional `EnvironmentFile=-%h/.config/spawn/node-gw.env` non-secret host overrides only (zero `spawn.env` / `*DATABASE_URL*`) | None | `go_unit_pg_isolation` enforced continuously |
+| `spawn-node-edge.service` | `pending_migration` | Optional `EnvironmentFile=-%h/.config/spawn/node-edge.env` (holds `SPAWN_SERVE_TOKEN` when serving off loopback; zero `spawn.env` / `*DATABASE_URL*`) | `spawn-serve.token` | `LoadCredential=spawn-serve.token:/run/keep/spawn-serve.token` (`go_unit_pg_isolation` enforced continuously) |
 | `spawn-model-relay.service` | `pending_migration` (Wave K1 prepared) | `EnvironmentFile=%h/.config/spawn/model-relay.env` (`DEEPSEEK_API_KEY`); `model-relay.py` supports `$CREDENTIALS_DIRECTORY/deepseek.api-key` + `GET /healthz`, and `spawn-model-relay.path` is staged | `deepseek.api-key` | `LoadCredential=deepseek.api-key:/run/keep/deepseek.api-key` + `RestartPreventExitStatus=243 78` (once Keep delivers `/run/keep/deepseek.api-key`) |
 | `spawn-node-gateway.service` | `pending_migration` | `EnvironmentFile=%h/.config/spawn/node-gateway.env` (`SPAWN_NODE_GATEWAY_DATABASE_URL`) | `spawn-node-gateway.database-url` | `LoadCredential=spawn-node-gateway.database-url:/run/keep/spawn-node-gateway.database-url` |
 | `spawn-serve.service`, `spawn-core.service` | `pending_migration` | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` | `spawn.database-url`, `spawn-serve.token` | `LoadCredential=` or restricted config + `SPAWN_SERVE_TOKEN` delivery |
@@ -488,6 +489,8 @@ Inspect the live migration status without opening any `.env` file, touching Post
 bash scripts/keep/credential-health.sh --audit-keep-migration
 bash scripts/keep/credential-health.sh --audit-keep-migration --json | jq .
 ```
+
+Baseline classification across the 27 checked `deploy/systemd/spawn-*.service` units: `total=27`, `keep_managed=2`, `no_secrets=5`, `pending_migration=20`, `go_units_pg_isolation=ok`.
 
 Validate a staged multi-row manifest (including `unix://%t/spawn/out.sock|/out/v1/health` or `http://127.0.0.1:8791/healthz`) offline before cutting over `scripts/keep/credentials.manifest`:
 
