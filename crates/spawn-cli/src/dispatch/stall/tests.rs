@@ -836,3 +836,50 @@ fn a_stall_already_told_waits_for_no_time() {
         "a new record is a new tag, with its own bound"
     );
 }
+
+#[test]
+fn quiet_delivered_task_within_bound_and_duplicate_held_task_do_not_stall() {
+    let mut delivered = row(7, "delivered", SESSION);
+    delivered["brief"] = json!("Audit corpus");
+    let mut dup = row(8, "assigned", "session_worker_dup");
+    dup["kind"] = json!("ephemeral");
+    dup["brief"] = json!("  Audit   corpus ");
+
+    let tasks = work(&[delivered, dup]);
+    let facts = [
+        worker(SemanticState::Working, false),
+        Facts {
+            session_id: "session_worker_dup".to_string(),
+            agent_id: "agent_worker_dup".to_string(),
+            ..worker(SemanticState::Waiting, true)
+        },
+    ];
+    let found = stalls(json!({
+        "tasks": [
+            open(7, "delivered", (120, "task.delivered", 600_000)),
+            {
+                "id": 8, "mission_id": 1, "kind": "ephemeral", "session_id": "session_worker_dup",
+                "state": "assigned", "revisions": 0, "gated": false, "accept": "review",
+                "halted": false,
+                "record": {"id": 121, "type": "task.assigned", "at_ms": NOW - 700_000, "age_ms": 700_000}
+            }
+        ],
+        "sessions": [
+            {"session_id": SESSION, "seq": 20, "event_name": "tool.completed", "at_ms": NOW - 300_000}
+        ]
+    }));
+    // Task #7 had engine activity 5m ago (<15m bound) and Task #8 is held as an in-flight duplicate.
+    assert!(items(&facts, &tasks, &found, &bounds()).is_empty());
+
+    // Once task #7 crosses the 15m activity bound without a fact or open job, Why::Stalled fires.
+    let stale = stalls(json!({
+        "tasks": [open(7, "delivered", (120, "task.delivered", 1_000_000))],
+        "sessions": [
+            {"session_id": SESSION, "seq": 20, "event_name": "tool.completed", "at_ms": NOW - 900_000}
+        ]
+    }));
+    let found_stale = items(&facts, &tasks, &stale, &bounds());
+    let stalled = only(&found_stale);
+    assert_eq!(stalled.why, Why::Stalled);
+    assert_eq!(stalled.tag(), format!("{SESSION} stall-7-activity-20"));
+}

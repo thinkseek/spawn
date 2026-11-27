@@ -34,7 +34,18 @@ function TerminalLines({ text }: { text: string }) {
   );
 }
 
-export function LiveBadge({ live, known = true }: { live: boolean; known?: boolean }) {
+export function LiveBadge({
+  live,
+  known = true,
+  pulse,
+  label,
+}: {
+  live: boolean;
+  known?: boolean;
+  pulse?: boolean;
+  label?: string;
+}) {
+  const shouldPulse = pulse ?? live;
   return (
     <span
       className={cx(
@@ -48,10 +59,12 @@ export function LiveBadge({ live, known = true }: { live: boolean; known?: boole
         aria-hidden="true"
         className={cx(
           "inline-block size-1.5 rounded-full",
-          live ? "animate-spawn-pulse bg-success" : "bg-muted-foreground",
+          live
+            ? cx("bg-success", shouldPulse && "animate-spawn-pulse")
+            : "bg-muted-foreground",
         )}
       />
-      {known ? (live ? "Live" : "Ended") : "…"}
+      {known ? (label ?? (live ? "Live" : "Ended")) : "…"}
     </span>
   );
 }

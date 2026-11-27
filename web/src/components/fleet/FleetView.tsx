@@ -10,7 +10,7 @@ import type { NeedItem } from "../../home";
 import { agentNames, agentsNow, allNotes, nameTask, alertsSpanMs, digestSince, digestWindow, latestNotes, missionsToday, needsSummary } from "../../home";
 import type { Missions } from "../../missions";
 import type { FleetContext } from "../../ordering";
-import { groupAgents, missingAlwaysOn, residentName, usualEngine } from "../../ordering";
+import { groupAgents, missingAlwaysOn, residentName, snapshotFreshness, usualEngine } from "../../ordering";
 import { useNow } from "../rsi/Phase";
 import { FOCUS_RING_INSET, LiveStatus, PageHeader, cx } from "../ui";
 import { useAway } from "../home/Home";
@@ -106,6 +106,17 @@ export function FleetView({
   };
 
   const now = Date.now();
+  const latestNodeBeatMs = useMemo(() => {
+    if (!data?.nodes.length) return null;
+    let max: number | null = null;
+    for (const node of data.nodes) {
+      if (node.sampled_ms !== null && (max === null || node.sampled_ms > max)) {
+        max = node.sampled_ms;
+      }
+    }
+    return max;
+  }, [data?.nodes]);
+  const freshness = snapshotFreshness(data?.generated_at_ms ?? updated, now, latestNodeBeatMs);
   // What happened while the reader was away: at least the last 24 h (design §3 Q4).
   const away = useAway();
   const digestSpan = digestWindow(now, away?.from ?? null);
@@ -133,11 +144,14 @@ export function FleetView({
         </span>
         <LiveStatus
           error={fleet.error}
+          freshness={freshness.level}
           label={
             data
-              ? updated
-                ? `Updated ${relativeTime(updated)}`
-                : "Live"
+              ? freshness.level === "fresh"
+                ? updated
+                  ? `Updated ${relativeTime(updated)}`
+                  : "Live"
+                : `${freshness.label} · ${updated ? relativeTime(updated) : "live"}`
               : "Connecting"
           }
         />
@@ -154,6 +168,20 @@ export function FleetView({
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto flex max-w-[1200px] flex-col gap-3 p-3 sm:p-4">
+            {freshness.level === "frozen" && (
+              <div
+                role="status"
+                className="rounded-lg border border-destructive/30 bg-fail-tint px-3 py-2 text-caption text-destructive"
+              >
+                {freshness.label}：控制面快照未及时更新
+                {freshness.driftMs !== null && freshness.driftMs > 0
+                  ? `（节点心跳仍领先 ${Math.floor(freshness.driftMs / 60_000)}m）`
+                  : freshness.ageMs !== null
+                    ? `（已滞后 ${Math.floor(freshness.ageMs / 60_000)}m）`
+                    : ""}
+                ，请先核实节点健康后再派单。
+              </div>
+            )}
             {/* Issue #91 P1b: the live digest line, the prompts to answer
                 and Master Control, above the home page. */}
             <DigestPanel />

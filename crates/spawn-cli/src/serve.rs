@@ -2453,6 +2453,7 @@ fn missions() -> Result<Value, String> {
     with_last_gates(&mut board, &gates);
     let activity = store.task_activity().map_err(err)?;
     with_activity(&mut board, &activity);
+    with_task_liveness(&mut board, now_ms());
     labels::label_board(&mut board);
     answers::slim_board(&mut board);
     Ok(board)
@@ -2817,6 +2818,138 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
             .unwrap_or(Value::Null);
         if let Some(fields) = task.as_object_mut() {
             fields.insert("last_gate".to_string(), gate);
+        }
+    }
+}
+
+/// Liveness quiet/stalled thresholds (milliseconds), aligned with
+/// `spawn-android` `FleetLivenessModel.kt` (`#63`).
+const LIVENESS_AGENT_QUIET_MS: i64 = 5 * 60_000;
+const LIVENESS_AGENT_STALLED_MS: i64 = 15 * 60_000;
+const LIVENESS_TASK_QUIET_MS: i64 = 10 * 60_000;
+const LIVENESS_TASK_STALLED_MS: i64 = 20 * 60_000;
+
+/// Enrich each agent row on `/api/fleet` with real execution liveness truth:
+/// `last_event_at_ms` (execution/turn/state timestamp, never `judged_at_ms`),
+/// `silence_ms`, and `liveness_state` (`active_heartbeat` / `quiet_working` /
+/// `loop_stalled` / `waiting_idle` / `blocked` / `offline`).
+fn with_fleet_liveness(agents: &mut Value, now_ms: i64) {
+    let Some(rows) = agents.as_array_mut() else {
+        return;
+    };
+    for agent in rows {
+        let live = agent.get("live").and_then(Value::as_bool).unwrap_or(false);
+        let state = agent
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN")
+            .to_ascii_uppercase();
+        let last_event_at_ms = agent
+            .get("activity")
+            .and_then(|activity| {
+                activity
+                    .get("last_event_at_ms")
+                    .and_then(Value::as_i64)
+                    .or_else(|| activity.get("turn_at_ms").and_then(Value::as_i64))
+            })
+            .or_else(|| agent.get("state_since_ms").and_then(Value::as_i64))
+            .or_else(|| agent.get("started_at_ms").and_then(Value::as_i64));
+        let silence_ms = if live {
+            last_event_at_ms.map(|ts| now_ms.saturating_sub(ts).max(0))
+        } else {
+            None
+        };
+        let liveness_state = if !live {
+            "offline"
+        } else if state == "BLOCKED" {
+            "blocked"
+        } else if matches!(state.as_str(), "WAITING" | "COMPLETED") {
+            "waiting_idle"
+        } else if silence_ms.is_some_and(|silence| silence >= LIVENESS_AGENT_STALLED_MS) {
+            "loop_stalled"
+        } else if silence_ms.is_some_and(|silence| silence >= LIVENESS_AGENT_QUIET_MS) {
+            "quiet_working"
+        } else {
+            "active_heartbeat"
+        };
+        if let Some(fields) = agent.as_object_mut() {
+            fields.insert("last_event_at_ms".to_string(), json!(last_event_at_ms));
+            fields.insert("silence_ms".to_string(), json!(silence_ms));
+            fields.insert("liveness_state".to_string(), json!(liveness_state));
+        }
+    }
+}
+
+/// Enrich `/api/missions` with top-level `generated_at_ms` and each task with
+/// `last_event_at_ms`, `silence_ms`, and `liveness_state` (`active_working` /
+/// `briefed_quiet` / `stalled` / `waiting_review` / `terminal`).
+fn with_task_liveness(board: &mut Value, now_ms: i64) {
+    if let Some(root) = board.as_object_mut() {
+        root.insert("generated_at_ms".to_string(), json!(now_ms));
+    }
+    let Some(missions) = board.get_mut("missions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for mission in missions {
+        let gated = mission.get("gate").is_some_and(|gate| !gate.is_null());
+        let Some(tasks) = mission.get_mut("tasks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for task in tasks {
+            let latest_stage_at_ms =
+                task.get("stages")
+                    .and_then(Value::as_array)
+                    .and_then(|stages| {
+                        stages
+                            .iter()
+                            .filter_map(|stage| stage.get("at_ms").and_then(Value::as_i64))
+                            .max()
+                    });
+            let fallback_ts = latest_stage_at_ms
+                .or_else(|| task.get("updated_at_ms").and_then(Value::as_i64))
+                .or_else(|| task.get("created_at_ms").and_then(Value::as_i64));
+            let state = task
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let (last_event_at_ms, silence_ms, liveness_state) = match state {
+                "delivered" => {
+                    let engine_at_ms = task
+                        .get("activity")
+                        .and_then(|activity| activity.get("at_ms"))
+                        .and_then(Value::as_i64);
+                    let delivered_since_ms = task
+                        .get("activity")
+                        .and_then(|activity| activity.get("since_ms"))
+                        .and_then(Value::as_i64);
+                    let last = engine_at_ms.or(delivered_since_ms).or(fallback_ts);
+                    let silence = last.map(|ts| now_ms.saturating_sub(ts).max(0));
+                    let liveness = if silence.is_some_and(|ms| ms >= LIVENESS_TASK_STALLED_MS) {
+                        "stalled"
+                    } else if engine_at_ms.is_none()
+                        || silence.is_some_and(|ms| ms >= LIVENESS_TASK_QUIET_MS)
+                    {
+                        "briefed_quiet"
+                    } else {
+                        "active_working"
+                    };
+                    (last, silence, liveness)
+                }
+                "reported" | "revise" | "landing" => (fallback_ts, None, "waiting_review"),
+                "accepted" => (
+                    fallback_ts,
+                    None,
+                    if gated { "waiting_review" } else { "terminal" },
+                ),
+                "landed" | "cancelled" => (fallback_ts, None, "terminal"),
+                // "assigned" and any unrecognized states read as briefed/quiet until delivered.
+                _ => (fallback_ts, None, "briefed_quiet"),
+            };
+            if let Some(fields) = task.as_object_mut() {
+                fields.insert("last_event_at_ms".to_string(), json!(last_event_at_ms));
+                fields.insert("silence_ms".to_string(), json!(silence_ms));
+                fields.insert("liveness_state".to_string(), json!(liveness_state));
+            }
         }
     }
 }
@@ -3379,6 +3512,9 @@ fn fleet() -> Result<Value, String> {
     let store = open_store()?;
     let mut health = store.fleet_health().map_err(err)?;
     let until = health["generated_at_ms"].as_i64().unwrap_or_else(now_ms);
+    if health["generated_at_ms"].is_null() {
+        health["generated_at_ms"] = json!(until);
+    }
     if let Some(posts) = crate::scorecard::interventions::queue_posts_between(
         until.saturating_sub(crate::scorecard::time::DAY_MS),
         until,
@@ -3391,7 +3527,9 @@ fn fleet() -> Result<Value, String> {
     health["backups"] = backups(&store)?;
     let mut agents = store.fleet_board().map_err(err)?;
     labels::label_fleet(&mut agents, &label_context(&store)?);
+    with_fleet_liveness(&mut agents, until);
     Ok(json!({
+        "generated_at_ms": until,
         "agents": agents,
         "health": health,
     }))
@@ -3951,8 +4089,8 @@ mod tests {
         local_exemption, log_window, mission_feature_paths, mission_query, objective_json,
         objective_prompt, open_network_request, open_networks, owner_uid, peer_uid, proc_sockets,
         public_nodes, rsi_objective, rsi_summary, same_origin, same_secret, serve_requests,
-        server_hosts, stream, tokenless_request, typed_text, with_activity, with_last_gates,
-        with_objectives,
+        server_hosts, stream, tokenless_request, typed_text, with_activity, with_fleet_liveness,
+        with_last_gates, with_objectives, with_task_liveness,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -6144,6 +6282,182 @@ mod tests {
                 .contains_key("activity"),
             "the key is always there"
         );
+    }
+
+    #[test]
+    fn fleet_liveness_distinguishes_active_quiet_stalled_idle_blocked_and_offline() {
+        let now = 1_000_000_000;
+        let min = 60_000;
+        let mut agents = json!([
+            {
+                "session_id": "s_active",
+                "live": true,
+                "state": "WORKING",
+                "judged_at_ms": now - 1000,
+                "state_since_ms": now - 10 * min,
+                "activity": { "last_event_at_ms": now - 2 * min }
+            },
+            {
+                "session_id": "s_quiet",
+                "live": true,
+                "state": "WORKING",
+                "judged_at_ms": now - 500,
+                "state_since_ms": now - 20 * min,
+                "activity": { "last_event_at_ms": null, "turn_at_ms": now - 7 * min }
+            },
+            {
+                "session_id": "s_stalled",
+                "live": true,
+                "state": "WORKING",
+                "judged_at_ms": now - 100,
+                "state_since_ms": now - 16 * min,
+                "activity": {}
+            },
+            {
+                "session_id": "s_waiting",
+                "live": true,
+                "state": "WAITING",
+                "state_since_ms": now - 25 * min,
+                "activity": { "last_event_at_ms": now - 25 * min }
+            },
+            {
+                "session_id": "s_blocked",
+                "live": true,
+                "state": "BLOCKED",
+                "state_since_ms": now - 30 * min,
+                "activity": { "last_event_at_ms": now - 30 * min }
+            },
+            {
+                "session_id": "s_offline",
+                "live": false,
+                "state": "COMPLETED",
+                "state_since_ms": now - 40 * min,
+                "activity": { "last_event_at_ms": now - 40 * min }
+            },
+            {
+                "session_id": "s_future_skew",
+                "live": true,
+                "state": "WORKING",
+                "activity": { "last_event_at_ms": now + 5_000 }
+            }
+        ]);
+
+        with_fleet_liveness(&mut agents, now);
+        let rows = agents.as_array().expect("agents array");
+        assert_eq!(rows[0]["liveness_state"], "active_heartbeat");
+        assert_eq!(rows[0]["last_event_at_ms"], now - 2 * min);
+        assert_eq!(rows[0]["silence_ms"], 2 * min);
+
+        assert_eq!(rows[1]["liveness_state"], "quiet_working");
+        assert_eq!(rows[1]["last_event_at_ms"], now - 7 * min);
+        assert_eq!(rows[1]["silence_ms"], 7 * min);
+
+        // Falls back to state_since_ms rather than judged_at_ms.
+        assert_eq!(rows[2]["liveness_state"], "loop_stalled");
+        assert_eq!(rows[2]["last_event_at_ms"], now - 16 * min);
+        assert_eq!(rows[2]["silence_ms"], 16 * min);
+
+        assert_eq!(rows[3]["liveness_state"], "waiting_idle");
+        assert_eq!(rows[4]["liveness_state"], "blocked");
+        assert_eq!(rows[5]["liveness_state"], "offline");
+        assert!(rows[5]["silence_ms"].is_null());
+
+        assert_eq!(rows[6]["liveness_state"], "active_heartbeat");
+        assert_eq!(rows[6]["silence_ms"], 0);
+    }
+
+    #[test]
+    fn task_liveness_sets_generated_at_ms_and_distinguishes_task_states() {
+        let now = 2_000_000_000;
+        let min = 60_000;
+        let mut board = json!({
+            "missions": [
+                {
+                    "id": 1,
+                    "gate": "/repo/rsi/scenarios",
+                    "tasks": [
+                        {
+                            "id": 10,
+                            "state": "delivered",
+                            "updated_at_ms": now - 3 * min,
+                            "activity": { "since_ms": now - 5 * min, "at_ms": now - 3 * min, "tool_calls": 4 }
+                        },
+                        {
+                            "id": 11,
+                            "state": "delivered",
+                            "updated_at_ms": now - 2 * min,
+                            "activity": { "since_ms": now - 2 * min, "at_ms": null, "tool_calls": 0 }
+                        },
+                        {
+                            "id": 12,
+                            "state": "delivered",
+                            "updated_at_ms": now - 12 * min,
+                            "activity": { "since_ms": now - 18 * min, "at_ms": now - 12 * min, "tool_calls": 7 }
+                        },
+                        {
+                            "id": 13,
+                            "state": "delivered",
+                            "updated_at_ms": now - 22 * min,
+                            "activity": { "since_ms": now - 25 * min, "at_ms": now - 22 * min, "tool_calls": 1 }
+                        },
+                        {
+                            "id": 14,
+                            "state": "reported",
+                            "stages": [{ "stage": "reported", "at_ms": now - min }]
+                        },
+                        {
+                            "id": 15,
+                            "state": "accepted",
+                            "updated_at_ms": now - min
+                        },
+                        {
+                            "id": 16,
+                            "state": "landed",
+                            "updated_at_ms": now - min
+                        }
+                    ]
+                },
+                {
+                    "id": 2,
+                    "gate": null,
+                    "tasks": [
+                        {
+                            "id": 20,
+                            "state": "accepted",
+                            "updated_at_ms": now - min
+                        }
+                    ]
+                }
+            ]
+        });
+
+        with_task_liveness(&mut board, now);
+        assert_eq!(board["generated_at_ms"], now);
+
+        let gated = &board["missions"][0]["tasks"];
+        assert_eq!(gated[0]["liveness_state"], "active_working");
+        assert_eq!(gated[0]["last_event_at_ms"], now - 3 * min);
+        assert_eq!(gated[0]["silence_ms"], 3 * min);
+
+        assert_eq!(gated[1]["liveness_state"], "briefed_quiet");
+        assert_eq!(gated[1]["last_event_at_ms"], now - 2 * min);
+        assert_eq!(gated[1]["silence_ms"], 2 * min);
+
+        assert_eq!(gated[2]["liveness_state"], "briefed_quiet");
+        assert_eq!(gated[2]["silence_ms"], 12 * min);
+
+        assert_eq!(gated[3]["liveness_state"], "stalled");
+        assert_eq!(gated[3]["silence_ms"], 22 * min);
+
+        assert_eq!(gated[4]["liveness_state"], "waiting_review");
+        assert_eq!(gated[4]["last_event_at_ms"], now - min);
+        assert!(gated[4]["silence_ms"].is_null());
+
+        assert_eq!(gated[5]["liveness_state"], "waiting_review");
+        assert_eq!(gated[6]["liveness_state"], "terminal");
+
+        let ungated = &board["missions"][1]["tasks"];
+        assert_eq!(ungated[0]["liveness_state"], "terminal");
     }
 
     #[test]

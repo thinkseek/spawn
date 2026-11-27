@@ -9,7 +9,7 @@
  * four sections: in flight, landed or accepted, sent back, cancelled; the
  * retries of one objective are one group, its latest attempt the row. */
 
-import type { FleetAgent } from "./fleet";
+import type { AgentLivenessState, FleetAgent } from "./fleet";
 import type { Mission, MissionTask, Missions, TaskState } from "./missions";
 import type { ScorecardScope } from "./scorecard";
 
@@ -638,4 +638,123 @@ export function orderScopes<T extends Pick<ScorecardScope, "scope" | "mission" |
       Number(isQuietScope(left)) - Number(isQuietScope(right)) ||
       position(left) - position(right),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Execution liveness & snapshot freshness (#63)
+
+export type SnapshotFreshnessLevel = "fresh" | "aging" | "frozen";
+
+export const LIVENESS_THRESHOLDS = {
+  snapshotStaleMs: 3 * 60_000,
+  snapshotFrozenMs: 10 * 60_000,
+  nodeHeartbeatDriftMs: 3 * 60_000,
+  agentQuietMs: 5 * 60_000,
+  agentStalledMs: 15 * 60_000,
+} as const;
+
+export interface AgentLivenessView {
+  state: AgentLivenessState;
+  label: string;
+  tone: "success" | "info" | "warning" | "muted";
+  pulse: boolean;
+  lastEventAtMs: number | null;
+  silenceMs: number | null;
+}
+
+export interface SnapshotFreshnessView {
+  level: SnapshotFreshnessLevel;
+  label: string;
+  ageMs: number | null;
+  driftMs: number | null;
+}
+
+const AGENT_LIVENESS_META: Record<
+  AgentLivenessState,
+  { label: string; tone: AgentLivenessView["tone"]; pulse: boolean }
+> = {
+  active_heartbeat: { label: "实时推进", tone: "success", pulse: true },
+  quiet_working: { label: "静默运行", tone: "info", pulse: false },
+  loop_stalled: { label: "疑似停滞", tone: "warning", pulse: false },
+  waiting_idle: { label: "待命", tone: "muted", pulse: false },
+  blocked: { label: "已阻塞", tone: "warning", pulse: false },
+  offline: { label: "已休眠", tone: "muted", pulse: false },
+};
+
+/** Classify an agent's true execution liveness at `now`, using real
+ * execution/turn/state timestamps and never periodic `judged_at_ms` (#63). */
+export function agentLiveness(agent: FleetAgent, now = Date.now()): AgentLivenessView {
+  const lastEventAtMs =
+    agent.last_event_at_ms ??
+    agent.activity.last_event_at_ms ??
+    agent.activity.turn_at_ms ??
+    agent.state_since_ms ??
+    agent.started_at_ms;
+  const silenceMs = agent.live
+    ? lastEventAtMs !== null
+      ? Math.max(0, now - lastEventAtMs)
+      : (agent.silence_ms ?? null)
+    : null;
+  const waitingOnOwnJob =
+    agent.live &&
+    agent.judgement?.reason === "WAITING_FOR_BACKGROUND_JOB" &&
+    agent.activity.jobs.length > 0;
+
+  let state: AgentLivenessState;
+  if (!agent.live) {
+    state = "offline";
+  } else if (agent.state === "BLOCKED") {
+    state = "blocked";
+  } else if (agent.state === "WAITING" || agent.state === "COMPLETED") {
+    state = "waiting_idle";
+  } else if (waitingOnOwnJob) {
+    state =
+      silenceMs !== null && silenceMs < LIVENESS_THRESHOLDS.agentQuietMs
+        ? "active_heartbeat"
+        : "quiet_working";
+  } else if (silenceMs !== null) {
+    if (silenceMs >= LIVENESS_THRESHOLDS.agentStalledMs) {
+      state = "loop_stalled";
+    } else if (silenceMs >= LIVENESS_THRESHOLDS.agentQuietMs) {
+      state = "quiet_working";
+    } else {
+      state = "active_heartbeat";
+    }
+  } else {
+    state = agent.liveness_state ?? "active_heartbeat";
+  }
+
+  return {
+    state,
+    ...AGENT_LIVENESS_META[state],
+    lastEventAtMs,
+    silenceMs,
+  };
+}
+
+/** Classify fleet/missions snapshot freshness at `now`, flagging stale/frozen
+ * control planes when `generated_at_ms` ages or trails live node heartbeats. */
+export function snapshotFreshness(
+  generatedAtMs: number | null | undefined,
+  now = Date.now(),
+  latestNodeBeatMs: number | null = null,
+): SnapshotFreshnessView {
+  const at =
+    typeof generatedAtMs === "number" && Number.isFinite(generatedAtMs) ? generatedAtMs : null;
+  const ageMs = at !== null ? Math.max(0, now - at) : null;
+  const driftMs =
+    at !== null && latestNodeBeatMs !== null && Number.isFinite(latestNodeBeatMs)
+      ? Math.max(0, latestNodeBeatMs - at)
+      : null;
+
+  if (
+    (ageMs !== null && ageMs >= LIVENESS_THRESHOLDS.snapshotFrozenMs) ||
+    (driftMs !== null && driftMs >= LIVENESS_THRESHOLDS.nodeHeartbeatDriftMs)
+  ) {
+    return { level: "frozen", label: "快照冻结", ageMs, driftMs };
+  }
+  if (ageMs !== null && ageMs >= LIVENESS_THRESHOLDS.snapshotStaleMs) {
+    return { level: "aging", label: "快照偏旧", ageMs, driftMs };
+  }
+  return { level: "fresh", label: "实时心跳", ageMs, driftMs };
 }

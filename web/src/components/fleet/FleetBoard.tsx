@@ -4,12 +4,12 @@ import type { FleetAgent } from "../../fleet";
 import { FLEET_STATES, jobsText, onOwnJob, percent, stateLabelUpper } from "../../fleet";
 import { absoluteTitle } from "../../format";
 import type { AgentGroup, AgentGroupId, FleetContext, TaskRef } from "../../ordering";
-import { AGENT_GROUP_LABEL, heldTask, lastTask } from "../../ordering";
+import { AGENT_GROUP_LABEL, agentLiveness, heldTask, lastTask } from "../../ordering";
 import { currentToolText } from "../../home";
 import { useStoredChoice } from "../ViewToggle";
 import { ToolChip } from "../BeautifulPrimitives";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, GroupHeader, LabeledId, cx, sinceText } from "../ui";
-import { FleetStateDot, JudgeBadge } from "./bits";
+import { AgentLivenessPill, FleetStateDot, JudgeBadge } from "./bits";
 
 /** One line for "what is it doing right now": its open tool; else, when the
  * rules judged it waiting at its prompt on a background job of its own, that
@@ -266,9 +266,10 @@ function AgentRow({
   onSelect: (sessionId: string) => void;
 }) {
   const now = doingNow(agent);
+  const liveness = agentLiveness(agent);
   const judgement = agent.judgement;
   // Quiet matters for a worker that should be moving: one on a task.
-  const quiet = group === "on_task" && agent.live && isQuiet(agent);
+  const quiet = group === "on_task" && agent.live && (isQuiet(agent) || liveness.state === "loop_stalled");
   const lost = group === "on_task" && !agent.live;
   const engine = agent.engine && agent.engine !== usualEngine ? agent.engine : null;
   return (
@@ -292,7 +293,7 @@ function AgentRow({
 
       {/* Agent */}
       <div className="flex w-full min-w-0 items-center gap-2 lg:w-auto">
-        <FleetStateDot state={agent.state} />
+        <FleetStateDot state={agent.state} pulse={liveness.pulse} />
         <div className="min-w-0">
           <LabeledId
             label={agent.label}
@@ -301,6 +302,7 @@ function AgentRow({
           />
           <div className="mt-0.5 flex min-w-0 items-center gap-1.5 whitespace-nowrap text-micro text-muted-foreground">
             <span>{stateLabelUpper(agent.state)}</span>
+            {agent.live && <AgentLivenessPill liveness={liveness} />}
             {agent.attention && (
               <span className="font-medium text-warning">· escalated</span>
             )}
@@ -341,7 +343,11 @@ function AgentRow({
       <div
         className={cx(
           "pl-4 text-caption lg:pl-0 lg:text-right",
-          quiet ? "font-medium text-warning" : "text-muted-foreground",
+          quiet
+            ? "font-medium text-warning"
+            : liveness.state === "quiet_working"
+              ? "font-medium text-info"
+              : "text-muted-foreground",
         )}
       >
         <span className="lg:hidden">last event </span>

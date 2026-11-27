@@ -9,12 +9,13 @@
 import type { RsiSummary } from "./api.ts";
 import type { Labels } from "./label.ts";
 import { labels } from "./label.ts";
-import { normalizeActivity } from "./taskActivity.ts";
-import type { TaskActivity } from "./taskActivity.ts";
+import { normalizeActivity, normalizeTaskLivenessState } from "./taskActivity.ts";
+import type { TaskActivity, TaskLivenessState } from "./taskActivity.ts";
 import { normalizeHolds } from "./attention.ts";
 import type { SourceHold } from "./attention.ts";
 
 export type { SourceHold } from "./attention.ts";
+export type { TaskLivenessState } from "./taskActivity.ts";
 
 export type TaskDifficulty = "l1" | "l2" | "l3";
 export type TaskTierRole = "top-decision" | "mainline" | "mechanical-offload";
@@ -236,6 +237,9 @@ export interface MissionTask extends Labels {
   created_by: string | null;
   created_at_ms: number | null;
   updated_at_ms: number | null;
+  last_event_at_ms?: number | null;
+  silence_ms?: number | null;
+  liveness_state?: TaskLivenessState | null;
 }
 
 /** The halt a mission is in (/api/missions' `halt`): its `mission.halted`
@@ -306,6 +310,7 @@ export interface Resident extends Labels {
 }
 
 export interface Missions {
+  generated_at_ms?: number | null;
   missions: Mission[];
   residents: Resident[];
   /** Every active owner's hold, with the tasks waiting behind it. */
@@ -458,6 +463,9 @@ function normalizeTask(value: unknown): MissionTask | null {
     created_by: optionalText(value.created_by),
     created_at_ms: optionalNumber(value.created_at_ms),
     updated_at_ms: optionalNumber(value.updated_at_ms),
+    last_event_at_ms: optionalNumber(value.last_event_at_ms),
+    silence_ms: optionalNumber(value.silence_ms),
+    liveness_state: normalizeTaskLivenessState(value.liveness_state),
   };
 }
 
@@ -571,7 +579,12 @@ export function normalizeMissions(value: unknown): Missions {
         RESIDENT_RANK[left.state] - RESIDENT_RANK[right.state] ||
         (left.name ?? "").localeCompare(right.name ?? ""),
     );
-  return { missions, residents, holds: normalizeHolds(raw.holds) };
+  return {
+    generated_at_ms: optionalNumber(raw.generated_at_ms),
+    missions,
+    residents,
+    holds: normalizeHolds(raw.holds),
+  };
 }
 
 export async function fetchMissions(signal: AbortSignal): Promise<Missions> {
