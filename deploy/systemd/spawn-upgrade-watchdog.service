@@ -1,0 +1,15 @@
+[Unit]
+Description=Spawn: independent post-upgrade health watchdog and automatic rollback (deploy/upgrade-watchdog.sh)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/share/spawn-rsi
+# Runs outside current/ (installed in ops/) and never invokes bin/spawn so a
+# crashing upgraded binary cannot disable its own rollback path.
+ExecStart=/bin/bash %h/.local/share/spawn-rsi/ops/upgrade-watchdog.sh --rsi-dir %h/.local/share/spawn-rsi
+Environment=SPAWN_RSI_DIR=%h/.local/share/spawn-rsi
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Optional watchdog-only overrides (threshold, URLs); zero database or host secret files.
+EnvironmentFile=-%h/.config/spawn/upgrade-watchdog.env
+TimeoutStartSec=2min

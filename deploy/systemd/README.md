@@ -30,6 +30,7 @@ main, changes nothing live until that commit is gated and deployed.
 | `spawn-nightly-stale@<source>` (`.timer`) | `scripts/rsi/nightly.sh --stale <source>`: whether the nightly covers anything (two skipped runs in a row, no fact younger than 26 h, or none though its timer fired: one `nightly_stale` alert); no run, no gate | oneshot, hourly |
 | `spawn-credential-health` (`.timer`) | `scripts/keep/credential-health.sh` from the controller, every 5 minutes, for each row of `scripts/keep/credentials.manifest` (today one: `typesafe.api-key`): Keep's `/run/keep/<id>` is present (after a 15-minute boot grace), loaded by its unit (`spawn-jev-relay`; not newer than its start), the unit is up, its newest relayed calls are not refused (401/403) or failing (3 non-200), and no legacy env file (`typesafe.env`), `EnvironmentFile=` naming it or `Environment=` setting its keys is back in any `spawn-*` unit or drop-in. One owner alert per row and fault class (kind `credential_health`, subject the id), cleared when it ends; it opens no credential. With `CH_DEPLOY_SYSTEMD_DIR` set (the unit sets none) it also compares the installed `spawn-*` units with that folder (`unit_drift`) | oneshot, every 5 min (first 5 min after boot) |
 | `spawn-deploy-on-landing` (`.timer`) | `deploy/on-landing.sh` from the controller (#54): deploys what the fleet landed on the Spawn source, `deploy.sh --main` from its own checkout of main, once the store holds a gate-accepted landing of it, after a quiet spell (at the latest a max wait), never while the source is held, a deploy is pending or running, or the nightly is red (below) | oneshot, a minute after the last tick |
+| `spawn-upgrade-watchdog` (`.timer`) | `ops/upgrade-watchdog.sh` (installed alongside `ops/self-upgrade.sh` outside `current/`): independent external rollback watchdog (`deploy/upgrade-watchdog.sh`), transitions `status` to `superseded` if an external deploy replaces managed symlinks, otherwise monitors `upgrade-state.json` during an active post-upgrade window, probes units (`ActiveState=active`, `SubState=running`, `NRestarts==0`) and control-plane HTTP endpoints without invoking `bin/spawn`, atomically flips `current -> previous` at `--failure-threshold` (`3` by default), and debounces once `status` leaves `active` | oneshot, every 30 s after completion |
 | `spawn-maintenance` (`.timer`) | `scripts/maintenance.sh` from the controller: the gate's leftover scratch (`$TMPDIR/spawn-gate.XXXXXX` whose gate is gone, by the pid, start time and boot the gate recorded in it; never a running gate's, whatever its age), deploy.sh's dumps in the backups directory beyond the newest 5, and a VACUUM (ANALYZE) of the test databases' own catalogs, the fleet's and the gates' shared spawn_test (`scripts/vacuum-catalogs.sh`, P21: refused on the live database's port or name, left alone while another session is connected, drops no schema; `--url-var SPAWN_TEST_DATABASE_URL --full`, a dry run unless `--apply`, is the one-time rewrite that gives a leak's room back, run by hand at a quiet moment, never on the timer); nothing Spawn did not create ([docs/storage.md](../../docs/storage.md#disk-room)) | oneshot, hourly |
 | `spawn-session-backup` (`.timer`), `spawn-session-backup-drill` (`.timer`) | `deploy/session-backup.sh`: every account's Claude Code sessions (`~/.claude/projects`, `history.jsonl`, `file-history`) copied as a version (a reflink copy, its manifest and its file and dir counts), thinned to one version per day after 48 h but never a version that holds a file no later one holds (both units run `thin --dry-run`: print-only); daily, a restore of the newest into scratch, checked file by file. **System** units, run as root, installed by hand (below, "Session backups") | oneshot, every 15 min; the drill daily at 05:30 |
 
@@ -131,6 +132,20 @@ cp deploy/systemd/spawn-node-gateway.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now spawn-node-gateway
 journalctl --user -u spawn-node-gateway -n 5   # listen address, cells, public primary key
+```
+
+### Smooth self-upgrade and external watchdog
+
+Because `deploy/sync-units.sh` only updates units already present in
+`~/.config/systemd/user/`, install the standalone `ops/` scripts and enable the
+watchdog timer explicitly on each host (`docs/upgrading.md`):
+
+```sh
+install -d -m 755 ~/.local/share/spawn-rsi/ops
+install -m 755 deploy/self-upgrade.sh deploy/upgrade-watchdog.sh ~/.local/share/spawn-rsi/ops/
+install -m 644 deploy/systemd/spawn-upgrade-watchdog.service deploy/systemd/spawn-upgrade-watchdog.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now spawn-upgrade-watchdog.timer
 ```
 
 ## Session backups

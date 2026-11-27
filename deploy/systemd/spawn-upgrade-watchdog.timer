@@ -1,0 +1,10 @@
+[Unit]
+Description=Spawn: post-upgrade watchdog probe every 30s (deploy/upgrade-watchdog.sh)
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

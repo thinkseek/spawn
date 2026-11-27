@@ -341,3 +341,109 @@ that runs them as children: stop the gates first (`systemctl --user stop
 `spawn-integrate` stopped. The older integrator adopts no unit: it judges
 the same tasks again beside them, and their judgings keep their controllers
 from ever being removed.
+
+## AI-era smooth self-upgrade (`deploy/self-upgrade.sh` & external watchdog)
+
+When promoting prebuilt immutable releases (`$SPAWN_RSI_DIR/releases/<tag>/`,
+holding `spawn`, optional `spawn-node-gateway` / `spawn-hc` / `spawn-node`,
+`web/dist/` or `web.tar.gz`, and `SHA256SUMS`), upgrades follow a four-layer
+zero-downtime protocol:
+
+1. **Immutable release & fail-closed verification (canary-ready)**:
+   `deploy/self-upgrade.sh --role <control-plane|worker-node> --version <tag>`
+   acquires `$SPAWN_RSI_DIR/self-upgrade.lock` (closing the lock FD before
+   spawning hooks or units), validates strict multi-path `SHA256SUMS` coverage
+   (rejecting path traversal, symlinks outside the release, unlisted entries in
+   the release root — only `SHA256SUMS`-verified executables are linked into
+   `bin/` — missing executable bits, setuid/setgid modes, non-regular/link
+   `web.tar.gz` members, and pre-existing unlisted `web/` alongside `web.tar.gz`),
+   and extracts `web.tar.gz` using `--no-same-owner --no-same-permissions` +
+   `chmod u-s,g-s,u+rwX,go+rX,go-w` into `$SPAWN_RSI_DIR/web-extracted/<tag>`
+   **before** touching `current`, `previous`, `bin/`, or `web`. Only currently
+   active systemd units are targeted, owner-stopped units
+   (`ActiveState=inactive`, `SubState=dead`, `Result=success`) are never started
+   on either upgrade or rollback, and `systemctl restart --job-mode=ignore-requirements`
+   is used so `Wants=` relationships (such as `spawn-integrate.service`
+   declaring `Wants=spawn-loop.service`) never pull up an owner-stopped peer
+   unit; zero active units on upgrade fail closed unless
+   `--allow-no-active-units` is passed (which records `staged (0 active units;
+   no units restarted or verified)` instead of `verified healthy`). On a first
+   upgrade from a legacy non-symlink live layout (`bin/*` regular executables
+   and `web/` directory without `current`/`previous`), the live binaries and
+   `web/` are atomically snapshotted into `releases/pre-upgrade-<utc-ts>/`
+   (with generated `SHA256SUMS`) before switching so rollback preserves every
+   legacy binary and UI asset. URLs (`scheme://...`), `Authorization:` /
+   `Cookie:` / `Set-Cookie:` headers, `Bearer`/`Basic` credentials,
+   JSON/key-value/CLI-flag secrets (`password`, `passwd`, `passphrase`, `token`,
+   `secret`, `api[_-]?key`, `access[_-]?token`, `refresh[_-]?token`,
+   `private[_-]?key`, `client[_-]?secret`, `session`, `key`), and bare `sk-...`
+   tokens are redacted across `upgrade-state.json`, `upgrade-audit.jsonl`,
+   script stdout/stderr, and captured backup-hook, drain, and `init-db` output.
+2. **DB-blind stateless Canary / remote node (`--role worker-node --db-blind`)**:
+   Remote/edge node units that never run schema migrations (such as
+   `spawn-node.service`) should upgrade first with `--db-blind`. Before touching
+   any symlink, `--db-blind` inspects each target unit's `ExecStartPre` (via
+   `systemctl show`, fragment unit files, and drop-ins) and fails closed if any
+   unit invokes `init-db`.
+3. **Control-plane (`--role control-plane`, 1C/1G)**:
+   Runs any configured pre-upgrade backup hook first, writes sanitized metadata
+   to `upgrade-state.json` (`upgrading` -> `active`), atomically flips symlinks
+   with same-filesystem temporary links (`mv -Tf`), executes `spawn init-db`,
+   restarts `spawn-node-gateway` then `spawn-serve`, and probes `ActiveState=active`,
+   `SubState=running`, `NRestarts == 0`, plus HTTP readiness (`/` on serve; non-5xx
+   / signed protocol codes on the gateway). Any failure triggers immediate atomic
+   rollback (`current -> previous`) and unit recovery (exit `3`).
+4. **Fleet-loop worker host (`--role worker-node`, Epoch Drain + `spawn init-db` via `spawn-loop.service`)**:
+   Because `deploy/systemd/spawn-loop.service` configures
+   `ExecStartPre=%h/.local/share/spawn-rsi/bin/spawn init-db`, restarting
+   `spawn-loop` executes `spawn init-db` with the new binary. Fleet-loop worker
+   hosts are **not** DB-blind and therefore roll out *after* control-plane R2
+   backup and schema migration (or run their own `--pre-backup-cmd` /
+   `--backup-unit`). Before switching symlinks, if `spawn-integrate.service` is
+   active, `self-upgrade.sh` runs `spawn integrate --drain` so in-flight gates
+   land cleanly; it **never** signals or kills `spawn-hc` process trees
+   (`KillMode=process`; `Bridge::recover()` adopts live Agent turns across loop
+   restarts), and enforces a post-restart stability window
+   (`--worker-settle-secs`, default `5`) to catch crash-looping binaries before
+   recording `status = "active"`.
+5. **Independent external watchdog (`deploy/upgrade-watchdog.sh`)**:
+   Installed standalone outside `current/` into `~/.local/share/spawn-rsi/ops/`
+   alongside `spawn-upgrade-watchdog.{service,timer}` (`deploy/sync-units.sh`
+   only updates already-installed units) and never executing `bin/spawn`:
+   ```sh
+   install -d -m 755 ~/.local/share/spawn-rsi/ops
+   install -m 755 deploy/self-upgrade.sh deploy/upgrade-watchdog.sh ~/.local/share/spawn-rsi/ops/
+   install -m 644 deploy/systemd/spawn-upgrade-watchdog.service deploy/systemd/spawn-upgrade-watchdog.timer ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemctl --user enable --now spawn-upgrade-watchdog.timer
+   ```
+   While `status == "active"` within `watch_window_until`, each 30 s tick
+   verifies `bin/` and `web` symlinks still point to the `self-upgrade`-managed
+   release; if `deploy/deploy.sh install_build` or another deploy replaced them,
+   the watchdog transitions state to `superseded` and exits `0` without
+   overwriting `bin/` or `web/`. Owner-stopped units (`ActiveState=inactive`,
+   `SubState=dead`, `Result=success`) are excluded from probe failures and are
+   never started during rollback (if an owner `systemctl stop` exceeds
+   `TimeoutStopSec` and terminates with `Result=timeout`, the watchdog treats
+   it fail-safe as non-clean rather than a clean stop). Once consecutive probe
+   failures for the remaining active/failed units reach `--failure-threshold`
+   (default `3`), it executes `current -> previous`, restarts only
+   non-cleanly-stopped units using `--job-mode=ignore-requirements`, appends a
+   redacted entry to `upgrade-audit.jsonl`, and sets `status = "rolled_back"`
+   to debounce against rollback loops.
+
+### Expand-Contract forward and backward compatibility (`N-1 <-> N`)
+
+Safe automated rollback between releases `N-1` and `N` requires every schema,
+event-log, and node-protocol change to obey Expand-Contract across adjacent
+versions (see also [Version-coupled boundaries](#version-coupled-boundaries)):
+
+- **Expand first (`N` understands `N-1`)**: new SQL columns/tables are additive
+  with defaults or nullable types; new JSON/serde fields use `#[serde(default)]`;
+  new HTTP/IPC fields are ignored by `N-1` or gated behind explicit capability
+  negotiation; both `N` and `N-1` tolerate all `EventKind` variants emitted
+  during the watch window before irreversible cleanup.
+- **Contract later (`N+1` or later)**: column drops, constraint tightening, or
+  removing legacy wire paths happen only after release `N` is established fleet-wide
+  beyond the rollback window.
+
