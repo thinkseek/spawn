@@ -1071,23 +1071,26 @@ impl NodeShadows {
         };
         let requeued = matches!(
             &settled,
-            Ok(Some(outcome)) if outcome.ok && outcome.next == Some(spawn_postgres::FaultNext::Queued)
+            Ok(Some(spawn_postgres::FaultOutcome::Applied {
+                next: spawn_postgres::FaultNext::Queued,
+                ..
+            }))
         );
         match &settled {
-            Ok(Some(outcome)) => println!(
+            Ok(Some(spawn_postgres::FaultOutcome::Applied { next, poison, .. })) => println!(
                 "integrate: task {task}'s node shadow {}: {} ({}): strike {}, next {:?}{}",
                 row.job_id,
                 judged.evidence,
                 judged.reason,
                 judged.strike,
-                outcome.next,
-                if outcome.poison == Some(true) {
+                next,
+                if *poison {
                     ", the job is the poison"
                 } else {
                     ""
                 }
             ),
-            Ok(None) => {}
+            Ok(Some(spawn_postgres::FaultOutcome::NotApplied) | None) => {}
             Err(error) => eprintln!(
                 "integrate: task {task}'s node shadow {}: {error}",
                 row.job_id
@@ -1127,7 +1130,7 @@ fn node_name(
     row: &spawn_postgres::RemoteJob,
     stored: &remote::Stored,
 ) -> String {
-    let id = row.node_id.clone().unwrap_or_default();
+    let id = row.node_id().unwrap_or_default().to_string();
     store
         .nodes_v1()
         .ok()
@@ -1992,7 +1995,7 @@ mod tests {
         assert_eq!(records[0]["result"], "verdict");
         assert_eq!(world.ledger.strikes("n252"), (0, true));
         let row = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
-        assert_eq!(row.state, spawn_postgres::RemoteJobState::Completed);
+        assert_eq!(row.state(), spawn_postgres::RemoteJobState::Completed);
         assert!(
             !world
                 .ledger
@@ -2073,7 +2076,7 @@ mod tests {
         assert!(written.all().is_empty());
         assert_eq!(world.ledger.strikes("n252"), (1, false));
         let row = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
-        assert_eq!(row.state, spawn_postgres::RemoteJobState::Queued);
+        assert_eq!(row.state(), spawn_postgres::RemoteJobState::Queued);
         assert_eq!(row.excluded_nodes, vec![node.clone()]);
         nodes.settings.queue_wait = Duration::ZERO;
         nodes.poll(&world.ledger.store, &|record| {
@@ -2089,7 +2092,7 @@ mod tests {
                 .remote_job(&job_id)
                 .unwrap()
                 .unwrap()
-                .state,
+                .state(),
             spawn_postgres::RemoteJobState::FallbackLocal
         );
         assert!(world.ledger.records("task.gated").is_empty());
@@ -2127,11 +2130,17 @@ mod tests {
                 .remote_job(&orphan)
                 .unwrap()
                 .unwrap()
-                .state,
+                .state(),
             spawn_postgres::RemoteJobState::FallbackLocal
         );
         assert_eq!(
-            world.ledger.store.remote_job(&mine).unwrap().unwrap().state,
+            world
+                .ledger
+                .store
+                .remote_job(&mine)
+                .unwrap()
+                .unwrap()
+                .state(),
             spawn_postgres::RemoteJobState::Queued
         );
         assert_eq!(after.waiting(), vec![mine.clone()]);
@@ -2193,7 +2202,7 @@ mod tests {
                 .remote_job(&job_id)
                 .unwrap()
                 .unwrap()
-                .state,
+                .state(),
             spawn_postgres::RemoteJobState::Queued
         );
     }

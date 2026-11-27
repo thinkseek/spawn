@@ -444,7 +444,7 @@ fn m3a_an_acceptance_on_the_jobs_own_inputs_is_believed() {
     assert_eq!(world.ledger.strikes("n1"), (0, false));
     let row = world.job();
     assert_eq!(row.kind, RemoteJobKind::Gate);
-    assert_eq!(row.state, RemoteJobState::Completed);
+    assert_eq!(row.state(), RemoteJobState::Completed);
     assert_eq!(row.task_id, Some(7));
     assert_eq!(
         row.judging_id.as_deref(),
@@ -525,7 +525,7 @@ fn m3a_judges_a_rejection_again_here_and_m3b_believes_it() {
             assert!(why.contains("valid run"), "{why}");
         }
         assert_eq!(world.ledger.strikes("n1"), (0, false), "{case}");
-        assert_eq!(world.job().state, RemoteJobState::Completed, "{case}");
+        assert_eq!(world.job().state(), RemoteJobState::Completed, "{case}");
         assert!(world.job().excluded_nodes.is_empty(), "{case}");
         assert!(world.ledger.records("remote_job.host_fault").is_empty());
         world.no_task_record();
@@ -627,7 +627,7 @@ fn a_valid_run_resets_the_nodes_strikes_and_a_self_fenced_one_does_not() {
         valid_run_on_two_strikes(&ValidRun::new("valid_m3a_accepts", false, "accepted"));
     assert_eq!(believed(outcome).belief, "M3a");
     assert_eq!(strikes, (0, false), "an M3a acceptance resets the strikes");
-    assert_eq!(row.state, RemoteJobState::Completed);
+    assert_eq!(row.state(), RemoteJobState::Completed);
     assert_eq!(
         row.lease_epoch, 2,
         "the completion is judged: its epoch moved"
@@ -691,7 +691,7 @@ fn a_rejection_naming_only_test_database_errors_resets_no_strikes() {
         let (_, strikes, row) = valid_run_on_two_strikes(&db_only(cases[0], DB_ONLY_STDOUT, true));
         assert_eq!(strikes, (2, false), "{rule}: a DB-error-only rejection");
         assert_eq!(row.lease_epoch, 1, "{rule}: the completion is not judged");
-        assert_eq!(row.state, RemoteJobState::Completed);
+        assert_eq!(row.state(), RemoteJobState::Completed);
         let (_, strikes, row) = valid_run_on_two_strikes(&db_only(cases[1], WORK_STDOUT, true));
         assert_eq!(strikes, (0, false), "{rule}: a failure of the work's");
         assert_eq!(row.lease_epoch, 2);
@@ -966,7 +966,7 @@ fn every_fault_row_is_settled_on_the_ledger_and_judged_here() {
             .remote_job(&job)
             .expect("read")
             .expect("the job");
-        assert_eq!(row.state, state, "{name} {evidence}: {why}");
+        assert_eq!(row.state(), state, "{name} {evidence}: {why}");
         assert_eq!(
             world.ledger.strikes(&name),
             (strikes, false),
@@ -1019,7 +1019,7 @@ fn a_poison_pill_gives_the_first_node_its_strike_back_and_is_judged_here() {
     assert_eq!(world.ledger.strikes("na"), (0, false));
     assert_eq!(world.ledger.strikes("nb"), (0, false));
     let row = world.job();
-    assert_eq!(row.state, RemoteJobState::FallbackLocal);
+    assert_eq!(row.state(), RemoteJobState::FallbackLocal);
     assert_eq!(row.fault_nodes.len(), 2);
     let faults = world.ledger.records("remote_job.host_fault");
     assert_eq!(faults.last().unwrap()["poison"], true);
@@ -1040,7 +1040,7 @@ fn a_job_no_node_leases_in_its_wait_is_taken_back_and_judged_here() {
     let why = local_why(&outcome);
     assert!(why.contains("taken back"), "{why}");
     let row = world.job();
-    assert_eq!(row.state, RemoteJobState::FallbackLocal);
+    assert_eq!(row.state(), RemoteJobState::FallbackLocal);
     // A node beating afterwards is granted nothing.
     let mut late = world.node("late");
     assert!(late.beat().is_empty());
@@ -1064,7 +1064,7 @@ fn a_take_back_that_loses_to_a_lease_waits_for_the_nodes_result() {
         .remote_job(&job_id)
         .expect("read")
         .expect("the job");
-    assert_eq!(stale.state, RemoteJobState::Queued);
+    assert_eq!(stale.state(), RemoteJobState::Queued);
     // ... and a node was granted it before the take-back.
     let mut node = world.node("n1");
     let grant = node.beat().into_iter().next().expect("a grant");
@@ -1073,7 +1073,7 @@ fn a_take_back_that_loses_to_a_lease_waits_for_the_nodes_result() {
         Ok(Look::Raced)
     );
     let row = world.job();
-    assert_eq!(row.state, RemoteJobState::Leased);
+    assert_eq!(row.state(), RemoteJobState::Leased);
     // Its result is waited for, whatever the queue wait.
     let results = world.results();
     let ran = std::thread::spawn(move || {
@@ -1123,7 +1123,7 @@ fn a_judging_stopped_while_it_waits_takes_its_queued_job_back() {
         since.elapsed() < Duration::from_secs(10),
         "not the whole wait"
     );
-    assert_eq!(world.job().state, RemoteJobState::FallbackLocal);
+    assert_eq!(world.job().state(), RemoteJobState::FallbackLocal);
 
     let leased = Fixture::new("stopped_leased", false, Duration::from_secs(30));
     let job = leased
@@ -1144,7 +1144,7 @@ fn a_judging_stopped_while_it_waits_takes_its_queued_job_back() {
         &stop,
     );
     assert!(matches!(outcome, PrimaryOutcome::Stopped), "{outcome:?}");
-    assert_eq!(leased.job().state, RemoteJobState::Leased);
+    assert_eq!(leased.job().state(), RemoteJobState::Leased);
     leased.no_task_record();
 }
 
@@ -1168,7 +1168,8 @@ fn a_lease_fenced_back_to_the_queue_is_waited_for_again() {
         admin
             .execute(
                 "update spawn_remote_jobs set state = 'queued', lease_epoch = lease_epoch + 1,
-                        node_id = null, boot_id = null, grant_seq = null
+                        node_id = null, boot_id = null, lease_expires_ms = null,
+                        grace_until_ms = null, grant_seq = null
                   where job_id = $1",
                 &[&id],
             )
@@ -1199,7 +1200,7 @@ fn a_predecessors_queued_gate_job_is_taken_back_at_the_first_pass() {
         super::DEFAULT_GATES,
     );
     off.pass_on(&world.ledger.store).expect("a pass");
-    assert_eq!(world.job().state, RemoteJobState::Queued);
+    assert_eq!(world.job().state(), RemoteJobState::Queued);
     let on = Integrator::new(
         world.dir.0.join("host"),
         world.dir.0.join("gate.sh"),
@@ -1218,7 +1219,7 @@ fn a_predecessors_queued_gate_job_is_taken_back_at_the_first_pass() {
         .remote_job(&id)
         .expect("read")
         .expect("the job");
-    assert_eq!(row.state, RemoteJobState::FallbackLocal);
+    assert_eq!(row.state(), RemoteJobState::FallbackLocal);
     // Once: a job queued later is this integrator's own business.
     let later = remote::enqueue(
         &world.ledger.store,
@@ -1233,7 +1234,7 @@ fn a_predecessors_queued_gate_job_is_taken_back_at_the_first_pass() {
             .remote_job(&later)
             .expect("read")
             .expect("the job")
-            .state,
+            .state(),
         RemoteJobState::Queued
     );
     assert_eq!(

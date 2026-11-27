@@ -145,8 +145,127 @@ pub struct RemoteJobSpec {
     pub queue_wait_ms: Option<i64>,
 }
 
+/// Stored node enrollment/lifecycle state in `spawn_node_state.status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeStatus {
+    /// Enrolled by token only; waiting for node key registration.
+    Pending,
+    /// Key pinned and eligible for heartbeats and grants (subject to drain/degraded flags).
+    Active,
+    /// Permanently revoked by owner admin action.
+    Revoked,
+}
+
+impl NodeStatus {
+    /// Canonical lowercase wire/SQL representation (`pending`, `active`, `revoked`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+/// Completion artifacts and exit metadata recorded once a remote job finishes on a node.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoteJobResult {
+    /// Completion timestamp in epoch milliseconds.
+    pub finished_at_ms: i64,
+    /// Remote process exit code (`None` when terminated by signal or timeout without exit status).
+    pub exit_code: Option<i32>,
+    /// The node's result metadata object, as uploaded.
+    pub result: Value,
+    /// SHA-256 hex digest of the result artifact.
+    pub result_sha256: String,
+    /// SHA-256 hex digest of the captured log artifact.
+    pub log_sha256: String,
+    /// Byte length of the captured remote log (`0..=33_554_432`).
+    pub log_bytes: i64,
+}
+
+/// Closed lifecycle progress and stage-specific fields of a [`RemoteJob`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum RemoteJobProgress {
+    /// Waiting in the queue for a node lease.
+    Queued {
+        /// Queue deadline timestamp in epoch milliseconds, if bounded.
+        queue_deadline_ms: Option<i64>,
+    },
+    /// Actively leased to a node until `lease_expires_ms`.
+    Leased {
+        /// Node holding the current lease.
+        node_id: String,
+        /// Timestamp when the current attempt was leased, in epoch milliseconds.
+        leased_at_ms: i64,
+        /// Timestamp when the current lease expires, in epoch milliseconds.
+        lease_expires_ms: i64,
+    },
+    /// Lease expired or node finished execution; awaiting late result upload until `grace_until_ms`.
+    ResultPending {
+        /// Node holding the expired lease within grace.
+        node_id: String,
+        /// Timestamp when the current attempt was leased, in epoch milliseconds.
+        leased_at_ms: i64,
+        /// Original lease expiry timestamp in epoch milliseconds.
+        lease_expires_ms: i64,
+        /// Grace deadline timestamp in epoch milliseconds.
+        grace_until_ms: i64,
+    },
+    /// Completed on a node with verified result artifacts.
+    Completed {
+        /// Node that finished the run.
+        node_id: String,
+        /// Timestamp when the completed attempt was leased, if recorded.
+        leased_at_ms: Option<i64>,
+        /// Uploaded result metadata and artifact digests.
+        completion: RemoteJobResult,
+    },
+    /// Taken back or routed to run locally on the primary host.
+    FallbackLocal,
+    /// Exhausted all attempts for a build or batch job.
+    DeadLetter,
+    /// Cancelled after exhausting shadow attempts.
+    Cancelled,
+}
+
+impl RemoteJobProgress {
+    /// Projection back to the flat [`RemoteJobState`] tag.
+    pub const fn state(&self) -> RemoteJobState {
+        match self {
+            Self::Queued { .. } => RemoteJobState::Queued,
+            Self::Leased { .. } => RemoteJobState::Leased,
+            Self::ResultPending { .. } => RemoteJobState::ResultPending,
+            Self::Completed { .. } => RemoteJobState::Completed,
+            Self::FallbackLocal => RemoteJobState::FallbackLocal,
+            Self::DeadLetter => RemoteJobState::DeadLetter,
+            Self::Cancelled => RemoteJobState::Cancelled,
+        }
+    }
+
+    /// Active holder or finishing `node_id` for states that hold one.
+    pub fn node_id(&self) -> Option<&str> {
+        match self {
+            Self::Leased { node_id, .. }
+            | Self::ResultPending { node_id, .. }
+            | Self::Completed { node_id, .. } => Some(node_id.as_str()),
+            Self::Queued { .. } | Self::FallbackLocal | Self::DeadLetter | Self::Cancelled => None,
+        }
+    }
+
+    /// Uploaded completion details when in [`RemoteJobProgress::Completed`].
+    pub const fn completion(&self) -> Option<&RemoteJobResult> {
+        match self {
+            Self::Completed { completion, .. } => Some(completion),
+            _ => None,
+        }
+    }
+}
+
 /// A remote job as the ledger holds it.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(try_from = "RawRemoteJob")]
 pub struct RemoteJob {
     /// Unique job identifier (`spawn_remote_jobs.job_id`).
     pub job_id: String,
@@ -154,8 +273,6 @@ pub struct RemoteJob {
     pub cell_id: String,
     /// Kind of work performed (`gate`, `gate_shadow`, `build`, `de_batch`).
     pub kind: RemoteJobKind,
-    /// Current lifecycle state in the ledger.
-    pub state: RemoteJobState,
     /// Dispatch priority (higher executes first).
     pub priority: i32,
     /// Associated judging identifier, if any.
@@ -176,41 +293,295 @@ pub struct RemoteJob {
     pub excluded_nodes: Vec<String>,
     /// Nodes it faulted on.
     pub fault_nodes: Vec<String>,
-    /// The holder, while leased or pending (and the finisher, once done).
-    pub node_id: Option<String>,
     /// Moves at every grant and every fence: only the current epoch's
     /// result is believed.
     pub lease_epoch: i64,
-    /// Timestamp when the current lease expires, in epoch milliseconds.
-    pub lease_expires_ms: Option<i64>,
-    /// Timestamp until which a late result is accepted after lease expiry.
-    pub grace_until_ms: Option<i64>,
     /// Total execution attempts used so far.
     pub attempts: i32,
     /// Maximum attempts permitted before fallback or dead-lettering.
     pub max_attempts: i32,
     /// Timestamp when the job was first enqueued, in epoch milliseconds.
     pub enqueued_at_ms: i64,
-    /// Queue deadline timestamp in epoch milliseconds, if bounded.
-    pub queue_deadline_ms: Option<i64>,
-    /// Timestamp when the current attempt was leased, in epoch milliseconds.
-    pub leased_at_ms: Option<i64>,
-    /// Completion timestamp in epoch milliseconds, once finished.
-    pub finished_at_ms: Option<i64>,
-    /// Remote process exit code, once finished.
-    pub exit_code: Option<i32>,
-    /// The node's result metadata, as it sent it.
-    pub result: Option<Value>,
-    /// SHA-256 hex digest of the result artifact, if uploaded.
-    pub result_sha256: Option<String>,
-    /// SHA-256 hex digest of the captured log artifact, if uploaded.
-    pub log_sha256: Option<String>,
-    /// Byte length of the captured remote log, if known.
-    pub log_bytes: Option<i64>,
+    /// Closed lifecycle stage and stage-owned timestamps, node holder, and result.
+    pub progress: RemoteJobProgress,
+}
+
+impl RemoteJob {
+    /// Current lifecycle state tag derived from [`Self::progress`].
+    pub const fn state(&self) -> RemoteJobState {
+        self.progress.state()
+    }
+
+    /// Holder or finishing `node_id` derived from [`Self::progress`].
+    pub fn node_id(&self) -> Option<&str> {
+        self.progress.node_id()
+    }
+
+    /// Completion artifacts when [`Self::progress`] is [`RemoteJobProgress::Completed`].
+    pub const fn completion(&self) -> Option<&RemoteJobResult> {
+        self.progress.completion()
+    }
+}
+
+#[derive(Deserialize)]
+struct RawRemoteJob {
+    job_id: String,
+    cell_id: String,
+    kind: RemoteJobKind,
+    state: RemoteJobState,
+    priority: i32,
+    judging_id: Option<String>,
+    mission_id: Option<i64>,
+    task_id: Option<i64>,
+    spec: Value,
+    requires: Value,
+    cost: Value,
+    base_commit: Option<String>,
+    excluded_nodes: Vec<String>,
+    fault_nodes: Vec<String>,
+    node_id: Option<String>,
+    lease_epoch: i64,
+    lease_expires_ms: Option<i64>,
+    grace_until_ms: Option<i64>,
+    attempts: i32,
+    max_attempts: i32,
+    enqueued_at_ms: i64,
+    queue_deadline_ms: Option<i64>,
+    leased_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
+    exit_code: Option<i32>,
+    result: Option<Value>,
+    result_sha256: Option<String>,
+    log_sha256: Option<String>,
+    log_bytes: Option<i64>,
+}
+
+const MAX_REMOTE_LOG_BYTES: i64 = 33_554_432;
+
+fn raw_has_completion_fields(raw: &RawRemoteJob) -> bool {
+    raw.finished_at_ms.is_some()
+        || raw.exit_code.is_some()
+        || raw.result.is_some()
+        || raw.result_sha256.is_some()
+        || raw.log_sha256.is_some()
+        || raw.log_bytes.is_some()
+}
+
+fn require_non_empty<'a>(
+    opt: Option<&'a str>,
+    field: &str,
+    state: &str,
+) -> Result<&'a str, String> {
+    let val = opt.ok_or_else(|| format!("remote_job state {state} requires non-null {field}"))?;
+    if val.is_empty() {
+        return Err(format!(
+            "remote_job state {state} requires non-empty {field}"
+        ));
+    }
+    Ok(val)
+}
+
+fn forbid_active_lease_timers(raw: &RawRemoteJob, state: &str) -> Result<(), String> {
+    if raw.lease_expires_ms.is_some() {
+        return Err(format!(
+            "remote_job state {state} must not have lease_expires_ms"
+        ));
+    }
+    if raw.grace_until_ms.is_some() {
+        return Err(format!(
+            "remote_job state {state} must not have grace_until_ms"
+        ));
+    }
+    Ok(())
+}
+
+fn decode_remote_job_progress(raw: &mut RawRemoteJob) -> Result<RemoteJobProgress, String> {
+    let prior_exclusions = !raw.excluded_nodes.is_empty();
+    let has_completion = raw_has_completion_fields(raw);
+    match raw.state {
+        RemoteJobState::Queued => {
+            if raw.node_id.is_some() {
+                return Err("remote_job state queued must not have node_id".to_string());
+            }
+            forbid_active_lease_timers(raw, "queued")?;
+            if !prior_exclusions && has_completion {
+                return Err(
+                    "remote_job state queued without excluded_nodes must not have completion fields"
+                        .to_string(),
+                );
+            }
+            Ok(RemoteJobProgress::Queued {
+                queue_deadline_ms: raw.queue_deadline_ms,
+            })
+        }
+        RemoteJobState::Leased => {
+            if raw.grace_until_ms.is_some() {
+                return Err("remote_job state leased must not have grace_until_ms".to_string());
+            }
+            if !prior_exclusions && has_completion {
+                return Err(
+                    "remote_job state leased without excluded_nodes must not have completion fields"
+                        .to_string(),
+                );
+            }
+            let node_id =
+                require_non_empty(raw.node_id.as_deref(), "node_id", "leased")?.to_string();
+            let leased_at_ms = raw
+                .leased_at_ms
+                .ok_or_else(|| "remote_job state leased requires leased_at_ms".to_string())?;
+            let lease_expires_ms = raw
+                .lease_expires_ms
+                .ok_or_else(|| "remote_job state leased requires lease_expires_ms".to_string())?;
+            Ok(RemoteJobProgress::Leased {
+                node_id,
+                leased_at_ms,
+                lease_expires_ms,
+            })
+        }
+        RemoteJobState::ResultPending => {
+            if !prior_exclusions && has_completion {
+                return Err(
+                    "remote_job state result_pending without excluded_nodes must not have completion fields"
+                        .to_string(),
+                );
+            }
+            let node_id =
+                require_non_empty(raw.node_id.as_deref(), "node_id", "result_pending")?.to_string();
+            let leased_at_ms = raw.leased_at_ms.ok_or_else(|| {
+                "remote_job state result_pending requires leased_at_ms".to_string()
+            })?;
+            let lease_expires_ms = raw.lease_expires_ms.ok_or_else(|| {
+                "remote_job state result_pending requires lease_expires_ms".to_string()
+            })?;
+            let grace_until_ms = raw.grace_until_ms.ok_or_else(|| {
+                "remote_job state result_pending requires grace_until_ms".to_string()
+            })?;
+            Ok(RemoteJobProgress::ResultPending {
+                node_id,
+                leased_at_ms,
+                lease_expires_ms,
+                grace_until_ms,
+            })
+        }
+        RemoteJobState::Completed => decode_completed_progress(raw),
+        RemoteJobState::FallbackLocal | RemoteJobState::DeadLetter => {
+            let label = match raw.state {
+                RemoteJobState::FallbackLocal => "fallback_local",
+                _ => "dead_letter",
+            };
+            forbid_active_lease_timers(raw, label)?;
+            if raw.node_id.is_some() && !prior_exclusions {
+                return Err(format!(
+                    "remote_job state {label} with node_id requires non-empty excluded_nodes"
+                ));
+            }
+            Ok(if raw.state == RemoteJobState::FallbackLocal {
+                RemoteJobProgress::FallbackLocal
+            } else {
+                RemoteJobProgress::DeadLetter
+            })
+        }
+        RemoteJobState::Cancelled => {
+            if raw.node_id.is_some() {
+                return Err("remote_job state cancelled must not have node_id".to_string());
+            }
+            forbid_active_lease_timers(raw, "cancelled")?;
+            Ok(RemoteJobProgress::Cancelled)
+        }
+    }
+}
+
+fn decode_completed_progress(raw: &mut RawRemoteJob) -> Result<RemoteJobProgress, String> {
+    forbid_active_lease_timers(raw, "completed")?;
+    let node_id = require_non_empty(raw.node_id.as_deref(), "node_id", "completed")?.to_string();
+    let finished_at_ms = raw
+        .finished_at_ms
+        .ok_or_else(|| "remote_job state completed requires finished_at_ms".to_string())?;
+    let result = raw
+        .result
+        .take()
+        .ok_or_else(|| "remote_job state completed requires result".to_string())?;
+    if !result.is_object() {
+        return Err("remote_job state completed requires result JSON object".to_string());
+    }
+    let result_sha256 =
+        require_non_empty(raw.result_sha256.as_deref(), "result_sha256", "completed")?.to_string();
+    let log_sha256 =
+        require_non_empty(raw.log_sha256.as_deref(), "log_sha256", "completed")?.to_string();
+    let log_bytes = raw
+        .log_bytes
+        .ok_or_else(|| "remote_job state completed requires log_bytes".to_string())?;
+    if !(0..=MAX_REMOTE_LOG_BYTES).contains(&log_bytes) {
+        return Err(format!(
+            "remote_job state completed log_bytes {log_bytes} out of range 0..={MAX_REMOTE_LOG_BYTES}"
+        ));
+    }
+    Ok(RemoteJobProgress::Completed {
+        node_id,
+        leased_at_ms: raw.leased_at_ms,
+        completion: RemoteJobResult {
+            finished_at_ms,
+            exit_code: raw.exit_code,
+            result,
+            result_sha256,
+            log_sha256,
+            log_bytes,
+        },
+    })
+}
+
+impl TryFrom<RawRemoteJob> for RemoteJob {
+    type Error = String;
+
+    fn try_from(mut raw: RawRemoteJob) -> Result<Self, String> {
+        if raw.attempts < 0 {
+            return Err(format!(
+                "remote_job attempts {} must be non-negative",
+                raw.attempts
+            ));
+        }
+        if raw.max_attempts < 1 {
+            return Err(format!(
+                "remote_job max_attempts {} must be at least 1",
+                raw.max_attempts
+            ));
+        }
+        if raw.lease_epoch < 0 {
+            return Err(format!(
+                "remote_job lease_epoch {} must be non-negative",
+                raw.lease_epoch
+            ));
+        }
+        if raw.node_id.as_deref() == Some("") {
+            return Err("remote_job node_id must not be empty".to_string());
+        }
+        let progress = decode_remote_job_progress(&mut raw)?;
+        Ok(Self {
+            job_id: raw.job_id,
+            cell_id: raw.cell_id,
+            kind: raw.kind,
+            priority: raw.priority,
+            judging_id: raw.judging_id,
+            mission_id: raw.mission_id,
+            task_id: raw.task_id,
+            spec: raw.spec,
+            requires: raw.requires,
+            cost: raw.cost,
+            base_commit: raw.base_commit,
+            excluded_nodes: raw.excluded_nodes,
+            fault_nodes: raw.fault_nodes,
+            lease_epoch: raw.lease_epoch,
+            attempts: raw.attempts,
+            max_attempts: raw.max_attempts,
+            enqueued_at_ms: raw.enqueued_at_ms,
+            progress,
+        })
+    }
 }
 
 /// A v1 node as the ledger holds it (its key and token digest left out).
 #[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(try_from = "RawNodeV1")]
 pub struct NodeV1 {
     /// Human-readable unique node name.
     pub name: String,
@@ -219,7 +590,7 @@ pub struct NodeV1 {
     /// Scheduling cell identifier (`c0` by default).
     pub cell_id: String,
     /// `pending`, `active` or `revoked`.
-    pub status: String,
+    pub status: NodeStatus,
     /// Whether an administrator drained this node from receiving new leases.
     pub drained: bool,
     /// Three strikes: no grants until an undrain.
@@ -252,6 +623,68 @@ pub struct NodeV1 {
     /// (printable ASCII, at most 64 bytes); none when not sent.
     #[serde(default)]
     pub node_version: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawNodeV1 {
+    name: String,
+    node_id: Option<String>,
+    cell_id: String,
+    status: NodeStatus,
+    drained: bool,
+    degraded: bool,
+    lost_recorded: bool,
+    host_fault_strikes: i32,
+    boot_id: Option<String>,
+    beat_seq: i64,
+    last_beat_ms: Option<i64>,
+    spec_sha256: Option<String>,
+    spec: Option<Value>,
+    warm_bases: Vec<String>,
+    #[serde(default)]
+    power: Option<Value>,
+    #[serde(default)]
+    build_sha: Option<String>,
+    #[serde(default)]
+    node_version: Option<String>,
+}
+
+impl TryFrom<RawNodeV1> for NodeV1 {
+    type Error = String;
+
+    fn try_from(raw: RawNodeV1) -> Result<Self, String> {
+        if raw.status == NodeStatus::Active && raw.node_id.is_none() {
+            return Err("active node missing node_id".to_string());
+        }
+        if raw.status == NodeStatus::Pending && raw.node_id.is_some() {
+            return Err("pending node must not hold node_id".to_string());
+        }
+        if raw.host_fault_strikes < 0 {
+            return Err(format!(
+                "node host_fault_strikes {} must be non-negative",
+                raw.host_fault_strikes
+            ));
+        }
+        Ok(Self {
+            name: raw.name,
+            node_id: raw.node_id,
+            cell_id: raw.cell_id,
+            status: raw.status,
+            drained: raw.drained,
+            degraded: raw.degraded,
+            lost_recorded: raw.lost_recorded,
+            host_fault_strikes: raw.host_fault_strikes,
+            boot_id: raw.boot_id,
+            beat_seq: raw.beat_seq,
+            last_beat_ms: raw.last_beat_ms,
+            spec_sha256: raw.spec_sha256,
+            spec: raw.spec,
+            warm_bases: raw.warm_bases,
+            power: raw.power,
+            build_sha: raw.build_sha,
+            node_version: raw.node_version,
+        })
+    }
 }
 
 /// The fields `nodes_v1`/`node_v1` read out of a node's last beat
@@ -344,25 +777,164 @@ impl FaultNext {
     }
 }
 
-/// What a fault judging did: `ok` false when the job is not completed at
-/// that epoch, or was judged already.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub struct FaultOutcome {
-    /// Whether the fault transition applied cleanly at the requested epoch.
-    pub ok: bool,
-    /// Where the job went (the poison rule and the attempts may override
-    /// the asked one).
+/// Strike count recorded by a non-poison applied [`FaultOutcome`] (`>= 1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FaultStrike {
+    strikes: i32,
+}
+
+impl FaultStrike {
+    /// Consecutive strikes required to mark a node degraded.
+    pub const DEGRADED_THRESHOLD: i32 = 3;
+
+    /// Construct a validated strike count (`strikes >= 1`).
+    pub const fn new(strikes: i32) -> Option<Self> {
+        if strikes >= 1 {
+            Some(Self { strikes })
+        } else {
+            None
+        }
+    }
+
+    /// Positive strike count after this fault was applied.
+    pub const fn strikes(self) -> i32 {
+        self.strikes
+    }
+
+    /// Whether this strike count crossed [`Self::DEGRADED_THRESHOLD`].
+    pub const fn degraded(self) -> bool {
+        self.strikes >= Self::DEGRADED_THRESHOLD
+    }
+}
+
+/// Closed outcome of judging a completed remote job as a host fault (`spawn_remote_job_fault`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawFaultOutcome")]
+pub enum FaultOutcome {
+    /// Job was not completed at that lease epoch or had already been judged.
+    NotApplied,
+    /// Fault judging applied cleanly at the requested epoch.
+    Applied {
+        /// Where the job transitioned next (`queued`, `fallback_local`, `dead_letter`, or `keep`).
+        next: FaultNext,
+        /// True when a prior node already faulted on the same job (earlier strikes refunded).
+        poison: bool,
+        /// Strike state if this fault recorded a strike (`None` when `strike == false` or `poison`).
+        strike: Option<FaultStrike>,
+    },
+}
+
+impl FaultOutcome {
+    /// Whether this fault judgement applied at the requested lease epoch.
+    pub const fn is_applied(self) -> bool {
+        matches!(self, Self::Applied { .. })
+    }
+
+    /// Destination state after an applied fault, or `None` when not applied.
+    pub const fn next(self) -> Option<FaultNext> {
+        match self {
+            Self::NotApplied => None,
+            Self::Applied { next, .. } => Some(next),
+        }
+    }
+
+    /// Whether the fault was classified as a poison-pill job.
+    pub const fn is_poison(self) -> bool {
+        matches!(self, Self::Applied { poison: true, .. })
+    }
+
+    /// Strike state recorded for the faulted node, if any.
+    pub const fn strike(self) -> Option<FaultStrike> {
+        match self {
+            Self::NotApplied => None,
+            Self::Applied { strike, .. } => strike,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFaultOutcome {
+    ok: bool,
     #[serde(default)]
-    pub next: Option<FaultNext>,
-    /// The job faulted on another node before: the cause, not they.
+    next: Option<FaultNext>,
     #[serde(default)]
-    pub poison: Option<bool>,
-    /// The node's strikes after a strike.
+    poison: Option<bool>,
     #[serde(default)]
-    pub strikes: Option<i32>,
-    /// Whether the node crossed the strike limit and is now marked degraded.
+    strikes: Option<i32>,
     #[serde(default)]
-    pub degraded: Option<bool>,
+    degraded: Option<bool>,
+}
+
+impl TryFrom<RawFaultOutcome> for FaultOutcome {
+    type Error = String;
+
+    fn try_from(raw: RawFaultOutcome) -> Result<Self, String> {
+        if !raw.ok {
+            if raw.next.is_some()
+                || raw.poison.is_some()
+                || raw.strikes.is_some()
+                || raw.degraded.is_some()
+            {
+                return Err(
+                    "fault outcome ok=false must not carry next, poison, strikes, or degraded"
+                        .to_string(),
+                );
+            }
+            return Ok(Self::NotApplied);
+        }
+
+        let next = raw
+            .next
+            .ok_or_else(|| "fault outcome ok=true missing next".to_string())?;
+        let poison = raw
+            .poison
+            .ok_or_else(|| "fault outcome ok=true missing poison".to_string())?;
+        let degraded = raw
+            .degraded
+            .ok_or_else(|| "fault outcome ok=true missing degraded".to_string())?;
+
+        if poison {
+            if next == FaultNext::Queued {
+                return Err("poison fault outcome must not transition to queued".to_string());
+            }
+            if raw.strikes.is_some() || degraded {
+                return Err("poison fault outcome must not carry strikes or degraded".to_string());
+            }
+            return Ok(Self::Applied {
+                next,
+                poison: true,
+                strike: None,
+            });
+        }
+
+        if let Some(count) = raw.strikes {
+            let strike = FaultStrike::new(count)
+                .ok_or_else(|| format!("applied fault outcome strikes {count} must be positive"))?;
+            if degraded != strike.degraded() {
+                return Err(format!(
+                    "fault outcome degraded={degraded} inconsistent with strikes={count}"
+                ));
+            }
+            Ok(Self::Applied {
+                next,
+                poison: false,
+                strike: Some(strike),
+            })
+        } else {
+            if degraded {
+                return Err(
+                    "applied fault outcome without strikes must not report degraded=true"
+                        .to_string(),
+                );
+            }
+            Ok(Self::Applied {
+                next,
+                poison: false,
+                strike: None,
+            })
+        }
+    }
 }
 
 /// What a sweep did: leases now waiting for a result, leases fenced after
@@ -623,5 +1195,332 @@ impl PostgresStore {
         )?
         .map(decode)
         .transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{
+        FaultNext, FaultOutcome, FaultStrike, NodeStatus, NodeV1, RemoteJob, RemoteJobProgress,
+        RemoteJobState,
+    };
+
+    fn base_node_json() -> Value {
+        json!({
+            "name": "n252",
+            "node_id": "a".repeat(64),
+            "cell_id": "c0",
+            "status": "active",
+            "drained": false,
+            "degraded": false,
+            "lost_recorded": false,
+            "host_fault_strikes": 0,
+            "boot_id": "0".repeat(32),
+            "beat_seq": 1,
+            "last_beat_ms": 1_000_000,
+            "spec_sha256": "b".repeat(64),
+            "spec": null,
+            "warm_bases": [],
+            "power": null,
+            "build_sha": null,
+            "node_version": null,
+            "seq_hi": 1
+        })
+    }
+
+    fn base_job_json() -> Value {
+        json!({
+            "job_id": "gate-00000001",
+            "cell_id": "c0",
+            "kind": "gate",
+            "state": "queued",
+            "priority": 0,
+            "judging_id": null,
+            "mission_id": 1,
+            "task_id": 2,
+            "spec": {},
+            "requires": {},
+            "cost": {},
+            "base_commit": null,
+            "excluded_nodes": [],
+            "fault_nodes": [],
+            "node_id": null,
+            "boot_id": null,
+            "lease_epoch": 0,
+            "lease_expires_ms": null,
+            "grace_until_ms": null,
+            "grant_seq": null,
+            "attempts": 0,
+            "max_attempts": 2,
+            "enqueued_at_ms": 1_000,
+            "queue_deadline_ms": 31_000,
+            "leased_at_ms": null,
+            "finished_at_ms": null,
+            "exit_code": null,
+            "result": null,
+            "result_sha256": null,
+            "log_sha256": null,
+            "log_bytes": null
+        })
+    }
+
+    #[test]
+    fn node_status_serde_and_node_v1_invariants() {
+        for (status, wire) in [
+            (NodeStatus::Pending, "\"pending\""),
+            (NodeStatus::Active, "\"active\""),
+            (NodeStatus::Revoked, "\"revoked\""),
+        ] {
+            assert_eq!(serde_json::to_string(&status).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<NodeStatus>(wire).unwrap(), status);
+            assert_eq!(format!("\"{}\"", status.as_str()), wire);
+        }
+
+        let active: NodeV1 = serde_json::from_value(base_node_json()).unwrap();
+        assert_eq!(active.status, NodeStatus::Active);
+
+        let mut pending_json = base_node_json();
+        pending_json["status"] = json!("pending");
+        pending_json["node_id"] = Value::Null;
+        assert_eq!(
+            serde_json::from_value::<NodeV1>(pending_json)
+                .unwrap()
+                .status,
+            NodeStatus::Pending
+        );
+
+        let mut revoked_unenrolled = base_node_json();
+        revoked_unenrolled["status"] = json!("revoked");
+        revoked_unenrolled["node_id"] = Value::Null;
+        assert_eq!(
+            serde_json::from_value::<NodeV1>(revoked_unenrolled)
+                .unwrap()
+                .status,
+            NodeStatus::Revoked
+        );
+
+        for (field, val) in [
+            ("status", json!("lost")),
+            ("node_id", Value::Null),
+            ("host_fault_strikes", json!(-1)),
+        ] {
+            let mut bad = base_node_json();
+            bad[field] = val;
+            assert!(serde_json::from_value::<NodeV1>(bad).is_err(), "{field}");
+        }
+
+        let mut pending_with_id = base_node_json();
+        pending_with_id["status"] = json!("pending");
+        assert!(serde_json::from_value::<NodeV1>(pending_with_id).is_err());
+    }
+
+    #[test]
+    fn fault_outcome_decodes_closed_variants_and_rejects_contradictions() {
+        assert_eq!(
+            serde_json::from_value::<FaultOutcome>(json!({"ok": false})).unwrap(),
+            FaultOutcome::NotApplied
+        );
+        assert_eq!(
+            serde_json::from_value::<FaultOutcome>(json!({
+                "ok": true, "next": "queued", "poison": false, "strikes": 1, "degraded": false
+            }))
+            .unwrap(),
+            FaultOutcome::Applied {
+                next: FaultNext::Queued,
+                poison: false,
+                strike: FaultStrike::new(1),
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<FaultOutcome>(json!({
+                "ok": true, "next": "fallback_local", "poison": false, "strikes": 3, "degraded": true
+            }))
+            .unwrap(),
+            FaultOutcome::Applied {
+                next: FaultNext::FallbackLocal,
+                poison: false,
+                strike: FaultStrike::new(3),
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<FaultOutcome>(json!({
+                "ok": true, "next": "fallback_local", "poison": true, "strikes": null, "degraded": false
+            }))
+            .unwrap(),
+            FaultOutcome::Applied {
+                next: FaultNext::FallbackLocal,
+                poison: true,
+                strike: None,
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<FaultOutcome>(json!({
+                "ok": true, "next": "keep", "poison": false, "strikes": null, "degraded": false
+            }))
+            .unwrap(),
+            FaultOutcome::Applied {
+                next: FaultNext::Keep,
+                poison: false,
+                strike: None,
+            }
+        );
+
+        for invalid in [
+            json!({"ok": false, "next": "queued"}),
+            json!({"ok": false, "poison": false}),
+            json!({"ok": false, "strikes": 1}),
+            json!({"ok": false, "degraded": true}),
+            json!({"ok": true, "next": "queued", "poison": false}),
+            json!({"ok": true, "next": "queued", "poison": true, "strikes": null, "degraded": false}),
+            json!({"ok": true, "next": "fallback_local", "poison": true, "strikes": 1, "degraded": false}),
+            json!({"ok": true, "next": "fallback_local", "poison": true, "strikes": null, "degraded": true}),
+            json!({"ok": true, "next": "queued", "poison": false, "strikes": 0, "degraded": false}),
+            json!({"ok": true, "next": "queued", "poison": false, "strikes": 2, "degraded": true}),
+            json!({"ok": true, "next": "queued", "poison": false, "strikes": 3, "degraded": false}),
+            json!({"ok": true, "next": "queued", "poison": false, "strikes": null, "degraded": true}),
+            json!({"ok": false, "unexpected": 1}),
+        ] {
+            assert!(
+                serde_json::from_value::<FaultOutcome>(invalid.clone()).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_job_decodes_all_valid_states() {
+        let queued: RemoteJob = serde_json::from_value(base_job_json()).unwrap();
+        assert_eq!(queued.state(), RemoteJobState::Queued);
+        assert!(matches!(
+            queued.progress,
+            RemoteJobProgress::Queued {
+                queue_deadline_ms: Some(31_000)
+            }
+        ));
+
+        let mut leased = base_job_json();
+        leased["state"] = json!("leased");
+        leased["node_id"] = json!("n1");
+        leased["leased_at_ms"] = json!(2_000);
+        leased["lease_expires_ms"] = json!(92_000);
+        leased["lease_epoch"] = json!(1);
+        leased["attempts"] = json!(1);
+        let decoded: RemoteJob = serde_json::from_value(leased.clone()).unwrap();
+        assert_eq!(decoded.node_id(), Some("n1"));
+
+        leased["state"] = json!("result_pending");
+        leased["grace_until_ms"] = json!(272_000);
+        assert_eq!(
+            serde_json::from_value::<RemoteJob>(leased).unwrap().state(),
+            RemoteJobState::ResultPending
+        );
+
+        let mut completed = base_job_json();
+        completed["state"] = json!("completed");
+        completed["node_id"] = json!("n1");
+        completed["finished_at_ms"] = json!(5_000);
+        completed["result"] = json!({"exit_code": null});
+        completed["result_sha256"] = json!("c".repeat(64));
+        completed["log_sha256"] = json!("d".repeat(64));
+        completed["log_bytes"] = json!(0);
+        let done: RemoteJob = serde_json::from_value(completed.clone()).unwrap();
+        assert_eq!(done.completion().unwrap().exit_code, None);
+
+        // Fault re-queued with residual prior completion columns stays valid when excluded_nodes is set.
+        let mut requeued = completed.clone();
+        requeued["state"] = json!("queued");
+        requeued["node_id"] = Value::Null;
+        requeued["excluded_nodes"] = json!(["n1"]);
+        assert_eq!(
+            serde_json::from_value::<RemoteJob>(requeued)
+                .unwrap()
+                .state(),
+            RemoteJobState::Queued
+        );
+
+        let mut local = base_job_json();
+        local["state"] = json!("fallback_local");
+        local["finished_at_ms"] = json!(6_000);
+        assert_eq!(
+            serde_json::from_value::<RemoteJob>(local).unwrap().state(),
+            RemoteJobState::FallbackLocal
+        );
+
+        let mut dead = completed;
+        dead["state"] = json!("dead_letter");
+        dead["excluded_nodes"] = json!(["n1"]);
+        assert_eq!(
+            serde_json::from_value::<RemoteJob>(dead).unwrap().state(),
+            RemoteJobState::DeadLetter
+        );
+
+        let mut cancelled = base_job_json();
+        cancelled["state"] = json!("cancelled");
+        assert_eq!(
+            serde_json::from_value::<RemoteJob>(cancelled)
+                .unwrap()
+                .state(),
+            RemoteJobState::Cancelled
+        );
+    }
+
+    #[test]
+    fn remote_job_rejects_illegal_cross_field_rows() {
+        let mut q_node = base_job_json();
+        q_node["node_id"] = json!("n1");
+        let mut q_exp = base_job_json();
+        q_exp["lease_expires_ms"] = json!(10);
+        let mut q_res = base_job_json();
+        q_res["result"] = json!({});
+
+        let mut l_no_node = base_job_json();
+        l_no_node["state"] = json!("leased");
+        l_no_node["leased_at_ms"] = json!(2_000);
+        l_no_node["lease_expires_ms"] = json!(92_000);
+
+        let mut l_grace = l_no_node.clone();
+        l_grace["node_id"] = json!("n1");
+        l_grace["grace_until_ms"] = json!(100_000);
+
+        let mut rp_no_grace = l_no_node.clone();
+        rp_no_grace["state"] = json!("result_pending");
+        rp_no_grace["node_id"] = json!("n1");
+
+        let mut c_no_sha = base_job_json();
+        c_no_sha["state"] = json!("completed");
+        c_no_sha["node_id"] = json!("n1");
+        c_no_sha["finished_at_ms"] = json!(5_000);
+        c_no_sha["result"] = json!({});
+        c_no_sha["log_sha256"] = json!("d".repeat(64));
+        c_no_sha["log_bytes"] = json!(0);
+
+        let mut c_timer = c_no_sha.clone();
+        c_timer["result_sha256"] = json!("c".repeat(64));
+        c_timer["lease_expires_ms"] = json!(9_000);
+
+        let mut fb_node_unexcluded = base_job_json();
+        fb_node_unexcluded["state"] = json!("fallback_local");
+        fb_node_unexcluded["node_id"] = json!("n1");
+
+        let mut cancelled_node = base_job_json();
+        cancelled_node["state"] = json!("cancelled");
+        cancelled_node["node_id"] = json!("n1");
+
+        for (label, row) in [
+            ("queued with node_id", q_node),
+            ("queued with lease_expires_ms", q_exp),
+            ("queued unexcluded with result", q_res),
+            ("leased without node_id", l_no_node),
+            ("leased with grace_until_ms", l_grace),
+            ("result_pending without grace_until_ms", rp_no_grace),
+            ("completed missing result_sha256", c_no_sha),
+            ("completed with lease_expires_ms", c_timer),
+            ("fallback_local with unexcluded node", fb_node_unexcluded),
+            ("cancelled with node_id", cancelled_node),
+        ] {
+            assert!(serde_json::from_value::<RemoteJob>(row).is_err(), "{label}");
+        }
     }
 }

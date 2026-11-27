@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use spawn_node_proto::PublicKey;
 use spawn_node_proto::enroll::EnrollToken;
-use spawn_postgres::{NodeAction, NodeV1, PostgresStore};
+use spawn_postgres::{NodeAction, NodeStatus, NodeV1, PostgresStore};
 
 use super::{USAGE, name_word, now_ms, open_store, power};
 
@@ -209,10 +209,10 @@ pub(super) fn drain(
 /// A v1 node's state in a word or two: `pending`, `revoked`, `lost`,
 /// `active`, with `drained` and `degraded` added.
 fn state_of(node: &NodeV1, now: i64) -> String {
-    let mut state = if node.status == "active" && is_lost(node, now) {
+    let mut state = if node.status == NodeStatus::Active && is_lost(node, now) {
         "lost".to_string()
     } else {
-        node.status.clone()
+        node.status.as_str().to_string()
     };
     if node.drained {
         state.push_str(",drained");
@@ -224,7 +224,7 @@ fn state_of(node: &NodeV1, now: i64) -> String {
 }
 
 fn is_lost(node: &NodeV1, now: i64) -> bool {
-    node.status == "active"
+    node.status == NodeStatus::Active
         && node
             .last_beat_ms
             .is_none_or(|beat| now.saturating_sub(beat) > LOST_AFTER_MS)
@@ -352,7 +352,8 @@ fn v1_json_with_soft_drain(v1: &[NodeV1], now: i64, threshold: u8) -> Vec<Value>
                 let mut obj = json_of(node, now);
                 let mapped = if node.drained {
                     "drained"
-                } else if node.status == "active" && !is_lost(node, now) && !node.degraded {
+                } else if node.status == NodeStatus::Active && !is_lost(node, now) && !node.degraded
+                {
                     "live"
                 } else {
                     original_state.as_str()
@@ -456,7 +457,7 @@ mod tests {
                 "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c".into(),
             ),
             cell_id: "c0".into(),
-            status: "active".into(),
+            status: NodeStatus::Active,
             drained: false,
             degraded: false,
             lost_recorded: false,
@@ -576,7 +577,7 @@ mod tests {
         let mut silent = node("n3");
         silent.last_beat_ms = Some(100);
         let mut pending = node("n4");
-        pending.status = "pending".into();
+        pending.status = NodeStatus::Pending;
         pending.node_id = None;
         pending.last_beat_ms = None;
         let v1 = vec![node("n1"), drained, silent, pending];
@@ -600,9 +601,11 @@ mod tests {
         assert_eq!(merged.len(), 5);
         assert_eq!(merged[0], p1[0]);
         assert_eq!(merged[1]["proto"], "node-v1");
+        assert_eq!(merged[1]["status"], "active");
         assert_eq!(merged[2]["degraded"], true);
         assert_eq!(merged[2]["host_fault_strikes"], 3);
         assert_eq!(merged[3]["lost"], true);
+        assert_eq!(merged[4]["status"], "pending");
         assert_eq!(merged[4]["node_id"], Value::Null);
         assert_eq!(merged_json(Value::Null, &[], now), json!([]));
     }
@@ -621,7 +624,7 @@ mod tests {
         assert!(token.as_str().starts_with("sne1."));
         assert!(expires > now_ms() - 60_000 && expires <= now_ms() + TOKEN_TTL_MS + 60_000);
         let pending = store.node_v1("n252").unwrap().expect("the pending node");
-        assert_eq!(pending.status, "pending");
+        assert_eq!(pending.status, NodeStatus::Pending);
         assert_eq!(pending.cell_id, "c0");
         // A new token for the same name replaces the old one.
         enroll_token(&store, "n252", None, &primary).unwrap();
@@ -698,7 +701,10 @@ mod tests {
             revoke(&store, "n252").unwrap(),
             "node n252: revoked already"
         );
-        assert_eq!(store.node_v1("n252").unwrap().unwrap().status, "revoked");
+        assert_eq!(
+            store.node_v1("n252").unwrap().unwrap().status,
+            NodeStatus::Revoked
+        );
         assert!(enroll_token(&store, "n252", None, &primary).is_err());
         assert!(revoke(&store, "nobody").is_err());
     }

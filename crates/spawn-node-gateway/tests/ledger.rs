@@ -24,7 +24,9 @@ use spawn_node_proto::heartbeat::Ack;
 use spawn_node_proto::result::ResultMeta;
 use spawn_node_proto::{Method, NodeSigner, Refusal, SigningKey};
 use spawn_postgres::testing::TestSchema;
-use spawn_postgres::{NodeAction, PostgresStore, RemoteJobKind, RemoteJobSpec, RemoteJobState};
+use spawn_postgres::{
+    NodeAction, PostgresStore, RemoteJobKind, RemoteJobProgress, RemoteJobSpec, RemoteJobState,
+};
 
 const JOB: &str = "gate-0123456789ab-k3x9q2ma";
 
@@ -239,11 +241,14 @@ fn results(owner: &PostgresStore, harness: &Harness) {
     assert_eq!(std::fs::read(dir.join("meta.json")).unwrap(), line);
     assert!(!dir.join("log.part").exists());
     let stored = owner.remote_job(JOB).unwrap().unwrap();
-    assert_eq!(stored.state, RemoteJobState::Completed);
-    assert_eq!(stored.log_bytes, Some(i64::try_from(log.len()).unwrap()));
+    assert_eq!(stored.state(), RemoteJobState::Completed);
+    let RemoteJobProgress::Completed { completion, .. } = &stored.progress else {
+        panic!("expected completed job progress, got {:?}", stored.progress);
+    };
+    assert_eq!(completion.log_bytes, i64::try_from(log.len()).unwrap());
     assert_eq!(
-        stored.result_sha256.as_deref(),
-        Some(spawn_node_proto::codec::sha256_hex(&line).as_str())
+        completion.result_sha256.as_str(),
+        spawn_node_proto::codec::sha256_hex(&line).as_str()
     );
     // The same result again: accepted, nothing rewritten.
     let twice = post_result(harness, 5, JOB, &line, &body);

@@ -153,8 +153,9 @@ pub use provenance::{
     ProvEntryInput, ProvEntryRecord, ProvLink,
 };
 pub use remote_jobs::{
-    Committed, FaultNext, FaultOutcome, NodeAction, NodeEnroll, NodeV1, RemoteJob, RemoteJobKind,
-    RemoteJobSpec, RemoteJobState, SweepOutcome,
+    Committed, FaultNext, FaultOutcome, FaultStrike, NodeAction, NodeEnroll, NodeStatus, NodeV1,
+    RemoteJob, RemoteJobKind, RemoteJobProgress, RemoteJobResult, RemoteJobSpec, RemoteJobState,
+    SweepOutcome,
 };
 pub use row::RETIRED_EVENTS;
 pub use sessions::{
