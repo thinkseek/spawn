@@ -117,7 +117,7 @@ pub(crate) const USAGE: &str = "usage:
       no hold it records nothing and prints `released` null)
   spawn mission list [--limit N] [--json | --table]   (every task with its stages and grading: JSON by default, --table for a readable summary)
   spawn mission show --id N [--root <workspace root>] [--json]
-      (one mission by id, including one outside list's window: its workspace kind/profile
+      (one mission by id, including one outside list's window: its workspace (kind and summary)
       and gate hint, resolved source and mirror, actual landing repository, gate and backlog
       paths, per-open-task delivery/report/gate diagnostics, and shell-quoted read-only checks.
       Prints JSON and creates nothing)
@@ -563,8 +563,10 @@ fn mission_view(
     Ok(json!({
         "mission": mission["id"],
         "state": mission["state"],
-        "workspace_kind": workspace_kind.as_str(),
-        "workspace_profile": profile,
+        "workspace": {
+            "kind": workspace_kind.as_str(),
+            "summary": profile.summary,
+        },
         "source": {"configured": configured, "resolved": resolved},
         "workspace_root": root,
         "mirror": {"path": mirror, "exists": mirror.exists()},
@@ -1916,10 +1918,11 @@ fn add(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i64, Stri
     // for every caller.
     let kind = parse_workspace_kind(flags)?;
     let raw_text = text(flags, "text")?;
-    if raw_text.trim().is_empty() {
+    let body = WorkspaceKind::strip_workspace_tags(&raw_text);
+    if body.trim().is_empty() {
         return Err("a mission needs text".to_string());
     }
-    let stored_text = kind.encode_mission_text(&raw_text);
+    let stored_text = kind.encode_mission_text(body);
     let sources = match flags.get("source") {
         Some(source) => json!([crate::sources::MissionSource::parse(&source)?.as_str()]),
         None => json!([]),
@@ -6072,16 +6075,58 @@ mod database_tests {
         let err = super::add(&store, &bad_flags).expect_err("unknown kind rejected");
         assert!(err.contains("unknown workspace kind"), "{err}");
 
-        let empty_media = vec![
+        for (raw_text, kind_flag) in [
+            ("   ", Some("media")),
+            ("[workspace:media]", None),
+            ("[workspace:media]", Some("media")),
+            ("  [workspace:code]  [workspace:factory]  ", Some("general")),
+        ] {
+            let mut empty_words = vec![
+                "add".to_string(),
+                "--text".to_string(),
+                raw_text.to_string(),
+            ];
+            if let Some(kind) = kind_flag {
+                empty_words.push("--kind".to_string());
+                empty_words.push(kind.to_string());
+            }
+            let (_, empty_flags) = split_mission(&empty_words).expect("flags");
+            let empty_err = super::add(&store, &empty_flags).expect_err("empty text rejected");
+            assert!(empty_err.contains("needs text"), "{empty_err}");
+        }
+
+        let spoof_words = vec![
             "add".to_string(),
             "--text".to_string(),
-            "   ".to_string(),
-            "--kind".to_string(),
-            "media".to_string(),
+            "[workspace:code] [workspace:media] ship fix".to_string(),
         ];
-        let (_, empty_flags) = split_mission(&empty_media).expect("flags");
-        let empty_err = super::add(&store, &empty_flags).expect_err("empty text rejected");
-        assert!(empty_err.contains("needs text"), "{empty_err}");
+        let (_, spoof_flags) = split_mission(&spoof_words).expect("flags");
+        let spoof_id = super::add(&store, &spoof_flags).expect("spoofed code mission added");
+        let spoof_mission = store
+            .mission_by_id(spoof_id)
+            .expect("query")
+            .expect("present");
+        assert_eq!(spoof_mission["text"], "ship fix");
+        let spoof_view = super::mission_view(&spoof_mission, &root, &runner, None, None, 100)
+            .expect("spoof view");
+        assert_eq!(spoof_view["workspace"]["kind"], "code");
+
+        let boundary_words = vec![
+            "add".to_string(),
+            "--text".to_string(),
+            "[workspace:media]foo".to_string(),
+        ];
+        let (_, boundary_flags) = split_mission(&boundary_words).expect("flags");
+        let boundary_id =
+            super::add(&store, &boundary_flags).expect("boundary literal mission added");
+        let boundary_mission = store
+            .mission_by_id(boundary_id)
+            .expect("query")
+            .expect("present");
+        assert_eq!(boundary_mission["text"], "[workspace:media]foo");
+        let boundary_view = super::mission_view(&boundary_mission, &root, &runner, None, None, 100)
+            .expect("boundary view");
+        assert_eq!(boundary_view["workspace"]["kind"], "code");
 
         let default_words = vec![
             "add".to_string(),
@@ -6097,8 +6142,19 @@ mod database_tests {
         assert_eq!(default_mission["text"], "code default");
         let default_view = super::mission_view(&default_mission, &root, &runner, None, None, 100)
             .expect("default view");
-        assert_eq!(default_view["workspace_kind"], "code");
-        assert_eq!(default_view["workspace_profile"]["expects_code_gate"], true);
+        assert!(
+            default_view.get("workspace_kind").is_none(),
+            "{default_view}"
+        );
+        assert!(
+            default_view.get("workspace_profile").is_none(),
+            "{default_view}"
+        );
+        assert_eq!(default_view["workspace"]["kind"], "code");
+        assert_eq!(
+            default_view["workspace"]["summary"],
+            spawn_core::mission::WorkspaceKind::Code.profile().summary
+        );
         assert_eq!(default_view["gate"]["expects_code_gate"], true);
         assert!(
             default_view["checks"]
@@ -6108,29 +6164,30 @@ mod database_tests {
                 .any(|c| c.as_str().is_some_and(|s| s.contains("missing-runner.sh")))
         );
 
-        for kind in ["media", "factory", "general"] {
+        for kind in [
+            spawn_core::mission::WorkspaceKind::Media,
+            spawn_core::mission::WorkspaceKind::Factory,
+            spawn_core::mission::WorkspaceKind::General,
+        ] {
+            let kind_str = kind.as_str();
             let words = vec![
                 "add".to_string(),
                 "--text".to_string(),
-                format!("produce {kind} workflow"),
+                format!("produce {kind_str} workflow"),
                 "--kind".to_string(),
-                kind.to_string(),
+                kind_str.to_string(),
             ];
             let (_, flags) = split_mission(&words).expect("flags");
             let id = super::add(&store, &flags).expect("kind mission added");
             let mission = store.mission_by_id(id).expect("query").expect("present");
             let view =
                 super::mission_view(&mission, &root, &runner, None, None, 100).expect("view");
-            assert_eq!(view["workspace_kind"], kind);
-            assert_eq!(view["workspace_profile"]["kind"], kind);
-            assert_eq!(view["workspace_profile"]["expects_code_gate"], false);
+            assert!(view.get("workspace_kind").is_none(), "{view}");
+            assert!(view.get("workspace_profile").is_none(), "{view}");
+            assert_eq!(view["workspace"]["kind"], kind_str);
+            assert_eq!(view["workspace"]["summary"], kind.profile().summary);
             assert_eq!(view["gate"]["expects_code_gate"], false);
-            assert!(
-                view["gate"]["hint"]
-                    .as_str()
-                    .is_some_and(|h| h.contains("Non-code")),
-                "{view}"
-            );
+            assert_eq!(view["gate"]["hint"], kind.profile().gate_hint);
             assert!(
                 view["checks"]
                     .as_array()
@@ -6139,6 +6196,55 @@ mod database_tests {
                     .all(|c| !c.as_str().is_some_and(|s| s.contains("missing-runner.sh")))
             );
         }
+
+        let media_source = root.join("media-source");
+        let media_gate = root.join("media-gate");
+        std::fs::create_dir_all(&media_source).expect("media source dir");
+        std::fs::create_dir_all(&media_gate).expect("media gate dir");
+        let media_source_str = media_source.to_string_lossy().into_owned();
+        let media_gate_str = media_gate.to_string_lossy().into_owned();
+        let gated_media_words = vec![
+            "add".to_string(),
+            "--text".to_string(),
+            "render media with explicit gate".to_string(),
+            "--kind".to_string(),
+            "media".to_string(),
+            "--source".to_string(),
+            media_source_str.clone(),
+            "--gate".to_string(),
+            media_gate_str.clone(),
+        ];
+        let (_, gated_media_flags) = split_mission(&gated_media_words).expect("flags");
+        let gated_media_id =
+            super::add(&store, &gated_media_flags).expect("gated media mission added");
+        let gated_media_mission = store
+            .mission_by_id(gated_media_id)
+            .expect("query")
+            .expect("present");
+        let gated_media_view =
+            super::mission_view(&gated_media_mission, &root, &runner, None, None, 100)
+                .expect("gated media view");
+        assert_eq!(gated_media_view["workspace"]["kind"], "media");
+        assert_eq!(gated_media_view["gate"]["expects_code_gate"], false);
+        assert_eq!(gated_media_view["gate"]["scenarios_dir"], media_gate_str);
+        assert_eq!(gated_media_view["gate"]["exists"], true);
+        let quoted_runner = super::shell_quote(&runner.to_string_lossy());
+        let expected_runner_check = format!("test -f {quoted_runner} && test -r {quoted_runner}");
+        let expected_gate_dir_check = format!("test -d {}", super::shell_quote(&media_gate_str));
+        let gated_checks: Vec<&str> = gated_media_view["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            gated_checks.contains(&expected_runner_check.as_str()),
+            "{gated_checks:?}"
+        );
+        assert!(
+            gated_checks.contains(&expected_gate_dir_check.as_str()),
+            "{gated_checks:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

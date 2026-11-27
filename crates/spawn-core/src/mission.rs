@@ -171,28 +171,56 @@ impl WorkspaceKind {
         }
     }
 
+    fn strip_leading_tag(text: &str) -> Option<(Self, &str)> {
+        let trimmed = text.trim_start();
+        let after_prefix = trimmed.strip_prefix(WORKSPACE_PREFIX)?;
+        let (raw_kind, rest) = after_prefix.split_once(']')?;
+        // Require empty suffix or whitespace after `]` so `[workspace:media]foo` is not misread as a tag.
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let kind = raw_kind.parse::<Self>().ok()?;
+        Some((kind, rest.trim_start()))
+    }
+
+    /// Strip all consecutive leading `[workspace:<kind>]` tags and intervening
+    /// leading whitespace from `text`. Leaves text without a leading workspace
+    /// tag untouched.
+    #[must_use]
+    pub fn strip_workspace_tags(text: &str) -> &str {
+        let mut rest = text;
+        while let Some((_, next)) = Self::strip_leading_tag(rest) {
+            rest = next;
+        }
+        rest
+    }
+
     /// Format mission `text` carrying this workspace kind without requiring
-    /// database schema changes. [`WorkspaceKind::Code`] leaves `text` untouched.
+    /// database schema changes. Any leading `[workspace:<kind>]` tags are
+    /// stripped first; [`WorkspaceKind::Code`] stores the untagged body.
     #[must_use]
     pub fn encode_mission_text(self, text: &str) -> String {
-        let (_, body) = Self::parse_mission_text(text);
+        let body = Self::strip_workspace_tags(text);
         if self == Self::Code {
             body.to_string()
         } else {
-            format!("{WORKSPACE_PREFIX}{}] {}", self.as_str(), body.trim_start())
+            let trimmed_body = body.trim_start();
+            if trimmed_body.is_empty() {
+                format!("{WORKSPACE_PREFIX}{}]", self.as_str())
+            } else {
+                format!("{WORKSPACE_PREFIX}{}] {trimmed_body}", self.as_str())
+            }
         }
     }
 
     /// Extract the [`WorkspaceKind`] and underlying mission body from stored
     /// mission text, defaulting to [`WorkspaceKind::Code`] when untagged.
+    /// Any additional spoofed leading `[workspace:<kind>]` tags after the
+    /// outermost tag are also stripped from the returned body.
     #[must_use]
     pub fn parse_mission_text(text: &str) -> (Self, &str) {
-        let trimmed = text.trim_start();
-        if let Some(after_prefix) = trimmed.strip_prefix(WORKSPACE_PREFIX)
-            && let Some((raw_kind, rest)) = after_prefix.split_once(']')
-            && let Ok(kind) = raw_kind.parse::<Self>()
-        {
-            return (kind, rest.trim_start());
+        if let Some((kind, rest)) = Self::strip_leading_tag(text) {
+            return (kind, Self::strip_workspace_tags(rest));
         }
         (Self::Code, text)
     }
@@ -302,6 +330,68 @@ mod tests {
             WorkspaceKind::parse_mission_text("[urgent] ship fix"),
             (WorkspaceKind::Code, "[urgent] ship fix")
         );
+        // Word-boundary check: `[workspace:<kind>]foo` without whitespace after `]` is plain text.
+        assert_eq!(
+            WorkspaceKind::parse_mission_text("[workspace:media]foo"),
+            (WorkspaceKind::Code, "[workspace:media]foo")
+        );
+        assert_eq!(
+            WorkspaceKind::Code.encode_mission_text("[workspace:media]foo"),
+            "[workspace:media]foo"
+        );
+        let media_literal = WorkspaceKind::Media.encode_mission_text("[workspace:media]foo");
+        assert_eq!(media_literal, "[workspace:media] [workspace:media]foo");
+        assert_eq!(
+            WorkspaceKind::parse_mission_text(&media_literal),
+            (WorkspaceKind::Media, "[workspace:media]foo")
+        );
+
+        // Multi-tag spoofing & mixed whitespace are stripped cleanly across all kinds.
+        let spoofed_cases = [
+            ("[workspace:code] [workspace:media] ship fix", "ship fix"),
+            (
+                "  [workspace:code]\n\t[workspace:factory]   [workspace:general]   ship fix",
+                "ship fix",
+            ),
+            (
+                "[workspace:media] [workspace:factory]foo",
+                "[workspace:factory]foo",
+            ),
+        ];
+        for kind in WorkspaceKind::ALL {
+            for (raw, expected_body) in spoofed_cases {
+                let encoded = kind.encode_mission_text(raw);
+                let (parsed_kind, parsed_body) = WorkspaceKind::parse_mission_text(&encoded);
+                assert_eq!(parsed_kind, kind);
+                assert_eq!(parsed_body, expected_body);
+            }
+        }
+        assert_eq!(
+            WorkspaceKind::parse_mission_text(
+                "  [workspace:factory] \t [workspace:media] build pipeline"
+            ),
+            (WorkspaceKind::Factory, "build pipeline")
+        );
+
+        // Pure-tag or tag-only inputs leave an empty body without trailing spaces.
+        assert_eq!(WorkspaceKind::strip_workspace_tags("[workspace:media]"), "");
+        assert_eq!(
+            WorkspaceKind::strip_workspace_tags("  [workspace:code]  [workspace:media]   "),
+            ""
+        );
+        assert_eq!(
+            WorkspaceKind::Code.encode_mission_text("[workspace:media]"),
+            ""
+        );
+        assert_eq!(
+            WorkspaceKind::Media.encode_mission_text("[workspace:factory]"),
+            "[workspace:media]"
+        );
+        assert_eq!(
+            WorkspaceKind::parse_mission_text("[workspace:media]"),
+            (WorkspaceKind::Media, "")
+        );
+
         // Re-encoding strips an earlier `[workspace:...]` prefix idempotently.
         let media = WorkspaceKind::Media.encode_mission_text("cut clips");
         assert_eq!(
