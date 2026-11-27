@@ -389,6 +389,29 @@ impl ProjectCutover {
         }
     }
 
+    /// Resume a cutover coordinator from persisted cross-process state (e.g. CLI rollback).
+    pub fn from_state(
+        project: impl Into<String>,
+        bare_repo: impl Into<PathBuf>,
+        workspace_root: impl Into<PathBuf>,
+        phase: CutoverPhase,
+        storage_mode: ProjectStorageMode,
+        dispatch_paused: bool,
+    ) -> Self {
+        Self {
+            project: project.into(),
+            bare_repo: bare_repo.into(),
+            workspace_root: workspace_root.into(),
+            phase,
+            storage_mode,
+            dispatch_paused,
+            default_tree: None,
+            export_attributes: None,
+            parity: None,
+            events: Vec::new(),
+        }
+    }
+
     /// Project identifier.
     pub fn project(&self) -> &str {
         &self.project
@@ -725,6 +748,41 @@ fn restore_writable_bare_repo(bare_repo: &Path) -> Result<(), D6StoreError> {
         }
     }
     Ok(())
+}
+
+/// Inspect whether `bare_repo` currently has the D6 read-only border receive lock installed
+/// (`hooks/pre-receive` regular file plus `receive.denyNonFastForwards=true`,
+/// `receive.denyDeletes=true`, and `receive.denyCurrentBranch=refuse`).
+pub fn is_readonly_border(bare_repo: &Path) -> Result<bool, D6StoreError> {
+    let hook_path = bare_repo.join("hooks/pre-receive");
+    match fs::symlink_metadata(&hook_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Ok(false);
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    }
+    for (key, expected) in [
+        ("receive.denyNonFastForwards", "true"),
+        ("receive.denyDeletes", "true"),
+        ("receive.denyCurrentBranch", "refuse"),
+    ] {
+        let out = git_bare_cmd(bare_repo)
+            .args(["config", "--get", key])
+            .output()?;
+        if out.status.code() == Some(1) {
+            return Ok(false);
+        }
+        if !out.status.success() {
+            ensure_git_cmd_ok("config --get", &out)?;
+        }
+        if String::from_utf8_lossy(&out.stdout).trim() != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Telemetry from [`reconcile_refs_journal`].
@@ -2029,5 +2087,67 @@ mod tests {
         assert_eq!(extract_spawn_task_trailer(body), Some(42));
         let none = b"author a 1 +0000\ncommitter b 2 +0000\n\nplain commit\n";
         assert_eq!(extract_spawn_task_trailer(none), None);
+    }
+
+    #[test]
+    fn readonly_border_inspection_and_from_state_roundtrip() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "spawn-host-ro-border-{}-{}",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let bare = root.join("bare.git");
+
+        let init = crate::test_git_command()
+            .arg("init")
+            .arg("--bare")
+            .arg(&bare)
+            .output()
+            .expect("run git init --bare");
+        assert!(
+            init.status.success(),
+            "git init --bare failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        assert!(
+            !is_readonly_border(&bare).expect("check initial border"),
+            "fresh bare repo should be writable"
+        );
+
+        let border = GitBorderAdapter::new();
+        border
+            .configure_readonly_receive(&bare)
+            .expect("configure readonly receive");
+        assert!(
+            is_readonly_border(&bare).expect("check locked border"),
+            "bare repo should report read-only after configure_readonly_receive"
+        );
+
+        restore_writable_bare_repo(&bare).expect("restore writable bare repo");
+        assert!(
+            !is_readonly_border(&bare).expect("check restored writable border"),
+            "bare repo should report writable after restore_writable_bare_repo"
+        );
+
+        let initial = ProjectCutover::new("proj-cutover-roundtrip", &bare, &root);
+        let restored = ProjectCutover::from_state(
+            "proj-cutover-roundtrip",
+            &bare,
+            &root,
+            initial.phase(),
+            initial.storage_mode(),
+            true,
+        );
+        assert_eq!(restored.phase(), initial.phase());
+        assert_eq!(restored.storage_mode(), initial.storage_mode());
+        assert!(restored.dispatch_paused());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
