@@ -48,7 +48,9 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
-use spawn_core::driver::{AgyDriver, DEFAULT, EngineHome, Guard};
+use spawn_core::driver::{
+    AgyDriver, CODEX_HOME, CODEX_ID, CodexDriver, DEFAULT, EngineHome, Guard,
+};
 
 use crate::deliver::{EngineReady, Engines};
 
@@ -323,6 +325,11 @@ fn login_files(engine: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<Pat
                 .map_or_else(|| home.join(spawn_core::driver::AGY_HOME), PathBuf::from);
             vec![agy_home.join("antigravity-oauth-token"), agy_home]
         }
+        CODEX_ID => {
+            let codex_home =
+                lookup("SPAWN_CODEX_HOME").map_or_else(|| home.join(CODEX_HOME), PathBuf::from);
+            vec![codex_home.join("auth.json"), codex_home]
+        }
         _ => Vec::new(),
     }
 }
@@ -333,109 +340,124 @@ fn login_files(engine: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<Pat
 /// enabled agy has its models listed; any failure is that engine's alone.
 pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
     let enabled = crate::runtime::engines(host.lookup).unwrap_or_default();
-    let mut engines = Vec::new();
-    for driver in spawn_core::driver::drivers() {
-        let id = driver.id();
-        let configured = enabled.iter().find(|(name, _)| name == id);
-        let program = match (id, configured) {
-            (DEFAULT, _) => {
-                (host.lookup)("SPAWN_CLAUDE_PROGRAM").unwrap_or_else(|| "claude".into())
-            }
-            (_, Some((_, home))) => home.program.clone(),
-            _ => (host.lookup)(&format!("SPAWN_{}_PROGRAM", id.to_ascii_uppercase()))
-                .unwrap_or_else(|| id.to_string()),
-        };
-        let model = configured.and_then(|(_, home)| home.model.clone());
-        let is_enabled = id == DEFAULT || configured.is_some();
-        let login = login_files(id, host.lookup)
-            .into_iter()
-            .map(|path| LoginFile {
-                present: (host.exists)(&path),
-                path: path.display().to_string(),
-            })
-            .collect();
-        if !is_enabled {
-            // Decision C3: an engine the host does not enable is never run,
-            // not even for its version.
-            engines.push(EngineProbe::not_run(
-                *driver,
-                (program, false),
+    let engines = spawn_core::driver::drivers()
+        .iter()
+        .map(|driver| {
+            let configured = enabled.iter().find(|(name, _)| name == driver.id());
+            probe_engine(*driver, configured, host)
+        })
+        .collect();
+    Probe { at_ms, engines }
+}
+
+fn probe_engine(
+    driver: &'static dyn spawn_core::driver::AgentDriver,
+    configured: Option<&(String, EngineHome)>,
+    host: &Host<'_>,
+) -> EngineProbe {
+    let id = driver.id();
+    let program = engine_program(id, configured, host.lookup);
+    let model = configured.and_then(|(_, home)| home.model.clone());
+    let is_enabled = id == DEFAULT || configured.is_some();
+    let login = login_files(id, host.lookup)
+        .into_iter()
+        .map(|path| LoginFile {
+            present: (host.exists)(&path),
+            path: path.display().to_string(),
+        })
+        .collect();
+    if !is_enabled {
+        // Decision C3: an engine the host does not enable is never run,
+        // not even for its version.
+        return EngineProbe::not_run(
+            driver,
+            (program, false),
+            login,
+            model,
+            format!("SPAWN_ENGINES does not name {id}: it is not enabled on this host"),
+        );
+    }
+    // An engine with no deny rules of its own runs inside its view, or
+    // not at all: with none, it is down and its program never runs.
+    let boxed = match configured {
+        Some((_, home)) if driver.traits().guard == Guard::Sandbox => (host.view)(id, home),
+        _ => Boxed::Off,
+    };
+    let prefix: Vec<&str> = match &boxed {
+        Boxed::Off => Vec::new(),
+        Boxed::Inside { words, .. } => words.iter().map(String::as_str).collect(),
+        Boxed::Unavailable(why) => {
+            return EngineProbe::not_run(
+                driver,
+                (program, true),
                 login,
                 model,
-                format!("SPAWN_ENGINES does not name {id}: it is not enabled on this host"),
-            ));
-            continue;
+                format!(
+                    "{id} is probed and run only inside its filesystem view, and {why}: \
+                     it will not start (engine_unavailable)"
+                ),
+            );
         }
-        // An engine with no deny rules of its own runs inside its view, or
-        // not at all: with none, it is down and its program never runs.
-        let boxed = match configured {
-            Some((_, home)) if driver.traits().guard == Guard::Sandbox => (host.view)(id, home),
-            _ => Boxed::Off,
-        };
-        let prefix: Vec<&str> = match &boxed {
-            Boxed::Off => Vec::new(),
-            Boxed::Inside { words, .. } => words.iter().map(String::as_str).collect(),
-            Boxed::Unavailable(why) => {
-                engines.push(EngineProbe::not_run(
-                    *driver,
-                    (program, true),
-                    login,
-                    model,
-                    format!(
-                        "{id} is probed and run only inside its filesystem view, and {why}: \
-                         it will not start (engine_unavailable)"
-                    ),
-                ));
-                continue;
-            }
-        };
-        let run = |arguments: &[&str], limit: Duration| {
-            run_in(host.run, &prefix, &program, arguments, limit)
-        };
-        let answer = run(&["--version"], VERSION_LIMIT);
-        let version = answer
-            .as_ref()
-            .ok()
-            .and_then(|text| AgyDriver::version(text));
-        let mut unavailable = match &answer {
-            Ok(_) => None,
-            Err(why) => Some(format!("{program} --version: {why}")),
-        };
-        let version_tested = (id == "agy")
-            .then(|| version.as_deref().map(AgyDriver::version_tested))
-            .flatten();
-        let mut known_models = None;
-        if id == "agy" && unavailable.is_none() {
-            match run(&["models"], MODELS_LIMIT) {
-                Ok(listing) => {
-                    let known = AgyDriver::known_models(&listing);
-                    if known.is_empty() {
-                        unavailable = Some(format!("{program} models listed no model"));
-                    }
-                    known_models = Some(known);
+    };
+    let run =
+        |arguments: &[&str], limit: Duration| run_in(host.run, &prefix, &program, arguments, limit);
+    let answer = run(&["--version"], VERSION_LIMIT);
+    let version = answer.as_ref().ok().and_then(|text| match id {
+        CODEX_ID => CodexDriver::version(text),
+        _ => AgyDriver::version(text),
+    });
+    let mut unavailable = answer
+        .as_ref()
+        .err()
+        .map(|why| format!("{program} --version: {why}"));
+    let version_tested = match id {
+        "agy" => version.as_deref().map(AgyDriver::version_tested),
+        CODEX_ID => version.as_deref().map(CodexDriver::version_tested),
+        _ => None,
+    };
+    let mut known_models = None;
+    if id == "agy" && unavailable.is_none() {
+        match run(&["models"], MODELS_LIMIT) {
+            Ok(listing) => {
+                let known = AgyDriver::known_models(&listing);
+                if known.is_empty() {
+                    unavailable = Some(format!("{program} models listed no model"));
                 }
-                Err(why) => unavailable = Some(format!("{program} models: {why}")),
+                known_models = Some(known);
             }
+            Err(why) => unavailable = Some(format!("{program} models: {why}")),
         }
-        engines.push(EngineProbe {
-            engine: id.to_string(),
-            title: driver.title().to_string(),
-            program,
-            enabled: true,
-            installed: Some(answer.is_ok()),
-            version,
-            version_tested,
-            login,
-            known_models,
-            model,
-            // Claude Code is never taken down by its probe: the Bridge finds
-            // its program at launch, as it always did.
-            unavailable: unavailable.filter(|_| id != DEFAULT),
-        });
-        // The view's scratch workspace goes once both runs are done.
-        drop(boxed);
     }
-    Probe { at_ms, engines }
+    // The view's scratch workspace goes once both runs are done.
+    drop(boxed);
+    EngineProbe {
+        engine: id.to_string(),
+        title: driver.title().to_string(),
+        program,
+        enabled: true,
+        installed: Some(answer.is_ok()),
+        version,
+        version_tested,
+        login,
+        known_models,
+        model,
+        // Claude Code is never taken down by its probe: the Bridge finds
+        // its program at launch, as it always did.
+        unavailable: unavailable.filter(|_| id != DEFAULT),
+    }
+}
+
+fn engine_program(
+    id: &str,
+    configured: Option<&(String, EngineHome)>,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    match (id, configured) {
+        (DEFAULT, _) => lookup("SPAWN_CLAUDE_PROGRAM").unwrap_or_else(|| "claude".into()),
+        (_, Some((_, home))) => home.program.clone(),
+        _ => lookup(&format!("SPAWN_{}_PROGRAM", id.to_ascii_uppercase()))
+            .unwrap_or_else(|| id.to_string()),
+    }
 }
 
 /// `run` of `program` with `arguments` within `limit`, after `prefix` (a
@@ -481,10 +503,8 @@ pub(crate) fn engines(probe: &Probe) -> Engines {
                     EngineReady {
                         known: engine
                             .known_models
-                            .iter()
-                            .flatten()
-                            .cloned()
-                            .collect::<BTreeSet<String>>(),
+                            .as_ref()
+                            .map(|models| models.iter().cloned().collect::<BTreeSet<String>>()),
                         default_label: engine.model.clone(),
                     },
                 );
@@ -924,6 +944,8 @@ mod tests {
                 "/home/a/.local/state/spawn/claude-config/.credentials.json",
                 "/home/a/.gemini/antigravity-cli/antigravity-oauth-token",
                 "/home/a/.gemini/antigravity-cli",
+                "/home/a/.codex/auth.json",
+                "/home/a/.codex",
             ]
         );
         let inherited_login = super::login_files("claude", &|key| match key {
@@ -1332,5 +1354,57 @@ mod tests {
                 std::path::PathBuf::from("/srv/agy"),
             ]
         );
+    }
+
+    #[test]
+    fn codex_probe_respects_enabled_gate_sandbox_and_login_files() {
+        let host = fake_viewed(
+            vec![
+                ("HOME", "/home/a"),
+                ("SPAWN_ENGINES", "claude,codex"),
+                ("SPAWN_CODEX_HOME", "/srv/codex"),
+                ("SPAWN_CODEX_MODEL", "gpt-5.4"),
+            ],
+            vec![
+                ("claude --version", Ok("2.1.0 (Claude Code)\n")),
+                (
+                    "bwrap --die-with-parent --unshare-pid -- codex --version",
+                    Ok("codex-cli 0.171.0\n"),
+                ),
+            ],
+            View::Wrap,
+        );
+        let probe = host.probe();
+        assert_eq!(
+            *host.runs.borrow(),
+            [
+                "claude --version",
+                "bwrap --die-with-parent --unshare-pid -- codex --version",
+            ]
+        );
+        let codex = &probe.engines[2];
+        assert_eq!(codex.engine, "codex");
+        assert!(codex.enabled);
+        assert_eq!(codex.installed, Some(true));
+        assert_eq!(codex.version.as_deref(), Some("0.171.0"));
+        assert_eq!(codex.version_tested, Some(true));
+        assert_eq!(codex.known_models, None);
+        assert_eq!(codex.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(codex.unavailable, None);
+        assert_eq!(codex.login[0].path, "/srv/codex/auth.json");
+        assert_eq!(codex.login[1].path, "/srv/codex");
+        let ready = engines(&probe);
+        assert_eq!(
+            ready.runs("codex", None),
+            Runs::On("codex".to_string(), Some("gpt-5.4".to_string()))
+        );
+        assert_eq!(
+            ready.runs("codex", Some("o3")),
+            Runs::On("codex".to_string(), Some("o3".to_string()))
+        );
+        assert!(matches!(
+            ready.runs("codex", Some("--bad")),
+            Runs::Unavailable(_)
+        ));
     }
 }

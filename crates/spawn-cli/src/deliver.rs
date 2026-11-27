@@ -885,8 +885,9 @@ pub(crate) struct Engines {
 /// One engine the probe found ready.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EngineReady {
-    /// The model labels its listing names (`agy models`).
-    pub(crate) known: BTreeSet<String>,
+    /// The model labels its listing names (`agy models`), or `None` when the
+    /// engine provides no model-listing subcommand (e.g. `codex`).
+    pub(crate) known: Option<BTreeSet<String>>,
     /// The host's own label for it (`SPAWN_AGY_MODEL`): what a resume and
     /// a start that names none runs.
     pub(crate) default_label: Option<String>,
@@ -931,10 +932,18 @@ impl Engines {
                 engine.to_ascii_uppercase()
             ));
         };
-        if !ready.known.contains(label) {
-            return Runs::Unavailable(format!(
-                "{engine} model label {label} is not one `{engine} models` lists on this host"
-            ));
+        match &ready.known {
+            Some(known) if !known.contains(label) => {
+                return Runs::Unavailable(format!(
+                    "{engine} model label {label} is not one `{engine} models` lists on this host"
+                ));
+            }
+            None if !spawn_core::command::is_model_label(label) => {
+                return Runs::Unavailable(format!(
+                    "{engine} model label {label:?} is not a valid model label"
+                ));
+            }
+            _ => {}
         }
         Runs::On(engine.to_string(), Some(label.to_string()))
     }
@@ -3219,7 +3228,7 @@ mod tests {
         engines.ready.insert(
             "agy".to_string(),
             super::EngineReady {
-                known: known.iter().map(|label| (*label).to_string()).collect(),
+                known: Some(known.iter().map(|label| (*label).to_string()).collect()),
                 default_label: None,
             },
         );
@@ -3256,7 +3265,7 @@ mod tests {
         assert_eq!(engine, "agy");
         assert_eq!(model_label.as_deref(), Some("gemini-3.8-flash-low"));
         assert!(unavailable(&planned, &[]).is_empty());
-        for label in [None, Some("claude"), Some("codex")] {
+        for label in [None, Some("claude"), Some("opencode")] {
             let mut claude = agy_task(5, "ephemeral", "opus");
             claude.preset_engine = label.map(str::to_string);
             let plan = orders(&work(vec![claude]), &[]);

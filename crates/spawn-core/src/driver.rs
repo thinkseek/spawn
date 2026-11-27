@@ -1088,11 +1088,18 @@ pub fn excerpt_for(engine: Option<&str>, pane: &str) -> String {
     }
 }
 
+pub use crate::driver_codex::{
+    CODEX_DIALOG_RULES, CODEX_ENV_ALLOWLIST, CODEX_HARD_BLOCK_RULES, CODEX_HOME, CODEX_ID,
+    CODEX_TESTED, CodexDriver, codex_arguments, codex_line, read_codex_screen,
+};
+
 static CLAUDE: ClaudeDriver = ClaudeDriver;
 
 static AGY: AgyDriver = AgyDriver;
 
-static DRIVERS: [&dyn AgentDriver; 2] = [&CLAUDE, &AGY];
+static CODEX: CodexDriver = CodexDriver;
+
+static DRIVERS: [&dyn AgentDriver; 3] = [&CLAUDE, &AGY, &CODEX];
 
 /// Every registered driver.
 pub fn drivers() -> &'static [&'static dyn AgentDriver] {
@@ -1269,18 +1276,19 @@ mod tests {
     }
 
     /// Claude Code is the registry's first driver and the default every
-    /// unknown name falls back on (agy, registered beside it since issue
-    /// #91 P2 PR 2, is checked in `registry_holds_agy_beside_claude`).
+    /// unknown name falls back on (`agy` is checked in
+    /// `registry_holds_agy_beside_claude`; `codex` is checked in `codex_driver`).
     #[test]
     fn registry_holds_claude_alone() {
         assert_eq!(DEFAULT, ENGINE);
-        assert_eq!(drivers().len(), 2);
+        assert_eq!(drivers().len(), 3);
         assert_eq!(drivers()[0].id(), ENGINE);
         assert_eq!(driver("claude").map(AgentDriver::id), Some("claude"));
-        assert!(driver("codex").is_none());
+        assert_eq!(driver("codex").map(AgentDriver::id), Some("codex"));
+        assert!(driver("opencode").is_none());
         assert!(driver("").is_none());
         assert!(driver("Claude").is_none());
-        assert_eq!(driver_or_default("codex").id(), ENGINE);
+        assert_eq!(driver_or_default("opencode").id(), ENGINE);
         assert_eq!(driver_or_default("").id(), ENGINE);
         assert_eq!(driver_or_default(ENGINE).id(), ENGINE);
     }

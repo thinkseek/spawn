@@ -1217,51 +1217,67 @@ fn engines_for(
         if name == spawn_core::driver::DEFAULT || engines.iter().any(|(known, _)| known == name) {
             continue;
         }
-        let home = lookup("SPAWN_AGY_HOME").unwrap_or_else(|| {
-            let user = lookup("HOME").unwrap_or_else(|| "/root".to_string());
-            format!(
-                "{}/{}",
-                user.trim_end_matches('/'),
-                spawn_core::driver::AGY_HOME
-            )
-        });
-        let data_dir = match lookup("SPAWN_AGY_DATA_DIR") {
-            Some(dir) if !dir.trim().is_empty() => {
-                let trimmed = dir.trim();
-                if !trimmed.starts_with('/') {
-                    return Err(format!(
-                        "SPAWN_AGY_DATA_DIR must be an absolute path, not {dir:?}"
-                    ));
-                }
-                let cleaned = trimmed.trim_end_matches('/');
-                Some(if cleaned.is_empty() {
-                    trimmed.to_string()
-                } else {
-                    cleaned.to_string()
-                })
+        let engine_home = if name == spawn_core::driver::CODEX_ID {
+            let codex_home = lookup("SPAWN_CODEX_HOME").unwrap_or_else(|| {
+                let user = lookup("HOME").unwrap_or_else(|| "/root".to_string());
+                format!(
+                    "{}/{}",
+                    user.trim_end_matches('/'),
+                    spawn_core::driver::CODEX_HOME
+                )
+            });
+            spawn_core::driver::EngineHome {
+                program: lookup("SPAWN_CODEX_PROGRAM").unwrap_or_else(|| "codex".to_string()),
+                sessions: codex_home,
+                model: lookup("SPAWN_CODEX_MODEL"),
+                data_dir: None,
+                isolate_brain: false,
             }
-            _ => None,
-        };
-        let isolate_brain = herdr_backend
-            && data_dir.is_some()
-            && matches!(
-                lookup("SPAWN_AGY_ISOLATE_BRAIN")
-                    .as_deref()
-                    .map(str::trim)
-                    .map(str::to_ascii_lowercase)
-                    .as_deref(),
-                Some("1" | "true" | "yes" | "on")
-            );
-        engines.push((
-            name.to_string(),
+        } else {
+            let home = lookup("SPAWN_AGY_HOME").unwrap_or_else(|| {
+                let user = lookup("HOME").unwrap_or_else(|| "/root".to_string());
+                format!(
+                    "{}/{}",
+                    user.trim_end_matches('/'),
+                    spawn_core::driver::AGY_HOME
+                )
+            });
+            let data_dir = match lookup("SPAWN_AGY_DATA_DIR") {
+                Some(dir) if !dir.trim().is_empty() => {
+                    let trimmed = dir.trim();
+                    if !trimmed.starts_with('/') {
+                        return Err(format!(
+                            "SPAWN_AGY_DATA_DIR must be an absolute path, not {dir:?}"
+                        ));
+                    }
+                    let cleaned = trimmed.trim_end_matches('/');
+                    Some(if cleaned.is_empty() {
+                        trimmed.to_string()
+                    } else {
+                        cleaned.to_string()
+                    })
+                }
+                _ => None,
+            };
+            let isolate_brain = herdr_backend
+                && data_dir.is_some()
+                && matches!(
+                    lookup("SPAWN_AGY_ISOLATE_BRAIN")
+                        .as_deref()
+                        .map(str::trim)
+                        .map(str::to_ascii_lowercase)
+                        .as_deref(),
+                    Some("1" | "true" | "yes" | "on")
+                );
             spawn_core::driver::EngineHome {
                 program: lookup("SPAWN_AGY_PROGRAM").unwrap_or_else(|| "agy".to_string()),
                 sessions: home,
                 model: lookup("SPAWN_AGY_MODEL"),
                 data_dir,
                 isolate_brain,
-            },
-        ));
+            }
+        };
+        engines.push((name.to_string(), engine_home));
     }
     Ok(engines)
 }
@@ -2279,8 +2295,23 @@ mod tests {
             ]))
             .is_err()
         );
-        let refused = engines(lookup(&[("SPAWN_ENGINES", "claude,codex")])).expect_err("codex");
-        assert!(refused.contains("codex"), "{refused}");
+        let codex = engines(lookup(&[
+            ("SPAWN_ENGINES", "claude,codex"),
+            ("SPAWN_CODEX_HOME", "/srv/codex"),
+            ("SPAWN_CODEX_PROGRAM", "/opt/codex/bin/codex"),
+            ("SPAWN_CODEX_MODEL", "gpt-5.4"),
+        ]))
+        .expect("codex");
+        assert_eq!(codex.len(), 1);
+        assert_eq!(codex[0].0, "codex");
+        assert_eq!(codex[0].1.program, "/opt/codex/bin/codex");
+        assert_eq!(codex[0].1.sessions, "/srv/codex");
+        assert_eq!(codex[0].1.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(codex[0].1.data_dir, None);
+        assert!(!codex[0].1.isolate_brain);
+        let refused =
+            engines(lookup(&[("SPAWN_ENGINES", "claude,opencode")])).expect_err("opencode");
+        assert!(refused.contains("opencode"), "{refused}");
     }
 
     #[test]

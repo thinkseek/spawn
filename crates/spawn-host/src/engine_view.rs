@@ -753,6 +753,43 @@ impl BwrapView {
             .collect()
     }
 
+    fn canonical_codex_homes(&self) -> Vec<PathBuf> {
+        self.config
+            .below_home(".codex")
+            .into_iter()
+            .filter_map(|dir| {
+                std::fs::canonicalize(&dir)
+                    .ok()
+                    .or_else(|| prospective_canonical(&dir).ok())
+            })
+            .collect()
+    }
+
+    fn allowed_self_homes_for(&self, engine: &str) -> Vec<PathBuf> {
+        match engine {
+            "claude" => self.canonical_claude_homes(),
+            "codex" => self.canonical_codex_homes(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn omit_codex_self_mask(
+        &self,
+        engine: &str,
+        engine_home: &Path,
+        directories: &mut Vec<PathBuf>,
+    ) {
+        if engine == "codex"
+            && self.config.home_isolation == HomeIsolation::Blacklist
+            && self
+                .canonical_codex_homes()
+                .iter()
+                .any(|dir| dir == engine_home)
+        {
+            directories.retain(|dir| dir != engine_home);
+        }
+    }
+
     fn canonical_engine_homes_for(&self, engine: &str) -> Vec<PathBuf> {
         let mut homes: Vec<PathBuf> = ENGINE_HOMES
             .iter()
@@ -855,15 +892,10 @@ impl BwrapView {
             ));
         }
         let engine_homes = self.canonical_engine_homes_for(engine);
-        let claude_homes = if engine == "claude" {
-            self.canonical_claude_homes()
-        } else {
-            Vec::new()
-        };
-        if let Some(conflict) = engine_homes
-            .iter()
-            .find(|dir| dir.starts_with(engine_home) && !claude_homes.iter().any(|c| c == *dir))
-        {
+        let allowed_self_homes = self.allowed_self_homes_for(engine);
+        if let Some(conflict) = engine_homes.iter().find(|dir| {
+            dir.starts_with(engine_home) && !allowed_self_homes.iter().any(|s| s == *dir)
+        }) {
             return Err(format!(
                 "the engine's home {} overlaps {}, which the view masks",
                 engine_home.display(),
@@ -871,7 +903,9 @@ impl BwrapView {
             ));
         }
         for forbidden in self.forbidden_home_targets_for(engine) {
-            if (whitelist || engine == "claude") && paths_overlap(engine_home, &forbidden) {
+            if (whitelist || engine == "claude" || engine == "codex")
+                && paths_overlap(engine_home, &forbidden)
+            {
                 return Err(format!(
                     "the engine's home {} overlaps {}, which the view masks",
                     engine_home.display(),
@@ -879,11 +913,10 @@ impl BwrapView {
                 ));
             }
         }
-        let allowed_claude_self =
-            |target: &Path| engine == "claude" && claude_homes.iter().any(|dir| dir == target);
+        let allowed_self = |target: &Path| allowed_self_homes.iter().any(|dir| dir == target);
         let refused = ctx.masked.iter().find(|target| {
             let target_path = target.as_path();
-            if target_path == engine_home && allowed_claude_self(target_path) {
+            if target_path == engine_home && allowed_self(target_path) {
                 return false;
             }
             target.starts_with(engine_home)
@@ -1645,7 +1678,7 @@ impl BwrapView {
             private: &private,
             masked: &masked,
         };
-        let (directories, files) = prune_nested(&all_directories, &all_files);
+        let (mut directories, files) = prune_nested(&all_directories, &all_files);
 
         let agy_data_root = (launch.engine == "agy")
             .then_some(self.config.agy_data_dir.as_deref())
@@ -1661,6 +1694,7 @@ impl BwrapView {
             &directories,
             isolate_agy_workers,
         )?;
+        self.omit_codex_self_mask(launch.engine, &engine_home, &mut directories);
 
         let agy_plan = match agy_data_root {
             Some(root) => Some(self.prepare_agy_data(root, launch, &engine_home, &ctx, &home)?),
@@ -3272,5 +3306,129 @@ mod tests {
             "{:?}",
             sandboxed_local.masks
         );
+    }
+
+    fn setup_codex_isolation_fixture(scratch: &Path) -> (BwrapView, PathBuf, Vec<PathBuf>) {
+        let (mut view, workspace, _) = view_in(scratch);
+        let xdg_state = scratch.join("xdg-state");
+        view.config.xdg_state_home = Some(xdg_state.clone());
+        let dirs = vec![
+            view.config.home.join(".claude"),
+            view.config.home.join(".local/state/spawn/claude-config"),
+            xdg_state.join("spawn/claude-config"),
+            view.config.home.join(".gemini"),
+            view.config.home.join(".config/antigravity"),
+            view.config.home.join(".hermes"),
+        ];
+        std::fs::create_dir_all(view.config.home.join(".codex")).expect("mkdir codex");
+        for dir in &dirs {
+            std::fs::create_dir_all(dir).expect("mkdir sibling");
+        }
+        (view, workspace, dirs)
+    }
+
+    #[test]
+    fn codex_home_is_allowed_for_codex_only_and_isolated_from_other_engines() {
+        let scratch = crate::Scratch::new("spawn-view-codex-isolation");
+        let (mut view, workspace, forbidden_for_codex) = setup_codex_isolation_fixture(&scratch);
+        let codex_home = view.config.home.join(".codex");
+        let canon = |p: &Path| std::fs::canonicalize(p).expect("canon");
+        let canon_codex = canon(&codex_home);
+        let canon_codex_str = canon_codex.display().to_string();
+        let ws = workspace.display().to_string();
+        let codex_str = codex_home.display().to_string();
+
+        for isolation in [
+            super::HomeIsolation::Blacklist,
+            super::HomeIsolation::Whitelist,
+        ] {
+            view.config.home_isolation = isolation;
+            let codex_plan = view
+                .plan(&ViewedLaunch {
+                    engine: "codex",
+                    workspace: &ws,
+                    engine_home: &codex_str,
+                    worker_id: Some("codex-w1"),
+                    exit_file: None,
+                })
+                .expect("codex plan for ~/.codex");
+            assert!(
+                codex_plan.words.windows(3).any(|w| {
+                    w == ["--bind", canon_codex_str.as_str(), canon_codex_str.as_str()]
+                }),
+                "codex should get writable bind for ~/.codex: {:?}",
+                codex_plan.words
+            );
+            for other_dir in &forbidden_for_codex {
+                if isolation == super::HomeIsolation::Blacklist {
+                    assert!(
+                        !codex_plan
+                            .masks
+                            .contains(&super::Mask::Directory(canon_codex.clone()))
+                    );
+                    assert!(
+                        codex_plan
+                            .masks
+                            .contains(&super::Mask::Directory(canon(other_dir))),
+                        "expected {} masked in codex blacklist plan",
+                        other_dir.display()
+                    );
+                }
+                let err = view
+                    .plan(&ViewedLaunch {
+                        engine: "codex",
+                        workspace: &ws,
+                        engine_home: &other_dir.display().to_string(),
+                        worker_id: None,
+                        exit_file: None,
+                    })
+                    .expect_err("codex must refuse other engine home");
+                assert!(err.contains("overlaps"), "{err}");
+            }
+            for other in ["claude", "agy"] {
+                let err = view
+                    .plan(&ViewedLaunch {
+                        engine: other,
+                        workspace: &ws,
+                        engine_home: &codex_str,
+                        worker_id: None,
+                        exit_file: None,
+                    })
+                    .expect_err("non-codex engine must refuse ~/.codex");
+                assert!(err.contains("overlaps"), "{other}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_codex_engines_and_custom_codex_home_mask_default_codex_dir() {
+        let scratch = crate::Scratch::new("spawn-view-codex-masking");
+        let (view, workspace, forbidden_for_codex) = setup_codex_isolation_fixture(&scratch);
+        let canon_codex = std::fs::canonicalize(view.config.home.join(".codex")).expect("canon");
+        let ws = workspace.display().to_string();
+        for (engine, home_dir) in [
+            ("claude", forbidden_for_codex[1].as_path()),
+            (
+                "agy",
+                view.config.home.join(".gemini/antigravity-cli").as_path(),
+            ),
+            ("codex", scratch.join("custom-codex").as_path()),
+        ] {
+            let plan = view
+                .plan(&ViewedLaunch {
+                    engine,
+                    workspace: &ws,
+                    engine_home: &home_dir.display().to_string(),
+                    worker_id: None,
+                    exit_file: None,
+                })
+                .expect("plan");
+            assert!(
+                plan.masks
+                    .contains(&super::Mask::Directory(canon_codex.clone())),
+                "{engine} should mask ~/.codex: {:?}",
+                plan.masks
+            );
+        }
     }
 }

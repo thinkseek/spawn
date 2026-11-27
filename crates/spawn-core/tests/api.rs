@@ -170,9 +170,10 @@ fn events_round_trip_through_json() {
         )
     };
     assert!(start(ENGINE).is_ok());
-    let refused = start("codex").expect_err("codex is not an engine");
+    assert!(start("codex").is_ok());
+    let refused = start("opencode").expect_err("opencode is not an engine");
     assert!(
-        refused.to_string().contains("unknown engine codex"),
+        refused.to_string().contains("unknown engine opencode"),
         "{refused}"
     );
     let unnamed = serde_json::json!({"type": "start", "prompt": "x"});
