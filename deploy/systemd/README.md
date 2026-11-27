@@ -33,8 +33,8 @@ main, changes nothing live until that commit is gated and deployed.
 | `spawn-maintenance` (`.timer`) | `scripts/maintenance.sh` from the controller: the gate's leftover scratch (`$TMPDIR/spawn-gate.XXXXXX` whose gate is gone, by the pid, start time and boot the gate recorded in it; never a running gate's, whatever its age), deploy.sh's dumps in the backups directory beyond the newest 5, and a VACUUM (ANALYZE) of the test databases' own catalogs, the fleet's and the gates' shared spawn_test (`scripts/vacuum-catalogs.sh`, P21: refused on the live database's port or name, left alone while another session is connected, drops no schema; `--url-var SPAWN_TEST_DATABASE_URL --full`, a dry run unless `--apply`, is the one-time rewrite that gives a leak's room back, run by hand at a quiet moment, never on the timer); nothing Spawn did not create ([docs/storage.md](../../docs/storage.md#disk-room)) | oneshot, hourly |
 | `spawn-session-backup` (`.timer`), `spawn-session-backup-drill` (`.timer`) | `deploy/session-backup.sh`: every account's Claude Code sessions (`~/.claude/projects`, `history.jsonl`, `file-history`) copied as a version (a reflink copy, its manifest and its file and dir counts), thinned to one version per day after 48 h but never a version that holds a file no later one holds (both units run `thin --dry-run`: print-only); daily, a restore of the newest into scratch, checked file by file. **System** units, run as root, installed by hand (below, "Session backups") | oneshot, every 15 min; the drill daily at 05:30 |
 
-`spawn-loop` uses `KillMode=process` so a restart keeps the agents' tmux
-server alive. That only works because `ExecStart` is `spawn loop` itself: with
+`spawn-loop` uses `KillMode=process` so a restart keeps the agents' Herdr
+terminal server alive. That only works because `ExecStart` is `spawn loop` itself: with
 a wrapper script as the main process, systemd would kill the wrapper and leave
 the old loop running beside the new one. SIGTERM (a stop or a deploy's
 restart) ends `spawn loop` after its current pass, once the branch pushes

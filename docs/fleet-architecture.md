@@ -3048,7 +3048,7 @@ the tree's own:
   one run) are cached outside the sandbox, keyed by everything that decides
   them: the base commit, the blobs of the scenario and of the gate, the
   tools the scenarios run (`rustc -vV`, `cargo -V`, `node --version`,
-  `psql -V`, `git --version`, `tmux -V`, `python3 -V`, `jq --version`, in
+  `psql -V`, `git --version`, `python3 -V`, `jq --version`, in
   the sandbox inside the base tree) and the test server's
   `server_version_num`, the scenarios directory's build hook and helpers
   (and the `bind` list's text), a fingerprint of each directory the `bind`

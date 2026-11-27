@@ -81,7 +81,7 @@ fn backoff(interval: std::time::Duration, failures: u32) -> std::time::Duration 
 }
 
 /// Most intervals a execution end waits before its kill finishes.
-/// Longer than a host's kill takes at its bound (tmux: 7 s) plus a
+/// Longer than a host's kill takes at its bound (terminal host: 7 s) plus a
 /// waiting command's retry (1 s by default).
 const TICK_ENDS_LIMIT: std::time::Duration = std::time::Duration::from_secs(12);
 

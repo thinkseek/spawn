@@ -3,8 +3,8 @@
 //! the live panes, and the one click that answers one.
 //!
 //! No agent protocol is spoken (no ACP): the engines (Claude Code, Codex
-//! CLI, AGY CLI, OpenCode) run in Spawn's terminal host as ever (`tmux` or
-//! Herdr, `config::terminal_host`), and what each shows is read from the
+//! CLI, AGY CLI, OpenCode) run in Spawn's terminal host as ever (Herdr,
+//! `config::terminal_host`), and what each shows is read from the
 //! tail of its pane, as `/api/sessions/<id>/pane` reads it, by [`detect`]: a fixed
 //! set of text rules, the same for every engine, no model involved. An
 //! answer is the named keys (spawn-core `NamedKey`, the digits `digit1` to
@@ -21,7 +21,7 @@
 //!     "id": "session_worker_a:3f2c...",   // see below
 //!     "kind": "choice" | "permission" | "yes_no" | "confirm" | "attention" | "mission_halted",
 //!     "session_id", "agent_id",           // null for a mission's item
-//!     "backend": "tmux" | "herdr" | null,
+//!     "backend": "herdr" | null,          // legacy records may carry "tmux"
 //!     "label": "...",                     // what it asks, in a few words
 //!     "summary": "...",                   // its question line, when one is read
 //!     "excerpt": "...",                   // the pane's last lines (masked, bounded)

@@ -3186,7 +3186,7 @@ fn session_list(id: &str, what: &str, query: &str) -> Result<Value, String> {
     }
 }
 
-/// The tail of a session's terminal, read from tmux: a live peek at compute,
+/// The tail of a session's terminal, read from Herdr: a live peek at compute,
 /// not storage. Capturing a pane changes nothing, so the API stays read-only.
 /// It leaves the host masked unless the session's newest start is
 /// positively Claude Code's (decision C2, N4: a failed lookup masks;

@@ -20,7 +20,7 @@ UnsetEnvironment=SPAWN_GATE_SANDBOX SPAWN_ARCHIVE_LOCATIONS_TOOL
 # A new binary migrates the schema before anything reads it.
 ExecStartPre=%h/.local/share/spawn-rsi/bin/spawn init-db
 ExecStart=%h/.local/share/spawn-rsi/bin/spawn loop
-# The agents' tmux server lives in this cgroup. Restarting the loop must not
+# The agents' Herdr terminal server (`spawn-hc` / `herdr`) lives in this cgroup. Restarting the loop must not
 # kill the agents: the next loop recovers their executions from the event
 # log. KillMode=process signals only the main process, so the main process
 # must be `spawn loop` itself; a wrapper script would leave the old loop

@@ -2,7 +2,7 @@
 //! and the model's latest reply.
 //!
 //! The task is read from storage. The terminal tail is a compute peek at
-//! tmux; the Observer stores the copy it used as evidence, so the judgement
+//! the terminal host; the Observer stores the copy it used as evidence, so the judgement
 //! stays replayable from storage alone. The tail leaves the host through
 //! here (the judge's evidence, the attention view's read back), so it is
 //! masked here first: as it is only for a session whose newest start is
