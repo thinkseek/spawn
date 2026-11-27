@@ -105,7 +105,7 @@ until the PoC is measured and the owner says to switch.
   (`--disk-limit-gb`), and the free disk is the smaller of `df`'s and the
   limit less what `du` counts on `/`.
 
-What it must **not** have: no engines, no workspaces, no tmux sessions, no
+What it must **not** have: no engines, no workspaces, no terminal sessions, no
 live database. `setup.sh` wants nothing of the fleet, and the dispatcher
 never sends one: the job carries code and commits, never a credential.
 

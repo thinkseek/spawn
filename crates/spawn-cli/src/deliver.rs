@@ -5794,7 +5794,7 @@ PENDING_ISSUES\n";
         let mut facts = spent_facts("deliver-4-0", 50_000);
         // An earlier attempt may have typed it, the later ones refused.
         facts.dispatched[3].error = Some(format!(
-            "submit text: tmux died; the text {}",
+            "submit text: terminal host died; the text {}",
             spawn_core::bridge::MAY_HAVE_TYPED
         ));
         let rows = [facts];

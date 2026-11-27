@@ -35,7 +35,7 @@
 //! ([`alert_untested`]), and refuses nothing: a screen Spawn cannot read
 //! reads `Unknown`, which types nothing.
 //!
-//! The answer also names the terminal backend: tmux, or Herdr with its
+//! The answer also names the terminal backend: Herdr with its
 //! version, the protocol its server speaks and the agent detection
 //! manifests it has active beside the pinned ones (carry list N8).
 
@@ -693,7 +693,7 @@ pub(crate) fn alert_untested(store: &spawn_postgres::PostgresStore) -> Option<St
     }
 }
 
-/// The terminal backend's part of the answer: tmux, or Herdr with its
+/// The terminal backend's part of the answer: Herdr with its
 /// program's version (`herdr --version`, bounded) and its running server's
 /// protocol and manifests ([`spawn_host::HerdrHost::server_facts`]), or why
 /// they could not be read.

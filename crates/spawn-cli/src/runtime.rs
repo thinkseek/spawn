@@ -1849,15 +1849,15 @@ mod tests {
         let herdr_engines = engines_for(&env, true).expect("herdr engines");
         assert!(herdr_engines[0].1.isolate_brain);
 
-        let tmux_view = view_config_for_backend(&env, false);
-        assert_eq!(tmux_view.canonical_workspace, None);
+        let non_herdr_view = view_config_for_backend(&env, false);
+        assert_eq!(non_herdr_view.canonical_workspace, None);
         assert_eq!(
-            tmux_view.home_isolation,
+            non_herdr_view.home_isolation,
             spawn_host::HomeIsolation::Blacklist
         );
-        assert!(!tmux_view.isolate_brain);
-        let tmux_engines = engines_for(&env, false).expect("tmux engines");
-        assert!(!tmux_engines[0].1.isolate_brain);
+        assert!(!non_herdr_view.isolate_brain);
+        let non_herdr_engines = engines_for(&env, false).expect("non-herdr engines");
+        assert!(!non_herdr_engines[0].1.isolate_brain);
     }
 
     #[test]
