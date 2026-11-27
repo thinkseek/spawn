@@ -709,6 +709,7 @@ impl<L: RefLedger> D6Workspace<L> {
             .project_snapshot_oid(&snap, &parent_oids)
             .map_err(map_store_err)?;
         self.store.cas().sync_store().map_err(map_cas_err)?;
+        let mut canonical = new_snapshot.clone();
         let at_ms = if let Some(existing) = self
             .ledger
             .get_snapshot(new_snapshot)
@@ -722,7 +723,7 @@ impl<L: RefLedger> D6Workspace<L> {
             } else {
                 self.now_ms()
             };
-            let _ = self
+            canonical = self
                 .ledger
                 .record_snapshot(
                     new_snapshot,
@@ -735,6 +736,7 @@ impl<L: RefLedger> D6Workspace<L> {
                 .map_err(map_store_err)?;
             ts
         };
+        let new_snapshot = &canonical;
         let seq = self
             .ledger
             .land_main_ref(
@@ -2756,10 +2758,13 @@ impl<L: RefLedger> D6Workspace<L> {
         reason: &str,
     ) -> Result<u64, WorkspaceError> {
         self.store.cas().sync_store().map_err(map_cas_err)?;
-        let _ = self
+        // Reference the canonical id: a concurrent writer may have recorded
+        // the same Git commit under another digest first.
+        let canonical = self
             .ledger
             .record_snapshot(snap_id, git_oid, tree, parents, &self.project, at_ms)
             .map_err(map_store_err)?;
+        let snap_id = &canonical;
         let seq = self
             .ledger
             .cas_ref(

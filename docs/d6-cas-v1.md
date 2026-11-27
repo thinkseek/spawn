@@ -58,7 +58,7 @@
 
 1. Write chunks (if `> 4 MiB`), `chunk-index`, file blobs, child-to-root trees, and snapshot object.
 2. Call `Store::sync_store()` (single `syncfs` on Linux) so all new objects and indexes are durable on disk before PostgreSQL references them.
-3. Commit the PostgreSQL transaction (`spawn_snapshot_record` / `spawn_ref_cas`).
+3. Commit the PostgreSQL transaction (`spawn_snapshot_record` / `spawn_ref_cas`). `spawn_snapshot_record` returns the canonical snapshot id: when a concurrent writer already recorded the same Git commit (same `git_oid`, `tree`, `parents`, `project`) under another id or `created_at_ms`, it returns that row's id (first writer's `created_at_ms` wins) instead of raising `23505` on `spawn_snapshots_git_oid_key`, and the ref move must name the returned id. Mismatched content still raises `23505`.
 4. Append and `fsync` the storage root's `refs.journal` (used for fast-forward reconciliation across backup restore windows).
 
 ### Single-Owner GC & Fence
