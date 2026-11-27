@@ -2500,6 +2500,11 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
     warnings.extend(shared_cache_warnings);
     let (model_endpoints, model_warnings) = probe_model_endpoints();
     warnings.extend(model_warnings);
+    let (claude_config, claude_config_warnings) = probe_claude_config_with(
+        &|name| std::env::var(name).ok(),
+        loaded_config.as_ref().map(|(_, cfg)| cfg),
+    );
+    warnings.extend(claude_config_warnings);
 
     let report = json!({
         "ok": git["ok"].as_bool().unwrap_or(false) && kernel["ok"].as_bool().unwrap_or(false),
@@ -2528,6 +2533,7 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
         "storage_probes": storage_probes,
         "shared_build_caches": shared_build_caches,
         "model_endpoints": model_endpoints,
+        "claude_config": claude_config,
         "warnings": warnings,
     });
 
@@ -3179,6 +3185,7 @@ fn print_doctor_human(report: &Value) {
     );
     print_doctor_shared_build_caches(&report["shared_build_caches"]);
     print_doctor_model_endpoints(&report["model_endpoints"]);
+    print_doctor_claude_config(&report["claude_config"]);
     if let Some(warnings) = report["warnings"].as_array() {
         for warning in warnings {
             if let Some(text) = warning.as_str() {
@@ -3286,6 +3293,90 @@ fn probe_single_model_endpoint(
     )
 }
 
+/// Which Claude Code directory the engines run with (issue #79), as far
+/// as it is no secret: where it comes from (`SPAWN_CLAUDE_CONFIG_DIR`,
+/// `[engines.claude].config_dir`, or the user's own `~/.claude`), its
+/// path, and whether a `settings.json` is there. The file is never read:
+/// it holds the gateway's token.
+fn probe_claude_config_with(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    cfg: Option<&SpawnConfig>,
+) -> (Value, Vec<String>) {
+    let mut warnings = Vec::new();
+    let from_toml = cfg
+        .and_then(|cfg| cfg.engines.claude.as_ref())
+        .filter(|claude| claude.enabled)
+        .and_then(|claude| claude.config_dir.as_ref());
+    // The rule `spawn loop` applies (`runtime::claude_config_dir`): empty
+    // reads as unset, anything but an absolute path stops the loop. This
+    // file is also compiled alone by `tests/config_toml.rs`, so the rule is
+    // restated here rather than called.
+    let from_env = lookup("SPAWN_CLAUDE_CONFIG_DIR").filter(|dir| !dir.trim().is_empty());
+    let (source, dir) = match from_env {
+        Some(dir) if dir.starts_with('/') => {
+            let trimmed = dir.trim_end_matches('/');
+            let dir = if trimmed.is_empty() { "/" } else { trimmed };
+            ("SPAWN_CLAUDE_CONFIG_DIR", Some(PathBuf::from(dir)))
+        }
+        Some(dir) => {
+            warnings.push(format!(
+                "SPAWN_CLAUDE_CONFIG_DIR must be an absolute path, not {dir:?}: `spawn loop` \
+                 refuses to start"
+            ));
+            ("SPAWN_CLAUDE_CONFIG_DIR", None)
+        }
+        None => match from_toml {
+            Some(dir) => match expand_tilde(dir, lookup) {
+                Ok(dir) => ("[engines.claude].config_dir", Some(dir)),
+                Err(error) => {
+                    warnings.push(format!("[engines.claude].config_dir: {error}"));
+                    ("[engines.claude].config_dir", None)
+                }
+            },
+            None => (
+                "default",
+                lookup("HOME")
+                    .filter(|home| !home.is_empty())
+                    .map(|home| PathBuf::from(home).join(".claude")),
+            ),
+        },
+    };
+    let isolated = source != "default" && dir.is_some();
+    let settings_json = dir
+        .as_ref()
+        .is_some_and(|dir| dir.join("settings.json").is_file());
+    if isolated && !settings_json {
+        warnings.push(format!(
+            "engine Claude Code directory {} has no settings.json: engines there get no \
+             gateway token",
+            dir.as_deref().unwrap_or(Path::new("")).display()
+        ));
+    }
+    (
+        json!({
+            "source": source,
+            "path": dir,
+            "isolated": isolated,
+            "settings_json_present": settings_json,
+        }),
+        warnings,
+    )
+}
+
+fn print_doctor_claude_config(report: &Value) {
+    println!(
+        "claude_config: source={}, path={}, isolated={}, settings_json={}",
+        report["source"].as_str().unwrap_or("unknown"),
+        report["path"].as_str().unwrap_or("unknown"),
+        report["isolated"].as_bool().unwrap_or(false),
+        if report["settings_json_present"].as_bool().unwrap_or(false) {
+            "present"
+        } else {
+            "missing"
+        },
+    );
+}
+
 fn probe_model_endpoints() -> (Value, Vec<String>) {
     probe_model_endpoints_with(
         &|name| std::env::var(name).ok(),
@@ -3332,6 +3423,13 @@ fn probe_model_endpoints_with(
         "preflight_mode": preflight_mode,
         "model_relay": relay_report,
         "judge": judge_report,
+        // Every slot Spawn's inline `--settings` names through the relay
+        // (issue #79), so `~/.claude/settings.json` cannot change them.
+        "pinned_slots": if relay_configured {
+            spawn_core::bridge::MODEL_SLOTS.to_vec()
+        } else {
+            Vec::new()
+        },
         "model_slots": {
             "default": default_slot,
             "cheap": cheap_slot,
@@ -3345,6 +3443,74 @@ fn probe_model_endpoints_with(
 #[cfg(test)]
 mod tests {
     use super::probe_model_endpoints_with;
+
+    /// Issue #79: doctor shows which Claude Code directory the engines run
+    /// with, the env first, then `spawn.toml`, else the user's own, and
+    /// never reads what `settings.json` holds.
+    #[test]
+    fn doctor_reports_the_engines_claude_config_dir_without_its_contents() {
+        use super::{SpawnConfig, probe_claude_config_with};
+
+        let base = std::env::temp_dir().join(format!("spawn-doctor-claude-{}", std::process::id()));
+        let fleet = base.join("fleet-claude");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        std::fs::write(
+            fleet.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"DoctorTok99"}}"#,
+        )
+        .expect("write settings");
+        let fleet_str = fleet.display().to_string();
+        let home = base.join("home").display().to_string();
+
+        let lookup = |key: &str| match key {
+            "SPAWN_CLAUDE_CONFIG_DIR" => Some(format!("{fleet_str}/")),
+            "HOME" => Some(home.clone()),
+            _ => None,
+        };
+        let (env, warnings) = probe_claude_config_with(&lookup, None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(env["source"], "SPAWN_CLAUDE_CONFIG_DIR");
+        assert_eq!(env["path"], fleet_str.as_str());
+        assert_eq!(env["isolated"], true);
+        assert_eq!(env["settings_json_present"], true);
+        assert!(!env.to_string().contains("DoctorTok99"), "{env}");
+
+        let toml = concat!(
+            "schema_version = 1\n\n[instance]\ndata_dir = \"/srv/spawn\"\n\n",
+            "[engines.claude]\nconfig_dir = \"~/fleet-claude\"\n"
+        );
+        let cfg = SpawnConfig::from_toml_str(toml).expect("config parses");
+        let home_only = |key: &str| (key == "HOME").then(|| base.display().to_string());
+        let (toml_report, warnings) = probe_claude_config_with(&home_only, Some(&cfg));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(toml_report["source"], "[engines.claude].config_dir");
+        assert_eq!(toml_report["path"], fleet_str.as_str());
+        assert_eq!(toml_report["isolated"], true);
+
+        let (default, warnings) =
+            probe_claude_config_with(&|key| (key == "HOME").then(|| home.clone()), None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(default["source"], "default");
+        assert_eq!(default["path"], format!("{home}/.claude").as_str());
+        assert_eq!(default["isolated"], false);
+
+        let relative = |key: &str| (key == "SPAWN_CLAUDE_CONFIG_DIR").then(|| "rel".to_string());
+        let (refused, warnings) = probe_claude_config_with(&relative, None);
+        assert_eq!(refused["isolated"], false);
+        assert!(refused["path"].is_null());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+        let empty = base.join("empty-claude");
+        std::fs::create_dir_all(&empty).expect("mkdir empty");
+        let empty_str = empty.display().to_string();
+        let (no_settings, warnings) = probe_claude_config_with(
+            &|key| (key == "SPAWN_CLAUDE_CONFIG_DIR").then(|| empty_str.clone()),
+            None,
+        );
+        assert_eq!(no_settings["settings_json_present"], false);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn probe_model_endpoints_reports_not_configured_ok_and_redacted_unreachable() {
@@ -3375,6 +3541,11 @@ mod tests {
         assert_eq!(healthy["model_slots"]["default"], "claude-opus-5-5");
         assert_eq!(healthy["model_slots"]["cheap"], "deepseek-v4-pro");
         assert_eq!(healthy["model_slots"]["small"], "deepseek-flash");
+        assert_eq!(
+            healthy["pinned_slots"],
+            serde_json::json!(spawn_core::bridge::MODEL_SLOTS)
+        );
+        assert_eq!(unconfigured["pinned_slots"], serde_json::json!([]));
 
         let down_probe = |url: &str, _timeout: std::time::Duration| spawn_jev::EndpointHealth {
             status: spawn_jev::EndpointStatus::Unreachable,

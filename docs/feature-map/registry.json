@@ -592,6 +592,7 @@
         "README.zh-CN.md",
         "docs/api.md",
         "docs/architecture.md",
+        "docs/config.md",
         "docs/design.md",
         "docs/glossary.md"
       ],
