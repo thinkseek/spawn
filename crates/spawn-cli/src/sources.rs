@@ -46,7 +46,6 @@ use spawn_cas::{Digest, GitOid};
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{BaseMerge, Branch, Commit, Hold, SetAside, WorkspaceError, WorkspaceStore};
 use spawn_host::d6_workspace::D6Workspace;
-use spawn_host::tree_path::TreePath;
 use spawn_host::workspace::DynRefLedger;
 use spawn_host::{
     CasMerkleStore, D6RefKind, D6StoreError, LedgerRef, LedgerSnapshot, LocalWorkspaceStore,
@@ -602,9 +601,11 @@ pub(crate) fn open_d6_workspace_borrowed<'a>(
     Ok(store)
 }
 
-/// Read `.main-copies/<agent>` directly under `root`, supporting both Git hex commits
-/// and D6 `sha256:...` digests when `root` is a D6 workspace root.
+/// Read non-marker conflict `<root>/.main-copies/<agent>` directly under `root` in tests,
+/// supporting both Git hex commits and D6 `sha256:...` digests when `root` is a D6 workspace root.
+#[cfg(test)]
 pub(crate) fn read_main_copies_at(root: &Path, agent: &str) -> Option<(String, Vec<String>)> {
+    use spawn_host::tree_path::TreePath;
     let canonical = spawn_host::canonical_root(root);
     let bytes = std::fs::read(canonical.join(".main-copies").join(agent)).ok()?;
     let mut fields = bytes.split(|&b| b == b'\0');
@@ -631,50 +632,6 @@ pub(crate) fn read_main_copies_at(root: &Path, agent: &str) -> Option<(String, V
         .map(|entry| TreePath::from_bytes(entry).shown())
         .collect();
     Some((main, files))
-}
-
-/// Read non-marker conflict main-copies recorded for `agent` via `store`'s active backend.
-pub(crate) fn main_copies_for_store(
-    store: &LocalWorkspaceStore,
-    agent: &str,
-) -> Option<(String, Vec<String>)> {
-    match store {
-        LocalWorkspaceStore::D6(d6) => d6.main_copies(agent),
-        LocalWorkspaceStore::D6Shadow(oracle) => oracle.primary().main_copies(agent),
-        LocalWorkspaceStore::Git(git) => git.main_copies(agent),
-        LocalWorkspaceStore::Cow(cow) => read_main_copies_at(cow.root(), agent),
-        #[cfg(target_os = "linux")]
-        LocalWorkspaceStore::Overlay(overlay) => read_main_copies_at(overlay.root(), agent),
-    }
-}
-
-fn has_git_pending_merge_at(root: &Path, agent: &str) -> bool {
-    let Ok(bytes) = std::fs::read(spawn_host::canonical_root(root).join(".merge").join(agent))
-    else {
-        return false;
-    };
-    let mut fields = bytes.split(|&b| b == b'\0');
-    let is_hex = |field: &[u8]| !field.is_empty() && field.iter().all(u8::is_ascii_hexdigit);
-    let Some(first) = fields.next() else {
-        return false;
-    };
-    if first == b"pending-merge" {
-        fields.next().is_some_and(is_hex) && fields.next().is_some_and(is_hex)
-    } else {
-        is_hex(first)
-    }
-}
-
-/// Check whether `agent` has an unresolved pending merge via `store`'s active backend.
-pub(crate) fn has_pending_merge_for_store(store: &LocalWorkspaceStore, agent: &str) -> bool {
-    match store {
-        LocalWorkspaceStore::D6(d6) => d6.has_pending_merge(agent),
-        LocalWorkspaceStore::D6Shadow(oracle) => oracle.primary().has_pending_merge(agent),
-        LocalWorkspaceStore::Git(git) => git.has_pending_merge(agent),
-        LocalWorkspaceStore::Cow(cow) => has_git_pending_merge_at(cow.root(), agent),
-        #[cfg(target_os = "linux")]
-        LocalWorkspaceStore::Overlay(overlay) => has_git_pending_merge_at(overlay.root(), agent),
-    }
 }
 
 /// Lazy [`RefLedger`] wrapper used by standalone `WorkspaceSettings::store` calls before a shared
@@ -1093,7 +1050,7 @@ impl MissionWorkspaces {
 
     pub(crate) fn main_copies(&self, agent: &str) -> Option<(String, Vec<String>)> {
         let routed = self.route(agent).ok()?;
-        main_copies_for_store(&routed.store, agent)
+        routed.store.main_copies(agent)
     }
 
     /// The same store deduplicating build artifacts when `on`
@@ -1947,7 +1904,7 @@ impl WorkspaceStore for MissionWorkspaces {
         if let Some((repo, source)) = &routed.mirror
             && receives_branches(source)
         {
-            let worker_ref = spawn_host::git::worker_head_ref(workspace.sandbox());
+            let worker_ref = spawn_host::workspace_rules::worker_head_ref(workspace.sandbox());
             if ref_commit(repo, &worker_ref).is_some() {
                 match crate::push::push_ref(repo, source, &worker_ref, &worker_ref) {
                     Pushed::Done => {}
@@ -2078,7 +2035,7 @@ fn d6_pin_worker_head<L: RefLedger + Send + Sync>(
             ));
         }
     }
-    let worker_ref = spawn_host::git::worker_head_ref(agent_id);
+    let worker_ref = spawn_host::workspace_rules::worker_head_ref(agent_id);
     let snap = match d6
         .branch_snapshot(agent_id)
         .map_err(|error| error.to_string())?
@@ -2126,8 +2083,8 @@ fn persist_worker_commits_with_store(
     task_id: i64,
     stage: &str,
 ) -> Result<Option<String>, String> {
-    let worker_ref = spawn_host::git::worker_head_ref(agent_id);
-    let task_ref = spawn_host::git::task_head_ref(task_id, stage);
+    let worker_ref = spawn_host::workspace_rules::worker_head_ref(agent_id);
+    let task_ref = spawn_host::workspace_rules::task_head_ref(task_id, stage);
     if let Some(d6) = local.d6_workspace() {
         return d6_pin_worker_head(d6, agent_id, &[&task_ref])
             .map_err(|error| format!("pin {task_ref}: {error}"));
@@ -2190,7 +2147,7 @@ pub(crate) fn task_worker_head_pinned_with_settings(
     else {
         return false;
     };
-    let task_ref = spawn_host::git::task_head_ref(task_id, stage);
+    let task_ref = spawn_host::workspace_rules::task_head_ref(task_id, stage);
     if settings.active == HostWorkspaceBackend::D6 {
         let project = repo.to_string_lossy();
         return store
@@ -2239,7 +2196,7 @@ pub(crate) fn persist_task_worker_commits_with_settings(
         return Ok(None);
     };
     if settings.active == HostWorkspaceBackend::D6 {
-        let task_ref = spawn_host::git::task_head_ref(task_id, stage);
+        let task_ref = spawn_host::workspace_rules::task_head_ref(task_id, stage);
         let d6 = open_d6_workspace_borrowed(&repo, root, &settings.d6, store)?;
         return d6_pin_worker_head(&d6, agent_id, &[&task_ref])
             .map_err(|error| format!("pin {task_ref}: {error}"));
@@ -2915,11 +2872,7 @@ mod tests {
             let needle = concat!(":", ":git");
             let path = code.match_indices(needle).any(|(at, _)| {
                 let rest = &code[at + needle.len()..];
-                let is_host_git_ref_helper = code[..at].ends_with("spawn_host")
-                    && (rest.starts_with("::worker_head_ref")
-                        || rest.starts_with("::task_head_ref"));
-                !is_host_git_ref_helper
-                    && !rest.starts_with(|next: char| next.is_alphanumeric() || next == '_')
+                !rest.starts_with(|next: char| next.is_alphanumeric() || next == '_')
             });
             let listed = code.match_indices("use ").any(|(at, _)| {
                 let line = code[..at].rfind('\n').map_or(0, |newline| newline + 1);
@@ -2969,8 +2922,6 @@ mod tests {
             "    use crate::sources::{ensure_mirror, test_git as git};"
         ));
         assert!(!names_git("let git = crate::sources::test_git;"));
-        assert!(!names_git("spawn_host::git::worker_head_ref(\"a\")"));
-        assert!(!names_git("spawn_host::git::task_head_ref(1, \"head\")"));
         let own = include_str!("sources.rs");
         let code = own.split("#[cfg(test)]\nmod ").next().unwrap_or(own);
         assert_eq!(code.matches("spawn_host::git_command(\"git\")").count(), 1);
@@ -3706,9 +3657,9 @@ mod tests {
         ])
         .expect("source gc");
         for r in [
-            spawn_host::git::worker_head_ref(branch.as_str()),
-            spawn_host::git::task_head_ref(77, "head"),
-            spawn_host::git::task_head_ref(77, "accepted"),
+            spawn_host::workspace_rules::worker_head_ref(branch.as_str()),
+            spawn_host::workspace_rules::task_head_ref(77, "head"),
+            spawn_host::workspace_rules::task_head_ref(77, "accepted"),
         ] {
             assert_eq!(
                 ref_commit(&source, &r).as_deref(),
@@ -3978,8 +3929,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let (repo, head) = seed_prune_guard_repo(&base);
 
-        let task_ref = spawn_host::git::task_head_ref(42, "head");
-        let worker_head = spawn_host::git::worker_head_ref("w-active");
+        let task_ref = spawn_host::workspace_rules::task_head_ref(42, "head");
+        let worker_head = spawn_host::workspace_rules::worker_head_ref("w-active");
         let active_spawn = "refs/heads/spawn/w-active";
         let active_local = "refs/heads/w-active";
         let integrate_ref = "refs/spawn-integrate/w-active";
@@ -4213,9 +4164,9 @@ mod tests {
             .into_owned();
         let refs = store.list_refs(Some(&repo_key)).expect("list_refs");
         for expected_ref in [
-            spawn_host::git::worker_head_ref(&agent_id),
-            spawn_host::git::task_head_ref(task_id, "head"),
-            spawn_host::git::task_head_ref(task_id, "accepted"),
+            spawn_host::workspace_rules::worker_head_ref(&agent_id),
+            spawn_host::workspace_rules::task_head_ref(task_id, "head"),
+            spawn_host::workspace_rules::task_head_ref(task_id, "accepted"),
         ] {
             assert!(
                 refs.iter().any(|r| r.name == expected_ref),

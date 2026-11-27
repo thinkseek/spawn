@@ -668,6 +668,60 @@ impl LocalWorkspaceStore {
         }
     }
 
+    /// Files `commit` changes against `base` that hold an unresolved conflict marker block.
+    pub fn conflict_markers(
+        &self,
+        base: &str,
+        commit: &str,
+    ) -> Result<Vec<String>, WorkspaceError> {
+        match self {
+            Self::Git(store) => store.conflict_markers(base, commit),
+            Self::Cow(store) => store.git_store().conflict_markers(base, commit),
+            #[cfg(target_os = "linux")]
+            Self::Overlay(store) => store.git_store().conflict_markers(base, commit),
+            Self::D6Shadow(oracle) => oracle.primary().conflict_markers(base, commit),
+            Self::D6(store) => store.conflict_markers(base, commit),
+        }
+    }
+
+    /// Unified patch turning `from` into `to` for Git-backed stores.
+    pub fn patch_between(&self, from: &str, to: &str) -> Result<String, WorkspaceError> {
+        match self {
+            Self::Git(store) => store.patch_between(from, to),
+            Self::Cow(store) => store.git_store().patch_between(from, to),
+            #[cfg(target_os = "linux")]
+            Self::Overlay(store) => store.git_store().patch_between(from, to),
+            Self::D6Shadow(oracle) => oracle.primary().patch_between(from, to),
+            Self::D6(_) => Err(WorkspaceError::Unavailable(
+                "D6 workspace does not render textual git patches".to_string(),
+            )),
+        }
+    }
+
+    /// Non-marker conflict `main` copies recorded for `branch`, if any.
+    pub fn main_copies(&self, branch: &str) -> Option<(String, Vec<String>)> {
+        match self {
+            Self::Git(store) => store.main_copies(branch),
+            Self::Cow(store) => store.git_store().main_copies(branch),
+            #[cfg(target_os = "linux")]
+            Self::Overlay(store) => store.git_store().main_copies(branch),
+            Self::D6Shadow(oracle) => oracle.primary().main_copies(branch),
+            Self::D6(store) => store.main_copies(branch),
+        }
+    }
+
+    /// Whether a merge of `main` into `branch` is waiting on conflict marker resolution.
+    pub fn has_pending_merge(&self, branch: &str) -> bool {
+        match self {
+            Self::Git(store) => store.has_pending_merge(branch),
+            Self::Cow(store) => store.git_store().has_pending_merge(branch),
+            #[cfg(target_os = "linux")]
+            Self::Overlay(store) => store.git_store().has_pending_merge(branch),
+            Self::D6Shadow(oracle) => oracle.primary().has_pending_merge(branch),
+            Self::D6(store) => store.has_pending_merge(branch),
+        }
+    }
+
     /// The directory where the host reads and writes `workspace`'s files:
     /// the workspace's own path for Git and Cow; for an overlay, its merged
     /// view through the holder ([`OverlayWorkspace::host_path`]).

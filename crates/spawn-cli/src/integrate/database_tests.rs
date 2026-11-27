@@ -11503,8 +11503,8 @@ fn prune_guard_protects_active_worker_branches_and_task_head_refs_across_integra
     let agent = agent_of(&db, mission, task);
     let pushed = push_work(&base, &source, &agent, "task.txt");
 
-    let task_ref = spawn_host::git::task_head_ref(task, "head");
-    let worker_ref = spawn_host::git::worker_head_ref(&agent);
+    let task_ref = spawn_host::workspace_rules::task_head_ref(task, "head");
+    let worker_ref = spawn_host::workspace_rules::worker_head_ref(&agent);
     let pushed_branch_ref = format!("refs/heads/spawn/{agent}");
     git(&["--git-dir", &source, "update-ref", &task_ref, &pushed]).expect("tag task head");
     git(&["--git-dir", &source, "update-ref", &worker_ref, &pushed]).expect("tag worker head");

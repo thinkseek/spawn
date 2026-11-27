@@ -3075,9 +3075,8 @@ fn d6_judge_inspects_pending_merge_conflict_markers_and_patch_without_git_mirror
             .expect("tree id"),
         main_tree.to_string()
     );
-    let markers =
-        super::Judge::store_conflict_markers(&local, &nonexistent_mirror, &main_oid, &marked_oid)
-            .expect("conflict markers");
+    let markers = super::Judge::store_conflict_markers(&local, &main_oid, &marked_oid)
+        .expect("conflict markers");
     assert_eq!(markers, vec!["custom/code.c".to_string()]);
 
     // Resolve markers in small clean commit and test D6 patch length + landing candidate.
@@ -3091,13 +3090,12 @@ fn d6_judge_inspects_pending_merge_conflict_markers_and_patch_without_git_mirror
     };
     let clean_oid = clean_commit.as_str().to_string();
     assert!(
-        super::Judge::store_conflict_markers(&local, &nonexistent_mirror, &main_oid, &clean_oid)
+        super::Judge::store_conflict_markers(&local, &main_oid, &clean_oid)
             .expect("no markers")
             .is_empty()
     );
     let small_len =
-        super::Judge::store_patch_len(&local, &nonexistent_mirror, &main_oid, &clean_oid)
-            .expect("small patch");
+        super::Judge::store_patch_len(&local, &main_oid, &clean_oid).expect("small patch");
     assert!(
         small_len > 0 && small_len < super::MAX_PATCH_BYTES,
         "{small_len}"
@@ -3125,8 +3123,7 @@ fn d6_judge_inspects_pending_merge_conflict_markers_and_patch_without_git_mirror
         panic!("expected Created");
     };
     let big_len =
-        super::Judge::store_patch_len(&local, &nonexistent_mirror, &main_oid, big_commit.as_str())
-            .expect("big patch");
+        super::Judge::store_patch_len(&local, &main_oid, big_commit.as_str()).expect("big patch");
     assert!(big_len > super::MAX_PATCH_BYTES, "{big_len}");
     assert!(!nonexistent_mirror.exists());
 

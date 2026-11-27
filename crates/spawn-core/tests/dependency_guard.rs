@@ -863,3 +863,45 @@ fn workspace_safe_crate_guard_covers_all_non_exempt_members() {
         "every non-exempt workspace crate must be covered by SAFE_WORKSPACE_CRATES"
     );
 }
+
+#[test]
+fn git_module_boundary_ratchet_is_enforced() {
+    let root = repo_root();
+    for rel in [
+        "crates/spawn-host/src/d6_workspace.rs",
+        "crates/spawn-host/src/d6_layer0.rs",
+        "crates/spawn-host/src/d6_cutover.rs",
+        "crates/spawn-host/src/git_border.rs",
+        "crates/spawn-host/src/cas_merkle.rs",
+        "crates/spawn-host/src/merkle_merge.rs",
+    ] {
+        let path = root.join(rel);
+        let text = fs::read_to_string(&path).expect("read guarded spawn-host module");
+        assert!(
+            !text.contains("crate::git::"),
+            "{rel} must not reference crate::git::"
+        );
+    }
+
+    let cli_src = root.join("crates/spawn-cli/src");
+    let mut cli_files = Vec::new();
+    collect_rs_files(&cli_src, &mut cli_files);
+    cli_files.sort();
+    assert!(!cli_files.is_empty(), "expected crates/spawn-cli/src files");
+    for path in cli_files {
+        if is_test_only_src_file(&cli_src, &path) {
+            continue;
+        }
+        let text = fs::read_to_string(&path).expect("read spawn-cli src file");
+        let prod = strip_cfg_test_blocks(&text);
+        let rel = rel_path_unix(&root, &path);
+        assert!(
+            !prod.contains("spawn_host::git::"),
+            "{rel} non-test code must not reference spawn_host::git::"
+        );
+        assert!(
+            !prod.contains("GitWorkspace"),
+            "{rel} non-test code must not name GitWorkspace"
+        );
+    }
+}

@@ -972,7 +972,7 @@ fn verify_commits_and_diff_contracts(
         "feature one\n",
         "Add feature one",
         Some("spawn checkpoint exec_1"),
-        &spawn_host::git::task_head_ref(fx.t1, "head"),
+        &spawn_host::workspace_rules::task_head_ref(fx.t1, "head"),
     );
     let head2 = push_branch_from_base(
         &fx.work,
@@ -981,7 +981,7 @@ fn verify_commits_and_diff_contracts(
         "feature two\n",
         "Add feature two",
         Some("spawn checkpoint exec_2"),
-        &spawn_host::git::worker_head_ref(&fx.agent2),
+        &spawn_host::workspace_rules::worker_head_ref(&fx.agent2),
     );
     let _head3 = push_branch_from_base(
         &fx.work,
@@ -998,7 +998,7 @@ fn verify_commits_and_diff_contracts(
     assert_eq!(commits_json["task_id"], fx.t1);
     assert_eq!(
         commits_json["resolved_ref"],
-        spawn_host::git::task_head_ref(fx.t1, "head")
+        spawn_host::workspace_rules::task_head_ref(fx.t1, "head")
     );
     assert_eq!(commits_json["base_sha"], fx.base_sha);
     assert_eq!(commits_json["head_sha"], head1);
@@ -1018,7 +1018,7 @@ fn verify_commits_and_diff_contracts(
     let t2_json = spawn_json(&["task", "commits", &t2_str, "--json"], env);
     assert_eq!(
         t2_json["resolved_ref"],
-        spawn_host::git::worker_head_ref(&fx.agent2)
+        spawn_host::workspace_rules::worker_head_ref(&fx.agent2)
     );
     let t3_json = spawn_json(&["task", "commits", &t3_str, "--json"], env);
     assert_eq!(
@@ -1127,7 +1127,7 @@ fn verify_conflict_and_error_contracts(env: &[(&str, &str)], fx: &TaskLandFixtur
         "worker change\n",
         "Conflicting readme change",
         None,
-        &spawn_host::git::task_head_ref(fx.t4, "head"),
+        &spawn_host::workspace_rules::task_head_ref(fx.t4, "head"),
     );
     run_test_git(Some(&fx.work), &["fetch", "origin", "main"]);
     run_test_git(Some(&fx.work), &["checkout", "-B", "main_adv", new_main]);

@@ -6,7 +6,7 @@
 //!
 //! Safety invariants:
 //! - Depends strictly on `spawn-host` + `spawn-cas` (zero database dependencies, zero forbidden OS code).
-//! - All Git commands go exclusively through [`crate::git::git_command`].
+//! - All Git commands go exclusively through [`crate::git_process::git_command`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -27,8 +27,8 @@ use spawn_cas::{
 
 use crate::cas_merkle::{CasMerkleStore, D6RefKind, D6StoreError, RefLedger, is_pointer_sized};
 use crate::d6_layer0::{ExportAttributesAudit, audit_export_attributes};
-use crate::git::git_command;
 use crate::git_border::{GitBorderAdapter, ImportReport};
+use crate::git_process::git_command;
 use crate::tree_path::{TreePath, nul_fields};
 
 static CUTOVER_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);

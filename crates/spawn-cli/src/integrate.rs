@@ -4299,26 +4299,7 @@ impl Judge {
         d6: &spawn_host::d6_workspace::D6Workspace<L>,
         rev: &str,
     ) -> Result<spawn_host::LedgerSnapshot, String> {
-        if let Ok(oid) = spawn_cas::GitOid::parse_hex(rev) {
-            return d6
-                .ledger()
-                .get_snapshot_by_oid(&oid)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("commit {rev} missing from D6 RefLedger"));
-        }
-        let branch = rev.strip_prefix("refs/heads/").unwrap_or(rev);
-        if let Some(snap) = d6
-            .branch_snapshot(branch)
-            .map_err(|error| error.to_string())?
-        {
-            return Ok(snap);
-        }
-        if branch != rev
-            && let Some(snap) = d6.branch_snapshot(rev).map_err(|error| error.to_string())?
-        {
-            return Ok(snap);
-        }
-        Err(format!("ref {rev} missing from D6 RefLedger"))
+        d6.resolve_snapshot(rev).map_err(|error| error.to_string())
     }
 
     fn d6_is_ancestor<L: spawn_host::RefLedger>(
@@ -4452,143 +4433,16 @@ impl Judge {
     }
 
     pub(super) fn store_has_pending_merge(repo: &LocalWorkspaceStore, agent: &str) -> bool {
-        sources::has_pending_merge_for_store(repo, agent)
-    }
-
-    pub(super) fn d6_conflict_markers<L: spawn_host::RefLedger>(
-        d6: &spawn_host::d6_workspace::D6Workspace<L>,
-        base: &str,
-        commit: &str,
-    ) -> Result<Vec<String>, String> {
-        let base_snap = Self::resolve_d6_snapshot(d6, base)?;
-        let commit_snap = Self::resolve_d6_snapshot(d6, commit)?;
-        let base_flat = d6
-            .store()
-            .flatten_tree(&base_snap.tree)
-            .map_err(|error| error.to_string())?;
-        let commit_flat = d6
-            .store()
-            .flatten_tree(&commit_snap.tree)
-            .map_err(|error| error.to_string())?;
-        let mut files: Vec<spawn_host::tree_path::TreePath> = Vec::new();
-        for (path, entry) in &commit_flat {
-            if !matches!(
-                entry.kind,
-                spawn_cas::TreeEntryKind::File | spawn_cas::TreeEntryKind::Executable
-            ) {
-                continue;
-            }
-            if base_flat.get(path) != Some(entry) {
-                files.push(spawn_host::tree_path::TreePath::from_bytes(path.clone()));
-            }
-        }
-        if files.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut shortest = vec![7usize; files.len()];
-        for flat in [&base_flat, &commit_flat] {
-            if let Some(entry) = flat.get(b".gitattributes".as_slice())
-                && let Some(digest) = entry.digest()
-            {
-                let raw = d6
-                    .store()
-                    .cas()
-                    .read_blob(&digest)
-                    .map_err(|error| error.to_string())?;
-                if let Ok(attrs) = spawn_host::merkle_merge::GitAttributes::from_root_str(
-                    &String::from_utf8_lossy(&raw),
-                    &[],
-                ) {
-                    for (idx, path) in files.iter().enumerate() {
-                        shortest[idx] = shortest[idx]
-                            .min(attrs.resolve_path(path.as_bytes()).conflict_marker_size);
-                    }
-                }
-            }
-            for (idx, path) in files.iter().enumerate() {
-                let bytes = path.as_bytes();
-                let mut offset = 0usize;
-                while let Some(pos) = bytes[offset..].iter().position(|&b| b == b'/') {
-                    let dir = &bytes[..offset + pos];
-                    let mut attr_path = Vec::with_capacity(dir.len() + 15);
-                    attr_path.extend_from_slice(dir);
-                    attr_path.extend_from_slice(b"/.gitattributes");
-                    if let Some(entry) = flat.get(&attr_path)
-                        && let Some(digest) = entry.digest()
-                    {
-                        let raw = d6
-                            .store()
-                            .cas()
-                            .read_blob(&digest)
-                            .map_err(|error| error.to_string())?;
-                        if let Ok(attrs) = spawn_host::merkle_merge::GitAttributes::from_root_str(
-                            &String::from_utf8_lossy(&raw),
-                            &[],
-                        ) {
-                            let rel = &bytes[offset + pos + 1..];
-                            shortest[idx] =
-                                shortest[idx].min(attrs.resolve_path(rel).conflict_marker_size);
-                        }
-                    }
-                    offset += pos + 1;
-                }
-            }
-        }
-        let mut marked = Vec::new();
-        for (path, min_marker) in files.into_iter().zip(shortest) {
-            let entry = &commit_flat[path.as_bytes()];
-            let Some(digest) = entry.digest() else {
-                continue;
-            };
-            let bytes = d6
-                .store()
-                .cas()
-                .read_blob(&digest)
-                .map_err(|error| error.to_string())?;
-            if spawn_host::git::has_conflict_block_sized(&bytes, min_marker) {
-                marked.push(path.shown());
-            }
-        }
-        Ok(marked)
+        repo.has_pending_merge(agent)
     }
 
     pub(super) fn store_conflict_markers(
         repo: &LocalWorkspaceStore,
-        mirror: &Path,
         base: &str,
         commit: &str,
     ) -> Result<Vec<String>, String> {
-        match repo {
-            LocalWorkspaceStore::D6(d6) => Self::d6_conflict_markers(d6, base, commit),
-            LocalWorkspaceStore::Git(git_store) => git_store
-                .conflict_markers(base, commit)
-                .map_err(|error| error.to_string()),
-            LocalWorkspaceStore::D6Shadow(oracle) => oracle
-                .primary()
-                .conflict_markers(base, commit)
-                .map_err(|error| error.to_string()),
-            LocalWorkspaceStore::Cow(_) => {
-                let LocalWorkspaceStore::Git(git_store) =
-                    LocalWorkspaceStore::git(mirror, repo.root())
-                else {
-                    unreachable!()
-                };
-                git_store
-                    .conflict_markers(base, commit)
-                    .map_err(|error| error.to_string())
-            }
-            #[cfg(target_os = "linux")]
-            LocalWorkspaceStore::Overlay(_) => {
-                let LocalWorkspaceStore::Git(git_store) =
-                    LocalWorkspaceStore::git(mirror, repo.root())
-                else {
-                    unreachable!()
-                };
-                git_store
-                    .conflict_markers(base, commit)
-                    .map_err(|error| error.to_string())
-            }
-        }
+        repo.conflict_markers(base, commit)
+            .map_err(|error| error.to_string())
     }
 
     fn entry_blob_bytes(
@@ -4685,45 +4539,15 @@ impl Judge {
 
     pub(super) fn store_patch_len(
         repo: &LocalWorkspaceStore,
-        mirror: &Path,
         base: &str,
         candidate: &str,
     ) -> Result<usize, String> {
-        match repo {
-            LocalWorkspaceStore::D6(d6) => Self::d6_patch_len(d6, base, candidate),
-            LocalWorkspaceStore::Git(git_store) => git_store
-                .patch_between(base, candidate)
-                .map(|patch| patch.len())
-                .map_err(|error| error.to_string()),
-            LocalWorkspaceStore::D6Shadow(oracle) => oracle
-                .primary()
-                .patch_between(base, candidate)
-                .map(|patch| patch.len())
-                .map_err(|error| error.to_string()),
-            LocalWorkspaceStore::Cow(_) => {
-                let LocalWorkspaceStore::Git(git_store) =
-                    LocalWorkspaceStore::git(mirror, repo.root())
-                else {
-                    unreachable!()
-                };
-                git_store
-                    .patch_between(base, candidate)
-                    .map(|patch| patch.len())
-                    .map_err(|error| error.to_string())
-            }
-            #[cfg(target_os = "linux")]
-            LocalWorkspaceStore::Overlay(_) => {
-                let LocalWorkspaceStore::Git(git_store) =
-                    LocalWorkspaceStore::git(mirror, repo.root())
-                else {
-                    unreachable!()
-                };
-                git_store
-                    .patch_between(base, candidate)
-                    .map(|patch| patch.len())
-                    .map_err(|error| error.to_string())
-            }
+        if let Some(d6) = repo.d6_workspace() {
+            return Self::d6_patch_len(d6, base, candidate);
         }
+        repo.patch_between(base, candidate)
+            .map(|patch| patch.len())
+            .map_err(|error| error.to_string())
     }
 
     /// Judge `branch`, the agent's pushed head already in the mirror (`None`:
@@ -5013,7 +4837,7 @@ impl Judge {
             // A merge of main whose markers are not resolved is not judged: the
             // markers could land, and a file rewritten instead of resolved would
             // revert main.
-            let marked = Self::store_conflict_markers(&repo, mirror, main, &branch)?;
+            let marked = Self::store_conflict_markers(&repo, main, &branch)?;
             if let Some(note) = markers_note(
                 Self::store_has_pending_merge(&repo, &task.agent_id),
                 &marked,
@@ -5052,7 +4876,7 @@ impl Judge {
             if tree_of(&candidate)? == tree_of(main)? && task.objective.is_none() {
                 return rejected("the work changes nothing on main", "");
             }
-            let patch_len = Self::store_patch_len(&repo, mirror, main, &candidate)?;
+            let patch_len = Self::store_patch_len(&repo, main, &candidate)?;
             if patch_len > MAX_PATCH_BYTES {
                 return rejected("the patch is larger than 1 MiB", "");
             }

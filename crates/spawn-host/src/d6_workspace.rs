@@ -639,6 +639,125 @@ impl<L: RefLedger> D6Workspace<L> {
             .map(|(main, files)| (main, shown_paths(&files)))
     }
 
+    /// Resolve `rev` (40-hex commit OID, `refs/heads/<branch>`, or `<branch>`) to its [`LedgerSnapshot`].
+    pub fn resolve_snapshot(&self, rev: &str) -> Result<LedgerSnapshot, WorkspaceError> {
+        if let Ok(oid) = GitOid::parse_hex(rev) {
+            return self
+                .ledger
+                .get_snapshot_by_oid(&oid)
+                .map_err(map_store_err)?
+                .ok_or_else(|| {
+                    WorkspaceError::Unavailable(format!("commit {rev} missing from D6 RefLedger"))
+                });
+        }
+        let branch = rev.strip_prefix("refs/heads/").unwrap_or(rev);
+        if let Some(snap) = self.branch_snapshot(branch)? {
+            return Ok(snap);
+        }
+        if branch != rev
+            && let Some(snap) = self.branch_snapshot(rev)?
+        {
+            return Ok(snap);
+        }
+        Err(WorkspaceError::Unavailable(format!(
+            "ref {rev} missing from D6 RefLedger"
+        )))
+    }
+
+    /// The files `commit` changes against `base` that hold a whole conflict
+    /// marker block ([`has_conflict_block_sized`]): work that must not be
+    /// judged, let alone land. The paths are shown lossily.
+    pub fn conflict_markers(
+        &self,
+        base: &str,
+        commit: &str,
+    ) -> Result<Vec<String>, WorkspaceError> {
+        let base_snap = self.resolve_snapshot(base)?;
+        let commit_snap = self.resolve_snapshot(commit)?;
+        let base_flat = self
+            .store
+            .flatten_tree(&base_snap.tree)
+            .map_err(map_store_err)?;
+        let commit_flat = self
+            .store
+            .flatten_tree(&commit_snap.tree)
+            .map_err(map_store_err)?;
+        let mut files: Vec<TreePath> = Vec::new();
+        for (path, entry) in &commit_flat {
+            if !matches!(entry.kind, TreeEntryKind::File | TreeEntryKind::Executable) {
+                continue;
+            }
+            if base_flat.get(path) != Some(entry) {
+                files.push(TreePath::from_bytes(path.clone()));
+            }
+        }
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut shortest = vec![CONFLICT_MARKER_SIZE; files.len()];
+        for flat in [&base_flat, &commit_flat] {
+            if let Some(entry) = flat.get(b".gitattributes".as_slice())
+                && let Some(digest) = entry.digest()
+            {
+                let raw = self
+                    .store
+                    .cas()
+                    .read_blob(&digest)
+                    .map_err(|error| map_store_err(D6StoreError::from(error)))?;
+                if let Ok(attrs) = GitAttributes::from_root_str(&String::from_utf8_lossy(&raw), &[])
+                {
+                    for (idx, path) in files.iter().enumerate() {
+                        shortest[idx] = shortest[idx]
+                            .min(attrs.resolve_path(path.as_bytes()).conflict_marker_size);
+                    }
+                }
+            }
+            for (idx, path) in files.iter().enumerate() {
+                let bytes = path.as_bytes();
+                let mut offset = 0usize;
+                while let Some(pos) = bytes[offset..].iter().position(|&b| b == b'/') {
+                    let dir = &bytes[..offset + pos];
+                    let mut attr_path = Vec::with_capacity(dir.len() + 15);
+                    attr_path.extend_from_slice(dir);
+                    attr_path.extend_from_slice(b"/.gitattributes");
+                    if let Some(entry) = flat.get(&attr_path)
+                        && let Some(digest) = entry.digest()
+                    {
+                        let raw = self
+                            .store
+                            .cas()
+                            .read_blob(&digest)
+                            .map_err(|error| map_store_err(D6StoreError::from(error)))?;
+                        if let Ok(attrs) =
+                            GitAttributes::from_root_str(&String::from_utf8_lossy(&raw), &[])
+                        {
+                            let rel = &bytes[offset + pos + 1..];
+                            shortest[idx] =
+                                shortest[idx].min(attrs.resolve_path(rel).conflict_marker_size);
+                        }
+                    }
+                    offset += pos + 1;
+                }
+            }
+        }
+        let mut marked = Vec::new();
+        for (path, min_marker) in files.into_iter().zip(shortest) {
+            let entry = &commit_flat[path.as_bytes()];
+            let Some(digest) = entry.digest() else {
+                continue;
+            };
+            let bytes = self
+                .store
+                .cas()
+                .read_blob(&digest)
+                .map_err(|error| map_store_err(D6StoreError::from(error)))?;
+            if has_conflict_block_sized(&bytes, min_marker) {
+                marked.push(path.shown());
+            }
+        }
+        Ok(marked)
+    }
+
     /// Look up the current [`LedgerSnapshot`] of `branch` (any ref matching `name = branch`).
     pub fn branch_snapshot(&self, branch: &str) -> Result<Option<LedgerSnapshot>, WorkspaceError> {
         let Some(r) = self.find_ref(branch)? else {

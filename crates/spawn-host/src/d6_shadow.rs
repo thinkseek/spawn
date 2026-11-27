@@ -30,7 +30,8 @@ use crate::cas_merkle::{
 };
 use crate::cow::CowWorkspace;
 use crate::d6_workspace::D6Workspace;
-use crate::git::{GitWorkspace, git_command};
+use crate::git::GitWorkspace;
+use crate::git_process::git_command;
 use crate::merkle_merge::{
     MergeBaseError, MergeShadowOutcome, ShadowOracleSummary, classify_shadow_merge, merge_snapshots,
 };
