@@ -1691,6 +1691,163 @@ pub fn is_quality_rejection(verdict: &str) -> bool {
     verdict == "rejected"
 }
 
+/// Minimum calibration window duration (in days) before PV5 durability signals
+/// switch from shadow observation into calibration decisions.
+pub const PV5_MIN_WINDOW_DAYS: u64 = 28;
+
+/// Minimum closed outcome samples required before calibration acts (aligned with
+/// [`DEMOTE_MIN_TOTAL`]).
+pub const PV5_MIN_SAMPLES: u64 = 5;
+
+/// Number of milliseconds in one whole UTC day (`86_400_000`).
+pub const PV5_DAY_MS: i64 = 86_400_000;
+
+/// Per-tier count of closed calibration outcome samples collected inside active
+/// preset windows (`l1`, `l2`, `l3`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pv5TierSamples {
+    /// Samples for `l1` (`mechanical-offload`) tasks.
+    pub l1: u64,
+    /// Samples for `l2` (`mainline`) tasks.
+    pub l2: u64,
+    /// Samples for `l3` (`top-decision`) tasks.
+    pub l3: u64,
+}
+
+impl Pv5TierSamples {
+    /// Accumulates `count` samples into the bucket matching `difficulty`.
+    pub fn add(&mut self, difficulty: TaskDifficulty, count: u64) {
+        match difficulty {
+            TaskDifficulty::L1 => self.l1 = self.l1.saturating_add(count),
+            TaskDifficulty::L2 => self.l2 = self.l2.saturating_add(count),
+            TaskDifficulty::L3 => self.l3 = self.l3.saturating_add(count),
+        }
+    }
+
+    /// Total samples across all tiers.
+    pub fn total(&self) -> u64 {
+        self.l1.saturating_add(self.l2).saturating_add(self.l3)
+    }
+}
+
+/// Aggregated calibration window sample counts for a `(preset_id, difficulty)`
+/// pair read from `mission_tasks` for PV5 readiness reporting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pv5SampleSummary {
+    /// Preset identifier (`mission_tasks.first_preset_id`).
+    pub preset_id: String,
+    /// Task difficulty bucket.
+    pub difficulty: TaskDifficulty,
+    /// Total closed outcomes in the preset's calibration window.
+    pub total: u64,
+    /// First-pass closed outcomes (`state in ('landed', 'accepted')` and zero
+    /// quality rejections).
+    pub first_pass: u64,
+    /// Earliest `created_at_ms` among matching sample rows.
+    pub earliest_at_ms: Option<i64>,
+    /// Latest `updated_at_ms` among matching sample rows.
+    pub latest_at_ms: Option<i64>,
+}
+
+/// Per-preset sample breakdown exposed inside [`Pv5CalibrationWindow`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pv5PresetSample {
+    /// Preset identifier.
+    pub preset_id: String,
+    /// Task difficulty bucket (`l1`, `l2`, `l3`).
+    pub difficulty: TaskDifficulty,
+    /// Top-down tier role (`mechanical-offload`, `mainline`, or `top-decision`).
+    pub tier_role: String,
+    /// Total closed outcomes in the preset's window.
+    pub total: u64,
+    /// First-pass outcomes in the preset's window.
+    pub first_pass: u64,
+}
+
+/// Read-only PV5 28-day calibration window readiness snapshot exposed by
+/// `spawn grade status --json` and `GET /api/grading`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pv5CalibrationWindow {
+    /// Total closed calibration samples collected across all tiers.
+    pub samples_collected: u64,
+    /// Whole days elapsed since `window_start_ms` (`0` when empty or skewed).
+    pub window_days_elapsed: u64,
+    /// Minimum window duration in days required for PV5 (`28`).
+    pub min_window_days: u64,
+    /// Minimum closed sample count required before calibration demotes (`5`).
+    pub min_samples: u64,
+    /// True once both `window_days_elapsed >= min_window_days` and
+    /// `samples_collected >= min_samples`.
+    pub ready_to_calibrate: bool,
+    /// Baseline window start timestamp in Unix epoch milliseconds, if any.
+    pub window_start_ms: Option<i64>,
+    /// Per-tier closed sample counts (`l1`, `l2`, `l3`).
+    pub tier_samples: Pv5TierSamples,
+    /// Per-preset breakdown sorted by `(preset_id, difficulty)`.
+    pub per_preset: Vec<Pv5PresetSample>,
+}
+
+/// Evaluates pure PV5 28-day calibration window readiness from the current
+/// catalog, aggregated window samples, and wall clock `now_ms`.
+pub fn evaluate_pv5_window(
+    catalog: &[GradedPreset],
+    samples: &[Pv5SampleSummary],
+    now_ms: i64,
+) -> Pv5CalibrationWindow {
+    let mut tier_samples = Pv5TierSamples::default();
+    let mut per_preset: Vec<Pv5PresetSample> = samples
+        .iter()
+        .map(|sample| {
+            tier_samples.add(sample.difficulty, sample.total);
+            Pv5PresetSample {
+                preset_id: sample.preset_id.clone(),
+                difficulty: sample.difficulty,
+                tier_role: TopDownTier::from_grade(sample.difficulty.required_grade())
+                    .as_str()
+                    .to_string(),
+                total: sample.total,
+                first_pass: sample.first_pass,
+            }
+        })
+        .collect();
+    per_preset.sort_by(|a, b| {
+        a.preset_id
+            .cmp(&b.preset_id)
+            .then(a.difficulty.cmp(&b.difficulty))
+    });
+
+    let samples_collected = tier_samples.total();
+    let window_start_ms = catalog
+        .iter()
+        .filter(|preset| preset.is_routable())
+        .map(|preset| preset.window_start_ms)
+        .min()
+        .or_else(|| catalog.iter().map(|preset| preset.window_start_ms).min())
+        .or_else(|| {
+            samples
+                .iter()
+                .filter_map(|sample| sample.earliest_at_ms)
+                .min()
+        });
+    let window_days_elapsed = window_start_ms.map_or(0, |start| {
+        let elapsed_ms = now_ms.saturating_sub(start).max(0);
+        u64::try_from(elapsed_ms / PV5_DAY_MS).unwrap_or(0)
+    });
+    let ready_to_calibrate =
+        window_days_elapsed >= PV5_MIN_WINDOW_DAYS && samples_collected >= PV5_MIN_SAMPLES;
+
+    Pv5CalibrationWindow {
+        samples_collected,
+        window_days_elapsed,
+        min_window_days: PV5_MIN_WINDOW_DAYS,
+        min_samples: PV5_MIN_SAMPLES,
+        ready_to_calibrate,
+        window_start_ms,
+        tier_samples,
+        per_preset,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -2936,5 +3093,95 @@ mod tests {
         // Pure mechanical Chinese remains eligible for L1.
         let zh_typo = classify_difficulty("修正文档中的错别字与排版");
         assert_eq!(zh_typo.difficulty, TaskDifficulty::L1);
+    }
+
+    #[test]
+    fn evaluate_pv5_window_tracks_28_day_readiness_and_tier_samples() {
+        assert_eq!(PV5_MIN_SAMPLES, u64::from(DEMOTE_MIN_TOTAL));
+
+        let empty = evaluate_pv5_window(&[], &[], 30 * PV5_DAY_MS);
+        assert_eq!(empty.samples_collected, 0);
+        assert_eq!(empty.window_days_elapsed, 0);
+        assert_eq!(empty.min_window_days, 28);
+        assert_eq!(empty.min_samples, 5);
+        assert!(!empty.ready_to_calibrate);
+        assert_eq!(empty.window_start_ms, None);
+        assert_eq!(empty.tier_samples, Pv5TierSamples::default());
+        assert!(empty.per_preset.is_empty());
+
+        let mut non_routable = preset("disabled-old", SkillGrade::L1, 1);
+        non_routable.state = PresetState::Disabled;
+        non_routable.window_start_ms = 1_000;
+        let mut routable_a = preset(TOPDOWN_L2_PRESET_ID, SkillGrade::L2, 20);
+        routable_a.window_start_ms = 5 * PV5_DAY_MS;
+        let mut routable_b = preset(TOPDOWN_L3_PRESET_ID, SkillGrade::L3, 30);
+        routable_b.window_start_ms = 10 * PV5_DAY_MS;
+        let catalog = vec![non_routable, routable_a, routable_b];
+
+        // Clock skew before window start yields 0 elapsed days.
+        let skewed = evaluate_pv5_window(&catalog, &[], 2 * PV5_DAY_MS);
+        assert_eq!(skewed.window_start_ms, Some(5 * PV5_DAY_MS));
+        assert_eq!(skewed.window_days_elapsed, 0);
+        assert!(!skewed.ready_to_calibrate);
+
+        let samples = vec![
+            Pv5SampleSummary {
+                preset_id: TOPDOWN_L3_PRESET_ID.to_string(),
+                difficulty: TaskDifficulty::L3,
+                total: 2,
+                first_pass: 2,
+                earliest_at_ms: Some(12 * PV5_DAY_MS),
+                latest_at_ms: Some(20 * PV5_DAY_MS),
+            },
+            Pv5SampleSummary {
+                preset_id: TOPDOWN_L2_PRESET_ID.to_string(),
+                difficulty: TaskDifficulty::L2,
+                total: 2,
+                first_pass: 1,
+                earliest_at_ms: Some(6 * PV5_DAY_MS),
+                latest_at_ms: Some(25 * PV5_DAY_MS),
+            },
+            Pv5SampleSummary {
+                preset_id: TOPDOWN_L1_PRESET_ID.to_string(),
+                difficulty: TaskDifficulty::L1,
+                total: 1,
+                first_pass: 1,
+                earliest_at_ms: Some(7 * PV5_DAY_MS),
+                latest_at_ms: Some(8 * PV5_DAY_MS),
+            },
+        ];
+
+        // 27 days elapsed with 5 samples: still not ready.
+        let day_27 = evaluate_pv5_window(&catalog, &samples, (5 + 27) * PV5_DAY_MS);
+        assert_eq!(day_27.window_days_elapsed, 27);
+        assert_eq!(day_27.samples_collected, 5);
+        assert!(!day_27.ready_to_calibrate);
+
+        // 28 days elapsed with fewer than 5 samples: still not ready.
+        let few_samples = evaluate_pv5_window(&catalog, &samples[..2], (5 + 28) * PV5_DAY_MS);
+        assert_eq!(few_samples.window_days_elapsed, 28);
+        assert_eq!(few_samples.samples_collected, 4);
+        assert!(!few_samples.ready_to_calibrate);
+
+        // 28 days elapsed with 5 samples across L1/L2/L3: ready!
+        let ready = evaluate_pv5_window(&catalog, &samples, (5 + 28) * PV5_DAY_MS);
+        assert_eq!(ready.window_days_elapsed, 28);
+        assert_eq!(ready.samples_collected, 5);
+        assert!(ready.ready_to_calibrate);
+        assert_eq!(
+            ready.tier_samples,
+            Pv5TierSamples {
+                l1: 1,
+                l2: 2,
+                l3: 2,
+            }
+        );
+        assert_eq!(ready.per_preset.len(), 3);
+        assert_eq!(ready.per_preset[0].preset_id, TOPDOWN_L1_PRESET_ID);
+        assert_eq!(ready.per_preset[0].tier_role, "mechanical-offload");
+        assert_eq!(ready.per_preset[1].preset_id, TOPDOWN_L2_PRESET_ID);
+        assert_eq!(ready.per_preset[1].tier_role, "mainline");
+        assert_eq!(ready.per_preset[2].preset_id, TOPDOWN_L3_PRESET_ID);
+        assert_eq!(ready.per_preset[2].tier_role, "top-decision");
     }
 }

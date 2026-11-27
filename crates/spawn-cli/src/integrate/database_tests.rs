@@ -11098,6 +11098,165 @@ fn a_fresh_task_after_a_yield_is_routed_afresh() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Issue #99 Phase 2 closure: Top-Down 3-tier (`topdown-l3-fable`,
+/// `topdown-l2-neon`, optional `topdown-l1-mechanical`) objective routing
+/// writes `classification`, `difficulty`, `preset_id`, and `tier_role`
+/// onto `task.assigned`, honors upward-only fallback (`l1` -> `l2` without
+/// `--with-l1`, never downgrading `l3` -> `l2`), and respects explicit
+/// `--model` overrides from either backlog JSON or `mission.objectives.model`.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn topdown_stack_routes_objectives_and_respects_explicit_model_overrides() {
+    let base = std::env::temp_dir().join(format!("spawn-db-obj-topdown-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let db = Db::new("objective_topdown_closure");
+
+    // 1. Default 2-tier stack (T3 Fable + T2 Neon): L1 classifies as l1 but falls back upward to T2.
+    crate::grading::init_topdown(&db.store, false, None).expect("init 2-tier topdown");
+    let m2 = prompted_mission(
+        &db,
+        &base.join("two_tier"),
+        "td2",
+        &[
+            (1, "Fix the typo in README.md"),
+            (2, "Implement pagination helper"),
+            (3, "Harden authentication against SQL injection"),
+        ],
+    );
+    let none = std::collections::BTreeSet::new();
+    let assigned_2 = crate::objectives::assign_next(&db.store, &snapshot(&db, m2), &none)
+        .expect("assign 2-tier");
+    assert_eq!(assigned_2.len(), 3);
+
+    let t_l1_up = objective_task(&db, m2, 1).id;
+    let r_l1_up = assigned_record(&db, t_l1_up);
+    assert_eq!(r_l1_up["difficulty"], json!("l1"));
+    assert_eq!(
+        r_l1_up["preset_id"],
+        json!(spawn_core::grading::TOPDOWN_L2_PRESET_ID)
+    );
+    assert_eq!(r_l1_up["tier_role"], json!("mainline"));
+    assert_eq!(r_l1_up["execution_profile"], json!("neon-mainline"));
+    assert_eq!(r_l1_up["classification"]["difficulty"], json!("l1"));
+    assert!(
+        r_l1_up["classification"].get("routed_at").is_none(),
+        "{r_l1_up}"
+    );
+    assert_eq!(r_l1_up["classification"]["rules"], json!("brief-v3"));
+
+    let t_l2 = objective_task(&db, m2, 2).id;
+    let r_l2 = assigned_record(&db, t_l2);
+    assert_eq!(r_l2["difficulty"], json!("l2"));
+    assert_eq!(
+        r_l2["preset_id"],
+        json!(spawn_core::grading::TOPDOWN_L2_PRESET_ID)
+    );
+    assert_eq!(r_l2["tier_role"], json!("mainline"));
+
+    let t_l3 = objective_task(&db, m2, 3).id;
+    let r_l3 = assigned_record(&db, t_l3);
+    assert_eq!(r_l3["difficulty"], json!("l3"));
+    assert_eq!(
+        r_l3["preset_id"],
+        json!(spawn_core::grading::TOPDOWN_L3_PRESET_ID)
+    );
+    assert_eq!(r_l3["tier_role"], json!("top-decision"));
+    assert_eq!(r_l3["execution_profile"], json!("fable-5-2"));
+
+    // 2. Enable T1 (`init-topdown --with-l1`): pure mechanical L1 now offloads to T1,
+    //    while explicit backlog `"model": "cheap"` bypasses catalog routing cleanly.
+    crate::grading::init_topdown(&db.store, true, Some("deepseek-v4")).expect("add l1 tier");
+    let m3_base = base.join("three_tier");
+    let m3 = prompted_mission(
+        &db,
+        &m3_base,
+        "td3",
+        &[
+            (1, "Fix the typo in README.md"),
+            (2, "Harden authentication against SQL injection"),
+        ],
+    );
+    std::fs::write(
+        m3_base.join("backlog").join("002.json"),
+        json!({
+            "id": 2,
+            "title": "Objective 2",
+            "prompt": "Harden authentication against SQL injection",
+            "model": "cheap"
+        })
+        .to_string(),
+    )
+    .expect("rewrite objective 2 with explicit model override");
+    let assigned_3 = crate::objectives::assign_next(&db.store, &snapshot(&db, m3), &none)
+        .expect("assign 3-tier");
+    assert_eq!(assigned_3.len(), 2);
+
+    let r_offload = assigned_record(&db, objective_task(&db, m3, 1).id);
+    assert_eq!(r_offload["model"], json!("cheap"));
+    assert_eq!(r_offload["difficulty"], json!("l1"));
+    assert_eq!(
+        r_offload["preset_id"],
+        json!(spawn_core::grading::TOPDOWN_L1_PRESET_ID)
+    );
+    assert_eq!(r_offload["tier_role"], json!("mechanical-offload"));
+    assert_eq!(r_offload["classification"]["rules"], json!("brief-v3"));
+
+    let t_override = objective_task(&db, m3, 2).id;
+    let r_override = assigned_record(&db, t_override);
+    assert_eq!(r_override["model"], json!("cheap"));
+    assert!(r_override.get("preset_id").is_none(), "{r_override}");
+    assert!(r_override.get("tier_role").is_none(), "{r_override}");
+    assert!(r_override.get("classification").is_none(), "{r_override}");
+    assert_eq!(grading_of(&db, t_override).3, "cheap");
+
+    // 3. Mission-level `objectives.model` bypasses catalog, and disabling T3 makes
+    //    unflagged L3 fall back safely without downgrading to L2.
+    let m_cfg = prompted_mission(
+        &db,
+        &base.join("mission_override"),
+        "tdm",
+        &[(1, "Write the schema migration")],
+    );
+    db.admin()
+        .query_one(
+            "select spawn_mission_reconfigure($1, $2)",
+            &[&m_cfg, &json!({"objectives": {"model": "cheap"}})],
+        )
+        .expect("set mission objectives.model");
+    let assigned_cfg = crate::objectives::assign_next(&db.store, &snapshot(&db, m_cfg), &none)
+        .expect("assign mission override");
+    let r_cfg = assigned_record(&db, assigned_cfg[0]);
+    assert_eq!(r_cfg["model"], json!("cheap"));
+    assert!(r_cfg.get("preset_id").is_none(), "{r_cfg}");
+    assert!(r_cfg.get("tier_role").is_none(), "{r_cfg}");
+
+    db.store
+        .grading_record(&json!({
+            "type": "preset.state_changed",
+            "preset_id": spawn_core::grading::TOPDOWN_L3_PRESET_ID,
+            "from_state": "active",
+            "to_state": "disabled"
+        }))
+        .expect("disable T3");
+    let m_nodown = prompted_mission(
+        &db,
+        &base.join("no_downgrade"),
+        "tdnd",
+        &[(1, "Write the schema migration")],
+    );
+    let assigned_nd = crate::objectives::assign_next(&db.store, &snapshot(&db, m_nodown), &none)
+        .expect("assign L3 without L3 coverage");
+    assert_eq!(
+        grading_of(&db, assigned_nd[0]),
+        (2, None, None, "default".to_string(), "resident".to_string())
+    );
+    let r_nd = assigned_record(&db, assigned_nd[0]);
+    assert!(r_nd.get("preset_id").is_none(), "{r_nd}");
+    assert!(r_nd.get("tier_role").is_none(), "{r_nd}");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// `agent`'s checkpoint on `source`'s main, pushed as `spawn/<agent>` and
 /// fetched into `mirror`: the pushed commit.
 fn push_checkpoint(base: &Path, source: &str, mirror: &Path, agent: &str) -> String {

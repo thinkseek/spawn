@@ -3842,8 +3842,17 @@ begin
                 then jsonb_build_object('duplicate_of', v_duplicate) else '{}'::jsonb end
         || case when p_pin then jsonb_build_object('pinned', true) else '{}'::jsonb end
         || case when p_preset is not null or p_difficulty <> 2
-                then jsonb_strip_nulls(jsonb_build_object('difficulty', 'l' || p_difficulty,
-                                                          'preset_id', p_preset))
+                then jsonb_strip_nulls(jsonb_build_object(
+                         'difficulty', 'l' || p_difficulty,
+                         'preset_id', p_preset,
+                         'tier_role', case coalesce(
+                             case when v_preset.preset_id is not null
+                                       and v_preset.state in ('active', 'demoted')
+                                  then coalesce(v_preset.locked_grade, v_preset.calibrated_grade) end,
+                             p_difficulty)
+                             when 1 then 'mechanical-offload'
+                             when 2 then 'mainline'
+                             when 3 then 'top-decision' end))
                 else '{}'::jsonb end
         || case when v_preset.execution_profile is not null
                 then jsonb_build_object('execution_profile', v_preset.execution_profile)
@@ -5017,6 +5026,12 @@ begin
         raise exception 'an objective mission''s workers is a whole number from 1 to 128, not %',
             p_objectives -> 'workers';
     end if;
+    if p_objectives ? 'model'
+       and (jsonb_typeof(p_objectives -> 'model') is distinct from 'string'
+            or p_objectives ->> 'model' not in ('default', 'cheap')) then
+        raise exception 'an objective mission''s model is default or cheap, not %',
+            p_objectives -> 'model';
+    end if;
     -- Agents' branches reach only a directory on this host (the pusher's
     -- one producer since the cross-host cut): a gate on a URL would wait
     -- for a push nobody makes. A source the integrator cannot find is
@@ -5312,8 +5327,17 @@ begin
         || case when v_model <> 'default'
                 then jsonb_build_object('model', v_model) else '{}'::jsonb end
         || case when v_preset_id is not null or v_difficulty <> 2
-                then jsonb_strip_nulls(jsonb_build_object('difficulty', 'l' || v_difficulty,
-                                                          'preset_id', v_preset_id))
+                then jsonb_strip_nulls(jsonb_build_object(
+                         'difficulty', 'l' || v_difficulty,
+                         'preset_id', v_preset_id,
+                         'tier_role', case coalesce(
+                             case when v_preset.preset_id is not null
+                                       and v_preset.state in ('active', 'demoted')
+                                  then coalesce(v_preset.locked_grade, v_preset.calibrated_grade) end,
+                             v_difficulty)
+                             when 1 then 'mechanical-offload'
+                             when 2 then 'mainline'
+                             when 3 then 'top-decision' end))
                 else '{}'::jsonb end
         || case when v_carried
                 then jsonb_strip_nulls(jsonb_build_object(

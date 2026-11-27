@@ -28,21 +28,23 @@ pub(crate) const USAGE: &str = "usage:
       the database merges them under its lock, checks the result and records it whole.
       A setting is cleared only by its own switch, which takes no value: --no-gate,
       --no-budget (every field), --no-minutes, --no-tool-calls, --no-daily-usd, --no-objectives,
-      --no-workers (back to the default 1), --no-features; a switch and a value for the
+      --no-workers (back to the default 1), --no-features, --no-model; a switch and a value for the
       same setting are refused. Prints {mission, before, after}; with nothing given it
       changes nothing.
       Clearing the gate, or moving accept away from gate, waits while a task is landing.
       settings: --gate <scenarios dir> [--accept review|gate] [--minutes N] [--tool-calls N]
                 [--daily-usd <US dollars above 0>]
-                [--backlog <dir> --resident <name> [--workers N] [--features <file>]]
-                (with add, all of them at once, and --backlog, --resident, --workers and
-                --features need --gate: an objective lands only through a gate;
+                [--backlog <dir> --resident <name> [--workers N] [--features <file>] [--model default|cheap]]
+                (with add, all of them at once, and --backlog, --resident, --workers,
+                --features and --model need --gate: an objective lands only through a gate;
                 with configure, any of them alone, and --backlog with --resident for a
                 mission without objectives)
                 (--features: the mission's feature map, a JSON file of capabilities and
                 their provenance sources; identities and links only, never a status)
                 (--workers: objective tasks in flight at once, 1 to 128, default 1: the
                 resident takes one, per-task workers the rest)
+                (--model: explicit model profile override for an objective mission's
+                assignments, bypassing the grading catalog)
                 (--daily-usd: what the mission's model calls may cost in a UTC day; the
                 loop raises one cost_budget alert the day it is reached)
   spawn mission objectives [--mission N]
@@ -1289,6 +1291,13 @@ impl Settings {
         }
         let workers = number("workers")?;
         let features = features_file(flags, "features", 0)?;
+        let model = flags
+            .get("model")
+            .map(|text| {
+                ModelProfile::parse(&text)
+                    .ok_or_else(|| format!("--model is default or cheap, not {text}\n{USAGE}"))
+            })
+            .transpose()?;
         let gate = directory(flags, "gate")?;
         let objectives = match (directory(flags, "backlog")?, flags.get("resident")) {
             (Some(backlog), Some(resident)) => {
@@ -1298,7 +1307,7 @@ impl Settings {
                 // the settings the command line named.
                 if gate.is_none() {
                     return Err(format!(
-                        "add with --backlog, --resident, --workers or --features needs \
+                        "add with --backlog, --resident, --workers, --features or --model needs \
                          --gate: an objective lands only through a gate\n{USAGE}"
                     ));
                 }
@@ -1311,12 +1320,15 @@ impl Settings {
                 if let (Some(features), Some(map)) = (features, objectives.as_object_mut()) {
                     map.insert("features".to_string(), json!(features));
                 }
+                if let (Some(model), Some(map)) = (model, objectives.as_object_mut()) {
+                    map.insert("model".to_string(), json!(model.as_str()));
+                }
                 Some(objectives)
             }
-            (None, None) if workers.is_none() && features.is_none() => None,
+            (None, None) if workers.is_none() && features.is_none() && model.is_none() => None,
             (None, None) => {
                 return Err(format!(
-                    "--workers and --features go with --backlog and --resident\n{USAGE}"
+                    "--workers, --features and --model go with --backlog and --resident\n{USAGE}"
                 ));
             }
             _ => return Err(format!("--backlog and --resident go together\n{USAGE}")),
@@ -1331,6 +1343,7 @@ impl Settings {
             "resident",
             "workers",
             "features",
+            "model",
         ]
         .iter()
         .any(|name| flags.get(name).is_some());
@@ -1396,7 +1409,7 @@ fn features_file(flags: &Flags, name: &str, mission_id: i64) -> Result<Option<St
 
 /// `configure`'s clearing switches (they take no value), and the setting
 /// (and key in it) each clears.
-const CLEARING: [(&str, &str, Option<&str>); 8] = [
+const CLEARING: [(&str, &str, Option<&str>); 9] = [
     ("no-gate", "gate", None),
     ("no-budget", "budget", None),
     ("no-minutes", "budget", Some("minutes")),
@@ -1405,6 +1418,7 @@ const CLEARING: [(&str, &str, Option<&str>); 8] = [
     ("no-objectives", "objectives", None),
     ("no-workers", "objectives", Some("workers")),
     ("no-features", "objectives", Some("features")),
+    ("no-model", "objectives", Some("model")),
 ];
 
 /// The change `spawn mission configure` asks for (objective 027): only the
@@ -1414,7 +1428,7 @@ const CLEARING: [(&str, &str, Option<&str>); 8] = [
 /// cleared, or a flag configure does not know, is refused. No flag at all is
 /// an empty change, which changes and records nothing.
 fn change(flags: &Flags) -> Result<Value, String> {
-    const KNOWN: [&str; 10] = [
+    const KNOWN: [&str; 11] = [
         "id",
         "gate",
         "accept",
@@ -1425,6 +1439,7 @@ fn change(flags: &Flags) -> Result<Value, String> {
         "resident",
         "workers",
         "features",
+        "model",
     ];
     if let Some(unknown) = flags.names().find(|name| !KNOWN.contains(name)) {
         return Err(format!(
@@ -1486,7 +1501,19 @@ fn change(flags: &Flags) -> Result<Value, String> {
     if let Some(features) = features_file(flags, "features", mission)? {
         part("objectives", Some("features"), json!(features));
     }
-    // Every value flag and the setting (and key) it writes.
+    if let Some(text) = flags.get("model") {
+        let parsed = ModelProfile::parse(&text)
+            .ok_or_else(|| format!("--model is default or cheap, not {text}\n{USAGE}"))?;
+        part("objectives", Some("model"), json!(parsed.as_str()));
+    }
+    apply_clearing_switches(flags, &mut part)?;
+    Ok(Value::Object(change))
+}
+
+fn apply_clearing_switches(
+    flags: &Flags,
+    part: &mut impl FnMut(&str, Option<&str>, Value),
+) -> Result<(), String> {
     let written = [
         ("gate", "gate", None),
         ("accept", "accept", None),
@@ -1497,6 +1524,7 @@ fn change(flags: &Flags) -> Result<Value, String> {
         ("resident", "objectives", Some("resident")),
         ("workers", "objectives", Some("workers")),
         ("features", "objectives", Some("features")),
+        ("model", "objectives", Some("model")),
     ];
     for (switch, setting, key) in CLEARING {
         if !flags.switch(switch) {
@@ -1513,7 +1541,7 @@ fn change(flags: &Flags) -> Result<Value, String> {
         }
         part(setting, key, Value::Null);
     }
-    Ok(Value::Object(change))
+    Ok(())
 }
 
 /// `spawn mission ...`
@@ -3632,6 +3660,25 @@ mod tests {
         );
         // Nothing given: an empty change, which changes nothing.
         assert_eq!(configure(&["--id", "4"]), Ok(json!({})));
+    }
+
+    #[test]
+    fn configure_sets_clears_and_validates_objective_model_override() {
+        assert_eq!(
+            configure(&["--id", "4", "--model", "cheap"]),
+            Ok(json!({"objectives": {"model": "cheap"}}))
+        );
+        assert_eq!(
+            configure(&["--id", "4", "--model", "default"]),
+            Ok(json!({"objectives": {"model": "default"}}))
+        );
+        assert_eq!(
+            configure(&["--id", "4", "--no-model"]),
+            Ok(json!({"objectives": {"model": null}}))
+        );
+        assert!(configure(&["--id", "4", "--model", "turbo"]).is_err());
+        let conflict = configure(&["--id", "4", "--no-model", "--model", "cheap"]).unwrap_err();
+        assert!(conflict.contains("--no-model and --model"), "{conflict}");
     }
 
     #[test]

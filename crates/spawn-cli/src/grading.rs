@@ -15,10 +15,10 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use spawn_core::grading::{
-    CalibrationDecision, DifficultyClassification, ExamCaseResult, GradedPreset, PresetState,
-    RoutingDecision, SkillGrade, TaskDifficulty, calibrate_preset, catalog_covers,
-    evaluate_onboarding, is_preset_id, is_quality_rejection, registered_profile, reprobe_plan,
-    tier_role, topdown_default_stack,
+    CalibrationDecision, DifficultyClassification, ExamCaseResult, GradedPreset, PresetActivity,
+    PresetState, Pv5SampleSummary, RoutingDecision, SkillGrade, TaskDifficulty, calibrate_preset,
+    catalog_covers, evaluate_onboarding, evaluate_pv5_window, is_preset_id, is_quality_rejection,
+    registered_profile, reprobe_plan, tier_role, topdown_default_stack,
 };
 use spawn_postgres::PostgresStore;
 
@@ -71,7 +71,12 @@ pub(crate) const USAGE: &str = "usage:
        topdown-l3-fable on claude / claude-fable-5-2, and locked l2 mainline preset
        topdown-l2-neon on agy / gemini-pro-orchestrator-neon; --with-l1 also seeds and
        onboards l1 mechanical-offload preset topdown-l1-mechanical on deepseek-v4 or
-       --l1-model, leaving existing presets untouched)";
+       --l1-model, leaving existing presets untouched)
+  spawn grade status [--json]
+      (read-only catalog and PV5 28-day calibration window readiness status: presets with
+       routing_grade, profile, driver, tier_role and reprobe_due, profiles, and
+       calibration_window with samples_collected, window_days_elapsed, min_window_days (28),
+       min_samples, ready_to_calibrate and per-tier sample counts l1/l2/l3)";
 
 /// The onboarding suite's place in a Spawn tree.
 const SUITE: &str = "evals/onboarding";
@@ -115,6 +120,7 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
         }
         "upkeep" => upkeep_command(rest)?,
         "init-topdown" => init_topdown_command(rest)?,
+        "status" => status_command(rest)?,
         "exam" => {
             let flags = Flags::parse(rest)?;
             only(&flags, &["workspaces", "suite"])?;
@@ -123,64 +129,70 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
             print(&exam(&suite, &workspaces, CASE_TIMEOUT)?);
         }
         verb @ ("register" | "onboard" | "lock-grade" | "unlock-grade" | "enable" | "disable") => {
-            let Some((preset_id, rest)) = rest.split_first() else {
-                return Err(format!("spawn grade {verb} needs a preset id\n{USAGE}"));
-            };
-            if !is_preset_id(preset_id) {
-                return Err(format!(
-                    "a preset id is [a-z0-9][a-z0-9_-]{{0,63}}, not '{preset_id}'"
-                ));
-            }
-            let flags = Flags::parse(rest)?;
-            let store = open_store()?;
-            let record = if verb == "register" {
-                registered(preset_id, &flags)?
-            } else {
-                let catalog = store.grading_catalog().map_err(|e| e.to_string())?;
-                let preset = catalog
-                    .iter()
-                    .find(|p| p.preset_id == *preset_id)
-                    .ok_or_else(|| format!("preset {preset_id} is not in the grading catalog"))?;
-                match verb {
-                    "onboard" => {
-                        only(&flags, &["results"])?;
-                        let path = flags.required("results")?;
-                        let text = std::fs::read_to_string(&path)
-                            .map_err(|error| format!("read {path}: {error}"))?;
-                        onboarded(preset, &text)?
-                    }
-                    "lock-grade" => {
-                        only(&flags, &["grade"])?;
-                        let text = flags.required("grade")?;
-                        let grade = SkillGrade::parse(&text)
-                            .ok_or_else(|| format!("--grade is l1, l2 or l3, not {text}"))?;
-                        grade_locked(preset, Some(grade))?
-                    }
-                    "unlock-grade" => {
-                        only(&flags, &[])?;
-                        grade_locked(preset, None)?
-                    }
-                    _ => {
-                        only(&flags, &[])?;
-                        state_change(preset, verb == "enable")?
-                    }
-                }
-            };
-            let event = store
-                .grading_record(&record)
-                .map_err(|error| error.to_string())?;
-            let mut answer = record;
-            if let Some(map) = answer.as_object_mut() {
-                map.insert("event".to_string(), json!(event));
-            }
-            print(&answer);
-            if matches!(verb, "disable" | "unlock-grade" | "onboard") {
-                warn_if_default_uncovered(&store);
-            }
+            record_command(verb, rest)?;
         }
         other => return Err(format!("unknown grade command {other}\n{USAGE}")),
     }
     Ok(0)
+}
+
+/// Handles `spawn grade register|onboard|lock-grade|unlock-grade|enable|disable`.
+fn record_command(verb: &str, rest: &[String]) -> Result<(), String> {
+    let Some((preset_id, rest)) = rest.split_first() else {
+        return Err(format!("spawn grade {verb} needs a preset id\n{USAGE}"));
+    };
+    if !is_preset_id(preset_id) {
+        return Err(format!(
+            "a preset id is [a-z0-9][a-z0-9_-]{{0,63}}, not '{preset_id}'"
+        ));
+    }
+    let flags = Flags::parse(rest)?;
+    let store = open_store()?;
+    let record = if verb == "register" {
+        registered(preset_id, &flags)?
+    } else {
+        let catalog = store.grading_catalog().map_err(|e| e.to_string())?;
+        let preset = catalog
+            .iter()
+            .find(|p| p.preset_id == *preset_id)
+            .ok_or_else(|| format!("preset {preset_id} is not in the grading catalog"))?;
+        match verb {
+            "onboard" => {
+                only(&flags, &["results"])?;
+                let path = flags.required("results")?;
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|error| format!("read {path}: {error}"))?;
+                onboarded(preset, &text)?
+            }
+            "lock-grade" => {
+                only(&flags, &["grade"])?;
+                let text = flags.required("grade")?;
+                let grade = SkillGrade::parse(&text)
+                    .ok_or_else(|| format!("--grade is l1, l2 or l3, not {text}"))?;
+                grade_locked(preset, Some(grade))?
+            }
+            "unlock-grade" => {
+                only(&flags, &[])?;
+                grade_locked(preset, None)?
+            }
+            _ => {
+                only(&flags, &[])?;
+                state_change(preset, verb == "enable")?
+            }
+        }
+    };
+    let event = store
+        .grading_record(&record)
+        .map_err(|error| error.to_string())?;
+    let mut answer = record;
+    if let Some(map) = answer.as_object_mut() {
+        map.insert("event".to_string(), json!(event));
+    }
+    print(&answer);
+    if matches!(verb, "disable" | "unlock-grade" | "onboard") {
+        warn_if_default_uncovered(&store);
+    }
+    Ok(())
 }
 
 /// `spawn grade upkeep [--apply] [--json]`.
@@ -209,6 +221,42 @@ fn upkeep_command(rest: &[String]) -> Result<(), String> {
         warn_if_default_uncovered(&store);
     }
     Ok(())
+}
+
+/// `spawn grade status [--json]`.
+fn status_command(rest: &[String]) -> Result<(), String> {
+    let flags = Flags::parse_with_switches(rest, &["json"])?;
+    only(&flags, &[])?;
+    let store = open_store()?;
+    let report = status(&store, now_ms(), reprobe_interval_ms())?;
+    if flags.switch("json") {
+        print(&report);
+    } else {
+        println!("{}", status_text(&report));
+    }
+    Ok(())
+}
+
+/// Read-only grading catalog and PV5 28-day calibration window readiness snapshot.
+pub(crate) fn status(
+    store: &PostgresStore,
+    now_ms: i64,
+    interval_ms: i64,
+) -> Result<Value, String> {
+    let catalog = store.grading_catalog().map_err(|error| error.to_string())?;
+    let activity = store
+        .grading_activity()
+        .map_err(|error| error.to_string())?;
+    let samples = store
+        .grading_pv5_samples()
+        .map_err(|error| error.to_string())?;
+    Ok(api_catalog_with_samples(
+        &catalog,
+        &activity,
+        &samples,
+        now_ms,
+        interval_ms,
+    ))
 }
 
 fn validate_init_topdown_flags(rest: &[String]) -> Result<(bool, Option<String>), String> {
@@ -861,16 +909,30 @@ fn upkeep_line(report: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| format!("grading upkeep: {}", parts.join("; ")))
 }
 
-/// The catalog as `/api/grading` answers it: `{presets, profiles}`, each
-/// preset as [`GradedPreset`] serializes (so every phase-1 field is there
-/// as it was) with `routing_grade`, `profile` (its
+/// The catalog as `/api/grading` answers it: `{presets, profiles,
+/// calibration_window}`, each preset as [`GradedPreset`] serializes (so every
+/// phase-1 field is there as it was) with `routing_grade`, `profile` (its
 /// [`GradedPreset::profile_name`]), `driver` and `label_only` (its
 /// [`GradedPreset::driver_id`]: the engine its worker runs, and whether its
-/// labels are for people only) and `reprobe_due` at `now_ms`; every
-/// profile name the catalog runs as, sorted, once.
+/// labels are for people only), `tier_role` and `reprobe_due` at `now_ms`;
+/// every profile name the catalog runs as, sorted, once; and strictly additive
+/// read-only PV5 28-day calibration window readiness metrics.
+#[cfg(test)]
 pub(crate) fn api_catalog(
     catalog: &[GradedPreset],
-    activity: &[spawn_core::grading::PresetActivity],
+    activity: &[PresetActivity],
+    now_ms: i64,
+    interval_ms: i64,
+) -> Value {
+    api_catalog_with_samples(catalog, activity, &[], now_ms, interval_ms)
+}
+
+/// [`api_catalog`] populated with persisted PV5 window outcome summaries from
+/// `mission_tasks`.
+pub(crate) fn api_catalog_with_samples(
+    catalog: &[GradedPreset],
+    activity: &[PresetActivity],
+    samples: &[Pv5SampleSummary],
     now_ms: i64,
     interval_ms: i64,
 ) -> Value {
@@ -895,7 +957,62 @@ pub(crate) fn api_catalog(
         .collect();
     let profiles: std::collections::BTreeSet<&str> =
         catalog.iter().map(GradedPreset::profile_name).collect();
-    json!({"presets": presets, "profiles": profiles})
+    let calibration_window = evaluate_pv5_window(catalog, samples, now_ms);
+    json!({
+        "presets": presets,
+        "profiles": profiles,
+        "calibration_window": calibration_window,
+    })
+}
+
+/// Human-readable formatting of `spawn grade status`.
+fn status_text(report: &Value) -> String {
+    let window = &report["calibration_window"];
+    let ready = if window["ready_to_calibrate"] == json!(true) {
+        "ready"
+    } else {
+        "not ready"
+    };
+    let days = window["window_days_elapsed"].as_u64().unwrap_or(0);
+    let min_days = window["min_window_days"].as_u64().unwrap_or(28);
+    let samples = window["samples_collected"].as_u64().unwrap_or(0);
+    let min_samples = window["min_samples"].as_u64().unwrap_or(5);
+    let tiers = &window["tier_samples"];
+    let l1 = tiers["l1"].as_u64().unwrap_or(0);
+    let l2 = tiers["l2"].as_u64().unwrap_or(0);
+    let l3 = tiers["l3"].as_u64().unwrap_or(0);
+    let presets = report["presets"].as_array().map_or(0, Vec::len);
+    let profiles: Vec<&str> = report["profiles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let mut lines = vec![
+        format!(
+            "grading catalog: {presets} preset(s), profiles: {}",
+            if profiles.is_empty() {
+                "-".to_string()
+            } else {
+                profiles.join(", ")
+            }
+        ),
+        format!(
+            "pv5 calibration window: {ready} ({days}/{min_days} days elapsed, \
+             {samples}/{min_samples} samples collected; tiers: l1={l1} l2={l2} l3={l3})"
+        ),
+    ];
+    for entry in window["per_preset"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "  {:<24} {:<2} ({:<18}) {}/{} first_pass",
+            entry["preset_id"].as_str().unwrap_or("-"),
+            entry["difficulty"].as_str().unwrap_or("-"),
+            entry["tier_role"].as_str().unwrap_or("-"),
+            entry["first_pass"].as_u64().unwrap_or(0),
+            entry["total"].as_u64().unwrap_or(0),
+        ));
+    }
+    lines.join("\n")
 }
 
 /// The catalog as a table.
@@ -1598,6 +1715,58 @@ mod tests {
         .unwrap();
         assert_eq!(ok, (true, Some("deepseek-v4.1-flash".to_string())));
     }
+
+    #[test]
+    fn api_catalog_with_samples_exposes_additive_pv5_window_and_preserves_fields() {
+        let mut l2 = graded_preset(PresetState::Active, Some(SkillGrade::L2));
+        l2.preset_id = spawn_core::grading::TOPDOWN_L2_PRESET_ID.to_string();
+        l2.window_start_ms = 0;
+        let samples = vec![
+            Pv5SampleSummary {
+                preset_id: spawn_core::grading::TOPDOWN_L1_PRESET_ID.to_string(),
+                difficulty: TaskDifficulty::L1,
+                total: 2,
+                first_pass: 2,
+                earliest_at_ms: Some(100),
+                latest_at_ms: Some(200),
+            },
+            Pv5SampleSummary {
+                preset_id: spawn_core::grading::TOPDOWN_L2_PRESET_ID.to_string(),
+                difficulty: TaskDifficulty::L2,
+                total: 3,
+                first_pass: 2,
+                earliest_at_ms: Some(150),
+                latest_at_ms: Some(300),
+            },
+        ];
+
+        let api = api_catalog_with_samples(
+            &[l2],
+            &[],
+            &samples,
+            29 * spawn_core::grading::PV5_DAY_MS,
+            i64::MAX,
+        );
+        assert_eq!(api["presets"][0]["preset_id"], json!("topdown-l2-neon"));
+        assert_eq!(api["presets"][0]["tier_role"], json!("mainline"));
+        assert_eq!(api["profiles"], json!(["default"]));
+
+        let cw = &api["calibration_window"];
+        assert_eq!(cw["samples_collected"], json!(5));
+        assert_eq!(cw["window_days_elapsed"], json!(29));
+        assert_eq!(cw["min_window_days"], json!(28));
+        assert_eq!(cw["min_samples"], json!(5));
+        assert_eq!(cw["ready_to_calibrate"], json!(true));
+        assert_eq!(cw["tier_samples"], json!({"l1": 2, "l2": 3, "l3": 0}));
+
+        let summary = status_text(&api);
+        assert!(
+            summary.contains(
+                "ready (29/28 days elapsed, 5/5 samples collected; tiers: l1=2 l2=3 l3=0)"
+            ),
+            "{summary}"
+        );
+    }
 }
 
 /// Routing, rework reroutes and calibration through the CLI's own paths,
@@ -1606,7 +1775,7 @@ mod tests {
 #[cfg(test)]
 mod database_tests {
     use serde_json::{Value, json};
-    use spawn_core::grading::{PresetState, SkillGrade};
+    use spawn_core::grading::{PresetState, SkillGrade, TaskDifficulty};
     use spawn_postgres::PostgresStore;
     use spawn_postgres::testing::TestSchema;
 
@@ -2576,5 +2745,91 @@ mod database_tests {
         assert_eq!(l1.locked_grade, None);
         assert_eq!(l1.model_label, "deepseek-v4.1-flash");
         assert_eq!(l1.model_profile, spawn_core::event::ModelProfile::Cheap);
+    }
+
+    #[test]
+    fn grade_status_reads_pv5_window_readiness_against_live_tasks() {
+        let schema = TestSchema::new("cli_grading_status_pv5");
+        let store = schema.store();
+        let mut client = admin(&schema);
+        let mission = store.mission_add("StatusPV5", &json!([]), "human").unwrap();
+        preset(&store, "s-l1", "cheap", 1, "l1");
+        preset(&store, "s-l2", "default", 2, "l2");
+        preset(&store, "s-l3", "default", 3, "l3");
+
+        let mut cmd = 0_i64;
+        for (diff, p_id, model, n) in [
+            (TaskDifficulty::L1, "s-l1", "cheap", 1),
+            (TaskDifficulty::L2, "s-l2", "default", 2),
+            (TaskDifficulty::L3, "s-l3", "default", 2),
+        ] {
+            for idx in 0..n {
+                let brief = format!("work-{}-{idx}", diff.as_str());
+                let t = store
+                    .task_assign_routed(
+                        mission,
+                        "ephemeral",
+                        "w",
+                        &brief,
+                        model,
+                        false,
+                        false,
+                        diff,
+                        Some(p_id),
+                    )
+                    .unwrap();
+                cmd += 1;
+                report(&store, t, cmd);
+                store.task_review(t, true, "", None).unwrap();
+            }
+        }
+
+        let earliest_start: i64 = client
+            .query_one("select min(window_start_ms) from grading_presets", &[])
+            .unwrap()
+            .get(0);
+
+        let before_28 = super::status(
+            &store,
+            earliest_start + 10 * spawn_core::grading::PV5_DAY_MS,
+            i64::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            before_28["calibration_window"]["samples_collected"],
+            json!(5)
+        );
+        assert_eq!(
+            before_28["calibration_window"]["window_days_elapsed"],
+            json!(10)
+        );
+        assert_eq!(
+            before_28["calibration_window"]["min_window_days"],
+            json!(28)
+        );
+        assert_eq!(
+            before_28["calibration_window"]["ready_to_calibrate"],
+            json!(false)
+        );
+
+        let at_28 = super::status(
+            &store,
+            earliest_start + 28 * spawn_core::grading::PV5_DAY_MS,
+            i64::MAX,
+        )
+        .unwrap();
+        assert_eq!(at_28["calibration_window"]["samples_collected"], json!(5));
+        assert_eq!(
+            at_28["calibration_window"]["window_days_elapsed"],
+            json!(28)
+        );
+        assert_eq!(
+            at_28["calibration_window"]["ready_to_calibrate"],
+            json!(true)
+        );
+        assert_eq!(
+            at_28["calibration_window"]["tier_samples"],
+            json!({"l1": 1, "l2": 2, "l3": 2})
+        );
     }
 }

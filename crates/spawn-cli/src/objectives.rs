@@ -122,6 +122,7 @@ use serde::Deserialize;
 use spawn_postgres::PostgresStore;
 
 use serde_json::json;
+use spawn_core::event::ModelProfile;
 use spawn_core::grading::{DifficultyClassification, RoutingDecision, TaskDifficulty};
 use spawn_core::mission::TaskState;
 
@@ -163,6 +164,9 @@ pub(crate) struct Task {
     /// here until it lands in this mission (a landing is the only thing
     /// this backlog's openness reads).
     pub(crate) owner_judged: bool,
+    /// Optional explicit model profile override (`"default"` or `"cheap"`) set
+    /// in the objective backlog JSON to bypass catalog routing.
+    pub(crate) model: Option<ModelProfile>,
 }
 
 impl Task {
@@ -269,6 +273,20 @@ pub(crate) fn load_backlog(directory: &Path) -> Result<Vec<Task>, String> {
                 Some(flag) => flag.as_bool().ok_or_else(|| {
                     format!("{}: `owner_judged` is not true or false", path.display())
                 })?,
+            },
+            model: match value.get("model") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(raw) => {
+                    let text = raw.as_str().ok_or_else(|| {
+                        format!("{}: `model` must be default or cheap", path.display())
+                    })?;
+                    Some(ModelProfile::parse(text).ok_or_else(|| {
+                        format!(
+                            "{}: `model` must be default or cheap, not {text}",
+                            path.display()
+                        )
+                    })?)
+                }
             },
             after: match value.get("after") {
                 None | Some(serde_json::Value::Null) => Vec::new(),
@@ -1095,7 +1113,15 @@ pub(crate) fn assign_next(
     }
     let mut assigned = Vec::new();
     for task in choose(&objectives, &landings, &in_flight, &attempts, &held, free) {
-        match assign(store, mission, task, &landings, overruns.get(&task.id)) {
+        let explicit_model = explicit_model_override(config, task);
+        match assign(
+            store,
+            mission,
+            task,
+            &landings,
+            overruns.get(&task.id),
+            explicit_model,
+        ) {
             Ok(id) => assigned.push(id),
             Err(error) if assigned.is_empty() => return Err(error),
             Err(error) => {
@@ -1110,6 +1136,17 @@ pub(crate) fn assign_next(
     Ok(assigned)
 }
 
+/// Returns the explicit model profile override for `task`, checking the
+/// objective's own `"model"` field first and then `mission.objectives.model`.
+fn explicit_model_override(config: &serde_json::Value, task: &Task) -> Option<ModelProfile> {
+    task.model.or_else(|| {
+        config
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .and_then(ModelProfile::parse)
+    })
+}
+
 /// Assign one objective of `mission`; the task's id.
 fn assign(
     store: &PostgresStore,
@@ -1117,6 +1154,7 @@ fn assign(
     task: &Task,
     landings: &[Landing],
     continues: Option<&Overrun>,
+    explicit_model: Option<ModelProfile>,
 ) -> Result<i64, String> {
     let id = i32::try_from(task.id).map_err(|_| format!("objective {} is too large", task.id))?;
     let history: Vec<GateRecord> = serde_json::from_value(
@@ -1140,14 +1178,7 @@ fn assign(
         &history,
         continues,
     );
-    let route = match continues {
-        Some(overrun) => match continued_route(store, task, overrun.task) {
-            Carried::Route(decision) => Some((decision, None)),
-            Carried::Unrouted => None,
-            Carried::Afresh => grading_route(store, task).map(|(d, c)| (d, Some(c))),
-        },
-        None => grading_route(store, task).map(|(d, c)| (d, Some(c))),
-    };
+    let (route, fallback_model) = resolve_assignment_route(store, task, continues, explicit_model);
     let (model, difficulty, preset, classification) = match &route {
         Some((decision, classified)) => (
             decision.model_profile.as_str(),
@@ -1158,7 +1189,7 @@ fn assign(
                 .map(|classified| crate::grading::classification_record(classified, decision)),
         ),
         None => (
-            "default",
+            fallback_model,
             i32::from(TaskDifficulty::default().rank()),
             None,
             None,
@@ -1186,6 +1217,14 @@ fn assign(
             classified.as_ref(),
             continues,
         );
+    } else if let Some(profile) = explicit_model {
+        println!(
+            "integrate: mission {} objective {} -> task {assigned}: explicit --model {} override \
+             bypassed agent grading",
+            mission.id,
+            task.id,
+            profile.as_str(),
+        );
     }
     match continues {
         Some(overrun) => println!(
@@ -1206,6 +1245,42 @@ fn assign(
         ),
     }
     Ok(assigned)
+}
+
+/// Resolves the catalog route and fallback model profile for an objective task.
+fn resolve_assignment_route(
+    store: &PostgresStore,
+    task: &Task,
+    continues: Option<&Overrun>,
+    explicit_model: Option<ModelProfile>,
+) -> (
+    Option<(RoutingDecision, Option<DifficultyClassification>)>,
+    &'static str,
+) {
+    match continues {
+        Some(overrun) => match continued_route(store, task, overrun.task) {
+            Carried::Route(decision) if explicit_model.is_none() => {
+                (Some((decision, None)), "default")
+            }
+            Carried::Route(_) | Carried::Unrouted => {
+                (None, explicit_model.map_or("default", ModelProfile::as_str))
+            }
+            Carried::Afresh => match explicit_model {
+                Some(profile) => (None, profile.as_str()),
+                None => (
+                    grading_route(store, task).map(|(d, c)| (d, Some(c))),
+                    "default",
+                ),
+            },
+        },
+        None => match explicit_model {
+            Some(profile) => (None, profile.as_str()),
+            None => (
+                grading_route(store, task).map(|(d, c)| (d, Some(c))),
+                "default",
+            ),
+        },
+    }
 }
 
 /// The text agent grading classifies an objective's difficulty from: its
@@ -1229,9 +1304,10 @@ fn say_route(
     classified: Option<&DifficultyClassification>,
     continues: Option<&Overrun>,
 ) {
+    let role = spawn_core::grading::tier_role(Some(decision.preset_grade)).unwrap_or("-");
     println!(
         "integrate: mission {} objective {} -> task {assigned}: agent grading routed it to \
-         preset {} at {} ({}){}",
+         preset {} ({role}) at {} ({}){}",
         mission,
         objective,
         decision.preset_id,
@@ -1463,6 +1539,7 @@ mod tests {
             target: recurring.then_some(1100.0),
             after: Vec::new(),
             owner_judged: false,
+            model: None,
         }
     }
 

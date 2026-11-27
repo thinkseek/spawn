@@ -2275,3 +2275,302 @@ fn spawn_reader_and_spawn_supervisor_read_mission_board_and_mission_by_id_with_g
         assert_eq!(role_by_id, owner_by_id, "{login}");
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn task_assigned_emits_consistent_tier_role_and_validates_objective_model() {
+    let (store, schema) = store("grading_tier_role_objective_model");
+    let mut client = admin(&schema);
+    let mission = objective_mission(&store, "tierrole", 6);
+    register(&store, "small-l1", "cheap", 10);
+    onboard(&store, "small-l1", "unexamined", "l1");
+    register(&store, "mid-l2", "default", 20);
+    onboard(&store, "mid-l2", "unexamined", "l2");
+    register(&store, "top-l3", "default", 30);
+    onboard(&store, "top-l3", "unexamined", "l3");
+
+    let cls_l1 = json!({"difficulty": "l1", "score": -2, "rules": "brief-v3",
+                        "signals": [{"rule": "low_risk", "points": -2, "evidence": ["typo"]}],
+                        "rationale": "l1 (score -2: low_risk -2 [typo])"});
+    let obj_l1 = store
+        .objective_assign_classified(
+            mission,
+            1,
+            None,
+            "Objective 1",
+            None,
+            "cheap",
+            1,
+            Some("small-l1"),
+            Some(&cls_l1),
+        )
+        .expect("assign l1 obj");
+    let obj_l2 = store
+        .objective_assign_classified(
+            mission,
+            2,
+            None,
+            "Objective 2",
+            None,
+            "default",
+            2,
+            Some("mid-l2"),
+            None,
+        )
+        .expect("assign l2 obj");
+    let obj_l3 = store
+        .objective_assign_classified(
+            mission,
+            3,
+            None,
+            "Objective 3",
+            None,
+            "default",
+            3,
+            Some("top-l3"),
+            None,
+        )
+        .expect("assign l3 obj");
+    let obj_explicit_cheap = store
+        .objective_assign_classified(
+            mission,
+            4,
+            None,
+            "Objective 4 explicit cheap",
+            None,
+            "cheap",
+            2,
+            None,
+            None,
+        )
+        .expect("assign explicit cheap obj");
+
+    let r1 = assigned_record(&mut client, obj_l1);
+    assert_eq!(r1["tier_role"], json!("mechanical-offload"));
+    assert_eq!(r1["classification"], cls_l1);
+    assert_eq!(
+        assigned_record(&mut client, obj_l2)["tier_role"],
+        json!("mainline")
+    );
+    assert_eq!(
+        assigned_record(&mut client, obj_l3)["tier_role"],
+        json!("top-decision")
+    );
+    let r4 = assigned_record(&mut client, obj_explicit_cheap);
+    assert_eq!(r4["model"], json!("cheap"));
+    assert!(r4.get("tier_role").is_none(), "{r4}");
+    assert!(r4.get("preset_id").is_none(), "{r4}");
+
+    // `spawn_task_assign` emits matching `tier_role` when routed or non-default difficulty,
+    // and omits it on unrouted l2 assignments.
+    let task_l1 = store
+        .task_assign_routed(
+            mission,
+            "ephemeral",
+            "w1",
+            "typo fix",
+            "cheap",
+            false,
+            false,
+            TaskDifficulty::L1,
+            Some("small-l1"),
+        )
+        .expect("assign task l1");
+    let task_plain = store
+        .task_assign(mission, "ephemeral", "w2", "plain", "default")
+        .expect("assign plain");
+    assert_eq!(
+        assigned_record(&mut client, task_l1)["tier_role"],
+        json!("mechanical-offload")
+    );
+    assert!(
+        assigned_record(&mut client, task_plain)
+            .get("tier_role")
+            .is_none()
+    );
+
+    // `spawn_mission_reconfigure` validates and clears `objectives.model`.
+    let set_cheap: Value = client
+        .query_one(
+            "select spawn_mission_reconfigure($1, $2)",
+            &[&mission, &json!({"objectives": {"model": "cheap"}})],
+        )
+        .expect("set objectives.model")
+        .get(0);
+    assert_eq!(set_cheap["after"]["objectives"]["model"], json!("cheap"));
+
+    let clear_model: Value = client
+        .query_one(
+            "select spawn_mission_reconfigure($1, $2)",
+            &[&mission, &json!({"objectives": {"model": null}})],
+        )
+        .expect("clear objectives.model")
+        .get(0);
+    assert!(clear_model["after"]["objectives"].get("model").is_none());
+
+    let bad_model = client
+        .query_one(
+            "select spawn_mission_reconfigure($1, $2)",
+            &[&mission, &json!({"objectives": {"model": "turbo"}})],
+        )
+        .expect_err("invalid objectives.model refused");
+    assert!(sql_refusal(&bad_model).contains("default or cheap"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn pv5_samples_aggregate_deduplicated_outcomes_per_tier_and_allow_restricted_readers() {
+    let (store, schema) = store("grading_pv5_samples");
+    let mut client = admin(&schema);
+    let mission = store
+        .mission_add("PV5 Samples", &json!([]), "human")
+        .expect("add");
+    register(&store, "small-l1", "cheap", 10);
+    onboard(&store, "small-l1", "unexamined", "l1");
+    register(&store, "mid-l2", "default", 20);
+    onboard(&store, "mid-l2", "unexamined", "l2");
+    register(&store, "top-l3", "default", 30);
+    onboard(&store, "top-l3", "unexamined", "l3");
+
+    let mut command = 0_i64;
+    let mut next = || {
+        command += 1;
+        command
+    };
+
+    // L1: 1 first-pass accepted, 1 quality-rejected then cancelled, 1 clean cancel (ignored).
+    let l1_ok = reported(
+        &store,
+        mission,
+        "l1 ok",
+        "cheap",
+        TaskDifficulty::L1,
+        "small-l1",
+        next(),
+    );
+    store
+        .task_review(l1_ok, true, "", None)
+        .expect("accept l1_ok");
+    let l1_fail = reported(
+        &store,
+        mission,
+        "l1 fail",
+        "cheap",
+        TaskDifficulty::L1,
+        "small-l1",
+        next(),
+    );
+    gated(&mut client, l1_fail, "rejected", 0);
+    store.task_cancel(l1_fail).expect("cancel l1_fail");
+    let l1_clean = reported(
+        &store,
+        mission,
+        "l1 clean cancel",
+        "cheap",
+        TaskDifficulty::L1,
+        "small-l1",
+        next(),
+    );
+    store.task_cancel(l1_clean).expect("clean cancel");
+
+    // L2: 2 first-pass accepted (one reassigned once before delivery doesn't double-count).
+    let l2_pre = store
+        .task_assign_routed(
+            mission,
+            "ephemeral",
+            "w-a",
+            "l2 reassign",
+            "default",
+            false,
+            false,
+            TaskDifficulty::L2,
+            Some("mid-l2"),
+        )
+        .expect("assign l2_pre");
+    store.task_delivered(l2_pre, next()).expect("del l2_pre");
+    let l2_succ = store
+        .task_reassign(l2_pre, Some("moved"))
+        .expect("reassign")["task"]
+        .as_i64()
+        .expect("succ id");
+    store.task_delivered(l2_succ, next()).expect("del l2_succ");
+    assert!(store.task_reported(l2_succ, "done").expect("rep"));
+    store
+        .task_review(l2_succ, true, "", None)
+        .expect("accept succ");
+
+    let l2_ok = reported(
+        &store,
+        mission,
+        "l2 ok",
+        "default",
+        TaskDifficulty::L2,
+        "mid-l2",
+        next(),
+    );
+    store
+        .task_review(l2_ok, true, "", None)
+        .expect("accept l2_ok");
+
+    // L3: 1 first-pass accepted, plus 1 pre-window task ignored.
+    let l3_ok = reported(
+        &store,
+        mission,
+        "l3 ok",
+        "default",
+        TaskDifficulty::L3,
+        "top-l3",
+        next(),
+    );
+    store
+        .task_review(l3_ok, true, "", None)
+        .expect("accept l3_ok");
+    let l3_old = reported(
+        &store,
+        mission,
+        "l3 pre-window",
+        "default",
+        TaskDifficulty::L3,
+        "top-l3",
+        next(),
+    );
+    store
+        .task_review(l3_old, true, "", None)
+        .expect("accept l3_old");
+    client
+        .execute(
+            "update mission_tasks set created_at_ms = 0 where id = $1",
+            &[&l3_old],
+        )
+        .expect("backdate pre-window task");
+
+    let samples = store.grading_pv5_samples().expect("pv5 samples");
+    assert_eq!(samples.len(), 3, "{samples:?}");
+    let find = |id: &str| samples.iter().find(|s| s.preset_id == id).unwrap();
+    let s1 = find("small-l1");
+    assert_eq!(
+        (s1.difficulty, s1.total, s1.first_pass),
+        (TaskDifficulty::L1, 2, 1)
+    );
+    let s2 = find("mid-l2");
+    assert_eq!(
+        (s2.difficulty, s2.total, s2.first_pass),
+        (TaskDifficulty::L2, 2, 2)
+    );
+    let s3 = find("top-l3");
+    assert_eq!(
+        (s3.difficulty, s3.total, s3.first_pass),
+        (TaskDifficulty::L3, 1, 1)
+    );
+
+    for login in ["spawn_reader", "spawn_supervisor"] {
+        let role_url =
+            spawn_postgres::role_url(&common::schema_url(&schema), login).expect("role url");
+        let role_store = PostgresStore::connect(&role_url).expect("connect restricted login");
+        assert_eq!(
+            role_store.grading_pv5_samples().expect("role pv5 samples"),
+            samples,
+            "{login}"
+        );
+    }
+}
