@@ -477,6 +477,57 @@ impl RefLedger for BorrowedPgRefLedger<'_> {
     }
 }
 
+/// Closed project storage backend classification resolved from host boundary
+/// markers, root marker, D6 ledger state, and optional environment configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectStorage {
+    Git,
+    D6,
+}
+
+impl ProjectStorage {
+    pub(crate) const fn is_d6(self) -> bool {
+        matches!(self, Self::D6)
+    }
+}
+
+/// Signals evaluated by [`project_storage`] / [`project_storage_with_env`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ProjectStorageQuery<'a> {
+    pub(crate) root: Option<&'a Path>,
+    pub(crate) git_dir: Option<&'a Path>,
+    pub(crate) ledger_only_d6: bool,
+}
+
+/// Single source of truth determining whether a project or workspace root uses
+/// [`ProjectStorage::D6`] or [`ProjectStorage::Git`].
+pub(crate) fn project_storage_with_env(
+    query: ProjectStorageQuery<'_>,
+    env_backend: Option<&str>,
+) -> ProjectStorage {
+    let border_ro = query
+        .git_dir
+        .is_some_and(|dir| spawn_host::is_readonly_border(dir).unwrap_or(false));
+    let root_d6 = query.root.is_some_and(|root| {
+        matches!(
+            spawn_host::root_backend(root),
+            Ok(Some(HostWorkspaceBackend::D6))
+        )
+    });
+    let env_d6 = env_backend.is_some_and(|value| value.trim().eq_ignore_ascii_case("d6"));
+    if border_ro || root_d6 || (query.git_dir.is_none() && query.ledger_only_d6) || env_d6 {
+        ProjectStorage::D6
+    } else {
+        ProjectStorage::Git
+    }
+}
+
+/// Convenience wrapper for [`project_storage_with_env`] reading `SPAWN_WORKSPACE_BACKEND`.
+pub(crate) fn project_storage(query: ProjectStorageQuery<'_>) -> ProjectStorage {
+    let env_backend = crate::config::env_value("SPAWN_WORKSPACE_BACKEND");
+    project_storage_with_env(query, env_backend.as_deref())
+}
+
 /// Resolve workspace backend settings for `root` without claiming the root on disk
 /// or caching into [`WorkspaceSettings::from_env`]'s process-global `OnceLock`.
 /// When `SPAWN_WORKSPACE_BACKEND` is unset and `root` already carries a `d6` marker,
@@ -510,7 +561,14 @@ pub(crate) fn workspace_settings_readonly(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
-        && existing == Some(HostWorkspaceBackend::D6)
+        && project_storage_with_env(
+            ProjectStorageQuery {
+                root: Some(root),
+                ..Default::default()
+            },
+            None,
+        )
+        .is_d6()
     {
         crate::config::WorkspaceBackend::D6
     } else {
@@ -614,14 +672,15 @@ pub(crate) fn read_main_copies_at(root: &Path, agent: &str) -> Option<(String, V
     }
     let main_bytes = fields.next()?;
     let main = std::str::from_utf8(main_bytes).ok()?.to_string();
-    let is_d6 = matches!(
-        spawn_host::root_backend(&canonical),
-        Ok(Some(HostWorkspaceBackend::D6))
-    );
-    let valid_main = if is_d6 {
-        Digest::parse(&main).is_ok()
-    } else {
-        !main.is_empty() && main.bytes().all(|b| b.is_ascii_hexdigit())
+    let valid_main = match project_storage_with_env(
+        ProjectStorageQuery {
+            root: Some(&canonical),
+            ..Default::default()
+        },
+        None,
+    ) {
+        ProjectStorage::D6 => Digest::parse(&main).is_ok(),
+        ProjectStorage::Git => !main.is_empty() && main.bytes().all(|b| b.is_ascii_hexdigit()),
     };
     if !valid_main {
         return None;
@@ -4343,6 +4402,161 @@ mod tests {
             1
         );
 
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    fn init_bare_repo_with_main(scratch: &std::path::Path) -> std::path::PathBuf {
+        let bare = scratch.join("bare.git");
+        let work = scratch.join("work");
+        std::fs::create_dir_all(&bare).expect("mkdir bare");
+        std::fs::create_dir_all(&work).expect("mkdir work");
+        let bare_s = bare.to_string_lossy().into_owned();
+        let work_s = work.to_string_lossy().into_owned();
+        git(&["init", "--bare", "-q", &bare_s]).expect("init bare");
+        git(&["init", "-q", &work_s]).expect("init work");
+        git(&["-C", &work_s, "config", "user.name", "T"]).expect("u");
+        git(&["-C", &work_s, "config", "user.email", "t@t"]).expect("e");
+        std::fs::write(work.join("README.md"), "v1\n").expect("readme");
+        git(&["-C", &work_s, "add", "README.md"]).expect("add");
+        git(&["-C", &work_s, "commit", "-q", "-m", "m1"]).expect("commit");
+        git(&["-C", &work_s, "branch", "-M", "main"]).expect("branch");
+        git(&["-C", &work_s, "remote", "add", "origin", &bare_s]).expect("remote");
+        git(&["-C", &work_s, "push", "-q", "origin", "main"]).expect("push");
+        bare
+    }
+
+    #[test]
+    fn project_storage_unifies_root_ledger_and_env_signals() {
+        use super::{
+            ProjectStorage, ProjectStorageQuery, project_storage_with_env,
+            workspace_settings_readonly,
+        };
+        use crate::config::WorkspaceBackend;
+
+        let scratch = std::env::temp_dir().join(format!(
+            "spawn-project-storage-signals-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let git_root = scratch.join("git-root");
+        let cow_root = scratch.join("cow-root");
+        let d6_root = scratch.join("d6-root");
+        for dir in [&git_root, &cow_root, &d6_root] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        spawn_host::claim_root(&git_root, spawn_host::WorkspaceBackend::Git).expect("claim git");
+        spawn_host::claim_root(&cow_root, spawn_host::WorkspaceBackend::Cow).expect("claim cow");
+        spawn_host::claim_root(&d6_root, spawn_host::WorkspaceBackend::D6).expect("claim d6");
+        let bare = init_bare_repo_with_main(&scratch);
+
+        // Plain git/cow/`d6-shadow` roots without read-only border or ledger-only resolve to Git.
+        let git_q = ProjectStorageQuery {
+            root: Some(&git_root),
+            git_dir: Some(&bare),
+            ledger_only_d6: false,
+        };
+        assert_eq!(project_storage_with_env(git_q, None), ProjectStorage::Git);
+        assert_eq!(
+            project_storage_with_env(git_q, Some("d6-shadow")),
+            ProjectStorage::Git
+        );
+        assert_eq!(
+            project_storage_with_env(
+                ProjectStorageQuery {
+                    root: Some(&cow_root),
+                    ..git_q
+                },
+                Some("cow"),
+            ),
+            ProjectStorage::Git
+        );
+        // Plain `d6` env var triggers D6 storage even before root marker inspection.
+        assert_eq!(
+            project_storage_with_env(ProjectStorageQuery::default(), Some(" D6 ")),
+            ProjectStorage::D6
+        );
+        // `ledger_only_d6` applies only when no local Git repository exists.
+        assert_eq!(
+            project_storage_with_env(
+                ProjectStorageQuery {
+                    ledger_only_d6: true,
+                    ..git_q
+                },
+                None
+            ),
+            ProjectStorage::Git
+        );
+        assert_eq!(
+            project_storage_with_env(
+                ProjectStorageQuery {
+                    root: Some(&git_root),
+                    git_dir: None,
+                    ledger_only_d6: true
+                },
+                None,
+            ),
+            ProjectStorage::D6
+        );
+        // `d6` root marker wins even if env_backend names `git`, matching `workspace_settings_readonly`.
+        assert_eq!(
+            project_storage_with_env(
+                ProjectStorageQuery {
+                    root: Some(&d6_root),
+                    git_dir: None,
+                    ledger_only_d6: false
+                },
+                Some("git"),
+            ),
+            ProjectStorage::D6
+        );
+        if let Ok(settings) = workspace_settings_readonly(&d6_root) {
+            assert_eq!(settings.configured, WorkspaceBackend::D6);
+        }
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn project_storage_respects_readonly_git_border() {
+        use super::{ProjectStorage, ProjectStorageQuery, project_storage_with_env};
+
+        let scratch = std::env::temp_dir().join(format!(
+            "spawn-project-storage-border-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let git_root = scratch.join("git-root");
+        let d6_root = scratch.join("d6-root");
+        std::fs::create_dir_all(&git_root).expect("mkdir git");
+        std::fs::create_dir_all(&d6_root).expect("mkdir d6");
+        spawn_host::claim_root(&git_root, spawn_host::WorkspaceBackend::Git).expect("claim git");
+        spawn_host::claim_root(&d6_root, spawn_host::WorkspaceBackend::D6).expect("claim d6");
+        let bare = init_bare_repo_with_main(&scratch);
+
+        let border = spawn_host::GitBorderAdapter::new();
+        let cas = spawn_host::CasMerkleStore::open(d6_root.join(".cas")).expect("open cas");
+        let schema = spawn_postgres::testing::TestSchema::new("project_storage_ro_border");
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let pg = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("test pg");
+        let ledger = super::PostgresRefLedger::new(std::sync::Arc::new(pg));
+        let mut cutover = spawn_host::ProjectCutover::new("proj-storage-border", &bare, &d6_root);
+        run_cutover_steps(&mut cutover, &cas, &ledger, &border, "storage test");
+
+        assert_eq!(
+            project_storage_with_env(
+                ProjectStorageQuery {
+                    root: Some(&git_root),
+                    git_dir: Some(&bare),
+                    ledger_only_d6: false,
+                },
+                None,
+            ),
+            ProjectStorage::D6
+        );
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
