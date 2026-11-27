@@ -482,11 +482,13 @@
 //! on every pass.
 
 use std::cell::RefCell;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde::de::Error as _;
 use serde_json::{Value, json};
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
@@ -765,7 +767,7 @@ pub(crate) fn gate_slots(
     gate_slots_with(flag, env, per_gate, None)
 }
 
-pub(crate) fn gate_slots_from(flags: &Flags) -> Result<usize, String> {
+fn gate_slots_from(flags: &Flags) -> Result<usize, String> {
     gate_slots_with(
         flags.get("gates"),
         crate::config::env_value("SPAWN_INTEGRATE_GATES"),
@@ -808,194 +810,656 @@ pub(crate) fn gate_slots_with(
     }
 }
 
+/// Lifecycle state of a mission in `mission_missions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MissionState {
+    #[default]
+    Open,
+    Active,
+    Done,
+    Dropped,
+}
+
+/// Who accepts a mission's task before the gate judges it (`mission_missions.accept`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptPolicy {
+    Review,
+    Gate,
+}
+
+impl AcceptPolicy {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "review" => Ok(Self::Review),
+            "gate" => Ok(Self::Gate),
+            other => Err(format!(
+                "invalid mission accept policy {other:?}: expected \"review\" or \"gate\""
+            )),
+        }
+    }
+}
+
+/// Coupled state of a mission's current `no_room` gate run (`gate_room_*`).
+/// `since_ms` and `last_ms` record the store's `clock_timestamp()` wall clock,
+/// which is not monotonic (`last_ms < since_ms` is valid; consumers use
+/// saturating arithmetic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoomRun {
+    Idle,
+    Active {
+        task: i64,
+        since_ms: i64,
+        last_ms: i64,
+        waits: NonZeroU32,
+        escalated: bool,
+    },
+}
+
+impl RoomRun {
+    fn try_from_fields(
+        task: Option<i64>,
+        since_ms: Option<i64>,
+        last_ms: Option<i64>,
+        waits: u32,
+        escalated: bool,
+    ) -> Result<Self, String> {
+        match (task, since_ms, last_ms, NonZeroU32::new(waits), escalated) {
+            (None, None, None, None, false) => Ok(Self::Idle),
+            (Some(task), Some(since_ms), Some(last_ms), Some(waits), escalated) => {
+                Ok(Self::Active {
+                    task,
+                    since_ms,
+                    last_ms,
+                    waits,
+                    escalated,
+                })
+            }
+            _ => Err(format!(
+                "inconsistent gate room run fields: task={task:?}, since_ms={since_ms:?}, \
+                 last_ms={last_ms:?}, waits={waits}, escalated={escalated}"
+            )),
+        }
+    }
+}
+
+/// Coupled state of a mission's current `host_fault` gate run (`gate_host_*`,
+/// `gate_base_disagrees`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostFaultRun {
+    Idle,
+    Active {
+        faults: NonZeroU32,
+        task: i64,
+        due_ms: Option<i64>,
+        base_disagrees: u32,
+    },
+}
+
+impl HostFaultRun {
+    fn try_from_fields(
+        faults: u32,
+        task: Option<i64>,
+        due_ms: Option<i64>,
+        base_disagrees: u32,
+    ) -> Result<Self, String> {
+        if base_disagrees > faults {
+            return Err(format!(
+                "invalid host fault run: gate_base_disagrees ({base_disagrees}) > \
+                 gate_host_faults ({faults})"
+            ));
+        }
+        match (NonZeroU32::new(faults), task, due_ms) {
+            (None, None, None) => Ok(Self::Idle),
+            (Some(faults), Some(task), due_ms) => Ok(Self::Active {
+                faults,
+                task,
+                due_ms,
+                base_disagrees,
+            }),
+            _ => Err(format!(
+                "inconsistent host fault run fields: faults={faults}, task={task:?}, \
+                 due_ms={due_ms:?}, base_disagrees={base_disagrees}"
+            )),
+        }
+    }
+}
+
+/// Coupled state of a mission's current consecutive gate rejection run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectionRun {
+    Idle,
+    SingleObjective { count: NonZeroU32, objective: u32 },
+    MixedOrUnscoped { count: NonZeroU32 },
+}
+
+impl RejectionRun {
+    fn try_from_fields(rejections: u32, objective: Option<u32>) -> Result<Self, String> {
+        match (NonZeroU32::new(rejections), objective) {
+            (None, None) => Ok(Self::Idle),
+            (None, Some(obj)) => Err(format!(
+                "inconsistent rejection run: gate_rejection_objective ({obj}) set with \
+                 gate_rejections == 0"
+            )),
+            (Some(count), Some(objective)) => Ok(Self::SingleObjective { count, objective }),
+            (Some(count), None) => Ok(Self::MixedOrUnscoped { count }),
+        }
+    }
+}
+
+/// Coupled scenario count floor and the scenario filenames captured at that floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScenarioFloor<'a> {
+    Unset,
+    Set {
+        count: NonZeroU32,
+        names: Option<&'a [String]>,
+    },
+}
+
+impl<'a> ScenarioFloor<'a> {
+    fn try_from_fields(floor: u32, names: Option<&'a [String]>) -> Result<Self, String> {
+        match (NonZeroU32::new(floor), names) {
+            (None, None) => Ok(Self::Unset),
+            (None, Some(_)) => Err(
+                "inconsistent scenario floor: scenario_names present when scenario_floor == 0"
+                    .to_string(),
+            ),
+            (Some(count), names) => Ok(Self::Set { count, names }),
+        }
+    }
+}
+
+/// Coupled state of a task's load-sensitive bound (`gate_load_sensitive_*`,
+/// `gate_parked_pushed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoadSensitiveState<'a> {
+    Clear,
+    Observed {
+        pushed: &'a str,
+        scenarios: &'a [String],
+    },
+    Parked {
+        pushed: &'a str,
+        scenarios: &'a [String],
+    },
+}
+
+impl<'a> LoadSensitiveState<'a> {
+    fn try_from_fields(
+        pushed: Option<&'a str>,
+        scenarios: Option<&'a [String]>,
+        parked: Option<&'a str>,
+    ) -> Result<Self, String> {
+        match (pushed, scenarios, parked) {
+            (None, None, None) => Ok(Self::Clear),
+            (Some(pushed), sc, None) => Ok(Self::Observed {
+                pushed,
+                scenarios: sc.unwrap_or(&[]),
+            }),
+            (Some(pushed), sc, Some(parked)) if pushed == parked => Ok(Self::Parked {
+                pushed: parked,
+                scenarios: sc.unwrap_or(&[]),
+            }),
+            (Some(pushed), _, Some(parked)) => Err(format!(
+                "inconsistent load-sensitive state: gate_parked_pushed ({parked:?}) != \
+                 gate_load_sensitive_pushed ({pushed:?})"
+            )),
+            (None, sc, parked) => Err(format!(
+                "inconsistent load-sensitive state: gate_load_sensitive_pushed is None with \
+                 scenarios_present={}, parked={parked:?}",
+                sc.is_some()
+            )),
+        }
+    }
+}
+
 /// One mission with a gate the integrator visits, from `gated_missions`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct Mission {
     pub(crate) id: i64,
     /// `open` or `active`; `done` while the closure rule lets its work go
     /// on (`spawn_task_may_continue`).
-    #[serde(default)]
-    pub(crate) state: String,
+    pub(crate) state: MissionState,
     pub(crate) gate: String,
     pub(crate) accept: String,
-    #[serde(default)]
     pub(crate) budget: Option<Value>,
-    #[serde(default)]
     pub(crate) baseline: Option<String>,
-    #[serde(default)]
     pub(crate) halted: Option<String>,
     /// The owner has paused it (objective 099): no objective is assigned
     /// to it (`spawn_objective_assign` would refuse) until it is resumed.
-    #[serde(default)]
     pub(crate) paused: bool,
-    #[serde(default)]
     pub(crate) scenario_floor: u32,
     /// The scenario file names (`*.sh`) the gate directory held at the
     /// gating that set `scenario_floor` (the latest at the floor since the
     /// mission's last resume), folded by the store from that `task.gated`'s
     /// `scenario_names`; none before such a gating, or from a record without
     /// them. A halt on the floor names the ones gone since ([`floor_gone`]).
-    #[serde(default)]
     pub(crate) scenario_names: Option<Vec<String>>,
     /// The gate directory's scenario file names as this pass read them, for
     /// the gating's record (`scenario_names`): never the store's.
-    #[serde(skip)]
     pub(crate) scenarios_now: Option<Vec<String>>,
-    #[serde(default)]
     pub(crate) gate_rejections: u32,
     /// The objective every rejection of the current `gate_rejections` run
     /// was a task of, folded by the store; none when there is no run or the
     /// run spans objectives (or a task without one). A run of one
     /// objective's rejections yields that objective
     /// ([`crate::objectives::yields`]) and does not halt the mission.
-    #[serde(default)]
     pub(crate) gate_rejection_objective: Option<u32>,
-    #[serde(default)]
     pub(crate) gate_aborts: u32,
     /// The mission's current run of `no_room` gate outcomes, folded by the
     /// store: the task it is about (a run is one task's; it ends when that
     /// task leaves the gate), when it began, when the latest was recorded,
     /// how many, and whether one carried `escalate`.
-    #[serde(default)]
     pub(crate) gate_room_task: Option<i64>,
-    #[serde(default)]
     pub(crate) gate_room_since_ms: Option<i64>,
-    #[serde(default)]
     pub(crate) gate_room_last_ms: Option<i64>,
-    #[serde(default)]
     pub(crate) gate_room_waits: u32,
-    #[serde(default)]
     pub(crate) gate_room_escalated: bool,
     /// Main of the mission's source is red on a check ([`Red`], the store's
     /// `mission_source_reds` row): none while it is not.
-    #[serde(default)]
     pub(crate) red: Option<Red>,
     /// The database's clock when the store read the mission
     /// (`spawn_now_ms()`, in the same query): the gate's due times are the
     /// store's (`gate_room_last_ms` is its record's time, `gate_host_due_ms`
     /// that plus the backoff), so a wait is measured against it, never the
     /// host's clock ([`gate_wait`]). Absent only in a mission built by hand.
-    #[serde(default)]
     pub(crate) now_ms: Option<i64>,
     /// The mission's current run of `host_fault` gate outcomes, folded by
     /// the store: how many in a row, the task the latest was about, and the
     /// latest record's `due_ms` (its own time plus its backoff).
-    #[serde(default)]
     pub(crate) gate_host_faults: u32,
-    #[serde(default)]
     pub(crate) gate_host_task: Option<i64>,
-    #[serde(default)]
     pub(crate) gate_host_due_ms: Option<i64>,
     /// The mission's current run of `host_fault` gate outcomes whose
     /// evidence is a base that disagreed with itself (objective 033), folded
     /// by the store: the record that makes it [`BASE_DISAGREES_ALERT_AT`]
     /// carries `alert`, and every other one does not.
-    #[serde(default)]
     pub(crate) gate_base_disagrees: u32,
-    #[serde(default)]
     pub(crate) objectives: Option<Value>,
     /// When the mission was last configured (`mission.configured`), on the
     /// database's clock: an overrun chain's hold ends with a configure newer
     /// than its escalated record ([`crate::objectives`]).
-    #[serde(default)]
     pub(crate) configured_ms: Option<i64>,
-    #[serde(default)]
     pub(crate) source: Option<String>,
     /// The owner's active hold on its source (the `source.held` record's
     /// event id), if one, as the pass read it: which of its landing tasks
     /// wait behind it ([`Mission::in_flight`]). A landing never trusts it:
     /// [`land`] reads the hold from the store under the landing lock.
-    #[serde(default)]
     pub(crate) hold: Option<i64>,
     /// Its tasks the closure rule lets go on: every open task of an open
     /// mission; of a done one, delivered, reported, accepted and landing.
-    #[serde(default)]
     pub(crate) tasks: Vec<Task>,
+}
+
+#[derive(Deserialize)]
+struct RawMission {
+    id: i64,
+    #[serde(default)]
+    state: MissionState,
+    gate: String,
+    accept: String,
+    #[serde(default)]
+    budget: Option<Value>,
+    #[serde(default)]
+    baseline: Option<String>,
+    #[serde(default)]
+    halted: Option<String>,
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    scenario_floor: u32,
+    #[serde(default)]
+    scenario_names: Option<Vec<String>>,
+    #[serde(default)]
+    gate_rejections: u32,
+    #[serde(default)]
+    gate_rejection_objective: Option<u32>,
+    #[serde(default)]
+    gate_aborts: u32,
+    #[serde(default)]
+    gate_room_task: Option<i64>,
+    #[serde(default)]
+    gate_room_since_ms: Option<i64>,
+    #[serde(default)]
+    gate_room_last_ms: Option<i64>,
+    #[serde(default)]
+    gate_room_waits: u32,
+    #[serde(default)]
+    gate_room_escalated: bool,
+    #[serde(default)]
+    red: Option<Red>,
+    #[serde(default)]
+    now_ms: Option<i64>,
+    #[serde(default)]
+    gate_host_faults: u32,
+    #[serde(default)]
+    gate_host_task: Option<i64>,
+    #[serde(default)]
+    gate_host_due_ms: Option<i64>,
+    #[serde(default)]
+    gate_base_disagrees: u32,
+    #[serde(default)]
+    objectives: Option<Value>,
+    #[serde(default)]
+    configured_ms: Option<i64>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    hold: Option<i64>,
+    #[serde(default)]
+    tasks: Vec<Task>,
+}
+
+impl From<RawMission> for Mission {
+    fn from(raw: RawMission) -> Self {
+        Self {
+            id: raw.id,
+            state: raw.state,
+            gate: raw.gate,
+            accept: raw.accept,
+            budget: raw.budget,
+            baseline: raw.baseline,
+            halted: raw.halted,
+            paused: raw.paused,
+            scenario_floor: raw.scenario_floor,
+            scenario_names: raw.scenario_names,
+            scenarios_now: None,
+            gate_rejections: raw.gate_rejections,
+            gate_rejection_objective: raw.gate_rejection_objective,
+            gate_aborts: raw.gate_aborts,
+            gate_room_task: raw.gate_room_task,
+            gate_room_since_ms: raw.gate_room_since_ms,
+            gate_room_last_ms: raw.gate_room_last_ms,
+            gate_room_waits: raw.gate_room_waits,
+            gate_room_escalated: raw.gate_room_escalated,
+            red: raw.red,
+            now_ms: raw.now_ms,
+            gate_host_faults: raw.gate_host_faults,
+            gate_host_task: raw.gate_host_task,
+            gate_host_due_ms: raw.gate_host_due_ms,
+            gate_base_disagrees: raw.gate_base_disagrees,
+            objectives: raw.objectives,
+            configured_ms: raw.configured_ms,
+            source: raw.source,
+            hold: raw.hold,
+            tasks: raw.tasks,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Mission {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawMission::deserialize(deserializer)?;
+        let mission = Self::from(raw);
+        mission.validate_wire().map_err(D::Error::custom)?;
+        Ok(mission)
+    }
 }
 
 /// Main of a source red on a check (docs/fleet-architecture.md §10.3, "Main
 /// is red"): the store's fold of its `source.main_red` records less the
 /// `source.main_green` that ends it. `main` is the main last found red,
 /// `scenario` the check, `since_ms` the first red record's time, `latest_ms`
-/// the latest's and `probed_ms` the latest probe gate's (the store's clock
-/// all three).
-#[derive(Debug, Clone, Deserialize)]
+/// the latest's and `probed_ms` the latest probe gate's (the store's
+/// `clock_timestamp()` wall clock all three, so ordering is not monotonic
+/// and consumers use saturating arithmetic).
+#[derive(Debug, Clone)]
 pub(crate) struct Red {
     pub(crate) main: String,
     pub(crate) scenario: String,
     pub(crate) since_ms: i64,
     pub(crate) latest_ms: i64,
-    #[serde(default)]
     pub(crate) probed_ms: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct RawRed {
+    main: String,
+    scenario: String,
+    since_ms: i64,
+    latest_ms: i64,
+    #[serde(default)]
+    probed_ms: Option<i64>,
+}
+
+impl<'de> Deserialize<'de> for Red {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawRed::deserialize(deserializer)?;
+        if raw.main.trim().is_empty() {
+            return Err(D::Error::custom("red.main must not be empty"));
+        }
+        if raw.scenario.trim().is_empty() {
+            return Err(D::Error::custom("red.scenario must not be empty"));
+        }
+        Ok(Self {
+            main: raw.main,
+            scenario: raw.scenario,
+            since_ms: raw.since_ms,
+            latest_ms: raw.latest_ms,
+            probed_ms: raw.probed_ms,
+        })
+    }
+}
+
 /// One of its tasks the integrator may act on.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct Task {
     pub(crate) id: i64,
     pub(crate) agent_id: String,
     pub(crate) session_id: String,
     pub(crate) state: TaskState,
-    #[serde(default)]
     pub(crate) base: Option<String>,
-    #[serde(default)]
     pub(crate) candidate: Option<String>,
-    #[serde(default)]
     pub(crate) scenario: Option<String>,
-    #[serde(default)]
     pub(crate) delivered_at_ms: Option<i64>,
     /// The backlog objective it pursues, for an objective mission's task.
-    #[serde(default)]
     pub(crate) objective: Option<u32>,
     /// The revision of its report (`mission_tasks.revisions`): every
     /// verdict names the one it judged, and the store refuses it once the
     /// task has moved on to another.
-    #[serde(default)]
     pub(crate) revisions: i32,
     /// Its brief (`mission_tasks.brief`): an objective task's first line is
     /// `Objective <id>: <title>`.
-    #[serde(default)]
     pub(crate) brief: String,
     /// The report the gate's verdict is for (`mission_tasks.report`), as the
     /// record holds it: the landing's message summarises it.
-    #[serde(default)]
     pub(crate) report: Option<String>,
     /// When it last changed state (reported, accepted, or a verdict that
     /// left it ready): how long it has waited for a gate.
-    #[serde(default)]
     pub(crate) updated_at_ms: i64,
     /// The owner's hold its landing last waited behind (its latest
     /// `task.held`), if any.
-    #[serde(default)]
     pub(crate) held_by: Option<i64>,
     /// The overrun task whose work this one continues (its `task.assigned`
     /// names it), if any: a second overrun of such a task goes to the
     /// supervisor and holds its objective.
-    #[serde(default)]
     pub(crate) continues: Option<i64>,
     /// The load-sensitive bound (sync/design-load-sensitive-bound.md): the
     /// pushed commit whose gate last found a regression load-sensitive, and
     /// every scenario found so across those judgings.
-    #[serde(default)]
     pub(crate) gate_load_sensitive_pushed: Option<String>,
-    #[serde(default)]
     pub(crate) gate_load_sensitive_scenarios: Option<Vec<String>>,
     /// The pushed commit the bound parked: not judged again until a new
     /// commit is pushed or a person releases it.
-    #[serde(default)]
     pub(crate) gate_parked_pushed: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct RawTask {
+    id: i64,
+    agent_id: String,
+    session_id: String,
+    state: TaskState,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    candidate: Option<String>,
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    delivered_at_ms: Option<i64>,
+    #[serde(default)]
+    objective: Option<u32>,
+    #[serde(default)]
+    revisions: i32,
+    #[serde(default)]
+    brief: String,
+    #[serde(default)]
+    report: Option<String>,
+    #[serde(default)]
+    updated_at_ms: i64,
+    #[serde(default)]
+    held_by: Option<i64>,
+    #[serde(default)]
+    continues: Option<i64>,
+    #[serde(default)]
+    gate_load_sensitive_pushed: Option<String>,
+    #[serde(default)]
+    gate_load_sensitive_scenarios: Option<Vec<String>>,
+    #[serde(default)]
+    gate_parked_pushed: Option<String>,
+}
+
+impl From<RawTask> for Task {
+    fn from(raw: RawTask) -> Self {
+        Self {
+            id: raw.id,
+            agent_id: raw.agent_id,
+            session_id: raw.session_id,
+            state: raw.state,
+            base: raw.base,
+            candidate: raw.candidate,
+            scenario: raw.scenario,
+            delivered_at_ms: raw.delivered_at_ms,
+            objective: raw.objective,
+            revisions: raw.revisions,
+            brief: raw.brief,
+            report: raw.report,
+            updated_at_ms: raw.updated_at_ms,
+            held_by: raw.held_by,
+            continues: raw.continues,
+            gate_load_sensitive_pushed: raw.gate_load_sensitive_pushed,
+            gate_load_sensitive_scenarios: raw.gate_load_sensitive_scenarios,
+            gate_parked_pushed: raw.gate_parked_pushed,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Task {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let task = Self::from(RawTask::deserialize(deserializer)?);
+        task.load_sensitive_state().map_err(D::Error::custom)?;
+        Ok(task)
+    }
+}
+
+impl Task {
+    fn load_sensitive_state(&self) -> Result<LoadSensitiveState<'_>, String> {
+        LoadSensitiveState::try_from_fields(
+            self.gate_load_sensitive_pushed.as_deref(),
+            self.gate_load_sensitive_scenarios.as_deref(),
+            self.gate_parked_pushed.as_deref(),
+        )
+    }
+}
+
 impl Mission {
+    fn accept_policy(&self) -> Result<AcceptPolicy, String> {
+        AcceptPolicy::parse(&self.accept)
+    }
+
+    fn room_run(&self) -> Result<RoomRun, String> {
+        RoomRun::try_from_fields(
+            self.gate_room_task,
+            self.gate_room_since_ms,
+            self.gate_room_last_ms,
+            self.gate_room_waits,
+            self.gate_room_escalated,
+        )
+    }
+
+    fn host_fault_run(&self) -> Result<HostFaultRun, String> {
+        HostFaultRun::try_from_fields(
+            self.gate_host_faults,
+            self.gate_host_task,
+            self.gate_host_due_ms,
+            self.gate_base_disagrees,
+        )
+    }
+
+    fn rejection_run(&self) -> Result<RejectionRun, String> {
+        RejectionRun::try_from_fields(self.gate_rejections, self.gate_rejection_objective)
+    }
+
+    fn scenario_floor_state(&self) -> Result<ScenarioFloor<'_>, String> {
+        ScenarioFloor::try_from_fields(self.scenario_floor, self.scenario_names.as_deref())
+    }
+
+    fn validate_wire(&self) -> Result<(), String> {
+        self.accept_policy()?;
+        self.room_run()?;
+        self.rejection_run()?;
+        self.scenario_floor_state()?;
+        if self.gate_base_disagrees > self.gate_host_faults {
+            return Err(format!(
+                "invalid host fault run: gate_base_disagrees ({}) > gate_host_faults ({})",
+                self.gate_base_disagrees, self.gate_host_faults
+            ));
+        }
+        if self.gate_host_due_ms.is_some() && self.gate_host_task.is_none() {
+            return Err(
+                "inconsistent host fault run: gate_host_due_ms set without gate_host_task"
+                    .to_string(),
+            );
+        }
+        if self.source.is_none() && (self.hold.is_some() || self.red.is_some()) {
+            return Err(
+                "inconsistent source state: hold/red present without mission source".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Strict validation enforced at the real Postgres `gated_missions` read boundary.
+    fn validate_store_row(&self) -> Result<(), String> {
+        self.validate_wire()?;
+        if self.now_ms.is_none() {
+            return Err("missing now_ms from gated_missions query".to_string());
+        }
+        self.host_fault_run()?;
+        for task in &self.tasks {
+            task.load_sensitive_state()
+                .map_err(|error| format!("task {}: {error}", task.id))?;
+        }
+        Ok(())
+    }
+
+    fn can_judge(&self, task: &Task) -> bool {
+        task.state == TaskState::Accepted
+            || (self.accept_policy().ok() == Some(AcceptPolicy::Gate)
+                && task.state == TaskState::Reported)
+    }
+
     /// The task the gate judges next: one the supervisor accepted, or, when
     /// the gate alone accepts, also one just reported.
     fn ready(&self) -> Option<&Task> {
         self.tasks.iter().find(|task| {
             // A task the load-sensitive bound parked is not judged; the
             // mission's next one is ([`Integrator::parked`] says it once).
-            task.gate_parked_pushed.is_none()
-                && (task.state == TaskState::Accepted
-                    || (self.accept == "gate" && task.state == TaskState::Reported))
+            !matches!(
+                task.load_sensitive_state(),
+                Ok(LoadSensitiveState::Parked { .. })
+            ) && self.can_judge(task)
         })
     }
 
@@ -1003,9 +1467,10 @@ impl Mission {
     /// otherwise.
     fn parked(&self) -> impl Iterator<Item = &Task> {
         self.tasks.iter().filter(|task| {
-            task.gate_parked_pushed.is_some()
-                && (task.state == TaskState::Accepted
-                    || (self.accept == "gate" && task.state == TaskState::Reported))
+            matches!(
+                task.load_sensitive_state(),
+                Ok(LoadSensitiveState::Parked { .. })
+            ) && self.can_judge(task)
         })
     }
 
@@ -1028,17 +1493,32 @@ impl Mission {
     }
 }
 
+/// Parse and validate rows returned by `PostgresStore::gated_missions`.
+fn parse_gated_missions(value: Value) -> Result<Vec<Mission>, String> {
+    let missions: Vec<Mission> =
+        serde_json::from_value(value).map_err(|error| format!("gated missions: {error}"))?;
+    for mission in &missions {
+        mission
+            .validate_store_row()
+            .map_err(|error| format!("gated missions: mission {}: {error}", mission.id))?;
+    }
+    Ok(missions)
+}
+
 /// The halt rule that fires before anything is judged, if one does.
 pub(crate) fn halt_reason(mission: &Mission, scenarios: u32) -> Option<String> {
     // Three rejections of one objective's tasks yield that objective
     // (`objectives::yields`); only a run spanning objectives halts, or one
     // in a mission without objectives to yield.
-    let yields = mission.gate_rejection_objective.is_some() && mission.objectives.is_some();
-    if mission.gate_rejections >= HALT_AFTER && !yields {
-        return Some(format!(
-            "{} gate rejections in a row",
-            mission.gate_rejections
-        ));
+    let rejection_count = match mission.rejection_run() {
+        Ok(RejectionRun::Idle) | Err(_) => 0,
+        Ok(RejectionRun::SingleObjective { .. }) if mission.objectives.is_some() => 0,
+        Ok(
+            RejectionRun::SingleObjective { count, .. } | RejectionRun::MixedOrUnscoped { count },
+        ) => count.get(),
+    };
+    if rejection_count >= HALT_AFTER {
+        return Some(format!("{rejection_count} gate rejections in a row"));
     }
     if mission.gate_aborts >= HALT_AFTER {
         return Some(format!("{} gate aborts in a row", mission.gate_aborts));
@@ -1049,12 +1529,11 @@ pub(crate) fn halt_reason(mission: &Mission, scenarios: u32) -> Option<String> {
 /// The scenario floor's halt rule: a candidate that deletes the scenario
 /// that judges it passes by removing the work, so the count may not fall.
 fn floor_reason(mission: &Mission, scenarios: u32) -> Option<String> {
-    (mission.scenario_floor > 0 && scenarios < mission.scenario_floor).then(|| {
-        format!(
-            "the scenarios fell from {} to {scenarios}",
-            mission.scenario_floor
-        )
-    })
+    let Ok(ScenarioFloor::Set { count, .. }) = mission.scenario_floor_state() else {
+        return None;
+    };
+    (scenarios < count.get())
+        .then(|| format!("the scenarios fell from {} to {scenarios}", count.get()))
 }
 
 /// The scenarios a halt on the floor names as gone: the file names the
@@ -1062,7 +1541,12 @@ fn floor_reason(mission: &Mission, scenarios: u32) -> Option<String> {
 /// directory's at the halt) no longer holds, sorted. None when that gating
 /// named none (a record from before names were recorded).
 pub(crate) fn floor_gone(mission: &Mission, now: &[String]) -> Option<Vec<String>> {
-    let then = mission.scenario_names.as_ref()?;
+    let Ok(ScenarioFloor::Set {
+        names: Some(then), ..
+    }) = mission.scenario_floor_state()
+    else {
+        return None;
+    };
     let mut gone: Vec<String> = then
         .iter()
         .filter(|name| !now.contains(name))
@@ -1090,12 +1574,20 @@ pub(crate) fn room_backoff(waits: u32) -> Duration {
 /// gate may run: also when the mission's run is another task's, which never
 /// lends its backoff.
 pub(crate) fn room_wait(mission: &Mission, task: i64, now_ms: i64) -> Option<Duration> {
-    if mission.gate_room_task != Some(task) {
+    let Ok(RoomRun::Active {
+        task: run_task,
+        last_ms,
+        waits,
+        ..
+    }) = mission.room_run()
+    else {
+        return None;
+    };
+    if run_task != task {
         return None;
     }
-    let last = mission.gate_room_last_ms?;
-    let backoff = i64::try_from(room_backoff(mission.gate_room_waits).as_millis()).ok()?;
-    let left = last.saturating_add(backoff).saturating_sub(now_ms);
+    let backoff = i64::try_from(room_backoff(waits.get()).as_millis()).ok()?;
+    let left = last_ms.saturating_add(backoff).saturating_sub(now_ms);
     (left > 0).then(|| Duration::from_millis(left.unsigned_abs()))
 }
 
@@ -1125,10 +1617,18 @@ pub(crate) fn host_fault_base(text: Option<&str>) -> Duration {
 /// memory. None when the gate may run: no run of host
 /// faults, or the latest was about another task.
 pub(crate) fn host_wait(mission: &Mission, task: i64, now_ms: i64) -> Option<Duration> {
-    if mission.gate_host_faults == 0 || mission.gate_host_task != Some(task) {
+    let Ok(HostFaultRun::Active {
+        task: run_task,
+        due_ms: Some(due_ms),
+        ..
+    }) = mission.host_fault_run()
+    else {
+        return None;
+    };
+    if run_task != task {
         return None;
     }
-    let left = mission.gate_host_due_ms?.saturating_sub(now_ms);
+    let left = due_ms.saturating_sub(now_ms);
     (left > 0).then(|| Duration::from_millis(left.unsigned_abs()))
 }
 
@@ -1286,7 +1786,7 @@ pub(crate) fn name_unknown(
 /// so: it is built on the history before the rewrite, and never lands. An
 /// unknown commit is [`name_unknown`]'s to say; any other verdict is as it
 /// was.
-pub(crate) fn name_old(
+fn name_old(
     verdict: Freshness,
     reported: Option<&str>,
     checkpoint: Option<&str>,
@@ -1391,25 +1891,44 @@ pub(crate) fn source_head(source: &str) -> Result<(String, String), String> {
     Ok((branch, commit))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunMode {
+    Loop,
+    Once,
+    Drain,
+}
+
+impl RunMode {
+    fn parse(rest: &[String]) -> Result<(Self, Vec<String>), String> {
+        let once = rest.iter().any(|word| word == "--once");
+        let drain = rest.iter().any(|word| word == "--drain");
+        let mode = match (once, drain) {
+            (true, true) => {
+                return Err(format!("--once and --drain do not go together\n{USAGE}"));
+            }
+            (true, false) => Self::Once,
+            (false, true) => Self::Drain,
+            (false, false) => Self::Loop,
+        };
+        let valued = rest
+            .iter()
+            .filter(|word| *word != "--once" && *word != "--drain")
+            .cloned()
+            .collect();
+        Ok((mode, valued))
+    }
+}
+
 /// `spawn integrate [--once]`: pass after pass, or one. `spawn integrate
 /// --drain`: ask the integrator running with the same root to drain
 /// ([`request_drain`]).
 pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
-    let once = rest.iter().any(|word| word == "--once");
-    let drain = rest.iter().any(|word| word == "--drain");
-    if once && drain {
-        return Err(format!("--once and --drain do not go together\n{USAGE}"));
-    }
-    let valued: Vec<String> = rest
-        .iter()
-        .filter(|word| *word != "--once" && *word != "--drain")
-        .cloned()
-        .collect();
+    let (mode, valued) = RunMode::parse(rest)?;
     let flags = Flags::parse(&valued).map_err(|error| format!("{error}\n{USAGE}"))?;
     let root = workspace_root(&flags)
         .map(PathBuf::from)
         .ok_or_else(|| format!("--root or SPAWN_WORKSPACE_ROOT is required\n{USAGE}"))?;
-    if drain {
+    if mode == RunMode::Drain {
         return request_drain(&root);
     }
     // The drain's bound is checked before anything is judged or recorded.
@@ -1424,7 +1943,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     // The integrator's lock, on a connection of its own, before anything is
     // written, kept for the process's life (objective 221).
     let lock = take_lock_at_start(&open_store, LOCK_WAIT)?;
-    record_start(&lock.0, &gate, &root, once);
+    record_start(&lock.0, &gate, &root, mode == RunMode::Once);
     // The gate gets an allowlist of this environment, never all of it: the
     // owner's SPAWN_DATABASE_URL must not reach candidate code.
     let gate_env = gate::gate_env(|name| std::env::var(name).ok());
@@ -1500,16 +2019,20 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
-    if once {
-        let pass = integrator.pass();
-        // One pass, and the gates it started run to their records.
-        integrator.settle();
-        return pass
-            .map(|()| 0)
-            .inspect_err(|error| eprintln!("integrate: {error}"));
+    match mode {
+        RunMode::Once => {
+            let pass = integrator.pass();
+            // One pass, and the gates it started run to their records.
+            integrator.settle();
+            pass.map(|()| 0)
+                .inspect_err(|error| eprintln!("integrate: {error}"))
+        }
+        RunMode::Loop => {
+            write_pid_file(&integrator.judge.root);
+            run_passes(&integrator, &drain_asked, drain_bound)
+        }
+        RunMode::Drain => unreachable!("handled above"),
     }
-    write_pid_file(&integrator.judge.root);
-    run_passes(&integrator, &drain_asked, drain_bound)
 }
 
 /// How the integrator opens a connection to its store.
@@ -2024,7 +2547,7 @@ fn red_for(ms: i64) -> String {
 }
 
 /// number of milliseconds from 1 up; anything else is the default.
-pub(crate) fn main_red_probe_ms(text: Option<&str>) -> i64 {
+fn main_red_probe_ms(text: Option<&str>) -> i64 {
     text.and_then(|text| text.trim().parse::<i64>().ok())
         .filter(|ms| *ms > 0)
         .unwrap_or(MAIN_RED_PROBE_MS)
@@ -2201,21 +2724,45 @@ struct Ready {
     gated: Mission,
     count: u32,
     task: Task,
-    /// A probe of its source's red main ([`Integrator::red_holds`]): its
-    /// `source.main_probe` is written when its gate starts, never before.
-    probe: bool,
+    /// A probe of its source's red main ([`Integrator::red_holds`]): carries
+    /// the red scenario when probing; its `source.main_probe` is written when
+    /// its gate starts, never before.
+    probe: Option<String>,
 }
 
 /// What a source's red main means for one ready task's gate
 /// ([`Integrator::red_holds`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RedHold {
     /// Main is not red, or not the red one: the gate runs as usual.
     No,
-    /// Red, and a probe is due: the gate may run, as a probe.
-    Probe,
+    /// Red, and a probe is due: the gate may run, as a probe on `scenario`.
+    Probe { scenario: String },
     /// Red, no probe due: the gate waits.
     Held,
+}
+
+/// Whether a judging in flight serves a task's gate or an owner push request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunningKind {
+    Task(i64),
+    Owner(i64),
+}
+
+impl RunningKind {
+    fn task(self) -> Option<i64> {
+        match self {
+            Self::Task(task) => Some(task),
+            Self::Owner(_) => None,
+        }
+    }
+
+    fn owner(self) -> Option<i64> {
+        match self {
+            Self::Owner(request) => Some(request),
+            Self::Task(_) => None,
+        }
+    }
 }
 
 /// One judging in flight.
@@ -2244,6 +2791,15 @@ struct Running {
     /// Running names is one an earlier integrator left ([`Integrator::adopt`]).
     judging: String,
     handle: std::thread::JoinHandle<()>,
+}
+
+impl Running {
+    fn kind(&self) -> RunningKind {
+        match self.owner {
+            Some(request) => RunningKind::Owner(request),
+            None => RunningKind::Task(self.task),
+        }
+    }
 }
 
 /// The marker a mission's owner puts in its scenarios directory when its gate
@@ -2408,8 +2964,7 @@ impl Integrator {
             .running
             .borrow()
             .iter()
-            .filter(|gate| gate.owner.is_none())
-            .map(|gate| gate.task)
+            .filter_map(|gate| gate.kind().task())
             .collect();
         tasks.sort_unstable();
         tasks.dedup();
@@ -2461,7 +3016,7 @@ impl Integrator {
             .running
             .borrow()
             .iter()
-            .filter(|gate| gate.owner.is_some())
+            .filter(|gate| gate.kind().owner().is_some())
             .count();
         Self::record_own(
             store,
@@ -2702,7 +3257,13 @@ impl Integrator {
         source: &str,
         mirror: &Path,
     ) -> Result<(), String> {
-        let Some(parked) = task.gate_parked_pushed.as_deref() else {
+        let LoadSensitiveState::Parked {
+            pushed: parked,
+            scenarios,
+        } = task
+            .load_sensitive_state()
+            .map_err(|error| format!("task {}: {error}", task.id))?
+        else {
             return Ok(());
         };
         let pushed = sources::fetch_pushed_into(
@@ -2736,10 +3297,7 @@ impl Integrator {
                 mission.id,
                 task.id,
                 short_commit(parked),
-                task.gate_load_sensitive_scenarios
-                    .as_deref()
-                    .unwrap_or_default()
-                    .join(", "),
+                scenarios.join(", "),
                 task.id
             );
         }
@@ -2788,7 +3346,9 @@ impl Integrator {
             .probed_ms
             .map_or(red.latest_ms, |probed| probed.max(red.latest_ms));
         if now.saturating_sub(last) >= self.red_probe_ms {
-            return RedHold::Probe;
+            return RedHold::Probe {
+                scenario: red.scenario.clone(),
+            };
         }
         if self.waiting.borrow_mut().insert((task.id, Wait::Red)) {
             println!(
@@ -3023,10 +3583,8 @@ impl Integrator {
             match store
                 .gated_missions()
                 .map_err(|error| error.to_string())
-                .and_then(|missions| {
-                    serde_json::from_value::<Vec<Mission>>(missions)
-                        .map_err(|error| format!("gated missions: {error}"))
-                }) {
+                .and_then(parse_gated_missions)
+            {
                 Ok(missions) => {
                     let live = missions.iter().any(|mission| {
                         mission.halted.is_none() && mission.source.as_deref() == Some(&source)
@@ -3116,16 +3674,17 @@ impl Integrator {
         // The mission's next task waits for a gate from now.
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
         self.last_judged.borrow_mut().insert(gate.mission, now);
+        let kind = gate.kind();
         if gate.handle.join().is_err() {
-            match gate.owner {
-                Some(request) => eprintln!(
+            match kind {
+                RunningKind::Owner(request) => eprintln!(
                     "integrate: the owner judging of request {request} on {} panicked; it is \
                      judged again",
                     gate.source
                 ),
-                None => eprintln!(
-                    "integrate: mission {}: the judging of task {} panicked; it is judged again",
-                    gate.mission, gate.task
+                RunningKind::Task(task) => eprintln!(
+                    "integrate: mission {}: the judging of task {task} panicked; it is judged again",
+                    gate.mission
                 ),
             }
         }
@@ -3197,7 +3756,7 @@ impl Integrator {
     /// gate runs on, and its result is discarded all the same.
     fn stop_withdrawn(&self, store: &PostgresStore) {
         for gate in self.running.borrow().iter() {
-            let Some(request) = gate.owner else {
+            let RunningKind::Owner(request) = gate.kind() else {
                 continue;
             };
             if !gate.handle.is_finished()
@@ -3221,13 +3780,13 @@ impl Integrator {
         for request in urgent {
             for gate in self.running.borrow().iter() {
                 if gate.source == request.source
-                    && gate.owner.is_none()
+                    && let RunningKind::Task(task) = gate.kind()
                     && gate.stop.stop(request.id, request.reason.clone())
                 {
                     println!(
                         "integrate: the owner's urgent landing of {} on {} (request {}) stops the \
                          judging of task {} (mission {}): discarded, judged again on the new main",
-                        request.commit, request.source, request.id, gate.task, gate.mission
+                        request.commit, request.source, request.id, task, gate.mission
                     );
                 }
             }
@@ -3245,9 +3804,8 @@ impl Integrator {
         owner_moved: &[(String, String)],
         owner_judge: Vec<owner::Request>,
     ) -> Result<(), String> {
-        let missions: Vec<Mission> =
-            serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
-                .map_err(|error| format!("gated missions: {error}"))?;
+        let missions =
+            parse_gated_missions(store.gated_missions().map_err(|error| error.to_string())?)?;
         // The judgings an earlier integrator left: their gates are taken
         // over before any mission's step, so none is judged again (D5).
         self.adopt(store, &missions);
@@ -3757,9 +4315,9 @@ impl Integrator {
                 .borrow()
                 .iter()
                 .filter(|gate| gate.mission == mission.id)
-                .map(|gate| gate.task),
+                .filter_map(|gate| gate.kind().task()),
         );
-        if mission.state != "done"
+        if mission.state != MissionState::Done
             && !mission.paused
             && let Err(error) = objectives::assign_next(store, mission, &settled)
         {
@@ -3775,10 +4333,11 @@ impl Integrator {
             if self.backs_off(mission, task).is_some() {
                 return Ok(false);
             }
-            let red = self.red_holds(mission, source, &main, task);
-            if red == RedHold::Held {
-                return Ok(false);
-            }
+            let probe = match self.red_holds(mission, source, &main, task) {
+                RedHold::Held => return Ok(false),
+                RedHold::No => None,
+                RedHold::Probe { scenario } => Some(scenario),
+            };
             if self.controller_behind(store, mission, task, source, &mirror, &scenarios)? {
                 return Ok(false);
             }
@@ -3796,7 +4355,7 @@ impl Integrator {
                 gated,
                 count,
                 task: task.clone(),
-                probe: red == RedHold::Probe,
+                probe,
             });
         }
         Ok(false)
@@ -3910,12 +4469,7 @@ impl Integrator {
         // A probe of a red main is spent here, as its gate starts: the
         // store refuses one that is not due (another mission's on the same
         // source took it), and then the gate does not start.
-        if probe {
-            let red = gated
-                .red
-                .as_ref()
-                .map(|red| red.scenario.clone())
-                .unwrap_or_default();
+        if let Some(red) = probe.as_deref() {
             if let Err(error) = store.integrator_record(&json!({
                 "type": "source.main_probe", "source": source, "main": main,
                 "scenario": red, "task": task.id, "mission": mission_id,
@@ -3943,7 +4497,7 @@ impl Integrator {
                     "count": count, "shares_server": shares_server, "jobs": jobs,
                     "gate": pinned(&resolve_gate_script(&self.judge.gate, Path::new(&gated.gate))), "scenarios": gated.gate,
                     "scenario_names": gated.scenarios_now,
-                    "probe": probe}),
+                    "probe": probe.is_some()}),
             self.judge.units,
         )
         .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
@@ -5456,13 +6010,18 @@ impl Judge {
         log: &str,
         named: &[String],
     ) -> Value {
-        let again = task.gate_load_sensitive_pushed.as_deref() == Some(pushed);
-        let mut scenarios: Vec<String> = if again {
-            task.gate_load_sensitive_scenarios
-                .clone()
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+        let (again, mut scenarios) = match task.load_sensitive_state() {
+            Ok(
+                LoadSensitiveState::Observed {
+                    pushed: prev,
+                    scenarios,
+                }
+                | LoadSensitiveState::Parked {
+                    pushed: prev,
+                    scenarios,
+                },
+            ) if prev == pushed => (true, scenarios.to_vec()),
+            _ => (false, Vec::new()),
         };
         for name in named {
             if !scenarios.contains(name) {
@@ -5595,9 +6154,8 @@ fn abort_unrecorded(
     main: &str,
     reason: &str,
 ) -> Result<Option<&'static str>, String> {
-    let missions: Vec<Mission> =
-        serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
-            .map_err(|error| format!("gated missions: {error}"))?;
+    let missions =
+        parse_gated_missions(store.gated_missions().map_err(|error| error.to_string())?)?;
     let unrecorded = missions
         .iter()
         .flat_map(|mission| &mission.tasks)
@@ -6063,7 +6621,7 @@ pub(crate) enum Kept {
 /// the work counts as lost (the pusher pushes within its interval, and
 /// retries a failed push): `SPAWN_KEPT_WAIT_SECS`, a whole number of
 /// seconds from 1 up; anything else is 30.
-pub(crate) fn kept_wait_ms(text: Option<&str>) -> i64 {
+fn kept_wait_ms(text: Option<&str>) -> i64 {
     const DEFAULT: i64 = 30;
     text.and_then(|text| text.trim().parse::<i64>().ok())
         .filter(|seconds| *seconds > 0)
@@ -6197,3 +6755,411 @@ mod database_tests;
 /// on the ledger alone, against the test database.
 #[cfg(test)]
 mod remote_primary_tests;
+
+#[cfg(test)]
+mod adt_tests {
+    use super::*;
+
+    fn base_mission_json() -> Value {
+        json!({
+            "id": 1,
+            "gate": "/g",
+            "accept": "review",
+        })
+    }
+
+    fn parse_mission(patch: &[(&str, Value)]) -> Result<Mission, String> {
+        let mut obj = base_mission_json();
+        let map = obj.as_object_mut().expect("object");
+        for (k, v) in patch {
+            map.insert((*k).to_string(), v.clone());
+        }
+        serde_json::from_value(obj).map_err(|e| e.to_string())
+    }
+
+    fn base_task_json() -> Value {
+        json!({
+            "id": 10,
+            "agent_id": "agent_a",
+            "session_id": "session_a",
+            "state": "reported",
+        })
+    }
+
+    fn parse_task(patch: &[(&str, Value)]) -> Result<Task, String> {
+        let mut obj = base_task_json();
+        let map = obj.as_object_mut().expect("object");
+        for (k, v) in patch {
+            map.insert((*k).to_string(), v.clone());
+        }
+        serde_json::from_value(obj).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn mission_state_and_accept_policy_validate_at_boundary() {
+        assert_eq!(
+            parse_mission(&[]).expect("default").state,
+            MissionState::Open
+        );
+        for (raw, expected) in [
+            ("open", MissionState::Open),
+            ("active", MissionState::Active),
+            ("done", MissionState::Done),
+            ("dropped", MissionState::Dropped),
+        ] {
+            let m = parse_mission(&[("state", json!(raw))]).expect(raw);
+            assert_eq!(m.state, expected);
+        }
+        for bad in ["", "closed", "Open"] {
+            assert!(parse_mission(&[("state", json!(bad))]).is_err(), "{bad}");
+        }
+
+        assert_eq!(
+            parse_mission(&[("accept", json!("review"))])
+                .expect("review")
+                .accept_policy(),
+            Ok(AcceptPolicy::Review)
+        );
+        assert_eq!(
+            parse_mission(&[("accept", json!("gate"))])
+                .expect("gate")
+                .accept_policy(),
+            Ok(AcceptPolicy::Gate)
+        );
+        for bad in ["", "auto", "GATE"] {
+            assert!(parse_mission(&[("accept", json!(bad))]).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn room_run_enforces_coupled_invariants() {
+        assert_eq!(
+            parse_mission(&[]).expect("idle").room_run(),
+            Ok(RoomRun::Idle)
+        );
+        let active = parse_mission(&[
+            ("gate_room_task", json!(7)),
+            ("gate_room_since_ms", json!(1000)),
+            ("gate_room_last_ms", json!(1000)),
+            ("gate_room_waits", json!(1)),
+            ("gate_room_escalated", json!(false)),
+        ])
+        .expect("active same ts");
+        assert_eq!(
+            active.room_run(),
+            Ok(RoomRun::Active {
+                task: 7,
+                since_ms: 1000,
+                last_ms: 1000,
+                waits: NonZeroU32::new(1).expect("nz"),
+                escalated: false,
+            })
+        );
+        assert!(parse_mission(&[("gate_room_waits", json!(1))]).is_err());
+        assert!(parse_mission(&[("gate_room_escalated", json!(true))]).is_err());
+        assert!(parse_mission(&[("gate_room_task", json!(7))]).is_err());
+        assert!(
+            parse_mission(&[
+                ("gate_room_task", json!(7)),
+                ("gate_room_since_ms", json!(1000)),
+                ("gate_room_last_ms", json!(1200)),
+                ("gate_room_waits", json!(0)),
+            ])
+            .is_err()
+        );
+        let backward = parse_mission(&[
+            ("gate_room_task", json!(7)),
+            ("gate_room_since_ms", json!(2000)),
+            ("gate_room_last_ms", json!(1000)),
+            ("gate_room_waits", json!(1)),
+        ])
+        .expect("non-monotonic wall clock last_ms < since_ms is accepted");
+        assert_eq!(
+            backward.room_run(),
+            Ok(RoomRun::Active {
+                task: 7,
+                since_ms: 2000,
+                last_ms: 1000,
+                waits: NonZeroU32::new(1).expect("nz"),
+                escalated: false,
+            })
+        );
+    }
+
+    #[test]
+    fn host_fault_run_enforces_wire_and_store_boundaries() {
+        let valid_active = parse_mission(&[
+            ("now_ms", json!(5000)),
+            ("gate_host_faults", json!(2)),
+            ("gate_host_task", json!(4)),
+            ("gate_host_due_ms", json!(8000)),
+            ("gate_base_disagrees", json!(1)),
+        ])
+        .expect("active host fault");
+        assert_eq!(
+            valid_active.host_fault_run(),
+            Ok(HostFaultRun::Active {
+                faults: NonZeroU32::new(2).expect("nz"),
+                task: 4,
+                due_ms: Some(8000),
+                base_disagrees: 1,
+            })
+        );
+        assert!(parse_mission(&[("gate_base_disagrees", json!(1))]).is_err());
+        assert!(parse_mission(&[("gate_host_due_ms", json!(8000))]).is_err());
+
+        // DB boundary rejects partial host fault runs and missing now_ms.
+        let mut store_row = base_mission_json();
+        assert!(parse_gated_missions(json!([store_row])).is_err());
+        store_row["now_ms"] = json!(5000);
+        assert!(parse_gated_missions(json!([store_row.clone()])).is_ok());
+        store_row["gate_host_task"] = json!(4);
+        assert!(parse_gated_missions(json!([store_row.clone()])).is_err());
+        store_row["gate_host_faults"] = json!(1);
+        store_row["gate_host_task"] = Value::Null;
+        assert!(parse_gated_missions(json!([store_row])).is_err());
+    }
+
+    #[test]
+    fn rejection_run_and_scenario_floor_enforce_invariants() {
+        assert_eq!(
+            parse_mission(&[]).expect("idle").rejection_run(),
+            Ok(RejectionRun::Idle)
+        );
+        assert!(parse_mission(&[("gate_rejection_objective", json!(19))]).is_err());
+
+        let scoped = parse_mission(&[
+            ("gate_rejections", json!(3)),
+            ("gate_rejection_objective", json!(19)),
+            ("objectives", json!({"backlog": "/b", "resident": "r"})),
+        ])
+        .expect("scoped");
+        assert_eq!(
+            scoped.rejection_run(),
+            Ok(RejectionRun::SingleObjective {
+                count: NonZeroU32::new(3).expect("nz"),
+                objective: 19,
+            })
+        );
+        assert_eq!(halt_reason(&scoped, 0), None);
+
+        let mixed = parse_mission(&[
+            ("gate_rejections", json!(3)),
+            ("objectives", json!({"backlog": "/b", "resident": "r"})),
+        ])
+        .expect("mixed");
+        assert_eq!(
+            mixed.rejection_run(),
+            Ok(RejectionRun::MixedOrUnscoped {
+                count: NonZeroU32::new(3).expect("nz"),
+            })
+        );
+        assert!(halt_reason(&mixed, 0).is_some());
+
+        assert!(parse_mission(&[("scenario_names", json!(["a.sh"]))]).is_err());
+        let floor = parse_mission(&[("scenario_floor", json!(2))]).expect("legacy floor");
+        assert_eq!(
+            floor.scenario_floor_state(),
+            Ok(ScenarioFloor::Set {
+                count: NonZeroU32::new(2).expect("nz"),
+                names: None,
+            })
+        );
+    }
+
+    #[test]
+    fn source_red_hold_and_load_sensitive_validate_at_boundary() {
+        assert!(parse_mission(&[("hold", json!(7))]).is_err());
+        assert!(
+            parse_mission(&[(
+                "red",
+                json!({"main": "abc", "scenario": "01.sh", "since_ms": 10, "latest_ms": 20}),
+            )])
+            .is_err()
+        );
+        assert!(
+            parse_mission(&[
+                ("source", json!("/srv/repo.git")),
+                (
+                    "red",
+                    json!({"main": "", "scenario": "01.sh", "since_ms": 10, "latest_ms": 20}),
+                ),
+            ])
+            .is_err()
+        );
+        let backward_red = parse_mission(&[
+            ("source", json!("/srv/repo.git")),
+            (
+                "red",
+                json!({"main": "abc", "scenario": "01.sh", "since_ms": 30, "latest_ms": 20}),
+            ),
+        ])
+        .expect("non-monotonic wall clock latest_ms < since_ms is accepted");
+        let red = backward_red.red.expect("red");
+        assert_eq!(red.since_ms, 30);
+        assert_eq!(red.latest_ms, 20);
+
+        let observed =
+            parse_task(&[("gate_load_sensitive_pushed", json!("deadbeef"))]).expect("obs");
+        assert!(matches!(
+            observed.load_sensitive_state(),
+            Ok(LoadSensitiveState::Observed {
+                pushed: "deadbeef",
+                scenarios: []
+            })
+        ));
+        let parked = parse_task(&[
+            ("gate_load_sensitive_pushed", json!("deadbeef")),
+            ("gate_load_sensitive_scenarios", json!(["09.sh"])),
+            ("gate_parked_pushed", json!("deadbeef")),
+        ])
+        .expect("parked");
+        assert!(matches!(
+            parked.load_sensitive_state(),
+            Ok(LoadSensitiveState::Parked {
+                pushed: "deadbeef",
+                ..
+            })
+        ));
+        assert!(parse_task(&[("gate_parked_pushed", json!("deadbeef"))]).is_err());
+        assert!(parse_task(&[("gate_load_sensitive_scenarios", json!(["09.sh"]))]).is_err());
+        assert!(
+            parse_task(&[
+                ("gate_load_sensitive_pushed", json!("aaa")),
+                ("gate_parked_pushed", json!("bbb")),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn run_mode_and_running_kind_are_exhaustive() {
+        let args = |words: &[&str]| words.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            RunMode::parse(&args(&["--root", "/r"])),
+            Ok((RunMode::Loop, args(&["--root", "/r"])))
+        );
+        assert_eq!(
+            RunMode::parse(&args(&["--once", "--root", "/r"])),
+            Ok((RunMode::Once, args(&["--root", "/r"])))
+        );
+        assert_eq!(
+            RunMode::parse(&args(&["--drain", "--root", "/r"])),
+            Ok((RunMode::Drain, args(&["--root", "/r"])))
+        );
+        assert!(RunMode::parse(&args(&["--once", "--drain"])).is_err());
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let task_gate = Running {
+            mission: 1,
+            source: "/s".to_string(),
+            task: 42,
+            shares_server: false,
+            jobs: 1,
+            owner: None,
+            stop: Arc::new(Stop::default()),
+            halt: Arc::new(gate::Halt::default()),
+            judging: String::new(),
+            handle: std::thread::spawn(move || {
+                let _ = rx.recv();
+            }),
+        };
+        assert_eq!(task_gate.kind(), RunningKind::Task(42));
+        assert_eq!(task_gate.kind().task(), Some(42));
+        assert_eq!(task_gate.kind().owner(), None);
+        drop(tx);
+        let _ = task_gate.handle.join();
+
+        let owner_gate = Running {
+            mission: 1,
+            source: "/s".to_string(),
+            task: 0,
+            shares_server: false,
+            jobs: 1,
+            owner: Some(99),
+            stop: Arc::new(Stop::default()),
+            halt: Arc::new(gate::Halt::default()),
+            judging: String::new(),
+            handle: std::thread::spawn(|| {}),
+        };
+        assert_eq!(owner_gate.kind(), RunningKind::Owner(99));
+        assert_eq!(owner_gate.kind().task(), None);
+        assert_eq!(owner_gate.kind().owner(), Some(99));
+        let _ = owner_gate.handle.join();
+    }
+
+    #[test]
+    fn wall_clock_regression_parses_and_handles_room_wait_and_red_without_panic() {
+        let mut row = base_mission_json();
+        let obj = row.as_object_mut().expect("object");
+        obj.insert("source".to_string(), json!("/srv/repo.git"));
+        obj.insert("now_ms".to_string(), json!(500));
+        obj.insert("gate_room_task".to_string(), json!(7));
+        obj.insert("gate_room_since_ms".to_string(), json!(2000));
+        obj.insert("gate_room_last_ms".to_string(), json!(1000));
+        obj.insert("gate_room_waits".to_string(), json!(1));
+        obj.insert(
+            "red".to_string(),
+            json!({
+                "main": "deadbeefdeadbeef",
+                "scenario": "01.sh",
+                "since_ms": 3000,
+                "latest_ms": 1000,
+            }),
+        );
+        let task = parse_task(&[("id", json!(7))]).expect("task");
+
+        let mut missions = parse_gated_missions(json!([row])).expect("parse backward clock row");
+        assert_eq!(missions.len(), 1);
+        let mission = &mut missions[0];
+
+        // room_wait and gate_wait handle last_ms < since_ms and now_ms < last_ms safely.
+        assert_eq!(
+            room_wait(mission, 7, 500),
+            Some(Duration::from_millis(
+                u64::try_from(ROOM_BACKOFF.as_millis()).expect("ms") + 500
+            ))
+        );
+        assert_eq!(
+            room_wait(mission, 7, 1500),
+            Some(Duration::from_millis(
+                u64::try_from(ROOM_BACKOFF.as_millis()).expect("ms") - 500
+            ))
+        );
+        assert_eq!(
+            room_wait(mission, 7, 1000 + 300_000),
+            None,
+            "wait expires once backoff elapses past last_ms"
+        );
+        assert!(matches!(gate_wait(mission, &task), Some((Wait::Room, _))));
+
+        // Red checks and elapsed display saturate cleanly when now < latest_ms < since_ms.
+        let integrator = Integrator::new(
+            PathBuf::from("/tmp/fix-pr248-clock-unused"),
+            PathBuf::from("/tmp/fix-pr248-clock-gate.sh"),
+            Vec::new(),
+            crate::gate::Room::from_env(|_| None),
+            1,
+        );
+        assert_eq!(
+            integrator.red_holds(mission, "/srv/repo.git", "deadbeefdeadbeef", &task),
+            RedHold::Held
+        );
+        assert_eq!(red_for(500i64.saturating_sub(3000)), "0 min");
+
+        // Once the database clock advances past latest_ms + red_probe_ms, probing resumes normally.
+        mission.now_ms = Some(1000 + integrator.red_probe_ms);
+        assert_eq!(
+            integrator.red_holds(mission, "/srv/repo.git", "deadbeefdeadbeef", &task),
+            RedHold::Probe {
+                scenario: "01.sh".to_string()
+            }
+        );
+
+        // Extreme timestamp differences never panic or wrap.
+        mission.gate_room_since_ms = Some(i64::MAX);
+        mission.gate_room_last_ms = Some(i64::MIN);
+        assert_eq!(room_wait(mission, 7, i64::MAX), None);
+        assert_eq!(red_for(i64::MIN.saturating_sub(i64::MAX)), "0 min");
+    }
+}
