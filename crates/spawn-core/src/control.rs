@@ -619,6 +619,9 @@ pub struct TaskAssignedRecord {
     /// Optional model label from the routed preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_label: Option<String>,
+    /// Optional top-down tier role (`mechanical-offload`, `mainline`, or `top-decision`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_role: Option<String>,
     /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,

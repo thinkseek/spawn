@@ -2440,18 +2440,22 @@ fn verifications() -> Result<Value, String> {
 }
 
 /// `/api/grading`: the grading catalog (docs/agent-grading.md) as the web
-/// reads it ([`crate::grading::api_catalog`]): every preset as `spawn grade
-/// list --json` prints it, with its routing grade, the profile it runs as
-/// (its named execution profile, else its model profile) and whether it is
-/// due an anti-starvation re-probe now; and every profile the catalog
-/// names. Read through the reader login like every other read.
+/// reads it ([`crate::grading::api_catalog_with_samples`]): every preset as
+/// `spawn grade list --json` prints it, with its routing grade, the profile it
+/// runs as (its named execution profile, else its model profile), `driver`,
+/// `label_only`, `tier_role`, and whether it is due an anti-starvation
+/// re-probe now; every profile the catalog names; and strictly additive
+/// read-only PV5 28-day calibration window readiness metrics. Read through the
+/// reader login like every other read.
 fn grading() -> Result<Value, String> {
     let store = open_store()?;
     let catalog = store.grading_catalog().map_err(err)?;
     let activity = store.grading_activity().map_err(err)?;
-    Ok(crate::grading::api_catalog(
+    let samples = store.grading_pv5_samples().map_err(err)?;
+    Ok(crate::grading::api_catalog_with_samples(
         &catalog,
         &activity,
+        &samples,
         now_ms(),
         crate::grading::reprobe_interval_ms(),
     ))
@@ -5732,6 +5736,7 @@ mod tests {
             target: recurring.then_some(1100.0),
             after: Vec::new(),
             owner_judged: false,
+            model: None,
         }
     }
 

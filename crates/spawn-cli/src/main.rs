@@ -146,7 +146,7 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn features scan|check [--root <dir>] [--registry <file>] [--json]\n       \
      spawn features associate --path <file> --feature <id> [--feature <id>]... [--root <dir>] [--registry <file>] [--json]\n       \
      spawn features graph [--root <dir>] [--registry <file>] [--level file|unit|feature] [--from <id|path>] [--to <id|path>] [--feature <id>] [--json]\n       \
-     spawn grade register|list|exam|onboard|lock-grade|unlock-grade|enable|disable|calibrate|upkeep|init-topdown ...   (the grading catalog: spawn grade --help for each verb's flags)\n       \
+     spawn grade register|list|exam|onboard|lock-grade|unlock-grade|enable|disable|calibrate|upkeep|init-topdown|status ...   (the grading catalog: spawn grade --help for each verb's flags)\n       \
      spawn prov index|who|show|blast|revert|split|compose|snapshot|refs|rollback|durability ...   (file provenance: spawn prov --help for each verb's flags)\n       \
      spawn source init|list|show|sync|export ...   (internal source and metadata store: spawn source --help for each verb's flags)\n       \
      spawn config check [--config <path>] [--json]\n       \

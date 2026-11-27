@@ -254,6 +254,7 @@ spawn grade lock-grade <preset_id> --grade l1|l2|l3  |  unlock-grade <preset_id>
 spawn grade enable|disable <preset_id>
 spawn grade calibrate [--apply] [--json]
 spawn grade upkeep [--apply] [--json]
+spawn grade status [--json]
 spawn mission list [--limit N] [--json | --table]        # --json default; enriches tasks with grading & rework_step_up
 spawn mission episodes [--mission <id>] [--strict] [--verify-parity] [--json]   # replays typed ControlRecord task episodes and checks SQL projection parity
 spawn task assign ... (--brief <text|-> | --brief-file <path>) [--difficulty l1|l2|l3] [--preset <preset_id>]
@@ -411,8 +412,31 @@ the API now tell apart as many profiles as presets name.
   `execution_profile`, and `task.assigned` / `task.rerouted` carry it when
   the preset has one.
 - `GET /api/grading`: `{presets: [... every catalog field, routing_grade,
-  profile, driver, label_only, tier_role, reprobe_due], profiles: [sorted names]}`,
-  read-only, rendered by the web UI's `#/grading` view (`GradingView`).
+  profile, driver, label_only, tier_role, reprobe_due], profiles: [sorted names],
+  calibration_window: {samples_collected, window_days_elapsed, min_window_days (28),
+  min_samples, ready_to_calibrate, window_start_ms, tier_samples: {l1, l2, l3},
+  per_preset: [{preset_id, difficulty, tier_role, total, first_pass}]}}`,
+  read-only, rendered by the web UI's `#/grading` view (`GradingView`) and matched
+  verbatim by `spawn grade status --json`.
+
+### PV5 28-day calibration window observability
+
+`spawn grade status [--json]` and `GET /api/grading` expose the strictly additive
+read-only `calibration_window` object derived purely from `grading_presets` and
+closed deduplicated outcomes in `mission_tasks`:
+
+- `samples_collected`: total closed graded outcomes collected across active windows.
+- `window_days_elapsed`: whole days elapsed since the earliest routable (else registered,
+  else sample) `window_start_ms`, clamped at `0`.
+- `min_window_days`: `28` (minimum PV5 calibration observation window before durability-driven
+  calibration switches on).
+- `min_samples`: `5` (`DEMOTE_MIN_TOTAL`).
+- `ready_to_calibrate`: `true` once both `window_days_elapsed >= 28` and
+  `samples_collected >= 5`.
+- `tier_samples`: `{l1, l2, l3}` sample counts by tier (`mechanical-offload`, `mainline`,
+  `top-decision`).
+- `per_preset`: per `(preset_id, difficulty)` breakdown with `tier_role`, `total`, and
+  `first_pass`.
 - `GET|HEAD /api/episodes[?mission=<id>]` (contract-locked read-only route on
   `reads` / `spawn_reader`): replays typed `ControlRecord` events into
   per-task `TaskEpisode` timelines (including `difficulty`, `preset_id`, rework /
@@ -441,7 +465,13 @@ the API now tell apart as many profiles as presets name.
   catalog by the same rule as `spawn task assign` (its classified
   difficulty, else `l2`, with the anti-starvation re-probe:
   `missions::route_unflagged`), and recorded with its `model`,
-  `difficulty`, `preset_id`, `execution_profile` and `classification`.
+  `difficulty`, `preset_id`, `tier_role`, `execution_profile`, and `classification`
+  on `task.assigned` (`spawn_objective_assign` and `spawn_task_assign` both write
+  `tier_role` consistently alongside `preset_id` / `difficulty`).
+  Operators can still bypass catalog routing with an explicit model override via
+  `spawn mission add|configure ... --model default|cheap` (cleared with `--no-model`)
+  or an objective backlog JSON `"model": "default"|"cheap"` field, which assigns cleanly
+  without `preset_id`, `classification`, or `tier_role`.
   Its gate rejections step its rework up as any routed task's do, within
   the task. Across tasks of one objective:
   - A budget overrun's continuation (`continues`, `p_continues`) keeps the

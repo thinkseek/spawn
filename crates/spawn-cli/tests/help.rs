@@ -361,6 +361,30 @@ fn empty_postgres_json_read_commands_return_stable_contract_schemas() {
     let grade_list = spawn_json(&["grade", "list", "--json"], &env);
     assert_eq!(grade_list.as_array().map(Vec::len), Some(0));
 
+    let grade_status = spawn_json(&["grade", "status", "--json"], &env);
+    assert_eq!(grade_status["presets"].as_array().map(Vec::len), Some(0));
+    assert_eq!(grade_status["profiles"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        grade_status["calibration_window"]["samples_collected"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        grade_status["calibration_window"]["window_days_elapsed"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        grade_status["calibration_window"]["min_window_days"].as_u64(),
+        Some(28)
+    );
+    assert_eq!(
+        grade_status["calibration_window"]["ready_to_calibrate"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        grade_status["calibration_window"]["tier_samples"],
+        serde_json::json!({"l1": 0, "l2": 0, "l3": 0})
+    );
+
     let node_list = spawn_json(&["node", "list", "--json"], &env);
     assert_eq!(node_list.as_array().map(Vec::len), Some(0));
 

@@ -13,8 +13,8 @@ use serde::Serialize;
 use serde_json::Value;
 use spawn_core::event::ModelProfile;
 use spawn_core::grading::{
-    CALIBRATION_WINDOW, ExecutionProfile, GradedPreset, PresetActivity, PresetState, SkillGrade,
-    TaskDifficulty, TaskOutcomeSample,
+    CALIBRATION_WINDOW, ExecutionProfile, GradedPreset, PresetActivity, PresetState,
+    Pv5SampleSummary, SkillGrade, TaskDifficulty, TaskOutcomeSample,
 };
 use spawn_core::port::StoreError;
 
@@ -38,6 +38,32 @@ const ACTIVITY: &str = "select first_preset_id, difficulty, max(created_at_ms)
                          where first_preset_id is not null
                          group by first_preset_id, difficulty
                          order by first_preset_id, difficulty";
+
+/// Aggregated closed outcomes inside each preset's active calibration window
+/// for PV5 28-day window observability (`spawn grade status --json` and
+/// `GET /api/grading`), using the exact deduplicated closing semantics of
+/// `OUTCOMES`.
+const PV5_SAMPLES: &str = r"
+select k.first_preset_id,
+       k.difficulty,
+       count(*)::bigint as total,
+       count(*) filter (where k.state in ('landed', 'accepted')
+                          and k.quality_rejections = 0)::bigint as first_pass,
+       min(k.created_at_ms) as earliest_at_ms,
+       max(k.updated_at_ms) as latest_at_ms
+  from mission_tasks k
+  join grading_presets gp on gp.preset_id = k.first_preset_id
+ where k.first_preset_id is not null
+   and k.created_at_ms >= gp.window_start_ms
+   and (k.state in ('landed', 'accepted')
+        or (k.state = 'cancelled' and k.quality_rejections > 0
+            and not exists (select 1 from mission_tasks s
+                             where s.reissue_of = k.id
+                                or s.reassign_of = k.id
+                                or (s.continues = k.id
+                                    and s.first_preset_id = k.first_preset_id))))
+ group by k.first_preset_id, k.difficulty
+ order by k.first_preset_id, k.difficulty";
 
 /// A preset's calibration window: the tasks first assigned to preset `$1`
 /// (`first_preset_id`, which a rework reroute never moves: a task counts
@@ -219,6 +245,32 @@ impl PostgresStore {
                         StoreError::Backend(format!("a stored difficulty {rank}"))
                     })?,
                     last_assigned_ms: row.get(2),
+                })
+            })
+            .collect()
+    }
+
+    /// Aggregated closed outcomes inside each preset's active calibration
+    /// window (`PV5_SAMPLES`), grouped by `(first_preset_id, difficulty)`.
+    pub fn grading_pv5_samples(&self) -> Result<Vec<Pv5SampleSummary>, StoreError> {
+        self.query(PV5_SAMPLES, &[])?
+            .iter()
+            .map(|row| {
+                let rank: i16 = row.get(1);
+                let total_raw: i64 = row.get(2);
+                let first_pass_raw: i64 = row.get(3);
+                Ok(Pv5SampleSummary {
+                    preset_id: row.get(0),
+                    difficulty: TaskDifficulty::from_rank(i64::from(rank)).ok_or_else(|| {
+                        StoreError::Backend(format!("a stored difficulty {rank}"))
+                    })?,
+                    total: u64::try_from(total_raw)
+                        .map_err(|_| StoreError::Backend(format!("a sample total {total_raw}")))?,
+                    first_pass: u64::try_from(first_pass_raw).map_err(|_| {
+                        StoreError::Backend(format!("a first-pass count {first_pass_raw}"))
+                    })?,
+                    earliest_at_ms: row.get(4),
+                    latest_at_ms: row.get(5),
                 })
             })
             .collect()
