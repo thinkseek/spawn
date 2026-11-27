@@ -22,7 +22,11 @@ use std::sync::Mutex;
 use serde_json::{Value, json};
 use spawn_postgres::PostgresStore;
 
-use crate::storage::{Sizes, archive, archive_path, projects_path, walk, workspaces};
+use crate::storage::{
+    SharedCacheSizes, Sizes, WORKSPACE_BREAKDOWN_MAX_ENTRIES, WorkspaceBreakdown, archive,
+    archive_path, is_cachedir_tagged, projects_path, shared_caches_with, walk, workspace_breakdown,
+    workspaces,
+};
 
 /// How long the sizes are kept before they are read again.
 pub(crate) const READ_EVERY_MS: i64 = 600_000;
@@ -51,9 +55,6 @@ pub(crate) const TMPFS_DIRS_MAX: usize = 4096;
 /// together: a build directory of many files is measured in part, and says
 /// so (`partial`).
 pub(crate) const TMPFS_ENTRIES_MAX: usize = 100_000;
-
-/// The cache directory tagging standard's signature, Cargo's tag's start.
-const TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 
 /// The tmpfs a test run looks under instead of the host's: a path that is
 /// not there, so no test reads the host's `/tmp` (or
@@ -105,35 +106,6 @@ fn refuse_a_watched_host_path(root: &Path) {
             watched.display()
         );
     }
-}
-
-/// Whether `dir` holds a CACHEDIR.TAG: a regular file (not a symlink)
-/// starting with the standard's signature. The tag is opened without
-/// following a symlink and without blocking (a FIFO swapped in never holds
-/// the read), and is read only when the opened file is a regular one.
-fn cachedir_tagged(dir: &Path) -> bool {
-    use rustix::fs::{FileType, Mode, OFlags};
-    let Ok(tag) = rustix::fs::open(
-        dir.join("CACHEDIR.TAG"),
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) else {
-        return false;
-    };
-    if !rustix::fs::fstat(&tag)
-        .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile)
-    {
-        return false;
-    }
-    let mut head = [0_u8; TAG_SIGNATURE.len()];
-    let mut got = 0;
-    while got < head.len() {
-        match rustix::io::read(&tag, &mut head[got..]) {
-            Ok(0) | Err(_) => break,
-            Ok(read) => got += read,
-        }
-    }
-    head[..got] == *TAG_SIGNATURE
 }
 
 /// What the look for build directories may read: directories and entries,
@@ -246,7 +218,7 @@ pub(crate) fn tmpfs_build_targets_within(root: &Path, bound: Bound) -> Value {
                 continue;
             }
             let child = entry.path();
-            if cachedir_tagged(&child) {
+            if is_cachedir_tagged(&child) {
                 let (sizes, whole) = measure(&child, &mut budget);
                 found.push((child, sizes, !whole));
                 if !whole {
@@ -328,6 +300,10 @@ pub(crate) struct Walked {
     /// The Cargo build directories on the tmpfs
     /// ([`tmpfs_build_targets`]).
     pub(crate) tmpfs_build_targets: Value,
+    /// Bounded per-workspace disk usage classification (`repo` / `.git` / rebuild caches).
+    pub(crate) workspace_breakdown: Option<WorkspaceBreakdown>,
+    /// Active or residual shared host build cache usage (`#105`).
+    pub(crate) shared_build_cache: Option<SharedCacheSizes>,
 }
 
 impl Walked {
@@ -336,6 +312,16 @@ impl Walked {
     /// on the tmpfs at `tmpfs_root` (the live callers pass [`tmpfs_root`];
     /// the tests a sandbox of their own, never the host's `/tmp`).
     pub(crate) fn read(root: Option<&Path>, projects_path: PathBuf, tmpfs_root: &Path) -> Self {
+        Self::read_with_env(root, projects_path, tmpfs_root, &crate::env_value)
+    }
+
+    /// [`Walked::read`] using caller-supplied `lookup` for shared build cache resolution.
+    pub(crate) fn read_with_env(
+        root: Option<&Path>,
+        projects_path: PathBuf,
+        tmpfs_root: &Path,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
         Self {
             root: root.map(Path::to_path_buf),
             archive: root.map(archive).unwrap_or_default(),
@@ -346,6 +332,9 @@ impl Walked {
                 crate::storage::session_backup_status().as_deref(),
             ),
             tmpfs_build_targets: tmpfs_build_targets(tmpfs_root),
+            workspace_breakdown: root
+                .map(|dir| workspace_breakdown(dir, WORKSPACE_BREAKDOWN_MAX_ENTRIES)),
+            shared_build_cache: shared_caches_with(root, lookup),
         }
     }
 }
@@ -508,6 +497,40 @@ pub(crate) fn test_databases(readings: Vec<(&'static str, Result<Value, String>)
         .collect()
 }
 
+fn workspace_breakdown_json(breakdown: &WorkspaceBreakdown) -> Value {
+    json!({
+        "workspace_count": breakdown.workspace_count,
+        "total_bytes": breakdown.total_bytes,
+        "repo_bytes": breakdown.repo_bytes,
+        "git_bytes": breakdown.git_bytes,
+        "build_cache_bytes": breakdown.build_cache_bytes,
+        "files": breakdown.files,
+        "truncated": breakdown.truncated,
+        "workspaces": breakdown
+            .workspaces
+            .iter()
+            .map(|ws| json!({
+                "name": ws.name,
+                "total_bytes": ws.total_bytes,
+                "repo_bytes": ws.repo_bytes,
+                "git_bytes": ws.git_bytes,
+                "build_cache_bytes": ws.build_cache_bytes,
+                "files": ws.files,
+                "truncated": ws.truncated,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn shared_build_cache_json(cache: &SharedCacheSizes) -> Value {
+    json!({
+        "path": cache.path.display().to_string(),
+        "bytes": cache.sizes.bytes,
+        "files": cache.sizes.files,
+        "enabled": cache.enabled,
+    })
+}
+
 /// The kept part of the figures, read at `read_at_ms`: the sizes, the
 /// database's, the test databases' ([`test_databases`]), the archive's
 /// growth, the growth of every grower that persists ([`growth_parts`]) and
@@ -549,6 +572,8 @@ pub(crate) fn sizes(
             "path": path(root),
             "bytes": walked.workspaces.bytes,
         })),
+        "workspace_breakdown": walked.workspace_breakdown.as_ref().map(workspace_breakdown_json),
+        "shared_build_cache": walked.shared_build_cache.as_ref().map(shared_build_cache_json),
         "database": database.clone(),
         "test_databases": tests.clone(),
         "growth_bytes_per_day": parts["archive"],
@@ -689,7 +714,7 @@ mod tests {
         file(&root.join("agent_c/big.bin"), 2000);
         file(&projects.join("-one/s1.jsonl"), 100);
         file(&projects.join("-two/s2.jsonl"), 200);
-        let mut walked = Walked::read(Some(&root), projects.clone(), &tmpfs);
+        let mut walked = Walked::read_with_env(Some(&root), projects.clone(), &tmpfs, &|_| None);
         // The walk looked in the sandbox, never at the host's own /tmp.
         assert_eq!(
             walked.tmpfs_build_targets["root"],
@@ -728,6 +753,25 @@ mod tests {
                 "projects": {"path": projects.display().to_string(), "bytes": 300, "files": 2,
                              "before": 40},
                 "workspaces": {"path": root.display().to_string(), "bytes": 2000},
+                "workspace_breakdown": {
+                    "workspace_count": 1,
+                    "total_bytes": 2000,
+                    "repo_bytes": 2000,
+                    "git_bytes": 0,
+                    "build_cache_bytes": 0,
+                    "files": 1,
+                    "truncated": false,
+                    "workspaces": [{
+                        "name": "agent_c",
+                        "total_bytes": 2000,
+                        "repo_bytes": 2000,
+                        "git_bytes": 0,
+                        "build_cache_bytes": 0,
+                        "files": 1,
+                        "truncated": false,
+                    }],
+                },
+                "shared_build_cache": Value::Null,
                 "database": database,
                 "test_databases": tests,
                 "growth_bytes_per_day": 5000,
@@ -1296,5 +1340,107 @@ mod tests {
                 assert!(refused.is_err(), "{} was looked under", looked.display());
             }
         }
+    }
+
+    #[test]
+    fn health_storage_exposes_workspace_breakdown_and_shared_cache_compatibly() {
+        let root = scratch("serve_breakdown");
+        let projects = scratch("serve_breakdown_projects");
+        let tmpfs = scratch("serve_breakdown_tmpfs");
+
+        file(&root.join(".caches/zig/obj.o"), 1500);
+        file(&root.join(".caches/ccache/a.o"), 500);
+        file(&root.join("alpha/.git/index"), 200);
+        file(&root.join("alpha/src/main.rs"), 100);
+        file(&root.join("beta/.zig-cache/z1"), 900);
+        file(&root.join("beta/target/app"), 300);
+        file(&root.join("beta/node_modules/pkg/index.js"), 100);
+        file(&root.join("beta/README.md"), 50);
+
+        let walked = Walked::read_with_env(Some(&root), projects.clone(), &tmpfs, &|k| match k {
+            "SPAWN_SHARED_BUILD_CACHES" => Some("1".to_string()),
+            "SPAWN_DATABASE_URL" => {
+                Some("postgres://u:SuperSecret99@127.0.0.1:5432/db".to_string())
+            }
+            "SPAWN_SERVE_TOKEN" => Some("TopSecretTok77".to_string()),
+            _ => None,
+        });
+        let payload = with_free(
+            sizes(
+                1000,
+                &walked,
+                &json!({"oldest": null, "carrying": null, "before": null}),
+                &json!({"bytes": 512}),
+                &json!([]),
+            ),
+            Some(4096),
+        );
+
+        // `.caches` is excluded from `workspaces.bytes` and tracked in `shared_build_cache`.
+        assert_eq!(payload["workspaces"]["bytes"], 1650);
+        assert_eq!(
+            payload["shared_build_cache"],
+            json!({
+                "path": root.join(".caches").display().to_string(),
+                "bytes": 2000,
+                "files": 2,
+                "enabled": true,
+            })
+        );
+        // Existing keys preserved alongside `workspace_breakdown`.
+        assert_eq!(payload["free_bytes"], 4096);
+        assert_eq!(payload["database"]["bytes"], 512);
+        assert_eq!(payload["workspace_breakdown"]["workspace_count"], 2);
+        assert_eq!(payload["workspace_breakdown"]["total_bytes"], 1650);
+        assert_eq!(payload["workspace_breakdown"]["repo_bytes"], 150);
+        assert_eq!(payload["workspace_breakdown"]["git_bytes"], 200);
+        assert_eq!(payload["workspace_breakdown"]["build_cache_bytes"], 1300);
+        assert_eq!(payload["workspace_breakdown"]["truncated"], false);
+        assert_eq!(
+            payload["workspace_breakdown"]["workspaces"][0]["name"],
+            "beta"
+        );
+        assert_eq!(
+            payload["workspace_breakdown"]["workspaces"][1]["name"],
+            "alpha"
+        );
+
+        let serialized = payload.to_string();
+        for secret in ["SuperSecret99", "TopSecretTok77"] {
+            assert!(
+                !serialized.contains(secret),
+                "secret leaked in payload: {serialized}"
+            );
+        }
+
+        // Custom `SPAWN_SHARED_BUILD_CACHE_DIR` overrides default path in `shared_build_cache`.
+        let custom = scratch("serve_breakdown_custom_cache");
+        file(&custom.join("go-build/a"), 777);
+        let walked_custom =
+            Walked::read_with_env(Some(&root), projects.clone(), &tmpfs, &|k| match k {
+                "SPAWN_SHARED_BUILD_CACHE_DIR" => Some(custom.display().to_string()),
+                _ => None,
+            });
+        let custom_payload = sizes(
+            1000,
+            &walked_custom,
+            &json!({"oldest": null, "carrying": null, "before": null}),
+            &Value::Null,
+            &json!([]),
+        );
+        assert_eq!(
+            custom_payload["shared_build_cache"],
+            json!({
+                "path": custom.display().to_string(),
+                "bytes": 777,
+                "files": 1,
+                "enabled": true,
+            })
+        );
+
+        std::fs::remove_dir_all(&root).expect("clean root");
+        std::fs::remove_dir_all(&projects).expect("clean projects");
+        std::fs::remove_dir_all(&tmpfs).expect("clean tmpfs");
+        std::fs::remove_dir_all(&custom).expect("clean custom");
     }
 }
