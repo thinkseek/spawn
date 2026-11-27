@@ -30,7 +30,8 @@ case "${PGHOST-}" in
 *) echo "test-pg-restore-drill: needs a socket URL" >&2; exit 2 ;;
 esac
 image=${SPAWN_PG_IMAGE:-postgres:16-alpine}
-real_docker=$(command -v docker)
+real_docker=$(command -v docker || true)
+[ -n "$real_docker" ] || { echo "test-pg-restore-drill: docker is required" >&2; exit 2; }
 
 work=$(mktemp -d)
 db="drill_test_$$_$RANDOM"

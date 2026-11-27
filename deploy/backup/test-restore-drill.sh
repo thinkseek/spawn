@@ -261,7 +261,7 @@ check "the chain is the full bundle and its increment" grep -qE "restore-drill: 
 check "transcripts: 3 restored, 2 the same, 1 grown, 1 new since" \
   grep -qE "transcripts: 3 files \([0-9]+ bytes\) restored; against .*: 2 the same, 1 grown since \(their start the same\), 1 new since the bundle, 0 in no bundle" "$out"
 check "the source: 3 refs, main moved on, side removed, after added" \
-  grep -qF "missions $src: 3 refs restored (clone --mirror, fsck connected); against live: 1 the same, 1 moved on since (descendants), 1 added since, 1 removed since, 0 mismatch(es)" "$out"
+  grep -qF "missions $src: 3 refs restored (clone --mirror, fsck --full clean); against live: 1 the same, 1 moved on since (descendants), 1 added since, 1 removed since, 0 mismatch(es)" "$out"
 check "the empty source restores as empty" grep -qF "missions $empty: 0 refs restored" "$out"
 check "says it passed" grep -q "restore-drill: passed: bundle" "$out"
 check "no scratch directory is left" [ "$(drills_left)" -eq 0 ]
