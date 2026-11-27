@@ -349,13 +349,36 @@ impl ToolFailure {
     }
 }
 
+/// Cause read from a persisted `execution.ended` event: the Bridge's three
+/// current [`EndCause`] variants plus the historical `memory_limit` variant
+/// emitted on 2026-11-08 (`4492e363..47717497`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecordedEndCause {
+    Exited,
+    Stopped,
+    Lost,
+    MemoryLimit,
+}
+
+impl From<EndCause> for RecordedEndCause {
+    fn from(cause: EndCause) -> Self {
+        match cause {
+            EndCause::Exited => Self::Exited,
+            EndCause::Stopped => Self::Stopped,
+            EndCause::Lost => Self::Lost,
+        }
+    }
+}
+
 /// The engine's end, as `execution.ended` recorded it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct End {
     pub(crate) event_id: i64,
     pub(crate) ended_at_ms: i64,
-    /// `exited`, `stopped` or `lost` (the Bridge's three).
-    pub(crate) cause: EndCause,
+    /// `exited`, `stopped` or `lost` (the Bridge's three), plus legacy
+    /// `memory_limit` written on 2026-11-08.
+    pub(crate) cause: RecordedEndCause,
     pub(crate) exit_code: Option<i32>,
     pub(crate) signal: Option<i32>,
     pub(crate) evidence: Option<String>,
@@ -656,7 +679,10 @@ pub(crate) fn classify(facts: &Facts<'_>) -> Cause {
             StopKind::Other | StopKind::CancelledTask => Cause::Stopped,
         };
     }
-    if facts.end.is_some_and(|end| end.cause == EndCause::Stopped) {
+    if facts
+        .end
+        .is_some_and(|end| end.cause == RecordedEndCause::Stopped)
+    {
         return Cause::Stopped;
     }
     if facts.over_budget.is_some() {
@@ -676,7 +702,11 @@ pub(crate) fn classify(facts: &Facts<'_>) -> Cause {
     }
     // The engine's own end after a request the model will never accept:
     // resuming it sends the same request again.
-    if facts.model_error.is_some() && facts.end.is_none_or(|end| end.cause != EndCause::Lost) {
+    if facts.model_error.is_some()
+        && facts
+            .end
+            .is_none_or(|end| end.cause != RecordedEndCause::Lost)
+    {
         return Cause::ModelError;
     }
     // A signal, a non-zero code, or a terminal gone while its server lived:
@@ -684,7 +714,7 @@ pub(crate) fn classify(facts: &Facts<'_>) -> Cause {
     if facts.end.is_some_and(|end| {
         end.exit_code.is_some_and(|code| code != 0)
             || end.signal.is_some()
-            || end.cause == EndCause::Lost
+            || end.cause == RecordedEndCause::Lost
     }) {
         return Cause::Crashed;
     }
@@ -1020,7 +1050,7 @@ struct RawExecution {
     #[serde(default)]
     ended_at_ms: Option<i64>,
     #[serde(default)]
-    cause: Option<EndCause>,
+    cause: Option<RecordedEndCause>,
     #[serde(default)]
     exit_code: Option<i32>,
     #[serde(default)]
@@ -1114,9 +1144,11 @@ impl RecoverySchedule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordedSchedule {
     Explicit(RecoverySchedule),
-    /// Historical or test record that omitted `path`;
-    /// [`Interrupted::effective_path`] falls back to the cause's default path.
+    /// Historical record that omitted `path`, or a historical 2026-11-08
+    /// non-`final` record (`4492e363..47717497`) written before
+    /// `spawn_host_record` required numeric `due_ms`.
     Legacy {
+        path: Option<Path>,
         due_ms: Option<i64>,
     },
 }
@@ -1137,7 +1169,7 @@ impl Interrupted {
     pub(crate) fn explicit_path(&self) -> Option<Path> {
         match self.schedule {
             RecordedSchedule::Explicit(schedule) => Some(schedule.path()),
-            RecordedSchedule::Legacy { .. } => None,
+            RecordedSchedule::Legacy { path, .. } => path,
         }
     }
 
@@ -1146,14 +1178,14 @@ impl Interrupted {
     pub(crate) fn effective_path(&self) -> Path {
         match self.schedule {
             RecordedSchedule::Explicit(schedule) => schedule.path(),
-            RecordedSchedule::Legacy { .. } => self.cause.path(),
+            RecordedSchedule::Legacy { path, .. } => path.unwrap_or_else(|| self.cause.path()),
         }
     }
 
     pub(crate) fn due_ms(&self) -> Option<i64> {
         match self.schedule {
             RecordedSchedule::Explicit(schedule) => schedule.due_ms(),
-            RecordedSchedule::Legacy { due_ms } => due_ms,
+            RecordedSchedule::Legacy { due_ms, .. } => due_ms,
         }
     }
 
@@ -1233,12 +1265,11 @@ impl<'de> Deserialize<'de> for Recorded {
                     (Some(Path::Wait), Some(due_ms)) => {
                         RecordedSchedule::Explicit(RecoverySchedule::Wait { due_ms })
                     }
-                    (Some(_), None) => {
-                        return Err(de::Error::custom(
-                            "non-final execution.interrupted requires due_ms",
-                        ));
-                    }
-                    (None, due_ms) => RecordedSchedule::Legacy { due_ms },
+                    (Some(path), None) => RecordedSchedule::Legacy {
+                        path: Some(path),
+                        due_ms: None,
+                    },
+                    (None, due_ms) => RecordedSchedule::Legacy { path: None, due_ms },
                 };
                 Ok(Self::Interrupted(Interrupted {
                     event_id: raw.event_id,
@@ -1584,22 +1615,23 @@ pub(crate) fn step(state: &mut Recovery, world: &World<'_>) -> Result<Vec<String
         .into_iter()
         .map(|(_, session)| session)
         .collect();
-    for Candidate {
-        session_id,
-        agent_id,
-    } in sessions
-    {
-        let (session, agent) = (session_id, agent_id);
-        if !kept(&agent, &session, work, &residents) {
-            continue;
-        }
-        let facts = store
-            .recovery_facts(&SessionId::new(&session).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
-        let row: FactsRow = serde_json::from_value(facts)
-            .map_err(|error| format!("recovery facts of {session}: {error}"))?;
+    let rows = sessions.into_iter().filter_map(
+        |Candidate {
+             session_id,
+             agent_id,
+         }| {
+            if !kept(&agent_id, &session_id, work, &residents) {
+                return None;
+            }
+            let fetched = SessionId::new(&session_id)
+                .map_err(|error| error.to_string())
+                .and_then(|id| store.recovery_facts(&id).map_err(|error| error.to_string()));
+            Some((session_id, fetched))
+        },
+    );
+    visit_pass_rows(rows, &mut lines, |row| {
         let Some(execution) = row.execution.as_ref() else {
-            continue;
+            return Ok(Vec::new());
         };
         let records = row.records.clone();
         let mut one = One {
@@ -1620,14 +1652,106 @@ pub(crate) fn step(state: &mut Recovery, world: &World<'_>) -> Result<Vec<String
             lines: Vec::new(),
         };
         one.run(outage.as_ref())?;
-        lines.extend(one.lines);
-    }
+        Ok(one.lines)
+    })?;
     // The database answered every session this pass read: the outage is
     // over, its records written.
     if outage.is_some() {
         state.outage = None;
     }
     Ok(lines)
+}
+
+fn redact_delimited_after(
+    text: &str,
+    marker: &str,
+    open: char,
+    close: char,
+    replacement: &str,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(marker) {
+        let prefix_end = pos + marker.len();
+        out.push_str(&rest[..prefix_end]);
+        let after = &rest[prefix_end..];
+        if let Some(after_open) = after.strip_prefix(open) {
+            let mut escaped = false;
+            let mut end_idx = None;
+            for (idx, ch) in after_open.char_indices() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if open == '"' && ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == close {
+                    end_idx = Some(idx + ch.len_utf8());
+                    break;
+                }
+            }
+            if let Some(end) = end_idx {
+                out.push_str(replacement);
+                rest = &after_open[end..];
+                continue;
+            }
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Strip literal unexpected field/variant/string values echoed by serde before
+/// logging malformed `RECOVERY_FACTS` rows.
+fn sanitize_parse_error(raw: &str) -> String {
+    let mut cleaned = redact_delimited_after(raw, "unknown variant ", '`', '`', "`<redacted>`");
+    cleaned = redact_delimited_after(
+        &cleaned,
+        "unexpected recovery record type ",
+        '`',
+        '`',
+        "`<redacted>`",
+    );
+    cleaned = redact_delimited_after(&cleaned, "unknown field ", '`', '`', "`<redacted>`");
+    cleaned = redact_delimited_after(&cleaned, "string ", '"', '"', "\"<redacted>\"");
+    crate::deliver::one_line(&cleaned, 200)
+}
+
+fn parse_session_facts(session: &str, facts: Value) -> Result<FactsRow, String> {
+    serde_json::from_value(facts).map_err(|error| {
+        format!(
+            "recover: skipping {session}: malformed recovery facts ({})",
+            sanitize_parse_error(&error.to_string())
+        )
+    })
+}
+
+/// Stream kept session rows through recovery while isolating malformed `FactsRow`
+/// payloads to their own session; transport/store errors still fail the pass.
+fn visit_pass_rows<I>(
+    rows: I,
+    lines: &mut Vec<String>,
+    mut on_row: impl FnMut(FactsRow) -> Result<Vec<String>, String>,
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = (String, Result<Value, String>)>,
+{
+    for (session, facts_result) in rows {
+        let facts = facts_result?;
+        let row = match parse_session_facts(&session, facts) {
+            Ok(row) => row,
+            Err(skip_line) => {
+                lines.push(skip_line);
+                continue;
+            }
+        };
+        let more = on_row(row)?;
+        lines.extend(more);
+    }
+    Ok(())
 }
 
 impl Recovery {
@@ -3168,11 +3292,11 @@ mod tests {
     use super::{
         AuthRetry, Cause, CauseExt, CommandAction, Config, Credentials, ENGINE, End, EndCause,
         Executed, Execution, ExecutionState, Facts, FactsRow, Interrupted, LoopStart, Outage, Path,
-        PlannedCommand, Recorded, RecordedSchedule, Recovery, RecoverySchedule, RevivalEnv,
-        RevivalPlan, Sent, SentOutcome, Stop, StopAction, StopFact, StopKind, ToolFailure, Turn,
-        auth_retry_action, auth_retry_due, classify, counts_as_failure, disk_cleared, key,
-        model_due, model_resumes, model_retries, pending, plan_auth_retry, refused, resume_due,
-        resume_failed, retry_at, server_gone, stop_fact, way,
+        PlannedCommand, Recorded, RecordedEndCause, RecordedSchedule, Recovery, RecoverySchedule,
+        RevivalEnv, RevivalPlan, Sent, SentOutcome, Stop, StopAction, StopFact, StopKind,
+        ToolFailure, Turn, auth_retry_action, auth_retry_due, classify, counts_as_failure,
+        disk_cleared, key, model_due, model_resumes, model_retries, pending, plan_auth_retry,
+        refused, resume_due, resume_failed, retry_at, server_gone, stop_fact, visit_pass_rows, way,
     };
     use serde_json::{Value, json};
 
@@ -3535,7 +3659,7 @@ mod tests {
         End {
             event_id: 90,
             ended_at_ms: 2_000,
-            cause,
+            cause: cause.into(),
             exit_code,
             signal,
             evidence: None,
@@ -3837,7 +3961,7 @@ mod tests {
                 Some(ended_at_ms) => ExecutionState::Ended(End {
                     event_id: 90,
                     ended_at_ms,
-                    cause: EndCause::Exited,
+                    cause: RecordedEndCause::Exited,
                     exit_code: Some(0),
                     signal: None,
                     evidence: None,
@@ -4873,9 +4997,7 @@ mod tests {
 
         for bad_record in [
             json!({"type": "execution.interrupted", "cause": "stopped", "path": "final", "attempt": 1, "due_ms": 1_000}),
-            json!({"type": "execution.interrupted", "cause": "crashed", "path": "resume", "attempt": 1, "due_ms": null}),
-            json!({"type": "execution.interrupted", "cause": "context_exhausted", "path": "handoff", "attempt": 1}),
-            json!({"type": "execution.interrupted", "cause": "disk_full", "path": "wait", "attempt": 1, "due_ms": null}),
+            json!({"type": "execution.interrupted", "cause": "crashed", "path": "resume", "attempt": 1, "due_ms": "soon"}),
             json!({"type": "execution.interrupted", "cause": "crashed", "path": "resume", "attempt": 0, "due_ms": 1_000}),
             json!({"type": "execution.interrupted", "cause": "unknown_cause", "path": "final", "attempt": 1}),
             json!({"type": "execution.interrupted", "cause": "crashed", "path": "loop_forever", "attempt": 1, "due_ms": 1_000}),
@@ -5017,5 +5139,129 @@ mod tests {
             earlier_boot_id: Some("boot-abc".to_string()),
         };
         assert_eq!(recovery.earlier_boot_id(), Some("boot-abc"));
+    }
+
+    #[test]
+    fn historical_2026_11_08_shapes_decode_cleanly() {
+        // 1. Historical `execution.ended` with `cause: "memory_limit"` (4492e363..47717497).
+        let legacy_exec: Execution = serde_json::from_value(json!({
+            "id": "exec_1436",
+            "started_at_ms": 1_762_560_000_000_i64,
+            "ended_at_ms": 1_762_560_005_000_i64,
+            "cause": "memory_limit",
+            "exit_code": null,
+            "signal": 9,
+            "evidence": "systemd oom-kill",
+            "end_event_id": 77,
+        }))
+        .expect("historical memory_limit execution.ended must decode");
+        let ended = legacy_exec.end().expect("ended");
+        assert_eq!(ended.cause, RecordedEndCause::MemoryLimit);
+        assert_eq!(json!(ended.cause), json!("memory_limit"));
+        assert_eq!(
+            classify(&Facts {
+                end: Some(ended),
+                ..Facts::default()
+            }),
+            Cause::Crashed
+        );
+
+        // 2. Historical non-`final` `execution.interrupted` without `due_ms` (or `due_ms: null`).
+        for (path, due_field, expected_path) in [
+            ("resume", None, Path::Resume),
+            ("handoff", Some(Value::Null), Path::Handoff),
+            ("wait", None, Path::Wait),
+        ] {
+            let mut rec = json!({
+                "type": "execution.interrupted",
+                "cause": "memory_limit",
+                "path": path,
+                "attempt": 1,
+                "fact_event_id": 77,
+                "evidence": {},
+            });
+            if let Some(due) = due_field {
+                rec["due_ms"] = due;
+            }
+            let parsed: Recorded = serde_json::from_value(json!({
+                "event_id": 88,
+                "at_ms": 1_762_560_006_000_i64,
+                "record": rec,
+            }))
+            .expect("historical non-final record without due_ms must decode");
+            match parsed {
+                Recorded::Interrupted(interrupted) => {
+                    assert_eq!(
+                        interrupted.schedule,
+                        RecordedSchedule::Legacy {
+                            path: Some(expected_path),
+                            due_ms: None,
+                        }
+                    );
+                    assert_eq!(interrupted.explicit_path(), Some(expected_path));
+                    assert_eq!(interrupted.effective_path(), expected_path);
+                    assert_eq!(interrupted.due_ms(), None);
+                }
+                Recorded::Cleared { .. } => panic!("expected Interrupted"),
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_facts_row_skips_only_affected_session_with_sanitized_log() {
+        let healthy = |session: &str| {
+            Ok(json!({
+                "session_id": session,
+                "agent_id": format!("agent_{session}"),
+                "execution": {
+                    "id": format!("exec_{session}"),
+                    "started_at_ms": 1_000,
+                },
+            }))
+        };
+        let malformed = Ok(json!({
+            "session_id": "bad_session",
+            "agent_id": "agent_bad",
+            "execution": {
+                "id": "exec_bad",
+                "started_at_ms": 1_000,
+                "ended_at_ms": 2_000,
+                "cause": "sk-live-secret-do-not-echo",
+                "end_event_id": 55,
+            },
+        }));
+        let mut lines = Vec::new();
+        let mut visited = Vec::new();
+        let outcome = visit_pass_rows(
+            vec![
+                ("healthy_1".to_string(), healthy("healthy_1")),
+                ("bad_session".to_string(), malformed),
+                ("healthy_2".to_string(), healthy("healthy_2")),
+            ],
+            &mut lines,
+            |row| {
+                visited.push(row.session_id.clone());
+                Ok(vec![format!("ok: {}", row.session_id)])
+            },
+        );
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(visited, ["healthy_1", "healthy_2"]);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "ok: healthy_1");
+        assert!(
+            lines[1].contains("bad_session") && !lines[1].contains("sk-live-secret-do-not-echo"),
+            "skip line must name session and redact raw value: {}",
+            lines[1]
+        );
+        assert_eq!(lines[2], "ok: healthy_2");
+
+        // Store/transport failures still propagate for outage backoff and handling.
+        let mut err_lines = Vec::new();
+        let transport_err = visit_pass_rows(
+            vec![("s1".to_string(), Err("connection refused".to_string()))],
+            &mut err_lines,
+            |_row| Ok(Vec::new()),
+        );
+        assert_eq!(transport_err, Err("connection refused".to_string()));
     }
 }
