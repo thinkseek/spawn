@@ -174,6 +174,7 @@ fn cwd_beneath(pid: u32, directory: &std::path::Path) -> bool {
 
 /// `signal` to `pid` through a pidfd, only while its working directory is
 /// still beneath `directory` once the pidfd holds it.
+#[cfg(target_os = "linux")]
 fn signal_beneath(pid: u32, directory: &std::path::Path, signal: rustix::process::Signal) {
     let Some(raw) = rustix::process::Pid::from_raw(pid.cast_signed()) else {
         return;
@@ -185,6 +186,16 @@ fn signal_beneath(pid: u32, directory: &std::path::Path, signal: rustix::process
         let _ = rustix::process::pidfd_send_signal(&pidfd, signal);
     }
 }
+
+/// Without pidfds (every target but Linux) no signal is sent: a signal by
+/// pid after a check of its directory could reach a process that reused the
+/// pid in between, which [`end_stragglers`] promises never happens. Nor is
+/// one needed: stragglers are found through `/proc/<pid>/cwd`, so where
+/// there is no pidfd there is no `/proc` either and none is ever found. Were
+/// one found, it would outlive both rounds and [`end_stragglers`] would name
+/// it in its error.
+#[cfg(not(target_os = "linux"))]
+fn signal_beneath(_pid: u32, _directory: &std::path::Path, _signal: rustix::process::Signal) {}
 
 /// The processes still in the sessions `leaders` lead once none is left or
 /// `limit` passes.
@@ -875,9 +886,44 @@ mod tests {
         )));
     }
 
+    /// Without pidfds and `/proc` (every target but Linux) the sweep finds
+    /// nothing and signals nothing: a process beneath the workspace is left
+    /// alone rather than signalled by a pid that could have been reused.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn without_pidfds_nothing_beneath_the_workspace_is_signalled() {
+        let scratch = crate::Scratch::new("spawn-straggler-test");
+        let workspace = scratch.join("ws");
+        std::fs::create_dir_all(&workspace).expect("dirs");
+        if !sweepable(&workspace) {
+            eprintln!(
+                "skipped: the scratch {} is not sweepable",
+                workspace.display()
+            );
+            return;
+        }
+        let mut inside = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&workspace)
+            .spawn()
+            .expect("sleep");
+        let ended = end_stragglers(
+            &workspace.display().to_string(),
+            (Duration::from_millis(50), Duration::from_millis(50)),
+        );
+        let alive = inside.try_wait().expect("try_wait").is_none();
+        let _ = inside.kill();
+        let _ = inside.wait();
+        assert!(ended.is_ok(), "{ended:?}");
+        assert!(stragglers_beneath(&workspace).is_empty());
+        assert!(alive, "never signalled by pid");
+    }
+
     /// A process the test starts with its working directory below a
     /// workspace, detached from any session, is found by pid and ended;
-    /// one elsewhere is left alone.
+    /// one elsewhere is left alone. The sweep reads `/proc` and signals
+    /// through pidfds: Linux only.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_detached_process_beneath_the_workspace_is_ended_by_pid() {
         let scratch = crate::Scratch::new("spawn-straggler-test");
