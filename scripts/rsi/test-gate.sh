@@ -1699,6 +1699,21 @@ expect "a test retired by its last component only is still a drop, and the reaso
 expect "the log names the line and the test" "$(cat "$work/gate.out")" \
     '| retired-tests: b names tests::b only by its last component: write the whole name, as cargo lists it'
 printf '# retired with their feature\ntests::b\n' >"$retiring_scenarios/retired-tests"
+expect "a retired test deleted without replacement lowers the floor equally" \
+    "$(judge "$comment" "" "$retiring_scenarios")" 'exit=0 {"verdict":"accepted"}'
+expect "a candidate below base minus retired count is still refused" \
+    "$(judge "$uncompiled" "" "$retiring_scenarios")" 'runs fewer tests (3 -> 2; base 4 minus 1 retired)'
+rust_branch rust-retire-plus-rename
+drop_b
+sed -i 's/^    fn a() {/    fn a_renamed() {/' "$seed/src/lib.rs"
+retire_plus_rename=$(commit rust-retire-plus-rename)
+expect "a retired test plus an unretired rename is still refused at the adjusted floor" \
+    "$(judge "$retire_plus_rename" "" "$retiring_scenarios")" 'drops or renames base tests (1: tests::a)'
+rust_branch rust-unretired-drop
+sed -i 's/^    fn a() {/    #[ignore]\n&/' "$seed/src/lib.rs"
+unretired_drop=$(commit rust-unretired-drop)
+expect "a retired line absent from base drops does not lower the floor" \
+    "$(judge "$unretired_drop" "" "$retiring_scenarios")" 'runs fewer tests (4 -> 3)'
 base=$saved_base
 rust_branch rust-moved-path
 drop_b

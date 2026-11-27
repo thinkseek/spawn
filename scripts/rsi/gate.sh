@@ -4208,16 +4208,26 @@ candidate_binary=$(binary_hash "$work/candidate")
 # rejection ends the gate. Right after the candidate's listing on a cache
 # hit; after the candidate's runs when the base's listing ran beside them.
 tests_judge() {
-    if [ "$candidate_tests" -lt "$base_tests" ]; then
-        verdict rejected "candidate runs fewer tests ($base_tests -> $candidate_tests)"
-        exit 0
-    fi
-    dropped=$(LC_ALL=C comm -23 "$work/tests.base-names" "$work/tests.candidate-names")
+    raw_dropped=$(LC_ALL=C comm -23 "$work/tests.base-names" "$work/tests.candidate-names")
+    retired_dropped=0
+    dropped=$raw_dropped
     # The owner retires tests with the features they removed: names listed in
-    # `<scenarios-dir>/retired-tests` (one per line, `#` comments) may go.
-    if [ -n "$dropped" ] && [ -f "$scenarios/retired-tests" ]; then
+    # `<scenarios-dir>/retired-tests` (one per line, `#` comments) may go,
+    # lowering the runnable-test floor by the exact number of retired base
+    # tests actually absent from the candidate.
+    if [ -n "$raw_dropped" ] && [ -f "$scenarios/retired-tests" ]; then
         grep -v '^#' "$scenarios/retired-tests" | grep . | LC_ALL=C sort -u >"$work/tests.retired"
-        dropped=$(printf '%s\n' "$dropped" | LC_ALL=C comm -23 - "$work/tests.retired")
+        retired_dropped=$(printf '%s\n' "$raw_dropped" | LC_ALL=C comm -12 - "$work/tests.retired" | grep -c . || true)
+        dropped=$(printf '%s\n' "$raw_dropped" | LC_ALL=C comm -23 - "$work/tests.retired")
+    fi
+    effective_base_tests=$((base_tests - retired_dropped))
+    if [ "$candidate_tests" -lt "$effective_base_tests" ]; then
+        if [ "$retired_dropped" -gt 0 ]; then
+            verdict rejected "candidate runs fewer tests ($effective_base_tests -> $candidate_tests; base $base_tests minus $retired_dropped retired)"
+        else
+            verdict rejected "candidate runs fewer tests ($base_tests -> $candidate_tests)"
+        fi
+        exit 0
     fi
     if [ -n "$dropped" ]; then
         echo "| base tests the candidate does not run by name: $(printf '%s\n' "$dropped" | head -n 20 | tr '\n' ' ')"
