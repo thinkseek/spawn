@@ -829,6 +829,138 @@ impl WorkspaceSettings {
     }
 }
 
+/// Environment variable overriding the TOML file searched for `[auth.profiles.<name>]`.
+pub(crate) const AUTH_CONFIG_ENV: &str = "SPAWN_AUTH_CONFIG";
+
+/// Environment variable overriding the root directory for isolated `native_login` profile dirs.
+pub(crate) const AUTH_PROFILES_DIR_ENV: &str = "SPAWN_AUTH_PROFILES_DIR";
+
+fn non_empty_env(env_lookup: &dyn Fn(&str) -> Option<String>, name: &str) -> Option<String> {
+    env_lookup(name).filter(|value| !value.trim().is_empty())
+}
+
+fn default_auth_config_path_with(env_lookup: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    if let Some(xdg) = non_empty_env(env_lookup, "XDG_CONFIG_HOME") {
+        return PathBuf::from(xdg).join("spawn").join("auth.toml");
+    }
+    if let Some(home) = non_empty_env(env_lookup, "HOME") {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("spawn")
+            .join("auth.toml");
+    }
+    PathBuf::from(".spawn").join("auth.toml")
+}
+
+fn default_spawn_toml_path_with(env_lookup: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if let Some(xdg) = non_empty_env(env_lookup, "XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(xdg).join("spawn").join("spawn.toml"));
+    }
+    non_empty_env(env_lookup, "HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join("spawn")
+            .join("spawn.toml")
+    })
+}
+
+/// Resolve the TOML file path used when writing `[auth.profiles.<name>]`.
+///
+/// Precedence: explicit `--config <path>` -> `SPAWN_AUTH_CONFIG` ->
+/// `$XDG_CONFIG_HOME/spawn/auth.toml` -> `$HOME/.config/spawn/auth.toml` ->
+/// `.spawn/auth.toml`.
+pub(crate) fn auth_config_write_path_with(
+    explicit: Option<&Path>,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    if let Some(path) = non_empty_env(env_lookup, AUTH_CONFIG_ENV) {
+        return PathBuf::from(path);
+    }
+    default_auth_config_path_with(env_lookup)
+}
+
+/// Resolve the TOML file path used when reading `[auth.profiles.<name>]`.
+///
+/// Precedence: explicit `--config <path>` -> `SPAWN_AUTH_CONFIG` -> existing
+/// default `auth.toml` -> existing `SPAWN_CONFIG` -> existing default `spawn.toml` ->
+/// default `auth.toml`.
+pub(crate) fn auth_config_read_path_with(
+    explicit: Option<&Path>,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    if let Some(path) = non_empty_env(env_lookup, AUTH_CONFIG_ENV) {
+        return PathBuf::from(path);
+    }
+    let default_auth = default_auth_config_path_with(env_lookup);
+    if exists(&default_auth) {
+        return default_auth;
+    }
+    if let Some(spawn_cfg) = non_empty_env(env_lookup, "SPAWN_CONFIG").map(PathBuf::from)
+        && exists(&spawn_cfg)
+    {
+        return spawn_cfg;
+    }
+    if let Some(spawn_toml) = default_spawn_toml_path_with(env_lookup)
+        && exists(&spawn_toml)
+    {
+        return spawn_toml;
+    }
+    default_auth
+}
+
+/// Resolve the isolated root directory for `native_login` auth profile directories.
+///
+/// Precedence: `SPAWN_AUTH_PROFILES_DIR` -> `$XDG_STATE_HOME/spawn/auth-profiles` ->
+/// `$XDG_DATA_HOME/spawn/auth-profiles` -> `$HOME/.local/state/spawn/auth-profiles`.
+/// Refuses to fall back to shared `/tmp` directories when none of these env vars exist.
+pub(crate) fn auth_profiles_root_dir_with(
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<PathBuf, String> {
+    if let Some(dir) = non_empty_env(env_lookup, AUTH_PROFILES_DIR_ENV) {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(xdg) = non_empty_env(env_lookup, "XDG_STATE_HOME") {
+        return Ok(PathBuf::from(xdg).join("spawn").join("auth-profiles"));
+    }
+    if let Some(xdg) = non_empty_env(env_lookup, "XDG_DATA_HOME") {
+        return Ok(PathBuf::from(xdg).join("spawn").join("auth-profiles"));
+    }
+    if let Some(home) = non_empty_env(env_lookup, "HOME") {
+        return Ok(PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("spawn")
+            .join("auth-profiles"));
+    }
+    Err(
+        "cannot resolve isolated auth profiles directory: set SPAWN_AUTH_PROFILES_DIR, \
+         XDG_STATE_HOME, XDG_DATA_HOME, or HOME (shared temp fallback is refused)"
+            .to_string(),
+    )
+}
+
+/// Resolve [`auth_config_write_path_with`] against the process environment.
+pub(crate) fn auth_config_write_path(explicit: Option<&Path>) -> PathBuf {
+    auth_config_write_path_with(explicit, &|name| env_value(name))
+}
+
+/// Resolve [`auth_config_read_path_with`] against the process environment and filesystem.
+pub(crate) fn auth_config_read_path(explicit: Option<&Path>) -> PathBuf {
+    auth_config_read_path_with(explicit, &|name| env_value(name), &Path::exists)
+}
+
+/// Resolve [`auth_profiles_root_dir_with`] against the process environment.
+pub(crate) fn auth_profiles_root_dir() -> Result<PathBuf, String> {
+    auth_profiles_root_dir_with(&|name| env_value(name))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1632,5 +1764,102 @@ mod workspace_tests {
             assert!(!err.contains(canary), "secret leaked in {err}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_config_and_profile_paths_follow_precedence() {
+        use super::{
+            AUTH_CONFIG_ENV, AUTH_PROFILES_DIR_ENV, auth_config_read_path_with,
+            auth_config_write_path_with, auth_profiles_root_dir_with,
+        };
+        use std::collections::HashMap;
+
+        let env = |pairs: &[(&str, &str)]| {
+            let map: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            move |name: &str| map.get(name).cloned()
+        };
+
+        let explicit = Path::new("/etc/spawn/custom-auth.toml");
+        let full_env = env(&[
+            (AUTH_CONFIG_ENV, "/srv/auth.toml"),
+            ("XDG_CONFIG_HOME", "/home/u/.xdg-cfg"),
+            ("HOME", "/home/u"),
+            ("SPAWN_CONFIG", "/etc/spawn/spawn.toml"),
+            (AUTH_PROFILES_DIR_ENV, "/var/lib/spawn/auth-profiles"),
+            ("XDG_DATA_HOME", "/home/u/.xdg-data"),
+        ]);
+
+        assert_eq!(
+            auth_config_write_path_with(Some(explicit), &full_env),
+            explicit
+        );
+        assert_eq!(
+            auth_config_write_path_with(None, &full_env),
+            PathBuf::from("/srv/auth.toml")
+        );
+
+        let xdg_only = env(&[("XDG_CONFIG_HOME", "/home/u/.xdg-cfg"), ("HOME", "/home/u")]);
+        assert_eq!(
+            auth_config_write_path_with(None, &xdg_only),
+            PathBuf::from("/home/u/.xdg-cfg/spawn/auth.toml")
+        );
+
+        let home_only = env(&[
+            ("HOME", "/home/u"),
+            ("SPAWN_CONFIG", "/etc/spawn/spawn.toml"),
+        ]);
+        assert_eq!(
+            auth_config_write_path_with(None, &home_only),
+            PathBuf::from("/home/u/.config/spawn/auth.toml")
+        );
+
+        // Read falls back to existing SPAWN_CONFIG if default auth.toml does not exist.
+        let spawn_cfg_exists = |p: &Path| p == Path::new("/etc/spawn/spawn.toml");
+        assert_eq!(
+            auth_config_read_path_with(None, &home_only, &spawn_cfg_exists),
+            PathBuf::from("/etc/spawn/spawn.toml")
+        );
+        // Read prefers existing default auth.toml over SPAWN_CONFIG.
+        let both_exist = |p: &Path| {
+            p == Path::new("/home/u/.config/spawn/auth.toml")
+                || p == Path::new("/etc/spawn/spawn.toml")
+        };
+        assert_eq!(
+            auth_config_read_path_with(None, &home_only, &both_exist),
+            PathBuf::from("/home/u/.config/spawn/auth.toml")
+        );
+
+        assert_eq!(
+            auth_profiles_root_dir_with(&full_env).unwrap(),
+            PathBuf::from("/var/lib/spawn/auth-profiles")
+        );
+        let xdg_state = env(&[
+            ("XDG_STATE_HOME", "/home/u/.xdg-state"),
+            ("XDG_DATA_HOME", "/home/u/.xdg-data"),
+            ("HOME", "/home/u"),
+        ]);
+        assert_eq!(
+            auth_profiles_root_dir_with(&xdg_state).unwrap(),
+            PathBuf::from("/home/u/.xdg-state/spawn/auth-profiles")
+        );
+        let xdg_data = env(&[("XDG_DATA_HOME", "/home/u/.xdg-data"), ("HOME", "/home/u")]);
+        assert_eq!(
+            auth_profiles_root_dir_with(&xdg_data).unwrap(),
+            PathBuf::from("/home/u/.xdg-data/spawn/auth-profiles")
+        );
+        let home_data = env(&[("HOME", "/home/u")]);
+        assert_eq!(
+            auth_profiles_root_dir_with(&home_data).unwrap(),
+            PathBuf::from("/home/u/.local/state/spawn/auth-profiles")
+        );
+        let empty_env = env(&[]);
+        assert!(
+            auth_profiles_root_dir_with(&empty_env)
+                .unwrap_err()
+                .contains("refused")
+        );
     }
 }

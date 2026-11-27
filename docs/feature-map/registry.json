@@ -728,6 +728,7 @@
         "Cargo.lock",
         "Cargo.toml",
         "crates/spawn-cli/Cargo.toml",
+        "crates/spawn-cli/src/auth.rs",
         "crates/spawn-cli/src/commands/inspect.rs",
         "crates/spawn-cli/src/commands/loops.rs",
         "crates/spawn-cli/src/commands/mod.rs",
