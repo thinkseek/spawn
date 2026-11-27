@@ -103,9 +103,6 @@ where
     }
 }
 
-/// Deserialize an optional list of `i64` IDs accepting either JSON integers
-/// (`[1, 2]`, e.g. from `spawn_integrator_record`) or base-10 integer strings
-/// (`["1", "2"]`, e.g. from `spawn_source_moved` via `jsonb_array_elements_text`).
 /// A field that is present reads as `Some`, `null` included (`Some(Value::Null)`);
 /// only an absent one (through `#[serde(default)]`) is `None`. A round trip
 /// writes `"field": null` back.
@@ -116,6 +113,9 @@ where
     Value::deserialize(deserializer).map(Some)
 }
 
+/// Deserialize an optional list of `i64` IDs accepting either JSON integers
+/// (`[1, 2]`, e.g. from `spawn_integrator_record`) or base-10 integer strings
+/// (`["1", "2"]`, e.g. from `spawn_source_moved` via `jsonb_array_elements_text`).
 fn deserialize_opt_vec_i64<'de, D>(deserializer: D) -> Result<Option<Vec<i64>>, D::Error>
 where
     D: Deserializer<'de>,
@@ -624,6 +624,92 @@ pub struct TaskAssignedRecord {
     /// Forward-compatible extra JSON fields.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Which earlier task a `task.assigned` record's task comes from: the
+/// record's four lineage fields read once. Each is written by one writer
+/// alone (`schema.sql`, every version), so a record names at most one:
+/// `duplicate_of` by `spawn_mission_assign` (assigned again on purpose
+/// while a task with the same brief is open), `reissue_of` by the
+/// dispatcher's re-issue of an undelivered task, `reassign_of` by a
+/// reassign to a fresh per-task worker, and `continues` by the
+/// integrator's objective assign (a continuation of an overrun).
+///
+/// The ledger keeps [`TaskAssignedRecord`]'s wire fields unchanged (an
+/// append-only log is never rewritten); this is the one reading of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOrigin {
+    /// A first assignment: no earlier task.
+    New,
+    /// Assigned again while task `of`, with the same brief, is open.
+    Duplicate {
+        /// The open task with the same brief.
+        of: i64,
+    },
+    /// Re-issued in place of task `of`, which was cancelled for it.
+    Reissue {
+        /// The task re-issued.
+        of: i64,
+    },
+    /// Task `of`'s work, taken over by a fresh per-task worker.
+    Reassign {
+        /// The task reassigned.
+        of: i64,
+    },
+    /// Continues the work of task `of`, an objective's overrun.
+    Continuation {
+        /// The task continued.
+        of: i64,
+    },
+}
+
+impl TaskOrigin {
+    /// The earlier task, unless this is a first assignment.
+    pub const fn of(self) -> Option<i64> {
+        match self {
+            Self::New => None,
+            Self::Duplicate { of }
+            | Self::Reissue { of }
+            | Self::Reassign { of }
+            | Self::Continuation { of } => Some(of),
+        }
+    }
+}
+
+impl TaskAssignedRecord {
+    /// Where the task comes from ([`TaskOrigin`]). Refuses only what no
+    /// writer ever recorded: two lineage fields on one record.
+    pub fn origin(&self) -> Result<TaskOrigin, ControlRecordError> {
+        let named = [
+            (
+                "duplicate_of",
+                self.duplicate_of.map(|of| TaskOrigin::Duplicate { of }),
+            ),
+            (
+                "reissue_of",
+                self.reissue_of.map(|of| TaskOrigin::Reissue { of }),
+            ),
+            (
+                "reassign_of",
+                self.reassign_of.map(|of| TaskOrigin::Reassign { of }),
+            ),
+            (
+                "continues",
+                self.continues.map(|of| TaskOrigin::Continuation { of }),
+            ),
+        ];
+        let mut set = named
+            .iter()
+            .filter_map(|(field, origin)| origin.map(|o| (field, o)));
+        match (set.next(), set.next()) {
+            (None, _) => Ok(TaskOrigin::New),
+            (Some((_, origin)), None) => Ok(origin),
+            (Some((first, _)), Some((second, _))) => Err(invariant_err(
+                ControlRecordKind::TaskAssigned.as_str(),
+                format!("`{first}` and `{second}` name two earlier tasks"),
+            )),
+        }
+    }
 }
 
 /// Payload for `task.delivered`.
@@ -3137,6 +3223,7 @@ fn validate_control_record_strict(record: &ControlRecord) -> Result<(), ControlR
             if r.agent_id.is_empty() || r.session_id.is_empty() {
                 return Err(invariant_err(kind, "`agent_id` and `session_id` required"));
             }
+            r.origin()?;
         }
         ControlRecord::TaskGated(r) => {
             r.outcome()?;
@@ -4148,7 +4235,7 @@ mod tests {
     use super::{
         ControlRecord, ControlRecordError, ControlRecordKind, ControllersDrillOutcome,
         DrillOutcome, EpisodeOutcome, GateOutcome, GateVerdict, GateVerdictClass, GradeWire,
-        GradingRecord, GradingRecordKind, HostRetry, TaskGatedRecord, invariant_err,
+        GradingRecord, GradingRecordKind, HostRetry, TaskGatedRecord, TaskOrigin, invariant_err,
         replay_task_episodes,
     };
     use crate::mission::TaskState;
@@ -5077,6 +5164,120 @@ mod tests {
             bad[field] = value;
             let error = ControlRecord::from_value_strict(&bad).expect_err(field);
             assert!(error.to_string().contains(says), "{field}: {error}");
+        }
+    }
+
+    /// A `task.assigned` as each of its four writers (`schema.sql`) records
+    /// it, from the owner's first assignment with every routing field to the
+    /// integrator's continuation: it reads through the strict parse, writes
+    /// back the same JSON, and says where its task comes from.
+    #[test]
+    fn task_assigned_records_read_as_their_writers_wrote_them_and_write_back_unchanged() {
+        let base = |id: i64, kind: &str, created_by: &str| {
+            json!({"type": "task.assigned", "id": id, "mission_id": 4, "kind": kind,
+                   "agent_id": format!("agent_worker_task_{id}"),
+                   "session_id": format!("session_worker_task_{id}"),
+                   "brief": "make the gate green", "model": "default",
+                   "created_by": created_by})
+        };
+        let with = |mut record: Value, fields: Value| {
+            for (key, value) in fields.as_object().expect("fields") {
+                record[key] = value.clone();
+            }
+            record
+        };
+        let routed = json!({"difficulty": "l3", "preset_id": "topdown-l3-fable",
+                            "tier_role": "top-decision", "execution_profile": "fable-5-2",
+                            "classification": {"grade": "l3", "by": "classifier"},
+                            "engine": "claude", "model_label": "claude-fable-5-2"});
+        let carried = json!({"objective": 210, "scenario": "gate", "difficulty": "l1",
+                             "preset_id": "mid-a", "first_preset_id": "small",
+                             "quality_rejections": 2});
+        let cases = [
+            (base(7, "resident", "human"), TaskOrigin::New),
+            (
+                with(base(8, "resident", "spawn_supervisor"), routed.clone()),
+                TaskOrigin::New,
+            ),
+            (
+                with(
+                    base(9, "ephemeral", "human"),
+                    json!({"duplicate_of": 8, "pinned": true}),
+                ),
+                TaskOrigin::Duplicate { of: 8 },
+            ),
+            (
+                with(
+                    with(base(10, "ephemeral", "human"), carried.clone()),
+                    json!({"reissue_of": 9}),
+                ),
+                TaskOrigin::Reissue { of: 9 },
+            ),
+            (
+                with(
+                    with(base(11, "ephemeral", "human"), carried.clone()),
+                    json!({"reassign_of": 10}),
+                ),
+                TaskOrigin::Reassign { of: 10 },
+            ),
+            (
+                with(
+                    with(base(12, "ephemeral", "spawn-integrate"), carried),
+                    json!({"continues": 11, "tier_role": "mechanical-offload"}),
+                ),
+                TaskOrigin::Continuation { of: 11 },
+            ),
+        ];
+        for (wire, origin) in cases {
+            let record = ControlRecord::from_value_strict(&wire)
+                .unwrap_or_else(|error| panic!("{wire}: {error}"));
+            assert_eq!(record.to_value().expect("serializes"), wire, "round trip");
+            assert_eq!(
+                serde_json::to_string(&record.to_value().expect("serializes")).expect("text"),
+                serde_json::to_string(&wire).expect("text"),
+                "the same JSON text"
+            );
+            let ControlRecord::TaskAssigned(assigned) = record else {
+                panic!("{wire} is a task.assigned");
+            };
+            assert_eq!(assigned.origin(), Ok(origin), "{wire}");
+            assert_eq!(
+                origin.of(),
+                wire.get("duplicate_of")
+                    .or(wire.get("reissue_of"))
+                    .or(wire.get("reassign_of"))
+                    .or(wire.get("continues"))
+                    .and_then(Value::as_i64)
+            );
+        }
+    }
+
+    /// Every pair of lineage fields names two earlier tasks, which no writer
+    /// ever recorded: the view and the strict parse refuse it, and the
+    /// compatible parse still reads the record.
+    #[test]
+    fn a_task_assigned_names_at_most_one_earlier_task() {
+        let lineage = ["duplicate_of", "reissue_of", "reassign_of", "continues"];
+        for (i, first) in lineage.iter().enumerate() {
+            for second in &lineage[i + 1..] {
+                let mut wire = json!({"type": "task.assigned", "id": 9, "mission_id": 4,
+                                      "kind": "ephemeral", "agent_id": "a", "session_id": "s",
+                                      "brief": "b"});
+                wire[*first] = json!(7);
+                wire[*second] = json!(8);
+                let error = ControlRecord::from_value_strict(&wire).expect_err("two origins");
+                let says = format!("`{first}` and `{second}` name two earlier tasks");
+                assert!(error.to_string().contains(&says), "{wire}: {error}");
+                let Ok(super::CompatControlRecord::Known(record)) =
+                    ControlRecord::from_value_compat(&wire)
+                else {
+                    panic!("{wire} reads compatibly");
+                };
+                let ControlRecord::TaskAssigned(assigned) = *record else {
+                    panic!("{wire} is a task.assigned");
+                };
+                assert_eq!(assigned.origin(), Err(invariant_err("task.assigned", says)));
+            }
         }
     }
 }
