@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -104,10 +104,50 @@ impl From<&ProjectCutoverRecord> for ProjectCutoverRecordView {
     }
 }
 
+fn deserialize_unique_projects<'de, D, T>(deserializer: D) -> Result<BTreeMap<String, T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct UniqueProjectsVisitor<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for UniqueProjectsVisitor<T> {
+        type Value = BTreeMap<String, T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a map of unique project cutover records")
+        }
+
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut projects = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, T>()? {
+                if projects.contains_key(&key) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate project key `{key}`"
+                    )));
+                }
+                projects.insert(key, value);
+            }
+            Ok(projects)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueProjectsVisitor(std::marker::PhantomData))
+}
+
+#[derive(Debug, Deserialize)]
+struct CutoverStateVersionProbe {
+    schema_version: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CutoverStateFile {
     schema_version: u32,
+    #[serde(deserialize_with = "deserialize_unique_projects")]
     projects: BTreeMap<String, ProjectCutoverRecord>,
 }
 
@@ -136,6 +176,7 @@ struct LegacyProjectCutoverRecord {
 #[serde(deny_unknown_fields)]
 struct LegacyCutoverStateFile {
     schema_version: u32,
+    #[serde(deserialize_with = "deserialize_unique_projects")]
     projects: BTreeMap<String, LegacyProjectCutoverRecord>,
 }
 
@@ -512,6 +553,14 @@ fn upgrade_legacy_record(
     rec: LegacyProjectCutoverRecord,
     state_path: &Path,
 ) -> Result<ProjectCutoverRecord, String> {
+    if rec.phase == CutoverPhase::DispatchPaused {
+        return Err(format!(
+            "unsupported legacy v1 cutover phase {:?} for project {:?} in {}: dispatch_paused is schema v2 only",
+            rec.phase,
+            rec.project,
+            state_path.display(),
+        ));
+    }
     let phase = match (rec.phase, rec.storage_mode, rec.dispatch_paused) {
         (CutoverPhase::BackfillImported, ProjectStorageMode::Git, true) => {
             CutoverPhase::DispatchPaused
@@ -582,32 +631,26 @@ fn read_cutover_state(cas_dir: &Path) -> Result<Option<CutoverStateFile>, String
     }
 
     let state_path = cas_dir.join(CUTOVER_STATE_FILE);
-    let Some(file) = open_file_no_symlink(&state_path, "cutover state")? else {
+    let Some(mut file) = open_file_no_symlink(&state_path, "cutover state")? else {
         return Ok(None);
     };
-    let raw: serde_json::Value = serde_json::from_reader(file)
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("read {}: {e}", state_path.display()))?;
+    let probe: CutoverStateVersionProbe = serde_json::from_slice(&bytes)
         .map_err(|e| format!("parse {}: {e}", state_path.display()))?;
-    let version = raw
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            format!(
-                "parse {}: missing numeric schema_version",
-                state_path.display()
-            )
-        })?;
-    match u32::try_from(version) {
-        Ok(CUTOVER_STATE_SCHEMA_VERSION) => {
-            let parsed: CutoverStateFile = serde_json::from_value(raw)
+    match probe.schema_version {
+        CUTOVER_STATE_SCHEMA_VERSION => {
+            let parsed: CutoverStateFile = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("parse {}: {e}", state_path.display()))?;
             Ok(Some(parsed))
         }
-        Ok(LEGACY_CUTOVER_STATE_SCHEMA_VERSION) => {
-            let legacy: LegacyCutoverStateFile = serde_json::from_value(raw)
+        LEGACY_CUTOVER_STATE_SCHEMA_VERSION => {
+            let legacy: LegacyCutoverStateFile = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("parse legacy v1 {}: {e}", state_path.display()))?;
             upgrade_legacy_cutover_state(legacy, &state_path).map(Some)
         }
-        _ => Err(format!(
+        version => Err(format!(
             "unsupported cutover state schema_version {version} in {}",
             state_path.display()
         )),
@@ -1619,6 +1662,52 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn cutover_state_rejects_duplicate_json_keys_and_v2_only_phase_in_v1() {
+        let scratch = ScratchDir::new("dup-keys");
+        let cas = scratch.0.join(".d6/cas");
+        fs::create_dir_all(&cas).expect("mkdir cas");
+        let state_path = cas.join(CUTOVER_STATE_FILE);
+
+        let dup_cases = [
+            (
+                "v2 duplicate phase resumed->rolled_back",
+                r#"{"schema_version":2,"projects":{"proj":{"project":"proj","bare_repo":"/tmp/proj.git","phase":"resumed","phase":"rolled_back","reason":null,"updated_at_ms":1}}}"#,
+            ),
+            (
+                "v2 duplicate phase rolled_back->resumed",
+                r#"{"schema_version":2,"projects":{"proj":{"project":"proj","bare_repo":"/tmp/proj.git","phase":"rolled_back","phase":"resumed","reason":null,"updated_at_ms":1}}}"#,
+            ),
+            (
+                "v1 duplicate dispatch_paused",
+                r#"{"schema_version":1,"projects":{"proj":{"project":"proj","bare_repo":"/tmp/proj.git","phase":"backfill_imported","storage_mode":"git","dispatch_paused":true,"dispatch_paused":false,"reason":null,"updated_at_ms":1}}}"#,
+            ),
+            (
+                "v1 duplicate storage_mode",
+                r#"{"schema_version":1,"projects":{"proj":{"project":"proj","bare_repo":"/tmp/proj.git","phase":"resumed","storage_mode":"git","storage_mode":"d6_cas","dispatch_paused":false,"reason":null,"updated_at_ms":1}}}"#,
+            ),
+            (
+                "duplicate schema_version",
+                r#"{"schema_version":1,"schema_version":2,"projects":{}}"#,
+            ),
+            (
+                "duplicate project map key",
+                r#"{"schema_version":2,"projects":{"proj":{"project":"proj","bare_repo":"/tmp/proj.git","phase":"resumed","reason":null,"updated_at_ms":1},"proj":{"project":"proj","bare_repo":"/tmp/proj.git","phase":"rolled_back","reason":null,"updated_at_ms":2}}}"#,
+            ),
+        ];
+
+        for (label, raw) in dup_cases {
+            fs::write(&state_path, raw.as_bytes()).expect("write duplicate-key fixture");
+            let msg = read_cutover_state(&cas).expect_err(label);
+            assert!(msg.contains("duplicate"), "{label}: {msg}");
+        }
+
+        let v1_dispatch_paused = r#"{"schema_version":1,"projects":{"proj":{"project":"proj","bare_repo":"/tmp/proj.git","phase":"dispatch_paused","storage_mode":"git","dispatch_paused":true,"reason":null,"updated_at_ms":1}}}"#;
+        fs::write(&state_path, v1_dispatch_paused.as_bytes()).expect("write v1 dispatch_paused");
+        let err = read_cutover_state(&cas).expect_err("reject v2-only dispatch_paused in v1");
+        assert!(err.contains("schema v2 only"), "{err}");
     }
 
     #[test]

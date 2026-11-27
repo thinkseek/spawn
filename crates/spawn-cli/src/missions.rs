@@ -2425,6 +2425,7 @@ struct ReviewCommit {
     is_checkpoint: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum TaskRepo {
     LocalGit {
         git_dir: std::path::PathBuf,
@@ -2949,21 +2950,35 @@ fn lookup_snapshot_digest_by_oid(
         .map_err(|error| format!("invalid D6 snapshot digest {}: {error}", row.id))
 }
 
+fn lookup_task_repo_d6_refs(
+    store: &spawn_postgres::PostgresStore,
+    ctx: &TaskRepoContext,
+) -> Result<Option<(String, Vec<spawn_postgres::RefRow>)>, String> {
+    match &ctx.repo {
+        TaskRepo::D6Ledger { project } => {
+            let rows = store
+                .list_refs(Some(project))
+                .map_err(|error| format!("list D6 refs for {project}: {error}"))?;
+            Ok((!rows.is_empty()).then(|| (project.clone(), rows)))
+        }
+        TaskRepo::LocalGit { git_dir, .. } => {
+            let candidates = d6_project_candidates(
+                ctx.source.as_deref(),
+                Some(git_dir.as_path()),
+                ctx.root.as_deref(),
+            );
+            load_d6_project_refs(store, &candidates)
+        }
+    }
+}
+
 fn resolve_task_refs(
     store: &spawn_postgres::PostgresStore,
     ctx: &TaskRepoContext,
 ) -> Result<ResolvedTaskRefs, String> {
-    let mut candidates = d6_project_candidates(
-        ctx.source.as_deref(),
-        ctx.repo.local_git_dir(),
-        ctx.root.as_deref(),
-    );
-    if let TaskRepo::D6Ledger { project } = &ctx.repo {
-        push_unique_project(&mut candidates, project);
-    }
-    let d6_project_refs = load_d6_project_refs(store, &candidates)?;
-    let d6_mode = is_d6_mode_for_task(ctx, d6_project_refs.is_some());
+    let d6_project_refs = lookup_task_repo_d6_refs(store, ctx)?;
     let local_git_dir = ctx.repo.local_git_dir();
+    let d6_mode = is_d6_mode_for_task(ctx, d6_project_refs.is_some());
 
     let (base_sha, base_snapshot) = match (&d6_project_refs, local_git_dir) {
         (Some((project, rows)), None) => {
@@ -6118,6 +6133,172 @@ mod database_tests {
             "{missing_err}"
         );
         assert!(!missing_cas.join(spawn_cas::CAS_MARKER).exists());
+    }
+
+    fn publish_d6_main_and_task_head_pair(
+        cas: &spawn_host::CasMerkleStore,
+        ledger: &crate::sources::PostgresRefLedger,
+        project: &str,
+        task_ref: &str,
+        tag: &str,
+    ) -> (String, String) {
+        use spawn_cas::{Tree, TreeEntry, TreeEntryKind};
+        use spawn_host::{D6RefKind, PublishRequest, format_commit_body};
+
+        let (b1, l1) = cas
+            .put_bytes_blob(format!("base-{tag}\n").as_bytes())
+            .unwrap();
+        let t1 = cas
+            .put_tree_cached(
+                &Tree::from_entries(vec![TreeEntry {
+                    kind: TreeEntryKind::File,
+                    name: b"file.txt".to_vec(),
+                    id: b1.as_bytes(),
+                    size: l1,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let body1 = format_commit_body(
+            "T <t@s> 1700000000 +0000",
+            "T <t@s> 1700000000 +0000",
+            &format!("base {tag}\n"),
+        );
+        let p1 = cas
+            .publish_snapshot(
+                ledger,
+                &PublishRequest {
+                    project,
+                    ref_name: "main",
+                    kind: D6RefKind::Main,
+                    expected_ref: None,
+                    tree: &t1,
+                    parents: &[],
+                    commit_body: &body1,
+                    created_at_ms: 1_700_000_000_000,
+                    reason: "main",
+                    landing_task_id: None,
+                },
+            )
+            .unwrap();
+        let (b2, l2) = cas
+            .put_bytes_blob(format!("head-{tag}\n").as_bytes())
+            .unwrap();
+        let t2 = cas
+            .put_tree_cached(
+                &Tree::from_entries(vec![TreeEntry {
+                    kind: TreeEntryKind::File,
+                    name: b"file.txt".to_vec(),
+                    id: b2.as_bytes(),
+                    size: l2,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let body2 = format_commit_body(
+            "T <t@s> 1700000100 +0000",
+            "T <t@s> 1700000100 +0000",
+            &format!("head {tag}\n"),
+        );
+        let p2 = cas
+            .publish_snapshot(
+                ledger,
+                &PublishRequest {
+                    project,
+                    ref_name: task_ref,
+                    kind: D6RefKind::Branch,
+                    expected_ref: None,
+                    tree: &t2,
+                    parents: std::slice::from_ref(&p1.snapshot),
+                    commit_body: &body2,
+                    created_at_ms: 1_700_000_100_000,
+                    reason: "head",
+                    landing_task_id: None,
+                },
+            )
+            .unwrap();
+        (p1.git_oid.to_hex(), p2.git_oid.to_hex())
+    }
+
+    #[test]
+    fn d6_ledger_task_refs_read_only_selected_project_when_mirror_and_source_url_both_exist() {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("missions_d6_two_names");
+        let store = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+                .expect("isolated schema"),
+        );
+
+        let guard = super::TempDirGuard::create("missions-d6-two-names").expect("temp dir");
+        let root = guard.path.join("ws-root");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join(".spawn-backend"), "d6\n").expect("backend marker");
+        let source_url = "https://example.invalid/thinkseek/spawn.git";
+        let mirror_project = crate::sources::mirror_path(&root, Some(source_url))
+            .expect("mirror path")
+            .to_string_lossy()
+            .into_owned();
+        let cas = spawn_host::CasMerkleStore::open(root.join(".cas")).expect("open cas");
+        let ledger = crate::sources::PostgresRefLedger::new(std::sync::Arc::clone(&store));
+
+        let mission_id = store
+            .mission_add(
+                "Remote D6 mission",
+                &serde_json::json!([source_url]),
+                "human",
+            )
+            .expect("mission add");
+        let task_id = store
+            .task_assign(
+                mission_id,
+                "ephemeral",
+                "agent_d6",
+                "two-name brief",
+                "default",
+            )
+            .expect("task assign");
+        let task_ref = spawn_host::workspace_rules::task_head_ref(task_id, "head");
+
+        let (mirror_base, mirror_head) =
+            publish_d6_main_and_task_head_pair(&cas, &ledger, &mirror_project, &task_ref, "mirror");
+        let (url_base, url_head) =
+            publish_d6_main_and_task_head_pair(&cas, &ledger, source_url, &task_ref, "url");
+        assert_ne!(mirror_base, url_base);
+        assert_ne!(mirror_head, url_head);
+
+        let root_str = root.to_string_lossy().into_owned();
+        let mut ctx = super::load_task_repo(&store, task_id, Some(&root_str)).expect("load d6 ctx");
+        assert_eq!(
+            ctx.repo,
+            super::TaskRepo::D6Ledger {
+                project: mirror_project
+            }
+        );
+
+        let resolved = super::resolve_task_refs(&store, &ctx).expect("resolve mirror refs");
+        assert_eq!(
+            (resolved.base_sha.as_str(), resolved.head_sha.as_str()),
+            (mirror_base.as_str(), mirror_head.as_str())
+        );
+
+        ctx.repo = super::TaskRepo::D6Ledger {
+            project: source_url.to_string(),
+        };
+        let resolved_url = super::resolve_task_refs(&store, &ctx).expect("resolve url refs");
+        assert_eq!(
+            (
+                resolved_url.base_sha.as_str(),
+                resolved_url.head_sha.as_str()
+            ),
+            (url_base.as_str(), url_head.as_str())
+        );
+
+        ctx.repo = super::TaskRepo::D6Ledger {
+            project: "missing-ledger-project".to_string(),
+        };
+        assert!(super::resolve_task_refs(&store, &ctx).is_err());
     }
 
     #[test]

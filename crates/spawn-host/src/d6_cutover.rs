@@ -104,8 +104,6 @@ impl CutoverPhase {
 pub struct CutoverEvent {
     /// Resulting phase after transition.
     pub phase: CutoverPhase,
-    /// Project storage mode active at transition time.
-    pub storage_mode: ProjectStorageMode,
     /// Human-readable audit summary.
     pub detail: String,
 }
@@ -477,7 +475,6 @@ impl ProjectCutover {
     fn push_event(&mut self, detail: impl Into<String>) {
         self.events.push(CutoverEvent {
             phase: self.phase,
-            storage_mode: self.storage_mode(),
             detail: detail.into(),
         });
     }

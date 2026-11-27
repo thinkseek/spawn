@@ -813,3 +813,78 @@ fn pg_storage_cutover_v1_state_migration_and_contradiction_rejection() {
         );
     }
 }
+
+#[test]
+fn pg_storage_cutover_status_rejects_duplicate_json_keys() {
+    let schema = TestSchema::new("storage_cutover_dup_keys");
+    let _pg = schema.store();
+    let db_url = schema_url(&schema);
+
+    let scratch = Scratch::new("cutover-dup-keys");
+    let (ws, _work, bare) = init_project_repo(&scratch);
+    let cas_dir = ws.join(".d6/cas");
+    fs::create_dir_all(&cas_dir).expect("mkdir cas");
+    fs::write(cas_dir.join(CAS_MARKER), "1\n").expect("write cas marker");
+
+    let bare_json = serde_json::to_string(
+        &fs::canonicalize(&bare)
+            .expect("canonical bare")
+            .to_string_lossy(),
+    )
+    .expect("quote bare");
+    let bare_s = fs::canonicalize(&bare)
+        .expect("canonical bare")
+        .to_string_lossy()
+        .into_owned();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let state_path = cas_dir.join(".cutover-state.json");
+
+    let dup_payloads = [
+        format!(
+            r#"{{"schema_version":2,"projects":{{{bare_json}:{{"project":{bare_json},"bare_repo":{bare_json},"phase":"resumed","phase":"rolled_back","reason":null,"updated_at_ms":1}}}}}}"#
+        ),
+        format!(
+            r#"{{"schema_version":2,"projects":{{{bare_json}:{{"project":{bare_json},"bare_repo":{bare_json},"phase":"rolled_back","phase":"resumed","reason":null,"updated_at_ms":1}}}}}}"#
+        ),
+        format!(
+            r#"{{"schema_version":1,"projects":{{{bare_json}:{{"project":{bare_json},"bare_repo":{bare_json},"phase":"backfill_imported","storage_mode":"git","dispatch_paused":true,"dispatch_paused":false,"reason":null,"updated_at_ms":1}}}}}}"#
+        ),
+        format!(
+            r#"{{"schema_version":1,"projects":{{{bare_json}:{{"project":{bare_json},"bare_repo":{bare_json},"phase":"resumed","storage_mode":"git","storage_mode":"d6_cas","dispatch_paused":false,"reason":null,"updated_at_ms":1}}}}}}"#
+        ),
+        r#"{"schema_version":1,"schema_version":2,"projects":{}}"#.to_string(),
+        format!(
+            r#"{{"schema_version":2,"projects":{{{bare_json}:{{"project":{bare_json},"bare_repo":{bare_json},"phase":"resumed","reason":null,"updated_at_ms":1}},{bare_json}:{{"project":{bare_json},"bare_repo":{bare_json},"phase":"rolled_back","reason":null,"updated_at_ms":2}}}}}}"#
+        ),
+    ];
+
+    for raw in &dup_payloads {
+        fs::write(&state_path, raw.as_bytes()).expect("write dup state");
+        let out = run_cli(
+            &[
+                "storage", "cutover", "--status", "--repo", &bare_s, "--root", &ws_s, "--json",
+            ],
+            Some(&db_url),
+        );
+        assert!(!out.status.success(), "duplicate key state accepted: {raw}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("duplicate"),
+            "stderr missing duplicate: {stderr}"
+        );
+    }
+
+    let v1_dispatch_paused = format!(
+        r#"{{"schema_version":1,"projects":{{{bare_json}:{{"project":{bare_json},"bare_repo":{bare_json},"phase":"dispatch_paused","storage_mode":"git","dispatch_paused":true,"reason":null,"updated_at_ms":1}}}}}}"#
+    );
+    fs::write(&state_path, v1_dispatch_paused.as_bytes()).expect("write v1 dispatch_paused");
+    let out = run_cli(
+        &[
+            "storage", "cutover", "--status", "--repo", &bare_s, "--root", &ws_s, "--json",
+        ],
+        Some(&db_url),
+    );
+    assert!(!out.status.success(), "v1 dispatch_paused accepted");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("schema v2 only"), "{stderr}");
+}
