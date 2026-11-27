@@ -106,6 +106,7 @@ const ENGINE_HOMES: &[&str] = &[".gemini", ".config/antigravity", ".codex", ".he
 /// `.config/<x>` one also below `$XDG_CONFIG_HOME` when that is set).
 const HOME_DIRECTORIES: &[&str] = &[
     ".claude",
+    ".local/state/spawn/claude-config",
     ".gemini",
     ".config/antigravity",
     ".codex",
@@ -403,9 +404,11 @@ impl ViewConfig {
             }
         }
         if let Some(state) = &self.xdg_state_home {
-            let target = state.join("herdr-core");
-            if !targets.contains(&target) {
-                targets.push(target);
+            for rel in ["herdr-core", "spawn/claude-config"] {
+                let target = state.join(rel);
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
             }
         }
         for dir in HOME_DIRECTORIES {
@@ -416,6 +419,24 @@ impl ViewConfig {
             }
         }
         targets
+    }
+
+    /// Directories holding Claude Code configuration/credentials below
+    /// `$HOME` or `$XDG_STATE_HOME` (`~/.claude`, `~/.local/state/spawn/claude-config`,
+    /// `$XDG_STATE_HOME/spawn/claude-config`). Masked from non-Claude engines;
+    /// kept accessible or overlaid only for `claude`.
+    fn claude_config_targets(&self) -> Vec<PathBuf> {
+        let mut paths = vec![
+            self.home.join(".claude"),
+            self.home.join(".local/state/spawn/claude-config"),
+        ];
+        if let Some(state) = &self.xdg_state_home {
+            let target = state.join("spawn/claude-config");
+            if !paths.contains(&target) {
+                paths.push(target);
+            }
+        }
+        paths
     }
 
     /// `dir` below the home, and below `$XDG_CONFIG_HOME` too for a
@@ -722,7 +743,7 @@ impl BwrapView {
 
     fn canonical_claude_homes(&self) -> Vec<PathBuf> {
         self.config
-            .below_home(".claude")
+            .claude_config_targets()
             .into_iter()
             .filter_map(|dir| {
                 std::fs::canonicalize(&dir)
@@ -751,7 +772,9 @@ impl BwrapView {
     fn forbidden_home_targets_for(&self, engine: &str) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for dir in HOME_DIRECTORIES.iter().copied().filter(|dir| {
-            !(ENGINE_HOMES.contains(dir) || (engine == "claude" && *dir == ".claude"))
+            !(ENGINE_HOMES.contains(dir)
+                || (engine == "claude"
+                    && (*dir == ".claude" || *dir == ".local/state/spawn/claude-config")))
         }) {
             paths.extend(self.config.below_home(dir));
         }
@@ -760,6 +783,9 @@ impl BwrapView {
         paths.push(self.config.home.join(".local/state/herdr-core"));
         if let Some(state) = &self.config.xdg_state_home {
             paths.push(state.join("herdr-core"));
+            if engine != "claude" {
+                paths.push(state.join("spawn/claude-config"));
+            }
         }
         paths.extend(HOME_FILES.iter().map(|file| self.config.home.join(file)));
         paths.extend(self.config.loop_dirs.iter().cloned());
@@ -3156,6 +3182,95 @@ mod tests {
                 .any(|w| w == ["--ro-bind", canon_real.as_str(), expected_link.as_str()]),
             "{:?}",
             planned.words
+        );
+    }
+
+    #[test]
+    fn managed_claude_config_dirs_are_masked_from_agy_and_allowed_for_claude() {
+        let scratch = crate::Scratch::new("spawn-view-managed-claude");
+        let (mut view, workspace, _) = view_in(&scratch);
+        let default_managed = view.config.home.join(".local/state/spawn/claude-config");
+        let xdg_state = scratch.join("xdg-state");
+        let xdg_managed = xdg_state.join("spawn/claude-config");
+        std::fs::create_dir_all(&default_managed).expect("mkdir default managed");
+        std::fs::create_dir_all(&xdg_managed).expect("mkdir xdg managed");
+        view.config.xdg_state_home = Some(xdg_state);
+
+        let agy_home = view.config.home.join(".gemini/antigravity-cli");
+        let agy_plan = view
+            .plan(&ViewedLaunch {
+                engine: "agy",
+                workspace: &workspace.display().to_string(),
+                engine_home: &agy_home.display().to_string(),
+                worker_id: Some("agy-w1"),
+                exit_file: None,
+            })
+            .expect("agy plan");
+        let canon_default = std::fs::canonicalize(&default_managed).expect("canon default");
+        let canon_xdg = std::fs::canonicalize(&xdg_managed).expect("canon xdg");
+        assert!(
+            agy_plan
+                .masks
+                .contains(&super::Mask::Directory(canon_default.clone())),
+            "{:?}",
+            agy_plan.masks
+        );
+        assert!(
+            agy_plan
+                .masks
+                .contains(&super::Mask::Directory(canon_xdg.clone())),
+            "{:?}",
+            agy_plan.masks
+        );
+
+        for target in [&default_managed, &xdg_managed] {
+            let err = view
+                .plan(&ViewedLaunch {
+                    engine: "agy",
+                    workspace: &workspace.display().to_string(),
+                    engine_home: &target.display().to_string(),
+                    worker_id: None,
+                    exit_file: None,
+                })
+                .expect_err("agy must refuse managed claude dir");
+            assert!(err.contains("overlaps"), "{err}");
+
+            let claude_plan = view
+                .plan(&ViewedLaunch {
+                    engine: "claude",
+                    workspace: &workspace.display().to_string(),
+                    engine_home: &target.display().to_string(),
+                    worker_id: Some("claude-w1"),
+                    exit_file: None,
+                })
+                .expect("claude plan");
+            let canon_target = std::fs::canonicalize(target).expect("canon target");
+            assert!(
+                !claude_plan
+                    .masks
+                    .contains(&super::Mask::Directory(canon_target)),
+                "{:?}",
+                claude_plan.masks
+            );
+        }
+
+        // Also valid for claude when SPAWN_CLAUDE_SANDBOX=1 (claude_data_dir set).
+        view.config.claude_data_dir = Some(scratch.join("claude-data"));
+        let sandboxed_local = view
+            .plan(&ViewedLaunch {
+                engine: "claude",
+                workspace: &workspace.display().to_string(),
+                engine_home: &default_managed.display().to_string(),
+                worker_id: Some("claude-w2"),
+                exit_file: None,
+            })
+            .expect("sandboxed claude plan for default managed dir");
+        assert!(
+            sandboxed_local
+                .masks
+                .contains(&super::Mask::Directory(canon_default)),
+            "{:?}",
+            sandboxed_local.masks
         );
     }
 }

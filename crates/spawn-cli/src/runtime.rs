@@ -1,8 +1,11 @@
 //! Assembly of the Bridge and the Observer over one store and the host
 //! adapters (git workspaces, Herdr terminals, judge).
 
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use spawn_core::bridge::{Bridge, BridgeConfig, LaunchEnvironment, ModelRelay};
 use spawn_core::observe::{Observer, StateJudge};
@@ -276,9 +279,33 @@ fn bridge_config_for(herdr_backend: bool, workspace_root: &Path) -> Result<Bridg
     // Opt-in shared host toolchain build caches (issue #105): deterministic
     // non-secret subdirectories under the cache root with caller overrides preserved.
     config.environment.extend(shared_cache.env);
-    // Engines on a Claude Code directory of their own, when the loop names
-    // one (SPAWN_CLAUDE_CONFIG_DIR, issue #79); else the user's own.
-    config.environment.extend(claude_config_env(env_value)?);
+    // Isolate Claude Code configuration by default against host
+    // `~/.claude/settings.json` drift (issue #79): run engines on the default
+    // fleet-owned directory (bootstrapping auth-only keys noclobber from host
+    // `~/.claude` once), unless an explicit path, ambient non-home
+    // `CLAUDE_CONFIG_DIR`, or `SPAWN_CLAUDE_CONFIG_DIR=inherit|host` is set.
+    match resolve_claude_config(env_value)? {
+        ClaudeConfigResolution::Explicit(dir) => {
+            config
+                .environment
+                .push(("CLAUDE_CONFIG_DIR".to_string(), dir));
+        }
+        ClaudeConfigResolution::DefaultManaged(dir) => {
+            let host_claude = env_value("HOME")
+                .as_deref()
+                .and_then(clean_abs_dir)
+                .map(|home| PathBuf::from(home.trim_end_matches('/')).join(".claude"));
+            bootstrap_managed_claude_config(
+                Path::new(&dir),
+                host_claude.as_deref(),
+                config.model_relay.is_some(),
+            )?;
+            config
+                .environment
+                .push(("CLAUDE_CONFIG_DIR".to_string(), dir));
+        }
+        ClaudeConfigResolution::InheritedEnv(_) | ClaudeConfigResolution::InheritHost => {}
+    }
     // A worker's pane gets no database login: the Bridge reads what the
     // engine does from its files and screen. The supervisor's pane gets its
     // own login: it reads the fleet and commands workers through the
@@ -878,45 +905,278 @@ fn resolve_model_relay(lookup: impl Fn(&str) -> Option<String>) -> Option<ModelR
     })
 }
 
-/// The Claude Code directory engines run with instead of the user's own
-/// `~/.claude` (issue #79): `SPAWN_CLAUDE_CONFIG_DIR`, opt-in. Set, the
-/// engines get it as `CLAUDE_CONFIG_DIR`, so their settings, login and
-/// transcripts are that directory's: its `settings.json` must give them
-/// the gateway's token, as `~/.claude/settings.json` does otherwise (the
-/// relay holds none). Unset or empty, nothing changes: the engines inherit
-/// the user's own settings, token included.
+static CLAUDE_BOOTSTRAP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaudeConfigResolution {
+    /// Explicit `SPAWN_CLAUDE_CONFIG_DIR=/abs/path`.
+    Explicit(String),
+    /// Default fleet-owned managed config dir outside workspaces
+    /// (`$SPAWN_CLAUDE_DATA_DIR/config`, else `$XDG_STATE_HOME/spawn/claude-config`,
+    /// else `$HOME/.local/state/spawn/claude-config`).
+    DefaultManaged(String),
+    /// Ambient non-home `CLAUDE_CONFIG_DIR` passed by an external harness or
+    /// caller (preserved without override or bootstrap).
+    InheritedEnv(String),
+    /// Explicit opt-out (`SPAWN_CLAUDE_CONFIG_DIR=inherit|host`) or no resolvable
+    /// home directory: uses `~/.claude`, `CLAUDE_CONFIG_DIR` not overridden.
+    InheritHost,
+}
+
+fn clean_abs_dir(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let clean = trimmed.trim_end_matches('/');
+    Some(if clean.is_empty() {
+        "/".to_string()
+    } else {
+        clean.to_string()
+    })
+}
+
+/// Resolve the Claude Code configuration directory (issue #79):
 ///
-/// An absolute path only: a relative one (or `~/…`, which no shell expands
-/// here) would name another directory in each engine's workspace, and the
-/// engines' deny rules name it by its path. Refused, `spawn loop` does not
-/// start.
+/// 1. `SPAWN_CLAUDE_CONFIG_DIR=inherit|host` (case-insensitive) -> [`ClaudeConfigResolution::InheritHost`]
+/// 2. `SPAWN_CLAUDE_CONFIG_DIR=/abs/path` -> [`ClaudeConfigResolution::Explicit`]
+///    (relative/`~` paths fail closed)
+/// 3. Unset/empty `SPAWN_CLAUDE_CONFIG_DIR`:
+///    - if ambient `CLAUDE_CONFIG_DIR` is a non-root absolute path distinct from
+///      `$HOME/.claude` -> [`ClaudeConfigResolution::InheritedEnv`]
+///    - else `$SPAWN_CLAUDE_DATA_DIR/config` -> `$XDG_STATE_HOME/spawn/claude-config`
+///      -> `$HOME/.local/state/spawn/claude-config` ([`ClaudeConfigResolution::DefaultManaged`])
+///    - else [`ClaudeConfigResolution::InheritHost`] when no base directory env is set.
+pub(crate) fn resolve_claude_config(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<ClaudeConfigResolution, String> {
+    if let Some(raw) = lookup("SPAWN_CLAUDE_CONFIG_DIR")
+        && !raw.trim().is_empty()
+    {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("inherit") || trimmed.eq_ignore_ascii_case("host") {
+            return Ok(ClaudeConfigResolution::InheritHost);
+        }
+        return clean_abs_dir(trimmed)
+            .map(ClaudeConfigResolution::Explicit)
+            .ok_or_else(|| {
+                format!("SPAWN_CLAUDE_CONFIG_DIR must be an absolute path (or inherit/host), not {raw:?}")
+            });
+    }
+
+    let clean_home = lookup("HOME").as_deref().and_then(clean_abs_dir);
+    if let Some(ambient) = lookup("CLAUDE_CONFIG_DIR")
+        .as_deref()
+        .and_then(clean_abs_dir)
+    {
+        let host_dot_claude = clean_home
+            .as_deref()
+            .is_some_and(|home| ambient == format!("{}/.claude", home.trim_end_matches('/')));
+        if !host_dot_claude && ambient != "/" {
+            return Ok(ClaudeConfigResolution::InheritedEnv(ambient));
+        }
+    }
+
+    if let Some(data_dir) = lookup("SPAWN_CLAUDE_DATA_DIR")
+        .as_deref()
+        .and_then(clean_abs_dir)
+        .filter(|dir| dir != "/")
+    {
+        return Ok(ClaudeConfigResolution::DefaultManaged(format!(
+            "{data_dir}/config"
+        )));
+    }
+    if let Some(state_home) = lookup("XDG_STATE_HOME")
+        .as_deref()
+        .and_then(clean_abs_dir)
+        .filter(|dir| dir != "/")
+    {
+        return Ok(ClaudeConfigResolution::DefaultManaged(format!(
+            "{state_home}/spawn/claude-config"
+        )));
+    }
+    if let Some(home) = clean_home {
+        return Ok(ClaudeConfigResolution::DefaultManaged(format!(
+            "{}/.local/state/spawn/claude-config",
+            home.trim_end_matches('/')
+        )));
+    }
+
+    Ok(ClaudeConfigResolution::InheritHost)
+}
+
+/// The Claude Code directory engines run with instead of the user's own
+/// `~/.claude` (issue #79): explicit `SPAWN_CLAUDE_CONFIG_DIR`, ambient
+/// non-home `CLAUDE_CONFIG_DIR`, or the default fleet-owned isolated directory;
+/// `None` only when explicitly inherited (`inherit`/`host`) or unresolvable.
 pub(crate) fn claude_config_dir(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<String>, String> {
-    let Some(dir) = lookup("SPAWN_CLAUDE_CONFIG_DIR").filter(|dir| !dir.trim().is_empty()) else {
-        return Ok(None);
-    };
-    if !dir.starts_with('/') {
-        return Err(format!(
-            "SPAWN_CLAUDE_CONFIG_DIR must be an absolute path, not {dir:?}"
-        ));
-    }
-    let trimmed = dir.trim_end_matches('/');
-    Ok(Some(if trimmed.is_empty() {
-        dir
-    } else {
-        trimmed.to_string()
-    }))
+    Ok(match resolve_claude_config(lookup)? {
+        ClaudeConfigResolution::Explicit(dir)
+        | ClaudeConfigResolution::DefaultManaged(dir)
+        | ClaudeConfigResolution::InheritedEnv(dir) => Some(dir),
+        ClaudeConfigResolution::InheritHost => None,
+    })
 }
 
-/// The engine environment [`claude_config_dir`] adds, or why it refuses.
+/// The engine environment [`resolve_claude_config`] injects as `CLAUDE_CONFIG_DIR`.
+#[cfg(test)]
 fn claude_config_env(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Vec<(String, String)>, String> {
-    Ok(claude_config_dir(lookup)?
-        .map(|dir| ("CLAUDE_CONFIG_DIR".to_string(), dir))
-        .into_iter()
-        .collect())
+    Ok(match resolve_claude_config(lookup)? {
+        ClaudeConfigResolution::Explicit(dir) | ClaudeConfigResolution::DefaultManaged(dir) => {
+            vec![("CLAUDE_CONFIG_DIR".to_string(), dir)]
+        }
+        ClaudeConfigResolution::InheritedEnv(_) | ClaudeConfigResolution::InheritHost => Vec::new(),
+    })
+}
+
+fn sanitize_claude_settings_json(
+    src: &serde_json::Value,
+    relay_configured: bool,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    if let Some(helper) = src.get("apiKeyHelper") {
+        out.insert("apiKeyHelper".to_string(), helper.clone());
+    }
+    if let Some(src_env) = src.get("env").and_then(serde_json::Value::as_object) {
+        let mut env = serde_json::Map::new();
+        for key in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+            if let Some(val) = src_env.get(key) {
+                env.insert(key.to_string(), val.clone());
+            }
+        }
+        if !relay_configured && let Some(base_url) = src_env.get("ANTHROPIC_BASE_URL") {
+            env.insert("ANTHROPIC_BASE_URL".to_string(), base_url.clone());
+        }
+        if !env.is_empty() {
+            out.insert("env".to_string(), serde_json::Value::Object(env));
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+fn ensure_dir_0700(dir: &Path, label: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(format!(
+                    "{label} {} exists and is not a real directory",
+                    dir.display()
+                ));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(|error| format!("create {label} {}: {error}", dir.display()))?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("chmod {label} {}: {error}", dir.display()))?;
+            Ok(())
+        }
+        Err(error) => Err(format!("inspect {label} {}: {error}", dir.display())),
+    }
+}
+
+fn write_file_atomic_noclobber_0600(dst: &Path, bytes: &[u8]) -> Result<(), String> {
+    match std::fs::symlink_metadata(dst) {
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect {}: {error}", dst.display())),
+    }
+    let parent = dst
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", dst.display()))?;
+    let (tmp_path, mut tmp_file) = loop {
+        let seq = CLAUDE_BOOTSTRAP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".bootstrap-{}-{seq}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "create temporary bootstrap file {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    };
+    let write_res = tmp_file.write_all(bytes);
+    drop(tmp_file);
+    if let Err(error) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("write {}: {error}", dst.display()));
+    }
+    if let Err(error) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+    {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("chmod {}: {error}", dst.display()));
+    }
+    let link_res = std::fs::hard_link(&tmp_path, dst);
+    let _ = std::fs::remove_file(&tmp_path);
+    match link_res {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(format!("publish {}: {error}", dst.display())),
+    }
+}
+
+/// One-time noclobber bootstrap for the default managed `CLAUDE_CONFIG_DIR`:
+/// creates `managed_dir` (`0700`), extracts only authentication keys from host
+/// `settings.json` (never model slots or plugins, and never `ANTHROPIC_BASE_URL`
+/// when `relay_configured` is true), and noclobber-copies `.credentials.json`
+/// (`0600`). Never logs or prints file contents or auth values.
+fn bootstrap_managed_claude_config(
+    managed_dir: &Path,
+    host_claude_dir: Option<&Path>,
+    relay_configured: bool,
+) -> Result<(), String> {
+    ensure_dir_0700(managed_dir, "managed Claude config directory")?;
+    let Some(host_dir) = host_claude_dir else {
+        return Ok(());
+    };
+
+    let dst_settings = managed_dir.join("settings.json");
+    if std::fs::symlink_metadata(&dst_settings)
+        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+    {
+        let src_settings = host_dir.join("settings.json");
+        if std::fs::metadata(&src_settings).is_ok_and(|meta| meta.is_file()) {
+            let raw = std::fs::read_to_string(&src_settings)
+                .map_err(|error| format!("read {}: {error}", src_settings.display()))?;
+            let parsed: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|_| format!("parse {} as JSON failed", src_settings.display()))?;
+            let sanitized = sanitize_claude_settings_json(&parsed, relay_configured);
+            let mut bytes = serde_json::to_vec_pretty(&sanitized)
+                .map_err(|error| format!("encode {}: {error}", dst_settings.display()))?;
+            bytes.push(b'\n');
+            write_file_atomic_noclobber_0600(&dst_settings, &bytes)?;
+        }
+    }
+
+    let dst_creds = managed_dir.join(".credentials.json");
+    if std::fs::symlink_metadata(&dst_creds)
+        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+    {
+        let src_creds = host_dir.join(".credentials.json");
+        if std::fs::metadata(&src_creds).is_ok_and(|meta| meta.is_file()) {
+            let bytes = std::fs::read(&src_creds)
+                .map_err(|error| format!("read {}: {error}", src_creds.display()))?;
+            write_file_atomic_noclobber_0600(&dst_creds, &bytes)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// The engines this host runs besides Claude Code, and where each lives:
@@ -1135,25 +1395,21 @@ pub(crate) fn claude_projects() -> String {
 }
 
 /// [`claude_projects`] over the environment `lookup` reads:
-/// `SPAWN_CLAUDE_PROJECTS` always wins; else the engines' own directory's
-/// (`$SPAWN_CLAUDE_CONFIG_DIR/projects`), else
-/// `$CLAUDE_CONFIG_DIR/projects`, else `$HOME/.claude/projects`.
+/// `SPAWN_CLAUDE_PROJECTS` always wins; else the resolved directory's
+/// `projects` subdirectory (`$SPAWN_CLAUDE_CONFIG_DIR`, ambient
+/// `$CLAUDE_CONFIG_DIR`, or the default managed isolated directory), else
+/// `$HOME/.claude/projects` when `inherit`/`host` is set.
 fn resolve_claude_projects(lookup: impl Fn(&str) -> Option<String>) -> String {
     if let Some(projects) = lookup("SPAWN_CLAUDE_PROJECTS") {
         return projects;
     }
-    // An invalid one stops `spawn loop` (`bridge_config`); a reader here
-    // goes on as without it.
+    // An invalid SPAWN_CLAUDE_CONFIG_DIR stops `spawn loop` (`bridge_config_for`);
+    // a reader here falls back to `~/.claude/projects`.
     if let Ok(Some(dir)) = claude_config_dir(&lookup) {
         return format!("{}/projects", dir.trim_end_matches('/'));
     }
-    lookup("CLAUDE_CONFIG_DIR").map_or_else(
-        || {
-            let home = lookup("HOME").unwrap_or_else(|| "/root".to_string());
-            format!("{home}/.claude/projects")
-        },
-        |dir| format!("{dir}/projects"),
-    )
+    let home = lookup("HOME").unwrap_or_else(|| "/root".to_string());
+    format!("{}/.claude/projects", home.trim_end_matches('/'))
 }
 
 /// Resolve the configured judge endpoint URL from `--judge-url` or
@@ -1332,10 +1588,18 @@ mod tests {
     }
 
     #[test]
-    fn on_the_host_the_transcripts_are_under_the_hosts_home() {
+    fn on_the_host_the_transcripts_follow_default_isolation_or_explicit_inherit() {
         let host = environment(&[("HOME", "/home/owner")]);
         assert_eq!(
             resolve_claude_projects(&host),
+            "/home/owner/.local/state/spawn/claude-config/projects"
+        );
+        let inherit = environment(&[
+            ("HOME", "/home/owner"),
+            ("SPAWN_CLAUDE_CONFIG_DIR", "inherit"),
+        ]);
+        assert_eq!(
+            resolve_claude_projects(&inherit),
             "/home/owner/.claude/projects"
         );
         let configured = environment(&[("HOME", "/home/owner"), ("CLAUDE_CONFIG_DIR", "/cc")]);
@@ -1397,18 +1661,31 @@ mod tests {
             ("SPAWN_CLAUDE_CONFIG_DIR", ""),
         ]);
         assert_eq!(resolve_claude_projects(&empty), "/cc/projects");
-        let home = environment(&[("HOME", "/home/owner"), ("SPAWN_CLAUDE_CONFIG_DIR", "  ")]);
+        let default_isolated =
+            environment(&[("HOME", "/home/owner"), ("SPAWN_CLAUDE_CONFIG_DIR", "  ")]);
         assert_eq!(
-            resolve_claude_projects(&home),
+            resolve_claude_projects(&default_isolated),
+            "/home/owner/.local/state/spawn/claude-config/projects"
+        );
+        let inherit_overrides_ambient = environment(&[
+            ("HOME", "/home/owner"),
+            ("CLAUDE_CONFIG_DIR", "/cc"),
+            ("SPAWN_CLAUDE_CONFIG_DIR", "HOST"),
+        ]);
+        assert_eq!(
+            resolve_claude_projects(&inherit_overrides_ambient),
             "/home/owner/.claude/projects"
         );
     }
 
-    /// Opt-in: only a named directory reaches the engines, as
-    /// `CLAUDE_CONFIG_DIR`. Unset, the engines get nothing that would move
-    /// them off the user's own settings, whose token they inherit.
+    /// Issue #79: engines are isolated into a fleet-owned `CLAUDE_CONFIG_DIR`
+    /// by default (`SPAWN_CLAUDE_CONFIG_DIR` -> ambient non-home
+    /// `CLAUDE_CONFIG_DIR` preserved -> `$SPAWN_CLAUDE_DATA_DIR/config` ->
+    /// `$XDG_STATE_HOME/spawn/claude-config` ->
+    /// `$HOME/.local/state/spawn/claude-config`).
+    /// `SPAWN_CLAUDE_CONFIG_DIR=inherit|host` opts out to host `~/.claude`.
     #[test]
-    fn engines_get_a_claude_directory_only_when_the_loop_names_one() {
+    fn engines_get_default_isolated_claude_directory_with_inherit_opt_out() {
         assert_eq!(
             claude_config_env(environment(&[(
                 "SPAWN_CLAUDE_CONFIG_DIR",
@@ -1419,16 +1696,198 @@ mod tests {
                 "/data/fleet-claude".to_string()
             )])
         );
-        assert_eq!(claude_config_env(environment(&[])), Ok(Vec::new()));
         assert_eq!(
-            claude_config_env(environment(&[("SPAWN_CLAUDE_CONFIG_DIR", "")])),
-            Ok(Vec::new())
+            claude_config_env(environment(&[("HOME", "/home/owner")])),
+            Ok(vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/home/owner/.local/state/spawn/claude-config".to_string()
+            )])
         );
-        // Claude Code's own variable, set for the loop, is not handed on.
+        assert_eq!(
+            claude_config_env(environment(&[
+                ("HOME", "/home/owner"),
+                ("XDG_STATE_HOME", "/var/lib/state/"),
+                ("SPAWN_CLAUDE_CONFIG_DIR", ""),
+            ])),
+            Ok(vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/var/lib/state/spawn/claude-config".to_string()
+            )])
+        );
+        assert_eq!(
+            claude_config_env(environment(&[
+                ("HOME", "/home/owner"),
+                ("XDG_STATE_HOME", "/var/lib/state"),
+                ("SPAWN_CLAUDE_DATA_DIR", "/srv/claude-data/"),
+            ])),
+            Ok(vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/srv/claude-data/config".to_string()
+            )])
+        );
+        // Ambient CLAUDE_CONFIG_DIR pointing at host ~/.claude does not bypass default isolation.
+        assert_eq!(
+            claude_config_env(environment(&[
+                ("HOME", "/home/owner"),
+                ("CLAUDE_CONFIG_DIR", "/home/owner/.claude/"),
+            ])),
+            Ok(vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/home/owner/.local/state/spawn/claude-config".to_string()
+            )])
+        );
+        // Ambient non-home CLAUDE_CONFIG_DIR (e.g. external test harness) is preserved.
         assert_eq!(
             claude_config_env(environment(&[("CLAUDE_CONFIG_DIR", "/cc")])),
             Ok(Vec::new())
         );
+        // Explicit opt-out (`inherit` or `host`, case-insensitive) leaves CLAUDE_CONFIG_DIR unset.
+        for opt_out in ["inherit", "INHERIT", "host", " Host "] {
+            assert_eq!(
+                claude_config_env(environment(&[
+                    ("HOME", "/home/owner"),
+                    ("SPAWN_CLAUDE_CONFIG_DIR", opt_out),
+                ])),
+                Ok(Vec::new()),
+                "{opt_out}"
+            );
+        }
+        assert_eq!(claude_config_env(environment(&[])), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn bootstrap_managed_claude_config_sanitizes_auth_once_and_never_clobbers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("spawn-b1-boot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let host_claude = base.join("host/.claude");
+        std::fs::create_dir_all(&host_claude).expect("host dir");
+        std::fs::write(
+            host_claude.join("settings.json"),
+            r#"{
+  "model": "kimi-k3-1-pro",
+  "enabledPlugins": { "foo": true },
+  "apiKeyHelper": "/usr/local/bin/helper",
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "tok-synth-1",
+    "ANTHROPIC_API_KEY": "key-synth-2",
+    "ANTHROPIC_BASE_URL": "https://host-custom.example/api",
+    "ANTHROPIC_MODEL": "kimi-k3-1-pro",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "kimi-k3-1-pro",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "kimi-k3-1-pro",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "kimi-k3-1-pro",
+    "ANTHROPIC_SMALL_FAST_MODEL": "kimi-k3-1-pro",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "kimi-k3-1-pro",
+    "UNRELATED_ENV": "drop-me"
+  }
+}"#,
+        )
+        .expect("write host settings");
+        std::fs::write(
+            host_claude.join(".credentials.json"),
+            r#"{"oauth":"cred-1"}"#,
+        )
+        .expect("write host creds");
+
+        // Case 1: relay configured -> drops ANTHROPIC_BASE_URL, keeps auth keys only.
+        let managed_relay = base.join("managed-relay");
+        super::bootstrap_managed_claude_config(&managed_relay, Some(&host_claude), true)
+            .expect("bootstrap relay");
+        assert_eq!(
+            std::fs::metadata(&managed_relay)
+                .expect("dir meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let settings_meta =
+            std::fs::metadata(managed_relay.join("settings.json")).expect("settings meta");
+        assert_eq!(settings_meta.permissions().mode() & 0o777, 0o600);
+        let creds_meta =
+            std::fs::metadata(managed_relay.join(".credentials.json")).expect("creds meta");
+        assert_eq!(creds_meta.permissions().mode() & 0o777, 0o600);
+
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(managed_relay.join("settings.json")).expect("read managed"),
+        )
+        .expect("parse managed");
+        assert!(parsed.get("model").is_none(), "{parsed}");
+        assert!(parsed.get("enabledPlugins").is_none(), "{parsed}");
+        assert_eq!(parsed["apiKeyHelper"], "/usr/local/bin/helper");
+        let env_obj = parsed["env"].as_object().expect("env object");
+        assert_eq!(env_obj["ANTHROPIC_AUTH_TOKEN"], "tok-synth-1");
+        assert_eq!(env_obj["ANTHROPIC_API_KEY"], "key-synth-2");
+        for forbidden in [
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+            "UNRELATED_ENV",
+        ] {
+            assert!(!env_obj.contains_key(forbidden), "{forbidden}: {parsed}");
+        }
+
+        // Noclobber: host drift must NOT overwrite existing managed settings or creds.
+        std::fs::write(
+            host_claude.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"CHANGED"}}"#,
+        )
+        .expect("mutate host settings");
+        std::fs::write(
+            host_claude.join(".credentials.json"),
+            r#"{"oauth":"CHANGED"}"#,
+        )
+        .expect("mutate host creds");
+        super::bootstrap_managed_claude_config(&managed_relay, Some(&host_claude), true)
+            .expect("second bootstrap noclobber");
+        let still_original: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(managed_relay.join("settings.json")).expect("re-read"),
+        )
+        .expect("re-parse");
+        assert_eq!(still_original["env"]["ANTHROPIC_AUTH_TOKEN"], "tok-synth-1");
+        assert_eq!(
+            std::fs::read_to_string(managed_relay.join(".credentials.json")).expect("creds"),
+            r#"{"oauth":"cred-1"}"#
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bootstrap_managed_claude_config_keeps_base_url_without_relay() {
+        let base = std::env::temp_dir().join(format!("spawn-b1-direct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let host_claude = base.join("host/.claude");
+        std::fs::create_dir_all(&host_claude).expect("host dir");
+        let managed_direct = base.join("managed-direct");
+        std::fs::write(
+            host_claude.join("settings.json"),
+            r#"{"model":"drift","env":{"ANTHROPIC_AUTH_TOKEN":"tok-2","ANTHROPIC_BASE_URL":"https://host.example/anthropic","ANTHROPIC_MODEL":"drift"}}"#,
+        )
+        .expect("write host direct");
+        super::bootstrap_managed_claude_config(&managed_direct, Some(&host_claude), false)
+            .expect("bootstrap direct");
+        let direct_parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(managed_direct.join("settings.json")).expect("read direct"),
+        )
+        .expect("parse direct");
+        assert!(direct_parsed.get("model").is_none(), "{direct_parsed}");
+        assert_eq!(
+            direct_parsed["env"]["ANTHROPIC_BASE_URL"],
+            "https://host.example/anthropic"
+        );
+        assert_eq!(direct_parsed["env"]["ANTHROPIC_AUTH_TOKEN"], "tok-2");
+        assert!(
+            direct_parsed["env"].get("ANTHROPIC_MODEL").is_none(),
+            "{direct_parsed}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Issue #79's review (F4): only an absolute directory is taken; a

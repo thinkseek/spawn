@@ -1531,9 +1531,9 @@ fn the_newest_manifests_key_is_its_headers_and_its_file_must_be_here() {
     fs::remove_dir_all(&dir).expect("clean up");
 }
 
-/// Issue #79's review (F5): the `sessions` area backs up the engines'
-/// Claude Code directory, the account's `~/.claude` unless `spawn loop`
-/// runs them on an absolute one of their own.
+/// Issue #79: the `sessions` area backs up the engines' Claude Code
+/// directory — explicit `SPAWN_CLAUDE_CONFIG_DIR`, else the default
+/// managed isolated directory, else `~/.claude` on explicit `inherit`/`host`.
 #[test]
 fn the_sessions_area_is_the_engines_claude_directory() {
     let lookup = |pairs: &'static [(&'static str, &'static str)]| {
@@ -1552,13 +1552,19 @@ fn the_sessions_area_is_the_engines_claude_directory() {
         ),
         PathBuf::from("/data/fleet-claude")
     );
-    for unset in [
-        &[][..],
-        &[("SPAWN_CLAUDE_CONFIG_DIR", "")][..],
+    for default_isolated in [&[][..], &[("SPAWN_CLAUDE_CONFIG_DIR", "")][..]] {
+        assert_eq!(
+            super::claude_dir(lookup(default_isolated), home),
+            PathBuf::from("/home/o/.local/state/spawn/claude-config")
+        );
+    }
+    for host in [
+        &[("SPAWN_CLAUDE_CONFIG_DIR", "inherit")][..],
+        &[("SPAWN_CLAUDE_CONFIG_DIR", "host")][..],
         &[("SPAWN_CLAUDE_CONFIG_DIR", "rel")][..],
     ] {
         assert_eq!(
-            super::claude_dir(lookup(unset), home),
+            super::claude_dir(lookup(host), home),
             PathBuf::from("/home/o/.claude")
         );
     }

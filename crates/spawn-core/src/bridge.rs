@@ -8043,10 +8043,11 @@ pub fn claude_dir_rules(path: &str) -> Vec<String> {
 /// `CLAUDE_CODE_SUBAGENT_MODEL` inherits the main one), so no slot takes a
 /// value from the env of `~/.claude/settings.json` (issue #79: a host file
 /// rewritten to a raw provider model took the fleet down). The top-level
-/// `model` is pinned only with a main model to pin: without
-/// `SPAWN_DEFAULT_MODEL`, a `model` key in the user's own file still names
-/// the default profile's main model; `SPAWN_CLAUDE_CONFIG_DIR` keeps that
-/// file out entirely. Without a relay nothing about models is set: the
+/// `model` is always pinned as well (to `""` when `SPAWN_DEFAULT_MODEL` is
+/// unset), so a `model` key in host settings cannot name the default
+/// profile's main model; managed `CLAUDE_CONFIG_DIR` isolation also keeps
+/// `~/.claude/settings.json` out by default unless explicitly inherited.
+/// Without a relay nothing about models is set: the
 /// cheap profile needs one, and the Bridge refuses to
 /// start it without.
 ///
@@ -8123,9 +8124,7 @@ pub fn claude_settings_in(
         pin("ANTHROPIC_DEFAULT_HAIKU_MODEL", Some(&relay.small_model));
         pin("ANTHROPIC_SMALL_FAST_MODEL", Some(&relay.small_model));
         settings["env"] = serde_json::Value::Object(env);
-        if let Some(main) = main {
-            settings["model"] = json!(main);
-        }
+        settings["model"] = json!(main.unwrap_or_default());
     }
     settings.to_string()
 }

@@ -1588,6 +1588,118 @@ fn claude_bwrap_sandbox_isolates_home_and_shares_projects_with_host() {
     );
 }
 
+fn seed_managed_claude_dir(dir: &Path, token: &str, oauth: &str) {
+    std::fs::create_dir_all(dir).expect("mkdir managed");
+    std::fs::write(
+        dir.join("settings.json"),
+        format!("{{\"env\":{{\"ANTHROPIC_AUTH_TOKEN\":\"{token}\"}}}}\n"),
+    )
+    .expect("write settings");
+    std::fs::write(
+        dir.join(".credentials.json"),
+        format!("{{\"oauth\":\"{oauth}\"}}\n"),
+    )
+    .expect("write creds");
+}
+
+#[test]
+fn managed_claude_config_is_masked_from_agy() {
+    let fixture = Fixture::new();
+    let default_managed = fixture.home().join(".local/state/spawn/claude-config");
+    let xdg_state = fixture.scratch.join("xdg-state");
+    let xdg_managed = xdg_state.join("spawn/claude-config");
+    seed_managed_claude_dir(&default_managed, "managed-secret-1", "managed-cred-1");
+    seed_managed_claude_dir(&xdg_managed, "xdg-secret-2", "xdg-cred-2");
+
+    let mut config = fixture.config();
+    config.xdg_state_home = Some(xdg_state);
+    let Some(view) = view(config) else {
+        return;
+    };
+    let (workspace, _, agy_home) = fixture.launch();
+    let agy_words = view
+        .wrap(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &agy_home,
+            worker_id: Some("agy-w1"),
+            exit_file: None,
+        })
+        .expect("wrap agy");
+    for hidden in [
+        default_managed.join("settings.json"),
+        default_managed.join(".credentials.json"),
+        xdg_managed.join("settings.json"),
+        xdg_managed.join(".credentials.json"),
+    ] {
+        fails(&agy_words, &format!("cat '{}'", hidden.display()));
+    }
+}
+
+#[test]
+fn managed_claude_config_works_under_claude_sandbox() {
+    let fixture = Fixture::new();
+    let default_managed = fixture.home().join(".local/state/spawn/claude-config");
+    seed_managed_claude_dir(&default_managed, "managed-secret-1", "managed-cred-1");
+
+    let claude_data = fixture.scratch.join("claude-data");
+    let data_managed = claude_data.join("config");
+    seed_managed_claude_dir(&data_managed, "data-dir-secret-3", "data-dir-cred-3");
+
+    let mut config = fixture.config();
+    config.claude_data_dir = Some(claude_data);
+    let Some(view) = view(config) else {
+        return;
+    };
+    let (workspace, _, _) = fixture.launch();
+
+    for (idx, managed) in [(&data_managed), (&default_managed)].iter().enumerate() {
+        let worker_id = format!("claude-m{idx}");
+        let claude_words = view
+            .wrap(&ViewedLaunch {
+                engine: "claude",
+                workspace: &workspace,
+                engine_home: &managed.display().to_string(),
+                worker_id: Some(&worker_id),
+                exit_file: None,
+            })
+            .expect("wrap claude");
+        let settings = ok(
+            &claude_words,
+            &format!("cat '{}'", managed.join("settings.json").display()),
+        );
+        assert!(settings.contains("ANTHROPIC_AUTH_TOKEN"), "{settings}");
+        fails(
+            &claude_words,
+            &format!(
+                "sh -c 'echo x > \"{}\"'",
+                managed.join("settings.json").display()
+            ),
+        );
+        let creds = ok(
+            &claude_words,
+            &format!("cat '{}'", managed.join(".credentials.json").display()),
+        );
+        assert!(creds.contains("oauth"), "{creds}");
+        let transcript = managed.join("projects/sess-managed.jsonl");
+        assert_eq!(
+            ok(
+                &claude_words,
+                &format!(
+                    "printf 'ok\\n' > '{}' && cat '{}'",
+                    transcript.display(),
+                    transcript.display()
+                ),
+            ),
+            "ok"
+        );
+        assert_eq!(
+            std::fs::read_to_string(transcript).expect("persisted transcript"),
+            "ok\n"
+        );
+    }
+}
+
 #[test]
 fn container_view_fails_closed_on_bare_host_and_sets_isolated_tmpdir_in_container() {
     let fixture = Fixture::new();

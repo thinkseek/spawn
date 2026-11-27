@@ -134,7 +134,7 @@ The landing gate runs every check on one tree: `scripts/rsi/gate.sh $PWD/.git HE
 | [docs/architecture.md](./docs/architecture.md), [docs/design.md](./docs/design.md) | Architecture and design (Chinese) |
 | [docs/fleet-architecture.md](./docs/fleet-architecture.md) | Observation, control, missions, landing, nodes, alerts |
 | [docs/api.md](./docs/api.md) | Every HTTP route and its CLI twin |
-| [docs/config.md](./docs/config.md) | Engine configuration: model pinning and a dedicated Claude Code directory (`SPAWN_CLAUDE_CONFIG_DIR`) |
+| [docs/config.md](./docs/config.md) | Engine configuration: model pinning and default-isolated Claude Code directory (`SPAWN_CLAUDE_CONFIG_DIR`) |
 | [docs/storage.md](./docs/storage.md), [docs/d6-cas-v1.md](./docs/d6-cas-v1.md) | Storage, workspace backends, CAS format |
 | [docs/agent-grading.md](./docs/agent-grading.md) | Task grading and routing |
 | [docs/feature-map.md](./docs/feature-map.md) | Feature registry and dependency checks |
