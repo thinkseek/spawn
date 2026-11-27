@@ -57,6 +57,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use spawn_core::control::{ControlRecord, ControllersDrillOutcome, DrillOutcome};
 
 use super::Figure;
 
@@ -235,21 +236,63 @@ pub(super) fn parse_last(text: &str) -> Option<Last> {
 }
 
 /// A record type's reading from [`spawn_postgres::PostgresStore::drill_of_type`]'s
-/// `{at_ms, record, passed_at_ms}`: the newest record ok exactly when its
-/// `ok` is JSON true, its reason its `reason` when a string, else "".
+/// `{at_ms, record, passed_at_ms}`: the newest record's verdict. A restore
+/// drill's (`backup.drilled.*`) is its [`DrillOutcome`] ([`drill_verdict`]);
+/// any other type's (the database drill's `backup.verified`) is ok exactly
+/// when its `ok` is JSON true, its reason its `reason` when a string, else "".
 pub(super) fn record_reading(answer: Option<&Value>) -> Reading {
     let Some(answer) = answer else {
         return Reading::default();
     };
     let record = &answer["record"];
+    let (ok, reason) = drill_verdict(record).unwrap_or_else(|| {
+        (
+            record["ok"] == Value::Bool(true),
+            record["reason"].as_str().unwrap_or("").to_string(),
+        )
+    });
     Reading {
         passed_at_ms: answer["passed_at_ms"].as_i64(),
         last: Some(Last {
             at_ms: answer["at_ms"].as_i64(),
-            ok: record["ok"] == Value::Bool(true),
-            reason: record["reason"].as_str().unwrap_or("").to_string(),
+            ok,
+            reason,
         }),
     }
+}
+
+/// A restore drill record's verdict, read through its closed outcome: ok
+/// with reason "" when it passed, its reason when it failed (a controllers
+/// run that could not restore the backup failed with its reason). A drill
+/// record no writer could have written (one `spawn_backup_record` refuses)
+/// is no pass, and says why. `None` for a record of another type.
+fn drill_verdict(record: &Value) -> Option<(bool, String)> {
+    if !record["type"].as_str()?.starts_with("backup.drilled.") {
+        return None;
+    }
+    let unwritten = |why: &dyn std::fmt::Display| {
+        (false, format!("not a drill record any writer wrote: {why}"))
+    };
+    let verdict = |outcome: Result<DrillOutcome<'_>, _>| match outcome {
+        Ok(DrillOutcome::Passed) => (true, String::new()),
+        Ok(DrillOutcome::Failed { reason }) => (false, reason.to_string()),
+        Err(error) => unwritten(&error),
+    };
+    Some(match ControlRecord::from_value_strict(record) {
+        Ok(
+            ControlRecord::BackupDrilledTranscripts(drill)
+            | ControlRecord::BackupDrilledMissions(drill)
+            | ControlRecord::BackupDrilledSync(drill),
+        ) => verdict(drill.outcome()),
+        Ok(ControlRecord::BackupDrilledControllers(drill)) => {
+            verdict(drill.outcome().map(|outcome| match outcome {
+                ControllersDrillOutcome::Compared { outcome, .. } => outcome,
+                ControllersDrillOutcome::Unrestorable { reason } => DrillOutcome::Failed { reason },
+            }))
+        }
+        Ok(other) => unwritten(&other.kind().as_str()),
+        Err(error) => unwritten(&error),
+    })
 }
 
 /// `<program> [--user] show -p
@@ -1010,6 +1053,44 @@ mod tests {
             "ok is JSON true only; a reason that is no string is \"\""
         );
         assert_eq!(record_reading(None), Reading::default());
+    }
+
+    /// A restore drill's newest record reads through its closed outcome: a
+    /// pass, a failure with its reason, a controllers run that could not
+    /// restore the backup; a record no writer could have written (a pass
+    /// that names a reason, a failure without one) is no pass and says why.
+    #[test]
+    fn a_drill_records_verdict_is_its_closed_outcome() {
+        let last = |record: Value| {
+            record_reading(Some(
+                &json!({"at_ms": 7, "passed_at_ms": 3, "record": record}),
+            ))
+            .last
+            .expect("a newest drill")
+        };
+        let drill = |kind: &str, ok: bool, reason: &str| {
+            json!({"type": kind, "ok": ok, "reason": reason, "bundle": "b",
+                   "bundle_event_id": 1, "mismatches": u64::from(!ok), "duration_ms": 5})
+        };
+        let passed = last(drill("backup.drilled.transcripts", true, ""));
+        assert!(passed.ok);
+        assert_eq!(passed.reason, "");
+        let failed = last(drill("backup.drilled.missions", false, "missions: 1 older"));
+        assert!(!failed.ok);
+        assert_eq!(failed.reason, "missions: 1 older");
+        let unrestorable = last(drill("backup.drilled.controllers", false, "no bundle"));
+        assert!(!unrestorable.ok);
+        assert_eq!(unrestorable.reason, "no bundle");
+        for (ok, reason) in [(true, "why"), (false, "")] {
+            let odd = last(drill("backup.drilled.sync", ok, reason));
+            assert!(!odd.ok, "{ok} {reason:?}");
+            assert!(
+                odd.reason
+                    .starts_with("not a drill record any writer wrote"),
+                "{}",
+                odd.reason
+            );
+        }
     }
 
     /// A unit's newest run from the same `systemctl show` output.
