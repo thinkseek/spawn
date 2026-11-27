@@ -453,6 +453,23 @@ backup's)"
     })
 }
 
+/// Keep `LoadCredential=` filename for `spawn store` dedicated R2 credentials.
+const CRED_STORE_R2: &str = "r2-store.credentials";
+
+/// Resolve the store R2 credential path, preferring `$CREDENTIALS_DIRECTORY/r2-store.credentials`
+/// (validated fail-closed against empty/bad-mode/symlink) and falling back to
+/// `SPAWN_STORE_ENV_FILE` or `~/.config/spawn/r2-store.env`.
+pub(super) fn resolve_store_credential_path(
+    cred_dir: Option<&Path>,
+    explicit: Option<PathBuf>,
+    home: &Path,
+) -> Result<PathBuf, String> {
+    if let Some(path) = crate::config::load_credential_file(cred_dir, CRED_STORE_R2)? {
+        return Ok(path);
+    }
+    Ok(explicit.unwrap_or_else(|| home.join(".config/spawn/r2-store.env")))
+}
+
 /// The store's bucket and credentials, from the store credential `file`
 /// (`R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKETS`)
 /// and `bucket` (`SPAWN_STORE_BUCKET`), which must be one `R2_BUCKETS`
@@ -1250,10 +1267,11 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
         ));
     }
     // The store's own bucket and credential; r2.env is never read (rev-g N5).
-    let credential = env_value("SPAWN_STORE_ENV_FILE").map_or_else(
-        || super::home().join(".config/spawn/r2-store.env"),
-        PathBuf::from,
-    );
+    let credential = resolve_store_credential_path(
+        env_value("CREDENTIALS_DIRECTORY").as_deref().map(Path::new),
+        env_value("SPAWN_STORE_ENV_FILE").map(PathBuf::from),
+        &super::home(),
+    )?;
     let settings = Settings::with_r2(&flags, || {
         store_r2(&credential, env_value("SPAWN_STORE_BUCKET").as_deref())
     })?;

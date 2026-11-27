@@ -100,11 +100,17 @@ failure and is told not to retry). Find out why; if the drop is intended
 
 ## Keys to keep safe
 
-| File (mode 600) | Holds | If lost |
+| File (mode 600; Keep `/run/keep/*` 0400/0600) | Holds | If lost |
 | --- | --- | --- |
-| `~/.config/spawn/backup.key` | the encryption passphrase (32 random bytes, base64) | **every dump and bundle in R2 is unreadable.** Copy it off this host now (password manager or paper) |
-| `~/.config/spawn/r2.env` | `SPAWN_R2_ENDPOINT`, `SPAWN_R2_BUCKET`, `SPAWN_R2_ACCESS_KEY_ID`, `SPAWN_R2_SECRET_ACCESS_KEY` | make a new token (below) |
-| `~/.local/share/spawn-rsi/spawn.env` | `SPAWN_DATABASE_URL` (live) and `SPAWN_BACKUP_DRILL_DATABASE_URL` (the fleet test database's server; the drill makes and drops its own database there) | — |
+| `~/.config/spawn/backup.key` (or Keep `$CREDENTIALS_DIRECTORY/backup.key.k1` / `backup.encryption-key`) | the encryption passphrase (32 random bytes, base64) | **every dump and bundle in R2 is unreadable.** Copy it off this host now (password manager or paper) |
+| `~/.config/spawn/r2.env` (or Keep `$CREDENTIALS_DIRECTORY/r2.credentials`) | `SPAWN_R2_ENDPOINT`, `SPAWN_R2_BUCKET`, `SPAWN_R2_ACCESS_KEY_ID`, `SPAWN_R2_SECRET_ACCESS_KEY` | make a new token (below) |
+| `~/.local/share/spawn-rsi/spawn.env` (or Keep `$CREDENTIALS_DIRECTORY/spawn.database-url` & `spawn.backup-drill-database-url`) | `SPAWN_DATABASE_URL` (live) and `SPAWN_BACKUP_DRILL_DATABASE_URL` (the fleet test database's server; the drill makes and drops its own database there) | — |
+
+Both `spawn backup` / `spawn store` and `deploy/backup/lib.sh` support Keep Wave K3
+(`LoadCredential=` into `$CREDENTIALS_DIRECTORY`) with fail-closed validation
+(symlinks, empty files, or group/world permissions exit `78` / `EX_CONFIG` without
+falling back to legacy `.env` files), while falling back smoothly to `~/.config/spawn/*`
+and `spawn.env` when Keep credentials are not yet delivered to a host.
 
 The R2 credentials are the S3 form of a Cloudflare user API token named
 `spawn-store-backup` with only *Workers R2 Storage Bucket Item Read/Write* on

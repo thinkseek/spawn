@@ -229,7 +229,14 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
             .get("web")
             .unwrap_or_else(|| env_or("SPAWN_WEB_DIR", "web/dist")),
     );
-    let token = access_token(&address, env_value("SPAWN_SERVE_TOKEN"))?;
+    let raw_token = match serve_token() {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("serve: {error}");
+            return Ok(crate::config::CREDENTIAL_EXIT_CODE);
+        }
+    };
+    let token = access_token(&address, raw_token)?;
     // The loop records costs at these prices; a page served beside a setting
     // that cannot be read would show figures nobody can trust, so it stops.
     crate::cost::Prices::from_env()?;
@@ -540,8 +547,28 @@ fn serve_requests(
     }
 }
 
-/// The token every API request must carry, if any: whatever
-/// `SPAWN_SERVE_TOKEN` holds. An address that is not loopback needs one.
+/// Resolve the UI/API bearer token, preferring Keep's `$CREDENTIALS_DIRECTORY/spawn-serve.token`
+/// when present and falling back to `SPAWN_SERVE_TOKEN`.
+fn serve_token() -> Result<Option<String>, String> {
+    serve_token_with(
+        env_value("CREDENTIALS_DIRECTORY").as_deref().map(Path::new),
+        env_value("SPAWN_SERVE_TOKEN"),
+    )
+}
+
+fn serve_token_with(
+    cred_dir: Option<&Path>,
+    env_token: Option<String>,
+) -> Result<Option<String>, String> {
+    if let Some(token) = crate::config::load_credential_value(cred_dir, "spawn-serve.token")? {
+        return Ok(Some(token));
+    }
+    Ok(env_token)
+}
+
+/// The token every API request must carry, if any: Keep's `spawn-serve.token`
+/// credential file when delivered, else `SPAWN_SERVE_TOKEN`. An address that
+/// is not loopback needs one.
 fn access_token(address: &str, token: Option<String>) -> Result<Option<String>, String> {
     if let Some(token) = &token
         && !is_header_safe_token(token)
@@ -6165,6 +6192,38 @@ mod tests {
                 access_token("127.0.0.1:8787", Some(bad.to_string())).expect_err("not a token");
             assert!(refused.contains("visible ASCII"), "{bad:?}: {refused}");
         }
+    }
+
+    #[test]
+    fn serve_token_prefers_keep_credential_over_env_and_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::storage::tests::scratch("serve-token-keep");
+        assert_eq!(
+            super::serve_token_with(None, Some("env-tok-1".to_string())).unwrap(),
+            Some("env-tok-1".to_string())
+        );
+        assert_eq!(
+            super::serve_token_with(Some(&dir), Some("env-tok-2".to_string())).unwrap(),
+            Some("env-tok-2".to_string())
+        );
+
+        let keep_tok = "keep-tok-9941";
+        let path = dir.join("spawn-serve.token");
+        std::fs::write(&path, format!("{keep_tok}\n")).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).expect("mode");
+        assert_eq!(
+            super::serve_token_with(Some(&dir), Some("env-tok-ignored".to_string())).unwrap(),
+            Some(keep_tok.to_string())
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("bad mode");
+        let err = super::serve_token_with(Some(&dir), Some("env-tok-fallback-forbidden".into()))
+            .expect_err("bad mode must fail closed");
+        assert!(err.starts_with("credential spawn-serve.token"));
+        assert!(!err.contains(keep_tok));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

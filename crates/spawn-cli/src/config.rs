@@ -5,9 +5,88 @@
 //! carries everything its hook and runner need.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use spawn_postgres::PostgresStore;
+
+/// Process exit status (`EX_CONFIG` in `<sysexits.h>`) when a Keep-delivered
+/// `$CREDENTIALS_DIRECTORY/<id>` credential file is unreadable, empty, malformed,
+/// or a symlink so systemd `RestartPreventExitStatus=78` halts fail-closed.
+pub(crate) const CREDENTIAL_EXIT_CODE: i32 = 78;
+
+/// Validate a credential file inside `cred_dir` without reading or echoing its bytes.
+///
+/// Returns `Ok(None)` when `cred_dir` is `None` or `<cred_dir>/<id>` does not exist,
+/// falling back cleanly to legacy configuration. Once `<cred_dir>/<id>` exists,
+/// symlinks, non-regular files, empty files, and group/world permissions fail closed.
+pub(crate) fn load_credential_file(
+    cred_dir: Option<&Path>,
+    id: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(dir) = cred_dir else {
+        return Ok(None);
+    };
+    let path = dir.join(id);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("credential {id}: {error}")),
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(format!("credential {id} must be a regular file"));
+    }
+    if meta.len() == 0 {
+        return Err(format!("credential {id} is empty"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "credential {id} has mode {mode:o}: must be 0400 or 0600"
+            ));
+        }
+    }
+    Ok(Some(path))
+}
+
+/// Read a single-value UTF-8 credential from `cred_dir/<id>`, stripping at most one
+/// trailing newline while rejecting empty values, embedded newlines/NULs, or symlinks.
+pub(crate) fn load_credential_value(
+    cred_dir: Option<&Path>,
+    id: &str,
+) -> Result<Option<String>, String> {
+    let Some(path) = load_credential_file(cred_dir, id)? else {
+        return Ok(None);
+    };
+    let bytes = fs::read(&path).map_err(|error| format!("credential {id}: {error}"))?;
+    let raw =
+        String::from_utf8(bytes).map_err(|_| format!("credential {id} is not valid UTF-8"))?;
+    let trimmed = if let Some(rest) = raw.strip_suffix('\n') {
+        rest.strip_suffix('\r').unwrap_or(rest)
+    } else {
+        &raw
+    };
+    if trimmed.is_empty() {
+        return Err(format!("credential {id} is empty"));
+    }
+    if trimmed.contains(['\n', '\r', '\0']) {
+        return Err(format!(
+            "credential {id} contains embedded newline or NUL byte"
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Resolve `$CREDENTIALS_DIRECTORY/<id>` as a validated single-value secret string.
+pub(crate) fn credential_value(id: &str) -> Result<Option<String>, String> {
+    load_credential_value(
+        env_value("CREDENTIALS_DIRECTORY").as_deref().map(Path::new),
+        id,
+    )
+}
 
 pub(crate) fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -80,8 +159,18 @@ fn not_set(name: &str) -> String {
     }
 }
 
+/// Resolve the controller's PostgreSQL URL, preferring Keep's
+/// `$CREDENTIALS_DIRECTORY/spawn.database-url` when present and falling back to
+/// `SPAWN_DATABASE_URL`.
+pub(crate) fn database_url() -> Result<String, String> {
+    if let Some(url) = credential_value("spawn.database-url")? {
+        return Ok(url);
+    }
+    required_env("SPAWN_DATABASE_URL")
+}
+
 pub(crate) fn open_store() -> Result<PostgresStore, String> {
-    let url = required_env("SPAWN_DATABASE_URL")?;
+    let url = database_url()?;
     PostgresStore::connect(&url).map_err(|error| error.to_string())
 }
 
@@ -1479,5 +1568,69 @@ mod workspace_tests {
             assert_eq!(s.active, eng);
             assert!(s.servable().is_ok());
         }
+    }
+
+    #[test]
+    fn load_credential_supports_valid_files_absent_fallback_and_fail_closed_checks() {
+        use super::{load_credential_file, load_credential_value};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::storage::tests::scratch("config-load-credential");
+        assert_eq!(load_credential_file(None, "spawn.database-url"), Ok(None));
+        assert_eq!(
+            load_credential_value(Some(&dir), "spawn.database-url"),
+            Ok(None)
+        );
+
+        let canary = "canary-cred-val-8391";
+        let valid_0400 = dir.join("spawn.database-url");
+        std::fs::write(&valid_0400, format!("{canary}\n")).expect("write 0400");
+        std::fs::set_permissions(&valid_0400, std::fs::Permissions::from_mode(0o400))
+            .expect("chmod 400");
+        assert_eq!(
+            load_credential_file(Some(&dir), "spawn.database-url").unwrap(),
+            Some(valid_0400.clone())
+        );
+        assert_eq!(
+            load_credential_value(Some(&dir), "spawn.database-url").unwrap(),
+            Some(canary.to_string())
+        );
+
+        let valid_0600 = dir.join("backup.key.k1");
+        std::fs::write(&valid_0600, format!("{canary}\r\n")).expect("write 0600");
+        std::fs::set_permissions(&valid_0600, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 600");
+        assert_eq!(
+            load_credential_value(Some(&dir), "backup.key.k1").unwrap(),
+            Some(canary.to_string())
+        );
+
+        let mut errs = Vec::new();
+        for (name, bytes, mode) in [
+            ("empty.cred", b"".as_slice(), 0o600),
+            ("nl.cred", b"\n", 0o600),
+            ("multi.cred", b"canary-one\ncanary-two\n", 0o600),
+            ("badutf8.cred", &[0xff, 0xfe], 0o600),
+            ("leaky.cred", format!("{canary}\n").as_bytes(), 0o640),
+        ] {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).expect("write bad");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            errs.push(load_credential_value(Some(&dir), name).unwrap_err());
+        }
+
+        let target = dir.join("real.target");
+        std::fs::write(&target, canary).expect("target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let link = dir.join("sym.cred");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        errs.push(load_credential_file(Some(&dir), "sym.cred").unwrap_err());
+        errs.push(load_credential_value(Some(&dir), "sym.cred").unwrap_err());
+
+        for err in &errs {
+            assert!(err.starts_with("credential "), "{err}");
+            assert!(!err.contains(canary), "secret leaked in {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

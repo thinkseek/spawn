@@ -204,7 +204,7 @@ load_and_validate_manifest() {
     [ "${f[0]}" != "$host_subject" ] || refuse "the id $host_subject (the unit_drift alert's subject)"
     valid_health_url "${f[2]}" || refuse "a health URL that is not http(s):// or unix://<socket>|<path>"
     [[ ${f[4]} != */ && ${f[6]} != */ ]] || refuse "a legacy file or scanner source ending in / (a folder)"
-    [[ ${f[1]} == - || ${f[1]} =~ ^[A-Za-z0-9][A-Za-z0-9@._-]*$ ]] || refuse "a unit that is not a unit name"
+    [[ ${f[1]} == - || ${f[1]} =~ ^[A-Za-z0-9][A-Za-z0-9@._-]*(,[A-Za-z0-9][A-Za-z0-9@._-]*)*$ ]] || refuse "a unit that is not a unit name"
     [[ ${f[3]} == - || ${f[3]} =~ ^[A-Za-z0-9_-]+$ ]] || refuse "a status tag that is not a plain word"
     [[ ${f[5]} == - || ${f[5]} =~ ^[A-Za-z_][A-Za-z0-9_]*(,[A-Za-z_][A-Za-z0-9_]*)*$ ]] || refuse "legacy keys that are not env names"
     for r in "${rows[@]}"; do [ "${r%%"$row_sep"*}" != "${f[0]}" ] || refuse "the id ${f[0]} twice"; done
@@ -249,11 +249,18 @@ json_string_array() {
 
 audit_keep_migration() {
   local audit_dir="" u path drop line rhs cred_id env_path status ef has_sensitive
+  local unit_type restart_statuses restart_guard_ready has_78 has_243 st_tok
   local total=0 n_keep=0 n_none=0 n_pending=0
   local go_checked=false go_ok=true
+  local backup_total=0 backup_keep=0 backup_pending=0 backup_guard_ready=0
+  local path_total=0 path_ok=true ppath pu p_changed p_unit has_pe p_safe
+  local sys_checked=false sys_total=0 sys_ok=true spath su
   local -a unit_names=() scan_files=() load_creds=() env_files=() suggested_ids=()
   local -a go_violations=() unit_records=() human_lines=()
+  local -a backup_unit_names=() path_violations=() path_records=()
+  local -a sys_violations=() sys_unit_names=()
   local lc_json ef_json sk_json go_v_json lc_disp ef_disp sk_disp
+  local bu_json pv_json pr_json sv_json su_json
 
   if [ -n "${deploy_units-}" ]; then
     audit_dir=$deploy_units
@@ -281,6 +288,8 @@ audit_keep_migration() {
 
     load_creds=()
     env_files=()
+    unit_type=simple
+    restart_statuses=""
     for path in "${scan_files[@]}"; do
       while IFS= read -r line || [ -n "$line" ]; do
         line=$(trim "$line")
@@ -295,9 +304,28 @@ audit_keep_migration() {
           rhs=${rhs#\"}; rhs=${rhs%\"}
           env_path=$(trim "$rhs")
           [ -n "$env_path" ] && append_unique_item env_files "$env_path"
+        elif [[ $line =~ ^Type[[:space:]]*= ]]; then
+          rhs=$(trim "${line#*=}")
+          rhs=${rhs#\"}; rhs=${rhs%\"}
+          [ -n "$rhs" ] && unit_type=$rhs
+        elif [[ $line =~ ^RestartPreventExitStatus[[:space:]]*= ]]; then
+          rhs=$(trim "${line#*=}")
+          rhs=${rhs#\"}; rhs=${rhs%\"}
+          restart_statuses="${restart_statuses:+$restart_statuses }$rhs"
         fi
       done <"$path"
     done
+
+    restart_guard_ready=false
+    has_78=0
+    has_243=0
+    for st_tok in $restart_statuses; do
+      case $st_tok in
+        78) has_78=1 ;;
+        243) has_243=1 ;;
+      esac
+    done
+    [ "$has_78" -eq 1 ] && [ "$has_243" -eq 1 ] && restart_guard_ready=true
 
     case $u in
       spawn-node-edge.service|spawn-node-gw.service|spawn-node-out.service)
@@ -332,6 +360,16 @@ audit_keep_migration() {
     fi
     total=$((total + 1))
 
+    case $u in
+      spawn-backup*.service)
+        backup_total=$((backup_total + 1))
+        [ "$status" = keep_managed ] && backup_keep=$((backup_keep + 1))
+        [ "$status" = pending_migration ] && backup_pending=$((backup_pending + 1))
+        [ "$restart_guard_ready" = true ] && backup_guard_ready=$((backup_guard_ready + 1))
+        append_unique_item backup_unit_names "$u"
+        ;;
+    esac
+
     suggested_ids=()
     if [ "$status" = keep_managed ]; then
       for cred_id in "${load_creds[@]}"; do
@@ -352,7 +390,13 @@ audit_keep_migration() {
           r2.env|r2-store.env) append_unique_item suggested_ids "r2.credentials" ;;
           spawn.env)
             case $u in
-              spawn-backup.service|spawn-backup-bundle.service|spawn-backup-verify.service|spawn-backup-restore-drill*.service)
+              spawn-backup-verify.service)
+                append_unique_item suggested_ids "spawn.database-url"
+                append_unique_item suggested_ids "spawn.backup-drill-database-url"
+                append_unique_item suggested_ids "backup.encryption-key"
+                append_unique_item suggested_ids "r2.credentials"
+                ;;
+              spawn-backup.service|spawn-backup-bundle.service|spawn-backup-restore-drill*.service)
                 append_unique_item suggested_ids "spawn.database-url"
                 append_unique_item suggested_ids "backup.encryption-key"
                 append_unique_item suggested_ids "r2.credentials"
@@ -381,10 +425,12 @@ audit_keep_migration() {
     unit_records+=("$(jq -cn \
       --arg unit "$u" \
       --arg status "$status" \
+      --arg unit_type "$unit_type" \
+      --argjson restart_guard_ready "$restart_guard_ready" \
       --argjson lc "$lc_json" \
       --argjson ef "$ef_json" \
       --argjson sk "$sk_json" \
-      '{unit: $unit, status: $status, load_credentials: $lc, env_files: $ef, suggested_keep_ids: $sk}')")
+      '{unit: $unit, status: $status, unit_type: $unit_type, restart_guard_ready: $restart_guard_ready, load_credentials: $lc, env_files: $ef, suggested_keep_ids: $sk}')")
 
     lc_disp=$(IFS=,; printf '%s' "${load_creds[*]-}"); [ -n "$lc_disp" ] || lc_disp="-"
     ef_disp=$(IFS=,; printf '%s' "${env_files[*]-}"); [ -n "$ef_disp" ] || ef_disp="-"
@@ -393,8 +439,67 @@ audit_keep_migration() {
       "$status" "$u" "$lc_disp" "$ef_disp" "$sk_disp")")
   done
 
+  for ppath in "$audit_dir"/spawn-*.path; do
+    [ -f "$ppath" ] || continue
+    pu=${ppath##*/}
+    p_changed=""
+    p_unit=""
+    has_pe=false
+    p_safe=true
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=$(trim "$line")
+      case $line in "" | "#"* | ";"*) continue ;; esac
+      if [[ $line =~ ^PathExists[[:space:]]*= ]]; then
+        has_pe=true
+      elif [[ $line =~ ^PathChanged[[:space:]]*= ]]; then
+        rhs=$(trim "${line#*=}")
+        rhs=${rhs#\"}; rhs=${rhs%\"}
+        p_changed=$rhs
+      elif [[ $line =~ ^Unit[[:space:]]*= ]]; then
+        rhs=$(trim "${line#*=}")
+        rhs=${rhs#\"}; rhs=${rhs%\"}
+        p_unit=$rhs
+      fi
+    done <"$ppath"
+    if [ "$has_pe" = true ] || [[ $p_changed != /run/keep/* ]] || [ -z "$p_unit" ]; then
+      p_safe=false
+      path_ok=false
+      [ "$has_pe" = true ] && append_unique_item path_violations "$pu"
+    fi
+    path_total=$((path_total + 1))
+    path_records+=("$(jq -cn \
+      --arg unit "$pu" \
+      --arg path_changed "$p_changed" \
+      --arg target_unit "$p_unit" \
+      --argjson safe "$p_safe" \
+      '{unit: $unit, path_changed: $path_changed, target_unit: $target_unit, safe: $safe}')")
+  done
+
+  if [ -d "$audit_dir/system" ]; then
+    for spath in "$audit_dir/system"/spawn-*.service; do
+      [ -f "$spath" ] || continue
+      sys_checked=true
+      sys_total=$((sys_total + 1))
+      su="system/${spath##*/}"
+      append_unique_item sys_unit_names "$su"
+      if grep -qiE '^[[:space:]]*EnvironmentFile[[:space:]]*=|DATABASE_URL|r2\.env|r2-store\.env|spawn\.env' "$spath" 2>/dev/null; then
+        sys_ok=false
+        append_unique_item sys_violations "$su"
+      fi
+    done
+  fi
+
   if [ "$audit_json" -eq 1 ]; then
     go_v_json=$(json_string_array ${go_violations[@]+"${go_violations[@]}"})
+    bu_json=$(json_string_array ${backup_unit_names[@]+"${backup_unit_names[@]}"})
+    pv_json=$(json_string_array ${path_violations[@]+"${path_violations[@]}"})
+    sv_json=$(json_string_array ${sys_violations[@]+"${sys_violations[@]}"})
+    su_json=$(json_string_array ${sys_unit_names[@]+"${sys_unit_names[@]}"})
+    if [ "${#path_records[@]}" -eq 0 ]; then
+      pr_json='[]'
+    else
+      pr_json=$(printf '%s\n' "${path_records[@]}" | jq -s .)
+    fi
     if [ "${#unit_records[@]}" -eq 0 ]; then
       printf '[]'
     else
@@ -408,6 +513,20 @@ audit_keep_migration() {
       --argjson go_checked "$go_checked" \
       --argjson go_ok "$go_ok" \
       --argjson go_violations "$go_v_json" \
+      --argjson backup_total "$backup_total" \
+      --argjson backup_keep "$backup_keep" \
+      --argjson backup_pending "$backup_pending" \
+      --argjson backup_guard_ready "$backup_guard_ready" \
+      --argjson backup_units "$bu_json" \
+      --argjson path_total "$path_total" \
+      --argjson path_ok "$path_ok" \
+      --argjson path_exists_violations "$pv_json" \
+      --argjson path_records "$pr_json" \
+      --argjson sys_checked "$sys_checked" \
+      --argjson sys_total "$sys_total" \
+      --argjson sys_ok "$sys_ok" \
+      --argjson sys_violations "$sv_json" \
+      --argjson sys_units "$su_json" \
       '{
         audit_dir: $audit_dir,
         counts: {
@@ -421,6 +540,26 @@ audit_keep_migration() {
           ok: $go_ok,
           violations: $go_violations
         },
+        backup_units: {
+          total: $backup_total,
+          keep_managed: $backup_keep,
+          pending_migration: $backup_pending,
+          restart_guard_ready: $backup_guard_ready,
+          units: $backup_units
+        },
+        staged_path_units: {
+          total: $path_total,
+          ok: $path_ok,
+          path_exists_violations: $path_exists_violations,
+          units: $path_records
+        },
+        system_units_audit: {
+          checked: $sys_checked,
+          total: $sys_total,
+          ok: $sys_ok,
+          violations: $sys_violations,
+          units: $sys_units
+        },
         units: .
       }'
   else
@@ -430,6 +569,10 @@ audit_keep_migration() {
     done
     printf 'summary: total=%d keep_managed=%d no_secrets=%d pending_migration=%d go_units_pg_isolation=%s\n' \
       "$total" "$n_keep" "$n_none" "$n_pending" "$([ "$go_ok" = true ] && printf ok || printf violation)"
+    printf 'summary_k3: backup_units=%d/%d(restart_guard_ready=%d) staged_path_units=%d(%s) system_units=%d(%s)\n' \
+      "$backup_keep" "$backup_total" "$backup_guard_ready" \
+      "$path_total" "$([ "$path_ok" = true ] && printf ok || printf violation)" \
+      "$sys_total" "$([ "$sys_ok" = true ] && printf ok || printf violation)"
   fi
   return 0
 }
@@ -464,9 +607,9 @@ done < <(systemctl --user list-unit-files --no-legend 'spawn-*' 2>/dev/null | so
 # --- the checks of one row: each sets a class with its reason (names and numbers only) ---
 check_row() {
   local id=$1 unit=$2 health_url=$3 tag=$4 legacy=$5 keys=$6 scanner=$7 legacy_raw=${8-}
-  local file=$keep_dir/$id in_grace="" up active code started started_s delivered_s inv newest
-  local legacy_why="" named="" own u fpath k base
-  local -a jsel codes
+  local file=$keep_dir/$id in_grace="" up active failed_state code started started_s delivered_s inv newest
+  local legacy_why="" named="" own u ru unit_type down_msg="" fpath k base
+  local -a jsel codes row_units=() down_reasons=()
   if [ ! -f "$file" ] || [ ! -s "$file" ] || [ "$(stat -c %a "$file" 2>/dev/null)" != 600 ]; then
     up=$(uptime_s)
     if [ "$up" -gt "$grace" ]; then
@@ -478,43 +621,68 @@ check_row() {
   fi
 
   if [ "$unit" != - ]; then
-    active=$(systemctl --user is-active "$unit" 2>/dev/null)
+    IFS=',' read -r -a row_units <<<"$unit"
     code=200
     [ "$health_url" = - ] || code=$(probe_health_url "$health_url")
-    if [ "$active" != active ] || [ "$code" != 200 ]; then
+    for ru in "${row_units[@]}"; do
+      own=${unit_text[$ru]-}
+      [ -n "$own" ] || own=$(systemctl --user cat "$ru" 2>/dev/null)
+      unit_type=$(systemctl --user show "$ru" -p Type --value 2>/dev/null)
+      if [ -z "$unit_type" ] && [ -n "$own" ] &&
+         grep -qiE '^[[:space:]]*Type[[:space:]]*=[[:space:]]*oneshot([[:space:]]|$)' <<<"$own"; then
+        unit_type=oneshot
+      fi
+      active=$(systemctl --user is-active "$ru" 2>/dev/null)
+      failed_state=$(systemctl --user is-failed "$ru" 2>/dev/null)
+      if [ "$unit_type" = oneshot ]; then
+        if [ "$active" = failed ] || [ "$failed_state" = failed ]; then
+          down_reasons+=("$ru is ${active:-failed}")
+        fi
+      elif [ "$active" != active ]; then
+        down_reasons+=("$ru is ${active:-unknown}")
+      fi
+
+      if [ "$active" = active ] && [ -s "$file" ]; then
+        started=$(systemctl --user show "$ru" -p ExecMainStartTimestamp --value 2>/dev/null)
+        started_s=$(date -d "$started" +%s 2>/dev/null || echo 0)
+        delivered_s=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+        if [ "$started_s" -gt 0 ] && [ $((delivered_s - started_s)) -gt 60 ]; then
+          fault "$id" not_loaded "$file delivered $((delivered_s - started_s))s after $ru started"
+        fi
+      fi
+
+      # Only the running unit's lines count: after a restart with a fixed key, an old 401 must not
+      # keep auth_failure open (or fire it on a fresh good start). Without an invocation id, the
+      # newest 400 lines.
+      if [ "$tag" != - ]; then
+        inv=$(systemctl --user show "$ru" -p InvocationID --value 2>/dev/null)
+        if [ -n "$inv" ]; then jsel=("_SYSTEMD_INVOCATION_ID=$inv"); else jsel=(-u "$ru" -n 400); fi
+        mapfile -t codes < <(journalctl --user "${jsel[@]}" -o cat --no-pager 2>/dev/null |
+          sed -n "s/^$tag: \([0-9][0-9][0-9]\) .*/\1/p" | tail -n 3)
+        if [ "${#codes[@]}" -gt 0 ]; then
+          newest=${codes[${#codes[@]}-1]}
+          case $newest in 401|403) fault "$id" auth_failure "the newest relayed call answered $newest" ;; esac
+          if [ "${#codes[@]}" -eq 3 ] && ! printf '%s\n' "${codes[@]}" | grep -qx 200; then
+            fault "$id" call_failure "the 3 newest relayed calls answered ${codes[*]}"
+          fi
+        fi
+      fi
+    done
+
+    if [ "${#down_reasons[@]}" -gt 0 ] || [ "$code" != 200 ]; then
       if [ -n "$in_grace" ]; then
         # After a boot the unit stays failed until Keep delivers its key: a normal gap, not a fault.
         say "$unit is ${active:-unknown}, waiting for its key within the boot grace"
-      elif [ "$health_url" = - ]; then
-        fault "$id" service_down "$unit is ${active:-unknown}"
       else
-        fault "$id" service_down "$unit is ${active:-unknown}; $(health_url_label "$health_url") answered ${code:-nothing}"
-      fi
-    fi
-
-    if [ "$active" = active ] && [ -s "$file" ]; then
-      started=$(systemctl --user show "$unit" -p ExecMainStartTimestamp --value 2>/dev/null)
-      started_s=$(date -d "$started" +%s 2>/dev/null || echo 0)
-      delivered_s=$(stat -c %Y "$file" 2>/dev/null || echo 0)
-      if [ "$started_s" -gt 0 ] && [ $((delivered_s - started_s)) -gt 60 ]; then
-        fault "$id" not_loaded "$file delivered $((delivered_s - started_s))s after $unit started"
-      fi
-    fi
-
-    # Only the running unit's lines count: after a restart with a fixed key, an old 401 must not
-    # keep auth_failure open (or fire it on a fresh good start). Without an invocation id, the
-    # newest 400 lines.
-    if [ "$tag" != - ]; then
-      inv=$(systemctl --user show "$unit" -p InvocationID --value 2>/dev/null)
-      if [ -n "$inv" ]; then jsel=("_SYSTEMD_INVOCATION_ID=$inv"); else jsel=(-u "$unit" -n 400); fi
-      mapfile -t codes < <(journalctl --user "${jsel[@]}" -o cat --no-pager 2>/dev/null |
-        sed -n "s/^$tag: \([0-9][0-9][0-9]\) .*/\1/p" | tail -n 3)
-      if [ "${#codes[@]}" -gt 0 ]; then
-        newest=${codes[${#codes[@]}-1]}
-        case $newest in 401|403) fault "$id" auth_failure "the newest relayed call answered $newest" ;; esac
-        if [ "${#codes[@]}" -eq 3 ] && ! printf '%s\n' "${codes[@]}" | grep -qx 200; then
-          fault "$id" call_failure "the 3 newest relayed calls answered ${codes[*]}"
+        if [ "${#down_reasons[@]}" -gt 0 ]; then
+          down_msg=$(IFS='; '; printf '%s' "${down_reasons[*]}")
+        elif [ "${#row_units[@]}" -eq 1 ]; then
+          down_msg="${row_units[0]} is ${active:-unknown}"
         fi
+        if [ "$health_url" != - ] && [ "$code" != 200 ]; then
+          down_msg="${down_msg:+$down_msg; }$(health_url_label "$health_url") answered ${code:-nothing}"
+        fi
+        fault "$id" service_down "$down_msg"
       fi
     fi
   fi
@@ -543,13 +711,16 @@ check_row() {
     done
   fi
   if [ "$unit" != - ]; then
-    own=$(systemctl --user cat "$unit" 2>/dev/null)
-    if [ -n "$own" ]; then
-      grep -qE '^[[:space:]]*EnvironmentFile[[:space:]]*=' <<<"$own" &&
-        legacy_why=$(add "$legacy_why" "$unit has an EnvironmentFile=")
-      grep -q "^LoadCredential=${id//./\\.}:" <<<"$own" ||
-        legacy_why=$(add "$legacy_why" "$unit has no LoadCredential=$id")
-    fi
+    for ru in "${row_units[@]}"; do
+      own=${unit_text[$ru]-}
+      [ -n "$own" ] || own=$(systemctl --user cat "$ru" 2>/dev/null)
+      if [ -n "$own" ]; then
+        grep -qE '^[[:space:]]*EnvironmentFile[[:space:]]*=' <<<"$own" &&
+          legacy_why=$(add "$legacy_why" "$ru has an EnvironmentFile=")
+        grep -q "^LoadCredential=${id//./\\.}:" <<<"$own" ||
+          legacy_why=$(add "$legacy_why" "$ru has no LoadCredential=$id")
+      fi
+    done
   fi
   [ -n "$legacy_why" ] && fault "$id" legacy_env "$legacy_why"
 

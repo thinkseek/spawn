@@ -179,5 +179,80 @@ for held in "backup.key" "backup.key.k1" "backup.key backup.key.k1"; do
   fi
 done
 
+# 4. Keep Wave K3 CREDENTIALS_DIRECTORY precedence, mode 400/600, fail-closed checks, and fallback.
+cdir=$work/creds; mkdir -p "$cdir"
+h4=$work/h4; mkdir -p "$h4/.config/spawn" "$h4/.local/share/spawn-rsi"
+made_up disk "$h4/.config/spawn/backup.key.k1"
+[ "$(default_file "$h4" CREDENTIALS_DIRECTORY="$cdir")" = "$h4/.config/spawn/backup.key.k1" ] &&
+  ok "CREDENTIALS_DIRECTORY without key files falls back to disk backup.key.k1" || bad "cred fallback key"
+
+printf 'made-up-keep-enc\n' >"$cdir/backup.encryption-key"; chmod 400 "$cdir/backup.encryption-key"
+[ "$(default_file "$h4" CREDENTIALS_DIRECTORY="$cdir")" = "$cdir/backup.encryption-key" ] &&
+  ok "CREDENTIALS_DIRECTORY/backup.encryption-key (0400) chosen when backup.key.k1 absent" || bad "cred alias key"
+
+printf 'made-up-keep-k1\n' >"$cdir/backup.key.k1"; chmod 400 "$cdir/backup.key.k1"
+[ "$(default_file "$h4" CREDENTIALS_DIRECTORY="$cdir")" = "$cdir/backup.key.k1" ] &&
+  ok "CREDENTIALS_DIRECTORY/backup.key.k1 overrides backup.encryption-key and disk" || bad "cred k1 key"
+
+r2_legacy=$h4/.config/spawn/r2.env
+cat >"$r2_legacy" <<'EOF'
+SPAWN_R2_ENDPOINT=https://legacy.example
+SPAWN_R2_BUCKET=legacy-bkt
+SPAWN_R2_ACCESS_KEY_ID=leg-id
+SPAWN_R2_SECRET_ACCESS_KEY=leg-sec
+EOF
+chmod 600 "$r2_legacy"
+
+cred_r2=$cdir/r2.credentials
+cat >"$cred_r2" <<'EOF'
+SPAWN_R2_ENDPOINT=https://keep.example/
+SPAWN_R2_BUCKET=keep-bkt
+SPAWN_R2_ACCESS_KEY_ID=keep-id
+SPAWN_R2_SECRET_ACCESS_KEY=keep-sec
+EOF
+chmod 400 "$cred_r2"
+if env -i PATH="$PATH" HOME="$h4" CREDENTIALS_DIRECTORY="$cdir" SPAWN_R2_ENV_FILE="$r2_legacy" \
+  bash -c '. "$1"; PROG=test; load_r2; [ "$R2_BUCKET" = "keep-bkt" ] && [ "$R2_ENDPOINT" = "https://keep.example" ] && [ "$R2_ACCESS_KEY_ID" = "keep-id" ] && [ "$R2_SECRET_ACCESS_KEY" = "keep-sec" ]' _ "$here/lib.sh"; then
+  ok "load_r2 prefers CREDENTIALS_DIRECTORY/r2.credentials (0400) over legacy r2.env"
+else
+  bad "load_r2 Keep precedence"
+fi
+
+chmod 644 "$cred_r2"
+if ! env -i PATH="$PATH" HOME="$h4" CREDENTIALS_DIRECTORY="$cdir" SPAWN_R2_ENV_FILE="$r2_legacy" \
+  bash -c '. "$1"; PROG=test; load_r2' _ "$here/lib.sh" 2>"$work/r2err"; then
+  ok "load_r2 fails closed when r2.credentials has mode 644 (no r2.env fallback)"
+else
+  bad "load_r2 should fail closed on mode 644"
+fi
+chmod 400 "$cred_r2"
+
+cred_db=$cdir/spawn.database-url
+printf 'postgres://keep@127.0.0.1/spawn_k\n' >"$cred_db"; chmod 400 "$cred_db"
+if env -i PATH="$PATH" HOME="$h4" CREDENTIALS_DIRECTORY="$cdir" \
+  bash -c '. "$1"; PROG=test; load_live_url; [ "$LIVE_URL" = "postgres://keep@127.0.0.1/spawn_k" ]' _ "$here/lib.sh"; then
+  ok "load_live_url reads single-line CREDENTIALS_DIRECTORY/spawn.database-url (0400)"
+else
+  bad "load_live_url Keep read"
+fi
+
+chmod 600 "$cred_db"
+printf 'postgres://one@127.0.0.1/db\npostgres://two@127.0.0.1/db\n' >"$cred_db" && chmod 400 "$cred_db"
+if ! env -i PATH="$PATH" HOME="$h4" CREDENTIALS_DIRECTORY="$cdir" \
+  bash -c '. "$1"; PROG=test; load_live_url' _ "$here/lib.sh" 2>"$work/dberr"; then
+  ok "load_live_url fails closed on multi-line spawn.database-url"
+else
+  bad "load_live_url should fail closed on multi-line file"
+fi
+
+ln -sf "$h4/.config/spawn/backup.key.k1" "$cdir/sym-db"
+rm -f "$cred_db" && mv "$cdir/sym-db" "$cred_db"
+if ! env -i PATH="$PATH" HOME="$h4" CREDENTIALS_DIRECTORY="$cdir" \
+  bash -c '. "$1"; PROG=test; load_live_url' _ "$here/lib.sh" 2>"$work/symerr"; then
+  ok "load_live_url fails closed on symlink credential"
+else
+  bad "load_live_url should fail closed on symlink"
+fi
+
 [ "$failed" = 0 ] || exit 1
 echo "test-pg-backup-key: all passed"

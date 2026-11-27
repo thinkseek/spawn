@@ -809,6 +809,43 @@ R2_SECRET_ACCESS_KEY=made-up-secret\nR2_BUCKETS=b-store,b-keep,b-work\n";
     fs::remove_dir_all(&dir).expect("clean up");
 }
 
+#[test]
+fn store_credential_prefers_keep_r2_store_credentials_and_fails_closed() {
+    use super::resolve_store_credential_path;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch("store-keep-cred");
+    let home = dir.join("home");
+    let cred_dir = dir.join("cred");
+    fs::create_dir_all(home.join(".config/spawn")).expect("home");
+    fs::create_dir_all(&cred_dir).expect("cred");
+
+    assert_eq!(
+        resolve_store_credential_path(Some(&cred_dir), None, &home).unwrap(),
+        home.join(".config/spawn/r2-store.env")
+    );
+    let cred_file = cred_dir.join("r2-store.credentials");
+    fs::write(
+        &cred_file,
+        "R2_ENDPOINT=https://keep.example\nR2_ACCESS_KEY_ID=kid\n\
+         R2_SECRET_ACCESS_KEY=ksecret\nR2_BUCKETS=b-work\n",
+    )
+    .expect("write");
+    fs::set_permissions(&cred_file, fs::Permissions::from_mode(0o400)).expect("400");
+    let chosen =
+        resolve_store_credential_path(Some(&cred_dir), Some(dir.join("explicit.env")), &home)
+            .expect("keep cred");
+    assert_eq!(chosen, cred_file);
+    assert_eq!(store_r2(&chosen, Some("b-work")).unwrap().access_key, "kid");
+
+    fs::set_permissions(&cred_file, fs::Permissions::from_mode(0o640)).expect("640");
+    let err = resolve_store_credential_path(Some(&cred_dir), None, &home).unwrap_err();
+    assert!(err.starts_with("credential r2-store.credentials"), "{err}");
+    assert!(!err.contains("ksecret"));
+
+    fs::remove_dir_all(&dir).expect("clean up");
+}
+
 /// cc-astra A30 adoption: an object already at a segment's key enters the
 /// manifest only when its contents are that segment's; one of the right
 /// size and a valid ETag but other bytes, at the key of a file verify would

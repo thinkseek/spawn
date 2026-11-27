@@ -118,7 +118,9 @@ use sha2::{Digest, Sha256};
 use spawn_postgres::PostgresStore;
 
 use crate::Flags;
-use crate::config::{env_or, env_value, open_store, workspace_root};
+use crate::config::{
+    CREDENTIAL_EXIT_CODE, database_url, env_or, env_value, open_store, workspace_root,
+};
 
 mod recoverable;
 mod restore_drill;
@@ -132,6 +134,13 @@ const DEFAULT_ALERT_MB: u64 = 8_000;
 
 /// A byte count per `SPAWN_BACKUP_R2_*` megabyte.
 const MB: u64 = 1_000_000;
+
+/// Keep `LoadCredential=` filename for R2 bucket endpoint, bucket name, and S3 keys.
+const CRED_R2: &str = "r2.credentials";
+/// Keep `LoadCredential=` default k1 encryption passphrase filename.
+const CRED_BACKUP_KEY: &str = "backup.encryption-key";
+/// Keep `LoadCredential=` filename for the disposable restore-drill database URL.
+const CRED_DRILL_DB_URL: &str = "spawn.backup-drill-database-url";
 
 /// The usage of `spawn backup`, the only copy (main's help reads it).
 pub(crate) const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep] [--only missions|controllers|transcripts|sync]\n       spawn backup cas snapshot|restore|verify|key-of [...]";
@@ -400,10 +409,63 @@ fn find_key(name: &str, explicit: Option<PathBuf>, dir: &Path) -> Result<Key, St
     }
 }
 
-/// [`find_key`] in this host's key directory.
+/// Whether an error came from a Keep `$CREDENTIALS_DIRECTORY/<id>` validation failure.
+pub(super) fn is_credential_error(reason: &str) -> bool {
+    reason.starts_with("credential ")
+}
+
+/// Configuration refusal exit code: `78` (`EX_CONFIG`) on Keep credential errors, `2` otherwise.
+pub(super) fn config_exit_code(reason: &str) -> i32 {
+    if is_credential_error(reason) {
+        CREDENTIAL_EXIT_CODE
+    } else {
+        2
+    }
+}
+
+/// Resolve the disposable restore-drill PostgreSQL URL, preferring Keep's
+/// `$CREDENTIALS_DIRECTORY/spawn.backup-drill-database-url` when present.
+fn drill_database_url() -> Result<Option<String>, String> {
+    if let Some(url) = crate::config::credential_value(CRED_DRILL_DB_URL)? {
+        return Ok(Some(url));
+    }
+    Ok(env_value("SPAWN_BACKUP_DRILL_DATABASE_URL"))
+}
+
+/// Like [`find_key`], but prefers validated files under `cred_dir` (`$CREDENTIALS_DIRECTORY`)
+/// when delivered (`backup.key.<name>`, or `backup.encryption-key` for `k1`). Fails closed on
+/// malformed or symlinked credential files in `cred_dir`.
+fn find_key_with_credentials(
+    name: &str,
+    cred_dir: Option<&Path>,
+    explicit: Option<PathBuf>,
+    dir: &Path,
+) -> Result<Key, String> {
+    if let Some(cdir) = cred_dir {
+        let named = format!("backup.key.{name}");
+        if let Some(file) = crate::config::load_credential_file(Some(cdir), &named)? {
+            return Ok(Key {
+                name: name.to_string(),
+                file,
+            });
+        }
+        if name == "k1"
+            && let Some(file) = crate::config::load_credential_file(Some(cdir), CRED_BACKUP_KEY)?
+        {
+            return Ok(Key {
+                name: name.to_string(),
+                file,
+            });
+        }
+    }
+    find_key(name, explicit, dir)
+}
+
+/// [`find_key_with_credentials`] in `$CREDENTIALS_DIRECTORY` and this host's key directory.
 fn key_on_host(name: &str) -> Result<Key, String> {
-    find_key(
+    find_key_with_credentials(
         name,
+        env_value("CREDENTIALS_DIRECTORY").as_deref().map(Path::new),
         env_value("SPAWN_BACKUP_KEY_FILE").map(PathBuf::from),
         &key_dir(),
     )
@@ -412,8 +474,12 @@ fn key_on_host(name: &str) -> Result<Key, String> {
 /// The key that reads what `what` names ("the dump", "the bundle", "the
 /// bundle chain"), sealed with `name`: its file on this host, mode 600.
 fn reading_key(name: &str, what: &str) -> Result<Key, String> {
-    let key = key_on_host(name).map_err(|path| {
-        format!("{what} is sealed with {name}; its key file {path} is not on this host")
+    let key = key_on_host(name).map_err(|err| {
+        if is_credential_error(&err) {
+            err
+        } else {
+            format!("{what} is sealed with {name}; its key file {err} is not on this host")
+        }
     })?;
     private_file(&key.file, "the backup key")?;
     Ok(key)
@@ -424,8 +490,12 @@ fn reading_key(name: &str, what: &str) -> Result<Key, String> {
 fn sealing_key() -> Result<Key, String> {
     let name = key_name(env_value("SPAWN_BACKUP_SEAL_KEY").as_deref())
         .map_err(|rule| format!("SPAWN_BACKUP_SEAL_KEY {rule}"))?;
-    let key = key_on_host(&name).map_err(|path| {
-        format!("the sealing key {name}: its key file {path} is not on this host")
+    let key = key_on_host(&name).map_err(|err| {
+        if is_credential_error(&err) {
+            err
+        } else {
+            format!("the sealing key {name}: its key file {err} is not on this host")
+        }
     })?;
     private_file(&key.file, "the backup key")?;
     Ok(key)
@@ -543,13 +613,71 @@ fn prefix_value(text: Option<String>) -> Result<String, String> {
     Ok(text.to_string())
 }
 
+/// Resolve R2 endpoint, bucket, and S3 keys, preferring Keep's `$CREDENTIALS_DIRECTORY/r2.credentials`
+/// (fail-closed on bad mode, symlink, empty file, or missing S3 keys without falling back to env/r2.env)
+/// and falling back to `SPAWN_R2_ENV_FILE` / `~/.config/spawn/r2.env` when Keep has not delivered it.
+fn resolve_backup_r2(
+    cred_dir: Option<&Path>,
+    explicit_env_file: Option<PathBuf>,
+    home: &Path,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<R2, String> {
+    if let Some(cred_file) = crate::config::load_credential_file(cred_dir, CRED_R2)? {
+        let vars = parse_env_file(
+            &fs::read_to_string(&cred_file)
+                .map_err(|error| format!("credential {CRED_R2}: {error}"))?,
+        );
+        let secret_needed = |name: &str| -> Result<String, String> {
+            vars.get(name)
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .ok_or_else(|| format!("credential {CRED_R2} is missing {name}"))
+        };
+        let setting_needed = |name: &str| -> Result<String, String> {
+            vars.get(name)
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .or_else(|| env_lookup(name))
+                .ok_or_else(|| format!("credential {CRED_R2} is missing {name}"))
+        };
+        let r2 = R2 {
+            endpoint: setting_needed("SPAWN_R2_ENDPOINT")?,
+            bucket: setting_needed("SPAWN_R2_BUCKET")?,
+            access_key: secret_needed("SPAWN_R2_ACCESS_KEY_ID")?,
+            secret_key: secret_needed("SPAWN_R2_SECRET_ACCESS_KEY")?,
+        };
+        not_locked_forever(&r2.bucket)?;
+        return Ok(r2);
+    }
+    let env_file = explicit_env_file.unwrap_or_else(|| home.join(".config/spawn/r2.env"));
+    private_file(&env_file, "the R2 environment")?;
+    let vars = parse_env_file(
+        &fs::read_to_string(&env_file)
+            .map_err(|error| format!("the R2 environment {}: {error}", env_file.display()))?,
+    );
+    let needed = |name: &str| -> Result<String, String> {
+        vars.get(name)
+            .cloned()
+            .or_else(|| env_lookup(name))
+            .ok_or_else(|| format!("{name} is not set in {}", env_file.display()))
+    };
+    let r2 = R2 {
+        endpoint: needed("SPAWN_R2_ENDPOINT")?,
+        bucket: needed("SPAWN_R2_BUCKET")?,
+        access_key: needed("SPAWN_R2_ACCESS_KEY_ID")?,
+        secret_key: needed("SPAWN_R2_SECRET_ACCESS_KEY")?,
+    };
+    not_locked_forever(&r2.bucket)?;
+    Ok(r2)
+}
+
 impl Settings {
     /// `key` as it is stored: under `SPAWN_BACKUP_PREFIX`, or as given.
     fn stored(&self, key: &str) -> String {
         format!("{}{key}", self.prefix)
     }
 
-    /// `spawn backup`'s settings: its bucket and credentials from r2.env
+    /// `spawn backup`'s settings: its bucket and credentials from Keep or r2.env
     /// ([`Self::backup_r2`]), never the keep bucket.
     /// It needs no key file: a reader reads each record with the key it
     /// names, and a run that seals takes [`Self::seal`].
@@ -557,33 +685,16 @@ impl Settings {
         Self::build(flags, Self::backup_r2, false)
     }
 
-    /// The bucket and credentials `spawn backup` works with: r2.env's
-    /// (`SPAWN_R2_ENV_FILE`), each value from it or else the environment.
-    /// A bucket locked for good ([`store::locked_forever`]) is refused here,
-    /// before any request: the store is the keep bucket's only writer, and
-    /// `spawn backup` has no business there (the lead, 2026-11-13).
+    /// The bucket and credentials `spawn backup` works with: Keep's
+    /// `$CREDENTIALS_DIRECTORY/r2.credentials` when present, else r2.env's
+    /// (`SPAWN_R2_ENV_FILE`), never allowing the keep bucket.
     fn backup_r2() -> Result<R2, String> {
-        let env_file = env_value("SPAWN_R2_ENV_FILE")
-            .map_or_else(|| home().join(".config/spawn/r2.env"), PathBuf::from);
-        private_file(&env_file, "the R2 environment")?;
-        let vars = parse_env_file(
-            &fs::read_to_string(&env_file)
-                .map_err(|error| format!("the R2 environment {}: {error}", env_file.display()))?,
-        );
-        let needed = |name: &str| -> Result<String, String> {
-            vars.get(name)
-                .cloned()
-                .or_else(|| env_value(name))
-                .ok_or_else(|| format!("{name} is not set in {}", env_file.display()))
-        };
-        let r2 = R2 {
-            endpoint: needed("SPAWN_R2_ENDPOINT")?,
-            bucket: needed("SPAWN_R2_BUCKET")?,
-            access_key: needed("SPAWN_R2_ACCESS_KEY_ID")?,
-            secret_key: needed("SPAWN_R2_SECRET_ACCESS_KEY")?,
-        };
-        not_locked_forever(&r2.bucket)?;
-        Ok(r2)
+        resolve_backup_r2(
+            env_value("CREDENTIALS_DIRECTORY").as_deref().map(Path::new),
+            env_value("SPAWN_R2_ENV_FILE").map(PathBuf::from),
+            &home(),
+            env_value,
+        )
     }
 
     /// The settings with the bucket and credentials `r2` gives (the store
@@ -635,7 +746,7 @@ SPAWN_BACKUP_R2_LIMIT_MB ({limit_bytes} bytes)"
             limit_bytes,
             alert_bytes,
             prefix,
-            drill_url: env_value("SPAWN_BACKUP_DRILL_DATABASE_URL"),
+            drill_url: drill_database_url()?,
         })
     }
 
@@ -1159,7 +1270,14 @@ pub(crate) const STORE_USAGE: &str = store::USAGE;
 /// `spawn store put|plan|get|list|verify` (the off-host copy's layer,
 /// [`store`]).
 pub(crate) fn store_command(arguments: &[String]) -> Result<i32, String> {
-    store::command(arguments)
+    store::command(arguments).or_else(|error| {
+        if is_credential_error(&error) {
+            eprintln!("spawn store: {error}");
+            Ok(CREDENTIAL_EXIT_CODE)
+        } else {
+            Err(error)
+        }
+    })
 }
 
 /// The entry point: `spawn backup dump|bundle|verify|restore-drill|cas [...]`.
@@ -1183,8 +1301,16 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
         "bundle" => bundle(&flags),
         "verify" => verify(&flags),
         "restore-drill" => restore_drill::restore_drill(&flags),
-        other => Err(format!("unknown backup command {other}\n{USAGE}")),
+        other => return Err(format!("unknown backup command {other}\n{USAGE}")),
     }
+    .or_else(|error| {
+        if is_credential_error(&error) {
+            eprintln!("spawn backup {verb}: {error}");
+            Ok(CREDENTIAL_EXIT_CODE)
+        } else {
+            Err(error)
+        }
+    })
 }
 
 /// `spawn backup dump`: one encrypted copy of the log, now.
@@ -1196,7 +1322,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
         Err(error) => {
             eprintln!("spawn backup dump: {error}");
             record_refusal("dump", &error);
-            return Ok(2);
+            return Ok(config_exit_code(&error));
         }
     };
     // Sealed with SPAWN_BACKUP_SEAL_KEY's key, never k1 in its place.
@@ -1205,12 +1331,12 @@ fn dump(flags: &Flags) -> Result<i32, String> {
         Err(reason) => {
             eprintln!("spawn backup dump: {reason}");
             record_refusal("dump", &reason);
-            return Ok(2);
+            return Ok(config_exit_code(&reason));
         }
     };
     let _lock = Lock::acquire(&settings.root)?;
     let store = open_store()?;
-    let url = parse_pg_url(&crate::config::required_env("SPAWN_DATABASE_URL")?)?;
+    let url = parse_pg_url(&database_url()?)?;
     let now_ms = store.now_ms().map_err(|error| error.to_string())?;
     let now = Stamp::at(now_ms);
     let previous = dump_records(&store, &settings.prefix, now_ms)?;
@@ -2204,7 +2330,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         Err(error) => {
             eprintln!("spawn backup bundle: {error}");
             record_refusal("bundle", &error);
-            return Ok(2);
+            return Ok(config_exit_code(&error));
         }
     };
     let seal = match settings.seal.clone() {
@@ -2212,7 +2338,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         Err(reason) => {
             eprintln!("spawn backup bundle: {reason}");
             record_refusal("bundle", &reason);
-            return Ok(2);
+            return Ok(config_exit_code(&reason));
         }
     };
     let _lock = Lock::acquire(&settings.root)?;
@@ -2729,7 +2855,7 @@ fn verify(flags: &Flags) -> Result<i32, String> {
                 &Drilled::default(),
                 started,
             );
-            return Ok(2);
+            return Ok(config_exit_code(&error));
         }
     };
     let _lock = Lock::acquire(&settings.root)?;
@@ -3677,7 +3803,7 @@ fn record_verified(
         "duration_ms": i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
     });
     if record["server"].is_null()
-        && let Some(drilled_url) = env_value("SPAWN_BACKUP_DRILL_DATABASE_URL")
+        && let Ok(Some(drilled_url)) = drill_database_url()
         && let Ok(url) = parse_pg_url(&drilled_url)
     {
         record["server"] = json!(url.server());
@@ -5065,5 +5191,139 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         );
         drop(made);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wave_k3_r2_prefers_keep_credentials_and_fails_closed() {
+        use super::resolve_backup_r2;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::storage::tests::scratch("backup-wave-k3-r2");
+        let home = dir.join("home");
+        let spawn_cfg = home.join(".config/spawn");
+        let cred_dir = dir.join("cred");
+        std::fs::create_dir_all(&spawn_cfg).expect("cfg");
+        std::fs::create_dir_all(&cred_dir).expect("cred_dir");
+
+        let legacy_key_id = "legacy_id_221";
+        let legacy_secret = "legacy_secret_221";
+        let r2_env = spawn_cfg.join("r2.env");
+        std::fs::write(
+            &r2_env,
+            format!(
+                "SPAWN_R2_ENDPOINT=https://legacy.r2.example\nSPAWN_R2_BUCKET=spawn-store\n\
+                 SPAWN_R2_ACCESS_KEY_ID={legacy_key_id}\nSPAWN_R2_SECRET_ACCESS_KEY={legacy_secret}\n"
+            ),
+        )
+        .expect("r2.env");
+        std::fs::set_permissions(&r2_env, std::fs::Permissions::from_mode(0o600)).expect("mode");
+
+        // No r2.credentials in cred_dir -> smooth fallback to r2.env.
+        let legacy = resolve_backup_r2(Some(&cred_dir), None, &home, |_| None).expect("fallback");
+        assert_eq!(legacy.access_key, legacy_key_id);
+        assert_eq!(legacy.bucket, "spawn-store");
+
+        // Keep r2.credentials (0400) overrides legacy r2.env + env.
+        let keep_id = "keep_id_994";
+        let keep_secret = "keep_secret_994";
+        let cred_r2 = cred_dir.join("r2.credentials");
+        std::fs::write(
+            &cred_r2,
+            format!(
+                "SPAWN_R2_ENDPOINT=https://keep.r2.example\nSPAWN_R2_BUCKET=keep-bkt\n\
+                 SPAWN_R2_ACCESS_KEY_ID={keep_id}\nSPAWN_R2_SECRET_ACCESS_KEY={keep_secret}\n"
+            ),
+        )
+        .expect("cred r2");
+        std::fs::set_permissions(&cred_r2, std::fs::Permissions::from_mode(0o400)).expect("mode");
+        let keep = resolve_backup_r2(Some(&cred_dir), Some(r2_env.clone()), &home, |_| {
+            Some("ignored-env".into())
+        })
+        .expect("keep r2");
+        assert_eq!(keep.access_key, keep_id);
+        assert_eq!(keep.secret_key, keep_secret);
+        assert_eq!(keep.bucket, "keep-bkt");
+
+        // Missing secret key inside r2.credentials fails closed (never falls back to env/r2.env).
+        std::fs::set_permissions(&cred_r2, std::fs::Permissions::from_mode(0o600)).expect("600");
+        std::fs::write(
+            &cred_r2,
+            format!("SPAWN_R2_ENDPOINT=https://keep.r2.example\nSPAWN_R2_BUCKET=keep-bkt\nSPAWN_R2_ACCESS_KEY_ID={keep_id}\n"),
+        )
+        .expect("partial r2");
+        std::fs::set_permissions(&cred_r2, std::fs::Permissions::from_mode(0o400)).expect("400");
+        let err_missing = resolve_backup_r2(Some(&cred_dir), Some(r2_env), &home, |_| {
+            Some("env-secret-must-not-rescue".into())
+        })
+        .unwrap_err();
+        assert!(
+            err_missing.starts_with("credential r2.credentials"),
+            "{err_missing}"
+        );
+        assert!(!err_missing.contains(keep_id));
+
+        // Bad permissions on r2.credentials fail closed without leaking secrets.
+        std::fs::set_permissions(&cred_r2, std::fs::Permissions::from_mode(0o600)).expect("600");
+        std::fs::write(
+            &cred_r2,
+            format!("SPAWN_R2_ACCESS_KEY_ID={keep_id}\nSPAWN_R2_SECRET_ACCESS_KEY={keep_secret}\n"),
+        )
+        .expect("restore");
+        std::fs::set_permissions(&cred_r2, std::fs::Permissions::from_mode(0o644)).expect("644");
+        let err_mode = resolve_backup_r2(Some(&cred_dir), None, &home, |_| None).unwrap_err();
+        assert!(
+            err_mode.starts_with("credential r2.credentials"),
+            "{err_mode}"
+        );
+        assert!(!err_mode.contains(keep_secret));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wave_k3_backup_key_prefers_keep_credentials_with_fallback() {
+        use super::find_key_with_credentials;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::storage::tests::scratch("backup-wave-k3-key");
+        let key_dir = dir.join("keys");
+        let cred_dir = dir.join("cred");
+        std::fs::create_dir_all(&key_dir).expect("key_dir");
+        std::fs::create_dir_all(&cred_dir).expect("cred_dir");
+
+        // Encryption key lookup: backup.key.k1 > backup.encryption-key > fallback.
+        let disk_k1 = key_dir.join("backup.key.k1");
+        std::fs::write(&disk_k1, MADE_UP_SECRET).expect("disk k1");
+        std::fs::set_permissions(&disk_k1, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        assert_eq!(
+            find_key_with_credentials("k1", Some(&cred_dir), None, &key_dir)
+                .unwrap()
+                .file,
+            disk_k1
+        );
+
+        let cred_alias = cred_dir.join("backup.encryption-key");
+        std::fs::write(&cred_alias, MADE_UP_SECRET).expect("alias");
+        std::fs::set_permissions(&cred_alias, std::fs::Permissions::from_mode(0o400)).expect("400");
+        assert_eq!(
+            find_key_with_credentials("k1", Some(&cred_dir), None, &key_dir)
+                .unwrap()
+                .file,
+            cred_alias
+        );
+
+        let primary_cred = cred_dir.join("backup.key.k1");
+        std::fs::write(&primary_cred, MADE_UP_SECRET).expect("cred k1");
+        std::fs::set_permissions(&primary_cred, std::fs::Permissions::from_mode(0o400))
+            .expect("400");
+        assert_eq!(
+            find_key_with_credentials("k1", Some(&cred_dir), Some(disk_k1), &key_dir)
+                .unwrap()
+                .file,
+            primary_cred
+        );
+        // k2 never consumes k1's alias backup.encryption-key.
+        assert!(find_key_with_credentials("k2", Some(&cred_dir), None, &key_dir).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

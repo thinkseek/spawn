@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use spawn_node_gateway::config::ConfigError;
 use spawn_node_gateway::{Config, Gateway, Settings, primary, spawn, system_clock};
 use spawn_postgres::PostgresStore;
 
@@ -21,27 +22,31 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("spawn-node-gateway: {error}");
-            ExitCode::FAILURE
+            eprintln!("spawn-node-gateway: {}", error.message);
+            ExitCode::from(error.exit_code)
         }
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<(), ConfigError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
             "usage: spawn-node-gateway [--public-prefix /path]\n\
-             environment: SPAWN_NODE_GATEWAY_DATABASE_URL, SPAWN_NODE_GATEWAY_KEY_FILE, \
-             SPAWN_NODE_ARTIFACTS, SPAWN_NODE_RESULTS (required); SPAWN_NODE_GATEWAY_LISTEN \
-             (127.0.0.1:18096), SPAWN_NODE_GATEWAY_CELLS (c0), SPAWN_NODE_GATEWAY_PUBLIC_PREFIX"
+             environment: SPAWN_NODE_GATEWAY_DATABASE_URL (or $CREDENTIALS_DIRECTORY/spawn-node-gateway.database-url), \
+             SPAWN_NODE_GATEWAY_KEY_FILE, SPAWN_NODE_ARTIFACTS, SPAWN_NODE_RESULTS (required); \
+             SPAWN_NODE_GATEWAY_LISTEN (127.0.0.1:18096), SPAWN_NODE_GATEWAY_CELLS (c0), SPAWN_NODE_GATEWAY_PUBLIC_PREFIX"
         );
         return Ok(());
     }
-    let config = Config::from_env(|name| std::env::var(name).ok(), &args)?;
-    let key = primary::load_or_create(&config.key_file)?;
+    let config = Config::from_env_with_credentials(|name| std::env::var(name).ok(), &args)?;
+    let fail = |message: String| ConfigError {
+        message,
+        exit_code: 1,
+    };
+    let key = primary::load_or_create(&config.key_file).map_err(fail)?;
     std::fs::create_dir_all(&config.results)
-        .map_err(|error| format!("{}: {error}", config.results.display()))?;
+        .map_err(|error| fail(format!("{}: {error}", config.results.display())))?;
     if !config.artifacts.is_dir() {
         eprintln!(
             "spawn-node-gateway: warning: {} is not a directory yet",
@@ -62,8 +67,8 @@ fn run() -> Result<(), String> {
         }),
     }));
     let listener = TcpListener::bind(config.listen)
-        .map_err(|error| format!("listen on {}: {error}", config.listen))?;
-    let addr = spawn(listener, &gateway, WORKERS).map_err(|error| error.to_string())?;
+        .map_err(|error| fail(format!("listen on {}: {error}", config.listen)))?;
+    let addr = spawn(listener, &gateway, WORKERS).map_err(|error| fail(error.to_string()))?;
     let primary = gateway.primary_key();
     eprintln!(
         "spawn-node-gateway: listening on {addr} (cells {}), primary key {} ({})",
