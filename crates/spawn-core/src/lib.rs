@@ -13,6 +13,7 @@ pub mod command;
 pub mod contract;
 pub mod control;
 pub mod driver;
+pub mod driver_codex;
 pub mod event;
 pub mod feature_coverage;
 pub mod feature_deps;

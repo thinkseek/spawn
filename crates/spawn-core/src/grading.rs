@@ -1715,7 +1715,15 @@ mod tests {
                 label_only: false
             }
         );
-        for label in ["codex", "opencode", "Claude", ""] {
+        p.engine_label = "codex".to_string();
+        assert_eq!(
+            p.driver_id(),
+            PresetDriver {
+                driver: "codex",
+                label_only: false
+            }
+        );
+        for label in ["opencode", "Claude", ""] {
             p.engine_label = label.to_string();
             assert_eq!(
                 p.driver_id(),

@@ -1251,7 +1251,10 @@ mod tests {
         let mut codex = claude.clone();
         codex.preset_id = "codex".to_string();
         codex.engine_label = "codex".to_string();
-        let answer = api_catalog(&[claude, agy, codex], &[], 1_000, 1_000);
+        let mut opencode = claude.clone();
+        opencode.preset_id = "opencode".to_string();
+        opencode.engine_label = "opencode".to_string();
+        let answer = api_catalog(&[claude, agy, codex, opencode], &[], 1_000, 1_000);
         let presets = answer["presets"].as_array().unwrap();
         let pairs: Vec<(Value, Value)> = presets
             .iter()
@@ -1262,6 +1265,7 @@ mod tests {
             [
                 (json!("claude"), json!(false)),
                 (json!("agy"), json!(false)),
+                (json!("codex"), json!(false)),
                 (json!("claude"), json!(true)),
             ]
         );

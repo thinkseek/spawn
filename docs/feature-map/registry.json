@@ -629,6 +629,7 @@
         "crates/spawn-core/src/command.rs",
         "crates/spawn-core/src/contract.rs",
         "crates/spawn-core/src/driver.rs",
+        "crates/spawn-core/src/driver_codex.rs",
         "crates/spawn-core/src/event.rs",
         "crates/spawn-core/src/id.rs",
         "crates/spawn-core/src/ingest.rs",
@@ -666,6 +667,7 @@
         "crates/spawn-core/tests/api.rs",
         "crates/spawn-core/tests/audit_lifecycle.rs",
         "crates/spawn-core/tests/background_jobs.rs",
+        "crates/spawn-core/tests/codex_driver.rs",
         "crates/spawn-core/tests/dependency_guard.rs",
         "crates/spawn-core/tests/spawn_ipc_v1.rs",
         "crates/spawn-core/tests/waiting_inputs.rs",
@@ -708,7 +710,8 @@
         "commits": [],
         "tests": [
           "crates/spawn-core/tests/api.rs",
-          "crates/spawn-core/tests/audit_lifecycle.rs"
+          "crates/spawn-core/tests/audit_lifecycle.rs",
+          "crates/spawn-core/tests/codex_driver.rs"
         ],
         "deploys": [],
         "artifacts": [],
