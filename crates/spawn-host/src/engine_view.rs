@@ -166,6 +166,322 @@ pub struct ExtraMount {
     pub writable: bool,
 }
 
+/// Closed set of agent engines whose filesystem views `engine_view` configures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ViewEngine {
+    /// Antigravity CLI (`agy`).
+    Agy,
+    /// Anthropic Claude Code (`claude`).
+    Claude,
+    /// OpenAI Codex CLI (`codex`).
+    Codex,
+}
+
+impl ViewEngine {
+    /// Every supported engine variant in canonical order.
+    pub const ALL: [Self; 3] = [Self::Agy, Self::Claude, Self::Codex];
+
+    /// Parse a launch engine identifier (`"agy"`, `"claude"`, `"codex"`).
+    #[must_use]
+    pub fn parse(id: &str) -> Option<Self> {
+        match id {
+            "agy" => Some(Self::Agy),
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+
+    /// Canonical engine identifier string.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Agy => "agy",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Environment variable overriding this engine's executable path.
+    #[must_use]
+    pub const fn program_env_var(self) -> &'static str {
+        match self {
+            Self::Agy => "SPAWN_AGY_PROGRAM",
+            Self::Claude => "SPAWN_CLAUDE_PROGRAM",
+            Self::Codex => "SPAWN_CODEX_PROGRAM",
+        }
+    }
+
+    /// Environment variable overriding this engine's off-home data root.
+    #[must_use]
+    pub const fn data_dir_env_var(self) -> &'static str {
+        match self {
+            Self::Agy => "SPAWN_AGY_DATA_DIR",
+            Self::Claude => "SPAWN_CLAUDE_DATA_DIR",
+            Self::Codex => "SPAWN_CODEX_DATA_DIR",
+        }
+    }
+
+    const fn scrubbed_env_vars(self) -> &'static [&'static str] {
+        match self {
+            Self::Claude => &["CODEX_HOME"],
+            Self::Agy => &["CLAUDE_CONFIG_DIR", "CODEX_HOME"],
+            Self::Codex => &["CLAUDE_CONFIG_DIR"],
+        }
+    }
+
+    const fn home_env_var(self) -> Option<&'static str> {
+        match self {
+            Self::Claude => Some("CLAUDE_CONFIG_DIR"),
+            Self::Codex => Some("CODEX_HOME"),
+            Self::Agy => None,
+        }
+    }
+}
+
+/// Where per-worker `agy` `home/` and `tmp/` directories live when
+/// `SPAWN_AGY_DATA_DIR` is configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgyWorkerHome {
+    /// Isolate per-worker `home/` and `tmp/` under `<root>/workers/<id>`
+    /// (default when `SPAWN_AGY_ISOLATE_WORKERS != "0"`).
+    PerWorker,
+    /// Bind the host `agy` home directly while keeping `<root>` for `brain/`
+    /// (`SPAWN_AGY_ISOLATE_WORKERS=0`).
+    Host,
+}
+
+/// Where `agy`'s `brain/` directory lives when `SPAWN_AGY_DATA_DIR` is
+/// configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgyBrain {
+    /// Share `<root>/brain` across workers (default).
+    Shared,
+    /// Isolate each worker's `brain/` inside `<root>/workers/<id>/home/brain`
+    /// (`SPAWN_AGY_ISOLATE_BRAIN=1|true|yes|on`).
+    PerWorker,
+}
+
+/// Off-home data root configuration for `agy` (`SPAWN_AGY_DATA_DIR`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgyDataDir {
+    /// Root directory on the host where per-worker and shared state live.
+    pub root: PathBuf,
+    /// Whether per-worker `home/` + `tmp/` are isolated under [`Self::root`].
+    pub home: AgyWorkerHome,
+    /// Whether `brain/` is shared under [`Self::root`] or isolated per worker.
+    pub brain: AgyBrain,
+}
+
+impl AgyDataDir {
+    /// Construct an `agy` data root isolating worker `home/` + `tmp/` per
+    /// worker while sharing `<root>/brain`.
+    #[must_use]
+    pub fn per_worker(root: PathBuf) -> Self {
+        Self {
+            root,
+            home: AgyWorkerHome::PerWorker,
+            brain: AgyBrain::Shared,
+        }
+    }
+
+    fn from_env(root: PathBuf, lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        let home = if lookup("SPAWN_AGY_ISOLATE_WORKERS")
+            .as_deref()
+            .map(str::trim)
+            == Some("0")
+        {
+            AgyWorkerHome::Host
+        } else {
+            AgyWorkerHome::PerWorker
+        };
+        let brain = if matches!(
+            lookup("SPAWN_AGY_ISOLATE_BRAIN")
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        ) {
+            AgyBrain::PerWorker
+        } else {
+            AgyBrain::Shared
+        };
+        Self { root, home, brain }
+    }
+}
+
+/// Configured host executable and/or off-home data root for one engine inside
+/// [`ViewConfig`].
+///
+/// Absence (`None` on a field of [`EngineViews`]) means neither is configured,
+/// so vacuous empty pairs are unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnginePaths<D = PathBuf> {
+    /// Executable path only (`SPAWN_*_PROGRAM` or resolved default command).
+    Program(PathBuf),
+    /// Off-home data root only (`SPAWN_*_DATA_DIR`).
+    Data(D),
+    /// Both executable path and off-home data root are configured.
+    Both {
+        /// Engine executable path.
+        program: PathBuf,
+        /// Off-home data root configuration.
+        data: D,
+    },
+}
+
+impl<D> EnginePaths<D> {
+    /// Construct an [`EnginePaths`] when at least one of `program` or `data` is
+    /// `Some`.
+    #[must_use]
+    pub fn from_parts(program: Option<PathBuf>, data: Option<D>) -> Option<Self> {
+        match (program, data) {
+            (Some(program), Some(data)) => Some(Self::Both { program, data }),
+            (Some(program), None) => Some(Self::Program(program)),
+            (None, Some(data)) => Some(Self::Data(data)),
+            (None, None) => None,
+        }
+    }
+
+    /// The engine executable path, if resolved.
+    #[must_use]
+    pub fn program(&self) -> Option<&Path> {
+        match self {
+            Self::Program(program) | Self::Both { program, .. } => Some(program),
+            Self::Data(_) => None,
+        }
+    }
+
+    /// The off-home data configuration, if enabled.
+    #[must_use]
+    pub fn data(&self) -> Option<&D> {
+        match self {
+            Self::Data(data) | Self::Both { data, .. } => Some(data),
+            Self::Program(_) => None,
+        }
+    }
+
+    /// Mutable access to the off-home data configuration, if enabled.
+    pub fn data_mut(&mut self) -> Option<&mut D> {
+        match self {
+            Self::Data(data) | Self::Both { data, .. } => Some(data),
+            Self::Program(_) => None,
+        }
+    }
+}
+
+/// Per-engine executable paths and off-home data roots indexed cleanly by
+/// engine, without illegal cross-engine isolation states.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineViews {
+    /// Antigravity CLI (`agy`) binary and optional off-home data root.
+    pub agy: Option<EnginePaths<AgyDataDir>>,
+    /// Claude Code binary and optional off-home data root.
+    pub claude: Option<EnginePaths<PathBuf>>,
+    /// OpenAI Codex CLI binary and optional off-home data root.
+    pub codex: Option<EnginePaths<PathBuf>>,
+}
+
+impl EngineViews {
+    /// Read per-engine programs and off-home data roots from `lookup`.
+    #[must_use]
+    pub fn from_env(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        let agy_program = resolve_program_env(
+            lookup,
+            ViewEngine::Agy.program_env_var(),
+            ViewEngine::Agy.id(),
+        );
+        let agy_data = clean_dir_env(lookup, ViewEngine::Agy.data_dir_env_var())
+            .map(|root| AgyDataDir::from_env(root, lookup));
+        let claude_program = resolve_program_env(
+            lookup,
+            ViewEngine::Claude.program_env_var(),
+            ViewEngine::Claude.id(),
+        );
+        let claude_data = clean_dir_env(lookup, ViewEngine::Claude.data_dir_env_var());
+        let codex_program = resolve_program_env(
+            lookup,
+            ViewEngine::Codex.program_env_var(),
+            ViewEngine::Codex.id(),
+        );
+        let codex_data = clean_dir_env(lookup, ViewEngine::Codex.data_dir_env_var());
+        Self {
+            agy: EnginePaths::from_parts(agy_program, agy_data),
+            claude: EnginePaths::from_parts(claude_program, claude_data),
+            codex: EnginePaths::from_parts(codex_program, codex_data),
+        }
+    }
+
+    /// Executable path configured or resolved for `engine`.
+    #[must_use]
+    pub fn program(&self, engine: ViewEngine) -> Option<&Path> {
+        match engine {
+            ViewEngine::Agy => self.agy.as_ref().and_then(EnginePaths::program),
+            ViewEngine::Claude => self.claude.as_ref().and_then(EnginePaths::program),
+            ViewEngine::Codex => self.codex.as_ref().and_then(EnginePaths::program),
+        }
+    }
+
+    /// Off-home data root directory path for `engine`.
+    #[must_use]
+    pub fn data_dir(&self, engine: ViewEngine) -> Option<&Path> {
+        match engine {
+            ViewEngine::Agy => self.agy_data().map(|data| data.root.as_path()),
+            ViewEngine::Claude => self
+                .claude
+                .as_ref()
+                .and_then(EnginePaths::data)
+                .map(PathBuf::as_path),
+            ViewEngine::Codex => self
+                .codex
+                .as_ref()
+                .and_then(EnginePaths::data)
+                .map(PathBuf::as_path),
+        }
+    }
+
+    /// Full `agy` off-home data root configuration, if enabled.
+    #[must_use]
+    pub fn agy_data(&self) -> Option<&AgyDataDir> {
+        self.agy.as_ref().and_then(EnginePaths::data)
+    }
+
+    /// Whether `engine` isolates per-worker `home/` and `tmp/` directories
+    /// under an off-home data root.
+    #[must_use]
+    pub fn isolates_workers(&self, engine: ViewEngine) -> bool {
+        match engine {
+            ViewEngine::Agy => self
+                .agy_data()
+                .is_some_and(|data| data.home == AgyWorkerHome::PerWorker),
+            ViewEngine::Claude | ViewEngine::Codex => self.data_dir(engine).is_some(),
+        }
+    }
+
+    /// Whether `agy` isolates `brain/` per worker under its off-home data root.
+    #[must_use]
+    pub fn isolates_agy_brain(&self) -> bool {
+        self.agy_data()
+            .is_some_and(|data| data.brain == AgyBrain::PerWorker)
+    }
+
+    /// Force `agy` `brain/` sharing (`AgyBrain::Shared`) when `SPAWN_AGY_DATA_DIR`
+    /// is configured.
+    pub fn disable_agy_brain_isolation(&mut self) {
+        if let Some(data) = self.agy.as_mut().and_then(EnginePaths::data_mut) {
+            data.brain = AgyBrain::Shared;
+        }
+    }
+
+    /// Configured `(engine, root)` off-home data directories across every engine.
+    pub fn data_dirs(&self) -> impl Iterator<Item = (ViewEngine, &Path)> {
+        ViewEngine::ALL
+            .into_iter()
+            .filter_map(|engine| self.data_dir(engine).map(|root| (engine, root)))
+    }
+}
+
 /// What a view hides and where it keeps its own empty file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewConfig {
@@ -201,33 +517,12 @@ pub struct ViewConfig {
     pub home_isolation: HomeIsolation,
     /// Additional mounts from `SPAWN_ENGINE_VIEW_WRITABLE`.
     pub extra_mounts: Vec<ExtraMount>,
-    /// Optional off-home data root for `agy` (`SPAWN_AGY_DATA_DIR`).
-    pub agy_data_dir: Option<PathBuf>,
-    /// Whether per-worker `agy` homes and temp dirs are isolated under
-    /// `agy_data_dir` (`SPAWN_AGY_ISOLATE_WORKERS != "0"` when `agy_data_dir`
-    /// is set).
-    pub isolate_workers: bool,
-    /// Whether each worker's `agy` `brain/` directory is isolated per worker
-    /// under `agy_data_dir` (`SPAWN_AGY_ISOLATE_BRAIN=1|true|yes|on` when
-    /// `agy_data_dir` is set; default `false` so `brain/` is shared).
-    pub isolate_brain: bool,
-    /// Executable path of `agy` (`SPAWN_AGY_PROGRAM` else `agy` on `PATH`),
-    /// RO-bound in whitelist mode if located under `$HOME`.
-    pub agy_program: Option<PathBuf>,
     /// Safe host toolchain/config inheritance policy (`SPAWN_SANDBOX_INHERIT_HOST`).
     pub inherit_host: HostInheritMode,
     /// Explicit host paths read-only inherited (`SPAWN_SANDBOX_INHERIT_HOST_PATHS`).
     pub inherit_host_paths: Vec<PathBuf>,
-    /// Executable path of `claude` (`SPAWN_CLAUDE_PROGRAM` else `claude` on `PATH`),
-    /// RO-bound in whitelist mode if located under `$HOME`.
-    pub claude_program: Option<PathBuf>,
-    /// Optional off-home data root for `claude` (`SPAWN_CLAUDE_DATA_DIR`).
-    pub claude_data_dir: Option<PathBuf>,
-    /// Executable path of `codex` (`SPAWN_CODEX_PROGRAM` else `codex` on `PATH`),
-    /// RO-bound in whitelist mode if located under `$HOME`.
-    pub codex_program: Option<PathBuf>,
-    /// Optional off-home data root for `codex` (`SPAWN_CODEX_DATA_DIR`).
-    pub codex_data_dir: Option<PathBuf>,
+    /// Per-engine executable paths and off-home data root configuration.
+    pub engines: EngineViews,
 }
 
 fn trim_trailing_slash(raw: &str) -> &str {
@@ -331,22 +626,6 @@ impl ViewConfig {
         let extra_mounts = lookup("SPAWN_ENGINE_VIEW_WRITABLE")
             .map(|raw| parse_extra_mounts(&raw))
             .unwrap_or_default();
-        let agy_data_dir = clean_dir_env(lookup, "SPAWN_AGY_DATA_DIR");
-        let isolate_workers = agy_data_dir.is_some()
-            && lookup("SPAWN_AGY_ISOLATE_WORKERS")
-                .as_deref()
-                .map(str::trim)
-                != Some("0");
-        let isolate_brain = agy_data_dir.is_some()
-            && matches!(
-                lookup("SPAWN_AGY_ISOLATE_BRAIN")
-                    .as_deref()
-                    .map(str::trim)
-                    .map(str::to_ascii_lowercase)
-                    .as_deref(),
-                Some("1" | "true" | "yes" | "on")
-            );
-        let agy_program = resolve_program_env(lookup, "SPAWN_AGY_PROGRAM", "agy");
         let inherit_host = match lookup("SPAWN_SANDBOX_INHERIT_HOST")
             .as_deref()
             .map(str::trim)
@@ -357,10 +636,6 @@ impl ViewConfig {
         let inherit_host_paths = lookup("SPAWN_SANDBOX_INHERIT_HOST_PATHS")
             .map(|raw| parse_inherit_host_paths(&raw))
             .unwrap_or_default();
-        let claude_program = resolve_program_env(lookup, "SPAWN_CLAUDE_PROGRAM", "claude");
-        let claude_data_dir = clean_dir_env(lookup, "SPAWN_CLAUDE_DATA_DIR");
-        let codex_program = resolve_program_env(lookup, "SPAWN_CODEX_PROGRAM", "codex");
-        let codex_data_dir = clean_dir_env(lookup, "SPAWN_CODEX_DATA_DIR");
         Self {
             xdg_config_home: lookup("XDG_CONFIG_HOME")
                 .filter(|dir| dir.starts_with('/'))
@@ -380,16 +655,9 @@ impl ViewConfig {
             canonical_workspace,
             home_isolation,
             extra_mounts,
-            agy_data_dir,
-            isolate_workers,
-            isolate_brain,
-            agy_program,
             inherit_host,
             inherit_host_paths,
-            claude_program,
-            claude_data_dir,
-            codex_program,
-            codex_data_dir,
+            engines: EngineViews::from_env(lookup),
         }
     }
 
@@ -660,7 +928,7 @@ impl BwrapView {
     }
 
     /// Validate [`ViewConfig`] invariants (`canonical_workspace`,
-    /// `extra_mounts`, `agy_data_dir`, `claude_data_dir`, `codex_data_dir`,
+    /// `extra_mounts`, configured [`EngineViews`] data roots,
     /// `inherit_host_paths`, and whitelist `$HOME`).
     fn validate_config(&self) -> Result<(), String> {
         validate_config_for(&self.config)
@@ -671,7 +939,10 @@ impl BwrapView {
     /// another masked directory included: the writable binds are checked
     /// against every one ([`BwrapView::refuse_binds_for`]), and only the words
     /// leave the nested ones out ([`prune_nested`]).
-    fn targets_for(&self, engine: &str) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, String)>) {
+    fn targets_for(
+        &self,
+        engine: Option<ViewEngine>,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, String)>) {
         let home =
             std::fs::canonicalize(&self.config.home).unwrap_or_else(|_| self.config.home.clone());
         let mut skipped = Vec::new();
@@ -732,7 +1003,7 @@ impl BwrapView {
         }
         if self.config.inherit_host == HostInheritMode::Auto
             && self.config.home_isolation == HomeIsolation::Blacklist
-            && engine != "claude"
+            && engine != Some(ViewEngine::Claude)
         {
             for rel in [".cargo/credentials", ".cargo/credentials.toml"] {
                 let candidate = self.config.home.join(rel);
@@ -770,34 +1041,36 @@ impl BwrapView {
             .collect()
     }
 
-    fn allowed_self_homes_for(&self, engine: &str) -> Vec<PathBuf> {
+    fn allowed_self_homes_for(&self, engine: Option<ViewEngine>) -> Vec<PathBuf> {
         match engine {
-            "claude" => self.canonical_claude_homes(),
-            "codex" => self.canonical_codex_homes(),
-            _ => Vec::new(),
+            Some(ViewEngine::Claude) => self.canonical_claude_homes(),
+            Some(ViewEngine::Codex) => self.canonical_codex_homes(),
+            Some(ViewEngine::Agy) | None => Vec::new(),
         }
     }
 
     fn omit_self_engine_mask(
         &self,
-        engine: &str,
+        engine: Option<ViewEngine>,
         engine_home: &Path,
         directories: &mut Vec<PathBuf>,
     ) {
         if self.config.home_isolation != HomeIsolation::Blacklist {
             return;
         }
-        let allowed = match engine {
-            "claude" if self.config.claude_data_dir.is_none() => self.canonical_claude_homes(),
-            "codex" if self.config.codex_data_dir.is_none() => self.canonical_codex_homes(),
-            _ => return,
+        let Some(engine) = engine else {
+            return;
         };
+        if self.config.engines.data_dir(engine).is_some() {
+            return;
+        }
+        let allowed = self.allowed_self_homes_for(Some(engine));
         if allowed.iter().any(|dir| dir == engine_home) {
             directories.retain(|dir| dir != engine_home);
         }
     }
 
-    fn canonical_engine_homes_for(&self, engine: &str) -> Vec<PathBuf> {
+    fn canonical_engine_homes_for(&self, engine: Option<ViewEngine>) -> Vec<PathBuf> {
         let mut homes: Vec<PathBuf> = ENGINE_HOMES
             .iter()
             .flat_map(|dir| self.config.below_home(dir))
@@ -807,18 +1080,18 @@ impl BwrapView {
                     .or_else(|| prospective_canonical(&dir).ok())
             })
             .collect();
-        if engine == "claude" {
+        if engine == Some(ViewEngine::Claude) {
             homes.extend(self.canonical_claude_homes());
         }
         homes
     }
 
-    fn forbidden_home_targets_for(&self, engine: &str) -> Vec<PathBuf> {
+    fn forbidden_home_targets_for(&self, engine: Option<ViewEngine>) -> Vec<PathBuf> {
+        let is_claude = engine == Some(ViewEngine::Claude);
         let mut paths = Vec::new();
         for dir in HOME_DIRECTORIES.iter().copied().filter(|dir| {
             !(ENGINE_HOMES.contains(dir)
-                || (engine == "claude"
-                    && (*dir == ".claude" || *dir == ".local/state/spawn/claude-config")))
+                || (is_claude && (*dir == ".claude" || *dir == ".local/state/spawn/claude-config")))
         }) {
             paths.extend(self.config.below_home(dir));
         }
@@ -828,7 +1101,7 @@ impl BwrapView {
         if let Some(state) = &self.config.xdg_state_home {
             paths.push(state.join("herdr-core"));
             paths.push(state.join("cc-socks"));
-            if engine != "claude" {
+            if !is_claude {
                 paths.push(state.join("spawn/claude-config"));
             }
         }
@@ -849,7 +1122,7 @@ impl BwrapView {
     /// directory (see the module's documentation).
     fn refuse_binds_for(
         &self,
-        engine: &str,
+        engine: Option<ViewEngine>,
         ctx: &BindContext<'_>,
         engine_home: &Path,
     ) -> Result<(), String> {
@@ -911,7 +1184,7 @@ impl BwrapView {
             ));
         }
         for forbidden in self.forbidden_home_targets_for(engine) {
-            if (whitelist || engine == "claude" || engine == "codex")
+            if (whitelist || matches!(engine, Some(ViewEngine::Claude | ViewEngine::Codex)))
                 && paths_overlap(engine_home, &forbidden)
             {
                 return Err(format!(
@@ -983,18 +1256,17 @@ impl BwrapView {
     /// static read-only overlays, and `brain/` binding plan when
     /// `SPAWN_AGY_DATA_DIR` is enabled for `agy`.
     fn prepare_agy_data(
-        &self,
-        root: &Path,
+        data: &AgyDataDir,
         launch: &ViewedLaunch<'_>,
         host_engine_home: &Path,
         ctx: &BindContext<'_>,
         home: &Path,
     ) -> Result<AgyDataPlan, String> {
         let (canonical_root, _worker_base, worker_home, worker_tmp) =
-            prepare_worker_dirs(root, "SPAWN_AGY_DATA_DIR", launch, ctx, home)?;
+            prepare_worker_dirs(&data.root, "SPAWN_AGY_DATA_DIR", launch, ctx, home)?;
         ensure_dir_0700(&worker_home.join("brain"), "worker brain")?;
         let mut overlays = Vec::new();
-        if self.config.isolate_workers {
+        if data.home == AgyWorkerHome::PerWorker {
             for rel in [
                 "installation_id",
                 "jetski_state.pbtxt",
@@ -1043,14 +1315,16 @@ impl BwrapView {
                 overlays.push((canonical, "antigravity-oauth-token"));
             }
         }
-        let shared_brain = if self.config.isolate_brain {
-            None
-        } else {
-            let shared = ensure_dir_0700(&canonical_root.join("brain"), "shared brain")?;
-            Self::refuse_extra_target(&shared, "shared brain", ctx, home)?;
-            Some(shared)
+        let shared_brain = match data.brain {
+            AgyBrain::PerWorker => None,
+            AgyBrain::Shared => {
+                let shared = ensure_dir_0700(&canonical_root.join("brain"), "shared brain")?;
+                Self::refuse_extra_target(&shared, "shared brain", ctx, home)?;
+                Some(shared)
+            }
         };
         Ok(AgyDataPlan {
+            home: data.home,
             worker_home,
             worker_tmp,
             overlays,
@@ -1177,7 +1451,7 @@ impl BwrapView {
 
     fn resolve_engine_ro_binaries(
         &self,
-        launch: &ViewedLaunch<'_>,
+        engine: Option<ViewEngine>,
         home: &Path,
         engine_home: &Path,
         ctx: &BindContext<'_>,
@@ -1185,13 +1459,7 @@ impl BwrapView {
         if self.config.home_isolation != HomeIsolation::Whitelist {
             return Vec::new();
         }
-        let prog = match launch.engine {
-            "agy" => self.config.agy_program.as_deref(),
-            "claude" => self.config.claude_program.as_deref(),
-            "codex" => self.config.codex_program.as_deref(),
-            _ => None,
-        };
-        let Some(prog) = prog else {
+        let Some(prog) = engine.and_then(|kind| self.config.engines.program(kind)) else {
             return Vec::new();
         };
         let Ok(canon) = std::fs::canonicalize(prog) else {
@@ -1200,14 +1468,22 @@ impl BwrapView {
         if !std::fs::symlink_metadata(&canon).is_ok_and(|meta| meta.is_file()) {
             return Vec::new();
         }
-        let forbidden = self.forbidden_home_targets_for(launch.engine);
-        let safe = |dest: &Path| {
-            dest.starts_with(home)
-                && dest != home
-                && !paths_overlap(dest, ctx.private)
-                && !paths_overlap(dest, engine_home)
-                && !forbidden.iter().any(|bad| paths_overlap(dest, bad))
+        let forbidden = self.forbidden_home_targets_for(engine);
+        let engine_homes = self.canonical_engine_homes_for(engine);
+        let blocked = |path: &Path| {
+            paths_overlap(path, ctx.private)
+                || paths_overlap(path, engine_home)
+                || engine_homes.iter().any(|dir| paths_overlap(path, dir))
+                || forbidden.iter().any(|bad| paths_overlap(path, bad))
+                || ctx
+                    .masked
+                    .iter()
+                    .any(|mask| **mask != home && paths_overlap(path, mask))
         };
+        if blocked(&canon) || is_secret_candidate(&canon) {
+            return Vec::new();
+        }
+        let safe = |dest: &Path| dest.starts_with(home) && dest != home && !blocked(dest);
         collect_program_ro_binds(prog, &canon, &safe)
     }
 
@@ -1331,7 +1607,7 @@ impl BwrapView {
 
     fn resolve_host_inherit_ro_binds(
         &self,
-        engine: &str,
+        engine: Option<ViewEngine>,
         bind: &BindContext<'_>,
         home: &Path,
         engine_home: &Path,
@@ -1525,53 +1801,55 @@ impl BwrapView {
     }
 
     fn append_agy_binds<'a>(
-        &self,
         words: &mut Vec<String>,
         bound_dests: &mut Vec<&'a Path>,
         engine_home: &'a Path,
         tmpdir: &'a Path,
         plan: &AgyDataPlan,
     ) {
-        if self.config.isolate_workers {
-            bound_dests.push(engine_home);
-            words.extend([
-                "--bind".to_string(),
-                path_word(&plan.worker_home),
-                path_word(engine_home),
-            ]);
-            for (src, rel) in &plan.overlays {
-                words.extend([
-                    "--ro-bind".to_string(),
-                    path_word(src),
-                    path_word(&engine_home.join(rel)),
-                ]);
-            }
-            if let Some(shared_brain) = &plan.shared_brain {
+        match plan.home {
+            AgyWorkerHome::PerWorker => {
+                bound_dests.push(engine_home);
                 words.extend([
                     "--bind".to_string(),
-                    path_word(shared_brain),
+                    path_word(&plan.worker_home),
+                    path_word(engine_home),
+                ]);
+                for (src, rel) in &plan.overlays {
+                    words.extend([
+                        "--ro-bind".to_string(),
+                        path_word(src),
+                        path_word(&engine_home.join(rel)),
+                    ]);
+                }
+                if let Some(shared_brain) = &plan.shared_brain {
+                    words.extend([
+                        "--bind".to_string(),
+                        path_word(shared_brain),
+                        path_word(&engine_home.join("brain")),
+                    ]);
+                }
+                words.extend([
+                    "--bind".to_string(),
+                    path_word(tmpdir),
+                    path_word(tmpdir),
+                    "--setenv".to_string(),
+                    "XDG_CACHE_HOME".to_string(),
+                    path_word(&engine_home.join("xdg-cache")),
+                ]);
+            }
+            AgyWorkerHome::Host => {
+                Self::append_default_engine_binds(words, bound_dests, engine_home, tmpdir);
+                let brain_src = plan
+                    .shared_brain
+                    .clone()
+                    .unwrap_or_else(|| plan.worker_home.join("brain"));
+                words.extend([
+                    "--bind".to_string(),
+                    path_word(&brain_src),
                     path_word(&engine_home.join("brain")),
                 ]);
             }
-            words.extend([
-                "--bind".to_string(),
-                path_word(tmpdir),
-                path_word(tmpdir),
-                "--setenv".to_string(),
-                "XDG_CACHE_HOME".to_string(),
-                path_word(&engine_home.join("xdg-cache")),
-            ]);
-        } else {
-            Self::append_default_engine_binds(words, bound_dests, engine_home, tmpdir);
-            let brain_src = plan
-                .shared_brain
-                .clone()
-                .unwrap_or_else(|| plan.worker_home.join("brain"));
-            words.extend([
-                "--bind".to_string(),
-                path_word(&brain_src),
-                path_word(&engine_home.join("brain")),
-            ]);
         }
     }
 
@@ -1652,7 +1930,7 @@ impl BwrapView {
 
     fn append_engine_isolation_env(
         words: &mut Vec<String>,
-        engine: &str,
+        engine: Option<ViewEngine>,
         binds: &PlannedBinds<'_>,
     ) {
         words.extend([
@@ -1663,28 +1941,17 @@ impl BwrapView {
             "XDG_RUNTIME_DIR".to_string(),
             path_word(binds.worker_runtime),
         ]);
-        match engine {
-            "claude" => {
-                words.extend(["--unsetenv".to_string(), "CODEX_HOME".to_string()]);
+        if let Some(engine) = engine {
+            for var in engine.scrubbed_env_vars() {
+                words.extend(["--unsetenv".to_string(), (*var).to_string()]);
             }
-            "agy" => {
-                words.extend([
-                    "--unsetenv".to_string(),
-                    "CLAUDE_CONFIG_DIR".to_string(),
-                    "--unsetenv".to_string(),
-                    "CODEX_HOME".to_string(),
-                ]);
-            }
-            "codex" => {
-                words.extend(["--unsetenv".to_string(), "CLAUDE_CONFIG_DIR".to_string()]);
-            }
-            _ => {}
         }
     }
 
     fn append_binds_and_env(
         &self,
         words: &mut Vec<String>,
+        engine: Option<ViewEngine>,
         launch: &ViewedLaunch<'_>,
         binds: &PlannedBinds<'_>,
     ) {
@@ -1699,56 +1966,55 @@ impl BwrapView {
             path_word(binds.workspace_dest),
         ]);
 
-        if let Some(plan) = binds.agy_plan {
-            self.append_agy_binds(
-                words,
-                &mut bound_dests,
-                binds.engine_home,
-                binds.tmpdir,
-                plan,
-            );
-        } else if let Some(plan) = binds.claude_plan {
-            Self::append_claude_binds(
-                words,
-                &mut bound_dests,
-                binds.home,
-                binds.engine_home,
-                binds.tmpdir,
-                plan,
-            );
-        } else if let Some(plan) = binds.codex_plan {
-            Self::append_codex_binds(
-                words,
-                &mut bound_dests,
-                binds.engine_home,
-                binds.tmpdir,
-                plan,
-            );
-        } else {
-            Self::append_default_engine_binds(
-                words,
-                &mut bound_dests,
-                binds.engine_home,
-                binds.tmpdir,
-            );
-            if launch.engine == "claude" {
-                if binds.mask_claude_cc_socks {
+        match binds.data_plan {
+            Some(EngineDataPlan::Agy(plan)) => {
+                Self::append_agy_binds(
+                    words,
+                    &mut bound_dests,
+                    binds.engine_home,
+                    binds.tmpdir,
+                    plan,
+                );
+            }
+            Some(EngineDataPlan::Claude(plan)) => {
+                Self::append_claude_binds(
+                    words,
+                    &mut bound_dests,
+                    binds.home,
+                    binds.engine_home,
+                    binds.tmpdir,
+                    plan,
+                );
+            }
+            Some(EngineDataPlan::Codex(plan)) => {
+                Self::append_codex_binds(
+                    words,
+                    &mut bound_dests,
+                    binds.engine_home,
+                    binds.tmpdir,
+                    plan,
+                );
+            }
+            None => {
+                Self::append_default_engine_binds(
+                    words,
+                    &mut bound_dests,
+                    binds.engine_home,
+                    binds.tmpdir,
+                );
+                if engine == Some(ViewEngine::Claude) && binds.mask_claude_cc_socks {
                     words.extend([
                         "--tmpfs".to_string(),
                         path_word(&binds.engine_home.join("cc-socks")),
                     ]);
                 }
-                words.extend([
-                    "--setenv".to_string(),
-                    "CLAUDE_CONFIG_DIR".to_string(),
-                    path_word(binds.engine_home),
-                ]);
-            } else if launch.engine == "codex" {
-                words.extend([
-                    "--setenv".to_string(),
-                    "CODEX_HOME".to_string(),
-                    path_word(binds.engine_home),
-                ]);
+                if let Some(var) = engine.and_then(ViewEngine::home_env_var) {
+                    words.extend([
+                        "--setenv".to_string(),
+                        var.to_string(),
+                        path_word(binds.engine_home),
+                    ]);
+                }
             }
         }
 
@@ -1760,7 +2026,7 @@ impl BwrapView {
             words.extend(["--ro-bind".to_string(), path_word(src), path_word(dest)]);
         }
 
-        Self::append_engine_isolation_env(words, launch.engine, binds);
+        Self::append_engine_isolation_env(words, engine, binds);
         self.append_canonical_env(words, launch, binds);
         words.extend([
             "--chdir".to_string(),
@@ -1771,7 +2037,7 @@ impl BwrapView {
 
     fn resolve_engine_home_for_plan(
         &self,
-        engine: &str,
+        engine: Option<ViewEngine>,
         wanted: &Path,
         ctx: &BindContext<'_>,
         directories: &[PathBuf],
@@ -1815,38 +2081,59 @@ impl BwrapView {
     }
 }
 
-#[derive(Default)]
-struct DataPlans {
-    agy: Option<AgyDataPlan>,
-    claude: Option<ClaudeDataPlan>,
-    codex: Option<CodexDataPlan>,
+enum EngineDataPlan {
+    Agy(AgyDataPlan),
+    Claude(ClaudeDataPlan),
+    Codex(CodexDataPlan),
+}
+
+impl EngineDataPlan {
+    fn worker_tmp(&self) -> Option<&Path> {
+        match self {
+            Self::Agy(plan) => {
+                (plan.home == AgyWorkerHome::PerWorker).then_some(plan.worker_tmp.as_path())
+            }
+            Self::Claude(plan) => Some(plan.worker_tmp.as_path()),
+            Self::Codex(plan) => Some(plan.worker_tmp.as_path()),
+        }
+    }
 }
 
 impl BwrapView {
-    fn prepare_data_plans(
+    fn prepare_data_plan(
         &self,
+        engine: Option<ViewEngine>,
         launch: &ViewedLaunch<'_>,
         engine_home: &Path,
         ctx: &BindContext<'_>,
         home: &Path,
-    ) -> Result<DataPlans, String> {
-        Ok(DataPlans {
-            agy: (launch.engine == "agy")
-                .then_some(self.config.agy_data_dir.as_deref())
-                .flatten()
-                .map(|root| self.prepare_agy_data(root, launch, engine_home, ctx, home))
-                .transpose()?,
-            claude: (launch.engine == "claude")
-                .then_some(self.config.claude_data_dir.as_deref())
-                .flatten()
+    ) -> Result<Option<EngineDataPlan>, String> {
+        let Some(engine) = engine else {
+            return Ok(None);
+        };
+        match engine {
+            ViewEngine::Agy => self
+                .config
+                .engines
+                .agy_data()
+                .map(|data| Self::prepare_agy_data(data, launch, engine_home, ctx, home))
+                .transpose()
+                .map(|opt| opt.map(EngineDataPlan::Agy)),
+            ViewEngine::Claude => self
+                .config
+                .engines
+                .data_dir(ViewEngine::Claude)
                 .map(|root| Self::prepare_claude_data(root, launch, engine_home, ctx, home))
-                .transpose()?,
-            codex: (launch.engine == "codex")
-                .then_some(self.config.codex_data_dir.as_deref())
-                .flatten()
+                .transpose()
+                .map(|opt| opt.map(EngineDataPlan::Claude)),
+            ViewEngine::Codex => self
+                .config
+                .engines
+                .data_dir(ViewEngine::Codex)
                 .map(|root| Self::prepare_codex_data(root, launch, engine_home, ctx, home))
-                .transpose()?,
-        })
+                .transpose()
+                .map(|opt| opt.map(EngineDataPlan::Codex)),
+        }
     }
 
     /// The view of one launch: every target resolved now, the masks first
@@ -1855,6 +2142,7 @@ impl BwrapView {
     /// cannot be made.
     pub fn plan(&self, launch: &ViewedLaunch<'_>) -> Result<Plan, String> {
         self.validate_config()?;
+        let engine = ViewEngine::parse(launch.engine);
         let workspace = canonical_directory(Path::new(launch.workspace), "the workspace")?;
         let workspace_dest = self
             .config
@@ -1864,7 +2152,7 @@ impl BwrapView {
         let home =
             std::fs::canonicalize(&self.config.home).unwrap_or_else(|_| self.config.home.clone());
         let private = self.private_dir()?;
-        let (all_directories, all_files, mut skipped) = self.targets_for(launch.engine);
+        let (all_directories, all_files, mut skipped) = self.targets_for(engine);
         let masked: Vec<&PathBuf> = all_directories.iter().chain(all_files.iter()).collect();
         let ctx = BindContext {
             workspace_src: &workspace,
@@ -1874,43 +2162,35 @@ impl BwrapView {
         };
         let (mut directories, files) = prune_nested(&all_directories, &all_files);
 
-        let isolate_agy_workers = launch.engine == "agy"
-            && self.config.agy_data_dir.is_some()
-            && self.config.isolate_workers;
+        let isolate_agy_workers = engine == Some(ViewEngine::Agy)
+            && self.config.engines.isolates_workers(ViewEngine::Agy);
         let engine_home = self.resolve_engine_home_for_plan(
-            launch.engine,
+            engine,
             Path::new(launch.engine_home),
             &ctx,
             &directories,
             isolate_agy_workers,
         )?;
-        self.omit_self_engine_mask(launch.engine, &engine_home, &mut directories);
+        self.omit_self_engine_mask(engine, &engine_home, &mut directories);
 
-        let plans = self.prepare_data_plans(launch, &engine_home, &ctx, &home)?;
-        let mask_claude_cc_socks = if launch.engine == "claude" && plans.claude.is_none() {
+        let data_plan = self.prepare_data_plan(engine, launch, &engine_home, &ctx, &home)?;
+        let mask_claude_cc_socks = if engine == Some(ViewEngine::Claude) && data_plan.is_none() {
             ensure_dir_0700(&engine_home.join("cc-socks"), "claude cc-socks")?;
             true
         } else {
             false
         };
-        let tmpdir = match (&plans.agy, &plans.claude, &plans.codex) {
-            (Some(plan), _, _) if self.config.isolate_workers => plan.worker_tmp.clone(),
-            (_, Some(plan), _) => plan.worker_tmp.clone(),
-            (_, _, Some(plan)) => plan.worker_tmp.clone(),
-            _ => engine_tmpdir(&engine_home)?,
+        let tmpdir = match data_plan.as_ref().and_then(EngineDataPlan::worker_tmp) {
+            Some(worker_tmp) => worker_tmp.to_path_buf(),
+            None => engine_tmpdir(&engine_home)?,
         };
         let worker_runtime =
             self.resolve_worker_runtime(&directories, &engine_home, &workspace, &tmpdir)?;
         let extra_binds = self.resolve_extra_mounts(&ctx, &home, &engine_home)?;
-        let host_inherit_binds = self.resolve_host_inherit_ro_binds(
-            launch.engine,
-            &ctx,
-            &home,
-            &engine_home,
-            &mut skipped,
-        )?;
+        let host_inherit_binds =
+            self.resolve_host_inherit_ro_binds(engine, &ctx, &home, &engine_home, &mut skipped)?;
         let engine_ro_binaries: Vec<(PathBuf, PathBuf)> = self
-            .resolve_engine_ro_binaries(launch, &home, &engine_home, &ctx)
+            .resolve_engine_ro_binaries(engine, &home, &engine_home, &ctx)
             .into_iter()
             .filter(|(_, dest)| {
                 !host_inherit_binds
@@ -1925,6 +2205,7 @@ impl BwrapView {
 
         self.append_binds_and_env(
             &mut words,
+            engine,
             launch,
             &PlannedBinds {
                 home: &home,
@@ -1933,9 +2214,7 @@ impl BwrapView {
                 engine_home: &engine_home,
                 tmpdir: &tmpdir,
                 worker_runtime: &worker_runtime,
-                agy_plan: plans.agy.as_ref(),
-                claude_plan: plans.claude.as_ref(),
-                codex_plan: plans.codex.as_ref(),
+                data_plan: data_plan.as_ref(),
                 mask_claude_cc_socks,
                 extra_binds: &extra_binds,
                 engine_ro_binaries: &engine_ro_binaries,
@@ -1979,9 +2258,7 @@ struct PlannedBinds<'a> {
     engine_home: &'a Path,
     tmpdir: &'a Path,
     worker_runtime: &'a Path,
-    agy_plan: Option<&'a AgyDataPlan>,
-    claude_plan: Option<&'a ClaudeDataPlan>,
-    codex_plan: Option<&'a CodexDataPlan>,
+    data_plan: Option<&'a EngineDataPlan>,
     mask_claude_cc_socks: bool,
     extra_binds: &'a [(PathBuf, bool)],
     engine_ro_binaries: &'a [(PathBuf, PathBuf)],
@@ -2004,6 +2281,7 @@ struct InheritCheckCtx<'a> {
 }
 
 struct AgyDataPlan {
+    home: AgyWorkerHome,
     worker_home: PathBuf,
     worker_tmp: PathBuf,
     overlays: Vec<(PathBuf, &'static str)>,
@@ -2297,16 +2575,14 @@ impl EngineView for ContainerView {
         let prospective = prospective_canonical(wanted)
             .map_err(|why| format!("the engine's home {}: {why}", wanted.display()))?;
         let engine_home = make_engine_home(wanted, &prospective)?;
-        let data_root = match launch.engine {
-            "agy" => self
-                .config
-                .isolate_workers
-                .then_some(self.config.agy_data_dir.as_deref())
-                .flatten(),
-            "claude" => self.config.claude_data_dir.as_deref(),
-            "codex" => self.config.codex_data_dir.as_deref(),
-            _ => None,
-        };
+        let engine = ViewEngine::parse(launch.engine);
+        let data_root = engine.and_then(|kind| {
+            self.config
+                .engines
+                .isolates_workers(kind)
+                .then(|| self.config.engines.data_dir(kind))
+                .flatten()
+        });
         let worker_key = worker_key_for(launch, &workspace);
         let (tmpdir, runtime_dir) = if let Some(root) = data_root {
             let canonical_root = ensure_dir_0700(root, "engine data dir")?;
@@ -2324,17 +2600,13 @@ impl EngineView for ContainerView {
                 ensure_dir_0700(&runtime_root.join(&worker_key), "worker runtime dir")?,
             )
         };
-        let unset_stmt = match launch.engine {
-            "claude" => "unset CODEX_HOME;",
-            "agy" => "unset CLAUDE_CONFIG_DIR CODEX_HOME;",
-            "codex" => "unset CLAUDE_CONFIG_DIR;",
-            _ => "",
-        };
-        let extra_set = match launch.engine {
-            "claude" => "CLAUDE_CONFIG_DIR=\"$3\"; export CLAUDE_CONFIG_DIR;",
-            "codex" => "CODEX_HOME=\"$3\"; export CODEX_HOME;",
-            _ => "",
-        };
+        let unset_stmt = engine
+            .map(ViewEngine::scrubbed_env_vars)
+            .filter(|vars| !vars.is_empty())
+            .map_or_else(String::new, |vars| format!("unset {};", vars.join(" ")));
+        let extra_set = engine
+            .and_then(ViewEngine::home_env_var)
+            .map_or_else(String::new, |var| format!("{var}=\"$3\"; export {var};"));
         let script = format!(
             "TMPDIR=\"$1\"; XDG_RUNTIME_DIR=\"$2\"; export TMPDIR XDG_RUNTIME_DIR; \
              {unset_stmt} {extra_set} shift 4; exec \"$@\""
@@ -2429,14 +2701,14 @@ fn validate_config_for(config: &ViewConfig) -> Result<(), String> {
             }
         }
     }
-    for (root, label) in [
-        (&config.agy_data_dir, "SPAWN_AGY_DATA_DIR"),
-        (&config.claude_data_dir, "SPAWN_CLAUDE_DATA_DIR"),
-        (&config.codex_data_dir, "SPAWN_CODEX_DATA_DIR"),
-    ] {
-        if let Some(root) = root {
-            validate_managed_root(root, label, config, &private_norm, &home_norm)?;
-        }
+    for (engine, root) in config.engines.data_dirs() {
+        validate_managed_root(
+            root,
+            engine.data_dir_env_var(),
+            config,
+            &private_norm,
+            &home_norm,
+        )?;
     }
     for mount in &config.extra_mounts {
         validate_managed_root(
@@ -2590,6 +2862,11 @@ fn collect_program_ro_binds(
     push_dest(canon.to_path_buf());
     let mut cur = prog.to_path_buf();
     for _ in 0..16 {
+        if let (Some(parent), Some(name)) = (cur.parent(), cur.file_name())
+            && let Ok(canon_parent) = std::fs::canonicalize(parent)
+        {
+            push_dest(canon_parent.join(name));
+        }
         if let Ok(prosp) = prospective_canonical(&cur) {
             push_dest(prosp);
         }
@@ -2888,7 +3165,10 @@ fn find_program(program: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BwrapView, ViewConfig};
+    use super::{
+        AgyBrain, AgyDataDir, AgyWorkerHome, BwrapView, EnginePaths, EngineViews, ViewConfig,
+        ViewEngine,
+    };
     use spawn_core::port::ViewedLaunch;
     use std::path::{Path, PathBuf};
 
@@ -2917,16 +3197,9 @@ mod tests {
             canonical_workspace: None,
             home_isolation: super::HomeIsolation::Blacklist,
             extra_mounts: Vec::new(),
-            agy_data_dir: None,
-            isolate_workers: false,
-            isolate_brain: false,
-            agy_program: None,
             inherit_host: super::HostInheritMode::Off,
             inherit_host_paths: Vec::new(),
-            claude_program: None,
-            claude_data_dir: None,
-            codex_program: None,
-            codex_data_dir: None,
+            engines: EngineViews::default(),
         };
         let view = BwrapView {
             program: PathBuf::from("/usr/bin/bwrap"),
@@ -3099,9 +3372,9 @@ mod tests {
         assert_eq!(config.canonical_workspace, None);
         assert_eq!(config.home_isolation, super::HomeIsolation::Blacklist);
         assert!(config.extra_mounts.is_empty());
-        assert_eq!(config.agy_data_dir, None);
-        assert!(!config.isolate_workers);
-        assert!(!config.isolate_brain);
+        assert_eq!(config.engines.data_dir(ViewEngine::Agy), None);
+        assert!(!config.engines.isolates_workers(ViewEngine::Agy));
+        assert!(!config.engines.isolates_agy_brain());
     }
 
     #[test]
@@ -3148,17 +3421,20 @@ mod tests {
         assert_eq!(enabled.extra_mounts.len(), 2);
         assert!(!enabled.extra_mounts[0].writable);
         assert!(enabled.extra_mounts[1].writable);
-        assert_eq!(enabled.agy_data_dir, Some(PathBuf::from("/data01/agy")));
-        assert!(enabled.isolate_workers);
-        assert!(!enabled.isolate_brain);
+        assert_eq!(
+            enabled.engines.data_dir(ViewEngine::Agy),
+            Some(Path::new("/data01/agy"))
+        );
+        assert!(enabled.engines.isolates_workers(ViewEngine::Agy));
+        assert!(!enabled.engines.isolates_agy_brain());
 
         let isolated_brain = ViewConfig::from_env(&lookup(&[
             ("HOME", "/home/u"),
             ("SPAWN_AGY_DATA_DIR", "/data01/agy"),
             ("SPAWN_AGY_ISOLATE_BRAIN", "1"),
         ]));
-        assert!(isolated_brain.isolate_workers);
-        assert!(isolated_brain.isolate_brain);
+        assert!(isolated_brain.engines.isolates_workers(ViewEngine::Agy));
+        assert!(isolated_brain.engines.isolates_agy_brain());
 
         let disabled = ViewConfig::from_env(&lookup(&[
             ("HOME", "/home/u"),
@@ -3168,8 +3444,16 @@ mod tests {
             ("SPAWN_AGY_ISOLATE_BRAIN", "0"),
         ]));
         assert_eq!(disabled.canonical_workspace, None);
-        assert!(!disabled.isolate_workers);
-        assert!(!disabled.isolate_brain);
+        assert!(!disabled.engines.isolates_workers(ViewEngine::Agy));
+        assert!(!disabled.engines.isolates_agy_brain());
+        assert_eq!(
+            disabled.engines.agy_data(),
+            Some(&AgyDataDir {
+                root: PathBuf::from("/data01/agy"),
+                home: AgyWorkerHome::Host,
+                brain: AgyBrain::Shared,
+            })
+        );
     }
 
     #[test]
@@ -3351,7 +3635,10 @@ mod tests {
                 PathBuf::from("/home/u/.local/tools"),
             ]
         );
-        assert_eq!(cfg.claude_data_dir, Some(PathBuf::from("/data01/claude")));
+        assert_eq!(
+            cfg.engines.data_dir(ViewEngine::Claude),
+            Some(Path::new("/data01/claude"))
+        );
 
         assert!(super::gitconfig_has_no_inline_secrets(
             "[user]\n\tname = Ada\n\temail = ada@example.com\n[core]\n\tautocrlf = false\n"
@@ -3403,7 +3690,7 @@ mod tests {
 
         view.config.home_isolation = super::HomeIsolation::Whitelist;
         view.config.canonical_workspace = Some(PathBuf::from("/workspace"));
-        view.config.claude_program = Some(entry_bin);
+        view.config.engines.claude = Some(EnginePaths::Program(entry_bin));
         let planned = view
             .plan(&ViewedLaunch {
                 engine: "claude",
@@ -3506,8 +3793,8 @@ mod tests {
             );
         }
 
-        // Also valid for claude when SPAWN_CLAUDE_SANDBOX=1 (claude_data_dir set).
-        view.config.claude_data_dir = Some(scratch.join("claude-data"));
+        // Also valid for claude when SPAWN_CLAUDE_SANDBOX=1 (claude data dir set).
+        view.config.engines.claude = Some(EnginePaths::Data(scratch.join("claude-data")));
         let sandboxed_local = view
             .plan(&ViewedLaunch {
                 engine: "claude",
@@ -3669,20 +3956,26 @@ mod tests {
             "SPAWN_CODEX_DATA_DIR" => Some("/data01/codex/".to_string()),
             _ => None,
         });
-        assert_eq!(cfg.codex_program.as_deref(), Some(codex_bin.as_path()));
-        assert_eq!(cfg.codex_data_dir, Some(PathBuf::from("/data01/codex")));
+        assert_eq!(
+            cfg.engines.program(ViewEngine::Codex),
+            Some(codex_bin.as_path())
+        );
+        assert_eq!(
+            cfg.engines.data_dir(ViewEngine::Codex),
+            Some(Path::new("/data01/codex"))
+        );
         assert!(super::is_secret_candidate(Path::new(
             "/home/u/.codex/auth.json"
         )));
         assert!(super::is_secret_candidate(Path::new("/opt/tmp/auth.json")));
 
         let mut bad_rel = cfg.clone();
-        bad_rel.codex_data_dir = Some(PathBuf::from("relative/codex"));
+        bad_rel.engines.codex = Some(EnginePaths::Data(PathBuf::from("relative/codex")));
         assert!(super::validate_config_for(&bad_rel).is_err());
 
         let mut bad_whitelist = cfg;
         bad_whitelist.home_isolation = super::HomeIsolation::Whitelist;
-        bad_whitelist.codex_data_dir = Some(PathBuf::from("/home/u/codex-data"));
+        bad_whitelist.engines.codex = Some(EnginePaths::Data(PathBuf::from("/home/u/codex-data")));
         let err = super::validate_config_for(&bad_whitelist).expect_err("whitelist overlap");
         assert!(err.contains("SPAWN_CODEX_DATA_DIR"), "{err}");
     }
@@ -3748,5 +4041,303 @@ mod tests {
                 .windows(3)
                 .any(|w| w == ["--setenv", "CODEX_HOME", canon_codex.as_str()])
         );
+    }
+
+    #[test]
+    fn engine_views_adt_covers_all_variants() {
+        let scratch = crate::Scratch::new("spawn-view-engine-views-adt");
+        let bin_dir = scratch.join("bin");
+        let agy_bin = bin_dir.join("agy");
+        let claude_bin = bin_dir.join("claude");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        for bin in [&agy_bin, &claude_bin] {
+            std::fs::write(bin, "#!/bin/sh\nexit 0\n").expect("write bin");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+        }
+
+        // Empty (None, None) is unrepresentable in EnginePaths / EngineViews.
+        assert_eq!(EnginePaths::<PathBuf>::from_parts(None, None), None);
+        for id in ["agy", "claude", "codex"] {
+            let parsed = ViewEngine::parse(id).expect("known engine");
+            assert_eq!(parsed.id(), id);
+        }
+        assert_eq!(ViewEngine::parse("unknown"), None);
+
+        // Isolation flags without SPAWN_AGY_DATA_DIR do not create a vacuous entry.
+        let bare = ViewConfig::from_env(&lookup(&[
+            ("HOME", "/home/u"),
+            ("PATH", ""),
+            ("SPAWN_AGY_ISOLATE_WORKERS", "1"),
+            ("SPAWN_AGY_ISOLATE_BRAIN", "1"),
+        ]));
+        assert_eq!(bare.engines, EngineViews::default());
+        assert!(!bare.engines.isolates_workers(ViewEngine::Agy));
+        assert!(!bare.engines.isolates_agy_brain());
+
+        // Program-only, Data-only (bare PathBuf for claude/codex), and Both variants round-trip.
+        let mut cfg = ViewConfig::from_env(&|key| match key {
+            "HOME" => Some("/home/u".to_string()),
+            "PATH" => Some(bin_dir.display().to_string()),
+            "SPAWN_AGY_DATA_DIR" => Some("/data01/agy".to_string()),
+            "SPAWN_AGY_ISOLATE_BRAIN" => Some("1".to_string()),
+            "SPAWN_CODEX_DATA_DIR" => Some("/data01/codex".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            cfg.engines.agy,
+            Some(EnginePaths::Both {
+                program: agy_bin.clone(),
+                data: AgyDataDir {
+                    root: PathBuf::from("/data01/agy"),
+                    home: AgyWorkerHome::PerWorker,
+                    brain: AgyBrain::PerWorker,
+                },
+            })
+        );
+        assert_eq!(
+            cfg.engines.claude,
+            Some(EnginePaths::Program(claude_bin.clone()))
+        );
+        assert_eq!(
+            cfg.engines.codex,
+            Some(EnginePaths::Data(PathBuf::from("/data01/codex")))
+        );
+
+        cfg.engines.disable_agy_brain_isolation();
+        assert!(!cfg.engines.isolates_agy_brain());
+        assert!(cfg.engines.isolates_workers(ViewEngine::Agy));
+
+        let dirs: Vec<(ViewEngine, &Path)> = cfg.engines.data_dirs().collect();
+        assert_eq!(
+            dirs,
+            vec![
+                (ViewEngine::Agy, Path::new("/data01/agy")),
+                (ViewEngine::Codex, Path::new("/data01/codex")),
+            ]
+        );
+    }
+
+    #[test]
+    fn agy_data_dir_env_parses_all_four_home_and_brain_layouts() {
+        for (workers_val, brain_val, expect_home, expect_brain) in [
+            ("1", "0", AgyWorkerHome::PerWorker, AgyBrain::Shared),
+            ("1", "1", AgyWorkerHome::PerWorker, AgyBrain::PerWorker),
+            ("0", "0", AgyWorkerHome::Host, AgyBrain::Shared),
+            ("0", "true", AgyWorkerHome::Host, AgyBrain::PerWorker),
+        ] {
+            let parsed = ViewConfig::from_env(&|key| match key {
+                "HOME" => Some("/home/u".to_string()),
+                "PATH" => Some(String::new()),
+                "SPAWN_AGY_DATA_DIR" => Some("/data01/agy".to_string()),
+                "SPAWN_AGY_ISOLATE_WORKERS" => Some(workers_val.to_string()),
+                "SPAWN_AGY_ISOLATE_BRAIN" => Some(brain_val.to_string()),
+                _ => None,
+            });
+            assert_eq!(
+                parsed.engines.agy_data(),
+                Some(&AgyDataDir {
+                    root: PathBuf::from("/data01/agy"),
+                    home: expect_home,
+                    brain: expect_brain,
+                })
+            );
+            assert_eq!(
+                parsed.engines.isolates_workers(ViewEngine::Agy),
+                expect_home == AgyWorkerHome::PerWorker
+            );
+            assert_eq!(
+                parsed.engines.isolates_agy_brain(),
+                expect_brain == AgyBrain::PerWorker
+            );
+        }
+    }
+
+    #[test]
+    fn collect_program_ro_binds_resolves_symlink_chain_under_symlinked_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = crate::Scratch::new("spawn-view-symlink-home");
+        let real_home = scratch.join("real-home");
+        let link_home = scratch.join("link-home");
+        let ws = scratch.join("ws");
+        let runtime = scratch.join("run");
+        let claude_home = real_home.join(".claude");
+        let real_bin = link_home.join(".local/opt/node/lib/claude.exe");
+        let link_bin = link_home.join(".local/opt/node/bin/claude");
+        let entry_bin = scratch.join("bin/claude");
+        for dir in [&claude_home, &ws, &runtime, entry_bin.parent().unwrap()] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        std::os::unix::fs::symlink(&real_home, &link_home).expect("home symlink");
+        std::fs::create_dir_all(real_bin.parent().unwrap()).expect("real bin parent");
+        std::fs::create_dir_all(link_bin.parent().unwrap()).expect("link bin parent");
+        std::fs::write(&real_bin, "#!/bin/sh\necho ok\n").expect("write real");
+        std::fs::set_permissions(&real_bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::os::unix::fs::symlink("../lib/claude.exe", &link_bin).expect("sym1");
+        std::os::unix::fs::symlink(&link_bin, &entry_bin).expect("sym2");
+
+        let cfg = ViewConfig {
+            home: link_home,
+            xdg_config_home: None,
+            xdg_state_home: None,
+            runtime_dir: runtime.clone(),
+            host_directories: Vec::new(),
+            loop_dirs: Vec::new(),
+            extra_files: Vec::new(),
+            host_tmpdir: None,
+            private_dir: runtime.join("spawn-engine-view-test"),
+            canonical_workspace: Some(PathBuf::from("/workspace")),
+            home_isolation: super::HomeIsolation::Whitelist,
+            extra_mounts: Vec::new(),
+            inherit_host: super::HostInheritMode::Off,
+            inherit_host_paths: Vec::new(),
+            engines: EngineViews {
+                claude: Some(EnginePaths::Program(entry_bin)),
+                ..EngineViews::default()
+            },
+        };
+        let view = BwrapView {
+            program: PathBuf::from("/usr/bin/bwrap"),
+            config: cfg,
+        };
+        let planned = view
+            .plan(&ViewedLaunch {
+                engine: "claude",
+                workspace: &ws.display().to_string(),
+                engine_home: &claude_home.display().to_string(),
+                worker_id: Some("w-sym"),
+                exit_file: None,
+            })
+            .expect("plan through symlinked $HOME");
+
+        let canon_real = std::fs::canonicalize(&real_bin)
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_link = std::fs::canonicalize(real_home.join(".local/opt/node/bin"))
+            .unwrap()
+            .join("claude")
+            .display()
+            .to_string();
+        assert!(
+            planned
+                .words
+                .windows(3)
+                .any(|w| w == ["--ro-bind", canon_real.as_str(), expected_link.as_str()]),
+            "expected symlink hop inside symlinked $HOME to resolve canonical parent bind: {:?}",
+            planned.words
+        );
+    }
+
+    #[test]
+    fn whitelist_refuses_program_symlink_targeting_masked_or_private_file_for_plain_and_symlinked_home()
+     {
+        use std::os::unix::fs::PermissionsExt;
+        for symlinked_home in [false, true] {
+            let scratch = crate::Scratch::new("spawn-view-prog-mask-guard");
+            let real_home = scratch.join("real-home");
+            let home = if symlinked_home {
+                let link = scratch.join("link-home");
+                std::fs::create_dir_all(&real_home).expect("real home");
+                std::os::unix::fs::symlink(&real_home, &link).expect("link home");
+                link
+            } else {
+                real_home.clone()
+            };
+            let ws = scratch.join("ws");
+            let runtime = scratch.join("run");
+            let private_dir = runtime.join("spawn-engine-view-test");
+            let host_keep = scratch.join("keep");
+            let claude_home = real_home.join(".claude");
+            let ssh_dir = real_home.join(".ssh");
+            let bin_dir = home.join(".local/bin");
+            for dir in [
+                &ws,
+                &runtime,
+                &private_dir,
+                &host_keep,
+                &claude_home,
+                &ssh_dir,
+                &bin_dir,
+            ] {
+                std::fs::create_dir_all(dir).expect("mkdir");
+            }
+            std::fs::set_permissions(&private_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod private");
+            let ssh_exec = ssh_dir.join("exec-secret");
+            let priv_exec = private_dir.join("priv-exec");
+            let keep_exec = host_keep.join("keep-exec");
+            for secret in [&ssh_exec, &priv_exec, &keep_exec] {
+                std::fs::write(secret, "#!/bin/sh\necho LEAK\n").expect("write secret exec");
+                std::fs::set_permissions(secret, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod secret exec");
+            }
+
+            let link_bin = bin_dir.join("claude");
+            for (case_name, target) in [
+                ("ssh", &ssh_exec),
+                ("private", &priv_exec),
+                ("host_keep", &keep_exec),
+            ] {
+                let _ = std::fs::remove_file(&link_bin);
+                std::os::unix::fs::symlink(target, &link_bin).expect("symlink prog");
+
+                let view = BwrapView {
+                    program: PathBuf::from("/usr/bin/bwrap"),
+                    config: ViewConfig {
+                        home: home.clone(),
+                        xdg_config_home: None,
+                        xdg_state_home: None,
+                        runtime_dir: runtime.clone(),
+                        host_directories: vec![host_keep.clone()],
+                        loop_dirs: Vec::new(),
+                        extra_files: Vec::new(),
+                        host_tmpdir: None,
+                        private_dir: private_dir.clone(),
+                        canonical_workspace: Some(PathBuf::from("/workspace")),
+                        home_isolation: super::HomeIsolation::Whitelist,
+                        extra_mounts: Vec::new(),
+                        inherit_host: super::HostInheritMode::Off,
+                        inherit_host_paths: Vec::new(),
+                        engines: EngineViews {
+                            claude: Some(EnginePaths::Program(link_bin.clone())),
+                            ..EngineViews::default()
+                        },
+                    },
+                };
+                let planned = view
+                    .plan(&ViewedLaunch {
+                        engine: "claude",
+                        workspace: &ws.display().to_string(),
+                        engine_home: &claude_home.display().to_string(),
+                        worker_id: Some("w-guard"),
+                        exit_file: None,
+                    })
+                    .expect("plan");
+
+                let canon_target = std::fs::canonicalize(target).unwrap().display().to_string();
+                let canon_link = std::fs::canonicalize(bin_dir.as_path())
+                    .unwrap()
+                    .join("claude")
+                    .display()
+                    .to_string();
+                let link_str = link_bin.display().to_string();
+                assert!(
+                    !planned.words.windows(3).any(|w| {
+                        w[0] == "--ro-bind"
+                            && (w[1] == canon_target
+                                || w[2] == canon_target
+                                || w[2] == canon_link
+                                || w[2] == link_str)
+                    }),
+                    "symlinked_home={symlinked_home} case={case_name}: unexpected program ro-bind in {:?}",
+                    planned.words
+                );
+            }
+        }
     }
 }

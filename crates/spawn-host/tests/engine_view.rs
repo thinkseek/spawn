@@ -20,7 +20,10 @@ use std::time::{Duration, Instant};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::{EngineView, Launch, ServerSeen, TerminalHost, ViewedLaunch};
-use spawn_host::engine_view::{HOST_DIRECTORIES, Mask, TMP_FALLBACK};
+use spawn_host::engine_view::{
+    AgyBrain, AgyDataDir, AgyWorkerHome, EnginePaths, EngineViews, HOST_DIRECTORIES, Mask,
+    TMP_FALLBACK,
+};
 use spawn_host::{BwrapView, HerdrHost, Scratch, ViewConfig};
 
 fn required() -> bool {
@@ -155,16 +158,9 @@ impl Fixture {
             canonical_workspace: None,
             home_isolation: spawn_host::HomeIsolation::Blacklist,
             extra_mounts: Vec::new(),
-            agy_data_dir: None,
-            isolate_workers: false,
-            isolate_brain: false,
-            agy_program: None,
             inherit_host: spawn_host::HostInheritMode::Off,
             inherit_host_paths: Vec::new(),
-            claude_program: None,
-            claude_data_dir: None,
-            codex_program: None,
-            codex_data_dir: None,
+            engines: EngineViews::default(),
         }
     }
 
@@ -999,9 +995,11 @@ fn agy_data_dir_isolates_worker_home_tmp_ro_creds_and_brain() {
     let mut config = fixture.config();
     config.home_isolation = spawn_host::HomeIsolation::Whitelist;
     config.canonical_workspace = Some(PathBuf::from("/workspace"));
-    config.agy_data_dir = Some(data_dir.clone());
-    config.isolate_workers = true;
-    config.isolate_brain = true;
+    config.engines.agy = Some(EnginePaths::Data(AgyDataDir {
+        root: data_dir.clone(),
+        home: AgyWorkerHome::PerWorker,
+        brain: AgyBrain::PerWorker,
+    }));
 
     let Some(view_isolated) = view(config) else {
         return;
@@ -1098,9 +1096,11 @@ fn agy_data_dir_keeps_bin_and_xdg_cache_writable_per_worker() {
     let mut config = fixture.config();
     config.home_isolation = spawn_host::HomeIsolation::Whitelist;
     config.canonical_workspace = Some(PathBuf::from("/workspace"));
-    config.agy_data_dir = Some(data_dir.clone());
-    config.isolate_workers = true;
-    config.isolate_brain = true;
+    config.engines.agy = Some(EnginePaths::Data(AgyDataDir {
+        root: data_dir.clone(),
+        home: AgyWorkerHome::PerWorker,
+        brain: AgyBrain::PerWorker,
+    }));
 
     let Some(view_isolated) = view(config) else {
         return;
@@ -1147,9 +1147,7 @@ fn agy_data_dir_shares_brain_when_isolate_brain_is_off() {
     let mut config = fixture.config();
     config.home_isolation = spawn_host::HomeIsolation::Whitelist;
     config.canonical_workspace = Some(PathBuf::from("/workspace"));
-    config.agy_data_dir = Some(data_dir.clone());
-    config.isolate_workers = true;
-    config.isolate_brain = false;
+    config.engines.agy = Some(EnginePaths::Data(AgyDataDir::per_worker(data_dir.clone())));
 
     let Some(view_shared) = view(config) else {
         return;
@@ -1260,7 +1258,7 @@ fn whitelist_ro_binds_agy_binary_inside_home_without_exposing_siblings() {
 
     let mut config = fixture.config();
     config.home_isolation = spawn_host::HomeIsolation::Whitelist;
-    config.agy_program = Some(agy_bin.clone());
+    config.engines.agy = Some(EnginePaths::Program(agy_bin.clone()));
     let Some(view) = view(config) else {
         return;
     };
@@ -1513,7 +1511,7 @@ fn claude_bwrap_sandbox_isolates_home_and_shares_projects_with_host() {
     let mut config = fixture.config();
     config.home_isolation = spawn_host::HomeIsolation::Whitelist;
     config.canonical_workspace = Some(PathBuf::from("/workspace"));
-    config.claude_data_dir = Some(claude_data.clone());
+    config.engines.claude = Some(EnginePaths::Data(claude_data.clone()));
     let Some(view) = view(config) else {
         return;
     };
@@ -1649,7 +1647,7 @@ fn managed_claude_config_works_under_claude_sandbox() {
     seed_managed_claude_dir(&data_managed, "data-dir-secret-3", "data-dir-cred-3");
 
     let mut config = fixture.config();
-    config.claude_data_dir = Some(claude_data);
+    config.engines.claude = Some(EnginePaths::Data(claude_data));
     let Some(view) = view(config) else {
         return;
     };
@@ -1932,8 +1930,10 @@ fn codex_data_dir_isolates_workers_protects_host_and_allows_whitelist_binary() {
     let mut cfg = fixture.config();
     cfg.home_isolation = spawn_host::HomeIsolation::Whitelist;
     cfg.canonical_workspace = Some(PathBuf::from("/workspace"));
-    cfg.codex_data_dir = Some(fixture.scratch.join("codex-data"));
-    cfg.codex_program = Some(link_bin.clone());
+    cfg.engines.codex = Some(EnginePaths::Both {
+        program: link_bin.clone(),
+        data: fixture.scratch.join("codex-data"),
+    });
     let Some(view) = view(cfg) else {
         return;
     };
@@ -2102,7 +2102,7 @@ fn container_view_isolates_per_worker_runtime_and_cross_engine_env_across_all_th
     let fixture = Fixture::new();
     let mut cfg = fixture.config();
     let codex_data = fixture.scratch.join("ctr-codex-data");
-    cfg.codex_data_dir = Some(codex_data.clone());
+    cfg.engines.codex = Some(EnginePaths::Data(codex_data.clone()));
     let view = spawn_host::ContainerView::new_with_detector(cfg, &|| spawn_host::ContainerEnv {
         in_container: true,
         runtime: Some("docker".to_string()),
@@ -2156,6 +2156,80 @@ fn container_view_isolates_per_worker_runtime_and_cross_engine_env_across_all_th
                 assert_eq!(codex_env, codex_home.display().to_string());
             }
             _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn whitelist_program_symlink_into_masked_dir_binds_nothing_for_plain_and_symlinked_home() {
+    let _serial = exclusive();
+    for symlinked_home in [false, true] {
+        let fixture = Fixture::new();
+        write(&fixture.workspace().join("ok.txt"), "ws-ok");
+        let home = if symlinked_home {
+            let link_home = fixture.scratch.join("link-home");
+            std::os::unix::fs::symlink(fixture.home(), &link_home).expect("symlink home");
+            link_home
+        } else {
+            fixture.home()
+        };
+        let canon_home = std::fs::canonicalize(&home).expect("canon home");
+
+        for (label, canary) in [
+            ("ssh", home.join(".ssh/exec-canary")),
+            ("keep", fixture.keep().join("keep-canary")),
+        ] {
+            write(&canary, "#!/bin/sh\necho leaked\n");
+            std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod canary");
+            let canon_canary = std::fs::canonicalize(&canary).expect("canon canary");
+
+            let link_bin = home.join(format!(".local/bin/claude-{label}-canary"));
+            std::fs::create_dir_all(link_bin.parent().expect("bin parent")).expect("mkdir bin");
+            std::os::unix::fs::symlink(&canary, &link_bin).expect("symlink bin");
+
+            let mut cfg = fixture.config();
+            cfg.home = home.clone();
+            cfg.home_isolation = spawn_host::HomeIsolation::Whitelist;
+            cfg.canonical_workspace = Some(PathBuf::from("/workspace"));
+            cfg.engines.claude = Some(EnginePaths::Program(link_bin.clone()));
+            let Some(view) = view(cfg) else {
+                return;
+            };
+            let ws = fixture.workspace().display().to_string();
+            let claude_home = canon_home.join(".claude").display().to_string();
+            let words = view
+                .wrap(&ViewedLaunch {
+                    engine: "claude",
+                    workspace: &ws,
+                    engine_home: &claude_home,
+                    worker_id: Some("w-masked-prog"),
+                    exit_file: None,
+                })
+                .expect("wrap");
+
+            let canary_name = format!("{label}-canary");
+            assert!(
+                !triples(&words, "--ro-bind").iter().any(|(src, dst)| {
+                    src.contains(&canary_name)
+                        || dst.contains(&canary_name)
+                        || *src == canary.to_string_lossy()
+                        || *src == canon_canary.to_string_lossy()
+                        || *dst == link_bin.to_string_lossy()
+                }),
+                "unexpected ro-bind for masked program target (symlinked_home={symlinked_home}, label={label}): {words:?}"
+            );
+            assert!(
+                !words.iter().any(|w| w.contains(&canary_name)),
+                "unexpected bwrap word exposing masked program target (symlinked_home={symlinked_home}, label={label}): {words:?}"
+            );
+
+            assert_eq!(ok(&words, "cat /workspace/ok.txt"), "ws-ok");
+            let canon_link = canon_home.join(format!(".local/bin/claude-{label}-canary"));
+            for blocked in [&link_bin, &canon_link, &canary, &canon_canary] {
+                fails(&words, &format!("cat '{}'", blocked.display()));
+                fails(&words, &format!("'{}'", blocked.display()));
+            }
         }
     }
 }
