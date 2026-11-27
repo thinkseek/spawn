@@ -14,6 +14,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::json;
@@ -26,6 +27,7 @@ use spawn_host::{
     LedgerSnapshot, PublishRequest, RefLedger, TrackedSetPolicy, format_commit_body,
     test_git_command,
 };
+use spawn_postgres::testing::TestSchema;
 use spawn_postgres::{PostgresStore, RefKind};
 
 struct Scratch(PathBuf);
@@ -56,21 +58,17 @@ impl Drop for Scratch {
 
 struct PgRefLedger {
     pg: PostgresStore,
+    _schema: Arc<TestSchema>,
 }
 
 impl PgRefLedger {
     fn connect_isolated(case: &str) -> Self {
-        static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
-        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
-            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
-        );
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let seq = SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed);
-        let schema = format!("spawn_test_{}_{nanos:x}_{seq}_{case}", std::process::id());
-        let pg = PostgresStore::connect_in_schema(&url, &schema).expect("connect_in_schema");
-        Self { pg }
+        let schema = Arc::new(TestSchema::new(case));
+        let pg = schema.store();
+        Self {
+            pg,
+            _schema: schema,
+        }
     }
 }
 

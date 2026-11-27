@@ -16,7 +16,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde_json::json;
 use spawn_cas::{
@@ -38,6 +38,7 @@ use spawn_host::{
     ShadowTrackedSetMode, bind_store_gc_fence, check_gc_fence, format_commit_body,
     reconcile_refs_journal, run_persistent_gc_for_ledger, test_git_command,
 };
+use spawn_postgres::testing::TestSchema;
 use spawn_postgres::{PostgresStore, RefKind};
 
 struct Scratch(PathBuf);
@@ -68,29 +69,20 @@ impl Drop for Scratch {
 
 struct PgRefLedger {
     pg: PostgresStore,
+    _schema: Arc<TestSchema>,
 }
 
 impl PgRefLedger {
-    fn unique_schema(case: &str) -> String {
-        static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let seq = SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed);
-        format!("spawn_test_{}_{nanos:x}_{seq}_{case}", std::process::id())
-    }
-
-    fn connect_in_schema_name(schema: &str) -> Self {
-        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
-            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
-        );
-        let pg = PostgresStore::connect_in_schema(&url, schema).expect("connect_in_schema");
-        Self { pg }
+    fn connect_in_schema(schema: Arc<TestSchema>) -> Self {
+        let pg = schema.store();
+        Self {
+            pg,
+            _schema: schema,
+        }
     }
 
     fn connect_isolated(case: &str) -> Self {
-        let schema = Self::unique_schema(case);
-        Self::connect_in_schema_name(&schema)
+        Self::connect_in_schema(Arc::new(TestSchema::new(case)))
     }
 }
 
@@ -1414,8 +1406,8 @@ fn d6_workspace_pg_concurrent_8_branches_checkpoint_and_merge_main_clean() {
     let scratch = Scratch::new("pg_concurrent_8");
     let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("cas"));
     let disk_root = scratch.join("work");
-    let schema = PgRefLedger::unique_schema("concurrent8");
-    let coord_ledger = Arc::new(PgRefLedger::connect_in_schema_name(&schema));
+    let schema = Arc::new(TestSchema::new("concurrent8"));
+    let coord_ledger = Arc::new(PgRefLedger::connect_in_schema(Arc::clone(&schema)));
     let coord_store = D6Workspace::new("proj-conc", &disk_root, cas.clone(), coord_ledger.clone());
 
     seed_l1_main_with_blob(
@@ -1439,13 +1431,13 @@ fn d6_workspace_pg_concurrent_8_branches_checkpoint_and_merge_main_clean() {
 
     let worker_stores: Vec<_> = (0..8)
         .map(|_| {
-            let l = Arc::new(PgRefLedger::connect_in_schema_name(&schema));
+            let l = Arc::new(PgRefLedger::connect_in_schema(Arc::clone(&schema)));
             D6Workspace::new("proj-conc", &disk_root, cas.clone(), l)
         })
         .collect();
     let merger_stores: Vec<_> = (0..4)
         .map(|_| {
-            let l = Arc::new(PgRefLedger::connect_in_schema_name(&schema));
+            let l = Arc::new(PgRefLedger::connect_in_schema(Arc::clone(&schema)));
             D6Workspace::new("proj-conc", &disk_root, cas.clone(), l)
         })
         .collect();
