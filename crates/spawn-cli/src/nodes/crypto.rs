@@ -64,9 +64,13 @@ pub(crate) fn b64(bytes: &[u8]) -> String {
 
 /// Base64, standard or URL-safe, padded or not.
 pub(crate) fn unb64(text: &str) -> Result<Vec<u8>, String> {
-    let normal: String = text
-        .trim()
-        .trim_end_matches('=')
+    let trimmed = text.trim().trim_end_matches('=');
+    if !trimmed.contains(['-', '_']) {
+        return base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(trimmed.as_bytes())
+            .map_err(|_| "not base64".to_string());
+    }
+    let normal: String = trimmed
         .chars()
         .map(|c| match c {
             '-' => '+',
@@ -922,15 +926,41 @@ impl ReplyKey {
 
     /// `reply` sealed for the requester.
     pub(crate) fn seal(&self, reply: &Value) -> Result<Value, String> {
-        let nonce = random::<12>()?;
-        let rep_nonce = b64(&nonce);
-        let plain = Zeroizing::new(serde_json::to_vec(reply).map_err(|e| e.to_string())?);
-        let ct = seal_aead(&self.key, nonce, &self.aad(&rep_nonce), &plain)?;
+        let (nonce_b64, ct_b64) = self.seal_parts(reply)?;
         Ok(json!({
             "v": E2E_REPLY_DOMAIN, "from": self.responder, "to": self.requester,
             "channel_id": self.channel_id, "req_nonce": self.req_nonce,
-            "rep_nonce": rep_nonce, "ct": b64(&ct),
+            "rep_nonce": nonce_b64, "ct": ct_b64,
         }))
+    }
+
+    /// Seal `reply` directly into a wire `relay` JSON frame, avoiding building
+    /// an intermediate `Value` tree or rescanning the base64 ciphertext.
+    pub(crate) fn seal_relay_frame(&self, from: &str, reply: &Value) -> Result<String, String> {
+        let (rep_nonce, ct_b64) = self.seal_parts(reply)?;
+        let meta = crate::nodes::coord::encode_json_fast(&json!({
+            "v": E2E_REPLY_DOMAIN,
+            "from": self.responder,
+            "to": self.requester,
+            "channel_id": self.channel_id,
+            "req_nonce": self.req_nonce,
+            "rep_nonce": rep_nonce,
+        }))?;
+        let outer = crate::nodes::coord::encode_json_fast(&json!({
+            "type": "relay",
+            "from": from,
+            "to": self.requester,
+            "id": self.req_nonce,
+        }))?;
+        Ok(splice_relay_frame(&outer, &meta, &ct_b64))
+    }
+
+    fn seal_parts(&self, reply: &Value) -> Result<(String, String), String> {
+        let nonce = random::<12>()?;
+        let rep_nonce = b64(&nonce);
+        let plain = Zeroizing::new(crate::nodes::coord::encode_json_fast(reply)?.into_bytes());
+        let ct = seal_aead(&self.key, nonce, &self.aad(&rep_nonce), &plain)?;
+        Ok((rep_nonce, b64(&ct)))
     }
 
     /// The reply `envelope` seals: refused when it is not this request's,
@@ -963,15 +993,27 @@ impl ReplyKey {
     }
 }
 
-/// Seal `payload` from `me` to `peer` on `channel_id`: the envelope, and
-/// the key its reply opens with.
-pub(crate) fn seal_request(
+fn splice_relay_frame(outer: &str, meta: &str, ct_b64: &str) -> String {
+    let outer_prefix = outer.strip_suffix('}').unwrap_or(outer);
+    let meta_prefix = meta.strip_suffix('}').unwrap_or(meta);
+    let mut frame =
+        String::with_capacity(outer_prefix.len() + meta_prefix.len() + ct_b64.len() + 32);
+    frame.push_str(outer_prefix);
+    frame.push_str(",\"envelope\":");
+    frame.push_str(meta_prefix);
+    frame.push_str(",\"ct\":\"");
+    frame.push_str(ct_b64);
+    frame.push_str("\"}}");
+    frame
+}
+
+fn seal_request_parts(
     me: &NodeIdentity,
     peer: &PeerKeys,
     policy: &TrustPolicy,
     channel_id: &str,
     payload: &Value,
-) -> Result<(Value, ReplyKey), String> {
+) -> Result<(EnvelopeHeader, String, String, ReplyKey), String> {
     if policy.revoked(&peer.node_id) {
         return Err(format!("node {} is revoked", peer.node_id));
     }
@@ -993,23 +1035,70 @@ pub(crate) fn seal_request(
     let [request_key, reply_key] = e2e_keys(&shared, policy.token(), &header)?;
     let aad = header.canonical();
     let sig = me.sign(&aad);
-    let plain = Zeroizing::new(serde_json::to_vec(payload).map_err(|e| e.to_string())?);
+    let plain = Zeroizing::new(crate::nodes::coord::encode_json_fast(payload)?.into_bytes());
     let ct = seal_aead(&request_key, req_nonce, &aad, &plain)?;
+    let reply = ReplyKey {
+        key: reply_key,
+        requester: header.from.clone(),
+        responder: header.to.clone(),
+        channel_id: header.channel_id.clone(),
+        at_ms: header.at_ms,
+        req_nonce: header.req_nonce.clone(),
+    };
+    Ok((header, b64(&sig), b64(&ct), reply))
+}
+
+/// Seal `payload` from `me` to `peer` on `channel_id`: the envelope, and
+/// the key its reply opens with.
+pub(crate) fn seal_request(
+    me: &NodeIdentity,
+    peer: &PeerKeys,
+    policy: &TrustPolicy,
+    channel_id: &str,
+    payload: &Value,
+) -> Result<(Value, ReplyKey), String> {
+    let (header, sig_b64, ct_b64, reply) =
+        seal_request_parts(me, peer, policy, channel_id, payload)?;
     let envelope = json!({
         "v": E2E_DOMAIN, "from": header.from, "to": header.to, "from_pub": header.from_pub,
         "eph": header.eph, "to_xpub": header.to_xpub, "epoch": header.epoch,
         "channel_id": header.channel_id, "at_ms": header.at_ms,
-        "req_nonce": header.req_nonce, "sig": b64(&sig), "ct": b64(&ct),
+        "req_nonce": header.req_nonce, "sig": sig_b64, "ct": ct_b64,
     });
-    let reply = ReplyKey {
-        key: reply_key,
-        requester: header.from,
-        responder: header.to,
-        channel_id: header.channel_id,
-        at_ms: header.at_ms,
-        req_nonce: header.req_nonce,
-    };
     Ok((envelope, reply))
+}
+
+/// Seal `payload` directly into `(req_nonce, wire_relay_json, reply_key)`.
+pub(crate) fn seal_request_relay_frame(
+    me: &NodeIdentity,
+    peer: &PeerKeys,
+    policy: &TrustPolicy,
+    channel_id: &str,
+    payload: &Value,
+) -> Result<(String, String, ReplyKey), String> {
+    let (header, sig_b64, ct_b64, reply) =
+        seal_request_parts(me, peer, policy, channel_id, payload)?;
+    let meta = crate::nodes::coord::encode_json_fast(&json!({
+        "v": E2E_DOMAIN,
+        "from": header.from,
+        "to": header.to,
+        "from_pub": header.from_pub,
+        "eph": header.eph,
+        "to_xpub": header.to_xpub,
+        "epoch": header.epoch,
+        "channel_id": header.channel_id,
+        "at_ms": header.at_ms,
+        "req_nonce": header.req_nonce,
+        "sig": sig_b64,
+    }))?;
+    let outer = crate::nodes::coord::encode_json_fast(&json!({
+        "type": "relay",
+        "from": header.from,
+        "to": header.to,
+        "id": header.req_nonce,
+    }))?;
+    let frame = splice_relay_frame(&outer, &meta, &ct_b64);
+    Ok((header.req_nonce, frame, reply))
 }
 
 /// A request a [`Responder`] opened: what it asks, who sent it, and the

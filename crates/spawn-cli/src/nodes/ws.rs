@@ -40,7 +40,7 @@ const MAX_HEAD: usize = 16 * 1024;
 /// something to read: a read that finds nothing is a spurious wakeup).
 const READY_WAIT: Duration = Duration::from_millis(50);
 /// What one read takes at most.
-const READ_CHUNK: usize = 64 * 1024;
+const READ_CHUNK: usize = 128 * 1024;
 /// RFC 6455's GUID, appended to the key whose SHA-1 the server answers.
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -424,7 +424,25 @@ impl WsStream {
     pub(crate) fn closed(&self) -> bool {
         self.closed
     }
+}
 
+fn xor_mask_in_place(bytes: &mut [u8], mask: [u8; 4]) {
+    let word_mask = u64::from_ne_bytes([
+        mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3],
+    ]);
+    let mut chunks = bytes.chunks_exact_mut(8);
+    for chunk in &mut chunks {
+        let value = u64::from_ne_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]) ^ word_mask;
+        chunk.copy_from_slice(&value.to_ne_bytes());
+    }
+    for (index, byte) in chunks.into_remainder().iter_mut().enumerate() {
+        *byte ^= mask[index & 3];
+    }
+}
+
+impl WsStream {
     /// Send one frame of `opcode`.
     fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), String> {
         if payload.len() > MAX_FRAME {
@@ -447,12 +465,9 @@ impl WsStream {
         if self.client {
             let mask = random::<4>()?;
             frame.extend_from_slice(&mask);
-            frame.extend(
-                payload
-                    .iter()
-                    .enumerate()
-                    .map(|(i, byte)| byte ^ mask[i % 4]),
-            );
+            let start = frame.len();
+            frame.extend_from_slice(payload);
+            xor_mask_in_place(&mut frame[start..], mask);
         } else {
             frame.extend_from_slice(payload);
         }
@@ -537,11 +552,17 @@ impl WsStream {
         if buffer.len() < at + len {
             return Ok(None);
         }
-        let mut payload: Vec<u8> = self.buffer.drain(..at + len).skip(at).collect();
+        let total = at + len;
+        let mut payload = self.buffer[at..total].to_vec();
+        if total == self.buffer.len() {
+            self.buffer.clear();
+        } else {
+            let tail = self.buffer.len() - total;
+            self.buffer.copy_within(total.., 0);
+            self.buffer.truncate(tail);
+        }
         if let Some(mask) = mask {
-            for (index, byte) in payload.iter_mut().enumerate() {
-                *byte ^= mask[index % 4];
-            }
+            xor_mask_in_place(&mut payload, mask);
         }
         Ok(Some((fin, opcode, payload)))
     }

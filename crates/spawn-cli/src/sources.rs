@@ -36,7 +36,7 @@
 //! ([`controller_git`]), whatever the host's git or its configuration
 //! would allow.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -1095,7 +1095,7 @@ pub(crate) fn refresh(mirror: &Path, source: &str) -> Result<(), String> {
 }
 
 /// The commit a ref of a bare repository points at, if it exists.
-fn ref_commit(repo: &Path, reference: &str) -> Option<String> {
+pub(crate) fn ref_commit(repo: &Path, reference: &str) -> Option<String> {
     git(&[
         "--git-dir",
         &repo.to_string_lossy(),
@@ -1268,7 +1268,9 @@ pub(crate) fn restore_published(
             }
         },
     );
-    let _ = git(&["--git-dir", &path, "update-ref", "-d", &private]);
+    if !is_protected_task_ref(&private) {
+        let _ = git(&["--git-dir", &path, "update-ref", "-d", &private]);
+    }
     restored
 }
 
@@ -1373,7 +1375,10 @@ pub(crate) fn fetch_pushed_into(
         .lines()
         .any(|line| line.split_whitespace().nth(1) == Some(remote.as_str()))
     {
-        if ref_commit(mirror, tracking).is_some() {
+        if !is_protected_task_ref(tracking)
+            && !tracking.starts_with("refs/spawn/workers/")
+            && ref_commit(mirror, tracking).is_some()
+        {
             let _ = git(&["--git-dir", &path, "update-ref", "-d", tracking]);
         }
         return Ok(None);
@@ -1388,6 +1393,159 @@ pub(crate) fn fetch_pushed_into(
         &format!("+{remote}:{tracking}"),
     ])?;
     Ok(ref_commit(mirror, tracking))
+}
+
+/// Structured [`WorkspaceError::Refused`] code returned when cleanup or prune
+/// targets an active worker branch or protected task ref (`#103` item 3).
+#[allow(dead_code)]
+pub(crate) const PROTECTED_REF_CODE: &str = "protected_ref";
+
+/// Whether `ref_name` is a protected per-task durable ref (`refs/spawn/tasks/<id>/*`).
+pub(crate) fn is_protected_task_ref(ref_name: &str) -> bool {
+    ref_name.starts_with("refs/spawn/tasks/")
+}
+
+/// Extract the worker agent identifier named by a worker branch or tracking ref.
+#[allow(dead_code)]
+pub(crate) fn worker_agent_from_ref(ref_name: &str) -> Option<&str> {
+    if let Some(rest) = ref_name.strip_prefix("refs/heads/spawn/") {
+        return (!rest.is_empty()).then_some(rest);
+    }
+    if let Some(rest) = ref_name.strip_prefix("refs/heads/") {
+        return (!rest.is_empty()).then_some(rest);
+    }
+    if let Some(rest) = ref_name.strip_prefix("refs/spawn-integrate/") {
+        return (!rest.is_empty()).then_some(rest);
+    }
+    if let Some(rest) = ref_name.strip_prefix("refs/spawn-restore/") {
+        return (!rest.is_empty()).then_some(rest);
+    }
+    if let Some(rest) = ref_name.strip_prefix("refs/spawn/workers/") {
+        return rest.split('/').next().filter(|agent| !agent.is_empty());
+    }
+    if !ref_name.starts_with("refs/") {
+        let rest = ref_name.strip_prefix("spawn/").unwrap_or(ref_name);
+        return (!rest.is_empty()).then_some(rest);
+    }
+    None
+}
+
+/// Return the refusal reason if `ref_name` must not be deleted or pruned.
+#[allow(dead_code)]
+pub(crate) fn ref_prune_refusal(
+    ref_name: &str,
+    active_workers: &BTreeSet<String>,
+) -> Option<String> {
+    if is_protected_task_ref(ref_name) {
+        return Some(format!("refusing to delete protected task ref {ref_name}"));
+    }
+    if let Some(agent) = worker_agent_from_ref(ref_name) {
+        if ref_name.starts_with("refs/spawn/workers/") {
+            return Some(format!(
+                "refusing to delete protected worker ref {ref_name}"
+            ));
+        }
+        if active_workers.contains(agent) {
+            return Some(format!(
+                "refusing to delete active worker ref {ref_name} (agent {agent})"
+            ));
+        }
+    }
+    None
+}
+
+/// Collect active worker agent ids from live store publishing & delivery tables.
+#[allow(dead_code)]
+pub(crate) fn active_worker_set(store: &PostgresStore) -> Result<BTreeSet<String>, String> {
+    let mut active = BTreeSet::new();
+    for (agent, _) in store
+        .publishing_agents()
+        .map_err(|error| error.to_string())?
+    {
+        if !agent.is_empty() {
+            active.insert(agent);
+        }
+    }
+    let rows = store.delivery_rows().map_err(|error| error.to_string())?;
+    for row in rows.as_array().into_iter().flatten() {
+        let Some(agent) = row["agent_id"].as_str().filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        if !matches!(
+            row["state"].as_str(),
+            Some("landed" | "cancelled" | "aborted" | "yielded" | "done" | "closed")
+        ) {
+            active.insert(agent.to_string());
+        }
+    }
+    Ok(active)
+}
+
+/// Delete `ref_name` in `repo` only when it is not a protected task/worker ref
+/// and does not belong to an active worker in `active_workers`.
+#[allow(dead_code)]
+pub(crate) fn delete_ref_guarded(
+    repo: &Path,
+    ref_name: &str,
+    active_workers: &BTreeSet<String>,
+) -> Result<(), WorkspaceError> {
+    if let Some(message) = ref_prune_refusal(ref_name, active_workers) {
+        return Err(WorkspaceError::Refused {
+            code: PROTECTED_REF_CODE.to_string(),
+            message,
+        });
+    }
+    if ref_commit(repo, ref_name).is_none() {
+        return Ok(());
+    }
+    let path = repo.to_string_lossy().to_string();
+    git(&["--git-dir", &path, "update-ref", "-d", ref_name])?;
+    Ok(())
+}
+
+/// Prune `worktree_path` (and optionally delete `branch_ref`) in `repo` only
+/// after verifying neither targets an active worker or protected ref.
+#[allow(dead_code)]
+pub(crate) fn prune_worktree_guarded(
+    repo: &Path,
+    worktree_path: &Path,
+    branch_ref: Option<&str>,
+    active_workers: &BTreeSet<String>,
+) -> Result<(), WorkspaceError> {
+    if let Some(ref_name) = branch_ref
+        && let Some(message) = ref_prune_refusal(ref_name, active_workers)
+    {
+        return Err(WorkspaceError::Refused {
+            code: PROTECTED_REF_CODE.to_string(),
+            message,
+        });
+    }
+    let path = repo.to_string_lossy().to_string();
+    let wt_path = worktree_path.to_string_lossy().to_string();
+    if worktree_path.exists() {
+        if let Ok(head_ref) = git(&["-C", &wt_path, "symbolic-ref", "-q", "HEAD"])
+            && let Some(message) = ref_prune_refusal(head_ref.trim(), active_workers)
+        {
+            return Err(WorkspaceError::Refused {
+                code: PROTECTED_REF_CODE.to_string(),
+                message,
+            });
+        }
+        git(&[
+            "--git-dir",
+            &path,
+            "worktree",
+            "remove",
+            "--force",
+            &wt_path,
+        ])?;
+    } else {
+        let _ = git(&["--git-dir", &path, "worktree", "prune"]);
+    }
+    if let Some(ref_name) = branch_ref {
+        delete_ref_guarded(repo, ref_name, active_workers)?;
+    }
+    Ok(())
 }
 
 impl WorkspaceStore for MissionWorkspaces {
@@ -1478,6 +1636,9 @@ impl WorkspaceStore for MissionWorkspaces {
                         eprintln!("sources: push {worker_ref}: {why}");
                     }
                 }
+            }
+            if has_branch(repo, workspace.sandbox()) {
+                self.mark(repo, source, workspace.sandbox());
             }
         }
         self.unmounted(&routed.store);
@@ -1661,8 +1822,8 @@ impl Drop for MissionWorkspaces {
 mod tests {
     use super::{
         MissionSource, Routed, commit_routed, ensure_mirror, fetch_pushed_into, mirror_name,
-        mirror_path, port_is_digits, receives_branches, restore_published, source_readable,
-        test_git as git,
+        mirror_path, port_is_digits, receives_branches, ref_commit, restore_published,
+        source_readable, test_git as git,
     };
     use crate::push::{Pushed, Pusher, push_branch};
     use spawn_core::id::{BranchName, CommitId, WorkspaceId};
@@ -3298,6 +3459,154 @@ mod tests {
         assert!(!store.list_refs(None).expect("list_refs").is_empty());
 
         let _ = std::fs::remove_dir_all(&tmpfs_dir);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn seed_prune_guard_repo(base: &Path) -> (std::path::PathBuf, String) {
+        let repo = base.join("repo.git");
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        git(&["init", "--quiet", "--bare", &repo.to_string_lossy()]).expect("init bare");
+        git(&[
+            "clone",
+            "--quiet",
+            &repo.to_string_lossy(),
+            &work.to_string_lossy(),
+        ])
+        .expect("clone");
+        let work_s = work.to_string_lossy().to_string();
+        git(&["-C", &work_s, "config", "user.name", "Test"]).expect("user");
+        git(&["-C", &work_s, "config", "user.email", "t@e.st"]).expect("email");
+        std::fs::write(work.join("README.md"), "seed\n").expect("seed");
+        git(&["-C", &work_s, "add", "."]).expect("add");
+        git(&["-C", &work_s, "commit", "--quiet", "-m", "seed"]).expect("commit");
+        git(&[
+            "-C",
+            &work_s,
+            "push",
+            "--quiet",
+            "origin",
+            "HEAD:refs/heads/main",
+        ])
+        .expect("push main");
+        let head = git(&[
+            "--git-dir",
+            &repo.to_string_lossy(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .expect("main oid");
+        (repo, head.trim().to_string())
+    }
+
+    #[test]
+    fn protected_ref_guard_refuses_active_worker_branches_and_task_head_refs() {
+        let base = std::env::temp_dir().join(format!("spawn-prune-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (repo, head) = seed_prune_guard_repo(&base);
+
+        let task_ref = spawn_host::git::task_head_ref(42, "head");
+        let worker_head = spawn_host::git::worker_head_ref("w-active");
+        let active_spawn = "refs/heads/spawn/w-active";
+        let active_local = "refs/heads/w-active";
+        let integrate_ref = "refs/spawn-integrate/w-active";
+        let inactive_spawn = "refs/heads/spawn/w-done";
+        for reference in [
+            task_ref.as_str(),
+            worker_head.as_str(),
+            active_spawn,
+            active_local,
+            integrate_ref,
+            inactive_spawn,
+        ] {
+            git(&[
+                "--git-dir",
+                &repo.to_string_lossy(),
+                "update-ref",
+                reference,
+                &head,
+            ])
+            .expect("create ref");
+        }
+        let wt_active = base.join("wt-active");
+        git(&[
+            "--git-dir",
+            &repo.to_string_lossy(),
+            "worktree",
+            "add",
+            &wt_active.to_string_lossy(),
+            "w-active",
+        ])
+        .expect("add worktree");
+
+        let active_workers = std::collections::BTreeSet::from(["w-active".to_string()]);
+        assert!(super::is_protected_task_ref(&task_ref));
+        assert!(super::ref_prune_refusal(&task_ref, &std::collections::BTreeSet::new()).is_some());
+
+        for protected in [
+            task_ref.as_str(),
+            worker_head.as_str(),
+            active_spawn,
+            active_local,
+            integrate_ref,
+        ] {
+            let err = super::delete_ref_guarded(&repo, protected, &active_workers)
+                .expect_err("protected or active ref must be refused");
+            assert!(
+                matches!(err, WorkspaceError::Refused { ref code, .. } if code == super::PROTECTED_REF_CODE),
+                "unexpected error for {protected}: {err}"
+            );
+            assert_eq!(ref_commit(&repo, protected).as_deref(), Some(head.as_str()));
+        }
+
+        for branch_arg in [Some(active_local), None] {
+            let wt_err =
+                super::prune_worktree_guarded(&repo, &wt_active, branch_arg, &active_workers)
+                    .expect_err("active worktree must not be pruned");
+            assert!(
+                matches!(wt_err, WorkspaceError::Refused { ref code, .. } if code == super::PROTECTED_REF_CODE),
+                "{wt_err}"
+            );
+            assert!(wt_active.exists());
+        }
+
+        super::delete_ref_guarded(&repo, inactive_spawn, &active_workers)
+            .expect("inactive worker branch deletes");
+        assert!(ref_commit(&repo, inactive_spawn).is_none());
+
+        let wt_inactive = base.join("wt-inactive");
+        let inactive_local = "refs/heads/w-done";
+        git(&[
+            "--git-dir",
+            &repo.to_string_lossy(),
+            "update-ref",
+            inactive_local,
+            &head,
+        ])
+        .expect("create inactive branch");
+        git(&[
+            "--git-dir",
+            &repo.to_string_lossy(),
+            "worktree",
+            "add",
+            &wt_inactive.to_string_lossy(),
+            "w-done",
+        ])
+        .expect("add inactive wt");
+        super::prune_worktree_guarded(&repo, &wt_inactive, Some(inactive_local), &active_workers)
+            .expect("inactive worktree prunes cleanly");
+        assert!(!wt_inactive.exists());
+        assert!(ref_commit(&repo, inactive_local).is_none());
+
+        let empty = std::collections::BTreeSet::new();
+        let err = super::delete_ref_guarded(&repo, &task_ref, &empty)
+            .expect_err("task head ref always refused");
+        assert!(
+            matches!(err, WorkspaceError::Refused { ref code, .. } if code == super::PROTECTED_REF_CODE),
+            "{err}"
+        );
+        assert_eq!(ref_commit(&repo, &task_ref).as_deref(), Some(head.as_str()));
+
         let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -10836,8 +10836,10 @@ fn an_objective_is_classified_and_routed_through_the_catalog() {
         "default is not named: {record}"
     );
 
-    // The re-probe: every preset's window long past, the next l2
-    // objective goes once to mid-dear (mid is the cheapest), then to mid.
+    // The re-probe: by default (`SPAWN_GRADING_REPROBE_SECS` unset, `i64::MAX`),
+    // routing stays on the cheapest sufficient preset (`mid`) even with
+    // starved windows; when opt-in re-probing is active, a starved `l2`
+    // preset (`mid-dear`) is re-probed once, then routing returns to `mid`.
     db.admin()
         .batch_execute("update grading_presets set window_start_ms = 0")
         .expect("starve the presets");
@@ -10845,19 +10847,71 @@ fn an_objective_is_classified_and_routed_through_the_catalog() {
     let mission = prompted_mission(&db, &base_l2, "rp", &[(5, "Do it.")]);
     let probed =
         crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("a pass");
-    assert_eq!(
-        grading_of(&db, probed[0]).1.as_deref(),
-        Some("mid-dear"),
-        "the starved l2 preset is re-probed"
-    );
-    db.store.task_cancel(probed[0]).expect("cancel");
-    let next =
-        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("a pass");
-    assert_eq!(
-        grading_of(&db, next[0]).1.as_deref(),
-        Some("mid"),
-        "re-probed once, then the minimum-sufficient preset"
-    );
+    if crate::grading::reprobe_interval_ms() == i64::MAX {
+        assert_eq!(
+            grading_of(&db, probed[0]).1.as_deref(),
+            Some("mid"),
+            "with re-probe off by default, the cheapest sufficient preset is chosen"
+        );
+        db.store.task_cancel(probed[0]).expect("cancel");
+
+        let catalog = db.store.grading_catalog().expect("catalog");
+        let mut activity = db.store.grading_activity().expect("activity");
+        let now_ms = crate::grading::now_ms();
+        let reprobed = spawn_core::grading::route_with_reprobe(
+            spawn_core::grading::TaskDifficulty::L2,
+            &catalog,
+            &activity,
+            now_ms,
+            60_000,
+        )
+        .expect("opt-in reprobe routes");
+        assert_eq!(
+            reprobed.preset_id, "mid-dear",
+            "the starved l2 preset is re-probed when opted in"
+        );
+        assert!(reprobed.reprobe);
+
+        if let Some(entry) = activity.iter_mut().find(|entry| {
+            entry.preset_id == "mid-dear"
+                && entry.difficulty == spawn_core::grading::TaskDifficulty::L2
+        }) {
+            entry.last_assigned_ms = now_ms;
+        } else {
+            activity.push(spawn_core::grading::PresetActivity {
+                preset_id: "mid-dear".to_string(),
+                difficulty: spawn_core::grading::TaskDifficulty::L2,
+                last_assigned_ms: now_ms,
+            });
+        }
+        let next = spawn_core::grading::route_with_reprobe(
+            spawn_core::grading::TaskDifficulty::L2,
+            &catalog,
+            &activity,
+            now_ms,
+            60_000,
+        )
+        .expect("post-reprobe routes");
+        assert_eq!(
+            next.preset_id, "mid",
+            "re-probed once, then the minimum-sufficient preset"
+        );
+        assert!(!next.reprobe);
+    } else {
+        assert_eq!(
+            grading_of(&db, probed[0]).1.as_deref(),
+            Some("mid-dear"),
+            "the starved l2 preset is re-probed"
+        );
+        db.store.task_cancel(probed[0]).expect("cancel");
+        let next = crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+            .expect("a pass");
+        assert_eq!(
+            grading_of(&db, next[0]).1.as_deref(),
+            Some("mid"),
+            "re-probed once, then the minimum-sufficient preset"
+        );
+    }
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -11240,5 +11294,133 @@ fn integrator_own_landing_is_not_external_main_advance_but_external_push_after_i
     // Re-running passes without further main changes stays deduplicated.
     integrator.pass_on(&db.store).expect("dedup pass");
     assert_eq!(adv_rows().len(), 1);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+fn setup_active_worktree(
+    base: &Path,
+    source: &str,
+    agent: &str,
+    pushed: &str,
+) -> (PathBuf, PathBuf, String) {
+    let checkout = base.join("active-wt-repo.git");
+    git(&[
+        "clone",
+        "--quiet",
+        "--bare",
+        source,
+        &checkout.to_string_lossy(),
+    ])
+    .expect("clone bare repo");
+    let wt_branch = format!("refs/heads/{agent}");
+    git(&[
+        "--git-dir",
+        &checkout.to_string_lossy(),
+        "update-ref",
+        &wt_branch,
+        pushed,
+    ])
+    .expect("create active worker branch");
+    let wt_dir = base.join("active-wt");
+    git(&[
+        "--git-dir",
+        &checkout.to_string_lossy(),
+        "worktree",
+        "add",
+        &wt_dir.to_string_lossy(),
+        agent,
+    ])
+    .expect("attach worktree");
+    (checkout, wt_dir, wt_branch)
+}
+
+#[test]
+fn prune_guard_protects_active_worker_branches_and_task_head_refs_across_integrate_passes() {
+    let gate = "printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+    let (base, source, scenarios, integrator) = world("prune-guard", gate);
+    let db = Db::new("prune_guard");
+    let mission = db.gated_mission(&source, &scenarios);
+    let task = db.reported_task(mission, "w");
+    let agent = agent_of(&db, mission, task);
+    let pushed = push_work(&base, &source, &agent, "task.txt");
+
+    let task_ref = spawn_host::git::task_head_ref(task, "head");
+    let worker_ref = spawn_host::git::worker_head_ref(&agent);
+    let pushed_branch_ref = format!("refs/heads/spawn/{agent}");
+    git(&["--git-dir", &source, "update-ref", &task_ref, &pushed]).expect("tag task head");
+    git(&["--git-dir", &source, "update-ref", &worker_ref, &pushed]).expect("tag worker head");
+    let (checkout, wt_dir, wt_branch) = setup_active_worktree(&base, &source, &agent, &pushed);
+
+    let source_path = Path::new(&source);
+    let err_active =
+        crate::integrate::prune_ref_guarded(&db.store, source_path, &pushed_branch_ref)
+            .expect_err("active worker branch must be refused");
+    assert!(
+        err_active.contains(crate::sources::PROTECTED_REF_CODE),
+        "{err_active}"
+    );
+    let err_worker_head = crate::integrate::prune_ref_guarded(&db.store, source_path, &worker_ref)
+        .expect_err("worker durable head ref must be refused");
+    assert!(
+        err_worker_head.contains(crate::sources::PROTECTED_REF_CODE),
+        "{err_worker_head}"
+    );
+    let err_task_head = crate::integrate::prune_ref_guarded(&db.store, source_path, &task_ref)
+        .expect_err("protected task head ref must be refused");
+    assert!(
+        err_task_head.contains(crate::sources::PROTECTED_REF_CODE),
+        "{err_task_head}"
+    );
+    let err_wt =
+        crate::integrate::prune_worktree_guarded(&db.store, &checkout, &wt_dir, Some(&wt_branch))
+            .expect_err("active worker worktree prune must be refused");
+    assert!(
+        err_wt.contains(crate::sources::PROTECTED_REF_CODE),
+        "{err_wt}"
+    );
+    assert!(wt_dir.exists(), "active worktree must remain on disk");
+    assert_eq!(
+        crate::sources::ref_commit(source_path, &pushed_branch_ref).as_deref(),
+        Some(pushed.as_str())
+    );
+    assert_eq!(
+        crate::sources::ref_commit(source_path, &task_ref).as_deref(),
+        Some(pushed.as_str())
+    );
+
+    // Land the task through integrate.
+    integrator.pass_on(&db.store).expect("start gate");
+    integrator.settle();
+    assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+
+    // Protected task/worker head refs stay guarded even after landing, while the
+    // retired worker branch & worktree can now be cleanly pruned.
+    let still_task = crate::integrate::prune_ref_guarded(&db.store, source_path, &task_ref)
+        .expect_err("task head ref stays protected after landing");
+    assert!(
+        still_task.contains(crate::sources::PROTECTED_REF_CODE),
+        "{still_task}"
+    );
+    let still_worker = crate::integrate::prune_ref_guarded(&db.store, source_path, &worker_ref)
+        .expect_err("worker head ref stays protected after landing");
+    assert!(
+        still_worker.contains(crate::sources::PROTECTED_REF_CODE),
+        "{still_worker}"
+    );
+
+    crate::integrate::prune_ref_guarded(&db.store, source_path, &pushed_branch_ref)
+        .expect("landed worker branch may be pruned");
+    assert!(
+        crate::sources::ref_commit(source_path, &pushed_branch_ref).is_none(),
+        "landed branch pruned"
+    );
+    crate::integrate::prune_worktree_guarded(&db.store, &checkout, &wt_dir, Some(&wt_branch))
+        .expect("landed worktree may be pruned");
+    assert!(!wt_dir.exists(), "landed worktree removed");
+    assert!(
+        crate::sources::ref_commit(&checkout, &wt_branch).is_none(),
+        "landed local worker branch deleted"
+    );
+
     let _ = std::fs::remove_dir_all(&base);
 }

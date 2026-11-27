@@ -144,6 +144,15 @@ impl Judging {
     /// Remove the judging's directory and everything in it: the last step
     /// of a reap, after its outcome is recorded.
     pub(crate) fn remove(&self) {
+        if self.directory.parent().and_then(Path::file_name)
+            != Some(std::ffi::OsStr::new(DIRECTORY))
+        {
+            eprintln!(
+                "integrate: refuse to remove non-judging directory {}",
+                self.directory.display()
+            );
+            return;
+        }
         if let Err(error) = std::fs::remove_dir_all(&self.directory)
             && error.kind() != std::io::ErrorKind::NotFound
         {
