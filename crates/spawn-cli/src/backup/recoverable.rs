@@ -3527,10 +3527,15 @@ fn cmd_snapshot(flags: &Flags) -> Result<i32, String> {
     let parent = flags.get("parent");
 
     let store = CasStore::open(&store_root).map_err(|error| error.to_string())?;
+    // First, so what a killed earlier run left is reclaimed whether or not
+    // this snapshot succeeds; this run's own staging files are removed by
+    // their guards on every return.
+    if let Err(error) = store.sweep_staging() {
+        eprintln!("spawn backup cas: staging sweep: {error}");
+    }
     let summary = store
         .create_snapshot(&source, fm_graph_opt.as_ref(), parent.as_deref())
         .map_err(|error| error.to_string())?;
-    let _ = store.sweep_staging();
 
     if flags.switch("json") {
         println!(
@@ -3653,20 +3658,44 @@ fn cmd_key_of(flags: &Flags) -> Result<i32, String> {
     Ok(0)
 }
 
+/// A scratch directory `<parent>/spawn-<label>-<pid>-<seq>` for one D6
+/// export, removed when dropped. It holds an exclusive advisory lock on its
+/// [`EXPORT_LOCK`] for its whole life, so a process killed before its drop
+/// (an OOM kill on a small host) leaves a directory the next export can
+/// tell from a live one ([`reclaim_stale_exports`]).
 struct TempExportDir {
     path: PathBuf,
+    _lock: File,
 }
+
+/// The lock file inside a [`TempExportDir`].
+const EXPORT_LOCK: &str = ".spawn-export.lock";
 
 impl TempExportDir {
     fn create(parent: Option<&Path>, label: &str) -> Result<Self, String> {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let base = parent.map_or_else(std::env::temp_dir, Path::to_path_buf);
+        let reclaim = reclaim_stale_exports(&base, label);
+        if reclaim.removed > 0 {
+            eprintln!(
+                "spawn backup: reclaimed {} stale D6 export dir(s) under {}",
+                reclaim.removed,
+                base.display()
+            );
+        }
+        for error in &reclaim.errors {
+            eprintln!("spawn backup: stale D6 export dir: {error}");
+        }
         let path = base.join(format!("spawn-{label}-{}-{seq}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).map_err(|error| {
             format!("create temporary D6 export dir {}: {error}", path.display())
         })?;
-        Ok(Self { path })
+        let lock_path = path.join(EXPORT_LOCK);
+        let lock = File::create(&lock_path)
+            .and_then(|file| file.lock().map(|()| file))
+            .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
+        Ok(Self { path, _lock: lock })
     }
 }
 
@@ -3674,6 +3703,75 @@ impl Drop for TempExportDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+/// What [`reclaim_stale_exports`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Reclaimed {
+    removed: usize,
+    errors: Vec<String>,
+}
+
+/// Remove the [`TempExportDir`]s of `label` under `base` that no process
+/// owns any more. A directory is taken only when every one of these holds,
+/// so an active export is never touched: its name is
+/// `spawn-<label>-<pid>-<seq>`; it is a real directory (a symlink is never
+/// followed) owned by this user; its `<pid>` runs no process here; and its
+/// [`EXPORT_LOCK`], when it has one, is held by nobody (a live export in
+/// another PID namespace sharing `base` still holds it). Off Unix nothing is
+/// taken: liveness cannot be told there.
+fn reclaim_stale_exports(base: &Path, label: &str) -> Reclaimed {
+    let mut reclaimed = Reclaimed::default();
+    if !cfg!(unix) {
+        return reclaimed;
+    }
+    let Ok(entries) = fs::read_dir(base) else {
+        return reclaimed;
+    };
+    let prefix = format!("spawn-{label}-");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+            .and_then(|rest| rest.split_once('-'))
+            .filter(|(_, seq)| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() || !owned_by_me(&meta) || is_process_alive(pid) {
+            continue;
+        }
+        if let Ok(lock) = File::open(path.join(EXPORT_LOCK))
+            && lock.try_lock().is_err()
+        {
+            continue;
+        }
+        match fs::remove_dir_all(&path) {
+            Ok(()) => reclaimed.removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => reclaimed
+                .errors
+                .push(format!("remove {}: {error}", path.display())),
+        }
+    }
+    reclaimed
+}
+
+#[cfg(unix)]
+fn owned_by_me(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.uid() == rustix::process::geteuid().as_raw()
+}
+
+#[cfg(not(unix))]
+fn owned_by_me(_meta: &fs::Metadata) -> bool {
+    false
 }
 
 struct BorrowedPgRefLedger<'a>(&'a spawn_postgres::PostgresStore);
@@ -5264,5 +5362,126 @@ mod tests {
                 .is_empty(),
             "live PG refs must remain unchanged after read-only refusal"
         );
+    }
+
+    /// Of the entries under a temp dir, only a real, owned
+    /// `spawn-<label>-<pid>-<seq>` directory whose pid runs nothing and whose
+    /// lock nobody holds is reclaimed: a live pid's, a locked one (a live
+    /// export in another PID namespace), a symlink (never followed), a plain
+    /// file, another label's and a malformed name are all left.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_export_dir_is_reclaimed_and_an_active_one_never() {
+        let base = TempDir::new("reclaim-base");
+        let outside = TempDir::new("reclaim-outside");
+        fs::write(outside.path().join("keep.txt"), b"not ours to delete").unwrap();
+        let label = "backup-d6-export";
+        let dir = |name: &str| {
+            let path = base.path().join(name);
+            fs::create_dir_all(path.join("repo.git")).unwrap();
+            fs::write(
+                path.join("repo.git").join("HEAD"),
+                b"ref: refs/heads/main\n",
+            )
+            .unwrap();
+            path
+        };
+        let dead = dir(&format!("spawn-{label}-999999-1"));
+        let live = dir(&format!("spawn-{label}-{}-2", std::process::id()));
+        let locked = dir(&format!("spawn-{label}-999999-3"));
+        let held = File::create(locked.join(EXPORT_LOCK)).unwrap();
+        held.lock().unwrap();
+        let link = base.path().join(format!("spawn-{label}-999999-4"));
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let file = base.path().join(format!("spawn-{label}-999999-5"));
+        fs::write(&file, b"a file, not an export").unwrap();
+        let other = dir("spawn-other-999999-6");
+        let malformed = dir(&format!("spawn-{label}-999999-x"));
+
+        let reclaimed = reclaim_stale_exports(base.path(), label);
+        assert_eq!(
+            reclaimed,
+            Reclaimed {
+                removed: 1,
+                errors: Vec::new()
+            }
+        );
+        assert!(!dead.exists(), "a dead, unlocked export is reclaimed");
+        for kept in [&live, &locked, &file, &other, &malformed] {
+            assert!(kept.exists(), "{} must be left", kept.display());
+        }
+        assert!(fs::symlink_metadata(&link).is_ok(), "the symlink is left");
+        assert!(
+            outside.path().join("keep.txt").exists(),
+            "its target is never touched"
+        );
+
+        drop(held);
+        let reclaimed = reclaim_stale_exports(base.path(), label);
+        assert_eq!(
+            reclaimed.removed, 1,
+            "once its lock is free, the dead pid's export goes"
+        );
+        assert!(!locked.exists());
+        assert!(live.exists(), "a live pid's export is never taken");
+    }
+
+    /// A new export reclaims what a killed one left, holds its own lock for
+    /// its life (so it is never reclaimed while it runs), and is removed on
+    /// drop.
+    #[cfg(unix)]
+    #[test]
+    fn an_export_dir_reclaims_the_stale_and_holds_its_own_lock() {
+        let base = TempDir::new("export-base");
+        let label = "backup-d6-export";
+        let stale = base.path().join(format!("spawn-{label}-999999-9"));
+        fs::create_dir_all(&stale).unwrap();
+        File::create(stale.join(EXPORT_LOCK)).unwrap();
+
+        let export = TempExportDir::create(Some(base.path()), label).expect("create");
+        assert!(!stale.exists(), "the killed export's dir is reclaimed");
+        assert!(export.path.is_dir());
+        let probe = File::open(export.path.join(EXPORT_LOCK)).unwrap();
+        assert!(probe.try_lock().is_err(), "a live export holds its lock");
+        assert_eq!(
+            reclaim_stale_exports(base.path(), label).removed,
+            0,
+            "a running export is never reclaimed"
+        );
+        let path = export.path.clone();
+        drop(export);
+        assert!(!path.exists(), "dropped, it is removed");
+    }
+
+    /// `cas snapshot` sweeps the staging a killed run left before it
+    /// snapshots, so it is reclaimed even when this snapshot fails.
+    #[test]
+    fn a_snapshot_sweeps_stale_staging_first_even_when_it_fails() {
+        let store_dir = TempDir::new("sweep-first-store");
+        let cas = CasStore::open(store_dir.path()).expect("open");
+        fs::create_dir_all(cas.staging_dir()).unwrap();
+        let stray = cas.staging_dir().join(".tmp-999999-7");
+        fs::write(&stray, b"left by a killed run").unwrap();
+        let live = cas
+            .staging_dir()
+            .join(format!(".tmp-{}-8", std::process::id()));
+        fs::write(&live, b"a live writer's").unwrap();
+        let missing = store_dir.path().join("no-such-source");
+        let arguments: Vec<String> = [
+            "snapshot",
+            "--source",
+            missing.to_str().unwrap(),
+            "--store",
+            store_dir.path().to_str().unwrap(),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert!(command(&arguments).is_err(), "the snapshot itself fails");
+        assert!(
+            !stray.exists(),
+            "the stale staging file is reclaimed anyway"
+        );
+        assert!(live.exists(), "a live writer's staging file is left");
     }
 }
