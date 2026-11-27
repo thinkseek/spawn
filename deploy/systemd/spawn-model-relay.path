@@ -1,0 +1,22 @@
+[Unit]
+Description=Spawn: start the model relay when Keep delivers its DeepSeek API key
+
+[Path]
+# After a reboot /run/keep is empty until Keep delivers again (Wave K1):
+# once spawn-model-relay.service is cut over to LoadCredential, it starts
+# at boot without the file, fails with 243 and stays stopped. When Keep
+# then writes /run/keep/deepseek.api-key (closed after a write, or renamed
+# into place), this unit starts spawn-model-relay.service; it does nothing
+# while the relay runs. PathChanged alone, not PathExists: with PathExists
+# systemd starts the relay again each time it stops while the file is there,
+# so an empty file (the relay exits 78) would be retried until the start
+# limit, which leaves this unit failed and a later good write unheard.
+# PathChanged hits that limit too (5 starts in 10 s) only if Keep writes a
+# bad file over and over; then `systemctl --user reset-failed` and start
+# this unit again. /run/keep itself may be absent at first: systemd
+# watches the nearest parent that exists.
+PathChanged=/run/keep/deepseek.api-key
+Unit=spawn-model-relay.service
+
+[Install]
+WantedBy=default.target

@@ -323,7 +323,7 @@ audit_keep_migration() {
     if [ "${#load_creds[@]}" -gt 0 ] && [ "$has_sensitive" -eq 0 ]; then
       status=keep_managed
       n_keep=$((n_keep + 1))
-    elif [ "${#load_creds[@]}" -eq 0 ] && [ "${#env_files[@]}" -eq 0 ]; then
+    elif [ "${#load_creds[@]}" -eq 0 ] && [ "$has_sensitive" -eq 0 ]; then
       status=no_secrets
       n_none=$((n_none + 1))
     else

@@ -68,8 +68,16 @@ send the request's credentials to whatever host it names.
 The DeepSeek key stays in this process. It never enters Spawn's environment,
 the engine's environment, the event log, or an agent's terminal.
 
+The key (Wave K1): under systemd's LoadCredential, the unit's credential
+`deepseek.api-key` (Keep's /run/keep/deepseek.api-key, copied by systemd into
+the unit's own $CREDENTIALS_DIRECTORY), and only that: with a credentials
+directory and no readable, non-empty UTF-8 `deepseek.api-key` in it, the relay
+refuses to start (exit 78) and says which. Without a credentials directory
+(the unit before its move), DEEPSEEK_API_KEY.
+
 Environment:
-  DEEPSEEK_API_KEY        required
+  CREDENTIALS_DIRECTORY   set by systemd for a unit with LoadCredential=
+  DEEPSEEK_API_KEY        the key when there is no credentials directory
   DEEPSEEK_ANTHROPIC_URL  default https://api.deepseek.com/anthropic
   MODEL_RELAY_EVERY_MODEL_AS  a deepseek-* model every other model is sent
                           to DeepSeek as; unset (the default) for none; a
@@ -157,6 +165,47 @@ def opener():
     return urllib.request.build_opener(NoRedirect)
 
 
+# The key's name as a credential: Keep's file name, LoadCredential's name.
+CREDENTIAL = "deepseek.api-key"
+# The exit status when systemd gives a credentials directory but the
+# credential in it is no key (unreadable, not UTF-8 or empty): the unit lists
+# it in RestartPreventExitStatus beside 243, so such a start stops once,
+# saying why, as a missing file does, rather than restarting every 3 s.
+CREDENTIAL_EXIT = 78  # EX_CONFIG
+
+
+def key_from(environ):
+    """(the API key, why there is none): the credential CREDENTIAL in
+    $CREDENTIALS_DIRECTORY when systemd gives the relay one, and nothing else
+    then; else DEEPSEEK_API_KEY. A why names the credential or the variable,
+    never a value. The key is the file's text as Keep writes it (the raw value,
+    no newline); one trailing newline, as a file written by hand ends, is taken
+    off, and nothing else."""
+    directory = environ.get("CREDENTIALS_DIRECTORY", "")
+    if directory:
+        try:
+            with open(os.path.join(directory, CREDENTIAL), "rb") as credential:
+                key = credential.read().decode("utf-8")
+            key = key[:-1] if key.endswith("\n") else key
+        except OSError as error:
+            return "", f"the credential {CREDENTIAL} cannot be read ({error.strerror})"
+        except UnicodeDecodeError:
+            return "", f"the credential {CREDENTIAL} is not UTF-8 text"
+        if not key:
+            return "", f"the credential {CREDENTIAL} is empty"
+        return key, None
+    key = environ.get("DEEPSEEK_API_KEY", "")
+    if not key:
+        return "", f"DEEPSEEK_API_KEY is not set, and there is no credential {CREDENTIAL}"
+    return key, None
+
+
+def exit_status(environ):
+    """The status the relay exits with when it has no key: CREDENTIAL_EXIT
+    under a credentials directory (the unit stays stopped), else 1."""
+    return CREDENTIAL_EXIT if environ.get("CREDENTIALS_DIRECTORY", "") else 1
+
+
 def settings_upstream():
     """`env.ANTHROPIC_BASE_URL` of Claude Code's user settings, if any."""
     home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
@@ -170,8 +219,10 @@ def settings_upstream():
 def config(environ):
     """The relay's settings from `environ`."""
     host, _, port = environ.get("MODEL_RELAY_ADDRESS", "127.0.0.1:8791").rpartition(":")
+    key, key_missing = key_from(environ)
     return {
-        "key": environ.get("DEEPSEEK_API_KEY", ""),
+        "key": key,
+        "key_missing": key_missing,
         "deepseek": environ.get(
             "DEEPSEEK_ANTHROPIC_URL", "https://api.deepseek.com/anthropic"
         ).rstrip("/"),
@@ -316,11 +367,12 @@ def handler(settings):
             # What the log reports: the status the client got (502 when the
             # upstream failed before any) and the body bytes it was sent.
             self._status, self._sent = 502, 0
-            if self.path == "/healthz":
+            if self.path == "/healthz" and self.command == "GET":
                 self._reply(200, b'{"ok":true}')
                 return
             if not self.path.startswith("/v1/"):
-                self._reply(404, error_body("only /v1/ is relayed"))
+                # Any body stays unread, so the connection cannot be reused.
+                self._reply(404, error_body("only /v1/ is relayed"), close=True)
                 return
             if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
                 self._reply(411, error_body("send a Content-Length"), close=True)
@@ -611,7 +663,7 @@ def serve(settings):
 def refusal(settings):
     """Why the relay must not start with `settings`, or None."""
     if not settings["key"]:
-        return "DEEPSEEK_API_KEY is not set"
+        return settings.get("key_missing") or "DEEPSEEK_API_KEY is not set"
     if not settings["upstream"]:
         return "no upstream; set MODEL_RELAY_UPSTREAM"
     # A bad MODEL_RELAY_EVERY_MODEL_AS is not refused here: an exit under
@@ -660,11 +712,12 @@ def not_dumpable():
 
 
 def main():
-    not_dumpable()  # its environment holds the key
+    not_dumpable()  # its memory (and, without a credential, its environment) holds the key
     settings = config(os.environ)
     problem = refusal(settings)
     if problem:
-        sys.exit(f"model-relay: {problem}")
+        sys.stderr.write(f"model-relay: {problem}\n")
+        sys.exit(exit_status(os.environ) if not settings["key"] else 1)
     warning = normalize_every_model_override(settings)
     if warning:
         sys.stderr.write(warning + "\n")
@@ -680,6 +733,7 @@ def main():
         f"model-relay: http://{settings['host']}:{server.server_port}/v1/ -> "
         f"deepseek-* to {deepseek}, {others}\n"
     )
+    sys.stderr.flush()
     server.serve_forever()
 
 
