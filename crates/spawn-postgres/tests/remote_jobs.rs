@@ -204,6 +204,10 @@ fn the_ledger_behaves_as_the_design_measured_it() {
         .map(|n| format!("gate-00000000000{n}-aaaaaaaa"))
         .collect();
     for id in &jobs {
+        // Grants go out `order by priority desc, enqueued_at_ms` with no further tiebreak, and a
+        // refunded grant's row moves to the end of the heap: two jobs enqueued in the same
+        // millisecond come back in either order. Keep the enqueue times distinct.
+        std::thread::sleep(std::time::Duration::from_millis(2));
         store
             .remote_job_enqueue(&job(
                 id,

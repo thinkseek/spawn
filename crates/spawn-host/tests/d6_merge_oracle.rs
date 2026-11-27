@@ -4,7 +4,9 @@
 //!   exact-content rename resolution, `.gitattributes`, modes/symlinks/gitlinks/dir-file,
 //!   single merge-base guard, `Spawn-Head` first-parent merge snapshots)
 //! - Full repository historical merge replay across `thinkseek/spawn`'s real
-//!   two-parent merge commits asserting `BlockerRustCleanGitConflictOrTreeDiff == 0`.
+//!   two-parent merge commits asserting `BlockerRustCleanGitConflictOrTreeDiff == 0`; on a
+//!   `git archive` export with no `.git` (`scripts/rsi/gate.sh`) the same oracle replays a
+//!   self-contained synthetic history of >= 12 realistic merges instead.
 
 use std::collections::HashMap;
 use std::fs;
@@ -1055,40 +1057,23 @@ fn modes_symlinks_gitlinks_dir_file_single_merge_base_and_spawn_head_snapshot() 
     assert_eq!(kinds.get("node"), Some(&ConflictKind::DirectoryFile));
 }
 
-#[test]
-#[expect(clippy::too_many_lines)]
-fn real_thinkseek_spawn_history_merge_oracle_has_zero_blockers() {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
-        .to_path_buf();
-    let scratch = Scratch::new("hist_oracle");
-    let cas_store = CasMerkleStore::open(scratch.join("cas")).expect("open cas");
-
-    let rev_list_out = git_in(&repo_root, &["rev-list", "--merges", "--parents", "HEAD"]);
-    let merges: Vec<Vec<String>> = rev_list_out
-        .lines()
-        .map(|line| line.split_whitespace().map(str::to_string).collect())
-        .filter(|parts: &Vec<String>| parts.len() == 3)
-        .collect();
-    assert!(
-        merges.len() >= 800,
-        "expected >= 800 real two-parent merges in thinkseek/spawn history, got {}",
-        merges.len()
-    );
-
-    let mut batch_reader = BatchGitReader::open(&repo_root);
-    let mut tree_cache: HashMap<GitOid, Digest> = HashMap::new();
-    let mut blob_cache: HashMap<GitOid, (Digest, u64)> = HashMap::new();
+/// Replays every two-parent merge in `merges` (`[merge, p1, p2]`) through `merge_trees` and the
+/// `git merge-tree` shadow oracle, asserting no blocker, and returns the oracle summary.
+fn replay_merges_through_oracle(
+    repo: &Path,
+    merges: &[Vec<String>],
+    cas_store: &CasMerkleStore,
+    batch_reader: &mut BatchGitReader,
+    tree_cache: &mut HashMap<GitOid, Digest>,
+    blob_cache: &mut HashMap<GitOid, (Digest, u64)>,
+) -> ShadowOracleSummary {
     let mut summary = ShadowOracleSummary::default();
-
-    for parts in &merges {
+    for parts in merges {
         let merge_commit = &parts[0];
         let p1 = &parts[1];
         let p2 = &parts[2];
 
-        let mb_out = git_in(&repo_root, &["merge-base", "--all", p1, p2]);
+        let mb_out = git_in(repo, &["merge-base", "--all", p1, p2]);
         let bases: Vec<Digest> = mb_out
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -1115,16 +1100,16 @@ fn real_thinkseek_spawn_history_merge_oracle_has_zero_blockers() {
         let base_commit = mb_out.lines().next().expect("single base").trim();
 
         let rev_to_tree = |rev: &str| -> GitOid {
-            let h = git_in(&repo_root, &["rev-parse", &format!("{rev}^{{tree}}")]);
+            let h = git_in(repo, &["rev-parse", &format!("{rev}^{{tree}}")]);
             GitOid::parse_hex(h.trim()).expect("tree oid")
         };
         let b_oid = rev_to_tree(base_commit);
         let p1_oid = rev_to_tree(p1);
         let p2_oid = rev_to_tree(p2);
 
-        let b_cas = batch_reader.import_tree(&cas_store, b_oid, &mut tree_cache, &mut blob_cache);
-        let p1_cas = batch_reader.import_tree(&cas_store, p1_oid, &mut tree_cache, &mut blob_cache);
-        let p2_cas = batch_reader.import_tree(&cas_store, p2_oid, &mut tree_cache, &mut blob_cache);
+        let b_cas = batch_reader.import_tree(cas_store, b_oid, tree_cache, blob_cache);
+        let p1_cas = batch_reader.import_tree(cas_store, p1_oid, tree_cache, blob_cache);
+        let p2_cas = batch_reader.import_tree(cas_store, p2_oid, tree_cache, blob_cache);
 
         let options = MergeOptions {
             labels: ConflictLabels {
@@ -1134,14 +1119,14 @@ fn real_thinkseek_spawn_history_merge_oracle_has_zero_blockers() {
             },
             extra_attributes: Vec::new(),
         };
-        let rust_rep = merge_trees(&cas_store, &b_cas, &p1_cas, &p2_cas, &options)
+        let rust_rep = merge_trees(cas_store, &b_cas, &p1_cas, &p2_cas, &options)
             .unwrap_or_else(|e| panic!("merge_trees failed on {merge_commit}: {e}"));
 
-        let git_res = run_git_merge_tree(&repo_root, base_commit, p1, p2, true);
+        let git_res = run_git_merge_tree(repo, base_commit, p1, p2, true);
         let mut had_non_exact_rename = false;
         if !rust_rep.is_clean() && git_res.clean {
             let r1 = git_in(
-                &repo_root,
+                repo,
                 &[
                     "diff-tree",
                     "-r",
@@ -1153,7 +1138,7 @@ fn real_thinkseek_spawn_history_merge_oracle_has_zero_blockers() {
                 ],
             );
             let r2 = git_in(
-                &repo_root,
+                repo,
                 &[
                     "diff-tree",
                     "-r",
@@ -1180,12 +1165,353 @@ fn real_thinkseek_spawn_history_merge_oracle_has_zero_blockers() {
         );
         assert!(
             !outcome.is_blocker(),
-            "blocker on historical merge {merge_commit} (base={base_commit}, p1={p1}, p2={p2}): {outcome:?}; rust_conflicts={:?}; git_conflicts={:?}",
+            "blocker on merge {merge_commit} (base={base_commit}, p1={p1}, p2={p2}): {outcome:?}; rust_conflicts={:?}; git_conflicts={:?}",
             rust_rep.conflicts,
             git_res.conflict_paths
         );
         summary.record(&outcome);
     }
+
+    summary
+}
+
+/// Two-parent merges reachable from `HEAD` in `repo`, newest first, as `[merge, p1, p2]`.
+fn two_parent_merges(repo: &Path) -> Vec<Vec<String>> {
+    git_in(repo, &["rev-list", "--merges", "--parents", "HEAD"])
+        .lines()
+        .map(|line| line.split_whitespace().map(str::to_string).collect())
+        .filter(|parts: &Vec<String>| parts.len() == 3)
+        .collect()
+}
+
+/// True when `repo_root` is the top level of its own git work tree. `scripts/rsi/gate.sh`
+/// exports candidate trees with `git archive`, which carries no `.git`.
+fn is_own_git_work_tree(repo_root: &Path) -> bool {
+    let out = test_git_command()
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--is-inside-work-tree", "--show-toplevel"])
+        .output();
+    let Ok(out) = out else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    if lines.next().map(str::trim) != Some("true") {
+        return false;
+    }
+    let Some(top) = lines.next().map(str::trim) else {
+        return false;
+    };
+    match (fs::canonicalize(top), fs::canonicalize(repo_root)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn head_oid(repo: &Path) -> String {
+    git_in(repo, &["rev-parse", "HEAD"]).trim().to_string()
+}
+
+fn commit_all(repo: &Path, msg: &str) -> String {
+    git_in(repo, &["add", "-A"]);
+    git_in(repo, &["commit", "-q", "--allow-empty", "-m", msg]);
+    head_oid(repo)
+}
+
+/// Records a real two-parent merge commit `p1 + p2` on `branch` (checked out afterwards).
+/// The merge tree is git's clean result, or `p1`'s tree when git reports a conflict.
+fn record_merge(repo: &Path, branch: &str, p1: &str, p2: &str, msg: &str) -> String {
+    let out = test_git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-tree", "--write-tree", p1, p2])
+        .output()
+        .expect("git merge-tree");
+    let tree = if out.status.code() == Some(0) {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .expect("merge-tree oid")
+            .trim()
+            .to_string()
+    } else {
+        git_in(repo, &["rev-parse", &format!("{p1}^{{tree}}")])
+            .trim()
+            .to_string()
+    };
+    let merge = git_in(repo, &["commit-tree", &tree, "-p", p1, "-p", p2, "-m", msg])
+        .trim()
+        .to_string();
+    git_in(
+        repo,
+        &["update-ref", &format!("refs/heads/{branch}"), &merge],
+    );
+    git_in(repo, &["checkout", "-q", "-f", branch]);
+    git_in(repo, &["reset", "-q", "--hard", &merge]);
+    merge
+}
+
+/// One merge scenario on top of `main`: `side` edits run on a branch, `main_edits` on main,
+/// then a two-parent merge `main + side` is recorded on main.
+fn merge_scenario(
+    repo: &Path,
+    name: &str,
+    side: impl FnOnce(&Path),
+    main_edits: impl FnOnce(&Path),
+) -> String {
+    let branch = format!("side-{name}");
+    git_in(repo, &["checkout", "-q", "-b", &branch, "main"]);
+    side(repo);
+    let p2 = commit_all(repo, &format!("{name}: side"));
+    git_in(repo, &["checkout", "-q", "main"]);
+    main_edits(repo);
+    let p1 = commit_all(repo, &format!("{name}: main"));
+    record_merge(repo, "main", &p1, &p2, &format!("Merge {name}"))
+}
+
+fn numbered_lines(prefix: &str, n: usize) -> String {
+    let mut out = String::new();
+    for i in 1..=n {
+        std::fmt::Write::write_fmt(&mut out, format_args!("{prefix} line {i}\n"))
+            .expect("write to String");
+    }
+    out
+}
+
+/// Builds a self-contained repository with realistic two-parent merges covering clean disjoint
+/// edits, same-file non-overlapping edits, diff3 conflicts, exact-content renames, binary files,
+/// executable modes, symlinks, delete/modify conflicts and a criss-cross multi-merge-base merge.
+#[expect(clippy::too_many_lines)]
+fn build_synthetic_merge_history(repo: &Path) {
+    fs::create_dir_all(repo).expect("mkdir synthetic repo");
+    git_in(repo, &["init", "-q", "-b", "main"]);
+    fs::create_dir_all(repo.join("src/core")).unwrap();
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(repo.join("src/core/lib.rs"), numbered_lines("lib", 40)).unwrap();
+    fs::write(repo.join("src/core/util.rs"), numbered_lines("util", 20)).unwrap();
+    fs::write(repo.join("docs/guide.md"), numbered_lines("guide", 30)).unwrap();
+    fs::write(
+        repo.join("src/conflict.rs"),
+        "fn value() -> i32 {\n    1\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("src/moved_src.rs"),
+        "pub fn moved() -> u8 { 7 }\n",
+    )
+    .unwrap();
+    fs::write(repo.join("assets.bin"), [0_u8, 1, 2, 3, 0, 255, 254, 0]).unwrap();
+    fs::write(repo.join("assets2.bin"), [9_u8, 0, 8, 0, 7, 0]).unwrap();
+    fs::write(
+        repo.join("run.sh"),
+        "#!/bin/sh\necho one\necho two\necho three\n",
+    )
+    .unwrap();
+    fs::write(repo.join("doomed.txt"), numbered_lines("doomed", 5)).unwrap();
+    symlink("docs/guide.md", repo.join("link")).unwrap();
+    symlink("src/core/lib.rs", repo.join("link2")).unwrap();
+    commit_all(repo, "base");
+
+    // 1. Clean disjoint edits in different files and subtrees.
+    merge_scenario(
+        repo,
+        "disjoint",
+        |r| fs::write(r.join("docs/guide.md"), numbered_lines("guide v2", 30)).unwrap(),
+        |r| fs::write(r.join("src/core/util.rs"), numbered_lines("util v2", 20)).unwrap(),
+    );
+    // 2. Same file, non-overlapping hunks.
+    merge_scenario(
+        repo,
+        "same_file",
+        |r| {
+            let s = fs::read_to_string(r.join("src/core/lib.rs")).unwrap();
+            fs::write(
+                r.join("src/core/lib.rs"),
+                s.replace("lib line 35\n", "lib line 35 side\n"),
+            )
+            .unwrap();
+        },
+        |r| {
+            let s = fs::read_to_string(r.join("src/core/lib.rs")).unwrap();
+            fs::write(
+                r.join("src/core/lib.rs"),
+                s.replace("lib line 3\n", "lib line 3 main\n"),
+            )
+            .unwrap();
+        },
+    );
+    // 3. Overlapping edits: diff3 content conflict.
+    merge_scenario(
+        repo,
+        "diff3",
+        |r| fs::write(r.join("src/conflict.rs"), "fn value() -> i32 {\n    2\n}\n").unwrap(),
+        |r| fs::write(r.join("src/conflict.rs"), "fn value() -> i32 {\n    3\n}\n").unwrap(),
+    );
+    // 4. Exact-content rename on one side, unrelated edit on the other.
+    merge_scenario(
+        repo,
+        "rename",
+        |r| fs::rename(r.join("src/moved_src.rs"), r.join("src/core/moved.rs")).unwrap(),
+        |r| fs::write(r.join("docs/notes.md"), "notes\n").unwrap(),
+    );
+    // 5. Binary file changed on one side only: clean.
+    merge_scenario(
+        repo,
+        "binary_one_side",
+        |r| fs::write(r.join("assets.bin"), [0_u8, 9, 9, 9, 0, 1]).unwrap(),
+        |r| fs::write(r.join("src/core/util.rs"), numbered_lines("util v3", 20)).unwrap(),
+    );
+    // 6. Binary file changed differently on both sides: binary conflict.
+    merge_scenario(
+        repo,
+        "binary_both",
+        |r| fs::write(r.join("assets2.bin"), [1_u8, 0, 1, 0]).unwrap(),
+        |r| fs::write(r.join("assets2.bin"), [2_u8, 0, 2, 0, 2]).unwrap(),
+    );
+    // 7. Executable bit on one side, content edit on the other.
+    merge_scenario(
+        repo,
+        "exec_mode",
+        |r| fs::set_permissions(r.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap(),
+        |r| {
+            fs::write(
+                r.join("run.sh"),
+                "#!/bin/sh\necho one\necho two\necho THREE\n",
+            )
+            .unwrap();
+        },
+    );
+    // 8. Symlink retargeted on one side: clean.
+    merge_scenario(
+        repo,
+        "symlink_one_side",
+        |r| {
+            fs::remove_file(r.join("link")).unwrap();
+            symlink("src/core/util.rs", r.join("link")).unwrap();
+        },
+        |r| fs::write(r.join("docs/notes.md"), "notes v2\n").unwrap(),
+    );
+    // 9. Symlink retargeted differently on both sides: symlink conflict.
+    merge_scenario(
+        repo,
+        "symlink_both",
+        |r| {
+            fs::remove_file(r.join("link2")).unwrap();
+            symlink("side-target", r.join("link2")).unwrap();
+        },
+        |r| {
+            fs::remove_file(r.join("link2")).unwrap();
+            symlink("main-target", r.join("link2")).unwrap();
+        },
+    );
+    // 10. Delete on one side, modify on the other: modify/delete conflict.
+    merge_scenario(
+        repo,
+        "delete_modify",
+        |r| fs::remove_file(r.join("doomed.txt")).unwrap(),
+        |r| fs::write(r.join("doomed.txt"), numbered_lines("doomed v2", 5)).unwrap(),
+    );
+    // 11. Identical file added on both sides: clean add/add.
+    merge_scenario(
+        repo,
+        "add_add_same",
+        |r| fs::write(r.join("src/shared.rs"), "pub const SHARED: u8 = 1;\n").unwrap(),
+        |r| fs::write(r.join("src/shared.rs"), "pub const SHARED: u8 = 1;\n").unwrap(),
+    );
+
+    // 12-14. Criss-cross: A and B merge each other, then the two merges are merged, which has
+    // two merge bases (A and B) and must be rejected by the single merge-base guard.
+    git_in(repo, &["checkout", "-q", "-b", "cross-b", "main"]);
+    fs::write(repo.join("src/cross_b.rs"), "pub fn b() {}\n").unwrap();
+    let b = commit_all(repo, "criss-cross: B");
+    git_in(repo, &["checkout", "-q", "main"]);
+    fs::write(repo.join("src/cross_a.rs"), "pub fn a() {}\n").unwrap();
+    let a = commit_all(repo, "criss-cross: A");
+    let m_ab = record_merge(repo, "main", &a, &b, "criss-cross: merge B into A");
+    let m_ba = record_merge(repo, "cross-b", &b, &a, "criss-cross: merge A into B");
+    git_in(repo, &["checkout", "-q", "cross-b"]);
+    fs::write(repo.join("docs/guide.md"), numbered_lines("guide v3", 30)).unwrap();
+    let b2 = commit_all(repo, "criss-cross: B2");
+    git_in(repo, &["checkout", "-q", "main"]);
+    fs::write(repo.join("src/core/util.rs"), numbered_lines("util v4", 20)).unwrap();
+    let a2 = commit_all(repo, "criss-cross: A2");
+    assert_ne!(m_ab, m_ba);
+    record_merge(repo, "main", &a2, &b2, "criss-cross: final merge");
+}
+
+#[test]
+#[expect(clippy::too_many_lines)]
+fn real_thinkseek_spawn_history_merge_oracle_has_zero_blockers() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .to_path_buf();
+    let scratch = Scratch::new("hist_oracle");
+    let cas_store = CasMerkleStore::open(scratch.join("cas")).expect("open cas");
+
+    if !is_own_git_work_tree(&repo_root) {
+        // `scripts/rsi/gate.sh` runs the suite on a `git archive` export with no `.git`: replay the
+        // same oracle over a self-contained synthetic history instead of the real one.
+        let synthetic = scratch.join("synthetic-history");
+        build_synthetic_merge_history(&synthetic);
+        let merges = two_parent_merges(&synthetic);
+        assert!(
+            merges.len() >= 12,
+            "expected >= 12 synthetic two-parent merges, got {}",
+            merges.len()
+        );
+        let mut batch_reader = BatchGitReader::open(&synthetic);
+        let mut tree_cache: HashMap<GitOid, Digest> = HashMap::new();
+        let mut blob_cache: HashMap<GitOid, (Digest, u64)> = HashMap::new();
+        let summary = replay_merges_through_oracle(
+            &synthetic,
+            &merges,
+            &cas_store,
+            &mut batch_reader,
+            &mut tree_cache,
+            &mut blob_cache,
+        );
+        eprintln!(
+            "SYNTHETIC MERGE ORACLE SUMMARY (no .git at {}): merges={} total={} agree_clean={} agree_conflict={} blockers={} observed_non_exact_rename={} rejected_multi_merge_base={}",
+            repo_root.display(),
+            merges.len(),
+            summary.total,
+            summary.agree_clean,
+            summary.agree_conflict,
+            summary.blockers,
+            summary.observed_non_exact_rename,
+            summary.rejected_multi_merge_base
+        );
+        assert_eq!(summary.blockers, 0);
+        assert!(summary.agree_clean >= 6);
+        assert!(summary.agree_conflict >= 4);
+        assert!(summary.rejected_multi_merge_base >= 1);
+        return;
+    }
+
+    let merges = two_parent_merges(&repo_root);
+    assert!(
+        merges.len() >= 800,
+        "expected >= 800 real two-parent merges in thinkseek/spawn history, got {}",
+        merges.len()
+    );
+
+    let mut batch_reader = BatchGitReader::open(&repo_root);
+    let mut tree_cache: HashMap<GitOid, Digest> = HashMap::new();
+    let mut blob_cache: HashMap<GitOid, (Digest, u64)> = HashMap::new();
+    let summary = replay_merges_through_oracle(
+        &repo_root,
+        &merges,
+        &cas_store,
+        &mut batch_reader,
+        &mut tree_cache,
+        &mut blob_cache,
+    );
 
     eprintln!(
         "HISTORY MERGE ORACLE SUMMARY: total={} agree_clean={} agree_conflict={} blockers={} observed_non_exact_rename={} rejected_multi_merge_base={}",

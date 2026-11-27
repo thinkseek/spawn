@@ -218,11 +218,17 @@ fn launch(program: &str, arguments: &[&str], environment: &[(&str, &str)]) -> La
     launch_named(terminal(), program, arguments, environment)
 }
 
+/// Polls the runner until it is [`Runner::Gone`] or `limit` elapses, returning the last state.
+///
+/// After a launched command exits, its pid disappears a few milliseconds before herdr-core
+/// reaps `SIGCHLD` and marks the terminal exited, so the runner passes through both
+/// [`Runner::Running`] and a transient [`Runner::Untracked`] ("pid X is gone") on its way to
+/// [`Runner::Gone`]; both are retried until the deadline.
 fn settled(host: &HerdrCoreHost, limit: Duration) -> Runner {
     let deadline = Instant::now() + limit;
     loop {
         let runner = host.runner(&terminal(), &workspace()).expect("runner");
-        if runner != Runner::Running || Instant::now() > deadline {
+        if runner == Runner::Gone || Instant::now() > deadline {
             return runner;
         }
         std::thread::sleep(Duration::from_millis(50));

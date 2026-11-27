@@ -78,7 +78,7 @@ const CONFLICT_READ_LIMIT: u64 = 64 << 20;
 const FLATTEN_CACHE_CAP: usize = 16;
 const VERIFIED_CLEAN_CAP: usize = 64;
 
-/// Minimum host RAM reserved before admitting D6 L1 `tmpfs` workspaces (`64 GiB`).
+/// Minimum host RAM reserved before admitting D6 L1 `tmpfs` workspaces (`64 GiB`, capped at half of host RAM).
 const DEFAULT_L1_MIN_HOST_RESERVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// Default percentage of total host RAM reserved before admitting D6 L1 `tmpfs` workspaces (`15%`).
 const DEFAULT_L1_HOST_RESERVE_PCT: u8 = 15;
@@ -113,15 +113,15 @@ pub struct L1TmpfsPolicy {
     pub flush_threshold_pct: u8,
     /// Periodic interval (ms, default `60_000`) after which mounted L1 workspaces flush dirty state to CAS+PG.
     pub flush_interval_ms: i64,
-    /// Absolute host RAM reserve floor in bytes (default `64 GiB`).
+    /// Absolute host RAM reserve floor in bytes (default `64 GiB`); capped at half of total host RAM.
     pub min_host_reserve_bytes: u64,
-    /// Percentage of total host RAM reserved (`default 15%`); effective floor is `max(min, total * pct / 100)`.
+    /// Percentage of total host RAM reserved (`default 15%`); effective floor is `max(min(min, total / 2), total * pct / 100)`.
     pub host_reserve_pct: u8,
 }
 
 impl L1TmpfsPolicy {
     /// Create an L1 policy backed by `tmpfs_root` with a `tmpfs_budget_mb` global cap and default thresholds
-    /// (`80%` flush threshold, `60s` flush interval, `max(64 GiB, 15% total RAM)` host reserve).
+    /// (`80%` flush threshold, `60s` flush interval, `max(min(64 GiB, total / 2), 15% total RAM)` host reserve).
     pub fn new(tmpfs_root: impl AsRef<Path>, tmpfs_budget_mb: u64) -> Self {
         Self {
             tmpfs_root: canonical_root(tmpfs_root.as_ref()),
@@ -155,7 +155,7 @@ impl L1TmpfsPolicy {
         self
     }
 
-    /// Override host memory reservation floor parameters (`max(min_bytes, total * pct / 100)`).
+    /// Override host memory reservation floor parameters (`max(min(min_bytes, total / 2), total * pct / 100)`).
     #[must_use]
     pub fn with_host_reserve(mut self, min_bytes: u64, pct: u8) -> Self {
         self.min_host_reserve_bytes = min_bytes;
@@ -174,13 +174,19 @@ impl L1TmpfsPolicy {
             .map_or_else(|| self.budget_bytes(), |q| q.min(self.budget_bytes()))
     }
 
-    /// Effective host RAM reserve floor `max(min_host_reserve_bytes, total_ram_bytes * host_reserve_pct / 100)`.
+    /// Effective host RAM reserve floor
+    /// `max(min(min_host_reserve_bytes, total_ram_bytes / 2), total_ram_bytes * host_reserve_pct / 100)`.
+    ///
+    /// The absolute minimum is capped at half of host RAM so that hosts with `<= 2 * min` RAM
+    /// (e.g. an 18 GiB VM or a 16 GiB container) get a reserve below `MemTotal` instead of a floor
+    /// that rejects every L1 admission; large hosts keep `64 GiB` or `15%`, whichever is larger.
     pub fn host_reserve_bytes(&self, total_ram_bytes: u64) -> u64 {
         let pct_bytes = u64::try_from(
             u128::from(total_ram_bytes).saturating_mul(u128::from(self.host_reserve_pct)) / 100,
         )
         .unwrap_or(u64::MAX);
-        self.min_host_reserve_bytes.max(pct_bytes)
+        let capped_min = self.min_host_reserve_bytes.min(total_ram_bytes / 2);
+        capped_min.max(pct_bytes)
     }
 }
 
@@ -4857,7 +4863,7 @@ MemAvailable:   2087943188 kB
 
         let policy =
             L1TmpfsPolicy::new("/dev/shm/d6-test", 512).with_per_workspace_quota_bytes(1000);
-        // 128 GiB host -> max(64 GiB, 19.2 GiB) = 64 GiB
+        // 128 GiB host -> max(min(64 GiB, 64 GiB), 19.2 GiB) = 64 GiB
         assert_eq!(
             policy.host_reserve_bytes(128 * 1024 * 1024 * 1024),
             DEFAULT_L1_MIN_HOST_RESERVE_BYTES
@@ -4868,6 +4874,12 @@ MemAvailable:   2087943188 kB
             policy.host_reserve_bytes(one_tib),
             u64::try_from(u128::from(one_tib) * 15 / 100).unwrap()
         );
+        // 18 GiB host (primary VM) -> max(min(64 GiB, 9 GiB), 2.7 GiB) = 9 GiB
+        let gib = 1024_u64 * 1024 * 1024;
+        assert_eq!(policy.host_reserve_bytes(18 * gib), 9 * gib);
+        assert!(policy.host_reserve_bytes(18 * gib) < 18 * gib);
+        // 16 GiB host (container) -> max(min(64 GiB, 8 GiB), 2.4 GiB) = 8 GiB
+        assert_eq!(policy.host_reserve_bytes(16 * gib), 8 * gib);
 
         let mut acc = L1WorkspaceAccounting {
             branch: "b".to_string(),
