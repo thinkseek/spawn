@@ -62,7 +62,7 @@ pub struct Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         Self {
-            idle: Duration::from_secs(5),
+            idle: Duration::from_secs(65),
             head: Duration::from_secs(10),
             body_base: Duration::from_secs(10),
             body_min_rate: 256 * 1024,
@@ -668,5 +668,10 @@ mod tests {
         assert_eq!(strip_eol(b"abc\r\n"), Some("abc"));
         assert_eq!(strip_eol(b"abc"), None);
         assert_eq!(strip_eol(b"a\x00c\r\n"), None);
+    }
+
+    #[test]
+    fn default_idle_timeout_is_65_seconds() {
+        assert_eq!(Timeouts::default().idle, Duration::from_secs(65));
     }
 }
