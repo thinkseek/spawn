@@ -120,7 +120,7 @@ fn only_the_dialogs_own_footer_is_the_dialog() {
 /// Claude Code 2.1.330 (PR H3-screen-fix, R1–R4 of the C2 capture gate),
 /// sanitized: paths, models and texts made up, the layout as captured.
 mod claude_2_1_330 {
-    use spawn_core::driver::{AgentDriver, ClaudeDriver};
+    use spawn_core::driver::driver;
     use spawn_core::screen::{
         ScreenState, TRUST_KEYS, is_choice_footer, is_trust_dialog, read_claude_screen,
     };
@@ -146,7 +146,8 @@ mod claude_2_1_330 {
         let cleared = format!("{TRUST}\n\n\n");
         assert!(is_trust_dialog(&cleared));
         assert_eq!(read_claude_screen(&cleared).state, ScreenState::Unknown);
-        assert_eq!(ClaudeDriver.startup_answer(&cleared), Some(&TRUST_KEYS[..]));
+        let claude = driver("claude").expect("claude driver");
+        assert_eq!(claude.startup_answer(&cleared), Some(&TRUST_KEYS[..]));
     }
 
     /// R2: a draft drawn with a no-break space after `$`.
@@ -170,10 +171,11 @@ mod claude_2_1_330 {
                     2. Yes, allow all edits during this session\n3. No\n\
                     Select with numbers [1-3]. Then Enter to submit or Escape to cancel:\n\
                     Esc to cancel\n";
+        let claude = driver("claude").expect("claude driver");
         for pane in [question, tool] {
             assert!(is_choice_footer(pane), "{pane}");
             assert_eq!(read_claude_screen(pane).state, ScreenState::Permission);
-            assert_eq!(ClaudeDriver.startup_answer(pane), None);
+            assert_eq!(claude.startup_answer(pane), None);
         }
         // Quoted by the model, the input box below it: history.
         let quoted = super::idle_after(

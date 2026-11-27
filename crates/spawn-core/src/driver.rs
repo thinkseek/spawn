@@ -1,19 +1,19 @@
 //! Agent drivers: what the Bridge needs to know about one engine (issue
-//! #91), behind one seam.
+//! #91 / #113 D1), behind a narrow 3-hook seam plus static declarative specs.
 //!
-//! An [`AgentDriver`] says how an engine is launched, how its native session
-//! is named and where its transcript lies, how a transcript line and a pane
-//! read, and how a startup dialog is answered. It does nothing itself: no
-//! IO, no clock. The Bridge does the IO and asks the driver what it means.
+//! An [`AgentDriver`] exposes its static [`DriverSpec`] (metadata and
+//! declarative [`ScreenSpec`] rules for screen reading, startup dialogs,
+//! excerpt masking, startup refusals, dialog resolution, and hard blocks) and
+//! three runtime hooks: [`AgentDriver::launch`], [`AgentDriver::read_line`],
+//! and [`AgentDriver::session_binding`] ([`NativeSessionHook::Assigned`] vs
+//! [`NativeSessionHook::Reported`]). Drivers perform no IO and read no clock.
 //!
-//! The registry is static: [`ClaudeDriver`] (Claude Code, [`DEFAULT`]) and
-//! [`AgyDriver`] (the Antigravity CLI, `agy`). A command naming any other
-//! engine does not parse ([`crate::command`]), and a logged record naming
-//! one is read as Claude Code's, as before ([`driver_or_default`]). A
-//! registered engine runs only where the host enables it (`SPAWN_ENGINES`,
-//! Claude Code alone by default) and, for agy, only on a terminal host that
-//! detects agents itself (Herdr): its session is named by the engine and
-//! told by the host ([`SessionBinding::Reported`]).
+//! The registry is static: [`ClaudeDriver`] (Claude Code, [`DEFAULT`]),
+//! [`AgyDriver`] (the Antigravity CLI, `agy`), and [`CodexDriver`] (OpenAI
+//! Codex CLI, `codex`). A command naming any other engine does not parse
+//! ([`crate::command`]), and a logged record naming one falls back to Claude
+//! Code ([`driver_or_default`]). A registered engine runs only where the host
+//! enables it (`SPAWN_ENGINES`, Claude Code alone by default).
 
 use crate::bridge::{
     ModelRelay, claude_arguments, claude_session_id, claude_settings_in,
@@ -23,8 +23,9 @@ use crate::event::ModelProfile;
 use crate::id::{ExecutionId, WorkspaceId};
 use crate::ingest::{Normalized, agy_line, claude_line, claude_usage, claude_version};
 use crate::screen::{
-    AGY_TRUST_KEYS, ScreenReading, TRUST_KEYS, agy_unknown_model, drop_agy_account_lines,
-    is_agy_trust_dialog, is_trust_dialog, read_agy_screen, read_claude_screen,
+    AGY_TRUST_KEYS, ScreenReading, TAIL_LINES, TRUST_KEYS, agy_unknown_model,
+    drop_agy_account_lines, is_agy_trust_dialog, is_trust_dialog, read_agy_screen,
+    read_claude_screen, strip_ansi,
 };
 
 /// The engine a record or a command that names none runs, and the one an
@@ -35,10 +36,10 @@ pub const DEFAULT: &str = crate::event::ENGINE;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionBinding {
     /// The Bridge names it before the engine starts
-    /// ([`AgentDriver::new_session_id`]), so its transcript is known first.
+    /// ([`NativeSessionHook::Assigned`]), so its transcript is known first.
     Assigned,
-    /// The engine names it, and its output says which
-    /// ([`AgentDriver::reported_session`]).
+    /// The engine names it, and its output or host reports which
+    /// ([`NativeSessionHook::Reported`]).
     Reported,
 }
 
@@ -317,105 +318,379 @@ impl LineCursor {
     }
 }
 
-/// One engine, as the Bridge sees it. Implementations are pure: no IO, no
-/// clock.
-pub trait AgentDriver: Send + Sync + std::fmt::Debug {
-    /// Wire name, as `execution.started` and commands carry it.
-    fn id(&self) -> &'static str;
+/// Declarative startup trust dialog match and keys (`#113` D1).
+#[derive(Debug, Clone, Copy)]
+pub struct StartupDialogRule {
+    /// Pure predicate checking whether the trailing pane shows this dialog.
+    pub matches: fn(&str) -> bool,
+    /// Keys (tmux / Herdr names) pressed in order when `matches` holds.
+    pub keys: &'static [&'static str],
+}
 
-    /// Name for people.
-    fn title(&self) -> &'static str;
+/// Declarative fatal startup refusal evaluation rule (`#113` D1).
+#[derive(Debug, Clone, Copy)]
+pub enum StartRefusalRule {
+    /// This engine defines no deterministic startup refusal rule.
+    None,
+    /// Match lowercased substrings against the trailing non-empty masked lines.
+    TailNeedles {
+        /// Lowercased substrings that cause immediate startup refusal.
+        needles: &'static [&'static str],
+        /// Error prefix prepended to the matched line excerpt.
+        prefix: &'static str,
+        /// Maximum evidence characters copied from the matched line.
+        max_chars: usize,
+    },
+    /// Run a dedicated pure pane classifier returning the raw offending line.
+    Classifier {
+        /// Classifier returning the raw offending line if startup is refused.
+        detect: fn(&str) -> Option<String>,
+        /// Error prefix prepended to the detected line.
+        prefix: &'static str,
+    },
+}
 
-    /// What it is like.
-    fn traits(&self) -> DriverTraits;
+/// Declarative screen, dialog, masking, and hard-block specification (`#113` D1).
+#[derive(Debug, Clone, Copy)]
+pub struct ScreenSpec {
+    /// Tail pane state classifier.
+    pub read_screen: fn(&str) -> ScreenReading,
+    /// Optional startup trust dialog rule answered before the first prompt.
+    pub startup_dialog: Option<StartupDialogRule>,
+    /// Optional pane sanitizer applied before external excerpts leave the host.
+    pub excerpt_mask: Option<fn(&str) -> String>,
+    /// Startup refusal rule checked while waiting for the initial prompt.
+    pub start_refusal: StartRefusalRule,
+    /// Declarative run-time dialog resolution rows for this engine.
+    pub dialog_rules: &'static [DialogRule],
+    /// Declarative hard-block tail rules for this engine.
+    pub hard_block_rules: &'static [HardBlockRule],
+}
 
-    /// How to start it from `home` for `launch`.
-    fn launch(&self, home: &EngineHome, launch: &EngineLaunch<'_>) -> LaunchPlan;
+impl ScreenSpec {
+    /// Classify the tail of `pane`.
+    pub fn read_screen(&self, pane: &str) -> ScreenReading {
+        (self.read_screen)(pane)
+    }
 
-    /// The id of the native session a new execution starts, when the Bridge
-    /// names it ([`SessionBinding::Assigned`]).
-    fn new_session_id(&self, execution: &ExecutionId) -> Option<String>;
+    /// Keys answering a startup dialog on `pane`, if configured and shown.
+    pub fn startup_answer(&self, pane: &str) -> Option<&'static [&'static str]> {
+        self.startup_dialog
+            .and_then(|rule| (rule.matches)(pane).then_some(rule.keys))
+    }
 
-    /// Where the transcript of `native` lies for an engine started in
-    /// `workspace`.
-    fn transcript_path(&self, home: &EngineHome, workspace: &WorkspaceId, native: &str) -> String;
+    /// Pane masked per this engine's fail-closed excerpt policy.
+    pub fn excerpt_source(&self, pane: &str) -> String {
+        match self.excerpt_mask {
+            Some(mask) => mask(pane),
+            None => pane.to_string(),
+        }
+    }
 
-    /// Where the transcript of `native` lies for an engine of `worker_id`
-    /// started in `workspace`.
-    fn transcript_path_for(
+    /// Fatal startup refusal reason for `pane`, if any.
+    pub fn start_refusal(&self, pane: &str) -> Option<String> {
+        match self.start_refusal {
+            StartRefusalRule::None => None,
+            StartRefusalRule::TailNeedles {
+                needles,
+                prefix,
+                max_chars,
+            } => {
+                let masked = self.excerpt_source(pane);
+                tail_non_empty_lines(&masked)
+                    .into_iter()
+                    .find(|line| {
+                        let lower = line.to_lowercase();
+                        needles.iter().any(|needle| lower.contains(needle))
+                    })
+                    .map(|line| {
+                        let trimmed: String = line.trim().chars().take(max_chars).collect();
+                        format!("{prefix}: {trimmed}")
+                    })
+            }
+            StartRefusalRule::Classifier { detect, prefix } => {
+                detect(pane).map(|line| format!("{prefix}: {line}"))
+            }
+        }
+    }
+
+    /// Resolve a run-time `dialog` using this spec's declarative table.
+    pub fn dialog_answer(
+        &self,
+        engine: &str,
+        dialog: &Dialog<'_>,
+        workspace: &WorkspaceId,
+    ) -> Answer {
+        eval_dialog_rules(self.dialog_rules, engine, dialog, workspace)
+    }
+
+    /// Check hard-block tail rules or exit-only dialog choices.
+    pub fn hard_block(&self, pane: &str, choices: &[String]) -> Option<&'static str> {
+        eval_hard_block_rules(self.hard_block_rules, pane, choices)
+    }
+}
+
+/// Static declarative specification of one [`AgentDriver`] (`#113` D1).
+#[derive(Debug, Clone, Copy)]
+pub struct DriverSpec {
+    /// Wire identifier carried in events and commands.
+    pub id: &'static str,
+    /// Human-readable title.
+    pub title: &'static str,
+    /// Capability traits read by the Bridge and API.
+    pub traits: DriverTraits,
+    /// `major.minor` releases verified against Spawn's parser and screen rules.
+    pub tested_versions: &'static [&'static str],
+    /// Declarative screen, dialog, masking, and hard-block specification.
+    pub screen: ScreenSpec,
+}
+
+/// Hook 3: native session ID binding and transcript/scan discovery (`#91` / `#113` D1).
+#[derive(Debug, Clone, Copy)]
+pub enum NativeSessionHook {
+    /// The Bridge generates and passes the native session ID before launch.
+    Assigned {
+        /// Generate the native session ID for `execution`.
+        new_session_id: fn(&ExecutionId) -> String,
+        /// Resolve the transcript path for `(home, workspace, worker_id, native)`.
+        transcript_path: fn(&EngineHome, &WorkspaceId, Option<&str>, &str) -> String,
+    },
+    /// The engine chooses its native session ID; Spawn discovers it from output or disk.
+    Reported {
+        /// Resolve the transcript path for `(home, workspace, worker_id, native)`.
+        transcript_path: fn(&EngineHome, &WorkspaceId, Option<&str>, &str) -> String,
+        /// Extract a reported native session ID from an output or JSONL line.
+        reported_session: fn(&str) -> Option<String>,
+        /// Resolve the conversation scan directory for `(home, worker_id)`.
+        scan_dir: fn(&EngineHome, Option<&str>) -> Option<String>,
+    },
+}
+
+impl NativeSessionHook {
+    /// Binding mode implied by this hook variant.
+    pub const fn binding(&self) -> SessionBinding {
+        match self {
+            Self::Assigned { .. } => SessionBinding::Assigned,
+            Self::Reported { .. } => SessionBinding::Reported,
+        }
+    }
+
+    /// Assigned native session ID for `execution`, or `None` when [`Self::Reported`].
+    pub fn new_session_id(&self, execution: &ExecutionId) -> Option<String> {
+        match self {
+            Self::Assigned { new_session_id, .. } => Some(new_session_id(execution)),
+            Self::Reported { .. } => None,
+        }
+    }
+
+    /// Resolve transcript path for `(home, workspace, worker_id, native)`.
+    pub fn transcript_path_for(
         &self,
         home: &EngineHome,
         workspace: &WorkspaceId,
-        _worker_id: Option<&str>,
+        worker_id: Option<&str>,
         native: &str,
     ) -> String {
-        self.transcript_path(home, workspace, native)
+        match self {
+            Self::Assigned {
+                transcript_path, ..
+            }
+            | Self::Reported {
+                transcript_path, ..
+            } => transcript_path(home, workspace, worker_id, native),
+        }
     }
 
-    /// The native session a line of output names, when the engine names its
-    /// own ([`SessionBinding::Reported`]).
-    fn reported_session(&self, line: &str) -> Option<String>;
-
-    /// The directory below the engine's home whose subdirectories are its
-    /// conversations, one per native session, when the engine names its own
-    /// ([`SessionBinding::Reported`]) and the Bridge may look for the one an
-    /// execution started there itself (agy's `<home>/brain`): the fallback
-    /// when the terminal host reports no session (agy's hooks and the
-    /// host's socket masked inside its filesystem view). `None` for an
-    /// engine whose sessions are not found that way.
-    fn session_scan_dir(&self, _home: &EngineHome) -> Option<String> {
-        None
+    /// Extract a reported native session ID from `line`, or `None` when [`Self::Assigned`].
+    pub fn reported_session(&self, line: &str) -> Option<String> {
+        match self {
+            Self::Assigned { .. } => None,
+            Self::Reported {
+                reported_session, ..
+            } => reported_session(line),
+        }
     }
 
-    /// The conversation scan directory for `worker_id`, falling back to
-    /// [`Self::session_scan_dir`] when no per-worker directory applies.
-    fn session_scan_dir_for(&self, home: &EngineHome, _worker_id: Option<&str>) -> Option<String> {
-        self.session_scan_dir(home)
+    /// Conversation scan directory for `(home, worker_id)`, or `None` when [`Self::Assigned`].
+    pub fn session_scan_dir_for(
+        &self,
+        home: &EngineHome,
+        worker_id: Option<&str>,
+    ) -> Option<String> {
+        match self {
+            Self::Assigned { .. } => None,
+            Self::Reported { scan_dir, .. } => scan_dir(home, worker_id),
+        }
+    }
+}
+
+/// One engine, as the Bridge sees it (`#91` / `#113` D1 3-hook seam).
+/// Implementations are pure: no IO, no clock.
+pub trait AgentDriver: Send + Sync + std::fmt::Debug {
+    /// Static metadata and declarative screen/dialog/hard-block spec.
+    fn spec(&self) -> &'static DriverSpec;
+
+    /// Wire name, as `execution.started` and commands carry it.
+    fn id(&self) -> &'static str {
+        self.spec().id
     }
 
-    /// What one transcript line says.
+    /// Hook 1: how to start the engine from `home` for `launch`.
+    fn launch(&self, home: &EngineHome, launch: &EngineLaunch<'_>) -> LaunchPlan;
+
+    /// Hook 2: what one transcript line says.
     fn read_line(&self, line: &str, cursor: &mut LineCursor) -> LineFacts;
 
-    /// What the tail of its pane shows.
-    fn read_screen(&self, pane: &str) -> ScreenReading;
+    /// Hook 3: how native sessions are bound and located on disk.
+    fn session_binding(&self) -> NativeSessionHook;
+}
 
-    /// The keys that answer a dialog the engine shows before it starts up
-    /// (Claude Code's workspace trust dialog), when the pane shows one.
-    fn startup_answer(&self, pane: &str) -> Option<&'static [&'static str]>;
-
-    /// The pane as an excerpt may quote it (a start whose pane never got
-    /// ready says what it showed last): the pane itself, unless the engine
-    /// draws something there that Spawn must not record (agy's account
-    /// line).
-    fn excerpt_source(&self, pane: &str) -> String {
-        pane.to_string()
+impl dyn AgentDriver + '_ {
+    /// Human-readable engine title.
+    pub fn title(&self) -> &'static str {
+        self.spec().title
     }
 
-    /// Why a start whose pane shows `pane` fails at once instead of waiting
-    /// for the engine's prompt: the engine said it will not run what it was
-    /// asked to (agy's unknown model, [`agy_unknown_model`]). None for a
-    /// pane that says nothing of the kind.
-    fn start_refusal(&self, _pane: &str) -> Option<String> {
-        None
+    /// Engine capability traits.
+    pub fn traits(&self) -> DriverTraits {
+        self.spec().traits
     }
 
-    /// How the run-time resolver answers `dialog`, shown by this engine
-    /// started in `workspace` ([`table_answer`] for this engine's id): a
-    /// fixed table, never a guess.
-    fn dialog_answer(&self, dialog: &Dialog<'_>, workspace: &WorkspaceId) -> Answer {
-        eval_dialog_rules(self.dialog_rules(), self.id(), dialog, workspace)
+    /// Verified `major.minor` releases for this engine.
+    pub fn tested_versions(&self) -> &'static [&'static str] {
+        self.spec().tested_versions
     }
 
-    /// Declarative dialog resolution table entries used by
-    /// [`Self::dialog_answer`].
-    fn dialog_rules(&self) -> &'static [DialogRule] {
-        DIALOG_RULES
+    /// Native session ID pre-assigned for `execution`, if [`SessionBinding::Assigned`].
+    pub fn new_session_id(&self, execution: &ExecutionId) -> Option<String> {
+        self.session_binding().new_session_id(execution)
+    }
+
+    /// Transcript path for `native` in `workspace`.
+    pub fn transcript_path(
+        &self,
+        home: &EngineHome,
+        workspace: &WorkspaceId,
+        native: &str,
+    ) -> String {
+        self.transcript_path_for(home, workspace, None, native)
+    }
+
+    /// Transcript path for `native` and `worker_id` in `workspace`.
+    pub fn transcript_path_for(
+        &self,
+        home: &EngineHome,
+        workspace: &WorkspaceId,
+        worker_id: Option<&str>,
+        native: &str,
+    ) -> String {
+        self.session_binding()
+            .transcript_path_for(home, workspace, worker_id, native)
+    }
+
+    /// Native session ID reported by `line`, if [`SessionBinding::Reported`].
+    pub fn reported_session(&self, line: &str) -> Option<String> {
+        self.session_binding().reported_session(line)
+    }
+
+    /// Base conversation scan directory below `home`, if supported.
+    pub fn session_scan_dir(&self, home: &EngineHome) -> Option<String> {
+        self.session_scan_dir_for(home, None)
+    }
+
+    /// Conversation scan directory for `worker_id`, falling back to `home`.
+    pub fn session_scan_dir_for(
+        &self,
+        home: &EngineHome,
+        worker_id: Option<&str>,
+    ) -> Option<String> {
+        self.session_binding().session_scan_dir_for(home, worker_id)
+    }
+
+    /// Classify the tail of `pane`.
+    pub fn read_screen(&self, pane: &str) -> ScreenReading {
+        self.spec().screen.read_screen(pane)
+    }
+
+    /// Keys that answer a startup trust dialog shown on `pane`, if any.
+    pub fn startup_answer(&self, pane: &str) -> Option<&'static [&'static str]> {
+        self.spec().screen.startup_answer(pane)
+    }
+
+    /// Pane masked per this driver's fail-closed excerpt policy.
+    pub fn excerpt_source(&self, pane: &str) -> String {
+        self.spec().screen.excerpt_source(pane)
+    }
+
+    /// Fatal startup refusal reason for `pane`, if any.
+    pub fn start_refusal(&self, pane: &str) -> Option<String> {
+        self.spec().screen.start_refusal(pane)
+    }
+
+    /// Resolve a run-time `dialog` via this driver's declarative table.
+    pub fn dialog_answer(&self, dialog: &Dialog<'_>, workspace: &WorkspaceId) -> Answer {
+        self.spec()
+            .screen
+            .dialog_answer(self.id(), dialog, workspace)
+    }
+
+    /// Declarative dialog resolution table entries for this engine.
+    pub fn dialog_rules(&self) -> &'static [DialogRule] {
+        self.spec().screen.dialog_rules
     }
 
     /// Declarative hard-block tail rules evaluated on panes from this engine.
-    fn hard_block_rules(&self) -> &'static [HardBlockRule] {
-        HARD_BLOCK_RULES
+    pub fn hard_block_rules(&self) -> &'static [HardBlockRule] {
+        self.spec().screen.hard_block_rules
     }
+
+    /// Check this engine's hard-block tail rules or exit-only dialog choices.
+    pub fn hard_block(&self, pane: &str, choices: &[String]) -> Option<&'static str> {
+        self.spec().screen.hard_block(pane, choices)
+    }
+}
+
+/// Extract trailing non-empty ANSI-stripped lines from `pane` up to [`TAIL_LINES`].
+pub(crate) fn tail_non_empty_lines(pane: &str) -> Vec<String> {
+    let all: Vec<String> = pane
+        .lines()
+        .map(|line| strip_ansi(line).trim_end().to_string())
+        .collect();
+    let end = all
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map_or(0, |at| at + 1);
+    let start = end.saturating_sub(TAIL_LINES);
+    all[start..end]
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .cloned()
+        .collect()
+}
+
+/// Parse a dotted semantic version (`1.5.17`, `0.171.0`) from CLI `--version` output.
+#[must_use]
+pub fn parse_cli_version(answer: &str) -> Option<String> {
+    answer
+        .split_whitespace()
+        .map(|word| word.trim_start_matches('v'))
+        .find(|word| {
+            word.contains('.')
+                && word
+                    .split('.')
+                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        })
+        .map(str::to_string)
+}
+
+/// Whether `version`'s `major.minor` matches one of `tested`.
+#[must_use]
+pub fn version_matches_tested(version: &str, tested: &[&str]) -> bool {
+    let mut parts = version.split('.');
+    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    tested.contains(&format!("{major}.{minor}").as_str())
 }
 
 /// How a [`DialogRule`] matches `Dialog::rule`.
@@ -527,18 +802,8 @@ const UNCAPTURED: &str = "no captured screen of this dialog yet: a person answer
 /// | codex | `trust_directory`, `startup_update`, `live_strong_blocker` | — | escalate | not verified |
 /// | opencode | `permission_required` | — | escalate | not verified |
 /// | any | no row | — | escalate | — |
-/// Declarative resolver rules (`#113` D1; design section 6.3). Evaluated in order
-/// by [`eval_dialog_rules`].
-pub const DIALOG_RULES: &[DialogRule] = &[
-    DialogRule {
-        engine: "agy",
-        rule: RuleMatch::Exact("trust_prompt"),
-        kind: None,
-        guard: DialogGuard::WorkspaceTrustedFolder {
-            mismatch_reason: "agy's trust dialog names another folder, or its cursor is not on trust",
-        },
-        outcome: DialogOutcome::Keys(&crate::screen::AGY_TRUST_KEYS),
-    },
+/// Declarative dialog rules for Claude Code (`#113` D1).
+pub const CLAUDE_DIALOG_RULES: &[DialogRule] = &[
     // The Bridge answers it before the first prompt (two keys, audited);
     // at run time the resolver leaves it to a person.
     DialogRule {
@@ -550,7 +815,6 @@ pub const DIALOG_RULES: &[DialogRule] = &[
             "Claude Code's trust dialog is the Bridge's startup answer: a person answers it later",
         ),
     },
-    // Rows whose screen nobody has captured working yet.
     DialogRule {
         engine: "claude",
         rule: RuleMatch::None,
@@ -569,20 +833,6 @@ pub const DIALOG_RULES: &[DialogRule] = &[
         engine: "claude",
         rule: RuleMatch::Exact("generic_permission_prompt"),
         kind: Some("permission"),
-        guard: DialogGuard::Always,
-        outcome: DialogOutcome::Escalate(UNCAPTURED),
-    },
-    DialogRule {
-        engine: "agy",
-        rule: RuleMatch::Exact("permission_prompt"),
-        kind: None,
-        guard: DialogGuard::Always,
-        outcome: DialogOutcome::Escalate(UNCAPTURED),
-    },
-    DialogRule {
-        engine: "agy",
-        rule: RuleMatch::Exact("question_prompt"),
-        kind: None,
         guard: DialogGuard::Always,
         outcome: DialogOutcome::Escalate(UNCAPTURED),
     },
@@ -607,6 +857,48 @@ pub const DIALOG_RULES: &[DialogRule] = &[
         guard: DialogGuard::Always,
         outcome: DialogOutcome::Escalate(UNCAPTURED),
     },
+];
+
+/// Declarative dialog rules for Antigravity CLI (`#113` D1).
+pub const AGY_DIALOG_RULES: &[DialogRule] = &[
+    DialogRule {
+        engine: "agy",
+        rule: RuleMatch::Exact("trust_prompt"),
+        kind: None,
+        guard: DialogGuard::WorkspaceTrustedFolder {
+            mismatch_reason: "agy's trust dialog names another folder, or its cursor is not on trust",
+        },
+        outcome: DialogOutcome::Keys(&crate::screen::AGY_TRUST_KEYS),
+    },
+    DialogRule {
+        engine: "agy",
+        rule: RuleMatch::Exact("permission_prompt"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "agy",
+        rule: RuleMatch::Exact("question_prompt"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+];
+
+/// Declarative resolver rules across all engines (`#113` D1; design section 6.3).
+/// Evaluated in order by [`eval_dialog_rules`] when an engine has no registered driver.
+pub const DIALOG_RULES: &[DialogRule] = &[
+    AGY_DIALOG_RULES[0],
+    CLAUDE_DIALOG_RULES[0],
+    CLAUDE_DIALOG_RULES[1],
+    CLAUDE_DIALOG_RULES[2],
+    CLAUDE_DIALOG_RULES[3],
+    AGY_DIALOG_RULES[1],
+    AGY_DIALOG_RULES[2],
+    CLAUDE_DIALOG_RULES[4],
+    CLAUDE_DIALOG_RULES[5],
+    CLAUDE_DIALOG_RULES[6],
     DialogRule {
         engine: "codex",
         rule: RuleMatch::Exact("trust_directory"),
@@ -624,6 +916,20 @@ pub const DIALOG_RULES: &[DialogRule] = &[
     DialogRule {
         engine: "codex",
         rule: RuleMatch::Exact("live_strong_blocker"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "codex",
+        rule: RuleMatch::Exact("permission_prompt"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "codex",
+        rule: RuleMatch::Exact("approval_prompt"),
         kind: None,
         guard: DialogGuard::Always,
         outcome: DialogOutcome::Escalate(UNCAPTURED),
@@ -680,9 +986,15 @@ pub fn eval_dialog_rules(
     Answer::Escalate("no row of the resolver's table covers this dialog")
 }
 
-/// Look up `(engine, dialog)` in [`DIALOG_RULES`].
+/// Look up `(engine, dialog)` via the registered driver's [`ScreenSpec`], else [`DIALOG_RULES`].
 pub fn table_answer(engine: &str, dialog: &Dialog<'_>, workspace: &WorkspaceId) -> Answer {
-    eval_dialog_rules(DIALOG_RULES, engine, dialog, workspace)
+    match driver(engine) {
+        Some(driver) => driver
+            .spec()
+            .screen
+            .dialog_answer(engine, dialog, workspace),
+        None => eval_dialog_rules(DIALOG_RULES, engine, dialog, workspace),
+    }
 }
 
 /// Screens no key may answer: the engine cannot go on without a person
@@ -772,26 +1084,60 @@ pub fn hard_block(pane: &str, choices: &[String]) -> Option<&'static str> {
     eval_hard_block_rules(HARD_BLOCK_RULES, pane, choices)
 }
 
+/// Evaluate hard-block rules using `engine`'s [`ScreenSpec`] when registered,
+/// falling back fail-closed to [`hard_block`] for unknown or unset engines.
+#[must_use]
+pub fn hard_block_for(
+    engine: Option<&str>,
+    pane: &str,
+    choices: &[String],
+) -> Option<&'static str> {
+    match engine.and_then(driver) {
+        Some(driver) => driver.spec().screen.hard_block(pane, choices),
+        None => hard_block(pane, choices),
+    }
+}
+
+fn claude_transcript_for(
+    home: &EngineHome,
+    workspace: &WorkspaceId,
+    _worker_id: Option<&str>,
+    native: &str,
+) -> String {
+    claude_transcript_path(&home.sessions, workspace, native)
+}
+
+/// Declarative specification for [`ClaudeDriver`].
+pub const CLAUDE_SPEC: DriverSpec = DriverSpec {
+    id: crate::event::ENGINE,
+    title: "Claude Code",
+    traits: DriverTraits {
+        session: SessionBinding::Assigned,
+        turns: TurnSource::Transcript,
+        guard: Guard::Settings,
+    },
+    tested_versions: &[],
+    screen: ScreenSpec {
+        read_screen: read_claude_screen,
+        startup_dialog: Some(StartupDialogRule {
+            matches: is_trust_dialog,
+            keys: &TRUST_KEYS,
+        }),
+        excerpt_mask: None,
+        start_refusal: StartRefusalRule::None,
+        dialog_rules: CLAUDE_DIALOG_RULES,
+        hard_block_rules: HARD_BLOCK_RULES,
+    },
+};
+
 /// Claude Code, interactive in a terminal: everything it does is the
 /// Bridge's existing Claude functions, unchanged.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClaudeDriver;
 
 impl AgentDriver for ClaudeDriver {
-    fn id(&self) -> &'static str {
-        crate::event::ENGINE
-    }
-
-    fn title(&self) -> &'static str {
-        "Claude Code"
-    }
-
-    fn traits(&self) -> DriverTraits {
-        DriverTraits {
-            session: SessionBinding::Assigned,
-            turns: TurnSource::Transcript,
-            guard: Guard::Settings,
-        }
+    fn spec(&self) -> &'static DriverSpec {
+        &CLAUDE_SPEC
     }
 
     fn launch(&self, home: &EngineHome, launch: &EngineLaunch<'_>) -> LaunchPlan {
@@ -802,18 +1148,6 @@ impl AgentDriver for ClaudeDriver {
             environment: Vec::new(),
             settings,
         }
-    }
-
-    fn new_session_id(&self, execution: &ExecutionId) -> Option<String> {
-        Some(claude_session_id(execution))
-    }
-
-    fn transcript_path(&self, home: &EngineHome, workspace: &WorkspaceId, native: &str) -> String {
-        claude_transcript_path(&home.sessions, workspace, native)
-    }
-
-    fn reported_session(&self, _line: &str) -> Option<String> {
-        None
     }
 
     fn read_line(&self, line: &str, cursor: &mut LineCursor) -> LineFacts {
@@ -828,12 +1162,11 @@ impl AgentDriver for ClaudeDriver {
         }
     }
 
-    fn read_screen(&self, pane: &str) -> ScreenReading {
-        read_claude_screen(pane)
-    }
-
-    fn startup_answer(&self, pane: &str) -> Option<&'static [&'static str]> {
-        is_trust_dialog(pane).then_some(&TRUST_KEYS[..])
+    fn session_binding(&self) -> NativeSessionHook {
+        NativeSessionHook::Assigned {
+            new_session_id: claude_session_id,
+            transcript_path: claude_transcript_for,
+        }
     }
 }
 
@@ -887,21 +1220,69 @@ pub fn plain_session_id(native: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
+fn agy_brain_dir(home: &EngineHome, worker_id: Option<&str>) -> String {
+    if let Some(worker_id) = worker_id
+        && let Some(worker_brain) = home.worker_brain_dir(worker_id)
+    {
+        return worker_brain.display().to_string();
+    }
+    if let Some(shared) = home.shared_brain_dir() {
+        return shared.display().to_string();
+    }
+    format!("{}/brain", home.sessions.trim_end_matches('/'))
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn agy_scan_dir_for(home: &EngineHome, worker_id: Option<&str>) -> Option<String> {
+    Some(agy_brain_dir(home, worker_id))
+}
+
+fn agy_transcript_for(
+    home: &EngineHome,
+    _workspace: &WorkspaceId,
+    worker_id: Option<&str>,
+    native: &str,
+) -> String {
+    let brain = agy_brain_dir(home, worker_id);
+    format!(
+        "{}/{native}/.system_generated/logs/transcript_full.jsonl",
+        brain.trim_end_matches('/')
+    )
+}
+
+fn agy_reported_session(_line: &str) -> Option<String> {
+    None
+}
+
+/// Declarative specification for [`AgyDriver`].
+pub const AGY_SPEC: DriverSpec = DriverSpec {
+    id: "agy",
+    title: "Antigravity CLI",
+    traits: DriverTraits {
+        session: SessionBinding::Reported,
+        turns: TurnSource::Transcript,
+        guard: Guard::Sandbox,
+    },
+    tested_versions: &AGY_TESTED,
+    screen: ScreenSpec {
+        read_screen: read_agy_screen,
+        startup_dialog: Some(StartupDialogRule {
+            matches: is_agy_trust_dialog,
+            keys: &AGY_TRUST_KEYS,
+        }),
+        excerpt_mask: Some(drop_agy_account_lines),
+        start_refusal: StartRefusalRule::Classifier {
+            detect: agy_unknown_model,
+            prefix: "agy does not know the model it was started on, and would run its own",
+        },
+        dialog_rules: AGY_DIALOG_RULES,
+        hard_block_rules: HARD_BLOCK_RULES,
+    },
+};
+
 impl AgentDriver for AgyDriver {
-    fn id(&self) -> &'static str {
-        "agy"
-    }
-
-    fn title(&self) -> &'static str {
-        "Antigravity CLI"
-    }
-
-    fn traits(&self) -> DriverTraits {
-        DriverTraits {
-            session: SessionBinding::Reported,
-            turns: TurnSource::Transcript,
-            guard: Guard::Sandbox,
-        }
+    fn spec(&self) -> &'static DriverSpec {
+        &AGY_SPEC
     }
 
     /// The model is the launch's (the start's `model_label`), else the
@@ -922,54 +1303,6 @@ impl AgentDriver for AgyDriver {
         }
     }
 
-    fn new_session_id(&self, _execution: &ExecutionId) -> Option<String> {
-        None
-    }
-
-    /// `<home>/brain/<conversation>/.system_generated/logs/transcript_full.jsonl`.
-    fn transcript_path(&self, home: &EngineHome, workspace: &WorkspaceId, native: &str) -> String {
-        self.transcript_path_for(home, workspace, None, native)
-    }
-
-    fn transcript_path_for(
-        &self,
-        home: &EngineHome,
-        _workspace: &WorkspaceId,
-        worker_id: Option<&str>,
-        native: &str,
-    ) -> String {
-        let brain = self
-            .session_scan_dir_for(home, worker_id)
-            .unwrap_or_else(|| format!("{}/brain", home.sessions.trim_end_matches('/')));
-        format!(
-            "{}/{native}/.system_generated/logs/transcript_full.jsonl",
-            brain.trim_end_matches('/')
-        )
-    }
-
-    /// agy's lines never name its conversation: the host reports it.
-    fn reported_session(&self, _line: &str) -> Option<String> {
-        None
-    }
-
-    /// `<home>/brain` (or `<data_dir>/brain` when shared `data_dir` is used):
-    /// one directory per conversation.
-    fn session_scan_dir(&self, home: &EngineHome) -> Option<String> {
-        if let Some(shared) = home.shared_brain_dir() {
-            return Some(shared.display().to_string());
-        }
-        Some(format!("{}/brain", home.sessions.trim_end_matches('/')))
-    }
-
-    fn session_scan_dir_for(&self, home: &EngineHome, worker_id: Option<&str>) -> Option<String> {
-        if let Some(worker_id) = worker_id
-            && let Some(worker_brain) = home.worker_brain_dir(worker_id)
-        {
-            return Some(worker_brain.display().to_string());
-        }
-        self.session_scan_dir(home)
-    }
-
     fn read_line(&self, line: &str, cursor: &mut LineCursor) -> LineFacts {
         cursor.lines = cursor.lines.saturating_add(1);
         LineFacts {
@@ -978,22 +1311,12 @@ impl AgentDriver for AgyDriver {
         }
     }
 
-    fn read_screen(&self, pane: &str) -> ScreenReading {
-        read_agy_screen(pane)
-    }
-
-    fn startup_answer(&self, pane: &str) -> Option<&'static [&'static str]> {
-        is_agy_trust_dialog(pane).then_some(&AGY_TRUST_KEYS[..])
-    }
-
-    fn excerpt_source(&self, pane: &str) -> String {
-        drop_agy_account_lines(pane)
-    }
-
-    fn start_refusal(&self, pane: &str) -> Option<String> {
-        agy_unknown_model(pane).map(|line| {
-            format!("agy does not know the model it was started on, and would run its own: {line}")
-        })
+    fn session_binding(&self) -> NativeSessionHook {
+        NativeSessionHook::Reported {
+            transcript_path: agy_transcript_for,
+            reported_session: agy_reported_session,
+            scan_dir: agy_scan_dir_for,
+        }
     }
 }
 
@@ -1047,50 +1370,33 @@ impl AgyDriver {
     /// word that is digits and dots with at least one dot, a leading `v`
     /// dropped.
     pub fn version(answer: &str) -> Option<String> {
-        answer
-            .split_whitespace()
-            .map(|word| word.trim_start_matches('v'))
-            .find(|word| {
-                word.contains('.')
-                    && word
-                        .split('.')
-                        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-            })
-            .map(str::to_string)
+        parse_cli_version(answer)
     }
 
     /// Whether `version`'s `major.minor` is one Spawn was checked against
     /// ([`AGY_TESTED`]).
     pub fn version_tested(version: &str) -> bool {
-        let mut parts = version.split('.');
-        let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
-            return false;
-        };
-        AGY_TESTED.contains(&format!("{major}.{minor}").as_str())
+        version_matches_tested(version, &AGY_TESTED)
     }
 }
 
 /// The pane as an excerpt that leaves the host may quote it, for an
 /// execution whose engine the log names `engine` (`None`: the lookup failed
-/// or found nothing). **Fail-closed** (decision C2, N4): only an engine
-/// positively known as Claude Code keeps its pane byte for byte; a
-/// registered engine's pane goes through its driver's
-/// [`AgentDriver::excerpt_source`], and an unknown engine's, or an unknown
-/// one, through agy's mask ([`drop_agy_account_lines`]), the one Spawn has.
+/// or found nothing). **Fail-closed** (decision C2, N4): only a registered
+/// driver whose [`ScreenSpec`] defines no excerpt mask keeps its pane byte for
+/// byte; another registered engine's pane goes through its driver's
+/// [`ScreenSpec::excerpt_source`], and an unregistered or unknown engine goes
+/// through agy's mask ([`drop_agy_account_lines`]).
 pub fn excerpt_for(engine: Option<&str>, pane: &str) -> String {
-    match engine {
-        Some(DEFAULT) => pane.to_string(),
-        Some(id) => match driver(id) {
-            Some(driver) if driver.id() != DEFAULT => driver.excerpt_source(pane),
-            _ => drop_agy_account_lines(pane),
-        },
+    match engine.and_then(driver) {
+        Some(driver) => driver.spec().screen.excerpt_source(pane),
         None => drop_agy_account_lines(pane),
     }
 }
 
 pub use crate::driver_codex::{
     CODEX_DIALOG_RULES, CODEX_ENV_ALLOWLIST, CODEX_HARD_BLOCK_RULES, CODEX_HOME, CODEX_ID,
-    CODEX_TESTED, CodexDriver, codex_arguments, codex_line, read_codex_screen,
+    CODEX_SPEC, CODEX_TESTED, CodexDriver, codex_arguments, codex_line, read_codex_screen,
 };
 
 static CLAUDE: ClaudeDriver = ClaudeDriver;
@@ -1201,12 +1507,20 @@ mod tests {
         }
     }
 
+    fn claude() -> &'static dyn AgentDriver {
+        driver("claude").expect("claude registered")
+    }
+
+    fn agy() -> &'static dyn AgentDriver {
+        driver("agy").expect("agy registered")
+    }
+
     #[test]
     fn new_session_id_is_claude_session_id() {
         for command in [0, 1, 42, u64::MAX] {
             let execution = ExecutionId::for_command(CommandId(command));
             assert_eq!(
-                ClaudeDriver.new_session_id(&execution),
+                claude().new_session_id(&execution),
                 Some(claude_session_id(&execution))
             );
         }
@@ -1224,7 +1538,7 @@ mod tests {
                 isolate_brain: false,
             };
             assert_eq!(
-                ClaudeDriver.transcript_path(&home, &workspace, "abc"),
+                claude().transcript_path(&home, &workspace, "abc"),
                 transcript_path(sessions, &workspace, "abc")
             );
         }
@@ -1252,7 +1566,7 @@ mod tests {
         }
         assert!(usage_seen, "the sample holds a model call's usage");
         assert_eq!(cursor.lines, 4);
-        assert_eq!(ClaudeDriver.reported_session(lines[0]), None);
+        assert_eq!(claude().reported_session(lines[0]), None);
     }
 
     #[test]
@@ -1266,13 +1580,13 @@ mod tests {
             "",
         ];
         for pane in panes {
-            assert_eq!(ClaudeDriver.read_screen(pane), read_claude_screen(pane));
+            assert_eq!(claude().read_screen(pane), read_claude_screen(pane));
             assert_eq!(
-                ClaudeDriver.startup_answer(pane),
+                claude().startup_answer(pane),
                 is_trust_dialog(pane).then_some(&TRUST_KEYS[..])
             );
         }
-        assert_eq!(ClaudeDriver.startup_answer(trust), Some(&TRUST_KEYS[..]));
+        assert_eq!(claude().startup_answer(trust), Some(&TRUST_KEYS[..]));
     }
 
     /// Claude Code is the registry's first driver and the default every
@@ -1295,9 +1609,9 @@ mod tests {
 
     #[test]
     fn claude_traits_and_title() {
-        assert_eq!(ClaudeDriver.title(), "Claude Code");
+        assert_eq!(claude().title(), "Claude Code");
         assert_eq!(
-            ClaudeDriver.traits(),
+            claude().traits(),
             DriverTraits {
                 session: SessionBinding::Assigned,
                 turns: TurnSource::Transcript,
@@ -1322,9 +1636,9 @@ mod tests {
         assert_eq!(driver("agy").map(AgentDriver::id), Some("agy"));
         assert_eq!(driver_or_default("agy").id(), "agy");
         assert!(driver("AGY").is_none());
-        assert_eq!(AgyDriver.title(), "Antigravity CLI");
+        assert_eq!(agy().title(), "Antigravity CLI");
         assert_eq!(
-            AgyDriver.traits(),
+            agy().traits(),
             DriverTraits {
                 session: SessionBinding::Reported,
                 turns: TurnSource::Transcript,
@@ -1332,8 +1646,8 @@ mod tests {
             }
         );
         let execution = ExecutionId::for_command(CommandId(7));
-        assert_eq!(AgyDriver.new_session_id(&execution), None);
-        assert_eq!(AgyDriver.reported_session("{}"), None);
+        assert_eq!(agy().new_session_id(&execution), None);
+        assert_eq!(agy().reported_session("{}"), None);
     }
 
     /// Every launch names the model, skips permissions and trusts the
@@ -1447,10 +1761,10 @@ mod tests {
     #[test]
     fn agy_refuses_a_start_on_its_unknown_model_line_and_claude_never_does() {
         let pane = "Warning: model \"x-1\" is not recognized as a known model\n>\n";
-        let why = AgyDriver.start_refusal(pane).expect("refused");
+        let why = agy().start_refusal(pane).expect("refused");
         assert!(why.contains("is not recognized as a known model"), "{why}");
-        assert_eq!(ClaudeDriver.start_refusal(pane), None);
-        assert_eq!(AgyDriver.start_refusal(">\n"), None);
+        assert_eq!(claude().start_refusal(pane), None);
+        assert_eq!(agy().start_refusal(">\n"), None);
     }
 
     /// Fail-closed (N4): only a pane positively Claude Code's stays as it
@@ -1470,7 +1784,7 @@ mod tests {
     fn agy_transcript_is_the_full_one_below_its_home() {
         let workspace = WorkspaceId::new("3:/workspaces/agent_a").expect("workspace");
         assert_eq!(
-            AgyDriver.transcript_path(&agy_home(), &workspace, "11111111-2222"),
+            agy().transcript_path(&agy_home(), &workspace, "11111111-2222"),
             "/home/a/.gemini/antigravity-cli/brain/11111111-2222/.system_generated/logs/transcript_full.jsonl"
         );
         assert!(plain_session_id("11111111-2222-4333-8444-555555555555"));
@@ -1485,16 +1799,16 @@ mod tests {
     #[test]
     fn agy_scans_its_brain_and_claude_scans_nothing() {
         assert_eq!(
-            AgyDriver.session_scan_dir(&agy_home()).as_deref(),
+            agy().session_scan_dir(&agy_home()).as_deref(),
             Some("/home/a/.gemini/antigravity-cli/brain")
         );
         let mut trailing = agy_home();
         trailing.sessions.push('/');
         assert_eq!(
-            AgyDriver.session_scan_dir(&trailing).as_deref(),
+            agy().session_scan_dir(&trailing).as_deref(),
             Some("/home/a/.gemini/antigravity-cli/brain")
         );
-        assert_eq!(ClaudeDriver.session_scan_dir(&home()), None);
+        assert_eq!(claude().session_scan_dir(&home()), None);
     }
 
     #[test]
@@ -1511,18 +1825,18 @@ mod tests {
         assert_eq!(facts.version, None);
         assert_eq!(cursor.lines, 1);
         let trust = "Do you trust the contents of this project?\n> Yes, I trust this folder\n  No, exit\n  ↑/↓ Navigate · enter Confirm\n";
-        assert_eq!(AgyDriver.startup_answer(trust), Some(&["Enter"][..]));
-        assert_eq!(ClaudeDriver.startup_answer(trust), None);
+        assert_eq!(agy().startup_answer(trust), Some(&["Enter"][..]));
+        assert_eq!(claude().startup_answer(trust), None);
         let rule = "──────────";
         let idle = format!("{rule}\n>\n{rule}\n? for shortcuts\n");
         assert_eq!(
-            AgyDriver.read_screen(&idle).state,
+            agy().read_screen(&idle).state,
             crate::screen::ScreenState::Ready
         );
-        assert_eq!(AgyDriver.startup_answer(&idle), None);
+        assert_eq!(agy().startup_answer(&idle), None);
         let banner = "▀▀▀▀▀▀ someone@example.invalid (Pro)\nok\n";
-        assert_eq!(AgyDriver.excerpt_source(banner), "ok\n");
-        assert_eq!(ClaudeDriver.excerpt_source(banner), banner);
+        assert_eq!(agy().excerpt_source(banner), "ok\n");
+        assert_eq!(claude().excerpt_source(banner), banner);
     }
 
     // --- the resolver's table (design section 6.3): one test a row -------
@@ -1564,10 +1878,7 @@ mod tests {
             &body,
         );
         assert_eq!(table_answer("agy", &ours, &ws()), Answer::Keys(&["Enter"]));
-        assert_eq!(
-            AgyDriver.dialog_answer(&ours, &ws()),
-            Answer::Keys(&["Enter"])
-        );
+        assert_eq!(agy().dialog_answer(&ours, &ws()), Answer::Keys(&["Enter"]));
         let elsewhere = strings(&["Accessing workspace:", "/home/someone"]);
         let other = dialog(
             Some("trust_prompt"),
@@ -1631,13 +1942,13 @@ mod tests {
             Answer::Escalate(_)
         ));
         assert!(matches!(
-            ClaudeDriver.dialog_answer(&shown, &ws()),
+            claude().dialog_answer(&shown, &ws()),
             Answer::Escalate(_)
         ));
         // The Bridge's own startup answer is unchanged.
         let trust = "Do you trust the files in this folder?\n\ny. Yes, I trust this folder\n\
                      n. No, exit\nEnter y/n:\nEnter to confirm · Esc to cancel\n";
-        assert_eq!(ClaudeDriver.startup_answer(trust), Some(&TRUST_KEYS[..]));
+        assert_eq!(claude().startup_answer(trust), Some(&TRUST_KEYS[..]));
     }
 
     #[test]
@@ -1854,13 +2165,13 @@ mod tests {
             vec![PathBuf::from("/home/a/.gemini/antigravity-cli/")]
         );
         assert_eq!(
-            AgyDriver
+            agy()
                 .session_scan_dir_for(&plain, Some("agent_1"))
                 .as_deref(),
             Some("/home/a/.gemini/antigravity-cli/brain")
         );
         assert_eq!(
-            AgyDriver.transcript_path_for(&plain, &ws, Some("agent_1"), "conv-1"),
+            agy().transcript_path_for(&plain, &ws, Some("agent_1"), "conv-1"),
             "/home/a/.gemini/antigravity-cli/brain/conv-1/.system_generated/logs/transcript_full.jsonl"
         );
 
@@ -1890,17 +2201,17 @@ mod tests {
             ]
         );
         assert_eq!(
-            AgyDriver
+            agy()
                 .session_scan_dir_for(&isolated, Some("agent_1"))
                 .as_deref(),
             Some("/data01/agy/workers/agent_1/home/brain")
         );
         assert_eq!(
-            AgyDriver.transcript_path_for(&isolated, &ws, Some("agent_1"), "conv-1"),
+            agy().transcript_path_for(&isolated, &ws, Some("agent_1"), "conv-1"),
             "/data01/agy/workers/agent_1/home/brain/conv-1/.system_generated/logs/transcript_full.jsonl"
         );
         assert_eq!(
-            AgyDriver.transcript_path_for(&isolated, &ws, None, "conv-1"),
+            agy().transcript_path_for(&isolated, &ws, None, "conv-1"),
             "/home/a/.gemini/antigravity-cli/brain/conv-1/.system_generated/logs/transcript_full.jsonl"
         );
 
@@ -1922,17 +2233,17 @@ mod tests {
             ]
         );
         assert_eq!(
-            AgyDriver.session_scan_dir(&shared).as_deref(),
+            agy().session_scan_dir(&shared).as_deref(),
             Some("/data01/agy/brain")
         );
         assert_eq!(
-            AgyDriver
+            agy()
                 .session_scan_dir_for(&shared, Some("agent_1"))
                 .as_deref(),
             Some("/data01/agy/brain")
         );
         assert_eq!(
-            AgyDriver.transcript_path_for(&shared, &ws, Some("agent_1"), "conv-1"),
+            agy().transcript_path_for(&shared, &ws, Some("agent_1"), "conv-1"),
             "/data01/agy/brain/conv-1/.system_generated/logs/transcript_full.jsonl"
         );
     }
@@ -1940,16 +2251,20 @@ mod tests {
     #[test]
     fn declarative_dialog_and_hard_block_tables_match_driver_defaults() {
         use super::{
+            AGY_DIALOG_RULES, CLAUDE_DIALOG_RULES, CODEX_DIALOG_RULES, CODEX_HARD_BLOCK_RULES,
             DIALOG_RULES, DialogGuard, DialogOutcome, HARD_BLOCK_RULES, eval_dialog_rules,
-            eval_hard_block_rules, hard_block, table_answer,
+            eval_hard_block_rules, hard_block, hard_block_for, table_answer,
         };
-        let agy = AgyDriver;
-        let claude = ClaudeDriver;
-        assert_eq!(agy.dialog_rules(), DIALOG_RULES);
-        assert_eq!(claude.dialog_rules(), DIALOG_RULES);
+        let agy = agy();
+        let claude = claude();
+        let codex = driver("codex").expect("codex registered");
+        assert_eq!(agy.dialog_rules(), AGY_DIALOG_RULES);
+        assert_eq!(claude.dialog_rules(), CLAUDE_DIALOG_RULES);
+        assert_eq!(codex.dialog_rules(), CODEX_DIALOG_RULES);
         assert_eq!(agy.hard_block_rules(), HARD_BLOCK_RULES);
         assert_eq!(claude.hard_block_rules(), HARD_BLOCK_RULES);
-        assert!(DIALOG_RULES.iter().any(|row| row.engine == "agy"
+        assert_eq!(codex.hard_block_rules(), CODEX_HARD_BLOCK_RULES);
+        assert!(AGY_DIALOG_RULES.iter().any(|row| row.engine == "agy"
             && matches!(row.guard, DialogGuard::WorkspaceTrustedFolder { .. })
             && matches!(row.outcome, DialogOutcome::Keys(_))));
         let choices = strings(&["Yes, I trust this folder", "No, exit"]);
@@ -1972,6 +2287,14 @@ mod tests {
         assert_eq!(
             hard_block("Please run /login", &[]),
             eval_hard_block_rules(HARD_BLOCK_RULES, "Please run /login", &[])
+        );
+        assert_eq!(
+            hard_block_for(Some("codex"), "insufficient_quota", &[]),
+            Some("quota reached")
+        );
+        assert_eq!(
+            hard_block_for(None, "Please run /login", &[]),
+            Some("login required")
         );
     }
 }

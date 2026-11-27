@@ -608,6 +608,8 @@ fn bwrap_view_hides_herdr_core_paths_while_host_witness_sees_sandboxed_agy() {
         inherit_host_paths: Vec::new(),
         claude_program: None,
         claude_data_dir: None,
+        codex_program: None,
+        codex_data_dir: None,
     };
     let Ok(view) = BwrapView::new("bwrap", config) else {
         assert!(!required(), "SPAWN_REQUIRE_HERDR=1 and bwrap unavailable");

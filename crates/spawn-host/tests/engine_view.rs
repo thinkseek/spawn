@@ -163,6 +163,8 @@ impl Fixture {
             inherit_host_paths: Vec::new(),
             claude_program: None,
             claude_data_dir: None,
+            codex_program: None,
+            codex_data_dir: None,
         }
     }
 
@@ -1738,4 +1740,422 @@ fn container_view_fails_closed_on_bare_host_and_sets_isolated_tmpdir_in_containe
     let out = cmd.output().expect("run wrapper");
     assert!(out.status.success(), "{out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected_tmp);
+}
+
+fn inside_with_env(words: &[String], envs: &[(&str, &str)], script: &str) -> Output {
+    let mut command = Command::new(&words[0]);
+    command.args(&words[1..]);
+    for &(key, val) in envs {
+        command.env(key, val);
+    }
+    command
+        .args(["/bin/sh", "-c", script])
+        .stdin(Stdio::null())
+        .output()
+        .expect("bwrap")
+}
+
+fn ok_with_env(words: &[String], envs: &[(&str, &str)], script: &str) -> String {
+    let out = inside_with_env(words, envs, script);
+    assert!(
+        out.status.success(),
+        "{script}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    text(&out)
+}
+
+fn bind_host_socket_if_fits(path: &Path) -> Option<std::os::unix::net::UnixListener> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("socket parent");
+    }
+    if path.as_os_str().len() < 100 {
+        Some(std::os::unix::net::UnixListener::bind(path).expect("bind host socket"))
+    } else {
+        None
+    }
+}
+
+fn run_socket_isolation_check(
+    view: &BwrapView,
+    fixture: &Fixture,
+    engine: &str,
+    engine_home: &Path,
+) {
+    let ws = fixture.workspace().display().to_string();
+    let eh = engine_home.display().to_string();
+    let words_a = view
+        .wrap(&ViewedLaunch {
+            engine,
+            workspace: &ws,
+            engine_home: &eh,
+            worker_id: Some("worker-a"),
+            exit_file: None,
+        })
+        .expect("wrap worker-a");
+    let words_b = view
+        .wrap(&ViewedLaunch {
+            engine,
+            workspace: &ws,
+            engine_home: &eh,
+            worker_id: Some("worker-b"),
+            exit_file: None,
+        })
+        .expect("wrap worker-b");
+
+    let ready_file = fixture.workspace().join(format!("ready-{engine}"));
+    let _ = std::fs::remove_file(&ready_file);
+    let cc_socks = engine_home.join("cc-socks");
+    let script_a = format!(
+        "echo a > \"$XDG_RUNTIME_DIR/worker-a.sock\" && \
+         echo a > /tmp/worker-a.sock && \
+         mkdir -p '{}' && echo a > '{}/worker-a.sock' && \
+         echo ok > '{}' && sleep 2",
+        cc_socks.display(),
+        cc_socks.display(),
+        ready_file.display()
+    );
+    let child_a = Command::new(&words_a[0])
+        .args(&words_a[1..])
+        .args(["/bin/sh", "-c", &script_a])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn worker-a");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready_file.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "{engine} worker-a never signaled ready"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(ok(&words_b, "ls -A \"$XDG_RUNTIME_DIR\""), "", "{engine}");
+    assert_eq!(ok(&words_b, "ls -A /tmp"), "", "{engine}");
+    assert_eq!(
+        ok(
+            &words_b,
+            &format!("ls -A '{}'", fixture.home().join(".cc-socks").display())
+        ),
+        "",
+        "{engine}"
+    );
+    fails(&words_b, "cat \"$XDG_RUNTIME_DIR/worker-a.sock\"");
+    fails(&words_b, "cat /tmp/worker-a.sock");
+    fails(
+        &words_b,
+        &format!(
+            "test -e '{}'",
+            fixture.runtime().join("supervisor.sock").display()
+        ),
+    );
+    if engine == "claude" {
+        assert_eq!(ok(&words_b, &format!("ls -A '{}'", cc_socks.display())), "");
+        ok(
+            &words_b,
+            &format!("echo b > '{}/probe-b'", cc_socks.display()),
+        );
+        assert!(
+            !cc_socks.join("probe-b").exists(),
+            "cc-socks leaked onto host"
+        );
+    }
+
+    let out_a = child_a.wait_with_output().expect("wait worker-a");
+    assert!(out_a.status.success(), "{out_a:?}");
+    let _ = std::fs::remove_file(&ready_file);
+}
+
+#[test]
+fn runtime_and_socket_dirs_are_isolated_across_workers_for_all_three_engines() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let claude_managed = fixture.home().join(".local/state/spawn/claude-config");
+    let custom_codex = fixture.scratch.join("codex-home");
+    write(&fixture.home().join(".cc-socks/peer.canary"), "host-sock");
+    write(&claude_managed.join("cc-socks/host.canary"), "claude-sock");
+    std::fs::create_dir_all(&custom_codex).expect("codex home");
+    let _host_sock = bind_host_socket_if_fits(&fixture.runtime().join("supervisor.sock"));
+    let _peer_sock = bind_host_socket_if_fits(&fixture.home().join(".cc-socks/peer.sock"));
+    let _claude_sock = bind_host_socket_if_fits(&claude_managed.join("cc-socks/claude.sock"));
+
+    let mut cfg = fixture.config();
+    cfg.extra_mounts = Vec::new();
+    let Some(view) = view(cfg) else {
+        return;
+    };
+    let agy_home = fixture.engine_home();
+    for (engine, engine_home) in [
+        ("claude", claude_managed.as_path()),
+        ("agy", agy_home.as_path()),
+        ("codex", custom_codex.as_path()),
+    ] {
+        run_socket_isolation_check(&view, &fixture, engine, engine_home);
+    }
+}
+
+fn seed_codex_whitelist_fixture(fixture: &Fixture) -> (PathBuf, PathBuf, PathBuf) {
+    let codex_home = fixture.home().join(".codex");
+    write(&codex_home.join("config.toml"), "model = \"gpt-5.4\"\n");
+    write(&codex_home.join("auth.json"), "{\"token\":\"codex-tok\"}\n");
+    write(&codex_home.join("history.jsonl"), "host-codex-history\n");
+    std::fs::create_dir_all(codex_home.join("sessions")).expect("sessions");
+    write(
+        &fixture.home().join(".claude/settings.json"),
+        "{\"sec\":1}\n",
+    );
+    write(&fixture.home().join(".ssh/id_rsa"), "SSH_KEY");
+
+    let real_bin = fixture.home().join(".local/opt/codex/bin/codex-real");
+    let link_bin = fixture.home().join(".local/bin/codex");
+    let sibling_secret = fixture.home().join(".local/bin/sibling-secret");
+    write(&real_bin, "#!/bin/sh\necho codex-ok\n");
+    write(&sibling_secret, "#!/bin/sh\necho sibling\n");
+    std::fs::set_permissions(&real_bin, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod real");
+    std::fs::set_permissions(&sibling_secret, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod sib");
+    std::fs::create_dir_all(link_bin.parent().unwrap()).expect("bin parent");
+    std::os::unix::fs::symlink(&real_bin, &link_bin).expect("symlink");
+    (codex_home, link_bin, sibling_secret)
+}
+
+#[test]
+fn codex_data_dir_isolates_workers_protects_host_and_allows_whitelist_binary() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let (codex_home, link_bin, sibling_secret) = seed_codex_whitelist_fixture(&fixture);
+
+    let mut cfg = fixture.config();
+    cfg.home_isolation = spawn_host::HomeIsolation::Whitelist;
+    cfg.canonical_workspace = Some(PathBuf::from("/workspace"));
+    cfg.codex_data_dir = Some(fixture.scratch.join("codex-data"));
+    cfg.codex_program = Some(link_bin.clone());
+    let Some(view) = view(cfg) else {
+        return;
+    };
+    let ws = fixture.workspace().display().to_string();
+    let wrap = |worker: &str| {
+        view.wrap(&ViewedLaunch {
+            engine: "codex",
+            workspace: &ws,
+            engine_home: &codex_home.display().to_string(),
+            worker_id: Some(worker),
+            exit_file: None,
+        })
+        .expect("wrap codex")
+    };
+    let (w1, w2) = (wrap("codex-w1"), wrap("codex-w2"));
+
+    assert_eq!(ok(&w1, &link_bin.display().to_string()), "codex-ok");
+    for secret in [
+        sibling_secret,
+        fixture.home().join(".ssh/id_rsa"),
+        fixture.home().join(".claude/settings.json"),
+        codex_home.join("history.jsonl"),
+    ] {
+        fails(&w1, &format!("cat '{}'", secret.display()));
+    }
+    assert_eq!(
+        ok(
+            &w1,
+            &format!("cat '{}'", codex_home.join("config.toml").display())
+        ),
+        "model = \"gpt-5.4\""
+    );
+    assert_eq!(
+        ok(
+            &w1,
+            &format!("cat '{}'", codex_home.join("auth.json").display())
+        ),
+        "{\"token\":\"codex-tok\"}"
+    );
+    fails(
+        &w1,
+        &format!(
+            "sh -c 'echo x > \"{}\"'",
+            codex_home.join("auth.json").display()
+        ),
+    );
+    assert_eq!(
+        ok(
+            &w1,
+            "printf '%s|%s' \"$CODEX_HOME\" \"${CLAUDE_CONFIG_DIR-unset}\""
+        ),
+        format!("{}|unset", codex_home.display())
+    );
+
+    ok(
+        &w1,
+        &format!("echo w1-private > '{}/log/w1.log'", codex_home.display()),
+    );
+    fails(&w2, &format!("cat '{}/log/w1.log'", codex_home.display()));
+    assert!(!codex_home.join("log/w1.log").exists());
+
+    let rollout = codex_home.join("sessions/rollout-1.jsonl");
+    assert_eq!(
+        ok(
+            &w1,
+            &format!(
+                "printf 'ev\\n' > '{}' && cat '{}'",
+                rollout.display(),
+                rollout.display()
+            )
+        ),
+        "ev"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rollout).expect("persisted"),
+        "ev\n"
+    );
+}
+
+#[test]
+fn all_three_engines_isolate_sibling_configs_and_scrub_cross_engine_env() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let host_claude = home.join(".claude/settings.json");
+    let managed_claude = home.join(".local/state/spawn/claude-config");
+    let managed_settings = managed_claude.join("settings.json");
+    let host_codex_auth = home.join(".codex/auth.json");
+    let host_agy_oauth = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    write(&host_claude, "{\"hostClaudeSecret\":true}\n");
+    write(&managed_settings, "{\"managed\":true}\n");
+    write(&host_codex_auth, "{\"codexSecret\":true}\n");
+    write(&host_agy_oauth, "agy-oauth-secret\n");
+    let custom_codex = fixture.scratch.join("custom-codex");
+    std::fs::create_dir_all(&custom_codex).expect("custom codex");
+
+    let Some(view) = view(fixture.config()) else {
+        return;
+    };
+    let ws = fixture.workspace().display().to_string();
+    let dirty_env = [
+        ("CLAUDE_CONFIG_DIR", "/polluted/claude"),
+        ("CODEX_HOME", "/polluted/codex"),
+    ];
+    let agy_home = fixture.engine_home();
+    let cases: [(&str, &Path, &str, Vec<&Path>, String); 3] = [
+        (
+            "claude",
+            &managed_claude,
+            "w-cl",
+            vec![&host_claude, &host_codex_auth, &host_agy_oauth],
+            format!("{}|unset", managed_claude.display()),
+        ),
+        (
+            "agy",
+            &agy_home,
+            "w-ag",
+            vec![&host_claude, &managed_settings, &host_codex_auth],
+            "unset|unset".to_string(),
+        ),
+        (
+            "codex",
+            &custom_codex,
+            "w-cx",
+            vec![
+                &host_codex_auth,
+                &host_claude,
+                &managed_settings,
+                &host_agy_oauth,
+            ],
+            format!("unset|{}", custom_codex.display()),
+        ),
+    ];
+    for (engine, engine_home, worker, hidden_files, expected_env) in cases {
+        let words = view
+            .wrap(&ViewedLaunch {
+                engine,
+                workspace: &ws,
+                engine_home: &engine_home.display().to_string(),
+                worker_id: Some(worker),
+                exit_file: None,
+            })
+            .expect(engine);
+        assert_eq!(
+            ok_with_env(
+                &words,
+                &dirty_env,
+                "printf '%s|%s' \"${CLAUDE_CONFIG_DIR-unset}\" \"${CODEX_HOME-unset}\"",
+            ),
+            expected_env
+        );
+        if engine == "claude" {
+            assert_eq!(
+                ok(&words, &format!("cat '{}'", managed_settings.display())),
+                "{\"managed\":true}"
+            );
+        }
+        for hidden in hidden_files {
+            fails(&words, &format!("cat '{}'", hidden.display()));
+        }
+    }
+}
+
+#[test]
+fn container_view_isolates_per_worker_runtime_and_cross_engine_env_across_all_three_engines() {
+    let fixture = Fixture::new();
+    let mut cfg = fixture.config();
+    let codex_data = fixture.scratch.join("ctr-codex-data");
+    cfg.codex_data_dir = Some(codex_data.clone());
+    let view = spawn_host::ContainerView::new_with_detector(cfg, &|| spawn_host::ContainerEnv {
+        in_container: true,
+        runtime: Some("docker".to_string()),
+        signals: vec!["/.dockerenv".to_string()],
+    })
+    .expect("container view");
+
+    let (workspace, agy_home, _) = fixture.launch();
+    let claude_home = fixture.scratch.join("ctr-claude");
+    let codex_home = fixture.scratch.join("ctr-codex");
+    for (engine, eh, worker, expect_cfg) in [
+        ("claude", claude_home.as_path(), "w-c", "claude|unset"),
+        ("agy", Path::new(&agy_home), "w-a", "unset|unset"),
+        ("codex", codex_home.as_path(), "w-x", "unset|codex"),
+    ] {
+        let words = view
+            .wrap(&ViewedLaunch {
+                engine,
+                workspace: &workspace,
+                engine_home: &eh.display().to_string(),
+                worker_id: Some(worker),
+                exit_file: None,
+            })
+            .expect("wrap");
+        let out = ok_with_env(
+            &words,
+            &[
+                ("CLAUDE_CONFIG_DIR", "/dirty/claude"),
+                ("CODEX_HOME", "/dirty/codex"),
+            ],
+            "[ -d \"$XDG_RUNTIME_DIR\" ] && [ -d \"$TMPDIR\" ] && \
+             printf '%s|%s|%s' \"$XDG_RUNTIME_DIR\" \"${CLAUDE_CONFIG_DIR-unset}\" \"${CODEX_HOME-unset}\"",
+        );
+        let mut parts = out.split('|');
+        let rt = parts.next().expect("rt");
+        let claude_env = parts.next().expect("claude env");
+        let codex_env = parts.next().expect("codex env");
+        assert_ne!(rt, fixture.runtime().display().to_string());
+        match expect_cfg {
+            "claude|unset" => {
+                assert_eq!(claude_env, claude_home.display().to_string());
+                assert_eq!(codex_env, "unset");
+            }
+            "unset|unset" => assert_eq!((claude_env, codex_env), ("unset", "unset")),
+            "unset|codex" => {
+                assert!(
+                    rt.starts_with(&codex_data.join("workers/w-x").display().to_string()),
+                    "{rt}"
+                );
+                assert_eq!(claude_env, "unset");
+                assert_eq!(codex_env, codex_home.display().to_string());
+            }
+            _ => unreachable!(),
+        }
+    }
 }
