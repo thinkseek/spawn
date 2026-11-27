@@ -267,6 +267,125 @@ impl Cpu {
     pub(crate) fn fits(&self, running: usize, jobs: usize) -> bool {
         running == 0 || running + jobs + self.reserved <= self.cores
     }
+
+    /// Scale gate concurrency down under elevated host 1-minute load (#28)
+    /// while preserving at least one slot.
+    pub(crate) fn jobs_under_load(
+        &self,
+        shared: bool,
+        at_once: usize,
+        load_1m: f64,
+        max_load_per_core: f64,
+    ) -> usize {
+        let base = self.jobs_for(shared, at_once);
+        if !load_1m.is_finite()
+            || load_1m < 0.0
+            || !max_load_per_core.is_finite()
+            || max_load_per_core <= 0.0
+        {
+            return base;
+        }
+        let cores_f64 = f64::from(u32::try_from(self.cores.max(1)).unwrap_or(u32::MAX));
+        let ceiling = max_load_per_core * cores_f64;
+        if load_1m >= ceiling {
+            1
+        } else if load_1m >= ceiling * 0.75 {
+            (base / 2).max(1)
+        } else {
+            base
+        }
+    }
+}
+
+/// Parse `(1m, 5m, 15m)` load averages from `/proc/loadavg` text.
+pub(crate) fn parse_loadavg(text: &str) -> Option<(f64, f64, f64)> {
+    let mut parts = text.split_whitespace();
+    let parse = |raw: Option<&str>| {
+        raw?.parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
+    Some((
+        parse(parts.next())?,
+        parse(parts.next())?,
+        parse(parts.next())?,
+    ))
+}
+
+fn measured_load_1m() -> Option<f64> {
+    parse_loadavg(&std::fs::read_to_string("/proc/loadavg").ok()?).map(|(one, _, _)| one)
+}
+
+fn host_cores() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+const DEFAULT_MAX_LOAD_PER_CORE: f64 = 2.0;
+const DEFAULT_LOAD_BACKOFF_MS: u64 = 2_000;
+const MAX_LOAD_BACKOFF_MS: u64 = 30_000;
+const DEFAULT_LOAD_BACKOFF_ATTEMPTS: usize = 3;
+const MAX_LOAD_BACKOFF_ATTEMPTS: usize = 5;
+const DEFAULT_LOAD_RETRIES: usize = 1;
+const MAX_LOAD_RETRIES: usize = 3;
+
+/// Host-load guard configuration (#28), read outside the gate sandbox.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LoadPolicy {
+    max_load: Option<f64>,
+    backoff_ms: u64,
+    max_backoff_attempts: usize,
+    max_load_retries: usize,
+}
+
+impl LoadPolicy {
+    fn from_env(lookup: impl Fn(&str) -> Option<String>, cores: usize) -> Self {
+        let set = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
+        let non_neg_f64 = |name: &str| {
+            set(name).and_then(|raw| {
+                raw.trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+            })
+        };
+        let max_load = if let Some(abs) = non_neg_f64("SPAWN_GATE_MAX_LOAD") {
+            (abs > 0.0).then_some(abs)
+        } else {
+            let ratio =
+                non_neg_f64("SPAWN_GATE_MAX_LOAD_PER_CORE").unwrap_or(DEFAULT_MAX_LOAD_PER_CORE);
+            if ratio > 0.0 {
+                let cores_f64 = f64::from(u32::try_from(cores.max(1)).unwrap_or(u32::MAX));
+                Some(ratio * cores_f64)
+            } else {
+                None
+            }
+        };
+        let backoff_ms = set("SPAWN_GATE_LOAD_BACKOFF_MS")
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_LOAD_BACKOFF_MS)
+            .min(MAX_LOAD_BACKOFF_MS);
+        let max_backoff_attempts = set("SPAWN_GATE_LOAD_BACKOFF_ATTEMPTS")
+            .and_then(|raw| whole(&raw))
+            .unwrap_or(DEFAULT_LOAD_BACKOFF_ATTEMPTS)
+            .min(MAX_LOAD_BACKOFF_ATTEMPTS);
+        let max_load_retries = set("SPAWN_GATE_LOAD_RETRIES")
+            .and_then(|raw| whole(&raw))
+            .unwrap_or(DEFAULT_LOAD_RETRIES)
+            .min(MAX_LOAD_RETRIES);
+        Self {
+            max_load,
+            backoff_ms,
+            max_backoff_attempts,
+            max_load_retries,
+        }
+    }
+
+    fn is_high(&self, load_1m: Option<f64>) -> bool {
+        match (self.max_load, load_1m) {
+            (Some(limit), Some(current)) => current.is_finite() && current >= limit,
+            _ => false,
+        }
+    }
 }
 
 /// A whole number as gate.sh reads one: digits only, no sign, no leading
@@ -1152,32 +1271,79 @@ fn seen_base_check(file: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// [`judge`], with the private directory made under `parent` and free space
-/// measured by `free_kb` (a seam for tests: a disk with no room at all).
-#[allow(clippy::too_many_arguments)]
-fn judge_in(
-    parent: &Path,
-    free_kb: &dyn Fn(&Path) -> Option<u64>,
-    gate: &Path,
-    repo: &Path,
-    base: &str,
-    candidate: &str,
-    scenarios: &Path,
-    scenario: Option<&Path>,
+struct GateRequest<'a> {
+    gate: &'a Path,
+    repo: &'a Path,
+    base: &'a str,
+    candidate: &'a str,
+    scenarios: &'a Path,
+    scenario: Option<&'a Path>,
+}
+
+struct GateHost<'a> {
+    parent: &'a Path,
+    free_kb: &'a dyn Fn(&Path) -> Option<u64>,
+    load_1m: &'a dyn Fn() -> Option<f64>,
+    sleep: &'a dyn Fn(Duration),
+    policy: LoadPolicy,
+}
+
+fn with_jobs_cap(env: &[(String, String)], cap: usize) -> Vec<(String, String)> {
+    let cap = cap.max(1);
+    let cap_str = cap.to_string();
+    let mut bounded = Vec::with_capacity(env.len() + 1);
+    let mut saw_jobs = false;
+    for (name, value) in env {
+        if name == "SPAWN_GATE_JOBS" {
+            let next = whole(value)
+                .map_or(cap, |current| current.min(cap))
+                .to_string();
+            bounded.push((name.clone(), next));
+            saw_jobs = true;
+        } else if name == "SPAWN_GATE_HOST_JOBS" && whole(value).is_some_and(|n| n > cap) {
+            bounded.push((name.clone(), cap_str.clone()));
+        } else {
+            bounded.push((name.clone(), value.clone()));
+        }
+    }
+    if !saw_jobs {
+        bounded.push(("SPAWN_GATE_JOBS".to_string(), cap_str));
+    }
+    bounded
+}
+
+fn with_bounded_jobs(env: &[(String, String)]) -> Vec<(String, String)> {
+    with_jobs_cap(env, 1)
+}
+
+fn check_stop_or_halt() -> Result<(), GateFailure> {
+    if this_halt().is_some_and(|halt| halt.halted()) {
+        park_for_good();
+    }
+    if stopped() {
+        return Err(GateFailure::Aborted {
+            reason: STOPPED.to_string(),
+            log: String::new(),
+        });
+    }
+    Ok(())
+}
+
+fn run_once(
+    host: &GateHost<'_>,
+    req: &GateRequest<'_>,
     env: &[(String, String)],
     limit: Duration,
+    adopted: Option<PathBuf>,
     seen: &mut Option<String>,
 ) -> Result<Verdict, GateFailure> {
-    for (parameter, value) in [("base", base), ("candidate", candidate)] {
-        validate_revision(parameter, value).map_err(GateFailure::Parameter)?;
-    }
     let floor = env_value(env, "SPAWN_GATE_MIN_FREE_GB")
         .map_or(Some(DEFAULT_MIN_FREE_GB), |text| text.parse::<u64>().ok());
     // The gate's own TMPDIR, as gate.sh reads it.
     let tmpdir = PathBuf::from(env_value(env, "TMPDIR").unwrap_or("/tmp"));
     let short = |path: &Path, log: &str, why: &str| -> Option<GateFailure> {
         let min_gb = floor?;
-        let free = free_kb(path)?;
+        let free = (host.free_kb)(path)?;
         (free < min_gb.saturating_mul(1_048_576)).then(|| GateFailure::NoRoom {
             short: Shortfall::Disk {
                 free_kb: free,
@@ -1191,19 +1357,15 @@ fn judge_in(
             ),
         })
     };
-    // A judging adopted from an earlier integrator (gate v2 step 2, D5)
-    // takes over the gate that one left running, once: its private
-    // directory, its verdict file and its unit.
-    let adopted = crate::integrate::judging::take_adopted();
     let adopting = adopted.is_some();
     let directory = match adopted.map_or_else(
-        || PrivateDirectory::create_in(parent),
+        || PrivateDirectory::create_in(host.parent),
         |path| Ok(PrivateDirectory::adopt(path)),
     ) {
         Ok(directory) => directory,
         Err(error) => {
             return Err(short(
-                parent,
+                host.parent,
                 "",
                 &format!("cannot create the gate's private directory: {error}"),
             )
@@ -1213,12 +1375,12 @@ fn judge_in(
     let verdict_path = directory.path().join("verdict");
     let mut command = Command::new("sh");
     command
-        .arg(gate)
-        .arg(repo)
-        .arg(base)
-        .arg(candidate)
-        .arg(scenarios);
-    if let Some(scenario) = scenario {
+        .arg(req.gate)
+        .arg(req.repo)
+        .arg(req.base)
+        .arg(req.candidate)
+        .arg(req.scenarios);
+    if let Some(scenario) = req.scenario {
         command.arg(scenario);
     }
     let mut gate_env = env.to_vec();
@@ -1233,15 +1395,18 @@ fn judge_in(
     };
     // The base check is read before anything else of the run, so a gate the
     // wall clock killed (a timeout) still says main passed it.
-    *seen = std::fs::read_to_string(&verdict_path)
+    let base_check = std::fs::read_to_string(&verdict_path)
         .ok()
         .as_deref()
         .and_then(seen_base_check);
+    if base_check.is_some() {
+        *seen = base_check;
+    }
     let run = match run {
         Ok(run) => run,
         Err(GateFailure::Failed(error)) => {
             return Err(short(
-                parent,
+                host.parent,
                 "",
                 &format!("cannot run the gate in its private directory: {error}"),
             )
@@ -1274,6 +1439,308 @@ fn judge_in(
         }
         other => other,
     }
+}
+
+fn preflight_load(host: &GateHost<'_>, deadline: Instant) -> Result<Option<f64>, GateFailure> {
+    let mut current = (host.load_1m)();
+    let mut attempt = 0_usize;
+    while host.policy.is_high(current) && attempt < host.policy.max_backoff_attempts {
+        check_stop_or_halt()?;
+        let wait_ms = host
+            .policy
+            .backoff_ms
+            .saturating_mul(1_u64 << attempt.min(10))
+            .min(15_000);
+        let wait = Duration::from_millis(wait_ms);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() || remaining <= wait.saturating_mul(2) {
+            break;
+        }
+        (host.sleep)(wait);
+        attempt += 1;
+        current = (host.load_1m)();
+    }
+    Ok(current)
+}
+
+fn push_unique_test_name(names: &mut Vec<String>, candidate: &str) {
+    let name = candidate.trim();
+    if !name.is_empty() && name.len() <= 160 && !names.iter().any(|seen| seen == name) {
+        names.push(name.to_string());
+    }
+}
+
+fn extract_failing_tests(output: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim().trim_start_matches("! ").trim();
+        if let Some(rest) = trimmed.strip_prefix("test ")
+            && let Some(name) = rest.strip_suffix(" ... FAILED")
+        {
+            push_unique_test_name(&mut names, name);
+        } else if let Some(rest) = trimmed.strip_prefix("FAILED ") {
+            let name = rest.split([':', ' ']).next().unwrap_or_default();
+            push_unique_test_name(&mut names, name);
+        } else if let Some(rest) = trimmed.strip_prefix("not ok ")
+            && let Some((_, name)) = rest.split_once(" - ")
+        {
+            push_unique_test_name(&mut names, name);
+        } else if let Some(name) = trimmed.strip_prefix("✖ ") {
+            push_unique_test_name(&mut names, name);
+        }
+        if names.len() >= 8 {
+            break;
+        }
+    }
+    names
+}
+
+fn has_load_timeout_signature(reason: &str, output: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "timed out",
+        "timeout",
+        "etimedout",
+        "deadline exceeded",
+        "busy bound",
+        "resource temporarily unavailable",
+        "cannot allocate memory",
+    ];
+    let lower_reason = reason.to_ascii_lowercase();
+    if MARKERS.iter().any(|marker| lower_reason.contains(marker)) {
+        return true;
+    }
+    let lower_out = output.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| lower_out.contains(marker))
+}
+
+fn failing_scenario_name(reason: &str) -> String {
+    for token in reason.split_whitespace() {
+        let cleaned = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                ':' | ',' | ';' | '.' | '(' | ')' | '[' | ']' | '"' | '\''
+            )
+        });
+        if is_check_name(cleaned) || is_scenario_name(cleaned) {
+            return cleaned.to_string();
+        }
+    }
+    if reason.contains("check-tests") {
+        "check-tests.sh".to_string()
+    } else {
+        "gate".to_string()
+    }
+}
+
+fn retry_rejected_under_load(
+    host: &GateHost<'_>,
+    req: &GateRequest<'_>,
+    env: &[(String, String)],
+    deadline: Instant,
+    mut first: Verdict,
+    load_after: Option<f64>,
+    seen: &mut Option<String>,
+) -> Result<Verdict, GateFailure> {
+    let first_tests = extract_failing_tests(&first.output);
+    let first_timeout = has_load_timeout_signature(&first.reason, &first.output);
+    let bounded_env = with_bounded_jobs(env);
+    let first_scenario = failing_scenario_name(&first.reason);
+
+    for attempt in 0..host.policy.max_load_retries {
+        check_stop_or_halt()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining < Duration::from_secs(1) {
+            break;
+        }
+        let wait = Duration::from_millis(host.policy.backoff_ms);
+        if !wait.is_zero() && remaining > wait.saturating_mul(2) {
+            (host.sleep)(wait);
+        }
+        let budget = deadline.saturating_duration_since(Instant::now());
+        if budget.is_zero() {
+            break;
+        }
+        match run_once(host, req, &bounded_env, budget, None, seen) {
+            Ok(mut retry) if retry.accepted => {
+                if is_check_name(&first_scenario)
+                    && !retry.flakes.iter().any(|item| item == &first_scenario)
+                {
+                    retry.flakes.push(first_scenario);
+                }
+                let _ = writeln!(
+                    retry.output,
+                    "! gate: initial rejection under high host load recovered on serial retry \
+                     (SPAWN_GATE_JOBS=1, attempt {})",
+                    attempt + 1
+                );
+                return Ok(retry);
+            }
+            Ok(retry) => {
+                let load_retry = (host.load_1m)();
+                let retry_tests = extract_failing_tests(&retry.output);
+                let retry_timeout = has_load_timeout_signature(&retry.reason, &retry.output);
+                let deterministic = (!first_timeout && !retry_timeout)
+                    && ((!first_tests.is_empty() && first_tests == retry_tests)
+                        || (first_tests.is_empty()
+                            && retry_tests.is_empty()
+                            && (!host.policy.is_high(load_retry) || first.reason == retry.reason)));
+                if deterministic {
+                    return Ok(retry);
+                }
+                let load_induced = (first_timeout
+                    || retry_timeout
+                    || (!first_tests.is_empty()
+                        && !retry_tests.is_empty()
+                        && first_tests != retry_tests))
+                    && (host.policy.is_high(load_after) || host.policy.is_high(load_retry));
+                if load_induced {
+                    let scenario = failing_scenario_name(&retry.reason);
+                    let load_sensitive = if is_scenario_name(&scenario) {
+                        vec![scenario.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    let log = format!(
+                        "{}\n! gate: load-sensitive failure persisted across serial retry \
+                         (load_1m after={load_after:?}, retry={load_retry:?})\n{}",
+                        first.output.trim_end(),
+                        retry.output
+                    );
+                    return Err(GateFailure::CannotJudge {
+                        scenario,
+                        log,
+                        load_sensitive,
+                    });
+                }
+                first = retry;
+            }
+            Err(GateFailure::Timeout) if host.policy.is_high((host.load_1m)()) => {
+                return Err(GateFailure::CannotJudge {
+                    scenario: first_scenario,
+                    log: first.output,
+                    load_sensitive: Vec::new(),
+                });
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(first)
+}
+
+fn judge_with_load(
+    host: &GateHost<'_>,
+    req: &GateRequest<'_>,
+    env: &[(String, String)],
+    limit: Duration,
+    seen: &mut Option<String>,
+) -> Result<Verdict, GateFailure> {
+    for (parameter, value) in [("base", req.base), ("candidate", req.candidate)] {
+        validate_revision(parameter, value).map_err(GateFailure::Parameter)?;
+    }
+    let deadline = Instant::now() + limit;
+    // A judging adopted from an earlier integrator (gate v2 step 2, D5)
+    // takes over the gate that one left running, once: its private
+    // directory, its verdict file and its unit.
+    let adopted = crate::integrate::judging::take_adopted();
+    let adopting = adopted.is_some();
+
+    let (load_before, run_env) = if adopting {
+        (None, env.to_vec())
+    } else {
+        let sampled = preflight_load(host, deadline)?;
+        let effective = if host.policy.is_high(sampled) {
+            with_bounded_jobs(env)
+        } else if let (Some(limit), Some(load_1m)) = (host.policy.max_load, sampled) {
+            let cores = host_cores();
+            let max_per_core = limit / f64::from(u32::try_from(cores.max(1)).unwrap_or(u32::MAX));
+            let shared = on_shared_server(env);
+            match Cpu::from_env(|name| env_value(env, name).map(str::to_string), cores) {
+                Ok(cpu) => {
+                    let scaled = cpu.jobs_under_load(shared, 1, load_1m, max_per_core);
+                    if scaled < cpu.jobs_for(shared, 1) {
+                        with_jobs_cap(env, scaled)
+                    } else {
+                        env.to_vec()
+                    }
+                }
+                Err(_) => env.to_vec(),
+            }
+        } else {
+            env.to_vec()
+        };
+        (sampled, effective)
+    };
+
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(1));
+    let outcome = run_once(host, req, &run_env, remaining, adopted, seen);
+    let load_after = (host.load_1m)();
+    let under_high_load = host.policy.is_high(load_before) || host.policy.is_high(load_after);
+
+    match outcome {
+        Ok(verdict)
+            if !verdict.accepted
+                && under_high_load
+                && !adopting
+                && host.policy.max_load_retries > 0 =>
+        {
+            retry_rejected_under_load(host, req, env, deadline, verdict, load_after, seen)
+        }
+        Err(GateFailure::Timeout) if under_high_load && !adopting => {
+            Err(GateFailure::CannotJudge {
+                scenario: "gate".to_string(),
+                log: format!(
+                    "gate timed out under elevated host load (load_1m before={load_before:?}, \
+                     after={load_after:?})"
+                ),
+                load_sensitive: Vec::new(),
+            })
+        }
+        other => other,
+    }
+}
+
+/// [`judge`], with the private directory made under `parent` and free space
+/// measured by `free_kb` (a seam for tests: a disk with no room at all).
+#[allow(clippy::too_many_arguments)]
+fn judge_in(
+    parent: &Path,
+    free_kb: &dyn Fn(&Path) -> Option<u64>,
+    gate: &Path,
+    repo: &Path,
+    base: &str,
+    candidate: &str,
+    scenarios: &Path,
+    scenario: Option<&Path>,
+    env: &[(String, String)],
+    limit: Duration,
+    seen: &mut Option<String>,
+) -> Result<Verdict, GateFailure> {
+    let policy = LoadPolicy::from_env(
+        |name| {
+            env_value(env, name)
+                .map(str::to_string)
+                .or_else(|| std::env::var(name).ok())
+        },
+        host_cores(),
+    );
+    let host = GateHost {
+        parent,
+        free_kb,
+        load_1m: &measured_load_1m,
+        sleep: &std::thread::sleep,
+        policy,
+    };
+    let req = GateRequest {
+        gate,
+        repo,
+        base,
+        candidate,
+        scenarios,
+        scenario,
+    };
+    judge_with_load(&host, &req, env, limit, seen)
 }
 
 /// The value of `name` in the gate's environment, when set.
@@ -1388,9 +1855,16 @@ pub(crate) fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFa
         .unwrap_or(&run.stdout);
     let mut output = record(stdout);
     let _ = writeln!(output, "{line}");
+    let mut reason = text("reason").unwrap_or_else(|| "gate rejected the candidate".to_string());
+    if !accepted {
+        let failing = extract_failing_tests(&output);
+        if !failing.is_empty() && !failing.iter().any(|test| reason.contains(test)) {
+            let _ = write!(reason, " (failing tests: {})", failing.join(", "));
+        }
+    }
     Ok(Verdict {
         accepted,
-        reason: text("reason").unwrap_or_else(|| "gate rejected the candidate".to_string()),
+        reason,
         metric: text("metric"),
         flakes: flakes(&value),
         main_red_scenarios: main_red_scenarios(&value),
@@ -2919,6 +3393,10 @@ mod tests {
             let directory = PrivateDirectory::create().expect("directory");
             std::fs::write(directory.path().join("gate.sh"), body).expect("gate");
             Self { directory }
+        }
+
+        fn script(&self) -> PathBuf {
+            self.directory.path().join("gate.sh")
         }
 
         fn judge(&self, env: &[(String, String)]) -> Result<super::Verdict, GateFailure> {
@@ -4483,6 +4961,294 @@ mod tests {
         let (kept, warning) = withhold_owners_cluster(&env, None, |_| panic!("no connection"));
         assert_eq!(kept, env);
         assert!(warning.is_none());
+    }
+
+    #[test]
+    fn parse_loadavg_parses_valid_and_rejects_malformed() {
+        assert_eq!(
+            super::parse_loadavg("25.40 18.12 12.01 4/1920 9981\n"),
+            Some((25.40, 18.12, 12.01))
+        );
+        assert_eq!(
+            super::parse_loadavg("0.00 0.00 0.00"),
+            Some((0.0, 0.0, 0.0))
+        );
+        assert_eq!(super::parse_loadavg("-1.0 1.0 1.0"), None);
+        assert_eq!(super::parse_loadavg("NaN 1.0 1.0"), None);
+        assert_eq!(super::parse_loadavg("1.0 2.0"), None);
+        assert_eq!(super::parse_loadavg(""), None);
+    }
+
+    #[test]
+    fn cpu_jobs_under_load_sheds_concurrency_above_threshold() {
+        let host = cpu(&[], 16).expect("defaults");
+        // base = (16 - 4) / 2 = 6; ceiling at 2.0/core = 32.0 (75% = 24.0)
+        assert_eq!(host.jobs_under_load(false, 2, 10.0, 2.0), 6);
+        assert_eq!(host.jobs_under_load(false, 2, 24.0, 2.0), 3);
+        assert_eq!(host.jobs_under_load(false, 2, 32.0, 2.0), 1);
+        assert_eq!(host.jobs_under_load(false, 2, f64::NAN, 2.0), 6);
+    }
+
+    #[test]
+    fn extract_failing_tests_and_decide_names_failing_tests() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let run = super::Run {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: "running 2 tests\ntest alpha_passes ... ok\ntest beta_fails ... FAILED\n\
+                     not ok 2 - gamma_tap\n"
+                .to_string(),
+            stderr: String::new(),
+        };
+        let verdict = super::decide(
+            &run,
+            Some(r#"{"verdict":"rejected","reason":"check-tests.sh failed"}"#),
+        )
+        .expect("verdict");
+        assert!(!verdict.accepted);
+        assert!(verdict.reason.contains("beta_fails"), "{}", verdict.reason);
+        assert!(verdict.reason.contains("gamma_tap"), "{}", verdict.reason);
+    }
+
+    #[test]
+    fn judge_with_load_never_masks_deterministic_unit_test_failure_under_high_load() {
+        let gate = FakeGate::new(
+            "echo 'test broken_invariant ... FAILED'\n\
+             echo '{\"verdict\":\"rejected\",\"reason\":\"check-tests.sh failed\"}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let dir = PrivateDirectory::create().expect("parent");
+        let sleeps = std::cell::RefCell::new(Vec::new());
+        let policy = super::LoadPolicy {
+            max_load: Some(8.0),
+            backoff_ms: 50,
+            max_backoff_attempts: 1,
+            max_load_retries: 1,
+        };
+        let host = super::GateHost {
+            parent: dir.path(),
+            free_kb: &|_| Some(100 * 1_048_576),
+            load_1m: &|| Some(28.0),
+            sleep: &|d| sleeps.borrow_mut().push(d),
+            policy,
+        };
+        let gate_script = gate.script();
+        let req = super::GateRequest {
+            gate: &gate_script,
+            repo: Path::new("/tmp"),
+            base: "base",
+            candidate: "cand",
+            scenarios: Path::new("/tmp"),
+            scenario: None,
+        };
+        let mut seen = None;
+        let verdict = super::judge_with_load(
+            &host,
+            &req,
+            &path_only(),
+            Duration::from_secs(30),
+            &mut seen,
+        )
+        .expect("deterministic failure must return rejected verdict, not CannotJudge");
+        assert!(!verdict.accepted);
+        assert!(
+            verdict.reason.contains("broken_invariant"),
+            "{}",
+            verdict.reason
+        );
+        assert!(!sleeps.borrow().is_empty());
+    }
+
+    #[test]
+    fn judge_with_load_recovers_transient_load_flake_with_serial_retry() {
+        let state_dir = PrivateDirectory::create().expect("state");
+        let counter = state_dir.path().join("count");
+        let gate = FakeGate::new(&format!(
+            "n=0\n\
+             [ -f \"{c}\" ] && n=$(cat \"{c}\")\n\
+             n=$((n + 1))\n\
+             echo \"$n\" >\"{c}\"\n\
+             if [ \"$n\" -eq 1 ]; then\n\
+                 echo 'Test timed out in 5000ms'\n\
+                 echo '{{\"verdict\":\"rejected\",\"reason\":\"check-tests.sh failed\"}}' >\"$SPAWN_GATE_VERDICT\"\n\
+             else\n\
+                 [ \"${{SPAWN_GATE_JOBS-}}\" = \"1\" ] || exit 1\n\
+                 echo '{{\"verdict\":\"accepted\",\"reason\":\"passed\"}}' >\"$SPAWN_GATE_VERDICT\"\n\
+             fi\n",
+            c = counter.display()
+        ));
+        let mut env = path_only();
+        env.push(("SPAWN_GATE_JOBS".to_string(), "4".to_string()));
+        let policy = super::LoadPolicy {
+            max_load: Some(8.0),
+            backoff_ms: 10,
+            max_backoff_attempts: 1,
+            max_load_retries: 1,
+        };
+        let host = super::GateHost {
+            parent: state_dir.path(),
+            free_kb: &|_| Some(100 * 1_048_576),
+            load_1m: &|| Some(25.0),
+            sleep: &|_| {},
+            policy,
+        };
+        let gate_script = gate.script();
+        let req = super::GateRequest {
+            gate: &gate_script,
+            repo: Path::new("/tmp"),
+            base: "base",
+            candidate: "cand",
+            scenarios: Path::new("/tmp"),
+            scenario: None,
+        };
+        let mut seen = None;
+        let verdict = super::judge_with_load(&host, &req, &env, Duration::from_secs(30), &mut seen)
+            .expect("serial retry should pass and avoid false rejection");
+        assert!(verdict.accepted);
+        assert_eq!(verdict.flakes, ["check-tests.sh"]);
+        assert!(verdict.output.contains("recovered on serial retry"));
+    }
+
+    #[test]
+    fn judge_with_load_reclassifies_sustained_load_timeout_as_cannot_judge() {
+        let gate = FakeGate::new(
+            "echo 'Test timed out in 5000ms'\n\
+             echo '{\"verdict\":\"rejected\",\"reason\":\"scenario 023.sh failed: timed out\"}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let dir = PrivateDirectory::create().expect("parent");
+        let policy = super::LoadPolicy {
+            max_load: Some(8.0),
+            backoff_ms: 10,
+            max_backoff_attempts: 1,
+            max_load_retries: 1,
+        };
+        let host = super::GateHost {
+            parent: dir.path(),
+            free_kb: &|_| Some(100 * 1_048_576),
+            load_1m: &|| Some(30.0),
+            sleep: &|_| {},
+            policy,
+        };
+        let gate_script = gate.script();
+        let req = super::GateRequest {
+            gate: &gate_script,
+            repo: Path::new("/tmp"),
+            base: "base",
+            candidate: "cand",
+            scenarios: Path::new("/tmp"),
+            scenario: None,
+        };
+        let mut seen = None;
+        let Err(super::GateFailure::CannotJudge {
+            scenario,
+            log,
+            load_sensitive,
+        }) = super::judge_with_load(
+            &host,
+            &req,
+            &path_only(),
+            Duration::from_secs(30),
+            &mut seen,
+        )
+        else {
+            panic!("sustained timeout under high load must classify as CannotJudge");
+        };
+        assert_eq!(scenario, "023.sh");
+        assert_eq!(load_sensitive, ["023.sh"]);
+        assert!(log.contains("load-sensitive failure persisted"));
+    }
+
+    #[test]
+    fn judge_with_load_preflight_backoff_waits_for_load_to_drop_without_clamping() {
+        let gate = FakeGate::new(
+            "if [ \"${SPAWN_GATE_JOBS-}\" != \"4\" ]; then\n\
+                 echo '{\"verdict\":\"rejected\",\"reason\":\"clamped unnecessarily\"}' >\"$SPAWN_GATE_VERDICT\"\n\
+             else\n\
+                 echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n\
+             fi\n",
+        );
+        let dir = PrivateDirectory::create().expect("parent");
+        let calls = std::cell::Cell::new(0_usize);
+        let policy = super::LoadPolicy {
+            max_load: Some(8.0),
+            backoff_ms: 25,
+            max_backoff_attempts: 2,
+            max_load_retries: 1,
+        };
+        let host = super::GateHost {
+            parent: dir.path(),
+            free_kb: &|_| Some(100 * 1_048_576),
+            load_1m: &|| {
+                let n = calls.get();
+                calls.set(n + 1);
+                Some(if n == 0 { 24.0 } else { 2.0 })
+            },
+            sleep: &|_| {},
+            policy,
+        };
+        let mut env = path_only();
+        env.push(("SPAWN_GATE_JOBS".to_string(), "4".to_string()));
+        let gate_script = gate.script();
+        let req = super::GateRequest {
+            gate: &gate_script,
+            repo: Path::new("/tmp"),
+            base: "base",
+            candidate: "cand",
+            scenarios: Path::new("/tmp"),
+            scenario: None,
+        };
+        let mut seen = None;
+        let verdict = super::judge_with_load(&host, &req, &env, Duration::from_secs(30), &mut seen)
+            .expect("accepted");
+        assert!(verdict.accepted, "{}", verdict.reason);
+    }
+
+    #[test]
+    fn judge_with_load_never_retries_deterministic_failure_under_normal_load() {
+        let state_dir = PrivateDirectory::create().expect("state");
+        let counter = state_dir.path().join("count");
+        let gate = FakeGate::new(&format!(
+            "n=0\n\
+             [ -f \"{c}\" ] && n=$(cat \"{c}\")\n\
+             echo $((n + 1)) >\"{c}\"\n\
+             echo 'test unit_failure ... FAILED'\n\
+             echo '{{\"verdict\":\"rejected\",\"reason\":\"check-tests.sh failed\"}}' >\"$SPAWN_GATE_VERDICT\"\n",
+            c = counter.display()
+        ));
+        let policy = super::LoadPolicy {
+            max_load: Some(8.0),
+            backoff_ms: 10,
+            max_backoff_attempts: 2,
+            max_load_retries: 2,
+        };
+        let host = super::GateHost {
+            parent: state_dir.path(),
+            free_kb: &|_| Some(100 * 1_048_576),
+            load_1m: &|| Some(1.5),
+            sleep: &|_| panic!("normal load must not sleep"),
+            policy,
+        };
+        let gate_script = gate.script();
+        let req = super::GateRequest {
+            gate: &gate_script,
+            repo: Path::new("/tmp"),
+            base: "base",
+            candidate: "cand",
+            scenarios: Path::new("/tmp"),
+            scenario: None,
+        };
+        let mut seen = None;
+        let verdict = super::judge_with_load(
+            &host,
+            &req,
+            &path_only(),
+            Duration::from_secs(30),
+            &mut seen,
+        )
+        .expect("rejected");
+        assert!(!verdict.accepted);
+        assert_eq!(
+            std::fs::read_to_string(&counter).expect("count").trim(),
+            "1"
+        );
     }
 }
 

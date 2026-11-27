@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 
 import type { FleetState, Role } from "../../fleet";
 import { ROLE_LABEL, judgeKind, percent, sessionState } from "../../fleet";
+import type { AgentLivenessView } from "../../ordering";
 import { StateBadge, StateDot } from "../StateDot";
 import { cx } from "../ui";
 
@@ -71,21 +72,71 @@ export function RoleBadge({ role }: { role: Role }) {
 export function FleetStateBadge({
   state,
   size,
+  pulse,
 }: {
   state: FleetState;
   size?: "sm" | "md";
+  pulse?: boolean;
 }) {
-  return <StateBadge state={sessionState(state)} size={size} />;
+  return <StateBadge state={sessionState(state)} size={size} pulse={pulse} />;
 }
 
 export function FleetStateDot({
   state,
   size,
+  pulse,
 }: {
   state: FleetState;
   size?: "sm" | "md";
+  pulse?: boolean;
 }) {
-  return <StateDot state={sessionState(state)} size={size} />;
+  return <StateDot state={sessionState(state)} size={size} pulse={pulse} />;
+}
+
+const LIVENESS_TONE: Record<AgentLivenessView["tone"], { badge: string; dot: string }> = {
+  success: {
+    badge: "bg-ok-tint text-success ring-success/25",
+    dot: "bg-success",
+  },
+  info: {
+    badge: "bg-info-tint text-info ring-info/25",
+    dot: "bg-info",
+  },
+  warning: {
+    badge: "bg-wait-tint text-warning ring-warning/25",
+    dot: "bg-warning",
+  },
+  muted: {
+    badge: "bg-muted text-muted-foreground ring-surface-border",
+    dot: "bg-muted-foreground",
+  },
+};
+
+/** Compact liveness status pill distinguishing real progress (`实时推进`)
+ * from quiet work (`静默运行`) and silent stalls (`疑似停滞`). */
+export function AgentLivenessPill({
+  liveness,
+  title,
+}: {
+  liveness: AgentLivenessView;
+  title?: string;
+}) {
+  const tone = LIVENESS_TONE[liveness.tone];
+  return (
+    <span
+      title={title}
+      className={cx(
+        "inline-flex h-5 shrink-0 items-center gap-1 rounded px-1.5 text-micro font-medium ring-1 ring-inset",
+        tone.badge,
+      )}
+    >
+      <span
+        aria-hidden="true"
+        className={cx("size-1.5 rounded-full", tone.dot, liveness.pulse && "animate-spawn-pulse")}
+      />
+      {liveness.label}
+    </span>
+  );
 }
 
 /**

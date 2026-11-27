@@ -426,6 +426,7 @@ const ALERT_TITLES: Record<string, string> = {
   mission_halted: "A mission is halted",
   node_lost: "A node does not answer",
   task_undelivered: "A task was never delivered",
+  task_stalled: "A delivered task looks stalled",
   admission_wait: "Work waits for room",
   backup_stale: "A backup is late",
   source_away: "A mission's source is not a directory on this host",

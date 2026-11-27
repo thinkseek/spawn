@@ -92,13 +92,16 @@ export function PageHeader({
   );
 }
 
-/** Connection status of a poll: a calm dot when live, red when not. */
+/** Connection status of a poll: a calm pulsing dot when live/fresh, static
+ * amber/red when aging or frozen, red badge on poll error. */
 export function LiveStatus({
   error,
   label,
+  freshness = "fresh",
 }: {
   error: string | null;
   label: ReactNode;
+  freshness?: "fresh" | "aging" | "frozen";
 }) {
   if (error) {
     return (
@@ -108,6 +111,28 @@ export function LiveStatus({
       >
         <WifiOff size={12} />
         {error.startsWith("HTTP 401") ? "Token needed" : "Disconnected"}
+      </span>
+    );
+  }
+  if (freshness === "frozen") {
+    return (
+      <span
+        title="控制面快照已冻结，请勿仅凭旧快照重派或判断进展"
+        className="inline-flex h-6 items-center gap-1.5 rounded-md bg-fail-tint px-2 text-caption font-medium text-destructive ring-1 ring-destructive/25 ring-inset"
+      >
+        <span aria-hidden="true" className="inline-flex size-2 rounded-full bg-destructive" />
+        <span className="tnum">{label}</span>
+      </span>
+    );
+  }
+  if (freshness === "aging") {
+    return (
+      <span
+        title="快照超过 3 分钟未刷新"
+        className="inline-flex h-6 items-center gap-1.5 rounded-md bg-wait-tint px-2 text-caption font-medium text-warning ring-1 ring-warning/25 ring-inset"
+      >
+        <span aria-hidden="true" className="inline-flex size-2 rounded-full bg-warning" />
+        <span className="tnum">{label}</span>
       </span>
     );
   }

@@ -33,6 +33,7 @@ import {
   reasonText,
   stateLabelUpper,
 } from "../../fleet";
+import { agentLiveness } from "../../ordering";
 import { clockTime, formatDuration, relativeTime } from "../../format";
 import { commandSummary, foldCommands, inputAt, inputLeads, principalWords } from "../../commands";
 import { messageLine } from "../../messages.ts";
@@ -44,6 +45,7 @@ import { freshAt } from "../../validated";
 import { LiveBadge, TerminalPanel } from "../Terminal";
 import { Ago, Button, Card, CardHeader, Drawer, EmptyState, FOCUS_RING, cx } from "../ui";
 import {
+  AgentLivenessPill,
   Fact,
   FleetStateBadge,
   FleetStateDot,
@@ -117,13 +119,15 @@ export function AgentDetail({ agent, name = null, held = null, onClose, onOpenTi
           seq: agent.judgement?.based_on_seq ?? null,
         };
 
+  const liveness = agentLiveness(agent);
+
   return (
     <Drawer
       width="max-w-6xl"
       onClose={onClose}
       header={
         <>
-          <FleetStateDot state={agent.state} />
+          <FleetStateDot state={agent.state} pulse={liveness.pulse} />
           <h2
             className="min-w-0 shrink-0 truncate text-title-sm font-semibold text-foreground"
             title={[shownName, agent.label].filter(Boolean).join("\n")}
@@ -137,8 +141,9 @@ export function AgentDetail({ agent, name = null, held = null, onClose, onOpenTi
           )}
           <CopyIds agentId={agent.agent_id} sessionId={sessionId} />
           <RoleBadge role={agent.role} />
-          <FleetStateBadge state={agent.state} />
-          <LiveBadge live={agent.live} />
+          <FleetStateBadge state={agent.state} pulse={liveness.pulse} />
+          <LiveBadge live={agent.live} pulse={liveness.pulse} />
+          <AgentLivenessPill liveness={liveness} />
           {agent.attention && (
             <span
               className="text-caption font-medium text-warning"
@@ -416,6 +421,7 @@ function AgentSummary({
   const shown = summaryTask(agent, held);
   const line = shown && "task" in shown ? shown.task : null;
   const now = doingNow(agent);
+  const liveness = agentLiveness(agent);
   const since = forHowLong(agent.state_since_ms, Date.now());
   const activity = agent.activity;
   // A standing agent's input leads while fresh (UI note §4.6); an older
@@ -469,7 +475,11 @@ function AgentSummary({
           <span className="group-open/facts:hidden">Details</span>
           <span className="hidden group-open/facts:inline">Hide details</span>
         </summary>
-        <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4 lg:grid-cols-7">
+        <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4 lg:grid-cols-8">
+          <Fact label="Liveness">
+            {liveness.label}
+            {liveness.silenceMs !== null ? ` · silent ${formatDuration(liveness.silenceMs)}` : ""}
+          </Fact>
           <Fact label="Last event"><Ago ms={activity.last_event_at_ms} /></Fact>
           <Fact label="In state since"><Ago ms={agent.state_since_ms} /></Fact>
           <Fact label="Engine · execution" mono>

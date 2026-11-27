@@ -14,6 +14,7 @@ import {
 import { taskTitle } from "../../ordering";
 import { VerdictBadge } from "../rsi/Phase";
 import { FOCUS_RING, cx } from "../ui";
+import { taskLiveness } from "../../taskActivity";
 import { TaskText, useTaskTexts } from "./TaskTexts";
 import { AgentLink, Collapsible, TaskGradingDetails } from "./parts";
 import { TaskActivityLine } from "./TaskActivity";
@@ -100,7 +101,11 @@ export function TaskPanel({
             <AgentLink sessionId={task.session_id} agentId={task.agent_id} />
           </div>
           <div className="mt-1">
-            <TaskActivityLine activity={task.activity} now={now} />
+            <TaskActivityLine
+              activity={task.activity}
+              liveness={taskLiveness(task, Boolean(lane.mission.gate), now)}
+              now={now}
+            />
           </div>
         </div>
         <button

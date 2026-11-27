@@ -32,6 +32,16 @@ export type Role = "supervisor" | "worker" | "rsi";
 export type JudgeKind = "rules" | "jev" | "other";
 export type Probabilities = Record<FleetState, number>;
 
+/** Server-computed execution liveness classification (#63),
+ * aligned with `spawn-android` `FleetLivenessModel.kt`. */
+export type AgentLivenessState =
+  | "active_heartbeat"
+  | "quiet_working"
+  | "loop_stalled"
+  | "waiting_idle"
+  | "blocked"
+  | "offline";
+
 export interface Evidence {
   screen_tail: string | null;
   task: string | null;
@@ -117,6 +127,9 @@ export interface FleetAgent extends Labels {
   task: string | null;
   activity: Activity;
   judgement: Judgement | null;
+  last_event_at_ms?: number | null;
+  silence_ms?: number | null;
+  liveness_state?: AgentLivenessState | null;
 }
 
 export const LADDER_STEPS = [
@@ -174,6 +187,7 @@ export interface DiskPlace {
 }
 
 export interface Fleet {
+  generated_at_ms?: number | null;
   agents: FleetAgent[];
   health: FleetHealth;
   /** Optional node payloads when `/api/fleet` includes them; empty when omitted. */
@@ -356,6 +370,22 @@ function normalizeJobs(value: unknown): BackgroundJob[] {
   });
 }
 
+const AGENT_LIVENESS_STATES: ReadonlySet<AgentLivenessState> = new Set([
+  "active_heartbeat",
+  "quiet_working",
+  "loop_stalled",
+  "waiting_idle",
+  "blocked",
+  "offline",
+]);
+
+function normalizeAgentLivenessState(value: unknown): AgentLivenessState | null {
+  if (typeof value !== "string") return null;
+  return AGENT_LIVENESS_STATES.has(value as AgentLivenessState)
+    ? (value as AgentLivenessState)
+    : null;
+}
+
 function normalizeAgent(value: unknown): FleetAgent | null {
   const raw = object(value);
   const sessionId = text(raw.session_id);
@@ -363,6 +393,7 @@ function normalizeAgent(value: unknown): FleetAgent | null {
   const activity = object(raw.activity);
   const agentRole = role(raw.role);
   const judgement = normalizeJudgement(raw.judgement);
+  const activityLastEventAtMs = optionalNumber(activity.last_event_at_ms);
   return {
     ...labels(raw),
     session_id: sessionId,
@@ -386,7 +417,7 @@ function normalizeAgent(value: unknown): FleetAgent | null {
       current_tool_summary: optionalText(activity.current_tool_summary),
       jobs: normalizeJobs(activity.jobs),
       last_event_name: optionalText(activity.last_event_name),
-      last_event_at_ms: optionalNumber(activity.last_event_at_ms),
+      last_event_at_ms: activityLastEventAtMs,
       turn_open: optionalBool(activity.turn_open),
       turn_at_ms: optionalNumber(activity.turn_at_ms),
       event_count: optionalNumber(activity.event_count),
@@ -394,6 +425,14 @@ function normalizeAgent(value: unknown): FleetAgent | null {
       executions: optionalNumber(activity.executions),
     },
     judgement,
+    last_event_at_ms:
+      optionalNumber(raw.last_event_at_ms) ??
+      activityLastEventAtMs ??
+      optionalNumber(activity.turn_at_ms) ??
+      optionalNumber(raw.state_since_ms) ??
+      optionalNumber(raw.started_at_ms),
+    silence_ms: optionalNumber(raw.silence_ms),
+    liveness_state: normalizeAgentLivenessState(raw.liveness_state),
   };
 }
 
@@ -489,7 +528,8 @@ export function normalizeFleet(value: unknown): Fleet {
     );
   const health = normalizeHealth(raw.health, agents);
   const nodes = normalizeNodeList(raw.nodes ?? object(raw.health).nodes);
-  return { agents, health, nodes };
+  const generated_at_ms = optionalNumber(raw.generated_at_ms) ?? health.generated_at_ms;
+  return { generated_at_ms, agents, health, nodes };
 }
 
 export function normalizeJudgements(value: unknown): JudgementRecord[] {

@@ -516,6 +516,9 @@ pub(crate) struct Settings {
     pub(crate) stuck_idle_dwell_ms: i64,
     /// Minimum dwell time at `quiet_live` before `agent_stuck` fires.
     pub(crate) stuck_quiet_dwell_ms: i64,
+    /// How long a delivered task may stay silent without engine output before
+    /// `task_stalled` fires (0: never checked).
+    pub(crate) task_stalled_ms: i64,
 }
 
 /// A database URL, which holds a password: never shown, not even by
@@ -617,6 +620,7 @@ impl Settings {
             guardrail_clear_ms: secs("SPAWN_GUARDRAIL_CLEAR_SECS", 3600, &mut warnings),
             stuck_idle_dwell_ms: secs("SPAWN_ALERT_STUCK_IDLE_DWELL_SECS", 60, &mut warnings),
             stuck_quiet_dwell_ms: secs("SPAWN_ALERT_STUCK_QUIET_DWELL_SECS", 180, &mut warnings),
+            task_stalled_ms: secs("SPAWN_ALERT_TASK_STALLED_SECS", 1200, &mut warnings),
         };
         (settings, warnings)
     }
@@ -898,6 +902,9 @@ pub(crate) struct Monitor {
     /// Each transcript's current `archive_failed` occurrence, by agent and
     /// native session.
     archive_occurrences: BTreeMap<(String, String), archives::Occurrence>,
+    /// Earliest timestamp when a currently silent delivered task crosses
+    /// `settings.task_stalled_ms`.
+    delivered_silence_due_ms: Option<i64>,
 }
 
 /// What the supervisor has to dispatch, as one read of the attention view
@@ -1055,6 +1062,7 @@ impl Monitor {
             archives_after: 0,
             archives_due: true,
             archive_occurrences: BTreeMap::new(),
+            delivered_silence_due_ms: None,
         }
     }
 
@@ -1128,6 +1136,10 @@ impl Monitor {
         // The transcript archive's events: at the first check, when the log
         // moved, and after a read that failed (objective 193).
         self.read_archives(store, now, moved, &mut lines);
+        let task_stalled_due = self.delivered_silence_due_ms.is_some_and(|due| now >= due);
+        if reading_due || task_stalled_due {
+            self.read_task_activity(store, now, &mut events, &mut lines);
+        }
         if reading_due {
             self.next_reading_ms = now.saturating_add(self.settings.check_ms);
             self.read_host(now, &mut events, &mut lines);
@@ -2143,6 +2155,22 @@ impl Monitor {
         if self
             .tasks
             .get(&id)
+            .is_some_and(|task| task.state.as_deref() != Some("delivered"))
+        {
+            for key in self.open_keys("task_stalled", &format!("task #{id}")) {
+                out.push(Event::Clear {
+                    key,
+                    evidence: json!({
+                        "task": id,
+                        "record": kind,
+                        "reading_ms": at_ms,
+                    }),
+                });
+            }
+        }
+        if self
+            .tasks
+            .get(&id)
             .is_some_and(|task| task.state.as_deref() != Some("assigned"))
             && let Some(assigned) = task.assigned_event
             && self.is_open(&format!("task_undelivered:{id}:{assigned}"))
@@ -2152,6 +2180,169 @@ impl Monitor {
                 evidence: json!({"event_id": event_id, "record": kind}),
             });
         }
+    }
+
+    fn read_task_activity(
+        &mut self,
+        store: &PostgresStore,
+        now: i64,
+        out: &mut Vec<Event>,
+        lines: &mut Vec<String>,
+    ) {
+        if self.settings.task_stalled_ms <= 0 {
+            self.task_activity(&json!({}), now, out);
+            return;
+        }
+        match store.task_activity() {
+            Ok(activity) => self.task_activity(&activity, now, out),
+            Err(spawn_core::port::StoreError::Rejected(_)) => {}
+            Err(error) => lines.push(format!("alerts: task_activity: {error}")),
+        }
+    }
+
+    /// Escalate delivered tasks whose silence past real engine output (or
+    /// delivery, when no output arrived yet) meets `task_stalled_ms` (#63),
+    /// while clearing promptly on new engine output, task completion, or pause.
+    fn task_activity(&mut self, activity: &Value, now: i64, out: &mut Vec<Event>) {
+        let threshold = self.settings.task_stalled_ms;
+        let map = activity.as_object();
+        self.clear_stale_task_stalls(map, threshold, now, out);
+        let mut next_due: Option<i64> = None;
+        for (id_str, entry) in map.into_iter().flatten() {
+            if let Some(due) = self.evaluate_task_activity_entry(id_str, entry, threshold, now, out)
+            {
+                next_due = Some(next_due.map_or(due, |known| known.min(due)));
+            }
+        }
+        self.delivered_silence_due_ms = next_due;
+    }
+
+    fn clear_stale_task_stalls(
+        &self,
+        map: Option<&serde_json::Map<String, Value>>,
+        threshold: i64,
+        now: i64,
+        out: &mut Vec<Event>,
+    ) {
+        let stale_keys: Vec<String> = self
+            .known
+            .iter()
+            .filter(|(_, row)| row.open() && row.kind == "task_stalled")
+            .filter(|(_, row)| {
+                let id_str = row.subject.strip_prefix("task #").unwrap_or_default();
+                let missing = map.is_none_or(|entries| !entries.contains_key(id_str));
+                let disabled_or_paused = threshold <= 0
+                    || id_str
+                        .parse::<i64>()
+                        .ok()
+                        .and_then(|id| self.tasks.get(&id))
+                        .and_then(|task| self.missions.get(&task.mission))
+                        .is_some_and(|mission| mission.paused || mission.closed());
+                missing || disabled_or_paused
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale_keys {
+            out.push(Event::Clear {
+                key,
+                evidence: json!({"reading_ms": now, "reason": "task no longer delivered"}),
+            });
+        }
+    }
+
+    fn evaluate_task_activity_entry(
+        &self,
+        id_str: &str,
+        entry: &Value,
+        threshold: i64,
+        now: i64,
+        out: &mut Vec<Event>,
+    ) -> Option<i64> {
+        let id: i64 = id_str.parse().ok()?;
+        let task = self.tasks.get(&id);
+        if task
+            .and_then(|t| self.missions.get(&t.mission))
+            .is_some_and(|mission| mission.paused || mission.closed())
+        {
+            return None;
+        }
+        let since_ms = entry["since_ms"].as_i64()?;
+        let at_ms = entry["at_ms"].as_i64();
+        let last_event_at_ms = at_ms.unwrap_or(since_ms);
+        let silence_ms = now.saturating_sub(last_event_at_ms).max(0);
+        let tool_calls = entry["tool_calls"].as_i64().unwrap_or(0);
+        let event_name = entry["event"].as_str();
+        let subject = format!("task #{id}");
+        let open = self.open_keys("task_stalled", &subject);
+        let key = format!("task_stalled:{id}:{last_event_at_ms}");
+        if threshold <= 0 || silence_ms < threshold {
+            for open_key in open {
+                out.push(Event::Clear {
+                    key: open_key,
+                    evidence: json!({
+                        "task": id,
+                        "since_ms": since_ms,
+                        "last_event_at_ms": last_event_at_ms,
+                        "silence_ms": silence_ms,
+                        "last_event": event_name,
+                        "tool_calls": tool_calls,
+                        "reading_ms": now,
+                    }),
+                });
+            }
+            return (threshold > 0).then(|| last_event_at_ms.saturating_add(threshold));
+        }
+        for old_key in open.iter().filter(|existing| *existing != &key) {
+            out.push(Event::Clear {
+                key: old_key.clone(),
+                evidence: json!({"task": id, "last_event_at_ms": last_event_at_ms, "reading_ms": now}),
+            });
+        }
+        if !self.known.contains_key(&key) {
+            let mut evidence = json!({
+                "task": id,
+                "since_ms": since_ms,
+                "last_event_at_ms": last_event_at_ms,
+                "silence_ms": silence_ms,
+                "threshold_ms": threshold,
+                "last_event": event_name,
+                "tool_calls": tool_calls,
+                "command": restart_command(id),
+                "reading_ms": now,
+            });
+            if let Some(t) = task {
+                evidence["mission"] = json!(t.mission);
+                evidence["agent_id"] = json!(t.agent);
+            }
+            let text = if at_ms.is_some() {
+                format!(
+                    "task #{id} has been silent in delivered state for {} s (threshold {} s; \
+                     last output {} with {} tool calls); `{}` gives it a fresh execution",
+                    silence_ms / 1000,
+                    threshold / 1000,
+                    event_name.unwrap_or("event"),
+                    tool_calls,
+                    restart_command(id)
+                )
+            } else {
+                format!(
+                    "task #{id} has produced no engine output for {} s since delivery \
+                     (threshold {} s); `{}` gives it a fresh execution",
+                    silence_ms / 1000,
+                    threshold / 1000,
+                    restart_command(id)
+                )
+            };
+            out.push(Event::Fire {
+                key,
+                kind: "task_stalled",
+                subject,
+                evidence,
+                text,
+                notice: false,
+            });
+        }
+        None
     }
 
     /// A worker's task moved past its part ([`PART_DONE`]) by the record
@@ -4644,6 +4835,9 @@ times in a row)",
         if let Some(due) = self.messages_due {
             next = next.min(due);
         }
+        if let Some(due) = self.delivered_silence_due_ms {
+            next = next.min(due);
+        }
         self.next_bound_ms = (next != i64::MAX).then_some(next);
     }
 
@@ -5752,6 +5946,7 @@ mod tests {
             guardrail_clear_ms: 3_600_000,
             stuck_idle_dwell_ms: 60_000,
             stuck_quiet_dwell_ms: 180_000,
+            task_stalled_ms: 1_200_000,
         }
     }
 
@@ -13406,5 +13601,119 @@ execute function alerts_test_deploys_mid_start();
         let mut out = Vec::new();
         monitor.commands(&commands, &mut out);
         assert_eq!(fires(&out), ["command_failed:12", "command_failed:13"]);
+    }
+
+    #[test]
+    fn delivered_task_silence_escalates_past_threshold_and_clears_on_activity_or_completion() {
+        let mut m = monitor();
+        // Seed task #7 in delivered state under active mission #1.
+        let seeded = feed(
+            &mut m,
+            10,
+            1_000,
+            json!({
+                "type": "mission.created",
+                "id": 1,
+                "origin": "human",
+                "text": "Keep tasks observable",
+                "accept": "review"
+            }),
+        );
+        let ev_seeded = decided(&m, seeded);
+        commit(&mut m, &ev_seeded);
+        let assigned = feed(
+            &mut m,
+            11,
+            2_000,
+            json!({
+                "type": "task.assigned",
+                "id": 7,
+                "mission_id": 1,
+                "agent_id": "agent_worker_7",
+                "kind": "ephemeral",
+                "brief": "Run long corpus crawl"
+            }),
+        );
+        let ev_assigned = decided(&m, assigned);
+        commit(&mut m, &ev_assigned);
+        let delivered = feed(
+            &mut m,
+            12,
+            10_000,
+            json!({ "type": "task.delivered", "id": 7, "command_id": 1 }),
+        );
+        let ev_delivered = decided(&m, delivered);
+        commit(&mut m, &ev_delivered);
+
+        // Within threshold (10 minutes quiet since engine output): no alert fires, and due time is planned.
+        let t_ok = 10_000 + 10 * 60_000;
+        let quiet_activity = json!({
+            "7": { "since_ms": 10_000, "at_ms": 20_000, "event": "tool.completed", "tool_calls": 5 }
+        });
+        let mut out = Vec::new();
+        m.task_activity(&quiet_activity, t_ok, &mut out);
+        assert!(
+            out.is_empty(),
+            "quiet working within threshold must not alert: {out:?}"
+        );
+        m.plan(t_ok);
+        assert_eq!(m.delivered_silence_due_ms, Some(20_000 + 1_200_000));
+
+        // Past threshold (20 minutes silent): fires explicit task_stalled alert once.
+        let t_stalled = 20_000 + 1_200_000;
+        let mut out = Vec::new();
+        m.task_activity(&quiet_activity, t_stalled, &mut out);
+        let fired = decided(&m, out);
+        assert_eq!(fires(&fired), ["task_stalled:7:20000"]);
+        let Event::Fire { evidence, text, .. } = &fired[0] else {
+            panic!("expected Fire");
+        };
+        assert_eq!(evidence["task"], 7);
+        assert_eq!(evidence["silence_ms"], 1_200_000);
+        assert_eq!(evidence["command"], "spawn task restart --id 7");
+        assert!(text.contains("spawn task restart --id 7"), "{text}");
+        commit(&mut m, &fired);
+
+        // Idempotent while still silent.
+        let mut repeat = Vec::new();
+        m.task_activity(&quiet_activity, t_stalled + 30_000, &mut repeat);
+        assert!(decided(&m, repeat).is_empty());
+
+        // New engine output clears task_stalled immediately.
+        let t_active = t_stalled + 40_000;
+        let resumed_activity = json!({
+            "7": { "since_ms": 10_000, "at_ms": t_active - 1_000, "event": "tool.started", "tool_calls": 6 }
+        });
+        let mut recovered = Vec::new();
+        m.task_activity(&resumed_activity, t_active, &mut recovered);
+        let cleared = decided(&m, recovered);
+        assert_eq!(cleared.len(), 1);
+        assert!(matches!(&cleared[0], Event::Clear { key, .. } if key == "task_stalled:7:20000"));
+        commit(&mut m, &cleared);
+
+        // A later silence past threshold after recovery fires under the new event timestamp key.
+        let t_second_stall = (t_active - 1_000) + 1_200_000;
+        let mut second = Vec::new();
+        m.task_activity(&resumed_activity, t_second_stall, &mut second);
+        let second_fired = decided(&m, second);
+        assert_eq!(
+            fires(&second_fired),
+            [format!("task_stalled:7:{}", t_active - 1_000)]
+        );
+        commit(&mut m, &second_fired);
+
+        // Transitioning out of delivered clears any open task_stalled alert.
+        let reported = feed(
+            &mut m,
+            13,
+            t_second_stall + 1_000,
+            json!({ "type": "task.reported", "id": 7, "revision": 0, "report": "done" }),
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|ev| matches!(ev, Event::Clear { key, .. } if key == &format!("task_stalled:7:{}", t_active - 1_000))),
+            "{reported:?}"
+        );
     }
 }

@@ -2,8 +2,15 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { taskReviewCommands } from "../src/missions.ts";
-import { QUIET_MS, activityLine, normalizeActivity, spanWords } from "../src/taskActivity.ts";
+import { normalizeMissions, taskReviewCommands } from "../src/missions.ts";
+import {
+  QUIET_MS,
+  STALLED_MS,
+  activityLine,
+  normalizeActivity,
+  spanWords,
+  taskLiveness,
+} from "../src/taskActivity.ts";
 
 const MIN = 60_000;
 
@@ -96,4 +103,109 @@ test("TaskPanel wires Review & land CLI helper with copy action and zero extra A
   assert.ok(panel.includes("navigator.clipboard"));
   assert.equal(panel.includes("fetch("), false);
   assert.equal(panel.includes("/api/"), false);
+});
+
+test("taskLiveness distinguishes 实时推进, 已下发·静默, 静默运行, 疑似停滞, 待审核, and 已结束", () => {
+  const now = 2_000 * MIN;
+  const active = taskLiveness(
+    {
+      state: "delivered",
+      activity: { since_ms: now - 3 * MIN, at_ms: now - 30_000, event: "tool.completed", tool_calls: 4 },
+    },
+    true,
+    now,
+  );
+  assert.equal(active.state, "active_working");
+  assert.equal(active.label, "实时推进");
+  assert.equal(active.tone, "success");
+  assert.equal(active.pulse, true);
+
+  const briefedSilent = taskLiveness(
+    {
+      state: "delivered",
+      activity: { since_ms: now - 2 * MIN, at_ms: null, event: null, tool_calls: 0 },
+    },
+    true,
+    now,
+  );
+  assert.equal(briefedSilent.state, "briefed_quiet");
+  assert.equal(briefedSilent.label, "已下发·静默");
+  assert.equal(briefedSilent.tone, "info");
+  assert.equal(briefedSilent.pulse, false);
+
+  const quietRunning = taskLiveness(
+    {
+      state: "delivered",
+      activity: { since_ms: now - 30 * MIN, at_ms: now - QUIET_MS, event: "model.usage", tool_calls: 2 },
+    },
+    true,
+    now,
+  );
+  assert.equal(quietRunning.state, "briefed_quiet");
+  assert.equal(quietRunning.label, "静默运行");
+  assert.equal(quietRunning.tone, "info");
+  assert.equal(quietRunning.pulse, false);
+
+  const stalled = taskLiveness(
+    {
+      state: "delivered",
+      activity: { since_ms: now - 40 * MIN, at_ms: now - STALLED_MS, event: "tool.completed", tool_calls: 5 },
+    },
+    true,
+    now,
+  );
+  assert.equal(stalled.state, "stalled");
+  assert.equal(stalled.label, "疑似停滞");
+  assert.equal(stalled.tone, "warning");
+  assert.equal(stalled.pulse, false);
+
+  const waitingReview = taskLiveness({ state: "reported", activity: null }, true, now);
+  assert.equal(waitingReview.state, "waiting_review");
+  assert.equal(waitingReview.label, "待审核");
+  assert.equal(waitingReview.pulse, false);
+
+  const acceptedNoGate = taskLiveness({ state: "accepted", activity: null }, false, now);
+  assert.equal(acceptedNoGate.state, "terminal");
+  assert.equal(acceptedNoGate.label, "已结束");
+  assert.equal(acceptedNoGate.pulse, false);
+});
+
+test("normalizeMissions reads top-level generated_at_ms and task liveness fields while tolerating older payloads", () => {
+  const now = 5_000 * MIN;
+  const parsed = normalizeMissions({
+    generated_at_ms: now,
+    missions: [
+      {
+        id: 1,
+        text: "Track liveness",
+        tasks: [
+          {
+            id: 10,
+            state: "delivered",
+            last_event_at_ms: now - 15 * MIN,
+            silence_ms: 15 * MIN,
+            liveness_state: "briefed_quiet",
+            created_at_ms: now - 20 * MIN,
+          },
+          {
+            id: 11,
+            state: "assigned",
+            created_at_ms: now - 5 * MIN,
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.equal(parsed.generated_at_ms, now);
+  const [t10, t11] = parsed.missions[0].tasks;
+  assert.equal(t10.last_event_at_ms, now - 15 * MIN);
+  assert.equal(t10.silence_ms, 15 * MIN);
+  assert.equal(t10.liveness_state, "briefed_quiet");
+  assert.equal(t11.last_event_at_ms, null);
+  assert.equal(t11.silence_ms, null);
+  assert.equal(t11.liveness_state, null);
+
+  const legacy = normalizeMissions({ missions: [] });
+  assert.equal(legacy.generated_at_ms, null);
 });

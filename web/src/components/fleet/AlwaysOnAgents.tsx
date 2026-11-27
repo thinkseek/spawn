@@ -4,10 +4,10 @@ import type { FleetAgent } from "../../fleet";
 import { stateLabelUpper } from "../../fleet";
 import { absoluteTitle, formatDuration } from "../../format";
 import type { FleetContext, MissingAgent } from "../../ordering";
-import { heldTask, residentName } from "../../ordering";
+import { agentLiveness, heldTask, residentName } from "../../ordering";
 import { LiveBadge } from "../Terminal";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, LabeledId, MiddleId, cx, sinceText } from "../ui";
-import { FleetStateDot } from "./bits";
+import { AgentLivenessPill, FleetStateDot } from "./bits";
 import { DoingIcon, TaskCell, doingNow } from "./FleetBoard";
 
 /** How long an agent's current execution has run, while it runs. */
@@ -113,6 +113,7 @@ function AlwaysOnTile({
   const resident = residentName(agent, context);
   const held = heldTask(agent, context);
   const now = doingNow(agent);
+  const liveness = agentLiveness(agent);
   const uptime = uptimeMs(agent);
   const engine = agent.engine && agent.engine !== usualEngine ? agent.engine : null;
   return (
@@ -132,7 +133,7 @@ function AlwaysOnTile({
       )}
       <div className="flex min-w-0 items-start gap-2">
         <span className="mt-1.5 shrink-0">
-          <FleetStateDot state={agent.state} />
+          <FleetStateDot state={agent.state} pulse={liveness.pulse} />
         </span>
         {agent.label ? (
           <LabeledId
@@ -152,7 +153,7 @@ function AlwaysOnTile({
           </>
         )}
         <span className="ml-auto shrink-0">
-          <LiveBadge live={agent.live} />
+          {agent.live ? <AgentLivenessPill liveness={liveness} /> : <LiveBadge live={false} />}
         </span>
       </div>
 

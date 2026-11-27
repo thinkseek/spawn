@@ -39,9 +39,11 @@ import {
   missionClass,
   missionName,
   orderMissions,
+  snapshotFreshness,
   stateWords,
   taskTitle,
 } from "../../ordering";
+import { taskLiveness } from "../../taskActivity";
 import { Fact, SectionLabel } from "../fleet/bits";
 import { VerdictBadge, useNow } from "../rsi/Phase";
 import { TaskActivityLine } from "./TaskActivity";
@@ -75,6 +77,7 @@ const MODE_OPTIONS: ReadonlyArray<ViewOption<Mode>> = [
 export function MissionsView({ missions }: { missions: PollResult<Missions> }) {
   useNow(1_000);
   const data = missions.data;
+  const freshness = snapshotFreshness(data?.generated_at_ms ?? null);
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
@@ -87,9 +90,12 @@ export function MissionsView({ missions }: { missions: PollResult<Missions> }) {
       >
         <LiveStatus
           error={missions.error}
+          freshness={freshness.level}
           label={
             data
-              ? `${data.missions.length} mission${data.missions.length === 1 ? "" : "s"}`
+              ? freshness.level === "fresh"
+                ? `${data.missions.length} mission${data.missions.length === 1 ? "" : "s"}`
+                : `${freshness.label} · ${data.missions.length} mission${data.missions.length === 1 ? "" : "s"}`
               : "Connecting"
           }
         />
@@ -737,7 +743,16 @@ function TaskRow({
       ) : (
         <Pipeline task={task} steps={pipelineOf(mission)} />
       )}
-      <TaskActivityLine activity={task.activity} now={Date.now()} />
+      {(() => {
+        const now = Date.now();
+        return (
+          <TaskActivityLine
+            activity={task.activity}
+            liveness={taskLiveness(task, Boolean(mission.gate), now)}
+            now={now}
+          />
+        );
+      })()}
 
       {(task.objective !== null ||
         task.candidate ||

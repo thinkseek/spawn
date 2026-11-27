@@ -49,11 +49,14 @@ export function stateLabel(state: SessionState): string {
 export function StateDot({
   state,
   size = "md",
+  pulse,
 }: {
   state: SessionState;
   size?: "sm" | "md";
+  pulse?: boolean;
 }) {
   const tone = TONE[state];
+  const shouldPulse = pulse ?? tone.pulse;
   return (
     <span
       aria-hidden="true"
@@ -61,7 +64,7 @@ export function StateDot({
         "inline-block shrink-0 rounded-full",
         size === "sm" ? "size-1.5" : "size-2",
         tone.dot,
-        tone.pulse && "animate-spawn-pulse",
+        shouldPulse && "animate-spawn-pulse",
       )}
     />
   );
@@ -70,9 +73,11 @@ export function StateDot({
 export function StateBadge({
   state,
   size = "sm",
+  pulse,
 }: {
   state: SessionState;
   size?: "sm" | "md";
+  pulse?: boolean;
 }) {
   const tone = TONE[state];
   return (
@@ -85,7 +90,7 @@ export function StateBadge({
         tone.badge,
       )}
     >
-      <StateDot state={state} size={size === "md" ? "md" : "sm"} />
+      <StateDot state={state} size={size === "md" ? "md" : "sm"} pulse={pulse} />
       {tone.label}
     </span>
   );

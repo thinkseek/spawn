@@ -1339,6 +1339,7 @@ pub(crate) fn next_due(work: &Work, rows: &[Facts], now_ms: i64) -> Option<i64> 
     for task in &work.tasks {
         if !matches!(task.state, TaskState::Assigned | TaskState::Revise)
             || !next.contains(&task.id)
+            || duplicate_in_flight(work, task).is_some()
         {
             continue;
         }
@@ -1661,6 +1662,15 @@ pub(crate) fn delivery_status(
     } else {
         format!("attempts: {}", parts.join("; "))
     };
+    if let Some(existing) = duplicate_in_flight(work, task) {
+        return DeliveryStatus {
+            given_up: true,
+            line: format!(
+                "{tried}; held: duplicate brief already delivered and in flight on task #{} ({})",
+                existing.id, existing.session_id
+            ),
+        };
+    }
     let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
     let mut given_up = false;
     let attempts = found.map_or(Attempts::None, |facts| attempts(&work.waits, task, facts));
@@ -1797,7 +1807,10 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
         let found = facts.get(session).copied();
         match task.state {
             TaskState::Assigned | TaskState::Revise => {
-                if !next.contains(&task.id) || reassign_held(task, &facts) {
+                if !next.contains(&task.id)
+                    || reassign_held(task, &facts)
+                    || duplicate_in_flight(work, task).is_some()
+                {
                     continue;
                 }
                 let attempts =
@@ -2274,6 +2287,38 @@ fn resume_prompt(task: &TaskRow) -> String {
     }
 }
 
+/// Collapse whitespace so formatting differences do not bypass in-flight
+/// duplicate brief detection (#63).
+fn normalize_brief(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// If a waiting task in `Assigned` state duplicates the normalized brief of
+/// another already `Delivered` task in the same mission, return that earlier
+/// in-flight task so delivery is held rather than dispatched blindly (#63).
+/// Explicit reassignments (`reassign_of`), reissues (`reissue_of`), and
+/// revisions (`Revise`) are never held here.
+pub(crate) fn duplicate_in_flight<'a>(work: &'a Work, task: &TaskRow) -> Option<&'a TaskRow> {
+    if task.state != TaskState::Assigned
+        || task.is_revision()
+        || task.reassign_of.is_some()
+        || task.reissue_of.is_some()
+    {
+        return None;
+    }
+    let wanted = normalize_brief(&task.brief);
+    if wanted.is_empty() {
+        return None;
+    }
+    work.tasks.iter().find(|other| {
+        other.id != task.id
+            && other.mission_id == task.mission_id
+            && other.state == TaskState::Delivered
+            && other.reassigned_as != Some(task.id)
+            && normalize_brief(&other.brief) == wanted
+    })
+}
+
 /// `text` on one line, cut to `limit` characters.
 pub(crate) fn one_line(text: &str, limit: usize) -> String {
     let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2348,6 +2393,24 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
         });
     }
     items.extend(engine_unavailable(work, rows));
+    for task in &work.tasks {
+        if task.state == TaskState::Assigned
+            && !work.paused(task.mission_id)
+            && let Some(existing) = duplicate_in_flight(work, task)
+        {
+            items.push(Escalation {
+                session_id: task.session_id.clone(),
+                id: format!("duplicate-brief-{}-{}", task.id, existing.id),
+                why: Why::DeliveryFailed,
+                line: format!(
+                    "task #{} (mission #{}) held: duplicate brief is already delivered and in \
+                     flight on task #{} ({}); inspect task #{} or cancel the duplicate",
+                    task.id, task.mission_id, existing.id, existing.session_id, existing.id
+                ),
+                since_ms: None,
+            });
+        }
+    }
     for (task, facts, attempts) in waiting_attempts(work, rows) {
         let Attempts::Failed { why, spent, .. } = attempts else {
             continue;
@@ -6341,5 +6404,79 @@ PENDING_ISSUES\n";
         let busy_diag =
             super::not_ready_streak_diagnostic("session_resident_core", &busy_refs).expect("diag");
         assert!(busy_diag.contains("ready_pane_stall=false"), "{busy_diag}");
+    }
+
+    #[test]
+    fn duplicate_in_flight_brief_holds_redispatch_and_surfaces_collision() {
+        let mut active = task(10, TaskState::Delivered, "ephemeral");
+        active.agent_id = "agent_worker_10".to_string();
+        active.session_id = "session_worker_10".to_string();
+        active.resident = None;
+        active.charter = None;
+        active.brief = "Audit arxiv\n  corpus & judge".to_string();
+
+        let mut dup = task(11, TaskState::Assigned, "ephemeral");
+        dup.agent_id = "agent_worker_11".to_string();
+        dup.session_id = "session_worker_11".to_string();
+        dup.resident = None;
+        dup.charter = None;
+        dup.brief = "  Audit   arxiv corpus & judge  ".to_string();
+
+        let mut distinct = task(12, TaskState::Assigned, "ephemeral");
+        distinct.agent_id = "agent_worker_12".to_string();
+        distinct.session_id = "session_worker_12".to_string();
+        distinct.resident = None;
+        distinct.charter = None;
+        distinct.brief = "Different task brief".to_string();
+
+        let mut other_mission = task(13, TaskState::Assigned, "ephemeral");
+        other_mission.mission_id = 2;
+        other_mission.agent_id = "agent_worker_13".to_string();
+        other_mission.session_id = "session_worker_13".to_string();
+        other_mission.resident = None;
+        other_mission.charter = None;
+        other_mission.brief = active.brief.clone();
+
+        let work = with(
+            vec![
+                active.clone(),
+                dup.clone(),
+                distinct.clone(),
+                other_mission.clone(),
+            ],
+            None,
+        );
+        let built = orders(&work, &[]);
+        let dispatched_tasks: Vec<i64> = built.iter().filter_map(|order| order.task).collect();
+        assert!(
+            !dispatched_tasks.contains(&11),
+            "duplicate brief must not be dispatched while #10 is delivered: {built:?}"
+        );
+        assert!(dispatched_tasks.contains(&12));
+        assert!(dispatched_tasks.contains(&13));
+
+        let status = super::delivery_status(&work, &dup, None, 1_000);
+        assert!(status.given_up);
+        assert!(status.line.contains("task #10"), "{}", status.line);
+
+        let escalations = news_items(&work, &[]);
+        assert!(
+            escalations
+                .iter()
+                .any(|item| item.id == "duplicate-brief-11-10" && item.why == Why::DeliveryFailed),
+            "{escalations:?}"
+        );
+
+        // Reassign and finished states are never blocked.
+        let mut reassign = dup.clone();
+        reassign.reassign_of = Some(10);
+        assert!(super::duplicate_in_flight(&work, &reassign).is_none());
+
+        let mut done = active;
+        done.state = TaskState::Reported;
+        let resolved_work = with(vec![done, dup.clone()], None);
+        assert!(super::duplicate_in_flight(&resolved_work, &dup).is_none());
+        let resolved_orders = orders(&resolved_work, &[]);
+        assert!(resolved_orders.iter().any(|order| order.task == Some(11)));
     }
 }
