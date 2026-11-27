@@ -3943,6 +3943,53 @@ mod tests {
         );
     }
 
+    fn assert_verify_rejects_corrupt_rows(
+        base_url: &str,
+        scratch_db: &str,
+        db_client: &mut postgres::Client,
+        agent: &str,
+        session: &str,
+    ) -> Result<(), String> {
+        // Truly corrupt rows fail closed: (a) known EventKind with corrupt detail,
+        // (b) invalid-format name, and (c) non-object JSON kind.
+        for (seq, kind_sql, label) in [
+            (
+                4_i64,
+                "{\"name\":\"message.typed\",\"detail\":{\"command_id\":\"not-a-number\"}}",
+                "known event with corrupt detail",
+            ),
+            (
+                5_i64,
+                "{\"name\":\"BAD NAME!\",\"detail\":{}}",
+                "invalid event name",
+            ),
+            (6_i64, "42", "non-object JSON kind"),
+        ] {
+            db_client
+                .execute(
+                    "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms)
+                     values ($1, $2, 'claude', $3::text::jsonb, $4, 2000)",
+                    &[&agent, &session, &kind_sql, &seq],
+                )
+                .map_err(|e| format!("insert corrupt ({label}): {e}"))?;
+            let check = super::verify_restored_events(base_url, scratch_db);
+            db_client
+                .execute(
+                    "delete from spawn_events where session_id = $1 and session_seq = $2",
+                    &[&session, &seq],
+                )
+                .map_err(|e| format!("cleanup corrupt ({label}): {e}"))?;
+            match check {
+                Ok(n) => {
+                    return Err(format!("unexpected success decoding {label} row ({n})"));
+                }
+                Err(msg) if msg.contains("decode restored spawn_events") => {}
+                Err(msg) => return Err(format!("unexpected error for {label}: {msg}")),
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn verify_restored_events_allows_retired_rows_and_rejects_corrupt_rows() {
         let Ok(base_url) = std::env::var("SPAWN_TEST_DATABASE_URL") else {
@@ -3986,29 +4033,33 @@ mod tests {
             .map_err(|e| format!("append: {e}"))?;
             let mut db_client = postgres::Client::connect(&scratch_url, postgres::NoTls)
                 .map_err(|e| e.to_string())?;
-            db_client
-                .execute(
-                    "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms)
-                     values ($1, $2, 'claude', '{\"name\":\"notice.received\"}'::jsonb, 2, 2000)",
-                    &[&agent.as_str(), &session.as_str()],
-                )
-                .map_err(|e| format!("insert retired: {e}"))?;
+            for (seq, kind_sql, label) in [
+                (2_i64, "{\"name\":\"notice.received\"}", "retired"),
+                (
+                    3_i64,
+                    "{\"name\":\"future.v99_event\",\"detail\":{}}",
+                    "future unknown",
+                ),
+            ] {
+                db_client
+                    .execute(
+                        "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms)
+                         values ($1, $2, 'claude', $3::text::jsonb, $4, 2000)",
+                        &[&agent.as_str(), &session.as_str(), &kind_sql, &seq],
+                    )
+                    .map_err(|e| format!("insert {label}: {e}"))?;
+            }
             let decoded = super::verify_restored_events(&base_url, &scratch_db)?;
             if decoded != 1 {
                 return Err(format!("expected 1 active decoded row, got {decoded}"));
             }
-            db_client
-                .execute(
-                    "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms)
-                     values ($1, $2, 'claude', '{\"name\":\"bogus.unknown\",\"detail\":{}}'::jsonb, 3, 2000)",
-                    &[&agent.as_str(), &session.as_str()],
-                )
-                .map_err(|e| format!("insert bogus: {e}"))?;
-            match super::verify_restored_events(&base_url, &scratch_db) {
-                Ok(n) => Err(format!("unexpected success decoding bogus row ({n})")),
-                Err(msg) if msg.contains("decode restored spawn_events") => Ok(()),
-                Err(msg) => Err(format!("unexpected error: {msg}")),
-            }
+            assert_verify_rejects_corrupt_rows(
+                &base_url,
+                &scratch_db,
+                &mut db_client,
+                agent.as_str(),
+                session.as_str(),
+            )
         })();
         drop(scoped);
         let _ = admin.batch_execute(&format!(

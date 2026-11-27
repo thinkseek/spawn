@@ -802,8 +802,9 @@ pub const ACTIVE_EVENT_NAMES: &[&str] = &[
 ];
 
 impl EventKind {
-    /// Stable dotted wire name.
-    pub fn name(&self) -> &'static str {
+    /// Compile-time exhaustive mapping from every [`EventKind`] variant to its
+    /// stable dotted wire name.
+    pub const fn wire_name(&self) -> &'static str {
         match self {
             Self::NativeSessionStarted { .. } => "session.native_started",
             Self::SessionLinked { .. } => "session.linked",
@@ -837,6 +838,25 @@ impl EventKind {
             Self::ControlRecorded { .. } => "control.recorded",
             Self::NodeRecorded { .. } => "node.recorded",
             Self::GradingRecorded { .. } => "grading.recorded",
+        }
+    }
+
+    /// Stable dotted wire name.
+    pub const fn name(&self) -> &'static str {
+        self.wire_name()
+    }
+
+    /// Whether `name` is one of the active [`EventKind`] wire names in this build,
+    /// backed by [`EventKind`]'s serde deserializer when omitted from [`ACTIVE_EVENT_NAMES`].
+    pub fn is_known_name(name: &str) -> bool {
+        if ACTIVE_EVENT_NAMES.contains(&name) {
+            return true;
+        }
+        match serde_json::from_value::<Self>(serde_json::json!({ "name": name })) {
+            Ok(_) => true,
+            Err(err) => !err
+                .to_string()
+                .starts_with(&format!("unknown variant `{name}`, ")),
         }
     }
 
@@ -981,6 +1001,280 @@ mod tests {
             assert!(
                 serde_json::from_value::<EventKind>(wire).is_err(),
                 "retired event {name} must not decode as EventKind"
+            );
+        }
+    }
+
+    fn session_message_and_tool_samples() -> Vec<EventKind> {
+        use crate::id::{CommandId, SessionId};
+
+        vec![
+            EventKind::NativeSessionStarted {
+                engine: super::ENGINE.to_string(),
+                native_session_id: "native_1".to_string(),
+                transcript_path: None,
+                engine_version: None,
+            },
+            EventKind::SessionLinked {
+                parent_session_id: SessionId::new("session_parent").expect("parent"),
+            },
+            EventKind::MessageReceived,
+            EventKind::MessageTyped {
+                command_id: CommandId(1),
+            },
+            EventKind::MessageTaken {
+                command_id: CommandId(1),
+            },
+            EventKind::MessageActed {
+                command_id: CommandId(1),
+                outcome: "done".to_string(),
+                why: None,
+            },
+            EventKind::ToolStarted {
+                tool_name: "Bash".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                summary: None,
+                summary_whole: false,
+            },
+            EventKind::ToolCompleted {
+                tool_use_id: "tool_1".to_string(),
+                duration_ms: Some(5),
+            },
+            EventKind::ToolFailed {
+                tool_use_id: "tool_1".to_string(),
+                error: "err".to_string(),
+            },
+        ]
+    }
+
+    fn turn_job_and_execution_samples() -> Vec<EventKind> {
+        use super::{CommandStep, ENGINE, EndCause, Fork, JobEnd, LaunchSummary, ModelProfile};
+        use crate::id::{CommandId, CommitId, WorkspaceId};
+        use crate::port::TerminalServer;
+
+        let commit = CommitId::new("0123456789abcdef0123456789abcdef01234567").expect("commit");
+        vec![
+            EventKind::TurnStopped {
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+            },
+            EventKind::ModelUsage {
+                message_id: "msg_1".to_string(),
+                model: "claude".to_string(),
+                at_ms: 1000,
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_write_tokens: 0,
+                cache_read_tokens: 0,
+            },
+            EventKind::TurnFailed {
+                error: "err".to_string(),
+                status: None,
+                error_kind: None,
+            },
+            EventKind::JobStarted {
+                job_id: "job_1".to_string(),
+                kind: BackgroundJobKind::Bash,
+            },
+            EventKind::JobEnded {
+                job_id: "job_1".to_string(),
+                how: JobEnd::Completed,
+            },
+            EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace: WorkspaceId::new("1:/workspaces/1").expect("ws"),
+                command_id: CommandId(1),
+                fork: Some(Fork {
+                    from: "main".to_string(),
+                    commit,
+                }),
+                model: ModelProfile::Default,
+                transcript_from: None,
+                launch: Some(LaunchSummary::default()),
+            },
+            EventKind::TerminalStarted {
+                server: TerminalServer {
+                    pid: 1,
+                    started_at_ms: 1000,
+                },
+            },
+            EventKind::ExecutionEnded {
+                cause: EndCause::Exited,
+                exit_code: Some(0),
+                signal: None,
+                evidence: None,
+            },
+            EventKind::ExecutionUnmounting,
+            EventKind::CommandStepped {
+                command_id: CommandId(1),
+                step: CommandStep::Typing,
+                workspace: None,
+            },
+            EventKind::ExecutionEndStalled {
+                cause: EndCause::Lost,
+                exit_code: None,
+                failures: 1,
+                error: "stalled".to_string(),
+            },
+        ]
+    }
+
+    fn artifact_command_and_control_samples() -> Vec<EventKind> {
+        use super::{ArtifactRef, CheckpointReason, SessionSeq};
+        use crate::id::{BranchName, CommandId, CommitId};
+        use crate::observation::{Confidence, Observation, SemanticState};
+        use crate::screen::ScreenState;
+
+        let commit = CommitId::new("0123456789abcdef0123456789abcdef01234567").expect("commit");
+        let branch = BranchName::new("agent_test").expect("branch");
+        let artifact = ArtifactRef {
+            project: "proj".to_string(),
+            branch,
+            commit: commit.clone(),
+        };
+        let observation = Observation {
+            state: SemanticState::Working,
+            reason: None,
+            based_on_seq: SessionSeq(1),
+            confidence: Confidence::ZERO,
+            judge: "rules".to_string(),
+            ambiguity: None,
+            rules_state: None,
+            probabilities: None,
+            needs_human: None,
+            stuck: None,
+            latency_ms: None,
+            attention: false,
+            evidence: None,
+            attention_reason: None,
+            human_question: None,
+            fingerprint: None,
+        };
+        vec![
+            EventKind::ArtifactCommitted {
+                reason: CheckpointReason::TurnStopped,
+                artifact: artifact.clone(),
+                files: Vec::new(),
+            },
+            EventKind::ArtifactBranchRecreated {
+                artifact,
+                parent: Some(commit),
+            },
+            EventKind::ArchiveFailed {
+                native: "native_1".to_string(),
+                reason: "err".to_string(),
+            },
+            EventKind::ArchiveResumed {
+                native: "native_1".to_string(),
+                copied: 10,
+            },
+            EventKind::MergeConflicted {
+                files: vec!["a.rs".to_string()],
+                marked: false,
+            },
+            EventKind::CommandAccepted {
+                command_id: CommandId(1),
+            },
+            EventKind::CommandFinished {
+                command_id: CommandId(1),
+                succeeded: true,
+                error: None,
+            },
+            EventKind::ScreenObserved {
+                state: ScreenState::Ready,
+                evidence: ">".to_string(),
+            },
+            EventKind::ObservationRecorded { observation },
+            EventKind::ControlRecorded {
+                record: json!({"type": "mission.added"}),
+            },
+            EventKind::NodeRecorded {
+                record: json!({"type": "node.heartbeat"}),
+            },
+            EventKind::GradingRecorded {
+                record: json!({"type": "preset.created"}),
+            },
+        ]
+    }
+
+    fn all_event_kind_samples() -> Vec<EventKind> {
+        let mut samples = session_message_and_tool_samples();
+        samples.extend(turn_job_and_execution_samples());
+        samples.extend(artifact_command_and_control_samples());
+        samples
+    }
+
+    fn serde_variant_names_from_probe() -> std::collections::BTreeSet<String> {
+        let err = serde_json::from_value::<EventKind>(json!({ "name": "__variant_probe__" }))
+            .expect_err("probe name must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("unknown variant `__variant_probe__`, expected one of "),
+            "unexpected serde unknown variant format: {msg}"
+        );
+        let (_, list) = msg
+            .split_once("expected one of ")
+            .expect("expected one of list");
+        let mut names = std::collections::BTreeSet::new();
+        let mut rest = list;
+        while let Some((_, after_open)) = rest.split_once('`') {
+            let Some((variant, after_close)) = after_open.split_once('`') else {
+                break;
+            };
+            names.insert(variant.to_string());
+            rest = after_close;
+        }
+        names
+    }
+
+    #[test]
+    fn is_known_name_matches_every_event_kind_variant_and_rejects_unknown() {
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in all_event_kind_samples() {
+            let wire_name = kind.wire_name();
+            assert_eq!(kind.name(), wire_name);
+            let wire = serde_json::to_value(&kind).expect("serialize EventKind");
+            assert_eq!(wire["name"].as_str(), Some(wire_name));
+            let decoded: EventKind = serde_json::from_value(wire).expect("deserialize EventKind");
+            assert_eq!(decoded.wire_name(), wire_name);
+            assert!(
+                EventKind::is_known_name(wire_name),
+                "is_known_name must accept active event {wire_name}"
+            );
+            seen.insert(wire_name);
+        }
+        let active: std::collections::BTreeSet<&str> =
+            super::ACTIVE_EVENT_NAMES.iter().copied().collect();
+        let serde_owned = serde_variant_names_from_probe();
+        let serde_names: std::collections::BTreeSet<&str> =
+            serde_owned.iter().map(String::as_str).collect();
+        assert_eq!(
+            serde_names, active,
+            "ACTIVE_EVENT_NAMES must stay identical to EventKind's serde variants"
+        );
+        assert_eq!(
+            seen, active,
+            "all_event_kind_samples must cover every EventKind variant"
+        );
+        for unknown in [
+            "future.v99_event",
+            "invented.corrupt_event",
+            "bogus.unknown",
+            "session.native_ended",
+            "notice.typed",
+            "notice.received",
+            "notification.received",
+            "",
+            "message",
+            "Message.Received",
+            "message..received",
+            ".message.received",
+            "message.received.",
+            "BAD NAME!",
+        ] {
+            assert!(
+                !EventKind::is_known_name(unknown),
+                "is_known_name must reject unknown/invalid event {unknown:?}"
             );
         }
     }

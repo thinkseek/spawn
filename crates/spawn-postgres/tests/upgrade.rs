@@ -11,6 +11,9 @@
 //! A real database is required (`SPAWN_TEST_DATABASE_URL`).
 
 use postgres::Client;
+use spawn_core::event::{ENGINE, EventKind, GlobalPosition, ModelProfile, NewEvent, Source};
+use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
+use spawn_core::port::{EventLog, StoreError};
 
 mod common;
 use common::{admin, first_shapes, migrate_warnings, store, url};
@@ -234,5 +237,195 @@ fn the_retired_rsi_tables_are_dropped_only_when_nothing_in_them_is_lost() {
     assert!(migrate_warnings(&schema).is_empty());
     for table in ["rsi_attempts", "rsi_iterations", "rsi_state"] {
         assert!(!exists(&mut client, table), "{table} is dropped");
+    }
+}
+
+fn insert_raw_kind_json(
+    client: &mut Client,
+    agent: &AgentId,
+    session: &SessionId,
+    kind_json: &str,
+    seq: i64,
+) -> i64 {
+    client
+        .query_one(
+            "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms)
+             values ($1, $2, 'claude', $3::text::jsonb, $4, 2000)
+             returning id",
+            &[&agent.as_str(), &session.as_str(), &kind_json, &seq],
+        )
+        .expect("insert raw spawn_events row")
+        .get(0)
+}
+
+#[test]
+fn unknown_future_event_kind_is_skipped_without_stalling_global_reads() {
+    let (pg, schema) = store("upgrade_unknown_event_kind");
+    let mut client = admin(&schema);
+    let agent = AgentId::new("agent_upgrade_unknown").expect("agent");
+    let session = SessionId::new("session_upgrade_unknown").expect("session");
+
+    let first = pg
+        .append(NewEvent {
+            agent_id: agent.clone(),
+            session_id: session.clone(),
+            execution_id: None,
+            source: Source::Claude,
+            source_event_id: Some("known-1".to_string()),
+            kind: EventKind::MessageReceived,
+        })
+        .expect("append known 1");
+
+    // Newer-release dotted event kinds stored before a rollback.
+    insert_raw_kind_json(
+        &mut client,
+        &agent,
+        &session,
+        "{\"name\":\"future.v99_event\",\"detail\":{\"phase\":1,\"nested\":{\"ok\":true}}}",
+        2,
+    );
+    insert_raw_kind_json(
+        &mut client,
+        &agent,
+        &session,
+        "{\"name\":\"future.rollback_unit\"}",
+        3,
+    );
+
+    pg.append(NewEvent {
+        agent_id: agent.clone(),
+        session_id: session,
+        execution_id: None,
+        source: Source::Claude,
+        source_event_id: Some("known-2".to_string()),
+        kind: EventKind::TurnStopped {
+            input_tokens: Some(12),
+            output_tokens: Some(4),
+        },
+    })
+    .expect("append known 2");
+
+    // Batch fill continues past skipped unknown rows without losing known records.
+    let batch = pg
+        .read_global(GlobalPosition(0), 2)
+        .expect("read_global skips unknown dotted events");
+    let names: Vec<&str> = batch
+        .iter()
+        .map(|record| record.event.kind.name())
+        .collect();
+    assert_eq!(names, ["message.received", "turn.stopped"]);
+
+    let tail = pg
+        .read_global(first.record.position, 10)
+        .expect("read_global from cursor skips intervening unknown rows");
+    let tail_names: Vec<&str> = tail.iter().map(|record| record.event.kind.name()).collect();
+    assert_eq!(tail_names, ["turn.stopped"]);
+
+    let raw_count: i64 = client
+        .query_one("select count(*) from spawn_events", &[])
+        .expect("count rows")
+        .get(0);
+    assert_eq!(raw_count, 4);
+
+    // A trailing unknown dotted event on an active session does not break `open_execution`.
+    let exec_agent = AgentId::new("agent_upgrade_open_exec").expect("exec agent");
+    let exec_session = SessionId::new("session_upgrade_open_exec").expect("exec session");
+    pg.append(NewEvent {
+        agent_id: exec_agent.clone(),
+        session_id: exec_session.clone(),
+        execution_id: Some(ExecutionId::new("exec_upgrade_open").expect("exec id")),
+        source: Source::Bridge,
+        source_event_id: Some("start-1".to_string()),
+        kind: EventKind::ExecutionStarted {
+            engine: ENGINE.to_string(),
+            workspace: WorkspaceId::new("1:/workspaces/1").expect("ws"),
+            command_id: CommandId(1),
+            fork: None,
+            model: ModelProfile::Default,
+            transcript_from: None,
+            launch: None,
+        },
+    })
+    .expect("append execution.started");
+    insert_raw_kind_json(
+        &mut client,
+        &exec_agent,
+        &exec_session,
+        "{\"name\":\"future.trailing_note\",\"detail\":{\"step\":1}}",
+        2,
+    );
+    let open = pg
+        .open_execution(&exec_session)
+        .expect("open_execution stays unaffected")
+        .expect("open execution remains visible");
+    assert_eq!(open.event.kind.name(), "execution.started");
+}
+
+#[test]
+fn corrupt_event_kind_rows_fail_closed_with_corrupt_error() {
+    let (pg, schema) = store("upgrade_corrupt_event_kind");
+    let mut client = admin(&schema);
+    let agent = AgentId::new("agent_upgrade_corrupt").expect("agent");
+    let session = SessionId::new("session_upgrade_corrupt").expect("session");
+
+    // Syntactically malformed JSON is refused by PostgreSQL's `jsonb` boundary itself.
+    let malformed = client.execute(
+        "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms)
+         values ($1, $2, 'claude', '{not-json'::jsonb, 1, 2000)",
+        &[&agent.as_str(), &session.as_str()],
+    );
+    assert!(
+        malformed.is_err(),
+        "PostgreSQL jsonb must reject invalid JSON text"
+    );
+
+    let cases = [
+        (
+            "known event with wrong field type",
+            "{\"name\":\"message.typed\",\"detail\":{\"command_id\":\"not-a-number\"}}",
+        ),
+        (
+            "known event missing required detail fields",
+            "{\"name\":\"tool.started\",\"detail\":{}}",
+        ),
+        (
+            "known event grading.recorded missing record detail",
+            "{\"name\":\"grading.recorded\",\"detail\":{}}",
+        ),
+        (
+            "known event with invalid inner enum variant",
+            "{\"name\":\"job.started\",\"detail\":{\"job_id\":\"j1\",\"kind\":\"bogus_kind\"}}",
+        ),
+        (
+            "known event with inner enum variant matching outer name",
+            "{\"name\":\"job.started\",\"detail\":{\"job_id\":\"j1\",\"kind\":\"job.started\"}}",
+        ),
+        ("non-object number", "42"),
+        ("non-object array", "[\"message.received\"]"),
+        ("non-object string", "\"message.received\""),
+        ("non-object boolean", "true"),
+        ("non-object null", "null"),
+        ("missing name field", "{\"detail\":{}}"),
+        ("non-string name field", "{\"name\":123,\"detail\":{}}"),
+        ("null name field", "{\"name\":null}"),
+        ("empty name", "{\"name\":\"\"}"),
+        ("name without dot", "{\"name\":\"nodot\"}"),
+        ("leading dot name", "{\"name\":\".leading\"}"),
+        ("trailing dot name", "{\"name\":\"trailing.\"}"),
+        ("double dot name", "{\"name\":\"a..b\"}"),
+        ("uppercase name", "{\"name\":\"Future.Event\"}"),
+        ("space/punctuation name", "{\"name\":\"BAD NAME!\"}"),
+    ];
+    for (idx, (label, kind_json)) in cases.iter().enumerate() {
+        let seq = 10 + i64::try_from(idx).expect("seq");
+        let id = insert_raw_kind_json(&mut client, &agent, &session, kind_json, seq);
+        let decoded = pg.read_global(GlobalPosition(0), 20);
+        client
+            .execute("delete from spawn_events where id = $1", &[&id])
+            .expect("delete corrupt row");
+        assert!(
+            matches!(decoded, Err(StoreError::Corrupt(_))),
+            "{label} ({kind_json}) must return StoreError::Corrupt, got {decoded:?}"
+        );
     }
 }
