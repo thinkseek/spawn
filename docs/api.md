@@ -324,6 +324,44 @@ supervisor digests and `/api/alerts` notices (`notice: true`):
   `source_main_advanced` notices feed `Why::MainAdvanced` in supervisor digests,
   deduplicated per notice via `missions main-advanced-<id>` tags.
 
+## Fleet storage breakdown & shared build caches (`GET /api/fleet` `health.storage`, PR #180 / PR #184)
+
+`GET /api/fleet` includes `health.storage` computed incrementally inside the
+600 s `READ_EVERY_MS` cache window ([`crates/spawn-cli/src/storage.rs`](../crates/spawn-cli/src/storage.rs),
+[`crates/spawn-cli/src/serve/storage.rs`](../crates/spawn-cli/src/serve/storage.rs); see also
+[storage.md](./storage.md)):
+
+- **`workspaces` (`{path, bytes}` or `null`):** Regular-file apparent bytes
+  under `SPAWN_WORKSPACE_ROOT`, excluding `.transcripts`,
+  `.transcripts-progress`, the opt-in shared build cache directory `.caches`,
+  `.spawn-workspace-backend`, and `test-schemas-seen.json` (plus `.partial`).
+- **`workspace_breakdown` (or `null` when no workspace root is configured):**
+  Read-only, symlink-safe per-workspace classification across all non-`.`
+  directories under the workspace root, bounded globally by
+  `WORKSPACE_BREAKDOWN_MAX_ENTRIES = 200_000` directory entries:
+  - Shape:
+    `{workspace_count, total_bytes, repo_bytes, git_bytes, build_cache_bytes, files, truncated, workspaces}`
+    where each entry in `workspaces` has
+    `{name, total_bytes, repo_bytes, git_bytes, build_cache_bytes, files, truncated}`.
+  - Classification rules: `.git` directories and regular files (such as
+    worktree `.git` pointer files) map to `git_bytes`; directories named
+    `target`, `.zig-cache`, `zig-out`, `node_modules`, `.venv`, `__pycache__`,
+    `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.cache`, `dist`, or `build`,
+    or containing a regular `CACHEDIR.TAG` file matching the standard
+    `Signature: 8a477f597d28d172789f06886806bc55` header (opened
+    `O_NOFOLLOW | O_NONBLOCK`, never following symlinks or FIFOs), map to
+    `build_cache_bytes`; remaining regular files map to `repo_bytes`.
+  - Ordering and cap: `workspaces` is sorted by `total_bytes` descending (ties
+    broken ascending by `name`) and truncated to top `32`
+    (`WORKSPACE_BREAKDOWN_TOP_LIMIT`), while top-level totals still cover all
+    `workspace_count` workspaces (setting `truncated: true` if the global entry
+    bound was hit).
+- **`shared_build_cache` (or `null`):** Reports `{path, bytes, files, enabled}`
+  when shared host build caches are configured (`enabled: true`), or when a
+  real non-symlink `<workspace_root>/.caches` directory remains on disk
+  (`enabled: false`). Apparent regular-file sizes are summed without following
+  symlinks.
+
 ## Operator CLI, preflight diagnostics & terminal backend
 
 - **`spawn status [--json]`** (PR #167): Single-command overview of active fleet sessions, open tasks, and uncleared alerts. Prints a human-readable table by default, or `{schema_version: 1, generated_at_ms, summary: {sessions_total, sessions_live, sessions_attention, open_tasks, open_alerts}, sessions, tasks, alerts}` with `--json`.
@@ -331,4 +369,5 @@ supervisor digests and `/api/alerts` notices (`notice: true`):
 - **`spawn submit` smart defaults** (PR #167): `spawn submit --agent <agent id> [--session <session id>] [--key <idempotency key>] --action <command action JSON> [--principal <name>]` makes `--session` and `--key` optional (auto-resolving a single live session and auto-generating a unique key while keeping default principal `spawn` and full compatibility with explicit callers).
 - **`spawn mission episodes [--mission N] [--strict] [--verify-parity] [--json]`**: Replays `session_control` into typed `TaskEpisode`s and optionally verifies 100% parity against `mission_tasks` SQL projections (`--verify-parity` exits `0` on match, `1` on drift).
 - **`spawn doctor [--config <path>] [--root <dir>] [--json]` & startup model preflight** (PR #165): `doctor` reports `model_endpoints` (`preflight_mode`, `model_relay` and `judge` health probes with `status`, `target`, `latency_ms`, `detail`, `remediation`, and `model_slots: {default, cheap, small}`). Startup preflight honors `SPAWN_MODEL_PREFLIGHT=warn|strict|off` (default `warn`; `strict` aborts startup when configured endpoints fail preflight; `off` skips probes) and `SPAWN_CHEAP_FALLBACK` (enabled by default in `warn` mode: unreachable `SPAWN_MODEL_RELAY` is cleared at startup so sessions fall back to direct/default; set `SPAWN_CHEAP_FALLBACK=off` — or `0`/`false`/`no`/`keep-relay` — to retain the relay).
+- **Opt-in shared host build caches & `spawn doctor` diagnostics** (PR #180): Default-off opt-in cache sharing via `SPAWN_SHARED_BUILD_CACHES` (`1|true|yes|on` enables `<workspace_root>/.caches`; `0|false|no|off` or unset disables; invalid values fail closed) and `SPAWN_SHARED_BUILD_CACHE_DIR=<abs-dir>` (explicit validated absolute path rejecting relative paths, `..`, control characters, bare system dirs, sensitive subtrees such as `/run/keep*` and `/var/run/keep*`, `$HOME` directly, and symlinks resolving into forbidden paths). Materializes eight zero-secret toolchain variables (`ZIG_GLOBAL_CACHE_DIR`, `CCACHE_DIR`, `UV_CACHE_DIR`, `SCCACHE_DIR`, `PIP_CACHE_DIR`, `NPM_CONFIG_CACHE`, `GOMODCACHE`, `GOCACHE`) while preserving non-empty caller overrides, binds a deduplicated writable `ExtraMount` into sandboxed engines (`BwrapView` / `ContainerView`), and adds the active root to [`host.storage_bytes`](../crates/spawn-cli/src/storage_bytes.rs) `build_cache` canonical extent accounting. [`spawn doctor --json`](../crates/spawn-cli/src/config_file.rs) performs a strictly read-only check (never creating directories and redacting secrets in validation errors) and reports `shared_build_caches: {enabled, status ("disabled"|"ok"|"not_writable"|"not_a_directory"|"invalid"), path, exists, writable, managed_env_vars, error}`.
 - **Single Herdr terminal backend** (PR #150): `SPAWN_TERMINAL_BACKEND` supports `herdr` only (default when unset/empty; `SPAWN_HERDR_MODE=core` uses embedded `herdr-core` via sibling `spawn-hc`, `SPAWN_HERDR_MODE=legacy` uses external `herdr 0.9.5`, `SPAWN_HERDR_SHARDS=1..=64`). The `tmux` backend has been removed: both `SPAWN_TERMINAL_BACKEND=tmux` and `[terminal].backend = "tmux"` in `spawn.toml` are refused fail-closed.
