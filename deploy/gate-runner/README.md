@@ -28,7 +28,7 @@ until the PoC is measured and the owner says to switch.
 - **The same Rust toolchain as the primary**, installed through rustup under
   the runner user's `$HOME` (the gate's sandbox binds it back read-only).
   The gate's base-cache key includes `rustc -vV`, `cargo -V`, `node -V`,
-  `psql -V`, `git --version`, `tmux -V`, `python3 -V`, `jq --version` and the
+  `psql -V`, `git --version`, `python3 -V`, `jq --version` and the
   test server's version, so a different toolchain does not share the cache:
   it computes a different key. Never a false hit — just no sharing.
 - **A private PostgreSQL**: `docker` with the test server's image

@@ -307,7 +307,6 @@ preflight() {
     tool cargo cargo -V
     tool node node --version
     tool psql psql -V
-    tool tmux tmux -V
     tool python3 python3 -V
     tool jq jq --version
     printf 'jobs=%s\n' "$cfg_jobs"

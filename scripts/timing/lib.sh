@@ -14,7 +14,7 @@
 . "$D/config"
 
 # Whether perturbations of `kind` are on (TIMING_KINDS: a comma list of
-# kinds, `all`, and `-<kind>` to leave one out: `all,-flaky`).
+# kinds, `all`, and `-<kind>` to leave one out: `all,-push`).
 t_on() {
     case ",$TIMING_KINDS," in
     *",-$1,"*) return 1 ;;

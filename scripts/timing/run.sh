@@ -11,7 +11,7 @@
 #   -o DIR      results (default $TMPDIR/spawn-timing-<time>): per seed and
 #               target the log, the perturbation log, and summary.{tsv,md}
 #   -j N        targets of one seed run N at a time (default 1)
-#   -k KINDS    SPAWN_TIMING_KINDS (default all; `all,-flaky` leaves one out)
+#   -k KINDS    SPAWN_TIMING_KINDS (default all; `all,-push` leaves one out)
 #   -x PCT      SPAWN_TIMING_SCALE (default 100)
 #   target      bb:<scenario> (scripts/blackbox/scenarios/<scenario>.sh),
 #               bb (all of them), e2e, rsi:<NNN> (rsi/scenarios/NNN.sh);

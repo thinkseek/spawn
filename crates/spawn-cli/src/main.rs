@@ -30,7 +30,7 @@
 //!   (docs/storage.md, "Where state lives"); `store` puts the transcript
 //!   archive and the native sessions in the off-host object store.
 //! - `mask` and `mask-hook` replace known secret values in what a program
-//!   prints; `secret` keeps secrets by name.
+//!   prints.
 //! - `commit-map` loads a map of rewritten commit ids.
 //! - `features` scans and checks the feature registry
 //!   (docs/feature-map/registry.json) and associates files with it.
@@ -89,7 +89,6 @@ mod runtime;
 mod scorecard;
 mod scratch_owner;
 mod scratch_sweep;
-mod secret;
 mod serve;
 mod set_aside;
 mod sources;
@@ -140,7 +139,6 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn ack <command id> done|declined [<why>]\n       \
      spawn mask --values <file>\n       \
      spawn mask-hook --values <file>\n       \
-     spawn secret set|generate|rotate|list\n       \
      spawn verify <mission>/<objective> --by <name> --how <text> --result pass|fail\n       \
      spawn verify list\n       \
      spawn objective retire --mission <m> --objective <n> --kind on-main|renumbered|obsolete --by <name> --reason <text>\n       \
@@ -328,12 +326,6 @@ const COMMANDS: &[Command] = &[
         aliases: &[],
         usage: &[mask::HOOK_USAGE],
         run: mask::hook_command,
-    },
-    Command {
-        name: "secret",
-        aliases: &[],
-        usage: &[secret::USAGE],
-        run: |rest| Ok(secret::command(rest)),
     },
     Command {
         name: "verify",
@@ -836,7 +828,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), words.len(), "a command listed twice: {list}");
-        for removed in ["dispatch", "charter", "hook", "corpus", "judge"] {
+        for removed in ["dispatch", "charter", "hook", "corpus", "judge", "secret"] {
             assert!(
                 !words.contains(&removed),
                 "{removed} is no longer a command"
@@ -936,13 +928,13 @@ mod tests {
         words.sort_unstable();
         words.dedup();
         assert_eq!(words.len(), all, "a word names two rows: {words:?}");
-        for removed in ["dispatch", "charter", "hook", "corpus", "judge"] {
+        for removed in ["dispatch", "charter", "hook", "corpus", "judge", "secret"] {
             assert!(
                 find(removed).is_none(),
                 "{removed} stays an unknown command"
             );
         }
-        assert_eq!(COMMANDS.len(), 35, "the commands: {words:?}");
+        assert_eq!(COMMANDS.len(), 34, "the commands: {words:?}");
     }
 
     #[test]

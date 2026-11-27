@@ -26,7 +26,7 @@ target=$1
 seed=$2
 shift 2
 kinds=("$@")
-[ ${#kinds[@]} -gt 0 ] || kinds=(checkpoint push tmux flaky screen transcript integrate)
+[ ${#kinds[@]} -gt 0 ] || kinds=(checkpoint push screen transcript integrate)
 out=${out:-${TMPDIR:-/tmp}/spawn-timing-min-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$out"
 
