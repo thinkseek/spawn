@@ -24,6 +24,9 @@ import os
 import pathlib
 import socket
 import struct
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -777,6 +780,13 @@ class RelayTest(unittest.TestCase):
         connection.request("GET", "/healthz")
         response = connection.getresponse()
         self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader("Content-Type"), "application/json")
+        body = response.read()
+        self.assertEqual(body, b'{"ok":true}')
+        self.assertEqual(json.loads(body), {"ok": True})
+        connection.request("POST", "/healthz", body=b"{}", headers={"Content-Length": "2"})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 404)
         response.read()
         connection.request("GET", "/admin")
         response = connection.getresponse()
@@ -784,6 +794,218 @@ class RelayTest(unittest.TestCase):
         response.read()
         connection.close()
         self.assertEqual(self.gateway.requests, [])
+        self.assertEqual(self.deepseek.requests, [])
+
+    def test_the_key_is_the_credential_when_systemd_gives_one(self):
+        env_key = "ds-env-fallback-key"
+        with tempfile.TemporaryDirectory() as directory:
+            credential = pathlib.Path(directory, relay.CREDENTIAL)
+            both = {"CREDENTIALS_DIRECTORY": directory, "DEEPSEEK_API_KEY": env_key}
+            credential.write_text(FAKE_KEY, encoding="utf-8")
+            self.assertEqual(relay.key_from(both), (FAKE_KEY, None))
+            credential.write_text(FAKE_KEY + "\n", encoding="utf-8")
+            self.assertEqual(relay.key_from(both), (FAKE_KEY, None))
+            credential.write_text(FAKE_KEY + "\n\n", encoding="utf-8")
+            self.assertEqual(relay.key_from(both), (FAKE_KEY + "\n", None))
+            credential.write_text(" " + FAKE_KEY + " ", encoding="utf-8")
+            self.assertEqual(relay.key_from(both), (" " + FAKE_KEY + " ", None))
+
+            for raw in ("", "\n"):
+                credential.write_text(raw, encoding="utf-8")
+                key, why = relay.key_from(both)
+                self.assertEqual((key, why), ("", "the credential deepseek.api-key is empty"))
+                self.assertNotIn(env_key, why)
+
+            credential.write_bytes(b"\xff\xfe\xfd")
+            key, why = relay.key_from(both)
+            self.assertEqual(
+                (key, why), ("", "the credential deepseek.api-key is not UTF-8 text")
+            )
+            self.assertNotIn(env_key, why)
+
+            credential.unlink()
+            key, why = relay.key_from(both)
+            self.assertEqual(key, "", "no credential is no key, whatever the environment holds")
+            self.assertTrue(
+                why.startswith("the credential deepseek.api-key cannot be read ("), why
+            )
+            self.assertNotIn(env_key, why)
+
+            # A directory at the credential path is unreadable as a file even as root.
+            credential.mkdir()
+            key, why = relay.key_from(both)
+            self.assertEqual(key, "")
+            self.assertTrue(
+                why.startswith("the credential deepseek.api-key cannot be read ("), why
+            )
+
+        self.assertEqual(relay.key_from({"DEEPSEEK_API_KEY": env_key}), (env_key, None))
+        self.assertEqual(
+            relay.key_from({}),
+            ("", "DEEPSEEK_API_KEY is not set, and there is no credential deepseek.api-key"),
+        )
+        self.assertEqual(relay.exit_status({"CREDENTIALS_DIRECTORY": "/x"}), relay.CREDENTIAL_EXIT)
+        self.assertEqual(relay.CREDENTIAL_EXIT, 78)
+        self.assertEqual(relay.exit_status({"DEEPSEEK_API_KEY": env_key}), 1)
+
+    def _run_relay_subprocess(self, extra_env):
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "DEEPSEEK_ANTHROPIC_URL": self.deepseek.url + "/anthropic",
+            "MODEL_RELAY_UPSTREAM": self.gateway.url,
+            "MODEL_RELAY_ADDRESS": "127.0.0.1:0",
+            "no_proxy": "127.0.0.1,localhost",
+            **extra_env,
+        }
+        return subprocess.run(
+            [sys.executable, "-I", str(HERE / "model-relay.py")],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+
+    def _start_relay_subprocess(self, extra_env):
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "DEEPSEEK_ANTHROPIC_URL": self.deepseek.url + "/anthropic",
+            "MODEL_RELAY_UPSTREAM": self.gateway.url,
+            "MODEL_RELAY_ADDRESS": "127.0.0.1:0",
+            "no_proxy": "127.0.0.1,localhost",
+            **extra_env,
+        }
+        proc = subprocess.Popen(
+            [sys.executable, "-I", str(HERE / "model-relay.py")],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        def stop():
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            if proc.stderr:
+                proc.stderr.close()
+
+        self.addCleanup(stop)
+        deadline = time.monotonic() + 10
+        line = ""
+        while time.monotonic() < deadline:
+            line = proc.stderr.readline()
+            if "http://127.0.0.1:" in line or not line:
+                break
+        self.assertIn("http://127.0.0.1:", line, f"relay failed to start (exit={proc.poll()})")
+        port = int(line.split("http://127.0.0.1:")[1].split("/")[0])
+        return proc, port
+
+    def test_load_credential_failures_exit_78_and_valid_dual_mode_works_in_subprocess(self):
+        env_key = "ds-env-sentinel-secret"
+        cred_key = "ds-keep-credential-secret"
+        with tempfile.TemporaryDirectory() as directory:
+            credential = pathlib.Path(directory, relay.CREDENTIAL)
+
+            # Missing credential fails closed with exit 78 even when DEEPSEEK_API_KEY is set.
+            res = self._run_relay_subprocess(
+                {"CREDENTIALS_DIRECTORY": directory, "DEEPSEEK_API_KEY": env_key}
+            )
+            self.assertEqual(res.returncode, relay.CREDENTIAL_EXIT)
+            self.assertIn("deepseek.api-key cannot be read", res.stderr)
+            self.assertNotIn(env_key, res.stderr)
+
+            # Empty and newline-only credentials fail closed with exit 78.
+            for raw in ("", "\n"):
+                credential.write_text(raw, encoding="utf-8")
+                res = self._run_relay_subprocess(
+                    {"CREDENTIALS_DIRECTORY": directory, "DEEPSEEK_API_KEY": env_key}
+                )
+                self.assertEqual(res.returncode, relay.CREDENTIAL_EXIT)
+                self.assertIn("deepseek.api-key is empty", res.stderr)
+                self.assertNotIn(env_key, res.stderr)
+
+            # Non-UTF-8 credential fails closed with exit 78.
+            credential.write_bytes(b"\xff\xfe\x80")
+            res = self._run_relay_subprocess(
+                {"CREDENTIALS_DIRECTORY": directory, "DEEPSEEK_API_KEY": env_key}
+            )
+            self.assertEqual(res.returncode, relay.CREDENTIAL_EXIT)
+            self.assertIn("deepseek.api-key is not UTF-8 text", res.stderr)
+            self.assertNotIn(env_key, res.stderr)
+
+            # Unreadable directory in place of credential fails closed with exit 78.
+            credential.unlink()
+            credential.mkdir()
+            res = self._run_relay_subprocess(
+                {"CREDENTIALS_DIRECTORY": directory, "DEEPSEEK_API_KEY": env_key}
+            )
+            self.assertEqual(res.returncode, relay.CREDENTIAL_EXIT)
+            self.assertIn("deepseek.api-key cannot be read", res.stderr)
+            credential.rmdir()
+
+            # Missing env fallback without CREDENTIALS_DIRECTORY exits 1.
+            res = self._run_relay_subprocess({})
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("DEEPSEEK_API_KEY is not set", res.stderr)
+
+            # Valid credential (with trailing newline stripped) overrides DEEPSEEK_API_KEY.
+            credential.write_text(cred_key + "\n", encoding="utf-8")
+            _, port = self._start_relay_subprocess(
+                {"CREDENTIALS_DIRECTORY": directory, "DEEPSEEK_API_KEY": env_key}
+            )
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            self.addCleanup(conn.close)
+            conn.request("GET", "/healthz")
+            health = conn.getresponse()
+            self.assertEqual(health.status, 200)
+            self.assertEqual(json.loads(health.read()), {"ok": True})
+            self.assertEqual(self.deepseek.requests, [])
+            self.assertEqual(self.gateway.requests, [])
+
+            body = json.dumps({"model": "deepseek-flash", "max_tokens": 1}).encode()
+            conn.request(
+                "POST",
+                "/v1/messages",
+                body=body,
+                headers={"Content-Type": "application/json", "Authorization": CLIENT_TOKEN},
+            )
+            reply = conn.getresponse()
+            self.assertEqual(reply.status, 200)
+            reply.read()
+            self.assertEqual(len(self.deepseek.requests), 1)
+            self.assertEqual(self.deepseek.requests[0]["headers"]["x-api-key"], cred_key)
+            self.assertNotIn("authorization", self.deepseek.requests[0]["headers"])
+            self.assertEqual(self.gateway.requests, [])
+
+        # Without CREDENTIALS_DIRECTORY, DEEPSEEK_API_KEY env fallback works.
+        self.deepseek.requests.clear()
+        _, env_port = self._start_relay_subprocess({"DEEPSEEK_API_KEY": env_key})
+        conn = http.client.HTTPConnection("127.0.0.1", env_port, timeout=10)
+        self.addCleanup(conn.close)
+        conn.request("GET", "/healthz")
+        health = conn.getresponse()
+        self.assertEqual(health.status, 200)
+        self.assertEqual(json.loads(health.read()), {"ok": True})
+        self.assertEqual(self.deepseek.requests, [])
+        body = json.dumps({"model": "deepseek-flash", "max_tokens": 1}).encode()
+        conn.request(
+            "POST",
+            "/v1/messages",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        reply = conn.getresponse()
+        self.assertEqual(reply.status, 200)
+        reply.read()
+        self.assertEqual(len(self.deepseek.requests), 1)
+        self.assertEqual(self.deepseek.requests[0]["headers"]["x-api-key"], env_key)
 
     def test_the_relay_refuses_to_start_off_loopback_or_without_a_key(self):
         good = {"DEEPSEEK_API_KEY": FAKE_KEY, "MODEL_RELAY_UPSTREAM": "http://gateway"}

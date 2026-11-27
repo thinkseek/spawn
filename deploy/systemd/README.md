@@ -16,7 +16,7 @@ main, changes nothing live until that commit is gated and deployed.
 | `spawn-integrate` | `spawn integrate`: lands gated missions' work through the controller's `scripts/rsi/gate.sh` (below), assigns objective tasks (RSI is an objective mission) | never; a halt is per mission, cleared by `spawn mission resume` |
 | `spawn-serve` | `spawn serve`: UI and API, read as `spawn_reader`, and a person's input to a session typed as `spawn_human` (the one write, `POST /api/session/<id>/input`); the UI is the build `deploy.sh` installs in `~/.local/share/spawn-rsi/web` (`SPAWN_WEB_DIR`), on `SPAWN_SERVE_ADDRESS` (default `127.0.0.1:8787`). Off loopback (e.g. `0.0.0.0:8787` for the LAN) it refuses to start without `SPAWN_SERVE_TOKEN`; open the UI once as `http://<host>:8787/?token=<token>` | never; without the token it exits and restarts every 3 s |
 | `spawn-jev-relay` (and `.path`) | `scripts/jev-relay.py` on 127.0.0.1:8790, holding the API key (Keep's `/run/keep/typesafe.api-key`, by `LoadCredential`; objective 201). Without the file (after a reboot, until Keep delivers again) it fails with 243 and stays stopped; `spawn-jev-relay.path` starts it when Keep writes the file | never; stopped while the key file is absent or empty, until Keep writes it |
-| `spawn-model-relay` | `scripts/model-relay.py` on 127.0.0.1:8791: the engines' model calls, `deepseek-*` to DeepSeek with `DEEPSEEK_API_KEY` (from `~/.config/spawn/model-relay.env`, 0600, held only here), everything else to the gateway of `~/.claude/settings.json` with the engine's own auth ([fleet-architecture.md §3.3](../../docs/fleet-architecture.md#33-engine-models)) | never |
+| `spawn-model-relay` (and `.path` staged) | `scripts/model-relay.py` on 127.0.0.1:8791 (`GET /healthz` -> `{"ok":true}`): the engines' model calls, `deepseek-*` to DeepSeek with `DEEPSEEK_API_KEY` (dual-mode ready for Keep `$CREDENTIALS_DIRECTORY/deepseek.api-key`, exit `78` fail-closed; currently still fed by `~/.config/spawn/model-relay.env`, 0600, until operator Wave K1 cutover), everything else to the gateway of `~/.claude/settings.json` with the engine's own auth ([fleet-architecture.md §3.3](../../docs/fleet-architecture.md#33-engine-models)) | never (`RestartPreventExitStatus=243 78` once cut over to Keep) |
 | `spawn-node-gateway` | `spawn-node-gateway` on `SPAWN_NODE_GATEWAY_LISTEN` (default 127.0.0.1:18096): the signed HTTP front of the node ledger for spawn-node v1 ([node-protocol-v1.md](../../docs/node-protocol-v1.md)), logged in as the restricted `spawn_node_gateway` login from `~/.config/spawn/node-gateway.env` (0600), never `spawn.env`; installed by hand (below) | never (`Restart=always`) |
 | `spawn-core` | **Phase 2 opt-in** (`SPAWN_DEPLOY_EDGE_MODE=go-uds`): `spawn serve --ipc --ipc-sock %t/spawn/core.sock`, the local UDS IPC control core with zero direct TCP edge exposure ([spawn-ipc-v1.md](../../docs/spawn-ipc-v1.md)) | never (`Restart=always`) |
 | `spawn-node-edge` | **Phase 2 opt-in** (`SPAWN_DEPLOY_EDGE_MODE=go-uds`): `spawn-node front --serve edge --core-sock %t/spawn/core.sock --listen ${SPAWN_SERVE_ADDRESS} --web ${SPAWN_WEB_DIR}` HTTP/SSE & PWA front (zero `spawn.env` / `*DATABASE_URL*`) | never (`Restart=always`) |
@@ -473,9 +473,10 @@ Keep (`~/.keep` on the owner host, delivered to `/run/keep/<id>` mode `0600`) ke
 | `spawn-jev-relay.service` | `keep_managed` | `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key` | `typesafe.api-key` | Delivered (`RestartPreventExitStatus=243 78`, `http://127.0.0.1:8790/healthz`) |
 | `spawn-node-out.service` | `keep_managed` | `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key` (`EnvironmentFile=-%h/.config/spawn/node-out.env` optional non-secret override only) | `typesafe.api-key` | Delivered (`RestartPreventExitStatus=243 78`, probe `unix://%t/spawn/out.sock\|/out/v1/health`: HTTP `200` healthy, `503` -> `service_down`) |
 | `spawn-agent-presence.service`, `spawn-agent-presence-upload.service`, `spawn-fleet-test-db.service`, `spawn-shadow-observe.service` | `no_secrets` | None (`spawn-agent-presence-upload` reads its own optional token file when enabled) | None | No `EnvironmentFile=` / `LoadCredential=` needed |
-| `spawn-model-relay.service` | `pending_migration` | `EnvironmentFile=%h/.config/spawn/model-relay.env` (`DEEPSEEK_API_KEY`) | `deepseek.api-key` | `LoadCredential=deepseek.api-key:/run/keep/deepseek.api-key` |
+| `spawn-node-gw.service` | `no_secrets` | Optional `EnvironmentFile=-%h/.config/spawn/node-gw.env` non-secret host overrides only (zero `spawn.env` / `*DATABASE_URL*`) | None | `go_unit_pg_isolation` enforced continuously |
+| `spawn-node-edge.service` | `pending_migration` | Optional `EnvironmentFile=-%h/.config/spawn/node-edge.env` (holds `SPAWN_SERVE_TOKEN` when serving off loopback; zero `spawn.env` / `*DATABASE_URL*`) | `spawn-serve.token` | `LoadCredential=spawn-serve.token:/run/keep/spawn-serve.token` (`go_unit_pg_isolation` enforced continuously) |
+| `spawn-model-relay.service` | `pending_migration` (Wave K1 prepared) | `EnvironmentFile=%h/.config/spawn/model-relay.env` (`DEEPSEEK_API_KEY`); `model-relay.py` supports `$CREDENTIALS_DIRECTORY/deepseek.api-key` + `GET /healthz`, and `spawn-model-relay.path` is staged | `deepseek.api-key` | `LoadCredential=deepseek.api-key:/run/keep/deepseek.api-key` + `RestartPreventExitStatus=243 78` (once Keep delivers `/run/keep/deepseek.api-key`) |
 | `spawn-node-gateway.service` | `pending_migration` | `EnvironmentFile=%h/.config/spawn/node-gateway.env` (`SPAWN_NODE_GATEWAY_DATABASE_URL`) | `spawn-node-gateway.database-url` | `LoadCredential=spawn-node-gateway.database-url:/run/keep/spawn-node-gateway.database-url` |
-| `spawn-node-edge.service`, `spawn-node-gw.service` | `pending_migration` | `EnvironmentFile=-%h/.config/spawn/node-{edge,gw}.env` (zero `spawn.env` / `*DATABASE_URL*`) | `spawn-serve.token` (edge, if auth token needed); none for gw | Optional host overrides today; zero Postgres credentials allowed |
 | `spawn-serve.service`, `spawn-core.service` | `pending_migration` | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` | `spawn.database-url`, `spawn-serve.token` | `LoadCredential=` or restricted config + `SPAWN_SERVE_TOKEN` delivery |
 | `spawn-backup.service`, `spawn-backup-bundle.service`, `spawn-backup-verify.service`, `spawn-backup-restore-drill*.service` | `pending_migration` | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` | `spawn.database-url`, `backup.encryption-key`, `r2.credentials` | `LoadCredential=` delivery per backup/R2 secret |
 | `spawn-loop.service`, `spawn-integrate.service`, `spawn-credential-health.service`, `spawn-deploy-on-landing.service`, `spawn-maintenance.service`, `spawn-nightly*.service` | `pending_migration` | `EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env` | `spawn.database-url` | Role-scoped `LoadCredential=` delivery replacing `spawn.env` |
@@ -489,11 +490,40 @@ bash scripts/keep/credential-health.sh --audit-keep-migration
 bash scripts/keep/credential-health.sh --audit-keep-migration --json | jq .
 ```
 
-Validate a staged multi-row manifest (including `unix://%t/spawn/out.sock|/out/v1/health`) offline before cutting over `scripts/keep/credentials.manifest`:
+Baseline classification across the 27 checked `deploy/systemd/spawn-*.service` units: `total=27`, `keep_managed=2`, `no_secrets=5`, `pending_migration=20`, `go_units_pg_isolation=ok`.
+
+Validate a staged multi-row manifest (including `unix://%t/spawn/out.sock|/out/v1/health` or `http://127.0.0.1:8791/healthz`) offline before cutting over `scripts/keep/credentials.manifest`:
 
 ```sh
 bash scripts/keep/credential-health.sh --validate-manifest /path/to/staged.manifest
 ```
+
+### Wave K1 Cutover Procedure (Model Relay -> Keep)
+
+Wave K1 ships dual-mode support safely before Keep delivers `deepseek.api-key`:
+
+- **Pre-cutover safety (safe on live VMs now)**: `scripts/model-relay.py` reads `$CREDENTIALS_DIRECTORY/deepseek.api-key` (stripping at most one trailing `\n`, exiting `78` fail-closed on missing/unreadable/non-UTF-8/empty) when `CREDENTIALS_DIRECTORY` is set and falls back to `DEEPSEEK_API_KEY` otherwise; `GET /healthz` answers `200 {"ok":true}` without touching upstreams; `deploy/systemd/spawn-model-relay.path` (`PathChanged=/run/keep/deepseek.api-key`) is committed and skipped by `deploy/sync-units.sh` while uninstalled. `deploy/systemd/spawn-model-relay.service` intentionally retains `EnvironmentFile=%h/.config/spawn/model-relay.env` and `scripts/keep/credentials.manifest` omits `deepseek.api-key` until Keep actively delivers `/run/keep/deepseek.api-key`.
+- **Operator cutover steps** (only after Wave K1 is deployed to `~/.local/share/spawn-rsi/bin/model-relay.py` and Keep delivers `/run/keep/deepseek.api-key` mode `0600`):
+  1. Confirm delivery and dry-run validate a 2-row manifest (`typesafe.api-key` + `deepseek.api-key` -> `spawn-model-relay.service` at `http://127.0.0.1:8791/healthz`):
+     ```sh
+     test -s /run/keep/deepseek.api-key && [ "$(stat -c %a /run/keep/deepseek.api-key)" = 600 ]
+     bash scripts/keep/credential-health.sh --validate-manifest /path/to/wave-k1-staged.manifest
+     ```
+  2. Cut over unit, redaction map, and health manifest in the follow-up cutover commit:
+     - Replace `EnvironmentFile=%h/.config/spawn/model-relay.env` in `deploy/systemd/spawn-model-relay.service` with `LoadCredential=deepseek.api-key:/run/keep/deepseek.api-key` and `RestartPreventExitStatus=243 78`.
+     - Add `"deepseek.api-key": ".config/spawn/model-relay.env"` to `KEEP` in `scripts/redact/secret-values.py` before retiring `~/.config/spawn/model-relay.env`.
+     - Append the `deepseek.api-key` row (`spawn-model-relay.service | http://127.0.0.1:8791/healthz | model-relay | ~/.config/spawn/model-relay.env | DEEPSEEK_API_KEY | -`) to `scripts/keep/credentials.manifest`.
+  3. Install/enable the `.path` unit, restart `spawn-model-relay.service`, retire `model-relay.env` (recording any retired value if rotating), and verify:
+     ```sh
+     cp deploy/systemd/spawn-model-relay.path deploy/systemd/spawn-model-relay.service ~/.config/systemd/user/
+     systemctl --user daemon-reload
+     systemctl --user enable --now spawn-model-relay.path
+     systemctl --user restart spawn-model-relay.service
+     curl -fsS http://127.0.0.1:8791/healthz   # {"ok":true}
+     bash scripts/keep/credential-health.sh --audit-keep-migration
+     bash scripts/keep/credential-health.sh
+     ```
+  4. **Rollback**: restore `~/.config/spawn/model-relay.env` (`0600`) and `EnvironmentFile=%h/.config/spawn/model-relay.env`, disable `spawn-model-relay.path`, `systemctl --user daemon-reload`, and `systemctl --user restart spawn-model-relay.service`.
 
 ## The controller
 

@@ -364,6 +364,19 @@ run2 >/dev/null
 [ "$(n_fired "spawn-units:go_unit_pg_isolation:")" = 1 ] && ! grep -q 'alert.cleared.*unit_drift' "$scratch/alerts" &&
   pass "installed Go drop-in DATABASE_URL caught even without CH_DEPLOY_SYSTEMD_DIR while leaving unit_drift untouched" || fail "installed Go drop-in isolation"
 
+setup_clean_go_deploy
+cp "$repo_root/deploy/systemd/spawn-node-gw.service" "$scratch/units/"
+mkdir -p "$scratch/units/spawn-node-gw.service.d"
+printf '%s\n' '[Service]' 'EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env' >"$scratch/units/spawn-node-gw.service.d/override.conf"
+run2 >/dev/null
+expect_fired "installed Go gw drop-in spawn.env caught without CH_DEPLOY_SYSTEMD_DIR: go_unit_pg_isolation" spawn-units:go_unit_pg_isolation
+key=$(sed -n 's/.*"key":"\(credential_health:spawn-units:go_unit_pg_isolation:[0-9]*\)".*/\1/p' "$scratch/alerts" | head -1)
+printf 'OPEN %s\n' "$key" >>"$scratch/alerts"
+rm -f "$scratch/units/spawn-node-gw.service.d/override.conf"
+run2 >/dev/null
+grep -q "alert.cleared.*$key" "$scratch/alerts" &&
+  pass "installed Go gw drop-in spawn.env removed: go_unit_pg_isolation cleared" || fail "go_unit_pg_isolation clear (gw drop-in)"
+
 # Static compliance audit of committed deploy/systemd/spawn-{core,node-edge,node-gw,node-out}.service.
 reset2
 out=$(CH_DEPLOY_SYSTEMD_DIR="$repo_root/deploy/systemd" run2)
@@ -398,6 +411,16 @@ grep -q -- '--bind-retry-timeout 5s' "$repo_root/deploy/systemd/spawn-node-edge.
 [ -n "$go_static_ok" ] &&
   pass "deploy/systemd/spawn-node-{edge,gw,out}.service enforce MemoryMax, GOMEMLIMIT, bind-retry, LoadCredential, zero PG" || fail "spawn-node-*.service static audit"
 
+model_relay_path=$repo_root/deploy/systemd/spawn-model-relay.path
+model_relay_svc=$repo_root/deploy/systemd/spawn-model-relay.service
+[ -f "$model_relay_path" ] &&
+  grep -qxF 'PathChanged=/run/keep/deepseek.api-key' "$model_relay_path" &&
+  grep -qxF 'Unit=spawn-model-relay.service' "$model_relay_path" &&
+  grep -qxF 'EnvironmentFile=%h/.config/spawn/model-relay.env' "$model_relay_svc" &&
+  ! grep -q '^LoadCredential=' "$model_relay_svc" &&
+  pass "Wave K1 spawn-model-relay.path staged and spawn-model-relay.service preserves live model-relay.env safety" ||
+  fail "Wave K1 spawn-model-relay unit/path static audit"
+
 # --- --validate-manifest dry-run validation (multi-row + unix://%t/..., exit 2 on invalid, zero alerts) ---
 rm -f "$scratch/alerts"
 cat >"$scratch/valid-multi.manifest" <<'EOF'
@@ -408,6 +431,16 @@ EOF
 val_out=$(CH_FAKE_ALERTS="$scratch/alerts" bash "$check" --validate-manifest "$scratch/valid-multi.manifest" 2>&1)
 [ "$?" -eq 0 ] && grep -q 'manifest ok: 2 row(s) valid' <<<"$val_out" && [ ! -e "$scratch/alerts" ] &&
   pass "--validate-manifest accepts valid multi-row unix://%t + http:// manifest with zero alerts" || fail "--validate-manifest valid ($val_out)"
+
+# Wave K1 staged manifest (legacy jev-relay + model-relay) dry-run validation.
+cat >"$scratch/wave-k1.manifest" <<'EOF'
+# Wave K1 staged manifest: active typesafe.api-key + staged deepseek.api-key
+typesafe.api-key | spawn-jev-relay.service | http://127.0.0.1:8790/healthz | jev-relay | ~/.config/spawn/typesafe.env | TYPESAFE_API_KEY | -
+deepseek.api-key | spawn-model-relay.service | http://127.0.0.1:8791/healthz | model-relay | ~/.config/spawn/model-relay.env | DEEPSEEK_API_KEY | -
+EOF
+k1_out=$(CH_FAKE_ALERTS="$scratch/alerts" bash "$check" --validate-manifest "$scratch/wave-k1.manifest" 2>&1)
+[ "$?" -eq 0 ] && grep -q 'manifest ok: 2 row(s) valid' <<<"$k1_out" && [ ! -e "$scratch/alerts" ] &&
+  pass "--validate-manifest accepts Wave K1 multi-row manifest (spawn-jev-relay + spawn-model-relay) with zero alerts" || fail "--validate-manifest Wave K1 ($k1_out)"
 
 printf 'bad.row|only-three-fields|-\n' >"$scratch/invalid.manifest"
 val_bad_out=$(CH_FAKE_ALERTS="$scratch/alerts" bash "$check" --validate-manifest "$scratch/invalid.manifest" 2>&1); st=$?
@@ -433,9 +466,13 @@ st=$?
   (.go_units_pg_isolation.violations | length == 0) and
   (.counts.total == .counts.keep_managed + .counts.no_secrets + .counts.pending_migration) and
   (.counts.keep_managed >= 2) and
+  (.counts.no_secrets == 5) and
+  (.counts.pending_migration == 20) and
   (.units | map(select(.unit == "spawn-jev-relay.service" and .status == "keep_managed" and (.load_credentials | index("typesafe.api-key")) != null)) | length == 1) and
   (.units | map(select(.unit == "spawn-node-out.service" and .status == "keep_managed" and (.load_credentials | index("typesafe.api-key")) != null)) | length == 1) and
   (.units | map(select(.unit == "spawn-agent-presence.service" and .status == "no_secrets")) | length == 1) and
+  (.units | map(select(.unit == "spawn-node-gw.service" and .status == "no_secrets" and (.suggested_keep_ids | length == 0))) | length == 1) and
+  (.units | map(select(.unit == "spawn-node-edge.service" and .status == "pending_migration" and (.suggested_keep_ids | index("spawn-serve.token")) != null)) | length == 1) and
   (.units | map(select(.unit == "spawn-model-relay.service" and .status == "pending_migration" and (.suggested_keep_ids | index("deepseek.api-key")) != null)) | length == 1) and
   (.units | map(select(.unit == "spawn-loop.service" and .status == "pending_migration" and (.env_files | length > 0))) | length == 1)
 ' <<<"$real_audit_json" >/dev/null &&
@@ -444,6 +481,8 @@ st=$?
 real_audit_human=$(CH_DEPLOY_SYSTEMD_DIR="" CH_UNIT_DIR="" SPAWN_DATABASE_URL="" bash "$check" --audit-keep-migration)
 grep -q 'keep_managed.*spawn-jev-relay\.service' <<<"$real_audit_human" &&
   grep -q 'keep_managed.*spawn-node-out\.service' <<<"$real_audit_human" &&
+  grep -q 'no_secrets.*spawn-node-gw\.service' <<<"$real_audit_human" &&
+  grep -q 'pending_migration.*spawn-node-edge\.service' <<<"$real_audit_human" &&
   grep -q 'pending_migration.*spawn-model-relay\.service' <<<"$real_audit_human" &&
   grep -q 'go_units_pg_isolation=ok' <<<"$real_audit_human" &&
   pass "--audit-keep-migration human output summarizes repo units and PG isolation" || fail "--audit-keep-migration human"
@@ -486,6 +525,10 @@ cat >"$audit_sys/spawn-node-edge.service.d/bad.conf" <<'EOF'
 [Service]
 Environment=BAD_DATABASE_URL=postgres://synthetic-dropin-leak
 EOF
+cat >"$audit_sys/spawn-node-gw.service" <<'EOF'
+[Service]
+EnvironmentFile=-%h/.config/spawn/node-gw.env
+EOF
 
 syn_json=$(HOME="$audit_home" CH_DEPLOY_SYSTEMD_DIR="$audit_sys" CH_FAKE_ALERTS="$scratch/alerts" \
   bash "$check" --audit-keep-migration --json)
@@ -493,21 +536,36 @@ syn_human=$(HOME="$audit_home" CH_DEPLOY_SYSTEMD_DIR="$audit_sys" CH_FAKE_ALERTS
   bash "$check" --audit-keep-migration)
 
 jq -e '
-  .counts.total == 6 and
+  .counts.total == 7 and
   .counts.keep_managed == 2 and
-  .counts.no_secrets == 1 and
+  .counts.no_secrets == 2 and
   .counts.pending_migration == 3 and
   .go_units_pg_isolation.checked == true and
   .go_units_pg_isolation.ok == false and
   (.go_units_pg_isolation.violations == ["spawn-node-edge.service"]) and
+  (.units | map(select(.unit == "spawn-node-gw.service" and .status == "no_secrets" and (.suggested_keep_ids | length == 0))) | length == 1) and
+  (.units | map(select(.unit == "spawn-node-edge.service" and .status == "pending_migration" and (.suggested_keep_ids | index("spawn-serve.token")) != null)) | length == 1) and
   (.units | map(select(.unit == "spawn-mixed-pending.service" and .status == "pending_migration")) | length == 1) and
   (.units | map(select(.unit == "spawn-plain-pending.service" and .status == "pending_migration" and (.suggested_keep_ids | index("spawn.database-url")) != null)) | length == 1)
 ' <<<"$syn_json" >/dev/null &&
   [ ! -e "$scratch/alerts" ] &&
   pass "--audit-keep-migration classifies synthetic mixed/optional/Go units and writes zero alerts" || fail "--audit-keep-migration synthetic ($syn_json)"
 
-! grep -q 'made-up-audit-canary-value-9941' <<<"$syn_json$syn_human" &&
-  ! grep -q 'synthetic-dropin-leak' <<<"$syn_json$syn_human" &&
+# Also verify go_units_pg_isolation catches spawn-node-gw.service violations in --audit-keep-migration.
+mkdir -p "$audit_sys/spawn-node-gw.service.d"
+printf '%s\n' '[Service]' 'EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env' >"$audit_sys/spawn-node-gw.service.d/bad.conf"
+syn_gw_json=$(HOME="$audit_home" CH_DEPLOY_SYSTEMD_DIR="$audit_sys" CH_FAKE_ALERTS="$scratch/alerts" \
+  bash "$check" --audit-keep-migration --json)
+jq -e '
+  .go_units_pg_isolation.checked == true and
+  .go_units_pg_isolation.ok == false and
+  (.go_units_pg_isolation.violations == ["spawn-node-edge.service", "spawn-node-gw.service"]) and
+  (.units | map(select(.unit == "spawn-node-gw.service" and .status == "pending_migration")) | length == 1)
+' <<<"$syn_gw_json" >/dev/null &&
+  pass "--audit-keep-migration catches spawn-node-gw.service PG violation" || fail "--audit-keep-migration gw violation ($syn_gw_json)"
+
+! grep -q 'made-up-audit-canary-value-9941' <<<"$syn_json$syn_human$syn_gw_json" &&
+  ! grep -q 'synthetic-dropin-leak' <<<"$syn_json$syn_human$syn_gw_json" &&
   pass "--audit-keep-migration never reads or echoes env file contents or canary secrets" || fail "canary leaked in audit"
 
 echo "$fails failed"
