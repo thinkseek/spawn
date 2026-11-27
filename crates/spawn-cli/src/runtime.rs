@@ -213,7 +213,7 @@ pub(crate) fn view_config_for_backend_with_cache(
     if !herdr_backend {
         cfg.canonical_workspace = None;
         cfg.home_isolation = spawn_host::HomeIsolation::Blacklist;
-        cfg.isolate_brain = false;
+        cfg.engines.disable_agy_brain_isolation();
     }
     if let Some(cache_root) = shared_cache_root {
         apply_shared_build_cache_mount(&mut cfg, cache_root);
@@ -2335,7 +2335,7 @@ mod tests {
             herdr_view.home_isolation,
             spawn_host::HomeIsolation::Whitelist
         );
-        assert!(herdr_view.isolate_brain);
+        assert!(herdr_view.engines.isolates_agy_brain());
         let herdr_engines = engines_for(&env, true).expect("herdr engines");
         assert!(herdr_engines[0].1.isolate_brain);
 
@@ -2345,7 +2345,7 @@ mod tests {
             non_herdr_view.home_isolation,
             spawn_host::HomeIsolation::Blacklist
         );
-        assert!(!non_herdr_view.isolate_brain);
+        assert!(!non_herdr_view.engines.isolates_agy_brain());
         let non_herdr_engines = engines_for(&env, false).expect("non-herdr engines");
         assert!(!non_herdr_engines[0].1.isolate_brain);
     }

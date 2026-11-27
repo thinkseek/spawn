@@ -600,16 +600,9 @@ fn bwrap_view_hides_herdr_core_paths_while_host_witness_sees_sandboxed_agy() {
         canonical_workspace: None,
         home_isolation: spawn_host::HomeIsolation::Blacklist,
         extra_mounts: Vec::new(),
-        agy_data_dir: None,
-        isolate_workers: false,
-        isolate_brain: false,
-        agy_program: None,
         inherit_host: spawn_host::HostInheritMode::Off,
         inherit_host_paths: Vec::new(),
-        claude_program: None,
-        claude_data_dir: None,
-        codex_program: None,
-        codex_data_dir: None,
+        engines: spawn_host::engine_view::EngineViews::default(),
     };
     let Ok(view) = BwrapView::new("bwrap", config) else {
         assert!(!required(), "SPAWN_REQUIRE_HERDR=1 and bwrap unavailable");
