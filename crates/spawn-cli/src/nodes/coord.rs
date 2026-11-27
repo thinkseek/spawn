@@ -50,12 +50,12 @@
 //! reuses its coordinator sessions and the nodes' checked prekeys
 //! ([`pool`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs as _, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -65,8 +65,7 @@ use zeroize::Zeroizing;
 
 use super::auth::{MAX_SKEW_MS, same};
 use super::crypto::{
-    self, NodeIdentity, PeerKeys, Responder, TrustPolicy, envelope_error, seal_request, unb64,
-    valid_node_id,
+    self, NodeIdentity, PeerKeys, Responder, TrustPolicy, envelope_error, unb64, valid_node_id,
 };
 use super::relay::{Registrar, Runner, store_refusal};
 use super::transport::{Op, forbidden, nonce, parse, valid_nonce};
@@ -275,15 +274,20 @@ impl Channel {
     }
 
     pub(crate) fn send(&mut self, message: &Value) -> Result<(), String> {
-        let text = serde_json::to_string(message).map_err(|error| error.to_string())?;
+        let text = encode_json_fast(message)?;
+        self.send_text(&text)
+    }
+
+    pub(crate) fn send_text(&mut self, text: &str) -> Result<(), String> {
         if text.len() > MAX_FRAME {
             return Err(format!("a message over {MAX_FRAME} bytes"));
         }
         match self {
-            Self::Ws(ws) => ws.send_text(&text),
+            Self::Ws(ws) => ws.send_text(text),
             Self::Line { stream, .. } => {
                 use std::io::Write as _;
-                let mut line = text.into_bytes();
+                let mut line = Vec::with_capacity(text.len() + 1);
+                line.extend_from_slice(text.as_bytes());
                 line.push(b'\n');
                 stream.write_all(&line).map_err(|error| error.to_string())
             }
@@ -303,12 +307,8 @@ impl Channel {
                 use std::io::Read as _;
                 let deadline = Instant::now() + timeout;
                 loop {
-                    if let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
-                        let line: Vec<u8> = buffer.drain(..=end).collect();
-                        return parse(&line[..end]).map(Some);
-                    }
-                    if buffer.len() > MAX_FRAME {
-                        return Err(format!("a message over {MAX_FRAME} bytes"));
+                    if let Some((message, _)) = take_line(buffer, false)? {
+                        return Ok(Some(message));
                     }
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
@@ -354,25 +354,78 @@ impl Channel {
     /// The next whole message of what was read already, no IO (a
     /// WebSocket's ping answered): none when there is no whole one. A line
     /// or a frame over [`MAX_FRAME`] is refused (the session ends).
+    #[cfg(test)]
     pub(crate) fn next_buffered(&mut self) -> Result<Option<Value>, String> {
+        self.next_buffered_raw()
+            .map(|frame| frame.map(|(message, _)| message))
+    }
+
+    /// Like [`Self::next_buffered`], also returning the validated raw frame
+    /// text when a relay/punch/error frame can be forwarded unchanged.
+    fn next_buffered_raw(&mut self) -> Result<Option<(Value, Option<String>)>, String> {
         match self {
             Self::Ws(ws) => match ws.next_buffered()? {
                 None => Ok(None),
-                Some(Message::Text(text)) => parse(text.as_bytes()).map(Some),
-                Some(Message::Binary(bytes)) => parse(&bytes).map(Some),
+                Some(Message::Text(text)) => {
+                    let message = parse(text.as_bytes())?;
+                    let raw = matches!(message["type"].as_str(), Some("relay" | "punch" | "error"))
+                        .then_some(text);
+                    Ok(Some((message, raw)))
+                }
+                Some(Message::Binary(bytes)) => {
+                    let message = parse(&bytes)?;
+                    let raw = matches!(message["type"].as_str(), Some("relay" | "punch" | "error"))
+                        .then(|| String::from_utf8(bytes).ok())
+                        .flatten();
+                    Ok(Some((message, raw)))
+                }
                 Some(Message::Close) => Err("the coordinator closed".to_string()),
             },
-            Self::Line { buffer, .. } => match buffer.iter().position(|byte| *byte == b'\n') {
-                Some(end) if end > MAX_FRAME => Err(format!("a message over {MAX_FRAME} bytes")),
-                Some(end) => {
-                    let line: Vec<u8> = buffer.drain(..=end).collect();
-                    parse(&line[..end]).map(Some)
-                }
-                None if buffer.len() > MAX_FRAME => {
-                    Err(format!("a message over {MAX_FRAME} bytes"))
-                }
+            Self::Line { buffer, .. } => take_line(buffer, true),
+        }
+    }
+
+    /// Next buffered frame for a coordinator session: skips full `Value`
+    /// allocation of sealed relay envelopes while validating routing headers.
+    fn next_coord_frame(&mut self) -> Result<Option<CoordFrame>, String> {
+        match self {
+            Self::Ws(ws) => match ws.next_buffered()? {
                 None => Ok(None),
+                Some(Message::Text(text)) => {
+                    if let Some((kind, from, to, id)) = try_relay_header(text.as_bytes()) {
+                        return Ok(Some(CoordFrame::Relay {
+                            kind,
+                            from,
+                            to,
+                            id,
+                            raw: text,
+                        }));
+                    }
+                    let message = parse(text.as_bytes())?;
+                    let raw = matches!(message["type"].as_str(), Some("error")).then_some(text);
+                    Ok(Some(CoordFrame::Value(message, raw)))
+                }
+                Some(Message::Binary(bytes)) => {
+                    if let Some((kind, from, to, id)) = try_relay_header(&bytes)
+                        && let Ok(raw) = String::from_utf8(bytes.clone())
+                    {
+                        return Ok(Some(CoordFrame::Relay {
+                            kind,
+                            from,
+                            to,
+                            id,
+                            raw,
+                        }));
+                    }
+                    let message = parse(&bytes)?;
+                    let raw = matches!(message["type"].as_str(), Some("error"))
+                        .then(|| String::from_utf8(bytes).ok())
+                        .flatten();
+                    Ok(Some(CoordFrame::Value(message, raw)))
+                }
+                Some(Message::Close) => Err("the coordinator closed".to_string()),
             },
+            Self::Line { buffer, .. } => take_line_coord(buffer),
         }
     }
 
@@ -380,27 +433,266 @@ impl Channel {
     /// readable), kept for [`Self::next_buffered`].
     fn read_ready(&mut self) -> Result<(), String> {
         match self {
-            Self::Ws(ws) => ws.read_ready(),
+            Self::Ws(ws) => {
+                ws.read_ready()?;
+                while rustix::io::ioctl_fionread(ws.tcp()).unwrap_or(0) > 0 {
+                    ws.read_ready()?;
+                }
+                Ok(())
+            }
             Self::Line { stream, buffer } => {
                 use std::io::Read as _;
+                const LINE_READ_CHUNK: usize = 128 * 1024;
                 stream
                     .set_read_timeout(Some(READY_WAIT))
                     .map_err(|error| error.to_string())?;
-                match super::ws::read_into(buffer, |spare| stream.read(spare)) {
-                    Ok(0) => Err("the connection closed".to_string()),
-                    Ok(_) => Ok(()),
+                let start = buffer.len();
+                buffer.resize(start + LINE_READ_CHUNK, 0);
+                match stream.read(&mut buffer[start..]) {
+                    Ok(0) => {
+                        buffer.truncate(start);
+                        Err("the connection closed".to_string())
+                    }
+                    Ok(count) => {
+                        buffer.truncate(start + count);
+                        Ok(())
+                    }
                     Err(error)
                         if matches!(
                             error.kind(),
                             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                         ) =>
                     {
+                        buffer.truncate(start);
                         Ok(())
                     }
-                    Err(error) => Err(error.to_string()),
+                    Err(error) => {
+                        buffer.truncate(start);
+                        Err(error.to_string())
+                    }
                 }
             }
         }
+    }
+}
+
+fn is_plain_ascii_json(s: &str) -> bool {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const MIN_PRINT: u64 = 0x2020_2020_2020_2020;
+    const QUOTE: u64 = 0x2222_2222_2222_2222;
+    const SLASH: u64 = 0x5c5c_5c5c_5c5c_5c5c;
+    let mut chunks = s.as_bytes().chunks_exact(8);
+    for chunk in &mut chunks {
+        let w = u64::from_ne_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        if (w & HI) != 0 || (w.wrapping_sub(MIN_PRINT) & HI) != 0 {
+            return false;
+        }
+        let xq = w ^ QUOTE;
+        if (xq.wrapping_sub(LO) & !xq & HI) != 0 {
+            return false;
+        }
+        let xs = w ^ SLASH;
+        if (xs.wrapping_sub(LO) & !xs & HI) != 0 {
+            return false;
+        }
+    }
+    chunks
+        .remainder()
+        .iter()
+        .all(|&b| (0x20..0x80).contains(&b) && b != b'"' && b != b'\\')
+}
+
+fn push_json_str(out: &mut String, s: &str) -> Result<(), String> {
+    if is_plain_ascii_json(s) {
+        out.push('"');
+        out.push_str(s);
+        out.push('"');
+        Ok(())
+    } else {
+        let escaped = serde_json::to_string(s).map_err(|error| error.to_string())?;
+        out.push_str(&escaped);
+        Ok(())
+    }
+}
+
+fn push_json_value(out: &mut String, value: &Value) -> Result<(), String> {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(true) => out.push_str("true"),
+        Value::Bool(false) => out.push_str("false"),
+        Value::Number(n) => {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{n}");
+        }
+        Value::String(s) => push_json_str(out, s)?,
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                push_json_value(out, item)?;
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (index, (k, v)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                push_json_str(out, k)?;
+                out.push(':');
+                push_json_value(out, v)?;
+            }
+            out.push('}');
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn encode_json_fast(value: &Value) -> Result<String, String> {
+    let cap = value["envelope"]["ct"]
+        .as_str()
+        .or_else(|| value["output"].as_str())
+        .map_or(256, |s| s.len() + 1024);
+    let mut out = String::with_capacity(cap);
+    push_json_value(&mut out, value)?;
+    Ok(out)
+}
+
+fn find_newline(bytes: &[u8]) -> Option<usize> {
+    const MASK: u64 = 0x0a0a_0a0a_0a0a_0a0a;
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let mut chunks = bytes.chunks_exact(8);
+    let mut base = 0_usize;
+    for chunk in &mut chunks {
+        let word = u64::from_ne_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]) ^ MASK;
+        if word.wrapping_sub(LO) & !word & HI != 0 {
+            return chunk
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map(|offset| base + offset);
+        }
+        base += 8;
+    }
+    chunks
+        .remainder()
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map(|offset| base + offset)
+}
+
+enum CoordFrame {
+    Value(Value, Option<String>),
+    Relay {
+        kind: &'static str,
+        from: Option<String>,
+        to: Option<String>,
+        id: Value,
+        raw: String,
+    },
+}
+
+#[derive(serde::Deserialize)]
+struct RelayMeta<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    from: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    to: Option<std::borrow::Cow<'a, str>>,
+    id: Option<Value>,
+    #[serde(rename = "envelope")]
+    _envelope: Option<serde::de::IgnoredAny>,
+}
+
+fn try_relay_header(bytes: &[u8]) -> Option<(&'static str, Option<String>, Option<String>, Value)> {
+    let meta = serde_json::from_slice::<RelayMeta<'_>>(bytes).ok()?;
+    let kind = match meta.kind.as_deref()? {
+        "relay" => "relay",
+        "punch" => "punch",
+        _ => return None,
+    };
+    Some((
+        kind,
+        meta.from.map(std::borrow::Cow::into_owned),
+        meta.to.map(std::borrow::Cow::into_owned),
+        meta.id.unwrap_or(Value::Null),
+    ))
+}
+
+fn take_line_coord(buffer: &mut Vec<u8>) -> Result<Option<CoordFrame>, String> {
+    match find_newline(buffer) {
+        Some(end) if end > MAX_FRAME => Err(format!("a message over {MAX_FRAME} bytes")),
+        Some(end) => {
+            let result = if let Some((kind, from, to, id)) = try_relay_header(&buffer[..end]) {
+                let raw = std::str::from_utf8(&buffer[..end])
+                    .map(str::to_string)
+                    .map_err(|_| "not UTF-8".to_string());
+                raw.map(|raw| {
+                    Some(CoordFrame::Relay {
+                        kind,
+                        from,
+                        to,
+                        id,
+                        raw,
+                    })
+                })
+            } else {
+                parse(&buffer[..end]).map(|value| Some(CoordFrame::Value(value, None)))
+            };
+            consume_prefix(buffer, end);
+            result
+        }
+        None if buffer.len() > MAX_FRAME => Err(format!("a message over {MAX_FRAME} bytes")),
+        None => Ok(None),
+    }
+}
+
+fn consume_prefix(buffer: &mut Vec<u8>, end: usize) {
+    if end + 1 == buffer.len() {
+        buffer.clear();
+    } else {
+        let tail = buffer.len() - (end + 1);
+        buffer.copy_within(end + 1.., 0);
+        buffer.truncate(tail);
+    }
+}
+
+fn take_line(
+    buffer: &mut Vec<u8>,
+    capture_raw: bool,
+) -> Result<Option<(Value, Option<String>)>, String> {
+    match find_newline(buffer) {
+        Some(end) if end > MAX_FRAME => Err(format!("a message over {MAX_FRAME} bytes")),
+        Some(end) => {
+            let parsed = parse(&buffer[..end]);
+            let raw = if capture_raw
+                && let Ok(ref value) = parsed
+                && matches!(value["type"].as_str(), Some("relay" | "punch" | "error"))
+            {
+                std::str::from_utf8(&buffer[..end]).ok().map(str::to_string)
+            } else {
+                None
+            };
+            if end + 1 == buffer.len() {
+                buffer.clear();
+            } else {
+                let tail = buffer.len() - (end + 1);
+                buffer.copy_within(end + 1.., 0);
+                buffer.truncate(tail);
+            }
+            parsed.map(|value| Some((value, raw)))
+        }
+        None if buffer.len() > MAX_FRAME => Err(format!("a message over {MAX_FRAME} bytes")),
+        None => Ok(None),
     }
 }
 
@@ -438,15 +730,20 @@ impl Waker {
 
 /// A session's (or a client's) outbound queue and its pump's waker: a
 /// message pushed is sent at once, never after a poll's period.
+enum Outbound {
+    Json(Value),
+    Raw(String),
+}
+
 #[derive(Clone)]
 pub(crate) struct Outbox {
-    queue: SyncSender<Value>,
+    queue: SyncSender<Outbound>,
     waker: Arc<Waker>,
 }
 
 impl Outbox {
     /// A queue of [`QUEUE`] messages, its receiving end, and its waker.
-    fn new() -> Result<(Self, Receiver<Value>, Arc<Waker>), String> {
+    fn new() -> Result<(Self, Receiver<Outbound>, Arc<Waker>), String> {
         let (queue, outbound) = std::sync::mpsc::sync_channel(QUEUE);
         let waker = Arc::new(Waker::new()?);
         Ok((
@@ -459,12 +756,21 @@ impl Outbox {
         ))
     }
 
+    fn push_item(&self, item: Outbound) {
+        if self.queue.try_send(item).is_ok() {
+            self.waker.wake();
+        }
+    }
+
     /// Queue `message` and wake the pump; dropped when the queue is full
     /// or gone (a slow reader cannot grow its sender).
     fn push(&self, message: Value) {
-        if self.queue.try_send(message).is_ok() {
-            self.waker.wake();
-        }
+        self.push_item(Outbound::Json(message));
+    }
+
+    /// Queue pre-serialized frame `raw` and wake the pump.
+    fn push_raw(&self, raw: String) {
+        self.push_item(Outbound::Raw(raw));
     }
 }
 
@@ -703,6 +1009,14 @@ fn push(queue: &Outbox, message: Value) {
     queue.push(message);
 }
 
+fn push_outbound(queue: &Outbox, message: Value, raw: Option<String>) {
+    if let Some(raw) = raw {
+        queue.push_raw(raw);
+    } else {
+        queue.push(message);
+    }
+}
+
 impl Coordinator {
     pub(crate) fn new(
         identity: Arc<NodeIdentity>,
@@ -903,8 +1217,65 @@ impl Coordinator {
         }
     }
 
+    fn handle_coord(self: &Arc<Self>, id: u64, frame: CoordFrame) {
+        match frame {
+            CoordFrame::Value(message, raw) => self.handle(id, message, raw),
+            CoordFrame::Relay {
+                kind,
+                from,
+                to,
+                id: msg_id,
+                raw,
+            } => {
+                if let Some(tap) = &self.tap
+                    && let Ok(parsed) = parse(raw.as_bytes())
+                {
+                    tap.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(parsed.to_string());
+                }
+                let (Some(from), Some(to)) = (from, to) else {
+                    return self.reply_to(
+                        id,
+                        json!({"type": "error", "id": msg_id,
+                               "error": format!("a {kind} without from and to")}),
+                    );
+                };
+                if !self.may_send_as(id, &from) {
+                    return self.reply_to(
+                        id,
+                        json!({"type": "error", "id": msg_id, "to": to,
+                               "for": from,
+                               "error": format!("a {kind} from another node than the session's")}),
+                    );
+                }
+                if !valid_node_id(&to) {
+                    return self.reply_to(
+                        id,
+                        json!({"type": "error", "id": msg_id, "to": to,
+                               "error": "no such peer"}),
+                    );
+                }
+                match self.hop(&to) {
+                    Hop::Local(queue) => queue.push_raw(raw),
+                    Hop::Parent => {
+                        if let Some(parent) = self.parent() {
+                            parent.queue.push_raw(raw);
+                            parent.idle.touch();
+                        }
+                    }
+                    Hop::Nowhere => {
+                        let error = json!({"type": "error", "id": msg_id, "to": to,
+                                           "for": from, "error": "no such peer"});
+                        self.reply_to(id, error);
+                    }
+                }
+            }
+        }
+    }
+
     /// Handle one message of the session `id` (after its hello).
-    pub(crate) fn handle(self: &Arc<Self>, id: u64, message: Value) {
+    fn handle(self: &Arc<Self>, id: u64, message: Value, raw: Option<String>) {
         if let Some(tap) = &self.tap {
             tap.lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -935,7 +1306,7 @@ impl Coordinator {
                                                     "error": "no such peer"}),
                     );
                 }
-                self.route(id, &to, message);
+                self.route(id, &to, message, raw);
             }
             Some("error") => {
                 // A child coordinator's refusal of a relay, to its sender;
@@ -946,7 +1317,7 @@ impl Coordinator {
                 }
                 if let Some(target) = message["for"].as_str() {
                     match self.hop(target) {
-                        Hop::Local(queue) => push(&queue, message),
+                        Hop::Local(queue) => push_outbound(&queue, message, raw),
                         Hop::Parent | Hop::Nowhere => {}
                     }
                 }
@@ -961,12 +1332,12 @@ impl Coordinator {
     }
 
     /// Pass `message` (a relay or punch, its sender checked) toward `to`.
-    fn route(&self, id: u64, to: &str, message: Value) {
+    fn route(&self, id: u64, to: &str, message: Value, raw: Option<String>) {
         match self.hop(to) {
-            Hop::Local(queue) => push(&queue, message),
+            Hop::Local(queue) => push_outbound(&queue, message, raw),
             Hop::Parent => {
                 if let Some(parent) = self.parent() {
-                    parent.send(message);
+                    parent.send_raw(message, raw);
                 }
             }
             Hop::Nowhere => {
@@ -1167,8 +1538,8 @@ fn session(
     let welcome = json!({"type": "welcome", "v": PROTOCOL, "zone": coordinator.zone,
                          "coordinator": coordinator.identity.node_id(), "reflexive": reflexive});
     if channel.send(&welcome).is_ok() {
-        pump(&mut channel, &outbound, &waker, &dead, stop, |message| {
-            coordinator.handle(id, message);
+        pump_coord(&mut channel, &outbound, &waker, &dead, stop, |frame| {
+            coordinator.handle_coord(id, frame);
         });
     }
     coordinator.leave(id);
@@ -1178,20 +1549,20 @@ fn session(
 /// Send what `outbound` holds, take what comes (to `take`), until the
 /// connection fails, `dead` or `stop` is set, or nothing comes for
 /// [`IDLE`]: woken at once by what comes or what is queued (`waker`).
-fn pump(
+fn pump_coord(
     channel: &mut Channel,
-    outbound: &Receiver<Value>,
+    outbound: &Receiver<Outbound>,
     waker: &Waker,
     dead: &AtomicBool,
     stop: &AtomicBool,
-    mut take: impl FnMut(Value),
+    mut take: impl FnMut(CoordFrame),
 ) {
     let mut heard = Instant::now();
     while !dead.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
         if !send_queued(channel, outbound) {
             return;
         }
-        let Some(more) = take_buffered(channel, &mut heard, &mut take) else {
+        let Some(more) = take_buffered_coord(channel, &mut heard, &mut take) else {
             return;
         };
         if more {
@@ -1213,9 +1584,13 @@ fn pump(
 }
 
 /// Send all `outbound` holds: false when the connection failed.
-fn send_queued(channel: &mut Channel, outbound: &Receiver<Value>) -> bool {
-    while let Ok(message) = outbound.try_recv() {
-        if channel.send(&message).is_err() {
+fn send_queued(channel: &mut Channel, outbound: &Receiver<Outbound>) -> bool {
+    while let Ok(item) = outbound.try_recv() {
+        let sent = match item {
+            Outbound::Json(message) => channel.send(&message),
+            Outbound::Raw(raw) => channel.send_text(&raw),
+        };
+        if sent.is_err() {
             return false;
         }
     }
@@ -1225,16 +1600,34 @@ fn send_queued(channel: &mut Channel, outbound: &Receiver<Value>) -> bool {
 /// Hand every whole message read already to `take` (at most [`BATCH`]):
 /// whether more may wait, or none when the connection failed (a frame
 /// over [`MAX_FRAME`] among them).
-fn take_buffered(
+fn take_buffered_coord(
     channel: &mut Channel,
     heard: &mut Instant,
-    take: &mut impl FnMut(Value),
+    take: &mut impl FnMut(CoordFrame),
 ) -> Option<bool> {
     for _ in 0..BATCH {
-        match channel.next_buffered() {
-            Ok(Some(message)) => {
+        match channel.next_coord_frame() {
+            Ok(Some(frame)) => {
                 *heard = Instant::now();
-                take(message);
+                take(frame);
+            }
+            Ok(None) => return Some(false),
+            Err(_) => return None,
+        }
+    }
+    Some(true)
+}
+
+fn take_buffered_raw(
+    channel: &mut Channel,
+    heard: &mut Instant,
+    take: &mut impl FnMut(Value, Option<String>),
+) -> Option<bool> {
+    for _ in 0..BATCH {
+        match channel.next_buffered_raw() {
+            Ok(Some((message, raw))) => {
+                *heard = Instant::now();
+                take(message, raw);
             }
             Ok(None) => return Some(false),
             Err(_) => return None,
@@ -1339,9 +1732,24 @@ fn accept_loop(
         .name("coord-accept".to_string())
         .spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                let Ok((stream, _)) = listener.accept() else {
-                    std::thread::sleep(Duration::from_millis(20));
-                    continue;
+                let (stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        let timeout = rustix::event::Timespec {
+                            tv_sec: 0,
+                            tv_nsec: 50_000_000,
+                        };
+                        let mut fds = [rustix::event::PollFd::new(
+                            &listener,
+                            rustix::event::PollFlags::IN,
+                        )];
+                        let _ = rustix::event::poll(&mut fds, Some(&timeout));
+                        continue;
+                    }
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
                 };
                 // No slot: the connection is closed at once.
                 let (Some(thread_slot), Some(pending_slot)) = (
@@ -1753,8 +2161,12 @@ impl CoordClient {
 
     /// Queue `message` for the coordinator (its pump woken at once).
     pub(crate) fn send(&self, message: Value) {
+        self.send_raw(message, None);
+    }
+
+    fn send_raw(&self, message: Value, raw: Option<String>) {
         self.idle.touch();
-        push(&self.queue, message);
+        push_outbound(&self.queue, message, raw);
     }
 
     /// The next incoming message within `timeout`.
@@ -1766,15 +2178,20 @@ impl CoordClient {
             .ok()
     }
 
-    /// Send `message` and wait for the answer keyed `key`.
-    fn ask(&self, key: &str, message: Value, timeout: Duration) -> Result<Value, String> {
+    /// Send via `queue_msg` and wait for the answer keyed `key`.
+    fn ask_with(
+        &self,
+        key: &str,
+        timeout: Duration,
+        queue_msg: impl FnOnce(),
+    ) -> Result<Value, String> {
         let _asking = Asking::new(&self.idle);
         let (answer, wait) = std::sync::mpsc::channel();
         self.waiters
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(key.to_string(), answer);
-        self.send(message);
+        queue_msg();
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -1794,6 +2211,11 @@ impl CoordClient {
         } else {
             "the coordinator's connection closed".to_string()
         })
+    }
+
+    /// Send `message` and wait for the answer keyed `key`.
+    fn ask(&self, key: &str, message: Value, timeout: Duration) -> Result<Value, String> {
+        self.ask_with(key, timeout, || self.send(message))
     }
 
     /// A node's public record by `node_id` or `name`, or none.
@@ -1831,16 +2253,15 @@ impl CoordClient {
         payload: &Value,
         timeout: Duration,
     ) -> Result<Value, String> {
-        let (envelope, key) = seal_request(&self.identity, peer, policy, &nonce(), payload)?;
-        let req_nonce = envelope["req_nonce"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let answer = self.ask(
+        let (req_nonce, frame, key) =
+            crypto::seal_request_relay_frame(&self.identity, peer, policy, &nonce(), payload)?;
+        let answer = self.ask_with(
             &format!("reply:{}:{req_nonce}", peer.node_id),
-            json!({"type": "relay", "from": self.identity.node_id(), "to": peer.node_id,
-                   "id": req_nonce, "envelope": envelope}),
             timeout,
+            || {
+                self.idle.touch();
+                self.queue.push_raw(frame);
+            },
         )?;
         if answer["type"] == "error" {
             return Err(format!(
@@ -1880,7 +2301,7 @@ impl Drop for CoordClient {
 /// what is queued (`waker`).
 fn client_pump(
     channel: &mut Channel,
-    outbound: &Receiver<Value>,
+    outbound: &Receiver<Outbound>,
     waker: &Waker,
     stop: &AtomicBool,
     idle: &IdleClock,
@@ -1897,7 +2318,8 @@ fn client_pump(
             }
             pinged = Instant::now();
         }
-        let Some(more) = take_buffered(channel, &mut heard, &mut take) else {
+        let Some(more) = take_buffered_raw(channel, &mut heard, &mut |message, _| take(message))
+        else {
             return;
         };
         if more {
@@ -1991,10 +2413,10 @@ impl NodeService {
     /// Answer an envelope sealed to this node: its probe run, its
     /// registration recorded; the reply sealed (or a refusal of an
     /// envelope that does not open).
-    pub(crate) fn answer(&self, envelope: &Value) -> Value {
+    fn open_and_reply(&self, envelope: &Value) -> Result<(crypto::Opened, Value), Value> {
         let opened = match self.responder.open(envelope) {
             Ok(opened) => opened,
-            Err(why) => return envelope_error(&why, envelope),
+            Err(why) => return Err(envelope_error(&why, envelope)),
         };
         let reply = match self.request(&opened) {
             Ok(Value::Object(mut fields)) => {
@@ -2004,10 +2426,25 @@ impl NodeService {
             Ok(_) => json!({"ok": true}),
             Err(error) => json!({"ok": false, "error": spawn_core::redact::redact(&error)}),
         };
+        Ok((opened, reply))
+    }
+
+    pub(crate) fn answer(&self, envelope: &Value) -> Value {
+        match self.open_and_reply(envelope) {
+            Ok((opened, reply)) => opened
+                .reply
+                .seal(&reply)
+                .unwrap_or_else(|why| envelope_error(&why, envelope)),
+            Err(error) => error,
+        }
+    }
+
+    fn answer_relay_frame(&self, envelope: &Value, my_node_id: &str) -> Result<String, Value> {
+        let (opened, reply) = self.open_and_reply(envelope)?;
         opened
             .reply
-            .seal(&reply)
-            .unwrap_or_else(|why| envelope_error(&why, envelope))
+            .seal_relay_frame(my_node_id, &reply)
+            .map_err(|why| envelope_error(&why, envelope))
     }
 
     fn request(&self, opened: &crypto::Opened) -> Result<Value, String> {
@@ -2148,6 +2585,48 @@ pub(crate) type Say = Arc<dyn Fn(String) + Send + Sync>;
 /// `spawn node connect`'s loop: connected (again, with a backoff), its
 /// hello said, each request answered on a thread of its own, its
 /// registration sent once, until `stop`.
+struct ConnectorUdp {
+    reflexive: Option<String>,
+    thread: Option<JoinHandle<()>>,
+    punch: Option<Puncher>,
+}
+
+fn setup_connector_udp(
+    config: &ConnectConfig,
+    service: &Arc<NodeService>,
+    stop: &Arc<AtomicBool>,
+    say: &Say,
+) -> Result<ConnectorUdp, String> {
+    let Some(server) = &config.udp_stun else {
+        return Ok(ConnectorUdp {
+            reflexive: None,
+            thread: None,
+            punch: None,
+        });
+    };
+    let server = bind_address(server)?;
+    let local = if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(local).map_err(|error| error.to_string())?;
+    let reflexive = stun(&socket, server, Duration::from_secs(5))?;
+    say(format!("node connect: udp reflexive {reflexive}"));
+    // The punches go out of the very socket the mapping is of.
+    let punch_socket = Puncher::new(
+        socket.try_clone().map_err(|error| error.to_string())?,
+        config.punch_loopback,
+    );
+    let udp_thread = udp_service(socket, Arc::clone(service), Arc::clone(stop))
+        .map_err(|error| error.to_string())?;
+    Ok(ConnectorUdp {
+        reflexive: Some(reflexive.to_string()),
+        thread: Some(udp_thread),
+        punch: Some(punch_socket),
+    })
+}
+
 pub(crate) fn run_connector(
     config: &ConnectConfig,
     identity: &Arc<NodeIdentity>,
@@ -2156,30 +2635,11 @@ pub(crate) fn run_connector(
     tls: Option<&Arc<rustls::ClientConfig>>,
     say: &Say,
 ) -> Result<(), String> {
-    let mut udp_reflexive = None;
-    let mut udp_thread = None;
-    let mut punch_socket = None;
-    if let Some(server) = &config.udp_stun {
-        let server = bind_address(server)?;
-        let local = if server.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        let socket = UdpSocket::bind(local).map_err(|error| error.to_string())?;
-        let reflexive = stun(&socket, server, Duration::from_secs(5))?;
-        say(format!("node connect: udp reflexive {reflexive}"));
-        udp_reflexive = Some(reflexive.to_string());
-        // The punches go out of the very socket the mapping is of.
-        punch_socket = Some(Puncher::new(
-            socket.try_clone().map_err(|error| error.to_string())?,
-            config.punch_loopback,
-        ));
-        udp_thread = Some(
-            udp_service(socket, Arc::clone(service), Arc::clone(stop))
-                .map_err(|error| error.to_string())?,
-        );
-    }
+    let ConnectorUdp {
+        reflexive: udp_reflexive,
+        thread: udp_thread,
+        punch: punch_socket,
+    } = setup_connector_udp(config, service, stop, say)?;
     let fields = HelloFields {
         kind: Kind::Node,
         name: config.name.clone(),
@@ -2240,10 +2700,17 @@ pub(crate) fn run_connector(
                 .map_err(|error| error.to_string())?;
             registered = true;
         }
+        let request_pool = RequestPool::new(MAX_REQUESTS);
         while client.alive() && !stop.load(Ordering::Relaxed) && rotated.elapsed() < PREKEY_LIFETIME
         {
             if let Some(message) = client.next_incoming(Duration::from_millis(100)) {
-                take_incoming(message, &client, service, punch_socket.as_ref());
+                take_incoming(
+                    message,
+                    &client,
+                    service,
+                    punch_socket.as_ref(),
+                    &request_pool,
+                );
             }
         }
         client.close();
@@ -2320,14 +2787,157 @@ impl Puncher {
     }
 }
 
-/// One message to a connected node: a sealed request answered on a
-/// thread of its own; a punch answered by `punch` (the node's mapped
+struct RequestJob {
+    message: Value,
+    client: Arc<CoordClient>,
+    service: Arc<NodeService>,
+    slot: Held,
+}
+
+struct RequestPoolState {
+    queue: VecDeque<RequestJob>,
+    busy: usize,
+    workers: usize,
+    stopped: bool,
+}
+
+struct BusyGuard<'a>(&'a (Mutex<RequestPoolState>, Condvar));
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.0.lock().unwrap_or_else(PoisonError::into_inner);
+        state.busy = state.busy.saturating_sub(1);
+    }
+}
+
+/// Bounded worker pool for sealed incoming requests on a connected node:
+/// reuses live threads across repeated bursts instead of spawning an OS
+/// thread per request.
+struct RequestPool {
+    inner: Arc<(Mutex<RequestPoolState>, Condvar)>,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+    max_workers: usize,
+}
+
+impl RequestPool {
+    fn new(max_workers: usize) -> Self {
+        Self {
+            inner: Arc::new((
+                Mutex::new(RequestPoolState {
+                    queue: VecDeque::new(),
+                    busy: 0,
+                    workers: 0,
+                    stopped: false,
+                }),
+                Condvar::new(),
+            )),
+            handles: Mutex::new(Vec::new()),
+            max_workers: max_workers.max(1),
+        }
+    }
+
+    fn submit(&self, job: RequestJob) {
+        let should_spawn = {
+            let (lock, cv) = &*self.inner;
+            let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.stopped {
+                return;
+            }
+            state.queue.push_back(job);
+            let need =
+                state.busy + state.queue.len() > state.workers && state.workers < self.max_workers;
+            if need {
+                state.workers += 1;
+            }
+            cv.notify_one();
+            need
+        };
+        if should_spawn {
+            let inner = Arc::clone(&self.inner);
+            if let Ok(handle) = std::thread::Builder::new()
+                .name("node-request".to_string())
+                .spawn(move || request_worker(&inner))
+            {
+                self.handles
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(handle);
+            } else {
+                let (lock, _) = &*self.inner;
+                let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                state.workers = state.workers.saturating_sub(1);
+            }
+        }
+    }
+}
+
+impl Drop for RequestPool {
+    fn drop(&mut self) {
+        {
+            let (lock, cv) = &*self.inner;
+            let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            state.stopped = true;
+            state.queue.clear();
+            cv.notify_all();
+        }
+        let handles =
+            std::mem::take(&mut *self.handles.lock().unwrap_or_else(PoisonError::into_inner));
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn request_worker(inner: &(Mutex<RequestPoolState>, Condvar)) {
+    loop {
+        let job = {
+            let mut state = inner.0.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if let Some(job) = state.queue.pop_front() {
+                    state.busy += 1;
+                    break Some(job);
+                }
+                if state.stopped {
+                    state.workers = state.workers.saturating_sub(1);
+                    break None;
+                }
+                state = inner.1.wait(state).unwrap_or_else(PoisonError::into_inner);
+            }
+        };
+        let Some(job) = job else {
+            return;
+        };
+        let _busy = BusyGuard(inner);
+        let _slot = job.slot;
+        let envelope = &job.message["envelope"];
+        let my_id = job.client.identity().node_id();
+        match job.service.answer_relay_frame(envelope, my_id) {
+            Ok(raw) => {
+                job.client.idle.touch();
+                job.client.queue.push_raw(raw);
+            }
+            Err(err_envelope) => {
+                job.client.send(json!({
+                    "type": "relay",
+                    "from": my_id,
+                    "to": envelope["from"],
+                    "id": envelope["req_nonce"],
+                    "envelope": err_envelope,
+                }));
+            }
+        }
+    }
+}
+
+/// One message to a connected node: a sealed request answered on the node's
+/// reusable worker pool; a punch answered by `punch` (the node's mapped
 /// socket).
 fn take_incoming(
     message: Value,
     client: &Arc<CoordClient>,
     service: &Arc<NodeService>,
     punch: Option<&Puncher>,
+    pool: &RequestPool,
 ) {
     match message["type"].as_str() {
         Some("relay") if message["envelope"]["v"] == crypto::E2E_DOMAIN => {
@@ -2342,18 +2952,12 @@ fn take_incoming(
                 }));
                 return;
             };
-            let (client, service) = (Arc::clone(client), Arc::clone(service));
-            let _ = std::thread::Builder::new()
-                .name("node-request".to_string())
-                .spawn(move || {
-                    let _slot = slot;
-                    let envelope = &message["envelope"];
-                    let reply = service.answer(envelope);
-                    client.send(json!({
-                        "type": "relay", "from": client.identity().node_id(),
-                        "to": envelope["from"], "id": envelope["req_nonce"], "envelope": reply,
-                    }));
-                });
+            pool.submit(RequestJob {
+                message,
+                client: Arc::clone(client),
+                service: Arc::clone(service),
+                slot,
+            });
         }
         Some("punch") => {
             if let Some(puncher) = punch {
@@ -2598,7 +3202,7 @@ fn punched(
     payload: &Value,
     wait: Duration,
 ) -> Result<Value, String> {
-    let (envelope, key) = seal_request(client.identity(), peer, policy, &nonce(), payload)?;
+    let (envelope, key) = crypto::seal_request(client.identity(), peer, policy, &nonce(), payload)?;
     let socket = UdpSocket::bind(if reflexive.is_ipv4() {
         "0.0.0.0:0"
     } else {

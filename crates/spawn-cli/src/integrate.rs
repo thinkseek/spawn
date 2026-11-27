@@ -5852,6 +5852,57 @@ fn kept_work(store: &PostgresStore, mission: &Mission, task: &Task) -> Result<Ke
     Ok(Kept::Waiting)
 }
 
+/// Active worker agent ids across open/delivering tasks and gated missions
+/// (`#103` item 3): refs belonging to any of these workers are strictly
+/// protected against branch or worktree pruning.
+#[allow(dead_code)]
+pub(crate) fn active_worker_set(
+    store: &PostgresStore,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut active = sources::active_worker_set(store)?;
+    let gated = store.gated_missions().map_err(|error| error.to_string())?;
+    for mission in gated.as_array().into_iter().flatten() {
+        for task in mission["tasks"].as_array().into_iter().flatten() {
+            let Some(agent) = task["agent_id"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            if !matches!(
+                task["state"].as_str(),
+                Some("landed" | "cancelled" | "aborted" | "yielded" | "done" | "closed")
+            ) {
+                active.insert(agent.to_string());
+            }
+        }
+    }
+    Ok(active)
+}
+
+/// Delete `ref_name` in `repo` only if it is neither a protected task/worker
+/// ref nor a branch of an active worker in `store`.
+#[allow(dead_code)]
+pub(crate) fn prune_ref_guarded(
+    store: &PostgresStore,
+    repo: &Path,
+    ref_name: &str,
+) -> Result<(), String> {
+    let active = active_worker_set(store)?;
+    sources::delete_ref_guarded(repo, ref_name, &active).map_err(|error| error.to_string())
+}
+
+/// Remove `worktree_path` (and optionally delete `branch_ref`) in `repo`
+/// only after verifying neither targets an active worker or protected ref.
+#[allow(dead_code)]
+pub(crate) fn prune_worktree_guarded(
+    store: &PostgresStore,
+    repo: &Path,
+    worktree_path: &Path,
+    branch_ref: Option<&str>,
+) -> Result<(), String> {
+    let active = active_worker_set(store)?;
+    sources::prune_worktree_guarded(repo, worktree_path, branch_ref, &active)
+        .map_err(|error| error.to_string())
+}
+
 /// A path through the controller's symlink (`controllers/<name>` in the
 /// live directory, switched by deploy/controller.sh), resolved once for a
 /// step: what counts the scenarios, the gate and its scenarios are then one
