@@ -2859,12 +2859,29 @@ fn with_fleet_liveness(agents: &mut Value, now_ms: i64) {
         } else {
             None
         };
+        let waiting_on_own_job = live
+            && agent
+                .get("judgement")
+                .and_then(|judgement| judgement.get("reason"))
+                .and_then(Value::as_str)
+                == Some("WAITING_FOR_BACKGROUND_JOB")
+            && agent
+                .get("activity")
+                .and_then(|activity| activity.get("jobs"))
+                .and_then(Value::as_array)
+                .is_some_and(|jobs| !jobs.is_empty());
         let liveness_state = if !live {
             "offline"
         } else if state == "BLOCKED" {
             "blocked"
         } else if matches!(state.as_str(), "WAITING" | "COMPLETED") {
             "waiting_idle"
+        } else if waiting_on_own_job {
+            if silence_ms.is_some_and(|silence| silence < LIVENESS_AGENT_QUIET_MS) {
+                "active_heartbeat"
+            } else {
+                "quiet_working"
+            }
         } else if silence_ms.is_some_and(|silence| silence >= LIVENESS_AGENT_STALLED_MS) {
             "loop_stalled"
         } else if silence_ms.is_some_and(|silence| silence >= LIVENESS_AGENT_QUIET_MS) {
@@ -6364,6 +6381,100 @@ mod tests {
 
         assert_eq!(rows[6]["liveness_state"], "active_heartbeat");
         assert_eq!(rows[6]["silence_ms"], 0);
+    }
+
+    #[test]
+    fn fleet_liveness_caps_waiting_for_background_job_at_quiet_working() {
+        let now = 1_000_000_000;
+        let min = 60_000;
+        let mut agents = json!([
+            {
+                "session_id": "s_bg_active",
+                "live": true,
+                "state": "WORKING",
+                "judgement": { "reason": "WAITING_FOR_BACKGROUND_JOB" },
+                "activity": {
+                    "last_event_at_ms": now - 2 * min,
+                    "jobs": [{ "id": "job-1" }]
+                }
+            },
+            {
+                "session_id": "s_bg_quiet",
+                "live": true,
+                "state": "WORKING",
+                "judgement": { "reason": "WAITING_FOR_BACKGROUND_JOB" },
+                "activity": {
+                    "last_event_at_ms": now - 7 * min,
+                    "jobs": [{ "id": "job-2" }]
+                }
+            },
+            {
+                "session_id": "s_bg_long_wait",
+                "live": true,
+                "state": "WORKING",
+                "judgement": { "reason": "WAITING_FOR_BACKGROUND_JOB" },
+                "activity": {
+                    "last_event_at_ms": now - 25 * min,
+                    "jobs": [{ "id": "job-3" }]
+                }
+            },
+            {
+                "session_id": "s_bg_null_ts",
+                "live": true,
+                "state": "WORKING",
+                "judgement": { "reason": "WAITING_FOR_BACKGROUND_JOB" },
+                "activity": {
+                    "jobs": [{ "id": "job-4" }]
+                }
+            },
+            {
+                "session_id": "s_bg_empty_jobs_stalled",
+                "live": true,
+                "state": "WORKING",
+                "judgement": { "reason": "WAITING_FOR_BACKGROUND_JOB" },
+                "activity": {
+                    "last_event_at_ms": now - 25 * min,
+                    "jobs": []
+                }
+            },
+            {
+                "session_id": "s_non_bg_stalled",
+                "live": true,
+                "state": "WORKING",
+                "judgement": { "reason": "MODEL_SILENT" },
+                "activity": {
+                    "last_event_at_ms": now - 25 * min,
+                    "jobs": [{ "id": "job-5" }]
+                }
+            }
+        ]);
+
+        with_fleet_liveness(&mut agents, now);
+        let rows = agents.as_array().expect("agents array");
+
+        assert_eq!(rows[0]["liveness_state"], "active_heartbeat");
+        assert_eq!(rows[0]["last_event_at_ms"], now - 2 * min);
+        assert_eq!(rows[0]["silence_ms"], 2 * min);
+
+        assert_eq!(rows[1]["liveness_state"], "quiet_working");
+        assert_eq!(rows[1]["last_event_at_ms"], now - 7 * min);
+        assert_eq!(rows[1]["silence_ms"], 7 * min);
+
+        assert_eq!(rows[2]["liveness_state"], "quiet_working");
+        assert_eq!(rows[2]["last_event_at_ms"], now - 25 * min);
+        assert_eq!(rows[2]["silence_ms"], 25 * min);
+
+        assert_eq!(rows[3]["liveness_state"], "quiet_working");
+        assert!(rows[3]["last_event_at_ms"].is_null());
+        assert!(rows[3]["silence_ms"].is_null());
+
+        assert_eq!(rows[4]["liveness_state"], "loop_stalled");
+        assert_eq!(rows[4]["last_event_at_ms"], now - 25 * min);
+        assert_eq!(rows[4]["silence_ms"], 25 * min);
+
+        assert_eq!(rows[5]["liveness_state"], "loop_stalled");
+        assert_eq!(rows[5]["last_event_at_ms"], now - 25 * min);
+        assert_eq!(rows[5]["silence_ms"], 25 * min);
     }
 
     #[test]

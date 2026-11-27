@@ -472,6 +472,10 @@ impl RefLedger for BorrowedPgRefLedger<'_> {
     fn list_refs(&self, project: Option<&str>) -> Result<Vec<LedgerRef>, D6StoreError> {
         pg_list_refs(self.0, project)
     }
+
+    fn retire_project_refs(&self, project: &str, reason: &str) -> Result<usize, D6StoreError> {
+        pg_retire_project_refs(self.0, project, reason)
+    }
 }
 
 /// Resolve workspace backend settings for `root` without claiming the root on disk
@@ -824,6 +828,18 @@ fn pg_list_refs(pg: &PostgresStore, project: Option<&str>) -> Result<Vec<LedgerR
         .collect()
 }
 
+fn pg_retire_project_refs(
+    pg: &PostgresStore,
+    project: &str,
+    reason: &str,
+) -> Result<usize, D6StoreError> {
+    let retired = pg
+        .retire_project_refs(project, reason)
+        .map_err(|e| D6StoreError::Ledger(e.to_string()))?;
+    usize::try_from(retired)
+        .map_err(|_| D6StoreError::Ledger(format!("negative retired ref count: {retired}")))
+}
+
 impl RefLedger for PostgresRefLedger {
     fn record_snapshot(
         &self,
@@ -907,6 +923,10 @@ impl RefLedger for PostgresRefLedger {
     fn list_refs(&self, project: Option<&str>) -> Result<Vec<LedgerRef>, D6StoreError> {
         pg_list_refs(&self.store, project)
     }
+
+    fn retire_project_refs(&self, project: &str, reason: &str) -> Result<usize, D6StoreError> {
+        pg_retire_project_refs(&self.store, project, reason)
+    }
 }
 
 impl RefLedger for LazyPgRefLedger {
@@ -981,6 +1001,10 @@ impl RefLedger for LazyPgRefLedger {
 
     fn list_refs(&self, project: Option<&str>) -> Result<Vec<LedgerRef>, D6StoreError> {
         self.with_store(|pg| pg_list_refs(pg, project))
+    }
+
+    fn retire_project_refs(&self, project: &str, reason: &str) -> Result<usize, D6StoreError> {
+        self.with_store(|pg| pg_retire_project_refs(pg, project, reason))
     }
 }
 
@@ -4204,5 +4228,398 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn publish_test_ref(
+        cas: &spawn_host::CasMerkleStore,
+        ledger: &dyn spawn_host::RefLedger,
+        project: &str,
+        ref_name: &str,
+        kind: spawn_host::D6RefKind,
+        entry: (&[u8], &[u8]),
+        at_ms: i64,
+    ) -> spawn_cas::Digest {
+        let (file_name, content) = entry;
+        let (blob, size) = cas.put_bytes_blob(content).expect("blob");
+        let tree = cas
+            .put_tree_cached(
+                &spawn_cas::Tree::from_entries(vec![spawn_cas::TreeEntry::file(
+                    file_name.to_vec(),
+                    &blob,
+                    size,
+                )])
+                .expect("tree"),
+            )
+            .expect("put tree");
+        let body = spawn_host::format_commit_body(
+            "t <t@t> 1000 +0000",
+            "t <t@t> 1000 +0000",
+            &format!("{project}:{ref_name}\n"),
+        );
+        cas.publish_snapshot(
+            ledger,
+            &spawn_host::PublishRequest {
+                project,
+                ref_name,
+                kind,
+                expected_ref: None,
+                tree: &tree,
+                parents: &[],
+                commit_body: &body,
+                created_at_ms: at_ms,
+                reason: "test:publish",
+                landing_task_id: None,
+            },
+        )
+        .expect("publish")
+        .snapshot
+    }
+
+    fn run_cutover_steps(
+        cutover: &mut spawn_host::ProjectCutover,
+        cas: &spawn_host::CasMerkleStore,
+        ledger: &super::PostgresRefLedger,
+        border: &spawn_host::GitBorderAdapter,
+        reason: &str,
+    ) {
+        cutover
+            .step1_backfill_history(cas, ledger)
+            .expect("step1_backfill_history");
+        cutover
+            .step2_pause_dispatch_and_verify_clean(cas)
+            .expect("step2_pause_dispatch_and_verify_clean");
+        cutover
+            .step3_import_tail_commits(cas, ledger)
+            .expect("step3_import_tail_commits");
+        cutover
+            .step4_commit_refs_and_flip_mode(cas, ledger, border, reason)
+            .expect("step4_commit_refs_and_flip_mode");
+        cutover
+            .step5_verify_parity(cas, ledger)
+            .expect("step5_verify_parity");
+        cutover
+            .step6_configure_readonly_border(border)
+            .expect("step6_configure_readonly_border");
+        cutover
+            .step7_resume_dispatch()
+            .expect("step7_resume_dispatch");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pg_ref_ledger_adapters_retire_project_refs_audit_and_preserve_snapshots_and_other_projects()
+    {
+        use spawn_host::{CasMerkleStore, D6RefKind, RefLedger};
+        use spawn_postgres::SnapshotState;
+
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("d6_retire_adapters");
+        let store = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+        );
+        let base = std::env::temp_dir().join(format!(
+            "spawn-sources-retire-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let cas = CasMerkleStore::open(base.join("cas")).expect("cas");
+
+        let pg_ledger = super::PostgresRefLedger::new(std::sync::Arc::clone(&store));
+        let lazy_ledger = super::LazyPgRefLedger {
+            store: std::sync::Mutex::new(Some(std::sync::Arc::clone(&store))),
+        };
+        let borrowed_ledger = super::BorrowedPgRefLedger::new(&store);
+
+        let mut retired_snaps = Vec::new();
+        for (idx, (project, ledger_ref)) in [
+            ("proj-pg", &pg_ledger as &dyn RefLedger),
+            ("proj-lazy", &lazy_ledger as &dyn RefLedger),
+            ("proj-borrowed", &borrowed_ledger as &dyn RefLedger),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let offset = i64::try_from(idx).expect("idx") * 10_000;
+            let s_main = publish_test_ref(
+                &cas,
+                ledger_ref,
+                project,
+                "main",
+                D6RefKind::Main,
+                (b"README.md", format!("main:{project}\n").as_bytes()),
+                1_000_000 + offset,
+            );
+            let s_branch = publish_test_ref(
+                &cas,
+                ledger_ref,
+                project,
+                "feat/work",
+                D6RefKind::Branch,
+                (b"WORK.md", format!("branch:{project}\n").as_bytes()),
+                1_001_000 + offset,
+            );
+            retired_snaps.push(s_main);
+            retired_snaps.push(s_branch);
+        }
+
+        let other_main = publish_test_ref(
+            &cas,
+            &pg_ledger,
+            "proj-other",
+            "main",
+            D6RefKind::Main,
+            (b"OTHER.md", b"keep-main\n"),
+            2_000_000,
+        );
+        let other_branch = publish_test_ref(
+            &cas,
+            &pg_ledger,
+            "proj-other",
+            "topic/keep",
+            D6RefKind::Branch,
+            (b"TOPIC.md", b"keep-branch\n"),
+            2_001_000,
+        );
+
+        assert!(pg_ledger.retire_project_refs("   ", "blank").is_err());
+
+        let seq_before = store.latest_ref_log_seq().expect("seq before");
+        assert_eq!(
+            (&pg_ledger as &dyn RefLedger)
+                .retire_project_refs("proj-pg", "test:pg-retire")
+                .expect("retire pg"),
+            2
+        );
+        assert_eq!(
+            (&lazy_ledger as &dyn RefLedger)
+                .retire_project_refs("proj-lazy", "test:lazy-retire")
+                .expect("retire lazy"),
+            2
+        );
+        assert_eq!(
+            (&borrowed_ledger as &dyn RefLedger)
+                .retire_project_refs("proj-borrowed", "test:borrowed-retire")
+                .expect("retire borrowed"),
+            2
+        );
+
+        for project in ["proj-pg", "proj-lazy", "proj-borrowed"] {
+            assert!(
+                store.list_refs(Some(project)).expect("list").is_empty(),
+                "{project} must have zero active spawn_refs after retire"
+            );
+            assert_eq!(
+                pg_ledger
+                    .retire_project_refs(project, "repeat")
+                    .expect("repeat retire"),
+                0,
+                "repeating retire for {project} must be a 0-row no-op"
+            );
+        }
+
+        let kept_refs = store.list_refs(Some("proj-other")).expect("other refs");
+        assert_eq!(kept_refs.len(), 2);
+        assert!(
+            kept_refs
+                .iter()
+                .any(|r| r.name == "main" && r.snapshot == other_main.to_string())
+        );
+        assert!(
+            kept_refs
+                .iter()
+                .any(|r| r.name == "topic/keep" && r.snapshot == other_branch.to_string())
+        );
+
+        for snap in &retired_snaps {
+            let row = store
+                .get_snapshot(&snap.to_string())
+                .expect("get_snapshot")
+                .expect("retired snapshot row must stay intact");
+            assert_eq!(row.state, SnapshotState::Live);
+        }
+
+        let log_rows = store
+            .list_ref_log_after(i64::try_from(seq_before).expect("seq fits i64"))
+            .expect("list_ref_log_after");
+        assert_eq!(log_rows.len(), 6);
+        for (project, reason) in [
+            ("proj-pg", "test:pg-retire"),
+            ("proj-lazy", "test:lazy-retire"),
+            ("proj-borrowed", "test:borrowed-retire"),
+        ] {
+            let matches: Vec<_> = log_rows
+                .iter()
+                .filter(|row| row.project == project && row.reason == reason)
+                .collect();
+            assert_eq!(matches.len(), 2, "missing audit rows for {project}");
+            for row in matches {
+                assert_eq!(row.old_snapshot.as_deref(), Some(row.new_snapshot.as_str()));
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pg_ref_ledger_rollback_to_git_advance_main_and_recutover_to_d6() {
+        use spawn_host::{
+            CasMerkleStore, D6RefKind, GitBorderAdapter, ProjectCutover, RefLedger,
+            is_readonly_border, verify_cutover_parity,
+        };
+        use spawn_postgres::SnapshotState;
+
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("d6_recutover");
+        let store = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+        );
+        let ledger = super::PostgresRefLedger::new(std::sync::Arc::clone(&store));
+
+        let scratch = std::env::temp_dir().join(format!(
+            "spawn-sources-recutover-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let bare = scratch.join("bare.git");
+        let work = scratch.join("work");
+        let ws_root = scratch.join("ws-root");
+        std::fs::create_dir_all(&ws_root).expect("ws_root");
+        let bare_s = bare.to_string_lossy().into_owned();
+        let work_s = work.to_string_lossy().into_owned();
+
+        git(&["init", "--quiet", "--bare", &bare_s]).expect("init bare");
+        git(&[
+            "--git-dir",
+            &bare_s,
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ])
+        .expect("symref");
+        std::fs::create_dir_all(&work).expect("work");
+        git(&["-C", &work_s, "init", "--quiet"]).expect("init work");
+        git(&["-C", &work_s, "checkout", "-B", "main"]).expect("checkout main");
+        git(&["-C", &work_s, "config", "user.name", "Test"]).expect("cfg name");
+        git(&["-C", &work_s, "config", "user.email", "t@t"]).expect("cfg email");
+        std::fs::write(work.join("README.md"), "v1\n").expect("write v1");
+        git(&["-C", &work_s, "add", "README.md"]).expect("add v1");
+        git(&["-C", &work_s, "commit", "-q", "-m", "m1"]).expect("commit m1");
+        let m1_oid = git(&["-C", &work_s, "rev-parse", "HEAD"]).expect("m1 oid");
+        git(&["-C", &work_s, "remote", "add", "origin", &bare_s]).expect("remote");
+        git(&["-C", &work_s, "push", "-q", "-u", "origin", "main"]).expect("push m1");
+        git(&["-C", &work_s, "checkout", "-q", "-b", "feat"]).expect("checkout feat");
+        std::fs::write(work.join("FEAT.md"), "feat\n").expect("write feat");
+        git(&["-C", &work_s, "add", "FEAT.md"]).expect("add feat");
+        git(&["-C", &work_s, "commit", "-q", "-m", "feat"]).expect("commit feat");
+        git(&["-C", &work_s, "push", "-q", "origin", "feat"]).expect("push feat");
+        git(&["-C", &work_s, "checkout", "-q", "main"]).expect("back to main");
+
+        let cas = CasMerkleStore::open(ws_root.join(".d6/cas")).expect("cas");
+        let border = GitBorderAdapter::new();
+        let kept_other_snap = publish_test_ref(
+            &cas,
+            &ledger,
+            "proj-keep",
+            "main",
+            D6RefKind::Main,
+            (b"KEEP.md", b"keep\n"),
+            500_000,
+        );
+
+        let project = bare_s.clone();
+        let mut cutover1 = ProjectCutover::new(&project, &bare, &ws_root);
+        run_cutover_steps(&mut cutover1, &cas, &ledger, &border, "cutover-1");
+        assert!(is_readonly_border(&bare).expect("ro after cutover 1"));
+
+        let refs_before_rb = ledger.list_refs(Some(&project)).expect("refs before rb");
+        let main_before_rb = refs_before_rb
+            .iter()
+            .find(|r| r.name == "main")
+            .expect("main ref before rollback");
+        let main_snap_m1 = ledger
+            .get_snapshot(&main_before_rb.snapshot)
+            .expect("get m1 snap")
+            .expect("m1 snap exists");
+        assert_eq!(main_snap_m1.git_oid.to_hex(), m1_oid);
+
+        let seq_before_rb = store.latest_ref_log_seq().expect("seq before rb");
+        let rb = cutover1
+            .rollback_to_git(&cas, &ledger, &border)
+            .expect("rollback_to_git");
+        assert_eq!(rb.exported_refs, refs_before_rb.len());
+        assert!(!is_readonly_border(&bare).expect("writable after rollback"));
+        assert!(
+            ledger
+                .list_refs(Some(&project))
+                .expect("refs after rb")
+                .is_empty(),
+            "rollback must retire all active spawn_refs for project"
+        );
+        assert_eq!(
+            store
+                .get_snapshot(&main_before_rb.snapshot.to_string())
+                .expect("snap after rb")
+                .expect("snap still present")
+                .state,
+            SnapshotState::Live
+        );
+        assert_eq!(
+            ledger
+                .list_refs(Some("proj-keep"))
+                .expect("kept project")
+                .first()
+                .map(|r| r.snapshot.clone()),
+            Some(kept_other_snap)
+        );
+        let rb_logs = store
+            .list_ref_log_after(i64::try_from(seq_before_rb).expect("seq"))
+            .expect("rb log");
+        assert_eq!(rb_logs.len(), rb.exported_refs);
+        assert!(
+            rb_logs
+                .iter()
+                .all(|row| row.project == project && row.reason == "rollback to git")
+        );
+
+        // Advance `main` directly in Git while rolled back, then re-cut over to D6.
+        std::fs::write(work.join("README.md"), "v2 from git\n").expect("write v2");
+        git(&["-C", &work_s, "add", "README.md"]).expect("add v2");
+        git(&["-C", &work_s, "commit", "-q", "-m", "m2"]).expect("commit m2");
+        let m2_oid = git(&["-C", &work_s, "rev-parse", "HEAD"]).expect("m2 oid");
+        assert_ne!(m2_oid, m1_oid);
+        git(&["-C", &work_s, "push", "-q", "origin", "main"]).expect("push m2");
+
+        let mut cutover2 = ProjectCutover::new(&project, &bare, &ws_root);
+        run_cutover_steps(&mut cutover2, &cas, &ledger, &border, "cutover-2");
+        assert!(is_readonly_border(&bare).expect("ro after cutover 2"));
+        verify_cutover_parity(&cas, &ledger, &project, &bare).expect("parity after recutover");
+        let refs_after = ledger
+            .list_refs(Some(&project))
+            .expect("refs after recutover");
+        let main_after = refs_after
+            .iter()
+            .find(|r| r.name == "main")
+            .expect("main ref after recutover");
+        let main_snap_m2 = ledger
+            .get_snapshot(&main_after.snapshot)
+            .expect("get m2 snap")
+            .expect("m2 snap exists");
+        assert_eq!(main_snap_m2.git_oid.to_hex(), m2_oid);
+        assert_eq!(
+            ledger
+                .list_refs(Some("proj-keep"))
+                .expect("kept still")
+                .len(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }
