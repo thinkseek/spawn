@@ -3807,6 +3807,16 @@ impl spawn_host::RefLedger for BorrowedPgRefLedger<'_> {
             })
             .collect()
     }
+
+    fn retire_project_refs(
+        &self,
+        _project: &str,
+        _reason: &str,
+    ) -> Result<usize, spawn_host::D6StoreError> {
+        Err(spawn_host::D6StoreError::Ledger(
+            "backup export ledger is read-only".to_string(),
+        ))
+    }
 }
 
 /// Prepared repository path ready for `heads_of` / `git bundle create` / live
@@ -5052,7 +5062,9 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn d6_backup_source_preparation_supports_full_incremental_and_fails_closed_on_missing_cas() {
         use spawn_cas::{Tree, TreeEntry, TreeEntryKind};
-        use spawn_host::{CasMerkleStore, D6RefKind, PublishRequest, format_commit_body};
+        use spawn_host::{
+            CasMerkleStore, D6RefKind, PublishRequest, RefLedger as _, format_commit_body,
+        };
 
         let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
             "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
@@ -5265,5 +5277,19 @@ mod tests {
         .expect("wip-only passes through");
         assert!(!git_pass.is_d6());
         assert_eq!(git_pass.git_dir(), wip_project);
+
+        // Read-only backup export ledger refuses retiring project refs rather than defaulting Ok(0).
+        let ro_ledger = super::BorrowedPgRefLedger(&store);
+        let retire_err = ro_ledger
+            .retire_project_refs(&project, "test read-only contract")
+            .expect_err("read-only ledger must refuse retire_project_refs");
+        assert!(retire_err.to_string().contains("read-only"), "{retire_err}");
+        assert!(
+            !store
+                .list_refs(Some(&project))
+                .expect("refs stay intact")
+                .is_empty(),
+            "live PG refs must remain unchanged after read-only refusal"
+        );
     }
 }

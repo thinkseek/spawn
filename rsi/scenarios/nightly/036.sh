@@ -79,9 +79,10 @@
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
 # error exits 2, never 1.
 #
-# Fails with 1 at (1) on the live main (984d059) and on objective 035's
-# reference implementation alone: no shadow reaches the runner. It passes
-# once judged verdicts are shadowed as above.
+# Objective 036 landed on main in 144edc3c (task 239) and passes on live
+# main (0d400b2e+); M2 remote gate runner capability is ready with
+# spawn-node v0.1.2-m2. Fails with 1 at (1) only on pre-144edc3c trees
+# lacking shadow verdict dispatch.
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh): needs SPAWN_BIN and
 # SPAWN_TEST_DATABASE_URL, creates and drops its own database, uses a
 # private tmux socket, no network. Every wait is bounded in time.

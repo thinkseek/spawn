@@ -1473,13 +1473,24 @@ fn push_unique_test_name(names: &mut Vec<String>, candidate: &str) {
 fn extract_failing_tests(output: &str) -> Vec<String> {
     let mut names = Vec::new();
     for line in output.lines() {
-        let trimmed = line.trim().trim_start_matches("! ").trim();
+        let mut trimmed = line.trim();
+        while let Some(rest) = trimmed
+            .strip_prefix("! ")
+            .or_else(|| trimmed.strip_prefix("| "))
+        {
+            trimmed = rest.trim_start();
+        }
         if let Some(rest) = trimmed.strip_prefix("test ")
             && let Some(name) = rest.strip_suffix(" ... FAILED")
         {
             push_unique_test_name(&mut names, name);
         } else if let Some(rest) = trimmed.strip_prefix("FAILED ") {
-            let name = rest.split([':', ' ']).next().unwrap_or_default();
+            let head = rest.split_once(": ").map_or(rest, |(name, _)| name);
+            let name = head
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches(':');
             push_unique_test_name(&mut names, name);
         } else if let Some(rest) = trimmed.strip_prefix("not ok ")
             && let Some((_, name)) = rest.split_once(" - ")
@@ -1773,6 +1784,10 @@ fn unread_version(verdict: Option<&str>) -> Option<String> {
     })
 }
 
+// Keep `integrate::host::CHECK_TESTS_REGRESSION` verbatim; host regression fault
+// detection matches `verdict.reason` by exact equality against that sentinel.
+const CHECK_TESTS_REGRESSION: &str = "regression: check-tests.sh fails on the candidate";
+
 /// The verdict of a finished gate run: the verdict file's, only after a
 /// clean exit.
 ///
@@ -1856,7 +1871,7 @@ pub(crate) fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFa
     let mut output = record(stdout);
     let _ = writeln!(output, "{line}");
     let mut reason = text("reason").unwrap_or_else(|| "gate rejected the candidate".to_string());
-    if !accepted {
+    if !accepted && reason.trim() != CHECK_TESTS_REGRESSION {
         let failing = extract_failing_tests(&output);
         if !failing.is_empty() && !failing.iter().any(|test| reason.contains(test)) {
             let _ = write!(reason, " (failing tests: {})", failing.join(", "));
@@ -5007,6 +5022,153 @@ mod tests {
         assert!(!verdict.accepted);
         assert!(verdict.reason.contains("beta_fails"), "{}", verdict.reason);
         assert!(verdict.reason.contains("gamma_tap"), "{}", verdict.reason);
+    }
+
+    #[test]
+    fn extract_failing_tests_and_decide_strips_gate_and_stderr_prefixes() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let run = super::Run {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: "| FAILED api::tests::one: boom\n\
+                     | | test nested_unit_fail ... FAILED\n\
+                     | not ok 3 - nested_tap_fail\n"
+                .to_string(),
+            stderr: "| FAILED stderr_prefixed_two: bang\n".to_string(),
+        };
+        let extracted = super::extract_failing_tests(&format!(
+            "{}\n! | FAILED stderr_prefixed_two: bang\n",
+            run.stdout
+        ));
+        assert_eq!(
+            extracted,
+            vec![
+                "api::tests::one",
+                "nested_unit_fail",
+                "nested_tap_fail",
+                "stderr_prefixed_two",
+            ]
+        );
+        let verdict = super::decide(
+            &run,
+            Some(r#"{"verdict":"rejected","reason":"check-tests.sh failed"}"#),
+        )
+        .expect("verdict");
+        assert!(!verdict.accepted);
+        assert!(
+            verdict.reason.contains("api::tests::one"),
+            "{}",
+            verdict.reason
+        );
+        assert!(
+            verdict.reason.contains("stderr_prefixed_two"),
+            "{}",
+            verdict.reason
+        );
+
+        let regression_run = super::Run {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: "| FAILED api::tests::one: error connecting to server: Connection refused (os error 111)\n"
+                .to_string(),
+            stderr: String::new(),
+        };
+        let regression_verdict = super::decide(
+            &regression_run,
+            Some(r#"{"verdict":"rejected","reason":"regression: check-tests.sh fails on the candidate"}"#),
+        )
+        .expect("regression verdict");
+        assert!(!regression_verdict.accepted);
+        assert_eq!(
+            regression_verdict.reason,
+            "regression: check-tests.sh fails on the candidate"
+        );
+        assert_eq!(
+            super::extract_failing_tests(&regression_verdict.output),
+            vec!["api::tests::one"]
+        );
+    }
+
+    #[test]
+    fn judge_with_load_identifies_pipe_prefixed_deterministic_and_flaky_failures() {
+        let state_dir = PrivateDirectory::create().expect("state");
+        let counter = state_dir.path().join("count");
+        let det_gate = FakeGate::new(
+            "echo '| FAILED deterministic_prefixed_test: assert eq'\n\
+             echo '{\"verdict\":\"rejected\",\"reason\":\"check-tests.sh failed\"}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let dir = PrivateDirectory::create().expect("parent");
+        let policy = super::LoadPolicy {
+            max_load: Some(8.0),
+            backoff_ms: 10,
+            max_backoff_attempts: 1,
+            max_load_retries: 1,
+        };
+        let host = super::GateHost {
+            parent: dir.path(),
+            free_kb: &|_| Some(100 * 1_048_576),
+            load_1m: &|| Some(28.0),
+            sleep: &|_| {},
+            policy,
+        };
+        let det_script = det_gate.script();
+        let det_req = super::GateRequest {
+            gate: &det_script,
+            repo: Path::new("/tmp"),
+            base: "base",
+            candidate: "cand",
+            scenarios: Path::new("/tmp"),
+            scenario: None,
+        };
+        let mut seen = None;
+        let det = super::judge_with_load(
+            &host,
+            &det_req,
+            &path_only(),
+            Duration::from_secs(30),
+            &mut seen,
+        )
+        .expect("pipe-prefixed identical failure must reject deterministically");
+        assert!(!det.accepted);
+        assert!(
+            det.reason.contains("deterministic_prefixed_test"),
+            "{}",
+            det.reason
+        );
+
+        let flake_gate = FakeGate::new(&format!(
+            "n=0\n\
+             [ -f \"{c}\" ] && n=$(cat \"{c}\")\n\
+             n=$((n + 1))\n\
+             echo \"$n\" >\"{c}\"\n\
+             if [ \"$n\" -eq 1 ]; then\n\
+                 echo '| FAILED flake_alpha: transient'\n\
+             else\n\
+                 echo '| FAILED flake_beta: transient'\n\
+             fi\n\
+             echo '{{\"verdict\":\"rejected\",\"reason\":\"check-tests.sh failed\"}}' >\"$SPAWN_GATE_VERDICT\"\n",
+            c = counter.display()
+        ));
+        let flake_script = flake_gate.script();
+        let flake_req = super::GateRequest {
+            gate: &flake_script,
+            repo: Path::new("/tmp"),
+            base: "base",
+            candidate: "cand",
+            scenarios: Path::new("/tmp"),
+            scenario: None,
+        };
+        let mut seen2 = None;
+        let err = super::judge_with_load(
+            &host,
+            &flake_req,
+            &path_only(),
+            Duration::from_secs(30),
+            &mut seen2,
+        )
+        .expect_err("diverging pipe-prefixed failures under high load must yield CannotJudge");
+        assert!(
+            matches!(err, super::GateFailure::CannotJudge { .. }),
+            "unexpected failure variant: {err:?}"
+        );
     }
 
     #[test]

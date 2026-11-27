@@ -3092,8 +3092,6 @@ impl GitWorkspace {
 /// takes, and the files over the size cap it leaves out, with their sizes.
 pub(crate) type CheckpointPaths = (Vec<TreePath>, Vec<(TreePath, u64)>);
 
-/// `<meta>\t<path>`, an entry of a `-z` tree listing: the meta fields
-/// (ASCII) and the path as bytes.
 /// The refusal of a stale workspace's checkpoint or merge, naming the
 /// snapshot that keeps its state when there is one.
 fn stale_refusal(branch: &str, kept: Option<&str>) -> WorkspaceError {
