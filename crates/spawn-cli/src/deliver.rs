@@ -638,7 +638,10 @@ impl TaskRow {
     fn reissuable(&self) -> bool {
         self.state == TaskState::Assigned
             && self.revisions == 0
-            && matches!(self.predecessor(), Ok(None))
+            && matches!(
+                self.predecessor(),
+                Ok(None | Some(Predecessor::Reassign { .. }))
+            )
     }
 
     /// Idempotency key of this task's current delivery.
@@ -6674,6 +6677,10 @@ PENDING_ISSUES\n";
                 of: 7,
                 from_session: Some("session_worker_task_7")
             }))
+        );
+        assert!(
+            reassign.reissuable(),
+            "a reassign is no re-issue itself: its spent first delivery is re-issued"
         );
         let gone = delivery_row(&json!({"reassign_of": 7}));
         assert_eq!(
