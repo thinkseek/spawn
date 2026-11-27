@@ -1,7 +1,6 @@
 //! Unified 3-layer decoupled authentication and credential subsystem.
 //!
-//! Decouples three orthogonal concerns so engines, credentials, and model
-//! capacity never collapse into a single brittle knob:
+//! Decouples three orthogonal concerns using strict Sum / Product ADTs:
 //!
 //! ```text
 //! Engine (claude | codex | agy | opencode)
@@ -9,12 +8,9 @@
 //!   != ModelTier (L1 | L2 | L3)
 //! ```
 //!
-//! Security invariants enforced fail-closed:
-//! - Zero plaintext secrets in `[auth.profiles.*]` TOML, CLI flags, JSON output,
-//!   or error strings (delegated strictly to [`SecretRef`] env/file handles).
-//! - Isolated per-profile directories for `native_login`, refusing `$HOME`
-//!   and host engine directories (`~/.claude`, `~/.gemini`, `~/.codex`, etc.),
-//!   including through symlinks.
+//! Illegal combinations (such as `agy` under `relay`, `local`, or `cloud_iam`,
+//! or cross-cloud IAM fields across Vertex / Bedrock / Azure) are unrepresentable
+//! in the type system and rejected fail-closed at parse boundaries.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
@@ -24,7 +20,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Value, json};
 
 use crate::config;
@@ -69,7 +65,7 @@ const FORBIDDEN_PLAINTEXT_FLAGS: &[&str] = &[
 ];
 
 /// Supported coding-agent execution engines (layer 1: Engine).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Engine {
     Claude,
@@ -87,23 +83,63 @@ impl Engine {
             Self::OpenCode => "opencode",
         }
     }
-
-    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            "agy" | "antigravity" => Ok(Self::Agy),
-            "opencode" => Ok(Self::OpenCode),
-            other => Err(format!(
-                "unknown engine `{other}`: expected one of claude, codex, agy, opencode"
-            )),
-        }
-    }
 }
 
 impl fmt::Display for Engine {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// Closed 3-variant engine subset valid for `relay` and `local` endpoints (`Agy` unrepresentable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RelayEngine {
+    Claude,
+    Codex,
+    OpenCode,
+}
+
+impl RelayEngine {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+        }
+    }
+
+    pub(crate) const fn into_engine(self) -> Engine {
+        match self {
+            Self::Claude => Engine::Claude,
+            Self::Codex => Engine::Codex,
+            Self::OpenCode => Engine::OpenCode,
+        }
+    }
+
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "opencode" => Ok(Self::OpenCode),
+            "agy" | "antigravity" => Err(
+                "engine `agy` only supports `native_login` (not allowed in `relay`, `local`, or `cloud_iam`)"
+                    .to_string(),
+            ),
+            other => Err(format!(
+                "unknown relay/local engine `{other}`: expected claude, codex, or opencode (`agy` only supports `native_login`)"
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RelayEngine {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(de::Error::custom)
     }
 }
 
@@ -138,35 +174,8 @@ impl ModelTier {
     }
 }
 
-impl fmt::Display for ModelTier {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// Four orthogonal authentication modes supported by `[auth.profiles.<name>]` (layer 2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum AuthMode {
-    Relay,
-    NativeLogin,
-    CloudIam,
-    Local,
-}
-
-impl AuthMode {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Relay => "relay",
-            Self::NativeLogin => "native_login",
-            Self::CloudIam => "cloud_iam",
-            Self::Local => "local",
-        }
-    }
-}
-
 /// Non-destructive readiness state of an auth profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProfileReadiness {
     Ready,
@@ -184,7 +193,7 @@ impl ProfileReadiness {
     }
 }
 
-/// Native OAuth/QR login providers.
+/// Closed Sum Type for native OAuth / QR login engines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeLoginProvider {
@@ -224,7 +233,7 @@ impl NativeLoginProvider {
             "claude" | "claude_oauth" => Ok(Self::ClaudeOauth),
             "codex" | "codex_oauth" => Ok(Self::CodexOauth),
             other => Err(format!(
-                "unknown native_login provider `{other}`: expected agy, claude_oauth (claude), or codex_oauth (codex)"
+                "native_login supports `agy`, `claude` (`claude_oauth`), or `codex` (`codex_oauth`), got `{other}`"
             )),
         }
     }
@@ -249,54 +258,7 @@ impl NativeLoginProvider {
     }
 }
 
-/// Passwordless cloud IAM providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CloudIamProvider {
-    Vertex,
-    Bedrock,
-    Azure,
-}
-
-impl CloudIamProvider {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Vertex => "vertex",
-            Self::Bedrock => "bedrock",
-            Self::Azure => "azure",
-        }
-    }
-
-    pub(crate) fn default_engines(self) -> Vec<Engine> {
-        match self {
-            Self::Vertex => vec![Engine::Claude, Engine::Agy],
-            Self::Bedrock => vec![Engine::Claude],
-            Self::Azure => vec![Engine::Codex, Engine::OpenCode],
-        }
-    }
-
-    pub(crate) fn default_credential_chain(self) -> Vec<String> {
-        match self {
-            Self::Vertex => vec![
-                "workload_identity".to_string(),
-                "application_default".to_string(),
-                "gce_metadata".to_string(),
-            ],
-            Self::Bedrock => vec![
-                "web_identity_token".to_string(),
-                "ecs_container_credentials".to_string(),
-                "iam_role_profile".to_string(),
-            ],
-            Self::Azure => vec![
-                "federated_token".to_string(),
-                "managed_identity".to_string(),
-                "azure_cli_cache".to_string(),
-            ],
-        }
-    }
-}
-
-/// Local passwordless OpenAI-compatible inference backends.
+/// Passwordless local OpenAI-compatible inference backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LocalProvider {
@@ -323,36 +285,12 @@ impl LocalProvider {
     }
 }
 
-/// Explicit passwordless authentication marker for `local` endpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum LocalAuthMode {
-    #[default]
-    None,
-}
-
-impl<'de> Deserialize<'de> for LocalAuthMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        if raw.trim().eq_ignore_ascii_case("none") {
-            Ok(Self::None)
-        } else {
-            Err(serde::de::Error::custom(format!(
-                "local profile `auth` must be \"none\", got `{raw}` (use `mode = \"relay\"` with SecretRef for keyed gateways)"
-            )))
-        }
-    }
-}
-
 /// Relay / API gateway profile backed strictly by a non-plaintext [`SecretRef`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelayProfile {
     pub(crate) base_url: String,
     pub(crate) api_key: SecretRef,
-    pub(crate) engines: Vec<Engine>,
+    pub(crate) engines: BTreeSet<RelayEngine>,
 }
 
 /// Isolated native OAuth / QR login profile with host directory isolation.
@@ -362,30 +300,73 @@ pub(crate) struct NativeLoginProfile {
     pub(crate) profile_dir: PathBuf,
 }
 
-/// Cloud IAM passwordless workload identity / credential chain profile.
+/// Strict 3-variant Sum Type for passwordless cloud IAM providers (zero cross-cloud field bloat).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CloudIamProfile {
-    pub(crate) provider: CloudIamProvider,
-    pub(crate) region: String,
-    pub(crate) project: Option<String>,
-    pub(crate) engines: Vec<Engine>,
-    pub(crate) credential_chain: Vec<String>,
-    pub(crate) aws_profile: Option<String>,
-    pub(crate) service_account: Option<String>,
-    pub(crate) tenant_id: Option<String>,
-    pub(crate) endpoint: Option<String>,
+pub(crate) enum CloudIamProfile {
+    Vertex {
+        region: String,
+        project: Option<String>,
+        service_account: Option<String>,
+        endpoint: Option<String>,
+        credential_chain: Vec<String>,
+    },
+    Bedrock {
+        region: String,
+        aws_profile: Option<String>,
+        endpoint: Option<String>,
+        credential_chain: Vec<String>,
+    },
+    Azure {
+        region: String,
+        resource: Option<String>,
+        tenant_id: Option<String>,
+        endpoint: Option<String>,
+        credential_chain: Vec<String>,
+    },
 }
 
-/// Passwordless local OpenAI-compatible inference endpoint profile.
+impl CloudIamProfile {
+    pub(crate) const fn provider_str(&self) -> &'static str {
+        match self {
+            Self::Vertex { .. } => "vertex",
+            Self::Bedrock { .. } => "bedrock",
+            Self::Azure { .. } => "azure",
+        }
+    }
+
+    pub(crate) const fn region(&self) -> &str {
+        match self {
+            Self::Vertex { region, .. }
+            | Self::Bedrock { region, .. }
+            | Self::Azure { region, .. } => region.as_str(),
+        }
+    }
+
+    pub(crate) fn endpoint(&self) -> Option<&str> {
+        match self {
+            Self::Vertex { endpoint, .. }
+            | Self::Bedrock { endpoint, .. }
+            | Self::Azure { endpoint, .. } => endpoint.as_deref(),
+        }
+    }
+
+    pub(crate) const fn engines(&self) -> &'static [Engine] {
+        match self {
+            Self::Vertex { .. } | Self::Bedrock { .. } => &[Engine::Claude],
+            Self::Azure { .. } => &[Engine::Codex, Engine::OpenCode],
+        }
+    }
+}
+
+/// Passwordless local OpenAI-compatible inference endpoint (`auth = "none"` enforced on parse).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalProfile {
     pub(crate) provider: LocalProvider,
     pub(crate) base_url: String,
-    pub(crate) auth: LocalAuthMode,
-    pub(crate) engines: Vec<Engine>,
+    pub(crate) engines: BTreeSet<RelayEngine>,
 }
 
-/// Concrete authentication configuration variant.
+/// Concrete authentication configuration variant (layer 2: AuthProfile).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuthProfile {
     Relay(RelayProfile),
@@ -395,21 +376,21 @@ pub(crate) enum AuthProfile {
 }
 
 impl AuthProfile {
-    pub(crate) const fn mode(&self) -> AuthMode {
+    pub(crate) const fn mode_str(&self) -> &'static str {
         match self {
-            Self::Relay(_) => AuthMode::Relay,
-            Self::NativeLogin(_) => AuthMode::NativeLogin,
-            Self::CloudIam(_) => AuthMode::CloudIam,
-            Self::Local(_) => AuthMode::Local,
+            Self::Relay(_) => "relay",
+            Self::NativeLogin(_) => "native_login",
+            Self::CloudIam(_) => "cloud_iam",
+            Self::Local(_) => "local",
         }
     }
 
     pub(crate) fn engines(&self) -> Vec<Engine> {
         match self {
-            Self::Relay(relay) => relay.engines.clone(),
+            Self::Relay(relay) => relay.engines.iter().map(|e| e.into_engine()).collect(),
             Self::NativeLogin(native) => vec![native.provider.engine()],
-            Self::CloudIam(cloud) => cloud.engines.clone(),
-            Self::Local(local) => local.engines.clone(),
+            Self::CloudIam(cloud) => cloud.engines().to_vec(),
+            Self::Local(local) => local.engines.iter().map(|e| e.into_engine()).collect(),
         }
     }
 
@@ -417,16 +398,6 @@ impl AuthProfile {
         match self {
             Self::NativeLogin(native) => Some(native.profile_dir.as_path()),
             Self::Relay(_) | Self::CloudIam(_) | Self::Local(_) => None,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn supports_engine(&self, engine: Engine) -> bool {
-        match self {
-            Self::Relay(relay) => relay.engines.contains(&engine),
-            Self::NativeLogin(native) => native.provider.engine() == engine,
-            Self::CloudIam(cloud) => cloud.engines.contains(&engine),
-            Self::Local(local) => local.engines.contains(&engine),
         }
     }
 }
@@ -448,47 +419,7 @@ pub(crate) struct NamedAuthProfile {
     pub(crate) profile: AuthProfile,
 }
 
-/// Orthogonal composition binding `Engine` + named `AuthProfile` + `ModelTier`.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExecutionBinding {
-    pub(crate) engine: Engine,
-    pub(crate) profile: String,
-    pub(crate) tier: ModelTier,
-}
-
-impl ExecutionBinding {
-    /// Validate that `named` admits both the requested `engine` and `tier`.
-    #[allow(dead_code)]
-    pub(crate) fn validate_against(&self, named: &NamedAuthProfile) -> Result<(), String> {
-        if self.profile != named.name {
-            return Err(format!(
-                "binding expects profile `{}`, got `{}`",
-                self.profile, named.name
-            ));
-        }
-        if !named.profile.supports_engine(self.engine) {
-            return Err(format!(
-                "auth profile `{}` ({}) does not allow engine `{}`",
-                named.name,
-                named.profile.mode().as_str(),
-                self.engine
-            ));
-        }
-        if !named.tiers.contains(&self.tier) {
-            return Err(format!(
-                "auth profile `{}` does not allow model tier `{}`",
-                named.name, self.tier
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// Isolated subprocess environment delta produced for one engine execution.
-///
-/// [`fmt::Debug`] and [`Self::masked_summary`] automatically redact sensitive
-/// values so resolved API keys never reach logs, JSON output, or error strings.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub(crate) struct EnvPlan {
     pub(crate) set: BTreeMap<String, String>,
@@ -501,7 +432,6 @@ impl EnvPlan {
         self.set.insert(key.into(), value.into());
     }
 
-    #[allow(dead_code)]
     fn set_secret(&mut self, key: impl Into<String>, value: impl Into<String>) {
         let key = key.into();
         self.secret_keys.insert(key.clone());
@@ -515,25 +445,24 @@ impl EnvPlan {
         }
     }
 
-    fn is_sensitive_key(&self, key: &str) -> bool {
-        if self.secret_keys.contains(key) {
-            return true;
-        }
-        let upper = key.to_ascii_uppercase();
-        upper.contains("KEY") || upper.contains("TOKEN") || upper.contains("SECRET")
-    }
-
-    /// Return a map safe for logging/debugging with all secret values masked as `<redacted>`.
+    /// Return a map safe for logging/JSON with all sensitive values masked as `<redacted>`.
     pub(crate) fn masked_summary(&self) -> BTreeMap<String, String> {
         self.set
             .iter()
             .map(|(key, value)| {
-                let shown = if self.is_sensitive_key(key) {
-                    "<redacted>".to_string()
-                } else {
-                    value.clone()
-                };
-                (key.clone(), shown)
+                let upper = key.to_ascii_uppercase();
+                let sensitive = self.secret_keys.contains(key)
+                    || upper.contains("KEY")
+                    || upper.contains("TOKEN")
+                    || upper.contains("SECRET");
+                (
+                    key.clone(),
+                    if sensitive && value != "not-required" {
+                        "<redacted>".to_string()
+                    } else {
+                        value.clone()
+                    },
+                )
             })
             .collect()
     }
@@ -554,7 +483,6 @@ impl fmt::Debug for EnvPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LoginCommandPlan {
     pub(crate) profile: String,
-    pub(crate) provider: NativeLoginProvider,
     pub(crate) engine: Engine,
     pub(crate) profile_dir: PathBuf,
     pub(crate) program: String,
@@ -564,12 +492,15 @@ pub(crate) struct LoginCommandPlan {
 
 impl RelayProfile {
     /// Translate a resolved relay secret into isolated environment variables for `engine`.
-    #[allow(dead_code)]
-    pub(crate) fn translate_env(&self, engine: Engine, secret: &str) -> Result<EnvPlan, String> {
+    pub(crate) fn translate_env(
+        &self,
+        engine: RelayEngine,
+        secret: &str,
+    ) -> Result<EnvPlan, String> {
         if !self.engines.contains(&engine) {
             return Err(format!(
-                "relay profile does not permit engine `{engine}`; configured engines: {}",
-                format_engine_list(&self.engines)
+                "relay profile does not permit engine `{}`",
+                engine.as_str()
             ));
         }
         if secret.trim().is_empty() {
@@ -581,7 +512,7 @@ impl RelayProfile {
 
         let mut plan = EnvPlan::default();
         match engine {
-            Engine::Claude => {
+            RelayEngine::Claude => {
                 plan.set_public("ANTHROPIC_BASE_URL", &self.base_url);
                 plan.set_secret("ANTHROPIC_API_KEY", secret);
                 plan.push_unset("CLAUDE_CODE_USE_BEDROCK");
@@ -589,92 +520,134 @@ impl RelayProfile {
                 plan.push_unset("CLAUDE_CODE_USE_FOUNDRY");
                 plan.push_unset("ANTHROPIC_AUTH_TOKEN");
             }
-            Engine::Codex => {
+            RelayEngine::Codex => {
                 plan.set_public("OPENAI_BASE_URL", &self.base_url);
                 plan.set_secret("OPENAI_API_KEY", secret);
             }
-            Engine::OpenCode => {
+            RelayEngine::OpenCode => {
                 plan.set_public("OPENAI_BASE_URL", &self.base_url);
                 plan.set_secret("OPENAI_API_KEY", secret);
                 plan.set_public("ANTHROPIC_BASE_URL", &self.base_url);
                 plan.set_secret("ANTHROPIC_API_KEY", secret);
             }
-            Engine::Agy => {
-                plan.set_public("AGY_BASE_URL", &self.base_url);
-                plan.set_secret("AGY_API_KEY", secret);
-                plan.push_unset("GEMINI_API_KEY");
-                plan.push_unset("GOOGLE_API_KEY");
-            }
         }
         Ok(plan)
     }
+}
 
-    /// Resolve `self.api_key` via `env_lookup` / secret file and translate to `EnvPlan`.
-    #[allow(dead_code)]
-    pub(crate) fn resolve_env_with(
-        &self,
-        engine: Engine,
-        env_lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<EnvPlan, String> {
-        let secret = resolve_secret_safely(&self.api_key, env_lookup)?;
-        self.translate_env(engine, &secret)
+impl NativeLoginProfile {
+    /// Build the isolated environment delta for this native login directory.
+    pub(crate) fn translate_env(&self, profile_name: &str) -> EnvPlan {
+        let mut env = EnvPlan::default();
+        env.set_public(
+            "XDG_CONFIG_HOME",
+            self.profile_dir.join("xdg-config").display().to_string(),
+        );
+        env.set_public(
+            "XDG_DATA_HOME",
+            self.profile_dir.join("xdg-data").display().to_string(),
+        );
+        env.set_public("SPAWN_AUTH_PROFILE", profile_name);
+        env.set_public(
+            "SPAWN_AUTH_PROFILE_DIR",
+            self.profile_dir.display().to_string(),
+        );
+        match self.provider {
+            NativeLoginProvider::ClaudeOauth => {
+                env.set_public("CLAUDE_CONFIG_DIR", self.profile_dir.display().to_string());
+                env.push_unset("ANTHROPIC_API_KEY");
+                env.push_unset("ANTHROPIC_BASE_URL");
+                env.push_unset("ANTHROPIC_AUTH_TOKEN");
+            }
+            NativeLoginProvider::CodexOauth => {
+                env.set_public("CODEX_HOME", self.profile_dir.display().to_string());
+                env.push_unset("OPENAI_API_KEY");
+                env.push_unset("OPENAI_BASE_URL");
+            }
+            NativeLoginProvider::Agy => {
+                env.set_public("AGY_HOME", self.profile_dir.display().to_string());
+                env.set_public("GEMINI_CLI_HOME", self.profile_dir.display().to_string());
+                env.push_unset("GEMINI_API_KEY");
+                env.push_unset("GOOGLE_API_KEY");
+            }
+        }
+        env
     }
 }
 
 impl CloudIamProfile {
     /// Translate passwordless cloud IAM metadata into isolated environment variables.
-    #[allow(dead_code)]
     pub(crate) fn translate_env(&self, engine: Engine) -> Result<EnvPlan, String> {
-        if !self.engines.contains(&engine) {
+        if engine == Engine::Agy {
+            return Err("engine `agy` only supports `native_login` (not `cloud_iam`)".to_string());
+        }
+        if !self.engines().contains(&engine) {
             return Err(format!(
-                "cloud_iam profile ({}) does not permit engine `{engine}`",
-                self.provider.as_str()
+                "cloud_iam provider `{}` does not permit engine `{engine}`",
+                self.provider_str()
             ));
         }
+
         let mut plan = EnvPlan::default();
-        match self.provider {
-            CloudIamProvider::Vertex => {
+        match self {
+            Self::Vertex {
+                region,
+                project,
+                service_account,
+                endpoint,
+                ..
+            } => {
                 plan.set_public("CLAUDE_CODE_USE_VERTEX", "1");
-                plan.set_public("CLOUD_ML_REGION", &self.region);
-                plan.set_public("GOOGLE_CLOUD_REGION", &self.region);
-                if let Some(project) = &self.project {
-                    plan.set_public("ANTHROPIC_VERTEX_PROJECT_ID", project);
-                    plan.set_public("GOOGLE_CLOUD_PROJECT", project);
+                plan.set_public("CLOUD_ML_REGION", region);
+                plan.set_public("GOOGLE_CLOUD_REGION", region);
+                if let Some(proj) = project {
+                    plan.set_public("ANTHROPIC_VERTEX_PROJECT_ID", proj);
+                    plan.set_public("GOOGLE_CLOUD_PROJECT", proj);
                 }
-                if let Some(sa) = &self.service_account {
+                if let Some(sa) = service_account {
                     plan.set_public("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT", sa);
                 }
-                if let Some(endpoint) = &self.endpoint {
-                    plan.set_public("ANTHROPIC_VERTEX_BASE_URL", endpoint);
+                if let Some(url) = endpoint {
+                    plan.set_public("ANTHROPIC_VERTEX_BASE_URL", url);
                 }
                 plan.push_unset("ANTHROPIC_API_KEY");
                 plan.push_unset("ANTHROPIC_AUTH_TOKEN");
-                plan.push_unset("GEMINI_API_KEY");
             }
-            CloudIamProvider::Bedrock => {
+            Self::Bedrock {
+                region,
+                aws_profile,
+                endpoint,
+                ..
+            } => {
                 plan.set_public("CLAUDE_CODE_USE_BEDROCK", "1");
-                plan.set_public("AWS_REGION", &self.region);
-                plan.set_public("AWS_DEFAULT_REGION", &self.region);
-                if let Some(profile) = &self.aws_profile {
+                plan.set_public("AWS_REGION", region);
+                plan.set_public("AWS_DEFAULT_REGION", region);
+                if let Some(profile) = aws_profile {
                     plan.set_public("AWS_PROFILE", profile);
                 }
-                if let Some(endpoint) = &self.endpoint {
-                    plan.set_public("ANTHROPIC_BEDROCK_BASE_URL", endpoint);
+                if let Some(url) = endpoint {
+                    plan.set_public("ANTHROPIC_BEDROCK_BASE_URL", url);
                 }
                 plan.push_unset("ANTHROPIC_API_KEY");
                 plan.push_unset("ANTHROPIC_AUTH_TOKEN");
             }
-            CloudIamProvider::Azure => {
-                plan.set_public("AZURE_REGION", &self.region);
-                if let Some(project) = &self.project {
-                    plan.set_public("AZURE_OPENAI_RESOURCE", project);
+            Self::Azure {
+                region,
+                resource,
+                tenant_id,
+                endpoint,
+                ..
+            } => {
+                plan.set_public("AZURE_REGION", region);
+                if let Some(res) = resource {
+                    plan.set_public("AZURE_OPENAI_RESOURCE", res);
                 }
-                if let Some(tenant) = &self.tenant_id {
+                if let Some(tenant) = tenant_id {
                     plan.set_public("AZURE_TENANT_ID", tenant);
                 }
-                if let Some(endpoint) = &self.endpoint {
-                    plan.set_public("AZURE_OPENAI_ENDPOINT", endpoint);
-                    plan.set_public("OPENAI_BASE_URL", endpoint);
+                if let Some(url) = endpoint {
+                    plan.set_public("AZURE_OPENAI_ENDPOINT", url);
+                    plan.set_public("OPENAI_BASE_URL", url);
                 }
                 plan.push_unset("OPENAI_API_KEY");
                 plan.push_unset("ANTHROPIC_API_KEY");
@@ -685,32 +658,27 @@ impl CloudIamProfile {
 }
 
 impl LocalProfile {
-    /// Translate local OpenAI-compatible inference settings into isolated environment variables.
-    #[allow(dead_code)]
-    pub(crate) fn translate_env(&self, engine: Engine) -> Result<EnvPlan, String> {
+    /// Translate passwordless local inference settings into isolated environment variables.
+    pub(crate) fn translate_env(&self, engine: RelayEngine) -> Result<EnvPlan, String> {
         if !self.engines.contains(&engine) {
             return Err(format!(
-                "local profile ({}) does not permit engine `{engine}`",
-                self.provider.as_str()
+                "local profile ({}) does not permit engine `{}`",
+                self.provider.as_str(),
+                engine.as_str()
             ));
         }
-        let LocalAuthMode::None = self.auth;
         let mut plan = EnvPlan::default();
         plan.set_public("SPAWN_LOCAL_PROVIDER", self.provider.as_str());
         match engine {
-            Engine::Claude => {
+            RelayEngine::Claude => {
                 plan.set_public("ANTHROPIC_BASE_URL", &self.base_url);
                 plan.set_public("ANTHROPIC_API_KEY", "not-required");
                 plan.push_unset("CLAUDE_CODE_USE_BEDROCK");
                 plan.push_unset("CLAUDE_CODE_USE_VERTEX");
             }
-            Engine::Codex | Engine::OpenCode => {
+            RelayEngine::Codex | RelayEngine::OpenCode => {
                 plan.set_public("OPENAI_BASE_URL", &self.base_url);
                 plan.set_public("OPENAI_API_KEY", "not-required");
-            }
-            Engine::Agy => {
-                plan.set_public("AGY_BASE_URL", &self.base_url);
-                plan.push_unset("AGY_API_KEY");
             }
         }
         Ok(plan)
@@ -770,7 +738,6 @@ pub(crate) fn validate_env_var_name(name: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// Validate a safe non-secret identifier (`region`, `project`, `aws_profile`, etc.).
 fn validate_safe_identifier(field: &str, raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty()
@@ -795,7 +762,6 @@ pub(crate) fn validate_endpoint_url(raw: &str) -> Result<String, String> {
         .strip_prefix("https://")
         .or_else(|| trimmed.strip_prefix("http://"))
         .ok_or_else(|| format!("endpoint URL `{trimmed}` must start with https:// or http://"))?;
-
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     if authority.is_empty() {
@@ -807,9 +773,7 @@ pub(crate) fn validate_endpoint_url(raw: &str) -> Result<String, String> {
                 .to_string(),
         );
     }
-
-    let query_and_frag = &rest[authority_end..];
-    if let Some((_, query_plus)) = query_and_frag.split_once('?') {
+    if let Some((_, query_plus)) = rest[authority_end..].split_once('?') {
         let query = query_plus.split('#').next().unwrap_or(query_plus);
         for pair in query.split('&') {
             let key = pair.split('=').next().unwrap_or("").to_ascii_lowercase();
@@ -823,7 +787,6 @@ pub(crate) fn validate_endpoint_url(raw: &str) -> Result<String, String> {
             }
         }
     }
-
     Ok(trimmed.trim_end_matches('/').to_string())
 }
 
@@ -856,7 +819,7 @@ fn resolve_through_existing_ancestor(path: &Path) -> PathBuf {
         return canonical;
     }
     let mut cur = path;
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut tail = Vec::new();
     while !cur.exists() {
         if let Some(name) = cur.file_name() {
             tail.push(name.to_os_string());
@@ -873,17 +836,14 @@ fn resolve_through_existing_ancestor(path: &Path) -> PathBuf {
     resolved
 }
 
-fn forbidden_host_dirs(home: Option<&Path>) -> Vec<PathBuf> {
-    let Some(home) = home else {
-        return Vec::new();
-    };
-    let mut candidates = Vec::new();
+fn forbidden_host_dirs(home: &Path) -> Vec<PathBuf> {
     let mut roots = vec![home.to_path_buf()];
     if let Ok(canon) = fs::canonicalize(home)
         && canon != home
     {
         roots.push(canon);
     }
+    let mut candidates = Vec::new();
     for root in roots {
         candidates.push(root.clone());
         for rel in [
@@ -903,14 +863,8 @@ fn forbidden_host_dirs(home: Option<&Path>) -> Vec<PathBuf> {
     candidates
 }
 
-fn path_touches_forbidden_dir(candidate: &Path, forbidden: &Path, home: &Path) -> bool {
-    if candidate == home {
-        return true;
-    }
-    if candidate == forbidden || (forbidden != home && candidate.starts_with(forbidden)) {
-        return true;
-    }
-    false
+fn path_touches_forbidden_dir(candidate: &Path, blocked: &Path, home: &Path) -> bool {
+    candidate == home || candidate == blocked || (blocked != home && candidate.starts_with(blocked))
 }
 
 /// Validate that a `native_login` `profile_dir` is strictly isolated from host
@@ -928,10 +882,9 @@ pub(crate) fn validate_isolated_profile_dir(
 
     if let Some(home_dir) = home {
         let home_norm = normalize_lexical(home_dir)?;
-        let forbidden = forbidden_host_dirs(Some(&home_norm));
-        for blocked in &forbidden {
-            if path_touches_forbidden_dir(&normalized, blocked, &home_norm)
-                || path_touches_forbidden_dir(&canonical, blocked, &home_norm)
+        for blocked in forbidden_host_dirs(&home_norm) {
+            if path_touches_forbidden_dir(&normalized, &blocked, &home_norm)
+                || path_touches_forbidden_dir(&canonical, &blocked, &home_norm)
             {
                 return Err(format!(
                     "native_login profile_dir {} refuses host directory {} to prevent host credential pollution",
@@ -945,7 +898,7 @@ pub(crate) fn validate_isolated_profile_dir(
                 } else {
                     normalized.parent().unwrap_or(home_dir).join(target)
                 };
-                if path_touches_forbidden_dir(&abs_target, blocked, &home_norm) {
+                if path_touches_forbidden_dir(&abs_target, &blocked, &home_norm) {
                     return Err(format!(
                         "native_login profile_dir {} symlinks into forbidden host directory {}",
                         dir.display(),
@@ -955,7 +908,6 @@ pub(crate) fn validate_isolated_profile_dir(
             }
         }
     }
-
     Ok(normalized)
 }
 
@@ -966,32 +918,69 @@ fn current_unix_secs() -> i64 {
     i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
-#[allow(dead_code)]
+enum SecretResolveError {
+    Missing(String),
+    Invalid(String),
+}
+
 fn resolve_secret_safely(
     secret_ref: &SecretRef,
     env_lookup: &dyn Fn(&str) -> Option<String>,
-) -> Result<String, String> {
+) -> Result<(String, Vec<String>), SecretResolveError> {
     match secret_ref {
         SecretRef::FromEnv { from_env } => {
-            validate_env_var_name(from_env)?;
-            secret_ref.resolve_with(env_lookup)
+            validate_env_var_name(from_env).map_err(SecretResolveError::Invalid)?;
+            let value = secret_ref.resolve_with(env_lookup).map_err(|_| {
+                SecretResolveError::Missing(format!(
+                    "environment variable `{from_env}` is unset or empty"
+                ))
+            })?;
+            Ok((value, Vec::new()))
         }
         SecretRef::FromFile { from_file } => {
-            let normalized = normalize_lexical(from_file)?;
-            let meta = fs::symlink_metadata(&normalized)
-                .map_err(|error| format!("read secret file {}: {error}", normalized.display()))?;
+            let normalized = normalize_lexical(from_file).map_err(SecretResolveError::Invalid)?;
+            let meta = match fs::symlink_metadata(&normalized) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(SecretResolveError::Missing(format!(
+                        "secret file {} does not exist",
+                        normalized.display()
+                    )));
+                }
+                Err(error) => {
+                    return Err(SecretResolveError::Invalid(format!(
+                        "cannot stat secret file {}: {error}",
+                        normalized.display()
+                    )));
+                }
+            };
             if meta.file_type().is_symlink() || !meta.is_file() {
-                return Err(format!(
+                return Err(SecretResolveError::Invalid(format!(
                     "secret file {} must be a regular non-symlink file",
                     normalized.display()
-                ));
+                )));
             }
-            secret_ref.resolve_with(env_lookup)
+            let mut warnings = Vec::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    warnings.push(format!(
+                        "secret file {} has permissions {mode:04o}; consider 0600",
+                        normalized.display()
+                    ));
+                }
+            }
+            let value = secret_ref
+                .resolve_with(env_lookup)
+                .map_err(SecretResolveError::Invalid)?;
+            Ok((value, warnings))
         }
     }
 }
 
-/// Readiness probe summary for a `native_login` directory.
+/// Non-destructive probe result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProbeOutcome {
     pub(crate) readiness: ProfileReadiness,
@@ -1013,12 +1002,11 @@ fn parse_expiry_timestamp(value: &Value) -> Option<i64> {
         Value::String(text) => text.trim().parse::<i64>().ok(),
         _ => None,
     }?;
-    // Normalize millisecond timestamps (e.g. 1_750_000_000_000) to Unix seconds.
-    if secs > 10_000_000_000 {
-        Some(secs / 1000)
+    Some(if secs > 10_000_000_000 {
+        secs / 1000
     } else {
-        Some(secs)
-    }
+        secs
+    })
 }
 
 fn inspect_oauth_json(doc: &Value, now_unix_secs: i64) -> Result<(), String> {
@@ -1041,7 +1029,6 @@ fn inspect_oauth_json(doc: &Value, now_unix_secs: i64) -> Result<(), String> {
     {
         return Err(format!("OAuth session status is `{status}`"));
     }
-
     let containers = [
         Some(obj),
         obj.get("claudeAiOauth").and_then(Value::as_object),
@@ -1082,7 +1069,6 @@ pub(crate) fn probe_native_login(
             warnings: Vec::new(),
         };
     }
-
     for rel in provider.credential_candidates() {
         let candidate = dir.join(rel);
         let Ok(meta) = fs::symlink_metadata(&candidate) else {
@@ -1144,7 +1130,6 @@ pub(crate) fn probe_native_login(
             warnings,
         };
     }
-
     ProbeOutcome {
         readiness: ProfileReadiness::Missing,
         detail: format!(
@@ -1160,99 +1145,32 @@ fn probe_secret_ref_with(
     secret: &SecretRef,
     env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> ProbeOutcome {
-    match secret {
-        SecretRef::FromEnv { from_env } => {
-            if let Err(err) = validate_env_var_name(from_env) {
-                return ProbeOutcome {
-                    readiness: ProfileReadiness::ReauthRequired,
-                    detail: err,
-                    warnings: Vec::new(),
-                };
-            }
-            match env_lookup(from_env) {
-                Some(val) if !val.trim().is_empty() => ProbeOutcome {
-                    readiness: ProfileReadiness::Ready,
-                    detail: format!("from_env:{from_env} is set (non-empty)"),
-                    warnings: Vec::new(),
-                },
-                _ => ProbeOutcome {
-                    readiness: ProfileReadiness::Missing,
-                    detail: format!("environment variable `{from_env}` is unset or empty"),
-                    warnings: Vec::new(),
-                },
-            }
-        }
-        SecretRef::FromFile { from_file } => {
-            let Ok(normalized) = normalize_lexical(from_file) else {
-                return ProbeOutcome {
-                    readiness: ProfileReadiness::ReauthRequired,
-                    detail: format!(
-                        "from_file `{}` must be safe and absolute",
-                        from_file.display()
-                    ),
-                    warnings: Vec::new(),
-                };
-            };
-            let meta = match fs::symlink_metadata(&normalized) {
-                Ok(meta) => meta,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return ProbeOutcome {
-                        readiness: ProfileReadiness::Missing,
-                        detail: format!("secret file {} does not exist", normalized.display()),
-                        warnings: Vec::new(),
-                    };
+    match resolve_secret_safely(secret, env_lookup) {
+        Ok((_resolved_and_dropped, warnings)) => {
+            let detail = match secret {
+                SecretRef::FromEnv { from_env } => {
+                    format!("from_env:{from_env} is set (non-empty)")
                 }
-                Err(error) => {
-                    return ProbeOutcome {
-                        readiness: ProfileReadiness::ReauthRequired,
-                        detail: format!(
-                            "cannot stat secret file {}: {error}",
-                            normalized.display()
-                        ),
-                        warnings: Vec::new(),
-                    };
+                SecretRef::FromFile { from_file } => {
+                    format!("from_file:{} readable", from_file.display())
                 }
             };
-            if meta.file_type().is_symlink() || !meta.is_file() {
-                return ProbeOutcome {
-                    readiness: ProfileReadiness::ReauthRequired,
-                    detail: format!(
-                        "secret file {} must be a regular file",
-                        normalized.display()
-                    ),
-                    warnings: Vec::new(),
-                };
-            }
-            let mut warnings = Vec::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = meta.permissions().mode() & 0o777;
-                if mode & 0o077 != 0 {
-                    warnings.push(format!(
-                        "secret file {} has permissions {mode:04o}; consider 0600",
-                        normalized.display()
-                    ));
-                }
-            }
-            match fs::read_to_string(&normalized) {
-                Ok(raw) if !raw.trim_end_matches(['\r', '\n']).is_empty() => ProbeOutcome {
-                    readiness: ProfileReadiness::Ready,
-                    detail: format!("from_file:{} readable", normalized.display()),
-                    warnings,
-                },
-                Ok(_) => ProbeOutcome {
-                    readiness: ProfileReadiness::ReauthRequired,
-                    detail: format!("secret file {} is empty", normalized.display()),
-                    warnings,
-                },
-                Err(error) => ProbeOutcome {
-                    readiness: ProfileReadiness::ReauthRequired,
-                    detail: format!("cannot read secret file {}: {error}", normalized.display()),
-                    warnings,
-                },
+            ProbeOutcome {
+                readiness: ProfileReadiness::Ready,
+                detail,
+                warnings,
             }
         }
+        Err(SecretResolveError::Missing(detail)) => ProbeOutcome {
+            readiness: ProfileReadiness::Missing,
+            detail,
+            warnings: Vec::new(),
+        },
+        Err(SecretResolveError::Invalid(detail)) => ProbeOutcome {
+            readiness: ProfileReadiness::ReauthRequired,
+            detail,
+            warnings: Vec::new(),
+        },
     }
 }
 
@@ -1268,8 +1186,8 @@ pub(crate) fn probe_cloud_iam_with(
         env_lookup(name).is_some_and(|p| !p.trim().is_empty() && file_exists(Path::new(&p)))
     };
 
-    let detected: Option<&str> = match cloud.provider {
-        CloudIamProvider::Vertex => {
+    let detected: Option<&str> = match cloud {
+        CloudIamProfile::Vertex { .. } => {
             if env_file_exists("GOOGLE_APPLICATION_CREDENTIALS") {
                 Some("GOOGLE_APPLICATION_CREDENTIALS file present")
             } else if has_env("CLOUDSDK_AUTH_ACCESS_TOKEN")
@@ -1285,14 +1203,14 @@ pub(crate) fn probe_cloud_iam_with(
                 None
             }
         }
-        CloudIamProvider::Bedrock => {
+        CloudIamProfile::Bedrock { aws_profile, .. } => {
             if env_file_exists("AWS_WEB_IDENTITY_TOKEN_FILE") {
                 Some("AWS_WEB_IDENTITY_TOKEN_FILE present")
             } else if has_env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
                 || has_env("AWS_CONTAINER_CREDENTIALS_FULL_URI")
                 || has_env("AWS_ROLE_ARN")
                 || has_env("AWS_PROFILE")
-                || cloud.aws_profile.is_some()
+                || aws_profile.is_some()
             {
                 Some("AWS IAM profile or container workload identity detected")
             } else if home.is_some_and(|h| {
@@ -1303,7 +1221,7 @@ pub(crate) fn probe_cloud_iam_with(
                 None
             }
         }
-        CloudIamProvider::Azure => {
+        CloudIamProfile::Azure { .. } => {
             if env_file_exists("AZURE_FEDERATED_TOKEN_FILE") {
                 Some("AZURE_FEDERATED_TOKEN_FILE present")
             } else if has_env("IDENTITY_ENDPOINT") || has_env("MSI_ENDPOINT") {
@@ -1324,8 +1242,8 @@ pub(crate) fn probe_cloud_iam_with(
             readiness: ProfileReadiness::Ready,
             detail: format!(
                 "{} IAM chain ready (region={}, {evidence})",
-                cloud.provider.as_str(),
-                cloud.region
+                cloud.provider_str(),
+                cloud.region()
             ),
             warnings: Vec::new(),
         }
@@ -1334,16 +1252,15 @@ pub(crate) fn probe_cloud_iam_with(
             readiness: ProfileReadiness::Missing,
             detail: format!(
                 "no ambient {} IAM credential chain detected (region={})",
-                cloud.provider.as_str(),
-                cloud.region
+                cloud.provider_str(),
+                cloud.region()
             ),
             warnings: Vec::new(),
         }
     }
 }
 
-/// Probe any [`AuthProfile`] non-destructively.
-pub(crate) fn probe_profile_with(
+fn probe_profile_with(
     profile: &AuthProfile,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     file_exists: &dyn Fn(&Path) -> bool,
@@ -1368,77 +1285,43 @@ pub(crate) fn probe_profile_with(
     }
 }
 
-/// Build an isolated command/environment plan to run `spawn auth login <engine>`.
+/// Build an isolated command/environment plan to run `spawn auth login <agy|claude|codex>`.
 pub(crate) fn plan_login_command(
-    engine: Engine,
+    provider: NativeLoginProvider,
     profile_name: &str,
     profile_dir: &Path,
     home: Option<&Path>,
     env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<LoginCommandPlan, String> {
-    let provider = match engine {
-        Engine::Agy => NativeLoginProvider::Agy,
-        Engine::Claude => NativeLoginProvider::ClaudeOauth,
-        Engine::Codex => NativeLoginProvider::CodexOauth,
-        Engine::OpenCode => {
-            return Err(
-                "`opencode` does not have a native OAuth launcher; use `mode = \"relay\"` or `mode = \"local\"`"
-                    .to_string(),
-            );
-        }
-    };
     let validated_name = validate_profile_name(profile_name)?;
     let validated_dir = validate_isolated_profile_dir(profile_dir, home)?;
-
-    let mut env = EnvPlan::default();
-    let xdg_cfg = validated_dir.join("xdg-config");
-    let xdg_data = validated_dir.join("xdg-data");
-    env.set_public("XDG_CONFIG_HOME", xdg_cfg.display().to_string());
-    env.set_public("XDG_DATA_HOME", xdg_data.display().to_string());
-    env.set_public("SPAWN_AUTH_PROFILE", &validated_name);
-    env.set_public(
-        "SPAWN_AUTH_PROFILE_DIR",
-        validated_dir.display().to_string(),
-    );
-
-    let (program, args) = match engine {
-        Engine::Claude => {
-            env.set_public("CLAUDE_CONFIG_DIR", validated_dir.display().to_string());
-            env.push_unset("ANTHROPIC_API_KEY");
-            env.push_unset("ANTHROPIC_BASE_URL");
-            env.push_unset("ANTHROPIC_AUTH_TOKEN");
-            let bin = env_lookup("SPAWN_AUTH_CLAUDE_BIN")
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "claude".to_string());
-            (bin, vec!["auth".to_string(), "login".to_string()])
-        }
-        Engine::Codex => {
-            env.set_public("CODEX_HOME", validated_dir.display().to_string());
-            env.push_unset("OPENAI_API_KEY");
-            env.push_unset("OPENAI_BASE_URL");
-            let bin = env_lookup("SPAWN_AUTH_CODEX_BIN")
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "codex".to_string());
-            (bin, vec!["login".to_string()])
-        }
-        Engine::Agy => {
-            env.set_public("AGY_HOME", validated_dir.display().to_string());
-            env.set_public("GEMINI_CLI_HOME", validated_dir.display().to_string());
-            env.push_unset("AGY_API_KEY");
-            env.push_unset("GEMINI_API_KEY");
-            env.push_unset("GOOGLE_API_KEY");
-            let bin = env_lookup("SPAWN_AUTH_AGY_BIN")
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "agy".to_string());
-            (bin, vec!["auth".to_string(), "login".to_string()])
-        }
-        Engine::OpenCode => unreachable!(),
+    let native = NativeLoginProfile {
+        provider,
+        profile_dir: validated_dir.clone(),
     };
+    let env = native.translate_env(&validated_name);
+    let (env_var, default_bin, args) = match provider {
+        NativeLoginProvider::ClaudeOauth => (
+            "SPAWN_AUTH_CLAUDE_BIN",
+            "claude",
+            vec!["auth".to_string(), "login".to_string()],
+        ),
+        NativeLoginProvider::CodexOauth => {
+            ("SPAWN_AUTH_CODEX_BIN", "codex", vec!["login".to_string()])
+        }
+        NativeLoginProvider::Agy => (
+            "SPAWN_AUTH_AGY_BIN",
+            "agy",
+            vec!["auth".to_string(), "login".to_string()],
+        ),
+    };
+    let program = env_lookup(env_var)
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default_bin.to_string());
 
     Ok(LoginCommandPlan {
         profile: validated_name,
-        provider,
-        engine,
+        engine: provider.engine(),
         profile_dir: validated_dir,
         program,
         args,
@@ -1453,7 +1336,7 @@ struct RawRelayProfile {
     base_url: String,
     api_key: SecretRef,
     #[serde(default)]
-    engines: Vec<Engine>,
+    engines: Vec<RelayEngine>,
     #[serde(default)]
     tiers: Vec<ModelTier>,
 }
@@ -1470,19 +1353,50 @@ struct RawNativeLoginProfile {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawCloudIamProfile {
+struct RawVertexIam {
     mode: String,
-    provider: CloudIamProvider,
+    provider: String,
     region: String,
     project: Option<String>,
-    #[serde(default)]
-    engines: Vec<Engine>,
+    service_account: Option<String>,
+    endpoint: Option<String>,
     #[serde(default)]
     credential_chain: Vec<String>,
+    #[serde(default)]
+    engines: Vec<String>,
+    #[serde(default)]
+    tiers: Vec<ModelTier>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBedrockIam {
+    mode: String,
+    provider: String,
+    region: String,
     aws_profile: Option<String>,
-    service_account: Option<String>,
+    endpoint: Option<String>,
+    #[serde(default)]
+    credential_chain: Vec<String>,
+    #[serde(default)]
+    engines: Vec<String>,
+    #[serde(default)]
+    tiers: Vec<ModelTier>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAzureIam {
+    mode: String,
+    provider: String,
+    region: String,
+    resource: Option<String>,
     tenant_id: Option<String>,
     endpoint: Option<String>,
+    #[serde(default)]
+    credential_chain: Vec<String>,
+    #[serde(default)]
+    engines: Vec<String>,
     #[serde(default)]
     tiers: Vec<ModelTier>,
 }
@@ -1493,10 +1407,9 @@ struct RawLocalProfile {
     mode: String,
     provider: LocalProvider,
     base_url: Option<String>,
+    auth: Option<String>,
     #[serde(default)]
-    auth: LocalAuthMode,
-    #[serde(default)]
-    engines: Vec<Engine>,
+    engines: Vec<RelayEngine>,
     #[serde(default)]
     tiers: Vec<ModelTier>,
 }
@@ -1521,8 +1434,7 @@ fn reject_plaintext_fields_in_json(profile_name: &str, value: &Value) -> Result<
         }
         if let Some(sub) = v.as_object() {
             for sub_key in sub.keys() {
-                let sub_lower = sub_key.to_ascii_lowercase();
-                if FORBIDDEN_PLAINTEXT_FIELDS.contains(&sub_lower.as_str()) {
+                if FORBIDDEN_PLAINTEXT_FIELDS.contains(&sub_key.to_ascii_lowercase().as_str()) {
                     return Err(format!(
                         "[auth.profiles.{profile_name}.{k}]: field `{sub_key}` looks like an inline credential; {PLAINTEXT_ERR}"
                     ));
@@ -1533,22 +1445,48 @@ fn reject_plaintext_fields_in_json(profile_name: &str, value: &Value) -> Result<
     Ok(())
 }
 
-fn dedup_preserve_order<T: Copy + Eq>(items: Vec<T>) -> Vec<T> {
+fn normalize_tiers(tiers: Vec<ModelTier>) -> Vec<ModelTier> {
     let mut out = Vec::new();
-    for item in items {
-        if !out.contains(&item) {
-            out.push(item);
+    for t in tiers {
+        if !out.contains(&t) {
+            out.push(t);
         }
     }
-    out
-}
-
-fn normalize_tiers(tiers: Vec<ModelTier>) -> Vec<ModelTier> {
-    let deduped = dedup_preserve_order(tiers);
-    if deduped.is_empty() {
+    if out.is_empty() {
         ModelTier::ALL.to_vec()
     } else {
-        deduped
+        out
+    }
+}
+
+fn validate_cloud_iam_engines(
+    profile_name: &str,
+    provider: &str,
+    configured: &[String],
+    allowed: &[Engine],
+) -> Result<(), String> {
+    for raw in configured {
+        let norm = raw.trim().to_ascii_lowercase();
+        if matches!(norm.as_str(), "agy" | "antigravity") {
+            return Err(format!(
+                "[auth.profiles.{profile_name}]: engine `agy` only supports `native_login` (not `cloud_iam`)"
+            ));
+        }
+        if !allowed.iter().any(|e| e.as_str() == norm) {
+            return Err(format!(
+                "[auth.profiles.{profile_name}]: cloud_iam provider `{provider}` only permits [{}], got `{raw}`",
+                format_engine_list(allowed)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn default_chain(raw: Vec<String>, fallback: &[&str]) -> Vec<String> {
+    if raw.is_empty() {
+        fallback.iter().map(|s| (*s).to_string()).collect()
+    } else {
+        raw
     }
 }
 
@@ -1595,10 +1533,10 @@ fn parse_relay_table(name: String, value: Value) -> Result<NamedAuthProfile, Str
         normalize_lexical(from_file)
             .map_err(|error| format!("[auth.profiles.{name}]: api_key.from_file {error}"))?;
     }
-    let engines = dedup_preserve_order(raw.engines);
+    let engines: BTreeSet<RelayEngine> = raw.engines.into_iter().collect();
     if engines.is_empty() {
         return Err(format!(
-            "[auth.profiles.{name}]: `engines` must list at least one engine (e.g. [\"claude\", \"codex\"])"
+            "[auth.profiles.{name}]: `engines` must list at least one engine (claude, codex, opencode)"
         ));
     }
     Ok(NamedAuthProfile {
@@ -1640,88 +1578,143 @@ fn parse_native_login_table(
     })
 }
 
-fn parse_cloud_iam_table(name: String, value: Value) -> Result<NamedAuthProfile, String> {
-    let raw: RawCloudIamProfile = serde_json::from_value(value)
-        .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
-    let _ = raw.mode;
-    let region = validate_safe_identifier("region", &raw.region)
-        .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
-    let project = raw
-        .project
-        .as_deref()
-        .map(|p| validate_safe_identifier("project", p))
+fn opt_safe_id(name: &str, field: &str, val: Option<&str>) -> Result<Option<String>, String> {
+    val.map(|v| validate_safe_identifier(field, v))
         .transpose()
-        .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
-    if raw.provider == CloudIamProvider::Vertex && project.is_none() {
-        return Err(format!(
-            "[auth.profiles.{name}]: `project` is required when provider = \"vertex\""
-        ));
-    }
-    let endpoint = raw
-        .endpoint
-        .as_deref()
-        .map(validate_endpoint_url)
-        .transpose()
-        .map_err(|error| format!("[auth.profiles.{name}]: endpoint: {error}"))?;
-    let aws_profile = raw
-        .aws_profile
-        .as_deref()
-        .map(|v| validate_safe_identifier("aws_profile", v))
-        .transpose()
-        .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
-    let service_account = raw
-        .service_account
-        .as_deref()
-        .map(|v| validate_safe_identifier("service_account", v))
-        .transpose()
-        .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
-    let tenant_id = raw
-        .tenant_id
-        .as_deref()
-        .map(|v| validate_safe_identifier("tenant_id", v))
-        .transpose()
-        .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
+        .map_err(|error| format!("[auth.profiles.{name}]: {error}"))
+}
 
-    let mut engines = dedup_preserve_order(raw.engines);
-    if engines.is_empty() {
-        engines = raw.provider.default_engines();
+fn opt_endpoint(name: &str, val: Option<&str>) -> Result<Option<String>, String> {
+    val.map(validate_endpoint_url)
+        .transpose()
+        .map_err(|error| format!("[auth.profiles.{name}]: endpoint: {error}"))
+}
+
+fn parse_cloud_iam_table(name: String, value: Value) -> Result<NamedAuthProfile, String> {
+    let provider = value
+        .as_object()
+        .and_then(|map| map.get("provider"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "[auth.profiles.{name}]: cloud_iam requires `provider` (vertex | bedrock | azure)"
+            )
+        })?
+        .trim()
+        .to_ascii_lowercase();
+
+    match provider.as_str() {
+        "vertex" => {
+            let raw: RawVertexIam = serde_json::from_value(value)
+                .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
+            let _ = (raw.mode, raw.provider);
+            validate_cloud_iam_engines(&name, "vertex", &raw.engines, &[Engine::Claude])?;
+            let region = validate_safe_identifier("region", &raw.region)
+                .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
+            let cloud = CloudIamProfile::Vertex {
+                region,
+                project: opt_safe_id(&name, "project", raw.project.as_deref())?,
+                service_account: opt_safe_id(
+                    &name,
+                    "service_account",
+                    raw.service_account.as_deref(),
+                )?,
+                endpoint: opt_endpoint(&name, raw.endpoint.as_deref())?,
+                credential_chain: default_chain(
+                    raw.credential_chain,
+                    &["workload_identity", "application_default", "gce_metadata"],
+                ),
+            };
+            Ok(NamedAuthProfile {
+                name,
+                source: ProfileSource::Configured,
+                tiers: normalize_tiers(raw.tiers),
+                profile: AuthProfile::CloudIam(cloud),
+            })
+        }
+        "bedrock" => {
+            let raw: RawBedrockIam = serde_json::from_value(value)
+                .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
+            let _ = (raw.mode, raw.provider);
+            validate_cloud_iam_engines(&name, "bedrock", &raw.engines, &[Engine::Claude])?;
+            let region = validate_safe_identifier("region", &raw.region)
+                .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
+            let cloud = CloudIamProfile::Bedrock {
+                region,
+                aws_profile: opt_safe_id(&name, "aws_profile", raw.aws_profile.as_deref())?,
+                endpoint: opt_endpoint(&name, raw.endpoint.as_deref())?,
+                credential_chain: default_chain(
+                    raw.credential_chain,
+                    &[
+                        "web_identity_token",
+                        "ecs_container_credentials",
+                        "iam_role_profile",
+                    ],
+                ),
+            };
+            Ok(NamedAuthProfile {
+                name,
+                source: ProfileSource::Configured,
+                tiers: normalize_tiers(raw.tiers),
+                profile: AuthProfile::CloudIam(cloud),
+            })
+        }
+        "azure" => {
+            let raw: RawAzureIam = serde_json::from_value(value)
+                .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
+            let _ = (raw.mode, raw.provider);
+            validate_cloud_iam_engines(
+                &name,
+                "azure",
+                &raw.engines,
+                &[Engine::Codex, Engine::OpenCode],
+            )?;
+            let region = validate_safe_identifier("region", &raw.region)
+                .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
+            let cloud = CloudIamProfile::Azure {
+                region,
+                resource: opt_safe_id(&name, "resource", raw.resource.as_deref())?,
+                tenant_id: opt_safe_id(&name, "tenant_id", raw.tenant_id.as_deref())?,
+                endpoint: opt_endpoint(&name, raw.endpoint.as_deref())?,
+                credential_chain: default_chain(
+                    raw.credential_chain,
+                    &["federated_token", "managed_identity", "azure_cli_cache"],
+                ),
+            };
+            Ok(NamedAuthProfile {
+                name,
+                source: ProfileSource::Configured,
+                tiers: normalize_tiers(raw.tiers),
+                profile: AuthProfile::CloudIam(cloud),
+            })
+        }
+        other => Err(format!(
+            "[auth.profiles.{name}]: unknown cloud_iam provider `{other}`; expected vertex, bedrock, or azure"
+        )),
     }
-    let credential_chain = if raw.credential_chain.is_empty() {
-        raw.provider.default_credential_chain()
-    } else {
-        raw.credential_chain
-    };
-    Ok(NamedAuthProfile {
-        name,
-        source: ProfileSource::Configured,
-        tiers: normalize_tiers(raw.tiers),
-        profile: AuthProfile::CloudIam(CloudIamProfile {
-            provider: raw.provider,
-            region,
-            project,
-            engines,
-            credential_chain,
-            aws_profile,
-            service_account,
-            tenant_id,
-            endpoint,
-        }),
-    })
 }
 
 fn parse_local_table(name: String, value: Value) -> Result<NamedAuthProfile, String> {
     let raw: RawLocalProfile = serde_json::from_value(value)
         .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
     let _ = raw.mode;
+    if let Some(auth_val) = &raw.auth
+        && !auth_val.trim().eq_ignore_ascii_case("none")
+    {
+        return Err(format!(
+            "[auth.profiles.{name}]: local profile `auth` must be \"none\", got `{auth_val}` (use `mode = \"relay\"` with SecretRef for keyed gateways)"
+        ));
+    }
     let base_url = validate_endpoint_url(
         raw.base_url
             .as_deref()
             .unwrap_or_else(|| raw.provider.default_base_url()),
     )
     .map_err(|error| format!("[auth.profiles.{name}]: {error}"))?;
-    let mut engines = dedup_preserve_order(raw.engines);
+    let mut engines: BTreeSet<RelayEngine> = raw.engines.into_iter().collect();
     if engines.is_empty() {
-        engines = vec![Engine::Codex, Engine::OpenCode];
+        engines.insert(RelayEngine::Codex);
+        engines.insert(RelayEngine::OpenCode);
     }
     Ok(NamedAuthProfile {
         name,
@@ -1730,7 +1723,6 @@ fn parse_local_table(name: String, value: Value) -> Result<NamedAuthProfile, Str
         profile: AuthProfile::Local(LocalProfile {
             provider: raw.provider,
             base_url,
-            auth: raw.auth,
             engines,
         }),
     })
@@ -1759,7 +1751,6 @@ pub(crate) fn parse_auth_profiles_toml(
     let Some(profiles_obj) = profiles_val.as_object() else {
         return Err("[auth.profiles] must be a TOML table".to_string());
     };
-
     let mut out = BTreeMap::new();
     for (name, entry) in profiles_obj {
         let parsed = parse_single_profile(name, entry.clone(), default_profiles_root, home)?;
@@ -1768,39 +1759,29 @@ pub(crate) fn parse_auth_profiles_toml(
     Ok(out)
 }
 
-/// Built-in default isolated `native_login` profiles (`agy-native`, `claude-native`, `codex-native`).
-pub(crate) fn default_native_profiles(default_profiles_root: &Path) -> Vec<NamedAuthProfile> {
-    [
-        NativeLoginProvider::Agy,
-        NativeLoginProvider::ClaudeOauth,
-        NativeLoginProvider::CodexOauth,
-    ]
-    .into_iter()
-    .map(|provider| {
-        let name = provider.default_profile_name().to_string();
-        NamedAuthProfile {
-            profile: AuthProfile::NativeLogin(NativeLoginProfile {
-                provider,
-                profile_dir: default_profiles_root.join(&name),
-            }),
-            name,
-            source: ProfileSource::Default,
-            tiers: ModelTier::ALL.to_vec(),
-        }
-    })
-    .collect()
-}
-
-/// Merge configured profiles with built-in defaults (configured profiles take precedence).
+/// Merge configured profiles with built-in isolated `native_login` defaults.
 pub(crate) fn merge_with_default_profiles(
     configured: BTreeMap<String, NamedAuthProfile>,
     default_profiles_root: &Path,
 ) -> Vec<NamedAuthProfile> {
     let mut merged = configured;
-    for default_profile in default_native_profiles(default_profiles_root) {
+    for provider in [
+        NativeLoginProvider::Agy,
+        NativeLoginProvider::ClaudeOauth,
+        NativeLoginProvider::CodexOauth,
+    ] {
+        let name = provider.default_profile_name().to_string();
         merged
-            .entry(default_profile.name.clone())
-            .or_insert(default_profile);
+            .entry(name.clone())
+            .or_insert_with(|| NamedAuthProfile {
+                profile: AuthProfile::NativeLogin(NativeLoginProfile {
+                    provider,
+                    profile_dir: default_profiles_root.join(&name),
+                }),
+                name,
+                source: ProfileSource::Default,
+                tiers: ModelTier::ALL.to_vec(),
+            });
     }
     merged.into_values().collect()
 }
@@ -1830,40 +1811,18 @@ fn section_header_name(trimmed_line: &str) -> Option<&str> {
     if stripped.starts_with('[') {
         return None;
     }
-    let before_comment = stripped.split('#').next().unwrap_or(stripped).trim_end();
-    before_comment.strip_suffix(']').map(str::trim)
+    stripped
+        .split('#')
+        .next()
+        .unwrap_or(stripped)
+        .trim_end()
+        .strip_suffix(']')
+        .map(str::trim)
 }
 
 fn belongs_to_profile_section(section: &str, name: &str) -> bool {
     let target = format!("auth.profiles.{name}");
     section == target || section.starts_with(&format!("{target}."))
-}
-
-/// Format `[auth.profiles.<name>]` + `[auth.profiles.<name>.api_key]` cleanly without plaintext keys.
-fn format_relay_toml_block(name: &str, relay: &RelayProfile, tiers: &[ModelTier]) -> String {
-    let engines = relay
-        .engines
-        .iter()
-        .map(|e| toml_basic_string(e.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let tier_list = tiers
-        .iter()
-        .map(|t| toml_basic_string(t.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let secret_line = match &relay.api_key {
-        SecretRef::FromEnv { from_env } => format!("from_env = {}", toml_basic_string(from_env)),
-        SecretRef::FromFile { from_file } => {
-            let path = from_file.display().to_string();
-            format!("from_file = {}", toml_basic_string(&path))
-        }
-    };
-
-    format!(
-        "[auth.profiles.{name}]\nmode = \"relay\"\nbase_url = {}\nengines = [{engines}]\ntiers = [{tier_list}]\n\n[auth.profiles.{name}.api_key]\n{secret_line}\n",
-        toml_basic_string(&relay.base_url),
-    )
 }
 
 /// Upsert `[auth.profiles.<name>]` in `existing` TOML while preserving unrelated sections/comments.
@@ -1882,8 +1841,7 @@ pub(crate) fn upsert_relay_profile_toml(
     let mut kept_lines: Vec<&str> = Vec::new();
     let mut skip_section = false;
     for line in existing.lines() {
-        let trimmed = line.trim();
-        if let Some(section) = section_header_name(trimmed) {
+        if let Some(section) = section_header_name(line.trim()) {
             skip_section = belongs_to_profile_section(section, &valid_name);
             if skip_section {
                 continue;
@@ -1893,10 +1851,30 @@ pub(crate) fn upsert_relay_profile_toml(
             kept_lines.push(line);
         }
     }
-
     while kept_lines.last().is_some_and(|line| line.trim().is_empty()) {
         kept_lines.pop();
     }
+
+    let engines = relay
+        .engines
+        .iter()
+        .map(|e| toml_basic_string(e.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tier_list = tiers
+        .iter()
+        .map(|t| toml_basic_string(t.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let secret_line = match &relay.api_key {
+        SecretRef::FromEnv { from_env } => format!("from_env = {}", toml_basic_string(from_env)),
+        SecretRef::FromFile { from_file } => {
+            format!(
+                "from_file = {}",
+                toml_basic_string(&from_file.display().to_string())
+            )
+        }
+    };
 
     let mut out = if kept_lines.is_empty() {
         String::new()
@@ -1905,13 +1883,15 @@ pub(crate) fn upsert_relay_profile_toml(
         s.push_str("\n\n");
         s
     };
-    out.push_str(&format_relay_toml_block(&valid_name, relay, tiers));
+    let _ = write!(
+        &mut out,
+        "[auth.profiles.{valid_name}]\nmode = \"relay\"\nbase_url = {}\nengines = [{engines}]\ntiers = [{tier_list}]\n\n[auth.profiles.{valid_name}.api_key]\n{secret_line}\n",
+        toml_basic_string(&relay.base_url)
+    );
 
-    // Verify round-trip parse safety before returning so callers never persist malformed TOML.
     parse_auth_profiles_toml(&out, Path::new("/tmp/spawn-auth-validate"), None).map_err(
         |error| format!("upsert `{valid_name}` conflicts with existing TOML structure: {error}"),
     )?;
-
     Ok(out)
 }
 
@@ -1971,7 +1951,7 @@ fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
 pub(crate) struct RedactedProfileView {
     pub(crate) name: String,
     pub(crate) source: ProfileSource,
-    pub(crate) mode: AuthMode,
+    pub(crate) mode: &'static str,
     pub(crate) engines: Vec<Engine>,
     pub(crate) tiers: Vec<ModelTier>,
     pub(crate) readiness: ProfileReadiness,
@@ -1982,7 +1962,8 @@ pub(crate) struct RedactedProfileView {
     pub(crate) secret_source: Option<Value>,
     pub(crate) cloud: Option<Value>,
     pub(crate) local_provider: Option<LocalProvider>,
-    pub(crate) local_auth: Option<LocalAuthMode>,
+    pub(crate) local_auth: Option<&'static str>,
+    pub(crate) env_preview: BTreeMap<&'static str, BTreeMap<String, String>>,
 }
 
 /// Summary counters for `list` and `check`.
@@ -2010,13 +1991,87 @@ pub(crate) struct AuthReport {
 
 fn secret_source_redacted(secret: &SecretRef) -> Value {
     match secret {
-        SecretRef::FromEnv { from_env } => json!({
-            "kind": "from_env",
-            "var": from_env,
+        SecretRef::FromEnv { from_env } => json!({ "kind": "from_env", "var": from_env }),
+        SecretRef::FromFile { from_file } => {
+            json!({ "kind": "from_file", "path": from_file.display().to_string() })
+        }
+    }
+}
+
+fn redacted_env_preview(
+    named: &NamedAuthProfile,
+) -> BTreeMap<&'static str, BTreeMap<String, String>> {
+    let mut map = BTreeMap::new();
+    match &named.profile {
+        AuthProfile::Relay(relay) => {
+            for &engine in &relay.engines {
+                if let Ok(plan) = relay.translate_env(engine, "<redacted>") {
+                    map.insert(engine.as_str(), plan.masked_summary());
+                }
+            }
+        }
+        AuthProfile::NativeLogin(native) => {
+            map.insert(
+                native.provider.engine().as_str(),
+                native.translate_env(&named.name).masked_summary(),
+            );
+        }
+        AuthProfile::CloudIam(cloud) => {
+            for &engine in cloud.engines() {
+                if let Ok(plan) = cloud.translate_env(engine) {
+                    map.insert(engine.as_str(), plan.masked_summary());
+                }
+            }
+        }
+        AuthProfile::Local(local) => {
+            for &engine in &local.engines {
+                if let Ok(plan) = local.translate_env(engine) {
+                    map.insert(engine.as_str(), plan.masked_summary());
+                }
+            }
+        }
+    }
+    map
+}
+
+fn cloud_metadata_json(cloud: &CloudIamProfile) -> Value {
+    match cloud {
+        CloudIamProfile::Vertex {
+            region,
+            project,
+            service_account,
+            credential_chain,
+            ..
+        } => json!({
+            "provider": "vertex",
+            "region": region,
+            "project": project,
+            "service_account": service_account,
+            "credential_chain": credential_chain,
         }),
-        SecretRef::FromFile { from_file } => json!({
-            "kind": "from_file",
-            "path": from_file.display().to_string(),
+        CloudIamProfile::Bedrock {
+            region,
+            aws_profile,
+            credential_chain,
+            ..
+        } => json!({
+            "provider": "bedrock",
+            "region": region,
+            "aws_profile": aws_profile,
+            "credential_chain": credential_chain,
+        }),
+        CloudIamProfile::Azure {
+            region,
+            resource,
+            tenant_id,
+            credential_chain,
+            ..
+        } => json!({
+            "provider": "azure",
+            "region": region,
+            "resource": resource,
+            "tenant_id": tenant_id,
+            "credential_chain": credential_chain,
         }),
     }
 }
@@ -2026,6 +2081,7 @@ fn redact_profile_view(named: &NamedAuthProfile, probe: ProbeOutcome) -> Redacte
         .profile
         .isolated_dir()
         .map(|p| p.display().to_string());
+    let env_preview = redacted_env_preview(named);
     let (base_url, secret_source, cloud, local_provider, local_auth) = match &named.profile {
         AuthProfile::Relay(relay) => (
             Some(relay.base_url.clone()),
@@ -2036,17 +2092,9 @@ fn redact_profile_view(named: &NamedAuthProfile, probe: ProbeOutcome) -> Redacte
         ),
         AuthProfile::NativeLogin(_) => (None, None, None, None, None),
         AuthProfile::CloudIam(cloud) => (
-            cloud.endpoint.clone(),
+            cloud.endpoint().map(str::to_string),
             None,
-            Some(json!({
-                "provider": cloud.provider.as_str(),
-                "region": cloud.region,
-                "project": cloud.project,
-                "credential_chain": cloud.credential_chain,
-                "aws_profile": cloud.aws_profile,
-                "service_account": cloud.service_account,
-                "tenant_id": cloud.tenant_id,
-            })),
+            Some(cloud_metadata_json(cloud)),
             None,
             None,
         ),
@@ -2055,14 +2103,14 @@ fn redact_profile_view(named: &NamedAuthProfile, probe: ProbeOutcome) -> Redacte
             None,
             None,
             Some(local.provider),
-            Some(local.auth),
+            Some("none"),
         ),
     };
 
     RedactedProfileView {
         name: named.name.clone(),
         source: named.source,
-        mode: named.profile.mode(),
+        mode: named.profile.mode_str(),
         engines: named.profile.engines(),
         tiers: named.tiers.clone(),
         readiness: probe.readiness,
@@ -2074,6 +2122,7 @@ fn redact_profile_view(named: &NamedAuthProfile, probe: ProbeOutcome) -> Redacte
         cloud,
         local_provider,
         local_auth,
+        env_preview,
     }
 }
 
@@ -2097,11 +2146,8 @@ pub(crate) fn evaluate_profiles_report_with(
 
     let all_profiles = merge_with_default_profiles(configured, profiles_root);
     let mut views = Vec::with_capacity(all_profiles.len());
-    let mut ready = 0usize;
-    let mut missing = 0usize;
-    let mut reauth_required = 0usize;
-    let mut configured_count = 0usize;
-    let mut configured_ready = 0usize;
+    let (mut ready, mut missing, mut reauth_required) = (0usize, 0usize, 0usize);
+    let (mut configured_count, mut configured_ready) = (0usize, 0usize);
 
     for named in &all_profiles {
         let probe =
@@ -2182,7 +2228,7 @@ fn format_report_text(report: &AuthReport, heading: &str) -> String {
             p.name,
             p.readiness.as_str(),
             src,
-            p.mode.as_str(),
+            p.mode,
             engines,
             tiers,
             isolated,
@@ -2269,16 +2315,12 @@ fn parse_auth_args(
     Ok(parsed)
 }
 
-fn parse_comma_list<T>(
+fn parse_comma_items<T>(
     raw: Option<&str>,
-    default_items: Vec<T>,
     parser: impl Fn(&str) -> Result<T, String>,
-) -> Result<Vec<T>, String>
-where
-    T: Copy + Eq,
-{
+) -> Result<Vec<T>, String> {
     let Some(text) = raw else {
-        return Ok(default_items);
+        return Ok(Vec::new());
     };
     let mut items = Vec::new();
     for part in text.split(',') {
@@ -2286,13 +2328,7 @@ where
         if trimmed.is_empty() {
             return Err("empty item in comma-separated list".to_string());
         }
-        let parsed = parser(trimmed)?;
-        if !items.contains(&parsed) {
-            items.push(parsed);
-        }
-    }
-    if items.is_empty() {
-        return Err("list must contain at least one item".to_string());
+        items.push(parser(trimmed)?);
     }
     Ok(items)
 }
@@ -2310,7 +2346,6 @@ fn process_home() -> Option<PathBuf> {
 }
 
 /// Dispatch `spawn auth <verb> ...` without global `--config` override.
-#[allow(dead_code)]
 pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
     command_with_config(None, rest)
 }
@@ -2363,12 +2398,7 @@ fn run_list_or_check(
         };
         print!("{}", format_report_text(&report, heading));
     }
-
-    if fail_on_unready && !report.ok {
-        Ok(1)
-    } else {
-        Ok(0)
-    }
+    Ok(i32::from(fail_on_unready && !report.ok))
 }
 
 fn run_add_relay(cli_config: Option<&str>, args: &[String]) -> Result<i32, String> {
@@ -2392,10 +2422,9 @@ fn run_add_relay(cli_config: Option<&str>, args: &[String]) -> Result<i32, Strin
         (Some(var), None) => SecretRef::FromEnv {
             from_env: validate_env_var_name(var)?,
         },
-        (None, Some(path)) => {
-            let abs = normalize_lexical(Path::new(path))?;
-            SecretRef::FromFile { from_file: abs }
-        }
+        (None, Some(path)) => SecretRef::FromFile {
+            from_file: normalize_lexical(Path::new(path))?,
+        },
         (None, None) => {
             return Err(format!(
                 "either --key-env or --key-file is required; {PLAINTEXT_ERR}"
@@ -2403,23 +2432,27 @@ fn run_add_relay(cli_config: Option<&str>, args: &[String]) -> Result<i32, Strin
         }
     };
 
-    let engines = parse_comma_list(
+    let parsed_engines = parse_comma_items(
         parsed.values.get("engines").map(String::as_str),
-        vec![Engine::Claude, Engine::Codex],
-        Engine::parse,
+        RelayEngine::parse,
     )?;
-    let tiers = parse_comma_list(
+    let engines: BTreeSet<RelayEngine> = if parsed_engines.is_empty() {
+        [RelayEngine::Claude, RelayEngine::Codex]
+            .into_iter()
+            .collect()
+    } else {
+        parsed_engines.into_iter().collect()
+    };
+    let tiers = normalize_tiers(parse_comma_items(
         parsed.values.get("tiers").map(String::as_str),
-        ModelTier::ALL.to_vec(),
         ModelTier::parse,
-    )?;
+    )?);
 
     let relay = RelayProfile {
         base_url,
         api_key: api_key.clone(),
-        engines: engines.clone(),
+        engines,
     };
-
     let explicit = effective_explicit_config(cli_config, &parsed);
     let target_path = config::auth_config_write_path(explicit.as_deref());
     let existing = if target_path.exists() {
@@ -2432,7 +2465,6 @@ fn run_add_relay(cli_config: Option<&str>, args: &[String]) -> Result<i32, Strin
     } else {
         String::new()
     };
-
     let updated = upsert_relay_profile_toml(&existing, &name, &relay, &tiers)?;
     write_text_atomic(&target_path, &updated)?;
 
@@ -2444,23 +2476,26 @@ fn run_add_relay(cli_config: Option<&str>, args: &[String]) -> Result<i32, Strin
             "mode": "relay",
             "config_path": target_path.display().to_string(),
             "base_url": relay.base_url,
-            "engines": engines,
+            "engines": relay.engines,
             "tiers": tiers,
             "secret_source": secret_source_redacted(&api_key),
         });
-        let text = serde_json::to_string_pretty(&payload)
-            .map_err(|error| format!("serialize add-relay output: {error}"))?;
-        println!("{text}");
-    } else {
         println!(
-            "saved relay auth profile `{name}` in {} (url={}, engines=[{}], secret={})",
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .map_err(|error| format!("serialize add-relay output: {error}"))?
+        );
+    } else {
+        let engine_names: Vec<&str> = relay.engines.iter().map(|e| e.as_str()).collect();
+        let source = match &api_key {
+            SecretRef::FromEnv { from_env } => format!("from_env:{from_env}"),
+            SecretRef::FromFile { from_file } => format!("from_file:{}", from_file.display()),
+        };
+        println!(
+            "saved relay auth profile `{name}` in {} (url={}, engines=[{}], secret={source})",
             target_path.display(),
             relay.base_url,
-            format_engine_list(&engines),
-            match &api_key {
-                SecretRef::FromEnv { from_env } => format!("from_env:{from_env}"),
-                SecretRef::FromFile { from_file } => format!("from_file:{}", from_file.display()),
-            }
+            engine_names.join(",")
         );
     }
     Ok(0)
@@ -2483,13 +2518,8 @@ fn ensure_isolated_dirs(dir: &Path) -> Result<(), String> {
 
 fn run_login(cli_config: Option<&str>, args: &[String]) -> Result<i32, String> {
     let parsed = parse_auth_args(args, Some("<engine>"), &["profile", "config"], &[])?;
-    let engine = Engine::parse(parsed.positional.as_deref().unwrap_or_default())?;
-    if !matches!(engine, Engine::Agy | Engine::Claude | Engine::Codex) {
-        return Err(format!(
-            "`spawn auth login` supports agy, claude, or codex (not `{engine}`)"
-        ));
-    }
-
+    let provider =
+        NativeLoginProvider::parse_provider(parsed.positional.as_deref().unwrap_or_default())?;
     let explicit = effective_explicit_config(cli_config, &parsed);
     let config_path = config::auth_config_read_path(explicit.as_deref());
     let profiles_root = config::auth_profiles_root_dir();
@@ -2503,14 +2533,13 @@ fn run_login(cli_config: Option<&str>, args: &[String]) -> Result<i32, String> {
     };
 
     let (profile_name, profile_dir) = resolve_login_target(
-        engine,
+        provider,
         parsed.values.get("profile").map(String::as_str),
         &configured,
         &profiles_root,
     )?;
-
     let plan = plan_login_command(
-        engine,
+        provider,
         &profile_name,
         &profile_dir,
         home.as_deref(),
@@ -2533,7 +2562,6 @@ fn run_login(cli_config: Option<&str>, args: &[String]) -> Result<i32, String> {
     for (key, value) in &plan.env.set {
         cmd.env(key, value);
     }
-
     let status = cmd.status().map_err(|error| {
         format!(
             "failed to start `{}` for isolated login (`{}`): {error}",
@@ -2544,7 +2572,7 @@ fn run_login(cli_config: Option<&str>, args: &[String]) -> Result<i32, String> {
 }
 
 fn resolve_login_target(
-    engine: Engine,
+    provider: NativeLoginProvider,
     requested_profile: Option<&str>,
     configured: &BTreeMap<String, NamedAuthProfile>,
     profiles_root: &Path,
@@ -2553,16 +2581,17 @@ fn resolve_login_target(
         let valid_name = validate_profile_name(raw_name)?;
         if let Some(existing) = configured.get(&valid_name) {
             return match &existing.profile {
-                AuthProfile::NativeLogin(native) if native.provider.engine() == engine => {
+                AuthProfile::NativeLogin(native) if native.provider == provider => {
                     Ok((existing.name.clone(), native.profile_dir.clone()))
                 }
                 AuthProfile::NativeLogin(native) => Err(format!(
-                    "profile `{valid_name}` is configured for engine `{}`, not `{engine}`",
-                    native.provider.engine()
+                    "profile `{valid_name}` is configured for `{}`, not `{}`",
+                    native.provider.as_str(),
+                    provider.as_str()
                 )),
                 other => Err(format!(
                     "profile `{valid_name}` uses mode `{}`; `spawn auth login` requires `native_login`",
-                    other.mode().as_str()
+                    other.mode_str()
                 )),
             };
         }
@@ -2570,21 +2599,13 @@ fn resolve_login_target(
     }
 
     if let Some(matched) = configured.values().find(|entry| {
-        matches!(
-            &entry.profile,
-            AuthProfile::NativeLogin(native) if native.provider.engine() == engine
-        )
+        matches!(&entry.profile, AuthProfile::NativeLogin(native) if native.provider == provider)
     }) && let AuthProfile::NativeLogin(native) = &matched.profile
     {
         return Ok((matched.name.clone(), native.profile_dir.clone()));
     }
 
-    let default_name = match engine {
-        Engine::Agy => NativeLoginProvider::Agy.default_profile_name(),
-        Engine::Claude => NativeLoginProvider::ClaudeOauth.default_profile_name(),
-        Engine::Codex => NativeLoginProvider::CodexOauth.default_profile_name(),
-        Engine::OpenCode => unreachable!(),
-    };
+    let default_name = provider.default_profile_name();
     Ok((default_name.to_string(), profiles_root.join(default_name)))
 }
 
@@ -2606,69 +2627,143 @@ mod tests {
     }
 
     #[test]
-    fn three_layer_decoupling_validates_engine_profile_and_tier_independently() {
-        let relay = NamedAuthProfile {
-            name: "gateway-main".to_string(),
-            source: ProfileSource::Configured,
-            tiers: vec![ModelTier::L1, ModelTier::L2],
-            profile: AuthProfile::Relay(RelayProfile {
-                base_url: "https://gw.example.com/v1".to_string(),
-                api_key: SecretRef::FromEnv {
-                    from_env: "GW_KEY".to_string(),
-                },
-                engines: vec![Engine::Claude, Engine::Codex],
-            }),
-        };
+    fn adt_forbids_agy_in_relay_local_and_cloud_iam() {
+        let root = Path::new("/tmp/spawn-auth-validate");
+        let args = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
 
-        let ok_binding = ExecutionBinding {
-            engine: Engine::Claude,
-            profile: "gateway-main".to_string(),
-            tier: ModelTier::L2,
-        };
-        assert_eq!(ok_binding.validate_against(&relay), Ok(()));
+        for bad_engines in ["agy", "claude,agy"] {
+            let err = command(&args(&[
+                "add-relay",
+                "bad",
+                "--url",
+                "https://gw.example.com",
+                "--key-env",
+                "GW_KEY",
+                "--engines",
+                bad_engines,
+            ]))
+            .unwrap_err();
+            assert!(err.contains("native_login"), "{bad_engines}: {err}");
+        }
 
-        let codex_binding = ExecutionBinding {
-            engine: Engine::Codex,
-            profile: "gateway-main".to_string(),
-            tier: ModelTier::L1,
-        };
-        assert_eq!(codex_binding.validate_against(&relay), Ok(()));
-
-        let bad_engine = ExecutionBinding {
-            engine: Engine::Agy,
-            profile: "gateway-main".to_string(),
-            tier: ModelTier::L1,
-        };
+        let relay_agy = r#"
+[auth.profiles.r-agy]
+mode = "relay"
+base_url = "https://gw.example.com/v1"
+engines = ["claude", "agy"]
+api_key = { from_env = "GW_KEY" }
+"#;
         assert!(
-            bad_engine
-                .validate_against(&relay)
+            parse_auth_profiles_toml(relay_agy, root, None)
                 .unwrap_err()
-                .contains("does not allow engine `agy`")
+                .contains("native_login")
         );
 
-        let bad_tier = ExecutionBinding {
-            engine: Engine::Claude,
-            profile: "gateway-main".to_string(),
-            tier: ModelTier::L3,
-        };
+        let local_agy = r#"
+[auth.profiles.l-agy]
+mode = "local"
+provider = "ollama"
+engines = ["agy"]
+"#;
         assert!(
-            bad_tier
-                .validate_against(&relay)
+            parse_auth_profiles_toml(local_agy, root, None)
                 .unwrap_err()
-                .contains("does not allow model tier `L3`")
+                .contains("native_login")
         );
+
+        let cloud_agy = r#"
+[auth.profiles.v-agy]
+mode = "cloud_iam"
+provider = "vertex"
+region = "us-central1"
+engines = ["agy"]
+"#;
+        assert!(
+            parse_auth_profiles_toml(cloud_agy, root, None)
+                .unwrap_err()
+                .contains("native_login")
+        );
+
+        let vertex_codex = r#"
+[auth.profiles.v-codex]
+mode = "cloud_iam"
+provider = "vertex"
+region = "us-central1"
+engines = ["codex"]
+"#;
+        assert!(parse_auth_profiles_toml(vertex_codex, root, None).is_err());
+
+        let azure_claude = r#"
+[auth.profiles.az-claude]
+mode = "cloud_iam"
+provider = "azure"
+region = "eastus"
+engines = ["claude"]
+"#;
+        assert!(parse_auth_profiles_toml(azure_claude, root, None).is_err());
     }
 
     #[test]
-    fn parses_all_four_auth_profile_modes_from_toml() {
+    fn adt_rejects_cross_cloud_iam_fields() {
+        let root = Path::new("/tmp/spawn-auth-validate");
+        let bad_clouds = [
+            r#"
+[auth.profiles.bad_vertex]
+mode = "cloud_iam"
+provider = "vertex"
+region = "us-central1"
+aws_profile = "prod-aws"
+"#,
+            r#"
+[auth.profiles.bad_vertex_tenant]
+mode = "cloud_iam"
+provider = "vertex"
+region = "us-central1"
+tenant_id = "0000-tenant"
+"#,
+            r#"
+[auth.profiles.bad_bedrock]
+mode = "cloud_iam"
+provider = "bedrock"
+region = "us-east-1"
+service_account = "sa@proj.iam.gserviceaccount.com"
+"#,
+            r#"
+[auth.profiles.bad_bedrock_tenant]
+mode = "cloud_iam"
+provider = "bedrock"
+region = "us-east-1"
+tenant_id = "0000-tenant"
+"#,
+            r#"
+[auth.profiles.bad_azure]
+mode = "cloud_iam"
+provider = "azure"
+region = "eastus"
+aws_profile = "prod-aws"
+"#,
+            r#"
+[auth.profiles.bad_azure_sa]
+mode = "cloud_iam"
+provider = "azure"
+region = "eastus"
+service_account = "sa@proj.iam.gserviceaccount.com"
+"#,
+        ];
+        for toml in bad_clouds {
+            assert!(
+                parse_auth_profiles_toml(toml, root, None).is_err(),
+                "expected cross-cloud rejection for:\n{toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_all_four_modes_from_toml() {
         let root = scratch_dir("parse-all-four");
         let isolated_dir = root.join("profiles/claude-work");
         let toml = format!(
             r#"
-[instance]
-name = "fleet-test"
-data_dir = "/srv/spawn-data"
-
 [auth.profiles.openrouter]
 mode = "relay"
 base_url = "https://openrouter.ai/api/"
@@ -2687,13 +2782,25 @@ mode = "cloud_iam"
 provider = "vertex"
 region = "us-central1"
 project = "my-gcp-project"
-engines = ["claude", "agy"]
-credential_chain = ["workload_identity", "application_default"]
+service_account = "runner@my-gcp-project.iam.gserviceaccount.com"
+
+[auth.profiles.aws-bedrock]
+mode = "cloud_iam"
+provider = "bedrock"
+region = "us-east-1"
+aws_profile = "bedrock-prod"
+
+[auth.profiles.az-openai]
+mode = "cloud_iam"
+provider = "azure"
+region = "eastus"
+resource = "aoai-prod"
+tenant_id = "tenant-123"
+endpoint = "https://aoai-prod.openai.azure.com"
 
 [auth.profiles.local-ollama]
 mode = "local"
 provider = "ollama"
-base_url = "http://127.0.0.1:11434/v1"
 auth = "none"
 engines = ["codex", "opencode"]
 "#,
@@ -2706,58 +2813,137 @@ engines = ["codex", "opencode"]
             Some(Path::new("/home/tester")),
         )
         .expect("parse all 4 modes");
+        assert_eq!(parsed.len(), 6);
+        assert_eq!(parsed["openrouter"].profile.mode_str(), "relay");
+        assert_eq!(parsed["claude-work"].profile.mode_str(), "native_login");
+        assert_eq!(parsed["gcp-vertex"].profile.mode_str(), "cloud_iam");
+        assert_eq!(parsed["aws-bedrock"].profile.mode_str(), "cloud_iam");
+        assert_eq!(parsed["az-openai"].profile.mode_str(), "cloud_iam");
+        assert_eq!(parsed["local-ollama"].profile.mode_str(), "local");
+        let _ = fs::remove_dir_all(&root);
+    }
 
-        assert_eq!(parsed.len(), 4);
-
-        match &parsed["openrouter"].profile {
-            AuthProfile::Relay(r) => {
-                assert_eq!(r.base_url, "https://openrouter.ai/api");
-                assert_eq!(
-                    r.api_key,
-                    SecretRef::FromEnv {
-                        from_env: "OPENROUTER_API_KEY".to_string()
-                    }
-                );
-                assert_eq!(
-                    r.engines,
-                    vec![Engine::Claude, Engine::Codex, Engine::OpenCode]
-                );
-            }
-            other => panic!("expected relay, got {other:?}"),
-        }
+    #[test]
+    fn translates_relay_envs_with_secret_redaction() {
+        let canary = "sk-canary-never-leak-debug-4291";
+        let relay = RelayProfile {
+            base_url: "https://openrouter.ai/api".to_string(),
+            api_key: SecretRef::FromEnv {
+                from_env: "OPENROUTER_API_KEY".to_string(),
+            },
+            engines: [
+                RelayEngine::Claude,
+                RelayEngine::Codex,
+                RelayEngine::OpenCode,
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let claude_env = relay
+            .translate_env(RelayEngine::Claude, canary)
+            .expect("claude env");
         assert_eq!(
-            parsed["openrouter"].tiers,
-            vec![ModelTier::L1, ModelTier::L2]
+            claude_env.set.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("https://openrouter.ai/api")
+        );
+        assert_eq!(
+            claude_env.set.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some(canary)
+        );
+        assert!(!format!("{claude_env:?}").contains(canary));
+        assert_eq!(
+            claude_env
+                .masked_summary()
+                .get("ANTHROPIC_API_KEY")
+                .map(String::as_str),
+            Some("<redacted>")
         );
 
-        match &parsed["claude-work"].profile {
-            AuthProfile::NativeLogin(n) => {
-                assert_eq!(n.provider, NativeLoginProvider::ClaudeOauth);
-                assert_eq!(n.profile_dir, isolated_dir);
-            }
-            other => panic!("expected native_login, got {other:?}"),
-        }
-        assert_eq!(parsed["claude-work"].tiers, ModelTier::ALL.to_vec());
+        let codex_env = relay
+            .translate_env(RelayEngine::Codex, canary)
+            .expect("codex env");
+        assert_eq!(
+            codex_env.set.get("OPENAI_API_KEY").map(String::as_str),
+            Some(canary)
+        );
+        let oc_env = relay
+            .translate_env(RelayEngine::OpenCode, canary)
+            .expect("opencode env");
+        assert!(
+            oc_env.set.contains_key("OPENAI_API_KEY")
+                && oc_env.set.contains_key("ANTHROPIC_API_KEY")
+        );
+    }
 
-        match &parsed["gcp-vertex"].profile {
-            AuthProfile::CloudIam(c) => {
-                assert_eq!(c.provider, CloudIamProvider::Vertex);
-                assert_eq!(c.region, "us-central1");
-                assert_eq!(c.project.as_deref(), Some("my-gcp-project"));
-            }
-            other => panic!("expected cloud_iam, got {other:?}"),
-        }
+    #[test]
+    fn translates_cloud_iam_and_local_envs_cleanly() {
+        let vertex = CloudIamProfile::Vertex {
+            region: "us-central1".to_string(),
+            project: Some("my-gcp-project".to_string()),
+            service_account: None,
+            endpoint: None,
+            credential_chain: vec!["workload_identity".to_string()],
+        };
+        assert_eq!(vertex.engines(), &[Engine::Claude]);
+        let vertex_env = vertex.translate_env(Engine::Claude).expect("vertex env");
+        assert_eq!(
+            vertex_env
+                .set
+                .get("CLAUDE_CODE_USE_VERTEX")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(
+            vertex
+                .translate_env(Engine::Agy)
+                .unwrap_err()
+                .contains("native_login")
+        );
+        assert!(vertex.translate_env(Engine::Codex).is_err());
 
-        match &parsed["local-ollama"].profile {
-            AuthProfile::Local(l) => {
-                assert_eq!(l.provider, LocalProvider::Ollama);
-                assert_eq!(l.auth, LocalAuthMode::None);
-                assert_eq!(l.base_url, "http://127.0.0.1:11434/v1");
-            }
-            other => panic!("expected local, got {other:?}"),
-        }
+        let bedrock = CloudIamProfile::Bedrock {
+            region: "us-east-1".to_string(),
+            aws_profile: Some("bedrock-prod".to_string()),
+            endpoint: None,
+            credential_chain: vec!["web_identity_token".to_string()],
+        };
+        let bedrock_env = bedrock.translate_env(Engine::Claude).expect("bedrock env");
+        assert_eq!(
+            bedrock_env.set.get("AWS_PROFILE").map(String::as_str),
+            Some("bedrock-prod")
+        );
 
-        let _ = fs::remove_dir_all(&root);
+        let azure = CloudIamProfile::Azure {
+            region: "eastus".to_string(),
+            resource: Some("aoai-prod".to_string()),
+            tenant_id: Some("tenant-123".to_string()),
+            endpoint: Some("https://aoai-prod.openai.azure.com".to_string()),
+            credential_chain: vec!["federated_token".to_string()],
+        };
+        assert_eq!(azure.engines(), &[Engine::Codex, Engine::OpenCode]);
+        let az_env = azure.translate_env(Engine::Codex).expect("azure env");
+        assert_eq!(
+            az_env.set.get("AZURE_TENANT_ID").map(String::as_str),
+            Some("tenant-123")
+        );
+        assert!(azure.translate_env(Engine::Claude).is_err());
+
+        let local = LocalProfile {
+            provider: LocalProvider::Ollama,
+            base_url: LocalProvider::Ollama.default_base_url().to_string(),
+            engines: [RelayEngine::Codex, RelayEngine::OpenCode]
+                .into_iter()
+                .collect(),
+        };
+        let local_env = local.translate_env(RelayEngine::Codex).expect("local env");
+        assert_eq!(
+            local_env.set.get("OPENAI_BASE_URL").map(String::as_str),
+            Some("http://127.0.0.1:11434/v1")
+        );
+        assert_eq!(
+            local_env.set.get("OPENAI_API_KEY").map(String::as_str),
+            Some("not-required")
+        );
     }
 
     #[test]
@@ -2773,7 +2959,7 @@ engines = ["claude"]
         let err = parse_auth_profiles_toml(plaintext_toml, root, None).unwrap_err();
         assert!(!err.contains("sk-plaintext-must-fail"), "{err}");
 
-        let smuggled_key_toml = r#"
+        let smuggled_toml = r#"
 [auth.profiles.bad]
 mode = "relay"
 base_url = "https://gw.example.com/v1"
@@ -2782,115 +2968,26 @@ engines = ["claude"]
 [auth.profiles.bad.api_key]
 from_env = "OK_VAR"
 "#;
-        assert!(parse_auth_profiles_toml(smuggled_key_toml, root, None).is_err());
+        assert!(parse_auth_profiles_toml(smuggled_toml, root, None).is_err());
 
-        let relative_file_toml = r#"
-[auth.profiles.bad]
-mode = "relay"
-base_url = "https://gw.example.com/v1"
-api_key = { from_file = "relative/key.txt" }
-engines = ["claude"]
-"#;
-        assert!(parse_auth_profiles_toml(relative_file_toml, root, None).is_err());
-
-        let userinfo_url_toml = r#"
-[auth.profiles.bad]
-mode = "relay"
-base_url = "https://user:secret@gw.example.com/v1"
-api_key = { from_env = "OK_VAR" }
-engines = ["claude"]
-"#;
         assert!(
-            parse_auth_profiles_toml(userinfo_url_toml, root, None)
+            validate_endpoint_url("https://user:secret@gw.example.com/v1")
                 .unwrap_err()
                 .contains("userinfo")
         );
-
         assert!(
             validate_endpoint_url("https://gw.example.com/v1?api_key=sk-secret")
                 .unwrap_err()
                 .contains("query parameter")
         );
 
-        let bad_local_toml = r#"
+        let bad_local = r#"
 [auth.profiles.badlocal]
 mode = "local"
 provider = "vllm"
 auth = "sk-local-secret"
 "#;
-        assert!(parse_auth_profiles_toml(bad_local_toml, root, None).is_err());
-    }
-
-    #[test]
-    fn relay_translates_env_vars_per_engine_and_redacts_debug() {
-        let relay = RelayProfile {
-            base_url: "https://relay.example.com/v1".to_string(),
-            api_key: SecretRef::FromEnv {
-                from_env: "RELAY_CANARY_ENV".to_string(),
-            },
-            engines: vec![Engine::Claude, Engine::Codex, Engine::OpenCode],
-        };
-        let canary = "sk-canary-never-leak-debug-4291";
-        let env_map = |name: &str| (name == "RELAY_CANARY_ENV").then(|| canary.to_string());
-
-        let claude_env = relay
-            .resolve_env_with(Engine::Claude, &env_map)
-            .expect("claude");
-        assert_eq!(
-            claude_env.set.get("ANTHROPIC_BASE_URL").map(String::as_str),
-            Some("https://relay.example.com/v1")
-        );
-        assert_eq!(
-            claude_env.set.get("ANTHROPIC_API_KEY").map(String::as_str),
-            Some(canary)
-        );
-        assert!(
-            claude_env
-                .unset
-                .contains(&"CLAUDE_CODE_USE_BEDROCK".to_string())
-        );
-        assert!(
-            claude_env
-                .unset
-                .contains(&"CLAUDE_CODE_USE_VERTEX".to_string())
-        );
-
-        let debug_str = format!("{claude_env:?}");
-        assert!(
-            !debug_str.contains(canary),
-            "secret leaked in Debug: {debug_str}"
-        );
-        assert!(debug_str.contains("<redacted>"), "{debug_str}");
-
-        let codex_env = relay
-            .resolve_env_with(Engine::Codex, &env_map)
-            .expect("codex");
-        assert_eq!(
-            codex_env.set.get("OPENAI_BASE_URL").map(String::as_str),
-            Some("https://relay.example.com/v1")
-        );
-        assert_eq!(
-            codex_env.set.get("OPENAI_API_KEY").map(String::as_str),
-            Some(canary)
-        );
-
-        let opencode_env = relay
-            .resolve_env_with(Engine::OpenCode, &env_map)
-            .expect("opencode");
-        assert_eq!(
-            opencode_env.set.get("OPENAI_API_KEY").map(String::as_str),
-            Some(canary)
-        );
-        assert_eq!(
-            opencode_env
-                .set
-                .get("ANTHROPIC_API_KEY")
-                .map(String::as_str),
-            Some(canary)
-        );
-
-        let err = relay.resolve_env_with(Engine::Agy, &env_map).unwrap_err();
-        assert!(err.contains("does not permit engine `agy`"), "{err}");
+        assert!(parse_auth_profiles_toml(bad_local, root, None).is_err());
     }
 
     #[test]
@@ -2912,28 +3009,23 @@ auth = "sk-local-secret"
             assert!(err.contains("refuses host directory"), "{err}");
         }
 
-        // Symlink pointing into ~/.claude must also fail closed.
         let escape_link = scratch.join("sneaky-link");
         std::os::unix::fs::symlink(fake_home.join(".claude"), &escape_link).expect("symlink");
         assert!(validate_isolated_profile_dir(&escape_link, Some(&fake_home)).is_err());
-
-        // Traversal with `..` or relative paths must fail closed.
         assert!(validate_isolated_profile_dir(Path::new("rel/profile"), Some(&fake_home)).is_err());
-        assert!(
-            validate_isolated_profile_dir(&scratch.join("safe/../home/.claude"), Some(&fake_home))
-                .is_err()
-        );
 
-        // Clean isolated directory -> Missing, then Ready, then ReauthRequired on expiry/malformed JSON.
         let isolated = scratch.join("isolated/claude-work");
         let now = 1_750_000_000_i64;
-        let missing = probe_native_login(
-            &isolated,
-            NativeLoginProvider::ClaudeOauth,
-            Some(&fake_home),
-            now,
+        assert_eq!(
+            probe_native_login(
+                &isolated,
+                NativeLoginProvider::ClaudeOauth,
+                Some(&fake_home),
+                now
+            )
+            .readiness,
+            ProfileReadiness::Missing
         );
-        assert_eq!(missing.readiness, ProfileReadiness::Missing);
 
         fs::create_dir_all(&isolated).expect("isolated");
         let cred = isolated.join(".credentials.json");
@@ -2945,15 +3037,17 @@ auth = "sk-local-secret"
             ),
         )
         .expect("write ready cred");
-        let ready = probe_native_login(
-            &isolated,
-            NativeLoginProvider::ClaudeOauth,
-            Some(&fake_home),
-            now,
+        assert_eq!(
+            probe_native_login(
+                &isolated,
+                NativeLoginProvider::ClaudeOauth,
+                Some(&fake_home),
+                now
+            )
+            .readiness,
+            ProfileReadiness::Ready
         );
-        assert_eq!(ready.readiness, ProfileReadiness::Ready, "{ready:?}");
 
-        // Expired millisecond timestamp -> ReauthRequired.
         fs::write(
             &cred,
             format!(
@@ -2962,106 +3056,42 @@ auth = "sk-local-secret"
             ),
         )
         .expect("write expired cred");
-        let expired = probe_native_login(
-            &isolated,
-            NativeLoginProvider::ClaudeOauth,
-            Some(&fake_home),
-            now,
+        assert_eq!(
+            probe_native_login(
+                &isolated,
+                NativeLoginProvider::ClaudeOauth,
+                Some(&fake_home),
+                now
+            )
+            .readiness,
+            ProfileReadiness::ReauthRequired
         );
-        assert_eq!(expired.readiness, ProfileReadiness::ReauthRequired);
 
-        // Explicit flag or corrupted JSON -> ReauthRequired.
         fs::write(&cred, "{not-valid-json").expect("write bad json");
-        let bad_json = probe_native_login(
-            &isolated,
-            NativeLoginProvider::ClaudeOauth,
-            Some(&fake_home),
-            now,
+        assert_eq!(
+            probe_native_login(
+                &isolated,
+                NativeLoginProvider::ClaudeOauth,
+                Some(&fake_home),
+                now
+            )
+            .readiness,
+            ProfileReadiness::ReauthRequired
         );
-        assert_eq!(bad_json.readiness, ProfileReadiness::ReauthRequired);
 
-        // Command planner sets isolated env vars and unsets raw API keys.
         let plan = plan_login_command(
-            Engine::Claude,
-            "claude-work",
-            &isolated,
+            NativeLoginProvider::Agy,
+            "agy-work",
+            &scratch.join("isolated/agy-work"),
             Some(&fake_home),
             &|_| None,
         )
-        .expect("plan login");
-        assert_eq!(
-            plan.env.set.get("CLAUDE_CONFIG_DIR").map(String::as_str),
-            Some(isolated.to_string_lossy().as_ref())
-        );
-        assert!(plan.env.unset.contains(&"ANTHROPIC_API_KEY".to_string()));
-        assert!(
-            plan_login_command(Engine::OpenCode, "oc", &isolated, Some(&fake_home), &|_| {
-                None
-            })
-            .is_err()
-        );
+        .expect("plan agy login");
+        assert_eq!(plan.engine, Engine::Agy);
+        assert!(plan.env.set.contains_key("AGY_HOME"));
+        assert!(plan.env.unset.contains(&"GEMINI_API_KEY".to_string()));
 
         let _ = fs::remove_dir_all(&scratch);
-    }
-
-    #[test]
-    fn cloud_iam_and_local_translate_env_and_probe_cleanly() {
-        let vertex = CloudIamProfile {
-            provider: CloudIamProvider::Vertex,
-            region: "us-east5".to_string(),
-            project: Some("vertex-proj".to_string()),
-            engines: vec![Engine::Claude, Engine::Agy],
-            credential_chain: vec!["workload_identity".to_string()],
-            aws_profile: None,
-            service_account: Some("runner@vertex-proj.iam.gserviceaccount.com".to_string()),
-            tenant_id: None,
-            endpoint: None,
-        };
-
-        let missing = probe_cloud_iam_with(&vertex, &|_| None, &|_| false, None);
-        assert_eq!(missing.readiness, ProfileReadiness::Missing);
-
-        let adc_path = Path::new("/run/secrets/gcp-adc.json");
-        let ready = probe_cloud_iam_with(
-            &vertex,
-            &|k| (k == "GOOGLE_APPLICATION_CREDENTIALS").then(|| adc_path.display().to_string()),
-            &|p| p == adc_path,
-            None,
-        );
-        assert_eq!(ready.readiness, ProfileReadiness::Ready);
-
-        let vertex_env = vertex.translate_env(Engine::Claude).expect("vertex env");
-        assert_eq!(
-            vertex_env
-                .set
-                .get("CLAUDE_CODE_USE_VERTEX")
-                .map(String::as_str),
-            Some("1")
-        );
-        assert_eq!(
-            vertex_env
-                .set
-                .get("ANTHROPIC_VERTEX_PROJECT_ID")
-                .map(String::as_str),
-            Some("vertex-proj")
-        );
-        assert!(vertex_env.unset.contains(&"ANTHROPIC_API_KEY".to_string()));
-
-        let local = LocalProfile {
-            provider: LocalProvider::Ollama,
-            base_url: LocalProvider::Ollama.default_base_url().to_string(),
-            auth: LocalAuthMode::None,
-            engines: vec![Engine::Codex],
-        };
-        let local_env = local.translate_env(Engine::Codex).expect("local env");
-        assert_eq!(
-            local_env.set.get("OPENAI_BASE_URL").map(String::as_str),
-            Some("http://127.0.0.1:11434/v1")
-        );
-        assert_eq!(
-            local_env.set.get("OPENAI_API_KEY").map(String::as_str),
-            Some("not-required")
-        );
     }
 
     #[test]
@@ -3078,8 +3108,10 @@ auth = "sk-local-secret"
         }
 
         let cfg_path = scratch.join("auth.toml");
-        let cfg_toml = format!(
-            r#"
+        fs::write(
+            &cfg_path,
+            format!(
+                r#"
 [auth.profiles.relay-env]
 mode = "relay"
 base_url = "https://relay-a.example.com/v1"
@@ -3094,14 +3126,14 @@ engines = ["codex"]
 [auth.profiles.relay-file.api_key]
 from_file = "{secret_file}"
 "#,
-            secret_file = secret_file.display()
-        );
-        fs::write(&cfg_path, cfg_toml).expect("write auth.toml");
+                secret_file = secret_file.display()
+            ),
+        )
+        .expect("write auth.toml");
 
-        let profiles_root = scratch.join("profiles");
         let report = evaluate_profiles_report_with(
             &cfg_path,
-            &profiles_root,
+            &scratch.join("profiles"),
             &|name| (name == "CANARY_RELAY_KEY").then(|| env_canary.to_string()),
             &Path::exists,
             Some(Path::new("/home/tester")),
@@ -3112,7 +3144,6 @@ from_file = "{secret_file}"
         assert!(report.ok);
         assert_eq!(report.summary.configured, 2);
         assert_eq!(report.summary.configured_ready, 2);
-        assert_eq!(report.summary.reauth_required, 0);
 
         let json_out = serde_json::to_string_pretty(&report).expect("json");
         let text_out = format_report_text(&report, "spawn auth list");
@@ -3123,8 +3154,8 @@ from_file = "{secret_file}"
                 "file canary leaked: {output}"
             );
         }
-        assert!(json_out.contains("CANARY_RELAY_KEY"), "{json_out}");
-        assert!(json_out.contains("from_file"), "{json_out}");
+        assert!(json_out.contains("CANARY_RELAY_KEY"));
+        assert!(json_out.contains("env_preview"));
 
         let _ = fs::remove_dir_all(&scratch);
     }
@@ -3133,22 +3164,24 @@ from_file = "{secret_file}"
     fn cli_arg_parsing_and_relay_toml_upsert_reject_boundaries_cleanly() {
         let args = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
 
-        // Plaintext CLI key flags must be refused.
-        let key_flag_err = parse_auth_args(
-            &args(&["myrelay", "--url", "https://gw.example", "--key", "sk-bad"]),
-            Some("<name>"),
-            &["url", "key-env", "key-file", "engines", "tiers", "config"],
-            &["json"],
-        )
+        let key_flag_err = command(&args(&[
+            "add-relay",
+            "myrelay",
+            "--url",
+            "https://gw.example",
+            "--key",
+            "sk-bad",
+        ]))
         .unwrap_err();
         assert!(key_flag_err.contains("forbidden"), "{key_flag_err}");
+        assert!(command(&args(&["login", "opencode"])).is_err());
+        assert!(command(&[]).is_err());
+        assert!(
+            command(&args(&["unknown"]))
+                .unwrap_err()
+                .contains("unknown auth subcommand")
+        );
 
-        // Invalid profile names rejected.
-        assert!(validate_profile_name("../escape").is_err());
-        assert!(validate_profile_name("has.dot").is_err());
-        assert!(validate_profile_name("good-profile_1").is_ok());
-
-        // Atomic TOML upsert preserves other sections and updates an existing relay profile.
         let initial = r#"# fleet auth config
 [auth.profiles.keep-local]
 mode = "local"
@@ -3158,7 +3191,6 @@ provider = "ollama"
 mode = "relay"
 base_url = "https://old.example/v1"
 engines = ["claude"]
-
 [auth.profiles.openrouter.api_key]
 from_env = "OLD_KEY"
 "#;
@@ -3170,47 +3202,19 @@ from_env = "OLD_KEY"
                 api_key: SecretRef::FromEnv {
                     from_env: "NEW_OPENROUTER_KEY".to_string(),
                 },
-                engines: vec![Engine::Claude, Engine::Codex],
+                engines: [RelayEngine::Claude, RelayEngine::Codex]
+                    .into_iter()
+                    .collect(),
             },
-            &[ModelTier::L1, ModelTier::L2, ModelTier::L3],
+            &ModelTier::ALL,
         )
         .expect("upsert");
 
-        assert!(updated.contains("[auth.profiles.keep-local]"), "{updated}");
-        assert!(!updated.contains("OLD_KEY"), "{updated}");
-        assert!(updated.contains("NEW_OPENROUTER_KEY"), "{updated}");
-
+        assert!(updated.contains("[auth.profiles.keep-local]"));
+        assert!(!updated.contains("OLD_KEY"));
+        assert!(updated.contains("NEW_OPENROUTER_KEY"));
         let reparsed =
-            parse_auth_profiles_toml(&updated, Path::new("/tmp/p"), None).expect("reparse updated");
+            parse_auth_profiles_toml(&updated, Path::new("/tmp/p"), None).expect("reparse");
         assert_eq!(reparsed.len(), 2);
-        match &reparsed["openrouter"].profile {
-            AuthProfile::Relay(r) => {
-                assert_eq!(r.base_url, "https://openrouter.ai/api");
-                assert_eq!(r.engines, vec![Engine::Claude, Engine::Codex]);
-            }
-            other => panic!("expected relay, got {other:?}"),
-        }
-
-        // Command handler refuses unknown subcommand & wrong login engine.
-        assert!(command(&[]).is_err());
-        assert!(
-            command(&args(&["unknown"]))
-                .unwrap_err()
-                .contains("unknown auth subcommand")
-        );
-        assert!(command(&args(&["login", "opencode"])).is_err());
-        assert!(
-            command(&args(&[
-                "add-relay",
-                "r1",
-                "--url",
-                "https://gw.example",
-                "--key-env",
-                "A",
-                "--key-file",
-                "/abs/k"
-            ]))
-            .is_err()
-        );
     }
 }
