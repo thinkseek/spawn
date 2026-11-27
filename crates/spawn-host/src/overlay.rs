@@ -59,7 +59,8 @@ use spawn_core::port::{
     WorkspaceStore,
 };
 
-use crate::git::{GitWorkspace, git_command, pathspec_batches, report, report_listing};
+use crate::git::GitWorkspace;
+use crate::git_process::{git_command, pathspec_batches, report, report_listing};
 
 /// Directories a checkpoint leaves out by default, at any depth: build
 /// output, installed dependencies and Spawn's own runtime files. They may
@@ -442,6 +443,11 @@ impl OverlayWorkspace {
     /// The store root, resolved.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Underlying bare [`GitWorkspace`] holding mirror refs and history.
+    pub(crate) fn git_store(&self) -> &GitWorkspace {
+        &self.git
     }
 
     /// The shared snapshot layer of `commit`.
@@ -1787,7 +1793,7 @@ impl OverlayWorkspace {
         let _store = self.lock_store(false)?;
         let _lock = self.lock_workspace(name)?;
         ready().map_err(|why| WorkspaceError::Refused {
-            code: crate::git::SET_ASIDE_WAITS.to_string(),
+            code: crate::workspace_rules::SET_ASIDE_WAITS.to_string(),
             message: why,
         })?;
         let reference = format!("refs/heads/{branch}");
@@ -1850,7 +1856,10 @@ impl OverlayWorkspace {
         let now = self.write_tree(&state, &lower, &diff)?;
         crate::cow::plan_move(&view, &tree(&now)?, &new)?;
 
-        self.commit_locked(&workspace, &crate::git::set_aside_kept_message(name))?;
+        self.commit_locked(
+            &workspace,
+            &crate::workspace_rules::set_aside_kept_message(name),
+        )?;
         let head = self.git.commit_id_of(&reference)?;
         let plan = match self.git.set_aside_plan(&head, &start, message)? {
             Ok(plan) => plan,
@@ -1859,7 +1868,7 @@ impl OverlayWorkspace {
         let commit = self.git.set_aside_commit(&plan, message)?;
         let moves = crate::cow::plan_move(&view, &tree(&plan.head)?, &new)?;
         let layer = self.ensure_layer(&start)?;
-        let aside = format!("{}/{}", crate::git::SET_ASIDE_FILES, plan.head);
+        let aside = format!("{}/{}", crate::workspace_rules::SET_ASIDE_FILES, plan.head);
         let verify = |going: &crate::cow::Going| self.verify_taken(&view, going);
         crate::cow::apply_move(&view, &layer, &moves, aside.as_bytes(), &verify)?;
         write_atomic(
@@ -1909,7 +1918,7 @@ impl OverlayWorkspace {
                 .args(["hash-object", "--no-filters", "--"])
                 .args(chunk.iter().map(|(path, _)| path.as_os_str()))
                 .stdin(Stdio::null());
-            let hashed = crate::git::report(command.output(), "hash-object")?;
+            let hashed = report(command.output(), "hash-object")?;
             let hashed: Vec<&str> = hashed.lines().collect();
             if hashed.len() != chunk.len() {
                 return Err(WorkspaceError::Unavailable(

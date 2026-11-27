@@ -94,7 +94,8 @@ use spawn_core::port::{
     WorkspaceStore,
 };
 
-use crate::git::{GitWorkspace, report};
+use crate::git::GitWorkspace;
+use crate::git_process::report;
 
 /// The store's own directory under its root.
 const COW_DIRECTORY: &str = ".cow";
@@ -1704,6 +1705,11 @@ impl CowWorkspace {
         &self.root
     }
 
+    /// Underlying bare [`GitWorkspace`] holding mirror refs and history.
+    pub(crate) fn git_store(&self) -> &GitWorkspace {
+        &self.git
+    }
+
     /// Whether this store's root can clone copy-on-write (else every mount
     /// copies).
     pub fn cow_supported(&self) -> bool {
@@ -1919,7 +1925,9 @@ impl CowWorkspace {
     /// root, takes it.
     fn lock_branch(&self, branch: &str) -> Result<fs::File, WorkspaceError> {
         Self::checked_branch(branch)?;
-        crate::git::lock_file(&self.cow_dir().join("locks").join(format!("{branch}.lock")))
+        crate::workspace_rules::lock_file(
+            &self.cow_dir().join("locks").join(format!("{branch}.lock")),
+        )
     }
 
     /// The commit `reference` names, when it names one.
@@ -3032,7 +3040,7 @@ impl CowWorkspace {
         let branch = branch.as_str();
         let _lock = self.lock_branch(branch)?;
         ready().map_err(|why| WorkspaceError::Refused {
-            code: crate::git::SET_ASIDE_WAITS.to_string(),
+            code: crate::workspace_rules::SET_ASIDE_WAITS.to_string(),
             message: why,
         })?;
         self.clear_diagnostics();
@@ -3084,7 +3092,10 @@ impl CowWorkspace {
 
         let workspace = WorkspaceId::new(format!("{branch}:{}", directory.display()))
             .map_err(|error| unavailable(error.to_string()))?;
-        self.commit_locked(&workspace, &crate::git::set_aside_kept_message(branch))?;
+        self.commit_locked(
+            &workspace,
+            &crate::workspace_rules::set_aside_kept_message(branch),
+        )?;
         let head = self.git.commit_id_of(&reference)?;
         let plan = match self.git.set_aside_plan(&head, &start, message)? {
             Ok(plan) => plan,
@@ -3100,7 +3111,7 @@ impl CowWorkspace {
             .map(|(path, entry)| (path.clone(), (entry.mode, entry.sha.clone())))
             .collect();
         let steps = plan_move(&directory, &old, &new)?;
-        let aside = format!("{}/{}", crate::git::SET_ASIDE_FILES, plan.head);
+        let aside = format!("{}/{}", crate::workspace_rules::SET_ASIDE_FILES, plan.head);
         let moved = apply_move(
             &directory,
             &self.baseline_path(&start),
@@ -3671,7 +3682,7 @@ mod tests {
     }
 
     fn git(directory: &Path, arguments: &[&str]) -> String {
-        let output = crate::git::test_git_command()
+        let output = crate::git_process::test_git_command()
             .arg("-C")
             .arg(directory)
             .args(arguments)

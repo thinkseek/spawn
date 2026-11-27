@@ -27,6 +27,7 @@ pub mod d6_workspace;
 pub mod engine_view;
 pub mod git;
 pub mod git_border;
+pub mod git_process;
 pub mod herdr;
 pub mod herdr_core;
 pub mod herdr_witness;
@@ -48,55 +49,47 @@ pub mod workspace_rules;
 #[cfg(test)]
 mod audit;
 
-pub use cas_dedup::{
-    ArtifactRoot, DedupConfig, DedupError, DedupReport, PruneReport, dedup_dirs, prune_unused,
-};
+pub use cas_dedup::{ArtifactRoot, DedupConfig, DedupError, DedupReport, dedup_dirs, prune_unused};
 pub use cas_merkle::{
-    BUILD_OUTPUT as D6_BUILD_OUTPUT, CasMerkleStore, D6RefKind, D6StoreError, InMemoryRefLedger,
-    LedgerRef, LedgerSnapshot, MaterializeReport, PublishRequest, PublishedSnapshot, RefLedger,
-    ScannedEntry, ScannedKind, TrackedSetPolicy, format_commit_body,
+    CasMerkleStore, D6RefKind, D6StoreError, InMemoryRefLedger, LedgerRef, LedgerSnapshot,
+    PublishRequest, PublishedSnapshot, RefLedger, TrackedSetPolicy, format_commit_body,
 };
 pub use container::{BwrapCapability, ContainerEnv, detect_container, probe_bwrap};
 pub use cow::{
-    CloneKind, CowStats, CowWorkspace, DirectoryOccupancy, WorkspaceLease, clone_or_copy,
-    cow_clone_supported, directory_occupancy, live_users, reflink_file,
+    CloneKind, CowWorkspace, WorkspaceLease, clone_or_copy, cow_clone_supported, live_users,
+    reflink_file,
 };
 pub use d6_cutover::{
-    BackfillReport, BundleDrillReport, CutoverEvent, CutoverParityReport, CutoverPhase,
-    CutoverRefParity, GcFenceStatus, LocalOnlyLargeFile, PendingMergeAudit, PreCutoverCleanReport,
-    ProjectCutover, ProjectStorageMode, ReconcileReport, RollbackReport,
+    CutoverParityReport, CutoverPhase, GcFenceStatus, ProjectCutover, ProjectStorageMode,
     assert_zero_pending_merges, bind_store_gc_fence, check_gc_fence, is_readonly_border,
     reconcile_refs_journal, run_persistent_gc_for_ledger, verify_bundle_snapshot_roundtrip,
     verify_cutover_parity, verify_zero_pending_merges,
 };
 pub use d6_layer0::{
-    EolPathFinding, ExistingDestPolicy, ExportAttrRuleFinding, ExportAttributesAudit,
-    Layer0MaterializeReport, Layer0Options, audit_export_attributes, materialize_layer0,
+    ExistingDestPolicy, Layer0Options, audit_export_attributes, materialize_layer0,
     materialize_workspace_from_tree,
 };
 pub use d6_shadow::{
-    SetAsideWhen, ShadowCheckpointOutcome, ShadowD6Workspace, ShadowOracleMetrics,
-    ShadowTrackedSetMode,
+    ShadowCheckpointOutcome, ShadowD6Workspace, ShadowOracleMetrics, ShadowTrackedSetMode,
 };
 pub use d6_workspace::D6Workspace;
 pub use engine_view::{
     BwrapView, ContainerView, ExtraMount, HomeIsolation, HostInheritMode, ViewConfig,
 };
+pub use git::GitWorkspace;
+pub use git_border::{BorderRefTarget, GitBorderAdapter};
+pub use git_process::git_command;
 #[cfg(any(test, feature = "testing"))]
-pub use git::test_git_command;
-pub use git::{GitWorkspace, git_command};
-pub use git_border::{BorderRefTarget, ExportReport, GitBorderAdapter, ImportReport, ImportedRef};
+pub use git_process::test_git_command;
 pub use herdr::{HerdrHost, HerdrPool};
 pub use herdr_core::HerdrCoreHost;
 pub use merkle_merge::{
-    BuiltMergeSnapshot, ConflictKind, ConflictLabels, EolAttr, GitAttributes, MergeBaseError,
-    MergeConflict, MergeDriver, MergeOptions, MergeReport, MergeShadowOutcome, MergeSnapshotSpec,
-    PathAttributes, ShadowBlockerReason, ShadowOracleSummary, TextAttr, TextMergeResult,
-    build_merge_snapshot, classify_shadow_merge, find_merge_bases, find_single_merge_base,
-    is_binary_buffer, merge_snapshots, merge_text_3way, merge_trees, validate_single_merge_base,
+    ConflictKind, ConflictLabels, MergeBaseError, MergeDriver, MergeOptions, MergeShadowOutcome,
+    MergeSnapshotSpec, ShadowOracleSummary, build_merge_snapshot, classify_shadow_merge,
+    merge_snapshots, merge_text_3way, merge_trees, validate_single_merge_base,
 };
 #[cfg(target_os = "linux")]
-pub use overlay::{OverlayWorkspace, Swept, overlay_supported, overlay_supported_in, sweep_probes};
+pub use overlay::{OverlayWorkspace, overlay_supported_in, sweep_probes};
 pub use process::{current_uid, undumpable};
 pub use root::canonical_root;
 #[cfg(any(test, feature = "testing"))]
@@ -107,9 +100,8 @@ pub use workspace::{
     BACKEND_MARKER, CAS_DIRECTORY, LocalWorkspaceStore, WorkspaceBackend, claim_root, root_backend,
 };
 pub use workspace_rules::{
-    DEFAULT_MAX_FILE_MB, ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER, MAIN_COPIES, OversizedFile,
-    SET_ASIDE_FILES, SET_ASIDE_WAITS, has_conflict_block, has_conflict_block_sized, max_file_bytes,
-    names_files_outside_git, oversized_record,
+    ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER, MAIN_COPIES, SET_ASIDE_FILES, SET_ASIDE_WAITS,
+    has_conflict_block, has_conflict_block_sized, names_files_outside_git,
 };
 
 /// The terminal host of this machine Spawn runs on: embedded `herdr-core`

@@ -8,7 +8,7 @@
 //! touches a checked-out tree and needs no branch to be current.
 //!
 //! Every file of the workspace is a blob of the checkpoint, up to a size cap
-//! (`SPAWN_MAX_FILE_MB`, [`DEFAULT_MAX_FILE_MB`]). A file over it is left out
+//! (`SPAWN_MAX_FILE_MB`, [`crate::workspace_rules::DEFAULT_MAX_FILE_MB`]). A file over it is left out
 //! of the checkpoint, never failing it: the checkpoint goes on without it,
 //! and the agent is told once, by the prompt that carries it
 //! ([`WorkspaceStore::notices`], [`WorkspaceStore::notices_told`]). The one
@@ -35,9 +35,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 
 use spawn_core::event::Fork;
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
@@ -46,16 +45,15 @@ use spawn_core::port::{
     WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
 };
 
-use crate::tree_path::{TreePath, nul_fields};
-pub(crate) use crate::workspace_rules::{CONFLICT_MARKER_SIZE, lock_file, set_aside_kept_message};
-pub use crate::workspace_rules::{
-    DEFAULT_MAX_FILE_MB, ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER, MAIN_COPIES, OversizedFile,
-    SET_ASIDE_FILES, SET_ASIDE_WAITS, has_conflict_block, has_conflict_block_sized, max_file_bytes,
-    names_files_outside_git, oversized_record, task_head_ref, worker_head_ref,
+use crate::git_process::{
+    git_command, nul_terminated, pathspec_batches, report, report_listing, shown_arguments,
 };
+use crate::tree_path::{TreePath, nul_fields};
 use crate::workspace_rules::{
-    Oversized, encode_oversized, oversized_digest, oversized_file, oversized_notice_message,
-    parse_oversized, stale_ref,
+    CONFLICT_MARKER_SIZE, ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER, MAIN_COPIES, Oversized,
+    SET_ASIDE_FILES, SET_ASIDE_WAITS, encode_oversized, has_conflict_block_sized, lock_file,
+    max_file_bytes, names_files_outside_git, oversized_digest, oversized_file,
+    oversized_notice_message, parse_oversized, set_aside_kept_message, stale_ref, worker_head_ref,
 };
 
 /// Distinguishes the staged mounts of one process ([`GitWorkspace::staging_path`]).
@@ -133,140 +131,6 @@ fn runtime_pathspecs(magic: &str) -> Vec<OsString> {
 
 /// First field of the record of main's copies ([`GitWorkspace::main_copies`]).
 const COPIES_TAG: &str = "main-copies";
-
-/// The locale every git Spawn runs gets (`LC_ALL`): git's own, untranslated
-/// messages.
-const GIT_LOCALE: &str = "C";
-
-/// A command that runs `program` (the git to run) the way Spawn runs every
-/// git: in the C locale, `LC_ALL=C` and no `LANGUAGE`.
-/// Every git of [`GitWorkspace`] and of the controller (`spawn-cli`'s
-/// `controller_git`) is built here, so none can be left to the host's
-/// locale.
-///
-/// Spawn reads what git answers: a push's summary, a merge's conflict
-/// kinds, a listing, an exit code, and the error it quotes in a record or a
-/// note. Under a translated locale (`LANG=zh_CN.UTF-8`) git, and the
-/// `git-receive-pack` or hook it starts, writes its messages in that
-/// language; nothing Spawn decides may change with the host's language.
-/// `LC_ALL` wins over `LANG` and every `LC_*`; `LANGUAGE`, which gettext
-/// would otherwise read first, is removed. Paths, listings and commit
-/// messages are bytes to git in any locale.
-pub fn git_command(program: impl AsRef<OsStr>) -> Command {
-    let mut command = Command::new(program);
-    command.env("LC_ALL", GIT_LOCALE).env_remove("LANGUAGE");
-    command
-}
-
-/// A command that runs git the way a test runs its own (a seed's `init`,
-/// `add` and `commit`, a look at a ref or an index): [`git_command`],
-/// without the user's or the system's git configuration.
-///
-/// `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` leave out
-/// `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` and `/etc/gitconfig`, and
-/// configuration inherited through the environment (`GIT_CONFIG_COUNT`,
-/// `GIT_CONFIG_PARAMETERS`) is removed. So a host whose configuration signs
-/// every commit (`commit.gpgsign` with a key no agent holds: `ssh-keygen -Y
-/// sign` waits forever), runs hooks (`core.hooksPath`) or refuses to guess
-/// an identity (`user.useConfigOnly`) neither hangs nor fails a test, and
-/// a configuration a test sets on the command itself still counts. It
-/// leaves out every setting, not just signing: no setting of the host's
-/// can reach a test's own git. Standard input is empty; the identity
-/// (`spawn-test`) is one a test may override with its own `-c`.
-///
-/// Never Spawn's own git: what Spawn runs must hold under the host's
-/// configuration, and a test runs it that way (`spawn-cli`'s
-/// `spawns_own_commits_ignore_forced_signing`).
-#[cfg(any(test, feature = "testing"))]
-pub fn test_git_command() -> Command {
-    let mut command = git_command("git");
-    command
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .stdin(Stdio::null())
-        .args([
-            "-c",
-            "user.name=spawn-test",
-            "-c",
-            "user.email=spawn@localhost",
-        ]);
-    command
-}
-
-/// Stdout of a git command exactly as written, bytes and all, or the
-/// failure as an error. A `-z` listing is read this way: a path may begin
-/// or end with whitespace, which trimming would cut off the first or the
-/// last path, and its bytes need not be UTF-8 ([`TreePath`]).
-pub(crate) fn report_listing(
-    output: std::io::Result<Output>,
-    word: &str,
-) -> Result<Vec<u8>, WorkspaceError> {
-    let output =
-        output.map_err(|error| WorkspaceError::Unavailable(format!("run {word}: {error}")))?;
-    if !output.status.success() {
-        return Err(WorkspaceError::Unavailable(format!(
-            "git {word}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(output.stdout)
-}
-
-/// Trimmed stdout of a git command that prints one value (a commit, a
-/// tree), or the failure as an error. Never for a listing of paths.
-pub(crate) fn report(
-    output: std::io::Result<Output>,
-    word: &str,
-) -> Result<String, WorkspaceError> {
-    report_listing(output, word).map(|stdout| String::from_utf8_lossy(&stdout).trim().to_string())
-}
-
-/// git arguments joined for an error message.
-fn shown_arguments<S: AsRef<OsStr>>(arguments: &[S]) -> String {
-    arguments
-        .iter()
-        .map(|argument| argument.as_ref().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Bytes of pathspecs one `git ls-tree` call carries on its command line:
-/// far under Linux's 2 MiB for arguments and environment together, and
-/// over any single path, so every batch holds at least one.
-const PATHSPEC_BATCH_BYTES: usize = 128 << 10;
-
-/// `specs` in order, cut into runs of at most [`PATHSPEC_BATCH_BYTES`]
-/// (a longer spec gets a run of its own).
-pub(crate) fn pathspec_batches(specs: Vec<OsString>) -> Vec<Vec<OsString>> {
-    let mut batches: Vec<Vec<OsString>> = Vec::new();
-    let mut bytes = 0;
-    for spec in specs {
-        let length = spec.len() + 1;
-        match batches.last_mut() {
-            Some(batch) if bytes + length <= PATHSPEC_BATCH_BYTES => {
-                bytes += length;
-                batch.push(spec);
-            }
-            _ => {
-                bytes = length;
-                batches.push(vec![spec]);
-            }
-        }
-    }
-    batches
-}
-
-/// `specs` NUL-terminated, for `--pathspec-from-file=- --pathspec-file-nul`.
-fn nul_terminated(specs: &[OsString]) -> Vec<u8> {
-    let mut input = Vec::new();
-    for spec in specs {
-        input.extend_from_slice(spec.as_bytes());
-        input.push(0);
-    }
-    input
-}
 
 /// The paths of a NUL-separated listing of paths.
 fn listed_paths(listing: &[u8]) -> Vec<TreePath> {
@@ -1084,7 +948,7 @@ impl GitWorkspace {
     }
 
     /// Where the files over the cap that checkpoints of a branch left out are
-    /// recorded ([`oversized_record`] reads it; the format is there).
+    /// recorded ([`crate::workspace_rules::oversized_record`] reads it; the format is there).
     fn oversized_path(&self, branch: &str) -> PathBuf {
         oversized_file(&self.root, branch)
     }
@@ -3029,7 +2893,7 @@ impl GitWorkspace {
     }
 
     /// The files `commit` changes against `base` that hold a whole conflict
-    /// marker block ([`has_conflict_block`]): work that must not be judged,
+    /// marker block ([`crate::workspace_rules::has_conflict_block`]): work that must not be judged,
     /// let alone land. The paths are shown lossily; each file is read by its
     /// own bytes.
     pub fn conflict_markers(
@@ -3233,7 +3097,7 @@ mod tests {
     use super::GitWorkspace;
 
     fn git(directory: &Path, arguments: &[&str]) -> String {
-        let output = super::test_git_command()
+        let output = crate::git_process::test_git_command()
             .arg("-C")
             .arg(directory)
             .args([
@@ -3292,7 +3156,7 @@ mod tests {
         assert_eq!(held, expected);
 
         let staged = |index: &Path| {
-            let listed = super::test_git_command()
+            let listed = crate::git_process::test_git_command()
                 .arg("-C")
                 .arg(&checkout)
                 .arg("ls-files")
@@ -3313,7 +3177,7 @@ mod tests {
         );
         // An index that holds two of them loses both.
         let full = base.join("full-index");
-        let added = super::test_git_command()
+        let added = crate::git_process::test_git_command()
             .arg("-C")
             .arg(&checkout)
             .args(["add", "-A"])
@@ -3360,7 +3224,7 @@ mod tests {
     fn other_writers_commit(checkout: &Path) -> String {
         let index = checkout.join(".git").join("other-writer-index");
         let with_index = |arguments: &[&str]| {
-            let output = super::test_git_command()
+            let output = crate::git_process::test_git_command()
                 .arg("-C")
                 .arg(checkout)
                 .args(arguments)
@@ -3754,7 +3618,7 @@ mod tests {
         store.commit(&workspace, "one").expect("commit");
         let expected = sha(&bytes);
         let root = base.join("work");
-        let record = super::oversized_record(&root, "agent_a");
+        let record = crate::workspace_rules::oversized_record(&root, "agent_a");
         assert_eq!(record.len(), 1, "{record:?}");
         assert_eq!(record[0].path.as_bytes(), b"big.bin");
         assert_eq!(record[0].size, (1 << 20) + 5);
@@ -3769,7 +3633,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(directory.join("big.bin"), &changed).expect("write");
         store.commit(&workspace, "two").expect("commit");
-        let record = super::oversized_record(&root, "agent_a");
+        let record = crate::workspace_rules::oversized_record(&root, "agent_a");
         assert_eq!(record[0].digest, Some(sha(&changed)));
 
         // A record of the earlier format: no digest, still told.
@@ -3781,7 +3645,7 @@ mod tests {
             format!("told\0{size}\0big.bin\0"),
         )
         .expect("an old record");
-        let old = super::oversized_record(&root, "agent_a");
+        let old = crate::workspace_rules::oversized_record(&root, "agent_a");
         assert_eq!(old.len(), 1);
         assert_eq!(old[0].digest, None);
         assert!(old[0].told);
@@ -3789,7 +3653,7 @@ mod tests {
         // The next checkpoint adds the digest and keeps it told.
         std::fs::write(directory.join("work.txt"), "w\n").expect("write");
         store.commit(&workspace, "three").expect("commit");
-        let record = super::oversized_record(&root, "agent_a");
+        let record = crate::workspace_rules::oversized_record(&root, "agent_a");
         assert!(record[0].told);
         assert_eq!(record[0].digest, Some(sha(&changed)));
         // A malformed digest is no digest; a name that is no branch reads
@@ -3799,14 +3663,17 @@ mod tests {
             format!("untold\0{size} sha256:XYZ\0big.bin\0"),
         )
         .expect("a bad digest");
-        assert_eq!(super::oversized_record(&root, "agent_a")[0].digest, None);
+        assert_eq!(
+            crate::workspace_rules::oversized_record(&root, "agent_a")[0].digest,
+            None
+        );
         // An entry with an empty path is left out; the rest still reads.
         std::fs::write(
             root.join(".oversized/agent_a"),
             format!("untold\0{size}\0\0told\0{size}\0big.bin\0"),
         )
         .expect("an empty path");
-        let read = super::oversized_record(&root, "agent_a");
+        let read = crate::workspace_rules::oversized_record(&root, "agent_a");
         assert_eq!(read.len(), 1, "{read:?}");
         assert_eq!(read[0].path.as_bytes(), b"big.bin");
         let _ = std::fs::remove_dir_all(&base);
@@ -3826,7 +3693,7 @@ mod tests {
         // A valid record outside `.oversized`, at `<root>/outside`.
         std::fs::write(root.join("outside"), &record).expect("outside");
         std::fs::write(root.join(".oversized/agent_a"), &record).expect("inside");
-        let inside = super::oversized_record(&root, "agent_a");
+        let inside = crate::workspace_rules::oversized_record(&root, "agent_a");
         assert_eq!(inside.len(), 1, "a legitimate record reads");
         assert_eq!(inside[0].digest.as_deref(), Some(digest.as_str()));
         assert_eq!(inside[0].size, 7);
@@ -3842,20 +3709,23 @@ mod tests {
             "..\\outside",
             "/agent_a",
         ] {
-            assert!(super::oversized_record(&root, name).is_empty(), "{name:?}");
+            assert!(
+                crate::workspace_rules::oversized_record(&root, name).is_empty(),
+                "{name:?}"
+            );
         }
         // A record that is a symbolic link, even to a valid record, and a
         // `.oversized` that is one: nothing.
         std::os::unix::fs::symlink(&outside, root.join(".oversized/linked")).expect("a link");
-        assert!(super::oversized_record(&root, "linked").is_empty());
+        assert!(crate::workspace_rules::oversized_record(&root, "linked").is_empty());
         let other = base.join("other");
         std::fs::create_dir_all(&other).expect("another root");
         std::os::unix::fs::symlink(root.join(".oversized"), other.join(".oversized"))
             .expect("a linked directory");
-        assert!(super::oversized_record(&other, "agent_a").is_empty());
+        assert!(crate::workspace_rules::oversized_record(&other, "agent_a").is_empty());
         // A directory where the record would be: nothing.
         std::fs::create_dir_all(root.join(".oversized/dir")).expect("a directory");
-        assert!(super::oversized_record(&root, "dir").is_empty());
+        assert!(crate::workspace_rules::oversized_record(&root, "dir").is_empty());
     }
 
     /// A file over the cap that `main` holds as a blob (it came from the
@@ -3941,7 +3811,7 @@ mod tests {
 
     #[test]
     fn the_cap_is_a_positive_number_of_mib_or_the_default() {
-        use super::{DEFAULT_MAX_FILE_MB, max_file_bytes};
+        use crate::workspace_rules::{DEFAULT_MAX_FILE_MB, max_file_bytes};
         assert_eq!(max_file_bytes(Some("20")), 20 << 20);
         for unset in [None, Some(""), Some("0"), Some("-5"), Some("lots")] {
             assert_eq!(
@@ -4281,7 +4151,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Every git this store runs, and every git built on [`super::git_command`]
+    /// Every git this store runs, and every git built on [`crate::git_process::git_command`]
     /// (the controller's), is in the C locale whatever the host's; this
     /// module starts no other git.
     #[test]
@@ -4289,8 +4159,8 @@ mod tests {
         use std::ffi::OsStr;
         let store = GitWorkspace::new("/nonexistent.git", std::env::temp_dir());
         for command in [
-            super::git_command("git"),
-            super::test_git_command(),
+            crate::git_process::git_command("git"),
+            crate::git_process::test_git_command(),
             store.command(),
             store.command_in(Path::new("/work"), Path::new("/index")),
         ] {
@@ -4305,14 +4175,24 @@ mod tests {
         let code = own.split("#[cfg(test)]\nmod tests").next().unwrap_or(own);
         assert_eq!(
             code.matches("Command::new(").count(),
-            2,
-            "git_command's, and tar's"
+            1,
+            "tar's only; git runs in git_process.rs"
         );
         assert_eq!(code.matches("Command::new(\"tar\")").count(), 1);
+        let process_own = include_str!("git_process.rs");
+        let process_code = process_own
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(process_own);
+        assert_eq!(
+            process_code.matches("Command::new(").count(),
+            1,
+            "git_command's only"
+        );
     }
 
     /// Every git a test of this crate runs for itself is built by
-    /// [`super::test_git_command`], which no setting of the host's reaches:
+    /// [`crate::git_process::test_git_command`], which no setting of the host's reaches:
     /// no file of the crate, its tests included, starts git another way.
     #[test]
     fn every_test_git_is_built_by_test_git_command() {
@@ -4327,7 +4207,7 @@ mod tests {
                 }
             }
         }
-        let command = super::test_git_command();
+        let command = crate::git_process::test_git_command();
         let envs: Vec<_> = command.get_envs().collect();
         for expected in [
             (
@@ -4370,7 +4250,7 @@ mod tests {
     /// A host whose `~/.gitconfig` signs every commit with a key that is
     /// not there, runs a hook that refuses every commit and guesses no
     /// identity: git with that configuration cannot commit, and a test's
-    /// own git ([`super::test_git_command`]) commits as if it were not.
+    /// own git ([`crate::git_process::test_git_command`]) commits as if it were not.
     #[test]
     fn a_tests_git_ignores_the_hosts_git_configuration() {
         use std::os::unix::fs::PermissionsExt;
@@ -4402,13 +4282,13 @@ mod tests {
                 .output()
                 .expect("git runs")
         };
-        let init = super::test_git_command()
+        let init = crate::git_process::test_git_command()
             .args(["init", "-q", &repo])
             .status()
             .expect("git runs");
         assert!(init.success());
 
-        let mut hosts = super::git_command("git");
+        let mut hosts = crate::git_process::git_command("git");
         hosts
             .env_remove("GIT_CONFIG_GLOBAL")
             .stdin(std::process::Stdio::null());
@@ -4417,7 +4297,7 @@ mod tests {
             !refused.status.success(),
             "the hostile configuration counts for a git with the host's: {refused:?}"
         );
-        let committed = commit(super::test_git_command());
+        let committed = commit(crate::git_process::test_git_command());
         assert!(committed.status.success(), "{committed:?}");
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4482,7 +4362,7 @@ mod tests {
     /// A merge of `main` comes to the same decision, the error a failed git
     /// quotes included, in a process whose whole environment is Chinese
     /// (`LC_ALL`, `LANG`, `LC_MESSAGES`, `LANGUAGE`) as in C: every git of
-    /// this store runs in the C locale ([`super::git_command`]). Without
+    /// this store runs in the C locale ([`crate::git_process::git_command`]). Without
     /// it, the quoted error was git's Chinese. On a host without zh_CN or
     /// git's Chinese messages nothing is translated, and the comparison
     /// holds anyway.
@@ -4843,7 +4723,7 @@ mod tests {
             ),
             "same-length edit immediately after prewarm must still be committed"
         );
-        let show = super::test_git_command()
+        let show = crate::git_process::test_git_command()
             .current_dir(&checkout)
             .args(["show", "refs/heads/agent_a:README.md"])
             .output()
@@ -4881,7 +4761,7 @@ mod tests {
     /// aggressive `git gc`, with original authors/messages intact and
     /// strictly separate from synthetic `refs/heads/<agent>` checkpoints.
     fn run_worker_git(ws_dir: &Path, args: &[&str]) -> String {
-        let out = super::test_git_command()
+        let out = crate::git_process::test_git_command()
             .current_dir(ws_dir)
             .env("GIT_AUTHOR_NAME", "Worker Alice")
             .env("GIT_AUTHOR_EMAIL", "alice@worker.local")
@@ -4928,7 +4808,7 @@ mod tests {
                 .expect("commit"),
             Commit::Created(_)
         ));
-        let head_ref = super::task_head_ref(42, "head");
+        let head_ref = crate::workspace_rules::task_head_ref(42, "head");
         let pinned = store
             .pin_worker_head(branch.as_str(), Some(&ws_dir), &[&head_ref])
             .expect("pin head")
@@ -4936,7 +4816,7 @@ mod tests {
         assert_eq!(pinned.as_str(), sha2);
         store.unmount(&ws).expect("unmount");
         assert!(!ws_dir.exists(), "workspace deleted on unmount");
-        let accepted_ref = super::task_head_ref(42, "accepted");
+        let accepted_ref = crate::workspace_rules::task_head_ref(42, "accepted");
         let accepted = store
             .pin_worker_head(branch.as_str(), None, &[&accepted_ref])
             .expect("pin accepted post-unmount")
@@ -4991,7 +4871,7 @@ mod tests {
         assert!(err.to_string().contains("refs/spawn/"), "{err}");
 
         // Unborn .git yields None cleanly.
-        let init = super::test_git_command()
+        let init = crate::git_process::test_git_command()
             .current_dir(&ws_dir)
             .args(["init", "-q"])
             .output()
@@ -5002,7 +4882,7 @@ mod tests {
                 .pin_worker_head(
                     branch.as_str(),
                     Some(&ws_dir),
-                    &[&super::task_head_ref(1, "head")]
+                    &[&crate::workspace_rules::task_head_ref(1, "head")]
                 )
                 .expect("unborn ok"),
             None

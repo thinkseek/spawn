@@ -1152,6 +1152,7 @@
         "crates/spawn-host/src/beneath.rs",
         "crates/spawn-host/src/beneath/tests.rs",
         "crates/spawn-host/src/git.rs",
+        "crates/spawn-host/src/git_process.rs",
         "crates/spawn-host/src/home.rs",
         "crates/spawn-host/src/lib.rs",
         "crates/spawn-host/src/process.rs",

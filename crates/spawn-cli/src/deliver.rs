@@ -2746,7 +2746,7 @@ pub(crate) fn collect_reports(
                             Ok(Some(sha)) => lines.push(format!(
                                 "deliver: task #{} preserved worker HEAD {sha} in {}",
                                 task.id,
-                                spawn_host::git::task_head_ref(task.id, "head")
+                                spawn_host::workspace_rules::task_head_ref(task.id, "head")
                             )),
                             Ok(None) => {}
                             Err(error) => lines.push(format!(

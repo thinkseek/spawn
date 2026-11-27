@@ -863,3 +863,282 @@ fn workspace_safe_crate_guard_covers_all_non_exempt_members() {
         "every non-exempt workspace crate must be covered by SAFE_WORKSPACE_CRATES"
     );
 }
+
+const GUARDED_HOST_D6_CAS_MODULES: [&str; 6] = [
+    "crates/spawn-host/src/d6_workspace.rs",
+    "crates/spawn-host/src/d6_layer0.rs",
+    "crates/spawn-host/src/d6_cutover.rs",
+    "crates/spawn-host/src/git_border.rs",
+    "crates/spawn-host/src/cas_merkle.rs",
+    "crates/spawn-host/src/merkle_merge.rs",
+];
+
+const BANNED_HOST_GIT_ITEMS: [&str; 3] = ["GitWorkspace", "SetAsidePlan", "CheckpointPaths"];
+const BANNED_CLI_GIT_ITEMS: [&str; 1] = ["GitWorkspace"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RustToken<'a> {
+    Ident(&'a str),
+    ColonColon,
+    LBrace,
+    RBrace,
+    Comma,
+    Other,
+}
+
+fn rust_tokens(src: &str) -> Vec<RustToken<'_>> {
+    let bytes = src.as_bytes();
+    let n = bytes.len();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if let Some(next) = skip_comment_or_literal(bytes, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i] == b'r'
+            && bytes.get(i + 1) == Some(&b'#')
+            && bytes
+                .get(i + 2)
+                .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_')
+        {
+            let start = i + 2;
+            let mut j = start + 1;
+            while j < n && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            tokens.push(RustToken::Ident(&src[start..j]));
+            i = j;
+            continue;
+        }
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let mut j = i + 1;
+            while j < n && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            tokens.push(RustToken::Ident(&src[i..j]));
+            i = j;
+            continue;
+        }
+        if bytes[i] == b':' && bytes.get(i + 1) == Some(&b':') {
+            tokens.push(RustToken::ColonColon);
+            i += 2;
+            continue;
+        }
+        let tok = match bytes[i] {
+            b'{' => RustToken::LBrace,
+            b'}' => RustToken::RBrace,
+            b',' => RustToken::Comma,
+            _ => RustToken::Other,
+        };
+        tokens.push(tok);
+        i += 1;
+    }
+    tokens
+}
+
+fn skip_brace_group(tokens: &[RustToken<'_>], lbrace: usize) -> usize {
+    let mut depth = 0usize;
+    let mut idx = lbrace;
+    while idx < tokens.len() {
+        match tokens[idx] {
+            RustToken::LBrace => depth += 1,
+            RustToken::RBrace => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return idx + 1;
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    tokens.len()
+}
+
+fn group_imports_ident(tokens: &[RustToken<'_>], lbrace: usize, target: &str) -> bool {
+    let mut idx = lbrace + 1;
+    let mut at_item_start = true;
+    while idx < tokens.len() {
+        match tokens[idx] {
+            RustToken::RBrace => return false,
+            RustToken::Comma => {
+                at_item_start = true;
+                idx += 1;
+            }
+            RustToken::Ident(name) => {
+                if at_item_start && name == target {
+                    return true;
+                }
+                at_item_start = false;
+                idx += 1;
+            }
+            RustToken::LBrace => {
+                if at_item_start && group_imports_ident(tokens, idx, target) {
+                    return true;
+                }
+                at_item_start = false;
+                idx = skip_brace_group(tokens, idx);
+            }
+            RustToken::ColonColon | RustToken::Other => {
+                at_item_start = false;
+                idx += 1;
+            }
+        }
+    }
+    false
+}
+
+fn references_module_under_roots(tokens: &[RustToken<'_>], roots: &[&str], module: &str) -> bool {
+    for (i, token) in tokens.iter().enumerate() {
+        let RustToken::Ident(root) = token else {
+            continue;
+        };
+        if !roots.contains(root) || tokens.get(i + 1) != Some(&RustToken::ColonColon) {
+            continue;
+        }
+        match tokens.get(i + 2) {
+            Some(RustToken::Ident(name)) if *name == module => return true,
+            Some(RustToken::LBrace) if group_imports_ident(tokens, i + 2, module) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn first_banned_ident(tokens: &[RustToken<'_>], banned: &[&'static str]) -> Option<&'static str> {
+    tokens.iter().find_map(|tok| match tok {
+        RustToken::Ident(ident) => banned.iter().copied().find(|name| name == ident),
+        _ => None,
+    })
+}
+
+fn host_d6_git_boundary_violation(src: &str) -> Option<&'static str> {
+    let tokens = rust_tokens(src);
+    first_banned_ident(&tokens, &BANNED_HOST_GIT_ITEMS).or_else(|| {
+        references_module_under_roots(&tokens, &["crate", "super"], "git")
+            .then_some("crate::git / super::git")
+    })
+}
+
+fn cli_prod_git_boundary_violation(src: &str) -> Option<&'static str> {
+    let prod = strip_cfg_test_blocks(src);
+    let tokens = rust_tokens(&prod);
+    first_banned_ident(&tokens, &BANNED_CLI_GIT_ITEMS).or_else(|| {
+        references_module_under_roots(&tokens, &["spawn_host"], "git").then_some("spawn_host::git")
+    })
+}
+
+#[test]
+fn git_module_boundary_ratchet_is_enforced() {
+    let root = repo_root();
+    for rel in GUARDED_HOST_D6_CAS_MODULES {
+        let path = root.join(rel);
+        let text = fs::read_to_string(&path).expect("read guarded spawn-host module");
+        assert_eq!(
+            host_d6_git_boundary_violation(&text),
+            None,
+            "{rel} must stay isolated from git.rs items and crate::git / super::git imports"
+        );
+    }
+
+    let cli_src = root.join("crates/spawn-cli/src");
+    let mut cli_files = Vec::new();
+    collect_rs_files(&cli_src, &mut cli_files);
+    cli_files.sort();
+    assert!(!cli_files.is_empty(), "expected crates/spawn-cli/src files");
+    for path in cli_files {
+        if is_test_only_src_file(&cli_src, &path) {
+            continue;
+        }
+        let text = fs::read_to_string(&path).expect("read spawn-cli src file");
+        let rel = rel_path_unix(&root, &path);
+        assert_eq!(
+            cli_prod_git_boundary_violation(&text),
+            None,
+            "{rel} non-test code must stay isolated from spawn_host::git and GitWorkspace"
+        );
+    }
+}
+
+#[test]
+fn git_module_boundary_ratchet_catches_bypasses_without_false_positives() {
+    let host_bypasses = [
+        ("use crate::GitWorkspace;", "GitWorkspace"),
+        ("use crate::SetAsidePlan;", "SetAsidePlan"),
+        ("use crate::CheckpointPaths;", "CheckpointPaths"),
+        ("use crate::git;", "crate::git / super::git"),
+        ("use crate::git::GitWorkspace;", "GitWorkspace"),
+        ("use crate::git::helper;", "crate::git / super::git"),
+        ("use crate::git as legacy_git;", "crate::git / super::git"),
+        ("use crate::{git};", "crate::git / super::git"),
+        ("use crate::{git_process, git};", "crate::git / super::git"),
+        ("use crate::{{git}};", "crate::git / super::git"),
+        ("use super::git::Foo;", "crate::git / super::git"),
+        ("use super::{foo, git};", "crate::git / super::git"),
+        ("use super::super::git;", "crate::git / super::git"),
+        ("use crate::r#git;", "crate::git / super::git"),
+    ];
+    for (sample, expected) in host_bypasses {
+        assert_eq!(
+            host_d6_git_boundary_violation(sample),
+            Some(expected),
+            "expected guarded spawn-host check to reject: {sample}"
+        );
+    }
+
+    let host_allowed = [
+        "use crate::git_process::git_command;",
+        "use crate::git_border::{BorderRefTarget, GitBorderAdapter};",
+        "use crate::{git_process::git_command, git_border::ImportReport};",
+        "use crate::{git_process as git};",
+        "// use crate::git;\nlet cmd = git_command(\"git\");",
+    ];
+    for sample in host_allowed {
+        assert_eq!(
+            host_d6_git_boundary_violation(sample),
+            None,
+            "unexpected false positive in guarded spawn-host check for: {sample}"
+        );
+    }
+
+    let cli_bypasses = [
+        ("use spawn_host::git;", "spawn_host::git"),
+        ("use spawn_host::git::Foo;", "spawn_host::git"),
+        ("use spawn_host::git as host_git;", "spawn_host::git"),
+        ("use spawn_host::{git, git_command};", "spawn_host::git"),
+        (
+            "use spawn_host::{git_command, git::Foo};",
+            "spawn_host::git",
+        ),
+        ("use spawn_host::GitWorkspace;", "GitWorkspace"),
+        ("fn f(w: GitWorkspace) { let _ = w; }", "GitWorkspace"),
+    ];
+    for (sample, expected) in cli_bypasses {
+        assert_eq!(
+            cli_prod_git_boundary_violation(sample),
+            Some(expected),
+            "expected spawn-cli non-test check to reject: {sample}"
+        );
+    }
+
+    let cli_allowed = [
+        "use spawn_host::git_command;",
+        "use spawn_host::{git_command, test_git_command};",
+        "use spawn_host::git_border::GitBorderAdapter;",
+        "let store = spawn_host::LocalWorkspaceStore::git(repo, root);",
+        "use crate::sources::git;",
+        "#[cfg(test)]\nmod tests { use spawn_host::GitWorkspace; use spawn_host::git; }",
+    ];
+    for sample in cli_allowed {
+        assert_eq!(
+            cli_prod_git_boundary_violation(sample),
+            None,
+            "unexpected false positive in spawn-cli non-test check for: {sample}"
+        );
+    }
+}

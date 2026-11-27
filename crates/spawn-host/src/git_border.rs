@@ -24,7 +24,7 @@ use spawn_cas::{
 use crate::cas_merkle::{
     CasMerkleStore, D6RefKind, D6StoreError, LedgerRef, RefLedger, is_pointer_sized,
 };
-use crate::git::git_command;
+use crate::git_process::git_command;
 use crate::tree_path::nul_fields;
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
