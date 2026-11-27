@@ -437,6 +437,66 @@ done
 assert_eq "$(scalar 'select count(*) from spawn_commands')" 0 "doctor writes no command"
 assert_eq "$(scalar 'select count(*) from spawn_events')" 0 "doctor writes no event"
 
+echo "j05: [bb010 cli contract] spawn doctor --json reports shared_build_caches (disabled, enabled read-only, invalid redacted)"
+capture env -u SPAWN_CONFIG -u SPAWN_MODEL_RELAY -u SPAWN_JUDGE_URL -u SPAWN_MODEL_PREFLIGHT \
+    -u SPAWN_DEFAULT_MODEL -u SPAWN_CHEAP_MODEL -u SPAWN_SMALL_MODEL -u SPAWN_JUDGE_MODEL \
+    -u SPAWN_SHARED_BUILD_CACHES -u SPAWN_SHARED_BUILD_CACHE_DIR \
+    "$SPAWN_BIN" doctor --root "$WORK" --json
+assert_eq "$status" 0 "doctor --json shared_build_caches disabled exit"
+out | jq -e '
+    (.shared_build_caches | type == "object") and
+    (.shared_build_caches.enabled == false) and
+    (.shared_build_caches.status == "disabled") and
+    (.shared_build_caches.path == null) and
+    (.shared_build_caches.exists == false) and
+    (.shared_build_caches.writable == false) and
+    (.shared_build_caches.error == null) and
+    (.shared_build_caches.managed_env_vars | type == "array" and length == 8) and
+    (.shared_build_caches.managed_env_vars | index("ZIG_GLOBAL_CACHE_DIR") != null) and
+    (.shared_build_caches.managed_env_vars | index("GOCACHE") != null)
+' >/dev/null || fail "doctor --json shared_build_caches disabled payload invalid: [$(out)]"
+
+[ ! -e "$WORK/.caches" ] || fail "$WORK/.caches already existed before read-only doctor check"
+capture env -u SPAWN_CONFIG -u SPAWN_MODEL_RELAY -u SPAWN_JUDGE_URL -u SPAWN_MODEL_PREFLIGHT \
+    -u SPAWN_DEFAULT_MODEL -u SPAWN_CHEAP_MODEL -u SPAWN_SMALL_MODEL -u SPAWN_JUDGE_MODEL \
+    -u SPAWN_SHARED_BUILD_CACHE_DIR \
+    SPAWN_SHARED_BUILD_CACHES=1 \
+    "$SPAWN_BIN" doctor --root "$WORK" --json
+assert_eq "$status" 0 "doctor --json shared_build_caches enabled exit"
+out | jq -e --arg want "$WORK/.caches" '
+    (.shared_build_caches.enabled == true) and
+    (.shared_build_caches.status == "ok") and
+    (.shared_build_caches.path == $want) and
+    (.shared_build_caches.exists == false) and
+    (.shared_build_caches.writable == true) and
+    (.shared_build_caches.error == null) and
+    (.shared_build_caches.managed_env_vars | length == 8)
+' >/dev/null || fail "doctor --json shared_build_caches enabled payload invalid: [$(out)]"
+[ ! -e "$WORK/.caches" ] || fail "spawn doctor must stay read-only and never create $WORK/.caches"
+
+capture env -u SPAWN_CONFIG -u SPAWN_MODEL_RELAY -u SPAWN_JUDGE_URL -u SPAWN_MODEL_PREFLIGHT \
+    -u SPAWN_DEFAULT_MODEL -u SPAWN_CHEAP_MODEL -u SPAWN_SMALL_MODEL -u SPAWN_JUDGE_MODEL \
+    -u SPAWN_SHARED_BUILD_CACHES \
+    SPAWN_SHARED_BUILD_CACHE_DIR="http://user:CacheSecret99@127.0.0.1/cache?token=CacheTok00" \
+    "$SPAWN_BIN" doctor --root "$WORK" --json
+assert_eq "$status" 0 "doctor --json shared_build_caches invalid exit"
+out | jq -e '
+    (.shared_build_caches.enabled == false) and
+    (.shared_build_caches.status == "invalid") and
+    (.shared_build_caches.path == null) and
+    (.shared_build_caches.exists == false) and
+    (.shared_build_caches.writable == false) and
+    (.shared_build_caches.error | type == "string") and
+    (.warnings | map(select(contains("shared build caches configuration invalid"))) | length >= 1)
+' >/dev/null || fail "doctor --json shared_build_caches invalid payload invalid: [$(out)]"
+for leaked in CacheSecret99 CacheTok00; do
+    if printf '%s\n%s\n' "$(out)" "$(err)" | grep -qF "$leaked"; then
+        fail "doctor --json leaked synthetic shared-cache credential marker $leaked"
+    fi
+done
+assert_eq "$(scalar 'select count(*) from spawn_commands')" 0 "doctor shared_build_caches writes no command"
+assert_eq "$(scalar 'select count(*) from spawn_events')" 0 "doctor shared_build_caches writes no event"
+
 # --- blackbox 060: spawn run -------------------------------------------------------
 part=bb060
 echo "j05: [bb060 the program is required]"
