@@ -31,7 +31,8 @@ use crate::sources::PostgresRefLedger;
 pub(crate) const USAGE: &str = "usage: spawn storage cutover --status|--to d6|--rollback git|--verify [--project <name>] [--repo <bare repo>] [--root <dir>] [--cas-dir <dir>] [--reason <text>] [--json]";
 
 const CUTOVER_STATE_FILE: &str = ".cutover-state.json";
-const CUTOVER_STATE_SCHEMA_VERSION: u32 = 1;
+const CUTOVER_STATE_SCHEMA_VERSION: u32 = 2;
+const LEGACY_CUTOVER_STATE_SCHEMA_VERSION: u32 = 1;
 const SWITCHES: &[&str] = &["status", "verify", "json"];
 const ALLOWED_FLAGS: &[&str] = &[
     "status", "to", "rollback", "verify", "project", "repo", "root", "cas-dir", "reason", "json",
@@ -58,89 +59,53 @@ struct ParsedArgs {
     json: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PersistedPhase {
-    NotStarted,
-    BackfillImported,
-    DispatchPausedAndDrained,
-    TailImported,
-    RefsCommitted,
-    ParityVerified,
-    BorderReadOnly,
-    Resumed,
-    RolledBack,
-}
-
-impl From<CutoverPhase> for PersistedPhase {
-    fn from(value: CutoverPhase) -> Self {
-        match value {
-            CutoverPhase::NotStarted => Self::NotStarted,
-            CutoverPhase::BackfillImported => Self::BackfillImported,
-            CutoverPhase::DispatchPausedAndDrained => Self::DispatchPausedAndDrained,
-            CutoverPhase::TailImported => Self::TailImported,
-            CutoverPhase::RefsCommitted => Self::RefsCommitted,
-            CutoverPhase::ParityVerified => Self::ParityVerified,
-            CutoverPhase::BorderReadOnly => Self::BorderReadOnly,
-            CutoverPhase::Resumed => Self::Resumed,
-            CutoverPhase::RolledBack => Self::RolledBack,
-        }
-    }
-}
-
-impl From<PersistedPhase> for CutoverPhase {
-    fn from(value: PersistedPhase) -> Self {
-        match value {
-            PersistedPhase::NotStarted => Self::NotStarted,
-            PersistedPhase::BackfillImported => Self::BackfillImported,
-            PersistedPhase::DispatchPausedAndDrained => Self::DispatchPausedAndDrained,
-            PersistedPhase::TailImported => Self::TailImported,
-            PersistedPhase::RefsCommitted => Self::RefsCommitted,
-            PersistedPhase::ParityVerified => Self::ParityVerified,
-            PersistedPhase::BorderReadOnly => Self::BorderReadOnly,
-            PersistedPhase::Resumed => Self::Resumed,
-            PersistedPhase::RolledBack => Self::RolledBack,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PersistedStorageMode {
-    Git,
-    D6Cas,
-}
-
-impl From<ProjectStorageMode> for PersistedStorageMode {
-    fn from(value: ProjectStorageMode) -> Self {
-        match value {
-            ProjectStorageMode::Git => Self::Git,
-            ProjectStorageMode::D6Cas => Self::D6Cas,
-        }
-    }
-}
-
-impl From<PersistedStorageMode> for ProjectStorageMode {
-    fn from(value: PersistedStorageMode) -> Self {
-        match value {
-            PersistedStorageMode::Git => Self::Git,
-            PersistedStorageMode::D6Cas => Self::D6Cas,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProjectCutoverRecord {
     project: String,
     bare_repo: String,
-    phase: PersistedPhase,
-    storage_mode: PersistedStorageMode,
+    phase: CutoverPhase,
+    reason: Option<String>,
+    updated_at_ms: i64,
+}
+
+impl ProjectCutoverRecord {
+    const fn storage_mode(&self) -> ProjectStorageMode {
+        self.phase.storage_mode()
+    }
+
+    const fn dispatch_paused(&self) -> bool {
+        self.phase.dispatch_paused()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ProjectCutoverRecordView {
+    project: String,
+    bare_repo: String,
+    phase: CutoverPhase,
+    storage_mode: ProjectStorageMode,
     dispatch_paused: bool,
     reason: Option<String>,
     updated_at_ms: i64,
 }
 
+impl From<&ProjectCutoverRecord> for ProjectCutoverRecordView {
+    fn from(rec: &ProjectCutoverRecord) -> Self {
+        Self {
+            project: rec.project.clone(),
+            bare_repo: rec.bare_repo.clone(),
+            phase: rec.phase,
+            storage_mode: rec.storage_mode(),
+            dispatch_paused: rec.dispatch_paused(),
+            reason: rec.reason.clone(),
+            updated_at_ms: rec.updated_at_ms,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CutoverStateFile {
     schema_version: u32,
     projects: BTreeMap<String, ProjectCutoverRecord>,
@@ -153,6 +118,25 @@ impl Default for CutoverStateFile {
             projects: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyProjectCutoverRecord {
+    project: String,
+    bare_repo: String,
+    phase: CutoverPhase,
+    storage_mode: ProjectStorageMode,
+    dispatch_paused: bool,
+    reason: Option<String>,
+    updated_at_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCutoverStateFile {
+    schema_version: u32,
+    projects: BTreeMap<String, LegacyProjectCutoverRecord>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -205,7 +189,7 @@ struct StatusReport {
     bare_repo: Option<String>,
     readonly_border: Option<bool>,
     pg_ref_count: Option<usize>,
-    cutover_state: Option<ProjectCutoverRecord>,
+    cutover_state: Option<ProjectCutoverRecordView>,
     recorded_projects: Vec<String>,
 }
 
@@ -234,7 +218,7 @@ struct VerifyReport {
     gc_fence: GcFenceView,
     ref_count: Option<usize>,
     parity_error: Option<String>,
-    cutover_state: Option<ProjectCutoverRecord>,
+    cutover_state: Option<ProjectCutoverRecordView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -247,8 +231,8 @@ struct CutoverResultReport {
     workspace_root: String,
     workspace_backend: String,
     cas_dir: String,
-    phase: PersistedPhase,
-    storage_mode: PersistedStorageMode,
+    phase: CutoverPhase,
+    storage_mode: ProjectStorageMode,
     dispatch_paused: bool,
     readonly_border: bool,
     refs_verified: usize,
@@ -268,8 +252,8 @@ struct RollbackResultReport {
     workspace_root: String,
     workspace_backend: String,
     cas_dir: String,
-    phase: PersistedPhase,
-    storage_mode: PersistedStorageMode,
+    phase: CutoverPhase,
+    storage_mode: ProjectStorageMode,
     dispatch_paused: bool,
     readonly_border: bool,
     exported_refs: usize,
@@ -524,6 +508,62 @@ fn open_file_no_symlink(path: &Path, label: &str) -> Result<Option<File>, String
     Ok(Some(file))
 }
 
+fn upgrade_legacy_record(
+    rec: LegacyProjectCutoverRecord,
+    state_path: &Path,
+) -> Result<ProjectCutoverRecord, String> {
+    let phase = match (rec.phase, rec.storage_mode, rec.dispatch_paused) {
+        (CutoverPhase::BackfillImported, ProjectStorageMode::Git, true) => {
+            CutoverPhase::DispatchPaused
+        }
+        (phase, mode, paused)
+            if mode == phase.storage_mode() && paused == phase.dispatch_paused() =>
+        {
+            phase
+        }
+        (phase, mode, paused) => {
+            return Err(format!(
+                "contradictory legacy v1 cutover state for project {:?} in {}: phase {:?} implies storage_mode={:?}, dispatch_paused={}, found storage_mode={:?}, dispatch_paused={}",
+                rec.project,
+                state_path.display(),
+                phase,
+                phase.storage_mode(),
+                phase.dispatch_paused(),
+                mode,
+                paused,
+            ));
+        }
+    };
+    Ok(ProjectCutoverRecord {
+        project: rec.project,
+        bare_repo: rec.bare_repo,
+        phase,
+        reason: rec.reason,
+        updated_at_ms: rec.updated_at_ms,
+    })
+}
+
+fn upgrade_legacy_cutover_state(
+    legacy: LegacyCutoverStateFile,
+    state_path: &Path,
+) -> Result<CutoverStateFile, String> {
+    if legacy.schema_version != LEGACY_CUTOVER_STATE_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported legacy cutover state schema_version {} in {}",
+            legacy.schema_version,
+            state_path.display()
+        ));
+    }
+    let mut projects = BTreeMap::new();
+    for (key, rec) in legacy.projects {
+        projects.insert(key, upgrade_legacy_record(rec, state_path)?);
+    }
+    Ok(CutoverStateFile {
+        schema_version: CUTOVER_STATE_SCHEMA_VERSION,
+        projects,
+    })
+}
+
 fn read_cutover_state(cas_dir: &Path) -> Result<Option<CutoverStateFile>, String> {
     match fs::symlink_metadata(cas_dir) {
         Ok(meta) => {
@@ -545,16 +585,33 @@ fn read_cutover_state(cas_dir: &Path) -> Result<Option<CutoverStateFile>, String
     let Some(file) = open_file_no_symlink(&state_path, "cutover state")? else {
         return Ok(None);
     };
-    let parsed: CutoverStateFile = serde_json::from_reader(file)
+    let raw: serde_json::Value = serde_json::from_reader(file)
         .map_err(|e| format!("parse {}: {e}", state_path.display()))?;
-    if parsed.schema_version != CUTOVER_STATE_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported cutover state schema_version {} in {}",
-            parsed.schema_version,
+    let version = raw
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "parse {}: missing numeric schema_version",
+                state_path.display()
+            )
+        })?;
+    match u32::try_from(version) {
+        Ok(CUTOVER_STATE_SCHEMA_VERSION) => {
+            let parsed: CutoverStateFile = serde_json::from_value(raw)
+                .map_err(|e| format!("parse {}: {e}", state_path.display()))?;
+            Ok(Some(parsed))
+        }
+        Ok(LEGACY_CUTOVER_STATE_SCHEMA_VERSION) => {
+            let legacy: LegacyCutoverStateFile = serde_json::from_value(raw)
+                .map_err(|e| format!("parse legacy v1 {}: {e}", state_path.display()))?;
+            upgrade_legacy_cutover_state(legacy, &state_path).map(Some)
+        }
+        _ => Err(format!(
+            "unsupported cutover state schema_version {version} in {}",
             state_path.display()
-        ));
+        )),
     }
-    Ok(Some(parsed))
 }
 
 fn write_cutover_state(cas_dir: &Path, state: &CutoverStateFile) -> Result<(), String> {
@@ -602,9 +659,7 @@ fn save_cutover_record(
     let record = ProjectCutoverRecord {
         project: cutover.project().to_string(),
         bare_repo: bare_repo.to_string_lossy().into_owned(),
-        phase: cutover.phase().into(),
-        storage_mode: cutover.storage_mode().into(),
-        dispatch_paused: cutover.dispatch_paused(),
+        phase: cutover.phase(),
         reason: reason.map(ToString::to_string),
         updated_at_ms: now_ms(),
     };
@@ -878,7 +933,7 @@ fn run_status(args: &ParsedArgs) -> Result<i32, String> {
         bare_repo: bare_repo.map(|r| r.to_string_lossy().into_owned()),
         readonly_border,
         pg_ref_count,
-        cutover_state,
+        cutover_state: cutover_state.as_ref().map(ProjectCutoverRecordView::from),
         recorded_projects,
     };
 
@@ -905,17 +960,10 @@ fn initialize_or_resume_cutover(
     existing_record: Option<ProjectCutoverRecord>,
 ) -> Result<(ProjectCutover, CutoverStepCounts), String> {
     if let Some(rec) = existing_record
-        && rec.storage_mode == PersistedStorageMode::D6Cas
+        && rec.storage_mode() == ProjectStorageMode::D6Cas
     {
         return Ok((
-            ProjectCutover::from_state(
-                ctx.project,
-                ctx.bare_repo,
-                &ctx.args.root,
-                rec.phase.into(),
-                rec.storage_mode.into(),
-                rec.dispatch_paused,
-            ),
+            ProjectCutover::from_state(ctx.project, ctx.bare_repo, &ctx.args.root, rec.phase),
             CutoverStepCounts {
                 backfill_commits_scanned: 0,
                 tail_commits_scanned: 0,
@@ -961,8 +1009,8 @@ fn run_cutover_to_d6(args: &ParsedArgs) -> Result<i32, String> {
     ensure_existing_dir_not_symlink(&bare_repo, "bare repo")?;
 
     if let Some(rec) = &existing_record
-        && rec.phase == PersistedPhase::Resumed
-        && rec.storage_mode == PersistedStorageMode::D6Cas
+        && rec.phase == CutoverPhase::Resumed
+        && rec.storage_mode() == ProjectStorageMode::D6Cas
     {
         return Err(format!(
             "project {project:?} is already cut over to d6_cas (phase: resumed); run --verify to audit or --rollback git to revert"
@@ -1019,8 +1067,8 @@ fn run_cutover_to_d6(args: &ParsedArgs) -> Result<i32, String> {
         workspace_root: args.root.to_string_lossy().into_owned(),
         workspace_backend: WorkspaceBackend::D6.name().to_string(),
         cas_dir: args.cas_dir.to_string_lossy().into_owned(),
-        phase: cutover.phase().into(),
-        storage_mode: cutover.storage_mode().into(),
+        phase: cutover.phase(),
+        storage_mode: cutover.storage_mode(),
         dispatch_paused: cutover.dispatch_paused(),
         readonly_border,
         refs_verified,
@@ -1166,7 +1214,7 @@ fn run_verify(args: &ParsedArgs) -> Result<i32, String> {
         gc_fence: gc_fence_view,
         ref_count,
         parity_error,
-        cutover_state,
+        cutover_state: cutover_state.as_ref().map(ProjectCutoverRecordView::from),
     };
 
     if args.json {
@@ -1207,7 +1255,7 @@ fn update_backend_marker_after_rollback(
         .projects
         .values()
         .filter(|rec| {
-            rec.project != rolled_back_project && rec.storage_mode == PersistedStorageMode::D6Cas
+            rec.project != rolled_back_project && rec.storage_mode() == ProjectStorageMode::D6Cas
         })
         .map(|rec| rec.project.clone())
         .collect();
@@ -1241,7 +1289,7 @@ fn run_rollback_to_git(args: &ParsedArgs) -> Result<i32, String> {
             args.cas_dir.join(CUTOVER_STATE_FILE).display()
         )
     })?;
-    if record.storage_mode != PersistedStorageMode::D6Cas {
+    if record.storage_mode() != ProjectStorageMode::D6Cas {
         return Err(format!(
             "project {project:?} is not in d6_cas mode (phase: {:?}); cannot roll back to git",
             record.phase
@@ -1252,14 +1300,7 @@ fn run_rollback_to_git(args: &ParsedArgs) -> Result<i32, String> {
     let ledger = PostgresRefLedger::new(Arc::clone(&pg));
     let store = require_bound_checked_cas(&args.cas_dir, &pg)?;
 
-    let mut cutover = ProjectCutover::from_state(
-        &project,
-        &bare_repo,
-        &args.root,
-        record.phase.into(),
-        record.storage_mode.into(),
-        record.dispatch_paused,
-    );
+    let mut cutover = ProjectCutover::from_state(&project, &bare_repo, &args.root, record.phase);
     let border = GitBorderAdapter::new();
     let rb = cutover
         .rollback_to_git(&store, &ledger, &border)
@@ -1281,8 +1322,8 @@ fn run_rollback_to_git(args: &ParsedArgs) -> Result<i32, String> {
         workspace_root: args.root.to_string_lossy().into_owned(),
         workspace_backend: active_backend.name().to_string(),
         cas_dir: args.cas_dir.to_string_lossy().into_owned(),
-        phase: cutover.phase().into(),
-        storage_mode: cutover.storage_mode().into(),
+        phase: cutover.phase(),
+        storage_mode: cutover.storage_mode(),
         dispatch_paused: cutover.dispatch_paused(),
         readonly_border,
         exported_refs: rb.exported_refs,
@@ -1482,21 +1523,25 @@ mod tests {
         fs::create_dir_all(&cas).expect("mkdir cas");
 
         let bare = scratch.0.join("proj.git");
-        let cutover = ProjectCutover::from_state(
-            "proj",
-            &bare,
-            &root,
-            CutoverPhase::Resumed,
-            ProjectStorageMode::D6Cas,
-            false,
-        );
+        let cutover = ProjectCutover::from_state("proj", &bare, &root, CutoverPhase::Resumed);
         save_cutover_record(&cas, &cutover, &bare, Some("test cutover")).expect("save state");
+        let persisted: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(cas.join(CUTOVER_STATE_FILE)).expect("read state raw"),
+        )
+        .expect("parse state raw");
+        assert_eq!(persisted["schema_version"], CUTOVER_STATE_SCHEMA_VERSION);
+        let raw_rec = &persisted["projects"]["proj"];
+        assert_eq!(raw_rec["phase"], "resumed");
+        assert!(raw_rec.get("storage_mode").is_none());
+        assert!(raw_rec.get("dispatch_paused").is_none());
+
         let loaded = read_cutover_state(&cas)
             .expect("read state")
             .expect("state exists");
         let rec = loaded.projects.get("proj").expect("proj record");
-        assert_eq!(rec.phase, PersistedPhase::Resumed);
-        assert_eq!(rec.storage_mode, PersistedStorageMode::D6Cas);
+        assert_eq!(rec.phase, CutoverPhase::Resumed);
+        assert_eq!(rec.storage_mode(), ProjectStorageMode::D6Cas);
+        assert!(!rec.dispatch_paused());
         assert_eq!(rec.reason.as_deref(), Some("test cutover"));
 
         write_workspace_backend_marker(&root, WorkspaceBackend::D6).expect("write d6 marker");
@@ -1519,6 +1564,60 @@ mod tests {
             symlink(&decoy, &state_path).expect("symlink state");
             let err = read_cutover_state(&cas).expect_err("refuse symlink state");
             assert!(err.contains("symlink"));
+        }
+    }
+
+    #[test]
+    fn legacy_v1_cutover_state_upgrades_and_rejects_contradictions() {
+        let scratch = ScratchDir::new("v1-upgrade");
+        let cas = scratch.0.join(".d6/cas");
+        fs::create_dir_all(&cas).expect("mkdir cas");
+        let state_path = cas.join(CUTOVER_STATE_FILE);
+
+        let write_v1 = |phase: &str, mode: &str, paused: bool| {
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "projects": {
+                    "proj": {
+                        "project": "proj",
+                        "bare_repo": "/tmp/proj.git",
+                        "phase": phase,
+                        "storage_mode": mode,
+                        "dispatch_paused": paused,
+                        "reason": "v1",
+                        "updated_at_ms": 42
+                    }
+                }
+            });
+            fs::write(&state_path, serde_json::to_vec_pretty(&payload).unwrap()).unwrap();
+        };
+
+        write_v1("resumed", "d6_cas", false);
+        let resumed = read_cutover_state(&cas).expect("read v1 resumed").unwrap();
+        assert_eq!(resumed.schema_version, CUTOVER_STATE_SCHEMA_VERSION);
+        assert_eq!(resumed.projects["proj"].phase, CutoverPhase::Resumed);
+
+        write_v1("backfill_imported", "git", true);
+        let paused = read_cutover_state(&cas).expect("read v1 paused").unwrap();
+        assert_eq!(paused.projects["proj"].phase, CutoverPhase::DispatchPaused);
+        assert_eq!(
+            paused.projects["proj"].storage_mode(),
+            ProjectStorageMode::Git
+        );
+        assert!(paused.projects["proj"].dispatch_paused());
+
+        for (phase, mode, paused) in [
+            ("resumed", "git", true),
+            ("resumed", "git", false),
+            ("resumed", "d6_cas", true),
+            ("not_started", "d6_cas", false),
+        ] {
+            write_v1(phase, mode, paused);
+            let err = read_cutover_state(&cas).expect_err("reject contradictory v1 state");
+            assert!(
+                err.contains("contradictory legacy v1 cutover state"),
+                "{err}"
+            );
         }
     }
 

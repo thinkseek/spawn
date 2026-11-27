@@ -495,6 +495,26 @@ fn assert_cutover_and_locked_border(url: &str, ws: &Path, work: &Path, ws_s: &st
     );
     assert!(ws.join(".d6/cas/.gc-fence").is_file());
     assert!(ws.join(".d6/cas/.cutover-state.json").is_file());
+    let persisted: Value = serde_json::from_str(
+        &fs::read_to_string(ws.join(".d6/cas/.cutover-state.json")).expect("read state json"),
+    )
+    .expect("parse state json");
+    assert_eq!(persisted["schema_version"], 2);
+    let first_rec = persisted["projects"]
+        .as_object()
+        .expect("projects object")
+        .values()
+        .next()
+        .expect("persisted project record");
+    assert_eq!(first_rec["phase"], "resumed");
+    assert!(
+        first_rec.get("storage_mode").is_none(),
+        "v2 state file must not persist redundant storage_mode: {first_rec}"
+    );
+    assert!(
+        first_rec.get("dispatch_paused").is_none(),
+        "v2 state file must not persist redundant dispatch_paused: {first_rec}"
+    );
 
     let ver = run_cli_json(
         &[
@@ -686,4 +706,110 @@ fn pg_storage_cutover_gc_fence_mismatch_fails_closed() {
         0,
     );
     assert_eq!(ok_a["ok"], true);
+}
+
+#[test]
+fn pg_storage_cutover_v1_state_migration_and_contradiction_rejection() {
+    let schema = TestSchema::new("storage_cutover_v1_mig");
+    let _pg = schema.store();
+    let db_url = schema_url(&schema);
+
+    let scratch = Scratch::new("cutover-v1-mig");
+    let (ws, _work, bare) = init_project_repo(&scratch);
+    let cas_dir = ws.join(".d6/cas");
+    fs::create_dir_all(&cas_dir).expect("mkdir cas");
+    fs::write(cas_dir.join(CAS_MARKER), "1\n").expect("write cas marker");
+
+    let canonical_bare = fs::canonicalize(&bare).expect("canonical bare");
+    let bare_s = canonical_bare.to_string_lossy().into_owned();
+    let ws_s = ws.to_string_lossy().into_owned();
+    let state_path = cas_dir.join(".cutover-state.json");
+
+    let write_v1 = |phase: &str, mode: &str, paused: bool| {
+        let mut projects = serde_json::Map::new();
+        projects.insert(
+            bare_s.clone(),
+            json!({
+                "project": bare_s,
+                "bare_repo": bare_s,
+                "phase": phase,
+                "storage_mode": mode,
+                "dispatch_paused": paused,
+                "reason": "legacy v1",
+                "updated_at_ms": 1_700_000_000_000_i64,
+            }),
+        );
+        let payload = json!({
+            "schema_version": 1,
+            "projects": projects,
+        });
+        fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&payload).expect("serialize v1 state"),
+        )
+        .expect("write v1 state");
+    };
+
+    // Valid legacy v1: resumed on d6_cas with dispatch active.
+    write_v1("resumed", "d6_cas", false);
+    let st_resumed = run_cli_json(
+        &[
+            "storage", "cutover", "--status", "--repo", &bare_s, "--root", &ws_s, "--json",
+        ],
+        &db_url,
+        0,
+    );
+    assert_eq!(st_resumed["cutover_state"]["phase"], "resumed");
+    assert_eq!(st_resumed["cutover_state"]["storage_mode"], "d6_cas");
+    assert_eq!(st_resumed["cutover_state"]["dispatch_paused"], false);
+
+    // Valid legacy v1: Step 2a paused while phase remained backfill_imported upgrades to dispatch_paused.
+    write_v1("backfill_imported", "git", true);
+    let st_paused = run_cli_json(
+        &[
+            "storage", "cutover", "--status", "--repo", &bare_s, "--root", &ws_s, "--json",
+        ],
+        &db_url,
+        0,
+    );
+    assert_eq!(st_paused["cutover_state"]["phase"], "dispatch_paused");
+    assert_eq!(st_paused["cutover_state"]["storage_mode"], "git");
+    assert_eq!(st_paused["cutover_state"]["dispatch_paused"], true);
+
+    // Contradictory legacy v1 combinations must fail closed instead of silently trusting redundant fields.
+    for (phase, mode, paused, label) in [
+        ("resumed", "git", true, "(Resumed, Git, paused)"),
+        ("resumed", "git", false, "(Resumed, Git, active)"),
+        ("resumed", "d6_cas", true, "(Resumed, D6Cas, paused)"),
+        (
+            "not_started",
+            "d6_cas",
+            false,
+            "(NotStarted, D6Cas, active)",
+        ),
+        ("rolled_back", "git", true, "(RolledBack, Git, paused)"),
+        (
+            "dispatch_paused_and_drained",
+            "git",
+            false,
+            "(DispatchPausedAndDrained, Git, active)",
+        ),
+    ] {
+        write_v1(phase, mode, paused);
+        let out = run_cli(
+            &[
+                "storage", "cutover", "--status", "--repo", &bare_s, "--root", &ws_s, "--json",
+            ],
+            Some(&db_url),
+        );
+        assert!(
+            !out.status.success(),
+            "contradictory v1 state {label} unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("contradictory legacy v1 cutover state"),
+            "missing contradiction error for {label}: {stderr}"
+        );
+    }
 }
