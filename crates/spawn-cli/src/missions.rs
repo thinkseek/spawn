@@ -16,13 +16,14 @@ use spawn_core::grading::{
     DifficultyClassification, GradedPreset, RoutingDecision, RoutingError, TaskDifficulty,
     classify_difficulty, route_preset, route_with_reprobe,
 };
+use spawn_core::mission::WorkspaceKind;
 
 use crate::{Flags, open_store};
 
 /// The usage of `spawn mission`, `spawn task` and `spawn resident`, the only
 /// copy: main's help shows each command its own lines of it.
 pub(crate) const USAGE: &str = "usage:
-  spawn mission add --text <mission> [--source <git repo path or URL>] [<settings>]
+  spawn mission add --text <mission> [--kind code|media|factory|general] [--source <git repo path or URL>] [<settings>]
   spawn mission configure --id N [<settings>] [<clearing switches>]   (owner only)
       changes only the settings it is given and keeps every other as the mission has it;
       the database merges them under its lock, checks the result and records it whole.
@@ -115,10 +116,11 @@ pub(crate) const USAGE: &str = "usage:
   spawn mission release --source <path>   (owner: the waiting tasks land at the next pass; with
       no hold it records nothing and prints `released` null)
   spawn mission list [--limit N] [--json | --table]   (every task with its stages and grading: JSON by default, --table for a readable summary)
-  spawn mission show --id N [--root <workspace root>]
-      (one mission by id, including one outside list's window: its resolved source and mirror,
-      actual landing repository, gate and backlog paths, per-open-task delivery/report/gate
-      diagnostics, and shell-quoted read-only checks. Prints JSON and creates nothing)
+  spawn mission show --id N [--root <workspace root>] [--json]
+      (one mission by id, including one outside list's window: its workspace kind/profile
+      and gate hint, resolved source and mirror, actual landing repository, gate and backlog
+      paths, per-open-task delivery/report/gate diagnostics, and shell-quoted read-only checks.
+      Prints JSON and creates nothing)
       (also: spawn mission episodes [--mission N] [--strict] [--verify-parity] [--json]:
        replay session_control into typed TaskEpisodes and optionally verify 100% parity
        against mission_tasks SQL projections; --verify-parity exits 0 on match, 1 on drift)
@@ -518,11 +520,18 @@ fn mission_view(
         .collect();
     let quoted_mirror = shell_quote(&mirror.to_string_lossy());
     let quoted_runner = shell_quote(&runner.to_string_lossy());
+    let (workspace_kind, _) =
+        WorkspaceKind::parse_mission_text(mission["text"].as_str().unwrap_or_default());
+    let profile = workspace_kind.profile();
     let mut checks = vec![
         format!("git --git-dir {quoted_mirror} rev-parse --verify refs/heads/main"),
         format!("git --git-dir {quoted_mirror} log -1 --oneline refs/heads/main"),
-        format!("test -f {quoted_runner} && test -r {quoted_runner}"),
     ];
+    if profile.expects_code_gate || scenarios.is_some() {
+        checks.push(format!(
+            "test -f {quoted_runner} && test -r {quoted_runner}"
+        ));
+    }
     if let Some(source) = resolved {
         checks.push(format!(
             "git ls-remote --symref -- {} HEAD refs/heads/main",
@@ -554,6 +563,8 @@ fn mission_view(
     Ok(json!({
         "mission": mission["id"],
         "state": mission["state"],
+        "workspace_kind": workspace_kind.as_str(),
+        "workspace_profile": profile,
         "source": {"configured": configured, "resolved": resolved},
         "workspace_root": root,
         "mirror": {"path": mirror, "exists": mirror.exists()},
@@ -563,6 +574,8 @@ fn mission_view(
             "scenarios_dir": scenarios,
             "exists": scenarios.is_some_and(|path| std::path::Path::new(path).is_dir()),
             "runner": runner,
+            "expects_code_gate": profile.expects_code_gate,
+            "hint": profile.gate_hint,
         },
         "backlog": {
             "directory": backlog,
@@ -1223,6 +1236,8 @@ fn split_mission(rest: &[String]) -> Result<(&str, Flags), String> {
         &["json", "table"]
     } else if verb == "episodes" {
         &["strict", "verify-parity", "json"]
+    } else if verb == "show" {
+        &["json"]
     } else {
         &[]
     };
@@ -1882,6 +1897,16 @@ fn episodes_cmd(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<
     Ok(0)
 }
 
+fn parse_workspace_kind(flags: &Flags) -> Result<WorkspaceKind, String> {
+    match flags.get("kind") {
+        Some(raw) => raw
+            .trim()
+            .parse::<WorkspaceKind>()
+            .map_err(|error| format!("--kind {error}")),
+        None => Ok(WorkspaceKind::Code),
+    }
+}
+
 /// `spawn mission add`: the mission, then every setting the command line
 /// gave it. A setting is never dropped: `Settings::from` refuses objectives
 /// without a gate (they could never land), and `given` is true for any
@@ -1889,6 +1914,12 @@ fn episodes_cmd(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<
 fn add(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i64, String> {
     // Checked here for a clear error; spawn_mission_add holds the same rule
     // for every caller.
+    let kind = parse_workspace_kind(flags)?;
+    let raw_text = text(flags, "text")?;
+    if raw_text.trim().is_empty() {
+        return Err("a mission needs text".to_string());
+    }
+    let stored_text = kind.encode_mission_text(&raw_text);
     let sources = match flags.get("source") {
         Some(source) => json!([crate::sources::MissionSource::parse(&source)?.as_str()]),
         None => json!([]),
@@ -1912,7 +1943,7 @@ fn add(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i64, Stri
         );
     }
     let id = store
-        .mission_add(&text(flags, "text")?, &sources, "human")
+        .mission_add(&stored_text, &sources, "human")
         .map_err(|error| error.to_string())?;
     if settings.given {
         settings.apply(store, id)?;
@@ -5999,5 +6030,116 @@ mod database_tests {
             "{missing_err}"
         );
         assert!(!missing_cas.join(spawn_cas::CAS_MARKER).exists());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mission_add_and_show_support_workspace_kinds_and_preserve_code_default() {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("mission_workspace_kinds");
+        let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+            .expect("isolated schema");
+        let root = std::env::temp_dir().join(format!(
+            "spawn-mission-kind-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runner = root.join("missing-runner.sh");
+
+        let split_mission = super::split_mission;
+        let show_words = [
+            "show".to_string(),
+            "--id".to_string(),
+            "1".to_string(),
+            "--json".to_string(),
+        ];
+        let (show_verb, show_flags) = split_mission(&show_words).expect("show --json flags parse");
+        assert_eq!(show_verb, "show");
+        assert!(show_flags.switch("json"));
+
+        let bad_words = vec![
+            "add".to_string(),
+            "--text".to_string(),
+            "test".to_string(),
+            "--kind".to_string(),
+            "video-only".to_string(),
+        ];
+        let (_, bad_flags) = split_mission(&bad_words).expect("flags");
+        let err = super::add(&store, &bad_flags).expect_err("unknown kind rejected");
+        assert!(err.contains("unknown workspace kind"), "{err}");
+
+        let empty_media = vec![
+            "add".to_string(),
+            "--text".to_string(),
+            "   ".to_string(),
+            "--kind".to_string(),
+            "media".to_string(),
+        ];
+        let (_, empty_flags) = split_mission(&empty_media).expect("flags");
+        let empty_err = super::add(&store, &empty_flags).expect_err("empty text rejected");
+        assert!(empty_err.contains("needs text"), "{empty_err}");
+
+        let default_words = vec![
+            "add".to_string(),
+            "--text".to_string(),
+            "code default".to_string(),
+        ];
+        let (_, default_flags) = split_mission(&default_words).expect("flags");
+        let default_id = super::add(&store, &default_flags).expect("default mission added");
+        let default_mission = store
+            .mission_by_id(default_id)
+            .expect("query")
+            .expect("present");
+        assert_eq!(default_mission["text"], "code default");
+        let default_view = super::mission_view(&default_mission, &root, &runner, None, None, 100)
+            .expect("default view");
+        assert_eq!(default_view["workspace_kind"], "code");
+        assert_eq!(default_view["workspace_profile"]["expects_code_gate"], true);
+        assert_eq!(default_view["gate"]["expects_code_gate"], true);
+        assert!(
+            default_view["checks"]
+                .as_array()
+                .expect("checks array")
+                .iter()
+                .any(|c| c.as_str().is_some_and(|s| s.contains("missing-runner.sh")))
+        );
+
+        for kind in ["media", "factory", "general"] {
+            let words = vec![
+                "add".to_string(),
+                "--text".to_string(),
+                format!("produce {kind} workflow"),
+                "--kind".to_string(),
+                kind.to_string(),
+            ];
+            let (_, flags) = split_mission(&words).expect("flags");
+            let id = super::add(&store, &flags).expect("kind mission added");
+            let mission = store.mission_by_id(id).expect("query").expect("present");
+            let view =
+                super::mission_view(&mission, &root, &runner, None, None, 100).expect("view");
+            assert_eq!(view["workspace_kind"], kind);
+            assert_eq!(view["workspace_profile"]["kind"], kind);
+            assert_eq!(view["workspace_profile"]["expects_code_gate"], false);
+            assert_eq!(view["gate"]["expects_code_gate"], false);
+            assert!(
+                view["gate"]["hint"]
+                    .as_str()
+                    .is_some_and(|h| h.contains("Non-code")),
+                "{view}"
+            );
+            assert!(
+                view["checks"]
+                    .as_array()
+                    .expect("checks array")
+                    .iter()
+                    .all(|c| !c.as_str().is_some_and(|s| s.contains("missing-runner.sh")))
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
