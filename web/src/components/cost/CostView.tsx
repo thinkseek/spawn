@@ -4,7 +4,7 @@ import { CircleDollarSign } from "lucide-react";
 import { readApi, usePoll } from "../../api";
 import type { CostAnswer, CostView as Figures, Fold, Row } from "../../cost.ts";
 import { costView, dashboard, rowLines, unpricedNoteTitle } from "../../cost.ts";
-import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
+import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx, tr, useLocale } from "../ui";
 import { CostDashboard } from "./CostDashboard";
 import { SegmentedControl } from "../aui/kit";
 
@@ -203,28 +203,46 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
  * counts. Strictly read-only.
  */
 export function CostView() {
+  const { locale } = useLocale();
   const [picked, setPicked] = useState<WindowId>("24h");
   const poll = usePoll(`cost-${picked}`, (signal) => fetchCost(picked, signal), POLL_MS);
-  const label = WINDOWS.find((window) => window.id === picked)?.label ?? picked;
+  const windowOptions = WINDOWS.map((window) => ({
+    value: window.id,
+    label:
+      window.id === "24h"
+        ? tr(locale, "近 24 小时", "Last 24 h")
+        : tr(locale, "近 7 天", "Last 7 days"),
+  }));
+  const label = windowOptions.find((window) => window.value === picked)?.label ?? picked;
   // A poll of the window picked before keeps its data until the new one
   // answers: show it only when it is the picked window's.
   const data = poll.data && poll.data.window === picked ? poll.data : null;
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
-      <PageHeader title={<h1 className="text-body font-semibold text-foreground">Cost</h1>}>
+      <PageHeader
+        title={
+          <h1 className="text-body font-semibold text-foreground">
+            {tr(locale, "费用统计", "Cost")}
+          </h1>
+        }
+      >
         <SegmentedControl
           size="sm"
-          aria-label="Cost window"
+          aria-label={tr(locale, "费用时间窗", "Cost window")}
           value={picked}
           onChange={(value) => setPicked(value)}
-          options={WINDOWS.map((window) => ({ value: window.id, label: window.label }))}
+          options={windowOptions}
         />
         <LiveStatus error={poll.error} label="" />
       </PageHeader>
       <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5">
         <div className="flex flex-col gap-4">
-          {data ? <CostDashboard view={dashboard(data)} /> : <EmptyState title="Loading…" />}
-          <WindowCard label={`${label} · detail`} figures={data ? costView(data) : null} />
+          {data ? (
+            <CostDashboard view={dashboard(data)} />
+          ) : (
+            <EmptyState title={tr(locale, "正在加载…", "Loading…")} />
+          )}
+          <WindowCard label={`${label} · ${tr(locale, "明细", "detail")}`} figures={data ? costView(data) : null} />
         </div>
       </div>
     </main>

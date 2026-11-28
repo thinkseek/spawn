@@ -19,7 +19,7 @@ import type { PollResult, SessionTail } from "./api";
 import { markNeedsHuman, needsHuman } from "./attention";
 import { inputTarget } from "./commands";
 import { DetailsRail, ExecutionSummary, RailContent } from "./components/DetailsRail";
-import { MobileNav, Sidebar, ThemeSwitch } from "./components/Sidebar";
+import { MobileNav, LocaleSwitch, Sidebar, ThemeSwitch } from "./components/Sidebar";
 import { Timeline } from "./components/Timeline";
 import { TokenGate } from "./components/TokenGate";
 import {
@@ -31,7 +31,7 @@ import {
   type SessionRole,
 } from "./token";
 import { AgentsConsoleView } from "./components/agents/AgentsConsoleView";
-import { AlertsView, OpenAlerts } from "./components/alerts/AlertsView";
+import { AlertsView } from "./components/alerts/AlertsView";
 import { CostView } from "./components/cost/CostView";
 import { CoveragePage } from "./components/features/CoveragePage";
 import { FeatureMapView } from "./components/features/FeatureMapView";
@@ -41,34 +41,22 @@ import { MissionsView } from "./components/missions/MissionsView";
 import { RsiView } from "./components/rsi/RsiView";
 import { ScorecardView } from "./components/scorecard/ScorecardView";
 import { StorageTreeView } from "./components/storage/StorageTreeView";
-import { Button, Drawer, LiveStatus, PageHeader } from "./components/ui";
+import { Button, Drawer, LiveStatus, PageHeader, tr, useLocale } from "./components/ui";
 import type { Fleet } from "./fleet";
 import { fetchFleet } from "./fleet";
 import { relativeTime } from "./format";
 import type { Missions } from "./missions";
 import { fetchMissions } from "./missions";
+import type { NavView } from "./navigation";
 import { fleetContext, missingAlwaysOn } from "./ordering";
-import { actionableAlerts, agentNames, needsYou } from "./home";
+import { actionableAlerts, actionableHomeNeeds, agentNames, needsYou } from "./home";
 
 // Its own chunk: Motion and d3 load only when the Show view opens.
 const ShowView = lazy(() =>
   import("./components/show/ShowView").then((module) => ({ default: module.ShowView })),
 );
 
-export type View =
-  | "fleet"
-  | "agents"
-  | "missions"
-  | "grading"
-  | "features"
-  | "coverage"
-  | "rsi"
-  | "alerts"
-  | "scorecard"
-  | "cost"
-  | "storage"
-  | "show"
-  | "sessions";
+export type View = NavView;
 
 interface Route {
   view: View;
@@ -160,6 +148,7 @@ function useMinute(): number {
 }
 
 export default function App() {
+  const { locale } = useLocale();
   const [auth, setAuth] = useState<AuthGateState>({ kind: "checking" });
   const [probeSeq, setProbeSeq] = useState(0);
   const mounted = useRef(true);
@@ -266,7 +255,7 @@ export default function App() {
       <div className="grid h-dvh w-full place-items-center bg-page-canvas text-caption text-faint-foreground">
         <div className="flex items-center gap-2.5">
           <Orbit size={16} className="animate-spin text-muted-foreground" />
-          <span>正在连接 Spawn…</span>
+          <span>{tr(locale, "正在连接 Spawn…", "Connecting to Spawn…")}</span>
         </div>
       </div>
     );
@@ -288,20 +277,27 @@ export default function App() {
     return (
       <div className="h-dvh w-full overflow-y-auto bg-page-canvas text-label text-foreground">
         <div className="flex min-h-full flex-col">
-          <header className="flex shrink-0 items-center justify-end px-4 pt-3 sm:px-6 sm:pt-4">
+          <header className="flex shrink-0 items-center justify-end gap-2 px-4 pt-3 sm:px-6 sm:pt-4">
+            <LocaleSwitch compact />
             <ThemeSwitch />
           </header>
           <main className="flex flex-1 items-center justify-center px-4 py-4 sm:px-6">
             <section className="w-full max-w-[400px] rounded-card bg-surface p-6 shadow-card sm:p-7">
               <div className="flex items-center gap-2.5 text-foreground">
                 <ShieldAlert size={18} className="shrink-0 text-destructive" />
-                <h1 className="text-title-sm font-semibold">访问被服务端拒绝</h1>
+                <h1 className="text-title-sm font-semibold">
+                  {tr(locale, "访问被服务端拒绝", "Access denied by server")}
+                </h1>
               </div>
               <p className="mt-2.5 rounded-control bg-fail-tint px-3 py-2 text-caption text-destructive">
                 {auth.message}
               </p>
               <p className="mt-3 text-caption leading-relaxed text-faint-foreground">
-                服务端在只读探测（GET）阶段返回了 HTTP 403，通常源于 Host 或 Origin 安全策略拦截，而非只读 Token 限制。请核对浏览器访问域名或反向代理的 Host/Origin 转发配置后再重试。
+                {tr(
+                  locale,
+                  "服务端在只读探测（GET）阶段返回了 HTTP 403，通常源于 Host 或 Origin 安全策略拦截，而非只读 Token 限制。请核对浏览器访问域名或反向代理的 Host/Origin 转发配置后再重试。",
+                  "The server returned HTTP 403 on the read-only probe, typically due to Host or Origin policy checks. Verify the domain or reverse-proxy Host/Origin headers and retry.",
+                )}
               </p>
               <div className="mt-4">
                 <button
@@ -309,7 +305,7 @@ export default function App() {
                   onClick={retryProbe}
                   className="inline-flex h-11 w-full items-center justify-center rounded-control bg-inset px-4 text-caption font-medium text-muted-foreground shadow-hairline transition-colors hover:bg-surface-hover hover:text-foreground"
                 >
-                  重新检查
+                  {tr(locale, "重新检查", "Retry check")}
                 </button>
               </div>
             </section>
@@ -323,14 +319,17 @@ export default function App() {
     return (
       <div className="h-dvh w-full overflow-y-auto bg-page-canvas text-label text-foreground">
         <div className="flex min-h-full flex-col">
-          <header className="flex shrink-0 items-center justify-end px-4 pt-3 sm:px-6 sm:pt-4">
+          <header className="flex shrink-0 items-center justify-end gap-2 px-4 pt-3 sm:px-6 sm:pt-4">
+            <LocaleSwitch compact />
             <ThemeSwitch />
           </header>
           <main className="flex flex-1 items-center justify-center px-4 py-4 sm:px-6">
             <section className="w-full max-w-[400px] rounded-card bg-surface p-6 shadow-card sm:p-7">
               <div className="flex items-center gap-2.5 text-foreground">
                 <WifiOff size={18} className="text-muted-foreground" />
-                <h1 className="text-title-sm font-semibold">暂时无法连接 Spawn 服务端</h1>
+                <h1 className="text-title-sm font-semibold">
+                  {tr(locale, "暂时无法连接 Spawn 服务端", "Cannot reach Spawn server")}
+                </h1>
               </div>
               <p className="mt-2.5 rounded-control bg-inset px-3 py-2 font-mono text-caption text-muted-foreground">
                 {auth.message}
@@ -341,7 +340,7 @@ export default function App() {
                   onClick={retryProbe}
                   className="inline-flex h-11 w-full items-center justify-center rounded-control bg-primary px-4 text-body font-semibold text-primary-foreground shadow-btn transition-opacity hover:opacity-90"
                 >
-                  重试连接
+                  {tr(locale, "重试连接", "Retry connection")}
                 </button>
                 {auth.hasStoredToken && (
                   <button
@@ -349,7 +348,7 @@ export default function App() {
                     onClick={() => void handleClearStoredAndRetry()}
                     className="inline-flex h-11 w-full items-center justify-center rounded-control bg-inset px-4 text-caption font-medium text-muted-foreground shadow-hairline hover:bg-surface-hover hover:text-foreground"
                   >
-                    清除已存 Token 并重试
+                    {tr(locale, "清除已存 Token 并重试", "Clear stored token and retry")}
                   </button>
                 )}
               </div>
@@ -378,6 +377,7 @@ function DashboardShell({
   onUnauthorized: () => void;
   onSignOut: () => void;
 }) {
+  const { locale } = useLocale();
   // The live log (stream.ts, shared among tabs): every poll that names a
   // topic reads again when an event of it arrives, and polls slower while
   // the stream is live.
@@ -398,8 +398,7 @@ function DashboardShell({
   // the dispatcher's view (/api/attention), never a judge's flag.
   const fleetPoll = usePoll("fleet", fetchFleet, 3_000, { live: ["fleet"] });
   const attention = usePoll("attention", fetchAttention, 3_000, { live: ["attention"] });
-  // The alerts Spawn raised, on every page: the open ones are a strip at the
-  // top, and the Alerts view shows the window.
+  // The alerts Spawn raised, viewed quietly in Diagnostics -> Alerts Log or Home's folded digest.
   const alerts = usePoll("alerts", fetchAlerts, 5_000, { live: ["alerts"] });
   const needs = useMemo(
     () => (attention.data ? needsHuman(attention.data) : null),
@@ -414,9 +413,6 @@ function DashboardShell({
     [fleetPoll.data, needs],
   );
   const fleet: PollResult<Fleet> = { data: fleetData, error: fleetPoll.error };
-  // The open alerts to act on: one about a session that has ended is moot,
-  // and a stuck one not scored since it fired is stale; neither is in the
-  // band nor counted (home.ts; design-ui-information.md §4.6).
   const applying = useMemo(
     () => actionableAlerts(alerts.data, fleetPoll.data?.agents ?? null),
     [alerts.data, fleetPoll.data],
@@ -462,9 +458,7 @@ function DashboardShell({
     [fleetPoll.data, context],
   );
   // "Needs you" is computed here, once: the Home card lists these items and
-  // the Home badge counts their actions, so the two never disagree (when
-  // /api/attention fails, both go on with the missions, alerts and host;
-  // at a hold's 30-minute edge, both cross it together on the minute).
+  // the Home badge counts their actions, so the two never disagree.
   const minute = useMinute();
   // One name per agent (design §4.5), unique across the board.
   const pollNames = useMemo(() => agentNames(fleetPoll.data?.agents ?? [], context), [fleetPoll.data, context]);
@@ -478,12 +472,14 @@ function DashboardShell({
         health: fleetPoll.data?.health ?? null,
         missingAlwaysOn: missing.length,
         now: minute,
+        locale,
         nameOf: (session) => pollNames.get(session) ?? null,
       }),
-    [attention.data, missions.data, alerts.data, fleetPoll.data, missing, minute, pollNames],
+    [attention.data, missions.data, alerts.data, fleetPoll.data, missing, minute, locale, pollNames],
   );
+  const homeNeeds = useMemo(() => actionableHomeNeeds(needItems), [needItems]);
   const humanCount = {
-    count: needItems.filter((item) => item.tone === "act").length,
+    count: homeNeeds.filter((item) => item.tone === "act").length,
     error: attention.data ? null : attention.error,
   };
   const setView = (next: View) => setRoute({ view: next, agent: null });
@@ -556,6 +552,8 @@ function DashboardShell({
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-app-shell text-label text-foreground md:flex-row">
       <MobileNav
         view={view}
+        rsi={rsi}
+        error={overview.error}
         attention={humanCount}
         openAlerts={openAlerts}
         onShowFleet={() => setView("fleet")}
@@ -604,9 +602,6 @@ function DashboardShell({
       />
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      {view !== "fleet" && (
-        <OpenAlerts alerts={applying} onOpen={() => setView("alerts")} />
-      )}
       {view === "fleet" ? (
         <FleetView
           fleet={fleet}
@@ -615,7 +610,10 @@ function DashboardShell({
           missions={missions.data}
           alerts={alerts.data}
           needs={needItems}
+          actionableNeeds={homeNeeds}
           onShowMissions={() => setView("missions")}
+          onShowFeatures={() => setView("features")}
+          onShowAgents={() => setView("agents")}
           selectedId={route.agent}
           onSelect={(agent) => setRoute({ view: "fleet", agent })}
           onOpenTimeline={openTimeline}
@@ -665,7 +663,7 @@ function DashboardShell({
                     className="min-w-0 truncate text-body font-semibold text-foreground"
                     title={[sessionName, agentId, sessionId].filter(Boolean).join("\n") || undefined}
                   >
-                    {sessionName ?? agentId ?? sessionId ?? "No session selected"}
+                    {sessionName ?? agentId ?? sessionId ?? tr(locale, "未选择会话", "No session selected")}
                   </h1>
                   {sessionId && (sessionName || agentId) && (
                     <span className="hidden truncate rounded bg-muted px-1.5 py-px font-mono text-micro text-muted-foreground select-all sm:inline">
@@ -680,21 +678,27 @@ function DashboardShell({
               }
             >
               <span className="tnum hidden text-caption text-muted-foreground lg:inline">
-                {freshness ? `${freshness.event_count} events` : "0 events"}
+                {freshness
+                  ? tr(locale, `${freshness.event_count} 条事件`, `${freshness.event_count} events`)
+                  : tr(locale, "0 条事件", "0 events")}
                 <span className="mx-1.5 text-faint-foreground">·</span>
                 {freshness
-                  ? `last ${relativeTime(freshness.last_event_at_ms)}`
-                  : "no events yet"}
+                  ? tr(
+                      locale,
+                      `最近 ${relativeTime(freshness.last_event_at_ms)}`,
+                      `last ${relativeTime(freshness.last_event_at_ms)}`,
+                    )
+                  : tr(locale, "暂无事件", "no events yet")}
               </span>
               <ExecutionSummary detail={detail} className="hidden md:inline-flex" />
               <LiveStatus error={error} label="" />
               <Button
                 onClick={() => setRailOpen(true)}
                 className="lg:hidden"
-                title="Session details"
+                title={tr(locale, "会话详情", "Session details")}
               >
                 <PanelRight size={13} />
-                Details
+                {tr(locale, "详情", "Details")}
               </Button>
             </PageHeader>
 
@@ -718,7 +722,7 @@ function DashboardShell({
             )}
 
             {!selectedId ? (
-              <Placeholder text="Waiting for a session." />
+              <Placeholder text={tr(locale, "请等待或选择一个会话。", "Waiting for a session.")} />
             ) : detail ? (
               <Timeline
                 key={selectedId}
@@ -734,8 +738,8 @@ function DashboardShell({
               <Placeholder
                 text={
                   session.error
-                    ? "Could not load this session."
-                    : "Loading session…"
+                    ? tr(locale, "无法加载该会话。", "Could not load this session.")
+                    : tr(locale, "正在加载会话…", "Loading session…")
                 }
               />
             )}
@@ -753,7 +757,7 @@ function DashboardShell({
               onClose={() => setRailOpen(false)}
               header={
                 <h2 className="text-title-sm font-semibold text-foreground">
-                  Session details
+                  {tr(locale, "会话详情", "Session details")}
                 </h2>
               }
             >

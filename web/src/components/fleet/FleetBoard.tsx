@@ -4,11 +4,11 @@ import type { FleetAgent } from "../../fleet";
 import { FLEET_STATES, jobsText, onOwnJob, percent, stateLabelUpper } from "../../fleet";
 import { absoluteTitle } from "../../format";
 import type { AgentGroup, AgentGroupId, FleetContext, TaskRef } from "../../ordering";
-import { AGENT_GROUP_LABEL, agentLiveness, heldTask, lastTask } from "../../ordering";
+import { agentGroupLabel, agentLiveness, heldTask, lastTask } from "../../ordering";
 import { currentToolText } from "../../home";
 import { useStoredChoice } from "../ViewToggle";
 import { ToolChip } from "../BeautifulPrimitives";
-import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, GroupHeader, LabeledId, cx, sinceText } from "../ui";
+import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, GroupHeader, LabeledId, cx, sinceText, useLocale } from "../ui";
 import { AgentLivenessPill, FleetStateDot, JudgeBadge } from "./bits";
 
 /** One line for "what is it doing right now": its open tool; else, when the
@@ -77,6 +77,7 @@ export function FleetBoard({
   selectedId: string | null;
   onSelect: (sessionId: string) => void;
 }) {
+  const { locale } = useLocale();
   const [ended, setEnded] = useStoredChoice("spawn.fleet.ended", ["open", "closed"] as const, "closed");
   const shown = groups.filter((group) => group.id !== "always_on");
   const live = total.filter((agent) => agent.live).length;
@@ -134,12 +135,12 @@ export function FleetBoard({
             return (
               <section
                 key={group.id}
-                aria-label={AGENT_GROUP_LABEL[group.id]}
+                aria-label={agentGroupLabel(group.id, locale)}
                 className="border-b border-surface-border last:border-b-0"
               >
                 <GroupHeader
                   className="bg-page-canvas/40 px-4 py-1.5"
-                  label={AGENT_GROUP_LABEL[group.id]}
+                  label={agentGroupLabel(group.id, locale)}
                   count={group.agents.length}
                   expanded={folds ? open : undefined}
                   onToggle={folds ? () => setEnded(open ? "closed" : "open") : undefined}

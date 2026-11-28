@@ -12,6 +12,7 @@ import type { Alert } from "./api";
 import type { Attention, AttentionItem } from "./attention";
 import { itemSince, questionSummary } from "./attention.ts";
 import type { Activity, FleetAgent, FleetHealth } from "./fleet";
+import type { Locale } from "./i18n.ts";
 import type { Mission, Missions, MissionTask } from "./missions";
 import type { FleetContext, TaskRef } from "./ordering";
 import {
@@ -77,11 +78,13 @@ export function actionableAlerts(alerts: readonly Alert[] | null, agents: readon
 }
 
 /** "5 h", "52 min": an age in the words a line can hold. */
-export function ageText(ms: number): string {
+export function ageText(ms: number, locale: Locale = "en"): string {
   const minutes = Math.max(0, Math.round(ms / 60_000));
-  if (minutes < 60) return `${minutes} min`;
+  if (minutes < 60) return locale === "zh" ? `${minutes} 分钟` : `${minutes} min`;
   const hours = Math.round(minutes / 60);
-  return hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} d`;
+  if (hours < 48) return locale === "zh" ? `${hours} 小时` : `${hours} h`;
+  const days = Math.round(hours / 24);
+  return locale === "zh" ? `${days} 天` : `${days} d`;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +97,8 @@ export type NeedTone = "act" | "know";
 export interface NeedItem {
   key: string;
   tone: NeedTone;
+  /** Alert `kind` when `key` comes from `/api/alerts` (`alert:*`). */
+  alertKind?: string | null;
   /** What it is, in a few words. */
   title: string;
   /** One line of detail, or null. */
@@ -129,6 +134,8 @@ export interface NeedsInput {
   /** Always-on agents expected and not running (ordering.missingAlwaysOn). */
   missingAlwaysOn: number;
   now: number;
+  /** Copy language; defaults to `"en"` so existing headless tests stay stable. */
+  locale?: Locale;
   /** An agent's one name by its session id (agentName), for an alert whose
    * subject is a session; null keeps the subject as it is. */
   nameOf?: (session: string) => string | null;
@@ -151,26 +158,54 @@ function shortDuration(text: string): string {
 
 /** An escalation's line in one line: a stall in words, else its first
  * clause (up to the first ": "), else the line. */
-export function oneLine(line: string): string {
+export function oneLine(line: string, locale: Locale = "en"): string {
   const stall = STALL_LINE.exec(line);
   if (stall) {
     const [, task, step, waited, bound] = stall;
+    if (locale === "zh") {
+      return `T${task} 在 ${step} 阶段等待 ${shortDuration(waited)}（上限 ${shortDuration(bound)}）`;
+    }
     return `T${task} waiting for its ${step} ${shortDuration(waited)} (bound ${shortDuration(bound)})`;
   }
   const clause = line.indexOf(": ");
   return clause > 0 && clause < line.length - 2 ? line.slice(0, clause) : line;
 }
 
-function escalation(item: AttentionItem, told: boolean): NeedItem {
-  const short = oneLine(item.line);
-  const full = told ? `${item.line} (the supervisor was told)` : item.line;
+const ESCALATION_WHY_ZH: Record<string, string> = {
+  attention: "需要人工关注",
+  stalled: "执行停滞",
+  blocked: "已阻塞",
+  conflict: "存在冲突",
+  failed: "执行失败",
+  waiting: "等待响应",
+};
+
+function escalationTitle(why: string, locale: Locale): string {
+  if (locale === "zh") {
+    const key = why.trim().toLowerCase();
+    return ESCALATION_WHY_ZH[key] ?? why;
+  }
+  return why.charAt(0).toUpperCase() + why.slice(1);
+}
+
+function escalation(item: AttentionItem, told: boolean, locale: Locale = "en"): NeedItem {
+  const short = oneLine(item.line, locale);
+  const full = told
+    ? locale === "zh"
+      ? `${item.line}（已通知主控）`
+      : `${item.line} (the supervisor was told)`
+    : item.line;
   return {
     key: `attention:${item.tag}:${item.session_id}`,
     // Told items went to the supervisor and are unresolved: worth knowing;
     // an untold one is the owner's to look at now.
     tone: told ? "know" : "act",
-    title: item.why.charAt(0).toUpperCase() + item.why.slice(1),
-    detail: told ? `${short} · the supervisor was told` : short,
+    title: escalationTitle(item.why, locale),
+    detail: told
+      ? locale === "zh"
+        ? `${short} · 已通知主控`
+        : `${short} · the supervisor was told`
+      : short,
     full: full !== short ? full : null,
     since_ms: itemSince(item),
     command: null,
@@ -185,10 +220,18 @@ export const GONE_SHOWN = 5;
 /** A halt's line: the reason, then, when scenarios are gone, at most
  * GONE_SHOWN of their names and "and N more" for the rest; `full` names
  * them all when the line does not. */
-export function haltWords(reason: string, gone: readonly string[] | null): { detail: string; full: string | null } {
+export function haltWords(
+  reason: string,
+  gone: readonly string[] | null,
+  locale: Locale = "en",
+): { detail: string; full: string | null } {
   if (!gone || gone.length === 0) return { detail: reason, full: null };
   const shown = gone.slice(0, GONE_SHOWN).join(", ");
   const rest = gone.length - GONE_SHOWN;
+  if (locale === "zh") {
+    const detail = `${reason}；缺失场景：${shown}${rest > 0 ? ` 等其余 ${rest} 项` : ""}`;
+    return { detail, full: rest > 0 ? `${reason}；缺失场景：${gone.join(", ")}` : null };
+  }
   const detail = `${reason}; gone: ${shown}${rest > 0 ? ` and ${rest} more` : ""}`;
   return { detail, full: rest > 0 ? `${reason}; gone: ${gone.join(", ")}` : null };
 }
@@ -225,10 +268,17 @@ export function foldedDefects(alerts: readonly Alert[]): Map<string, string | nu
  * long the mission had been without work when it fired; said from its
  * evidence's `since_ms`, it says how long as of now (objective 071). Any
  * other alert, or one without a numeric `since_ms`, keeps its text. */
-export function alertWords(alert: Pick<Alert, "kind" | "subject" | "text" | "evidence">, now: number): string {
+export function alertWords(
+  alert: Pick<Alert, "kind" | "subject" | "text" | "evidence">,
+  now: number,
+  locale: Locale = "en",
+): string {
   if (alert.kind !== "mission_idle") return alert.text;
   const since = (alert.evidence as { since_ms?: unknown } | null)?.since_ms;
   if (typeof since !== "number" || !Number.isFinite(since)) return alert.text;
+  if (locale === "zh") {
+    return `${alert.subject} 距上个任务结束已空闲 ${ageText(now - since, "zh")}：其目标待办中暂无可分配任务`;
+  }
   return `${alert.subject} has had no task in work for ${ageText(now - since)} since its last task ended: its objective backlog has nothing open to assign`;
 }
 
@@ -238,8 +288,9 @@ export function alertWords(alert: Pick<Alert, "kind" | "subject" | "text" | "evi
 export function alertRowWords(
   alert: Pick<Alert, "kind" | "subject" | "text" | "evidence" | "state">,
   now: number,
+  locale: Locale = "en",
 ): string {
-  return alert.state === "open" ? alertWords(alert, now) : alert.text;
+  return alert.state === "open" ? alertWords(alert, now, locale) : alert.text;
 }
 
 /** The open-alerts banner's line on every page but Home: how many, the
@@ -256,6 +307,7 @@ export function openAlertsLine(
 
 /** Every item that needs the owner, actions first, oldest first within. */
 export function needsYou(input: NeedsInput): NeedItem[] {
+  const locale: Locale = input.locale ?? "en";
   const items: NeedItem[] = [];
   const { attention, missions, health } = input;
   const supervisor = attention?.supervisor ?? null;
@@ -264,15 +316,15 @@ export function needsYou(input: NeedsInput): NeedItem[] {
     items.push({
       key: "question",
       tone: "act",
-      title: "The supervisor asks you",
+      title: locale === "zh" ? "主控 Agent 向你提问" : "The supervisor asks you",
       detail: summary.text,
       since_ms: supervisor.question.asked_at_ms,
       command: null,
       session: supervisor.session_id,
     });
   }
-  for (const item of attention?.pending ?? []) items.push(escalation(item, false));
-  for (const item of attention?.told ?? []) items.push(escalation(item, true));
+  for (const item of attention?.pending ?? []) items.push(escalation(item, false, locale));
+  for (const item of attention?.told ?? []) items.push(escalation(item, true, locale));
 
   const halted = new Set<number>();
   for (const mission of missions?.missions ?? []) {
@@ -280,11 +332,14 @@ export function needsYou(input: NeedsInput): NeedItem[] {
     halted.add(mission.id);
     // normalizeMissions read the halt: null without an event to resume.
     const halt = mission.halt ?? null;
-    const words = haltWords(mission.halted, halt?.gone ?? null);
+    const words = haltWords(mission.halted, halt?.gone ?? null, locale);
     items.push({
       key: `halted:${mission.id}`,
       tone: "act",
-      title: `Mission #${mission.id} ${missionName(mission)} is halted`,
+      title:
+        locale === "zh"
+          ? `任务 #${mission.id} ${missionName(mission)} 已阻断`
+          : `Mission #${mission.id} ${missionName(mission)} is halted`,
       detail: words.detail,
       full: words.full,
       since_ms: halt?.at_ms ?? mission.updated_at_ms,
@@ -301,8 +356,14 @@ export function needsYou(input: NeedsInput): NeedItem[] {
     items.push({
       key: `hold:${hold.hold}`,
       tone: "act",
-      title: `Source held${left !== null ? `, ${left <= 0 ? "expired" : `expires in ${Math.ceil(left / 60_000)} min`}` : ""}`,
-      detail: `${hold.source}${waiting ? ` · ${waiting} task${waiting === 1 ? "" : "s"} waiting` : ""}${hold.reason ? ` · ${hold.reason}` : ""}`,
+      title:
+        locale === "zh"
+          ? `源码锁定${left !== null ? (left <= 0 ? "，已过期" : `，${Math.ceil(left / 60_000)} 分钟后过期`) : ""}`
+          : `Source held${left !== null ? `, ${left <= 0 ? "expired" : `expires in ${Math.ceil(left / 60_000)} min`}` : ""}`,
+      detail:
+        locale === "zh"
+          ? `${hold.source}${waiting ? ` · ${waiting} 个任务等待中` : ""}${hold.reason ? ` · ${hold.reason}` : ""}`
+          : `${hold.source}${waiting ? ` · ${waiting} task${waiting === 1 ? "" : "s"} waiting` : ""}${hold.reason ? ` · ${hold.reason}` : ""}`,
       since_ms: hold.held_at_ms,
       command: `spawn mission release --source ${hold.source}`,
       session: null,
@@ -330,10 +391,16 @@ export function needsYou(input: NeedsInput): NeedItem[] {
     items.push({
       key: `alert:${alert.key}`,
       tone: stale ? "know" : "act",
-      title: fold !== undefined ? alertTitle({ kind: alert.kind, subject: fold }) : alertTitle(alert, named),
+      alertKind: alert.kind,
+      title:
+        fold !== undefined
+          ? alertTitle({ kind: alert.kind, subject: fold }, null, locale)
+          : alertTitle(alert, named, locale),
       detail: stale
-        ? `scored stuck${typeof score === "number" ? ` ${score.toFixed(2)}` : ""} ${ageText(input.now - alert.fired_at_ms)} ago; not scored since (its latest judgement, ${ageText(input.now - (stale.judged_at_ms ?? input.now))} ago, has no score${stale.judgement?.reason ? `: ${stale.judgement.reason}` : ""})`
-        : alertWords(alert, input.now),
+        ? locale === "zh"
+          ? `${ageText(input.now - alert.fired_at_ms, "zh")}前卡住评分${typeof score === "number" ? ` ${score.toFixed(2)}` : ""}；最近评审（${ageText(input.now - (stale.judged_at_ms ?? input.now), "zh")}前）未返回评分${stale.judgement?.reason ? `：${stale.judgement.reason}` : ""}`
+          : `scored stuck${typeof score === "number" ? ` ${score.toFixed(2)}` : ""} ${ageText(input.now - alert.fired_at_ms)} ago; not scored since (its latest judgement, ${ageText(input.now - (stale.judged_at_ms ?? input.now))} ago, has no score${stale.judgement?.reason ? `: ${stale.judgement.reason}` : ""})`
+        : alertWords(alert, input.now, locale),
       since_ms: alert.fired_at_ms,
       command,
       // A session's alert opens that agent's page.
@@ -348,8 +415,14 @@ export function needsYou(input: NeedsInput): NeedItem[] {
     items.push({
       key: "liveness",
       tone: "know",
-      title: `${input.missingAlwaysOn} always-on agent${input.missingAlwaysOn === 1 ? " is" : "s are"} not running`,
-      detail: "The supervisor restarts them; it is said here until they are back.",
+      title:
+        locale === "zh"
+          ? `${input.missingAlwaysOn} 个常驻 Agent 未运行`
+          : `${input.missingAlwaysOn} always-on agent${input.missingAlwaysOn === 1 ? " is" : "s are"} not running`,
+      detail:
+        locale === "zh"
+          ? "主控正在尝试重启；恢复前暂显示在此。"
+          : "The supervisor restarts them; it is said here until they are back.",
       since_ms: null,
       command: null,
       session: null,
@@ -360,8 +433,14 @@ export function needsYou(input: NeedsInput): NeedItem[] {
     items.push({
       key: `disk:${place.label}`,
       tone: "know",
-      title: `Disk ${place.label}: ${gib(place.free_bytes)} free`,
-      detail: `under its warning (${gib(place.warn_bytes)}); no execution starts under ${gib(place.floor_bytes)}`,
+      title:
+        locale === "zh"
+          ? `磁盘 ${place.label}：剩余 ${gib(place.free_bytes)}`
+          : `Disk ${place.label}: ${gib(place.free_bytes)} free`,
+      detail:
+        locale === "zh"
+          ? `低于告警阈值（${gib(place.warn_bytes)}）；低于 ${gib(place.floor_bytes)} 将暂停新执行`
+          : `under its warning (${gib(place.warn_bytes)}); no execution starts under ${gib(place.floor_bytes)}`,
       since_ms: null,
       command: null,
       session: null,
@@ -372,8 +451,14 @@ export function needsYou(input: NeedsInput): NeedItem[] {
     items.push({
       key: "memory",
       tone: "know",
-      title: `Memory: ${gib(memory.available_bytes)} available`,
-      detail: `under its warning (${gib(memory.warn_bytes)})`,
+      title:
+        locale === "zh"
+          ? `可用内存：${gib(memory.available_bytes)}`
+          : `Memory: ${gib(memory.available_bytes)} available`,
+      detail:
+        locale === "zh"
+          ? `低于告警阈值（${gib(memory.warn_bytes)}）`
+          : `under its warning (${gib(memory.warn_bytes)})`,
       since_ms: null,
       command: null,
       session: null,
@@ -383,7 +468,7 @@ export function needsYou(input: NeedsInput): NeedItem[] {
     items.push({
       key: `warning:${index}`,
       tone: "know",
-      title: "The dispatcher's view is incomplete",
+      title: locale === "zh" ? "调度器视图不完整" : "The dispatcher's view is incomplete",
       detail: warning,
       since_ms: null,
       command: null,
@@ -425,27 +510,63 @@ const ALERT_TITLES: Record<string, string> = {
   guardrail_out_of_range: "A guardrail is out of its range",
 };
 
+const ALERT_TITLES_ZH: Record<string, string> = {
+  agent_stuck: "Agent 疑似卡住",
+  judge_down: "模型评审无响应",
+  integrator_down: "集成器离线",
+  controller_behind: "合入等待部署同步",
+  deploy_failed: "部署失败",
+  mission_halted: "任务已阻断",
+  node_lost: "节点失联无响应",
+  task_undelivered: "任务未成功下发",
+  task_stalled: "已下发任务疑似停滞",
+  admission_wait: "任务排队等待准入空间",
+  backup_stale: "备份已延迟",
+  source_away: "任务源码目录在本机不可用",
+  validator_defect: "main 分支验证器同样失败",
+  task_parked: "任务因负载敏感两次被搁置",
+  mission_idle: "任务线当前无待办作业",
+  message_not_taken: "消息未被 Agent 接收",
+  owner_request_waiting: "Owner 合入请求等待裁决",
+  guardrail_out_of_range: "护栏指标超出阈值",
+};
+
 /** A message not taken whose evidence says Spawn has read no line of the
  * transcript since it was typed (`read_since_typed` 0, the Bridge's own
  * record): whether the agent took it is unknown, so the title does not say
  * it was not taken (S17). */
 const UNREAD_TITLE = "Spawn has read nothing of a transcript since a message was typed";
+const UNREAD_TITLE_ZH = "输入消息后尚未读取到会话日志";
 
 export function alertTitle(
   alert: Pick<Alert, "kind" | "subject"> & Partial<Pick<Alert, "evidence">>,
   named: string | null = null,
+  locale: Locale = "en",
 ): string {
   const evidence = (alert.evidence ?? null) as { read_since_typed?: unknown } | null;
   const unread = alert.kind === "message_not_taken" && evidence?.read_since_typed === 0;
-  const title = unread ? UNREAD_TITLE : (ALERT_TITLES[alert.kind] ?? alert.kind.replaceAll("_", " "));
+  const title =
+    locale === "zh"
+      ? unread
+        ? UNREAD_TITLE_ZH
+        : (ALERT_TITLES_ZH[alert.kind] ?? ALERT_TITLES[alert.kind] ?? alert.kind.replaceAll("_", " "))
+      : unread
+        ? UNREAD_TITLE
+        : (ALERT_TITLES[alert.kind] ?? alert.kind.replaceAll("_", " "));
   return `${title} · ${named ?? alert.subject}`;
 }
 
 /** What "Needs you" holds, in words: the page header and the card say the
  * same, from this. */
-export function needsSummary(items: readonly NeedItem[]): string {
+export function needsSummary(items: readonly NeedItem[], locale: Locale = "en"): string {
   const act = items.filter((item) => item.tone === "act").length;
   const know = items.length - act;
+  if (locale === "zh") {
+    if (items.length === 0) return "暂无待处理项";
+    return [act > 0 ? `${act} 项待处理` : null, know > 0 ? `${know} 项仅知悉` : null]
+      .filter(Boolean)
+      .join(" · ");
+  }
   if (items.length === 0) return "Nothing needs you";
   return [act > 0 ? `${act} to act on` : null, know > 0 ? `${know} to know` : null].filter(Boolean).join(" · ");
 }
@@ -1099,4 +1220,381 @@ export function digestToday(
   agents: readonly FleetAgent[] | null = null,
 ): Digest {
   return digestSince(missions, alerts, now, now - TODAY_MS, agents);
+}
+
+// ---------------------------------------------------------------------------
+// Focused Home models (Actionable needs, Mission Completion, System Status)
+
+/** Critical/actionable alert kinds kept on Home ("Action Required") when open and non-stale. */
+export const CRITICAL_ALERT_KINDS = new Set([
+  "owner_request_waiting",
+  "deploy_failed",
+  "integrator_down",
+  "judge_down",
+  "mission_halted",
+  "node_lost",
+  "agent_stuck",
+  "task_stalled",
+  "task_undelivered",
+  "controller_behind",
+  "task_parked",
+]);
+
+/** Infrastructure outage alert kinds that elevate Home SystemStatusHero to `degraded`. */
+export const OUTAGE_ALERT_KINDS = new Set([
+  "deploy_failed",
+  "integrator_down",
+  "judge_down",
+  "node_lost",
+]);
+
+/** Low-signal/repetitive alert kinds kept quiet in Diagnostics -> Alerts Log instead of Home. */
+export const NOISY_ALERT_KINDS = new Set([
+  "mission_idle",
+  "admission_wait",
+  "backup_stale",
+  "validator_defect",
+  "message_not_taken",
+  "source_away",
+  "guardrail_out_of_range",
+]);
+
+function needAlertKind(item: Pick<NeedItem, "key" | "alertKind">): string | null {
+  if (item.alertKind) return item.alertKind;
+  if (!item.key.startsWith("alert:")) return null;
+  const raw = item.key.slice("alert:".length);
+  const sep = raw.indexOf(":");
+  return (sep === -1 ? raw : raw.slice(0, sep)) || null;
+}
+
+/** Count open, actionable infrastructure-outage alerts surfaced on Home. */
+export function countOutageAlerts(items: readonly NeedItem[]): number {
+  return items.filter((item) => {
+    if (item.tone !== "act") return false;
+    const kind = needAlertKind(item);
+    return kind !== null && OUTAGE_ALERT_KINDS.has(kind);
+  }).length;
+}
+
+/**
+ * Filter `needsYou` items down to genuine human action/blocking items for Home:
+ * keeps owner approvals, outages, stuck workers with actions, halted missions,
+ * pending escalations, and resource warnings while keeping low-signal alerts
+ * quiet in Diagnostics -> Alerts Log.
+ */
+export function actionableHomeNeeds(items: readonly NeedItem[]): NeedItem[] {
+  return items.filter((item) => {
+    if (item.key.startsWith("alert:")) {
+      if (item.tone !== "act") return false;
+      const kind = needAlertKind(item);
+      if (kind && NOISY_ALERT_KINDS.has(kind)) return false;
+      return (kind !== null && CRITICAL_ALERT_KINDS.has(kind)) || Boolean(item.command);
+    }
+    if (item.key.startsWith("halted:")) return true;
+    if (item.key.startsWith("attention:")) return item.tone === "act";
+    if (item.key.startsWith("disk:") || item.key === "memory") return true;
+    return item.tone === "act";
+  });
+}
+
+export type MissionProgressStatus = "active" | "halted" | "paused" | "idle";
+
+export interface MissionProgressRow {
+  id: number | null;
+  name: string;
+  status: MissionProgressStatus;
+  completedTasks: number;
+  totalTasks: number;
+  inFlightTasks: number;
+  blockedTasks: number;
+  /** Whole percentage `0..100`, or null when the mission has zero non-cancelled tasks. */
+  completionPct: number | null;
+  landedToday: number;
+  inFlight: InFlight[];
+  lastRejection: MissionRow["lastRejection"];
+  haltedReason: string | null;
+}
+
+export interface MissionProgressSummary {
+  rows: MissionProgressRow[];
+  openMissions: number;
+  closedMissions: number;
+  totalTasks: number;
+  completedTasks: number;
+  inFlightTasks: number;
+  blockedTasks: number;
+  landedToday: number;
+  overallPct: number | null;
+}
+
+function isTaskCompleted(task: MissionTask, mission: Mission): boolean {
+  return task.state === "landed" || (!mission.gate && task.state === "accepted");
+}
+
+function isTaskBlocked(task: MissionTask): boolean {
+  return task.state === "revise" || Boolean(task.parked) || task.held_by !== null;
+}
+
+const PROGRESS_STATUS_RANK: Record<MissionProgressStatus, number> = {
+  halted: 0,
+  active: 1,
+  paused: 2,
+  idle: 3,
+};
+
+/**
+ * Summarize completion progress across all open missions and their non-cancelled tasks.
+ */
+export function missionProgressSummary(
+  missions: Missions | null,
+  now: number,
+): MissionProgressSummary {
+  const rows: Array<MissionProgressRow & { moved: number }> = [];
+  let closedMissions = 0;
+  let totalTasks = 0;
+  let completedTasks = 0;
+  let inFlightTasks = 0;
+  let blockedTasks = 0;
+  let landedToday = 0;
+  const since = now - TODAY_MS;
+
+  for (const mission of missions?.missions ?? []) {
+    const kind = missionClass(mission);
+    if (kind === "closed") {
+      closedMissions += 1;
+      continue;
+    }
+
+    const countable = mission.tasks.filter((task) => task.state !== "cancelled");
+    const completed = countable.filter((task) => isTaskCompleted(task, mission)).length;
+    const blocked = countable.filter(isTaskBlocked).length;
+    const inFlight: InFlight[] = mission.tasks
+      .filter((task) => isOpenTask(task, mission))
+      .map((task) => {
+        const conflicts = conflictCount(task);
+        const earlierConflicts = earlierConflictCount(task, mission);
+        return {
+          task_id: task.id,
+          title: task.task_title,
+          state: taskStateLabel(task, mission),
+          since_ms: latestRecord(task),
+          conflicts,
+          earlierConflicts,
+          conflictText: conflictText(conflicts, earlierConflicts),
+        };
+      })
+      .sort((left, right) => (left.task_id ?? 0) - (right.task_id ?? 0));
+
+    let missionLandedToday = 0;
+    let lastRejection: MissionRow["lastRejection"] = null;
+    let moved = mission.updated_at_ms ?? 0;
+    for (const task of mission.tasks) {
+      const landed = landedAt(task, mission);
+      if (landed !== null && landed >= since) missionLandedToday += 1;
+      moved = Math.max(moved, latestRecord(task) ?? 0);
+      for (const back of sendBacks(task)) {
+        if (back.at_ms < since || (lastRejection && lastRejection.at_ms >= back.at_ms)) continue;
+        const gate = task.last_gate;
+        lastRejection = {
+          task_id: task.id,
+          verdict: back.verdict,
+          reason: gate && gate.verdict === back.verdict ? gate.reason : null,
+          at_ms: back.at_ms,
+        };
+      }
+    }
+
+    const status: MissionProgressStatus = mission.halted
+      ? "halted"
+      : mission.paused
+        ? "paused"
+        : inFlight.length > 0
+          ? "active"
+          : "idle";
+
+    const missionTotal = countable.length;
+    const completionPct = missionTotal > 0 ? Math.round((completed / missionTotal) * 100) : null;
+
+    totalTasks += missionTotal;
+    completedTasks += completed;
+    inFlightTasks += inFlight.length;
+    blockedTasks += blocked;
+    landedToday += missionLandedToday;
+
+    rows.push({
+      id: mission.id,
+      name: missionName(mission),
+      status,
+      completedTasks: completed,
+      totalTasks: missionTotal,
+      inFlightTasks: inFlight.length,
+      blockedTasks: blocked,
+      completionPct,
+      landedToday: missionLandedToday,
+      inFlight,
+      lastRejection,
+      haltedReason: mission.halted ?? null,
+      moved,
+    });
+  }
+
+  rows.sort((left, right) => {
+    const byStatus = PROGRESS_STATUS_RANK[left.status] - PROGRESS_STATUS_RANK[right.status];
+    if (byStatus !== 0) return byStatus;
+    return right.moved - left.moved;
+  });
+
+  const overallPct = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : null;
+
+  return {
+    rows: rows.map(({ moved: _moved, ...row }) => row),
+    openMissions: rows.length,
+    closedMissions,
+    totalTasks,
+    completedTasks,
+    inFlightTasks,
+    blockedTasks,
+    landedToday,
+    overallPct,
+  };
+}
+
+export type SystemHealthTone = "healthy" | "attention" | "degraded";
+
+export interface SystemLivenessInput {
+  total: number;
+  up: number;
+}
+
+export interface NodeStatusInput {
+  state: string;
+}
+
+export interface SystemStatusInput {
+  health: FleetHealth | null;
+  liveness: SystemLivenessInput | null;
+  agents: readonly FleetAgent[] | null;
+  nodes: readonly NodeStatusInput[];
+  missionProgress: MissionProgressSummary;
+  actionCount: number;
+  criticalOutageCount?: number;
+  freshnessLevel: "fresh" | "aging" | "frozen";
+}
+
+export interface SystemStatusModel {
+  tone: SystemHealthTone;
+  nodesOnline: number;
+  nodesTotal: number;
+  alwaysOnUp: number;
+  alwaysOnTotal: number;
+  restarts24h: number;
+  agentsLive: number;
+  agentsTotal: number;
+  workingCount: number;
+  waitingCount: number;
+  blockedCount: number;
+  memoryUsedPct: number | null;
+  memoryAvailBytes: number | null;
+  tightestDiskLabel: string | null;
+  tightestDiskFreeBytes: number | null;
+  diskLowCount: number;
+  haltedMissions: number;
+  actionCount: number;
+}
+
+/**
+ * Aggregate live host/agent/mission health into a single Home hero model.
+ */
+export function buildSystemStatusModel(input: SystemStatusInput): SystemStatusModel {
+  const {
+    health,
+    liveness,
+    agents,
+    nodes,
+    missionProgress,
+    actionCount,
+    criticalOutageCount = 0,
+    freshnessLevel,
+  } = input;
+  const nodesTotal = nodes.length;
+  const nodesOnline = nodes.filter((node) => node.state === "live").length;
+  const alwaysOnTotal = liveness?.total ?? 0;
+  const alwaysOnUp = liveness?.up ?? 0;
+  const restarts24h = health?.ladder_24h.liveness ?? 0;
+  const agentsLive = health?.live ?? (agents?.filter((agent) => agent.live).length ?? 0);
+  const agentsTotal = health?.agents_total ?? (agents?.length ?? 0);
+  const workingCount =
+    health?.by_state.WORKING ?? (agents?.filter((agent) => agent.live && agent.state === "WORKING").length ?? 0);
+  const waitingCount =
+    health?.by_state.WAITING ?? (agents?.filter((agent) => agent.live && agent.state === "WAITING").length ?? 0);
+  const blockedCount =
+    health?.by_state.BLOCKED ?? (agents?.filter((agent) => agent.live && agent.state === "BLOCKED").length ?? 0);
+
+  let memoryUsedPct: number | null = null;
+  const memoryAvailBytes = health?.memory?.available_bytes ?? null;
+  const memoryTotalBytes = health?.memory?.total_bytes ?? null;
+  if (
+    memoryAvailBytes !== null &&
+    memoryTotalBytes !== null &&
+    memoryTotalBytes > 0
+  ) {
+    memoryUsedPct = Math.max(
+      0,
+      Math.min(100, Math.round(((memoryTotalBytes - memoryAvailBytes) / memoryTotalBytes) * 100)),
+    );
+  }
+  const memoryLow =
+    health?.memory !== null &&
+    health?.memory !== undefined &&
+    health.memory.available_bytes !== null &&
+    health.memory.available_bytes < health.memory.warn_bytes;
+
+  let tightestDiskLabel: string | null = null;
+  let tightestDiskFreeBytes: number | null = null;
+  let diskLowCount = 0;
+  for (const place of health?.disk ?? []) {
+    if (place.free_bytes === null) continue;
+    if (place.free_bytes < place.warn_bytes) diskLowCount += 1;
+    if (tightestDiskFreeBytes === null || place.free_bytes < tightestDiskFreeBytes) {
+      tightestDiskFreeBytes = place.free_bytes;
+      tightestDiskLabel = place.label;
+    }
+  }
+
+  const haltedMissions = missionProgress.rows.filter((row) => row.status === "halted").length;
+  const nodesLost = nodes.some((node) => node.state === "lost");
+  const alwaysOnDown = alwaysOnTotal > 0 && alwaysOnUp < alwaysOnTotal;
+
+  const tone: SystemHealthTone =
+    freshnessLevel === "frozen" || haltedMissions > 0 || nodesLost || criticalOutageCount > 0
+      ? "degraded"
+      : freshnessLevel === "aging" ||
+          alwaysOnDown ||
+          blockedCount > 0 ||
+          diskLowCount > 0 ||
+          memoryLow ||
+          actionCount > 0
+        ? "attention"
+        : "healthy";
+
+  return {
+    tone,
+    nodesOnline,
+    nodesTotal,
+    alwaysOnUp,
+    alwaysOnTotal,
+    restarts24h,
+    agentsLive,
+    agentsTotal,
+    workingCount,
+    waitingCount,
+    blockedCount,
+    memoryUsedPct,
+    memoryAvailBytes,
+    tightestDiskLabel,
+    tightestDiskFreeBytes,
+    diskLowCount,
+    haltedMissions,
+    actionCount,
+  };
 }

@@ -1,4 +1,4 @@
-import { ArrowDown, ChevronsUp, GanttChart, List } from "lucide-react";
+import { ArrowDown, ChevronsUp, GanttChart, List, ListOrdered } from "lucide-react";
 import { Fragment, Suspense, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
@@ -11,7 +11,8 @@ import { hasEarlier, joinTail, mergeEvents, readBack } from "../sessionWindow";
 import type { EventWindow } from "../sessionWindow";
 import { eventTone, fullText, pairs } from "../eventFormat";
 import { clockTime } from "../format";
-import { EmptyState, cx } from "./ui";
+import { SessionStreamView } from "./trace/SessionStreamView";
+import { EmptyState, cx, tr, useLocale } from "./ui";
 import { ViewToggle, useStoredChoice } from "./ViewToggle";
 import type { ViewOption } from "./ViewToggle";
 
@@ -21,12 +22,8 @@ const TraceView = lazy(() =>
   import("./trace/TraceView").then((module) => ({ default: module.TraceView })),
 );
 
-type Mode = "trace" | "list";
-const MODES = ["trace", "list"] as const;
-const MODE_OPTIONS: ReadonlyArray<ViewOption<Mode>> = [
-  { id: "trace", label: "Trace", icon: <GanttChart size={13} /> },
-  { id: "list", label: "List", icon: <List size={13} /> },
-];
+type Mode = "stream" | "trace" | "list";
+const MODES = ["stream", "trace", "list"] as const;
 
 /** A session's events as a trace (spans on a time axis) or as the plain
  * list, for searching and copying. The choice is remembered. `tail` is the
@@ -56,7 +53,13 @@ export function Timeline({
   /** Open another session's timeline (a reassign's other end). */
   onOpenSession?: (sessionId: string) => void;
 }) {
-  const [mode, choose] = useStoredChoice<Mode>("spawn.timeline.mode", MODES, "trace");
+  const { locale } = useLocale();
+  const [mode, choose] = useStoredChoice<Mode>("spawn.timeline.mode", MODES, "stream");
+  const modeOptions: ReadonlyArray<ViewOption<Mode>> = [
+    { id: "stream", label: tr(locale, "流式步骤", "Stream"), icon: <ListOrdered size={13} /> },
+    { id: "trace", label: tr(locale, "时间线", "Trace"), icon: <GanttChart size={13} /> },
+    { id: "list", label: tr(locale, "原始事件", "List"), icon: <List size={13} /> },
+  ];
   const [held, setHeld] = useState<EventWindow>(tail);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
@@ -106,11 +109,15 @@ export function Timeline({
       <div className="grid min-h-0 flex-1 place-items-center">
         <div className="flex flex-col items-center gap-3">
           <EmptyState
-            title={earlier ? `No events from #${held.after + 1}` : "No events in this session"}
+            title={
+              earlier
+                ? tr(locale, `从 #${held.after + 1} 起暂无可见事件`, `No events from #${held.after + 1}`)
+                : tr(locale, "该会话暂无事件", "No events in this session")
+            }
             hint={
               earlier
-                ? "The latest stretch holds only the observer's own events."
-                : "Events appear here as the agent's hooks report them."
+                ? tr(locale, "最近一段仅包含观察器自身的内部事件。", "The latest stretch holds only the observer's own events.")
+                : tr(locale, "当 Agent 产生操作事件后会实时展示在此。", "Events appear here as the agent's hooks report them.")
             }
           />
           {earlier && (
@@ -122,7 +129,11 @@ export function Timeline({
               className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-caption text-muted-foreground hover:bg-surface-hover hover:text-foreground disabled:opacity-60"
             >
               <ChevronsUp size={13} />
-              {loading ? "Loading…" : failed ? "Retry earlier" : "Earlier"}
+              {loading
+                ? tr(locale, "加载中…", "Loading…")
+                : failed
+                  ? tr(locale, "重试加载更早", "Retry earlier")
+                  : tr(locale, "更早事件", "Earlier")}
             </button>
           )}
         </div>
@@ -133,23 +144,40 @@ export function Timeline({
   const first = held.after + 1;
   const toggle = (
     <>
-      <ViewToggle label="Timeline view" options={MODE_OPTIONS} value={mode} onChange={choose} />
+      <ViewToggle
+        label={tr(locale, "会话视图", "Timeline view")}
+        options={modeOptions}
+        value={mode}
+        onChange={choose}
+      />
       <ReassignLinks to={reassignedTo} from={reassignedFrom} onOpen={onOpenSession} />
       {earlier && (
         <button
           type="button"
           onClick={loadEarlier}
           disabled={loading}
-          title={failed ?? `Events from #${first}; load the ones before them`}
+          title={failed ?? tr(locale, `当前从 #${first} 开始；点击加载更早事件`, `Events from #${first}; load the ones before them`)}
           className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-caption text-muted-foreground hover:bg-surface-hover hover:text-foreground disabled:opacity-60"
         >
           <ChevronsUp size={13} />
-          {loading ? "Loading…" : failed ? "Retry earlier" : `Earlier · from #${first}`}
+          {loading
+            ? tr(locale, "加载中…", "Loading…")
+            : failed
+              ? tr(locale, "重试更早", "Retry earlier")
+              : tr(locale, `更早 · #${first} 之前`, `Earlier · from #${first}`)}
         </button>
       )}
     </>
   );
-  return mode === "trace" ? (
+  return mode === "stream" ? (
+    <SessionStreamView
+      events={events}
+      executions={executions}
+      commands={commands}
+      to={to}
+      header={toggle}
+    />
+  ) : mode === "trace" ? (
     <Suspense fallback={<div className="min-h-0 flex-1" />}>
       <TraceView events={events} executions={executions} commands={commands} to={to} header={toggle} />
     </Suspense>

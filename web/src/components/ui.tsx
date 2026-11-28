@@ -1,9 +1,28 @@
 import { ChevronRight, WifiOff, X } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 
 import { absoluteTitle, relativeTime } from "../format";
+import {
+  getLocale,
+  setLocale,
+  subscribeLocale,
+  syncDocumentLocale,
+  tr,
+  type Locale,
+} from "../i18n";
 import { splitId } from "../ordering";
+
+export { tr, type Locale };
+
+/** Subscribe to the bilingual UI locale (`"zh"` | `"en"`) and sync `<html lang>`. */
+export function useLocale(): { locale: Locale; setLocale: (next: Locale) => void } {
+  const locale = useSyncExternalStore(subscribeLocale, getLocale, getLocale);
+  useEffect(() => {
+    syncDocumentLocale(locale);
+  }, [locale]);
+  return { locale, setLocale };
+}
 
 /** Join class names, skipping falsy ones. */
 export function cx(...parts: Array<string | false | null | undefined>): string {
@@ -103,6 +122,7 @@ export function LiveStatus({
   label: ReactNode;
   freshness?: "fresh" | "aging" | "frozen";
 }) {
+  const { locale } = useLocale();
   if (error) {
     return (
       <span
@@ -110,14 +130,20 @@ export function LiveStatus({
         className="inline-flex h-6 items-center gap-1.5 rounded-md bg-fail-tint px-2 text-caption font-medium text-destructive ring-1 ring-destructive/25 ring-inset"
       >
         <WifiOff size={12} />
-        {error.startsWith("HTTP 401") ? "Token needed" : "Disconnected"}
+        {error.startsWith("HTTP 401")
+          ? tr(locale, "需要令牌", "Token needed")
+          : tr(locale, "连接断开", "Disconnected")}
       </span>
     );
   }
   if (freshness === "frozen") {
     return (
       <span
-        title="控制面快照已冻结，请勿仅凭旧快照重派或判断进展"
+        title={tr(
+          locale,
+          "控制面快照已冻结，请勿仅凭旧快照重派或判断进展",
+          "Control-plane snapshot is frozen; avoid dispatching from stale state",
+        )}
         className="inline-flex h-6 items-center gap-1.5 rounded-md bg-fail-tint px-2 text-caption font-medium text-destructive ring-1 ring-destructive/25 ring-inset"
       >
         <span aria-hidden="true" className="inline-flex size-2 rounded-full bg-destructive" />
@@ -128,7 +154,7 @@ export function LiveStatus({
   if (freshness === "aging") {
     return (
       <span
-        title="快照超过 3 分钟未刷新"
+        title={tr(locale, "快照超过 3 分钟未刷新", "Snapshot has not refreshed in over 3 minutes")}
         className="inline-flex h-6 items-center gap-1.5 rounded-md bg-wait-tint px-2 text-caption font-medium text-warning ring-1 ring-warning/25 ring-inset"
       >
         <span aria-hidden="true" className="inline-flex size-2 rounded-full bg-warning" />

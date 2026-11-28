@@ -51,7 +51,7 @@ import {
 import { relativeTime } from "../../format";
 import { pageHidden } from "../../validated";
 import type { SessionRole } from "../../token.ts";
-import { Button, Card, CardHeader, EmptyState, FOCUS_RING, FOCUS_RING_INSET, PageHeader, chip, cx } from "../ui";
+import { Button, Card, CardHeader, EmptyState, FOCUS_RING, FOCUS_RING_INSET, PageHeader, chip, cx, tr, useLocale } from "../ui";
 import { Badge, type BadgeTone } from "../ui/badge";
 
 const DISCOVERY_POLL_MS = 3_000;
@@ -680,6 +680,7 @@ export function AgentsConsoleView({
     });
   };
 
+  const { locale } = useLocale();
   const showListOnMobile = !mobileDetailOpen || selectedAddress === null;
 
   return (
@@ -703,12 +704,12 @@ export function AgentsConsoleView({
                     : "服务端拒绝变更请求（只读会话）"
                 }
               >
-                只读观察 · ReadOnlyViewer
-                {role.kind === "viewer" ? ` (${relativeTime(role.expiresAtMs)}到期)` : ""}
+                {tr(locale, "只读观察", "Read-Only")} · ReadOnlyViewer
+                {role.kind === "viewer" ? ` (${relativeTime(role.expiresAtMs)})` : ""}
               </Badge>
             ) : (
               <Badge tone="success" size="md">
-                操作模式
+                {tr(locale, "操作模式", "Interactive")}
               </Badge>
             )}
           </>
@@ -729,15 +730,15 @@ export function AgentsConsoleView({
               : "切换 GET /api/agents?all=true（包含已退出终端；外部终端可见性由角色权限控制）"
           }
         >
-          {includeAll ? "包含已退出 (?all=true)" : "仅运行中"}
+          {includeAll ? tr(locale, "包含已退出 (?all=true)", "Include exited (?all=true)") : tr(locale, "仅运行中", "Live only")}
         </button>
         <Button
           onClick={() => setRefreshSeq((s) => s + 1)}
           className="pointer-coarse:h-10"
-          title="立即刷新全局终端列表与当前屏幕快照"
+          title={tr(locale, "立即刷新全局终端列表与当前屏幕快照", "Refresh agents list and terminal snapshot")}
         >
           <RefreshCw size={13} />
-          刷新
+          {tr(locale, "刷新", "Refresh")}
         </Button>
       </PageHeader>
 

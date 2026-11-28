@@ -10,6 +10,7 @@
  * retries of one objective are one group, its latest attempt the row. */
 
 import type { AgentLivenessState, FleetAgent } from "./fleet";
+import type { Locale } from "./i18n.ts";
 import type { Mission, MissionTask, Missions, TaskState } from "./missions";
 import type { ScorecardScope } from "./scorecard";
 
@@ -376,6 +377,18 @@ export const AGENT_GROUP_LABEL: Record<AgentGroupId, string> = {
   idle: "Idle",
   ended: "Ended",
 };
+
+const AGENT_GROUP_LABEL_ZH: Record<AgentGroupId, string> = {
+  always_on: "常驻",
+  on_task: "执行任务中",
+  idle: "空闲",
+  ended: "已结束",
+};
+
+/** Localized group heading for fleet & sidebar agent lists. */
+export function agentGroupLabel(id: AgentGroupId, locale: Locale = "en"): string {
+  return locale === "zh" ? AGENT_GROUP_LABEL_ZH[id] : AGENT_GROUP_LABEL[id];
+}
 
 /** A task as an agent row shows it. */
 export interface TaskRef {

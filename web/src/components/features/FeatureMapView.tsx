@@ -52,7 +52,7 @@ import {
   buildRelationIndex,
   validateFeatureGraph,
 } from "../../featuresGraph";
-import { Card, FOCUS_RING, LiveStatus, PageHeader, chip, cx } from "../ui";
+import { Card, FOCUS_RING, LiveStatus, PageHeader, chip, cx, tr, useLocale } from "../ui";
 import { ActiveSpineView } from "./ActiveSpineView";
 import { FeatureInspector } from "./FeatureInspector";
 import { FeatureMindMap } from "./FeatureMindMap";
@@ -72,6 +72,7 @@ interface FeatureMapViewProps {
  * (tri-column dependency focus), interactive Mind Map, and State Columns.
  * States remain strictly server-derived from Spawn's event log. */
 export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapViewProps) {
+  const { locale } = useLocale();
   const poll = usePoll("features", fetchFeatureMap, 4_000, { checked: true });
   const [chosen, setChosen] = useState<number | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("spine");
@@ -141,7 +142,8 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
       <PageHeader
         title={
           <h1 className="truncate text-body font-semibold text-foreground">
-            Feature map{mission ? ` · mission #${mission.id}` : ""}
+            {tr(locale, "能力地图", "Feature map")}
+            {mission ? ` · ${tr(locale, `任务 #${mission.id}`, `mission #${mission.id}`)}` : ""}
           </h1>
         }
       >
@@ -149,7 +151,7 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
         <div
           className="flex items-center gap-1"
           role="group"
-          aria-label="Feature map view mode"
+          aria-label={tr(locale, "能力地图视图模式", "Feature map view mode")}
         >
           <button
             type="button"
@@ -158,7 +160,7 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
             className={cx(chip(viewMode === "spine"), FOCUS_RING)}
           >
             <GitBranch size={13} />
-            Active spine
+            {tr(locale, "主心骨", "Active spine")}
           </button>
           <button
             type="button"
@@ -167,7 +169,7 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
             className={cx(chip(viewMode === "mindmap"), FOCUS_RING)}
           >
             <Network size={13} />
-            Mind map
+            {tr(locale, "思维导图", "Mind map")}
           </button>
           <button
             type="button"
@@ -176,17 +178,21 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
             className={cx(chip(viewMode === "columns"), FOCUS_RING)}
           >
             <LayoutGrid size={13} />
-            State columns
+            {tr(locale, "状态分栏", "State columns")}
           </button>
           {onOpenCoverage && (
             <button
               type="button"
               onClick={onOpenCoverage}
-              title="Open file coverage & one-click unassociated-file (野文件) scan"
+              title={tr(
+                locale,
+                "打开文件覆盖率与未关联野文件扫描",
+                "Open file coverage & one-click unassociated-file (野文件) scan",
+              )}
               className={cx(chip(false), FOCUS_RING)}
             >
               <FileSearch size={13} />
-              Wild-file scan
+              {tr(locale, "野文件扫描", "Wild-file scan")}
             </button>
           )}
         </div>
@@ -213,19 +219,25 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
           error={poll.error}
           label={
             data
-              ? `Updated ${relativeTime(freshAt(data.generated_at_ms, poll.checkedAt))}`
-              : "Connecting"
+              ? tr(
+                  locale,
+                  `更新于 ${relativeTime(freshAt(data.generated_at_ms, poll.checkedAt))}`,
+                  `Updated ${relativeTime(freshAt(data.generated_at_ms, poll.checkedAt))}`,
+                )
+              : tr(locale, "连接中", "Connecting")
           }
         />
       </PageHeader>
 
       {!data ? (
         <div className="grid flex-1 place-items-center text-label text-muted-foreground">
-          {poll.error ? `The feature map could not be read: ${poll.error}` : "Reading the map…"}
+          {poll.error
+            ? tr(locale, `无法读取能力地图：${poll.error}`, `The feature map could not be read: ${poll.error}`)
+            : tr(locale, "正在读取能力地图…", "Reading the map…")}
         </div>
       ) : !mission || !tree || !activeSpine ? (
         <div className="grid flex-1 place-items-center px-6 text-center text-label text-muted-foreground">
-          No open objective mission has a capability map.
+          {tr(locale, "当前没有包含能力地图的开放任务。", "No open objective mission has a capability map.")}
         </div>
       ) : viewMode === "spine" ? (
         <div
