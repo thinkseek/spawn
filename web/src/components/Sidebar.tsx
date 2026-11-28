@@ -1,4 +1,4 @@
-import { Activity, BellRing, Boxes, CircleDollarSign, FolderSearch, Gauge, GitBranch, House, Layers, LogOut, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
+import { Activity, BellRing, Boxes, CircleDollarSign, FolderSearch, Gauge, GitBranch, House, Layers, LogOut, Monitor, Moon, Orbit, Rows3, Search, SquareTerminal, Sun, Target, Waypoints, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
@@ -40,6 +40,7 @@ interface SidebarProps {
   /** How many alerts are open (the record's own count, from /api/alerts). */
   openAlerts: number;
   onShowFleet: () => void;
+  onShowAgents: () => void;
   onShowMissions: () => void;
   onShowGrading: () => void;
   onShowFeatures: () => void;
@@ -79,6 +80,7 @@ export function Sidebar({
   attention,
   openAlerts,
   onShowFleet,
+  onShowAgents,
   onShowMissions,
   onShowGrading,
   onShowFeatures,
@@ -126,6 +128,12 @@ export function Sidebar({
             icon={<House size={15} />}
             label="Home"
             trailing={<AttentionCount {...attention} />}
+          />
+          <NavItem
+            active={view === "agents"}
+            onClick={onShowAgents}
+            icon={<SquareTerminal size={15} />}
+            label="Agents"
           />
           <NavItem
             active={view === "missions"}
@@ -581,6 +589,7 @@ export function MobileNav({
   attention,
   openAlerts,
   onShowFleet,
+  onShowAgents,
   onShowMissions,
   onShowGrading,
   onShowFeatures,
@@ -598,6 +607,7 @@ export function MobileNav({
   | "view"
   | "attention"
   | "onShowFleet"
+  | "onShowAgents"
   | "onShowMissions"
   | "onShowGrading"
   | "onShowFeatures"
@@ -634,6 +644,7 @@ export function MobileNav({
         {(
           [
             ["fleet", "Home", <House key="f" size={13} />, onShowFleet],
+            ["agents", "Agents", <SquareTerminal key="ag" size={13} />, onShowAgents],
             ["missions", "Missions", <Target key="m" size={13} />, onShowMissions],
             ["grading", "Grading", <Layers key="gr" size={13} />, onShowGrading],
             ["features", "Map", <Boxes key="f" size={13} />, onShowFeatures],
