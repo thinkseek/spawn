@@ -1217,3 +1217,71 @@ test("each alert in Needs you names the verb that judges it", () => {
   const halted = needsYou({ ...base, alerts: [] });
   assert.ok(halted.every((entry) => !entry.judge));
 });
+
+test("closed mission digest matches between full /api/missions and ?summary=1 payload (PR #285 R3)", () => {
+  const since = NOW - 24 * HOUR;
+  const fullPayload = {
+    missions: [
+      {
+        id: 42,
+        text: "Closed sprint mission",
+        state: "done",
+        updated_at_ms: NOW - 20 * MIN,
+        halted: null,
+        paused: false,
+        tasks: [1, 2, 3].map((id) => ({
+          id,
+          task_title: `Task ${id}`,
+          state: "landed",
+          brief: "Full brief text that summary strips",
+          report: "Full report text that summary strips",
+          review_note: "LGTM",
+          activity: { current_tool: null, jobs: [] },
+          last_gate: { verdict: "accepted", reason: "all checks green", at_ms: NOW - id * 10 * MIN },
+          stages: [
+            { stage: "assigned", verdict: null, at_ms: NOW - 3 * HOUR, took_ms: 1000, details: "bulky" },
+            { stage: "gated", verdict: "accepted", at_ms: NOW - id * 10 * MIN - 5000, took_ms: 5000, stdout: "long log" },
+            { stage: "landed", verdict: "pass", at_ms: NOW - id * 10 * MIN, took_ms: 200, diff: "big diff" },
+          ],
+        })),
+      },
+    ],
+    residents: [],
+    holds: [],
+  };
+
+  // Mirror `answers::summary_board`: keep light SUMMARY_STAGE_FIELDS on closed missions,
+  // while nulling brief/report/review_note/last_gate/activity.
+  const summaryPayload = {
+    ...fullPayload,
+    missions: fullPayload.missions.map((m) => ({
+      ...m,
+      tasks: m.tasks.map((t) => ({
+        ...t,
+        brief: null,
+        report: null,
+        review_note: null,
+        activity: null,
+        last_gate: null,
+        stages: t.stages.map(({ stage, verdict, at_ms, took_ms }) => ({
+          stage,
+          verdict,
+          at_ms,
+          took_ms,
+        })),
+      })),
+    })),
+  };
+
+  const fullDigest = digestSince(normalizeMissions(fullPayload), [], NOW, since);
+  const summaryDigest = digestSince(normalizeMissions(summaryPayload), [], NOW, since);
+
+  assert.equal(fullDigest.landed, 3);
+  assert.equal(summaryDigest.landed, 3);
+  assert.equal(fullDigest.entries.length, 3);
+  assert.equal(summaryDigest.entries.length, 3);
+  assert.deepEqual(
+    summaryDigest.entries.map((e) => ({ at_ms: e.at_ms, kind: e.kind, text: e.text })),
+    fullDigest.entries.map((e) => ({ at_ms: e.at_ms, kind: e.kind, text: e.text })),
+  );
+});

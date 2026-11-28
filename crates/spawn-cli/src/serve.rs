@@ -5822,10 +5822,24 @@ const STATIC_CACHE_MAX_ENTRIES: usize = 32;
 const STATIC_CACHE_MAX_ENTRY_BYTES: usize = 1024 * 1024;
 const STATIC_CACHE_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
+fn metadata_ino(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
 #[derive(Clone)]
 struct CachedStaticAsset {
     len: u64,
     modified: Option<std::time::SystemTime>,
+    ino: u64,
     etag: String,
     raw: Arc<[u8]>,
     gzip: Option<Arc<[u8]>>,
@@ -5865,9 +5879,10 @@ impl StaticAssetCache {
         path: &Path,
         len: u64,
         modified: Option<std::time::SystemTime>,
+        ino: u64,
     ) -> Option<CachedStaticAsset> {
         if let Some(entry) = self.entries.get(path) {
-            if entry.len == len && entry.modified == modified {
+            if entry.len == len && entry.modified == modified && entry.ino == ino {
                 return Some(entry.clone());
             }
         } else {
@@ -5928,10 +5943,11 @@ fn load_static_asset(
     }
     let len = meta.len();
     let modified = meta.modified().ok();
+    let ino = metadata_ino(&meta);
     if let Some(hit) = cache
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .get_matching(&file, len, modified)
+        .get_matching(&file, len, modified, ino)
     {
         return Some(hit);
     }
@@ -5944,6 +5960,7 @@ fn load_static_asset(
     let asset = CachedStaticAsset {
         len,
         modified,
+        ino,
         etag,
         raw,
         gzip,
@@ -13686,6 +13703,7 @@ mod tests {
         let asset = |raw_len: usize, tag: &str| super::CachedStaticAsset {
             len: raw_len as u64,
             modified: None,
+            ino: 0,
             etag: tag.to_string(),
             raw: Arc::from(vec![b'x'; raw_len]),
             gzip: None,
@@ -13696,7 +13714,7 @@ mod tests {
         assert_eq!(cache.total_bytes, 0);
         assert!(
             cache
-                .get_matching(std::path::Path::new("/oversize.js"), 101, None)
+                .get_matching(std::path::Path::new("/oversize.js"), 101, None, 0)
                 .is_none()
         );
 
@@ -13705,12 +13723,12 @@ mod tests {
         // 80 + 80 > 150, so /a.js is FIFO-evicted.
         assert!(
             cache
-                .get_matching(std::path::Path::new("/a.js"), 80, None)
+                .get_matching(std::path::Path::new("/a.js"), 80, None, 0)
                 .is_none()
         );
         assert!(
             cache
-                .get_matching(std::path::Path::new("/b.js"), 80, None)
+                .get_matching(std::path::Path::new("/b.js"), 80, None, 0)
                 .is_some()
         );
         assert_eq!(cache.total_bytes, 80);

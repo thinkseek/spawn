@@ -653,9 +653,10 @@ fn pick_fields(value: &mut Value, allowed: &[&str]) {
 }
 
 /// Summary view of `/api/missions` for `/api/missions?summary=1`: keeps live
-/// mission/task status, counters, halt context, and light stage/gate summaries
-/// needed by Home, Fleet, and Sidebar while stripping full text excerpts and
-/// closed-mission task details to keep polling payloads small.
+/// mission/task status, counters, halt context, and light stage summaries
+/// needed by Home (`normalizeMissions` + `digestSince`), Fleet, and Sidebar
+/// while stripping full text excerpts, bulky stage details, and closed-mission
+/// `last_gate`/`activity` payloads to keep polling payloads small.
 pub(super) fn summary_board(board: &mut Value) {
     let Some(missions) = board.get_mut("missions").and_then(Value::as_array_mut) else {
         return;
@@ -676,10 +677,12 @@ pub(super) fn summary_board(board: &mut Value) {
             let Some(obj) = task.as_object_mut() else {
                 continue;
             };
-            if folded {
-                if obj.contains_key("stages") {
-                    obj.insert("stages".to_string(), Value::Array(Vec::new()));
+            if let Some(stages) = obj.get_mut("stages").and_then(Value::as_array_mut) {
+                for stage in stages {
+                    pick_fields(stage, SUMMARY_STAGE_FIELDS);
                 }
+            }
+            if folded {
                 if obj.contains_key("last_gate") {
                     obj.insert("last_gate".to_string(), Value::Null);
                 }
@@ -690,11 +693,6 @@ pub(super) fn summary_board(board: &mut Value) {
             }
             if let Some(last_gate) = obj.get_mut("last_gate") {
                 pick_fields(last_gate, SUMMARY_GATE_FIELDS);
-            }
-            if let Some(stages) = obj.get_mut("stages").and_then(Value::as_array_mut) {
-                for stage in stages {
-                    pick_fields(stage, SUMMARY_STAGE_FIELDS);
-                }
             }
         }
     }
@@ -1296,7 +1294,10 @@ mod tests {
                             "review_note": "closed note",
                             "activity": {"idle_ms": 999},
                             "last_gate": {"verdict": "accepted", "reason": "ok", "at_ms": 100},
-                            "stages": [{"stage": "gate", "verdict": "pass", "at_ms": 100, "took_ms": 10}]
+                            "stages": [
+                                {"stage": "gated", "verdict": "accepted", "at_ms": 95, "took_ms": 8, "details": "bulky log"},
+                                {"stage": "landed", "verdict": "pass", "at_ms": 100, "took_ms": 10, "diff": "huge diff"}
+                            ]
                         }
                     ]
                 }
@@ -1327,6 +1328,12 @@ mod tests {
         assert_eq!(closed_task["report"], json!(null));
         assert_eq!(closed_task["last_gate"], json!(null));
         assert_eq!(closed_task["activity"], json!(null));
-        assert_eq!(closed_task["stages"], json!([]));
+        assert_eq!(
+            closed_task["stages"],
+            json!([
+                {"stage": "gated", "verdict": "accepted", "at_ms": 95, "took_ms": 8},
+                {"stage": "landed", "verdict": "pass", "at_ms": 100, "took_ms": 10}
+            ])
+        );
     }
 }
