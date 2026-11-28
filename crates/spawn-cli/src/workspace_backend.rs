@@ -8,33 +8,22 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// (`[storage].workspace_backend`) and the runtime `SPAWN_WORKSPACE_BACKEND` boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceBackend {
-    /// Git working copies: the default when `SPAWN_WORKSPACE_BACKEND` is unset.
-    Git,
-    /// Copy-on-write clones of a per-commit baseline.
-    Cow,
-    /// An unprivileged overlay per workspace (Linux): by name only.
-    Overlay,
-    /// Dual-track oracle wrapping authoritative `git` beside shadow `d6`: opt-in only.
-    D6Shadow,
-    /// Pure-Rust CAS Merkle + ledger workspace store (`D6Workspace`): opt-in only.
-    D6,
     /// The cheapest backend the root supports that the loop serves
     /// (`spawn_host::WorkspaceBackend::auto_with`), chosen once at start.
     Auto,
+    /// An explicit concrete host workspace backend (`git`, `cow`, `overlay`,
+    /// `d6-shadow`, or `d6`).
+    Named(spawn_host::WorkspaceBackend),
 }
 
 impl WorkspaceBackend {
     /// Canonical lowercase backend identifier (`"git"`, `"cow"`, `"overlay"`,
     /// `"d6-shadow"`, `"d6"`, or `"auto"`).
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
-            Self::Git => "git",
-            Self::Cow => "cow",
-            Self::Overlay => "overlay",
-            Self::D6Shadow => "d6-shadow",
-            Self::D6 => "d6",
             Self::Auto => "auto",
+            Self::Named(host) => host.name(),
         }
     }
 
@@ -43,19 +32,7 @@ impl WorkspaceBackend {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "auto" => Some(Self::Auto),
-            other => spawn_host::WorkspaceBackend::parse(other).map(Self::from_host),
-        }
-    }
-
-    /// Convert a concrete host backend into [`WorkspaceBackend`].
-    #[must_use]
-    pub const fn from_host(backend: spawn_host::WorkspaceBackend) -> Self {
-        match backend {
-            spawn_host::WorkspaceBackend::Git => Self::Git,
-            spawn_host::WorkspaceBackend::Cow => Self::Cow,
-            spawn_host::WorkspaceBackend::Overlay => Self::Overlay,
-            spawn_host::WorkspaceBackend::D6Shadow => Self::D6Shadow,
-            spawn_host::WorkspaceBackend::D6 => Self::D6,
+            other => spawn_host::WorkspaceBackend::parse(other).map(Self::Named),
         }
     }
 
@@ -63,12 +40,8 @@ impl WorkspaceBackend {
     #[must_use]
     pub const fn to_host(self) -> Option<spawn_host::WorkspaceBackend> {
         match self {
-            Self::Git => Some(spawn_host::WorkspaceBackend::Git),
-            Self::Cow => Some(spawn_host::WorkspaceBackend::Cow),
-            Self::Overlay => Some(spawn_host::WorkspaceBackend::Overlay),
-            Self::D6Shadow => Some(spawn_host::WorkspaceBackend::D6Shadow),
-            Self::D6 => Some(spawn_host::WorkspaceBackend::D6),
             Self::Auto => None,
+            Self::Named(host) => Some(host),
         }
     }
 }

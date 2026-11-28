@@ -308,7 +308,7 @@ pub(crate) fn loop_interval() -> std::time::Duration {
 /// unset or empty; anything it does not name is refused, never read as git.
 pub(crate) fn workspace_backend(value: Option<&str>) -> Result<WorkspaceBackend, String> {
     match value.map(str::trim) {
-        None | Some("") => Ok(WorkspaceBackend::Git),
+        None | Some("") => Ok(WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Git)),
         Some(name) => WorkspaceBackend::parse(name).ok_or_else(|| {
             format!(
                 "SPAWN_WORKSPACE_BACKEND={name:?} names no workspace backend: use git (the \
@@ -518,7 +518,7 @@ impl WorkspaceSettings {
         probes: &Probes<'_>,
     ) -> Result<Self, String> {
         let active = match configured {
-            WorkspaceBackend::Overlay => {
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay) => {
                 (probes.overlay)(root).map_err(|why| {
                     format!(
                         "SPAWN_WORKSPACE_BACKEND=overlay: no unprivileged overlay under {}: \
@@ -528,13 +528,11 @@ impl WorkspaceSettings {
                 })?;
                 spawn_host::WorkspaceBackend::Overlay
             }
+            WorkspaceBackend::Named(host) => host,
             WorkspaceBackend::Auto => match (probes.marked)(root)? {
                 Some(there) => there,
                 None => spawn_host::WorkspaceBackend::auto_with((probes.cow)(root)),
             },
-            other => other
-                .to_host()
-                .expect("non-auto/overlay variant maps to host backend"),
         };
         Ok(Self {
             configured,
@@ -1302,19 +1300,36 @@ mod workspace_tests {
 
     #[test]
     fn the_workspace_backend_is_git_unless_another_is_named() {
-        assert_eq!(workspace_backend(None), Ok(WorkspaceBackend::Git));
-        assert_eq!(workspace_backend(Some("")), Ok(WorkspaceBackend::Git));
-        assert_eq!(workspace_backend(Some("git")), Ok(WorkspaceBackend::Git));
-        assert_eq!(workspace_backend(Some(" cow ")), Ok(WorkspaceBackend::Cow));
+        use spawn_host::WorkspaceBackend as HostBackend;
+
+        assert_eq!(
+            workspace_backend(None),
+            Ok(WorkspaceBackend::Named(HostBackend::Git))
+        );
+        assert_eq!(
+            workspace_backend(Some("")),
+            Ok(WorkspaceBackend::Named(HostBackend::Git))
+        );
+        assert_eq!(
+            workspace_backend(Some("git")),
+            Ok(WorkspaceBackend::Named(HostBackend::Git))
+        );
+        assert_eq!(
+            workspace_backend(Some(" cow ")),
+            Ok(WorkspaceBackend::Named(HostBackend::Cow))
+        );
         assert_eq!(
             workspace_backend(Some("overlay")),
-            Ok(WorkspaceBackend::Overlay)
+            Ok(WorkspaceBackend::Named(HostBackend::Overlay))
         );
         assert_eq!(
             workspace_backend(Some("d6-shadow")),
-            Ok(WorkspaceBackend::D6Shadow)
+            Ok(WorkspaceBackend::Named(HostBackend::D6Shadow))
         );
-        assert_eq!(workspace_backend(Some(" d6 ")), Ok(WorkspaceBackend::D6));
+        assert_eq!(
+            workspace_backend(Some(" d6 ")),
+            Ok(WorkspaceBackend::Named(HostBackend::D6))
+        );
         assert_eq!(workspace_backend(Some("auto")), Ok(WorkspaceBackend::Auto));
         for unknown in ["Git", "COW", "btrfs", "zfs", "overlayfs", "d6_shadow", "1"] {
             let error = workspace_backend(Some(unknown)).expect_err(unknown);
@@ -1343,21 +1358,14 @@ mod workspace_tests {
         let root = Path::new("/srv/work");
         let none = |_: &Path| Err("user namespaces are off".to_string());
         let clones = |_: &Path| true;
-        let error = WorkspaceSettings::resolve(
-            WorkspaceBackend::Overlay,
-            false,
-            root,
-            &probes(&none, &clones),
-        )
-        .expect_err("refused");
+        let overlay = WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay);
+        let error = WorkspaceSettings::resolve(overlay, false, root, &probes(&none, &clones))
+            .expect_err("refused");
         assert!(error.contains("SPAWN_WORKSPACE_BACKEND=overlay"), "{error}");
         assert!(error.contains("user namespaces are off"), "{error}");
         assert!(error.contains("/srv/work"), "{error}");
         #[cfg(not(target_os = "linux"))]
-        assert!(
-            WorkspaceSettings::resolve(WorkspaceBackend::Overlay, false, root, &Probes::host())
-                .is_err()
-        );
+        assert!(WorkspaceSettings::resolve(overlay, false, root, &Probes::host()).is_err());
     }
 
     /// `auto` is spawn-host's rule: Cow where clones work, else Git, and
@@ -1395,8 +1403,14 @@ mod workspace_tests {
         // Asked for by name, git and cow need no probe.
         let never_cow = |_: &Path| -> bool { panic!("no probe for a named backend") };
         for (configured, backend) in [
-            (WorkspaceBackend::Git, spawn_host::WorkspaceBackend::Git),
-            (WorkspaceBackend::Cow, spawn_host::WorkspaceBackend::Cow),
+            (
+                WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Git),
+                spawn_host::WorkspaceBackend::Git,
+            ),
+            (
+                WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Cow),
+                spawn_host::WorkspaceBackend::Cow,
+            ),
         ] {
             let settings =
                 WorkspaceSettings::resolve(configured, true, root, &probes(&never, &never_cow))
@@ -1422,7 +1436,7 @@ mod workspace_tests {
             "workspace backend cow under /srv/work (SPAWN_WORKSPACE_BACKEND=auto); cas dedup on"
         );
         let git = WorkspaceSettings::resolve(
-            WorkspaceBackend::Git,
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Git),
             true,
             root,
             &probes(&mounts, &clones),
@@ -1433,7 +1447,7 @@ mod workspace_tests {
         assert_eq!(git.store(Path::new("/r.git"), root).backend_name(), "git");
         assert_eq!(auto.store(Path::new("/r.git"), root).backend_name(), "cow");
         let overlay = WorkspaceSettings::resolve(
-            WorkspaceBackend::Overlay,
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay),
             false,
             root,
             &probes(&mounts, &clones),
@@ -1453,9 +1467,15 @@ mod workspace_tests {
     /// alone, a conflict said as the loop would refuse it.
     #[test]
     fn a_peek_reads_the_marker_and_names_a_conflict() {
+        use spawn_host::WorkspaceBackend as HostBackend;
+
         let peek = WorkspaceSettings::peek_with;
         assert_eq!(
-            peek(Ok(WorkspaceBackend::Git), Ok(false), Ok(None)),
+            peek(
+                Ok(WorkspaceBackend::Named(HostBackend::Git)),
+                Ok(false),
+                Ok(None)
+            ),
             json!({"configured": "git", "active": "git", "root": null, "cas_dedup": "off",
                    "servable": true})
         );
@@ -1468,20 +1488,24 @@ mod workspace_tests {
             peek(
                 Ok(WorkspaceBackend::Auto),
                 Ok(true),
-                Ok(Some(spawn_host::WorkspaceBackend::Cow))
+                Ok(Some(HostBackend::Cow))
             ),
             json!({"configured": "auto", "active": "cow", "root": "cow", "cas_dedup": "on",
                    "servable": true})
         );
         assert_eq!(
-            peek(Ok(WorkspaceBackend::Overlay), Ok(false), Ok(None)),
+            peek(
+                Ok(WorkspaceBackend::Named(HostBackend::Overlay)),
+                Ok(false),
+                Ok(None)
+            ),
             json!({"configured": "overlay", "active": "overlay", "root": null,
                    "cas_dedup": "off", "servable": false})
         );
         let conflict = peek(
-            Ok(WorkspaceBackend::Cow),
+            Ok(WorkspaceBackend::Named(HostBackend::Cow)),
             Ok(false),
-            Ok(Some(spawn_host::WorkspaceBackend::Git)),
+            Ok(Some(HostBackend::Git)),
         );
         assert!(
             conflict["error"]
@@ -1560,7 +1584,7 @@ mod workspace_tests {
         let mounts = |_: &Path| Ok(());
         let clones = |_: &Path| true;
         let overlay = WorkspaceSettings::resolve(
-            WorkspaceBackend::Overlay,
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay),
             false,
             &root,
             &probes(&mounts, &clones),
@@ -1577,7 +1601,7 @@ mod workspace_tests {
         );
         assert_eq!(spawn_host::root_backend(&root).unwrap(), None);
         let cow = WorkspaceSettings::resolve(
-            WorkspaceBackend::Cow,
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Cow),
             false,
             &root,
             &probes(&mounts, &clones),
@@ -1693,21 +1717,23 @@ mod workspace_tests {
 
     #[test]
     fn d6_shadow_and_d6_compatibility_in_resolve_and_peek() {
+        use spawn_host::WorkspaceBackend as HostBackend;
+
         let peek = WorkspaceSettings::peek_with;
         // git root allows d6-shadow (active=d6-shadow, root=git), refuses pure d6
         assert_eq!(
             peek(
-                Ok(WorkspaceBackend::D6Shadow),
+                Ok(WorkspaceBackend::Named(HostBackend::D6Shadow)),
                 Ok(false),
-                Ok(Some(spawn_host::WorkspaceBackend::Git))
+                Ok(Some(HostBackend::Git))
             ),
             json!({"configured": "d6-shadow", "active": "d6-shadow", "root": "git",
                    "cas_dedup": "off", "servable": true})
         );
         let refused_d6 = peek(
-            Ok(WorkspaceBackend::D6),
+            Ok(WorkspaceBackend::Named(HostBackend::D6)),
             Ok(false),
-            Ok(Some(spawn_host::WorkspaceBackend::Git)),
+            Ok(Some(HostBackend::Git)),
         );
         assert!(
             refused_d6["error"]
@@ -1719,17 +1745,17 @@ mod workspace_tests {
         // pure d6 root refuses git and d6-shadow
         assert!(
             peek(
-                Ok(WorkspaceBackend::Git),
+                Ok(WorkspaceBackend::Named(HostBackend::Git)),
                 Ok(false),
-                Ok(Some(spawn_host::WorkspaceBackend::D6))
+                Ok(Some(HostBackend::D6))
             )["error"]
                 .is_string()
         );
         assert!(
             peek(
-                Ok(WorkspaceBackend::D6Shadow),
+                Ok(WorkspaceBackend::Named(HostBackend::D6Shadow)),
                 Ok(false),
-                Ok(Some(spawn_host::WorkspaceBackend::D6))
+                Ok(Some(HostBackend::D6))
             )["error"]
                 .is_string()
         );
@@ -1738,10 +1764,10 @@ mod workspace_tests {
         let never_cow = |_: &Path| -> bool { panic!("no cow probe for d6") };
         for (cfg, eng) in [
             (
-                WorkspaceBackend::D6Shadow,
-                spawn_host::WorkspaceBackend::D6Shadow,
+                WorkspaceBackend::Named(HostBackend::D6Shadow),
+                HostBackend::D6Shadow,
             ),
-            (WorkspaceBackend::D6, spawn_host::WorkspaceBackend::D6),
+            (WorkspaceBackend::Named(HostBackend::D6), HostBackend::D6),
         ] {
             let s = WorkspaceSettings::resolve(
                 cfg,

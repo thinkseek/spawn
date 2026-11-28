@@ -1928,7 +1928,11 @@ fn collect_config_warnings(cfg: &SpawnConfig, warnings: &mut Vec<String>) {
             }
         }
     }
-    if cfg.storage.workspace_backend == Some(WorkspaceBackend::Overlay) {
+    if cfg.storage.workspace_backend
+        == Some(WorkspaceBackend::Named(
+            spawn_host::WorkspaceBackend::Overlay,
+        ))
+    {
         warnings.push(
             "storage.workspace_backend = \"overlay\" is experimental and refused by `spawn loop`"
                 .to_string(),
@@ -2051,8 +2055,7 @@ pub fn exec_with_config(
 }
 
 struct ParsedCliFlags {
-    config_path: Option<PathBuf>,
-    config_path_origin: Option<ConfigOrigin>,
+    config: Option<(PathBuf, ConfigOrigin)>,
     switches: BTreeSet<String>,
     values: BTreeMap<String, String>,
 }
@@ -2116,18 +2119,18 @@ fn parse_config_flag(
         return Err(format!("unknown flag --{name}"));
     }
 
-    let (config_path, config_path_origin) = if let Some(val) = values.get("config").cloned() {
-        (Some(PathBuf::from(val)), Some(ConfigOrigin::Flag))
+    let config = if let Some(val) = values.get("config").cloned() {
+        Some((PathBuf::from(val), ConfigOrigin::Flag))
     } else if let Some(val) = global_config {
-        (Some(PathBuf::from(val)), Some(ConfigOrigin::Flag))
-    } else if let Some(val) = std::env::var("SPAWN_CONFIG").ok().filter(|v| !v.is_empty()) {
-        (Some(PathBuf::from(val)), Some(ConfigOrigin::Env))
+        Some((PathBuf::from(val), ConfigOrigin::Flag))
     } else {
-        (None, None)
+        std::env::var("SPAWN_CONFIG")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|val| (PathBuf::from(val), ConfigOrigin::Env))
     };
     Ok(ParsedCliFlags {
-        config_path,
-        config_path_origin,
+        config,
         switches,
         values,
     })
@@ -2152,7 +2155,7 @@ pub fn config_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
 fn cmd_config_check(global_config: Option<&str>, args: &[String]) -> Result<i32, String> {
     let parsed = parse_config_flag(args, global_config, &["json"], &[])?;
     let json_mode = parsed.switches.contains("json");
-    let Some(path) = parsed.config_path else {
+    let Some((path, _)) = parsed.config else {
         return Err("missing config path: pass --config <path> or set SPAWN_CONFIG".to_string());
     };
     let report = evaluate_config_check(&path);
@@ -2179,7 +2182,7 @@ fn cmd_config_check(global_config: Option<&str>, args: &[String]) -> Result<i32,
 fn cmd_config_effective(global_config: Option<&str>, args: &[String]) -> Result<i32, String> {
     let parsed = parse_config_flag(args, global_config, &["json"], &[])?;
     let json_mode = parsed.switches.contains("json");
-    let Some(path) = parsed.config_path else {
+    let Some((path, _)) = parsed.config else {
         return Err("missing config path: pass --config <path> or set SPAWN_CONFIG".to_string());
     };
     let cfg = SpawnConfig::from_file(&path)?;
@@ -2619,9 +2622,9 @@ fn cmd_config_docker_plan(global_config: Option<&str>, rest: &[String]) -> Resul
     let parsed = parse_config_flag(rest, global_config, &["json"], &["data-dir", "image"])?;
     let json_mode = parsed.switches.contains("json");
     let loaded = parsed
-        .config_path
+        .config
         .as_ref()
-        .map(|p| SpawnConfig::from_file(p))
+        .map(|(p, _)| SpawnConfig::from_file(p))
         .transpose()?;
     let data_dir = parsed
         .values
@@ -2640,7 +2643,7 @@ fn cmd_config_docker_plan(global_config: Option<&str>, rest: &[String]) -> Resul
         .unwrap_or_else(|| "spawn:latest".to_string());
 
     let plan = build_docker_plan_report(
-        parsed.config_path.as_deref(),
+        parsed.config.as_ref().map(|(p, _)| p.as_path()),
         &data_dir,
         repo.as_deref(),
         &image,
@@ -2659,10 +2662,9 @@ fn cmd_config_docker_plan(global_config: Option<&str>, rest: &[String]) -> Resul
 pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i32, String> {
     let parsed = parse_config_flag(rest, global_config, &["json"], &["root"])?;
     let json_mode = parsed.switches.contains("json");
-    let config_path = parsed.config_path;
-    let config_path_origin = parsed.config_path_origin;
+    let config = parsed.config;
 
-    let loaded_config = if let Some(path) = &config_path {
+    let loaded_config = if let Some((path, _)) = &config {
         Some(SpawnConfig::from_file(path)?)
     } else {
         None
@@ -2673,10 +2675,8 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
         resolve_doctor_probe_root(explicit_root.as_deref(), loaded_config.as_ref());
 
     let report = build_doctor_report(
-        config_path.as_deref(),
-        config_path_origin,
-        &workspaces_or_root,
-        probe_root_origin,
+        config.as_ref().map(|(p, o)| (p.as_path(), *o)),
+        (&workspaces_or_root, probe_root_origin),
         explicit_root.as_deref(),
         loaded_config.as_ref(),
     );
@@ -2692,13 +2692,12 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
 }
 
 fn build_doctor_report(
-    config_path: Option<&Path>,
-    config_path_origin: Option<ConfigOrigin>,
-    probe_root: &Path,
-    probe_root_origin: ConfigOrigin,
+    config: Option<(&Path, ConfigOrigin)>,
+    probe_root: (&Path, ConfigOrigin),
     explicit_root: Option<&Path>,
     loaded_config: Option<&SpawnConfig>,
 ) -> Value {
+    let (probe_root, probe_root_origin) = probe_root;
     let toolchain_paths: Vec<String> = loaded_config
         .and_then(|cfg| cfg.terminal.toolchain_paths.clone())
         .unwrap_or_default();
@@ -2738,8 +2737,8 @@ fn build_doctor_report(
 
     json!({
         "ok": git["ok"].as_bool().unwrap_or(false) && kernel["ok"].as_bool().unwrap_or(false),
-        "config_path": config_path,
-        "config_path_origin": config_path_origin.map(ConfigOrigin::as_str),
+        "config_path": config.map(|(path, _)| path),
+        "config_path_origin": config.map(|(_, origin)| origin.as_str()),
         "probe_root": probe_root,
         "probe_root_origin": probe_root_origin.as_str(),
         "kernel": kernel,

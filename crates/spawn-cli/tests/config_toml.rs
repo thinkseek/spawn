@@ -1717,7 +1717,7 @@ workspace_backend = "d6"
     let subref_url_cfg = SpawnConfig::from_toml_str(subref_url_toml).expect("subref url parses");
     assert_eq!(
         subref_url_cfg.storage.workspace_backend,
-        Some(WorkspaceBackend::D6)
+        Some(WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6))
     );
     let url_env = env_map(&[("PROBE_DB_URL", "postgres://u:pw@127.0.0.1:5432/db")]);
     let subref_url_eff =
@@ -1734,34 +1734,17 @@ workspace_backend = "d6"
 #[test]
 fn workspace_backend_host_roundtrip_and_auto() {
     let concrete = [
-        (
-            spawn_host::WorkspaceBackend::Git,
-            WorkspaceBackend::Git,
-            "git",
-        ),
-        (
-            spawn_host::WorkspaceBackend::Cow,
-            WorkspaceBackend::Cow,
-            "cow",
-        ),
-        (
-            spawn_host::WorkspaceBackend::Overlay,
-            WorkspaceBackend::Overlay,
-            "overlay",
-        ),
-        (
-            spawn_host::WorkspaceBackend::D6Shadow,
-            WorkspaceBackend::D6Shadow,
-            "d6-shadow",
-        ),
-        (spawn_host::WorkspaceBackend::D6, WorkspaceBackend::D6, "d6"),
+        (spawn_host::WorkspaceBackend::Git, "git"),
+        (spawn_host::WorkspaceBackend::Cow, "cow"),
+        (spawn_host::WorkspaceBackend::Overlay, "overlay"),
+        (spawn_host::WorkspaceBackend::D6Shadow, "d6-shadow"),
+        (spawn_host::WorkspaceBackend::D6, "d6"),
     ];
-    for (host, cfg_variant, name) in concrete {
-        let converted = WorkspaceBackend::from_host(host);
-        assert_eq!(converted, cfg_variant);
+    for (host, name) in concrete {
+        let converted = WorkspaceBackend::Named(host);
         assert_eq!(converted.to_host(), Some(host));
         assert_eq!(converted.name(), name);
-        assert_eq!(WorkspaceBackend::parse(name), Some(cfg_variant));
+        assert_eq!(WorkspaceBackend::parse(name), Some(converted));
     }
     assert_eq!(WorkspaceBackend::Auto.to_host(), None);
     assert_eq!(WorkspaceBackend::Auto.name(), "auto");
