@@ -6103,3 +6103,94 @@ fn sharded_bridge_rejects_mixed_totals_duplicate_slots_and_missing_shards_fail_c
         shard_four,
     );
 }
+
+#[test]
+fn concurrent_first_claim_with_mixed_shard_totals_rejects_cleanly_without_deadlock() {
+    use spawn_core::port::StoreError;
+    use std::sync::Barrier;
+
+    let _budget = ApiBudgetGuard::exclusive();
+    let shard_zero_of_2 = BridgeShard::partition(0, 2).expect("0/2");
+    let principal = Principal::new("tester").expect("principal");
+
+    for round in 0..4_u32 {
+        let (store_a, schema) = store(&format!("concurrent_first_claim_{round}"));
+        let store_b =
+            PostgresStore::connect_in_schema(&url(), schema.name()).expect("connect store_b");
+        let session = (1..1_000_u64)
+            .map(|n| SessionId::new(format!("session_conc_{round}_{n}")).expect("session"))
+            .find(|sid| shard_zero_of_2.owns_session(sid))
+            .expect("0/2 session");
+        let _cmd = store_a
+            .submit(
+                &principal,
+                &start_for("agent_conc", session, &format!("conc-k-{round}")),
+            )
+            .expect("submit open command before topology initialization");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let (res_all, res_sharded) = std::thread::scope(|s| {
+            let b_all = Arc::clone(&barrier);
+            let st_a = &store_a;
+            let h_all = s.spawn(move || {
+                b_all.wait();
+                st_a.claim("concurrent-all", Duration::from_mins(1))
+            });
+
+            let b_sharded = Arc::clone(&barrier);
+            let st_b = &store_b;
+            let h_sharded = s.spawn(move || {
+                b_sharded.wait();
+                st_b.claim_for_shard("concurrent-0-of-2", Duration::from_mins(1), shard_zero_of_2)
+            });
+
+            (
+                h_all.join().expect("join all claim"),
+                h_sharded.join().expect("join sharded claim"),
+            )
+        });
+
+        let winning_total = match (res_all, res_sharded) {
+            (Ok(claimed), Err(StoreError::Rejected(_))) => {
+                assert!(
+                    claimed.is_some(),
+                    "round {round}: winning unsharded claim must lease command"
+                );
+                1_i32
+            }
+            (Err(StoreError::Rejected(_)), Ok(claimed)) => {
+                assert!(
+                    claimed.is_some(),
+                    "round {round}: winning 0/2 claim must lease command"
+                );
+                2_i32
+            }
+            (left, right) => panic!(
+                "round {round}: expected exactly one Ok and one Rejected (23P01), got left={left:?}, right={right:?}"
+            ),
+        };
+
+        let mut client = admin(schema.name());
+        let topology_total: i32 = client
+            .query_one(
+                "select shard_total from spawn_shard_topology where singleton",
+                &[],
+            )
+            .expect("topology total")
+            .get(0);
+        assert_eq!(topology_total, winning_total);
+
+        let wrong_open: i64 = client
+            .query_one(
+                "select count(*) from spawn_commands
+                  where state not in ('finished', 'failed', 'cancelled')
+                    and shard_total is distinct from $1",
+                &[&winning_total],
+            )
+            .expect("open command backfill consistency")
+            .get(0);
+        assert_eq!(wrong_open, 0);
+
+        drop((client, store_a, store_b, schema));
+    }
+}

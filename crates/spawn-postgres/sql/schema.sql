@@ -636,6 +636,7 @@ create or replace function spawn_claim(
 ) language plpgsql as $$
 declare
     v_active_total integer;
+    v_inserted     integer;
 begin
     perform spawn_lock_migrate_shared();
     select t.shard_total into v_active_total
@@ -649,26 +650,29 @@ begin
     end if;
 
     if v_active_total is null then
-        perform pg_advisory_xact_lock(1399957403, hashtext(current_schema()));
+        insert into spawn_shard_topology (singleton, shard_total, updated_at_ms)
+        values (true, 1, spawn_now_ms())
+        on conflict (singleton) do nothing;
+        get diagnostics v_inserted = row_count;
+
         select t.shard_total into v_active_total
         from spawn_shard_topology t
         where t.singleton
         for update;
-        if v_active_total is null then
-            insert into spawn_shard_topology (singleton, shard_total, updated_at_ms)
-            values (true, 1, spawn_now_ms())
-            on conflict (singleton) do nothing;
 
+        if v_active_total is distinct from 1 then
+            raise exception 'Bridge claim shard total 1 conflicts with active shard topology %',
+                            v_active_total
+                using errcode = '23P01';
+        end if;
+
+        if v_inserted > 0 then
             update spawn_commands c
             set shard_total = 1,
                 shard_index = 0
             where c.state not in ('finished', 'failed', 'cancelled')
               and (c.shard_total is distinct from 1
                    or c.shard_index is distinct from 0);
-        elsif v_active_total <> 1 then
-            raise exception 'Bridge claim shard total 1 conflicts with active shard topology %',
-                            v_active_total
-                using errcode = '23P01';
         end if;
     end if;
 
@@ -792,8 +796,7 @@ declare
 begin
     select t.shard_total into v_total
     from spawn_shard_topology t
-    where t.singleton
-    for share;
+    where t.singleton;
 
     if v_total is not null then
         new.shard_total := v_total;
@@ -821,6 +824,7 @@ create or replace function spawn_register_bridge_shard(
 ) returns void language plpgsql as $$
 declare
     v_active_total integer;
+    v_inserted     integer;
     v_live_count   integer;
     v_db_oid       oid := (select oid from pg_database where datname = current_database());
     v_now          bigint;
@@ -839,8 +843,19 @@ begin
             using errcode = '22023';
     end if;
 
-    perform pg_advisory_xact_lock(1399957403, hashtext(current_schema()));
     v_now := spawn_now_ms();
+
+    -- Acquire topology row lock via singleton PK before touching spawn_bridge_shards
+    -- so concurrent registrations/claims never invert row lock order.
+    insert into spawn_shard_topology (singleton, shard_total, updated_at_ms)
+    values (true, p_shard_total, v_now)
+    on conflict (singleton) do nothing;
+    get diagnostics v_inserted = row_count;
+
+    select t.shard_total into v_active_total
+    from spawn_shard_topology t
+    where t.singleton
+    for update;
 
     delete from spawn_bridge_shards s
     where not exists (
@@ -855,26 +870,18 @@ begin
                                       then 4294967296 else 0 end)::integer = s.lock_key
     );
 
-    select t.shard_total into v_active_total
-    from spawn_shard_topology t
-    where t.singleton
-    for update;
-
     select count(*) into v_live_count
     from spawn_bridge_shards s
     where s.worker <> p_worker;
 
-    if v_active_total is null then
-        insert into spawn_shard_topology (singleton, shard_total, updated_at_ms)
-        values (true, p_shard_total, v_now);
-
+    if v_inserted > 0 then
         update spawn_commands c
         set shard_total = p_shard_total,
             shard_index = spawn_fnv1a_shard_index(c.session_id, p_shard_total)
         where c.state not in ('finished', 'failed', 'cancelled')
           and (c.shard_total is distinct from p_shard_total
                or c.shard_index is distinct from spawn_fnv1a_shard_index(c.session_id, p_shard_total));
-    elsif v_active_total <> p_shard_total then
+    elsif v_active_total is distinct from p_shard_total then
         if v_live_count > 0 then
             raise exception 'Bridge shard total % conflicts with active shard topology %',
                             p_shard_total, v_active_total
@@ -990,6 +997,7 @@ create or replace function spawn_claim_shard(
 ) language plpgsql security definer as $$
 declare
     v_active_total integer;
+    v_inserted     integer;
 begin
     perform spawn_lock_migrate_shared();
     if spawn_mission_caller() is distinct from 'owner' then
@@ -1016,26 +1024,29 @@ begin
     end if;
 
     if v_active_total is null then
-        perform pg_advisory_xact_lock(1399957403, hashtext(current_schema()));
+        insert into spawn_shard_topology (singleton, shard_total, updated_at_ms)
+        values (true, p_shard_total, spawn_now_ms())
+        on conflict (singleton) do nothing;
+        get diagnostics v_inserted = row_count;
+
         select t.shard_total into v_active_total
         from spawn_shard_topology t
         where t.singleton
         for update;
-        if v_active_total is null then
-            insert into spawn_shard_topology (singleton, shard_total, updated_at_ms)
-            values (true, p_shard_total, spawn_now_ms())
-            on conflict (singleton) do nothing;
 
+        if v_active_total is distinct from p_shard_total then
+            raise exception 'Bridge claim shard total % conflicts with active shard topology %',
+                            p_shard_total, v_active_total
+                using errcode = '23P01';
+        end if;
+
+        if v_inserted > 0 then
             update spawn_commands c
             set shard_total = p_shard_total,
                 shard_index = spawn_fnv1a_shard_index(c.session_id, p_shard_total)
             where c.state not in ('finished', 'failed', 'cancelled')
               and (c.shard_total is distinct from p_shard_total
                    or c.shard_index is distinct from spawn_fnv1a_shard_index(c.session_id, p_shard_total));
-        elsif v_active_total <> p_shard_total then
-            raise exception 'Bridge claim shard total % conflicts with active shard topology %',
-                            p_shard_total, v_active_total
-                using errcode = '23P01';
         end if;
     end if;
 
