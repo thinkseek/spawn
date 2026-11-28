@@ -1652,6 +1652,7 @@ fn pg_reversible_cutover_shadow_d6_l1_and_border_roundtrip_drill() {
         scratch.join("shadow-d6-work"),
         shadow_cas.clone(),
         shadow_dyn,
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
     )
     .with_strict_fail_closed(true);
     let shadow_store =
@@ -1759,8 +1760,12 @@ fn pg_reversible_cutover_shadow_d6_l1_and_border_roundtrip_drill() {
     // Stage 3: Native LocalWorkspaceStore::D6 full lifecycle on L1 tmpfs (zero git subprocesses).
     let tmpfs_guard = DevShmGuard::new("cutover-drill");
     let prod_dyn: DynRefLedger = prod_pg.clone();
-    let d6_opts = D6StoreOptions::new(prod_cas.clone(), prod_dyn)
-        .with_l1_policy(L1TmpfsPolicy::new(&tmpfs_guard.0, 128));
+    let d6_opts = D6StoreOptions::new(
+        prod_cas.clone(),
+        prod_dyn,
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_l1_policy(L1TmpfsPolicy::new(&tmpfs_guard.0, 128));
     let d6_store = LocalWorkspaceStore::d6("cutover-drill", scratch.join("d6-disk"), d6_opts);
     assert_eq!(d6_store.backend_name(), "d6");
 
@@ -2325,7 +2330,11 @@ fn concurrent_workspace_lifecycle_races_git_d6_shadow_and_d6_with_border_fsck() 
 
     // 1. Git backend concurrent storm.
     let git_bare = seed_bare_repo_for_storm(&scratch, "git");
-    let git_store = LocalWorkspaceStore::git(&git_bare, scratch.join("ws-git"));
+    let git_store = LocalWorkspaceStore::git(
+        &git_bare,
+        scratch.join("ws-git"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     git_store.claim().expect("claim git");
     let _git_m = run_store_storm_harness(&git_store, "git", true);
     assert_git_fsck_clean(&git_bare);
@@ -2336,8 +2345,13 @@ fn concurrent_workspace_lifecycle_races_git_d6_shadow_and_d6_with_border_fsck() 
         Arc::new(CasMerkleStore::open(scratch.join("shadow-cas")).expect("shadow cas"));
     let shadow_ledger = Arc::new(PgRefLedger::connect_isolated("chaos_ws_shadow"));
     let shadow_dyn: DynRefLedger = shadow_ledger.clone();
-    let shadow_opts = D6ShadowOptions::new(scratch.join("shadow-d6-work"), shadow_cas, shadow_dyn)
-        .with_strict_fail_closed(true);
+    let shadow_opts = D6ShadowOptions::new(
+        scratch.join("shadow-d6-work"),
+        shadow_cas,
+        shadow_dyn,
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_strict_fail_closed(true);
     let shadow_store =
         LocalWorkspaceStore::d6_shadow(&shadow_bare, scratch.join("ws-shadow"), shadow_opts);
     shadow_store.claim().expect("claim d6-shadow");
@@ -2385,7 +2399,7 @@ fn concurrent_workspace_lifecycle_races_git_d6_shadow_and_d6_with_border_fsck() 
     cutover.step7_resume_dispatch().expect("step7");
 
     let d6_dyn: DynRefLedger = d6_ledger.clone();
-    let d6_opts = D6StoreOptions::new(d6_cas.clone(), d6_dyn);
+    let d6_opts = D6StoreOptions::new(d6_cas.clone(), d6_dyn, spawn_host::DEFAULT_MAX_FILE_BYTES);
     let d6_store = LocalWorkspaceStore::d6("chaos-d6-proj", scratch.join("ws-d6"), d6_opts);
     d6_store.claim().expect("claim d6");
     let _d6_m = run_store_storm_harness(&d6_store, "d6", true);
@@ -2423,15 +2437,21 @@ fn d6_l1_tmpfs_budget_exhaustion_backpressure_fallback_and_recovery() {
     let policy = L1TmpfsPolicy::new(&tmpfs_guard.0, 1)
         .with_per_workspace_quota_bytes(800 * 1024)
         .with_flush_threshold_pct(80);
-    let d6 = D6Workspace::new("l1-chaos-proj", &disk_root, cas.clone(), ledger.clone())
-        .with_l1_policy(policy.clone())
-        .with_l1_memory_probe(Arc::new(move |_| {
-            Some(HostMemorySample {
-                total_bytes: 512 * gib,
-                available_bytes: 400 * gib,
-                tmpfs_available_bytes: Some(avail_probe.load(Ordering::Relaxed)),
-            })
-        }));
+    let d6 = D6Workspace::new(
+        "l1-chaos-proj",
+        &disk_root,
+        cas.clone(),
+        ledger.clone(),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_l1_policy(policy.clone())
+    .with_l1_memory_probe(Arc::new(move |_| {
+        Some(HostMemorySample {
+            total_bytes: 512 * gib,
+            available_bytes: 400 * gib,
+            tmpfs_available_bytes: Some(avail_probe.load(Ordering::Relaxed)),
+        })
+    }));
 
     // Seed 600 KiB main snapshot in CAS + PG ledger.
     let seed_payload = vec![0x4B_u8; 600 * 1024];

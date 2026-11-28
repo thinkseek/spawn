@@ -3168,7 +3168,7 @@ fn a_recorded_checkpoint_whose_push_was_lost_is_pushed_again_and_fresh() {
     let task = ready_task(&db, db.reported_task(mission, "lost"));
     let root = base.join("host");
     let mirror = crate::sources::ensure_mirror(&root, Some(&source)).expect("mirror");
-    let host = spawn_host::GitWorkspace::new(&mirror, &root);
+    let host = spawn_host::GitWorkspace::new(&mirror, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     let branch = BranchName::new(task.agent_id.as_str()).expect("branch");
     host.ensure_branch(&branch, None).expect("branch");
     let workspace = host.mount(&branch).expect("mount");
@@ -10254,7 +10254,7 @@ fn a_checkpoint_from_before_the_rewrite_is_never_pushed_again() {
     let task = ready_task(&db, db.reported_task(mission, "dropped"));
     let root = base.join("host");
     let mirror = crate::sources::ensure_mirror(&root, Some(&source)).expect("mirror");
-    let host = spawn_host::GitWorkspace::new(&mirror, &root);
+    let host = spawn_host::GitWorkspace::new(&mirror, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     let branch = BranchName::new(task.agent_id.as_str()).expect("branch");
     host.ensure_branch(&branch, None).expect("branch");
     let workspace = host.mount(&branch).expect("mount");

@@ -79,10 +79,22 @@ fn code<T: std::fmt::Debug>(result: Result<T, WorkspaceError>) -> String {
 /// Every backend this host runs, each over a root of its own under `base`.
 fn engines(base: &Path, repo: &Path) -> Vec<LocalWorkspaceStore> {
     let mut stores = vec![
-        LocalWorkspaceStore::git(repo, base.join("git-root")),
-        LocalWorkspaceStore::cow(repo, base.join("cow-root")),
+        LocalWorkspaceStore::git(
+            repo,
+            base.join("git-root"),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        ),
+        LocalWorkspaceStore::cow(
+            repo,
+            base.join("cow-root"),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        ),
     ];
-    match LocalWorkspaceStore::overlay(repo, base.join("overlay-root")) {
+    match LocalWorkspaceStore::overlay(
+        repo,
+        base.join("overlay-root"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    ) {
         Ok(store) => stores.push(store),
         Err(why) => eprintln!("overlay backend skipped: {why}"),
     }
@@ -130,15 +142,17 @@ fn constructors_name_their_engine_and_auto_picks_the_cheapest_supported() {
     let scratch = Scratch::new("local-store-names");
     let repo = seed(&scratch);
     assert_eq!(
-        LocalWorkspaceStore::git(&repo, scratch.join("g")).backend_name(),
+        LocalWorkspaceStore::git(&repo, scratch.join("g"), spawn_host::DEFAULT_MAX_FILE_BYTES)
+            .backend_name(),
         "git"
     );
     assert_eq!(
-        LocalWorkspaceStore::cow(&repo, scratch.join("c")).backend_name(),
+        LocalWorkspaceStore::cow(&repo, scratch.join("c"), spawn_host::DEFAULT_MAX_FILE_BYTES)
+            .backend_name(),
         "cow"
     );
     let root = scratch.join("auto");
-    let auto = LocalWorkspaceStore::auto(&repo, &root);
+    let auto = LocalWorkspaceStore::auto(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     // Never the overlay, even where the kernel mounts one: an engine the
     // loop starts would not see its files.
     let expected = if spawn_host::cow_clone_supported(&root) {
@@ -157,11 +171,17 @@ fn constructors_name_their_engine_and_auto_picks_the_cheapest_supported() {
         assert_eq!(WorkspaceBackend::parse(backend.name()), Some(backend));
     }
     assert_eq!(WorkspaceBackend::parse("auto"), None);
-    let opened = LocalWorkspaceStore::open(WorkspaceBackend::Cow, &repo, scratch.join("c2"));
+    let opened = LocalWorkspaceStore::open(
+        WorkspaceBackend::Cow,
+        &repo,
+        scratch.join("c2"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     assert_eq!(opened.unwrap().backend(), WorkspaceBackend::Cow);
     assert_eq!(auto.root(), spawn_host::canonical_root(&root));
     assert_eq!(auto.cas_root(), auto.root().join(spawn_host::CAS_DIRECTORY));
-    match LocalWorkspaceStore::overlay(&repo, scratch.join("o")) {
+    match LocalWorkspaceStore::overlay(&repo, scratch.join("o"), spawn_host::DEFAULT_MAX_FILE_BYTES)
+    {
         Ok(store) => assert_eq!(store.backend_name(), "overlay"),
         Err(why) => assert!(why.contains("overlay"), "{why}"),
     }
@@ -392,7 +412,11 @@ fn a_file_in_the_way_of_the_start_is_moved_aside_in_cow_and_overlay() {
 fn cas_dedup_shares_artifacts_and_never_touches_transcripts() {
     let scratch = Scratch::new("local-store-cas");
     let repo = seed(&scratch);
-    let store = LocalWorkspaceStore::cow(&repo, scratch.join("cow-root"));
+    let store = LocalWorkspaceStore::cow(
+        &repo,
+        scratch.join("cow-root"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     assert!(store.prune_cas(Duration::ZERO).unwrap().is_none());
     let b = branch("builder");
     store.ensure_branch(&b, None).unwrap();
@@ -463,7 +487,11 @@ fn cas_dedup_shares_artifacts_and_never_touches_transcripts() {
     assert!(!listed.contains("target/"), "{listed}");
     assert!(!listed.contains(".cas"), "{listed}");
 
-    let other = LocalWorkspaceStore::git(&repo, scratch.join("git-root"));
+    let other = LocalWorkspaceStore::git(
+        &repo,
+        scratch.join("git-root"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     let b = branch("plain");
     other.ensure_branch(&b, None).unwrap();
     let plain = other.mount(&b).unwrap();
@@ -492,17 +520,33 @@ fn every_engine_passes_the_shared_workspace_contract() {
     let repo = seed(&scratch);
     contract::workspace_store(
         "cow_direct",
-        &CowWorkspace::new(&repo, scratch.join("cow-direct")),
+        &CowWorkspace::new(
+            &repo,
+            scratch.join("cow-direct"),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        ),
     );
     contract::workspace_store(
         "local_git",
-        &LocalWorkspaceStore::git(&repo, scratch.join("git")),
+        &LocalWorkspaceStore::git(
+            &repo,
+            scratch.join("git"),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        ),
     );
     contract::workspace_store(
         "local_cow",
-        &LocalWorkspaceStore::cow(&repo, scratch.join("cow")),
+        &LocalWorkspaceStore::cow(
+            &repo,
+            scratch.join("cow"),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        ),
     );
-    match LocalWorkspaceStore::overlay(&repo, scratch.join("overlay")) {
+    match LocalWorkspaceStore::overlay(
+        &repo,
+        scratch.join("overlay"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    ) {
         Ok(store) => contract::workspace_store("local_overlay", &store),
         Err(why) => assert!(
             !overlay_here(&scratch),
@@ -520,7 +564,7 @@ fn a_root_is_claimed_by_one_engine_and_refuses_another() {
     let repo = seed(&scratch);
     let root = scratch.join("root");
     assert_eq!(root_backend(&root).unwrap(), None);
-    let cow = LocalWorkspaceStore::cow(&repo, &root);
+    let cow = LocalWorkspaceStore::cow(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     cow.claim().unwrap();
     assert_eq!(
         fs::read_to_string(root.join(BACKEND_MARKER)).unwrap(),
@@ -547,7 +591,7 @@ fn a_root_is_claimed_by_one_engine_and_refuses_another() {
 
     // Before the marker: a Git workspace in the root makes it Git's.
     let legacy = scratch.join("legacy");
-    let git = LocalWorkspaceStore::git(&repo, &legacy);
+    let git = LocalWorkspaceStore::git(&repo, &legacy, spawn_host::DEFAULT_MAX_FILE_BYTES);
     let b = branch("old");
     git.ensure_branch(&b, None).unwrap();
     git.mount(&b).unwrap();
@@ -660,9 +704,7 @@ fn a_set_aside_blocked_by_a_special_file_changes_nothing_and_is_retried() {
 fn a_cow_set_aside_blocked_by_a_file_over_the_cap_changes_nothing_and_is_retried() {
     let scratch = Scratch::new("local-store-over-cap");
     let repo = seed(&scratch);
-    let store: LocalWorkspaceStore = CowWorkspace::new(&repo, scratch.join("cow"))
-        .with_max_file_bytes(64)
-        .into();
+    let store: LocalWorkspaceStore = CowWorkspace::new(&repo, scratch.join("cow"), 64).into();
     let (workspace, view) = without_src(&store, "capped");
     fs::write(view.join("src"), vec![b'x'; 4096]).unwrap();
     refused_then_retried(&store, &repo, "capped", &view);
@@ -784,7 +826,11 @@ fn a_prune_keeps_only_what_mounted_workspaces_use() {
 fn a_probe_that_cannot_be_removed_stops_neither_the_sweep_nor_the_prune() {
     let scratch = Scratch::new("local-store-sweep");
     let repo = seed(&scratch);
-    let store = LocalWorkspaceStore::cow(&repo, scratch.join("cow"));
+    let store = LocalWorkspaceStore::cow(
+        &repo,
+        scratch.join("cow"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     let b = branch("once");
     store.ensure_branch(&b, None).unwrap();
     let workspace = store.mount(&b).unwrap();
@@ -825,7 +871,7 @@ fn a_cow_set_aside_survives_a_concurrent_prune() {
     let scratch = Scratch::new("local-store-prune-race");
     let repo = seed(&scratch);
     let root = scratch.join("cow");
-    let store = LocalWorkspaceStore::cow(&repo, &root);
+    let store = LocalWorkspaceStore::cow(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     let b = branch("racer");
     store.ensure_branch(&b, None).unwrap();
     let workspace = store.mount(&b).unwrap();
@@ -833,7 +879,7 @@ fn a_cow_set_aside_survives_a_concurrent_prune() {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pruner = {
         let stop = stop.clone();
-        let pruner = CowWorkspace::new(&repo, &root);
+        let pruner = CowWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
         std::thread::spawn(move || {
             let mut runs = 0_u32;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {

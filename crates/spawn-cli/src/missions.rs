@@ -3764,8 +3764,8 @@ fn open_d6_workspace_for_land(
         ws_root,
         std::sync::Arc::clone(&cas),
         ledger,
-    )
-    .with_max_file_bytes(crate::config::workspace_max_file_bytes());
+        crate::config::workspace_max_file_bytes(),
+    );
     Ok((cas, d6))
 }
 

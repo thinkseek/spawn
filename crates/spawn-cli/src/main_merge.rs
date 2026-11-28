@@ -922,7 +922,7 @@ mod tests {
         git(&["clone", "-q", "--bare", &seed.to_string_lossy(), &source]).expect("source");
         let root = base.join("host");
         let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
-        let store = GitWorkspace::new(&mirror, &root);
+        let store = GitWorkspace::new(&mirror, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
         (base, source, root, mirror, store)
     }
 
@@ -2474,7 +2474,11 @@ mod tests {
 
         let cas = Arc::new(CasMerkleStore::open(root.join(".d6/cas")).expect("cas"));
         let ledger = Arc::new(InMemoryRefLedger::new());
-        let opts = spawn_host::workspace::D6StoreOptions::new(Arc::clone(&cas), ledger.clone());
+        let opts = spawn_host::workspace::D6StoreOptions::new(
+            Arc::clone(&cas),
+            ledger.clone(),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        );
         let store = LocalWorkspaceStore::d6("d6-unmarked-proj", &root, opts);
         let d6 = store.d6_workspace().expect("d6");
 
@@ -2594,6 +2598,7 @@ mod tests {
             false,
             &root,
             &Probes::host(),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
         )
         .expect("resolve d6")
         .with_d6(D6RuntimeConfig::default());

@@ -68,9 +68,9 @@ use crate::tree_path::{TreePath, nul_fields};
 use crate::workspace_rules::{
     CONFLICT_MARKER_SIZE, ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER, MAIN_COPIES,
     OVERSIZED_RECORD_LIMIT, Oversized, SET_ASIDE_FILES, SET_ASIDE_WAITS, encode_oversized,
-    has_conflict_block_sized, is_plain_name, lock_file, max_file_bytes, names_files_outside_git,
-    oversized_digest, oversized_file, oversized_notice_message, parse_oversized,
-    set_aside_kept_message, worker_head_ref,
+    has_conflict_block_sized, is_plain_name, lock_file, names_files_outside_git, oversized_digest,
+    oversized_file, oversized_notice_message, parse_oversized, set_aside_kept_message,
+    worker_head_ref,
 };
 
 const BASE_BRANCH: &str = "main";
@@ -567,19 +567,21 @@ impl<L: RefLedger> D6Workspace<L> {
         Ok(seq)
     }
 
-    /// Construct a `D6Workspace` backed by `store` and `ledger` with workspaces rooted at `root`.
+    /// Construct a `D6Workspace` backed by `store` and `ledger` with workspaces rooted at `root`
+    /// and checkpoint file cap `max_file_bytes`.
     pub fn new(
         project: impl Into<String>,
         root: impl AsRef<Path>,
         store: Arc<CasMerkleStore>,
         ledger: Arc<L>,
+        max_file_bytes: u64,
     ) -> Self {
         Self {
             project: project.into(),
             root: canonical_root(root.as_ref()),
             store,
             ledger,
-            max_file_bytes: max_file_bytes(None),
+            max_file_bytes,
             author_name: "spawn".to_string(),
             author_email: "spawn@localhost".to_string(),
             extra_exclude_files: Vec::new(),
@@ -594,23 +596,17 @@ impl<L: RefLedger> D6Workspace<L> {
         }
     }
 
-    /// Open a CAS store at `cas_root` and construct a [`D6Workspace`].
+    /// Open a CAS store at `cas_root` and construct a [`D6Workspace`] with checkpoint file cap
+    /// `max_file_bytes`.
     pub fn open(
         project: impl Into<String>,
         root: impl AsRef<Path>,
         cas_root: impl AsRef<Path>,
         ledger: Arc<L>,
+        max_file_bytes: u64,
     ) -> Result<Self, D6StoreError> {
         let store = Arc::new(CasMerkleStore::open(cas_root.as_ref().to_path_buf())?);
-        Ok(Self::new(project, root, store, ledger))
-    }
-
-    /// Override the per-file size limit (in bytes) above which untracked files are left out
-    /// of checkpoints and surfaced via [`WorkspaceStore::notices`].
-    #[must_use]
-    pub fn with_max_file_bytes(mut self, bytes: u64) -> Self {
-        self.max_file_bytes = bytes;
-        self
+        Ok(Self::new(project, root, store, ledger, max_file_bytes))
     }
 
     /// Override the author/committer name and email used for synthetic commit envelopes.
@@ -5339,8 +5335,14 @@ mod tests {
         let ledger = Arc::new(InMemoryRefLedger::new());
         let clock_ms = Arc::new(AtomicI64::new(1_700_000_000_000));
         let c = clock_ms.clone();
-        let ws = D6Workspace::new("proj", scratch.join("work"), cas.clone(), ledger.clone())
-            .with_clock_ms(Arc::new(move || c.fetch_add(1_000, Ordering::Relaxed)));
+        let ws = D6Workspace::new(
+            "proj",
+            scratch.join("work"),
+            cas.clone(),
+            ledger.clone(),
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        )
+        .with_clock_ms(Arc::new(move || c.fetch_add(1_000, Ordering::Relaxed)));
         (scratch, cas, ledger, ws, clock_ms)
     }
 

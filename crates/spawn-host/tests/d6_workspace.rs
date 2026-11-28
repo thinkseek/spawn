@@ -311,8 +311,7 @@ fn d6_workspace_pg_full_lifecycle_layer0_hold_merge_set_aside_and_discard() {
     let c = clock_ms.clone();
     let d6_root = scratch.join("d6-work");
 
-    let store = D6Workspace::new("proj-d6", &d6_root, cas.clone(), ledger.clone())
-        .with_max_file_bytes(1024)
+    let store = D6Workspace::new("proj-d6", &d6_root, cas.clone(), ledger.clone(), 1024)
         .with_clock_ms(Arc::new(move || c.fetch_add(1_000, Ordering::Relaxed)));
     assert_eq!(store.project(), "proj-d6");
 
@@ -685,7 +684,11 @@ fn shadow_d6_workspace_pg_dual_track_oracle_parity() {
     let init_main_oid = GitOid::parse_hex(&git_in(&checkout, &["rev-parse", "main"])).expect("oid");
 
     let bare_repo = checkout.join(".git");
-    let primary = GitWorkspace::new(&bare_repo, scratch.join("git-work"));
+    let primary = GitWorkspace::new(
+        &bare_repo,
+        scratch.join("git-work"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("cas"));
     let ledger = Arc::new(PgRefLedger::connect_isolated("shadow_parity"));
     let d6 = D6Workspace::new(
@@ -693,6 +696,7 @@ fn shadow_d6_workspace_pg_dual_track_oracle_parity() {
         scratch.join("d6-work"),
         cas.clone(),
         ledger.clone(),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
     );
     let oracle = ShadowD6Workspace::new(primary, d6);
 
@@ -953,21 +957,23 @@ fn shadow_d6_workspace_pg_negative_tracked_set_leak_fails_closed() {
     git_in(&checkout, &["add", "-A"]);
     git_in(&checkout, &["commit", "-qm", "base"]);
 
+    let cap = spawn_host::DEFAULT_MAX_FILE_BYTES;
     let bare_repo = checkout.join(".git");
-    let primary = GitWorkspace::new(&bare_repo, scratch.join("git-work"));
+    let primary = GitWorkspace::new(&bare_repo, scratch.join("git-work"), cap);
     let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("cas"));
     let ledger = Arc::new(PgRefLedger::connect_isolated("shadow_leak"));
-
-    // Positive strict run: zero leaks with .env & sub/secret.local present
-    let strict_oracle = ShadowD6Workspace::new(
-        primary.clone(),
+    let leak_d6 = || {
         D6Workspace::new(
             "proj-leak",
             scratch.join("d6-work"),
             cas.clone(),
             ledger.clone(),
-        ),
-    );
+            cap,
+        )
+    };
+
+    // Positive strict run: zero leaks with .env & sub/secret.local present
+    let strict_oracle = ShadowD6Workspace::new(primary.clone(), leak_d6());
     let b = BranchName::new("agent_sec").expect("branch");
     strict_oracle.ensure_branch(&b, None).expect("ensure");
     let ws = strict_oracle.mount(&b).expect("mount");
@@ -993,17 +999,9 @@ fn shadow_d6_workspace_pg_negative_tracked_set_leak_fails_closed() {
     // Negative Case 1: policy bypass with a normal edit (`Commit::Created`) must fail-closed
     // on `.env` and `sub/secret.local`, reporting `TrackedSetLeak` (not `TreeOidMismatch`)
     // and leaving PG `spawn_refs` untouched.
-    let leaky_oracle = ShadowD6Workspace::new(
-        primary.clone(),
-        D6Workspace::new(
-            "proj-leak",
-            scratch.join("d6-work"),
-            cas.clone(),
-            ledger.clone(),
-        ),
-    )
-    .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
-    .with_strict_fail_closed(true);
+    let leaky_oracle = ShadowD6Workspace::new(primary.clone(), leak_d6())
+        .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
+        .with_strict_fail_closed(true);
 
     fs::write(ws_dir.join("work.txt"), "clean code v2\n").expect("edit work");
     let err1 = leaky_oracle
@@ -1026,12 +1024,9 @@ fn shadow_d6_workspace_pg_negative_tracked_set_leak_fails_closed() {
 
     // Negative Case 2: primary returns Commit::Unchanged (only an ignored file added),
     // yet unfiltered shadow scan STILL catches `TrackedSetLeak` fail-closed.
-    let nonblocking_leaky_oracle = ShadowD6Workspace::new(
-        primary,
-        D6Workspace::new("proj-leak", scratch.join("d6-work"), cas, ledger.clone()),
-    )
-    .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
-    .with_strict_fail_closed(false);
+    let nonblocking_leaky_oracle = ShadowD6Workspace::new(primary, leak_d6())
+        .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
+        .with_strict_fail_closed(false);
 
     fs::write(ws_dir.join("sub/only_ignored.local"), "ONLY_IGNORED=1\n").expect("write local2");
     let (res2, out2) = nonblocking_leaky_oracle
@@ -1111,15 +1106,21 @@ fn verify_l1_host_memory_reserve_fallbacks(
 ) {
     let gib = 1024_u64 * 1024 * 1024;
     // 1a) 128 GiB host with only 50 GiB available (< 64 GiB absolute floor) -> fallback to disk
-    let low_abs_store = D6Workspace::new("proj-l1", disk_root, cas.clone(), ledger.clone())
-        .with_l1_policy(L1TmpfsPolicy::new(tmpfs_root, 16))
-        .with_l1_memory_probe(Arc::new(move |_| {
-            Some(HostMemorySample {
-                total_bytes: 128 * gib,
-                available_bytes: 50 * gib,
-                tmpfs_available_bytes: Some(gib),
-            })
-        }));
+    let low_abs_store = D6Workspace::new(
+        "proj-l1",
+        disk_root,
+        cas.clone(),
+        ledger.clone(),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_l1_policy(L1TmpfsPolicy::new(tmpfs_root, 16))
+    .with_l1_memory_probe(Arc::new(move |_| {
+        Some(HostMemorySample {
+            total_bytes: 128 * gib,
+            available_bytes: 50 * gib,
+            tmpfs_available_bytes: Some(gib),
+        })
+    }));
     let b_low_abs = BranchName::new("agent_low64").expect("branch");
     low_abs_store
         .ensure_branch(&b_low_abs, None)
@@ -1136,15 +1137,21 @@ fn verify_l1_host_memory_reserve_fallbacks(
     low_abs_store.discard(&ws_low_abs).expect("discard");
 
     // 1b) 1 TiB host with 100 GiB available (> 64 GiB, but < 15% of 1 TiB = 153.6 GiB) -> fallback
-    let low_pct_store = D6Workspace::new("proj-l1", disk_root, cas.clone(), ledger.clone())
-        .with_l1_policy(L1TmpfsPolicy::new(tmpfs_root, 16))
-        .with_l1_memory_probe(Arc::new(move |_| {
-            Some(HostMemorySample {
-                total_bytes: 1024 * gib,
-                available_bytes: 100 * gib,
-                tmpfs_available_bytes: Some(gib),
-            })
-        }));
+    let low_pct_store = D6Workspace::new(
+        "proj-l1",
+        disk_root,
+        cas.clone(),
+        ledger.clone(),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_l1_policy(L1TmpfsPolicy::new(tmpfs_root, 16))
+    .with_l1_memory_probe(Arc::new(move |_| {
+        Some(HostMemorySample {
+            total_bytes: 1024 * gib,
+            available_bytes: 100 * gib,
+            tmpfs_available_bytes: Some(gib),
+        })
+    }));
     let b_low_pct = BranchName::new("agent_low15pct").expect("branch");
     low_pct_store
         .ensure_branch(&b_low_pct, None)
@@ -1235,16 +1242,22 @@ fn d6_workspace_pg_l1_tmpfs_admission_fallback_pressure_flush_and_reclaim() {
     let clock_ms = Arc::new(AtomicI64::new(1_700_000_010_000));
     let clk = clock_ms.clone();
     let policy = L1TmpfsPolicy::new(&tmpfs_root, 1).with_per_workspace_quota_bytes(700 * 1024);
-    let store = D6Workspace::new("proj-l1", &disk_root, cas.clone(), ledger.clone())
-        .with_clock_ms(Arc::new(move || clk.fetch_add(1_000, Ordering::Relaxed)))
-        .with_l1_policy(policy)
-        .with_l1_memory_probe(Arc::new(move |_| {
-            Some(HostMemorySample {
-                total_bytes: 512 * gib,
-                available_bytes: 400 * gib,
-                tmpfs_available_bytes: Some(gib),
-            })
-        }));
+    let store = D6Workspace::new(
+        "proj-l1",
+        &disk_root,
+        cas.clone(),
+        ledger.clone(),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_clock_ms(Arc::new(move || clk.fetch_add(1_000, Ordering::Relaxed)))
+    .with_l1_policy(policy)
+    .with_l1_memory_probe(Arc::new(move |_| {
+        Some(HostMemorySample {
+            total_bytes: 512 * gib,
+            available_bytes: 400 * gib,
+            tmpfs_available_bytes: Some(gib),
+        })
+    }));
 
     // Seed 520 KiB baseline file onto PG main (within 700 KiB quota, < 80% = 560 KiB)
     seed_l1_main_with_blob(
@@ -1417,8 +1430,13 @@ fn d6_workspace_pg_concurrent_8_branches_checkpoint_and_merge_main_clean() {
     let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("cas"));
     let disk_root = scratch.join("work");
     let schema = Arc::new(TestSchema::new("concurrent8"));
-    let coord_ledger = Arc::new(PgRefLedger::connect_in_schema(Arc::clone(&schema)));
-    let coord_store = D6Workspace::new("proj-conc", &disk_root, cas.clone(), coord_ledger.clone());
+    let cap = spawn_host::DEFAULT_MAX_FILE_BYTES;
+    let open_conc = || {
+        let l = Arc::new(PgRefLedger::connect_in_schema(Arc::clone(&schema)));
+        let ws = D6Workspace::new("proj-conc", &disk_root, cas.clone(), l.clone(), cap);
+        (l, ws)
+    };
+    let (coord_ledger, coord_store) = open_conc();
 
     seed_l1_main_with_blob(
         &coord_store,
@@ -1439,18 +1457,8 @@ fn d6_workspace_pg_concurrent_8_branches_checkpoint_and_merge_main_clean() {
         coord_store.ensure_branch(b, None).expect("ensure branch");
     }
 
-    let worker_stores: Vec<_> = (0..8)
-        .map(|_| {
-            let l = Arc::new(PgRefLedger::connect_in_schema(Arc::clone(&schema)));
-            D6Workspace::new("proj-conc", &disk_root, cas.clone(), l)
-        })
-        .collect();
-    let merger_stores: Vec<_> = (0..4)
-        .map(|_| {
-            let l = Arc::new(PgRefLedger::connect_in_schema(Arc::clone(&schema)));
-            D6Workspace::new("proj-conc", &disk_root, cas.clone(), l)
-        })
-        .collect();
+    let worker_stores: Vec<_> = (0..8).map(|_| open_conc().1).collect();
+    let merger_stores: Vec<_> = (0..4).map(|_| open_conc().1).collect();
 
     let barrier = Arc::new(Barrier::new(13));
     std::thread::scope(|scope| {
@@ -1525,10 +1533,22 @@ fn d6_workspace_pg_same_second_identical_commits_are_idempotent() {
     let ledger = Arc::new(PgRefLedger::connect_isolated("same_sec_idempotent"));
     let disk_root = scratch.join("disk-work");
 
-    let store_a = D6Workspace::new("proj-sec", &disk_root, cas.clone(), ledger.clone())
-        .with_clock_ms(Arc::new(|| 1_700_000_050_111));
-    let store_b = D6Workspace::new("proj-sec", &disk_root, cas, ledger)
-        .with_clock_ms(Arc::new(|| 1_700_000_050_987));
+    let store_a = D6Workspace::new(
+        "proj-sec",
+        &disk_root,
+        cas.clone(),
+        ledger.clone(),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_clock_ms(Arc::new(|| 1_700_000_050_111));
+    let store_b = D6Workspace::new(
+        "proj-sec",
+        &disk_root,
+        cas,
+        ledger,
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_clock_ms(Arc::new(|| 1_700_000_050_987));
 
     let b1 = BranchName::new("agent_sec_a").expect("b1");
     let b2 = BranchName::new("agent_sec_b").expect("b2");
@@ -1587,9 +1607,14 @@ fn verify_local_store_d6_shadow_strict_leak(cas: Arc<CasMerkleStore>) {
     let bare = scratch.join("bare.git");
     setup_local_bare_repo(&seed, &bare);
     let ledger: DynRefLedger = Arc::new(PgRefLedger::connect_isolated("local_d6_shadow_strict"));
-    let opts = D6ShadowOptions::new(scratch.join("shadow-work"), cas, ledger)
-        .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
-        .with_strict_fail_closed(true);
+    let opts = D6ShadowOptions::new(
+        scratch.join("shadow-work"),
+        cas,
+        ledger,
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
+    .with_strict_fail_closed(true);
     let store = LocalWorkspaceStore::d6_shadow(&bare, scratch.join("git-work"), opts);
     let branch = BranchName::new("agent_strict_leak").expect("branch");
     store.ensure_branch(&branch, None).expect("ensure_branch");
@@ -1620,8 +1645,13 @@ fn local_workspace_store_d6_shadow_parity_and_strict_fail_closed_leak() {
     let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("cas"));
     let ledger: DynRefLedger = Arc::new(PgRefLedger::connect_isolated("local_d6_shadow"));
 
-    let mut opts = D6ShadowOptions::new(scratch.join("shadow-work"), cas.clone(), ledger)
-        .with_strict_fail_closed(true);
+    let mut opts = D6ShadowOptions::new(
+        scratch.join("shadow-work"),
+        cas.clone(),
+        ledger,
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_strict_fail_closed(true);
     opts = opts.with_l1_policy(L1TmpfsPolicy::new(scratch.join("l1-tmpfs"), 16));
     let store = LocalWorkspaceStore::d6_shadow(&bare, scratch.join("git-work"), opts);
     assert_eq!(store.backend_name(), "d6-shadow");
@@ -1678,7 +1708,7 @@ fn local_workspace_store_d6_native_lifecycle_and_l1_tmpfs() {
     let ledger: DynRefLedger = ledger_pg.clone();
     let tmpfs_root = scratch.join("l1-tmpfs");
 
-    let opts = D6StoreOptions::new(cas.clone(), ledger)
+    let opts = D6StoreOptions::new(cas.clone(), ledger, spawn_host::DEFAULT_MAX_FILE_BYTES)
         .with_l1_policy(L1TmpfsPolicy::new(&tmpfs_root, 32));
     let store = LocalWorkspaceStore::d6("proj-local-d6", scratch.join("disk-work"), opts);
     assert_eq!(store.backend_name(), "d6");
@@ -1814,7 +1844,7 @@ fn d6_workspace_pg_host_and_pg_restart_recovery_with_gc_fence_and_journal() {
     let store = LocalWorkspaceStore::d6(
         "restart-proj",
         scratch.join("disk-work"),
-        D6StoreOptions::new(cas.clone(), live_dyn),
+        D6StoreOptions::new(cas.clone(), live_dyn, spawn_host::DEFAULT_MAX_FILE_BYTES),
     );
     let d6 = store.d6_workspace().expect("d6 inner");
 
@@ -1939,7 +1969,11 @@ fn d6_workspace_pg_host_and_pg_restart_recovery_with_gc_fence_and_journal() {
     let reopened_store = LocalWorkspaceStore::d6(
         "restart-proj",
         scratch.join("disk-work"),
-        D6StoreOptions::new(reopened_cas.clone(), live_pg.clone()),
+        D6StoreOptions::new(
+            reopened_cas.clone(),
+            live_pg.clone(),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        ),
     );
     let ws2 = reopened_store.mount(&branch).expect("remount");
     assert_eq!(
@@ -2047,7 +2081,11 @@ fn d6_workspace_pg_host_and_pg_restart_recovery_with_gc_fence_and_journal() {
     let restored_store = LocalWorkspaceStore::d6(
         "restart-proj",
         scratch.join("restored-disk-work"),
-        D6StoreOptions::new(restored_cas, restored_pg),
+        D6StoreOptions::new(
+            restored_cas,
+            restored_pg,
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        ),
     );
     let ws3 = restored_store.mount(&branch).expect("mount restored");
     assert_eq!(
@@ -2090,7 +2128,7 @@ fn seed_bootstrap_main_and_agent(
     let store = LocalWorkspaceStore::d6(
         project,
         scratch.join("work"),
-        D6StoreOptions::new(cas.clone(), dyn_ledger),
+        D6StoreOptions::new(cas.clone(), dyn_ledger, spawn_host::DEFAULT_MAX_FILE_BYTES),
     );
     let d6 = store.d6_workspace().expect("d6 inner");
 
@@ -2370,7 +2408,7 @@ fn pg_d6_pin_worker_head_local_git_boundary() {
     let store = LocalWorkspaceStore::d6(
         "proj-pin-boundary",
         scratch.join("work"),
-        D6StoreOptions::new(cas.clone(), dyn_ledger),
+        D6StoreOptions::new(cas.clone(), dyn_ledger, spawn_host::DEFAULT_MAX_FILE_BYTES),
     );
     let d6 = store.d6_workspace().expect("d6 inner");
 
@@ -2860,8 +2898,14 @@ fn d6_workspace_native_writes_produce_commit_v2_without_compat_body() {
     let clk = clock_ms.clone();
     let d6_root = scratch.join("ws");
 
-    let ws_store = D6Workspace::new("proj-native-v2", &d6_root, cas.clone(), ledger.clone())
-        .with_clock_ms(Arc::new(move || clk.fetch_add(1_000, Ordering::Relaxed)));
+    let ws_store = D6Workspace::new(
+        "proj-native-v2",
+        &d6_root,
+        cas.clone(),
+        ledger.clone(),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_clock_ms(Arc::new(move || clk.fetch_add(1_000, Ordering::Relaxed)));
     let branch = BranchName::new("agent_v2").expect("branch name");
     let (main0, ws) = verify_native_v2_branch_commits(&cas, &ws_store, &branch);
     verify_native_v2_land_merge_set_aside_and_compat(

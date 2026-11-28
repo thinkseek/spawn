@@ -576,6 +576,7 @@ pub(crate) fn workspace_settings_readonly(
     };
     let cas = crate::config::cas_dedup(crate::config::env_value("SPAWN_CAS_DEDUP").as_deref())?;
     let d6 = crate::config::D6RuntimeConfig::from_env()?;
+    let max_file_bytes = crate::config::workspace_max_file_bytes();
 
     let probes = crate::config::Probes {
         overlay: &overlay_probe,
@@ -583,7 +584,8 @@ pub(crate) fn workspace_settings_readonly(
         marked: &marked_probe,
     };
     let settings =
-        crate::config::WorkspaceSettings::resolve(configured, cas, root, &probes)?.with_d6(d6);
+        crate::config::WorkspaceSettings::resolve(configured, cas, root, &probes, max_file_bytes)?
+            .with_d6(d6);
     if let Some(there) = existing
         && !spawn_host::workspace::backends_compatible(there, settings.active)
     {
@@ -604,9 +606,19 @@ pub(crate) fn open_non_d6_store(
     root: &Path,
 ) -> Result<LocalWorkspaceStore, String> {
     match settings.active {
-        HostWorkspaceBackend::Git => Ok(LocalWorkspaceStore::git(repo, root)),
-        HostWorkspaceBackend::Cow => Ok(LocalWorkspaceStore::cow(repo, root)),
-        HostWorkspaceBackend::Overlay => LocalWorkspaceStore::overlay(repo, root),
+        HostWorkspaceBackend::Git => Ok(LocalWorkspaceStore::git(
+            repo,
+            root,
+            settings.max_file_bytes,
+        )),
+        HostWorkspaceBackend::Cow => Ok(LocalWorkspaceStore::cow(
+            repo,
+            root,
+            settings.max_file_bytes,
+        )),
+        HostWorkspaceBackend::Overlay => {
+            LocalWorkspaceStore::overlay(repo, root, settings.max_file_bytes)
+        }
         other @ (HostWorkspaceBackend::D6 | HostWorkspaceBackend::D6Shadow) => Err(format!(
             "workspace backend {} requires CAS and RefLedger configuration",
             other.name()
@@ -644,6 +656,7 @@ pub(crate) fn open_d6_workspace_borrowed<'a>(
     repo: &Path,
     root: &Path,
     d6_cfg: &crate::config::D6RuntimeConfig,
+    max_file_bytes: u64,
     pg: &'a PostgresStore,
 ) -> Result<D6Workspace<BorrowedPgRefLedger<'a>>, String> {
     let cas_dir = d6_cfg.effective_cas_dir(root, HostWorkspaceBackend::D6);
@@ -652,8 +665,13 @@ pub(crate) fn open_d6_workspace_borrowed<'a>(
             .map_err(|error| format!("open D6 CAS store at {}: {error}", cas_dir.display()))?,
     );
     let ledger = Arc::new(BorrowedPgRefLedger::new(pg));
-    let mut store = D6Workspace::new(repo.to_string_lossy().into_owned(), root, cas, ledger)
-        .with_max_file_bytes(crate::config::workspace_max_file_bytes());
+    let mut store = D6Workspace::new(
+        repo.to_string_lossy().into_owned(),
+        root,
+        cas,
+        ledger,
+        max_file_bytes,
+    );
     if let Some(policy) = d6_cfg.l1_policy() {
         store = store.with_l1_policy(policy);
     }
@@ -1034,8 +1052,8 @@ fn rebuild_d6_workspace_with_ledger(
         existing.root(),
         existing.store().clone(),
         Arc::new(ledger),
+        existing.max_file_bytes(),
     )
-    .with_max_file_bytes(existing.max_file_bytes())
     .with_extra_exclude_files(existing.extra_exclude_files().to_vec());
     if let Some(policy) = existing.l1_policy() {
         rebuilt = rebuilt.with_l1_policy(policy.clone());
@@ -1058,6 +1076,7 @@ fn rebind_d6_store(local: LocalWorkspaceStore, pg: &Arc<PostgresStore>) -> Local
                 oracle.shadow().root().to_path_buf(),
                 oracle.shadow().store().clone(),
                 ledger,
+                oracle.shadow().max_file_bytes(),
             )
             .with_strict_fail_closed(oracle.strict_fail_closed())
             .with_tracked_set_mode(oracle.tracked_set_mode());
@@ -2014,7 +2033,9 @@ pub(crate) fn persist_worker_commits_to_repo(
     let settings = workspace_settings_readonly(root)?;
     let local = match settings.active {
         HostWorkspaceBackend::D6 => settings.store(repo, root),
-        HostWorkspaceBackend::D6Shadow => LocalWorkspaceStore::git(repo, root),
+        HostWorkspaceBackend::D6Shadow => {
+            LocalWorkspaceStore::git(repo, root, settings.max_file_bytes)
+        }
         _ => open_non_d6_store(&settings, repo, root)?,
     };
     persist_worker_commits_with_store(&local, repo, source, root, agent_id, task_id, stage)
@@ -2084,12 +2105,15 @@ pub(crate) fn persist_task_worker_commits_with_settings(
     };
     if settings.is_d6() {
         let task_ref = spawn_host::workspace_rules::task_head_ref(task_id, stage);
-        let d6 = open_d6_workspace_borrowed(&repo, root, &settings.d6, store)?;
+        let d6 =
+            open_d6_workspace_borrowed(&repo, root, &settings.d6, settings.max_file_bytes, store)?;
         return d6_pin_worker_head(&d6, agent_id, &[&task_ref])
             .map_err(|error| format!("pin {task_ref}: {error}"));
     }
     let local = match settings.active {
-        HostWorkspaceBackend::D6Shadow => LocalWorkspaceStore::git(&repo, root),
+        HostWorkspaceBackend::D6Shadow => {
+            LocalWorkspaceStore::git(&repo, root, settings.max_file_bytes)
+        }
         _ => open_non_d6_store(settings, &repo, root)?,
     };
     persist_worker_commits_with_store(
@@ -2122,7 +2146,9 @@ pub(crate) fn agent_branch_head_with_settings(
             return None;
         }
         let mirror = mirror_path(root, Some(&source)).ok()?;
-        let d6 = open_d6_workspace_borrowed(&mirror, root, &settings.d6, store).ok()?;
+        let d6 =
+            open_d6_workspace_borrowed(&mirror, root, &settings.d6, settings.max_file_bytes, store)
+                .ok()?;
         return d6
             .branch_head(&branch)
             .ok()
@@ -2131,7 +2157,9 @@ pub(crate) fn agent_branch_head_with_settings(
     }
     let mirror = ensure_mirror(root, Some(&source)).ok()?;
     let local = match settings.active {
-        HostWorkspaceBackend::D6Shadow => LocalWorkspaceStore::git(&mirror, root),
+        HostWorkspaceBackend::D6Shadow => {
+            LocalWorkspaceStore::git(&mirror, root, settings.max_file_bytes)
+        }
         _ => open_non_d6_store(settings, &mirror, root).ok()?,
     };
     local
@@ -2247,7 +2275,7 @@ mod tests {
 
         let root = base.join("host");
         let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
-        let host = GitWorkspace::new(&mirror, &root);
+        let host = GitWorkspace::new(&mirror, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
         let landing = "refs/spawn-integrate/agent_x";
 
         // Nothing published yet: the integrator finds nothing.
@@ -2323,7 +2351,7 @@ mod tests {
         git(&["clone", "-q", "--bare", &seed_path, &source]).expect("bare source");
         let root = base.join("host");
         let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
-        let host = GitWorkspace::new(&mirror, &root);
+        let host = GitWorkspace::new(&mirror, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
         let landing = "refs/spawn-integrate/agent_x";
 
         // The killed process committed and queued a push it never made.
@@ -2462,7 +2490,7 @@ mod tests {
         git(&["clone", "-q", "--bare", &seed_path, &source]).expect("bare source");
         let root = base.join("host");
         let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
-        let host = GitWorkspace::new(&mirror, &root);
+        let host = GitWorkspace::new(&mirror, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
         checkpoint(&host, "agent_x", "one.txt");
         assert_eq!(push_branch(&mirror, &source, "agent_x"), Pushed::Done);
         (source, mirror, host)
@@ -3056,7 +3084,9 @@ mod tests {
     /// `source` is.
     fn routed_x(mirror: &Path, root: &Path, source: &str) -> Routed {
         Routed {
-            store: std::sync::Arc::new(GitWorkspace::new(mirror, root).into()),
+            store: std::sync::Arc::new(
+                GitWorkspace::new(mirror, root, spawn_host::DEFAULT_MAX_FILE_BYTES).into(),
+            ),
             mirror: Some((mirror.to_path_buf(), source.to_string())),
         }
     }
@@ -3280,14 +3310,19 @@ mod tests {
             WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay),
         ] {
             let root = base.join(format!("{configured:?}").to_lowercase());
-            let settings =
-                match WorkspaceSettings::resolve(configured, true, &root, &Probes::host()) {
-                    Ok(settings) => settings,
-                    Err(why) => {
-                        eprintln!("skipped: {why}");
-                        continue;
-                    }
-                };
+            let settings = match WorkspaceSettings::resolve(
+                configured,
+                true,
+                &root,
+                &Probes::host(),
+                spawn_host::DEFAULT_MAX_FILE_BYTES,
+            ) {
+                Ok(settings) => settings,
+                Err(why) => {
+                    eprintln!("skipped: {why}");
+                    continue;
+                }
+            };
             let name = settings.active.name();
             ran.push(name);
             let workspaces = settings.one_shot(&repo, &root, store.clone());
@@ -3459,9 +3494,13 @@ mod tests {
             WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay),
         ] {
             let root = base.join(format!("{configured:?}").to_lowercase());
-            let Ok(settings) =
-                WorkspaceSettings::resolve(configured, false, &root, &Probes::host())
-            else {
+            let Ok(settings) = WorkspaceSettings::resolve(
+                configured,
+                false,
+                &root,
+                &Probes::host(),
+                spawn_host::DEFAULT_MAX_FILE_BYTES,
+            ) else {
                 continue;
             };
             let routed = Routed {
@@ -3540,7 +3579,8 @@ mod tests {
 
         let source_str = source.to_string_lossy().to_string();
         let mirror = ensure_mirror(&work, Some(&source_str)).expect("ensure mirror");
-        let store = spawn_host::GitWorkspace::new(&mirror, &work);
+        let store =
+            spawn_host::GitWorkspace::new(&mirror, &work, spawn_host::DEFAULT_MAX_FILE_BYTES);
         let branch = BranchName::new("agent_worker_m").expect("branch");
         store.ensure_branch(&branch, None).expect("ensure branch");
         let ws = store.mount(&branch).expect("mount");
@@ -3626,9 +3666,14 @@ mod tests {
             std::sync::Arc::new(CasMerkleStore::open(root.join(".d6-shadow/cas")).expect("cas"));
         let ledger: super::DynRefLedger =
             std::sync::Arc::new(super::PostgresRefLedger::new(std::sync::Arc::clone(&pg)));
-        let opts = D6ShadowOptions::new(root.join(".d6-shadow/work"), cas, ledger)
-            .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
-            .with_strict_fail_closed(true);
+        let opts = D6ShadowOptions::new(
+            root.join(".d6-shadow/work"),
+            cas,
+            ledger,
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        )
+        .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
+        .with_strict_fail_closed(true);
         let store = super::LocalWorkspaceStore::d6_shadow(&strict_repo, &root, opts);
         let factory: super::Factory = std::sync::Arc::new(|_| unreachable!("uses default"));
         let workspaces = super::MissionWorkspaces::new(store, &root, pg, factory);
@@ -3685,6 +3730,7 @@ mod tests {
             false,
             &root,
             &Probes::host(),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
         )
         .expect("resolve")
         .with_d6(D6RuntimeConfig::default());
@@ -3753,6 +3799,7 @@ mod tests {
             false,
             &root,
             &Probes::host(),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
         )
         .expect("resolve")
         .with_d6(D6RuntimeConfig {
@@ -3874,6 +3921,7 @@ mod tests {
             false,
             &root,
             &Probes::host(),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
         )
         .expect("resolve")
         .with_d6(D6RuntimeConfig::default());
@@ -4679,6 +4727,7 @@ mod tests {
             base.0.join("work"),
             std::sync::Arc::clone(&cas),
             ledger,
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
         );
         let branch = BranchName::new("agent_pin").expect("branch");
         d6.ensure_branch(&branch, None).expect("ensure_branch");
@@ -4745,6 +4794,178 @@ mod tests {
                     r.project == project && &r.name == expected && r.snapshot == head_snap.id
                 }),
                 "missing restored ref {expected} in {restored:?}"
+            );
+        }
+    }
+
+    fn verify_max_file_cap_on_branch(
+        workspaces: &super::MissionWorkspaces,
+        backend: &str,
+        repo: &Path,
+        branch_name: &str,
+        small_file: &str,
+        big_file: &str,
+    ) {
+        let branch = BranchName::new(branch_name).expect("branch");
+        workspaces
+            .ensure_branch(&branch, None)
+            .expect("ensure_branch");
+        let routed = workspaces.route(branch.as_str()).expect("routed");
+        assert_eq!(routed.store.max_file_bytes(), 1 << 20, "{backend}");
+        if let spawn_host::LocalWorkspaceStore::D6Shadow(ref oracle) = *routed.store {
+            assert_eq!(oracle.primary().max_file_bytes(), 1 << 20, "{backend}");
+            assert_eq!(oracle.shadow().max_file_bytes(), 1 << 20, "{backend}");
+        }
+
+        let ws = workspaces.mount(&branch).expect("mount");
+        let ws_dir = std::path::PathBuf::from(ws.path());
+        std::fs::write(ws_dir.join(small_file), "ok\n").expect("write small");
+        std::fs::write(ws_dir.join(big_file), vec![b'B'; 2 << 20]).expect("write big");
+        let Commit::Created(commit) = workspaces.commit(&ws, "cap check").expect("commit") else {
+            panic!("{backend}: expected Commit::Created");
+        };
+
+        let notices = workspaces.notices(&ws);
+        assert_eq!(notices.len(), 1, "{backend}: {notices:?}");
+        assert!(
+            notices[0].starts_with(&format!("{big_file} (2 MiB) is over the 1 MiB cap")),
+            "{backend}: {notices:?}"
+        );
+
+        let primary_records =
+            spawn_host::workspace_rules::oversized_record(routed.store.root(), branch.as_str());
+        assert_eq!(primary_records.len(), 1, "{backend}: {primary_records:?}");
+        assert_eq!(primary_records[0].path.as_str(), Some(big_file));
+        assert_eq!(primary_records[0].size, 2 << 20);
+
+        if let spawn_host::LocalWorkspaceStore::D6Shadow(ref oracle) = *routed.store {
+            let shadow_records = spawn_host::workspace_rules::oversized_record(
+                oracle.shadow().root(),
+                branch.as_str(),
+            );
+            assert_eq!(shadow_records.len(), 1, "{backend}: {shadow_records:?}");
+            assert_eq!(shadow_records[0].path.as_str(), Some(big_file));
+            assert_eq!(shadow_records[0].size, 2 << 20);
+            let metrics = routed.store.shadow_metrics().expect("shadow metrics");
+            assert_eq!(metrics.shadow_errors, 0, "{metrics:?}");
+            assert!(!metrics.has_divergences(), "{metrics:?}");
+        }
+
+        if let Some(d6) = routed.store.d6_workspace() {
+            let snap = d6
+                .branch_snapshot(branch.as_str())
+                .expect("branch_snapshot")
+                .expect("snapshot present");
+            let flat = d6.store().flatten_tree(&snap.tree).expect("flatten_tree");
+            assert!(
+                flat.contains_key(small_file.as_bytes()),
+                "{backend}: missing {small_file}"
+            );
+            assert!(
+                !flat.contains_key(big_file.as_bytes()),
+                "{backend}: committed oversized {big_file}"
+            );
+        } else {
+            let repo_str = repo.to_string_lossy().to_string();
+            let listed = git(&[
+                "--git-dir",
+                &repo_str,
+                "ls-tree",
+                "-r",
+                "--name-only",
+                commit.as_str(),
+            ])
+            .expect("ls-tree");
+            let names: Vec<&str> = listed.lines().collect();
+            assert!(
+                names.contains(&small_file),
+                "{backend}: missing {small_file} in {names:?}"
+            );
+            assert!(
+                !names.contains(&big_file),
+                "{backend}: committed oversized {big_file} in {names:?}"
+            );
+        }
+
+        workspaces.unmount(&ws).expect("unmount");
+    }
+
+    #[test]
+    fn workspace_max_file_mb_enforced_through_from_env_and_mission_workspaces_across_backends() {
+        const CHILD_ENV: &str = "SPAWN_TEST_MAX_FILE_CAP_BACKEND";
+        const CAP_TEST: &str = "sources::tests::workspace_max_file_mb_enforced_through_from_env_and_mission_workspaces_across_backends";
+
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+
+        let Ok(backend) = std::env::var(CHILD_ENV) else {
+            let exe = std::env::current_exe().expect("current_exe");
+            for backend in ["git", "cow", "d6", "d6-shadow"] {
+                let mut cmd = std::process::Command::new(&exe);
+                cmd.args(["--exact", CAP_TEST, "--nocapture"])
+                    .env(CHILD_ENV, backend)
+                    .env("SPAWN_WORKSPACE_BACKEND", backend)
+                    .env("SPAWN_MAX_FILE_MB", "1")
+                    .env_remove("SPAWN_D6_CAS_DIR")
+                    .env_remove("SPAWN_D6_TMPFS_ROOT")
+                    .env_remove("SPAWN_D6_TMPFS_BUDGET_MB")
+                    .env_remove("SPAWN_D6_STRICT_FAIL_CLOSED")
+                    .env_remove("SPAWN_CAS_DEDUP");
+                let out = cmd.output().expect("spawn child cap check");
+                assert!(
+                    out.status.success(),
+                    "backend={backend} failed:\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            return;
+        };
+
+        let schema = spawn_postgres::testing::TestSchema::new("mw_max_file_cap");
+        let store = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect"),
+        );
+        let base = TempDirGuard(std::env::temp_dir().join(format!(
+            "spawn-sources-cap-{backend}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        std::fs::create_dir_all(&base.0).expect("mkdir base");
+        let repo = backend_repo(&base.0);
+        let root = base.0.join("ws-root");
+
+        let settings = crate::config::WorkspaceSettings::from_env(&root).expect("from_env");
+        assert_eq!(settings.max_file_bytes, 1 << 20, "{backend}");
+        assert_eq!(settings.active.name(), backend);
+
+        let factory = settings.factory(&root);
+        let workspaces =
+            super::MissionWorkspaces::new(factory(&repo), &root, store.clone(), factory);
+        verify_max_file_cap_on_branch(
+            &workspaces,
+            &backend,
+            &repo,
+            "agent_cap_check",
+            "small.txt",
+            "big.bin",
+        );
+
+        if backend == "d6-shadow" {
+            let one_shot = settings.one_shot(&repo, &root, store);
+            verify_max_file_cap_on_branch(
+                &one_shot,
+                "d6-shadow-one-shot",
+                &repo,
+                "agent_cap_oneshot",
+                "small2.txt",
+                "big2.bin",
             );
         }
     }

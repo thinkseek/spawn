@@ -13,8 +13,9 @@
 //!    `crates/spawn-postgres/src/testing.rs`). Only `#![cfg(test)]`, `#[cfg(test)] mod <ident> { ... }`,
 //!    and `#[cfg(all(..., test, ...))] mod ...` are stripped; all other `#[cfg(test)]`
 //!    targets are audited as production code.
-//! 2. **Zero unallowlisted `clippy::disallowed_methods` suppressions**: Rejects any
-//!    production `allow(...)` or `expect(...)` mentioning `disallowed_methods` outside
+//! 2. **Zero unallowlisted clippy/env lint suppressions**: Rejects any
+//!    production `allow(...)` or `expect(...)` mentioning `disallowed_methods`,
+//!    `clippy::all`, `clippy::style`, bare `clippy`, or `warnings` outside
 //!    `ENV_BOUNDARY_ALLOWLIST` and verifies root `clippy.toml` forbids all four
 //!    `std::env::{var, var_os, vars, vars_os}` methods.
 //! 3. **Workspace member parity**: Asserts `WORKSPACE_CRATES` matches `[workspace] members`
@@ -799,6 +800,50 @@ fn scan_source(rel_or_abs_path: &Path, src: &str) -> Vec<Violation> {
     violations_from_lines(rel_or_abs_path, src, violated_lines)
 }
 
+fn is_forbidden_lint_args(args: &[Token]) -> bool {
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].ident_name() {
+            Some("disallowed_methods" | "warnings") => return true,
+            Some("clippy") => {
+                let is_group_or_bare = match args.get(i + 1).map(|t| &t.kind) {
+                    Some(TokenKind::ColonColon) => matches!(
+                        args.get(i + 2).and_then(Token::ident_name),
+                        Some("all" | "style")
+                    ),
+                    _ => true,
+                };
+                if is_group_or_bare {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+fn attribute_contains_forbidden_lint(inside: &[Token]) -> bool {
+    let mut i = 0usize;
+    while i < inside.len() {
+        if matches!(inside[i].ident_name(), Some("allow" | "expect"))
+            && inside
+                .get(i + 1)
+                .is_some_and(|t| t.kind == TokenKind::Open(Delim::Paren))
+            && let Some(paren_close) = matching_close(inside, i + 1)
+        {
+            if is_forbidden_lint_args(&inside[i + 2..paren_close]) {
+                return true;
+            }
+            i = paren_close + 1;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
 fn scan_disallowed_methods_allows(rel_or_abs_path: &Path, src: &str) -> Vec<Violation> {
     let tokens = tokenize(src);
     let prod_tokens = strip_cfg_test_tokens(&tokens);
@@ -829,13 +874,7 @@ fn scan_disallowed_methods_allows(rel_or_abs_path: &Path, src: &str) -> Vec<Viol
             continue;
         };
         let inside = &prod_tokens[bracket_idx + 1..close_idx];
-        let has_disallowed = inside
-            .iter()
-            .any(|t| t.ident_name() == Some("disallowed_methods"));
-        let has_allow_or_expect = inside
-            .iter()
-            .any(|t| matches!(t.ident_name(), Some("allow" | "expect")));
-        if has_disallowed && has_allow_or_expect {
+        if attribute_contains_forbidden_lint(inside) {
             violated_lines.insert(prod_tokens[i].line);
         }
         i = close_idx + 1;
@@ -1441,7 +1480,7 @@ fn env_boundary_guard_verifies_clippy_toml_and_prod_disallowed_allows() {
         vec!["std::env::var_os", "std::env::vars", "std::env::vars_os"]
     );
 
-    let prod_allows = r"
+    let prod_allows = r#"
 #[allow(clippy::disallowed_methods)]
 fn a() {}
 
@@ -1455,16 +1494,53 @@ fn c() {}
 #[cfg_attr(unix, allow(clippy::disallowed_methods))]
 fn d() {}
 
+#[allow(clippy::style)]
+fn e_style() {
+    macro_rules! grab {
+        ($m:ident, $f:ident) => {
+            std::$m::$f("BYPASS")
+        };
+    }
+    let _ = grab!(env, var);
+}
+
+#[allow(clippy::all)]
+fn f_all() {}
+
+#[expect(clippy::style)]
+fn g_expect_style() {}
+
+#[allow(warnings)]
+fn h_warnings() {}
+
+fn i_inner_all() {
+    #![allow(clippy::all)]
+}
+
+#[cfg_attr(unix, allow(clippy::style))]
+fn j_cfg_style() {}
+
+#[allow(clippy)]
+fn k_bare_clippy() {}
+
+#[cfg_attr(all(unix), allow(clippy::too_many_lines))]
+fn ok_unrelated_clippy_and_cfg_all() {}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::disallowed_methods)]
+    #![allow(clippy::all)]
     #[test]
     fn ok() {}
 }
-";
+"#;
     let found = scan_disallowed_methods_allows(Path::new("allows.rs"), prod_allows);
     let lines: Vec<usize> = found.iter().map(|v| v.line).collect();
-    assert_eq!(lines, vec![2, 6, 9, 12], "got {found:?}");
+    assert_eq!(
+        lines,
+        vec![2, 6, 9, 12, 15, 25, 28, 31, 35, 38, 41],
+        "got {found:?}"
+    );
 
     let test_file = "\n#![cfg(test)]\n#![allow(clippy::disallowed_methods)]\n#[test]\nfn ok() {}\n";
     assert!(scan_disallowed_methods_allows(Path::new("tests.rs"), test_file).is_empty());

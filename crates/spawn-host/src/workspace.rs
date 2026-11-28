@@ -54,18 +54,18 @@ pub struct D6StoreOptions {
     pub ledger: DynRefLedger,
     /// Optional bounded L1 `tmpfs` upperdir policy.
     pub l1_policy: Option<L1TmpfsPolicy>,
-    /// Optional per-file checkpoint byte limit overriding the default.
-    pub max_file_bytes: Option<u64>,
+    /// Per-file checkpoint byte limit.
+    pub max_file_bytes: u64,
 }
 
 impl D6StoreOptions {
-    /// Create D6 store options with CAS and ledger handles (`l1_policy = None`).
-    pub fn new(cas: Arc<CasMerkleStore>, ledger: DynRefLedger) -> Self {
+    /// Create D6 store options with CAS, ledger, and checkpoint file cap (`l1_policy = None`).
+    pub fn new(cas: Arc<CasMerkleStore>, ledger: DynRefLedger, max_file_bytes: u64) -> Self {
         Self {
             cas,
             ledger,
             l1_policy: None,
-            max_file_bytes: None,
+            max_file_bytes,
         }
     }
 
@@ -73,13 +73,6 @@ impl D6StoreOptions {
     #[must_use]
     pub fn with_l1_policy(mut self, policy: L1TmpfsPolicy) -> Self {
         self.l1_policy = Some(policy);
-        self
-    }
-
-    /// Override the maximum checkpoint file size (`bytes`).
-    #[must_use]
-    pub const fn with_max_file_bytes(mut self, bytes: u64) -> Self {
-        self.max_file_bytes = Some(bytes);
         self
     }
 }
@@ -110,16 +103,18 @@ pub struct D6ShadowOptions {
     pub strict_fail_closed: bool,
     /// Tracked-set scan policy (`Strict` by default).
     pub tracked_set_mode: ShadowTrackedSetMode,
-    /// Optional per-file checkpoint byte limit overriding the default.
-    pub max_file_bytes: Option<u64>,
+    /// Per-file checkpoint byte limit for primary and shadow stores.
+    pub max_file_bytes: u64,
 }
 
 impl D6ShadowOptions {
-    /// Create dual-track shadow options with strict leak checking and default scan mode.
+    /// Create dual-track shadow options with strict leak checking, default scan mode, and
+    /// explicit checkpoint file size cap `max_file_bytes`.
     pub fn new(
         shadow_root: impl Into<PathBuf>,
         cas: Arc<CasMerkleStore>,
         ledger: DynRefLedger,
+        max_file_bytes: u64,
     ) -> Self {
         Self {
             shadow_root: shadow_root.into(),
@@ -128,7 +123,7 @@ impl D6ShadowOptions {
             l1_policy: None,
             strict_fail_closed: false,
             tracked_set_mode: ShadowTrackedSetMode::Strict,
-            max_file_bytes: None,
+            max_file_bytes,
         }
     }
 
@@ -152,13 +147,6 @@ impl D6ShadowOptions {
         self.tracked_set_mode = mode;
         self
     }
-
-    /// Override the maximum checkpoint file size (`bytes`) on primary and shadow stores.
-    #[must_use]
-    pub const fn with_max_file_bytes(mut self, bytes: u64) -> Self {
-        self.max_file_bytes = Some(bytes);
-        self
-    }
 }
 
 impl std::fmt::Debug for D6ShadowOptions {
@@ -170,6 +158,7 @@ impl std::fmt::Debug for D6ShadowOptions {
             .field("l1_policy", &self.l1_policy)
             .field("strict_fail_closed", &self.strict_fail_closed)
             .field("tracked_set_mode", &self.tracked_set_mode)
+            .field("max_file_bytes", &self.max_file_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -394,48 +383,64 @@ pub enum LocalWorkspaceStore {
 
 impl LocalWorkspaceStore {
     /// The Git store over the bare repository `repo`, workspaces under
-    /// `root`.
-    pub fn git(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
-        Self::Git(GitWorkspace::new(repo, root))
+    /// `root`, with checkpoint file size cap `max_file_bytes`.
+    pub fn git(repo: impl AsRef<Path>, root: impl AsRef<Path>, max_file_bytes: u64) -> Self {
+        Self::Git(GitWorkspace::new(repo, root, max_file_bytes))
     }
 
-    /// The copy-on-write store over `repo`, workspaces under `root`. It
-    /// works on any file system (a mount copies where it cannot clone);
-    /// [`Self::auto`] chooses it only where clones work.
-    pub fn cow(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
-        Self::Cow(CowWorkspace::new(repo, root))
+    /// The copy-on-write store over `repo`, workspaces under `root`, with
+    /// checkpoint file size cap `max_file_bytes`. It works on any file
+    /// system (a mount copies where it cannot clone); [`Self::auto`] chooses
+    /// it only where clones work.
+    pub fn cow(repo: impl AsRef<Path>, root: impl AsRef<Path>, max_file_bytes: u64) -> Self {
+        Self::Cow(CowWorkspace::new(repo, root, max_file_bytes))
     }
 
-    /// The overlay store over `repo`, workspaces under `root`, once the
-    /// kernel showed an unprivileged overlay mounts under `root`
-    /// ([`overlay_supported_in`]); refused, with the kernel's reason,
-    /// otherwise.
+    /// The overlay store over `repo`, workspaces under `root`, with
+    /// checkpoint file size cap `max_file_bytes`, once the kernel showed an
+    /// unprivileged overlay mounts under `root` ([`overlay_supported_in`]);
+    /// refused, with the kernel's reason, otherwise.
     #[cfg(target_os = "linux")]
-    pub fn overlay(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<Self, String> {
+    pub fn overlay(
+        repo: impl AsRef<Path>,
+        root: impl AsRef<Path>,
+        max_file_bytes: u64,
+    ) -> Result<Self, String> {
         let root = root.as_ref();
         std::fs::create_dir_all(root)
             .map_err(|error| format!("create {}: {error}", root.display()))?;
         overlay_supported_in(root)
             .map_err(|why| format!("no unprivileged overlay under {}: {why}", root.display()))?;
-        Ok(Self::Overlay(OverlayWorkspace::new(repo, root)))
+        Ok(Self::Overlay(OverlayWorkspace::new(
+            repo,
+            root,
+            max_file_bytes,
+        )))
     }
 
     /// The overlay store: never on a system other than Linux.
     #[cfg(not(target_os = "linux"))]
-    pub fn overlay(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<Self, String> {
-        let _ = (repo, root);
+    pub fn overlay(
+        repo: impl AsRef<Path>,
+        root: impl AsRef<Path>,
+        max_file_bytes: u64,
+    ) -> Result<Self, String> {
+        let _ = (repo, root, max_file_bytes);
         Err("the overlay workspace store needs Linux".to_string())
     }
 
     /// Pure-Rust CAS Merkle + ledger workspace store (`D6Workspace`) for `project`
     /// with workspaces under `root`.
     pub fn d6(project: impl Into<String>, root: impl AsRef<Path>, options: D6StoreOptions) -> Self {
-        let mut store = D6Workspace::new(project, root, options.cas, Arc::new(options.ledger));
+        let mut store = D6Workspace::new(
+            project,
+            root,
+            options.cas,
+            Arc::new(options.ledger),
+            options.max_file_bytes,
+        );
         if let Some(policy) = options.l1_policy {
             store = store.with_l1_policy(policy);
-        }
-        if let Some(bytes) = options.max_file_bytes {
-            store = store.with_max_file_bytes(bytes);
         }
         Self::D6(store)
     }
@@ -448,19 +453,16 @@ impl LocalWorkspaceStore {
         options: D6ShadowOptions,
     ) -> Self {
         let repo = repo.as_ref();
-        let mut primary = GitWorkspace::new(repo, root);
+        let primary = GitWorkspace::new(repo, root, options.max_file_bytes);
         let mut shadow = D6Workspace::new(
             primary.project().to_string(),
             options.shadow_root,
             options.cas,
             Arc::new(options.ledger),
+            options.max_file_bytes,
         );
         if let Some(policy) = options.l1_policy {
             shadow = shadow.with_l1_policy(policy);
-        }
-        if let Some(bytes) = options.max_file_bytes {
-            primary = primary.with_max_file_bytes(bytes);
-            shadow = shadow.with_max_file_bytes(bytes);
         }
         let oracle = ShadowD6Workspace::with_git_repo(primary, shadow, repo)
             .with_strict_fail_closed(options.strict_fail_closed)
@@ -468,17 +470,15 @@ impl LocalWorkspaceStore {
         Self::D6Shadow(oracle)
     }
 
-    /// Override the maximum checkpoint file size (`bytes`) across whichever backend
-    /// this store wraps.
-    #[must_use]
-    pub fn with_max_file_bytes(self, bytes: u64) -> Self {
+    /// Checkpoint file size cap in bytes across whichever backend this store wraps.
+    pub const fn max_file_bytes(&self) -> u64 {
         match self {
-            Self::Git(git) => Self::Git(git.with_max_file_bytes(bytes)),
-            Self::Cow(cow) => Self::Cow(cow.with_max_file_bytes(bytes)),
+            Self::Git(git) => git.max_file_bytes(),
+            Self::Cow(cow) => cow.max_file_bytes(),
             #[cfg(target_os = "linux")]
-            Self::Overlay(overlay) => Self::Overlay(overlay.with_max_file_bytes(bytes)),
-            Self::D6Shadow(oracle) => Self::D6Shadow(oracle.with_max_file_bytes(bytes)),
-            Self::D6(d6) => Self::D6(d6.with_max_file_bytes(bytes)),
+            Self::Overlay(overlay) => overlay.max_file_bytes(),
+            Self::D6Shadow(oracle) => oracle.shadow().max_file_bytes(),
+            Self::D6(d6) => d6.max_file_bytes(),
         }
     }
 
@@ -487,27 +487,28 @@ impl LocalWorkspaceStore {
     /// system clones ([`cow_clone_supported`]: btrfs, XFS with reflink,
     /// APFS), else Git working copies. Never the overlay, which is chosen
     /// by name alone ([`Self::overlay`]).
-    pub fn auto(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
+    pub fn auto(repo: impl AsRef<Path>, root: impl AsRef<Path>, max_file_bytes: u64) -> Self {
         let root = root.as_ref();
         match WorkspaceBackend::auto(root) {
-            WorkspaceBackend::Cow => Self::cow(repo, root),
-            _ => Self::git(repo, root),
+            WorkspaceBackend::Cow => Self::cow(repo, root, max_file_bytes),
+            _ => Self::git(repo, root, max_file_bytes),
         }
     }
 
-    /// The store of `backend` over `repo`, workspaces under `root`; the
-    /// overlay only where the kernel mounts one ([`Self::overlay`]). Opt-in
-    /// D6 backends require CAS + ledger configuration via [`Self::d6_shadow`]
-    /// or [`Self::d6`].
+    /// The store of `backend` over `repo`, workspaces under `root`, with
+    /// checkpoint file size cap `max_file_bytes`; the overlay only where the
+    /// kernel mounts one ([`Self::overlay`]). Opt-in D6 backends require CAS
+    /// + ledger configuration via [`Self::d6_shadow`] or [`Self::d6`].
     pub fn open(
         backend: WorkspaceBackend,
         repo: impl AsRef<Path>,
         root: impl AsRef<Path>,
+        max_file_bytes: u64,
     ) -> Result<Self, String> {
         match backend {
-            WorkspaceBackend::Git => Ok(Self::git(repo, root)),
-            WorkspaceBackend::Cow => Ok(Self::cow(repo, root)),
-            WorkspaceBackend::Overlay => Self::overlay(repo, root),
+            WorkspaceBackend::Git => Ok(Self::git(repo, root, max_file_bytes)),
+            WorkspaceBackend::Cow => Ok(Self::cow(repo, root, max_file_bytes)),
+            WorkspaceBackend::Overlay => Self::overlay(repo, root, max_file_bytes),
             WorkspaceBackend::D6Shadow | WorkspaceBackend::D6 => Err(format!(
                 "workspace backend {} requires CAS and RefLedger configuration (use \
                  LocalWorkspaceStore::{} or WorkspaceSettings)",
@@ -1088,8 +1089,13 @@ mod tests {
     fn open_requires_d6_options_and_never_falls_back_to_git() {
         let base = scratch_dir("open");
         for b in [WorkspaceBackend::D6Shadow, WorkspaceBackend::D6] {
-            let err = LocalWorkspaceStore::open(b, base.join("r.git"), &base)
-                .expect_err("requires options");
+            let err = LocalWorkspaceStore::open(
+                b,
+                base.join("r.git"),
+                &base,
+                crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+            )
+            .expect_err("requires options");
             assert!(err.contains(b.name()), "{err}");
         }
         let _ = std::fs::remove_dir_all(&base);

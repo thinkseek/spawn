@@ -399,12 +399,13 @@ struct Holder {
 
 impl OverlayWorkspace {
     /// Store over the bare repository `repo`, keeping layers, state and
-    /// mount points under `root`, resolved through its symlinks. `root`
-    /// must be a root of its own, never a [`GitWorkspace`]'s.
-    pub fn new(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
+    /// mount points under `root`, resolved through its symlinks, and enforcing
+    /// `max_file_bytes` per checkpointed file. `root` must be a root of its
+    /// own, never a [`GitWorkspace`]'s.
+    pub fn new(repo: impl AsRef<Path>, root: impl AsRef<Path>, max_file_bytes: u64) -> Self {
         let root = crate::root::canonical_root(root.as_ref());
         Self {
-            git: GitWorkspace::new(repo, &root),
+            git: GitWorkspace::new(repo, &root, max_file_bytes),
             root,
             lower_layers: Vec::new(),
             derived: DEFAULT_DERIVED_DIRS.iter().map(OsString::from).collect(),
@@ -440,12 +441,9 @@ impl OverlayWorkspace {
         self
     }
 
-    /// The same store with a checkpoint file size cap of `bytes` instead of
-    /// [`crate::workspace_rules::DEFAULT_MAX_FILE_MB`].
-    #[must_use]
-    pub fn with_max_file_bytes(mut self, bytes: u64) -> Self {
-        self.git = self.git.clone().with_max_file_bytes(bytes);
-        self
+    /// Checkpoint file size cap in bytes.
+    pub const fn max_file_bytes(&self) -> u64 {
+        self.git.max_file_bytes()
     }
 
     /// The store root, resolved.
@@ -2400,7 +2398,11 @@ mod tests {
         git(&["-C", c, "commit", "--quiet", "-m", "seed"]);
         git(&["init", "--quiet", "--bare", repo.to_str().unwrap()]);
         git(&["-C", c, "push", "--quiet", repo.to_str().unwrap(), "main"]);
-        let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+        let store = OverlayWorkspace::new(
+            &repo,
+            scratch.join("ws"),
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         let agent = BranchName::new("agent".to_string()).unwrap();
         store.ensure_branch(&agent, None).unwrap();
         let workspace = store.mount(&agent).unwrap();

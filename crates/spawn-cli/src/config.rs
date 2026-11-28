@@ -683,6 +683,7 @@ impl WorkspaceSettings {
         cas_dedup: bool,
         root: &std::path::Path,
         probes: &Probes<'_>,
+        max_file_bytes: u64,
     ) -> Result<Self, String> {
         let active = match configured {
             WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay) => {
@@ -706,7 +707,7 @@ impl WorkspaceSettings {
             active,
             cas_dedup,
             d6: D6RuntimeConfig::default(),
-            max_file_bytes: spawn_host::workspace_rules::max_file_bytes(None),
+            max_file_bytes,
         })
     }
 
@@ -714,13 +715,6 @@ impl WorkspaceSettings {
     #[must_use]
     pub(crate) fn with_d6(mut self, d6: D6RuntimeConfig) -> Self {
         self.d6 = d6;
-        self
-    }
-
-    /// Override the maximum checkpoint file size cap in bytes.
-    #[must_use]
-    pub(crate) fn with_max_file_bytes(mut self, max_file_bytes: u64) -> Self {
-        self.max_file_bytes = max_file_bytes;
         self
     }
 
@@ -744,9 +738,9 @@ impl WorkspaceSettings {
         resolved
             .entry(root.to_path_buf())
             .or_insert_with(|| {
-                let settings = Self::resolve(configured, cas, root, &Probes::host())?
-                    .with_d6(d6)
-                    .with_max_file_bytes(max_file_bytes);
+                let settings =
+                    Self::resolve(configured, cas, root, &Probes::host(), max_file_bytes)?
+                        .with_d6(d6);
                 if let Some(existing) = spawn_host::root_backend(root).map_err(|error| {
                     format!("read workspace backend under {}: {error}", root.display())
                 })? && !spawn_host::workspace::backends_compatible(existing, settings.active)
@@ -824,19 +818,14 @@ impl WorkspaceSettings {
             });
         }
         let active = named.or(marked);
-        let settings = active.map(|active| Self {
-            configured,
-            active,
-            cas_dedup: cas,
-            d6: D6RuntimeConfig::default(),
-            max_file_bytes: spawn_host::workspace_rules::max_file_bytes(None),
-        });
         serde_json::json!({
             "configured": configured.name(),
             "active": active.map(spawn_host::WorkspaceBackend::name),
             "root": marked.map(spawn_host::WorkspaceBackend::name),
-            "cas_dedup": settings.as_ref().map_or(if cas { "on" } else { "off" }, Self::cas_state),
-            "servable": settings.as_ref().is_none_or(|settings| settings.servable().is_ok()),
+            "cas_dedup": active.map_or(if cas { "on" } else { "off" }, |active| {
+                Self::cas_state_for(cas, active)
+            }),
+            "servable": active.is_none_or(|active| Self::servable_for(active).is_ok()),
         })
     }
 
@@ -853,8 +842,8 @@ impl WorkspaceSettings {
         );
         match self.active {
             spawn_host::WorkspaceBackend::D6 => {
-                let mut opts = spawn_host::workspace::D6StoreOptions::new(cas, ledger)
-                    .with_max_file_bytes(self.max_file_bytes);
+                let mut opts =
+                    spawn_host::workspace::D6StoreOptions::new(cas, ledger, self.max_file_bytes);
                 if let Some(policy) = self.d6.l1_policy() {
                     opts = opts.with_l1_policy(policy);
                 }
@@ -869,8 +858,8 @@ impl WorkspaceSettings {
                     D6RuntimeConfig::shadow_work_root(root),
                     cas,
                     ledger,
+                    self.max_file_bytes,
                 )
-                .with_max_file_bytes(self.max_file_bytes)
                 .with_strict_fail_closed(self.d6.strict_fail_closed);
                 if let Some(policy) = self.d6.l1_policy() {
                     opts = opts.with_l1_policy(policy);
@@ -879,16 +868,13 @@ impl WorkspaceSettings {
             }
             other => Ok(match other {
                 spawn_host::WorkspaceBackend::Cow => {
-                    spawn_host::LocalWorkspaceStore::cow(repo, root)
-                        .with_max_file_bytes(self.max_file_bytes)
+                    spawn_host::LocalWorkspaceStore::cow(repo, root, self.max_file_bytes)
                 }
                 #[cfg(target_os = "linux")]
                 spawn_host::WorkspaceBackend::Overlay => spawn_host::LocalWorkspaceStore::Overlay(
-                    spawn_host::OverlayWorkspace::new(repo, root)
-                        .with_max_file_bytes(self.max_file_bytes),
+                    spawn_host::OverlayWorkspace::new(repo, root, self.max_file_bytes),
                 ),
-                _ => spawn_host::LocalWorkspaceStore::git(repo, root)
-                    .with_max_file_bytes(self.max_file_bytes),
+                _ => spawn_host::LocalWorkspaceStore::git(repo, root, self.max_file_bytes),
             }),
         }
     }
@@ -913,13 +899,13 @@ impl WorkspaceSettings {
         root: &std::path::Path,
     ) -> spawn_host::LocalWorkspaceStore {
         match self.active {
-            spawn_host::WorkspaceBackend::Cow => spawn_host::LocalWorkspaceStore::cow(repo, root)
-                .with_max_file_bytes(self.max_file_bytes),
+            spawn_host::WorkspaceBackend::Cow => {
+                spawn_host::LocalWorkspaceStore::cow(repo, root, self.max_file_bytes)
+            }
             #[cfg(target_os = "linux")]
             // Supported: [`Self::resolve`] asked the kernel.
             spawn_host::WorkspaceBackend::Overlay => spawn_host::LocalWorkspaceStore::Overlay(
-                spawn_host::OverlayWorkspace::new(repo, root)
-                    .with_max_file_bytes(self.max_file_bytes),
+                spawn_host::OverlayWorkspace::new(repo, root, self.max_file_bytes),
             ),
             spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow => {
                 let ledger: spawn_host::workspace::DynRefLedger =
@@ -927,8 +913,7 @@ impl WorkspaceSettings {
                 self.build_d6_store(repo, root, ledger)
                     .unwrap_or_else(|error| panic!("{error}"))
             }
-            _ => spawn_host::LocalWorkspaceStore::git(repo, root)
-                .with_max_file_bytes(self.max_file_bytes),
+            _ => spawn_host::LocalWorkspaceStore::git(repo, root, self.max_file_bytes),
         }
     }
 
@@ -961,21 +946,23 @@ impl WorkspaceSettings {
 
     /// What the cas deduplication does with this backend: `"on"`, `"off"`,
     /// or `"inactive"` (asked for, but only Cow workspaces deduplicate).
-    pub(crate) fn cas_state(&self) -> &'static str {
-        match (self.cas_dedup, self.active) {
+    pub(crate) fn cas_state_for(
+        cas_dedup: bool,
+        active: spawn_host::WorkspaceBackend,
+    ) -> &'static str {
+        match (cas_dedup, active) {
             (false, _) => "off",
             (true, spawn_host::WorkspaceBackend::Cow) => "on",
             (true, _) => "inactive",
         }
     }
 
-    /// Refused where engines run (`spawn loop`, `spawn tick`) for a backend
-    /// they cannot serve yet: an overlay workspace is seen only inside its
-    /// holder's mount namespace, while the Bridge starts an engine in the
-    /// workspace's host path and the loop reads its reports, acks and exit
-    /// files there. Never run half-served. (`auto` never chooses it.)
-    pub(crate) fn servable(&self) -> Result<(), String> {
-        if self.active == spawn_host::WorkspaceBackend::Overlay {
+    pub(crate) fn cas_state(&self) -> &'static str {
+        Self::cas_state_for(self.cas_dedup, self.active)
+    }
+
+    pub(crate) fn servable_for(active: spawn_host::WorkspaceBackend) -> Result<(), String> {
+        if active == spawn_host::WorkspaceBackend::Overlay {
             return Err(
                 "SPAWN_WORKSPACE_BACKEND=overlay: spawn loop does not serve overlay workspaces \
                  to engines yet (an engine would start in the empty host mount point, and its \
@@ -985,6 +972,15 @@ impl WorkspaceSettings {
             );
         }
         Ok(())
+    }
+
+    /// Refused where engines run (`spawn loop`, `spawn tick`) for a backend
+    /// they cannot serve yet: an overlay workspace is seen only inside its
+    /// holder's mount namespace, while the Bridge starts an engine in the
+    /// workspace's host path and the loop reads its reports, acks and exit
+    /// files there. Never run half-served. (`auto` never chooses it.)
+    pub(crate) fn servable(&self) -> Result<(), String> {
+        Self::servable_for(self.active)
     }
 
     /// The line `spawn loop` says at start.
@@ -1552,13 +1548,14 @@ mod workspace_tests {
         let none = |_: &Path| Err("user namespaces are off".to_string());
         let clones = |_: &Path| true;
         let overlay = WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay);
-        let error = WorkspaceSettings::resolve(overlay, false, root, &probes(&none, &clones))
+        let cap = spawn_host::DEFAULT_MAX_FILE_BYTES;
+        let error = WorkspaceSettings::resolve(overlay, false, root, &probes(&none, &clones), cap)
             .expect_err("refused");
         assert!(error.contains("SPAWN_WORKSPACE_BACKEND=overlay"), "{error}");
         assert!(error.contains("user namespaces are off"), "{error}");
         assert!(error.contains("/srv/work"), "{error}");
         #[cfg(not(target_os = "linux"))]
-        assert!(WorkspaceSettings::resolve(overlay, false, root, &Probes::host()).is_err());
+        assert!(WorkspaceSettings::resolve(overlay, false, root, &Probes::host(), cap).is_err());
     }
 
     /// `auto` is spawn-host's rule: Cow where clones work, else Git, and
@@ -1570,10 +1567,17 @@ mod workspace_tests {
         let never = |_: &Path| -> Result<(), String> { panic!("auto asks no overlay probe") };
         let clones = |_: &Path| true;
         let copies = |_: &Path| false;
+        let cap = spawn_host::DEFAULT_MAX_FILE_BYTES;
         let active = |overlay: &dyn Fn(&Path) -> Result<(), String>,
                       cow: &dyn Fn(&Path) -> bool| {
-            WorkspaceSettings::resolve(WorkspaceBackend::Auto, false, root, &probes(overlay, cow))
-                .unwrap()
+            WorkspaceSettings::resolve(
+                WorkspaceBackend::Auto,
+                false,
+                root,
+                &probes(overlay, cow),
+                cap,
+            )
+            .unwrap()
         };
         assert_eq!(
             active(&never, &clones).active,
@@ -1605,9 +1609,14 @@ mod workspace_tests {
                 spawn_host::WorkspaceBackend::Cow,
             ),
         ] {
-            let settings =
-                WorkspaceSettings::resolve(configured, true, root, &probes(&never, &never_cow))
-                    .unwrap();
+            let settings = WorkspaceSettings::resolve(
+                configured,
+                true,
+                root,
+                &probes(&never, &never_cow),
+                cap,
+            )
+            .unwrap();
             assert_eq!(settings.active, backend);
         }
     }
@@ -1617,11 +1626,13 @@ mod workspace_tests {
         let root = Path::new("/srv/work");
         let mounts = |_: &Path| Ok(());
         let clones = |_: &Path| true;
+        let cap = spawn_host::DEFAULT_MAX_FILE_BYTES;
         let auto = WorkspaceSettings::resolve(
             WorkspaceBackend::Auto,
             true,
             root,
             &probes(&mounts, &clones),
+            cap,
         )
         .unwrap();
         assert_eq!(
@@ -1633,6 +1644,7 @@ mod workspace_tests {
             true,
             root,
             &probes(&mounts, &clones),
+            cap,
         )
         .unwrap();
         assert_eq!(git.cas_state(), "inactive");
@@ -1644,6 +1656,7 @@ mod workspace_tests {
             false,
             root,
             &probes(&mounts, &clones),
+            cap,
         )
         .unwrap();
         assert_eq!(overlay.active, spawn_host::WorkspaceBackend::Overlay);
@@ -1737,8 +1750,14 @@ mod workspace_tests {
             cow: &clones,
             marked: host.marked,
         };
-        let settings =
-            WorkspaceSettings::resolve(WorkspaceBackend::Auto, false, &base, &probes).unwrap();
+        let settings = WorkspaceSettings::resolve(
+            WorkspaceBackend::Auto,
+            false,
+            &base,
+            &probes,
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        )
+        .unwrap();
         assert_eq!(settings.active, spawn_host::WorkspaceBackend::Git);
         settings.claim(&base).expect("Git's root claimed for Git");
         let peek = WorkspaceSettings::peek_with(
@@ -1758,8 +1777,14 @@ mod workspace_tests {
             cow: &copies,
             marked: host.marked,
         };
-        let settings =
-            WorkspaceSettings::resolve(WorkspaceBackend::Auto, false, &cow, &probes).unwrap();
+        let settings = WorkspaceSettings::resolve(
+            WorkspaceBackend::Auto,
+            false,
+            &cow,
+            &probes,
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        )
+        .unwrap();
         assert_eq!(settings.active, spawn_host::WorkspaceBackend::Cow);
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1781,6 +1806,7 @@ mod workspace_tests {
             false,
             &root,
             &probes(&mounts, &clones),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
         )
         .unwrap();
         let refused = overlay.claim(&root).expect_err("not served");
@@ -1798,6 +1824,7 @@ mod workspace_tests {
             false,
             &root,
             &probes(&mounts, &clones),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
         )
         .unwrap();
         cow.claim(&root).expect("the root is free");
@@ -1967,6 +1994,7 @@ mod workspace_tests {
                 false,
                 Path::new("/srv/w"),
                 &probes(&never, &never_cow),
+                spawn_host::DEFAULT_MAX_FILE_BYTES,
             )
             .expect("resolve");
             assert_eq!(s.active, eng);

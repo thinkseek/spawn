@@ -52,8 +52,8 @@ use crate::tree_path::{TreePath, nul_fields};
 use crate::workspace_rules::{
     CONFLICT_MARKER_SIZE, ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER, MAIN_COPIES, Oversized,
     SET_ASIDE_FILES, SET_ASIDE_WAITS, encode_oversized, has_conflict_block_sized, lock_file,
-    max_file_bytes, names_files_outside_git, oversized_digest, oversized_file,
-    oversized_notice_message, parse_oversized, set_aside_kept_message, stale_ref, worker_head_ref,
+    names_files_outside_git, oversized_digest, oversized_file, oversized_notice_message,
+    parse_oversized, set_aside_kept_message, stale_ref, worker_head_ref,
 };
 
 /// Distinguishes the staged mounts of one process ([`GitWorkspace::staging_path`]).
@@ -264,21 +264,21 @@ pub struct GitWorkspace {
     repo: PathBuf,
     root: PathBuf,
     git: String,
-    /// The size cap of one file in a checkpoint ([`max_file_bytes`]).
+    /// The size cap of one file in a checkpoint ([`crate::workspace_rules::max_file_bytes`]).
     max_file_bytes: u64,
 }
 
 impl GitWorkspace {
     /// Store that keeps working trees on this machine, under `root`
-    /// resolved through its symlinks once, here ([`crate::root`]): every
-    /// workspace id it mints names the directory as the engine's process
-    /// sees it.
-    pub fn new(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
+    /// resolved through its symlinks once, here ([`crate::root`]), with a
+    /// checkpoint file size cap of `max_file_bytes`: every workspace id it
+    /// mints names the directory as the engine's process sees it.
+    pub fn new(repo: impl AsRef<Path>, root: impl AsRef<Path>, max_file_bytes: u64) -> Self {
         Self {
             repo: repo.as_ref().to_path_buf(),
             root: crate::root::canonical_root(root.as_ref()),
             git: "git".to_string(),
-            max_file_bytes: max_file_bytes(None),
+            max_file_bytes,
         }
     }
 
@@ -287,12 +287,9 @@ impl GitWorkspace {
         &self.root
     }
 
-    /// The same store with a size cap of `bytes` for one file in a
-    /// checkpoint instead of [`crate::workspace_rules::DEFAULT_MAX_FILE_MB`].
-    #[must_use]
-    pub fn with_max_file_bytes(mut self, bytes: u64) -> Self {
-        self.max_file_bytes = bytes;
-        self
+    /// The checkpoint size cap for one file in bytes.
+    pub const fn max_file_bytes(&self) -> u64 {
+        self.max_file_bytes
     }
 
     /// Every git this store runs: in the C locale ([`git_command`]), on its
@@ -507,7 +504,7 @@ impl GitWorkspace {
 
     /// Tree of the work tree in `directory` for a checkpoint of `branch`
     /// whose parent is `head`, built against `index`, and the files over
-    /// the size cap ([`max_file_bytes`]) left out of it, with their sizes.
+    /// the size cap ([`crate::workspace_rules::max_file_bytes`]) left out of it, with their sizes.
     ///
     /// Build output and files over the cap leave the index after `add -A`,
     /// so a `.gitignore` inside the tree cannot re-include them; a file over
@@ -869,7 +866,7 @@ impl GitWorkspace {
     /// and untracked ones no `.gitignore`, `info/exclude` or build-output
     /// rule ignores), never an engine runtime file ([`ENGINE_RUNTIME_FILES`])
     /// unless both `head` and `main` track it, and no file over the cap
-    /// ([`max_file_bytes`]) unless `main` holds it as a blob. A tracked path
+    /// ([`crate::workspace_rules::max_file_bytes`]) unless `main` holds it as a blob. A tracked path
     /// is listed even when it is gone from `directory` or ignored: the
     /// caller reads the work tree for it. `index` names a file that does not
     /// exist (nothing is written to it): the listing is against `head`
@@ -3138,7 +3135,11 @@ mod tests {
         std::fs::write(checkout.join("other.txt"), "other\n").expect("write");
         git(&checkout, &["add", "-A"]);
         git(&checkout, &["commit", "-qm", "base"]);
-        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"));
+        let store = GitWorkspace::new(
+            checkout.join(".git"),
+            base.join("work"),
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         let paths: Vec<(TreePath, u64)> = names
             .iter()
             .map(|name| (TreePath::from(name.as_str()), 1))
@@ -3205,7 +3206,11 @@ mod tests {
         std::fs::write(checkout.join("README.md"), "base\n").expect("write");
         git(&checkout, &["add", "-A"]);
         git(&checkout, &["commit", "-qm", "base"]);
-        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"));
+        let store = GitWorkspace::new(
+            checkout.join(".git"),
+            base.join("work"),
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         let branch = BranchName::new("agent_a").expect("valid branch");
         store.ensure_branch(&branch, None).expect("branch");
         let workspace = store.mount(&branch).expect("mount");
@@ -3537,8 +3542,7 @@ mod tests {
         std::fs::write(checkout.join("README.md"), "base\n").expect("write");
         git(&checkout, &["add", "-A"]);
         git(&checkout, &["commit", "-qm", "base"]);
-        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"))
-            .with_max_file_bytes(1 << 20);
+        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"), 1 << 20);
         let branch = BranchName::new("agent_a").expect("valid branch");
         store.ensure_branch(&branch, None).expect("branch");
         let workspace = store.mount(&branch).expect("mount");
@@ -3742,8 +3746,7 @@ mod tests {
         std::fs::write(checkout.join("model.bin"), vec![4u8; 2 << 20]).expect("write");
         git(&checkout, &["add", "-A"]);
         git(&checkout, &["commit", "-qm", "base"]);
-        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"))
-            .with_max_file_bytes(1 << 20);
+        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"), 1 << 20);
         let branch = BranchName::new("agent_a").expect("valid branch");
         store.ensure_branch(&branch, None).expect("branch");
         let workspace = store.mount(&branch).expect("mount");
@@ -4157,7 +4160,11 @@ mod tests {
     #[test]
     fn every_git_runs_in_the_c_locale() {
         use std::ffi::OsStr;
-        let store = GitWorkspace::new("/nonexistent.git", std::env::temp_dir());
+        let store = GitWorkspace::new(
+            "/nonexistent.git",
+            std::env::temp_dir(),
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         for command in [
             crate::git_process::git_command("git"),
             crate::git_process::test_git_command(),
@@ -4323,7 +4330,11 @@ mod tests {
         std::fs::write(checkout.join("gone.txt"), "kept\n").expect("write");
         git(&checkout, &["add", "-A"]);
         git(&checkout, &["commit", "-qm", "base"]);
-        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"));
+        let store = GitWorkspace::new(
+            checkout.join(".git"),
+            base.join("work"),
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         let worked = |agent: &str, file: &str| {
             let branch = BranchName::new(agent).expect("valid branch");
             store.ensure_branch(&branch, None).expect("branch");
@@ -4492,7 +4503,11 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
             .expect("chmod gated-git");
 
-        let store_b = GitWorkspace::new(checkout.join(".git"), &work);
+        let store_b = GitWorkspace::new(
+            checkout.join(".git"),
+            &work,
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         let store_a = GitWorkspace {
             git: script.to_string_lossy().to_string(),
             ..store_b.clone()
@@ -4640,7 +4655,11 @@ mod tests {
         git(&checkout, &["add", "-A"]);
         git(&checkout, &["commit", "-qm", "base"]);
 
-        let store = Arc::new(GitWorkspace::new(checkout.join(".git"), &work));
+        let store = Arc::new(GitWorkspace::new(
+            checkout.join(".git"),
+            &work,
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        ));
         let branch = BranchName::new("agent_a").expect("valid branch");
         store.ensure_branch(&branch, None).expect("branch");
         let ws = store.mount(&branch).expect("mount");
@@ -4699,7 +4718,11 @@ mod tests {
         git(&checkout, &["add", "-A"]);
         git(&checkout, &["commit", "-qm", "base"]);
 
-        let store = GitWorkspace::new(checkout.join(".git"), &work);
+        let store = GitWorkspace::new(
+            checkout.join(".git"),
+            &work,
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         let branch = BranchName::new("agent_a").expect("valid branch");
         store.ensure_branch(&branch, None).expect("branch");
         let ws = store.mount(&branch).expect("mount");
@@ -4787,7 +4810,11 @@ mod tests {
         std::fs::write(checkout.join("README.md"), "base\n").expect("write base");
         git(&checkout, &["add", "-A"]);
         git(&checkout, &["commit", "-qm", "base commit"]);
-        let store = GitWorkspace::new(checkout.join(".git"), &work);
+        let store = GitWorkspace::new(
+            checkout.join(".git"),
+            &work,
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         let branch = BranchName::new("agent_worker_w1").expect("valid branch");
         store.ensure_branch(&branch, None).expect("ensure branch");
         let ws = store.mount(&branch).expect("mount");
@@ -4858,7 +4885,11 @@ mod tests {
         git(&checkout, &["commit", "-qm", "base commit"]);
         git(&outside, &["init", "--bare", "-q"]);
 
-        let store = GitWorkspace::new(checkout.join(".git"), &work);
+        let store = GitWorkspace::new(
+            checkout.join(".git"),
+            &work,
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         let branch = BranchName::new("agent_worker_guard").expect("valid branch");
         store.ensure_branch(&branch, None).expect("ensure branch");
         let ws = store.mount(&branch).expect("mount");

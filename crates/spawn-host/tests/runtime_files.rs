@@ -45,7 +45,11 @@ fn project(tag: &str, files: &[(&str, &str)]) -> (Scratch, PathBuf, GitWorkspace
     git(&checkout, &["commit", "-qm", "base"]);
     let root = base.join("work");
     fs::create_dir_all(&root).expect("create the workspace root");
-    let store = GitWorkspace::new(checkout.join(".git"), &root);
+    let store = GitWorkspace::new(
+        checkout.join(".git"),
+        &root,
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     (base, checkout, store, root)
 }
 

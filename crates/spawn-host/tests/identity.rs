@@ -77,7 +77,11 @@ impl World {
     }
 
     fn store(&self) -> GitWorkspace {
-        GitWorkspace::new(&self.repo, self.configured())
+        GitWorkspace::new(
+            &self.repo,
+            self.configured(),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        )
     }
 }
 

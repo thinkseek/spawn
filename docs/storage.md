@@ -1219,7 +1219,7 @@ three must hold:
   sight never moves, and a schema gone from a server that answered is
   dropped.
 
-Every test schema is made so (`PostgresStore::connect_in_schema`,
+Every test schema is made so (`PostgresStore::connect_in_schema_with_options`,
 `TestSchema`, the spawn-postgres test helpers, `made_schema_sql`). Its
 connection's `application_name` is the schema's name, and it carries that
 comment.

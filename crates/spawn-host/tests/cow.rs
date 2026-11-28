@@ -183,7 +183,7 @@ fn extents(path: &Path) -> Option<(Extents, bool)> {
 fn workspaces_are_isolated_cow_clones_committed_by_manifest() {
     let base = scratch("cow-store");
     let repo = seeded(&base, 200);
-    let store = CowWorkspace::new(&repo, base.join("work"));
+    let store = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     let cow = store.cow_supported();
     eprintln!("copy-on-write clones on this file system: {cow}");
 
@@ -410,7 +410,7 @@ fn workspaces_are_isolated_cow_clones_committed_by_manifest() {
 fn unmount_keeps_transcripts_and_never_follows_links() {
     let base = scratch("cow-unmount");
     let repo = seeded(&base, 2);
-    let store = CowWorkspace::new(&repo, base.join("work"));
+    let store = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     store
         .ensure_branch(&branch("agent_a"), None)
         .expect("ensure");
@@ -1088,7 +1088,7 @@ fn a_tree_that_escapes_is_refused_and_writes_nothing_outside() {
         "evil_dotgit",
         &mktree(&repo, &format!("040000 tree {hooks}\t.GIT\n")),
     );
-    let store = CowWorkspace::new(&repo, base.join("work"));
+    let store = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     for name in ["evil_dup", "evil_dotdot", "evil_dotgit"] {
         match store.mount(&branch(name)) {
             Err(WorkspaceError::Refused { code, .. }) => assert_eq!(code, UNSAFE_TREE, "{name}"),
@@ -1120,7 +1120,7 @@ fn unmount_refuses_an_unreadable_workspace_and_deletes_nothing() {
     }
     let base = scratch("cow-unreadable");
     let repo = seeded(&base, 1);
-    let store = CowWorkspace::new(&repo, base.join("work"));
+    let store = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     store
         .ensure_branch(&branch("agent_a"), None)
         .expect("ensure");
@@ -1153,7 +1153,7 @@ fn submodule_gitlinks_survive_commit_and_remount() {
     let top = mktree(&repo, &format!("{listing}\n040000 tree {vendor}\tvendor\n"));
     let commit = git(&repo, &["commit-tree", &top, "-p", "main", "-m", "sub"]);
     git(&repo, &["update-ref", "refs/heads/main", &commit]);
-    let store = CowWorkspace::new(&repo, base.join("work"));
+    let store = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     store
         .ensure_branch(&branch("agent_a"), None)
         .expect("ensure");
@@ -1190,8 +1190,8 @@ fn submodule_gitlinks_survive_commit_and_remount() {
 fn two_stores_mounting_one_branch_at_once_both_succeed() {
     let base = scratch("cow-race");
     let repo = seeded(&base, 20);
-    let first = CowWorkspace::new(&repo, base.join("work"));
-    let second = CowWorkspace::new(&repo, base.join("work"));
+    let first = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
+    let second = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     first
         .ensure_branch(&branch("agent_a"), None)
         .expect("ensure");
@@ -1220,7 +1220,7 @@ fn two_stores_mounting_one_branch_at_once_both_succeed() {
 fn unmount_refuses_while_a_process_works_inside() {
     let base = scratch("cow-busy");
     let repo = seeded(&base, 1);
-    let store = CowWorkspace::new(&repo, base.join("work"));
+    let store = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     store
         .ensure_branch(&branch("agent_a"), None)
         .expect("ensure");
@@ -1259,7 +1259,7 @@ fn unmount_refuses_while_a_process_works_inside() {
 fn unmount_refuses_while_a_worker_thread_holds_a_file_inside() {
     let base = scratch("cow-busy-thread");
     let repo = seeded(&base, 1);
-    let store = CowWorkspace::new(&repo, base.join("work"));
+    let store = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     store
         .ensure_branch(&branch("agent_a"), None)
         .expect("ensure");
@@ -1292,7 +1292,7 @@ fn unmount_refuses_while_a_worker_thread_holds_a_file_inside() {
 fn kept_transcripts_tell_branches_apart() {
     let base = scratch("cow-kept");
     let repo = seeded(&base, 1);
-    let store = CowWorkspace::new(&repo, base.join("work"));
+    let store = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     for name in ["a", "a-b"] {
         store.ensure_branch(&branch(name), None).expect("ensure");
         let workspace = store.mount(&branch(name)).expect("mount");
@@ -1325,7 +1325,7 @@ fn refused_with(result: Result<impl std::fmt::Debug, WorkspaceError>, expected: 
 fn a_directory_the_store_did_not_mount_is_never_touched() {
     let base = scratch("cow-owned");
     let repo = seeded(&base, 1);
-    let store = CowWorkspace::new(&repo, base.join("work"));
+    let store = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     // An ordinary workspace of the same name, made by someone else.
     let foreign = store.root().join("agent_x");
     fs::create_dir_all(&foreign).expect("mkdir");
@@ -1368,7 +1368,7 @@ fn a_directory_the_store_did_not_mount_is_never_touched() {
 fn a_worker_lease_blocks_replacement_unmount_and_dedup() {
     let base = scratch("cow-lease");
     let repo = seeded(&base, 1);
-    let store = CowWorkspace::new(&repo, base.join("work"));
+    let store = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     store
         .ensure_branch(&branch("agent_a"), None)
         .expect("ensure");
@@ -1533,7 +1533,7 @@ fn a_tracked_path_under_a_build_directory_survives_checkpoints() {
     fs::write(checkout.join("target/config"), "tracked\n").expect("write");
     git(&checkout, &["add", "-f", "target/config"]);
     git(&checkout, &["commit", "-qm", "config"]);
-    let store = CowWorkspace::new(&repo, base.join("work"));
+    let store = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     store
         .ensure_branch(&branch("agent_a"), None)
         .expect("ensure");
@@ -1634,7 +1634,7 @@ fn ignoring(base: &Path) -> (PathBuf, CowWorkspace, WorkspaceId) {
     fs::write(checkout.join(".gitignore"), ".env\ndist/\n").expect("write");
     git(&checkout, &["add", ".gitignore"]);
     git(&checkout, &["commit", "-qm", "ignore"]);
-    let store = CowWorkspace::new(&repo, base.join("work")).with_max_file_bytes(1 << 20);
+    let store = CowWorkspace::new(&repo, base.join("work"), 1 << 20);
     store
         .ensure_branch(&branch("agent_a"), None)
         .expect("ensure");
@@ -1836,7 +1836,7 @@ fn a_large_untracked_transcript_is_no_size_notice() {
 fn bench_cow_mount_commit_and_dedup() {
     let base = scratch("cow-bench");
     let repo = seeded(&base, 2000);
-    let store = CowWorkspace::new(&repo, base.join("work"));
+    let store = CowWorkspace::new(&repo, base.join("work"), spawn_host::DEFAULT_MAX_FILE_BYTES);
     println!("copy-on-write supported: {}", store.cow_supported());
     for at in 0..4 {
         let name = format!("agent_{at}");

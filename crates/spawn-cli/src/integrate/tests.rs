@@ -336,7 +336,7 @@ fn a_landing_reaches_the_agents_pushed_branch_through_the_next_merge() {
     let root = base.join("host");
     let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
     let mirror_path = mirror.to_string_lossy().to_string();
-    let store = GitWorkspace::new(&mirror, &root);
+    let store = GitWorkspace::new(&mirror, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     let rev = |reference: &str| {
         git(&["--git-dir", &mirror_path, "rev-parse", reference]).expect("rev-parse")
     };
@@ -452,7 +452,7 @@ fn world(
     git(&["clone", "-q", "--bare", &seed_path, &source]).expect("bare source");
     let root = base.join("host");
     let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
-    let store = spawn_host::GitWorkspace::new(&mirror, &root);
+    let store = spawn_host::GitWorkspace::new(&mirror, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     (base, source, root, mirror, store)
 }
 
@@ -2312,7 +2312,11 @@ fn own_commits_under_forced_signing() {
     );
 
     let mirror = format!("{seed_path}/.git");
-    let store = spawn_host::GitWorkspace::new(&mirror, base.join("work"));
+    let store = spawn_host::GitWorkspace::new(
+        &mirror,
+        base.join("work"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     let branch = spawn_core::id::BranchName::new("agent_signed").expect("valid branch");
     store.ensure_branch(&branch, None).expect("branch");
     let workspace = store.mount(&branch).expect("mount");
@@ -2997,7 +3001,11 @@ fn d6_judge_inspects_pending_merge_conflict_markers_and_patch_without_git_mirror
 
     let cas = Arc::new(CasMerkleStore::open(root.join(".d6/cas")).expect("cas"));
     let ledger = Arc::new(InMemoryRefLedger::new());
-    let opts = spawn_host::workspace::D6StoreOptions::new(Arc::clone(&cas), ledger);
+    let opts = spawn_host::workspace::D6StoreOptions::new(
+        Arc::clone(&cas),
+        ledger,
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     let local = LocalWorkspaceStore::d6("d6-judge-proj", &root, opts);
     let d6 = local.d6_workspace().expect("d6");
     let d6_ledger = d6.ledger();

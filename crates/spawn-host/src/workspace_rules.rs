@@ -72,6 +72,10 @@ pub const SET_ASIDE_WAITS: &str = "SetAsideWaits";
 /// every checkpoint that changed it (docs/storage.md).
 pub const DEFAULT_MAX_FILE_MB: u64 = 100;
 
+/// The default size cap of one file in a checkpoint, in bytes
+/// ([`DEFAULT_MAX_FILE_MB`] MiB).
+pub const DEFAULT_MAX_FILE_BYTES: u64 = DEFAULT_MAX_FILE_MB << 20;
+
 /// The size cap of one file in a checkpoint, in bytes: `SPAWN_MAX_FILE_MB`
 /// (`value`) when it is a positive number of MiB, else
 /// [`DEFAULT_MAX_FILE_MB`].

@@ -210,7 +210,11 @@ fn five_agents_share_one_lower_layer_and_commit_their_own_diff() {
     fs::create_dir_all(&transcripts).unwrap();
     fs::write(transcripts.join("agent-0.jsonl"), b"{\"turn\":1}\n").unwrap();
     let main = git_in(&repo, &["rev-parse", "main"]);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
 
     let names: Vec<String> = (0..5).map(|n| format!("agent-{n}")).collect();
     for name in &names {
@@ -403,7 +407,11 @@ fn unmount_refuses_while_a_transcript_is_in_the_upperdir() {
         return;
     };
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     sh(
@@ -437,7 +445,7 @@ fn an_upperdir_outlives_its_holder_and_is_mounted_again() {
     };
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     sh(&first, &workspace, "echo pending > pending.txt");
@@ -446,7 +454,7 @@ fn an_upperdir_outlives_its_holder_and_is_mounted_again() {
     drop(first);
     assert!(!Path::new(&format!("/proc/{pid}")).exists());
 
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     assert!(second.holder_pid(&workspace).is_none());
     let again = remounted(&second, "agent");
     assert_eq!(again, workspace);
@@ -468,13 +476,13 @@ fn an_overlay_workspace_is_mounted_only_while_its_holder_serves_overlay() {
     };
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     assert!(first.is_mounted(&workspace));
     drop(first);
 
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     assert!(second.holder_pid(&workspace).is_none());
     assert!(!second.is_mounted(&workspace));
     let again = remounted(&second, "agent");
@@ -489,7 +497,7 @@ fn is_mounted_is_false_for_detached_overlay_directories_without_holder() {
     let scratch = Scratch::new("overlay-detached-dir");
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let store = OverlayWorkspace::new(&repo, &root);
+    let store = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     let merged = store.root().join("agent");
     let workspace = WorkspaceId::new(format!("agent:{}", merged.display())).unwrap();
     let state = store
@@ -547,7 +555,11 @@ fn unmount_refuses_an_upperdir_it_cannot_read_and_deletes_nothing() {
         return;
     };
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     sh(
@@ -595,7 +607,11 @@ fn unmount_refuses_while_a_process_is_still_inside_the_workspace() {
         return;
     };
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     sh(&store, &workspace, "echo pending > pending.txt");
@@ -621,7 +637,11 @@ fn unmount_refuses_while_a_nested_namespace_still_shows_the_overlay() {
         return;
     };
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     let child = enter(
@@ -647,7 +667,7 @@ fn a_process_outliving_a_dropped_store_blocks_a_second_mount() {
     };
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     sh(&first, &workspace, "echo pending > pending.txt");
@@ -661,7 +681,7 @@ fn a_process_outliving_a_dropped_store_blocks_a_second_mount() {
 
     // The second store finds that live holder and mounts nothing: one
     // overlay over the upperdir.
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     assert_eq!(second.mount(&branch("agent")).unwrap(), workspace);
     assert_eq!(second.holder_pid(&workspace), Some(holder));
     assert_eq!(namespaces_showing(&upper).len(), 1);
@@ -681,7 +701,11 @@ fn a_branch_moved_under_the_workspace_is_stale_and_a_deleted_one_is_recreated() 
         return;
     };
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     sh(&store, &workspace, "echo one > one.txt");
@@ -736,7 +760,12 @@ fn prewarmed_lower_layers_are_shared_and_never_committed() {
     .unwrap();
     fs::create_dir_all(deps.join("target/debug")).unwrap();
     fs::write(deps.join("target/debug/libdep.rlib"), b"rlib").unwrap();
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws")).with_lower_layers([deps.clone()]);
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_lower_layers([deps.clone()]);
     let mut workspaces = Vec::new();
     for name in ["a", "b"] {
         store.ensure_branch(&branch(name), None).unwrap();
@@ -833,7 +862,11 @@ fn a_host_process_inside_host_path_blocks_the_unmount() {
         return;
     };
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     sh(&store, &workspace, "echo pending > pending.txt");
@@ -870,7 +903,7 @@ fn a_file_held_open_through_host_path_blocks_unmount_and_a_second_mount() {
     };
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     sh(&first, &workspace, "echo pending > pending.txt");
@@ -882,7 +915,7 @@ fn a_file_held_open_through_host_path_blocks_unmount_and_a_second_mount() {
     let upper = first.upper_dir(&workspace).unwrap();
     drop(first);
 
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     refused_with(second.mount(&branch("agent")), IN_USE);
     assert!(second.holder_pid(&workspace).is_none());
     assert!(namespaces_showing(&upper).is_empty());
@@ -913,7 +946,11 @@ fn a_file_mapped_through_host_path_blocks_the_unmount() {
         return;
     }
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     sh(&store, &workspace, "echo pending > pending.txt");
@@ -962,7 +999,11 @@ fn a_nested_namespace_that_lazily_unmounted_the_overlay_blocks_the_unmount() {
         return;
     };
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     let child = enter(
@@ -988,7 +1029,7 @@ fn a_process_that_lazily_unmounted_after_a_drop_blocks_a_second_mount() {
     };
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     sh(&first, &workspace, "echo pending > pending.txt");
@@ -1020,7 +1061,7 @@ fn a_process_that_lazily_unmounted_after_a_drop_blocks_a_second_mount() {
     // The holder lives on (the client holds the lease), but shows no
     // overlay any more: the mount would retire it, and refuses while the
     // client holds the lease; so does the unmount.
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     refused_with(second.mount(&branch("agent")), IN_USE);
     refused_with(second.unmount(&workspace), IN_USE);
     drop(stdin);
@@ -1050,7 +1091,7 @@ fn a_thread_group_whose_leader_exited_still_holds_the_workspace() {
     }
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     let script = "import ctypes, os, sys, threading\n\
@@ -1090,7 +1131,7 @@ fn a_thread_group_whose_leader_exited_still_holds_the_workspace() {
     refused_with(first.unmount(&workspace), IN_USE);
     let upper = first.upper_dir(&workspace).unwrap();
     drop(first);
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     assert_eq!(second.mount(&branch("agent")).unwrap(), workspace);
     refused_with(second.unmount(&workspace), IN_USE);
     finish(child);
@@ -1123,7 +1164,7 @@ fn prune_never_leaves_a_half_deleted_layer() {
     let all = "README a/one.txt b/fixture.jsonl c/three.txt link";
     let listing = "for f in README a/one.txt b/fixture.jsonl c/three.txt c/stray.jsonl link; \
                    do [ -e \"$f\" ] && printf '%s ' \"$f\"; done";
-    let store = OverlayWorkspace::new(&repo, &root);
+    let store = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     store.ensure_branch(&branch("agent"), None).unwrap();
     let layer = store.layer_path(&main);
     let layers = layer.parent().unwrap().to_path_buf();
@@ -1139,14 +1180,14 @@ fn prune_never_leaves_a_half_deleted_layer() {
 
     let workspace = store.mount(&branch("agent")).unwrap();
     forget(store, &workspace);
-    let store = OverlayWorkspace::new(&repo, &root);
+    let store = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     assert_eq!(store.prune_layers().unwrap(), 1);
     assert!(!layer.exists());
     assert!(names().is_empty(), "{:?}", names());
     let workspace = store.mount(&branch("agent")).unwrap();
     assert_eq!(sh(&store, &workspace, listing).trim(), all);
     forget(store, &workspace);
-    let store = OverlayWorkspace::new(&repo, &root);
+    let store = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
 
     // A `*.jsonl` the commit does not hold: refused, the layer kept whole
     // under a name no mount uses, and the next mount builds a clean one.
@@ -1168,7 +1209,7 @@ fn prune_never_leaves_a_half_deleted_layer() {
     let workspace = store.mount(&branch("agent")).unwrap();
     assert_eq!(sh(&store, &workspace, listing).trim(), all);
     forget(store, &workspace);
-    let store = OverlayWorkspace::new(&repo, &root);
+    let store = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     // The commit's fixture, changed: refused and set aside too.
     fs::write(layer.join("b/fixture.jsonl"), b"{\"changed\":1}\n").unwrap();
     refused_with(store.prune_layers(), TRANSCRIPT_IN_LAYER);
@@ -1192,7 +1233,11 @@ fn prune_refuses_a_state_it_cannot_read() {
         return;
     };
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     let main = git_in(&repo, &["rev-parse", "main"]);
@@ -1225,7 +1270,11 @@ fn nested_branch_names_never_share_state() {
         return;
     };
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("a"), None).unwrap();
     let a = store.mount(&branch("a")).unwrap();
     git_in(&repo, &["update-ref", "-d", "refs/heads/a"]);
@@ -1262,7 +1311,11 @@ fn derived_names_leave_out_only_untracked_directories() {
         ("fixtures/node_modules/a.txt", b"a\n", false),
     ];
     let repo = seed(&scratch, files);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     sh(
@@ -1295,8 +1348,8 @@ fn two_stores_mounting_one_branch_at_once_make_one_overlay() {
     };
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let a = OverlayWorkspace::new(&repo, &root);
-    let b = OverlayWorkspace::new(&repo, &root);
+    let a = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
+    let b = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     a.ensure_branch(&branch("agent"), None).unwrap();
     for _ in 0..5 {
         let barrier = std::sync::Barrier::new(2);
@@ -1337,7 +1390,7 @@ fn a_reused_holder_pid_is_neither_trusted_nor_killed() {
     };
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     let state = first
@@ -1370,7 +1423,7 @@ fn a_reused_holder_pid_is_neither_trusted_nor_killed() {
     forged.extend(recorded.split_whitespace().skip(1).map(str::to_string));
     fs::write(state.join("holder"), format!("{}\n", forged.join(" "))).unwrap();
 
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     assert!(second.holder_pid(&workspace).is_none());
     assert!(second.command(&workspace, "true").is_err());
     // Done or refused as unproven, the stranger lives on.
@@ -1396,7 +1449,11 @@ fn a_whiteout_named_like_a_transcript_does_not_block_the_unmount() {
         ("fixture.jsonl", b"{}\n", false),
     ];
     let repo = seed(&scratch, files);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     sh(&store, &workspace, "rm fixture.jsonl");
@@ -1418,7 +1475,11 @@ fn a_directory_replaced_by_a_file_and_a_file_by_a_directory_commit() {
         return;
     };
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     sh(
@@ -1456,8 +1517,12 @@ fn a_file_held_open_from_a_lower_layer_on_another_filesystem_blocks_the_unmount(
     fs::create_dir_all(deps.join("node_modules/pkg")).unwrap();
     fs::write(deps.join("node_modules/pkg/index.js"), b"1;\n").unwrap();
     let repo = seed(&scratch, SEED);
-    let store =
-        OverlayWorkspace::new(&repo, scratch.join("ws")).with_lower_layers([deps.to_path_buf()]);
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    )
+    .with_lower_layers([deps.to_path_buf()]);
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     let file = fs::File::open(
@@ -1513,7 +1578,11 @@ fn a_non_dumpable_host_process_inside_host_path_blocks_the_unmount() {
         return;
     }
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     sh(&store, &workspace, "echo pending > pending.txt");
@@ -1547,7 +1616,7 @@ fn a_non_dumpable_host_process_blocks_a_second_mount_after_a_drop() {
     }
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     sh(&first, &workspace, "echo pending > pending.txt");
@@ -1555,7 +1624,7 @@ fn a_non_dumpable_host_process_blocks_a_second_mount_after_a_drop() {
     let upper = first.upper_dir(&workspace).unwrap();
     drop(first);
 
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     let message = refused_with(second.mount(&branch("agent")), IN_USE);
     assert!(message.contains("workdir busy"), "{message}");
     assert!(second.holder_pid(&workspace).is_none());
@@ -1587,7 +1656,11 @@ fn an_execute_only_binary_inside_host_path_blocks_the_unmount() {
     fs::copy("/bin/sleep", &sleep).unwrap();
     fs::set_permissions(&sleep, fs::Permissions::from_mode(0o111)).unwrap();
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     let mut child = std::process::Command::new(&sleep)
@@ -1623,7 +1696,7 @@ fn a_descriptor_in_flight_in_a_unix_socket_blocks_a_second_mount() {
     }
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     sh(&first, &workspace, "echo pending > pending.txt");
@@ -1649,7 +1722,7 @@ fn a_descriptor_in_flight_in_a_unix_socket_blocks_a_second_mount() {
     assert_eq!(line.trim(), "in");
     drop(first);
 
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     let message = refused_with(second.mount(&branch("agent")), IN_USE);
     assert!(message.contains("workdir busy"), "{message}");
     assert!(
@@ -1672,7 +1745,7 @@ fn a_holder_record_without_its_fields_is_not_trusted() {
     };
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     let state = first
@@ -1686,7 +1759,7 @@ fn a_holder_record_without_its_fields_is_not_trusted() {
     let old: Vec<&str> = recorded.split_whitespace().take(2).collect();
     fs::write(state.join("holder"), format!("{}\n", old.join(" "))).unwrap();
 
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     assert!(second.holder_pid(&workspace).is_none());
     assert!(second.host_path(&workspace).is_err());
     refused_with(second.unmount(&workspace), IN_USE);
@@ -1752,7 +1825,11 @@ fn benchmark_five_overlays_against_five_full_copies() {
     let full_time = started.elapsed();
 
     // Five overlays over one layer.
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     let started = Instant::now();
     let mut workspaces = Vec::new();
     for n in 0..5 {
@@ -1809,7 +1886,7 @@ fn an_unreadable_lower_record_is_never_taken_for_a_fresh_workspace() {
     };
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     let lower = first
@@ -1826,7 +1903,7 @@ fn an_unreadable_lower_record_is_never_taken_for_a_fresh_workspace() {
         eprintln!("skipped: mode 000 does not stop this user reading (root?)");
         return;
     }
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     let result = second.mount(&branch("agent"));
     let mode = fs::metadata(&lower).unwrap().permissions().mode();
     fs::set_permissions(&lower, fs::Permissions::from_mode(0o644)).unwrap();
@@ -1856,14 +1933,14 @@ fn an_unrelated_non_dumpable_host_process_never_blocks_teardown() {
     let bystander = undumpable_in(&elsewhere);
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     sh(&first, &workspace, "echo pending > pending.txt");
     let upper = first.upper_dir(&workspace).unwrap();
     drop(first);
 
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     assert_eq!(remounted(&second, "agent"), workspace);
     assert_eq!(sh(&second, &workspace, "cat pending.txt"), "pending\n");
     unmounted(&second, &workspace);
@@ -1924,7 +2001,7 @@ fn a_whole_lifecycle_runs_inside_a_nested_pid_namespace() {
     assert_ne!(own, Path::new(&outer), "not in a nested pid namespace");
     let repo = seed(&scratch, SEED);
     let root = scratch.join("ws");
-    let first = OverlayWorkspace::new(&repo, &root);
+    let first = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     first.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = first.mount(&branch("agent")).unwrap();
     sh(&first, &workspace, "echo one > one.txt");
@@ -1935,7 +2012,7 @@ fn a_whole_lifecycle_runs_inside_a_nested_pid_namespace() {
     sh(&first, &workspace, "echo pending > pending.txt");
     let upper = first.upper_dir(&workspace).unwrap();
     drop(first);
-    let second = OverlayWorkspace::new(&repo, &root);
+    let second = OverlayWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     assert_eq!(remounted(&second, "agent"), workspace);
     assert_eq!(sh(&second, &workspace, "cat pending.txt"), "pending\n");
     let child = enter(&second, &workspace, "echo in; read line");
@@ -1959,7 +2036,11 @@ fn a_client_that_closes_its_descriptors_keeps_the_lease() {
         return;
     }
     let repo = seed(&scratch, SEED);
-    let store = OverlayWorkspace::new(&repo, scratch.join("ws"));
+    let store = OverlayWorkspace::new(
+        &repo,
+        scratch.join("ws"),
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    );
     store.ensure_branch(&branch("agent"), None).unwrap();
     let workspace = store.mount(&branch("agent")).unwrap();
     let script = "import os, sys\n\
