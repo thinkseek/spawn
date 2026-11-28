@@ -3,26 +3,35 @@
 //! Enforces two invariants across `crates/spawn-core/src`, `crates/spawn-cas/src`,
 //! and `crates/spawn-postgres/src`:
 //!
-//! 1. **Zero production `std::env::var*` access**: Using a Rust lexer, nested `#[cfg(test)]`
-//!    token stripper, recursive `use`-tree analyzer, and production path scanner (with
-//!    line-preserving spans), rejects every non-test `std::env::{var, var_os, vars, vars_os}`,
-//!    short `env::var*`, module alias (`use std::env as e; e::var*`), glob (`use std::env::*;`),
-//!    nested/wrapped `use` tree (`use std::{env::{var, var_os}, fmt};`), and `env::$...`
-//!    macro path access.
-//! 2. **Zero production `spawn-postgres/testing` activation**: Scans workspace and crate
-//!    `Cargo.toml` manifests to guarantee `spawn-postgres`'s `"testing"` feature is enabled
-//!    only in `[dev-dependencies]` / `[target.*.dev-dependencies]`, never in production
-//!    dependency or feature tables.
+//! 1. **Zero production `std::env::var*` access**: Using a Rust lexer, fail-closed
+//!    `#[cfg(test)]` module stripper, recursive `use`-tree analyzer, and production
+//!    path scanner (with exact line numbers), rejects every production `std::env::var`,
+//!    `std::env::var_os`, `std::env::vars`, `std::env::vars_os`, short `env::var*`,
+//!    renamed `use std::env as ...`, glob `use std::env::*`, nested or multi-line
+//!    `use` trees (`use std::{env::{var, var_os}, fmt};`), `env::$...`, and `$m::var*`
+//!    macro path accesses. Only `crates/spawn-postgres/src/testing.rs`, `#![cfg(test)]`,
+//!    and `#[cfg(test)] mod <ident> { ... }` (plus `#[cfg(all(..., test, ...))] mod ...`)
+//!    are skipped; all other `#[cfg(test)]` targets are audited as production code.
+//! 2. **Zero production `spawn-postgres/testing` activation**: Queries Cargo's real
+//!    dependency graph (`cargo tree --offline --workspace -e normal,build`) and fails if
+//!    `spawn-postgres` ever resolves with the `"testing"` feature on any non-dev edge.
 //!
-//! Static boundary: `crates/spawn-postgres/src/testing.rs` is explicitly scoped as test-support
-//! (guarded by the `Cargo.toml` `"testing"` feature check). Without full `rustc` macro
-//! expansion, cross-macro token synthesis that splits *both* the module path and item name
-//! across separate metavariables (`$m::$f`) or proc-macro generation cannot be proved statically
-//! and will be closed workspace-wide in Wave-2 via `clippy.toml` `disallowed-methods`.
+//! Known single-file lexical / pre-expansion static limits:
+//! - `crates/spawn-postgres/src/testing.rs` is test-support gated behind the `"testing"`
+//!   feature (enforced by invariant 2 above).
+//! - Cross-file `pub use std::env as ...;` alias re-exports (note: `use std::env as <alias>;`
+//!   declarations inside any core crate are already rejected directly in the declaring file).
+//! - Module-level or split-metavariable macro token pasting (`std::$m::var` or `$m::$f`)
+//!   and proc-macro synthesis that require full `rustc` macro expansion.
+//!
+//! Wave-2 closes remaining `env::var` call sites in `spawn-host`/`spawn-cli` and enables
+//! workspace-wide `clippy.toml` `disallowed-methods` to cover all post-expansion paths.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const TARGET_CRATE_SRCS: &[&str] = &[
     "crates/spawn-core/src",
@@ -78,15 +87,8 @@ impl Token {
         }
     }
 
-    fn kw(&self) -> Option<&str> {
-        match &self.kind {
-            TokenKind::Ident(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
-
     fn is_kw(&self, expected: &str) -> bool {
-        self.kw() == Some(expected)
+        matches!(&self.kind, TokenKind::Ident(s) if s == expected)
     }
 }
 
@@ -210,9 +212,13 @@ fn try_lex_char_or_lifetime(src: &str, bytes: &[u8], start: usize) -> Option<(To
         return None;
     }
     if bytes[after] == b'\\' {
-        let mut i = after + 1;
+        if after + 1 >= bytes.len() {
+            return None;
+        }
+        // Step over both `\` and the escaped character (including `\\` and `\'`).
+        let mut i = after + 2;
         while i < bytes.len() && bytes[i] != b'\'' && bytes[i] != b'\n' {
-            i = (i + if bytes[i] == b'\\' { 2 } else { 1 }).min(bytes.len());
+            i += 1;
         }
         return (bytes.get(i) == Some(&b'\'')).then_some((TokenKind::Literal, i + 1));
     }
@@ -243,34 +249,30 @@ fn try_lex_char_or_lifetime(src: &str, bytes: &[u8], start: usize) -> Option<(To
 }
 
 fn try_lex_ident(src: &str, bytes: &[u8], start: usize) -> Option<(TokenKind, usize)> {
-    if bytes[start..].starts_with(b"r#") {
-        let body = start + 2;
-        let first = src[body..].chars().next()?;
-        if first.is_alphabetic() || first == '_' {
-            let mut end = body + first.len_utf8();
-            for ch in src[end..].chars() {
-                if ch.is_alphanumeric() || ch == '_' {
-                    end += ch.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            return Some((TokenKind::RawIdent(src[body..end].to_string()), end));
+    let (is_raw, ident_start) = if bytes[start..].starts_with(b"r#") {
+        (true, start + 2)
+    } else {
+        (false, start)
+    };
+    let first = src[ident_start..].chars().next()?;
+    if !first.is_alphabetic() && first != '_' {
+        return None;
+    }
+    let mut end = ident_start + first.len_utf8();
+    for ch in src[end..].chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            end += ch.len_utf8();
+        } else {
+            break;
         }
     }
-    let first = src[start..].chars().next()?;
-    if first.is_alphabetic() || first == '_' {
-        let mut end = start + first.len_utf8();
-        for ch in src[end..].chars() {
-            if ch.is_alphanumeric() || ch == '_' {
-                end += ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-        return Some((TokenKind::Ident(src[start..end].to_string()), end));
-    }
-    None
+    let text = src[ident_start..end].to_string();
+    let kind = if is_raw {
+        TokenKind::RawIdent(text)
+    } else {
+        TokenKind::Ident(text)
+    };
+    Some((kind, end))
 }
 
 fn lex_punct(bytes: &[u8], i: usize) -> (TokenKind, usize) {
@@ -341,7 +343,7 @@ fn tokenize(src: &str) -> Vec<Token> {
 }
 
 // ---------------------------------------------------------------------------
-// Layer B: Exact #[cfg(test)] Stripping
+// Layer B: Fail-Closed #[cfg(test)] Stripping (#![cfg(test)] & #[cfg(test)] mod { ... })
 // ---------------------------------------------------------------------------
 
 fn matching_close(tokens: &[Token], open_idx: usize) -> Option<usize> {
@@ -406,9 +408,6 @@ fn is_cfg_test_pred(tokens: &[Token]) -> bool {
         if tokens[0].is_kw("any") {
             return !args.is_empty() && args.iter().all(|arg| is_cfg_test_pred(arg));
         }
-        if tokens[0].is_kw("not") {
-            return false;
-        }
     }
     false
 }
@@ -421,7 +420,15 @@ fn is_cfg_test_attr(inner: &[Token]) -> bool {
         && is_cfg_test_pred(&inner[2..inner.len() - 1])
 }
 
-fn skip_visibility(tokens: &[Token], mut i: usize) -> usize {
+fn cfg_test_mod_end(tokens: &[Token], mut i: usize) -> Option<usize> {
+    while tokens.get(i).is_some_and(|t| t.kind == TokenKind::Pound)
+        && tokens
+            .get(i + 1)
+            .is_some_and(|t| t.kind == TokenKind::Open(Delim::Bracket))
+        && let Some(end_bracket) = matching_close(tokens, i + 1)
+    {
+        i = end_bracket + 1;
+    }
     if tokens.get(i).is_some_and(|t| t.is_kw("pub")) {
         i += 1;
         if tokens
@@ -432,192 +439,19 @@ fn skip_visibility(tokens: &[Token], mut i: usize) -> usize {
             i = close + 1;
         }
     }
-    i
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CfgTargetKind {
-    SemiItem,
-    BlockOrSemiItem,
-    MacroRules,
-    BlockControl,
-    NonItem,
-}
-
-fn classify_cfg_target(tokens: &[Token], start: usize) -> CfgTargetKind {
-    let after_vis = skip_visibility(tokens, start);
-    let mut k = after_vis;
-    let first_is_const = tokens.get(k).is_some_and(|t| t.is_kw("const"));
-    let starts_unsafe_or_async = tokens
-        .get(k)
-        .is_some_and(|t| t.is_kw("unsafe") || t.is_kw("async"));
-
-    while let Some(tok) = tokens.get(k) {
-        if matches!(tok.kw(), Some("default" | "unsafe" | "async" | "const")) {
-            k += 1;
-        } else if tok.is_kw("extern") {
-            k += 1;
-            if tokens.get(k).is_some_and(|n| n.kind == TokenKind::Literal) {
-                k += 1;
-            }
-        } else {
-            break;
-        }
+    if !tokens.get(i).is_some_and(|t| t.is_kw("mod")) {
+        return None;
     }
-
-    match tokens.get(k).and_then(Token::kw) {
-        Some("fn" | "mod" | "impl" | "trait" | "struct" | "enum" | "union") => {
-            CfgTargetKind::BlockOrSemiItem
-        }
-        Some("use" | "type" | "static") => CfgTargetKind::SemiItem,
-        Some("macro_rules") if tokens.get(k + 1).is_some_and(|t| t.kind == TokenKind::Bang) => {
-            CfgTargetKind::MacroRules
-        }
-        _ if first_is_const => CfgTargetKind::SemiItem,
-        _ if tokens
-            .get(k)
+    let name_ok = tokens.get(i + 1).and_then(Token::ident_name).is_some();
+    let brace_open = i + 2;
+    if !name_ok
+        || !tokens
+            .get(brace_open)
             .is_some_and(|t| t.kind == TokenKind::Open(Delim::Brace))
-            && (after_vis == start || starts_unsafe_or_async) =>
-        {
-            CfgTargetKind::BlockControl
-        }
-        _ if after_vis == start
-            && matches!(
-                tokens.get(start).and_then(Token::kw),
-                Some("if" | "match" | "for" | "while" | "loop")
-            ) =>
-        {
-            CfgTargetKind::BlockControl
-        }
-        _ => CfgTargetKind::NonItem,
-    }
-}
-
-fn skip_until_semi_or_enclosing_close(tokens: &[Token], mut i: usize) -> usize {
-    let mut depth = 0usize;
-    while i < tokens.len() {
-        match tokens[i].kind {
-            TokenKind::Open(_) => depth += 1,
-            TokenKind::Close(_) => {
-                if depth == 0 {
-                    return i;
-                }
-                depth -= 1;
-            }
-            TokenKind::Semi if depth == 0 => return i + 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    i
-}
-
-fn skip_block_or_semi_item(tokens: &[Token], mut i: usize) -> usize {
-    let mut stack: Vec<Delim> = Vec::new();
-    while i < tokens.len() {
-        match tokens[i].kind {
-            TokenKind::Open(d) => stack.push(d),
-            TokenKind::Close(d) => {
-                if stack.is_empty() {
-                    return i;
-                }
-                let popped = stack.pop();
-                if popped == Some(d) && stack.is_empty() && d == Delim::Brace {
-                    return i + 1;
-                }
-            }
-            TokenKind::Semi if stack.is_empty() => return i + 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    i
-}
-
-fn skip_macro_rules_item(tokens: &[Token], mut i: usize) -> usize {
-    while i < tokens.len() {
-        if let TokenKind::Open(d) = tokens[i].kind
-            && let Some(close) = matching_close(tokens, i)
-        {
-            let mut end = close + 1;
-            if d != Delim::Brace && tokens.get(end).is_some_and(|t| t.kind == TokenKind::Semi) {
-                end += 1;
-            }
-            return end;
-        }
-        i += 1;
-    }
-    i
-}
-
-fn skip_single_block_control(tokens: &[Token], mut i: usize) -> usize {
-    let mut stack: Vec<Delim> = Vec::new();
-    while i < tokens.len() {
-        match tokens[i].kind {
-            TokenKind::Open(d) => stack.push(d),
-            TokenKind::Close(d) => {
-                if stack.is_empty() {
-                    return i;
-                }
-                let popped = stack.pop();
-                if popped == Some(d) && stack.is_empty() && d == Delim::Brace {
-                    return i + 1;
-                }
-            }
-            TokenKind::Semi | TokenKind::Comma if stack.is_empty() => return i + 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    i
-}
-
-fn skip_block_control(tokens: &[Token], start: usize) -> usize {
-    let is_if = tokens.get(start).is_some_and(|t| t.is_kw("if"));
-    let mut end = skip_single_block_control(tokens, start);
-    if is_if {
-        while tokens.get(end).is_some_and(|t| t.is_kw("else")) {
-            end = skip_single_block_control(tokens, end + 1);
-        }
-    }
-    end
-}
-
-fn skip_non_item(tokens: &[Token], mut i: usize) -> usize {
-    let mut depth = 0usize;
-    while i < tokens.len() {
-        match tokens[i].kind {
-            TokenKind::Open(_) => depth += 1,
-            TokenKind::Close(_) => {
-                if depth == 0 {
-                    return i;
-                }
-                depth -= 1;
-            }
-            TokenKind::Comma | TokenKind::Semi if depth == 0 => return i + 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    i
-}
-
-fn skip_cfg_test_target(tokens: &[Token], mut i: usize) -> usize {
-    while tokens.get(i).is_some_and(|t| t.kind == TokenKind::Pound)
-        && tokens
-            .get(i + 1)
-            .is_some_and(|t| t.kind == TokenKind::Open(Delim::Bracket))
-        && let Some(end_bracket) = matching_close(tokens, i + 1)
     {
-        i = end_bracket + 1;
+        return None;
     }
-    match classify_cfg_target(tokens, i) {
-        CfgTargetKind::SemiItem => skip_until_semi_or_enclosing_close(tokens, i),
-        CfgTargetKind::BlockOrSemiItem => skip_block_or_semi_item(tokens, i),
-        CfgTargetKind::MacroRules => skip_macro_rules_item(tokens, i),
-        CfgTargetKind::BlockControl => skip_block_control(tokens, i),
-        CfgTargetKind::NonItem => skip_non_item(tokens, i),
-    }
+    matching_close(tokens, brace_open).map(|close| close + 1)
 }
 
 fn strip_cfg_test_tokens(tokens: &[Token]) -> Vec<Token> {
@@ -662,8 +496,9 @@ fn strip_cfg_test_tokens(tokens: &[Token]) -> Vec<Token> {
                 .is_some_and(|t| t.kind == TokenKind::Open(Delim::Bracket))
             && let Some(end_bracket) = matching_close(tokens, i + 1)
             && is_cfg_test_attr(&tokens[i + 2..end_bracket])
+            && let Some(mod_end) = cfg_test_mod_end(tokens, end_bracket + 1)
         {
-            i = skip_cfg_test_target(tokens, end_bracket + 1);
+            i = mod_end;
             continue;
         }
 
@@ -707,6 +542,9 @@ fn check_leaf_use(
     if is_env_module_path(&eff, env_aliases) {
         if let Some(name) = alias {
             env_aliases.insert(name.to_string());
+            // Flag renamed `std::env` imports directly in these core crates so
+            // cross-module alias re-exports (`pub(crate) use std::env as zz;`) cannot slip by.
+            violated_lines.insert(line);
         }
         return;
     }
@@ -778,7 +616,25 @@ fn collect_use_slices(tokens: &[Token]) -> Vec<&[Token]> {
     let mut i = 0usize;
     while i < tokens.len() {
         if tokens[i].is_kw("use") {
-            let end = skip_until_semi_or_enclosing_close(tokens, i + 1);
+            let mut end = i + 1;
+            let mut depth = 0usize;
+            while end < tokens.len() {
+                match tokens[end].kind {
+                    TokenKind::Open(_) => depth += 1,
+                    TokenKind::Close(_) => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    TokenKind::Semi if depth == 0 => {
+                        end += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+                end += 1;
+            }
             let slice_end = if end > i + 1 && tokens[end - 1].kind == TokenKind::Semi {
                 end - 1
             } else {
@@ -814,6 +670,20 @@ fn audit_path_accesses(
     violated_lines: &mut BTreeSet<usize>,
 ) {
     for i in 0..tokens.len() {
+        if tokens[i].kind == TokenKind::Dollar
+            && tokens.get(i + 1).and_then(Token::ident_name).is_some()
+            && tokens
+                .get(i + 2)
+                .is_some_and(|t| t.kind == TokenKind::ColonColon)
+            && tokens
+                .get(i + 3)
+                .and_then(Token::ident_name)
+                .is_some_and(|sym| FORBIDDEN_ENV_SYMS.contains(&sym))
+        {
+            violated_lines.insert(tokens[i].line);
+            continue;
+        }
+
         let Some(mod_name) = tokens[i].ident_name() else {
             continue;
         };
@@ -860,277 +730,58 @@ fn scan_source(rel_or_abs_path: &Path, src: &str) -> Vec<Violation> {
 }
 
 // ---------------------------------------------------------------------------
-// Cargo.toml `spawn-postgres` `"testing"` feature guard
+// Cargo Dependency Graph Guard (`cargo tree --offline --workspace -e normal,build`)
 // ---------------------------------------------------------------------------
 
-fn strip_toml_line_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut i = 0usize;
-    let mut in_basic = false;
-    let mut in_literal = false;
-    while i < bytes.len() {
-        if in_basic {
-            if bytes[i] == b'\\' {
-                i += 2;
-                continue;
-            }
-            if bytes[i] == b'"' {
-                in_basic = false;
-            }
-        } else if in_literal {
-            if bytes[i] == b'\'' {
-                in_literal = false;
-            }
-        } else {
-            match bytes[i] {
-                b'#' => return &line[..i],
-                b'"' => in_basic = true,
-                b'\'' => in_literal = true,
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    line
-}
-
-fn extract_toml_statements(src: &str) -> Vec<(String, usize, String)> {
-    let mut stmts = Vec::new();
-    let mut section = String::new();
-    let mut cur = String::new();
-    let mut start_line = 1usize;
-    let mut depth = 0usize;
-
-    for (idx, raw_line) in src.lines().enumerate() {
-        let line_no = idx + 1;
-        let clean = strip_toml_line_comment(raw_line).trim();
-        if clean.is_empty() {
-            continue;
-        }
-        if depth == 0 && clean.starts_with('[') && clean.ends_with(']') && !clean.contains('=') {
-            section = clean[1..clean.len() - 1].trim().to_string();
-            continue;
-        }
-        if cur.is_empty() {
-            start_line = line_no;
-        } else {
-            cur.push(' ');
-        }
-        cur.push_str(clean);
-        depth = update_toml_depth(&cur);
-        if depth == 0 {
-            stmts.push((section.clone(), start_line, std::mem::take(&mut cur)));
-        }
-    }
-    if !cur.is_empty() {
-        stmts.push((section, start_line, cur));
-    }
-    stmts
-}
-
-fn update_toml_depth(stmt: &str) -> usize {
-    let bytes = stmt.as_bytes();
-    let mut depth = 0usize;
-    let mut i = 0usize;
-    let mut in_basic = false;
-    let mut in_literal = false;
-    while i < bytes.len() {
-        if in_basic {
-            if bytes[i] == b'\\' {
-                i += 2;
-                continue;
-            }
-            if bytes[i] == b'"' {
-                in_basic = false;
-            }
-        } else if in_literal {
-            if bytes[i] == b'\'' {
-                in_literal = false;
-            }
-        } else {
-            match bytes[i] {
-                b'"' => in_basic = true,
-                b'\'' => in_literal = true,
-                b'[' | b'{' => depth += 1,
-                b']' | b'}' => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    depth
-}
-
-fn unquote_toml_string(s: &str) -> Option<&str> {
-    let trimmed = s.trim();
-    if trimmed.len() >= 2
-        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
-    {
-        Some(&trimmed[1..trimmed.len() - 1])
-    } else {
-        None
-    }
-}
-
-fn split_toml_quoted_items(array_text: &str) -> Vec<String> {
-    let trimmed = array_text.trim();
-    let inner = trimmed
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(trimmed);
-    let mut items = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    let bytes = inner.as_bytes();
-    let mut i = 0usize;
-    let mut in_basic = false;
-    let mut in_literal = false;
-    while i < bytes.len() {
-        if in_basic {
-            if bytes[i] == b'\\' {
-                i += 2;
-                continue;
-            }
-            if bytes[i] == b'"' {
-                in_basic = false;
-            }
-        } else if in_literal {
-            if bytes[i] == b'\'' {
-                in_literal = false;
-            }
-        } else {
-            match bytes[i] {
-                b'"' => in_basic = true,
-                b'\'' => in_literal = true,
-                b'[' | b'{' => depth += 1,
-                b']' | b'}' => depth = depth.saturating_sub(1),
-                b',' if depth == 0 => {
-                    if let Some(val) = unquote_toml_string(&inner[start..i]) {
-                        items.push(val.to_string());
-                    }
-                    start = i + 1;
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    if let Some(val) = unquote_toml_string(&inner[start..]) {
-        items.push(val.to_string());
-    }
-    items
-}
-
-fn section_is_non_dev_dep_table(section: &str) -> bool {
-    let s = section.trim();
-    if matches!(
-        s,
-        "dependencies" | "workspace.dependencies" | "build-dependencies"
-    ) {
-        return true;
-    }
-    s.starts_with("target.") && (s.ends_with(".dependencies") || s.ends_with(".build-dependencies"))
-}
-
-fn section_is_non_dev_spawn_pg_subtable(section: &str) -> bool {
-    section
-        .trim()
-        .strip_suffix(".spawn-postgres")
-        .is_some_and(section_is_non_dev_dep_table)
-}
-
-fn inline_features_list(inline_table: &str) -> Option<&str> {
-    let idx = inline_table.find("features")?;
-    let after = inline_table[idx + "features".len()..].trim_start();
-    let eq = after.strip_prefix('=')?.trim_start();
-    if !eq.starts_with('[') {
-        return None;
-    }
-    let bytes = eq.as_bytes();
-    let mut depth = 0usize;
-    let mut in_basic = false;
-    let mut in_literal = false;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if in_basic {
-            if bytes[i] == b'\\' {
-                i += 2;
-                continue;
-            }
-            if bytes[i] == b'"' {
-                in_basic = false;
-            }
-        } else if in_literal {
-            if bytes[i] == b'\'' {
-                in_literal = false;
-            }
-        } else {
-            match bytes[i] {
-                b'"' => in_basic = true,
-                b'\'' => in_literal = true,
-                b'[' => depth += 1,
-                b']' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        return Some(&eq[..=i]);
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn scan_cargo_toml_for_spawn_postgres_testing(path: &Path, src: &str) -> Vec<Violation> {
+fn parse_cargo_tree_testing_violations(stdout: &str) -> Vec<String> {
     let mut violations = Vec::new();
-    for (section, line, stmt) in extract_toml_statements(src) {
-        let Some((lhs_raw, rhs_raw)) = stmt.split_once('=') else {
+    for raw_line in stdout.lines() {
+        let trimmed = raw_line.trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+        if trimmed.split_whitespace().next() != Some("spawn-postgres") {
             continue;
-        };
-        let lhs = lhs_raw.trim();
-        let rhs = rhs_raw.trim();
-
-        let bad_dep = if section_is_non_dev_dep_table(&section) && lhs == "spawn-postgres" {
-            inline_features_list(rhs)
-                .is_some_and(|arr| split_toml_quoted_items(arr).iter().any(|f| f == "testing"))
-        } else if section_is_non_dev_spawn_pg_subtable(&section) && lhs == "features" {
-            split_toml_quoted_items(rhs).iter().any(|f| f == "testing")
-        } else if section == "features" && lhs != "testing" {
-            split_toml_quoted_items(rhs)
-                .iter()
-                .any(|f| f == "spawn-postgres/testing" || f == "spawn-postgres?/testing")
-        } else {
-            false
-        };
-
-        if bad_dep {
-            violations.push(Violation {
-                path: path.to_path_buf(),
-                line,
-                snippet: stmt,
-            });
+        }
+        let without_dedup = trimmed
+            .trim_end()
+            .strip_suffix("(*)")
+            .unwrap_or(trimmed)
+            .trim_end();
+        if let Some(body) = without_dedup.strip_suffix(']')
+            && let Some(open) = body.rfind('[')
+            && body[open + 1..]
+                .split(',')
+                .any(|feat| feat.trim() == "testing")
+        {
+            violations.push(trimmed.to_string());
         }
     }
     violations
 }
 
-fn collect_workspace_cargo_tomls(root: &Path) -> Vec<PathBuf> {
-    let mut manifests = vec![root.join("Cargo.toml")];
-    let crates_dir = root.join("crates");
-    let entries =
-        fs::read_dir(&crates_dir).unwrap_or_else(|e| panic!("read {}: {e}", crates_dir.display()));
-    let mut dirs: Vec<PathBuf> = entries.map(|e| e.expect("dir entry").path()).collect();
-    dirs.sort();
-    for dir in dirs {
-        let cargo_toml = dir.join("Cargo.toml");
-        if cargo_toml.is_file() {
-            manifests.push(cargo_toml);
-        }
-    }
-    manifests
+fn check_cargo_tree_no_prod_testing_feature(manifest_path: &Path) -> Vec<String> {
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "tree",
+            "--offline",
+            "--workspace",
+            "-e",
+            "normal,build",
+            "-f",
+            "{p} [{f}]",
+            "--manifest-path",
+        ])
+        .arg(manifest_path)
+        .output()
+        .unwrap_or_else(|e| panic!("run cargo tree for {}: {e}", manifest_path.display()));
+    assert!(
+        output.status.success(),
+        "cargo tree failed fail-closed for {} (status {}):\nstdout:\n{}\nstderr:\n{}",
+        manifest_path.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_cargo_tree_testing_violations(&stdout)
 }
 
 #[test]
@@ -1166,26 +817,12 @@ fn core_cas_and_postgres_production_code_contains_zero_env_var_calls() {
 
 #[test]
 fn no_production_crate_enables_spawn_postgres_testing_feature() {
-    let root = workspace_root();
-    let manifests = collect_workspace_cargo_tomls(&root);
-    assert!(!manifests.is_empty(), "expected workspace Cargo.toml files");
-
-    let mut violations = Vec::new();
-    for manifest in manifests {
-        let rel = manifest.strip_prefix(&root).unwrap_or(&manifest);
-        let text = fs::read_to_string(&manifest)
-            .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
-        violations.extend(scan_cargo_toml_for_spawn_postgres_testing(rel, &text));
-    }
-
+    let manifest = workspace_root().join("Cargo.toml");
+    let violations = check_cargo_tree_no_prod_testing_feature(&manifest);
     assert!(
         violations.is_empty(),
         "forbidden production activation of spawn-postgres/testing:\n{}",
-        violations
-            .iter()
-            .map(|v| format!("  {}:{}: {}", v.path.display(), v.line, v.snippet))
-            .collect::<Vec<_>>()
-            .join("\n")
+        violations.join("\n")
     );
 }
 
@@ -1227,7 +864,7 @@ pub fn after_tests_still_checked() -> Vec<(String, String)> {
 
 #[test]
 fn env_boundary_guard_catches_all_cfg_field_and_import_bypass_mutations() {
-    let store_like = r##"
+    let cfg_and_char_samples = r##"
 pub struct Store<'a> {
     root: &'a str,
     #[cfg(test)]
@@ -1241,23 +878,39 @@ impl std::fmt::Debug for Store<'_> {
     }
 }
 
-pub struct NoTrailingComma {
-    #[cfg(test)]
-    hook: Option<usize>
+#[cfg(test)]
+thread_local! {
+    static TL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-pub fn fn_after_cfg_field() -> Option<String> {
-    std::env::var("AFTER_CFG_FIELD").ok()
+pub fn fn_after_thread_local() -> Option<String> {
+    std::env::var("AFTER_THREAD_LOCAL").ok()
 }
 
-pub fn with_stmt_cfg_and_raw_chars<'a>(ch: char) -> Option<String> {
-    let _c = (',', '}', '\'', '❯', r#"std::env::var("RAW_IGNORED")"#);
-    let _keep: &'a str = self::after_lifetime_still_scanned();
-    #[cfg(test)]
-    if !ch.is_whitespace() {
-        let _ = std::env::var("TEST_ONLY_IF_BLOCK");
+pub fn match_block_and_backslash_char(ch: char, b: u8) -> Option<char> {
+    match ch {
+        #[cfg(test)]
+        't' => {
+            let _ = 1;
+            None
+        }
+        'a' => {
+            let _v = std::env::var("NEXT_MATCH_ARM");
+            None
+        }
+        '\\' => std::env::var("BACKSLASH_CHAR").ok().map(|_| 'x'),
+        _ if b == b'\\' => std::env::var("BYTE_BACKSLASH_CHAR").ok().map(|_| 'y'),
+        _ => None,
     }
-    std::env::var("AFTER_TEST_IF").ok()
+}
+
+pub fn brace_macro_and_raw_strings<'a>() -> Option<String> {
+    #[cfg(test)]
+    eprintln! { "x" }
+    let _c = (',', '}', '\'', '❯', r#"std::env::var("RAW_IGNORED")"#);
+    let _keep: &'a str = self::after_lifetime();
+    let v = std::env::var("AFTER_BRACE_MACRO").ok();
+    v
 }
 
 #[cfg(not(test))]
@@ -1276,14 +929,32 @@ mod gated_tests {
         let _ = std::env::var("ALL_TEST_ALLOWED");
     }
 }
-"##;
-    let found_cfg = scan_source(Path::new("store_like.rs"), store_like);
-    let cfg_lines: Vec<usize> = found_cfg.iter().map(|v| v.line).collect();
-    assert_eq!(cfg_lines, vec![10, 21, 31, 36, 41], "got {found_cfg:?}");
 
+pub mod inner_cfg_mod {
+    #![cfg(test)]
+    pub fn inner_allowed() {
+        let _ = std::env::var("INNER_CFG_ALLOWED");
+    }
+}
+
+pub fn after_inner_cfg_mod() -> Option<String> {
+    std::env::var("AFTER_INNER_MOD").ok()
+}
+"##;
+    let found_cfg = scan_source(Path::new("cfg_and_chars.rs"), cfg_and_char_samples);
+    let cfg_lines: Vec<usize> = found_cfg.iter().map(|v| v.line).collect();
+    assert_eq!(
+        cfg_lines,
+        vec![10, 21, 32, 35, 36, 46, 52, 57, 75],
+        "got {found_cfg:?}"
+    );
+}
+
+#[test]
+fn env_boundary_guard_catches_alias_glob_nested_wrapped_and_macro_bypasses() {
     let import_and_macro_bypasses = r#"
-use std::env as e;
-use e as e2;
+pub(crate) use std::env as zz;
+use zz as e2;
 use std::env::*;
 use std::{env::{var as a, var_os as b}, fmt};
 use std::env::{
@@ -1292,53 +963,148 @@ use std::env::{
     var as v,
 };
 
-macro_rules! grab {
+macro_rules! grab_fn {
     ($f:ident) => {
-        std::env::$f("MACRO_BYPASS")
+        std::env::$f("MACRO_FN_BYPASS")
+    };
+}
+
+macro_rules! grab_mod {
+    ($m:ident) => {
+        std::$m::var("MACRO_MOD_BYPASS")
     };
 }
 
 pub fn use_bypasses() {
-    let _ = e::var("ALIAS_1");
+    let _ = zz::var("ALIAS_1");
     let _ = e2::var_os("ALIAS_2");
     let _ = var("GLOB_CALL");
 }
 "#;
     let found_imp = scan_source(Path::new("bypasses.rs"), import_and_macro_bypasses);
     let imp_lines: Vec<usize> = found_imp.iter().map(|v| v.line).collect();
-    assert_eq!(imp_lines, vec![4, 5, 9, 14, 19, 20], "got {found_imp:?}");
+    assert_eq!(
+        imp_lines,
+        vec![2, 3, 4, 5, 9, 14, 20, 25, 26],
+        "got {found_imp:?}"
+    );
+}
+
+struct TempWorkspace(PathBuf);
+
+impl TempWorkspace {
+    fn new(prefix: &str) -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let id = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-env-guard-{prefix}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp workspace");
+        Self(dir)
+    }
+
+    fn write(&self, rel: &str, content: &str) {
+        let p = self.0.join(rel);
+        fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+        fs::write(p, content).expect("write");
+    }
+
+    fn root_manifest(&self) -> PathBuf {
+        self.0.join("Cargo.toml")
+    }
+}
+
+impl Drop for TempWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn run_temp_cargo_tree_case(
+    prefix: &str,
+    pg_features: &str,
+    consumer_manifest_tail: &str,
+) -> Vec<String> {
+    let ws = TempWorkspace::new(prefix);
+    ws.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"3\"\nmembers = [\"spawn-postgres\", \"consumer\"]\n\n[workspace.dependencies]\nspawn-postgres = { path = \"spawn-postgres\" }\n",
+    );
+    ws.write(
+        "spawn-postgres/Cargo.toml",
+        &format!(
+            "[package]\nname = \"spawn-postgres\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[features]\n{pg_features}"
+        ),
+    );
+    ws.write("spawn-postgres/src/lib.rs", "");
+    ws.write(
+        "consumer/Cargo.toml",
+        &format!(
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n{consumer_manifest_tail}"
+        ),
+    );
+    ws.write("consumer/src/lib.rs", "");
+    check_cargo_tree_no_prod_testing_feature(&ws.root_manifest())
 }
 
 #[test]
-fn cargo_toml_guard_catches_production_testing_feature_and_allows_dev_dependencies() {
-    let manifest = r#"
-[workspace.dependencies]
-spawn-postgres = { path = "crates/spawn-postgres", features = ["testing"] }
+fn cargo_tree_guard_catches_all_production_testing_feature_forms_and_allows_dev_deps() {
+    let synthetic = "\
+consumer v0.1.0 (/tmp/consumer) []
+├── spawn-postgres v0.1.0 (/tmp/crates[1]/spawn-postgres) []
+├── spawn-postgres v0.1.0 (/tmp/crates[1]/spawn-postgres) [default,testing] (*)
+└── spawn-postgres v0.1.0 (/tmp/crates/spawn-postgres) [testing]
+";
+    assert_eq!(parse_cargo_tree_testing_violations(synthetic).len(), 2);
 
-[dependencies]
-# spawn-postgres = { workspace = true, features = ["testing"] }
-spawn-postgres = { workspace = true, features = ["testing"] }
+    let pg_clean = "default = []\ntesting = []\n";
+    let pg_default_bad = "default = [\"testing\"]\ntesting = []\n";
 
-[dependencies.spawn-postgres]
-workspace = true
-features = [
-    "testing",
-]
-
-[target.'cfg(unix)'.dependencies]
-spawn-postgres = { workspace = true, features = ["testing"] }
-
-[features]
-default = ["spawn-postgres/testing"]
-testing = ["spawn-postgres?/testing"]
-
-[dev-dependencies]
-spawn-postgres = { workspace = true, features = ["testing"] }
-
-[target.'cfg(unix)'.dev-dependencies]
-spawn-postgres = { workspace = true, features = ["testing"] }
-"#;
-    let found = scan_cargo_toml_for_spawn_postgres_testing(Path::new("Cargo.toml"), manifest);
-    let lines: Vec<usize> = found.iter().map(|v| v.line).collect();
-    assert_eq!(lines, vec![3, 7, 11, 16, 19], "got {found:?}");
+    // 1. Clean: `[dev-dependencies]` enables `testing`, normal deps do not.
+    assert!(
+        run_temp_cargo_tree_case(
+            "dev-ok",
+            pg_clean,
+            "[dependencies]\nspawn-postgres.workspace = true\n[dev-dependencies]\nspawn-postgres = { path = \"../spawn-postgres\", features = [\"testing\"] }\n",
+        )
+        .is_empty()
+    );
+    // 2. Dotted key `spawn-postgres.features = ["testing"]`.
+    assert!(
+        !run_temp_cargo_tree_case(
+            "dotted",
+            pg_clean,
+            "[dependencies]\nspawn-postgres.workspace = true\nspawn-postgres.features = [\"testing\"]\n",
+        )
+        .is_empty()
+    );
+    // 3. `default = ["testing"]` inside `spawn-postgres/Cargo.toml`.
+    assert!(
+        !run_temp_cargo_tree_case(
+            "default-self",
+            pg_default_bad,
+            "[dependencies]\nspawn-postgres.workspace = true\n",
+        )
+        .is_empty()
+    );
+    // 4. `default = ["testing"]` + `testing = ["spawn-postgres/testing"]` in consumer.
+    assert!(
+        !run_temp_cargo_tree_case(
+            "forwarded",
+            pg_clean,
+            "[features]\ndefault = [\"testing\"]\ntesting = [\"spawn-postgres/testing\"]\n\n[dependencies]\nspawn-postgres.workspace = true\n",
+        )
+        .is_empty()
+    );
+    // 5. Renamed dependency `zz-pg = { package = "spawn-postgres", ..., features = ["testing"] }`.
+    assert!(
+        !run_temp_cargo_tree_case(
+            "renamed",
+            pg_clean,
+            "[dependencies]\nzz-pg = { package = \"spawn-postgres\", path = \"../spawn-postgres\", features = [\"testing\"] }\n",
+        )
+        .is_empty()
+    );
 }
