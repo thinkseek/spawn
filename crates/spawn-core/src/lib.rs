@@ -34,3 +34,4 @@ pub mod screen;
 pub mod shell;
 pub mod time;
 pub mod transcripts;
+pub mod tui;
