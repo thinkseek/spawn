@@ -25,7 +25,6 @@
 //! supervisor is still kept alive, so someone can act on the warning.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -35,7 +34,16 @@ use spawn_postgres::PostgresStore;
 use crate::config::env_value;
 use crate::dispatch::{Escalation, Order, Why};
 
-const GIB: u64 = 1024 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+
+/// Minimum effective warning threshold on small volumes (64 MiB when the
+/// filesystem can hold at least 128 MiB).
+const MIN_WARN_BYTES: u64 = 64 * MIB;
+
+/// Minimum effective execution-hold floor on small volumes (16 MiB when the
+/// filesystem can hold at least 64 MiB).
+const MIN_FLOOR_BYTES: u64 = 16 * MIB;
 
 /// How often the loop reads free space.
 pub(crate) const CHECK_EVERY: Duration = Duration::from_mins(1);
@@ -63,6 +71,21 @@ pub(crate) struct Thresholds {
     pub(crate) floor: u64,
 }
 
+fn cap_to_volume(
+    configured: u64,
+    total: u64,
+    ratio_divisor: u64,
+    min_bytes: u64,
+    max_share_divisor: u64,
+) -> u64 {
+    if configured == 0 || total == 0 {
+        return configured;
+    }
+    let proportional = total / ratio_divisor;
+    let floor = min_bytes.min((total / max_share_divisor).max(1));
+    configured.min(proportional.max(floor))
+}
+
 impl Thresholds {
     /// `SPAWN_DISK_WARN_GB` (default 20) and `SPAWN_DISK_FLOOR_GB` (default
     /// 2), whole GiB.
@@ -78,6 +101,33 @@ impl Thresholds {
             floor: gib("SPAWN_DISK_FLOOR_GB", 2),
         }
     }
+
+    /// Effective thresholds for a filesystem of `total_bytes`: preserves
+    /// configured `warn` / `floor` on large volumes (`>= 100 GiB` for the
+    /// 20 GiB / 2 GiB defaults) or when `total_bytes` is unknown/zero, and
+    /// proportionally caps them on small volumes (`warn <= total / 5`,
+    /// `floor <= total / 10`, with guarded minimums that never exceed the
+    /// volume or invert `floor <= warn`, and never raise a `0` threshold).
+    pub(crate) fn effective_for(self, total_bytes: Option<u64>) -> Self {
+        let Some(total) = total_bytes.filter(|&bytes| bytes > 0) else {
+            return self;
+        };
+        Self {
+            warn: cap_to_volume(self.warn, total, 5, MIN_WARN_BYTES, 2),
+            floor: cap_to_volume(self.floor, total, 10, MIN_FLOOR_BYTES, 4),
+        }
+    }
+}
+
+/// Recovery hysteresis above `warn` for a filesystem of `total_bytes`:
+/// [`RECOVERY_MARGIN`] (1 GiB) on volumes `>= 20 GiB` or unknown capacity,
+/// scaled to 5% of `total_bytes` (at least 1 byte) on smaller volumes so a
+/// small `tmpfs` (e.g., 480 MiB `/tmp`) can always recover cleanly.
+pub(crate) fn recovery_margin_for(total_bytes: Option<u64>) -> u64 {
+    let Some(total) = total_bytes.filter(|&bytes| bytes > 0) else {
+        return RECOVERY_MARGIN;
+    };
+    (total / 20).clamp(1, RECOVERY_MARGIN)
 }
 
 /// A path the fleet writes to, and what it is.
@@ -103,31 +153,32 @@ pub(crate) fn places(root: Option<&Path>) -> Vec<Place> {
     places
 }
 
-/// Free bytes on the filesystem that holds `path`, as `df -P` reports them
-/// to an unprivileged user.
-pub(crate) fn free_bytes(path: &Path) -> Result<u64, String> {
-    let output = Command::new("df")
-        .arg("-Pk")
-        .arg("--")
-        .arg(path)
-        .output()
-        .map_err(|error| format!("df {}: {error}", path.display()))?;
-    if !output.status.success() {
-        return Err(format!(
-            "df {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    parse_df(&String::from_utf8_lossy(&output.stdout))
-        .ok_or_else(|| format!("df {}: no free space in its output", path.display()))
+/// Free (unprivileged available) and total bytes of a filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Space {
+    pub(crate) free: u64,
+    pub(crate) total: u64,
 }
 
-/// The available KiB column of `df -Pk`'s one line, in bytes.
-fn parse_df(text: &str) -> Option<u64> {
-    let line = text.lines().nth(1)?;
-    let available: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
-    Some(available.saturating_mul(1024))
+/// Free and total bytes on the filesystem that holds `path`, via `statvfs(2)`.
+pub(crate) fn space(path: &Path) -> Result<Space, String> {
+    let stat = rustix::fs::statvfs(path)
+        .map_err(|error| format!("statvfs {}: {error}", path.display()))?;
+    let unit = if stat.f_frsize > 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    };
+    Ok(Space {
+        free: stat.f_bavail.saturating_mul(unit),
+        total: stat.f_blocks.saturating_mul(unit),
+    })
+}
+
+/// Free bytes on the filesystem that holds `path`, as `statvfs(2)` reports
+/// them to an unprivileged user.
+pub(crate) fn free_bytes(path: &Path) -> Result<u64, String> {
+    space(path).map(|measured| measured.free)
 }
 
 /// One reading of one place.
@@ -137,16 +188,26 @@ pub(crate) struct Reading {
     pub(crate) free: u64,
 }
 
-/// The free space of every place, now; a place that cannot be read is left
-/// out and named in the error lines.
-pub(crate) fn read(places: &[Place]) -> (Vec<Reading>, Vec<String>) {
+/// Internal reading paired with the filesystem's total capacity when known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Measured {
+    reading: Reading,
+    total: Option<u64>,
+}
+
+/// The free and total space of every place, now; a place that cannot be read
+/// is left out and named in the error lines.
+fn read_measured(places: &[Place]) -> (Vec<Measured>, Vec<String>) {
     let mut readings = Vec::new();
     let mut errors = Vec::new();
     for place in places {
-        match free_bytes(&place.path) {
-            Ok(free) => readings.push(Reading {
-                place: place.clone(),
-                free,
+        match space(&place.path) {
+            Ok(measured) => readings.push(Measured {
+                reading: Reading {
+                    place: place.clone(),
+                    free: measured.free,
+                },
+                total: Some(measured.total),
             }),
             Err(error) => errors.push(format!("disk: {error}")),
         }
@@ -163,25 +224,36 @@ pub(crate) fn gib(bytes: u64) -> String {
 }
 
 /// The record a reading makes, given whether its path was last recorded
-/// low: `low` when it falls under the warning threshold, `recovered` when
-/// a low path is back [`RECOVERY_MARGIN`] above it, else none.
-pub(crate) fn crossing(was_low: bool, reading: &Reading, thresholds: Thresholds) -> Option<Value> {
-    let state = if !was_low && reading.free < thresholds.warn {
+/// low: `low` when it falls under the effective warning threshold, `recovered`
+/// when a low path is back [`recovery_margin_for`] above it, else none.
+fn crossing(
+    was_low: bool,
+    reading: &Reading,
+    total: Option<u64>,
+    thresholds: Thresholds,
+) -> Option<Value> {
+    let effective = thresholds.effective_for(total);
+    let margin = recovery_margin_for(total);
+    let state = if !was_low && reading.free < effective.warn {
         "low"
-    } else if was_low && reading.free >= thresholds.warn.saturating_add(RECOVERY_MARGIN) {
+    } else if was_low && reading.free >= effective.warn.saturating_add(margin) {
         "recovered"
     } else {
         return None;
     };
-    Some(json!({
+    let mut record = json!({
         "type": "host.disk",
         "label": reading.place.label,
         "path": reading.place.path.display().to_string(),
         "state": state,
         "free_bytes": reading.free,
-        "warn_bytes": thresholds.warn,
-        "floor_bytes": thresholds.floor,
-    }))
+        "warn_bytes": effective.warn,
+        "floor_bytes": effective.floor,
+    });
+    if let Some(total) = total {
+        record["total_bytes"] = json!(total);
+    }
+    Some(record)
 }
 
 /// Keep `orders` that start no new execution; return how many were held.
@@ -327,9 +399,9 @@ hours: {what}. Its work waits (no halt counts); {advice} or tell the owner."
 }
 
 /// The size report the fleet view shows: per place (the workspace root of
-/// `SPAWN_WORKSPACE_ROOT`, and `TMPDIR`) its free space now (`null` when it
-/// cannot be read), the thresholds, and the state of its latest `host.disk`
-/// record (`null` when none).
+/// `SPAWN_WORKSPACE_ROOT`, and `TMPDIR`) its free and total space now (`null`
+/// when it cannot be read), the effective thresholds for that filesystem's
+/// capacity, and the state of its latest `host.disk` record (`null` when none).
 pub(crate) fn report(records: &Value) -> Value {
     let root = env_value("SPAWN_WORKSPACE_ROOT").map(PathBuf::from);
     report_of(&places(root.as_deref()), Thresholds::from_env(), records)
@@ -338,28 +410,38 @@ pub(crate) fn report(records: &Value) -> Value {
 fn report_of(places: &[Place], thresholds: Thresholds, records: &Value) -> Value {
     let places: Vec<Value> = places
         .iter()
-        .map(|place| {
-            let path = place.path.display().to_string();
-            let recorded = records
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|record| record["path"].as_str() == Some(path.as_str()));
-            json!({
-                "label": place.label,
-                "path": path,
-                "free_bytes": free_bytes(&place.path).ok(),
-                "warn_bytes": thresholds.warn,
-                "floor_bytes": thresholds.floor,
-                "recorded": recorded.map(|record| json!({
-                    "state": record["state"],
-                    "free_bytes": record["free_bytes"],
-                    "at_ms": record["at_ms"],
-                })),
-            })
-        })
+        .map(|place| report_place(place, space(&place.path).ok(), thresholds, records))
         .collect();
     Value::Array(places)
+}
+
+fn report_place(
+    place: &Place,
+    measured: Option<Space>,
+    thresholds: Thresholds,
+    records: &Value,
+) -> Value {
+    let path = place.path.display().to_string();
+    let recorded = records
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|record| record["path"].as_str() == Some(path.as_str()));
+    let total = measured.map(|space| space.total);
+    let effective = thresholds.effective_for(total);
+    json!({
+        "label": place.label,
+        "path": path,
+        "free_bytes": measured.map(|space| space.free),
+        "total_bytes": total,
+        "warn_bytes": effective.warn,
+        "floor_bytes": effective.floor,
+        "recorded": recorded.map(|record| json!({
+            "state": record["state"],
+            "free_bytes": record["free_bytes"],
+            "at_ms": record["at_ms"],
+        })),
+    })
 }
 
 /// What the loop knows about disk room: the latest record per path (read
@@ -370,7 +452,7 @@ pub(crate) struct Monitor {
     checked: Option<Instant>,
     /// The latest `host.disk` record per path, `None` until read from the log.
     records: Option<Vec<Value>>,
-    readings: Vec<Reading>,
+    readings: Vec<Measured>,
 }
 
 impl Monitor {
@@ -403,12 +485,12 @@ impl Monitor {
             let records = store.host_disk().map_err(|error| error.to_string())?;
             self.records = Some(records.as_array().cloned().unwrap_or_default());
         }
-        let (readings, mut lines) = read(&self.places);
+        let (readings, mut lines) = read_measured(&self.places);
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
         // A low record of a path no longer watched is closed; one that
         // could not be written is made again at the next check.
         let mut records = self.unwatched();
-        records.extend(self.observe(readings));
+        records.extend(self.observe_measured(readings));
         for record in records {
             let id = store
                 .host_record(&record)
@@ -429,15 +511,35 @@ impl Monitor {
     }
 
     /// Take `readings` as the latest and return the records they make.
-    pub(crate) fn observe(&mut self, readings: Vec<Reading>) -> Vec<Value> {
+    fn observe_measured(&mut self, readings: Vec<Measured>) -> Vec<Value> {
         let records: Vec<Value> = readings
             .iter()
-            .filter_map(|reading| {
-                crossing(self.was_low(&reading.place.path), reading, self.thresholds)
+            .filter_map(|measured| {
+                crossing(
+                    self.was_low(&measured.reading.place.path),
+                    &measured.reading,
+                    measured.total,
+                    self.thresholds,
+                )
             })
             .collect();
         self.readings = readings;
         records
+    }
+
+    /// Take `readings` without capacity metadata as the latest and return the
+    /// records they make.
+    #[cfg(test)]
+    pub(crate) fn observe(&mut self, readings: Vec<Reading>) -> Vec<Value> {
+        self.observe_measured(
+            readings
+                .into_iter()
+                .map(|reading| Measured {
+                    reading,
+                    total: None,
+                })
+                .collect(),
+        )
     }
 
     /// The records that close the `low` records of paths this loop does not
@@ -490,12 +592,12 @@ impl Monitor {
         records.push(record);
     }
 
-    /// Whether any place was under the floor at the latest reading: no new
-    /// execution starts.
+    /// Whether any place was under its effective floor at the latest reading:
+    /// no new execution starts.
     pub(crate) fn below_floor(&self) -> bool {
-        self.readings
-            .iter()
-            .any(|reading| reading.free < self.thresholds.floor)
+        self.readings.iter().any(|measured| {
+            measured.reading.free < self.thresholds.effective_for(measured.total).floor
+        })
     }
 
     /// The digest items for the latest records.
@@ -524,8 +626,9 @@ impl Monitor {
 mod tests {
     #![allow(clippy::disallowed_methods)]
     use super::{
-        GIB, Monitor, Place, RECOVERY_MARGIN, Reading, Thresholds, escalations,
-        gate_room_escalations, hold_new_executions, parse_df, places,
+        GIB, MIB, Measured, Monitor, Place, RECOVERY_MARGIN, Reading, Space, Thresholds,
+        escalations, free_bytes, gate_room_escalations, hold_new_executions, places,
+        recovery_margin_for, report_place, space,
     };
     use crate::dispatch::{Order, Why};
     use serde_json::json;
@@ -551,6 +654,19 @@ mod tests {
         }
     }
 
+    fn measured(label: &'static str, path: &str, free: u64, total: u64) -> Measured {
+        Measured {
+            reading: Reading {
+                place: Place {
+                    label,
+                    path: PathBuf::from(path),
+                },
+                free,
+            },
+            total: Some(total),
+        }
+    }
+
     fn order(action: CommandAction) -> Order {
         Order {
             agent_id: "agent_worker_a".to_string(),
@@ -562,13 +678,13 @@ mod tests {
     }
 
     #[test]
-    fn df_output_is_read_as_bytes() {
-        let text = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
-                    /dev/sda2 1000 400 600 40% /data\n";
-        assert_eq!(parse_df(text), Some(600 * 1024));
-        assert_eq!(parse_df("Filesystem\n"), None);
-        assert!(super::free_bytes(Path::new("/")).is_ok_and(|free| free > 0));
-        assert!(super::free_bytes(Path::new("/no/such/path/at/all")).is_err());
+    fn statvfs_space_reads_free_and_total_bytes() {
+        let root = space(Path::new("/")).expect("root filesystem");
+        assert!(root.free > 0);
+        assert!(root.total >= root.free);
+        assert!(free_bytes(Path::new("/")).is_ok_and(|free| free > 0));
+        assert!(space(Path::new("/no/such/path/at/all")).is_err());
+        assert!(free_bytes(Path::new("/no/such/path/at/all")).is_err());
     }
 
     #[test]
@@ -800,12 +916,19 @@ mod tests {
                 .as_u64()
                 .is_some_and(|free| free > 0)
         );
+        let root_total = report[0]["total_bytes"].as_u64();
+        assert!(root_total.is_some_and(|total| total > 0));
+        let expected_root = THRESHOLDS.effective_for(root_total);
         assert_eq!(
             report[0]["recorded"],
             json!({"state": "low", "free_bytes": 5, "at_ms": 9})
         );
-        assert_eq!(report[0]["warn_bytes"], json!(20 * GIB));
+        assert_eq!(report[0]["warn_bytes"], json!(expected_root.warn));
+        assert_eq!(report[0]["floor_bytes"], json!(expected_root.floor));
         assert_eq!(report[1]["free_bytes"], json!(null), "unreadable: null");
+        assert_eq!(report[1]["total_bytes"], json!(null), "unreadable: null");
+        assert_eq!(report[1]["warn_bytes"], json!(20 * GIB));
+        assert_eq!(report[1]["floor_bytes"], json!(2 * GIB));
         assert_eq!(report[1]["recorded"], json!(null));
     }
 
@@ -959,5 +1082,127 @@ serve more scenarios or tell the owner."
         );
         assert_eq!(items[0].why, Why::GateRoom);
         assert_eq!(items[0].tag(), "host gate-room-24");
+    }
+
+    #[test]
+    fn small_480_mib_tmpfs_caps_thresholds_and_recovers_cleanly() {
+        let tmp_total = 480 * MIB;
+        let effective = THRESHOLDS.effective_for(Some(tmp_total));
+        assert_eq!(effective.warn, 96 * MIB);
+        assert_eq!(effective.floor, 48 * MIB);
+        assert_eq!(recovery_margin_for(Some(tmp_total)), 24 * MIB);
+
+        let tmp = Place {
+            label: "tmpdir",
+            path: PathBuf::from("/tmp"),
+        };
+        let healthy = report_place(
+            &tmp,
+            Some(Space {
+                free: 470 * MIB,
+                total: tmp_total,
+            }),
+            THRESHOLDS,
+            &json!([]),
+        );
+        assert_eq!(healthy["free_bytes"], json!(470 * MIB));
+        assert_eq!(healthy["total_bytes"], json!(480 * MIB));
+        assert_eq!(healthy["warn_bytes"], json!(96 * MIB));
+        assert_eq!(healthy["floor_bytes"], json!(48 * MIB));
+
+        let mut monitor = Monitor::with(vec![tmp], THRESHOLDS);
+        assert!(
+            monitor
+                .observe_measured(vec![measured("tmpdir", "/tmp", 470 * MIB, tmp_total)])
+                .is_empty(),
+            "470 MiB free on a 480 MiB tmpfs must not false-alarm"
+        );
+        assert!(!monitor.below_floor());
+
+        let low = monitor.observe_measured(vec![measured("tmpdir", "/tmp", 80 * MIB, tmp_total)]);
+        assert_eq!(low.len(), 1);
+        assert_eq!(low[0]["state"], "low");
+        assert_eq!(low[0]["warn_bytes"], json!(96 * MIB));
+        assert_eq!(low[0]["floor_bytes"], json!(48 * MIB));
+        assert_eq!(low[0]["total_bytes"], json!(480 * MIB));
+        assert!(!monitor.below_floor());
+        monitor.remember(low[0].clone(), 1, 1);
+
+        assert!(
+            monitor
+                .observe_measured(vec![measured("tmpdir", "/tmp", 40 * MIB, tmp_total)])
+                .is_empty()
+        );
+        assert!(monitor.below_floor());
+
+        assert!(
+            monitor
+                .observe_measured(vec![measured("tmpdir", "/tmp", 119 * MIB, tmp_total)])
+                .is_empty(),
+            "inside the 24 MiB recovery margin above 96 MiB"
+        );
+        let recovered =
+            monitor.observe_measured(vec![measured("tmpdir", "/tmp", 120 * MIB, tmp_total)]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0]["state"], "recovered");
+        assert_eq!(recovered[0]["warn_bytes"], json!(96 * MIB));
+        assert_eq!(recovered[0]["floor_bytes"], json!(48 * MIB));
+        assert_eq!(recovered[0]["total_bytes"], json!(480 * MIB));
+    }
+
+    #[test]
+    fn large_500_gib_disk_keeps_configured_thresholds_unchanged() {
+        let large_total = 500 * GIB;
+        let effective = THRESHOLDS.effective_for(Some(large_total));
+        assert_eq!(effective, THRESHOLDS);
+        assert_eq!(recovery_margin_for(Some(large_total)), RECOVERY_MARGIN);
+
+        let ws = place("/ws");
+        let report = report_place(
+            &ws,
+            Some(Space {
+                free: 300 * GIB,
+                total: large_total,
+            }),
+            THRESHOLDS,
+            &json!([]),
+        );
+        assert_eq!(report["warn_bytes"], json!(20 * GIB));
+        assert_eq!(report["floor_bytes"], json!(2 * GIB));
+        assert_eq!(report["total_bytes"], json!(500 * GIB));
+
+        let mut monitor = Monitor::with(vec![ws], THRESHOLDS);
+        let low =
+            monitor.observe_measured(vec![measured("workspace", "/ws", 19 * GIB, large_total)]);
+        assert_eq!(low[0]["state"], "low");
+        assert_eq!(low[0]["warn_bytes"], json!(20 * GIB));
+        assert_eq!(low[0]["floor_bytes"], json!(2 * GIB));
+    }
+
+    #[test]
+    fn thin_25_gib_disk_and_tiny_or_disabled_thresholds_behave_safely() {
+        assert_eq!(
+            THRESHOLDS.effective_for(Some(25 * GIB)),
+            Thresholds {
+                warn: 5 * GIB,
+                floor: 2 * GIB,
+            }
+        );
+        assert_eq!(recovery_margin_for(Some(25 * GIB)), RECOVERY_MARGIN);
+
+        for total in [64 * MIB, 10 * MIB, 2] {
+            let eff = THRESHOLDS.effective_for(Some(total));
+            let margin = recovery_margin_for(Some(total));
+            assert!(eff.floor > 0 && eff.floor <= eff.warn && eff.warn < total);
+            assert!(eff.warn.saturating_add(margin) <= total);
+        }
+
+        assert_eq!(THRESHOLDS.effective_for(Some(0)), THRESHOLDS);
+        assert_eq!(THRESHOLDS.effective_for(None), THRESHOLDS);
+        assert_eq!(recovery_margin_for(Some(0)), RECOVERY_MARGIN);
+        assert_eq!(recovery_margin_for(None), RECOVERY_MARGIN);
+
+        let zero = Thresholds { warn: 0, floor: 0 };
+        assert_eq!(zero.effective_for(Some(480 * MIB)), zero);
     }
 }
