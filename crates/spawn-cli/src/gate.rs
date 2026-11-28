@@ -432,7 +432,11 @@ fn available_mb(meminfo: &str) -> Option<u64> {
 
 /// The test database's probe, as `spawn integrate` runs it.
 fn probed_database(url: &str) -> Result<(), spawn_postgres::ProbeFailure> {
-    spawn_postgres::parallel_query_probe(url, DATABASE_PROBE_LIMIT)
+    spawn_postgres::parallel_query_probe_with_passfile(
+        url,
+        DATABASE_PROBE_LIMIT,
+        crate::config::pg_passfile().as_deref(),
+    )
 }
 
 /// Free KiB of the filesystem holding a path ([`Room`]'s disk measure).

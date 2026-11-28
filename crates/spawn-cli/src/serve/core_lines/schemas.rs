@@ -50,8 +50,14 @@ pub(super) struct UrlFile {
 /// The URL in the file at `path`, or why it is refused: not a regular file
 /// this user (`uid`) owns at mode 0600, not a postgres URL, a host that is
 /// not this one's (a socket or loopback), or the live database (`live`,
-/// compared by the database each names). The reason never holds the URL.
-pub(super) fn url_from_file(path: &Path, live: Option<&str>, uid: u32) -> Result<String, String> {
+/// compared by the database each names using `defaults`). The reason never
+/// holds the URL.
+pub(super) fn url_from_file_with(
+    path: &Path,
+    live: Option<&str>,
+    uid: u32,
+    defaults: &spawn_postgres::LibpqDefaults,
+) -> Result<String, String> {
     use std::os::unix::fs::MetadataExt as _;
 
     let metadata = std::fs::symlink_metadata(path)
@@ -69,16 +75,22 @@ pub(super) fn url_from_file(path: &Path, live: Option<&str>, uid: u32) -> Result
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("cannot be read: {}", error.kind()))?;
     let url = text.trim().to_string();
-    let named = spawn_postgres::database_identity(&url)?;
+    let named = spawn_postgres::database_identity_with_defaults(&url, defaults)?;
     if !named.local {
         return Err("names a host that is not this one's (a local socket or loopback)".to_string());
     }
-    if let Some(live) = live.and_then(|live| spawn_postgres::database_identity(live).ok())
+    if let Some(live) =
+        live.and_then(|live| spawn_postgres::database_identity_with_defaults(live, defaults).ok())
         && live == named
     {
         return Err("names the live database".to_string());
     }
     Ok(url)
+}
+
+#[cfg(test)]
+pub(super) fn url_from_file(path: &Path, live: Option<&str>, uid: u32) -> Result<String, String> {
+    url_from_file_with(path, live, uid, &spawn_postgres::LibpqDefaults::default())
 }
 
 /// The `<pid>` of a test schema's name, `spawn_test_<pid>_...`; `None` for

@@ -277,7 +277,10 @@ pub use gateway::{
     MasterMessageMode,
 };
 pub use grading::RoutedTask;
-pub use host::{DatabaseIdentity, database_identity, test_database_size, test_schemas};
+pub use host::{
+    DatabaseIdentity, LibpqDefaults, database_identity, database_identity_with_defaults,
+    test_database_size, test_database_size_with_passfile, test_schemas, test_schemas_with_passfile,
+};
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use nodes::StoreConnector;
 pub use provenance::{
@@ -333,6 +336,15 @@ fn backend(error: &postgres::Error) -> StoreError {
     StoreError::Unreachable(error.to_string())
 }
 
+/// Explicit connection options injected by entry boundaries into [`PostgresStore`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectOptions {
+    /// Optional explicit passfile path (`PGPASSFILE` / `$HOME/.pgpass`) resolved outside core.
+    pub passfile: Option<std::path::PathBuf>,
+    /// Optional per-session `statement_timeout` (with 5 s connect timeout).
+    pub statement_timeout: Option<std::time::Duration>,
+}
+
 /// PostgreSQL store.
 pub struct PostgresStore {
     client: Arc<Mutex<Client>>,
@@ -345,6 +357,8 @@ pub struct PostgresStore {
     /// The URL this store connected with, for the server-wide migration
     /// lock ([`PostgresStore::migrate`]).
     url: String,
+    /// Optional passfile path passed when constructing this store, reused by reconnects/LISTEN.
+    passfile: Option<std::path::PathBuf>,
     /// The statements this connection has prepared, by the SQL they were
     /// prepared from: the loop's fixed reads are parsed and planned once and
     /// reused, not once per pass ([`PostgresStore::query_prepared`]).
@@ -371,8 +385,24 @@ const LOGINS: [&str; 4] = [
 impl PostgresStore {
     /// Connect to the database in the URL.
     pub fn connect(url: &str) -> Result<Self, StoreError> {
-        let config = passfile::config(url).map_err(|error| backend(&error))?;
-        Self::connect_config(config, url)
+        Self::connect_with_options(url, &ConnectOptions::default())
+    }
+
+    /// Connect to the database in `url` using explicit boundary [`ConnectOptions`].
+    pub fn connect_with_options(url: &str, options: &ConnectOptions) -> Result<Self, StoreError> {
+        let mut config =
+            passfile::config(url, options.passfile.as_deref()).map_err(|error| backend(&error))?;
+        if let Some(timeout) = options.statement_timeout {
+            let limit = format!("-c statement_timeout={}", timeout.as_millis().max(1));
+            let merged = match config.get_options() {
+                Some(existing) if !existing.trim().is_empty() => format!("{existing} {limit}"),
+                _ => limit,
+            };
+            config
+                .options(&merged)
+                .connect_timeout(std::time::Duration::from_secs(5));
+        }
+        Self::connect_config(config, url, options.passfile.clone())
     }
 
     /// [`Self::connect`] for a reader that must never wait on the server
@@ -382,19 +412,20 @@ impl PostgresStore {
         url: &str,
         timeout: std::time::Duration,
     ) -> Result<Self, StoreError> {
-        let mut config = passfile::config(url).map_err(|error| backend(&error))?;
-        let limit = format!("-c statement_timeout={}", timeout.as_millis().max(1));
-        let options = match config.get_options() {
-            Some(options) if !options.trim().is_empty() => format!("{options} {limit}"),
-            _ => limit,
-        };
-        config
-            .options(&options)
-            .connect_timeout(std::time::Duration::from_secs(5));
-        Self::connect_config(config, url)
+        Self::connect_with_options(
+            url,
+            &ConnectOptions {
+                passfile: None,
+                statement_timeout: Some(timeout),
+            },
+        )
     }
 
-    fn connect_config(mut config: postgres::Config, url: &str) -> Result<Self, StoreError> {
+    fn connect_config(
+        mut config: postgres::Config,
+        url: &str,
+        passfile: Option<std::path::PathBuf>,
+    ) -> Result<Self, StoreError> {
         // The schema warns (`raise warning`) about what a migration left for
         // a human, such as tables it kept. The many notices of an idempotent
         // migration ("already exists, skipping") stay quiet.
@@ -407,8 +438,9 @@ impl PostgresStore {
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
             workers: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            password: url_password(url),
+            password: url_password_with_passfile(url, passfile.as_deref()),
             url: url.to_string(),
+            passfile,
             prepared: Mutex::new(std::collections::HashMap::new()),
             schema: None,
         })
@@ -466,7 +498,13 @@ impl PostgresStore {
             .query_one("select current_schema()", &[])
             .map_err(|error| backend(&error))?
             .get(0);
-        let store = PostgresStore::connect(&self.url)?;
+        let store = PostgresStore::connect_with_options(
+            &self.url,
+            &ConnectOptions {
+                passfile: self.passfile.clone(),
+                statement_timeout: None,
+            },
+        )?;
         {
             let mut client = store.lock();
             client
@@ -487,7 +525,7 @@ impl PostgresStore {
         // Where that database cannot be reached, a lost race is run again
         // (every statement of the schema is idempotent), a bounded number of
         // times.
-        let _server = server_migration_lock(&self.url);
+        let _server = server_migration_lock(&self.url, self.passfile.as_deref());
         let mut attempt: u32 = 0;
         loop {
             match self.migrate_once() {
@@ -550,8 +588,10 @@ const MIGRATION_LOCK_KEY: i64 = 1_399_957_400;
 
 /// The migration lock, held in the server's `postgres` database until the
 /// returned connection drops; `None` where that database cannot be reached.
-fn server_migration_lock(url: &str) -> Option<Client> {
-    let mut client = maintenance_config(url)?.connect(NoTls).ok()?;
+fn server_migration_lock(url: &str, passfile: Option<&std::path::Path>) -> Option<Client> {
+    let mut client = maintenance_config_with_passfile(url, passfile)?
+        .connect(NoTls)
+        .ok()?;
     client
         .execute("select pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
         .ok()?;
@@ -562,10 +602,18 @@ fn server_migration_lock(url: &str) -> Option<Client> {
 /// maintenance database `postgres`, keeping host, port, credentials and
 /// every other parameter, as the driver reads them; `None` when the URL
 /// does not parse.
-fn maintenance_config(url: &str) -> Option<postgres::Config> {
-    let mut config = passfile::config(url).ok()?;
+fn maintenance_config_with_passfile(
+    url: &str,
+    passfile: Option<&std::path::Path>,
+) -> Option<postgres::Config> {
+    let mut config = passfile::config(url, passfile).ok()?;
     config.dbname("postgres");
     Some(config)
+}
+
+#[cfg(test)]
+fn maintenance_config(url: &str) -> Option<postgres::Config> {
+    maintenance_config_with_passfile(url, None)
 }
 
 /// One restricted login of the database `client` is in: its role name
@@ -627,15 +675,19 @@ fn retry_pause(attempt: u32) -> std::time::Duration {
 }
 
 /// The password `url` connects with, as the driver reads it (the user
-/// info, decoded, or a `password=` parameter), else the passfile's
-/// ([`passfile`], objective 109), or "": every spelling of one password
-/// derives the same login passwords, wherever it comes from.
-fn url_password(url: &str) -> String {
-    passfile::config(url)
+/// info, decoded, or a `password=` parameter), else `passfile`'s matching
+/// entry ([`passfile`], objective 109), or "".
+fn url_password_with_passfile(url: &str, passfile: Option<&std::path::Path>) -> String {
+    passfile::config(url, passfile)
         .ok()
         .and_then(|config| config.get_password().map(<[u8]>::to_vec))
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn url_password(url: &str) -> String {
+    url_password_with_passfile(url, None)
 }
 
 /// PBKDF2-HMAC-SHA256 rounds of a login password: a guess at the owner's
@@ -702,14 +754,29 @@ fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
 /// in the passfile (the logins' passwords derive from it, and from nothing
 /// they would be public), or the database is unreachable or not migrated.
 pub fn role_url(owner: &str, role: &str) -> Result<String, String> {
-    let password = url_password(owner);
+    role_url_with_passfile(owner, role, None)
+}
+
+/// [`role_url`] using an explicit `passfile` when the owner's URL omits its password.
+///
+/// # Errors
+///
+/// When the owner's URL is not `scheme://...`, has no password (even in
+/// `passfile`), or the database is unreachable or not migrated.
+pub fn role_url_with_passfile(
+    owner: &str,
+    role: &str,
+    passfile: Option<&std::path::Path>,
+) -> Result<String, String> {
+    let password = url_password_with_passfile(owner, passfile);
     let Some((scheme, rest)) = owner.split_once("://").filter(|_| !password.is_empty()) else {
         return Err(format!(
             "{role}: the database URL must be scheme://user:password@host/..., or its \
              password a passfile line's (the restricted logins' passwords derive from the owner's)"
         ));
     };
-    let mut config = passfile::config(owner).map_err(|error| format!("{role}: {error}"))?;
+    let mut config =
+        passfile::config(owner, passfile).map_err(|error| format!("{role}: {error}"))?;
     config.connect_timeout(std::time::Duration::from_secs(5));
     let mut client = config
         .connect(NoTls)
@@ -778,7 +845,20 @@ fn login_url(scheme: &str, rest: &str, role: &str, password: &str) -> Result<Str
 /// When the URL does not parse, the server is unreachable, or the login may
 /// not read `pg_control_system()`.
 pub fn cluster_identity(url: &str) -> Result<String, StoreError> {
-    let mut config = passfile::config(url).map_err(|error| backend(&error))?;
+    cluster_identity_with_passfile(url, None)
+}
+
+/// [`cluster_identity`] using an explicit `passfile` when `url` omits its password.
+///
+/// # Errors
+///
+/// When the URL does not parse, the server is unreachable, or the login may
+/// not read `pg_control_system()`.
+pub fn cluster_identity_with_passfile(
+    url: &str,
+    passfile: Option<&std::path::Path>,
+) -> Result<String, StoreError> {
+    let mut config = passfile::config(url, passfile).map_err(|error| backend(&error))?;
     config.connect_timeout(std::time::Duration::from_secs(5));
     let mut client = config.connect(NoTls).map_err(|error| backend(&error))?;
     let row = client
@@ -821,6 +901,21 @@ const PROBE_ROWS: i64 = 100_000;
 /// connection refused or not made within `limit`, a query that errs or does
 /// not finish within `limit`.
 pub fn parallel_query_probe(url: &str, limit: std::time::Duration) -> Result<(), ProbeFailure> {
+    parallel_query_probe_with_passfile(url, limit, None)
+}
+
+/// [`parallel_query_probe`] using an explicit `passfile` when `url` omits its password.
+///
+/// # Errors
+///
+/// The step that failed and its error: a URL that does not parse, a
+/// connection refused or not made within `limit`, a query that errs or does
+/// not finish within `limit`.
+pub fn parallel_query_probe_with_passfile(
+    url: &str,
+    limit: std::time::Duration,
+    passfile: Option<&std::path::Path>,
+) -> Result<(), ProbeFailure> {
     let seconds = limit.as_secs().max(1);
     let connect = format!("connect within {seconds} s");
     let query = format!(
@@ -833,7 +928,7 @@ pub fn parallel_query_probe(url: &str, limit: std::time::Duration) -> Result<(),
         probe: probe.to_string(),
         error,
     };
-    let mut config = passfile::config(url).map_err(|error| {
+    let mut config = passfile::config(url, passfile).map_err(|error| {
         failure(
             "read SPAWN_TEST_DATABASE_URL as a postgres URL",
             probe_error(&error),
@@ -1361,5 +1456,37 @@ mod tests {
             login_url("postgres", "o:p%40ss@h/db", "spawn_reader_db", "secret"),
             Ok("postgres://spawn_reader_db:secret@h/db".to_string())
         );
+    }
+
+    #[test]
+    fn explicit_passfile_resolves_url_password_and_connect_options_connects() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-lib-passfile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let pf = dir.join("pgpass");
+        std::fs::write(&pf, "db.local:5433:spawn_db:spawn_u:passfileSecret!\n").expect("write");
+        std::fs::set_permissions(&pf, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        let url = "postgres://spawn_u@db.local:5433/spawn_db";
+        assert_eq!(super::url_password_with_passfile(url, None), "");
+        assert_eq!(
+            super::url_password_with_passfile(url, Some(&pf)),
+            "passfileSecret!"
+        );
+
+        let opts = super::ConnectOptions {
+            passfile: Some(pf.clone()),
+            statement_timeout: None,
+        };
+        assert_eq!(opts.passfile.as_deref(), Some(pf.as_path()));
+        assert!(opts.statement_timeout.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

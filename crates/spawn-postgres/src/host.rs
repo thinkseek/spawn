@@ -183,15 +183,35 @@ const TEST_DATABASE_LIMIT: std::time::Duration = std::time::Duration::from_secs(
 /// A URL that does not parse, a server that cannot be reached, a statement
 /// that fails. The error never names the URL.
 pub fn test_database_size(url: &str) -> Result<Value, StoreError> {
-    test_database_read(url, &TEST_DATABASE_SIZE.replace("SCHEMAS_COUNT", SCHEMAS))
+    test_database_size_with_passfile(url, None)
+}
+
+/// [`test_database_size`] using an explicit passfile when the URL omits its password.
+///
+/// # Errors
+///
+/// A URL that does not parse, a server that cannot be reached, or a query failure.
+pub fn test_database_size_with_passfile(
+    url: &str,
+    passfile: Option<&std::path::Path>,
+) -> Result<Value, StoreError> {
+    test_database_read(
+        url,
+        &TEST_DATABASE_SIZE.replace("SCHEMAS_COUNT", SCHEMAS),
+        passfile,
+    )
 }
 
 /// One read-only statement answering one jsonb value, on a connection of its
 /// own to the test database at `url` that gives up after
 /// [`TEST_DATABASE_LIMIT`] connecting and as long querying. The error never
 /// names the URL.
-fn test_database_read(url: &str, statement: &str) -> Result<Value, StoreError> {
-    let mut config = crate::passfile::config(url)
+fn test_database_read(
+    url: &str,
+    statement: &str,
+    passfile: Option<&std::path::Path>,
+) -> Result<Value, StoreError> {
+    let mut config = crate::passfile::config(url, passfile)
         .map_err(|_| StoreError::Backend("the URL is not a postgres URL".to_string()))?;
     let limit = format!("-c statement_timeout={}", TEST_DATABASE_LIMIT.as_millis());
     let options = match config.get_options() {
@@ -234,7 +254,32 @@ select coalesce(jsonb_agg(jsonb_build_object(
 /// A URL that does not parse, a server that cannot be reached, a statement
 /// that fails. The error never names the URL.
 pub fn test_schemas(url: &str) -> Result<Value, StoreError> {
-    test_database_read(url, TEST_SCHEMAS)
+    test_schemas_with_passfile(url, None)
+}
+
+/// [`test_schemas`] using an explicit passfile when the URL omits its password.
+///
+/// # Errors
+///
+/// A URL that does not parse, a server that cannot be reached, or a query failure.
+pub fn test_schemas_with_passfile(
+    url: &str,
+    passfile: Option<&std::path::Path>,
+) -> Result<Value, StoreError> {
+    test_database_read(url, TEST_SCHEMAS, passfile)
+}
+
+/// Explicit fallback defaults corresponding to libpq's `PGPORT`, `PGUSER`/`USER`,
+/// and `PGDATABASE`, passed by entry boundaries instead of reading env vars in
+/// the PostgreSQL layer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibpqDefaults {
+    /// Fallback port when omitted from the connection URL (defaults to `5432` if `None`).
+    pub port: Option<u16>,
+    /// Fallback user name when omitted from the connection URL.
+    pub user: Option<String>,
+    /// Fallback database name when omitted from the connection URL (falls back to `user`).
+    pub database: Option<String>,
 }
 
 /// The database a URL names, after libpq's defaults (objective 094): whether
@@ -248,22 +293,34 @@ pub struct DatabaseIdentity {
     /// The host as named, for a server that is not local; empty for a
     /// local one.
     pub host: String,
-    /// TCP or Unix-socket port number (defaults to `PGPORT` or 5432).
+    /// TCP or Unix-socket port number (defaults to `LibpqDefaults::port` or 5432).
     pub port: u16,
     /// Target database name resolved after libpq defaults.
     pub database: String,
 }
 
-/// The database `url` names ([`DatabaseIdentity`]): libpq's defaults for
-/// what it leaves out (a socket when no host, `PGPORT` or 5432, the user's
-/// name as the database, the user `PGUSER` or the login). Never names the
-/// URL in its error.
+/// The database `url` names ([`DatabaseIdentity`]), without consulting process
+/// environment variables (`port` defaults to `5432`). Never names the URL in its error.
 ///
 /// # Errors
 ///
 /// A URL that does not parse as a postgres URL or key-value string, or one
-/// naming more than one host.
+/// naming more than one host or port.
 pub fn database_identity(url: &str) -> Result<DatabaseIdentity, String> {
+    database_identity_with_defaults(url, &LibpqDefaults::default())
+}
+
+/// Resolve [`DatabaseIdentity`] using caller-supplied [`LibpqDefaults`] instead of
+/// ambient environment variables. Never names the URL in its error.
+///
+/// # Errors
+///
+/// A URL that does not parse as a postgres URL or key-value string, or one
+/// naming more than one host or port.
+pub fn database_identity_with_defaults(
+    url: &str,
+    defaults: &LibpqDefaults,
+) -> Result<DatabaseIdentity, String> {
     let config: postgres::Config = url
         .trim()
         .parse()
@@ -291,23 +348,16 @@ pub fn database_identity(url: &str) -> Result<DatabaseIdentity, String> {
     if ports.len() > 1 {
         return Err("names more than one port".to_string());
     }
-    let port = match ports.first() {
-        Some(port) => *port,
-        None => std::env::var("PGPORT")
-            .ok()
-            .and_then(|port| port.trim().parse().ok())
-            .unwrap_or(5432),
-    };
+    let port = ports.first().copied().or(defaults.port).unwrap_or(5432);
     let user = config
         .get_user()
         .map(str::to_string)
-        .or_else(|| std::env::var("PGUSER").ok())
-        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| defaults.user.clone())
         .unwrap_or_default();
     let database = config
         .get_dbname()
         .map(str::to_string)
-        .or_else(|| std::env::var("PGDATABASE").ok())
+        .or_else(|| defaults.database.clone())
         .unwrap_or(user);
     Ok(DatabaseIdentity {
         local,
@@ -509,5 +559,58 @@ impl PostgresStore {
     /// Every distinct mission source (`SOURCES`).
     pub fn mission_sources(&self) -> Result<Value, StoreError> {
         self.query_json(SOURCES, &[])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LibpqDefaults, database_identity, database_identity_with_defaults};
+
+    #[test]
+    fn database_identity_uses_explicit_defaults_without_reading_env() {
+        let bare = database_identity("postgres:///spawn_test").expect("parse");
+        assert!(bare.local);
+        assert_eq!(bare.port, 5432);
+        assert_eq!(bare.database, "spawn_test");
+
+        let with_defaults = database_identity_with_defaults(
+            "host=127.0.0.1",
+            &LibpqDefaults {
+                port: Some(65432),
+                user: Some("alice".to_string()),
+                database: None,
+            },
+        )
+        .expect("parse with defaults");
+        assert!(with_defaults.local);
+        assert_eq!(with_defaults.port, 65432);
+        assert_eq!(with_defaults.database, "alice");
+
+        let explicit_db = database_identity_with_defaults(
+            "host=db.example.com",
+            &LibpqDefaults {
+                port: Some(5433),
+                user: Some("alice".to_string()),
+                database: Some("custom_db".to_string()),
+            },
+        )
+        .expect("parse explicit db");
+        assert!(!explicit_db.local);
+        assert_eq!(explicit_db.host, "db.example.com");
+        assert_eq!(explicit_db.port, 5433);
+        assert_eq!(explicit_db.database, "custom_db");
+
+        let uri_defaults = database_identity_with_defaults(
+            "postgres://bob@127.0.0.1",
+            &LibpqDefaults {
+                port: Some(65432),
+                user: Some("alice".to_string()),
+                database: Some("custom_db".to_string()),
+            },
+        )
+        .expect("parse uri");
+        assert!(uri_defaults.local);
+        assert_eq!(uri_defaults.port, 5432);
+        assert_eq!(uri_defaults.database, "custom_db");
     }
 }

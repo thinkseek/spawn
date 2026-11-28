@@ -3851,7 +3851,7 @@ pub(crate) fn url_for_database(drill_url: &str, database: &str) -> Result<String
 /// database is dropped.
 pub(crate) fn verify_restored_events(drill_url: &str, database: &str) -> Result<usize, String> {
     let url = url_for_database(drill_url, database)?;
-    let store = PostgresStore::connect(&url)
+    let store = PostgresStore::connect_with_options(&url, &crate::config::pg_connect_options(None))
         .map_err(|error| format!("connect restored database {database}: {error}"))?;
     verify_store_events(&store, 1000)
 }

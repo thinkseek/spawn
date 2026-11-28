@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use zeroize::Zeroize as _;
 
 use super::toml_parser;
 
@@ -64,6 +65,74 @@ const BARE_SYSTEM_DIRS: &[&str] = &[
     "/var/tmp",
 ];
 
+/// Closed source tag describing where an effective configuration value originated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigOrigin {
+    /// Built-in default used when no higher-precedence source supplies a value.
+    Default,
+    /// Value declared in a `spawn.toml` configuration file.
+    File,
+    /// Value supplied by a process environment variable.
+    Env,
+    /// Value loaded from a credential file (`$CREDENTIALS_DIRECTORY/<id>` or `{ from_file }`).
+    Credential,
+    /// Value explicitly passed via CLI flag.
+    Flag,
+}
+
+impl ConfigOrigin {
+    /// Stable lowercase source label for diagnostics and reporting.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::File => "file",
+            Self::Env => "env",
+            Self::Credential => "credential",
+            Self::Flag => "flag",
+        }
+    }
+}
+
+/// Secret string wrapper whose [`fmt::Debug`] always renders `[REDACTED]`,
+/// intentionally omits [`fmt::Display`] and [`serde::Serialize`] so secrets cannot be
+/// accidentally formatted or serialized in plaintext, and zeroizes bytes on drop.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    /// Wrap sensitive bytes without exposing them in `Debug` or serialization.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Borrow the underlying secret string at an explicit consuming boundary.
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the wrapper and take the inner string for boundary handoff.
+    #[must_use]
+    pub fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 /// Reference to a secret loaded either from an environment variable or a file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
@@ -73,11 +142,20 @@ pub enum SecretRef {
 }
 
 impl SecretRef {
-    /// Resolve the secret using a caller-supplied environment lookup function.
-    pub fn resolve_with(
+    /// Origin category of this secret reference (`Env` vs `Credential`).
+    #[must_use]
+    pub const fn origin(&self) -> ConfigOrigin {
+        match self {
+            Self::FromEnv { .. } => ConfigOrigin::Env,
+            Self::FromFile { .. } => ConfigOrigin::Credential,
+        }
+    }
+
+    /// Resolve the secret into a [`SecretString`] using a caller-supplied environment lookup.
+    pub fn resolve_secret_with(
         &self,
         env_lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<String, String> {
+    ) -> Result<SecretString, String> {
         match self {
             Self::FromEnv { from_env } => {
                 let value = env_lookup(from_env)
@@ -85,7 +163,7 @@ impl SecretRef {
                 if value.is_empty() {
                     return Err(format!("secret environment variable {from_env} is empty"));
                 }
-                Ok(value)
+                Ok(SecretString::new(value))
             }
             Self::FromFile { from_file } => {
                 if !from_file.is_absolute() {
@@ -101,9 +179,18 @@ impl SecretRef {
                 if trimmed.is_empty() {
                     return Err(format!("secret file {} is empty", from_file.display()));
                 }
-                Ok(trimmed)
+                Ok(SecretString::new(trimmed))
             }
         }
+    }
+
+    /// Resolve the secret using a caller-supplied environment lookup function.
+    pub fn resolve_with(
+        &self,
+        env_lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<String, String> {
+        self.resolve_secret_with(env_lookup)
+            .map(SecretString::into_inner)
     }
 }
 
@@ -278,6 +365,25 @@ pub struct ServerConfig {
     pub web_dir: Option<PathBuf>,
 }
 
+/// Structured D6 workspace storage overrides under `[storage.d6]`, projected
+/// to `SPAWN_D6_*` environment variables when configured.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageD6Config {
+    /// Override for the CAS Merkle + `refs.journal` directory (`SPAWN_D6_CAS_DIR`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cas_dir: Option<PathBuf>,
+    /// Bounded L1 `tmpfs` upperdir directory (`SPAWN_D6_TMPFS_ROOT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmpfs_root: Option<PathBuf>,
+    /// Hard L1 memory budget in MiB (`SPAWN_D6_TMPFS_BUDGET_MB`, must be `> 0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmpfs_budget_mb: Option<u64>,
+    /// Fail checkpoints closed on `TrackedSetLeak` in `d6-shadow` (`SPAWN_D6_STRICT_FAIL_CLOSED`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_fail_closed: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
@@ -289,6 +395,8 @@ pub struct StorageConfig {
     pub cas_dedup: Option<bool>,
     #[serde(default)]
     pub max_checkpoint_file_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d6: Option<StorageD6Config>,
 }
 
 impl Default for StorageConfig {
@@ -298,6 +406,7 @@ impl Default for StorageConfig {
             canonical_mount: default_canonical_mount(),
             cas_dedup: default_true_opt(),
             max_checkpoint_file_mb: None,
+            d6: None,
         }
     }
 }
@@ -670,10 +779,13 @@ impl SpawnConfig {
 
     fn validate_storage(&self) -> Result<(), String> {
         if let Some(backend) = &self.storage.workspace_backend
-            && !matches!(backend.as_str(), "auto" | "cow" | "git" | "overlay")
+            && !matches!(
+                backend.as_str(),
+                "auto" | "cow" | "git" | "overlay" | "d6" | "d6-shadow"
+            )
         {
             return Err(format!(
-                "[storage].workspace_backend = {backend:?} is invalid: expected \"auto\", \"cow\", \"git\", or \"overlay\""
+                "[storage].workspace_backend = {backend:?} is invalid: expected \"auto\", \"cow\", \"git\", \"overlay\", \"d6\", or \"d6-shadow\""
             ));
         }
         if let Some(mount) = &self.storage.canonical_mount
@@ -690,6 +802,9 @@ impl SpawnConfig {
         }
         if self.storage.max_checkpoint_file_mb == Some(0) {
             return Err("[storage].max_checkpoint_file_mb must be > 0".to_string());
+        }
+        if let Some(d6) = &self.storage.d6 {
+            validate_storage_d6(d6)?;
         }
         Ok(())
     }
@@ -899,6 +1014,37 @@ impl SpawnConfig {
             .unwrap_or_else(|| format!("spawn-{}", self.instance.name))
     }
 
+    /// Source provenance tags for major configuration blocks resolved from this file.
+    #[must_use]
+    pub fn field_origins(&self) -> BTreeMap<&'static str, ConfigOrigin> {
+        let mut origins = BTreeMap::new();
+        origins.insert("instance", ConfigOrigin::File);
+        origins.insert(
+            "database",
+            self.database
+                .as_ref()
+                .and_then(|db| db.url.as_ref().or(db.password.as_ref()))
+                .map_or(ConfigOrigin::Default, SecretRef::origin),
+        );
+        origins.insert(
+            "server.token",
+            self.server
+                .token
+                .as_ref()
+                .map_or(ConfigOrigin::Default, SecretRef::origin),
+        );
+        origins.insert("storage.workspace_backend", ConfigOrigin::File);
+        origins.insert(
+            "storage.d6",
+            if self.storage.d6.is_some() {
+                ConfigOrigin::File
+            } else {
+                ConfigOrigin::Default
+            },
+        );
+        origins
+    }
+
     fn enabled_engines(&self) -> Vec<&'static str> {
         let mut enabled = Vec::new();
         if self.engines.claude.as_ref().is_none_or(|c| c.enabled) {
@@ -941,6 +1087,49 @@ fn expand_tilde(
     } else {
         Ok(path.to_path_buf())
     }
+}
+
+fn validate_d6_abs_dir(path: &Path, field: &str) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    let raw = path.to_string_lossy();
+    if raw.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    if !path.is_absolute() {
+        return Err(format!(
+            "{field} must be an absolute path, not {:?}",
+            path.display()
+        ));
+    }
+    if has_parent_dir(path) {
+        return Err(format!(
+            "{field} must not contain '..', got {:?}",
+            path.display()
+        ));
+    }
+    let normalized = normalize_lexically(path);
+    let text = normalized.to_string_lossy();
+    if BARE_SYSTEM_DIRS.contains(&text.as_ref()) {
+        return Err(format!(
+            "{field} {text:?} is a bare system directory; configure a dedicated subdirectory"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_storage_d6(d6: &StorageD6Config) -> Result<(), String> {
+    if let Some(cas_dir) = &d6.cas_dir {
+        validate_d6_abs_dir(cas_dir, "[storage.d6].cas_dir")?;
+    }
+    if let Some(tmpfs_root) = &d6.tmpfs_root {
+        validate_d6_abs_dir(tmpfs_root, "[storage.d6].tmpfs_root")?;
+    }
+    if d6.tmpfs_budget_mb == Some(0) {
+        return Err("[storage.d6].tmpfs_budget_mb must be > 0".to_string());
+    }
+    Ok(())
 }
 
 fn has_parent_dir(path: &Path) -> bool {
@@ -1031,10 +1220,12 @@ fn format_pg_host(host: &str) -> String {
 fn resolve_database_url(
     db: &DatabaseConfig,
     env_lookup: &dyn Fn(&str) -> Option<String>,
-) -> Result<String, String> {
+) -> Result<SecretString, String> {
     if let Some(url_ref) = &db.url {
-        let url = url_ref.resolve_with(env_lookup)?;
-        if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+        let url = url_ref.resolve_secret_with(env_lookup)?;
+        if !url.expose_secret().starts_with("postgres://")
+            && !url.expose_secret().starts_with("postgresql://")
+        {
             return Err(
                 "[database].url must resolve to a postgres:// or postgresql:// URL".to_string(),
             );
@@ -1056,15 +1247,15 @@ fn resolve_database_url(
     let name_enc = percent_encode_userinfo(name);
     match &db.password {
         Some(pw_ref) => {
-            let pw = pw_ref.resolve_with(env_lookup)?;
-            let pw_enc = percent_encode_userinfo(&pw);
-            Ok(format!(
+            let pw = pw_ref.resolve_secret_with(env_lookup)?;
+            let pw_enc = percent_encode_userinfo(pw.expose_secret());
+            Ok(SecretString::new(format!(
                 "postgres://{user_enc}:{pw_enc}@{host_fmt}:{port}/{name_enc}"
-            ))
+            )))
         }
-        None => Ok(format!(
+        None => Ok(SecretString::new(format!(
             "postgres://{user_enc}@{host_fmt}:{port}/{name_enc}"
-        )),
+        ))),
     }
 }
 
@@ -1096,7 +1287,7 @@ pub fn resolve_env_entries_with(
     if let Some(db) = &cfg.database {
         entries.insert(
             "SPAWN_DATABASE_URL".to_string(),
-            resolve_database_url(db, env_lookup)?,
+            resolve_database_url(db, env_lookup)?.into_inner(),
         );
     }
     entries.insert(
@@ -1130,7 +1321,7 @@ fn resolve_server_env(
     if let Some(token_ref) = &cfg.server.token {
         entries.insert(
             "SPAWN_SERVE_TOKEN".to_string(),
-            token_ref.resolve_with(env_lookup)?,
+            token_ref.resolve_secret_with(env_lookup)?.into_inner(),
         );
     }
     if let Some(web_dir) = &cfg.server.web_dir {
@@ -1165,6 +1356,32 @@ fn resolve_storage_env(cfg: &SpawnConfig, entries: &mut BTreeMap<String, String>
             "SPAWN_SANDBOX_CANONICAL_WORKSPACE".to_string(),
             canonical.clone(),
         );
+    }
+    if let Some(d6) = &cfg.storage.d6 {
+        if let Some(cas_dir) = &d6.cas_dir {
+            entries.insert(
+                "SPAWN_D6_CAS_DIR".to_string(),
+                cas_dir.display().to_string(),
+            );
+        }
+        if let Some(tmpfs_root) = &d6.tmpfs_root {
+            entries.insert(
+                "SPAWN_D6_TMPFS_ROOT".to_string(),
+                tmpfs_root.display().to_string(),
+            );
+        }
+        if let Some(budget_mb) = d6.tmpfs_budget_mb {
+            entries.insert(
+                "SPAWN_D6_TMPFS_BUDGET_MB".to_string(),
+                budget_mb.to_string(),
+            );
+        }
+        if let Some(strict) = d6.strict_fail_closed {
+            entries.insert(
+                "SPAWN_D6_STRICT_FAIL_CLOSED".to_string(),
+                if strict { "1" } else { "0" }.to_string(),
+            );
+        }
     }
 }
 
@@ -1507,6 +1724,11 @@ pub fn effective_json_with(
     let raw_entries = resolve_env_entries_with(cfg, env_lookup)?;
     let env_map = redact_env_entries(cfg, raw_entries);
     let safe_cfg = redacted_config_for_display(cfg);
+    let origins: BTreeMap<&'static str, &'static str> = cfg
+        .field_origins()
+        .into_iter()
+        .map(|(field, origin)| (field, origin.as_str()))
+        .collect();
     Ok(json!({
         "schema_version": cfg.schema_version,
         "instance": {
@@ -1516,6 +1738,7 @@ pub fn effective_json_with(
             "derived_paths": cfg.derived_paths(),
         },
         "config": safe_cfg,
+        "origins": origins,
         "env": env_map,
     }))
 }

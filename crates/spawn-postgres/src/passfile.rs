@@ -1,6 +1,6 @@
-//! The password of a URL that holds none, from a passfile, as libpq reads
-//! one (objective 109, part 1 of A1): `PGPASSFILE` when set, else
-//! `$HOME/.pgpass`.
+//! The password of a URL that holds none, from an explicit passfile path
+//! passed by the caller boundary (objective 109, part 1 of A1: e.g.
+//! `PGPASSFILE` when set, else `$HOME/.pgpass`, resolved outside the core).
 //!
 //! A line is `host:port:database:user:password`; `*` in any of the first
 //! four fields matches anything, `\:` and `\\` stand for `:` and `\`, and a
@@ -29,26 +29,23 @@ const DEFAULT_SOCKET_DIRS: [&str; 3] = ["/tmp", "/var/run/postgresql", "/run/pos
 /// The passfiles already said to be refused: each is said once.
 static REFUSED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
-/// `url` parsed as the driver reads it, with the passfile's password when
-/// it holds none.
+/// `url` parsed as the driver reads it, reading a password from `passfile`
+/// when the URL itself carries none.
 ///
 /// # Errors
 ///
 /// When the URL does not parse.
-pub(crate) fn config(url: &str) -> Result<postgres::Config, postgres::Error> {
+pub(crate) fn config(
+    url: &str,
+    passfile: Option<&Path>,
+) -> Result<postgres::Config, postgres::Error> {
     let mut config: postgres::Config = url.parse()?;
-    fill(&mut config);
+    if config.get_password().is_none()
+        && let Some(path) = passfile
+    {
+        fill_from(&mut config, path);
+    }
     Ok(config)
-}
-
-/// Give `config` the passfile's password when it has none.
-pub(crate) fn fill(config: &mut postgres::Config) {
-    if config.get_password().is_some() {
-        return;
-    }
-    if let Some(path) = passfile_path() {
-        fill_from(config, &path);
-    }
 }
 
 /// Give `config`, which has no password, the password of the passfile at
@@ -57,16 +54,6 @@ fn fill_from(config: &mut postgres::Config, path: &Path) {
     if let Some(password) = lookup(path, &Target::of(config)) {
         config.password(password);
     }
-}
-
-/// `PGPASSFILE` when set and not empty, else `$HOME/.pgpass`.
-fn passfile_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("PGPASSFILE").filter(|path| !path.is_empty()) {
-        return Some(PathBuf::from(path));
-    }
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(|home| Path::new(&home).join(".pgpass"))
 }
 
 /// What a passfile line is matched against.

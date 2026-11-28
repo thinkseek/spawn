@@ -867,6 +867,7 @@
         "crates/spawn-postgres/src/wake.rs",
         "crates/spawn-postgres/tests/api.rs",
         "crates/spawn-postgres/tests/common/mod.rs",
+        "crates/spawn-postgres/tests/env_boundary_guard.rs",
         "crates/spawn-postgres/tests/first-shapes.sql",
         "crates/spawn-postgres/tests/identity.rs",
         "crates/spawn-postgres/tests/lock_order_guard.rs",

@@ -97,7 +97,8 @@ impl PostgresStore {
         // `spawn serve`'s single shared hub in `ServePools` therefore holds 1 pooled
         // events connection + 1 private connection, staying within the default
         // `SPAWN_SERVE_EVENTS_POOL=2` budget solely because there is a single hub.
-        let config = crate::passfile::config(&self.url).map_err(|error| backend(&error))?;
+        let config = crate::passfile::config(&self.url, self.passfile.as_deref())
+            .map_err(|error| backend(&error))?;
         let mut client = config.connect(NoTls).map_err(|error| backend(&error))?;
         client
             .batch_execute(&format!("listen {channel}"))
@@ -285,7 +286,7 @@ mod tests {
             "database-wide spawn_events must not wake an isolated test channel"
         );
 
-        let mut notify = crate::passfile::config(&url)
+        let mut notify = crate::passfile::config(&url, None)
             .expect("config")
             .connect(NoTls)
             .expect("notify client");

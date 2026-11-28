@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use spawn_postgres::PostgresStore;
+use spawn_postgres::{ConnectOptions, LibpqDefaults, PostgresStore};
+
+pub(crate) use crate::config_file::{ConfigOrigin, SecretString};
 
 /// Process exit status (`EX_CONFIG` in `<sysexits.h>`) when a Keep-delivered
 /// `$CREDENTIALS_DIRECTORY/<id>` credential file is unreadable, empty, malformed,
@@ -52,12 +54,13 @@ pub(crate) fn load_credential_file(
     Ok(Some(path))
 }
 
-/// Read a single-value UTF-8 credential from `cred_dir/<id>`, stripping at most one
-/// trailing newline while rejecting empty values, embedded newlines/NULs, or symlinks.
-pub(crate) fn load_credential_value(
+/// Read a single-value UTF-8 credential from `cred_dir/<id>` into a [`SecretString`],
+/// stripping at most one trailing newline while rejecting empty values, embedded
+/// newlines/NULs, or symlinks.
+pub(crate) fn load_credential_secret(
     cred_dir: Option<&Path>,
     id: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<SecretString>, String> {
     let Some(path) = load_credential_file(cred_dir, id)? else {
         return Ok(None);
     };
@@ -77,15 +80,29 @@ pub(crate) fn load_credential_value(
             "credential {id} contains embedded newline or NUL byte"
         ));
     }
-    Ok(Some(trimmed.to_string()))
+    Ok(Some(SecretString::new(trimmed)))
+}
+
+/// Read a single-value UTF-8 credential from `cred_dir/<id>`, stripping at most one
+/// trailing newline while rejecting empty values, embedded newlines/NULs, or symlinks.
+pub(crate) fn load_credential_value(
+    cred_dir: Option<&Path>,
+    id: &str,
+) -> Result<Option<String>, String> {
+    Ok(load_credential_secret(cred_dir, id)?.map(SecretString::into_inner))
+}
+
+/// Resolve `$CREDENTIALS_DIRECTORY/<id>` as a validated [`SecretString`].
+pub(crate) fn credential_secret(id: &str) -> Result<Option<SecretString>, String> {
+    load_credential_secret(
+        env_value("CREDENTIALS_DIRECTORY").as_deref().map(Path::new),
+        id,
+    )
 }
 
 /// Resolve `$CREDENTIALS_DIRECTORY/<id>` as a validated single-value secret string.
 pub(crate) fn credential_value(id: &str) -> Result<Option<String>, String> {
-    load_credential_value(
-        env_value("CREDENTIALS_DIRECTORY").as_deref().map(Path::new),
-        id,
-    )
+    Ok(credential_secret(id)?.map(SecretString::into_inner))
 }
 
 pub(crate) fn env_value(name: &str) -> Option<String> {
@@ -159,19 +176,54 @@ fn not_set(name: &str) -> String {
     }
 }
 
+/// Resolve the controller's PostgreSQL URL with its [`ConfigOrigin`], preferring
+/// Keep's `$CREDENTIALS_DIRECTORY/spawn.database-url` (`Credential`) when present
+/// and falling back to `SPAWN_DATABASE_URL` (`Env`).
+pub(crate) fn database_url_with_origin() -> Result<(SecretString, ConfigOrigin), String> {
+    if let Some(url) = credential_secret("spawn.database-url")? {
+        return Ok((url, ConfigOrigin::Credential));
+    }
+    required_env("SPAWN_DATABASE_URL").map(|url| (SecretString::new(url), ConfigOrigin::Env))
+}
+
 /// Resolve the controller's PostgreSQL URL, preferring Keep's
 /// `$CREDENTIALS_DIRECTORY/spawn.database-url` when present and falling back to
 /// `SPAWN_DATABASE_URL`.
 pub(crate) fn database_url() -> Result<String, String> {
-    if let Some(url) = credential_value("spawn.database-url")? {
-        return Ok(url);
+    database_url_with_origin().map(|(url, _)| url.into_inner())
+}
+
+/// Resolve libpq passfile location at the CLI boundary (`PGPASSFILE` else `$HOME/.pgpass`).
+pub(crate) fn pg_passfile() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PGPASSFILE").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path));
     }
-    required_env("SPAWN_DATABASE_URL")
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| Path::new(&home).join(".pgpass"))
+}
+
+/// Explicit libpq connect options injected from the CLI environment boundary.
+pub(crate) fn pg_connect_options(statement_timeout: Option<std::time::Duration>) -> ConnectOptions {
+    ConnectOptions {
+        passfile: pg_passfile(),
+        statement_timeout,
+    }
+}
+
+/// Explicit libpq default identity fields read at the CLI environment boundary.
+pub(crate) fn libpq_defaults() -> LibpqDefaults {
+    LibpqDefaults {
+        port: env_value("PGPORT").and_then(|port| port.trim().parse().ok()),
+        user: env_value("PGUSER").or_else(|| env_value("USER")),
+        database: env_value("PGDATABASE"),
+    }
 }
 
 pub(crate) fn open_store() -> Result<PostgresStore, String> {
-    let url = database_url()?;
-    PostgresStore::connect(&url).map_err(|error| error.to_string())
+    let (url, _origin) = database_url_with_origin()?;
+    PostgresStore::connect_with_options(url.expose_secret(), &pg_connect_options(None))
+        .map_err(|error| error.to_string())
 }
 
 /// Whether this host runs the supervisor (`SPAWN_SUPERVISOR` is set).
@@ -186,10 +238,21 @@ pub(crate) fn spawn_program() -> String {
     resolve_spawn_program(env_value("SPAWN_PROGRAM"), std::env::current_exe().ok())
 }
 
+fn resolve_spawn_program_with_origin(
+    configured: Option<String>,
+    current: Option<PathBuf>,
+) -> (String, ConfigOrigin) {
+    match configured {
+        Some(program) => (program, ConfigOrigin::Env),
+        None => (
+            current.map_or_else(|| "spawn".to_string(), |path| path.display().to_string()),
+            ConfigOrigin::Default,
+        ),
+    }
+}
+
 fn resolve_spawn_program(configured: Option<String>, current: Option<PathBuf>) -> String {
-    configured
-        .or_else(|| current.map(|path| path.display().to_string()))
-        .unwrap_or_else(|| "spawn".to_string())
+    resolve_spawn_program_with_origin(configured, current).0
 }
 
 /// `--root`, else `SPAWN_WORKSPACE_ROOT`, resolved through its symlinks,
@@ -199,8 +262,12 @@ fn resolve_spawn_program(configured: Option<String>, current: Option<PathBuf>) -
 /// derive from this one root, so no two of them can name a workspace two
 /// ways.
 pub(crate) fn workspace_root(flags: &Flags) -> Option<String> {
-    resolve_workspace_root(flags.get("root"), env_value("SPAWN_WORKSPACE_ROOT"))
-        .map(|root| canonical_workspace_root(&root))
+    resolve_workspace_root_with_origin(flags.get("root"), env_value("SPAWN_WORKSPACE_ROOT")).map(
+        |(root, origin)| {
+            let _ = origin.as_str();
+            canonical_workspace_root(&root)
+        },
+    )
 }
 
 /// `root` resolved through its symlinks ([`workspace_root`]).
@@ -210,8 +277,17 @@ fn canonical_workspace_root(root: &str) -> String {
         .to_string()
 }
 
+fn resolve_workspace_root_with_origin(
+    flag: Option<String>,
+    environment: Option<String>,
+) -> Option<(String, ConfigOrigin)> {
+    flag.map(|value| (value, ConfigOrigin::Flag))
+        .or_else(|| environment.map(|value| (value, ConfigOrigin::Env)))
+}
+
+#[cfg(test)]
 fn resolve_workspace_root(flag: Option<String>, environment: Option<String>) -> Option<String> {
-    flag.or(environment)
+    resolve_workspace_root_with_origin(flag, environment).map(|(value, _)| value)
 }
 
 /// The oldest git Spawn runs on. Merges of main into a branch, the Bridge's
@@ -1669,6 +1745,38 @@ mod workspace_tests {
         assert!(D6RuntimeConfig::parse(None, None, Some("0"), None).is_err());
         assert!(D6RuntimeConfig::parse(None, None, Some("abc"), None).is_err());
         assert!(D6RuntimeConfig::parse(None, None, None, Some("yes")).is_err());
+    }
+
+    #[test]
+    fn config_origin_and_secret_string_behavior() {
+        use super::{
+            ConfigOrigin, SecretString, resolve_spawn_program_with_origin,
+            resolve_workspace_root_with_origin,
+        };
+
+        assert_eq!(
+            resolve_spawn_program_with_origin(Some("/opt/spawn".into()), None),
+            ("/opt/spawn".to_string(), ConfigOrigin::Env)
+        );
+        assert_eq!(
+            resolve_spawn_program_with_origin(None, None),
+            ("spawn".to_string(), ConfigOrigin::Default)
+        );
+        assert_eq!(
+            resolve_workspace_root_with_origin(Some("/flag".into()), Some("/env".into())),
+            Some(("/flag".to_string(), ConfigOrigin::Flag))
+        );
+        assert_eq!(
+            resolve_workspace_root_with_origin(None, Some("/env".into())),
+            Some(("/env".to_string(), ConfigOrigin::Env))
+        );
+        assert_eq!(ConfigOrigin::File.as_str(), "file");
+        assert_eq!(ConfigOrigin::Credential.as_str(), "credential");
+
+        let secret = SecretString::new("TopSecretValue_001");
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
+        assert_eq!(secret.expose_secret(), "TopSecretValue_001");
+        assert_eq!(secret.into_inner(), "TopSecretValue_001");
     }
 
     #[test]

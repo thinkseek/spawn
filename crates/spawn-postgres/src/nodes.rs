@@ -4,12 +4,13 @@
 //! (`spawn_node_latest`): no table holds them, and no read scans a node's
 //! heartbeats.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::Value;
 use spawn_core::port::StoreError;
 
-use crate::{PostgresStore, backend};
+use crate::{ConnectOptions, PostgresStore, backend};
 
 /// How a background worker reaches this store's database and schema on a
 /// connection of its own, made on the worker's thread (never the caller's):
@@ -19,6 +20,7 @@ use crate::{PostgresStore, backend};
 #[derive(Clone)]
 pub struct StoreConnector {
     url: String,
+    passfile: Option<PathBuf>,
     schema: Option<String>,
     timeout: Duration,
 }
@@ -26,7 +28,13 @@ pub struct StoreConnector {
 impl StoreConnector {
     /// Connect (the connect itself bounded at 5 s).
     pub fn connect(&self) -> Result<PostgresStore, StoreError> {
-        let mut store = PostgresStore::connect_with_statement_timeout(&self.url, self.timeout)?;
+        let mut store = PostgresStore::connect_with_options(
+            &self.url,
+            &ConnectOptions {
+                passfile: self.passfile.clone(),
+                statement_timeout: Some(self.timeout),
+            },
+        )?;
         let timeout = (self.timeout / 2).as_millis().max(1);
         let session = match &self.schema {
             Some(schema) => format!("set lock_timeout = {timeout}; set search_path to {schema}"),
@@ -169,6 +177,7 @@ impl PostgresStore {
     pub fn connector(&self, timeout: Duration) -> StoreConnector {
         StoreConnector {
             url: self.url.clone(),
+            passfile: self.passfile.clone(),
             schema: self.schema.clone(),
             timeout,
         }

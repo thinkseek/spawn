@@ -133,7 +133,7 @@ impl std::fmt::Display for TestSchema {
 /// dropped as it was made; it gives up connecting after
 /// [`CONNECT_TIMEOUT`].
 fn client(url: &str) -> Result<postgres::Client, postgres::Error> {
-    crate::passfile::config(url)?
+    crate::passfile::config(url, None)?
         .connect_timeout(CONNECT_TIMEOUT)
         .connect(postgres::NoTls)
 }

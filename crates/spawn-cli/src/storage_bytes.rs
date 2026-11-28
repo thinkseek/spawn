@@ -454,7 +454,11 @@ pub(crate) fn read(plan: &Plan, stop: &AtomicBool) -> Map<String, Value> {
     sources.insert(
         TEST_DATABASES.to_string(),
         test_databases(&plan.test_databases, |url| {
-            spawn_postgres::test_database_size(url).map_err(|error| error.to_string())
+            spawn_postgres::test_database_size_with_passfile(
+                url,
+                crate::config::pg_passfile().as_deref(),
+            )
+            .map_err(|error| error.to_string())
         }),
     );
     sources

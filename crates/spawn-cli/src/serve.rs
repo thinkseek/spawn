@@ -1345,7 +1345,11 @@ fn open_store() -> Result<PooledStore, String> {
                 .ok_or_else(|| "SPAWN_DATABASE_URL is not set".to_string())?;
             let url = match env_value("SPAWN_SERVE_DATABASE_URL") {
                 Some(url) => url,
-                None => spawn_postgres::role_url(&controller, "spawn_reader")?,
+                None => spawn_postgres::role_url_with_passfile(
+                    &controller,
+                    "spawn_reader",
+                    crate::config::pg_passfile().as_deref(),
+                )?,
             };
             checkout_pooled(&reader_pool_for_url(&url))
         }
