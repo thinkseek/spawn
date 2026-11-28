@@ -4,15 +4,19 @@ import {
   CheckCircle2,
   CornerDownLeft,
   Clock,
+  Cpu,
+  Keyboard,
   Lock,
   OctagonX,
+  Plus,
   RefreshCw,
   Search,
   Send,
   ShieldAlert,
+  Smartphone,
   SquareTerminal,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 
 import {
   agentSnapshotUrl,
@@ -22,6 +26,7 @@ import {
   evaluateActionCapabilities,
   isGuardedPolicyMode,
   isValidScreenGuard,
+  keyEventToHerdrAction,
   parseKeyChordList,
   parseStyledLine,
   reduceAction,
@@ -34,6 +39,7 @@ import {
   type AgentStatus,
   type AnsiColorTone,
   type DiscoveredTerminal,
+  type DiscoveryDiagnostics,
   type SendPolicyMode,
   type SnapshotFidelity,
   type SnapshotLoadState,
@@ -47,12 +53,18 @@ import {
   fetchGlobalAgentSnapshot,
   fetchGlobalAgents,
   postGlobalAgentAction,
+  postGlobalAgentSpawn,
 } from "../../agentRuntimeApi";
+import { fetchWhoami, type WhoamiInfo } from "../../devicesApi";
 import { relativeTime } from "../../format";
 import { pageHidden } from "../../validated";
 import type { SessionRole } from "../../token.ts";
+import { RouteErrorBoundary, retryableLazy } from "../RouteErrorBoundary";
 import { Button, Card, CardHeader, EmptyState, FOCUS_RING, FOCUS_RING_INSET, PageHeader, chip, cx, tr, useLocale } from "../ui";
 import { Badge, type BadgeTone } from "../ui/badge";
+
+const UnkernelSandboxPanel = retryableLazy(() => import("./UnkernelSandboxPanel"));
+const AndroidDevicesPanel = retryableLazy(() => import("./AndroidDevicesPanel"));
 
 const DISCOVERY_POLL_MS = 3_000;
 const SNAPSHOT_POLL_MS = 2_000;
@@ -116,9 +128,12 @@ const SEND_POLICY_OPTIONS: ReadonlyArray<{
 ];
 
 type OriginFilter = "all" | "spawn_managed" | "external";
+export type AgentsConsoleTab = "herdr" | "sandbox" | "devices";
 
 interface AgentsConsoleViewProps {
   role: SessionRole;
+  activeTab?: AgentsConsoleTab;
+  onSelectTab?: (tab: AgentsConsoleTab) => void;
   selectedAddress: string | null;
   onSelectAddress: (address: string | null) => void;
 }
@@ -269,6 +284,8 @@ function matchesSearch(agent: DiscoveredTerminal, query: string): boolean {
 
 export function AgentsConsoleView({
   role,
+  activeTab = "herdr",
+  onSelectTab,
   selectedAddress,
   onSelectAddress,
 }: AgentsConsoleViewProps) {
@@ -278,8 +295,34 @@ export function AgentsConsoleView({
   const [refreshSeq, setRefreshSeq] = useState(0);
   const [mobileDetailOpen, setMobileDetailOpen] = useState(() => selectedAddress !== null);
   const [serverReadOnlyRefused, setServerReadOnlyRefused] = useState(false);
+  const [whoami, setWhoami] = useState<WhoamiInfo | null>(null);
+  const [diagnostics, setDiagnostics] = useState<DiscoveryDiagnostics | null>(null);
 
-  const isReadOnly = role.kind === "viewer" || serverReadOnlyRefused;
+  const [showSpawnForm, setShowSpawnForm] = useState(false);
+  const [spawnCommand, setSpawnCommand] = useState("bash");
+  const [spawnName, setSpawnName] = useState("");
+  const [spawnCwd, setSpawnCwd] = useState("");
+  const [spawnSubmitting, setSpawnSubmitting] = useState(false);
+  const [spawnError, setSpawnError] = useState<string | null>(null);
+
+  const [directKeyboard, setDirectKeyboard] = useState(true);
+  const [viewportFocused, setViewportFocused] = useState(false);
+
+  const isReadOnly =
+    role.kind === "viewer" ||
+    serverReadOnlyRefused ||
+    (whoami !== null && !whoami.can_write);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchWhoami(controller.signal).then((res) => {
+      if (controller.signal.aborted) return;
+      if (res.ok) {
+        setWhoami(res.data);
+      }
+    });
+    return () => controller.abort();
+  }, [role, refreshSeq]);
 
   const [discovery, setDiscovery] = useState<AgentDiscoveryState>(() => ({
     kind: "loading",
@@ -354,6 +397,7 @@ export function AgentsConsoleView({
         const res = await fetchGlobalAgents(includeAll, controller.signal);
         if (cancelled) return;
         if (res.ok) {
+          setDiagnostics(res.data.diagnostics ?? null);
           const visible = visibleAgentsForRole(res.data.agents, role);
           setDiscovery((curr) =>
             reduceDiscovery(curr, {
@@ -687,6 +731,58 @@ export function AgentsConsoleView({
     });
   };
 
+  const handleSpawnTerminal = async () => {
+    if (isReadOnly || spawnSubmitting) return;
+    setSpawnSubmitting(true);
+    setSpawnError(null);
+    try {
+      const res = await postGlobalAgentSpawn({
+        command: spawnCommand.trim() || "bash",
+        name: spawnName.trim() || undefined,
+        cwd: spawnCwd.trim() || undefined,
+      });
+      if (res.ok) {
+        setShowSpawnForm(false);
+        setSpawnName("");
+        onSelectAddress(res.data.address);
+        setMobileDetailOpen(true);
+        setRefreshSeq((s) => s + 1);
+      } else {
+        setSpawnError(res.error.message);
+      }
+    } finally {
+      setSpawnSubmitting(false);
+    }
+  };
+
+  const handleViewportKeyDown = (ev: KeyboardEvent<HTMLDivElement>) => {
+    if (!directKeyboard || !selectedAddress || actionSubmitting) return;
+    const mapped = keyEventToHerdrAction(
+      {
+        key: ev.key,
+        ctrlKey: ev.ctrlKey,
+        altKey: ev.altKey,
+        metaKey: ev.metaKey,
+        shiftKey: ev.shiftKey,
+        isComposing: ev.nativeEvent.isComposing,
+      },
+      capabilities,
+    );
+    if (!mapped.ok) {
+      if (!mapped.ignored && mapped.message) {
+        ev.preventDefault();
+        setActionState({
+          kind: "failed",
+          address: selectedAddress,
+          message: mapped.message,
+        });
+      }
+      return;
+    }
+    ev.preventDefault();
+    void dispatchAction(selectedAddress, mapped.action);
+  };
+
   const { locale } = useLocale();
   const showListOnMobile = !mobileDetailOpen || selectedAddress === null;
 
@@ -711,44 +807,179 @@ export function AgentsConsoleView({
                     : "服务端拒绝变更请求（只读会话）"
                 }
               >
-                {tr(locale, "只读观察", "Read-Only")} · ReadOnlyViewer
+                {tr(locale, "只读观察", "Read-Only")} · {whoami?.principal ?? "ReadOnlyViewer"}
                 {role.kind === "viewer" ? ` (${relativeTime(role.expiresAtMs)})` : ""}
               </Badge>
             ) : (
               <Badge tone="success" size="md">
                 {tr(locale, "操作模式", "Interactive")}
+                {whoami ? ` · ${whoami.principal}` : ""}
               </Badge>
             )}
           </>
         }
       >
-        <button
-          type="button"
-          onClick={() => setIncludeAll((v) => !v)}
-          aria-pressed={includeAll}
-          className={cx(
-            chip(includeAll),
-            "pointer-coarse:h-10",
-            FOCUS_RING,
-          )}
-          title={
-            isReadOnly
-              ? "切换 GET /api/agents?all=true（包含已退出的 Spawn 托管终端）"
-              : "切换 GET /api/agents?all=true（包含已退出终端；外部终端可见性由角色权限控制）"
-          }
-        >
-          {includeAll ? tr(locale, "包含已退出 (?all=true)", "Include exited (?all=true)") : tr(locale, "仅运行中", "Live only")}
-        </button>
-        <Button
-          onClick={() => setRefreshSeq((s) => s + 1)}
-          className="pointer-coarse:h-10"
-          title={tr(locale, "立即刷新全局终端列表与当前屏幕快照", "Refresh agents list and terminal snapshot")}
-        >
-          <RefreshCw size={13} />
-          {tr(locale, "刷新", "Refresh")}
-        </Button>
+        {activeTab === "herdr" && !isReadOnly && (
+          <button
+            type="button"
+            onClick={() => setShowSpawnForm((v) => !v)}
+            className={cx(
+              "inline-flex h-9 items-center gap-1.5 rounded-control bg-primary px-3 text-caption font-semibold text-primary-foreground shadow-btn transition-opacity hover:opacity-90 pointer-coarse:h-10",
+              FOCUS_RING,
+            )}
+          >
+            <Plus size={13} />
+            {tr(locale, "新建 Terminal", "New Terminal")}
+          </button>
+        )}
+        {activeTab === "herdr" && (
+          <>
+            <button
+              type="button"
+              onClick={() => setIncludeAll((v) => !v)}
+              aria-pressed={includeAll}
+              className={cx(
+                chip(includeAll),
+                "pointer-coarse:h-10",
+                FOCUS_RING,
+              )}
+              title={
+                isReadOnly
+                  ? "切换 GET /api/agents?all=true（包含已退出的 Spawn 托管终端）"
+                  : "切换 GET /api/agents?all=true（包含已退出终端；外部终端可见性由角色权限控制）"
+              }
+            >
+              {includeAll ? tr(locale, "包含已退出 (?all=true)", "Include exited (?all=true)") : tr(locale, "仅运行中", "Live only")}
+            </button>
+            <Button
+              onClick={() => setRefreshSeq((s) => s + 1)}
+              className="pointer-coarse:h-10"
+              title={tr(locale, "立即刷新全局终端列表与当前屏幕快照", "Refresh agents list and terminal snapshot")}
+            >
+              <RefreshCw size={13} />
+              {tr(locale, "刷新", "Refresh")}
+            </Button>
+          </>
+        )}
       </PageHeader>
 
+      {/* Sub-navigation tabs: Herdr / Linux Sandbox (unkernel) / Android Devices */}
+      <nav
+        aria-label="Agents runtime workspace switcher"
+        className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-surface-border bg-app-shell px-4 py-2"
+      >
+        <button
+          type="button"
+          onClick={() => onSelectTab?.("herdr")}
+          className={cx(chip(activeTab === "herdr"), "pointer-coarse:h-10", FOCUS_RING)}
+        >
+          <SquareTerminal size={13} />
+          {tr(locale, "Herdr 终端", "Herdr Terminals")}
+        </button>
+        <button
+          type="button"
+          onClick={() => onSelectTab?.("sandbox")}
+          className={cx(chip(activeTab === "sandbox"), "pointer-coarse:h-10", FOCUS_RING)}
+        >
+          <Cpu size={13} />
+          {tr(locale, "Linux 沙箱 (unkernel)", "Linux Sandbox (unkernel)")}
+        </button>
+        <button
+          type="button"
+          onClick={() => onSelectTab?.("devices")}
+          className={cx(chip(activeTab === "devices"), "pointer-coarse:h-10", FOCUS_RING)}
+        >
+          <Smartphone size={13} />
+          {tr(locale, "Android 设备控制", "Android Devices")}
+        </button>
+      </nav>
+
+      {showSpawnForm && activeTab === "herdr" && !isReadOnly && (
+        <div className="shrink-0 border-b border-surface-border bg-surface px-4 py-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              type="text"
+              value={spawnCommand}
+              onChange={(e) => setSpawnCommand(e.target.value)}
+              placeholder="启动命令（默认 bash，如 claude / codex / zsh）"
+              aria-label="终端启动命令"
+              className={cx(
+                "h-9 min-w-52 flex-1 rounded-control border border-surface-border bg-inset px-2.5 font-mono text-caption text-foreground pointer-coarse:h-11",
+                FOCUS_RING,
+              )}
+            />
+            <input
+              type="text"
+              value={spawnName}
+              onChange={(e) => setSpawnName(e.target.value)}
+              placeholder="名称（可选）"
+              aria-label="终端名称"
+              className={cx(
+                "h-9 w-36 rounded-control border border-surface-border bg-inset px-2.5 font-mono text-caption text-foreground pointer-coarse:h-11",
+                FOCUS_RING,
+              )}
+            />
+            <input
+              type="text"
+              value={spawnCwd}
+              onChange={(e) => setSpawnCwd(e.target.value)}
+              placeholder="工作目录（可选）"
+              aria-label="工作目录"
+              className={cx(
+                "h-9 min-w-44 flex-1 rounded-control border border-surface-border bg-inset px-2.5 font-mono text-caption text-foreground pointer-coarse:h-11",
+                FOCUS_RING,
+              )}
+            />
+            <button
+              type="button"
+              disabled={spawnSubmitting}
+              onClick={() => void handleSpawnTerminal()}
+              className={cx(
+                "inline-flex h-9 items-center gap-1.5 rounded-control bg-primary px-3 text-caption font-semibold text-primary-foreground shadow-btn transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45 pointer-coarse:h-11",
+                FOCUS_RING,
+              )}
+            >
+              {spawnSubmitting ? "创建中…" : "启动终端"}
+            </button>
+            <Button onClick={() => setShowSpawnForm(false)} className="pointer-coarse:h-11">
+              取消
+            </Button>
+          </div>
+          {spawnError && (
+            <p className="mt-2 text-caption text-destructive">{spawnError}</p>
+          )}
+        </div>
+      )}
+
+      {activeTab === "sandbox" ? (
+        <RouteErrorBoundary resetKey="agents-sandbox">
+          <Suspense
+            fallback={
+              <div className="grid flex-1 place-items-center text-caption text-faint-foreground">
+                正在按需加载 unkernel Linux 7.x 运行时…
+              </div>
+            }
+          >
+            <UnkernelSandboxPanel
+              principalLabel={whoami?.principal ?? role.kind}
+              canWrite={!isReadOnly}
+              agentsCount={rawAgents.length}
+            />
+          </Suspense>
+        </RouteErrorBoundary>
+      ) : activeTab === "devices" ? (
+        <RouteErrorBoundary resetKey="agents-devices">
+          <Suspense
+            fallback={
+              <div className="grid flex-1 place-items-center text-caption text-faint-foreground">
+                正在加载 Android 设备控制面板…
+              </div>
+            }
+          >
+            <AndroidDevicesPanel canWrite={!isReadOnly} />
+          </Suspense>
+        </RouteErrorBoundary>
+      ) : (
       <div className="flex min-h-0 min-w-0 flex-1 flex-col md:flex-row">
         {/* Left pane: Global Herdr Terminal Discovery */}
         <section
@@ -834,18 +1065,38 @@ export function AgentsConsoleView({
                   </div>
                 )}
                 {visibleAgents.length === 0 ? (
-                  <EmptyState
-                    icon={<SquareTerminal size={18} />}
-                    title="未发现匹配的终端"
-                    hint={
-                      isReadOnly
-                        ? includeAll
-                          ? "当前无运行中或已退出的 Spawn 受管 Herdr 终端（ReadOnlyViewer 不会显示外部非受管终端）。"
-                          : "当前无运行中的 Spawn 受管 Herdr 终端；可切换「包含已退出 (?all=true)」查看历史 Spawn 终端（外部终端仍不曝光）。"
-                        : "确认 herdr-core 正在运行，或切换「仅运行中 / 包含已退出 (?all=true)」查看更多终端。"
-                    }
-                    className="px-3 py-10"
-                  />
+                  <div className="space-y-3 px-2 py-6">
+                    <EmptyState
+                      icon={<SquareTerminal size={18} />}
+                      title="未发现匹配的终端"
+                      hint={
+                        diagnostics?.hint ||
+                        (isReadOnly
+                          ? includeAll
+                            ? "当前无运行中或已退出的 Spawn 受管 Herdr 终端（ReadOnlyViewer 不会显示外部非受管终端）。"
+                            : "当前无运行中的 Spawn 受管 Herdr 终端；可切换「包含已退出 (?all=true)」查看历史 Spawn 终端（外部终端仍不曝光）。"
+                          : "确认 herdr-core 正在运行，或点击右上角「新建 Terminal」启动交互终端。")
+                      }
+                      className="px-2 py-4"
+                    />
+                    {diagnostics && (
+                      <div className="rounded-control border border-surface-border bg-inset p-3 font-mono text-micro text-muted-foreground">
+                        <div className="mb-1 font-semibold text-foreground">
+                          Herdr 发现诊断（{diagnostics.scope_kind} · {diagnostics.visibility}）
+                        </div>
+                        <div>
+                          scanned_sockets: {diagnostics.scanned_sockets.length} · reachable:{" "}
+                          {diagnostics.reachable_sockets.length} · unreachable:{" "}
+                          {diagnostics.unreachable_sockets.length}
+                        </div>
+                        {diagnostics.unreachable_sockets.slice(0, 3).map((sock) => (
+                          <div key={sock.socket} className="mt-1 truncate text-warning">
+                            {sock.kind}: {sock.socket} ({sock.detail})
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 ) : (
                   <ul className="space-y-1">
                     {visibleAgents.map((terminal) => {
@@ -1133,6 +1384,30 @@ export function AgentsConsoleView({
                         : `${activeSnapshot.plain_lines.length} plain lines`}
                     </span>
                   )}
+                  {!isReadOnly && (
+                    <button
+                      type="button"
+                      onClick={() => setDirectKeyboard((v) => !v)}
+                      aria-pressed={directKeyboard}
+                      className={cx(
+                        "inline-flex items-center gap-1 rounded border px-2 py-0.5 font-mono text-micro transition-colors",
+                        directKeyboard
+                          ? viewportFocused
+                            ? "border-success bg-ok-tint text-success"
+                            : "border-info/50 bg-info-tint text-info"
+                          : "border-white/15 text-muted-foreground hover:text-foreground",
+                        FOCUS_RING,
+                      )}
+                      title="点击下方终端屏幕并开启此开关，可直接把键盘按键、Enter/Tab/Esc/方向键及 Ctrl+C 实时透传给 Herdr 终端"
+                    >
+                      <Keyboard size={11} />
+                      {directKeyboard
+                        ? viewportFocused
+                          ? "直接键盘已聚焦"
+                          : "直接键盘就绪"
+                        : "直接键盘已关闭"}
+                    </button>
+                  )}
                   {scopedSnapshotState.kind === "ready" && (
                     <span className="ml-auto inline-flex items-center gap-1 font-mono text-micro text-faint-foreground">
                       <Clock size={11} />
@@ -1141,7 +1416,16 @@ export function AgentsConsoleView({
                   )}
                 </header>
 
-                <div className="min-h-0 flex-1 overflow-auto px-3.5 py-3 font-mono text-[12px] leading-5 text-terminal-foreground">
+                <div
+                  tabIndex={directKeyboard && !isReadOnly ? 0 : -1}
+                  onFocus={() => setViewportFocused(true)}
+                  onBlur={() => setViewportFocused(false)}
+                  onKeyDown={handleViewportKeyDown}
+                  className={cx(
+                    "min-h-0 flex-1 overflow-auto px-3.5 py-3 font-mono text-[12px] leading-5 text-terminal-foreground outline-none",
+                    directKeyboard && viewportFocused && "ring-1 ring-inset ring-ring",
+                  )}
+                >
                   {activeSnapshot === null ? (
                     <div className="grid h-36 place-items-center text-caption text-faint-foreground">
                       正在获取屏幕快照…
@@ -1546,6 +1830,7 @@ export function AgentsConsoleView({
           )}
         </section>
       </div>
+      )}
     </div>
   );
 }

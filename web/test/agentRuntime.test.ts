@@ -13,6 +13,7 @@ import {
   fetchAgentSnapshotWithFetch,
   fetchAgentsWithFetch,
   isValidScreenGuard,
+  keyEventToHerdrAction,
   normalizeKeyChord,
   parseAgentsListResponse,
   parseKeyChordList,
@@ -20,6 +21,7 @@ import {
   parseTuiActionOutcome,
   parseTuiSnapshot,
   postAgentActionWithFetch,
+  postSpawnTerminalWithFetch,
   reduceAction,
   reduceDiscovery,
   reduceSnapshot,
@@ -645,4 +647,102 @@ test("reduceSnapshot preserves snapshot identity across unchanged polls", () => 
     assert.equal(unchangedAfterWindow.snapshot, first);
     assert.equal(unchangedAfterWindow.capturedAtMs, 30_000);
   }
+});
+
+test("parseAgentsListResponse preserves DiscoveryDiagnostics when provided", () => {
+  const parsed = parseAgentsListResponse({
+    agents: [],
+    count: 0,
+    diagnostics: {
+      scope_kind: "discovered",
+      scanned_sockets: ["/run/user/1000/herdr/hc.sock"],
+      reachable_sockets: [],
+      unreachable_sockets: [
+        {
+          socket: "/run/user/1000/herdr/hc.sock",
+          kind: "connect_unreachable",
+          detail: "No such file or directory",
+        },
+      ],
+      visibility: "all",
+      terminal_count: 0,
+      hint: "No live herdr-core control sockets found.",
+    },
+  });
+  assert.equal(parsed.count, 0);
+  assert.equal(parsed.diagnostics?.scanned_sockets.length, 1);
+  assert.equal(parsed.diagnostics?.unreachable_sockets[0]?.kind, "connect_unreachable");
+  assert.match(parsed.diagnostics?.hint ?? "", /herdr-core/);
+});
+
+test("postSpawnTerminalWithFetch sends POST /api/agents/spawn and classifies 201/403", async () => {
+  let calledUrl = "";
+  let calledMethod = "";
+  const created = await postSpawnTerminalWithFetch(
+    async (url, init) => {
+      calledUrl = url;
+      calledMethod = init?.method ?? "";
+      return fakeResponse(201, {
+        address: "t-desk",
+        terminal: { name: "desk", status: "idle" },
+      });
+    },
+    { Authorization: "Bearer adm" },
+    { command: "bash", name: "desk", cwd: "/tmp" },
+  );
+  assert.equal(calledUrl, "/api/agents/spawn");
+  assert.equal(calledMethod, "POST");
+  assert.equal(created.ok, true);
+  if (created.ok) {
+    assert.equal(created.data.address, "t-desk");
+  }
+
+  const forbidden = await postSpawnTerminalWithFetch(
+    async () => fakeResponse(403, { error: "read-only viewer token cannot mutate state" }),
+    {},
+    { command: "bash" },
+  );
+  assert.equal(forbidden.ok, false);
+  if (!forbidden.ok) {
+    assert.equal(forbidden.error.kind, "forbidden_readonly");
+  }
+});
+
+test("keyEventToHerdrAction maps Direct Keyboard events to guarded/plain Herdr actions", () => {
+  const styled = styledSnapshotFixture("t1", "0xaaaa111122223333");
+  const styledCaps = evaluateActionCapabilities({ kind: "admin" }, false, {
+    kind: "ready",
+    address: "t1",
+    snapshot: styled,
+    capturedAtMs: 1_000,
+    unchangedSinceMs: 1_000,
+  }, "t1");
+
+  const ctrlC = keyEventToHerdrAction({ key: "c", ctrlKey: true }, styledCaps);
+  assert.equal(ctrlC.ok, true);
+  if (ctrlC.ok) assert.equal(ctrlC.action.action, "interrupt");
+
+  const enter = keyEventToHerdrAction({ key: "Enter" }, styledCaps);
+  assert.equal(enter.ok, true);
+  if (enter.ok && enter.action.action === "send_keys") {
+    assert.deepEqual(enter.action.keys, ["enter"]);
+    assert.equal(enter.action.expected_guard, "0xaaaa111122223333");
+  }
+
+  const charA = keyEventToHerdrAction({ key: "a" }, styledCaps);
+  assert.equal(charA.ok, true);
+  if (charA.ok && charA.action.action === "send_text") {
+    assert.equal(charA.action.text, "a");
+    assert.equal(charA.action.policy.kind, "only_if");
+  }
+
+  const roCaps = evaluateActionCapabilities(
+    { kind: "viewer", raw: "v", expiresAtMs: 9_999_999_999_999 },
+    false,
+    { kind: "ready", address: "t1", snapshot: styled, capturedAtMs: 1_000, unchangedSinceMs: 1_000 },
+    "t1",
+  );
+  const blocked = keyEventToHerdrAction({ key: "Enter" }, roCaps);
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.ignored, undefined);
 });

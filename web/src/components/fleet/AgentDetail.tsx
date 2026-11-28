@@ -43,7 +43,7 @@ import type { HeldTask, JudgementRun } from "../../agentPage";
 import { recentToolRows, rowText, runEnd } from "../../trace";
 import { freshAt } from "../../validated";
 import { LiveBadge, TerminalPanel } from "../Terminal";
-import { Ago, Button, Card, CardHeader, Drawer, EmptyState, FOCUS_RING, cx } from "../ui";
+import { Ago, Button, Card, CardHeader, Drawer, EmptyState, FOCUS_RING, cx, tr, useLocale } from "../ui";
 import {
   AgentLivenessPill,
   Fact,
@@ -119,6 +119,7 @@ export function AgentDetail({ agent, name = null, held = null, onClose, onOpenTi
           seq: agent.judgement?.based_on_seq ?? null,
         };
 
+  const { locale } = useLocale();
   const liveness = agentLiveness(agent);
 
   return (
@@ -126,39 +127,50 @@ export function AgentDetail({ agent, name = null, held = null, onClose, onOpenTi
       width="max-w-6xl"
       onClose={onClose}
       header={
-        <>
-          <FleetStateDot state={agent.state} pulse={liveness.pulse} />
-          <h2
-            className="min-w-0 shrink-0 truncate text-title-sm font-semibold text-foreground"
-            title={[shownName, agent.label].filter(Boolean).join("\n")}
-          >
-            {name ?? agent.label ?? (agent.agent_id || sessionId)}
-          </h2>
-          {name && agent.label && (
-            <span className="min-w-0 shrink truncate text-caption text-muted-foreground" title={agent.label}>
-              {agent.label}
-            </span>
-          )}
-          <CopyIds agentId={agent.agent_id} sessionId={sessionId} />
-          <RoleBadge role={agent.role} />
-          <FleetStateBadge state={agent.state} pulse={liveness.pulse} />
-          <LiveBadge live={agent.live} pulse={liveness.pulse} />
-          <AgentLivenessPill liveness={liveness} />
-          {agent.attention && (
-            <span
-              className="text-caption font-medium text-warning"
-              title="In the dispatcher's Escalations, at the top of the Fleet page"
+        <div className="flex min-w-0 flex-1 flex-col gap-1.5 py-0.5">
+          <div className="flex min-w-0 items-center gap-2">
+            <FleetStateDot state={agent.state} pulse={liveness.pulse} />
+            <h2
+              className="min-w-0 flex-1 truncate text-title-sm font-semibold text-foreground"
+              title={[shownName, agent.label].filter(Boolean).join("\n")}
             >
-              escalated
-            </span>
-          )}
-          <span className="ml-auto" />
-          <Button onClick={() => onOpenTimeline(sessionId)} title="Open the event timeline">
-            <span className="hidden sm:inline">Session timeline</span>
-            <span className="sm:hidden">Timeline</span>
-            <ArrowRight size={12} />
-          </Button>
-        </>
+              {name ?? agent.label ?? (agent.agent_id || sessionId)}
+            </h2>
+            <Button
+              onClick={() => onOpenTimeline(sessionId)}
+              title={tr(locale, "打开事件时间线", "Open the event timeline")}
+              className="shrink-0"
+            >
+              <span className="hidden sm:inline">{tr(locale, "会话时间线", "Session timeline")}</span>
+              <span className="sm:hidden">{tr(locale, "时间线", "Timeline")}</span>
+              <ArrowRight size={12} />
+            </Button>
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+            {name && agent.label && (
+              <span className="min-w-0 max-w-full truncate text-caption text-muted-foreground" title={agent.label}>
+                {agent.label}
+              </span>
+            )}
+            <CopyIds agentId={agent.agent_id} sessionId={sessionId} />
+            <RoleBadge role={agent.role} />
+            <FleetStateBadge state={agent.state} pulse={liveness.pulse} />
+            <LiveBadge live={agent.live} pulse={liveness.pulse} />
+            <AgentLivenessPill liveness={liveness} />
+            {agent.attention && (
+              <span
+                className="text-caption font-medium text-warning"
+                title={tr(
+                  locale,
+                  "已在调度器 Escalations 队列中置顶提醒",
+                  "In the dispatcher's Escalations, at the top of the Fleet page",
+                )}
+              >
+                {tr(locale, "已升级待关注", "escalated")}
+              </span>
+            )}
+          </div>
+        </div>
       }
     >
       <div className="min-h-0 flex-1 overflow-y-auto bg-app-shell">
@@ -950,9 +962,11 @@ function AgentScreen({
           ? pane.error
             ? `Could not read the pane: ${pane.error}`
             : data
-              ? data.live
-                ? "The pane is empty."
-                : "No terminal is running for this agent."
+              ? data.diagnostic
+                ? data.diagnostic
+                : data.live
+                  ? "The pane is empty."
+                  : "No terminal is running for this agent."
               : "Connecting\u2026"
           : judged.judged
             ? "No screen was captured with this judgement."

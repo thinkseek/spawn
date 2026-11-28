@@ -160,6 +160,7 @@ pub(crate) mod attention;
 mod auth_token;
 pub(crate) mod capabilities;
 pub(crate) mod core_lines;
+mod devices;
 mod digest;
 pub(crate) mod feature_map;
 mod gzip;
@@ -189,6 +190,7 @@ use spawn_core::port::TerminalHost;
 use spawn_core::tui::{TerminalAddress, TuiAction};
 use spawn_host::herdr_global::{
     DiscoveryScope, GlobalErrorKind, GlobalHerdrError, HerdrGlobalClient, SocketScope,
+    SpawnTerminalRequest,
 };
 
 use crate::objectives::{
@@ -1647,6 +1649,12 @@ fn handle_api_request(
     if !access.can_mutate() && !matches!(request.method(), Method::Get | Method::Head) {
         return refuse_readonly_mutation(request).map(|()| None);
     }
+    if path == "/api/auth/whoami" {
+        return respond_whoami(request, access, shared).map(|()| None);
+    }
+    if let Some(device_route) = devices::parse_device_route(path) {
+        return devices::respond_device_route(request, device_route, access, shared).map(|()| None);
+    }
     if path == "/api/features/truth" || path == "/api/episodes" {
         if !matches!(request.method(), Method::Get | Method::Head) {
             return request
@@ -1787,6 +1795,7 @@ const MAX_AGENT_WAIT_MS: u64 = 120_000;
 
 enum AgentRoute {
     List,
+    Spawn,
     Snapshot { address: TerminalAddress },
     Action { address: TerminalAddress },
     InvalidAddress,
@@ -1800,6 +1809,9 @@ fn decode_agent_address(raw: &str) -> Option<TerminalAddress> {
 fn parse_agent_route(path: &str) -> Option<AgentRoute> {
     if path == "/api/agents" {
         return Some(AgentRoute::List);
+    }
+    if path == "/api/agents/spawn" {
+        return Some(AgentRoute::Spawn);
     }
     let rest = path.strip_prefix("/api/agents/")?;
     if let Some(raw_addr) = rest.strip_suffix("/snapshot") {
@@ -1968,13 +1980,21 @@ fn respond_agent_route(
             };
             let visibility = agent_visibility(access);
             let read = agent_socket_scope(shared).and_then(|scope| {
-                HerdrGlobalClient::discover_in_scope(&scope, include_exited, visibility)
+                HerdrGlobalClient::discover_in_scope_with_diagnostics(
+                    &scope,
+                    include_exited,
+                    visibility,
+                )
             });
             match read {
-                Ok(terminals) => {
+                Ok((terminals, diagnostics)) => {
                     let answer = answers::answer(
                         "/api/agents",
-                        Ok(json!({ "agents": terminals, "count": terminals.len() })),
+                        Ok(json!({
+                            "agents": terminals,
+                            "count": terminals.len(),
+                            "diagnostics": diagnostics,
+                        })),
                         BAD_REQUEST,
                     );
                     let if_none_match = header(&request, "If-None-Match").map(str::to_string);
@@ -1987,6 +2007,20 @@ fn respond_agent_route(
                     ))
                     .map_err(|error| error.to_string()),
             }
+        }
+        AgentRoute::Spawn => {
+            if *request.method() != Method::Post {
+                return request
+                    .respond(not_allowed("POST"))
+                    .map_err(|error| error.to_string());
+            }
+            let (status, body) = match agent_spawn_checked(&mut request, access, shared) {
+                Ok(created) => (201, created),
+                Err((status, error)) => (status, json!({ "error": error })),
+            };
+            request
+                .respond(json_response(status, &body))
+                .map_err(|error| error.to_string())
         }
         AgentRoute::Snapshot { address } => {
             if !matches!(request.method(), Method::Get | Method::Head) {
@@ -2110,6 +2144,48 @@ fn refuse_readonly_mutation(request: Request) -> Result<(), String> {
             &json!({ "error": auth_token::READONLY_MUTATION_ERROR }),
         ))
         .map_err(|error| error.to_string())
+}
+
+fn respond_whoami(request: Request, access: AuthPrincipal, shared: &Shared) -> Result<(), String> {
+    if !matches!(request.method(), Method::Get | Method::Head) {
+        return request
+            .respond(not_allowed("GET"))
+            .map_err(|error| error.to_string());
+    }
+    let (principal, mode) = match access {
+        AuthPrincipal::LocalOwner => ("local_owner", "interactive"),
+        AuthPrincipal::AdminToken => ("admin_token", "interactive"),
+        AuthPrincipal::ReadOnlyViewer { .. } => ("readonly_viewer", "read_only"),
+    };
+    let body = json!({
+        "principal": principal,
+        "mode": mode,
+        "can_write": access.can_mutate(),
+        "can_read_external_agents": access.can_mutate(),
+        "token_required": shared.token.is_some(),
+        "expires_at_ms": access.stream_expires_at_ms(),
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    let cache = Header::from_bytes("Cache-Control", "no-store").expect("static header is valid");
+    request
+        .respond(json_response(200, &body).with_header(cache))
+        .map_err(|error| error.to_string())
+}
+
+fn agent_spawn_checked(
+    request: &mut Request,
+    access: AuthPrincipal,
+    shared: &Shared,
+) -> Result<Value, (u16, String)> {
+    let (raw_body, _) = write_body(request, access, shared, "spawning a terminal")?;
+    let req: SpawnTerminalRequest = serde_json::from_slice(&raw_body).map_err(|error| {
+        (
+            400,
+            format!("{BAD_REQUEST}invalid terminal spawn request: {error}"),
+        )
+    })?;
+    let scope = agent_socket_scope(shared).map_err(agent_error_tuple)?;
+    HerdrGlobalClient::spawn_terminal_in_scope(&scope, &req).map_err(agent_error_tuple)
 }
 
 /// 405, naming the one method (`allow`) the path takes.
@@ -5390,9 +5466,14 @@ fn pane(id: &str, owner: Option<&str>) -> Result<Value, String> {
     let session = session_id(id)?;
     let latest = store.executions(&session).map_err(err)?.into_iter().next();
     let Some(execution) = latest else {
-        return Ok(
-            json!({ "live": false, "terminal": null, "captured_at_ms": now_ms(), "text": "" }),
-        );
+        return Ok(json!({
+            "live": false,
+            "terminal": null,
+            "captured_at_ms": now_ms(),
+            "text": "",
+            "diagnostic_code": "no_execution",
+            "diagnostic": "This session has no execution records yet.",
+        }));
     };
     let Some(agent) = store
         .state(&session)
@@ -5407,12 +5488,18 @@ fn pane(id: &str, owner: Option<&str>) -> Result<Value, String> {
     let root = env_or("SPAWN_WORKSPACE_ROOT", "/tmp");
     let workspace = WorkspaceId::new(format!("{agent}:{root}/{agent}")).map_err(err)?;
     let host = crate::config::terminal_host()?;
+    let mut capture_error: Option<String> = None;
     let text = if live {
-        let raw = host
-            .capture_tail(&terminal, &workspace, PANE_LINES)
-            .unwrap_or_default();
-        let engine = store.latest_engine(&session).ok().flatten();
-        spawn_core::driver::excerpt_for(engine.as_deref(), &raw)
+        match host.capture_tail(&terminal, &workspace, PANE_LINES) {
+            Ok(raw) => {
+                let engine = store.latest_engine(&session).ok().flatten();
+                spawn_core::driver::excerpt_for(engine.as_deref(), &raw)
+            }
+            Err(error) => {
+                capture_error = Some(error.to_string());
+                String::new()
+            }
+        }
     } else {
         String::new()
     };
@@ -5420,11 +5507,38 @@ fn pane(id: &str, owner: Option<&str>) -> Result<Value, String> {
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
     }
+    let has_text = live && !lines.is_empty();
+    let (diagnostic_code, diagnostic): (Value, Value) = if has_text {
+        (Value::Null, Value::Null)
+    } else if !live {
+        (
+            Value::from("execution_ended"),
+            Value::from("Latest execution has already ended; live terminal pane is closed."),
+        )
+    } else if let Some(error) = capture_error {
+        (
+            Value::from("capture_failed"),
+            Value::from(format!(
+                "Terminal pane capture failed for {}: {error}",
+                terminal.as_str()
+            )),
+        )
+    } else {
+        (
+            Value::from("pane_empty"),
+            Value::from(format!(
+                "Terminal {} responded with empty output (process may still be starting or waiting).",
+                terminal.as_str()
+            )),
+        )
+    };
     Ok(json!({
-        "live": live && !lines.is_empty(),
+        "live": has_text,
         "terminal": terminal.as_str(),
         "captured_at_ms": now_ms(),
         "text": lines.join("\n"),
+        "diagnostic_code": diagnostic_code,
+        "diagnostic": diagnostic,
     }))
 }
 
@@ -12740,6 +12854,27 @@ mod tests {
                     "turn": turn_now
                 }
             }),
+            "terminal.run" => {
+                state
+                    .mutations
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let name = params["name"].as_str().unwrap_or("t-spawned");
+                let address = format!("t-{name}");
+                let turn_next = state.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "result": {
+                        "address": address,
+                        "name": name,
+                        "argv": params["argv"],
+                        "cwd": params["cwd"],
+                        "status": "idle",
+                        "turn": turn_next,
+                        "created": true
+                    }
+                })
+            }
             other => panic!("unexpected mock agent rpc method: {other}"),
         }
     }
@@ -13732,5 +13867,209 @@ mod tests {
                 .is_some()
         );
         assert_eq!(cache.total_bytes, 80);
+    }
+
+    fn with_sock_token_server(
+        master: &str,
+        agent_socket: Option<PathBuf>,
+        xdg_runtime_dir: Option<PathBuf>,
+        tests: impl FnOnce(u16),
+    ) {
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("listen"));
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let shared = Arc::new(Shared {
+            web: std::env::temp_dir(),
+            token: Some(master.to_string()),
+            port: Some(port),
+            hosts: server_hosts("127.0.0.1:0", port),
+            open: Vec::new(),
+            pools: Ok(None),
+            agent_socket,
+            local_open: false,
+            herdr_discovery: spawn_host::HerdrDiscoveryEnv {
+                hc_socket: None,
+                xdg_runtime_dir,
+            },
+        });
+        let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
+        let s_srv = Arc::clone(&server);
+        let s_shared = Arc::clone(&shared);
+        let s_streams = Arc::clone(&streams);
+        let handle = std::thread::spawn(move || {
+            super::serve_requests_with_queue(
+                &s_srv,
+                &s_shared,
+                MAX_IN_FLIGHT,
+                super::MAX_REQUEST_QUEUE,
+                &s_streams,
+            )
+        });
+        tests(port);
+        server.unblock();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn whoami_and_devices_enforce_rbac_and_roundtrip() {
+        let master = "whoami-devices-master-secret";
+        let now = super::auth_token::current_epoch_secs().expect("clock");
+        let (viewer, _) =
+            super::auth_token::mint_viewer_token(master, now, 3_600).expect("mint viewer");
+
+        with_sock_token_server(master, None, None, |port| {
+            assert_eq!(
+                raw_method(port, "GET", "/api/auth/whoami", "", "").status,
+                401
+            );
+
+            let viewer_hdr = format!("Authorization: Bearer {viewer}\r\n");
+            let who_viewer = raw_method(port, "GET", "/api/auth/whoami", &viewer_hdr, "");
+            assert_eq!(who_viewer.status, 200);
+            assert_eq!(who_viewer.body["principal"], "readonly_viewer");
+            assert_eq!(who_viewer.body["mode"], "read_only");
+            assert_eq!(who_viewer.body["can_write"], false);
+            assert_eq!(who_viewer.body["can_read_external_agents"], false);
+
+            let admin_hdr = format!("Authorization: Bearer {master}\r\n");
+            let who_admin = raw_method(port, "GET", "/api/auth/whoami", &admin_hdr, "");
+            assert_eq!(who_admin.status, 200);
+            assert_eq!(who_admin.body["principal"], "admin_token");
+            assert_eq!(who_admin.body["mode"], "interactive");
+            assert_eq!(who_admin.body["can_write"], true);
+            assert_eq!(who_admin.body["can_read_external_agents"], true);
+
+            assert_eq!(
+                raw_method(port, "GET", "/api/devices", &viewer_hdr, "").status,
+                200
+            );
+            let viewer_reg = raw_method(
+                port,
+                "POST",
+                "/api/devices/register",
+                &format!("{viewer_hdr}Content-Type: application/json\r\n"),
+                r#"{"device_id":"ro-tab"}"#,
+            );
+            assert_eq!(viewer_reg.status, 403);
+
+            let admin_json = format!("{admin_hdr}Content-Type: application/json\r\n");
+            let reg = raw_method(
+                port,
+                "POST",
+                "/api/devices/register",
+                &admin_json,
+                r#"{"device_id":"http-tab-1","label":"Pixel Tablet","accessibility_ready":true,"notifications_ready":true,"control_enabled":true,"relay_enabled":true}"#,
+            );
+            assert_eq!(reg.status, 200, "{reg:?}");
+            let enq = raw_method(
+                port,
+                "POST",
+                "/api/devices/http-tab-1/commands",
+                &admin_json,
+                r#"{"action":"screen_observe","params":{}}"#,
+            );
+            assert_eq!(enq.status, 202, "{enq:?}");
+            let cmd_id = enq.body["command"]["command_id"]
+                .as_str()
+                .expect("command_id");
+            let poll = raw_method(
+                port,
+                "POST",
+                "/api/devices/http-tab-1/commands/poll",
+                &admin_json,
+                r#"{"limit":2}"#,
+            );
+            assert_eq!(poll.status, 200, "{poll:?}");
+            assert_eq!(poll.body["commands"].as_array().map_or(0, Vec::len), 1);
+            let report = raw_method(
+                port,
+                "POST",
+                &format!("/api/devices/http-tab-1/commands/{cmd_id}/result"),
+                &admin_json,
+                r#"{"outcome":"executed","message":"ok","active_package":"com.example.app","observation":{"nodes":[]}}"#,
+            );
+            assert_eq!(report.status, 200, "{report:?}");
+            assert_eq!(report.body["command"]["status"], "executed");
+        });
+    }
+
+    #[test]
+    fn agents_diagnostics_and_spawn_enforce_rbac() {
+        let master = "agents-diag-spawn-master-secret";
+        let now = super::auth_token::current_epoch_secs().expect("clock");
+        let (viewer, _) =
+            super::auth_token::mint_viewer_token(master, now, 3_600).expect("mint viewer");
+        let sock_dir = PathBuf::from(format!("/tmp/spn-ds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sock_dir);
+        let xdg_dir = sock_dir.join("xdg");
+        std::fs::create_dir_all(&xdg_dir).expect("create xdg dir");
+        let mock_sock = sock_dir.join("hc.sock");
+
+        with_sock_token_server(master, None, Some(xdg_dir), |port| {
+            let admin_hdr = format!("Authorization: Bearer {master}\r\n");
+            let list_diag = raw_method(port, "GET", "/api/agents", &admin_hdr, "");
+            assert_eq!(list_diag.status, 200, "{list_diag:?}");
+            assert_eq!(list_diag.body["diagnostics"]["scope_kind"], "discovered");
+            assert!(
+                list_diag.body["diagnostics"]["hint"]
+                    .as_str()
+                    .is_some_and(|h| !h.is_empty()),
+                "{list_diag:?}"
+            );
+        });
+
+        let (srv_handle, _srv_state) = spawn_mock_agent_uds(&mock_sock);
+        with_sock_token_server(master, Some(mock_sock.clone()), None, |port| {
+            let viewer_json =
+                format!("Authorization: Bearer {viewer}\r\nContent-Type: application/json\r\n");
+            let spawn_ro = raw_method(
+                port,
+                "POST",
+                "/api/agents/spawn",
+                &viewer_json,
+                r#"{"command":"bash","name":"denied"}"#,
+            );
+            assert_eq!(spawn_ro.status, 403);
+
+            let admin_hdr = format!("Authorization: Bearer {master}\r\n");
+            let admin_json = format!("{admin_hdr}Content-Type: application/json\r\n");
+            let spawn_bad = raw_method(
+                port,
+                "POST",
+                "/api/agents/spawn",
+                &admin_json,
+                r#"{"argv":[""]}"#,
+            );
+            assert_eq!(spawn_bad.status, 400);
+
+            let spawn_ok = raw_method(
+                port,
+                "POST",
+                "/api/agents/spawn",
+                &admin_json,
+                r#"{"command":"bash","name":"desk-shell"}"#,
+            );
+            assert_eq!(spawn_ok.status, 201, "{spawn_ok:?}");
+            assert_eq!(spawn_ok.body["address"], "t-desk-shell");
+            assert_eq!(spawn_ok.body["terminal"]["name"], "desk-shell");
+            assert_eq!(spawn_ok.body["terminal"]["created"], true);
+
+            let list_ok = raw_method(port, "GET", "/api/agents", &admin_hdr, "");
+            assert_eq!(list_ok.status, 200);
+            assert_eq!(
+                list_ok.body["diagnostics"]["reachable_sockets"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(1)
+            );
+            assert!(
+                list_ok.body["diagnostics"]["hint"]
+                    .as_str()
+                    .is_some_and(|h| !h.is_empty()),
+                "{list_ok:?}"
+            );
+        });
+        stop_mock_agent_uds(&mock_sock);
+        srv_handle.join().expect("mock agent srv join");
+        let _ = std::fs::remove_dir_all(&sock_dir);
     }
 }

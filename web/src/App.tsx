@@ -118,15 +118,20 @@ const EMPTY_SESSIONS: NonNullable<ReturnType<typeof peekOverview>>["sessions"] =
 
 export type View = NavView;
 
+export type AgentsTab = "herdr" | "sandbox" | "devices";
+
 interface Route {
   view: View;
   /** Agent open in the fleet view's detail drawer, or terminal address in Agents view. */
   agent: string | null;
+  agentsTab?: AgentsTab;
 }
 
 function routeFromHash(): Route {
   const hash = window.location.hash;
   if (hash.startsWith("#/sessions")) return { view: "sessions", agent: null };
+  if (hash.startsWith("#/sandbox")) return { view: "agents", agent: null, agentsTab: "sandbox" };
+  if (hash.startsWith("#/devices")) return { view: "agents", agent: null, agentsTab: "devices" };
   const agentsMatch = /^#\/agents\/(.+)$/.exec(hash);
   if (agentsMatch) {
     let agent: string | null = null;
@@ -135,9 +140,9 @@ function routeFromHash(): Route {
     } catch {
       agent = null;
     }
-    return { view: "agents", agent };
+    return { view: "agents", agent, agentsTab: "herdr" };
   }
-  if (hash.startsWith("#/agents")) return { view: "agents", agent: null };
+  if (hash.startsWith("#/agents")) return { view: "agents", agent: null, agentsTab: "herdr" };
   if (hash.startsWith("#/rsi")) return { view: "rsi", agent: null };
   if (hash.startsWith("#/grading")) return { view: "grading", agent: null };
   if (hash.startsWith("#/missions")) return { view: "missions", agent: null };
@@ -167,6 +172,8 @@ function hashFor(route: Route): string {
       : "#/fleet";
   }
   if (route.view === "agents") {
+    if (route.agentsTab === "sandbox") return "#/sandbox";
+    if (route.agentsTab === "devices") return "#/devices";
     return route.agent
       ? `#/agents/${encodeURIComponent(route.agent)}`
       : "#/agents";
@@ -533,8 +540,19 @@ function DashboardShell({
   const selectAgentAddress = useCallback(
     (agent: string | null) =>
       setRoute((curr) =>
-        curr.view === "agents" ? { view: "agents", agent } : curr,
+        curr.view === "agents"
+          ? { view: "agents", agent, agentsTab: curr.agentsTab ?? "herdr" }
+          : curr,
       ),
+    [],
+  );
+  const selectAgentsTab = useCallback(
+    (agentsTab: AgentsTab) =>
+      setRoute((curr) => ({
+        view: "agents",
+        agent: agentsTab === "herdr" && curr.view === "agents" ? curr.agent : null,
+        agentsTab,
+      })),
     [],
   );
   // Polled in every view too: summary board outside `/missions` avoids multi-hundred-KB polling.
@@ -750,6 +768,8 @@ function DashboardShell({
           {view === "agents" ? (
             <AgentsConsoleView
               role={tokenRole}
+              activeTab={route.agentsTab ?? "herdr"}
+              onSelectTab={selectAgentsTab}
               selectedAddress={route.agent}
               onSelectAddress={selectAgentAddress}
             />

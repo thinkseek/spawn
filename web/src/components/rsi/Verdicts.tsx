@@ -186,8 +186,8 @@ export function TaskDetail({ task, summary, onClose }: TaskDetailProps) {
     <Drawer
       onClose={onClose}
       header={
-        <>
-          <h2 className="tnum truncate text-title-sm font-semibold text-foreground">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <h2 className="tnum min-w-0 truncate text-title-sm font-semibold text-foreground">
             Task #{task}
           </h2>
           {state && <PhaseBadge phase={state} />}
@@ -196,7 +196,7 @@ export function TaskDetail({ task, summary, onClose }: TaskDetailProps) {
               refreshing every 3s
             </span>
           )}
-        </>
+        </div>
       }
     >
       {!data ? (

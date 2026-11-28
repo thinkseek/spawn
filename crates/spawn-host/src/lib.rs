@@ -86,7 +86,10 @@ pub use git_process::git_command;
 pub use git_process::test_git_command;
 pub use herdr::{HerdrHost, HerdrPool};
 pub use herdr_core::HerdrCoreHost;
-pub use herdr_global::{HerdrDiscoveryEnv, HerdrGlobalClient};
+pub use herdr_global::{
+    DiscoveryDiagnostics, HerdrDiscoveryEnv, HerdrGlobalClient, SpawnTerminalRequest,
+    UnreachableSocketDiagnostic,
+};
 pub use merkle_merge::{
     ConflictKind, ConflictLabels, MergeBaseError, MergeDriver, MergeOptions, MergeShadowOutcome,
     MergeSnapshotSpec, ShadowOracleSummary, build_merge_snapshot, classify_shadow_merge,

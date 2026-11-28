@@ -159,6 +159,8 @@ export interface RsiPane {
   session_id: string | null;
   captured_at_ms: number;
   text: string;
+  diagnostic_code?: string | null;
+  diagnostic?: string | null;
 }
 
 /** One landed value of a metric, for the chart. */
@@ -405,6 +407,8 @@ export function normalizePane(value: unknown): RsiPane {
     session_id: optionalText(raw.session_id),
     captured_at_ms: number(raw.captured_at_ms),
     text: text(raw.text),
+    diagnostic_code: optionalText(raw.diagnostic_code),
+    diagnostic: optionalText(raw.diagnostic),
   };
 }
 

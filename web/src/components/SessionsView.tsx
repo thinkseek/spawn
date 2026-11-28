@@ -153,7 +153,7 @@ export function SessionsView({
           width="max-w-sm"
           onClose={() => onSetRailOpen(false)}
           header={
-            <h2 className="text-title-sm font-semibold text-foreground">
+            <h2 className="min-w-0 truncate text-title-sm font-semibold text-foreground">
               {tr(locale, "会话详情", "Session details")}
             </h2>
           }

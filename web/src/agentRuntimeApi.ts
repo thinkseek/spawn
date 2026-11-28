@@ -7,10 +7,13 @@ import {
   fetchAgentsWithFetch,
   fetchAgentSnapshotWithFetch,
   postAgentActionWithFetch,
+  postSpawnTerminalWithFetch,
   type AgentEtagEntry,
   type AgentFetch,
   type AgentResult,
   type AgentsListResponse,
+  type SpawnTerminalRequest,
+  type SpawnTerminalResponse,
   type TuiAction,
   type TuiActionOutcome,
   type TuiSnapshot,
@@ -62,6 +65,16 @@ export function postGlobalAgentAction(
   signal?: AbortSignal,
 ): Promise<AgentResult<TuiActionOutcome>> {
   return postAgentActionWithFetch(browserFetch, apiHeaders(), address, action, {
+    signal,
+    onUnauthorized,
+  });
+}
+
+export function postGlobalAgentSpawn(
+  req: SpawnTerminalRequest,
+  signal?: AbortSignal,
+): Promise<AgentResult<SpawnTerminalResponse>> {
+  return postSpawnTerminalWithFetch(browserFetch, apiHeaders(), req, {
     signal,
     onUnauthorized,
   });
