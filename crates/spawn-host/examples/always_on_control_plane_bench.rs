@@ -28,7 +28,9 @@ use spawn_core::id::{
 };
 use spawn_core::ingest;
 use spawn_core::memory::{MemoryStore, MemoryWatch};
-use spawn_core::port::{BridgeShard, CommandQueue, EventLog, ShardPartition, TranscriptArchive};
+use spawn_core::port::{
+    BridgeShard, CommandOwnership, CommandQueue, EventLog, ShardPartition, TranscriptArchive,
+};
 use spawn_core::time::SystemClock;
 use spawn_host::LocalTranscriptArchive;
 use spawn_postgres::PostgresStore;
@@ -566,13 +568,44 @@ fn verify_deterministic_xid8_inversions(
     Ok(rounds)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoldbackProbeOutcome {
+    HeldBackAndReleased,
+    LeakedAheadOfXmin(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct XminHoldbackSummary {
+    attempted: usize,
+    verified: usize,
+    premature_leaks: usize,
+}
+
+fn summarize_xmin_holdback_outcomes(outcomes: &[HoldbackProbeOutcome]) -> XminHoldbackSummary {
+    let mut verified = 0_usize;
+    let mut premature_leaks = 0_usize;
+    for outcome in outcomes {
+        match *outcome {
+            HoldbackProbeOutcome::HeldBackAndReleased => verified += 1,
+            HoldbackProbeOutcome::LeakedAheadOfXmin(leaked) => {
+                premature_leaks = premature_leaks.saturating_add(leaked);
+            }
+        }
+    }
+    XminHoldbackSummary {
+        attempted: outcomes.len(),
+        verified,
+        premature_leaks,
+    }
+}
+
 fn run_single_xmin_holdback(
     pg_envs: &[(String, String)],
     schema: &str,
     store: &PostgresStore,
     cursor: &mut GlobalPosition,
     round: usize,
-) -> Result<(), String> {
+) -> Result<HoldbackProbeOutcome, String> {
     let pid = std::process::id();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -631,10 +664,10 @@ fn run_single_xmin_holdback(
     if !g1.is_empty() {
         let _ = t1.kill();
         let _ = t1.wait();
-        let leaked: Vec<GlobalPosition> = g1.iter().map(|r| r.position).collect();
-        return Err(format!(
-            "xid8 xmin watermark holdback round {round}: read_global leaked committed T2 rows {leaked:?} while older T1 XID remained uncommitted"
-        ));
+        if let Some(last) = g1.last() {
+            *cursor = last.position;
+        }
+        return Ok(HoldbackProbeOutcome::LeakedAheadOfXmin(g1.len()));
     }
 
     finish_t1_xid8_commit(t1, t1_in, id_t1, "xmin", round)?;
@@ -659,7 +692,7 @@ fn run_single_xmin_holdback(
             g3.len()
         ));
     }
-    Ok(())
+    Ok(HoldbackProbeOutcome::HeldBackAndReleased)
 }
 
 fn verify_xid8_xmin_watermark_holdback(
@@ -668,7 +701,7 @@ fn verify_xid8_xmin_watermark_holdback(
     store: &PostgresStore,
     cursor: &mut GlobalPosition,
     rounds: usize,
-) -> Result<(usize, usize), String> {
+) -> Result<XminHoldbackSummary, String> {
     if schema.is_empty()
         || !schema
             .chars()
@@ -685,10 +718,13 @@ fn verify_xid8_xmin_watermark_holdback(
              \\q\n"
         ),
     )?;
+    let mut outcomes = Vec::with_capacity(rounds);
     for round in 0..rounds {
-        run_single_xmin_holdback(&pg_envs, schema, store, cursor, round)?;
+        outcomes.push(run_single_xmin_holdback(
+            &pg_envs, schema, store, cursor, round,
+        )?);
     }
-    Ok((rounds, 0))
+    Ok(summarize_xmin_holdback_outcomes(&outcomes))
 }
 
 struct EventReadTally {
@@ -799,7 +835,7 @@ fn run_event_log_stress(
     let mut end_cursor = read_positions.last().map_or(initial_cursor, |s| s.position);
     let deterministic_inversions =
         verify_deterministic_xid8_inversions(bench_url, schema, base_store, &mut end_cursor, 4)?;
-    let (xmin_holdbacks, xmin_premature_leaks) =
+    let xmin_summary =
         verify_xid8_xmin_watermark_holdback(bench_url, schema, base_store, &mut end_cursor, 2)?;
 
     Ok(json!({
@@ -812,8 +848,9 @@ fn run_event_log_stress(
         "concurrent_commit_id_inversions": tally.commit_id_inversions,
         "deterministic_commit_id_inversions": deterministic_inversions,
         "commit_id_inversions": tally.commit_id_inversions + deterministic_inversions,
-        "xmin_watermark_holdbacks_verified": xmin_holdbacks,
-        "xmin_premature_leaks": xmin_premature_leaks,
+        "xmin_holdbacks_attempted": xmin_summary.attempted,
+        "xmin_holdbacks_verified": xmin_summary.verified,
+        "xmin_premature_leaks": xmin_summary.premature_leaks,
         "duplicate_reads": tally.duplicate_reads,
         "missing_reads": tally.missing_reads,
         "unexpected_reads": tally.unexpected_reads,
@@ -942,6 +979,7 @@ struct ShardWorker {
     partition: ShardPartition,
     name: String,
     store: PostgresStore,
+    _ownership: Box<dyn CommandOwnership>,
 }
 
 fn prepare_shard_connections(
@@ -966,16 +1004,32 @@ fn prepare_shard_connections(
             .new_connection()
             .map_err(|e| format!("shard new_connection: {e}"))?;
         let name = format!("always-on-shard-{idx}");
-        let _ownership = store
-            .recover_worker(&name)
-            .map_err(|e| format!("recover shard {name}: {e}"))?
-            .0;
+        let (ownership, _) = store
+            .recover_worker_for_shard(&name, BridgeShard::Partition(partition))
+            .map_err(|e| format!("recover shard {name}: {e}"))?;
         shard_workers.push(ShardWorker {
             idx,
             partition,
             name,
             store,
+            _ownership: ownership,
         });
+    }
+    if let Some(first) = shard_workers.first() {
+        let cov = first
+            .store
+            .shard_coverage()
+            .map_err(|e| format!("shard_coverage: {e}"))?
+            .ok_or_else(|| {
+                "shard_coverage unexpectedly empty after registering shards".to_string()
+            })?;
+        let expected: Vec<u16> = (0..cfg.shards).collect();
+        if cov.total != cfg.shards || cov.present != expected || !cov.missing.is_empty() {
+            return Err(format!(
+                "incomplete shard coverage: total={} present={:?} missing={:?}",
+                cov.total, cov.present, cov.missing
+            ));
+        }
     }
     Ok((submitters, shard_workers))
 }
@@ -1355,34 +1409,53 @@ fn drive_bridge_execution(
     ))
 }
 
-fn find_native_sid_for_execution(
+#[derive(Clone, Default)]
+struct ExecutionSpawnEvents {
+    started_event_agent_id: Option<String>,
+    started_event_session_id: Option<String>,
+    native_event_agent_id: Option<String>,
+    native_event_session_id: Option<String>,
+    native_sid: Option<String>,
+}
+
+fn read_execution_spawn_events(
     store: &PostgresStore,
     execution_id: &str,
-) -> Result<Option<String>, String> {
+) -> Result<ExecutionSpawnEvents, String> {
     let mut cursor = GlobalPosition(0);
-    let mut found = None;
+    let mut out = ExecutionSpawnEvents::default();
     loop {
         let batch = store
             .read_global(cursor, 500)
-            .map_err(|e| format!("read_global native sid: {e}"))?;
+            .map_err(|e| format!("read_global execution spawn events: {e}"))?;
         if batch.is_empty() {
             break;
         }
         for rec in &batch {
             cursor = rec.position;
-            if rec.event.execution_id.as_ref().map(ExecutionId::as_str) == Some(execution_id)
-                && let EventKind::NativeSessionStarted {
+            if rec.event.execution_id.as_ref().map(ExecutionId::as_str) != Some(execution_id) {
+                continue;
+            }
+            match &rec.event.kind {
+                EventKind::ExecutionStarted { .. } => {
+                    out.started_event_agent_id = Some(rec.event.agent_id.as_str().to_string());
+                    out.started_event_session_id = Some(rec.event.session_id.as_str().to_string());
+                }
+                EventKind::NativeSessionStarted {
                     native_session_id, ..
-                } = &rec.event.kind
-            {
-                found = Some(native_session_id.clone());
+                } => {
+                    out.native_event_agent_id = Some(rec.event.agent_id.as_str().to_string());
+                    out.native_event_session_id = Some(rec.event.session_id.as_str().to_string());
+                    out.native_sid = Some(native_session_id.clone());
+                }
+                _ => {}
             }
         }
         if batch.len() < 500 {
             break;
         }
     }
-    Ok(found)
+    Ok(out)
 }
 
 fn read_archived_transcript_bytes(
@@ -1445,87 +1518,23 @@ fn complete_task_landing_lifecycle(
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MatchState {
-    Matched,
-    Mismatched,
-}
-
-impl MatchState {
-    fn from_bool(ok: bool) -> Self {
-        if ok { Self::Matched } else { Self::Mismatched }
-    }
-
-    fn is_matched(self) -> bool {
-        self == Self::Matched
-    }
-}
-
 #[derive(Clone)]
-struct ObservedLineage {
-    task_id: Option<i64>,
-    cost_task_id: Option<i64>,
-    agent_matches_task: MatchState,
-    agent_matches_execution: MatchState,
-    agent_matches_cost: MatchState,
-    execution_matches_cost: MatchState,
-    model_matches_disk_and_cost: MatchState,
-    disk_transcript_verified: MatchState,
-    disk_tokens_match_cost: MatchState,
-    duration_ms: Option<i64>,
-    cost_usd: Option<f64>,
-    unpriced_tokens: i64,
-    has_landing_record: MatchState,
-}
-
-fn evaluate_observed_lineage(obs: &ObservedLineage, gaps: &mut AttributionGaps) -> Option<i64> {
-    let mut ok = true;
-    if !obs.agent_matches_task.is_matched()
-        || !obs.agent_matches_execution.is_matched()
-        || !obs.agent_matches_cost.is_matched()
-    {
-        gaps.missing_agent_id += 1;
-        ok = false;
-    }
-    if !obs.execution_matches_cost.is_matched() {
-        gaps.missing_execution_id += 1;
-        ok = false;
-    }
-    if obs.task_id.is_none() || obs.cost_task_id != obs.task_id {
-        gaps.missing_task_id += 1;
-        ok = false;
-    }
-    if !obs.model_matches_disk_and_cost.is_matched() {
-        gaps.missing_model_label += 1;
-        ok = false;
-    }
-    if !obs.disk_transcript_verified.is_matched() {
-        gaps.missing_transcript_ref += 1;
-        ok = false;
-    }
-    let dur_ms = match obs.duration_ms {
-        Some(ms) if ms > 0 => Some(ms),
-        _ => {
-            gaps.missing_duration_ms += 1;
-            ok = false;
-            None
-        }
-    };
-    let cost_ok = obs.cost_usd.is_some_and(|u| u > 0.0)
-        && obs.unpriced_tokens == 0
-        && obs.disk_tokens_match_cost.is_matched();
-    if !cost_ok {
-        gaps.missing_cost_or_tokens += 1;
-        ok = false;
-    }
-    if !obs.has_landing_record.is_matched() {
-        gaps.missing_landing_record += 1;
-        ok = false;
-    }
-    if ok {
-        gaps.tasks_fully_attributed += 1;
-    }
-    dur_ms
+struct RawTaskObservation {
+    expected_task_id: i64,
+    expected_session_id: String,
+    task_fact_agent_id: Option<String>,
+    exec_id: Option<String>,
+    exec_duration_ms: Option<i64>,
+    prov_exec_agent_id: Option<String>,
+    started_event_agent_id: Option<String>,
+    started_event_session_id: Option<String>,
+    native_event_agent_id: Option<String>,
+    native_event_session_id: Option<String>,
+    native_sid: Option<String>,
+    transcript_bytes: Vec<u8>,
+    cost_task_row: Option<Value>,
+    cost_exec_row: Option<Value>,
+    landed_tasks: BTreeSet<i64>,
 }
 
 #[derive(Default)]
@@ -1553,20 +1562,15 @@ impl DiskTranscriptSummary {
     }
 }
 
-fn read_disk_transcript_summary(
-    archive: &LocalTranscriptArchive,
-    agent_id: &str,
-    native_sid: &str,
-) -> Option<DiskTranscriptSummary> {
-    let bytes = read_archived_transcript_bytes(archive, agent_id, native_sid).ok()?;
-    if bytes.is_empty() || sha256_of(&bytes).hex().is_empty() {
+fn parse_raw_transcript_summary(bytes: &[u8]) -> Option<DiskTranscriptSummary> {
+    if bytes.is_empty() || sha256_of(bytes).hex().is_empty() {
         return None;
     }
     let mut summary = DiskTranscriptSummary {
         byte_len: bytes.len(),
         ..DiskTranscriptSummary::default()
     };
-    let text = String::from_utf8_lossy(&bytes);
+    let text = String::from_utf8_lossy(bytes);
     for line in text.lines() {
         if let Some(norm) = ingest::claude_usage(line)
             && let EventKind::ModelUsage {
@@ -1594,6 +1598,128 @@ fn read_disk_transcript_summary(
     (summary.total_tokens() > 0 && summary.model.is_some()).then_some(summary)
 }
 
+fn check_agent_and_exec_lineage(
+    obs: &RawTaskObservation,
+    cost_exec: Option<&Value>,
+    gaps: &mut AttributionGaps,
+) -> bool {
+    let mut ok = true;
+    let cost_agent = cost_exec.and_then(|r| r["agent"].as_str());
+    let agent_ok = obs
+        .task_fact_agent_id
+        .as_deref()
+        .zip(obs.prov_exec_agent_id.as_deref())
+        .zip(obs.started_event_agent_id.as_deref())
+        .zip(obs.native_event_agent_id.as_deref())
+        .zip(cost_agent)
+        .is_some_and(|((((t_ag, e_ag), s_ag), n_ag), c_ag)| {
+            !t_ag.is_empty() && t_ag == e_ag && e_ag == s_ag && s_ag == n_ag && n_ag == c_ag
+        });
+    if !agent_ok {
+        gaps.missing_agent_id += 1;
+        ok = false;
+    }
+
+    let cost_exec_id = cost_exec.and_then(|r| r["execution"].as_str());
+    let exec_ok = obs
+        .exec_id
+        .as_deref()
+        .zip(cost_exec_id)
+        .zip(obs.started_event_session_id.as_deref())
+        .zip(obs.native_event_session_id.as_deref())
+        .zip(obs.native_sid.as_deref())
+        .is_some_and(|((((eid, ceid), s_sid), n_sid), nsid)| {
+            !eid.is_empty()
+                && eid == ceid
+                && s_sid == obs.expected_session_id
+                && n_sid == obs.expected_session_id
+                && !nsid.is_empty()
+        });
+    if !exec_ok {
+        gaps.missing_execution_id += 1;
+        ok = false;
+    }
+    ok
+}
+
+fn evaluate_raw_task_observation(
+    obs: &RawTaskObservation,
+    gaps: &mut AttributionGaps,
+) -> Option<i64> {
+    let cost_exec = obs.cost_exec_row.as_ref();
+    let cost_task = obs.cost_task_row.as_ref();
+    let mut ok = check_agent_and_exec_lineage(obs, cost_exec, gaps);
+
+    let cost_task_id = cost_task.and_then(|r| r["task"].as_i64());
+    let cost_exec_task = cost_exec.and_then(|r| r["task"].as_i64());
+    if obs.expected_task_id <= 0
+        || cost_task_id != Some(obs.expected_task_id)
+        || cost_exec_task != Some(obs.expected_task_id)
+    {
+        gaps.missing_task_id += 1;
+        ok = false;
+    }
+
+    let disk_summary = parse_raw_transcript_summary(&obs.transcript_bytes);
+    let cost_model = cost_exec
+        .and_then(|r| r["models"].as_array())
+        .and_then(|m| m.first())
+        .and_then(|m| m["model"].as_str());
+    let model_ok = disk_summary
+        .as_ref()
+        .and_then(|d| d.model.as_deref())
+        .zip(cost_model)
+        .is_some_and(|(dm, cm)| !dm.is_empty() && dm == cm);
+    if !model_ok {
+        gaps.missing_model_label += 1;
+        ok = false;
+    }
+
+    if !disk_summary
+        .as_ref()
+        .is_some_and(|d| d.byte_len > 0 && d.total_tokens() > 0)
+    {
+        gaps.missing_transcript_ref += 1;
+        ok = false;
+    }
+
+    let dur_ms = match obs.exec_duration_ms {
+        Some(ms) if ms > 0 => Some(ms),
+        _ => {
+            gaps.missing_duration_ms += 1;
+            ok = false;
+            None
+        }
+    };
+
+    let cost_usd = cost_task.and_then(|r| r["usd"].as_f64());
+    let unpriced = cost_task
+        .and_then(|r| r["unpriced_tokens"].as_i64())
+        .unwrap_or(1);
+    let cost_task_tokens = cost_task.and_then(json_tokens_tuple);
+    let cost_exec_tokens = cost_exec.and_then(json_tokens_tuple);
+    let cost_ok = cost_usd.is_some_and(|u| u > 0.0)
+        && unpriced == 0
+        && disk_summary
+            .as_ref()
+            .zip(cost_task_tokens)
+            .zip(cost_exec_tokens)
+            .is_some_and(|((d, ct), ce)| d.tokens_tuple() == ct && ct == ce);
+    if !cost_ok {
+        gaps.missing_cost_or_tokens += 1;
+        ok = false;
+    }
+
+    if !obs.landed_tasks.contains(&obs.expected_task_id) {
+        gaps.missing_landing_record += 1;
+        ok = false;
+    }
+    if ok {
+        gaps.tasks_fully_attributed += 1;
+    }
+    dur_ms
+}
+
 fn json_tokens_tuple(row: &Value) -> Option<(i64, i64, i64, i64)> {
     let t = row.get("tokens")?;
     Some((
@@ -1612,151 +1738,142 @@ fn read_observed_task_lineage(
     landed_tasks: &BTreeSet<i64>,
     cost_tasks: &BTreeMap<i64, &Value>,
     cost_execs_by_id: &BTreeMap<String, &Value>,
-) -> Result<ObservedLineage, String> {
+) -> Result<RawTaskObservation, String> {
     let task_facts = store
         .prov_task_facts(&[task_id])
         .map_err(|e| format!("prov_task_facts: {e}"))?;
-    let task_agent = task_facts.get(&task_id).map(|f| f.agent_id.as_str());
+    let task_fact_agent_id = task_facts.get(&task_id).map(|f| f.agent_id.clone());
 
     let execs = store
         .executions(session_id)
         .map_err(|e| format!("executions: {e}"))?;
     let ended_exec = execs.iter().find(|e| e.ended_at.is_some());
-    let exec_id_str = ended_exec.map(|e| e.execution_id.as_str().to_string());
-    let exec_agents = match &exec_id_str {
+    let exec_id = ended_exec.map(|e| e.execution_id.as_str().to_string());
+    let exec_duration_ms = ended_exec.and_then(|e| e.duration_ms);
+    let exec_agents = match &exec_id {
         Some(id) => store
             .prov_execution_agents(std::slice::from_ref(id))
             .map_err(|e| format!("prov_execution_agents: {e}"))?,
         None => std::collections::HashMap::new(),
     };
-    let event_agent = exec_id_str
-        .as_ref()
-        .and_then(|id| exec_agents.get(id))
-        .map(String::as_str);
+    let prov_exec_agent_id = exec_id.as_ref().and_then(|id| exec_agents.get(id)).cloned();
 
-    let cost_row = cost_tasks.get(&task_id).copied();
-    let cost_exec_row = exec_id_str
+    let spawn_events = match &exec_id {
+        Some(eid) => read_execution_spawn_events(store, eid)?,
+        None => ExecutionSpawnEvents::default(),
+    };
+    let transcript_bytes = match (
+        prov_exec_agent_id.as_deref(),
+        spawn_events.native_sid.as_deref(),
+    ) {
+        (Some(ag), Some(nsid)) => {
+            read_archived_transcript_bytes(archive, ag, nsid).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let cost_task_row = cost_tasks.get(&task_id).copied().cloned();
+    let cost_exec_row = exec_id
         .as_ref()
         .and_then(|id| cost_execs_by_id.get(id))
-        .copied();
-    let cost_agent = cost_exec_row.and_then(|r| r["agent"].as_str());
-    let cost_exec_id = cost_exec_row.and_then(|r| r["execution"].as_str());
-    let cost_exec_task = cost_exec_row.and_then(|r| r["task"].as_i64());
-    let cost_task_id = cost_row.and_then(|r| r["task"].as_i64());
-    let cost_model = cost_exec_row
-        .and_then(|r| r["models"].as_array())
-        .and_then(|m| m.first())
-        .and_then(|m| m["model"].as_str());
-    let cost_task_tokens = cost_row.and_then(json_tokens_tuple);
-    let cost_exec_tokens = cost_exec_row.and_then(json_tokens_tuple);
+        .copied()
+        .cloned();
 
-    let native_sid = match &exec_id_str {
-        Some(eid) => find_native_sid_for_execution(store, eid)?,
-        None => None,
-    };
-    let disk_summary = event_agent
-        .zip(native_sid.as_deref())
-        .and_then(|(ag, nsid)| read_disk_transcript_summary(archive, ag, nsid));
-
-    let agent_matches_task = MatchState::from_bool(
-        task_agent
-            .zip(event_agent)
-            .is_some_and(|(t_ag, e_ag)| !t_ag.is_empty() && t_ag == e_ag),
-    );
-    let agent_matches_execution =
-        MatchState::from_bool(event_agent.is_some_and(|e_ag| !e_ag.is_empty()));
-    let agent_matches_cost = MatchState::from_bool(
-        event_agent
-            .zip(cost_agent)
-            .is_some_and(|(e_ag, c_ag)| e_ag == c_ag),
-    );
-    let execution_matches_cost = MatchState::from_bool(
-        exec_id_str
-            .as_deref()
-            .zip(cost_exec_id)
-            .zip(cost_exec_task)
-            .is_some_and(|((eid, ceid), ctid)| !eid.is_empty() && eid == ceid && ctid == task_id),
-    );
-    let model_matches_disk_and_cost = MatchState::from_bool(
-        disk_summary
-            .as_ref()
-            .and_then(|d| d.model.as_deref())
-            .zip(cost_model)
-            .is_some_and(|(dm, cm)| !dm.is_empty() && dm == cm),
-    );
-    let disk_transcript_verified = MatchState::from_bool(
-        disk_summary
-            .as_ref()
-            .is_some_and(|d| d.byte_len > 0 && d.total_tokens() > 0),
-    );
-    let disk_tokens_match_cost = MatchState::from_bool(
-        disk_summary
-            .as_ref()
-            .zip(cost_task_tokens)
-            .zip(cost_exec_tokens)
-            .is_some_and(|((d, ct), ce)| d.tokens_tuple() == ct && ct == ce),
-    );
-
-    Ok(ObservedLineage {
-        task_id: Some(task_id),
-        cost_task_id,
-        agent_matches_task,
-        agent_matches_execution,
-        agent_matches_cost,
-        execution_matches_cost,
-        model_matches_disk_and_cost,
-        disk_transcript_verified,
-        disk_tokens_match_cost,
-        duration_ms: ended_exec.and_then(|e| e.duration_ms),
-        cost_usd: cost_row.and_then(|r| r["usd"].as_f64()),
-        unpriced_tokens: cost_row
-            .and_then(|r| r["unpriced_tokens"].as_i64())
-            .unwrap_or(1),
-        has_landing_record: MatchState::from_bool(landed_tasks.contains(&task_id)),
+    Ok(RawTaskObservation {
+        expected_task_id: task_id,
+        expected_session_id: session_id.as_str().to_string(),
+        task_fact_agent_id,
+        exec_id,
+        exec_duration_ms,
+        prov_exec_agent_id,
+        started_event_agent_id: spawn_events.started_event_agent_id,
+        started_event_session_id: spawn_events.started_event_session_id,
+        native_event_agent_id: spawn_events.native_event_agent_id,
+        native_event_session_id: spawn_events.native_event_session_id,
+        native_sid: spawn_events.native_sid,
+        transcript_bytes,
+        cost_task_row,
+        cost_exec_row,
+        landed_tasks: landed_tasks.clone(),
     })
 }
 
-type LineageMutation = (&'static str, fn(&mut ObservedLineage));
+fn append_tampered_transcript_token_line(obs: &mut RawTaskObservation) {
+    let model = obs
+        .cost_exec_row
+        .as_ref()
+        .and_then(|r| r["models"].as_array())
+        .and_then(|m| m.first())
+        .and_then(|m| m["model"].as_str())
+        .unwrap_or("claude-opus-5-5");
+    let extra = format!(
+        "{{\"type\":\"assistant\",\"uuid\":\"u-tamper\",\"timestamp\":\"2026-11-28T00:00:00.000Z\",\
+          \"message\":{{\"id\":\"msg-tamper\",\"model\":\"{model}\",\
+          \"content\":[{{\"type\":\"text\",\"text\":\"tamper\"}}],\
+          \"usage\":{{\"input_tokens\":1,\"cache_creation_input_tokens\":0,\
+          \"cache_read_input_tokens\":0,\"output_tokens\":0}}}}}}\n"
+    );
+    obs.transcript_bytes.extend_from_slice(extra.as_bytes());
+}
 
-fn run_negative_attribution_falsification(valid: &ObservedLineage) -> Result<usize, String> {
-    let mutations: [LineageMutation; 10] = [
-        ("missing_agent_id", |o| {
-            o.agent_matches_task = MatchState::Mismatched;
+type RawObservationMutation = (&'static str, fn(&mut RawTaskObservation));
+
+fn run_raw_observation_falsification(valid: &RawTaskObservation) -> (usize, usize) {
+    let mutations: [RawObservationMutation; 12] = [
+        ("missing_task_fact_agent", |o| o.task_fact_agent_id = None),
+        ("execution_started_agent_mismatch", |o| {
+            o.started_event_agent_id = Some("wrong-started-agent".to_string());
         }),
-        ("agent_cost_mismatch", |o| {
-            o.agent_matches_cost = MatchState::Mismatched;
+        ("cost_exec_agent_mismatch", |o| {
+            if let Some(r) = o.cost_exec_row.as_mut() {
+                r["agent"] = json!("wrong-cost-agent");
+            }
         }),
-        ("missing_execution_id", |o| {
-            o.execution_matches_cost = MatchState::Mismatched;
+        ("execution_id_mismatch", |o| {
+            if let Some(r) = o.cost_exec_row.as_mut() {
+                r["execution"] = json!("exec-wrong");
+            }
         }),
-        ("missing_task_id", |o| o.cost_task_id = None),
-        ("missing_model_label", |o| {
-            o.model_matches_disk_and_cost = MatchState::Mismatched;
+        ("native_session_mismatch", |o| {
+            o.native_event_session_id = Some("wrong-native-session".to_string());
         }),
-        ("missing_transcript_ref", |o| {
-            o.disk_transcript_verified = MatchState::Mismatched;
+        ("missing_cost_task_id", |o| {
+            if let Some(r) = o.cost_task_row.as_mut() {
+                r["task"] = json!(null);
+            }
         }),
-        ("disk_token_mismatch", |o| {
-            o.disk_tokens_match_cost = MatchState::Mismatched;
+        ("model_label_mismatch", |o| {
+            if let Some(r) = o.cost_exec_row.as_mut()
+                && let Some(first) = r["models"].as_array_mut().and_then(|m| m.first_mut())
+            {
+                first["model"] = json!("claude-wrong-model");
+            }
         }),
-        ("missing_duration_ms", |o| o.duration_ms = Some(0)),
-        ("missing_cost_or_tokens", |o| o.unpriced_tokens = 1),
+        ("empty_transcript_bytes", |o| o.transcript_bytes.clear()),
+        (
+            "tampered_transcript_jsonl_tokens",
+            append_tampered_transcript_token_line,
+        ),
+        ("zero_duration_ms", |o| o.exec_duration_ms = Some(0)),
+        ("unpriced_tokens_nonzero", |o| {
+            if let Some(r) = o.cost_task_row.as_mut() {
+                r["unpriced_tokens"] = json!(1);
+            }
+        }),
         ("missing_landing_record", |o| {
-            o.has_landing_record = MatchState::Mismatched;
+            let _ = o.landed_tasks.remove(&o.expected_task_id);
         }),
     ];
-    for (name, mutate) in mutations {
+    let mut caught = 0_usize;
+    for (_name, mutate) in mutations {
         let mut mutated = valid.clone();
         mutate(&mut mutated);
         let mut gaps = AttributionGaps::default();
-        let _ = evaluate_observed_lineage(&mutated, &mut gaps);
-        if gaps.tasks_fully_attributed != 0 || gaps.total_field_gaps() == 0 {
-            return Err(format!(
-                "negative attribution falsification failed: mutating {name} did not cause ATTRIBUTION_COMPLETENESS to fail"
-            ));
+        let _ = evaluate_raw_task_observation(&mutated, &mut gaps);
+        if gaps.tasks_fully_attributed == 0 && gaps.total_field_gaps() > 0 {
+            caught += 1;
         }
     }
-    Ok(mutations.len())
+    (mutations.len(), caught)
 }
 
 fn run_attribution_bridge_tasks(
@@ -1784,7 +1901,6 @@ fn run_attribution_bridge_tasks(
     let mut bcfg = BridgeConfig::new("always-on-attr-bridge");
     bcfg.claude_projects = "/projects".to_string();
     bcfg.watch = Some(Arc::new(MemoryWatch::refusing()));
-    bcfg.recover_worker_leases = false;
     let mut bridge = Bridge::new(
         pg_bridge.clone(),
         pg_bridge,
@@ -1835,6 +1951,13 @@ fn run_attribution_bridge_tasks(
     Ok(tasks)
 }
 
+struct AttributionCheckSummary {
+    gaps: AttributionGaps,
+    total_work_duration_ms: i64,
+    negative_cases_total: usize,
+    negative_cases_caught: usize,
+}
+
 fn collect_attribution_gaps(
     store: &PostgresStore,
     archive: &LocalTranscriptArchive,
@@ -1842,7 +1965,7 @@ fn collect_attribution_gaps(
     landed_tasks: &BTreeSet<i64>,
     cost_tasks: &BTreeMap<i64, &Value>,
     cost_execs_by_id: &BTreeMap<String, &Value>,
-) -> Result<(AttributionGaps, i64, usize), String> {
+) -> Result<AttributionCheckSummary, String> {
     let mut gaps = AttributionGaps::default();
     let mut total_work_duration_ms = 0_i64;
     let mut sample_observed = None;
@@ -1859,17 +1982,20 @@ fn collect_attribution_gaps(
         if sample_observed.is_none() {
             sample_observed = Some(obs.clone());
         }
-        if let Some(ms) = evaluate_observed_lineage(&obs, &mut gaps) {
+        if let Some(ms) = evaluate_raw_task_observation(&obs, &mut gaps) {
             total_work_duration_ms = total_work_duration_ms.saturating_add(ms);
         }
     }
-    let neg_checked = match sample_observed.as_ref() {
-        Some(obs) => run_negative_attribution_falsification(obs)?,
-        None => {
-            return Err("no observed attribution task to run negative falsification".to_string());
-        }
+    let Some(sample) = sample_observed.as_ref() else {
+        return Err("no observed attribution task to run negative falsification".to_string());
     };
-    Ok((gaps, total_work_duration_ms, neg_checked))
+    let (negative_cases_total, negative_cases_caught) = run_raw_observation_falsification(sample);
+    Ok(AttributionCheckSummary {
+        gaps,
+        total_work_duration_ms,
+        negative_cases_total,
+        negative_cases_caught,
+    })
 }
 
 fn verify_attribution_completeness(
@@ -1921,7 +2047,7 @@ fn verify_attribution_completeness(
         .filter_map(|row| row["task"].as_i64().map(|id| (id, row)))
         .collect();
 
-    let (gaps, total_work_duration_ms, neg_checked) = collect_attribution_gaps(
+    let summary = collect_attribution_gaps(
         store,
         archive,
         &tasks,
@@ -1929,6 +2055,7 @@ fn verify_attribution_completeness(
         &cost_tasks,
         &cost_execs_by_id,
     )?;
+    let gaps = summary.gaps;
 
     let total_tasks = tasks.len();
     let total_field_gaps = gaps.total_field_gaps();
@@ -1951,15 +2078,15 @@ fn verify_attribution_completeness(
         "attribution_gaps": total_field_gaps,
         "completeness_pct": completeness_pct,
         "recorded_usage_messages": recorded_msgs,
-        "total_work_duration_ms": total_work_duration_ms,
+        "total_work_duration_ms": summary.total_work_duration_ms,
         "total_tokens": total_tokens,
         "total_cost_usd": cost["total"]["usd"].as_f64().unwrap_or(0.0),
         "unpriced_tokens": cost["total"]["unpriced_tokens"].as_i64().unwrap_or(0),
-        "negative_falsification_passed": true,
-        "negative_cases_checked": neg_checked,
+        "negative_cases_total": summary.negative_cases_total,
+        "negative_cases_caught": summary.negative_cases_caught,
         "field_sources": {
-            "agent_id": "mission_tasks(prov_task_facts) == spawn_events(prov_execution_agents) == cost_window.executions[].agent",
-            "execution_id": "bridge_executions(executions) == spawn_events(NativeSessionStarted) == cost_window.executions[].execution",
+            "agent_id": "mission_tasks(prov_task_facts) == spawn_events(prov_execution_agents & ExecutionStarted & NativeSessionStarted) == cost_window.executions[].agent",
+            "execution_id": "bridge_executions(executions) == spawn_events(ExecutionStarted & NativeSessionStarted session) == cost_window.executions[].execution",
             "task_id": "mission_tasks(prov_task_facts) == cost_window.tasks[].task == cost_window.executions[].task",
             "model_label": "LocalTranscriptArchive(ingest::claude_usage) == cost_window.executions[].models[].model",
             "transcript_ref": "spawn_events(NativeSessionStarted) -> LocalTranscriptArchive on-disk bytes + token parity",
@@ -2201,35 +2328,81 @@ mod tests {
     }
 
     #[test]
+    fn xmin_holdback_summary_counts_verified_and_leaks_without_hardcoding() {
+        let clean = summarize_xmin_holdback_outcomes(&[
+            HoldbackProbeOutcome::HeldBackAndReleased,
+            HoldbackProbeOutcome::HeldBackAndReleased,
+        ]);
+        assert_eq!(
+            clean,
+            XminHoldbackSummary {
+                attempted: 2,
+                verified: 2,
+                premature_leaks: 0,
+            }
+        );
+        let leaked = summarize_xmin_holdback_outcomes(&[
+            HoldbackProbeOutcome::HeldBackAndReleased,
+            HoldbackProbeOutcome::LeakedAheadOfXmin(3),
+        ]);
+        assert_eq!(
+            leaked,
+            XminHoldbackSummary {
+                attempted: 2,
+                verified: 1,
+                premature_leaks: 3,
+            }
+        );
+    }
+
+    #[test]
     fn attribution_negative_falsification_catches_all_eight_gaps() {
-        let valid = ObservedLineage {
-            task_id: Some(42),
-            cost_task_id: Some(42),
-            agent_matches_task: MatchState::Matched,
-            agent_matches_execution: MatchState::Matched,
-            agent_matches_cost: MatchState::Matched,
-            execution_matches_cost: MatchState::Matched,
-            model_matches_disk_and_cost: MatchState::Matched,
-            disk_transcript_verified: MatchState::Matched,
-            disk_tokens_match_cost: MatchState::Matched,
-            duration_ms: Some(12),
-            cost_usd: Some(0.05),
-            unpriced_tokens: 0,
-            has_landing_record: MatchState::Matched,
+        let transcript_bytes = br#"{"type":"assistant","uuid":"u-1","timestamp":"2026-11-28T00:00:00.000Z","message":{"id":"msg-1","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":4000,"cache_creation_input_tokens":2000,"cache_read_input_tokens":8000,"output_tokens":1200}}}
+"#
+        .to_vec();
+        let valid = RawTaskObservation {
+            expected_task_id: 42,
+            expected_session_id: "session_worker_attr000_42".to_string(),
+            task_fact_agent_id: Some("agent_worker_attr000_42".to_string()),
+            exec_id: Some("exec-42".to_string()),
+            exec_duration_ms: Some(12),
+            prov_exec_agent_id: Some("agent_worker_attr000_42".to_string()),
+            started_event_agent_id: Some("agent_worker_attr000_42".to_string()),
+            started_event_session_id: Some("session_worker_attr000_42".to_string()),
+            native_event_agent_id: Some("agent_worker_attr000_42".to_string()),
+            native_event_session_id: Some("session_worker_attr000_42".to_string()),
+            native_sid: Some("native-42".to_string()),
+            transcript_bytes,
+            cost_task_row: Some(json!({
+                "task": 42,
+                "usd": 0.05,
+                "unpriced_tokens": 0,
+                "tokens": {"input": 4000, "output": 1200, "cache_write": 2000, "cache_read": 8000}
+            })),
+            cost_exec_row: Some(json!({
+                "execution": "exec-42",
+                "agent": "agent_worker_attr000_42",
+                "task": 42,
+                "models": [{"model": "claude-opus-5-5"}],
+                "tokens": {"input": 4000, "output": 1200, "cache_write": 2000, "cache_read": 8000}
+            })),
+            landed_tasks: BTreeSet::from([42]),
         };
         let mut baseline_gaps = AttributionGaps::default();
         assert_eq!(
-            evaluate_observed_lineage(&valid, &mut baseline_gaps),
+            evaluate_raw_task_observation(&valid, &mut baseline_gaps),
             Some(12)
         );
         assert_eq!(baseline_gaps.tasks_fully_attributed, 1);
         assert_eq!(baseline_gaps.total_field_gaps(), 0);
-        assert_eq!(run_negative_attribution_falsification(&valid), Ok(10));
+        assert_eq!(run_raw_observation_falsification(&valid), (12, 12));
 
         let mut zero_usd = valid;
-        zero_usd.cost_usd = Some(0.0);
+        if let Some(r) = zero_usd.cost_task_row.as_mut() {
+            r["usd"] = json!(0.0);
+        }
         let mut zero_gaps = AttributionGaps::default();
-        let _ = evaluate_observed_lineage(&zero_usd, &mut zero_gaps);
+        let _ = evaluate_raw_task_observation(&zero_usd, &mut zero_gaps);
         assert_eq!(zero_gaps.tasks_fully_attributed, 0);
         assert_eq!(zero_gaps.missing_cost_or_tokens, 1);
     }

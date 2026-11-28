@@ -2048,7 +2048,244 @@ fn verify_manifest_refs_and_acks(
     })
 }
 
-fn internal_crash_verify_main(manifest_path: &Path) -> Result<Value, String> {
+struct PreTornJournalState {
+    entries_before: usize,
+    pre_max_journal_seq: u64,
+    pre_reconcile_last_journal_seq: u64,
+    pg_seq_pre: u64,
+}
+
+struct PostTornCommitReport {
+    branch: String,
+    post_commit_snapshot: String,
+    entries_before: usize,
+    entries_after: usize,
+    torn_tail_healed_on_disk: bool,
+    committed_new_entry: bool,
+    pg_seq_post: u64,
+    reconcile_post_entries_considered: usize,
+    reconcile_post_entries_replayed: usize,
+    reconcile_post_already_applied: usize,
+    reconcile_post_last_journal_seq: u64,
+    reconcile_post_last_ledger_seq: u64,
+    reconcile_converged_entries_considered: usize,
+    post_torn_commit_reconciled: bool,
+}
+
+fn commit_post_torn_healing_change(
+    fresh_ws: &D6Workspace<PgRefLedger>,
+    branch_name: &str,
+) -> Result<String, String> {
+    let branch = BranchName::new(branch_name.to_string()).map_err(|e| e.to_string())?;
+    let ws = fresh_ws
+        .mount(&branch)
+        .map_err(|e| format!("post-torn mount {branch_name}: {e}"))?;
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let target = Path::new(ws.path()).join(format!("crash/post_torn_heal_{pid}_{nanos:x}.dat"));
+    let commit_result = (|| -> Result<String, String> {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("post-torn create_dir_all: {e}"))?;
+        }
+        let seed = 0x504F_5354_544F_524E_u64
+            ^ u64::from(pid)
+            ^ u64::try_from(nanos & 0xFFFF_FFFF).unwrap_or(0);
+        let payload = fill_mixed_payload(
+            seed,
+            &format!("// post-torn heal commit pid={pid} nanos={nanos}\n"),
+            4096,
+        );
+        fs::write(&target, payload)
+            .map_err(|e| format!("post-torn write {}: {e}", target.display()))?;
+        match fresh_ws
+            .commit(&ws, &format!("post-torn heal commit pid={pid}"))
+            .map_err(|e| format!("post-torn D6Workspace::commit: {e}"))?
+        {
+            Commit::Created(_) | Commit::Recreated { .. } => {
+                let live = fresh_ws
+                    .branch_snapshot(branch_name)
+                    .map_err(|e| format!("post-torn branch_snapshot: {e}"))?
+                    .ok_or_else(|| format!("post-torn missing snapshot for {branch_name}"))?;
+                Ok(live.id.to_string())
+            }
+            Commit::Unchanged => Err(
+                "post-torn D6Workspace::commit unexpectedly returned Commit::Unchanged".to_string(),
+            ),
+        }
+    })();
+    let _ = fresh_ws.unmount(&ws);
+    commit_result
+}
+
+fn execute_post_torn_commit_and_reconcile(
+    fresh_cas: &CasMerkleStore,
+    fresh_ledger: &PgRefLedger,
+    fresh_ws: &D6Workspace<PgRefLedger>,
+    manifest: &CrashManifest,
+    pre: &PreTornJournalState,
+) -> Result<PostTornCommitReport, String> {
+    let branch_name = manifest
+        .expected_crash_branches
+        .first()
+        .map(|(branch, _)| branch.clone())
+        .ok_or_else(|| "crash manifest missing crash branch for post-torn commit".to_string())?;
+    let post_commit_snapshot = commit_post_torn_healing_change(fresh_ws, &branch_name)?;
+
+    let raw_after = fs::read(fresh_cas.cas().refs_journal_path())
+        .map_err(|e| format!("read post-torn refs.journal: {e}"))?;
+    let torn_tail_healed_on_disk = raw_after.ends_with(b"\n")
+        && !raw_after.ends_with(TORN_JOURNAL_TAIL)
+        && !raw_after
+            .windows(TORN_JOURNAL_TAIL.len())
+            .any(|w| w == TORN_JOURNAL_TAIL);
+
+    let journal_after = fresh_cas
+        .cas()
+        .read_ref_journal()
+        .map_err(|e| format!("post-torn read_ref_journal: {e}"))?;
+    let entries_after = journal_after.len();
+    let post_max_journal_seq = journal_after.last().map_or(0, |e| e.seq);
+    let committed_new_entry = entries_after == pre.entries_before.saturating_add(1)
+        && post_max_journal_seq > pre.pre_max_journal_seq;
+
+    let reconcile_post = reconcile_refs_journal(
+        fresh_cas,
+        fresh_ledger,
+        pre.pg_seq_pre,
+        "bench:crash-verify-post-torn",
+    )
+    .map_err(|e| format!("post-torn reconcile_refs_journal(pg_seq_pre): {e}"))?;
+
+    let pg_seq_post = fresh_ledger
+        .pg
+        .latest_ref_log_seq()
+        .map_err(|e| format!("post-torn latest_ref_log_seq: {e}"))?;
+    let reconcile_converged = reconcile_refs_journal(
+        fresh_cas,
+        fresh_ledger,
+        pg_seq_post,
+        "bench:crash-verify-converged",
+    )
+    .map_err(|e| format!("post-torn reconcile_refs_journal(pg_seq_post): {e}"))?;
+
+    let post_torn_commit_reconciled = reconcile_post.entries_considered >= 1
+        && reconcile_post.already_applied >= 1
+        && reconcile_post.entries_replayed == 0
+        && reconcile_post.last_journal_seq > pre.pre_reconcile_last_journal_seq
+        && reconcile_post.last_journal_seq == post_max_journal_seq
+        && reconcile_converged.entries_considered == 0
+        && reconcile_converged.last_journal_seq == post_max_journal_seq
+        && reconcile_converged.last_ledger_seq == pg_seq_post;
+
+    Ok(PostTornCommitReport {
+        branch: branch_name,
+        post_commit_snapshot,
+        entries_before: pre.entries_before,
+        entries_after,
+        torn_tail_healed_on_disk,
+        committed_new_entry,
+        pg_seq_post,
+        reconcile_post_entries_considered: reconcile_post.entries_considered,
+        reconcile_post_entries_replayed: reconcile_post.entries_replayed,
+        reconcile_post_already_applied: reconcile_post.already_applied,
+        reconcile_post_last_journal_seq: reconcile_post.last_journal_seq,
+        reconcile_post_last_ledger_seq: reconcile_post.last_ledger_seq,
+        reconcile_converged_entries_considered: reconcile_converged.entries_considered,
+        post_torn_commit_reconciled,
+    })
+}
+
+fn prepare_torn_journal_for_verify(
+    jpath: &Path,
+    manifest: &CrashManifest,
+    inject_torn: bool,
+) -> Result<bool, String> {
+    if inject_torn {
+        let raw_pre_inject = fs::read(jpath)
+            .map_err(|e| format!("verifier read refs.journal before re-inject: {e}"))?;
+        if !raw_pre_inject.ends_with(b"\n") || raw_pre_inject.ends_with(TORN_JOURNAL_TAIL) {
+            return Err(
+                "expected healed \\n-terminated refs.journal before --inject-torn-tail".to_string(),
+            );
+        }
+        let _ = inject_torn_journal_tail(jpath)?;
+    }
+    let raw_journal =
+        fs::read(jpath).map_err(|e| format!("verifier read raw refs.journal: {e}"))?;
+    Ok(manifest.torn_tail_bytes > 0 && raw_journal.ends_with(TORN_JOURNAL_TAIL))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CrashVerifyMode {
+    FreshKill,
+    ReInjectTornTail,
+}
+
+impl CrashVerifyMode {
+    fn is_reinject(self) -> bool {
+        self == Self::ReInjectTornTail
+    }
+}
+
+struct CrashVerifyJsonInput<'a> {
+    manifest: &'a CrashManifest,
+    refs_check: &'a ManifestRefsCheck,
+    post_torn: &'a PostTornCommitReport,
+    mode: CrashVerifyMode,
+    torn_tail_present_before_commit: bool,
+    torn_tail_healed_and_committed: bool,
+    pg_latest_ref_seq: u64,
+    reconcile_pre_entries_considered: usize,
+    reconcile_pre_last_journal_seq: u64,
+    reconcile_pre_last_ledger_seq: u64,
+    blobs_verified: usize,
+    lost_commits: usize,
+    corrupt_objects: usize,
+    recovery_ms: f64,
+    verified: bool,
+}
+
+fn build_crash_verify_json(input: &CrashVerifyJsonInput<'_>) -> Value {
+    let branches_verified =
+        input.manifest.expected_branches.len() + input.manifest.expected_crash_branches.len();
+    json!({
+        "verified": input.verified,
+        "verifier_pid": std::process::id(),
+        "inject_torn_tail": input.mode.is_reinject(),
+        "branches_verified": branches_verified,
+        "refs_verified": branches_verified + 1,
+        "snapshots_verified": input.refs_check.snapshots.len(),
+        "blobs_verified": input.blobs_verified,
+        "acknowledged_recovered": input.refs_check.acknowledged_recovered,
+        "journal_entries_before_commit": input.post_torn.entries_before,
+        "journal_entries_after_commit": input.post_torn.entries_after,
+        "torn_tail_present_before_commit": input.torn_tail_present_before_commit,
+        "torn_tail_healed_on_disk": input.post_torn.torn_tail_healed_on_disk,
+        "torn_tail_healed_and_committed": input.torn_tail_healed_and_committed,
+        "post_torn_commit_reconciled": input.post_torn.post_torn_commit_reconciled,
+        "post_torn_commit_branch": input.post_torn.branch,
+        "post_torn_commit_snapshot": input.post_torn.post_commit_snapshot,
+        "pg_latest_ref_seq_before_commit": input.pg_latest_ref_seq,
+        "pg_latest_ref_seq_after_commit": input.post_torn.pg_seq_post,
+        "reconcile_pre_entries_considered": input.reconcile_pre_entries_considered,
+        "reconcile_pre_last_journal_seq": input.reconcile_pre_last_journal_seq,
+        "reconcile_pre_last_ledger_seq": input.reconcile_pre_last_ledger_seq,
+        "reconcile_post_entries_considered": input.post_torn.reconcile_post_entries_considered,
+        "reconcile_post_entries_replayed": input.post_torn.reconcile_post_entries_replayed,
+        "reconcile_post_already_applied": input.post_torn.reconcile_post_already_applied,
+        "reconcile_post_last_journal_seq": input.post_torn.reconcile_post_last_journal_seq,
+        "reconcile_post_last_ledger_seq": input.post_torn.reconcile_post_last_ledger_seq,
+        "reconcile_converged_entries_considered": input.post_torn.reconcile_converged_entries_considered,
+        "lost_commits": input.lost_commits,
+        "lost_refs": input.refs_check.lost_refs,
+        "corrupt_objects": input.corrupt_objects,
+        "recovery_ms": input.recovery_ms,
+    })
+}
+
+fn internal_crash_verify_main(manifest_path: &Path, inject_torn: bool) -> Result<Value, String> {
     let url = env::var("SPAWN_BENCH_DATABASE_URL")
         .map_err(|_| "SPAWN_BENCH_DATABASE_URL required for internal crash verify".to_string())?;
     let raw = fs::read_to_string(manifest_path)
@@ -2066,13 +2303,14 @@ fn internal_crash_verify_main(manifest_path: &Path) -> Result<Value, String> {
         &manifest.disk_root,
         fresh_cas.clone(),
         fresh_ledger.clone(),
-    );
+    )
+    .with_max_file_bytes(u64::MAX);
 
-    let raw_journal = fs::read(fresh_cas.cas().refs_journal_path())
-        .map_err(|e| format!("verifier read raw refs.journal: {e}"))?;
-    let torn_tail_present =
-        manifest.torn_tail_bytes > 0 && raw_journal.ends_with(TORN_JOURNAL_TAIL);
-
+    let torn_tail_present_before_commit = prepare_torn_journal_for_verify(
+        &fresh_cas.cas().refs_journal_path(),
+        &manifest,
+        inject_torn,
+    )?;
     let journal = fresh_cas
         .cas()
         .read_ref_journal()
@@ -2081,61 +2319,76 @@ fn internal_crash_verify_main(manifest_path: &Path) -> Result<Value, String> {
         .pg
         .latest_ref_log_seq()
         .map_err(|e| format!("verifier latest_ref_log_seq: {e}"))?;
-    let reconcile = reconcile_refs_journal(
+    let reconcile_pre = reconcile_refs_journal(
         &fresh_cas,
         fresh_ledger.as_ref(),
         pg_latest_ref_seq,
-        "bench:crash-verify",
+        "bench:crash-verify-pre",
     )
     .map_err(|e| format!("verifier reconcile_refs_journal: {e}"))?;
 
     let min_expected_journal = manifest
         .min_journal_entries
         .max(manifest.acked_snapshots.len());
-    let torn_journal_line_recovered = torn_tail_present
+    let torn_tolerated_before_commit = torn_tail_present_before_commit
         && journal.len() >= min_expected_journal
-        && reconcile.last_journal_seq > 0
-        && reconcile.last_ledger_seq >= pg_latest_ref_seq;
+        && reconcile_pre.last_journal_seq > 0
+        && reconcile_pre.last_ledger_seq >= pg_latest_ref_seq;
 
     let refs_check = verify_manifest_refs_and_acks(
         &fresh_cas,
         &fresh_ledger,
         &fresh_ws,
         &manifest,
-        usize::from(!torn_journal_line_recovered),
+        usize::from(!torn_tolerated_before_commit),
     )?;
     let (lost_commits, corrupt_objects, blobs_verified) =
         verify_reopened_objects(&fresh_cas, &refs_check.snapshots);
     let lost_commits = lost_commits.saturating_add(refs_check.missing_pg_ack);
-    let recovery_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let post_torn = execute_post_torn_commit_and_reconcile(
+        &fresh_cas,
+        &fresh_ledger,
+        &fresh_ws,
+        &manifest,
+        &PreTornJournalState {
+            entries_before: journal.len(),
+            pre_max_journal_seq: journal.last().map_or(0, |e| e.seq),
+            pre_reconcile_last_journal_seq: reconcile_pre.last_journal_seq,
+            pg_seq_pre: pg_latest_ref_seq,
+        },
+    )?;
+
+    let torn_tail_healed_and_committed = torn_tolerated_before_commit
+        && post_torn.torn_tail_healed_on_disk
+        && post_torn.committed_new_entry;
     let verified = refs_check.lost_refs == 0
         && lost_commits == 0
         && corrupt_objects == 0
         && refs_check.acknowledged_recovered == manifest.acked_snapshots.len()
-        && torn_journal_line_recovered;
+        && torn_tail_healed_and_committed
+        && post_torn.post_torn_commit_reconciled;
 
-    Ok(json!({
-        "verified": verified,
-        "verifier_pid": std::process::id(),
-        "branches_verified": manifest.expected_branches.len() + manifest.expected_crash_branches.len(),
-        "refs_verified": manifest.expected_branches.len() + manifest.expected_crash_branches.len() + 1,
-        "snapshots_verified": refs_check.snapshots.len(),
-        "blobs_verified": blobs_verified,
-        "acknowledged_recovered": refs_check.acknowledged_recovered,
-        "journal_entries": journal.len(),
-        "journal_entries_after_torn_heal": journal.len(),
-        "torn_tail_present": torn_tail_present,
-        "torn_journal_line_recovered": torn_journal_line_recovered,
-        "pg_latest_ref_seq": pg_latest_ref_seq,
-        "reconcile_entries_considered": reconcile.entries_considered,
-        "reconcile_entries_replayed": reconcile.entries_replayed,
-        "reconcile_already_applied": reconcile.already_applied,
-        "reconcile_last_journal_seq": reconcile.last_journal_seq,
-        "reconcile_last_ledger_seq": reconcile.last_ledger_seq,
-        "lost_commits": lost_commits,
-        "lost_refs": refs_check.lost_refs,
-        "corrupt_objects": corrupt_objects,
-        "recovery_ms": recovery_ms,
+    Ok(build_crash_verify_json(&CrashVerifyJsonInput {
+        manifest: &manifest,
+        refs_check: &refs_check,
+        post_torn: &post_torn,
+        mode: if inject_torn {
+            CrashVerifyMode::ReInjectTornTail
+        } else {
+            CrashVerifyMode::FreshKill
+        },
+        torn_tail_present_before_commit,
+        torn_tail_healed_and_committed,
+        pg_latest_ref_seq,
+        reconcile_pre_entries_considered: reconcile_pre.entries_considered,
+        reconcile_pre_last_journal_seq: reconcile_pre.last_journal_seq,
+        reconcile_pre_last_ledger_seq: reconcile_pre.last_ledger_seq,
+        blobs_verified,
+        lost_commits,
+        corrupt_objects,
+        recovery_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        verified,
     }))
 }
 
@@ -3904,11 +4157,17 @@ fn main() {
             return;
         }
         Some("--internal-crash-verify") => {
-            let Some(path) = raw_args.next() else {
+            let mut inject_torn = false;
+            let mut manifest_arg = raw_args.next();
+            if manifest_arg.as_deref() == Some("--inject-torn-tail") {
+                inject_torn = true;
+                manifest_arg = raw_args.next();
+            }
+            let Some(path) = manifest_arg else {
                 eprintln!("--internal-crash-verify requires a manifest path");
                 std::process::exit(2);
             };
-            match internal_crash_verify_main(Path::new(&path)) {
+            match internal_crash_verify_main(Path::new(&path), inject_torn) {
                 Ok(report) => {
                     println!(
                         "{}",
@@ -4095,6 +4354,71 @@ mod tests {
         );
         let raw_after = fs::read(&jpath).expect("reread torn journal without truncation");
         assert!(raw_after.ends_with(TORN_JOURNAL_TAIL));
+
+        // Now execute a production publish_snapshot after the torn tail: PR #276 must heal
+        // the unterminated trailing fragment on disk under flock before appending seq=4.
+        let (blob4, blob4_len) = cas
+            .put_bytes_blob(b"branch-payload-4-after-torn")
+            .expect("put blob 4");
+        let tree4 = cas
+            .apply_mutations(
+                &empty_tree,
+                &[spawn_cas::TreeMutation::Upsert {
+                    path: vec![b"file_4.txt".to_vec()],
+                    kind: spawn_cas::TreeEntryKind::File,
+                    id: blob4.as_bytes(),
+                    size: blob4_len,
+                }],
+            )
+            .expect("apply tree 4");
+        let pub4 = cas
+            .publish_snapshot(
+                &writer_ledger,
+                &PublishRequest {
+                    project: "proj-bench",
+                    ref_name: "b4",
+                    kind: D6RefKind::Branch,
+                    expected_ref: None,
+                    tree: &tree4,
+                    parents: &[],
+                    commit_body: &body,
+                    created_at_ms: 1_700_000_000_004,
+                    reason: "unit-test-heal",
+                    landing_task_id: None,
+                },
+            )
+            .expect("publish snapshot 4 over torn tail");
+        assert!(!pub4.snapshot.hex().is_empty());
+
+        let raw_healed = fs::read(&jpath).expect("reread healed refs.journal");
+        assert!(raw_healed.ends_with(b"\n"));
+        assert!(!raw_healed.ends_with(TORN_JOURNAL_TAIL));
+        assert!(
+            !raw_healed
+                .windows(TORN_JOURNAL_TAIL.len())
+                .any(|w| w == TORN_JOURNAL_TAIL)
+        );
+
+        let healed_entries = cas
+            .cas()
+            .read_ref_journal()
+            .expect("read_ref_journal after heal");
+        assert_eq!(healed_entries.len(), 4);
+        assert_eq!(healed_entries.last().map(|e| e.seq), Some(4));
+
+        let report_post =
+            reconcile_refs_journal(&cas, &lagging_ledger, 3, "unit-test:reconcile-post-heal")
+                .expect("reconcile_refs_journal after heal");
+        assert_eq!(report_post.entries_considered, 1);
+        assert_eq!(report_post.entries_replayed, 1);
+        assert_eq!(report_post.last_journal_seq, 4);
+        assert_eq!(
+            lagging_ledger
+                .list_refs(Some("proj-bench"))
+                .expect("list lagging refs after heal")
+                .len(),
+            4
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
