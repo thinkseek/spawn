@@ -58,11 +58,11 @@ with h as materialized (
    where i.at_ms < $1)
 select jsonb_build_object(
   -- The newest event of the log in this statement's snapshot (MARK): the
-  -- boundary a later kept reading checks is still there (`spawn_events_pkey`
-  -- read backward, one row).
+  -- boundary a later kept reading checks is still there (reverse scan on
+  -- `spawn_events_commit_xid_id`, one row).
   'mark', (select jsonb_build_object('id', m.id, 'at', m.recorded_at_ms,
                                      'session', m.session_id, 'seq', m.session_seq)
-             from spawn_events m order by m.id desc limit 1),
+             from spawn_events m order by m.commit_xid desc, m.id desc limit 1),
   -- Each record's small object is built first and only then sorted and
   -- aggregated: sorted with its record (a gate's log, a brief) the rows
   -- spilled 28 MB to disk on every reading (the lead's plan on the live
@@ -249,17 +249,18 @@ const FULL_EVERY_MS: i64 = 3_600_000;
 /// A46): the one boundary of both kept maps.
 ///
 /// Every write the facts read commits with an event of the log, in the same
-/// transaction, under the append lock that hands out event ids
-/// (`pg_advisory_xact_lock(1399957335)` held to commit): a control record
-/// is its `control.recorded` event, a command's creation commits with
-/// `command.accepted` (`spawn_submit`) and its finish with
-/// `command.finished` (`spawn_finish`). So events commit in id order, and a
-/// restore in place to any earlier point of the log (a point-in-time
-/// restore, a dump of an earlier moment loaded under the same name) that
-/// takes away anything a kept reading saw (a control record, a command, a
-/// finish) takes away that reading's newest event too: the next kept
-/// reading finds its mark gone or another event under its id, drops the
-/// kept facts and reads them whole.
+/// transaction, with `commit_xid = pg_current_xact_id()` and its session's L3
+/// append lock (`pg_advisory_xact_lock(1399957401, hashtext(p_session))`, plus
+/// L2 `'session_control'` serialization for control writes): a control record
+/// is its `control.recorded` event (`session_control`), a command's creation
+/// commits with `command.accepted` (`spawn_submit`) and its finish with
+/// `command.finished` (`spawn_finish`). Reading `mark` in the same snapshot
+/// ordered by `(commit_xid, id) desc` guarantees a restore in place to any
+/// earlier point of the log (a point-in-time restore, a dump of an earlier
+/// moment loaded under the same name) that takes away anything a kept
+/// reading saw (a control record, a command, a finish) takes away that
+/// reading's mark too: the next kept reading finds its mark gone or another
+/// event under its id, drops the kept facts and reads them whole.
 ///
 /// It cannot notice, and needs not: a restore to a point after the mark
 /// (it takes away nothing kept). It does not notice: a change made around
@@ -271,8 +272,9 @@ const FULL_EVERY_MS: i64 = 3_600_000;
 ///
 /// What it rests on, for whoever adds a writer: a new write of anything the
 /// facts read (a control record, a command, its finish, a person's intent)
-/// must append its event in the same transaction under that lock, the
-/// append lock `pg_advisory_xact_lock(1399957335)` that `spawn_append`,
+/// must append its event in the same transaction under that session's L3
+/// append lock `pg_advisory_xact_lock(1399957401, hashtext(p_session))` and
+/// write `commit_xid = pg_current_xact_id()` that `spawn_append`,
 /// `spawn_append_trusted` and `spawn_submit` take. A writer outside it can
 /// commit an event below one already seen, and a restore that takes that
 /// write away would leave the mark in place: its kept fact would stay until

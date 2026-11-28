@@ -104,6 +104,139 @@ macro_rules! lost_before_ready {
     };
 }
 
+/// Maximum number of retries if an in-flight transaction in `pg_snapshot_xip`
+/// commits mid-statement before its `pg_locks` entry is inspected. On the final
+/// attempt the watermark fails closed to `pg_snapshot_xmin(snap.s)`.
+pub(crate) const WATERMARK_RACE_ATTEMPTS: usize = 5;
+
+/// Fail-closed schema-scoped `xid8` commit watermark CTE (`snap`, `xip`, `wm`):
+/// - Fast path (`xmin = xmax`, empty `xip`): returns `pg_snapshot_xmax(s)` with
+///   `wm_raced = false` and zero `pg_locks` scans.
+/// - Active path (`xmin < xmax`): maps each active top-level `x` in
+///   `pg_snapshot_xip(s)` to its `pg_locks` `virtualtransaction` (using 32-bit
+///   epoch wraparound-safe match on `transactionid`).
+///   - If any `xip` transaction already exited (`vtx is null`), sets
+///     `wm_raced = true` and fails closed to `pg_snapshot_xmin(s)` so callers
+///     retry or stay safe on the final attempt.
+///   - Otherwise holds back every `x` unless ALL three conditions hold:
+///     1. `vtx` holds zero non-`AccessShareLock` relation locks in `snap.ns_oid`;
+///     2. `vtx` holds zero `L0` (`1399957400`) advisory locks on `snap.ns_oid`;
+///     3. `vtx` holds >= 1 granted positive outside proof: cross-DB non-shared
+///        relation lock, same-DB committed user-schema relation lock (excluding
+///        `pg_catalog`, `information_schema`, `pg_temp_*`, `pg_toast_temp_*`),
+///        or same-DB other-schema exclusive `L0` migration lock.
+///
+/// Uncommitted relations (`c.oid is null`) and `pg_catalog` locks never count
+/// as outside proof (fail-closed for `CREATE TEMP TABLE`, `CREATE TABLE` in
+/// this schema, bare `pg_current_xact_id()`, and lockless transactions).
+///
+/// Single-schema writer invariant: Spawn writers never mix writes to another
+/// user schema's committed table with `spawn_append` in the same transaction
+/// (every SQL entrypoint pins `search_path = %I, pg_temp`, and production runs
+/// a single schema).
+macro_rules! commit_watermark_cte {
+    () => {
+        "snap as materialized (
+                    select pg_current_snapshot() as s,
+                           (select oid from pg_database where datname = current_database()) as db_oid,
+                           (select relnamespace from pg_class where oid = 'spawn_events'::regclass) as ns_oid
+                 ), locks as materialized (
+                    select l.locktype, l.mode, l.granted, l.database, l.relation,
+                           l.classid, l.objid, l.objsubid, l.transactionid, l.virtualtransaction
+                      from snap, pg_locks l
+                     where pg_snapshot_xmin(snap.s) < pg_snapshot_xmax(snap.s)
+                       and (
+                           (l.locktype = 'transactionid' and l.mode = 'ExclusiveLock' and l.granted)
+                           or (l.locktype = 'relation' and l.mode <> 'AccessShareLock')
+                           or (l.locktype = 'advisory'
+                               and l.database = snap.db_oid
+                               and l.classid = 1399957400::oid
+                               and l.objsubid = 2)
+                       )
+                 ), xip as materialized (
+                    select x,
+                           (select tl.virtualtransaction
+                              from locks tl
+                             where tl.locktype = 'transactionid'
+                               and tl.transactionid = ((x::text::numeric % 4294967296)::bigint::text)::xid
+                             limit 1) as vtx
+                      from snap,
+                           lateral pg_snapshot_xip(snap.s) as x
+                     where pg_snapshot_xmin(snap.s) < pg_snapshot_xmax(snap.s)
+                 ), wm as materialized (
+                    select
+                        case
+                            when pg_snapshot_xmin(snap.s) = pg_snapshot_xmax(snap.s) then pg_snapshot_xmax(snap.s)
+                            else coalesce(
+                                (select min(xip.x)
+                                   from xip, snap
+                                  where xip.vtx is null
+                                     or exists (
+                                            select 1
+                                              from locks rl
+                                              join pg_class c on c.oid = rl.relation
+                                             where rl.virtualtransaction = xip.vtx
+                                               and rl.locktype = 'relation'
+                                               and rl.database = snap.db_oid
+                                               and c.relnamespace = snap.ns_oid
+                                        )
+                                     or exists (
+                                            select 1
+                                              from locks al
+                                             where al.virtualtransaction = xip.vtx
+                                               and al.locktype = 'advisory'
+                                               and al.database = snap.db_oid
+                                               and al.classid = 1399957400::oid
+                                               and al.objsubid = 2
+                                               and al.objid = snap.ns_oid
+                                        )
+                                     or not exists (
+                                            select 1
+                                              from locks rl
+                                              left join pg_class c
+                                                on rl.locktype = 'relation'
+                                               and rl.database = snap.db_oid
+                                               and c.oid = rl.relation
+                                              left join pg_namespace n
+                                                on n.oid = c.relnamespace
+                                             where rl.virtualtransaction = xip.vtx
+                                               and rl.granted
+                                               and (
+                                                   (
+                                                       rl.locktype = 'relation'
+                                                       and rl.database is not null
+                                                       and rl.database <> 0::oid
+                                                       and rl.database <> snap.db_oid
+                                                   )
+                                                   or (
+                                                       rl.locktype = 'relation'
+                                                       and rl.database = snap.db_oid
+                                                       and c.oid is not null
+                                                       and c.relnamespace <> snap.ns_oid
+                                                       and n.nspname not in ('pg_catalog', 'information_schema')
+                                                       and left(n.nspname, 8) <> 'pg_temp_'
+                                                       and left(n.nspname, 14) <> 'pg_toast_temp_'
+                                                   )
+                                                   or (
+                                                       rl.locktype = 'advisory'
+                                                       and rl.database = snap.db_oid
+                                                       and rl.classid = 1399957400::oid
+                                                       and rl.objsubid = 2
+                                                       and rl.objid <> snap.ns_oid
+                                                       and rl.mode = 'ExclusiveLock'
+                                                   )
+                                               )
+                                        )),
+                                pg_snapshot_xmax(snap.s)
+                            )
+                        end as safe_xid,
+                        (pg_snapshot_xmin(snap.s) < pg_snapshot_xmax(snap.s)
+                         and exists (select 1 from xip where vtx is null)) as wm_raced
+                      from snap
+                 )"
+    };
+}
+
 mod acks;
 mod activity;
 mod alerts;
@@ -900,14 +1033,26 @@ pub fn made_schema_sql(schema: &str) -> String {
              perform set_config('application_name', '{schema}', false); \
            end if; \
          end $named$; \
-         do $made$ begin \
-           if not exists (select 1 from pg_namespace where nspname = '{schema}') then \
-             create schema {schema}; \
-             execute format('comment on schema {schema} is %L', \
-               jsonb_build_object('made_at_ms', \
-                 floor(extract(epoch from clock_timestamp()) * 1000)::bigint)::text); \
-           end if; \
-         exception when duplicate_schema then null; \
+         do $made$ \
+         declare \
+           v_ns_oid bigint; \
+           v_ns_key integer; \
+         begin \
+           begin \
+             if not exists (select 1 from pg_namespace where nspname = '{schema}') then \
+               create schema {schema}; \
+               v_ns_oid := (quote_ident('{schema}')::regnamespace)::oid::bigint; \
+               v_ns_key := (v_ns_oid - case when v_ns_oid >= 2147483648 then 4294967296 else 0 end)::integer; \
+               perform pg_advisory_xact_lock(1399957400, v_ns_key); \
+               execute format('comment on schema {schema} is %L', \
+                 jsonb_build_object('made_at_ms', \
+                   floor(extract(epoch from clock_timestamp()) * 1000)::bigint)::text); \
+             end if; \
+           exception when duplicate_schema then null; \
+           end; \
+           v_ns_oid := (quote_ident('{schema}')::regnamespace)::oid::bigint; \
+           v_ns_key := (v_ns_oid - case when v_ns_oid >= 2147483648 then 4294967296 else 0 end)::integer; \
+           perform pg_advisory_xact_lock(1399957400, v_ns_key); \
          end $made$"
     )
 }

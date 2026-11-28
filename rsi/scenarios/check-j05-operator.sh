@@ -1162,10 +1162,10 @@ part=017
 cat >"$WORK/seed.sql" <<'SQL'
 \set ON_ERROR_STOP 1
 begin;
--- The store's own append lock (spawn_append_trusted's advisory lock),
--- held to commit: no append can take a session_seq between the max
+-- session_control's L3 append lock (spawn_append_trusted's per-session advisory
+-- lock), held to commit: no append can take a session_seq between the max
 -- read below and these inserts.
-select pg_advisory_xact_lock(1399957335);
+select pg_advisory_xact_lock(1399957401, hashtext('session_control'));
 -- Hours from T0 = 2026-10-02T00:00:00Z, in ms.
 create function pg_temp.ms(h numeric) returns bigint language sql as $$
     select (extract(epoch from timestamptz '2026-10-02 00:00:00+00') * 1000)::bigint
@@ -1178,10 +1178,10 @@ select setval('seed_seq', coalesce(max(session_seq), 0) + 1, false)
 -- One control record at hour h, in the order written.
 create function pg_temp.rec(h numeric, r jsonb) returns void language sql as $$
     insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
-                              kind, session_seq, recorded_at_ms)
+                              kind, session_seq, recorded_at_ms, commit_xid)
     values ('agent_control', 'session_control', null, 'control', null,
             jsonb_build_object('name', 'control.recorded', 'detail', jsonb_build_object('record', r)),
-            nextval('seed_seq'), pg_temp.ms(h)) $$;
+            nextval('seed_seq'), pg_temp.ms(h), pg_current_xact_id()) $$;
 -- One finished command: (principal, key, agent, session, action, succeeded,
 -- error, created at hour h, finished one second later).
 create function pg_temp.cmd(p text, k text, a text, s text, act jsonb, ok boolean, e text,

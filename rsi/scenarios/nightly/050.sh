@@ -429,18 +429,19 @@ note() { echo "050: $*" >&2; }
 
 # rec <hours before now> <record JSON>: a control record as the store holds it.
 # The loop under test appends to session_control too, so the next
-# session_seq is taken under the store's own append lock
-# (spawn_append_trusted's pg_advisory_xact_lock), in a statement of its own
-# before the insert: the insert's snapshot then sees every append that
+# session_seq is taken under session_control's L3 append lock
+# (spawn_append_trusted's per-session pg_advisory_xact_lock), in a statement of
+# its own before the insert: the insert's snapshot then sees every append that
 # committed before the lock was granted, and none can commit meanwhile.
 # psql runs the -c string as one transaction; the id is its one number line.
 rec_sql() {
-    printf "select pg_advisory_xact_lock(1399957335);
-      insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id, kind, session_seq, recorded_at_ms)
+    printf "select pg_advisory_xact_lock(1399957401, hashtext('session_control'));
+      insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id, kind, session_seq, recorded_at_ms, commit_xid)
       select 'agent_control', 'session_control', null, 'control', null,
              jsonb_build_object('name', 'control.recorded', 'detail', jsonb_build_object('record', '%s'::jsonb)),
              coalesce((select max(session_seq) from spawn_events where session_id = 'session_control'), 0) + 1,
-             (floor(extract(epoch from clock_timestamp()) * 1000) + round(%s * 3600000))::bigint
+             (floor(extract(epoch from clock_timestamp()) * 1000) + round(%s * 3600000))::bigint,
+             pg_current_xact_id()
       returning id;\n" "$2" "$1"
 }
 rec() { # <hours> <json>: prints the event id

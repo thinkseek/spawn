@@ -773,13 +773,14 @@ note "(4) checked: a byte changed inside the backed-up range fails the transcrip
 # --- (5) a record bundled before 149 -------------------------------------------------
 old=$(printf '%s' "$bun" | cut -d'|' -f2- | jq -c 'del(.transcripts.sha256)')
 old_event=$(sql "begin;
-    select pg_advisory_xact_lock(1399957335);
+    select pg_advisory_xact_lock(1399957401, hashtext('session_control'));
     insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
-                              kind, session_seq, recorded_at_ms)
+                              kind, session_seq, recorded_at_ms, commit_xid)
     values ('agent_control', 'session_control', null, 'control', null,
             jsonb_build_object('name', 'control.recorded', 'detail', jsonb_build_object('record', '$old'::jsonb)),
             (select coalesce(max(session_seq), 0) + 1 from spawn_events where session_id = 'session_control'),
-            (floor(extract(epoch from clock_timestamp()) * 1000))::bigint)
+            (floor(extract(epoch from clock_timestamp()) * 1000))::bigint,
+            pg_current_xact_id())
     returning id;
     commit;" | grep -E '^[0-9]+$' | head -n 1)
 case "$old_event" in '' | *[!0-9]*) harness "the record without sha256 was not inserted: [$old_event]" ;; esac
@@ -796,13 +797,14 @@ note "(5) checked: a record without per-file sha256 is said and judged against l
 # backup and live agree with each other, so only the record can say no.
 insert_record() { # insert_record <record json>: as the store writes control records; prints the event id
     sql "begin;
-    select pg_advisory_xact_lock(1399957335);
+    select pg_advisory_xact_lock(1399957401, hashtext('session_control'));
     insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
-                              kind, session_seq, recorded_at_ms)
+                              kind, session_seq, recorded_at_ms, commit_xid)
     values ('agent_control', 'session_control', null, 'control', null,
             jsonb_build_object('name', 'control.recorded', 'detail', jsonb_build_object('record', '$1'::jsonb)),
             (select coalesce(max(session_seq), 0) + 1 from spawn_events where session_id = 'session_control'),
-            (floor(extract(epoch from clock_timestamp()) * 1000))::bigint)
+            (floor(extract(epoch from clock_timestamp()) * 1000))::bigint,
+            pg_current_xact_id())
     returning id;
     commit;" | grep -E '^[0-9]+$' | head -n 1
 }

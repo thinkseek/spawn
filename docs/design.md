@@ -265,7 +265,7 @@ Observer 每次 tick：
 
 | 表 | 关键列 |
 | --- | --- |
-| `spawn_events` | `id`、`agent_id`、`session_id`、`execution_id`、`source`、`source_event_id`、`kind`、`session_seq`、`recorded_at_ms`、生成列 `event_name` |
+| `spawn_events` | `id`、`agent_id`、`session_id`、`execution_id`、`source`、`source_event_id`、`kind`、`session_seq`、`recorded_at_ms`、生成列 `event_name`、`commit_xid`（`xid8`） |
 | `spawn_commands` | `principal`、`idempotency_key`、`state`、`lease_until_ms`、`lease_attempt` |
 | `spawn_grants` | 授权 principal |
 | `spawn_agent_sessions` | `agent_id` 主键、`session_id` 唯一：Agent 与 Session 一一对应（§2） |
@@ -275,7 +275,7 @@ Observer 每次 tick：
 | 函数 | 返回 | 说明 |
 | --- | --- | --- |
 | `spawn_now_ms()` | `bigint` | 单一时间源 |
-| `spawn_append(...)` | `out_id`、`out_seq`、`out_at`、`out_inserted` | 事务内取序号并插入，`pg_advisory_xact_lock(1399957335)` 串行化；会话最近一次 `execution.started` 之后还没有 Bridge 写的同一执行的 `execution.ended` 时，再一条 `execution.started` 被拒（`23P01`，`StoreError::Rejected`），同键重放照旧返回既有记录 |
+| `spawn_append(...)` | `out_id`、`out_seq`、`out_at`、`out_inserted` | 事务内取序号并插入，按严格单调四层锁体系 `L1(1399957337) -> L0(1399957400, per-schema 迁移锁) -> L2(1399957402) -> L3(1399957401, hashtext(p_session))` 串行化单会话并记录 `commit_xid = pg_current_xact_id()`；全局读经 fail-closed schema 作用域 `xid8` 提交水位线按 `(commit_xid, id)` 推进游标；会话最近一次 `execution.started` 之后还没有 Bridge 写的同一执行的 `execution.ended` 时，再一条 `execution.started` 被拒（`23P01`，`StoreError::Rejected`），同键重放照旧返回既有记录 |
 | `spawn_submit(...)` | `out_id` | 幂等插入并写 `command.accepted` |
 | `spawn_claim(worker, ttl_ms)` | `out_id`、`out_attempt`、`out_agent`、`out_session`、`out_principal`、`out_action` | `for update skip locked`，单会话串行（有 Bridge `waiting` 记录的未完成输入不挡后面的命令），过期租约 attempt+1 |
 | `spawn_release(command, attempt, ms)` | `boolean` | 不结束命令，把租约改为 `ms` 毫秒后到期；旧 attempt 或已结束的命令不动 |

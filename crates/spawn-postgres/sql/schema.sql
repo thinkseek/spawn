@@ -1,20 +1,62 @@
 -- Spawn storage: event log, command queue, read views.
 --
 -- Times are Unix epoch milliseconds in bigint, so no client date library is
--- needed. Every newly inserted event gets its id under one transaction-level
--- advisory lock: it makes "id order equals commit order" true, which lets a
--- global reader store its last position and never skip an event. A committed
--- idempotent repeat can be read without joining a contended lock queue.
+-- needed. Concurrency uses a strictly monotonic 4-tier advisory-lock hierarchy:
+--   L1 (outermost): NS_LANDING_HOLD (1399957337, never acquired by init-db)
+--   L0 (migration): NS_SCHEMA_MIGRATE (1399957400, bijective schema ns_key: init-db exclusive / writers shared)
+--   L2 (control):   NS_MISSION (1399957402, key = spawn_mission_lock_key(id) > 0, or 0 global)
+--   L3 (session):   NS_SESSION (1399957401, key = hashtext(session_id))
+-- Every newly inserted event records `commit_xid = pg_current_xact_id()`, and
+-- global readers advance across `(commit_xid, id)` below a fail-closed
+-- schema-scoped `xid8` commit watermark, eliminating the global write lock
+-- with zero missed or duplicate events. A committed idempotent repeat can be
+-- read without joining the session lock queue.
 
 -- A connection whose search_path names a schema that does not exist yet
 -- (an isolated test run) gets it created, so everything below lands there.
 do $$
 declare
-    v_first text := trim(both ' "' from split_part(current_setting('search_path'), ',', 1));
+    v_first  text := trim(both ' "' from split_part(current_setting('search_path'), ',', 1));
+    v_schema text;
+    v_ns_oid bigint;
+    v_ns_key integer;
 begin
-    if current_schema() is null and v_first <> '' and v_first not like '%$user%' then
+    v_schema := (current_schemas(false))[1];
+    if v_schema is null and v_first <> '' and v_first not like '%$user%' then
         execute format('create schema if not exists %I', v_first);
+        v_schema := (current_schemas(false))[1];
     end if;
+    if v_schema is null then
+        raise exception 'search_path has no active schema';
+    end if;
+    v_ns_oid := (quote_ident(v_schema)::regnamespace)::oid::bigint;
+    v_ns_key := (v_ns_oid - case when v_ns_oid >= 2147483648 then 4294967296 else 0 end)::integer;
+    perform pg_advisory_xact_lock(1399957400, v_ns_key);
+end
+$$;
+
+-- Shared L0 migration lock helper in NS_SCHEMA_MIGRATE (1399957400):
+-- runtime writers acquire L0 shared before L2/L3/table locks/DML (and after L1
+-- where held), while schema.sql migrations hold L0 exclusive for the transaction.
+create or replace function spawn_lock_migrate_shared() returns void
+language sql volatile as $$
+    select pg_advisory_xact_lock_shared(
+        1399957400,
+        (
+            (quote_ident(current_schema())::regnamespace)::oid::bigint
+            - case when (quote_ident(current_schema())::regnamespace)::oid::bigint >= 2147483648
+                   then 4294967296 else 0 end
+        )::integer
+    )
+$$;
+
+do $$
+begin
+    execute format(
+        'alter function spawn_lock_migrate_shared() set search_path = %I, pg_temp',
+        current_schema()
+    );
+    execute 'revoke execute on function spawn_lock_migrate_shared() from public';
 end
 $$;
 
@@ -66,8 +108,25 @@ create table if not exists spawn_events (
     kind            jsonb  not null,
     session_seq     bigint not null,
     recorded_at_ms  bigint not null,
-    event_name      text generated always as (kind ->> 'name') stored
+    event_name      text generated always as (kind ->> 'name') stored,
+    commit_xid      xid8   not null default pg_current_xact_id()
 );
+
+alter table spawn_events add column if not exists commit_xid xid8 not null default '3'::xid8;
+do $$ begin
+    if exists (
+        select 1 from information_schema.columns
+         where table_schema = current_schema()
+           and table_name = 'spawn_events'
+           and column_name = 'commit_xid'
+           and column_default is distinct from 'pg_current_xact_id()'
+    ) then
+        alter table spawn_events alter column commit_xid set default pg_current_xact_id();
+    end if;
+end $$;
+
+create index if not exists spawn_events_commit_xid_id
+    on spawn_events (commit_xid, id);
 
 create unique index if not exists spawn_events_session_seq
     on spawn_events (session_id, session_seq);
@@ -154,7 +213,13 @@ create table if not exists spawn_session_state (
 -- The session belongs to the agent of its first event, so a command another
 -- agent submits into the session cannot move it out of its owner's grants.
 create or replace function spawn_session_fold(p_session text) returns void
-language sql as $$
+language plpgsql as $$
+begin
+    if p_session = 'session_control' then
+        return;
+    end if;
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957401, hashtext(p_session));
     insert into spawn_session_state
     select f.session_id, a.agent_id, f.last_session_seq, f.last_event_id,
            f.last_event_at_ms, f.event_count,
@@ -191,20 +256,7 @@ language sql as $$
         observation_seq      = excluded.observation_seq,
         observation_event_id = excluded.observation_event_id,
         observation_at_ms    = excluded.observation_at_ms;
-$$;
-
--- Fold the sessions the projection is missing or behind on: a database from
--- before the projection, or events an older `spawn_append` wrote while this
--- migration ran. The append lock waits for those calls to commit; the
--- migration holds it until its own commit, after which the new body runs.
--- ponytail: this groups the whole log on every migration; keep a migration
--- version and run it once when init-db on a large log gets slow.
-select pg_advisory_xact_lock(1399957335);
-select spawn_session_fold(f.session_id)
-from (select e.session_id, max(e.session_seq) as last_seq
-      from spawn_events e group by e.session_id) f
-left join spawn_session_state p on p.session_id = f.session_id
-where p.last_session_seq is distinct from f.last_seq;
+end $$;
 
 -- One session per agent, one agent per session: an agent and its session
 -- are one entity, and `session_id` stays only as the log's column. The pair
@@ -256,11 +308,10 @@ $$;
 -- DEFINER paths such as the `agent_commands` gateway, which must record
 -- `command.accepted` with source `gateway` even when a restricted login
 -- submitted the command. Restricted logins call `spawn_append` below.
--- The append lock, pg_advisory_xact_lock(1399957335), is copied outside
--- this file: the black-box scenarios rsi/scenarios/045.sh, 050.sh and
--- check-j05-operator.sh take it to insert events with their own
--- session_seq beside a running store. A change of the key must update them
--- too, or their inserts collide again with the store's appends.
+-- Per-session L3 append lock: pg_advisory_xact_lock(1399957401, hashtext(p_session)),
+-- paired with `commit_xid = pg_current_xact_id()`. Direct-insert test scripts in
+-- rsi/scenarios/{check-j05-operator.sh,nightly/{045,050,104,105,112,114,149}.sh}
+-- also take this per-session L3 lock and write `pg_current_xact_id()`.
 create or replace function spawn_append_trusted(
     p_agent      text,
     p_session    text,
@@ -284,11 +335,12 @@ declare
     -- Only the Observer's judgement is the projected state.
     v_obs constant boolean := p_kind ->> 'name' = 'observation.recorded' and p_source = 'observer';
 begin
+    perform spawn_lock_migrate_shared();
     -- Keep the uncontended path free of an extra index read. Only a caller
     -- that would otherwise wait looks for a committed duplicate, which
     -- allocates no id and changes no state. A racing first write is not yet
     -- visible here; the caller takes the lock and finds that event below.
-    if not pg_try_advisory_xact_lock(1399957335) then
+    if not pg_try_advisory_xact_lock(1399957401, hashtext(p_session)) then
         if p_source_key is not null then
             select e.id, e.session_seq, e.recorded_at_ms into v_id, v_seq, v_at
                 from spawn_events e
@@ -301,7 +353,7 @@ begin
                 return;
             end if;
         end if;
-        perform pg_advisory_xact_lock(1399957335);
+        perform pg_advisory_xact_lock(1399957401, hashtext(p_session));
     end if;
 
     if p_source_key is not null and exists (
@@ -365,9 +417,9 @@ begin
     v_at := spawn_now_ms();
 
     insert into spawn_events
-        (agent_id, session_id, execution_id, source, source_event_id, kind, session_seq, recorded_at_ms)
+        (agent_id, session_id, execution_id, source, source_event_id, kind, session_seq, recorded_at_ms, commit_xid)
     values
-        (p_agent, p_session, p_execution, p_source, p_source_key, p_kind, v_seq, v_at)
+        (p_agent, p_session, p_execution, p_source, p_source_key, p_kind, v_seq, v_at, pg_current_xact_id())
     returning spawn_events.id into v_id;
 
     -- Guard: step the row only when it holds exactly the previous event.
@@ -498,11 +550,13 @@ create or replace function spawn_submit(
 declare
     v_id bigint;
 begin
-    -- The id is taken under the append lock, which is held to commit:
-    -- commands commit in id order, the order `spawn_claim` relies on. Only a
-    -- caller that would wait looks for an already committed key first; a
-    -- first submission still in flight uses the conflict path below.
-    if not pg_try_advisory_xact_lock(1399957335) then
+    perform spawn_lock_migrate_shared();
+    -- The id is taken under the session's L3 lock (1399957401, hashtext(p_session)),
+    -- held to commit: a session's commands commit in id order, which `spawn_claim`
+    -- relies on (`o.session_id = c.session_id and o.id < c.id`). Only a caller
+    -- that would wait looks for an already committed key first; a first
+    -- submission still in flight uses the conflict path below.
+    if not pg_try_advisory_xact_lock(1399957401, hashtext(p_session)) then
         select c.id into v_id
             from spawn_commands c
             where c.principal = p_principal and c.idempotency_key = p_key;
@@ -510,7 +564,7 @@ begin
             return query select v_id;
             return;
         end if;
-        perform pg_advisory_xact_lock(1399957335);
+        perform pg_advisory_xact_lock(1399957401, hashtext(p_session));
     end if;
     insert into spawn_commands
         (principal, idempotency_key, agent_id, session_id, action, state, created_at_ms)
@@ -548,7 +602,9 @@ create or replace function spawn_claim(
     out_action        jsonb,
     out_principal     text,
     out_created_at_ms bigint
-) language sql as $$
+) language plpgsql as $$
+begin
+    perform spawn_lock_migrate_shared();
     -- One command per session at a time: nothing earlier in the session
     -- may be unfinished, but an input that waits for its turn (the Bridge
     -- recorded its `command.step` `waiting`, keyed `cmd_<id>:waiting`): it
@@ -558,6 +614,7 @@ create or replace function spawn_claim(
     -- unfinished input that does not wait still holds everything. "Earlier"
     -- is id order, which is commit order because `spawn_submit` takes its id
     -- under the append lock.
+    return query
     with candidate as (
         select c.id
         from spawn_commands c
@@ -584,7 +641,7 @@ create or replace function spawn_claim(
     from candidate
     where c.id = candidate.id
     returning c.id, c.lease_attempt, c.agent_id, c.session_id, c.action, c.principal, c.created_at_ms;
-$$;
+end $$;
 
 -- Leave a claimed command unfinished and claimable again in `p_ms`: an
 -- input that waits for its turn. A lease that is no longer this attempt's
@@ -593,14 +650,19 @@ create or replace function spawn_release(
     p_command bigint,
     p_attempt integer,
     p_ms      bigint
-) returns boolean language sql as $$
+) returns boolean language plpgsql as $$
+declare
+    v_released boolean;
+begin
+    perform spawn_lock_migrate_shared();
     update spawn_commands c
        set lease_until_ms = spawn_now_ms() + greatest(p_ms, 0)
      where c.id = p_command
        and c.state not in ('finished', 'failed', 'cancelled')
        and c.lease_attempt = p_attempt
-    returning true;
-$$;
+    returning true into v_released;
+    return coalesce(v_released, false);
+end $$;
 
 create or replace function spawn_finish(
     p_command   bigint,
@@ -615,6 +677,13 @@ declare
     v_session   text;
     v_principal text;
 begin
+    perform spawn_lock_migrate_shared();
+    select c.session_id into v_session from spawn_commands c where c.id = p_command;
+    if v_session is null then
+        return 'missing';
+    end if;
+    perform pg_advisory_xact_lock(1399957401, hashtext(v_session));
+
     select c.state, c.lease_attempt, c.agent_id, c.session_id, c.principal
         into v_state, v_attempt, v_agent, v_session, v_principal
         from spawn_commands c
@@ -666,6 +735,13 @@ declare
     v_agent   text;
     v_session text;
 begin
+    perform spawn_lock_migrate_shared();
+    select c.session_id into v_session from spawn_commands c where c.id = p_command;
+    if v_session is null then
+        return 'missing';
+    end if;
+    perform pg_advisory_xact_lock(1399957401, hashtext(v_session));
+
     select c.state, c.lease_attempt, c.agent_id, c.session_id
         into v_state, v_attempt, v_agent, v_session
         from spawn_commands c
@@ -709,6 +785,7 @@ language plpgsql security definer as $$
 declare
     v_id bigint;
 begin
+    perform spawn_lock_migrate_shared();
     if not exists (
         select 1 from spawn_grants g
         where g.principal = spawn_principal()
@@ -1049,11 +1126,16 @@ revoke select (id) on agent_commands from public;
 -- trigger checks `session_user`'s grants, which SECURITY DEFINER keeps.
 create or replace function spawn_gateway_submit(p_agent text, p_session text, p_key text,
                                                 p_action jsonb)
-returns bigint language sql security definer as $$
+returns bigint language plpgsql security definer as $$
+declare
+    v_id bigint;
+begin
+    perform spawn_lock_migrate_shared();
     insert into agent_commands (agent_id, session_id, idempotency_key, action)
     values (p_agent, p_session, p_key, p_action)
-    returning id
-$$;
+    returning id into v_id;
+    return v_id;
+end $$;
 
 revoke execute on function spawn_append(text, text, text, text, text, jsonb) from public;
 revoke execute on function spawn_append_trusted(text, text, text, text, text, jsonb) from public;
@@ -1351,6 +1433,7 @@ begin
         raise exception 'an input holds no control character but tab and line ends'
             using errcode = '22023';
     end if;
+    perform spawn_lock_migrate_shared();
     select s.agent_id into v_agent from spawn_agent_sessions s where s.session_id = p_session;
     if v_agent is null then
         return null;
@@ -1420,6 +1503,7 @@ begin
         raise exception 'key % is not one of escape, up, down, left, right, enter, y, n, digit1 to digit9',
             coalesce(quote_literal(p_name), 'null') using errcode = '22023';
     end if;
+    perform spawn_lock_migrate_shared();
     select s.agent_id into v_agent from spawn_agent_sessions s where s.session_id = p_session;
     if v_agent is null then
         return null;
@@ -1540,9 +1624,10 @@ begin
         raise exception 'a message holds no control character but tab and line ends'
             using errcode = '22023';
     end if;
-    -- One message at a time decides on the supervisor's state: the append
-    -- lock spawn_submit takes, held to commit.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    -- One message at a time decides on the supervisor's state: the L3 lock
+    -- for session_supervisor that spawn_submit takes, held to commit.
+    perform pg_advisory_xact_lock(1399957401, hashtext(v_session));
     select c.id, c.action, c.session_id into v_first, v_first_action, v_first_session
       from spawn_commands c
      where c.principal = 'human' and c.idempotency_key = p_key;
@@ -2156,6 +2241,7 @@ begin
     if jsonb_typeof(p_prices) is distinct from 'object' then
         raise exception 'the prices are a JSON object, not %', p_prices;
     end if;
+    perform spawn_lock_migrate_shared();
     -- The cost record's lock (cost coverage 1b): the engine folds and the
     -- sessions' record commit one after another on every connection, so a
     -- message is never taken by both sides at once.
@@ -2311,6 +2397,7 @@ begin
     if jsonb_typeof(p_messages) is distinct from 'array' then
         raise exception 'the messages are a JSON array, not %', p_messages;
     end if;
+    perform spawn_lock_migrate_shared();
     -- The cost record's lock (cost coverage 1b): the engine folds and the
     -- sessions' record commit one after another on every connection, so a
     -- message is never taken by both sides at once.
@@ -2458,6 +2545,7 @@ begin
        or jsonb_typeof(p_files) is distinct from 'array' then
         raise exception 'the messages and the files are JSON arrays';
     end if;
+    perform spawn_lock_migrate_shared();
     -- The cost record's lock (cost coverage 1b): the engine folds and the
     -- sessions' record commit one after another on every connection, so a
     -- message is never taken by both sides at once.
@@ -2698,6 +2786,7 @@ begin
        <> jsonb_array_length(p_pairs) then
         raise exception 'a commit map names each old commit once';
     end if;
+    perform spawn_lock_migrate_shared();
     lock table spawn_commit_map in exclusive mode;
     v_given := jsonb_array_length(p_pairs);
     select count(*) into v_loaded from spawn_commit_map;
@@ -2783,6 +2872,7 @@ declare
     v_mission bigint;
     v_accept text;
 begin
+    perform spawn_lock_migrate_shared();
     case v_type
     when 'mission.added' then
         insert into mission_missions (id, text, origin, sources, created_at_ms, updated_at_ms)
@@ -3514,6 +3604,18 @@ begin
     end case;
 end $$;
 
+-- Maps a mission id to a strictly positive int4 key in NS_MISSION (1399957402),
+-- reserving key 0 exclusively for global / cross-mission control operations.
+create or replace function spawn_mission_lock_key(p_mission bigint) returns integer
+language sql immutable parallel safe as $$
+    select case
+             when p_mission is null or p_mission <= 0 then 0
+             when p_mission <= 2147483647 then p_mission::integer
+             else ((hashtext(p_mission::text) & 2147483647) | 1)
+           end
+$$;
+revoke execute on function spawn_mission_lock_key(bigint) from public;
+
 -- Append one record to the control stream and fold it into the tables.
 create or replace function spawn_control_record(p_record jsonb)
 returns bigint language plpgsql as $$
@@ -3521,6 +3623,7 @@ declare
     v_id bigint;
     v_at bigint;
 begin
+    perform spawn_lock_migrate_shared();
     select a.out_id, a.out_at into v_id, v_at
       from spawn_append_trusted('agent_control', 'session_control', null, 'control', null,
                                 jsonb_build_object('name', 'control.recorded',
@@ -3556,7 +3659,9 @@ returns void language plpgsql as $$
 declare
     v_event record;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
+    perform pg_advisory_xact_lock(1399957401, hashtext('session_control'));
     delete from mission_source_holds;
     delete from mission_retired_objectives;
     delete from mission_source_reds;
@@ -3597,8 +3702,8 @@ declare
     v_id bigint;
     v_source jsonb;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if v_caller is null then
         raise exception '% may not add missions', session_user using errcode = '42501';
     end if;
@@ -3675,8 +3780,8 @@ begin
     if p_state = 'dropped' then
         perform pg_advisory_xact_lock(1399957337);
     end if;
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(p_mission));
     if spawn_mission_caller() is null then
         raise exception '% may not close missions', session_user using errcode = '42501';
     end if;
@@ -3751,8 +3856,8 @@ declare
     v_duplicate_state text;
     v_preset grading_presets%rowtype;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(p_mission));
     if v_caller is null then
         raise exception '% may not assign tasks', session_user using errcode = '42501';
     end if;
@@ -3872,9 +3977,12 @@ end $$;
 -- in the state the step needs, and then nothing is recorded.
 create or replace function spawn_task_delivered(p_task bigint, p_command bigint)
 returns boolean language plpgsql security definer as $$
+declare
+    v_lock_mission bigint;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    select mission_id into v_lock_mission from mission_tasks where id = p_task;
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record deliveries', session_user using errcode = '42501';
     end if;
@@ -3905,9 +4013,12 @@ end $$;
 -- first version took none, and still records a null commit.
 create or replace function spawn_task_reported(p_task bigint, p_report text, p_commit text)
 returns boolean language plpgsql security definer as $$
+declare
+    v_lock_mission bigint;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    select mission_id into v_lock_mission from mission_tasks where id = p_task;
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record reports', session_user using errcode = '42501';
     end if;
@@ -3955,9 +4066,12 @@ create or replace function spawn_task_report_unfinished(p_task bigint, p_digest 
                                                         p_markers jsonb, p_note text,
                                                         p_command bigint)
 returns boolean language plpgsql security definer as $$
+declare
+    v_lock_mission bigint;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    select mission_id into v_lock_mission from mission_tasks where id = p_task;
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record reports', session_user using errcode = '42501';
     end if;
@@ -3983,10 +4097,12 @@ create or replace function spawn_task_fork_failed(p_task bigint, p_from bigint, 
                                                   p_error text)
 returns bigint language plpgsql security definer as $$
 declare
+    v_lock_mission bigint;
     v_first bigint;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    select mission_id into v_lock_mission from mission_tasks where id = p_task;
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record forks', session_user using errcode = '42501';
     end if;
@@ -4020,11 +4136,13 @@ create or replace function spawn_task_review(p_task bigint, p_accept boolean, p_
                                              p_revision integer default null)
 returns void language plpgsql security definer as $$
 declare
+    v_lock_mission bigint;
     v_revision integer;
     v_state text;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    select mission_id into v_lock_mission from mission_tasks where id = p_task;
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
     if spawn_mission_caller() is null then
         raise exception '% may not review tasks', session_user using errcode = '42501';
     end if;
@@ -4091,12 +4209,15 @@ create or replace function spawn_task_reroute(p_task bigint, p_preset text, p_re
                                               p_routed_difficulty integer)
 returns jsonb language plpgsql security definer as $$
 declare
+    v_lock_mission bigint;
     v_task mission_tasks%rowtype;
     v_preset grading_presets%rowtype;
     v_needed integer;
     v_record jsonb;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    select mission_id into v_lock_mission from mission_tasks where id = p_task;
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
     if spawn_mission_caller() is null then
         raise exception '% may not reroute tasks', session_user using errcode = '42501';
     end if;
@@ -4175,6 +4296,7 @@ returns void language plpgsql as $$
 declare
     v_id text := p_record ->> 'preset_id';
 begin
+    perform spawn_lock_migrate_shared();
     case p_record ->> 'type'
     when 'preset.registered' then
         insert into grading_presets (preset_id, engine_label, model_label, model_profile,
@@ -4234,7 +4356,8 @@ declare
     v_event bigint;
     v_at bigint;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record grading', session_user using errcode = '42501';
     end if;
@@ -4421,7 +4544,9 @@ returns void language plpgsql as $$
 declare
     v_event record;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
+    perform pg_advisory_xact_lock(1399957401, hashtext('session_control'));
     delete from grading_presets;
     for v_event in
         select e.id, e.kind -> 'detail' -> 'record' as record, e.recorded_at_ms
@@ -4435,9 +4560,12 @@ end $$;
 
 create or replace function spawn_task_cancel(p_task bigint)
 returns void language plpgsql security definer as $$
+declare
+    v_lock_mission bigint;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    select mission_id into v_lock_mission from mission_tasks where id = p_task;
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
     if spawn_mission_caller() is null then
         raise exception '% may not cancel tasks', session_user using errcode = '42501';
     end if;
@@ -4474,14 +4602,16 @@ end $$;
 create or replace function spawn_task_reissue(p_task bigint, p_attempts jsonb)
 returns bigint language plpgsql security definer as $$
 declare
+    v_lock_mission bigint;
     v_old mission_tasks%rowtype;
     v_id bigint;
     v_agent text;
     v_session text;
     v_label text;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    select mission_id into v_lock_mission from mission_tasks where id = p_task;
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not re-issue tasks', session_user using errcode = '42501';
     end if;
@@ -4550,12 +4680,14 @@ drop function if exists spawn_task_restart_as(bigint, text, text);
 create or replace function spawn_task_restart_as(p_task bigint, p_reason text, p_by text, p_key text default null)
 returns jsonb language plpgsql security definer as $$
 declare
+    v_lock_mission bigint;
     v_task mission_tasks%rowtype;
     v_execution text;
     v_n bigint;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    select mission_id into v_lock_mission from mission_tasks where id = p_task;
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
     select * into v_task from mission_tasks where id = p_task;
     if v_task.id is null then
         raise exception 'task % does not exist: there is nothing to restart', p_task
@@ -4595,14 +4727,16 @@ drop function if exists spawn_task_reassign_as(bigint, text, text);
 create or replace function spawn_task_reassign_as(p_task bigint, p_reason text, p_by text, p_key text default null)
 returns jsonb language plpgsql security definer as $$
 declare
+    v_lock_mission bigint;
     v_old mission_tasks%rowtype;
     v_id bigint;
     v_agent text;
     v_session text;
     v_label text;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    select mission_id into v_lock_mission from mission_tasks where id = p_task;
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
     select * into v_old from mission_tasks where id = p_task;
     if v_old.id is null then
         raise exception 'task % does not exist: there is nothing to reassign', p_task
@@ -4697,9 +4831,9 @@ begin
             using errcode = '22023';
     end if;
     v_norm_reason := nullif(btrim(coalesce(p_reason, '')), '');
-    -- Check and record under the append lock, so no other change interleaves
-    -- (two first uses of one key that race are one move).
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    -- Global L2(0) strictly precedes per-mission L2 in restart_as / reassign_as.
+    perform pg_advisory_xact_lock(1399957402, 0);
     select e.id, e.kind -> 'detail' -> 'record' as r into v_first
       from spawn_events e
      where e.session_id = 'session_control' and e.event_name = 'control.recorded'
@@ -4804,13 +4938,19 @@ create or replace function spawn_task_steal(p_task bigint, p_to text, p_by text,
                                             p_reason text default null)
 returns jsonb language plpgsql security definer as $$
 declare
+    v_lock_mission bigint;
     v_task mission_tasks;
     v_mission mission_missions;
     v_worker mission_residents;
     v_taker mission_residents;
     v_open record;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
+    select mission_id into v_lock_mission from mission_tasks where id = p_task;
+    if v_lock_mission is not null then
+        perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
+    end if;
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not move tasks', session_user using errcode = '42501';
     end if;
@@ -4913,8 +5053,8 @@ returns void language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if v_caller is null then
         raise exception '% may not propose residents', session_user using errcode = '42501';
     end if;
@@ -4940,8 +5080,8 @@ end $$;
 create or replace function spawn_resident_approve(p_name text)
 returns void language plpgsql security definer as $$
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only a human approves a resident' using errcode = '42501';
     end if;
@@ -4955,9 +5095,19 @@ create or replace function spawn_resident_retire(p_name text)
 returns void language plpgsql security definer as $$
 declare
     v_open bigint[];
+    v_lock_key integer;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
+    for v_lock_key in
+        select distinct spawn_mission_lock_key(k.mission_id) as lock_key
+          from mission_tasks k
+          join mission_residents r on r.agent_id = k.agent_id
+         where r.name = p_name and k.state <> 'cancelled'
+         order by lock_key
+    loop
+        perform pg_advisory_xact_lock(1399957402, v_lock_key);
+    end loop;
     if spawn_mission_caller() is null then
         raise exception '% may not retire residents', session_user using errcode = '42501';
     end if;
@@ -4980,8 +5130,8 @@ returns void language plpgsql security definer as $$
 declare
     v_landing bigint;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(p_mission));
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only a human sets a mission''s gate' using errcode = '42501';
     end if;
@@ -5086,7 +5236,8 @@ declare
     v_after jsonb;
     v_key text;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(p_mission));
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only a human sets a mission''s gate' using errcode = '42501';
     end if;
@@ -5218,8 +5369,8 @@ declare
     v_needed integer;
     v_carried boolean := false;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(p_mission));
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not assign objectives', session_user using errcode = '42501';
     end if;
@@ -5366,8 +5517,8 @@ returns void language plpgsql security definer as $$
 declare
     v_pause bigint;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(p_mission));
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only a human resumes a halted or paused mission' using errcode = '42501';
     end if;
@@ -5397,7 +5548,8 @@ declare
     v_state text;
     v_pause bigint;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(p_mission));
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only the owner (a human) pauses a mission; % may not', session_user
             using errcode = '42501';
@@ -5453,9 +5605,9 @@ begin
     if p_mission is null or p_halt is null then
         raise exception 'a resume names its mission and the halt it resumes' using errcode = '22023';
     end if;
-    -- Check and record under the append lock, so no other change interleaves
-    -- (two first uses of one key that race are one resume).
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    -- Serialize resumes for this mission under L2(p_mission).
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(p_mission));
     select e.id, e.kind -> 'detail' -> 'record' as r into v_first
       from spawn_events e
      where e.session_id = 'session_control' and e.event_name = 'control.recorded'
@@ -5514,7 +5666,8 @@ declare
     v_missions jsonb;
     v_cleared jsonb;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only the owner moves a source outside the gate' using errcode = '42501';
     end if;
@@ -5572,7 +5725,8 @@ create or replace function spawn_source_push_request(p_source text, p_commit tex
                                                      p_reason text default null)
 returns bigint language plpgsql security definer as $$
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only the owner lands on a source' using errcode = '42501';
     end if;
@@ -5635,9 +5789,39 @@ declare
     v_other text;
     v_request jsonb;
     v_hold mission_source_holds;
+    v_rec_type text := p_record ->> 'type';
+    v_lock_mission bigint;
 begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    if v_rec_type = 'task.landed' then
+        perform pg_advisory_xact_lock(1399957402, 0);
+        if coalesce(p_record ->> 'id', '') ~ '^[0-9]{1,18}$' then
+            select mission_id into v_lock_mission from mission_tasks
+             where id = (p_record ->> 'id')::bigint;
+            if v_lock_mission is not null then
+                perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
+            end if;
+        end if;
+    elsif v_rec_type in ('task.gated', 'task.aborted', 'task.over_budget',
+                         'task.held', 'task.cancelled', 'task.shadow_gated', 'task.released') then
+        if coalesce(p_record ->> 'id', '') ~ '^[0-9]{1,18}$' then
+            select mission_id into v_lock_mission from mission_tasks
+             where id = (p_record ->> 'id')::bigint;
+        end if;
+        perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
+    elsif v_rec_type = 'mission.halted' then
+        if coalesce(p_record ->> 'id', '') ~ '^[0-9]{1,18}$' then
+            v_lock_mission := (p_record ->> 'id')::bigint;
+        end if;
+        perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
+    elsif v_rec_type = 'objective.solved' then
+        if coalesce(p_record ->> 'mission', '') ~ '^[0-9]{1,18}$' then
+            v_lock_mission := (p_record ->> 'mission')::bigint;
+        end if;
+        perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
+    else
+        perform pg_advisory_xact_lock(1399957402, 0);
+    end if;
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record landings', session_user using errcode = '42501';
     end if;
@@ -6262,16 +6446,20 @@ end $$;
 -- landings) is recorded cancelled instead.
 create or replace function spawn_landing_hold(p_task bigint)
 returns boolean language plpgsql security definer as $$
+declare
+    v_lock_mission bigint;
 begin
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not land work', session_user using errcode = '42501';
     end if;
     perform pg_advisory_lock(1399957337);
+    perform spawn_lock_migrate_shared();
     if exists (select 1 from mission_tasks k where k.id = p_task and k.state = 'landing')
        and spawn_task_may_move(p_task, 'landing') then
         return true;
     end if;
-    perform pg_advisory_xact_lock(1399957335);
+    select mission_id into v_lock_mission from mission_tasks where id = p_task;
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_lock_mission));
     if exists (select 1 from mission_tasks k where k.id = p_task and k.state = 'landing')
        and not spawn_task_may_move(p_task, 'landing') then
         perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task,
@@ -6344,7 +6532,8 @@ declare
     v_renews bigint;
     v_id bigint;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only the owner holds a source' using errcode = '42501';
     end if;
@@ -6389,7 +6578,8 @@ declare
     v_hold bigint;
     v_waiting jsonb;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only the owner releases a source' using errcode = '42501';
     end if;
@@ -6480,7 +6670,8 @@ declare
     v_cause text := p_record ->> 'cause';
     v_path text := p_record ->> 'path';
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record host facts', session_user using errcode = '42501';
     end if;
@@ -6732,7 +6923,8 @@ declare
     v_off bigint;
     v_id bigint;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only the owner records a node''s facts; % may not', session_user
             using errcode = '42501';
@@ -7121,6 +7313,7 @@ create or replace function spawn_node_fence(
 declare
     v_facts jsonb;
 begin
+    perform spawn_lock_migrate_shared();
     with fenced as (
         update spawn_remote_jobs j
            set lease_epoch = j.lease_epoch + 1,
@@ -7162,6 +7355,7 @@ begin
        or jsonb_typeof(p_spec) is distinct from 'object' or octet_length(p_spec::text) > 65536 then
         return jsonb_build_object('ok', false, 'error', 'bad_request', 'server_time_ms', v_now);
     end if;
+    perform spawn_lock_migrate_shared();
     select * into v_n from spawn_node_state where enroll_token_sha256 = p_token_sha256 for update;
     if not found or v_n.status = 'revoked' or coalesce(v_n.enroll_expires_ms, 0) < v_now then
         return jsonb_build_object('ok', false, 'error', 'bad_token', 'server_time_ms', v_now);
@@ -7222,6 +7416,7 @@ declare
     v_need_sync jsonb := '{}'::jsonb;
     v_facts jsonb := '[]'::jsonb;
 begin
+    perform spawn_lock_migrate_shared();
     select * into v_n from spawn_node_state where node_id = p_node_id for update;
     if not found or v_n.status = 'pending' then
         return jsonb_build_object('ok', false, 'error', 'unknown_node', 'server_time_ms', v_now);
@@ -7412,6 +7607,7 @@ declare
     v_n spawn_node_state;
     v_pub text;
 begin
+    perform spawn_lock_migrate_shared();
     select * into v_n from spawn_node_state where node_id = p_node_id for update;
     if not found or v_n.status = 'pending' then
         return jsonb_build_object('ok', false, 'error', 'unknown_node', 'server_time_ms', v_now);
@@ -7465,6 +7661,7 @@ begin
        or coalesce(p_result ->> 'exit_code', '0') !~ '^-?[0-9]{1,9}$' then
         return false;
     end if;
+    perform spawn_lock_migrate_shared();
     select n.name into v_name from spawn_node_state n
      where n.node_id = p_node_id and n.status = 'active'
        for share;
@@ -7521,6 +7718,7 @@ begin
         raise exception 'only the owner sweeps the nodes; % may not', session_user
             using errcode = '42501';
     end if;
+    perform spawn_lock_migrate_shared();
     select coalesce(array_agg(x.node_id order by x.name), '{}') into v_nodes
       from (select n.name, n.node_id from spawn_node_state n
              where n.node_id is not null
@@ -7584,6 +7782,7 @@ begin
         raise exception 'an enrollment token is 32 bytes of SHA-256, good for at most 10 minutes'
             using errcode = '22023';
     end if;
+    perform spawn_lock_migrate_shared();
     -- A name the P1 records hold joined is another node's (spawn_node_record).
     if exists (select 1 from spawn_node_latest('node.joined', p_name, 0) j
                 where not exists (select 1 from spawn_node_latest('node.removed', p_name, j.seq))) then
@@ -7621,6 +7820,7 @@ begin
         raise exception 'a node is drained, undrained or revoked, not %', p_action
             using errcode = '22023';
     end if;
+    perform spawn_lock_migrate_shared();
     select * into v_n from spawn_node_state where name = p_name for update;
     if not found then
         raise exception 'no node is named %', p_name using errcode = 'P0002';
@@ -7663,6 +7863,7 @@ begin
         raise exception 'only the owner queues a remote job; % may not', session_user
             using errcode = '42501';
     end if;
+    perform spawn_lock_migrate_shared();
     insert into spawn_remote_jobs (job_id, kind, cell_id, priority, judging_id, mission_id, task_id,
                                    spec, requires, cost, base_commit, max_attempts,
                                    enqueued_at_ms, queue_deadline_ms)
@@ -7688,6 +7889,7 @@ begin
         raise exception 'only the owner takes a remote job back; % may not', session_user
             using errcode = '42501';
     end if;
+    perform spawn_lock_migrate_shared();
     update spawn_remote_jobs
        set state = 'fallback_local', lease_epoch = lease_epoch + 1, finished_at_ms = spawn_now_ms()
      where job_id = p_job_id and lease_epoch = p_lease_epoch and state = 'queued'
@@ -7721,6 +7923,7 @@ begin
         raise exception 'a faulted job is queued, fallback_local, dead_letter or kept, not %', p_next
             using errcode = '22023';
     end if;
+    perform spawn_lock_migrate_shared();
     select j.* into v_j from spawn_remote_jobs j
      where j.job_id = p_job_id and j.lease_epoch = p_lease_epoch and j.state = 'completed';
     if not found then
@@ -7798,6 +8001,7 @@ begin
         raise exception 'only the owner judges a remote job; % may not', session_user
             using errcode = '42501';
     end if;
+    perform spawn_lock_migrate_shared();
     select j.* into v_j from spawn_remote_jobs j
      where j.job_id = p_job_id and j.lease_epoch = p_lease_epoch and j.state = 'completed';
     if not found then
@@ -7890,7 +8094,8 @@ returns bigint language plpgsql security definer as $$
 declare
     v_type text := p_record ->> 'type';
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record alerts', session_user using errcode = '42501';
     end if;
@@ -8212,7 +8417,8 @@ $$;
 create or replace function spawn_backup_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record backups', session_user using errcode = '42501';
     end if;
@@ -8368,7 +8574,8 @@ end $$;
 create or replace function spawn_deploy_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(1399957402, 0);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record deploys', session_user using errcode = '42501';
     end if;
@@ -8404,7 +8611,15 @@ declare
     v_mission bigint;
     v_objective integer;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform spawn_lock_migrate_shared();
+    perform pg_advisory_xact_lock(
+        1399957402,
+        spawn_mission_lock_key(
+            case when jsonb_typeof(p_record -> 'mission') = 'number'
+                      and (p_record ->> 'mission') ~ '^[0-9]{1,9}$'
+                 then (p_record ->> 'mission')::bigint end
+        )
+    );
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record verifications', session_user using errcode = '42501';
     end if;
@@ -8532,6 +8747,7 @@ begin
        or p_record ->> 'reason' ~ '^[[:space:]]*$' then
         raise exception 'a retirement record''s reason is 1 to 500 characters, not blank';
     end if;
+    perform spawn_lock_migrate_shared();
     v_mission := (p_record ->> 'id')::numeric::bigint;
     v_objective := (p_record ->> 'objective')::numeric::integer;
     v_kind := p_record ->> 'kind';
@@ -8564,7 +8780,7 @@ begin
         v_gates := v_part;
     end if;
 
-    perform pg_advisory_xact_lock(1399957335);
+    perform pg_advisory_xact_lock(1399957402, spawn_mission_lock_key(v_mission));
     if not exists (select 1 from mission_missions where id = v_mission) then
         raise exception 'mission % does not exist', v_mission;
     end if;
@@ -8744,7 +8960,8 @@ do $$
 declare
     v_row record;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform pg_advisory_xact_lock(1399957402, 0);
+    perform pg_advisory_xact_lock(1399957401, hashtext('session_control'));
     if exists (select 1 from spawn_events where session_id = 'session_control')
        or not exists (select 1 from mission_missions union all select 1 from mission_residents) then
         return;
@@ -8793,7 +9010,8 @@ do $$
 declare
     v_task bigint;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform pg_advisory_xact_lock(1399957402, 0);
+    perform pg_advisory_xact_lock(1399957401, hashtext('session_control'));
     for v_task in
         select k.id from mission_tasks k
           join mission_missions m on m.id = k.mission_id
@@ -8819,7 +9037,8 @@ do $$
 declare
     v_task bigint;
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    perform pg_advisory_xact_lock(1399957402, 0);
+    perform pg_advisory_xact_lock(1399957401, hashtext('session_control'));
     for v_task in
         select k.id
           from mission_tasks k
@@ -8839,6 +9058,19 @@ begin
     end loop;
 end
 $$;
+
+-- Fold the sessions the projection is missing or behind on: runs after the
+-- L2(0) control migration blocks above so schema migration strictly obeys
+-- L2 -> L3 order; each session is locked under L3 NS_SESSION
+-- (1399957401, hashtext(session_id)) in ascending lock-key order.
+select spawn_session_fold(f.session_id)
+from (select e.session_id, max(e.session_seq) as last_seq
+      from spawn_events e
+     where e.session_id <> 'session_control'
+     group by e.session_id) f
+left join spawn_session_state p on p.session_id = f.session_id
+where p.last_session_seq is distinct from f.last_seq
+order by hashtext(f.session_id), f.session_id;
 
 -- Experience (objective 043; docs/fleet-architecture.md §4): decisions,
 -- interventions, outcomes and escalations, one row per item with `at_ms`
@@ -9572,6 +9804,7 @@ begin
         raise exception 'unknown provenance keys: %', v_unknown using errcode = '22023';
     end if;
 
+    perform spawn_lock_migrate_shared();
     v_change := jsonb_populate_record(null::prov_changes, p_change);
     v_change.id := null;
     v_change.attributed := coalesce(v_change.attributed, 'host');
@@ -9780,6 +10013,7 @@ begin
         raise exception 'snapshot fields must not be null' using errcode = '22023';
     end if;
 
+    perform spawn_lock_migrate_shared();
     insert into spawn_snapshots (id, git_oid, tree, parents, project, state, created_at_ms)
     values (p_id, p_git_oid, p_tree, v_parents, p_project, 'live', p_created_at_ms)
     on conflict do nothing
@@ -9854,6 +10088,7 @@ begin
             using errcode = '22023';
     end if;
 
+    perform spawn_lock_migrate_shared();
     perform pg_advisory_xact_lock(1399957360);
 
     select state into v_new_state from spawn_snapshots where id = p_new;
@@ -9951,6 +10186,7 @@ begin
             using errcode = '22023';
     end if;
 
+    perform spawn_lock_migrate_shared();
     perform pg_advisory_xact_lock(1399957360);
 
     select * into v_new_snap from spawn_snapshots where id = p_new_snapshot;
@@ -10075,6 +10311,7 @@ begin
         raise exception 'project must be non-empty' using errcode = '22023';
     end if;
 
+    perform spawn_lock_migrate_shared();
     perform pg_advisory_xact_lock(1399957360);
 
     v_now := spawn_now_ms();
@@ -10114,6 +10351,7 @@ begin
         return 0;
     end if;
 
+    perform spawn_lock_migrate_shared();
     perform pg_advisory_xact_lock(1399957360);
 
     update spawn_snapshots s
