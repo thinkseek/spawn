@@ -68,7 +68,7 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | GET | `/api/features` | The feature map of every open objective mission (a mission's `--features` file), or of `?mission=`; `?limit=` (10, at most 50) | – | web (Features) |
 | GET | `/api/features/coverage` | The feature registry's file coverage (`docs/feature-map/registry.json`): wild files, stale references, features; `?mission=<id>` for that mission's project | `spawn features scan --json` | web (Coverage) |
 | GET | `/api/features/coverage/projects` | Every project the Coverage page can read, over all open objective missions | – | web (Coverage) |
-| GET | `/api/stream` | The log as Server-Sent Events, live: `event: ready`, then one frame per event (its `/api/events` row), a comment probe `:` every 500 ms of quiet (a page gone, a reset included, frees its slot within a few probes) and `: keepalive` in its place every 15 s; catch-up of at most 500 events after `Last-Event-ID` or `?after=<id>`, else `event: resync`; on 64 slots of its own, at most 16 per client address that is not loopback (503 when all are taken, or that address's are), no `ETag` ([`serve/stream.rs`](../crates/spawn-cli/src/serve/stream.rs)) | – | web (`stream.ts`: live invalidation of Home's boards, one stream shared among tabs) |
+| GET | `/api/stream` | The log as Server-Sent Events, live: `event: ready`, then one frame per event (its `/api/events` row), a comment probe `:` every 500 ms of quiet (a page gone, a reset included, frees its slot within a few probes) and `: keepalive` in its place every 15 s; catch-up of at most 500 events after `Last-Event-ID` or `?after=<id>`, else `event: resync`; established `ReadOnlyViewer` streams close automatically at token expiry; on 64 slots of its own, at most 16 per client address that is not loopback (503 when all are taken, or that address's are), no `ETag` ([`serve/stream.rs`](../crates/spawn-cli/src/serve/stream.rs)) | – | web (`stream.ts`: live invalidation of Home's boards, one stream shared among tabs) |
 | GET | `/api/approvals` | The prompts a person must answer, read from the live panes (numbered choices, permission buttons, yes/no, confirm), sessions whose judgement asks for a person, and halted missions; each item's `id` is its `approval_id` ([`serve/approvals.rs`](../crates/spawn-cli/src/serve/approvals.rs)); a session's item also carries `auto: {state, answered, breaker}`, what the run-time resolver did and may do there ("Automatic answers" below) | – | web (Home, `approvals.ts`: the approvals queue) |
 | GET | `/api/context/digest` | The fleet in one small answer: states, nodes with power and the low-battery soft drain, open missions with their last gate failure, pending approvals, the supervisor's notes for the owner, and a Markdown `digest_text` under 4000 bytes ([`serve/digest.rs`](../crates/spawn-cli/src/serve/digest.rs)) | – | web (Home, `digest.ts`: the digest line and drawer) |
 | GET | `/api/prov/who` | Who made a file as the last recorded first-parent commit of `main` that touched it left it: that `land` or `import` Change, its entry, the `edit` revision the content came from (`origin`) and the path's history, oldest first; `?path=` (required), `?source=` (the domain `git:<source>`; every domain when empty); a `line` is 400 (a line's blame needs the repository) ([`serve/prov.rs`](../crates/spawn-cli/src/serve/prov.rs), [provenance](./provenance.md)) | `spawn prov who <path>[:<line>] --source <source>` (file-level from git's `main`, and a line's blame) | no web page yet |
@@ -164,16 +164,42 @@ once is 400.
 ## Access
 
 `serve` binds `127.0.0.1:8787` (`--address`, `SPAWN_SERVE_ADDRESS`); on any
-other address it refuses to start without `SPAWN_SERVE_TOKEN`. With a token
-set, every API request carries it (`Authorization: Bearer <token>` or
-`?token=<token>`), except from a loopback client running as the owner's uid
-when `SPAWN_SERVE_LOCAL_OPEN=1`, and from a client inside
-`SPAWN_SERVE_OPEN_NETWORKS` that names the server by an IP address inside
-it. A read served without the token also needs a `Host` naming this server
-and no cross-origin `Origin`. A refused request is 401 with a bearer
-challenge when a token is set, 403 otherwise. The built UI's static files
-are served without the token. The full rules, and the reasons for each, are
-the opening comment of
+other address it refuses to start without `SPAWN_SERVE_TOKEN`.
+
+- **Credential precedence & fail-closed rejection:** Every API request carries a
+  token via `Authorization: Bearer <token>` or `?token=<token>`.
+  `Authorization: Bearer` takes strict precedence over `?token=` (no OR
+  fallback: an invalid or expired `Authorization: Bearer` header paired with a
+  valid `?token=` still returns `401`). Any explicitly presented invalid,
+  expired, or unverifiable credential — including explicit credentials sent when
+  `SPAWN_SERVE_TOKEN` is unset — always fails closed with `401 Unauthorized`
+  (`WWW-Authenticate: Bearer`) and never falls back to `LocalOwner`, even from
+  loopback (`SPAWN_SERVE_LOCAL_OPEN=1`) or `SPAWN_SERVE_OPEN_NETWORKS`.
+- **Unauthenticated local/intranet reads:** Without an explicit credential,
+  access without a token is allowed only when `SPAWN_SERVE_TOKEN` is unset,
+  from a loopback client running as the owner's uid when
+  `SPAWN_SERVE_LOCAL_OPEN=1`, or from a client inside
+  `SPAWN_SERVE_OPEN_NETWORKS` that names the server by an IP address inside it.
+  Unauthenticated reads also require a `Host` naming this server and no
+  cross-origin `Origin`. Credential-less refusals answer `401` with a bearer
+  challenge when `SPAWN_SERVE_TOKEN` is set, and `403` (Host/Origin check)
+  otherwise. The built UI's static files are served without authentication.
+- **Read-only viewer tokens (`spawn serve viewer-token [--ttl <duration>]`):**
+  Mints a stateless HMAC-SHA256 token (`sv1.<exp_epoch_secs>.<b64url_hmac>`)
+  derived from `SPAWN_SERVE_TOKEN`:
+  - Lifetime defaults to `2h` and is capped at `24h` (`1s..=24h`) at minting
+    (tokens carry expiration only, not issued-at). There is no per-token
+    revocation list; rotating `SPAWN_SERVE_TOKEN` invalidates all viewer tokens.
+  - Authorized for `GET`/`HEAD` across **all** read endpoints — including live
+    terminal text endpoints such as `/api/sessions/<id>/pane` and
+    `/api/objectives/pane` (read-only does not mean low-sensitivity). All
+    mutating methods (`POST`, `PUT`, `PATCH`, `DELETE`) fail with `403
+    Forbidden` (`{"error":"read-only viewer token cannot mutate state"}`).
+  - Established `/api/stream` SSE connections automatically close at
+    `expires_at_ms` with zero post-expiry events delivered (subsequent requests or
+    reconnects with the expired token answer `401`).
+
+The full rules, and the reasons for each, are in the opening comment of
 [`crates/spawn-cli/src/serve.rs`](../crates/spawn-cli/src/serve.rs).
 
 ## Automatic answers (`spawn-resolve`)

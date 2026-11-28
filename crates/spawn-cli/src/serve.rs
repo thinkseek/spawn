@@ -132,6 +132,15 @@
 //! this server by an IP address inside one of them (an IP literal `Host`:
 //! a page that rebinds its own name sends its name, so it reads nothing).
 //! Off by default.
+//! `Authorization: Bearer` takes precedence over `?token=` (no fallback when
+//! the header fails verification). An explicitly presented invalid or expired
+//! credential always fails closed with `401` (including on loopback,
+//! `SPAWN_SERVE_OPEN_NETWORKS`, or when `SPAWN_SERVE_TOKEN` is unset) and never
+//! falls back to `LocalOwner`. Read-only `sv1` viewer tokens
+//! (`spawn serve viewer-token`, default `2h`, max `24h` enforced at minting;
+//! rotate `SPAWN_SERVE_TOKEN` to revoke all viewer tokens) allow `GET`/`HEAD`
+//! across every read endpoint including `/api/sessions/<id>/pane`, answer `403`
+//! on mutations, and close established `/api/stream` connections at expiry.
 //! An API read served without the token (no token set, or the local-open
 //! exemption) also needs a `Host` naming this server (127.0.0.1, localhost,
 //! [::1] or the bound address, with its port) and no cross-origin `Origin`:
@@ -148,6 +157,7 @@
 mod answers;
 pub(crate) mod approvals;
 pub(crate) mod attention;
+mod auth_token;
 pub(crate) mod capabilities;
 pub(crate) mod core_lines;
 mod digest;
@@ -158,6 +168,8 @@ mod prov;
 mod pwa;
 mod storage;
 mod stream;
+
+use auth_token::AuthPrincipal;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -213,13 +225,61 @@ pub(super) const MAX_INPUT_TEXT: usize = 8 * 1024;
 
 /// The usage of `spawn serve`, the only copy (main's help reads it).
 pub(crate) const USAGE: &str = "usage: spawn serve [--address <host:port>] [--web <dir>] [--ipc [--ipc-sock <path>] [--cas <dir>]]\n      \
+                                spawn serve viewer-token [--ttl <duration>]\n      \
                                 (the dashboard and the HTTP API, docs/api.md; --address or\n       \
                                 SPAWN_SERVE_ADDRESS, default 127.0.0.1:8787; --web or SPAWN_WEB_DIR,\n       \
                                 default web/dist; off loopback it needs SPAWN_SERVE_TOKEN;\n       \
-                                --ipc serves HTTP/1.1-over-UDS at $XDG_RUNTIME_DIR/spawn/core.sock)";
+                                --ipc serves HTTP/1.1-over-UDS at $XDG_RUNTIME_DIR/spawn/core.sock;\n       \
+                                viewer-token mints a short-lived read-only sv1 token, default 2h, max 24h;\n       \
+                                allows all GET endpoints including live panes; rotate SPAWN_SERVE_TOKEN to revoke)";
+
+/// Dispatch `spawn serve` and `spawn serve viewer-token`.
+pub fn command(rest: &[String]) -> Result<i32, String> {
+    if rest.first().map(String::as_str) == Some("viewer-token") {
+        let flags = Flags::parse(&rest[1..])?;
+        return viewer_token(&flags);
+    }
+    serve(&Flags::parse_with_switches(rest, &["ipc"])?)
+}
+
+/// Mint and print a short-lived read-only `sv1` viewer token (`spawn serve viewer-token`).
+/// Never echoes `SPAWN_SERVE_TOKEN` or any credential value.
+fn viewer_token(flags: &Flags) -> Result<i32, String> {
+    if let Some(unknown) = flags.names().find(|&name| name != "ttl") {
+        return Err(format!(
+            "unknown flag --{unknown} for `spawn serve viewer-token`"
+        ));
+    }
+    let master = match serve_token() {
+        Ok(Some(token)) => zeroize::Zeroizing::new(token),
+        Ok(None) => {
+            return Err(
+                "SPAWN_SERVE_TOKEN (or $CREDENTIALS_DIRECTORY/spawn-serve.token) must be set to mint a viewer token"
+                    .to_string(),
+            );
+        }
+        Err(error) => {
+            eprintln!("serve: {error}");
+            return Ok(crate::config::CREDENTIAL_EXIT_CODE);
+        }
+    };
+    if !is_header_safe_token(&master) {
+        return Err(format!(
+            "refusing to mint viewer token: SPAWN_SERVE_TOKEN must be 1 to {MAX_TOKEN_LEN} visible ASCII characters"
+        ));
+    }
+    let ttl_secs = match flags.get("ttl") {
+        Some(raw) => auth_token::parse_ttl_secs(&raw)?,
+        None => auth_token::DEFAULT_VIEWER_TTL_SECS,
+    };
+    let now_secs = auth_token::current_epoch_secs()?;
+    let (token, _) = auth_token::mint_viewer_token(&master, now_secs, ttl_secs)?;
+    println!("{token}");
+    Ok(0)
+}
 
 /// Serve the API and the built UI until the process is killed.
-pub fn serve(flags: &Flags) -> Result<i32, String> {
+fn serve(flags: &Flags) -> Result<i32, String> {
     if flags.switch("ipc") || flags.get("ipc-sock").is_some() {
         return ipc::run(flags);
     }
@@ -1046,26 +1106,13 @@ fn header<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
         .map(|header| header.value.as_str())
 }
 
-/// Whether `request` carries `token`, as a bearer header or `?token=`.
-fn authorized(request: &Request, query: &str, token: &str) -> bool {
+/// Extract an explicitly presented credential (`Authorization: Bearer` takes priority over `?token=`).
+fn presented_token<'a>(request: &'a Request, query: &'a str) -> Option<&'a str> {
     let bearer = header(request, "Authorization").and_then(|value| {
         let (scheme, rest) = value.split_once(' ')?;
         scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
     });
-    [bearer, parameter(query, "token")]
-        .into_iter()
-        .flatten()
-        .any(|given| same_secret(given.as_bytes(), token.as_bytes()))
-}
-
-/// Byte equality whose time does not depend on where the inputs differ.
-fn same_secret(given: &[u8], expected: &[u8]) -> bool {
-    given.len() == expected.len()
-        && given
-            .iter()
-            .zip(expected)
-            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
-            == 0
+    bearer.or_else(|| parameter(query, "token"))
 }
 
 enum ReaderContext {
@@ -1316,40 +1363,37 @@ fn checkout_human(shared: &Shared) -> Result<ipc::CheckedOutConn, (u16, String)>
         .map_err(ipc::PoolError::status_and_message)
 }
 
-/// What the read guard decided for one API request.
+/// Closed denial reason returned by [`access`] before mapping to HTTP 401 vs 403.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Access {
-    /// It may read (and so ask to write, [`input`]).
-    read: bool,
-    /// It carries the token.
-    token: bool,
+pub(super) enum AccessDenied {
+    Unauthorized,
+    ForbiddenHostOrOrigin,
 }
 
-/// The read guard. Without the token a read needs a Host that names this
-/// server and no foreign Origin (DNS rebinding, a local proxy); with it,
-/// any. With SPAWN_SERVE_LOCAL_OPEN=1 the owner's browser on this machine
-/// needs no token: a client running as the owner's uid can read the token
-/// file anyway. Another user's loopback client still needs it. Off by
-/// default. A client of an open network (SPAWN_SERVE_OPEN_NETWORKS) that
-/// names this server by its address there needs none either.
-fn access(request: &Request, query: &str, shared: &Shared) -> Access {
+/// Resolve the closed authorization principal for one HTTP/SSE request.
+/// Explicitly presented credentials never silently fall back to `LocalOwner`.
+fn access(request: &Request, query: &str, shared: &Shared) -> Result<AuthPrincipal, AccessDenied> {
     let host = header(request, "Host");
     let origin = header(request, "Origin");
     let named = tokenless_request(host, origin, &shared.hosts);
     let peer = request.remote_addr().copied();
-    let Some(token) = shared.token.as_deref() else {
-        return Access {
-            read: named,
-            token: false,
-        };
+    let presented = presented_token(request, query);
+    let Some(master) = shared.token.as_deref() else {
+        if presented.is_some() {
+            return Err(AccessDenied::Unauthorized);
+        }
+        return named
+            .then_some(AuthPrincipal::LocalOwner)
+            .ok_or(AccessDenied::ForbiddenHostOrOrigin);
     };
-    let carries = authorized(request, query, token);
-    Access {
-        read: carries
-            || (named && owners_own_request(peer, shared.port))
-            || open_network_request(peer, host, origin, shared.port, &shared.open),
-        token: carries,
+    if let Some(raw) = presented {
+        return auth_token::authenticate_bearer(raw, master, auth_token::current_epoch_secs().ok())
+            .ok_or(AccessDenied::Unauthorized);
     }
+    ((named && owners_own_request(peer, shared.port))
+        || open_network_request(peer, host, origin, shared.port, &shared.open))
+    .then_some(AuthPrincipal::LocalOwner)
+    .ok_or(AccessDenied::Unauthorized)
 }
 
 /// Every canonical API route `spawn serve` answers: its method (`GET`
@@ -1582,9 +1626,12 @@ fn handle_api_request(
     query: &str,
     shared: &Shared,
 ) -> Result<Option<Request>, String> {
-    let access = access(&request, query, shared);
-    if !access.read {
-        return refuse(request, shared.token.is_some()).map(|()| None);
+    let access = match access(&request, query, shared) {
+        Ok(principal) => principal,
+        Err(reason) => return refuse(request, reason).map(|()| None),
+    };
+    if !access.can_mutate() && !matches!(request.method(), Method::Get | Method::Head) {
+        return refuse_readonly_mutation(request).map(|()| None);
     }
     if path == "/api/features/truth" || path == "/api/episodes" {
         if !matches!(request.method(), Method::Get | Method::Head) {
@@ -1626,7 +1673,7 @@ fn handle_api_request(
             return moved(request, id, "reassign", access, shared).map(|()| None);
         }
         "/api/master/message" => return master_message(request, access, shared).map(|()| None),
-        "/api/stream" => return stream::stream(request, query, shared).map(|()| None),
+        "/api/stream" => return stream::stream(request, query, access, shared).map(|()| None),
         "/api/approvals/<session_id>/act" => {
             return approvals::act(request, id, access, shared).map(|()| None);
         }
@@ -1673,6 +1720,14 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
         };
         request
     } else {
+        if !matches!(request.method(), Method::Get | Method::Head)
+            && matches!(
+                access(&request, query, shared),
+                Ok(AuthPrincipal::ReadOnlyViewer { .. })
+            )
+        {
+            return refuse_readonly_mutation(request);
+        }
         request
     };
     // The PWA shell is the binary's own (serve/pwa.rs), whatever the
@@ -1762,21 +1817,32 @@ pub(super) fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
     })
 }
 
-/// Answer a refused API request: 401 with a bearer challenge when a token
-/// would let it in, 403 when no token is set (its Host or Origin is not this
-/// server's).
-fn refuse(request: Request, token_set: bool) -> Result<(), String> {
-    let response = if token_set {
-        let challenge =
-            Header::from_bytes("WWW-Authenticate", "Bearer").expect("static header is valid");
-        json_response(401, &json!({ "error": "unauthorized" })).with_header(challenge)
-    } else {
-        json_response(
+/// Answer a refused API request: 401 with a bearer challenge when authentication
+/// is required or an explicit credential failed, or 403 when a token-less
+/// server rejects a non-matching Host or cross-origin Origin.
+pub(super) fn refuse(request: Request, reason: AccessDenied) -> Result<(), String> {
+    let response = match reason {
+        AccessDenied::Unauthorized => {
+            let challenge =
+                Header::from_bytes("WWW-Authenticate", "Bearer").expect("static header is valid");
+            json_response(401, &json!({ "error": "unauthorized" })).with_header(challenge)
+        }
+        AccessDenied::ForbiddenHostOrOrigin => json_response(
             403,
             &json!({ "error": "forbidden: the Host or Origin does not name this server" }),
-        )
+        ),
     };
     request.respond(response).map_err(|error| error.to_string())
+}
+
+/// 403 Forbidden returned when a `ReadOnlyViewer` token attempts any mutation.
+fn refuse_readonly_mutation(request: Request) -> Result<(), String> {
+    request
+        .respond(json_response(
+            403,
+            &json!({ "error": auth_token::READONLY_MUTATION_ERROR }),
+        ))
+        .map_err(|error| error.to_string())
 }
 
 /// 405, naming the one method (`allow`) the path takes.
@@ -1792,7 +1858,12 @@ fn not_allowed(allow: &'static str) -> Response<std::io::Cursor<Vec<u8>>> {
 /// `POST /api/sessions/<id>/input`, past the read guard (`access`): a
 /// person's input to session `id`, or a probe of whether one would be taken
 /// (module doc).
-fn input(mut request: Request, id: &str, access: Access, shared: &Shared) -> Result<(), String> {
+fn input(
+    mut request: Request,
+    id: &str,
+    access: AuthPrincipal,
+    shared: &Shared,
+) -> Result<(), String> {
     if *request.method() != Method::Post {
         return request
             .respond(not_allowed("POST"))
@@ -1828,24 +1899,31 @@ struct InputBody {
 /// the write in the refusals ("an input", "a key").
 fn write_body(
     request: &mut Request,
-    access: Access,
+    access: AuthPrincipal,
     shared: &Shared,
     what: &str,
 ) -> Result<(Vec<u8>, Option<String>), (u16, String)> {
-    if !access.token {
-        if !same_origin(header(request, "Host"), header(request, "Origin")) {
-            return Err((
-                403,
-                format!("forbidden: {what} without the token needs this page's own Origin"),
-            ));
+    match access {
+        AuthPrincipal::AdminToken => {}
+        AuthPrincipal::ReadOnlyViewer { .. } => {
+            return Err((403, auth_token::READONLY_MUTATION_ERROR.to_string()));
         }
-        if shared.token.is_none() && !owners_client(request.remote_addr().copied(), shared.port) {
-            return Err((
-                403,
-                "forbidden: with no SPAWN_SERVE_TOKEN set, only the owner's own client on this \
-                 machine types"
-                    .to_string(),
-            ));
+        AuthPrincipal::LocalOwner => {
+            if !same_origin(header(request, "Host"), header(request, "Origin")) {
+                return Err((
+                    403,
+                    format!("forbidden: {what} without the token needs this page's own Origin"),
+                ));
+            }
+            if shared.token.is_none() && !owners_client(request.remote_addr().copied(), shared.port)
+            {
+                return Err((
+                    403,
+                    "forbidden: with no SPAWN_SERVE_TOKEN set, only the owner's own client on this \
+                     machine types"
+                        .to_string(),
+                ));
+            }
         }
     }
     if !is_json(header(request, "Content-Type")) {
@@ -1886,7 +1964,7 @@ pub(super) fn idempotency(
 fn typed(
     request: &mut Request,
     id: &str,
-    access: Access,
+    access: AuthPrincipal,
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "an input")?;
@@ -1987,7 +2065,12 @@ fn apply_input_body_checked(
 
 /// `POST /api/sessions/<id>/key`, past the read guard (`access`): a
 /// person's named key for session `id` (module doc, backlog P1).
-fn key(mut request: Request, id: &str, access: Access, shared: &Shared) -> Result<(), String> {
+fn key(
+    mut request: Request,
+    id: &str,
+    access: AuthPrincipal,
+    shared: &Shared,
+) -> Result<(), String> {
     if *request.method() != Method::Post {
         return request
             .respond(not_allowed("POST"))
@@ -2021,7 +2104,7 @@ struct KeyBody {
 fn pressed(
     request: &mut Request,
     id: &str,
-    access: Access,
+    access: AuthPrincipal,
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "a key")?;
@@ -2079,7 +2162,7 @@ fn moved(
     mut request: Request,
     id: &str,
     action: &str,
-    access: Access,
+    access: AuthPrincipal,
     shared: &Shared,
 ) -> Result<(), String> {
     if *request.method() != Method::Post {
@@ -2121,7 +2204,7 @@ fn move_task(
     request: &mut Request,
     id: &str,
     action: &str,
-    access: Access,
+    access: AuthPrincipal,
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let what = if action == "restart" {
@@ -2197,7 +2280,11 @@ fn apply_move_body_checked(
 /// `POST /api/master/message`, past the read guard (`access`): a person's
 /// message to the supervisor from Master Control (issue #91 P1a; module
 /// doc), or a probe of whether one would be taken.
-fn master_message(mut request: Request, access: Access, shared: &Shared) -> Result<(), String> {
+fn master_message(
+    mut request: Request,
+    access: AuthPrincipal,
+    shared: &Shared,
+) -> Result<(), String> {
     if *request.method() != Method::Post {
         return request
             .respond(not_allowed("POST"))
@@ -2236,7 +2323,7 @@ struct MasterBody {
 /// never refused: the only 409 is a key another request used.
 fn messaged(
     request: &mut Request,
-    access: Access,
+    access: AuthPrincipal,
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "a message")?;
@@ -2310,7 +2397,12 @@ fn apply_master_body_checked(
 
 /// `POST /api/missions/<id>/resume`, past the read guard (`access`): a
 /// person resumes mission `id` on the halt the page showed (module doc).
-fn resume(mut request: Request, id: &str, access: Access, shared: &Shared) -> Result<(), String> {
+fn resume(
+    mut request: Request,
+    id: &str,
+    access: AuthPrincipal,
+    shared: &Shared,
+) -> Result<(), String> {
     if *request.method() != Method::Post {
         return request
             .respond(not_allowed("POST"))
@@ -2344,7 +2436,7 @@ struct ResumeBody {
 fn resumed(
     request: &mut Request,
     id: &str,
-    access: Access,
+    access: AuthPrincipal,
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "a resume")?;
@@ -2621,7 +2713,7 @@ fn coverage_projects(missions: &Value) -> Value {
 fn feature_scan_post(
     mut request: Request,
     query: &str,
-    access: Access,
+    access: AuthPrincipal,
     shared: &Shared,
 ) -> Result<(), String> {
     if *request.method() != Method::Post {
@@ -2629,13 +2721,19 @@ fn feature_scan_post(
             .respond(not_allowed("POST"))
             .map_err(|error| error.to_string());
     }
-    if !access.token && !same_origin(header(&request, "Host"), header(&request, "Origin")) {
-        return request
-            .respond(json_response(
-                403,
-                &json!({ "error": "forbidden: a scan without the token needs this page's own Origin" }),
-            ))
-            .map_err(|error| error.to_string());
+    match access {
+        AuthPrincipal::AdminToken => {}
+        AuthPrincipal::ReadOnlyViewer { .. } => return refuse_readonly_mutation(request),
+        AuthPrincipal::LocalOwner => {
+            if !same_origin(header(&request, "Host"), header(&request, "Origin")) {
+                return request
+                    .respond(json_response(
+                        403,
+                        &json!({ "error": "forbidden: a scan without the token needs this page's own Origin" }),
+                    ))
+                    .map_err(|error| error.to_string());
+            }
+        }
     }
     let _ = read_body(&mut request);
     let paths = with_shared_reader(
@@ -2676,7 +2774,7 @@ struct FeatureAssociateBody {
 fn feature_associate_post(
     mut request: Request,
     query: &str,
-    access: Access,
+    access: AuthPrincipal,
     shared: &Shared,
 ) -> Result<(), String> {
     if *request.method() != Method::Post {
@@ -2711,7 +2809,7 @@ impl From<(u16, String)> for FeatureAssociateRefusal {
 fn feature_associate_checked(
     request: &mut Request,
     query: &str,
-    access: Access,
+    access: AuthPrincipal,
     shared: &Shared,
 ) -> Result<(u16, Value), FeatureAssociateRefusal> {
     let (raw_body, _) = write_body(request, access, shared, "a feature association")?;
@@ -5356,9 +5454,9 @@ mod tests {
         feature_paths, handle, is_json, is_loopback, keep_listening, listen_again_pause,
         local_exemption, log_window, mission_feature_paths, mission_query, objective_json,
         objective_prompt, open_network_request, open_networks, owner_uid, peer_uid, proc_sockets,
-        public_nodes, rsi_objective, rsi_summary, same_origin, same_secret, serve_requests,
-        server_hosts, stream, tokenless_request, typed_text, with_activity, with_fleet_liveness,
-        with_last_gates, with_objectives, with_task_liveness,
+        public_nodes, rsi_objective, rsi_summary, same_origin, serve_requests, server_hosts,
+        stream, tokenless_request, typed_text, with_activity, with_fleet_liveness, with_last_gates,
+        with_objectives, with_task_liveness,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -8682,10 +8780,10 @@ mod tests {
 
     #[test]
     fn secrets_match_only_when_equal() {
-        assert!(same_secret(b"abc", b"abc"));
-        assert!(!same_secret(b"abd", b"abc"));
-        assert!(!same_secret(b"ab", b"abc"));
-        assert!(!same_secret(b"", b"abc"));
+        assert!(super::auth_token::constant_time_eq(b"abc", b"abc"));
+        assert!(!super::auth_token::constant_time_eq(b"abd", b"abc"));
+        assert!(!super::auth_token::constant_time_eq(b"ab", b"abc"));
+        assert!(!super::auth_token::constant_time_eq(b"", b"abc"));
     }
 
     #[test]
@@ -11173,6 +11271,568 @@ mod tests {
 
             server.unblock();
             let _ = server_thread.join();
+        });
+    }
+
+    fn send_method(
+        token: Option<&'static str>,
+        open: &str,
+        method: &str,
+        path: &str,
+        headers: &str,
+        body: &str,
+    ) -> Answer {
+        let len_hdr = if body.is_empty() {
+            String::new()
+        } else {
+            format!("Content-Length: {}\r\n", body.len())
+        };
+        exchange(
+            token,
+            open,
+            None,
+            &format!(
+                "{method} {path} HTTP/1.1\r\n{headers}{len_hdr}Connection: close\r\n\r\n{body}"
+            ),
+        )
+    }
+
+    fn raw_method(port: u16, method: &str, path: &str, headers: &str, body: &str) -> Answer {
+        use std::io::{Read, Write};
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        let len_hdr = if body.is_empty() {
+            String::new()
+        } else {
+            format!("Content-Length: {}\r\n", body.len())
+        };
+        client
+            .write_all(
+                format!(
+                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{headers}{len_hdr}Connection: close\r\n\r\n{body}"
+                )
+                .as_bytes(),
+            )
+            .expect("send");
+        let mut raw = String::new();
+        let _ = client.read_to_string(&mut raw);
+        let (head, resp_body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+        Answer {
+            status: head
+                .split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse().ok())
+                .unwrap_or(0),
+            head: head.to_string(),
+            body: serde_json::from_str(resp_body).unwrap_or(serde_json::Value::Null),
+        }
+    }
+
+    fn assert_viewer_rbac_matrix(viewer: &str, expired: &str, tampered: &str, wrong_secret: &str) {
+        let viewer_json = format!(
+            "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer {viewer}\r\nContent-Type: application/json\r\n"
+        );
+        let mutations = [
+            ("POST", INPUT, r#"{"text":"hi","key":"k1"}"#, false),
+            (
+                "POST",
+                "/api/sessions/session_supervisor/key",
+                r#"{"key":"enter","key_id":"k2"}"#,
+                false,
+            ),
+            (
+                "POST",
+                "/api/missions/1/resume",
+                r#"{"halt":1,"key":"k3"}"#,
+                false,
+            ),
+            (
+                "POST",
+                "/api/sessions/session_supervisor/restart",
+                r#"{"key":"k4"}"#,
+                false,
+            ),
+            (
+                "POST",
+                "/api/sessions/session_supervisor/reassign",
+                r#"{"key":"k5"}"#,
+                false,
+            ),
+            (
+                "POST",
+                "/api/approvals/session_supervisor/act",
+                r#"{"probe":true}"#,
+                false,
+            ),
+            (
+                "POST",
+                "/api/master/message",
+                r#"{"text":"hi","key":"k6"}"#,
+                false,
+            ),
+            ("POST", "/api/features/scan", "{}", false),
+            (
+                "POST",
+                "/api/features/associate",
+                r#"{"path":"a","features":["b"]}"#,
+                false,
+            ),
+            ("PUT", "/api/fleet", "{}", false),
+            ("PATCH", "/api/missions", "{}", false),
+            ("DELETE", INPUT, "", false),
+            ("POST", "/", "{}", false),
+            ("POST", INPUT, r#"{"text":"hi","key":"k7"}"#, true),
+        ];
+        for (method, path, body, use_query) in mutations {
+            let (target, hdrs) = if use_query {
+                (
+                    format!("{path}?token={viewer}"),
+                    "Host: 127.0.0.1:PORT\r\nContent-Type: application/json\r\n".to_string(),
+                )
+            } else {
+                (path.to_string(), viewer_json.clone())
+            };
+            let ans = send_method(Some("secret"), "127.0.0.0/8", method, &target, &hdrs, body);
+            assert_eq!(ans.status, 403, "{method} {path}: {ans:?}");
+            assert_eq!(
+                ans.body["error"].as_str(),
+                Some(super::auth_token::READONLY_MUTATION_ERROR),
+                "{method} {path}: {ans:?}"
+            );
+        }
+
+        for bad in [expired, tampered, wrong_secret] {
+            let hdrs = format!(
+                "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer {bad}\r\nContent-Type: application/json\r\n"
+            );
+            let bad_get = send_method(
+                Some("secret"),
+                "127.0.0.0/8",
+                "GET",
+                "/api/overview",
+                &hdrs,
+                "",
+            );
+            assert_eq!(bad_get.status, 401, "{bad_get:?}");
+            assert!(
+                bad_get.head.contains("WWW-Authenticate: Bearer"),
+                "{}",
+                bad_get.head
+            );
+
+            let bad_post = send_method(Some("secret"), "127.0.0.0/8", "POST", INPUT, &hdrs, BODY);
+            assert_eq!(bad_post.status, 401, "{bad_post:?}");
+        }
+    }
+
+    #[test]
+    fn viewer_token_http_rbac_allows_static_and_blocks_all_mutations_with_403() {
+        let now = super::auth_token::current_epoch_secs().expect("clock");
+        let (viewer, _) =
+            super::auth_token::mint_viewer_token("secret", now, 3_600).expect("mint viewer");
+        let (expired, _) =
+            super::auth_token::mint_viewer_token("secret", now.saturating_sub(120), 60)
+                .expect("mint expired");
+        let mut tampered_bytes = viewer.clone().into_bytes();
+        let last = tampered_bytes.len() - 1;
+        tampered_bytes[last] = if tampered_bytes[last] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        let tampered = String::from_utf8(tampered_bytes).expect("ascii");
+        let (wrong_secret, _) =
+            super::auth_token::mint_viewer_token("other-secret", now, 3_600).expect("mint wrong");
+
+        let viewer_auth = format!("Host: 127.0.0.1:PORT\r\nAuthorization: Bearer {viewer}\r\n");
+        let root_get = send_method(
+            Some("secret"),
+            "",
+            "GET",
+            "/manifest.webmanifest",
+            &viewer_auth,
+            "",
+        );
+        assert_eq!(root_get.status, 200, "{}", root_get.head);
+        let root_head = send_method(
+            Some("secret"),
+            "",
+            "HEAD",
+            "/manifest.webmanifest",
+            &viewer_auth,
+            "",
+        );
+        assert_eq!(root_head.status, 200, "{}", root_head.head);
+
+        assert_viewer_rbac_matrix(&viewer, &expired, &tampered, &wrong_secret);
+
+        let admin_post = post(Some("secret"), "", None, INPUT, SCRIPT, BODY);
+        assert_ne!(admin_post.status, 401, "{admin_post:?}");
+        assert_ne!(admin_post.status, 403, "{admin_post:?}");
+    }
+
+    #[test]
+    fn viewer_token_precedence_and_tokenless_explicit_credentials_fail_closed_with_401() {
+        let now = super::auth_token::current_epoch_secs().expect("clock");
+        let (viewer, _) =
+            super::auth_token::mint_viewer_token("secret", now, 3_600).expect("mint viewer");
+        let (expired, _) =
+            super::auth_token::mint_viewer_token("secret", now.saturating_sub(120), 60)
+                .expect("mint expired");
+
+        // Authorization: Bearer takes strict precedence over ?token=.
+        let bad_bearer_good_query = send_method(
+            Some("secret"),
+            "127.0.0.0/8",
+            "GET",
+            "/api/overview?token=secret",
+            "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer wrong-secret\r\n",
+            "",
+        );
+        assert_eq!(bad_bearer_good_query.status, 401);
+        assert!(
+            bad_bearer_good_query
+                .head
+                .contains("WWW-Authenticate: Bearer")
+        );
+
+        let expired_bearer_valid_query = send_method(
+            Some("secret"),
+            "127.0.0.0/8",
+            "GET",
+            &format!("/api/overview?token={viewer}"),
+            &format!("Host: 127.0.0.1:PORT\r\nAuthorization: Bearer {expired}\r\n"),
+            "",
+        );
+        assert_eq!(expired_bearer_valid_query.status, 401);
+
+        let viewer_bearer_admin_query_post = send_method(
+            Some("secret"),
+            "",
+            "POST",
+            "/api/sessions/session_supervisor/input?token=secret",
+            &format!(
+                "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer {viewer}\r\nContent-Type: application/json\r\n"
+            ),
+            r#"{"text":"hi","key":"k-prec"}"#,
+        );
+        assert_eq!(viewer_bearer_admin_query_post.status, 403);
+
+        let admin_bearer_bad_query = send_method(
+            Some("secret"),
+            "",
+            "GET",
+            "/api/overview?token=not-valid",
+            "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret\r\n",
+            "",
+        );
+        assert_ne!(admin_bearer_bad_query.status, 401);
+        assert_ne!(admin_bearer_bad_query.status, 403);
+
+        // Token-less server rejects ANY explicit credential fail-closed with 401.
+        for (method, path, hdrs) in [
+            (
+                "GET",
+                "/api/overview",
+                "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer arbitrary-token\r\n",
+            ),
+            (
+                "GET",
+                "/api/overview",
+                &format!("Host: 127.0.0.1:PORT\r\nAuthorization: Bearer {viewer}\r\n"),
+            ),
+            (
+                "GET",
+                "/api/overview?token=arbitrary-query-token",
+                "Host: 127.0.0.1:PORT\r\n",
+            ),
+            (
+                "POST",
+                INPUT,
+                "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer arbitrary-token\r\nContent-Type: application/json\r\n",
+            ),
+        ] {
+            let ans = send_method(None, "", method, path, hdrs, "");
+            assert_eq!(ans.status, 401, "{method} {path}: {ans:?}");
+            assert!(
+                ans.head.contains("WWW-Authenticate: Bearer"),
+                "{}",
+                ans.head
+            );
+        }
+
+        // Credential-less token-less request with foreign Host still answers 403.
+        let foreign_host = send_method(
+            None,
+            "",
+            "GET",
+            "/api/overview",
+            "Host: attacker.example:PORT\r\n",
+            "",
+        );
+        assert_eq!(foreign_host.status, 403);
+    }
+
+    fn with_live_viewer_server(
+        owner: &str,
+        master: &str,
+        body: impl FnOnce(u16, &Arc<super::ipc::ServePools>),
+    ) {
+        let config = super::ipc::PoolConfig {
+            reads: 2,
+            writes: 1,
+            node: 1,
+            events: 2,
+            wait_timeout: std::time::Duration::from_millis(500),
+        };
+        let pools = super::ipc::ServePools::from_serve_env(Some(owner), None, config)
+            .expect("pools")
+            .expect("configured");
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("listen"));
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let shared = Arc::new(Shared {
+            web: std::env::temp_dir(),
+            token: Some(master.to_string()),
+            port: Some(port),
+            hosts: server_hosts("127.0.0.1:0", port),
+            open: Vec::new(),
+            pools: Ok(Some(Arc::clone(&pools))),
+        });
+        let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
+        let server_for_loop = Arc::clone(&server);
+        let server_shared = Arc::clone(&shared);
+        let server_streams = Arc::clone(&streams);
+        let server_thread = std::thread::spawn(move || {
+            super::serve_requests_with_queue(
+                &server_for_loop,
+                &server_shared,
+                MAX_IN_FLIGHT,
+                super::MAX_REQUEST_QUEUE,
+                &server_streams,
+            )
+        });
+        body(port, &pools);
+        server.unblock();
+        let _ = server_thread.join();
+    }
+
+    fn open_query_sse(port: u16, token: &str) -> std::net::TcpStream {
+        use std::io::Write;
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(
+            client,
+            "GET /api/stream?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )
+        .unwrap();
+        client.flush().unwrap();
+        let _ = read_tcp_until(&mut client, "event: ready\n");
+        client
+    }
+
+    fn verify_live_viewer_requests(
+        port: u16,
+        master: &str,
+        viewer: &str,
+        expired: &str,
+        store: &spawn_postgres::PostgresStore,
+    ) {
+        use spawn_core::port::EventLog;
+
+        let bearer_hdr = format!("Authorization: Bearer {viewer}\r\n");
+        for (path, hdr) in [
+            ("/api/overview", bearer_hdr.as_str()),
+            ("/api/fleet", bearer_hdr.as_str()),
+            (&format!("/api/overview?token={viewer}"), ""),
+        ] {
+            let (st, body) = raw_status(port, path, hdr);
+            assert_eq!(st, 200, "GET {path}: {body}");
+        }
+        let head_ans = raw_method(port, "HEAD", "/api/overview", &bearer_hdr, "");
+        assert_eq!(head_ans.status, 200, "{}", head_ans.head);
+
+        let mut sse_bearer = open_tcp_sse(port, viewer);
+        let mut sse_query = open_query_sse(port, viewer);
+        let (expired_st, _) = raw_status(
+            port,
+            "/api/stream",
+            &format!("Authorization: Bearer {expired}\r\n"),
+        );
+        assert_eq!(expired_st, 401);
+
+        let live_id = store
+            .append(spawn_core::event::NewEvent {
+                agent_id: spawn_core::id::AgentId::new("agent_viewer_sse").unwrap(),
+                session_id: spawn_core::id::SessionId::new("session_viewer_sse").unwrap(),
+                execution_id: None,
+                source: spawn_core::event::Source::Bridge,
+                source_event_id: Some("viewer-sse-live".to_string()),
+                kind: spawn_core::event::EventKind::MessageReceived,
+            })
+            .unwrap()
+            .record
+            .position
+            .0;
+        for sse in [&mut sse_bearer, &mut sse_query] {
+            let seen = read_tcp_until(sse, &format!("id: {live_id}\n"));
+            assert!(seen.contains("\"session_viewer_sse\""), "{seen}");
+        }
+        drop((sse_bearer, sse_query));
+
+        let viewer_post = raw_method(
+            port,
+            "POST",
+            "/api/sessions/session_viewer_sse/input",
+            &format!("{bearer_hdr}Content-Type: application/json\r\n"),
+            r#"{"probe":true}"#,
+        );
+        assert_eq!(viewer_post.status, 403, "{viewer_post:?}");
+        assert_eq!(
+            viewer_post.body["error"].as_str(),
+            Some(super::auth_token::READONLY_MUTATION_ERROR)
+        );
+
+        let admin_post = raw_method(
+            port,
+            "POST",
+            "/api/sessions/session_viewer_sse/input",
+            &format!("Authorization: Bearer {master}\r\nContent-Type: application/json\r\n"),
+            r#"{"probe":true}"#,
+        );
+        assert_eq!(admin_post.status, 200, "{admin_post:?}");
+        assert_eq!(admin_post.body["writable"], true);
+    }
+
+    #[test]
+    fn viewer_token_live_http_reads_and_sse_stream_succeed_while_mutations_return_403() {
+        in_test_schema(|owner, store| {
+            execution_starts(store);
+            let master = "viewer-live-master-secret";
+            let now = super::auth_token::current_epoch_secs().expect("clock");
+            let (viewer, _) =
+                super::auth_token::mint_viewer_token(master, now, 3_600).expect("mint viewer");
+            let (expired, _) =
+                super::auth_token::mint_viewer_token(master, now.saturating_sub(120), 60)
+                    .expect("mint expired");
+            with_live_viewer_server(owner, master, |port, _pools| {
+                verify_live_viewer_requests(port, master, &viewer, &expired, store);
+            });
+        });
+    }
+
+    fn open_close_query_sse(port: u16, token: &str) -> std::net::TcpStream {
+        use std::io::Write;
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(
+            client,
+            "GET /api/stream?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        client.flush().unwrap();
+        let _ = read_tcp_until(&mut client, "event: ready\n");
+        client
+    }
+
+    fn assert_no_trailing_bytes(client: &mut std::net::TcpStream) {
+        use std::io::Read as _;
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(400)))
+            .expect("short timeout");
+        let mut buf = [0_u8; 256];
+        match client.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!(
+                "unexpected bytes after chunked EOF: {:?}",
+                String::from_utf8_lossy(&buf[..n])
+            ),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(err) => panic!("unexpected trailing read error: {err}"),
+        }
+    }
+
+    #[test]
+    fn viewer_token_sse_stream_closes_at_expiry_without_post_expiry_events() {
+        use spawn_core::port::EventLog as _;
+        use std::io::Read as _;
+
+        in_test_schema(|owner, store| {
+            execution_starts(store);
+            let master = "viewer-sse-expiry-master";
+            with_live_viewer_server(owner, master, |port, pools| {
+                let now = super::auth_token::current_epoch_secs().expect("clock");
+                let (short_viewer, expires_at_ms) =
+                    super::auth_token::mint_viewer_token(master, now, 2)
+                        .expect("mint 2s viewer token");
+                let mut sse_keepalive = open_tcp_sse(port, &short_viewer);
+                let mut sse_close = open_close_query_sse(port, &short_viewer);
+                sse_close
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("read timeout");
+
+                while super::auth_token::current_epoch_ms()
+                    .is_some_and(|ms| ms < expires_at_ms + 1_000)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                let after_id = store
+                    .append(spawn_core::event::NewEvent {
+                        agent_id: spawn_core::id::AgentId::new("agent_viewer_expired_sse").unwrap(),
+                        session_id: spawn_core::id::SessionId::new("session_viewer_expired_sse")
+                            .unwrap(),
+                        execution_id: None,
+                        source: spawn_core::event::Source::Bridge,
+                        source_event_id: Some("viewer-sse-after-expiry".to_string()),
+                        kind: spawn_core::event::EventKind::MessageReceived,
+                    })
+                    .unwrap()
+                    .record
+                    .position
+                    .0;
+                std::thread::sleep(std::time::Duration::from_millis(350));
+
+                let mut close_tail = String::new();
+                sse_close
+                    .read_to_string(&mut close_tail)
+                    .expect("expired Connection: close SSE must end at TCP EOF");
+                assert!(close_tail.ends_with("0\r\n\r\n"), "{close_tail:?}");
+
+                let ka_tail = read_tcp_until(&mut sse_keepalive, "0\r\n\r\n");
+                assert_no_trailing_bytes(&mut sse_keepalive);
+
+                for tail in [&close_tail, &ka_tail] {
+                    assert!(
+                        !tail.contains("session_viewer_expired_sse"),
+                        "post-expiry event leaked to expired SSE stream: {tail}"
+                    );
+                    assert!(
+                        !tail.contains(&format!("id: {after_id}\n")),
+                        "post-expiry event id leaked to expired SSE stream: {tail}"
+                    );
+                }
+                drop((sse_close, sse_keepalive));
+
+                let bearer_hdr = format!("Authorization: Bearer {short_viewer}\r\n");
+                let (overview_st, overview_body) = raw_status(port, "/api/overview", &bearer_hdr);
+                assert_eq!(overview_st, 401, "{overview_body}");
+                let (stream_bearer_st, stream_bearer_body) =
+                    raw_status(port, "/api/stream", &bearer_hdr);
+                assert_eq!(stream_bearer_st, 401, "{stream_bearer_body}");
+                let (stream_query_st, stream_query_body) =
+                    raw_status(port, &format!("/api/stream?token={short_viewer}"), "");
+                assert_eq!(stream_query_st, 401, "{stream_query_body}");
+
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while pools.events.stats().0 != 0 && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                assert_eq!(pools.events.stats().0, 0);
+            });
         });
     }
 }
