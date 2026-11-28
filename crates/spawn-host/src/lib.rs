@@ -30,6 +30,7 @@ pub mod git_border;
 pub mod git_process;
 pub mod herdr;
 pub mod herdr_core;
+pub mod herdr_global;
 pub mod herdr_witness;
 pub mod home;
 pub mod merkle_merge;
@@ -84,6 +85,7 @@ pub use git_process::git_command;
 pub use git_process::test_git_command;
 pub use herdr::{HerdrHost, HerdrPool};
 pub use herdr_core::HerdrCoreHost;
+pub use herdr_global::HerdrGlobalClient;
 pub use merkle_merge::{
     ConflictKind, ConflictLabels, MergeBaseError, MergeDriver, MergeOptions, MergeShadowOutcome,
     MergeSnapshotSpec, ShadowOracleSummary, build_merge_snapshot, classify_shadow_merge,

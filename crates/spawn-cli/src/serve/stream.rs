@@ -66,7 +66,9 @@
 //!   (`{id, agent_id, session_id, execution_id, source, event_name, detail,
 //!   recorded_at_ms}`), the probe comment `:` every [`PROBE`] with nothing
 //!   to say, and the comment `: keepalive` in its place every
-//!   [`KEEPALIVE`] of quiet.
+//!   [`KEEPALIVE`] of quiet. A stream opened with [`AuthPrincipal::ReadOnlyViewer`]
+//!   closes automatically at its `expires_at_ms` deadline so expired viewer
+//!   tokens receive no post-expiry events or probes.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -80,7 +82,8 @@ use spawn_core::port::StoreError;
 use spawn_postgres::PostgresStore;
 use tiny_http::{Method, Request};
 
-use super::{BAD_REQUEST, json_response, not_allowed, parameter};
+use super::auth_token::{AuthPrincipal, current_epoch_ms};
+use super::{AccessDenied, BAD_REQUEST, json_response, not_allowed, parameter, refuse};
 
 /// Streams served at once, beside the requests' own slots.
 pub(super) const SSE_SLOTS: usize = 64;
@@ -582,9 +585,165 @@ pub(crate) fn cursor(last_event_id: Option<&str>, query: &str) -> Result<Option<
         .transpose()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamWindow {
+    Unbounded,
+    Remaining(Duration),
+    Expired,
+}
+
+fn stream_window(deadline_ms: Option<i64>, now_ms: Option<i64>) -> StreamWindow {
+    let Some(expires_at_ms) = deadline_ms else {
+        return StreamWindow::Unbounded;
+    };
+    let Some(now) = now_ms else {
+        return StreamWindow::Expired;
+    };
+    match expires_at_ms.checked_sub(now) {
+        Some(remaining_ms) if remaining_ms > 0 => u64::try_from(remaining_ms)
+            .map_or(StreamWindow::Expired, |ms| {
+                StreamWindow::Remaining(Duration::from_millis(ms))
+            }),
+        _ => StreamWindow::Expired,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmitOutcome {
+    Sent,
+    Expired,
+    WriteFailed,
+}
+
+fn encode_chunk(text: &str) -> String {
+    format!("{:x}\r\n{text}\r\n", text.len())
+}
+
+fn emit_raw_bounded(writer: &mut TimedWriter, text: &str, deadline_ms: Option<i64>) -> EmitOutcome {
+    let sent = match stream_window(deadline_ms, current_epoch_ms()) {
+        StreamWindow::Expired => return EmitOutcome::Expired,
+        StreamWindow::Unbounded => writer.emit(text).is_ok(),
+        StreamWindow::Remaining(remaining) => writer.emit_within(text, remaining).is_ok(),
+    };
+    if sent {
+        EmitOutcome::Sent
+    } else {
+        EmitOutcome::WriteFailed
+    }
+}
+
+fn emit_sse_bounded(
+    writer: &mut TimedWriter,
+    text: &str,
+    chunked: bool,
+    deadline_ms: Option<i64>,
+) -> EmitOutcome {
+    if text.is_empty() {
+        return EmitOutcome::Sent;
+    }
+    if chunked {
+        emit_raw_bounded(writer, &encode_chunk(text), deadline_ms)
+    } else {
+        emit_raw_bounded(writer, text, deadline_ms)
+    }
+}
+
+fn finish_chunked(writer: &mut TimedWriter, chunked: bool) {
+    if chunked {
+        let _ = writer.emit_within("0\r\n\r\n", Duration::from_millis(500));
+    }
+}
+
+fn stream_head(chunked: bool) -> String {
+    if chunked {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n\
+             Cache-Control: no-cache, no-store\r\nConnection: close\r\n\
+             Transfer-Encoding: chunked\r\nX-Accel-Buffering: no\r\n\r\n{}",
+            encode_chunk("retry: 3000\n\n")
+        )
+    } else {
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n\
+         Cache-Control: no-cache, no-store\r\nConnection: close\r\n\
+         X-Accel-Buffering: no\r\n\r\nretry: 3000\n\n"
+            .to_string()
+    }
+}
+
+fn pump_live_frames(
+    live: &Subscription,
+    writer: &mut TimedWriter,
+    mut sent: i64,
+    keepalive: Duration,
+    chunked: bool,
+    deadline_ms: Option<i64>,
+) -> bool {
+    // A quiet stream probes every PROBE (never less often than its
+    // keepalive), and says `: keepalive` once `keepalive` has passed
+    // since its last frame or keepalive; any active deadline bounds wait time.
+    let probe = PROBE.min(keepalive);
+    let mut said = Instant::now();
+    loop {
+        let wait = match stream_window(deadline_ms, current_epoch_ms()) {
+            StreamWindow::Expired => return true,
+            StreamWindow::Unbounded => probe,
+            StreamWindow::Remaining(remaining) => probe.min(remaining),
+        };
+        match live.recv_timeout(wait) {
+            Ok(frame) => {
+                if frame.id.is_some_and(|id| id <= sent) {
+                    continue;
+                }
+                sent = frame.id.unwrap_or(sent);
+                match emit_sse_bounded(writer, &frame.render(), chunked, deadline_ms) {
+                    EmitOutcome::Sent => said = Instant::now(),
+                    EmitOutcome::Expired => return true,
+                    EmitOutcome::WriteFailed => return false,
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if matches!(
+                    stream_window(deadline_ms, current_epoch_ms()),
+                    StreamWindow::Expired
+                ) {
+                    return true;
+                }
+                let text = if said.elapsed() >= keepalive {
+                    said = Instant::now();
+                    ": keepalive\n\n"
+                } else {
+                    PROBE_FRAME
+                };
+                match emit_sse_bounded(writer, text, chunked, deadline_ms) {
+                    EmitOutcome::Sent => {}
+                    EmitOutcome::Expired => return true,
+                    EmitOutcome::WriteFailed => return false,
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // Dropped by the hub: too slow to keep up.
+                return matches!(
+                    emit_sse_bounded(
+                        writer,
+                        &resync("slow_consumer", sent, None).render(),
+                        chunked,
+                        deadline_ms,
+                    ),
+                    EmitOutcome::Sent | EmitOutcome::Expired
+                );
+            }
+        }
+    }
+}
+
 /// `GET /api/stream` (module doc), past the slots and the read guard
 /// (`handle` refuses a stream exactly as any API read).
-pub(super) fn stream(request: Request, query: &str, shared: &super::Shared) -> Result<(), String> {
+pub(super) fn stream(
+    request: Request,
+    query: &str,
+    principal: AuthPrincipal,
+    shared: &super::Shared,
+) -> Result<(), String> {
     let pools = super::stream_pools(shared);
     let open_reader = || -> Result<super::PooledStore, String> {
         match &pools {
@@ -597,25 +756,38 @@ pub(super) fn stream(request: Request, query: &str, shared: &super::Shared) -> R
         // free for transient catch-up and ordinary HTTP/IPC reads.
         if *request.method() == Method::Get
             && cursor(super::header(&request, "Last-Event-ID"), query).is_ok()
+            && !matches!(
+                stream_window(principal.stream_expires_at_ms(), current_epoch_ms()),
+                StreamWindow::Expired
+            )
         {
             active_pools.ensure_stream_listener();
         }
         return serve_stream(
             request,
             query,
+            principal,
             &active_pools.events_hub,
             &open_reader,
             KEEPALIVE,
         );
     }
     let fallback_hub = Hub::new(CLIENT_BUFFER);
-    serve_stream(request, query, &fallback_hub, &open_reader, KEEPALIVE)
+    serve_stream(
+        request,
+        query,
+        principal,
+        &fallback_hub,
+        &open_reader,
+        KEEPALIVE,
+    )
 }
 
-/// A stream on `hub`, its catch-up read through `open`.
+/// A stream on `hub`, its catch-up read through `open`, bounded by `principal` expiry if set.
 pub(super) fn serve_stream<S: StoreHandle>(
     request: Request,
     query: &str,
+    principal: AuthPrincipal,
     hub: &Hub,
     open: &dyn Fn() -> Result<S, String>,
     keepalive: Duration,
@@ -633,6 +805,13 @@ pub(super) fn serve_stream<S: StoreHandle>(
                 .map_err(|error| error.to_string());
         }
     };
+    let deadline_ms = principal.stream_expires_at_ms();
+    if matches!(
+        stream_window(deadline_ms, current_epoch_ms()),
+        StreamWindow::Expired
+    ) {
+        return refuse(request, AccessDenied::Unauthorized);
+    }
     // Subscribed before the catch-up is read, so no event falls between
     // the two; one read in both is sent once (`sent`).
     let live = hub.subscribe();
@@ -649,7 +828,7 @@ pub(super) fn serve_stream<S: StoreHandle>(
                 .map_err(|error| error.to_string());
         }
     };
-    let (first, mut sent) = match catch_up(store.store(), wanted) {
+    let (first, sent) = match catch_up(store.store(), wanted) {
         Ok(caught) => caught,
         Err(error) => {
             store.mark_broken();
@@ -659,55 +838,34 @@ pub(super) fn serve_stream<S: StoreHandle>(
         }
     };
     drop(store);
+    if matches!(
+        stream_window(deadline_ms, current_epoch_ms()),
+        StreamWindow::Expired
+    ) {
+        return refuse(request, AccessDenied::Unauthorized);
+    }
     // The listener, if it has no cursor, starts no later than this.
     live.floor(sent);
+    let chunked = *request.http_version() >= tiny_http::HTTPVersion(1, 1);
     let mut writer = TimedWriter::new(request.into_writer(), WRITE_TIMEOUT);
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n\
-                Cache-Control: no-cache, no-store\r\nConnection: close\r\n\
-                X-Accel-Buffering: no\r\n\r\nretry: 3000\n\n";
-    if writer.emit(head).is_err() {
+    let head = stream_head(chunked);
+    if emit_raw_bounded(&mut writer, &head, deadline_ms) != EmitOutcome::Sent {
         return Ok(());
     }
     for frame in &first {
-        if writer.emit(&frame.render()).is_err() {
-            return Ok(());
-        }
-    }
-    // A quiet stream probes every PROBE (never less often than its
-    // keepalive), and says `: keepalive` once `keepalive` has passed
-    // since its last frame or keepalive.
-    let probe = PROBE.min(keepalive);
-    let mut said = Instant::now();
-    loop {
-        match live.recv_timeout(probe) {
-            Ok(frame) => {
-                if frame.id.is_some_and(|id| id <= sent) {
-                    continue;
-                }
-                sent = frame.id.unwrap_or(sent);
-                if writer.emit(&frame.render()).is_err() {
-                    return Ok(());
-                }
-                said = Instant::now();
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                let text = if said.elapsed() >= keepalive {
-                    said = Instant::now();
-                    ": keepalive\n\n"
-                } else {
-                    PROBE_FRAME
-                };
-                if writer.emit(text).is_err() {
-                    return Ok(());
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                // Dropped by the hub: too slow to keep up.
-                let _ = writer.emit(&resync("slow_consumer", sent, None).render());
+        match emit_sse_bounded(&mut writer, &frame.render(), chunked, deadline_ms) {
+            EmitOutcome::Sent => {}
+            EmitOutcome::Expired => {
+                finish_chunked(&mut writer, chunked);
                 return Ok(());
             }
+            EmitOutcome::WriteFailed => return Ok(()),
         }
     }
+    if pump_live_frames(&live, &mut writer, sent, keepalive, chunked, deadline_ms) {
+        finish_chunked(&mut writer, chunked);
+    }
+    Ok(())
 }
 
 /// A stream's writer whose every write is bounded by a timeout: the raw
@@ -746,14 +904,19 @@ impl TimedWriter {
         }
     }
 
-    /// Write `text` whole, or fail: an error, or no end in time.
+    /// Write `text` whole within `self.timeout`, or fail: an error, or no end in time.
     pub(super) fn emit(&mut self, text: &str) -> std::io::Result<()> {
+        self.emit_within(text, self.timeout)
+    }
+
+    /// Write `text` whole within `self.timeout.min(timeout)`, or fail: an error, or no end in time.
+    pub(super) fn emit_within(&mut self, text: &str, timeout: Duration) -> std::io::Result<()> {
         let gone =
             || std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the stream's writer ended");
         self.chunks
             .try_send(text.as_bytes().to_vec())
             .map_err(|_| gone())?;
-        match self.done.recv_timeout(self.timeout) {
+        match self.done.recv_timeout(self.timeout.min(timeout)) {
             Ok(written) => written,
             Err(RecvTimeoutError::Timeout) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,

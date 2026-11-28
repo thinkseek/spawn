@@ -337,6 +337,9 @@ export class LiveStream {
   /** Tabs do not share this stream: it is closed while the tab is hidden. */
   private solo = false;
   private paused = false;
+  private stopped = false;
+  private lockRequested = false;
+  private releaseLock: (() => void) | null = null;
   /** The stream being ended is made again at once, without a pause. */
   private reconnectNow = false;
   private current: LiveStatus = { state: "idle", retry_at_ms: null, error: null, leader: false, last_event_id: null };
@@ -366,9 +369,34 @@ export class LiveStream {
     return () => this.listeners.delete(listener);
   }
 
-  /** Begin (once): lead when this tab gets the lock, else follow. */
+  /** Begin (or resume after [`stop`]): lead when this tab gets the lock, else follow. */
   start(): void {
-    if (this.started) return;
+    this.stopped = false;
+    if (this.started) {
+      this.paused = false;
+      this.attempt = 0;
+      if (!this.solo && !this.leader) {
+        this.requestLeadership();
+        return;
+      }
+      if (!this.leader) {
+        this.wake();
+        return;
+      }
+      if (this.solo && this.hidden()) {
+        this.paused = true;
+        this.setStatus({ state: "paused", retry_at_ms: null, leader: true });
+        return;
+      }
+      if (this.abort !== null) {
+        this.reconnectNow = true;
+        this.abort.abort();
+        return;
+      }
+      this.clear();
+      void this.connect();
+      return;
+    }
     this.started = true;
     try {
       this.channel = this.deps.channel?.() ?? null;
@@ -394,22 +422,53 @@ export class LiveStream {
       this.lead();
       return;
     }
+    this.requestLeadership();
+  }
+
+  /** Stop reconnecting, close any active stream, and release the shared lock if held. */
+  stop(): void {
+    this.stopped = true;
+    this.paused = true;
+    this.reconnectNow = false;
+    this.attempt = 0;
+    this.clear();
+    this.abort?.abort();
+    const stepDown = !this.solo && this.leader;
+    if (stepDown) this.leader = false;
+    const release = this.releaseLock;
+    this.releaseLock = null;
+    release?.();
+    this.setStatus({ state: "idle", retry_at_ms: null, error: null, leader: this.leader });
+  }
+
+  private requestLeadership(): void {
+    const locks = this.channel ? this.deps.locks : null;
+    if (!locks || this.lockRequested || this.stopped) return;
+    this.lockRequested = true;
     this.setStatus({ state: "connecting", retry_at_ms: null, error: null, leader: false });
     this.post({ type: "hello" });
     locks
       .request(LOCK_NAME, () => {
+        if (this.stopped) return Promise.resolve();
         this.lead();
-        // Held for as long as this tab lives.
-        return new Promise<void>(() => undefined);
+        return new Promise<void>((resolve) => {
+          this.releaseLock = resolve;
+        });
       })
-      .catch(() => this.lead());
+      .catch(() => {
+        if (!this.stopped) this.lead();
+      })
+      .finally(() => {
+        this.lockRequested = false;
+        this.releaseLock = null;
+      });
   }
 
   /** Connect now if this tab leads and is not connected (a page shown
    * again, a network back), and make a stale stream again at once; a
    * follower asks the leader. */
   wake(): void {
-    if (!this.started) return;
+    if (!this.started || this.stopped) return;
     if (!this.leader) {
       this.post({ type: "wake" });
       return;
@@ -447,11 +506,11 @@ export class LiveStream {
     if (this.leader) return;
     this.leader = true;
     this.setStatus({ leader: true });
-    void this.connect();
+    if (!this.stopped && !this.paused) void this.connect();
   }
 
   private heard(message: Wire): void {
-    if (!message || typeof message !== "object") return;
+    if (this.stopped || !message || typeof message !== "object") return;
     if (message.type === "hello") {
       if (this.leader) this.post({ type: "signal", signal: { kind: "status", status: this.current } });
       return;
@@ -549,9 +608,9 @@ export class LiveStream {
         signal: controller.signal,
         cache: "no-store",
       });
-      if (response.status === 401 || response.status === 403) {
+      if (response.status === 401) {
         unauthorized = true;
-        failure = `HTTP ${response.status}: the token is missing or wrong`;
+        failure = "HTTP 401: the token is missing or wrong";
       } else if (!response.ok || response.body === null) {
         failure = `HTTP ${response.status}`;
       } else {

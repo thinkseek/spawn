@@ -541,3 +541,124 @@ test("tabs that cannot share a stream close it while hidden and resume from the 
   assert.equal(fetched, 0);
   assert.equal(later.status.state, "paused");
 });
+
+test("stop halts reconnects and start resumes with fresh headers", async () => {
+  const time = clock();
+  let token = "first";
+  const seenAuth: string[] = [];
+  let listener: (() => void) | null = null;
+  const page = { visibilityState: "visible", addEventListener: (_: string, fn: () => void) => void (listener = fn) };
+  const stream = new LiveStream(
+    deps(
+      {
+        headers: () => ({ Authorization: `Bearer ${token}` }),
+        document: page,
+        fetch: async (_url, init) => {
+          seenAuth.push(init.headers.Authorization ?? "");
+          return response(200, ['event: ready\ndata: {"latest_event_id":1,"replayed":0}\n\n'], true);
+        },
+      },
+      time,
+    ),
+  );
+  stream.start();
+  await tick();
+  await tick();
+  assert.equal(stream.status.state, "live");
+  assert.deepEqual(seenAuth, ["Bearer first"]);
+
+  stream.stop();
+  await tick();
+  assert.equal(stream.status.state, "idle");
+  // Visibility transitions while stopped must not wake a logged-out stream.
+  listener?.();
+  await tick();
+  assert.equal(seenAuth.length, 1);
+
+  token = "second";
+  stream.start();
+  await tick();
+  await tick();
+  assert.equal(stream.status.state, "live");
+  assert.deepEqual(seenAuth, ["Bearer first", "Bearer second"]);
+});
+
+test("a 403 stream refusal retries without marking unauthorized, and stop() releases the Web Lock to a waiting follower", async () => {
+  const time = clock();
+  const blocked = new LiveStream(
+    deps(
+      {
+        fetch: async () => response(403, []),
+      },
+      time,
+    ),
+  );
+  blocked.start();
+  await tick();
+  assert.equal(blocked.status.state, "retrying");
+  assert.equal(blocked.status.error, "HTTP 403");
+  blocked.stop();
+
+  // Real FIFO Web Lock queue that waits until callback's promise settles
+  const queue: Array<{ cb: () => Promise<void>; resolveReq: () => void }> = [];
+  let held = false;
+  const runNext = () => {
+    if (held || queue.length === 0) return;
+    const item = queue.shift()!;
+    held = true;
+    void item.cb().finally(() => {
+      held = false;
+      item.resolveReq();
+      runNext();
+    });
+  };
+  const handoffLocks: LocksLike = {
+    request: (_name, cb) =>
+      new Promise<void>((resolve) => {
+        queue.push({ cb, resolveReq: resolve });
+        runNext();
+      }),
+  };
+
+  const sharedChannel = channels();
+  const startedUrls: string[] = [];
+  const tabA = new LiveStream(
+    deps({
+      channel: sharedChannel,
+      locks: handoffLocks,
+      fetch: async (url) => {
+        startedUrls.push(`A:${url}`);
+        return response(200, ['event: ready\ndata: {"latest_event_id":1,"replayed":0}\n\n'], true);
+      },
+    }),
+  );
+  const tabB = new LiveStream(
+    deps({
+      channel: sharedChannel,
+      locks: handoffLocks,
+      fetch: async (url) => {
+        startedUrls.push(`B:${url}`);
+        return response(200, ['event: ready\ndata: {"latest_event_id":2,"replayed":0}\n\n'], true);
+      },
+    }),
+  );
+
+  tabA.start();
+  tabB.start();
+  await tick();
+  await tick();
+  assert.equal(tabA.status.leader, true);
+  assert.equal(tabB.status.leader, false);
+  assert.deepEqual(startedUrls, ["A:/api/stream"]);
+
+  // Stopping tabA (e.g. sign-out) releases its Web Lock so tabB becomes leader immediately
+  tabA.stop();
+  await tick();
+  await tick();
+  assert.equal(tabA.status.state, "idle");
+  assert.equal(tabA.status.leader, false);
+  assert.equal(tabB.status.leader, true);
+  assert.equal(tabB.status.state, "live");
+  assert.deepEqual(startedUrls, ["A:/api/stream", "B:/api/stream?after=1"]);
+  tabB.stop();
+});

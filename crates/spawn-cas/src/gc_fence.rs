@@ -165,12 +165,12 @@ fn collect_reachable(store: &Store, roots: &[Digest]) -> Result<ReachableClosure
             continue;
         }
         reachable_objects.insert(snap_digest.clone());
-        let snapshot = store.read_merkle_snapshot(&snap_digest)?;
-        tree_queue.push_back(snapshot.tree);
-        for parent in snapshot.parents {
+        let commit = store.get_commit_object(&snap_digest)?;
+        tree_queue.push_back(commit.tree().clone());
+        for parent in commit.parents() {
             reachable_objects.insert(parent.clone());
-            if store.has(&parent) {
-                snap_queue.push_back(parent);
+            if store.has(parent) {
+                snap_queue.push_back(parent.clone());
             }
         }
     }

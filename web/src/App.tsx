@@ -1,14 +1,32 @@
-import { PanelRight } from "lucide-react";
-import { Suspense, lazy, useEffect, useMemo, useState } from "react";
+import { Orbit, PanelRight, WifiOff } from "lucide-react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { fetchAlerts, fetchAttention, fetchOverview, fetchSessionTail, live, usePoll } from "./api";
+import {
+  fetchAlerts,
+  fetchAttention,
+  fetchOverview,
+  fetchSessionTail,
+  getInitialTokenProblem,
+  getServeToken,
+  live,
+  probeAuth,
+  setServeToken,
+  subscribeAuthSync,
+  usePoll,
+} from "./api";
 import { PAGE_EVENTS } from "./sessionWindow";
 import type { PollResult, SessionTail } from "./api";
 import { markNeedsHuman, needsHuman } from "./attention";
 import { inputTarget } from "./commands";
 import { DetailsRail, ExecutionSummary, RailContent } from "./components/DetailsRail";
-import { MobileNav, Sidebar } from "./components/Sidebar";
+import { MobileNav, Sidebar, ThemeSwitch } from "./components/Sidebar";
 import { Timeline } from "./components/Timeline";
+import { TokenGate } from "./components/TokenGate";
+import {
+  authStateFromProbe,
+  authStateOnUnauthorized,
+  type AuthGateState,
+} from "./token";
 import { AlertsView, OpenAlerts } from "./components/alerts/AlertsView";
 import { CostView } from "./components/cost/CostView";
 import { CoveragePage } from "./components/features/CoveragePage";
@@ -121,10 +139,186 @@ function useMinute(): number {
 }
 
 export default function App() {
+  const [auth, setAuth] = useState<AuthGateState>({ kind: "checking" });
+  const [probeSeq, setProbeSeq] = useState(0);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const dropToGate = useCallback(() => {
+    live.stop();
+    setAuth(authStateOnUnauthorized(getServeToken() !== null, getInitialTokenProblem()));
+  }, []);
+
+  const handleAuthenticated = useCallback(() => {
+    setAuth({ kind: "authenticated", hasStoredToken: getServeToken() !== null });
+  }, []);
+
+  const handleSignOut = useCallback(() => {
+    setServeToken(null);
+    setAuth({
+      kind: "needs_token",
+      reason: "missing_token",
+      problem: null,
+      hasStoredToken: false,
+    });
+  }, []);
+
+  const handleClearStoredAndRetry = useCallback(async (): Promise<boolean> => {
+    setServeToken(null);
+    const result = await probeAuth();
+    if (!mounted.current) return result.kind === "needs_token";
+    setAuth(authStateFromProbe(result, getServeToken() !== null, getInitialTokenProblem()));
+    return result.kind === "needs_token";
+  }, []);
+
+  const retryProbe = useCallback(() => {
+    setAuth({ kind: "checking" });
+    setProbeSeq((seq) => seq + 1);
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void probeAuth(controller.signal).then((result) => {
+      if (controller.signal.aborted || !mounted.current) return;
+      setAuth(authStateFromProbe(result, getServeToken() !== null, getInitialTokenProblem()));
+    });
+    return () => controller.abort();
+  }, [probeSeq]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const unsubscribe = subscribeAuthSync((event) => {
+      if (event.kind === "unauthorized") {
+        dropToGate();
+        return;
+      }
+      if (event.kind === "signed_out") {
+        live.stop();
+        setAuth({
+          kind: "needs_token",
+          reason: "missing_token",
+          problem: null,
+          hasStoredToken: false,
+        });
+        return;
+      }
+      void probeAuth(controller.signal).then((result) => {
+        if (controller.signal.aborted || !mounted.current) return;
+        const next = authStateFromProbe(result, getServeToken() !== null, getInitialTokenProblem());
+        setAuth((current) =>
+          current.kind === "authenticated" && next.kind === "authenticated" ? current : next,
+        );
+      });
+    });
+    return () => {
+      controller.abort();
+      unsubscribe();
+    };
+  }, [dropToGate]);
+
+  if (auth.kind === "checking") {
+    return (
+      <div className="grid h-dvh w-full place-items-center bg-page-canvas text-caption text-faint-foreground">
+        <div className="flex items-center gap-2.5">
+          <Orbit size={16} className="animate-spin text-muted-foreground" />
+          <span>正在连接 Spawn…</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (auth.kind === "needs_token") {
+    return (
+      <TokenGate
+        reason={auth.reason}
+        problem={auth.problem}
+        hasStoredToken={auth.hasStoredToken}
+        onAuthenticated={handleAuthenticated}
+        onClearStoredAndRetry={handleClearStoredAndRetry}
+      />
+    );
+  }
+
+  if (auth.kind === "unreachable") {
+    return (
+      <div className="h-dvh w-full overflow-y-auto bg-page-canvas text-label text-foreground">
+        <div className="flex min-h-full flex-col">
+          <header className="flex shrink-0 items-center justify-end px-4 pt-3 sm:px-6 sm:pt-4">
+            <ThemeSwitch />
+          </header>
+          <main className="flex flex-1 items-center justify-center px-4 py-4 sm:px-6">
+            <section className="w-full max-w-[400px] rounded-card bg-surface p-6 shadow-card sm:p-7">
+              <div className="flex items-center gap-2.5 text-foreground">
+                <WifiOff size={18} className="text-muted-foreground" />
+                <h1 className="text-title-sm font-semibold">暂时无法连接 Spawn 服务端</h1>
+              </div>
+              <p className="mt-2.5 rounded-control bg-inset px-3 py-2 font-mono text-caption text-muted-foreground">
+                {auth.message}
+              </p>
+              <div className="mt-4 space-y-2.5">
+                <button
+                  type="button"
+                  onClick={retryProbe}
+                  className="inline-flex h-11 w-full items-center justify-center rounded-control bg-primary px-4 text-body font-semibold text-primary-foreground shadow-btn transition-opacity hover:opacity-90"
+                >
+                  重试连接
+                </button>
+                {auth.hasStoredToken && (
+                  <button
+                    type="button"
+                    onClick={() => void handleClearStoredAndRetry()}
+                    className="inline-flex h-11 w-full items-center justify-center rounded-control bg-inset px-4 text-caption font-medium text-muted-foreground shadow-hairline hover:bg-surface-hover hover:text-foreground"
+                  >
+                    清除已存 Token 并重试
+                  </button>
+                )}
+              </div>
+            </section>
+          </main>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <DashboardShell
+      hasStoredToken={auth.hasStoredToken}
+      onUnauthorized={dropToGate}
+      onSignOut={handleSignOut}
+    />
+  );
+}
+
+function DashboardShell({
+  hasStoredToken,
+  onUnauthorized,
+  onSignOut,
+}: {
+  hasStoredToken: boolean;
+  onUnauthorized: () => void;
+  onSignOut: () => void;
+}) {
   // The live log (stream.ts, shared among tabs): every poll that names a
   // topic reads again when an event of it arrives, and polls slower while
   // the stream is live.
-  useEffect(() => live.start(), []);
+  useEffect(() => {
+    live.start();
+    const unsubscribe = live.subscribe((signal) => {
+      if (signal.kind === "status" && signal.status.state === "unauthorized") {
+        onUnauthorized();
+      }
+    });
+    return () => {
+      unsubscribe();
+      live.stop();
+    };
+  }, [onUnauthorized]);
   const overview = usePoll("overview", fetchOverview, 2_000, { live: ["overview"] });
   // Both polled in every view: the sidebar shows what is escalated, which is
   // the dispatcher's view (/api/attention), never a judge's flag.
@@ -284,6 +478,7 @@ export default function App() {
         onShowStorage={() => setView("storage")}
         onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
+        onSignOut={hasStoredToken ? onSignOut : undefined}
       />
       <Sidebar
         sessions={overview.data?.sessions ?? []}
@@ -311,6 +506,7 @@ export default function App() {
           setSelectedId(id);
           setView("sessions");
         }}
+        onSignOut={hasStoredToken ? onSignOut : undefined}
       />
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">

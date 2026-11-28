@@ -1,6 +1,17 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { normalizeAttention, type Attention } from "./attention";
-import { chooseToken, type TokenChoice } from "./token";
+import {
+  TOKEN_KEY,
+  chooseToken,
+  classifyStorageTokenEvent,
+  probeAuthWithFetch,
+  serveCredential,
+  verifyTokenWithFetch,
+  type AuthProbeResult,
+  type AuthSyncEvent,
+  type TokenChoice,
+  type TokenVerifyResult,
+} from "./token";
 import { markFresh, pageHidden, Validated } from "./validated";
 import { readTail } from "./sessionWindow.ts";
 import type { LiveStatus, LiveTopic } from "./stream.ts";
@@ -375,8 +386,6 @@ export function normalizeSession(value: unknown): SessionDetail {
   };
 }
 
-const TOKEN_KEY = "spawn.serve.token";
-
 /** The token `spawn serve` wants (`SPAWN_SERVE_TOKEN`): read from the page
  * URL's `?token=` once, then kept in this browser's localStorage, so new
  * tabs, reloads and restarts of the server need no token in the URL. The
@@ -413,8 +422,88 @@ const tokenChoice: TokenChoice = (() => {
 })();
 
 /** The token every API read carries: always a header-safe credential
- * ([`chooseToken`]), never a raw `?token=`. */
-const serveToken: string | null = tokenChoice.token;
+ * ([`chooseToken`]), never a raw `?token=`. Mutable so the login gate and
+ * sign-out button can set or clear it without a full page reload. */
+let serveToken: string | null = tokenChoice.token;
+let initialTokenProblem: string | null = tokenChoice.problem;
+
+type AuthSyncListener = (event: AuthSyncEvent) => void;
+const authSyncListeners = new Set<AuthSyncListener>();
+
+/** Subscribe to 401 unauthorized events raised at HTTP boundaries and cross-tab storage updates. */
+export function subscribeAuthSync(listener: AuthSyncListener): () => void {
+  authSyncListeners.add(listener);
+  return () => authSyncListeners.delete(listener);
+}
+
+function emitAuthSync(event: AuthSyncEvent): void {
+  for (const listener of authSyncListeners) listener(event);
+}
+
+/** Notify subscribers ONLY when the HTTP boundary returned 401 (never on 403 read-only refusals). */
+export function reportUnauthorizedStatus(status: number | null): void {
+  if (status === 401) emitAuthSync({ kind: "unauthorized" });
+}
+
+export function getServeToken(): string | null {
+  return serveToken;
+}
+
+export function getInitialTokenProblem(): string | null {
+  return initialTokenProblem;
+}
+
+/** Update or clear the active serve token, persist/clear localStorage, and flush cached ETags. */
+export function setServeToken(next: string | null): void {
+  const normalized = next === null ? null : serveCredential(next);
+  serveToken = normalized;
+  initialTokenProblem = null;
+  try {
+    if (normalized !== null) localStorage.setItem(TOKEN_KEY, normalized);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    // Storage disabled: kept in this page only.
+  }
+  reads.clear();
+  if (normalized === null) live.stop();
+}
+
+export type { AuthProbeResult, TokenVerifyResult };
+
+/** Probe whether the current session (stored token or loopback no-token host) is accepted. */
+export async function probeAuth(signal?: AbortSignal): Promise<AuthProbeResult> {
+  return probeAuthWithFetch((url, init) => fetch(url, init), apiHeaders(), signal);
+}
+
+/** Validate format, verify against `GET /api/overview`, and store on success. */
+export async function verifyAndApplyToken(
+  raw: string,
+  signal?: AbortSignal,
+): Promise<TokenVerifyResult> {
+  return verifyTokenWithFetch(
+    raw,
+    (url, init) => fetch(url, init),
+    (token) => setServeToken(token),
+    signal,
+  );
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    const change = classifyStorageTokenEvent(event.key, event.newValue, serveToken);
+    if (!change) return;
+    initialTokenProblem = null;
+    reads.clear();
+    if (change.kind === "signed_out") {
+      serveToken = null;
+      live.stop();
+      emitAuthSync({ kind: "signed_out" });
+      return;
+    }
+    serveToken = change.token;
+    emitAuthSync({ kind: "token_updated" });
+  });
+}
 
 /** `href` without its `?token=` parameter; every other part is kept. */
 export function withoutToken(href: string): string {
@@ -423,15 +512,22 @@ export function withoutToken(href: string): string {
   return url.toString();
 }
 
-/** The error of a failed API read. A 401 says how to give the token. */
+/** Pure error builder for failed API calls (no auth state mutation side effects). */
 export function apiError(status: number, detail = ""): Error {
   if (status === 401) {
-    const problem = tokenChoice.problem ? `${tokenChoice.problem} ` : "";
+    const problem = initialTokenProblem ? `${initialTokenProblem} ` : "";
     return new Error(
       problem +
       (serveToken
         ? "HTTP 401: the saved token is wrong; open this page once as /?token=<SPAWN_SERVE_TOKEN from spawn.env>"
         : "HTTP 401: no token; open this page once as /?token=<SPAWN_SERVE_TOKEN from spawn.env>, or from this machine at http://127.0.0.1:8787"),
+    );
+  }
+  if (status === 403) {
+    return new Error(
+      detail
+        ? `只读权限受限（HTTP 403）：${detail}`
+        : "只读权限受限（HTTP 403）：当前访问仅限只读操作",
     );
   }
   return new Error(detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}`);
@@ -454,7 +550,14 @@ export function readApi<T>(
   signal: AbortSignal,
   normalize: (raw: unknown) => T,
 ): Promise<T> {
-  return reads.read(url, normalize, { signal, headers: apiHeaders(), fail: apiError });
+  return reads.read(url, normalize, {
+    signal,
+    headers: apiHeaders(),
+    fail: (status, detail) => {
+      reportUnauthorizedStatus(status);
+      return apiError(status, detail);
+    },
+  });
 }
 
 export async function fetchOverview(signal: AbortSignal): Promise<Overview> {
@@ -555,6 +658,7 @@ async function postJson(
     if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
     return { status: null, body: null };
   }
+  reportUnauthorizedStatus(response.status);
   let answer: unknown = null;
   try {
     answer = await response.json();

@@ -651,6 +651,7 @@
         "crates/spawn-core/src/screen.rs",
         "crates/spawn-core/src/time.rs",
         "crates/spawn-core/src/transcripts.rs",
+        "crates/spawn-core/src/tui.rs",
         "crates/spawn-core/testdata/spawn-ipc-v1/MANIFEST.sha256",
         "crates/spawn-core/testdata/spawn-ipc-v1/events.ndjson",
         "crates/spawn-core/testdata/spawn-ipc-v1/hello.res.json",
@@ -1252,6 +1253,7 @@
         "crates/spawn-host/src/engine_view.rs",
         "crates/spawn-host/src/herdr.rs",
         "crates/spawn-host/src/herdr_core.rs",
+        "crates/spawn-host/src/herdr_global.rs",
         "crates/spawn-host/src/herdr_witness.rs",
         "crates/spawn-host/src/lib.rs",
         "crates/spawn-host/src/process.rs",
@@ -1453,6 +1455,7 @@
       "files": [
         "crates/spawn-cas/Cargo.toml",
         "crates/spawn-cas/src/chunker.rs",
+        "crates/spawn-cas/src/commit.rs",
         "crates/spawn-cas/src/digest.rs",
         "crates/spawn-cas/src/gc.rs",
         "crates/spawn-cas/src/gc_fence.rs",
@@ -1469,6 +1472,11 @@
         "crates/spawn-cas/testdata/d6-cas-v1/pointer-100mib.bin",
         "crates/spawn-cas/testdata/d6-cas-v1/snapshot.bin",
         "crates/spawn-cas/testdata/d6-cas-v1/tree.bin",
+        "crates/spawn-cas/testdata/d6-cas-v2/commit_git_compat.bin",
+        "crates/spawn-cas/testdata/d6-cas-v2/commit_minimal.bin",
+        "crates/spawn-cas/testdata/d6-cas-v2/commit_native.bin",
+        "crates/spawn-cas/testdata/d6-cas-v2/manifest.json",
+        "crates/spawn-cas/tests/commit_v2.rs",
         "crates/spawn-cas/tests/d6_cas.rs",
         "crates/spawn-cas/tests/d6_journal_gc.rs",
         "crates/spawn-cas/tests/store.rs",
@@ -1521,6 +1529,7 @@
           "2a785c5cd"
         ],
         "tests": [
+          "crates/spawn-cas/tests/commit_v2.rs",
           "crates/spawn-cas/tests/d6_cas.rs",
           "crates/spawn-cas/tests/d6_journal_gc.rs",
           "crates/spawn-cas/tests/store.rs",
@@ -3030,6 +3039,7 @@
         "crates/spawn-cli/src/serve.rs",
         "crates/spawn-cli/src/serve/answers.rs",
         "crates/spawn-cli/src/serve/approvals.rs",
+        "crates/spawn-cli/src/serve/auth_token.rs",
         "crates/spawn-cli/src/serve/attention.rs",
         "crates/spawn-cli/src/serve/capabilities.rs",
         "crates/spawn-cli/src/serve/core_lines.rs",
@@ -3055,6 +3065,7 @@
         "crates/spawn-cli/src/serve/labels.rs",
         "crates/spawn-cli/src/serve/storage.rs",
         "crates/spawn-cli/src/serve/stream.rs",
+        "crates/spawn-cli/tests/viewer_token.rs",
         "crates/spawn-postgres/sql/schema.sql",
         "crates/spawn-postgres/tests/dashboard.rs",
         "crates/spawn-postgres/tests/human_input.rs",
@@ -3199,7 +3210,8 @@
           "6c5d22782"
         ],
         "tests": [
-          "crates/spawn-cli/src/serve.rs"
+          "crates/spawn-cli/src/serve.rs",
+          "crates/spawn-cli/tests/viewer_token.rs"
         ],
         "deploys": [],
         "artifacts": [],
@@ -3458,6 +3470,7 @@
         "web/src/components/BeautifulPrimitives.tsx",
         "web/src/components/Sidebar.tsx",
         "web/src/components/StateDot.tsx",
+        "web/src/components/TokenGate.tsx",
         "web/src/components/ViewToggle.tsx",
         "web/src/components/aui/HomeCard.tsx",
         "web/src/components/aui/NorthStarChart.tsx",

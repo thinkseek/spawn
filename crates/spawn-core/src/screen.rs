@@ -127,7 +127,9 @@ impl ScreenReading {
 }
 
 /// Remove ANSI escape sequences: CSI (`ESC [ ... final`), OSC
-/// (`ESC ] ... BEL|ST`) and two-byte escapes.
+/// (`ESC ] ... BEL|ST`), ECMA-48 nF sequences (`ESC <0x20..=0x2F>+ <0x30..=0x7E>?`),
+/// and two-byte ASCII escapes (`ESC <0x30..=0x7E>`). A lone `ESC` at end-of-line or
+/// before a multi-byte UTF-8 character drops only `ESC` without swallowing the character.
 pub(crate) fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -136,7 +138,7 @@ pub(crate) fn strip_ansi(text: &str) -> String {
             out.push(character);
             continue;
         }
-        match chars.peek() {
+        match chars.peek().copied() {
             Some('[') => {
                 chars.next();
                 for next in chars.by_ref() {
@@ -157,10 +159,25 @@ pub(crate) fn strip_ansi(text: &str) -> String {
                     }
                 }
             }
-            Some(_) => {
+            Some(ch) if ('\u{20}'..='\u{2f}').contains(&ch) => {
+                chars.next();
+                while chars
+                    .peek()
+                    .is_some_and(|next| ('\u{20}'..='\u{2f}').contains(next))
+                {
+                    chars.next();
+                }
+                if chars
+                    .peek()
+                    .is_some_and(|next| ('\u{30}'..='\u{7e}').contains(next))
+                {
+                    chars.next();
+                }
+            }
+            Some(ch) if ('\u{30}'..='\u{7e}').contains(&ch) => {
                 chars.next();
             }
-            None => {}
+            _ => {}
         }
     }
     out
@@ -1341,5 +1358,21 @@ mod claude_2_1_330_tests {
         let done =
             format!("you: run the tests\n✻ Bebopped for 12s · done 9:20 PM\n{STATUS}\n{MODE}\n$ ");
         assert_eq!(read_claude_screen(&done).state, ScreenState::Ready);
+    }
+}
+
+#[cfg(test)]
+mod strip_ansi_tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strip_ansi_handles_multibyte_after_esc_and_three_byte_nf_sequences() {
+        assert_eq!(strip_ansi("x\x1b❯ 1. Allow"), "x❯ 1. Allow");
+        assert_eq!(strip_ansi("\x1b(Bhello\x1b(0world"), "helloworld");
+        assert_eq!(
+            strip_ansi("a\x1b7b\x1b]2;title\x1b\\c\x1b[36md\x1b[0m"),
+            "abcd"
+        );
+        assert_eq!(strip_ansi("tail\x1b"), "tail");
     }
 }

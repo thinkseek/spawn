@@ -13,8 +13,10 @@ use spawn_core::id::{AgentId, SessionId};
 use spawn_core::port::EventLog;
 use spawn_postgres::PostgresStore;
 
+use super::super::auth_token::{AuthPrincipal, current_epoch_ms};
 use super::{
-    Frame, Hub, REPLAY_MAX, TimedWriter, catch_up, cursor, listen, resync, serve_stream, sse_word,
+    Frame, Hub, REPLAY_MAX, StreamWindow, TimedWriter, catch_up, cursor, listen, resync,
+    serve_stream, sse_word, stream_window,
 };
 
 #[test]
@@ -226,6 +228,7 @@ fn a_whole_stream_over_http_replays_keeps_alive_and_goes_on_live() {
             serve_stream(
                 request,
                 &format!("after_event_id={first}"),
+                AuthPrincipal::LocalOwner,
                 &hub,
                 &*open,
                 Duration::from_millis(200),
@@ -394,7 +397,14 @@ fn after_an_idle_hub_a_new_stream_gets_its_first_live_event_every_round() {
             let (hub, open) = (Arc::clone(&hub), Arc::clone(&open));
             std::thread::spawn(move || {
                 let request = server.recv().expect("a request");
-                serve_stream(request, "", &hub, &*open, Duration::from_millis(200))
+                serve_stream(
+                    request,
+                    "",
+                    AuthPrincipal::LocalOwner,
+                    &hub,
+                    &*open,
+                    Duration::from_millis(200),
+                )
             })
         };
         let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -490,7 +500,14 @@ fn a_stream_with_after_replays_the_events_after_it() {
                 .split_once('?')
                 .map(|(_, query)| query.to_string())
                 .unwrap_or_default();
-            serve_stream(request, &query, &hub, &*open, Duration::from_millis(200))
+            serve_stream(
+                request,
+                &query,
+                AuthPrincipal::LocalOwner,
+                &hub,
+                &*open,
+                Duration::from_millis(200),
+            )
         })
     };
     let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -562,7 +579,14 @@ fn churn_server(
                     .split_once('?')
                     .map(|(_, query)| query.to_string())
                     .unwrap_or_default();
-                let outcome = serve_stream(request, &query, &hub, &*open, super::KEEPALIVE);
+                let outcome = serve_stream(
+                    request,
+                    &query,
+                    AuthPrincipal::LocalOwner,
+                    &hub,
+                    &*open,
+                    super::KEEPALIVE,
+                );
                 counted.fetch_sub(1, Ordering::AcqRel);
                 outcome.expect("no error");
             });
@@ -692,7 +716,14 @@ fn a_quiet_stream_probes_between_keepalives() {
         let (hub, open) = (Arc::clone(&hub), Arc::clone(&open));
         std::thread::spawn(move || {
             let request = server.recv().expect("a request");
-            serve_stream(request, "", &hub, &*open, keepalive)
+            serve_stream(
+                request,
+                "",
+                AuthPrincipal::LocalOwner,
+                &hub,
+                &*open,
+                keepalive,
+            )
         })
     };
     let mut client = page(port, "/api/stream");
@@ -725,4 +756,120 @@ fn a_quiet_stream_probes_between_keepalives() {
     );
     drop(client);
     serving.join().expect("joined").expect("no error");
+}
+
+#[test]
+fn stream_window_enforces_exact_deadline_bounds() {
+    assert_eq!(stream_window(None, Some(1_000)), StreamWindow::Unbounded);
+    assert_eq!(stream_window(None, None), StreamWindow::Unbounded);
+    assert_eq!(
+        stream_window(Some(2_000), Some(1_500)),
+        StreamWindow::Remaining(Duration::from_millis(500))
+    );
+    assert_eq!(
+        stream_window(Some(2_000), Some(2_000)),
+        StreamWindow::Expired
+    );
+    assert_eq!(
+        stream_window(Some(2_000), Some(2_500)),
+        StreamWindow::Expired
+    );
+    assert_eq!(stream_window(Some(2_000), None), StreamWindow::Expired);
+}
+
+fn run_viewer_stream_once(
+    hub: &Arc<Hub>,
+    open: &Opener,
+    expires_at_ms: i64,
+    connection_close: bool,
+) -> (
+    std::net::TcpStream,
+    std::thread::JoinHandle<Result<(), String>>,
+) {
+    let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
+    let port = server.server_addr().to_ip().expect("ip").port();
+    let serving = {
+        let (hub, open) = (Arc::clone(hub), Arc::clone(open));
+        std::thread::spawn(move || {
+            let request = server.recv().expect("a request");
+            serve_stream(
+                request,
+                "",
+                AuthPrincipal::ReadOnlyViewer { expires_at_ms },
+                &hub,
+                &*open,
+                super::KEEPALIVE,
+            )
+        })
+    };
+    let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let conn = if connection_close {
+        "Connection: close\r\n"
+    } else {
+        ""
+    };
+    client
+        .write_all(
+            format!("GET /api/stream HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{conn}\r\n").as_bytes(),
+        )
+        .expect("send");
+    (client, serving)
+}
+
+#[test]
+fn readonly_viewer_stream_closes_cleanly_on_expiry_even_when_idle() {
+    let (_schema, store, open) = reader_schema("stream_viewer_expiry");
+    let first = append(&store, 1);
+    let hub = Arc::new(Hub::new(64));
+
+    // Already-expired viewer principal refuses with 401 before streaming 200 OK.
+    let expired_at = current_epoch_ms().expect("clock") - 1_000;
+    let (mut rejected, expired_serving) = run_viewer_stream_once(&hub, &open, expired_at, true);
+    let mut rejected_raw = String::new();
+    rejected.read_to_string(&mut rejected_raw).expect("eof");
+    assert!(rejected_raw.starts_with("HTTP/1.1 401 "), "{rejected_raw}");
+    assert!(
+        rejected_raw.contains("WWW-Authenticate: Bearer"),
+        "{rejected_raw}"
+    );
+    expired_serving.join().expect("joined").expect("no error");
+    assert_eq!(hub.subscribers(), 0);
+
+    // Idle stream with `Connection: close`: closes cleanly with TCP EOF + chunked 0-terminator.
+    let close_exp = current_epoch_ms().expect("clock") + 1_200;
+    let (mut close_client, close_serving) = run_viewer_stream_once(&hub, &open, close_exp, true);
+    let mut close_seen = String::new();
+    read_to(&mut close_client, &mut close_seen, "event: ready\n");
+    let mut close_rest = String::new();
+    close_client
+        .read_to_string(&mut close_rest)
+        .expect("clean TCP EOF");
+    assert!(close_rest.ends_with("0\r\n\r\n"), "{close_rest:?}");
+    close_serving.join().expect("joined").expect("no error");
+    assert_eq!(hub.subscribers(), 0);
+
+    // Idle stream on keep-alive (no `Connection: close`): emits HTTP/1.1 `0\r\n\r\n` on expiry.
+    let keepalive_exp = current_epoch_ms().expect("clock") + 1_200;
+    let (mut ka_client, ka_serving) = run_viewer_stream_once(&hub, &open, keepalive_exp, false);
+    let mut ka_seen = String::new();
+    read_to(&mut ka_client, &mut ka_seen, "event: ready\n");
+    assert!(
+        ka_seen.contains("Transfer-Encoding: chunked"),
+        "{ka_seen:?}"
+    );
+    let mut ka_rest = String::new();
+    read_to(&mut ka_client, &mut ka_rest, "0\r\n\r\n");
+    drop(ka_client);
+    ka_serving.join().expect("joined").expect("no error");
+    hub.publish(&Arc::new(Frame {
+        id: Some(first + 1),
+        event: "tool.started".to_string(),
+        data: "{\"after_expiry\":true}".to_string(),
+    }));
+    assert!(!close_rest.contains("after_expiry"), "{close_rest}");
+    assert!(!ka_rest.contains("after_expiry"), "{ka_rest}");
+    assert_eq!(hub.subscribers(), 0);
 }
