@@ -589,3 +589,243 @@ fn persistent_gc_resets_rounds_when_object_becomes_reachable_again() {
     assert!(r5.deleted_objects.contains(&snap));
     assert!(!store.has(&blob));
 }
+
+#[test]
+fn journal_append_heals_torn_tail_after_committed_entries_and_restores_reconcile() {
+    let scratch = Scratch::new("journal-heal-tail");
+    let store = Store::open(scratch.join("cas")).expect("open");
+
+    let s1 = sha256_of(b"heal-s1");
+    let s2 = sha256_of(b"heal-s2");
+    let s3 = sha256_of(b"heal-s3");
+
+    let e1 = journal_entry(1, "branch/a", None, s1.clone(), "11", 1000);
+    let e2 = journal_entry(2, "branch/a", Some(s1), s2.clone(), "22", 2000);
+    let e3 = journal_entry(3, "branch/a", Some(s2), s3, "33", 3000);
+
+    store.append_ref_journal(&e1).expect("append e1");
+    store.append_ref_journal(&e2).expect("append e2");
+
+    // Simulate a crash mid-append leaving an unterminated fragment at EOF.
+    let mut raw = fs::OpenOptions::new()
+        .append(true)
+        .open(store.refs_journal_path())
+        .expect("open journal");
+    raw.write_all(b"{\"seq\":3,\"project\":\"spawn\",\"name\":\"torn")
+        .expect("inject torn tail");
+    drop(raw);
+
+    assert_eq!(
+        store.read_ref_journal().expect("read with torn tail"),
+        vec![e1.clone(), e2.clone()]
+    );
+    assert_eq!(store.latest_seq().expect("latest_seq before heal"), 2);
+
+    // Production append must heal the torn tail instead of concatenating onto it.
+    store
+        .append_ref_journal(&e3)
+        .expect("append e3 heals torn tail");
+
+    let expected = vec![e1, e2, e3];
+    assert_eq!(store.read_ref_journal().expect("read after heal"), expected);
+    assert_eq!(store.latest_seq().expect("latest_seq after heal"), 3);
+    assert_eq!(
+        store
+            .reconcile_entries_after(0)
+            .expect("reconcile after heal"),
+        expected
+    );
+
+    let on_disk = fs::read(store.refs_journal_path()).expect("read healed bytes");
+    assert!(on_disk.ends_with(b"\n"));
+    let on_disk_text = std::str::from_utf8(&on_disk).expect("valid utf-8 journal");
+    assert_eq!(on_disk_text.lines().count(), 3);
+}
+
+#[test]
+fn journal_append_heals_torn_tail_only_file_without_any_newline() {
+    let s1 = sha256_of(b"torn-only-s1");
+    let e1 = journal_entry(1, "main", None, s1, "44", 4000);
+
+    // Sub-case A: short unterminated fragment (no `\n` anywhere in file).
+    let short_scratch = Scratch::new("journal-torn-only-short");
+    let short_store = Store::open(short_scratch.join("cas")).expect("open");
+    fs::write(
+        short_store.refs_journal_path(),
+        b"{\"seq\":1,\"torn\xff\xfe",
+    )
+    .expect("seed short torn-only journal");
+
+    assert!(
+        short_store
+            .read_ref_journal()
+            .expect("empty before heal")
+            .is_empty()
+    );
+    assert_eq!(short_store.latest_seq().expect("seq 0 before heal"), 0);
+    short_store
+        .append_ref_journal(&e1)
+        .expect("append seq 1 heals short torn-only file");
+    assert_eq!(
+        short_store.read_ref_journal().expect("read healed"),
+        vec![e1.clone()]
+    );
+    assert_eq!(short_store.latest_seq().expect("latest seq 1"), 1);
+    assert_eq!(
+        short_store.reconcile_entries_after(0).expect("reconcile"),
+        vec![e1.clone()]
+    );
+
+    // Sub-case B: >16 KiB unterminated fragment crossing multiple backward scan chunks.
+    let long_scratch = Scratch::new("journal-torn-only-long");
+    let long_store = Store::open(long_scratch.join("cas")).expect("open");
+    fs::write(long_store.refs_journal_path(), vec![b'x'; 20_000]).expect("seed multi-chunk torn");
+
+    long_store
+        .append_ref_journal(&e1)
+        .expect("append seq 1 heals multi-chunk torn-only file");
+    assert_eq!(
+        long_store
+            .read_ref_journal()
+            .expect("read multi-chunk healed"),
+        vec![e1.clone()]
+    );
+    assert_eq!(
+        long_store.reconcile_entries_after(0).expect("reconcile"),
+        vec![e1]
+    );
+}
+
+#[test]
+fn journal_append_preserves_corrupt_newline_terminated_middle_line_fail_closed() {
+    let s1 = sha256_of(b"corrupt-mid-s1");
+    let s2 = sha256_of(b"corrupt-mid-s2");
+    let s3 = sha256_of(b"corrupt-mid-s3");
+
+    let e1 = journal_entry(1, "branch/a", None, s1.clone(), "11", 1000);
+    let e2 = journal_entry(2, "branch/a", Some(s1), s2.clone(), "22", 2000);
+    let e3 = journal_entry(3, "branch/a", Some(s2), s3, "33", 3000);
+
+    // Case A: valid line + corrupt `\n`-terminated line + valid line, then append.
+    let mid_scratch = Scratch::new("journal-corrupt-middle");
+    let mid_store = Store::open(mid_scratch.join("cas")).expect("open");
+    mid_store.append_ref_journal(&e1).expect("append e1");
+    let mut mid_raw = fs::OpenOptions::new()
+        .append(true)
+        .open(mid_store.refs_journal_path())
+        .expect("open mid");
+    mid_raw
+        .write_all(b"{\"seq\":2,\"corrupt\":\n")
+        .expect("write corrupt newline line");
+    drop(mid_raw);
+    mid_store.append_ref_journal(&e2).expect("append e2");
+    mid_store.append_ref_journal(&e3).expect("append e3");
+
+    assert!(matches!(
+        mid_store.read_ref_journal(),
+        Err(CasError::BadFormat(_))
+    ));
+    assert!(matches!(
+        mid_store.latest_seq(),
+        Err(CasError::BadFormat(_))
+    ));
+    assert!(matches!(
+        mid_store.reconcile_entries_after(0),
+        Err(CasError::BadFormat(_))
+    ));
+
+    // Case B: corrupt `\n`-terminated line immediately before an unterminated torn tail.
+    let tail_scratch = Scratch::new("journal-corrupt-before-torn");
+    let tail_store = Store::open(tail_scratch.join("cas")).expect("open");
+    tail_store.append_ref_journal(&e1).expect("append e1");
+    let mut tail_raw = fs::OpenOptions::new()
+        .append(true)
+        .open(tail_store.refs_journal_path())
+        .expect("open tail");
+    tail_raw
+        .write_all(b"{\"seq\":2,\"corrupt\":\n{\"seq\":3,\"half")
+        .expect("write corrupt line plus torn tail");
+    drop(tail_raw);
+
+    tail_store
+        .append_ref_journal(&e3)
+        .expect("append trims torn tail only, not corrupt committed line");
+    assert!(matches!(
+        tail_store.read_ref_journal(),
+        Err(CasError::BadFormat(
+            "malformed committed JSON line in refs.journal"
+        ))
+    ));
+    assert!(matches!(
+        tail_store.latest_seq(),
+        Err(CasError::BadFormat(
+            "malformed committed JSON line in refs.journal"
+        ))
+    ));
+    assert!(matches!(
+        tail_store.reconcile_entries_after(0),
+        Err(CasError::BadFormat(
+            "malformed committed JSON line in refs.journal"
+        ))
+    ));
+}
+
+#[test]
+fn journal_survives_consecutive_torn_tail_crashes_and_restarts_strictly_monotonic() {
+    let scratch = Scratch::new("journal-consecutive-crashes");
+    let cas_root = scratch.join("cas");
+
+    let s1 = sha256_of(b"cycle-s1");
+    let s2 = sha256_of(b"cycle-s2");
+    let s3 = sha256_of(b"cycle-s3");
+    let s4 = sha256_of(b"cycle-s4");
+
+    let e1 = journal_entry(1, "main", None, s1.clone(), "aa", 1000);
+    let e2 = journal_entry(2, "main", Some(s1), s2.clone(), "bb", 2000);
+    let e3 = journal_entry(3, "main", Some(s2), s3.clone(), "cc", 3000);
+    let e4 = journal_entry(4, "main", Some(s3), s4, "dd", 4000);
+
+    // Boot 1 -> commit seq 1 -> crash with torn tail #1.
+    let boot1 = Store::open(&cas_root).expect("boot 1");
+    boot1.append_ref_journal(&e1).expect("append e1");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(boot1.refs_journal_path())
+        .expect("open crash 1")
+        .write_all(b"{\"seq\":2,\"partial")
+        .expect("torn tail 1");
+    drop(boot1);
+
+    // Boot 2 -> reopen -> heal & append seq 2 -> crash with large torn tail #2 (>8 KiB).
+    let boot2 = Store::open(&cas_root).expect("boot 2");
+    assert_eq!(
+        boot2.read_ref_journal().expect("read boot 2"),
+        vec![e1.clone()]
+    );
+    boot2.append_ref_journal(&e2).expect("append e2");
+    assert_eq!(boot2.latest_seq().expect("seq after boot 2"), 2);
+    let mut crash2 = fs::OpenOptions::new()
+        .append(true)
+        .open(boot2.refs_journal_path())
+        .expect("open crash 2");
+    crash2.write_all(&vec![b'{'; 10_000]).expect("torn tail 2");
+    drop(crash2);
+    drop(boot2);
+
+    // Boot 3 -> reopen -> heal & append seq 3 and seq 4 -> full fast-forward reconcile succeeds.
+    let boot3 = Store::open(&cas_root).expect("boot 3");
+    assert_eq!(
+        boot3.read_ref_journal().expect("read boot 3"),
+        vec![e1.clone(), e2.clone()]
+    );
+    boot3.append_ref_journal(&e3).expect("append e3");
+    boot3.append_ref_journal(&e4).expect("append e4");
+
+    let expected = vec![e1, e2, e3, e4];
+    assert_eq!(boot3.read_ref_journal().expect("all 4 intact"), expected);
+    assert_eq!(boot3.latest_seq().expect("latest_seq 4"), 4);
+    assert_eq!(
+        boot3.reconcile_entries_after(0).expect("reconcile all 4"),
+        expected
+    );
+}
