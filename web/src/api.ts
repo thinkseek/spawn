@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { normalizeAttention, type Attention } from "./attention";
 import {
+  TOKEN_KEY,
   chooseToken,
+  classifyStorageTokenEvent,
+  probeAuthWithFetch,
   serveCredential,
-  unauthorizedReason,
-  validateSubmittedToken,
-  type AuthPromptReason,
+  verifyTokenWithFetch,
+  type AuthProbeResult,
+  type AuthSyncEvent,
   type TokenChoice,
+  type TokenVerifyResult,
 } from "./token";
 import { markFresh, pageHidden, Validated } from "./validated";
 import { readTail } from "./sessionWindow.ts";
@@ -382,8 +386,6 @@ export function normalizeSession(value: unknown): SessionDetail {
   };
 }
 
-const TOKEN_KEY = "spawn.serve.token";
-
 /** The token `spawn serve` wants (`SPAWN_SERVE_TOKEN`): read from the page
  * URL's `?token=` once, then kept in this browser's localStorage, so new
  * tabs, reloads and restarts of the server need no token in the URL. The
@@ -425,18 +427,22 @@ const tokenChoice: TokenChoice = (() => {
 let serveToken: string | null = tokenChoice.token;
 let initialTokenProblem: string | null = tokenChoice.problem;
 
-type UnauthorizedListener = (reason: AuthPromptReason) => void;
-const unauthorizedListeners = new Set<UnauthorizedListener>();
+type AuthSyncListener = (event: AuthSyncEvent) => void;
+const authSyncListeners = new Set<AuthSyncListener>();
 
-/** Subscribe to 401 unauthorized events raised by API reads or writes. */
-export function subscribeUnauthorized(listener: UnauthorizedListener): () => void {
-  unauthorizedListeners.add(listener);
-  return () => unauthorizedListeners.delete(listener);
+/** Subscribe to 401 unauthorized events raised at HTTP boundaries and cross-tab storage updates. */
+export function subscribeAuthSync(listener: AuthSyncListener): () => void {
+  authSyncListeners.add(listener);
+  return () => authSyncListeners.delete(listener);
 }
 
-function notifyUnauthorized(): void {
-  const reason = unauthorizedReason(serveToken !== null, initialTokenProblem);
-  for (const listener of unauthorizedListeners) listener(reason);
+function emitAuthSync(event: AuthSyncEvent): void {
+  for (const listener of authSyncListeners) listener(event);
+}
+
+/** Notify subscribers ONLY when the HTTP boundary returned 401 (never on 403 read-only refusals). */
+export function reportUnauthorizedStatus(status: number | null): void {
+  if (status === 401) emitAuthSync({ kind: "unauthorized" });
 }
 
 export function getServeToken(): string | null {
@@ -462,79 +468,41 @@ export function setServeToken(next: string | null): void {
   if (normalized === null) live.stop();
 }
 
-export type AuthProbeResult =
-  | { kind: "authenticated" }
-  | { kind: "unauthorized" }
-  | { kind: "unreachable"; message: string };
+export type { AuthProbeResult, TokenVerifyResult };
 
 /** Probe whether the current session (stored token or loopback no-token host) is accepted. */
 export async function probeAuth(signal?: AbortSignal): Promise<AuthProbeResult> {
-  try {
-    const response = await fetch("/api/overview", {
-      signal,
-      cache: "no-store",
-      headers: apiHeaders(),
-    });
-    await response.arrayBuffer().catch(() => undefined);
-    if (response.ok || response.status === 304) return { kind: "authenticated" };
-    if (response.status === 401 || response.status === 403) return { kind: "unauthorized" };
-    return { kind: "unreachable", message: `HTTP ${response.status}` };
-  } catch (cause) {
-    if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
-    return {
-      kind: "unreachable",
-      message: cause instanceof Error ? cause.message : "无法连接到服务端",
-    };
-  }
+  return probeAuthWithFetch((url, init) => fetch(url, init), apiHeaders(), signal);
 }
-
-export type TokenVerifyResult =
-  | { ok: true }
-  | { ok: false; kind: "invalid" | "rejected" | "unreachable"; message: string };
 
 /** Validate format, verify against `GET /api/overview`, and store on success. */
 export async function verifyAndApplyToken(
   raw: string,
   signal?: AbortSignal,
 ): Promise<TokenVerifyResult> {
-  const checked = validateSubmittedToken(raw);
-  if (!checked.ok) {
-    return { ok: false, kind: "invalid", message: checked.message };
-  }
-  try {
-    const response = await fetch("/api/overview", {
-      signal,
-      cache: "no-store",
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${checked.token}`,
-      },
-    });
-    await response.arrayBuffer().catch(() => undefined);
-    if (response.ok || response.status === 304) {
-      setServeToken(checked.token);
-      return { ok: true };
+  return verifyTokenWithFetch(
+    raw,
+    (url, init) => fetch(url, init),
+    (token) => setServeToken(token),
+    signal,
+  );
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    const change = classifyStorageTokenEvent(event.key, event.newValue, serveToken);
+    if (!change) return;
+    initialTokenProblem = null;
+    reads.clear();
+    if (change.kind === "signed_out") {
+      serveToken = null;
+      live.stop();
+      emitAuthSync({ kind: "signed_out" });
+      return;
     }
-    if (response.status === 401 || response.status === 403) {
-      return {
-        ok: false,
-        kind: "rejected",
-        message: "Token 无效或被服务端拒绝（HTTP 401），请核对 SPAWN_SERVE_TOKEN 后重试。",
-      };
-    }
-    return {
-      ok: false,
-      kind: "unreachable",
-      message: `服务端返回异常状态（HTTP ${response.status}），请稍后重试。`,
-    };
-  } catch (cause) {
-    if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
-    return {
-      ok: false,
-      kind: "unreachable",
-      message: cause instanceof Error ? `无法连接服务端：${cause.message}` : "无法连接服务端",
-    };
-  }
+    serveToken = change.token;
+    emitAuthSync({ kind: "token_updated" });
+  });
 }
 
 /** `href` without its `?token=` parameter; every other part is kept. */
@@ -544,16 +512,22 @@ export function withoutToken(href: string): string {
   return url.toString();
 }
 
-/** The error of a failed API read. A 401 says how to give the token. */
+/** Pure error builder for failed API calls (no auth state mutation side effects). */
 export function apiError(status: number, detail = ""): Error {
   if (status === 401) {
-    notifyUnauthorized();
     const problem = initialTokenProblem ? `${initialTokenProblem} ` : "";
     return new Error(
       problem +
       (serveToken
         ? "HTTP 401: the saved token is wrong; open this page once as /?token=<SPAWN_SERVE_TOKEN from spawn.env>"
         : "HTTP 401: no token; open this page once as /?token=<SPAWN_SERVE_TOKEN from spawn.env>, or from this machine at http://127.0.0.1:8787"),
+    );
+  }
+  if (status === 403) {
+    return new Error(
+      detail
+        ? `只读权限受限（HTTP 403）：${detail}`
+        : "只读权限受限（HTTP 403）：当前访问仅限只读操作",
     );
   }
   return new Error(detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}`);
@@ -576,7 +550,14 @@ export function readApi<T>(
   signal: AbortSignal,
   normalize: (raw: unknown) => T,
 ): Promise<T> {
-  return reads.read(url, normalize, { signal, headers: apiHeaders(), fail: apiError });
+  return reads.read(url, normalize, {
+    signal,
+    headers: apiHeaders(),
+    fail: (status, detail) => {
+      reportUnauthorizedStatus(status);
+      return apiError(status, detail);
+    },
+  });
 }
 
 export async function fetchOverview(signal: AbortSignal): Promise<Overview> {
@@ -677,9 +658,7 @@ async function postJson(
     if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
     return { status: null, body: null };
   }
-  if (response.status === 401) {
-    notifyUnauthorized();
-  }
+  reportUnauthorizedStatus(response.status);
   let answer: unknown = null;
   try {
     answer = await response.json();

@@ -10,7 +10,9 @@ import { FOCUS_RING, cx } from "./ui";
 interface TokenGateProps {
   reason: AuthPromptReason;
   problem: string | null;
+  hasStoredToken: boolean;
   onAuthenticated: () => void;
+  onClearStoredAndRetry: () => Promise<boolean>;
 }
 
 const REASON_NOTICE: Record<AuthPromptReason, string | null> = {
@@ -22,22 +24,32 @@ const REASON_NOTICE: Record<AuthPromptReason, string | null> = {
 /**
  * Centered token-only login gate shown whenever `spawn serve` requires bearer auth.
  * Keeps a single Token field (no username), works with virtual keyboards on 16:9 tablets
- * and phones, and validates live against `GET /api/overview` before entering the shell.
+ * and phones, validates live against `GET /api/overview`, and offers an escape hatch to
+ * clear stale stored tokens on loopback no-auth hosts.
  */
-export function TokenGate({ reason, problem, onAuthenticated }: TokenGateProps) {
+export function TokenGate({
+  reason,
+  problem,
+  hasStoredToken,
+  onAuthenticated,
+  onClearStoredAndRetry,
+}: TokenGateProps) {
   const inputId = useId();
   const [token, setToken] = useState("");
   const [visible, setVisible] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [clearing, setClearing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [clearedNote, setClearedNote] = useState<string | null>(null);
   const host = typeof window !== "undefined" ? window.location.host : "";
-  const statusNote = error ?? REASON_NOTICE[reason] ?? problem;
+  const statusNote = error ?? clearedNote ?? REASON_NOTICE[reason] ?? problem;
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (busy) return;
+    if (busy || clearing) return;
     setBusy(true);
     setError(null);
+    setClearedNote(null);
     try {
       const verdict = await verifyAndApplyToken(token);
       if (verdict.ok) {
@@ -48,6 +60,22 @@ export function TokenGate({ reason, problem, onAuthenticated }: TokenGateProps) 
       setError(verdict.message);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleClearAndRetry = async () => {
+    if (busy || clearing) return;
+    setClearing(true);
+    setError(null);
+    setClearedNote(null);
+    try {
+      setToken("");
+      const stillNeedsToken = await onClearStoredAndRetry();
+      if (stillNeedsToken) {
+        setClearedNote("已清除本地旧 Token；当前服务端仍需输入有效 Token。");
+      }
+    } finally {
+      setClearing(false);
     }
   };
 
@@ -149,7 +177,7 @@ export function TokenGate({ reason, problem, onAuthenticated }: TokenGateProps) 
 
               <button
                 type="submit"
-                disabled={busy}
+                disabled={busy || clearing}
                 className={cx(
                   "inline-flex h-11 w-full items-center justify-center rounded-control bg-primary px-4 text-body font-semibold text-primary-foreground shadow-btn transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50",
                   FOCUS_RING,
@@ -157,6 +185,20 @@ export function TokenGate({ reason, problem, onAuthenticated }: TokenGateProps) 
               >
                 {busy ? "正在验证 Token…" : "进入控制台"}
               </button>
+
+              {hasStoredToken && (
+                <button
+                  type="button"
+                  disabled={busy || clearing}
+                  onClick={() => void handleClearAndRetry()}
+                  className={cx(
+                    "inline-flex h-11 w-full items-center justify-center rounded-control bg-inset px-4 text-caption font-medium text-muted-foreground shadow-hairline transition-colors hover:bg-surface-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
+                    FOCUS_RING,
+                  )}
+                >
+                  {clearing ? "正在清除并重探…" : "清除已存 Token / 尝试本机免登"}
+                </button>
+              )}
             </form>
 
             <p className="mt-4 text-caption leading-relaxed text-faint-foreground">

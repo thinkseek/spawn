@@ -4,7 +4,18 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { chooseToken, serveCredential, unauthorizedReason, validateSubmittedToken } from "../src/token.ts";
+import {
+  TOKEN_KEY,
+  authStateFromProbe,
+  authStateOnUnauthorized,
+  chooseToken,
+  classifyStorageTokenEvent,
+  probeAuthWithFetch,
+  serveCredential,
+  unauthorizedReason,
+  validateSubmittedToken,
+  verifyTokenWithFetch,
+} from "../src/token.ts";
 
 test("only visible ASCII up to 512 characters is a token", () => {
   for (const good of ["abc", "bb-serve-token-1", "a".repeat(512), "!~#$%&'()*+,-./:;<=>?@[]^_`{|}"]) {
@@ -74,4 +85,117 @@ test("unauthorizedReason maps closed reasons for missing, invalid, and rejected 
   assert.equal(unauthorizedReason(true, "bad url"), "rejected_token");
   assert.equal(unauthorizedReason(false, "bad saved"), "invalid_token");
   assert.equal(unauthorizedReason(false, null), "missing_token");
+});
+
+test("probeAuthWithFetch maps 401 -> needs_token, 403/500/HTML/network -> unreachable, and 200 JSON -> authenticated", async () => {
+  const headers = { Accept: "application/json" };
+
+  assert.deepEqual(
+    await probeAuthWithFetch(async () => new Response(JSON.stringify({ sessions: [] }), { status: 200 }), headers),
+    { kind: "authenticated" },
+  );
+  assert.deepEqual(
+    await probeAuthWithFetch(async () => new Response(null, { status: 304 }), headers),
+    { kind: "authenticated" },
+  );
+  assert.deepEqual(
+    await probeAuthWithFetch(async () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 }), headers),
+    { kind: "needs_token" },
+  );
+
+  // 403, 500, HTML captive portal, malformed JSON, and network failure MUST never enter needs_token
+  for (const res of [
+    new Response(JSON.stringify({ error: "read-only viewer" }), { status: 403 }),
+    new Response(JSON.stringify({ error: "internal error" }), { status: 500 }),
+    new Response("<html><body>captive portal</body></html>", { status: 200 }),
+    new Response("{not json", { status: 200 }),
+    new Response("[]", { status: 200 }),
+  ]) {
+    const out = await probeAuthWithFetch(async () => res, headers);
+    assert.equal(out.kind, "unreachable");
+  }
+
+  const netOut = await probeAuthWithFetch(async () => {
+    throw new TypeError("Failed to fetch");
+  }, headers);
+  assert.equal(netOut.kind, "unreachable");
+});
+
+test("verifyTokenWithFetch saves valid token on 200 JSON and avoids hardcoded HTTP 401 on 401/403", async () => {
+  let stored: string | null = null;
+  const save = (tok: string) => {
+    stored = tok;
+  };
+
+  let fetched = 0;
+  const invalid = await verifyTokenWithFetch("bad token with space", async () => {
+    fetched += 1;
+    return new Response("{}", { status: 200 });
+  }, save);
+  assert.equal(invalid.ok, false);
+  assert.equal(fetched, 0);
+  assert.equal(stored, null);
+
+  const rejected401 = await verifyTokenWithFetch("spw_wrong", async () => {
+    return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+  }, save);
+  assert.equal(rejected401.ok, false);
+  if (!rejected401.ok) assert.ok(!rejected401.message.includes("HTTP 401"));
+  assert.equal(stored, null);
+
+  const refused403 = await verifyTokenWithFetch("spw_ro", async () => {
+    return new Response(JSON.stringify({ error: "forbidden" }), { status: 403 });
+  }, save);
+  assert.equal(refused403.ok, false);
+  if (!refused403.ok) assert.match(refused403.message, /403/);
+  assert.equal(stored, null);
+
+  const html200 = await verifyTokenWithFetch("spw_ok", async () => {
+    return new Response("<html>proxy error</html>", { status: 200 });
+  }, save);
+  assert.equal(html200.ok, false);
+  assert.equal(stored, null);
+
+  const accepted = await verifyTokenWithFetch("  spw_ok_123  ", async (_url, init) => {
+    const auth = (init.headers as Record<string, string>).Authorization;
+    assert.equal(auth, "Bearer spw_ok_123");
+    return new Response(JSON.stringify({ sessions: [] }), { status: 200 });
+  }, save);
+  assert.deepEqual(accepted, { ok: true });
+  assert.equal(stored, "spw_ok_123");
+});
+
+test("auth state machine handles stale-token escape hatch, unreachable errors, and cross-tab storage sync", async () => {
+  // Stale stored token rejected (401) -> clear -> loopback no-token host returns 200 -> authenticated(hasStoredToken=false)
+  assert.deepEqual(authStateFromProbe({ kind: "needs_token" }, true, null), {
+    kind: "needs_token",
+    reason: "rejected_token",
+    problem: null,
+    hasStoredToken: true,
+  });
+  assert.deepEqual(authStateFromProbe({ kind: "authenticated" }, false, null), {
+    kind: "authenticated",
+    hasStoredToken: false,
+  });
+  assert.deepEqual(authStateFromProbe({ kind: "unreachable", message: "HTTP 500" }, true, null), {
+    kind: "unreachable",
+    message: "HTTP 500",
+    hasStoredToken: true,
+  });
+  assert.deepEqual(authStateOnUnauthorized(true, null), {
+    kind: "needs_token",
+    reason: "rejected_token",
+    problem: null,
+    hasStoredToken: true,
+  });
+
+  // Cross-tab storage sync: sign-out affects tabs with a token, ignores unrelated keys or tokenless loopback tabs
+  assert.deepEqual(classifyStorageTokenEvent(TOKEN_KEY, null, "old-tok"), { kind: "signed_out" });
+  assert.deepEqual(classifyStorageTokenEvent(null, null, "old-tok"), { kind: "signed_out" });
+  assert.equal(classifyStorageTokenEvent(TOKEN_KEY, null, null), null);
+  assert.equal(classifyStorageTokenEvent("other.key", null, "old-tok"), null);
+  assert.deepEqual(classifyStorageTokenEvent(TOKEN_KEY, "new-tok", "old-tok"), {
+    kind: "token_updated",
+    token: "new-tok",
+  });
 });
