@@ -31,10 +31,7 @@ use spawn_core::memory::{MemoryStore, MemoryWatch};
 use spawn_core::port::{BridgeShard, CommandQueue, EventLog, ShardPartition, TranscriptArchive};
 use spawn_core::time::SystemClock;
 use spawn_host::LocalTranscriptArchive;
-use spawn_postgres::{
-    PostgresStore, ProvAttributionSource, ProvBoundary, ProvChangeInput, ProvChangeKind,
-    ProvEntryClass, ProvEntryInput,
-};
+use spawn_postgres::PostgresStore;
 
 const USAGE: &str = "spawn always-on control-plane & attribution benchmark\n\
 \n\
@@ -387,17 +384,21 @@ fn finish_t1_xid8_commit(
     mut t1: std::process::Child,
     mut t1_in: std::process::ChildStdin,
     id_t1: i64,
+    tag: &str,
     round: usize,
 ) -> Result<(), String> {
+    let agent = format!("agent_{tag}_a_{round}");
+    let session = format!("session_{tag}_a_{round}");
+    let source_id = format!("{tag}-a:{round}");
     let phase2 = format!(
-        "SELECT pg_advisory_xact_lock(1399957401, hashtext('session_xid8_a_{round}'));\n\
+        "SELECT pg_advisory_xact_lock(1399957401, hashtext('{session}'));\n\
          INSERT INTO spawn_agent_sessions (agent_id, session_id) \
-         VALUES ('agent_xid8_a_{round}', 'session_xid8_a_{round}') ON CONFLICT DO NOTHING;\n\
+         VALUES ('{agent}', '{session}') ON CONFLICT DO NOTHING;\n\
          INSERT INTO spawn_events (id, agent_id, session_id, execution_id, source, source_event_id, \
          kind, session_seq, recorded_at_ms, commit_xid) \
-         VALUES ({id_t1}, 'agent_xid8_a_{round}', 'session_xid8_a_{round}', NULL, 'observer', \
-         'xid8-a:{round}', '{{\"name\":\"message.received\"}}'::jsonb, 1, spawn_now_ms(), pg_current_xact_id());\n\
-         SELECT spawn_session_fold('session_xid8_a_{round}');\n\
+         VALUES ({id_t1}, '{agent}', '{session}', NULL, 'observer', \
+         '{source_id}', '{{\"name\":\"message.received\"}}'::jsonb, 1, spawn_now_ms(), pg_current_xact_id());\n\
+         SELECT spawn_session_fold('{session}');\n\
          COMMIT;\n\
          \\q\n"
     );
@@ -417,6 +418,35 @@ fn finish_t1_xid8_commit(
     if !out.status.success() {
         return Err(format!(
             "xid8 T1 commit failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn run_psql_exec(pg_envs: &[(String, String)], sql: &str) -> Result<(), String> {
+    let mut cmd = Command::new("psql");
+    cmd.args(["-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (k, v) in pg_envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("spawn psql exec: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(sql.as_bytes())
+            .and_then(|()| stdin.flush())
+            .map_err(|e| format!("write psql exec SQL: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("wait psql exec: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "psql exec failed ({}): {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
@@ -490,7 +520,7 @@ fn run_single_xid8_inversion(
     }
     *cursor = pos_t2;
 
-    finish_t1_xid8_commit(t1, t1_in, id_t1, round)?;
+    finish_t1_xid8_commit(t1, t1_in, id_t1, "xid8", round)?;
 
     let g2 = store
         .read_global(*cursor, 100)
@@ -519,7 +549,7 @@ fn verify_deterministic_xid8_inversions(
     bench_url: &str,
     schema: &str,
     store: &PostgresStore,
-    start_cursor: GlobalPosition,
+    cursor: &mut GlobalPosition,
     rounds: usize,
 ) -> Result<usize, String> {
     if schema.is_empty()
@@ -530,11 +560,135 @@ fn verify_deterministic_xid8_inversions(
         return Err(format!("invalid benchmark schema {schema:?}"));
     }
     let pg_envs = parse_pg_env(bench_url)?;
-    let mut cursor = start_cursor;
     for round in 0..rounds {
-        run_single_xid8_inversion(&pg_envs, schema, store, &mut cursor, round)?;
+        run_single_xid8_inversion(&pg_envs, schema, store, cursor, round)?;
     }
     Ok(rounds)
+}
+
+fn run_single_xmin_holdback(
+    pg_envs: &[(String, String)],
+    schema: &str,
+    store: &PostgresStore,
+    cursor: &mut GlobalPosition,
+    round: usize,
+) -> Result<(), String> {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let base = env::temp_dir();
+    let id_file = base.join(format!("spawn_xmin_id_{pid}_{round}_{nanos:x}.txt"));
+    let ready_file = base.join(format!("spawn_xmin_ready_{pid}_{round}_{nanos:x}.txt"));
+    let _cleanup = TempFilesGuard(vec![id_file.clone(), ready_file.clone()]);
+
+    let mut t1 = spawn_xid8_t1_psql(pg_envs)?;
+    let mut t1_in = t1
+        .stdin
+        .take()
+        .ok_or_else(|| "missing stdin pipe for xmin T1 psql".to_string())?;
+    // Writing into _bench_xid_anchor (in `schema` = `snap.ns_oid`, not touching `spawn_events`)
+    // assigns T1 a real earlier `xid8` (`pg_snapshot_xmin`) while keeping `T2` unblocked.
+    let phase1 = format!(
+        "SET search_path TO {schema};\n\
+         BEGIN;\n\
+         INSERT INTO _bench_xid_anchor (slot) VALUES ({round}) \
+         ON CONFLICT (slot) DO UPDATE SET slot = EXCLUDED.slot;\n\
+         SELECT nextval(pg_get_serial_sequence('spawn_events', 'id')) \\g {}\n\
+         SELECT 1 \\g {}\n",
+        id_file.display(),
+        ready_file.display(),
+    );
+    t1_in
+        .write_all(phase1.as_bytes())
+        .and_then(|()| t1_in.flush())
+        .map_err(|e| format!("write xmin T1 phase1 SQL: {e}"))?;
+
+    let id_t1 = wait_for_t1_reserved_id(&mut t1, &id_file, &ready_file)?;
+    let pos_t1 = GlobalPosition(
+        u64::try_from(id_t1).map_err(|_| format!("invalid negative xmin id_t1={id_t1}"))?,
+    );
+
+    let t2 = store
+        .append(NewEvent {
+            agent_id: AgentId::new(format!("agent_xmin_b_{round}")).map_err(|e| e.to_string())?,
+            session_id: SessionId::new(format!("session_xmin_b_{round}"))
+                .map_err(|e| e.to_string())?,
+            execution_id: None,
+            source: Source::Observer,
+            source_event_id: Some(format!("xmin-b:{round}")),
+            kind: EventKind::MessageReceived,
+        })
+        .map_err(|e| format!("append xmin T2 event: {e}"))?;
+    let pos_t2 = t2.record.position;
+    if pos_t2 <= pos_t1 {
+        return Err(format!("expected xmin T2 id {pos_t2:?} > T1 id {pos_t1:?}"));
+    }
+
+    let g1 = store
+        .read_global(*cursor, 100)
+        .map_err(|e| format!("read_global during open T1 xmin holdback: {e}"))?;
+    if !g1.is_empty() {
+        let _ = t1.kill();
+        let _ = t1.wait();
+        let leaked: Vec<GlobalPosition> = g1.iter().map(|r| r.position).collect();
+        return Err(format!(
+            "xid8 xmin watermark holdback round {round}: read_global leaked committed T2 rows {leaked:?} while older T1 XID remained uncommitted"
+        ));
+    }
+
+    finish_t1_xid8_commit(t1, t1_in, id_t1, "xmin", round)?;
+
+    let g2 = store
+        .read_global(*cursor, 100)
+        .map_err(|e| format!("read_global after xmin T1 commit: {e}"))?;
+    let g2_pos: Vec<GlobalPosition> = g2.iter().map(|r| r.position).collect();
+    if g2_pos != [pos_t1, pos_t2] {
+        return Err(format!(
+            "xid8 xmin holdback round {round}: expected release [{pos_t1:?}, {pos_t2:?}], got {g2_pos:?}"
+        ));
+    }
+    *cursor = pos_t2;
+
+    let g3 = store
+        .read_global(*cursor, 100)
+        .map_err(|e| format!("read_global post-xmin drain: {e}"))?;
+    if !g3.is_empty() {
+        return Err(format!(
+            "xid8 xmin holdback round {round}: expected 0 duplicate trailing rows, got {}",
+            g3.len()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_xid8_xmin_watermark_holdback(
+    bench_url: &str,
+    schema: &str,
+    store: &PostgresStore,
+    cursor: &mut GlobalPosition,
+    rounds: usize,
+) -> Result<(usize, usize), String> {
+    if schema.is_empty()
+        || !schema
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!("invalid benchmark schema {schema:?}"));
+    }
+    let pg_envs = parse_pg_env(bench_url)?;
+    run_psql_exec(
+        &pg_envs,
+        &format!(
+            "SET search_path TO {schema};\n\
+             CREATE TABLE IF NOT EXISTS _bench_xid_anchor (slot integer PRIMARY KEY);\n\
+             \\q\n"
+        ),
+    )?;
+    for round in 0..rounds {
+        run_single_xmin_holdback(&pg_envs, schema, store, cursor, round)?;
+    }
+    Ok((rounds, 0))
 }
 
 struct EventReadTally {
@@ -642,9 +796,11 @@ fn run_event_log_stress(
         });
     let wall_ms = wall_t0.elapsed().as_secs_f64() * 1000.0;
     let tally = tally_event_log_reads(&read_positions, &written_positions);
-    let end_cursor = read_positions.last().map_or(initial_cursor, |s| s.position);
+    let mut end_cursor = read_positions.last().map_or(initial_cursor, |s| s.position);
     let deterministic_inversions =
-        verify_deterministic_xid8_inversions(bench_url, schema, base_store, end_cursor, 4)?;
+        verify_deterministic_xid8_inversions(bench_url, schema, base_store, &mut end_cursor, 4)?;
+    let (xmin_holdbacks, xmin_premature_leaks) =
+        verify_xid8_xmin_watermark_holdback(bench_url, schema, base_store, &mut end_cursor, 2)?;
 
     Ok(json!({
         "writer_pool": cfg.writer_pool,
@@ -656,6 +812,8 @@ fn run_event_log_stress(
         "concurrent_commit_id_inversions": tally.commit_id_inversions,
         "deterministic_commit_id_inversions": deterministic_inversions,
         "commit_id_inversions": tally.commit_id_inversions + deterministic_inversions,
+        "xmin_watermark_holdbacks_verified": xmin_holdbacks,
+        "xmin_premature_leaks": xmin_premature_leaks,
         "duplicate_reads": tally.duplicate_reads,
         "missing_reads": tally.missing_reads,
         "unexpected_reads": tally.unexpected_reads,
@@ -1252,44 +1410,11 @@ fn read_archived_transcript_bytes(
     Ok(full)
 }
 
-fn record_landed_provenance_from_system(
+fn complete_task_landing_lifecycle(
     store: &PostgresStore,
-    archive: &LocalTranscriptArchive,
     task_id: i64,
-    session_id: &SessionId,
-    cost_execs_by_id: &BTreeMap<String, &Value>,
     idx: usize,
 ) -> Result<(), String> {
-    let task_facts = store
-        .prov_task_facts(&[task_id])
-        .map_err(|e| format!("prov_task_facts: {e}"))?;
-    let agent_id = task_facts
-        .get(&task_id)
-        .map(|f| f.agent_id.clone())
-        .ok_or_else(|| format!("task {task_id} missing from mission_tasks"))?;
-    let execs = store
-        .executions(session_id)
-        .map_err(|e| format!("executions({session_id}): {e}"))?;
-    let exec_row = execs
-        .iter()
-        .find(|e| e.ended_at.is_some())
-        .ok_or_else(|| format!("session {session_id} missing ended execution"))?;
-    let execution_id = exec_row.execution_id.as_str().to_string();
-    let native_sid = find_native_sid_for_execution(store, &execution_id)?
-        .ok_or_else(|| format!("execution {execution_id} missing NativeSessionStarted in PG"))?;
-    let archived_bytes = read_archived_transcript_bytes(archive, &agent_id, &native_sid)?;
-    let archive_sha = sha256_of(&archived_bytes);
-    let transcript_ref = format!(
-        "archive/{agent_id}/{native_sid}.jsonl#sha256={}",
-        archive_sha.hex()
-    );
-    let model_label = cost_execs_by_id
-        .get(&execution_id)
-        .and_then(|row| row["models"].as_array())
-        .and_then(|models| models.first())
-        .and_then(|m| m["model"].as_str())
-        .map(str::to_string);
-
     store
         .task_delivered(task_id, i64::try_from(idx + 1).expect("fits i64"))
         .map_err(|e| format!("task_delivered: {e}"))?;
@@ -1317,39 +1442,6 @@ fn record_landed_provenance_from_system(
             "to": commit_hex,
         }))
         .map_err(|e| format!("integrator_record landed: {e}"))?;
-    let at_ms = store
-        .database_now_ms()
-        .map_err(|e| format!("database_now_ms provenance: {e}"))?;
-    let _ = store
-        .record_change(
-            &ProvChangeInput {
-                change_id: format!("chg-attr-{idx:03}"),
-                rev: 1,
-                kind: ProvChangeKind::Land,
-                domain: "d6:bench".to_string(),
-                agent_id,
-                execution_id: Some(execution_id),
-                task_id: Some(task_id),
-                preset_id: None,
-                model_label,
-                transcript_ref: Some(transcript_ref),
-                attributed: ProvAttributionSource::Host,
-                base: base_hex,
-                result: commit_hex,
-                boundary: ProvBoundary::Land,
-                at_ms,
-            },
-            &[ProvEntryInput {
-                path: format!("src/task_{idx}.rs"),
-                before: None,
-                after: Some(archive_sha.to_string()),
-                size: Some(i64::try_from(archived_bytes.len()).expect("fits i64")),
-                class: ProvEntryClass::Content,
-                origin: None,
-            }],
-            &[],
-        )
-        .map_err(|e| format!("record_change: {e}"))?;
     Ok(())
 }
 
@@ -1372,12 +1464,14 @@ impl MatchState {
 #[derive(Clone)]
 struct ObservedLineage {
     task_id: Option<i64>,
-    prov_task_id: Option<i64>,
+    cost_task_id: Option<i64>,
     agent_matches_task: MatchState,
     agent_matches_execution: MatchState,
-    has_execution_id: MatchState,
-    model_matches_cost: MatchState,
-    transcript_ref_valid: MatchState,
+    agent_matches_cost: MatchState,
+    execution_matches_cost: MatchState,
+    model_matches_disk_and_cost: MatchState,
+    disk_transcript_verified: MatchState,
+    disk_tokens_match_cost: MatchState,
     duration_ms: Option<i64>,
     cost_usd: Option<f64>,
     unpriced_tokens: i64,
@@ -1386,23 +1480,26 @@ struct ObservedLineage {
 
 fn evaluate_observed_lineage(obs: &ObservedLineage, gaps: &mut AttributionGaps) -> Option<i64> {
     let mut ok = true;
-    if !obs.agent_matches_task.is_matched() || !obs.agent_matches_execution.is_matched() {
+    if !obs.agent_matches_task.is_matched()
+        || !obs.agent_matches_execution.is_matched()
+        || !obs.agent_matches_cost.is_matched()
+    {
         gaps.missing_agent_id += 1;
         ok = false;
     }
-    if !obs.has_execution_id.is_matched() {
+    if !obs.execution_matches_cost.is_matched() {
         gaps.missing_execution_id += 1;
         ok = false;
     }
-    if obs.task_id.is_none() || obs.prov_task_id != obs.task_id {
+    if obs.task_id.is_none() || obs.cost_task_id != obs.task_id {
         gaps.missing_task_id += 1;
         ok = false;
     }
-    if !obs.model_matches_cost.is_matched() {
+    if !obs.model_matches_disk_and_cost.is_matched() {
         gaps.missing_model_label += 1;
         ok = false;
     }
-    if !obs.transcript_ref_valid.is_matched() {
+    if !obs.disk_transcript_verified.is_matched() {
         gaps.missing_transcript_ref += 1;
         ok = false;
     }
@@ -1414,7 +1511,9 @@ fn evaluate_observed_lineage(obs: &ObservedLineage, gaps: &mut AttributionGaps) 
             None
         }
     };
-    let cost_ok = obs.cost_usd.is_some_and(|u| u > 0.0) && obs.unpriced_tokens == 0;
+    let cost_ok = obs.cost_usd.is_some_and(|u| u > 0.0)
+        && obs.unpriced_tokens == 0
+        && obs.disk_tokens_match_cost.is_matched();
     if !cost_ok {
         gaps.missing_cost_or_tokens += 1;
         ok = false;
@@ -1429,28 +1528,80 @@ fn evaluate_observed_lineage(obs: &ObservedLineage, gaps: &mut AttributionGaps) 
     dur_ms
 }
 
-fn verify_transcript_ref_against_disk(
+#[derive(Default)]
+struct DiskTranscriptSummary {
+    byte_len: usize,
+    model: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_write_tokens: i64,
+    cache_read_tokens: i64,
+}
+
+impl DiskTranscriptSummary {
+    fn tokens_tuple(&self) -> (i64, i64, i64, i64) {
+        (
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_write_tokens,
+            self.cache_read_tokens,
+        )
+    }
+
+    fn total_tokens(&self) -> i64 {
+        self.input_tokens + self.output_tokens + self.cache_write_tokens + self.cache_read_tokens
+    }
+}
+
+fn read_disk_transcript_summary(
     archive: &LocalTranscriptArchive,
     agent_id: &str,
     native_sid: &str,
-    recorded_ref: Option<&str>,
-) -> bool {
-    let Some(tref) = recorded_ref else {
-        return false;
-    };
-    let expected_prefix = format!("archive/{agent_id}/{native_sid}.jsonl#sha256=");
-    let Some(hex_digest) = tref.strip_prefix(&expected_prefix) else {
-        return false;
-    };
-    let Ok(bytes) = read_archived_transcript_bytes(archive, agent_id, native_sid) else {
-        return false;
-    };
-    if bytes.is_empty() || sha256_of(&bytes).hex() != hex_digest {
-        return false;
+) -> Option<DiskTranscriptSummary> {
+    let bytes = read_archived_transcript_bytes(archive, agent_id, native_sid).ok()?;
+    if bytes.is_empty() || sha256_of(&bytes).hex().is_empty() {
+        return None;
     }
+    let mut summary = DiskTranscriptSummary {
+        byte_len: bytes.len(),
+        ..DiskTranscriptSummary::default()
+    };
     let text = String::from_utf8_lossy(&bytes);
-    text.lines()
-        .any(|line| ingest::claude_usage(line).is_some())
+    for line in text.lines() {
+        if let Some(norm) = ingest::claude_usage(line)
+            && let EventKind::ModelUsage {
+                model,
+                input_tokens,
+                output_tokens,
+                cache_write_tokens,
+                cache_read_tokens,
+                ..
+            } = norm.kind
+        {
+            if let Some(prev) = &summary.model {
+                if prev != &model {
+                    return None;
+                }
+            } else {
+                summary.model = Some(model);
+            }
+            summary.input_tokens += i64::try_from(input_tokens).ok()?;
+            summary.output_tokens += i64::try_from(output_tokens).ok()?;
+            summary.cache_write_tokens += i64::try_from(cache_write_tokens).ok()?;
+            summary.cache_read_tokens += i64::try_from(cache_read_tokens).ok()?;
+        }
+    }
+    (summary.total_tokens() > 0 && summary.model.is_some()).then_some(summary)
+}
+
+fn json_tokens_tuple(row: &Value) -> Option<(i64, i64, i64, i64)> {
+    let t = row.get("tokens")?;
+    Some((
+        t.get("input")?.as_i64()?,
+        t.get("output")?.as_i64()?,
+        t.get("cache_write")?.as_i64()?,
+        t.get("cache_read")?.as_i64()?,
+    ))
 }
 
 fn read_observed_task_lineage(
@@ -1462,11 +1613,6 @@ fn read_observed_task_lineage(
     cost_tasks: &BTreeMap<i64, &Value>,
     cost_execs_by_id: &BTreeMap<String, &Value>,
 ) -> Result<ObservedLineage, String> {
-    let provs = store
-        .prov_changes_for_task(task_id)
-        .map_err(|e| format!("prov_changes_for_task: {e}"))?;
-    let prov = provs.first();
-
     let task_facts = store
         .prov_task_facts(&[task_id])
         .map_err(|e| format!("prov_task_facts: {e}"))?;
@@ -1493,50 +1639,74 @@ fn read_observed_task_lineage(
         .as_ref()
         .and_then(|id| cost_execs_by_id.get(id))
         .copied();
+    let cost_agent = cost_exec_row.and_then(|r| r["agent"].as_str());
+    let cost_exec_id = cost_exec_row.and_then(|r| r["execution"].as_str());
+    let cost_exec_task = cost_exec_row.and_then(|r| r["task"].as_i64());
+    let cost_task_id = cost_row.and_then(|r| r["task"].as_i64());
     let cost_model = cost_exec_row
         .and_then(|r| r["models"].as_array())
         .and_then(|m| m.first())
         .and_then(|m| m["model"].as_str());
-
-    let agent_matches_task = MatchState::from_bool(
-        prov.zip(task_agent)
-            .is_some_and(|(p, t_ag)| !p.agent_id.is_empty() && p.agent_id == t_ag),
-    );
-    let agent_matches_execution = MatchState::from_bool(
-        prov.zip(event_agent)
-            .is_some_and(|(p, e_ag)| p.agent_id == e_ag),
-    );
-    let has_execution_id = MatchState::from_bool(
-        prov.zip(exec_id_str.as_deref())
-            .is_some_and(|(p, eid)| p.execution_id.as_deref() == Some(eid)),
-    );
-    let model_matches_cost = MatchState::from_bool(
-        prov.zip(cost_model)
-            .is_some_and(|(p, m)| p.model_label.as_deref() == Some(m) && !m.is_empty()),
-    );
+    let cost_task_tokens = cost_row.and_then(json_tokens_tuple);
+    let cost_exec_tokens = cost_exec_row.and_then(json_tokens_tuple);
 
     let native_sid = match &exec_id_str {
         Some(eid) => find_native_sid_for_execution(store, eid)?,
         None => None,
     };
-    let transcript_ref_valid =
-        MatchState::from_bool(prov.zip(native_sid.as_deref()).is_some_and(|(p, nsid)| {
-            verify_transcript_ref_against_disk(
-                archive,
-                &p.agent_id,
-                nsid,
-                p.transcript_ref.as_deref(),
-            )
-        }));
+    let disk_summary = event_agent
+        .zip(native_sid.as_deref())
+        .and_then(|(ag, nsid)| read_disk_transcript_summary(archive, ag, nsid));
+
+    let agent_matches_task = MatchState::from_bool(
+        task_agent
+            .zip(event_agent)
+            .is_some_and(|(t_ag, e_ag)| !t_ag.is_empty() && t_ag == e_ag),
+    );
+    let agent_matches_execution =
+        MatchState::from_bool(event_agent.is_some_and(|e_ag| !e_ag.is_empty()));
+    let agent_matches_cost = MatchState::from_bool(
+        event_agent
+            .zip(cost_agent)
+            .is_some_and(|(e_ag, c_ag)| e_ag == c_ag),
+    );
+    let execution_matches_cost = MatchState::from_bool(
+        exec_id_str
+            .as_deref()
+            .zip(cost_exec_id)
+            .zip(cost_exec_task)
+            .is_some_and(|((eid, ceid), ctid)| !eid.is_empty() && eid == ceid && ctid == task_id),
+    );
+    let model_matches_disk_and_cost = MatchState::from_bool(
+        disk_summary
+            .as_ref()
+            .and_then(|d| d.model.as_deref())
+            .zip(cost_model)
+            .is_some_and(|(dm, cm)| !dm.is_empty() && dm == cm),
+    );
+    let disk_transcript_verified = MatchState::from_bool(
+        disk_summary
+            .as_ref()
+            .is_some_and(|d| d.byte_len > 0 && d.total_tokens() > 0),
+    );
+    let disk_tokens_match_cost = MatchState::from_bool(
+        disk_summary
+            .as_ref()
+            .zip(cost_task_tokens)
+            .zip(cost_exec_tokens)
+            .is_some_and(|((d, ct), ce)| d.tokens_tuple() == ct && ct == ce),
+    );
 
     Ok(ObservedLineage {
         task_id: Some(task_id),
-        prov_task_id: prov.and_then(|p| p.task_id),
+        cost_task_id,
         agent_matches_task,
         agent_matches_execution,
-        has_execution_id,
-        model_matches_cost,
-        transcript_ref_valid,
+        agent_matches_cost,
+        execution_matches_cost,
+        model_matches_disk_and_cost,
+        disk_transcript_verified,
+        disk_tokens_match_cost,
         duration_ms: ended_exec.and_then(|e| e.duration_ms),
         cost_usd: cost_row.and_then(|r| r["usd"].as_f64()),
         unpriced_tokens: cost_row
@@ -1549,19 +1719,25 @@ fn read_observed_task_lineage(
 type LineageMutation = (&'static str, fn(&mut ObservedLineage));
 
 fn run_negative_attribution_falsification(valid: &ObservedLineage) -> Result<usize, String> {
-    let mutations: [LineageMutation; 8] = [
+    let mutations: [LineageMutation; 10] = [
         ("missing_agent_id", |o| {
             o.agent_matches_task = MatchState::Mismatched;
         }),
-        ("missing_execution_id", |o| {
-            o.has_execution_id = MatchState::Mismatched;
+        ("agent_cost_mismatch", |o| {
+            o.agent_matches_cost = MatchState::Mismatched;
         }),
-        ("missing_task_id", |o| o.prov_task_id = None),
+        ("missing_execution_id", |o| {
+            o.execution_matches_cost = MatchState::Mismatched;
+        }),
+        ("missing_task_id", |o| o.cost_task_id = None),
         ("missing_model_label", |o| {
-            o.model_matches_cost = MatchState::Mismatched;
+            o.model_matches_disk_and_cost = MatchState::Mismatched;
         }),
         ("missing_transcript_ref", |o| {
-            o.transcript_ref_valid = MatchState::Mismatched;
+            o.disk_transcript_verified = MatchState::Mismatched;
+        }),
+        ("disk_token_mismatch", |o| {
+            o.disk_tokens_match_cost = MatchState::Mismatched;
         }),
         ("missing_duration_ms", |o| o.duration_ms = Some(0)),
         ("missing_cost_or_tokens", |o| o.unpriced_tokens = 1),
@@ -1724,15 +1900,8 @@ fn verify_attribution_completeness(
         .filter_map(|row| row["execution"].as_str().map(|id| (id.to_string(), row)))
         .collect();
 
-    for (idx, (task_id, session_id)) in tasks.iter().enumerate() {
-        record_landed_provenance_from_system(
-            store,
-            archive,
-            *task_id,
-            session_id,
-            &cost_execs_by_id,
-            idx,
-        )?;
+    for (idx, (task_id, _session_id)) in tasks.iter().enumerate() {
+        complete_task_landing_lifecycle(store, *task_id, idx)?;
     }
 
     let facts = store
@@ -1788,6 +1957,16 @@ fn verify_attribution_completeness(
         "unpriced_tokens": cost["total"]["unpriced_tokens"].as_i64().unwrap_or(0),
         "negative_falsification_passed": true,
         "negative_cases_checked": neg_checked,
+        "field_sources": {
+            "agent_id": "mission_tasks(prov_task_facts) == spawn_events(prov_execution_agents) == cost_window.executions[].agent",
+            "execution_id": "bridge_executions(executions) == spawn_events(NativeSessionStarted) == cost_window.executions[].execution",
+            "task_id": "mission_tasks(prov_task_facts) == cost_window.tasks[].task == cost_window.executions[].task",
+            "model_label": "LocalTranscriptArchive(ingest::claude_usage) == cost_window.executions[].models[].model",
+            "transcript_ref": "spawn_events(NativeSessionStarted) -> LocalTranscriptArchive on-disk bytes + token parity",
+            "duration_ms": "bridge_executions(executions[].duration_ms > 0)",
+            "cost_or_tokens": "cost_window.tasks[](usd > 0, unpriced_tokens == 0) == LocalTranscriptArchive tokens",
+            "landing_record": "scorecard_facts(control[].type == task.landed)"
+        },
         "field_gaps": {
             "agent_id": gaps.missing_agent_id,
             "execution_id": gaps.missing_execution_id,
@@ -2025,12 +2204,14 @@ mod tests {
     fn attribution_negative_falsification_catches_all_eight_gaps() {
         let valid = ObservedLineage {
             task_id: Some(42),
-            prov_task_id: Some(42),
+            cost_task_id: Some(42),
             agent_matches_task: MatchState::Matched,
             agent_matches_execution: MatchState::Matched,
-            has_execution_id: MatchState::Matched,
-            model_matches_cost: MatchState::Matched,
-            transcript_ref_valid: MatchState::Matched,
+            agent_matches_cost: MatchState::Matched,
+            execution_matches_cost: MatchState::Matched,
+            model_matches_disk_and_cost: MatchState::Matched,
+            disk_transcript_verified: MatchState::Matched,
+            disk_tokens_match_cost: MatchState::Matched,
             duration_ms: Some(12),
             cost_usd: Some(0.05),
             unpriced_tokens: 0,
@@ -2043,7 +2224,7 @@ mod tests {
         );
         assert_eq!(baseline_gaps.tasks_fully_attributed, 1);
         assert_eq!(baseline_gaps.total_field_gaps(), 0);
-        assert_eq!(run_negative_attribution_falsification(&valid), Ok(8));
+        assert_eq!(run_negative_attribution_falsification(&valid), Ok(10));
 
         let mut zero_usd = valid;
         zero_usd.cost_usd = Some(0.0);

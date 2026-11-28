@@ -140,6 +140,17 @@ def evaluate_scorecard(
             and ao.get("merged_files_verified") == expected_n
         )
 
+    def d6_dedup_ok(ao, expected_n):
+        return bool(
+            ao.get("slo_cdc_dedup_passed") is True
+            and ao.get("cdc_shifted_files") == expected_n
+            and ao.get("cdc_shifted_logical_bytes", 0) > 0
+            and ao.get("cdc_unique_stored_bytes", 0) > 0
+            and ao.get("cdc_dedup_ratio", 0.0) >= 2.0
+            and 0.0 < ao.get("cdc_fixed_block_dedup_ratio", 0.0) < 1.2
+            and ao.get("logical_written_bytes", 0) >= ao.get("cdc_shifted_logical_bytes", 0)
+        )
+
     def crash_drill_ok(cd):
         return bool(
             cd.get("verified") is True
@@ -149,7 +160,9 @@ def evaluate_scorecard(
             and cd.get("sigkill_executed") is True
             and cd.get("exit_signal") == 9
             and cd.get("committed_before_kill", 0) >= 6
+            and cd.get("torn_tail_present") is True
             and cd.get("torn_journal_line_recovered") is True
+            and cd.get("reconcile_last_journal_seq", 0) > 0
             and cd.get("verifier_pid", 0) > 0
         )
 
@@ -158,6 +171,9 @@ def evaluate_scorecard(
         and pg_restart_verify.get("lost_refs") == 0
         and pg_restart_verify.get("lost_commits") == 0
         and pg_restart_verify.get("corrupt_objects") == 0
+        and pg_restart_verify.get("torn_tail_present") is True
+        and pg_restart_verify.get("torn_journal_line_recovered") is True
+        and pg_restart_verify.get("reconcile_last_journal_seq", 0) > 0
         and pg_restart_verify.get("verifier_pid", 0) > 0
     )
 
@@ -208,18 +224,26 @@ def evaluate_scorecard(
         {
             "id": "D6_8_DEDUP_RATIO",
             "dimension": "A: D6 8-Branch",
-            "metric": "dedup_ratio",
-            "measured": f"{ao_8['dedup_ratio']:.2f}x",
-            "threshold": ">= 2.00x",
-            "passed": ao_8["dedup_ratio"] >= 2.0,
+            "metric": "cdc_dedup_ratio vs fixed_block",
+            "measured": (
+                f"cdc={ao_8.get('cdc_dedup_ratio', 0.0):.2f}x "
+                f"vs fixed={ao_8.get('cdc_fixed_block_dedup_ratio', 0.0):.2f}x "
+                f"(files={ao_8.get('cdc_shifted_files', 0)}/8, total={ao_8['dedup_ratio']:.2f}x)"
+            ),
+            "threshold": "cdc >= 2.00x & fixed < 1.20x & 8/8 shifted",
+            "passed": d6_dedup_ok(ao_8, 8),
         },
         {
             "id": "D6_16_DEDUP_RATIO",
             "dimension": "A: D6 16-Branch",
-            "metric": "dedup_ratio",
-            "measured": f"{ao_16['dedup_ratio']:.2f}x",
-            "threshold": ">= 2.00x",
-            "passed": ao_16["dedup_ratio"] >= 2.0,
+            "metric": "cdc_dedup_ratio vs fixed_block",
+            "measured": (
+                f"cdc={ao_16.get('cdc_dedup_ratio', 0.0):.2f}x "
+                f"vs fixed={ao_16.get('cdc_fixed_block_dedup_ratio', 0.0):.2f}x "
+                f"(files={ao_16.get('cdc_shifted_files', 0)}/16, total={ao_16['dedup_ratio']:.2f}x)"
+            ),
+            "threshold": "cdc >= 2.00x & fixed < 1.20x & 16/16 shifted",
+            "passed": d6_dedup_ok(ao_16, 16),
         },
         {
             "id": "D6_8_CHECKPOINT_P95",
@@ -272,9 +296,11 @@ def evaluate_scorecard(
                 f"{ev['missing_reads']} / {ev['deadlocks']} "
                 f"({ev['events_written']}/{ev['events_target']} events, "
                 f"xid8_reorders={ev.get('commit_id_inversions', 0)} "
-                f"[det={ev.get('deterministic_commit_id_inversions', 0)}])"
+                f"[det={ev.get('deterministic_commit_id_inversions', 0)}], "
+                f"xmin_holdback={ev.get('xmin_watermark_holdbacks_verified', 0)}, "
+                f"xmin_leaks={ev.get('xmin_premature_leaks', 0)})"
             ),
-            "threshold": "0 / 0 / 0 / 0, write_errors=0, xid8_reorders>=4 (det>=4)",
+            "threshold": "0 / 0 / 0 / 0, write_errors=0, xid8_reorders>=4 (det>=4), xmin_holdback>=2, xmin_leaks=0",
             "passed": (
                 ev["events_written"] == ev["events_target"]
                 and ev["events_target"] >= 1024
@@ -287,6 +313,8 @@ def evaluate_scorecard(
                 and ev["read_errors"] == 0
                 and ev.get("deterministic_commit_id_inversions", 0) >= 4
                 and ev.get("commit_id_inversions", 0) >= 4
+                and ev.get("xmin_watermark_holdbacks_verified", 0) >= 2
+                and ev.get("xmin_premature_leaks", 1) == 0
             ),
         },
         {
@@ -411,7 +439,16 @@ def run_self_tests():
                 "landings_completed": n,
                 "merged_files_verified": n,
                 "land_cas_retries": max(0, n - 1),
-                "dedup_ratio": 3.5,
+                "logical_written_bytes": n * 5_500_000,
+                "cas_stored_bytes": n * 1_600_000,
+                "dedup_ratio": 3.4,
+                "cdc_shifted_files": n,
+                "cdc_shifted_logical_bytes": n * 5_243_500,
+                "cdc_unique_stored_bytes": n * 1_300_000 + 3_900_000,
+                "cdc_fixed_block_unique_bytes": n * 5_243_500,
+                "cdc_dedup_ratio": 3.1,
+                "cdc_fixed_block_dedup_ratio": 1.0,
+                "slo_cdc_dedup_passed": True,
                 "crash_restart_drill": {
                     "verified": True,
                     "lost_refs": 0,
@@ -420,7 +457,9 @@ def run_self_tests():
                     "sigkill_executed": True,
                     "exit_signal": 9,
                     "committed_before_kill": 6,
+                    "torn_tail_present": True,
                     "torn_journal_line_recovered": True,
+                    "reconcile_last_journal_seq": 10,
                     "verifier_pid": 99999,
                     "recovery_ms": 120.0,
                     "snapshots_verified": n + 1,
@@ -436,6 +475,9 @@ def run_self_tests():
         "lost_refs": 0,
         "lost_commits": 0,
         "corrupt_objects": 0,
+        "torn_tail_present": True,
+        "torn_journal_line_recovered": True,
+        "reconcile_last_journal_seq": 10,
         "snapshots_verified": 17,
         "blobs_verified": 64,
         "verifier_pid": 88888,
@@ -457,6 +499,8 @@ def run_self_tests():
                 "read_errors": 0,
                 "deterministic_commit_id_inversions": 4,
                 "commit_id_inversions": 5,
+                "xmin_watermark_holdbacks_verified": 2,
+                "xmin_premature_leaks": 0,
                 "append_latency": {"p50_ms": 4.0, "p95_ms": 80.0, "p99_ms": 95.0, "n": 1024},
                 "read_global_latency": {"p50_ms": 5.0, "p95_ms": 70.0, "p99_ms": 90.0, "n": 40},
             },
@@ -479,7 +523,7 @@ def run_self_tests():
         "dimension_c_attribution": {
             "bridge_driven": True,
             "negative_falsification_passed": True,
-            "negative_cases_checked": 8,
+            "negative_cases_checked": 10,
             "tasks_total": 16,
             "tasks_fully_attributed": 16,
             "attribution_gaps": 0,
@@ -538,14 +582,20 @@ def run_self_tests():
     expect_nogo("max_conn_100", lambda d8, d16, pr, c, sm, kw: (kw.__setitem__("pg_max_conn", 100), "PG16_RESOURCE_ENVELOPE")[1])
     expect_nogo("land_delta_gt_50mib", lambda d8, d16, pr, c, sm, kw: (d16["always_on_d6"].__setitem__("max_bytes_per_landing", 60_000_000), "D6_16_LAND_DELTA")[1])
     expect_nogo("partial_landings", lambda d8, d16, pr, c, sm, kw: (d16["always_on_d6"].__setitem__("landings_completed", 15), "D6_16_LAND_DELTA")[1])
+    expect_nogo("low_cdc_dedup", lambda d8, d16, pr, c, sm, kw: (d16["always_on_d6"].__setitem__("cdc_dedup_ratio", 1.5), "D6_16_DEDUP_RATIO")[1])
+    expect_nogo("fixed_block_cheating_corpus", lambda d8, d16, pr, c, sm, kw: (d8["always_on_d6"].__setitem__("cdc_fixed_block_dedup_ratio", 1.5), "D6_8_DEDUP_RATIO")[1])
+    expect_nogo("missing_shifted_files", lambda d8, d16, pr, c, sm, kw: (d16["always_on_d6"].__setitem__("cdc_shifted_files", 15), "D6_16_DEDUP_RATIO")[1])
     expect_nogo("missing_sigkill", lambda d8, d16, pr, c, sm, kw: (d16["always_on_d6"]["crash_restart_drill"].__setitem__("sigkill_executed", False), "D6_CRASH_RESTART_ZERO_LOSS")[1])
     expect_nogo("failed_pg_restart", lambda d8, d16, pr, c, sm, kw: (pr.__setitem__("verified", False), "D6_CRASH_RESTART_ZERO_LOSS")[1])
+    expect_nogo("missing_torn_tail_pg_restart", lambda d8, d16, pr, c, sm, kw: (pr.__setitem__("torn_tail_present", False), "D6_CRASH_RESTART_ZERO_LOSS")[1])
     expect_nogo("zero_xid8_inversions", lambda d8, d16, pr, c, sm, kw: (c["dimension_b_pg16"]["event_log_xid8"].__setitem__("commit_id_inversions", 0), "PG16_XID8_WATERMARK_INTEGRITY")[1])
     expect_nogo("zero_det_xid8_inversions", lambda d8, d16, pr, c, sm, kw: (c["dimension_b_pg16"]["event_log_xid8"].__setitem__("deterministic_commit_id_inversions", 0), "PG16_XID8_WATERMARK_INTEGRITY")[1])
+    expect_nogo("zero_xmin_holdback", lambda d8, d16, pr, c, sm, kw: (c["dimension_b_pg16"]["event_log_xid8"].__setitem__("xmin_watermark_holdbacks_verified", 0), "PG16_XID8_WATERMARK_INTEGRITY")[1])
+    expect_nogo("xmin_premature_leak", lambda d8, d16, pr, c, sm, kw: (c["dimension_b_pg16"]["event_log_xid8"].__setitem__("xmin_premature_leaks", 1), "PG16_XID8_WATERMARK_INTEGRITY")[1])
     expect_nogo("attribution_gap", lambda d8, d16, pr, c, sm, kw: (c["dimension_c_attribution"].__setitem__("attribution_gaps", 1), "ATTRIBUTION_COMPLETENESS")[1])
     expect_nogo("failed_attr_neg_check", lambda d8, d16, pr, c, sm, kw: (c["dimension_c_attribution"].__setitem__("negative_falsification_passed", False), "ATTRIBUTION_COMPLETENESS")[1])
     expect_nogo("non_bridge_attr", lambda d8, d16, pr, c, sm, kw: (c["dimension_c_attribution"].__setitem__("bridge_driven", False), "ATTRIBUTION_COMPLETENESS")[1])
-    print("bench-always-on.sh self-test: 18/18 negative-falsification cases passed")
+    print("bench-always-on.sh self-test: 23/23 negative-falsification cases passed")
 
 
 def render_markdown(scorecard):
@@ -591,11 +641,11 @@ def render_markdown(scorecard):
         "## Dimension Details",
         "",
         "### Dimension A · D6 (L1 tmpfs + FastCDC + CAS Merkle)",
-        f"- **8 concurrent branches**: checkpoint={fmt_op(d6_8['operations'], 'checkpoint_changed')}; merge={fmt_op(d6_8['operations'], 'merge_base')}; land={fmt_op(d6_8['operations'], 'land_main')}; cas_retries=`{ao_8['land_cas_retries']}`; dedup=`{ao_8['dedup_ratio']:.2f}x`; mean/max land delta=`{ao_8['bytes_per_landing']:.0f}`/`{ao_8['max_bytes_per_landing']}` B; crash-restart recovery=`{ao_8['crash_restart_drill']['recovery_ms']:.2f} ms` (SIGKILL=`{ao_8['crash_restart_drill']['sigkill_executed']}`, torn_heal=`{ao_8['crash_restart_drill']['torn_journal_line_recovered']}`, 0 loss across `{ao_8['crash_restart_drill']['snapshots_verified']}` snapshots / `{ao_8['crash_restart_drill']['blobs_verified']}` blobs)",
-        f"- **16 concurrent branches**: checkpoint={fmt_op(d6_16['operations'], 'checkpoint_changed')}; merge={fmt_op(d6_16['operations'], 'merge_base')}; land={fmt_op(d6_16['operations'], 'land_main')}; cas_retries=`{ao_16['land_cas_retries']}`; dedup=`{ao_16['dedup_ratio']:.2f}x`; mean/max land delta=`{ao_16['bytes_per_landing']:.0f}`/`{ao_16['max_bytes_per_landing']}` B; crash-restart recovery=`{ao_16['crash_restart_drill']['recovery_ms']:.2f} ms` + post-PG16-restart verified=`{pr['verified']}` (`{pr['snapshots_verified']}` snapshots / `{pr['blobs_verified']}` blobs, `{pr['lost_refs']}/{pr['lost_commits']}/{pr['corrupt_objects']}` loss)",
+        f"- **8 concurrent branches**: checkpoint={fmt_op(d6_8['operations'], 'checkpoint_changed')}; merge={fmt_op(d6_8['operations'], 'merge_base')}; land={fmt_op(d6_8['operations'], 'land_main')}; cas_retries=`{ao_8['land_cas_retries']}`; shift_cdc=`{ao_8.get('cdc_dedup_ratio', 0.0):.2f}x` vs fixed=`{ao_8.get('cdc_fixed_block_dedup_ratio', 0.0):.2f}x` (`{ao_8.get('cdc_shifted_files', 0)}` shifted files); total_dedup=`{ao_8['dedup_ratio']:.2f}x`; mean/max land delta=`{ao_8['bytes_per_landing']:.0f}`/`{ao_8['max_bytes_per_landing']}` B; crash-restart recovery=`{ao_8['crash_restart_drill']['recovery_ms']:.2f} ms` (SIGKILL=`{ao_8['crash_restart_drill']['sigkill_executed']}`, torn_tail_present=`{ao_8['crash_restart_drill'].get('torn_tail_present')}`, reconcile_seq=`{ao_8['crash_restart_drill'].get('reconcile_last_journal_seq', 0)}`, 0 loss across `{ao_8['crash_restart_drill']['snapshots_verified']}` snapshots / `{ao_8['crash_restart_drill']['blobs_verified']}` blobs)",
+        f"- **16 concurrent branches**: checkpoint={fmt_op(d6_16['operations'], 'checkpoint_changed')}; merge={fmt_op(d6_16['operations'], 'merge_base')}; land={fmt_op(d6_16['operations'], 'land_main')}; cas_retries=`{ao_16['land_cas_retries']}`; shift_cdc=`{ao_16.get('cdc_dedup_ratio', 0.0):.2f}x` vs fixed=`{ao_16.get('cdc_fixed_block_dedup_ratio', 0.0):.2f}x` (`{ao_16.get('cdc_shifted_files', 0)}` shifted files); total_dedup=`{ao_16['dedup_ratio']:.2f}x`; mean/max land delta=`{ao_16['bytes_per_landing']:.0f}`/`{ao_16['max_bytes_per_landing']}` B; crash-restart recovery=`{ao_16['crash_restart_drill']['recovery_ms']:.2f} ms` + post-PG16-restart verified=`{pr['verified']}` (reconcile_seq=`{pr.get('reconcile_last_journal_seq', 0)}`, `{pr['snapshots_verified']}` snapshots / `{pr['blobs_verified']}` blobs, `{pr['lost_refs']}/{pr['lost_commits']}/{pr['corrupt_objects']}` loss)",
         "",
         "### Dimension B · Control Plane 1C/1G PG16 Concurrency & Sharding",
-        f"- **`xid8` Watermark Stress**: `{ev['events_written']}/{ev['events_target']}` events across `{ev['sessions']}` sessions / `{ev['writer_pool']}` writers at `{ev['events_per_sec']:.1f} events/s`; append={fmt_op({'a': ev['append_latency']}, 'a')}; read_global={fmt_op({'r': ev['read_global_latency']}, 'r')}; xid8_reorders=`{ev.get('commit_id_inversions', 0)}`",
+        f"- **`xid8` Watermark Stress**: `{ev['events_written']}/{ev['events_target']}` events across `{ev['sessions']}` sessions / `{ev['writer_pool']}` writers at `{ev['events_per_sec']:.1f} events/s`; append={fmt_op({'a': ev['append_latency']}, 'a')}; read_global={fmt_op({'r': ev['read_global_latency']}, 'r')}; xid8_reorders=`{ev.get('commit_id_inversions', 0)}`; xmin_holdbacks=`{ev.get('xmin_watermark_holdbacks_verified', 0)}` (leaks=`{ev.get('xmin_premature_leaks', 0)}`)",
         f"- **4-Shard Bridge Claim**: `{sh['commands_claimed_unique']}/{sh['commands_target']}` commands claimed at `{sh['claims_per_sec']:.1f} claims/s`; claim={fmt_op({'c': sh['claim_latency']}, 'c')}; finish={fmt_op({'f': sh['finish_latency']}, 'f')}; per-shard=`{json.dumps(sh['per_shard_counts'], sort_keys=True)}`",
         "",
         "### Dimension C · Context & Work-Hours Attribution Completeness",
@@ -659,7 +709,39 @@ sys.exit(0 if scorecard["verdict"] == "GO" else 1)
 PY
 }
 
+validate_docker_cgroup_limits() {
+    local nano_cpus="$1"
+    local mem_bytes="$2"
+    local mem_swap="$3"
+    if ! [[ "$nano_cpus" =~ ^[0-9]+$ ]] || [ "$nano_cpus" -le 0 ] || [ "$nano_cpus" -gt 1000000000 ]; then
+        echo "bench-always-on: docker NanoCpus limit missing/exceeded ($nano_cpus)" >&2
+        return 1
+    fi
+    if ! [[ "$mem_bytes" =~ ^[0-9]+$ ]] || [ "$mem_bytes" -le 0 ] || [ "$mem_bytes" -gt 1073741824 ]; then
+        echo "bench-always-on: docker Memory limit missing/exceeded ($mem_bytes)" >&2
+        return 1
+    fi
+    if ! [[ "$mem_swap" =~ ^-?[0-9]+$ ]] || [ "$mem_swap" -ne "$mem_bytes" ]; then
+        echo "bench-always-on: docker MemorySwap limit missing/exceeded ($mem_swap != $mem_bytes)" >&2
+        return 1
+    fi
+}
+
 if [ "$SELF_TEST" -eq 1 ]; then
+    validate_docker_cgroup_limits 1000000000 1073741824 1073741824
+    if validate_docker_cgroup_limits 1000000000 1073741824 -1 2>/dev/null; then
+        echo "bench-always-on self-test failed: accepted unlimited docker MemorySwap (-1)" >&2
+        exit 1
+    fi
+    if validate_docker_cgroup_limits 1000000000 1073741824 0 2>/dev/null; then
+        echo "bench-always-on self-test failed: accepted unset docker MemorySwap (0)" >&2
+        exit 1
+    fi
+    if validate_docker_cgroup_limits 1000000000 1073741824 2147483648 2>/dev/null; then
+        echo "bench-always-on self-test failed: accepted docker swap enabled (2G != 1G)" >&2
+        exit 1
+    fi
+    echo "bench-always-on.sh docker cgroup swap self-test: 4/4 cases passed"
     run_scorer_python --self-test
     exit 0
 fi
@@ -786,14 +868,7 @@ verify_cgroup_limits() {
             local info
             info="$(docker inspect --format '{{.HostConfig.NanoCpus}},{{.HostConfig.Memory}},{{.HostConfig.MemorySwap}}' "$PG_DOCKER_NAME")"
             IFS=',' read -r nano_cpus mem_bytes mem_swap <<<"$info"
-            if [ "${nano_cpus:-0}" -le 0 ] || [ "$nano_cpus" -gt 1000000000 ]; then
-                echo "bench-always-on: docker NanoCpus limit missing/exceeded ($nano_cpus)" >&2
-                exit 1
-            fi
-            if [ "${mem_bytes:-0}" -le 0 ] || [ "$mem_bytes" -gt 1073741824 ]; then
-                echo "bench-always-on: docker Memory limit missing/exceeded ($mem_bytes)" >&2
-                exit 1
-            fi
+            validate_docker_cgroup_limits "$nano_cpus" "$mem_bytes" "$mem_swap" || exit 1
             CGROUP_ENFORCED="true"
             CGROUP_DETAILS="docker NanoCpus=$nano_cpus Memory=$mem_bytes MemorySwap=$mem_swap"
             ;;

@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -23,11 +23,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use spawn_cas::{
-    Digest, GIT_POINTER_THRESHOLD, GitOid, RefJournal, Snapshot, git_blob_oid_of_bytes,
-    git_pointer_bytes,
+    CHUNK_AVG, CHUNK_MAX, Digest, GIT_POINTER_THRESHOLD, GitOid, Snapshot, git_blob_oid_of_bytes,
+    git_pointer_bytes, sha256_of,
 };
 use spawn_core::id::{AgentId, BranchName, WorkspaceId};
 use spawn_core::port::{BaseMerge, Commit, TranscriptArchive, WorkspaceStore};
+use spawn_host::d6_cutover::reconcile_refs_journal;
 use spawn_host::d6_workspace::L1TmpfsPolicy;
 use spawn_host::merkle_merge::merge_snapshots;
 use spawn_host::{
@@ -70,6 +71,10 @@ SPAWN_BENCH_DATABASE_URL optionally enables PostgreSQL writes (and is required f
 const LAND_DELTA_SLO_BYTES: u64 = 50 * 1024 * 1024;
 const DEFAULT_LAND_PAYLOAD_BYTES: usize = 128 * 1024;
 const BRANCH_INIT_FILES: usize = 4;
+const CDC_DEDUP_MIN_RATIO: f64 = 2.0;
+const CDC_FIXED_BLOCK_MAX_RATIO: f64 = 1.2;
+const TORN_JOURNAL_TAIL: &[u8] =
+    b"{\"seq\":99999999,\"project\":\"proj-bench\",\"name\":\"branch/torn";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -545,7 +550,25 @@ fn fill_mixed_payload(seed: u64, marker: &str, size: usize) -> Vec<u8> {
     out
 }
 
-fn seed_workspace(workspace: &Path, config: &Config) -> Result<(), String> {
+/// Inject a branch-unique variable-length front shift-edit into `base` so fixed-offset
+/// `CHUNK_AVG` blocking loses alignment across branches (`~1.00x`) while FastCDC v1
+/// resynchronizes cut points on the unchanged tail (`>= 2.00x`).
+fn build_shifted_oversized_payload(base: &[u8], branch_idx: usize) -> Vec<u8> {
+    let offset = (4096 + branch_idx * 137).min(base.len());
+    let insert_len = 383 + branch_idx * 97;
+    let seed = 0x5348_4946_u64 ^ ((branch_idx as u64).wrapping_add(1) << 24);
+    let marker = format!("// fastcdc-shift branch={branch_idx} offset={offset}\n");
+    let insertion = fill_mixed_payload(seed, &marker, insert_len);
+
+    let mut shifted = Vec::with_capacity(base.len().saturating_add(insertion.len()));
+    shifted.extend_from_slice(&base[..offset]);
+    shifted.extend_from_slice(&insertion);
+    shifted.extend_from_slice(&base[offset..]);
+    shifted
+}
+
+fn seed_workspace(workspace: &Path, config: &Config) -> Result<u64, String> {
+    let mut bytes_written = 0_u64;
     for index in 0..config.files {
         let path = workspace.join(format!("tree/{:04}/{:06}.txt", index % 32, index));
         fs::create_dir_all(path.parent().expect("a seeded file has a parent"))
@@ -553,14 +576,18 @@ fn seed_workspace(workspace: &Path, config: &Config) -> Result<(), String> {
         let seed = 0x5345_4544_u64.wrapping_mul((index as u64).wrapping_add(1));
         let marker = format!("// seed index={index}\n");
         let payload = fill_mixed_payload(seed, &marker, config.file_bytes);
+        bytes_written =
+            bytes_written.saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
         fs::write(&path, &payload).map_err(|error| format!("write {}: {error}", path.display()))?;
     }
     if let Some(bytes) = config.oversized_file_bytes {
         let payload = fill_mixed_payload(0x4F56_4552_5349_5A45, "BINv1\n", bytes);
+        bytes_written =
+            bytes_written.saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
         fs::write(workspace.join("oversized.bin"), payload)
             .map_err(|error| format!("write the oversized benchmark file: {error}"))?;
     }
-    Ok(())
+    Ok(bytes_written)
 }
 
 fn edit_workspace(
@@ -569,7 +596,8 @@ fn edit_workspace(
     worker_idx: usize,
     cycle: usize,
     d6_disjoint: bool,
-) -> Result<(), String> {
+) -> Result<u64, String> {
+    let mut bytes_written = 0_u64;
     for edit in 0..config.edits {
         let slot = (cycle * config.edits + edit) % config.files.max(1);
         let path = if d6_disjoint {
@@ -588,9 +616,11 @@ fn edit_workspace(
             ^ 0x4544_4954;
         let marker = format!("// cycle={cycle} edit={edit} worker={worker_idx}\n");
         let payload = fill_mixed_payload(seed, &marker, config.file_bytes);
+        bytes_written =
+            bytes_written.saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
         fs::write(&path, payload).map_err(|error| format!("edit {}: {error}", path.display()))?;
     }
-    Ok(())
+    Ok(bytes_written)
 }
 
 fn git_version() -> String {
@@ -1023,7 +1053,7 @@ fn d6_seed_initial_main(
     cas: &CasMerkleStore,
     project: &str,
     config: &Config,
-) -> Result<LedgerSnapshot, String> {
+) -> Result<(LedgerSnapshot, u64), String> {
     let dummy = BranchName::new("agent_bench_bootstrap").map_err(|e| e.to_string())?;
     let _ = store
         .ensure_branch(&dummy, None)
@@ -1064,6 +1094,10 @@ fn d6_seed_initial_main(
         let (digest, len) = cas.put_bytes_blob(&payload).map_err(|e| e.to_string())?;
         owned_blobs.push((vec![b"oversized.bin".to_vec()], digest, len));
     }
+
+    let seeded_logical_bytes = owned_blobs
+        .iter()
+        .fold(0_u64, |acc, (_, _, size)| acc.saturating_add(*size));
 
     let mutations: Vec<spawn_cas::TreeMutation> = owned_blobs
         .iter()
@@ -1109,10 +1143,11 @@ fn d6_seed_initial_main(
     let _ = store
         .land_main_snapshot(Some(&main0.id), &snap_id, Some(task_id), "seed main")
         .map_err(|e| e.to_string())?;
-    store
+    let head = store
         .main_snapshot()
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "seeded main vanished".to_string())
+        .ok_or_else(|| "seeded main vanished".to_string())?;
+    Ok((head, seeded_logical_bytes))
 }
 
 fn d6_advance_main_step(
@@ -1357,6 +1392,8 @@ trait BenchDriver: Send + Sync {
     fn shadow_metrics_json(&self) -> Option<Value> {
         None
     }
+    fn record_edit_bytes(&self, bytes: u64);
+    fn logical_byte_totals(&self) -> (u64, u64);
     fn always_on_d6_json(
         &self,
         _config: &Config,
@@ -1371,6 +1408,8 @@ struct GitDriver {
     stage_seed: PathBuf,
     workspaces_root: PathBuf,
     store: GitWorkspace,
+    logical_workspace_bytes: AtomicU64,
+    logical_written_bytes: AtomicU64,
 }
 
 impl BenchDriver for GitDriver {
@@ -1385,7 +1424,11 @@ impl BenchDriver for GitDriver {
             .ensure_branch(branch, None)
             .map_err(|e| e.to_string())?;
         let ws = self.store.mount(branch).map_err(|e| e.to_string())?;
-        seed_workspace(Path::new(ws.path()), config)?;
+        let written = seed_workspace(Path::new(ws.path()), config)?;
+        self.logical_workspace_bytes
+            .fetch_add(written, Ordering::Relaxed);
+        self.logical_written_bytes
+            .fetch_add(written, Ordering::Relaxed);
         if !matches!(
             self.store
                 .commit(&ws, "benchmark: seed")
@@ -1471,6 +1514,18 @@ impl BenchDriver for GitDriver {
             "oversized_present_requested": config.oversized_file_bytes.is_some(),
         })
     }
+
+    fn record_edit_bytes(&self, bytes: u64) {
+        self.logical_written_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn logical_byte_totals(&self) -> (u64, u64) {
+        (
+            self.logical_workspace_bytes.load(Ordering::Relaxed),
+            self.logical_written_bytes.load(Ordering::Relaxed),
+        )
+    }
 }
 
 #[derive(Default)]
@@ -1480,6 +1535,12 @@ struct AlwaysOnD6State {
     merged_files_verified: usize,
     fastcdc_chunked_files: usize,
     fastcdc_chunks_count: usize,
+    cdc_shifted_files: usize,
+    cdc_shifted_logical_bytes: u64,
+    cdc_unique_stored_bytes: u64,
+    cdc_fixed_block_unique_bytes: u64,
+    cdc_dedup_ratio: f64,
+    cdc_fixed_block_dedup_ratio: f64,
     crash_drill: Option<Value>,
 }
 
@@ -1543,6 +1604,127 @@ fn cas_blob_disk_bytes(
     } else {
         file_byte_len(&cas.object_path(digest))
     }
+}
+
+#[derive(Default, Clone, Copy)]
+struct ShiftedCdcMetrics {
+    shifted_files: usize,
+    shifted_logical_bytes: u64,
+    cdc_unique_stored_bytes: u64,
+    fixed_block_unique_bytes: u64,
+    cdc_dedup_ratio: f64,
+    fixed_block_dedup_ratio: f64,
+}
+
+fn evaluate_cdc_dedup_slo(metrics: ShiftedCdcMetrics, expected_files: usize) -> bool {
+    expected_files > 0
+        && metrics.shifted_files == expected_files
+        && metrics.shifted_logical_bytes > 0
+        && metrics.cdc_unique_stored_bytes > 0
+        && metrics.fixed_block_unique_bytes > 0
+        && metrics.cdc_dedup_ratio >= CDC_DEDUP_MIN_RATIO
+        && metrics.fixed_block_dedup_ratio > 0.0
+        && metrics.fixed_block_dedup_ratio < CDC_FIXED_BLOCK_MAX_RATIO
+}
+
+struct FixedBlockHasher {
+    block_size: usize,
+    buf: Vec<u8>,
+    unique_blocks: BTreeMap<Digest, u64>,
+}
+
+impl FixedBlockHasher {
+    fn new(block_size: usize) -> Self {
+        Self {
+            block_size: block_size.max(1),
+            buf: Vec::with_capacity(block_size.min(CHUNK_AVG)),
+            unique_blocks: BTreeMap::new(),
+        }
+    }
+
+    fn flush_block(&mut self) {
+        if !self.buf.is_empty() {
+            let digest = sha256_of(&self.buf);
+            let len = u64::try_from(self.buf.len()).unwrap_or(u64::MAX);
+            self.unique_blocks.entry(digest).or_insert(len);
+            self.buf.clear();
+        }
+    }
+
+    fn unique_stored_bytes(&self) -> u64 {
+        self.unique_blocks.values().copied().sum()
+    }
+}
+
+impl Write for FixedBlockHasher {
+    fn write(&mut self, mut src: &[u8]) -> std::io::Result<usize> {
+        let total = src.len();
+        while !src.is_empty() {
+            let need = self.block_size.saturating_sub(self.buf.len());
+            let take = src.len().min(need);
+            self.buf.extend_from_slice(&src[..take]);
+            src = &src[take..];
+            if self.buf.len() == self.block_size {
+                self.flush_block();
+            }
+        }
+        Ok(total)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn measure_shifted_cdc_dedup(
+    cas: &spawn_cas::Store,
+    shifted_files: &[(Digest, u64)],
+) -> Result<ShiftedCdcMetrics, String> {
+    if shifted_files.is_empty() {
+        return Ok(ShiftedCdcMetrics::default());
+    }
+    let mut cdc_seen = BTreeSet::new();
+    let mut fixed_hasher = FixedBlockHasher::new(CHUNK_AVG);
+    let mut shifted_logical_bytes = 0_u64;
+    let mut cdc_unique_stored_bytes = 0_u64;
+
+    for (digest, logical_len) in shifted_files {
+        if !cas.chunk_index_path(digest).is_file() {
+            return Err(format!(
+                "shifted file {digest} missing FastCDC chunk-index for dedup measurement"
+            ));
+        }
+        shifted_logical_bytes = shifted_logical_bytes.saturating_add(*logical_len);
+        cdc_unique_stored_bytes = cdc_unique_stored_bytes.saturating_add(cas_blob_disk_bytes(
+            cas,
+            digest,
+            &mut cdc_seen,
+        )?);
+        let streamed = cas
+            .stream_blob(digest, &mut fixed_hasher)
+            .map_err(|e| format!("stream shifted blob {digest} for fixed-block comparison: {e}"))?;
+        if streamed != *logical_len {
+            return Err(format!(
+                "shifted blob {digest} streamed {streamed} bytes != expected {logical_len}"
+            ));
+        }
+        fixed_hasher.flush_block();
+    }
+
+    let fixed_block_unique_bytes = fixed_hasher.unique_stored_bytes();
+    let cdc_dedup_ratio =
+        u64_to_f64(shifted_logical_bytes) / u64_to_f64(cdc_unique_stored_bytes.max(1));
+    let fixed_block_dedup_ratio =
+        u64_to_f64(shifted_logical_bytes) / u64_to_f64(fixed_block_unique_bytes.max(1));
+
+    Ok(ShiftedCdcMetrics {
+        shifted_files: shifted_files.len(),
+        shifted_logical_bytes,
+        cdc_unique_stored_bytes,
+        fixed_block_unique_bytes,
+        cdc_dedup_ratio,
+        fixed_block_dedup_ratio,
+    })
 }
 
 fn collect_tree_digests(
@@ -1654,6 +1836,8 @@ struct CrashManifest {
     expected_branches: Vec<(String, String)>,
     expected_crash_branches: Vec<(String, String)>,
     acked_snapshots: Vec<String>,
+    min_journal_entries: usize,
+    torn_tail_bytes: u64,
 }
 
 fn is_snapshot_ancestor(
@@ -1684,56 +1868,17 @@ fn is_snapshot_ancestor(
     Ok(false)
 }
 
-fn append_torn_journal_and_recover(
-    journal_path: &Path,
-    min_committed_entries: usize,
-) -> Result<usize, String> {
-    let torn_tail = b"{\"seq\":99999999,\"project\":\"proj-bench\",\"name\":\"branch/torn";
-    {
-        let mut f = fs::OpenOptions::new()
-            .append(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(journal_path)
-            .map_err(|e| format!("open refs.journal for torn injection: {e}"))?;
-        f.write_all(torn_tail)
-            .map_err(|e| format!("write torn journal tail: {e}"))?;
-        f.sync_all()
-            .map_err(|e| format!("sync torn journal: {e}"))?;
-    }
-
-    let entries = RefJournal::new(journal_path)
-        .read_all()
-        .map_err(|e| format!("RefJournal::read_all failed on torn tail: {e}"))?;
-    if entries.len() < min_committed_entries {
-        return Err(format!(
-            "RefJournal recovered {} entries, expected >= {min_committed_entries}",
-            entries.len()
-        ));
-    }
-
-    // Heal the incomplete trailing fragment cleanly at the last committed newline boundary.
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
+fn inject_torn_journal_tail(journal_path: &Path) -> Result<u64, String> {
+    let mut f = fs::OpenOptions::new()
+        .append(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(journal_path)
-        .map_err(|e| format!("open refs.journal for truncation heal: {e}"))?;
-    let mut raw = Vec::new();
-    file.read_to_end(&mut raw)
-        .map_err(|e| format!("read refs.journal for heal: {e}"))?;
-    let last_nl = raw
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .ok_or_else(|| "refs.journal contains no committed newline".to_string())?;
-    let clean_len =
-        u64::try_from(last_nl + 1).map_err(|_| "journal length overflows u64".to_string())?;
-    file.set_len(clean_len)
-        .map_err(|e| format!("truncate torn refs.journal tail: {e}"))?;
-    file.seek(SeekFrom::End(0))
-        .map_err(|e| format!("seek refs.journal end: {e}"))?;
-    file.sync_all()
-        .map_err(|e| format!("sync healed refs.journal: {e}"))?;
-    Ok(entries.len())
+        .map_err(|e| format!("open refs.journal for torn injection: {e}"))?;
+    f.write_all(TORN_JOURNAL_TAIL)
+        .map_err(|e| format!("write torn journal tail: {e}"))?;
+    f.sync_all()
+        .map_err(|e| format!("sync torn journal: {e}"))?;
+    u64::try_from(TORN_JOURNAL_TAIL.len()).map_err(|_| "torn tail length overflows u64".to_string())
 }
 
 fn read_complete_crash_acks(ack_path: &Path) -> Result<Vec<CrashAck>, String> {
@@ -1837,6 +1982,72 @@ fn internal_crash_writer_main(manifest_path: &Path) -> Result<(), String> {
     }
 }
 
+struct ManifestRefsCheck {
+    lost_refs: usize,
+    acknowledged_recovered: usize,
+    missing_pg_ack: usize,
+    snapshots: BTreeSet<Digest>,
+}
+
+fn verify_manifest_refs_and_acks(
+    fresh_cas: &CasMerkleStore,
+    fresh_ledger: &PgRefLedger,
+    fresh_ws: &D6Workspace<PgRefLedger>,
+    manifest: &CrashManifest,
+    initial_lost_refs: usize,
+) -> Result<ManifestRefsCheck, String> {
+    let mut lost_refs = initial_lost_refs;
+    let mut snapshots = BTreeSet::new();
+
+    let expected_main = Digest::parse(&manifest.expected_main).map_err(|e| e.to_string())?;
+    snapshots.insert(expected_main.clone());
+    match fresh_ws.main_snapshot() {
+        Ok(Some(live)) if live.id == expected_main => {}
+        _ => lost_refs += 1,
+    }
+
+    for (branch, expected_hex) in &manifest.expected_branches {
+        let expected_id = Digest::parse(expected_hex).map_err(|e| e.to_string())?;
+        snapshots.insert(expected_id.clone());
+        match fresh_ws.branch_snapshot(branch) {
+            Ok(Some(live)) if live.id == expected_id => {}
+            _ => lost_refs += 1,
+        }
+    }
+
+    for (branch, expected_acked_hex) in &manifest.expected_crash_branches {
+        let acked_id = Digest::parse(expected_acked_hex).map_err(|e| e.to_string())?;
+        snapshots.insert(acked_id.clone());
+        match fresh_ws.branch_snapshot(branch) {
+            Ok(Some(live)) => {
+                snapshots.insert(live.id.clone());
+                if !is_snapshot_ancestor(fresh_cas, &live.id, &acked_id).unwrap_or(false) {
+                    lost_refs += 1;
+                }
+            }
+            _ => lost_refs += 1,
+        }
+    }
+
+    let mut acknowledged_recovered = 0_usize;
+    let mut missing_pg_ack = 0_usize;
+    for snap_hex in &manifest.acked_snapshots {
+        let d = Digest::parse(snap_hex).map_err(|e| e.to_string())?;
+        snapshots.insert(d.clone());
+        match fresh_ledger.get_snapshot(&d) {
+            Ok(Some(_)) => acknowledged_recovered += 1,
+            _ => missing_pg_ack += 1,
+        }
+    }
+
+    Ok(ManifestRefsCheck {
+        lost_refs,
+        acknowledged_recovered,
+        missing_pg_ack,
+        snapshots,
+    })
+}
+
 fn internal_crash_verify_main(manifest_path: &Path) -> Result<Value, String> {
     let url = env::var("SPAWN_BENCH_DATABASE_URL")
         .map_err(|_| "SPAWN_BENCH_DATABASE_URL required for internal crash verify".to_string())?;
@@ -1857,78 +2068,86 @@ fn internal_crash_verify_main(manifest_path: &Path) -> Result<Value, String> {
         fresh_ledger.clone(),
     );
 
+    let raw_journal = fs::read(fresh_cas.cas().refs_journal_path())
+        .map_err(|e| format!("verifier read raw refs.journal: {e}"))?;
+    let torn_tail_present =
+        manifest.torn_tail_bytes > 0 && raw_journal.ends_with(TORN_JOURNAL_TAIL);
+
     let journal = fresh_cas
         .cas()
         .read_ref_journal()
         .map_err(|e| format!("verifier read_ref_journal: {e}"))?;
-    let min_expected_journal = manifest.acked_snapshots.len();
-    let mut lost_refs = usize::from(journal.len() < min_expected_journal);
-    let mut snapshots_to_verify = BTreeSet::new();
+    let pg_latest_ref_seq = fresh_ledger
+        .pg
+        .latest_ref_log_seq()
+        .map_err(|e| format!("verifier latest_ref_log_seq: {e}"))?;
+    let reconcile = reconcile_refs_journal(
+        &fresh_cas,
+        fresh_ledger.as_ref(),
+        pg_latest_ref_seq,
+        "bench:crash-verify",
+    )
+    .map_err(|e| format!("verifier reconcile_refs_journal: {e}"))?;
 
-    let expected_main = Digest::parse(&manifest.expected_main).map_err(|e| e.to_string())?;
-    snapshots_to_verify.insert(expected_main.clone());
-    match fresh_ws.main_snapshot() {
-        Ok(Some(live)) if live.id == expected_main => {}
-        _ => lost_refs += 1,
-    }
+    let min_expected_journal = manifest
+        .min_journal_entries
+        .max(manifest.acked_snapshots.len());
+    let torn_journal_line_recovered = torn_tail_present
+        && journal.len() >= min_expected_journal
+        && reconcile.last_journal_seq > 0
+        && reconcile.last_ledger_seq >= pg_latest_ref_seq;
 
-    for (branch, expected_hex) in &manifest.expected_branches {
-        let expected_id = Digest::parse(expected_hex).map_err(|e| e.to_string())?;
-        snapshots_to_verify.insert(expected_id.clone());
-        match fresh_ws.branch_snapshot(branch) {
-            Ok(Some(live)) if live.id == expected_id => {}
-            _ => lost_refs += 1,
-        }
-    }
-
-    for (branch, expected_acked_hex) in &manifest.expected_crash_branches {
-        let acked_id = Digest::parse(expected_acked_hex).map_err(|e| e.to_string())?;
-        snapshots_to_verify.insert(acked_id.clone());
-        match fresh_ws.branch_snapshot(branch) {
-            Ok(Some(live)) => {
-                snapshots_to_verify.insert(live.id.clone());
-                if !is_snapshot_ancestor(&fresh_cas, &live.id, &acked_id).unwrap_or(false) {
-                    lost_refs += 1;
-                }
-            }
-            _ => lost_refs += 1,
-        }
-    }
-
-    let mut acknowledged_recovered = 0_usize;
-    let mut missing_pg_ack = 0_usize;
-    for snap_hex in &manifest.acked_snapshots {
-        let d = Digest::parse(snap_hex).map_err(|e| e.to_string())?;
-        snapshots_to_verify.insert(d.clone());
-        match fresh_ledger.get_snapshot(&d) {
-            Ok(Some(_)) => acknowledged_recovered += 1,
-            _ => missing_pg_ack += 1,
-        }
-    }
-
+    let refs_check = verify_manifest_refs_and_acks(
+        &fresh_cas,
+        &fresh_ledger,
+        &fresh_ws,
+        &manifest,
+        usize::from(!torn_journal_line_recovered),
+    )?;
     let (lost_commits, corrupt_objects, blobs_verified) =
-        verify_reopened_objects(&fresh_cas, &snapshots_to_verify);
-    let lost_commits = lost_commits.saturating_add(missing_pg_ack);
+        verify_reopened_objects(&fresh_cas, &refs_check.snapshots);
+    let lost_commits = lost_commits.saturating_add(refs_check.missing_pg_ack);
     let recovery_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let verified = lost_refs == 0
+    let verified = refs_check.lost_refs == 0
         && lost_commits == 0
         && corrupt_objects == 0
-        && acknowledged_recovered == manifest.acked_snapshots.len();
+        && refs_check.acknowledged_recovered == manifest.acked_snapshots.len()
+        && torn_journal_line_recovered;
 
     Ok(json!({
         "verified": verified,
         "verifier_pid": std::process::id(),
         "branches_verified": manifest.expected_branches.len() + manifest.expected_crash_branches.len(),
         "refs_verified": manifest.expected_branches.len() + manifest.expected_crash_branches.len() + 1,
-        "snapshots_verified": snapshots_to_verify.len(),
+        "snapshots_verified": refs_check.snapshots.len(),
         "blobs_verified": blobs_verified,
-        "acknowledged_recovered": acknowledged_recovered,
+        "acknowledged_recovered": refs_check.acknowledged_recovered,
         "journal_entries": journal.len(),
+        "journal_entries_after_torn_heal": journal.len(),
+        "torn_tail_present": torn_tail_present,
+        "torn_journal_line_recovered": torn_journal_line_recovered,
+        "pg_latest_ref_seq": pg_latest_ref_seq,
+        "reconcile_entries_considered": reconcile.entries_considered,
+        "reconcile_entries_replayed": reconcile.entries_replayed,
+        "reconcile_already_applied": reconcile.already_applied,
+        "reconcile_last_journal_seq": reconcile.last_journal_seq,
+        "reconcile_last_ledger_seq": reconcile.last_ledger_seq,
         "lost_commits": lost_commits,
-        "lost_refs": lost_refs,
+        "lost_refs": refs_check.lost_refs,
         "corrupt_objects": corrupt_objects,
         "recovery_ms": recovery_ms,
     }))
+}
+
+struct ChunkedBlobInfo {
+    digest: Digest,
+    size: u64,
+    chunks: usize,
+}
+
+struct VerifiedBranchChunked {
+    base: ChunkedBlobInfo,
+    shifted: ChunkedBlobInfo,
 }
 
 struct D6Driver {
@@ -1945,6 +2164,9 @@ struct D6Driver {
     schema: String,
     oversized_ingested: bool,
     save_crash_manifest: Option<PathBuf>,
+    base_main_bytes: u64,
+    logical_workspace_bytes: AtomicU64,
+    logical_written_bytes: AtomicU64,
     always_on: Mutex<AlwaysOnD6State>,
 }
 
@@ -2014,7 +2236,8 @@ impl D6Driver {
         };
         let coord_ledger = Arc::new(PgRefLedger::from_store(init.pg_pool[0].clone()));
         let coord_store = make_ws(coord_ledger.clone());
-        let _ = d6_seed_initial_main(&coord_store, &coord_ledger, &cas, &project, config)?;
+        let (_, base_main_bytes) =
+            d6_seed_initial_main(&coord_store, &coord_ledger, &cas, &project, config)?;
 
         let mut worker_ledgers = Vec::with_capacity(config.concurrency);
         let mut worker_stores = Vec::with_capacity(config.concurrency);
@@ -2040,48 +2263,44 @@ impl D6Driver {
             schema: init.schema,
             oversized_ingested: config.oversized_file_bytes.is_some(),
             save_crash_manifest: config.save_crash_manifest.clone(),
+            base_main_bytes,
+            logical_workspace_bytes: AtomicU64::new(0),
+            logical_written_bytes: AtomicU64::new(base_main_bytes),
             always_on: Mutex::new(AlwaysOnD6State::default()),
         })
     }
 
-    fn verify_oversized_chunked_in_cas(
+    fn verify_chunked_blob_entry(
         &self,
-        branch: &BranchName,
+        flat: &BTreeMap<Vec<u8>, spawn_cas::TreeEntry>,
+        rel_path: &[u8],
+        label: &str,
         expected_size: usize,
-    ) -> Result<(Option<Digest>, usize), String> {
-        let head = self
-            .coord_store
-            .branch_snapshot(branch.as_str())
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("branch {branch} missing snapshot"))?;
-        let flat = self
-            .cas
-            .flatten_tree(&head.tree)
-            .map_err(|e| e.to_string())?;
+    ) -> Result<ChunkedBlobInfo, String> {
         let ent = flat
-            .get(b"oversized.bin".as_slice())
-            .ok_or_else(|| "D6 checkpoint omitted oversized.bin".to_string())?;
+            .get(rel_path)
+            .ok_or_else(|| format!("D6 checkpoint omitted {label}"))?;
         let want_size = u64::try_from(expected_size).map_err(|_| "size overflow".to_string())?;
         if ent.size != want_size {
-            return Err(format!("oversized.bin size {} != {want_size}", ent.size));
+            return Err(format!("{label} size {} != {want_size}", ent.size));
         }
         let digest = ent
             .digest()
-            .ok_or_else(|| "oversized.bin missing digest".to_string())?;
+            .ok_or_else(|| format!("{label} missing digest"))?;
         let mut chunks_count = 0_usize;
-        if expected_size > 4 * 1024 * 1024 {
+        if expected_size > CHUNK_MAX {
             if !self.cas.cas().chunk_index_path(&digest).is_file() {
-                return Err("oversized.bin was not FastCDC chunked into chunk-index".to_string());
+                return Err(format!("{label} was not FastCDC chunked into chunk-index"));
             }
             let idx = self
                 .cas
                 .cas()
                 .read_chunk_index(&digest)
-                .map_err(|e| format!("read oversized chunk index: {e}"))?;
+                .map_err(|e| format!("read {label} chunk index: {e}"))?;
             chunks_count = idx.chunks.len();
             if chunks_count < 2 {
                 return Err(format!(
-                    "heterogeneous oversized.bin expected >= 2 FastCDC chunks, got {chunks_count}"
+                    "heterogeneous {label} expected >= 2 FastCDC chunks, got {chunks_count}"
                 ));
             }
         }
@@ -2091,7 +2310,7 @@ impl D6Driver {
             let expected_pointer = git_blob_oid_of_bytes(&git_pointer_bytes(&digest, want_size));
             if projected_blob != expected_pointer {
                 return Err(format!(
-                    "oversized.bin OID {projected_blob} != pointer OID {expected_pointer}"
+                    "{label} OID {projected_blob} != pointer OID {expected_pointer}"
                 ));
             }
         } else {
@@ -2099,15 +2318,51 @@ impl D6Driver {
             self.cas
                 .cas()
                 .stream_blob(&digest, &mut blob_bytes)
-                .map_err(|e| format!("stream oversized.bin <= threshold: {e}"))?;
+                .map_err(|e| format!("stream {label} <= threshold: {e}"))?;
             let expected_blob_oid = git_blob_oid_of_bytes(&blob_bytes);
             if projected_blob != expected_blob_oid {
                 return Err(format!(
-                    "oversized.bin OID {projected_blob} != blob OID {expected_blob_oid}"
+                    "{label} OID {projected_blob} != blob OID {expected_blob_oid}"
                 ));
             }
         }
-        Ok(((chunks_count > 0).then_some(digest), chunks_count))
+        Ok(ChunkedBlobInfo {
+            digest,
+            size: want_size,
+            chunks: chunks_count,
+        })
+    }
+
+    fn verify_oversized_chunked_in_cas(
+        &self,
+        branch: &BranchName,
+        expected_size: usize,
+    ) -> Result<VerifiedBranchChunked, String> {
+        let idx = worker_index_from_branch(branch.as_str());
+        let head = self
+            .coord_store
+            .branch_snapshot(branch.as_str())
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("branch {branch} missing snapshot"))?;
+        let flat = self
+            .cas
+            .flatten_tree(&head.tree)
+            .map_err(|e| e.to_string())?;
+        let base = self.verify_chunked_blob_entry(
+            &flat,
+            b"oversized.bin",
+            "oversized.bin",
+            expected_size,
+        )?;
+        let shift_rel = format!("branches/w{idx:03}/oversized_shift.bin");
+        let shift_expected_size = expected_size.saturating_add(383 + idx * 97);
+        let shifted = self.verify_chunked_blob_entry(
+            &flat,
+            shift_rel.as_bytes(),
+            &shift_rel,
+            shift_expected_size,
+        )?;
+        Ok(VerifiedBranchChunked { base, shifted })
     }
 
     fn prepare_land_deliverables(
@@ -2142,6 +2397,10 @@ impl D6Driver {
                 0x4445_4C49_u64 ^ ((w.idx as u64).wrapping_add(1)),
                 &format!("// deliverable branch={} worker={}\n", w.branch, w.idx),
                 config.land_payload_bytes,
+            );
+            self.logical_written_bytes.fetch_add(
+                u64::try_from(deliv_payload.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
             );
             fs::write(&full_path, &deliv_payload).map_err(|e| e.to_string())?;
             match store
@@ -2431,6 +2690,8 @@ impl D6Driver {
             expected_branches,
             expected_crash_branches: Vec::new(),
             acked_snapshots: Vec::new(),
+            min_journal_entries: pre_journal_len,
+            torn_tail_bytes: 0,
         };
         Ok((manifest, pre_journal_len))
     }
@@ -2511,7 +2772,6 @@ impl D6Driver {
         manifest_path: &Path,
         killed_child_pid: u32,
         manifest: &CrashManifest,
-        recovered_entries: usize,
     ) -> Result<Value, String> {
         let ver_out = Command::new(exe)
             .arg("--internal-crash-verify")
@@ -2550,11 +2810,6 @@ impl D6Driver {
                 "committed_before_kill".to_string(),
                 json!(manifest.acked_snapshots.len()),
             );
-            map.insert("torn_journal_line_recovered".to_string(), json!(true));
-            map.insert(
-                "journal_entries_after_torn_heal".to_string(),
-                json!(recovered_entries),
-            );
         }
         Ok(report)
     }
@@ -2580,13 +2835,12 @@ impl D6Driver {
             latest_by_branch.insert(ack.branch.clone(), ack.snapshot.clone());
             acked_snapshots_set.insert(ack.snapshot.clone());
         }
-        let recovered_entries = append_torn_journal_and_recover(
-            &self.cas.cas().refs_journal_path(),
-            pre_journal_len.saturating_add(acks.len()),
-        )?;
+        let torn_tail_bytes = inject_torn_journal_tail(&self.cas.cas().refs_journal_path())?;
 
         manifest.expected_crash_branches = latest_by_branch.into_iter().collect();
         manifest.acked_snapshots = acked_snapshots_set.into_iter().collect();
+        manifest.min_journal_entries = pre_journal_len.saturating_add(acks.len());
+        manifest.torn_tail_bytes = torn_tail_bytes;
         let manifest_json = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
         fs::write(&manifest_path, &manifest_json)
             .map_err(|e| format!("update crash manifest: {e}"))?;
@@ -2598,13 +2852,8 @@ impl D6Driver {
                 .map_err(|e| format!("write saved crash manifest {}: {e}", save_path.display()))?;
         }
 
-        let report = self.run_crash_verifier_child(
-            &exe,
-            &manifest_path,
-            killed_child_pid,
-            &manifest,
-            recovered_entries,
-        )?;
+        let report =
+            self.run_crash_verifier_child(&exe, &manifest_path, killed_child_pid, &manifest)?;
         let verified = report["verified"].as_bool() == Some(true);
         {
             let mut guard = self
@@ -2632,6 +2881,7 @@ impl BenchDriver for D6Driver {
             .ensure_branch(branch, None)
             .map_err(|e| e.to_string())?;
         let ws = store.mount(branch).map_err(|e| e.to_string())?;
+        let mut branch_written = 0_u64;
         for file_idx in 0..BRANCH_INIT_FILES {
             let path = Path::new(ws.path()).join(format!("branches/w{idx:03}/init_{file_idx}.dat"));
             if let Some(parent) = path.parent() {
@@ -2642,8 +2892,30 @@ impl BenchDriver for D6Driver {
                 ^ 0x494E_4954;
             let marker = format!("// branch-init worker={idx} slot={file_idx}\n");
             let payload = fill_mixed_payload(seed, &marker, config.file_bytes);
+            branch_written =
+                branch_written.saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
             fs::write(&path, payload).map_err(|e| e.to_string())?;
         }
+        if config.oversized_file_bytes.is_some() {
+            let base_path = Path::new(ws.path()).join("oversized.bin");
+            let base = fs::read(&base_path)
+                .map_err(|e| format!("read mounted oversized.bin {}: {e}", base_path.display()))?;
+            let shifted = build_shifted_oversized_payload(&base, idx);
+            let shift_path =
+                Path::new(ws.path()).join(format!("branches/w{idx:03}/oversized_shift.bin"));
+            if let Some(parent) = shift_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            branch_written =
+                branch_written.saturating_add(u64::try_from(shifted.len()).unwrap_or(u64::MAX));
+            fs::write(&shift_path, shifted).map_err(|e| format!("write shifted file: {e}"))?;
+        }
+        self.logical_written_bytes
+            .fetch_add(branch_written, Ordering::Relaxed);
+        self.logical_workspace_bytes.fetch_add(
+            self.base_main_bytes.saturating_add(branch_written),
+            Ordering::Relaxed,
+        );
         if !matches!(
             store
                 .commit(&ws, "benchmark: seed unique branch files")
@@ -2724,13 +2996,18 @@ impl BenchDriver for D6Driver {
     fn verify_final(&self, branches: &[BranchName], config: &Config) -> Result<(), String> {
         let mut unique_chunked = BTreeSet::new();
         let mut total_chunks = 0_usize;
+        let mut shifted_entries = Vec::with_capacity(branches.len());
         for b in branches {
             if let Some(sz) = config.oversized_file_bytes {
-                let (digest_opt, chunks) = self.verify_oversized_chunked_in_cas(b, sz)?;
-                if let Some(d) = digest_opt
-                    && unique_chunked.insert(d)
-                {
-                    total_chunks = total_chunks.saturating_add(chunks);
+                let verified = self.verify_oversized_chunked_in_cas(b, sz)?;
+                if verified.base.chunks > 0 && unique_chunked.insert(verified.base.digest) {
+                    total_chunks = total_chunks.saturating_add(verified.base.chunks);
+                }
+                if verified.shifted.chunks > 0 {
+                    if unique_chunked.insert(verified.shifted.digest.clone()) {
+                        total_chunks = total_chunks.saturating_add(verified.shifted.chunks);
+                    }
+                    shifted_entries.push((verified.shifted.digest, verified.shifted.size));
                 }
             }
             let head = self
@@ -2742,6 +3019,7 @@ impl BenchDriver for D6Driver {
                 return Err(format!("snapshot {} missing in CAS", head.id));
             }
         }
+        let cdc_metrics = measure_shifted_cdc_dedup(self.cas.cas(), &shifted_entries)?;
         let journal = self
             .cas
             .cas()
@@ -2756,6 +3034,12 @@ impl BenchDriver for D6Driver {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.fastcdc_chunked_files = unique_chunked.len();
         guard.fastcdc_chunks_count = total_chunks;
+        guard.cdc_shifted_files = cdc_metrics.shifted_files;
+        guard.cdc_shifted_logical_bytes = cdc_metrics.shifted_logical_bytes;
+        guard.cdc_unique_stored_bytes = cdc_metrics.cdc_unique_stored_bytes;
+        guard.cdc_fixed_block_unique_bytes = cdc_metrics.fixed_block_unique_bytes;
+        guard.cdc_dedup_ratio = cdc_metrics.cdc_dedup_ratio;
+        guard.cdc_fixed_block_dedup_ratio = cdc_metrics.fixed_block_dedup_ratio;
         Ok(())
     }
 
@@ -2803,6 +3087,18 @@ impl BenchDriver for D6Driver {
         })
     }
 
+    fn record_edit_bytes(&self, bytes: u64) {
+        self.logical_written_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn logical_byte_totals(&self) -> (u64, u64) {
+        (
+            self.logical_workspace_bytes.load(Ordering::Relaxed),
+            self.logical_written_bytes.load(Ordering::Relaxed),
+        )
+    }
+
     fn always_on_d6_json(
         &self,
         config: &Config,
@@ -2820,6 +3116,15 @@ impl BenchDriver for D6Driver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dedup_ratio = u64_to_f64(logical_written_bytes) / u64_to_f64(cas_bytes.max(1));
+        let cdc_metrics = ShiftedCdcMetrics {
+            shifted_files: guard.cdc_shifted_files,
+            shifted_logical_bytes: guard.cdc_shifted_logical_bytes,
+            cdc_unique_stored_bytes: guard.cdc_unique_stored_bytes,
+            fixed_block_unique_bytes: guard.cdc_fixed_block_unique_bytes,
+            cdc_dedup_ratio: guard.cdc_dedup_ratio,
+            fixed_block_dedup_ratio: guard.cdc_fixed_block_dedup_ratio,
+        };
+        let cdc_slo_passed = evaluate_cdc_dedup_slo(cdc_metrics, config.concurrency);
         let landings = guard.land_deltas.len();
         let total_delta: u64 = guard.land_deltas.iter().copied().sum();
         let max_delta = guard.land_deltas.iter().copied().max().unwrap_or(0);
@@ -2851,6 +3156,13 @@ impl BenchDriver for D6Driver {
             "logical_written_bytes": logical_written_bytes,
             "cas_stored_bytes": cas_bytes,
             "dedup_ratio": dedup_ratio,
+            "cdc_shifted_files": guard.cdc_shifted_files,
+            "cdc_shifted_logical_bytes": guard.cdc_shifted_logical_bytes,
+            "cdc_unique_stored_bytes": guard.cdc_unique_stored_bytes,
+            "cdc_fixed_block_unique_bytes": guard.cdc_fixed_block_unique_bytes,
+            "cdc_dedup_ratio": guard.cdc_dedup_ratio,
+            "cdc_fixed_block_dedup_ratio": guard.cdc_fixed_block_dedup_ratio,
+            "slo_cdc_dedup_passed": cdc_slo_passed,
             "fastcdc_chunked_files": guard.fastcdc_chunked_files,
             "fastcdc_chunks_count": guard.fastcdc_chunks_count,
             "crash_restart_drill": guard.crash_drill,
@@ -2867,6 +3179,8 @@ struct ShadowDriver {
     cas: Arc<CasMerkleStore>,
     coord_ledger: Arc<PgRefLedger>,
     oracles: Vec<ShadowD6Workspace<GitWorkspace, PgRefLedger>>,
+    logical_workspace_bytes: AtomicU64,
+    logical_written_bytes: AtomicU64,
 }
 
 impl ShadowDriver {
@@ -2919,6 +3233,8 @@ impl ShadowDriver {
             cas,
             coord_ledger,
             oracles,
+            logical_workspace_bytes: AtomicU64::new(0),
+            logical_written_bytes: AtomicU64::new(0),
         })
     }
 
@@ -2955,7 +3271,11 @@ impl BenchDriver for ShadowDriver {
             .ensure_branch(branch, None)
             .map_err(|e| e.to_string())?;
         let ws = oracle.mount(branch).map_err(|e| e.to_string())?;
-        seed_workspace(Path::new(ws.path()), config)?;
+        let written = seed_workspace(Path::new(ws.path()), config)?;
+        self.logical_workspace_bytes
+            .fetch_add(written, Ordering::Relaxed);
+        self.logical_written_bytes
+            .fetch_add(written, Ordering::Relaxed);
         if !matches!(
             oracle
                 .commit(&ws, "benchmark: seed")
@@ -3087,6 +3407,18 @@ impl BenchDriver for ShadowDriver {
             "has_divergences": m.has_divergences(),
         }))
     }
+
+    fn record_edit_bytes(&self, bytes: u64) {
+        self.logical_written_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn logical_byte_totals(&self) -> (u64, u64) {
+        (
+            self.logical_workspace_bytes.load(Ordering::Relaxed),
+            self.logical_written_bytes.load(Ordering::Relaxed),
+        )
+    }
 }
 
 fn worker_branch_name(idx: usize, total: usize) -> Result<BranchName, String> {
@@ -3120,13 +3452,14 @@ fn run_worker_cycles(
         let measured = cycle >= config.warmup;
         let cycle_clock = Instant::now();
 
-        edit_workspace(
+        let edited_bytes = edit_workspace(
             Path::new(worker.workspace.path()),
             config,
             worker.idx,
             cycle,
             config.backend == Backend::D6,
         )?;
+        driver.record_edit_bytes(edited_bytes);
         let recreate =
             config.recreate_every > 0 && (cycle + 1).is_multiple_of(config.recreate_every);
         if recreate {
@@ -3235,6 +3568,8 @@ fn build_driver(
                 stage_seed,
                 workspaces_root,
                 store,
+                logical_workspace_bytes: AtomicU64::new(0),
+                logical_written_bytes: AtomicU64::new(0),
             }))
         }
         Backend::D6 => {
@@ -3345,42 +3680,6 @@ fn run(config: &Config) -> Result<Value, String> {
     )
 }
 
-fn compute_logical_written_bytes(config: &Config) -> (u64, u64) {
-    let logical_workspace_bytes = u64::try_from(
-        config
-            .files
-            .saturating_mul(config.file_bytes)
-            .saturating_add(config.oversized_file_bytes.unwrap_or(0))
-            .saturating_mul(config.concurrency),
-    )
-    .unwrap_or(u64::MAX);
-    let total_cycles_per_worker = config.warmup.saturating_add(config.iterations);
-    let edited_bytes_all_workers = u64::try_from(
-        total_cycles_per_worker
-            .saturating_mul(config.edits)
-            .saturating_mul(config.file_bytes)
-            .saturating_mul(config.concurrency),
-    )
-    .unwrap_or(u64::MAX);
-    let extra_branch_bytes = if config.backend == Backend::D6 {
-        let init_bytes = BRANCH_INIT_FILES.saturating_mul(config.file_bytes);
-        let deliv_bytes = if config.land_branches {
-            config.land_payload_bytes
-        } else {
-            0
-        };
-        init_bytes
-            .saturating_add(deliv_bytes)
-            .saturating_mul(config.concurrency)
-    } else {
-        0
-    };
-    let logical_written_bytes = logical_workspace_bytes
-        .saturating_add(edited_bytes_all_workers)
-        .saturating_add(u64::try_from(extra_branch_bytes).unwrap_or(u64::MAX));
-    (logical_workspace_bytes, logical_written_bytes)
-}
-
 fn finalize_and_build_report(
     driver: &Arc<dyn BenchDriver>,
     config: &Config,
@@ -3423,7 +3722,7 @@ fn finalize_and_build_report(
     let benchmark_binary_sha256 = binary_sha256()?;
 
     let mut disk = driver.disk_breakdown(scratch, &active_paths)?;
-    let (logical_workspace_bytes, logical_written_bytes) = compute_logical_written_bytes(config);
+    let (logical_workspace_bytes, logical_written_bytes) = driver.logical_byte_totals();
     let total_bytes = disk["total_bytes"].as_u64().unwrap_or(0);
     #[expect(clippy::cast_precision_loss)]
     let amp = (total_bytes as f64) / (logical_workspace_bytes.max(1) as f64);
@@ -3655,10 +3954,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        LAND_DELTA_SLO_BYTES, append_torn_journal_and_recover, cas_payload_bytes,
-        evaluate_land_delta_slo, fill_mixed_payload,
+        LAND_DELTA_SLO_BYTES, TORN_JOURNAL_TAIL, build_shifted_oversized_payload,
+        cas_payload_bytes, evaluate_cdc_dedup_slo, evaluate_land_delta_slo, fill_mixed_payload,
+        inject_torn_journal_tail, measure_shifted_cdc_dedup,
     };
-    use spawn_cas::{Digest, GitOid, JournalEntry, RefJournal, sha256_of};
+    use spawn_cas::{NS_BLOB, Store, empty_tree_digest, sha256_of};
+    use spawn_host::d6_cutover::reconcile_refs_journal;
+    use spawn_host::{
+        CasMerkleStore, D6RefKind, InMemoryRefLedger, PublishRequest, RefLedger, format_commit_body,
+    };
     use std::collections::BTreeSet;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3698,28 +4002,164 @@ mod tests {
     }
 
     #[test]
-    fn torn_journal_tail_is_ignored_and_healed_without_losing_committed_entries() {
-        let dir = unique_tmp_dir("torn-journal");
-        let jpath = dir.join("refs.journal");
-        let journal = RefJournal::new(&jpath);
+    fn torn_journal_tail_tolerated_by_production_journal_and_reconcile_without_truncation() {
+        let dir = unique_tmp_dir("torn-journal-reconcile");
+        let cas = CasMerkleStore::open(&dir).expect("open cas");
+        let writer_ledger = InMemoryRefLedger::new();
+        let lagging_ledger = InMemoryRefLedger::new();
+        let empty_tree = empty_tree_digest();
+        let body = format_commit_body(
+            "spawn <bench@localhost> 1700000010 +0000",
+            "spawn <bench@localhost> 1700000010 +0000",
+            "torn journal unit test\n",
+        );
+
         for seq in 1..=3_u64 {
-            let entry = JournalEntry {
-                seq,
-                project: "proj-bench".to_string(),
-                name: format!("branch/b{seq}"),
-                kind: "branch".to_string(),
-                old_snapshot: None,
-                new_snapshot: Digest::parse(&sha256_of(format!("s{seq}").as_bytes()).to_string())
-                    .expect("digest"),
-                git_oid: GitOid::parse_hex(&format!("{seq:040x}")).expect("oid"),
-                at_ms: 1_700_000_000_000 + i64::try_from(seq).expect("i64"),
-            };
-            journal.append(&entry).expect("append entry");
+            let (blob_d, blob_len) = cas
+                .put_bytes_blob(format!("branch-payload-{seq}").as_bytes())
+                .expect("put blob");
+            let tree = cas
+                .apply_mutations(
+                    &empty_tree,
+                    &[spawn_cas::TreeMutation::Upsert {
+                        path: vec![format!("file_{seq}.txt").into_bytes()],
+                        kind: spawn_cas::TreeEntryKind::File,
+                        id: blob_d.as_bytes(),
+                        size: blob_len,
+                    }],
+                )
+                .expect("apply tree");
+            let branch = format!("b{seq}");
+            let pub_res = cas
+                .publish_snapshot(
+                    &writer_ledger,
+                    &PublishRequest {
+                        project: "proj-bench",
+                        ref_name: &branch,
+                        kind: D6RefKind::Branch,
+                        expected_ref: None,
+                        tree: &tree,
+                        parents: &[],
+                        commit_body: &body,
+                        created_at_ms: 1_700_000_000_000 + i64::try_from(seq).expect("i64"),
+                        reason: "unit-test",
+                        landing_task_id: None,
+                    },
+                )
+                .expect("publish snapshot");
+            if seq == 1 {
+                let _ = lagging_ledger
+                    .record_snapshot(
+                        &pub_res.snapshot,
+                        &pub_res.git_oid,
+                        &pub_res.tree,
+                        &[],
+                        "proj-bench",
+                        1_700_000_000_001,
+                    )
+                    .expect("record seq 1 snapshot");
+                let lseq = lagging_ledger
+                    .cas_ref(
+                        "proj-bench",
+                        &branch,
+                        D6RefKind::Branch,
+                        None,
+                        &pub_res.snapshot,
+                        "unit-test",
+                    )
+                    .expect("cas_ref seq 1");
+                assert_eq!(lseq, 1);
+            }
         }
-        let recovered = append_torn_journal_and_recover(&jpath, 3).expect("torn recovery");
-        assert_eq!(recovered, 3);
-        let reread = journal.read_all().expect("reread healed journal");
-        assert_eq!(reread.len(), 3);
+
+        let jpath = cas.cas().refs_journal_path();
+        let tail_len = inject_torn_journal_tail(&jpath).expect("inject torn tail");
+        assert!(tail_len > 0);
+        let raw_before = fs::read(&jpath).expect("read torn journal");
+        assert!(raw_before.ends_with(TORN_JOURNAL_TAIL));
+
+        let entries = cas.cas().read_ref_journal().expect("read_ref_journal");
+        assert_eq!(entries.len(), 3);
+
+        let report = reconcile_refs_journal(&cas, &lagging_ledger, 1, "unit-test:reconcile")
+            .expect("reconcile_refs_journal");
+        assert_eq!(report.entries_considered, 2);
+        assert_eq!(report.entries_replayed, 2);
+        assert_eq!(report.last_journal_seq, 3);
+        assert_eq!(
+            lagging_ledger
+                .list_refs(Some("proj-bench"))
+                .expect("list lagging refs")
+                .len(),
+            3
+        );
+        let raw_after = fs::read(&jpath).expect("reread torn journal without truncation");
+        assert!(raw_after.ends_with(TORN_JOURNAL_TAIL));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fastcdc_shift_edit_dedup_beats_fixed_block_and_rejects_incompressible_corpus() {
+        let dir = unique_tmp_dir("cdc-shift-dedup");
+        let cas = Store::open(&dir).expect("open store");
+        let base = fill_mixed_payload(0x4F56_4552_5349_5A45, "BINv1\n", 5 * 1024 * 1024);
+
+        let mut shifted_entries = Vec::with_capacity(4);
+        for idx in 0..4_usize {
+            let shifted = build_shifted_oversized_payload(&base, idx);
+            let mut cursor = shifted.as_slice();
+            let stored = cas
+                .put_blob(NS_BLOB, &mut cursor)
+                .expect("put shifted blob");
+            shifted_entries.push((stored.digest, stored.size));
+        }
+        let shifted_metrics =
+            measure_shifted_cdc_dedup(&cas, &shifted_entries).expect("measure shifted cdc");
+        assert!(
+            evaluate_cdc_dedup_slo(shifted_metrics, 4),
+            "expected real shift-edit FastCDC >=2.0x vs fixed-block <1.2x, got cdc={:.2}x fixed={:.2}x",
+            shifted_metrics.cdc_dedup_ratio,
+            shifted_metrics.fixed_block_dedup_ratio
+        );
+        assert!(shifted_metrics.cdc_dedup_ratio >= 2.0);
+        assert!(shifted_metrics.fixed_block_dedup_ratio < 1.2);
+
+        // Incompressible corpus: independent random payloads per branch must fail NO-GO.
+        let mut random_entries = Vec::with_capacity(4);
+        for idx in 0..4_usize {
+            let rand_payload = fill_mixed_payload(
+                0xBAD0_0000_u64.wrapping_add(idx as u64),
+                &format!("// independent-{idx}\n"),
+                4_500_000,
+            );
+            let mut cursor = rand_payload.as_slice();
+            let stored = cas.put_blob(NS_BLOB, &mut cursor).expect("put random blob");
+            random_entries.push((stored.digest, stored.size));
+        }
+        let rand_metrics =
+            measure_shifted_cdc_dedup(&cas, &random_entries).expect("measure random cdc");
+        assert!(
+            !evaluate_cdc_dedup_slo(rand_metrics, 4),
+            "incompressible corpus unexpectedly passed: cdc={:.2}x",
+            rand_metrics.cdc_dedup_ratio
+        );
+
+        // Static identical-copy corpus: fixed-block dedup reaches ~4.0x and must fail NO-GO.
+        let mut static_entries = Vec::with_capacity(4);
+        let static_stored = cas
+            .put_blob(NS_BLOB, &mut base.as_slice())
+            .expect("put static blob");
+        for _ in 0..4 {
+            static_entries.push((static_stored.digest.clone(), static_stored.size));
+        }
+        let static_metrics =
+            measure_shifted_cdc_dedup(&cas, &static_entries).expect("measure static cdc");
+        assert!(
+            !evaluate_cdc_dedup_slo(static_metrics, 4),
+            "static copy cheating corpus unexpectedly passed: fixed={:.2}x",
+            static_metrics.fixed_block_dedup_ratio
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 
