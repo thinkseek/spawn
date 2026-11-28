@@ -865,6 +865,7 @@
         "crates/spawn-postgres/tests/common/mod.rs",
         "crates/spawn-postgres/tests/first-shapes.sql",
         "crates/spawn-postgres/tests/identity.rs",
+        "crates/spawn-postgres/tests/lock_order_guard.rs",
         "crates/spawn-postgres/tests/retired_events.rs",
         "crates/spawn-postgres/tests/roles.rs",
         "crates/spawn-postgres/tests/schema_guard.rs",
@@ -916,6 +917,7 @@
         "commits": [],
         "tests": [
           "crates/spawn-postgres/tests/api.rs",
+          "crates/spawn-postgres/tests/lock_order_guard.rs",
           "crates/spawn-postgres/tests/roles.rs"
         ],
         "deploys": [],
