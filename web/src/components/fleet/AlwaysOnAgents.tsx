@@ -4,16 +4,13 @@ import type { FleetAgent } from "../../fleet";
 import { stateLabelUpper } from "../../fleet";
 import { absoluteTitle, formatDuration } from "../../format";
 import type { FleetContext, MissingAgent } from "../../ordering";
-import { agentLiveness, heldTask, residentName } from "../../ordering";
+import { agentLiveness, heldTask, residentName, uptimeMs } from "../../ordering";
 import { LiveBadge } from "../Terminal";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, LabeledId, MiddleId, cx, sinceText } from "../ui";
 import { AgentLivenessPill, FleetStateDot } from "./bits";
 import { DoingIcon, TaskCell, doingNow } from "./FleetBoard";
 
-/** How long an agent's current execution has run, while it runs. */
-export function uptimeMs(agent: Pick<FleetAgent, "live" | "started_at_ms">, now = Date.now()): number | null {
-  return agent.live && agent.started_at_ms !== null ? Math.max(0, now - agent.started_at_ms) : null;
-}
+export { uptimeMs };
 
 /**
  * The agents that run forever: the supervisor, then the residents. Pinned

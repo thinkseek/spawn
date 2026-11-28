@@ -127,7 +127,8 @@ fn deflate_fixed(input: &[u8], bits: &mut BitWriter) {
                     break;
                 }
                 let can_beat = best_len == 0
-                    || (best_len < max_match && input[cand_pos + best_len] == input[pos + best_len]);
+                    || (best_len < max_match
+                        && input[cand_pos + best_len] == input[pos + best_len]);
                 if can_beat
                     && input[cand_pos] == input[pos]
                     && input[cand_pos + 1] == input[pos + 1]
@@ -463,7 +464,8 @@ mod tests {
             mixed_120k.extend_from_slice(entry.as_bytes());
         }
 
-        let boundary_max_dist = [b"ABCD".as_slice(), &vec![b'x'; 32_764], b"ABCD".as_slice()].concat();
+        let boundary_max_dist =
+            [b"ABCD".as_slice(), &vec![b'x'; 32_764], b"ABCD".as_slice()].concat();
         let boundary_max_match = b"Z".repeat(600);
         let mut x = 0x9e37_79b9u32;
         let mut pseudorandom = Vec::with_capacity(2048);
@@ -490,7 +492,14 @@ mod tests {
         }
 
         let shrunk = compress_if_smaller(&mixed_120k).expect("JSON shrinks well");
-        assert!(shrunk.len() * 5 < mixed_120k.len(), "expected >5x compression on JSON");
-        assert_eq!(compress_if_smaller(&pseudorandom), None, "incompressible data skipped");
+        assert!(
+            shrunk.len() * 5 < mixed_120k.len(),
+            "expected >5x compression on JSON"
+        );
+        assert_eq!(
+            compress_if_smaller(&pseudorandom),
+            None,
+            "incompressible data skipped"
+        );
     }
 }

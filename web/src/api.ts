@@ -662,6 +662,10 @@ export function peekAlerts(): Alert[] | null {
   return peekApi("/api/alerts", normalizeAlerts);
 }
 
+export function peekActiveAlerts(): Alert[] | null {
+  return peekApi("/api/alerts?active=1", normalizeAlerts);
+}
+
 /** GET an API read and normalize it; answered "not modified" (304), the
  * value read last time, the same object. Every module's reads go here. */
 export function readApi<T>(
@@ -886,6 +890,10 @@ export async function fetchAlerts(signal: AbortSignal): Promise<Alert[]> {
   return readApi("/api/alerts", signal, normalizeAlerts);
 }
 
+export async function fetchActiveAlerts(signal: AbortSignal): Promise<Alert[]> {
+  return readApi("/api/alerts?active=1", signal, normalizeAlerts);
+}
+
 /** The same, over the last `spanMs` (the server's window is 24 h unless
  * asked): home's digest reads as far back as the reader was away. */
 export async function fetchAlertsSince(spanMs: number, signal: AbortSignal): Promise<Alert[]> {
@@ -974,6 +982,9 @@ export function usePoll<T>(
   const initialRef = useRef(options.initial);
   initialRef.current = options.initial;
   const keyRef = useRef<string>(key);
+  const lastDataRef = useRef<T | null>(data);
+  const lastErrorRef = useRef<string | null>(error);
+  const lastCheckedAtRef = useRef<number | null>(checkedAt);
   const checked = options.checked === true;
   const liveTopics = (options.live ?? []).join(",");
 
@@ -985,7 +996,11 @@ export function usePoll<T>(
     // A new interval for the same key keeps what is on screen.
     if (keyRef.current !== key) {
       keyRef.current = key;
-      setData(initialRef.current?.() ?? null);
+      const hydrated = initialRef.current?.() ?? null;
+      lastDataRef.current = hydrated;
+      lastErrorRef.current = null;
+      lastCheckedAtRef.current = null;
+      setData(hydrated);
       setError(null);
       setCheckedAt(null);
     }
@@ -1019,15 +1034,36 @@ export function usePoll<T>(
       try {
         const next = await loadRef.current(controller.signal);
         if (!cancelled) {
-          setData(next);
-          setError(null);
-          if (checked) setCheckedAt(Date.now());
+          const dataChanged = next !== lastDataRef.current;
+          if (dataChanged) {
+            lastDataRef.current = next;
+            setData(next);
+          }
+          if (lastErrorRef.current !== null) {
+            lastErrorRef.current = null;
+            setError(null);
+          }
+          if (checked) {
+            const now = Date.now();
+            if (
+              dataChanged ||
+              lastCheckedAtRef.current === null ||
+              now - lastCheckedAtRef.current >= 30_000
+            ) {
+              lastCheckedAtRef.current = now;
+              setCheckedAt(now);
+            }
+          }
         }
       } catch (cause) {
         const aborted =
           cause instanceof DOMException && cause.name === "AbortError";
         if (!cancelled && !aborted) {
-          setError(cause instanceof Error ? cause.message : "request failed");
+          const message = cause instanceof Error ? cause.message : "request failed";
+          if (lastErrorRef.current !== message) {
+            lastErrorRef.current = message;
+            setError(message);
+          }
         }
       } finally {
         inFlight = false;

@@ -11,8 +11,10 @@ import {
   Terminal,
   Users,
 } from "lucide-react";
-import { Suspense, lazy, useState } from "react";
+import { Suspense, useState } from "react";
 import type { ReactNode } from "react";
+
+import { RouteErrorBoundary, retryableLazy } from "../RouteErrorBoundary";
 
 import type { PollResult } from "../../api";
 import { freshAt } from "../../validated";
@@ -40,7 +42,7 @@ import {
   missionClass,
   missionName,
   orderMissions,
-  snapshotFreshness,
+  effectiveSnapshotFreshness,
   stateWords,
   taskTitle,
 } from "../../ordering";
@@ -58,7 +60,7 @@ import type { ViewOption } from "../ViewToggle";
 
 // The timeline carries Motion and d3: loaded when first shown, so the first
 // page stays light.
-const MissionTimeline = lazy(() =>
+const MissionTimeline = retryableLazy(() =>
   import("./MissionTimeline").then((module) => ({ default: module.MissionTimeline })),
 );
 
@@ -79,8 +81,15 @@ export function MissionsView({ missions }: { missions: PollResult<Missions> }) {
   const { locale } = useLocale();
   const now = useNow(15_000);
   const data = missions.data;
-  const freshnessAt = data?.generated_at_ms != null ? freshAt(data.generated_at_ms, missions.checkedAt) : null;
-  const freshness = snapshotFreshness(freshnessAt, now);
+  const generatedAt = data?.generated_at_ms ?? null;
+  const freshnessAt = generatedAt !== null ? freshAt(generatedAt, missions.checkedAt) : null;
+  const freshness = effectiveSnapshotFreshness(
+    generatedAt,
+    freshnessAt,
+    now,
+    missions.checkedAt,
+    missions.error,
+  );
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
@@ -159,9 +168,11 @@ export function MissionsBody({ data }: { data: Missions }) {
             />
           </div>
         ) : (
-          <Suspense fallback={<div className="min-h-0 flex-1" />}>
-            <MissionTimeline missions={data.missions} header={toggle} holds={data.holds} />
-          </Suspense>
+          <RouteErrorBoundary resetKey="missions-timeline" compact>
+            <Suspense fallback={<div className="min-h-0 flex-1" />}>
+              <MissionTimeline missions={data.missions} header={toggle} holds={data.holds} />
+            </Suspense>
+          </RouteErrorBoundary>
         )}
       </div>
     );

@@ -1,7 +1,8 @@
 import { Orbit, ShieldAlert, WifiOff } from "lucide-react";
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  fetchActiveAlerts,
   fetchAlerts,
   fetchAttention,
   fetchOverview,
@@ -9,6 +10,7 @@ import {
   getInitialTokenProblem,
   getServeToken,
   live,
+  peekActiveAlerts,
   peekAlerts,
   peekApi,
   peekAttention,
@@ -21,6 +23,7 @@ import {
 import { PAGE_EVENTS } from "./sessionWindow";
 import type { PollResult, SessionTail } from "./api";
 import { markNeedsHuman, needsHuman } from "./attention";
+import { RouteErrorBoundary, retryableLazy } from "./components/RouteErrorBoundary";
 import { MobileNav, LocaleSwitch, Sidebar, ThemeSwitch } from "./components/Sidebar";
 import { TokenGate } from "./components/TokenGate";
 import {
@@ -36,7 +39,7 @@ import { tr, useLocale } from "./components/ui";
 import type { Fleet } from "./fleet";
 import { fetchFleet, peekFleet } from "./fleet";
 import type { Missions } from "./missions";
-import { fetchMissions, normalizeMissions } from "./missions";
+import { fetchMissions, fetchMissionsSummary, normalizeMissions } from "./missions";
 import type { NavView } from "./navigation";
 import { fleetContext, missingAlwaysOn } from "./ordering";
 import { actionableAlerts, actionableHomeNeeds, agentNames, needsYou } from "./home";
@@ -72,44 +75,46 @@ registerRouteLoaders({
   storage: loadStorageTreeView,
 });
 
-const AgentsConsoleView = lazy(() =>
+const AgentsConsoleView = retryableLazy(() =>
   loadAgentsConsoleView().then((module) => ({ default: module.AgentsConsoleView })),
 );
-const AlertsView = lazy(() =>
+const AlertsView = retryableLazy(() =>
   loadAlertsView().then((module) => ({ default: module.AlertsView })),
 );
-const CostView = lazy(() =>
+const CostView = retryableLazy(() =>
   loadCostView().then((module) => ({ default: module.CostView })),
 );
-const CoveragePage = lazy(() =>
+const CoveragePage = retryableLazy(() =>
   loadCoveragePage().then((module) => ({ default: module.CoveragePage })),
 );
-const FeatureMapView = lazy(() =>
+const FeatureMapView = retryableLazy(() =>
   loadFeatureMapView().then((module) => ({ default: module.FeatureMapView })),
 );
-const GradingView = lazy(() =>
+const GradingView = retryableLazy(() =>
   loadGradingView().then((module) => ({ default: module.GradingView })),
 );
-const MissionsView = lazy(() =>
+const MissionsView = retryableLazy(() =>
   loadMissionsView().then((module) => ({ default: module.MissionsView })),
 );
-const RsiView = lazy(() =>
+const RsiView = retryableLazy(() =>
   loadRsiView().then((module) => ({ default: module.RsiView })),
 );
-const ScorecardView = lazy(() =>
+const ScorecardView = retryableLazy(() =>
   loadScorecardView().then((module) => ({ default: module.ScorecardView })),
 );
-const SessionsView = lazy(() =>
+const SessionsView = retryableLazy(() =>
   loadSessionsView().then((module) => ({ default: module.SessionsView })),
 );
-const ShowView = lazy(() =>
+const ShowView = retryableLazy(() =>
   loadShowView().then((module) => ({ default: module.ShowView })),
 );
-const StorageTreeView = lazy(() =>
+const StorageTreeView = retryableLazy(() =>
   loadStorageTreeView().then((module) => ({ default: module.StorageTreeView })),
 );
 
 const peekMissions = () => peekApi("/api/missions", normalizeMissions);
+const peekMissionsSummary = () => peekApi("/api/missions?summary=1", normalizeMissions);
+const EMPTY_SESSIONS: NonNullable<ReturnType<typeof peekOverview>>["sessions"] = [];
 
 export type View = NavView;
 
@@ -451,10 +456,17 @@ function DashboardShell({
   useEffect(() => {
     return scheduleIdlePrefetch(routeFromHash().view);
   }, []);
-  const overview = usePoll("overview", fetchOverview, 2_000, {
-    live: ["overview"],
-    initial: peekOverview,
-  });
+  const [route, setRoute] = useState<Route>(routeFromHash);
+  const view = route.view;
+  const overview = usePoll(
+    "overview",
+    fetchOverview,
+    view === "sessions" ? 3_000 : 15_000,
+    {
+      live: ["overview"],
+      initial: peekOverview,
+    },
+  );
   // Both polled in every view: the sidebar shows what is escalated, which is
   // the dispatcher's view (/api/attention), never a judge's flag.
   const fleetPoll = usePoll("fleet", fetchFleet, 3_000, {
@@ -466,10 +478,19 @@ function DashboardShell({
     live: ["attention"],
     initial: peekAttention,
   });
-  // The alerts Spawn raised, viewed quietly in Diagnostics -> Alerts Log or Home's folded digest.
-  const alerts = usePoll("alerts", fetchAlerts, 5_000, {
+  // The alerts Spawn raised; poll active alerts outside `/alerts` to trim payload.
+  const alertsKey = view === "alerts" ? "alerts" : "alerts:active";
+  const fetchAlertsForView = view === "alerts" ? fetchAlerts : fetchActiveAlerts;
+  const alertsInitial = useCallback(
+    () =>
+      view === "alerts"
+        ? (peekAlerts() ?? peekActiveAlerts())
+        : (peekActiveAlerts() ?? peekAlerts()),
+    [view],
+  );
+  const alerts = usePoll(alertsKey, fetchAlertsForView, 5_000, {
     live: ["alerts"],
-    initial: peekAlerts,
+    initial: alertsInitial,
   });
   const needs = useMemo(
     () => (attention.data ? needsHuman(attention.data) : null),
@@ -483,11 +504,14 @@ function DashboardShell({
       },
     [fleetPoll.data, needs],
   );
-  const fleet: PollResult<Fleet> = {
-    data: fleetData,
-    error: fleetPoll.error,
-    checkedAt: fleetPoll.checkedAt,
-  };
+  const fleet = useMemo<PollResult<Fleet>>(
+    () => ({
+      data: fleetData,
+      error: fleetPoll.error,
+      checkedAt: fleetPoll.checkedAt,
+    }),
+    [fleetData, fleetPoll.error, fleetPoll.checkedAt],
+  );
   const applying = useMemo(
     () => actionableAlerts(alerts.data, fleetPoll.data?.agents ?? null),
     [alerts.data, fleetPoll.data],
@@ -495,10 +519,6 @@ function DashboardShell({
   const openAlerts = applying.length;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [railOpen, setRailOpen] = useState(false);
-  // The fleet view is the landing page; the hash keeps the view (and the
-  // open agent) across reloads.
-  const [route, setRoute] = useState<Route>(routeFromHash);
-  const view = route.view;
   const [tokenRole, setTokenRole] = useState<SessionRole>(() =>
     classifyTokenRole(getServeToken()),
   );
@@ -517,13 +537,21 @@ function DashboardShell({
       ),
     [],
   );
-  // Polled in every view too: the sidebar and the fleet board group agents
-  // by the tasks they hold. Faster while the missions page shows them.
+  // Polled in every view too: summary board outside `/missions` avoids multi-hundred-KB polling.
+  const missionsKey = view === "missions" ? "missions" : "missions:summary";
+  const fetchMissionsForView = view === "missions" ? fetchMissions : fetchMissionsSummary;
+  const missionsInitial = useCallback(
+    () =>
+      view === "missions"
+        ? (peekMissions() ?? peekMissionsSummary())
+        : (peekMissionsSummary() ?? peekMissions()),
+    [view],
+  );
   const missions = usePoll<Missions>(
-    "missions",
-    fetchMissions,
+    missionsKey,
+    fetchMissionsForView,
     view === "missions" ? 5_000 : 15_000,
-    { live: ["missions"], checked: true, initial: peekMissions },
+    { live: ["missions"], checked: true, initial: missionsInitial },
   );
   const context = useMemo(() => fleetContext(missions.data), [missions.data]);
   // The Home badge counts what needs the owner's action: the home page's
@@ -553,11 +581,35 @@ function DashboardShell({
     [attention.data, missions.data, alerts.data, fleetPoll.data, missing, minute, locale, pollNames],
   );
   const homeNeeds = useMemo(() => actionableHomeNeeds(needItems), [needItems]);
-  const humanCount = {
-    count: homeNeeds.filter((item) => item.tone === "act").length,
-    error: attention.data ? null : attention.error,
-  };
-  const setView = (next: View) => setRoute({ view: next, agent: null });
+  const humanCount = useMemo(
+    () => ({
+      count: homeNeeds.filter((item) => item.tone === "act").length,
+      error: attention.data ? null : attention.error,
+    }),
+    [homeNeeds, attention.data, attention.error],
+  );
+  const setView = useCallback((next: View) => setRoute({ view: next, agent: null }), []);
+  const showHome = useCallback(() => setView("fleet"), [setView]);
+  const showAgents = useCallback(() => setView("agents"), [setView]);
+  const showMissions = useCallback(() => setView("missions"), [setView]);
+  const showGrading = useCallback(() => setView("grading"), [setView]);
+  const showFeatures = useCallback(() => setView("features"), [setView]);
+  const showCoverage = useCallback(() => setView("coverage"), [setView]);
+  const showRsi = useCallback(() => setView("rsi"), [setView]);
+  const showAlerts = useCallback(() => setView("alerts"), [setView]);
+  const showScorecard = useCallback(() => setView("scorecard"), [setView]);
+  const showCost = useCallback(() => setView("cost"), [setView]);
+  const showStorage = useCallback(() => setView("storage"), [setView]);
+  const showShow = useCallback(() => setView("show"), [setView]);
+  const showSessions = useCallback(() => setView("sessions"), [setView]);
+  const selectSessionFromSidebar = useCallback(
+    (id: string) => {
+      setSelectedId(id);
+      setView("sessions");
+    },
+    [setView],
+  );
+  const selectFleetAgent = useCallback((agent: string | null) => setRoute({ view: "fleet", agent }), []);
 
   useEffect(() => {
     const next = hashFor(route);
@@ -616,9 +668,11 @@ function DashboardShell({
   if (view === "show" && presenting()) {
     return (
       <div className="flex h-dvh w-full overflow-hidden bg-page-canvas text-label text-foreground">
-        <Suspense fallback={null}>
-          <ShowView fleet={fleet} present />
-        </Suspense>
+        <RouteErrorBoundary resetKey="show">
+          <Suspense fallback={null}>
+            <ShowView fleet={fleet} present />
+          </Suspense>
+        </RouteErrorBoundary>
       </div>
     );
   }
@@ -631,23 +685,23 @@ function DashboardShell({
         error={overview.error}
         attention={humanCount}
         openAlerts={openAlerts}
-        onShowFleet={() => setView("fleet")}
-        onShowAgents={() => setView("agents")}
-        onShowMissions={() => setView("missions")}
-        onShowGrading={() => setView("grading")}
-        onShowFeatures={() => setView("features")}
-        onShowCoverage={() => setView("coverage")}
-        onShowRsi={() => setView("rsi")}
-        onShowAlerts={() => setView("alerts")}
-        onShowScorecard={() => setView("scorecard")}
-        onShowCost={() => setView("cost")}
-        onShowStorage={() => setView("storage")}
-        onShowShow={() => setView("show")}
-        onShowSessions={() => setView("sessions")}
+        onShowFleet={showHome}
+        onShowAgents={showAgents}
+        onShowMissions={showMissions}
+        onShowGrading={showGrading}
+        onShowFeatures={showFeatures}
+        onShowCoverage={showCoverage}
+        onShowRsi={showRsi}
+        onShowAlerts={showAlerts}
+        onShowScorecard={showScorecard}
+        onShowCost={showCost}
+        onShowStorage={showStorage}
+        onShowShow={showShow}
+        onShowSessions={showSessions}
         onSignOut={hasStoredToken ? onSignOut : undefined}
       />
       <Sidebar
-        sessions={overview.data?.sessions ?? []}
+        sessions={overview.data?.sessions ?? EMPTY_SESSIONS}
         agents={fleet.data?.agents ?? null}
         context={context}
         selectedId={view === "sessions" ? selectedId : null}
@@ -655,24 +709,21 @@ function DashboardShell({
         rsi={rsi}
         error={overview.error}
         attention={humanCount}
-        onShowFleet={() => setView("fleet")}
-        onShowAgents={() => setView("agents")}
-        onShowMissions={() => setView("missions")}
-        onShowGrading={() => setView("grading")}
-        onShowFeatures={() => setView("features")}
-        onShowCoverage={() => setView("coverage")}
-        onShowRsi={() => setView("rsi")}
-        onShowAlerts={() => setView("alerts")}
+        onShowFleet={showHome}
+        onShowAgents={showAgents}
+        onShowMissions={showMissions}
+        onShowGrading={showGrading}
+        onShowFeatures={showFeatures}
+        onShowCoverage={showCoverage}
+        onShowRsi={showRsi}
+        onShowAlerts={showAlerts}
         openAlerts={openAlerts}
-        onShowScorecard={() => setView("scorecard")}
-        onShowCost={() => setView("cost")}
-        onShowStorage={() => setView("storage")}
-        onShowShow={() => setView("show")}
-        onShowSessions={() => setView("sessions")}
-        onSelect={(id) => {
-          setSelectedId(id);
-          setView("sessions");
-        }}
+        onShowScorecard={showScorecard}
+        onShowCost={showCost}
+        onShowStorage={showStorage}
+        onShowShow={showShow}
+        onShowSessions={showSessions}
+        onSelect={selectSessionFromSidebar}
         onSignOut={hasStoredToken ? onSignOut : undefined}
       />
 
@@ -686,15 +737,16 @@ function DashboardShell({
           alerts={alerts.data}
           needs={needItems}
           actionableNeeds={homeNeeds}
-          onShowMissions={() => setView("missions")}
-          onShowFeatures={() => setView("features")}
-          onShowAgents={() => setView("agents")}
+          onShowMissions={showMissions}
+          onShowFeatures={showFeatures}
+          onShowAgents={showAgents}
           selectedId={route.agent}
-          onSelect={(agent) => setRoute({ view: "fleet", agent })}
+          onSelect={selectFleetAgent}
           onOpenTimeline={openTimeline}
         />
       ) : (
-        <Suspense fallback={<ViewLoadingFallback label={tr(locale, "正在加载视图…", "Loading view…")} />}>
+        <RouteErrorBoundary resetKey={`${view}:${route.agent ?? ""}`}>
+          <Suspense fallback={<ViewLoadingFallback label={tr(locale, "正在加载视图…", "Loading view…")} />}>
           {view === "agents" ? (
             <AgentsConsoleView
               role={tokenRole}
@@ -708,7 +760,7 @@ function DashboardShell({
           ) : view === "features" ? (
             <FeatureMapView
               onOpenSession={openTimeline}
-              onOpenCoverage={() => setView("coverage")}
+              onOpenCoverage={showCoverage}
             />
           ) : view === "coverage" ? (
             <CoveragePage />
@@ -718,7 +770,7 @@ function DashboardShell({
             <AlertsView
               agents={fleetPoll.data?.agents ?? null}
               nameOf={(session) => pollNames.get(session) ?? null}
-              onShowHome={() => setView("fleet")}
+              onShowHome={showHome}
             />
           ) : view === "scorecard" ? (
             <ScorecardView missions={missions.data} health={fleetPoll.data?.health ?? null} />
@@ -747,7 +799,8 @@ function DashboardShell({
               onSetRailOpen={setRailOpen}
             />
           )}
-        </Suspense>
+          </Suspense>
+        </RouteErrorBoundary>
       )}
       </div>
     </div>

@@ -7,6 +7,7 @@ import type { ScorecardScope } from "../src/scorecard.ts";
 import { absoluteTitle, localDateTime, utcDateTime } from "../src/format.ts";
 import {
   attemptOutcome,
+  effectiveSnapshotFreshness,
   fleetContext,
   groupAgents,
   groupTasks,
@@ -514,4 +515,18 @@ test("absolute times: local to the second, then UTC", () => {
   assert.equal(absoluteTitle(at), `${localDateTime(at, true)} local · 2026-11-06 09:37:22 UTC`);
   assert.equal(absoluteTitle(null), undefined);
   assert.equal(localDateTime(0), "—");
+});
+
+test("effectiveSnapshotFreshness holds fresh on initial hydrated snapshot until first poll settles", () => {
+  const staleAt = 1_000_000;
+  const now = staleAt + 5 * 60_000; // past snapshotStaleMs (3m)
+  // Reload hydrated from cache before first network poll finishes: checkedAt=null, error=null -> fresh!
+  const hydrated = effectiveSnapshotFreshness(staleAt, staleAt, now, null, null);
+  assert.equal(hydrated.level, "fresh");
+  // Once a poll check fails before checking in -> real freshness is reported.
+  const failed = effectiveSnapshotFreshness(staleAt, staleAt, now, null, "network error");
+  assert.equal(failed.level, "aging");
+  // Once a poll checked in cleanly -> uses freshAt(generatedAtMs, checkedAt) -> fresh!
+  const checked = effectiveSnapshotFreshness(staleAt, now, now, now, null);
+  assert.equal(checked.level, "fresh");
 });

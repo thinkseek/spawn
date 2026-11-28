@@ -10,8 +10,10 @@ export const SNAPSHOT_PATHS: ReadonlyArray<string> = [
   "/api/overview",
   "/api/fleet",
   "/api/missions",
+  "/api/missions?summary=1",
   "/api/attention",
   "/api/alerts",
+  "/api/alerts?active=1",
   "/api/approvals",
 ];
 

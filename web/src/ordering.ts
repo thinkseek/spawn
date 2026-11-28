@@ -771,3 +771,39 @@ export function snapshotFreshness(
   }
   return { level: "fresh", label: "实时心跳", ageMs, driftMs };
 }
+
+/**
+ * Snapshot freshness aware of initial reload hydration: while a localStorage
+ * snapshot is displayed before the first poll check completes (`checkedAt === null`
+ * and `!error`), keep `"fresh"` so reloads never flash `"aging"` / `"frozen"`.
+ */
+export function effectiveSnapshotFreshness(
+  generatedAtMs: number | null,
+  freshnessAt: number | null,
+  now: number,
+  checkedAt: number | null | undefined,
+  error: string | null,
+  latestNodeBeatMs: number | null = null,
+): SnapshotFreshnessView {
+  if (generatedAtMs !== null && checkedAt == null && error === null) {
+    return { level: "fresh", label: "实时心跳", ageMs: null, driftMs: null };
+  }
+  return snapshotFreshness(freshnessAt, now, latestNodeBeatMs);
+}
+
+/** How long an agent's current execution has run, while it runs. */
+export function uptimeMs(
+  agent: Pick<FleetAgent, "live" | "started_at_ms">,
+  now = Date.now(),
+): number | null {
+  return agent.live && agent.started_at_ms !== null ? Math.max(0, now - agent.started_at_ms) : null;
+}
+
+/** Liveness of the always-on agents, as the health strip's first cell reads it. */
+export interface Liveness {
+  /** Always-on agents (the supervisor and the residents) and how many run. */
+  total: number;
+  up: number;
+  /** The live always-on agent whose execution started last, and how long ago. */
+  shortest: { name: string; ms: number; since: number } | null;
+}

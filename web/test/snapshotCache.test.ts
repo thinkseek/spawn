@@ -59,6 +59,8 @@ test("saveSnapshot and loadSnapshots enforce allowlist, scope isolation, TTL, si
   const now = 1_795_000_000_000;
 
   assert.equal(isSnapshotAllowed("/api/fleet"), true);
+  assert.equal(isSnapshotAllowed("/api/missions?summary=1"), true);
+  assert.equal(isSnapshotAllowed("/api/alerts?active=1"), true);
   assert.equal(isSnapshotAllowed("/api/sessions/session_1"), false);
   assert.equal(saveSnapshot(storage, scopeA, "/api/sessions/session_1", 'W/"x"', {}, now), false);
 

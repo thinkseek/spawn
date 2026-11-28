@@ -1,4 +1,5 @@
 import { Bot, Hourglass, Wrench } from "lucide-react";
+import { useState } from "react";
 
 import type { FleetAgent } from "../../fleet";
 import { FLEET_STATES, jobsText, onOwnJob, percent, stateLabelUpper } from "../../fleet";
@@ -8,7 +9,7 @@ import { agentGroupLabel, agentLiveness, heldTask, lastTask } from "../../orderi
 import { currentToolText } from "../../home";
 import { useStoredChoice } from "../ViewToggle";
 import { ToolChip } from "../BeautifulPrimitives";
-import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, GroupHeader, LabeledId, cx, sinceText, useLocale } from "../ui";
+import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, GroupHeader, LabeledId, cx, sinceText, tr, useLocale } from "../ui";
 import { AgentLivenessPill, FleetStateDot, JudgeBadge } from "./bits";
 
 /** One line for "what is it doing right now": its open tool; else, when the
@@ -79,6 +80,7 @@ export function FleetBoard({
 }) {
   const { locale } = useLocale();
   const [ended, setEnded] = useStoredChoice("spawn.fleet.ended", ["open", "closed"] as const, "closed");
+  const [endedLimit, setEndedLimit] = useState(30);
   const shown = groups.filter((group) => group.id !== "always_on");
   const live = total.filter((agent) => agent.live).length;
   const byState = FLEET_STATES.map((state) => [
@@ -161,23 +163,54 @@ export function FleetBoard({
                       </p>
                     )
                   ) : (
-                    <ul className="divide-y divide-surface-border border-t border-surface-border">
-                      {group.agents
-                        .filter((agent) => open || agent.session_id === selectedId)
-                        .map((agent) => (
-                        <li key={agent.session_id}>
-                          <AgentRow
-                            agent={agent}
-                            group={group.id}
-                            held={heldTask(agent, context)}
-                            last={lastTask(agent, context)}
-                            usualEngine={usualEngine}
-                            selected={agent.session_id === selectedId}
-                            onSelect={onSelect}
-                          />
-                        </li>
-                      ))}
-                    </ul>
+                    (() => {
+                      const visibleAgents = group.agents.filter(
+                        (agent) => open || agent.session_id === selectedId,
+                      );
+                      const paginate = folds && open && visibleAgents.length > endedLimit;
+                      const displayedAgents = paginate
+                        ? visibleAgents.filter(
+                            (agent, index) => index < endedLimit || agent.session_id === selectedId,
+                          )
+                        : visibleAgents;
+                      return (
+                        <>
+                          <ul className="divide-y divide-surface-border border-t border-surface-border">
+                            {displayedAgents.map((agent) => (
+                              <li key={agent.session_id} className="cv-row">
+                                <AgentRow
+                                  agent={agent}
+                                  group={group.id}
+                                  held={heldTask(agent, context)}
+                                  last={lastTask(agent, context)}
+                                  usualEngine={usualEngine}
+                                  selected={agent.session_id === selectedId}
+                                  onSelect={onSelect}
+                                />
+                              </li>
+                            ))}
+                          </ul>
+                          {paginate && (
+                            <div className="border-t border-surface-border px-4 py-2">
+                              <button
+                                type="button"
+                                onClick={() => setEndedLimit((curr) => curr + 30)}
+                                className={cx(
+                                  "rounded-control px-2.5 py-1 text-caption font-medium text-muted-foreground hover:bg-surface-hover hover:text-foreground",
+                                  FOCUS_RING_INSET,
+                                )}
+                              >
+                                {tr(
+                                  locale,
+                                  `显示更多已结束 Worker（剩余 ${visibleAgents.length - displayedAgents.length} 个）`,
+                                  `Show more ended (${visibleAgents.length - displayedAgents.length} more)`,
+                                )}
+                              </button>
+                            </div>
+                          )}
+                        </>
+                      );
+                    })()
                   ))}
               </section>
             );

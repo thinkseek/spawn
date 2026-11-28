@@ -25,7 +25,7 @@ import {
   Waypoints,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import type { OverviewSession, RsiSummary, SessionState } from "../api";
@@ -349,7 +349,7 @@ function useDiagnosticsToggle(view: View) {
   return { diagnosticsOpen, toggleDiagnostics };
 }
 
-export function Sidebar(props: SidebarProps) {
+export const Sidebar = memo(function Sidebar(props: SidebarProps) {
   const {
     sessions,
     agents,
@@ -629,7 +629,7 @@ export function Sidebar(props: SidebarProps) {
       </div>
     </aside>
   );
-}
+});
 
 /** States whose words a held task's says better: the worker idles at its
  * prompt while its task is judged or lands. */
@@ -666,6 +666,7 @@ function GroupedSessions({
 }) {
   const { locale } = useLocale();
   const [ended, setEnded] = useStoredChoice("spawn.sidebar.ended", ["open", "closed"] as const, "closed");
+  const [endedLimit, setEndedLimit] = useState(40);
   const names = useMemo(() => agentNames(agents, context), [agents, context]);
   if (agents.length === 0) {
     return (
@@ -707,52 +708,83 @@ function GroupedSessions({
               onToggle={folds ? () => setEnded(open ? "closed" : "open") : undefined}
             />
             {(open || group.agents.some((agent) => agent.session_id === selectedId)) && (
-              <ul className="space-y-px">
-                {group.agents
-                  .filter((agent) => open || agent.session_id === selectedId)
-                  .map((agent) => {
-                    const held = heldTask(agent, context);
-                    const named = nameTask(agent, context);
-                    const recorded = recordedState(agent);
-                    const label =
-                      held && AT_THE_GATE.has(held.label)
-                        ? tr(locale, `任务 ${GATE_STATE_ZH[held.label] ?? held.label}`, `Task ${held.label}`)
-                        : locale === "zh"
-                          ? (RECORDED_STATE_ZH[recorded.label] ?? recorded.label)
-                          : recorded.label;
-                    const at =
-                      recorded.since ?? observed.get(agent.session_id)?.recorded_at_ms ?? null;
-                    return (
-                      <li key={agent.session_id}>
-                        <SessionRow
-                          sessionId={agent.session_id}
-                          agentId={agent.agent_id}
-                          name={nameOf(agent)}
-                          line={
-                            named && named !== held
-                              ? named.title
-                                ? tr(locale, `上次：${named.title}`, `last: ${named.title}`)
-                                : null
-                              : (named?.title ?? agent.task_title)
-                          }
-                          state={recorded.dot}
-                          label={label}
-                          at={at}
-                          attention={agent.attention}
-                          task={
-                            held
-                              ? `T${held.task_id ?? "?"} ${
-                                  locale === "zh" ? (GATE_STATE_ZH[held.label] ?? held.label) : held.label
-                                }${held.title ? ` · ${held.title}` : ""}`
-                              : null
-                          }
-                          selected={agent.session_id === selectedId}
-                          onSelect={onSelect}
-                        />
-                      </li>
-                    );
-                  })}
-              </ul>
+              (() => {
+                const visibleAgents = group.agents.filter(
+                  (agent) => open || agent.session_id === selectedId,
+                );
+                const paginate = folds && open && !searching && visibleAgents.length > endedLimit;
+                const displayedAgents = paginate
+                  ? visibleAgents.filter(
+                      (agent, index) => index < endedLimit || agent.session_id === selectedId,
+                    )
+                  : visibleAgents;
+                return (
+                  <>
+                    <ul className="space-y-px">
+                      {displayedAgents.map((agent) => {
+                        const held = heldTask(agent, context);
+                        const named = nameTask(agent, context);
+                        const recorded = recordedState(agent);
+                        const label =
+                          held && AT_THE_GATE.has(held.label)
+                            ? tr(locale, `任务 ${GATE_STATE_ZH[held.label] ?? held.label}`, `Task ${held.label}`)
+                            : locale === "zh"
+                              ? (RECORDED_STATE_ZH[recorded.label] ?? recorded.label)
+                              : recorded.label;
+                        const at =
+                          recorded.since ?? observed.get(agent.session_id)?.recorded_at_ms ?? null;
+                        return (
+                          <li key={agent.session_id} className="cv-row">
+                            <SessionRow
+                              sessionId={agent.session_id}
+                              agentId={agent.agent_id}
+                              name={nameOf(agent)}
+                              line={
+                                named && named !== held
+                                  ? named.title
+                                    ? tr(locale, `上次：${named.title}`, `last: ${named.title}`)
+                                    : null
+                                  : (named?.title ?? agent.task_title)
+                              }
+                              state={recorded.dot}
+                              label={label}
+                              at={at}
+                              attention={agent.attention}
+                              task={
+                                held
+                                  ? `T${held.task_id ?? "?"} ${
+                                      locale === "zh" ? (GATE_STATE_ZH[held.label] ?? held.label) : held.label
+                                    }${held.title ? ` · ${held.title}` : ""}`
+                                  : null
+                              }
+                              selected={agent.session_id === selectedId}
+                              onSelect={onSelect}
+                            />
+                          </li>
+                        );
+                      })}
+                    </ul>
+                    {paginate && (
+                      <div className="px-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => setEndedLimit((curr) => curr + 40)}
+                          className={cx(
+                            "w-full rounded-control px-2 py-1 text-left text-micro font-medium text-muted-foreground hover:bg-surface-hover hover:text-foreground",
+                            FOCUS_RING_INSET,
+                          )}
+                        >
+                          {tr(
+                            locale,
+                            `显示更多会话（剩余 ${visibleAgents.length - displayedAgents.length} 个）`,
+                            `Show more (${visibleAgents.length - displayedAgents.length} more)`,
+                          )}
+                        </button>
+                      </div>
+                    )}
+                  </>
+                );
+              })()
             )}
           </section>
         );
@@ -942,7 +974,7 @@ const DRAWER_FOCUSABLE_SELECTOR =
   'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 /** Compact header + slide-over left Side Tab drawer below the `md` breakpoint. */
-export function MobileNav(
+export const MobileNav = memo(function MobileNav(
   props: Pick<
     SidebarProps,
     | "view"
@@ -1121,7 +1153,7 @@ export function MobileNav(
       )}
     </>
   );
-}
+});
 
 /** 1-click Chinese / English switcher using contrast-checked surface tokens. */
 export function LocaleSwitch({ compact = false }: { compact?: boolean }) {

@@ -3,12 +3,15 @@
 //!
 //! - Validation. Every API answer that succeeded carries a weak `ETag`, a
 //!   hash of what it says; a request whose `If-None-Match` names it gets
-//!   `304 Not Modified` and no body. A clock the answer carries only to say
-//!   when it was made (`generated_at_ms` of `/api/objectives` and
-//!   `/api/attention`, `captured_at_ms` of a pane) is left out of the hash:
-//!   an answer that differs only there is the same answer, read later
-//!   ([`CLOCKS`]). The page keeps what it last read with its tag, sends the
-//!   tag on every poll, and on a 304 knows the answer still holds now.
+//!   `304 Not Modified` and no body. Pure freshness clocks (`generated_at_ms`
+//!   or `captured_at_ms` across [`CLOCKS`] and [`PATTERN_CLOCKS`] — covering
+//!   `/api/overview`, `/api/fleet`, `/api/missions`, `/api/objectives`,
+//!   `/api/approvals`, `/api/context/digest`, `/api/attention`,
+//!   `/api/features`, `/api/objectives/pane`, and `/api/sessions/*/pane`,
+//!   plus sub-minute/sub-MB `health` bucketing in `normalize_fleet_etag`) are
+//!   left out of the hash: an answer that differs only there is the same
+//!   answer, read later. The page keeps what it last read with its tag, sends
+//!   the tag on every poll, and on a 304 knows the answer still holds now.
 //! - Sharing. The boards every open page polls ([`shared`]) are computed
 //!   once per moment: an answer is kept [`SHARE_FOR`] (one second) from
 //!   when its reads began, and a request that accepts an answer that old
@@ -360,43 +363,115 @@ impl Answers {
 }
 
 /// Bounded cache of gzip-compressed payloads keyed by full SHA-256 of the
-/// exact response bytes (so distinct `generated_at_ms` bodies never alias).
+/// exact response bytes (so distinct `generated_at_ms` bodies never alias),
+/// capped by entry count, single-entry compressed size, and total compressed bytes.
 const GZIP_CACHE_MAX: usize = 24;
+const GZIP_CACHE_MAX_ENTRY_BYTES: usize = 512 * 1024;
+const GZIP_CACHE_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Default)]
 struct GzipCache {
+    max_entries: usize,
+    max_entry_bytes: usize,
+    max_total_bytes: usize,
+    total_bytes: usize,
     order: VecDeque<[u8; 32]>,
     entries: HashMap<[u8; 32], Option<Arc<[u8]>>>,
 }
 
-static GZIP_CACHE: LazyLock<Mutex<GzipCache>> = LazyLock::new(|| Mutex::new(GzipCache::default()));
+impl GzipCache {
+    fn new(max_entries: usize, max_entry_bytes: usize, max_total_bytes: usize) -> Self {
+        Self {
+            max_entries,
+            max_entry_bytes,
+            max_total_bytes,
+            total_bytes: 0,
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn entry_len(entry: Option<&Arc<[u8]>>) -> usize {
+        entry.map_or(0, |bytes| bytes.len())
+    }
+
+    fn lookup(&self, digest: &[u8; 32]) -> GzipLookup {
+        match self.entries.get(digest) {
+            Some(entry) => GzipLookup::Hit(entry.clone()),
+            None => GzipLookup::Miss,
+        }
+    }
+
+    #[cfg(test)]
+    fn get(&self, digest: &[u8; 32]) -> Option<Arc<[u8]>> {
+        self.entries.get(digest).and_then(Clone::clone)
+    }
+
+    #[cfg(test)]
+    fn contains(&self, digest: &[u8; 32]) -> bool {
+        self.entries.contains_key(digest)
+    }
+
+    fn insert(&mut self, digest: [u8; 32], compressed: Option<Arc<[u8]>>) -> Option<Arc<[u8]>> {
+        if let Some(hit) = self.entries.get(&digest) {
+            return hit.clone();
+        }
+        let bytes_len = Self::entry_len(compressed.as_ref());
+        if bytes_len > self.max_entry_bytes || bytes_len > self.max_total_bytes {
+            return compressed;
+        }
+        while !self.order.is_empty()
+            && (self.order.len() >= self.max_entries
+                || self.total_bytes.saturating_add(bytes_len) > self.max_total_bytes)
+        {
+            if let Some(evicted) = self.order.pop_front()
+                && let Some(removed) = self.entries.remove(&evicted)
+            {
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(Self::entry_len(removed.as_ref()));
+            }
+        }
+        if self.order.len() < self.max_entries
+            && self.total_bytes.saturating_add(bytes_len) <= self.max_total_bytes
+        {
+            self.total_bytes += bytes_len;
+            self.order.push_back(digest);
+            self.entries.insert(digest, compressed.clone());
+        }
+        compressed
+    }
+}
+
+enum GzipLookup {
+    Hit(Option<Arc<[u8]>>),
+    Miss,
+}
+
+static GZIP_CACHE: LazyLock<Mutex<GzipCache>> = LazyLock::new(|| {
+    Mutex::new(GzipCache::new(
+        GZIP_CACHE_MAX,
+        GZIP_CACHE_MAX_ENTRY_BYTES,
+        GZIP_CACHE_MAX_TOTAL_BYTES,
+    ))
+});
 
 fn cached_gzip(body: &[u8]) -> Option<Arc<[u8]>> {
     if body.len() < gzip::MIN_COMPRESS_BYTES {
         return None;
     }
     let digest: [u8; 32] = Sha256::digest(body).into();
-    if let Some(hit) = GZIP_CACHE
+    if let GzipLookup::Hit(hit) = GZIP_CACHE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .entries
-        .get(&digest)
+        .lookup(&digest)
     {
-        return hit.clone();
+        return hit;
     }
     let compressed = gzip::compress_if_smaller(body).map(Arc::<[u8]>::from);
-    let mut cache = GZIP_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(hit) = cache.entries.get(&digest) {
-        return hit.clone();
-    }
-    if cache.order.len() >= GZIP_CACHE_MAX
-        && let Some(evicted) = cache.order.pop_front()
-    {
-        cache.entries.remove(&evicted);
-    }
-    cache.order.push_back(digest);
-    cache.entries.insert(digest, compressed.clone());
-    compressed
+    GZIP_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(digest, compressed)
 }
 
 /// `Cache-Control` of every API answer: the page asks again every time
@@ -565,6 +640,66 @@ pub(super) fn slim_board(board: &mut Value) {
     }
 }
 
+/// Fields kept on a task's `last_gate` object in `/api/missions?summary=1`.
+const SUMMARY_GATE_FIELDS: &[&str] = &["verdict", "reason", "metric", "candidate", "at_ms"];
+
+/// Fields kept on each entry of a task's `stages` array in `/api/missions?summary=1`.
+const SUMMARY_STAGE_FIELDS: &[&str] = &["stage", "verdict", "at_ms", "took_ms"];
+
+fn pick_fields(value: &mut Value, allowed: &[&str]) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.retain(|key, _| allowed.contains(&key.as_str()));
+    }
+}
+
+/// Summary view of `/api/missions` for `/api/missions?summary=1`: keeps live
+/// mission/task status, counters, halt context, and light stage/gate summaries
+/// needed by Home, Fleet, and Sidebar while stripping full text excerpts and
+/// closed-mission task details to keep polling payloads small.
+pub(super) fn summary_board(board: &mut Value) {
+    let Some(missions) = board.get_mut("missions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for mission in missions {
+        let folded = closed(mission);
+        let Some(tasks) = mission.get_mut("tasks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for task in tasks {
+            trim_texts(
+                task,
+                &["brief", "review_note", "report"],
+                EXCERPT_LINES,
+                EXCERPT_BYTES,
+                false,
+            );
+            let Some(obj) = task.as_object_mut() else {
+                continue;
+            };
+            if folded {
+                if obj.contains_key("stages") {
+                    obj.insert("stages".to_string(), Value::Array(Vec::new()));
+                }
+                if obj.contains_key("last_gate") {
+                    obj.insert("last_gate".to_string(), Value::Null);
+                }
+                if obj.contains_key("activity") {
+                    obj.insert("activity".to_string(), Value::Null);
+                }
+                continue;
+            }
+            if let Some(last_gate) = obj.get_mut("last_gate") {
+                pick_fields(last_gate, SUMMARY_GATE_FIELDS);
+            }
+            if let Some(stages) = obj.get_mut("stages").and_then(Value::as_array_mut) {
+                for stage in stages {
+                    pick_fields(stage, SUMMARY_STAGE_FIELDS);
+                }
+            }
+        }
+    }
+}
+
 /// Lines of an objective's prompt `/api/objectives` sends: more than the four its
 /// card shows. Pointed at, the page reads the whole prompt
 /// (`/api/objectives/<mission>/<id>`) for its title.
@@ -606,8 +741,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Answer, Answers, SHARE_FOR, SWEEP_PAST, accepted_age, answer, excerpt, file_cache_control,
-        key, not_modified, shared, slim_board, slim_rsi, trim_texts,
+        Answer, Answers, GZIP_CACHE_MAX_ENTRY_BYTES, GZIP_CACHE_MAX_TOTAL_BYTES, GzipCache,
+        SHARE_FOR, SWEEP_PAST, accepted_age, answer, cached_gzip, excerpt, file_cache_control, key,
+        not_modified, shared, slim_board, slim_rsi, summary_board, trim_texts,
     };
 
     #[test]
@@ -697,7 +833,11 @@ mod tests {
             .etag
         );
 
-        let fleet_payload = |at: i64, free_bytes: i64, avail_bytes: i64, agent_ms: i64, agents: serde_json::Value| {
+        let fleet_payload = |at: i64,
+                             free_bytes: i64,
+                             avail_bytes: i64,
+                             agent_ms: i64,
+                             agents: serde_json::Value| {
             answer(
                 "/api/fleet",
                 Ok(json!({
@@ -715,12 +855,33 @@ mod tests {
                 "",
             )
         };
-        let f1 = fleet_payload(1_000, 44_206_051_328, 2_139_088_007_168, 37_413_512, json!([]));
-        let f2 = fleet_payload(5_000, 44_205_912_064, 2_139_076_714_496, 37_411_300, json!([]));
-        assert_eq!(f1.etag, f2.etag, "sub-MB / sub-minute fleet jitter keeps ETag");
+        let f1 = fleet_payload(
+            1_000,
+            44_206_051_328,
+            2_139_088_007_168,
+            37_413_512,
+            json!([]),
+        );
+        let f2 = fleet_payload(
+            5_000,
+            44_205_912_064,
+            2_139_076_714_496,
+            37_411_300,
+            json!([]),
+        );
+        assert_eq!(
+            f1.etag, f2.etag,
+            "sub-MB / sub-minute fleet jitter keeps ETag"
+        );
         assert!(f2.body.contains("\"generated_at_ms\":5000"));
         assert!(f2.body.contains("44205912064"));
-        let f_changed = fleet_payload(5_000, 44_205_912_064, 2_139_076_714_496, 37_411_300, json!([{"id": 1}]));
+        let f_changed = fleet_payload(
+            5_000,
+            44_205_912_064,
+            2_139_076_714_496,
+            37_411_300,
+            json!([{"id": 1}]),
+        );
         assert_ne!(f1.etag, f_changed.etag, "agent change updates fleet ETag");
     }
 
@@ -981,7 +1142,11 @@ mod tests {
 
         let items = vec!["\"ok\""; 300].join(",");
         let large_body = format!(r#"{{"missions":[{items}]}}"#);
-        let ans = answer("/api/missions", Ok(serde_json::from_str(&large_body).expect("json")), "");
+        let ans = answer(
+            "/api/missions",
+            Ok(serde_json::from_str(&large_body).expect("json")),
+            "",
+        );
         let etag = ans.etag.clone().expect("etag");
 
         let server = tiny_http::Server::http("127.0.0.1:0").expect("bind test server");
@@ -998,15 +1163,22 @@ mod tests {
         let send_raw = |raw_req: &str| -> Vec<u8> {
             let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
             stream.write_all(raw_req.as_bytes()).expect("write");
-            stream.shutdown(std::net::Shutdown::Write).expect("shutdown");
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("shutdown");
             let mut buf = Vec::new();
             stream.read_to_end(&mut buf).expect("read");
             buf
         };
 
         // 1. Accepts gzip -> Content-Encoding: gzip + Vary: Accept-Encoding + compressed body
-        let raw_gz = send_raw("GET /api/missions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAccept-Encoding: gzip\r\n\r\n");
-        let split = raw_gz.windows(4).position(|w| w == b"\r\n\r\n").expect("http headers");
+        let raw_gz = send_raw(
+            "GET /api/missions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAccept-Encoding: gzip\r\n\r\n",
+        );
+        let split = raw_gz
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("http headers");
         let hdrs = String::from_utf8_lossy(&raw_gz[..split]).to_ascii_lowercase();
         let gz_body = &raw_gz[split + 4..];
         assert!(hdrs.starts_with("http/1.1 200"));
@@ -1015,8 +1187,12 @@ mod tests {
         assert!(gz_body.len() < ans.body.len());
 
         // 2. No Accept-Encoding -> uncompressed plain JSON + Vary: Accept-Encoding
-        let raw_plain = send_raw("GET /api/missions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-        let split2 = raw_plain.windows(4).position(|w| w == b"\r\n\r\n").expect("http headers");
+        let raw_plain =
+            send_raw("GET /api/missions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        let split2 = raw_plain
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("http headers");
         let hdrs2 = String::from_utf8_lossy(&raw_plain[..split2]).to_ascii_lowercase();
         let plain_body = &raw_plain[split2 + 4..];
         assert!(hdrs2.starts_with("http/1.1 200"));
@@ -1028,12 +1204,129 @@ mod tests {
         let raw_304 = send_raw(&format!(
             "GET /api/missions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAccept-Encoding: gzip\r\nIf-None-Match: {etag}\r\n\r\n"
         ));
-        let split3 = raw_304.windows(4).position(|w| w == b"\r\n\r\n").expect("http headers");
+        let split3 = raw_304
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("http headers");
         let hdrs3 = String::from_utf8_lossy(&raw_304[..split3]).to_ascii_lowercase();
         assert!(hdrs3.starts_with("http/1.1 304"));
         assert!(hdrs3.contains("vary: accept-encoding"));
         assert_eq!(&raw_304[split3 + 4..], b"");
 
         handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn gzip_cache_enforces_entry_and_total_byte_budgets_with_fifo_eviction() {
+        assert_eq!(GZIP_CACHE_MAX_ENTRY_BYTES, 512 * 1024);
+        assert_eq!(GZIP_CACHE_MAX_TOTAL_BYTES, 4 * 1024 * 1024);
+
+        let mut cache = GzipCache::new(4, 16, 24);
+        let d1 = [1u8; 32];
+        let d2 = [2u8; 32];
+        let d3 = [3u8; 32];
+        let d_huge = [4u8; 32];
+
+        cache.insert(d1, Some(std::sync::Arc::from(vec![b'a'; 10])));
+        cache.insert(d2, Some(std::sync::Arc::from(vec![b'b'; 10])));
+        assert_eq!(cache.total_bytes, 20);
+        assert!(cache.get(&d1).is_some());
+
+        // Oversized single entry returns payload without entering cache or evicting existing entries.
+        let bypassed = cache.insert(d_huge, Some(std::sync::Arc::from(vec![b'x'; 17])));
+        assert_eq!(bypassed.as_ref().map(|b| b.len()), Some(17));
+        assert!(!cache.contains(&d_huge));
+        assert_eq!(cache.total_bytes, 20);
+
+        // Inserting d3 (10 bytes) pushes total_bytes to 30 > 24, so d1 is FIFO-evicted.
+        cache.insert(d3, Some(std::sync::Arc::from(vec![b'c'; 10])));
+        assert!(!cache.contains(&d1));
+        assert!(cache.contains(&d2));
+        assert!(cache.contains(&d3));
+        assert!(cache.get(&d3).is_some());
+        assert_eq!(cache.total_bytes, 20);
+
+        // Repeated >512B compressible payload gets compressed via global cached_gzip.
+        let large = "hello-spawn-gzip-".repeat(60);
+        let first = cached_gzip(large.as_bytes()).expect("compressed");
+        let second = cached_gzip(large.as_bytes()).expect("cached");
+        assert_eq!(first.as_ref(), second.as_ref());
+    }
+
+    #[test]
+    fn summary_board_strips_closed_mission_details_and_keeps_light_open_summaries() {
+        let mut board = json!({
+            "missions": [
+                {
+                    "id": 10,
+                    "state": "active",
+                    "halted": null,
+                    "tasks": [
+                        {
+                            "id": 101,
+                            "state": "delivered",
+                            "brief": "full brief text",
+                            "report": "full report text",
+                            "review_note": "note",
+                            "activity": {"idle_ms": 120},
+                            "last_gate": {
+                                "verdict": "accepted",
+                                "reason": "ok",
+                                "metric": 1.0,
+                                "candidate": "abc",
+                                "at_ms": 500,
+                                "stdout": "very bulky logs"
+                            },
+                            "stages": [
+                                {"stage": "gate", "verdict": "pass", "at_ms": 500, "took_ms": 42, "details": "huge"}
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "id": 9,
+                    "state": "done",
+                    "halted": null,
+                    "tasks": [
+                        {
+                            "id": 99,
+                            "state": "landed",
+                            "brief": "closed brief",
+                            "report": "closed report",
+                            "review_note": "closed note",
+                            "activity": {"idle_ms": 999},
+                            "last_gate": {"verdict": "accepted", "reason": "ok", "at_ms": 100},
+                            "stages": [{"stage": "gate", "verdict": "pass", "at_ms": 100, "took_ms": 10}]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        summary_board(&mut board);
+        let open_task = &board["missions"][0]["tasks"][0];
+        assert_eq!(open_task["brief"], json!(null));
+        assert_eq!(open_task["brief_bytes"], 15);
+        assert_eq!(open_task["report"], json!(null));
+        assert_eq!(open_task["report_bytes"], 16);
+        assert_eq!(open_task["review_note"], json!(null));
+        assert_eq!(open_task["review_note_bytes"], 4);
+        assert_eq!(open_task["activity"], json!({"idle_ms": 120}));
+        assert_eq!(
+            open_task["last_gate"],
+            json!({"verdict": "accepted", "reason": "ok", "metric": 1.0, "candidate": "abc", "at_ms": 500})
+        );
+        assert_eq!(
+            open_task["stages"],
+            json!([{"stage": "gate", "verdict": "pass", "at_ms": 500, "took_ms": 42}])
+        );
+
+        let closed_task = &board["missions"][1]["tasks"][0];
+        assert_eq!(closed_task["brief"], json!(null));
+        assert_eq!(closed_task["brief_bytes"], 12);
+        assert_eq!(closed_task["report"], json!(null));
+        assert_eq!(closed_task["last_gate"], json!(null));
+        assert_eq!(closed_task["activity"], json!(null));
+        assert_eq!(closed_task["stages"], json!([]));
     }
 }

@@ -321,9 +321,13 @@ test("mergeNodeRows combines /api/nodes and /api/fleet node payloads without los
   assert.deepEqual(mergeNodeRows(null, null), []);
 });
 
-test("NodeRows and FleetView wire build_sha monospace badge tooltip and node_version", () => {
+test("NodeRows and FleetDetailsSection wire build_sha monospace badge tooltip and node_version", () => {
   const nodeRows = readFileSync(new URL("../src/components/fleet/NodeRows.tsx", import.meta.url), "utf8");
   const fleetView = readFileSync(new URL("../src/components/fleet/FleetView.tsx", import.meta.url), "utf8");
+  const fleetDetails = readFileSync(
+    new URL("../src/components/fleet/FleetDetailsSection.tsx", import.meta.url),
+    "utf8",
+  );
   for (const needle of [
     "mergeNodeRows(data, fleetNodes)",
     "buildShaBadge(node)",
@@ -334,7 +338,8 @@ test("NodeRows and FleetView wire build_sha monospace badge tooltip and node_ver
   ]) {
     assert.ok(nodeRows.includes(needle), `NodeRows.tsx includes ${needle}`);
   }
-  assert.ok(fleetView.includes("<NodeRows fleetNodes={data.nodes} />"), "FleetView passes /api/fleet nodes to NodeRows");
+  assert.ok(fleetView.includes("<FleetDetailsSection"), "FleetView renders lazy FleetDetailsSection");
+  assert.ok(fleetDetails.includes("<NodeRows fleetNodes={data.nodes} />"), "FleetDetailsSection passes /api/fleet nodes to NodeRows");
 });
 
 test("enrolled v1 nodes from PR #203 /api/nodes normalize state, last_beat_ms, drained, and telemetry", () => {

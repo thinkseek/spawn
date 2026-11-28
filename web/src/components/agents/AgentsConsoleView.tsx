@@ -516,6 +516,13 @@ export function AgentsConsoleView({
     snapshotState,
     selectedAddress,
   );
+  const parsedStyledLines = useMemo(
+    () =>
+      activeSnapshot && activeSnapshot.fidelity.fidelity === "styled_vt"
+        ? activeSnapshot.fidelity.styled_lines.map((rawLine) => parseStyledLine(rawLine))
+        : null,
+    [activeSnapshot],
+  );
   const selectedSummary = useMemo(
     () => rawAgents.find((a) => a.address === selectedAddress) ?? null,
     [rawAgents, selectedAddress],
@@ -1139,28 +1146,25 @@ export function AgentsConsoleView({
                     <div className="grid h-36 place-items-center text-caption text-faint-foreground">
                       正在获取屏幕快照…
                     </div>
-                  ) : activeSnapshot.fidelity.fidelity === "styled_vt" ? (
+                  ) : parsedStyledLines !== null ? (
                     <pre className="whitespace-pre-wrap break-words font-[inherit]">
-                      {activeSnapshot.fidelity.styled_lines.length === 0 ? (
+                      {parsedStyledLines.length === 0 ? (
                         <span className="text-faint-foreground">(empty screen)</span>
                       ) : (
-                        activeSnapshot.fidelity.styled_lines.map((rawLine, lineIdx) => {
-                          const spans = parseStyledLine(rawLine);
-                          return (
-                            <div key={lineIdx} className="min-h-5">
-                              {spans.length === 0
-                                ? " "
-                                : spans.map((span, spanIdx) => (
-                                    <span
-                                      key={spanIdx}
-                                      className={spanClassName(span)}
-                                    >
-                                      {span.text}
-                                    </span>
-                                  ))}
-                            </div>
-                          );
-                        })
+                        parsedStyledLines.map((spans, lineIdx) => (
+                          <div key={lineIdx} className="min-h-5">
+                            {spans.length === 0
+                              ? " "
+                              : spans.map((span, spanIdx) => (
+                                  <span
+                                    key={spanIdx}
+                                    className={spanClassName(span)}
+                                  >
+                                    {span.text}
+                                  </span>
+                                ))}
+                          </div>
+                        ))
                       )}
                     </pre>
                   ) : (

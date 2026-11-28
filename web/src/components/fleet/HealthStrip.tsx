@@ -544,14 +544,9 @@ export function formatRate(value: number | null): string {
   return value.toFixed(1);
 }
 
-/** Liveness of the always-on agents, as the strip's first cell reads it. */
-export interface Liveness {
-  /** Always-on agents (the supervisor and the residents) and how many run. */
-  total: number;
-  up: number;
-  /** The live always-on agent whose execution started last, and how long ago. */
-  shortest: { name: string; ms: number; since: number } | null;
-}
+import type { Liveness } from "../../ordering";
+
+export type { Liveness };
 
 export const HUMAN_RATE_HINT =
   "Human per agent-hour: each time a person stepped in (a command, a pause, a resume, a task they assigned, a cancel and reassign) in the last 24 h, divided by the hours agents ran in that time; the Home card's figure. Lower is better; 0 means the fleet ran without anyone.";

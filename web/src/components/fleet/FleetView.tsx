@@ -1,49 +1,54 @@
-import { useMemo, useState } from "react";
+import { Suspense, useCallback, useMemo, useState } from "react";
 import { ChevronRight } from "lucide-react";
 
 import type { Alert, PollResult } from "../../api";
-import { fetchAlertsSince, usePoll } from "../../api";
 import { freshAt } from "../../validated";
 import type { Attention } from "../../attention";
-import type { Fleet, FleetAgent } from "../../fleet";
+import type { Fleet } from "../../fleet";
 import { relativeTime } from "../../format";
 import type { NeedItem } from "../../home";
 import {
   actionableHomeNeeds,
   agentNames,
   agentsNow,
-  alertsSpanMs,
-  allNotes,
   buildSystemStatusModel,
   countOutageAlerts,
-  digestSince,
-  digestWindow,
-  latestNotes,
   missionProgressSummary,
   nameTask,
 } from "../../home";
 import { tr } from "../../i18n";
 import type { Missions } from "../../missions";
-import type { AgentGroup, FleetContext } from "../../ordering";
-import { groupAgents, missingAlwaysOn, residentName, snapshotFreshness, usualEngine } from "../../ordering";
+import type { FleetContext, Liveness } from "../../ordering";
+import {
+  effectiveSnapshotFreshness,
+  groupAgents,
+  missingAlwaysOn,
+  residentName,
+  uptimeMs,
+  usualEngine,
+} from "../../ordering";
 import { useNow } from "../rsi/Phase";
+import { RouteErrorBoundary, retryableLazy } from "../RouteErrorBoundary";
 import { FOCUS_RING_INSET, LiveStatus, PageHeader, cx, useLocale } from "../ui";
 import { useAway } from "../home/Home";
-import { HomeRuntimeDetails, HomeView } from "../home/HomeView";
-import { AgentDetail } from "./AgentDetail";
-import { AlwaysOnAgents, uptimeMs } from "./AlwaysOnAgents";
-import { FleetBoard } from "./FleetBoard";
-import { InputBox } from "./InputBox";
-import { CORE_LINES_POLL_MS, fetchCoreLines } from "../home/CoreLines";
-import { coreLinesView } from "../../coreLines";
-import { figureState } from "../../interventions.ts";
-import { INTERVENTIONS_POLL_MS, fetchInterventions } from "./Interventions";
-import { HealthStrip } from "./HealthStrip";
-import { NodeRows } from "./NodeRows";
+import { HomeView } from "../home/HomeView";
 import { ApprovalsQueue } from "./ApprovalsQueue";
-import { DigestPanel } from "./DigestPanel";
 import { MasterComposer } from "./MasterComposer";
-import type { Liveness } from "./HealthStrip";
+
+const loadAgentDetail = () =>
+  import("./AgentDetail").then((mod) => ({ default: mod.AgentDetail }));
+const loadFleetDetailsSection = () => import("./FleetDetailsSection");
+
+const AgentDetail = retryableLazy(loadAgentDetail);
+const FleetDetailsSection = retryableLazy(loadFleetDetailsSection);
+
+export function prefetchAgentDetail(): void {
+  void loadAgentDetail().catch(() => {});
+}
+
+export function prefetchFleetDetails(): void {
+  void loadFleetDetailsSection().catch(() => {});
+}
 
 interface FleetViewProps {
   /** Its agents marked by what is escalated (App, attention.ts). */
@@ -100,27 +105,38 @@ export function FleetView({
   const groups = useMemo(() => groupAgents(agents ?? [], context), [agents, context]);
   const names = useMemo(() => agentNames(agents ?? [], context), [agents, context]);
   const onBoard = agents?.find((agent) => agent.role === "supervisor") ?? null;
-  const supervisor = {
-    session:
-      attention.data?.supervisor?.session_id ?? onBoard?.session_id ?? "session_supervisor",
-    live: attention.data?.supervisor?.live ?? onBoard?.live ?? true,
-  };
+  const supervisor = useMemo(
+    () => ({
+      session:
+        attention.data?.supervisor?.session_id ?? onBoard?.session_id ?? "session_supervisor",
+      live: attention.data?.supervisor?.live ?? onBoard?.live ?? true,
+    }),
+    [
+      attention.data?.supervisor?.session_id,
+      attention.data?.supervisor?.live,
+      onBoard?.session_id,
+      onBoard?.live,
+    ],
+  );
   const engine = useMemo(() => usualEngine(agents ?? []), [agents]);
   const alwaysOn = groups[0].agents;
   const missing = useMemo(() => missingAlwaysOn(agents ?? [], context), [agents, context]);
-  const liveness: Liveness = {
-    total: alwaysOn.length + missing.length,
-    up: alwaysOn.filter((agent) => agent.live).length,
-    shortest: alwaysOn.reduce<Liveness["shortest"]>((best, agent) => {
-      const ms = uptimeMs(agent);
-      if (ms === null || agent.started_at_ms === null || (best && best.ms <= ms)) return best;
-      const name =
-        agent.role === "supervisor"
-          ? "supervisor"
-          : `resident ${residentName(agent, context) ?? agent.agent_id}`;
-      return { name, ms, since: agent.started_at_ms };
-    }, null),
-  };
+  const liveness = useMemo<Liveness>(
+    () => ({
+      total: alwaysOn.length + missing.length,
+      up: alwaysOn.filter((agent) => agent.live).length,
+      shortest: alwaysOn.reduce<Liveness["shortest"]>((best, agent) => {
+        const ms = uptimeMs(agent);
+        if (ms === null || agent.started_at_ms === null || (best && best.ms <= ms)) return best;
+        const name =
+          agent.role === "supervisor"
+            ? "supervisor"
+            : `resident ${residentName(agent, context) ?? agent.agent_id}`;
+        return { name, ms, since: agent.started_at_ms };
+      }, null),
+    }),
+    [alwaysOn, missing.length, context],
+  );
 
   const latestNodeBeatMs = useMemo(() => {
     if (!data?.nodes.length) return null;
@@ -135,7 +151,14 @@ export function FleetView({
   const rawSnapshotAt = data?.generated_at_ms ?? updated;
   const snapshotAt = rawSnapshotAt !== null ? freshAt(rawSnapshotAt, fleet.checkedAt) : null;
   const displayUpdated = updated !== null ? freshAt(updated, fleet.checkedAt) : null;
-  const freshness = snapshotFreshness(snapshotAt, now, latestNodeBeatMs);
+  const freshness = effectiveSnapshotFreshness(
+    rawSnapshotAt,
+    snapshotAt,
+    now,
+    fleet.checkedAt,
+    fleet.error,
+    latestNodeBeatMs,
+  );
   const freshnessLabel = data
     ? freshness.level === "fresh"
       ? displayUpdated
@@ -145,7 +168,17 @@ export function FleetView({
     : tr(locale, "连接中", "Connecting");
 
   const away = useAway();
-  const openAgent = (session: string) => onSelect(session);
+  const openAgent = useCallback(
+    (session: string) => {
+      prefetchAgentDetail();
+      onSelect(session);
+    },
+    [onSelect],
+  );
+  const agentsNowModel = useMemo(
+    () => agentsNow(agents ?? null, context),
+    [agents, context],
+  );
 
   const actionItems = useMemo(
     () => actionableNeeds ?? actionableHomeNeeds(needs),
@@ -235,7 +268,7 @@ export function FleetView({
               actionableNeeds={actionItems}
               approvals={<ApprovalsQueue onOpenAgent={openAgent} />}
               masterControl={<MasterComposer />}
-              agents={agentsNow(agents ?? null, context)}
+              agents={agentsNowModel}
               onOpenAgent={openAgent}
               onShowMissions={onShowMissions}
               onShowAgents={onShowAgents ?? (() => undefined)}
@@ -245,6 +278,8 @@ export function FleetView({
             <button
               type="button"
               onClick={() => setDetailsOpen((value) => !value)}
+              onMouseEnter={prefetchFleetDetails}
+              onFocus={prefetchFleetDetails}
               aria-expanded={detailsOpen}
               className={cx(
                 "mt-1 flex items-center gap-1.5 self-start rounded-control px-2 py-1 text-caption font-medium text-muted-foreground hover:bg-surface-hover hover:text-foreground",
@@ -267,144 +302,67 @@ export function FleetView({
             </button>
 
             {detailsOpen && (
-              <FleetDetailsSection
-                now={now}
-                data={data}
-                attention={attention}
-                context={context}
-                missions={missions}
-                alerts={alerts}
-                agents={agents}
-                awayFromMs={away?.from ?? null}
-                awayAtMs={away?.at ?? null}
-                supervisor={supervisor}
-                alwaysOn={alwaysOn}
-                missing={missing}
-                liveness={liveness}
-                groups={groups}
-                engine={engine}
-                selectedId={selectedId}
-                onSelect={onSelect}
-              />
+              <RouteErrorBoundary resetKey="fleet-details" compact>
+                <Suspense
+                  fallback={
+                    <div
+                      role="status"
+                      className="rounded-card border border-surface-border bg-surface px-4 py-3 text-caption text-muted-foreground"
+                    >
+                      {tr(locale, "正在加载系统详情与工程指标…", "Loading system details & engineering metrics…")}
+                    </div>
+                  }
+                >
+                  <FleetDetailsSection
+                    now={now}
+                    data={data}
+                    attention={attention}
+                    context={context}
+                    missions={missions}
+                    alerts={alerts}
+                    agents={agents}
+                    awayFromMs={away?.from ?? null}
+                    awayAtMs={away?.at ?? null}
+                    supervisor={supervisor}
+                    alwaysOn={alwaysOn}
+                    missing={missing}
+                    liveness={liveness}
+                    groups={groups}
+                    engine={engine}
+                    selectedId={selectedId}
+                    onSelect={onSelect}
+                  />
+                </Suspense>
+              </RouteErrorBoundary>
             )}
           </div>
         </div>
       )}
 
       {selected && (
-        <AgentDetail
-          key={selected.session_id}
-          agent={selected}
-          name={names.get(selected.session_id) ?? null}
-          held={nameTask(selected, context)}
-          onClose={() => onSelect(null)}
-          onOpenTimeline={onOpenTimeline}
-        />
+        <RouteErrorBoundary resetKey={selected.session_id} compact>
+          <Suspense
+            fallback={
+              <div
+                role="status"
+                aria-live="polite"
+                className="fixed bottom-4 right-4 z-50 rounded-card border border-surface-border bg-surface px-3 py-2 text-caption text-muted-foreground shadow-card"
+              >
+                {tr(locale, "正在加载 Agent 详情…", "Loading agent details…")}
+              </div>
+            }
+          >
+            <AgentDetail
+              key={selected.session_id}
+              agent={selected}
+              name={names.get(selected.session_id) ?? null}
+              held={nameTask(selected, context)}
+              onClose={() => onSelect(null)}
+              onOpenTimeline={onOpenTimeline}
+            />
+          </Suspense>
+        </RouteErrorBoundary>
       )}
     </main>
-  );
-}
-
-/** Heavy Home details & engineering metrics: mounted (and polled) ONLY after the owner expands the fold. */
-function FleetDetailsSection({
-  now,
-  data,
-  attention,
-  context,
-  missions,
-  alerts,
-  agents,
-  awayFromMs,
-  awayAtMs,
-  supervisor,
-  alwaysOn,
-  missing,
-  liveness,
-  groups,
-  engine,
-  selectedId,
-  onSelect,
-}: {
-  now: number;
-  data: Fleet;
-  attention: PollResult<Attention>;
-  context: FleetContext;
-  missions: Missions | null;
-  alerts: Alert[] | null;
-  agents: Fleet["agents"] | undefined;
-  awayFromMs: number | null;
-  awayAtMs: number | null;
-  supervisor: { session: string; live: boolean };
-  alwaysOn: Fleet["agents"];
-  missing: ReturnType<typeof missingAlwaysOn>;
-  liveness: Liveness;
-  groups: AgentGroup<FleetAgent>[];
-  engine: ReturnType<typeof usualEngine>;
-  selectedId: string | null;
-  onSelect: (sessionId: string | null) => void;
-}) {
-  const digestSpan = digestWindow(now, awayFromMs);
-  const span = alertsSpanMs(now, digestSpan.since);
-  const digestAlerts = usePoll(`alerts:since:${span}`, (signal) => fetchAlertsSince(span, signal), 60_000);
-  const day = usePoll("interventions-24h", (signal) => fetchInterventions("24h", signal), INTERVENTIONS_POLL_MS);
-  const week = usePoll("interventions-7d", (signal) => fetchInterventions("7d", signal), INTERVENTIONS_POLL_MS);
-  const coreLines = usePoll("core-lines", fetchCoreLines, CORE_LINES_POLL_MS);
-
-  return (
-    <>
-      <DigestPanel />
-      <HomeRuntimeDetails
-        now={now}
-        notes={latestNotes(attention.data, now)}
-        allNotes={allNotes(attention.data)}
-        digest={digestSince(
-          missions,
-          digestAlerts.data ?? alerts,
-          now,
-          digestSpan.since,
-          agents ?? null,
-          digestSpan.away,
-        )}
-        back={awayAtMs}
-        interventions={{
-          day: figureState(day.data, day.error),
-          week: figureState(week.data, week.error),
-        }}
-        coreLines={{
-          answer: coreLines.data,
-          error: coreLines.data ? null : coreLines.error,
-        }}
-        talk={
-          <InputBox
-            key={supervisor.session}
-            sessionId={supervisor.session}
-            to="the supervisor"
-            stopped={!supervisor.live}
-          />
-        }
-      />
-      <AlwaysOnAgents
-        agents={alwaysOn}
-        missing={missing}
-        context={context}
-        usualEngine={engine}
-        selectedId={selectedId}
-        onSelect={onSelect}
-      />
-      <HealthStrip
-        health={data.health}
-        liveness={liveness}
-        diagnostics={coreLines.data ? coreLinesView(coreLines.data).diagnostics : []}
-      />
-      <NodeRows fleetNodes={data.nodes} />
-      <FleetBoard
-        groups={groups}
-        total={data.agents}
-        context={context}
-        usualEngine={engine}
-        selectedId={selectedId}
-        onSelect={onSelect}
-      />
-    </>
   );
 }
