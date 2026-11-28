@@ -20,8 +20,8 @@ use crate::id::{
 };
 use crate::port::{
     ArchiveError, BaseMerge, Branch, BridgeShard, CommandOwnership, CommandQueue, Commit, EventLog,
-    FileWatch, ForkFrom, Hold, Launch, READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError,
-    TerminalHost, TranscriptArchive, WatchError, WorkspaceError, WorkspaceStore,
+    FileWatch, ForkFrom, Hold, Launch, READ_LIMIT, Runner, ServerSeen, ShardCoverage, StoreError,
+    TerminalError, TerminalHost, TranscriptArchive, WatchError, WorkspaceError, WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
 
@@ -203,8 +203,8 @@ pub struct MemoryStore {
     project: String,
     clock: Arc<dyn Clock>,
     state: Mutex<State>,
-    /// Named workers owned by live Bridges over this store.
-    owners: Arc<Mutex<HashSet<String>>>,
+    /// Named workers and shard slots owned by live Bridges over this store.
+    owners: Arc<Mutex<MemoryOwners>>,
     /// Workspaces held now ([`WorkspaceStore::hold`]).
     held: Arc<AtomicUsize>,
 }
@@ -218,8 +218,15 @@ impl Drop for Held {
     }
 }
 
+#[derive(Default)]
+struct MemoryOwners {
+    workers: HashSet<String>,
+    live_shards: std::collections::HashMap<String, (u16, u16)>,
+    shard_total: Option<u16>,
+}
+
 struct MemoryOwnership {
-    owners: Arc<Mutex<HashSet<String>>>,
+    owners: Arc<Mutex<MemoryOwners>>,
     worker: String,
 }
 
@@ -227,10 +234,12 @@ impl CommandOwnership for MemoryOwnership {}
 
 impl Drop for MemoryOwnership {
     fn drop(&mut self) {
-        self.owners
+        let mut owners = self
+            .owners
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.worker);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners.workers.remove(&self.worker);
+        owners.live_shards.remove(&self.worker);
     }
 }
 
@@ -241,7 +250,7 @@ impl MemoryStore {
             project: project.to_string(),
             clock,
             state: Mutex::new(State::default()),
-            owners: Arc::new(Mutex::new(HashSet::new())),
+            owners: Arc::new(Mutex::new(MemoryOwners::default())),
             held: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -513,16 +522,52 @@ impl CommandQueue for MemoryStore {
         &self,
         worker: &str,
     ) -> Result<(Box<dyn CommandOwnership>, usize), StoreError> {
+        self.recover_worker_for_shard(worker, BridgeShard::All)
+    }
+
+    fn recover_worker_for_shard(
+        &self,
+        worker: &str,
+        shard: BridgeShard,
+    ) -> Result<(Box<dyn CommandOwnership>, usize), StoreError> {
+        let (index, total) = shard.index_and_total();
         let ownership = {
             let mut owners = self
                 .owners
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !owners.insert(worker.to_string()) {
+            if owners.workers.contains(worker) {
                 return Err(StoreError::Rejected(format!(
                     "Bridge worker {worker} is still owned by a live process"
                 )));
             }
+            if let Some(active_total) = owners.shard_total
+                && active_total != total
+            {
+                if owners.live_shards.is_empty() {
+                    owners.shard_total = Some(total);
+                } else {
+                    return Err(StoreError::Rejected(format!(
+                        "Bridge shard total {total} conflicts with active shard topology {active_total}"
+                    )));
+                }
+            } else {
+                owners.shard_total = Some(total);
+            }
+            if total > 1
+                && owners
+                    .live_shards
+                    .values()
+                    .any(|&(live_index, live_total)| live_total == total && live_index == index)
+            {
+                return Err(StoreError::Rejected(format!(
+                    "Bridge shard {index}/{total} is already owned by a live worker"
+                )));
+            }
+            owners.workers.insert(worker.to_string());
+            owners
+                .live_shards
+                .insert(worker.to_string(), (index, total));
             MemoryOwnership {
                 owners: self.owners.clone(),
                 worker: worker.to_string(),
@@ -542,6 +587,30 @@ impl CommandQueue for MemoryStore {
             }
         }
         Ok((Box::new(ownership), recovered))
+    }
+
+    fn shard_coverage(&self) -> Result<Option<ShardCoverage>, StoreError> {
+        let owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(total) = owners.shard_total else {
+            return Ok(None);
+        };
+        let present_set: std::collections::BTreeSet<u16> = owners
+            .live_shards
+            .values()
+            .filter_map(|&(index, shard_total)| (shard_total == total).then_some(index))
+            .collect();
+        let present: Vec<u16> = present_set.iter().copied().collect();
+        let missing: Vec<u16> = (0..total)
+            .filter(|idx| !present_set.contains(idx))
+            .collect();
+        Ok(Some(ShardCoverage {
+            total,
+            present,
+            missing,
+        }))
     }
 
     fn submit(
@@ -591,6 +660,24 @@ impl CommandQueue for MemoryStore {
         ttl: Duration,
         shard: BridgeShard,
     ) -> Result<Option<Claimed>, StoreError> {
+        let (_, total) = shard.index_and_total();
+        {
+            let mut owners = self
+                .owners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match owners.shard_total {
+                Some(active_total) if active_total != total => {
+                    return Err(StoreError::Rejected(format!(
+                        "Bridge claim shard total {total} conflicts with active shard topology {active_total}"
+                    )));
+                }
+                None => {
+                    owners.shard_total = Some(total);
+                }
+                Some(_) => {}
+            }
+        }
         let mut state = self.lock();
         let now = self.clock.now();
         let candidate = {

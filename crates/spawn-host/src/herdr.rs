@@ -1881,6 +1881,15 @@ impl TerminalHost for HerdrHost {
         crate::terminal_support::list_dirs_files(self.beneath.as_ref(), dir)
     }
 
+    fn list_dirs_up_to(
+        &self,
+        _workspace: &WorkspaceId,
+        dir: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, TerminalError> {
+        crate::terminal_support::list_dirs_files_up_to(self.beneath.as_ref(), dir, limit)
+    }
+
     fn write_new(
         &self,
         _workspace: &WorkspaceId,
@@ -2305,6 +2314,15 @@ impl TerminalHost for HerdrPool {
 
     fn list_dirs(&self, workspace: &WorkspaceId, dir: &str) -> Result<Vec<String>, TerminalError> {
         self.shards[0].host().list_dirs(workspace, dir)
+    }
+
+    fn list_dirs_up_to(
+        &self,
+        workspace: &WorkspaceId,
+        dir: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, TerminalError> {
+        self.shards[0].host().list_dirs_up_to(workspace, dir, limit)
     }
 
     fn write_new(

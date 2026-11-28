@@ -120,3 +120,22 @@ PostgreSQL instance configured with `max_connections = 30`:
 On larger database servers, any of these variables can be raised explicitly.
 Values must parse as integers `>= 1`; empty strings, `0`, negative numbers,
 or non-integer values fail closed at process startup before binding sockets.
+
+## 4. Bridge throughput, session scanning, and horizontal sharding
+
+The Bridge event loop and `spawn-host` directory scanner expose bounded scaling
+knobs plus fail-closed horizontal sharding configuration read once at startup:
+
+| Variable | Default | Bounds / values | Purpose & notes |
+| --- | --- | --- | --- |
+| `SPAWN_MAX_COMMANDS_PER_TICK` | `64` | `1..=1024` | Max commands claimed per Bridge `work()` tick |
+| `SPAWN_BACKSTOPS_PER_PASS` | `8` | `1..=256` | Max idle session screen/transcript backstops per tick |
+| `SPAWN_MAX_CONCURRENT_MOUNTS` | `16` | `1..=256` | Max workspace mounts allowed in flight concurrently |
+| `SPAWN_MAX_CONCURRENT_CHECKPOINTS` | `16` | `1..=256` | Max turn checkpoints allowed in flight concurrently |
+| `SPAWN_LIST_DIRS_LIMIT` | `512` | `1..=16384` | Max session directories scanned via `TerminalHost::list_dirs_up_to` across production hosts (lifts the legacy 64-dir cap) |
+| `SPAWN_BRIDGE_SHARD` | unset (`All`) | `<index>/<total>` (`0 <= index < total <= 65535`) | Horizontal partition (`64`-bit FNV-1a of `session_id`); auto-sets default `SPAWN_WORKER` to `spawn-worker-shard-<index>-of-<total>` when unset |
+| `SPAWN_BRIDGE_ALLOW_INCOMPLETE_SHARDS` | `false` | `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off` | When `false` (`RequireComplete`), sharded `Bridge::work` refuses to run with `total > 1` until all `[0..total)` partition workers hold live registrations |
+
+Fail-closed rules enforced at Bridge startup and Postgres claim boundaries:
+- Non-empty invalid integer bounds, out-of-range values, whitespace around `SPAWN_BRIDGE_SHARD`, or unrecognized booleans in `SPAWN_BRIDGE_ALLOW_INCOMPLETE_SHARDS` fail closed before connecting or claiming work.
+- Mixed shard totals across workers on the same schema (`All` vs `N/M`, or `M != M'`) and duplicate live workers claiming the same `index/total` slot fail closed (`StoreError::Rejected`). Clean resharding to a new `total` is permitted once all previous shard workers have exited (verified live via PostgreSQL session advisory locks).

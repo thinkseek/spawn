@@ -60,7 +60,7 @@ export async function runWildFileScan(
     body: "{}",
   });
   reportUnauthorizedStatus(response.status);
-  return parseCoverageHttpResponse(response, apiError);
+  return parseCoverageHttpResponse(response, (status, detail) => apiError(status, detail, "write"));
 }
 
 /** POST /api/features/associate: associate one in-scope file with one or more
@@ -79,5 +79,5 @@ export async function associateWildFile(
     body: JSON.stringify({ path, features }),
   });
   reportUnauthorizedStatus(response.status);
-  return parseCoverageHttpResponse(response, apiError);
+  return parseCoverageHttpResponse(response, (status, detail) => apiError(status, detail, "write"));
 }

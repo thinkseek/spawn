@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use postgres::{Client, NoTls};
-use spawn_core::bridge::{Bridge, BridgeConfig, BridgeShard};
+use spawn_core::bridge::{Bridge, BridgeConfig, BridgeShard, ShardCoveragePolicy};
 use spawn_core::command::{Claimed, CommandAction, Outcome, Submission};
 use spawn_core::contract;
 use spawn_core::event::{
@@ -5762,4 +5762,435 @@ fn spawn_claim_shard_respects_exclusive_l0_migration_lock() {
     mig_tx.commit().expect("release L0 migration lock");
     let claimed_id = claimer.join().expect("join blocked claimer");
     assert_eq!(claimed_id, expected_id.0.cast_signed());
+}
+
+fn collect_plan_nodes<'a>(node: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+    out.push(node);
+    if let Some(children) = node.get("Plans").and_then(serde_json::Value::as_array) {
+        for child in children {
+            collect_plan_nodes(child, out);
+        }
+    }
+}
+
+fn assert_idle_shard_explain_zero_scan(client: &mut Client) {
+    let explain_json: serde_json::Value = client
+        .query_one(
+            "explain (analyze, format json)
+             select c.id
+               from spawn_commands c
+              where c.state not in ('finished', 'failed', 'cancelled')
+                and c.shard_total = 2
+                and c.shard_index = 0
+                and (c.lease_until_ms is null or c.lease_until_ms <= spawn_now_ms())
+                and not exists (
+                    select 1 from spawn_commands o
+                     where o.session_id = c.session_id
+                       and o.state not in ('finished', 'failed', 'cancelled')
+                       and o.id < c.id
+                       and not exists (
+                           select 1 from spawn_events w
+                            where w.session_id = o.session_id
+                              and w.source = 'bridge'
+                              and w.source_event_id = 'cmd_' || o.id || ':waiting'
+                       )
+                )
+              order by c.id
+              for update skip locked
+              limit 1",
+            &[],
+        )
+        .expect("explain analyze candidate query")
+        .get(0);
+
+    let root = &explain_json.as_array().expect("explain array")[0]["Plan"];
+    let mut nodes = Vec::new();
+    collect_plan_nodes(root, &mut nodes);
+
+    let seq_scans: Vec<_> = nodes
+        .iter()
+        .filter(|n| {
+            n.get("Node Type").and_then(serde_json::Value::as_str) == Some("Seq Scan")
+                && n.get("Relation Name").and_then(serde_json::Value::as_str)
+                    == Some("spawn_commands")
+        })
+        .collect();
+    assert!(
+        seq_scans.is_empty(),
+        "empty shard claim must never Seq Scan spawn_commands: {explain_json}"
+    );
+
+    let shard_index_scans: Vec<_> = nodes
+        .iter()
+        .filter(|n| {
+            n.get("Index Name").and_then(serde_json::Value::as_str)
+                == Some("spawn_commands_open_shard")
+                && n.get("Node Type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|t| t.contains("Index"))
+        })
+        .collect();
+    assert!(
+        !shard_index_scans.is_empty(),
+        "empty shard claim must probe partial index spawn_commands_open_shard: {explain_json}"
+    );
+    for scan in shard_index_scans {
+        assert_eq!(
+            scan.get("Actual Rows").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "idle shard index probe must return 0 rows: {explain_json}"
+        );
+        assert_eq!(
+            scan.get("Rows Removed by Filter")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            0,
+            "idle shard index probe must filter 0 foreign rows: {explain_json}"
+        );
+        assert_eq!(
+            scan.get("Rows Removed by Index Recheck")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            0,
+            "idle shard index probe must recheck 0 foreign rows: {explain_json}"
+        );
+    }
+}
+
+#[test]
+fn idle_shard_empty_claim_uses_partial_shard_index_without_scanning_foreign_backlog() {
+    let _budget = ApiBudgetGuard::exclusive();
+    let (store, schema) = store("idle_shard_index");
+    let principal = Principal::new("tester").expect("principal");
+    let shard_zero = BridgeShard::partition(0, 2).expect("0/2");
+    let shard_one = BridgeShard::partition(1, 2).expect("1/2");
+
+    let mut foreign_count = 0_usize;
+    let mut seq = 0_u64;
+    while foreign_count < 1_025 {
+        let sid = SessionId::new(format!("session_idle_idx_{seq:05}")).expect("session");
+        let agent = format!("agent_idle_idx_{seq:05}");
+        let idemp = format!("idle-foreign-{seq}");
+        seq += 1;
+        if shard_one.owns_session(&sid) {
+            store
+                .submit(&principal, &start_for(&agent, sid, &idemp))
+                .expect("submit 1/2");
+            foreign_count += 1;
+        }
+    }
+
+    let _own0 = store
+        .recover_worker_for_shard("idle-s0", shard_zero)
+        .expect("recover 0/2");
+    let mut client = admin(&schema);
+    client
+        .batch_execute("analyze spawn_commands;")
+        .expect("analyze spawn_commands");
+
+    assert!(
+        store
+            .claim_for_shard("idle-s0", Duration::from_mins(1), shard_zero)
+            .expect("empty claim on 0/2")
+            .is_none()
+    );
+    assert_idle_shard_explain_zero_scan(&mut client);
+
+    let (owned_agent, owned_session) = loop {
+        let sid = SessionId::new(format!("session_idle_idx_{seq:05}")).expect("session");
+        let agent = format!("agent_idle_idx_{seq:05}");
+        seq += 1;
+        if shard_zero.owns_session(&sid) {
+            break (agent, sid);
+        }
+    };
+    let owned_id = store
+        .submit(
+            &principal,
+            &start_for(&owned_agent, owned_session, "idle-owned-0"),
+        )
+        .expect("submit 0/2 after topology");
+    let tag_row = client
+        .query_one(
+            "select shard_total, shard_index from spawn_commands where id = $1",
+            &[&owned_id.0.cast_signed()],
+        )
+        .expect("query trigger tag");
+    assert_eq!(tag_row.get::<_, Option<i32>>(0), Some(2));
+    assert_eq!(tag_row.get::<_, Option<i32>>(1), Some(0));
+
+    let claimed = store
+        .claim_for_shard("idle-s0", Duration::from_mins(1), shard_zero)
+        .expect("claim 0/2")
+        .expect("claimed owned command");
+    assert_eq!(claimed.command_id, owned_id);
+}
+
+fn assert_sigkill_pruning_and_reshard(
+    schema: &str,
+    store_a: &PostgresStore,
+    store_b: &PostgresStore,
+    mut b0: Bridge,
+    shard_one: BridgeShard,
+    shard_four: BridgeShard,
+) {
+    use spawn_core::port::StoreError;
+
+    let mut client = admin(schema);
+    let store_kill = PostgresStore::connect_in_schema(&url(), schema).expect("connect store_kill");
+    let own_kill = store_kill
+        .recover_worker_for_shard("pg-kill-1", shard_one)
+        .expect("recover before simulated kill");
+    let terminated: bool = client
+        .query_one(
+            "select pg_terminate_backend(l.pid)
+               from spawn_bridge_shards s
+               join pg_locks l
+                 on l.database = (select oid from pg_database where datname = current_database())
+                and l.locktype = 'advisory'
+                and l.classid = 1399957338::oid
+                and l.objsubid = 2
+                and l.granted
+                and (l.objid::bigint - case when l.objid::bigint >= 2147483648
+                                            then 4294967296 else 0 end)::integer = s.lock_key
+              where s.worker = 'pg-kill-1'",
+            &[],
+        )
+        .expect("terminate killed worker backend")
+        .get(0);
+    assert!(terminated);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let cov = store_a.shard_coverage().expect("cov").expect("some");
+        if cov.present == vec![0] && cov.missing == vec![1] {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for killed worker advisory lock cleanup: {cov:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stale_rows: i64 = client
+        .query_one(
+            "select count(*) from spawn_bridge_shards where worker = 'pg-kill-1'",
+            &[],
+        )
+        .expect("stale registration row stays until pruned")
+        .get(0);
+    assert_eq!(stale_rows, 1);
+    assert!(matches!(b0.work(), Err(StoreError::Rejected(_))));
+    drop(own_kill);
+    drop(store_kill);
+
+    let own1 = store_b
+        .recover_worker_for_shard("pg-replacement-1", shard_one)
+        .expect("replacement prunes dead SIGKILL registration and takes 1/2");
+    assert!(
+        store_a
+            .shard_coverage()
+            .expect("cov")
+            .expect("some")
+            .is_complete()
+    );
+
+    drop(own1);
+    drop(b0);
+    let _own_reshard = store_b
+        .recover_worker_for_shard("pg-reshard-0", shard_four)
+        .expect("clean reshard to 0/4 when zero live workers remain");
+    let topology_total: i32 = client
+        .query_one(
+            "select shard_total from spawn_shard_topology where singleton",
+            &[],
+        )
+        .expect("topology total")
+        .get(0);
+    assert_eq!(topology_total, 4);
+    let open_retagged: i64 = client
+        .query_one(
+            "select count(*) from spawn_commands
+              where state not in ('finished', 'failed', 'cancelled') and shard_total <> 4",
+            &[],
+        )
+        .expect("open commands retagged")
+        .get(0);
+    assert_eq!(open_retagged, 0);
+}
+
+#[test]
+fn sharded_bridge_rejects_mixed_totals_duplicate_slots_and_missing_shards_fail_closed() {
+    use spawn_core::port::StoreError;
+
+    let _budget = ApiBudgetGuard::exclusive();
+    let (store_a, schema) = store("shard_guards");
+    let store_a = Arc::new(store_a);
+    let store_b =
+        Arc::new(PostgresStore::connect_in_schema(&url(), schema.name()).expect("connect store_b"));
+    let shard_zero = BridgeShard::partition(0, 2).expect("0/2");
+    let shard_one = BridgeShard::partition(1, 2).expect("1/2");
+    let shard_four = BridgeShard::partition(0, 4).expect("0/4");
+    let principal = Principal::new("tester").expect("principal");
+    let s0_session = (1..1_000_u64)
+        .map(|n| SessionId::new(format!("session_pg_guard_{n}")).expect("session"))
+        .find(|sid| shard_zero.owns_session(sid))
+        .expect("0/2 session");
+    let _cmd = store_a
+        .submit(
+            &principal,
+            &start_for("agent_guard", s0_session, "guard-k1"),
+        )
+        .expect("submit");
+
+    let host = Arc::new(MemoryStore::new("pg-guard-host", Arc::new(SystemClock)));
+    let mut cfg0 = BridgeConfig::new("pg-worker-0a");
+    cfg0.shard = shard_zero;
+    cfg0.shard_coverage_policy = ShardCoveragePolicy::RequireComplete;
+    let mut b0 = Bridge::new(
+        store_a.clone(),
+        store_a.clone(),
+        host.clone(),
+        host.clone(),
+        cfg0,
+    );
+    b0.recover().expect("recover 0/2");
+
+    for (worker, shard) in [
+        ("pg-bad-all", BridgeShard::All),
+        ("pg-bad-4", shard_four),
+        ("pg-dup-0", shard_zero),
+    ] {
+        assert!(matches!(
+            store_b.recover_worker_for_shard(worker, shard),
+            Err(StoreError::Rejected(_))
+        ));
+    }
+    assert!(matches!(
+        store_b.claim("pg-rogue-all", Duration::from_mins(1)),
+        Err(StoreError::Rejected(_))
+    ));
+    assert!(matches!(
+        store_b.claim_for_shard("pg-rogue-4", Duration::from_mins(1), shard_four),
+        Err(StoreError::Rejected(_))
+    ));
+
+    assert!(matches!(b0.work(), Err(StoreError::Rejected(_))));
+    let cov = store_a.shard_coverage().expect("cov").expect("some");
+    assert_eq!((cov.total, cov.present, cov.missing), (2, vec![0], vec![1]));
+
+    let mut cfg1 = BridgeConfig::new("pg-worker-1a");
+    cfg1.shard = shard_one;
+    cfg1.shard_coverage_policy = ShardCoveragePolicy::RequireComplete;
+    let mut b1 = Bridge::new(store_b.clone(), store_b.clone(), host.clone(), host, cfg1);
+    b1.recover().expect("recover 1/2");
+    assert!(
+        store_a
+            .shard_coverage()
+            .expect("cov")
+            .expect("some")
+            .is_complete()
+    );
+    let _ = b0.work().expect("b0 work with full shard coverage");
+
+    drop(b1);
+    assert_sigkill_pruning_and_reshard(
+        schema.name(),
+        &store_a,
+        &store_b,
+        b0,
+        shard_one,
+        shard_four,
+    );
+}
+
+#[test]
+fn concurrent_first_claim_with_mixed_shard_totals_rejects_cleanly_without_deadlock() {
+    use spawn_core::port::StoreError;
+    use std::sync::Barrier;
+
+    let _budget = ApiBudgetGuard::exclusive();
+    let shard_zero_of_2 = BridgeShard::partition(0, 2).expect("0/2");
+    let principal = Principal::new("tester").expect("principal");
+
+    for round in 0..4_u32 {
+        let (store_a, schema) = store(&format!("concurrent_first_claim_{round}"));
+        let store_b =
+            PostgresStore::connect_in_schema(&url(), schema.name()).expect("connect store_b");
+        let session = (1..1_000_u64)
+            .map(|n| SessionId::new(format!("session_conc_{round}_{n}")).expect("session"))
+            .find(|sid| shard_zero_of_2.owns_session(sid))
+            .expect("0/2 session");
+        let _cmd = store_a
+            .submit(
+                &principal,
+                &start_for("agent_conc", session, &format!("conc-k-{round}")),
+            )
+            .expect("submit open command before topology initialization");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let (res_all, res_sharded) = std::thread::scope(|s| {
+            let b_all = Arc::clone(&barrier);
+            let st_a = &store_a;
+            let h_all = s.spawn(move || {
+                b_all.wait();
+                st_a.claim("concurrent-all", Duration::from_mins(1))
+            });
+
+            let b_sharded = Arc::clone(&barrier);
+            let st_b = &store_b;
+            let h_sharded = s.spawn(move || {
+                b_sharded.wait();
+                st_b.claim_for_shard("concurrent-0-of-2", Duration::from_mins(1), shard_zero_of_2)
+            });
+
+            (
+                h_all.join().expect("join all claim"),
+                h_sharded.join().expect("join sharded claim"),
+            )
+        });
+
+        let winning_total = match (res_all, res_sharded) {
+            (Ok(claimed), Err(StoreError::Rejected(_))) => {
+                assert!(
+                    claimed.is_some(),
+                    "round {round}: winning unsharded claim must lease command"
+                );
+                1_i32
+            }
+            (Err(StoreError::Rejected(_)), Ok(claimed)) => {
+                assert!(
+                    claimed.is_some(),
+                    "round {round}: winning 0/2 claim must lease command"
+                );
+                2_i32
+            }
+            (left, right) => panic!(
+                "round {round}: expected exactly one Ok and one Rejected (23P01), got left={left:?}, right={right:?}"
+            ),
+        };
+
+        let mut client = admin(schema.name());
+        let topology_total: i32 = client
+            .query_one(
+                "select shard_total from spawn_shard_topology where singleton",
+                &[],
+            )
+            .expect("topology total")
+            .get(0);
+        assert_eq!(topology_total, winning_total);
+
+        let wrong_open: i64 = client
+            .query_one(
+                "select count(*) from spawn_commands
+                  where state not in ('finished', 'failed', 'cancelled')
+                    and shard_total is distinct from $1",
+                &[&winning_total],
+            )
+            .expect("open command backfill consistency")
+            .get(0);
+        assert_eq!(wrong_open, 0);
+
+        drop((client, store_a, store_b, schema));
+    }
 }

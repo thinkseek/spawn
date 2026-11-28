@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { normalizeAttention, type Attention } from "./attention";
 import {
+  FORBIDDEN_HOST_OR_ORIGIN_MESSAGE,
   TOKEN_KEY,
   chooseToken,
   classifyStorageTokenEvent,
@@ -497,11 +498,13 @@ if (typeof window !== "undefined") {
     if (change.kind === "signed_out") {
       serveToken = null;
       live.stop();
-      emitAuthSync({ kind: "signed_out" });
+      emitAuthSync(change);
       return;
     }
-    serveToken = change.token;
-    emitAuthSync({ kind: "token_updated" });
+    if (change.kind === "token_updated") {
+      serveToken = change.token;
+      emitAuthSync(change);
+    }
   });
 }
 
@@ -512,8 +515,14 @@ export function withoutToken(href: string): string {
   return url.toString();
 }
 
+export type ApiRequestAccess = "read" | "write";
+
 /** Pure error builder for failed API calls (no auth state mutation side effects). */
-export function apiError(status: number, detail = ""): Error {
+export function apiError(
+  status: number,
+  detail = "",
+  access: ApiRequestAccess = "read",
+): Error {
   if (status === 401) {
     const problem = initialTokenProblem ? `${initialTokenProblem} ` : "";
     return new Error(
@@ -524,10 +533,17 @@ export function apiError(status: number, detail = ""): Error {
     );
   }
   if (status === 403) {
+    if (access === "write") {
+      return new Error(
+        detail
+          ? `只读权限受限（HTTP 403）：${detail}`
+          : "只读权限受限（HTTP 403）：当前访问仅限只读操作",
+      );
+    }
     return new Error(
       detail
-        ? `只读权限受限（HTTP 403）：${detail}`
-        : "只读权限受限（HTTP 403）：当前访问仅限只读操作",
+        ? `访问被服务端拒绝（HTTP 403）：${detail}`
+        : FORBIDDEN_HOST_OR_ORIGIN_MESSAGE,
     );
   }
   return new Error(detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}`);
@@ -555,7 +571,7 @@ export function readApi<T>(
     headers: apiHeaders(),
     fail: (status, detail) => {
       reportUnauthorizedStatus(status);
-      return apiError(status, detail);
+      return apiError(status, detail, "read");
     },
   });
 }

@@ -520,6 +520,17 @@ pub(crate) fn list_dirs_files(
     beneath: Option<&crate::beneath::Beneath>,
     dir: &str,
 ) -> Result<Vec<String>, TerminalError> {
+    list_dirs_files_up_to(beneath, dir, LIST_DIRS_LIMIT)
+}
+
+/// [`spawn_core::port::TerminalHost::list_dirs_up_to`] on this machine's files:
+/// identical symlink-safe traversal and newest-first ordering as [`list_dirs_files`],
+/// truncated to `limit` entries rather than [`LIST_DIRS_LIMIT`].
+pub(crate) fn list_dirs_files_up_to(
+    beneath: Option<&crate::beneath::Beneath>,
+    dir: &str,
+    limit: usize,
+) -> Result<Vec<String>, TerminalError> {
     use rustix::fs::{Mode, OFlags};
     if let Some(beneath) = beneath
         && let Some(relative) = beneath.relative(std::path::Path::new(dir))
@@ -527,7 +538,7 @@ pub(crate) fn list_dirs_files(
         let Some(opened) = beneath.open_dir(relative).map_err(TerminalError)? else {
             return Ok(Vec::new());
         };
-        return newest_dirs(opened.descriptor(), dir);
+        return newest_dirs(opened.descriptor(), dir, limit);
     }
     let fd = match rustix::fs::open(
         dir,
@@ -538,12 +549,16 @@ pub(crate) fn list_dirs_files(
         Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
         Err(errno) => return Err(TerminalError(format!("open {dir}: {errno}"))),
     };
-    newest_dirs(&fd, dir)
+    newest_dirs(&fd, dir, limit)
 }
 
 /// The subdirectories of the open directory `fd` (`shown` in errors), as
-/// [`list_dirs_files`] gives them.
-fn newest_dirs(fd: &std::os::fd::OwnedFd, shown: &str) -> Result<Vec<String>, TerminalError> {
+/// [`list_dirs_files_up_to`] gives them.
+fn newest_dirs(
+    fd: &std::os::fd::OwnedFd,
+    shown: &str,
+    limit: usize,
+) -> Result<Vec<String>, TerminalError> {
     use rustix::fs::{AtFlags, FileType};
     let mut entries = rustix::fs::Dir::read_from(fd)
         .map_err(|errno| TerminalError(format!("list {shown}: {errno}")))?;
@@ -571,7 +586,7 @@ fn newest_dirs(fd: &std::os::fd::OwnedFd, shown: &str) -> Result<Vec<String>, Te
         found.push((modified, name.to_string()));
     }
     found.sort_by(|(a, a_name), (b, b_name)| b.cmp(a).then_with(|| a_name.cmp(b_name)));
-    found.truncate(LIST_DIRS_LIMIT);
+    found.truncate(limit);
     Ok(found.into_iter().map(|(_, name)| name).collect())
 }
 
@@ -611,8 +626,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        READ_LIMIT, end_stragglers, list_dirs_files, read_in_workspace, read_local, replace_local,
-        stragglers_beneath, sweepable,
+        READ_LIMIT, end_stragglers, list_dirs_files, list_dirs_files_up_to, read_in_workspace,
+        read_local, replace_local, stragglers_beneath, sweepable,
     };
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -684,6 +699,44 @@ mod tests {
         assert_eq!(listed.len(), spawn_core::port::LIST_DIRS_LIMIT);
         assert_eq!(listed.first().map(String::as_str), Some("c69"));
         assert_eq!(listed.last().map(String::as_str), Some("c06"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_dirs_up_to_scales_past_64_preserving_newest_first_and_security() {
+        let dir = scratch("list-dirs-up-to");
+        let brain = dir.join("brain");
+        std::fs::create_dir_all(&brain).unwrap();
+        for at in 0..150_u64 {
+            let sub = brain.join(format!("conv-{at:03}"));
+            std::fs::create_dir(&sub).unwrap();
+            touch_dir(&sub, 20_000 + at);
+        }
+        std::fs::write(brain.join("ignored-file"), b"data").unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        touch_dir(&outside, 99_999);
+        std::os::unix::fs::symlink(&outside, brain.join("ignored-symlink")).unwrap();
+
+        let path = brain.to_str().unwrap();
+        let all = list_dirs_files_up_to(None, path, 4096).unwrap();
+        assert_eq!(all.len(), 150);
+        assert_eq!(all.first().map(String::as_str), Some("conv-149"));
+        assert_eq!(all.last().map(String::as_str), Some("conv-000"));
+        assert!(!all.contains(&"ignored-file".to_string()));
+        assert!(!all.contains(&"ignored-symlink".to_string()));
+
+        let beneath = crate::beneath::Beneath::new(&dir);
+        let top100 = list_dirs_files_up_to(Some(&beneath), path, 100).unwrap();
+        assert_eq!(top100.len(), 100);
+        assert_eq!(top100.first().map(String::as_str), Some("conv-149"));
+        assert_eq!(top100.last().map(String::as_str), Some("conv-050"));
+
+        assert!(list_dirs_files_up_to(None, path, 0).unwrap().is_empty());
+        assert_eq!(
+            list_dirs_files(None, path).unwrap().len(),
+            spawn_core::port::LIST_DIRS_LIMIT
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

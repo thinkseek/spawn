@@ -209,6 +209,14 @@ impl BridgeShard {
         Self::partition(index, total)
     }
 
+    /// Partition pair `(index, total)` (`All` maps to `(0, 1)`).
+    pub const fn index_and_total(self) -> (u16, u16) {
+        match self {
+            Self::All => (0, 1),
+            Self::Partition(partition) => (partition.index(), partition.total()),
+        }
+    }
+
     /// Deterministic hash ownership check for `session`.
     pub fn owns_session(&self, session: &SessionId) -> bool {
         match *self {
@@ -219,6 +227,36 @@ impl BridgeShard {
             }
         }
     }
+}
+
+/// Live horizontal shard coverage reported by a backing [`CommandQueue`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardCoverage {
+    /// Configured cluster shard count (`total >= 1`).
+    pub total: u16,
+    /// Sorted distinct shard indices currently owned by live workers.
+    pub present: Vec<u16>,
+    /// Sorted shard indices in `0..total` currently missing a live owner.
+    pub missing: Vec<u16>,
+}
+
+impl ShardCoverage {
+    /// True when every shard `0..total` currently has a live owner.
+    pub fn is_complete(&self) -> bool {
+        self.missing.is_empty()
+    }
+}
+
+/// Policy controlling whether a partitioned Bridge (`total > 1`) refuses work
+/// while sibling shard partitions lack a live registered owner.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ShardCoveragePolicy {
+    /// Fail closed before claiming if any sibling partition in `0..total` is missing.
+    RequireComplete,
+    /// Allow claiming this shard's partition even when sibling shards are absent
+    /// (e.g. unit tests or explicit single-shard operator maintenance override).
+    #[default]
+    AllowIncomplete,
 }
 
 impl std::fmt::Display for BridgeShard {
@@ -254,6 +292,26 @@ pub trait CommandQueue: Send + Sync {
         &self,
         worker: &str,
     ) -> Result<(Box<dyn CommandOwnership>, usize), StoreError>;
+
+    /// Acquire exclusive worker ownership for `shard`, failing closed when any
+    /// live worker holds a conflicting `shard_total` or duplicate partition slot.
+    fn recover_worker_for_shard(
+        &self,
+        worker: &str,
+        shard: BridgeShard,
+    ) -> Result<(Box<dyn CommandOwnership>, usize), StoreError> {
+        match shard {
+            BridgeShard::All => self.recover_worker(worker),
+            BridgeShard::Partition(partition) => Err(StoreError::Rejected(format!(
+                "command queue does not support sharded recovery for partition {partition}"
+            ))),
+        }
+    }
+
+    /// Snapshot live shard coverage across `0..total`, if the queue tracks shard topology.
+    fn shard_coverage(&self) -> Result<Option<ShardCoverage>, StoreError> {
+        Ok(None)
+    }
 
     /// Insert a command and its `command.accepted` event atomically. A
     /// repeated `(principal, idempotency_key)` returns the first command and
