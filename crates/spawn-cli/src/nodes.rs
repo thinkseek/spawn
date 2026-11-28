@@ -472,11 +472,16 @@ pub(crate) fn proxy_command(jumps: &[String]) -> Option<String> {
 /// jump hosts `jumps` in order ([`proxy_command`]; each a destination
 /// [`valid_ssh`] takes, checked by the caller, so none is read as an
 /// option), its options before the destination.
-pub(crate) fn ssh_command_via(destination: &str, jumps: &[String], script: &str) -> Command {
+pub(crate) fn ssh_command_via(
+    destination: &str,
+    jumps: &[String],
+    script: &str,
+    forwarded: &crate::config::SshForwardedEnv,
+) -> Command {
     let mut command = Command::new("ssh");
     command.env_clear();
-    for name in ["PATH", "HOME", "USER", "LOGNAME", "SSH_AUTH_SOCK"] {
-        if let Some(value) = std::env::var_os(name) {
+    for (name, value) in &forwarded.entries {
+        if let Some(value) = value {
             command.env(name, value);
         }
     }

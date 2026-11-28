@@ -13,6 +13,8 @@
 //! `SPAWN_REQUIRE_HERDR=1`, which makes a missing `bwrap` (or `herdr`, for
 //! the detection test) a failure.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -161,6 +163,8 @@ impl Fixture {
             inherit_host: spawn_host::HostInheritMode::Off,
             inherit_host_paths: Vec::new(),
             engines: EngineViews::default(),
+            path_env: std::env::var("PATH").ok(),
+            container_env: std::env::var("container").ok(),
         }
     }
 
@@ -678,7 +682,14 @@ struct HerdrSession {
 
 impl HerdrSession {
     fn host(&self) -> HerdrHost {
-        HerdrHost::on_session(&self.program, &self.name)
+        let host_env = spawn_host::TerminalHostEnv {
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            scrubbed_env_keys: spawn_host::TerminalHostEnv::collect_scrubbed_keys(
+                std::env::vars_os().map(|(k, _)| k),
+            ),
+            ..spawn_host::TerminalHostEnv::default()
+        };
+        HerdrHost::on_session(&self.program, &self.name, host_env)
             .expect("a valid session")
             .with_runtime_under(self.runtime.clone())
             .with_terminate_waits(Duration::from_secs(3), Duration::from_secs(2))

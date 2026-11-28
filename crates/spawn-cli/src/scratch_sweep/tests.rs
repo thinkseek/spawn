@@ -1,3 +1,6 @@
+#![cfg(test)]
+#![allow(clippy::disallowed_methods)]
+
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -1592,8 +1595,12 @@ fn a_running_execution_is_read_from_the_store() {
     let url = std::env::var("SPAWN_TEST_DATABASE_URL")
         .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip");
     let schema = spawn_postgres::testing::TestSchema::new("sweep_runs");
-    let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
-        .expect("a schema of its own, migrated");
+    let store = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+        &url,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("a schema of its own, migrated");
     let mut next = 0;
     let mut append = |kind: EventKind| {
         next += 1;

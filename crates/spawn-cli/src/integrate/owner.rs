@@ -1508,6 +1508,7 @@ impl super::Judge {
             None,
             &gate_env,
             super::gate_wall_clock(),
+            &self.host_load_env,
         );
         let ended = super::now_ms();
         // The gate's wall clock, and the mission whose gate judged it, on

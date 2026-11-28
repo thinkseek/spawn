@@ -566,6 +566,7 @@
         ".gitignore",
         "Cargo.lock",
         "Cargo.toml",
+        "clippy.toml",
         "rust-toolchain.toml",
         "rustfmt.toml"
       ],

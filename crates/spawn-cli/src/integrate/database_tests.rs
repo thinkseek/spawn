@@ -1,3 +1,6 @@
+#![cfg(test)]
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,7 +21,12 @@ impl Db {
         // Dropped after the store (declared after it), when the test passes (P19).
         let schema = spawn_postgres::testing::TestSchema::new(case);
         let url = schema.url().to_string();
-        let store = PostgresStore::connect_in_schema(&url, &schema).expect("connect");
+        let store = PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("connect");
         Self {
             store: Arc::new(store),
             url,
@@ -8206,7 +8214,12 @@ fn a_hold_taken_while_a_landing_holds_the_lock_waits_for_its_record() {
     let task = db.reported_task(mission, "l");
     db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
                       "verdict": "accepted", "base": b0, "candidate": "c"}));
-    let owner = PostgresStore::connect_in_schema(&db.url, &db.schema).expect("the owner's CLI");
+    let owner = PostgresStore::connect_in_schema_with_options(
+        &db.url,
+        &db.schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("the owner's CLI");
     let lock = db
         .store
         .landing_hold(task)
@@ -10414,14 +10427,24 @@ fn locking_integrator(db: &Db, tag: &str) -> (Integrator, Gone) {
     let (base, _, _, integrator) = world(tag, "exit 0\n");
     let (url, schema) = (db.url.clone(), db.schema.name().to_string());
     let integrator = integrator.with_connect(Box::new(move || {
-        PostgresStore::connect_in_schema(&url, &schema).map_err(|error| error.to_string())
+        PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .map_err(|error| error.to_string())
     }));
     (integrator, Gone(base))
 }
 
 /// A connection in `db`'s schema.
 fn connection(db: &Db) -> PostgresStore {
-    PostgresStore::connect_in_schema(&db.url, db.schema.name()).expect("connect")
+    PostgresStore::connect_in_schema_with_options(
+        &db.url,
+        db.schema.name(),
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("connect")
 }
 
 /// Objective 221: an idle integrator keeps its lock between passes, so a

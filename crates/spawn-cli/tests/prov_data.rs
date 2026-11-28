@@ -10,6 +10,8 @@
 //! rollback moves `clean` back, the affected shard and merge are rerun, and
 //! the validator passes again.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};

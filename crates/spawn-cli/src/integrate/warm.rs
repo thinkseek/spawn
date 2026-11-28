@@ -624,6 +624,7 @@ fn clean_logs(dir: &Path, days: u64) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{Left, Lost, PID_FILE, Taken, Want, Warms, stat_start_ticks};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};

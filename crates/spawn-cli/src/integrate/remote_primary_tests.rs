@@ -4,6 +4,9 @@
 //! a real ledger (`SPAWN_TEST_DATABASE_URL`, a schema of each test's own)
 //! with nodes simulated as the gateway would drive them.
 
+#![cfg(test)]
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

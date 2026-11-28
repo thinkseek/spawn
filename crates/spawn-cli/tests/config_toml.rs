@@ -2,6 +2,8 @@
 //! `SecretRef`, env resolution, secret redaction), and the `spawn config` /
 //! `spawn doctor` / `--config` CLI commands.
 
+#![allow(clippy::disallowed_methods)]
+
 #[allow(dead_code)]
 #[path = "../src/toml_parser.rs"]
 mod toml_parser;

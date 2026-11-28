@@ -862,6 +862,7 @@ fn shown(files: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{Merge, conflict_note, delivery_note, into_workspace, into_workspace_when};
     use crate::push::{Pushed, Pusher, push_branch};
     use crate::sources::{ensure_mirror, fetch_pushed_into, test_git as git};
@@ -1218,8 +1219,12 @@ mod tests {
             // Dropped after the store (declared after it), when the test passes (P19).
             let schema = spawn_postgres::testing::TestSchema::new(case);
             let url = schema.url().to_string();
-            let store =
-                spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect");
+            let store = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect");
             Self {
                 store: std::sync::Arc::new(store),
                 url,

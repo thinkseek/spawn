@@ -2,6 +2,7 @@
 //! (`SPAWN_TEST_DATABASE_URL`), and every case runs in a schema of its own.
 
 #![allow(dead_code)]
+#![allow(clippy::disallowed_methods)]
 
 use postgres::{Client, NoTls};
 use spawn_postgres::PostgresStore;

@@ -3885,6 +3885,7 @@ pub(crate) fn verify_store_events(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{
         R2, Settings, Stamp, Tier, bundle_compression, bundle_stamps, copy_events, full_bundle,
         get_options, get_pause_secs, is_plain_md5, md5_hex, not_locked_forever, object_length,

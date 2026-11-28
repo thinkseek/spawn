@@ -278,7 +278,7 @@ impl GitWorkspace {
             repo: repo.as_ref().to_path_buf(),
             root: crate::root::canonical_root(root.as_ref()),
             git: "git".to_string(),
-            max_file_bytes: max_file_bytes(std::env::var("SPAWN_MAX_FILE_MB").ok().as_deref()),
+            max_file_bytes: max_file_bytes(None),
         }
     }
 
@@ -288,7 +288,7 @@ impl GitWorkspace {
     }
 
     /// The same store with a size cap of `bytes` for one file in a
-    /// checkpoint instead of the one `SPAWN_MAX_FILE_MB` sets.
+    /// checkpoint instead of [`crate::workspace_rules::DEFAULT_MAX_FILE_MB`].
     #[must_use]
     pub fn with_max_file_bytes(mut self, bytes: u64) -> Self {
         self.max_file_bytes = bytes;

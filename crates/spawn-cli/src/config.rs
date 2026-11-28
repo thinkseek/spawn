@@ -85,6 +85,34 @@ pub(crate) fn load_credential_secret(
 }
 
 /// Resolve `$CREDENTIALS_DIRECTORY/<id>` as a validated [`SecretString`].
+/// Process environment boundary primitive: reads one UTF-8 env var at the CLI edge.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn process_var(name: &str) -> Result<String, std::env::VarError> {
+    std::env::var(name)
+}
+
+/// Process environment boundary primitive: reads one raw `OsString` env var at the CLI edge.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn process_var_os(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
+}
+
+/// Process environment boundary primitive: collects all process env var keys at the CLI edge.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn process_var_keys() -> Vec<std::ffi::OsString> {
+    std::env::vars_os().map(|(key, _)| key).collect()
+}
+
+/// Lookup adapter passed to `config_file` without introducing a crate dependency edge.
+pub(crate) fn process_env_for_config(name: &str) -> Option<String> {
+    process_var(name).ok()
+}
+
+/// Returns whether a process environment variable is present (including empty values).
+pub(crate) fn has_env_var(name: &str) -> bool {
+    process_var_os(name).is_some()
+}
+
 pub(crate) fn credential_secret(id: &str) -> Result<Option<SecretString>, String> {
     load_credential_secret(
         env_value("CREDENTIALS_DIRECTORY").as_deref().map(Path::new),
@@ -93,7 +121,144 @@ pub(crate) fn credential_secret(id: &str) -> Result<Option<SecretString>, String
 }
 
 pub(crate) fn env_value(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
+    process_var(name).ok().filter(|value| !value.is_empty())
+}
+
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    process_var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+pub(crate) fn workspace_root_dir() -> Option<PathBuf> {
+    process_var_os("SPAWN_WORKSPACE_ROOT")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+pub(crate) fn data_root_dir() -> Option<PathBuf> {
+    process_var_os("SPAWN_DATA_ROOT")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+pub(crate) fn workspace_max_file_bytes() -> u64 {
+    spawn_host::workspace_rules::max_file_bytes(process_var("SPAWN_MAX_FILE_MB").ok().as_deref())
+}
+
+pub(crate) fn collector_mask_config() -> spawn_host::CollectorMaskConfig {
+    spawn_host::CollectorMaskConfig {
+        tool: process_var_os("SPAWN_ARCHIVE_LOCATIONS_TOOL")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        sandbox: process_var("SPAWN_GATE_SANDBOX").ok(),
+    }
+}
+
+pub(crate) fn herdr_discovery_env() -> spawn_host::HerdrDiscoveryEnv {
+    spawn_host::HerdrDiscoveryEnv {
+        hc_socket: env_value("HC_SOCKET")
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from),
+        xdg_runtime_dir: process_var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+    }
+}
+
+pub(crate) fn terminal_host_env() -> spawn_host::TerminalHostEnv {
+    spawn_host::TerminalHostEnv {
+        home: home_dir(),
+        xdg_state_home: env_value("XDG_STATE_HOME").map(PathBuf::from),
+        xdg_config_home: env_value("XDG_CONFIG_HOME").map(PathBuf::from),
+        xdg_runtime_dir: env_value("XDG_RUNTIME_DIR").map(PathBuf::from),
+        launch_clear_limit: Some(spawn_host::herdr::launch_clear_limit_from(
+            env_value("SPAWN_HERDR_LAUNCH_CLEAR_MS").as_deref(),
+        )),
+        scrubbed_env_keys: spawn_host::TerminalHostEnv::collect_scrubbed_keys(process_var_keys()),
+    }
+}
+
+pub(crate) fn serve_local_open() -> bool {
+    process_var("SPAWN_SERVE_LOCAL_OPEN").is_ok_and(|value| value == "1")
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ServePoolEnv {
+    pub(crate) reads: Option<String>,
+    pub(crate) writes: Option<String>,
+    pub(crate) node: Option<String>,
+    pub(crate) events: Option<String>,
+}
+
+impl ServePoolEnv {
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
+        match name {
+            "SPAWN_SERVE_READS_POOL" => self.reads.as_deref(),
+            "SPAWN_SERVE_WRITES_POOL" => self.writes.as_deref(),
+            "SPAWN_SERVE_NODE_POOL" => self.node.as_deref(),
+            "SPAWN_SERVE_EVENTS_POOL" => self.events.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn serve_pool_env() -> ServePoolEnv {
+    ServePoolEnv {
+        reads: process_var("SPAWN_SERVE_READS_POOL").ok(),
+        writes: process_var("SPAWN_SERVE_WRITES_POOL").ok(),
+        node: process_var("SPAWN_SERVE_NODE_POOL").ok(),
+        events: process_var("SPAWN_SERVE_EVENTS_POOL").ok(),
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SshForwardedEnv {
+    pub(crate) entries: [(&'static str, Option<std::ffi::OsString>); 5],
+}
+
+pub(crate) fn ssh_forwarded_env() -> SshForwardedEnv {
+    SshForwardedEnv {
+        entries: [
+            ("PATH", process_var_os("PATH")),
+            ("HOME", process_var_os("HOME")),
+            ("USER", process_var_os("USER")),
+            ("LOGNAME", process_var_os("LOGNAME")),
+            ("SSH_AUTH_SOCK", process_var_os("SSH_AUTH_SOCK")),
+        ],
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GateLoadEnv {
+    pub(crate) max_load: Option<String>,
+    pub(crate) max_load_per_core: Option<String>,
+    pub(crate) load_backoff_ms: Option<String>,
+    pub(crate) load_backoff_attempts: Option<String>,
+    pub(crate) load_retries: Option<String>,
+}
+
+impl GateLoadEnv {
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
+        match name {
+            "SPAWN_GATE_MAX_LOAD" => self.max_load.as_deref(),
+            "SPAWN_GATE_MAX_LOAD_PER_CORE" => self.max_load_per_core.as_deref(),
+            "SPAWN_GATE_LOAD_BACKOFF_MS" => self.load_backoff_ms.as_deref(),
+            "SPAWN_GATE_LOAD_BACKOFF_ATTEMPTS" => self.load_backoff_attempts.as_deref(),
+            "SPAWN_GATE_LOAD_RETRIES" => self.load_retries.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn gate_load_env() -> GateLoadEnv {
+    GateLoadEnv {
+        max_load: process_var("SPAWN_GATE_MAX_LOAD").ok(),
+        max_load_per_core: process_var("SPAWN_GATE_MAX_LOAD_PER_CORE").ok(),
+        load_backoff_ms: process_var("SPAWN_GATE_LOAD_BACKOFF_MS").ok(),
+        load_backoff_attempts: process_var("SPAWN_GATE_LOAD_BACKOFF_ATTEMPTS").ok(),
+        load_retries: process_var("SPAWN_GATE_LOAD_RETRIES").ok(),
+    }
 }
 
 /// How long a message may go untaken before it is said not taken
@@ -176,8 +341,8 @@ pub(crate) fn database_url_secret() -> Result<SecretString, String> {
 /// Resolve libpq passfile location at the CLI boundary (`PGPASSFILE` else `$HOME/.pgpass`).
 pub(crate) fn pg_passfile() -> Option<PathBuf> {
     spawn_postgres::resolve_passfile_path(
-        std::env::var_os("PGPASSFILE").as_deref(),
-        std::env::var_os("HOME").as_deref(),
+        process_var_os("PGPASSFILE").as_deref(),
+        process_var_os("HOME").as_deref(),
     )
 }
 
@@ -499,6 +664,8 @@ pub(crate) struct WorkspaceSettings {
     pub(crate) cas_dedup: bool,
     /// Opt-in D6 runtime configuration (`SPAWN_D6_*`).
     pub(crate) d6: D6RuntimeConfig,
+    /// File size cap (`SPAWN_MAX_FILE_MB`) applied to checkpoints in the opened store.
+    pub(crate) max_file_bytes: u64,
 }
 
 impl WorkspaceSettings {
@@ -539,6 +706,7 @@ impl WorkspaceSettings {
             active,
             cas_dedup,
             d6: D6RuntimeConfig::default(),
+            max_file_bytes: spawn_host::workspace_rules::max_file_bytes(None),
         })
     }
 
@@ -546,6 +714,13 @@ impl WorkspaceSettings {
     #[must_use]
     pub(crate) fn with_d6(mut self, d6: D6RuntimeConfig) -> Self {
         self.d6 = d6;
+        self
+    }
+
+    /// Override the maximum checkpoint file size cap in bytes.
+    #[must_use]
+    pub(crate) fn with_max_file_bytes(mut self, max_file_bytes: u64) -> Self {
+        self.max_file_bytes = max_file_bytes;
         self
     }
 
@@ -561,6 +736,7 @@ impl WorkspaceSettings {
         let configured = workspace_backend(env_value("SPAWN_WORKSPACE_BACKEND").as_deref())?;
         let cas = cas_dedup(env_value("SPAWN_CAS_DEDUP").as_deref())?;
         let d6 = D6RuntimeConfig::from_env()?;
+        let max_file_bytes = workspace_max_file_bytes();
         let mut resolved = RESOLVED
             .get_or_init(Default::default)
             .lock()
@@ -568,7 +744,9 @@ impl WorkspaceSettings {
         resolved
             .entry(root.to_path_buf())
             .or_insert_with(|| {
-                let settings = Self::resolve(configured, cas, root, &Probes::host())?.with_d6(d6);
+                let settings = Self::resolve(configured, cas, root, &Probes::host())?
+                    .with_d6(d6)
+                    .with_max_file_bytes(max_file_bytes);
                 if let Some(existing) = spawn_host::root_backend(root).map_err(|error| {
                     format!("read workspace backend under {}: {error}", root.display())
                 })? && !spawn_host::workspace::backends_compatible(existing, settings.active)
@@ -651,6 +829,7 @@ impl WorkspaceSettings {
             active,
             cas_dedup: cas,
             d6: D6RuntimeConfig::default(),
+            max_file_bytes: spawn_host::workspace_rules::max_file_bytes(None),
         });
         serde_json::json!({
             "configured": configured.name(),
@@ -674,7 +853,8 @@ impl WorkspaceSettings {
         );
         match self.active {
             spawn_host::WorkspaceBackend::D6 => {
-                let mut opts = spawn_host::workspace::D6StoreOptions::new(cas, ledger);
+                let mut opts = spawn_host::workspace::D6StoreOptions::new(cas, ledger)
+                    .with_max_file_bytes(self.max_file_bytes);
                 if let Some(policy) = self.d6.l1_policy() {
                     opts = opts.with_l1_policy(policy);
                 }
@@ -690,6 +870,7 @@ impl WorkspaceSettings {
                     cas,
                     ledger,
                 )
+                .with_max_file_bytes(self.max_file_bytes)
                 .with_strict_fail_closed(self.d6.strict_fail_closed);
                 if let Some(policy) = self.d6.l1_policy() {
                     opts = opts.with_l1_policy(policy);
@@ -699,12 +880,15 @@ impl WorkspaceSettings {
             other => Ok(match other {
                 spawn_host::WorkspaceBackend::Cow => {
                     spawn_host::LocalWorkspaceStore::cow(repo, root)
+                        .with_max_file_bytes(self.max_file_bytes)
                 }
                 #[cfg(target_os = "linux")]
                 spawn_host::WorkspaceBackend::Overlay => spawn_host::LocalWorkspaceStore::Overlay(
-                    spawn_host::OverlayWorkspace::new(repo, root),
+                    spawn_host::OverlayWorkspace::new(repo, root)
+                        .with_max_file_bytes(self.max_file_bytes),
                 ),
-                _ => spawn_host::LocalWorkspaceStore::git(repo, root),
+                _ => spawn_host::LocalWorkspaceStore::git(repo, root)
+                    .with_max_file_bytes(self.max_file_bytes),
             }),
         }
     }
@@ -729,11 +913,13 @@ impl WorkspaceSettings {
         root: &std::path::Path,
     ) -> spawn_host::LocalWorkspaceStore {
         match self.active {
-            spawn_host::WorkspaceBackend::Cow => spawn_host::LocalWorkspaceStore::cow(repo, root),
+            spawn_host::WorkspaceBackend::Cow => spawn_host::LocalWorkspaceStore::cow(repo, root)
+                .with_max_file_bytes(self.max_file_bytes),
             #[cfg(target_os = "linux")]
             // Supported: [`Self::resolve`] asked the kernel.
             spawn_host::WorkspaceBackend::Overlay => spawn_host::LocalWorkspaceStore::Overlay(
-                spawn_host::OverlayWorkspace::new(repo, root),
+                spawn_host::OverlayWorkspace::new(repo, root)
+                    .with_max_file_bytes(self.max_file_bytes),
             ),
             spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow => {
                 let ledger: spawn_host::workspace::DynRefLedger =
@@ -741,7 +927,8 @@ impl WorkspaceSettings {
                 self.build_d6_store(repo, root, ledger)
                     .unwrap_or_else(|error| panic!("{error}"))
             }
-            _ => spawn_host::LocalWorkspaceStore::git(repo, root),
+            _ => spawn_host::LocalWorkspaceStore::git(repo, root)
+                .with_max_file_bytes(self.max_file_bytes),
         }
     }
 
@@ -1252,24 +1439,30 @@ pub(crate) fn terminal_host() -> Result<spawn_host::LocalTerminalHost, String> {
     let mode = herdr_mode(env_value("SPAWN_HERDR_MODE").as_deref())?;
     let session = env_or("SPAWN_HERDR_SESSION", spawn_host::herdr::DEFAULT_SESSION);
     let shards = herdr_shards(env_value("SPAWN_HERDR_SHARDS").as_deref())?;
+    let host_env = terminal_host_env();
     Ok(match (mode, shards) {
         (HerdrMode::Core, 1) => spawn_host::LocalTerminalHost::HerdrCore(
-            spawn_host::HerdrCoreHost::on_session(&sibling_spawn_hc(), &session)
+            spawn_host::HerdrCoreHost::on_session(&sibling_spawn_hc(), &session, host_env)
                 .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
         ),
         (HerdrMode::Core, count) => spawn_host::LocalTerminalHost::HerdrPool(
-            spawn_host::HerdrPool::on_core_session(&sibling_spawn_hc(), &session, count)
+            spawn_host::HerdrPool::on_core_session(&sibling_spawn_hc(), &session, count, &host_env)
                 .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
         ),
         (HerdrMode::Legacy, 1) => spawn_host::LocalTerminalHost::Herdr(
-            spawn_host::HerdrHost::on_session(&env_or("SPAWN_HERDR_PROGRAM", "herdr"), &session)
-                .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
+            spawn_host::HerdrHost::on_session(
+                &env_or("SPAWN_HERDR_PROGRAM", "herdr"),
+                &session,
+                host_env,
+            )
+            .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
         ),
         (HerdrMode::Legacy, count) => spawn_host::LocalTerminalHost::HerdrPool(
             spawn_host::HerdrPool::on_session(
                 &env_or("SPAWN_HERDR_PROGRAM", "herdr"),
                 &session,
                 count,
+                &host_env,
             )
             .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
         ),

@@ -89,8 +89,8 @@ impl PoolConfig {
         })
     }
 
-    pub(crate) fn from_process_env() -> Result<Self, String> {
-        Self::from_env(|name| std::env::var(name).ok())
+    pub(crate) fn from_serve_pool_env(env: &crate::config::ServePoolEnv) -> Result<Self, String> {
+        Self::from_env(|name| env.get(name).map(str::to_string))
     }
 }
 
@@ -901,7 +901,8 @@ pub(crate) fn run(flags: &Flags) -> Result<i32, String> {
     };
     crate::cost::Prices::from_env()?;
     crate::config::message_taken_ms();
-    let pool_config = PoolConfig::from_process_env()?;
+    let pool_env = crate::config::serve_pool_env();
+    let pool_config = PoolConfig::from_serve_pool_env(&pool_env)?;
     let owner_url = env_value("SPAWN_DATABASE_URL")
         .ok_or_else(|| "SPAWN_DATABASE_URL is required at IPC server startup".to_string())?;
     let urls = RoleUrls::from_owner(&owner_url)?;

@@ -58,11 +58,11 @@ const MOST_WAIT: Duration = Duration::from_mins(5);
 /// loop's passes, on a thread of its own at nice 19 with its own
 /// connection: once at start, then every [`EVERY`]. The engines' project
 /// directories (those of `root`, the workspace root) are skipped.
-pub(crate) fn start(root: Option<&Path>, prices: &Prices) {
-    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+pub(crate) fn start(home: Option<PathBuf>, root: Option<&Path>, prices: &Prices) {
+    let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) else {
         return;
     };
-    let projects = PathBuf::from(home).join(".claude").join("projects");
+    let projects = home.join(".claude").join("projects");
     let skip = root.map(engine_prefix);
     let prices = prices.clone();
     let spawned = std::thread::Builder::new()
@@ -470,6 +470,7 @@ pub(super) fn read_file(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};

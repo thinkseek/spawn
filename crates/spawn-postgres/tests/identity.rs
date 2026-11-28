@@ -165,7 +165,12 @@ fn a_migration_over_an_existing_log_records_its_pairs_and_reports_broken_ones() 
     assert_eq!(count, 5, "the log is not changed");
 
     // Writes go on for the pairs that stand, and stop for the broken ones.
-    let store = PostgresStore::connect_in_schema(&common::url(), &schema).expect("migrate again");
+    let store = PostgresStore::connect_in_schema_with_options(
+        &common::url(),
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("migrate again");
     drop(store);
     let append = |client: &mut Client, agent: &str, session: &str| {
         client.execute(

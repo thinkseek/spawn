@@ -1575,6 +1575,7 @@ pub(crate) fn merge_main_before(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{Escalation, Facts, FailedResume, Sent, Why, decide, decide_with};
     use crate::deliver::Work;
     use spawn_core::command::CommandAction;
@@ -3430,7 +3431,12 @@ mod tests {
         let schema = spawn_postgres::testing::TestSchema::new("ext_main_dispatch");
         let url = schema.url().to_string();
         let store = std::sync::Arc::new(
-            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+            spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect"),
         );
         let admin = || {
             let mut c = postgres::Client::connect(&url, postgres::NoTls).expect("client");

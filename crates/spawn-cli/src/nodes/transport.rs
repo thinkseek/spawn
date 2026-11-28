@@ -185,7 +185,15 @@ pub(crate) fn probe_route(route: &Route, op: Op, timeout: Duration) -> Result<St
             if !super::valid_ssh(destination) || !jumps.iter().all(|jump| super::valid_ssh(jump)) {
                 return Err("not an ssh destination".to_string());
             }
-            bounded(ssh_command_via(destination, jumps, op.script()), timeout)
+            bounded(
+                ssh_command_via(
+                    destination,
+                    jumps,
+                    op.script(),
+                    &crate::config::ssh_forwarded_env(),
+                ),
+                timeout,
+            )
         }
     }
 }

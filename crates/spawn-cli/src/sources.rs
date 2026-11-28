@@ -652,7 +652,8 @@ pub(crate) fn open_d6_workspace_borrowed<'a>(
             .map_err(|error| format!("open D6 CAS store at {}: {error}", cas_dir.display()))?,
     );
     let ledger = Arc::new(BorrowedPgRefLedger::new(pg));
-    let mut store = D6Workspace::new(repo.to_string_lossy().into_owned(), root, cas, ledger);
+    let mut store = D6Workspace::new(repo.to_string_lossy().into_owned(), root, cas, ledger)
+        .with_max_file_bytes(crate::config::workspace_max_file_bytes());
     if let Some(policy) = d6_cfg.l1_policy() {
         store = store.with_l1_policy(policy);
     }
@@ -2174,6 +2175,7 @@ impl Drop for MissionWorkspaces {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{
         MissionSource, Routed, commit_routed, ensure_mirror, fetch_pushed_into, mirror_name,
         mirror_path, port_is_digits, receives_branches, restore_published, source_readable,
@@ -3259,8 +3261,12 @@ mod tests {
         );
         let schema = spawn_postgres::testing::TestSchema::new("backends");
         let store = std::sync::Arc::new(
-            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
-                .expect("connect and migrate"),
+            spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect and migrate"),
         );
         let base =
             std::env::temp_dir().join(format!("spawn-sources-backends-{}", std::process::id()));
@@ -3607,7 +3613,12 @@ mod tests {
 
         let schema = spawn_postgres::testing::TestSchema::new("mw_d6_shadow_strict");
         let pg = std::sync::Arc::new(
-            spawn_postgres::PostgresStore::connect_in_schema(url, &schema).expect("connect"),
+            spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect"),
         );
         let strict_repo = backend_repo(&base.join("strict-src"));
         let root = base.join("shadow-strict-root");
@@ -3654,7 +3665,12 @@ mod tests {
         );
         let schema = spawn_postgres::testing::TestSchema::new("mw_d6_shadow");
         let store = std::sync::Arc::new(
-            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+            spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect"),
         );
         let base = std::env::temp_dir().join(format!(
             "spawn-sources-d6-shadow-{}-{:?}",
@@ -3715,13 +3731,8 @@ mod tests {
     fn mission_workspaces_d6_native_lifecycle_with_l1_tmpfs_and_zero_git() {
         use crate::config::{D6RuntimeConfig, Probes, WorkspaceBackend, WorkspaceSettings};
 
-        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
-            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
-        );
         let schema = spawn_postgres::testing::TestSchema::new("mw_d6_native");
-        let store = std::sync::Arc::new(
-            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
-        );
+        let store = std::sync::Arc::new(schema.store());
         let base = std::env::temp_dir().join(format!(
             "spawn-sources-d6-native-{}-{:?}",
             std::process::id(),
@@ -3842,7 +3853,12 @@ mod tests {
         );
         let schema = spawn_postgres::testing::TestSchema::new("d6_pin_worker");
         let store = std::sync::Arc::new(
-            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+            spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect"),
         );
         let base = std::env::temp_dir().join(format!(
             "spawn-sources-d6-pin-{}-{:?}",
@@ -4070,7 +4086,12 @@ mod tests {
         );
         let schema = spawn_postgres::testing::TestSchema::new("d6_retire_adapters");
         let store = std::sync::Arc::new(
-            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+            spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect"),
         );
         let base = std::env::temp_dir().join(format!(
             "spawn-sources-retire-{}-{:?}",
@@ -4230,7 +4251,12 @@ mod tests {
         );
         let schema = spawn_postgres::testing::TestSchema::new("d6_recutover");
         let store = std::sync::Arc::new(
-            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+            spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect"),
         );
         let ledger = super::PostgresRefLedger::new(std::sync::Arc::clone(&store));
 
@@ -4515,7 +4541,12 @@ mod tests {
         let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
             "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
         );
-        let pg = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("test pg");
+        let pg = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("test pg");
         let ledger = super::PostgresRefLedger::new(std::sync::Arc::new(pg));
         let mut cutover = spawn_host::ProjectCutover::new("proj-storage-border", &bare, &d6_root);
         run_cutover_steps(&mut cutover, &cas, &ledger, &border, "storage test");
@@ -4582,7 +4613,12 @@ mod tests {
         );
         let schema = spawn_postgres::testing::TestSchema::new(schema_name);
         let pg = std::sync::Arc::new(
-            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+            spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect"),
         );
         let cas = std::sync::Arc::new(spawn_host::CasMerkleStore::open(cas_dir).expect("open cas"));
         let ident = pg.database_identity().expect("db ident");

@@ -579,7 +579,7 @@ impl<L: RefLedger> D6Workspace<L> {
             root: canonical_root(root.as_ref()),
             store,
             ledger,
-            max_file_bytes: max_file_bytes(std::env::var("SPAWN_MAX_FILE_MB").ok().as_deref()),
+            max_file_bytes: max_file_bytes(None),
             author_name: "spawn".to_string(),
             author_email: "spawn@localhost".to_string(),
             extra_exclude_files: Vec::new(),

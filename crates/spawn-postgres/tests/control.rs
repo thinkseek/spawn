@@ -1363,7 +1363,12 @@ fn a_done_missions_landing_that_stays_stale_is_aborted_after_three_tries() {
 #[test]
 fn one_integrator_holds_the_lock() {
     let (first, schema) = store("control_integrator_lock");
-    let second = PostgresStore::connect_in_schema(&url(), &schema).expect("second connection");
+    let second = PostgresStore::connect_in_schema_with_options(
+        &url(),
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("second connection");
     assert!(
         first.integrator_try_lock().expect("lock"),
         "the first takes it"
@@ -1391,7 +1396,12 @@ fn one_integrator_holds_the_lock() {
 #[test]
 fn the_integrators_lock_names_its_holder_and_says_who_holds_it() {
     let (first, schema) = store("control_integrator_holder");
-    let second = PostgresStore::connect_in_schema(&url(), &schema).expect("second connection");
+    let second = PostgresStore::connect_in_schema_with_options(
+        &url(),
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("second connection");
     assert_eq!(
         second.integrator_lock_holder().expect("holder"),
         None,

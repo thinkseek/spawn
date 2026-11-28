@@ -57,7 +57,8 @@ impl SocketArg {
             Self::Auto => None,
             Self::Explicit(path) => Some(path.as_path()),
         };
-        SocketScope::resolve(explicit).map_err(|err| err.to_string())
+        SocketScope::resolve(explicit, &crate::config::herdr_discovery_env())
+            .map_err(|err| err.to_string())
     }
 }
 

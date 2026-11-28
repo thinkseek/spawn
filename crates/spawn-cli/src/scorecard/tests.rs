@@ -2,6 +2,9 @@
 //! histories, without a database: the facts are written as the store
 //! projects them.
 
+#![cfg(test)]
+#![allow(clippy::disallowed_methods)]
+
 use serde_json::{Value, json};
 
 use super::history::{Command, Facts, History, Kind, Record, stall_of};
@@ -1902,8 +1905,12 @@ fn gate_time_counts_the_owners_judgings_for_the_fleet_and_their_mission() {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.subsec_nanos());
     let schema = spawn_postgres::testing::TestSchema::new("gate_owner");
-    let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
-        .expect("connect and migrate");
+    let store = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+        &url,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("connect and migrate");
     let root =
         std::env::temp_dir().join(format!("spawn-gate-owner-{}-{nanos:x}", std::process::id()));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2028,8 +2035,12 @@ fn the_card_says_from_when_the_owners_judgings_are_counted() {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.subsec_nanos());
     let schema = spawn_postgres::testing::TestSchema::new("owner_from");
-    let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
-        .expect("connect and migrate");
+    let store = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+        &url,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("connect and migrate");
     let root =
         std::env::temp_dir().join(format!("spawn-owner-from-{}-{nanos:x}", std::process::id()));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

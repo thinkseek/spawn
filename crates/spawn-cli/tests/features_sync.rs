@@ -2,6 +2,8 @@
 //! `spawn features generate`, and `spawn features sync` (Issue #100 PR 5).
 //! No store is opened (`env_clear()` + `PATH`).
 
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 

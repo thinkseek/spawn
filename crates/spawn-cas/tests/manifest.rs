@@ -5,6 +5,8 @@
 //! newest snapshots of a ref, and the store stays readable after a write is
 //! interrupted or the writer is killed (SIGKILL) at any instant.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};

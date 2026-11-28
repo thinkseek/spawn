@@ -710,6 +710,7 @@ pub(super) fn walk(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{Bound, MARKER, Reason, never_counted, refused_roots, sweepable, unowned, walk};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};

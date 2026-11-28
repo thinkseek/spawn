@@ -54,6 +54,8 @@ pub struct D6StoreOptions {
     pub ledger: DynRefLedger,
     /// Optional bounded L1 `tmpfs` upperdir policy.
     pub l1_policy: Option<L1TmpfsPolicy>,
+    /// Optional per-file checkpoint byte limit overriding the default.
+    pub max_file_bytes: Option<u64>,
 }
 
 impl D6StoreOptions {
@@ -63,6 +65,7 @@ impl D6StoreOptions {
             cas,
             ledger,
             l1_policy: None,
+            max_file_bytes: None,
         }
     }
 
@@ -70,6 +73,13 @@ impl D6StoreOptions {
     #[must_use]
     pub fn with_l1_policy(mut self, policy: L1TmpfsPolicy) -> Self {
         self.l1_policy = Some(policy);
+        self
+    }
+
+    /// Override the maximum checkpoint file size (`bytes`).
+    #[must_use]
+    pub const fn with_max_file_bytes(mut self, bytes: u64) -> Self {
+        self.max_file_bytes = Some(bytes);
         self
     }
 }
@@ -80,6 +90,7 @@ impl std::fmt::Debug for D6StoreOptions {
             .debug_struct("D6StoreOptions")
             .field("cas_root", &self.cas.cas().root())
             .field("l1_policy", &self.l1_policy)
+            .field("max_file_bytes", &self.max_file_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -99,6 +110,8 @@ pub struct D6ShadowOptions {
     pub strict_fail_closed: bool,
     /// Tracked-set scan policy (`Strict` by default).
     pub tracked_set_mode: ShadowTrackedSetMode,
+    /// Optional per-file checkpoint byte limit overriding the default.
+    pub max_file_bytes: Option<u64>,
 }
 
 impl D6ShadowOptions {
@@ -115,6 +128,7 @@ impl D6ShadowOptions {
             l1_policy: None,
             strict_fail_closed: false,
             tracked_set_mode: ShadowTrackedSetMode::Strict,
+            max_file_bytes: None,
         }
     }
 
@@ -136,6 +150,13 @@ impl D6ShadowOptions {
     #[must_use]
     pub const fn with_tracked_set_mode(mut self, mode: ShadowTrackedSetMode) -> Self {
         self.tracked_set_mode = mode;
+        self
+    }
+
+    /// Override the maximum checkpoint file size (`bytes`) on primary and shadow stores.
+    #[must_use]
+    pub const fn with_max_file_bytes(mut self, bytes: u64) -> Self {
+        self.max_file_bytes = Some(bytes);
         self
     }
 }
@@ -413,6 +434,9 @@ impl LocalWorkspaceStore {
         if let Some(policy) = options.l1_policy {
             store = store.with_l1_policy(policy);
         }
+        if let Some(bytes) = options.max_file_bytes {
+            store = store.with_max_file_bytes(bytes);
+        }
         Self::D6(store)
     }
 
@@ -424,7 +448,7 @@ impl LocalWorkspaceStore {
         options: D6ShadowOptions,
     ) -> Self {
         let repo = repo.as_ref();
-        let primary = GitWorkspace::new(repo, root);
+        let mut primary = GitWorkspace::new(repo, root);
         let mut shadow = D6Workspace::new(
             primary.project().to_string(),
             options.shadow_root,
@@ -434,10 +458,28 @@ impl LocalWorkspaceStore {
         if let Some(policy) = options.l1_policy {
             shadow = shadow.with_l1_policy(policy);
         }
+        if let Some(bytes) = options.max_file_bytes {
+            primary = primary.with_max_file_bytes(bytes);
+            shadow = shadow.with_max_file_bytes(bytes);
+        }
         let oracle = ShadowD6Workspace::with_git_repo(primary, shadow, repo)
             .with_strict_fail_closed(options.strict_fail_closed)
             .with_tracked_set_mode(options.tracked_set_mode);
         Self::D6Shadow(oracle)
+    }
+
+    /// Override the maximum checkpoint file size (`bytes`) across whichever backend
+    /// this store wraps.
+    #[must_use]
+    pub fn with_max_file_bytes(self, bytes: u64) -> Self {
+        match self {
+            Self::Git(git) => Self::Git(git.with_max_file_bytes(bytes)),
+            Self::Cow(cow) => Self::Cow(cow.with_max_file_bytes(bytes)),
+            #[cfg(target_os = "linux")]
+            Self::Overlay(overlay) => Self::Overlay(overlay.with_max_file_bytes(bytes)),
+            Self::D6Shadow(oracle) => Self::D6Shadow(oracle.with_max_file_bytes(bytes)),
+            Self::D6(d6) => Self::D6(d6.with_max_file_bytes(bytes)),
+        }
     }
 
     /// The cheapest store `root` supports that every caller can serve

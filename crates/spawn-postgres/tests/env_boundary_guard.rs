@@ -1,31 +1,28 @@
-//! Wave-1 static env boundary guard (`spawn-core`, `spawn-cas`, `spawn-postgres`).
+//! Workspace-wide static env boundary guard across all 12 workspace crates.
 //!
-//! Enforces two invariants across `crates/spawn-core/src`, `crates/spawn-cas/src`,
-//! and `crates/spawn-postgres/src`:
+//! Enforces four invariants across every member crate listed in root `Cargo.toml`:
 //!
-//! 1. **Zero production `std::env::var*` access**: Using a Rust lexer, fail-closed
+//! 1. **Strict production `std::env::var*` convergence**: Using a Rust lexer, fail-closed
 //!    `#[cfg(test)]` module stripper, recursive `use`-tree analyzer, and production
 //!    path scanner (with exact line numbers), rejects every production `std::env::var`,
 //!    `std::env::var_os`, `std::env::vars`, `std::env::vars_os`, short `env::var*`,
-//!    renamed `use std::env as ...`, glob `use std::env::*`, nested or multi-line
-//!    `use` trees (`use std::{env::{var, var_os}, fmt};`), `env::$...`, and `$m::var*`
-//!    macro path accesses. Only `crates/spawn-postgres/src/testing.rs`, `#![cfg(test)]`,
-//!    and `#[cfg(test)] mod <ident> { ... }` (plus `#[cfg(all(..., test, ...))] mod ...`)
-//!    are skipped; all other `#[cfg(test)]` targets are audited as production code.
-//! 2. **Zero production `spawn-postgres/testing` activation**: Queries Cargo's real
-//!    dependency graph (`cargo tree --offline --workspace -e normal,build`) and fails if
-//!    `spawn-postgres` ever resolves with the `"testing"` feature on any non-dev edge.
-//!
-//! Known single-file lexical / pre-expansion static limits:
-//! - `crates/spawn-postgres/src/testing.rs` is test-support gated behind the `"testing"`
-//!   feature (enforced by invariant 2 above).
-//! - Cross-file `pub use std::env as ...;` alias re-exports (note: `use std::env as <alias>;`
-//!   declarations inside any core crate are already rejected directly in the declaring file).
-//! - Module-level or split-metavariable macro token pasting (`std::$m::var` or `$m::$f`)
-//!   and proc-macro synthesis that require full `rustc` macro expansion.
-//!
-//! Wave-2 closes remaining `env::var` call sites in `spawn-host`/`spawn-cli` and enables
-//! workspace-wide `clippy.toml` `disallowed-methods` to cover all post-expansion paths.
+//!    renamed `use std::env as ...`, unaliased `pub ... use std::env;` / `use std::env::{self};`,
+//!    glob `use std::env::*`, nested or multi-line `use` trees, `env::$...`, and `$m::var*`
+//!    macro path accesses outside `ENV_BOUNDARY_ALLOWLIST`
+//!    (`crates/spawn-cli/src/config.rs`, `crates/spawn-node-gateway/src/main.rs`, and
+//!    `crates/spawn-postgres/src/testing.rs`). Only `#![cfg(test)]`, `#[cfg(test)] mod <ident> { ... }`,
+//!    and `#[cfg(all(..., test, ...))] mod ...` are stripped; all other `#[cfg(test)]`
+//!    targets are audited as production code.
+//! 2. **Zero unallowlisted `clippy::disallowed_methods` suppressions**: Rejects any
+//!    production `allow(...)` or `expect(...)` mentioning `disallowed_methods` outside
+//!    `ENV_BOUNDARY_ALLOWLIST` and verifies root `clippy.toml` forbids all four
+//!    `std::env::{var, var_os, vars, vars_os}` methods.
+//! 3. **Workspace member parity**: Asserts `WORKSPACE_CRATES` matches `[workspace] members`
+//!    in root `Cargo.toml` so newly added workspace crates cannot evade auditing.
+//! 4. **Zero production `spawn-postgres/testing` activation**: Queries Cargo's real
+//!    dependency graph (`cargo tree --offline --locked --workspace -e normal,build --target all`)
+//!    with non-vacuous `seen_spawn_postgres > 0` verification and fails if `spawn-postgres`
+//!    ever resolves with `"testing"` on any normal or build edge.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -33,10 +30,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const TARGET_CRATE_SRCS: &[&str] = &[
-    "crates/spawn-core/src",
-    "crates/spawn-cas/src",
-    "crates/spawn-postgres/src",
+const WORKSPACE_CRATES: &[&str] = &[
+    "crates/spawn-core",
+    "crates/spawn-cas",
+    "crates/spawn-postgres",
+    "crates/spawn-host",
+    "crates/spawn-jev",
+    "crates/spawn-codegraph",
+    "crates/spawn-kdf",
+    "crates/spawn-node-proto",
+    "crates/spawn-hc",
+    "crates/ghostty-vt",
+    "crates/spawn-cli",
+    "crates/spawn-node-gateway",
+];
+
+const ENV_BOUNDARY_ALLOWLIST: &[&str] = &[
+    "crates/spawn-cli/src/config.rs",
+    "crates/spawn-node-gateway/src/main.rs",
+    "crates/spawn-postgres/src/testing.rs",
 ];
 
 const FORBIDDEN_ENV_SYMS: &[&str] = &["var", "var_os", "vars", "vars_os"];
@@ -113,9 +125,11 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn is_excluded_test_support(repo_root: &Path, path: &Path) -> bool {
+fn is_allowlisted_env_boundary(repo_root: &Path, path: &Path) -> bool {
     let rel = path.strip_prefix(repo_root).unwrap_or(path);
-    rel == Path::new("crates/spawn-postgres/src/testing.rs")
+    ENV_BOUNDARY_ALLOWLIST
+        .iter()
+        .any(|allowed| rel == Path::new(allowed))
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +541,7 @@ fn is_env_module_path(path: &[String], env_aliases: &BTreeSet<String>) -> bool {
 fn check_leaf_use(
     path: &[String],
     alias: Option<&str>,
+    is_pub: bool,
     line: usize,
     env_aliases: &mut BTreeSet<String>,
     violated_lines: &mut BTreeSet<usize>,
@@ -542,8 +557,12 @@ fn check_leaf_use(
     if is_env_module_path(&eff, env_aliases) {
         if let Some(name) = alias {
             env_aliases.insert(name.to_string());
-            // Flag renamed `std::env` imports directly in these core crates so
+            // Flag renamed `std::env` imports in non-allowlisted production files so
             // cross-module alias re-exports (`pub(crate) use std::env as zz;`) cannot slip by.
+            violated_lines.insert(line);
+        } else if is_pub {
+            // Also flag unaliased public re-exports (`pub use std::env;`, `pub(crate) use std::{env};`)
+            // so another module cannot bypass explicit `std::env` paths via `use ...::env`.
             violated_lines.insert(line);
         }
         return;
@@ -558,6 +577,7 @@ fn check_leaf_use(
 fn audit_use_subtree(
     slice: &[Token],
     prefix: &[String],
+    is_pub: bool,
     env_aliases: &mut BTreeSet<String>,
     violated_lines: &mut BTreeSet<usize>,
 ) {
@@ -580,7 +600,7 @@ fn audit_use_subtree(
         if tok.kind == TokenKind::Open(Delim::Brace) {
             if let Some(close) = matching_close(slice, i) {
                 for item in split_top_level_commas(&slice[i + 1..close]) {
-                    audit_use_subtree(item, &cur_path, env_aliases, violated_lines);
+                    audit_use_subtree(item, &cur_path, is_pub, env_aliases, violated_lines);
                 }
             }
             return;
@@ -588,7 +608,14 @@ fn audit_use_subtree(
         if tok.is_kw("as") {
             let alias = slice.get(i + 1).and_then(Token::ident_name);
             let err_line = slice.get(i + 1).map_or(leaf_line, |t| t.line);
-            check_leaf_use(&cur_path, alias, err_line, env_aliases, violated_lines);
+            check_leaf_use(
+                &cur_path,
+                alias,
+                is_pub,
+                err_line,
+                env_aliases,
+                violated_lines,
+            );
             return;
         }
         if let Some(seg) = tok.ident_name() {
@@ -607,15 +634,51 @@ fn audit_use_subtree(
     }
 
     if cur_path.len() > prefix.len() {
-        check_leaf_use(&cur_path, None, leaf_line, env_aliases, violated_lines);
+        check_leaf_use(
+            &cur_path,
+            None,
+            is_pub,
+            leaf_line,
+            env_aliases,
+            violated_lines,
+        );
     }
 }
 
-fn collect_use_slices(tokens: &[Token]) -> Vec<&[Token]> {
+fn is_pub_before(tokens: &[Token], use_idx: usize) -> bool {
+    if use_idx == 0 {
+        return false;
+    }
+    let prev = &tokens[use_idx - 1];
+    if prev.is_kw("pub") {
+        return true;
+    }
+    if prev.kind == TokenKind::Close(Delim::Paren) {
+        let mut depth = 1usize;
+        let mut j = use_idx - 1;
+        while j > 0 {
+            j -= 1;
+            match tokens[j].kind {
+                TokenKind::Close(Delim::Paren) => depth += 1,
+                TokenKind::Open(Delim::Paren) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return j > 0 && tokens[j - 1].is_kw("pub");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+fn collect_use_slices(tokens: &[Token]) -> Vec<(bool, &[Token])> {
     let mut uses = Vec::new();
     let mut i = 0usize;
     while i < tokens.len() {
         if tokens[i].is_kw("use") {
+            let is_pub = is_pub_before(tokens, i);
             let mut end = i + 1;
             let mut depth = 0usize;
             while end < tokens.len() {
@@ -640,7 +703,7 @@ fn collect_use_slices(tokens: &[Token]) -> Vec<&[Token]> {
             } else {
                 end
             };
-            uses.push(&tokens[i + 1..slice_end]);
+            uses.push((is_pub, &tokens[i + 1..slice_end]));
             i = end;
         } else {
             i += 1;
@@ -654,8 +717,8 @@ fn audit_use_trees(tokens: &[Token], violated_lines: &mut BTreeSet<usize>) -> BT
     let mut env_aliases = BTreeSet::new();
     loop {
         let before = env_aliases.len();
-        for u in &uses {
-            audit_use_subtree(u, &[], &mut env_aliases, violated_lines);
+        for &(is_pub, u) in &uses {
+            audit_use_subtree(u, &[], is_pub, &mut env_aliases, violated_lines);
         }
         if env_aliases.len() == before {
             break;
@@ -709,15 +772,13 @@ fn audit_path_accesses(
     }
 }
 
-fn scan_source(rel_or_abs_path: &Path, src: &str) -> Vec<Violation> {
-    let tokens = tokenize(src);
-    let prod_tokens = strip_cfg_test_tokens(&tokens);
-    let mut violated_lines = BTreeSet::new();
-    let env_aliases = audit_use_trees(&prod_tokens, &mut violated_lines);
-    audit_path_accesses(&prod_tokens, &env_aliases, &mut violated_lines);
-
+fn violations_from_lines(
+    rel_or_abs_path: &Path,
+    src: &str,
+    lines: BTreeSet<usize>,
+) -> Vec<Violation> {
     let orig_lines: Vec<&str> = src.lines().collect();
-    violated_lines
+    lines
         .into_iter()
         .map(|line| Violation {
             path: rel_or_abs_path.to_path_buf(),
@@ -729,17 +790,189 @@ fn scan_source(rel_or_abs_path: &Path, src: &str) -> Vec<Violation> {
         .collect()
 }
 
+fn scan_source(rel_or_abs_path: &Path, src: &str) -> Vec<Violation> {
+    let tokens = tokenize(src);
+    let prod_tokens = strip_cfg_test_tokens(&tokens);
+    let mut violated_lines = BTreeSet::new();
+    let env_aliases = audit_use_trees(&prod_tokens, &mut violated_lines);
+    audit_path_accesses(&prod_tokens, &env_aliases, &mut violated_lines);
+    violations_from_lines(rel_or_abs_path, src, violated_lines)
+}
+
+fn scan_disallowed_methods_allows(rel_or_abs_path: &Path, src: &str) -> Vec<Violation> {
+    let tokens = tokenize(src);
+    let prod_tokens = strip_cfg_test_tokens(&tokens);
+    let mut violated_lines = BTreeSet::new();
+    let mut i = 0usize;
+    while i < prod_tokens.len() {
+        if prod_tokens[i].kind != TokenKind::Pound {
+            i += 1;
+            continue;
+        }
+        let bracket_idx = if prod_tokens
+            .get(i + 1)
+            .is_some_and(|t| t.kind == TokenKind::Bang)
+        {
+            i + 2
+        } else {
+            i + 1
+        };
+        if !prod_tokens
+            .get(bracket_idx)
+            .is_some_and(|t| t.kind == TokenKind::Open(Delim::Bracket))
+        {
+            i += 1;
+            continue;
+        }
+        let Some(close_idx) = matching_close(&prod_tokens, bracket_idx) else {
+            i += 1;
+            continue;
+        };
+        let inside = &prod_tokens[bracket_idx + 1..close_idx];
+        let has_disallowed = inside
+            .iter()
+            .any(|t| t.ident_name() == Some("disallowed_methods"));
+        let has_allow_or_expect = inside
+            .iter()
+            .any(|t| matches!(t.ident_name(), Some("allow" | "expect")));
+        if has_disallowed && has_allow_or_expect {
+            violated_lines.insert(prod_tokens[i].line);
+        }
+        i = close_idx + 1;
+    }
+    violations_from_lines(rel_or_abs_path, src, violated_lines)
+}
+
+fn strip_toml_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    let mut in_basic = false;
+    let mut in_literal = false;
+    while let Some(ch) = chars.next() {
+        if in_basic {
+            out.push(ch);
+            if ch == '\\' {
+                if let Some(esc) = chars.next() {
+                    out.push(esc);
+                }
+            } else if ch == '"' {
+                in_basic = false;
+            }
+            continue;
+        }
+        if in_literal {
+            out.push(ch);
+            if ch == '\'' {
+                in_literal = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_basic = true;
+                out.push(ch);
+            }
+            '\'' => {
+                in_literal = true;
+                out.push(ch);
+            }
+            '#' => {
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn disallowed_methods_array_slice(stripped: &str) -> Option<&str> {
+    let key_idx = stripped.find("disallowed-methods")?;
+    let rest = &stripped[key_idx + "disallowed-methods".len()..];
+    let eq_idx = rest.find('=')?;
+    let after_eq = &rest[eq_idx + 1..];
+    let open_rel = after_eq.find('[')?;
+    let body_start = key_idx + "disallowed-methods".len() + eq_idx + 1 + open_rel;
+    let mut depth = 0usize;
+    for (offset, ch) in stripped[body_start..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&stripped[body_start..=body_start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn missing_disallowed_env_methods(clippy_toml: &str) -> Vec<&'static str> {
+    const REQUIRED: [&str; 4] = [
+        "std::env::var",
+        "std::env::var_os",
+        "std::env::vars",
+        "std::env::vars_os",
+    ];
+    let stripped = strip_toml_comments(clippy_toml);
+    let Some(section) = disallowed_methods_array_slice(&stripped) else {
+        return REQUIRED.to_vec();
+    };
+    REQUIRED
+        .into_iter()
+        .filter(|sym| {
+            !section.contains(&format!("\"{sym}\"")) && !section.contains(&format!("'{sym}'"))
+        })
+        .collect()
+}
+
+fn parse_workspace_members(cargo_toml: &str) -> Vec<String> {
+    let stripped = strip_toml_comments(cargo_toml);
+    let ws_idx = stripped.find("[workspace]").expect("[workspace] section");
+    let after_ws = &stripped[ws_idx..];
+    let members_idx = after_ws.find("members").expect("members key");
+    let after_members = &after_ws[members_idx..];
+    let open_idx = after_members.find('[').expect("members '['");
+    let close_idx = after_members[open_idx..].find(']').expect("members ']'") + open_idx;
+    let list_body = &after_members[open_idx + 1..close_idx];
+    let mut members = Vec::new();
+    let mut rest = list_body;
+    while let Some(q1) = rest.find('"') {
+        let after = &rest[q1 + 1..];
+        let Some(q2) = after.find('"') else {
+            break;
+        };
+        members.push(after[..q2].to_string());
+        rest = &after[q2 + 1..];
+    }
+    members
+}
+
 // ---------------------------------------------------------------------------
-// Cargo Dependency Graph Guard (`cargo tree --offline --workspace -e normal,build`)
+// Cargo Dependency Graph Guard (`cargo tree --offline --locked --target all`)
 // ---------------------------------------------------------------------------
 
-fn parse_cargo_tree_testing_violations(stdout: &str) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeAudit {
+    seen_spawn_postgres: usize,
+    violations: Vec<String>,
+}
+
+fn parse_cargo_tree_testing_violations(stdout: &str) -> TreeAudit {
+    let mut seen_spawn_postgres = 0usize;
     let mut violations = Vec::new();
     for raw_line in stdout.lines() {
         let trimmed = raw_line.trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
         if trimmed.split_whitespace().next() != Some("spawn-postgres") {
             continue;
         }
+        seen_spawn_postgres += 1;
         let without_dedup = trimmed
             .trim_end()
             .strip_suffix("(*)")
@@ -754,7 +987,10 @@ fn parse_cargo_tree_testing_violations(stdout: &str) -> Vec<String> {
             violations.push(trimmed.to_string());
         }
     }
-    violations
+    TreeAudit {
+        seen_spawn_postgres,
+        violations,
+    }
 }
 
 fn check_cargo_tree_no_prod_testing_feature(manifest_path: &Path) -> Vec<String> {
@@ -762,9 +998,12 @@ fn check_cargo_tree_no_prod_testing_feature(manifest_path: &Path) -> Vec<String>
         .args([
             "tree",
             "--offline",
+            "--locked",
             "--workspace",
             "-e",
             "normal,build",
+            "--target",
+            "all",
             "-f",
             "{p} [{f}]",
             "--manifest-path",
@@ -781,37 +1020,77 @@ fn check_cargo_tree_no_prod_testing_feature(manifest_path: &Path) -> Vec<String>
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_cargo_tree_testing_violations(&stdout)
+    let audit = parse_cargo_tree_testing_violations(&stdout);
+    assert!(
+        audit.seen_spawn_postgres > 0,
+        "non-vacuous cargo tree check failed for {}: zero spawn-postgres rows observed in output:\n{stdout}",
+        manifest_path.display(),
+    );
+    audit.violations
+}
+
+fn collect_workspace_prod_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for crate_dir in WORKSPACE_CRATES {
+        collect_rs_files(&root.join(crate_dir).join("src"), &mut files);
+    }
+    assert!(!files.is_empty(), "expected workspace crate source files");
+    files
 }
 
 #[test]
-fn core_cas_and_postgres_production_code_contains_zero_env_var_calls() {
+fn workspace_production_code_contains_zero_unallowlisted_env_var_or_suppress_allows() {
     let root = workspace_root();
-    let mut files = Vec::new();
-    for crate_src in TARGET_CRATE_SRCS {
-        collect_rs_files(&root.join(crate_src), &mut files);
-    }
-    assert!(!files.is_empty(), "expected core/cas/postgres source files");
+    let files = collect_workspace_prod_files(&root);
 
-    let mut violations = Vec::new();
+    let mut env_violations = Vec::new();
+    let mut allow_violations = Vec::new();
     for file in files {
-        if is_excluded_test_support(&root, &file) {
+        if is_allowlisted_env_boundary(&root, &file) {
             continue;
         }
         let rel = file.strip_prefix(&root).unwrap_or(&file);
         let text =
             fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        violations.extend(scan_source(rel, &text));
+        env_violations.extend(scan_source(rel, &text));
+        allow_violations.extend(scan_disallowed_methods_allows(rel, &text));
     }
 
     assert!(
-        violations.is_empty(),
-        "forbidden production env::var* call(s) found in core crates:\n{}",
-        violations
+        env_violations.is_empty(),
+        "forbidden production env::var* call(s) found outside ENV_BOUNDARY_ALLOWLIST:\n{}",
+        env_violations
             .iter()
             .map(|v| format!("  {}:{}: {}", v.path.display(), v.line, v.snippet))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+    assert!(
+        allow_violations.is_empty(),
+        "forbidden production allow/expect(clippy::disallowed_methods) found outside ENV_BOUNDARY_ALLOWLIST:\n{}",
+        allow_violations
+            .iter()
+            .map(|v| format!("  {}:{}: {}", v.path.display(), v.line, v.snippet))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn workspace_crates_list_matches_root_cargo_toml_and_clippy_toml_forbids_all_env_methods() {
+    let root = workspace_root();
+    let cargo_toml = fs::read_to_string(root.join("Cargo.toml")).expect("read root Cargo.toml");
+    let mut actual = parse_workspace_members(&cargo_toml);
+    actual.sort();
+    let mut expected: Vec<String> = WORKSPACE_CRATES.iter().map(|s| (*s).to_string()).collect();
+    expected.sort();
+    assert_eq!(actual, expected, "WORKSPACE_CRATES drifted from Cargo.toml");
+
+    let clippy_toml = fs::read_to_string(root.join("clippy.toml")).expect("read root clippy.toml");
+    let missing = missing_disallowed_env_methods(&clippy_toml);
+    assert!(
+        missing.is_empty(),
+        "root clippy.toml is missing required std::env entries: {missing:?}"
     );
 }
 
@@ -1046,6 +1325,17 @@ fn run_temp_cargo_tree_case(
         ),
     );
     ws.write("consumer/src/lib.rs", "");
+    let lock = Command::new(env!("CARGO"))
+        .args(["generate-lockfile", "--offline", "--manifest-path"])
+        .arg(ws.root_manifest())
+        .output()
+        .expect("generate lockfile for temp workspace");
+    assert!(
+        lock.status.success(),
+        "cargo generate-lockfile --offline failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&lock.stdout),
+        String::from_utf8_lossy(&lock.stderr),
+    );
     check_cargo_tree_no_prod_testing_feature(&ws.root_manifest())
 }
 
@@ -1057,7 +1347,14 @@ consumer v0.1.0 (/tmp/consumer) []
 ├── spawn-postgres v0.1.0 (/tmp/crates[1]/spawn-postgres) [default,testing] (*)
 └── spawn-postgres v0.1.0 (/tmp/crates/spawn-postgres) [testing]
 ";
-    assert_eq!(parse_cargo_tree_testing_violations(synthetic).len(), 2);
+    let parsed_synthetic = parse_cargo_tree_testing_violations(synthetic);
+    assert_eq!(parsed_synthetic.seen_spawn_postgres, 3);
+    assert_eq!(parsed_synthetic.violations.len(), 2);
+
+    let unrelated = "consumer v0.1.0 (/tmp/consumer) []\n";
+    let parsed_unrelated = parse_cargo_tree_testing_violations(unrelated);
+    assert_eq!(parsed_unrelated.seen_spawn_postgres, 0);
+    assert!(parsed_unrelated.violations.is_empty());
 
     let pg_clean = "default = []\ntesting = []\n";
     let pg_default_bad = "default = [\"testing\"]\ntesting = []\n";
@@ -1107,4 +1404,68 @@ consumer v0.1.0 (/tmp/consumer) []
         )
         .is_empty()
     );
+    // 6. Target-specific dependency caught by `--target all`.
+    assert!(
+        !run_temp_cargo_tree_case(
+            "target-cfg-windows",
+            pg_clean,
+            "[target.'cfg(windows)'.dependencies]\nspawn-postgres = { path = \"../spawn-postgres\", features = [\"testing\"] }\n",
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn env_boundary_guard_catches_unaliased_pub_reexports_and_allows_private_use() {
+    let sample = r"
+pub use std::env;
+pub(crate) use std::env;
+pub(super) use std::{env, fmt};
+pub(in crate::a) use std::env::{self};
+
+use std::env;
+pub fn ok() {
+    let _ = env::current_dir();
+}
+";
+    let found = scan_source(Path::new("reexports.rs"), sample);
+    let lines: Vec<usize> = found.iter().map(|v| v.line).collect();
+    assert_eq!(lines, vec![2, 3, 4, 5], "got {found:?}");
+}
+
+#[test]
+fn env_boundary_guard_verifies_clippy_toml_and_prod_disallowed_allows() {
+    let incomplete = "disallowed-methods = [\n  { path = \"std::env::var\" },\n  # { path = \"std::env::var_os\" },\n]\n";
+    assert_eq!(
+        missing_disallowed_env_methods(incomplete),
+        vec!["std::env::var_os", "std::env::vars", "std::env::vars_os"]
+    );
+
+    let prod_allows = r"
+#[allow(clippy::disallowed_methods)]
+fn a() {}
+
+fn b() {
+    #![allow(clippy::disallowed_methods)]
+}
+
+#[expect(clippy::disallowed_methods)]
+fn c() {}
+
+#[cfg_attr(unix, allow(clippy::disallowed_methods))]
+fn d() {}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::disallowed_methods)]
+    #[test]
+    fn ok() {}
+}
+";
+    let found = scan_disallowed_methods_allows(Path::new("allows.rs"), prod_allows);
+    let lines: Vec<usize> = found.iter().map(|v| v.line).collect();
+    assert_eq!(lines, vec![2, 6, 9, 12], "got {found:?}");
+
+    let test_file = "\n#![cfg(test)]\n#![allow(clippy::disallowed_methods)]\n#[test]\nfn ok() {}\n";
+    assert!(scan_disallowed_methods_allows(Path::new("tests.rs"), test_file).is_empty());
 }

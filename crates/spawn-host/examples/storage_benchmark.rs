@@ -36,7 +36,7 @@ use spawn_host::{
     LocalTranscriptArchive, RefLedger, ShadowD6Workspace, ShadowOracleMetrics, format_commit_body,
     git_command,
 };
-use spawn_postgres::{PostgresStore, RefKind};
+use spawn_postgres::{ConnectOptions, PostgresStore, RefKind};
 
 const USAGE: &str = "spawn storage benchmark\n\
 \n\
@@ -833,8 +833,9 @@ struct PgRefLedger {
 
 impl PgRefLedger {
     fn connect_schema(url: &str, schema: &str) -> Result<Self, String> {
-        let pg = PostgresStore::connect_in_schema(url, schema)
-            .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
+        let pg =
+            PostgresStore::connect_in_schema_with_options(url, schema, &ConnectOptions::default())
+                .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
         Ok(Self { pg: Arc::new(pg) })
     }
 
@@ -1901,6 +1902,7 @@ fn read_complete_crash_acks(ack_path: &Path) -> Result<Vec<CrashAck>, String> {
     Ok(acks)
 }
 
+#[allow(clippy::disallowed_methods)]
 fn internal_crash_writer_main(manifest_path: &Path) -> Result<(), String> {
     let url = env::var("SPAWN_BENCH_DATABASE_URL")
         .map_err(|_| "SPAWN_BENCH_DATABASE_URL required for internal crash writer".to_string())?;
@@ -2285,6 +2287,7 @@ fn build_crash_verify_json(input: &CrashVerifyJsonInput<'_>) -> Value {
     })
 }
 
+#[allow(clippy::disallowed_methods)]
 fn internal_crash_verify_main(manifest_path: &Path, inject_torn: bool) -> Result<Value, String> {
     let url = env::var("SPAWN_BENCH_DATABASE_URL")
         .map_err(|_| "SPAWN_BENCH_DATABASE_URL required for internal crash verify".to_string())?;
@@ -3783,8 +3786,9 @@ fn connect_pg_pool(
     schema: &str,
     count: usize,
 ) -> Result<Vec<Arc<PostgresStore>>, String> {
-    let first = PostgresStore::connect_in_schema(url, schema)
-        .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
+    let first =
+        PostgresStore::connect_in_schema_with_options(url, schema, &ConnectOptions::default())
+            .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
     let mut pool = Vec::with_capacity(count.max(1));
     for _ in 1..count.max(1) {
         let conn = first
@@ -3868,6 +3872,7 @@ fn build_driver(
     }
 }
 
+#[allow(clippy::disallowed_methods)]
 fn run(config: &Config) -> Result<Value, String> {
     static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
     let bench_url = env::var("SPAWN_BENCH_DATABASE_URL").ok();

@@ -1,0 +1,6 @@
+disallowed-methods = [
+    { path = "std::env::var", reason = "read environment variables at the top-level config boundary (crates/spawn-cli/src/config.rs or crates/spawn-node-gateway/src/main.rs) and pass typed config downward" },
+    { path = "std::env::var_os", reason = "read environment variables at the top-level config boundary (crates/spawn-cli/src/config.rs or crates/spawn-node-gateway/src/main.rs) and pass typed config downward" },
+    { path = "std::env::vars", reason = "read environment variables at the top-level config boundary (crates/spawn-cli/src/config.rs or crates/spawn-node-gateway/src/main.rs) and pass typed config downward" },
+    { path = "std::env::vars_os", reason = "read environment variables at the top-level config boundary (crates/spawn-cli/src/config.rs or crates/spawn-node-gateway/src/main.rs) and pass typed config downward" },
+]

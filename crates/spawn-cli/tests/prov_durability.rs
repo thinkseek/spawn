@@ -12,6 +12,8 @@
 //! task 14 (`haiku`, brief `reverts: task 13`) does not restore `src/b.rs`.
 //! Each task lands as a merge with the integrator's trailers.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 

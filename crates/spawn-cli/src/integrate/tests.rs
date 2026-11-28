@@ -1,3 +1,6 @@
+#![cfg(test)]
+#![allow(clippy::disallowed_methods)]
+
 use super::{
     BUDGET_GAP, Freshness, Mission, NO_TEST_DATABASE, aborted, active_ms, budget_gap, floor_gone,
     floor_reason, freshness, gates_at_once, halt_reason, markers_note, merged_tree,
@@ -1056,6 +1059,7 @@ fn judge_semantic(
         .map(|path| vec![("PATH".to_string(), path)])
         .unwrap_or_default();
     let run_gate = |against: &str, judged: &str| {
+        let default_load = crate::config::GateLoadEnv::default();
         crate::gate::judge(
             &gate_path,
             std::path::Path::new(mirror),
@@ -1065,6 +1069,7 @@ fn judge_semantic(
             None,
             &env,
             std::time::Duration::from_mins(1),
+            &default_load,
         )
     };
     let candidate = super::landing_candidate(mirror, main, head, "Work (task 48)\n")

@@ -2443,6 +2443,7 @@ fn why(now: CommitNow, commit: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{
         Chain, DrillDir, Only, Outcome, chain_of, compare_refs, compare_transcripts, drill_parent,
         judge_by_record, missions_members, only_of, outcome, sha256_prefix,

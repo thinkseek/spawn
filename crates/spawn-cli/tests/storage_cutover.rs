@@ -1,5 +1,7 @@
 //! End-to-end blackbox CLI and PostgreSQL/CAS tests for `spawn storage cutover` (`#113`).
 
+#![allow(clippy::disallowed_methods)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};

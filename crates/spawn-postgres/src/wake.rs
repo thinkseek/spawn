@@ -154,6 +154,7 @@ impl Listener {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use std::time::{Duration, Instant};
 
     use crate::PostgresStore;
@@ -167,7 +168,12 @@ mod tests {
         let url = std::env::var("SPAWN_TEST_DATABASE_URL")
             .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database");
         let schema = crate::testing::TestSchema::new("wake");
-        let store = PostgresStore::connect_in_schema(&url, &schema).expect("migrate");
+        let store = PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &crate::testing::test_connect_options(),
+        )
+        .expect("migrate");
         let mut listener = store.listen().expect("listen");
         // The channel is the database's, not the schema's: another case's
         // append may be waiting in it. Drain those first.
@@ -212,7 +218,12 @@ mod tests {
         let url = std::env::var("SPAWN_TEST_DATABASE_URL")
             .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database");
         let schema = crate::testing::TestSchema::new("lease");
-        let store = PostgresStore::connect_in_schema(&url, &schema).expect("migrate");
+        let store = PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &crate::testing::test_connect_options(),
+        )
+        .expect("migrate");
         assert_eq!(
             store.next_lease_ms().expect("lease"),
             None,
@@ -256,7 +267,12 @@ mod tests {
         let url = std::env::var(crate::testing::TEST_DATABASE_URL)
             .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database");
         let schema = crate::testing::TestSchema::new("wake_chan");
-        let store = PostgresStore::connect_in_schema(&url, &schema).expect("migrate");
+        let store = PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &crate::testing::test_connect_options(),
+        )
+        .expect("migrate");
 
         let too_long = "a".repeat(64);
         for bad in ["", "1bad", "a; select 1", "Upper", too_long.as_str()] {

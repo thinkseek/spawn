@@ -306,6 +306,17 @@ impl<W: WorkspaceStore, L: RefLedger> ShadowD6Workspace<W, L> {
     }
 }
 
+impl<L: RefLedger> ShadowD6Workspace<crate::git::GitWorkspace, L> {
+    /// Override the maximum checkpoint file size (`bytes`) on both the authoritative
+    /// primary [`crate::git::GitWorkspace`] and the shadow [`D6Workspace`].
+    #[must_use]
+    pub fn with_max_file_bytes(mut self, bytes: u64) -> Self {
+        self.primary = self.primary.with_max_file_bytes(bytes);
+        self.shadow = self.shadow.with_max_file_bytes(bytes);
+        self
+    }
+}
+
 impl<W: WorkspaceStore, L: RefLedger> std::fmt::Debug for ShadowD6Workspace<W, L> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter

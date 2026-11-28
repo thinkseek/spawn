@@ -26,6 +26,11 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
+fn load_process_config(args: &[String]) -> Result<Config, ConfigError> {
+    Config::from_env_with_credentials(|name| std::env::var(name).ok(), args)
+}
+
 fn run() -> Result<(), ConfigError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -37,7 +42,7 @@ fn run() -> Result<(), ConfigError> {
         );
         return Ok(());
     }
-    let config = Config::from_env_with_credentials(|name| std::env::var(name).ok(), &args)?;
+    let config = load_process_config(&args)?;
     let fail = |message: String| ConfigError {
         message,
         exit_code: 1,

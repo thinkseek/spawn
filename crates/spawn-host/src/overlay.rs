@@ -440,6 +440,14 @@ impl OverlayWorkspace {
         self
     }
 
+    /// The same store with a checkpoint file size cap of `bytes` instead of
+    /// [`crate::workspace_rules::DEFAULT_MAX_FILE_MB`].
+    #[must_use]
+    pub fn with_max_file_bytes(mut self, bytes: u64) -> Self {
+        self.git = self.git.clone().with_max_file_bytes(bytes);
+        self
+    }
+
     /// The store root, resolved.
     pub fn root(&self) -> &Path {
         &self.root

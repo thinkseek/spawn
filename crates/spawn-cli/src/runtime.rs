@@ -99,7 +99,10 @@ fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, O
             }
         }
     }
-    let (archive_mask, stand_in) = spawn_host::archive_mask::CollectorMask::from_env(&roots);
+    let (archive_mask, stand_in) = spawn_host::archive_mask::CollectorMask::from_config(
+        &roots,
+        &crate::config::collector_mask_config(),
+    );
     if let Some(stand_in) = &stand_in {
         eprintln!("{}", stand_in.said());
     }
@@ -2551,15 +2554,6 @@ mod tests {
     fn bridge_incomplete_shard_flag_parses_and_fails_closed() {
         use super::parse_bridge_scaling;
         use spawn_core::bridge::ShardCoveragePolicy;
-
-        // Legacy names are completely removed and leave canonical defaults untouched.
-        let ignored_legacy_env = environment(&[
-            ("SPAWN_BRIDGE_MAX_COMMANDS", "128"),
-            ("SPAWN_BRIDGE_BACKSTOPS_PER_PASS", "16"),
-        ]);
-        let parsed = parse_bridge_scaling(&ignored_legacy_env).expect("defaults without legacy");
-        assert_eq!(parsed.max_commands_per_tick, 64);
-        assert_eq!(parsed.backstops_per_pass, 8);
 
         for allow_val in ["true", "1", "yes", "on", " TRUE "] {
             let allow_env = environment(&[("SPAWN_BRIDGE_ALLOW_INCOMPLETE_SHARDS", allow_val)]);

@@ -416,13 +416,13 @@ const COMMANDS: &[Command] = &[
         name: "config",
         aliases: &[],
         usage: &[config_file::CONFIG_USAGE],
-        run: |rest| config_file::config_command(None, rest),
+        run: |rest| config_file::config_command(None, rest, &config::process_env_for_config),
     },
     Command {
         name: "doctor",
         aliases: &[],
         usage: &[config_file::DOCTOR_USAGE],
-        run: |rest| config_file::doctor_command(None, rest),
+        run: |rest| config_file::doctor_command(None, rest, &config::process_env_for_config),
     },
     Command {
         name: "auth",
@@ -690,10 +690,18 @@ pub(crate) fn dispatch() -> Result<i32, String> {
     match find(&command) {
         Some(row) => {
             if row.name == "config" {
-                return config_file::config_command(cli_config.as_deref(), &rest);
+                return config_file::config_command(
+                    cli_config.as_deref(),
+                    &rest,
+                    &config::process_env_for_config,
+                );
             }
             if row.name == "doctor" {
-                return config_file::doctor_command(cli_config.as_deref(), &rest);
+                return config_file::doctor_command(
+                    cli_config.as_deref(),
+                    &rest,
+                    &config::process_env_for_config,
+                );
             }
             if row.name == "auth" {
                 return auth::command_with_config(cli_config.as_deref(), &rest);
@@ -708,6 +716,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
                     &command,
                     &rest,
                     CONFIG_APPLIED_ENV,
+                    &config::process_env_for_config,
                 );
             }
             (row.run)(&rest)

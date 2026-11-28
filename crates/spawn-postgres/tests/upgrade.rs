@@ -115,7 +115,12 @@ fn the_first_shape_of_every_table_migrates_to_the_current_columns() {
         )
         .expect("rows of the first installs");
 
-    let upgraded = PostgresStore::connect_in_schema(&url(), &schema).expect("migrate");
+    let upgraded = PostgresStore::connect_in_schema_with_options(
+        &url(),
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("migrate");
     let (_fresh, fresh_schema) = store("first_shapes_fresh");
     assert_eq!(
         columns(&mut client, &schema),

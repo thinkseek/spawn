@@ -15,6 +15,7 @@
 //!
 //! Linux only: the store itself is compiled on Linux alone.
 #![cfg(target_os = "linux")]
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
 use std::fs;

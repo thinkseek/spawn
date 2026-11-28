@@ -4,6 +4,8 @@
 //! `herdr-core` (`spawn-hc`) runs on isolated private sessions/runtime dirs so
 //! no test touches another server.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -16,7 +18,7 @@ use spawn_core::id::{BranchName, TerminalName, WorkspaceId};
 use spawn_core::port::{
     Commit, Launch, Runner, ServerSeen, TerminalError, TerminalHost, WorkspaceStore,
 };
-use spawn_host::{GitWorkspace, HerdrCoreHost, Scratch};
+use spawn_host::{GitWorkspace, HerdrCoreHost, Scratch, TerminalHostEnv};
 
 /// Serialize the external programs of this test binary.
 ///
@@ -69,7 +71,14 @@ fn start_session(host: &HerdrCoreHost, launch: &Launch) -> Result<(), TerminalEr
 /// `program`'s `HerdrCoreHost`, keeping in `scratch` what it would keep in
 /// `$XDG_RUNTIME_DIR`.
 fn host_in(scratch: &Scratch, program: &str, session: &str) -> HerdrCoreHost {
-    HerdrCoreHost::on_session(program, session)
+    let host_env = TerminalHostEnv {
+        home: std::env::var_os("HOME").map(PathBuf::from),
+        scrubbed_env_keys: TerminalHostEnv::collect_scrubbed_keys(
+            std::env::vars_os().map(|(k, _)| k),
+        ),
+        ..TerminalHostEnv::default()
+    };
+    HerdrCoreHost::on_session(program, session, host_env)
         .expect("valid session")
         .with_runtime_under(runtime(scratch))
 }

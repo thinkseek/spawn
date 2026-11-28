@@ -364,7 +364,7 @@ pub struct PostgresStore {
     /// prepared from: the loop's fixed reads are parsed and planned once and
     /// reused, not once per pass ([`PostgresStore::query_prepared`]).
     prepared: Mutex<std::collections::HashMap<&'static str, postgres::Statement>>,
-    /// The schema a test store moved into ([`Self::connect_in_schema`]),
+    /// The schema a test store moved into ([`Self::connect_in_schema_with_options`]),
     /// for a connection of its own made elsewhere (nodes.rs `StoreConnector`).
     schema: Option<String>,
 }
@@ -461,11 +461,6 @@ impl PostgresStore {
         }
         store.migrate()?;
         Ok(store)
-    }
-
-    /// Connect and move this session into `schema`, creating it when absent.
-    pub fn connect_in_schema(url: &str, schema: &str) -> Result<Self, StoreError> {
-        Self::connect_in_schema_with_options(url, schema, &ConnectOptions::default())
     }
 
     fn lock(&self) -> MutexGuard<'_, Client> {
@@ -1115,6 +1110,7 @@ pub fn made_schema_sql(schema: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{ConnectOptions, login_url, role_password, role_url_with_passfile, url_password};
 
     /// The restricted logins' passwords are byte for byte what every install

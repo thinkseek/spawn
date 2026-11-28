@@ -36,9 +36,18 @@ pub enum BwrapCapability {
 }
 
 /// Detect whether the current process runs inside a container.
+///
+/// Accepts optional `container` environment hint (e.g. `container=podman`)
+/// injected from the process configuration boundary.
 #[must_use]
-pub fn detect_container() -> ContainerEnv {
-    detect_container_with(Path::new("/"), &|name| std::env::var(name).ok())
+pub fn detect_container(container_env: Option<&str>) -> ContainerEnv {
+    detect_container_with(Path::new("/"), &|name| {
+        if name == "container" {
+            container_env.map(str::to_string)
+        } else {
+            None
+        }
+    })
 }
 
 /// Testable implementation of [`detect_container`] inspecting `root` and
@@ -113,9 +122,10 @@ pub fn is_container_namespace_block(error: &str) -> bool {
 /// Probe `bwrap` with `config` and classify container namespace blocks cleanly.
 #[must_use]
 pub fn probe_bwrap(program: &str, config: &ViewConfig) -> BwrapCapability {
+    let container_env = config.container_env.clone();
     probe_bwrap_with(
         || BwrapView::new(program, config.clone()).map(|_| ()),
-        &detect_container,
+        &|| detect_container(container_env.as_deref()),
     )
 }
 

@@ -1946,8 +1946,8 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     record_start(&lock.0, &gate, &root, mode == RunMode::Once);
     // The gate gets an allowlist of this environment, never all of it: the
     // owner's SPAWN_DATABASE_URL must not reach candidate code.
-    let gate_env = gate::gate_env(|name| std::env::var(name).ok());
-    if std::env::var_os("SPAWN_TEST_DATABASE_URL").is_some()
+    let gate_env = gate::gate_env(|name| crate::config::process_var(name).ok());
+    if crate::config::has_env_var("SPAWN_TEST_DATABASE_URL")
         && !gate_env
             .iter()
             .any(|(name, _)| name == "SPAWN_TEST_DATABASE_URL")
@@ -1968,10 +1968,13 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     let gates = gate_slots_from(&flags)?;
     // What the host must have before a gate starts, read once like the
     // gate's environment (gate::Room).
-    let host_room = gate::Room::from_env(|name| std::env::var(name).ok());
+    let host_room = gate::Room::from_env(|name| crate::config::process_var(name).ok());
+    let host_load_env = crate::config::gate_load_env();
+    let owner_database_url = crate::config::process_var("SPAWN_DATABASE_URL").ok();
+    let pg_passfile = crate::config::pg_passfile();
     // The host's cores, shared among the gates (gate::Cpu), read once.
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let cpu = gate::Cpu::from_env(|name| std::env::var(name).ok(), cores)
+    let cpu = gate::Cpu::from_env(|name| crate::config::process_var(name).ok(), cores)
         .map_err(|error| format!("{error}\n{USAGE}"))?;
     // Gates in units of their own when a user manager answers (gate v2 step
     // 2: they outlive a restart); else as children, which a restart stops.
@@ -1985,6 +1988,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         );
     }
     let mut integrator = Integrator::new(root, gate, gate_env, host_room, gates)
+        .with_host_env(owner_database_url, pg_passfile, host_load_env)
         .with_cpu(cpu)
         .with_units(units)
         .with_lock(lock);
@@ -2586,6 +2590,12 @@ struct Judge {
     /// (`SPAWN_GATE_REMOTE=node`, [`remote::Primary`]); None (unset, empty
     /// or `local`) judges every gate on this host, as before.
     remote: Option<Arc<remote::Primary>>,
+    /// Owner database URL (`SPAWN_DATABASE_URL`) captured at the process boundary.
+    owner_database_url: Option<String>,
+    /// Resolved `PGPASSFILE` path captured at the process boundary.
+    pg_passfile: Option<PathBuf>,
+    /// Host gate-load overrides (`SPAWN_GATE_*LOAD*`) captured at the process boundary.
+    host_load_env: crate::config::GateLoadEnv,
 }
 
 /// What the primary path gives the judging in place of a local run of the
@@ -2874,6 +2884,9 @@ impl Integrator {
                 units: false,
                 adopted: None,
                 remote: None,
+                owner_database_url: None,
+                pg_passfile: None,
+                host_load_env: crate::config::GateLoadEnv::default(),
             },
             gates,
             cpu: None,
@@ -3119,6 +3132,18 @@ impl Integrator {
     /// integrator no longer stops them.
     fn with_units(mut self, units: bool) -> Self {
         self.judge.units = units;
+        self
+    }
+
+    fn with_host_env(
+        mut self,
+        owner_database_url: Option<String>,
+        pg_passfile: Option<PathBuf>,
+        host_load_env: crate::config::GateLoadEnv,
+    ) -> Self {
+        self.judge.owner_database_url = owner_database_url;
+        self.judge.pg_passfile = pg_passfile;
+        self.judge.host_load_env = host_load_env;
         self
     }
 
@@ -4670,15 +4695,11 @@ impl Judge {
     /// mission marked [`NO_TEST_DATABASE`]; SPAWN_GATE_JOBS the jobs it was
     /// given room for, never its own default.
     fn judging_env(&self, scenarios: &Path, jobs: Option<usize>) -> Vec<(String, String)> {
-        let owner = std::env::var("SPAWN_DATABASE_URL").ok();
-        let (mut gate_env, warning) =
-            gate::withhold_owners_cluster(&self.gate_env, owner.as_deref(), |url| {
-                spawn_postgres::cluster_identity_with_passfile(
-                    url,
-                    crate::config::pg_passfile().as_deref(),
-                )
+        let owner = self.owner_database_url.as_deref();
+        let (mut gate_env, warning) = gate::withhold_owners_cluster(&self.gate_env, owner, |url| {
+            spawn_postgres::cluster_identity_with_passfile(url, self.pg_passfile.as_deref())
                 .map_err(|error| error.to_string())
-            });
+        });
         if !needs_test_database(scenarios) {
             gate_env.retain(|(name, _)| !withheld_without_test_database(name));
         }
@@ -5506,6 +5527,7 @@ impl Judge {
                 scenario.as_deref(),
                 &head_env,
                 gate_wall_clock(),
+                &self.host_load_env,
             )
         };
         // Only a gate that runs on the test database can fail because it
@@ -5552,6 +5574,7 @@ impl Judge {
                 scenario.as_deref(),
                 &gate_env,
                 gate_wall_clock(),
+                &self.host_load_env,
             );
             bound.replace(Some((given, inputs::env_here(gate_log(&judged)))));
             (judged, base_check)

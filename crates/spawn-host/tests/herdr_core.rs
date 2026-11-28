@@ -1,5 +1,7 @@
 //! Integration tests for embedded `herdr-core` (`HerdrCoreHost` + sibling `spawn-hc` + `herdr_witness`).
 
+#![allow(clippy::disallowed_methods)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,7 +13,7 @@ use spawn_core::port::{
     AgentReading, AgentStatus, EngineView, Launch, Runner, ServerSeen, TerminalHost, ViewedLaunch,
 };
 use spawn_host::engine_view::HOST_DIRECTORIES;
-use spawn_host::{BwrapView, HerdrCoreHost, Scratch, ViewConfig};
+use spawn_host::{BwrapView, HerdrCoreHost, Scratch, TerminalHostEnv, ViewConfig};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -84,7 +86,14 @@ impl Session {
     }
 
     fn host(&self) -> HerdrCoreHost {
-        HerdrCoreHost::on_session(&self.program, &self.name)
+        let host_env = TerminalHostEnv {
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            scrubbed_env_keys: TerminalHostEnv::collect_scrubbed_keys(
+                std::env::vars_os().map(|(k, _)| k),
+            ),
+            ..TerminalHostEnv::default()
+        };
+        HerdrCoreHost::on_session(&self.program, &self.name, host_env)
             .expect("valid session")
             .with_runtime_under(self.runtime())
             .with_terminate_waits(Duration::from_secs(3), Duration::from_secs(2))
@@ -603,6 +612,8 @@ fn bwrap_view_hides_herdr_core_paths_while_host_witness_sees_sandboxed_agy() {
         inherit_host: spawn_host::HostInheritMode::Off,
         inherit_host_paths: Vec::new(),
         engines: spawn_host::engine_view::EngineViews::default(),
+        path_env: std::env::var("PATH").ok(),
+        container_env: std::env::var("container").ok(),
     };
     let Ok(view) = BwrapView::new("bwrap", config) else {
         assert!(!required(), "SPAWN_REQUIRE_HERDR=1 and bwrap unavailable");
@@ -692,7 +703,9 @@ impl Drop for PoolCleanup {
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         for session in &self.sessions {
-            if let Ok(host) = HerdrCoreHost::on_session(&self.program, session) {
+            if let Ok(host) =
+                HerdrCoreHost::on_session(&self.program, session, TerminalHostEnv::default())
+            {
                 let host = host.with_runtime_under(self.runtime.clone());
                 while matches!(host.server(), ServerSeen::Answers(_)) && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(50));
@@ -723,6 +736,15 @@ fn pick_pool_terminals(pool: &spawn_host::HerdrPool, shards: usize) -> Vec<Termi
     chosen
 }
 
+fn scrubbed_host_env() -> TerminalHostEnv {
+    TerminalHostEnv {
+        scrubbed_env_keys: TerminalHostEnv::collect_scrubbed_keys(
+            std::env::vars_os().map(|(k, _)| k),
+        ),
+        ..TerminalHostEnv::default()
+    }
+}
+
 #[test]
 fn herdr_pool_with_embedded_herdr_core_shards_concurrently() {
     let _serial = exclusive();
@@ -747,7 +769,7 @@ fn herdr_pool_with_embedded_herdr_core_shards_concurrently() {
     .expect("write stub");
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
 
-    let pool = spawn_host::HerdrPool::on_core_session(&program, &base, 4)
+    let pool = spawn_host::HerdrPool::on_core_session(&program, &base, 4, &scrubbed_host_env())
         .expect("core pool")
         .with_runtime_under(&runtime);
     assert!(pool.is_core());

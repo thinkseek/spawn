@@ -523,6 +523,10 @@ pub struct ViewConfig {
     pub inherit_host_paths: Vec<PathBuf>,
     /// Per-engine executable paths and off-home data root configuration.
     pub engines: EngineViews,
+    /// Host `PATH` used to resolve non-path programs such as `bwrap`.
+    pub path_env: Option<String>,
+    /// Outer container runtime hint (`container` env var, e.g. `podman`).
+    pub container_env: Option<String>,
 }
 
 fn trim_trailing_slash(raw: &str) -> &str {
@@ -658,6 +662,8 @@ impl ViewConfig {
             inherit_host,
             inherit_host_paths,
             engines: EngineViews::from_env(lookup),
+            path_env: lookup("PATH"),
+            container_env: lookup("container"),
         }
     }
 
@@ -799,7 +805,7 @@ impl BwrapView {
     /// of the same kind (same namespaces, a tmpfs and a bind) within
     /// `CHECK_LIMIT`.
     pub fn new(program: &str, config: ViewConfig) -> Result<Self, String> {
-        let program = find_program(program)
+        let program = find_program(program, config.path_env.as_deref())
             .ok_or_else(|| format!("{program} is not installed (not found on PATH)"))?;
         let view = Self { program, config };
         view.validate_config()?;
@@ -2529,7 +2535,10 @@ impl ContainerView {
     /// Construct a [`ContainerView`], failing closed unless container runtime
     /// signals are detected on the host.
     pub fn new(config: ViewConfig) -> Result<Self, String> {
-        Self::new_with_detector(config, &crate::container::detect_container)
+        let container_env = config.container_env.clone();
+        Self::new_with_detector(config, &|| {
+            crate::container::detect_container(container_env.as_deref())
+        })
     }
 
     /// Testable constructor taking a custom container detector.
@@ -3149,18 +3158,17 @@ fn find_program_entry(program: &str, path_env: Option<&str>) -> Option<PathBuf> 
         let path = PathBuf::from(program);
         return is_executable(&path).then_some(path);
     }
-    let path_os = path_env
-        .map(std::ffi::OsString::from)
-        .or_else(|| std::env::var_os("PATH"))?;
+    let path_os = path_env.map(std::ffi::OsString::from)?;
     std::env::split_paths(&path_os)
         .map(|dir| dir.join(program))
         .find(|candidate| is_executable(candidate))
 }
 
 /// `program` as a path: itself when it names one, else the first
-/// executable of that name on `PATH`, canonical.
-fn find_program(program: &str) -> Option<PathBuf> {
-    find_program_entry(program, None).map(|found| std::fs::canonicalize(&found).unwrap_or(found))
+/// executable of that name on `path_env`, canonical.
+fn find_program(program: &str, path_env: Option<&str>) -> Option<PathBuf> {
+    find_program_entry(program, path_env)
+        .map(|found| std::fs::canonicalize(&found).unwrap_or(found))
 }
 
 #[cfg(test)]
@@ -3200,6 +3208,8 @@ mod tests {
             inherit_host: super::HostInheritMode::Off,
             inherit_host_paths: Vec::new(),
             engines: EngineViews::default(),
+            path_env: None,
+            container_env: None,
         };
         let view = BwrapView {
             program: PathBuf::from("/usr/bin/bwrap"),
@@ -4199,6 +4209,8 @@ mod tests {
                 claude: Some(EnginePaths::Program(entry_bin)),
                 ..EngineViews::default()
             },
+            path_env: None,
+            container_env: None,
         };
         let view = BwrapView {
             program: PathBuf::from("/usr/bin/bwrap"),
@@ -4231,6 +4243,40 @@ mod tests {
             "expected symlink hop inside symlinked $HOME to resolve canonical parent bind: {:?}",
             planned.words
         );
+    }
+
+    fn prog_mask_view(
+        home: &Path,
+        runtime: &Path,
+        host_keep: &Path,
+        private_dir: &Path,
+        link_bin: &Path,
+    ) -> BwrapView {
+        BwrapView {
+            program: PathBuf::from("/usr/bin/bwrap"),
+            config: ViewConfig {
+                home: home.to_path_buf(),
+                xdg_config_home: None,
+                xdg_state_home: None,
+                runtime_dir: runtime.to_path_buf(),
+                host_directories: vec![host_keep.to_path_buf()],
+                loop_dirs: Vec::new(),
+                extra_files: Vec::new(),
+                host_tmpdir: None,
+                private_dir: private_dir.to_path_buf(),
+                canonical_workspace: Some(PathBuf::from("/workspace")),
+                home_isolation: super::HomeIsolation::Whitelist,
+                extra_mounts: Vec::new(),
+                inherit_host: super::HostInheritMode::Off,
+                inherit_host_paths: Vec::new(),
+                engines: EngineViews {
+                    claude: Some(EnginePaths::Program(link_bin.to_path_buf())),
+                    ..EngineViews::default()
+                },
+                path_env: None,
+                container_env: None,
+            },
+        }
     }
 
     #[test]
@@ -4286,29 +4332,7 @@ mod tests {
                 let _ = std::fs::remove_file(&link_bin);
                 std::os::unix::fs::symlink(target, &link_bin).expect("symlink prog");
 
-                let view = BwrapView {
-                    program: PathBuf::from("/usr/bin/bwrap"),
-                    config: ViewConfig {
-                        home: home.clone(),
-                        xdg_config_home: None,
-                        xdg_state_home: None,
-                        runtime_dir: runtime.clone(),
-                        host_directories: vec![host_keep.clone()],
-                        loop_dirs: Vec::new(),
-                        extra_files: Vec::new(),
-                        host_tmpdir: None,
-                        private_dir: private_dir.clone(),
-                        canonical_workspace: Some(PathBuf::from("/workspace")),
-                        home_isolation: super::HomeIsolation::Whitelist,
-                        extra_mounts: Vec::new(),
-                        inherit_host: super::HostInheritMode::Off,
-                        inherit_host_paths: Vec::new(),
-                        engines: EngineViews {
-                            claude: Some(EnginePaths::Program(link_bin.clone())),
-                            ..EngineViews::default()
-                        },
-                    },
-                };
+                let view = prog_mask_view(&home, &runtime, &host_keep, &private_dir, &link_bin);
                 let planned = view
                     .plan(&ViewedLaunch {
                         engine: "claude",
