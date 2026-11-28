@@ -814,6 +814,17 @@ fn scan_source(rel_or_abs_path: &Path, src: &str) -> Vec<Violation> {
     violations_from_lines(rel_or_abs_path, src, violated_lines)
 }
 
+fn scan_whoami_source(rel_or_abs_path: &Path, src: &str) -> Vec<Violation> {
+    let tokens = tokenize(src);
+    let prod_tokens = strip_cfg_test_tokens(&tokens);
+    let violated_lines: BTreeSet<usize> = prod_tokens
+        .iter()
+        .filter(|tok| tok.ident_name() == Some("whoami"))
+        .map(|tok| tok.line)
+        .collect();
+    violations_from_lines(rel_or_abs_path, src, violated_lines)
+}
+
 fn is_forbidden_lint_args(args: &[Token]) -> bool {
     let mut i = 0usize;
     while i < args.len() {
@@ -1328,6 +1339,39 @@ fn workspace_production_code_contains_zero_unallowlisted_env_var_or_suppress_all
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+#[test]
+fn spawn_postgres_production_has_no_implicit_os_user_fallback() {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    collect_rs_files(&root.join("crates/spawn-postgres/src"), &mut files);
+    let mut violations = Vec::new();
+    for file in files {
+        let rel = file.strip_prefix(&root).unwrap_or(&file);
+        let text =
+            fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        violations.extend(scan_whoami_source(rel, &text));
+    }
+    assert!(
+        violations.is_empty(),
+        "forbidden production whoami reference(s) found:\n{}",
+        violations
+            .iter()
+            .map(|v| format!("  {}:{}: {}", v.path.display(), v.line, v.snippet))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let probe = scan_whoami_source(
+        Path::new("synthetic.rs"),
+        "pub fn bad() { let _ = whoami::username().ok(); }\n#[cfg(test)] mod tests { fn ok() { let _ = whoami::username(); } }\n",
+    );
+    assert_eq!(
+        probe.len(),
+        1,
+        "negative probe must catch production whoami: {probe:?}"
+    );
+    assert_eq!(probe[0].line, 1);
 }
 
 #[test]

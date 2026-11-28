@@ -76,7 +76,7 @@ pub(super) fn url_from_file_with(
         .map_err(|error| format!("cannot be read: {}", error.kind()))?;
     let url = text.trim().to_string();
     let named = spawn_postgres::database_identity_with_defaults(&url, defaults)?;
-    if !named.local {
+    if !named.is_local() {
         return Err("names a host that is not this one's (a local socket or loopback)".to_string());
     }
     if let Some(live) =

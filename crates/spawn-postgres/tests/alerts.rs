@@ -693,3 +693,159 @@ fn the_controller_reading_lists_the_gated_missions_with_reported_work() {
         "{reading}"
     );
 }
+
+#[test]
+fn alert_clock_mirror_and_control_hold_back_behind_in_flight_control_writer() {
+    let (store, schema) = store("alerts_xid8_ctrl_hold");
+    let baseline = store.watermark().expect("baseline");
+
+    let mut conn_a = admin(&schema);
+    let mut conn_b = admin(&schema);
+
+    let mut tx_a = conn_a.transaction().expect("begin tx_a");
+    let id_a: i64 = tx_a
+        .query_one(
+            "select spawn_control_record($1)",
+            &[&json!({"type": "mission.added", "id": 91, "text": "in-flight mission", "origin": "human"})],
+        )
+        .expect("in-flight control record")
+        .get(0);
+
+    let worker_kind = json!({"name": "session.noted", "detail": {"text": "later commit"}});
+    let id_b: i64 = conn_b
+        .query_one(
+            "select out_id from spawn_append_trusted('agent_w', 'session_ctrl_other', null, 'bridge', null, $1)",
+            &[&worker_kind],
+        )
+        .expect("worker append")
+        .get(0);
+    assert!(id_b > id_a, "expected id_b ({id_b}) > id_a ({id_a})");
+
+    let (clock_wm, _) = store.alert_clock().expect("clock");
+    assert!(
+        clock_wm < id_a && clock_wm <= baseline,
+        "alert_clock ({clock_wm}) jumped past uncommitted control id_a={id_a}"
+    );
+    let mirror = store.alert_mirror().expect("mirror");
+    let mirror_wm = mirror["watermark"].as_i64().expect("mirror watermark");
+    assert!(
+        mirror_wm < id_a && mirror_wm <= baseline,
+        "alert_mirror watermark ({mirror_wm}) jumped past uncommitted control id_a={id_a}"
+    );
+    let batch_open = store.alert_control(baseline, 100).expect("control batch");
+    assert_eq!(
+        batch_open["records"].as_array().map(Vec::len),
+        Some(0),
+        "alert_control must not skip past uncommitted control id_a: {batch_open}"
+    );
+
+    tx_a.commit().expect("commit tx_a");
+    let (clock_after, _) = store.alert_clock().expect("clock after");
+    assert_eq!(clock_after, id_b);
+    let batch_after = store.alert_control(baseline, 100).expect("control after");
+    let records = batch_after["records"].as_array().expect("records array");
+    assert_eq!(records.len(), 1, "{batch_after}");
+    assert_eq!(records[0]["event_id"], id_a);
+}
+
+#[test]
+fn alert_mirror_advances_past_committed_control_with_unrelated_in_flight_worker() {
+    let (store, schema) = store("alerts_xid8_mirror_no_double");
+    let mut conn_a = admin(&schema);
+    let mut conn_b = admin(&schema);
+
+    let mut tx_a = conn_a.transaction().expect("begin tx_a");
+    let worker_kind = json!({"name": "session.noted", "detail": {"text": "in-flight worker"}});
+    let id_worker: i64 = tx_a
+        .query_one(
+            "select out_id from spawn_append_trusted('agent_w', 'session_worker_open', null, 'bridge', null, $1)",
+            &[&worker_kind],
+        )
+        .expect("in-flight worker append")
+        .get(0);
+
+    let id_control: i64 = conn_b
+        .query_one(
+            "select spawn_control_record($1)",
+            &[&json!({"type": "mission.added", "id": 92, "text": "committed mission", "origin": "human"})],
+        )
+        .expect("committed control record")
+        .get(0);
+    assert!(
+        id_control > id_worker,
+        "expected id_control ({id_control}) > id_worker ({id_worker})"
+    );
+
+    let mirror = store.alert_mirror().expect("mirror");
+    assert_eq!(mirror["watermark"].as_i64(), Some(id_control));
+    let has_mission = mirror["missions"]
+        .as_array()
+        .is_some_and(|missions| missions.iter().any(|m| m["id"] == 92));
+    assert!(
+        has_mission,
+        "mission 92 must be present in mirror: {mirror}"
+    );
+    let replay_check = store
+        .alert_control(id_control, 100)
+        .expect("subsequent alert_control after mirror watermark");
+    assert_eq!(
+        replay_check["records"].as_array().map(Vec::len),
+        Some(0),
+        "already-folded mission 92 must not be re-fed after mirror watermark: {replay_check}"
+    );
+
+    tx_a.commit().expect("commit tx_a");
+}
+
+#[test]
+fn alert_archives_holds_back_behind_in_flight_writer_and_delivers_both_on_commit() {
+    let (store, schema) = store("alerts_xid8_archives_hold");
+    let baseline = store.watermark().expect("baseline");
+
+    let mut conn_a = admin(&schema);
+    let mut conn_b = admin(&schema);
+
+    let archive_kind = |native: &str| {
+        json!({
+            "name": "archive.failed",
+            "detail": {"native": native, "reason": "disk full"}
+        })
+    };
+
+    let mut tx_a = conn_a.transaction().expect("begin tx_a");
+    let id_a: i64 = tx_a
+        .query_one(
+            "select out_id from spawn_append_trusted('agent_a', 'session_arch_a', null, 'bridge', null, $1)",
+            &[&archive_kind("native_a")],
+        )
+        .expect("in-flight archive a")
+        .get(0);
+
+    let id_b: i64 = conn_b
+        .query_one(
+            "select out_id from spawn_append_trusted('agent_b', 'session_arch_b', null, 'bridge', null, $1)",
+            &[&archive_kind("native_b")],
+        )
+        .expect("committed archive b")
+        .get(0);
+    assert!(id_b > id_a, "expected id_b ({id_b}) > id_a ({id_a})");
+
+    let while_open = store.alert_archives(baseline).expect("archives while open");
+    assert_eq!(
+        while_open,
+        json!([]),
+        "alert_archives must not return id_b ahead of uncommitted id_a"
+    );
+
+    tx_a.commit().expect("commit tx_a");
+    let after_commit = store
+        .alert_archives(baseline)
+        .expect("archives after commit");
+    let ids: Vec<i64> = after_commit
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|entry| entry["event_id"].as_i64().expect("event_id"))
+        .collect();
+    assert_eq!(ids, vec![id_a, id_b], "{after_commit}");
+}

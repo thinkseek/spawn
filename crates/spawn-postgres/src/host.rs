@@ -265,21 +265,52 @@ pub struct LibpqDefaults {
     pub database: Option<String>,
 }
 
+/// Whether a PostgreSQL server is on this host or at a remote address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostLocality {
+    /// A Unix socket, `localhost`, or a loopback IP address (`127.0.0.0/8`, `::1`).
+    Local,
+    /// A non-empty, lowercased remote host name or non-loopback IP address.
+    Remote(String),
+}
+
+impl HostLocality {
+    /// Whether this server is local to this host (a Unix socket or loopback address).
+    #[must_use]
+    pub const fn is_local(&self) -> bool {
+        matches!(self, Self::Local)
+    }
+
+    /// The lowercased remote host name or address, or `None` when [`Self::Local`].
+    #[must_use]
+    pub fn remote_host(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Remote(host) => Some(host),
+        }
+    }
+}
+
 /// The database a URL names, after libpq's defaults (objective 094): whether
-/// its server is this host's (a socket, or a loopback host), the port and
-/// the database name. Two spellings of one database (a socket against
+/// its server is this host's (a socket, or a loopback host) or remote, the
+/// port and the database name. Two spellings of one database (a socket against
 /// localhost or 127.0.0.1, an explicit 5432, another user) name the same.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseIdentity {
-    /// A Unix socket, localhost, or an address in 127.0.0.0/8 or ::1.
-    pub local: bool,
-    /// The host as named, for a server that is not local; empty for a
-    /// local one.
-    pub host: String,
+    /// Whether the server is local to this host or at a remote host name.
+    pub locality: HostLocality,
     /// TCP or Unix-socket port number (defaults to `LibpqDefaults::port` or 5432).
     pub port: u16,
     /// Target database name resolved after libpq defaults.
     pub database: String,
+}
+
+impl DatabaseIdentity {
+    /// Whether this server is local to this host (a Unix socket or loopback address).
+    #[must_use]
+    pub const fn is_local(&self) -> bool {
+        self.locality.is_local()
+    }
 }
 
 /// Resolve [`DatabaseIdentity`] using caller-supplied [`LibpqDefaults`] instead of
@@ -288,7 +319,7 @@ pub struct DatabaseIdentity {
 /// # Errors
 ///
 /// A URL that does not parse as a postgres URL or key-value string, or one
-/// naming more than one host or port.
+/// naming an empty host or more than one host or port.
 pub fn database_identity_with_defaults(
     url: &str,
     defaults: &LibpqDefaults,
@@ -301,18 +332,21 @@ pub fn database_identity_with_defaults(
     if hosts.len() > 1 {
         return Err("names more than one host".to_string());
     }
-    let (local, host) = match hosts.first() {
-        None | Some(postgres::config::Host::Unix(_)) => (true, String::new()),
+    let locality = match hosts.first() {
+        None | Some(postgres::config::Host::Unix(_)) => HostLocality::Local,
         Some(postgres::config::Host::Tcp(name)) => {
-            let bare = name.trim_start_matches('[').trim_end_matches(']');
+            let bare = name.trim().trim_start_matches('[').trim_end_matches(']');
+            if bare.is_empty() {
+                return Err("names an empty host".to_string());
+            }
             let loopback = bare.eq_ignore_ascii_case("localhost")
                 || bare
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|address| address.is_loopback());
             if loopback {
-                (true, String::new())
+                HostLocality::Local
             } else {
-                (false, bare.to_ascii_lowercase())
+                HostLocality::Remote(bare.to_ascii_lowercase())
             }
         }
     };
@@ -332,8 +366,7 @@ pub fn database_identity_with_defaults(
         .or_else(|| defaults.database.clone())
         .unwrap_or(user);
     Ok(DatabaseIdentity {
-        local,
-        host,
+        locality,
         port,
         database,
     })
@@ -536,14 +569,16 @@ impl PostgresStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{LibpqDefaults, database_identity_with_defaults};
+    use super::{HostLocality, LibpqDefaults, database_identity_with_defaults};
 
     #[test]
     fn database_identity_uses_explicit_defaults_without_reading_env() {
         let bare =
             database_identity_with_defaults("postgres:///spawn_test", &LibpqDefaults::default())
                 .expect("parse");
-        assert!(bare.local);
+        assert!(bare.is_local());
+        assert_eq!(bare.locality, HostLocality::Local);
+        assert_eq!(bare.locality.remote_host(), None);
         assert_eq!(bare.port, 5432);
         assert_eq!(bare.database, "spawn_test");
 
@@ -556,12 +591,13 @@ mod tests {
             },
         )
         .expect("parse with defaults");
-        assert!(with_defaults.local);
+        assert!(with_defaults.is_local());
+        assert_eq!(with_defaults.locality, HostLocality::Local);
         assert_eq!(with_defaults.port, 65432);
         assert_eq!(with_defaults.database, "alice");
 
         let explicit_db = database_identity_with_defaults(
-            "host=db.example.com",
+            "host=DB.EXAMPLE.COM",
             &LibpqDefaults {
                 port: Some(5433),
                 user: Some("alice".to_string()),
@@ -569,8 +605,12 @@ mod tests {
             },
         )
         .expect("parse explicit db");
-        assert!(!explicit_db.local);
-        assert_eq!(explicit_db.host, "db.example.com");
+        assert!(!explicit_db.is_local());
+        assert_eq!(
+            explicit_db.locality,
+            HostLocality::Remote("db.example.com".to_string())
+        );
+        assert_eq!(explicit_db.locality.remote_host(), Some("db.example.com"));
         assert_eq!(explicit_db.port, 5433);
         assert_eq!(explicit_db.database, "custom_db");
 
@@ -583,8 +623,39 @@ mod tests {
             },
         )
         .expect("parse uri");
-        assert!(uri_defaults.local);
+        assert!(uri_defaults.is_local());
+        assert_eq!(uri_defaults.locality, HostLocality::Local);
         assert_eq!(uri_defaults.port, 5432);
         assert_eq!(uri_defaults.database, "custom_db");
+
+        let ipv6_loopback = database_identity_with_defaults(
+            "postgres://bob@[::1]/spawn_test",
+            &LibpqDefaults::default(),
+        )
+        .expect("parse ipv6 loopback");
+        assert!(ipv6_loopback.is_local());
+        assert_eq!(ipv6_loopback.locality, HostLocality::Local);
+
+        let subnet_loopback = database_identity_with_defaults(
+            "postgres://bob@127.0.0.2/spawn_test",
+            &LibpqDefaults::default(),
+        )
+        .expect("parse 127/8 loopback");
+        assert!(subnet_loopback.is_local());
+
+        let socket = database_identity_with_defaults(
+            "host=/var/run/postgresql dbname=spawn_test",
+            &LibpqDefaults::default(),
+        )
+        .expect("parse unix socket");
+        assert!(socket.is_local());
+
+        let empty_host = database_identity_with_defaults(
+            "postgres://user:secret_pw@[]/spawn_test",
+            &LibpqDefaults::default(),
+        )
+        .expect_err("empty bracket host must be refused");
+        assert!(empty_host.contains("empty host"), "{empty_host}");
+        assert!(!empty_host.contains("secret_pw"), "{empty_host}");
     }
 }

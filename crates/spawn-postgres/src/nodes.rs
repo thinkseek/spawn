@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde_json::Value;
 use spawn_core::port::StoreError;
 
-use crate::{ConnectOptions, PostgresStore, backend};
+use crate::{ConnectOptions, PostgresStore, SchemaScope, SecretString, backend};
 
 /// How a background worker reaches this store's database and schema on a
 /// connection of its own, made on the worker's thread (never the caller's):
@@ -19,32 +19,50 @@ use crate::{ConnectOptions, PostgresStore, backend};
 /// it long.
 #[derive(Clone)]
 pub struct StoreConnector {
-    url: String,
+    url: SecretString,
     passfile: Option<PathBuf>,
-    schema: Option<String>,
+    schema: SchemaScope,
     timeout: Duration,
 }
 
+impl std::fmt::Debug for StoreConnector {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoreConnector")
+            .field("url", &self.url)
+            .field("passfile", &self.passfile)
+            .field("schema", &self.schema)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
 impl StoreConnector {
+    /// Whether this connector targets the default `search_path` or a validated isolated schema.
+    #[must_use]
+    pub const fn schema_scope(&self) -> &SchemaScope {
+        &self.schema
+    }
+
     /// Connect (the connect itself bounded at 5 s).
     pub fn connect(&self) -> Result<PostgresStore, StoreError> {
         let mut store = PostgresStore::connect_with_options(
-            &self.url,
+            self.url.expose_secret(),
             &ConnectOptions {
                 passfile: self.passfile.clone(),
                 statement_timeout: Some(self.timeout),
             },
         )?;
         let timeout = (self.timeout / 2).as_millis().max(1);
-        let session = match &self.schema {
-            Some(schema) => format!("set lock_timeout = {timeout}; set search_path to {schema}"),
+        let session = match self.schema.set_search_path_sql() {
+            Some(set_path) => format!("set lock_timeout = {timeout}; {set_path}"),
             None => format!("set lock_timeout = {timeout}"),
         };
         store
             .lock()
             .batch_execute(&session)
             .map_err(|error| backend(&error))?;
-        store.schema.clone_from(&self.schema);
+        store.schema = self.schema.clone();
         Ok(store)
     }
 }

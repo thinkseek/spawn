@@ -29,9 +29,41 @@ pub(crate) const MISSION_GATES: &str = "select coalesce(jsonb_agg(jsonb_build_ob
     'mission', id, 'gate', gate, 'source', sources ->> 0) order by id), '[]'::jsonb)
   from mission_missions where state in ('open', 'active')";
 
-/// The event watermark and the database's clock, in one index-only read:
-/// an idle pass costs the loop one statement (objective 023).
-pub(crate) const CLOCK: &str = "select coalesce(max(id), 0), spawn_now_ms() from spawn_events";
+/// Schema-scoped contiguous committed event watermark under `commit_watermark_cte!()`
+/// (`wm.safe_xid`): greatest `id` whose transaction committed below `safe_xid` and
+/// precedes the earliest row with `commit_xid >= wm.safe_xid` so an out-of-order
+/// commit never leaps ahead of an open earlier writer.
+macro_rules! committed_contiguous_watermark_id {
+    () => {
+        "coalesce(
+            (select id from spawn_events
+              where commit_xid < wm.safe_xid
+                and id < coalesce(
+                        (select min(n.id) from spawn_events n where n.commit_xid >= wm.safe_xid),
+                        9223372036854775807::bigint
+                    )
+              order by id desc
+              limit 1),
+            0
+        )"
+    };
+}
+
+/// The committed event watermark (`commit_watermark_cte!()`) and the database's
+/// clock, in one statement: an idle pass costs the loop one statement (objective 023),
+/// while in-flight transactions hold back the watermark so later commits on other
+/// sessions cannot jump past them.
+pub(crate) const CLOCK: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    "
+      select ",
+    committed_contiguous_watermark_id!(),
+    " as id,
+             spawn_now_ms() as now_ms,
+             wm.wm_raced
+        from wm"
+);
 
 /// For a typed message (`spawn_command_message`'s `typed`):
 /// `read_since_typed`, how many transcript lines of its session the Bridge
@@ -175,14 +207,24 @@ pub(crate) const NOW: &str = "select spawn_now_ms()";
 /// task's delivery bound needs (its `task.assigned` record, and whether its
 /// agent holds a delivered or reported task).
 ///
-/// `watermark` is the newest event id, read by the same statement and so
-/// from the same snapshot as the missions and tasks: the loop's checks go on
-/// from it, so a record committed after this read is fed by them, and one
-/// the missions and tasks already hold is not fed again (objective 106).
-pub(crate) const MIRROR: &str = r"
+/// `watermark` is read from the same snapshot as the missions and tasks under
+/// `commit_watermark_cte!()`: it never advances past an uncommitted control writer
+/// (`greatest(contiguous_committed_watermark, max(control.recorded))` keeps
+/// already-folded control records reflected in `missions`/`tasks` from being
+/// re-fed if an unrelated non-control writer is in flight, preserving objective 106).
+pub(crate) const MIRROR: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    r"
 select jsonb_build_object(
   'now_ms', spawn_now_ms(),
-  'watermark', (select coalesce(max(id), 0) from spawn_events),
+  'watermark', greatest(",
+    committed_contiguous_watermark_id!(),
+    r",
+    coalesce((select max(e.id) from spawn_events e
+               where e.session_id = 'session_control'
+                 and e.event_name = 'control.recorded'), 0)
+  ),
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
         'id', m.id, 'state', m.state, 'halted', m.halted, 'accept', m.accept,
         'gated', m.gate is not null, 'gate_rejections', m.gate_rejections,
@@ -248,7 +290,10 @@ select jsonb_build_object(
                 and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
                 and e.kind -> 'detail' -> 'record' ->> 'evidence' = 'load_sensitive_parked'
               order by e.id desc limit 1) end)
-      order by k.id) from mission_tasks k), '[]'::jsonb))";
+      order by k.id) from mission_tasks k), '[]'::jsonb)) as payload,
+  wm.wm_raced
+  from wm"
+);
 
 /// Every alert row, and the newest transition event id: the loop reads its
 /// alerts back after a restart, and fires nothing twice.
@@ -265,39 +310,58 @@ select jsonb_build_object(
         'cleared_evidence', a.cleared_evidence)
       order by a.fired_at_ms, a.key) from spawn_alerts a), '[]'::jsonb))";
 
-/// The control records after `$1`, oldest first, at most `$2`: what the loop
-/// has not looked at yet. `next` is the event id it continues from (the
-/// batch's last one, or `$1` when there was none).
-/// The batch is read once: `next` and `records` are that one read's last id
-/// and rows, not two reads of the control stream (the loop reads it on every
-/// pass it acts on).
-pub(crate) const CONTROL: &str = r"
-with batch as (
+/// The committed control records after `$1` below the `xid8` watermark, oldest
+/// first, at most `$2`: what the loop has not looked at yet. `next` is the event
+/// id it continues from (the batch's last one, or `$1` when there was none).
+pub(crate) const CONTROL: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    r", batch as (
   select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
-    from spawn_events e
+    from spawn_events e, wm
    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.commit_xid < wm.safe_xid
+     and e.id < coalesce(
+             (select min(n.id) from spawn_events n where n.commit_xid >= wm.safe_xid),
+             9223372036854775807::bigint
+         )
      and e.id > $1
    order by e.id limit $2)
-select jsonb_build_object(
-  'next', coalesce(max(b.id), $1),
-  'records', coalesce(jsonb_agg(jsonb_build_object(
-        'event_id', b.id, 'at_ms', b.recorded_at_ms, 'record', b.record)
-      order by b.id), '[]'::jsonb))
-from batch b";
+select (select jsonb_build_object(
+          'next', coalesce(max(b.id), $1),
+          'records', coalesce(jsonb_agg(jsonb_build_object(
+                'event_id', b.id, 'at_ms', b.recorded_at_ms, 'record', b.record)
+              order by b.id), '[]'::jsonb))
+          from batch b) as payload,
+       wm.wm_raced
+  from wm"
+);
 
-/// The transcript archive's events with an id after `$1`, oldest first
-/// (objective 193, `archive_failed`): the Bridge's `archive.failed` and
-/// `archive.resumed` (objective 179), written on a change only, so the rows
-/// are few; the index on `(event_name, recorded_at_ms)` finds them.
-pub(crate) const ARCHIVES: &str = r"
-select coalesce(jsonb_agg(jsonb_build_object(
-      'event_id', e.id, 'name', e.event_name, 'agent_id', e.agent_id,
-      'session_id', e.session_id, 'at_ms', e.recorded_at_ms,
-      'native', e.kind -> 'detail' ->> 'native',
-      'reason', e.kind -> 'detail' ->> 'reason')
-    order by e.id), '[]'::jsonb)
-from spawn_events e
-where e.event_name in ('archive.failed', 'archive.resumed') and e.id > $1";
+/// The transcript archive's committed events with an id after `$1` below the
+/// `xid8` watermark, oldest first (objective 193, `archive_failed`).
+pub(crate) const ARCHIVES: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    r"
+select coalesce((
+         select jsonb_agg(jsonb_build_object(
+                  'event_id', e.id, 'name', e.event_name, 'agent_id', e.agent_id,
+                  'session_id', e.session_id, 'at_ms', e.recorded_at_ms,
+                  'native', e.kind -> 'detail' ->> 'native',
+                  'reason', e.kind -> 'detail' ->> 'reason')
+                order by e.id)
+           from spawn_events e
+          where e.event_name in ('archive.failed', 'archive.resumed')
+            and e.commit_xid < wm.safe_xid
+            and e.id < coalesce(
+                    (select min(n.id) from spawn_events n where n.commit_xid >= wm.safe_xid),
+                    9223372036854775807::bigint
+                )
+            and e.id > $1
+       ), '[]'::jsonb) as payload,
+       wm.wm_raced
+  from wm"
+);
 
 /// The records the alert conditions read, newest last, since `$1`: the ones
 /// objectives 028, 029, 031 and 033 define, and the halt and resume, so a
@@ -572,11 +636,11 @@ impl PostgresStore {
         }))
     }
 
-    /// The newest event id and the database's clock, in one statement
-    /// (`CLOCK`).
+    /// The newest committed contiguous event id and the database's clock, in
+    /// one statement (`CLOCK`).
     pub fn alert_clock(&self) -> Result<(i64, i64), StoreError> {
-        let row = self.query_one(CLOCK, &[])?;
-        Ok((row.get(0), row.get(1)))
+        let row = self.query_one_watermark_prepared(CLOCK, &[])?;
+        Ok((row.get("id"), row.get("now_ms")))
     }
 
     /// The database's clock in epoch ms (`NOW`).
@@ -597,7 +661,7 @@ impl PostgresStore {
 
     /// The missions and tasks the loop compares records against (`MIRROR`).
     pub fn alert_mirror(&self) -> Result<Value, StoreError> {
-        self.query_json(MIRROR, &[])
+        Ok(self.query_one_watermark(MIRROR, &[])?.get(0))
     }
 
     /// Every alert row and the newest transition's event id (`ROWS`).
@@ -607,7 +671,7 @@ impl PostgresStore {
 
     /// The control records after `after` (`CONTROL`).
     pub fn alert_control(&self, after: i64, limit: i64) -> Result<Value, StoreError> {
-        self.query_json(CONTROL, &[&after, &limit])
+        Ok(self.query_one_watermark(CONTROL, &[&after, &limit])?.get(0))
     }
 
     /// The alert-family records since `since_ms` (`HISTORY`).
@@ -630,7 +694,7 @@ impl PostgresStore {
     /// The transcript archive's events after the event id `after`, oldest
     /// first (`ARCHIVES`).
     pub fn alert_archives(&self, after: i64) -> Result<Value, StoreError> {
-        self.query_json(ARCHIVES, &[&after])
+        Ok(self.query_one_watermark(ARCHIVES, &[&after])?.get(0))
     }
 
     /// Every session's latest judgement (`OBSERVATIONS`).

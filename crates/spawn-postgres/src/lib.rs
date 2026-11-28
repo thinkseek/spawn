@@ -278,7 +278,7 @@ pub use gateway::{
 };
 pub use grading::RoutedTask;
 pub use host::{
-    DatabaseIdentity, LibpqDefaults, database_identity_with_defaults,
+    DatabaseIdentity, HostLocality, LibpqDefaults, database_identity_with_defaults,
     test_database_size_with_passfile, test_schemas_with_passfile,
 };
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
@@ -298,7 +298,7 @@ pub use row::RETIRED_EVENTS;
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };
-pub use wake::Listener;
+pub use wake::{CommittedWatermark, Listener};
 
 /// Schema installed by [`PostgresStore::migrate`].
 const SCHEMA: &str = include_str!("../sql/schema.sql");
@@ -337,6 +337,112 @@ fn backend(error: &postgres::Error) -> StoreError {
     StoreError::Unreachable(error.to_string())
 }
 
+/// Zeroized UTF-8 secret wrapper whose [`Debug`] representation redacts its
+/// contents and whose backing buffer is overwritten on [`Drop`].
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub(crate) struct SecretString(String);
+
+impl SecretString {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub(crate) fn expose_secret(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        let mut bytes = std::mem::take(&mut self.0).into_bytes();
+        let capacity = bytes.capacity();
+        bytes.resize(capacity, 0);
+        bytes.fill(0);
+        std::hint::black_box(bytes.as_slice());
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        bytes.clear();
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+/// Validated unquoted PostgreSQL schema identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ValidatedSchemaName(String);
+
+impl ValidatedSchemaName {
+    /// Validate and construct a plain unquoted schema identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Rejected`] when `name` is empty, begins with a
+    /// digit, or contains characters outside ASCII `[A-Za-z0-9_]`.
+    pub fn parse(name: &str) -> Result<Self, StoreError> {
+        let mut bytes = name.bytes();
+        let valid = bytes
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if !valid {
+            return Err(StoreError::Rejected(format!(
+                "schema name {name} is not a plain identifier"
+            )));
+        }
+        Ok(Self(name.to_string()))
+    }
+
+    /// Borrow the validated schema identifier string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ValidatedSchemaName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Closed schema target for a [`PostgresStore`] or [`StoreConnector`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SchemaScope {
+    /// Default connection `search_path`.
+    #[default]
+    Default,
+    /// Explicitly validated isolated schema (typically a per-test schema).
+    Isolated(ValidatedSchemaName),
+}
+
+impl SchemaScope {
+    /// Construct an isolated [`SchemaScope`] from a raw schema identifier.
+    pub fn isolated(schema: &str) -> Result<Self, StoreError> {
+        ValidatedSchemaName::parse(schema).map(Self::Isolated)
+    }
+
+    /// The isolated schema name, or `None` for [`Self::Default`].
+    #[must_use]
+    pub const fn schema_name(&self) -> Option<&ValidatedSchemaName> {
+        match self {
+            Self::Default => None,
+            Self::Isolated(name) => Some(name),
+        }
+    }
+
+    pub(crate) fn set_search_path_sql(&self) -> Option<String> {
+        self.schema_name()
+            .map(|schema| format!("set search_path to {schema}"))
+    }
+}
+
 /// Explicit connection options injected by entry boundaries into [`PostgresStore`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConnectOptions {
@@ -354,10 +460,10 @@ pub struct PostgresStore {
     workers: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The password in the URL this store connected with: the owner's, when
     /// it migrates, and the key the logins' passwords are derived from.
-    password: String,
+    password: SecretString,
     /// The URL this store connected with, for the server-wide migration
     /// lock ([`PostgresStore::migrate`]).
-    url: String,
+    url: SecretString,
     /// Optional passfile path passed when constructing this store, reused by reconnects/LISTEN.
     passfile: Option<std::path::PathBuf>,
     /// The statements this connection has prepared, by the SQL they were
@@ -366,7 +472,19 @@ pub struct PostgresStore {
     prepared: Mutex<std::collections::HashMap<&'static str, postgres::Statement>>,
     /// The schema a test store moved into ([`Self::connect_in_schema_with_options`]),
     /// for a connection of its own made elsewhere (nodes.rs `StoreConnector`).
-    schema: Option<String>,
+    schema: SchemaScope,
+}
+
+impl std::fmt::Debug for PostgresStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PostgresStore")
+            .field("url", &self.url)
+            .field("password", &self.password)
+            .field("passfile", &self.passfile)
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The restricted logins, by their base name; each database has its own
@@ -419,11 +537,17 @@ impl PostgresStore {
             client: Arc::new(Mutex::new(client)),
             workers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             password: url_password_with_passfile(url, passfile.as_deref()),
-            url: url.to_string(),
+            url: SecretString::new(url),
             passfile,
             prepared: Mutex::new(std::collections::HashMap::new()),
-            schema: None,
+            schema: SchemaScope::Default,
         })
+    }
+
+    /// Whether this store operates on the default `search_path` or a validated isolated schema.
+    #[must_use]
+    pub const fn schema_scope(&self) -> &SchemaScope {
+        &self.schema
     }
 
     /// Connect and move this session into `schema`, creating it when absent,
@@ -440,22 +564,15 @@ impl PostgresStore {
         schema: &str,
         options: &ConnectOptions,
     ) -> Result<Self, StoreError> {
-        if !schema
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_')
-        {
-            return Err(StoreError::Rejected(format!(
-                "schema name {schema} is not a plain identifier"
-            )));
-        }
+        let validated = ValidatedSchemaName::parse(schema)?;
         let mut store = Self::connect_with_options(url, options)?;
-        store.schema = Some(schema.to_string());
+        store.schema = SchemaScope::Isolated(validated.clone());
         {
             let mut client = store.lock();
             client
                 .batch_execute(&format!(
-                    "{}; set search_path to {schema}",
-                    made_schema_sql(schema)
+                    "{}; set search_path to {validated}",
+                    made_schema_sql(validated.as_str())
                 ))
                 .map_err(|error| backend(&error))?;
         }
@@ -476,15 +593,31 @@ impl PostgresStore {
     /// never granted again on the shared connection a judging records
     /// through; the landing's records still go through the shared store.
     pub fn new_connection(&self) -> Result<PostgresStore, StoreError> {
-        // The schema this store's session is in (a test store connects into
-        // a schema the URL does not name).
-        let schema: String = self
-            .lock()
-            .query_one("select current_schema()", &[])
-            .map_err(|error| backend(&error))?
-            .get(0);
-        let store = PostgresStore::connect_with_options(
-            &self.url,
+        let (target_schema, resolved_scope) = match &self.schema {
+            SchemaScope::Isolated(schema) => {
+                (schema.clone(), SchemaScope::Isolated(schema.clone()))
+            }
+            SchemaScope::Default => {
+                // The schema this store's session is in (e.g. a connection whose URL
+                // set search_path without calling connect_in_schema_with_options).
+                let current: Option<String> = self
+                    .lock()
+                    .query_one("select current_schema()", &[])
+                    .map_err(|error| backend(&error))?
+                    .get(0);
+                let current = current
+                    .ok_or_else(|| StoreError::Backend("current_schema is empty".to_string()))?;
+                let validated = ValidatedSchemaName::parse(&current)?;
+                let scope = if validated.as_str() == "public" {
+                    SchemaScope::Default
+                } else {
+                    SchemaScope::Isolated(validated.clone())
+                };
+                (validated, scope)
+            }
+        };
+        let mut store = PostgresStore::connect_with_options(
+            self.url.expose_secret(),
             &ConnectOptions {
                 passfile: self.passfile.clone(),
                 statement_timeout: None,
@@ -493,9 +626,10 @@ impl PostgresStore {
         {
             let mut client = store.lock();
             client
-                .batch_execute(&format!("set search_path to {schema}"))
+                .batch_execute(&format!("set search_path to {target_schema}"))
                 .map_err(|error| backend(&error))?;
         }
+        store.schema = resolved_scope;
         Ok(store)
     }
 
@@ -507,10 +641,10 @@ impl PostgresStore {
         // updated"). Advisory locks belong to one database, so migrations
         // take theirs in the server's maintenance database, which every
         // database on the server shares: one migration at a time per server.
-        // Where that database cannot be reached, a lost race is run again
-        // (every statement of the schema is idempotent), a bounded number of
-        // times.
-        let _server = server_migration_lock(&self.url, self.passfile.as_deref());
+        // Invalid URL/passfile config or fatal SQL errors fail closed at once;
+        // transient maintenance-DB unavailability retries boundedly and then
+        // falls back to the idempotent catalog-race retry loop below.
+        let _server = server_migration_lock(self.url.expose_secret(), self.passfile.as_deref())?;
         let mut attempt: u32 = 0;
         loop {
             match self.migrate_once() {
@@ -556,8 +690,9 @@ impl PostgresStore {
                 // reaches pg_stat_activity and, on an error, the server log.
                 // The verifier is base64, `$` and `:`, and the role
                 // [a-z0-9_]: nothing needs quoting.
-                let password = role_password(&self.password, &salt, &role);
-                let verifier = postgres_protocol::password::scram_sha_256(password.as_bytes());
+                let password = role_password(self.password.expose_secret(), &salt, &role);
+                let verifier =
+                    postgres_protocol::password::scram_sha_256(password.expose_secret().as_bytes());
                 transaction.batch_execute(&format!(
                     "alter role \"{role}\" with login password '{verifier}'"
                 ))?;
@@ -571,33 +706,149 @@ impl PostgresStore {
 /// Key of the server-wide migration lock (an arbitrary constant).
 const MIGRATION_LOCK_KEY: i64 = 1_399_957_400;
 
+/// Maximum bounded attempts to acquire the server-wide migration lock when the
+/// maintenance database (`postgres`) is transiently unreachable or saturated.
+const SERVER_LOCK_ATTEMPTS: u32 = 5;
+
+/// Why the server-wide migration lock was explicitly yielded to the caller's
+/// bounded catalog-race retry loop rather than held across migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MigrationLockFallback {
+    MaintenanceDbInaccessible,
+    TransientlyUnreachable,
+}
+
+/// Explicit outcome of acquiring the cluster-wide migration advisory lock in
+/// the maintenance `postgres` database.
+#[derive(Debug, PartialEq, Eq)]
+enum ServerMigrationLock<C = Client> {
+    Held(C),
+    Fallback(MigrationLockFallback),
+}
+
+/// Classification of one maintenance-DB connect or `pg_advisory_lock` failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LockAttemptFailure {
+    Transient,
+    MaintenanceDbInaccessible,
+    Fatal(String),
+}
+
+fn classify_maintenance_connect_error(error: &postgres::Error) -> LockAttemptFailure {
+    use postgres::error::SqlState;
+    let Some(db) = error.as_db_error() else {
+        return LockAttemptFailure::Transient;
+    };
+    match db.code() {
+        &SqlState::INSUFFICIENT_PRIVILEGE
+        | &SqlState::INVALID_CATALOG_NAME
+        | &SqlState::INVALID_AUTHORIZATION_SPECIFICATION => {
+            LockAttemptFailure::MaintenanceDbInaccessible
+        }
+        &SqlState::TOO_MANY_CONNECTIONS
+        | &SqlState::ADMIN_SHUTDOWN
+        | &SqlState::CRASH_SHUTDOWN
+        | &SqlState::CANNOT_CONNECT_NOW => LockAttemptFailure::Transient,
+        _ => LockAttemptFailure::Fatal(format!("{} ({})", db.message(), db.code().code())),
+    }
+}
+
+fn classify_lock_query_error(error: &postgres::Error) -> LockAttemptFailure {
+    use postgres::error::SqlState;
+    let Some(db) = error.as_db_error() else {
+        return LockAttemptFailure::Transient;
+    };
+    match db.code() {
+        &SqlState::ADMIN_SHUTDOWN | &SqlState::CRASH_SHUTDOWN | &SqlState::CANNOT_CONNECT_NOW => {
+            LockAttemptFailure::Transient
+        }
+        _ => LockAttemptFailure::Fatal(format!("{} ({})", db.message(), db.code().code())),
+    }
+}
+
+/// Acquire the cluster-wide migration advisory lock fail-closed on invalid URL
+/// configuration or fatal SQL errors, and retry boundedly on transient
+/// maintenance-DB unavailability.
+fn acquire_server_migration_lock_with<C, F, P>(
+    url: &str,
+    passfile: Option<&std::path::Path>,
+    max_attempts: u32,
+    mut attempt_fn: F,
+    mut pause_fn: P,
+) -> Result<ServerMigrationLock<C>, StoreError>
+where
+    F: FnMut(&postgres::Config) -> Result<C, LockAttemptFailure>,
+    P: FnMut(u32),
+{
+    let config = maintenance_config_with_passfile(url, passfile)?;
+    let attempts = max_attempts.max(1);
+    for attempt in 1..=attempts {
+        match attempt_fn(&config) {
+            Ok(client) => return Ok(ServerMigrationLock::Held(client)),
+            Err(LockAttemptFailure::MaintenanceDbInaccessible) => {
+                return Ok(ServerMigrationLock::Fallback(
+                    MigrationLockFallback::MaintenanceDbInaccessible,
+                ));
+            }
+            Err(LockAttemptFailure::Fatal(message)) => {
+                return Err(StoreError::Backend(format!(
+                    "server migration lock failed: {message}"
+                )));
+            }
+            Err(LockAttemptFailure::Transient) => {
+                if attempt < attempts {
+                    pause_fn(attempt);
+                }
+            }
+        }
+    }
+    Ok(ServerMigrationLock::Fallback(
+        MigrationLockFallback::TransientlyUnreachable,
+    ))
+}
+
 /// The migration lock, held in the server's `postgres` database until the
-/// returned connection drops; `None` where that database cannot be reached.
-fn server_migration_lock(url: &str, passfile: Option<&std::path::Path>) -> Option<Client> {
-    let mut client = maintenance_config_with_passfile(url, passfile)?
-        .connect(NoTls)
-        .ok()?;
-    client
-        .execute("select pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
-        .ok()?;
-    Some(client)
+/// returned connection drops, failing closed on invalid configuration or fatal
+/// SQL errors.
+fn server_migration_lock(
+    url: &str,
+    passfile: Option<&std::path::Path>,
+) -> Result<ServerMigrationLock<Client>, StoreError> {
+    acquire_server_migration_lock_with(
+        url,
+        passfile,
+        SERVER_LOCK_ATTEMPTS,
+        |config| {
+            let mut client = config
+                .connect(NoTls)
+                .map_err(|error| classify_maintenance_connect_error(&error))?;
+            client
+                .execute("select pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
+                .map_err(|error| classify_lock_query_error(&error))?;
+            Ok(client)
+        },
+        |attempt| std::thread::sleep(retry_pause(attempt)),
+    )
 }
 
 /// `url`'s connection with its database replaced by the server's
 /// maintenance database `postgres`, keeping host, port, credentials and
-/// every other parameter, as the driver reads them; `None` when the URL
-/// does not parse.
+/// every other parameter, as the driver reads them. Never names `url` on error.
 fn maintenance_config_with_passfile(
     url: &str,
     passfile: Option<&std::path::Path>,
-) -> Option<postgres::Config> {
-    let mut config = passfile::config(url, passfile).ok()?;
-    config.dbname("postgres");
-    Some(config)
+) -> Result<postgres::Config, StoreError> {
+    let mut config = passfile::config(url, passfile).map_err(|_| {
+        StoreError::Backend("invalid maintenance database URL configuration".to_string())
+    })?;
+    config
+        .dbname("postgres")
+        .connect_timeout(std::time::Duration::from_secs(5));
+    Ok(config)
 }
 
 #[cfg(test)]
-fn maintenance_config(url: &str) -> Option<postgres::Config> {
+fn maintenance_config(url: &str) -> Result<postgres::Config, StoreError> {
     maintenance_config_with_passfile(url, None)
 }
 
@@ -661,18 +912,23 @@ fn retry_pause(attempt: u32) -> std::time::Duration {
 
 /// The password `url` connects with, as the driver reads it (the user
 /// info, decoded, or a `password=` parameter), else `passfile`'s matching
-/// entry ([`passfile`], objective 109), or "".
-fn url_password_with_passfile(url: &str, passfile: Option<&std::path::Path>) -> String {
+/// entry ([`passfile`], objective 109), or empty [`SecretString`].
+fn url_password_with_passfile(url: &str, passfile: Option<&std::path::Path>) -> SecretString {
     passfile::config(url, passfile)
         .ok()
-        .and_then(|config| config.get_password().map(<[u8]>::to_vec))
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .and_then(|config| {
+            config
+                .get_password()
+                .map(|bytes| SecretString::new(String::from_utf8_lossy(bytes)))
+        })
         .unwrap_or_default()
 }
 
 #[cfg(test)]
 fn url_password(url: &str) -> String {
     url_password_with_passfile(url, None)
+        .expose_secret()
+        .to_string()
 }
 
 /// PBKDF2-HMAC-SHA256 rounds of a login password: a guess at the owner's
@@ -685,13 +941,13 @@ const ROLE_PASSWORD_ROUNDS: u32 = 600_000;
 /// owner's password can form it, nothing secret is stored to agree on it,
 /// and a login that knows its own password and salt still needs the rounds
 /// for every guess at the owner's. Computed once per process.
-fn role_password(owner_password: &str, salt: &str, role: &str) -> String {
+fn role_password(owner_password: &str, salt: &str, role: &str) -> SecretString {
     use std::collections::HashMap;
     use std::sync::{Arc, OnceLock};
-    type Key = (String, String, String);
-    static DERIVED: OnceLock<Mutex<HashMap<Key, Arc<OnceLock<String>>>>> = OnceLock::new();
+    type Key = (SecretString, String, String);
+    static DERIVED: OnceLock<Mutex<HashMap<Key, Arc<OnceLock<SecretString>>>>> = OnceLock::new();
     let key = (
-        owner_password.to_string(),
+        SecretString::new(owner_password),
         salt.to_string(),
         role.to_string(),
     );
@@ -709,7 +965,7 @@ fn role_password(owner_password: &str, salt: &str, role: &str) -> String {
         .clone()
 }
 
-fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
+fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> SecretString {
     // The derivation itself is spawn-kdf's, compiled optimised in debug
     // builds too; its output is pinned (`the_login_passwords_are_the_ones_installs_have`).
     let output = spawn_kdf::pbkdf2_sha256(
@@ -717,11 +973,12 @@ fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
         format!("spawn-login-v2\0{salt}\0{role}").as_bytes(),
         ROLE_PASSWORD_ROUNDS,
     );
-    output.iter().fold(String::new(), |mut hex, byte| {
+    let mut hex = String::with_capacity(64);
+    for byte in output {
         use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
-        hex
-    })
+    }
+    SecretString::new(hex)
 }
 
 /// The owner's URL with its credentials replaced by one of the database's
@@ -759,7 +1016,8 @@ pub fn role_url_with_passfile(
     let (name, salt) = login_row(&mut client, role)
         .map_err(|error| format!("{role}: {}", backend(&error)))?
         .ok_or_else(|| no_login(role).to_string())?;
-    login_url(scheme, rest, &name, &role_password(&password, &salt, &name))
+    let derived = role_password(password.expose_secret(), &salt, &name);
+    login_url(scheme, rest, &name, derived.expose_secret())
         .map_err(|error| format!("{role}: {error}"))
 }
 
@@ -1066,6 +1324,39 @@ impl PostgresStore {
             .execute(sql, params)
             .map_err(|error| backend(&error))
     }
+
+    /// Execute a query carrying `commit_watermark_cte!()` (`wm_raced` column)
+    /// and retry up to [`WATERMARK_RACE_ATTEMPTS`] on an in-flight commit race.
+    pub(crate) fn query_one_watermark(
+        &self,
+        sql: &str,
+        params: &Params<'_>,
+    ) -> Result<Row, StoreError> {
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let row = self.query_one(sql, params)?;
+            if !row.get::<_, bool>("wm_raced") || attempt >= WATERMARK_RACE_ATTEMPTS {
+                return Ok(row);
+            }
+        }
+    }
+
+    /// Prepared variant of [`Self::query_one_watermark`].
+    pub(crate) fn query_one_watermark_prepared(
+        &self,
+        sql: &'static str,
+        params: &Params<'_>,
+    ) -> Result<Row, StoreError> {
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let row = self.query_one_prepared(sql, params)?;
+            if !row.get::<_, bool>("wm_raced") || attempt >= WATERMARK_RACE_ATTEMPTS {
+                return Ok(row);
+            }
+        }
+    }
 }
 
 /// The statements that make a test's `schema` when absent and name the
@@ -1111,7 +1402,11 @@ pub fn made_schema_sql(schema: &str) -> String {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::disallowed_methods)]
-    use super::{ConnectOptions, login_url, role_password, role_url_with_passfile, url_password};
+    use super::{
+        ConnectOptions, LockAttemptFailure, MigrationLockFallback, SchemaScope, SecretString,
+        ServerMigrationLock, ValidatedSchemaName, acquire_server_migration_lock_with, login_url,
+        role_password, role_url_with_passfile, url_password,
+    };
 
     /// The restricted logins' passwords are byte for byte what every install
     /// already has (computed by the derivation as it was at 554a4bd4, before
@@ -1149,7 +1444,11 @@ mod tests {
         ] {
             // role_password, the path a migration takes (cached), and
             // through it pbkdf2_hex.
-            assert_eq!(role_password(owner, &salt, role), password, "{role}");
+            assert_eq!(
+                role_password(owner, &salt, role).expose_secret(),
+                password,
+                "{role}"
+            );
         }
     }
 
@@ -1288,7 +1587,7 @@ mod tests {
             let mut passwordless =
                 super::PostgresStore::connect_with_options(&ours, &ConnectOptions::default())
                     .expect("connect");
-            passwordless.password = String::new();
+            passwordless.password = SecretString::default();
             passwordless
                 .migrate()
                 .expect("migrate without the owner's password");
@@ -1355,7 +1654,178 @@ mod tests {
             socket.get_hosts(),
             [postgres::config::Host::Unix("/run/postgresql".into())]
         );
-        assert!(maintenance_config("not a url").is_none());
+        let err =
+            maintenance_config("not a url secret_pw").expect_err("invalid url must fail closed");
+        assert!(
+            !err.to_string().contains("secret_pw"),
+            "config error must not leak credentials: {err}"
+        );
+    }
+
+    #[test]
+    fn server_migration_lock_fails_closed_and_retries_boundedly_on_transient_errors() {
+        let mut connect_calls = 0u32;
+        let bad_url = acquire_server_migration_lock_with::<(), _, _>(
+            "not a url super_secret",
+            None,
+            5,
+            |_| {
+                connect_calls += 1;
+                Ok(())
+            },
+            |_| {},
+        )
+        .expect_err("invalid URL must fail closed immediately");
+        assert_eq!(connect_calls, 0);
+        assert!(!bad_url.to_string().contains("super_secret"));
+
+        let mut ok_calls = 0u32;
+        let held = acquire_server_migration_lock_with(
+            "postgres://u:pw@127.0.0.1/spawn",
+            None,
+            5,
+            |_| {
+                ok_calls += 1;
+                Ok(42usize)
+            },
+            |_| {},
+        )
+        .expect("immediate lock");
+        assert_eq!(ok_calls, 1);
+        assert_eq!(held, ServerMigrationLock::Held(42usize));
+
+        let mut retry_calls = 0u32;
+        let mut retry_pauses = Vec::new();
+        let retried = acquire_server_migration_lock_with(
+            "postgres://u:pw@127.0.0.1/spawn",
+            None,
+            5,
+            |_| {
+                retry_calls += 1;
+                if retry_calls < 3 {
+                    Err(LockAttemptFailure::Transient)
+                } else {
+                    Ok("locked")
+                }
+            },
+            |attempt| retry_pauses.push(attempt),
+        )
+        .expect("retries transiently");
+        assert_eq!(retry_calls, 3);
+        assert_eq!(retry_pauses, vec![1, 2]);
+        assert_eq!(retried, ServerMigrationLock::Held("locked"));
+
+        let mut exhausted_calls = 0u32;
+        let mut exhausted_pauses = Vec::new();
+        let exhausted = acquire_server_migration_lock_with::<(), _, _>(
+            "postgres://u:pw@127.0.0.1/spawn",
+            None,
+            4,
+            |_| {
+                exhausted_calls += 1;
+                Err(LockAttemptFailure::Transient)
+            },
+            |attempt| exhausted_pauses.push(attempt),
+        )
+        .expect("transient exhaustion yields fallback");
+        assert_eq!(exhausted_calls, 4);
+        assert_eq!(exhausted_pauses, vec![1, 2, 3]);
+        assert_eq!(
+            exhausted,
+            ServerMigrationLock::Fallback(MigrationLockFallback::TransientlyUnreachable)
+        );
+
+        let mut denied_calls = 0u32;
+        let denied = acquire_server_migration_lock_with::<(), _, _>(
+            "postgres://u:pw@127.0.0.1/spawn",
+            None,
+            5,
+            |_| {
+                denied_calls += 1;
+                Err(LockAttemptFailure::MaintenanceDbInaccessible)
+            },
+            |_| panic!("should not retry inaccessible maintenance db"),
+        )
+        .expect("inaccessible maintenance db yields fallback without retry");
+        assert_eq!(denied_calls, 1);
+        assert_eq!(
+            denied,
+            ServerMigrationLock::Fallback(MigrationLockFallback::MaintenanceDbInaccessible)
+        );
+
+        let fatal = acquire_server_migration_lock_with::<(), _, _>(
+            "postgres://u:pw@127.0.0.1/spawn",
+            None,
+            5,
+            |_| {
+                Err(LockAttemptFailure::Fatal(
+                    "syntax error (42601)".to_string(),
+                ))
+            },
+            |_| panic!("should not retry fatal SQL error"),
+        )
+        .expect_err("fatal SQL error must fail closed immediately");
+        assert!(fatal.to_string().contains("42601"), "{fatal}");
+    }
+
+    #[test]
+    fn validated_schema_name_and_scope_enforce_plain_identifiers() {
+        for good in ["spawn_test_1", "_private", "PublicSchema", "a"] {
+            let parsed = ValidatedSchemaName::parse(good).expect(good);
+            assert_eq!(parsed.as_str(), good);
+            assert_eq!(
+                SchemaScope::isolated(good)
+                    .expect(good)
+                    .set_search_path_sql(),
+                Some(format!("set search_path to {good}"))
+            );
+        }
+        assert_eq!(SchemaScope::Default.schema_name(), None);
+        assert_eq!(SchemaScope::Default.set_search_path_sql(), None);
+        for bad in ["", "1abc", "a-b", "a; drop table x", "a b", "\"quoted\""] {
+            assert!(ValidatedSchemaName::parse(bad).is_err(), "{bad}");
+            assert!(SchemaScope::isolated(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn secret_string_and_store_debug_redact_credentials() {
+        let secret = SecretString::new("top-secret-pw-991");
+        assert_eq!(secret.expose_secret(), "top-secret-pw-991");
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
+        drop(secret);
+
+        let Ok(url) = std::env::var(crate::testing::TEST_DATABASE_URL) else {
+            return;
+        };
+        let schema = crate::testing::TestSchema::new("debug_redact");
+        let store = schema.store();
+        assert!(matches!(store.schema_scope(), SchemaScope::Isolated(_)));
+        let connector = store.connector(std::time::Duration::from_secs(5));
+        let store_dbg = format!("{store:?}");
+        let conn_dbg = format!("{connector:?}");
+        let schema_dbg = format!("{schema:?}");
+        assert!(store_dbg.contains("[REDACTED]"), "{store_dbg}");
+        assert!(conn_dbg.contains("[REDACTED]"), "{conn_dbg}");
+        assert!(schema_dbg.contains("[REDACTED]"), "{schema_dbg}");
+        assert!(!store_dbg.contains(&url), "store Debug leaked DB URL");
+        assert!(!conn_dbg.contains(&url), "connector Debug leaked DB URL");
+        assert!(!schema_dbg.contains(&url), "TestSchema Debug leaked DB URL");
+        let pw = super::url_password_with_passfile(&url, None);
+        if !pw.is_empty() {
+            assert!(
+                !store_dbg.contains(pw.expose_secret()),
+                "store Debug leaked password"
+            );
+            assert!(
+                !conn_dbg.contains(pw.expose_secret()),
+                "connector Debug leaked password"
+            );
+            assert!(
+                !schema_dbg.contains(pw.expose_secret()),
+                "TestSchema Debug leaked password"
+            );
+        }
     }
 
     #[test]
@@ -1376,22 +1846,28 @@ mod tests {
     fn a_login_password_is_salted_per_login_and_derived_slowly() {
         let salt = "ab".repeat(32);
         let password = role_password("owner", &salt, "spawn_reader_db");
-        assert_eq!(password.len(), 64);
-        assert_eq!(password, role_password("owner", &salt, "spawn_reader_db"));
-        assert_ne!(
-            password,
-            role_password("owner", &"cd".repeat(32), "spawn_reader_db")
+        assert_eq!(password.expose_secret().len(), 64);
+        assert_eq!(
+            password.expose_secret(),
+            role_password("owner", &salt, "spawn_reader_db").expose_secret()
         );
         assert_ne!(
-            password,
-            role_password("owner", &salt, "spawn_supervisor_db")
+            password.expose_secret(),
+            role_password("owner", &"cd".repeat(32), "spawn_reader_db").expose_secret()
         );
-        assert_ne!(password, role_password("other", &salt, "spawn_reader_db"));
+        assert_ne!(
+            password.expose_secret(),
+            role_password("owner", &salt, "spawn_supervisor_db").expose_secret()
+        );
+        assert_ne!(
+            password.expose_secret(),
+            role_password("other", &salt, "spawn_reader_db").expose_secret()
+        );
         // PBKDF2-HMAC-SHA256, checked against Python's hashlib.pbkdf2_hmac
         // ('sha256', b'owner', b'spawn-login-v2\0' + salt + b'\0spawn_reader_db',
         // 600000).hex().
         assert_eq!(
-            password,
+            password.expose_secret(),
             "f4e769b999554a01831a49183a5a9ffe13646043436172744f18a3fed9cc7185"
         );
     }
@@ -1449,9 +1925,12 @@ mod tests {
         std::fs::set_permissions(&pf, std::fs::Permissions::from_mode(0o600)).expect("chmod");
 
         let url = "postgres://spawn_u@db.local:5433/spawn_db";
-        assert_eq!(super::url_password_with_passfile(url, None), "");
         assert_eq!(
-            super::url_password_with_passfile(url, Some(&pf)),
+            super::url_password_with_passfile(url, None).expose_secret(),
+            ""
+        );
+        assert_eq!(
+            super::url_password_with_passfile(url, Some(&pf)).expose_secret(),
             "passfileSecret!"
         );
 

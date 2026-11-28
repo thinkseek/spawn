@@ -1,22 +1,23 @@
-//! Waking on change: the event watermark (the record) and
-//! `LISTEN spawn_events` (the hint).
+//! Waking on change: the committed event watermark (authoritative boundary)
+//! and `LISTEN spawn_events` (wake-up hint).
 //!
 //! `spawn loop` decides what to do from records, and a record is written
 //! only by an append: `spawn_append_trusted` notifies `spawn_events` with
-//! every event it writes. So two things say the same thing about the log,
+//! every event it writes. So two things say something about the log,
 //! and only one of them is authoritative:
 //!
-//! - the watermark, `max(spawn_events.id)` ([`PostgresStore::watermark`]):
-//!   the index-only read of the log's primary key that names everything
-//!   written up to it. It is the record: a step that has acted on the
-//!   watermark has acted on every event at or below it, and a step whose
-//!   watermark is behind has work to do;
-//! - a notification on `spawn_events` ([`PostgresStore::listen`]): a hint
-//!   that the watermark may have moved, which ends the loop's wait at once
-//!   so a change is acted on sooner. A notification lost, missed or never
-//!   sent proves nothing, and its absence is never read as "nothing
-//!   happened": the next pass reads the watermark anyway
-//!   (docs/design.md §14).
+//! - the committed watermark ([`CommittedWatermark`], [`PostgresStore::committed_watermark`],
+//!   [`PostgresStore::watermark`]): bounded below any in-flight transaction
+//!   (`commit_xid < wm.safe_xid` and strictly before any later-id out-of-order
+//!   commit via `commit_watermark_cte!()`). A step that has acted on this
+//!   watermark has acted on every committed event at or below it, and an
+//!   in-flight writer with a smaller `id` holds the watermark back until it
+//!   commits so slower transactions are never silently skipped;
+//! - a notification on `spawn_events` ([`PostgresStore::listen`]): an advisory
+//!   wake-up **hint** only, never a commit or visibility boundary. A lost,
+//!   missed, reordered, or uncommitted notification proves nothing, and its
+//!   absence is never read as "nothing happened": the next pass reads the
+//!   authoritative committed watermark anyway (docs/design.md §14).
 //!
 //! Times the loop waits for are not in this module: they are computed by
 //! each step from the records it read (a delivery's retry, a stall's bound,
@@ -31,10 +32,44 @@ use spawn_core::port::StoreError;
 
 use crate::backend;
 
-/// The log's watermark: the largest event id written, `0` on an empty log.
-/// A read of the primary key alone (PostgreSQL answers `max` with the index's
-/// last entry, never a table scan).
-pub(crate) const WATERMARK: &str = "select coalesce(max(id), 0) from spawn_events";
+/// Authoritative committed log watermark: the greatest event `id` such that
+/// all committed events at or below it satisfy `commit_xid < wm.safe_xid`
+/// and no visible row with `id > this` precedes an older in-flight writer.
+///
+/// Safe to use as an exact replay cursor/barrier (`id > watermark`), unlike
+/// advisory notifications on [`Listener`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CommittedWatermark(pub i64);
+
+impl CommittedWatermark {
+    /// Return the scalar `i64` event-id watermark for cursor comparisons.
+    #[must_use]
+    pub const fn as_i64(self) -> i64 {
+        self.0
+    }
+}
+
+/// The log's authoritative committed watermark: largest contiguous `id` below
+/// the schema-scoped `xid8` commit watermark (`commit_watermark_cte!()`), `0` on
+/// an empty or wholly uncommitted log.
+pub(crate) const WATERMARK: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    "
+      select coalesce(
+                 (select id from spawn_events
+                   where commit_xid < wm.safe_xid
+                     and id < coalesce(
+                             (select min(n.id) from spawn_events n where n.commit_xid >= wm.safe_xid),
+                             9223372036854775807::bigint
+                         )
+                   order by id desc
+                   limit 1),
+                 0
+             ) as id,
+             wm.wm_raced
+        from wm"
+);
 
 /// When the earliest leased command in the queue may be claimed: the next
 /// time the Bridge has work it cannot do now. `null` when nothing is
@@ -50,9 +85,17 @@ pub(crate) const NEXT_LEASE: &str = concat!(
 const CHANNEL: &str = "spawn_events";
 
 impl PostgresStore {
-    /// The log's watermark (`WATERMARK`).
+    /// Authoritative committed event watermark (`WATERMARK`), typed as
+    /// [`CommittedWatermark`].
+    pub fn committed_watermark(&self) -> Result<CommittedWatermark, StoreError> {
+        let row = self.query_one_watermark_prepared(WATERMARK, &[])?;
+        Ok(CommittedWatermark(row.get("id")))
+    }
+
+    /// Scalar committed event watermark (`WATERMARK`), equivalent to
+    /// `self.committed_watermark()?.as_i64()`.
     pub fn watermark(&self) -> Result<i64, StoreError> {
-        Ok(self.query_one_prepared(WATERMARK, &[])?.get(0))
+        self.committed_watermark().map(CommittedWatermark::as_i64)
     }
 
     /// The time the earliest unfinished command may be claimed
@@ -97,7 +140,7 @@ impl PostgresStore {
         // `spawn serve`'s single shared hub in `ServePools` therefore holds 1 pooled
         // events connection + 1 private connection, staying within the default
         // `SPAWN_SERVE_EVENTS_POOL=2` budget solely because there is a single hub.
-        let config = crate::passfile::config(&self.url, self.passfile.as_deref())
+        let config = crate::passfile::config(self.url.expose_secret(), self.passfile.as_deref())
             .map_err(|error| backend(&error))?;
         let mut client = config.connect(NoTls).map_err(|error| backend(&error))?;
         client
@@ -108,8 +151,10 @@ impl PostgresStore {
 }
 
 /// A connection that holds `LISTEN spawn_events` for the loop, so a change
-/// ends its wait at once. Notifications are only a hint to look again; the
-/// watermark is what says whether anything changed ([`PostgresStore::watermark`]).
+/// ends its wait at once. Notifications are **only an advisory hint** to look
+/// again — never a commit or visibility boundary; always read
+/// [`PostgresStore::committed_watermark`] / [`PostgresStore::watermark`] to determine
+/// which committed events exist.
 pub struct Listener {
     client: Client,
 }
@@ -316,5 +361,79 @@ mod tests {
         drop(listener);
         drop(notify);
         drop(store);
+    }
+
+    /// Out-of-order commits: an in-flight writer holding a lower event id (`id_a`)
+    /// holds `committed_watermark()` / `watermark()` below `id_a` even after another
+    /// session commits a higher `id_b > id_a`, advancing cleanly to `id_b` once the
+    /// earlier writer commits. Needs `SPAWN_TEST_DATABASE_URL`.
+    #[test]
+    fn watermark_holds_back_behind_uncommitted_transaction_and_advances_on_commit() {
+        use postgres::{Client, NoTls};
+
+        let url = std::env::var(crate::testing::TEST_DATABASE_URL)
+            .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database");
+        let schema = crate::testing::TestSchema::new("wake_xid8_wm");
+        let store = PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &crate::testing::test_connect_options(),
+        )
+        .expect("migrate");
+        let baseline = store.committed_watermark().expect("baseline");
+
+        let connect_in_schema = || -> Client {
+            let mut client =
+                crate::passfile::config(&url, crate::testing::test_passfile().as_deref())
+                    .expect("config")
+                    .connect(NoTls)
+                    .expect("connect");
+            client
+                .batch_execute(&format!("set search_path to {}", schema.name()))
+                .expect("search_path");
+            client
+        };
+
+        let kind = serde_json::json!({"name": "session.noted", "detail": {"text": "wm test"}});
+        let mut conn_a = connect_in_schema();
+        let mut conn_b = connect_in_schema();
+
+        let mut tx_a = conn_a.transaction().expect("begin tx_a");
+        let id_a: i64 = tx_a
+            .query_one(
+                "select out_id from spawn_append_trusted('agent_a', 'session_wm_a', null, 'bridge', null, $1)",
+                &[&kind],
+            )
+            .expect("append a")
+            .get(0);
+
+        let id_b: i64 = conn_b
+            .query_one(
+                "select out_id from spawn_append_trusted('agent_b', 'session_wm_b', null, 'bridge', null, $1)",
+                &[&kind],
+            )
+            .expect("append b")
+            .get(0);
+        assert!(id_b > id_a, "expected id_b ({id_b}) > id_a ({id_a})");
+
+        let while_open = store
+            .committed_watermark()
+            .expect("watermark while tx_a open");
+        assert!(
+            while_open < super::CommittedWatermark(id_a) && while_open <= baseline,
+            "committed watermark {while_open:?} jumped past uncommitted id_a={id_a} (baseline={baseline:?})"
+        );
+        assert_eq!(
+            store.watermark().expect("scalar watermark"),
+            while_open.as_i64()
+        );
+
+        tx_a.commit().expect("commit tx_a");
+        let after_commit = store.committed_watermark().expect("watermark after commit");
+        assert_eq!(
+            after_commit,
+            super::CommittedWatermark(id_b),
+            "watermark advances past both committed writes once tx_a commits"
+        );
     }
 }
