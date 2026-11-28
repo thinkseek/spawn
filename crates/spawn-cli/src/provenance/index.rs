@@ -1490,16 +1490,10 @@ fn resolve_d6_cas_dir_for_index(
         return Ok(None);
     };
     match configured {
-        crate::config::WorkspaceBackend::D6 => Ok(Some(
-            d6_cfg.effective_cas_dir(root, spawn_host::WorkspaceBackend::D6),
-        )),
-        crate::config::WorkspaceBackend::D6Shadow => Ok(Some(
-            d6_cfg.effective_cas_dir(root, spawn_host::WorkspaceBackend::D6Shadow),
-        )),
-        crate::config::WorkspaceBackend::Auto
-        | crate::config::WorkspaceBackend::Git
-        | crate::config::WorkspaceBackend::Cow
-        | crate::config::WorkspaceBackend::Overlay => {
+        crate::config::WorkspaceBackend::Named(
+            active @ (spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow),
+        ) => Ok(Some(d6_cfg.effective_cas_dir(root, active))),
+        crate::config::WorkspaceBackend::Auto | crate::config::WorkspaceBackend::Named(_) => {
             if let Some(active) = spawn_host::root_backend(root)
                 .map_err(|err| format!("read workspace backend under {}: {err}", root.display()))?
                 && matches!(
@@ -1546,13 +1540,9 @@ fn env_d6_resolution() -> Result<
     String,
 > {
     let d6_cfg = crate::config::D6RuntimeConfig::from_env()?;
-    let configured = match std::env::var("SPAWN_WORKSPACE_BACKEND") {
-        Ok(raw) => crate::config::workspace_backend(Some(&raw))?,
-        Err(std::env::VarError::NotPresent) => crate::config::WorkspaceBackend::Git,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err("SPAWN_WORKSPACE_BACKEND is not valid UTF-8".to_string());
-        }
-    };
+    let configured = crate::config::workspace_backend(
+        crate::config::env_value("SPAWN_WORKSPACE_BACKEND").as_deref(),
+    )?;
     Ok((d6_cfg, configured))
 }
 
@@ -2853,7 +2843,7 @@ mod commit_v2_tests {
             &fx_custom.domain,
             Some(&fx_custom.root),
             &cfg,
-            crate::config::WorkspaceBackend::D6,
+            crate::config::WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6),
         )
         .expect("index with explicit cas_dir override");
         assert_eq!(summary.lands, 2);
@@ -2865,7 +2855,7 @@ mod commit_v2_tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].agent_id, "agent_b");
 
-        // `.d6-shadow/cas` layout under `WorkspaceBackend::D6Shadow` and auto discovery.
+        // `.d6-shadow/cas` layout under `WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6Shadow)` and auto discovery.
         let fx_shadow = seed_v2_prov_fixture("v2-shadow", &[".d6-shadow", "cas"]);
         let mut shadow_repo =
             Repo::open(&fx_shadow.mirror_dir.to_string_lossy()).expect("open shadow mirror");
