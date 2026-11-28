@@ -8,7 +8,7 @@
 //! (required for `--backend d6|shadow`); a unique schema is created and measured. The live
 //! `SPAWN_DATABASE_URL` is NEVER read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -19,7 +19,9 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use spawn_cas::{Digest, GitOid, Snapshot, git_blob_oid_of_bytes, git_pointer_bytes};
+use spawn_cas::{
+    Digest, GIT_POINTER_THRESHOLD, GitOid, Snapshot, git_blob_oid_of_bytes, git_pointer_bytes,
+};
 use spawn_core::id::{AgentId, BranchName, WorkspaceId};
 use spawn_core::port::{BaseMerge, Commit, TranscriptArchive, WorkspaceStore};
 use spawn_host::d6_workspace::L1TmpfsPolicy;
@@ -38,6 +40,7 @@ Usage: cargo run --release -p spawn-host --example storage_benchmark -- [options
   --source-revision <sha>    Spawn source revision recorded in the report\n\
   --backend <git|d6|shadow>  Storage backend (default: git)\n\
   --concurrency <n>          Concurrent branch workers (default: 1)\n\
+  --pg-pool-size <n>         Shared PG connection pool size for d6 (0 = 1/worker)\n\
   --tmpfs-root <directory>   Enable bounded L1 tmpfs upperdir root for d6/shadow\n\
   --tmpfs-budget-mb <n>      L1 tmpfs budget in MiB when --tmpfs-root is set (default: 2048)\n\
   --iterations <n>           Measured cycles per worker (default: 40)\n\
@@ -49,11 +52,15 @@ Usage: cargo run --release -p spawn-host --example storage_benchmark -- [options
   --oversized-file-bytes <n> Add a file over the cap (must exceed --file-bytes)\n\
   --recreate-every <n>       Drop the branch before every nth checkpoint; 0 disables\n\
   --remount-every <n>        Unmount/mount every n cycles; 0 disables (default: 0)\n\
+  --land-branches            Land all worker branches onto main and measure delta bytes\n\
+  --crash-restart-drill      Reopen D6 CAS/PG stores and verify 0 lost refs/commits/blobs\n\
   --keep                     Keep the scratch root after a successful run\n\
   --help                     Show this help\n\
 \n\
 SPAWN_BENCH_DATABASE_URL optionally enables PostgreSQL writes (and is required for\n\
 --backend d6|shadow). It must name a dedicated benchmark database, never the live store.\n";
+
+const LAND_DELTA_SLO_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -89,6 +96,7 @@ struct Config {
     source_revision: Option<String>,
     backend: Backend,
     concurrency: usize,
+    pg_pool_size: usize,
     tmpfs_root: Option<PathBuf>,
     tmpfs_budget_mb: u64,
     iterations: usize,
@@ -100,6 +108,8 @@ struct Config {
     oversized_file_bytes: Option<usize>,
     recreate_every: usize,
     remount_every: usize,
+    land_branches: bool,
+    crash_restart_drill: bool,
     keep: bool,
 }
 
@@ -110,6 +120,7 @@ impl Default for Config {
             source_revision: None,
             backend: Backend::Git,
             concurrency: 1,
+            pg_pool_size: 0,
             tmpfs_root: None,
             tmpfs_budget_mb: 2048,
             iterations: 40,
@@ -121,9 +132,17 @@ impl Default for Config {
             oversized_file_bytes: None,
             recreate_every: 0,
             remount_every: 0,
+            land_branches: false,
+            crash_restart_drill: false,
             keep: false,
         }
     }
+}
+
+fn u64_to_f64(value: u64) -> f64 {
+    let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
+    let lo = u32::try_from(value & 0xffff_ffff).unwrap_or(u32::MAX);
+    f64::from(hi) * 4_294_967_296.0 + f64::from(lo)
 }
 
 fn number<T>(arguments: &mut impl Iterator<Item = String>, name: &str) -> Result<T, String>
@@ -169,6 +188,9 @@ fn validate_config(config: &Config) -> Result<(), String> {
     if config.recreate_every > 0 && config.backend != Backend::Git {
         return Err("--recreate-every is only supported with --backend git".to_string());
     }
+    if (config.land_branches || config.crash_restart_drill) && config.backend != Backend::D6 {
+        return Err("--land-branches and --crash-restart-drill require --backend d6".to_string());
+    }
     if let Some(revision) = &config.source_revision
         && (revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()))
     {
@@ -213,6 +235,7 @@ fn config() -> Result<Option<Config>, String> {
                 config.backend = Backend::parse(&raw)?;
             }
             "--concurrency" => config.concurrency = number(&mut arguments, "--concurrency")?,
+            "--pg-pool-size" => config.pg_pool_size = number(&mut arguments, "--pg-pool-size")?,
             "--tmpfs-root" => {
                 config.tmpfs_root = Some(PathBuf::from(
                     arguments
@@ -241,6 +264,8 @@ fn config() -> Result<Option<Config>, String> {
             "--remount-every" => {
                 config.remount_every = number(&mut arguments, "--remount-every")?;
             }
+            "--land-branches" => config.land_branches = true,
+            "--crash-restart-drill" => config.crash_restart_drill = true,
             "--keep" => config.keep = true,
             "--help" | "-h" => return Ok(None),
             _ => return Err(format!("unknown option {argument:?}\n\n{USAGE}")),
@@ -633,14 +658,18 @@ fn drop_git_branch(repo: &Path, branch: &BranchName) -> Result<(), String> {
 }
 
 struct PgRefLedger {
-    pg: PostgresStore,
+    pg: Arc<PostgresStore>,
 }
 
 impl PgRefLedger {
     fn connect_schema(url: &str, schema: &str) -> Result<Self, String> {
         let pg = PostgresStore::connect_in_schema(url, schema)
             .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
-        Ok(Self { pg })
+        Ok(Self { pg: Arc::new(pg) })
+    }
+
+    fn from_store(pg: Arc<PostgresStore>) -> Self {
+        Self { pg }
     }
 }
 
@@ -976,7 +1005,7 @@ struct WorkerState {
     agent: AgentId,
     transcript_offset: u64,
     transcript_payload: Vec<u8>,
-    database: Option<PostgresStore>,
+    database: Option<Arc<PostgresStore>>,
     single_worker: bool,
     last_database_event: Option<i64>,
     samples: Samples,
@@ -990,7 +1019,7 @@ impl WorkerState {
         archive_root: &Path,
         branch: BranchName,
         workspace: WorkspaceId,
-        database: Option<PostgresStore>,
+        database: Option<Arc<PostgresStore>>,
     ) -> Result<Self, String> {
         let agent =
             AgentId::new(format!("agent_storage_benchmark_{idx}")).map_err(|e| e.to_string())?;
@@ -1036,7 +1065,7 @@ impl WorkerState {
     }
 
     fn database_cycle(&mut self, cycle: usize, measured: bool) -> Result<(), String> {
-        let Some(database) = &self.database else {
+        let Some(database) = self.database.as_deref() else {
             return Ok(());
         };
         let record = json!({
@@ -1123,10 +1152,20 @@ trait BenchDriver: Send + Sync {
     fn merge_base(&self, ws: &WorkspaceId) -> Result<BaseMerge, String>;
     fn after_checkpoint(&self, branch: &BranchName, config: &Config) -> Result<(), String>;
     fn advance_main(&self, step: usize) -> Result<(), String>;
+    fn post_merge_phase(
+        &self,
+        _config: &Config,
+        _workers: &mut [WorkerState],
+    ) -> Result<(), String> {
+        Ok(())
+    }
     fn verify_final(&self, branches: &[BranchName], config: &Config) -> Result<(), String>;
     fn disk_breakdown(&self, scratch: &Scratch, active_paths: &[PathBuf]) -> Result<Value, String>;
     fn extra_totals(&self, config: &Config) -> Value;
     fn shadow_metrics_json(&self) -> Option<Value> {
+        None
+    }
+    fn always_on_d6_json(&self, _config: &Config, _logical_written_bytes: u64) -> Option<Value> {
         None
     }
 }
@@ -1238,6 +1277,18 @@ impl BenchDriver for GitDriver {
     }
 }
 
+#[derive(Default)]
+struct AlwaysOnD6State {
+    land_deltas: Vec<u64>,
+    crash_drill: Option<Value>,
+}
+
+fn cas_payload_bytes(cas_root: &Path) -> Result<u64, String> {
+    let objs = directory_size(&cas_root.join("objects"))?.bytes;
+    let idxs = directory_size(&cas_root.join("chunk-index"))?.bytes;
+    Ok(objs.saturating_add(idxs))
+}
+
 struct D6Driver {
     project: String,
     disk_root: PathBuf,
@@ -1246,19 +1297,64 @@ struct D6Driver {
     coord_ledger: Arc<PgRefLedger>,
     coord_store: D6Workspace<PgRefLedger>,
     worker_stores: Vec<D6Workspace<PgRefLedger>>,
+    pg_url: String,
+    schema: String,
     oversized_ingested: bool,
+    always_on: Mutex<AlwaysOnD6State>,
+}
+
+struct D6DriverInit<'a> {
+    project: String,
+    disk_root: PathBuf,
+    cas_root: PathBuf,
+    cas: Arc<CasMerkleStore>,
+    pg_pool: &'a [Arc<PostgresStore>],
+    pg_url: String,
+    schema: String,
+    config: &'a Config,
+}
+
+fn verify_reopened_objects(
+    fresh_cas: &CasMerkleStore,
+    snapshots: &BTreeSet<Digest>,
+) -> (usize, usize, usize) {
+    let mut lost_commits = 0_usize;
+    let mut corrupt_objects = 0_usize;
+    let mut blob_digests = BTreeSet::new();
+    for snap_id in snapshots {
+        match fresh_cas.cas().read_merkle_snapshot(snap_id) {
+            Ok(snap) => match fresh_cas.flatten_tree(&snap.tree) {
+                Ok(entries) => {
+                    for entry in entries.into_values() {
+                        if let Some(d) = entry.digest() {
+                            blob_digests.insert(d);
+                        }
+                    }
+                }
+                Err(_) => corrupt_objects += 1,
+            },
+            Err(_) => lost_commits += 1,
+        }
+    }
+    for blob in &blob_digests {
+        if fresh_cas
+            .cas()
+            .stream_blob(blob, &mut std::io::sink())
+            .is_err()
+        {
+            corrupt_objects += 1;
+        }
+    }
+    (lost_commits, corrupt_objects, blob_digests.len())
 }
 
 impl D6Driver {
-    fn new(
-        project: String,
-        disk_root: PathBuf,
-        cas_root: PathBuf,
-        cas: Arc<CasMerkleStore>,
-        bench_url: &str,
-        schema: &str,
-        config: &Config,
-    ) -> Result<Self, String> {
+    fn new(init: D6DriverInit<'_>) -> Result<Self, String> {
+        let project = init.project;
+        let disk_root = init.disk_root;
+        let cas_root = init.cas_root;
+        let cas = init.cas;
+        let config = init.config;
         let make_ws = |ledger: Arc<PgRefLedger>| {
             let mut ws = D6Workspace::new(&project, &disk_root, cas.clone(), ledger);
             if config.oversized_file_bytes.is_some() {
@@ -1269,13 +1365,15 @@ impl D6Driver {
             }
             ws
         };
-        let coord_ledger = Arc::new(PgRefLedger::connect_schema(bench_url, schema)?);
+        let coord_ledger = Arc::new(PgRefLedger::from_store(init.pg_pool[0].clone()));
         let coord_store = make_ws(coord_ledger.clone());
         let _ = d6_seed_initial_main(&coord_store, &coord_ledger, &cas, &project)?;
 
         let mut worker_stores = Vec::with_capacity(config.concurrency);
-        for _ in 0..config.concurrency {
-            let l = Arc::new(PgRefLedger::connect_schema(bench_url, schema)?);
+        for idx in 0..config.concurrency {
+            let l = Arc::new(PgRefLedger::from_store(
+                init.pg_pool[idx % init.pg_pool.len()].clone(),
+            ));
             worker_stores.push(make_ws(l));
         }
 
@@ -1287,7 +1385,10 @@ impl D6Driver {
             coord_ledger,
             coord_store,
             worker_stores,
+            pg_url: init.pg_url,
+            schema: init.schema,
             oversized_ingested: config.oversized_file_bytes.is_some(),
+            always_on: Mutex::new(AlwaysOnD6State::default()),
         })
     }
 
@@ -1320,10 +1421,194 @@ impl D6Driver {
         }
         let projected_blob = spawn_cas::project_blob_oid(self.cas.cas(), &digest, want_size)
             .map_err(|e| e.to_string())?;
-        let expected_pointer = git_blob_oid_of_bytes(&git_pointer_bytes(&digest, want_size));
-        if projected_blob != expected_pointer {
+        if want_size > GIT_POINTER_THRESHOLD {
+            let expected_pointer = git_blob_oid_of_bytes(&git_pointer_bytes(&digest, want_size));
+            if projected_blob != expected_pointer {
+                return Err(format!(
+                    "oversized.bin OID {projected_blob} != pointer OID {expected_pointer}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn run_land_phase(&self, workers: &mut [WorkerState]) -> Result<(), String> {
+        let mut prev_cas_bytes = cas_payload_bytes(&self.cas_root)?;
+        let mut deltas = Vec::with_capacity(workers.len());
+        for (idx, worker) in workers.iter_mut().enumerate() {
+            let main_now = self
+                .coord_store
+                .main_snapshot()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "main snapshot missing before land".to_string())?;
+            let branch_head = self
+                .coord_store
+                .branch_snapshot(worker.branch.as_str())
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("branch {} missing before land", worker.branch))?;
+
+            let artifact = format!(
+                "branch={}\nsnapshot={}\ntree={}\ngit_oid={}\n",
+                worker.branch, branch_head.id, branch_head.tree, branch_head.git_oid
+            );
+            let (bd, blen) = self
+                .cas
+                .put_bytes_blob(artifact.as_bytes())
+                .map_err(|e| e.to_string())?;
+            let next_tree = self
+                .cas
+                .apply_mutations(
+                    &main_now.tree,
+                    &[spawn_cas::TreeMutation::Upsert {
+                        path: vec![
+                            b"landings".to_vec(),
+                            format!("worker_{idx}.txt").into_bytes(),
+                        ],
+                        kind: spawn_cas::TreeEntryKind::File,
+                        id: bd.as_bytes(),
+                        size: blen,
+                    }],
+                )
+                .map_err(|e| e.to_string())?;
+
+            let ts_ms = 1_700_000_500_000_i64 + i64::try_from(idx).unwrap_or(0) * 1_000;
+            let body = format_commit_body(
+                "spawn <bench@localhost> 1700000500 +0000",
+                "spawn <bench@localhost> 1700000500 +0000",
+                &format!("land branch {}\n", worker.branch),
+            );
+            let snap = Snapshot {
+                tree: next_tree.clone(),
+                parents: vec![main_now.id.clone(), branch_head.id.clone()],
+                commit_body: body,
+            };
+            let snap_id = self
+                .cas
+                .cas()
+                .put_merkle_snapshot(&snap)
+                .map_err(|e| e.to_string())?;
+            let oid = self
+                .cas
+                .project_snapshot_oid(&snap, &[main_now.git_oid, branch_head.git_oid])
+                .map_err(|e| e.to_string())?;
+            let _ = self
+                .coord_ledger
+                .record_snapshot(
+                    &snap_id,
+                    &oid,
+                    &next_tree,
+                    &snap.parents,
+                    &self.project,
+                    ts_ms,
+                )
+                .map_err(|e| e.to_string())?;
+            let task_id = setup_accepted_task(
+                &self.coord_ledger.pg,
+                &format!("/tmp/d6-bench-land-{idx}.git"),
+                &main_now.git_oid,
+                &oid,
+            )?;
+
+            let t0 = Instant::now();
+            let _ = self
+                .coord_store
+                .land_main_snapshot(Some(&main_now.id), &snap_id, Some(task_id), "bench land")
+                .map_err(|e| e.to_string())?;
+            let dur = t0.elapsed();
+            worker.samples.push("land_main", dur);
+
+            let after_cas_bytes = cas_payload_bytes(&self.cas_root)?;
+            deltas.push(after_cas_bytes.saturating_sub(prev_cas_bytes));
+            prev_cas_bytes = after_cas_bytes;
+        }
+        let mut guard = self
+            .always_on
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.land_deltas = deltas;
+        Ok(())
+    }
+
+    fn run_crash_restart_drill(&self, workers: &[WorkerState]) -> Result<(), String> {
+        let expected_main = self
+            .coord_store
+            .main_snapshot()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "main snapshot missing before crash drill".to_string())?;
+        let mut expected_branches = Vec::with_capacity(workers.len());
+        for w in workers {
+            let head = self
+                .coord_store
+                .branch_snapshot(w.branch.as_str())
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("branch {} missing before crash drill", w.branch))?;
+            expected_branches.push((w.branch.as_str().to_string(), head.id));
+        }
+        let pre_journal_len = self
+            .cas
+            .cas()
+            .read_ref_journal()
+            .map_err(|e| e.to_string())?
+            .len();
+
+        let t0 = Instant::now();
+        let fresh_cas =
+            Arc::new(CasMerkleStore::open(&self.cas_root).map_err(|e| format!("reopen cas: {e}"))?);
+        let fresh_ledger = Arc::new(PgRefLedger::connect_schema(&self.pg_url, &self.schema)?);
+        let fresh_ws = D6Workspace::new(
+            &self.project,
+            &self.disk_root,
+            fresh_cas.clone(),
+            fresh_ledger,
+        );
+
+        let journal = fresh_cas
+            .cas()
+            .read_ref_journal()
+            .map_err(|e| format!("reopen refs.journal: {e}"))?;
+        let mut lost_refs = usize::from(journal.len() < pre_journal_len);
+        let mut snapshots_to_verify = BTreeSet::new();
+        snapshots_to_verify.insert(expected_main.id.clone());
+
+        match fresh_ws.main_snapshot() {
+            Ok(Some(live)) if live.id == expected_main.id => {}
+            _ => lost_refs += 1,
+        }
+        for (branch, expected_id) in &expected_branches {
+            snapshots_to_verify.insert(expected_id.clone());
+            match fresh_ws.branch_snapshot(branch) {
+                Ok(Some(live)) if &live.id == expected_id => {}
+                _ => lost_refs += 1,
+            }
+        }
+
+        let (lost_commits, corrupt_objects, blobs_verified) =
+            verify_reopened_objects(&fresh_cas, &snapshots_to_verify);
+        let recovery_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let verified = lost_refs == 0 && lost_commits == 0 && corrupt_objects == 0;
+
+        let report = json!({
+            "verified": verified,
+            "branches_verified": expected_branches.len(),
+            "refs_verified": expected_branches.len() + 1,
+            "snapshots_verified": snapshots_to_verify.len(),
+            "blobs_verified": blobs_verified,
+            "journal_entries": journal.len(),
+            "lost_commits": lost_commits,
+            "lost_refs": lost_refs,
+            "corrupt_objects": corrupt_objects,
+            "recovery_ms": recovery_ms,
+        });
+        {
+            let mut guard = self
+                .always_on
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.crash_drill = Some(report);
+        }
+        if !verified {
             return Err(format!(
-                "oversized.bin OID {projected_blob} != pointer OID {expected_pointer}"
+                "crash-restart drill failed: lost_refs={lost_refs}, lost_commits={lost_commits}, corrupt_objects={corrupt_objects}"
             ));
         }
         Ok(())
@@ -1410,6 +1695,16 @@ impl BenchDriver for D6Driver {
         )
     }
 
+    fn post_merge_phase(&self, config: &Config, workers: &mut [WorkerState]) -> Result<(), String> {
+        if config.land_branches {
+            self.run_land_phase(workers)?;
+        }
+        if config.crash_restart_drill {
+            self.run_crash_restart_drill(workers)?;
+        }
+        Ok(())
+    }
+
     fn verify_final(&self, branches: &[BranchName], config: &Config) -> Result<(), String> {
         for b in branches {
             if let Some(sz) = config.oversized_file_bytes {
@@ -1477,6 +1772,41 @@ impl BenchDriver for D6Driver {
             "oversized_chunked": self.oversized_ingested,
             "l1_reserved_bytes": l1_reserved,
         })
+    }
+
+    fn always_on_d6_json(&self, config: &Config, logical_written_bytes: u64) -> Option<Value> {
+        if !config.land_branches && !config.crash_restart_drill {
+            return None;
+        }
+        let guard = self
+            .always_on
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cas_bytes = cas_payload_bytes(&self.cas_root).unwrap_or(0);
+        let dedup_ratio = u64_to_f64(logical_written_bytes) / u64_to_f64(cas_bytes.max(1));
+        let landings = guard.land_deltas.len();
+        let total_delta: u64 = guard.land_deltas.iter().copied().sum();
+        let max_delta = guard.land_deltas.iter().copied().max().unwrap_or(0);
+        let mean_delta = if landings == 0 {
+            0.0
+        } else {
+            u64_to_f64(total_delta) / u64_to_f64(u64::try_from(landings).unwrap_or(1))
+        };
+        Some(json!({
+            "landings_completed": landings,
+            "bytes_per_landing": mean_delta,
+            "max_bytes_per_landing": max_delta,
+            "total_land_delta_bytes": total_delta,
+            "slo_bytes_per_landing_limit": LAND_DELTA_SLO_BYTES,
+            "slo_bytes_per_landing_passed": max_delta < LAND_DELTA_SLO_BYTES,
+            "logical_written_bytes": logical_written_bytes,
+            "cas_stored_bytes": cas_bytes,
+            "dedup_ratio": dedup_ratio,
+            "fastcdc_chunked_files": usize::from(
+                config.oversized_file_bytes.is_some_and(|b| b > 4 * 1024 * 1024)
+            ),
+            "crash_restart_drill": guard.crash_drill,
+        }))
     }
 }
 
@@ -1808,9 +2138,28 @@ fn run_worker_cycles(
     Ok(())
 }
 
+fn connect_pg_pool(
+    url: &str,
+    schema: &str,
+    count: usize,
+) -> Result<Vec<Arc<PostgresStore>>, String> {
+    let first = PostgresStore::connect_in_schema(url, schema)
+        .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
+    let mut pool = Vec::with_capacity(count.max(1));
+    for _ in 1..count.max(1) {
+        let conn = first
+            .new_connection()
+            .map_err(|e| format!("open pooled benchmark connection in {schema}: {e}"))?;
+        pool.push(Arc::new(conn));
+    }
+    pool.insert(0, Arc::new(first));
+    Ok(pool)
+}
+
 fn build_driver(
     config: &Config,
     scratch: &Scratch,
+    pg_pool: Option<&[Arc<PostgresStore>]>,
     bench_url: Option<&str>,
     schema: &str,
 ) -> Result<Arc<dyn BenchDriver>, String> {
@@ -1838,20 +2187,22 @@ fn build_driver(
             let url = bench_url.ok_or_else(|| {
                 "SPAWN_BENCH_DATABASE_URL is required for --backend d6".to_string()
             })?;
+            let pool = pg_pool.ok_or_else(|| "PG pool missing for d6".to_string())?;
             let disk_root = scratch.root.join("workspaces");
             let cas_root = scratch.root.join("cas");
             fs::create_dir_all(&disk_root).map_err(|e| e.to_string())?;
             let cas =
                 Arc::new(CasMerkleStore::open(&cas_root).map_err(|e| format!("open cas: {e}"))?);
-            Ok(Arc::new(D6Driver::new(
-                "proj-bench".to_string(),
+            Ok(Arc::new(D6Driver::new(D6DriverInit {
+                project: "proj-bench".to_string(),
                 disk_root,
                 cas_root,
                 cas,
-                url,
-                schema,
+                pg_pool: pool,
+                pg_url: url.to_string(),
+                schema: schema.to_string(),
                 config,
-            )?))
+            })?))
         }
         Backend::Shadow => {
             let url = bench_url.ok_or_else(|| {
@@ -1890,19 +2241,29 @@ fn run(config: &Config) -> Result<Value, String> {
     let archive_root = scratch.root.join(".transcripts");
     fs::create_dir_all(&archive_root).map_err(|e| e.to_string())?;
 
-    let driver = build_driver(config, &scratch, bench_url.as_deref(), &schema)?;
+    let desired_pool = if config.pg_pool_size > 0 {
+        config.pg_pool_size
+    } else {
+        config.concurrency.max(1)
+    };
+    let pg_pool = match &bench_url {
+        Some(url) => Some(connect_pg_pool(url, &schema, desired_pool)?),
+        None => None,
+    };
+
+    let driver = build_driver(
+        config,
+        &scratch,
+        pg_pool.as_deref(),
+        bench_url.as_deref(),
+        &schema,
+    )?;
 
     let mut workers = Vec::with_capacity(config.concurrency);
     for idx in 0..config.concurrency {
         let branch = worker_branch_name(idx, config.concurrency)?;
         let ws = driver.seed_branch(idx, &branch, config)?;
-        let db = match &bench_url {
-            Some(url) => Some(
-                PostgresStore::connect_in_schema(url, &schema)
-                    .map_err(|e| format!("connect worker pg: {e}"))?,
-            ),
-            None => None,
-        };
+        let db = pg_pool.as_ref().map(|pool| pool[idx % pool.len()].clone());
         workers.push(WorkerState::new(
             idx,
             config,
@@ -1916,6 +2277,7 @@ fn run(config: &Config) -> Result<Value, String> {
     let wall = Instant::now();
     let mut final_workers = run_checkpoint_phase(&driver, config, workers)?;
     run_merge_phase(&driver, config, &mut final_workers)?;
+    driver.post_merge_phase(config, &mut final_workers)?;
     let wall_ms = wall.elapsed().as_secs_f64() * 1000.0;
 
     finalize_and_build_report(
@@ -1978,6 +2340,15 @@ fn finalize_and_build_report(
             .saturating_mul(config.concurrency),
     )
     .unwrap_or(u64::MAX);
+    let total_cycles_per_worker = config.warmup.saturating_add(config.iterations);
+    let edited_bytes_all_workers = u64::try_from(
+        total_cycles_per_worker
+            .saturating_mul(config.edits)
+            .saturating_mul(config.file_bytes)
+            .saturating_mul(config.concurrency),
+    )
+    .unwrap_or(u64::MAX);
+    let logical_written_bytes = logical_workspace_bytes.saturating_add(edited_bytes_all_workers);
     let total_bytes = disk["total_bytes"].as_u64().unwrap_or(0);
     #[expect(clippy::cast_precision_loss)]
     let amp = (total_bytes as f64) / (logical_workspace_bytes.max(1) as f64);
@@ -2010,6 +2381,7 @@ fn finalize_and_build_report(
         "environment": {
             "backend": config.backend.as_str(),
             "concurrency": config.concurrency,
+            "pg_pool_size": (config.pg_pool_size > 0).then_some(config.pg_pool_size),
             "tmpfs_root": config.tmpfs_root,
             "tmpfs_budget_mb": config.tmpfs_root.as_ref().map(|_| config.tmpfs_budget_mb),
             "git_version": git_version(),
@@ -2024,6 +2396,9 @@ fn finalize_and_build_report(
     });
     if let Some(shadow) = driver.shadow_metrics_json() {
         report["shadow_oracle"] = shadow;
+    }
+    if let Some(always_on) = driver.always_on_d6_json(config, logical_written_bytes) {
+        report["always_on_d6"] = always_on;
     }
     Ok(report)
 }
@@ -2047,6 +2422,15 @@ fn build_cfg_json(config: &Config, has_database: bool) -> Value {
         if config.tmpfs_root.is_some() {
             cfg_json["tmpfs_budget_mb"] = json!(config.tmpfs_budget_mb);
         }
+    }
+    if config.pg_pool_size > 0 {
+        cfg_json["pg_pool_size"] = json!(config.pg_pool_size);
+    }
+    if config.land_branches {
+        cfg_json["land_branches"] = json!(true);
+    }
+    if config.crash_restart_drill {
+        cfg_json["crash_restart_drill"] = json!(true);
     }
     cfg_json
 }
