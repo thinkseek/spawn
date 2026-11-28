@@ -12,8 +12,8 @@ use std::error::Error;
 use std::fmt::{self, Write as _};
 
 use spawn_cas::{
-    Digest, GIT_POINTER_THRESHOLD, GitOid, Snapshot, Tree, TreeEntry, TreeEntryKind,
-    empty_tree_digest,
+    CommitActor, CommitIntent, CommitObject, CommitOrigin, CommitV2, Digest, GIT_POINTER_THRESHOLD,
+    GitOid, Snapshot, Tree, TreeEntry, TreeEntryKind, empty_tree_digest,
 };
 
 use crate::cas_merkle::{CasMerkleStore, D6StoreError, format_commit_body};
@@ -141,9 +141,10 @@ fn collect_ancestors(
         let parents = if let Some(cached) = parents_cache.get(&id) {
             cached.clone()
         } else {
-            let snap = store.cas().read_merkle_snapshot(&id)?;
-            parents_cache.insert(id.clone(), snap.parents.clone());
-            snap.parents
+            let commit = store.cas().get_commit_object(&id)?;
+            let parents = commit.parents().to_vec();
+            parents_cache.insert(id.clone(), parents.clone());
+            parents
         };
         for p in parents {
             if seen.insert(p.clone()) {
@@ -1519,9 +1520,9 @@ pub fn merge_snapshots(
     options: Option<MergeOptions>,
 ) -> Result<(Digest, MergeReport), MergeBaseError> {
     let base_snapshot = find_single_merge_base(store, main_snapshot, branch_snapshot)?;
-    let base_snap = store.cas().read_merkle_snapshot(&base_snapshot)?;
-    let main_snap = store.cas().read_merkle_snapshot(main_snapshot)?;
-    let branch_snap = store.cas().read_merkle_snapshot(branch_snapshot)?;
+    let base_obj = store.cas().get_commit_object(&base_snapshot)?;
+    let main_obj = store.cas().get_commit_object(main_snapshot)?;
+    let branch_obj = store.cas().get_commit_object(branch_snapshot)?;
 
     let resolved_opts = if let Some(opts) = options {
         opts
@@ -1542,9 +1543,9 @@ pub fn merge_snapshots(
 
     let report = merge_trees(
         store,
-        &base_snap.tree,
-        &main_snap.tree,
-        &branch_snap.tree,
+        base_obj.tree(),
+        main_obj.tree(),
+        branch_obj.tree(),
         &resolved_opts,
     )?;
     Ok((base_snapshot, report))
@@ -1558,12 +1559,12 @@ fn snapshot_oid_cached(
     if let Some(&oid) = cache.get(id) {
         return Ok(oid);
     }
-    let snap = store.cas().read_merkle_snapshot(id)?;
-    let mut parent_oids = Vec::with_capacity(snap.parents.len());
-    for p in &snap.parents {
+    let commit = store.cas().get_commit_object(id)?;
+    let mut parent_oids = Vec::with_capacity(commit.parents().len());
+    for p in commit.parents() {
         parent_oids.push(snapshot_oid_cached(store, p, cache)?);
     }
-    let oid = store.project_snapshot_oid(&snap, &parent_oids)?;
+    let oid = store.project_commit_object_oid(&commit, &parent_oids)?;
     cache.insert(id.clone(), oid);
     Ok(oid)
 }
@@ -2634,6 +2635,105 @@ pub fn build_merge_snapshot(
     Ok(BuiltMergeSnapshot {
         snapshot_id,
         snapshot,
+        git_oid,
+        tree_git_oid,
+    })
+}
+
+/// Inputs for [`build_merge_commit_v2`], producing a native `spawn-commit-v2`
+/// merge commit (`parents = [main_snapshot, branch_snapshot]`, `git_compat_body: None`).
+#[derive(Debug, Clone)]
+pub struct MergeCommitV2Spec<'a> {
+    /// First parent (current target/main head commit digest).
+    pub main_snapshot: &'a Digest,
+    /// Second parent (source/branch head commit digest).
+    pub branch_snapshot: &'a Digest,
+    /// Pre-computed merged `spawn-tree-v1` root digest.
+    pub merged_tree: &'a Digest,
+    /// Optional precomputed 40-hex OID of `main_snapshot` (computed from CAS if `None`).
+    pub main_git_oid: Option<GitOid>,
+    /// Optional precomputed 40-hex OID of `branch_snapshot` (computed from CAS if `None`).
+    pub branch_git_oid: Option<GitOid>,
+    /// Commit timestamp in Unix epoch milliseconds.
+    pub created_at_ms: i64,
+    /// Closed producing actor provenance.
+    pub actor: &'a CommitActor,
+    /// Closed commit origin (e.g. `CommitOrigin::Work { change: Derive, boundary: Checkpoint }` or `Land`).
+    pub origin: CommitOrigin,
+    /// Optional mission/task ID attached structurally to `intent.task_id`.
+    pub task_id: Option<i64>,
+    /// Optional transcript digest/URI reference.
+    pub transcript_ref: Option<&'a str>,
+    /// Commit message summary/body (preserved verbatim unless extra trailers are supplied).
+    pub message: &'a str,
+}
+
+/// Constructed first-parent merge `spawn-commit-v2` persisted in `spawn-cas`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltMergeCommitV2 {
+    /// Canonical `spawn-commit-v2` SHA-256 digest.
+    pub snapshot_id: Digest,
+    /// Stored `CommitV2` object (`parents = [main_snapshot, branch_snapshot]`).
+    pub commit: CommitV2,
+    /// Projected deterministic 40-hex commit OID.
+    pub git_oid: GitOid,
+    /// Projected deterministic 40-hex root tree OID.
+    pub tree_git_oid: GitOid,
+}
+
+/// Construct and store a first-parent native `spawn-commit-v2` merge commit
+/// (`parents = [main, branch]`, `git_compat_body: None`) and project its edge Git OIDs.
+pub fn build_merge_commit_v2(
+    store: &CasMerkleStore,
+    spec: &MergeCommitV2Spec<'_>,
+) -> Result<BuiltMergeCommitV2, D6StoreError> {
+    let mut cache = HashMap::new();
+    let main_oid = match spec.main_git_oid {
+        Some(oid) => oid,
+        None => snapshot_oid_cached(store, spec.main_snapshot, &mut cache)?,
+    };
+    let branch_oid = match spec.branch_git_oid {
+        Some(oid) => oid,
+        None => snapshot_oid_cached(store, spec.branch_snapshot, &mut cache)?,
+    };
+
+    let tombstone = format!("{LARGE_FILE_TRAILER}:");
+    if spec.message.lines().any(|line| {
+        let t = line.trim_start();
+        t.len() >= tombstone.len() && t[..tombstone.len()].eq_ignore_ascii_case(&tombstone)
+    }) {
+        return Err(D6StoreError::InvalidInput(format!(
+            "tombstoned {LARGE_FILE_TRAILER} trailer is forbidden in D6 merge commits"
+        )));
+    }
+
+    let trimmed = spec.message.trim_end_matches('\n');
+    let msg = if trimmed.is_empty() {
+        format!("spawn: merge {}", spec.branch_snapshot)
+    } else {
+        trimmed.to_string()
+    };
+    let commit = CommitV2 {
+        tree: spec.merged_tree.clone(),
+        parents: vec![spec.main_snapshot.clone(), spec.branch_snapshot.clone()],
+        at_ms: spec.created_at_ms,
+        actor: spec.actor.clone(),
+        intent: CommitIntent {
+            origin: spec.origin,
+            task_id: spec.task_id,
+            transcript_ref: spec.transcript_ref.map(str::to_string),
+            message: msg,
+        },
+        git_compat_body: None,
+    };
+    let snapshot_id = store.cas().put_commit_v2(&commit)?;
+    let tree_git_oid = store.project_tree_oid(spec.merged_tree)?;
+    let git_oid = store
+        .project_commit_object_oid(&CommitObject::V2(commit.clone()), &[main_oid, branch_oid])?;
+
+    Ok(BuiltMergeCommitV2 {
+        snapshot_id,
+        commit,
         git_oid,
         tree_git_oid,
     })

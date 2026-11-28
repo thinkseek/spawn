@@ -47,6 +47,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use spawn_cas::{
+    CommitActor, CommitObject, CommitOrigin, CommitV2, Digest as CasDigest, Store as CasStore,
+    WorkBoundary, WorkChange, empty_tree_digest,
+};
 use spawn_postgres::PostgresStore;
 use spawn_postgres::provenance::{
     ProvAttributionSource, ProvBoundary, ProvChangeInput, ProvChangeKind, ProvChangeRecord,
@@ -1043,7 +1047,7 @@ struct Facts {
 }
 
 impl Facts {
-    fn load(store: &PostgresStore, items: &[Item]) -> Result<Self, String> {
+    fn load(store: &PostgresStore, cas: Option<&CasStore>, items: &[Item]) -> Result<Self, String> {
         let error = |error: spawn_core::port::StoreError| error.to_string();
         let mut executions: Vec<String> = items
             .iter()
@@ -1076,9 +1080,23 @@ impl Facts {
             .flatten()
             .map(|(_, task)| *task)
             .collect();
+        let mut landed: Vec<i64> = Vec::new();
         for item in items {
             match item {
-                Item::Main { trailers, .. } => tasks.extend(trailers.task),
+                Item::Main {
+                    commit, trailers, ..
+                } => {
+                    if let Some(task) = trailers.task {
+                        tasks.push(task);
+                        landed.push(task);
+                    } else if let Some((_, v2)) = lookup_commit_v2(store, cas, &commit.id)
+                        && matches!(v2.intent.origin, CommitOrigin::Land)
+                        && let Some(task) = v2.intent.task_id
+                    {
+                        tasks.push(task);
+                        landed.push(task);
+                    }
+                }
                 Item::Checkpoint {
                     found: Found::Merge { task, .. },
                     ..
@@ -1088,13 +1106,6 @@ impl Facts {
         }
         tasks.sort_unstable();
         tasks.dedup();
-        let mut landed: Vec<i64> = items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Main { trailers, .. } => trailers.task,
-                Item::Checkpoint { .. } => None,
-            })
-            .collect();
         landed.sort_unstable();
         landed.dedup();
         let briefs = store.prov_task_briefs(&landed).map_err(error)?;
@@ -1243,6 +1254,197 @@ fn main_change(
         boundary,
         at_ms: commit.at_ms,
     }
+}
+
+/// Structured provenance fields deterministically extracted from a canonical [`CommitV2`]
+/// without any message or trailer text parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitV2ProvenanceFacts {
+    pub(crate) kind: ProvChangeKind,
+    pub(crate) boundary: ProvBoundary,
+    pub(crate) agent_id: String,
+    pub(crate) execution_id: Option<String>,
+    pub(crate) task_id: Option<i64>,
+    pub(crate) preset_id: Option<String>,
+    pub(crate) model_label: Option<String>,
+    pub(crate) transcript_ref: Option<String>,
+    pub(crate) attributed: ProvAttributionSource,
+    pub(crate) at_ms: i64,
+}
+
+fn project_commit_v2_origin(
+    origin: CommitOrigin,
+) -> (ProvChangeKind, ProvBoundary, ProvAttributionSource) {
+    match origin {
+        CommitOrigin::Work { change, boundary } => {
+            let kind = match change {
+                WorkChange::Edit => ProvChangeKind::Edit,
+                WorkChange::Derive => ProvChangeKind::Derive,
+                WorkChange::Revert => ProvChangeKind::Revert,
+            };
+            let prov_boundary = match boundary {
+                WorkBoundary::Checkpoint => ProvBoundary::Checkpoint,
+                WorkBoundary::Submit => ProvBoundary::Submit,
+                WorkBoundary::Job => ProvBoundary::Job,
+            };
+            (kind, prov_boundary, ProvAttributionSource::Host)
+        }
+        CommitOrigin::Land => (
+            ProvChangeKind::Land,
+            ProvBoundary::Land,
+            ProvAttributionSource::Host,
+        ),
+        CommitOrigin::Import => (
+            ProvChangeKind::Import,
+            ProvBoundary::Backfill,
+            ProvAttributionSource::Imported,
+        ),
+    }
+}
+
+/// Purely project a canonical [`CommitV2`] into [`CommitV2ProvenanceFacts`], matching all
+/// 11 [`CommitOrigin`] variants and all 3 [`CommitActor`] variants with zero text scraping.
+pub(crate) fn project_commit_v2_facts(commit: &CommitV2) -> CommitV2ProvenanceFacts {
+    let (kind, boundary, attributed) = project_commit_v2_origin(commit.intent.origin);
+    let (agent_id, execution_id, model_label, preset_id) = match &commit.actor {
+        CommitActor::Agent {
+            id,
+            execution_id,
+            model_label,
+            preset_id,
+        } => (
+            id.clone(),
+            execution_id.clone(),
+            model_label.clone(),
+            preset_id.clone(),
+        ),
+        CommitActor::Human { id } | CommitActor::System { id } => (id.clone(), None, None, None),
+    };
+    CommitV2ProvenanceFacts {
+        kind,
+        boundary,
+        agent_id,
+        execution_id,
+        task_id: commit.intent.task_id,
+        preset_id,
+        model_label,
+        transcript_ref: commit.intent.transcript_ref.clone(),
+        attributed,
+        at_ms: commit.at_ms,
+    }
+}
+
+/// Derive a deterministic `change_id` solely from structured [`CommitV2`] fields.
+pub(crate) fn commit_v2_change_id(
+    domain: &str,
+    commit_digest: &CasDigest,
+    commit: &CommitV2,
+) -> String {
+    let key = match (commit.intent.origin, commit.intent.task_id) {
+        (CommitOrigin::Land, Some(task)) => {
+            let head = commit.parents.get(1).unwrap_or(commit_digest).to_string();
+            land_key(task, &head)
+        }
+        (CommitOrigin::Import, _) => import_key(&commit_digest.to_string()),
+        (
+            CommitOrigin::Work {
+                change: WorkChange::Edit,
+                ..
+            },
+            Some(task),
+        ) => edit_task_key(task),
+        (CommitOrigin::Work { change, .. }, Some(task)) => {
+            format!("{}:task:{task}", change.as_str())
+        }
+        (origin, None) => {
+            let kind_str = match origin {
+                CommitOrigin::Work { change, .. } => change.as_str(),
+                CommitOrigin::Land => "land",
+                CommitOrigin::Import => "import",
+            };
+            format!("{kind_str}:actor:{}:{commit_digest}", commit.actor.id())
+        }
+    };
+    change_id(domain, &key)
+}
+
+/// Purely construct a [`ProvChangeInput`] from `(commit_digest, commit)` with optional
+/// `base_override` / `result_override` identifiers (e.g. `git1(...)` on Git-border paths).
+pub(crate) fn project_commit_v2_change(
+    domain: &str,
+    commit_digest: &CasDigest,
+    commit: &CommitV2,
+    rev: i32,
+    base_override: Option<&str>,
+    result_override: Option<&str>,
+) -> ProvChangeInput {
+    let facts = project_commit_v2_facts(commit);
+    let cid = commit_v2_change_id(domain, commit_digest, commit);
+    let base = base_override.map_or_else(
+        || {
+            commit
+                .parents
+                .first()
+                .cloned()
+                .unwrap_or_else(empty_tree_digest)
+                .to_string()
+        },
+        str::to_string,
+    );
+    let result = result_override.map_or_else(|| commit_digest.to_string(), str::to_string);
+    ProvChangeInput {
+        change_id: cid,
+        rev,
+        kind: facts.kind,
+        domain: domain.to_string(),
+        agent_id: facts.agent_id,
+        execution_id: facts.execution_id,
+        task_id: facts.task_id,
+        preset_id: facts.preset_id,
+        model_label: facts.model_label,
+        transcript_ref: facts.transcript_ref,
+        attributed: facts.attributed,
+        base,
+        result,
+        boundary: facts.boundary,
+        at_ms: facts.at_ms,
+    }
+}
+
+fn lookup_commit_v2(
+    store: &PostgresStore,
+    cas: Option<&CasStore>,
+    git_oid: &str,
+) -> Option<(CasDigest, CommitV2)> {
+    let cas = cas?;
+    let row = store.get_snapshot_by_oid(git_oid).ok().flatten()?;
+    let digest = CasDigest::parse(&row.id).ok()?;
+    match cas.get_commit_object(&digest).ok()? {
+        CommitObject::V2(commit) => Some((digest, commit)),
+        CommitObject::V1(_) => None,
+    }
+}
+
+fn commit_v2_for_item(
+    store: &PostgresStore,
+    cas: Option<&CasStore>,
+    domain: &str,
+    known: &Known,
+    commit: &CommitInfo,
+) -> Option<ProvChangeInput> {
+    let (digest, v2) = lookup_commit_v2(store, cas, &commit.id)?;
+    let cid = commit_v2_change_id(domain, &digest, &v2);
+    let rev = known.next_rev(&cid);
+    let base = git1(commit.parents.first().map_or(EMPTY_TREE, String::as_str));
+    let result = git1(&commit.id);
+    Some(project_commit_v2_change(
+        domain,
+        &digest,
+        &v2,
+        rev,
+        Some(&base),
+        Some(&result),
+    ))
 }
 
 /// A merge's `includes` edges and its entries' origins: one edge for each
@@ -1509,7 +1711,11 @@ pub(crate) fn index_with(
     if items.is_empty() {
         return Ok(summary);
     }
-    let facts = Facts::load(store, &items)?;
+    let cas = root
+        .map(|r| r.join(".cas"))
+        .filter(|p| p.is_dir())
+        .and_then(|p| CasStore::open(p).ok());
+    let facts = Facts::load(store, cas.as_ref(), &items)?;
     let tip = repo.resolve(MAIN);
     for item in &items {
         let (change, entries, edges) = match item {
@@ -1518,8 +1724,10 @@ pub(crate) fn index_with(
                 execution,
                 found,
             } => {
-                let change =
-                    checkpoint_change(domain, &known, &facts, commit, execution.as_ref(), found);
+                let change = commit_v2_for_item(store, cas.as_ref(), domain, &known, commit)
+                    .unwrap_or_else(|| {
+                        checkpoint_change(domain, &known, &facts, commit, execution.as_ref(), found)
+                    });
                 let entries = entries(
                     repo,
                     commit.parents.first().map(String::as_str),
@@ -1534,7 +1742,8 @@ pub(crate) fn index_with(
                 trailers,
                 checkpoints,
             } => {
-                let change = main_change(domain, &known, &facts, commit, trailers);
+                let change = commit_v2_for_item(store, cas.as_ref(), domain, &known, commit)
+                    .unwrap_or_else(|| main_change(domain, &known, &facts, commit, trailers));
                 let mut entries = entries(
                     repo,
                     commit.parents.first().map(String::as_str),
@@ -1575,4 +1784,279 @@ pub(crate) fn index_with(
         known.note(id, &change, &entries);
     }
     Ok(summary)
+}
+
+#[cfg(test)]
+mod commit_v2_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use spawn_cas::{CommitIntent, CommitOrigin, Store};
+    use spawn_core::id::BranchName;
+    use spawn_core::port::{Commit, WorkspaceStore};
+    use spawn_host::{CasMerkleStore, D6Workspace, InMemoryRefLedger};
+
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-cli-v2-prov-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn sample_v2(origin: CommitOrigin, actor: CommitActor, message: &str) -> CommitV2 {
+        CommitV2 {
+            tree: empty_tree_digest(),
+            parents: vec![],
+            at_ms: 1_700_500_000_000,
+            actor,
+            intent: CommitIntent {
+                origin,
+                task_id: Some(321),
+                transcript_ref: Some("transcript://321".to_string()),
+                message: message.to_string(),
+            },
+            git_compat_body: None,
+        }
+    }
+
+    const ORIGIN_CASES: [(
+        CommitOrigin,
+        ProvChangeKind,
+        ProvBoundary,
+        ProvAttributionSource,
+    ); 11] = [
+        (
+            CommitOrigin::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Checkpoint,
+            },
+            ProvChangeKind::Edit,
+            ProvBoundary::Checkpoint,
+            ProvAttributionSource::Host,
+        ),
+        (
+            CommitOrigin::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Submit,
+            },
+            ProvChangeKind::Edit,
+            ProvBoundary::Submit,
+            ProvAttributionSource::Host,
+        ),
+        (
+            CommitOrigin::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Job,
+            },
+            ProvChangeKind::Edit,
+            ProvBoundary::Job,
+            ProvAttributionSource::Host,
+        ),
+        (
+            CommitOrigin::Work {
+                change: WorkChange::Derive,
+                boundary: WorkBoundary::Checkpoint,
+            },
+            ProvChangeKind::Derive,
+            ProvBoundary::Checkpoint,
+            ProvAttributionSource::Host,
+        ),
+        (
+            CommitOrigin::Work {
+                change: WorkChange::Derive,
+                boundary: WorkBoundary::Submit,
+            },
+            ProvChangeKind::Derive,
+            ProvBoundary::Submit,
+            ProvAttributionSource::Host,
+        ),
+        (
+            CommitOrigin::Work {
+                change: WorkChange::Derive,
+                boundary: WorkBoundary::Job,
+            },
+            ProvChangeKind::Derive,
+            ProvBoundary::Job,
+            ProvAttributionSource::Host,
+        ),
+        (
+            CommitOrigin::Work {
+                change: WorkChange::Revert,
+                boundary: WorkBoundary::Checkpoint,
+            },
+            ProvChangeKind::Revert,
+            ProvBoundary::Checkpoint,
+            ProvAttributionSource::Host,
+        ),
+        (
+            CommitOrigin::Work {
+                change: WorkChange::Revert,
+                boundary: WorkBoundary::Submit,
+            },
+            ProvChangeKind::Revert,
+            ProvBoundary::Submit,
+            ProvAttributionSource::Host,
+        ),
+        (
+            CommitOrigin::Work {
+                change: WorkChange::Revert,
+                boundary: WorkBoundary::Job,
+            },
+            ProvChangeKind::Revert,
+            ProvBoundary::Job,
+            ProvAttributionSource::Host,
+        ),
+        (
+            CommitOrigin::Land,
+            ProvChangeKind::Land,
+            ProvBoundary::Land,
+            ProvAttributionSource::Host,
+        ),
+        (
+            CommitOrigin::Import,
+            ProvChangeKind::Import,
+            ProvBoundary::Backfill,
+            ProvAttributionSource::Imported,
+        ),
+    ];
+
+    #[test]
+    fn projects_all_eleven_commit_origins_and_all_actor_variants() {
+        for (origin, want_kind, want_boundary, want_attr) in ORIGIN_CASES {
+            let agent = CommitActor::Agent {
+                id: "worker-1".to_string(),
+                execution_id: Some("exec-1".to_string()),
+                model_label: Some("claude-sonnet".to_string()),
+                preset_id: Some("default".to_string()),
+            };
+            let facts = project_commit_v2_facts(&sample_v2(origin, agent, "work message"));
+            assert_eq!(facts.kind, want_kind);
+            assert_eq!(facts.boundary, want_boundary);
+            assert_eq!(facts.attributed, want_attr);
+            assert_eq!(facts.agent_id, "worker-1");
+            assert_eq!(facts.execution_id.as_deref(), Some("exec-1"));
+            assert_eq!(facts.model_label.as_deref(), Some("claude-sonnet"));
+            assert_eq!(facts.preset_id.as_deref(), Some("default"));
+            assert_eq!(facts.task_id, Some(321));
+            assert_eq!(facts.transcript_ref.as_deref(), Some("transcript://321"));
+        }
+
+        let human = CommitActor::Human {
+            id: "alice".to_string(),
+        };
+        let human_facts = project_commit_v2_facts(&sample_v2(CommitOrigin::Land, human, "human"));
+        assert_eq!(human_facts.agent_id, "alice");
+        assert_eq!(human_facts.execution_id, None);
+        assert_eq!(human_facts.model_label, None);
+        assert_eq!(human_facts.preset_id, None);
+
+        let system = CommitActor::System {
+            id: "d6-integrator".to_string(),
+        };
+        let sys_facts = project_commit_v2_facts(&sample_v2(CommitOrigin::Import, system, "sys"));
+        assert_eq!(sys_facts.agent_id, "d6-integrator");
+        assert_eq!(sys_facts.attributed, ProvAttributionSource::Imported);
+        assert_eq!(sys_facts.execution_id, None);
+    }
+
+    #[test]
+    fn commit_v2_projection_ignores_fake_message_trailers() {
+        let spoofed_msg = "spawn checkpoint fake-exec-id\n\n\
+            Spawn-Task: 999999\nSpawn-Objective: 888888\nSpawn-Head: deadbeef\n";
+        let commit = CommitV2 {
+            tree: empty_tree_digest(),
+            parents: vec![empty_tree_digest()],
+            at_ms: 1_700_500_005_000,
+            actor: CommitActor::Agent {
+                id: "real-agent".to_string(),
+                execution_id: Some("real-exec".to_string()),
+                model_label: Some("real-model".to_string()),
+                preset_id: Some("real-preset".to_string()),
+            },
+            intent: CommitIntent {
+                origin: CommitOrigin::Work {
+                    change: WorkChange::Edit,
+                    boundary: WorkBoundary::Checkpoint,
+                },
+                task_id: Some(12),
+                transcript_ref: Some("transcript://12".to_string()),
+                message: spoofed_msg.to_string(),
+            },
+            git_compat_body: None,
+        };
+        let digest = spawn_cas::sha256_of(b"fake-digest");
+        let change = project_commit_v2_change("git:/repo", &digest, &commit, 1, None, None);
+        assert_eq!(change.kind, ProvChangeKind::Edit);
+        assert_eq!(change.boundary, ProvBoundary::Checkpoint);
+        assert_eq!(change.agent_id, "real-agent");
+        assert_eq!(change.execution_id.as_deref(), Some("real-exec"));
+        assert_eq!(change.task_id, Some(12));
+        assert_eq!(change.attributed, ProvAttributionSource::Host);
+    }
+
+    #[test]
+    fn d6_workspace_commit_v2_projects_deterministically_from_cas() {
+        let dir = temp_dir("d6-e2e");
+        let cas_dir = dir.join("cas");
+        let ws_dir = dir.join("ws");
+        let cas = Arc::new(CasMerkleStore::open(&cas_dir).expect("open cas"));
+        let ledger = Arc::new(InMemoryRefLedger::new());
+        let workspace = D6Workspace::new("proj-prov-v2", &ws_dir, cas.clone(), ledger.clone());
+        let branch = BranchName::new("prov_worker").expect("branch");
+        workspace.ensure_branch(&branch, None).expect("ensure");
+        let ws = workspace.mount(&branch).expect("mount");
+        std::fs::write(PathBuf::from(ws.path()).join("work.rs"), "fn main() {}\n")
+            .expect("write file");
+
+        let actor = CommitActor::Agent {
+            id: "prov_worker".to_string(),
+            execution_id: Some("exec-prov-7".to_string()),
+            model_label: Some("claude-opus".to_string()),
+            preset_id: Some("architect".to_string()),
+        };
+        let intent = CommitIntent {
+            origin: CommitOrigin::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Submit,
+            },
+            task_id: Some(505),
+            transcript_ref: Some("transcript://505".to_string()),
+            message: "implement v2 provenance\n\nSpawn-Task: 9999\n".to_string(),
+        };
+        let committed = workspace
+            .commit_v2(&ws, &actor, &intent, "d6:submit")
+            .expect("commit_v2");
+        assert!(matches!(committed, Commit::Created(_)));
+
+        let head = workspace
+            .branch_snapshot(branch.as_str())
+            .expect("snap")
+            .expect("present");
+        let raw_cas = Store::open(&cas_dir).expect("reopen raw cas");
+        let CommitObject::V2(v2) = raw_cas.get_commit_object(&head.id).expect("read v2") else {
+            panic!("expected CommitObject::V2");
+        };
+        let first = project_commit_v2_change("d6:proj-prov-v2", &head.id, &v2, 1, None, None);
+        let second = project_commit_v2_change("d6:proj-prov-v2", &head.id, &v2, 1, None, None);
+        assert_eq!(first, second);
+        assert_eq!(first.kind, ProvChangeKind::Edit);
+        assert_eq!(first.boundary, ProvBoundary::Submit);
+        assert_eq!(first.agent_id, "prov_worker");
+        assert_eq!(first.execution_id.as_deref(), Some("exec-prov-7"));
+        assert_eq!(first.task_id, Some(505));
+        assert_eq!(first.model_label.as_deref(), Some("claude-opus"));
+        assert_eq!(first.preset_id.as_deref(), Some("architect"));
+        assert_eq!(first.transcript_ref.as_deref(), Some("transcript://505"));
+        assert_eq!(first.attributed, ProvAttributionSource::Host);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

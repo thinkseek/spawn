@@ -19,11 +19,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::json;
 use spawn_cas::{
-    DEFAULT_PERSISTENT_GC_GRACE, Digest, GIT_POINTER_THRESHOLD, GcFenceBinding, GitOid,
-    JournalEntry, NS_BLOB, Snapshot, Store, Tree, TreeEntry, TreeEntryKind, TreeMutation,
+    CommitActor, CommitIntent, CommitObject, CommitOrigin, CommitV2, DEFAULT_PERSISTENT_GC_GRACE,
+    Digest, GIT_POINTER_THRESHOLD, GcFenceBinding, GitOid, JournalEntry, NS_BLOB, Snapshot, Store,
+    Tree, TreeEntry, TreeEntryKind, TreeMutation, WorkBoundary, WorkChange,
 };
 use spawn_core::id::BranchName;
 use spawn_core::port::{BaseMerge, Commit, SetAside, WorkspaceStore};
+use spawn_host::cas_merkle::PublishCommitV2Request;
 use spawn_host::d6_workspace::{
     D6Workspace, HostMemorySample, L1Admission, L1FallbackReason, L1FlushReason, L1TmpfsPolicy,
 };
@@ -793,14 +795,14 @@ fn pg_live_cutover_7_steps_pending_merge_guard_parity_and_lossless_rollback() {
     let main_ref = parity.refs.get("refs/heads/main").expect("main parity");
     let main_snap = cas_store
         .cas()
-        .read_merkle_snapshot(&main_ref.snapshot)
+        .get_commit_object(&main_ref.snapshot)
         .expect("read main snap");
     let (post_id, post_sz) = cas_store
         .put_bytes_blob(b"post-cutover D6 file\n")
         .expect("put post file");
     let post_tree = cas_store
         .apply_mutations(
-            &main_snap.tree,
+            main_snap.tree(),
             &[spawn_cas::TreeMutation::Upsert {
                 path: vec![b"POST_CUTOVER.txt".to_vec()],
                 kind: spawn_cas::TreeEntryKind::File,
@@ -1229,11 +1231,16 @@ fn pg_refs_journal_crash_recovery_fast_forward_and_gc_fence_two_round_gc() {
         &p_br2.snapshot,
         &p_main2.snapshot,
     ] {
-        let snap_obj = store.cas().read_merkle_snapshot(snap_id).expect("src snap");
-        let put_snap = rec_store
-            .cas()
-            .put_merkle_snapshot(&snap_obj)
-            .expect("put rec snap");
+        let put_snap = match store.cas().get_commit_object(snap_id).expect("src snap") {
+            spawn_cas::CommitObject::V1(s) => rec_store
+                .cas()
+                .put_merkle_snapshot(&s)
+                .expect("put rec snap"),
+            spawn_cas::CommitObject::V2(v2) => rec_store
+                .cas()
+                .put_commit_v2(&v2)
+                .expect("put rec commit v2"),
+        };
         assert_eq!(&put_snap, snap_id);
     }
 
@@ -1948,10 +1955,10 @@ fn pg_reversible_cutover_shadow_d6_l1_and_border_roundtrip_drill() {
         .to_string();
         let snap = prod_cas
             .cas()
-            .read_merkle_snapshot(&entry.snapshot)
+            .get_commit_object(&entry.snapshot)
             .expect("read snap");
         let expected_tree = prod_cas
-            .project_tree_oid(&snap.tree)
+            .project_tree_oid(snap.tree())
             .expect("project tree oid")
             .to_hex();
         assert_eq!(rev_tree, expected_tree, "tree OID for {git_ref}");
@@ -2629,13 +2636,13 @@ fn publish_main_change_via_gate(
     let base_snap = ctx
         .cas_store
         .cas()
-        .read_merkle_snapshot(base_snap_id)
+        .get_commit_object(base_snap_id)
         .expect("read base snapshot");
     let (blob_id, blob_sz) = ctx.cas_store.put_bytes_blob(content).expect("put blob");
     let next_tree = ctx
         .cas_store
         .apply_mutations(
-            &base_snap.tree,
+            base_snap.tree(),
             &[TreeMutation::Upsert {
                 path: vec![file_name.as_bytes().to_vec()],
                 kind: TreeEntryKind::File,
@@ -2895,4 +2902,328 @@ fn pg_cutover_rollback_git_advance_main_recutover_and_verify() {
     let advanced_git_main = advance_git_after_rollback(&work);
     assert_git_fsck_clean(&bare_repo);
     verify_recutover_state_and_guard(&ctx, &binding, advanced_git_main, &init_main.snapshot);
+}
+
+struct SeededV2Cutover {
+    t1: Digest,
+    t2: Digest,
+    b2: Digest,
+    ts0: i64,
+    p_main1: spawn_host::PublishedSnapshot,
+    p_br: spawn_host::PublishedSnapshot,
+    p_main2: spawn_host::PublishedSnapshot,
+    live_task: i64,
+    agent_actor: CommitActor,
+}
+
+fn land_v2_branch_onto_main(
+    store: &CasMerkleStore,
+    live_ledger: &PgRefLedger,
+    p_main1: &spawn_host::PublishedSnapshot,
+    p_br: &spawn_host::PublishedSnapshot,
+    t2: &Digest,
+    ts0: i64,
+) -> (i64, spawn_host::PublishedSnapshot) {
+    let land_actor = CommitActor::System {
+        id: "d6-integrator".to_string(),
+    };
+    let land_intent = CommitIntent {
+        origin: CommitOrigin::Land,
+        task_id: Some(1),
+        transcript_ref: Some("transcript://land-1".to_string()),
+        message: "Land feat/v2 via structured CommitV2 task_id".to_string(),
+    };
+    let cand_oid = store
+        .project_commit_object_oid(
+            &CommitObject::V2(CommitV2 {
+                tree: t2.clone(),
+                parents: vec![p_main1.snapshot.clone(), p_br.snapshot.clone()],
+                at_ms: ts0 + 2_000,
+                actor: land_actor.clone(),
+                intent: land_intent.clone(),
+                git_compat_body: None,
+            }),
+            &[p_main1.git_oid, p_br.git_oid],
+        )
+        .expect("project land oid");
+    let live_task = setup_accepted_task(
+        &live_ledger.pg,
+        "/tmp/v2-cut-proj.git",
+        &p_main1.git_oid,
+        &cand_oid,
+    );
+    assert_eq!(live_task, 1);
+
+    let p_main2 = store
+        .publish_commit_v2(
+            live_ledger,
+            &PublishCommitV2Request {
+                project: "v2-cut-proj",
+                ref_name: "main",
+                kind: D6RefKind::Main,
+                expected_ref: Some(&p_main1.snapshot),
+                tree: t2,
+                parents: &[p_main1.snapshot.clone(), p_br.snapshot.clone()],
+                created_at_ms: ts0 + 2_000,
+                actor: &land_actor,
+                intent: &land_intent,
+                git_compat_body: None,
+                reason: "v2 land",
+                landing_task_id: Some(live_task),
+            },
+        )
+        .expect("pub v2 land");
+    assert_eq!(p_main2.git_oid, cand_oid);
+    (live_task, p_main2)
+}
+
+fn seed_v2_cutover_dag(
+    store: &CasMerkleStore,
+    live_ledger: &PgRefLedger,
+    ts0: i64,
+) -> SeededV2Cutover {
+    let (b1, sz1) = store.put_bytes_blob(b"v1 root content\n").expect("b1");
+    let (b2, sz2) = store.put_bytes_blob(b"v2 branch content\n").expect("b2");
+    let t1 = store
+        .put_tree_cached(
+            &Tree::from_entries(vec![TreeEntry::file(b"root.txt".to_vec(), &b1, sz1)]).expect("t1"),
+        )
+        .expect("store t1");
+    let t2 = store
+        .put_tree_cached(
+            &Tree::from_entries(vec![
+                TreeEntry::file(b"root.txt".to_vec(), &b1, sz1),
+                TreeEntry::file(b"v2.txt".to_vec(), &b2, sz2),
+            ])
+            .expect("t2"),
+        )
+        .expect("store t2");
+
+    let v1_body = format_commit_body(
+        "Alice <alice@spawn.local> 1700000100 +0000",
+        "Alice <alice@spawn.local> 1700000100 +0000",
+        "Legacy v1 root",
+    );
+    let p_main1 = store
+        .publish_snapshot(
+            live_ledger,
+            &PublishRequest {
+                project: "v2-cut-proj",
+                ref_name: "main",
+                kind: D6RefKind::Main,
+                expected_ref: None,
+                tree: &t1,
+                parents: &[],
+                commit_body: &v1_body,
+                created_at_ms: ts0,
+                reason: "v1 seed",
+                landing_task_id: None,
+            },
+        )
+        .expect("pub v1 main");
+
+    let agent_actor = CommitActor::Agent {
+        id: "v2-worker".to_string(),
+        execution_id: Some("exec-v2-cut".to_string()),
+        model_label: Some("claude-sonnet".to_string()),
+        preset_id: Some("coder".to_string()),
+    };
+    let br_intent = CommitIntent {
+        origin: CommitOrigin::Work {
+            change: WorkChange::Edit,
+            boundary: WorkBoundary::Submit,
+        },
+        task_id: Some(1),
+        transcript_ref: Some("transcript://1".to_string()),
+        message: "CommitV2 branch work (no text trailer)".to_string(),
+    };
+    let p_br = store
+        .publish_commit_v2(
+            live_ledger,
+            &PublishCommitV2Request {
+                project: "v2-cut-proj",
+                ref_name: "feat/v2",
+                kind: D6RefKind::Branch,
+                expected_ref: None,
+                tree: &t2,
+                parents: std::slice::from_ref(&p_main1.snapshot),
+                created_at_ms: ts0 + 1_000,
+                actor: &agent_actor,
+                intent: &br_intent,
+                git_compat_body: None,
+                reason: "v2 branch commit",
+                landing_task_id: None,
+            },
+        )
+        .expect("pub v2 branch");
+
+    let (live_task, p_main2) =
+        land_v2_branch_onto_main(store, live_ledger, &p_main1, &p_br, &t2, ts0);
+    SeededV2Cutover {
+        t1,
+        t2,
+        b2,
+        ts0,
+        p_main1,
+        p_br,
+        p_main2,
+        live_task,
+        agent_actor,
+    }
+}
+
+fn verify_v2_orphan_gc(
+    store: &CasMerkleStore,
+    clock: &ManualClock,
+    live_ledger: &PgRefLedger,
+    live_binding: &GcFenceBinding,
+    seeded: &SeededV2Cutover,
+) {
+    let (blob_orp, sz_orp) = store.put_bytes_blob(b"orphan v2 content\n").expect("b_orp");
+    let tree_orp = store
+        .put_tree_cached(
+            &Tree::from_entries(vec![TreeEntry::file(
+                b"orp.txt".to_vec(),
+                &blob_orp,
+                sz_orp,
+            )])
+            .expect("tree_orp"),
+        )
+        .expect("store tree_orp");
+    let orphan_v2 = CommitV2 {
+        tree: tree_orp.clone(),
+        parents: vec![seeded.p_main1.snapshot.clone()],
+        at_ms: seeded.ts0 + 3_000,
+        actor: seeded.agent_actor.clone(),
+        intent: CommitIntent {
+            origin: CommitOrigin::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Checkpoint,
+            },
+            task_id: None,
+            transcript_ref: None,
+            message: "orphan v2 checkpoint".to_string(),
+        },
+        git_compat_body: None,
+    };
+    let orphan_digest = store.cas().put_commit_v2(&orphan_v2).expect("put orp v2");
+    let orphan_git_oid = store
+        .project_commit_object_oid(&CommitObject::V2(orphan_v2), &[seeded.p_main1.git_oid])
+        .expect("orphan oid");
+    store.cas().sync_store().expect("sync orp");
+    live_ledger
+        .record_snapshot(
+            &orphan_digest,
+            &orphan_git_oid,
+            &tree_orp,
+            std::slice::from_ref(&seeded.p_main1.snapshot),
+            "v2-cut-proj",
+            seeded.ts0 + 3_000,
+        )
+        .expect("record orphan v2");
+
+    let r1 = run_persistent_gc_for_ledger(
+        store,
+        live_ledger,
+        live_binding,
+        live_ledger.pg.latest_ref_log_seq().expect("seq"),
+        DEFAULT_PERSISTENT_GC_GRACE,
+    )
+    .expect("gc round 1");
+    assert!(r1.deleted_objects.is_empty());
+    clock.advance(Duration::from_hours(25));
+    let r2 = run_persistent_gc_for_ledger(
+        store,
+        live_ledger,
+        live_binding,
+        live_ledger.pg.latest_ref_log_seq().expect("seq"),
+        DEFAULT_PERSISTENT_GC_GRACE,
+    )
+    .expect("gc round 2");
+    assert!(r2.deleted_objects.contains(&orphan_digest));
+    assert!(r2.deleted_objects.contains(&tree_orp));
+    assert!(r2.deleted_objects.contains(&blob_orp));
+    assert!(store.cas().has(&seeded.p_main2.snapshot));
+    assert!(store.cas().has(&seeded.p_br.snapshot));
+    assert!(store.cas().has(&seeded.p_main1.snapshot));
+    assert!(store.cas().has(&seeded.b2));
+}
+
+#[test]
+fn pg_commit_v2_reconcile_bundle_roundtrip_and_persistent_gc() {
+    let scratch = Scratch::new("pg_v2_cutover");
+    let clock = ManualClock::new(SystemTime::now() + Duration::from_mins(1));
+    let cas_root = scratch.join("cas");
+    let store = clock.cas_store(&cas_root);
+    let live_ledger = PgRefLedger::connect_isolated("d6_v2_cutover_live");
+    let live_ident = live_ledger.pg.database_identity().expect("live ident");
+    let live_binding = GcFenceBinding {
+        db_system_id: live_ident.db_system_id,
+        db_oid: live_ident.db_oid,
+        schema_name: live_ident.schema_name,
+    };
+    bind_store_gc_fence(&store, &live_binding).expect("bind live fence");
+
+    let seeded = seed_v2_cutover_dag(&store, &live_ledger, clock.now_ms());
+    verify_v2_orphan_gc(&store, &clock, &live_ledger, &live_binding, &seeded);
+
+    let adapter = GitBorderAdapter::new();
+    let bundle_path = scratch.join("v2-mixed.bundle");
+    let drill = verify_bundle_snapshot_roundtrip(
+        &store,
+        &live_ledger,
+        &adapter,
+        "v2-cut-proj",
+        &bundle_path,
+    )
+    .expect("v2 bundle roundtrip");
+    assert_eq!(drill.snapshots_verified, 3);
+    assert_eq!(drill.refs_verified.len(), 2);
+    assert!(store.read_tree_cached(&seeded.t2).is_ok());
+
+    let backup_ledger = PgRefLedger::connect_isolated("d6_v2_cutover_backup");
+    let backup_task = setup_accepted_task(
+        &backup_ledger.pg,
+        "/tmp/v2-cut-proj.git",
+        &seeded.p_main1.git_oid,
+        &seeded.p_main2.git_oid,
+    );
+    assert_eq!(backup_task, seeded.live_task);
+    backup_ledger
+        .record_snapshot(
+            &seeded.p_main1.snapshot,
+            &seeded.p_main1.git_oid,
+            &seeded.t1,
+            &[],
+            "v2-cut-proj",
+            seeded.ts0,
+        )
+        .expect("backup seed snap");
+    let seq1 = backup_ledger
+        .land_main_ref(
+            "v2-cut-proj",
+            "main",
+            None,
+            &seeded.p_main1.snapshot,
+            None,
+            "seed",
+        )
+        .expect("backup seed main");
+    assert_eq!(seq1, 1);
+
+    let rep = reconcile_refs_journal(&store, &backup_ledger, seq1, "v2_replay")
+        .expect("reconcile v2 journal");
+    assert_eq!(rep.entries_replayed, 2);
+    assert_eq!(
+        backup_ledger
+            .list_refs(Some("v2-cut-proj"))
+            .expect("list backup refs")
+            .into_iter()
+            .map(|r| (r.name, r.snapshot))
+            .collect::<HashMap<_, _>>(),
+        HashMap::from([
+            ("main".to_string(), seeded.p_main2.snapshot),
+            ("feat/v2".to_string(), seeded.p_br.snapshot),
+        ])
+    );
 }

@@ -17,12 +17,13 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use spawn_cas::{
-    Digest, GIT_POINTER_THRESHOLD, GitOid, JournalEntry, NS_BLOB, Snapshot, Store, Tree, TreeEntry,
-    TreeEntryKind, git_pointer_bytes,
+    CommitObject, Digest, GIT_POINTER_THRESHOLD, GitOid, JournalEntry, NS_BLOB, Snapshot, Store,
+    Tree, TreeEntry, TreeEntryKind, git_pointer_bytes,
 };
 
 use crate::cas_merkle::{
     CasMerkleStore, D6RefKind, D6StoreError, LedgerRef, RefLedger, is_pointer_sized,
+    project_commit_git_body,
 };
 use crate::git_process::git_command;
 use crate::tree_path::nul_fields;
@@ -334,8 +335,7 @@ impl GitBorderAdapter {
             // Group contiguous runs of standard commits into one `git fast-import` pass.
             let start = idx;
             while idx < plan.topo.len()
-                && parse_standard_commit_body(&plan.snapshots[&plan.topo[idx]].commit_body)
-                    .is_some()
+                && parse_standard_commit_body(&plan.projected_bodies[&plan.topo[idx]]).is_some()
             {
                 idx += 1;
             }
@@ -358,12 +358,13 @@ impl GitBorderAdapter {
             // Emit any non-standard commit (`gpgsig` / custom headers) via staging tree + hash-object.
             if idx < plan.topo.len() {
                 let snap_id = &plan.topo[idx];
-                let snap = &plan.snapshots[snap_id];
+                let commit = &plan.commits[snap_id];
+                let commit_body = &plan.projected_bodies[snap_id];
                 let tree_oid = self.materialize_git_tree_via_fast_import(
                     store,
                     mirror_dir,
                     plan,
-                    &snap.tree,
+                    commit.tree(),
                     marks_path,
                     stage_prefix,
                     &mut stage_counter,
@@ -378,7 +379,13 @@ impl GitBorderAdapter {
                         actual: tree_oid.to_hex(),
                     });
                 }
-                let oid = self.write_verbatim_commit(mirror_dir, snap, tree_oid, commit_oids)?;
+                let oid = self.write_verbatim_commit(
+                    mirror_dir,
+                    commit.parents(),
+                    commit_body,
+                    tree_oid,
+                    commit_oids,
+                )?;
                 let expected_commit = plan.expected_commits[snap_id];
                 if oid != expected_commit {
                     return Err(D6StoreError::OidMismatch {
@@ -578,19 +585,20 @@ impl GitBorderAdapter {
     fn write_verbatim_commit(
         &self,
         mirror_dir: &Path,
-        snap: &Snapshot,
+        parents: &[Digest],
+        commit_body: &[u8],
         tree_oid: GitOid,
         commit_oids: &HashMap<Digest, GitOid>,
     ) -> Result<GitOid, D6StoreError> {
-        let mut raw = Vec::with_capacity(64 + snap.parents.len() * 48 + snap.commit_body.len());
+        let mut raw = Vec::with_capacity(64 + parents.len() * 48 + commit_body.len());
         let _ = writeln!(raw, "tree {tree_oid}");
-        for p in &snap.parents {
+        for p in parents {
             let p_oid = commit_oids.get(p).ok_or_else(|| {
                 D6StoreError::InvalidInput(format!("missing exported parent {p}"))
             })?;
             let _ = writeln!(raw, "parent {p_oid}");
         }
-        raw.extend_from_slice(&snap.commit_body);
+        raw.extend_from_slice(commit_body);
 
         let out = run_with_stdin(
             self.git_bare(mirror_dir)
@@ -1123,7 +1131,8 @@ impl GitBorderAdapter {
 
 struct ExportPlan {
     topo: Vec<Digest>,
-    snapshots: HashMap<Digest, Snapshot>,
+    commits: HashMap<Digest, CommitObject>,
+    projected_bodies: HashMap<Digest, Vec<u8>>,
     expected_trees: HashMap<Digest, GitOid>,
     expected_commits: HashMap<Digest, GitOid>,
     tree_leaves: HashMap<Digest, BTreeMap<Vec<u8>, TreeEntry>>,
@@ -1134,7 +1143,7 @@ fn build_export_plan(
     ledger: Option<&dyn RefLedger>,
     targets: &[BorderRefTarget],
 ) -> Result<ExportPlan, D6StoreError> {
-    let mut visited = HashMap::<Digest, Snapshot>::new();
+    let mut visited = HashMap::<Digest, CommitObject>::new();
     let mut stack = targets
         .iter()
         .map(|t| t.snapshot.clone())
@@ -1144,13 +1153,13 @@ fn build_export_plan(
         if visited.contains_key(&id) {
             continue;
         }
-        let snap = store.cas().read_merkle_snapshot(&id)?;
-        for parent in &snap.parents {
+        let commit = store.cas().get_commit_object(&id)?;
+        for parent in commit.parents() {
             if !visited.contains_key(parent) {
                 stack.push_back(parent.clone());
             }
         }
-        visited.insert(id, snap);
+        visited.insert(id, commit);
     }
 
     let mut topo = Vec::with_capacity(visited.len());
@@ -1159,25 +1168,28 @@ fn build_export_plan(
         dfs_topo(&t.snapshot, &visited, &mut perm, &mut topo)?;
     }
 
+    let mut projected_bodies = HashMap::with_capacity(visited.len());
     let mut expected_trees = HashMap::new();
     let mut expected_commits = HashMap::new();
     let mut tree_leaves = HashMap::new();
     for id in &topo {
-        let snap = &visited[id];
-        if !tree_leaves.contains_key(&snap.tree) {
-            let leaves = store.flatten_tree(&snap.tree)?;
-            tree_leaves.insert(snap.tree.clone(), leaves);
+        let commit = &visited[id];
+        let tree_digest = commit.tree();
+        if !tree_leaves.contains_key(tree_digest) {
+            let leaves = store.flatten_tree(tree_digest)?;
+            tree_leaves.insert(tree_digest.clone(), leaves);
         }
-        let tree_oid = store.project_tree_oid(&snap.tree)?;
-        let mut p_oids = Vec::with_capacity(snap.parents.len());
-        for p in &snap.parents {
+        let tree_oid = store.project_tree_oid(tree_digest)?;
+        let mut p_oids = Vec::with_capacity(commit.parents().len());
+        for p in commit.parents() {
             p_oids.push(expected_commits[p]);
         }
-        let commit_oid = store.project_snapshot_oid(snap, &p_oids)?;
+        let git_body = project_commit_git_body(commit);
+        let commit_oid = store.project_commit_object_oid(commit, &p_oids)?;
 
         if let Some(ledger_ref) = ledger
             && let Some(row) = ledger_ref.get_snapshot(id)?
-            && (row.tree != snap.tree || row.git_oid != commit_oid)
+            && (row.tree != *tree_digest || row.git_oid != commit_oid)
         {
             return Err(D6StoreError::OidMismatch {
                 what: "ledger_snapshot",
@@ -1185,13 +1197,15 @@ fn build_export_plan(
                 actual: row.git_oid.to_hex(),
             });
         }
+        projected_bodies.insert(id.clone(), git_body);
         expected_trees.insert(id.clone(), tree_oid);
         expected_commits.insert(id.clone(), commit_oid);
     }
 
     Ok(ExportPlan {
         topo,
-        snapshots: visited,
+        commits: visited,
+        projected_bodies,
         expected_trees,
         expected_commits,
         tree_leaves,
@@ -1200,7 +1214,7 @@ fn build_export_plan(
 
 fn dfs_topo(
     id: &Digest,
-    snapshots: &HashMap<Digest, Snapshot>,
+    commits: &HashMap<Digest, CommitObject>,
     state: &mut HashMap<Digest, u8>,
     out: &mut Vec<Digest>,
 ) -> Result<(), D6StoreError> {
@@ -1214,11 +1228,11 @@ fn dfs_topo(
         _ => {}
     }
     state.insert(id.clone(), 1);
-    let snap = snapshots
+    let commit = commits
         .get(id)
         .ok_or_else(|| D6StoreError::InvalidInput(format!("missing snapshot {id}")))?;
-    for parent in &snap.parents {
-        dfs_topo(parent, snapshots, state, out)?;
+    for parent in commit.parents() {
+        dfs_topo(parent, commits, state, out)?;
     }
     state.insert(id.clone(), 2);
     out.push(id.clone());
@@ -1434,8 +1448,8 @@ fn write_fast_import_batch_stream(
     let mut next_mark = 1_usize;
 
     for snap_id in slice {
-        let snap = &plan.snapshots[snap_id];
-        let leaves = &plan.tree_leaves[&snap.tree];
+        let commit = &plan.commits[snap_id];
+        let leaves = &plan.tree_leaves[commit.tree()];
         for entry in leaves.values() {
             if entry.kind == TreeEntryKind::Gitlink {
                 continue;
@@ -1458,10 +1472,11 @@ fn write_fast_import_batch_stream(
     let mut batch_commit_marks: HashMap<Digest, usize> = HashMap::new();
     let mut commit_list = Vec::with_capacity(slice.len());
     for snap_id in slice {
-        let snap = &plan.snapshots[snap_id];
-        let parsed = parse_standard_commit_body(&snap.commit_body).ok_or_else(|| {
-            D6StoreError::InvalidInput("non-standard commit in fast-import batch".to_string())
-        })?;
+        let commit = &plan.commits[snap_id];
+        let parsed =
+            parse_standard_commit_body(&plan.projected_bodies[snap_id]).ok_or_else(|| {
+                D6StoreError::InvalidInput("non-standard commit in fast-import batch".to_string())
+            })?;
 
         *stage_counter += 1;
         let stage_ref = format!("{stage_prefix}/{}", *stage_counter);
@@ -1479,7 +1494,7 @@ fn write_fast_import_batch_stream(
         stdin.write_all(parsed.message)?;
         stdin.write_all(b"\n")?;
 
-        if let Some((first_parent, rest_parents)) = snap.parents.split_first() {
+        if let Some((first_parent, rest_parents)) = commit.parents().split_first() {
             write_parent_ref(
                 stdin,
                 "from",
@@ -1498,14 +1513,14 @@ fn write_fast_import_batch_stream(
             }
         }
 
-        let same_tree_as_first_parent = snap
-            .parents
+        let same_tree_as_first_parent = commit
+            .parents()
             .first()
-            .and_then(|p| plan.snapshots.get(p))
-            .is_some_and(|p_snap| p_snap.tree == snap.tree);
+            .and_then(|p| plan.commits.get(p))
+            .is_some_and(|p_commit| p_commit.tree() == commit.tree());
 
         if !same_tree_as_first_parent {
-            let leaves = &plan.tree_leaves[&snap.tree];
+            let leaves = &plan.tree_leaves[commit.tree()];
             write_tree_leaves(stdin, leaves, &batch_blob_marks)?;
         }
         stdin.write_all(b"\n")?;

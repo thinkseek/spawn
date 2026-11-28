@@ -33,8 +33,11 @@ type FilteredScanWithBytes = (Vec<ScannedWithMeta>, Vec<(TreePath, u64)>, u64);
 type FlattenCacheEntry = (Digest, FlatTreeMap);
 type StatCacheKey = (String, PathBuf);
 
+#[cfg(test)]
+use spawn_cas::Snapshot;
 use spawn_cas::{
-    Algo, Digest, GitOid, JournalEntry, Snapshot, TreeEntry, TreeEntryKind, TreeMutation,
+    Algo, CommitActor, CommitIntent, CommitObject, CommitOrigin, CommitV2, Digest, GitOid,
+    JournalEntry, TreeEntry, TreeEntryKind, TreeMutation, WorkBoundary, WorkChange,
     empty_tree_digest, is_valid_entry_name, sha256_of, sha256_reader,
 };
 use spawn_core::event::Fork;
@@ -45,17 +48,19 @@ use spawn_core::port::{
 };
 
 use crate::agent_files::{AgentFileError, read_regular, rename_within, replace_with};
+#[cfg(test)]
+use crate::cas_merkle::format_commit_body;
 use crate::cas_merkle::{
     BUILD_OUTPUT as D6_BUILD_OUTPUT, CasMerkleStore, D6RefKind, D6StoreError, LedgerRef,
-    LedgerSnapshot, PublishRequest, PublishedSnapshot, RefLedger, RefsJournalLock, ScannedEntry,
-    ScannedKind, TrackedSetPolicy, format_commit_body,
+    LedgerSnapshot, PublishCommitV2Request, PublishRequest, PublishedSnapshot, RefLedger,
+    RefsJournalLock, ScannedEntry, ScannedKind, TrackedSetPolicy,
 };
 use crate::cow::clone_or_copy;
 use crate::d6_layer0::{
     ExistingDestPolicy, Layer0MaterializeReport, Layer0Options, materialize_layer0,
 };
 use crate::merkle_merge::{
-    ConflictKind, GitAttributes, MergeBaseError, MergeSnapshotSpec, build_merge_snapshot,
+    ConflictKind, GitAttributes, MergeBaseError, MergeCommitV2Spec, build_merge_commit_v2,
     find_single_merge_base, merge_snapshots,
 };
 use crate::root::{canonical_root, legacy_workspace};
@@ -459,6 +464,8 @@ impl<L: RefLedger> std::fmt::Debug for D6Workspace<L> {
             .debug_struct("D6Workspace")
             .field("project", &self.project)
             .field("root", &self.root)
+            .field("author_name", &self.author_name)
+            .field("author_email", &self.author_email)
             .field("l1_enabled", &self.l1_policy.is_some())
             .finish_non_exhaustive()
     }
@@ -472,6 +479,29 @@ struct BranchRefUpdate<'a> {
     git_oid: GitOid,
     at_ms: i64,
     reason: &'a str,
+}
+
+enum PublishEnvelope<'a> {
+    DefaultV2 {
+        actor: CommitActor,
+        message: String,
+    },
+    ExplicitV2 {
+        actor: &'a CommitActor,
+        intent: &'a CommitIntent,
+    },
+    CompatBody(&'a [u8]),
+}
+
+struct BranchEnvelopeSpec<'a> {
+    branch: &'a str,
+    expected_ref: Option<&'a Digest>,
+    tree: &'a Digest,
+    parents: &'a [Digest],
+    envelope: &'a PublishEnvelope<'a>,
+    created_at_ms: i64,
+    reason: &'a str,
+    is_merge: bool,
 }
 
 fn resolve_ledger_worker_pin(
@@ -857,17 +887,16 @@ impl<L: RefLedger> D6Workspace<L> {
     /// with two parents), returning `(commit_git_oid_hex, changed_files)`.
     pub fn head_clean_merge(&self, branch: &str) -> Option<(String, Vec<String>)> {
         let snap = self.branch_snapshot(branch).ok().flatten()?;
-        let full = self.store.cas().read_merkle_snapshot(&snap.id).ok()?;
-        if full.parents.len() != 2 {
+        let obj = self.store.cas().get_commit_object(&snap.id).ok()?;
+        let parents = obj.parents();
+        if parents.len() != 2 {
             return None;
         }
-        let body = std::str::from_utf8(&full.commit_body).ok()?;
-        let msg = body.split_once("\n\n").map(|(_, msg)| msg)?;
-        let subject = msg.lines().next()?;
+        let subject = obj.message_subject()?;
         if !subject.starts_with("spawn: merge main ") {
             return None;
         }
-        let parent_tree = self.snapshot_tree(&full.parents[0]).ok()?;
+        let parent_tree = self.snapshot_tree(&parents[0]).ok()?;
         let files = self.diff_tree_paths(&parent_tree, &snap.tree).ok()?;
         Some((snap.git_oid.to_hex(), files))
     }
@@ -942,18 +971,18 @@ impl<L: RefLedger> D6Workspace<L> {
         task_id: Option<i64>,
         reason: &str,
     ) -> Result<u64, WorkspaceError> {
-        let snap = self
+        let commit = self
             .store
             .cas()
-            .read_merkle_snapshot(new_snapshot)
+            .get_commit_object(new_snapshot)
             .map_err(map_cas_err)?;
         let parent_oids = self
             .store
-            .resolve_parent_oids(self.ledger.as_ref(), &snap.parents)
+            .resolve_parent_oids(self.ledger.as_ref(), commit.parents())
             .map_err(map_store_err)?;
         let git_oid = self
             .store
-            .project_snapshot_oid(&snap, &parent_oids)
+            .project_commit_object_oid(&commit, &parent_oids)
             .map_err(map_store_err)?;
         self.store.cas().sync_store().map_err(map_cas_err)?;
         let mut canonical = new_snapshot.clone();
@@ -964,19 +993,17 @@ impl<L: RefLedger> D6Workspace<L> {
         {
             existing.created_at_ms
         } else {
-            let parsed_ms = parse_committer_ms(&snap.commit_body);
-            let ts = if parsed_ms > 0 {
-                parsed_ms
-            } else {
-                self.now_ms()
-            };
+            let ts = commit
+                .created_at_ms()
+                .filter(|&ms| ms > 0)
+                .unwrap_or_else(|| self.now_ms());
             canonical = self
                 .ledger
                 .record_snapshot(
                     new_snapshot,
                     &git_oid,
-                    &snap.tree,
-                    &snap.parents,
+                    commit.tree(),
+                    commit.parents(),
                     &self.project,
                     ts,
                 )
@@ -1036,7 +1063,29 @@ impl<L: RefLedger> D6Workspace<L> {
             &branch,
             &directory,
             &|| Ok(()),
-            commit_body,
+            &PublishEnvelope::CompatBody(commit_body),
+            created_at_ms,
+            reason,
+        )
+    }
+
+    /// Commit `workspace` natively as a [`CommitV2`] object with typed `actor` and `intent`.
+    pub fn commit_v2(
+        &self,
+        workspace: &WorkspaceId,
+        actor: &CommitActor,
+        intent: &CommitIntent,
+        reason: &str,
+    ) -> Result<Commit, WorkspaceError> {
+        let branch = workspace.sandbox().to_string();
+        let directory = self.checked_path(workspace)?;
+        let _lock = self.lock_branch(&branch)?;
+        let created_at_ms = self.commit_now_ms();
+        self.commit_locked_inner(
+            &branch,
+            &directory,
+            &|| Ok(()),
+            &PublishEnvelope::ExplicitV2 { actor, intent },
             created_at_ms,
             reason,
         )
@@ -1054,12 +1103,15 @@ impl<L: RefLedger> D6Workspace<L> {
         let directory = self.checked_path(workspace)?;
         let _lock = self.lock_branch(&branch)?;
         let created_at_ms = self.commit_now_ms();
-        let commit_body = self.format_body_ms(created_at_ms, message);
+        let envelope = PublishEnvelope::DefaultV2 {
+            actor: self.workspace_agent_actor(),
+            message: sanitize_commit_v2_message(message, "spawn: checkpoint"),
+        };
         self.commit_locked_inner(
             &branch,
             &directory,
             take_back,
-            &commit_body,
+            &envelope,
             created_at_ms,
             "d6:checkpoint",
         )
@@ -1220,21 +1272,34 @@ impl<L: RefLedger> D6Workspace<L> {
         }
 
         let at_ms = self.commit_now_ms();
-        let commit_body =
-            self.format_body_ms(at_ms, &format!("spawn: pin worker head for {branch}"));
+        let actor = self.workspace_agent_actor();
+        let intent = CommitIntent {
+            origin: CommitOrigin::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Submit,
+            },
+            task_id: None,
+            transcript_ref: None,
+            message: sanitize_commit_v2_message(
+                &format!("spawn: pin worker head for {branch}"),
+                "spawn: pin worker head",
+            ),
+        };
         let published = self
             .store
-            .publish_snapshot(
+            .publish_commit_v2(
                 self.ledger.as_ref(),
-                &PublishRequest {
+                &PublishCommitV2Request {
                     project: &self.project,
                     ref_name: worker_ref,
                     kind: D6RefKind::Branch,
                     expected_ref: existing_worker_snap.map(|s| &s.id),
                     tree: &next_tree,
                     parents: &parents,
-                    commit_body: &commit_body,
                     created_at_ms: at_ms,
+                    actor: &actor,
+                    intent: &intent,
+                    git_compat_body: None,
                     reason: "d6:pin_worker_head",
                     landing_task_id: None,
                 },
@@ -1952,32 +2017,15 @@ impl<L: RefLedger + Send + Sync> WorkspaceStore for D6Workspace<L> {
 
         let files = self.diff_tree_paths(&head.tree, &report.tree)?;
         let now_ms = self.commit_now_ms();
-        let ident = self.git_ident_line_ms(now_ms);
-        let msg = format!("spawn: merge main {} into {branch}", main_snap.git_oid);
-        let built = build_merge_snapshot(
-            &self.store,
-            &MergeSnapshotSpec {
-                main_snapshot: &head.id,
-                branch_snapshot: &main_snap.id,
-                merged_tree: &report.tree,
-                main_git_oid: Some(head.git_oid),
-                branch_git_oid: Some(main_snap.git_oid),
-                author_line: &ident,
-                committer_line: &ident,
-                message: &msg,
-                spawn_task: None,
-                spawn_objective: None,
-                extra_trailers: &[],
-            },
-        )
-        .map_err(map_store_err)?;
+        let built =
+            self.build_clean_merge_v2(branch.as_str(), &head, &main_snap, &report.tree, now_ms)?;
 
         self.commit_snapshot_cas(
             branch.as_str(),
             &head.id,
             &built.snapshot_id,
-            &built.snapshot.tree,
-            &built.snapshot.parents,
+            &built.commit.tree,
+            &built.commit.parents,
             &built.git_oid,
             now_ms,
             "d6:merge_main_clean",
@@ -2046,14 +2094,125 @@ impl<L: RefLedger> D6Workspace<L> {
         self.now_ms().div_euclid(1000).saturating_mul(1000)
     }
 
-    fn git_ident_line_ms(&self, at_ms: i64) -> String {
-        let secs = at_ms.div_euclid(1000);
-        format!("{} <{}> {secs} +0000", self.author_name, self.author_email)
+    fn workspace_agent_actor(&self) -> CommitActor {
+        CommitActor::Agent {
+            id: sanitize_actor_token(&self.author_name, "spawn"),
+            execution_id: None,
+            model_label: None,
+            preset_id: None,
+        }
     }
 
-    fn format_body_ms(&self, at_ms: i64, message: &str) -> Vec<u8> {
-        let ident = self.git_ident_line_ms(at_ms);
-        format_commit_body(&ident, &ident, message)
+    fn publish_branch_envelope(
+        &self,
+        spec: &BranchEnvelopeSpec<'_>,
+    ) -> Result<PublishedSnapshot, WorkspaceError> {
+        match spec.envelope {
+            PublishEnvelope::DefaultV2 { actor, message } => {
+                let intent = CommitIntent {
+                    origin: CommitOrigin::Work {
+                        change: if spec.is_merge {
+                            WorkChange::Derive
+                        } else {
+                            WorkChange::Edit
+                        },
+                        boundary: WorkBoundary::Checkpoint,
+                    },
+                    task_id: None,
+                    transcript_ref: None,
+                    message: message.clone(),
+                };
+                self.store
+                    .publish_commit_v2(
+                        self.ledger.as_ref(),
+                        &PublishCommitV2Request {
+                            project: &self.project,
+                            ref_name: spec.branch,
+                            kind: D6RefKind::Branch,
+                            expected_ref: spec.expected_ref,
+                            tree: spec.tree,
+                            parents: spec.parents,
+                            created_at_ms: spec.created_at_ms,
+                            actor,
+                            intent: &intent,
+                            git_compat_body: None,
+                            reason: spec.reason,
+                            landing_task_id: None,
+                        },
+                    )
+                    .map_err(map_store_err)
+            }
+            PublishEnvelope::ExplicitV2 { actor, intent } => self
+                .store
+                .publish_commit_v2(
+                    self.ledger.as_ref(),
+                    &PublishCommitV2Request {
+                        project: &self.project,
+                        ref_name: spec.branch,
+                        kind: D6RefKind::Branch,
+                        expected_ref: spec.expected_ref,
+                        tree: spec.tree,
+                        parents: spec.parents,
+                        created_at_ms: spec.created_at_ms,
+                        actor,
+                        intent,
+                        git_compat_body: None,
+                        reason: spec.reason,
+                        landing_task_id: None,
+                    },
+                )
+                .map_err(map_store_err),
+            PublishEnvelope::CompatBody(commit_body) => self
+                .store
+                .publish_snapshot(
+                    self.ledger.as_ref(),
+                    &PublishRequest {
+                        project: &self.project,
+                        ref_name: spec.branch,
+                        kind: D6RefKind::Branch,
+                        expected_ref: spec.expected_ref,
+                        tree: spec.tree,
+                        parents: spec.parents,
+                        commit_body,
+                        created_at_ms: spec.created_at_ms,
+                        reason: spec.reason,
+                        landing_task_id: None,
+                    },
+                )
+                .map_err(map_store_err),
+        }
+    }
+
+    fn build_clean_merge_v2(
+        &self,
+        branch: &str,
+        head: &LedgerSnapshot,
+        main_snap: &LedgerSnapshot,
+        merged_tree: &Digest,
+        now_ms: i64,
+    ) -> Result<crate::merkle_merge::BuiltMergeCommitV2, WorkspaceError> {
+        let actor = system_actor();
+        let message = format!("spawn: merge main {} into {branch}", main_snap.git_oid);
+        build_merge_commit_v2(
+            &self.store,
+            &MergeCommitV2Spec {
+                main_snapshot: &head.id,
+                branch_snapshot: &main_snap.id,
+                merged_tree,
+                main_git_oid: Some(head.git_oid),
+                branch_git_oid: Some(main_snap.git_oid),
+                created_at_ms: now_ms,
+                actor: &actor,
+                origin: CommitOrigin::Work {
+                    change: WorkChange::Derive,
+                    boundary: WorkBoundary::Checkpoint,
+                },
+                task_id: None,
+                transcript_ref: None,
+                message: &message,
+            },
+        )
+        .map_err(map_store_err)
     }
 
     fn d6_meta_dir(&self) -> PathBuf {
@@ -2153,20 +2312,28 @@ impl<L: RefLedger> D6Workspace<L> {
         }
         let empty_tree = self.store.cas().put_empty_tree().map_err(map_cas_err)?;
         let at_ms = self.commit_now_ms();
-        let body = self.format_body_ms(at_ms, "spawn: base");
+        let actor = system_actor();
+        let intent = CommitIntent {
+            origin: CommitOrigin::Import,
+            task_id: None,
+            transcript_ref: None,
+            message: "spawn: base".to_string(),
+        };
         let published = self
             .store
-            .publish_snapshot(
+            .publish_commit_v2(
                 self.ledger.as_ref(),
-                &PublishRequest {
+                &PublishCommitV2Request {
                     project: &self.project,
                     ref_name: BASE_BRANCH,
                     kind: D6RefKind::Main,
                     expected_ref: None,
                     tree: &empty_tree,
                     parents: &[],
-                    commit_body: &body,
                     created_at_ms: at_ms,
+                    actor: &actor,
+                    intent: &intent,
+                    git_compat_body: None,
                     reason: "d6:seed_base",
                     landing_task_id: None,
                 },
@@ -2219,21 +2386,21 @@ impl<L: RefLedger> D6Workspace<L> {
         if let Some(row) = self.ledger.get_snapshot(snap_id).map_err(map_store_err)? {
             return Ok(row.tree);
         }
-        let snap = self
+        let commit = self
             .store
             .cas()
-            .read_merkle_snapshot(snap_id)
+            .get_commit_object(snap_id)
             .map_err(map_cas_err)?;
-        Ok(snap.tree)
+        Ok(commit.tree().clone())
     }
 
     fn refuse_files_outside_d6(&self, snap_id: &Digest) -> Result<(), WorkspaceError> {
-        let snap = self
+        let commit = self
             .store
             .cas()
-            .read_merkle_snapshot(snap_id)
+            .get_commit_object(snap_id)
             .map_err(map_cas_err)?;
-        let msg = extract_commit_message(&snap.commit_body);
+        let msg = commit_object_message_lossy(&commit);
         if names_files_outside_git(&msg) {
             return Err(WorkspaceError::Refused {
                 code: "FilesOutsideGit".to_string(),
@@ -2397,7 +2564,7 @@ impl<L: RefLedger> D6Workspace<L> {
         branch: &str,
         directory: &Path,
         take_back: &dyn Fn() -> Result<(), WorkspaceError>,
-        commit_body: &[u8],
+        envelope: &PublishEnvelope<'_>,
         created_at_ms: i64,
         reason: &str,
     ) -> Result<Commit, WorkspaceError> {
@@ -2411,7 +2578,7 @@ impl<L: RefLedger> D6Workspace<L> {
             (head_opt, main_opt) = self.branch_and_main_snapshots(branch)?;
         }
         let Some(head) = head_opt else {
-            return self.recreate(branch, directory, commit_body, created_at_ms, reason);
+            return self.recreate(branch, directory, envelope, created_at_ms, reason);
         };
 
         let (next_tree, oversized, resolved_merge_main, measured_bytes) = self
@@ -2435,27 +2602,20 @@ impl<L: RefLedger> D6Workspace<L> {
         }
 
         let mut parents = vec![head.id.clone()];
+        let is_merge = merged_second.is_some();
         if let Some(m) = merged_second {
             parents.push(m);
         }
-        let published = self
-            .store
-            .publish_snapshot(
-                self.ledger.as_ref(),
-                &PublishRequest {
-                    project: &self.project,
-                    ref_name: branch,
-                    kind: D6RefKind::Branch,
-                    expected_ref: Some(&head.id),
-                    tree: &next_tree,
-                    parents: &parents,
-                    commit_body,
-                    created_at_ms,
-                    reason,
-                    landing_task_id: None,
-                },
-            )
-            .map_err(map_store_err)?;
+        let published = self.publish_branch_envelope(&BranchEnvelopeSpec {
+            branch,
+            expected_ref: Some(&head.id),
+            tree: &next_tree,
+            parents: &parents,
+            envelope,
+            created_at_ms,
+            reason,
+            is_merge,
+        })?;
 
         if resolved_merge_main.is_some() {
             self.clear_pending(branch);
@@ -2469,7 +2629,7 @@ impl<L: RefLedger> D6Workspace<L> {
         &self,
         branch: &str,
         directory: &Path,
-        commit_body: &[u8],
+        envelope: &PublishEnvelope<'_>,
         created_at_ms: i64,
         reason: &str,
     ) -> Result<Commit, WorkspaceError> {
@@ -2507,24 +2667,16 @@ impl<L: RefLedger> D6Workspace<L> {
         if let Some(m) = &main_snap {
             parents.push(m.id.clone());
         }
-        let published = self
-            .store
-            .publish_snapshot(
-                self.ledger.as_ref(),
-                &PublishRequest {
-                    project: &self.project,
-                    ref_name: branch,
-                    kind: D6RefKind::Branch,
-                    expected_ref: None,
-                    tree: &next_tree,
-                    parents: &parents,
-                    commit_body,
-                    created_at_ms,
-                    reason,
-                    landing_task_id: None,
-                },
-            )
-            .map_err(map_store_err)?;
+        let published = self.publish_branch_envelope(&BranchEnvelopeSpec {
+            branch,
+            expected_ref: None,
+            tree: &next_tree,
+            parents: &parents,
+            envelope,
+            created_at_ms,
+            reason,
+            is_merge: false,
+        })?;
         self.clear_pending(branch);
         let commit = CommitId::new(published.git_oid.to_hex())
             .map_err(|err| WorkspaceError::Unavailable(err.to_string()))?;
@@ -2957,32 +3109,14 @@ impl<L: RefLedger> D6Workspace<L> {
         let changed_files = apply_two_tree_update(&self.store, directory, &head.tree, merged_tree)?;
 
         let now_ms = self.commit_now_ms();
-        let ident = self.git_ident_line_ms(now_ms);
-        let msg = format!("spawn: merge main {} into {branch}", main_snap.git_oid);
-        let built = build_merge_snapshot(
-            &self.store,
-            &MergeSnapshotSpec {
-                main_snapshot: &head.id,
-                branch_snapshot: &main_snap.id,
-                merged_tree,
-                main_git_oid: Some(head.git_oid),
-                branch_git_oid: Some(main_snap.git_oid),
-                author_line: &ident,
-                committer_line: &ident,
-                message: &msg,
-                spawn_task: None,
-                spawn_objective: None,
-                extra_trailers: &[],
-            },
-        )
-        .map_err(map_store_err)?;
+        let built = self.build_clean_merge_v2(branch, head, main_snap, merged_tree, now_ms)?;
 
         if let Err(err) = self.commit_snapshot_cas(
             branch,
             &head.id,
             &built.snapshot_id,
-            &built.snapshot.tree,
-            &built.snapshot.parents,
+            &built.commit.tree,
+            &built.commit.parents,
             &built.git_oid,
             now_ms,
             "d6:merge_base",
@@ -3045,28 +3179,38 @@ impl<L: RefLedger> D6Workspace<L> {
         };
 
         let now_ms = self.commit_now_ms();
-        let body = self.format_body_ms(now_ms, message);
-        let snapshot = Snapshot {
+        let commit = CommitV2 {
             tree: start_snap.tree.clone(),
             parents: vec![head.id.clone()],
-            commit_body: body,
+            at_ms: now_ms,
+            actor: system_actor(),
+            intent: CommitIntent {
+                origin: CommitOrigin::Work {
+                    change: WorkChange::Revert,
+                    boundary: WorkBoundary::Checkpoint,
+                },
+                task_id: None,
+                transcript_ref: None,
+                message: sanitize_commit_v2_message(message, "spawn: set aside"),
+            },
+            git_compat_body: None,
         };
         let snap_id = self
             .store
             .cas()
-            .put_merkle_snapshot(&snapshot)
+            .put_commit_v2(&commit)
             .map_err(map_cas_err)?;
         let commit_oid = self
             .store
-            .project_snapshot_oid(&snapshot, &[head.git_oid])
+            .project_commit_object_oid(&CommitObject::V2(commit.clone()), &[head.git_oid])
             .map_err(map_store_err)?;
 
         if let Err(err) = self.commit_snapshot_cas(
             branch,
             &head.id,
             &snap_id,
-            &snapshot.tree,
-            &snapshot.parents,
+            &commit.tree,
+            &commit.parents,
             &commit_oid,
             now_ms,
             "d6:set_aside",
@@ -3117,25 +3261,23 @@ impl<L: RefLedger> D6Workspace<L> {
 
         if work_tree != head.tree {
             let now_ms = self.commit_now_ms();
-            let kept_body = self.format_body_ms(now_ms, &set_aside_kept_message(branch));
-            let published = self
-                .store
-                .publish_snapshot(
-                    self.ledger.as_ref(),
-                    &PublishRequest {
-                        project: &self.project,
-                        ref_name: branch,
-                        kind: D6RefKind::Branch,
-                        expected_ref: Some(&head.id),
-                        tree: &work_tree,
-                        parents: std::slice::from_ref(&head.id),
-                        commit_body: &kept_body,
-                        created_at_ms: now_ms,
-                        reason: "d6:set_aside_kept",
-                        landing_task_id: None,
-                    },
-                )
-                .map_err(map_store_err)?;
+            let envelope = PublishEnvelope::DefaultV2 {
+                actor: self.workspace_agent_actor(),
+                message: sanitize_commit_v2_message(
+                    &set_aside_kept_message(branch),
+                    "spawn: set aside kept",
+                ),
+            };
+            let published = self.publish_branch_envelope(&BranchEnvelopeSpec {
+                branch,
+                expected_ref: Some(&head.id),
+                tree: &work_tree,
+                parents: std::slice::from_ref(&head.id),
+                envelope: &envelope,
+                created_at_ms: now_ms,
+                reason: "d6:set_aside_kept",
+                is_merge: false,
+            })?;
             head = self
                 .ledger
                 .get_snapshot(&published.snapshot)
@@ -3221,13 +3363,14 @@ impl<L: RefLedger> D6Workspace<L> {
         if kept_snap.tree == *start_tree {
             return Ok(None);
         }
-        let raw_snap = self
+        let raw_commit = self
             .store
             .cas()
-            .read_merkle_snapshot(&head.id)
+            .get_commit_object(&head.id)
             .map_err(map_cas_err)?;
-        let actual_msg = extract_commit_message(&raw_snap.commit_body);
-        if actual_msg.trim() != message.trim() {
+        let actual_msg = commit_object_message_lossy(&raw_commit);
+        let expected_msg = sanitize_commit_v2_message(message, "spawn: set aside");
+        if actual_msg.trim() != expected_msg.trim() {
             return Ok(None);
         }
         let files = self.diff_tree_paths(&kept_snap.tree, start_tree)?;
@@ -3361,9 +3504,10 @@ impl<L: RefLedger> D6Workspace<L> {
             } else {
                 self.store
                     .cas()
-                    .read_merkle_snapshot(&id)
+                    .get_commit_object(&id)
                     .map_err(map_cas_err)?
-                    .parents
+                    .parents()
+                    .to_vec()
             };
             for p in parents {
                 if &p == ancestor {
@@ -3465,23 +3609,34 @@ impl<L: RefLedger> D6Workspace<L> {
             parents.push(prev_snap.id.clone());
         }
         let now_ms = self.commit_now_ms();
-        let body = self.format_body_ms(
-            now_ms,
-            &format!("spawn: stale workspace of {branch}, kept off the branch"),
-        );
+        let actor = self.workspace_agent_actor();
+        let intent = CommitIntent {
+            origin: CommitOrigin::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Checkpoint,
+            },
+            task_id: None,
+            transcript_ref: None,
+            message: sanitize_commit_v2_message(
+                &format!("spawn: stale workspace of {branch}, kept off the branch"),
+                "spawn: keep stale workspace",
+            ),
+        };
         let published = self
             .store
-            .publish_snapshot(
+            .publish_commit_v2(
                 self.ledger.as_ref(),
-                &PublishRequest {
+                &PublishCommitV2Request {
                     project: &self.project,
                     ref_name: &stale_ref_name,
                     kind: D6RefKind::Wip,
                     expected_ref: prev.as_ref().map(|p| &p.id),
                     tree: &stale_tree,
                     parents: &parents,
-                    commit_body: &body,
                     created_at_ms: now_ms,
+                    actor: &actor,
+                    intent: &intent,
+                    git_compat_body: None,
                     reason: "d6:keep_stale",
                     landing_task_id: None,
                 },
@@ -4409,32 +4564,66 @@ fn map_cas_err(err: spawn_cas::CasError) -> WorkspaceError {
     WorkspaceError::Unavailable(err.to_string())
 }
 
+fn sanitize_actor_token(raw: &str, fallback: &str) -> String {
+    let mut cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|ch| if ch.is_control() { '-' } else { ch })
+        .collect();
+    cleaned = cleaned.trim().to_string();
+    if cleaned.len() > 256 {
+        let mut end = 256;
+        while !cleaned.is_char_boundary(end) {
+            end -= 1;
+        }
+        cleaned.truncate(end);
+        cleaned = cleaned.trim().to_string();
+    }
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn sanitize_commit_v2_message(raw: &str, fallback: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let cleaned: String = normalized
+        .chars()
+        .map(|ch| {
+            if ch.is_control() && ch != '\n' && ch != '\t' {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    if cleaned.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn system_actor() -> CommitActor {
+    CommitActor::System {
+        id: "d6-workspace".to_string(),
+    }
+}
+
+fn commit_object_message_lossy(obj: &CommitObject) -> String {
+    obj.message_text()
+        .map(str::to_string)
+        .or_else(|| obj.git_compat_body().map(extract_commit_message))
+        .unwrap_or_default()
+}
+
 fn extract_commit_message(commit_body: &[u8]) -> String {
     if let Some(pos) = commit_body.windows(2).position(|w| w == b"\n\n") {
         String::from_utf8_lossy(&commit_body[pos + 2..]).into_owned()
     } else {
         String::new()
     }
-}
-
-fn parse_committer_ms(commit_body: &[u8]) -> i64 {
-    for raw_line in commit_body.split(|&b| b == b'\n') {
-        if raw_line.is_empty() {
-            break;
-        }
-        if let Some(rest) = raw_line.strip_prefix(b"committer ")
-            && let Ok(text) = std::str::from_utf8(rest)
-        {
-            let mut parts = text.split_whitespace().rev();
-            let _tz = parts.next();
-            if let Some(secs_str) = parts.next()
-                && let Ok(secs) = secs_str.parse::<i64>()
-            {
-                return secs.saturating_mul(1000);
-            }
-        }
-    }
-    0
 }
 
 fn split_rel_segments(rel_path: &[u8]) -> Vec<Vec<u8>> {

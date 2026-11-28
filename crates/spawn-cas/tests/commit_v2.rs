@@ -886,3 +886,113 @@ fn fail_closed_decode_rejects_payload_lengths_limits_and_trailers() {
         Err(CasError::TooLarge { kind: "commit", .. })
     ));
 }
+
+#[test]
+fn commit_object_unified_accessors_cover_v1_and_v2() {
+    let v1 = CommitObject::V1(Snapshot {
+        tree: digest_n(0x41),
+        parents: vec![digest_n(0x42)],
+        commit_body: b"author A <a@b> 1700000100 +0000\ncommitter A <a@b> 1700000200 +0000\n\nsubject line\n\nbody line".to_vec(),
+    });
+    assert_eq!(v1.tree(), &digest_n(0x41));
+    assert_eq!(v1.parents(), &[digest_n(0x42)]);
+    assert_eq!(v1.created_at_ms(), Some(1_700_000_200_000));
+    assert_eq!(v1.message_text(), Some("subject line\n\nbody line"));
+    assert_eq!(v1.message_subject(), Some("subject line"));
+    assert!(v1.git_compat_body().is_some());
+
+    let mut c2 = sample_commit();
+    c2.intent.message = "v2 subject\n\nsecond line".to_string();
+    let v2 = CommitObject::V2(c2.clone());
+    assert_eq!(v2.tree(), &c2.tree);
+    assert_eq!(v2.parents(), c2.parents.as_slice());
+    assert_eq!(v2.created_at_ms(), Some(1_795_700_000_000));
+    assert_eq!(v2.message_text(), Some("v2 subject\n\nsecond line"));
+    assert_eq!(v2.message_subject(), Some("v2 subject"));
+    assert_eq!(v2.git_compat_body(), None);
+}
+
+#[test]
+fn store_gc_persistent_retains_pure_v2_chunked_dag_and_multi_roots() {
+    let scratch = Scratch::new("store-gc-v2-dag");
+    let clock = ManualClock::new();
+    let store = clock.store(&scratch.join("cas"));
+
+    // Large >4 MiB payload produces FastCDC chunk index + chunk blobs referenced only by a V2 root.
+    let big_payload = vec![0x5Au8; CHUNK_MAX + 32_768];
+    let (v2_base_tree, big_blob) = store_single_file_tree(&store, "big.bin", &big_payload);
+    assert!(store.chunk_index_path(&big_blob).is_file());
+    let idx_chunks: Vec<Digest> = store
+        .read_chunk_index(&big_blob)
+        .expect("chunk index")
+        .chunks
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert!(idx_chunks.len() >= 2);
+
+    let mut v2_root = sample_commit();
+    v2_root.tree = v2_base_tree.clone();
+    v2_root.parents = Vec::new();
+    let v2_root_id = store.put_commit_v2(&v2_root).expect("put v2 root");
+
+    let (v2_child_tree, child_blob) = store_single_file_tree(&store, "child.txt", b"child");
+    let mut v2_child = sample_commit();
+    v2_child.tree = v2_child_tree.clone();
+    v2_child.parents = vec![v2_root_id.clone()];
+    v2_child.intent.origin = CommitOrigin::Land;
+    let v2_child_id = store.put_commit_v2(&v2_child).expect("put v2 child");
+
+    let (orphan_tree, orphan_blob) = store_single_file_tree(&store, "orphan.txt", b"orphan");
+    let mut v2_orphan = sample_commit();
+    v2_orphan.tree = orphan_tree.clone();
+    v2_orphan.parents = Vec::new();
+    v2_orphan.intent.message = "unreferenced v2".to_string();
+    let v2_orphan_id = store.put_commit_v2(&v2_orphan).expect("put orphan");
+
+    let binding = GcFenceBinding {
+        db_system_id: "7441000000000000101".to_string(),
+        db_oid: 20_481,
+        schema_name: "public".to_string(),
+    };
+    bind_gc_fence(&store, &binding).expect("bind fence");
+
+    let _ = store
+        .gc_persistent(
+            std::slice::from_ref(&v2_child_id),
+            &binding,
+            0,
+            DEFAULT_PERSISTENT_GC_GRACE,
+        )
+        .expect("gc pass 1");
+    clock.advance(Duration::from_hours(25));
+    let report = store
+        .gc_persistent(
+            std::slice::from_ref(&v2_child_id),
+            &binding,
+            0,
+            DEFAULT_PERSISTENT_GC_GRACE,
+        )
+        .expect("gc pass 2");
+
+    assert!(report.deleted_objects.contains(&v2_orphan_id));
+    assert!(report.deleted_objects.contains(&orphan_tree));
+    assert!(report.deleted_objects.contains(&orphan_blob));
+    assert!(!report.deleted_objects.contains(&v2_root_id));
+    assert!(store.has(&v2_child_id));
+    assert!(store.has(&v2_root_id));
+    assert!(store.has(&v2_base_tree));
+    assert!(store.has_blob(&big_blob));
+    assert!(store.has(&v2_child_tree));
+    assert!(store.has(&child_blob));
+    assert!(store.chunk_index_path(&big_blob).is_file());
+    for chunk_id in idx_chunks {
+        assert!(store.has(&chunk_id));
+    }
+    let mut restored = Vec::with_capacity(big_payload.len());
+    assert_eq!(
+        store.stream_blob(&big_blob, &mut restored).expect("stream"),
+        u64::try_from(big_payload.len()).expect("len")
+    );
+    assert_eq!(restored, big_payload);
+}

@@ -16,7 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use spawn_cas::{Digest, GitOid, Snapshot, Tree, TreeEntry, empty_tree_digest};
+use spawn_cas::{
+    CommitActor, CommitIntent, CommitObject, CommitOrigin, CommitV2, Digest, GitOid, Snapshot,
+    Tree, TreeEntry, WorkBoundary, WorkChange, empty_tree_digest,
+};
+use spawn_host::merkle_merge::{MergeCommitV2Spec, build_merge_commit_v2};
 use spawn_host::{
     BorderRefTarget, CasMerkleStore, ConflictKind, ConflictLabels, D6RefKind, GitBorderAdapter,
     InMemoryRefLedger, MergeBaseError, MergeDriver, MergeOptions, MergeShadowOutcome,
@@ -1637,4 +1641,215 @@ fn real_thinkseek_spawn_history_merge_oracle_has_zero_blockers() {
     if e2e_rep.is_clean() {
         assert_eq!(e2e_rep.tree_git_oid, sample_git.tree_oid);
     }
+}
+
+fn put_single_file_tree(cas: &CasMerkleStore, base: &Digest, path: &str, content: &[u8]) -> Digest {
+    let (blob_id, size) = cas.put_bytes_blob(content).expect("blob");
+    cas.apply_mutations(
+        base,
+        &[spawn_cas::TreeMutation::Upsert {
+            path: vec![path.as_bytes().to_vec()],
+            kind: spawn_cas::TreeEntryKind::File,
+            id: blob_id.as_bytes(),
+            size,
+        }],
+    )
+    .expect("tree")
+}
+
+fn verify_mixed_v1_v2_merge(
+    cas: &CasMerkleStore,
+    base_tree: &Digest,
+    left_tree: &Digest,
+    right_tree: &Digest,
+    land_actor: &CommitActor,
+) {
+    let v1_base = cas
+        .cas()
+        .put_merkle_snapshot(&Snapshot {
+            tree: base_tree.clone(),
+            parents: vec![],
+            commit_body: format_commit_body(
+                "Base <base@spawn.local> 1700000100 +0000",
+                "Base <base@spawn.local> 1700000100 +0000",
+                "v1 base\n",
+            ),
+        })
+        .expect("v1 base");
+    let v1_main = cas
+        .cas()
+        .put_merkle_snapshot(&Snapshot {
+            tree: left_tree.clone(),
+            parents: vec![v1_base.clone()],
+            commit_body: format_commit_body(
+                "Main <main@spawn.local> 1700000200 +0000",
+                "Main <main@spawn.local> 1700000200 +0000",
+                "v1 main\n",
+            ),
+        })
+        .expect("v1 main");
+    let v2_branch = cas
+        .cas()
+        .put_commit_v2(&CommitV2 {
+            tree: right_tree.clone(),
+            parents: vec![v1_base],
+            at_ms: 1_700_000_300_000,
+            actor: CommitActor::Agent {
+                id: "agent-branch".to_string(),
+                execution_id: None,
+                model_label: None,
+                preset_id: None,
+            },
+            intent: CommitIntent {
+                origin: CommitOrigin::Work {
+                    change: WorkChange::Edit,
+                    boundary: WorkBoundary::Checkpoint,
+                },
+                task_id: Some(88),
+                transcript_ref: None,
+                message: "v2 branch".to_string(),
+            },
+            git_compat_body: None,
+        })
+        .expect("v2 branch");
+
+    let (_base, mixed_report) =
+        merge_snapshots(cas, &v1_main, &v2_branch, None).expect("mixed v1+v2 merge");
+    assert!(mixed_report.is_clean());
+    let mixed_built = build_merge_commit_v2(
+        cas,
+        &MergeCommitV2Spec {
+            main_snapshot: &v1_main,
+            branch_snapshot: &v2_branch,
+            merged_tree: &mixed_report.tree,
+            main_git_oid: None,
+            branch_git_oid: None,
+            created_at_ms: 1_700_000_400_000,
+            actor: land_actor,
+            origin: CommitOrigin::Land,
+            task_id: Some(88),
+            transcript_ref: Some("transcript://land-88"),
+            message: "land task 88 cleanly",
+        },
+    )
+    .expect("build mixed merge commit v2");
+    assert_eq!(mixed_built.commit.parents, vec![v1_main, v2_branch]);
+    assert!(mixed_built.commit.git_compat_body.is_none());
+    let stored_mixed = cas
+        .cas()
+        .get_commit_object(&mixed_built.snapshot_id)
+        .expect("get mixed v2");
+    let expected_mixed_oid = cas
+        .project_commit_object_oid(
+            &stored_mixed,
+            &cas.resolve_parent_oids(&InMemoryRefLedger::new(), stored_mixed.parents())
+                .expect("resolve mixed parents"),
+        )
+        .expect("project mixed oid");
+    assert_eq!(mixed_built.git_oid, expected_mixed_oid);
+}
+
+fn verify_pure_v2_merge(
+    cas: &CasMerkleStore,
+    base_tree: &Digest,
+    left_tree: &Digest,
+    right_tree: &Digest,
+    land_actor: &CommitActor,
+) {
+    let v2_root = cas
+        .cas()
+        .put_commit_v2(&CommitV2 {
+            tree: base_tree.clone(),
+            parents: vec![],
+            at_ms: 1_700_001_000_000,
+            actor: land_actor.clone(),
+            intent: CommitIntent {
+                origin: CommitOrigin::Import,
+                task_id: None,
+                transcript_ref: None,
+                message: "pure v2 root".to_string(),
+            },
+            git_compat_body: None,
+        })
+        .expect("v2 root");
+    let v2_left = cas
+        .cas()
+        .put_commit_v2(&CommitV2 {
+            tree: left_tree.clone(),
+            parents: vec![v2_root.clone()],
+            at_ms: 1_700_001_100_000,
+            actor: land_actor.clone(),
+            intent: CommitIntent {
+                origin: CommitOrigin::Work {
+                    change: WorkChange::Edit,
+                    boundary: WorkBoundary::Checkpoint,
+                },
+                task_id: Some(101),
+                transcript_ref: None,
+                message: "pure v2 left".to_string(),
+            },
+            git_compat_body: None,
+        })
+        .expect("v2 left");
+    let v2_right = cas
+        .cas()
+        .put_commit_v2(&CommitV2 {
+            tree: right_tree.clone(),
+            parents: vec![v2_root.clone()],
+            at_ms: 1_700_001_200_000,
+            actor: land_actor.clone(),
+            intent: CommitIntent {
+                origin: CommitOrigin::Work {
+                    change: WorkChange::Edit,
+                    boundary: WorkBoundary::Submit,
+                },
+                task_id: Some(102),
+                transcript_ref: None,
+                message: "pure v2 right".to_string(),
+            },
+            git_compat_body: None,
+        })
+        .expect("v2 right");
+    let (resolved_base, pure_report) =
+        merge_snapshots(cas, &v2_left, &v2_right, None).expect("pure v2 merge");
+    assert_eq!(resolved_base, v2_root);
+    assert!(pure_report.is_clean());
+    let pure_built = build_merge_commit_v2(
+        cas,
+        &MergeCommitV2Spec {
+            main_snapshot: &v2_left,
+            branch_snapshot: &v2_right,
+            merged_tree: &pure_report.tree,
+            main_git_oid: None,
+            branch_git_oid: None,
+            created_at_ms: 1_700_001_300_000,
+            actor: land_actor,
+            origin: CommitOrigin::Work {
+                change: WorkChange::Derive,
+                boundary: WorkBoundary::Checkpoint,
+            },
+            task_id: None,
+            transcript_ref: None,
+            message: "pure v2 clean merge",
+        },
+    )
+    .expect("build pure v2 merge");
+    assert!(matches!(
+        cas.cas().get_commit_object(&pure_built.snapshot_id).expect("read pure v2"),
+        CommitObject::V2(ref c) if c.git_compat_body.is_none()
+    ));
+}
+
+#[test]
+fn merge_snapshots_and_build_merge_commit_v2_cover_pure_v2_and_mixed_v1_v2() {
+    let scratch = Scratch::new("merge-commit-v2");
+    let cas = CasMerkleStore::open(scratch.join("cas")).expect("open cas");
+    let base_tree = put_single_file_tree(&cas, &empty_tree_digest(), "a.txt", b"base\n");
+    let left_tree = put_single_file_tree(&cas, &base_tree, "left.txt", b"left\n");
+    let right_tree = put_single_file_tree(&cas, &base_tree, "right.txt", b"right\n");
+    let land_actor = CommitActor::System {
+        id: "integrator".to_string(),
+    };
+    verify_mixed_v1_v2_merge(&cas, &base_tree, &left_tree, &right_tree, &land_actor);
+    verify_pure_v2_merge(&cas, &base_tree, &left_tree, &right_tree, &land_actor);
 }
