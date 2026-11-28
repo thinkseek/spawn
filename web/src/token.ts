@@ -42,3 +42,39 @@ export function chooseToken(fromUrl: string | null, saved: string | null): Token
     problem: problems.length > 0 ? `${problems.join("; ")}.` : null,
   };
 }
+
+/** Closed reason why the page currently asks for the serve token. */
+export type AuthPromptReason = "missing_token" | "rejected_token" | "invalid_token";
+
+/** Closed authentication gate state for the web console. */
+export type AuthGateState =
+  | { kind: "checking" }
+  | { kind: "authenticated"; hasStoredToken: boolean }
+  | { kind: "unauthenticated"; reason: AuthPromptReason; problem: string | null };
+
+/** Closed result of validating user-entered token text before probing the server. */
+export type TokenSubmitValidation =
+  | { ok: true; token: string }
+  | { ok: false; message: string };
+
+/** Validate and trim an interactive single-token login submission. */
+export function validateSubmittedToken(raw: string): TokenSubmitValidation {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, message: "请输入 Token" };
+  }
+  const credential = serveCredential(trimmed);
+  if (credential === null) {
+    return {
+      ok: false,
+      message: "Token 格式无效（需为 1–512 位可见 ASCII 字符，不含空格或换行）",
+    };
+  }
+  return { ok: true, token: credential };
+}
+
+/** Map a 401/403 failure into whether the browser had no token or a rejected one. */
+export function unauthorizedReason(hasToken: boolean, problem: string | null = null): AuthPromptReason {
+  if (hasToken) return "rejected_token";
+  return problem ? "invalid_token" : "missing_token";
+}

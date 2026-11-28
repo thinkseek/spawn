@@ -541,3 +541,44 @@ test("tabs that cannot share a stream close it while hidden and resume from the 
   assert.equal(fetched, 0);
   assert.equal(later.status.state, "paused");
 });
+
+test("stop halts reconnects and start resumes with fresh headers", async () => {
+  const time = clock();
+  let token = "first";
+  const seenAuth: string[] = [];
+  let listener: (() => void) | null = null;
+  const page = { visibilityState: "visible", addEventListener: (_: string, fn: () => void) => void (listener = fn) };
+  const stream = new LiveStream(
+    deps(
+      {
+        headers: () => ({ Authorization: `Bearer ${token}` }),
+        document: page,
+        fetch: async (_url, init) => {
+          seenAuth.push(init.headers.Authorization ?? "");
+          return response(200, ['event: ready\ndata: {"latest_event_id":1,"replayed":0}\n\n'], true);
+        },
+      },
+      time,
+    ),
+  );
+  stream.start();
+  await tick();
+  await tick();
+  assert.equal(stream.status.state, "live");
+  assert.deepEqual(seenAuth, ["Bearer first"]);
+
+  stream.stop();
+  await tick();
+  assert.equal(stream.status.state, "idle");
+  // Visibility transitions while stopped must not wake a logged-out stream.
+  listener?.();
+  await tick();
+  assert.equal(seenAuth.length, 1);
+
+  token = "second";
+  stream.start();
+  await tick();
+  await tick();
+  assert.equal(stream.status.state, "live");
+  assert.deepEqual(seenAuth, ["Bearer first", "Bearer second"]);
+});

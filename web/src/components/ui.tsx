@@ -85,9 +85,9 @@ export function PageHeader({
   children?: ReactNode;
 }) {
   return (
-    <header className="flex h-12 shrink-0 items-center gap-3 border-b border-surface-border bg-page-canvas px-4 sm:px-5">
+    <header className="flex min-h-12 shrink-0 flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-surface-border bg-page-canvas px-4 py-2 sm:px-5">
       <div className="flex min-w-0 items-center gap-2.5">{title}</div>
-      <div className="ml-auto flex shrink-0 items-center gap-2">{children}</div>
+      <div className="ml-auto flex min-w-0 flex-wrap items-center gap-2">{children}</div>
     </header>
   );
 }

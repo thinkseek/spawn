@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { chooseToken, serveCredential } from "../src/token.ts";
+import { chooseToken, serveCredential, unauthorizedReason, validateSubmittedToken } from "../src/token.ts";
 
 test("only visible ASCII up to 512 characters is a token", () => {
   for (const good of ["abc", "bb-serve-token-1", "a".repeat(512), "!~#$%&'()*+,-./:;<=>?@[]^_`{|}"]) {
@@ -52,4 +52,26 @@ test("a good ?token= replaces a bad saved value", () => {
   assert.equal(choice.token, "good");
   assert.equal(choice.save, "good");
   assert.match(choice.problem ?? "", /saved token/);
+});
+
+test("validateSubmittedToken trims valid credentials and rejects empty or invalid input", () => {
+  assert.deepEqual(validateSubmittedToken("  spw_test_123  "), {
+    ok: true,
+    token: "spw_test_123",
+  });
+  for (const empty of ["", "   \n\t "]) {
+    const res = validateSubmittedToken(empty);
+    assert.equal(res.ok, false);
+  }
+  for (const bad of ["two words", "令牌", `a${"b".repeat(512)}`]) {
+    const res = validateSubmittedToken(bad);
+    assert.equal(res.ok, false, JSON.stringify(bad));
+  }
+});
+
+test("unauthorizedReason maps closed reasons for missing, invalid, and rejected tokens", () => {
+  assert.equal(unauthorizedReason(true), "rejected_token");
+  assert.equal(unauthorizedReason(true, "bad url"), "rejected_token");
+  assert.equal(unauthorizedReason(false, "bad saved"), "invalid_token");
+  assert.equal(unauthorizedReason(false, null), "missing_token");
 });
