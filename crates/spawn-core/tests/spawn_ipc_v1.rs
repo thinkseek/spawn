@@ -321,6 +321,53 @@ fn collapse_rust_line_continuations(source: &str) -> String {
     out
 }
 
+fn extract_braced_block<'a>(source: &'a str, marker: &str) -> &'a str {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing block marker: {marker:?}"));
+    let tail = &source[start..];
+    let bytes = tail.as_bytes();
+    let mut i = marker.len();
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                    } else if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    return &tail[..=i];
+                }
+                i += 1;
+            }
+            b'}' => panic!("unexpected closing brace before opening brace for {marker:?}"),
+            _ => i += 1,
+        }
+    }
+    panic!("unterminated braced block for marker: {marker:?}");
+}
+
 /// Issue #98 Item 2: cross-check HTTP `/api/*` canonical route inventory and
 /// `/ipc/v1/*` routes across `routes.json`, `docs/api.md`, `serve.rs`, and
 /// `serve/ipc/routes.rs`, plus the read-only out-of-table endpoints
@@ -372,7 +419,7 @@ fn http_api_routes_docs_serve_and_readonly_out_of_table_endpoints_stay_locked() 
 
     // Out-of-table read-only endpoints `/api/features/truth` and `/api/episodes`:
     // both exist in serve.rs and ipc/routes.rs, reject non-GET/HEAD with 405
-    // Allow: GET, and dispatch solely on read-only handlers/reads_gate.
+    // Allow: GET, and dispatch solely on read-only handlers/reader pool.
     for path in ["/api/features/truth", "/api/episodes"] {
         assert!(
             !serve_api.contains(&("POST".to_string(), path.to_string())),
@@ -380,26 +427,22 @@ fn http_api_routes_docs_serve_and_readonly_out_of_table_endpoints_stay_locked() 
         );
     }
 
-    let truth_serve_idx = serve_rs
-        .find("if path == \"/api/features/truth\"")
-        .expect("serve.rs handles /api/features/truth");
-    let truth_serve_block = &serve_rs[truth_serve_idx..truth_serve_idx + 420];
-    assert!(
-        truth_serve_block.contains("Method::Get | Method::Head")
-            && truth_serve_block.contains("not_allowed(\"GET\")")
-            && truth_serve_block.contains("feature_map::feature_truth_answer"),
-        "serve.rs /api/features/truth must remain strictly GET|HEAD read-only"
+    let serve_readonly_block = extract_braced_block(
+        &serve_rs,
+        "if path == \"/api/features/truth\" || path == \"/api/episodes\"",
     );
-
-    let episodes_serve_idx = serve_rs
-        .find("if path == \"/api/episodes\"")
-        .expect("serve.rs handles /api/episodes");
-    let episodes_serve_block = &serve_rs[episodes_serve_idx..episodes_serve_idx + 420];
     assert!(
-        episodes_serve_block.contains("Method::Get | Method::Head")
-            && episodes_serve_block.contains("not_allowed(\"GET\")")
-            && episodes_serve_block.contains("episodes_answer"),
-        "serve.rs /api/episodes must remain strictly GET|HEAD read-only"
+        serve_readonly_block.contains("Method::Get | Method::Head")
+            && serve_readonly_block.contains("not_allowed(\"GET\")")
+            && serve_readonly_block.contains("with_shared_reader(")
+            && serve_readonly_block.contains("feature_map::feature_truth_answer")
+            && serve_readonly_block.contains("episodes_answer"),
+        "serve.rs /api/features/truth and /api/episodes must remain strictly GET|HEAD read-only"
+    );
+    assert!(
+        !serve_readonly_block.contains("with_write")
+            && !serve_readonly_block.contains("with_shared_write"),
+        "serve.rs /api/features/truth and /api/episodes must never use write pool helpers"
     );
 
     for (path, handler_call) in [
@@ -410,10 +453,7 @@ fn http_api_routes_docs_serve_and_readonly_out_of_table_endpoints_stay_locked() 
         ("/api/episodes", "handle_api_get(\"/api/episodes\""),
     ] {
         let needle = format!("if req.path == \"{path}\"");
-        let idx = ipc_routes_rs
-            .find(&needle)
-            .unwrap_or_else(|| panic!("ipc/routes.rs must handle {path}"));
-        let block = &ipc_routes_rs[idx..idx + 420];
+        let block = extract_braced_block(&ipc_routes_rs, &needle);
         assert!(
             block.contains("\"GET\" | \"HEAD\"")
                 && block.contains("405")
@@ -422,14 +462,14 @@ fn http_api_routes_docs_serve_and_readonly_out_of_table_endpoints_stay_locked() 
             "ipc/routes.rs {path} must reject non-GET|HEAD and bind to handle_api_get"
         );
     }
-    let handle_get_idx = ipc_routes_rs
-        .find("fn handle_api_get(")
-        .expect("ipc/routes.rs handle_api_get");
-    let handle_get_block = &ipc_routes_rs[handle_get_idx..handle_get_idx + 900];
+    let handle_get_block = extract_braced_block(&ipc_routes_rs, "fn handle_api_get(");
     assert!(
-        handle_get_block.contains("state.pools.reads_gate.try_acquire()")
-            && handle_get_block.contains("serve::with_reader_url(reader_url"),
-        "ipc handle_api_get must enforce reads_gate pool and spawn_reader role binding"
+        handle_get_block.contains("serve::run_with_reader_pool_status(")
+            && handle_get_block.contains("&state.pools.reader")
+            && !handle_get_block.contains("with_write")
+            && !handle_get_block.contains("&state.pools.writer")
+            && !handle_get_block.contains("&state.pools.node"),
+        "ipc handle_api_get must enforce bounded reader RoleConnPool and remain strictly read-only"
     );
 }
 
