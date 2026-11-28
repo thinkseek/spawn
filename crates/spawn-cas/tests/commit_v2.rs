@@ -996,3 +996,56 @@ fn store_gc_persistent_retains_pure_v2_chunked_dag_and_multi_roots() {
     );
     assert_eq!(restored, big_payload);
 }
+
+#[test]
+fn store_gc_persistent_fails_closed_on_corrupt_v2_root_with_zero_deletions() {
+    let scratch = Scratch::new("store-gc-corrupt-v2-root");
+    let clock = ManualClock::new();
+    let store = clock.store(&scratch.join("cas"));
+
+    let (dead_tree, dead_blob) = store_single_file_tree(&store, "dead.txt", b"dead payload");
+    let mut v2_dead = sample_commit();
+    v2_dead.tree = dead_tree.clone();
+    v2_dead.parents = Vec::new();
+    v2_dead.intent.message = "unreachable v2".to_string();
+    let v2_dead_digest = store.put_commit_v2(&v2_dead).expect("put dead v2");
+
+    let (live_tree, live_blob) = store_single_file_tree(&store, "live.txt", b"live payload");
+    let mut v2_root = sample_commit();
+    v2_root.tree = live_tree.clone();
+    v2_root.parents = Vec::new();
+    let v2_root_digest = store.put_commit_v2(&v2_root).expect("put live v2 root");
+
+    let binding = GcFenceBinding {
+        db_system_id: "7441000000000000102".to_string(),
+        db_oid: 20_482,
+        schema_name: "public".to_string(),
+    };
+    bind_gc_fence(&store, &binding).expect("bind fence");
+
+    clock.advance(Duration::from_hours(25));
+    let root_path = store.object_path(&v2_root_digest);
+    let mut raw = fs::read(&root_path).expect("read root v2 object");
+    let last = raw.len() - 1;
+    raw[last] ^= 0x01;
+    fs::set_permissions(&root_path, fs::Permissions::from_mode(0o600)).expect("chmod rw");
+    fs::write(&root_path, &raw).expect("corrupt v2 root");
+    fs::set_permissions(&root_path, fs::Permissions::from_mode(0o444)).expect("chmod ro");
+
+    let err = store
+        .gc_persistent(
+            std::slice::from_ref(&v2_root_digest),
+            &binding,
+            0,
+            DEFAULT_PERSISTENT_GC_GRACE,
+        )
+        .expect_err("corrupt V2 root must abort GC fail-closed");
+    assert!(err.is_mismatch(), "expected Mismatch, got {err:?}");
+
+    // Zero deletions allowed once reachability marking fails.
+    assert!(store.has(&v2_dead_digest));
+    assert!(store.has(&dead_tree));
+    assert!(store.has(&dead_blob));
+    assert!(store.has(&live_tree));
+    assert!(store.has(&live_blob));
+}

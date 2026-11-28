@@ -1070,6 +1070,12 @@ pub struct LocalOnlyLargeFile {
 
 /// Result of an end-to-end R2 `git bundle` export -> blank-store import recovery drill
 /// (`#113` Fine Items 7.2.6–7.2.7).
+///
+/// For `CommitV2` or mixed V1/V2 DAGs, roundtrip verification proves identical `(GitOid -> tree)`
+/// content, ref targets, and `> 100 MiB` local-only file inventories. Structured `CommitV2`
+/// `actor` and `intent` metadata live exclusively in CAS (`spawn-commit-v2`) and are not carried
+/// through a plain Git bundle roundtrip (off-host bundle re-imports materialize `V1` snapshots from
+/// projected Git commit bodies).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleDrillReport {
     /// Audited project name.
@@ -1118,7 +1124,10 @@ impl Drop for TempDirGuard {
 /// 3. Verify and unbundle `bundle_path` into a fresh empty bare repo (`git bundle verify` + `git fsck --full --strict`).
 /// 4. Import the unbundled repo into a blank temporary [`CasMerkleStore`] (tolerating missing
 ///    `> 100 MiB` local-only blobs via `spawn-pointer-v1` while listing them explicitly).
-/// 5. Assert every `snapshot_id` and `git_oid` recomputes identically to the source store and ledger.
+/// 5. For pure-V1 DAGs, assert every `snapshot_id` and `git_oid` recomputes bit-for-bit; for
+///    `CommitV2` or mixed V1/V2 DAGs, verify `(GitOid -> tree)` equivalence and refs because
+///    structured `CommitV2` `actor` / `intent` metadata live in CAS and are not carried inside a
+///    plain Git bundle roundtrip.
 pub fn verify_bundle_snapshot_roundtrip<L: RefLedger + ?Sized>(
     store: &CasMerkleStore,
     ledger: &L,

@@ -48,8 +48,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use spawn_cas::{
-    CommitActor, CommitObject, CommitOrigin, CommitV2, Digest as CasDigest, Store as CasStore,
-    WorkBoundary, WorkChange, empty_tree_digest,
+    CAS_MARKER, CommitActor, CommitObject, CommitOrigin, CommitV2, Digest as CasDigest,
+    Store as CasStore, WorkBoundary, WorkChange, empty_tree_digest,
 };
 use spawn_postgres::PostgresStore;
 use spawn_postgres::provenance::{
@@ -1047,7 +1047,11 @@ struct Facts {
 }
 
 impl Facts {
-    fn load(store: &PostgresStore, cas: Option<&CasStore>, items: &[Item]) -> Result<Self, String> {
+    fn load(
+        store: &PostgresStore,
+        v2_commits: &HashMap<String, (CasDigest, CommitV2)>,
+        items: &[Item],
+    ) -> Result<Self, String> {
         let error = |error: spawn_core::port::StoreError| error.to_string();
         let mut executions: Vec<String> = items
             .iter()
@@ -1086,21 +1090,30 @@ impl Facts {
                 Item::Main {
                     commit, trailers, ..
                 } => {
-                    if let Some(task) = trailers.task {
-                        tasks.push(task);
-                        landed.push(task);
-                    } else if let Some((_, v2)) = lookup_commit_v2(store, cas, &commit.id)
-                        && matches!(v2.intent.origin, CommitOrigin::Land)
-                        && let Some(task) = v2.intent.task_id
-                    {
+                    if let Some((_, v2)) = v2_commits.get(&commit.id) {
+                        // CommitV2 typed intent is authoritative; ignore any forged trailers.
+                        if matches!(v2.intent.origin, CommitOrigin::Land)
+                            && let Some(task) = v2.intent.task_id
+                        {
+                            tasks.push(task);
+                            landed.push(task);
+                        }
+                    } else if let Some(task) = trailers.task {
                         tasks.push(task);
                         landed.push(task);
                     }
                 }
                 Item::Checkpoint {
+                    commit,
                     found: Found::Merge { task, .. },
                     ..
-                } => tasks.extend(*task),
+                } => {
+                    if let Some((_, v2)) = v2_commits.get(&commit.id) {
+                        tasks.extend(v2.intent.task_id);
+                    } else {
+                        tasks.extend(*task);
+                    }
+                }
                 Item::Checkpoint { .. } => {}
             }
         }
@@ -1411,36 +1424,183 @@ pub(crate) fn project_commit_v2_change(
     }
 }
 
+fn open_existing_d6_cas(path: &Path) -> Result<Option<CasStore>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!("inspect D6 CAS at {}: {err}", path.display()));
+        }
+        Ok(meta) => {
+            if !meta.is_dir() {
+                return Err(format!("D6 CAS path {} is not a directory", path.display()));
+            }
+        }
+    }
+    let marker = path.join(CAS_MARKER);
+    match std::fs::symlink_metadata(&marker) {
+        Err(err) => {
+            return Err(format!(
+                "invalid D6 CAS store at {} (missing or unreadable {CAS_MARKER}: {err})",
+                path.display()
+            ));
+        }
+        Ok(meta) if !meta.is_file() => {
+            return Err(format!(
+                "invalid D6 CAS marker at {}: not a regular file",
+                marker.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    CasStore::open(path)
+        .map(Some)
+        .map_err(|err| format!("open D6 CAS at {}: {err}", path.display()))
+}
+
+fn resolve_d6_cas_dir_for_index(
+    root: Option<&Path>,
+    d6_cfg: &crate::config::D6RuntimeConfig,
+    configured: crate::config::WorkspaceBackend,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if let Some(dir) = &d6_cfg.cas_dir {
+        return Ok(Some(dir.clone()));
+    }
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    match configured {
+        crate::config::WorkspaceBackend::D6 => Ok(Some(
+            d6_cfg.effective_cas_dir(root, spawn_host::WorkspaceBackend::D6),
+        )),
+        crate::config::WorkspaceBackend::D6Shadow => Ok(Some(
+            d6_cfg.effective_cas_dir(root, spawn_host::WorkspaceBackend::D6Shadow),
+        )),
+        crate::config::WorkspaceBackend::Auto
+        | crate::config::WorkspaceBackend::Git
+        | crate::config::WorkspaceBackend::Cow
+        | crate::config::WorkspaceBackend::Overlay => {
+            if let Some(active) = spawn_host::root_backend(root)
+                .map_err(|err| format!("read workspace backend under {}: {err}", root.display()))?
+                && matches!(
+                    active,
+                    spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow
+                )
+            {
+                return Ok(Some(d6_cfg.effective_cas_dir(root, active)));
+            }
+            for backend in [
+                spawn_host::WorkspaceBackend::D6,
+                spawn_host::WorkspaceBackend::D6Shadow,
+            ] {
+                let candidate = d6_cfg.effective_cas_dir(root, backend);
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(_) => return Ok(Some(candidate)),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(format!("inspect D6 CAS at {}: {err}", candidate.display()));
+                    }
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn open_d6_cas_with_config(
+    root: Option<&Path>,
+    d6_cfg: &crate::config::D6RuntimeConfig,
+    configured: crate::config::WorkspaceBackend,
+) -> Result<Option<CasStore>, String> {
+    let Some(cas_dir) = resolve_d6_cas_dir_for_index(root, d6_cfg, configured)? else {
+        return Ok(None);
+    };
+    open_existing_d6_cas(&cas_dir)
+}
+
+fn env_d6_resolution() -> Result<
+    (
+        crate::config::D6RuntimeConfig,
+        crate::config::WorkspaceBackend,
+    ),
+    String,
+> {
+    let d6_cfg = crate::config::D6RuntimeConfig::from_env()?;
+    let configured = match std::env::var("SPAWN_WORKSPACE_BACKEND") {
+        Ok(raw) => crate::config::workspace_backend(Some(&raw))?,
+        Err(std::env::VarError::NotPresent) => crate::config::WorkspaceBackend::Git,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("SPAWN_WORKSPACE_BACKEND is not valid UTF-8".to_string());
+        }
+    };
+    Ok((d6_cfg, configured))
+}
+
 fn lookup_commit_v2(
     store: &PostgresStore,
     cas: Option<&CasStore>,
     git_oid: &str,
-) -> Option<(CasDigest, CommitV2)> {
-    let cas = cas?;
-    let row = store.get_snapshot_by_oid(git_oid).ok().flatten()?;
-    let digest = CasDigest::parse(&row.id).ok()?;
-    match cas.get_commit_object(&digest).ok()? {
-        CommitObject::V2(commit) => Some((digest, commit)),
-        CommitObject::V1(_) => None,
+) -> Result<Option<(CasDigest, CommitV2)>, String> {
+    let Some(row) = store
+        .get_snapshot_by_oid(git_oid)
+        .map_err(|error| format!("lookup D6 snapshot for commit {git_oid}: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let Some(cas) = cas else {
+        return Err(format!(
+            "D6 snapshot {} exists for commit {git_oid}, but D6 CAS is unavailable (pass --root or set SPAWN_D6_CAS_DIR)",
+            row.id
+        ));
+    };
+    let digest = CasDigest::parse(&row.id).map_err(|error| {
+        format!(
+            "invalid D6 snapshot digest {:?} for commit {git_oid}: {error}",
+            row.id
+        )
+    })?;
+    match cas
+        .get_commit_object(&digest)
+        .map_err(|error| format!("read D6 commit object {digest} for commit {git_oid}: {error}"))?
+    {
+        CommitObject::V2(commit) => Ok(Some((digest, commit))),
+        CommitObject::V1(_) => Ok(None),
     }
 }
 
-fn commit_v2_for_item(
+fn load_commit_v2_map(
     store: &PostgresStore,
     cas: Option<&CasStore>,
+    items: &[Item],
+) -> Result<HashMap<String, (CasDigest, CommitV2)>, String> {
+    let mut out = HashMap::new();
+    for item in items {
+        let commit = match item {
+            Item::Checkpoint { commit, .. } | Item::Main { commit, .. } => commit,
+        };
+        if !out.contains_key(&commit.id)
+            && let Some(v2) = lookup_commit_v2(store, cas, &commit.id)?
+        {
+            out.insert(commit.id.clone(), v2);
+        }
+    }
+    Ok(out)
+}
+
+fn commit_v2_for_item(
+    v2_commits: &HashMap<String, (CasDigest, CommitV2)>,
     domain: &str,
     known: &Known,
     commit: &CommitInfo,
 ) -> Option<ProvChangeInput> {
-    let (digest, v2) = lookup_commit_v2(store, cas, &commit.id)?;
-    let cid = commit_v2_change_id(domain, &digest, &v2);
+    let (digest, v2) = v2_commits.get(&commit.id)?;
+    let cid = commit_v2_change_id(domain, digest, v2);
     let rev = known.next_rev(&cid);
     let base = git1(commit.parents.first().map_or(EMPTY_TREE, String::as_str));
     let result = git1(&commit.id);
     Some(project_commit_v2_change(
         domain,
-        &digest,
-        &v2,
+        digest,
+        v2,
         rev,
         Some(&base),
         Some(&result),
@@ -1705,17 +1865,27 @@ pub(crate) fn index_with(
     domain: &str,
     root: Option<&Path>,
 ) -> Result<Summary, String> {
+    let (d6_cfg, configured) = env_d6_resolution()?;
+    index_with_d6_config(store, repo, domain, root, &d6_cfg, configured)
+}
+
+fn index_with_d6_config(
+    store: &PostgresStore,
+    repo: &mut Repo,
+    domain: &str,
+    root: Option<&Path>,
+    d6_cfg: &crate::config::D6RuntimeConfig,
+    configured: crate::config::WorkspaceBackend,
+) -> Result<Summary, String> {
     let mut known = Known::load(store, domain)?;
     let mut summary = Summary::default();
     let items = plan(repo, &known, &mut summary)?;
     if items.is_empty() {
         return Ok(summary);
     }
-    let cas = root
-        .map(|r| r.join(".cas"))
-        .filter(|p| p.is_dir())
-        .and_then(|p| CasStore::open(p).ok());
-    let facts = Facts::load(store, cas.as_ref(), &items)?;
+    let cas = open_d6_cas_with_config(root, d6_cfg, configured)?;
+    let v2_commits = load_commit_v2_map(store, cas.as_ref(), &items)?;
+    let facts = Facts::load(store, &v2_commits, &items)?;
     let tip = repo.resolve(MAIN);
     for item in &items {
         let (change, entries, edges) = match item {
@@ -1724,7 +1894,7 @@ pub(crate) fn index_with(
                 execution,
                 found,
             } => {
-                let change = commit_v2_for_item(store, cas.as_ref(), domain, &known, commit)
+                let change = commit_v2_for_item(&v2_commits, domain, &known, commit)
                     .unwrap_or_else(|| {
                         checkpoint_change(domain, &known, &facts, commit, execution.as_ref(), found)
                     });
@@ -1742,7 +1912,7 @@ pub(crate) fn index_with(
                 trailers,
                 checkpoints,
             } => {
-                let change = commit_v2_for_item(store, cas.as_ref(), domain, &known, commit)
+                let change = commit_v2_for_item(&v2_commits, domain, &known, commit)
                     .unwrap_or_else(|| main_change(domain, &known, &facts, commit, trailers));
                 let mut entries = entries(
                     repo,
@@ -2058,5 +2228,772 @@ mod commit_v2_tests {
         assert_eq!(first.attributed, ProvAttributionSource::Host);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct TempRootGuard(PathBuf);
+
+    impl Drop for TempRootGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct PgCliRefLedger<'a> {
+        pg: &'a PostgresStore,
+    }
+
+    fn to_pg_kind(kind: spawn_host::D6RefKind) -> spawn_postgres::RefKind {
+        match kind {
+            spawn_host::D6RefKind::Main => spawn_postgres::RefKind::Main,
+            spawn_host::D6RefKind::Branch => spawn_postgres::RefKind::Branch,
+            spawn_host::D6RefKind::Wip => spawn_postgres::RefKind::Wip,
+            spawn_host::D6RefKind::Tag => spawn_postgres::RefKind::Tag,
+        }
+    }
+
+    fn from_pg_kind(kind: spawn_postgres::RefKind) -> spawn_host::D6RefKind {
+        match kind {
+            spawn_postgres::RefKind::Main => spawn_host::D6RefKind::Main,
+            spawn_postgres::RefKind::Branch => spawn_host::D6RefKind::Branch,
+            spawn_postgres::RefKind::Wip => spawn_host::D6RefKind::Wip,
+            spawn_postgres::RefKind::Tag => spawn_host::D6RefKind::Tag,
+        }
+    }
+
+    impl spawn_host::RefLedger for PgCliRefLedger<'_> {
+        fn record_snapshot(
+            &self,
+            id: &CasDigest,
+            git_oid: &spawn_cas::GitOid,
+            tree: &CasDigest,
+            parents: &[CasDigest],
+            project: &str,
+            created_at_ms: i64,
+        ) -> Result<CasDigest, spawn_host::D6StoreError> {
+            let parent_strs: Vec<String> = parents.iter().map(CasDigest::to_string).collect();
+            let out = self
+                .pg
+                .record_snapshot(
+                    &id.to_string(),
+                    &git_oid.to_hex(),
+                    &tree.to_string(),
+                    &parent_strs,
+                    project,
+                    created_at_ms,
+                )
+                .map_err(|e| spawn_host::D6StoreError::Ledger(e.to_string()))?;
+            Ok(CasDigest::parse(&out)?)
+        }
+
+        fn get_snapshot(
+            &self,
+            id: &CasDigest,
+        ) -> Result<Option<spawn_host::LedgerSnapshot>, spawn_host::D6StoreError> {
+            let row = self
+                .pg
+                .get_snapshot(&id.to_string())
+                .map_err(|e| spawn_host::D6StoreError::Ledger(e.to_string()))?;
+            row.map(|r| {
+                let parents = r
+                    .parents
+                    .iter()
+                    .map(|p| CasDigest::parse(p))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(spawn_host::LedgerSnapshot {
+                    id: CasDigest::parse(&r.id)?,
+                    git_oid: spawn_cas::GitOid::parse_hex(&r.git_oid)?,
+                    tree: CasDigest::parse(&r.tree)?,
+                    parents,
+                    project: r.project,
+                    created_at_ms: r.created_at_ms,
+                })
+            })
+            .transpose()
+        }
+
+        fn get_snapshot_by_oid(
+            &self,
+            git_oid: &spawn_cas::GitOid,
+        ) -> Result<Option<spawn_host::LedgerSnapshot>, spawn_host::D6StoreError> {
+            let row = self
+                .pg
+                .get_snapshot_by_oid(&git_oid.to_hex())
+                .map_err(|e| spawn_host::D6StoreError::Ledger(e.to_string()))?;
+            row.map(|r| {
+                let parents = r
+                    .parents
+                    .iter()
+                    .map(|p| CasDigest::parse(p))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(spawn_host::LedgerSnapshot {
+                    id: CasDigest::parse(&r.id)?,
+                    git_oid: spawn_cas::GitOid::parse_hex(&r.git_oid)?,
+                    tree: CasDigest::parse(&r.tree)?,
+                    parents,
+                    project: r.project,
+                    created_at_ms: r.created_at_ms,
+                })
+            })
+            .transpose()
+        }
+
+        fn cas_ref(
+            &self,
+            project: &str,
+            name: &str,
+            kind: spawn_host::D6RefKind,
+            expected: Option<&CasDigest>,
+            new_snapshot: &CasDigest,
+            reason: &str,
+        ) -> Result<u64, spawn_host::D6StoreError> {
+            let exp_str = expected.map(CasDigest::to_string);
+            let new_str = new_snapshot.to_string();
+            let seq = self
+                .pg
+                .cas_ref(
+                    project,
+                    name,
+                    to_pg_kind(kind),
+                    exp_str.as_deref(),
+                    &new_str,
+                    reason,
+                )
+                .map_err(|e| spawn_host::D6StoreError::Ledger(e.to_string()))?;
+            u64::try_from(seq)
+                .map_err(|_| spawn_host::D6StoreError::Ledger("negative seq".to_string()))
+        }
+
+        fn land_main_ref(
+            &self,
+            project: &str,
+            name: &str,
+            expected_base: Option<&CasDigest>,
+            new_snapshot: &CasDigest,
+            task_id: Option<i64>,
+            reason: &str,
+        ) -> Result<u64, spawn_host::D6StoreError> {
+            let exp_str = expected_base.map(CasDigest::to_string);
+            let new_str = new_snapshot.to_string();
+            let seq = self
+                .pg
+                .land_main_ref(project, name, exp_str.as_deref(), &new_str, task_id, reason)
+                .map_err(|e| spawn_host::D6StoreError::Ledger(e.to_string()))?;
+            u64::try_from(seq)
+                .map_err(|_| spawn_host::D6StoreError::Ledger("negative seq".to_string()))
+        }
+
+        fn list_refs(
+            &self,
+            project: Option<&str>,
+        ) -> Result<Vec<spawn_host::LedgerRef>, spawn_host::D6StoreError> {
+            let rows = self
+                .pg
+                .list_refs(project)
+                .map_err(|e| spawn_host::D6StoreError::Ledger(e.to_string()))?;
+            rows.into_iter()
+                .map(|r| {
+                    Ok(spawn_host::LedgerRef {
+                        project: r.project,
+                        name: r.name,
+                        kind: from_pg_kind(r.kind),
+                        snapshot: CasDigest::parse(&r.snapshot)?,
+                        updated_at_ms: r.updated_at_ms,
+                    })
+                })
+                .collect()
+        }
+
+        fn retire_project_refs(
+            &self,
+            project: &str,
+            reason: &str,
+        ) -> Result<usize, spawn_host::D6StoreError> {
+            let count = self
+                .pg
+                .retire_project_refs(project, reason)
+                .map_err(|e| spawn_host::D6StoreError::Ledger(e.to_string()))?;
+            usize::try_from(count)
+                .map_err(|_| spawn_host::D6StoreError::Ledger(format!("negative count: {count}")))
+        }
+    }
+
+    struct V2ProvFixture {
+        _guard: TempRootGuard,
+        _schema: spawn_postgres::testing::TestSchema,
+        store: PostgresStore,
+        schema_name: String,
+        db_url: String,
+        root: PathBuf,
+        cas_dir: PathBuf,
+        mirror_dir: PathBuf,
+        domain: String,
+        task_11: i64,
+        task_12: i64,
+        land_12_snap: CasDigest,
+    }
+
+    fn owner_client(url: &str, schema: &str) -> postgres::Client {
+        let mut client = postgres::Client::connect(url, postgres::NoTls).expect("pg owner");
+        client
+            .batch_execute(&format!("set search_path to {schema}"))
+            .expect("search_path");
+        client
+    }
+
+    fn write_v2_oversized_records(root: &Path, agent_b: &str) {
+        let cas_bytes = b"oversized payload\n";
+        let oversized_digest = format!(
+            "sha256:{}",
+            spawn_cas::sha256_reader(&mut &cas_bytes[..])
+                .expect("hash")
+                .hex()
+        );
+        std::fs::create_dir_all(root.join(".oversized")).expect("mkdir oversized");
+        std::fs::write(
+            root.join(".oversized").join(agent_b),
+            format!(
+                "untold\0{} {oversized_digest}\0model.bin\0",
+                cas_bytes.len()
+            ),
+        )
+        .expect("write real oversized");
+        std::fs::write(
+            root.join(".oversized/agent_decoy"),
+            format!(
+                "untold\0{} {oversized_digest}\0decoy.bin\0",
+                cas_bytes.len()
+            ),
+        )
+        .expect("write decoy oversized");
+    }
+
+    fn seed_v2_prov_fixture(tag: &str, cas_rel: &[&str]) -> V2ProvFixture {
+        let root = temp_dir(tag);
+        let guard = TempRootGuard(root.clone());
+        let cas_dir = cas_rel.iter().fold(root.clone(), |acc, p| acc.join(p));
+        let cas = CasMerkleStore::open(&cas_dir).expect("open d6 cas");
+        let mirror_dir = root.join(".sources").join("proj-v2.git");
+        let source = "/srv/proj-v2.git";
+        let domain = domain_of(source);
+        let schema = spawn_postgres::testing::TestSchema::new("prov_v2_r2");
+        let store = schema.store();
+        let ledger = PgCliRefLedger { pg: &store };
+
+        let mission = store
+            .mission_add("D6 V2 index_with E2E", &json!([source]), "human")
+            .expect("mission_add");
+        store
+            .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+            .expect("mission_configure");
+
+        // Publish base CommitV2 on main.
+        let (base_blob, base_sz) = cas.put_bytes_blob(b"one\n").expect("put base blob");
+        let base_tree = cas
+            .apply_mutations(
+                &empty_tree_digest(),
+                &[spawn_cas::TreeMutation::Upsert {
+                    path: vec![b"a.rs".to_vec()],
+                    kind: spawn_cas::TreeEntryKind::File,
+                    id: base_blob.as_bytes(),
+                    size: base_sz,
+                }],
+            )
+            .expect("base tree");
+        let base_actor = CommitActor::System {
+            id: "d6-bootstrap".to_string(),
+        };
+        let base_intent = CommitIntent {
+            origin: CommitOrigin::Import,
+            task_id: None,
+            transcript_ref: None,
+            message: "Initial import".to_string(),
+        };
+        let base_pub = cas
+            .publish_commit_v2(
+                &ledger,
+                &spawn_host::cas_merkle::PublishCommitV2Request {
+                    project: "proj-v2",
+                    ref_name: "main",
+                    kind: spawn_host::D6RefKind::Main,
+                    expected_ref: None,
+                    tree: &base_tree,
+                    parents: &[],
+                    created_at_ms: 1_700_000_000_000,
+                    actor: &base_actor,
+                    intent: &base_intent,
+                    git_compat_body: None,
+                    reason: "bootstrap",
+                    landing_task_id: None,
+                },
+            )
+            .expect("publish base");
+
+        let (t1_pub, task_11) =
+            publish_v2_land_one(&cas, &store, &ledger, mission, &base_pub, &base_tree);
+        let (t2_pub, task_12) =
+            publish_v2_land_two(&cas, &store, &ledger, mission, &t1_pub, &base_tree, task_11);
+
+        let agent_b = store
+            .prov_task_facts(&[task_12])
+            .expect("task_12 facts")
+            .remove(&task_12)
+            .expect("task_12 present")
+            .agent_id;
+        write_v2_oversized_records(&root, &agent_b);
+
+        let mut client = owner_client(schema.url(), schema.name());
+        client
+            .execute(
+                "insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
+                                            created_by, created_at_ms, updated_at_ms)
+                 overriding system value
+                 values (99999, $1, 'ephemeral', 'agent_decoy', 'session_decoy', 'decoy', 'human', 1000, 1000)",
+                &[&mission],
+            )
+            .expect("insert decoy task 99999");
+
+        spawn_host::GitBorderAdapter::new()
+            .export_project(&cas, &ledger, "proj-v2", &mirror_dir)
+            .expect("export mirror");
+
+        V2ProvFixture {
+            _guard: guard,
+            schema_name: schema.name().to_string(),
+            db_url: schema.url().to_string(),
+            _schema: schema,
+            store,
+            root,
+            cas_dir,
+            mirror_dir,
+            domain,
+            task_11,
+            task_12,
+            land_12_snap: t2_pub.snapshot,
+        }
+    }
+
+    fn accept_task_for_commit(
+        store: &PostgresStore,
+        task: i64,
+        base_oid: spawn_cas::GitOid,
+        cand_oid: spawn_cas::GitOid,
+    ) {
+        store.task_delivered(task, 1).expect("task_delivered");
+        assert!(store.task_reported(task, "done").expect("task_reported"));
+        store
+            .integrator_record(&json!({
+                "type": "task.gated",
+                "id": task,
+                "revision": 0,
+                "verdict": "accepted",
+                "base": base_oid.to_hex(),
+                "candidate": cand_oid.to_hex(),
+            }))
+            .expect("integrator_record accepted");
+    }
+
+    fn publish_v2_land_one(
+        cas: &CasMerkleStore,
+        store: &PostgresStore,
+        ledger: &PgCliRefLedger<'_>,
+        mission: i64,
+        base_pub: &spawn_host::PublishedSnapshot,
+        base_tree: &CasDigest,
+    ) -> (spawn_host::PublishedSnapshot, i64) {
+        let task_11 = store
+            .task_assign(mission, "ephemeral", "worker_a", "first task", "default")
+            .expect("assign task 11");
+        let (t1_blob, t1_sz) = cas.put_bytes_blob(b"one\nbad\n").expect("put t1 blob");
+        let t1_tree = cas
+            .apply_mutations(
+                base_tree,
+                &[spawn_cas::TreeMutation::Upsert {
+                    path: vec![b"a.rs".to_vec()],
+                    kind: spawn_cas::TreeEntryKind::File,
+                    id: t1_blob.as_bytes(),
+                    size: t1_sz,
+                }],
+            )
+            .expect("t1 tree");
+        let t1_actor = CommitActor::Agent {
+            id: "agent_a".to_string(),
+            execution_id: Some("exec-11".to_string()),
+            model_label: Some("claude-sonnet".to_string()),
+            preset_id: Some("worker".to_string()),
+        };
+        let t1_intent = CommitIntent {
+            origin: CommitOrigin::Land,
+            task_id: Some(task_11),
+            transcript_ref: Some("transcript://11".to_string()),
+            message: format!("land {task_11}\n"),
+        };
+        let t1_v2 = CommitV2 {
+            tree: t1_tree.clone(),
+            parents: vec![base_pub.snapshot.clone()],
+            at_ms: 1_700_000_001_000,
+            actor: t1_actor.clone(),
+            intent: t1_intent.clone(),
+            git_compat_body: None,
+        };
+        let t1_oid = cas
+            .project_commit_object_oid(&CommitObject::V2(t1_v2), &[base_pub.git_oid])
+            .expect("project t1 oid");
+        accept_task_for_commit(store, task_11, base_pub.git_oid, t1_oid);
+        let pub1 = cas
+            .publish_commit_v2(
+                ledger,
+                &spawn_host::cas_merkle::PublishCommitV2Request {
+                    project: "proj-v2",
+                    ref_name: "main",
+                    kind: spawn_host::D6RefKind::Main,
+                    expected_ref: Some(&base_pub.snapshot),
+                    tree: &t1_tree,
+                    parents: std::slice::from_ref(&base_pub.snapshot),
+                    created_at_ms: 1_700_000_001_000,
+                    actor: &t1_actor,
+                    intent: &t1_intent,
+                    git_compat_body: None,
+                    reason: "land-11",
+                    landing_task_id: Some(task_11),
+                },
+            )
+            .expect("publish t1");
+        (pub1, task_11)
+    }
+
+    fn publish_v2_land_two(
+        cas: &CasMerkleStore,
+        store: &PostgresStore,
+        ledger: &PgCliRefLedger<'_>,
+        mission: i64,
+        t1_pub: &spawn_host::PublishedSnapshot,
+        base_tree: &CasDigest,
+        task_11: i64,
+    ) -> (spawn_host::PublishedSnapshot, i64) {
+        let task_12_brief = format!("Undo {task_11}\n\nfixes: task {task_11}");
+        let task_12 = store
+            .task_assign(mission, "ephemeral", "worker_b", &task_12_brief, "default")
+            .expect("assign task 12");
+        let t2_actor = CommitActor::Agent {
+            id: "agent_b".to_string(),
+            execution_id: Some("exec-12".to_string()),
+            model_label: Some("claude-opus".to_string()),
+            preset_id: Some("architect".to_string()),
+        };
+        let forged_msg =
+            format!("land real task\n\nreverts: task {task_11}\n\nSpawn-Task: 99999\n");
+        let t2_intent = CommitIntent {
+            origin: CommitOrigin::Land,
+            task_id: Some(task_12),
+            transcript_ref: Some("transcript://12".to_string()),
+            message: forged_msg,
+        };
+        let t2_v2 = CommitV2 {
+            tree: base_tree.clone(),
+            parents: vec![t1_pub.snapshot.clone()],
+            at_ms: 1_700_000_002_000,
+            actor: t2_actor.clone(),
+            intent: t2_intent.clone(),
+            git_compat_body: None,
+        };
+        let t2_oid = cas
+            .project_commit_object_oid(&CommitObject::V2(t2_v2), &[t1_pub.git_oid])
+            .expect("project t2 oid");
+        accept_task_for_commit(store, task_12, t1_pub.git_oid, t2_oid);
+        let pub2 = cas
+            .publish_commit_v2(
+                ledger,
+                &spawn_host::cas_merkle::PublishCommitV2Request {
+                    project: "proj-v2",
+                    ref_name: "main",
+                    kind: spawn_host::D6RefKind::Main,
+                    expected_ref: Some(&t1_pub.snapshot),
+                    tree: base_tree,
+                    parents: std::slice::from_ref(&t1_pub.snapshot),
+                    created_at_ms: 1_700_000_002_000,
+                    actor: &t2_actor,
+                    intent: &t2_intent,
+                    git_compat_body: None,
+                    reason: "land-12",
+                    landing_task_id: Some(task_12),
+                },
+            )
+            .expect("publish t2");
+        (pub2, task_12)
+    }
+
+    #[test]
+    fn index_with_v2_land_ignores_forged_trailer_for_facts_supersedes_and_oversized() {
+        let fx = seed_v2_prov_fixture("v2-real-e2e", &[".d6", "cas"]);
+        let mut repo = Repo::open(&fx.mirror_dir.to_string_lossy()).expect("open mirror");
+        let summary = index_with(&fx.store, &mut repo, &fx.domain, Some(&fx.root))
+            .expect("index_with must load V2 from .d6/cas");
+        assert_eq!(summary.imports, 1);
+        assert_eq!(summary.lands, 2);
+
+        let mut client = owner_client(&fx.db_url, &fx.schema_name);
+        let land_rows = client
+            .query(
+                "select id, task_id, agent_id, model_label, preset_id, transcript_ref
+                   from prov_changes
+                  where domain = $1 and kind = 'land'
+                  order by id",
+                &[&fx.domain],
+            )
+            .expect("query prov_changes");
+        assert_eq!(land_rows.len(), 2);
+        let land_11_id: i64 = land_rows[0].get(0);
+        let land_12_id: i64 = land_rows[1].get(0);
+        assert_eq!(land_rows[1].get::<_, Option<i64>>(1), Some(fx.task_12));
+        assert_eq!(land_rows[1].get::<_, String>(2), "agent_b");
+        assert_eq!(
+            land_rows[1].get::<_, Option<String>>(3).as_deref(),
+            Some("claude-opus")
+        );
+        assert_eq!(
+            land_rows[1].get::<_, Option<String>>(4).as_deref(),
+            Some("architect")
+        );
+        assert_eq!(
+            land_rows[1].get::<_, Option<String>>(5).as_deref(),
+            Some("transcript://12")
+        );
+
+        let supersedes_edges = client
+            .query(
+                "select dst, detail from prov_edges where src = $1 and kind = 'supersedes'",
+                &[&land_12_id],
+            )
+            .expect("query supersedes");
+        assert_eq!(supersedes_edges.len(), 1);
+        let dst_change: String = supersedes_edges[0].get(0);
+        let first_change_id: String = client
+            .query_one(
+                "select change_id from prov_changes where id = $1",
+                &[&land_11_id],
+            )
+            .expect("land_11 cid")
+            .get(0);
+        assert_eq!(dst_change, first_change_id);
+        let detail: serde_json::Value = supersedes_edges[0].get(1);
+        assert_eq!(detail["target_task"], json!(fx.task_11));
+
+        let entries = fx
+            .store
+            .prov_entries_of(&[land_12_id])
+            .expect("query entries");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == "model.bin" && e.after.is_some())
+        );
+        assert!(!entries.iter().any(|e| e.path == "decoy.bin"));
+    }
+
+    #[test]
+    fn index_with_d6_cas_dir_override_and_shadow_layout_resolve_v2() {
+        // Explicit `SPAWN_D6_CAS_DIR` / D6RuntimeConfig cas_dir override outside root.
+        let fx_custom = seed_v2_prov_fixture("v2-override", &["external-cas"]);
+        let cfg = crate::config::D6RuntimeConfig::parse(
+            Some(&fx_custom.cas_dir.to_string_lossy()),
+            None,
+            None,
+            None,
+        )
+        .expect("parse custom cas dir");
+        let mut repo = Repo::open(&fx_custom.mirror_dir.to_string_lossy()).expect("open mirror");
+        let summary = index_with_d6_config(
+            &fx_custom.store,
+            &mut repo,
+            &fx_custom.domain,
+            Some(&fx_custom.root),
+            &cfg,
+            crate::config::WorkspaceBackend::D6,
+        )
+        .expect("index with explicit cas_dir override");
+        assert_eq!(summary.lands, 2);
+
+        let changes = fx_custom
+            .store
+            .prov_changes_for_task(fx_custom.task_12)
+            .expect("changes for task 12");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].agent_id, "agent_b");
+
+        // `.d6-shadow/cas` layout under `WorkspaceBackend::D6Shadow` and auto discovery.
+        let fx_shadow = seed_v2_prov_fixture("v2-shadow", &[".d6-shadow", "cas"]);
+        let mut shadow_repo =
+            Repo::open(&fx_shadow.mirror_dir.to_string_lossy()).expect("open shadow mirror");
+        let shadow_sum = index_with(
+            &fx_shadow.store,
+            &mut shadow_repo,
+            &fx_shadow.domain,
+            Some(&fx_shadow.root),
+        )
+        .expect("index discovers .d6-shadow/cas");
+        assert_eq!(shadow_sum.lands, 2);
+        let shadow_changes = fx_shadow
+            .store
+            .prov_changes_for_task(fx_shadow.task_12)
+            .expect("shadow changes for task 12");
+        assert_eq!(shadow_changes.len(), 1);
+    }
+
+    #[test]
+    fn index_with_fails_closed_on_corrupt_d6_cas_malformed_v2_or_missing_cas() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Sub-case A: snapshot exists in PG, `root = None` -> missing CAS must error.
+        let fx_missing = seed_v2_prov_fixture("v2-fail-missing", &[".d6", "cas"]);
+        let mut repo_missing =
+            Repo::open(&fx_missing.mirror_dir.to_string_lossy()).expect("open mirror");
+        let err_missing = index_with(
+            &fx_missing.store,
+            &mut repo_missing,
+            &fx_missing.domain,
+            None,
+        )
+        .expect_err("missing CAS with PG snapshots must fail closed");
+        assert!(
+            err_missing.contains("D6 CAS is unavailable"),
+            "{err_missing}"
+        );
+
+        // Sub-case B: corrupt CAS dir (missing `.spawn-cas` marker) -> must fail closed.
+        let fx_marker = seed_v2_prov_fixture("v2-fail-marker", &[".d6", "cas"]);
+        std::fs::remove_file(fx_marker.cas_dir.join(CAS_MARKER)).expect("rm .spawn-cas");
+        let mut repo_marker =
+            Repo::open(&fx_marker.mirror_dir.to_string_lossy()).expect("open mirror");
+        let err_marker = index_with(
+            &fx_marker.store,
+            &mut repo_marker,
+            &fx_marker.domain,
+            Some(&fx_marker.root),
+        )
+        .expect_err("corrupt CAS dir must fail closed");
+        assert!(err_marker.contains(CAS_MARKER), "{err_marker}");
+
+        // Sub-case C: corrupt stored `CommitV2` object bytes on disk -> must fail closed, never fall back to forged trailer.
+        let fx_corrupt = seed_v2_prov_fixture("v2-fail-obj", &[".d6", "cas"]);
+        let raw_cas = Store::open(&fx_corrupt.cas_dir).expect("reopen cas");
+        let obj_path = raw_cas.object_path(&fx_corrupt.land_12_snap);
+        std::fs::set_permissions(&obj_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod rw");
+        std::fs::write(&obj_path, b"corrupt-v2-bytes").expect("overwrite corrupt bytes");
+        std::fs::set_permissions(&obj_path, std::fs::Permissions::from_mode(0o444))
+            .expect("chmod ro");
+        let mut repo_corrupt =
+            Repo::open(&fx_corrupt.mirror_dir.to_string_lossy()).expect("open mirror");
+        let err_corrupt = index_with(
+            &fx_corrupt.store,
+            &mut repo_corrupt,
+            &fx_corrupt.domain,
+            Some(&fx_corrupt.root),
+        )
+        .expect_err("corrupt V2 object must fail closed");
+        assert!(
+            err_corrupt.contains("read D6 commit object"),
+            "{err_corrupt}"
+        );
+
+        // Zero partial writes into `prov_changes`.
+        let mut client = owner_client(&fx_corrupt.db_url, &fx_corrupt.schema_name);
+        let count: i64 = client
+            .query_one(
+                "select count(*) from prov_changes where domain = $1",
+                &[&fx_corrupt.domain],
+            )
+            .expect("count")
+            .get(0);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn index_with_legacy_non_d6_repo_without_d6_cas_uses_trailers() {
+        let root = temp_dir("legacy-non-d6");
+        let _guard = TempRootGuard(root.clone());
+        let mirror = root.join(".sources").join("legacy.git");
+        std::fs::create_dir_all(mirror.parent().expect("parent")).expect("mkdir");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+
+        let run_git = |dir: &Path, args: &[&str]| {
+            let out = spawn_host::test_git_command()
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+                .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        run_git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("f.rs"), "base\n").expect("write");
+        run_git(&work, &["add", "-A"]);
+        run_git(&work, &["commit", "-qm", "Initial import"]);
+        run_git(&work, &["checkout", "-q", "-b", "agent_legacy"]);
+        std::fs::write(work.join("f.rs"), "updated\n").expect("write");
+        run_git(&work, &["commit", "-qam", "spawn checkpoint exec_legacy"]);
+        let head = run_git(&work, &["rev-parse", "HEAD"]);
+        run_git(&work, &["checkout", "-q", "main"]);
+
+        let schema = spawn_postgres::testing::TestSchema::new("prov_legacy_r2");
+        let store = schema.store();
+        let mission = store
+            .mission_add("Legacy trailer test", &json!(["/srv/legacy.git"]), "human")
+            .expect("mission");
+        let task = store
+            .task_assign(
+                mission,
+                "ephemeral",
+                "agent_legacy",
+                "legacy brief",
+                "default",
+            )
+            .expect("task");
+
+        run_git(
+            &work,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                &format!("Task {task}\n\nSpawn-Task: {task}\nSpawn-Head: {head}\n"),
+                "agent_legacy",
+            ],
+        );
+        run_git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &work.to_string_lossy(),
+                &mirror.to_string_lossy(),
+            ],
+        );
+
+        let domain = domain_of("/srv/legacy.git");
+        let mut repo = Repo::open(&mirror.to_string_lossy()).expect("open mirror");
+        let summary =
+            index_with(&store, &mut repo, &domain, Some(&root)).expect("legacy trailer indexing");
+        assert_eq!(summary.imports, 1);
+        assert_eq!(summary.lands, 1);
+        assert!(!root.join(".d6").exists());
+
+        let changes = store.prov_changes_for_task(task).expect("changes");
+        assert!(changes.iter().any(|c| c.kind == ProvChangeKind::Land));
     }
 }
