@@ -10,12 +10,199 @@ import {
   isAbortError,
   type SessionRole,
 } from "./token.ts";
+import { tr, type Locale } from "./i18n.ts";
 
 // ---------------------------------------------------------------------------
-// Wire Domain Types (mirroring crates/spawn-core/src/tui.rs)
+// Wire Domain Types (mirroring crates/spawn-core/src/tui.rs & agent_events.rs)
 // ---------------------------------------------------------------------------
 
 export type AgentStatus = "idle" | "working" | "blocked" | "unknown";
+
+export type SessionFileFormat =
+  | "claude_jsonl"
+  | "codex_rollout_jsonl"
+  | "agy_full_jsonl"
+  | "opencode_jsonl"
+  | "generic_jsonl";
+
+export type SessionDiscoveryMethod =
+  | "process_open_fd"
+  | "process_env_and_cwd"
+  | "driver_hint";
+
+export type DiscoveryConfidence =
+  | "exact_fd"
+  | "matched_metadata"
+  | "heuristic_recent";
+
+export interface SessionAttachment {
+  path: string;
+  format: SessionFileFormat;
+  method: SessionDiscoveryMethod;
+  confidence: DiscoveryConfidence;
+  native_session_id: string | null;
+  cwd: string | null;
+}
+
+export type SessionDiscoveryStatus =
+  | {
+      status: "attached";
+      method: SessionDiscoveryMethod;
+      confidence: DiscoveryConfidence;
+    }
+  | { status: "no_live_pid" }
+  | { status: "remote_terminal_unscanned" }
+  | { status: "no_matching_session_file"; scanned_roots: number }
+  | { status: "read_failed"; reason: string };
+
+export interface TerminalTelemetrySummary {
+  process_count: number;
+  child_count: number;
+  total_rss_kib: number;
+  active_command: string | null;
+  discovery_status: SessionDiscoveryStatus;
+  session_bytes: number | null;
+  session_mtime_ms: number | null;
+}
+
+export type EventOrigin = "herdr_pty" | "native_session" | "spawn_control";
+
+export type EventFidelity = "screen_only" | "control_only" | "session_enriched";
+
+export type ObservabilitySource =
+  | "herdr_pty"
+  | "native_session"
+  | "spawn_control"
+  | "proc_tree"
+  | "osc7501";
+
+export interface ProcessNode {
+  pid: number;
+  ppid: number;
+  comm: string;
+  state: string;
+  rss_kib: number;
+  command: string;
+}
+
+export interface ProcessTreeTelemetry {
+  leader_pid: number;
+  process_count: number;
+  child_count: number;
+  total_rss_kib: number;
+  active_leaf_command: string | null;
+  processes: ProcessNode[];
+}
+
+export interface InFlightTool {
+  tool_call_id: string | null;
+  tool_name: string;
+  summary: string;
+  started_at_ms: number | null;
+}
+
+export interface UsageTotals {
+  last_model: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+}
+
+export type AgentHealth =
+  | { health: "healthy" }
+  | { health: "busy" }
+  | { health: "blocked"; rule: string }
+  | { health: "stalled"; silent_ms: number }
+  | { health: "erroring"; error_count: number }
+  | { health: "degraded"; reason: string }
+  | { health: "exited" };
+
+export interface AgentObservabilitySummary {
+  health: AgentHealth;
+  discovery_status: SessionDiscoveryStatus;
+  sources_observed: ObservabilitySource[];
+  turn_count: number;
+  tool_call_count: number;
+  tool_error_count: number;
+  error_count: number;
+  blocked_count: number;
+  in_flight_tools: InFlightTool[];
+  usage_totals: UsageTotals;
+  first_event_at_ms: number | null;
+  last_event_at_ms: number | null;
+  last_tool_name: string | null;
+  last_error: string | null;
+}
+
+export type FusedEventKind =
+  | {
+      kind: "session_meta";
+      engine: string | null;
+      cli_version: string | null;
+      cwd: string | null;
+      model: string | null;
+    }
+  | { kind: "turn_started"; turn_id: string | null }
+  | {
+      kind: "turn_completed";
+      turn_id: string | null;
+      duration_ms: number | null;
+      error: string | null;
+    }
+  | { kind: "user_input"; summary: string }
+  | { kind: "thinking"; summary: string; duration_ms: number | null }
+  | { kind: "assistant_message"; summary: string }
+  | {
+      kind: "tool_started";
+      tool_call_id: string | null;
+      tool_name: string;
+      summary: string;
+    }
+  | {
+      kind: "tool_completed";
+      tool_call_id: string | null;
+      tool_name: string;
+      ok: boolean;
+      duration_ms: number | null;
+      summary: string;
+    }
+  | {
+      kind: "usage_recorded";
+      model: string | null;
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_tokens: number;
+      cache_write_tokens: number;
+      cumulative: boolean;
+    }
+  | { kind: "prompt_blocked"; rule: string; choices_count: number }
+  | { kind: "process_state"; status: string; rule: string | null }
+  | { kind: "error_observed"; message: string };
+
+export interface FusedAgentEvent {
+  canonical_key: string;
+  timestamp_ms: number | null;
+  fidelity: EventFidelity;
+  origins: EventOrigin[];
+  kind: FusedEventKind;
+  session_id: string | null;
+  terminal_address: string | null;
+}
+
+export interface FusedEventsReport {
+  address: string;
+  engine: string | null;
+  session: SessionAttachment | null;
+  fidelity: EventFidelity;
+  summary: AgentObservabilitySummary;
+  process_tree: ProcessTreeTelemetry | null;
+  latest_key: string | null;
+  cursor_reset: boolean;
+  count: number;
+  truncated: boolean;
+  events: FusedAgentEvent[];
+}
 
 export type TerminalOrigin =
   | {
@@ -49,6 +236,8 @@ export interface DiscoveredTerminal {
   rows: number;
   agent: string | null;
   agent_status: AgentStatus;
+  session?: SessionAttachment | null;
+  telemetry?: TerminalTelemetrySummary | null;
   turn: number;
   keep: boolean;
 }
@@ -320,6 +509,22 @@ export function parseKeyChordList(
   return { ok: true, keys: normalized };
 }
 
+export const MAX_AFTER_KEY_BYTES = 256;
+export const DEFAULT_AGENT_EVENTS_LIMIT = 100;
+export const MAX_AGENT_EVENTS_LIMIT = 1000;
+export const MAX_RETAINED_AGENT_EVENTS = 250;
+
+const AFTER_KEY_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
+const UTF8_ENCODER = new TextEncoder();
+
+/** Mirrors `parse_agent_after_key_query` in `crates/spawn-cli/src/serve.rs`. */
+export function validateAfterKey(raw: string): boolean {
+  if (raw.length === 0 || AFTER_KEY_CONTROL_RE.test(raw)) {
+    return false;
+  }
+  return UTF8_ENCODER.encode(raw).length <= MAX_AFTER_KEY_BYTES;
+}
+
 export function agentsListUrl(includeAll: boolean): string {
   return includeAll ? "/api/agents?all=true" : "/api/agents";
 }
@@ -329,6 +534,37 @@ export function agentSnapshotUrl(address: string): string {
     throw new Error(`invalid terminal address: ${address}`);
   }
   return `/api/agents/${encodeURIComponent(address)}/snapshot`;
+}
+
+export function agentEventsUrl(
+  address: string,
+  options: { limit?: number; afterKey?: string | null } = {},
+): string {
+  if (!validateTerminalAddress(address)) {
+    throw new Error(`invalid terminal address: ${address}`);
+  }
+  const params = new URLSearchParams();
+  if (options.limit !== undefined) {
+    if (
+      !Number.isInteger(options.limit) ||
+      options.limit < 1 ||
+      options.limit > MAX_AGENT_EVENTS_LIMIT
+    ) {
+      throw new Error(
+        `limit must be an integer between 1 and ${MAX_AGENT_EVENTS_LIMIT}`,
+      );
+    }
+    params.set("limit", String(options.limit));
+  }
+  if (options.afterKey !== undefined && options.afterKey !== null) {
+    if (!validateAfterKey(options.afterKey)) {
+      throw new Error(`invalid after_key cursor: ${options.afterKey}`);
+    }
+    params.set("after_key", options.afterKey);
+  }
+  const query = params.toString();
+  const base = `/api/agents/${encodeURIComponent(address)}/events`;
+  return query.length > 0 ? `${base}?${query}` : base;
 }
 
 export function agentActionUrl(address: string): string {
@@ -475,13 +711,113 @@ function parseLabels(value: unknown, label: string): Record<string, string> {
   return out;
 }
 
+function parseSessionFileFormat(value: unknown, label: string): SessionFileFormat {
+  if (
+    value === "claude_jsonl" ||
+    value === "codex_rollout_jsonl" ||
+    value === "agy_full_jsonl" ||
+    value === "opencode_jsonl" ||
+    value === "generic_jsonl"
+  ) {
+    return value;
+  }
+  throw new Error(`unexpected SessionFileFormat at ${label}: ${String(value)}`);
+}
+
+function parseSessionDiscoveryMethod(
+  value: unknown,
+  label: string,
+): SessionDiscoveryMethod {
+  if (
+    value === "process_open_fd" ||
+    value === "process_env_and_cwd" ||
+    value === "driver_hint"
+  ) {
+    return value;
+  }
+  throw new Error(`unexpected SessionDiscoveryMethod at ${label}: ${String(value)}`);
+}
+
+function parseDiscoveryConfidence(value: unknown, label: string): DiscoveryConfidence {
+  if (
+    value === "exact_fd" ||
+    value === "matched_metadata" ||
+    value === "heuristic_recent"
+  ) {
+    return value;
+  }
+  throw new Error(`unexpected DiscoveryConfidence at ${label}: ${String(value)}`);
+}
+
+function parseSessionAttachment(value: unknown, label: string): SessionAttachment {
+  const obj = requireObject(value, label);
+  return {
+    path: requireString(obj, "path", label),
+    format: parseSessionFileFormat(obj.format, `${label}.format`),
+    method: parseSessionDiscoveryMethod(obj.method, `${label}.method`),
+    confidence: parseDiscoveryConfidence(obj.confidence, `${label}.confidence`),
+    native_session_id: requireOptionalString(obj, "native_session_id", label),
+    cwd: requireOptionalString(obj, "cwd", label),
+  };
+}
+
+function parseSessionDiscoveryStatus(
+  value: unknown,
+  label: string,
+): SessionDiscoveryStatus {
+  const obj = requireObject(value, label);
+  const status = requireString(obj, "status", label);
+  if (status === "attached") {
+    return {
+      status: "attached",
+      method: parseSessionDiscoveryMethod(obj.method, `${label}.method`),
+      confidence: parseDiscoveryConfidence(obj.confidence, `${label}.confidence`),
+    };
+  }
+  if (status === "no_live_pid" || status === "remote_terminal_unscanned") {
+    return { status };
+  }
+  if (status === "no_matching_session_file") {
+    return {
+      status: "no_matching_session_file",
+      scanned_roots: requireNumber(obj, "scanned_roots", label),
+    };
+  }
+  if (status === "read_failed") {
+    return {
+      status: "read_failed",
+      reason: requireString(obj, "reason", label),
+    };
+  }
+  throw new Error(`unexpected SessionDiscoveryStatus at ${label}: ${status}`);
+}
+
+function parseTerminalTelemetrySummary(
+  value: unknown,
+  label: string,
+): TerminalTelemetrySummary {
+  const obj = requireObject(value, label);
+  return {
+    process_count: requireNumber(obj, "process_count", label),
+    child_count: requireNumber(obj, "child_count", label),
+    total_rss_kib: requireNumber(obj, "total_rss_kib", label),
+    active_command: requireOptionalString(obj, "active_command", label),
+    discovery_status: parseSessionDiscoveryStatus(
+      obj.discovery_status,
+      `${label}.discovery_status`,
+    ),
+    session_bytes: requireOptionalNumber(obj, "session_bytes", label),
+    session_mtime_ms: requireOptionalNumber(obj, "session_mtime_ms", label),
+  };
+}
+
 function parseDiscoveredTerminal(value: unknown, label: string): DiscoveredTerminal {
   const obj = requireObject(value, label);
   const address = requireString(obj, "address", label);
   if (!validateTerminalAddress(address)) {
     throw new Error(`invalid terminal address at ${label}: ${address}`);
   }
-  return {
+  const parsed: DiscoveredTerminal = {
     address,
     machine: requireOptionalString(obj, "machine", label),
     name: requireOptionalString(obj, "name", label),
@@ -498,6 +834,16 @@ function parseDiscoveredTerminal(value: unknown, label: string): DiscoveredTermi
     turn: requireNumber(obj, "turn", label),
     keep: requireBoolean(obj, "keep", label),
   };
+  if (obj.session !== undefined && obj.session !== null) {
+    parsed.session = parseSessionAttachment(obj.session, `${label}.session`);
+  }
+  if (obj.telemetry !== undefined && obj.telemetry !== null) {
+    parsed.telemetry = parseTerminalTelemetrySummary(
+      obj.telemetry,
+      `${label}.telemetry`,
+    );
+  }
+  return parsed;
 }
 
 /** Parse `{ agents, count }` returned by `GET /api/agents`. */
@@ -684,6 +1030,301 @@ export function parseTuiActionOutcome(raw: unknown): TuiActionOutcome {
     };
   }
   throw new Error(`unexpected TuiActionOutcome kind: ${kind}`);
+}
+
+function parseEventOrigin(value: unknown, label: string): EventOrigin {
+  if (
+    value === "herdr_pty" ||
+    value === "native_session" ||
+    value === "spawn_control"
+  ) {
+    return value;
+  }
+  throw new Error(`unexpected EventOrigin at ${label}: ${String(value)}`);
+}
+
+function parseEventFidelity(value: unknown, label: string): EventFidelity {
+  if (
+    value === "screen_only" ||
+    value === "control_only" ||
+    value === "session_enriched"
+  ) {
+    return value;
+  }
+  throw new Error(`unexpected EventFidelity at ${label}: ${String(value)}`);
+}
+
+function parseObservabilitySource(
+  value: unknown,
+  label: string,
+): ObservabilitySource {
+  if (
+    value === "herdr_pty" ||
+    value === "native_session" ||
+    value === "spawn_control" ||
+    value === "proc_tree" ||
+    value === "osc7501"
+  ) {
+    return value;
+  }
+  throw new Error(`unexpected ObservabilitySource at ${label}: ${String(value)}`);
+}
+
+function parseProcessNode(value: unknown, label: string): ProcessNode {
+  const obj = requireObject(value, label);
+  return {
+    pid: requireNumber(obj, "pid", label),
+    ppid: requireNumber(obj, "ppid", label),
+    comm: requireString(obj, "comm", label),
+    state: requireString(obj, "state", label),
+    rss_kib: requireNumber(obj, "rss_kib", label),
+    command: requireString(obj, "command", label),
+  };
+}
+
+function parseProcessTreeTelemetry(
+  value: unknown,
+  label: string,
+): ProcessTreeTelemetry {
+  const obj = requireObject(value, label);
+  const rawProcesses = obj.processes ?? [];
+  if (!Array.isArray(rawProcesses)) {
+    throw new Error(`expected array at ${label}.processes`);
+  }
+  return {
+    leader_pid: requireNumber(obj, "leader_pid", label),
+    process_count: requireNumber(obj, "process_count", label),
+    child_count: requireNumber(obj, "child_count", label),
+    total_rss_kib: requireNumber(obj, "total_rss_kib", label),
+    active_leaf_command: requireOptionalString(obj, "active_leaf_command", label),
+    processes: rawProcesses.map((entry, idx) =>
+      parseProcessNode(entry, `${label}.processes[${idx}]`),
+    ),
+  };
+}
+
+function parseInFlightTool(value: unknown, label: string): InFlightTool {
+  const obj = requireObject(value, label);
+  return {
+    tool_call_id: requireOptionalString(obj, "tool_call_id", label),
+    tool_name: requireString(obj, "tool_name", label),
+    summary: requireString(obj, "summary", label),
+    started_at_ms: requireOptionalNumber(obj, "started_at_ms", label),
+  };
+}
+
+function parseUsageTotals(value: unknown, label: string): UsageTotals {
+  const obj = requireObject(value, label);
+  return {
+    last_model: requireOptionalString(obj, "last_model", label),
+    input_tokens: requireNumber(obj, "input_tokens", label),
+    output_tokens: requireNumber(obj, "output_tokens", label),
+    cache_read_tokens: requireNumber(obj, "cache_read_tokens", label),
+    cache_write_tokens: requireNumber(obj, "cache_write_tokens", label),
+  };
+}
+
+function parseAgentHealth(value: unknown, label: string): AgentHealth {
+  const obj = requireObject(value, label);
+  const health = requireString(obj, "health", label);
+  if (health === "healthy" || health === "busy" || health === "exited") {
+    return { health };
+  }
+  if (health === "blocked") {
+    return { health: "blocked", rule: requireString(obj, "rule", label) };
+  }
+  if (health === "stalled") {
+    return { health: "stalled", silent_ms: requireNumber(obj, "silent_ms", label) };
+  }
+  if (health === "erroring") {
+    return {
+      health: "erroring",
+      error_count: requireNumber(obj, "error_count", label),
+    };
+  }
+  if (health === "degraded") {
+    return { health: "degraded", reason: requireString(obj, "reason", label) };
+  }
+  throw new Error(`unexpected AgentHealth at ${label}: ${health}`);
+}
+
+function parseObservabilitySummary(
+  value: unknown,
+  label: string,
+): AgentObservabilitySummary {
+  const obj = requireObject(value, label);
+  if (!Array.isArray(obj.sources_observed)) {
+    throw new Error(`expected array at ${label}.sources_observed`);
+  }
+  const rawTools = obj.in_flight_tools ?? [];
+  if (!Array.isArray(rawTools)) {
+    throw new Error(`expected array at ${label}.in_flight_tools`);
+  }
+  return {
+    health: parseAgentHealth(obj.health, `${label}.health`),
+    discovery_status: parseSessionDiscoveryStatus(
+      obj.discovery_status,
+      `${label}.discovery_status`,
+    ),
+    sources_observed: obj.sources_observed.map((entry, idx) =>
+      parseObservabilitySource(entry, `${label}.sources_observed[${idx}]`),
+    ),
+    turn_count: requireNumber(obj, "turn_count", label),
+    tool_call_count: requireNumber(obj, "tool_call_count", label),
+    tool_error_count: requireNumber(obj, "tool_error_count", label),
+    error_count: requireNumber(obj, "error_count", label),
+    blocked_count: requireNumber(obj, "blocked_count", label),
+    in_flight_tools: rawTools.map((entry, idx) =>
+      parseInFlightTool(entry, `${label}.in_flight_tools[${idx}]`),
+    ),
+    usage_totals: parseUsageTotals(obj.usage_totals, `${label}.usage_totals`),
+    first_event_at_ms: requireOptionalNumber(obj, "first_event_at_ms", label),
+    last_event_at_ms: requireOptionalNumber(obj, "last_event_at_ms", label),
+    last_tool_name: requireOptionalString(obj, "last_tool_name", label),
+    last_error: requireOptionalString(obj, "last_error", label),
+  };
+}
+
+function parseFusedEventKind(value: unknown, label: string): FusedEventKind {
+  const obj = requireObject(value, label);
+  const kind = requireString(obj, "kind", label);
+  switch (kind) {
+    case "session_meta":
+      return {
+        kind,
+        engine: requireOptionalString(obj, "engine", label),
+        cli_version: requireOptionalString(obj, "cli_version", label),
+        cwd: requireOptionalString(obj, "cwd", label),
+        model: requireOptionalString(obj, "model", label),
+      };
+    case "turn_started":
+      return {
+        kind,
+        turn_id: requireOptionalString(obj, "turn_id", label),
+      };
+    case "turn_completed":
+      return {
+        kind,
+        turn_id: requireOptionalString(obj, "turn_id", label),
+        duration_ms: requireOptionalNumber(obj, "duration_ms", label),
+        error: requireOptionalString(obj, "error", label),
+      };
+    case "user_input":
+      return { kind, summary: requireString(obj, "summary", label) };
+    case "thinking":
+      return {
+        kind,
+        summary: requireString(obj, "summary", label),
+        duration_ms: requireOptionalNumber(obj, "duration_ms", label),
+      };
+    case "assistant_message":
+      return { kind, summary: requireString(obj, "summary", label) };
+    case "tool_started":
+      return {
+        kind,
+        tool_call_id: requireOptionalString(obj, "tool_call_id", label),
+        tool_name: requireString(obj, "tool_name", label),
+        summary: requireString(obj, "summary", label),
+      };
+    case "tool_completed":
+      return {
+        kind,
+        tool_call_id: requireOptionalString(obj, "tool_call_id", label),
+        tool_name: requireString(obj, "tool_name", label),
+        ok: requireBoolean(obj, "ok", label),
+        duration_ms: requireOptionalNumber(obj, "duration_ms", label),
+        summary: requireString(obj, "summary", label),
+      };
+    case "usage_recorded": {
+      const cumRaw = obj.cumulative;
+      if (cumRaw !== undefined && typeof cumRaw !== "boolean") {
+        throw new Error(`expected boolean at ${label}.cumulative`);
+      }
+      return {
+        kind,
+        model: requireOptionalString(obj, "model", label),
+        input_tokens: requireNumber(obj, "input_tokens", label),
+        output_tokens: requireNumber(obj, "output_tokens", label),
+        cache_read_tokens: requireNumber(obj, "cache_read_tokens", label),
+        cache_write_tokens: requireNumber(obj, "cache_write_tokens", label),
+        cumulative: cumRaw ?? false,
+      };
+    }
+    case "prompt_blocked":
+      return {
+        kind,
+        rule: requireString(obj, "rule", label),
+        choices_count: requireNumber(obj, "choices_count", label),
+      };
+    case "process_state":
+      return {
+        kind,
+        status: requireString(obj, "status", label),
+        rule: requireOptionalString(obj, "rule", label),
+      };
+    case "error_observed":
+      return { kind, message: requireString(obj, "message", label) };
+    default:
+      throw new Error(`unexpected FusedEventKind at ${label}: ${kind}`);
+  }
+}
+
+function parseFusedAgentEvent(value: unknown, label: string): FusedAgentEvent {
+  const obj = requireObject(value, label);
+  if (!Array.isArray(obj.origins)) {
+    throw new Error(`expected array at ${label}.origins`);
+  }
+  return {
+    canonical_key: requireString(obj, "canonical_key", label),
+    timestamp_ms: requireOptionalNumber(obj, "timestamp_ms", label),
+    fidelity: parseEventFidelity(obj.fidelity, `${label}.fidelity`),
+    origins: obj.origins.map((entry, idx) =>
+      parseEventOrigin(entry, `${label}.origins[${idx}]`),
+    ),
+    kind: parseFusedEventKind(obj.kind, `${label}.kind`),
+    session_id: requireOptionalString(obj, "session_id", label),
+    terminal_address: requireOptionalString(obj, "terminal_address", label),
+  };
+}
+
+/** Parse `FusedEventsReport` returned by `GET /api/agents/<addr>/events`. */
+export function parseFusedEventsReport(raw: unknown): FusedEventsReport {
+  const obj = requireObject(raw, "FusedEventsReport");
+  const address = requireString(obj, "address", "FusedEventsReport");
+  if (!validateTerminalAddress(address)) {
+    throw new Error(`invalid FusedEventsReport.address: ${address}`);
+  }
+  if (!Array.isArray(obj.events)) {
+    throw new Error("expected array FusedEventsReport.events");
+  }
+  const cursorResetRaw = obj.cursor_reset;
+  if (cursorResetRaw !== undefined && typeof cursorResetRaw !== "boolean") {
+    throw new Error("expected boolean FusedEventsReport.cursor_reset");
+  }
+  return {
+    address,
+    engine: requireOptionalString(obj, "engine", "FusedEventsReport"),
+    session:
+      obj.session === undefined || obj.session === null
+        ? null
+        : parseSessionAttachment(obj.session, "FusedEventsReport.session"),
+    fidelity: parseEventFidelity(obj.fidelity, "FusedEventsReport.fidelity"),
+    summary: parseObservabilitySummary(obj.summary, "FusedEventsReport.summary"),
+    process_tree:
+      obj.process_tree === undefined || obj.process_tree === null
+        ? null
+        : parseProcessTreeTelemetry(
+            obj.process_tree,
+            "FusedEventsReport.process_tree",
+          ),
+    latest_key: requireOptionalString(obj, "latest_key", "FusedEventsReport"),
+    cursor_reset: cursorResetRaw ?? false,
+    count: requireNumber(obj, "count", "FusedEventsReport"),
+    truncated: requireBoolean(obj, "truncated", "FusedEventsReport"),
+    events: obj.events.map((entry, idx) =>
+      parseFusedAgentEvent(entry, `FusedEventsReport.events[${idx}]`),
+    ),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +1582,48 @@ export async function fetchAgentSnapshotWithFetch(
     parseTuiSnapshot,
     options,
   );
+}
+
+export async function fetchAgentEventsWithFetch(
+  fetcher: AgentFetch,
+  headers: Record<string, string>,
+  address: string,
+  options: {
+    limit?: number;
+    afterKey?: string | null;
+    signal?: AbortSignal;
+    etagCache?: Map<string, AgentEtagEntry<FusedEventsReport>>;
+    bypassEtag?: boolean;
+    onUnauthorized?: () => void;
+  } = {},
+): Promise<AgentResult<FusedEventsReport>> {
+  if (!validateTerminalAddress(address)) {
+    return {
+      ok: false,
+      error: { kind: "bad_request", message: `非法终端地址：${address}` },
+    };
+  }
+  let url: string;
+  try {
+    url = agentEventsUrl(address, {
+      limit: options.limit,
+      afterKey: options.afterKey,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        kind: "bad_request",
+        message: err instanceof Error ? err.message : "非法事件流查询参数",
+      },
+    };
+  }
+  return getAgentJson(fetcher, headers, url, parseFusedEventsReport, {
+    signal: options.signal,
+    etagCache: options.etagCache,
+    bypassEtag: options.bypassEtag,
+    onUnauthorized: options.onUnauthorized,
+  });
 }
 
 export async function postAgentActionWithFetch(
@@ -1529,6 +2212,493 @@ export function snapshotFromState(
       : null;
   }
   return null;
+}
+
+export interface AgentEventsViewData {
+  address: string;
+  engine: string | null;
+  session: SessionAttachment | null;
+  fidelity: EventFidelity;
+  summary: AgentObservabilitySummary;
+  process_tree: ProcessTreeTelemetry | null;
+  latest_key: string | null;
+  events: FusedAgentEvent[];
+  truncated: boolean;
+  cursorResetCount: number;
+  lastCursorResetAtMs: number | null;
+  refreshedAtMs: number;
+}
+
+export type AgentEventsLoadState =
+  | { kind: "idle" }
+  | { kind: "loading"; address: string; previous: AgentEventsViewData | null }
+  | { kind: "ready"; address: string; data: AgentEventsViewData }
+  | { kind: "unauthorized"; address: string; message: string }
+  | { kind: "forbidden_external"; address: string; message: string }
+  | { kind: "not_found"; address: string; message: string }
+  | {
+      kind: "error";
+      address: string;
+      message: string;
+      previous: AgentEventsViewData | null;
+    };
+
+export type AgentEventsAction =
+  | { type: "cleared" }
+  | { type: "selected"; address: string }
+  | {
+      type: "fetch_succeeded";
+      address: string;
+      requestedAfterKey: string | null;
+      report: FusedEventsReport;
+      nowMs: number;
+      maxEvents?: number;
+    }
+  | { type: "fetch_failed"; address: string; error: AgentHttpError };
+
+function mergeFusedEvents(
+  previous: readonly FusedAgentEvent[],
+  incoming: readonly FusedAgentEvent[],
+  maxEvents: number,
+): FusedAgentEvent[] {
+  const cap = Math.max(1, maxEvents);
+  const merged = [...previous];
+  const indexByKey = new Map<string, number>();
+  for (let i = 0; i < merged.length; i += 1) {
+    indexByKey.set(merged[i].canonical_key, i);
+  }
+  for (const ev of incoming) {
+    const existingIdx = indexByKey.get(ev.canonical_key);
+    if (existingIdx !== undefined) {
+      merged[existingIdx] = ev;
+    } else {
+      indexByKey.set(ev.canonical_key, merged.length);
+      merged.push(ev);
+    }
+  }
+  if (merged.length <= cap) return merged;
+  return merged.slice(merged.length - cap);
+}
+
+function sameJsonValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+export function reduceAgentEvents(
+  state: AgentEventsLoadState,
+  action: AgentEventsAction,
+): AgentEventsLoadState {
+  switch (action.type) {
+    case "cleared":
+      return { kind: "idle" };
+    case "selected": {
+      if (state.kind === "ready" && state.address === action.address) {
+        return state;
+      }
+      const sameTarget =
+        (state.kind === "loading" || state.kind === "error") &&
+        state.address === action.address;
+      const previous = sameTarget ? state.previous : null;
+      return { kind: "loading", address: action.address, previous };
+    }
+    case "fetch_succeeded": {
+      if (action.report.address !== action.address) {
+        return state;
+      }
+      const prevData =
+        (state.kind === "ready" ||
+          state.kind === "loading" ||
+          state.kind === "error") &&
+        state.address === action.address
+          ? state.kind === "ready"
+            ? state.data
+            : state.previous
+          : null;
+      const maxEvents = action.maxEvents ?? MAX_RETAINED_AGENT_EVENTS;
+      const replaceWindow =
+        action.requestedAfterKey === null ||
+        action.report.cursor_reset ||
+        prevData === null;
+      const nextEvents = mergeFusedEvents(
+        replaceWindow ? [] : prevData.events,
+        action.report.events,
+        maxEvents,
+      );
+      const nextLatestKey =
+        action.report.latest_key !== null
+          ? action.report.latest_key
+          : replaceWindow
+            ? null
+            : (prevData?.latest_key ?? null);
+      const cursorResetCount =
+        (prevData?.cursorResetCount ?? 0) + (action.report.cursor_reset ? 1 : 0);
+      const lastCursorResetAtMs = action.report.cursor_reset
+        ? action.nowMs
+        : (prevData?.lastCursorResetAtMs ?? null);
+
+      if (
+        state.kind === "ready" &&
+        prevData !== null &&
+        !action.report.cursor_reset &&
+        action.report.events.length === 0 &&
+        nextLatestKey === prevData.latest_key &&
+        action.report.fidelity === prevData.fidelity &&
+        action.report.engine === prevData.engine &&
+        action.report.truncated === prevData.truncated &&
+        action.nowMs - prevData.refreshedAtMs < 15_000 &&
+        sameJsonValue(prevData.summary, action.report.summary) &&
+        sameJsonValue(prevData.process_tree, action.report.process_tree) &&
+        sameJsonValue(prevData.session, action.report.session)
+      ) {
+        return state;
+      }
+
+      return {
+        kind: "ready",
+        address: action.address,
+        data: {
+          address: action.address,
+          engine: action.report.engine,
+          session: action.report.session,
+          fidelity: action.report.fidelity,
+          summary: action.report.summary,
+          process_tree: action.report.process_tree,
+          latest_key: nextLatestKey,
+          events: nextEvents,
+          truncated: action.report.truncated,
+          cursorResetCount,
+          lastCursorResetAtMs,
+          refreshedAtMs: action.nowMs,
+        },
+      };
+    }
+    case "fetch_failed": {
+      if (action.error.kind === "unauthorized") {
+        return {
+          kind: "unauthorized",
+          address: action.address,
+          message: action.error.message,
+        };
+      }
+      if (
+        action.error.kind === "forbidden_external" ||
+        action.error.kind === "forbidden_origin"
+      ) {
+        return {
+          kind: "forbidden_external",
+          address: action.address,
+          message: action.error.message,
+        };
+      }
+      if (action.error.kind === "not_found") {
+        return {
+          kind: "not_found",
+          address: action.address,
+          message: action.error.message,
+        };
+      }
+      const samePrevious =
+        (state.kind === "ready" ||
+          state.kind === "loading" ||
+          state.kind === "error") &&
+        state.address === action.address
+          ? state.kind === "ready"
+            ? state.data
+            : state.previous
+          : null;
+      return {
+        kind: "error",
+        address: action.address,
+        message: action.error.message,
+        previous: samePrevious,
+      };
+    }
+  }
+}
+
+export function eventsDataFromState(
+  state: AgentEventsLoadState,
+  selectedAddress: string | null,
+): AgentEventsViewData | null {
+  if (selectedAddress === null) return null;
+  if (state.kind === "ready") {
+    return state.address === selectedAddress &&
+      state.data.address === selectedAddress
+      ? state.data
+      : null;
+  }
+  if (state.kind === "loading" || state.kind === "error") {
+    return state.address === selectedAddress &&
+      state.previous !== null &&
+      state.previous.address === selectedAddress
+      ? state.previous
+      : null;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Observability Formatting & View-Model Helpers (ZH / EN)
+// ---------------------------------------------------------------------------
+
+export type ObservabilityBadgeTone =
+  | "neutral"
+  | "info"
+  | "success"
+  | "warning"
+  | "danger"
+  | "purple";
+
+export function formatRssKib(kib: number): string {
+  const safe = Math.max(0, Math.round(kib));
+  if (safe < 1024) return `${safe} KiB`;
+  const mib = safe / 1024;
+  if (mib < 1024) {
+    return mib >= 100 ? `${Math.round(mib)} MiB` : `${mib.toFixed(1)} MiB`;
+  }
+  return `${(mib / 1024).toFixed(2)} GiB`;
+}
+
+export function formatTokenCount(tokens: number): string {
+  const safe = Math.max(0, Math.round(tokens));
+  if (safe < 1_000) return String(safe);
+  if (safe < 1_000_000) return `${(safe / 1_000).toFixed(1)}k`;
+  return `${(safe / 1_000_000).toFixed(2)}M`;
+}
+
+export function formatDurationCompact(ms: number): string {
+  const safe = Math.max(0, Math.round(ms));
+  if (safe < 1_000) return `${safe}ms`;
+  if (safe < 60_000) return `${(safe / 1_000).toFixed(1)}s`;
+  const mins = Math.floor(safe / 60_000);
+  const secs = Math.floor((safe % 60_000) / 1_000);
+  if (safe < 3_600_000) return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
+  const hrs = Math.floor(safe / 3_600_000);
+  const remMins = Math.floor((safe % 3_600_000) / 60_000);
+  return remMins > 0 ? `${hrs}h ${remMins}m` : `${hrs}h`;
+}
+
+export function describeAgentHealth(
+  health: AgentHealth,
+  locale: Locale,
+): {
+  label: string;
+  detail: string | null;
+  tone: ObservabilityBadgeTone;
+  live: boolean;
+} {
+  switch (health.health) {
+    case "healthy":
+      return {
+        label: tr(locale, "健康在线", "Healthy"),
+        detail: null,
+        tone: "success",
+        live: false,
+      };
+    case "busy":
+      return {
+        label: tr(locale, "运行中", "Busy"),
+        detail: null,
+        tone: "info",
+        live: true,
+      };
+    case "blocked":
+      return {
+        label: tr(locale, "等待确认", "Blocked"),
+        detail: health.rule,
+        tone: "warning",
+        live: false,
+      };
+    case "stalled":
+      return {
+        label: tr(locale, "疑似停滞", "Stalled"),
+        detail: tr(
+          locale,
+          `静默 ${formatDurationCompact(health.silent_ms)}`,
+          `silent ${formatDurationCompact(health.silent_ms)}`,
+        ),
+        tone: "warning",
+        live: false,
+      };
+    case "erroring":
+      return {
+        label: tr(locale, "异常出错", "Erroring"),
+        detail: tr(
+          locale,
+          `${health.error_count} 项错误`,
+          `${health.error_count} errors`,
+        ),
+        tone: "danger",
+        live: false,
+      };
+    case "degraded":
+      return {
+        label: tr(locale, "观测降级", "Degraded"),
+        detail: health.reason,
+        tone: "warning",
+        live: false,
+      };
+    case "exited":
+      return {
+        label: tr(locale, "已退出", "Exited"),
+        detail: null,
+        tone: "neutral",
+        live: false,
+      };
+  }
+}
+
+export function describeSessionDiscovery(
+  status: SessionDiscoveryStatus,
+  locale: Locale,
+): {
+  label: string;
+  detail: string | null;
+  tone: ObservabilityBadgeTone;
+} {
+  switch (status.status) {
+    case "attached":
+      return {
+        label: tr(locale, "已挂载会话", "Session Attached"),
+        detail: `${status.method} · ${status.confidence}`,
+        tone: "success",
+      };
+    case "no_live_pid":
+      return {
+        label: tr(locale, "无活跃 PID", "No Live PID"),
+        detail: null,
+        tone: "neutral",
+      };
+    case "remote_terminal_unscanned":
+      return {
+        label: tr(locale, "远端未扫描", "Remote Unscanned"),
+        detail: null,
+        tone: "info",
+      };
+    case "no_matching_session_file":
+      return {
+        label: tr(locale, "未匹配会话日志", "No Session File"),
+        detail: tr(
+          locale,
+          `已扫描 ${status.scanned_roots} 个目录`,
+          `scanned ${status.scanned_roots} roots`,
+        ),
+        tone: "neutral",
+      };
+    case "read_failed":
+      return {
+        label: tr(locale, "读取失败", "Read Failed"),
+        detail: status.reason,
+        tone: "warning",
+      };
+  }
+}
+
+export function describeFusedEvent(
+  event: FusedAgentEvent,
+  locale: Locale,
+): {
+  badge: string;
+  tone: ObservabilityBadgeTone;
+  text: string;
+  detail: string | null;
+} {
+  const k = event.kind;
+  switch (k.kind) {
+    case "session_meta":
+      return {
+        badge: "meta",
+        tone: "purple",
+        text: [k.engine, k.model, k.cli_version].filter(Boolean).join(" · ") || tr(locale, "会话元数据", "Session metadata"),
+        detail: k.cwd,
+      };
+    case "turn_started":
+      return {
+        badge: "turn+",
+        tone: "info",
+        text: tr(locale, "回合开始", "Turn started"),
+        detail: k.turn_id,
+      };
+    case "turn_completed":
+      return {
+        badge: k.error ? "turn!" : "turn✓",
+        tone: k.error ? "danger" : "success",
+        text: k.error
+          ? tr(locale, `回合失败：${k.error}`, `Turn failed: ${k.error}`)
+          : tr(locale, "回合完成", "Turn completed"),
+        detail: k.duration_ms !== null ? formatDurationCompact(k.duration_ms) : k.turn_id,
+      };
+    case "user_input":
+      return {
+        badge: tr(locale, "输入", "input"),
+        tone: "neutral",
+        text: k.summary,
+        detail: null,
+      };
+    case "thinking":
+      return {
+        badge: tr(locale, "思考", "think"),
+        tone: "purple",
+        text: k.summary,
+        detail: k.duration_ms !== null ? formatDurationCompact(k.duration_ms) : null,
+      };
+    case "assistant_message":
+      return {
+        badge: tr(locale, "回复", "reply"),
+        tone: "info",
+        text: k.summary,
+        detail: null,
+      };
+    case "tool_started":
+      return {
+        badge: `⚙ ${k.tool_name}`,
+        tone: "info",
+        text: k.summary || k.tool_name,
+        detail: k.tool_call_id,
+      };
+    case "tool_completed":
+      return {
+        badge: `${k.ok ? "✓" : "✕"} ${k.tool_name}`,
+        tone: k.ok ? "success" : "danger",
+        text: k.summary || k.tool_name,
+        detail: k.duration_ms !== null ? formatDurationCompact(k.duration_ms) : k.tool_call_id,
+      };
+    case "usage_recorded": {
+      const total = `${formatTokenCount(k.input_tokens)}/${formatTokenCount(k.output_tokens)}`;
+      return {
+        badge: k.cumulative ? "usage∑" : "usage",
+        tone: "neutral",
+        text: tr(
+          locale,
+          `输入/输出 ${total}${k.cache_read_tokens > 0 ? ` · 缓存读 ${formatTokenCount(k.cache_read_tokens)}` : ""}`,
+          `in/out ${total}${k.cache_read_tokens > 0 ? ` · cache ${formatTokenCount(k.cache_read_tokens)}` : ""}`,
+        ),
+        detail: k.model,
+      };
+    }
+    case "prompt_blocked":
+      return {
+        badge: tr(locale, "阻塞", "blocked"),
+        tone: "warning",
+        text: `${k.rule} (${k.choices_count})`,
+        detail: null,
+      };
+    case "process_state":
+      return {
+        badge: "proc",
+        tone: k.status === "exited" ? "neutral" : "info",
+        text: k.rule ? `${k.status} (${k.rule})` : k.status,
+        detail: null,
+      };
+    case "error_observed":
+      return {
+        badge: tr(locale, "错误", "error"),
+        tone: "danger",
+        text: k.message,
+        detail: null,
+      };
+  }
 }
 
 export type SendPolicyMode =

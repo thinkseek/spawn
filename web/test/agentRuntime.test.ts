@@ -3,35 +3,52 @@ import { test } from "node:test";
 
 import {
   agentActionUrl,
+  agentEventsUrl,
   agentSnapshotUrl,
   agentsListUrl,
   buildSendKeysAction,
   buildSendTextAction,
   classifyAgentHttpError,
   defaultSendPolicyMode,
+  describeAgentHealth,
+  describeFusedEvent,
+  describeSessionDiscovery,
   evaluateActionCapabilities,
+  eventsDataFromState,
+  fetchAgentEventsWithFetch,
   fetchAgentSnapshotWithFetch,
   fetchAgentsWithFetch,
+  formatDurationCompact,
+  formatRssKib,
+  formatTokenCount,
   isValidScreenGuard,
   normalizeKeyChord,
   parseAgentsListResponse,
+  parseFusedEventsReport,
   parseKeyChordList,
   parseStyledLine,
   parseTuiActionOutcome,
   parseTuiSnapshot,
   postAgentActionWithFetch,
   reduceAction,
+  reduceAgentEvents,
   reduceDiscovery,
   reduceSnapshot,
   snapshotFromState,
+  validateAfterKey,
   validateTerminalAddress,
   visibleAgentsForRole,
   type AgentDiscoveryState,
   type AgentEtagEntry,
+  type AgentEventsLoadState,
   type AgentFetch,
+  type AgentHealth,
   type AgentResponseLike,
   type AgentsListResponse,
   type DiscoveredTerminal,
+  type FusedAgentEvent,
+  type FusedEventsReport,
+  type SessionDiscoveryStatus,
   type SnapshotLoadState,
   type TuiSnapshot,
 } from "../src/agentRuntime.ts";
@@ -645,4 +662,476 @@ test("reduceSnapshot preserves snapshot identity across unchanged polls", () => 
     assert.equal(unchangedAfterWindow.snapshot, first);
     assert.equal(unchangedAfterWindow.capturedAtMs, 30_000);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Wave-AR AR-4A Observability Stream, Incremental Cursor & Telemetry Tests
+// ---------------------------------------------------------------------------
+
+function makeSampleEventsReport(
+  overrides: Partial<FusedEventsReport> = {},
+): FusedEventsReport {
+  return {
+    address: "t1",
+    engine: "claude",
+    session: {
+      path: "/home/tiger/.claude/projects/repo/sess-1.jsonl",
+      format: "claude_jsonl",
+      method: "process_open_fd",
+      confidence: "exact_fd",
+      native_session_id: "sess-1",
+      cwd: "/repo",
+    },
+    fidelity: "session_enriched",
+    summary: {
+      health: { health: "busy" },
+      discovery_status: {
+        status: "attached",
+        method: "process_open_fd",
+        confidence: "exact_fd",
+      },
+      sources_observed: ["herdr_pty", "native_session", "proc_tree"],
+      turn_count: 2,
+      tool_call_count: 3,
+      tool_error_count: 0,
+      error_count: 0,
+      blocked_count: 0,
+      in_flight_tools: [
+        {
+          tool_call_id: "toolu_1",
+          tool_name: "Bash",
+          summary: "cargo test -p spawn-core",
+          started_at_ms: 1_700_000_001_000,
+        },
+      ],
+      usage_totals: {
+        last_model: "claude-opus-4-6",
+        input_tokens: 12_400,
+        output_tokens: 1_850,
+        cache_read_tokens: 8_200,
+        cache_write_tokens: 400,
+      },
+      first_event_at_ms: 1_700_000_000_000,
+      last_event_at_ms: 1_700_000_002_000,
+      last_tool_name: "Bash",
+      last_error: null,
+    },
+    process_tree: {
+      leader_pid: 101,
+      process_count: 3,
+      child_count: 2,
+      total_rss_kib: 150 * 1024,
+      active_leaf_command: "cargo test -p spawn-core",
+      processes: [
+        {
+          pid: 101,
+          ppid: 100,
+          comm: "claude",
+          state: "S",
+          rss_kib: 100 * 1024,
+          command: "claude --resume sess-1",
+        },
+        {
+          pid: 102,
+          ppid: 101,
+          comm: "cargo",
+          state: "R",
+          rss_kib: 50 * 1024,
+          command: "cargo test -p spawn-core",
+        },
+      ],
+    },
+    latest_key: "native:ev-2",
+    cursor_reset: false,
+    count: 2,
+    truncated: false,
+    events: [
+      {
+        canonical_key: "native:ev-1",
+        timestamp_ms: 1_700_000_000_000,
+        fidelity: "session_enriched",
+        origins: ["native_session"],
+        kind: { kind: "user_input", summary: "run tests" },
+        session_id: "sess-1",
+        terminal_address: "t1",
+      },
+      {
+        canonical_key: "native:ev-2",
+        timestamp_ms: 1_700_000_001_000,
+        fidelity: "session_enriched",
+        origins: ["native_session"],
+        kind: {
+          kind: "tool_started",
+          tool_call_id: "toolu_1",
+          tool_name: "Bash",
+          summary: "cargo test -p spawn-core",
+        },
+        session_id: "sess-1",
+        terminal_address: "t1",
+      },
+    ],
+    ...overrides,
+  };
+}
+
+test("parseAgentsListResponse parses optional AR-4A session and telemetry fields cleanly", () => {
+  const payload = {
+    agents: [
+      {
+        ...sampleDiscoveredTerminals()[0],
+        session: {
+          path: "/home/tiger/.claude/projects/repo/sess-1.jsonl",
+          format: "claude_jsonl",
+          method: "process_open_fd",
+          confidence: "exact_fd",
+          native_session_id: "sess-1",
+          cwd: "/repo",
+        },
+        telemetry: {
+          process_count: 3,
+          child_count: 2,
+          total_rss_kib: 153600,
+          active_command: "cargo test",
+          discovery_status: {
+            status: "attached",
+            method: "process_open_fd",
+            confidence: "exact_fd",
+          },
+          session_bytes: 4096,
+          session_mtime_ms: 1_700_000_002_000,
+        },
+      },
+    ],
+    count: 1,
+  };
+  const parsed = parseAgentsListResponse(payload);
+  assert.equal(parsed.count, 1);
+  assert.equal(parsed.agents[0].session?.format, "claude_jsonl");
+  assert.equal(parsed.agents[0].telemetry?.child_count, 2);
+  assert.equal(parsed.agents[0].telemetry?.total_rss_kib, 153600);
+  assert.equal(parsed.agents[0].telemetry?.active_command, "cargo test");
+});
+
+test("agentEventsUrl, validateAfterKey, and fetchAgentEventsWithFetch enforce AR-4A contracts and ETags", async () => {
+  assert.equal(agentEventsUrl("t1"), "/api/agents/t1/events");
+  assert.equal(
+    agentEventsUrl("n252/t7", { limit: 100, afterKey: "native:ev-2" }),
+    "/api/agents/n252%2Ft7/events?limit=100&after_key=native%3Aev-2",
+  );
+  assert.equal(validateAfterKey("native:ev-1"), true);
+  assert.equal(validateAfterKey(""), false);
+  assert.equal(validateAfterKey("bad\nkey"), false);
+  assert.equal(validateAfterKey("a".repeat(257)), false);
+
+  assert.throws(() => agentEventsUrl("t1", { limit: 0 }));
+  assert.throws(() => agentEventsUrl("t1", { limit: 1001 }));
+  assert.throws(() => agentEventsUrl("t1", { afterKey: "" }));
+  assert.throws(() => agentEventsUrl("../bad", {}));
+
+  const seenUrls: string[] = [];
+  const cache = new Map<string, AgentEtagEntry<FusedEventsReport>>();
+  let unauthorizedCount = 0;
+  const report = makeSampleEventsReport();
+
+  // Invalid afterKey fails closed before network call
+  const invalidClientRes = await fetchAgentEventsWithFetch(
+    async () => {
+      throw new Error("should not reach network");
+    },
+    {},
+    "t1",
+    { afterKey: "bad\u0007key" },
+  );
+  assert.equal(invalidClientRes.ok, false);
+  if (!invalidClientRes.ok) {
+    assert.equal(invalidClientRes.error.kind, "bad_request");
+  }
+
+  let step = 0;
+  const fetcher: AgentFetch = async (url, init) => {
+    seenUrls.push(url);
+    const headers = init.headers as Record<string, string>;
+    step += 1;
+    if (step === 1) {
+      return fakeResponse(200, report, { ETag: '"ev-1"' });
+    }
+    if (step === 2) {
+      assert.equal(headers["If-None-Match"], '"ev-1"');
+      return fakeResponse(304, null);
+    }
+    if (step === 3) {
+      return fakeResponse(403, { error: "external terminal forbidden for ReadOnlyViewer" });
+    }
+    return fakeResponse(401, { error: "expired token" });
+  };
+
+  const first = await fetchAgentEventsWithFetch(fetcher, { Authorization: "Bearer tok" }, "t1", {
+    limit: 50,
+    afterKey: "native:ev-0",
+    etagCache: cache,
+    onUnauthorized: () => {
+      unauthorizedCount += 1;
+    },
+  });
+  assert.equal(first.ok, true);
+  assert.equal(
+    seenUrls[0],
+    "/api/agents/t1/events?limit=50&after_key=native%3Aev-0",
+  );
+
+  const cached304 = await fetchAgentEventsWithFetch(fetcher, {}, "t1", {
+    limit: 50,
+    afterKey: "native:ev-0",
+    etagCache: cache,
+  });
+  assert.equal(cached304.ok, true);
+  if (cached304.ok) {
+    assert.equal(cached304.data.latest_key, "native:ev-2");
+    assert.equal(cached304.data.events.length, 2);
+  }
+
+  const forbidden = await fetchAgentEventsWithFetch(fetcher, {}, "n252/t7", {});
+  assert.equal(forbidden.ok, false);
+  if (!forbidden.ok) {
+    assert.equal(forbidden.error.kind, "forbidden_external");
+  }
+
+  const unauth = await fetchAgentEventsWithFetch(fetcher, {}, "t1", {
+    onUnauthorized: () => {
+      unauthorizedCount += 1;
+    },
+  });
+  assert.equal(unauth.ok, false);
+  assert.equal(unauthorizedCount, 1);
+
+  // Verify omitted cursor_reset and cumulative defaults work cleanly
+  const minimalUsageReport = parseFusedEventsReport({
+    ...report,
+    cursor_reset: undefined,
+    events: [
+      {
+        canonical_key: "claude:cost-state",
+        timestamp_ms: null,
+        fidelity: "session_enriched",
+        origins: ["native_session"],
+        kind: {
+          kind: "usage_recorded",
+          model: "claude-opus-4-6",
+          input_tokens: 100,
+          output_tokens: 50,
+          cache_read_tokens: 0,
+          cache_write_tokens: 0,
+        },
+        session_id: "sess-1",
+        terminal_address: "t1",
+      },
+    ],
+  });
+  assert.equal(minimalUsageReport.cursor_reset, false);
+  assert.equal(minimalUsageReport.events[0].kind.kind, "usage_recorded");
+  if (minimalUsageReport.events[0].kind.kind === "usage_recorded") {
+    assert.equal(minimalUsageReport.events[0].kind.cumulative, false);
+  }
+});
+
+test("reduceAgentEvents handles incremental after_key appends, in-place updates, cursor_reset, and screen_only replacement", () => {
+  let state: AgentEventsLoadState = { kind: "idle" };
+  state = reduceAgentEvents(state, { type: "selected", address: "t1" });
+  assert.equal(state.kind, "loading");
+
+  // 1. Initial full fetch (requestedAfterKey = null)
+  const initialReport = makeSampleEventsReport();
+  state = reduceAgentEvents(state, {
+    type: "fetch_succeeded",
+    address: "t1",
+    requestedAfterKey: null,
+    report: initialReport,
+    nowMs: 10_000,
+  });
+  assert.equal(state.kind, "ready");
+  let data = eventsDataFromState(state, "t1");
+  assert.ok(data);
+  assert.equal(data.events.length, 2);
+  assert.equal(data.latest_key, "native:ev-2");
+  assert.equal(data.cursorResetCount, 0);
+
+  // Guard against cross-address leaks on frame 0
+  assert.equal(eventsDataFromState(state, "t2"), null);
+
+  // 2. Quiet incremental poll (no new events, same summary) keeps object identity within 15s
+  const quietIncremental = makeSampleEventsReport({
+    latest_key: "native:ev-2",
+    count: 0,
+    events: [],
+  });
+  const afterQuiet = reduceAgentEvents(state, {
+    type: "fetch_succeeded",
+    address: "t1",
+    requestedAfterKey: "native:ev-2",
+    report: quietIncremental,
+    nowMs: 12_000,
+  });
+  assert.strictEqual(afterQuiet, state);
+
+  // 3. Delta poll appends new event + updates in-place duplicate without duplication
+  const deltaEvent: FusedAgentEvent = {
+    canonical_key: "native:ev-3",
+    timestamp_ms: 1_700_000_003_000,
+    fidelity: "session_enriched",
+    origins: ["native_session"],
+    kind: {
+      kind: "tool_completed",
+      tool_call_id: "toolu_1",
+      tool_name: "Bash",
+      ok: true,
+      duration_ms: 1200,
+      summary: "ok",
+    },
+    session_id: "sess-1",
+    terminal_address: "t1",
+  };
+  const updatedEv2: FusedAgentEvent = {
+    ...initialReport.events[1],
+    origins: ["herdr_pty", "native_session"],
+  };
+  state = reduceAgentEvents(afterQuiet, {
+    type: "fetch_succeeded",
+    address: "t1",
+    requestedAfterKey: "native:ev-2",
+    report: makeSampleEventsReport({
+      latest_key: "native:ev-3",
+      count: 2,
+      events: [updatedEv2, deltaEvent],
+    }),
+    nowMs: 14_000,
+  });
+  data = eventsDataFromState(state, "t1");
+  assert.ok(data);
+  assert.deepEqual(
+    data.events.map((e) => e.canonical_key),
+    ["native:ev-1", "native:ev-2", "native:ev-3"],
+  );
+  assert.deepEqual(data.events[1].origins, ["herdr_pty", "native_session"]);
+  assert.equal(data.latest_key, "native:ev-3");
+
+  // 4. cursor_reset = true wipes stale events and replaces cleanly + increments cursorResetCount
+  const resetEvent: FusedAgentEvent = {
+    canonical_key: "native:fresh-1",
+    timestamp_ms: 1_700_000_010_000,
+    fidelity: "session_enriched",
+    origins: ["native_session"],
+    kind: { kind: "turn_started", turn_id: "turn-9" },
+    session_id: "sess-2",
+    terminal_address: "t1",
+  };
+  state = reduceAgentEvents(state, {
+    type: "fetch_succeeded",
+    address: "t1",
+    requestedAfterKey: "native:ev-3",
+    report: makeSampleEventsReport({
+      latest_key: "native:fresh-1",
+      cursor_reset: true,
+      count: 1,
+      events: [resetEvent],
+    }),
+    nowMs: 20_000,
+  });
+  data = eventsDataFromState(state, "t1");
+  assert.ok(data);
+  assert.deepEqual(
+    data.events.map((e) => e.canonical_key),
+    ["native:fresh-1"],
+  );
+  assert.equal(data.latest_key, "native:fresh-1");
+  assert.equal(data.cursorResetCount, 1);
+  assert.equal(data.lastCursorResetAtMs, 20_000);
+
+  // 5. Full window screen_only refresh (requestedAfterKey = null, latest_key = null) replaces window
+  const screenOnlyEvent: FusedAgentEvent = {
+    canonical_key: "screen:0011223344556677:working",
+    timestamp_ms: 1_700_000_020_000,
+    fidelity: "screen_only",
+    origins: ["herdr_pty"],
+    kind: { kind: "process_state", status: "working", rule: "spinner" },
+    session_id: null,
+    terminal_address: "t1",
+  };
+  state = reduceAgentEvents(state, {
+    type: "fetch_succeeded",
+    address: "t1",
+    requestedAfterKey: null,
+    report: makeSampleEventsReport({
+      fidelity: "screen_only",
+      session: null,
+      latest_key: null,
+      cursor_reset: false,
+      count: 1,
+      events: [screenOnlyEvent],
+    }),
+    nowMs: 25_000,
+  });
+  data = eventsDataFromState(state, "t1");
+  assert.ok(data);
+  assert.deepEqual(
+    data.events.map((e) => e.canonical_key),
+    ["screen:0011223344556677:working"],
+  );
+  assert.equal(data.latest_key, null);
+
+  // 6. Transient failure retains previous data on error
+  state = reduceAgentEvents(state, {
+    type: "fetch_failed",
+    address: "t1",
+    error: classifyAgentHttpError(503, "busy", "read"),
+  });
+  assert.equal(state.kind, "error");
+  assert.equal(eventsDataFromState(state, "t1")?.events.length, 1);
+});
+
+test("observability formatters describe all AgentHealth, SessionDiscoveryStatus, Usage, and RSS variants cleanly in zh & en", () => {
+  assert.equal(formatRssKib(512), "512 KiB");
+  assert.equal(formatRssKib(150 * 1024), "150 MiB");
+  assert.equal(formatRssKib(2 * 1024 * 1024), "2.00 GiB");
+  assert.equal(formatTokenCount(950), "950");
+  assert.equal(formatTokenCount(12_400), "12.4k");
+  assert.equal(formatTokenCount(2_500_000), "2.50M");
+  assert.equal(formatDurationCompact(450), "450ms");
+  assert.equal(formatDurationCompact(320_000), "5m 20s");
+
+  const healthCases: AgentHealth[] = [
+    { health: "healthy" },
+    { health: "busy" },
+    { health: "blocked", rule: "question_menu" },
+    { health: "stalled", silent_ms: 360_000 },
+    { health: "erroring", error_count: 3 },
+    { health: "degraded", reason: "session read failed" },
+    { health: "exited" },
+  ];
+  for (const h of healthCases) {
+    const zh = describeAgentHealth(h, "zh");
+    const en = describeAgentHealth(h, "en");
+    assert.ok(zh.label.length > 0);
+    assert.ok(en.label.length > 0);
+    assert.equal(zh.tone, en.tone);
+  }
+  assert.equal(describeAgentHealth({ health: "busy" }, "zh").live, true);
+  assert.equal(describeAgentHealth({ health: "erroring", error_count: 2 }, "en").tone, "danger");
+
+  const discoveryCases: SessionDiscoveryStatus[] = [
+    { status: "attached", method: "process_open_fd", confidence: "exact_fd" },
+    { status: "no_live_pid" },
+    { status: "remote_terminal_unscanned" },
+    { status: "no_matching_session_file", scanned_roots: 4 },
+    { status: "read_failed", reason: "permission denied" },
+  ];
+  for (const d of discoveryCases) {
+    assert.ok(describeSessionDiscovery(d, "zh").label.length > 0);
+    assert.ok(describeSessionDiscovery(d, "en").label.length > 0);
+  }
+
+  const report = makeSampleEventsReport();
+  const formattedTool = describeFusedEvent(report.events[1], "zh");
+  assert.equal(formattedTool.tone, "info");
+  assert.match(formattedTool.badge, /Bash/);
+  assert.equal(formattedTool.text, "cargo test -p spawn-core");
 });
