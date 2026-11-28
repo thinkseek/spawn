@@ -221,7 +221,7 @@ if [ "${1-}" = "features" ] && [ "${2-}" = "scan" ]; then
     esac
   done
   [ -n "$out_file" ] || exit 1
-  printf '{"root":"%s","registry_path":"%s","registry_writable":false,"read_only_reason":"precomputed snapshot","report":{"schema_version":1},"features":[]}\n' "$seen_root" "$seen_registry" > "$out_file"
+  printf '{"root":"%s","registry_path":"%s","registry_writable":false,"read_only_reason":"precomputed snapshot","report":{"schema_version":1,"scanned_at_ms":1700000000000,"initiative_id":"spawn","boundary":{"project_name":"Spawn","description":"d","included_categories":[],"exclusions":[]},"counts":{"total_seen":0,"in_scope":0,"covered":0,"unassociated_wild":0,"stale_references":0,"explicit_exclusions":0,"multi_feature_files":0,"orphan_features":0,"invalid_relations":0},"unassociated_files":[],"stale_references":[],"excluded_files":[],"bidirectional_index":{"feature_to_files":{},"file_to_features":{}},"consistency":{"orphan_features":[],"dangling_relations":[],"self_links":[],"cycle_errors":[],"duplicate_feature_ids":[],"invalid_paths":[]}},"features":[]}\n' "$seen_root" "$seen_registry" > "$out_file"
   exit 0
 fi
 [ "${1-}" = --version ] && { echo "v3-spawn"; exit 0; }
@@ -244,14 +244,36 @@ check "control-plane: feature-coverage.json uses portable relative root and regi
   'grep -q "\"root\":\"\\.\"" "$out_cp/feature-coverage.json" && grep -q "\"registry_path\":\"docs/feature-map/registry.json\"" "$out_cp/feature-coverage.json"'
 check "control-plane: SHA256SUMS verifies cleanly" '(cd "$out_cp" && sha256sum -c SHA256SUMS >/dev/null 2>&1)'
 
+# Live scan with external --feature-registry normalizes portable paths and leaks zero host paths.
+cp "$cp_repo/docs/feature-map/registry.json" "$root/ext-registry.json"
+out_cp_ext="$root/out-control-plane-ext-reg"
+run_build --mode control-plane --bin-dir "$cp_bins" --web-dir "$web" \
+  --feature-root "$cp_repo" --feature-registry "$root/ext-registry.json" --out-dir "$out_cp_ext"
+check "control-plane external registry: build exits 0" '[ "$rc" = 0 ]'
+check "control-plane external registry: normalized to portable root/registry_path with zero host paths" \
+  'grep -q "\"root\":\"\\.\"" "$out_cp_ext/feature-coverage.json" && grep -q "\"registry_path\":\"docs/feature-map/registry.json\"" "$out_cp_ext/feature-coverage.json" && ! grep -qF "$root" "$out_cp_ext/feature-coverage.json"'
+check "control-plane external registry: SHA256SUMS verifies cleanly" '(cd "$out_cp_ext" && sha256sum -c SHA256SUMS >/dev/null 2>&1)'
+
 # Prebuilt coverage snapshot cross-compile path without running $bin_dir/spawn.
 out_cp_pre="$root/out-control-plane-prebuilt"
 printf '#!/bin/sh\necho "should not execute target binary" >&2; exit 99\n' > "$cp_bins/spawn-cross"
-printf '{"root":"/pre","registry_path":"/pre/registry.json","registry_writable":false,"read_only_reason":"precomputed","report":{"schema_version":1},"features":[]}\n' > "$root/pre-cov.json"
+cat > "$root/pre-cov.json" <<'EOF'
+{"root":".","registry_path":"docs/feature-map/registry.json","registry_writable":false,"read_only_reason":"precomputed","report":{"schema_version":1,"scanned_at_ms":1700000000000,"initiative_id":"spawn","boundary":{"project_name":"Spawn","description":"d","included_categories":[],"exclusions":[]},"counts":{"total_seen":0,"in_scope":0,"covered":0,"unassociated_wild":0,"stale_references":0,"explicit_exclusions":0,"multi_feature_files":0,"orphan_features":0,"invalid_relations":0},"unassociated_files":[],"stale_references":[],"excluded_files":[],"bidirectional_index":{"feature_to_files":{},"file_to_features":{}},"consistency":{"orphan_features":[],"dangling_relations":[],"self_links":[],"cycle_errors":[],"duplicate_feature_ids":[],"invalid_paths":[]}},"features":[]}
+EOF
 run_build --mode control-plane --bin-dir "$cp_bins" --web-dir "$web" \
   --feature-coverage "$root/pre-cov.json" --feature-registry "$cp_repo/docs/feature-map/registry.json" \
   --out-dir "$out_cp_pre"
-check "control-plane prebuilt: build exits 0" '[ "$rc" = 0 ] && cmp -s "$out_cp_pre/feature-coverage.json" "$root/pre-cov.json"'
+check "control-plane prebuilt: valid portable snapshot exits 0" '[ "$rc" = 0 ] && cmp -s "$out_cp_pre/feature-coverage.json" "$root/pre-cov.json"'
+
+# Blocker 5 regressions: prebuilt inputs with host absolute paths or incomplete schema MUST fail closed.
+printf '{"root":"/pre","registry_path":"/pre/registry.json","registry_writable":false,"read_only_reason":"precomputed","report":{"schema_version":1,"scanned_at_ms":1700000000000,"initiative_id":"spawn","boundary":{"project_name":"Spawn","description":"d","included_categories":[],"exclusions":[]},"counts":{"total_seen":0,"in_scope":0,"covered":0,"unassociated_wild":0,"stale_references":0,"explicit_exclusions":0,"multi_feature_files":0,"orphan_features":0,"invalid_relations":0},"unassociated_files":[],"stale_references":[],"excluded_files":[],"bidirectional_index":{"feature_to_files":{},"file_to_features":{}},"consistency":{"orphan_features":[],"dangling_relations":[],"self_links":[],"cycle_errors":[],"duplicate_feature_ids":[],"invalid_paths":[]}},"features":[]}\n' > "$root/pre-cov-abs.json"
+refused "control-plane prebuilt absolute paths" 1 --mode control-plane --bin-dir "$cp_bins" --web-dir "$web" --feature-coverage "$root/pre-cov-abs.json" --feature-registry "$cp_repo/docs/feature-map/registry.json"
+printf '{"root":".","registry_path":"docs/feature-map/registry.json","registry_writable":false,"read_only_reason":"precomputed","report":{"schema_version":1},"features":[]}\n' > "$root/pre-cov-incomplete.json"
+refused "control-plane prebuilt incomplete report schema" 1 --mode control-plane --bin-dir "$cp_bins" --web-dir "$web" --feature-coverage "$root/pre-cov-incomplete.json" --feature-registry "$cp_repo/docs/feature-map/registry.json"
+sed 's/"registry_writable":false/"registry_writable":true/' "$root/pre-cov.json" > "$root/pre-cov-writable.json"
+refused "control-plane prebuilt writable flag" 1 --mode control-plane --bin-dir "$cp_bins" --web-dir "$web" --feature-coverage "$root/pre-cov-writable.json" --feature-registry "$cp_repo/docs/feature-map/registry.json"
+sed 's/"schema_version":1/"schema_version":2/' "$root/pre-cov.json" > "$root/pre-cov-badver.json"
+refused "control-plane prebuilt wrong schema_version" 1 --mode control-plane --bin-dir "$cp_bins" --web-dir "$web" --feature-coverage "$root/pre-cov-badver.json" --feature-registry "$cp_repo/docs/feature-map/registry.json"
 
 # Control-plane error paths fail closed.
 refused "control-plane missing feature-root/coverage" 2 --mode control-plane --bin-dir "$cp_bins" --web-dir "$web"
@@ -263,22 +285,23 @@ refused "control-plane missing spawn-node-gateway" 1 --mode control-plane --bin-
 : > "$root/empty-cov.json"
 refused "control-plane empty coverage file" 1 --mode control-plane --bin-dir "$cp_bins" --web-dir "$web" --feature-coverage "$root/empty-cov.json" --feature-registry "$cp_repo/docs/feature-map/registry.json"
 
-# Native deploy/self-upgrade.sh compatibility check (SHA256SUMS + current/{feature-coverage,registry}.json without linking JSONs into bin/).
+# Native deploy/self-upgrade.sh compatibility check (SHA256SUMS + current/{feature-coverage,registry}.json + unit drop-ins).
 upgrade_sh="$here/../deploy/self-upgrade.sh"
 if [ -x "$upgrade_sh" ]; then
   rsi_cp="$root/rsi-cp"
-  mkdir -p "$rsi_cp/releases/v1-cp" "$rsi_cp/bin"
+  cp_units="$root/cp-units"
+  mkdir -p "$rsi_cp/releases/v1-cp" "$rsi_cp/bin" "$cp_units"
   cp -a "$out_cp/." "$rsi_cp/releases/v1-cp/"
   set +e
-  up_out=$(SPAWN_RSI_DIR="$rsi_cp" bash "$upgrade_sh" --role control-plane --version v1-cp --rsi-dir "$rsi_cp" --allow-no-active-units 2>&1)
+  up_out=$(SPAWN_RSI_DIR="$rsi_cp" SPAWN_UNIT_DIR="$cp_units" bash "$upgrade_sh" --role control-plane --version v1-cp --rsi-dir "$rsi_cp" --allow-no-active-units 2>&1)
   up_rc=$?
   set -e
   check "control-plane self-upgrade accepts feature-coverage.json + registry.json (rc=$up_rc)" '[ "$up_rc" = 0 ]'
-  check "control-plane self-upgrade exposes current JSONs and excludes them from bin/" \
-    '[ -f "$rsi_cp/current/feature-coverage.json" ] && [ -f "$rsi_cp/current/registry.json" ] && [ -L "$rsi_cp/bin/spawn" ] && [ -L "$rsi_cp/bin/spawn-node-gateway" ] && [ ! -e "$rsi_cp/bin/feature-coverage.json" ] && [ ! -e "$rsi_cp/bin/registry.json" ]'
+  check "control-plane self-upgrade exposes current JSONs, excludes from bin/, and enables snapshot drop-ins" \
+    '[ -f "$rsi_cp/current/feature-coverage.json" ] && [ -f "$rsi_cp/current/registry.json" ] && [ -L "$rsi_cp/bin/spawn" ] && [ -L "$rsi_cp/bin/spawn-node-gateway" ] && [ ! -e "$rsi_cp/bin/feature-coverage.json" ] && [ ! -e "$rsi_cp/bin/registry.json" ] && grep -qxF "Environment=SPAWN_FEATURE_COVERAGE_SNAPSHOT=$rsi_cp/current/feature-coverage.json" "$cp_units/spawn-serve.service.d/50-feature-coverage-snapshot.conf" && grep -qxF "Environment=SPAWN_FEATURE_REGISTRY=$rsi_cp/current/registry.json" "$cp_units/spawn-core.service.d/50-feature-coverage-snapshot.conf"'
   echo 'tamper' >> "$rsi_cp/releases/v1-cp/feature-coverage.json"
   set +e
-  tamper_out=$(SPAWN_RSI_DIR="$rsi_cp" bash "$upgrade_sh" --role control-plane --version v1-cp --rsi-dir "$rsi_cp" --allow-no-active-units 2>&1)
+  tamper_out=$(SPAWN_RSI_DIR="$rsi_cp" SPAWN_UNIT_DIR="$cp_units" bash "$upgrade_sh" --role control-plane --version v1-cp --rsi-dir "$rsi_cp" --allow-no-active-units 2>&1)
   tamper_rc=$?
   set -e
   check "control-plane self-upgrade refuses tampered feature-coverage.json" '[ "$tamper_rc" = 1 ]'

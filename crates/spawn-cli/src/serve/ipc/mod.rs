@@ -13,6 +13,8 @@ mod http;
 mod node;
 mod routes;
 #[cfg(test)]
+pub(in crate::serve) use routes::dispatch_ipc_with_pools_for_test;
+#[cfg(test)]
 mod tests;
 
 use std::fs::{self, File};

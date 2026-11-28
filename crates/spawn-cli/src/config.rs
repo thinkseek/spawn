@@ -233,6 +233,43 @@ pub(crate) fn feature_coverage_source() -> FeatureCoverageSource {
     FeatureCoverageSource::resolve_with(env_value, &cwd)
 }
 
+/// Resolve the canonical local bare Spawn mission repository path
+/// (`<live>/missions/spawn.git`) from the process environment boundary.
+pub(crate) fn canonical_spawn_mission_repo() -> Option<PathBuf> {
+    canonical_spawn_mission_repo_with(env_value)
+}
+
+fn canonical_spawn_mission_repo_with<F>(env: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let non_empty_abs = |name: &str| {
+        env(name).and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty() && Path::new(trimmed).is_absolute())
+                .then(|| PathBuf::from(trimmed))
+        })
+    };
+    if let Some(repo) = non_empty_abs("SPAWN_MISSION_REPO") {
+        return Some(repo);
+    }
+    if let Some(live) = non_empty_abs("SPAWN_LIVE") {
+        return Some(live.join("missions").join("spawn.git"));
+    }
+    if let Some(rsi_dir) = non_empty_abs("SPAWN_RSI_DIR") {
+        return Some(rsi_dir.join("missions").join("spawn.git"));
+    }
+    if let Some(feature_root) = non_empty_abs("SPAWN_FEATURE_ROOT")
+        && feature_root.file_name().and_then(|s| s.to_str()) == Some("spawn")
+        && let Some(controllers_dir) = feature_root.parent()
+        && controllers_dir.file_name().and_then(|s| s.to_str()) == Some("controllers")
+        && let Some(live_base) = controllers_dir.parent()
+    {
+        return Some(live_base.join("missions").join("spawn.git"));
+    }
+    non_empty_abs("HOME").map(|home| home.join(".local/share/spawn-rsi/missions/spawn.git"))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ServePoolEnv {
     pub(crate) reads: Option<String>,
@@ -2277,5 +2314,72 @@ mod workspace_tests {
                 registry: PathBuf::from("/srv/cwd/docs/feature-map/registry.json"),
             }
         );
+    }
+
+    #[test]
+    fn canonical_spawn_mission_repo_follows_precedence_and_rejects_relative() {
+        use super::canonical_spawn_mission_repo_with;
+        use std::collections::HashMap;
+
+        let env = |pairs: &[(&str, &str)]| {
+            let map: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            move |name: &str| map.get(name).cloned()
+        };
+
+        assert_eq!(
+            canonical_spawn_mission_repo_with(env(&[
+                ("SPAWN_MISSION_REPO", "  /srv/custom/spawn.git  "),
+                ("SPAWN_LIVE", "/srv/live"),
+                ("HOME", "/home/u"),
+            ])),
+            Some(PathBuf::from("/srv/custom/spawn.git"))
+        );
+        assert_eq!(
+            canonical_spawn_mission_repo_with(env(&[
+                ("SPAWN_LIVE", "/srv/live"),
+                ("SPAWN_RSI_DIR", "/srv/rsi"),
+                ("HOME", "/home/u"),
+            ])),
+            Some(PathBuf::from("/srv/live/missions/spawn.git"))
+        );
+        assert_eq!(
+            canonical_spawn_mission_repo_with(env(&[
+                ("SPAWN_RSI_DIR", "/srv/rsi"),
+                ("SPAWN_FEATURE_ROOT", "/srv/ctl/controllers/spawn"),
+            ])),
+            Some(PathBuf::from("/srv/rsi/missions/spawn.git"))
+        );
+        assert_eq!(
+            canonical_spawn_mission_repo_with(env(&[(
+                "SPAWN_FEATURE_ROOT",
+                "/var/lib/spawn-rsi/controllers/spawn/",
+            )])),
+            Some(PathBuf::from("/var/lib/spawn-rsi/missions/spawn.git"))
+        );
+        // Non-controllers/spawn feature root falls back to HOME.
+        assert_eq!(
+            canonical_spawn_mission_repo_with(env(&[
+                ("SPAWN_FEATURE_ROOT", "/home/u/src/spawn"),
+                ("HOME", "/home/u"),
+            ])),
+            Some(PathBuf::from(
+                "/home/u/.local/share/spawn-rsi/missions/spawn.git"
+            ))
+        );
+        // Relative paths are ignored.
+        assert_eq!(
+            canonical_spawn_mission_repo_with(env(&[
+                ("SPAWN_MISSION_REPO", "relative/spawn.git"),
+                ("SPAWN_LIVE", "relative/live"),
+                ("HOME", "/home/u"),
+            ])),
+            Some(PathBuf::from(
+                "/home/u/.local/share/spawn-rsi/missions/spawn.git"
+            ))
+        );
+        assert_eq!(canonical_spawn_mission_repo_with(env(&[])), None);
     }
 }

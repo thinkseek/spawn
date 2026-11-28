@@ -161,6 +161,14 @@ fn read_map(
             .ok()
     });
     let fallback_registry = crate::config::feature_registry_override();
+    let canonical_spawn_repo = crate::config::canonical_spawn_mission_repo();
+    let control_plane_fallback =
+        fallback_registry
+            .as_deref()
+            .map(|registry| ControlPlaneFallback {
+                registry,
+                canonical_spawn_repo: canonical_spawn_repo.as_deref(),
+            });
     Ok(build_with_owner_landings_and_fallback(
         &missions,
         &verifications,
@@ -168,7 +176,7 @@ fn read_map(
         &live_anchor,
         &blockers,
         &owner_file_landings,
-        fallback_registry.as_deref(),
+        control_plane_fallback,
         now_ms(),
     ))
 }
@@ -663,6 +671,14 @@ fn build_with_owner_landings(
     )
 }
 
+/// Control-plane read-only fallback configuration: the release registry path
+/// and the deployment's canonical Spawn mission bare repository path.
+#[derive(Clone, Copy)]
+pub(super) struct ControlPlaneFallback<'a> {
+    pub(super) registry: &'a Path,
+    pub(super) canonical_spawn_repo: Option<&'a Path>,
+}
+
 /// [`build`], with each mission's gated owner landings per repo file and an
 /// optional control-plane `SPAWN_FEATURE_REGISTRY` read-only fallback.
 #[allow(clippy::too_many_arguments)]
@@ -673,7 +689,7 @@ fn build_with_owner_landings_and_fallback(
     live_anchor: &Value,
     blockers: &Value,
     owner_file_landings: &BTreeMap<i64, BTreeMap<String, GatedFileLanding>>,
-    fallback_registry: Option<&Path>,
+    fallback: Option<ControlPlaneFallback<'_>>,
     now: i64,
 ) -> Value {
     let facts = Facts {
@@ -690,7 +706,7 @@ fn build_with_owner_landings_and_fallback(
     };
     let rows: Vec<Value> = missions
         .iter()
-        .map(|mission| mission_row(mission, &facts, fallback_registry))
+        .map(|mission| mission_row(mission, &facts, fallback))
         .collect();
     json!({
         "generated_at_ms": now,
@@ -704,9 +720,13 @@ fn build_with_owner_landings_and_fallback(
 }
 
 /// One mission's capabilities, counts, blocker and mapping.
-fn mission_row(mission: &Value, facts: &Facts, fallback_registry: Option<&Path>) -> Value {
+fn mission_row(
+    mission: &Value,
+    facts: &Facts,
+    fallback: Option<ControlPlaneFallback<'_>>,
+) -> Value {
     let id = mission["id"].as_i64().unwrap_or_default();
-    let (specs, mapping) = specs_for_with_fallback(mission, fallback_registry);
+    let (specs, mapping) = specs_for_with_fallback(mission, fallback);
     let mut features: Vec<Value> = specs
         .iter()
         .map(|spec| derive(spec, mission, facts))
@@ -966,27 +986,142 @@ fn with_deployed(missions: &mut [Value], undeployed: &Value) {
     }
 }
 
-/// Whether `mission` tracks the Spawn repository itself (shipped by deploy
-/// or citing the Spawn repository in `sources`), and is therefore eligible
-/// for read-only `SPAWN_FEATURE_REGISTRY` control-plane fallback.
-pub(super) fn is_spawn_repo_mission(mission: &Value) -> bool {
-    if shipped_by_deploy(mission) {
+fn has_spawn_github_path(path: &str) -> bool {
+    if path.contains('?') || path.contains('#') {
+        return false;
+    }
+    let clean = path.strip_suffix('/').unwrap_or(path);
+    clean.eq_ignore_ascii_case("thinkseek/spawn")
+        || clean.eq_ignore_ascii_case("thinkseek/spawn.git")
+}
+
+fn strip_single_userinfo(authority: &str) -> Option<&str> {
+    match authority.split_once('@') {
+        Some((user, host_port)) => {
+            (!user.is_empty() && !host_port.contains('@')).then_some(host_port)
+        }
+        None => Some(authority),
+    }
+}
+
+fn is_spawn_remote_url(raw: &str) -> bool {
+    if let Some((scheme, rest)) = raw.split_once("://") {
+        let default_port = match scheme.to_ascii_lowercase().as_str() {
+            "https" | "git+https" => 443u16,
+            "http" => 80,
+            "ssh" | "git+ssh" => 22,
+            "git" => 9418,
+            _ => return false,
+        };
+        if rest.contains('?') || rest.contains('#') {
+            return false;
+        }
+        let Some((authority, path)) = rest.split_once('/') else {
+            return false;
+        };
+        let Some(host_port) = strip_single_userinfo(authority) else {
+            return false;
+        };
+        if host_port.contains('[') || host_port.contains(']') {
+            return false;
+        }
+        let host = match host_port.split_once(':') {
+            Some((host, port_str)) => {
+                if port_str.is_empty()
+                    || port_str.contains(':')
+                    || port_str.parse::<u16>().ok() != Some(default_port)
+                {
+                    return false;
+                }
+                host
+            }
+            None => host_port,
+        };
+        return host.eq_ignore_ascii_case("github.com") && has_spawn_github_path(path);
+    }
+
+    // SCP-like SSH syntax: `[user@]github.com:thinkseek/spawn[.git]`
+    if raw.starts_with('/') || raw.starts_with('.') || raw.starts_with('~') {
+        return false;
+    }
+    let Some((host_part, path_part)) = raw.split_once(':') else {
+        return false;
+    };
+    if host_part.contains('/') {
+        return false;
+    }
+    let Some(host) = strip_single_userinfo(host_part) else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("github.com") && has_spawn_github_path(path_part)
+}
+
+fn normalize_abs_lexical_path(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
+        return None;
+    }
+    let mut out = PathBuf::from("/");
+    for comp in components {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(seg) => out.push(seg),
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+fn is_canonical_local_spawn_repo(raw: &str, canonical_spawn_repo: Option<&Path>) -> bool {
+    let Some(canonical) = canonical_spawn_repo else {
+        return false;
+    };
+    if raw.contains("://") || !raw.starts_with('/') {
+        return false;
+    }
+    let candidate = Path::new(raw);
+    if let (Some(norm_cand), Some(norm_canon)) = (
+        normalize_abs_lexical_path(candidate),
+        normalize_abs_lexical_path(canonical),
+    ) && norm_cand == norm_canon
+    {
         return true;
     }
+    if let (Ok(canon_cand), Ok(canon_expected)) = (
+        std::fs::canonicalize(candidate),
+        std::fs::canonicalize(canonical),
+    ) {
+        return canon_cand == canon_expected;
+    }
+    false
+}
+
+fn source_is_spawn_repo(raw: &str, canonical_spawn_repo: Option<&Path>) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.bytes().any(|b| b.is_ascii_whitespace()) {
+        return false;
+    }
+    is_spawn_remote_url(trimmed) || is_canonical_local_spawn_repo(trimmed, canonical_spawn_repo)
+}
+
+/// Whether `mission` tracks `thinkseek/spawn` itself (by parsed `github.com`
+/// remote URL or exact match against `canonical_spawn_repo`), and is therefore
+/// eligible for read-only `SPAWN_FEATURE_REGISTRY` control-plane fallback.
+pub(super) fn is_spawn_repo_mission_with(
+    mission: &Value,
+    canonical_spawn_repo: Option<&Path>,
+) -> bool {
     mission["sources"]
         .as_array()
         .into_iter()
         .flatten()
-        .any(|source| {
-            source.as_str().is_some_and(|raw| {
-                let trimmed = raw.trim().trim_end_matches('/');
-                trimmed.ends_with(DEPLOYED_SOURCE_SUFFIX)
-                    || trimmed.ends_with("github.com/thinkseek/spawn")
-                    || trimmed.ends_with("github.com/thinkseek/spawn.git")
-                    || trimmed.ends_with("github.com:thinkseek/spawn")
-                    || trimmed.ends_with("github.com:thinkseek/spawn.git")
-            })
-        })
+        .filter_map(Value::as_str)
+        .any(|source| source_is_spawn_repo(source, canonical_spawn_repo))
 }
 
 /// Outcome of reading a mission's mapping file from local disk: only
@@ -1000,21 +1135,21 @@ enum MappingRead {
 
 fn try_spawn_registry_fallback(
     mission: &Value,
-    fallback_registry: Option<&Path>,
+    cp: Option<ControlPlaneFallback<'_>>,
     fallback: Vec<Spec>,
     configured_path: Option<String>,
     original_error: &str,
 ) -> (Vec<Spec>, Value) {
     let mission_id = mission["id"].as_i64().unwrap_or_default();
-    if is_spawn_repo_mission(mission)
-        && let Some(reg_path) = fallback_registry
+    if let Some(cp) = cp
+        && is_spawn_repo_mission_with(mission, cp.canonical_spawn_repo)
     {
-        return match read_mapping(reg_path, mission_id) {
+        return match read_mapping(cp.registry, mission_id) {
             Ok(specs) => (
                 specs,
                 json!({
                     "kind": "file",
-                    "path": reg_path.display().to_string(),
+                    "path": cp.registry.display().to_string(),
                     "error": Value::Null,
                     "fallback": true,
                     "configured_path": configured_path,
@@ -1024,8 +1159,8 @@ fn try_spawn_registry_fallback(
                 fallback,
                 json!({
                     "kind": "objectives",
-                    "path": configured_path.unwrap_or_else(|| reg_path.display().to_string()),
-                    "error": format!("{original_error}; fallback registry {}: {fb_err}", reg_path.display()),
+                    "path": configured_path.unwrap_or_else(|| cp.registry.display().to_string()),
+                    "error": format!("{original_error}; fallback registry {}: {fb_err}", cp.registry.display()),
                 }),
             ),
         };
@@ -1046,18 +1181,18 @@ fn specs_for(mission: &Value) -> (Vec<Spec>, Value) {
 
 fn specs_for_with_fallback(
     mission: &Value,
-    fallback_registry: Option<&Path>,
+    cp: Option<ControlPlaneFallback<'_>>,
 ) -> (Vec<Spec>, Value) {
     let fallback = fallback_specs(mission);
     let Some(given) = mission["features_file"].as_str() else {
         if fallback.is_empty()
             && let Some(backlog_err) = mission["backlog_error"].as_str()
-            && is_spawn_repo_mission(mission)
-            && fallback_registry.is_some()
+            && let Some(cp_cfg) = cp
+            && is_spawn_repo_mission_with(mission, cp_cfg.canonical_spawn_repo)
         {
             return try_spawn_registry_fallback(
                 mission,
-                fallback_registry,
+                Some(cp_cfg),
                 fallback,
                 None,
                 &format!("backlog unavailable: {backlog_err}"),
@@ -1073,7 +1208,7 @@ fn specs_for_with_fallback(
         Err(error) => {
             return try_spawn_registry_fallback(
                 mission,
-                fallback_registry,
+                cp,
                 fallback,
                 Some(given.to_string()),
                 &error,
@@ -1093,7 +1228,7 @@ fn specs_for_with_fallback(
         ),
         MappingRead::NotFound(error) => try_spawn_registry_fallback(
             mission,
-            fallback_registry,
+            cp,
             fallback,
             Some(path.display().to_string()),
             &error,
@@ -5170,8 +5305,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn control_plane_missing_paths_fallback_safely_only_for_spawn_missions() {
+    fn write_cp_fallback_fixture() -> (std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "spawn-feature-map-cp-fallback-{}-{:?}",
             std::process::id(),
@@ -5216,7 +5350,18 @@ mod tests {
             .expect("json"),
         )
         .expect("write fallback registry");
+        (dir, reg_path)
+    }
 
+    #[test]
+    fn control_plane_missing_paths_fallback_safely_only_for_spawn_missions() {
+        let (dir, reg_path) = write_cp_fallback_fixture();
+
+        let canonical_spawn = Path::new("/home/worker/.local/share/spawn-rsi/missions/spawn.git");
+        let cp = super::ControlPlaneFallback {
+            registry: &reg_path,
+            canonical_spawn_repo: Some(canonical_spawn),
+        };
         let spawn_mission = json!({
             "id": 4,
             "text": "Spawn RSI",
@@ -5236,7 +5381,7 @@ mod tests {
             &Value::Null,
             &json!([]),
             &NO_OWNER_FILE_LANDINGS,
-            Some(&reg_path),
+            Some(cp),
             123,
         );
         let row = &map["missions"][0];
@@ -5258,12 +5403,27 @@ mod tests {
         let mut unset_file = spawn_mission.clone();
         unset_file["features_file"] = Value::Null;
         unset_file["backlog"] = Value::Null;
-        let (specs_unset, mapping_unset) =
-            super::specs_for_with_fallback(&unset_file, Some(&reg_path));
+        let (specs_unset, mapping_unset) = super::specs_for_with_fallback(&unset_file, Some(cp));
         assert_eq!(specs_unset.len(), 2);
         assert_eq!(mapping_unset["kind"], "file");
         assert_eq!(mapping_unset["fallback"], true);
         assert_eq!(mapping_unset["error"], Value::Null);
+
+        // Remote GitHub URLs with explicit standard default port or SCP SSH syntax recover Spawn features.
+        for accepted_source in [
+            "https://github.com:443/thinkseek/spawn.git",
+            "https://github.com/thinkseek/spawn",
+            "ssh://git@github.com:22/thinkseek/spawn.git",
+            "git@github.com:thinkseek/spawn.git",
+        ] {
+            let mut remote_mission = spawn_mission.clone();
+            remote_mission["sources"] = json!([accepted_source]);
+            let (specs_remote, map_remote) =
+                super::specs_for_with_fallback(&remote_mission, Some(cp));
+            assert_eq!(specs_remote.len(), 2, "accepted source: {accepted_source}");
+            assert_eq!(map_remote["fallback"], true, "{accepted_source}");
+            assert_eq!(map_remote["error"], Value::Null, "{accepted_source}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5282,21 +5442,52 @@ mod tests {
             r#"{"schema_version":1,"initiative_id":"t","boundary":{"project_name":"Spawn","description":"d","included_categories":[],"exclusions":[]},"features":[{"id":"cap-a","title":"A","kind":"capability","summary":"a","files":[],"relations":[],"provenance":{}}]}"#,
         )
         .expect("write fallback registry");
+        let canonical_spawn = Path::new("/home/worker/.local/share/spawn-rsi/missions/spawn.git");
+        let cp = super::ControlPlaneFallback {
+            registry: &reg_path,
+            canonical_spawn_repo: Some(canonical_spawn),
+        };
 
-        let external_mission = json!({
-            "id": 9,
-            "sources": ["/home/worker/.local/share/spawn-rsi/missions/acme.git"],
-            "backlog": "/nonexistent/acme/backlog",
-            "backlog_error": "missing",
-            "features_file": "docs/feature-map/registry.json",
-            "objectives": [],
-            "shipped_by_deploy": false
-        });
-        let (ext_specs, ext_map) =
-            super::specs_for_with_fallback(&external_mission, Some(&reg_path));
-        assert!(ext_specs.is_empty());
-        assert_eq!(ext_map["kind"], "objectives");
-        assert!(ext_map["error"].as_str().is_some());
+        // Mirrors, non-canonical `/missions/spawn.git` suffixes (even if shipped_by_deploy: true),
+        // wrong ports, lookalike hosts, and file:// URLs must NEVER receive Spawn features.
+        for (idx, source, shipped_flag) in [
+            (
+                9,
+                "/home/worker/.local/share/spawn-rsi/missions/acme.git",
+                false,
+            ),
+            (
+                10,
+                "https://mirror.example/github.com/thinkseek/spawn.git",
+                false,
+            ),
+            (11, "/worker/owner-fork/missions/spawn.git", true),
+            (12, "https://github.com:8443/thinkseek/spawn.git", false),
+            (13, "https://github.com:22/thinkseek/spawn.git", false),
+            (14, "https://evil-github.com/thinkseek/spawn.git", false),
+            (15, "https://github.com/other/thinkseek/spawn.git", false),
+            (16, "https://github.com/thinkseek/spawn.git.bak", false),
+            (
+                17,
+                "git@mirror.example:github.com/thinkseek/spawn.git",
+                false,
+            ),
+            (18, "file:///home/u/github.com/thinkseek/spawn.git", false),
+        ] {
+            let external_mission = json!({
+                "id": idx,
+                "sources": [source],
+                "backlog": "/nonexistent/acme/backlog",
+                "backlog_error": "missing",
+                "features_file": "../docs/feature-map/registry.json",
+                "objectives": [],
+                "shipped_by_deploy": shipped_flag
+            });
+            let (ext_specs, ext_map) = super::specs_for_with_fallback(&external_mission, Some(cp));
+            assert!(ext_specs.is_empty(), "must refuse {source}");
+            assert_eq!(ext_map["kind"], "objectives", "{source}");
+            assert!(ext_map["error"].as_str().is_some(), "{source}");
+        }
 
         let corrupt_local = dir.join("corrupt.json");
         std::fs::write(&corrupt_local, "{not valid json").expect("write corrupt");
@@ -5307,13 +5498,16 @@ mod tests {
             "objectives": [],
             "shipped_by_deploy": true
         });
-        let (corrupt_specs, corrupt_map) =
-            super::specs_for_with_fallback(&spawn_corrupt, Some(&reg_path));
+        let (corrupt_specs, corrupt_map) = super::specs_for_with_fallback(&spawn_corrupt, Some(cp));
         assert!(corrupt_specs.is_empty());
         assert_eq!(corrupt_map["kind"], "objectives");
         assert!(corrupt_map["error"].as_str().unwrap().contains("parse "));
 
         let missing_reg = dir.join("nope.json");
+        let missing_cp = super::ControlPlaneFallback {
+            registry: &missing_reg,
+            canonical_spawn_repo: Some(canonical_spawn),
+        };
         let spawn_missing = json!({
             "id": 4,
             "sources": ["/home/worker/.local/share/spawn-rsi/missions/spawn.git"],
@@ -5323,11 +5517,24 @@ mod tests {
             "shipped_by_deploy": true
         });
         let (miss_specs, miss_map) =
-            super::specs_for_with_fallback(&spawn_missing, Some(&missing_reg));
+            super::specs_for_with_fallback(&spawn_missing, Some(missing_cp));
         assert!(miss_specs.is_empty());
         assert_eq!(miss_map["kind"], "objectives");
         let err_msg = miss_map["error"].as_str().expect("error");
         assert!(err_msg.contains("fallback registry"), "{err_msg}");
+
+        // Without configured canonical_spawn_repo, local paths do not match while remote GitHub still does.
+        let no_local_cp = super::ControlPlaneFallback {
+            registry: &reg_path,
+            canonical_spawn_repo: None,
+        };
+        let (nolocal_specs, _) = super::specs_for_with_fallback(&spawn_missing, Some(no_local_cp));
+        assert!(nolocal_specs.is_empty());
+        let mut github_missing = spawn_missing.clone();
+        github_missing["sources"] = json!(["https://github.com:443/thinkseek/spawn.git"]);
+        let (gh_specs, gh_map) = super::specs_for_with_fallback(&github_missing, Some(no_local_cp));
+        assert_eq!(gh_specs.len(), 1);
+        assert_eq!(gh_map["fallback"], true);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

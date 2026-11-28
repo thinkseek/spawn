@@ -141,6 +141,7 @@ fi
 want_features=0
 if [ "$mode" = control-plane ] || [ -n "$feature_root" ] || [ -n "$feature_coverage" ] || [ -n "$feature_registry" ]; then
   want_features=1
+  command -v jq >/dev/null 2>&1 || die "jq is required when staging feature coverage artifacts"
   if [ -n "$feature_root" ]; then
     [ -d "$feature_root" ] || die "--feature-root not found: $feature_root"
     [ -n "$feature_registry" ] || feature_registry="$feature_root/docs/feature-map/registry.json"
@@ -212,13 +213,139 @@ if [ "$mode" != node ]; then
   say "staged web.tar.gz"
 fi
 
+validate_feature_registry_json() {
+  local reg_file=$1
+  jq -e '
+    def is_str: type == "string";
+    def is_nonempty_str: is_str and (gsub("^[[:space:]]+|[[:space:]]+$"; "") | length > 0);
+    def is_rel_path:
+      is_nonempty_str
+      and (startswith("/") | not)
+      and (contains("\\") | not)
+      and (test("^[A-Za-z]:") | not);
+    type == "object"
+    and .schema_version == 1
+    and (.initiative_id | is_nonempty_str)
+    and (.boundary | type == "object")
+    and (.boundary.project_name | is_nonempty_str)
+    and (.boundary.description | is_str)
+    and (.boundary.included_categories | type == "array" and all(.[]; is_str))
+    and (.boundary.exclusions | type == "array" and all(.[];
+          type == "object"
+          and (.id | is_nonempty_str)
+          and (.pattern | is_nonempty_str)
+          and (.category | is_nonempty_str)
+          and (.reason | is_str)))
+    and (.features | type == "array" and all(.[];
+          type == "object"
+          and (.id | is_nonempty_str)
+          and (.title | is_str)
+          and (.kind == "domain" or .kind == "capability" or .kind == "initiative" or .kind == "slice" or .kind == "research-initiative" or .kind == "subsystem")
+          and (.summary | is_str)
+          and ((.files // []) | type == "array" and all(.[]; is_rel_path))))
+  ' "$reg_file" >/dev/null 2>&1
+}
+
+validate_feature_coverage_json() {
+  local cov_file=$1
+  jq -e '
+    def is_str: type == "string";
+    def is_nonempty_str: is_str and (gsub("^[[:space:]]+|[[:space:]]+$"; "") | length > 0);
+    def is_str_array: type == "array" and all(.[]; is_str);
+    def is_int: type == "number" and floor == .;
+    def is_nonneg_int: is_int and . >= 0;
+    def is_rel_path:
+      is_nonempty_str
+      and (startswith("/") | not)
+      and (contains("\\") | not)
+      and (test("^[A-Za-z]:") | not);
+    def is_valid_kind:
+      . == "domain" or . == "capability" or . == "initiative" or . == "slice" or . == "research-initiative" or . == "subsystem";
+    def is_valid_boundary:
+      type == "object"
+      and (.project_name | is_nonempty_str)
+      and (.description | is_str)
+      and (.included_categories | is_str_array)
+      and (.exclusions | type == "array" and all(.[];
+            type == "object"
+            and (.id | is_nonempty_str)
+            and (.pattern | is_nonempty_str)
+            and (.category | is_nonempty_str)
+            and (.reason | is_str)));
+    type == "object"
+    and .root == "."
+    and .registry_path == "docs/feature-map/registry.json"
+    and .registry_writable == false
+    and (.read_only_reason | is_nonempty_str)
+    and (.report | type == "object")
+    and .report.schema_version == 1
+    and (.report.scanned_at_ms | is_int)
+    and (.report.initiative_id | is_nonempty_str)
+    and (.report.boundary | is_valid_boundary)
+    and (.report.counts | type == "object"
+          and (.total_seen | is_nonneg_int)
+          and (.in_scope | is_nonneg_int)
+          and (.covered | is_nonneg_int)
+          and (.unassociated_wild | is_nonneg_int)
+          and (.stale_references | is_nonneg_int)
+          and (.explicit_exclusions | is_nonneg_int)
+          and (.multi_feature_files | is_nonneg_int)
+          and (.orphan_features | is_nonneg_int)
+          and (.invalid_relations | is_nonneg_int))
+    and (.report.unassociated_files | type == "array" and all(.[];
+          type == "object"
+          and (.path | is_rel_path)
+          and (.tracked | type == "boolean")
+          and (.size_bytes | is_nonneg_int)
+          and (.reason | is_str)
+          and (.evidence | is_str_array)
+          and (.suggested_features | is_str_array)))
+    and (.report.stale_references | type == "array" and all(.[];
+          type == "object"
+          and (.path | is_rel_path)
+          and (.referencing_features | is_str_array)
+          and (.rename_candidates | is_str_array)))
+    and (.report.excluded_files | type == "array" and all(.[];
+          type == "object"
+          and (.path | is_rel_path)
+          and (.rule_id | is_nonempty_str)
+          and (.category | is_nonempty_str)
+          and (.reason | is_str)))
+    and (.report.bidirectional_index | type == "object"
+          and (.feature_to_files | type == "object" and (to_entries | all(.[]; (.value | type == "array" and all(.[]; is_rel_path)))))
+          and (.file_to_features | type == "object" and (to_entries | all(.[]; (.key | is_rel_path) and (.value | is_str_array)))))
+    and (.report.consistency | type == "object"
+          and (.orphan_features | is_str_array)
+          and (.dangling_relations | is_str_array)
+          and (.self_links | is_str_array)
+          and (.cycle_errors | is_str_array)
+          and (.duplicate_feature_ids | is_str_array)
+          and (.invalid_paths | is_str_array))
+    and (.features | type == "array" and all(.[];
+          type == "object"
+          and (.id | is_nonempty_str)
+          and (.title | is_str)
+          and (.kind | is_valid_kind)
+          and (.parent == null or (.parent | is_str))
+          and (.summary | is_str)
+          and (.status_note == null or (.status_note | is_str))
+          and (.file_count | is_nonneg_int)
+          and ((.relations == null) or (.relations | type == "array" and all(.[]; type == "object" and (.target | is_nonempty_str) and (.kind | is_nonempty_str))))
+          and ((.provenance == null) or (.provenance | type == "object"))))
+  ' "$cov_file" >/dev/null 2>&1
+}
+
 if [ "$want_features" = 1 ]; then
-  rm -f -- "$out_dir/registry.json.tmp" "$out_dir/feature-coverage.json.tmp"
+  rm -f -- "$out_dir/registry.json.tmp" "$out_dir/feature-coverage.json.tmp" "$out_dir/feature-coverage.json.raw"
   cp -- "$feature_registry" "$out_dir/registry.json.tmp" || die "could not copy $feature_registry"
   chmod 0644 "$out_dir/registry.json.tmp"
   [ -s "$out_dir/registry.json.tmp" ] || {
     rm -f -- "$out_dir/registry.json.tmp"
     die "staged registry.json is empty"
+  }
+  validate_feature_registry_json "$out_dir/registry.json.tmp" || {
+    rm -f -- "$out_dir/registry.json.tmp"
+    die "staged registry.json failed schema validation: $feature_registry"
   }
   mv -f -- "$out_dir/registry.json.tmp" "$out_dir/registry.json"
   artifacts+=(registry.json)
@@ -245,16 +372,26 @@ if [ "$want_features" = 1 ]; then
     fi
     (
       cd -- "$abs_feature_root"
-      "$abs_snap_bin" features scan --root . --registry "$scan_reg" --snapshot --out "$out_dir/feature-coverage.json.tmp"
+      "$abs_snap_bin" features scan --root . --registry "$scan_reg" --snapshot --out "$out_dir/feature-coverage.json.raw"
     ) || {
-      rm -f -- "$out_dir/feature-coverage.json.tmp"
+      rm -f -- "$out_dir/feature-coverage.json.raw"
       die "failed to generate feature-coverage.json via $snap_bin features scan --snapshot"
     }
+    jq -c '.root = "." | .registry_path = "docs/feature-map/registry.json"' \
+      "$out_dir/feature-coverage.json.raw" > "$out_dir/feature-coverage.json.tmp" || {
+      rm -f -- "$out_dir/feature-coverage.json.raw" "$out_dir/feature-coverage.json.tmp"
+      die "failed to normalize generated feature-coverage.json portable metadata"
+    }
+    rm -f -- "$out_dir/feature-coverage.json.raw"
   fi
   chmod 0644 "$out_dir/feature-coverage.json.tmp"
   [ -s "$out_dir/feature-coverage.json.tmp" ] || {
     rm -f -- "$out_dir/feature-coverage.json.tmp"
     die "staged feature-coverage.json is empty"
+  }
+  validate_feature_coverage_json "$out_dir/feature-coverage.json.tmp" || {
+    rm -f -- "$out_dir/feature-coverage.json.tmp"
+    die "staged feature-coverage.json failed schema/portable-path validation (requires root=\".\", registry_path=\"docs/feature-map/registry.json\", registry_writable=false, complete report & features)"
   }
   mv -f -- "$out_dir/feature-coverage.json.tmp" "$out_dir/feature-coverage.json"
   artifacts+=(feature-coverage.json)

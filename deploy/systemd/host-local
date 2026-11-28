@@ -21,3 +21,9 @@ spawn-effort-report.timer
 # (SPAWN_GATE_SHADOW_RUNNER, SPAWN_GATE_SHADOW_EVERY;
 # crates/spawn-cli/src/integrate/shadow.rs). A runner's name is the host's.
 spawn-integrate.service.d/50-shadow-gate.conf
+
+# Control-plane precomputed feature-coverage snapshot overrides (ADR-006
+# Option B): managed exclusively by deploy/self-upgrade.sh --role control-plane
+# when a verified release stages both feature-coverage.json and registry.json.
+spawn-serve.service.d/50-feature-coverage-snapshot.conf
+spawn-core.service.d/50-feature-coverage-snapshot.conf
