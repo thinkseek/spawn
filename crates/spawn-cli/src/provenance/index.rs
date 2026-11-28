@@ -855,13 +855,48 @@ enum Found {
     /// Brought in by the merge `merge` on main: under its task when it is a
     /// landing; else the agent's task at the time, or the branch.
     Merge {
-        task: Option<i64>,
+        merge: String,
+        trailer_task: Option<i64>,
         merge_base: String,
     },
     /// On main's first-parent line.
     FirstParent,
     /// On the unlanded branch `branch` (`spawn/<agent>`).
     Branch { branch: String, merge_base: String },
+}
+
+impl Found {
+    /// Landing task authoritative for this found location: for a merge on
+    /// `main`, V2 structured `CommitOrigin::Land` metadata overrides any
+    /// legacy `Spawn-Task` trailer on that merge commit.
+    fn landing_task(&self, v2_commits: &HashMap<String, (CasDigest, CommitV2)>) -> Option<i64> {
+        match self {
+            Self::Merge {
+                merge,
+                trailer_task,
+                ..
+            } => main_landing_task(v2_commits, merge, *trailer_task),
+            Self::FirstParent | Self::Branch { .. } => None,
+        }
+    }
+}
+
+/// Authoritative landing task of a first-parent `main` commit:
+/// when the commit is a `CommitV2`, only its structured `CommitOrigin::Land`
+/// `intent.task_id` applies (ignoring any forged Git trailers); otherwise fall
+/// back to the legacy `Spawn-Task` trailer.
+fn main_landing_task(
+    v2_commits: &HashMap<String, (CasDigest, CommitV2)>,
+    commit_id: &str,
+    trailer_task: Option<i64>,
+) -> Option<i64> {
+    if let Some((_, v2)) = v2_commits.get(commit_id) {
+        matches!(v2.intent.origin, CommitOrigin::Land)
+            .then_some(v2.intent.task_id)
+            .flatten()
+    } else {
+        trailer_task
+    }
 }
 
 /// One thing to record, in the walk's order.
@@ -993,7 +1028,8 @@ fn plan(repo: &mut Repo, known: &Known, summary: &mut Summary) -> Result<Vec<Ite
                         commit: info,
                         execution,
                         found: Found::Merge {
-                            task: trailers.task,
+                            merge: commit.id.clone(),
+                            trailer_task: trailers.task,
                             merge_base: merge_base.clone(),
                         },
                     });
@@ -1090,31 +1126,18 @@ impl Facts {
                 Item::Main {
                     commit, trailers, ..
                 } => {
-                    if let Some((_, v2)) = v2_commits.get(&commit.id) {
-                        // CommitV2 typed intent is authoritative; ignore any forged trailers.
-                        if matches!(v2.intent.origin, CommitOrigin::Land)
-                            && let Some(task) = v2.intent.task_id
-                        {
-                            tasks.push(task);
-                            landed.push(task);
-                        }
-                    } else if let Some(task) = trailers.task {
+                    if let Some(task) = main_landing_task(v2_commits, &commit.id, trailers.task) {
                         tasks.push(task);
                         landed.push(task);
                     }
                 }
-                Item::Checkpoint {
-                    commit,
-                    found: Found::Merge { task, .. },
-                    ..
-                } => {
+                Item::Checkpoint { commit, found, .. } => {
                     if let Some((_, v2)) = v2_commits.get(&commit.id) {
                         tasks.extend(v2.intent.task_id);
                     } else {
-                        tasks.extend(*task);
+                        tasks.extend(found.landing_task(v2_commits));
                     }
                 }
-                Item::Checkpoint { .. } => {}
             }
         }
         tasks.sort_unstable();
@@ -1152,15 +1175,13 @@ fn checkpoint_change(
     domain: &str,
     known: &Known,
     facts: &Facts,
+    v2_commits: &HashMap<String, (CasDigest, CommitV2)>,
     commit: &CommitInfo,
     execution: Option<&String>,
     found: &Found,
 ) -> ProvChangeInput {
     let logged = execution.and_then(|execution| facts.executions.get(execution));
-    let landing_task = match found {
-        Found::Merge { task, .. } => *task,
-        _ => None,
-    };
+    let landing_task = found.landing_task(v2_commits);
     let fallback_agent = match found {
         Found::Branch { branch, .. } => Some(branch_agent(branch).to_string()),
         _ => landing_task
@@ -1573,14 +1594,24 @@ fn load_commit_v2_map(
     items: &[Item],
 ) -> Result<HashMap<String, (CasDigest, CommitV2)>, String> {
     let mut out = HashMap::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     for item in items {
-        let commit = match item {
-            Item::Checkpoint { commit, .. } | Item::Main { commit, .. } => commit,
+        let (commit_oid, merge_oid) = match item {
+            Item::Checkpoint {
+                commit,
+                found: Found::Merge { merge, .. },
+                ..
+            } => (commit.id.as_str(), Some(merge.as_str())),
+            Item::Checkpoint { commit, .. } | Item::Main { commit, .. } => {
+                (commit.id.as_str(), None)
+            }
         };
-        if !out.contains_key(&commit.id)
-            && let Some(v2) = lookup_commit_v2(store, cas, &commit.id)?
-        {
-            out.insert(commit.id.clone(), v2);
+        for oid in std::iter::once(commit_oid).chain(merge_oid) {
+            if seen.insert(oid)
+                && let Some(v2) = lookup_commit_v2(store, cas, oid)?
+            {
+                out.insert(oid.to_string(), v2);
+            }
         }
     }
     Ok(out)
@@ -1896,7 +1927,15 @@ fn index_with_d6_config(
             } => {
                 let change = commit_v2_for_item(&v2_commits, domain, &known, commit)
                     .unwrap_or_else(|| {
-                        checkpoint_change(domain, &known, &facts, commit, execution.as_ref(), found)
+                        checkpoint_change(
+                            domain,
+                            &known,
+                            &facts,
+                            &v2_commits,
+                            commit,
+                            execution.as_ref(),
+                            found,
+                        )
                     });
                 let entries = entries(
                     repo,
@@ -2427,9 +2466,12 @@ mod commit_v2_tests {
         cas_dir: PathBuf,
         mirror_dir: PathBuf,
         domain: String,
+        mission: i64,
+        base_tree: CasDigest,
         task_11: i64,
         task_12: i64,
         land_12_snap: CasDigest,
+        land_12_git_oid: spawn_cas::GitOid,
     }
 
     fn owner_client(url: &str, schema: &str) -> postgres::Client {
@@ -2566,9 +2608,12 @@ mod commit_v2_tests {
             cas_dir,
             mirror_dir,
             domain,
+            mission,
+            base_tree,
             task_11,
             task_12,
             land_12_snap: t2_pub.snapshot,
+            land_12_git_oid: t2_pub.git_oid,
         }
     }
 
@@ -2995,5 +3040,266 @@ mod commit_v2_tests {
 
         let changes = store.prov_changes_for_task(task).expect("changes");
         assert!(changes.iter().any(|c| c.kind == ProvChangeKind::Land));
+    }
+
+    #[test]
+    fn main_landing_task_prefers_v2_over_trailers_and_rejects_non_land_v2() {
+        let oid_v2_land = "1111111111111111111111111111111111111111".to_string();
+        let oid_v2_land_none = "2222222222222222222222222222222222222222".to_string();
+        let oid_v2_import = "3333333333333333333333333333333333333333".to_string();
+        let oid_v1_legacy = "4444444444444444444444444444444444444444".to_string();
+        let actor = CommitActor::Agent {
+            id: "agent_c".to_string(),
+            execution_id: Some("exec-3".to_string()),
+            model_label: Some("claude-opus".to_string()),
+            preset_id: Some("architect".to_string()),
+        };
+
+        let mut v2_commits = HashMap::new();
+        let mut land_with_task = sample_v2(
+            CommitOrigin::Land,
+            actor.clone(),
+            "land
+
+Spawn-Task: 99999
+",
+        );
+        land_with_task.intent.task_id = Some(3);
+        v2_commits.insert(
+            oid_v2_land.clone(),
+            (spawn_cas::sha256_of(b"v2-land-3"), land_with_task),
+        );
+
+        let mut land_without_task = sample_v2(
+            CommitOrigin::Land,
+            actor.clone(),
+            "land
+
+Spawn-Task: 99999
+",
+        );
+        land_without_task.intent.task_id = None;
+        v2_commits.insert(
+            oid_v2_land_none.clone(),
+            (spawn_cas::sha256_of(b"v2-land-none"), land_without_task),
+        );
+
+        let mut import_with_task = sample_v2(
+            CommitOrigin::Import,
+            actor,
+            "import
+
+Spawn-Task: 99999
+",
+        );
+        import_with_task.intent.task_id = Some(7);
+        v2_commits.insert(
+            oid_v2_import.clone(),
+            (spawn_cas::sha256_of(b"v2-import"), import_with_task),
+        );
+
+        assert_eq!(
+            main_landing_task(&v2_commits, &oid_v2_land, Some(99999)),
+            Some(3)
+        );
+        assert_eq!(main_landing_task(&v2_commits, &oid_v2_land, None), Some(3));
+        assert_eq!(
+            main_landing_task(&v2_commits, &oid_v2_land_none, Some(99999)),
+            None
+        );
+        assert_eq!(
+            main_landing_task(&v2_commits, &oid_v2_import, Some(99999)),
+            None
+        );
+        assert_eq!(
+            main_landing_task(&v2_commits, &oid_v1_legacy, Some(42)),
+            Some(42)
+        );
+    }
+
+    fn publish_v1_branch_checkpoint(
+        fx: &V2ProvFixture,
+        cas: &CasMerkleStore,
+        ledger: &PgCliRefLedger<'_>,
+        agent_c: &str,
+    ) -> (CasDigest, spawn_host::PublishedSnapshot) {
+        let (ckpt_blob, ckpt_sz) = cas
+            .put_bytes_blob(b"v1 checkpoint payload\n")
+            .expect("put v1 ckpt blob");
+        let ckpt_tree = cas
+            .apply_mutations(
+                &fx.base_tree,
+                &[spawn_cas::TreeMutation::Upsert {
+                    path: vec![b"c.rs".to_vec()],
+                    kind: spawn_cas::TreeEntryKind::File,
+                    id: ckpt_blob.as_bytes(),
+                    size: ckpt_sz,
+                }],
+            )
+            .expect("ckpt tree");
+        let ckpt_body = b"author worker_c <worker_c@spawn.local> 1700000003 +0000\n\
+committer worker_c <worker_c@spawn.local> 1700000003 +0000\n\n\
+spawn checkpoint exec_zzprobe\n";
+        let ckpt_branch = format!("spawn/{agent_c}");
+        let ckpt_pub = cas
+            .publish_snapshot(
+                ledger,
+                &spawn_host::cas_merkle::PublishRequest {
+                    project: "proj-v2",
+                    ref_name: &ckpt_branch,
+                    kind: spawn_host::D6RefKind::Branch,
+                    expected_ref: None,
+                    tree: &ckpt_tree,
+                    parents: std::slice::from_ref(&fx.land_12_snap),
+                    commit_body: ckpt_body,
+                    created_at_ms: 1_700_000_003_000,
+                    reason: "v1-checkpoint",
+                    landing_task_id: None,
+                },
+            )
+            .expect("publish v1 checkpoint");
+        (ckpt_tree, ckpt_pub)
+    }
+
+    fn publish_v1_checkpoint_merged_by_v2_land(fx: &V2ProvFixture) -> (i64, String, PathBuf) {
+        let cas = CasMerkleStore::open(&fx.cas_dir).expect("reopen d6 cas");
+        let ledger = PgCliRefLedger { pg: &fx.store };
+
+        let task_3 = fx
+            .store
+            .task_assign(fx.mission, "ephemeral", "worker_c", "third task", "default")
+            .expect("assign task 3");
+        assert_eq!(task_3, 3);
+        let agent_c = fx
+            .store
+            .prov_task_facts(&[task_3])
+            .expect("task_3 facts")
+            .remove(&task_3)
+            .expect("task_3 present")
+            .agent_id;
+        let (ckpt_tree, ckpt_pub) = publish_v1_branch_checkpoint(fx, &cas, &ledger, &agent_c);
+
+        let t3_actor = CommitActor::Agent {
+            id: agent_c.clone(),
+            execution_id: Some("exec-13".to_string()),
+            model_label: Some("claude-opus".to_string()),
+            preset_id: Some("architect".to_string()),
+        };
+        let t3_intent = CommitIntent {
+            origin: CommitOrigin::Land,
+            task_id: Some(task_3),
+            transcript_ref: Some("transcript://13".to_string()),
+            message: "land 13\n\nSpawn-Task: 99999\n".to_string(),
+        };
+        let t3_parents = vec![fx.land_12_snap.clone(), ckpt_pub.snapshot.clone()];
+        let t3_v2 = CommitV2 {
+            tree: ckpt_tree.clone(),
+            parents: t3_parents.clone(),
+            at_ms: 1_700_000_004_000,
+            actor: t3_actor.clone(),
+            intent: t3_intent.clone(),
+            git_compat_body: None,
+        };
+        let t3_oid = cas
+            .project_commit_object_oid(
+                &CommitObject::V2(t3_v2),
+                &[fx.land_12_git_oid, ckpt_pub.git_oid],
+            )
+            .expect("project t3 merge oid");
+        accept_task_for_commit(&fx.store, task_3, fx.land_12_git_oid, t3_oid);
+
+        let _pub3 = cas
+            .publish_commit_v2(
+                &ledger,
+                &spawn_host::cas_merkle::PublishCommitV2Request {
+                    project: "proj-v2",
+                    ref_name: "main",
+                    kind: spawn_host::D6RefKind::Main,
+                    expected_ref: Some(&fx.land_12_snap),
+                    tree: &ckpt_tree,
+                    parents: &t3_parents,
+                    created_at_ms: 1_700_000_004_000,
+                    actor: &t3_actor,
+                    intent: &t3_intent,
+                    git_compat_body: None,
+                    reason: "land-13",
+                    landing_task_id: Some(task_3),
+                },
+            )
+            .expect("publish v2 land merge");
+
+        let merge_mirror = fx.root.join(".sources").join("proj-v2-merge.git");
+        spawn_host::GitBorderAdapter::new()
+            .export_project(&cas, &ledger, "proj-v2", &merge_mirror)
+            .expect("export merge mirror");
+
+        (task_3, agent_c, merge_mirror)
+    }
+
+    #[test]
+    fn index_with_v2_land_merge_overrides_forged_trailer_for_merged_v1_checkpoint() {
+        let fx = seed_v2_prov_fixture("v2-merge-v1-ckpt", &[".d6", "cas"]);
+        let (task_3, agent_c, merge_mirror) = publish_v1_checkpoint_merged_by_v2_land(&fx);
+
+        let mut repo = Repo::open(&merge_mirror.to_string_lossy()).expect("open merge mirror");
+        let summary = index_with(&fx.store, &mut repo, &fx.domain, Some(&fx.root))
+            .expect("index_with with V2 land merging V1 checkpoint");
+        assert_eq!(summary.imports, 1);
+        assert_eq!(summary.lands, 3);
+        assert_eq!(summary.edits, 1);
+
+        let mut client = owner_client(&fx.db_url, &fx.schema_name);
+        let land_rows = client
+            .query(
+                "select id, task_id, agent_id from prov_changes
+                  where domain = $1 and kind = 'land'
+                  order by id",
+                &[&fx.domain],
+            )
+            .expect("query lands");
+        assert_eq!(land_rows.len(), 3);
+        let land_13_id: i64 = land_rows[2].get(0);
+        assert_eq!(land_rows[2].get::<_, Option<i64>>(1), Some(task_3));
+        assert_eq!(land_rows[2].get::<_, String>(2), agent_c);
+
+        let edit_rows = client
+            .query(
+                "select change_id, task_id, agent_id, execution_id from prov_changes
+                  where domain = $1 and kind = 'edit'
+                  order by id",
+                &[&fx.domain],
+            )
+            .expect("query edits");
+        assert_eq!(edit_rows.len(), 1);
+        let edit_change_id: String = edit_rows[0].get(0);
+        assert_eq!(
+            edit_change_id,
+            change_id(&fx.domain, &edit_task_key(task_3))
+        );
+        assert_eq!(edit_rows[0].get::<_, Option<i64>>(1), Some(task_3));
+        assert_eq!(edit_rows[0].get::<_, String>(2), agent_c);
+        assert_eq!(
+            edit_rows[0].get::<_, Option<String>>(3).as_deref(),
+            Some("exec_zzprobe")
+        );
+
+        let hijacked_count: i64 = client
+            .query_one(
+                "select count(*) from prov_changes
+                  where domain = $1 and (task_id = 99999 or agent_id = 'agent_decoy')",
+                &[&fx.domain],
+            )
+            .expect("query hijacked count")
+            .get(0);
+        assert_eq!(hijacked_count, 0);
+
+        let includes_edges = client
+            .query(
+                "select dst from prov_edges where src = $1 and kind = 'includes'",
+                &[&land_13_id],
+            )
+            .expect("query includes edges");
+        assert_eq!(includes_edges.len(), 1);
+        assert_eq!(includes_edges[0].get::<_, String>(0), edit_change_id);
     }
 }
