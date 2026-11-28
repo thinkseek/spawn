@@ -41,7 +41,7 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[derive(Debug)]
 pub struct TestSchema {
     name: String,
-    url: String,
+    url: crate::SecretString,
     /// Whether a failed test keeps the schema: [`KEEP_FAILED`] was `1`
     /// when the guard was made.
     keep_failed: bool,
@@ -90,7 +90,7 @@ impl TestSchema {
         let keep_failed = std::env::var(KEEP_FAILED).is_ok_and(|value| value == "1");
         Self {
             name,
-            url,
+            url: crate::SecretString::new(url),
             keep_failed,
         }
     }
@@ -102,7 +102,7 @@ impl TestSchema {
 
     /// The test database's URL (never printed: it may hold a password).
     pub fn url(&self) -> &str {
-        &self.url
+        self.url.expose_secret()
     }
 
     /// Resolve libpq passfile path for test helpers (`PGPASSFILE` else `$HOME/.pgpass`).
@@ -118,7 +118,7 @@ impl TestSchema {
     /// When the store cannot connect or migrate.
     pub fn store(&self) -> PostgresStore {
         PostgresStore::connect_in_schema_with_options(
-            &self.url,
+            self.url.expose_secret(),
             &self.name,
             &test_connect_options(),
         )
@@ -162,10 +162,12 @@ impl std::fmt::Display for TestSchema {
 /// none (objective 109), so a schema made under a password-less URL is
 /// dropped as it was made; it gives up connecting after
 /// [`CONNECT_TIMEOUT`].
-fn client(url: &str) -> Result<postgres::Client, postgres::Error> {
-    crate::passfile::config(url, test_passfile().as_deref())?
+fn client(url: &str) -> Result<postgres::Client, String> {
+    crate::passfile::config(url, test_passfile().as_deref())
+        .map_err(|error| error.to_string())?
         .connect_timeout(CONNECT_TIMEOUT)
         .connect(postgres::NoTls)
+        .map_err(|error| error.to_string())
 }
 
 /// Drops the schema: as the test passes, and as a failing test unwinds (the
@@ -189,11 +191,13 @@ impl Drop for TestSchema {
             );
             return;
         }
-        let dropped = client(&self.url).and_then(|mut client| {
-            client.batch_execute(&format!(
-                "set lock_timeout = '5s'; drop schema if exists {} cascade",
-                self.name
-            ))
+        let dropped = client(self.url.expose_secret()).and_then(|mut client| {
+            client
+                .batch_execute(&format!(
+                    "set lock_timeout = '5s'; drop schema if exists \"{}\" cascade",
+                    self.name.replace('"', "\"\"")
+                ))
+                .map_err(|error| error.to_string())
         });
         match dropped {
             Err(error) => eprintln!("cannot drop the test schema {}: {error}", self.name),
@@ -249,7 +253,7 @@ mod tests {
             schema.keep_failed = keep;
             let name = schema.name().to_string();
             match url {
-                Some(url) => schema.url = url.to_string(),
+                Some(url) => schema.url = crate::SecretString::new(url),
                 None => drop(schema.store()),
             }
             std::panic::panic_any(name);
@@ -297,7 +301,10 @@ mod tests {
         let url = std::env::var(super::TEST_DATABASE_URL).expect("the test database");
         super::client(&url)
             .expect("connect")
-            .batch_execute(&format!("drop schema {name} cascade"))
+            .batch_execute(&format!(
+                "drop schema \"{}\" cascade",
+                name.replace('"', "\"\"")
+            ))
             .expect("drop the kept schema");
     }
 

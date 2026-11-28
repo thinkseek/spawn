@@ -78,7 +78,7 @@ impl Monitor {
             let mut out = Vec::new();
             self.archive_event(row, &mut out);
             if let Some(id) = row["event_id"].as_i64() {
-                self.archives_after = self.archives_after.max(id);
+                self.archives_after = id;
             }
             if !out.is_empty() {
                 record(self, out, lines);

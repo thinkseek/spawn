@@ -1,22 +1,23 @@
-//! Waking on change: the event watermark (the record) and
-//! `LISTEN spawn_events` (the hint).
+//! Waking on change: the committed event watermark (authoritative boundary)
+//! and `LISTEN spawn_events` (wake-up hint).
 //!
 //! `spawn loop` decides what to do from records, and a record is written
 //! only by an append: `spawn_append_trusted` notifies `spawn_events` with
-//! every event it writes. So two things say the same thing about the log,
+//! every event it writes. So two things say something about the log,
 //! and only one of them is authoritative:
 //!
-//! - the watermark, `max(spawn_events.id)` ([`PostgresStore::watermark`]):
-//!   the index-only read of the log's primary key that names everything
-//!   written up to it. It is the record: a step that has acted on the
-//!   watermark has acted on every event at or below it, and a step whose
-//!   watermark is behind has work to do;
-//! - a notification on `spawn_events` ([`PostgresStore::listen`]): a hint
-//!   that the watermark may have moved, which ends the loop's wait at once
-//!   so a change is acted on sooner. A notification lost, missed or never
-//!   sent proves nothing, and its absence is never read as "nothing
-//!   happened": the next pass reads the watermark anyway
-//!   (docs/design.md §14).
+//! - the committed watermark ([`CommittedWatermark`], [`PostgresStore::committed_watermark`],
+//!   [`PostgresStore::watermark`]): bounded below any in-flight transaction
+//!   (`commit_xid < wm.safe_xid` and strictly before any later-id out-of-order
+//!   commit via `commit_watermark_cte!()`). A step that has acted on this
+//!   watermark has acted on every committed event at or below it, and an
+//!   in-flight writer with a smaller `id` holds the watermark back until it
+//!   commits so slower transactions are never silently skipped;
+//! - a notification on `spawn_events` ([`PostgresStore::listen`]): an advisory
+//!   wake-up **hint** only, never a commit or visibility boundary. A lost,
+//!   missed, reordered, or uncommitted notification proves nothing, and its
+//!   absence is never read as "nothing happened": the next pass reads the
+//!   authoritative committed watermark anyway (docs/design.md §14).
 //!
 //! Times the loop waits for are not in this module: they are computed by
 //! each step from the records it read (a delivery's retry, a stall's bound,
@@ -31,10 +32,62 @@ use spawn_core::port::StoreError;
 
 use crate::backend;
 
-/// The log's watermark: the largest event id written, `0` on an empty log.
-/// A read of the primary key alone (PostgreSQL answers `max` with the index's
-/// last entry, never a table scan).
-pub(crate) const WATERMARK: &str = "select coalesce(max(id), 0) from spawn_events";
+/// Authoritative committed log frontier: `(commit_xid, event_id)` of the
+/// newest committed event strictly below `wm.safe_xid` (`commit_watermark_cte!()`),
+/// ordered lexicographically by `commit_xid` first and `event_id` second.
+///
+/// Both fields are `0` on an empty or wholly uncommitted log. Safe to compare
+/// monotonically across commits and to resume replay from `(commit_xid, id) >
+/// cursor` without skipping out-of-order lower `event_id` commits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CommittedWatermark {
+    /// Transaction ID (`xid8`) of the frontier committed event (`0` when empty).
+    pub commit_xid: u64,
+    /// Event ID of the frontier committed event (`0` when empty).
+    pub event_id: i64,
+}
+
+impl CommittedWatermark {
+    /// Construct a [`CommittedWatermark`] from a `(commit_xid, event_id)` pair.
+    #[must_use]
+    pub const fn new(commit_xid: u64, event_id: i64) -> Self {
+        Self {
+            commit_xid,
+            event_id,
+        }
+    }
+
+    /// Return the scalar `i64` event-id of the frontier event.
+    #[must_use]
+    pub const fn as_i64(self) -> i64 {
+        self.event_id
+    }
+}
+
+pub(crate) fn parse_commit_xid(raw: &str) -> Result<u64, StoreError> {
+    raw.parse::<u64>()
+        .map_err(|error| StoreError::Corrupt(format!("invalid commit_xid {raw:?}: {error}")))
+}
+
+/// The log's authoritative committed frontier in `(commit_xid, id)` order
+/// strictly below the schema-scoped `xid8` commit watermark
+/// (`commit_watermark_cte!()`), `('0', 0)` on an empty or wholly uncommitted log.
+pub(crate) const WATERMARK: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    "
+      select coalesce(top.commit_xid, '0'::xid8)::text as xid,
+             coalesce(top.id, 0) as id,
+             wm.wm_raced
+        from wm
+        left join lateral (
+            select commit_xid, id
+              from spawn_events
+             where commit_xid < wm.safe_xid
+             order by commit_xid desc, id desc
+             limit 1
+        ) top on true"
+);
 
 /// When the earliest leased command in the queue may be claimed: the next
 /// time the Bridge has work it cannot do now. `null` when nothing is
@@ -50,9 +103,19 @@ pub(crate) const NEXT_LEASE: &str = concat!(
 const CHANNEL: &str = "spawn_events";
 
 impl PostgresStore {
-    /// The log's watermark (`WATERMARK`).
+    /// Authoritative committed event frontier (`WATERMARK`), typed as
+    /// [`CommittedWatermark`].
+    pub fn committed_watermark(&self) -> Result<CommittedWatermark, StoreError> {
+        let row = self.query_one_watermark_prepared(WATERMARK, &[])?;
+        let xid: String = row.get("xid");
+        let commit_xid = parse_commit_xid(&xid)?;
+        Ok(CommittedWatermark::new(commit_xid, row.get("id")))
+    }
+
+    /// Scalar committed event watermark (`WATERMARK`), equivalent to
+    /// `self.committed_watermark()?.as_i64()`.
     pub fn watermark(&self) -> Result<i64, StoreError> {
-        Ok(self.query_one_prepared(WATERMARK, &[])?.get(0))
+        self.committed_watermark().map(CommittedWatermark::as_i64)
     }
 
     /// The time the earliest unfinished command may be claimed
@@ -97,8 +160,8 @@ impl PostgresStore {
         // `spawn serve`'s single shared hub in `ServePools` therefore holds 1 pooled
         // events connection + 1 private connection, staying within the default
         // `SPAWN_SERVE_EVENTS_POOL=2` budget solely because there is a single hub.
-        let config = crate::passfile::config(&self.url, self.passfile.as_deref())
-            .map_err(|error| backend(&error))?;
+        let config = crate::passfile::config(self.url.expose_secret(), self.passfile.as_deref())
+            .map_err(|error| crate::passfile_store_error(&error))?;
         let mut client = config.connect(NoTls).map_err(|error| backend(&error))?;
         client
             .batch_execute(&format!("listen {channel}"))
@@ -108,8 +171,10 @@ impl PostgresStore {
 }
 
 /// A connection that holds `LISTEN spawn_events` for the loop, so a change
-/// ends its wait at once. Notifications are only a hint to look again; the
-/// watermark is what says whether anything changed ([`PostgresStore::watermark`]).
+/// ends its wait at once. Notifications are **only an advisory hint** to look
+/// again — never a commit or visibility boundary; always read
+/// [`PostgresStore::committed_watermark`] / [`PostgresStore::watermark`] to determine
+/// which committed events exist.
 pub struct Listener {
     client: Client,
 }
@@ -316,5 +381,199 @@ mod tests {
         drop(listener);
         drop(notify);
         drop(store);
+    }
+
+    /// Out-of-order commits: an in-flight writer holding a lower event id (`id_a`)
+    /// holds `committed_watermark()` / `watermark()` below `id_a` even after another
+    /// session commits a higher `id_b > id_a`, advancing cleanly to `id_b` once the
+    /// earlier writer commits. Needs `SPAWN_TEST_DATABASE_URL`.
+    #[test]
+    fn watermark_holds_back_behind_uncommitted_transaction_and_advances_on_commit() {
+        use postgres::{Client, NoTls};
+
+        let url = std::env::var(crate::testing::TEST_DATABASE_URL)
+            .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database");
+        let schema = crate::testing::TestSchema::new("wake_xid8_wm");
+        let store = PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &crate::testing::test_connect_options(),
+        )
+        .expect("migrate");
+        let baseline = store.committed_watermark().expect("baseline");
+
+        let connect_in_schema = || -> Client {
+            let mut client =
+                crate::passfile::config(&url, crate::testing::test_passfile().as_deref())
+                    .expect("config")
+                    .connect(NoTls)
+                    .expect("connect");
+            client
+                .batch_execute(&format!("set search_path to {}", schema.name()))
+                .expect("search_path");
+            client
+        };
+
+        let kind = serde_json::json!({"name": "session.noted", "detail": {"text": "wm test"}});
+        let mut conn_a = connect_in_schema();
+        let mut conn_b = connect_in_schema();
+
+        let mut tx_a = conn_a.transaction().expect("begin tx_a");
+        let id_a: i64 = tx_a
+            .query_one(
+                "select out_id from spawn_append_trusted('agent_a', 'session_wm_a', null, 'bridge', null, $1)",
+                &[&kind],
+            )
+            .expect("append a")
+            .get(0);
+
+        let id_b: i64 = conn_b
+            .query_one(
+                "select out_id from spawn_append_trusted('agent_b', 'session_wm_b', null, 'bridge', null, $1)",
+                &[&kind],
+            )
+            .expect("append b")
+            .get(0);
+        assert!(id_b > id_a, "expected id_b ({id_b}) > id_a ({id_a})");
+
+        let while_open = store
+            .committed_watermark()
+            .expect("watermark while tx_a open");
+        assert!(
+            while_open <= baseline && while_open.event_id < id_a,
+            "committed watermark {while_open:?} jumped past uncommitted id_a={id_a} (baseline={baseline:?})"
+        );
+        assert_eq!(
+            store.watermark().expect("scalar watermark"),
+            while_open.as_i64()
+        );
+
+        tx_a.commit().expect("commit tx_a");
+        let after_commit = store.committed_watermark().expect("watermark after commit");
+        assert_eq!(
+            after_commit.event_id, id_b,
+            "watermark advances past both committed writes once tx_a commits: {after_commit:?}"
+        );
+        assert!(after_commit > baseline && after_commit.commit_xid > 0);
+    }
+
+    fn tx_row_xid(tx: &mut postgres::Transaction<'_>, event_id: i64) -> u64 {
+        tx.query_one(
+            "select commit_xid::text from spawn_events where id = $1",
+            &[&event_id],
+        )
+        .expect("commit_xid")
+        .get::<_, String>(0)
+        .parse()
+        .expect("parse commit_xid")
+    }
+
+    /// Reversed `commit_xid` vs `id` order with a third older-XID blocker:
+    /// B allocates `x_b` first, C allocates `x_c` second (staying open), A
+    /// allocates `x_a` third and appends `id_a < id_b`, then B appends `id_b`
+    /// and commits first. The frontier advances to `(x_b, id_b)`, does NOT
+    /// move backward `id_b -> 0 -> id_b` when A commits behind open C, advances
+    /// monotonically to `(x_a, id_a)` once C commits, and `read_global` from
+    /// `id_b` recovers `id_a` without skipping or duplicating.
+    #[test]
+    fn watermark_advances_monotonically_in_xid_order_with_reversed_ids_and_blocker() {
+        use postgres::{Client, NoTls};
+        use spawn_core::event::GlobalPosition;
+        use spawn_core::port::EventLog;
+
+        let url = std::env::var(crate::testing::TEST_DATABASE_URL)
+            .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database");
+        let schema = crate::testing::TestSchema::new("wake_rev_xid");
+        let store = PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &crate::testing::test_connect_options(),
+        )
+        .expect("migrate");
+        let baseline = store.committed_watermark().expect("baseline");
+
+        let connect_in_schema = || -> Client {
+            let mut client =
+                crate::passfile::config(&url, crate::testing::test_passfile().as_deref())
+                    .expect("config")
+                    .connect(NoTls)
+                    .expect("connect");
+            let quoted = crate::ValidatedSchemaName::parse(schema.name())
+                .expect("schema")
+                .quote_ident();
+            client
+                .batch_execute(&format!("set search_path to {quoted}"))
+                .expect("search_path");
+            client
+        };
+
+        let kind = serde_json::to_value(spawn_core::event::EventKind::ArchiveFailed {
+            native: "rev_xid".to_string(),
+            reason: "test".to_string(),
+        })
+        .expect("event kind json");
+        let (mut conn_b, mut conn_c, mut conn_a) = (
+            connect_in_schema(),
+            connect_in_schema(),
+            connect_in_schema(),
+        );
+        let mut tx_b = conn_b.transaction().expect("begin tx_b");
+        let id_b0: i64 = tx_b
+            .query_one("select out_id from spawn_append_trusted('agent_b0', 'session_rev_b0', null, 'bridge', null, $1)", &[&kind])
+            .expect("append b0")
+            .get(0);
+        let x_b = tx_row_xid(&mut tx_b, id_b0);
+        let mut tx_c = conn_c.transaction().expect("begin tx_c");
+        let id_c: i64 = tx_c
+            .query_one("select out_id from spawn_append_trusted('agent_c', 'session_rev_c', null, 'bridge', null, $1)", &[&kind])
+            .expect("append c")
+            .get(0);
+        let x_c = tx_row_xid(&mut tx_c, id_c);
+        let mut tx_a = conn_a.transaction().expect("begin tx_a");
+        let id_a: i64 = tx_a
+            .query_one("select out_id from spawn_append_trusted('agent_a', 'session_rev_a', null, 'bridge', null, $1)", &[&kind])
+            .expect("append a")
+            .get(0);
+        let x_a = tx_row_xid(&mut tx_a, id_a);
+        assert!(x_b < x_c && x_c < x_a, "x_b={x_b}, x_c={x_c}, x_a={x_a}");
+
+        // B appends id_b > id_a under earlier x_b and commits first.
+        let id_b: i64 = tx_b
+            .query_one("select out_id from spawn_append_trusted('agent_b', 'session_rev_b', null, 'bridge', null, $1)", &[&kind])
+            .expect("append b")
+            .get(0);
+        assert!(id_a < id_b, "expected id_a ({id_a}) < id_b ({id_b})");
+
+        tx_b.commit().expect("commit tx_b");
+        let wm_b = store.committed_watermark().expect("wm after tx_b commit");
+        assert_eq!(wm_b, super::CommittedWatermark::new(x_b, id_b));
+        assert!(wm_b > baseline);
+
+        // Now A (with x_a > x_c and id_a < id_b) commits while C stays open.
+        tx_a.commit().expect("commit tx_a");
+        assert_eq!(
+            store
+                .committed_watermark()
+                .expect("wm while blocker C open"),
+            wm_b,
+            "frontier must not move backward behind committed B when lower-id A commits above open blocker C"
+        );
+
+        // Release blocker C -> frontier advances monotonically in XID order to (x_a, id_a).
+        tx_c.commit().expect("commit tx_c");
+        let wm_after_c = store
+            .committed_watermark()
+            .expect("wm after blocker C commit");
+        assert_eq!(wm_after_c, super::CommittedWatermark::new(x_a, id_a));
+        assert!(wm_after_c > wm_b);
+
+        let replayed = store
+            .read_global(GlobalPosition(u64::try_from(id_b).expect("i64")), 100)
+            .expect("read_global from id_b");
+        let replayed_ids: Vec<i64> = replayed
+            .iter()
+            .map(|r| i64::try_from(r.position.0).expect("i64"))
+            .collect();
+        assert_eq!(replayed_ids, vec![id_c, id_a]);
     }
 }

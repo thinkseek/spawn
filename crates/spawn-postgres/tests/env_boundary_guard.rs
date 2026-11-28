@@ -814,6 +814,97 @@ fn scan_source(rel_or_abs_path: &Path, src: &str) -> Vec<Violation> {
     violations_from_lines(rel_or_abs_path, src, violated_lines)
 }
 
+fn check_whoami_use_subtree(
+    slice: &[Token],
+    prefix: &[String],
+    violated_lines: &mut BTreeSet<usize>,
+) {
+    let mut i = usize::from(
+        slice
+            .first()
+            .is_some_and(|t| t.kind == TokenKind::ColonColon),
+    );
+    let mut cur_path = prefix.to_vec();
+    let mut leaf_line = slice.first().map_or(1, |t| t.line);
+
+    while i < slice.len() {
+        let tok = &slice[i];
+        if tok.kind == TokenKind::Star {
+            if cur_path.first().is_some_and(|root| root == "whoami") {
+                violated_lines.insert(tok.line);
+            }
+            return;
+        }
+        if tok.kind == TokenKind::Open(Delim::Brace) {
+            if let Some(close) = matching_close(slice, i) {
+                for item in split_top_level_commas(&slice[i + 1..close]) {
+                    check_whoami_use_subtree(item, &cur_path, violated_lines);
+                }
+            }
+            return;
+        }
+        if tok.is_kw("as") {
+            if cur_path.first().is_some_and(|root| root == "whoami") {
+                let err_line = slice.get(i + 1).map_or(leaf_line, |t| t.line);
+                violated_lines.insert(err_line);
+            }
+            return;
+        }
+        if let Some(seg) = tok.ident_name() {
+            cur_path.push(seg.to_string());
+            leaf_line = tok.line;
+            i += 1;
+            if slice
+                .get(i)
+                .is_some_and(|t| t.kind == TokenKind::ColonColon)
+            {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+
+    if cur_path.first().is_some_and(|root| root == "whoami") {
+        violated_lines.insert(leaf_line);
+    }
+}
+
+fn scan_whoami_source(rel_or_abs_path: &Path, src: &str) -> Vec<Violation> {
+    let tokens = tokenize(src);
+    let prod_tokens = strip_cfg_test_tokens(&tokens);
+    let mut violated_lines = BTreeSet::new();
+
+    for (_, use_slice) in collect_use_slices(&prod_tokens) {
+        check_whoami_use_subtree(use_slice, &[], &mut violated_lines);
+    }
+
+    let n = prod_tokens.len();
+    for i in 0..n {
+        if prod_tokens[i].is_kw("extern")
+            && prod_tokens.get(i + 1).is_some_and(|t| t.is_kw("crate"))
+            && prod_tokens.get(i + 2).and_then(Token::ident_name) == Some("whoami")
+        {
+            violated_lines.insert(prod_tokens[i + 2].line);
+            continue;
+        }
+        if prod_tokens[i].ident_name() == Some("whoami")
+            && prod_tokens
+                .get(i + 1)
+                .is_some_and(|t| t.kind == TokenKind::ColonColon)
+        {
+            let preceded_by_ident_colon = i >= 2
+                && prod_tokens[i - 1].kind == TokenKind::ColonColon
+                && prod_tokens[i - 2].ident_name().is_some();
+            if !preceded_by_ident_colon {
+                violated_lines.insert(prod_tokens[i].line);
+            }
+        }
+    }
+
+    violations_from_lines(rel_or_abs_path, src, violated_lines)
+}
+
 fn is_forbidden_lint_args(args: &[Token]) -> bool {
     let mut i = 0usize;
     while i < args.len() {
@@ -1327,6 +1418,55 @@ fn workspace_production_code_contains_zero_unallowlisted_env_var_or_suppress_all
             .map(|v| format!("  {}:{}: {}", v.path.display(), v.line, v.snippet))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+#[test]
+fn spawn_postgres_production_has_no_implicit_os_user_fallback() {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    collect_rs_files(&root.join("crates/spawn-postgres/src"), &mut files);
+    let allowed = Path::new("crates/spawn-postgres/src/passfile.rs");
+    let mut violations = Vec::new();
+    let mut passfile_whoami_hits = Vec::new();
+    for file in files {
+        let rel = file.strip_prefix(&root).unwrap_or(&file);
+        let text =
+            fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        let hits = scan_whoami_source(rel, &text);
+        if rel == allowed {
+            passfile_whoami_hits = hits;
+        } else {
+            violations.extend(hits);
+        }
+    }
+    assert_eq!(
+        passfile_whoami_hits.len(),
+        1,
+        "only crates/spawn-postgres/src/passfile.rs single user-resolution boundary may call whoami: {passfile_whoami_hits:?}"
+    );
+    assert!(
+        violations.is_empty(),
+        "forbidden production whoami reference(s) outside {}:\n{}",
+        allowed.display(),
+        violations
+            .iter()
+            .map(|v| format!("  {}:{}: {}", v.path.display(), v.line, v.snippet))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let probe = scan_whoami_source(
+        Path::new("synthetic.rs"),
+        "use ::whoami as os_user;\n\
+         pub fn bad() { let _ = whoami::username().ok(); }\n\
+         pub fn ok() { let whoami = \"ignored\"; fn nested() {} let _ = (whoami, crate::whoami::local()); }\n\
+         #[cfg(test)] mod tests { fn ok() { let _ = whoami::username(); } }\n",
+    );
+    let lines: Vec<usize> = probe.iter().map(|v| v.line).collect();
+    assert_eq!(
+        lines,
+        vec![1, 2],
+        "probe must flag crate-level whoami use/path and ignore local identifiers and cfg(test): {probe:?}"
     );
 }
 

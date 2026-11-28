@@ -29,9 +29,57 @@ pub(crate) const MISSION_GATES: &str = "select coalesce(jsonb_agg(jsonb_build_ob
     'mission', id, 'gate', gate, 'source', sources ->> 0) order by id), '[]'::jsonb)
   from mission_missions where state in ('open', 'active')";
 
-/// The event watermark and the database's clock, in one index-only read:
-/// an idle pass costs the loop one statement (objective 023).
-pub(crate) const CLOCK: &str = "select coalesce(max(id), 0), spawn_now_ms() from spawn_events";
+/// Lower-bound `commit_xid` resolution for an arbitrary event-id cursor `$param`
+/// under `commit_watermark_cte!()`, matching `event_log::READ_GLOBAL` and
+/// `sessions::LOG_AFTER` so replay from a higher `id` with an earlier XID never
+/// skips lower-`id` rows committed in later transactions.
+macro_rules! xid_cursor_for {
+    ($param:literal) => {
+        concat!(
+            "case
+                when ",
+            $param,
+            "::bigint <= 0::bigint then '0'::xid8
+                else coalesce(
+                    (select w.commit_xid from spawn_events w where w.id = ",
+            $param,
+            "::bigint),
+                    (select w.commit_xid
+                       from spawn_events w
+                      where w.id < ",
+            $param,
+            "::bigint
+                        and w.commit_xid < wm.safe_xid
+                      order by w.commit_xid desc, w.id desc
+                      limit 1),
+                    '0'::xid8
+                )
+            end"
+        )
+    };
+}
+
+/// The committed event frontier (`commit_watermark_cte!()` in `(commit_xid, id)`
+/// order) and the database's clock, in one statement: an idle pass costs the
+/// loop one statement (objective 023), while in-flight transactions hold back
+/// the watermark so later commits on other sessions cannot jump past them.
+pub(crate) const CLOCK: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    "
+      select coalesce(top.commit_xid, '0'::xid8)::text as xid,
+             coalesce(top.id, 0) as id,
+             spawn_now_ms() as now_ms,
+             wm.wm_raced
+        from wm
+        left join lateral (
+            select commit_xid, id
+              from spawn_events
+             where commit_xid < wm.safe_xid
+             order by commit_xid desc, id desc
+             limit 1
+        ) top on true"
+);
 
 /// For a typed message (`spawn_command_message`'s `typed`):
 /// `read_since_typed`, how many transcript lines of its session the Bridge
@@ -175,14 +223,55 @@ pub(crate) const NOW: &str = "select spawn_now_ms()";
 /// task's delivery bound needs (its `task.assigned` record, and whether its
 /// agent holds a delivered or reported task).
 ///
-/// `watermark` is the newest event id, read by the same statement and so
-/// from the same snapshot as the missions and tasks: the loop's checks go on
-/// from it, so a record committed after this read is fed by them, and one
-/// the missions and tasks already hold is not fed again (objective 106).
-pub(crate) const MIRROR: &str = r"
+/// SQL predicate evaluating `pg_visible_in_snapshot($xid, snap)` against a
+/// textual `pg_current_snapshot()::text` (`"xmin:xmax:xip1,xip2,..."`) bound
+/// as parameter `$param`.
+macro_rules! snapshot_visible_pred {
+    ($xid:literal, $param:literal) => {
+        concat!(
+            "((",
+            $xid,
+            "::text)::numeric < nullif(split_part(",
+            $param,
+            ", ':', 1), '')::numeric or ((",
+            $xid,
+            "::text)::numeric < nullif(split_part(",
+            $param,
+            ", ':', 2), '')::numeric and (nullif(split_part(",
+            $param,
+            ", ':', 3), '') is null or not (",
+            $xid,
+            "::text = any(string_to_array(nullif(split_part(",
+            $param,
+            ", ':', 3), ''), ','))))))"
+        )
+    };
+}
+
+/// `watermark` / `watermark_xid` and `clock` / `clock_xid` report the same
+/// snapshot's strict `< wm.safe_xid` frontier in `(commit_xid, id)` order.
+/// `snapshot` / `snapshot_xmax` export `pg_current_snapshot()` from that exact
+/// statement snapshot so callers can replay only records visible in `MIRROR`'s
+/// snapshot at start and later exclude them in [`CONTROL`] without skipping
+/// earlier-XID concurrent control writers that commit afterwards.
+pub(crate) const MIRROR: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    r", clock_top as (
+  select e.commit_xid, e.id
+    from spawn_events e, wm
+   where e.commit_xid < wm.safe_xid
+   order by e.commit_xid desc, e.id desc
+   limit 1
+)
 select jsonb_build_object(
   'now_ms', spawn_now_ms(),
-  'watermark', (select coalesce(max(id), 0) from spawn_events),
+  'watermark', coalesce((select c.id from clock_top c), 0),
+  'watermark_xid', coalesce((select c.commit_xid from clock_top c), '0'::xid8)::text,
+  'clock', coalesce((select c.id from clock_top c), 0),
+  'clock_xid', coalesce((select c.commit_xid from clock_top c), '0'::xid8)::text,
+  'snapshot', pg_current_snapshot()::text,
+  'snapshot_xmax', pg_snapshot_xmax(pg_current_snapshot())::text,
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
         'id', m.id, 'state', m.state, 'halted', m.halted, 'accept', m.accept,
         'gated', m.gate is not null, 'gate_rejections', m.gate_rejections,
@@ -248,7 +337,10 @@ select jsonb_build_object(
                 and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
                 and e.kind -> 'detail' -> 'record' ->> 'evidence' = 'load_sensitive_parked'
               order by e.id desc limit 1) end)
-      order by k.id) from mission_tasks k), '[]'::jsonb))";
+      order by k.id) from mission_tasks k), '[]'::jsonb)) as payload,
+  wm.wm_raced
+  from wm"
+);
 
 /// Every alert row, and the newest transition event id: the loop reads its
 /// alerts back after a restart, and fires nothing twice.
@@ -265,78 +357,172 @@ select jsonb_build_object(
         'cleared_evidence', a.cleared_evidence)
       order by a.fired_at_ms, a.key) from spawn_alerts a), '[]'::jsonb))";
 
-/// The control records after `$1`, oldest first, at most `$2`: what the loop
-/// has not looked at yet. `next` is the event id it continues from (the
-/// batch's last one, or `$1` when there was none).
-/// The batch is read once: `next` and `records` are that one read's last id
-/// and rows, not two reads of the control stream (the loop reads it on every
-/// pass it acts on).
-pub(crate) const CONTROL: &str = r"
-with batch as (
-  select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
-    from spawn_events e
+/// The committed control records after `$1` (in `(commit_xid, id)` order) below
+/// the `xid8` watermark, at most `$2`, optionally excluding transactions already
+/// visible in the textual snapshot `$3` (`pg_current_snapshot()::text`): what
+/// the loop has not looked at yet. `next` / `next_xid` mark the batch's last row
+/// (or `$1` when empty), and `watermark` / `watermark_xid` record this query's
+/// own snapshot frontier so the caller never replays records committed between
+/// `CLOCK` and `CONTROL`.
+pub(crate) const CONTROL: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    r", top as (
+  select coalesce(t.commit_xid, '0'::xid8) as commit_xid,
+         coalesce(t.id, 0::bigint) as id
+    from wm
+    left join lateral (
+        select e.commit_xid, e.id
+          from spawn_events e
+         where e.commit_xid < wm.safe_xid
+         order by e.commit_xid desc, e.id desc
+         limit 1
+    ) t on true
+), pos as (
+  select ",
+    xid_cursor_for!("$1"),
+    r" as after_xid,
+         greatest($1::bigint, 0::bigint) as after_id
+    from wm
+), batch as (
+  select e.commit_xid, e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
+    from spawn_events e, wm, pos
    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-     and e.id > $1
-   order by e.id limit $2)
+     and e.commit_xid < wm.safe_xid
+     and (e.commit_xid, e.id) > (pos.after_xid, pos.after_id)
+     and ($3::text is null or not ",
+    snapshot_visible_pred!("e.commit_xid", "$3"),
+    r")
+   order by e.commit_xid, e.id limit $2
+), last_row as (
+  select b.commit_xid, b.id
+    from batch b
+   order by b.commit_xid desc, b.id desc
+   limit 1
+)
 select jsonb_build_object(
-  'next', coalesce(max(b.id), $1),
-  'records', coalesce(jsonb_agg(jsonb_build_object(
-        'event_id', b.id, 'at_ms', b.recorded_at_ms, 'record', b.record)
-      order by b.id), '[]'::jsonb))
-from batch b";
+          'next', coalesce((select l.id from last_row l), $1),
+          'next_xid', coalesce((select l.commit_xid from last_row l), pos.after_xid)::text,
+          'watermark', top.id,
+          'watermark_xid', top.commit_xid::text,
+          'records', coalesce((
+              select jsonb_agg(jsonb_build_object(
+                    'event_id', b.id, 'commit_xid', b.commit_xid::text,
+                    'at_ms', b.recorded_at_ms, 'record', b.record)
+                  order by b.commit_xid, b.id)
+                from batch b
+          ), '[]'::jsonb)) as payload,
+       wm.wm_raced
+  from wm, pos, top"
+);
 
-/// The transcript archive's events with an id after `$1`, oldest first
-/// (objective 193, `archive_failed`): the Bridge's `archive.failed` and
-/// `archive.resumed` (objective 179), written on a change only, so the rows
-/// are few; the index on `(event_name, recorded_at_ms)` finds them.
-pub(crate) const ARCHIVES: &str = r"
-select coalesce(jsonb_agg(jsonb_build_object(
-      'event_id', e.id, 'name', e.event_name, 'agent_id', e.agent_id,
-      'session_id', e.session_id, 'at_ms', e.recorded_at_ms,
-      'native', e.kind -> 'detail' ->> 'native',
-      'reason', e.kind -> 'detail' ->> 'reason')
-    order by e.id), '[]'::jsonb)
-from spawn_events e
-where e.event_name in ('archive.failed', 'archive.resumed') and e.id > $1";
+/// The transcript archive's committed events after `$1` in `(commit_xid, id)`
+/// order strictly below the `xid8` watermark (objective 193, `archive_failed`).
+pub(crate) const ARCHIVES: &str = concat!(
+    "with ",
+    commit_watermark_cte!(),
+    r", pos as (
+  select ",
+    xid_cursor_for!("$1"),
+    r" as after_xid,
+         greatest($1::bigint, 0::bigint) as after_id
+    from wm
+)
+select coalesce((
+         select jsonb_agg(jsonb_build_object(
+                  'event_id', e.id, 'name', e.event_name, 'agent_id', e.agent_id,
+                  'session_id', e.session_id, 'at_ms', e.recorded_at_ms,
+                  'native', e.kind -> 'detail' ->> 'native',
+                  'reason', e.kind -> 'detail' ->> 'reason')
+                order by e.commit_xid, e.id)
+           from spawn_events e
+          where e.event_name in ('archive.failed', 'archive.resumed')
+            and e.commit_xid < wm.safe_xid
+            and (e.commit_xid, e.id) > (pos.after_xid, pos.after_id)
+       ), '[]'::jsonb) as payload,
+       wm.wm_raced
+  from wm, pos"
+);
 
-/// The records the alert conditions read, newest last, since `$1`: the ones
-/// objectives 028, 029, 031 and 033 define, and the halt and resume, so a
-/// loop that restarted still knows what is pending.
-pub(crate) const HISTORY: &str = r"
+/// The records the alert conditions read, newest last in `(commit_xid, id)` order,
+/// since `$1`, at most `$2`, optionally restricted to transactions visible in
+/// the textual snapshot `$3` (`pg_current_snapshot()::text`): the ones objectives
+/// 028, 029, 031 and 033 define, and the halt and resume, so a loop that
+/// restarted still knows what is pending.
+pub(crate) const HISTORY: &str = concat!(
+    r"
 select coalesce(jsonb_agg(jsonb_build_object(
-      'event_id', x.id, 'at_ms', x.recorded_at_ms, 'record', x.record)
-    order by x.id), '[]'::jsonb)
-from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
+      'event_id', x.id, 'commit_xid', x.commit_xid::text,
+      'at_ms', x.recorded_at_ms, 'record', x.record)
+    order by x.commit_xid, x.id), '[]'::jsonb)
+from (select e.id, e.commit_xid, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
         from spawn_events e
        where e.session_id = 'session_control' and e.event_name = 'control.recorded'
          and e.recorded_at_ms >= $1
+         and ($3::text is null or ",
+    snapshot_visible_pred!("e.commit_xid", "$3"),
+    r")
          and e.kind -> 'detail' -> 'record' ->> 'type' in
              ('mission.halted', 'mission.resumed', 'admission.waiting', 'admission.admitted',
               'backup.dumped', 'backup.bundled', 'backup.verified',
               'execution.interrupted', 'execution.cleared', 'host.judge')
-       order by e.id
-       limit $2) x";
+       order by e.commit_xid, e.id
+       limit $2) x"
+);
 
 /// The deploys' `deploy.finished` records after the event `$1` and up to
-/// `$2`, recorded since `$3`, oldest first, at most `$4`: what a restarted
-/// loop replays for `deploy_failed`. [`HISTORY`] does not list them: the
-/// step reads them from the last deploy record its `deploy_failed` alerts
-/// name (`$1`), not from a time, so a failure that fired nothing while one
-/// was open is not a new occurrence at every restart. A deploy restarts the
-/// loop and only then records how it ended (deploy/deploy.sh), so its record
-/// is often at or below the new loop's watermark, where no check feeds it.
-pub(crate) const DEPLOYS: &str = r"
+/// `$2` (or visible in textual snapshot `$5` when non-null) in
+/// `(commit_xid, id)` order, recorded since `$3`, at most `$4`: what a restarted
+/// loop replays for `deploy_failed`. [`HISTORY`] does not list them: the step
+/// reads them from the last deploy record its `deploy_failed` alerts name
+/// (`$1`), not from a time, so a failure that fired nothing while one was open
+/// is not a new occurrence at every restart. A deploy restarts the loop and
+/// only then records how it ended (deploy/deploy.sh), so its record is often
+/// at or below the new loop's watermark, where no check feeds it.
+pub(crate) const DEPLOYS: &str = concat!(
+    r"
+with bounds as (
+  select
+    case
+      when $1::bigint <= 0::bigint then '0'::xid8
+      else coalesce(
+        (select w.commit_xid from spawn_events w where w.id = $1::bigint),
+        (select w.commit_xid from spawn_events w where w.id < $1::bigint
+          order by w.commit_xid desc, w.id desc limit 1),
+        '0'::xid8
+      )
+    end as after_xid,
+    greatest($1::bigint, 0::bigint) as after_id,
+    case
+      when $2::bigint <= 0::bigint then '0'::xid8
+      else coalesce(
+        (select w.commit_xid from spawn_events w where w.id = $2::bigint),
+        (select w.commit_xid from spawn_events w where w.id < $2::bigint
+          order by w.commit_xid desc, w.id desc limit 1),
+        '0'::xid8
+      )
+    end as upto_xid,
+    greatest($2::bigint, 0::bigint) as upto_id
+)
 select coalesce(jsonb_agg(jsonb_build_object(
       'event_id', x.id, 'at_ms', x.recorded_at_ms, 'record', x.record)
-    order by x.id), '[]'::jsonb)
-from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
-        from spawn_events e
+    order by x.commit_xid, x.id), '[]'::jsonb)
+from (select e.id, e.commit_xid, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
+        from spawn_events e, bounds b
        where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-         and e.id > $1 and e.id <= $2
+         and (e.commit_xid, e.id) > (b.after_xid, b.after_id)
+         and (
+           ($5::text is null and $2::bigint > 0::bigint
+             and (e.commit_xid, e.id) <= (b.upto_xid, b.upto_id))
+           or ($5::text is not null and ",
+    snapshot_visible_pred!("e.commit_xid", "$5"),
+    r")
+         )
          and e.recorded_at_ms >= $3
          and e.kind -> 'detail' -> 'record' ->> 'type' = 'deploy.finished'
-       order by e.id
-       limit $4) x";
+       order by e.commit_xid, e.id
+       limit $4) x"
+);
 
 /// Every session's latest judgement, with its execution's end when the
 /// session's current execution has ended (an end clears a stuck alert,
@@ -572,11 +758,23 @@ impl PostgresStore {
         }))
     }
 
-    /// The newest event id and the database's clock, in one statement
-    /// (`CLOCK`).
+    /// The newest committed frontier event (`CommittedWatermark`) and the
+    /// database's clock, in one statement (`CLOCK`).
+    pub fn alert_clock_watermark(&self) -> Result<(crate::CommittedWatermark, i64), StoreError> {
+        let row = self.query_one_watermark_prepared(CLOCK, &[])?;
+        let xid: String = row.get("xid");
+        let commit_xid = crate::wake::parse_commit_xid(&xid)?;
+        Ok((
+            crate::CommittedWatermark::new(commit_xid, row.get("id")),
+            row.get("now_ms"),
+        ))
+    }
+
+    /// The newest committed frontier event id and the database's clock, in
+    /// one statement (`CLOCK`).
     pub fn alert_clock(&self) -> Result<(i64, i64), StoreError> {
-        let row = self.query_one(CLOCK, &[])?;
-        Ok((row.get(0), row.get(1)))
+        self.alert_clock_watermark()
+            .map(|(watermark, now)| (watermark.as_i64(), now))
     }
 
     /// The database's clock in epoch ms (`NOW`).
@@ -597,7 +795,7 @@ impl PostgresStore {
 
     /// The missions and tasks the loop compares records against (`MIRROR`).
     pub fn alert_mirror(&self) -> Result<Value, StoreError> {
-        self.query_json(MIRROR, &[])
+        Ok(self.query_one_watermark(MIRROR, &[])?.get(0))
     }
 
     /// Every alert row and the newest transition's event id (`ROWS`).
@@ -607,12 +805,36 @@ impl PostgresStore {
 
     /// The control records after `after` (`CONTROL`).
     pub fn alert_control(&self, after: i64, limit: i64) -> Result<Value, StoreError> {
-        self.query_json(CONTROL, &[&after, &limit])
+        self.alert_control_excluding(after, limit, None)
+    }
+
+    /// The control records after `after` (`CONTROL`), optionally excluding
+    /// transactions already visible in `exclude_snapshot` (`pg_current_snapshot()::text`).
+    pub fn alert_control_excluding(
+        &self,
+        after: i64,
+        limit: i64,
+        exclude_snapshot: Option<&str>,
+    ) -> Result<Value, StoreError> {
+        Ok(self
+            .query_one_watermark(CONTROL, &[&after, &limit, &exclude_snapshot])?
+            .get(0))
     }
 
     /// The alert-family records since `since_ms` (`HISTORY`).
     pub fn alert_history(&self, since_ms: i64, limit: i64) -> Result<Value, StoreError> {
-        self.query_json(HISTORY, &[&since_ms, &limit])
+        self.alert_history_in_snapshot(since_ms, limit, None)
+    }
+
+    /// The alert-family records since `since_ms` (`HISTORY`), optionally
+    /// restricted to transactions visible in `snapshot` (`pg_current_snapshot()::text`).
+    pub fn alert_history_in_snapshot(
+        &self,
+        since_ms: i64,
+        limit: i64,
+        snapshot: Option<&str>,
+    ) -> Result<Value, StoreError> {
+        self.query_json(HISTORY, &[&since_ms, &limit, &snapshot])
     }
 
     /// The `deploy.finished` records after the event `after` and up to
@@ -624,13 +846,27 @@ impl PostgresStore {
         since_ms: i64,
         limit: i64,
     ) -> Result<Value, StoreError> {
-        self.query_json(DEPLOYS, &[&after, &upto, &since_ms, &limit])
+        self.alert_deploys_in_snapshot(after, upto, since_ms, limit, None)
+    }
+
+    /// The `deploy.finished` records after the event `after` and up to
+    /// `upto` (or visible in `snapshot` when provided), recorded since
+    /// `since_ms` (`DEPLOYS`).
+    pub fn alert_deploys_in_snapshot(
+        &self,
+        after: i64,
+        upto: i64,
+        since_ms: i64,
+        limit: i64,
+        snapshot: Option<&str>,
+    ) -> Result<Value, StoreError> {
+        self.query_json(DEPLOYS, &[&after, &upto, &since_ms, &limit, &snapshot])
     }
 
     /// The transcript archive's events after the event id `after`, oldest
     /// first (`ARCHIVES`).
     pub fn alert_archives(&self, after: i64) -> Result<Value, StoreError> {
-        self.query_json(ARCHIVES, &[&after])
+        Ok(self.query_one_watermark(ARCHIVES, &[&after])?.get(0))
     }
 
     /// Every session's latest judgement (`OBSERVATIONS`).
