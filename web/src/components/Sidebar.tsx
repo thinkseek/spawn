@@ -305,28 +305,20 @@ export function Sidebar({
         </nav>
       </div>
 
-      <div className="flex h-10 shrink-0 items-center gap-2 border-t border-sidebar-border px-3 text-micro text-faint-foreground lg:px-4">
+      <div className="flex min-h-10 shrink-0 items-center gap-1.5 border-t border-sidebar-border px-3 py-1 text-micro text-faint-foreground lg:px-3.5">
         <span
           className={cx(
             "size-1.5 shrink-0 rounded-full",
             error ? "bg-destructive" : "bg-success",
           )}
         />
-        <span className="min-w-0 truncate font-mono">{window.location.host}</span>
-        <span className="ml-auto shrink-0">{error ? "offline" : "online"}</span>
+        <span className="min-w-0 flex-1 truncate font-mono">{window.location.host}</span>
+        <span className="shrink-0">{error ? "offline" : "online"}</span>
         {onSignOut && (
-          <button
-            type="button"
-            onClick={onSignOut}
-            title="退出登录 / 更换 Token"
-            aria-label="退出登录"
-            className={cx(
-              "grid size-5 shrink-0 place-items-center rounded-[5px] text-faint-foreground hover:text-foreground",
-              FOCUS_RING_INSET,
-            )}
-          >
-            <LogOut size={12} strokeWidth={2} />
-          </button>
+          <>
+            <SignOutButton onSignOut={onSignOut} compact />
+            <span aria-hidden="true" className="h-4 w-px shrink-0 bg-sidebar-border" />
+          </>
         )}
         <ThemeSwitch />
       </div>
@@ -541,8 +533,8 @@ function NavItem({
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cx(
-        // A compact row: 32 px on pointer, 36 px under touch inside the scrollable rail.
-        "flex h-8 w-full items-center gap-2.5 rounded-control px-2.5 text-left text-label transition-colors pointer-coarse:h-9",
+        // A fixed row: 32 px on pointer, 44 px under a finger inside the unified scrollable rail.
+        "flex h-8 w-full items-center gap-2.5 rounded-control px-2.5 text-left text-label transition-colors pointer-coarse:h-11",
         FOCUS_RING_INSET,
         active
           ? "bg-surface-selected font-semibold text-foreground"
@@ -622,22 +614,14 @@ export function MobileNav({
 >) {
   return (
     <header className="flex shrink-0 flex-col border-b border-sidebar-border bg-sidebar md:hidden">
-      <div className="flex h-11 items-center gap-2 px-3">
+      <div className="flex min-h-12 items-center gap-2 px-3 py-1">
         <Brand />
         <div className="ml-auto flex items-center gap-2">
           {onSignOut && (
-            <button
-              type="button"
-              onClick={onSignOut}
-              title="退出登录 / 更换 Token"
-              aria-label="退出登录"
-              className={cx(
-                "grid size-6 place-items-center rounded-md text-muted-foreground hover:bg-surface-hover hover:text-foreground",
-                FOCUS_RING_INSET,
-              )}
-            >
-              <LogOut size={14} strokeWidth={2} />
-            </button>
+            <>
+              <SignOutButton onSignOut={onSignOut} />
+              <span aria-hidden="true" className="h-4 w-px shrink-0 bg-sidebar-border" />
+            </>
           )}
           <ThemeSwitch />
         </div>
@@ -669,7 +653,7 @@ export function MobileNav({
             onClick={onClick}
             aria-current={view === id ? "page" : undefined}
             className={cx(
-              "inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-caption font-medium transition-colors",
+              "inline-flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-3 text-caption font-medium transition-colors pointer-coarse:h-11",
               view === id
                 ? "bg-surface-selected text-foreground"
                 : "text-muted-foreground hover:text-foreground",
@@ -687,6 +671,56 @@ export function MobileNav({
         ))}
       </nav>
     </header>
+  );
+}
+
+/** Two-step sign-out control so accidental taps next to ThemeSwitch never clear the stored token. */
+function SignOutButton({
+  onSignOut,
+  compact = false,
+}: {
+  onSignOut: () => void;
+  compact?: boolean;
+}) {
+  const [confirming, setConfirming] = useState(false);
+
+  useEffect(() => {
+    if (!confirming) return;
+    const timer = window.setTimeout(() => setConfirming(false), 4_000);
+    return () => window.clearTimeout(timer);
+  }, [confirming]);
+
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        if (!confirming) {
+          setConfirming(true);
+          return;
+        }
+        setConfirming(false);
+        onSignOut();
+      }}
+      onBlur={() => setConfirming(false)}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") setConfirming(false);
+      }}
+      title={confirming ? "再次点击确认清除 Token 并退出" : "退出登录 / 更换 Token"}
+      aria-label={confirming ? "确认退出登录" : "退出登录"}
+      className={cx(
+        "inline-flex shrink-0 items-center gap-1 rounded-control px-2 text-caption font-medium transition-colors",
+        compact
+          ? "h-7 pointer-coarse:h-10"
+          : "h-9 pointer-coarse:h-11",
+        confirming
+          ? "bg-fail-tint text-destructive"
+          : "text-muted-foreground hover:bg-surface-hover hover:text-foreground",
+        FOCUS_RING_INSET,
+      )}
+    >
+      <LogOut size={compact ? 12 : 14} strokeWidth={2} aria-hidden="true" />
+      <span>{confirming ? "确认退出" : "退出"}</span>
+    </button>
   );
 }
 

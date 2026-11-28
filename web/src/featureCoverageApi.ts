@@ -3,7 +3,7 @@
 // `node --test`. Each call reads the server's default project, or with
 // `mission` that mission's configured `--features` project.
 
-import { apiError, apiHeaders, readApi } from "./api";
+import { apiError, apiHeaders, readApi, reportUnauthorizedStatus } from "./api";
 import {
   coverageUrl,
   normalizeCoverageProjects,
@@ -59,6 +59,7 @@ export async function runWildFileScan(
     headers: { ...apiHeaders(), "Content-Type": "application/json" },
     body: "{}",
   });
+  reportUnauthorizedStatus(response.status);
   return parseCoverageHttpResponse(response, apiError);
 }
 
@@ -77,5 +78,6 @@ export async function associateWildFile(
     headers: { ...apiHeaders(), "Content-Type": "application/json" },
     body: JSON.stringify({ path, features }),
   });
+  reportUnauthorizedStatus(response.status);
   return parseCoverageHttpResponse(response, apiError);
 }
