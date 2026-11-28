@@ -230,6 +230,15 @@ impl spawn_core::port::TerminalHost for LocalTerminalHost {
         self.inner().list_dirs(workspace, dir)
     }
 
+    fn list_dirs_up_to(
+        &self,
+        workspace: &WorkspaceId,
+        dir: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, TerminalError> {
+        self.inner().list_dirs_up_to(workspace, dir, limit)
+    }
+
     fn write_new(
         &self,
         workspace: &WorkspaceId,
@@ -271,5 +280,47 @@ impl spawn_core::port::TerminalHost for LocalTerminalHost {
 
     fn agent_changes(&self) -> Vec<TerminalName> {
         self.inner().agent_changes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HerdrCoreHost, LocalTerminalHost};
+    use spawn_core::id::WorkspaceId;
+    use spawn_core::port::{LIST_DIRS_LIMIT, TerminalHost};
+
+    #[test]
+    fn local_terminal_host_list_dirs_up_to_scales_past_64_preserving_newest_first() {
+        let root =
+            std::env::temp_dir().join(format!("spawn-host-list-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
+        for i in 0..120_u64 {
+            let entry = root.join(format!("conv-{i:03}"));
+            std::fs::create_dir(&entry).expect("create dir");
+            let file = std::fs::File::open(&entry).expect("open dir");
+            file.set_modified(base + std::time::Duration::from_secs(i))
+                .expect("set mtime");
+        }
+
+        let host = LocalTerminalHost::HerdrCore(
+            HerdrCoreHost::on_session("spawn-hc", "spawn-hc-list-dirs").expect("herdr core host"),
+        );
+        let ws = WorkspaceId::new("local:/tmp").expect("workspace");
+        let path = root.to_str().expect("utf8 path");
+
+        let legacy = host.list_dirs(&ws, path).expect("legacy list_dirs");
+        assert_eq!(legacy.len(), LIST_DIRS_LIMIT);
+        assert_eq!(legacy.first().map(String::as_str), Some("conv-119"));
+
+        let expanded = host
+            .list_dirs_up_to(&ws, path, 4096)
+            .expect("list_dirs_up_to 4096");
+        assert_eq!(expanded.len(), 120);
+        assert_eq!(expanded.first().map(String::as_str), Some("conv-119"));
+        assert_eq!(expanded.last().map(String::as_str), Some("conv-000"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

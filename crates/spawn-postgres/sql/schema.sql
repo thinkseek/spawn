@@ -485,13 +485,44 @@ create table if not exists spawn_commands (
     error           text,
     created_at_ms   bigint not null,
     finished_at_ms  bigint,
+    shard_total     integer,
+    shard_index     integer,
     unique (principal, idempotency_key)
 );
+
+alter table spawn_commands add column if not exists shard_total integer;
+alter table spawn_commands add column if not exists shard_index integer;
 
 drop index if exists spawn_commands_open;
 create index spawn_commands_open
     on spawn_commands (session_id, id)
     where state not in ('finished', 'failed', 'cancelled');
+
+-- Partial B-tree index enabling empty/idle shards to return in O(log N)
+-- without scanning open commands belonging to other shards.
+drop index if exists spawn_commands_open_shard;
+create index spawn_commands_open_shard
+    on spawn_commands (shard_total, shard_index, id)
+    where state not in ('finished', 'failed', 'cancelled');
+
+-- Active horizontal sharding topology for this schema (`total = 1` unsharded,
+-- `total > 1` partitioned). Shared across workers to reject mixed totals.
+create table if not exists spawn_shard_topology (
+    singleton      boolean primary key default true check (singleton),
+    shard_total    integer not null check (shard_total >= 1 and shard_total <= 65535),
+    updated_at_ms  bigint  not null
+);
+
+-- Live worker partition slot registrations verified against PG session
+-- advisory locks (`WORKER_LOCK_NAMESPACE = 1399957338`).
+create table if not exists spawn_bridge_shards (
+    worker         text    primary key,
+    shard_index    integer not null check (shard_index >= 0),
+    shard_total    integer not null check (shard_total >= 1 and shard_total <= 65535),
+    lock_key       integer not null,
+    registered_ms  bigint  not null,
+    check (shard_index < shard_total)
+);
 
 -- A session's latest commands, finished or not: the fleet board's task.
 create index if not exists spawn_commands_session
@@ -603,8 +634,44 @@ create or replace function spawn_claim(
     out_principal     text,
     out_created_at_ms bigint
 ) language plpgsql as $$
+declare
+    v_active_total integer;
 begin
     perform spawn_lock_migrate_shared();
+    select t.shard_total into v_active_total
+    from spawn_shard_topology t
+    where t.singleton;
+
+    if v_active_total is not null and v_active_total <> 1 then
+        raise exception 'Bridge claim shard total 1 conflicts with active shard topology %',
+                        v_active_total
+            using errcode = '23P01';
+    end if;
+
+    if v_active_total is null then
+        perform pg_advisory_xact_lock(1399957403, hashtext(current_schema()));
+        select t.shard_total into v_active_total
+        from spawn_shard_topology t
+        where t.singleton
+        for update;
+        if v_active_total is null then
+            insert into spawn_shard_topology (singleton, shard_total, updated_at_ms)
+            values (true, 1, spawn_now_ms())
+            on conflict (singleton) do nothing;
+
+            update spawn_commands c
+            set shard_total = 1,
+                shard_index = 0
+            where c.state not in ('finished', 'failed', 'cancelled')
+              and (c.shard_total is distinct from 1
+                   or c.shard_index is distinct from 0);
+        elsif v_active_total <> 1 then
+            raise exception 'Bridge claim shard total 1 conflicts with active shard topology %',
+                            v_active_total
+                using errcode = '23P01';
+        end if;
+    end if;
+
     -- One command per session at a time: nothing earlier in the session
     -- may be unfinished, but an input that waits for its turn (the Bridge
     -- recorded its `command.step` `waiting`, keyed `cmd_<id>:waiting`): it
@@ -643,15 +710,13 @@ begin
     returning c.id, c.lease_attempt, c.agent_id, c.session_id, c.action, c.principal, c.created_at_ms;
 end $$;
 
--- Deterministic 64-bit unsigned FNV-1a shard ownership matching Rust's
--- `spawn_core::port::BridgeShard::owns_session` bit-for-bit across all UTF-8
--- session IDs and u16 partition specs.
-drop function if exists spawn_fnv1a_shard_owns(text, integer, integer);
-create or replace function spawn_fnv1a_shard_owns(
+-- Deterministic 64-bit unsigned FNV-1a shard index matching Rust's
+-- `spawn_core::port::BridgeShard::index_and_total` / `owns_session`.
+drop function if exists spawn_fnv1a_shard_index(text, integer);
+create or replace function spawn_fnv1a_shard_index(
     p_session text,
-    p_index   integer,
     p_total   integer
-) returns boolean language plpgsql immutable as $$
+) returns integer language plpgsql immutable as $$
 declare
     v_bytes   bytea;
     v_len     integer;
@@ -665,13 +730,10 @@ declare
 begin
     if p_session is null
        or p_total is null
-       or p_index is null
        or p_total < 1
-       or p_total > 65535
-       or p_index < 0
-       or p_index >= p_total then
-        raise exception 'invalid shard check (%/% for session %)',
-                        p_index, p_total, p_session
+       or p_total > 65535 then
+        raise exception 'invalid shard check (% for session %)',
+                        p_total, p_session
             using errcode = '22023';
     end if;
 
@@ -691,13 +753,226 @@ begin
 
     v_mod := ((v_hi % p_total::bigint) * (4294967296::bigint % p_total::bigint)
               + (v_lo % p_total::bigint)) % p_total::bigint;
-    return v_mod = p_index::bigint;
+    return v_mod::integer;
+end
+$$;
+
+-- Deterministic 64-bit unsigned FNV-1a shard ownership matching Rust's
+-- `spawn_core::port::BridgeShard::owns_session` bit-for-bit across all UTF-8
+-- session IDs and u16 partition specs.
+drop function if exists spawn_fnv1a_shard_owns(text, integer, integer);
+create or replace function spawn_fnv1a_shard_owns(
+    p_session text,
+    p_index   integer,
+    p_total   integer
+) returns boolean language plpgsql immutable as $$
+begin
+    if p_session is null
+       or p_total is null
+       or p_index is null
+       or p_total < 1
+       or p_total > 65535
+       or p_index < 0
+       or p_index >= p_total then
+        raise exception 'invalid shard check (%/% for session %)',
+                        p_index, p_total, p_session
+            using errcode = '22023';
+    end if;
+
+    return spawn_fnv1a_shard_index(p_session, p_total) = p_index;
+end
+$$;
+
+-- Tag inserted commands with the schema's active `(shard_total, shard_index)`
+-- so `spawn_commands_open_shard` indexes new commands immediately.
+create or replace function spawn_commands_tag_shard_fn()
+returns trigger language plpgsql as $$
+declare
+    v_total integer;
+begin
+    select t.shard_total into v_total
+    from spawn_shard_topology t
+    where t.singleton
+    for share;
+
+    if v_total is not null then
+        new.shard_total := v_total;
+        new.shard_index := spawn_fnv1a_shard_index(new.session_id, v_total);
+    end if;
+    return new;
+end
+$$;
+
+drop trigger if exists spawn_commands_tag_shard on spawn_commands;
+create trigger spawn_commands_tag_shard
+    before insert on spawn_commands
+    for each row execute function spawn_commands_tag_shard_fn();
+
+-- Register a live worker's shard assignment at Bridge startup (`recover`),
+-- rejecting mixed `shard_total` when other live workers exist and rejecting
+-- duplicate live partition slots (`shard_total > 1`). Clean resharding to a new
+-- `shard_total` is allowed once zero other live workers hold session locks.
+drop function if exists spawn_register_bridge_shard(text, integer, integer, integer);
+create or replace function spawn_register_bridge_shard(
+    p_worker      text,
+    p_shard_index integer,
+    p_shard_total integer,
+    p_lock_key    integer
+) returns void language plpgsql as $$
+declare
+    v_active_total integer;
+    v_live_count   integer;
+    v_db_oid       oid := (select oid from pg_database where datname = current_database());
+    v_now          bigint;
+begin
+    perform spawn_lock_migrate_shared();
+    if p_worker is null or btrim(p_worker) = '' then
+        raise exception 'Bridge worker name must not be empty' using errcode = '22023';
+    end if;
+    if p_shard_total is null
+       or p_shard_index is null
+       or p_shard_total < 1
+       or p_shard_total > 65535
+       or p_shard_index < 0
+       or p_shard_index >= p_shard_total then
+        raise exception 'invalid shard partition %/%', p_shard_index, p_shard_total
+            using errcode = '22023';
+    end if;
+
+    perform pg_advisory_xact_lock(1399957403, hashtext(current_schema()));
+    v_now := spawn_now_ms();
+
+    delete from spawn_bridge_shards s
+    where not exists (
+        select 1
+        from pg_locks l
+        where l.database = v_db_oid
+          and l.locktype = 'advisory'
+          and l.classid = 1399957338::oid
+          and l.objsubid = 2
+          and l.granted
+          and (l.objid::bigint - case when l.objid::bigint >= 2147483648
+                                      then 4294967296 else 0 end)::integer = s.lock_key
+    );
+
+    select t.shard_total into v_active_total
+    from spawn_shard_topology t
+    where t.singleton
+    for update;
+
+    select count(*) into v_live_count
+    from spawn_bridge_shards s
+    where s.worker <> p_worker;
+
+    if v_active_total is null then
+        insert into spawn_shard_topology (singleton, shard_total, updated_at_ms)
+        values (true, p_shard_total, v_now);
+
+        update spawn_commands c
+        set shard_total = p_shard_total,
+            shard_index = spawn_fnv1a_shard_index(c.session_id, p_shard_total)
+        where c.state not in ('finished', 'failed', 'cancelled')
+          and (c.shard_total is distinct from p_shard_total
+               or c.shard_index is distinct from spawn_fnv1a_shard_index(c.session_id, p_shard_total));
+    elsif v_active_total <> p_shard_total then
+        if v_live_count > 0 then
+            raise exception 'Bridge shard total % conflicts with active shard topology %',
+                            p_shard_total, v_active_total
+                using errcode = '23P01';
+        end if;
+        update spawn_shard_topology
+        set shard_total = p_shard_total,
+            updated_at_ms = v_now
+        where singleton;
+
+        update spawn_commands c
+        set shard_total = p_shard_total,
+            shard_index = spawn_fnv1a_shard_index(c.session_id, p_shard_total)
+        where c.state not in ('finished', 'failed', 'cancelled')
+          and (c.shard_total is distinct from p_shard_total
+               or c.shard_index is distinct from spawn_fnv1a_shard_index(c.session_id, p_shard_total));
+    end if;
+
+    if p_shard_total > 1
+       and exists (
+           select 1
+           from spawn_bridge_shards s
+           where s.shard_total = p_shard_total
+             and s.shard_index = p_shard_index
+             and s.worker <> p_worker
+       ) then
+        raise exception 'Bridge shard %/% is already owned by a live worker',
+                        p_shard_index, p_shard_total
+            using errcode = '23P01';
+    end if;
+
+    insert into spawn_bridge_shards (worker, shard_index, shard_total, lock_key, registered_ms)
+    values (p_worker, p_shard_index, p_shard_total, p_lock_key, v_now)
+    on conflict (worker) do update
+    set shard_index = excluded.shard_index,
+        shard_total = excluded.shard_total,
+        lock_key = excluded.lock_key,
+        registered_ms = excluded.registered_ms;
+end
+$$;
+
+drop function if exists spawn_unregister_bridge_shard(text);
+create or replace function spawn_unregister_bridge_shard(p_worker text)
+returns void language plpgsql as $$
+begin
+    perform spawn_lock_migrate_shared();
+    delete from spawn_bridge_shards where worker = p_worker;
+end
+$$;
+
+-- Live shard coverage verified against granted PostgreSQL session advisory locks.
+drop function if exists spawn_shard_coverage();
+create or replace function spawn_shard_coverage()
+returns table (
+    out_total   integer,
+    out_present integer[]
+) language plpgsql as $$
+declare
+    v_total  integer;
+    v_db_oid oid := (select oid from pg_database where datname = current_database());
+begin
+    perform spawn_lock_migrate_shared();
+    select t.shard_total into v_total
+    from spawn_shard_topology t
+    where t.singleton;
+
+    if v_total is null then
+        return;
+    end if;
+
+    return query
+    select
+        v_total,
+        coalesce(
+            (
+                select array_agg(distinct s.shard_index order by s.shard_index)
+                from spawn_bridge_shards s
+                where s.shard_total = v_total
+                  and exists (
+                      select 1
+                      from pg_locks l
+                      where l.database = v_db_oid
+                        and l.locktype = 'advisory'
+                        and l.classid = 1399957338::oid
+                        and l.objsubid = 2
+                        and l.granted
+                        and (l.objid::bigint - case when l.objid::bigint >= 2147483648
+                                                    then 4294967296 else 0 end)::integer = s.lock_key
+                  )
+            ),
+            '{}'::integer[]
+        );
 end
 $$;
 
 -- Owner-only shard-filtered claim: leases the oldest claimable command whose
--- session belongs to shard `(p_shard_index, p_shard_total)` without touching or
--- leasing commands owned by other shards.
+-- session belongs to shard `(p_shard_index, p_shard_total)` via partial index
+-- `spawn_commands_open_shard`, without touching or scanning foreign shards.
 drop function if exists spawn_claim_shard(text, bigint, integer, integer);
 create or replace function spawn_claim_shard(
     p_worker      text,
@@ -713,6 +988,8 @@ create or replace function spawn_claim_shard(
     out_principal     text,
     out_created_at_ms bigint
 ) language plpgsql security definer as $$
+declare
+    v_active_total integer;
 begin
     perform spawn_lock_migrate_shared();
     if spawn_mission_caller() is distinct from 'owner' then
@@ -728,13 +1005,48 @@ begin
             using errcode = '22023';
     end if;
 
+    select t.shard_total into v_active_total
+    from spawn_shard_topology t
+    where t.singleton;
+
+    if v_active_total is not null and v_active_total <> p_shard_total then
+        raise exception 'Bridge claim shard total % conflicts with active shard topology %',
+                        p_shard_total, v_active_total
+            using errcode = '23P01';
+    end if;
+
+    if v_active_total is null then
+        perform pg_advisory_xact_lock(1399957403, hashtext(current_schema()));
+        select t.shard_total into v_active_total
+        from spawn_shard_topology t
+        where t.singleton
+        for update;
+        if v_active_total is null then
+            insert into spawn_shard_topology (singleton, shard_total, updated_at_ms)
+            values (true, p_shard_total, spawn_now_ms())
+            on conflict (singleton) do nothing;
+
+            update spawn_commands c
+            set shard_total = p_shard_total,
+                shard_index = spawn_fnv1a_shard_index(c.session_id, p_shard_total)
+            where c.state not in ('finished', 'failed', 'cancelled')
+              and (c.shard_total is distinct from p_shard_total
+                   or c.shard_index is distinct from spawn_fnv1a_shard_index(c.session_id, p_shard_total));
+        elsif v_active_total <> p_shard_total then
+            raise exception 'Bridge claim shard total % conflicts with active shard topology %',
+                            p_shard_total, v_active_total
+                using errcode = '23P01';
+        end if;
+    end if;
+
     return query
     with candidate as (
         select c.id
         from spawn_commands c
         where c.state not in ('finished', 'failed', 'cancelled')
+          and c.shard_total = p_shard_total
+          and c.shard_index = p_shard_index
           and (c.lease_until_ms is null or c.lease_until_ms <= spawn_now_ms())
-          and spawn_fnv1a_shard_owns(c.session_id, p_shard_index, p_shard_total)
           and not exists (
               select 1 from spawn_commands o
               where o.session_id = c.session_id
@@ -1224,7 +1536,7 @@ left join lateral (
 -- go through the grant-filtered `spawn_read_*` functions below; the gateway
 -- trigger runs as the owner and checks `session_user` against `spawn_grants`.
 -- The revoke on the views also removes the public select of older schemas.
-revoke all on spawn_events, spawn_commands, spawn_grants, spawn_session_state, spawn_agent_sessions
+revoke all on spawn_events, spawn_commands, spawn_shard_topology, spawn_bridge_shards, spawn_grants, spawn_session_state, spawn_agent_sessions
     from public;
 revoke select on agent_state, agent_status, agent_timeline, agent_judgements, agent_tasks,
     agent_task_events, agent_executions, agent_artifacts, agent_relations,
@@ -1258,7 +1570,12 @@ revoke execute on function spawn_append_trusted(text, text, text, text, text, js
 revoke execute on function spawn_session_fold(text) from public;
 revoke execute on function spawn_submit(text, text, text, text, jsonb) from public;
 revoke execute on function spawn_claim(text, bigint) from public;
+revoke execute on function spawn_fnv1a_shard_index(text, integer) from public;
 revoke execute on function spawn_fnv1a_shard_owns(text, integer, integer) from public;
+revoke execute on function spawn_commands_tag_shard_fn() from public;
+revoke execute on function spawn_register_bridge_shard(text, integer, integer, integer) from public;
+revoke execute on function spawn_unregister_bridge_shard(text) from public;
+revoke execute on function spawn_shard_coverage() from public;
 revoke execute on function spawn_claim_shard(text, bigint, integer, integer) from public;
 revoke execute on function spawn_release(bigint, integer, bigint) from public;
 revoke execute on function spawn_finish(bigint, integer, boolean, text) from public;

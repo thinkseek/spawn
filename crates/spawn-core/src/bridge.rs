@@ -121,7 +121,7 @@ use crate::port::{
     TerminalHost, TranscriptArchive, UNMOUNT_IN_USE, ViewedLaunch, WatchError, WorkspaceError,
     WorkspaceStore,
 };
-pub use crate::port::{BridgeShard, ShardPartition};
+pub use crate::port::{BridgeShard, ShardCoverage, ShardCoveragePolicy, ShardPartition};
 use crate::screen::{ScreenState, TAIL_LINES};
 use crate::time::{Clock, SystemClock};
 use crate::transcripts::{self, ArchiveProgress};
@@ -319,6 +319,12 @@ pub struct BridgeConfig {
     /// Horizontal shard assignment (`SPAWN_BRIDGE_SHARD`, e.g. `"0/4"`).
     /// Defaults to [`BridgeShard::All`], preserving single-Bridge behavior.
     pub shard: BridgeShard,
+    /// Fail-closed policy for missing shard workers when `shard` partitions
+    /// work across multiple workers (`total > 1`). Defaults to
+    /// [`ShardCoveragePolicy::AllowIncomplete`] for unit tests that drive a
+    /// partial [`BridgeConfig`] directly; CLI production builds enforce
+    /// [`ShardCoveragePolicy::RequireComplete`] unless explicitly opted out.
+    pub shard_coverage_policy: ShardCoveragePolicy,
     /// Whether an engine with no deny rules of its own
     /// ([`crate::driver::Guard::Sandbox`]) runs inside a filesystem view
     /// (decision C2, N6; `SPAWN_ENGINE_VIEW`). Required by default, and
@@ -400,6 +406,7 @@ impl BridgeConfig {
             backstops_per_pass: BACKSTOPS_PER_PASS,
             session_scan_limit: crate::port::DEFAULT_SESSION_SCAN_LIMIT,
             shard: BridgeShard::All,
+            shard_coverage_policy: ShardCoveragePolicy::AllowIncomplete,
             engine_view: EngineViewPolicy::unconfigured(),
             claude_sandbox: false,
             input_wait_max_retry: Duration::from_mins(1),
@@ -2011,7 +2018,9 @@ impl Bridge {
     pub fn recover(&mut self) -> Result<(), StoreError> {
         self.validate_config()?;
         if self.config.recover_worker_leases && self.ownership.is_none() {
-            let (ownership, recovered) = self.queue.recover_worker(&self.config.worker)?;
+            let (ownership, recovered) = self
+                .queue
+                .recover_worker_for_shard(&self.config.worker, self.config.shard)?;
             self.ownership = Some(ownership);
             if recovered > 0 {
                 eprintln!(
@@ -2265,6 +2274,36 @@ impl Bridge {
         Ok(())
     }
 
+    fn verify_shard_coverage(&self) -> Result<(), StoreError> {
+        if self.config.shard_coverage_policy != ShardCoveragePolicy::RequireComplete {
+            return Ok(());
+        }
+        let (index, total) = self.config.shard.index_and_total();
+        if total <= 1 {
+            return Ok(());
+        }
+        let coverage = self.queue.shard_coverage()?.ok_or_else(|| {
+            StoreError::Rejected(format!(
+                "sharded Bridge worker {} ({index}/{total}) cannot run without shard coverage registration (run recover first)",
+                self.config.worker
+            ))
+        })?;
+        if coverage.total != total {
+            return Err(StoreError::Rejected(format!(
+                "Bridge shard total {total} conflicts with active shard topology {}",
+                coverage.total
+            )));
+        }
+        if !coverage.is_complete() {
+            let missing: Vec<String> = coverage.missing.iter().map(ToString::to_string).collect();
+            return Err(StoreError::Rejected(format!(
+                "sharded Bridge topology {total} has missing shard worker(s): [{}] (set SPAWN_BRIDGE_ALLOW_INCOMPLETE_SHARDS=true to override)",
+                missing.join(", ")
+            )));
+        }
+        Ok(())
+    }
+
     /// The Bridge's own reading of the log and of the command queue: catch
     /// up with the events written since the last one, and claim the commands
     /// waiting in the queue, one per session at a time, until none is
@@ -2279,6 +2318,7 @@ impl Bridge {
     /// (`lease_until_ms`) is the caller's to time.
     pub fn work(&mut self) -> Result<(TickReport, bool), StoreError> {
         self.validate_config()?;
+        self.verify_shard_coverage()?;
         self.catch_up()?;
         self.reap_cancelled_mounts();
         let mut report = TickReport::default();
@@ -8721,8 +8761,8 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex};
 
     use super::{
-        Bridge, BridgeConfig, BridgeShard, RESOLVE_PRINCIPAL, ShardPartition, mounted_key,
-        trust_answer_key, waits,
+        Bridge, BridgeConfig, BridgeShard, RESOLVE_PRINCIPAL, ShardCoverage, ShardCoveragePolicy,
+        ShardPartition, mounted_key, trust_answer_key, waits,
     };
     use super::{ENGINE_UNAVAILABLE, EngineViewPolicy, ViewedLaunch, rfc3339_ms};
     use crate::command::{CommandAction, NamedKey, Outcome, Submission};
@@ -15190,6 +15230,18 @@ mod tests {
             self.inner.recover_worker(worker)
         }
 
+        fn recover_worker_for_shard(
+            &self,
+            worker: &str,
+            shard: BridgeShard,
+        ) -> Result<(Box<dyn crate::port::CommandOwnership>, usize), StoreError> {
+            self.inner.recover_worker_for_shard(worker, shard)
+        }
+
+        fn shard_coverage(&self) -> Result<Option<ShardCoverage>, StoreError> {
+            self.inner.shard_coverage()
+        }
+
         fn submit(
             &self,
             principal: &Principal,
@@ -16500,5 +16552,157 @@ mod tests {
         }
         let _ = cp_bridge.poll().expect("concurrent poll past 8");
         assert_eq!(commits.peak.load(Ordering::SeqCst), 12);
+    }
+
+    #[test]
+    fn sharded_bridge_rejects_mixed_totals_at_startup_and_claim() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let mut s0_cfg = BridgeConfig::new("worker-s0");
+        s0_cfg.shard = BridgeShard::partition(0, 2).expect("0/2");
+        let mut b0 = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            s0_cfg,
+        )
+        .with_clock(clock.clone());
+        b0.recover().expect("recover 0/2");
+
+        for bad_shard in [BridgeShard::All, BridgeShard::partition(0, 4).expect("0/4")] {
+            let mut bad_cfg = BridgeConfig::new("worker-bad");
+            bad_cfg.shard = bad_shard;
+            let mut bad = Bridge::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                bad_cfg,
+            )
+            .with_clock(clock.clone());
+            assert!(
+                matches!(bad.recover(), Err(StoreError::Rejected(_))),
+                "recover with {bad_shard} must fail closed against active 2-shard worker"
+            );
+        }
+
+        assert!(matches!(
+            store.claim("unsharded-rogue", Duration::from_mins(1)),
+            Err(StoreError::Rejected(_))
+        ));
+        assert!(matches!(
+            store.claim_for_shard(
+                "wrong-total-rogue",
+                Duration::from_mins(1),
+                BridgeShard::partition(0, 4).expect("0/4"),
+            ),
+            Err(StoreError::Rejected(_))
+        ));
+
+        // Dropping all live workers allows clean full resharding to a new shard_total.
+        drop(b0);
+        let (_own, _) = store
+            .recover_worker_for_shard("reshard-0", BridgeShard::partition(0, 4).expect("0/4"))
+            .expect("reshard after all live workers stop");
+        let cov = store.shard_coverage().expect("coverage").expect("some");
+        assert_eq!(cov.total, 4);
+        assert_eq!(cov.present, vec![0]);
+        assert_eq!(cov.missing, vec![1, 2, 3]);
+
+        // Even without recover(), mixed claim totals fail closed on a fresh store.
+        let unrecovered = Arc::new(MemoryStore::new("shop-raw", clock));
+        assert!(
+            unrecovered
+                .claim("raw-all", Duration::from_mins(1))
+                .expect("claim All")
+                .is_none()
+        );
+        assert!(matches!(
+            unrecovered.claim_for_shard(
+                "raw-0-2",
+                Duration::from_mins(1),
+                BridgeShard::partition(0, 2).expect("0/2"),
+            ),
+            Err(StoreError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn sharded_bridge_rejects_duplicate_live_slot_and_gates_incomplete_shards() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let shard_zero = BridgeShard::partition(0, 2).expect("0/2");
+        let shard_one = BridgeShard::partition(1, 2).expect("1/2");
+
+        let s0_num = (1..1000_u64)
+            .find(|n| shard_zero.owns_session(&resumable_session(*n)))
+            .expect("0/2 session");
+        let cmd_id = submit_resumable_start(&store, s0_num, "", READY);
+
+        let mut cfg0 = BridgeConfig::new("worker-0a");
+        cfg0.shard = shard_zero;
+        cfg0.shard_coverage_policy = ShardCoveragePolicy::RequireComplete;
+        let mut b0 = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            cfg0,
+        )
+        .with_clock(clock.clone());
+        b0.recover().expect("recover 0/2");
+
+        // Duplicate live worker claiming slot 0/2 under another worker name fails closed.
+        let mut dup_cfg = BridgeConfig::new("worker-0b");
+        dup_cfg.shard = shard_zero;
+        let mut dup = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            dup_cfg,
+        )
+        .with_clock(clock.clone());
+        assert!(matches!(dup.recover(), Err(StoreError::Rejected(_))));
+
+        // With shard 1/2 absent, RequireComplete blocks work().
+        assert!(matches!(b0.work(), Err(StoreError::Rejected(_))));
+        let cov = store.shard_coverage().expect("cov").expect("some");
+        assert_eq!(cov.present, vec![0]);
+        assert_eq!(cov.missing, vec![1]);
+        assert!(!cov.is_complete());
+
+        // Bringing shard 1/2 online completes coverage and unblocks both Bridges.
+        let mut cfg1 = BridgeConfig::new("worker-1a");
+        cfg1.shard = shard_one;
+        cfg1.shard_coverage_policy = ShardCoveragePolicy::RequireComplete;
+        let mut b1 = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            cfg1,
+        )
+        .with_clock(clock);
+        b1.recover().expect("recover 1/2");
+        assert!(
+            store
+                .shard_coverage()
+                .expect("cov")
+                .expect("some")
+                .is_complete()
+        );
+        drive_work(&mut b0, &store, || {
+            command_outcome(&store, cmd_id) == Some(Outcome::Succeeded)
+        });
+        assert_eq!(command_outcome(&store, cmd_id), Some(Outcome::Succeeded));
+
+        // Dropping shard 1/2 re-triggers RequireComplete gate, while AllowIncomplete overrides it.
+        drop(b1);
+        assert!(matches!(b0.work(), Err(StoreError::Rejected(_))));
+        b0.config.shard_coverage_policy = ShardCoveragePolicy::AllowIncomplete;
+        b0.work()
+            .expect("AllowIncomplete explicitly permits partial work");
     }
 }
