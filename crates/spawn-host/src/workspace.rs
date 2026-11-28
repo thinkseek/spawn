@@ -645,8 +645,12 @@ impl LocalWorkspaceStore {
         }
     }
 
-    /// Persists worker-authored `.git` commits in `directory` into
-    /// `refs/spawn/workers/<branch>/head` and `target_refs` (`#103`, `#110`).
+    /// Persists worker workspace changes/HEAD into `refs/spawn/workers/<branch>/head`
+    /// and `target_refs` without modifying `refs/heads/*` (`#103`, `#110`).
+    ///
+    /// Git/CoW stores fetch from the workspace's inner `.git` repository; [`D6Workspace`]
+    /// scans working-tree changes directly into CAS snapshots and persistent `RefLedger` /
+    /// `refs.journal` transitions in pure Rust without reading through `.git` pointer files.
     pub fn pin_worker_head(
         &self,
         branch: &str,
@@ -663,7 +667,7 @@ impl LocalWorkspaceStore {
             }
             #[cfg(target_os = "linux")]
             Self::Overlay(_) => Ok(None),
-            Self::D6(_) => Ok(None),
+            Self::D6(store) => store.pin_worker_head(branch, directory, target_refs),
         }
     }
 
