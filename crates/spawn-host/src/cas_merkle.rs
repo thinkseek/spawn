@@ -19,9 +19,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use spawn_cas::{
-    CasError, Digest, GIT_POINTER_THRESHOLD, GitOid, GitOidCache, JournalEntry, NS_BLOB, Snapshot,
-    Store, Tree, TreeEntry, TreeEntryKind, TreeMutation, empty_tree_digest, is_valid_entry_name,
-    project_snapshot_oid, project_tree_oid, sha256_of, sha256_reader,
+    CasError, CommitActor, CommitIntent, CommitObject, CommitV2, Digest, GIT_POINTER_THRESHOLD,
+    GitOid, GitOidCache, JournalEntry, NS_BLOB, Snapshot, Store, Tree, TreeEntry, TreeEntryKind,
+    TreeMutation, empty_tree_digest, is_valid_entry_name, project_snapshot_oid, project_tree_oid,
+    sha256_of, sha256_reader,
 };
 
 use crate::canonical_root;
@@ -592,6 +593,35 @@ pub struct PublishRequest<'a> {
     pub landing_task_id: Option<i64>,
 }
 
+/// Strongly-typed request parameters for [`CasMerkleStore::publish_commit_v2`].
+#[derive(Debug, Clone)]
+pub struct PublishCommitV2Request<'a> {
+    /// Target project identifier.
+    pub project: &'a str,
+    /// Target ref name (e.g. `main`, `feat/x`, `wip/feat/x`, `tags/v1`).
+    pub ref_name: &'a str,
+    /// Ref classification.
+    pub kind: D6RefKind,
+    /// Expected prior commit/snapshot on this ref (`None` when creating or bootstrapping).
+    pub expected_ref: Option<&'a Digest>,
+    /// Canonical `spawn-tree-v1` root digest.
+    pub tree: &'a Digest,
+    /// Parent commit digests in first-parent order.
+    pub parents: &'a [Digest],
+    /// Transition timestamp in Unix epoch milliseconds.
+    pub created_at_ms: i64,
+    /// Closed actor identity and optional agent execution provenance.
+    pub actor: &'a CommitActor,
+    /// Closed origin, optional task/transcript linkage, and commit message.
+    pub intent: &'a CommitIntent,
+    /// Optional edge Git compatibility body (`None` for native Spawn objects).
+    pub git_compat_body: Option<&'a [u8]>,
+    /// Transition log reason stored in `spawn_ref_log`.
+    pub reason: &'a str,
+    /// Landing task ID required when advancing an existing `main` ref.
+    pub landing_task_id: Option<i64>,
+}
+
 /// Summary returned by [`CasMerkleStore::publish_snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedSnapshot {
@@ -671,11 +701,83 @@ pub fn format_commit_body(author_line: &str, committer_line: &str, message: &str
     out
 }
 
+fn sanitize_git_display_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '<' | '>') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "spawn".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn sanitize_git_email_local(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '+') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(|ch| ch == '.' || ch == '_');
+    if trimmed.is_empty() {
+        "actor".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Deterministically synthesize edge Git commit body bytes (`author` + `committer` + `\n\n` +
+/// message) from any [`CommitObject`] (`V1` body verbatim; `V2` `git_compat_body` if attached,
+/// else synthesized cleanly from typed `actor`, `at_ms`, and `intent.message`).
+pub fn project_commit_git_body(commit: &CommitObject) -> Vec<u8> {
+    match commit {
+        CommitObject::V1(snapshot) => snapshot.commit_body.clone(),
+        CommitObject::V2(v2) => {
+            if let Some(compat) = v2.git_compat_body.as_ref() {
+                return compat.clone();
+            }
+            let secs = v2.at_ms.div_euclid(1_000).max(0);
+            let name = sanitize_git_display_name(v2.actor.id());
+            let email_local = sanitize_git_email_local(v2.actor.id());
+            let ident = format!(
+                "{name} <{}.{email_local}@spawn.local> {secs} +0000",
+                v2.actor.kind_str()
+            );
+            format_commit_body(&ident, &ident, &v2.intent.message)
+        }
+    }
+}
+
 /// In-memory Merkle tree cache + `CasMerkleStore` facade over [`spawn_cas::Store`].
 pub struct CasMerkleStore {
     cas: Store,
     oid_cache: Mutex<GitOidCache>,
     tree_cache: Mutex<HashMap<Digest, Tree>>,
+}
+
+struct RefAdvanceMeta<'a> {
+    project: &'a str,
+    ref_name: &'a str,
+    kind: D6RefKind,
+    expected_ref: Option<&'a Digest>,
+    tree: &'a Digest,
+    parents: &'a [Digest],
+    created_at_ms: i64,
+    reason: &'a str,
+    landing_task_id: Option<i64>,
 }
 
 impl CasMerkleStore {
@@ -788,6 +890,26 @@ impl CasMerkleStore {
             parent_oids,
             &mut cache,
         )?)
+    }
+
+    /// Project any [`CommitObject`] (`V1` or `V2`) and ordered parent Git OIDs to
+    /// its deterministic 40-hex Git commit OID without mutating CAS.
+    pub fn project_commit_object_oid(
+        &self,
+        commit: &CommitObject,
+        parent_oids: &[GitOid],
+    ) -> Result<GitOid, D6StoreError> {
+        match commit {
+            CommitObject::V1(snapshot) => self.project_snapshot_oid(snapshot, parent_oids),
+            CommitObject::V2(v2) => {
+                let projected = Snapshot {
+                    tree: v2.tree.clone(),
+                    parents: v2.parents.clone(),
+                    commit_body: project_commit_git_body(commit),
+                };
+                self.project_snapshot_oid(&projected, parent_oids)
+            }
+        }
     }
 
     /// Flatten a canonical `spawn-tree-v1` root into sorted `(path_bytes, TreeEntry)` leaf entries.
@@ -1072,18 +1194,92 @@ impl CasMerkleStore {
         // Durability barrier before publishing roots in PostgreSQL.
         self.cas.sync_store()?;
 
-        self.record_and_advance_ref(ledger, req, &snapshot_id, &git_oid)
-            .map(|ref_seq| PublishedSnapshot {
-                snapshot: snapshot_id,
-                tree: req.tree.clone(),
-                git_oid,
-                tree_git_oid,
-                ref_seq,
-            })
+        self.record_and_advance_ref(
+            ledger,
+            &RefAdvanceMeta {
+                project: req.project,
+                ref_name: req.ref_name,
+                kind: req.kind,
+                expected_ref: req.expected_ref,
+                tree: req.tree,
+                parents: req.parents,
+                created_at_ms: req.created_at_ms,
+                reason: req.reason,
+                landing_task_id: req.landing_task_id,
+            },
+            &snapshot_id,
+            &git_oid,
+        )
+        .map(|ref_seq| PublishedSnapshot {
+            snapshot: snapshot_id,
+            tree: req.tree.clone(),
+            git_oid,
+            tree_git_oid,
+            ref_seq,
+        })
+    }
+
+    /// Execute the atomic 4-step D6 publish sequence storing a canonical
+    /// `spawn-commit-v2` object (`git_compat_body: None` for native writes)
+    /// while projecting edge `git_oid` deterministically on demand.
+    pub fn publish_commit_v2(
+        &self,
+        ledger: &dyn RefLedger,
+        req: &PublishCommitV2Request<'_>,
+    ) -> Result<PublishedSnapshot, D6StoreError> {
+        if has_tombstoned_large_trailer(req.intent.message.as_bytes())
+            || req
+                .git_compat_body
+                .is_some_and(has_tombstoned_large_trailer)
+        {
+            return Err(D6StoreError::InvalidInput(format!(
+                "tombstoned {LARGE_FILE_TRAILER} commit trailer is forbidden in D6 commits"
+            )));
+        }
+
+        let parent_oids = self.resolve_parent_oids(ledger, req.parents)?;
+        let commit = CommitV2 {
+            tree: req.tree.clone(),
+            parents: req.parents.to_vec(),
+            at_ms: req.created_at_ms,
+            actor: req.actor.clone(),
+            intent: req.intent.clone(),
+            git_compat_body: req.git_compat_body.map(<[u8]>::to_vec),
+        };
+        let commit_id = self.cas.put_commit_v2(&commit)?;
+        let tree_git_oid = self.project_tree_oid(req.tree)?;
+        let git_oid = self.project_commit_object_oid(&CommitObject::V2(commit), &parent_oids)?;
+
+        // Durability barrier before publishing roots in PostgreSQL.
+        self.cas.sync_store()?;
+
+        self.record_and_advance_ref(
+            ledger,
+            &RefAdvanceMeta {
+                project: req.project,
+                ref_name: req.ref_name,
+                kind: req.kind,
+                expected_ref: req.expected_ref,
+                tree: req.tree,
+                parents: req.parents,
+                created_at_ms: req.created_at_ms,
+                reason: req.reason,
+                landing_task_id: req.landing_task_id,
+            },
+            &commit_id,
+            &git_oid,
+        )
+        .map(|ref_seq| PublishedSnapshot {
+            snapshot: commit_id,
+            tree: req.tree.clone(),
+            git_oid,
+            tree_git_oid,
+            ref_seq,
+        })
     }
 
     /// Resolve Git commit OIDs for an ordered parent slice using the ledger first,
-    /// falling back recursively to [`Store::read_merkle_snapshot`].
+    /// falling back recursively to [`Store::get_commit_object`].
     pub fn resolve_parent_oids(
         &self,
         ledger: &dyn RefLedger,
@@ -1110,12 +1306,12 @@ impl CasMerkleStore {
             seen.insert(id.clone(), row.git_oid);
             return Ok(row.git_oid);
         }
-        let snap = self.cas.read_merkle_snapshot(id)?;
-        let mut parent_oids = Vec::with_capacity(snap.parents.len());
-        for parent in &snap.parents {
+        let commit = self.cas.get_commit_object(id)?;
+        let mut parent_oids = Vec::with_capacity(commit.parents().len());
+        for parent in commit.parents() {
             parent_oids.push(self.resolve_snapshot_oid_cached(ledger, parent, seen)?);
         }
-        let oid = self.project_snapshot_oid(&snap, &parent_oids)?;
+        let oid = self.project_commit_object_oid(&commit, &parent_oids)?;
         seen.insert(id.clone(), oid);
         Ok(oid)
     }
@@ -1123,47 +1319,47 @@ impl CasMerkleStore {
     fn record_and_advance_ref(
         &self,
         ledger: &dyn RefLedger,
-        req: &PublishRequest<'_>,
+        meta: &RefAdvanceMeta<'_>,
         snapshot_id: &Digest,
         git_oid: &GitOid,
     ) -> Result<u64, D6StoreError> {
         let canonical = ledger.record_snapshot(
             snapshot_id,
             git_oid,
-            req.tree,
-            req.parents,
-            req.project,
-            req.created_at_ms,
+            meta.tree,
+            meta.parents,
+            meta.project,
+            meta.created_at_ms,
         )?;
         let snapshot_id = &canonical;
         let _journal_lock = self.lock_refs_journal()?;
-        let ref_seq = match req.kind {
+        let ref_seq = match meta.kind {
             D6RefKind::Main => ledger.land_main_ref(
-                req.project,
-                req.ref_name,
-                req.expected_ref,
+                meta.project,
+                meta.ref_name,
+                meta.expected_ref,
                 snapshot_id,
-                req.landing_task_id,
-                req.reason,
+                meta.landing_task_id,
+                meta.reason,
             )?,
             D6RefKind::Branch | D6RefKind::Wip | D6RefKind::Tag => ledger.cas_ref(
-                req.project,
-                req.ref_name,
-                req.kind,
-                req.expected_ref,
+                meta.project,
+                meta.ref_name,
+                meta.kind,
+                meta.expected_ref,
                 snapshot_id,
-                req.reason,
+                meta.reason,
             )?,
         };
         let entry = JournalEntry {
             seq: ref_seq,
-            project: req.project.to_string(),
-            name: req.ref_name.to_string(),
-            kind: req.kind.as_str().to_string(),
-            old_snapshot: req.expected_ref.cloned(),
+            project: meta.project.to_string(),
+            name: meta.ref_name.to_string(),
+            kind: meta.kind.as_str().to_string(),
+            old_snapshot: meta.expected_ref.cloned(),
             new_snapshot: snapshot_id.clone(),
             git_oid: *git_oid,
-            at_ms: req.created_at_ms,
+            at_ms: meta.created_at_ms,
         };
         self.cas.append_ref_journal(&entry)?;
         Ok(ref_seq)

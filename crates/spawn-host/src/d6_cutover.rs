@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use spawn_cas::{
-    Digest, GIT_POINTER_THRESHOLD, GcFenceBinding, GitOid, NS_BLOB, PersistentGcReport, Snapshot,
-    Store, Tree, TreeEntry, git_pointer_bytes,
+    CommitObject, Digest, GIT_POINTER_THRESHOLD, GcFenceBinding, GitOid, NS_BLOB,
+    PersistentGcReport, Snapshot, Store, Tree, TreeEntry, git_pointer_bytes,
 };
 
 use crate::cas_merkle::{CasMerkleStore, D6RefKind, D6StoreError, RefLedger, is_pointer_sized};
@@ -861,7 +861,7 @@ pub fn reconcile_refs_journal<L: RefLedger + ?Sized>(
 
     for entry in &suffix {
         let kind = parse_ledger_ref_kind(&entry.kind)?;
-        let snap = store.cas().read_merkle_snapshot(&entry.new_snapshot)?;
+        let commit = store.cas().get_commit_object(&entry.new_snapshot)?;
         let expected_oid = ensure_snapshot_recorded_in_ledger(
             store,
             ledger,
@@ -892,8 +892,7 @@ pub fn reconcile_refs_journal<L: RefLedger + ?Sized>(
             )));
         }
 
-        let applied_seq =
-            replay_reconcile_entry(ledger, entry, kind, &snap.commit_body, reason_prefix)?;
+        let applied_seq = replay_reconcile_entry(ledger, entry, kind, &commit, reason_prefix)?;
         current_refs.insert(key, entry.new_snapshot.clone());
         last_ledger_seq = last_ledger_seq.max(applied_seq);
         entries_replayed += 1;
@@ -912,19 +911,28 @@ fn replay_reconcile_entry<L: RefLedger + ?Sized>(
     ledger: &L,
     entry: &spawn_cas::JournalEntry,
     kind: D6RefKind,
-    commit_body: &[u8],
+    commit: &CommitObject,
     reason_prefix: &str,
 ) -> Result<u64, D6StoreError> {
     let reason = format!("{reason_prefix}:seq={}", entry.seq);
     match kind {
         D6RefKind::Main => {
             let task_id = if entry.old_snapshot.is_some() {
-                let parsed = extract_spawn_task_trailer(commit_body).ok_or_else(|| {
-                    D6StoreError::InvalidInput(format!(
-                        "reconciling main advance seq={} missing Spawn-Task trailer",
-                        entry.seq
-                    ))
-                })?;
+                let parsed = match commit {
+                    CommitObject::V2(v2) => v2.intent.task_id.ok_or_else(|| {
+                        D6StoreError::InvalidInput(format!(
+                            "reconciling main advance seq={} CommitV2 missing intent.task_id",
+                            entry.seq
+                        ))
+                    })?,
+                    CommitObject::V1(snap) => extract_spawn_task_trailer(&snap.commit_body)
+                        .ok_or_else(|| {
+                            D6StoreError::InvalidInput(format!(
+                                "reconciling main advance seq={} missing Spawn-Task trailer",
+                                entry.seq
+                            ))
+                        })?,
+                };
                 Some(parsed)
             } else {
                 None
@@ -962,23 +970,24 @@ fn ensure_snapshot_recorded_in_ledger<L: RefLedger + ?Sized>(
         oid_cache.insert(snapshot_id.clone(), row.git_oid);
         return Ok(row.git_oid);
     }
-    let snap = store.cas().read_merkle_snapshot(snapshot_id)?;
-    let mut parent_oids = Vec::with_capacity(snap.parents.len());
-    for parent in &snap.parents {
+    let commit = store.cas().get_commit_object(snapshot_id)?;
+    let mut parent_oids = Vec::with_capacity(commit.parents().len());
+    for parent in commit.parents() {
         let p_oid = ensure_snapshot_recorded_in_ledger(
             store, ledger, project, parent, None, journal_ts, oid_cache,
         )?;
         parent_oids.push(p_oid);
     }
-    let commit_oid = store.project_snapshot_oid(&snap, &parent_oids)?;
+    let commit_oid = store.project_commit_object_oid(&commit, &parent_oids)?;
     let at_ms = override_at_ms
         .or_else(|| journal_ts.get(snapshot_id).copied())
-        .unwrap_or_else(|| extract_committer_ms(&snap.commit_body));
+        .or_else(|| commit.created_at_ms())
+        .unwrap_or(0);
     let _ = ledger.record_snapshot(
         snapshot_id,
         &commit_oid,
-        &snap.tree,
-        &snap.parents,
+        commit.tree(),
+        commit.parents(),
         project,
         at_ms,
     )?;
@@ -1061,6 +1070,12 @@ pub struct LocalOnlyLargeFile {
 
 /// Result of an end-to-end R2 `git bundle` export -> blank-store import recovery drill
 /// (`#113` Fine Items 7.2.6–7.2.7).
+///
+/// For `CommitV2` or mixed V1/V2 DAGs, roundtrip verification proves identical `(GitOid -> tree)`
+/// content, ref targets, and `> 100 MiB` local-only file inventories. Structured `CommitV2`
+/// `actor` and `intent` metadata live exclusively in CAS (`spawn-commit-v2`) and are not carried
+/// through a plain Git bundle roundtrip (off-host bundle re-imports materialize `V1` snapshots from
+/// projected Git commit bodies).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleDrillReport {
     /// Audited project name.
@@ -1109,7 +1124,10 @@ impl Drop for TempDirGuard {
 /// 3. Verify and unbundle `bundle_path` into a fresh empty bare repo (`git bundle verify` + `git fsck --full --strict`).
 /// 4. Import the unbundled repo into a blank temporary [`CasMerkleStore`] (tolerating missing
 ///    `> 100 MiB` local-only blobs via `spawn-pointer-v1` while listing them explicitly).
-/// 5. Assert every `snapshot_id` and `git_oid` recomputes identically to the source store and ledger.
+/// 5. For pure-V1 DAGs, assert every `snapshot_id` and `git_oid` recomputes bit-for-bit; for
+///    `CommitV2` or mixed V1/V2 DAGs, verify `(GitOid -> tree)` equivalence and refs because
+///    structured `CommitV2` `actor` / `intent` metadata live in CAS and are not carried inside a
+///    plain Git bundle roundtrip.
 pub fn verify_bundle_snapshot_roundtrip<L: RefLedger + ?Sized>(
     store: &CasMerkleStore,
     ledger: &L,
@@ -1192,8 +1210,10 @@ pub fn verify_bundle_snapshot_roundtrip<L: RefLedger + ?Sized>(
 
 struct ProjectInventory {
     snapshots: BTreeMap<Digest, GitOid>,
+    oid_trees: BTreeMap<GitOid, Digest>,
     refs: BTreeMap<String, (Digest, GitOid)>,
     local_only_large_files: Vec<LocalOnlyLargeFile>,
+    all_v1: bool,
 }
 
 fn collect_project_dag_inventory<L: RefLedger + ?Sized>(
@@ -1206,6 +1226,8 @@ fn collect_project_dag_inventory<L: RefLedger + ?Sized>(
     let mut refs = BTreeMap::new();
     let mut queue = VecDeque::new();
     let mut snapshots = BTreeMap::new();
+    let mut oid_trees = BTreeMap::new();
+    let mut all_v1 = true;
     let mut tree_large_cache: HashMap<Digest, Vec<(TreePath, Digest, u64)>> = HashMap::new();
     let mut large_files = BTreeSet::new();
 
@@ -1233,19 +1255,24 @@ fn collect_project_dag_inventory<L: RefLedger + ?Sized>(
             continue;
         }
         let oid = resolve_cas_snapshot_oid(store, &snap_id, &mut oid_cache)?;
-        let snap = store.cas().read_merkle_snapshot(&snap_id)?;
-        let large_in_tree = if let Some(cached) = tree_large_cache.get(&snap.tree) {
+        let commit = store.cas().get_commit_object(&snap_id)?;
+        if matches!(commit, CommitObject::V2(_)) {
+            all_v1 = false;
+        }
+        let tree_digest = commit.tree().clone();
+        oid_trees.insert(oid, tree_digest.clone());
+        let large_in_tree = if let Some(cached) = tree_large_cache.get(&tree_digest) {
             cached.clone()
         } else {
             let mut found = Vec::new();
-            for (path_bytes, entry) in store.flatten_tree(&snap.tree)? {
+            for (path_bytes, entry) in store.flatten_tree(&tree_digest)? {
                 if is_pointer_sized(&entry)
                     && let Some(digest) = entry.digest()
                 {
                     found.push((TreePath::from_bytes(path_bytes), digest, entry.size));
                 }
             }
-            tree_large_cache.insert(snap.tree.clone(), found.clone());
+            tree_large_cache.insert(tree_digest, found.clone());
             found
         };
         for (path, digest, size) in large_in_tree {
@@ -1256,7 +1283,7 @@ fn collect_project_dag_inventory<L: RefLedger + ?Sized>(
                 size,
             });
         }
-        for p in &snap.parents {
+        for p in commit.parents() {
             if !snapshots.contains_key(p) {
                 queue.push_back(p.clone());
             }
@@ -1266,8 +1293,10 @@ fn collect_project_dag_inventory<L: RefLedger + ?Sized>(
 
     Ok(ProjectInventory {
         snapshots,
+        oid_trees,
         refs,
         local_only_large_files: large_files.into_iter().collect(),
+        all_v1,
     })
 }
 
@@ -1320,6 +1349,7 @@ fn apply_unbundled_refs(restore_bare: &Path, unbundle_stdout: &[u8]) -> Result<(
 
 struct BlankRestoreResult {
     snapshots: BTreeMap<Digest, GitOid>,
+    oid_trees: BTreeMap<GitOid, Digest>,
     refs: BTreeMap<String, (Digest, GitOid)>,
     missing_large_files: Vec<LocalOnlyLargeFile>,
 }
@@ -1338,6 +1368,7 @@ fn import_bare_repo_into_blank_store(
     let mut tree_cache: DrillTreeCache = HashMap::new();
     let mut commit_map: HashMap<GitOid, (Digest, GitOid)> = HashMap::new();
     let mut snapshots = BTreeMap::new();
+    let mut oid_trees = BTreeMap::new();
     let mut missing_large = BTreeSet::new();
 
     for commit_oid in &commit_order {
@@ -1390,6 +1421,7 @@ fn import_bare_repo_into_blank_store(
                 size,
             });
         }
+        oid_trees.insert(projected_commit, snap.tree);
         commit_map.insert(*commit_oid, (snap_id.clone(), projected_commit));
         snapshots.insert(snap_id, projected_commit);
     }
@@ -1404,6 +1436,7 @@ fn import_bare_repo_into_blank_store(
 
     Ok(BlankRestoreResult {
         snapshots,
+        oid_trees,
         refs,
         missing_large_files: missing_large.into_iter().collect(),
     })
@@ -1558,21 +1591,67 @@ fn verify_restored_matches_source(
     source: &ProjectInventory,
     restored: &BlankRestoreResult,
 ) -> Result<(), D6StoreError> {
-    if source.snapshots != restored.snapshots {
+    if source.all_v1 {
+        if source.snapshots != restored.snapshots {
+            return Err(D6StoreError::InvalidInput(format!(
+                "restored bundle snapshot inventory diverged: expected {}, got {}",
+                source.snapshots.len(),
+                restored.snapshots.len()
+            )));
+        }
+        if source.refs != restored.refs {
+            return Err(D6StoreError::InvalidInput(format!(
+                "restored bundle refs diverged: expected {}, got {}",
+                source.refs.len(),
+                restored.refs.len()
+            )));
+        }
+        if source.local_only_large_files != restored.missing_large_files {
+            return Err(D6StoreError::InvalidInput(format!(
+                "restored bundle local-only large file report diverged: expected {}, got {}",
+                source.local_only_large_files.len(),
+                restored.missing_large_files.len()
+            )));
+        }
+        return Ok(());
+    }
+
+    if source.oid_trees != restored.oid_trees || source.snapshots.len() != restored.snapshots.len()
+    {
         return Err(D6StoreError::InvalidInput(format!(
-            "restored bundle snapshot inventory diverged: expected {}, got {}",
+            "restored bundle CommitV2 commit/tree OID inventory diverged: expected {} ({}), got {} ({})",
             source.snapshots.len(),
-            restored.snapshots.len()
+            source.oid_trees.len(),
+            restored.snapshots.len(),
+            restored.oid_trees.len()
         )));
     }
-    if source.refs != restored.refs {
+    let source_ref_oids: BTreeMap<&String, GitOid> =
+        source.refs.iter().map(|(k, (_, oid))| (k, *oid)).collect();
+    let restored_ref_oids: BTreeMap<&String, GitOid> = restored
+        .refs
+        .iter()
+        .map(|(k, (_, oid))| (k, *oid))
+        .collect();
+    if source_ref_oids != restored_ref_oids {
         return Err(D6StoreError::InvalidInput(format!(
-            "restored bundle refs diverged: expected {}, got {}",
-            source.refs.len(),
-            restored.refs.len()
+            "restored bundle ref GitOids diverged: expected {}, got {}",
+            source_ref_oids.len(),
+            restored_ref_oids.len()
         )));
     }
-    if source.local_only_large_files != restored.missing_large_files {
+    let map_large = |items: &[LocalOnlyLargeFile], snaps: &BTreeMap<Digest, GitOid>| {
+        items
+            .iter()
+            .map(|f| {
+                let oid = snaps.get(&f.snapshot).copied();
+                (oid, f.path.clone(), f.digest.clone(), f.size)
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    if map_large(&source.local_only_large_files, &source.snapshots)
+        != map_large(&restored.missing_large_files, &restored.snapshots)
+    {
         return Err(D6StoreError::InvalidInput(format!(
             "restored bundle local-only large file report diverged: expected {}, got {}",
             source.local_only_large_files.len(),
@@ -1696,12 +1775,12 @@ fn resolve_cas_snapshot_oid(
     if let Some(&oid) = cache.get(id) {
         return Ok(oid);
     }
-    let snap = store.cas().read_merkle_snapshot(id)?;
-    let mut p_oids = Vec::with_capacity(snap.parents.len());
-    for parent in &snap.parents {
+    let commit = store.cas().get_commit_object(id)?;
+    let mut p_oids = Vec::with_capacity(commit.parents().len());
+    for parent in commit.parents() {
         p_oids.push(resolve_cas_snapshot_oid(store, parent, cache)?);
     }
-    let oid = store.project_snapshot_oid(&snap, &p_oids)?;
+    let oid = store.project_commit_object_oid(&commit, &p_oids)?;
     cache.insert(id.clone(), oid);
     Ok(oid)
 }

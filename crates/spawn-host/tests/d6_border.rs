@@ -19,12 +19,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::json;
 use spawn_cas::{
-    Digest, GIT_POINTER_THRESHOLD, GitOid, NS_BLOB, Snapshot, Tree, TreeEntry, TreeEntryKind,
-    bind_gc_fence, empty_tree_digest, git_pointer_bytes, verify_gc_fence,
+    CommitActor, CommitIntent, CommitObject, CommitOrigin, Digest, GIT_POINTER_THRESHOLD, GitOid,
+    NS_BLOB, Snapshot, Tree, TreeEntry, TreeEntryKind, WorkBoundary, WorkChange, bind_gc_fence,
+    empty_tree_digest, git_pointer_bytes, verify_gc_fence,
 };
+use spawn_host::cas_merkle::PublishCommitV2Request;
 use spawn_host::{
-    CasMerkleStore, D6RefKind, D6StoreError, GitBorderAdapter, InMemoryRefLedger, LedgerRef,
-    LedgerSnapshot, PublishRequest, RefLedger, TrackedSetPolicy, format_commit_body,
+    BorderRefTarget, CasMerkleStore, D6RefKind, D6StoreError, GitBorderAdapter, InMemoryRefLedger,
+    LedgerRef, LedgerSnapshot, PublishRequest, RefLedger, TrackedSetPolicy, format_commit_body,
     test_git_command,
 };
 use spawn_postgres::testing::TestSchema;
@@ -1181,5 +1183,164 @@ fn tombstoned_spawn_large_trailer_is_rejected_on_publish() {
             .list_refs(Some("tombstone-proj"))
             .expect("list")
             .is_empty()
+    );
+}
+
+fn seed_v2_border_dag(
+    cas_store: &CasMerkleStore,
+    ledger: &InMemoryRefLedger,
+) -> (spawn_host::PublishedSnapshot, spawn_host::PublishedSnapshot) {
+    let (blob_id, blob_sz) = cas_store
+        .put_bytes_blob(b"hello commit v2\n")
+        .expect("put blob");
+    let base_tree = cas_store
+        .apply_mutations(
+            &empty_tree_digest(),
+            &[spawn_cas::TreeMutation::Upsert {
+                path: vec![b"README.md".to_vec()],
+                kind: TreeEntryKind::File,
+                id: blob_id.as_bytes(),
+                size: blob_sz,
+            }],
+        )
+        .expect("base tree");
+    let root_actor = CommitActor::System {
+        id: "seed <bot>".to_string(),
+    };
+    let root_intent = CommitIntent {
+        origin: CommitOrigin::Import,
+        task_id: None,
+        transcript_ref: None,
+        message: "import base commit".to_string(),
+    };
+    let root = cas_store
+        .publish_commit_v2(
+            ledger,
+            &PublishCommitV2Request {
+                project: "v2-border-proj",
+                ref_name: "main",
+                kind: D6RefKind::Main,
+                expected_ref: None,
+                tree: &base_tree,
+                parents: &[],
+                created_at_ms: -5_000,
+                actor: &root_actor,
+                intent: &root_intent,
+                git_compat_body: None,
+                reason: "seed import",
+                landing_task_id: None,
+            },
+        )
+        .expect("publish v2 root");
+    assert!(matches!(
+        cas_store
+            .cas()
+            .get_commit_object(&root.snapshot)
+            .expect("read root"),
+        CommitObject::V2(ref c) if c.git_compat_body.is_none()
+    ));
+
+    let (next_id, next_sz) = cas_store
+        .put_bytes_blob(b"feature work\n")
+        .expect("put next blob");
+    let branch_tree = cas_store
+        .apply_mutations(
+            &base_tree,
+            &[spawn_cas::TreeMutation::Upsert {
+                path: vec![b"feat.txt".to_vec()],
+                kind: TreeEntryKind::File,
+                id: next_id.as_bytes(),
+                size: next_sz,
+            }],
+        )
+        .expect("branch tree");
+    let agent_actor = CommitActor::Agent {
+        id: "worker-alpha".to_string(),
+        execution_id: Some("exec-42".to_string()),
+        model_label: Some("claude-sonnet".to_string()),
+        preset_id: Some("builder".to_string()),
+    };
+    let branch_intent = CommitIntent {
+        origin: CommitOrigin::Work {
+            change: WorkChange::Edit,
+            boundary: WorkBoundary::Checkpoint,
+        },
+        task_id: Some(77),
+        transcript_ref: Some("transcript://77".to_string()),
+        message: "checkpoint feature work".to_string(),
+    };
+    let tip = cas_store
+        .publish_commit_v2(
+            ledger,
+            &PublishCommitV2Request {
+                project: "v2-border-proj",
+                ref_name: "feat/v2",
+                kind: D6RefKind::Branch,
+                expected_ref: None,
+                tree: &branch_tree,
+                parents: std::slice::from_ref(&root.snapshot),
+                created_at_ms: 1_700_010_000_000,
+                actor: &agent_actor,
+                intent: &branch_intent,
+                git_compat_body: None,
+                reason: "v2 checkpoint",
+                landing_task_id: None,
+            },
+        )
+        .expect("publish v2 tip");
+    (root, tip)
+}
+
+#[test]
+fn commit_v2_native_export_passes_git_fsck_and_matches_oid() {
+    let scratch = Scratch::new("commit-v2-border");
+    let cas_store = CasMerkleStore::open(scratch.join("cas")).expect("open cas");
+    let ledger = InMemoryRefLedger::new();
+    let (root, tip) = seed_v2_border_dag(&cas_store, &ledger);
+
+    let bare_repo = scratch.join("export.git");
+    let adapter = GitBorderAdapter::new();
+    let report = adapter
+        .export_refs(
+            &cas_store,
+            Some(&ledger),
+            &bare_repo,
+            &[
+                BorderRefTarget {
+                    git_ref: "refs/heads/main".to_string(),
+                    snapshot: root.snapshot,
+                },
+                BorderRefTarget {
+                    git_ref: "refs/heads/feat/v2".to_string(),
+                    snapshot: tip.snapshot,
+                },
+            ],
+        )
+        .expect("export CommitV2 refs");
+    assert_eq!(report.refs.get("refs/heads/main"), Some(&root.git_oid));
+    assert_eq!(report.refs.get("refs/heads/feat/v2"), Some(&tip.git_oid));
+
+    let rev_tip = test_git_command()
+        .arg("--git-dir")
+        .arg(&bare_repo)
+        .args(["rev-parse", "refs/heads/feat/v2"])
+        .output()
+        .expect("rev-parse");
+    assert!(rev_tip.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&rev_tip.stdout).trim(),
+        tip.git_oid.to_hex()
+    );
+
+    let fsck = test_git_command()
+        .arg("--git-dir")
+        .arg(&bare_repo)
+        .args(["fsck", "--full", "--strict"])
+        .output()
+        .expect("fsck");
+    assert!(
+        fsck.status.success(),
+        "git fsck failed on CommitV2 export: {}",
+        String::from_utf8_lossy(&fsck.stderr)
     );
 }

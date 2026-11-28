@@ -20,8 +20,9 @@ use std::time::Duration;
 
 use serde_json::json;
 use spawn_cas::{
-    CasError, DEFAULT_PERSISTENT_GC_GRACE, Digest, GcFenceBinding, GitOid, Snapshot, Tree,
-    TreeEntry, TreeEntryKind, TreeMutation,
+    CasError, CommitActor, CommitIntent, CommitObject, CommitOrigin, DEFAULT_PERSISTENT_GC_GRACE,
+    Digest, GcFenceBinding, GitOid, Snapshot, Tree, TreeEntry, TreeEntryKind, TreeMutation,
+    WorkBoundary, WorkChange,
 };
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{
@@ -2848,4 +2849,254 @@ fn pg_d6_concurrent_checkpoint_pin_and_discard_keep_refs_journal_strictly_monoto
             .map(|r| (r.name, r.snapshot))
             .collect();
     assert_eq!(restored, live);
+}
+
+#[test]
+fn d6_workspace_native_writes_produce_commit_v2_without_compat_body() {
+    let scratch = Scratch::new("native_v2");
+    let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("open cas"));
+    let ledger = Arc::new(PgRefLedger::connect_isolated("d6_native_commit_v2"));
+    let clock_ms = Arc::new(AtomicI64::new(1_700_200_000_000));
+    let clk = clock_ms.clone();
+    let d6_root = scratch.join("ws");
+
+    let ws_store = D6Workspace::new("proj-native-v2", &d6_root, cas.clone(), ledger.clone())
+        .with_clock_ms(Arc::new(move || clk.fetch_add(1_000, Ordering::Relaxed)));
+    let branch = BranchName::new("agent_v2").expect("branch name");
+    let (main0, ws) = verify_native_v2_branch_commits(&cas, &ws_store, &branch);
+    verify_native_v2_land_merge_set_aside_and_compat(
+        &cas, &ledger, &ws_store, &branch, &ws, &main0, &clock_ms,
+    );
+}
+
+fn verify_native_v2_branch_commits(
+    cas: &CasMerkleStore,
+    ws_store: &D6Workspace<PgRefLedger>,
+    branch: &BranchName,
+) -> (LedgerSnapshot, WorkspaceId) {
+    ws_store.ensure_branch(branch, None).expect("ensure branch");
+    let main0 = ws_store.main_snapshot().expect("main").expect("seeded");
+    assert!(matches!(
+        cas.cas().get_commit_object(&main0.id).expect("read seed"),
+        CommitObject::V2(ref c)
+            if c.git_compat_body.is_none()
+                && c.intent.origin == CommitOrigin::Import
+                && matches!(c.actor, CommitActor::System { .. })
+    ));
+
+    let ws = ws_store.mount(branch).expect("mount");
+    let ws_dir = PathBuf::from(ws.path());
+    fs::write(ws_dir.join("alpha.txt"), "hello v2\n").expect("write alpha");
+    let ckpt = ws_store
+        .checkpoint(&ws, "native checkpoint\r\n")
+        .expect("checkpoint");
+    assert!(matches!(ckpt, Commit::Created(_)));
+    let head1 = ws_store
+        .branch_snapshot(branch.as_str())
+        .expect("snap")
+        .expect("present");
+    assert!(matches!(
+        cas.cas().get_commit_object(&head1.id).expect("read head1"),
+        CommitObject::V2(ref c)
+            if c.git_compat_body.is_none()
+                && c.intent.origin
+                    == CommitOrigin::Work {
+                        change: WorkChange::Edit,
+                        boundary: WorkBoundary::Checkpoint,
+                    }
+    ));
+
+    fs::write(ws_dir.join("beta.txt"), "typed commit v2\n").expect("write beta");
+    let typed_actor = CommitActor::Agent {
+        id: "agent_v2".to_string(),
+        execution_id: Some("exec-v2-1".to_string()),
+        model_label: Some("gpt-test".to_string()),
+        preset_id: Some("coder".to_string()),
+    };
+    let typed_intent = CommitIntent {
+        origin: CommitOrigin::Work {
+            change: WorkChange::Edit,
+            boundary: WorkBoundary::Submit,
+        },
+        task_id: Some(42),
+        transcript_ref: Some("transcript://42".to_string()),
+        message: "typed submit commit".to_string(),
+    };
+    let c_v2 = ws_store
+        .commit_v2(&ws, &typed_actor, &typed_intent, "d6:commit_v2")
+        .expect("commit_v2");
+    assert!(matches!(c_v2, Commit::Created(_)));
+    let head2 = ws_store
+        .branch_snapshot(branch.as_str())
+        .expect("head2")
+        .expect("present");
+    let obj2 = cas.cas().get_commit_object(&head2.id).expect("read head2");
+    assert!(matches!(
+        obj2,
+        CommitObject::V2(ref c)
+            if c.git_compat_body.is_none()
+                && c.actor == typed_actor
+                && c.intent == typed_intent
+    ));
+
+    fs::write(ws_dir.join("dirty.txt"), "dirty pin\n").expect("write dirty");
+    let pinned = ws_store
+        .pin_worker_head(branch.as_str(), Some(&ws_dir), &[])
+        .expect("pin")
+        .expect("pinned");
+    let worker_ref = spawn_host::workspace_rules::worker_head_ref(branch.as_str());
+    let worker_snap = ws_store
+        .branch_snapshot(&worker_ref)
+        .expect("worker snap")
+        .expect("present");
+    assert_eq!(worker_snap.git_oid.to_hex(), pinned.as_str());
+    assert!(matches!(
+        cas.cas()
+            .get_commit_object(&worker_snap.id)
+            .expect("read worker snap"),
+        CommitObject::V2(ref c)
+            if c.git_compat_body.is_none()
+                && c.intent.origin
+                    == CommitOrigin::Work {
+                        change: WorkChange::Edit,
+                        boundary: WorkBoundary::Submit,
+                    }
+    ));
+    (main0, ws)
+}
+
+fn publish_test_v2_main(
+    cas: &CasMerkleStore,
+    ledger: &PgRefLedger,
+    main0: &LedgerSnapshot,
+    clock_ms: &AtomicI64,
+) {
+    let (main_blob, main_sz) = cas.put_bytes_blob(b"main update\n").expect("main blob");
+    let next_main_tree = cas
+        .apply_mutations(
+            &main0.tree,
+            &[TreeMutation::Upsert {
+                path: vec![b"MAIN.md".to_vec()],
+                kind: TreeEntryKind::File,
+                id: main_blob.as_bytes(),
+                size: main_sz,
+            }],
+        )
+        .expect("next main tree");
+    let main_actor = CommitActor::System {
+        id: "integrator".to_string(),
+    };
+    let main_intent = CommitIntent {
+        origin: CommitOrigin::Land,
+        task_id: None,
+        transcript_ref: None,
+        message: "land main doc".to_string(),
+    };
+    let pre_main_oid = cas
+        .project_commit_object_oid(
+            &CommitObject::V2(spawn_cas::CommitV2 {
+                tree: next_main_tree.clone(),
+                parents: vec![main0.id.clone()],
+                at_ms: clock_ms.load(Ordering::Relaxed),
+                actor: main_actor.clone(),
+                intent: main_intent.clone(),
+                git_compat_body: None,
+            }),
+            &[main0.git_oid],
+        )
+        .expect("project oid");
+    let task_id = setup_accepted_task(
+        &ledger.pg,
+        "/tmp/proj-native-v2.git",
+        &main0.git_oid,
+        &pre_main_oid,
+    );
+    let main1 = cas
+        .publish_commit_v2(
+            ledger,
+            &spawn_host::cas_merkle::PublishCommitV2Request {
+                project: "proj-native-v2",
+                ref_name: "main",
+                kind: D6RefKind::Main,
+                expected_ref: Some(&main0.id),
+                tree: &next_main_tree,
+                parents: std::slice::from_ref(&main0.id),
+                created_at_ms: clock_ms.fetch_add(1_000, Ordering::Relaxed),
+                actor: &main_actor,
+                intent: &main_intent,
+                git_compat_body: None,
+                reason: "d6:test_land",
+                landing_task_id: Some(task_id),
+            },
+        )
+        .expect("publish v2 main");
+    assert_eq!(main1.git_oid, pre_main_oid);
+}
+
+fn verify_native_v2_land_merge_set_aside_and_compat(
+    cas: &CasMerkleStore,
+    ledger: &PgRefLedger,
+    ws_store: &D6Workspace<PgRefLedger>,
+    branch: &BranchName,
+    ws: &WorkspaceId,
+    main0: &LedgerSnapshot,
+    clock_ms: &AtomicI64,
+) {
+    let ws_dir = PathBuf::from(ws.path());
+    publish_test_v2_main(cas, ledger, main0, clock_ms);
+
+    let merged = ws_store.merge_base(ws).expect("merge_base");
+    assert!(matches!(merged, BaseMerge::Merged { .. }));
+    let head3 = ws_store
+        .branch_snapshot(branch.as_str())
+        .expect("head3")
+        .expect("present");
+    assert!(matches!(
+        cas.cas().get_commit_object(&head3.id).expect("read head3"),
+        CommitObject::V2(ref c)
+            if c.git_compat_body.is_none()
+                && c.intent.origin
+                    == CommitOrigin::Work {
+                        change: WorkChange::Derive,
+                        boundary: WorkBoundary::Checkpoint,
+                    }
+    ));
+
+    let sa = ws_store
+        .set_aside(branch, None, "set aside v2 work")
+        .expect("set_aside");
+    assert!(matches!(sa, SetAside::Created { .. }));
+    let head4 = ws_store
+        .branch_snapshot(branch.as_str())
+        .expect("head4")
+        .expect("present");
+    assert!(matches!(
+        cas.cas().get_commit_object(&head4.id).expect("read head4"),
+        CommitObject::V2(ref c)
+            if c.git_compat_body.is_none()
+                && c.intent.origin
+                    == CommitOrigin::Work {
+                        change: WorkChange::Revert,
+                        boundary: WorkBoundary::Checkpoint,
+                    }
+    ));
+
+    fs::write(ws_dir.join("compat.txt"), "legacy body\n").expect("write compat");
+    let compat_body = format_commit_body(
+        "Compat <c@spawn.local> 1700200100 +0000",
+        "Compat <c@spawn.local> 1700200100 +0000",
+        "compat commit\n",
+    );
+    let compat = ws_store
+        .commit_with_body(ws, &compat_body, 1_700_200_100_000, "d6:compat")
+        .expect("commit_with_body");
+    assert!(matches!(compat, Commit::Created(_)));
+    let head5 = ws_store
+        .branch_snapshot(branch.as_str())
+        .expect("head5")
+        .expect("present");
+    assert!(matches!(
+        cas.cas().get_commit_object(&head5.id).expect("read head5"),
+        CommitObject::V1(_)
+    ));
 }

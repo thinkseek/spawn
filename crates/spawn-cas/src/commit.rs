@@ -72,6 +72,40 @@ impl CommitObject {
         }
     }
 
+    /// Commit timestamp in Unix epoch milliseconds (`Some` for `V2`, parsed
+    /// from the V1 `committer` header seconds when present and valid).
+    pub fn created_at_ms(&self) -> Option<i64> {
+        match self {
+            Self::V1(snapshot) => parse_v1_committer_ms(&snapshot.commit_body),
+            Self::V2(commit) => Some(commit.at_ms),
+        }
+    }
+
+    /// Commit message UTF-8 text (`V2` `intent.message`, or `V1` body after `\n\n`).
+    pub fn message_text(&self) -> Option<&str> {
+        match self {
+            Self::V1(snapshot) => parse_v1_message(&snapshot.commit_body),
+            Self::V2(commit) => Some(commit.intent.message.as_str()),
+        }
+    }
+
+    /// First line of the commit message (`V1` or `V2`).
+    pub fn message_subject(&self) -> Option<&str> {
+        match self {
+            Self::V1(snapshot) => parse_v1_message(&snapshot.commit_body)
+                .map(|msg| msg.split('\n').next().unwrap_or("")),
+            Self::V2(commit) => Some(commit.message_subject()),
+        }
+    }
+
+    /// Raw Git commit body bytes when embedded (`V1` body or `V2` edge compatibility trailer).
+    pub fn git_compat_body(&self) -> Option<&[u8]> {
+        match self {
+            Self::V1(snapshot) => Some(&snapshot.commit_body),
+            Self::V2(commit) => commit.git_compat_body.as_deref(),
+        }
+    }
+
     /// Borrow the underlying `V1` [`Snapshot`] if this object is `V1`.
     pub const fn as_v1(&self) -> Option<&Snapshot> {
         match self {
@@ -87,6 +121,28 @@ impl CommitObject {
             Self::V2(commit) => Some(commit),
         }
     }
+}
+
+fn parse_v1_message(commit_body: &[u8]) -> Option<&str> {
+    let sep = commit_body.windows(2).position(|pair| pair == b"\n\n")?;
+    std::str::from_utf8(&commit_body[sep + 2..]).ok()
+}
+
+fn parse_v1_committer_ms(commit_body: &[u8]) -> Option<i64> {
+    let header_end = commit_body
+        .windows(2)
+        .position(|pair| pair == b"\n\n")
+        .unwrap_or(commit_body.len());
+    let headers = std::str::from_utf8(&commit_body[..header_end]).ok()?;
+    for line in headers.lines() {
+        let Some(rest) = line.strip_prefix("committer ") else {
+            continue;
+        };
+        let secs_token = rest.rsplit(' ').nth(1)?;
+        let secs = parse_strict_i64(secs_token.as_bytes())?;
+        return secs.checked_mul(1_000);
+    }
+    None
 }
 
 /// Specific tree change operation for [`CommitOrigin::Work`].
@@ -201,137 +257,69 @@ pub enum CommitOrigin {
     Import,
 }
 
-impl CommitOrigin {
-    /// Exhaustive list of all 11 valid `CommitOrigin` states.
-    pub const ALL: [Self; 11] = [
-        Self::Work {
-            change: WorkChange::Edit,
-            boundary: WorkBoundary::Checkpoint,
-        },
-        Self::Work {
-            change: WorkChange::Edit,
-            boundary: WorkBoundary::Submit,
-        },
-        Self::Work {
-            change: WorkChange::Edit,
-            boundary: WorkBoundary::Job,
-        },
-        Self::Work {
-            change: WorkChange::Derive,
-            boundary: WorkBoundary::Checkpoint,
-        },
-        Self::Work {
-            change: WorkChange::Derive,
-            boundary: WorkBoundary::Submit,
-        },
-        Self::Work {
-            change: WorkChange::Derive,
-            boundary: WorkBoundary::Job,
-        },
-        Self::Work {
-            change: WorkChange::Revert,
-            boundary: WorkBoundary::Checkpoint,
-        },
-        Self::Work {
-            change: WorkChange::Revert,
-            boundary: WorkBoundary::Submit,
-        },
-        Self::Work {
-            change: WorkChange::Revert,
-            boundary: WorkBoundary::Job,
-        },
-        Self::Land,
-        Self::Import,
-    ];
+macro_rules! define_commit_origins {
+    ($([$($arm:tt)+] => $token:literal),+ $(,)?) => {
+        impl CommitOrigin {
+            /// Exhaustive list of all 11 valid `CommitOrigin` states.
+            pub const ALL: [Self; 11] = [$($($arm)+),+];
 
-    /// Canonical lowercase wire token for this origin.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Work {
-                change: WorkChange::Edit,
-                boundary: WorkBoundary::Checkpoint,
-            } => "work/edit/checkpoint",
-            Self::Work {
-                change: WorkChange::Edit,
-                boundary: WorkBoundary::Submit,
-            } => "work/edit/submit",
-            Self::Work {
-                change: WorkChange::Edit,
-                boundary: WorkBoundary::Job,
-            } => "work/edit/job",
-            Self::Work {
-                change: WorkChange::Derive,
-                boundary: WorkBoundary::Checkpoint,
-            } => "work/derive/checkpoint",
-            Self::Work {
-                change: WorkChange::Derive,
-                boundary: WorkBoundary::Submit,
-            } => "work/derive/submit",
-            Self::Work {
-                change: WorkChange::Derive,
-                boundary: WorkBoundary::Job,
-            } => "work/derive/job",
-            Self::Work {
-                change: WorkChange::Revert,
-                boundary: WorkBoundary::Checkpoint,
-            } => "work/revert/checkpoint",
-            Self::Work {
-                change: WorkChange::Revert,
-                boundary: WorkBoundary::Submit,
-            } => "work/revert/submit",
-            Self::Work {
-                change: WorkChange::Revert,
-                boundary: WorkBoundary::Job,
-            } => "work/revert/job",
-            Self::Land => "land",
-            Self::Import => "import",
-        }
-    }
+            /// Canonical lowercase wire token for this origin.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $($($arm)+ => $token,)+
+                }
+            }
 
-    /// Parse strictly from one of the 11 canonical lowercase wire tokens.
-    pub fn parse(text: &str) -> Result<Self, CasError> {
-        match text {
-            "work/edit/checkpoint" => Ok(Self::Work {
-                change: WorkChange::Edit,
-                boundary: WorkBoundary::Checkpoint,
-            }),
-            "work/edit/submit" => Ok(Self::Work {
-                change: WorkChange::Edit,
-                boundary: WorkBoundary::Submit,
-            }),
-            "work/edit/job" => Ok(Self::Work {
-                change: WorkChange::Edit,
-                boundary: WorkBoundary::Job,
-            }),
-            "work/derive/checkpoint" => Ok(Self::Work {
-                change: WorkChange::Derive,
-                boundary: WorkBoundary::Checkpoint,
-            }),
-            "work/derive/submit" => Ok(Self::Work {
-                change: WorkChange::Derive,
-                boundary: WorkBoundary::Submit,
-            }),
-            "work/derive/job" => Ok(Self::Work {
-                change: WorkChange::Derive,
-                boundary: WorkBoundary::Job,
-            }),
-            "work/revert/checkpoint" => Ok(Self::Work {
-                change: WorkChange::Revert,
-                boundary: WorkBoundary::Checkpoint,
-            }),
-            "work/revert/submit" => Ok(Self::Work {
-                change: WorkChange::Revert,
-                boundary: WorkBoundary::Submit,
-            }),
-            "work/revert/job" => Ok(Self::Work {
-                change: WorkChange::Revert,
-                boundary: WorkBoundary::Job,
-            }),
-            "land" => Ok(Self::Land),
-            "import" => Ok(Self::Import),
-            _ => Err(CasError::BadFormat("unknown commit origin")),
+            /// Parse strictly from one of the 11 canonical lowercase wire tokens.
+            pub fn parse(text: &str) -> Result<Self, CasError> {
+                match text {
+                    $($token => Ok($($arm)+),)+
+                    _ => Err(CasError::BadFormat("unknown commit origin")),
+                }
+            }
         }
-    }
+    };
+}
+
+define_commit_origins! {
+    [Self::Work {
+        change: WorkChange::Edit,
+        boundary: WorkBoundary::Checkpoint,
+    }] => "work/edit/checkpoint",
+    [Self::Work {
+        change: WorkChange::Edit,
+        boundary: WorkBoundary::Submit,
+    }] => "work/edit/submit",
+    [Self::Work {
+        change: WorkChange::Edit,
+        boundary: WorkBoundary::Job,
+    }] => "work/edit/job",
+    [Self::Work {
+        change: WorkChange::Derive,
+        boundary: WorkBoundary::Checkpoint,
+    }] => "work/derive/checkpoint",
+    [Self::Work {
+        change: WorkChange::Derive,
+        boundary: WorkBoundary::Submit,
+    }] => "work/derive/submit",
+    [Self::Work {
+        change: WorkChange::Derive,
+        boundary: WorkBoundary::Job,
+    }] => "work/derive/job",
+    [Self::Work {
+        change: WorkChange::Revert,
+        boundary: WorkBoundary::Checkpoint,
+    }] => "work/revert/checkpoint",
+    [Self::Work {
+        change: WorkChange::Revert,
+        boundary: WorkBoundary::Submit,
+    }] => "work/revert/submit",
+    [Self::Work {
+        change: WorkChange::Revert,
+        boundary: WorkBoundary::Job,
+    }] => "work/revert/job",
+    [Self::Land] => "land",
+    [Self::Import] => "import",
 }
 
 impl fmt::Display for CommitOrigin {
