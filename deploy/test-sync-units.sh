@@ -341,6 +341,49 @@ status=0
 SPAWN_UNIT_DIR="$k4_units_dir" bash "$script" --check "$k4_src" >"$scratch/k4-clean.out" 2>&1 || status=$?
 check "Wave K4 --check exits 0 after --apply (got $status)" [ "$status" = 0 ]
 
+# Blocker 1 regressions: shared units stay snapshot-free so live hosts without snapshots keep HTTP 200;
+# control-plane snapshot drop-ins are listed in host-local and left intact by sync-units in legacy and go-uds modes.
+for live_unit in spawn-serve.service spawn-core.service; do
+  check "repo $live_unit omits unconditional SPAWN_FEATURE_COVERAGE_SNAPSHOT and SPAWN_FEATURE_REGISTRY" \
+    bash -c '! grep -qE "SPAWN_FEATURE_COVERAGE_SNAPSHOT|SPAWN_FEATURE_REGISTRY" "$1" && grep -qE "^[[:space:]]*Environment=SPAWN_FEATURE_ROOT=" "$1"' \
+    _ "$repo_units/$live_unit"
+done
+for snap_dropin in \
+  spawn-serve.service.d/50-feature-coverage-snapshot.conf \
+  spawn-core.service.d/50-feature-coverage-snapshot.conf; do
+  check "repo deploy/systemd/host-local lists $snap_dropin" \
+    bash -c 'sed -e "s/#.*//" "$1" | awk "NF { print \$1 }" | grep -qxF -- "$2"' _ "$repo_units/host-local" "$snap_dropin"
+done
+
+snap_src=$scratch/snap-src snap_units_cp=$scratch/snap-units-cp snap_units_live=$scratch/snap-units-live
+mkdir -p "$snap_src" "$snap_units_cp/spawn-serve.service.d" "$snap_units_cp/spawn-core.service.d" "$snap_units_live"
+cp "$repo_units/host-local" "$snap_src/host-local"
+for u in spawn-serve.service spawn-core.service spawn-node-edge.service spawn-node-gw.service spawn-node-out.service; do
+  cp "$repo_units/$u" "$snap_src/$u"
+  cp "$repo_units/$u" "$snap_units_live/$u"
+  cp "$repo_units/$u" "$snap_units_cp/$u"
+done
+printf '[Service]\nEnvironment=SPAWN_FEATURE_COVERAGE_SNAPSHOT=/var/lib/spawn/current/feature-coverage.json\n' >"$snap_units_cp/spawn-serve.service.d/50-feature-coverage-snapshot.conf"
+printf '[Service]\nEnvironment=SPAWN_FEATURE_COVERAGE_SNAPSHOT=/var/lib/spawn/current/feature-coverage.json\n' >"$snap_units_cp/spawn-core.service.d/50-feature-coverage-snapshot.conf"
+
+rm -f "$SYSTEMCTL_LOG"
+for mode_arg in "--check" "--apply"; do
+  status=0
+  SPAWN_UNIT_DIR="$snap_units_cp" SPAWN_DEPLOY_EDGE_MODE=go-uds bash "$script" "$mode_arg" "$snap_src" >"$scratch/snap-cp-$mode_arg.out" 2>&1 || status=$?
+  check "go-uds $mode_arg accepts control-plane with snapshot drop-ins (got $status)" [ "$status" = 0 ]
+  check "go-uds $mode_arg prints neither WARNING nor snapshot Environment value" \
+    bash -c '! grep -q "WARNING" "$1" && ! grep -q "SPAWN_FEATURE_COVERAGE_SNAPSHOT" "$1"' _ "$scratch/snap-cp-$mode_arg.out"
+  status=0
+  SPAWN_UNIT_DIR="$snap_units_live" bash "$script" "$mode_arg" "$snap_src" >"$scratch/snap-live-$mode_arg.out" 2>&1 || status=$?
+  check "legacy $mode_arg accepts live/worker host without snapshot drop-ins (got $status)" [ "$status" = 0 ]
+done
+check "sync-units preserved control-plane snapshot drop-ins" \
+  bash -c 'grep -q "SPAWN_FEATURE_COVERAGE_SNAPSHOT" "$1/spawn-serve.service.d/50-feature-coverage-snapshot.conf" && grep -q "SPAWN_FEATURE_COVERAGE_SNAPSHOT" "$1/spawn-core.service.d/50-feature-coverage-snapshot.conf"' \
+  _ "$snap_units_cp"
+check "sync-units never adds snapshot drop-ins to live/worker host" \
+  bash -c '[ ! -e "$1/spawn-serve.service.d" ] && [ ! -e "$1/spawn-core.service.d" ]' \
+  _ "$snap_units_live"
+
 echo "sync-units: $passed passed, $failures failed"
 [ "$failures" = 0 ] && echo "sync-units: all cases pass"
 [ "$failures" = 0 ]

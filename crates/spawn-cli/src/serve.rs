@@ -2777,28 +2777,97 @@ fn apply_resume_body_checked(
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_FEATURE_COVERAGE_SOURCE: std::cell::RefCell<
+        Option<crate::config::FeatureCoverageSource>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(in crate::serve) fn with_test_feature_coverage_source<T>(
+    source: crate::config::FeatureCoverageSource,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<crate::config::FeatureCoverageSource>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_FEATURE_COVERAGE_SOURCE.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = TEST_FEATURE_COVERAGE_SOURCE.with(|slot| slot.borrow_mut().replace(source));
+    let _reset = Reset(prev);
+    f()
+}
+
+fn default_feature_coverage_source() -> crate::config::FeatureCoverageSource {
+    #[cfg(test)]
+    if let Some(overridden) = TEST_FEATURE_COVERAGE_SOURCE.with(|slot| slot.borrow().clone()) {
+        return overridden;
+    }
+    crate::config::feature_coverage_source()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotReadOnlyOp {
+    Associate,
+    Scan,
+}
+
+fn snapshot_read_only_refusal(
+    snapshot_path: &std::path::Path,
+    op: SnapshotReadOnlyOp,
+) -> (u16, Value) {
+    let reason = crate::feature_inventory::PRECOMPUTED_SNAPSHOT_READ_ONLY_REASON;
+    let message = match op {
+        SnapshotReadOnlyOp::Associate => format!(
+            "the feature registry on this deployment is read-only, so the association \
+             was not saved: {reason}"
+        ),
+        SnapshotReadOnlyOp::Scan => format!(
+            "the feature registry on this deployment is read-only, so a live feature scan \
+             cannot run (read GET /api/features/coverage for the precomputed snapshot): {reason}"
+        ),
+    };
+    (
+        409,
+        json!({
+            "error": message,
+            "code": "registry_read_only",
+            "registry_writable": false,
+            "read_only_reason": reason,
+            "registry_path": snapshot_path.display().to_string(),
+        }),
+    )
+}
+
+fn refuse_if_precomputed_snapshot(op: SnapshotReadOnlyOp) -> Result<(), (u16, Value)> {
+    if let crate::config::FeatureCoverageSource::PrecomputedSnapshot { snapshot_path } =
+        default_feature_coverage_source()
+    {
+        return Err(snapshot_read_only_refusal(&snapshot_path, op));
+    }
+    Ok(())
+}
+
 /// `GET /api/features/coverage`: current feature-map file coverage report,
 /// boundary policy, exclusions, wild files, stale references, and features.
 fn feature_coverage_get() -> Result<Value, String> {
-    let root = crate::feature_inventory::default_root();
-    let registry = crate::feature_inventory::default_registry_path(&root);
-    crate::feature_inventory::api_coverage_payload(&root, &registry)
+    crate::feature_inventory::api_coverage_payload_from_source(&default_feature_coverage_source())
 }
 
 pub(super) fn feature_coverage_for_query(query: &str) -> (u16, Value) {
-    match feature_paths(query) {
-        Ok((root, registry)) => {
-            match crate::feature_inventory::api_coverage_payload(&root, &registry) {
-                Ok(payload) => (200, payload),
-                Err(error) => (500, json!({ "error": error })),
-            }
-        }
+    match feature_coverage_source_for_query(query) {
+        Ok(source) => match crate::feature_inventory::api_coverage_payload_from_source(&source) {
+            Ok(payload) => (200, payload),
+            Err(error) => (500, json!({ "error": error })),
+        },
         Err(refusal) => refusal,
     }
 }
 
 /// `GET /api/features/coverage?mission=<id>`: [`feature_coverage_get`] for
-/// that mission's project ([`feature_paths`]), its refusals structured.
+/// that mission's project ([`feature_coverage_source_for_query`]), its refusals structured.
 fn feature_coverage_mission_get(
     request: Request,
     query: &str,
@@ -2818,16 +2887,64 @@ fn feature_coverage_mission_get(
         .map_err(|error| error.to_string())
 }
 
-/// The project root and feature registry a coverage request reads: without
-/// `?mission` the server's own (`SPAWN_FEATURE_ROOT`, else the working
-/// directory; `SPAWN_FEATURE_REGISTRY`, else the root's registry); with it,
-/// the open objective mission's `--features` file and the project root it
-/// belongs to ([`mission_feature_paths`]).
-pub(super) fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Value)> {
+pub(super) fn resolve_mission_coverage_source(
+    missions: &Value,
+    id: i64,
+    default_source: &crate::config::FeatureCoverageSource,
+    canonical_spawn_repo: Option<&std::path::Path>,
+) -> Result<crate::config::FeatureCoverageSource, (u16, Value)> {
+    let mission = missions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|mission| mission["id"].as_i64() == Some(id))
+        .ok_or_else(|| {
+            (
+                404,
+                json!({ "error": format!("no open objective mission {id}"),
+                        "code": "mission_not_found", "mission": id }),
+            )
+        })?;
+    match mission_paths(mission, id) {
+        Ok((root, registry)) => match coverage_registry_checked(&registry, id) {
+            Ok(()) => Ok(crate::config::FeatureCoverageSource::LiveRepo { root, registry }),
+            Err(err) => {
+                if std::fs::symlink_metadata(&registry)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    && let crate::config::FeatureCoverageSource::PrecomputedSnapshot {
+                        snapshot_path,
+                    } = default_source
+                    && feature_map::is_spawn_repo_mission_with(mission, canonical_spawn_repo)
+                {
+                    return Ok(crate::config::FeatureCoverageSource::PrecomputedSnapshot {
+                        snapshot_path: snapshot_path.clone(),
+                    });
+                }
+                Err(err)
+            }
+        },
+        Err(err) => {
+            if let crate::config::FeatureCoverageSource::PrecomputedSnapshot { snapshot_path } =
+                default_source
+                && feature_map::is_spawn_repo_mission_with(mission, canonical_spawn_repo)
+                && mission
+                    .pointer("/objectives/features")
+                    .is_some_and(Value::is_string)
+            {
+                return Ok(crate::config::FeatureCoverageSource::PrecomputedSnapshot {
+                    snapshot_path: snapshot_path.clone(),
+                });
+            }
+            Err(err)
+        }
+    }
+}
+
+pub(super) fn feature_coverage_source_for_query(
+    query: &str,
+) -> Result<crate::config::FeatureCoverageSource, (u16, Value)> {
     let Some(text) = mission_query(query) else {
-        let root = crate::feature_inventory::default_root();
-        let registry = crate::feature_inventory::default_registry_path(&root);
-        return Ok((root, registry));
+        return Ok(default_feature_coverage_source());
     };
     let Ok(id) = text.parse::<i64>() else {
         return Err((
@@ -2838,9 +2955,53 @@ pub(super) fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Val
     let missions = open_store()
         .and_then(|store| store.objective_missions().map_err(err))
         .map_err(|error| (500, json!({ "error": error })))?;
-    let (root, registry) = mission_feature_paths(&missions, id)?;
-    coverage_registry_checked(&registry, id)?;
-    Ok((root, registry))
+    let canonical_spawn_repo = crate::config::canonical_spawn_mission_repo();
+    resolve_mission_coverage_source(
+        &missions,
+        id,
+        &default_feature_coverage_source(),
+        canonical_spawn_repo.as_deref(),
+    )
+}
+
+/// The writable project root and feature registry for mutation routes
+/// (`POST /api/features/associate` and mission-scoped truth). Precomputed
+/// snapshots refuse mutation with a structured 409 (`registry_read_only`)
+/// before resolving any mission path.
+pub(super) fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Value)> {
+    refuse_if_precomputed_snapshot(SnapshotReadOnlyOp::Associate)?;
+    match feature_coverage_source_for_query(query)? {
+        crate::config::FeatureCoverageSource::LiveRepo { root, registry } => Ok((root, registry)),
+        crate::config::FeatureCoverageSource::PrecomputedSnapshot { snapshot_path } => Err(
+            snapshot_read_only_refusal(&snapshot_path, SnapshotReadOnlyOp::Associate),
+        ),
+    }
+}
+
+/// Shared HTTP + IPC handler for `POST /api/features/scan`: in precomputed
+/// snapshot deployments, unconditionally refuses with structured 409
+/// (`registry_read_only`) before resolving any mission path.
+pub(super) fn feature_scan_for_query(query: &str) -> (u16, Value) {
+    if let Err(refusal) = refuse_if_precomputed_snapshot(SnapshotReadOnlyOp::Scan) {
+        return refusal;
+    }
+    feature_coverage_for_query(query)
+}
+
+/// Shared HTTP + IPC handler for `POST /api/features/associate`: refuses
+/// precomputed snapshot deployments with structured 409 (`registry_read_only`)
+/// before resolving any mission path.
+pub(super) fn feature_associate_for_query(query: &str, raw_body: &[u8]) -> (u16, Value) {
+    if let Err(refusal) = refuse_if_precomputed_snapshot(SnapshotReadOnlyOp::Associate) {
+        return refusal;
+    }
+    match feature_paths(query) {
+        Ok((root, registry)) => match feature_associate_at(&root, &registry, raw_body) {
+            Ok(ans) | Err(FeatureAssociateRefusal::Structured(ans)) => ans,
+            Err(FeatureAssociateRefusal::Plain((st, msg))) => (st, json!({ "error": msg })),
+        },
+        Err(refusal) => refusal,
+    }
 }
 
 /// A query parameter as given (`None` when absent, `Some("")` for bare
@@ -2885,6 +3046,7 @@ fn coverage_registry_checked(registry: &Path, id: i64) -> Result<(), (u16, Value
 
 /// Mission `id`'s registry and project root ([`mission_paths`]), from the
 /// open objective missions `missions`: 404 when there is no such mission.
+#[cfg(test)]
 fn mission_feature_paths(missions: &Value, id: i64) -> Result<(PathBuf, PathBuf), (u16, Value)> {
     let mission = missions
         .as_array()
@@ -3002,24 +3164,15 @@ fn feature_scan_post(
         }
     }
     let _ = read_body(&mut request);
-    let paths = with_shared_reader(
+    let (status, body) = with_shared_reader(
         shared,
-        || feature_paths(query),
-        |res| matches!(res, Err((500, _))),
+        || feature_scan_for_query(query),
+        |(st, _)| *st == 500,
         |err| {
             let (st, msg) = err.status_and_message();
-            Err((st, json!({ "error": msg })))
+            (st, json!({ "error": msg }))
         },
     );
-    let (status, body) = match paths {
-        Ok((root, registry)) => {
-            match crate::feature_inventory::api_coverage_payload(&root, &registry) {
-                Ok(payload) => (200, payload),
-                Err(error) => (500, json!({ "error": error })),
-            }
-        }
-        Err(refusal) => refusal,
-    };
     request
         .respond(json_response(status, &body))
         .map_err(|error| error.to_string())
@@ -3079,6 +3232,8 @@ fn feature_associate_checked(
     shared: &Shared,
 ) -> Result<(u16, Value), FeatureAssociateRefusal> {
     let (raw_body, _) = write_body(request, access, shared, "a feature association")?;
+    refuse_if_precomputed_snapshot(SnapshotReadOnlyOp::Associate)
+        .map_err(FeatureAssociateRefusal::Structured)?;
     let (root, registry) = with_shared_reader(
         shared,
         || feature_paths(query),
@@ -12763,5 +12918,520 @@ mod tests {
         stop_mock_agent_uds(&mock_sock);
         srv_handle.join().expect("mock agent srv join");
         let _ = std::fs::remove_dir_all(&sock_dir);
+    }
+
+    /// Exchange a single HTTP request through `handle()` on the calling thread so
+    /// thread-local test overrides remain active without races.
+    fn exchange_local_with_pools(
+        token: Option<&'static str>,
+        raw: &str,
+        pools: Option<Arc<super::ipc::ServePools>>,
+    ) -> Answer {
+        use std::io::{Read, Write};
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let shared = Shared {
+            web: std::env::temp_dir(),
+            token: token.map(str::to_string),
+            port: Some(port),
+            hosts: server_hosts("127.0.0.1:0", port),
+            open: Vec::new(),
+            pools: Ok(pools),
+            agent_socket: None,
+            local_open: false,
+            herdr_discovery: spawn_host::HerdrDiscoveryEnv::default(),
+        };
+        let raw_req = raw.replace("PORT", &port.to_string());
+        let client_handle = std::thread::spawn(move || {
+            let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            client.write_all(raw_req.as_bytes()).expect("send");
+            let mut answer = String::new();
+            client.read_to_string(&mut answer).expect("read");
+            answer
+        });
+        let request = server.recv().expect("request");
+        handle(request, &shared).expect("answered");
+        let answer = client_handle.join().expect("client join");
+        let (head, body) = answer.split_once("\r\n\r\n").unwrap_or((&answer, ""));
+        Answer {
+            status: head
+                .split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse().ok())
+                .expect("status line"),
+            head: head.to_string(),
+            body: serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
+        }
+    }
+
+    fn exchange_local(token: Option<&'static str>, raw: &str) -> Answer {
+        exchange_local_with_pools(token, raw, None)
+    }
+
+    fn write_fixture_snapshot(base: &std::path::Path) -> std::path::PathBuf {
+        use spawn_core::feature_coverage::{
+            BoundaryPolicy, FeatureKind, FeatureNode, FeatureProvenance, FeatureRegistry,
+            SCHEMA_VERSION,
+        };
+        let repo_root = base.join("repo");
+        std::fs::create_dir_all(repo_root.join("src")).expect("src");
+        std::fs::write(repo_root.join("src/lib.rs"), "pub fn ok() {}\n").expect("lib.rs");
+        let reg_path = repo_root.join("docs/feature-map/registry.json");
+        let reg = FeatureRegistry {
+            schema_version: SCHEMA_VERSION,
+            initiative_id: "t559u".to_string(),
+            boundary: BoundaryPolicy::default_spawn_boundary(),
+            features: vec![FeatureNode {
+                id: "cap-ok".to_string(),
+                title: "OK".to_string(),
+                kind: FeatureKind::Capability,
+                parent: None,
+                summary: "Test feature".to_string(),
+                status_note: None,
+                files: vec!["src/lib.rs".to_string()],
+                relations: Vec::new(),
+                provenance: FeatureProvenance::default(),
+            }],
+        };
+        crate::feature_inventory::save_registry_atomic(&reg_path, &reg).expect("save registry");
+        let snapshot_payload =
+            crate::feature_inventory::api_coverage_snapshot_payload(&repo_root, &reg_path)
+                .expect("snapshot payload");
+        let snapshot_path = base.join("feature-coverage.json");
+        std::fs::write(
+            &snapshot_path,
+            serde_json::to_string_pretty(&snapshot_payload).expect("serialize snapshot"),
+        )
+        .expect("write snapshot");
+        // Remove the source tree to prove serve performs zero disk walk.
+        std::fs::remove_dir_all(&repo_root).expect("remove source repo");
+        snapshot_path
+    }
+
+    #[test]
+    fn precomputed_snapshot_serves_coverage_and_refuses_associate() {
+        use crate::config::FeatureCoverageSource;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base = std::env::temp_dir().join(format!(
+            "spawn-serve-precomputed-snapshot-{}-{nanos}",
+            std::process::id()
+        ));
+        let snapshot_path = write_fixture_snapshot(&base);
+
+        super::with_test_feature_coverage_source(
+            FeatureCoverageSource::PrecomputedSnapshot { snapshot_path },
+            || {
+                let get_res = exchange_local(
+                    Some("secret-token"),
+                    "GET /api/features/coverage HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                     Authorization: Bearer secret-token\r\nConnection: close\r\n\r\n",
+                );
+                assert_eq!(get_res.status, 200, "{get_res:?}");
+                assert_eq!(get_res.body["registry_writable"], json!(false));
+                assert!(
+                    get_res.body["read_only_reason"]
+                        .as_str()
+                        .is_some_and(|r| !r.trim().is_empty())
+                );
+                assert_eq!(get_res.body["report"]["counts"]["covered"], json!(1));
+                assert_eq!(get_res.body["features"].as_array().map(Vec::len), Some(1));
+
+                let scan_res = exchange_local(
+                    Some("secret-token"),
+                    "POST /api/features/scan HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                     Authorization: Bearer secret-token\r\nContent-Length: 2\r\n\
+                     Connection: close\r\n\r\n{}",
+                );
+                assert_eq!(scan_res.status, 409, "{scan_res:?}");
+                assert_eq!(scan_res.body["code"], "registry_read_only");
+                assert_eq!(scan_res.body["registry_writable"], json!(false));
+                assert!(
+                    scan_res.body["read_only_reason"]
+                        .as_str()
+                        .is_some_and(|r| !r.trim().is_empty())
+                );
+
+                let assoc_body = r#"{"path":"src/lib.rs","features":["cap-ok"]}"#;
+                let assoc_res = exchange_local(
+                    Some("secret-token"),
+                    &format!(
+                        "POST /api/features/associate HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                         Authorization: Bearer secret-token\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{assoc_body}",
+                        assoc_body.len()
+                    ),
+                );
+                assert_eq!(assoc_res.status, 409, "{assoc_res:?}");
+                assert_eq!(assoc_res.body["code"], "registry_read_only");
+                assert_eq!(assoc_res.body["registry_writable"], json!(false));
+                assert!(
+                    assoc_res.body["read_only_reason"]
+                        .as_str()
+                        .is_some_and(|r| !r.is_empty())
+                );
+            },
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn precomputed_snapshot_mission_fallback_and_corrupt_snapshot_fail_closed() {
+        use crate::config::FeatureCoverageSource;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base = std::env::temp_dir().join(format!(
+            "spawn-serve-precomputed-neg-{}-{nanos}",
+            std::process::id()
+        ));
+        let snapshot_path = write_fixture_snapshot(&base);
+
+        let canonical_repo =
+            std::path::Path::new("/home/spawn/.local/share/spawn-rsi/missions/spawn.git");
+        let missions = json!([
+            {
+                "id": 4,
+                "sources": ["/home/spawn/.local/share/spawn-rsi/missions/spawn.git"],
+                "objectives": {"backlog": "/none/backlog", "features": "../docs/feature-map/registry.json"}
+            },
+            {
+                "id": 5,
+                "sources": ["https://github.com:443/thinkseek/spawn.git"],
+                "objectives": {"backlog": "/none/backlog", "features": "../docs/feature-map/registry.json"}
+            },
+            {
+                "id": 8,
+                "sources": ["/worker/owner-fork/missions/spawn.git"],
+                "objectives": {"backlog": "/none/fork", "features": "../docs/feature-map/registry.json"}
+            },
+            {
+                "id": 9,
+                "sources": ["/m/missions/acme.git"],
+                "objectives": {"backlog": "/none/acme", "features": "../docs/feature-map/registry.json"}
+            }
+        ]);
+        let src = FeatureCoverageSource::PrecomputedSnapshot {
+            snapshot_path: snapshot_path.clone(),
+        };
+        assert!(matches!(
+            super::resolve_mission_coverage_source(&missions, 4, &src, Some(canonical_repo))
+                .expect("canonical spawn resolves"),
+            FeatureCoverageSource::PrecomputedSnapshot { .. }
+        ));
+        assert!(matches!(
+            super::resolve_mission_coverage_source(&missions, 5, &src, Some(canonical_repo))
+                .expect("port-normalized github url resolves"),
+            FeatureCoverageSource::PrecomputedSnapshot { .. }
+        ));
+        for refused_id in [8, 9] {
+            let (status, body) = super::resolve_mission_coverage_source(
+                &missions,
+                refused_id,
+                &src,
+                Some(canonical_repo),
+            )
+            .expect_err("non-canonical/external refused");
+            assert_eq!(status, 400, "mission {refused_id}: {body}");
+            assert_eq!(body["code"], "not_a_coverage_registry");
+        }
+
+        std::fs::write(&snapshot_path, "{corrupt json").expect("corrupt snapshot");
+        super::with_test_feature_coverage_source(src.clone(), || {
+            let err_get = exchange_local(
+                Some("secret-token"),
+                "GET /api/features/coverage HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                 Authorization: Bearer secret-token\r\nConnection: close\r\n\r\n",
+            );
+            assert_eq!(err_get.status, 500, "{err_get:?}");
+            assert!(err_get.body["error"].is_string());
+
+            let err_scan = exchange_local(
+                Some("secret-token"),
+                "POST /api/features/scan HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                 Authorization: Bearer secret-token\r\nContent-Length: 2\r\n\
+                 Connection: close\r\n\r\n{}",
+            );
+            assert_eq!(err_scan.status, 409, "{err_scan:?}");
+            assert_eq!(err_scan.body["code"], "registry_read_only");
+        });
+
+        std::fs::remove_file(&snapshot_path).expect("delete snapshot");
+        super::with_test_feature_coverage_source(src, || {
+            let (status, body) = super::feature_coverage_for_query("");
+            assert_eq!(status, 500, "{body:?}");
+            assert!(body["error"].is_string());
+        });
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn setup_writable_mission_repo_and_snapshot(
+        base: &std::path::Path,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        Vec<u8>,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        use spawn_core::feature_coverage::{
+            BoundaryPolicy, FeatureKind, FeatureNode, FeatureProvenance, FeatureRegistry,
+            SCHEMA_VERSION,
+        };
+
+        let mission_root = base.join("mission-repo");
+        let backlog_dir = mission_root.join("rsi");
+        std::fs::create_dir_all(mission_root.join("src")).expect("src");
+        std::fs::create_dir_all(&backlog_dir).expect("backlog");
+        std::fs::write(mission_root.join("src/lib.rs"), "pub fn lib() {}\n").expect("lib.rs");
+        std::fs::write(mission_root.join("src/wild.rs"), "pub fn wild() {}\n").expect("wild.rs");
+        let mission_reg = mission_root.join("docs/feature-map/registry.json");
+        let reg = FeatureRegistry {
+            schema_version: SCHEMA_VERSION,
+            initiative_id: "m1".to_string(),
+            boundary: BoundaryPolicy::default_spawn_boundary(),
+            features: vec![FeatureNode {
+                id: "cap-ok".to_string(),
+                title: "OK".to_string(),
+                kind: FeatureKind::Capability,
+                parent: None,
+                summary: "Writable mission feature".to_string(),
+                status_note: None,
+                files: vec!["src/lib.rs".to_string()],
+                relations: Vec::new(),
+                provenance: FeatureProvenance::default(),
+            }],
+        };
+        crate::feature_inventory::save_registry_atomic(&mission_reg, &reg)
+            .expect("save mission reg");
+        let before_bytes = std::fs::read(&mission_reg).expect("read before bytes");
+
+        let snapshot_payload =
+            crate::feature_inventory::api_coverage_snapshot_payload(&mission_root, &mission_reg)
+                .expect("snapshot");
+        let snapshot_path = base.join("feature-coverage.json");
+        std::fs::write(
+            &snapshot_path,
+            serde_json::to_string_pretty(&snapshot_payload).expect("serialize snapshot"),
+        )
+        .expect("write snapshot");
+        (
+            mission_root,
+            backlog_dir,
+            before_bytes,
+            mission_reg,
+            snapshot_path,
+        )
+    }
+
+    fn assert_snapshot_refuses_mission_mutations_on_http_and_ipc(
+        pools: &Arc<super::ipc::ServePools>,
+        assoc_query: &str,
+        assoc_body: &str,
+        snapshot_path: std::path::PathBuf,
+        mission_reg: &std::path::Path,
+        before_bytes: &[u8],
+    ) {
+        use crate::config::FeatureCoverageSource;
+
+        super::with_test_feature_coverage_source(
+            FeatureCoverageSource::PrecomputedSnapshot { snapshot_path },
+            || {
+                let http_cov = exchange_local_with_pools(
+                    Some("secret-token"),
+                    "GET /api/features/coverage HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                     Authorization: Bearer secret-token\r\nConnection: close\r\n\r\n",
+                    Some(Arc::clone(pools)),
+                );
+                assert_eq!(http_cov.status, 200, "{http_cov:?}");
+                assert_eq!(http_cov.body["registry_writable"], json!(false));
+
+                let (ipc_cov_st, ipc_cov_body) = super::ipc::dispatch_ipc_with_pools_for_test(
+                    Arc::clone(pools),
+                    "GET",
+                    "/api/features/coverage",
+                    "",
+                    Vec::new(),
+                );
+                assert_eq!(ipc_cov_st, 200, "{ipc_cov_body:?}");
+                assert_eq!(ipc_cov_body["registry_writable"], json!(false));
+
+                let http_assoc = exchange_local_with_pools(
+                    Some("secret-token"),
+                    &format!(
+                        "POST /api/features/associate?{assoc_query} HTTP/1.1\r\n\
+                         Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret-token\r\n\
+                         Content-Type: application/json\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n{assoc_body}",
+                        assoc_body.len()
+                    ),
+                    Some(Arc::clone(pools)),
+                );
+                assert_eq!(http_assoc.status, 409, "{http_assoc:?}");
+                assert_eq!(http_assoc.body["code"], "registry_read_only");
+                assert_eq!(http_assoc.body["registry_writable"], json!(false));
+
+                let (ipc_assoc_st, ipc_assoc_body) = super::ipc::dispatch_ipc_with_pools_for_test(
+                    Arc::clone(pools),
+                    "POST",
+                    "/api/features/associate",
+                    assoc_query,
+                    assoc_body.as_bytes().to_vec(),
+                );
+                assert_eq!(ipc_assoc_st, 409, "{ipc_assoc_body:?}");
+                assert_eq!(ipc_assoc_body["code"], "registry_read_only");
+                assert_eq!(ipc_assoc_body["registry_writable"], json!(false));
+
+                for scan_query in ["", assoc_query] {
+                    let req_path = if scan_query.is_empty() {
+                        "/api/features/scan".to_string()
+                    } else {
+                        format!("/api/features/scan?{scan_query}")
+                    };
+                    let http_scan = exchange_local_with_pools(
+                        Some("secret-token"),
+                        &format!(
+                            "POST {req_path} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                             Authorization: Bearer secret-token\r\nContent-Length: 2\r\n\
+                             Connection: close\r\n\r\n{{}}"
+                        ),
+                        Some(Arc::clone(pools)),
+                    );
+                    assert_eq!(
+                        http_scan.status, 409,
+                        "http scan {scan_query}: {http_scan:?}"
+                    );
+                    assert_eq!(http_scan.body["code"], "registry_read_only");
+
+                    let (ipc_scan_st, ipc_scan_body) = super::ipc::dispatch_ipc_with_pools_for_test(
+                        Arc::clone(pools),
+                        "POST",
+                        "/api/features/scan",
+                        scan_query,
+                        Vec::new(),
+                    );
+                    assert_eq!(ipc_scan_st, 409, "ipc scan {scan_query}: {ipc_scan_body:?}");
+                    assert_eq!(ipc_scan_body["code"], "registry_read_only");
+                }
+
+                assert_eq!(
+                    std::fs::read(mission_reg).expect("read after"),
+                    before_bytes,
+                    "mission registry bytes must stay untouched in snapshot mode"
+                );
+            },
+        );
+    }
+
+    fn assert_live_mission_remains_writable(
+        pools: &Arc<super::ipc::ServePools>,
+        mission_root: std::path::PathBuf,
+        mission_reg: &std::path::Path,
+        assoc_query: &str,
+        assoc_body: &str,
+        before_bytes: &[u8],
+    ) {
+        use crate::config::FeatureCoverageSource;
+
+        super::with_test_feature_coverage_source(
+            FeatureCoverageSource::LiveRepo {
+                root: mission_root,
+                registry: mission_reg.to_path_buf(),
+            },
+            || {
+                let live_cov = exchange_local_with_pools(
+                    Some("secret-token"),
+                    &format!(
+                        "GET /api/features/coverage?{assoc_query} HTTP/1.1\r\n\
+                         Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret-token\r\n\
+                         Connection: close\r\n\r\n"
+                    ),
+                    Some(Arc::clone(pools)),
+                );
+                assert_eq!(live_cov.status, 200, "{live_cov:?}");
+                assert_eq!(live_cov.body["registry_writable"], json!(true));
+
+                let live_assoc = exchange_local_with_pools(
+                    Some("secret-token"),
+                    &format!(
+                        "POST /api/features/associate?{assoc_query} HTTP/1.1\r\n\
+                         Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret-token\r\n\
+                         Content-Type: application/json\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n{assoc_body}",
+                        assoc_body.len()
+                    ),
+                    Some(Arc::clone(pools)),
+                );
+                assert_eq!(live_assoc.status, 200, "{live_assoc:?}");
+                assert_ne!(
+                    std::fs::read(mission_reg).expect("read after live"),
+                    before_bytes
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn precomputed_snapshot_refuses_mission_associate_and_scan_on_http_and_ipc() {
+        in_test_schema(|owner, store| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let base = std::env::temp_dir().join(format!(
+                "spawn-serve-mission-ro-{}-{nanos}",
+                std::process::id()
+            ));
+            let (mission_root, backlog_dir, before_bytes, mission_reg, snapshot_path) =
+                setup_writable_mission_repo_and_snapshot(&base);
+
+            let mission_id = store
+                .mission_add("Mission Writable", &json!([]), "human")
+                .expect("mission_add");
+            let obj = json!({
+                "backlog": backlog_dir.display().to_string(),
+                "resident": "rsi",
+                "features": mission_reg.display().to_string(),
+            });
+            store
+                .mission_configure(mission_id, Some("/scenarios"), "review", None, Some(&obj))
+                .expect("mission_configure");
+
+            let config = super::ipc::PoolConfig {
+                reads: 1,
+                writes: 1,
+                node: 1,
+                events: 1,
+                wait_timeout: std::time::Duration::from_millis(500),
+            };
+            let pools = super::ipc::ServePools::from_serve_env(Some(owner), None, config)
+                .expect("pools")
+                .expect("configured");
+
+            let assoc_body = r#"{"path":"src/wild.rs","features":["cap-ok"]}"#;
+            let assoc_query = format!("mission={mission_id}");
+
+            assert_snapshot_refuses_mission_mutations_on_http_and_ipc(
+                &pools,
+                &assoc_query,
+                assoc_body,
+                snapshot_path,
+                &mission_reg,
+                &before_bytes,
+            );
+            assert_live_mission_remains_writable(
+                &pools,
+                mission_root,
+                &mission_reg,
+                &assoc_query,
+                assoc_body,
+                &before_bytes,
+            );
+
+            let _ = std::fs::remove_dir_all(&base);
+        });
     }
 }

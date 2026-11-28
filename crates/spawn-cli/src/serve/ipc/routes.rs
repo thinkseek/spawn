@@ -10,9 +10,7 @@ use super::PoolError;
 use super::events::{latest_cursor, serve_api_sse, serve_ndjson_events};
 use super::http::{IpcRequest, IpcResponse, write_response};
 use super::node::handle_node_route;
-use crate::serve::{
-    self, BAD_REQUEST, FeatureAssociateRefusal, MAX_INPUT_TEXT, answers, approvals, route,
-};
+use crate::serve::{self, BAD_REQUEST, MAX_INPUT_TEXT, answers, approvals, route};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -392,7 +390,7 @@ fn handle_api_post(pattern: &str, id: &str, req: &IpcRequest, state: &IpcState) 
         let (status, value) = serve::run_with_reader_pool_status(
             &state.pools.reader,
             false,
-            || serve::feature_coverage_for_query(&req.query),
+            || serve::feature_scan_for_query(&req.query),
             |(st, _)| *st == 500,
             |err| {
                 let (st, msg) = err.status_and_message();
@@ -405,17 +403,7 @@ fn handle_api_post(pattern: &str, id: &str, req: &IpcRequest, state: &IpcState) 
         let (status, value) = serve::run_with_reader_pool_status(
             &state.pools.reader,
             false,
-            || match serve::feature_paths(&req.query) {
-                Ok((root, registry)) => {
-                    match serve::feature_associate_at(&root, &registry, &req.body) {
-                        Ok(ans) | Err(FeatureAssociateRefusal::Structured(ans)) => ans,
-                        Err(FeatureAssociateRefusal::Plain((st, msg))) => {
-                            (st, json!({ "error": msg }))
-                        }
-                    }
-                }
-                Err(refusal) => refusal,
-            },
+            || serve::feature_associate_for_query(&req.query, &req.body),
             |(st, _)| *st == 500,
             |err| {
                 let (st, msg) = err.status_and_message();
@@ -677,6 +665,33 @@ fn resolve_ipc_act(
 }
 
 #[cfg(test)]
+pub(in crate::serve) fn dispatch_ipc_with_pools_for_test(
+    pools: Arc<super::ServePools>,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: Vec<u8>,
+) -> (u16, Value) {
+    let state = IpcState {
+        pools,
+        cas_root: std::env::temp_dir(),
+        epoch: "test-epoch".to_string(),
+    };
+    let req = IpcRequest {
+        method: method.to_string(),
+        path: path.to_string(),
+        query: query.to_string(),
+        headers: std::collections::BTreeMap::new(),
+        idempotency_key: None,
+        body,
+        close: false,
+    };
+    let resp = dispatch_buffered(&req, &state);
+    let parsed = serde_json::from_slice(&resp.body).unwrap_or(Value::Null);
+    (resp.status, parsed)
+}
+
+#[cfg(test)]
 mod truth_tests {
     use std::path::PathBuf;
 
@@ -928,5 +943,96 @@ mod truth_tests {
         assert!(etag.starts_with("W/\""), "expected weak ETag, got {etag}");
         assert!(answers::not_modified(Some(&etag), &etag));
         assert!(!answers::not_modified(Some("W/\"different\""), &etag));
+    }
+
+    #[test]
+    fn precomputed_snapshot_ipc_serves_get_coverage_and_refuses_scan_and_associate() {
+        use crate::config::FeatureCoverageSource;
+        use spawn_core::feature_coverage::{
+            BoundaryPolicy, FeatureKind, FeatureNode, FeatureProvenance, FeatureRegistry,
+            SCHEMA_VERSION,
+        };
+
+        let dir = ScratchDir::new("snapshot-ipc");
+        let repo_root = dir.0.join("repo");
+        std::fs::create_dir_all(repo_root.join("src")).unwrap();
+        std::fs::write(repo_root.join("src/lib.rs"), "pub fn ipc_ok() {}\n").unwrap();
+        let reg_path = repo_root.join("docs/feature-map/registry.json");
+        let reg = FeatureRegistry {
+            schema_version: SCHEMA_VERSION,
+            initiative_id: "t559u".to_string(),
+            boundary: BoundaryPolicy::default_spawn_boundary(),
+            features: vec![FeatureNode {
+                id: "cap-ipc".to_string(),
+                title: "IPC OK".to_string(),
+                kind: FeatureKind::Capability,
+                parent: None,
+                summary: "IPC snapshot fixture".to_string(),
+                status_note: None,
+                files: vec!["src/lib.rs".to_string()],
+                relations: Vec::new(),
+                provenance: FeatureProvenance::default(),
+            }],
+        };
+        crate::feature_inventory::save_registry_atomic(&reg_path, &reg).unwrap();
+        let snapshot_payload =
+            crate::feature_inventory::api_coverage_snapshot_payload(&repo_root, &reg_path).unwrap();
+        let snapshot_path = dir.0.join("feature-coverage.json");
+        std::fs::write(
+            &snapshot_path,
+            serde_json::to_string_pretty(&snapshot_payload).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&repo_root).unwrap();
+
+        let state = IpcState::with_test_wait_timeout(
+            RoleUrls::from_explicit(
+                "postgres://spawn_reader@127.0.0.1:1/spawn".to_string(),
+                "postgres://spawn_human@127.0.0.1:1/spawn".to_string(),
+                "postgres://spawn_node_gateway@127.0.0.1:1/spawn".to_string(),
+            ),
+            dir.0.join("cas"),
+            None,
+            std::time::Duration::ZERO,
+        );
+
+        serve::with_test_feature_coverage_source(
+            FeatureCoverageSource::PrecomputedSnapshot { snapshot_path },
+            || {
+                let get_resp = dispatch_buffered(
+                    &ipc_request("GET", "/api/features/coverage", "", vec![]),
+                    &state,
+                );
+                assert_eq!(get_resp.status, 200);
+                let get_body: Value = serde_json::from_slice(&get_resp.body).unwrap();
+                assert_eq!(get_body["registry_writable"], json!(false));
+                assert_eq!(get_body["report"]["counts"]["covered"], json!(1));
+
+                for query in ["", "mission=1"] {
+                    let scan_resp = dispatch_buffered(
+                        &ipc_request("POST", "/api/features/scan", query, vec![]),
+                        &state,
+                    );
+                    assert_eq!(scan_resp.status, 409, "scan {query}");
+                    let scan_body: Value = serde_json::from_slice(&scan_resp.body).unwrap();
+                    assert_eq!(scan_body["code"], "registry_read_only");
+                    assert_eq!(scan_body["registry_writable"], json!(false));
+                    assert!(
+                        scan_body["read_only_reason"]
+                            .as_str()
+                            .is_some_and(|r| !r.trim().is_empty())
+                    );
+
+                    let mut assoc_req =
+                        ipc_request("POST", "/api/features/associate", query, vec![]);
+                    assoc_req.body = br#"{"path":"src/lib.rs","features":["cap-ipc"]}"#.to_vec();
+                    let assoc_resp = dispatch_buffered(&assoc_req, &state);
+                    assert_eq!(assoc_resp.status, 409, "assoc {query}");
+                    let assoc_body: Value = serde_json::from_slice(&assoc_resp.body).unwrap();
+                    assert_eq!(assoc_body["code"], "registry_read_only");
+                    assert_eq!(assoc_body["registry_writable"], json!(false));
+                }
+            },
+        );
     }
 }

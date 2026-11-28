@@ -127,6 +127,7 @@ usage() {
 
 init_upgrade_defaults() {
   rsi_dir=${SPAWN_RSI_DIR:-${SPAWN_LIVE:-$HOME/.local/share/spawn-rsi}}
+  unit_dir=${SPAWN_UNIT_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}
   role=""
   version=""
   rollback=0
@@ -1035,6 +1036,116 @@ verify_worker_settle() {
   return 0
 }
 
+release_has_verified_feature_snapshots() {
+  local release_dir=$1
+  local sums_file="$release_dir/SHA256SUMS"
+  [ -f "$sums_file" ] && [ ! -L "$sums_file" ] || return 1
+
+  local has_cov=0 has_reg=0 line rel
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" != *$'\r' ]] || return 1
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^([0-9a-fA-F]{64})\ ([ \*])(.+)$ ]] || continue
+    rel=${BASH_REMATCH[3]}
+    while [[ "$rel" == ./* ]]; do
+      rel=${rel#./}
+    done
+    case "$rel" in
+      feature-coverage.json) has_cov=1 ;;
+      registry.json) has_reg=1 ;;
+    esac
+  done <"$sums_file"
+
+  [ "$has_cov" -eq 1 ] && [ "$has_reg" -eq 1 ] || return 1
+  [ -f "$release_dir/feature-coverage.json" ] && [ ! -L "$release_dir/feature-coverage.json" ] && [ -s "$release_dir/feature-coverage.json" ] || return 1
+  [ -f "$release_dir/registry.json" ] && [ ! -L "$release_dir/registry.json" ] && [ -s "$release_dir/registry.json" ] || return 1
+  return 0
+}
+
+sync_control_plane_feature_snapshot_dropins() {
+  local tag=$1 target_role=$2 active_unit_count=${3:-0}
+  [ "$target_role" = "control-plane" ] || return 0
+
+  local release_dir="$rsi_dir/releases/$tag"
+  local rsi_clean=${rsi_dir%/}
+  [ -n "$rsi_clean" ] || rsi_clean="/"
+  local dropin_rsi_dir
+  if [ -n "${HOME-}" ] && [ "$rsi_clean" = "${HOME%/}/.local/share/spawn-rsi" ]; then
+    dropin_rsi_dir='%h/.local/share/spawn-rsi'
+  else
+    dropin_rsi_dir=$rsi_clean
+  fi
+  case "$dropin_rsi_dir" in
+    *$'\n'* | *$'\r'*)
+      LAST_PROBE_REASON="invalid newline/CR in rsi_dir for control-plane snapshot drop-in"
+      return 1
+      ;;
+  esac
+
+  local want_dropin=0
+  if release_has_verified_feature_snapshots "$release_dir"; then
+    want_dropin=1
+  fi
+
+  local changed=0 unit dropin_dir dropin_file tmp
+  for unit in spawn-serve.service spawn-core.service; do
+    dropin_dir="$unit_dir/${unit}.d"
+    dropin_file="$dropin_dir/50-feature-coverage-snapshot.conf"
+    if [ "$want_dropin" -eq 1 ]; then
+      if ! mkdir -p "$dropin_dir"; then
+        LAST_PROBE_REASON="failed to create drop-in dir $dropin_dir"
+        return 1
+      fi
+      tmp="$dropin_dir/.50-feature-coverage-snapshot.conf.tmp.$$"
+      if ! {
+        printf '# Managed by deploy/self-upgrade.sh (--role control-plane).\n'
+        printf '# Enabled only when verified current/feature-coverage.json and current/registry.json exist.\n'
+        printf '[Service]\n'
+        printf 'Environment=SPAWN_FEATURE_COVERAGE_SNAPSHOT=%s/current/feature-coverage.json\n' "$dropin_rsi_dir"
+        printf 'Environment=SPAWN_FEATURE_REGISTRY=%s/current/registry.json\n' "$dropin_rsi_dir"
+      } >"$tmp"; then
+        rm -f -- "$tmp"
+        LAST_PROBE_REASON="failed to write temp drop-in $tmp"
+        return 1
+      fi
+      if [ ! -f "$dropin_file" ] || [ -L "$dropin_file" ] || ! cmp -s "$tmp" "$dropin_file"; then
+        if ! { chmod 0644 "$tmp" && mv -f -- "$tmp" "$dropin_file"; }; then
+          rm -f -- "$tmp"
+          LAST_PROBE_REASON="failed to install drop-in $dropin_file"
+          return 1
+        fi
+        changed=1
+      else
+        rm -f -- "$tmp"
+      fi
+    else
+      if [ -e "$dropin_file" ] || [ -L "$dropin_file" ]; then
+        if ! rm -f -- "$dropin_file"; then
+          LAST_PROBE_REASON="failed to remove stale drop-in $dropin_file"
+          return 1
+        fi
+        rmdir -- "$dropin_dir" 2>/dev/null || true
+        changed=1
+      fi
+    fi
+  done
+
+  if [ "$changed" -eq 1 ]; then
+    local -a sysctl_arr=()
+    split_cmd_array "$systemctl_cmd" sysctl_arr
+    if [ "$active_unit_count" -gt 0 ]; then
+      if ! run_without_lock_fd "${sysctl_arr[@]}" daemon-reload; then
+        LAST_PROBE_REASON="systemctl daemon-reload failed"
+        return 1
+      fi
+    else
+      run_without_lock_fd "${sysctl_arr[@]}" daemon-reload >/dev/null 2>&1 || true
+    fi
+  fi
+  return 0
+}
+
 perform_rollback() {
   local actor=$1 from_tag=$2 prev_tag=$3 target_role=$4 reason_raw=$5
   shift 5
@@ -1072,7 +1183,7 @@ perform_rollback() {
   local -a rollback_units=(${units[@]+"${units[@]}"})
   filter_out_cleanly_stopped_units rollback_units
 
-  if ! restart_units ${rollback_units[@]+"${rollback_units[@]}"} || ! probe_role_health "$target_role" "$probe_retries" "$probe_interval" ${rollback_units[@]+"${rollback_units[@]}"}; then
+  if ! sync_control_plane_feature_snapshot_dropins "$prev_tag" "$target_role" "${#rollback_units[@]}" || ! restart_units ${rollback_units[@]+"${rollback_units[@]}"} || ! probe_role_health "$target_role" "$probe_retries" "$probe_interval" ${rollback_units[@]+"${rollback_units[@]}"}; then
     local full_reason="$reason_raw; rollback recovery failed: ${LAST_PROBE_REASON:-restart error}"
     warn "rollback recovery failed ($actor): $full_reason"
     write_upgrade_state "rollback_failed" "$target_role" "$prev_tag" "$prev_tag" \
@@ -1149,6 +1260,7 @@ parse_self_upgrade_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --rsi-dir) need_val "$@"; rsi_dir=$2; shift ;;
+      --unit-dir) need_val "$@"; unit_dir=$2; shift ;;
       --role) need_val "$@"; role=$2; shift ;;
       --version) need_val "$@"; version=$2; shift ;;
       --rollback) rollback=1 ;;
@@ -1295,7 +1407,9 @@ main() {
   activate_release_links "$version" 1
 
   local fail_reason=""
-  if ! run_init_db; then
+  if ! sync_control_plane_feature_snapshot_dropins "$version" "$role" "${#units[@]}"; then
+    fail_reason=${LAST_PROBE_REASON:-"control-plane feature snapshot drop-in sync failed"}
+  elif ! run_init_db; then
     fail_reason=${LAST_PROBE_REASON:-"init-db failed"}
   elif ! restart_units ${units[@]+"${units[@]}"}; then
     fail_reason=${LAST_PROBE_REASON:-"unit restart failed"}

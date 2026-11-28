@@ -1389,5 +1389,209 @@ check "(units) spawn-upgrade-watchdog.service is regular file without spawn.env/
 check "(units) spawn-upgrade-watchdog.timer is regular file under timers.target" \
   bash -c '[ -f "$1" ] && [ ! -L "$1" ] && grep -q "WantedBy=timers.target" "$1"' _ "$unit_timer"
 
+# -----------------------------------------------------------------------------
+# Scenario (o) PR #281 Blocker 1: control-plane snapshot drop-ins (legacy + Go/UDS)
+# -----------------------------------------------------------------------------
+add_snapshot_artifacts() {
+  local rdir=$1 cov=${2:-1} reg=${3:-1}
+  if [ "$cov" -eq 1 ]; then
+    printf '{"root":".","registry_path":"docs/feature-map/registry.json","registry_writable":false,"read_only_reason":"precomputed","report":{"schema_version":1},"features":[]}\n' >"$rdir/feature-coverage.json"
+    chmod 0644 "$rdir/feature-coverage.json"
+  fi
+  if [ "$reg" -eq 1 ]; then
+    printf '{"schema_version":1,"initiative_id":"spawn","boundary":{"project_name":"Spawn","description":"d","included_categories":[],"exclusions":[]},"features":[]}\n' >"$rdir/registry.json"
+    chmod 0644 "$rdir/registry.json"
+  fi
+  rehash_release "$rdir"
+}
+
+cp_units_o="$scratch/units-o"
+mkdir -p "$cp_units_o"
+
+# (o1) Release without snapshot artifacts -> no drop-ins, no daemon-reload
+rsi_o1="$scratch/rsi-o1"
+seed_initial_v1 "$rsi_o1" "control-plane"
+make_release "$rsi_o1" "v2-live" "control-plane" "dir"
+export MOCK_RSI_DIR="$rsi_o1"
+rm -rf "$cp_units_o"/* "$MOCK_SYSCTL_STATE"/*
+echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-serve.service"
+echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-node-gateway.service"
+: >"$MOCK_EVENTS_LOG"
+rc=0
+SPAWN_UNIT_DIR="$cp_units_o" SPAWN_UPGRADE_NOW_EPOCH=7100 \
+  bash "$upgrade_sh" --rsi-dir "$rsi_o1" --role control-plane --version v2-live \
+  --probe-retries 1 --probe-interval 0 \
+  --systemctl "$mock_bin/systemctl --user" --curl "$mock_bin/curl" >"$scratch/o1.out" 2>&1 || rc=$?
+check "(o1) control-plane without snapshot artifacts exits 0, no drop-in, no daemon-reload (got $rc)" \
+  bash -c '[ "$1" -eq 0 ] && [ ! -e "$2/spawn-serve.service.d/50-feature-coverage-snapshot.conf" ] && [ ! -e "$2/spawn-core.service.d/50-feature-coverage-snapshot.conf" ] && ! grep -q "daemon-reload" "$3"' \
+  _ "$rc" "$cp_units_o" "$MOCK_EVENTS_LOG"
+
+# (o2) Missing one of the two snapshot artifacts -> no drop-ins
+for partial_mode in "cov-only" "reg-only"; do
+  rsi_op="$scratch/rsi-o2-$partial_mode"
+  seed_initial_v1 "$rsi_op" "control-plane"
+  make_release "$rsi_op" "v2-partial" "control-plane" "dir"
+  if [ "$partial_mode" = "cov-only" ]; then
+    add_snapshot_artifacts "$rsi_op/releases/v2-partial" 1 0
+  else
+    add_snapshot_artifacts "$rsi_op/releases/v2-partial" 0 1
+  fi
+  export MOCK_RSI_DIR="$rsi_op"
+  rm -rf "$cp_units_o"/* "$MOCK_SYSCTL_STATE"/*
+  echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-serve.service"
+  echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-node-gateway.service"
+  : >"$MOCK_EVENTS_LOG"
+  rc=0
+  SPAWN_UNIT_DIR="$cp_units_o" SPAWN_UPGRADE_NOW_EPOCH=7150 \
+    bash "$upgrade_sh" --rsi-dir "$rsi_op" --role control-plane --version v2-partial \
+    --probe-retries 1 --probe-interval 0 \
+    --systemctl "$mock_bin/systemctl --user" --curl "$mock_bin/curl" >"$scratch/o2-$partial_mode.out" 2>&1 || rc=$?
+  check "(o2:$partial_mode) partial snapshot artifacts leave drop-ins absent (got $rc)" \
+    bash -c '[ "$1" -eq 0 ] && [ ! -e "$2/spawn-serve.service.d/50-feature-coverage-snapshot.conf" ] && [ ! -e "$2/spawn-core.service.d/50-feature-coverage-snapshot.conf" ] && ! grep -q "daemon-reload" "$3"' \
+    _ "$rc" "$cp_units_o" "$MOCK_EVENTS_LOG"
+done
+
+# (o3) Release with both verified snapshot artifacts -> creates 0644 drop-ins for serve+core and daemon-reloads before restart
+rsi_o3="$scratch/rsi-o3"
+seed_initial_v1 "$rsi_o3" "control-plane"
+make_release "$rsi_o3" "v2-snap" "control-plane" "dir"
+add_snapshot_artifacts "$rsi_o3/releases/v2-snap" 1 1
+export MOCK_RSI_DIR="$rsi_o3"
+rm -rf "$cp_units_o"/* "$MOCK_SYSCTL_STATE"/*
+echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-serve.service"
+echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-node-gateway.service"
+: >"$MOCK_EVENTS_LOG"
+rc=0
+SPAWN_UNIT_DIR="$cp_units_o" SPAWN_UPGRADE_NOW_EPOCH=7200 \
+  bash "$upgrade_sh" --rsi-dir "$rsi_o3" --role control-plane --version v2-snap \
+  --probe-retries 1 --probe-interval 0 \
+  --systemctl "$mock_bin/systemctl --user" --curl "$mock_bin/curl" >"$scratch/o3.out" 2>&1 || rc=$?
+serve_dropin="$cp_units_o/spawn-serve.service.d/50-feature-coverage-snapshot.conf"
+core_dropin="$cp_units_o/spawn-core.service.d/50-feature-coverage-snapshot.conf"
+check "(o3) verified snapshot release installs 0644 drop-ins and daemon-reloads before restarting serve (got $rc)" \
+  bash -c '
+    [ "$1" -eq 0 ] &&
+    [ -f "$2" ] && [ "$(stat -c %a "$2")" = 644 ] &&
+    [ -f "$3" ] && [ "$(stat -c %a "$3")" = 644 ] &&
+    grep -qxF "Environment=SPAWN_FEATURE_COVERAGE_SNAPSHOT=$4/current/feature-coverage.json" "$2" &&
+    grep -qxF "Environment=SPAWN_FEATURE_REGISTRY=$4/current/registry.json" "$2" &&
+    grep -qxF "Environment=SPAWN_FEATURE_COVERAGE_SNAPSHOT=$4/current/feature-coverage.json" "$3" &&
+    grep -qxF "Environment=SPAWN_FEATURE_REGISTRY=$4/current/registry.json" "$3" &&
+    awk "/^systemctl:daemon-reload:/{d=NR} /^systemctl:restart:spawn-serve\\.service$/{r=NR} END{exit !(d && r && d < r)}" "$5"
+  ' _ "$rc" "$serve_dropin" "$core_dropin" "$rsi_o3" "$MOCK_EVENTS_LOG"
+
+# (o4) Go/UDS control-plane (--units spawn-core.service) with verified snapshots enables spawn-core drop-in before restart
+cp_units_go="$scratch/units-o-go"
+mkdir -p "$cp_units_go"
+rm -rf "$MOCK_SYSCTL_STATE"/*
+echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-core.service"
+echo "inactive" >"$MOCK_SYSCTL_STATE/active.spawn-serve.service"
+echo "inactive" >"$MOCK_SYSCTL_STATE/active.spawn-node-gateway.service"
+make_release "$rsi_o3" "v3-snap-go" "control-plane" "dir"
+add_snapshot_artifacts "$rsi_o3/releases/v3-snap-go" 1 1
+: >"$MOCK_EVENTS_LOG"
+rc=0
+SPAWN_UPGRADE_NOW_EPOCH=7250 \
+  bash "$upgrade_sh" --rsi-dir "$rsi_o3" --unit-dir "$cp_units_go" --role control-plane --units spawn-core.service --version v3-snap-go \
+  --probe-retries 1 --probe-interval 0 \
+  --systemctl "$mock_bin/systemctl --user" --curl "$mock_bin/curl" >"$scratch/o4.out" 2>&1 || rc=$?
+check "(o4) Go/UDS control-plane enables spawn-core drop-in and daemon-reloads before restarting spawn-core (got $rc)" \
+  bash -c '
+    [ "$1" -eq 0 ] &&
+    [ -f "$2/spawn-core.service.d/50-feature-coverage-snapshot.conf" ] &&
+    grep -qxF "Environment=SPAWN_FEATURE_COVERAGE_SNAPSHOT=$3/current/feature-coverage.json" "$2/spawn-core.service.d/50-feature-coverage-snapshot.conf" &&
+    awk "/^systemctl:daemon-reload:/{d=NR} /^systemctl:restart:spawn-core\\.service$/{r=NR} END{exit !(d && r && d < r)}" "$4"
+  ' _ "$rc" "$cp_units_go" "$rsi_o3" "$MOCK_EVENTS_LOG"
+
+# (o5a) Manual --rollback from snapshot v2-snap back to live v1 removes drop-ins and daemon-reloads before restart
+rm -rf "$MOCK_SYSCTL_STATE"/*
+echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-serve.service"
+echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-node-gateway.service"
+# Re-upgrade rsi_o3 to v2-snap cleanly so current=v2-snap, previous=v1, drop-ins active in $cp_units_o
+rsi_o5="$scratch/rsi-o5"
+cp_units_o5="$scratch/units-o5"
+mkdir -p "$cp_units_o5"
+seed_initial_v1 "$rsi_o5" "control-plane"
+make_release "$rsi_o5" "v2-snap" "control-plane" "dir"
+add_snapshot_artifacts "$rsi_o5/releases/v2-snap" 1 1
+export MOCK_RSI_DIR="$rsi_o5"
+SPAWN_UNIT_DIR="$cp_units_o5" SPAWN_UPGRADE_NOW_EPOCH=7300 \
+  bash "$upgrade_sh" --rsi-dir "$rsi_o5" --role control-plane --version v2-snap \
+  --probe-retries 1 --probe-interval 0 \
+  --systemctl "$mock_bin/systemctl --user" --curl "$mock_bin/curl" >/dev/null
+: >"$MOCK_EVENTS_LOG"
+rc=0
+SPAWN_UNIT_DIR="$cp_units_o5" SPAWN_UPGRADE_NOW_EPOCH=7320 \
+  bash "$upgrade_sh" --rsi-dir "$rsi_o5" --role control-plane --rollback \
+  --probe-retries 1 --probe-interval 0 \
+  --systemctl "$mock_bin/systemctl --user" --curl "$mock_bin/curl" >"$scratch/o5a.out" 2>&1 || rc=$?
+check "(o5a) manual --rollback to live v1 removes snapshot drop-ins and daemon-reloads before restart (got $rc)" \
+  bash -c '
+    [ "$1" -eq 0 ] &&
+    [ ! -e "$2/spawn-serve.service.d/50-feature-coverage-snapshot.conf" ] &&
+    [ ! -e "$2/spawn-core.service.d/50-feature-coverage-snapshot.conf" ] &&
+    awk "/^systemctl:daemon-reload:/{d=NR} /^systemctl:restart:spawn-serve\\.service$/{r=NR} END{exit !(d && r && d < r)}" "$3"
+  ' _ "$rc" "$cp_units_o5" "$MOCK_EVENTS_LOG"
+
+# (o5b) Probe-failure auto-rollback from snapshot v2-snap-bad back to live v1 cleans up newly written drop-ins
+rsi_o5b="$scratch/rsi-o5b"
+cp_units_o5b="$scratch/units-o5b"
+mkdir -p "$cp_units_o5b"
+seed_initial_v1 "$rsi_o5b" "control-plane"
+make_release "$rsi_o5b" "v2-snap-bad" "control-plane" "dir"
+add_snapshot_artifacts "$rsi_o5b/releases/v2-snap-bad" 1 1
+export MOCK_RSI_DIR="$rsi_o5b"
+rm -rf "$MOCK_SYSCTL_STATE"/*
+echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-serve.service"
+echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-node-gateway.service"
+echo "v2-snap-bad" >"$MOCK_SYSCTL_STATE/serve_code_by_unitver"
+: >"$MOCK_EVENTS_LOG"
+rc=0
+SPAWN_UNIT_DIR="$cp_units_o5b" SPAWN_UPGRADE_NOW_EPOCH=7350 \
+  bash "$upgrade_sh" --rsi-dir "$rsi_o5b" --role control-plane --version v2-snap-bad \
+  --probe-retries 1 --probe-interval 0 \
+  --systemctl "$mock_bin/systemctl --user" --curl "$mock_bin/curl" >"$scratch/o5b.out" 2>&1 || rc=$?
+check "(o5b) auto-rollback on failed snapshot release removes drop-ins cleanly (got $rc)" \
+  bash -c '[ "$1" -eq 3 ] && [ "$(readlink "$2/current")" = "releases/v1" ] && [ ! -e "$3/spawn-serve.service.d/50-feature-coverage-snapshot.conf" ] && [ ! -e "$3/spawn-core.service.d/50-feature-coverage-snapshot.conf" ]' \
+  _ "$rc" "$rsi_o5b" "$cp_units_o5b"
+
+# (o6) --role worker-node NEVER creates snapshot drop-ins even if snapshot artifacts exist
+rsi_o6="$scratch/rsi-o6"
+cp_units_w="$scratch/units-o6-worker"
+mkdir -p "$cp_units_w"
+seed_initial_v1 "$rsi_o6" "worker-node"
+make_release "$rsi_o6" "v2-worker" "worker-node" "none"
+add_snapshot_artifacts "$rsi_o6/releases/v2-worker" 1 1
+export MOCK_RSI_DIR="$rsi_o6"
+rm -rf "$MOCK_SYSCTL_STATE"/*
+echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-loop.service"
+echo "inactive" >"$MOCK_SYSCTL_STATE/active.spawn-integrate.service"
+echo "inactive" >"$MOCK_SYSCTL_STATE/active.spawn-node.service"
+: >"$MOCK_EVENTS_LOG"
+rc=0
+SPAWN_UNIT_DIR="$cp_units_w" SPAWN_UPGRADE_NOW_EPOCH=7400 \
+  bash "$upgrade_sh" --rsi-dir "$rsi_o6" --role worker-node --version v2-worker \
+  --worker-settle-secs 0 --probe-retries 1 --probe-interval 0 \
+  --systemctl "$mock_bin/systemctl --user" --curl "$mock_bin/curl" >"$scratch/o6.out" 2>&1 || rc=$?
+check "(o6) worker-node upgrade never creates snapshot drop-ins (got $rc)" \
+  bash -c '[ "$1" -eq 0 ] && [ ! -e "$2/spawn-serve.service.d/50-feature-coverage-snapshot.conf" ] && [ ! -e "$2/spawn-core.service.d/50-feature-coverage-snapshot.conf" ] && ! grep -q "daemon-reload" "$3"' \
+  _ "$rc" "$cp_units_w" "$MOCK_EVENTS_LOG"
+
+# (o7) --dry-run on snapshot release creates no drop-ins and runs no daemon-reload
+cp_units_dry="$scratch/units-o7-dry"
+mkdir -p "$cp_units_dry"
+export MOCK_RSI_DIR="$rsi_o3"
+rm -rf "$MOCK_SYSCTL_STATE"/*
+echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-serve.service"
+echo "active" >"$MOCK_SYSCTL_STATE/active.spawn-node-gateway.service"
+: >"$MOCK_EVENTS_LOG"
+rc=0
+SPAWN_UNIT_DIR="$cp_units_dry" \
+  bash "$upgrade_sh" --rsi-dir "$rsi_o3" --role control-plane --version v3-snap-go --dry-run \
+  --systemctl "$mock_bin/systemctl --user" --curl "$mock_bin/curl" >"$scratch/o7.out" 2>&1 || rc=$?
+check "(o7) --dry-run on snapshot release leaves drop-ins untouched and runs no systemctl (got $rc)" \
+  bash -c '[ "$1" -eq 0 ] && [ ! -e "$2/spawn-serve.service.d/50-feature-coverage-snapshot.conf" ] && [ ! -e "$2/spawn-core.service.d/50-feature-coverage-snapshot.conf" ] && [ ! -s "$3" ]' \
+  _ "$rc" "$cp_units_dry" "$MOCK_EVENTS_LOG"
+
 echo "test-self-upgrade: $passed passed, $failures failed"
 [ "$failures" -eq 0 ]
