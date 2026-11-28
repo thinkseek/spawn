@@ -102,7 +102,8 @@ pub use terminal_support::TerminalHostEnv;
 pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};
 pub use watch::InotifyWatch;
 pub use workspace::{
-    BACKEND_MARKER, CAS_DIRECTORY, LocalWorkspaceStore, WorkspaceBackend, claim_root, root_backend,
+    BACKEND_MARKER, CAS_DIRECTORY, LocalD6ShadowStore, LocalWorkspaceStore, WorkspaceBackend,
+    claim_root, root_backend,
 };
 pub use workspace_rules::{
     DEFAULT_MAX_FILE_BYTES, ENGINE_RUNTIME_FILES, MAIN_COPIES, SET_ASIDE_FILES, SET_ASIDE_WAITS,

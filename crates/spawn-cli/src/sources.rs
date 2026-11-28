@@ -1067,23 +1067,8 @@ fn rebind_d6_store(local: LocalWorkspaceStore, pg: &Arc<PostgresStore>) -> Local
         LocalWorkspaceStore::D6(store) => {
             LocalWorkspaceStore::D6(rebuild_d6_workspace_with_ledger(&store, ledger))
         }
-        LocalWorkspaceStore::D6Shadow(oracle) => {
-            let repo = oracle.git_repo().map_or_else(
-                || PathBuf::from(oracle.primary().project()),
-                Path::to_path_buf,
-            );
-            let mut opts = spawn_host::workspace::D6ShadowOptions::new(
-                oracle.shadow().root().to_path_buf(),
-                oracle.shadow().store().clone(),
-                ledger,
-                oracle.shadow().max_file_bytes(),
-            )
-            .with_strict_fail_closed(oracle.strict_fail_closed())
-            .with_tracked_set_mode(oracle.tracked_set_mode());
-            if let Some(policy) = oracle.shadow().l1_policy() {
-                opts = opts.with_l1_policy(policy.clone());
-            }
-            LocalWorkspaceStore::d6_shadow(&repo, oracle.primary().root(), opts)
+        LocalWorkspaceStore::D6Shadow(store) => {
+            LocalWorkspaceStore::D6Shadow(store.with_ledger(ledger))
         }
         other => other,
     }
@@ -4968,5 +4953,59 @@ mod tests {
                 "big2.bin",
             );
         }
+    }
+
+    #[test]
+    fn rebind_d6_store_preserves_single_shared_max_file_bytes_on_d6_shadow() {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("rebind_d6_shadow_cap");
+        let pg = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect"),
+        );
+        let base = TempDirGuard(std::env::temp_dir().join(format!(
+            "spawn-rebind-shadow-cap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        std::fs::create_dir_all(&base.0).expect("mkdir");
+        let repo = backend_repo(&base.0);
+        let root = base.0.join("ws-root");
+        let cas = std::sync::Arc::new(
+            spawn_host::CasMerkleStore::open(root.join(".d6-shadow/cas")).expect("cas"),
+        );
+        let initial_ledger: super::DynRefLedger =
+            std::sync::Arc::new(spawn_host::InMemoryRefLedger::default());
+        let cap: u64 = 3 << 20;
+        let opts = spawn_host::workspace::D6ShadowOptions::new(
+            root.join(".d6-shadow/work"),
+            cas,
+            initial_ledger,
+            cap,
+        )
+        .with_strict_fail_closed(true);
+        let local = super::LocalWorkspaceStore::d6_shadow(&repo, &root, opts);
+        assert_eq!(local.max_file_bytes(), cap);
+        let spawn_host::LocalWorkspaceStore::D6Shadow(ref before) = local else {
+            panic!("expected D6Shadow");
+        };
+        assert_eq!(before.primary().max_file_bytes(), cap);
+        assert_eq!(before.shadow().max_file_bytes(), cap);
+
+        let rebound = super::rebind_d6_store(local, &pg);
+        assert_eq!(rebound.max_file_bytes(), cap);
+        let spawn_host::LocalWorkspaceStore::D6Shadow(ref after) = rebound else {
+            panic!("expected D6Shadow");
+        };
+        assert_eq!(after.max_file_bytes(), cap);
+        assert_eq!(after.primary().max_file_bytes(), cap);
+        assert_eq!(after.shadow().max_file_bytes(), cap);
+        assert!(after.oracle().strict_fail_closed());
     }
 }

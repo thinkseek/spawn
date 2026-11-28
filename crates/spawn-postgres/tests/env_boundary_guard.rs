@@ -1,6 +1,6 @@
 //! Workspace-wide static env boundary guard across all 12 workspace crates.
 //!
-//! Enforces four invariants across every member crate listed in root `Cargo.toml`:
+//! Enforces five invariants across every member crate listed in root `Cargo.toml`:
 //!
 //! 1. **Strict production `std::env::var*` convergence**: Using a Rust lexer, fail-closed
 //!    `#[cfg(test)]` module stripper, recursive `use`-tree analyzer, and production
@@ -10,17 +10,21 @@
 //!    glob `use std::env::*`, nested or multi-line `use` trees, `env::$...`, and `$m::var*`
 //!    macro path accesses outside `ENV_BOUNDARY_ALLOWLIST`
 //!    (`crates/spawn-cli/src/config.rs`, `crates/spawn-node-gateway/src/main.rs`, and
-//!    `crates/spawn-postgres/src/testing.rs`). Only `#![cfg(test)]`, `#[cfg(test)] mod <ident> { ... }`,
-//!    and `#[cfg(all(..., test, ...))] mod ...` are stripped; all other `#[cfg(test)]`
-//!    targets are audited as production code.
+//!    `crates/spawn-postgres/src/testing.rs`). Only `#![cfg(test)]`, `#[cfg(test)] mod <ident> { ... }`
+//!    (regardless of outer attribute order on that module), and `#[cfg(all(..., test, ...))] mod ...`
+//!    are stripped; all other `#[cfg(test)]` targets are audited as production code.
 //! 2. **Zero unallowlisted clippy/env lint suppressions**: Rejects any
 //!    production `allow(...)` or `expect(...)` mentioning `disallowed_methods`,
 //!    `clippy::all`, `clippy::style`, bare `clippy`, or `warnings` outside
 //!    `ENV_BOUNDARY_ALLOWLIST` and verifies root `clippy.toml` forbids all four
 //!    `std::env::{var, var_os, vars, vars_os}` methods.
-//! 3. **Workspace member parity**: Asserts `WORKSPACE_CRATES` matches `[workspace] members`
+//! 3. **Production `--force-warn clippy::disallowed_methods` audit**: Runs real `cargo clippy`
+//!    with `--offline --locked --force-warn clippy::disallowed_methods` across all workspace
+//!    production targets (`--lib --bins`) so even macro-generated `#[allow/expect(clippy::disallowed_methods)]`
+//!    suppressions cannot silence disallowed `std::env` calls outside `ENV_BOUNDARY_ALLOWLIST`.
+//! 4. **Workspace member parity**: Asserts `WORKSPACE_CRATES` matches `[workspace] members`
 //!    in root `Cargo.toml` so newly added workspace crates cannot evade auditing.
-//! 4. **Zero production `spawn-postgres/testing` activation**: Queries Cargo's real
+//! 5. **Zero production `spawn-postgres/testing` activation**: Queries Cargo's real
 //!    dependency graph (`cargo tree --offline --locked --workspace -e normal,build --target all`)
 //!    with non-vacuous `seen_spawn_postgres > 0` verification and fails if `spawn-postgres`
 //!    ever resolves with `"testing"` on any normal or build edge.
@@ -30,6 +34,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde_json::Value;
 
 const WORKSPACE_CRATES: &[&str] = &[
     "crates/spawn-core",
@@ -435,14 +441,21 @@ fn is_cfg_test_attr(inner: &[Token]) -> bool {
         && is_cfg_test_pred(&inner[2..inner.len() - 1])
 }
 
-fn cfg_test_mod_end(tokens: &[Token], mut i: usize) -> Option<usize> {
+fn cfg_test_mod_group_end(tokens: &[Token], mut i: usize) -> Option<usize> {
+    let mut has_cfg_test = false;
     while tokens.get(i).is_some_and(|t| t.kind == TokenKind::Pound)
         && tokens
             .get(i + 1)
             .is_some_and(|t| t.kind == TokenKind::Open(Delim::Bracket))
         && let Some(end_bracket) = matching_close(tokens, i + 1)
     {
+        if is_cfg_test_attr(&tokens[i + 2..end_bracket]) {
+            has_cfg_test = true;
+        }
         i = end_bracket + 1;
+    }
+    if !has_cfg_test {
+        return None;
     }
     if tokens.get(i).is_some_and(|t| t.is_kw("pub")) {
         i += 1;
@@ -509,9 +522,7 @@ fn strip_cfg_test_tokens(tokens: &[Token]) -> Vec<Token> {
             && tokens
                 .get(i + 1)
                 .is_some_and(|t| t.kind == TokenKind::Open(Delim::Bracket))
-            && let Some(end_bracket) = matching_close(tokens, i + 1)
-            && is_cfg_test_attr(&tokens[i + 2..end_bracket])
-            && let Some(mod_end) = cfg_test_mod_end(tokens, end_bracket + 1)
+            && let Some(mod_end) = cfg_test_mod_group_end(tokens, i)
         {
             i = mod_end;
             continue;
@@ -880,6 +891,166 @@ fn scan_disallowed_methods_allows(rel_or_abs_path: &Path, src: &str) -> Vec<Viol
         i = close_idx + 1;
     }
     violations_from_lines(rel_or_abs_path, src, violated_lines)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClippyDisallowedAudit {
+    allowlisted_diagnostics: usize,
+    violations: Vec<String>,
+}
+
+fn normalize_diagnostic_path(manifest_dir: &Path, raw: &str) -> String {
+    let path = Path::new(raw);
+    let rel_owned = if path.is_absolute() {
+        if let Ok(stripped) = path.strip_prefix(manifest_dir) {
+            stripped.to_path_buf()
+        } else if let (Ok(canon_root), Ok(canon_path)) =
+            (fs::canonicalize(manifest_dir), fs::canonicalize(path))
+            && let Ok(stripped) = canon_path.strip_prefix(&canon_root)
+        {
+            stripped.to_path_buf()
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    };
+    let normalized = rel_owned.to_string_lossy().replace('\\', "/");
+    normalized
+        .strip_prefix("./")
+        .unwrap_or(&normalized)
+        .to_string()
+}
+
+fn collect_span_files(span: &Value, manifest_dir: &Path, out: &mut BTreeSet<(String, u64)>) {
+    if let Some(file_name) = span.get("file_name").and_then(Value::as_str)
+        && !file_name.is_empty()
+        && !file_name.starts_with('<')
+    {
+        let line = span.get("line_start").and_then(Value::as_u64).unwrap_or(0);
+        out.insert((normalize_diagnostic_path(manifest_dir, file_name), line));
+    }
+    if let Some(expansion) = span.get("expansion") {
+        if let Some(call_site) = expansion.get("span") {
+            collect_span_files(call_site, manifest_dir, out);
+        }
+        if let Some(def_site) = expansion.get("def_site_span") {
+            collect_span_files(def_site, manifest_dir, out);
+        }
+    }
+}
+
+fn parse_clippy_disallowed_methods_json(
+    manifest_dir: &Path,
+    stdout: &str,
+    allowlist: &[&str],
+) -> ClippyDisallowedAudit {
+    let mut allowlisted_diagnostics = 0usize;
+    let mut violations = Vec::new();
+    for line in stdout.lines() {
+        let Ok(obj) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if obj.get("reason").and_then(Value::as_str) != Some("compiler-message") {
+            continue;
+        }
+        let Some(msg) = obj.get("message") else {
+            continue;
+        };
+        let code = msg
+            .get("code")
+            .and_then(|c| c.get("code"))
+            .and_then(Value::as_str);
+        if code != Some("clippy::disallowed_methods") {
+            continue;
+        }
+
+        let spans = msg
+            .get("spans")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let primary_spans: Vec<&Value> = spans
+            .iter()
+            .filter(|s| s.get("is_primary").and_then(Value::as_bool) == Some(true))
+            .collect();
+        let selected: Vec<&Value> = if primary_spans.is_empty() {
+            spans.iter().collect()
+        } else {
+            primary_spans
+        };
+
+        let mut locs = BTreeSet::new();
+        for span in selected {
+            collect_span_files(span, manifest_dir, &mut locs);
+        }
+
+        if !locs.is_empty()
+            && locs
+                .iter()
+                .all(|(path, _)| allowlist.contains(&path.as_str()))
+        {
+            allowlisted_diagnostics += 1;
+        } else {
+            let summary = msg
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("clippy::disallowed_methods");
+            let location = if locs.is_empty() {
+                "<unknown>".to_string()
+            } else {
+                locs.iter()
+                    .map(|(path, ln)| format!("{path}:{ln}"))
+                    .collect::<Vec<_>>()
+                    .join(" <- ")
+            };
+            violations.push(format!("{location}: {summary}"));
+        }
+    }
+    ClippyDisallowedAudit {
+        allowlisted_diagnostics,
+        violations,
+    }
+}
+
+fn run_clippy_force_warn_disallowed_methods(
+    manifest_path: &Path,
+    target_dir: Option<&Path>,
+    allowlist: &[&str],
+) -> ClippyDisallowedAudit {
+    let manifest_dir = manifest_path
+        .parent()
+        .expect("Cargo.toml has parent directory");
+    let mut cmd = Command::new(env!("CARGO"));
+    cmd.args([
+        "clippy",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--lib",
+        "--bins",
+        "--message-format=json",
+        "--manifest-path",
+    ])
+    .arg(manifest_path);
+    if let Some(dir) = target_dir {
+        cmd.arg("--target-dir").arg(dir);
+    }
+    cmd.args(["--", "--force-warn", "clippy::disallowed_methods"]);
+
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("run cargo clippy for {}: {e}", manifest_path.display()));
+    assert!(
+        output.status.success(),
+        "cargo clippy --force-warn failed for {} (status {}):\nstdout:\n{}\nstderr:\n{}",
+        manifest_path.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_clippy_disallowed_methods_json(manifest_dir, &stdout, allowlist)
 }
 
 fn strip_toml_comments(src: &str) -> String {
@@ -1544,4 +1715,207 @@ mod tests {
 
     let test_file = "\n#![cfg(test)]\n#![allow(clippy::disallowed_methods)]\n#[test]\nfn ok() {}\n";
     assert!(scan_disallowed_methods_allows(Path::new("tests.rs"), test_file).is_empty());
+}
+
+#[test]
+fn env_boundary_guard_strips_cfg_test_mod_outer_attrs_regardless_of_order() {
+    let sample = r#"
+#[allow(clippy::all)]
+#[cfg(test)]
+mod lint_first {
+    fn test_only() {
+        let _ = std::env::var("TEST_ONLY_LINT_FIRST");
+    }
+}
+
+#[expect(clippy::disallowed_methods)]
+#[cfg(all(test, unix))]
+pub(crate) mod expect_first {
+    fn test_only() {
+        let _ = std::env::var_os("TEST_ONLY_EXPECT_FIRST");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::all)]
+mod cfg_first {
+    fn test_only() {
+        let _ = std::env::var("TEST_ONLY_CFG_FIRST");
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::disallowed_methods)]
+mod cfg_then_expect {
+    fn test_only() {
+        let _ = std::env::vars();
+    }
+}
+
+#[allow(clippy::all)]
+#[cfg(not(test))]
+mod prod_not_test {
+    fn bad() {
+        let _ = std::env::var("PROD_NOT_TEST");
+    }
+}
+
+#[allow(clippy::all)]
+fn prod_before_test_mod() {}
+
+#[cfg(test)]
+mod trailing_test_mod {}
+"#;
+    let found_allows = scan_disallowed_methods_allows(Path::new("attr_order.rs"), sample);
+    let allow_lines: Vec<usize> = found_allows.iter().map(|v| v.line).collect();
+    assert_eq!(allow_lines, vec![34, 42], "got allows: {found_allows:?}");
+
+    let found_env = scan_source(Path::new("attr_order.rs"), sample);
+    let env_lines: Vec<usize> = found_env.iter().map(|v| v.line).collect();
+    assert_eq!(env_lines, vec![38], "got env: {found_env:?}");
+}
+
+#[test]
+fn workspace_production_clippy_force_warn_finds_zero_unallowlisted_disallowed_methods() {
+    let root = workspace_root();
+    let audit = run_clippy_force_warn_disallowed_methods(
+        &root.join("Cargo.toml"),
+        None,
+        ENV_BOUNDARY_ALLOWLIST,
+    );
+    assert!(
+        audit.allowlisted_diagnostics > 0,
+        "non-vacuous clippy --force-warn check expected allowlisted env boundary diagnostics, got {audit:?}"
+    );
+    assert!(
+        audit.violations.is_empty(),
+        "forbidden production clippy::disallowed_methods found outside ENV_BOUNDARY_ALLOWLIST (even via macro-generated suppressions):\n{}",
+        audit.violations.join("\n")
+    );
+}
+
+fn setup_clippy_macro_workspace(sneaky_src: &str) -> TempWorkspace {
+    let ws = TempWorkspace::new("clippy-macro-bypass");
+    ws.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"3\"\nmembers = [\"boundary\", \"sneaky\"]\n",
+    );
+    ws.write(
+        "clippy.toml",
+        "disallowed-methods = [\n  { path = \"std::env::var\" },\n  { path = \"std::env::var_os\" },\n  { path = \"std::env::vars\" },\n  { path = \"std::env::vars_os\" },\n]\n",
+    );
+    ws.write(
+        "boundary/Cargo.toml",
+        "[package]\nname = \"boundary\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    ws.write(
+        "boundary/src/lib.rs",
+        "#[allow(clippy::disallowed_methods)]\npub fn allowed_read(key: &str) -> Option<String> {\n    std::env::var(key).ok()\n}\n",
+    );
+    ws.write(
+        "sneaky/Cargo.toml",
+        "[package]\nname = \"sneaky\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    ws.write("sneaky/src/lib.rs", sneaky_src);
+
+    let lock = Command::new(env!("CARGO"))
+        .args(["generate-lockfile", "--offline", "--manifest-path"])
+        .arg(ws.root_manifest())
+        .output()
+        .expect("generate lockfile for clippy macro workspace");
+    assert!(
+        lock.status.success(),
+        "cargo generate-lockfile --offline failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&lock.stdout),
+        String::from_utf8_lossy(&lock.stderr),
+    );
+    ws
+}
+
+#[test]
+fn clippy_force_warn_catches_macro_generated_suppression_and_env_read() {
+    let sneaky_src = r#"
+macro_rules! expect_bypass {
+    ($kind:ident, $group:ident, $lint:ident, $m:ident, $f:ident) => {{
+        #[$kind($group::$lint)]
+        let v = std::$m::$f("MACRO_EXPECT_BYPASS");
+        v.ok()
+    }};
+}
+
+macro_rules! allow_bypass {
+    ($m:ident, $f:ident) => {{
+        #[allow(clippy::disallowed_methods)]
+        let v = std::$m::$f("MACRO_ALLOW_BYPASS");
+        v
+    }};
+}
+
+pub fn via_expect() -> Option<String> {
+    expect_bypass!(expect, clippy, disallowed_methods, env, var)
+}
+
+pub fn via_allow() -> Option<std::ffi::OsString> {
+    allow_bypass!(env, var_os)
+}
+"#;
+    let ws = setup_clippy_macro_workspace(sneaky_src);
+    let target_dir = ws.0.join("target");
+    // Baseline: standard `-D warnings` lets macro-generated `#[expect/allow]` suppress the read.
+    let baseline = Command::new(env!("CARGO"))
+        .args([
+            "clippy",
+            "--offline",
+            "--locked",
+            "--workspace",
+            "--lib",
+            "--target-dir",
+        ])
+        .arg(&target_dir)
+        .arg("--manifest-path")
+        .arg(ws.root_manifest())
+        .args(["--", "-D", "warnings"])
+        .output()
+        .expect("run baseline clippy -D warnings");
+    assert!(
+        baseline.status.success(),
+        "expected baseline -D warnings to be bypassed by macro #[expect]/#[allow], got:\n{}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+
+    let audit = run_clippy_force_warn_disallowed_methods(
+        &ws.root_manifest(),
+        Some(&target_dir),
+        &["boundary/src/lib.rs"],
+    );
+    assert!(
+        audit.allowlisted_diagnostics >= 1,
+        "expected allowlisted boundary diagnostic, got {audit:?}"
+    );
+    assert_eq!(
+        audit.violations.len(),
+        2,
+        "expected macro-generated #[expect] and #[allow] env reads to be caught: {audit:?}"
+    );
+    assert!(
+        audit
+            .violations
+            .iter()
+            .all(|v| v.contains("sneaky/src/lib.rs:")),
+        "expected all violations to blame sneaky/src/lib.rs: {audit:?}"
+    );
+    assert!(
+        audit
+            .violations
+            .iter()
+            .any(|v| v.contains("std::env::var`")),
+        "missing std::env::var violation: {audit:?}"
+    );
+    assert!(
+        audit
+            .violations
+            .iter()
+            .any(|v| v.contains("std::env::var_os")),
+        "missing std::env::var_os violation: {audit:?}"
+    );
 }

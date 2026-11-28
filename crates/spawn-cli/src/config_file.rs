@@ -614,12 +614,6 @@ fn default_auto_approve() -> Option<String> {
 }
 
 impl SpawnConfig {
-    /// Parse and validate `spawn.toml` text without reading process environment.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn from_toml_str(input: &str) -> Result<Self, String> {
-        Self::from_toml_str_with(input, &|_| None)
-    }
-
     /// Parse and validate `spawn.toml` text using an injected environment lookup.
     pub fn from_toml_str_with(
         input: &str,
@@ -3801,7 +3795,7 @@ mod tests {
             "schema_version = 1\n\n[instance]\ndata_dir = \"/srv/spawn\"\n\n",
             "[engines.claude]\nconfig_dir = \"~/fleet-claude\"\n"
         );
-        let cfg = SpawnConfig::from_toml_str(toml).expect("config parses");
+        let cfg = SpawnConfig::from_toml_str_with(toml, &|_| None).expect("config parses");
         let home_only = |key: &str| (key == "HOME").then(|| base.display().to_string());
         let (toml_report, warnings) = probe_claude_config_with(&home_only, Some(&cfg));
         assert!(warnings.is_empty(), "{warnings:?}");

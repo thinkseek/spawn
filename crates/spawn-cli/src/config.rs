@@ -1921,8 +1921,9 @@ mod workspace_tests {
         assert_eq!(ConfigOrigin::File.as_str(), "file");
         assert_eq!(ConfigOrigin::Credential.as_str(), "credential");
 
-        let cfg = SpawnConfig::from_toml_str(
+        let cfg = SpawnConfig::from_toml_str_with(
             "schema_version = 1\n[instance]\ndata_dir = \"/srv/spawn\"\n",
+            &|_| None,
         )
         .expect("parse");
         let origins = cfg.field_origins();
