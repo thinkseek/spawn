@@ -1,11 +1,11 @@
-//! End-to-end storage benchmark for Spawn's real host adapters (`git`, `d6`, `shadow`).
+//! End-to-end storage benchmark for Spawn's real host adapters (`git`, `d6`).
 //!
-//! Creates an isolated scratch directory, drives [`GitWorkspace`], pure-Rust [`D6Workspace`],
-//! or dual-track [`ShadowD6Workspace`] alongside [`LocalTranscriptArchive`] through their
-//! public traits, verifies every invariant, and prints one JSON report.
+//! Creates an isolated scratch directory, drives [`GitWorkspace`] or pure-Rust
+//! [`D6Workspace`] alongside [`LocalTranscriptArchive`] through their public traits,
+//! verifies every invariant, and prints one JSON report.
 //!
 //! Optionally `SPAWN_BENCH_DATABASE_URL` names a dedicated benchmark PostgreSQL database
-//! (required for `--backend d6|shadow`); a unique schema is created and measured. The live
+//! (required for `--backend d6`); a unique schema is created and measured. The live
 //! `SPAWN_DATABASE_URL` is NEVER read.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,8 +33,7 @@ use spawn_host::d6_workspace::L1TmpfsPolicy;
 use spawn_host::merkle_merge::merge_snapshots;
 use spawn_host::{
     CasMerkleStore, D6RefKind, D6StoreError, D6Workspace, GitWorkspace, LedgerRef, LedgerSnapshot,
-    LocalTranscriptArchive, RefLedger, ShadowD6Workspace, ShadowOracleMetrics, format_commit_body,
-    git_command,
+    LocalTranscriptArchive, RefLedger, format_commit_body, git_command,
 };
 use spawn_postgres::{ConnectOptions, PostgresStore, RefKind};
 
@@ -44,10 +43,10 @@ Usage: cargo run --release -p spawn-host --example storage_benchmark -- [options
 \n\
   --root <new-directory>        Scratch root (default: a unique temporary path)\n\
   --source-revision <sha>       Spawn source revision recorded in the report\n\
-  --backend <git|d6|shadow>     Storage backend (default: git)\n\
+  --backend <git|d6>            Storage backend (default: git)\n\
   --concurrency <n>             Concurrent branch workers (default: 1)\n\
   --pg-pool-size <n>            Shared PG connection pool size for d6 (0 = 1/worker)\n\
-  --tmpfs-root <directory>      Enable bounded L1 tmpfs upperdir root for d6/shadow\n\
+  --tmpfs-root <directory>      Enable bounded L1 tmpfs upperdir root for d6\n\
   --tmpfs-budget-mb <n>         L1 tmpfs budget in MiB when --tmpfs-root is set (default: 2048)\n\
   --iterations <n>              Measured cycles per worker (default: 40)\n\
   --warmup <n>                  Warm-up cycles per worker (default: 5)\n\
@@ -66,7 +65,7 @@ Usage: cargo run --release -p spawn-host --example storage_benchmark -- [options
   --help                        Show this help\n\
 \n\
 SPAWN_BENCH_DATABASE_URL optionally enables PostgreSQL writes (and is required for\n\
---backend d6|shadow). It must name a dedicated benchmark database, never the live store.\n";
+--backend d6). It must name a dedicated benchmark database, never the live store.\n";
 
 const LAND_DELTA_SLO_BYTES: u64 = 50 * 1024 * 1024;
 const DEFAULT_LAND_PAYLOAD_BYTES: usize = 128 * 1024;
@@ -80,7 +79,6 @@ const TORN_JOURNAL_TAIL: &[u8] =
 enum Backend {
     Git,
     D6,
-    Shadow,
 }
 
 impl Backend {
@@ -88,7 +86,6 @@ impl Backend {
         match self {
             Self::Git => "git",
             Self::D6 => "d6",
-            Self::Shadow => "shadow",
         }
     }
 
@@ -96,10 +93,7 @@ impl Backend {
         match raw {
             "git" => Ok(Self::Git),
             "d6" => Ok(Self::D6),
-            "shadow" => Ok(Self::Shadow),
-            _ => Err(format!(
-                "invalid --backend {raw:?}; expected git, d6 or shadow"
-            )),
+            _ => Err(format!("invalid --backend {raw:?}; expected git or d6")),
         }
     }
 }
@@ -257,7 +251,7 @@ fn config() -> Result<Option<Config>, String> {
             "--backend" => {
                 let raw = arguments
                     .next()
-                    .ok_or_else(|| "--backend needs git, d6 or shadow".to_string())?;
+                    .ok_or_else(|| "--backend needs git or d6".to_string())?;
                 config.backend = Backend::parse(&raw)?;
             }
             "--concurrency" => config.concurrency = number(&mut arguments, "--concurrency")?,
@@ -1390,9 +1384,6 @@ trait BenchDriver: Send + Sync {
     fn verify_final(&self, branches: &[BranchName], config: &Config) -> Result<(), String>;
     fn disk_breakdown(&self, scratch: &Scratch, active_paths: &[PathBuf]) -> Result<Value, String>;
     fn extra_totals(&self, config: &Config) -> Value;
-    fn shadow_metrics_json(&self) -> Option<Value> {
-        None
-    }
     fn record_edit_bytes(&self, bytes: u64);
     fn logical_byte_totals(&self) -> (u64, u64);
     fn always_on_d6_json(
@@ -3436,253 +3427,6 @@ impl BenchDriver for D6Driver {
     }
 }
 
-struct ShadowDriver {
-    repo: PathBuf,
-    stage_seed: PathBuf,
-    git_root: PathBuf,
-    d6_root: PathBuf,
-    cas_root: PathBuf,
-    cas: Arc<CasMerkleStore>,
-    coord_ledger: Arc<PgRefLedger>,
-    oracles: Vec<ShadowD6Workspace<GitWorkspace, PgRefLedger>>,
-    logical_workspace_bytes: AtomicU64,
-    logical_written_bytes: AtomicU64,
-}
-
-impl ShadowDriver {
-    #[expect(clippy::too_many_arguments)]
-    fn new(
-        repo: PathBuf,
-        stage_seed: PathBuf,
-        git_root: PathBuf,
-        d6_root: PathBuf,
-        cas_root: PathBuf,
-        cas: Arc<CasMerkleStore>,
-        bench_url: &str,
-        schema: &str,
-        config: &Config,
-    ) -> Result<Self, String> {
-        let mut oracles = Vec::with_capacity(config.concurrency);
-        let coord_ledger = Arc::new(PgRefLedger::connect_schema(bench_url, schema)?);
-        for _ in 0..config.concurrency {
-            let cap = if config.oversized_file_bytes.is_some() {
-                u64::try_from(config.file_bytes).map_err(|_| "file_bytes overflow".to_string())?
-            } else {
-                spawn_host::DEFAULT_MAX_FILE_BYTES
-            };
-            let primary = GitWorkspace::new(&repo, &git_root, cap);
-            let ledger = Arc::new(PgRefLedger::connect_schema(bench_url, schema)?);
-            let mut shadow = D6Workspace::new(
-                repo.to_string_lossy().into_owned(),
-                &d6_root,
-                cas.clone(),
-                ledger,
-                cap,
-            );
-            if let Some(t) = &config.tmpfs_root {
-                shadow = shadow.with_l1_policy(L1TmpfsPolicy::new(t, config.tmpfs_budget_mb));
-            }
-            let oracle = ShadowD6Workspace::new(primary, shadow);
-            let _ = oracle.sync_main_from_git(None).map_err(|e| e.to_string())?;
-            oracles.push(oracle);
-        }
-        Ok(Self {
-            repo,
-            stage_seed,
-            git_root,
-            d6_root,
-            cas_root,
-            cas,
-            coord_ledger,
-            oracles,
-            logical_workspace_bytes: AtomicU64::new(0),
-            logical_written_bytes: AtomicU64::new(0),
-        })
-    }
-
-    fn aggregate_metrics(&self) -> ShadowOracleMetrics {
-        let mut agg = ShadowOracleMetrics::default();
-        for o in &self.oracles {
-            let m = o.metrics();
-            agg.checkpoints_agreed += m.checkpoints_agreed;
-            agg.tree_mismatches += m.tree_mismatches;
-            agg.tracked_set_leaks += m.tracked_set_leaks;
-            agg.shadow_errors += m.shadow_errors;
-            agg.merge_summary.total += m.merge_summary.total;
-            agg.merge_summary.agree_clean += m.merge_summary.agree_clean;
-            agg.merge_summary.agree_conflict += m.merge_summary.agree_conflict;
-            agg.merge_summary.blockers += m.merge_summary.blockers;
-            agg.merge_summary.observed_non_exact_rename +=
-                m.merge_summary.observed_non_exact_rename;
-            agg.merge_summary.rejected_multi_merge_base +=
-                m.merge_summary.rejected_multi_merge_base;
-        }
-        agg
-    }
-}
-
-impl BenchDriver for ShadowDriver {
-    fn seed_branch(
-        &self,
-        idx: usize,
-        branch: &BranchName,
-        config: &Config,
-    ) -> Result<WorkspaceId, String> {
-        let oracle = &self.oracles[idx];
-        let _ = oracle
-            .ensure_branch(branch, None)
-            .map_err(|e| e.to_string())?;
-        let ws = oracle.mount(branch).map_err(|e| e.to_string())?;
-        let written = seed_workspace(Path::new(ws.path()), config)?;
-        self.logical_workspace_bytes
-            .fetch_add(written, Ordering::Relaxed);
-        self.logical_written_bytes
-            .fetch_add(written, Ordering::Relaxed);
-        if !matches!(
-            oracle
-                .commit(&ws, "benchmark: seed")
-                .map_err(|e| e.to_string())?,
-            Commit::Created(_)
-        ) {
-            return Err("seeded shadow workspace produced no commit".to_string());
-        }
-        assert_git_oversized_excluded(&self.repo, branch, config.oversized_file_bytes.is_some())?;
-        Ok(ws)
-    }
-
-    fn commit(&self, ws: &WorkspaceId, msg: &str) -> Result<Commit, String> {
-        let idx = worker_index_from_branch(ws.sandbox());
-        self.oracles[idx].commit(ws, msg).map_err(|e| e.to_string())
-    }
-
-    fn drop_for_recreate(&self, branch: &BranchName) -> Result<(), String> {
-        drop_git_branch(&self.repo, branch)
-    }
-
-    fn remount(
-        &self,
-        ws: &WorkspaceId,
-        branch: &BranchName,
-    ) -> Result<(WorkspaceId, Duration, Duration), String> {
-        let idx = worker_index_from_branch(branch.as_str());
-        let oracle = &self.oracles[idx];
-        let t0 = Instant::now();
-        oracle.unmount(ws).map_err(|e| e.to_string())?;
-        let u_dur = t0.elapsed();
-        let t1 = Instant::now();
-        let next = oracle.mount(branch).map_err(|e| e.to_string())?;
-        let m_dur = t1.elapsed();
-        Ok((next, u_dur, m_dur))
-    }
-
-    fn merge_base(&self, ws: &WorkspaceId) -> Result<BaseMerge, String> {
-        let idx = worker_index_from_branch(ws.sandbox());
-        self.oracles[idx].merge_base(ws).map_err(|e| e.to_string())
-    }
-
-    fn after_checkpoint(&self, branch: &BranchName, config: &Config) -> Result<(), String> {
-        assert_git_oversized_excluded(&self.repo, branch, config.oversized_file_bytes.is_some())
-    }
-
-    fn advance_main(&self, step: usize) -> Result<(), String> {
-        let (prev, next) = advance_git_main(&self.repo, &self.stage_seed, step)?;
-        let task_id = setup_accepted_task(
-            &self.coord_ledger.pg,
-            &format!("/tmp/shadow-bench-{step}.git"),
-            &prev,
-            &next,
-        )?;
-        let _ = self.oracles[0]
-            .sync_main_from_git(Some(task_id))
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    fn verify_final(&self, _branches: &[BranchName], _config: &Config) -> Result<(), String> {
-        check_git_repository(&self.repo)?;
-        let m = self.aggregate_metrics();
-        if m.has_divergences() {
-            return Err(format!(
-                "shadow oracle reported divergences: tree_mismatches={}, tracked_set_leaks={}, shadow_errors={}, blockers={}",
-                m.tree_mismatches, m.tracked_set_leaks, m.shadow_errors, m.merge_summary.blockers
-            ));
-        }
-        let _ = &self.cas;
-        Ok(())
-    }
-
-    fn disk_breakdown(&self, scratch: &Scratch, active_paths: &[PathBuf]) -> Result<Value, String> {
-        let repo = directory_size(&self.repo)?;
-        let git_ws = directory_size(&self.git_root)?;
-        let cas = directory_size(&self.cas_root)?;
-        let layer0 = directory_size(&self.d6_root.join(".d6/layers"))?;
-        let d6_ws = directory_size(&self.d6_root)?;
-        let l1_tmpfs = match &scratch.tmpfs_root {
-            Some(p) => directory_size(p)?,
-            None => DirStats::default(),
-        };
-        let transcripts = directory_size(&scratch.root.join(".transcripts"))?;
-        let mut active_ws = DirStats::default();
-        for p in active_paths {
-            let s = directory_size(p)?;
-            active_ws.bytes = active_ws.bytes.saturating_add(s.bytes);
-            active_ws.files = active_ws.files.saturating_add(s.files);
-        }
-        let total = repo
-            .bytes
-            .saturating_add(git_ws.bytes)
-            .saturating_add(cas.bytes)
-            .saturating_add(d6_ws.bytes)
-            .saturating_add(l1_tmpfs.bytes)
-            .saturating_add(transcripts.bytes);
-        Ok(json!({
-            "repository": repo.to_json(),
-            "workspace": active_ws.to_json(),
-            "workspaces_root": git_ws.to_json(),
-            "cas": cas.to_json(),
-            "layer0": layer0.to_json(),
-            "l1_tmpfs": l1_tmpfs.to_json(),
-            "transcripts": transcripts.to_json(),
-            "total_bytes": total,
-        }))
-    }
-
-    fn extra_totals(&self, config: &Config) -> Value {
-        json!({
-            "git_fsck": "passed",
-            "integrity": "passed",
-            "oversized_ingested": false,
-            "oversized_present_requested": config.oversized_file_bytes.is_some(),
-        })
-    }
-
-    fn shadow_metrics_json(&self) -> Option<Value> {
-        let m = self.aggregate_metrics();
-        Some(json!({
-            "checkpoints_agreed": m.checkpoints_agreed,
-            "tree_mismatches": m.tree_mismatches,
-            "tracked_set_leaks": m.tracked_set_leaks,
-            "shadow_errors": m.shadow_errors,
-            "merge_agree_clean": m.merge_summary.agree_clean,
-            "merge_agree_conflict": m.merge_summary.agree_conflict,
-            "merge_blockers": m.merge_summary.blockers,
-            "has_divergences": m.has_divergences(),
-        }))
-    }
-
-    fn record_edit_bytes(&self, bytes: u64) {
-        self.logical_written_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    fn logical_byte_totals(&self) -> (u64, u64) {
-        (
-            self.logical_workspace_bytes.load(Ordering::Relaxed),
-            self.logical_written_bytes.load(Ordering::Relaxed),
-        )
-    }
-}
-
 fn worker_branch_name(idx: usize, total: usize) -> Result<BranchName, String> {
     let raw = if total == 1 {
         "agent_storage_benchmark".to_string()
@@ -3857,24 +3601,6 @@ fn build_driver(
                 config,
             })?))
         }
-        Backend::Shadow => {
-            let url = bench_url.ok_or_else(|| {
-                "SPAWN_BENCH_DATABASE_URL is required for --backend shadow".to_string()
-            })?;
-            let repo = scratch.root.join("store.git");
-            let stage_seed = scratch.root.join(".seed-git");
-            let git_root = scratch.root.join("git-workspaces");
-            let d6_root = scratch.root.join("d6-workspaces");
-            let cas_root = scratch.root.join("cas");
-            fs::create_dir_all(&git_root).map_err(|e| e.to_string())?;
-            fs::create_dir_all(&d6_root).map_err(|e| e.to_string())?;
-            let _ = initialize_repository_with_main(&repo, &stage_seed)?;
-            let cas =
-                Arc::new(CasMerkleStore::open(&cas_root).map_err(|e| format!("open cas: {e}"))?);
-            Ok(Arc::new(ShadowDriver::new(
-                repo, stage_seed, git_root, d6_root, cas_root, cas, url, schema, config,
-            )?))
-        }
     }
 }
 
@@ -4032,9 +3758,6 @@ fn finalize_and_build_report(
         "disk": disk,
         "scratch_kept": config.keep,
     });
-    if let Some(shadow) = driver.shadow_metrics_json() {
-        report["shadow_oracle"] = shadow;
-    }
     if let Some(always_on) = driver.always_on_d6_json(config, logical_written_bytes)? {
         report["always_on_d6"] = always_on;
     }

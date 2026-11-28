@@ -29,7 +29,7 @@ use spawn_host::cas_merkle::PublishCommitV2Request;
 use spawn_host::d6_workspace::{
     D6Workspace, HostMemorySample, L1Admission, L1FallbackReason, L1FlushReason, L1TmpfsPolicy,
 };
-use spawn_host::workspace::{D6ShadowOptions, D6StoreOptions, DynRefLedger};
+use spawn_host::workspace::{D6StoreOptions, DynRefLedger};
 use spawn_host::{
     CasMerkleStore, CutoverPhase, D6RefKind, D6StoreError, ExistingDestPolicy, GitBorderAdapter,
     Layer0Options, LedgerRef, LedgerSnapshot, LocalWorkspaceStore, ProjectCutover,
@@ -1585,7 +1585,7 @@ impl Drop for DevShmGuard {
 
 #[test]
 #[expect(clippy::too_many_lines)]
-fn pg_reversible_cutover_shadow_d6_l1_and_border_roundtrip_drill() {
+fn pg_reversible_cutover_d6_l1_and_border_roundtrip_drill() {
     let scratch = Scratch::new("reversible_drill");
     let adapter = GitBorderAdapter::new();
 
@@ -1643,38 +1643,8 @@ fn pg_reversible_cutover_shadow_d6_l1_and_border_roundtrip_drill() {
         &["remote", "add", "origin", bare_repo.to_str().expect("utf8")],
     );
 
-    // Stage 1: Dual-track d6-shadow parity with zero divergences and FastCDC >4 MiB ingestion.
-    let shadow_cas =
-        Arc::new(CasMerkleStore::open(scratch.join("shadow-cas")).expect("shadow cas"));
-    let shadow_ledger = Arc::new(PgRefLedger::connect_isolated("drill_shadow"));
-    let shadow_dyn: DynRefLedger = shadow_ledger.clone();
-    let shadow_opts = D6ShadowOptions::new(
-        scratch.join("shadow-d6-work"),
-        shadow_cas.clone(),
-        shadow_dyn,
-        spawn_host::DEFAULT_MAX_FILE_BYTES,
-    )
-    .with_strict_fail_closed(true);
-    let shadow_store =
-        LocalWorkspaceStore::d6_shadow(&bare_repo, scratch.join("shadow-git-root"), shadow_opts);
-
     let branch_alpha = BranchName::new("agent_alpha").expect("branch_alpha");
     let branch_beta = BranchName::new("agent_beta").expect("branch_beta");
-    shadow_store
-        .ensure_branch(&branch_alpha, None)
-        .expect("shadow ensure_branch");
-    let shadow_ws = shadow_store.mount(&branch_alpha).expect("shadow mount");
-    let shadow_dir = PathBuf::from(shadow_ws.path());
-    fs::create_dir_all(shadow_dir.join("build_tmp")).expect("mkdir build_tmp");
-    fs::write(shadow_dir.join("scratch.local.log"), "ignored\n").expect("ignored log");
-    fs::write(shadow_dir.join("build_tmp/out.bin"), b"ignored build").expect("ignored bin");
-    fs::write(shadow_dir.join("shadow_step.txt"), "from d6-shadow\n").expect("shadow step");
-    assert!(matches!(
-        shadow_store
-            .checkpoint(&shadow_ws, "shadow checkpoint")
-            .expect("shadow checkpoint"),
-        Commit::Created(_)
-    ));
 
     git_in(&work, &["checkout", "main"]);
     fs::write(
@@ -1685,38 +1655,6 @@ fn pg_reversible_cutover_shadow_d6_l1_and_border_roundtrip_drill() {
     git_in(&work, &["add", "upstream_pre_cutover.txt"]);
     git_in(&work, &["commit", "-m", "upstream pre-cutover"]);
     git_in(&work, &["push", "origin", "main"]);
-
-    assert!(matches!(
-        shadow_store
-            .merge_base(&shadow_ws)
-            .expect("shadow merge_base"),
-        BaseMerge::Merged { .. }
-    ));
-    let shadow_oracle = shadow_store
-        .d6_shadow_workspace()
-        .expect("shadow oracle accessor");
-    let shadow_snap = shadow_oracle
-        .shadow()
-        .branch_snapshot("agent_alpha")
-        .expect("shadow snap")
-        .expect("present");
-    let shadow_flat = shadow_cas.flatten_tree(&shadow_snap.tree).expect("flatten");
-    let big_entry = shadow_flat
-        .get(b"assets/model_weights.bin".as_slice())
-        .expect("big asset in shadow tree");
-    let big_digest = big_entry.digest().expect("big digest");
-    assert!(
-        shadow_cas.cas().chunk_index_path(&big_digest).is_file(),
-        ">4 MiB asset must trigger FastCDC chunking in shadow CAS"
-    );
-    shadow_store.unmount(&shadow_ws).expect("shadow unmount");
-    let metrics = shadow_store.shadow_metrics().expect("shadow metrics");
-    assert!(metrics.checkpoints_agreed >= 1, "{metrics:?}");
-    assert_eq!(metrics.merge_summary.agree_clean, 1, "{metrics:?}");
-    assert_eq!(metrics.tree_mismatches, 0, "{metrics:?}");
-    assert_eq!(metrics.tracked_set_leaks, 0, "{metrics:?}");
-    assert_eq!(metrics.shadow_errors, 0, "{metrics:?}");
-    assert!(!metrics.has_divergences(), "{metrics:?}");
 
     // Stage 2: 7-step ProjectCutover to D6Cas on isolated production CAS + PG.
     let prod_cas = Arc::new(CasMerkleStore::open(scratch.join("prod-cas")).expect("prod cas"));
@@ -1745,6 +1683,24 @@ fn pg_reversible_cutover_shadow_d6_l1_and_border_roundtrip_drill() {
     cutover.step7_resume_dispatch().expect("step7");
     assert_eq!(cutover.storage_mode(), ProjectStorageMode::D6Cas);
     assert_eq!(cutover.phase(), CutoverPhase::Resumed);
+    let main_ref = prod_pg
+        .list_refs(Some("cutover-drill"))
+        .expect("list cutover refs")
+        .into_iter()
+        .find(|r| r.name == "main")
+        .expect("main ledger ref after cutover");
+    let main_snap = prod_cas
+        .cas()
+        .read_merkle_snapshot(&main_ref.snapshot)
+        .expect("read main snapshot");
+    let main_flat = prod_cas
+        .flatten_tree(&main_snap.tree)
+        .expect("flatten main");
+    let big_digest = main_flat
+        .get(b"assets/model_weights.bin".as_slice())
+        .expect("big asset in main tree")
+        .digest()
+        .expect("big digest");
     assert!(
         prod_cas.cas().chunk_index_path(&big_digest).is_file(),
         ">4 MiB asset must be chunked during backfill into prod CAS"
@@ -2213,48 +2169,9 @@ fn run_destructive_contention_round(
     lat_us
 }
 
-fn run_shadow_safe_contention_round(
-    store: &LocalWorkspaceStore,
-    slot_id: usize,
-    rounds: usize,
-) -> Vec<u64> {
-    let branch = BranchName::new(format!("worker_guard_{slot_id}")).expect("guard branch");
-    let mut lat_us = Vec::with_capacity(rounds);
-    for round in 0..rounds {
-        let started = Instant::now();
-        store
-            .ensure_branch(&branch, None)
-            .expect("ensure guard branch");
-        let cancelled = store.mount_when(&branch, &|| Err("cancelled before mount".to_string()));
-        assert!(
-            cancelled.is_err(),
-            "mount_when must fail closed when ready errs"
-        );
-        let ws = store.mount_when(&branch, &|| Ok(())).expect("mount guard");
-        let held = store.hold(&ws).expect("hold guard");
-        fs::write(
-            Path::new(ws.path()).join(format!("guarded_{slot_id}_{round}.txt")),
-            "guarded\n",
-        )
-        .expect("write guarded");
-        drop(held);
-        assert!(matches!(
-            store.checkpoint(&ws, "guarded ckpt").expect("ckpt"),
-            Commit::Created(_)
-        ));
-        let busy_merge =
-            store.set_aside_when(&branch, None, "busy", &|| Err("agent typing".to_string()));
-        assert!(busy_merge.is_err());
-        store.discard(&ws).expect("discard guard");
-        lat_us.push(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
-    }
-    lat_us
-}
-
 fn run_store_storm_harness(
     store: &LocalWorkspaceStore,
     backend_label: &str,
-    destructive_shared_race: bool,
 ) -> (f64, f64, f64, usize) {
     let sentinel = BranchName::new("worker_sentinel").expect("sentinel branch");
     store
@@ -2276,23 +2193,19 @@ fn run_store_storm_harness(
                 barrier.wait();
                 let local = if tid < 6 {
                     run_slot_worker_rounds(store, tid, 3)
-                } else if destructive_shared_race {
-                    run_destructive_contention_round(store, tid, 4)
                 } else {
-                    run_shadow_safe_contention_round(store, tid, 3)
+                    run_destructive_contention_round(store, tid, 4)
                 };
                 samples.lock().expect("samples").extend(local);
             });
         }
     });
 
-    if destructive_shared_race {
-        let shared = BranchName::new("worker_race_shared").expect("shared");
-        if store.ensure_branch(&shared, None).is_ok()
-            && let Ok(ws) = store.mount(&shared)
-        {
-            store.discard(&ws).expect("cleanup shared ws");
-        }
+    let shared = BranchName::new("worker_race_shared").expect("shared");
+    if store.ensure_branch(&shared, None).is_ok()
+        && let Ok(ws) = store.mount(&shared)
+    {
+        store.discard(&ws).expect("cleanup shared ws");
     }
 
     assert!(
@@ -2324,7 +2237,7 @@ fn run_store_storm_harness(
 }
 
 #[test]
-fn concurrent_workspace_lifecycle_races_git_d6_shadow_and_d6_with_border_fsck() {
+fn concurrent_workspace_lifecycle_races_git_and_d6_with_border_fsck() {
     let scratch = Scratch::new("ws_lifecycle_chaos");
     let adapter = GitBorderAdapter::new();
 
@@ -2336,34 +2249,10 @@ fn concurrent_workspace_lifecycle_races_git_d6_shadow_and_d6_with_border_fsck() 
         spawn_host::DEFAULT_MAX_FILE_BYTES,
     );
     git_store.claim().expect("claim git");
-    let _git_m = run_store_storm_harness(&git_store, "git", true);
+    let _git_m = run_store_storm_harness(&git_store, "git");
     assert_git_fsck_clean(&git_bare);
 
-    // 2. D6Shadow backend concurrent storm (strict parity oracle).
-    let shadow_bare = seed_bare_repo_for_storm(&scratch, "shadow");
-    let shadow_cas =
-        Arc::new(CasMerkleStore::open(scratch.join("shadow-cas")).expect("shadow cas"));
-    let shadow_ledger = Arc::new(PgRefLedger::connect_isolated("chaos_ws_shadow"));
-    let shadow_dyn: DynRefLedger = shadow_ledger.clone();
-    let shadow_opts = D6ShadowOptions::new(
-        scratch.join("shadow-d6-work"),
-        shadow_cas,
-        shadow_dyn,
-        spawn_host::DEFAULT_MAX_FILE_BYTES,
-    )
-    .with_strict_fail_closed(true);
-    let shadow_store =
-        LocalWorkspaceStore::d6_shadow(&shadow_bare, scratch.join("ws-shadow"), shadow_opts);
-    shadow_store.claim().expect("claim d6-shadow");
-    let _shadow_m = run_store_storm_harness(&shadow_store, "d6-shadow", false);
-    let shadow_metrics = shadow_store.shadow_metrics().expect("shadow metrics");
-    assert_eq!(shadow_metrics.tree_mismatches, 0, "{shadow_metrics:?}");
-    assert_eq!(shadow_metrics.tracked_set_leaks, 0, "{shadow_metrics:?}");
-    assert_eq!(shadow_metrics.shadow_errors, 0, "{shadow_metrics:?}");
-    assert!(!shadow_metrics.has_divergences(), "{shadow_metrics:?}");
-    assert_git_fsck_clean(&shadow_bare);
-
-    // 3. Pure D6 backend concurrent storm + .gc-fence + refs.journal + border git fsck.
+    // 2. Pure D6 backend concurrent storm + .gc-fence + refs.journal + border git fsck.
     let d6_bare = seed_bare_repo_for_storm(&scratch, "d6");
     let d6_cas = Arc::new(CasMerkleStore::open(scratch.join("d6-cas")).expect("d6 cas"));
     let d6_ledger = Arc::new(PgRefLedger::connect_isolated("chaos_ws_d6"));
@@ -2402,7 +2291,7 @@ fn concurrent_workspace_lifecycle_races_git_d6_shadow_and_d6_with_border_fsck() 
     let d6_opts = D6StoreOptions::new(d6_cas.clone(), d6_dyn, spawn_host::DEFAULT_MAX_FILE_BYTES);
     let d6_store = LocalWorkspaceStore::d6("chaos-d6-proj", scratch.join("ws-d6"), d6_opts);
     d6_store.claim().expect("claim d6");
-    let _d6_m = run_store_storm_harness(&d6_store, "d6", true);
+    let _d6_m = run_store_storm_harness(&d6_store, "d6");
 
     let pg_seq = d6_ledger.pg.latest_ref_log_seq().expect("pg seq");
     let fence = check_gc_fence(&d6_cas, &binding, pg_seq).expect("gc fence intact");

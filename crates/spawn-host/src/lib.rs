@@ -1,7 +1,6 @@
-//! Host adapters: embedded `herdr-core` / legacy `herdr` terminals, the workspace stores (Git, the opt-in
-//! copy-on-write and overlay stores, behind one [`LocalWorkspaceStore`]),
-//! the artifact deduplicator, the local transcript archive, and the
-//! filesystem view (`bwrap`) an engine without deny rules runs in.
+//! Host adapters: embedded `herdr-core` / legacy `herdr` terminals, the workspace stores (D6 CAS
+//! default and Git border under one [`LocalWorkspaceStore`]), descriptor-safe reflink primitives,
+//! the local transcript archive, and the filesystem view (`bwrap`) an engine without deny rules runs in.
 //!
 //! The Herdr and git adapters wrap external binaries (`spawn-hc` / `herdr`,
 //! `git`) and apply uniform locale and error handling (`git` runs in the C
@@ -16,13 +15,10 @@ use spawn_core::port::TerminalError;
 pub mod agent_files;
 pub mod archive_mask;
 pub mod beneath;
-pub mod cas_dedup;
 pub mod cas_merkle;
 pub mod container;
-pub mod cow;
 pub mod d6_cutover;
 pub mod d6_layer0;
-pub mod d6_shadow;
 pub mod d6_workspace;
 pub mod engine_view;
 pub mod git;
@@ -34,9 +30,8 @@ pub mod herdr_global;
 pub mod herdr_witness;
 pub mod home;
 pub mod merkle_merge;
-#[cfg(target_os = "linux")]
-pub mod overlay;
 pub mod process;
+pub mod reflink;
 pub mod root;
 #[cfg(any(test, feature = "testing"))]
 pub mod scratch;
@@ -52,17 +47,12 @@ pub mod workspace_rules;
 mod audit;
 
 pub use archive_mask::CollectorMaskConfig;
-pub use cas_dedup::{ArtifactRoot, DedupConfig, DedupError, DedupReport, dedup_dirs, prune_unused};
 pub use cas_merkle::{
     CasMerkleStore, D6RefKind, D6StoreError, InMemoryRefLedger, LedgerRef, LedgerSnapshot,
     PublishRequest, PublishedSnapshot, RefLedger, RefsJournalLock, TrackedSetPolicy,
     format_commit_body,
 };
 pub use container::{BwrapCapability, ContainerEnv, detect_container, probe_bwrap};
-pub use cow::{
-    CloneKind, CowWorkspace, WorkspaceLease, clone_or_copy, cow_clone_supported, live_users,
-    reflink_file,
-};
 pub use d6_cutover::{
     CutoverParityReport, CutoverPhase, GcFenceStatus, ProjectCutover, ProjectStorageMode,
     assert_zero_pending_merges, bind_store_gc_fence, check_gc_fence, is_readonly_border,
@@ -72,9 +62,6 @@ pub use d6_cutover::{
 pub use d6_layer0::{
     ExistingDestPolicy, Layer0Options, audit_export_attributes, materialize_layer0,
     materialize_workspace_from_tree,
-};
-pub use d6_shadow::{
-    ShadowCheckpointOutcome, ShadowD6Workspace, ShadowOracleMetrics, ShadowTrackedSetMode,
 };
 pub use d6_workspace::D6Workspace;
 pub use engine_view::{
@@ -93,9 +80,8 @@ pub use merkle_merge::{
     MergeSnapshotSpec, ShadowOracleSummary, build_merge_snapshot, classify_shadow_merge,
     merge_snapshots, merge_text_3way, merge_trees, validate_single_merge_base,
 };
-#[cfg(target_os = "linux")]
-pub use overlay::{OverlayWorkspace, overlay_supported_in, sweep_probes};
 pub use process::{current_uid, undumpable};
+pub use reflink::{CloneKind, clone_or_copy, reflink_file, reflink_supported};
 pub use root::canonical_root;
 #[cfg(any(test, feature = "testing"))]
 pub use scratch::Scratch;
@@ -103,8 +89,7 @@ pub use terminal_support::TerminalHostEnv;
 pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};
 pub use watch::InotifyWatch;
 pub use workspace::{
-    BACKEND_MARKER, CAS_DIRECTORY, LocalD6ShadowStore, LocalWorkspaceStore, WorkspaceBackend,
-    claim_root, root_backend,
+    BACKEND_MARKER, LocalWorkspaceStore, WorkspaceBackend, claim_root, root_backend,
 };
 pub use workspace_rules::{
     DEFAULT_MAX_FILE_BYTES, ENGINE_RUNTIME_FILES, MAIN_COPIES, SET_ASIDE_FILES, SET_ASIDE_WAITS,

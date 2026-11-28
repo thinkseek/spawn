@@ -26,7 +26,7 @@ Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎�
 | --- | --- | --- |
 | `spawn-core` | 类型、端口、强类型 `ControlRecord`（67 变体）/ `GradingRecord` ADT（`control.rs`）、任务 episode 回放、Bridge、Observer、能力图与依赖纯度引擎（`feature_deps`）；内存实现与一致性套件在 `testing` feature 后。零 IO；声明 `#![forbid(unsafe_code)]` 与 `#![warn(missing_docs)]` | serde、serde_json、sha2、thiserror |
 | `spawn-postgres` | EventLog + CommandQueue + RefLedger 的 PG 实现、`sql/schema.sql`、只读与 episode 校验方法、`LISTEN spawn_events` 连接（`wake.rs`）；声明 `#![forbid(unsafe_code)]` 与 `#![warn(missing_docs)]` | spawn-core、spawn-kdf、postgres、postgres-protocol、fallible-iterator、serde、serde_json、whoami |
-| `spawn-host` | 终端（`TerminalHost`：`HerdrCoreHost` 默认通过进程外 `spawn-hc` 运行，`HerdrPool` 按分片路由到 `<session>-s0..N`，`HerdrHost` 由 `SPAWN_HERDR_MODE=legacy` 选择，共享 OS 辅助位于 `terminal_support`，`tmux` 后端已移除并显式拒绝；`herdr_witness` 宿主机第二证人；`BwrapView`/`ContainerView` 沙箱隔离）、工作区存储（`LocalWorkspaceStore`：`git`、`cow`、`overlay` 与 opt-in `d6-shadow` 双轨对照 / 纯 Rust 无 `git` 子进程的 `d6` `D6Workspace` 五种引擎加 `auto` 选择，同一 `WorkspaceStore` 契约；`cas_dedup` 对 Cow 工作区的 `target/`、`node_modules/` 去重，块存于 `spawn-cas`）、transcript 归档、inotify；声明 `#![forbid(unsafe_code)]` 与 `#![warn(missing_docs)]` | spawn-core、spawn-cas、libc、rustix、serde_json |
+| `spawn-host` | 终端（`TerminalHost`：`HerdrCoreHost` 默认通过进程外 `spawn-hc` 运行，`HerdrPool` 按分片路由到 `<session>-s0..N`，`HerdrHost` 由 `SPAWN_HERDR_MODE=legacy` 选择，共享 OS 辅助位于 `terminal_support`，`tmux` 后端已移除并显式拒绝；`herdr_witness` 宿主机第二证人；`BwrapView`/`ContainerView` 沙箱隔离）、工作区存储（`LocalWorkspaceStore`：默认 `git` `GitWorkspace` 与按需启用/无 `git` 子进程的纯 Rust `d6` `D6Workspace` 两种后端，同一 `WorkspaceStore` 契约，工作区复制隔离位于 `reflink.rs` 的 `clone_or_copy`）、transcript 归档、inotify；声明 `#![forbid(unsafe_code)]` 与 `#![warn(missing_docs)]` | spawn-core、spawn-cas、libc、rustix、serde_json |
 | `spawn-cas` | 统一内容寻址存储：带算法前缀的摘要（`sha256:<64 hex>`）、`objects/<algo>/<2 hex>/<hex>`（0444）、`pins/<owner>/<name>`、D6 Merkle 树/日志存储、按命名空间的 LRU GC（`access/<ns>/`）、`tmp/` 暂存；crash-only，不 fsync；与 Go `spawn-node/cas` 同一磁盘布局；声明 `#![forbid(unsafe_code)]` 与 `#![warn(missing_docs)]` | sha2、thiserror、libc |
 | `spawn-jev` | 判定 HTTP 客户端（支持直连 HTTP/1.1 与 `SPAWN_OUT_SOCK` 本地 `out.sock` UDS 通道及 `validate_out_sock` 安全校验），端口在 core，实现在此；声明 `#![forbid(unsafe_code)]` 与 `#![warn(missing_docs)]` | spawn-core、serde、serde_json |
 | `spawn-kdf` | 受限登录口令的 PBKDF2-HMAC-SHA256 派生（单独一个 crate，开发构建也以 `opt-level = 3` 编译）；声明 `#![forbid(unsafe_code)]` 与 `#![warn(missing_docs)]` | sha2、hmac |
@@ -67,7 +67,7 @@ flowchart LR
   gw --> pg
 ```
 
-依赖单向：只有 `spawn-cli` 同时依赖 `spawn` 各同步实现层；独立配套二进制 `spawn-hc` 仅封装 `herdr-core`（经 Cargo `[patch]` 使用纯 Rust `ghostty-vt`），与 `spawn` 二进制完全隔离，因此 `spawn` 不引入 `herdr-core`、`ghostty-vt` 或任何新增异步依赖；实现层之间的依赖只有两条：`spawn-postgres` 用 `spawn-kdf` 派生登录口令，`spawn-host` 的 `cas_dedup` 把块存进 `spawn-cas`。`spawn-node-gateway` 是另一个二进制，只依赖 `spawn-node-proto` 与 `spawn-postgres`。
+依赖单向：只有 `spawn-cli` 同时依赖 `spawn` 各同步实现层；独立配套二进制 `spawn-hc` 仅封装 `herdr-core`（经 Cargo `[patch]` 使用纯 Rust `ghostty-vt`），与 `spawn` 二进制完全隔离，因此 `spawn` 不引入 `herdr-core`、`ghostty-vt` 或任何新增异步依赖；实现层之间的依赖只有两条：`spawn-postgres` 用 `spawn-kdf` 派生登录口令，`spawn-host` 的 `D6Workspace` 与 cutover/border 适配器基于 `spawn-cas` 存储内容寻址对象与 Merkle 树。`spawn-node-gateway` 是另一个二进制，只依赖 `spawn-node-proto` 与 `spawn-postgres`。
 
 ## 3. 一次任务的链路
 
@@ -177,13 +177,11 @@ spawn fleet
 | `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录；启动时解析符号链接一次，工作区 id 都在解析后的根下 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude 可执行文件 |
 | `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude 写 transcript 的目录 |
-| `SPAWN_MAX_FILE_MB` | `100` | Git 与 Cow checkpoint 收录的单个文件上限（MiB）；更大的文件不进 checkpoint，并告知 agent 一次（overlay 的 checkpoint 无上限） |
-| `SPAWN_WORKSPACE_BACKEND` | `git` | 根下所有工作区的引擎：`git`（默认）、`cow`、`overlay`（仅 Linux；`spawn loop` 目前拒绝）、opt-in `d6-shadow`（`git` 主轨 + D6 双轨影子校验）、opt-in `d6`（纯 Rust `D6Workspace`，零 `git` 子进程，见 [d6-cas-v1.md](./d6-cas-v1.md)），以及 `auto`（从不自动选 `overlay`、`d6-shadow` 或 `d6`）。根兼容性矩阵：`git <-> d6-shadow` 可兼容互切；纯 `d6` 严禁与 `git\|cow\|overlay\|d6-shadow` 混用；不兼容或未知取值时 `spawn loop` 启动即退出 |
-| `SPAWN_D6_CAS_DIR` | 未设 | opt-in `d6` / `d6-shadow` 的 CAS Merkle 与 `refs.journal` 目录覆写（绝对路径） |
-| `SPAWN_D6_TMPFS_ROOT` | 未设 | opt-in `d6` / `d6-shadow` 的有界 L1 `tmpfs` upperdir 根目录（绝对路径） |
+| `SPAWN_MAX_FILE_MB` | `100` | Git 与 D6 checkpoint 收录的单个文件上限（MiB）；更大的文件不进 checkpoint，并告知 agent 一次 |
+| `SPAWN_WORKSPACE_BACKEND` | `git` | 根下所有工作区的引擎：`git`（默认，每个分支一份 Git 工作副本）、`d6`（按需启用的纯 Rust `D6Workspace`，零 `git` 子进程，见 [d6-cas-v1.md](./d6-cas-v1.md)），以及 `auto`（遵循根标记或既有 `.d6/`/`.sources`/工作区，干净根目录选 `git`）。根兼容性矩阵：纯 `d6` 严禁与 `git` 混用；不兼容或未知取值（含已退场的 `cow`/`overlay`/`d6-shadow`）以及未标记的旧 `.cow/`/`.overlay/`/`.d6-shadow/` 目录时启动即 fail-closed 拒绝 |
+| `SPAWN_D6_CAS_DIR` | 未设 | `d6` 的 CAS Merkle 与 `refs.journal` 目录覆写（绝对路径） |
+| `SPAWN_D6_TMPFS_ROOT` | 未设 | `d6` 的有界 L1 `tmpfs` upperdir 根目录（绝对路径） |
 | `SPAWN_D6_TMPFS_BUDGET_MB` | `2048` | L1 `tmpfs` 硬预算（MiB；设 `SPAWN_D6_TMPFS_ROOT` 时生效） |
-| `SPAWN_D6_STRICT_FAIL_CLOSED` | `0` | `1`/`true` 时，若 `d6-shadow` 发生 `TrackedSetLeak` 则 fail-closed 拒绝 checkpoint |
-| `SPAWN_CAS_DEDUP` | 未设 | `1`：每次挂载 Cow 工作区时把 `target/`、`node_modules/` 对 `<root>/.cas` 去重（从不碰 transcript），卸载后修剪；`0` 或未设：关闭；其他取值 `spawn loop` 启动即退出 |
 | `SPAWN_TERMINAL_BACKEND` | `herdr` | 唯一终端后端：`herdr`（默认，经 `SPAWN_HERDR_MODE=core` 路由到内置 `spawn-hc`）；`tmux` 已移除并在环境变量与 `spawn.toml` 中显式拒绝 |
 | `SPAWN_HERDR_MODE` | `core` | herdr 后端模式：`core`（默认，使用同目录 `spawn-hc`）或 `legacy`（外置 legacy `herdr`） |
 | `SPAWN_HERDR_CORE_PROGRAM` | 同目录 `spawn-hc` | 内嵌 `herdr-core` 模式的可执行文件覆写路径 |

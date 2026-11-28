@@ -1450,21 +1450,21 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn workspace_disk_classification_d6_shadow_zero_byte_and_symlinks() {
-        let root = scratch("ws_disk_d6_shadow");
-        let projects = scratch("ws_disk_d6_shadow_proj");
-        let tmpfs = scratch("ws_disk_d6_shadow_tmpfs");
-        let outside = scratch("ws_disk_d6_shadow_outside");
+    fn workspace_disk_classification_d6_zero_byte_and_symlinks() {
+        let root = scratch("ws_disk_d6");
+        let projects = scratch("ws_disk_d6_proj");
+        let tmpfs = scratch("ws_disk_d6_tmpfs");
+        let outside = scratch("ws_disk_d6_outside");
 
         // External payload in outside dir
         file(&outside.join("secret_data.bin"), 54_321);
 
         // 1. Root-level hidden dirs and files that must NOT be counted as workspaces:
-        // .d6-shadow (cas and work dirs with chunk blobs and zero-byte marker files)
-        file(&root.join(".d6-shadow/cas/chunk_01.bin"), 8192);
-        file(&root.join(".d6-shadow/cas/zero_chunk.bin"), 0);
-        file(&root.join(".d6-shadow/work/lock"), 0);
-        file(&root.join(".d6-shadow/work/staging/tree.bin"), 4096);
+        // .d6 (cas and work dirs with chunk blobs and zero-byte marker files)
+        file(&root.join(".d6/cas/chunk_01.bin"), 8192);
+        file(&root.join(".d6/cas/zero_chunk.bin"), 0);
+        file(&root.join(".d6/work/lock"), 0);
+        file(&root.join(".d6/work/staging/tree.bin"), 4096);
         // Other root-level dot dirs & metadata files
         file(&root.join(".transcripts/agent_1/t1.jsonl"), 1200);
         file(&root.join(".caches/shared/obj.o"), 3000);
@@ -1508,7 +1508,7 @@ mod tests {
             .as_ref()
             .expect("breakdown present");
 
-        // .d6-shadow is ignored! Only non-dot directories are candidates.
+        // .d6 is ignored! Only non-dot directories are candidates.
         // agent_symlink_outside is ignored because symlink is not a directory.
         assert_eq!(breakdown.workspace_count, 3, "ws_alpha, ws_beta, ws_empty");
         assert!(!breakdown.truncated);

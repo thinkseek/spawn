@@ -279,10 +279,6 @@
         },
         {
           "kind": "contains",
-          "target": "cap-overlay-workspaces"
-        },
-        {
-          "kind": "contains",
           "target": "cap-cow-cas-workspaces"
         }
       ],
@@ -780,10 +776,6 @@
         },
         {
           "kind": "depends_on",
-          "target": "cap-overlay-workspaces"
-        },
-        {
-          "kind": "depends_on",
           "target": "cap-postgres-event-log"
         },
         {
@@ -1143,7 +1135,7 @@
       "title": "Git Workspaces, Branch Checkpoints, Merge & Set-Aside",
       "kind": "capability",
       "parent": "domain-host-execution",
-      "summary": "Canonical workspace root resolution, descriptor-safe agent file access, mission workspace materialization, git checkpointing, main-branch merge, background push, and set-aside commits. Overlay and copy-on-write stores: cap-overlay-workspaces, cap-cow-cas-workspaces.",
+      "summary": "Canonical workspace root resolution, descriptor-safe agent file access, mission workspace materialization, git checkpointing, main-branch merge, background push, and set-aside commits. Native D6 Merkle/CAS workspaces: cap-cow-cas-workspaces.",
       "files": [
         "crates/spawn-cas/src/digest.rs",
         "crates/spawn-cli/src/commit_now.rs",
@@ -1411,57 +1403,11 @@
       }
     },
     {
-      "id": "cap-overlay-workspaces",
-      "title": "Overlay v2 (layerfs) Workspace Store",
-      "kind": "capability",
-      "parent": "domain-host-execution",
-      "summary": "The layerfs v2 overlay workspace store: a read-only base layer shared by agent workspaces with a private upper layer per agent (M7 #556).",
-      "files": [
-        "crates/spawn-host/src/overlay.rs",
-        "crates/spawn-host/tests/overlay.rs",
-        "docs/layerfs-v2-overlay.md"
-      ],
-      "relations": [
-        {
-          "kind": "depends_on",
-          "target": "cap-git-workspaces"
-        },
-        {
-          "kind": "relates_to",
-          "target": "cap-storage-lifecycle"
-        },
-        {
-          "kind": "depends_on",
-          "target": "cap-bridge-events"
-        },
-        {
-          "kind": "depends_on",
-          "target": "cap-cow-cas-workspaces"
-        }
-      ],
-      "provenance": {
-        "objectives": [],
-        "tasks": [],
-        "agents": [],
-        "commits": [
-          "140acf7dd"
-        ],
-        "tests": [
-          "crates/spawn-host/tests/overlay.rs"
-        ],
-        "deploys": [],
-        "artifacts": [
-          "docs/layerfs-v2-overlay.md"
-        ],
-        "discussions": []
-      }
-    },
-    {
       "id": "cap-cow-cas-workspaces",
-      "title": "Copy-on-Write Workspace Store with CAS Dedup",
+      "title": "D6 Content-Addressed Merkle Store & Workspace Engine",
       "kind": "capability",
       "parent": "domain-host-execution",
-      "summary": "The cross-OS copy-on-write workspace store (reflink clones) with content-addressed block deduplication (M7 #557), stored in the unified spawn-cas crate (objects/<algo>/<2 hex>/<hex>, chunk-index/<algo>/<2 hex>/<hex>, pins, per-namespace LRU GC + persistent tree/blob namespaces, FastCDC v1 chunking, canonical spawn-tree-v1 / spawn-snapshot-v1 Merkle store, deterministic 40-hex Git OID projection, SHA-256 only; legacy <2 hex>/<hex> blobs adopted in place, ST1 / D6 Phase 0).",
+      "summary": "Content-addressed storage in the unified spawn-cas crate (objects/<algo>/<2 hex>/<hex>, chunk-index/<algo>/<2 hex>/<hex>, pins, per-namespace LRU GC + persistent tree/blob namespaces, FastCDC v1 chunking, canonical spawn-tree-v1 / spawn-snapshot-v1 / spawn-commit-v2 Merkle store, deterministic 40-hex Git OID projection, SHA-256 only; legacy <2 hex>/<hex> blobs adopted in place) powering the pure-Rust D6Workspace (D6 Layer 0 materialization with descriptor-safe clone_or_copy reflink/copy fallback, merkle_merge, git_border, d6_cutover).",
       "files": [
         "crates/spawn-cas/Cargo.toml",
         "crates/spawn-cas/src/chunker.rs",
@@ -1491,23 +1437,19 @@
         "crates/spawn-cas/tests/d6_journal_gc.rs",
         "crates/spawn-cas/tests/store.rs",
         "crates/spawn-cli/src/workspace_backend.rs",
-        "crates/spawn-host/src/cas_dedup.rs",
         "crates/spawn-host/src/cas_merkle.rs",
-        "crates/spawn-host/src/cow.rs",
         "crates/spawn-host/src/d6_cutover.rs",
         "crates/spawn-host/src/d6_layer0.rs",
-        "crates/spawn-host/src/d6_shadow.rs",
         "crates/spawn-host/src/d6_workspace.rs",
         "crates/spawn-host/src/git_border.rs",
         "crates/spawn-host/src/merkle_merge.rs",
+        "crates/spawn-host/src/reflink.rs",
         "crates/spawn-host/src/workspace.rs",
-        "crates/spawn-host/tests/cow.rs",
         "crates/spawn-host/tests/d6_border.rs",
         "crates/spawn-host/tests/d6_layer0_cutover.rs",
         "crates/spawn-host/tests/d6_ledger_canonical.rs",
         "crates/spawn-host/tests/d6_merge_oracle.rs",
         "crates/spawn-host/tests/d6_workspace.rs",
-        "docs/cross-os-cow-storage.md",
         "docs/d6-cas-v1.md"
       ],
       "relations": [
@@ -1517,19 +1459,11 @@
         },
         {
           "kind": "relates_to",
-          "target": "cap-overlay-workspaces"
-        },
-        {
-          "kind": "relates_to",
           "target": "cap-storage-lifecycle"
         },
         {
           "kind": "depends_on",
           "target": "cap-bridge-events"
-        },
-        {
-          "kind": "depends_on",
-          "target": "cap-transcript-archive"
         }
       ],
       "provenance": {
@@ -1544,14 +1478,13 @@
           "crates/spawn-cas/tests/d6_cas.rs",
           "crates/spawn-cas/tests/d6_journal_gc.rs",
           "crates/spawn-cas/tests/store.rs",
-          "crates/spawn-host/tests/cow.rs",
           "crates/spawn-host/tests/d6_layer0_cutover.rs",
           "crates/spawn-host/tests/d6_workspace.rs",
           "crates/spawn-host/tests/d6_ledger_canonical.rs"
         ],
         "deploys": [],
         "artifacts": [
-          "docs/cross-os-cow-storage.md"
+          "docs/d6-cas-v1.md"
         ],
         "discussions": []
       }
@@ -1561,7 +1494,7 @@
       "title": "Unified Local Workspace Store & Backend Selection",
       "kind": "capability",
       "parent": "domain-host-execution",
-      "summary": "LocalWorkspaceStore: the Git, Cow and opt-in overlay workspace backends behind one WorkspaceStore, each passing the shared contract, with one set-aside rule (pre-checked, no change when refused); SPAWN_WORKSPACE_BACKEND (git default, cow, auto = Cow else Git, overlay by name only and refused by spawn loop until served) chosen in one place and claimed per root (.spawn-workspace-backend); baseline/layer/probe pruning after unmounts; opt-in Cow CAS dedup of target/ and node_modules/ (SPAWN_CAS_DEDUP=1) (Issue #95 part 1).",
+      "summary": "LocalWorkspaceStore: Git (default) and opt-in pure-Rust D6 workspace backends behind one WorkspaceStore contract, chosen in one place and claimed per root (.spawn-workspace-backend).",
       "files": [
         "README.md",
         "crates/spawn-cli/src/config.rs",
@@ -1582,10 +1515,6 @@
         {
           "kind": "depends_on",
           "target": "cap-cow-cas-workspaces"
-        },
-        {
-          "kind": "depends_on",
-          "target": "cap-overlay-workspaces"
         },
         {
           "kind": "relates_to",

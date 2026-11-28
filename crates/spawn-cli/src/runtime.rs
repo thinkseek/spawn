@@ -52,15 +52,13 @@ fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, O
     // mission owns use the default repository. Every store is the one
     // engine `SPAWN_WORKSPACE_BACKEND` chose for the root.
     let settings = WorkspaceSettings::from_env(std::path::Path::new(&root))?;
-    settings.servable()?;
     let factory = settings.factory(std::path::Path::new(&root));
     let missions = sources::MissionWorkspaces::new(
         factory(std::path::Path::new(&repo)),
         std::path::Path::new(&root),
         store.clone(),
         factory,
-    )
-    .with_cas_dedup(settings.cas_dedup);
+    );
     // A push queued by the last process and lost with it is made now.
     if let Err(error) = missions.republish() {
         eprintln!("sources: {error}; a push lost with the last process waits for its next");

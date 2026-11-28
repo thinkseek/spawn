@@ -2595,7 +2595,6 @@ mod tests {
         let root = base.join("d6-root");
         let settings = WorkspaceSettings::resolve(
             WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6),
-            false,
             &root,
             &Probes::host(),
             spawn_host::DEFAULT_MAX_FILE_BYTES,

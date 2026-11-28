@@ -26,7 +26,7 @@ Spawn 在隔离的工作区中运行编码 agent（Claude Code，可选 agy）�
 | --- | --- |
 | 引擎 | `claude`（默认）与 `agy`，用 `SPAWN_ENGINES=claude,agy` 启用；由 start 动作或 `spawn task assign --engine` 选择 |
 | 沙箱 | 自身没有拒绝规则的引擎（agy）只在 `bwrap` 文件系统视图中运行（`SPAWN_ENGINE_VIEW=required`，默认）；`SPAWN_CLAUDE_SANDBOX=1` 让 Claude Code 也进入该视图 |
-| 工作区 | 可插拔后端：`git`、`cow`、`auto`、`overlay`、`d6-shadow`、`d6`（见[存储后端](#存储后端)） |
+| 工作区 | 后端：`git`（默认）、`d6`（按需启用 / 切换）、`auto`（见[存储后端](#存储后端)） |
 | Mission 与落地 | supervisor 规划并分派任务；`spawn integrate` 用 `scripts/rsi/gate.sh` 判定每个候选，以 compare-and-swap 推送落地 |
 | 任务分级 | 三级（`l1`/`l2`/`l3`）：任务路由到按难度分级的最便宜 preset，返工屡次不过时升级（[docs/agent-grading.md](./docs/agent-grading.md)） |
 | Feature Map | `spawn features` 让 `docs/feature-map/registry.json` 与代码保持同步；`check --deps enforce` 用 Rust/TypeScript/Python/Go 代码图核对声明的功能依赖 |
@@ -79,7 +79,7 @@ spawn say agent_demo "please also add a test"                  # 向运行中的
 | `SPAWN_ENGINES` | `claude` | 启用的引擎：`claude`、`agy` |
 | `SPAWN_AGY_MODEL` | 不设 | agy 的模型；不设时拒绝启动 agy |
 | `SPAWN_ENGINE_VIEW` | `required` | 沙箱策略：`required`、`container` 或 `off` |
-| `SPAWN_WORKSPACE_BACKEND` | `git` | `git`、`cow`、`auto`、`overlay`、`d6-shadow` 或 `d6` |
+| `SPAWN_WORKSPACE_BACKEND` | `git` | `git`、`d6` 或 `auto` |
 | `SPAWN_HERDR_MODE` | `core` | `core`（同级 `spawn-hc`）或 `legacy`（外部 `herdr`） |
 | `SPAWN_JUDGE_URL` | 不设 | 可选判定服务；不设时只用规则判定 |
 | `SPAWN_SERVE_ADDRESS` | `127.0.0.1:8787` | `spawn serve` 绑定地址 |
@@ -92,13 +92,10 @@ spawn say agent_demo "please also add a test"                  # 向运行中的
 | 后端 | 说明 |
 | --- | --- |
 | `git`（默认） | 每个分支一份 Git 工作副本 |
-| `cow` | 按提交基线做写时复制克隆 |
-| `auto` | 文件系统支持克隆时用 `cow`，否则 `git` |
-| `overlay` | 每个工作区一个非特权 overlay（Linux，需显式启用） |
-| `d6-shadow` | `git` 仍为权威；`d6` 作为受校验的影子并行运行 |
-| `d6` | 内容寻址存储：SHA-256 对象、大文件 FastCDC 分块、Merkle 树、ref 存于 PostgreSQL、可选有界 `tmpfs` 层（`SPAWN_D6_TMPFS_ROOT`）（[docs/d6-cas-v1.md](./docs/d6-cas-v1.md)） |
+| `d6` | 按需启用的内容寻址存储：SHA-256 对象、大文件 FastCDC 分块、Merkle 树、ref 存于 PostgreSQL、可选有界 `tmpfs` 层（`SPAWN_D6_TMPFS_ROOT`）（[docs/d6-cas-v1.md](./docs/d6-cas-v1.md)） |
+| `auto` | 遵循 `.spawn-workspace-backend` 或已有 `.d6/`、`.sources`/工作区（`d6` 或 `git`），干净根目录选择 `git` |
 
-工作区根目录会记录占用它的后端；不兼容的后端会被拒绝。可选项：`SPAWN_CAS_DEDUP=1` 对 Cow 工作区的 `target/` 与 `node_modules/` 去重；`SPAWN_SHARED_BUILD_CACHES=1` 让各工作区共享 npm、pip、uv、Go、ccache、sccache 与 zig 缓存。
+工作区根目录会记录占用它的后端；不兼容的后端会被拒绝。可选项：`SPAWN_SHARED_BUILD_CACHES=1` 让各工作区共享 npm、pip、uv、Go、ccache、sccache 与 zig 缓存。
 
 ## 命令
 

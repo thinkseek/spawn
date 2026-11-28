@@ -67,7 +67,7 @@ output=$("$SPAWN_BIN" version) || exit 1
 
 **agent 一侧。** RSI 的常驻 worker 是普通 worker，受同一 uid 的限制（[fleet-architecture.md](fleet-architecture.md) §8）；无内置 deny 规则的引擎（以及启用 `SPAWN_CLAUDE_SANDBOX=1` 的 Claude Code）默认运行于 `BwrapView`（容器环境下可通过 `SPAWN_ENGINE_VIEW=container` 使用 `ContainerView`，裸宿主机 fail-closed 拒绝），并以 `inherit_host=auto` 安全只读白名单继承宿主工具链（见 [upgrading.md](upgrading.md) 第 12 节）。
 
-**不给 `SYS_ADMIN`，不用 FUSE，不用 overlay（门禁沙箱）。** 门禁工作区由 `git archive` 导出，已经够用（运行时工作区另支持默认 `git` 以及 opt-in `cow` / `d6-shadow` / `d6`，见 [storage.md](./storage.md)、[d6-cas-v1.md](./d6-cas-v1.md)）。实测 `--device /dev/fuse --cap-add SYS_ADMIN` 在 `overlay2` 存储驱动上挂 overlay 返回 `Invalid argument`；而且 `SYS_ADMIN` 接近宿主 root，抵消隔离。
+**不给 `SYS_ADMIN`，不用 FUSE，不用 overlay（门禁沙箱）。** 门禁工作区由 `git archive` 导出，已经够用（运行时工作区支持默认 `git` 以及按需启用的 `d6`，见 [storage.md](./storage.md)、[d6-cas-v1.md](./d6-cas-v1.md)）。实测 `--device /dev/fuse --cap-add SYS_ADMIN` 在 `overlay2` 存储驱动上挂 overlay 返回 `Invalid argument`；而且 `SYS_ADMIN` 接近宿主 root，抵消隔离。
 
 ## 5. 落地与停机
 

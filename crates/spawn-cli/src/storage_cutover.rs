@@ -608,7 +608,7 @@ fn resolve_cas_dir_from_flags(flags: &Flags) -> Result<PathBuf, String> {
                 .to_string(),
         );
     };
-    Ok(cfg.effective_cas_dir(&root, WorkspaceBackend::D6))
+    Ok(cfg.effective_cas_dir(&root))
 }
 
 fn is_macos_root_system_symlink(cur: &Path) -> bool {
@@ -890,7 +890,7 @@ fn parse_cutover_args(args: &[String]) -> Result<ParsedArgs, String> {
     let cas_dir = if let Some(explicit) = parse_non_empty_flag(&flags, "cas-dir")? {
         normalize_cas_dir(Path::new(&explicit))?
     } else {
-        D6RuntimeConfig::from_env()?.effective_cas_dir(&root, WorkspaceBackend::D6)
+        D6RuntimeConfig::from_env()?.effective_cas_dir(&root)
     };
 
     let repo = match parse_non_empty_flag(&flags, "repo")?.or_else(|| env_value("SPAWN_REPO")) {

@@ -30,7 +30,7 @@
 
 ### Layout Erratum (`chunk-index/` vs `index/`, Issue #113 Comment #6)
 
-- Initial drafts named `<cas>/index/` for physical chunk indexes. That path collides with existing shared CAS roots because [`crates/spawn-host/src/cas_dedup.rs`](../crates/spawn-host/src/cas_dedup.rs) writes `<cas>/index` as a **regular file** (explicitly guarded by `crates/spawn-cas/tests/store.rs::legacy_shards_are_adopted_in_place_without_rehashing`), causing `EISDIR` / `CasError::NotPlain`.
+- Initial drafts named `<cas>/index/` for physical chunk indexes. That path collides with legacy shared CAS roots because historical `cas_dedup` shards wrote `<cas>/index` as a **regular file** (explicitly guarded by `crates/spawn-cas/tests/store.rs::legacy_shards_are_adopted_in_place_without_rehashing`), causing `EISDIR` / `CasError::NotPlain`.
 - **Frozen Path**: Both Rust (`Store::chunk_index_path` / `Store::LAYOUT = ["objects", "chunk-index", "pins", "access", "tmp"]`) and Go `cas` use **`chunk-index/sha256/<2 hex>/<file hex>`**.
 
 ### Safety & Crash-Only Invariants
@@ -190,7 +190,7 @@ From [`crates/spawn-cas/testdata/d6-cas-v1/manifest.json`](../crates/spawn-cas/t
 
 Spawn maintains strict physical and domain separation across all storage subsystems:
 
-1. **D6 Host CAS (`spawn-cas`, this document)**: Lives at `<cas>/{objects,chunk-index,pins,access,tmp}` with marker `.spawn-cas`. Owns `artifacts`, `base-cache`, `backup`, `data`, and persistent `tree`/`blob`. Adopts `<cas>/<2 hex>/<64 hex>` legacy shards via `Store::adopt_legacy_shards` while leaving `crates/spawn-host/src/cas_dedup.rs`'s `<cas>/index` regular file intact.
+1. **D6 Host CAS (`spawn-cas`, this document)**: Lives at `<cas>/{objects,chunk-index,pins,access,tmp}` with marker `.spawn-cas`. Owns `artifacts`, `base-cache`, `backup`, `data`, and persistent `tree`/`blob`. Adopts `<cas>/<2 hex>/<64 hex>` legacy shards via `Store::adopt_legacy_shards` while leaving legacy `<cas>/index` regular files intact.
 2. **`fm-cas/v1` Recoverable Backup CAS (`crates/spawn-cli/src/backup/recoverable.rs`, [`docs/recoverable-storage-keys.md`](./recoverable-storage-keys.md))**: Strictly namespaced under `<store_root>/fm-cas/v1/` with `spawn.cas.v1.*` domain tags and its own `.cas.lock` / `snapshots.json`. Never overlaps runtime host CAS roots; future incompatible backup versions must advance to `fm-cas/v2`.
 3. **`spawn store` Off-Host Transcript & Session Segments (`crates/spawn-cli/src/backup/store/`)**: Upload-only encrypted backup store (`transcripts/`, `sessions/`) keyed by HMAC-SHA256 of plain segments under `.json.gpg` manifests. Completely independent of D6 runtime CAS.
 4. **Tombstoned `Spawn-Large` Git Trailer (`crates/spawn-host/src/workspace_rules.rs::LARGE_FILE_TRAILER`, [`docs/provenance.md`](./provenance.md))**: Permanently tombstoned. D6 snapshots and commits must **never** reintroduce or interpret `Spawn-Large` commit trailers (large files live transparently in D6 `spawn-chunks-v1` + `chunk-index/`, projected at Git borders via `spawn-pointer-v1`).
@@ -199,19 +199,18 @@ Spawn maintains strict physical and domain separation across all storage subsyst
 
 ## 9. Runtime Configuration, Backend Compatibility & Bounded L1 `tmpfs` Tier
 
-D6 backends are **strictly opt-in** in both [`spawn-host`](../crates/spawn-host/src/workspace.rs) and [`spawn-cli`](../crates/spawn-cli/src/config.rs). Leaving `SPAWN_WORKSPACE_BACKEND` unset or set to `auto` resolves only `cow` (when CoW reflinks are supported) or `git` — never `overlay`, `d6-shadow`, or `d6`.
+`git` remains the default backend when `SPAWN_WORKSPACE_BACKEND` is unset/empty, and `auto` selects `git` on clean roots while preserving existing `.spawn-workspace-backend`, `.d6/`, or `.sources/` / workspace directories in both [`spawn-host`](../crates/spawn-host/src/workspace.rs) and [`spawn-cli`](../crates/spawn-cli/src/config.rs); pure-Rust `d6` is selected explicitly via `SPAWN_WORKSPACE_BACKEND=d6` or cutover (`spawn storage cutover`).
 
 ### Environment Contract (`crates/spawn-cli/src/config.rs`)
 
 | Environment Variable | Accepted Values / Type | Default | Semantics |
 | --- | --- | --- | --- |
-| `SPAWN_WORKSPACE_BACKEND` | `git`, `cow`, `overlay`, `d6-shadow`, `d6`, `auto` | `git` (via `config`) | Selects `LocalWorkspaceStore` backend; `d6-shadow` runs dual-track oracle over `GitWorkspace`, `d6` runs pure-Rust `D6Workspace` with zero `git` subprocesses or `.sources/*.git` mirror clones |
-| `SPAWN_D6_CAS_DIR` | Absolute directory path | `<root>/.d6/cas` (`d6`), `<root>/.d6-shadow/cas` (`d6-shadow`) | Overrides CAS Merkle + `refs.journal` root (`CasMerkleStore::open`) |
+| `SPAWN_WORKSPACE_BACKEND` | `git`, `d6`, `auto` | `git` | Selects `LocalWorkspaceStore` backend; `git` retains the default working copy mode, `d6` opts into pure-Rust `D6Workspace` with zero `git` subprocesses or `.sources/*.git` mirror clones, and `auto` follows existing root markers/`.d6`/workspaces else `git` |
+| `SPAWN_D6_CAS_DIR` | Absolute directory path | `<root>/.d6/cas` | Overrides CAS Merkle + `refs.journal` root (`CasMerkleStore::open`) |
 | `SPAWN_D6_TMPFS_ROOT` | Absolute directory path | `None` (disk-only Layer 0) | Opts into bounded L1 `tmpfs` upperdir mounting (`<tmpfs_root>/<branch>`) |
 | `SPAWN_D6_TMPFS_BUDGET_MB` | Positive integer (`u64 > 0`) | `2048` MiB when `SPAWN_D6_TMPFS_ROOT` is set | Hard host-wide L1 RAM ceiling across admitted active branches |
-| `SPAWN_D6_STRICT_FAIL_CLOSED` | `0`, `false`, `1`, `true` | `false` | When `true` under `d6-shadow`, `TrackedSetLeak` ALSO returns `WorkspaceError::Refused { code: "TrackedSetLeak" }` instead of recording only shadow metrics/aborting shadow writes |
 
-Invalid paths (relative `SPAWN_D6_CAS_DIR` or `SPAWN_D6_TMPFS_ROOT`), non-positive `SPAWN_D6_TMPFS_BUDGET_MB`, or unrecognized `SPAWN_D6_STRICT_FAIL_CLOSED` values fail closed during startup (`WorkspaceSettings::from_env` / `WorkspaceSettings::peek`).
+Invalid paths (relative `SPAWN_D6_CAS_DIR` or `SPAWN_D6_TMPFS_ROOT`) or non-positive `SPAWN_D6_TMPFS_BUDGET_MB` fail closed during startup (`WorkspaceSettings::from_env` / `WorkspaceSettings::peek`).
 
 ### Root Backend Compatibility Matrix (`backends_compatible`)
 
@@ -219,10 +218,13 @@ Invalid paths (relative `SPAWN_D6_CAS_DIR` or `SPAWN_D6_TMPFS_ROOT`), non-positi
 
 | Existing Root Marker | Requested Backend | Outcome | Notes |
 | --- | --- | --- | --- |
-| `git` (`.spawn-workspace-backend` or existing workspaces) | `d6-shadow` | **Allowed** | Wraps authoritative `GitWorkspace` root in dual-track oracle mode |
-| `d6-shadow` | `git` | **Allowed** | Safe toggle back to authoritative `GitWorkspace` |
-| `git`, `cow`, `overlay`, or `d6-shadow` | `d6` | **Refused** | Pure `d6` cannot share a root with Git/CoW/Overlay/Shadow without explicit cutover (`WorkspaceSettings::from_env` refuses before creating `.d6/cas`) |
-| `d6` | `git`, `cow`, `overlay`, `d6-shadow` | **Refused** | Pure `d6` root cannot be claimed by another backend without lossless rollback |
+| Clean / empty root | unset, `git`, or `auto` | **`git`** | Claims clean root for `GitWorkspace` (default until separate gated Wave-1 cutover) |
+| Clean / empty root | `d6` | **`d6`** | Opts clean root into native `D6Workspace` |
+| `git` (`.spawn-workspace-backend`, `.sources/`, or existing workspaces) | `auto` or `git` | **`git`** | Preserves existing `GitWorkspace` root until explicit cutover |
+| `git` (`.spawn-workspace-backend`, `.sources/`, or existing workspaces) | `d6` | **Refused** | Pure `d6` cannot share a root with `git` without explicit cutover (`WorkspaceSettings::from_env` refuses before creating `.d6/cas`) |
+| `d6` (`.spawn-workspace-backend` or `.d6/`) | `git` | **Refused** | Pure `d6` root cannot be claimed by `git` without lossless rollback |
+
+Retired markers (`cow`, `overlay`, `d6-shadow`) and unmarked legacy `.cow/`, `.overlay/`, or `.d6-shadow/` directories fail closed in `root_backend` rather than silently mapping to `git` or `d6`.
 
 ### Bounded L1 `tmpfs` Admission & Pressure Policy (`crates/spawn-host/src/d6_workspace.rs`)
 
@@ -238,10 +240,7 @@ When `L1TmpfsPolicy` is active (`SPAWN_D6_TMPFS_ROOT` set):
 
 ## 10. Reversible Cutover, Border Mirror & Crash-Recovery Runbook
 
-1. **Pre-Cutover Shadow Validation (`d6-shadow`)**:
-   - Deploy `SPAWN_WORKSPACE_BACKEND=d6-shadow` (optionally with `SPAWN_D6_STRICT_FAIL_CLOSED=1`) over the existing `git` root.
-   - Verify `ShadowOracleMetrics` stays at `tree_mismatches == 0`, `tracked_set_leaks == 0`, `shadow_errors == 0`, and `merge_summary.blockers == 0` across active missions.
-2. **7-Step Lossless Project Cutover (`crates/spawn-host/src/d6_cutover.rs::ProjectCutover`)**:
+1. **7-Step Lossless Project Cutover (`crates/spawn-host/src/d6_cutover.rs::ProjectCutover`)**:
    - **Step 1 (`step1_backfill_history`)**: Import commit DAG, trees, FastCDC chunks, and blobs into CAS + `spawn_snapshots` (`spawn_refs` untouched).
    - **Step 2 (`step2_pause_dispatch_and_verify_clean`)**: Pause dispatch, fail closed if any `.merge/*` or pending markers remain (`assert_zero_pending_merges`), and audit `.gitattributes` (`export-ignore`, `export-subst`, `eol`) via `audit_export_attributes`.
    - **Step 3 (`step3_import_tail_commits`)**: Import tail commits landed during drain.
