@@ -2324,4 +2324,35 @@ mod tests {
             assert_eq!(pooled_current, *candidate);
         }
     }
+
+    #[test]
+    fn refused_connection_maps_to_transient_and_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        let err = postgres::Config::new()
+            .host("127.0.0.1")
+            .port(port)
+            .user("spawn")
+            .dbname("spawn")
+            .connect(postgres::NoTls)
+            .err()
+            .expect("connection to dropped listener must fail");
+        assert!(super::is_transient_driver_error(&err), "{err}");
+        assert!(
+            matches!(
+                super::backend(&err),
+                spawn_core::port::StoreError::Unreachable(_)
+            ),
+            "{:?}",
+            super::backend(&err)
+        );
+        assert!(
+            matches!(
+                super::classify_maintenance_connect_error(&err),
+                LockAttemptFailure::Transient
+            ),
+            "{err}"
+        );
+    }
 }

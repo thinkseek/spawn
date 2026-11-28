@@ -794,6 +794,12 @@ pub(crate) struct Monitor {
     /// Monotonic `(commit_xid, event_id)` cursor already folded into alerts
     /// (`MIRROR` / `CONTROL`), never regressed by clock lag or mid-step commits.
     control_after: spawn_postgres::CommittedWatermark,
+    /// Snapshot (`pg_current_snapshot()::text`) from `MIRROR` at start, used to
+    /// skip post-`safe_xid` control records already reflected in `MIRROR` until
+    /// `control_after.commit_xid >= mirror_snapshot_xmax`.
+    mirror_snapshot: Option<String>,
+    /// Exclusive upper bound (`pg_snapshot_xmax`) of [`Self::mirror_snapshot`].
+    mirror_snapshot_xmax: u64,
     /// When the host and the logs are read next, on the database's clock.
     next_reading_ms: i64,
     /// The earliest bound that has not fired yet.
@@ -1032,6 +1038,8 @@ impl Monitor {
             watermark: 0,
             watermark_xid: 0,
             control_after: spawn_postgres::CommittedWatermark::default(),
+            mirror_snapshot: None,
+            mirror_snapshot_xmax: 0,
             next_reading_ms: 0,
             next_bound_ms: None,
             known: BTreeMap::new(),
@@ -1090,6 +1098,58 @@ impl Monitor {
             .unwrap_or(0)
     }
 
+    /// Advance `control_after` and consume any control records since the last
+    /// check, skipping transactions already reflected in [`Self::mirror_snapshot`].
+    fn advance_control(
+        &mut self,
+        store: &PostgresStore,
+        now: i64,
+        clock_wm: spawn_postgres::CommittedWatermark,
+        lines: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let batch = store
+            .alert_control_excluding(
+                self.control_after.event_id,
+                BATCH,
+                self.mirror_snapshot.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+        let records = batch["records"].as_array().map_or(&[][..], Vec::as_slice);
+        // One record at a time, as at the start: a halt and its resume
+        // in one batch end cleared, naming the resume.
+        for entry in records {
+            let id = entry["event_id"].as_i64().unwrap_or_default();
+            let at = entry["at_ms"].as_i64().unwrap_or(now);
+            let mut fed = Vec::new();
+            self.feed(id, at, &entry["record"], &mut fed);
+            self.flush(store, now, &fed, lines);
+        }
+        let batch_wm = batch["watermark"].as_i64().map_or(clock_wm, |id| {
+            spawn_postgres::CommittedWatermark::new(Self::parse_xid(&batch["watermark_xid"]), id)
+        });
+        let next_pos = batch["next"].as_i64().map_or(self.control_after, |id| {
+            spawn_postgres::CommittedWatermark::new(Self::parse_xid(&batch["next_xid"]), id)
+        });
+        // What the step has read: the last control record when the
+        // batch was cut at its limit (the rest waits for the next
+        // check), and otherwise everything up to CONTROL's own committed
+        // frontier so mid-step commits are never replayed (objective 023).
+        if i64::try_from(records.len()).unwrap_or(i64::MAX) < BATCH {
+            let advanced = clock_wm.max(batch_wm);
+            self.set_watermark_pos(self.watermark_pos().max(advanced));
+            self.control_after = self.control_after.max(advanced);
+        } else {
+            self.control_after = self.control_after.max(next_pos);
+            if next_pos < clock_wm {
+                self.set_watermark_pos(self.watermark_pos().max(next_pos));
+            }
+        }
+        if self.control_after.commit_xid >= self.mirror_snapshot_xmax {
+            self.mirror_snapshot = None;
+        }
+        Ok(())
+    }
+
     /// One pass: read what is new, decide, record. Returns lines for the
     /// loop's log. Never fails the loop: the caller says the error and tries
     /// again at the next check.
@@ -1116,42 +1176,7 @@ impl Monitor {
         let mut events = Vec::new();
         let moved = clock_wm > self.watermark_pos();
         if moved {
-            let batch = store
-                .alert_control(self.control_after.event_id, BATCH)
-                .map_err(|error| error.to_string())?;
-            let records = batch["records"].as_array().map_or(&[][..], Vec::as_slice);
-            // One record at a time, as at the start: a halt and its resume
-            // in one batch end cleared, naming the resume.
-            for entry in records {
-                let id = entry["event_id"].as_i64().unwrap_or_default();
-                let at = entry["at_ms"].as_i64().unwrap_or(now);
-                let mut fed = Vec::new();
-                self.feed(id, at, &entry["record"], &mut fed);
-                self.flush(store, now, &fed, &mut lines);
-            }
-            let batch_wm = batch["watermark"].as_i64().map_or(clock_wm, |id| {
-                spawn_postgres::CommittedWatermark::new(
-                    Self::parse_xid(&batch["watermark_xid"]),
-                    id,
-                )
-            });
-            let next_pos = batch["next"].as_i64().map_or(self.control_after, |id| {
-                spawn_postgres::CommittedWatermark::new(Self::parse_xid(&batch["next_xid"]), id)
-            });
-            // What the step has read: the last control record when the
-            // batch was cut at its limit (the rest waits for the next
-            // check), and otherwise everything up to CONTROL's own committed
-            // frontier so mid-step commits are never replayed (objective 023).
-            if i64::try_from(records.len()).unwrap_or(i64::MAX) < BATCH {
-                let advanced = clock_wm.max(batch_wm);
-                self.set_watermark_pos(self.watermark_pos().max(advanced));
-                self.control_after = self.control_after.max(advanced);
-            } else {
-                self.control_after = self.control_after.max(next_pos);
-                if next_pos < clock_wm {
-                    self.set_watermark_pos(self.watermark_pos().max(next_pos));
-                }
-            }
+            self.advance_control(store, now, clock_wm, &mut lines)?;
             let observations = store
                 .alert_observations()
                 .map_err(|error| error.to_string())?;
@@ -1220,47 +1245,42 @@ impl Monitor {
             .map_or(due, |poll| poll.min(due))
     }
 
-    /// Read what the step needs back: its alerts, the missions and tasks, the
-    /// pending records, and where the event log stands.
-    fn start(&mut self, store: &PostgresStore, lines: &mut Vec<String>) -> Result<(), String> {
-        let mirror = store.alert_mirror().map_err(|error| error.to_string())?;
-        // Where the event log stood when the missions and tasks were read,
-        // from the same snapshot (objective 106): every record after it in
-        // `(commit_xid, id)` order is the checks' to feed, whatever commits
-        // while the start runs, and none the mirror holds is fed again.
-        let watermark = mirror["watermark"]
-            .as_i64()
-            .ok_or_else(|| "the alert mirror holds no watermark".to_string())?;
-        let mirror_wm = spawn_postgres::CommittedWatermark::new(
-            Self::parse_xid(&mirror["watermark_xid"]),
-            watermark,
-        );
-        let clock_wm = mirror["clock"].as_i64().map_or(mirror_wm, |id| {
-            spawn_postgres::CommittedWatermark::new(Self::parse_xid(&mirror["clock_xid"]), id)
-        });
-        let now = mirror["now_ms"]
-            .as_i64()
-            .unwrap_or_else(|| store.now_ms().unwrap_or_default());
-        self.seed_mirror(&mirror);
-        let rows = store.alert_rows().map_err(|error| error.to_string())?;
-        self.seed_rows(&rows["rows"]);
-        self.seed_stuck_ended(store)?;
+    /// Replay alert-family history and deploy outcomes visible in `MIRROR`'s
+    /// snapshot so restarts preserve state without double-folding concurrent
+    /// writes.
+    fn replay_history_and_deploys(
+        &mut self,
+        store: &PostgresStore,
+        rows: &Value,
+        mirror_wm: spawn_postgres::CommittedWatermark,
+        mirror_snapshot: Option<&str>,
+        now: i64,
+        lines: &mut Vec<String>,
+    ) -> Result<(), String> {
         let history = store
-            .alert_history(now.saturating_sub(HISTORY_MS), HISTORY_LIMIT)
+            .alert_history_in_snapshot(
+                now.saturating_sub(HISTORY_MS),
+                HISTORY_LIMIT,
+                mirror_snapshot,
+            )
             .map_err(|error| error.to_string())?;
         // Each record is recorded before the next is read, so a later record
         // in the same history (a halt's resume, a good drill after a failed
         // one) finds the alert its predecessor fired and clears it, naming
         // itself; a record older than an open alert's own clears nothing
         // ([`after`]).
-        // A record after the mirror frontier in `(commit_xid, id)` order is
-        // the checks' (objective 106): fed here too, it would fold twice.
+        // Records committed outside `MIRROR`'s snapshot are withheld for the
+        // checks so nothing folds twice (objective 106).
         for entry in history.as_array().into_iter().flatten() {
             let id = entry["event_id"].as_i64().unwrap_or_default();
-            let pos =
-                spawn_postgres::CommittedWatermark::new(Self::parse_xid(&entry["commit_xid"]), id);
-            if pos > mirror_wm {
-                continue;
+            if mirror_snapshot.is_none() {
+                let pos = spawn_postgres::CommittedWatermark::new(
+                    Self::parse_xid(&entry["commit_xid"]),
+                    id,
+                );
+                if pos > mirror_wm {
+                    continue;
+                }
             }
             let at = entry["at_ms"].as_i64().unwrap_or(now);
             let mut fed = Vec::new();
@@ -1282,7 +1302,13 @@ impl Monitor {
             0
         };
         let deploys = store
-            .alert_deploys(cursor, watermark, since, HISTORY_LIMIT)
+            .alert_deploys_in_snapshot(
+                cursor,
+                mirror_wm.event_id,
+                since,
+                HISTORY_LIMIT,
+                mirror_snapshot,
+            )
             .map_err(|error| error.to_string())?;
         for entry in deploys.as_array().into_iter().flatten() {
             let id = entry["event_id"].as_i64().unwrap_or_default();
@@ -1290,6 +1316,45 @@ impl Monitor {
             self.deploy_record(id, &entry["record"], &mut fed);
             self.flush(store, now, &fed, lines);
         }
+        Ok(())
+    }
+
+    /// Read what the step needs back: its alerts, the missions and tasks, the
+    /// pending records, and where the event log stands.
+    fn start(&mut self, store: &PostgresStore, lines: &mut Vec<String>) -> Result<(), String> {
+        let mirror = store.alert_mirror().map_err(|error| error.to_string())?;
+        // Where the event log stood when the missions and tasks were read,
+        // from the same snapshot (objective 106): every record visible in
+        // `MIRROR`'s snapshot is replayed at start and excluded in `CONTROL`,
+        // while records outside that snapshot (including earlier-XID concurrent
+        // writers that commit later) are delivered cleanly on subsequent checks.
+        let watermark = mirror["watermark"]
+            .as_i64()
+            .ok_or_else(|| "the alert mirror holds no watermark".to_string())?;
+        let mirror_wm = spawn_postgres::CommittedWatermark::new(
+            Self::parse_xid(&mirror["watermark_xid"]),
+            watermark,
+        );
+        let clock_wm = mirror["clock"].as_i64().map_or(mirror_wm, |id| {
+            spawn_postgres::CommittedWatermark::new(Self::parse_xid(&mirror["clock_xid"]), id)
+        });
+        let mirror_snapshot = mirror["snapshot"].as_str().map(str::to_string);
+        let mirror_snapshot_xmax = Self::parse_xid(&mirror["snapshot_xmax"]);
+        let now = mirror["now_ms"]
+            .as_i64()
+            .unwrap_or_else(|| store.now_ms().unwrap_or_default());
+        self.seed_mirror(&mirror);
+        let rows = store.alert_rows().map_err(|error| error.to_string())?;
+        self.seed_rows(&rows["rows"]);
+        self.seed_stuck_ended(store)?;
+        self.replay_history_and_deploys(
+            store,
+            &rows,
+            mirror_wm,
+            mirror_snapshot.as_deref(),
+            now,
+            lines,
+        )?;
         let mut events = Vec::new();
         // An alert read back whose missions all closed while the loop was
         // down, or before it fired (an owner alert of before objective 056,
@@ -1313,7 +1378,14 @@ impl Monitor {
             .map_err(|error| error.to_string())?;
         self.messages(&messages, &mut events);
         self.set_watermark_pos(clock_wm);
-        self.control_after = mirror_wm;
+        self.control_after = clock_wm;
+        if clock_wm.commit_xid < mirror_snapshot_xmax {
+            self.mirror_snapshot = mirror_snapshot;
+            self.mirror_snapshot_xmax = mirror_snapshot_xmax;
+        } else {
+            self.mirror_snapshot = None;
+            self.mirror_snapshot_xmax = 0;
+        }
         // Read after the watermark: a request or an outcome recorded since
         // is in both reads, and folds the same.
         self.seed_owner_requests(store, now, &mut events)?;
@@ -12220,7 +12292,7 @@ execute function alerts_test_deploys_mid_start();
                     .expect("arch w")
                     .get(0);
 
-                // Commit a control event after tx_w started (`ctrl_top > clock_top`).
+                // Commit a control event after tx_w started (MIRROR snapshot captures it while safe_xid stays below tx_w).
                 let id_ctrl: i64 = conn_ctrl
                     .query_one(
                         "select spawn_control_record($1)",
@@ -12232,12 +12304,16 @@ execute function alerts_test_deploys_mid_start();
                 // Start monitor while tx_w is still open.
                 let mut monitor = super::monitor();
                 monitor.check(store).expect("start check while worker open");
-                assert_eq!(monitor.control_after.event_id, id_ctrl);
+                assert_eq!(monitor.control_after, monitor.watermark_pos());
                 assert!(
-                    monitor.watermark_pos() < monitor.control_after,
-                    "clock watermark {:?} must stay below open worker while control_after {:?}",
-                    monitor.watermark_pos(),
+                    monitor.control_after.event_id < id_w
+                        && monitor.control_after.event_id < id_ctrl,
+                    "cursors {:?} must remain below open worker ({id_w}) and concurrent ctrl ({id_ctrl})",
                     monitor.control_after
+                );
+                assert!(
+                    monitor.mirror_snapshot.is_some(),
+                    "mirror_snapshot must guard against re-folding {id_ctrl}"
                 );
 
                 // Commit tx_w: next check must see clock advance past tx_w and read archive_failed,
@@ -12262,6 +12338,92 @@ execute function alerts_test_deploys_mid_start();
                 assert!(
                     keys.contains(&format!("archive_failed:agent_w:nat_w:{id_w}").as_str()),
                     "{keys:?}"
+                );
+            });
+        }
+
+        #[test]
+        fn monitor_start_and_check_deliver_early_xid_for_update_control_writer_without_double_fold()
+        {
+            in_schema("alerts_cli_early_xid", |store| {
+                let url =
+                    std::env::var("SPAWN_TEST_DATABASE_URL").expect("SPAWN_TEST_DATABASE_URL");
+                let (mut setup, mut conn_w, mut conn_r, mut conn_s) = (
+                    schema_conn(store, &url),
+                    schema_conn(store, &url),
+                    schema_conn(store, &url),
+                    schema_conn(store, &url),
+                );
+                for id in [960, 961] {
+                    setup
+                        .query_one(
+                            "select spawn_control_record($1)",
+                            &[&json!({"type": "mission.added", "id": id, "text": format!("m{id}"), "origin": "human"})],
+                        )
+                        .expect("seed mission");
+                }
+                setup
+                    .batch_execute("select spawn_control_refold()")
+                    .expect("refold");
+
+                let mut tx_w = conn_w.transaction().expect("tx_w");
+                let _id_w = tx_append_note(&mut tx_w, "agent_w", "sess_cli_early_w");
+
+                let mut tx_r = conn_r.transaction().expect("tx_r");
+                let _: i64 = tx_r
+                    .query_one(
+                        "select id from mission_missions where id = 960 for update",
+                        &[],
+                    )
+                    .expect("for update 960")
+                    .get(0);
+
+                let id_s: i64 = conn_s
+                    .query_one(
+                        "select spawn_control_record($1)",
+                        &[&json!({"type": "mission.halted", "id": 961, "reason": "s_before_start"})],
+                    )
+                    .expect("halted s")
+                    .get(0);
+
+                let mut monitor = super::monitor();
+                monitor.check(store).expect("start while w and r open");
+
+                let id_r: i64 = tx_r
+                    .query_one(
+                        "select spawn_control_record($1)",
+                        &[&json!({"type": "mission.halted", "id": 960, "reason": "r_early_xid"})],
+                    )
+                    .expect("halted r")
+                    .get(0);
+                tx_r.commit().expect("commit tx_r");
+                assert!(id_s < id_r, "expected id_s ({id_s}) < id_r ({id_r})");
+
+                monitor.check(store).expect("check while w still open");
+                tx_w.commit().expect("commit tx_w");
+                monitor.check(store).expect("check after commits");
+
+                let keys: Vec<String> = store
+                    .alerts(0)
+                    .expect("alerts")
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .filter_map(|row| row["key"].as_str().map(str::to_string))
+                    .collect();
+                assert_eq!(
+                    keys.iter()
+                        .filter(|k| **k == format!("mission_halted:960:{id_r}"))
+                        .count(),
+                    1,
+                    "early-XID control record R must be delivered once: {keys:?}"
+                );
+                assert_eq!(
+                    keys.iter()
+                        .filter(|k| **k == format!("mission_halted:961:{id_s}"))
+                        .count(),
+                    1,
+                    "mirror-folded control record S must not fold twice: {keys:?}"
                 );
             });
         }

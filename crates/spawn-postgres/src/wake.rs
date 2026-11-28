@@ -457,11 +457,6 @@ mod tests {
         assert!(after_commit > baseline && after_commit.commit_xid > 0);
     }
 
-    /// Reversed `commit_xid` vs `id` order with a third older-XID blocker:
-    /// B allocates `x_b` first, C allocates `x_c` second (staying open), A
-    /// allocates `x_a` third and appends `id_a < id_b`, then B appends `id_b`
-    /// and commits first. The frontier advances to `(x_b, id_b)`, does NOT
-    /// move backward `id_b -> 0 -> id_b` when A commits behind open C, advances
     fn tx_row_xid(tx: &mut postgres::Transaction<'_>, event_id: i64) -> u64 {
         tx.query_one(
             "select commit_xid::text from spawn_events where id = $1",
@@ -473,6 +468,11 @@ mod tests {
         .expect("parse commit_xid")
     }
 
+    /// Reversed `commit_xid` vs `id` order with a third older-XID blocker:
+    /// B allocates `x_b` first, C allocates `x_c` second (staying open), A
+    /// allocates `x_a` third and appends `id_a < id_b`, then B appends `id_b`
+    /// and commits first. The frontier advances to `(x_b, id_b)`, does NOT
+    /// move backward `id_b -> 0 -> id_b` when A commits behind open C, advances
     /// monotonically to `(x_a, id_a)` once C commits, and `read_global` from
     /// `id_b` recovers `id_a` without skipping or duplicating.
     #[test]

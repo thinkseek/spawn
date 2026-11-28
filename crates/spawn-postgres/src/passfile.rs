@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn url_without_user_never_falls_back_to_ambient_os_user() {
+    fn url_without_user_resolves_explicit_default_or_os_user_in_config() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let url_no_user: postgres::Config = "postgres://db.example/spawn".parse().expect("parses");

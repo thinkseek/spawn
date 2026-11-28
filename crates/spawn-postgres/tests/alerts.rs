@@ -777,7 +777,18 @@ fn alert_mirror_advances_past_committed_control_with_unrelated_in_flight_worker(
     );
 
     let mirror = store.alert_mirror().expect("mirror");
-    assert_eq!(mirror["watermark"].as_i64(), Some(id_control));
+    let mirror_wm = mirror["watermark"].as_i64().expect("mirror watermark");
+    assert!(
+        mirror_wm < id_worker,
+        "mirror watermark ({mirror_wm}) must remain at safe frontier below in-flight worker ({id_worker})"
+    );
+    let snapshot = mirror["snapshot"]
+        .as_str()
+        .expect("mirror must export pg_current_snapshot text");
+    assert!(
+        mirror["snapshot_xmax"].as_str().is_some(),
+        "mirror must export snapshot_xmax: {mirror}"
+    );
     let has_mission = mirror["missions"]
         .as_array()
         .is_some_and(|missions| missions.iter().any(|m| m["id"] == 92));
@@ -785,16 +796,16 @@ fn alert_mirror_advances_past_committed_control_with_unrelated_in_flight_worker(
         has_mission,
         "mission 92 must be present in mirror: {mirror}"
     );
-    let replay_check = store
-        .alert_control(id_control, 100)
-        .expect("subsequent alert_control after mirror watermark");
-    assert_eq!(
-        replay_check["records"].as_array().map(Vec::len),
-        Some(0),
-        "already-folded mission 92 must not be re-fed after mirror watermark: {replay_check}"
-    );
 
     tx_a.commit().expect("commit tx_a");
+    let after_commit = store
+        .alert_control_excluding(mirror_wm, 100, Some(snapshot))
+        .expect("subsequent alert_control_excluding must skip snapshot-visible mission 92");
+    assert_eq!(
+        after_commit["records"].as_array().map(Vec::len),
+        Some(0),
+        "already-folded mission 92 must not be re-fed when excluded by mirror snapshot: {after_commit}"
+    );
 }
 
 #[test]
@@ -976,5 +987,97 @@ fn alerts_reversed_xid_vs_id_order_recovers_lower_ids_without_regression() {
     assert_eq!(
         store.alert_archives(id_arch_a).expect("arch tail"),
         json!([])
+    );
+}
+
+#[test]
+fn alert_mirror_and_control_deliver_early_xid_for_update_writer_and_skip_folded() {
+    let (store, schema) = store("alerts_early_xid_for_update");
+    let mut setup = admin(&schema);
+    setup
+        .query_one(
+            "select spawn_control_record($1)",
+            &[&json!({"type": "mission.added", "id": 960, "text": "m960", "origin": "human"})],
+        )
+        .expect("add 960");
+    setup
+        .query_one(
+            "select spawn_control_record($1)",
+            &[&json!({"type": "mission.added", "id": 961, "text": "m961", "origin": "human"})],
+        )
+        .expect("add 961");
+    setup
+        .batch_execute("select spawn_control_refold()")
+        .expect("refold");
+    let baseline = store.committed_watermark().expect("baseline");
+
+    let (mut conn_w, mut conn_r, mut conn_s) = (admin(&schema), admin(&schema), admin(&schema));
+    let mut tx_w = conn_w.transaction().expect("begin tx_w");
+    let _id_w: i64 = tx_w
+        .query_one(
+            "select out_id from spawn_append_trusted('agent_w', 'sess_early_w', null, 'bridge', null, $1)",
+            &[&json!({"name": "session.noted", "detail": {"text": "open worker"}})],
+        )
+        .expect("append w")
+        .get(0);
+
+    // Writer R allocates an earlier XID via FOR UPDATE without holding session_control.
+    let mut tx_r = conn_r.transaction().expect("begin tx_r");
+    let locked: i64 = tx_r
+        .query_one(
+            "select id from mission_missions where id = 960 for update",
+            &[],
+        )
+        .expect("for update 960")
+        .get(0);
+    assert_eq!(locked, 960);
+
+    // Writer S obtains a newer XID and commits mission.halted before MIRROR reads.
+    let id_s: i64 = conn_s
+        .query_one(
+            "select spawn_control_record($1)",
+            &[&json!({"type": "mission.halted", "id": 961, "reason": "s_before_start"})],
+        )
+        .expect("commit s")
+        .get(0);
+
+    let mirror = store.alert_mirror().expect("mirror");
+    assert_eq!(mirror["watermark"].as_i64(), Some(baseline.event_id));
+    let snap = mirror["snapshot"].as_str().expect("snapshot").to_string();
+    let history = store
+        .alert_history_in_snapshot(0, 100, Some(&snap))
+        .expect("history in mirror snapshot");
+    assert!(
+        payload_event_ids(&history).contains(&id_s),
+        "S must appear in mirror-snapshot history: {history}"
+    );
+
+    // R resumes after MIRROR and commits with (x_r, id_r) < (x_s, id_s).
+    let id_r: i64 = tx_r
+        .query_one(
+            "select spawn_control_record($1)",
+            &[&json!({"type": "mission.halted", "id": 960, "reason": "r_early_xid"})],
+        )
+        .expect("record r")
+        .get(0);
+    tx_r.commit().expect("commit r");
+    assert!(id_s < id_r, "expected id_s ({id_s}) < id_r ({id_r})");
+
+    tx_w.commit().expect("commit w");
+    let batch = store
+        .alert_control_excluding(baseline.event_id, 100, Some(&snap))
+        .expect("control excluding mirror snapshot");
+    assert_eq!(
+        payload_event_ids(&batch["records"]),
+        vec![id_r],
+        "CONTROL must deliver early-XID writer R and skip folded S: {batch}"
+    );
+    let next_wm = batch["watermark"].as_i64().expect("watermark");
+    let tail = store
+        .alert_control_excluding(next_wm, 100, Some(&snap))
+        .expect("tail check");
+    assert!(
+        tail["records"].as_array().is_some_and(Vec::is_empty),
+        "neither R nor S may replay past {next_wm}: {tail}"
     );
 }
