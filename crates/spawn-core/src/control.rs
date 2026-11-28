@@ -629,7 +629,7 @@ pub struct TaskAssignedRecord {
 /// Which earlier task a `task.assigned` record's task comes from: the
 /// record's four lineage fields read once. Each is written by one writer
 /// alone (`schema.sql`, every version), so a record names at most one:
-/// `duplicate_of` by `spawn_mission_assign` (assigned again on purpose
+/// `duplicate_of` by `spawn_task_assign` (assigned again on purpose
 /// while a task with the same brief is open), `reissue_of` by the
 /// dispatcher's re-issue of an undelivered task, `reassign_of` by a
 /// reassign to a fresh per-task worker, and `continues` by the
@@ -3426,7 +3426,492 @@ pub struct EpisodeStage {
     pub kind: ControlRecordKind,
 }
 
+const EPISODE_KIND: &str = "task.episode";
+
+/// Which earlier task a [`TaskEpisode`] continues, reissues, or reassigns from:
+/// the episode's three mutually exclusive predecessor lineage fields read once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodePredecessor {
+    /// Re-issued in place of undelivered task `of`.
+    Reissue {
+        /// Original task ID that was re-issued.
+        of: i64,
+    },
+    /// Delivered work of task `of` taken over by a fresh per-task worker.
+    Reassign {
+        /// Original task ID that was reassigned.
+        of: i64,
+    },
+    /// Continues the work of overrun task `of` on the same objective.
+    Continuation {
+        /// Prior task ID whose work this episode continues.
+        of: i64,
+    },
+}
+
+impl EpisodePredecessor {
+    /// The predecessor task identifier.
+    #[must_use]
+    pub const fn of(self) -> i64 {
+        match self {
+            Self::Reissue { of } | Self::Reassign { of } | Self::Continuation { of } => of,
+        }
+    }
+
+    /// Map a parsed [`TaskOrigin`] to its episode predecessor (`New` and
+    /// `Duplicate` have no sequential predecessor on [`TaskEpisode`]).
+    #[must_use]
+    pub const fn from_task_origin(origin: TaskOrigin) -> Option<Self> {
+        match origin {
+            TaskOrigin::New | TaskOrigin::Duplicate { .. } => None,
+            TaskOrigin::Reissue { of } => Some(Self::Reissue { of }),
+            TaskOrigin::Reassign { of } => Some(Self::Reassign { of }),
+            TaskOrigin::Continuation { of } => Some(Self::Continuation { of }),
+        }
+    }
+}
+
+/// Objective index and optional scenario targeted by an objective episode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpisodeObjective<'a> {
+    /// Numeric objective index within the mission.
+    pub index: i32,
+    /// Scenario path/name targeted for this objective, if specified.
+    pub scenario: Option<&'a str>,
+}
+
+/// Preset routing attribution state read from `preset_id`, `first_preset_id`,
+/// and `reroutes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeRouting<'a> {
+    /// Assigned without the grading preset catalog and never rerouted.
+    Unrouted,
+    /// Routed through the grading preset catalog (`first_preset_id` recorded).
+    Routed {
+        /// Currently attributed preset identifier.
+        current: &'a str,
+        /// Initial preset identifier first assigned to the episode.
+        first: &'a str,
+        /// Number of `task.rerouted` step-up transitions observed.
+        reroutes: u32,
+    },
+}
+
+impl<'a> EpisodeRouting<'a> {
+    /// Currently attributed preset identifier, if routed.
+    #[must_use]
+    pub const fn current(self) -> Option<&'a str> {
+        match self {
+            Self::Unrouted => None,
+            Self::Routed { current, .. } => Some(current),
+        }
+    }
+
+    /// Initial preset identifier first assigned, if routed.
+    #[must_use]
+    pub const fn first(self) -> Option<&'a str> {
+        match self {
+            Self::Unrouted => None,
+            Self::Routed { first, .. } => Some(first),
+        }
+    }
+
+    /// Count of `task.rerouted` step-up transitions observed.
+    #[must_use]
+    pub const fn reroutes(self) -> u32 {
+        match self {
+            Self::Unrouted => 0,
+            Self::Routed { reroutes, .. } => reroutes,
+        }
+    }
+}
+
+/// Non-terminal lifecycle states permitted while [`EpisodeOutcome::InFlight`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InFlightState {
+    /// Assigned, waiting for first delivery (`task.assigned`).
+    Assigned,
+    /// Delivered to worker (`task.delivered`).
+    Delivered,
+    /// Worker completion report submitted (`task.reported`).
+    Reported,
+    /// Sent back by reviewer or gate for rework (`task.reviewed` / `task.gated`).
+    Revise,
+    /// Accepted by reviewer on a gated mission, awaiting gate judging.
+    Accepted,
+    /// Passed gate, waiting to land onto the mission's target branch.
+    Landing,
+}
+
+impl InFlightState {
+    /// Underlying [`TaskState`].
+    #[must_use]
+    pub const fn as_task_state(self) -> TaskState {
+        match self {
+            Self::Assigned => TaskState::Assigned,
+            Self::Delivered => TaskState::Delivered,
+            Self::Reported => TaskState::Reported,
+            Self::Revise => TaskState::Revise,
+            Self::Accepted => TaskState::Accepted,
+            Self::Landing => TaskState::Landing,
+        }
+    }
+
+    /// Convert a [`TaskState`] if it represents an in-flight task.
+    #[must_use]
+    pub const fn from_task_state(state: TaskState) -> Option<Self> {
+        match state {
+            TaskState::Assigned => Some(Self::Assigned),
+            TaskState::Delivered => Some(Self::Delivered),
+            TaskState::Reported => Some(Self::Reported),
+            TaskState::Revise => Some(Self::Revise),
+            TaskState::Accepted => Some(Self::Accepted),
+            TaskState::Landing => Some(Self::Landing),
+            TaskState::Landed | TaskState::Cancelled => None,
+        }
+    }
+}
+
+/// Closing sequence number and timestamp paired once an episode leaves flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpisodeClosedAt {
+    /// Control event sequence number (or import sequence) of closure.
+    pub seq: i64,
+    /// Closure timestamp in Unix epoch milliseconds.
+    pub at_ms: i64,
+}
+
+/// Terminal closure variant pairing outcome, terminal [`TaskState`], actor,
+/// and reason without contradictory combinations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeClosure<'a> {
+    /// Gated task landed onto the mission's target branch (`task.landed`).
+    Landed,
+    /// Review-only task accepted (`task.reviewed` `accepted: true`).
+    Accepted,
+    /// Cancelled with explicit yield / objective exhaustion (`yielded: true`).
+    Rejected {
+        /// Actor credited with closing/yielding the task, if recorded.
+        by: Option<&'a str>,
+        /// Reason recorded on the yield cancellation, if any.
+        reason: Option<&'a str>,
+    },
+    /// Aborted due to budget overrun/stale limit with work dropped (`task.aborted`).
+    Aborted {
+        /// Optional abort explanation recorded on `task.aborted`.
+        reason: Option<&'a str>,
+    },
+    /// Ended over budget with branch work kept for continuation (`task.over_budget`).
+    OverBudget {
+        /// Budget limit reason (`tool_calls`, `elapsed_ms`, etc.).
+        reason: &'a str,
+    },
+    /// Explicitly cancelled or closed by mission/resident closure rule.
+    Cancelled {
+        /// Actor credited with cancelling the task, if recorded.
+        by: Option<&'a str>,
+        /// Optional cancellation reason.
+        reason: Option<&'a str>,
+    },
+}
+
+impl<'a> EpisodeClosure<'a> {
+    /// Terminal [`TaskState`] implied by this closure.
+    #[must_use]
+    pub const fn task_state(self) -> TaskState {
+        match self {
+            Self::Landed => TaskState::Landed,
+            Self::Accepted => TaskState::Accepted,
+            Self::Rejected { .. }
+            | Self::Aborted { .. }
+            | Self::OverBudget { .. }
+            | Self::Cancelled { .. } => TaskState::Cancelled,
+        }
+    }
+
+    /// Corresponding [`EpisodeOutcome`] discriminant.
+    #[must_use]
+    pub const fn outcome(self) -> EpisodeOutcome {
+        match self {
+            Self::Landed => EpisodeOutcome::Landed,
+            Self::Accepted => EpisodeOutcome::Accepted,
+            Self::Rejected { .. } => EpisodeOutcome::Rejected,
+            Self::Aborted { .. } => EpisodeOutcome::Aborted,
+            Self::OverBudget { .. } => EpisodeOutcome::OverBudget,
+            Self::Cancelled { .. } => EpisodeOutcome::Cancelled,
+        }
+    }
+
+    /// Actor credited with closure, when present.
+    #[must_use]
+    pub const fn by(self) -> Option<&'a str> {
+        match self {
+            Self::Rejected { by, .. } | Self::Cancelled { by, .. } => by,
+            Self::Landed | Self::Accepted | Self::Aborted { .. } | Self::OverBudget { .. } => None,
+        }
+    }
+
+    /// Closure reason text, when present.
+    #[must_use]
+    pub const fn reason(self) -> Option<&'a str> {
+        match self {
+            Self::Rejected { reason, .. }
+            | Self::Aborted { reason }
+            | Self::Cancelled { reason, .. } => reason,
+            Self::OverBudget { reason } => Some(reason),
+            Self::Landed | Self::Accepted => None,
+        }
+    }
+}
+
+/// Closed-set lifecycle view unifying `state`, `outcome`, `closed_seq`,
+/// `closed_at_ms`, `terminal_by`, and `terminal_reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeLifecycle<'a> {
+    /// Still open with no closure timestamp or terminal metadata.
+    InFlight(InFlightState),
+    /// Closed with matching `closed_at` coordinates and typed [`EpisodeClosure`].
+    Closed {
+        /// Sequence and timestamp at which the episode closed.
+        closed_at: EpisodeClosedAt,
+        /// Terminal closure cause and attribution.
+        closure: EpisodeClosure<'a>,
+    },
+}
+
+impl EpisodeLifecycle<'_> {
+    /// Replayed [`TaskState`] implied by this lifecycle state.
+    #[must_use]
+    pub const fn task_state(self) -> TaskState {
+        match self {
+            Self::InFlight(state) => state.as_task_state(),
+            Self::Closed { closure, .. } => closure.task_state(),
+        }
+    }
+
+    /// High-level [`EpisodeOutcome`] implied by this lifecycle state.
+    #[must_use]
+    pub const fn outcome(self) -> EpisodeOutcome {
+        match self {
+            Self::InFlight(_) => EpisodeOutcome::InFlight,
+            Self::Closed { closure, .. } => closure.outcome(),
+        }
+    }
+
+    /// Closing coordinates if closed.
+    #[must_use]
+    pub const fn closed_at(self) -> Option<EpisodeClosedAt> {
+        match self {
+            Self::InFlight(_) => None,
+            Self::Closed { closed_at, .. } => Some(closed_at),
+        }
+    }
+
+    /// Whether the episode has reached a terminal closed state.
+    #[must_use]
+    pub const fn is_closed(self) -> bool {
+        matches!(self, Self::Closed { .. })
+    }
+}
+
+/// Closed-set delivery view pairing `deliveries`, `last_command_id`, and
+/// `delivered_at_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeDelivery {
+    /// Not yet delivered (`deliveries == 0`, no command ID, no timestamp).
+    Pending,
+    /// Historical `legacy.imported` row from before `delivered_at_ms` existed
+    /// (`deliveries == 0`, `last_command_id: Some`, `delivered_at_ms: None`).
+    LegacyCommandOnly {
+        /// Command identifier recorded on the legacy row.
+        command_id: i64,
+    },
+    /// Delivered at least once (`deliveries >= 1`, `delivered_at_ms: Some`).
+    /// `command_id` is always `Some` after any replayed `task.delivered` stage or
+    /// multiple deliveries, and `None` only on imported legacy rows that omitted it.
+    Delivered {
+        /// Most recent delivered command identifier, when recorded.
+        command_id: Option<i64>,
+        /// Latest delivery timestamp in Unix epoch milliseconds.
+        at_ms: i64,
+        /// Total `task.delivered` transitions observed (always `>= 1`).
+        count: u32,
+    },
+}
+
+impl EpisodeDelivery {
+    /// Delivered command identifier, if recorded.
+    #[must_use]
+    pub const fn command_id(self) -> Option<i64> {
+        match self {
+            Self::Pending => None,
+            Self::LegacyCommandOnly { command_id } => Some(command_id),
+            Self::Delivered { command_id, .. } => command_id,
+        }
+    }
+
+    /// Delivery timestamp in Unix epoch milliseconds, if delivered.
+    #[must_use]
+    pub const fn delivered_at_ms(self) -> Option<i64> {
+        match self {
+            Self::Pending | Self::LegacyCommandOnly { .. } => None,
+            Self::Delivered { at_ms, .. } => Some(at_ms),
+        }
+    }
+
+    /// Recorded delivery transition count.
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        match self {
+            Self::Pending | Self::LegacyCommandOnly { .. } => 0,
+            Self::Delivered { count, .. } => count,
+        }
+    }
+}
+
+/// Closed-set report submission view pairing `reports`, `last_report`, and
+/// `last_report_commit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeReport<'a> {
+    /// No report submitted (`reports == 0`, no text, no commit).
+    None,
+    /// At least one report submitted (`reports >= 1`, `last_report: Some`).
+    Submitted {
+        /// Latest completion report text.
+        text: &'a str,
+        /// Candidate commit SHA carried on the latest report, if any.
+        commit: Option<&'a str>,
+        /// Total `task.reported` submissions observed (always `>= 1`).
+        count: u32,
+    },
+}
+
+impl<'a> EpisodeReport<'a> {
+    /// Submitted report text, if any.
+    #[must_use]
+    pub const fn text(self) -> Option<&'a str> {
+        match self {
+            Self::None => None,
+            Self::Submitted { text, .. } => Some(text),
+        }
+    }
+
+    /// Candidate commit SHA carried on the latest report, if any.
+    #[must_use]
+    pub const fn commit(self) -> Option<&'a str> {
+        match self {
+            Self::None => None,
+            Self::Submitted { commit, .. } => commit,
+        }
+    }
+
+    /// Count of report submissions observed.
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Submitted { count, .. } => count,
+        }
+    }
+}
+
+/// Closed-set gate evaluation view pairing `last_gate_verdict`, `gate_verdicts`,
+/// `base`, `candidate`, and `metric`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeGate<'a> {
+    /// No gate verdict or legacy gate artifacts recorded.
+    Ungated,
+    /// Gate artifact fields carried from a `legacy.imported` row with no
+    /// `task.gated` checkpoint history (`gate_verdicts` empty).
+    LegacySnapshot {
+        /// Baseline commit SHA imported from `mission_tasks`.
+        base: Option<&'a str>,
+        /// Candidate commit SHA imported from `mission_tasks`.
+        candidate: Option<&'a str>,
+        /// Gate metric string imported from `mission_tasks`.
+        metric: Option<&'a str>,
+    },
+    /// At least one `task.gated` checkpoint judged on this episode.
+    Judged {
+        /// Most recent gate verdict checkpoint.
+        last: &'a GateSyncPoint,
+        /// Latest baseline commit SHA retained on the episode.
+        base: Option<&'a str>,
+        /// Active passing candidate commit SHA (`None` unless awaiting landing / landed).
+        candidate: Option<&'a str>,
+        /// Latest gate metric emitted on an `accepted` verdict.
+        metric: Option<&'a str>,
+        /// Total gate verdict checkpoints recorded.
+        count: usize,
+    },
+}
+
+impl<'a> EpisodeGate<'a> {
+    /// Most recent gate verdict, if judged via `task.gated`.
+    #[must_use]
+    pub const fn last_verdict(self) -> Option<GateVerdict> {
+        match self {
+            Self::Ungated | Self::LegacySnapshot { .. } => None,
+            Self::Judged { last, .. } => Some(last.verdict),
+        }
+    }
+
+    /// Baseline commit SHA recorded by the gate, if any.
+    #[must_use]
+    pub const fn base(self) -> Option<&'a str> {
+        match self {
+            Self::Ungated => None,
+            Self::LegacySnapshot { base, .. } | Self::Judged { base, .. } => base,
+        }
+    }
+
+    /// Candidate commit SHA retained by the gate, if any.
+    #[must_use]
+    pub const fn candidate(self) -> Option<&'a str> {
+        match self {
+            Self::Ungated => None,
+            Self::LegacySnapshot { candidate, .. } | Self::Judged { candidate, .. } => candidate,
+        }
+    }
+
+    /// Metric string recorded by the gate, if any.
+    #[must_use]
+    pub const fn metric(self) -> Option<&'a str> {
+        match self {
+            Self::Ungated => None,
+            Self::LegacySnapshot { metric, .. } | Self::Judged { metric, .. } => metric,
+        }
+    }
+}
+
+/// Consolidated closed-set view over a [`TaskEpisode`]'s 19 coupled `Option`
+/// fields; its 4 independent optional scalars (`created_by`, `engine`,
+/// `model_label`, `review_note`) have no cross-field coupling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskEpisodeView<'a> {
+    /// Preceding task lineage (`reissue_of`, `reassign_of`, `continues`).
+    pub predecessor: Option<EpisodePredecessor>,
+    /// Objective index and optional scenario (`objective`, `scenario`).
+    pub objective: Option<EpisodeObjective<'a>>,
+    /// Preset routing attribution (`preset_id`, `first_preset_id`, `reroutes`).
+    pub routing: EpisodeRouting<'a>,
+    /// Lifecycle state, outcome, closure sequence/time, and terminal attribution.
+    pub lifecycle: EpisodeLifecycle<'a>,
+    /// Delivery status, command ID, and timestamp.
+    pub delivery: EpisodeDelivery,
+    /// Report submission text, commit SHA, and count.
+    pub report: EpisodeReport<'a>,
+    /// Gate evaluation checkpoints, verdict, and artifacts.
+    pub gate: EpisodeGate<'a>,
+}
+
 /// Deterministic projection of a single task's lifecycle from `control.recorded`.
+///
+/// External JSON wire serialization and SQL-parity scalar fields remain flat on
+/// the struct so UI, CLI, and store readers stay byte-identical; use
+/// [`Self::view`] (or its constituent view methods) to read the 19 coupled
+/// `Option` fields through closed-set ADTs. The remaining four optional scalars
+/// (`created_by`, `engine`, `model_label`, `review_note`) vary independently.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskEpisode {
     /// Task identifier.
@@ -3531,8 +4016,317 @@ pub struct TaskEpisode {
 
 impl TaskEpisode {
     /// Alias for [`Self::rework`] matching SQL `mission_tasks.revisions`.
+    #[must_use]
     pub const fn revisions(&self) -> u32 {
         self.rework
+    }
+
+    /// Read the episode's mutually exclusive predecessor lineage.
+    pub fn predecessor(&self) -> Result<Option<EpisodePredecessor>, ControlRecordError> {
+        let named = [
+            (
+                "reissue_of",
+                self.reissue_of.map(|of| EpisodePredecessor::Reissue { of }),
+            ),
+            (
+                "reassign_of",
+                self.reassign_of
+                    .map(|of| EpisodePredecessor::Reassign { of }),
+            ),
+            (
+                "continues",
+                self.continues
+                    .map(|of| EpisodePredecessor::Continuation { of }),
+            ),
+        ];
+        let mut set = named
+            .iter()
+            .filter_map(|(field, pred)| pred.map(|p| (field, p)));
+        match (set.next(), set.next()) {
+            (None, _) => Ok(None),
+            (Some((_, pred)), None) => Ok(Some(pred)),
+            (Some((first, _)), Some((second, _))) => Err(invariant_err(
+                EPISODE_KIND,
+                format!("`{first}` and `{second}` name two predecessors"),
+            )),
+        }
+    }
+
+    /// Read the episode's targeted objective and optional scenario.
+    pub fn objective_target(&self) -> Result<Option<EpisodeObjective<'_>>, ControlRecordError> {
+        match (self.objective, self.scenario.as_deref()) {
+            (Some(index), scenario) => Ok(Some(EpisodeObjective { index, scenario })),
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(invariant_err(
+                EPISODE_KIND,
+                "`scenario` without `objective`",
+            )),
+        }
+    }
+
+    /// Read the episode's grading preset routing attribution.
+    pub fn routing(&self) -> Result<EpisodeRouting<'_>, ControlRecordError> {
+        match (
+            self.preset_id.as_deref(),
+            self.first_preset_id.as_deref(),
+            self.reroutes,
+        ) {
+            (None, None, 0) => Ok(EpisodeRouting::Unrouted),
+            (None, None, 1..) => Err(invariant_err(
+                EPISODE_KIND,
+                "`reroutes` without a routed `preset_id`",
+            )),
+            (Some(current), Some(first), reroutes) => Ok(EpisodeRouting::Routed {
+                current,
+                first,
+                reroutes,
+            }),
+            (Some(_), None, _) => Err(invariant_err(
+                EPISODE_KIND,
+                "`preset_id` without `first_preset_id`",
+            )),
+            (None, Some(_), _) => Err(invariant_err(
+                EPISODE_KIND,
+                "`first_preset_id` without `preset_id`",
+            )),
+        }
+    }
+
+    /// Read the episode's closed-set lifecycle state and terminal attribution.
+    pub fn lifecycle(&self) -> Result<EpisodeLifecycle<'_>, ControlRecordError> {
+        if self.outcome == EpisodeOutcome::InFlight {
+            let Some(in_flight) = InFlightState::from_task_state(self.state) else {
+                return Err(invariant_err(
+                    EPISODE_KIND,
+                    format!(
+                        "in-flight outcome cannot carry terminal state `{}`",
+                        self.state.as_str()
+                    ),
+                ));
+            };
+            if self.closed_seq.is_some() || self.closed_at_ms.is_some() {
+                return Err(invariant_err(
+                    EPISODE_KIND,
+                    "in-flight episode cannot carry `closed_seq` or `closed_at_ms`",
+                ));
+            }
+            if self.terminal_by.is_some() || self.terminal_reason.is_some() {
+                return Err(invariant_err(
+                    EPISODE_KIND,
+                    "in-flight episode cannot carry `terminal_by` or `terminal_reason`",
+                ));
+            }
+            return Ok(EpisodeLifecycle::InFlight(in_flight));
+        }
+
+        let closed_at = match (self.closed_seq, self.closed_at_ms) {
+            (Some(seq), Some(at_ms)) => EpisodeClosedAt { seq, at_ms },
+            (Some(_), None) => {
+                return Err(invariant_err(
+                    EPISODE_KIND,
+                    "`closed_seq` without `closed_at_ms`",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(invariant_err(
+                    EPISODE_KIND,
+                    "`closed_at_ms` without `closed_seq`",
+                ));
+            }
+            (None, None) => {
+                return Err(invariant_err(
+                    EPISODE_KIND,
+                    format!(
+                        "closed outcome `{:?}` requires `closed_seq` and `closed_at_ms`",
+                        self.outcome
+                    ),
+                ));
+            }
+        };
+
+        let closure = self.closure()?;
+        Ok(EpisodeLifecycle::Closed { closed_at, closure })
+    }
+
+    fn closure(&self) -> Result<EpisodeClosure<'_>, ControlRecordError> {
+        let by = self.terminal_by.as_deref();
+        let reason = self.terminal_reason.as_deref();
+        match (self.outcome, self.state) {
+            (EpisodeOutcome::Landed, TaskState::Landed) => {
+                if by.is_some() || reason.is_some() {
+                    return Err(invariant_err(
+                        EPISODE_KIND,
+                        "`landed` episode cannot carry `terminal_by` or `terminal_reason`",
+                    ));
+                }
+                Ok(EpisodeClosure::Landed)
+            }
+            (EpisodeOutcome::Accepted, TaskState::Accepted) => {
+                if by.is_some() || reason.is_some() {
+                    return Err(invariant_err(
+                        EPISODE_KIND,
+                        "`accepted` episode cannot carry `terminal_by` or `terminal_reason`",
+                    ));
+                }
+                Ok(EpisodeClosure::Accepted)
+            }
+            (EpisodeOutcome::Rejected, TaskState::Cancelled) => {
+                Ok(EpisodeClosure::Rejected { by, reason })
+            }
+            (EpisodeOutcome::Aborted, TaskState::Cancelled) => {
+                if by.is_some() {
+                    return Err(invariant_err(
+                        EPISODE_KIND,
+                        "`aborted` episode cannot carry `terminal_by`",
+                    ));
+                }
+                Ok(EpisodeClosure::Aborted { reason })
+            }
+            (EpisodeOutcome::OverBudget, TaskState::Cancelled) => {
+                if by.is_some() {
+                    return Err(invariant_err(
+                        EPISODE_KIND,
+                        "`over_budget` episode cannot carry `terminal_by`",
+                    ));
+                }
+                let Some(reason) = reason else {
+                    return Err(invariant_err(
+                        EPISODE_KIND,
+                        "`over_budget` episode requires `terminal_reason`",
+                    ));
+                };
+                Ok(EpisodeClosure::OverBudget { reason })
+            }
+            (EpisodeOutcome::Cancelled, TaskState::Cancelled) => {
+                Ok(EpisodeClosure::Cancelled { by, reason })
+            }
+            _ => Err(invariant_err(
+                EPISODE_KIND,
+                format!(
+                    "outcome `{:?}` disagrees with state `{}`",
+                    self.outcome,
+                    self.state.as_str()
+                ),
+            )),
+        }
+    }
+
+    /// Read the episode's delivery state.
+    pub fn delivery(&self) -> Result<EpisodeDelivery, ControlRecordError> {
+        match (self.deliveries, self.last_command_id, self.delivered_at_ms) {
+            (0, None, None) => Ok(EpisodeDelivery::Pending),
+            (0, Some(command_id), None) => Ok(EpisodeDelivery::LegacyCommandOnly { command_id }),
+            (0, _, Some(_)) => Err(invariant_err(
+                EPISODE_KIND,
+                "`delivered_at_ms` with zero `deliveries`",
+            )),
+            (1.., _, None) => Err(invariant_err(
+                EPISODE_KIND,
+                "`deliveries` without `delivered_at_ms`",
+            )),
+            (count @ 1.., None, Some(_))
+                if count > 1
+                    || self
+                        .stages
+                        .iter()
+                        .any(|s| s.kind == ControlRecordKind::TaskDelivered) =>
+            {
+                Err(invariant_err(
+                    EPISODE_KIND,
+                    "`task.delivered` without `last_command_id`",
+                ))
+            }
+            (count @ 1.., command_id, Some(at_ms)) => Ok(EpisodeDelivery::Delivered {
+                command_id,
+                at_ms,
+                count,
+            }),
+        }
+    }
+
+    /// Read the episode's completion report submission state.
+    pub fn report(&self) -> Result<EpisodeReport<'_>, ControlRecordError> {
+        match (
+            self.reports,
+            self.last_report.as_deref(),
+            self.last_report_commit.as_deref(),
+        ) {
+            (0, None, None) => Ok(EpisodeReport::None),
+            (0, Some(_), _) => Err(invariant_err(
+                EPISODE_KIND,
+                "`last_report` with zero `reports`",
+            )),
+            (0, None, Some(_)) => Err(invariant_err(
+                EPISODE_KIND,
+                "`last_report_commit` without `last_report`",
+            )),
+            (count @ 1.., Some(text), commit) => Ok(EpisodeReport::Submitted {
+                text,
+                commit,
+                count,
+            }),
+            (1.., None, _) => Err(invariant_err(
+                EPISODE_KIND,
+                "`reports` without `last_report`",
+            )),
+        }
+    }
+
+    /// Read the episode's gate verdict and artifact state.
+    pub fn gate(&self) -> Result<EpisodeGate<'_>, ControlRecordError> {
+        let base = self.base.as_deref();
+        let candidate = self.candidate.as_deref();
+        let metric = self.metric.as_deref();
+        match (self.gate_verdicts.last(), self.last_gate_verdict) {
+            (None, Some(_)) => Err(invariant_err(
+                EPISODE_KIND,
+                "`last_gate_verdict` without `gate_verdicts`",
+            )),
+            (Some(_), None) => Err(invariant_err(
+                EPISODE_KIND,
+                "`gate_verdicts` without `last_gate_verdict`",
+            )),
+            (Some(last), Some(verdict)) if last.verdict != verdict => Err(invariant_err(
+                EPISODE_KIND,
+                format!(
+                    "`last_gate_verdict` (`{}`) disagrees with last gate checkpoint (`{}`)",
+                    verdict.as_str(),
+                    last.verdict.as_str()
+                ),
+            )),
+            (Some(last), Some(_)) => Ok(EpisodeGate::Judged {
+                last,
+                base,
+                candidate,
+                metric,
+                count: self.gate_verdicts.len(),
+            }),
+            (None, None) => {
+                if base.is_none() && candidate.is_none() && metric.is_none() {
+                    Ok(EpisodeGate::Ungated)
+                } else {
+                    Ok(EpisodeGate::LegacySnapshot {
+                        base,
+                        candidate,
+                        metric,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Validate and read all coupled optional groups of the episode as one
+    /// closed-set [`TaskEpisodeView`].
+    pub fn view(&self) -> Result<TaskEpisodeView<'_>, ControlRecordError> {
+        Ok(TaskEpisodeView {
+            predecessor: self.predecessor()?,
+            objective: self.objective_target()?,
+            routing: self.routing()?,
+            lifecycle: self.lifecycle()?,
+            delivery: self.delivery()?,
+            report: self.report()?,
+            gate: self.gate()?,
+        })
     }
 }
 
@@ -3661,11 +4455,15 @@ impl ReplayState {
             let resident = self.residents.get(&ep.agent_id).copied();
             if !task_may_continue(ep.state, meta_copy, resident) && ep.state != TaskState::Cancelled
             {
-                ep.state = TaskState::Cancelled;
-                ep.outcome = EpisodeOutcome::Cancelled;
-                ep.updated_at_ms = at_ms;
-                ep.closed_seq.get_or_insert(seq);
-                ep.closed_at_ms.get_or_insert(at_ms);
+                close_episode(
+                    ep,
+                    seq,
+                    at_ms,
+                    EpisodeClosure::Cancelled {
+                        by: None,
+                        reason: None,
+                    },
+                );
             }
         }
     }
@@ -3686,11 +4484,15 @@ impl ReplayState {
             if !task_may_continue(ep.state, meta, Some(ResidentTrackState::Retired))
                 && ep.state != TaskState::Cancelled
             {
-                ep.state = TaskState::Cancelled;
-                ep.outcome = EpisodeOutcome::Cancelled;
-                ep.updated_at_ms = at_ms;
-                ep.closed_seq.get_or_insert(seq);
-                ep.closed_at_ms.get_or_insert(at_ms);
+                close_episode(
+                    ep,
+                    seq,
+                    at_ms,
+                    EpisodeClosure::Cancelled {
+                        by: None,
+                        reason: None,
+                    },
+                );
             }
         }
     }
@@ -3811,12 +4613,11 @@ impl ReplayState {
         });
         ep.updated_at_ms = at_ms;
         if r.accepted {
-            ep.state = TaskState::Accepted;
             let gated = self.missions.get(&ep.mission_id).is_some_and(|m| m.gated);
-            if !gated {
-                ep.outcome = EpisodeOutcome::Accepted;
-                ep.closed_seq.get_or_insert(seq);
-                ep.closed_at_ms.get_or_insert(at_ms);
+            if gated {
+                ep.state = TaskState::Accepted;
+            } else {
+                close_episode(ep, seq, at_ms, EpisodeClosure::Accepted);
             }
         } else {
             ep.state = TaskState::Revise;
@@ -3910,11 +4711,7 @@ impl ReplayState {
 
     fn on_task_landed(&mut self, seq: i64, at_ms: i64, task_id: i64) {
         if let Some(ep) = self.episodes.get_mut(&task_id) {
-            ep.state = TaskState::Landed;
-            ep.outcome = EpisodeOutcome::Landed;
-            ep.updated_at_ms = at_ms;
-            ep.closed_seq.get_or_insert(seq);
-            ep.closed_at_ms.get_or_insert(at_ms);
+            close_episode(ep, seq, at_ms, EpisodeClosure::Landed);
             ep.stages.push(EpisodeStage {
                 event_seq: seq,
                 at_ms,
@@ -3925,13 +4722,15 @@ impl ReplayState {
 
     fn on_task_aborted(&mut self, seq: i64, at_ms: i64, r: &TaskAbortedRecord) {
         if let Some(ep) = self.episodes.get_mut(&r.id) {
-            ep.state = TaskState::Cancelled;
-            ep.outcome = EpisodeOutcome::Aborted;
             ep.review_note.clone_from(&r.reason);
-            ep.terminal_reason.clone_from(&r.reason);
-            ep.updated_at_ms = at_ms;
-            ep.closed_seq.get_or_insert(seq);
-            ep.closed_at_ms.get_or_insert(at_ms);
+            close_episode(
+                ep,
+                seq,
+                at_ms,
+                EpisodeClosure::Aborted {
+                    reason: r.reason.as_deref(),
+                },
+            );
             ep.stages.push(EpisodeStage {
                 event_seq: seq,
                 at_ms,
@@ -3942,13 +4741,13 @@ impl ReplayState {
 
     fn on_task_over_budget(&mut self, seq: i64, at_ms: i64, r: &TaskOverBudgetRecord) {
         if let Some(ep) = self.episodes.get_mut(&r.id) {
-            ep.state = TaskState::Cancelled;
-            ep.outcome = EpisodeOutcome::OverBudget;
             ep.review_note = Some(r.reason.clone());
-            ep.terminal_reason = Some(r.reason.clone());
-            ep.updated_at_ms = at_ms;
-            ep.closed_seq.get_or_insert(seq);
-            ep.closed_at_ms.get_or_insert(at_ms);
+            close_episode(
+                ep,
+                seq,
+                at_ms,
+                EpisodeClosure::OverBudget { reason: &r.reason },
+            );
             ep.stages.push(EpisodeStage {
                 event_seq: seq,
                 at_ms,
@@ -3959,21 +4758,18 @@ impl ReplayState {
 
     fn on_task_cancelled(&mut self, seq: i64, at_ms: i64, r: &TaskCancelledRecord) {
         if let Some(ep) = self.episodes.get_mut(&r.id) {
-            ep.state = TaskState::Cancelled;
-            ep.outcome = if r.yielded == Some(true) {
-                EpisodeOutcome::Rejected
+            let closure = if r.yielded == Some(true) {
+                EpisodeClosure::Rejected {
+                    by: r.by.as_deref(),
+                    reason: r.reason.as_deref(),
+                }
             } else {
-                EpisodeOutcome::Cancelled
+                EpisodeClosure::Cancelled {
+                    by: r.by.as_deref(),
+                    reason: r.reason.as_deref(),
+                }
             };
-            if ep.terminal_by.is_none() {
-                ep.terminal_by.clone_from(&r.by);
-            }
-            if ep.terminal_reason.is_none() {
-                ep.terminal_reason.clone_from(&r.reason);
-            }
-            ep.updated_at_ms = at_ms;
-            ep.closed_seq.get_or_insert(seq);
-            ep.closed_at_ms.get_or_insert(at_ms);
+            close_episode(ep, seq, at_ms, closure);
             ep.stages.push(EpisodeStage {
                 event_seq: seq,
                 at_ms,
@@ -4043,21 +4839,34 @@ impl ReplayState {
             TaskState::Accepted if !gated => EpisodeOutcome::Accepted,
             _ => EpisodeOutcome::InFlight,
         };
-        let preset_id = legacy_opt_str(row, "preset_id");
-        let first_preset_id = legacy_opt_str(row, "first_preset_id").or_else(|| preset_id.clone());
-        let ep = build_legacy_episode(
-            seq,
-            at_ms,
-            id,
-            mission_id,
-            state,
-            outcome,
-            preset_id,
-            first_preset_id,
-            row,
-        );
+        let ep = build_legacy_episode(seq, at_ms, id, mission_id, state, outcome, row);
         self.episodes.insert(id, ep);
     }
+}
+
+fn close_episode(ep: &mut TaskEpisode, seq: i64, at_ms: i64, closure: EpisodeClosure<'_>) {
+    ep.state = closure.task_state();
+    ep.outcome = closure.outcome();
+    match closure {
+        EpisodeClosure::Landed | EpisodeClosure::Accepted => {}
+        EpisodeClosure::Rejected { by, reason } | EpisodeClosure::Cancelled { by, reason } => {
+            if ep.terminal_by.is_none() {
+                ep.terminal_by = by.map(str::to_string);
+            }
+            if ep.terminal_reason.is_none() {
+                ep.terminal_reason = reason.map(str::to_string);
+            }
+        }
+        EpisodeClosure::Aborted { reason } => {
+            ep.terminal_reason = reason.map(str::to_string);
+        }
+        EpisodeClosure::OverBudget { reason } => {
+            ep.terminal_reason = Some(reason.to_string());
+        }
+    }
+    ep.updated_at_ms = at_ms;
+    ep.closed_seq.get_or_insert(seq);
+    ep.closed_at_ms.get_or_insert(at_ms);
 }
 
 fn legacy_opt_str(row: &Value, key: &str) -> Option<String> {
@@ -4070,7 +4879,6 @@ fn legacy_opt_u32(row: &Value, key: &str) -> Option<u32> {
         .and_then(|n| u32::try_from(n).ok())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_legacy_episode(
     seq: i64,
     at_ms: i64,
@@ -4078,8 +4886,6 @@ fn build_legacy_episode(
     mission_id: i64,
     state: TaskState,
     outcome: EpisodeOutcome,
-    preset_id: Option<String>,
-    first_preset_id: Option<String>,
     row: &Value,
 ) -> TaskEpisode {
     let kind = match row.get("kind").and_then(Value::as_str) {
@@ -4091,10 +4897,18 @@ fn build_legacy_episode(
         .and_then(Value::as_i64)
         .and_then(GradeWire::from_rank)
         .unwrap_or(GradeWire::L2);
+    let preset_id = legacy_opt_str(row, "preset_id");
+    let first_preset_id = legacy_opt_str(row, "first_preset_id").or_else(|| preset_id.clone());
     let updated_at_ms = row
         .get("updated_at_ms")
         .and_then(Value::as_i64)
         .unwrap_or(at_ms);
+    let delivered_at_ms = row.get("delivered_at_ms").and_then(Value::as_i64);
+    let last_report = legacy_opt_str(row, "report");
+    let closed_at = (outcome != EpisodeOutcome::InFlight).then_some(EpisodeClosedAt {
+        seq,
+        at_ms: updated_at_ms,
+    });
     TaskEpisode {
         task_id: id,
         mission_id,
@@ -4125,10 +4939,10 @@ fn build_legacy_episode(
         reroutes: 0,
         restarts: 0,
         steals: 0,
-        deliveries: u32::from(row.get("delivered_at_ms").is_some_and(|v| !v.is_null())),
-        reports: u32::from(row.get("report").is_some_and(|v| !v.is_null())),
+        deliveries: u32::from(delivered_at_ms.is_some()),
+        reports: u32::from(last_report.is_some()),
         last_command_id: row.get("command_id").and_then(Value::as_i64),
-        last_report: legacy_opt_str(row, "report"),
+        last_report,
         last_report_commit: None,
         review_note: legacy_opt_str(row, "review_note"),
         base: legacy_opt_str(row, "base"),
@@ -4144,9 +4958,9 @@ fn build_legacy_episode(
             .get("created_at_ms")
             .and_then(Value::as_i64)
             .unwrap_or(at_ms),
-        delivered_at_ms: row.get("delivered_at_ms").and_then(Value::as_i64),
-        closed_seq: (outcome != EpisodeOutcome::InFlight).then_some(seq),
-        closed_at_ms: (outcome != EpisodeOutcome::InFlight).then_some(updated_at_ms),
+        delivered_at_ms,
+        closed_seq: closed_at.map(|c| c.seq),
+        closed_at_ms: closed_at.map(|c| c.at_ms),
         updated_at_ms,
         stages: Vec::new(),
     }
@@ -4234,9 +5048,11 @@ mod tests {
 
     use super::{
         ControlRecord, ControlRecordError, ControlRecordKind, ControllersDrillOutcome,
-        DrillOutcome, EpisodeOutcome, GateOutcome, GateVerdict, GateVerdictClass, GradeWire,
-        GradingRecord, GradingRecordKind, HostRetry, TaskGatedRecord, TaskOrigin, invariant_err,
-        replay_task_episodes,
+        DrillOutcome, EPISODE_KIND, EpisodeClosedAt, EpisodeClosure, EpisodeDelivery, EpisodeGate,
+        EpisodeLifecycle, EpisodeObjective, EpisodeOutcome, EpisodePredecessor, EpisodeReport,
+        EpisodeRouting, EpisodeStage, GateOutcome, GateSyncPoint, GateVerdict, GateVerdictClass,
+        GradeWire, GradingRecord, GradingRecordKind, HostRetry, InFlightState, TaskEpisode,
+        TaskGatedRecord, TaskKind, TaskOrigin, invariant_err, replay_task_episodes,
     };
     use crate::mission::TaskState;
 
@@ -5279,5 +6095,734 @@ mod tests {
                 assert_eq!(assigned.origin(), Err(invariant_err("task.assigned", says)));
             }
         }
+    }
+
+    fn base_episode() -> TaskEpisode {
+        TaskEpisode {
+            task_id: 1,
+            mission_id: 1,
+            kind: TaskKind::Ephemeral,
+            agent_id: "agent_a".to_string(),
+            session_id: "session_a".to_string(),
+            brief: "task brief".to_string(),
+            created_by: None,
+            objective: None,
+            scenario: None,
+            model: "default".to_string(),
+            difficulty: GradeWire::L2,
+            preset_id: None,
+            first_preset_id: None,
+            engine: None,
+            model_label: None,
+            pinned: false,
+            reissue_of: None,
+            continues: None,
+            reassign_of: None,
+            state: TaskState::Assigned,
+            outcome: EpisodeOutcome::InFlight,
+            rework: 0,
+            quality_rejections: 0,
+            reroutes: 0,
+            restarts: 0,
+            steals: 0,
+            deliveries: 0,
+            reports: 0,
+            last_command_id: None,
+            last_report: None,
+            last_report_commit: None,
+            review_note: None,
+            base: None,
+            candidate: None,
+            metric: None,
+            last_gate_verdict: None,
+            review_sync_points: Vec::new(),
+            gate_verdicts: Vec::new(),
+            terminal_by: None,
+            terminal_reason: None,
+            assigned_seq: 1,
+            assigned_at_ms: 100,
+            delivered_at_ms: None,
+            closed_seq: None,
+            closed_at_ms: None,
+            updated_at_ms: 100,
+            stages: vec![EpisodeStage {
+                event_seq: 1,
+                at_ms: 100,
+                kind: ControlRecordKind::TaskAssigned,
+            }],
+        }
+    }
+
+    fn assert_episode_err<T: std::fmt::Debug>(
+        result: Result<T, ControlRecordError>,
+        snippet: &str,
+    ) {
+        let err = result.expect_err(snippet);
+        assert_eq!(
+            err,
+            invariant_err(
+                EPISODE_KIND,
+                match &err {
+                    ControlRecordError::Invariant { message, .. } => message.clone(),
+                    other => panic!("expected Invariant error, got {other:?}"),
+                }
+            )
+        );
+        assert!(err.to_string().contains(snippet), "{err} ~ {snippet}");
+    }
+
+    fn replay_sample_stream() -> Vec<(i64, i64, ControlRecord)> {
+        parse_stream(&[
+            (
+                1,
+                100,
+                json!({"type": "mission.added", "id": 1, "text": "m", "sources": []}),
+            ),
+            (
+                2,
+                110,
+                json!({"type": "task.assigned", "id": 10, "mission_id": 1, "kind": "ephemeral",
+                       "agent_id": "agent_a", "session_id": "session_a", "brief": "review task",
+                       "created_by": "human", "objective": 3, "scenario": "/s.sh",
+                       "preset_id": "cheap-l1"}),
+            ),
+            (
+                3,
+                120,
+                json!({"type": "task.delivered", "id": 10, "command_id": 1}),
+            ),
+            (
+                4,
+                130,
+                json!({"type": "task.reported", "id": 10, "report": "v0", "commit": "sha0"}),
+            ),
+            (
+                5,
+                140,
+                json!({"type": "task.reviewed", "id": 10, "accepted": false, "note": "fix"}),
+            ),
+            (
+                6,
+                145,
+                json!({"type": "task.rerouted", "id": 10, "preset_id": "neon-l2", "model": "default"}),
+            ),
+            (
+                7,
+                150,
+                json!({"type": "task.delivered", "id": 10, "command_id": 2}),
+            ),
+            (
+                8,
+                160,
+                json!({"type": "task.restarted", "task": 10, "session_id": "session_a", "agent_id": "agent_a"}),
+            ),
+            (
+                9,
+                170,
+                json!({"type": "task.reported", "id": 10, "report": "v1", "commit": "sha1"}),
+            ),
+            (
+                10,
+                180,
+                json!({"type": "task.reviewed", "id": 10, "accepted": true, "note": ""}),
+            ),
+            (
+                11,
+                190,
+                json!({"type": "task.assigned", "id": 11, "mission_id": 1, "kind": "ephemeral",
+                       "agent_id": "agent_b", "session_id": "session_b", "brief": "reissued",
+                       "reissue_of": 10}),
+            ),
+            (
+                12,
+                200,
+                json!({"type": "task.aborted", "id": 11, "reason": "gate timeout"}),
+            ),
+            (
+                13,
+                210,
+                json!({"type": "task.assigned", "id": 12, "mission_id": 1, "kind": "ephemeral",
+                       "agent_id": "agent_c", "session_id": "session_c", "brief": "reassigned",
+                       "reassign_of": 11}),
+            ),
+            (
+                14,
+                220,
+                json!({"type": "task.assigned", "id": 13, "mission_id": 1, "kind": "ephemeral",
+                       "agent_id": "agent_d", "session_id": "session_d", "brief": "over"}),
+            ),
+            (
+                15,
+                230,
+                json!({"type": "task.over_budget", "id": 13, "reason": "tool_calls"}),
+            ),
+            (
+                16,
+                240,
+                json!({"type": "task.assigned", "id": 14, "mission_id": 1, "kind": "ephemeral",
+                       "agent_id": "agent_e", "session_id": "session_e", "brief": "cont",
+                       "continues": 13, "objective": 4}),
+            ),
+            (
+                17,
+                250,
+                json!({"type": "task.cancelled", "id": 14, "by": "spawn-integrate", "yielded": true, "reason": "exhausted"}),
+            ),
+        ])
+    }
+
+    fn assert_episode_wire_round_trip(ep: &TaskEpisode) {
+        let value = serde_json::to_value(ep).expect("to_value");
+        let text = serde_json::to_string(ep).expect("to_string");
+        let obj = value.as_object().expect("json object");
+        assert_eq!(obj.len(), 47, "exact 47-key TaskEpisode wire contract");
+        let back: TaskEpisode = serde_json::from_str(&text).expect("round-trip");
+        assert_eq!(&back, ep);
+    }
+
+    #[test]
+    fn replayed_episodes_read_through_closed_views_and_wire_round_trip() {
+        let episodes = replay_task_episodes(&replay_sample_stream());
+        assert_eq!(episodes.len(), 5);
+        let v10 = episodes[0].view().expect("ep10 view");
+        assert_eq!(episodes[0].revisions(), 1);
+        assert_eq!(v10.predecessor, None);
+        assert_eq!(
+            v10.objective,
+            Some(EpisodeObjective {
+                index: 3,
+                scenario: Some("/s.sh")
+            })
+        );
+        assert_eq!(
+            v10.routing,
+            EpisodeRouting::Routed {
+                current: "neon-l2",
+                first: "cheap-l1",
+                reroutes: 1
+            }
+        );
+        assert!(v10.lifecycle.is_closed());
+        assert_eq!(
+            v10.delivery,
+            EpisodeDelivery::Delivered {
+                command_id: Some(2),
+                at_ms: 150,
+                count: 2
+            }
+        );
+        assert_eq!(
+            v10.report,
+            EpisodeReport::Submitted {
+                text: "v1",
+                commit: Some("sha1"),
+                count: 2
+            }
+        );
+        assert_eq!(v10.gate, EpisodeGate::Ungated);
+
+        let v11 = episodes[1].view().expect("ep11 view");
+        assert_eq!(
+            v11.predecessor,
+            Some(EpisodePredecessor::Reissue { of: 10 })
+        );
+        assert!(matches!(
+            v11.lifecycle,
+            EpisodeLifecycle::Closed {
+                closure: EpisodeClosure::Aborted {
+                    reason: Some("gate timeout")
+                },
+                ..
+            }
+        ));
+
+        let v12 = episodes[2].view().expect("ep12 view");
+        assert_eq!(
+            v12.predecessor,
+            Some(EpisodePredecessor::Reassign { of: 11 })
+        );
+        assert_eq!(
+            v12.lifecycle,
+            EpisodeLifecycle::InFlight(InFlightState::Assigned)
+        );
+        assert_eq!(v12.delivery, EpisodeDelivery::Pending);
+        assert_eq!(v12.report, EpisodeReport::None);
+
+        let v14 = episodes[4].view().expect("ep14 view");
+        assert_eq!(
+            v14.predecessor,
+            Some(EpisodePredecessor::Continuation { of: 13 })
+        );
+        assert_eq!(
+            v14.lifecycle.closed_at(),
+            Some(EpisodeClosedAt {
+                seq: 17,
+                at_ms: 250
+            })
+        );
+
+        let gated = replay_task_episodes(&gated_mission_stream());
+        let vg = gated[0].view().expect("gated view");
+        assert_eq!(vg.gate.last_verdict(), Some(GateVerdict::Accepted));
+        assert_eq!(vg.gate.base(), Some("b0"));
+        assert_eq!(vg.gate.candidate(), Some("c2"));
+        assert_eq!(vg.gate.metric(), None);
+        assert!(matches!(vg.gate, EpisodeGate::Judged { count: 4, .. }));
+
+        for ep in episodes.iter().chain(gated.iter()) {
+            assert_episode_wire_round_trip(ep);
+        }
+    }
+
+    fn legacy_sample_stream() -> Vec<(i64, i64, ControlRecord)> {
+        parse_stream(&[
+            (
+                1,
+                10,
+                json!({"type": "legacy.imported", "table": "mission_missions",
+                       "row": {"id": 1, "state": "active", "accept": "review", "gate": null}}),
+            ),
+            (
+                2,
+                11,
+                json!({"type": "legacy.imported", "table": "mission_missions",
+                       "row": {"id": 2, "state": "active", "accept": "gate", "gate": "/g"}}),
+            ),
+            (
+                3,
+                20,
+                json!({"type": "legacy.imported", "table": "mission_tasks",
+                       "row": {"id": 100, "mission_id": 1, "state": "delivered",
+                               "command_id": 42, "created_at_ms": 15, "updated_at_ms": 18}}),
+            ),
+            (
+                4,
+                30,
+                json!({"type": "legacy.imported", "table": "mission_tasks",
+                       "row": {"id": 101, "mission_id": 1, "state": "landed",
+                               "delivered_at_ms": 150, "report": "big",
+                               "base": "b0", "candidate": "c0", "metric": "5/5",
+                               "preset_id": "mid", "created_at_ms": 100, "updated_at_ms": 200}}),
+            ),
+            (
+                5,
+                40,
+                json!({"type": "legacy.imported", "table": "mission_tasks",
+                       "row": {"id": 102, "mission_id": 1, "state": "accepted",
+                               "preset_id": "mid", "first_preset_id": "small",
+                               "created_at_ms": 100, "updated_at_ms": 210}}),
+            ),
+            (
+                6,
+                50,
+                json!({"type": "legacy.imported", "table": "mission_tasks",
+                       "row": {"id": 103, "mission_id": 2, "state": "accepted",
+                               "created_at_ms": 100, "updated_at_ms": 220}}),
+            ),
+            (
+                7,
+                60,
+                json!({"type": "task.reviewed", "id": 103, "accepted": true, "note": ""}),
+            ),
+        ])
+    }
+
+    #[test]
+    fn legacy_imported_episodes_read_through_closed_views() {
+        let episodes = replay_task_episodes(&legacy_sample_stream());
+        assert_eq!(episodes.len(), 4);
+
+        let v100 = episodes[0].view().expect("legacy cmd-only");
+        assert_eq!(
+            v100.delivery,
+            EpisodeDelivery::LegacyCommandOnly { command_id: 42 }
+        );
+        assert_eq!(v100.delivery.command_id(), Some(42));
+        assert_eq!(v100.delivery.delivered_at_ms(), None);
+        assert_eq!(v100.delivery.count(), 0);
+        assert_eq!(
+            v100.lifecycle,
+            EpisodeLifecycle::InFlight(InFlightState::Delivered)
+        );
+
+        let v101 = episodes[1].view().expect("legacy scorecard-shaped landed");
+        assert_eq!(
+            v101.delivery,
+            EpisodeDelivery::Delivered {
+                command_id: None,
+                at_ms: 150,
+                count: 1
+            }
+        );
+        assert_eq!(v101.delivery.command_id(), None);
+        assert_eq!(v101.delivery.delivered_at_ms(), Some(150));
+        assert_eq!(
+            v101.gate,
+            EpisodeGate::LegacySnapshot {
+                base: Some("b0"),
+                candidate: Some("c0"),
+                metric: Some("5/5")
+            }
+        );
+        assert_eq!(
+            v101.routing,
+            EpisodeRouting::Routed {
+                current: "mid",
+                first: "mid",
+                reroutes: 0
+            }
+        );
+
+        let v102 = episodes[2].view().expect("legacy ungated accepted");
+        assert_eq!(v102.routing.first(), Some("small"));
+        assert!(matches!(
+            v102.lifecycle,
+            EpisodeLifecycle::Closed {
+                closure: EpisodeClosure::Accepted,
+                ..
+            }
+        ));
+        assert_eq!(
+            episodes[3].view().expect("legacy gated accepted").lifecycle,
+            EpisodeLifecycle::InFlight(InFlightState::Accepted)
+        );
+
+        let mut after_review = episodes[1].clone();
+        after_review.stages.push(EpisodeStage {
+            event_seq: 99,
+            at_ms: 300,
+            kind: ControlRecordKind::TaskReviewed,
+        });
+        assert_eq!(
+            after_review.delivery(),
+            Ok(EpisodeDelivery::Delivered {
+                command_id: None,
+                at_ms: 150,
+                count: 1
+            })
+        );
+    }
+
+    #[test]
+    fn episode_predecessor_and_objective_refuse_impossible_combinations() {
+        let none = base_episode();
+        assert_eq!(none.predecessor(), Ok(None));
+        assert_eq!(none.objective_target(), Ok(None));
+
+        let mut single = base_episode();
+        single.reissue_of = Some(5);
+        assert_eq!(
+            single.predecessor(),
+            Ok(Some(EpisodePredecessor::Reissue { of: 5 }))
+        );
+        assert_eq!(EpisodePredecessor::Reissue { of: 5 }.of(), 5);
+        single.reissue_of = None;
+        single.reassign_of = Some(6);
+        assert_eq!(
+            single.predecessor(),
+            Ok(Some(EpisodePredecessor::Reassign { of: 6 }))
+        );
+        assert_eq!(EpisodePredecessor::Reassign { of: 6 }.of(), 6);
+        single.reassign_of = None;
+        single.continues = Some(7);
+        assert_eq!(
+            single.predecessor(),
+            Ok(Some(EpisodePredecessor::Continuation { of: 7 }))
+        );
+        assert_eq!(EpisodePredecessor::Continuation { of: 7 }.of(), 7);
+
+        for (mask, first, second) in [
+            (0b011, "reissue_of", "reassign_of"),
+            (0b101, "reissue_of", "continues"),
+            (0b110, "reassign_of", "continues"),
+            (0b111, "reissue_of", "reassign_of"),
+        ] {
+            let mut bad = base_episode();
+            if mask & 0b001 != 0 {
+                bad.reissue_of = Some(1);
+            }
+            if mask & 0b010 != 0 {
+                bad.reassign_of = Some(2);
+            }
+            if mask & 0b100 != 0 {
+                bad.continues = Some(3);
+            }
+            assert_episode_err(
+                bad.predecessor(),
+                &format!("`{first}` and `{second}` name two predecessors"),
+            );
+        }
+
+        assert_eq!(EpisodePredecessor::from_task_origin(TaskOrigin::New), None);
+        assert_eq!(
+            EpisodePredecessor::from_task_origin(TaskOrigin::Duplicate { of: 4 }),
+            None
+        );
+        assert_eq!(
+            EpisodePredecessor::from_task_origin(TaskOrigin::Reissue { of: 5 }),
+            Some(EpisodePredecessor::Reissue { of: 5 })
+        );
+        assert_eq!(
+            EpisodePredecessor::from_task_origin(TaskOrigin::Reassign { of: 6 }),
+            Some(EpisodePredecessor::Reassign { of: 6 })
+        );
+        assert_eq!(
+            EpisodePredecessor::from_task_origin(TaskOrigin::Continuation { of: 7 }),
+            Some(EpisodePredecessor::Continuation { of: 7 })
+        );
+
+        let mut obj = base_episode();
+        obj.objective = Some(2);
+        assert_eq!(
+            obj.objective_target(),
+            Ok(Some(EpisodeObjective {
+                index: 2,
+                scenario: None
+            }))
+        );
+        obj.scenario = Some("/s.sh".to_string());
+        assert_eq!(
+            obj.objective_target(),
+            Ok(Some(EpisodeObjective {
+                index: 2,
+                scenario: Some("/s.sh")
+            }))
+        );
+        obj.objective = None;
+        assert_episode_err(obj.objective_target(), "`scenario` without `objective`");
+    }
+
+    fn closed_episode(outcome: EpisodeOutcome, state: TaskState) -> TaskEpisode {
+        let mut ep = base_episode();
+        ep.outcome = outcome;
+        ep.state = state;
+        ep.closed_seq = Some(2);
+        ep.closed_at_ms = Some(200);
+        ep
+    }
+
+    fn assert_in_flight_lifecycle_invariants() {
+        for state in TaskState::ALL {
+            let mut ep = base_episode();
+            ep.state = state;
+            if let Some(in_flight) = InFlightState::from_task_state(state) {
+                assert_eq!(ep.lifecycle(), Ok(EpisodeLifecycle::InFlight(in_flight)));
+                assert_eq!(EpisodeLifecycle::InFlight(in_flight).task_state(), state);
+                assert_eq!(
+                    EpisodeLifecycle::InFlight(in_flight).outcome(),
+                    EpisodeOutcome::InFlight
+                );
+                assert_eq!(EpisodeLifecycle::InFlight(in_flight).closed_at(), None);
+            } else {
+                assert_episode_err(ep.lifecycle(), "cannot carry terminal state");
+            }
+        }
+        for mutate in [
+            (|e: &mut TaskEpisode| e.closed_seq = Some(9)) as fn(&mut TaskEpisode),
+            |e| e.closed_at_ms = Some(99),
+        ] {
+            let mut ep = base_episode();
+            mutate(&mut ep);
+            assert_episode_err(
+                ep.lifecycle(),
+                "cannot carry `closed_seq` or `closed_at_ms`",
+            );
+        }
+        for mutate in [
+            (|e: &mut TaskEpisode| e.terminal_by = Some("human".to_string()))
+                as fn(&mut TaskEpisode),
+            |e| e.terminal_reason = Some("r".to_string()),
+        ] {
+            let mut ep = base_episode();
+            mutate(&mut ep);
+            assert_episode_err(
+                ep.lifecycle(),
+                "cannot carry `terminal_by` or `terminal_reason`",
+            );
+        }
+    }
+
+    #[test]
+    fn episode_lifecycle_refuses_impossible_state_outcome_and_closure_combinations() {
+        assert_in_flight_lifecycle_invariants();
+
+        let mut unclosed = base_episode();
+        unclosed.outcome = EpisodeOutcome::Landed;
+        unclosed.state = TaskState::Landed;
+        assert_episode_err(
+            unclosed.lifecycle(),
+            "requires `closed_seq` and `closed_at_ms`",
+        );
+        unclosed.closed_seq = Some(2);
+        assert_episode_err(unclosed.lifecycle(), "`closed_seq` without `closed_at_ms`");
+        unclosed.closed_seq = None;
+        unclosed.closed_at_ms = Some(200);
+        assert_episode_err(unclosed.lifecycle(), "`closed_at_ms` without `closed_seq`");
+
+        for (outcome, bad_state) in [
+            (EpisodeOutcome::Landed, TaskState::Accepted),
+            (EpisodeOutcome::Accepted, TaskState::Landed),
+            (EpisodeOutcome::Rejected, TaskState::Assigned),
+            (EpisodeOutcome::Aborted, TaskState::Landing),
+            (EpisodeOutcome::OverBudget, TaskState::Delivered),
+            (EpisodeOutcome::Cancelled, TaskState::Reported),
+        ] {
+            assert_episode_err(
+                closed_episode(outcome, bad_state).lifecycle(),
+                "disagrees with state",
+            );
+        }
+
+        for (outcome, state) in [
+            (EpisodeOutcome::Landed, TaskState::Landed),
+            (EpisodeOutcome::Accepted, TaskState::Accepted),
+        ] {
+            let mut ep = closed_episode(outcome, state);
+            ep.terminal_by = Some("human".to_string());
+            assert_episode_err(
+                ep.lifecycle(),
+                "cannot carry `terminal_by` or `terminal_reason`",
+            );
+            let mut ep = closed_episode(outcome, state);
+            ep.terminal_reason = Some("why".to_string());
+            assert_episode_err(
+                ep.lifecycle(),
+                "cannot carry `terminal_by` or `terminal_reason`",
+            );
+        }
+
+        let mut aborted_by = closed_episode(EpisodeOutcome::Aborted, TaskState::Cancelled);
+        aborted_by.terminal_by = Some("human".to_string());
+        assert_episode_err(
+            aborted_by.lifecycle(),
+            "`aborted` episode cannot carry `terminal_by`",
+        );
+
+        let over_no_reason = closed_episode(EpisodeOutcome::OverBudget, TaskState::Cancelled);
+        assert_episode_err(
+            over_no_reason.lifecycle(),
+            "`over_budget` episode requires `terminal_reason`",
+        );
+        let mut over_with_by = closed_episode(EpisodeOutcome::OverBudget, TaskState::Cancelled);
+        over_with_by.terminal_by = Some("human".to_string());
+        over_with_by.terminal_reason = Some("cap".to_string());
+        assert_episode_err(
+            over_with_by.lifecycle(),
+            "`over_budget` episode cannot carry `terminal_by`",
+        );
+
+        let closure = EpisodeClosure::OverBudget { reason: "cap" };
+        let lc = EpisodeLifecycle::Closed {
+            closed_at: EpisodeClosedAt { seq: 5, at_ms: 500 },
+            closure,
+        };
+        assert_eq!(closure.by(), None);
+        assert_eq!(closure.reason(), Some("cap"));
+        assert_eq!(lc.closed_at(), Some(EpisodeClosedAt { seq: 5, at_ms: 500 }));
+        assert_eq!(lc.outcome(), EpisodeOutcome::OverBudget);
+        assert_eq!(lc.task_state(), TaskState::Cancelled);
+    }
+
+    #[test]
+    fn episode_routing_delivery_report_and_gate_refuse_impossible_combinations() {
+        let ep = base_episode();
+        assert_eq!(ep.routing().expect("unrouted").current(), None);
+        assert_eq!(ep.routing().expect("unrouted").first(), None);
+        assert_eq!(ep.routing().expect("unrouted").reroutes(), 0);
+
+        let mut routed = base_episode();
+        routed.preset_id = Some("neon".to_string());
+        routed.first_preset_id = Some("cheap".to_string());
+        routed.reroutes = 1;
+        let rv = routed.routing().expect("routed");
+        assert_eq!(rv.current(), Some("neon"));
+        assert_eq!(rv.first(), Some("cheap"));
+        assert_eq!(rv.reroutes(), 1);
+
+        let mut bad_route = base_episode();
+        bad_route.reroutes = 1;
+        assert_episode_err(
+            bad_route.routing(),
+            "`reroutes` without a routed `preset_id`",
+        );
+        bad_route.reroutes = 0;
+        bad_route.preset_id = Some("p".to_string());
+        assert_episode_err(bad_route.routing(), "`preset_id` without `first_preset_id`");
+        bad_route.preset_id = None;
+        bad_route.first_preset_id = Some("p".to_string());
+        assert_episode_err(bad_route.routing(), "`first_preset_id` without `preset_id`");
+
+        let mut bad_del = base_episode();
+        bad_del.delivered_at_ms = Some(100);
+        assert_episode_err(
+            bad_del.delivery(),
+            "`delivered_at_ms` with zero `deliveries`",
+        );
+        bad_del.delivered_at_ms = None;
+        bad_del.deliveries = 1;
+        bad_del.last_command_id = Some(9);
+        assert_episode_err(bad_del.delivery(), "`deliveries` without `delivered_at_ms`");
+        bad_del.delivered_at_ms = Some(100);
+        bad_del.last_command_id = None;
+        bad_del.deliveries = 2;
+        assert_episode_err(
+            bad_del.delivery(),
+            "`task.delivered` without `last_command_id`",
+        );
+        bad_del.deliveries = 1;
+        bad_del.stages.push(EpisodeStage {
+            event_seq: 2,
+            at_ms: 100,
+            kind: ControlRecordKind::TaskDelivered,
+        });
+        assert_episode_err(
+            bad_del.delivery(),
+            "`task.delivered` without `last_command_id`",
+        );
+
+        let mut bad_rep = base_episode();
+        assert_eq!(bad_rep.report().expect("none").text(), None);
+        assert_eq!(bad_rep.report().expect("none").commit(), None);
+        assert_eq!(bad_rep.report().expect("none").count(), 0);
+        bad_rep.last_report = Some("hi".to_string());
+        assert_episode_err(bad_rep.report(), "`last_report` with zero `reports`");
+        bad_rep.last_report = None;
+        bad_rep.last_report_commit = Some("abc".to_string());
+        assert_episode_err(
+            bad_rep.report(),
+            "`last_report_commit` without `last_report`",
+        );
+        bad_rep.reports = 1;
+        bad_rep.last_report_commit = None;
+        assert_episode_err(bad_rep.report(), "`reports` without `last_report`");
+        bad_rep.last_report = Some("ok".to_string());
+        let rep = bad_rep.report().expect("submitted");
+        assert_eq!(rep.text(), Some("ok"));
+        assert_eq!(rep.commit(), None);
+        assert_eq!(rep.count(), 1);
+
+        let mut bad_gate = base_episode();
+        bad_gate.last_gate_verdict = Some(GateVerdict::Accepted);
+        assert_episode_err(
+            bad_gate.gate(),
+            "`last_gate_verdict` without `gate_verdicts`",
+        );
+        bad_gate.last_gate_verdict = None;
+        bad_gate.gate_verdicts.push(GateSyncPoint {
+            event_seq: 3,
+            at_ms: 120,
+            revision: 0,
+            verdict: GateVerdict::Rejected,
+            class: Some(GateVerdictClass::Code),
+            base: None,
+            candidate: None,
+            note: Some("no".to_string()),
+        });
+        assert_episode_err(
+            bad_gate.gate(),
+            "`gate_verdicts` without `last_gate_verdict`",
+        );
+        bad_gate.last_gate_verdict = Some(GateVerdict::Accepted);
+        assert_episode_err(bad_gate.gate(), "disagrees with last gate checkpoint");
     }
 }
