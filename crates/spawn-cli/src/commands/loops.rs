@@ -528,7 +528,6 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     if let Some(root) = &root {
         let settings = crate::config::WorkspaceSettings::from_env(root)?;
         eprintln!("spawn loop: {}", settings.said(root));
-        settings.servable()?;
     }
     // What only the transcript archive holds, counted beside the passes.
     cost::archive::start(root.as_deref(), &prices);

@@ -9,7 +9,7 @@
 | `spawn-core` | ADT、端口、控制流 episode 回放、分级路由、能力图纯度校验、事件归一、Bridge、Observer、内存实现、一致性套件 | 文件、网络、进程 IO；依赖驱动 |
 | `spawn-postgres` | `EventLog` 与 `CommandQueue` 实现、`schema.sql` | 编排逻辑、投影规则 |
 | `spawn-jev` | 判定 HTTP 客户端（直连或 `SPAWN_OUT_SOCK` UDS） | 持有会话状态 |
-| `spawn-host` | 嵌入式 `herdr-core`（`spawn-hc`）/ `HerdrPool` / legacy `herdr`（已移除并拒绝 `tmux`）、`herdr_witness`、`BwrapView`/`ContainerView`（`inherit_host=auto`）、`git`/`cow`/`overlay`/`d6-shadow`/`d6` 工作区与 transcript 归档适配 | 解释事件内容 |
+| `spawn-host` | 嵌入式 `herdr-core`（`spawn-hc`）/ `HerdrPool` / legacy `herdr`（已移除并拒绝 `tmux`）、`herdr_witness`、`BwrapView`/`ContainerView`（`inherit_host=auto`）、`d6` / `git` 工作区、extent 克隆与互斥拷贝（`reflink.rs`）与 transcript 归档适配 | 解释事件内容 |
 | `spawn-cas` / `spawn-kdf` / `spawn-codegraph` / `spawn-node-proto` / `spawn-node-gateway` / `ghostty-vt` / `spawn-hc` | CAS/Merkle 存储、KDF、代码图、v1 线协议与签名网关、VT 仿真、进程外 `herdr-core` 守护进程（完整 12 crate 清单见 [architecture.md](./architecture.md) §2） | 越权跨越控制核或持有主库直连（`spawn-node-gateway` 仅限受限网关角色） |
 | `spawn-cli` | 子命令、本地 IPC / 控制面服务端与配置装配 | 越过 `spawn-core` 端口边界解释内部业务规则 |
 
@@ -341,7 +341,7 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | crate | 覆盖 |
 | --- | --- |
 | `spawn-core` | ID 校验、事件往返、去重、双序号、租约过期、屏尾六态、Bridge 事件序、每 tick 新进程折叠下的 Start→Stop→Start→Lost、Observer 跨进程不重复写 |
-| `spawn-host` | git / cow / d6-shadow / d6 工作区、嵌入式 `herdr-core`（`spawn-hc`）生命周期与跨进程恢复、`herdr_witness`、`BwrapView` / `ContainerView`（`inherit_host=auto`）、transcript 归档与 `inotify` |
+| `spawn-host` | `git`（默认）/ `d6`（按需启用）工作区、嵌入式 `herdr-core`（`spawn-hc`）生命周期与跨进程恢复、`herdr_witness`、`BwrapView` / `ContainerView`（`inherit_host=auto`）、transcript 归档与 `inotify` |
 | `spawn-jev` | 请求体结构与 criteria 顺序、真实响应往返、缺失字段回退、错误降级、chunked |
 | `spawn-postgres` | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图与读方法（列集快照、投影等于日志折叠、状态、时间线分页、判定、执行时长、未闭合工具、新鲜度、祖先链、命令事件、任务）、`spawn_finish` 四态、授权拒绝、非 owner 直查视图被拒、有授权写入与读函数过滤、共享一致性套件 |
 

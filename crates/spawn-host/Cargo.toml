@@ -13,7 +13,7 @@ libc.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# The content-addressed store of deduplicated build artifacts (`cas_dedup`).
+# Content-addressed store (D6 Merkle trees, snapshots, commits, journal).
 spawn-cas.workspace = true
 
 [features]

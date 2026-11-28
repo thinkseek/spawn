@@ -26,7 +26,7 @@ Spawn runs coding agents (Claude Code, and optionally agy) in isolated workspace
 | --- | --- |
 | Engines | `claude` (default) and `agy`, enabled with `SPAWN_ENGINES=claude,agy`; a start action or `spawn task assign --engine` picks one |
 | Sandbox | Engines without their own deny rules (agy) run only inside a `bwrap` filesystem view (`SPAWN_ENGINE_VIEW=required`, the default); `SPAWN_CLAUDE_SANDBOX=1` puts Claude Code in it too |
-| Workspaces | Pluggable backends: `git`, `cow`, `auto`, `overlay`, `d6-shadow`, `d6` (see [Storage](#storage-backends)) |
+| Workspaces | Backends: `git` (default), `d6` (opt-in / cutover), `auto` (see [Storage](#storage-backends)) |
 | Missions & landing | Supervisor plans and assigns tasks; `spawn integrate` judges each candidate with `scripts/rsi/gate.sh` and lands it with a compare-and-swap push |
 | Task grading | Three tiers (`l1`/`l2`/`l3`): tasks route to the cheapest preset graded for their difficulty and step up on repeated rework ([docs/agent-grading.md](./docs/agent-grading.md)) |
 | Feature map | `spawn features` keeps `docs/feature-map/registry.json` in sync with the code; `check --deps enforce` checks declared feature dependencies against a Rust/TypeScript/Python/Go code graph |
@@ -79,7 +79,7 @@ Configuration is environment first. A `spawn.toml` can supply the same settings:
 | `SPAWN_ENGINES` | `claude` | Enabled engines: `claude`, `agy` |
 | `SPAWN_AGY_MODEL` | unset | Model for agy; a start of agy is refused without it |
 | `SPAWN_ENGINE_VIEW` | `required` | Sandbox policy: `required`, `container` or `off` |
-| `SPAWN_WORKSPACE_BACKEND` | `git` | `git`, `cow`, `auto`, `overlay`, `d6-shadow` or `d6` |
+| `SPAWN_WORKSPACE_BACKEND` | `git` | `git`, `d6` or `auto` |
 | `SPAWN_HERDR_MODE` | `core` | `core` (sibling `spawn-hc`) or `legacy` (external `herdr`) |
 | `SPAWN_JUDGE_URL` | unset | Optional judge service; without it the rules judge alone |
 | `SPAWN_SERVE_ADDRESS` | `127.0.0.1:8787` | `spawn serve` bind address |
@@ -92,13 +92,10 @@ Configuration is environment first. A `spawn.toml` can supply the same settings:
 | Backend | What it is |
 | --- | --- |
 | `git` (default) | A Git working copy per branch |
-| `cow` | Copy-on-write clones of a per-commit baseline |
-| `auto` | `cow` where the file system clones, else `git` |
-| `overlay` | Unprivileged overlay per workspace (Linux, opt-in) |
-| `d6-shadow` | `git` stays authoritative; `d6` runs beside it as a checked shadow |
-| `d6` | Content-addressed store: SHA-256 objects, FastCDC chunking for large files, Merkle trees, refs in PostgreSQL, optional bounded `tmpfs` layer (`SPAWN_D6_TMPFS_ROOT`) ([docs/d6-cas-v1.md](./docs/d6-cas-v1.md)) |
+| `d6` | Opt-in content-addressed store: SHA-256 objects, FastCDC chunking for large files, Merkle trees, refs in PostgreSQL, optional bounded `tmpfs` layer (`SPAWN_D6_TMPFS_ROOT`) ([docs/d6-cas-v1.md](./docs/d6-cas-v1.md)) |
+| `auto` | Follows `.spawn-workspace-backend` / existing `.d6/` or `.sources/` / workspaces (`d6` or `git`), and selects `git` on clean roots |
 
-A workspace root records the backend that claimed it; an incompatible backend is refused. Opt-ins: `SPAWN_CAS_DEDUP=1` deduplicates `target/` and `node_modules/` in Cow workspaces; `SPAWN_SHARED_BUILD_CACHES=1` shares npm, pip, uv, Go, ccache, sccache and zig caches across workspaces.
+A workspace root records the backend that claimed it; an incompatible backend is refused. Opt-in: `SPAWN_SHARED_BUILD_CACHES=1` shares npm, pip, uv, Go, ccache, sccache and zig caches across workspaces.
 
 ## Commands
 

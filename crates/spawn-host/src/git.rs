@@ -293,7 +293,7 @@ impl GitWorkspace {
     }
 
     /// Every git this store runs: in the C locale ([`git_command`]), on its
-    /// repository. The overlay store runs its git here too.
+    /// repository.
     pub(crate) fn command(&self) -> Command {
         let mut command = git_command(&self.git);
         command.arg(format!("--git-dir={}", self.repo.display()));
@@ -854,94 +854,6 @@ impl GitWorkspace {
         special.sort();
         special.dedup();
         Ok((oversized, special))
-    }
-
-    /// The paths a checkpoint of the work tree in `directory`, whose parent
-    /// is `head`, takes by this store's rules, for a store that builds the
-    /// tree itself (the copy-on-write store, [`crate::cow`]); and the files
-    /// over the size cap it leaves out, with their sizes.
-    ///
-    /// The rules are [`Self::tree_of`]'s: what `git ls-files --cached
-    /// --others --exclude-standard` lists against `head` (tracked files,
-    /// and untracked ones no `.gitignore`, `info/exclude` or build-output
-    /// rule ignores), never an engine runtime file ([`ENGINE_RUNTIME_FILES`])
-    /// unless both `head` and `main` track it, and no file over the cap
-    /// ([`crate::workspace_rules::max_file_bytes`]) unless `main` holds it as a blob. A tracked path
-    /// is listed even when it is gone from `directory` or ignored: the
-    /// caller reads the work tree for it. `index` names a file that does not
-    /// exist (nothing is written to it): the listing is against `head`
-    /// alone, never a kept index.
-    pub(crate) fn checkpoint_paths(
-        &self,
-        directory: &Path,
-        index: &Path,
-        head: &str,
-    ) -> Result<CheckpointPaths, WorkspaceError> {
-        self.exclude_build_output()?;
-        let with_tree = OsString::from(format!("--with-tree={head}"));
-        let mut listing: Vec<OsString> = ["ls-files", "-z", "--cached", "--others"]
-            .map(OsString::from)
-            .into();
-        listing.extend([
-            OsString::from("--exclude-standard"),
-            with_tree.clone(),
-            OsString::from("--"),
-            OsString::from("."),
-        ]);
-        listing.extend(runtime_pathspecs("exclude"));
-        let mut paths = listed_paths(&self.listing_in(directory, index, &listing)?);
-        // The runtime files the project tracks: in `head` and in `main`.
-        let mut runtime: Vec<OsString> = ["ls-files", "-z", "--cached"].map(OsString::from).into();
-        runtime.extend([with_tree, OsString::from("--")]);
-        runtime.extend(runtime_pathspecs(""));
-        let tracked: Vec<(TreePath, u64)> =
-            listed_paths(&self.listing_in(directory, index, &runtime)?)
-                .into_iter()
-                .map(|path| (path, 0))
-                .collect();
-        if !tracked.is_empty()
-            && let Ok(main) = self.commit_id_of(&format!("refs/heads/{BASE}"))
-        {
-            let in_main = self.blobs_in(&[main], &tracked)?;
-            paths.extend(
-                tracked
-                    .into_iter()
-                    .map(|(path, _)| path)
-                    .filter(|path| in_main.contains(path)),
-            );
-        }
-        paths.sort();
-        paths.dedup();
-        let mut oversized = Vec::new();
-        for path in &paths {
-            match std::fs::symlink_metadata(directory.join(path.as_path())) {
-                Ok(meta) if meta.is_file() && meta.len() > self.max_file_bytes => {
-                    oversized.push((path.clone(), meta.len()));
-                }
-                Ok(_) => {}
-                // Gone, or a leading directory is a file now: a deletion.
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) => {}
-                Err(error) => {
-                    return Err(WorkspaceError::Unavailable(format!(
-                        "stat {}: {error}",
-                        directory.join(path.as_path()).display()
-                    )));
-                }
-            }
-        }
-        let kept = self.blobs_in(&self.source_commits(None), &oversized)?;
-        oversized.retain(|(path, _)| !kept.contains(path));
-        let left_out: HashSet<&TreePath> = oversized.iter().map(|(path, _)| path).collect();
-        let paths = paths
-            .iter()
-            .filter(|path| !left_out.contains(path))
-            .cloned()
-            .collect();
-        Ok((paths, oversized))
     }
 
     /// Where the files over the cap that checkpoints of a branch left out are
@@ -1994,8 +1906,8 @@ impl GitWorkspace {
     /// The commit a set-aside of `branch` (at `head`) goes back to: `start`
     /// resolved, or where the branch forked from `main` when `None`. A
     /// commit that is not an ancestor of `head` is refused (`NotAncestor`):
-    /// no foreign tree is ever written. Shared by every store with branches
-    /// ([`crate::CowWorkspace`], `OverlayWorkspace`), so the rule is one.
+    /// no foreign tree is ever written. Shared across worktrees, so the rule
+    /// is one.
     pub(crate) fn set_aside_start(
         &self,
         branch: &str,
@@ -2068,29 +1980,6 @@ impl GitWorkspace {
             "-m",
             message,
         ])
-    }
-
-    /// Move `branch` from `plan`'s head to `commit` (compare-and-swap).
-    pub(crate) fn move_to_set_aside(
-        &self,
-        branch: &str,
-        plan: &SetAsidePlan,
-        commit: &str,
-    ) -> Result<SetAside, WorkspaceError> {
-        let reference = format!("refs/heads/{branch}");
-        self.git_output(&["update-ref", &reference, commit, &plan.head])
-            .map_err(|error| {
-                WorkspaceError::Unavailable(format!("{error} (branch moved under the set-aside)"))
-            })?;
-        let id = |text: &str| {
-            CommitId::new(text.to_string())
-                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
-        };
-        Ok(SetAside::Created {
-            commit: id(commit)?,
-            kept: id(&plan.head)?,
-            files: plan.files.clone(),
-        })
     }
 
     /// Before a set-aside moves `directory` to `start`'s tree: what the
@@ -2948,10 +2837,6 @@ impl GitWorkspace {
         Ok(marked)
     }
 }
-
-/// What [`GitWorkspace::checkpoint_paths`] answers: the paths a checkpoint
-/// takes, and the files over the size cap it leaves out, with their sizes.
-pub(crate) type CheckpointPaths = (Vec<TreePath>, Vec<(TreePath, u64)>);
 
 /// The refusal of a stale workspace's checkpoint or merge, naming the
 /// snapshot that keeps its state when there is one.

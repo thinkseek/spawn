@@ -210,7 +210,7 @@ cargo build --release --locked --offline -p spawn-host --example storage_benchma
 # Start an isolated disposable PostgreSQL 16 instance (durable settings) and export:
 export SPAWN_BENCH_DATABASE_URL="postgres://<user>:<pass>@127.0.0.1:<port>/<db>"
 
-# Run across git, d6 (disk), d6 (L1 tmpfs), and shadow at c=1 and c=8:
+# Run across git, d6 (disk), and d6 (L1 tmpfs) at c=1 and c=8:
 for c in 1 8; do
   target/release/examples/storage_benchmark \
     --source-revision 4509381764fb00c907c8827a28b50d373e4b1d9d \
@@ -230,12 +230,6 @@ for c in 1 8; do
     --files 512 --file-bytes 4096 --iterations 40 --warmup 5 --edits 4 --transcript-bytes 16384 \
     --tmpfs-root "<shm_dir>/d6-l1-c${c}" --tmpfs-budget-mb 512 \
     > "bench-d6-l1-c${c}.json"
-
-  target/release/examples/storage_benchmark \
-    --source-revision 4509381764fb00c907c8827a28b50d373e4b1d9d \
-    --backend shadow --concurrency "$c" \
-    --files 512 --file-bytes 4096 --iterations 40 --warmup 5 --edits 4 --transcript-bytes 16384 \
-    > "bench-shadow-c${c}.json"
 done
 ```
 
@@ -348,7 +342,7 @@ PostgreSQL and git borders.
 | --- | --- | --- | --- |
 | `pg_concurrency_idempotency_replay_storm_claim_contention_and_event_monotonicity` | `crates/spawn-postgres/tests/recovery.rs` | 16-thread `Idempotency-Key` replay storm (`submit` + `claim` contention + `append` + `finish`) | 384 submits deduplicate to 264 unique commands; single live claim per command; idempotent duplicate `EventLog::append`; 792 strictly monotonic global events |
 | `pg_worker_crash_lease_expiry_and_reconnect_takeover_zero_duplicate_side_effects` | `crates/spawn-postgres/tests/recovery.rs` | Abrupt worker connection/advisory-lock drop (`SIGKILL`) & lease TTL expiry takeover | Live worker fencing (`Rejected`); immediate takeover recovers 4 abandoned leases + 4 TTL-expired leases; `StoreError::LeaseLost` on active attempt-2 collision; zero duplicate `execution.terminal_started` events (`12/12` finished, `36` monotonic events) |
-| `concurrent_workspace_lifecycle_races_git_d6_shadow_and_d6_with_border_fsck` | `crates/spawn-host/tests/d6_layer0_cutover.rs` | 8-thread `LocalWorkspaceStore` lifecycle contention across `git`, `d6-shadow`, and `d6` | Sibling sentinel isolation; zero orphan dirs or `.d6-layer0-stage*` leftovers; zero `d6-shadow` divergences; `.gc-fence` + `reconcile_refs_journal` clean (`entries_replayed == 0`); border `git fsck --full --strict` clean |
+| `concurrent_workspace_lifecycle_races_git_and_d6_with_border_fsck` | `crates/spawn-host/tests/d6_layer0_cutover.rs` | 8-thread `LocalWorkspaceStore` lifecycle contention across `git` and `d6` | Sibling sentinel isolation; zero orphan dirs or `.d6-layer0-stage*` leftovers; `.gc-fence` + `reconcile_refs_journal` clean (`entries_replayed == 0`); border `git fsck --full --strict` clean |
 | `d6_l1_tmpfs_budget_exhaustion_backpressure_fallback_and_recovery` | `crates/spawn-host/tests/d6_layer0_cutover.rs` | L1 `tmpfs` quota (`BudgetExceeded`), low free-space (`TmpfsFreeSpaceInsufficient`), and 80% `UsageThreshold` flush | Clean fallback to L0 disk workspace; pressure demotion reclaims `921600` bytes; automatic L1 re-admission after headroom recovery; border `git fsck --full --strict` clean |
 
 ### Reproduction Commands
@@ -372,7 +366,6 @@ and `8/8` passing `d6_layer0_cutover` tests:
 | `pg_replay_storm` | 16 threads, 384 submits -> 264 unique cmds, 792 events | `submit_ms=(52.45/333.58/405.33)` · `claim_ms=(2.57/9.26/19.59)` · `append_ms=(11.48/60.74/113.74)` · `finish_ms=(11.95/54.76/113.13)` (p50/p95/max) |
 | `pg_crash_recovery` | 4 `SIGKILL` abandoned leases + 4 TTL-expired leases (`12` cmds) | `recover_ms=6.69` · `ttl_takeover_ms=107.15` |
 | `ws_lifecycle_storm` (`git`) | 8 threads, 26 lifecycle cycles | `p50_ms=81.06` · `p95_ms=126.29` · `max_ms=174.75` |
-| `ws_lifecycle_storm` (`d6-shadow`) | 8 threads, 24 lifecycle cycles (strict oracle, 0 divergences) | `p50_ms=392.72` · `p95_ms=504.69` · `max_ms=525.59` |
-| `ws_lifecycle_storm` (`d6`) | 8 threads, 26 lifecycle cycles (border `fsck` clean) | `p50_ms=250.37` · `p95_ms=272.53` · `max_ms=274.96` |
+| `ws_lifecycle_storm` (`d6` historical baseline before `d6-shadow` sunset) | 8 threads, 26 lifecycle cycles (border `fsck` clean) | `p50_ms=250.37` · `p95_ms=272.53` · `max_ms=274.96` |
 | `d6_l1_backpressure` | L1 quota/space fallback -> demote (`921600` B) -> recover | `fallback_ms=4.07` · `demote_ms=31.21` · `recover_ms=21.16` |
 

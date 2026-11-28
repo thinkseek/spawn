@@ -1,6 +1,6 @@
 //! Shared workspace policy constants, locking, oversized-file tracking,
 //! conflict-marker detection, and trailer rules shared across workspace stores
-//! (`GitWorkspace`, `CowWorkspace`, `OverlayWorkspace`, `D6Workspace`).
+//! (`D6Workspace`, `GitWorkspace`).
 //!
 //! Keeping these pure-Rust / descriptor-safe rules outside `crate::git` lets
 //! D6 CAS workspaces enforce identical boundaries without pulling any Git

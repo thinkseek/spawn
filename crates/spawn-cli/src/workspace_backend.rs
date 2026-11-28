@@ -8,17 +8,15 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// (`[storage].workspace_backend`) and the runtime `SPAWN_WORKSPACE_BACKEND` boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceBackend {
-    /// The cheapest backend the root supports that the loop serves
-    /// (`spawn_host::WorkspaceBackend::auto_with`), chosen once at start.
+    /// Git by default, or the backend the root already holds
+    /// ([`spawn_host::WorkspaceBackend::auto`]), chosen once at start.
     Auto,
-    /// An explicit concrete host workspace backend (`git`, `cow`, `overlay`,
-    /// `d6-shadow`, or `d6`).
+    /// An explicit concrete host workspace backend (`d6` or `git`).
     Named(spawn_host::WorkspaceBackend),
 }
 
 impl WorkspaceBackend {
-    /// Canonical lowercase backend identifier (`"git"`, `"cow"`, `"overlay"`,
-    /// `"d6-shadow"`, `"d6"`, or `"auto"`).
+    /// Canonical lowercase backend identifier (`"d6"`, `"git"`, or `"auto"`).
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -63,7 +61,7 @@ impl<'de> Deserialize<'de> for WorkspaceBackend {
         let raw = String::deserialize(deserializer)?;
         Self::parse(&raw).ok_or_else(|| {
             de::Error::custom(format!(
-                "[storage].workspace_backend = {raw:?} is invalid: expected \"auto\", \"cow\", \"git\", \"overlay\", \"d6\", or \"d6-shadow\""
+                "[storage].workspace_backend = {raw:?} is invalid: expected \"auto\", \"d6\", or \"git\""
             ))
         })
     }

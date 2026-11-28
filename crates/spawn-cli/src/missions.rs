@@ -3078,7 +3078,7 @@ fn resolve_d6_cas_dir(
     }
     let cfg = crate::config::D6RuntimeConfig::from_env()?;
     if let Some(root) = ctx.root.as_deref() {
-        return Ok(cfg.effective_cas_dir(root, spawn_host::WorkspaceBackend::D6));
+        return Ok(cfg.effective_cas_dir(root));
     }
     cfg.cas_dir.ok_or_else(|| {
         format!(
@@ -4025,21 +4025,16 @@ mod tests {
         assert!(!base.exists());
 
         std::fs::create_dir_all(&base).expect("root");
-        spawn_host::claim_root(&base, spawn_host::WorkspaceBackend::Cow).expect("claimed");
+        spawn_host::claim_root(&base, spawn_host::WorkspaceBackend::D6).expect("claimed");
         let before: Vec<_> = std::fs::read_dir(&base)
             .expect("list")
             .map(|entry| entry.expect("entry").file_name())
             .collect();
         let marked = spawn_host::root_backend(&base).map_err(|error| error.to_string());
-        let view = WorkspaceSettings::peek_with(
-            Ok(crate::config::WorkspaceBackend::Auto),
-            Ok(true),
-            marked,
-        );
+        let view = WorkspaceSettings::peek_with(Ok(crate::config::WorkspaceBackend::Auto), marked);
         assert_eq!(
             view,
-            json!({"configured": "auto", "active": "cow", "root": "cow", "cas_dedup": "on",
-                   "servable": true})
+            json!({"configured": "auto", "active": "d6", "root": "d6"})
         );
         let _ = WorkspaceSettings::peek(&base);
         let after: Vec<_> = std::fs::read_dir(&base)

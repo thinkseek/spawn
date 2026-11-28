@@ -23,7 +23,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) type ScannedWorkspaceTree = (Digest, Vec<(TreePath, u64)>, Option<Digest>);
 type ScannedWithMeta = (ScannedEntry, Option<fs::Metadata>);
 type FilteredScanWithMeta = (Vec<ScannedWithMeta>, Vec<(TreePath, u64)>);
 type BranchAndMain = (Option<LedgerSnapshot>, Option<LedgerSnapshot>);
@@ -55,7 +54,6 @@ use crate::cas_merkle::{
     LedgerSnapshot, PublishCommitV2Request, PublishRequest, PublishedSnapshot, RefLedger,
     RefsJournalLock, ScannedEntry, ScannedKind, TrackedSetPolicy,
 };
-use crate::cow::clone_or_copy;
 use crate::d6_layer0::{
     ExistingDestPolicy, Layer0MaterializeReport, Layer0Options, materialize_layer0,
 };
@@ -63,6 +61,7 @@ use crate::merkle_merge::{
     ConflictKind, GitAttributes, MergeBaseError, MergeCommitV2Spec, build_merge_commit_v2,
     find_single_merge_base, merge_snapshots,
 };
+use crate::reflink::clone_or_copy;
 use crate::root::{canonical_root, legacy_workspace};
 use crate::tree_path::{TreePath, nul_fields};
 use crate::workspace_rules::{
@@ -1559,27 +1558,6 @@ impl<L: RefLedger> D6Workspace<L> {
         Ok(())
     }
 
-    /// Scan `directory` into CAS (`NS_BLOB` + `NS_TREE`) for `branch` against `TrackedSetPolicy`,
-    /// applying size filtering and optional fail-closed leak verification.
-    pub(crate) fn scan_directory_tree(
-        &self,
-        branch: &str,
-        directory: &Path,
-        extra_excludes: &[PathBuf],
-        simulate_unfiltered: bool,
-    ) -> Result<ScannedWorkspaceTree, WorkspaceError> {
-        let (head, main_snap) = self.branch_and_main_snapshots(branch)?;
-        let (tree, oversized, resolved, _) = self.scan_directory_tree_with_heads(
-            branch,
-            directory,
-            head.as_ref(),
-            main_snap.as_ref(),
-            extra_excludes,
-            simulate_unfiltered,
-        )?;
-        Ok((tree, oversized, resolved))
-    }
-
     fn scan_directory_tree_with_heads(
         &self,
         branch: &str,
@@ -1673,180 +1651,6 @@ impl<L: RefLedger> D6Workspace<L> {
         }
 
         Ok((next_tree, oversized, resolved_merge_main, measured_bytes))
-    }
-
-    #[expect(clippy::too_many_arguments)]
-    pub(crate) fn publish_branch_commit_with_body(
-        &self,
-        branch: &str,
-        directory: &Path,
-        next_tree: &Digest,
-        oversized: &[(TreePath, u64)],
-        resolved_merge_main: Option<&Digest>,
-        commit_body: &[u8],
-        created_at_ms: i64,
-        reason: &str,
-    ) -> Result<Commit, WorkspaceError> {
-        let _lock = self.lock_branch(branch)?;
-        self.record_oversized(branch, directory, oversized);
-        let head = self.branch_snapshot(branch)?;
-        let Some(head) = head else {
-            let main_snap = self.main_snapshot()?;
-            let mut parents = Vec::new();
-            if let Some(m) = &main_snap {
-                parents.push(m.id.clone());
-            }
-            let published = self
-                .store
-                .publish_snapshot(
-                    self.ledger.as_ref(),
-                    &PublishRequest {
-                        project: &self.project,
-                        ref_name: branch,
-                        kind: D6RefKind::Branch,
-                        expected_ref: None,
-                        tree: next_tree,
-                        parents: &parents,
-                        commit_body,
-                        created_at_ms,
-                        reason,
-                        landing_task_id: None,
-                    },
-                )
-                .map_err(map_store_err)?;
-            self.clear_pending(branch);
-            let commit = CommitId::new(published.git_oid.to_hex())
-                .map_err(|err| WorkspaceError::Unavailable(err.to_string()))?;
-            let parent = main_snap
-                .map(|m| CommitId::new(m.git_oid.to_hex()))
-                .transpose()
-                .map_err(|err| WorkspaceError::Unavailable(err.to_string()))?;
-            return Ok(Commit::Recreated { commit, parent });
-        };
-
-        let merged_second = resolved_merge_main.filter(|m| *m != &head.id).cloned();
-        if *next_tree == head.tree && merged_second.is_none() {
-            if resolved_merge_main.is_some() {
-                self.clear_pending(branch);
-            }
-            return Ok(Commit::Unchanged);
-        }
-
-        let mut parents = vec![head.id.clone()];
-        if let Some(m) = merged_second {
-            parents.push(m);
-        }
-        let published = self
-            .store
-            .publish_snapshot(
-                self.ledger.as_ref(),
-                &PublishRequest {
-                    project: &self.project,
-                    ref_name: branch,
-                    kind: D6RefKind::Branch,
-                    expected_ref: Some(&head.id),
-                    tree: next_tree,
-                    parents: &parents,
-                    commit_body,
-                    created_at_ms,
-                    reason,
-                    landing_task_id: None,
-                },
-            )
-            .map_err(map_store_err)?;
-        if resolved_merge_main.is_some() {
-            self.clear_pending(branch);
-        }
-        CommitId::new(published.git_oid.to_hex())
-            .map(Commit::Created)
-            .map_err(|err| WorkspaceError::Unavailable(err.to_string()))
-    }
-
-    pub(crate) fn write_pending_merge_for_shadow(
-        &self,
-        branch: &str,
-        main_snap: &Digest,
-        written_over: &Digest,
-        files: &[TreePath],
-    ) -> Result<(), WorkspaceError> {
-        let _lock = self.lock_branch(branch)?;
-        self.write_pending(branch, main_snap, written_over, files)
-    }
-
-    #[expect(clippy::too_many_arguments)]
-    pub(crate) fn publish_merge_commit_with_body(
-        &self,
-        branch: &str,
-        expected_head: &Digest,
-        main_snap: &Digest,
-        merged_tree: &Digest,
-        commit_body: &[u8],
-        created_at_ms: i64,
-        reason: &str,
-    ) -> Result<PublishedSnapshot, WorkspaceError> {
-        let _lock = self.lock_branch(branch)?;
-        let published = self
-            .store
-            .publish_snapshot(
-                self.ledger.as_ref(),
-                &PublishRequest {
-                    project: &self.project,
-                    ref_name: branch,
-                    kind: D6RefKind::Branch,
-                    expected_ref: Some(expected_head),
-                    tree: merged_tree,
-                    parents: &[expected_head.clone(), main_snap.clone()],
-                    commit_body,
-                    created_at_ms,
-                    reason,
-                    landing_task_id: None,
-                },
-            )
-            .map_err(map_store_err)?;
-        self.clear_pending(branch);
-        self.clear_main_copies(branch);
-        Ok(published)
-    }
-
-    pub(crate) fn publish_set_aside_commit_with_body(
-        &self,
-        branch: &str,
-        expected_head: &Digest,
-        tree: &Digest,
-        commit_body: &[u8],
-        created_at_ms: i64,
-        reason: &str,
-    ) -> Result<PublishedSnapshot, WorkspaceError> {
-        let _lock = self.lock_branch(branch)?;
-        let published = self
-            .store
-            .publish_snapshot(
-                self.ledger.as_ref(),
-                &PublishRequest {
-                    project: &self.project,
-                    ref_name: branch,
-                    kind: D6RefKind::Branch,
-                    expected_ref: Some(expected_head),
-                    tree,
-                    parents: std::slice::from_ref(expected_head),
-                    commit_body,
-                    created_at_ms,
-                    reason,
-                    landing_task_id: None,
-                },
-            )
-            .map_err(map_store_err)?;
-        self.clear_pending(branch);
-        Ok(published)
-    }
-
-    pub(crate) fn workspace_id_for_branch(
-        &self,
-        branch: &str,
-    ) -> Result<WorkspaceId, WorkspaceError> {
-        let dir = self.active_workspace_dir(branch);
-        WorkspaceId::new(format!("{branch}:{}", dir.display()))
-            .map_err(|err| WorkspaceError::Unavailable(err.to_string()))
     }
 }
 

@@ -557,14 +557,19 @@ pub(crate) fn loop_interval() -> std::time::Duration {
 }
 
 /// The backend `value` (`SPAWN_WORKSPACE_BACKEND`) names: git when it is
-/// unset or empty; anything it does not name is refused, never read as git.
+/// unset or empty; anything else unrecognized (including retired `cow`,
+/// `overlay`, `d6-shadow`) is refused, never read as git.
 pub(crate) fn workspace_backend(value: Option<&str>) -> Result<WorkspaceBackend, String> {
     match value.map(str::trim) {
         None | Some("") => Ok(WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Git)),
+        Some(retired @ ("cow" | "overlay" | "d6-shadow")) => Err(format!(
+            "SPAWN_WORKSPACE_BACKEND={retired:?} names retired workspace backend \
+             {retired} (removed in S3a; see docs/upgrading.md): use git (the default), d6 or auto"
+        )),
         Some(name) => WorkspaceBackend::parse(name).ok_or_else(|| {
             format!(
                 "SPAWN_WORKSPACE_BACKEND={name:?} names no workspace backend: use git (the \
-                 default), cow, overlay, d6-shadow, d6 or auto"
+                 default), d6 or auto"
             )
         }),
     }
@@ -574,7 +579,7 @@ pub(crate) fn workspace_backend(value: Option<&str>) -> Result<WorkspaceBackend,
 /// without `SPAWN_D6_TMPFS_BUDGET_MB`.
 pub(crate) const DEFAULT_D6_TMPFS_BUDGET_MB: u64 = 2048;
 
-/// Optional runtime configuration for opt-in `d6-shadow` and `d6` workspace backends.
+/// Optional runtime configuration for the opt-in `d6` workspace backend.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct D6RuntimeConfig {
     /// `SPAWN_D6_CAS_DIR`: override for the CAS Merkle + `refs.journal` directory.
@@ -583,8 +588,6 @@ pub(crate) struct D6RuntimeConfig {
     pub(crate) tmpfs_root: Option<PathBuf>,
     /// `SPAWN_D6_TMPFS_BUDGET_MB`: hard L1 memory budget in MiB (`2048` default when `tmpfs_root` set).
     pub(crate) tmpfs_budget_mb: Option<u64>,
-    /// `SPAWN_D6_STRICT_FAIL_CLOSED`: fail checkpoints when `TrackedSetLeak` triggers in `d6-shadow`.
-    pub(crate) strict_fail_closed: bool,
 }
 
 fn parse_abs_dir(var_name: &str, raw: Option<&str>) -> Result<Option<PathBuf>, String> {
@@ -612,27 +615,17 @@ fn parse_positive_u64(var_name: &str, raw: Option<&str>) -> Result<Option<u64>, 
     }
 }
 
-fn parse_bool_flag(var_name: &str, raw: Option<&str>) -> Result<bool, String> {
-    match raw.map(str::trim) {
-        None | Some("" | "0" | "false") => Ok(false),
-        Some("1" | "true") => Ok(true),
-        Some(other) => Err(format!("{var_name}={other:?} must be 1/true or 0/false")),
-    }
-}
-
 impl D6RuntimeConfig {
     /// Parse `SPAWN_D6_*` configuration values explicitly (unit-testable without mutating env).
     pub(crate) fn parse(
         cas_dir: Option<&str>,
         tmpfs_root: Option<&str>,
         tmpfs_budget_mb: Option<&str>,
-        strict_fail_closed: Option<&str>,
     ) -> Result<Self, String> {
         Ok(Self {
             cas_dir: parse_abs_dir("SPAWN_D6_CAS_DIR", cas_dir)?,
             tmpfs_root: parse_abs_dir("SPAWN_D6_TMPFS_ROOT", tmpfs_root)?,
             tmpfs_budget_mb: parse_positive_u64("SPAWN_D6_TMPFS_BUDGET_MB", tmpfs_budget_mb)?,
-            strict_fail_closed: parse_bool_flag("SPAWN_D6_STRICT_FAIL_CLOSED", strict_fail_closed)?,
         })
     }
 
@@ -642,28 +635,15 @@ impl D6RuntimeConfig {
             env_value("SPAWN_D6_CAS_DIR").as_deref(),
             env_value("SPAWN_D6_TMPFS_ROOT").as_deref(),
             env_value("SPAWN_D6_TMPFS_BUDGET_MB").as_deref(),
-            env_value("SPAWN_D6_STRICT_FAIL_CLOSED").as_deref(),
         )
     }
 
-    /// Resolved CAS root for `active` under workspace `root`.
-    pub(crate) fn effective_cas_dir(
-        &self,
-        root: &std::path::Path,
-        active: spawn_host::WorkspaceBackend,
-    ) -> PathBuf {
+    /// Resolved CAS root under workspace `root`.
+    pub(crate) fn effective_cas_dir(&self, root: &std::path::Path) -> PathBuf {
         if let Some(dir) = &self.cas_dir {
             return dir.clone();
         }
-        match active {
-            spawn_host::WorkspaceBackend::D6Shadow => root.join(".d6-shadow").join("cas"),
-            _ => root.join(".d6").join("cas"),
-        }
-    }
-
-    /// Shadow staging/working root under `root` for `d6-shadow`.
-    pub(crate) fn shadow_work_root(root: &std::path::Path) -> PathBuf {
-        root.join(".d6-shadow").join("work")
+        root.join(".d6").join("cas")
     }
 
     /// Bounded L1 `tmpfs` policy when `SPAWN_D6_TMPFS_ROOT` is configured.
@@ -677,30 +657,9 @@ impl D6RuntimeConfig {
     }
 }
 
-/// Whether `value` (`SPAWN_CAS_DEDUP`) turns the deduplication of build
-/// artifacts on: `1` does, unset, empty or `0` does not; anything else is
-/// refused.
-pub(crate) fn cas_dedup(value: Option<&str>) -> Result<bool, String> {
-    match value.map(str::trim) {
-        None | Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(other) => Err(format!(
-            "SPAWN_CAS_DEDUP={other:?} is neither 1 (deduplicate build artifacts) nor 0"
-        )),
-    }
-}
-
-/// How the backends' support of a root is asked (the kernel and the file
-/// system in production, fixed answers in a test).
+/// How existing-root markers are inspected (in production via [`spawn_host::root_backend`],
+/// or stubbed in unit tests).
 pub(crate) struct Probes<'a> {
-    /// Whether an unprivileged overlay mounts under the root
-    /// ([`spawn_host::overlay_supported_in`]); `Err` with the reason. Asked
-    /// only when the overlay is asked for by name.
-    pub(crate) overlay: &'a dyn Fn(&std::path::Path) -> Result<(), String>,
-    /// Whether the root's file system clones copy-on-write
-    /// ([`spawn_host::cow_clone_supported`]). Asked only for `auto` on a
-    /// root no backend has yet.
-    pub(crate) cow: &'a dyn Fn(&std::path::Path) -> bool,
     /// The backend the root already is ([`spawn_host::root_backend`]: its
     /// marker, else what it holds), read and never written. Asked only for
     /// `auto`, which follows it.
@@ -709,30 +668,12 @@ pub(crate) struct Probes<'a> {
 }
 
 impl Probes<'static> {
-    /// The host's own answers. Both write under the root (a probe file, a
-    /// probe mount): only a process that runs workspaces asks them, never
-    /// a read like `spawn mission show` ([`WorkspaceSettings::peek`]).
+    /// The host's own reader for an existing root marker ([`spawn_host::root_backend`]).
     pub(crate) fn host() -> Self {
-        #[cfg(target_os = "linux")]
-        fn overlay(root: &std::path::Path) -> Result<(), String> {
-            let _ = std::fs::create_dir_all(root);
-            spawn_host::overlay_supported_in(root)
-        }
-        #[cfg(not(target_os = "linux"))]
-        fn overlay(_root: &std::path::Path) -> Result<(), String> {
-            Err("the overlay workspace store needs Linux".to_string())
-        }
-        fn cow(root: &std::path::Path) -> bool {
-            spawn_host::WorkspaceBackend::auto(root) == spawn_host::WorkspaceBackend::Cow
-        }
         fn marked(root: &std::path::Path) -> Result<Option<spawn_host::WorkspaceBackend>, String> {
             spawn_host::root_backend(root).map_err(|error| error.to_string())
         }
-        Self {
-            overlay: &overlay,
-            cow: &cow,
-            marked: &marked,
-        }
+        Self { marked: &marked }
     }
 }
 
@@ -745,54 +686,35 @@ impl Probes<'static> {
 pub(crate) struct WorkspaceSettings {
     /// `SPAWN_WORKSPACE_BACKEND` as given (`git` when unset).
     pub(crate) configured: WorkspaceBackend,
-    /// The backend.
+    /// The active concrete host workspace backend (`Git` or `D6`).
     pub(crate) active: spawn_host::WorkspaceBackend,
-    /// `SPAWN_CAS_DEDUP=1`: build artifacts deduplicated (Cow only).
-    pub(crate) cas_dedup: bool,
-    /// Opt-in D6 runtime configuration (`SPAWN_D6_*`).
+    /// D6 runtime configuration (`SPAWN_D6_*`).
     pub(crate) d6: D6RuntimeConfig,
     /// File size cap (`SPAWN_MAX_FILE_MB`) applied to checkpoints in the opened store.
     pub(crate) max_file_bytes: u64,
 }
 
 impl WorkspaceSettings {
-    /// The backend `configured` is under `root`. `overlay` asked for where
-    /// the kernel mounts none (not Linux, no user namespaces, a file system
-    /// it refuses) is refused with the kernel's reason, never run as
-    /// another backend. `auto` follows the backend the root already is (its
-    /// marker, else what it holds: a root with workspaces and no marker is
-    /// Git's), so it starts where `spawn mission show` says it would; on a
-    /// root no backend has, it is spawn-host's own rule
-    /// ([`spawn_host::WorkspaceBackend::auto_with`]): Cow where the file
-    /// system clones, else Git; never the overlay, never D6.
+    /// Resolve `configured` under `root`. `auto` follows the backend the
+    /// root already holds ([`spawn_host::root_backend`]: its marker, else an
+    /// unclaimed root with workspaces stays `git`); on a clean root with no
+    /// backend marker yet, [`spawn_host::WorkspaceBackend::auto`] selects `Git`.
     pub(crate) fn resolve(
         configured: WorkspaceBackend,
-        cas_dedup: bool,
         root: &std::path::Path,
         probes: &Probes<'_>,
         max_file_bytes: u64,
     ) -> Result<Self, String> {
         let active = match configured {
-            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay) => {
-                (probes.overlay)(root).map_err(|why| {
-                    format!(
-                        "SPAWN_WORKSPACE_BACKEND=overlay: no unprivileged overlay under {}: \
-                         {why}; use git, cow or auto",
-                        root.display()
-                    )
-                })?;
-                spawn_host::WorkspaceBackend::Overlay
-            }
             WorkspaceBackend::Named(host) => host,
             WorkspaceBackend::Auto => match (probes.marked)(root)? {
                 Some(there) => there,
-                None => spawn_host::WorkspaceBackend::auto_with((probes.cow)(root)),
+                None => spawn_host::WorkspaceBackend::auto(root),
             },
         };
         Ok(Self {
             configured,
             active,
-            cas_dedup,
             d6: D6RuntimeConfig::default(),
             max_file_bytes,
         })
@@ -806,16 +728,15 @@ impl WorkspaceSettings {
     }
 
     /// The settings the environment gives for `root`
-    /// (`SPAWN_WORKSPACE_BACKEND`, `SPAWN_CAS_DEDUP`, `SPAWN_D6_*`), resolved on
-    /// the host and the root claimed for the backend ([`spawn_host::claim_root`]:
-    /// a root another incompatible backend runs on is refused), once per root
-    /// and process. For a process that runs workspaces only: it writes under the root.
+    /// (`SPAWN_WORKSPACE_BACKEND`, `SPAWN_D6_*`), resolved on the host and
+    /// the root claimed for the backend ([`spawn_host::claim_root`]: a root
+    /// another incompatible backend runs on is refused), once per root and
+    /// process. For a process that runs workspaces only: it writes under the root.
     pub(crate) fn from_env(root: &std::path::Path) -> Result<Self, String> {
         static RESOLVED: std::sync::OnceLock<
             std::sync::Mutex<HashMap<PathBuf, Result<WorkspaceSettings, String>>>,
         > = std::sync::OnceLock::new();
         let configured = workspace_backend(env_value("SPAWN_WORKSPACE_BACKEND").as_deref())?;
-        let cas = cas_dedup(env_value("SPAWN_CAS_DEDUP").as_deref())?;
         let d6 = D6RuntimeConfig::from_env()?;
         let max_file_bytes = workspace_max_file_bytes();
         let mut resolved = RESOLVED
@@ -826,8 +747,7 @@ impl WorkspaceSettings {
             .entry(root.to_path_buf())
             .or_insert_with(|| {
                 let settings =
-                    Self::resolve(configured, cas, root, &Probes::host(), max_file_bytes)?
-                        .with_d6(d6);
+                    Self::resolve(configured, root, &Probes::host(), max_file_bytes)?.with_d6(d6);
                 if let Some(existing) = spawn_host::root_backend(root).map_err(|error| {
                     format!("read workspace backend under {}: {error}", root.display())
                 })? && !spawn_host::workspace::backends_compatible(existing, settings.active)
@@ -839,11 +759,8 @@ impl WorkspaceSettings {
                         settings.active.name()
                     ));
                 }
-                if matches!(
-                    settings.active,
-                    spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow
-                ) {
-                    let cas_dir = settings.d6.effective_cas_dir(root, settings.active);
+                if settings.active == spawn_host::WorkspaceBackend::D6 {
+                    let cas_dir = settings.d6.effective_cas_dir(root);
                     spawn_host::CasMerkleStore::open(cas_dir.clone()).map_err(|error| {
                         format!("open D6 CAS store at {}: {error}", cas_dir.display())
                     })?;
@@ -854,26 +771,21 @@ impl WorkspaceSettings {
             .clone()
     }
 
-    /// Claim `root` for this backend ([`spawn_host::claim_root`]), only once
-    /// the loop can serve it ([`Self::servable`]): a start refused for the
-    /// overlay writes no marker, so the root stays free for another backend.
+    /// Claim `root` for this backend ([`spawn_host::claim_root`]).
     pub(crate) fn claim(&self, root: &std::path::Path) -> Result<(), String> {
-        self.servable()?;
         spawn_host::claim_root(root, self.active)
     }
 
     /// What `spawn mission show` says of the backend of `root`, read and
-    /// never written: no root is made, no probe file or mount tried. The
-    /// backend is the one the root's marker names
-    /// ([`spawn_host::root_backend`]) or the one asked for by name; `auto`
-    /// on a root no loop claimed yet is undecided (`active: null`).
+    /// never written: no root is made. The backend is the one the root's
+    /// marker names ([`spawn_host::root_backend`]) or the one asked for by
+    /// name; `auto` on a root no loop claimed yet is undecided (`active: null`).
     pub(crate) fn peek(root: &std::path::Path) -> serde_json::Value {
         if let Err(error) = D6RuntimeConfig::from_env() {
             return serde_json::json!({ "error": error });
         }
         Self::peek_with(
             workspace_backend(env_value("SPAWN_WORKSPACE_BACKEND").as_deref()),
-            cas_dedup(env_value("SPAWN_CAS_DEDUP").as_deref()),
             spawn_host::root_backend(root).map_err(|error| error.to_string()),
         )
     }
@@ -881,12 +793,11 @@ impl WorkspaceSettings {
     /// [`Self::peek`] of the environment's answers and the root's marker.
     pub(crate) fn peek_with(
         configured: Result<WorkspaceBackend, String>,
-        cas: Result<bool, String>,
         marked: Result<Option<spawn_host::WorkspaceBackend>, String>,
     ) -> serde_json::Value {
-        let (configured, cas, marked) = match (configured, cas, marked) {
-            (Ok(configured), Ok(cas), Ok(marked)) => (configured, cas, marked),
-            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+        let (configured, marked) = match (configured, marked) {
+            (Ok(configured), Ok(marked)) => (configured, marked),
+            (Err(error), _) | (_, Err(error)) => {
                 return serde_json::json!({ "error": error });
             }
         };
@@ -909,10 +820,6 @@ impl WorkspaceSettings {
             "configured": configured.name(),
             "active": active.map(spawn_host::WorkspaceBackend::name),
             "root": marked.map(spawn_host::WorkspaceBackend::name),
-            "cas_dedup": active.map_or(if cas { "on" } else { "off" }, |active| {
-                Self::cas_state_for(cas, active)
-            }),
-            "servable": active.is_none_or(|active| Self::servable_for(active).is_ok()),
         })
     }
 
@@ -922,60 +829,41 @@ impl WorkspaceSettings {
         root: &std::path::Path,
         ledger: spawn_host::workspace::DynRefLedger,
     ) -> Result<spawn_host::LocalWorkspaceStore, String> {
-        let cas_dir = self.d6.effective_cas_dir(root, self.active);
+        let cas_dir = self.d6.effective_cas_dir(root);
         let cas = std::sync::Arc::new(
             spawn_host::CasMerkleStore::open(&cas_dir)
                 .map_err(|error| format!("open D6 CAS store at {}: {error}", cas_dir.display()))?,
         );
-        match self.active {
-            spawn_host::WorkspaceBackend::D6 => {
-                let mut opts =
-                    spawn_host::workspace::D6StoreOptions::new(cas, ledger, self.max_file_bytes);
-                if let Some(policy) = self.d6.l1_policy() {
-                    opts = opts.with_l1_policy(policy);
-                }
-                Ok(spawn_host::LocalWorkspaceStore::d6(
-                    repo.to_string_lossy().into_owned(),
-                    root,
-                    opts,
-                ))
-            }
-            spawn_host::WorkspaceBackend::D6Shadow => {
-                let mut opts = spawn_host::workspace::D6ShadowOptions::new(
-                    D6RuntimeConfig::shadow_work_root(root),
-                    cas,
-                    ledger,
-                    self.max_file_bytes,
-                )
-                .with_strict_fail_closed(self.d6.strict_fail_closed);
-                if let Some(policy) = self.d6.l1_policy() {
-                    opts = opts.with_l1_policy(policy);
-                }
-                Ok(spawn_host::LocalWorkspaceStore::d6_shadow(repo, root, opts))
-            }
-            other => Ok(match other {
-                spawn_host::WorkspaceBackend::Cow => {
-                    spawn_host::LocalWorkspaceStore::cow(repo, root, self.max_file_bytes)
-                }
-                #[cfg(target_os = "linux")]
-                spawn_host::WorkspaceBackend::Overlay => spawn_host::LocalWorkspaceStore::Overlay(
-                    spawn_host::OverlayWorkspace::new(repo, root, self.max_file_bytes),
-                ),
-                _ => spawn_host::LocalWorkspaceStore::git(repo, root, self.max_file_bytes),
-            }),
+        let mut opts = spawn_host::workspace::D6StoreOptions::new(cas, ledger, self.max_file_bytes);
+        if let Some(policy) = self.d6.l1_policy() {
+            opts = opts.with_l1_policy(policy);
         }
+        Ok(spawn_host::LocalWorkspaceStore::d6(
+            repo.to_string_lossy().into_owned(),
+            root,
+            opts,
+        ))
     }
 
-    /// Construct a store bound directly to `pg` for D6/D6-shadow backends.
+    /// Construct a store bound directly to `pg` for the D6 backend.
     pub(crate) fn store_with_pg(
         &self,
         repo: &std::path::Path,
         root: &std::path::Path,
         pg: std::sync::Arc<PostgresStore>,
     ) -> Result<spawn_host::LocalWorkspaceStore, String> {
-        let ledger: spawn_host::workspace::DynRefLedger =
-            std::sync::Arc::new(crate::sources::PostgresRefLedger::new(pg));
-        self.build_d6_store(repo, root, ledger)
+        match self.active {
+            spawn_host::WorkspaceBackend::D6 => {
+                let ledger: spawn_host::workspace::DynRefLedger =
+                    std::sync::Arc::new(crate::sources::PostgresRefLedger::new(pg));
+                self.build_d6_store(repo, root, ledger)
+            }
+            spawn_host::WorkspaceBackend::Git => Ok(spawn_host::LocalWorkspaceStore::git(
+                repo,
+                root,
+                self.max_file_bytes,
+            )),
+        }
     }
 
     /// The store of this backend over the bare repository `repo`,
@@ -986,21 +874,15 @@ impl WorkspaceSettings {
         root: &std::path::Path,
     ) -> spawn_host::LocalWorkspaceStore {
         match self.active {
-            spawn_host::WorkspaceBackend::Cow => {
-                spawn_host::LocalWorkspaceStore::cow(repo, root, self.max_file_bytes)
-            }
-            #[cfg(target_os = "linux")]
-            // Supported: [`Self::resolve`] asked the kernel.
-            spawn_host::WorkspaceBackend::Overlay => spawn_host::LocalWorkspaceStore::Overlay(
-                spawn_host::OverlayWorkspace::new(repo, root, self.max_file_bytes),
-            ),
-            spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow => {
+            spawn_host::WorkspaceBackend::D6 => {
                 let ledger: spawn_host::workspace::DynRefLedger =
                     std::sync::Arc::new(crate::sources::LazyPgRefLedger::new());
                 self.build_d6_store(repo, root, ledger)
                     .unwrap_or_else(|error| panic!("{error}"))
             }
-            _ => spawn_host::LocalWorkspaceStore::git(repo, root, self.max_file_bytes),
+            spawn_host::WorkspaceBackend::Git => {
+                spawn_host::LocalWorkspaceStore::git(repo, root, self.max_file_bytes)
+            }
         }
     }
 
@@ -1022,62 +904,21 @@ impl WorkspaceSettings {
         store: std::sync::Arc<PostgresStore>,
     ) -> crate::sources::MissionWorkspaces {
         let default = match self.active {
-            spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow => self
+            spawn_host::WorkspaceBackend::D6 => self
                 .store_with_pg(repo, root, std::sync::Arc::clone(&store))
                 .unwrap_or_else(|error| panic!("{error}")),
-            _ => self.store(repo, root),
+            spawn_host::WorkspaceBackend::Git => self.store(repo, root),
         };
         crate::sources::MissionWorkspaces::one_shot(default, root, store, self.factory(root))
-            .with_cas_dedup(self.cas_dedup)
-    }
-
-    /// What the cas deduplication does with this backend: `"on"`, `"off"`,
-    /// or `"inactive"` (asked for, but only Cow workspaces deduplicate).
-    pub(crate) fn cas_state_for(
-        cas_dedup: bool,
-        active: spawn_host::WorkspaceBackend,
-    ) -> &'static str {
-        match (cas_dedup, active) {
-            (false, _) => "off",
-            (true, spawn_host::WorkspaceBackend::Cow) => "on",
-            (true, _) => "inactive",
-        }
-    }
-
-    pub(crate) fn cas_state(&self) -> &'static str {
-        Self::cas_state_for(self.cas_dedup, self.active)
-    }
-
-    pub(crate) fn servable_for(active: spawn_host::WorkspaceBackend) -> Result<(), String> {
-        if active == spawn_host::WorkspaceBackend::Overlay {
-            return Err(
-                "SPAWN_WORKSPACE_BACKEND=overlay: spawn loop does not serve overlay workspaces \
-                 to engines yet (an engine would start in the empty host mount point, and its \
-                 report, acks and exit file would not be read); use SPAWN_WORKSPACE_BACKEND=cow, \
-                 git or auto"
-                    .to_string(),
-            );
-        }
-        Ok(())
-    }
-
-    /// Refused where engines run (`spawn loop`, `spawn tick`) for a backend
-    /// they cannot serve yet: an overlay workspace is seen only inside its
-    /// holder's mount namespace, while the Bridge starts an engine in the
-    /// workspace's host path and the loop reads its reports, acks and exit
-    /// files there. Never run half-served. (`auto` never chooses it.)
-    pub(crate) fn servable(&self) -> Result<(), String> {
-        Self::servable_for(self.active)
     }
 
     /// The line `spawn loop` says at start.
     pub(crate) fn said(&self, root: &std::path::Path) -> String {
         format!(
-            "workspace backend {} under {} (SPAWN_WORKSPACE_BACKEND={}); cas dedup {}",
+            "workspace backend {} under {} (SPAWN_WORKSPACE_BACKEND={})",
             self.active.name(),
             root.display(),
             self.configured.name(),
-            self.cas_state()
         )
     }
 
@@ -1554,7 +1395,7 @@ pub(crate) fn terminal_host() -> Result<spawn_host::LocalTerminalHost, String> {
 
 #[cfg(test)]
 mod workspace_tests {
-    use super::{Probes, WorkspaceBackend, WorkspaceSettings, cas_dedup, workspace_backend};
+    use super::{Probes, WorkspaceBackend, WorkspaceSettings, workspace_backend};
     use serde_json::json;
     use std::path::{Path, PathBuf};
 
@@ -1563,19 +1404,12 @@ mod workspace_tests {
         Ok(None)
     }
 
-    fn probes<'a>(
-        overlay: &'a dyn Fn(&Path) -> Result<(), String>,
-        cow: &'a dyn Fn(&Path) -> bool,
-    ) -> Probes<'a> {
-        Probes {
-            overlay,
-            cow,
-            marked: &unmarked,
-        }
+    fn probes<'a>() -> Probes<'a> {
+        Probes { marked: &unmarked }
     }
 
     #[test]
-    fn the_workspace_backend_is_git_unless_another_is_named() {
+    fn the_workspace_backend_defaults_to_git() {
         use spawn_host::WorkspaceBackend as HostBackend;
 
         assert_eq!(
@@ -1591,169 +1425,90 @@ mod workspace_tests {
             Ok(WorkspaceBackend::Named(HostBackend::Git))
         );
         assert_eq!(
-            workspace_backend(Some(" cow ")),
-            Ok(WorkspaceBackend::Named(HostBackend::Cow))
-        );
-        assert_eq!(
-            workspace_backend(Some("overlay")),
-            Ok(WorkspaceBackend::Named(HostBackend::Overlay))
-        );
-        assert_eq!(
-            workspace_backend(Some("d6-shadow")),
-            Ok(WorkspaceBackend::Named(HostBackend::D6Shadow))
-        );
-        assert_eq!(
             workspace_backend(Some(" d6 ")),
             Ok(WorkspaceBackend::Named(HostBackend::D6))
         );
         assert_eq!(workspace_backend(Some("auto")), Ok(WorkspaceBackend::Auto));
+        for retired in ["cow", "overlay", "d6-shadow"] {
+            let error = workspace_backend(Some(retired)).expect_err(retired);
+            assert!(error.contains("SPAWN_WORKSPACE_BACKEND"), "{error}");
+            assert!(error.contains("retired"), "{error}");
+            assert!(error.contains("git (the default), d6 or auto"), "{error}");
+        }
         for unknown in ["Git", "COW", "btrfs", "zfs", "overlayfs", "d6_shadow", "1"] {
             let error = workspace_backend(Some(unknown)).expect_err(unknown);
             assert!(error.contains("SPAWN_WORKSPACE_BACKEND"), "{error}");
-            assert!(
-                error.contains("git (the default), cow, overlay, d6-shadow, d6 or auto"),
-                "{error}"
-            );
+            assert!(error.contains("git (the default), d6 or auto"), "{error}");
         }
     }
 
+    /// `auto` is spawn-host's rule: Git on clean roots, or existing root marker when present.
     #[test]
-    fn cas_dedup_is_off_unless_one_and_refuses_anything_else() {
-        assert_eq!(cas_dedup(None), Ok(false));
-        assert_eq!(cas_dedup(Some("")), Ok(false));
-        assert_eq!(cas_dedup(Some("0")), Ok(false));
-        assert_eq!(cas_dedup(Some("1")), Ok(true));
-        for unknown in ["yes", "true", "2", "on"] {
-            let error = cas_dedup(Some(unknown)).expect_err(unknown);
-            assert!(error.contains("SPAWN_CAS_DEDUP"), "{error}");
-        }
-    }
-
-    #[test]
-    fn overlay_asked_for_where_none_mounts_is_refused_never_run_as_another() {
+    fn auto_selects_git_on_clean_roots() {
         let root = Path::new("/srv/work");
-        let none = |_: &Path| Err("user namespaces are off".to_string());
-        let clones = |_: &Path| true;
-        let overlay = WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay);
         let cap = spawn_host::DEFAULT_MAX_FILE_BYTES;
-        let error = WorkspaceSettings::resolve(overlay, false, root, &probes(&none, &clones), cap)
-            .expect_err("refused");
-        assert!(error.contains("SPAWN_WORKSPACE_BACKEND=overlay"), "{error}");
-        assert!(error.contains("user namespaces are off"), "{error}");
-        assert!(error.contains("/srv/work"), "{error}");
-        #[cfg(not(target_os = "linux"))]
-        assert!(WorkspaceSettings::resolve(overlay, false, root, &Probes::host(), cap).is_err());
-    }
+        let auto =
+            WorkspaceSettings::resolve(WorkspaceBackend::Auto, root, &probes(), cap).unwrap();
+        assert_eq!(auto.active, spawn_host::WorkspaceBackend::Git);
+        assert_eq!(auto.active, spawn_host::WorkspaceBackend::auto(root));
 
-    /// `auto` is spawn-host's rule: Cow where clones work, else Git, and
-    /// never the overlay, which the loop would refuse.
-    #[test]
-    fn auto_takes_cow_then_git_and_never_the_overlay() {
-        let root = Path::new("/srv/work");
-        let mounts = |_: &Path| Ok(());
-        let never = |_: &Path| -> Result<(), String> { panic!("auto asks no overlay probe") };
-        let clones = |_: &Path| true;
-        let copies = |_: &Path| false;
-        let cap = spawn_host::DEFAULT_MAX_FILE_BYTES;
-        let active = |overlay: &dyn Fn(&Path) -> Result<(), String>,
-                      cow: &dyn Fn(&Path) -> bool| {
-            WorkspaceSettings::resolve(
-                WorkspaceBackend::Auto,
-                false,
-                root,
-                &probes(overlay, cow),
-                cap,
-            )
-            .unwrap()
-        };
-        assert_eq!(
-            active(&never, &clones).active,
-            spawn_host::WorkspaceBackend::Cow
-        );
-        assert_eq!(
-            active(&never, &copies).active,
-            spawn_host::WorkspaceBackend::Git
-        );
-        for cow in [true, false] {
-            let probe = move |_: &Path| cow;
-            let settings = active(&mounts, &probe);
-            assert_eq!(
-                settings.active,
-                spawn_host::WorkspaceBackend::auto_with(cow),
-                "one rule"
-            );
-            assert!(settings.servable().is_ok(), "auto always starts the loop");
-        }
-        // Asked for by name, git and cow need no probe.
-        let never_cow = |_: &Path| -> bool { panic!("no probe for a named backend") };
         for (configured, backend) in [
             (
                 WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Git),
                 spawn_host::WorkspaceBackend::Git,
             ),
             (
-                WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Cow),
-                spawn_host::WorkspaceBackend::Cow,
+                WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6),
+                spawn_host::WorkspaceBackend::D6,
             ),
         ] {
-            let settings = WorkspaceSettings::resolve(
-                configured,
-                true,
-                root,
-                &probes(&never, &never_cow),
-                cap,
-            )
-            .unwrap();
+            let settings = WorkspaceSettings::resolve(configured, root, &probes(), cap).unwrap();
             assert_eq!(settings.active, backend);
         }
     }
 
     #[test]
-    fn the_settings_are_said_with_the_cas_state_and_overlay_is_not_served() {
+    fn the_settings_are_said_and_build_matching_stores() {
         let root = Path::new("/srv/work");
-        let mounts = |_: &Path| Ok(());
-        let clones = |_: &Path| true;
         let cap = spawn_host::DEFAULT_MAX_FILE_BYTES;
-        let auto = WorkspaceSettings::resolve(
-            WorkspaceBackend::Auto,
-            true,
+        let auto =
+            WorkspaceSettings::resolve(WorkspaceBackend::Auto, root, &probes(), cap).unwrap();
+        assert_eq!(
+            auto.said(root),
+            "workspace backend git under /srv/work (SPAWN_WORKSPACE_BACKEND=auto)"
+        );
+        let git = WorkspaceSettings::resolve(
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Git),
             root,
-            &probes(&mounts, &clones),
+            &probes(),
+            cap,
+        )
+        .unwrap();
+        let d6 = WorkspaceSettings::resolve(
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6),
+            root,
+            &probes(),
             cap,
         )
         .unwrap();
         assert_eq!(
-            auto.said(root),
-            "workspace backend cow under /srv/work (SPAWN_WORKSPACE_BACKEND=auto); cas dedup on"
+            d6.said(root),
+            "workspace backend d6 under /srv/work (SPAWN_WORKSPACE_BACKEND=d6)"
         );
-        let git = WorkspaceSettings::resolve(
-            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Git),
-            true,
-            root,
-            &probes(&mounts, &clones),
-            cap,
-        )
-        .unwrap();
-        assert_eq!(git.cas_state(), "inactive");
-        assert!(git.servable().is_ok() && auto.servable().is_ok());
         assert_eq!(git.store(Path::new("/r.git"), root).backend_name(), "git");
-        assert_eq!(auto.store(Path::new("/r.git"), root).backend_name(), "cow");
-        let overlay = WorkspaceSettings::resolve(
-            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay),
-            false,
-            root,
-            &probes(&mounts, &clones),
-            cap,
-        )
-        .unwrap();
-        assert_eq!(overlay.active, spawn_host::WorkspaceBackend::Overlay);
-        assert_eq!(overlay.cas_state(), "off");
-        let refused = overlay.servable().expect_err("not served");
-        assert!(
-            refused.contains("SPAWN_WORKSPACE_BACKEND=overlay"),
-            "{refused}"
+        assert_eq!(auto.store(Path::new("/r.git"), root).backend_name(), "git");
+        let store_root = std::env::temp_dir().join(format!(
+            "spawn-settings-store-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&store_root);
+        std::fs::create_dir_all(&store_root).expect("create temp store root");
+        assert_eq!(
+            d6.store(Path::new("/r.git"), &store_root).backend_name(),
+            "d6"
         );
-        assert!(refused.contains("cow, git or auto"), "{refused}");
+        let _ = std::fs::remove_dir_all(&store_root);
     }
 
     /// A read of the settings: from the environment and the root's marker
@@ -1764,40 +1519,19 @@ mod workspace_tests {
 
         let peek = WorkspaceSettings::peek_with;
         assert_eq!(
-            peek(
-                Ok(WorkspaceBackend::Named(HostBackend::Git)),
-                Ok(false),
-                Ok(None)
-            ),
-            json!({"configured": "git", "active": "git", "root": null, "cas_dedup": "off",
-                   "servable": true})
+            peek(Ok(WorkspaceBackend::Named(HostBackend::Git)), Ok(None)),
+            json!({"configured": "git", "active": "git", "root": null})
         );
         assert_eq!(
-            peek(Ok(WorkspaceBackend::Auto), Ok(true), Ok(None)),
-            json!({"configured": "auto", "active": null, "root": null, "cas_dedup": "on",
-                   "servable": true})
+            peek(Ok(WorkspaceBackend::Auto), Ok(None)),
+            json!({"configured": "auto", "active": null, "root": null})
         );
         assert_eq!(
-            peek(
-                Ok(WorkspaceBackend::Auto),
-                Ok(true),
-                Ok(Some(HostBackend::Cow))
-            ),
-            json!({"configured": "auto", "active": "cow", "root": "cow", "cas_dedup": "on",
-                   "servable": true})
-        );
-        assert_eq!(
-            peek(
-                Ok(WorkspaceBackend::Named(HostBackend::Overlay)),
-                Ok(false),
-                Ok(None)
-            ),
-            json!({"configured": "overlay", "active": "overlay", "root": null,
-                   "cas_dedup": "off", "servable": false})
+            peek(Ok(WorkspaceBackend::Auto), Ok(Some(HostBackend::D6))),
+            json!({"configured": "auto", "active": "d6", "root": "d6"})
         );
         let conflict = peek(
-            Ok(WorkspaceBackend::Named(HostBackend::Cow)),
-            Ok(false),
+            Ok(WorkspaceBackend::Named(HostBackend::D6)),
             Ok(Some(HostBackend::Git)),
         );
         assert!(
@@ -1809,16 +1543,14 @@ mod workspace_tests {
         );
         let bad = peek(
             Err("SPAWN_WORKSPACE_BACKEND=\"x\" ...".to_string()),
-            Ok(false),
             Ok(None),
         );
         assert_eq!(bad.as_object().map(serde_json::Map::len), Some(1));
     }
 
-    /// `auto` on a root that already is a backend's follows it, even where
-    /// the file system clones: a Git-shaped root with no marker (its
-    /// workspaces, `.transcripts/`) stays Git's, as `spawn mission show`
-    /// says, instead of being refused as Cow at the claim.
+    /// `auto` on a root that already is a backend's follows it: a Git-shaped
+    /// root with no marker (its workspaces, `.transcripts/`) stays Git's, as
+    /// `spawn mission show` says.
     #[test]
     fn auto_follows_an_existing_roots_engine() {
         let base = std::env::temp_dir().join(format!(
@@ -1829,19 +1561,11 @@ mod workspace_tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("owner-gates")).expect("a workspace");
         std::fs::create_dir_all(base.join(".transcripts")).expect("transcripts");
-        let clones = |_: &Path| true;
-        let never = |_: &Path| -> Result<(), String> { panic!("no overlay probe for auto") };
         let host = Probes::host();
-        let probes = Probes {
-            overlay: &never,
-            cow: &clones,
-            marked: host.marked,
-        };
         let settings = WorkspaceSettings::resolve(
             WorkspaceBackend::Auto,
-            false,
             &base,
-            &probes,
+            &host,
             spawn_host::DEFAULT_MAX_FILE_BYTES,
         )
         .unwrap();
@@ -1849,77 +1573,34 @@ mod workspace_tests {
         settings.claim(&base).expect("Git's root claimed for Git");
         let peek = WorkspaceSettings::peek_with(
             Ok(WorkspaceBackend::Auto),
-            Ok(false),
             spawn_host::root_backend(&base).map_err(|error| error.to_string()),
         );
         assert_eq!(peek["active"], "git", "{peek}");
-        assert_eq!(peek["servable"], true, "{peek}");
 
-        // A claimed Cow root: auto follows the marker.
-        let cow = base.join("cow-root");
-        spawn_host::claim_root(&cow, spawn_host::WorkspaceBackend::Cow).unwrap();
-        let copies = |_: &Path| false;
-        let probes = Probes {
-            overlay: &never,
-            cow: &copies,
-            marked: host.marked,
-        };
+        // A claimed D6 root: auto follows the marker.
+        let d6_root = base.join("d6-root");
+        spawn_host::claim_root(&d6_root, spawn_host::WorkspaceBackend::D6).unwrap();
         let settings = WorkspaceSettings::resolve(
             WorkspaceBackend::Auto,
-            false,
-            &cow,
-            &probes,
+            &d6_root,
+            &host,
             spawn_host::DEFAULT_MAX_FILE_BYTES,
         )
         .unwrap();
-        assert_eq!(settings.active, spawn_host::WorkspaceBackend::Cow);
-        let _ = std::fs::remove_dir_all(&base);
-    }
+        assert_eq!(settings.active, spawn_host::WorkspaceBackend::D6);
 
-    /// A start refused for the overlay claims nothing: the fresh root stays
-    /// free, and a later start as Cow, Git or auto claims it.
-    #[test]
-    fn a_refused_overlay_start_leaves_a_fresh_root_unclaimed() {
-        let root = std::env::temp_dir().join(format!(
-            "spawn-overlay-refused-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let mounts = |_: &Path| Ok(());
-        let clones = |_: &Path| true;
-        let overlay = WorkspaceSettings::resolve(
-            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay),
-            false,
-            &root,
-            &probes(&mounts, &clones),
+        // An empty clean root: auto selects Git until explicit D6 cutover/opt-in.
+        let clean_root = base.join("clean-root");
+        std::fs::create_dir_all(&clean_root).expect("empty clean root");
+        let clean_settings = WorkspaceSettings::resolve(
+            WorkspaceBackend::Auto,
+            &clean_root,
+            &host,
             spawn_host::DEFAULT_MAX_FILE_BYTES,
         )
         .unwrap();
-        let refused = overlay.claim(&root).expect_err("not served");
-        assert!(
-            refused.contains("SPAWN_WORKSPACE_BACKEND=overlay"),
-            "{refused}"
-        );
-        assert!(
-            !root.join(spawn_host::BACKEND_MARKER).exists(),
-            "a refused start claimed the root"
-        );
-        assert_eq!(spawn_host::root_backend(&root).unwrap(), None);
-        let cow = WorkspaceSettings::resolve(
-            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Cow),
-            false,
-            &root,
-            &probes(&mounts, &clones),
-            spawn_host::DEFAULT_MAX_FILE_BYTES,
-        )
-        .unwrap();
-        cow.claim(&root).expect("the root is free");
-        assert_eq!(
-            spawn_host::root_backend(&root).unwrap(),
-            Some(spawn_host::WorkspaceBackend::Cow)
-        );
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(clean_settings.active, spawn_host::WorkspaceBackend::Git);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1947,44 +1628,30 @@ mod workspace_tests {
     fn d6_runtime_config_parses_and_validates_all_fields() {
         use super::{D6RuntimeConfig, DEFAULT_D6_TMPFS_BUDGET_MB};
 
-        let def = D6RuntimeConfig::parse(None, None, None, None).expect("default");
+        let def = D6RuntimeConfig::parse(None, None, None).expect("default");
         assert_eq!(def, D6RuntimeConfig::default());
         assert_eq!(
-            def.effective_cas_dir(Path::new("/srv/work"), spawn_host::WorkspaceBackend::D6),
+            def.effective_cas_dir(Path::new("/srv/work")),
             PathBuf::from("/srv/work/.d6/cas")
-        );
-        assert_eq!(
-            def.effective_cas_dir(
-                Path::new("/srv/work"),
-                spawn_host::WorkspaceBackend::D6Shadow
-            ),
-            PathBuf::from("/srv/work/.d6-shadow/cas")
         );
         assert!(def.l1_policy().is_none());
 
-        let configured = D6RuntimeConfig::parse(
-            Some(" /var/lib/d6-cas "),
-            Some("/dev/shm/d6-l1"),
-            None,
-            Some("true"),
-        )
-        .expect("configured");
+        let configured =
+            D6RuntimeConfig::parse(Some(" /var/lib/d6-cas "), Some("/dev/shm/d6-l1"), None)
+                .expect("configured");
         assert_eq!(configured.cas_dir, Some(PathBuf::from("/var/lib/d6-cas")));
         assert_eq!(configured.tmpfs_root, Some(PathBuf::from("/dev/shm/d6-l1")));
-        assert!(configured.strict_fail_closed);
         let l1 = configured.l1_policy().expect("l1 policy");
         assert_eq!(l1.tmpfs_budget_mb, DEFAULT_D6_TMPFS_BUDGET_MB);
 
-        let custom = D6RuntimeConfig::parse(None, Some("/dev/shm/d6-l1"), Some("4096"), Some("1"))
-            .expect("custom");
+        let custom =
+            D6RuntimeConfig::parse(None, Some("/dev/shm/d6-l1"), Some("4096")).expect("custom");
         assert_eq!(custom.l1_policy().expect("l1").tmpfs_budget_mb, 4096);
-        assert!(custom.strict_fail_closed);
 
-        assert!(D6RuntimeConfig::parse(Some("relative/cas"), None, None, None).is_err());
-        assert!(D6RuntimeConfig::parse(None, Some("relative/tmpfs"), None, None).is_err());
-        assert!(D6RuntimeConfig::parse(None, None, Some("0"), None).is_err());
-        assert!(D6RuntimeConfig::parse(None, None, Some("abc"), None).is_err());
-        assert!(D6RuntimeConfig::parse(None, None, None, Some("yes")).is_err());
+        assert!(D6RuntimeConfig::parse(Some("relative/cas"), None, None).is_err());
+        assert!(D6RuntimeConfig::parse(None, Some("relative/tmpfs"), None).is_err());
+        assert!(D6RuntimeConfig::parse(None, None, Some("0")).is_err());
+        assert!(D6RuntimeConfig::parse(None, None, Some("abc")).is_err());
     }
 
     #[test]
@@ -2024,23 +1691,12 @@ mod workspace_tests {
     }
 
     #[test]
-    fn d6_shadow_and_d6_compatibility_in_resolve_and_peek() {
+    fn d6_compatibility_in_resolve_and_peek() {
         use spawn_host::WorkspaceBackend as HostBackend;
 
         let peek = WorkspaceSettings::peek_with;
-        // git root allows d6-shadow (active=d6-shadow, root=git), refuses pure d6
-        assert_eq!(
-            peek(
-                Ok(WorkspaceBackend::Named(HostBackend::D6Shadow)),
-                Ok(false),
-                Ok(Some(HostBackend::Git))
-            ),
-            json!({"configured": "d6-shadow", "active": "d6-shadow", "root": "git",
-                   "cas_dedup": "off", "servable": true})
-        );
         let refused_d6 = peek(
             Ok(WorkspaceBackend::Named(HostBackend::D6)),
-            Ok(false),
             Ok(Some(HostBackend::Git)),
         );
         assert!(
@@ -2050,43 +1706,27 @@ mod workspace_tests {
                 .contains("git backend's"),
             "{refused_d6}"
         );
-        // pure d6 root refuses git and d6-shadow
+        // pure d6 root refuses git
         assert!(
             peek(
                 Ok(WorkspaceBackend::Named(HostBackend::Git)),
-                Ok(false),
                 Ok(Some(HostBackend::D6))
             )["error"]
                 .is_string()
         );
-        assert!(
-            peek(
-                Ok(WorkspaceBackend::Named(HostBackend::D6Shadow)),
-                Ok(false),
-                Ok(Some(HostBackend::D6))
-            )["error"]
-                .is_string()
-        );
-        // resolve d6 / d6-shadow need no cow/overlay probes and are servable
-        let never = |_: &Path| -> Result<(), String> { panic!("no overlay probe for d6") };
-        let never_cow = |_: &Path| -> bool { panic!("no cow probe for d6") };
+        // resolve d6 / git succeed
         for (cfg, eng) in [
-            (
-                WorkspaceBackend::Named(HostBackend::D6Shadow),
-                HostBackend::D6Shadow,
-            ),
             (WorkspaceBackend::Named(HostBackend::D6), HostBackend::D6),
+            (WorkspaceBackend::Named(HostBackend::Git), HostBackend::Git),
         ] {
             let s = WorkspaceSettings::resolve(
                 cfg,
-                false,
                 Path::new("/srv/w"),
-                &probes(&never, &never_cow),
+                &probes(),
                 spawn_host::DEFAULT_MAX_FILE_BYTES,
             )
             .expect("resolve");
             assert_eq!(s.active, eng);
-            assert!(s.servable().is_ok());
         }
     }
 

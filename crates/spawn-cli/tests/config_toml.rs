@@ -403,9 +403,8 @@ token = {{ from_file = "{tok_file}" }}
 web_dir = "/srv/spawn/web"
 
 [storage]
-workspace_backend = "cow"
+workspace_backend = "d6"
 canonical_mount = "/workspace"
-cas_dedup = true
 max_checkpoint_file_mb = 250
 
 [terminal]
@@ -479,8 +478,7 @@ fn spawn_config_resolves_core_storage_terminal_and_network_env() {
     assert_eq!(resolved["SPAWN_SERVE_LOCAL_OPEN"], "1");
     assert_eq!(resolved["SPAWN_SERVE_TOKEN"], "Tok3nValueXYZ");
     assert_eq!(resolved["SPAWN_WEB_DIR"], "/srv/spawn/web");
-    assert_eq!(resolved["SPAWN_WORKSPACE_BACKEND"], "cow");
-    assert_eq!(resolved["SPAWN_CAS_DEDUP"], "1");
+    assert_eq!(resolved["SPAWN_WORKSPACE_BACKEND"], "d6");
     assert_eq!(resolved["SPAWN_MAX_FILE_MB"], "250");
     assert_eq!(resolved["SPAWN_TERMINAL_BACKEND"], "herdr");
     assert_eq!(resolved["SPAWN_HERDR_SESSION"], "spawn-alpha");
@@ -1406,9 +1404,9 @@ fn config_toml_rejects_removed_tmux_terminal_backend() {
 
 #[test]
 fn spawn_config_accepts_d6_backends_and_projects_storage_d6_config() {
-    for backend in ["d6", "d6-shadow"] {
-        let toml = format!(
-            r#"
+    let backend = "d6";
+    let toml = format!(
+        r#"
 schema_version = 1
 
 [instance]
@@ -1422,79 +1420,67 @@ workspace_backend = "{backend}"
 cas_dir = "/var/lib/spawn/d6-cas"
 tmpfs_root = "/dev/shm/spawn-d6-l1"
 tmpfs_budget_mb = 4096
-strict_fail_closed = true
 "#
-        );
-        let cfg = SpawnConfig::from_toml_str_with(&toml, &|_| None)
-            .unwrap_or_else(|e| panic!("accept backend {backend}: {e}"));
-        let d6 = cfg.storage.d6.as_ref().expect("storage.d6 populated");
-        assert_eq!(
-            d6.cas_dir.as_deref(),
-            Some(Path::new("/var/lib/spawn/d6-cas"))
-        );
-        assert_eq!(
-            d6.tmpfs_root.as_deref(),
-            Some(Path::new("/dev/shm/spawn-d6-l1"))
-        );
-        assert_eq!(d6.tmpfs_budget_mb, Some(4096));
-        assert_eq!(d6.strict_fail_closed, Some(true));
+    );
+    let cfg = SpawnConfig::from_toml_str_with(&toml, &|_| None)
+        .unwrap_or_else(|e| panic!("accept backend {backend}: {e}"));
+    let d6 = cfg.storage.d6.as_ref().expect("storage.d6 populated");
+    assert_eq!(
+        d6.cas_dir.as_deref(),
+        Some(Path::new("/var/lib/spawn/d6-cas"))
+    );
+    assert_eq!(
+        d6.tmpfs_root.as_deref(),
+        Some(Path::new("/dev/shm/spawn-d6-l1"))
+    );
+    assert_eq!(d6.tmpfs_budget_mb, Some(4096));
 
-        let env = env_as_map(resolve_env_entries_with(&cfg, &|_| None).expect("resolve env"));
-        assert_eq!(env["SPAWN_WORKSPACE_BACKEND"], backend);
-        assert_eq!(env["SPAWN_D6_CAS_DIR"], "/var/lib/spawn/d6-cas");
-        assert_eq!(env["SPAWN_D6_TMPFS_ROOT"], "/dev/shm/spawn-d6-l1");
-        assert_eq!(env["SPAWN_D6_TMPFS_BUDGET_MB"], "4096");
-        assert_eq!(env["SPAWN_D6_STRICT_FAIL_CLOSED"], "1");
+    let env = env_as_map(resolve_env_entries_with(&cfg, &|_| None).expect("resolve env"));
+    assert_eq!(env["SPAWN_WORKSPACE_BACKEND"], backend);
+    assert_eq!(env["SPAWN_D6_CAS_DIR"], "/var/lib/spawn/d6-cas");
+    assert_eq!(env["SPAWN_D6_TMPFS_ROOT"], "/dev/shm/spawn-d6-l1");
+    assert_eq!(env["SPAWN_D6_TMPFS_BUDGET_MB"], "4096");
 
-        let eff = effective_json_with(&cfg, &|_| None).expect("effective json");
-        assert_eq!(
-            eff["config"]["storage"]["workspace_backend"],
-            json!(backend)
-        );
-        assert_eq!(
-            eff["config"]["storage"]["d6"]["cas_dir"],
-            json!("/var/lib/spawn/d6-cas")
-        );
-        assert_eq!(
-            eff["config"]["storage"]["d6"]["tmpfs_root"],
-            json!("/dev/shm/spawn-d6-l1")
-        );
-        assert_eq!(
-            eff["config"]["storage"]["d6"]["tmpfs_budget_mb"],
-            json!(4096)
-        );
-        assert_eq!(
-            eff["config"]["storage"]["d6"]["strict_fail_closed"],
-            json!(true)
-        );
-        assert_eq!(eff["env"]["SPAWN_WORKSPACE_BACKEND"], json!(backend));
-        assert_eq!(
-            eff["env"]["SPAWN_D6_CAS_DIR"],
-            json!("/var/lib/spawn/d6-cas")
-        );
-        assert_eq!(
-            eff["env"]["SPAWN_D6_TMPFS_ROOT"],
-            json!("/dev/shm/spawn-d6-l1")
-        );
-        assert_eq!(eff["env"]["SPAWN_D6_TMPFS_BUDGET_MB"], json!("4096"));
-        assert_eq!(eff["env"]["SPAWN_D6_STRICT_FAIL_CLOSED"], json!("1"));
-        assert_eq!(eff["origins"]["storage.d6"], json!("file"));
-    }
+    let eff = effective_json_with(&cfg, &|_| None).expect("effective json");
+    assert_eq!(
+        eff["config"]["storage"]["workspace_backend"],
+        json!(backend)
+    );
+    assert_eq!(
+        eff["config"]["storage"]["d6"]["cas_dir"],
+        json!("/var/lib/spawn/d6-cas")
+    );
+    assert_eq!(
+        eff["config"]["storage"]["d6"]["tmpfs_root"],
+        json!("/dev/shm/spawn-d6-l1")
+    );
+    assert_eq!(
+        eff["config"]["storage"]["d6"]["tmpfs_budget_mb"],
+        json!(4096)
+    );
+    assert_eq!(eff["env"]["SPAWN_WORKSPACE_BACKEND"], json!(backend));
+    assert_eq!(
+        eff["env"]["SPAWN_D6_CAS_DIR"],
+        json!("/var/lib/spawn/d6-cas")
+    );
+    assert_eq!(
+        eff["env"]["SPAWN_D6_TMPFS_ROOT"],
+        json!("/dev/shm/spawn-d6-l1")
+    );
+    assert_eq!(eff["env"]["SPAWN_D6_TMPFS_BUDGET_MB"], json!("4096"));
+    assert_eq!(eff["origins"]["storage.d6"], json!("file"));
 
-    let strict_false = r#"
+    let empty_d6 = r#"
 schema_version = 1
 [instance]
 data_dir = "/srv/spawn-d6"
 [storage]
-workspace_backend = "d6-shadow"
-[storage.d6]
-strict_fail_closed = false
+workspace_backend = "d6"
 "#;
-    let cfg_false =
-        SpawnConfig::from_toml_str_with(strict_false, &|_| None).expect("strict false parses");
-    let env_false = env_as_map(resolve_env_entries_with(&cfg_false, &|_| None).expect("env false"));
-    assert_eq!(env_false["SPAWN_D6_STRICT_FAIL_CLOSED"], "0");
-    assert!(!env_false.contains_key("SPAWN_D6_CAS_DIR"));
+    let cfg_empty =
+        SpawnConfig::from_toml_str_with(empty_d6, &|_| None).expect("empty storage.d6 parses");
+    let env_empty = env_as_map(resolve_env_entries_with(&cfg_empty, &|_| None).expect("env empty"));
+    assert!(!env_empty.contains_key("SPAWN_D6_CAS_DIR"));
 }
 
 #[test]
@@ -1508,7 +1494,10 @@ workspace_backend = "zfs"
 "#;
     let err = SpawnConfig::from_toml_str_with(bad_backend, &|_| None)
         .expect_err("invalid workspace_backend");
-    assert!(err.contains("d6") && err.contains("d6-shadow"), "{err}");
+    assert!(
+        err.contains("d6") && err.contains("git") && err.contains("auto"),
+        "{err}"
+    );
 
     for bad_cas in ["relative/cas", "/", "/tmp", "/var/lib", "/srv/d6/../bad"] {
         let toml = format!(
@@ -1679,7 +1668,7 @@ schema_version = 1
 [instance]
 data_dir = "/srv/spawn"
 [storage]
-cas_dedup = false
+max_checkpoint_file_mb = 250
 "#;
     let bare_cfg = parse(bare_toml).expect("bare cfg parses");
     assert_eq!(bare_cfg.storage.workspace_backend, None);
@@ -1753,9 +1742,6 @@ workspace_backend = "d6"
 fn workspace_backend_host_roundtrip_and_auto() {
     let concrete = [
         (spawn_host::WorkspaceBackend::Git, "git"),
-        (spawn_host::WorkspaceBackend::Cow, "cow"),
-        (spawn_host::WorkspaceBackend::Overlay, "overlay"),
-        (spawn_host::WorkspaceBackend::D6Shadow, "d6-shadow"),
         (spawn_host::WorkspaceBackend::D6, "d6"),
     ];
     for (host, name) in concrete {
@@ -1771,4 +1757,34 @@ fn workspace_backend_host_roundtrip_and_auto() {
         Some(WorkspaceBackend::Auto)
     );
     assert_eq!(WorkspaceBackend::parse("unknown"), None);
+}
+
+#[test]
+fn config_init_defaults_workspace_backend_to_auto() {
+    let dir = TempDir::new("init-auto");
+    let data_dir = dir.path().join("data");
+    let out_toml = dir.path().join("spawn.toml");
+    let out = spawn_bin(
+        &[
+            "config",
+            "init",
+            "--data-dir",
+            data_dir.to_str().expect("utf-8"),
+            "--output",
+            out_toml.to_str().expect("utf-8"),
+        ],
+        &[],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rendered = fs::read_to_string(&out_toml).expect("read init toml");
+    assert!(
+        rendered.contains("workspace_backend = \"auto\""),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("cas_dedup"), "{rendered}");
 }

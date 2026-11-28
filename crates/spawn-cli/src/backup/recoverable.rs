@@ -3988,8 +3988,7 @@ fn prepare_source_for_bundle_with_cas(
 
     let cas_dir = match cas_dir_override {
         Some(dir) => dir.to_path_buf(),
-        None => crate::config::D6RuntimeConfig::from_env()?
-            .effective_cas_dir(root, spawn_host::WorkspaceBackend::D6),
+        None => crate::config::D6RuntimeConfig::from_env()?.effective_cas_dir(root),
     };
     if !cas_dir.is_dir() || !cas_dir.join(spawn_cas::CAS_MARKER).is_file() {
         return Err(format!(

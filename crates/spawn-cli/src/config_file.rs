@@ -370,9 +370,6 @@ pub struct StorageD6Config {
     /// Hard L1 memory budget in MiB (`SPAWN_D6_TMPFS_BUDGET_MB`, must be `> 0`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmpfs_budget_mb: Option<u64>,
-    /// Fail checkpoints closed on `TrackedSetLeak` in `d6-shadow` (`SPAWN_D6_STRICT_FAIL_CLOSED`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strict_fail_closed: Option<bool>,
 }
 
 pub use super::workspace_backend::WorkspaceBackend;
@@ -384,8 +381,6 @@ pub struct StorageConfig {
     pub workspace_backend: Option<WorkspaceBackend>,
     #[serde(default = "default_canonical_mount")]
     pub canonical_mount: Option<String>,
-    #[serde(default = "default_true_opt")]
-    pub cas_dedup: Option<bool>,
     #[serde(default)]
     pub max_checkpoint_file_mb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -397,7 +392,6 @@ impl Default for StorageConfig {
         Self {
             workspace_backend: None,
             canonical_mount: default_canonical_mount(),
-            cas_dedup: default_true_opt(),
             max_checkpoint_file_mb: None,
             d6: None,
         }
@@ -1337,14 +1331,6 @@ fn resolve_storage_env(cfg: &SpawnConfig, entries: &mut BTreeMap<String, String>
             .name()
             .to_string(),
     );
-    entries.insert(
-        "SPAWN_CAS_DEDUP".to_string(),
-        if cfg.storage.cas_dedup.unwrap_or(true) {
-            "1".to_string()
-        } else {
-            "0".to_string()
-        },
-    );
     if let Some(max_mb) = cfg.storage.max_checkpoint_file_mb {
         entries.insert("SPAWN_MAX_FILE_MB".to_string(), max_mb.to_string());
     }
@@ -1373,12 +1359,6 @@ fn resolve_storage_env(cfg: &SpawnConfig, entries: &mut BTreeMap<String, String>
             entries.insert(
                 "SPAWN_D6_TMPFS_BUDGET_MB".to_string(),
                 budget_mb.to_string(),
-            );
-        }
-        if let Some(strict) = d6.strict_fail_closed {
-            entries.insert(
-                "SPAWN_D6_STRICT_FAIL_CLOSED".to_string(),
-                if strict { "1" } else { "0" }.to_string(),
             );
         }
     }
@@ -1929,16 +1909,6 @@ fn collect_config_warnings(cfg: &SpawnConfig, warnings: &mut Vec<String>) {
             }
         }
     }
-    if cfg.storage.workspace_backend
-        == Some(WorkspaceBackend::Named(
-            spawn_host::WorkspaceBackend::Overlay,
-        ))
-    {
-        warnings.push(
-            "storage.workspace_backend = \"overlay\" is experimental and refused by `spawn loop`"
-                .to_string(),
-        );
-    }
     if let Some(db) = &cfg.database {
         if let Some(url) = &db.url {
             check_secret_file_permissions(url, warnings);
@@ -2302,7 +2272,6 @@ auth = "local-open"
 [storage]
 workspace_backend = "auto"
 canonical_mount = "/workspace"
-cas_dedup = true
 
 [terminal]
 backend = "herdr"
@@ -2493,7 +2462,6 @@ auth = "local-open"
 [storage]
 workspace_backend = "auto"
 canonical_mount = "/workspace"
-cas_dedup = true
 
 [terminal]
 backend = "herdr"
@@ -3033,18 +3001,12 @@ fn probe_storage(probe_dir: &Path) -> Value {
             "reason": "probe directory is not writable by current user",
         });
     }
-    let cow = spawn_host::cow_clone_supported(probe_dir);
-    #[cfg(target_os = "linux")]
-    let overlay = spawn_host::overlay_supported_in(probe_dir);
-    #[cfg(not(target_os = "linux"))]
-    let overlay: Result<(), String> = Err("overlayfs requires Linux".to_string());
+    let reflink = spawn_host::reflink_supported(probe_dir);
 
     json!({
         "probed": true,
         "path": probe_dir,
-        "cow_clone_supported": cow,
-        "overlay_supported": overlay.is_ok(),
-        "overlay_error": overlay.err(),
+        "reflink_supported": reflink,
     })
 }
 
@@ -3441,12 +3403,11 @@ fn print_doctor_human(report: &Value) {
             .unwrap_or(false)
     );
     println!(
-        "storage ({}): cow={}, overlay={}",
+        "storage ({}): reflink={}",
         report["storage_probes"]["path"]
             .as_str()
             .unwrap_or("unknown"),
-        report["storage_probes"]["cow_clone_supported"],
-        report["storage_probes"]["overlay_supported"],
+        report["storage_probes"]["reflink_supported"],
     );
     print_doctor_shared_build_caches(&report["shared_build_caches"]);
     print_doctor_model_endpoints(&report["model_endpoints"]);

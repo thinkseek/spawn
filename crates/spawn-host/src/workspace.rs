@@ -1,46 +1,25 @@
-//! The workspace store of the machine Spawn runs on: one type over the
-//! five workspace backends ([`GitWorkspace`], [`CowWorkspace`], on Linux
-//! [`OverlayWorkspace`], [`ShadowD6Workspace`] and [`D6Workspace`]), told
-//! apart only here, as [`crate::LocalTerminalHost`] tells the terminal hosts
-//! apart.
+//! The workspace store of the machine Spawn runs on: one type over the two
+//! workspace backends ([`GitWorkspace`] by default and [`D6Workspace`] for
+//! opt-in / cutover CAS Merkle workspaces), told apart only here, as
+//! [`crate::LocalTerminalHost`] tells the terminal hosts apart.
 //!
 //! Every backend obeys the same [`WorkspaceStore`] contract (the branch lock
 //! under `mount_when`, `unmount_when`, `hold` and `set_aside_when`, the
-//! `is_mounted` the Bridge's recovery asks), so a caller holds a
-//! [`LocalWorkspaceStore`] and never asks which backend it is, except to say
-//! it ([`LocalWorkspaceStore::backend_name`]) or to launch a process into an
-//! overlay ([`LocalWorkspaceStore::launch_arguments`]). A backend is chosen
-//! in one place ([`WorkspaceBackend`]), and a root runs one backend only
-//! ([`claim_root`]).
-//!
-//! Build-artifact deduplication ([`crate::cas_dedup`]) is a helper of the
-//! store, never part of a checkpoint: [`LocalWorkspaceStore::dedup_artifacts`]
-//! clones a Cow workspace's `target/` and `node_modules/` against the CAS
-//! at `<root>/.cas` while the workspace is offline, and
-//! [`LocalWorkspaceStore::prune_cas`] drops the blobs nothing uses any more.
+//! `is_mounted` the Bridge's recovery asks). A backend is chosen in one place
+//! ([`WorkspaceBackend`]), and a root runs one backend only ([`claim_root`]).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{BaseMerge, Branch, Commit, Hold, SetAside, WorkspaceError, WorkspaceStore};
 
-use crate::cas_dedup::{
-    ARTIFACT_DIRECTORIES, ArtifactRoot, CAS_MARKER, DedupConfig, DedupReport, PruneReport,
-    dedup_dirs, prune_unused,
-};
 use crate::cas_merkle::{CasMerkleStore, RefLedger};
-use crate::cow::{CowWorkspace, cow_clone_supported};
-use crate::d6_shadow::{ShadowD6Workspace, ShadowOracleMetrics, ShadowTrackedSetMode};
 use crate::d6_workspace::{D6Workspace, L1TmpfsPolicy};
 use crate::git::GitWorkspace;
-#[cfg(target_os = "linux")]
-use crate::overlay::{OverlayWorkspace, overlay_supported_in};
 
 /// Type-erased thread-safe D6 ledger handle stored inside [`LocalWorkspaceStore`].
 pub type DynRefLedger = Arc<dyn RefLedger + Send + Sync>;
@@ -88,114 +67,26 @@ impl std::fmt::Debug for D6StoreOptions {
     }
 }
 
-/// Construction options for [`LocalWorkspaceStore::d6_shadow`].
-#[derive(Clone)]
-pub struct D6ShadowOptions {
-    /// Internal shadow `D6Workspace` directory root (typically `<root>/.d6-shadow/work`).
-    pub shadow_root: PathBuf,
-    /// Content-addressed Merkle object store and journal root.
-    pub cas: Arc<CasMerkleStore>,
-    /// Transactional ref and snapshot ledger (`spawn_refs` / `spawn_snapshots`).
-    pub ledger: DynRefLedger,
-    /// Optional bounded L1 `tmpfs` upperdir policy for shadow staging.
-    pub l1_policy: Option<L1TmpfsPolicy>,
-    /// Fail checkpoints fail-closed when `TrackedSetLeak` triggers.
-    pub strict_fail_closed: bool,
-    /// Tracked-set scan policy (`Strict` by default).
-    pub tracked_set_mode: ShadowTrackedSetMode,
-    /// Per-file checkpoint byte limit for primary and shadow stores.
-    pub max_file_bytes: u64,
-}
-
-impl D6ShadowOptions {
-    /// Create dual-track shadow options with strict leak checking, default scan mode, and
-    /// explicit checkpoint file size cap `max_file_bytes`.
-    pub fn new(
-        shadow_root: impl Into<PathBuf>,
-        cas: Arc<CasMerkleStore>,
-        ledger: DynRefLedger,
-        max_file_bytes: u64,
-    ) -> Self {
-        Self {
-            shadow_root: shadow_root.into(),
-            cas,
-            ledger,
-            l1_policy: None,
-            strict_fail_closed: false,
-            tracked_set_mode: ShadowTrackedSetMode::Strict,
-            max_file_bytes,
-        }
-    }
-
-    /// Configure an optional L1 `tmpfs` policy on the shadow store.
-    #[must_use]
-    pub fn with_l1_policy(mut self, policy: L1TmpfsPolicy) -> Self {
-        self.l1_policy = Some(policy);
-        self
-    }
-
-    /// Configure fail-closed enforcement on `TrackedSetLeak`.
-    #[must_use]
-    pub const fn with_strict_fail_closed(mut self, enabled: bool) -> Self {
-        self.strict_fail_closed = enabled;
-        self
-    }
-
-    /// Override tracked-set scanning mode (for negative leak verification).
-    #[must_use]
-    pub const fn with_tracked_set_mode(mut self, mode: ShadowTrackedSetMode) -> Self {
-        self.tracked_set_mode = mode;
-        self
-    }
-}
-
-impl std::fmt::Debug for D6ShadowOptions {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("D6ShadowOptions")
-            .field("shadow_root", &self.shadow_root)
-            .field("cas_root", &self.cas.cas().root())
-            .field("l1_policy", &self.l1_policy)
-            .field("strict_fail_closed", &self.strict_fail_closed)
-            .field("tracked_set_mode", &self.tracked_set_mode)
-            .field("max_file_bytes", &self.max_file_bytes)
-            .finish_non_exhaustive()
-    }
-}
-
-/// The directory under a store's root that holds the CAS of deduplicated
-/// build artifacts ([`LocalWorkspaceStore::cas_root`]).
-pub const CAS_DIRECTORY: &str = ".cas";
-
 /// The file under a workspace root that names the one backend its
 /// workspaces run on ([`claim_root`]).
 pub const BACKEND_MARKER: &str = ".spawn-workspace-backend";
 
-/// The five backends a [`LocalWorkspaceStore`] can be, by name. The one
-/// place a backend is chosen ([`WorkspaceBackend::auto_with`]): the
-/// constructors here and `spawn`'s `SPAWN_WORKSPACE_BACKEND` both use it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// The two backends a [`LocalWorkspaceStore`] can be: `git` (default)
+/// or opt-in pure-Rust `d6`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum WorkspaceBackend {
     /// [`GitWorkspace`].
+    #[default]
     Git,
-    /// [`CowWorkspace`].
-    Cow,
-    /// `OverlayWorkspace` (Linux).
-    Overlay,
-    /// Dual-track oracle wrapping authoritative [`GitWorkspace`] beside shadow [`D6Workspace`].
-    D6Shadow,
     /// Pure-Rust CAS Merkle + transactional ledger workspace store ([`D6Workspace`]).
     D6,
 }
 
 impl WorkspaceBackend {
-    /// `"git"`, `"cow"`, `"overlay"`, `"d6-shadow"` or `"d6"`.
+    /// `"git"` or `"d6"`.
     pub fn name(self) -> &'static str {
         match self {
             Self::Git => "git",
-            Self::Cow => "cow",
-            Self::Overlay => "overlay",
-            Self::D6Shadow => "d6-shadow",
             Self::D6 => "d6",
         }
     }
@@ -204,67 +95,70 @@ impl WorkspaceBackend {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "git" => Some(Self::Git),
-            "cow" => Some(Self::Cow),
-            "overlay" => Some(Self::Overlay),
-            "d6-shadow" => Some(Self::D6Shadow),
             "d6" => Some(Self::D6),
             _ => None,
         }
     }
 
-    /// The backend "the cheapest supported" means, given whether the root's
-    /// file system clones copy-on-write: Cow where it does, else Git. Never
-    /// the overlay and never opt-in `d6`/`d6-shadow`.
-    pub fn auto_with(clones: bool) -> Self {
-        if clones { Self::Cow } else { Self::Git }
-    }
-
-    /// [`Self::auto_with`] for `root`, asked of its file system
-    /// ([`cow_clone_supported`]: a probe file is cloned there; the root is
-    /// made if missing).
-    pub fn auto(root: &Path) -> Self {
-        let _ = std::fs::create_dir_all(root);
-        Self::auto_with(cow_clone_supported(root))
+    /// Default backend (`Git`) when selecting `"auto"` for a clean root.
+    pub const fn auto(_root: &Path) -> Self {
+        Self::Git
     }
 }
 
 /// Whether `requested` may safely share a root already initialized by `existing`.
-///
-/// Pure `d6` roots never mix with `git`/`cow`/`overlay`/`d6-shadow` without explicit cutover,
-/// while opt-in `d6-shadow` safely wraps an authoritative `git` root (and toggling `d6-shadow`
-/// back to `git` preserves the root).
 pub const fn backends_compatible(existing: WorkspaceBackend, requested: WorkspaceBackend) -> bool {
     matches!(
         (existing, requested),
-        (
-            WorkspaceBackend::Git | WorkspaceBackend::D6Shadow,
-            WorkspaceBackend::Git | WorkspaceBackend::D6Shadow
-        ) | (WorkspaceBackend::Cow, WorkspaceBackend::Cow)
-            | (WorkspaceBackend::Overlay, WorkspaceBackend::Overlay)
-            | (WorkspaceBackend::D6, WorkspaceBackend::D6)
+        (WorkspaceBackend::D6, WorkspaceBackend::D6)
+            | (WorkspaceBackend::Git, WorkspaceBackend::Git)
+    )
+}
+
+const RETIRED_BACKEND_DIRS: &[(&str, &str)] = &[
+    (".cow", "cow"),
+    (".overlay", "overlay"),
+    (".d6-shadow", "d6-shadow"),
+];
+
+fn retired_backend_dir_error(root: &Path, entry_path: &Path, backend: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "workspace root {} contains retired {backend} backend directory {} \
+             (removed in S3a; migrate or use a new SPAWN_WORKSPACE_ROOT — see docs/upgrading.md)",
+            root.display(),
+            entry_path.display()
+        ),
     )
 }
 
 /// The backend `root`'s workspaces run on, read and never written: the one
-/// its [`BACKEND_MARKER`] names, else the one what is there shows (a root
-/// from before the marker: `.cow/` is Cow's, `.overlay/` the overlay's, `.d6/`
-/// native D6's, `.d6-shadow/` shadow D6's, any workspace directory Git's),
-/// else `None` (a new or empty root). A marker that names no backend is an error.
+/// its [`BACKEND_MARKER`] names, else the one what is there shows (`.d6/` is
+/// native D6's, `.sources/` or any workspace directory is Git's), else `None`
+/// (a new or empty root). A marker that names no supported backend or an
+/// unmarked root containing retired `.cow/`, `.overlay/`, or `.d6-shadow/`
+/// directories fails closed.
 pub fn root_backend(root: &Path) -> std::io::Result<Option<WorkspaceBackend>> {
     match std::fs::read_to_string(root.join(BACKEND_MARKER)) {
         Ok(text) => {
-            return WorkspaceBackend::parse(text.trim())
-                .map(Some)
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "{} names no workspace backend: {:?}",
-                            root.join(BACKEND_MARKER).display(),
-                            text.trim()
-                        ),
+            let trimmed = text.trim();
+            return WorkspaceBackend::parse(trimmed).map(Some).ok_or_else(|| {
+                let message = if matches!(trimmed, "cow" | "overlay" | "d6-shadow") {
+                    format!(
+                        "{} names retired workspace backend {trimmed:?} \
+                         (removed in S3a; migrate or use a new SPAWN_WORKSPACE_ROOT — see docs/upgrading.md)",
+                        root.join(BACKEND_MARKER).display(),
                     )
-                });
+                } else {
+                    format!(
+                        "{} names no workspace backend: {:?}",
+                        root.join(BACKEND_MARKER).display(),
+                        trimmed
+                    )
+                };
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+            });
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
@@ -274,60 +168,55 @@ pub fn root_backend(root: &Path) -> std::io::Result<Option<WorkspaceBackend>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    let mut has_d6 = false;
     let mut workspaces = false;
-    let mut shadow_dir = false;
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
-        match name.to_str() {
-            Some(".cow") => return Ok(Some(WorkspaceBackend::Cow)),
-            Some(".overlay") => return Ok(Some(WorkspaceBackend::Overlay)),
-            Some(".d6") => return Ok(Some(WorkspaceBackend::D6)),
-            Some(".d6-shadow") => shadow_dir = true,
-            _ => {}
+        if let Some(name_str) = name.to_str() {
+            if let Some((_, retired)) = RETIRED_BACKEND_DIRS
+                .iter()
+                .find(|(dir_name, _)| *dir_name == name_str)
+            {
+                return Err(retired_backend_dir_error(root, &entry.path(), retired));
+            }
+            if name_str == ".d6" {
+                has_d6 = true;
+                continue;
+            }
         }
-        workspaces |= !name.as_encoded_bytes().starts_with(b".") && entry.file_type()?.is_dir();
+        let is_git_dir = (name.to_str() == Some(".sources")
+            || !name.as_encoded_bytes().starts_with(b"."))
+            && entry.file_type()?.is_dir();
+        workspaces |= is_git_dir;
     }
-    if shadow_dir {
-        return Ok(Some(WorkspaceBackend::D6Shadow));
+    if has_d6 {
+        Ok(Some(WorkspaceBackend::D6))
+    } else {
+        Ok(workspaces.then_some(WorkspaceBackend::Git))
     }
-    Ok(workspaces.then_some(WorkspaceBackend::Git))
 }
 
 /// Claim `root` for `backend`: the first store of any process to use the
 /// root writes its [`BACKEND_MARKER`] (made beside it and linked into
 /// place, so two processes racing to claim it see one winner), and every
-/// later one must ask for a compatible backend ([`backends_compatible`]). Refused,
-/// with nothing written, when the root belongs to an incompatible backend
-/// ([`root_backend`]): pure `git` and pure `d6` never share a root without
-/// an explicit cutover, while `d6-shadow` can safely run over a `git` root.
+/// later one must ask for a compatible backend ([`backends_compatible`]).
+/// Refused, with nothing written, when the root belongs to an incompatible
+/// backend ([`root_backend`]): pure `git` and pure `d6` never share a root
+/// without an explicit cutover.
 pub fn claim_root(root: &Path, backend: WorkspaceBackend) -> Result<(), String> {
     let marker = root.join(BACKEND_MARKER);
     let refused = |there: WorkspaceBackend| {
-        // Name the marker only when there is one: a root from before it
-        // was read by what it holds.
         let why = if marker.is_file() {
             format!("named by {}", marker.display())
         } else {
             "by what the root holds".to_string()
         };
-        let cutover_hint = if matches!(
-            (there, backend),
-            (
-                WorkspaceBackend::Git | WorkspaceBackend::D6Shadow,
-                WorkspaceBackend::D6
-            ) | (
-                WorkspaceBackend::D6,
-                WorkspaceBackend::Git | WorkspaceBackend::D6Shadow
-            )
-        ) {
-            " (complete D6 project cutover before switching between git and pure d6, or use another SPAWN_WORKSPACE_ROOT)"
-        } else {
-            " or use another SPAWN_WORKSPACE_ROOT"
-        };
         format!(
             "workspace root {} is the {} backend's ({why}); refusing to run the {} backend on \
-             it: set SPAWN_WORKSPACE_BACKEND={} (or auto, which follows the root){cutover_hint}",
+             it: set SPAWN_WORKSPACE_BACKEND={} (or auto, which follows the root) (complete D6 \
+             project cutover before switching between git and pure d6, or use another \
+             SPAWN_WORKSPACE_ROOT)",
             root.display(),
             there.name(),
             backend.name(),
@@ -342,7 +231,10 @@ pub fn claim_root(root: &Path, backend: WorkspaceBackend) -> Result<(), String> 
     };
     let marker_backend = existing.unwrap_or(backend);
     std::fs::create_dir_all(root).map_err(|error| format!("create {}: {error}", root.display()))?;
-    let staged = root.join(format!("{BACKEND_MARKER}.{}", crate::cow::unique_suffix()));
+    let staged = root.join(format!(
+        "{BACKEND_MARKER}.{}",
+        crate::reflink::unique_suffix()
+    ));
     std::fs::write(&staged, format!("{}\n", marker_backend.name()))
         .and_then(|()| std::fs::File::open(&staged)?.sync_all())
         .map_err(|error| format!("write {}: {error}", staged.display()))?;
@@ -359,125 +251,15 @@ pub fn claim_root(root: &Path, backend: WorkspaceBackend) -> Result<(), String> 
     }
 }
 
-/// Dual-track `d6-shadow` store wrapping an authoritative [`GitWorkspace`]
-/// and a shadow [`D6Workspace`] constructed from a single shared
-/// `max_file_bytes` cap.
-///
-/// Fields are private so primary and shadow caps cannot diverge across
-/// construction or ledger rebinding.
-#[derive(Debug)]
-pub struct LocalD6ShadowStore {
-    oracle: ShadowD6Workspace<GitWorkspace, DynRefLedger>,
-    max_file_bytes: u64,
-}
-
-impl LocalD6ShadowStore {
-    /// Construct a dual-track `d6-shadow` store over bare repository `repo`
-    /// and working root `root`, sharing `options.max_file_bytes` across both
-    /// primary Git and shadow D6 stores.
-    pub fn new(repo: impl AsRef<Path>, root: impl AsRef<Path>, options: D6ShadowOptions) -> Self {
-        Self::build(repo, root, options, Vec::new())
-    }
-
-    fn build(
-        repo: impl AsRef<Path>,
-        root: impl AsRef<Path>,
-        options: D6ShadowOptions,
-        extra_exclude_files: Vec<PathBuf>,
-    ) -> Self {
-        let repo = repo.as_ref();
-        let max_file_bytes = options.max_file_bytes;
-        let primary = GitWorkspace::new(repo, root, max_file_bytes);
-        let mut shadow = D6Workspace::new(
-            primary.project().to_string(),
-            options.shadow_root,
-            options.cas,
-            Arc::new(options.ledger),
-            max_file_bytes,
-        )
-        .with_extra_exclude_files(extra_exclude_files);
-        if let Some(policy) = options.l1_policy {
-            shadow = shadow.with_l1_policy(policy);
-        }
-        let oracle = ShadowD6Workspace::with_git_repo(primary, shadow, repo)
-            .with_strict_fail_closed(options.strict_fail_closed)
-            .with_tracked_set_mode(options.tracked_set_mode);
-        debug_assert_eq!(oracle.primary().max_file_bytes(), max_file_bytes);
-        debug_assert_eq!(oracle.shadow().max_file_bytes(), max_file_bytes);
-        Self {
-            oracle,
-            max_file_bytes,
-        }
-    }
-
-    /// Rebuild this `d6-shadow` store with a new [`DynRefLedger`], keeping the
-    /// single shared `max_file_bytes` invariant intact.
-    #[must_use]
-    pub fn with_ledger(&self, ledger: DynRefLedger) -> Self {
-        let repo = self.oracle.git_repo().map_or_else(
-            || PathBuf::from(self.oracle.primary().project()),
-            Path::to_path_buf,
-        );
-        let mut opts = D6ShadowOptions::new(
-            self.oracle.shadow().root().to_path_buf(),
-            self.oracle.shadow().store().clone(),
-            ledger,
-            self.max_file_bytes,
-        )
-        .with_strict_fail_closed(self.oracle.strict_fail_closed())
-        .with_tracked_set_mode(self.oracle.tracked_set_mode());
-        if let Some(policy) = self.oracle.shadow().l1_policy() {
-            opts = opts.with_l1_policy(policy.clone());
-        }
-        Self::build(
-            &repo,
-            self.oracle.primary().root(),
-            opts,
-            self.oracle.shadow().extra_exclude_files().to_vec(),
-        )
-    }
-
-    /// Shared checkpoint file size cap in bytes enforced on both primary and shadow stores.
-    pub const fn max_file_bytes(&self) -> u64 {
-        self.max_file_bytes
-    }
-
-    /// Borrow the underlying [`ShadowD6Workspace`] oracle.
-    pub const fn oracle(&self) -> &ShadowD6Workspace<GitWorkspace, DynRefLedger> {
-        &self.oracle
-    }
-
-    /// Borrow the authoritative primary [`GitWorkspace`].
-    pub const fn primary(&self) -> &GitWorkspace {
-        self.oracle.primary()
-    }
-
-    /// Borrow the shadow [`D6Workspace`].
-    pub const fn shadow(&self) -> &D6Workspace<DynRefLedger> {
-        self.oracle.shadow()
-    }
-}
-
-/// The workspace store of this machine: Git working copies (the default),
-/// copy-on-write clones of a per-commit baseline, on Linux an unprivileged
-/// overlay over a per-commit snapshot layer, dual-track `d6-shadow` over Git,
-/// or native pure-Rust `d6`.
+/// The workspace store of this machine: `git` (the default) or opt-in
+/// pure-Rust `d6` (`D6Workspace`).
 #[derive(Debug)]
 #[expect(clippy::large_enum_variant)]
 pub enum LocalWorkspaceStore {
-    /// One `git worktree`-style working copy per branch ([`GitWorkspace`]).
-    Git(GitWorkspace),
-    /// One plain directory per branch, cloned extent by extent from a
-    /// read-only baseline of its commit ([`CowWorkspace`]).
-    Cow(CowWorkspace),
-    /// One unprivileged overlay per branch over a shared snapshot of its
-    /// commit ([`OverlayWorkspace`]).
-    #[cfg(target_os = "linux")]
-    Overlay(OverlayWorkspace),
-    /// Dual-track oracle running authoritative [`GitWorkspace`] with shadow [`D6Workspace`].
-    D6Shadow(LocalD6ShadowStore),
     /// Pure-Rust CAS Merkle + transactional ledger workspace store ([`D6Workspace`]).
     D6(D6Workspace<DynRefLedger>),
+    /// One `git worktree`-style working copy per branch ([`GitWorkspace`]).
+    Git(GitWorkspace),
 }
 
 impl LocalWorkspaceStore {
@@ -485,47 +267,6 @@ impl LocalWorkspaceStore {
     /// `root`, with checkpoint file size cap `max_file_bytes`.
     pub fn git(repo: impl AsRef<Path>, root: impl AsRef<Path>, max_file_bytes: u64) -> Self {
         Self::Git(GitWorkspace::new(repo, root, max_file_bytes))
-    }
-
-    /// The copy-on-write store over `repo`, workspaces under `root`, with
-    /// checkpoint file size cap `max_file_bytes`. It works on any file
-    /// system (a mount copies where it cannot clone); [`Self::auto`] chooses
-    /// it only where clones work.
-    pub fn cow(repo: impl AsRef<Path>, root: impl AsRef<Path>, max_file_bytes: u64) -> Self {
-        Self::Cow(CowWorkspace::new(repo, root, max_file_bytes))
-    }
-
-    /// The overlay store over `repo`, workspaces under `root`, with
-    /// checkpoint file size cap `max_file_bytes`, once the kernel showed an
-    /// unprivileged overlay mounts under `root` ([`overlay_supported_in`]);
-    /// refused, with the kernel's reason, otherwise.
-    #[cfg(target_os = "linux")]
-    pub fn overlay(
-        repo: impl AsRef<Path>,
-        root: impl AsRef<Path>,
-        max_file_bytes: u64,
-    ) -> Result<Self, String> {
-        let root = root.as_ref();
-        std::fs::create_dir_all(root)
-            .map_err(|error| format!("create {}: {error}", root.display()))?;
-        overlay_supported_in(root)
-            .map_err(|why| format!("no unprivileged overlay under {}: {why}", root.display()))?;
-        Ok(Self::Overlay(OverlayWorkspace::new(
-            repo,
-            root,
-            max_file_bytes,
-        )))
-    }
-
-    /// The overlay store: never on a system other than Linux.
-    #[cfg(not(target_os = "linux"))]
-    pub fn overlay(
-        repo: impl AsRef<Path>,
-        root: impl AsRef<Path>,
-        max_file_bytes: u64,
-    ) -> Result<Self, String> {
-        let _ = (repo, root, max_file_bytes);
-        Err("the overlay workspace store needs Linux".to_string())
     }
 
     /// Pure-Rust CAS Merkle + ledger workspace store (`D6Workspace`) for `project`
@@ -544,45 +285,17 @@ impl LocalWorkspaceStore {
         Self::D6(store)
     }
 
-    /// Dual-track `d6-shadow` store wrapping authoritative [`GitWorkspace`] over
-    /// `repo` with workspaces under `root` and shadow state in `options.shadow_root`.
-    pub fn d6_shadow(
-        repo: impl AsRef<Path>,
-        root: impl AsRef<Path>,
-        options: D6ShadowOptions,
-    ) -> Self {
-        Self::D6Shadow(LocalD6ShadowStore::new(repo, root, options))
-    }
-
     /// Checkpoint file size cap in bytes across whichever backend this store wraps.
     pub const fn max_file_bytes(&self) -> u64 {
         match self {
-            Self::Git(git) => git.max_file_bytes(),
-            Self::Cow(cow) => cow.max_file_bytes(),
-            #[cfg(target_os = "linux")]
-            Self::Overlay(overlay) => overlay.max_file_bytes(),
-            Self::D6Shadow(store) => store.max_file_bytes(),
             Self::D6(d6) => d6.max_file_bytes(),
+            Self::Git(git) => git.max_file_bytes(),
         }
     }
 
-    /// The cheapest store `root` supports that every caller can serve
-    /// ([`WorkspaceBackend::auto`]): copy-on-write clones when its file
-    /// system clones ([`cow_clone_supported`]: btrfs, XFS with reflink,
-    /// APFS), else Git working copies. Never the overlay, which is chosen
-    /// by name alone ([`Self::overlay`]).
-    pub fn auto(repo: impl AsRef<Path>, root: impl AsRef<Path>, max_file_bytes: u64) -> Self {
-        let root = root.as_ref();
-        match WorkspaceBackend::auto(root) {
-            WorkspaceBackend::Cow => Self::cow(repo, root, max_file_bytes),
-            _ => Self::git(repo, root, max_file_bytes),
-        }
-    }
-
-    /// The store of `backend` over `repo`, workspaces under `root`, with
-    /// checkpoint file size cap `max_file_bytes`; the overlay only where the
-    /// kernel mounts one ([`Self::overlay`]). Opt-in D6 backends require CAS
-    /// + ledger configuration via [`Self::d6_shadow`] or [`Self::d6`].
+    /// Open `backend` over `repo`, workspaces under `root`, with checkpoint
+    /// file size cap `max_file_bytes`. Native `d6` requires CAS + ledger
+    /// configuration via [`Self::d6`].
     pub fn open(
         backend: WorkspaceBackend,
         repo: impl AsRef<Path>,
@@ -591,52 +304,32 @@ impl LocalWorkspaceStore {
     ) -> Result<Self, String> {
         match backend {
             WorkspaceBackend::Git => Ok(Self::git(repo, root, max_file_bytes)),
-            WorkspaceBackend::Cow => Ok(Self::cow(repo, root, max_file_bytes)),
-            WorkspaceBackend::Overlay => Self::overlay(repo, root, max_file_bytes),
-            WorkspaceBackend::D6Shadow | WorkspaceBackend::D6 => Err(format!(
-                "workspace backend {} requires CAS and RefLedger configuration (use \
-                 LocalWorkspaceStore::{} or WorkspaceSettings)",
-                backend.name(),
-                if backend == WorkspaceBackend::D6 {
-                    "d6"
-                } else {
-                    "d6_shadow"
-                }
-            )),
+            WorkspaceBackend::D6 => Err(
+                "workspace backend d6 requires CAS and RefLedger configuration (use \
+                 LocalWorkspaceStore::d6 or WorkspaceSettings)"
+                    .to_string(),
+            ),
         }
     }
 
     /// Which backend this is.
     pub fn backend(&self) -> WorkspaceBackend {
         match self {
-            Self::Git(_) => WorkspaceBackend::Git,
-            Self::Cow(_) => WorkspaceBackend::Cow,
-            #[cfg(target_os = "linux")]
-            Self::Overlay(_) => WorkspaceBackend::Overlay,
-            Self::D6Shadow(_) => WorkspaceBackend::D6Shadow,
             Self::D6(_) => WorkspaceBackend::D6,
+            Self::Git(_) => WorkspaceBackend::Git,
         }
     }
 
-    /// Which backend this is: `"git"`, `"cow"`, `"overlay"`, `"d6-shadow"` or `"d6"`.
+    /// Which backend this is: `"d6"` or `"git"`.
     pub fn backend_name(&self) -> &'static str {
         self.backend().name()
     }
 
-    /// Oracle metrics snapshot when backed by [`Self::D6Shadow`].
-    pub fn shadow_metrics(&self) -> Option<ShadowOracleMetrics> {
-        match self {
-            Self::D6Shadow(store) => Some(store.oracle().metrics()),
-            _ => None,
-        }
-    }
-
-    /// Reserved L1 `tmpfs` bytes across mounted branches when backed by D6 / D6-shadow.
+    /// Reserved L1 `tmpfs` bytes across mounted branches when backed by D6.
     pub fn d6_l1_reserved_bytes(&self) -> Option<u64> {
         match self {
             Self::D6(store) => Some(store.l1_total_reserved_bytes()),
-            Self::D6Shadow(store) => Some(store.shadow().l1_total_reserved_bytes()),
-            _ => None,
+            Self::Git(_) => None,
         }
     }
 
@@ -644,17 +337,7 @@ impl LocalWorkspaceStore {
     pub const fn d6_workspace(&self) -> Option<&D6Workspace<DynRefLedger>> {
         match self {
             Self::D6(store) => Some(store),
-            _ => None,
-        }
-    }
-
-    /// Borrow the underlying [`ShadowD6Workspace`] when backed by [`Self::D6Shadow`].
-    pub const fn d6_shadow_workspace(
-        &self,
-    ) -> Option<&ShadowD6Workspace<GitWorkspace, DynRefLedger>> {
-        match self {
-            Self::D6Shadow(store) => Some(store.oracle()),
-            _ => None,
+            Self::Git(_) => None,
         }
     }
 
@@ -663,53 +346,11 @@ impl LocalWorkspaceStore {
         claim_root(self.root(), self.backend())
     }
 
-    /// Remove what no mounted workspace uses any more: a Cow store's
-    /// baselines ([`CowWorkspace::prune_baselines`]), an overlay store's
-    /// snapshot layers ([`OverlayWorkspace::prune_layers`]), and, on Linux,
-    /// the overlay probes a killed process left under the root
-    /// ([`crate::sweep_probes`]). Each step runs whatever the others found:
-    /// a probe that cannot be removed (it holds a `*.jsonl`) or a root that
-    /// cannot be listed is a warning, and the baselines and layers are still
-    /// pruned. Returns how many trees went and the warnings; an error only
-    /// when the baselines or layers could not be pruned (a state that cannot
-    /// be read prunes nothing).
-    pub fn prune_unused(&self) -> Result<(usize, Vec<String>), String> {
-        #[cfg(target_os = "linux")]
-        let (swept, warnings) = match crate::overlay::sweep_probes(self.root()) {
-            Ok(swept) => (
-                swept.removed,
-                swept
-                    .kept
-                    .iter()
-                    .map(|(probe, why)| format!("overlay probe {} kept: {why}", probe.display()))
-                    .collect(),
-            ),
-            Err(error) => (0, vec![format!("sweep overlay probes: {error}")]),
-        };
-        #[cfg(not(target_os = "linux"))]
-        let (swept, warnings) = (0, Vec::new());
-        let pruned = match self {
-            Self::Git(_) | Self::D6Shadow(_) | Self::D6(_) => 0,
-            Self::Cow(store) => store
-                .prune_baselines()
-                .map_err(|error| format!("prune baselines: {error}"))?,
-            #[cfg(target_os = "linux")]
-            Self::Overlay(store) => store
-                .prune_layers()
-                .map_err(|error| format!("prune layers: {error}"))?,
-        };
-        Ok((swept + pruned, warnings))
-    }
-
     /// The resolved root workspaces live under.
     pub fn root(&self) -> &Path {
         match self {
-            Self::Git(store) => store.root(),
-            Self::Cow(store) => store.root(),
-            #[cfg(target_os = "linux")]
-            Self::Overlay(store) => store.root(),
-            Self::D6Shadow(store) => store.primary().root(),
             Self::D6(store) => store.root(),
+            Self::Git(store) => store.root(),
         }
     }
 
@@ -722,20 +363,16 @@ impl LocalWorkspaceStore {
         self.inner().commit(workspace, message)
     }
 
-    /// Discard the mounted `workspace` directory cleanly (and any L1/shadow state).
+    /// Discard the mounted `workspace` directory cleanly (and any L1 state).
     pub fn discard(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
         match self {
-            Self::D6Shadow(store) => store.oracle().discard(workspace),
             Self::D6(store) => store.discard(workspace),
-            _ => self.inner().unmount(workspace),
+            Self::Git(_) => self.inner().unmount(workspace),
         }
     }
 
     /// [`WorkspaceStore::set_aside`], only while `ready` says the agent is
-    /// idle, asked under the branch's lock before anything is written
-    /// ([`GitWorkspace::set_aside_when`], [`CowWorkspace::set_aside_when`],
-    /// [`OverlayWorkspace::set_aside_when`], [`D6Workspace::set_aside_when`],
-    /// [`ShadowD6Workspace::set_aside_when`]: one rule).
+    /// idle, asked under the branch's lock before anything is written.
     pub fn set_aside_when(
         &self,
         branch: &BranchName,
@@ -744,18 +381,13 @@ impl LocalWorkspaceStore {
         ready: &dyn Fn() -> Result<(), String>,
     ) -> Result<SetAside, WorkspaceError> {
         match self {
-            Self::Git(store) => store.set_aside_when(branch, start, message, ready),
-            Self::Cow(store) => store.set_aside_when(branch, start, message, ready),
-            #[cfg(target_os = "linux")]
-            Self::Overlay(store) => store.set_aside_when(branch, start, message, ready),
-            Self::D6Shadow(store) => store.oracle().set_aside_when(branch, start, message, ready),
             Self::D6(store) => store.set_aside_when(branch, start, message, ready),
+            Self::Git(store) => store.set_aside_when(branch, start, message, ready),
         }
     }
 
     /// Commit the workspace, asking `take_back` first, under the branch's
-    /// lock, when its branch is gone ([`GitWorkspace::commit_or_take_back`]
-    /// and its Cow, overlay, `D6Shadow` and `D6` twins).
+    /// lock, when its branch is gone.
     pub fn commit_or_take_back(
         &self,
         workspace: &WorkspaceId,
@@ -763,23 +395,13 @@ impl LocalWorkspaceStore {
         take_back: &dyn Fn() -> Result<(), WorkspaceError>,
     ) -> Result<Commit, WorkspaceError> {
         match self {
-            Self::Git(store) => store.commit_or_take_back(workspace, message, take_back),
-            Self::Cow(store) => store.commit_or_take_back(workspace, message, take_back),
-            #[cfg(target_os = "linux")]
-            Self::Overlay(store) => store.commit_or_take_back(workspace, message, take_back),
-            Self::D6Shadow(store) => store
-                .oracle()
-                .commit_or_take_back(workspace, message, take_back),
             Self::D6(store) => store.commit_or_take_back(workspace, message, take_back),
+            Self::Git(store) => store.commit_or_take_back(workspace, message, take_back),
         }
     }
 
     /// Persists worker workspace changes/HEAD into `refs/spawn/workers/<branch>/head`
     /// and `target_refs` without modifying `refs/heads/*` (`#103`, `#110`).
-    ///
-    /// Git/CoW stores fetch from the workspace's inner `.git` repository; [`D6Workspace`]
-    /// scans working-tree changes directly into CAS snapshots and persistent `RefLedger` /
-    /// `refs.journal` transitions in pure Rust without reading through `.git` pointer files.
     pub fn pin_worker_head(
         &self,
         branch: &str,
@@ -787,16 +409,8 @@ impl LocalWorkspaceStore {
         target_refs: &[&str],
     ) -> Result<Option<CommitId>, WorkspaceError> {
         match self {
-            Self::Git(store) => store.pin_worker_head(branch, directory, target_refs),
-            Self::Cow(store) => store.pin_worker_head(branch, directory, target_refs),
-            Self::D6Shadow(store) => {
-                store
-                    .primary()
-                    .pin_worker_head(branch, directory, target_refs)
-            }
-            #[cfg(target_os = "linux")]
-            Self::Overlay(_) => Ok(None),
             Self::D6(store) => store.pin_worker_head(branch, directory, target_refs),
+            Self::Git(store) => store.pin_worker_head(branch, directory, target_refs),
         }
     }
 
@@ -807,145 +421,41 @@ impl LocalWorkspaceStore {
         commit: &str,
     ) -> Result<Vec<String>, WorkspaceError> {
         match self {
-            Self::Git(store) => store.conflict_markers(base, commit),
-            Self::Cow(store) => store.git_store().conflict_markers(base, commit),
-            #[cfg(target_os = "linux")]
-            Self::Overlay(store) => store.git_store().conflict_markers(base, commit),
-            Self::D6Shadow(oracle) => oracle.primary().conflict_markers(base, commit),
             Self::D6(store) => store.conflict_markers(base, commit),
+            Self::Git(store) => store.conflict_markers(base, commit),
         }
     }
 
     /// Unified patch turning `from` into `to` for Git-backed stores.
     pub fn patch_between(&self, from: &str, to: &str) -> Result<String, WorkspaceError> {
         match self {
-            Self::Git(store) => store.patch_between(from, to),
-            Self::Cow(store) => store.git_store().patch_between(from, to),
-            #[cfg(target_os = "linux")]
-            Self::Overlay(store) => store.git_store().patch_between(from, to),
-            Self::D6Shadow(oracle) => oracle.primary().patch_between(from, to),
             Self::D6(_) => Err(WorkspaceError::Unavailable(
                 "D6 workspace does not render textual git patches".to_string(),
             )),
+            Self::Git(store) => store.patch_between(from, to),
         }
     }
 
     /// Non-marker conflict `main` copies recorded for `branch`, if any.
     pub fn main_copies(&self, branch: &str) -> Option<(String, Vec<String>)> {
         match self {
-            Self::Git(store) => store.main_copies(branch),
-            Self::Cow(store) => store.git_store().main_copies(branch),
-            #[cfg(target_os = "linux")]
-            Self::Overlay(store) => store.git_store().main_copies(branch),
-            Self::D6Shadow(oracle) => oracle.primary().main_copies(branch),
             Self::D6(store) => store.main_copies(branch),
+            Self::Git(store) => store.main_copies(branch),
         }
     }
 
     /// Whether a merge of `main` into `branch` is waiting on conflict marker resolution.
     pub fn has_pending_merge(&self, branch: &str) -> bool {
         match self {
-            Self::Git(store) => store.has_pending_merge(branch),
-            Self::Cow(store) => store.git_store().has_pending_merge(branch),
-            #[cfg(target_os = "linux")]
-            Self::Overlay(store) => store.git_store().has_pending_merge(branch),
-            Self::D6Shadow(oracle) => oracle.primary().has_pending_merge(branch),
             Self::D6(store) => store.has_pending_merge(branch),
+            Self::Git(store) => store.has_pending_merge(branch),
         }
-    }
-
-    /// The directory where the host reads and writes `workspace`'s files:
-    /// the workspace's own path for Git and Cow; for an overlay, its merged
-    /// view through the holder ([`OverlayWorkspace::host_path`]).
-    pub fn host_path(&self, workspace: &WorkspaceId) -> Result<PathBuf, WorkspaceError> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::Overlay(store) => store.host_path(workspace),
-            _ => Ok(PathBuf::from(workspace.path())),
-        }
-    }
-
-    /// The launch prefix a process must run under to see `workspace`
-    /// ([`OverlayWorkspace::launch_arguments`]); `None` for Git and Cow,
-    /// whose workspaces are plain directories.
-    pub fn launch_arguments(
-        &self,
-        workspace: &WorkspaceId,
-    ) -> Result<Option<Vec<OsString>>, WorkspaceError> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::Overlay(store) => store.launch_arguments(workspace).map(Some),
-            _ => {
-                let _ = workspace;
-                Ok(None)
-            }
-        }
-    }
-
-    /// The CAS of deduplicated build artifacts: `<root>/.cas`.
-    pub fn cas_root(&self) -> PathBuf {
-        self.root().join(CAS_DIRECTORY)
-    }
-
-    /// Deduplicate `workspace`'s build artifacts (`target/`,
-    /// `node_modules/`) against [`Self::cas_root`],
-    /// with the workspace taken offline for the pass
-    /// ([`CowWorkspace::offline`]: no worker holds its lease, none starts,
-    /// no process is seen in it). Transcripts are never touched: a `*.jsonl`
-    /// file and anything under a `.transcripts/` directory are skipped
-    /// file by file ([`dedup_dirs`]), and only artifact directories are
-    /// roots.
-    ///
-    /// `Ok(None)` when there is nothing to do: a Git store (a working copy
-    /// has no offline lease), an overlay (its artifacts are in its upperdir,
-    /// behind the holder's namespace; share them through pre-warmed lower
-    /// layers, [`OverlayWorkspace::with_lower_layers`]), or a workspace with
-    /// no artifact directory.
-    pub fn dedup_artifacts(&self, workspace: &WorkspaceId) -> Result<Option<DedupReport>, String> {
-        let Self::Cow(store) = self else {
-            return Ok(None);
-        };
-        let directory = PathBuf::from(workspace.path());
-        let present: Vec<PathBuf> = ARTIFACT_DIRECTORIES
-            .iter()
-            .map(|name| directory.join(name))
-            .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()))
-            .collect();
-        if present.is_empty() {
-            return Ok(None);
-        }
-        let offline = store
-            .offline(workspace)
-            .map_err(|error| format!("take {workspace} offline: {error}"))?;
-        let roots = present
-            .iter()
-            .map(|path| ArtifactRoot::new(&offline, path))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        dedup_dirs(&DedupConfig::new(self.cas_root()), &roots)
-            .map(Some)
-            .map_err(|error| error.to_string())
-    }
-
-    /// Drop the CAS blobs no deduplicated file uses any more and that are
-    /// older than `grace` ([`prune_unused`]). `Ok(None)` when no pass made
-    /// a CAS here yet.
-    pub fn prune_cas(&self, grace: Duration) -> std::io::Result<Option<PruneReport>> {
-        let cas = self.cas_root();
-        if !cas.join(CAS_MARKER).is_file() {
-            return Ok(None);
-        }
-        prune_unused(&cas, grace).map(Some)
     }
 
     fn inner(&self) -> &dyn WorkspaceStore {
         match self {
-            Self::Git(store) => store,
-            Self::Cow(store) => store,
-            #[cfg(target_os = "linux")]
-            Self::Overlay(store) => store,
-            Self::D6Shadow(store) => store.oracle(),
             Self::D6(store) => store,
+            Self::Git(store) => store,
         }
     }
 }
@@ -1047,34 +557,16 @@ impl From<GitWorkspace> for LocalWorkspaceStore {
     }
 }
 
-impl From<CowWorkspace> for LocalWorkspaceStore {
-    fn from(store: CowWorkspace) -> Self {
-        Self::Cow(store)
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl From<OverlayWorkspace> for LocalWorkspaceStore {
-    fn from(store: OverlayWorkspace) -> Self {
-        Self::Overlay(store)
-    }
-}
-
 impl From<D6Workspace<DynRefLedger>> for LocalWorkspaceStore {
     fn from(store: D6Workspace<DynRefLedger>) -> Self {
         Self::D6(store)
     }
 }
 
-impl From<LocalD6ShadowStore> for LocalWorkspaceStore {
-    fn from(store: LocalD6ShadowStore) -> Self {
-        Self::D6Shadow(store)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn scratch_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1088,46 +580,35 @@ mod tests {
     }
 
     #[test]
-    fn backend_parse_and_auto_stay_opt_in_only() {
-        for (backend, expected) in [
-            (WorkspaceBackend::Git, "git"),
-            (WorkspaceBackend::Cow, "cow"),
-            (WorkspaceBackend::Overlay, "overlay"),
-            (WorkspaceBackend::D6Shadow, "d6-shadow"),
-            (WorkspaceBackend::D6, "d6"),
-        ] {
+    fn backend_parse_and_default_is_git() {
+        for (backend, expected) in [(WorkspaceBackend::Git, "git"), (WorkspaceBackend::D6, "d6")] {
             assert_eq!(backend.name(), expected);
             assert_eq!(WorkspaceBackend::parse(expected), Some(backend));
         }
-        assert_eq!(WorkspaceBackend::parse("auto"), None);
-        assert_eq!(WorkspaceBackend::parse("d6_shadow"), None);
-        assert_eq!(WorkspaceBackend::auto_with(true), WorkspaceBackend::Cow);
-        assert_eq!(WorkspaceBackend::auto_with(false), WorkspaceBackend::Git);
+        assert_eq!(WorkspaceBackend::default(), WorkspaceBackend::Git);
+        for retired in ["auto", "cow", "overlay", "d6-shadow", "d6_shadow"] {
+            assert_eq!(WorkspaceBackend::parse(retired), None, "{retired}");
+        }
         let dir = scratch_dir("auto");
-        assert!(matches!(
-            WorkspaceBackend::auto(&dir),
-            WorkspaceBackend::Cow | WorkspaceBackend::Git
-        ));
+        assert_eq!(WorkspaceBackend::auto(&dir), WorkspaceBackend::Git);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn claim_root_refuses_incompatible_d6_mixes_and_allows_shadow_over_git() {
+    fn claim_root_refuses_incompatible_d6_and_git_mixes() {
         let base = scratch_dir("claim");
 
-        // 1. Marked Git root allows d6-shadow (keeping "git" marker), refuses pure d6 & cow.
+        // 1. Marked Git root refuses D6.
         let git_root = base.join("git");
         claim_root(&git_root, WorkspaceBackend::Git).expect("claim git");
-        claim_root(&git_root, WorkspaceBackend::D6Shadow).expect("d6-shadow compatible with git");
         assert_eq!(
             root_backend(&git_root).expect("read"),
             Some(WorkspaceBackend::Git)
         );
         let err = claim_root(&git_root, WorkspaceBackend::D6).expect_err("git vs d6 refused");
         assert!(err.contains("cutover"), "{err}");
-        assert!(claim_root(&git_root, WorkspaceBackend::Cow).is_err());
 
-        // 2. Unmarked legacy Git root allows d6-shadow (claiming as "git") and refuses d6.
+        // 2. Unmarked legacy Git root reads as Git and refuses D6 without writing marker.
         let legacy_git = base.join("legacy-git");
         std::fs::create_dir_all(legacy_git.join("agent-1")).expect("agent dir");
         assert_eq!(
@@ -1136,23 +617,27 @@ mod tests {
         );
         assert!(claim_root(&legacy_git, WorkspaceBackend::D6).is_err());
         assert!(!legacy_git.join(BACKEND_MARKER).exists());
-        claim_root(&legacy_git, WorkspaceBackend::D6Shadow).expect("shadow over legacy git");
+
+        // 2b. Unmarked legacy Git root holding only `.sources/` reads as Git; explicit d6 marker wins.
+        let legacy_sources = base.join("legacy-sources");
+        std::fs::create_dir_all(legacy_sources.join(".sources")).expect("mkdir .sources");
         assert_eq!(
-            root_backend(&legacy_git).expect("claimed as git"),
+            root_backend(&legacy_sources).expect("sources"),
             Some(WorkspaceBackend::Git)
         );
+        assert!(claim_root(&legacy_sources, WorkspaceBackend::D6).is_err());
+        let sources_marked_d6 = base.join("sources-marked-d6");
+        std::fs::create_dir_all(sources_marked_d6.join(".sources")).expect("mkdir .sources");
+        std::fs::write(sources_marked_d6.join(BACKEND_MARKER), "d6\n").expect("write d6 marker");
+        assert_eq!(
+            root_backend(&sources_marked_d6).expect("explicit d6 over .sources"),
+            Some(WorkspaceBackend::D6)
+        );
 
-        // 3. Pure D6 root (marked or unmarked .d6/) refuses git, cow, overlay, d6-shadow.
+        // 3. Pure D6 root (marked or unmarked .d6/) refuses Git.
         let d6_root = base.join("d6");
         claim_root(&d6_root, WorkspaceBackend::D6).expect("claim d6");
-        for other in [
-            WorkspaceBackend::Git,
-            WorkspaceBackend::Cow,
-            WorkspaceBackend::Overlay,
-            WorkspaceBackend::D6Shadow,
-        ] {
-            assert!(claim_root(&d6_root, other).is_err(), "{other:?} vs d6");
-        }
+        assert!(claim_root(&d6_root, WorkspaceBackend::Git).is_err());
         let d6_unmarked = base.join("d6-unmarked");
         std::fs::create_dir_all(d6_unmarked.join(".d6")).expect("mkdir .d6");
         assert_eq!(
@@ -1161,73 +646,102 @@ mod tests {
         );
         assert!(claim_root(&d6_unmarked, WorkspaceBackend::Git).is_err());
 
-        // 4. Fresh d6-shadow root permits returning to git, refuses d6 & cow.
-        let shadow_root = base.join("d6-shadow");
-        claim_root(&shadow_root, WorkspaceBackend::D6Shadow).expect("claim shadow");
-        claim_root(&shadow_root, WorkspaceBackend::Git).expect("git compatible with d6-shadow");
-        assert!(claim_root(&shadow_root, WorkspaceBackend::D6).is_err());
-        assert!(claim_root(&shadow_root, WorkspaceBackend::Cow).is_err());
+        // 4. Retired and unknown markers fail closed.
+        for legacy_marker in ["cow", "overlay", "d6-shadow"] {
+            std::fs::write(
+                base.join("d6").join(BACKEND_MARKER),
+                format!("{legacy_marker}\n"),
+            )
+            .expect("write retired marker");
+            let err = root_backend(&base.join("d6"))
+                .expect_err("retired marker must fail closed")
+                .to_string();
+            assert!(
+                err.contains("retired") && err.contains(legacy_marker),
+                "{err}"
+            );
+        }
+        std::fs::write(base.join("d6").join(BACKEND_MARKER), "zfs\n")
+            .expect("write unknown marker");
+        let unknown_err = root_backend(&base.join("d6"))
+            .expect_err("unknown marker must fail closed")
+            .to_string();
+        assert!(
+            unknown_err.contains("names no workspace backend"),
+            "{unknown_err}"
+        );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn unmarked_retired_backend_directories_fail_closed() {
+        let base = scratch_dir("unmarked-retired");
+        for (dir_name, backend_name) in [
+            (".cow", "cow"),
+            (".overlay", "overlay"),
+            (".d6-shadow", "d6-shadow"),
+        ] {
+            // Alone: must fail closed and refuse claim_root without writing a marker.
+            let alone = base.join(format!("alone-{backend_name}"));
+            std::fs::create_dir_all(alone.join(dir_name)).expect("mkdir retired alone");
+            let err = root_backend(&alone)
+                .expect_err("retired dir alone must fail closed")
+                .to_string();
+            assert!(
+                err.contains("retired") && err.contains(backend_name),
+                "{err}"
+            );
+            assert!(claim_root(&alone, WorkspaceBackend::Git).is_err());
+            assert!(claim_root(&alone, WorkspaceBackend::D6).is_err());
+            assert!(!alone.join(BACKEND_MARKER).exists());
+
+            // With sibling plain workspace dir: must not fall back to Git.
+            let with_ws = base.join(format!("ws-{backend_name}"));
+            std::fs::create_dir_all(with_ws.join("agent-1")).expect("mkdir workspace");
+            std::fs::create_dir_all(with_ws.join(dir_name)).expect("mkdir retired with ws");
+            let err = root_backend(&with_ws)
+                .expect_err("retired dir with workspaces must fail closed")
+                .to_string();
+            assert!(
+                err.contains("retired") && err.contains(backend_name),
+                "{err}"
+            );
+
+            // With sibling `.d6`: must not fall back to D6 regardless of directory iteration order.
+            let with_d6 = base.join(format!("d6-{backend_name}"));
+            std::fs::create_dir_all(with_d6.join(".d6")).expect("mkdir .d6");
+            std::fs::create_dir_all(with_d6.join(dir_name)).expect("mkdir retired with .d6");
+            let err = root_backend(&with_d6)
+                .expect_err("retired dir with .d6 must fail closed")
+                .to_string();
+            assert!(
+                err.contains("retired") && err.contains(backend_name),
+                "{err}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn open_requires_d6_options_and_never_falls_back_to_git() {
         let base = scratch_dir("open");
-        for b in [WorkspaceBackend::D6Shadow, WorkspaceBackend::D6] {
-            let err = LocalWorkspaceStore::open(
-                b,
-                base.join("r.git"),
-                &base,
-                crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
-            )
-            .expect_err("requires options");
-            assert!(err.contains(b.name()), "{err}");
-        }
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn d6_shadow_store_enforces_single_shared_max_file_bytes_across_rebind() {
-        let base = scratch_dir("shadow-single-cap");
-        let repo = base.join("repo.git");
-        let st = crate::git_process::test_git_command()
-            .args(["init", "--bare", &repo.to_string_lossy()])
-            .status()
-            .expect("git init --bare");
-        assert!(st.success(), "git init --bare failed");
-        let cap: u64 = 1 << 20;
-        let cas = Arc::new(crate::cas_merkle::CasMerkleStore::open(base.join("cas")).expect("cas"));
-        let ledger1: DynRefLedger = Arc::new(crate::cas_merkle::InMemoryRefLedger::default());
-        let l1_policy = L1TmpfsPolicy::new(base.join("l1-tmpfs"), 8);
-        let opts = D6ShadowOptions::new(base.join("shadow-work"), cas, ledger1, cap)
-            .with_strict_fail_closed(true)
-            .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
-            .with_l1_policy(l1_policy.clone());
-        let store = LocalWorkspaceStore::d6_shadow(&repo, base.join("git-work"), opts);
-        let LocalWorkspaceStore::D6Shadow(ref shadow_store) = store else {
-            panic!("expected D6Shadow");
-        };
-        assert_eq!(store.max_file_bytes(), cap);
-        assert_eq!(shadow_store.max_file_bytes(), cap);
-        assert_eq!(shadow_store.primary().max_file_bytes(), cap);
-        assert_eq!(shadow_store.shadow().max_file_bytes(), cap);
-
-        let ledger2: DynRefLedger = Arc::new(crate::cas_merkle::InMemoryRefLedger::default());
-        let rebound = LocalWorkspaceStore::from(shadow_store.with_ledger(ledger2));
-        let LocalWorkspaceStore::D6Shadow(ref rebound_shadow) = rebound else {
-            panic!("expected D6Shadow");
-        };
-        assert_eq!(rebound.max_file_bytes(), cap);
-        assert_eq!(rebound_shadow.max_file_bytes(), cap);
-        assert_eq!(rebound_shadow.primary().max_file_bytes(), cap);
-        assert_eq!(rebound_shadow.shadow().max_file_bytes(), cap);
-        assert!(rebound_shadow.oracle().strict_fail_closed());
-        assert_eq!(
-            rebound_shadow.oracle().tracked_set_mode(),
-            ShadowTrackedSetMode::SimulateUnfilteredScan
-        );
-        assert_eq!(rebound_shadow.shadow().l1_policy(), Some(&l1_policy));
+        let err = LocalWorkspaceStore::open(
+            WorkspaceBackend::D6,
+            base.join("r.git"),
+            &base,
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        )
+        .expect_err("requires options");
+        assert!(err.contains("d6"), "{err}");
+        let git = LocalWorkspaceStore::open(
+            WorkspaceBackend::Git,
+            base.join("r.git"),
+            &base,
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        )
+        .expect("open git");
+        assert_eq!(git.backend(), WorkspaceBackend::Git);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

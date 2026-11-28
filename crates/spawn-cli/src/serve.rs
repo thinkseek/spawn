@@ -4020,8 +4020,6 @@ fn get_snapshot_safe(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StorageBackend {
     D6,
-    Cow,
-    Overlay,
     Git,
 }
 
@@ -4029,8 +4027,6 @@ impl StorageBackend {
     const fn as_str(self) -> &'static str {
         match self {
             Self::D6 => "d6",
-            Self::Cow => "cow",
-            Self::Overlay => "overlay",
             Self::Git => "git",
         }
     }
@@ -4044,19 +4040,14 @@ fn detect_storage_backend(has_d6_data: bool) -> (StorageBackend, String) {
         .map(|raw| spawn_host::canonical_root(Path::new(&raw)))
         .and_then(|root| spawn_host::root_backend(&root).ok().flatten());
     if has_d6_data {
-        let mode_note = match root_kind {
-            Some(spawn_host::WorkspaceBackend::D6Shadow) => {
-                "D6 shadow ledger active alongside authoritative Git border.".to_string()
-            }
-            _ => "D6 persistent CAS Merkle tree and PostgreSQL ref ledger active.".to_string(),
-        };
-        return (StorageBackend::D6, mode_note);
+        return (
+            StorageBackend::D6,
+            "D6 persistent CAS Merkle tree and PostgreSQL ref ledger active.".to_string(),
+        );
     }
-    if matches!(configured.as_deref(), Some("d6" | "d6-shadow" | "cas"))
-        || matches!(
-            root_kind,
-            Some(spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow)
-        )
+    if matches!(configured.as_deref(), Some("d6" | "cas"))
+        || (configured.as_deref() != Some("git")
+            && root_kind == Some(spawn_host::WorkspaceBackend::D6))
     {
         return (
             StorageBackend::D6,
@@ -4064,17 +4055,9 @@ fn detect_storage_backend(has_d6_data: bool) -> (StorageBackend, String) {
                 .to_string(),
         );
     }
-    let backend = match root_kind {
-        Some(spawn_host::WorkspaceBackend::Cow) => StorageBackend::Cow,
-        Some(spawn_host::WorkspaceBackend::Overlay) => StorageBackend::Overlay,
-        _ => StorageBackend::Git,
-    };
-    let backend_name = backend.as_str();
     (
-        backend,
-        format!(
-            "Running in {backend_name} workspace mode with no D6 CAS snapshots recorded. Run `spawn storage cutover --to d6` to enable D6 snapshot tracking."
-        ),
+        StorageBackend::Git,
+        "Running in git workspace mode with no D6 CAS snapshots recorded. Run `spawn storage cutover --to d6` to enable D6 snapshot tracking.".to_string(),
     )
 }
 

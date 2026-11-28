@@ -1490,30 +1490,22 @@ fn resolve_d6_cas_dir_for_index(
         return Ok(None);
     };
     match configured {
-        crate::config::WorkspaceBackend::Named(
-            active @ (spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow),
-        ) => Ok(Some(d6_cfg.effective_cas_dir(root, active))),
+        crate::config::WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6) => {
+            Ok(Some(d6_cfg.effective_cas_dir(root)))
+        }
         crate::config::WorkspaceBackend::Auto | crate::config::WorkspaceBackend::Named(_) => {
             if let Some(active) = spawn_host::root_backend(root)
                 .map_err(|err| format!("read workspace backend under {}: {err}", root.display()))?
-                && matches!(
-                    active,
-                    spawn_host::WorkspaceBackend::D6 | spawn_host::WorkspaceBackend::D6Shadow
-                )
+                && active == spawn_host::WorkspaceBackend::D6
             {
-                return Ok(Some(d6_cfg.effective_cas_dir(root, active)));
+                return Ok(Some(d6_cfg.effective_cas_dir(root)));
             }
-            for backend in [
-                spawn_host::WorkspaceBackend::D6,
-                spawn_host::WorkspaceBackend::D6Shadow,
-            ] {
-                let candidate = d6_cfg.effective_cas_dir(root, backend);
-                match std::fs::symlink_metadata(&candidate) {
-                    Ok(_) => return Ok(Some(candidate)),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => {
-                        return Err(format!("inspect D6 CAS at {}: {err}", candidate.display()));
-                    }
+            let candidate = d6_cfg.effective_cas_dir(root);
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(_) => return Ok(Some(candidate)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(format!("inspect D6 CAS at {}: {err}", candidate.display()));
                 }
             }
             Ok(None)
@@ -2832,12 +2824,11 @@ mod commit_v2_tests {
     }
 
     #[test]
-    fn index_with_d6_cas_dir_override_and_shadow_layout_resolve_v2() {
+    fn index_with_d6_cas_dir_override_resolves_v2() {
         // Explicit `SPAWN_D6_CAS_DIR` / D6RuntimeConfig cas_dir override outside root.
         let fx_custom = seed_v2_prov_fixture("v2-override", &["external-cas"]);
         let cfg = crate::config::D6RuntimeConfig::parse(
             Some(&fx_custom.cas_dir.to_string_lossy()),
-            None,
             None,
             None,
         )
@@ -2860,24 +2851,6 @@ mod commit_v2_tests {
             .expect("changes for task 12");
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].agent_id, "agent_b");
-
-        // `.d6-shadow/cas` layout under `WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6Shadow)` and auto discovery.
-        let fx_shadow = seed_v2_prov_fixture("v2-shadow", &[".d6-shadow", "cas"]);
-        let mut shadow_repo =
-            Repo::open(&fx_shadow.mirror_dir.to_string_lossy()).expect("open shadow mirror");
-        let shadow_sum = index_with(
-            &fx_shadow.store,
-            &mut shadow_repo,
-            &fx_shadow.domain,
-            Some(&fx_shadow.root),
-        )
-        .expect("index discovers .d6-shadow/cas");
-        assert_eq!(shadow_sum.lands, 2);
-        let shadow_changes = fx_shadow
-            .store
-            .prov_changes_for_task(fx_shadow.task_12)
-            .expect("shadow changes for task 12");
-        assert_eq!(shadow_changes.len(), 1);
     }
 
     #[test]
