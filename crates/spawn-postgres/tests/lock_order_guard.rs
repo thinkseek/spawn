@@ -1,8 +1,18 @@
 //! Static CI guard for `sql/schema.sql`: enforces the 4-tier advisory lock
 //! hierarchy (`L1 -> L0 -> L2 -> L3`), zero occurrences of the retired global
-//! lock `1399957335`, mandatory `perform spawn_lock_migrate_shared();` before DML
-//! or inner locks in non-trigger functions, and `L3 + commit_xid` protection
-//! on every `INSERT INTO spawn_events`.
+//! lock `1399957335`, mandatory unconditional `perform spawn_lock_migrate_shared();`
+//! before DML or inner locks in non-trigger functions, forbidden dynamic DML /
+//! advisory lock strings in `EXECUTE`, and unconditional `blocking L3 + commit_xid`
+//! protection on every `spawn_events` write across **all** declared functions.
+//!
+//! Scope boundary: monotonic lock-order verification (`L1 -> L0 -> L2 -> L3`)
+//! inspects sequential lock acquisitions intra-procedurally within each
+//! individual function or `DO` block (it does not trace cross-function call
+//! graphs). Trigger functions (`RETURNS TRIGGER`) are exempt from self-acquiring
+//! `L0` (`spawn_lock_migrate_shared()`) because they fire inside an outer DML
+//! statement that already holds `L0`, **but trigger functions are still audited
+//! for monotonic lock ordering, zero retired `1399957335`, dynamic `EXECUTE`,
+//! and `spawn_events` write rules**.
 
 use std::fmt;
 
@@ -93,6 +103,8 @@ enum DmlKind {
     Insert,
     Update,
     Delete,
+    Truncate,
+    Merge,
 }
 
 impl fmt::Display for DmlKind {
@@ -101,6 +113,8 @@ impl fmt::Display for DmlKind {
             Self::Insert => f.write_str("INSERT"),
             Self::Update => f.write_str("UPDATE"),
             Self::Delete => f.write_str("DELETE"),
+            Self::Truncate => f.write_str("TRUNCATE"),
+            Self::Merge => f.write_str("MERGE"),
         }
     }
 }
@@ -145,6 +159,16 @@ enum Violation {
         line: usize,
         call: String,
     },
+    UnbalancedControlFlow {
+        scope: String,
+        line: usize,
+        detail: String,
+    },
+    ForbiddenDynamicSql {
+        scope: String,
+        line: usize,
+        detail: String,
+    },
     SpawnEventsInsertWithoutL3Lock {
         function: String,
         insert_line: usize,
@@ -185,7 +209,7 @@ impl fmt::Display for Violation {
             Self::ConditionalMigrateSharedLock { function, line } => {
                 write!(
                     f,
-                    "{function} (L{line}): spawn_lock_migrate_shared() called only inside IF"
+                    "{function} (L{line}): spawn_lock_migrate_shared() called only inside conditional scope"
                 )
             }
             Self::MigrateSharedLockAfterDml {
@@ -222,12 +246,22 @@ impl fmt::Display for Violation {
                     "{scope} (L{line}): unrecognized advisory lock call `{call}`"
                 )
             }
+            Self::UnbalancedControlFlow {
+                scope,
+                line,
+                detail,
+            } => write!(f, "{scope} (L{line}): unbalanced control flow ({detail})"),
+            Self::ForbiddenDynamicSql {
+                scope,
+                line,
+                detail,
+            } => write!(f, "{scope} (L{line}): forbidden dynamic EXECUTE ({detail})"),
             Self::SpawnEventsInsertWithoutL3Lock {
                 function,
                 insert_line,
             } => write!(
                 f,
-                "{function} (L{insert_line}): INSERT INTO spawn_events lacks blocking L3 ({LOCK_L3_SESSION})"
+                "{function} (L{insert_line}): write to spawn_events lacks unconditional blocking L3 ({LOCK_L3_SESSION})"
             ),
             Self::SpawnEventsInsertWithoutCommitXid {
                 function,
@@ -261,7 +295,7 @@ struct AuditSummary {
 enum TokenKind {
     Word(String),
     Number(String),
-    SingleQuoted,
+    SingleQuoted(String),
     DollarQuoted {
         body: String,
         body_start_line: usize,
@@ -314,21 +348,15 @@ fn lex_sql(input: &str, start_line: usize) -> Vec<Token> {
             }
         } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
             (i, line) = skip_block_comment(bytes, i + 2, line);
-        } else if matches!(b, b'e' | b'E') && bytes.get(i + 1) == Some(&b'\'') {
+        } else if (matches!(b, b'e' | b'E') && bytes.get(i + 1) == Some(&b'\'')) || b == b'\'' {
             let offset = i;
             let start = line;
-            (i, line) = skip_single_quoted(bytes, i + 2, line, true);
+            let escape_backslash = b != b'\'';
+            let quote_start = if escape_backslash { i + 2 } else { i + 1 };
+            let text;
+            (text, i, line) = skip_single_quoted(bytes, quote_start, line, escape_backslash);
             tokens.push(Token {
-                kind: TokenKind::SingleQuoted,
-                line: start,
-                offset,
-            });
-        } else if b == b'\'' {
-            let offset = i;
-            let start = line;
-            (i, line) = skip_single_quoted(bytes, i + 1, line, false);
-            tokens.push(Token {
-                kind: TokenKind::SingleQuoted,
+                kind: TokenKind::SingleQuoted(text),
                 line: start,
                 offset,
             });
@@ -423,29 +451,36 @@ fn skip_single_quoted(
     mut i: usize,
     mut line: usize,
     escape_backslash: bool,
-) -> (usize, usize) {
+) -> (String, usize, usize) {
+    let mut text = Vec::new();
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'\n' {
+            text.push(b);
             line += 1;
             i += 1;
         } else if escape_backslash && b == b'\\' {
-            if bytes.get(i + 1) == Some(&b'\n') {
-                line += 1;
+            if let Some(&next) = bytes.get(i + 1) {
+                if next == b'\n' {
+                    line += 1;
+                }
+                text.push(next);
             }
             i = (i + 2).min(bytes.len());
         } else if b == b'\'' {
             if bytes.get(i + 1) == Some(&b'\'') {
+                text.push(b'\'');
                 i += 2;
             } else {
                 i += 1;
                 break;
             }
         } else {
+            text.push(b);
             i += 1;
         }
     }
-    (i, line)
+    (String::from_utf8_lossy(&text).into_owned(), i, line)
 }
 
 fn read_quoted_ident(input: &str, mut i: usize, mut line: usize) -> (String, usize, usize) {
@@ -791,7 +826,7 @@ struct LockAcquisition {
     token_idx: usize,
     line: usize,
     tier: AdvisoryLockTier,
-    if_depth: usize,
+    cond_depth: usize,
     blocking: bool,
 }
 
@@ -807,54 +842,410 @@ struct DmlSite {
 struct BodyScan {
     locks: Vec<LockAcquisition>,
     dmls: Vec<DmlSite>,
+    unconditional_l3_ready_at: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScopeFrame {
+    Block {
+        in_exception: bool,
+    },
+    If,
+    TryLockL3Fallback {
+        xact_scoped: bool,
+        key_tokens: Vec<TokenKind>,
+        fallback_acquired: bool,
+        saw_elsif_or_else: bool,
+    },
+    CaseStmt,
+    CaseExpr,
+    Loop,
+}
+
+fn cond_depth(stack: &[ScopeFrame]) -> usize {
+    stack
+        .iter()
+        .filter(|frame| {
+            !matches!(
+                frame,
+                ScopeFrame::Block {
+                    in_exception: false
+                }
+            )
+        })
+        .count()
+}
+
+fn skip_label(tokens: &[Token], i: usize) -> Option<usize> {
+    if matches!(tokens.get(i).map(|t| &t.kind), Some(TokenKind::Other('<')))
+        && matches!(
+            tokens.get(i + 1).map(|t| &t.kind),
+            Some(TokenKind::Other('<'))
+        )
+        && tokens.get(i + 2).and_then(Token::as_word).is_some()
+        && matches!(
+            tokens.get(i + 3).map(|t| &t.kind),
+            Some(TokenKind::Other('>'))
+        )
+        && matches!(
+            tokens.get(i + 4).map(|t| &t.kind),
+            Some(TokenKind::Other('>'))
+        )
+    {
+        return Some(i + 5);
+    }
+    None
+}
+
+fn find_matching_then(tokens: &[Token], start: usize) -> Option<usize> {
+    let mut paren_depth = 0_usize;
+    let mut case_depth = 0_usize;
+    for (offset, tok) in tokens[start..].iter().enumerate() {
+        match tok.kind {
+            TokenKind::LParen => paren_depth += 1,
+            TokenKind::RParen => paren_depth = paren_depth.saturating_sub(1),
+            TokenKind::Semicolon if paren_depth == 0 && case_depth == 0 => return None,
+            _ if tok.is_word("case") => case_depth += 1,
+            _ if tok.is_word("end") => case_depth = case_depth.saturating_sub(1),
+            _ if paren_depth == 0 && case_depth == 0 && tok.is_word("then") => {
+                return Some(start + offset);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn try_match_l3_trylock_condition(tokens: &[Token], if_idx: usize) -> Option<ScopeFrame> {
+    let then_idx = find_matching_then(tokens, if_idx + 1)?;
+    let cond = &tokens[if_idx + 1..then_idx];
+    if !cond.first()?.is_word("not") {
+        return None;
+    }
+    let fn_name = cond.get(1)?.as_word()?;
+    let xact_scoped = match fn_name {
+        "pg_try_advisory_xact_lock" => true,
+        "pg_try_advisory_lock" => false,
+        _ => return None,
+    };
+    if !matches!(cond.get(2).map(|t| &t.kind), Some(TokenKind::LParen)) {
+        return None;
+    }
+    let close = find_matching_paren(cond, 2)?;
+    if close + 1 != cond.len() {
+        return None;
+    }
+    let args = split_top_level_commas(&cond[3..close]);
+    if args.len() != 2 {
+        return None;
+    }
+    let key_is_l3 = args[0].len() == 1
+        && matches!(&args[0][0].kind, TokenKind::Number(n) if n == LOCK_L3_SESSION);
+    if !key_is_l3 || args[1].is_empty() {
+        return None;
+    }
+    Some(ScopeFrame::TryLockL3Fallback {
+        xact_scoped,
+        key_tokens: args[1].iter().map(|t| t.kind.clone()).collect(),
+        fallback_acquired: false,
+        saw_elsif_or_else: false,
+    })
+}
+
+fn check_dynamic_execute(scope: &str, tokens: &[Token], i: usize, violations: &mut Vec<Violation>) {
+    let exec_line = tokens[i].line;
+    let mut saw_literal = false;
+    for tok in &tokens[i + 1..] {
+        if matches!(tok.kind, TokenKind::Semicolon) {
+            break;
+        }
+        let body = match &tok.kind {
+            TokenKind::SingleQuoted(s) => s.as_str(),
+            TokenKind::DollarQuoted { body, .. } => body.as_str(),
+            _ => continue,
+        };
+        saw_literal = true;
+        for sub in lex_sql(body, tok.line) {
+            if let Some(word) = sub.as_word()
+                && (matches!(
+                    word,
+                    "insert" | "update" | "delete" | "truncate" | "merge" | "spawn_events"
+                ) || word.starts_with("pg_advisory"))
+            {
+                violations.push(Violation::ForbiddenDynamicSql {
+                    scope: scope.to_string(),
+                    line: sub.line,
+                    detail: format!("dynamic EXECUTE contains forbidden keyword `{word}`"),
+                });
+            }
+        }
+    }
+    if !saw_literal {
+        violations.push(Violation::ForbiddenDynamicSql {
+            scope: scope.to_string(),
+            line: exec_line,
+            detail: "opaque dynamic EXECUTE without literal SQL".to_string(),
+        });
+    }
+}
+
+fn handle_end_keyword(
+    scope: &str,
+    tokens: &[Token],
+    i: usize,
+    stack: &mut Vec<ScopeFrame>,
+    scan: &mut BodyScan,
+    violations: &mut Vec<Violation>,
+) -> usize {
+    let line = tokens[i].line;
+    let next = tokens.get(i + 1);
+    if next.is_some_and(|t| t.is_word("if")) {
+        match stack.pop() {
+            Some(ScopeFrame::If) => {}
+            Some(ScopeFrame::TryLockL3Fallback {
+                fallback_acquired,
+                saw_elsif_or_else,
+                ..
+            }) => {
+                if fallback_acquired && !saw_elsif_or_else {
+                    scan.unconditional_l3_ready_at.push(i + 1);
+                }
+            }
+            other => violations.push(Violation::UnbalancedControlFlow {
+                scope: scope.to_string(),
+                line,
+                detail: format!("END IF without matching IF (top={other:?})"),
+            }),
+        }
+        return i + 2;
+    }
+    if next.is_some_and(|t| t.is_word("case")) {
+        match stack.pop() {
+            Some(ScopeFrame::CaseStmt) => {}
+            other => violations.push(Violation::UnbalancedControlFlow {
+                scope: scope.to_string(),
+                line,
+                detail: format!("END CASE without matching CASE (top={other:?})"),
+            }),
+        }
+        return i + 2;
+    }
+    if next.is_some_and(|t| t.is_word("loop")) {
+        match stack.pop() {
+            Some(ScopeFrame::Loop) => {}
+            other => violations.push(Violation::UnbalancedControlFlow {
+                scope: scope.to_string(),
+                line,
+                detail: format!("END LOOP without matching LOOP (top={other:?})"),
+            }),
+        }
+        return i + 2;
+    }
+    match stack.pop() {
+        Some(ScopeFrame::CaseExpr | ScopeFrame::Block { .. }) => {}
+        other => violations.push(Violation::UnbalancedControlFlow {
+            scope: scope.to_string(),
+            line,
+            detail: format!("END without matching BEGIN or CASE expression (top={other:?})"),
+        }),
+    }
+    i + 1
+}
+
+fn handle_control_word(
+    scope: &str,
+    tokens: &[Token],
+    i: usize,
+    at_stmt_start: &mut bool,
+    stack: &mut Vec<ScopeFrame>,
+    violations: &mut Vec<Violation>,
+) {
+    let Some(word) = tokens[i].as_word() else {
+        *at_stmt_start = false;
+        return;
+    };
+    let prev = i.checked_sub(1).and_then(|idx| tokens.get(idx));
+    let stmt_start = *at_stmt_start;
+    match word {
+        "declare" if stmt_start => {
+            *at_stmt_start = true;
+        }
+        "begin" if stmt_start => {
+            stack.push(ScopeFrame::Block {
+                in_exception: false,
+            });
+            *at_stmt_start = true;
+        }
+        "exception" if stmt_start && !prev.is_some_and(|t| t.is_word("raise")) => {
+            if let Some(ScopeFrame::Block { in_exception }) = stack
+                .iter_mut()
+                .rev()
+                .find(|frame| matches!(frame, ScopeFrame::Block { .. }))
+            {
+                *in_exception = true;
+            } else {
+                violations.push(Violation::UnbalancedControlFlow {
+                    scope: scope.to_string(),
+                    line: tokens[i].line,
+                    detail: "EXCEPTION without enclosing BEGIN block".to_string(),
+                });
+            }
+            *at_stmt_start = false;
+        }
+        "if" if stmt_start => {
+            let frame = if cond_depth(stack) == 0 {
+                try_match_l3_trylock_condition(tokens, i).unwrap_or(ScopeFrame::If)
+            } else {
+                ScopeFrame::If
+            };
+            stack.push(frame);
+            *at_stmt_start = false;
+        }
+        "elsif" | "elseif" if stmt_start => {
+            if let Some(ScopeFrame::TryLockL3Fallback {
+                saw_elsif_or_else, ..
+            }) = stack.last_mut()
+            {
+                *saw_elsif_or_else = true;
+            }
+            *at_stmt_start = false;
+        }
+        "case" => {
+            stack.push(if stmt_start {
+                ScopeFrame::CaseStmt
+            } else {
+                ScopeFrame::CaseExpr
+            });
+            *at_stmt_start = false;
+        }
+        "loop" => {
+            stack.push(ScopeFrame::Loop);
+            *at_stmt_start = true;
+        }
+        "then" => {
+            *at_stmt_start = matches!(
+                stack.last(),
+                Some(
+                    ScopeFrame::If
+                        | ScopeFrame::TryLockL3Fallback { .. }
+                        | ScopeFrame::CaseStmt
+                        | ScopeFrame::Block { in_exception: true }
+                )
+            );
+        }
+        "else" => {
+            if let Some(ScopeFrame::TryLockL3Fallback {
+                saw_elsif_or_else, ..
+            }) = stack.last_mut()
+            {
+                *saw_elsif_or_else = true;
+            }
+            *at_stmt_start = matches!(
+                stack.last(),
+                Some(ScopeFrame::If | ScopeFrame::TryLockL3Fallback { .. } | ScopeFrame::CaseStmt)
+            );
+        }
+        _ => *at_stmt_start = false,
+    }
 }
 
 fn scan_body_events(scope: &str, tokens: &[Token], violations: &mut Vec<Violation>) -> BodyScan {
     let mut scan = BodyScan::default();
-    let mut if_depth = 0_usize;
+    let mut stack = Vec::new();
+    let mut at_stmt_start = true;
     let mut i = 0;
 
     while i < tokens.len() {
-        update_if_depth(tokens, i, &mut if_depth);
-
-        if let Some((acq, next_i)) = try_parse_lock_call(scope, tokens, i, if_depth, violations) {
+        if let Some(next_i) = skip_label(tokens, i) {
+            i = next_i;
+            continue;
+        }
+        if matches!(tokens[i].kind, TokenKind::Semicolon) {
+            at_stmt_start = true;
+            i += 1;
+            continue;
+        }
+        let after_dot = i
+            .checked_sub(1)
+            .and_then(|idx| tokens.get(idx))
+            .is_some_and(|t| matches!(t.kind, TokenKind::Dot));
+        if !after_dot && tokens[i].is_word("end") {
+            i = handle_end_keyword(scope, tokens, i, &mut stack, &mut scan, violations);
+            at_stmt_start = false;
+            continue;
+        }
+        if !after_dot && at_stmt_start && tokens[i].is_word("execute") {
+            check_dynamic_execute(scope, tokens, i, violations);
+            at_stmt_start = false;
+            i += 1;
+            continue;
+        }
+        if let Some((acq, call_name, second_arg, next_i)) =
+            try_parse_lock_call(scope, tokens, i, cond_depth(&stack), violations)
+        {
+            if cond_depth(&stack) == 1 {
+                record_trylock_fallback_hit(&mut stack, acq, call_name, &second_arg);
+            }
             scan.locks.push(acq);
+            at_stmt_start = false;
             i = next_i;
             continue;
         }
         if let Some(dml) = try_parse_dml(tokens, i) {
             scan.dmls.push(dml);
         }
+        if after_dot {
+            at_stmt_start = false;
+        } else {
+            handle_control_word(scope, tokens, i, &mut at_stmt_start, &mut stack, violations);
+        }
         i += 1;
     }
 
+    if !stack.is_empty() {
+        violations.push(Violation::UnbalancedControlFlow {
+            scope: scope.to_string(),
+            line: tokens.last().map_or(1, |t| t.line),
+            detail: format!("unclosed control-flow scopes at end of body: {stack:?}"),
+        });
+    }
     scan
 }
 
-fn update_if_depth(tokens: &[Token], i: usize, if_depth: &mut usize) {
-    let prev = i.checked_sub(1).and_then(|idx| tokens.get(idx));
-    if tokens[i].is_word("end") && tokens.get(i + 1).is_some_and(|t| t.is_word("if")) {
-        *if_depth = if_depth.saturating_sub(1);
+fn record_trylock_fallback_hit(
+    stack: &mut [ScopeFrame],
+    acq: LockAcquisition,
+    call_name: &str,
+    second_arg: &[TokenKind],
+) {
+    if acq.tier != AdvisoryLockTier::L3Session || !acq.blocking {
         return;
     }
-    if tokens[i].is_word("if") {
-        let after_end = prev.is_some_and(|t| t.is_word("end"));
-        let is_ddl_if_exists = tokens.get(i + 1).is_some_and(|t| t.is_word("exists"))
-            || (tokens.get(i + 1).is_some_and(|t| t.is_word("not"))
-                && tokens.get(i + 2).is_some_and(|t| t.is_word("exists")));
-        if !after_end && !is_ddl_if_exists {
-            *if_depth += 1;
+    if let Some(ScopeFrame::TryLockL3Fallback {
+        xact_scoped,
+        key_tokens,
+        fallback_acquired,
+        saw_elsif_or_else: false,
+    }) = stack.last_mut()
+    {
+        let expected_call = if *xact_scoped {
+            "pg_advisory_xact_lock"
+        } else {
+            "pg_advisory_lock"
+        };
+        if call_name == expected_call && second_arg == key_tokens.as_slice() {
+            *fallback_acquired = true;
         }
     }
 }
 
-fn try_parse_lock_call(
+fn try_parse_lock_call<'a>(
     scope: &str,
-    tokens: &[Token],
+    tokens: &'a [Token],
     i: usize,
-    if_depth: usize,
+    cond_depth: usize,
     violations: &mut Vec<Violation>,
-) -> Option<(LockAcquisition, usize)> {
+) -> Option<(LockAcquisition, &'a str, Vec<TokenKind>, usize)> {
     let name = tokens[i].as_word()?;
     if !matches!(tokens.get(i + 1).map(|t| &t.kind), Some(TokenKind::LParen)) {
         return None;
@@ -868,9 +1259,11 @@ fn try_parse_lock_call(
                 token_idx: i,
                 line,
                 tier: AdvisoryLockTier::L0SchemaMigrate,
-                if_depth,
+                cond_depth,
                 blocking: true,
             },
+            name,
+            Vec::new(),
             close + 1,
         ));
     }
@@ -892,10 +1285,14 @@ fn try_parse_lock_call(
     }
 
     let args = &tokens[i + 2..close];
-    let first_arg = args
-        .split(|tok| matches!(tok.kind, TokenKind::Comma))
+    let mut split_args = args.split(|tok| matches!(tok.kind, TokenKind::Comma));
+    let first_arg = split_args.next().unwrap_or(&[]);
+    let second_arg_kinds: Vec<TokenKind> = split_args
         .next()
-        .unwrap_or(&[]);
+        .unwrap_or(&[])
+        .iter()
+        .map(|tok| tok.kind.clone())
+        .collect();
     let numeric_key = first_arg.iter().find_map(|tok| match &tok.kind {
         TokenKind::Number(num) => Some(num.as_str()),
         _ => None,
@@ -926,9 +1323,11 @@ fn try_parse_lock_call(
                         token_idx: i,
                         line,
                         tier,
-                        if_depth,
+                        cond_depth,
                         blocking: !name.starts_with("pg_try_"),
                     },
+                    name,
+                    second_arg_kinds,
                     close + 1,
                 ))
             } else {
@@ -978,6 +1377,44 @@ fn try_parse_dml(tokens: &[Token], i: usize) -> Option<DmlSite> {
             token_idx: i,
             line,
             kind: DmlKind::Delete,
+            table,
+        });
+    }
+
+    if tokens[i].is_word("truncate") {
+        let is_trigger_event =
+            prev.is_some_and(|t| t.is_word("before") || t.is_word("after") || t.is_word("or"));
+        if is_trigger_event {
+            return None;
+        }
+        let mut table_idx = i + 1;
+        if tokens.get(table_idx).is_some_and(|t| t.is_word("table")) {
+            table_idx += 1;
+        }
+        if tokens.get(table_idx).is_some_and(|t| t.is_word("only")) {
+            table_idx += 1;
+        }
+        table_idx = skip_schema_prefix(tokens, table_idx);
+        let table = tokens.get(table_idx)?.as_word()?.to_string();
+        return Some(DmlSite {
+            token_idx: i,
+            line,
+            kind: DmlKind::Truncate,
+            table,
+        });
+    }
+
+    if tokens[i].is_word("merge") && tokens.get(i + 1).is_some_and(|t| t.is_word("into")) {
+        let mut table_idx = i + 2;
+        if tokens.get(table_idx).is_some_and(|t| t.is_word("only")) {
+            table_idx += 1;
+        }
+        table_idx = skip_schema_prefix(tokens, table_idx);
+        let table = tokens.get(table_idx)?.as_word()?.to_string();
+        return Some(DmlSite {
+            token_idx: i,
+            line,
+            kind: DmlKind::Merge,
             table,
         });
     }
@@ -1051,15 +1488,9 @@ fn audit_function(
     }
 
     for dml in &scan.dmls {
-        if dml.kind == DmlKind::Insert && dml.table == "spawn_events" {
+        if dml.table == "spawn_events" && matches!(dml.kind, DmlKind::Insert | DmlKind::Merge) {
             summary.spawn_events_writers.push(func.name.clone());
-            check_spawn_events_insert(
-                func,
-                dml,
-                &scan.locks,
-                spawn_events_has_xid_default,
-                violations,
-            );
+            check_spawn_events_write(func, dml, &scan, spawn_events_has_xid_default, violations);
         }
     }
 }
@@ -1082,7 +1513,7 @@ fn check_function_l0_rules(
     let first_unconditional_l0 = scan
         .locks
         .iter()
-        .find(|lock| lock.tier == AdvisoryLockTier::L0SchemaMigrate && lock.if_depth == 0)
+        .find(|lock| lock.tier == AdvisoryLockTier::L0SchemaMigrate && lock.cond_depth == 0)
         .copied();
 
     let Some(l0) = first_unconditional_l0 else {
@@ -1133,21 +1564,36 @@ fn check_function_l0_rules(
     }
 }
 
-fn check_spawn_events_insert(
+fn check_spawn_events_write(
     func: &ParsedFunction,
     dml: &DmlSite,
-    locks: &[LockAcquisition],
+    scan: &BodyScan,
     spawn_events_has_xid_default: bool,
     violations: &mut Vec<Violation>,
 ) {
-    let has_blocking_l3 = locks.iter().any(|lock| {
-        lock.tier == AdvisoryLockTier::L3Session && lock.blocking && lock.token_idx < dml.token_idx
-    });
-    if !has_blocking_l3 {
+    let has_unconditional_l3 = scan.locks.iter().any(|lock| {
+        lock.tier == AdvisoryLockTier::L3Session
+            && lock.blocking
+            && lock.cond_depth == 0
+            && lock.token_idx < dml.token_idx
+    }) || scan
+        .unconditional_l3_ready_at
+        .iter()
+        .any(|&ready_idx| ready_idx < dml.token_idx);
+    if !has_unconditional_l3 {
         violations.push(Violation::SpawnEventsInsertWithoutL3Lock {
             function: func.name.clone(),
             insert_line: dml.line,
         });
+    }
+
+    if dml.kind == DmlKind::Merge {
+        violations.push(Violation::SpawnEventsInsertWithoutCommitXid {
+            function: func.name.clone(),
+            insert_line: dml.line,
+            detail: "MERGE INTO spawn_events is forbidden".to_string(),
+        });
+        return;
     }
 
     let tokens = &func.body_tokens;
@@ -1292,15 +1738,11 @@ fn audit_schema_sql(sql: &str) -> Result<AuditSummary, Vec<Violation>> {
     }
 
     let extracted = extract_schema(sql);
-    let spawn_functions: Vec<&ParsedFunction> = extracted
-        .functions
-        .iter()
-        .filter(|f| f.name.starts_with("spawn_"))
-        .collect();
+    let all_functions: Vec<&ParsedFunction> = extracted.functions.iter().collect();
 
     let mut summary = AuditSummary {
-        total_functions: spawn_functions.len(),
-        trigger_functions: spawn_functions.iter().filter(|f| f.is_trigger).count(),
+        total_functions: all_functions.len(),
+        trigger_functions: all_functions.iter().filter(|f| f.is_trigger).count(),
         do_blocks: extracted.do_blocks.len(),
         retired_lock_hits,
         ..AuditSummary::default()
@@ -1314,7 +1756,7 @@ fn audit_schema_sql(sql: &str) -> Result<AuditSummary, Vec<Violation>> {
         check_monotonic_locks(&scope, &scan.locks, &mut violations);
     }
 
-    for func in &spawn_functions {
+    for func in &all_functions {
         audit_function(
             func,
             extracted.spawn_events_has_xid_default,
@@ -1324,7 +1766,7 @@ fn audit_schema_sql(sql: &str) -> Result<AuditSummary, Vec<Violation>> {
     }
 
     for exempt in EXEMPT_DML_FUNCTIONS {
-        if !spawn_functions.iter().any(|f| f.name == *exempt) {
+        if !all_functions.iter().any(|f| f.name == *exempt) {
             violations.push(Violation::UnusedExemption {
                 function: (*exempt).to_string(),
             });
@@ -1353,7 +1795,7 @@ fn check_bootstrap_l0(extracted: &ExtractedSchema, violations: &mut Vec<Violatio
             scan.locks.iter().any(|lock| {
                 lock.tier == AdvisoryLockTier::L0SchemaMigrate
                     && lock.blocking
-                    && lock.if_depth == 0
+                    && lock.cond_depth == 0
             })
         });
     if !has_bootstrap_l0 {
@@ -1781,5 +2223,393 @@ fn mutation_rejects_subdomain_leaf_mixing_and_missing_bootstrap_l0() {
             .iter()
             .any(|err| matches!(err, Violation::MissingExclusiveBootstrapLock)),
         "expected MissingExclusiveBootstrapLock, got {boot_errs:?}"
+    );
+}
+
+#[test]
+fn mutation_rejects_if_exists_if_not_exists_conditional_l0_and_underflow() {
+    let cases = [
+        (
+            "if_exists_l0",
+            "create or replace function spawn_b1_if_exists() returns void language plpgsql as $$\n\
+             begin\n\
+                 if exists (select 1 from mission_tasks) then\n\
+                     perform spawn_lock_migrate_shared();\n\
+                 end if;\n\
+                 delete from mission_tasks where id = 1;\n\
+             end $$;",
+        ),
+        (
+            "if_not_exists_l0",
+            "create or replace function spawn_b1_if_not_exists() returns void language plpgsql as $$\n\
+             begin\n\
+                 if not exists (select 1 from mission_tasks) then\n\
+                     perform spawn_lock_migrate_shared();\n\
+                 end if;\n\
+                 delete from mission_tasks where id = 1;\n\
+             end $$;",
+        ),
+        (
+            "nested_if_exists_underflow_evasion",
+            "create or replace function spawn_b1_nested(p_flag boolean) returns void language plpgsql as $$\n\
+             begin\n\
+                 if p_flag then\n\
+                     if exists (select 1 from mission_tasks) then\n\
+                         null;\n\
+                     end if;\n\
+                     perform spawn_lock_migrate_shared();\n\
+                 end if;\n\
+                 delete from mission_tasks where id = 1;\n\
+             end $$;",
+        ),
+    ];
+
+    for (name, fn_sql) in cases {
+        let sql = wrap_with_valid_bootstrap(fn_sql, true);
+        let errs = audit_schema_sql(&sql).expect_err(&format!("{name} must fail"));
+        assert!(
+            errs.iter()
+                .any(|err| matches!(err, Violation::ConditionalMigrateSharedLock { .. })),
+            "{name}: expected ConditionalMigrateSharedLock, got {errs:?}"
+        );
+    }
+
+    let underflow = wrap_with_valid_bootstrap(
+        "create or replace function spawn_b1_underflow() returns void language plpgsql as $$\n\
+         begin\n\
+             end if;\n\
+             perform spawn_lock_migrate_shared();\n\
+             delete from mission_tasks where id = 1;\n\
+         end $$;",
+        true,
+    );
+    let underflow_errs =
+        audit_schema_sql(&underflow).expect_err("control-flow underflow must fail");
+    assert!(
+        underflow_errs
+            .iter()
+            .any(|err| matches!(err, Violation::UnbalancedControlFlow { .. })),
+        "expected UnbalancedControlFlow, got {underflow_errs:?}"
+    );
+}
+
+#[test]
+fn mutation_rejects_case_loop_while_and_exception_conditional_l0() {
+    let cases = [
+        (
+            "case_stmt_l0",
+            "create or replace function spawn_b2_case(p_x integer) returns void language plpgsql as $$\n\
+             begin\n\
+                 case p_x\n\
+                 when 1 then\n\
+                     perform spawn_lock_migrate_shared();\n\
+                 else\n\
+                     null;\n\
+                 end case;\n\
+                 delete from mission_tasks where id = 1;\n\
+             end $$;",
+        ),
+        (
+            "while_loop_l0",
+            "create or replace function spawn_b2_while(p_flag boolean) returns void language plpgsql as $$\n\
+             begin\n\
+                 while p_flag loop\n\
+                     perform spawn_lock_migrate_shared();\n\
+                     exit;\n\
+                 end loop;\n\
+                 update mission_tasks set state = 'done';\n\
+             end $$;",
+        ),
+        (
+            "for_loop_l0",
+            "create or replace function spawn_b2_for() returns void language plpgsql as $$\n\
+             declare v_i integer;\n\
+             begin\n\
+                 for v_i in 1..1 loop\n\
+                     perform spawn_lock_migrate_shared();\n\
+                 end loop;\n\
+                 insert into mission_tasks (id) values (1);\n\
+             end $$;",
+        ),
+        (
+            "exception_handler_l0",
+            "create or replace function spawn_b2_exception() returns void language plpgsql as $$\n\
+             begin\n\
+                 select 1;\n\
+             exception when others then\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 delete from mission_tasks where id = 1;\n\
+             end $$;",
+        ),
+    ];
+
+    for (name, fn_sql) in cases {
+        let sql = wrap_with_valid_bootstrap(fn_sql, true);
+        let errs = audit_schema_sql(&sql).expect_err(&format!("{name} must fail"));
+        assert!(
+            errs.iter()
+                .any(|err| matches!(err, Violation::ConditionalMigrateSharedLock { .. })),
+            "{name}: expected ConditionalMigrateSharedLock, got {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn mutation_rejects_conditional_l3_before_spawn_events_insert_and_accepts_trylock_fallback() {
+    let conditional_l3 = wrap_with_valid_bootstrap(
+        "create or replace function spawn_b3_cond_l3(p_flag boolean) returns void language plpgsql as $$\n\
+         begin\n\
+             perform spawn_lock_migrate_shared();\n\
+             if p_flag then\n\
+                 perform pg_advisory_xact_lock(1399957401, 1);\n\
+             end if;\n\
+             insert into spawn_events (id, commit_xid) values (1, pg_current_xact_id());\n\
+         end $$;",
+        true,
+    );
+    let cond_errs = audit_schema_sql(&conditional_l3).expect_err("conditional L3 must fail");
+    assert!(
+        cond_errs.iter().any(|err| matches!(
+            err,
+            Violation::SpawnEventsInsertWithoutL3Lock { function, .. }
+            if function == "spawn_b3_cond_l3"
+        )),
+        "expected SpawnEventsInsertWithoutL3Lock, got {cond_errs:?}"
+    );
+
+    let extra_clause = wrap_with_valid_bootstrap(
+        "create or replace function spawn_b3_extra_cond(p_session text, p_ok boolean) returns void language plpgsql as $$\n\
+         begin\n\
+             perform spawn_lock_migrate_shared();\n\
+             if not pg_try_advisory_xact_lock(1399957401, hashtext(p_session)) and p_ok then\n\
+                 perform pg_advisory_xact_lock(1399957401, hashtext(p_session));\n\
+             end if;\n\
+             insert into spawn_events (id, commit_xid) values (1, pg_current_xact_id());\n\
+         end $$;",
+        true,
+    );
+    let extra_errs =
+        audit_schema_sql(&extra_clause).expect_err("compound try-lock guard must fail");
+    assert!(
+        extra_errs
+            .iter()
+            .any(|err| matches!(err, Violation::SpawnEventsInsertWithoutL3Lock { .. })),
+        "expected SpawnEventsInsertWithoutL3Lock for compound guard, got {extra_errs:?}"
+    );
+
+    let key_mismatch = wrap_with_valid_bootstrap(
+        "create or replace function spawn_b3_mismatch(p_session text) returns void language plpgsql as $$\n\
+         begin\n\
+             perform spawn_lock_migrate_shared();\n\
+             if not pg_try_advisory_xact_lock(1399957401, hashtext(p_session)) then\n\
+                 perform pg_advisory_xact_lock(1399957401, 42);\n\
+             end if;\n\
+             insert into spawn_events (id, commit_xid) values (1, pg_current_xact_id());\n\
+         end $$;",
+        true,
+    );
+    let mismatch_errs = audit_schema_sql(&key_mismatch).expect_err("mismatched L3 keys must fail");
+    assert!(
+        mismatch_errs
+            .iter()
+            .any(|err| matches!(err, Violation::SpawnEventsInsertWithoutL3Lock { .. })),
+        "expected SpawnEventsInsertWithoutL3Lock for key mismatch, got {mismatch_errs:?}"
+    );
+
+    let valid_fallback = wrap_with_valid_bootstrap(
+        "create or replace function spawn_b3_valid_fallback(p_session text, p_dup boolean) returns void language plpgsql as $$\n\
+         begin\n\
+             perform spawn_lock_migrate_shared();\n\
+             if not pg_try_advisory_xact_lock(1399957401, hashtext(p_session)) then\n\
+                 if p_dup then\n\
+                     return;\n\
+                 end if;\n\
+                 perform pg_advisory_xact_lock(1399957401, hashtext(p_session));\n\
+             end if;\n\
+             insert into spawn_events (id, commit_xid) values (1, pg_current_xact_id());\n\
+         end $$;",
+        true,
+    );
+    let ok = audit_schema_sql(&valid_fallback).expect("exact L3 try-lock fallback should pass");
+    assert_eq!(ok.spawn_events_writers, vec!["spawn_b3_valid_fallback"]);
+}
+
+#[test]
+fn mutation_audits_non_spawn_prefixed_functions_and_tracks_writers() {
+    let bypass_attempt = wrap_with_valid_bootstrap(
+        "create or replace function helper_writer() returns void language plpgsql as $$\n\
+         begin\n\
+             insert into spawn_events (id, commit_xid) values (1, '3'::xid8);\n\
+         end $$;",
+        true,
+    );
+    let errs = audit_schema_sql(&bypass_attempt).expect_err("non-spawn_ writer must be audited");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            Violation::MissingMigrateSharedLock { function, .. } if function == "helper_writer"
+        )),
+        "expected MissingMigrateSharedLock for helper_writer, got {errs:?}"
+    );
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            Violation::SpawnEventsInsertWithoutL3Lock { function, .. } if function == "helper_writer"
+        )),
+        "expected SpawnEventsInsertWithoutL3Lock for helper_writer, got {errs:?}"
+    );
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            Violation::SpawnEventsInsertWithoutCommitXid { function, .. } if function == "helper_writer"
+        )),
+        "expected SpawnEventsInsertWithoutCommitXid for helper_writer, got {errs:?}"
+    );
+
+    let tracked_ok = wrap_with_valid_bootstrap(
+        "create or replace function helper_writer_ok() returns void language plpgsql as $$\n\
+         begin\n\
+             perform spawn_lock_migrate_shared();\n\
+             perform pg_advisory_xact_lock(1399957401, 7);\n\
+             insert into spawn_events (id, commit_xid) values (1, pg_current_xact_id());\n\
+         end $$;",
+        true,
+    );
+    let ok = audit_schema_sql(&tracked_ok).expect("compliant non-spawn function should pass");
+    assert_eq!(ok.spawn_events_writers, vec!["helper_writer_ok"]);
+}
+
+#[test]
+fn mutation_rejects_dynamic_execute_dml_or_locks_and_truncate_or_merge_without_l0() {
+    let dynamic_cases = [
+        (
+            "exec_delete",
+            "create or replace function spawn_exec_del() returns void language plpgsql as $$\n\
+             begin\n\
+                 execute 'delete from mission_tasks where id = 1';\n\
+             end $$;",
+        ),
+        (
+            "exec_lock",
+            "create or replace function spawn_exec_lock() returns void language plpgsql as $$\n\
+             begin\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 execute 'select pg_advisory_xact_lock(999999999)';\n\
+             end $$;",
+        ),
+        (
+            "exec_spawn_events",
+            "create or replace function spawn_exec_events() returns void language plpgsql as $$\n\
+             begin\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 execute 'insert into spawn_events (id) values (1)';\n\
+             end $$;",
+        ),
+        (
+            "exec_opaque_var",
+            "create or replace function spawn_exec_var(p_sql text) returns void language plpgsql as $$\n\
+             begin\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 execute p_sql;\n\
+             end $$;",
+        ),
+    ];
+
+    for (name, fn_sql) in dynamic_cases {
+        let sql = wrap_with_valid_bootstrap(fn_sql, true);
+        let errs = audit_schema_sql(&sql).expect_err(&format!("{name} must fail"));
+        assert!(
+            errs.iter()
+                .any(|err| matches!(err, Violation::ForbiddenDynamicSql { .. })),
+            "{name}: expected ForbiddenDynamicSql, got {errs:?}"
+        );
+    }
+
+    let truncate_no_l0 = wrap_with_valid_bootstrap(
+        "create or replace function spawn_trunc_no_l0() returns void language plpgsql as $$\n\
+         begin\n\
+             truncate table mission_tasks;\n\
+         end $$;",
+        true,
+    );
+    let trunc_errs = audit_schema_sql(&truncate_no_l0).expect_err("TRUNCATE without L0 must fail");
+    assert!(
+        trunc_errs.iter().any(|err| matches!(
+            err,
+            Violation::MissingMigrateSharedLock { function, .. } if function == "spawn_trunc_no_l0"
+        )),
+        "expected MissingMigrateSharedLock for TRUNCATE, got {trunc_errs:?}"
+    );
+
+    let merge_no_l0 = wrap_with_valid_bootstrap(
+        "create or replace function spawn_merge_no_l0() returns void language plpgsql as $$\n\
+         begin\n\
+             merge into mission_tasks t using mission_tasks s on t.id = s.id when not matched then insert (id) values (s.id);\n\
+         end $$;",
+        true,
+    );
+    let merge_errs = audit_schema_sql(&merge_no_l0).expect_err("MERGE without L0 must fail");
+    assert!(
+        merge_errs.iter().any(|err| matches!(
+            err,
+            Violation::MissingMigrateSharedLock { function, .. } if function == "spawn_merge_no_l0"
+        )),
+        "expected MissingMigrateSharedLock for MERGE, got {merge_errs:?}"
+    );
+}
+
+#[test]
+fn mutation_enforces_lock_order_and_retired_lock_on_trigger_functions() {
+    let valid_trigger = wrap_with_valid_bootstrap(
+        "create or replace function spawn_trig_ok() returns trigger language plpgsql as $$\n\
+         begin\n\
+             perform pg_advisory_xact_lock(1399957402, 0);\n\
+             perform pg_advisory_xact_lock(1399957401, 1);\n\
+             insert into mission_tasks (id) values (1);\n\
+             return new;\n\
+         end $$;",
+        true,
+    );
+    let ok = audit_schema_sql(&valid_trigger).expect("valid trigger exempt from L0 should pass");
+    assert_eq!(ok.trigger_functions, 1);
+
+    let bad_order_trigger = wrap_with_valid_bootstrap(
+        "create or replace function spawn_trig_bad_order() returns trigger language plpgsql as $$\n\
+         begin\n\
+             perform pg_advisory_xact_lock(1399957401, 1);\n\
+             perform pg_advisory_xact_lock(1399957402, 0);\n\
+             return new;\n\
+         end $$;",
+        true,
+    );
+    let order_errs =
+        audit_schema_sql(&bad_order_trigger).expect_err("trigger L3->L2 inversion must fail");
+    assert!(
+        order_errs.iter().any(|err| matches!(
+            err,
+            Violation::InvalidLockOrder {
+                scope,
+                prev: AdvisoryLockTier::L3Session,
+                next: AdvisoryLockTier::L2Control,
+                ..
+            } if scope == "spawn_trig_bad_order"
+        )),
+        "expected InvalidLockOrder on trigger, got {order_errs:?}"
+    );
+
+    let retired_trigger = wrap_with_valid_bootstrap(
+        "create or replace function spawn_trig_retired() returns trigger language plpgsql as $$\n\
+         begin\n\
+             perform pg_advisory_xact_lock(1399957335);\n\
+             return new;\n\
+         end $$;",
+        true,
+    );
+    let ret_errs = audit_schema_sql(&retired_trigger).expect_err("trigger retired lock must fail");
+    assert!(
+        ret_errs
+            .iter()
+            .any(|err| matches!(err, Violation::RetiredGlobalLock { .. })),
+        "expected RetiredGlobalLock on trigger, got {ret_errs:?}"
     );
 }
