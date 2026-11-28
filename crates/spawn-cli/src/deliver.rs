@@ -3053,6 +3053,7 @@ fn send_note(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{
         CREDENTIALS_LINE, Cancelled, CancelledBy, DELIVERY_RETRIES, NOT_READY_RETRY_MS, News,
         PROCESSES_LINE, PausedMission, PausedWorker, Predecessor, REPORT, ReportStatus, Restart,
@@ -5214,7 +5215,12 @@ mod tests {
             let schema = spawn_postgres::testing::TestSchema::new(case);
             let url = schema.url().to_string();
             let store = std::sync::Arc::new(
-                spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+                spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                    &url,
+                    &schema,
+                    &spawn_postgres::testing::test_connect_options(),
+                )
+                .expect("connect"),
             );
             Self { store, url, schema }
         }

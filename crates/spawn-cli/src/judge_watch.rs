@@ -220,6 +220,7 @@ impl StateJudge for WatchedJudge {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{Standing, WatchedJudge, brief, standing_of};
     use serde_json::{Value, json};
     use spawn_core::observation::{Confidence, SemanticState};
@@ -261,7 +262,12 @@ mod tests {
         );
         let schema = spawn_postgres::testing::TestSchema::new(name);
         let store = Arc::new(
-            PostgresStore::connect_in_schema(&url, &schema).expect("a schema of its own, migrated"),
+            PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("a schema of its own, migrated"),
         );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| case(store)));
         if let Err(panic) = result {

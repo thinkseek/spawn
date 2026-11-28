@@ -26,10 +26,10 @@ use spawn_core::port::{
     TerminalServer,
 };
 
-use crate::herdr::{launch_script, no_listener, peer_server, private, scrub, valid_session};
+use crate::herdr::{launch_script, no_listener, peer_server, private, valid_session};
 use crate::herdr_witness;
 use crate::process::ProcessId;
-use crate::terminal_support::{HANGUP_WAIT, KILL_WAIT};
+use crate::terminal_support::{HANGUP_WAIT, KILL_WAIT, TerminalHostEnv, remove_scrubbed_env};
 
 /// OpenRPC / wire generation expected from `spawn-hc`.
 pub const EXPECTED_GENERATION: u32 = 1;
@@ -184,13 +184,19 @@ pub struct HerdrCoreHost {
     session: String,
     waits: (Duration, Duration),
     runtime_base: Option<PathBuf>,
+    host_env: TerminalHostEnv,
     beneath: Option<crate::beneath::Beneath>,
     agents: Arc<Mutex<Agents>>,
 }
 
 impl HerdrCoreHost {
-    /// Creates a host talking to `session` through the `spawn-hc` executable at `program`.
-    pub fn on_session(program: &str, session: &str) -> Result<Self, TerminalError> {
+    /// Creates a host talking to `session` through the `spawn-hc` executable at `program`,
+    /// configured with explicit process environment [`TerminalHostEnv`].
+    pub fn on_session(
+        program: &str,
+        session: &str,
+        host_env: TerminalHostEnv,
+    ) -> Result<Self, TerminalError> {
         if !valid_session(session) {
             return Err(TerminalError(format!(
                 "{session:?} cannot name Spawn's herdr session: use letters, digits, `_` and `-`, \
@@ -202,6 +208,7 @@ impl HerdrCoreHost {
             session: session.to_string(),
             waits: (HANGUP_WAIT, KILL_WAIT),
             runtime_base: None,
+            host_env,
             beneath: None,
             agents: Arc::new(Mutex::new(Agents::default())),
         };
@@ -282,20 +289,31 @@ impl HerdrCoreHost {
                 holder_socket,
             }
         } else {
-            let home = std::env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .map_or_else(|| PathBuf::from("/"), PathBuf::from);
-            let state_home = std::env::var_os("XDG_STATE_HOME")
-                .filter(|v| !v.is_empty())
-                .map_or_else(|| home.join(".local/state"), PathBuf::from);
-            let config_home = std::env::var_os("XDG_CONFIG_HOME")
-                .filter(|v| !v.is_empty())
-                .map_or_else(|| home.join(".config"), PathBuf::from);
+            let home = self
+                .host_env
+                .home
+                .clone()
+                .filter(|v| !v.as_os_str().is_empty())
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let state_home = self
+                .host_env
+                .xdg_state_home
+                .clone()
+                .filter(|v| !v.as_os_str().is_empty())
+                .unwrap_or_else(|| home.join(".local/state"));
+            let config_home = self
+                .host_env
+                .xdg_config_home
+                .clone()
+                .filter(|v| !v.as_os_str().is_empty())
+                .unwrap_or_else(|| home.join(".config"));
             let state = state_home.join("herdr-core").join(&self.session);
             let config = config_home.join("herdr-core").join("config.toml");
-            let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
+            let runtime = self
+                .host_env
+                .xdg_runtime_dir
+                .clone()
+                .filter(|v| !v.as_os_str().is_empty())
                 .or_else(|| {
                     let run_user = PathBuf::from(format!("/run/user/{}", crate::current_uid()));
                     run_user.is_dir().then_some(run_user)
@@ -326,7 +344,12 @@ impl HerdrCoreHost {
         let base = self
             .runtime_base
             .clone()
-            .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
+            .or_else(|| {
+                self.host_env
+                    .xdg_runtime_dir
+                    .clone()
+                    .filter(|v| !v.as_os_str().is_empty())
+            })
             .ok_or_else(|| {
                 TerminalError(
                     "herdr-core keeps Spawn terminal records in $XDG_RUNTIME_DIR, which is not set"
@@ -376,11 +399,7 @@ impl HerdrCoreHost {
         let paths = self.core_paths()?;
         let mut command = Command::new(&self.program);
         command.args(arguments);
-        for (name, _) in std::env::vars_os() {
-            if scrub(&name) {
-                command.env_remove(name);
-            }
-        }
+        remove_scrubbed_env(&mut command, &self.host_env);
         if let Some(base) = &self.runtime_base {
             command
                 .env("XDG_RUNTIME_DIR", &paths.runtime)
@@ -1101,7 +1120,11 @@ impl TerminalHost for HerdrCoreHost {
             self.waits,
             "terminal.kill",
         )?;
-        crate::terminal_support::end_stragglers(workspace.path(), self.waits)?;
+        crate::terminal_support::end_stragglers(
+            workspace.path(),
+            self.waits,
+            self.host_env.home.as_deref(),
+        )?;
         self.forget(terminal);
         self.unfollow(terminal);
         Ok(())
@@ -1458,9 +1481,10 @@ mod tests {
 
     #[test]
     fn valid_sessions_and_socket_bounds_are_enforced() {
-        assert!(HerdrCoreHost::on_session("spawn-hc", "default").is_err());
-        assert!(HerdrCoreHost::on_session("spawn-hc", "a/b").is_err());
-        let host = HerdrCoreHost::on_session("spawn-hc", "spawn-hc-test")
+        let env = crate::TerminalHostEnv::default();
+        assert!(HerdrCoreHost::on_session("spawn-hc", "default", env.clone()).is_err());
+        assert!(HerdrCoreHost::on_session("spawn-hc", "a/b", env.clone()).is_err());
+        let host = HerdrCoreHost::on_session("spawn-hc", "spawn-hc-test", env)
             .unwrap()
             .with_runtime_under(PathBuf::from("/tmp/hc"));
         let paths = host.core_paths().unwrap();

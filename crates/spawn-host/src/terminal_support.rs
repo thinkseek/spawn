@@ -4,14 +4,69 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::{LIST_DIRS_LIMIT, READ_LIMIT, TerminalError};
 
+/// Environment inputs for terminal hosts ([`crate::HerdrHost`], [`crate::HerdrCoreHost`],
+/// [`crate::HerdrPool`]), injected at startup from the host configuration boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalHostEnv {
+    /// User home directory (`$HOME`), used for XDG defaults and straggler-sweep safety.
+    pub home: Option<PathBuf>,
+    /// `$XDG_STATE_HOME` override for `herdr-core` state directories.
+    pub xdg_state_home: Option<PathBuf>,
+    /// `$XDG_CONFIG_HOME` override for `herdr-core` config directories.
+    pub xdg_config_home: Option<PathBuf>,
+    /// `$XDG_RUNTIME_DIR` override for sockets and terminal state records.
+    pub xdg_runtime_dir: Option<PathBuf>,
+    /// Override for legacy `herdr` launch-clear timeout (`SPAWN_HERDR_LAUNCH_CLEAR_MS`).
+    pub launch_clear_limit: Option<Duration>,
+    /// Parent environment variable keys matching controller scrub rules to strip from
+    /// spawned terminal daemon child processes.
+    pub scrubbed_env_keys: Vec<OsString>,
+}
+
+impl TerminalHostEnv {
+    /// Filter `keys` down to those matching [`crate::herdr::scrub`] rules so spawned
+    /// terminal daemons never inherit controller secrets, `SPAWN_*`, `HERDR_*`, or `HC_*`.
+    #[must_use]
+    pub fn collect_scrubbed_keys(keys: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+        let mut out: Vec<OsString> = keys
+            .into_iter()
+            .filter(|name| crate::herdr::scrub(name))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
 /// Variables kept out of spawned terminal server environments, besides every
 /// `SPAWN_*` one (see [`scrub`]).
 const SCRUBBED: [&str; 2] = ["PGPASSWORD", "TYPESAFE_API_KEY"];
+
+const STATIC_HERDR_SCRUBBED: [&str; 6] = [
+    "PGPASSWORD",
+    "TYPESAFE_API_KEY",
+    "HERDR_SOCKET_PATH",
+    "HERDR_SESSION",
+    "HC_SOCKET",
+    "HC_SESSION",
+];
+
+pub(crate) fn remove_scrubbed_env(command: &mut Command, host_env: &TerminalHostEnv) {
+    for key in STATIC_HERDR_SCRUBBED {
+        command.env_remove(key);
+    }
+    for key in &host_env.scrubbed_env_keys {
+        command.env_remove(key);
+    }
+}
 
 /// Whether a variable of the controller's stays out of terminal hosts: every
 /// `SPAWN_*` setting (database logins, the serve token, repository and
@@ -80,9 +135,10 @@ pub(crate) fn wait_sessions_gone(
 pub(crate) fn end_stragglers(
     directory: &str,
     waits: (Duration, Duration),
+    home_dir: Option<&Path>,
 ) -> Result<(), TerminalError> {
     let directory = std::path::Path::new(directory);
-    if !sweepable(directory) {
+    if !sweepable(directory, home_dir) {
         return Ok(());
     }
     for (signal, wait) in [
@@ -116,7 +172,7 @@ pub(crate) fn end_stragglers(
 /// parts (`/tmp/a` and `/home/user` are never one workspace), that is not
 /// this process's working directory, the home directory or the temporary
 /// directory, nor above any of them.
-fn sweepable(directory: &std::path::Path) -> bool {
+fn sweepable(directory: &std::path::Path, home_dir: Option<&Path>) -> bool {
     use std::path::Component;
     if !directory.is_absolute()
         || directory
@@ -132,7 +188,8 @@ fn sweepable(directory: &std::path::Path) -> bool {
     }
     let shared = [
         std::env::current_dir().ok(),
-        std::env::var_os("HOME").map(std::path::PathBuf::from),
+        home_dir.map(Path::to_path_buf),
+        crate::home::Home::of_account().path,
         Some(std::env::temp_dir()),
     ];
     !shared
@@ -917,6 +974,7 @@ mod tests {
     /// Never a directory too broad to be one workspace.
     #[test]
     fn only_a_narrow_directory_is_swept() {
+        let home = crate::home::Home::of_account().path;
         for broad in [
             "/",
             "/tmp",
@@ -925,18 +983,27 @@ mod tests {
             "relative/a/b",
             "/a/../b/c",
         ] {
-            assert!(!sweepable(std::path::Path::new(broad)), "{broad}");
+            assert!(
+                !sweepable(std::path::Path::new(broad), home.as_deref()),
+                "{broad}"
+            );
         }
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        if let Some(home) = home {
-            assert!(!sweepable(&home));
-            assert!(home.parent().is_none_or(|parent| !sweepable(parent)));
+        if let Some(home_dir) = &home {
+            assert!(!sweepable(home_dir, home.as_deref()));
+            assert!(
+                home_dir
+                    .parent()
+                    .is_none_or(|parent| !sweepable(parent, home.as_deref()))
+            );
         }
+        let configured_home = std::path::Path::new("/var/tmp/custom-home/user");
+        assert!(!sweepable(configured_home, Some(configured_home)));
         let here = std::env::current_dir().expect("cwd");
-        assert!(!sweepable(&here));
-        assert!(sweepable(std::path::Path::new(
-            "/workspaces/agents/agent_a"
-        )));
+        assert!(!sweepable(&here, home.as_deref()));
+        assert!(sweepable(
+            std::path::Path::new("/workspaces/agents/agent_a"),
+            home.as_deref(),
+        ));
     }
 
     /// Without pidfds and `/proc` (every target but Linux) the sweep finds
@@ -948,7 +1015,7 @@ mod tests {
         let scratch = crate::Scratch::new("spawn-straggler-test");
         let workspace = scratch.join("ws");
         std::fs::create_dir_all(&workspace).expect("dirs");
-        if !sweepable(&workspace) {
+        if !sweepable(&workspace, None) {
             eprintln!(
                 "skipped: the scratch {} is not sweepable",
                 workspace.display()
@@ -963,6 +1030,7 @@ mod tests {
         let ended = end_stragglers(
             &workspace.display().to_string(),
             (Duration::from_millis(50), Duration::from_millis(50)),
+            None,
         );
         let alive = inside.try_wait().expect("try_wait").is_none();
         let _ = inside.kill();
@@ -985,7 +1053,7 @@ mod tests {
         std::fs::create_dir_all(&nested).expect("dirs");
         let elsewhere = scratch.join("other");
         std::fs::create_dir_all(&elsewhere).expect("dirs");
-        if !sweepable(&workspace) {
+        if !sweepable(&workspace, None) {
             eprintln!(
                 "skipped: the scratch {} is not sweepable",
                 workspace.display()
@@ -1008,6 +1076,7 @@ mod tests {
         end_stragglers(
             &workspace.display().to_string(),
             (Duration::from_secs(2), Duration::from_secs(2)),
+            None,
         )
         .expect("ended");
         let status = reaper.join().expect("joined").expect("waited");

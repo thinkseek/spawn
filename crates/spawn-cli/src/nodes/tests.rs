@@ -3,6 +3,9 @@
 //! the watch's decisions (lost, back, the ten-minute sample, the join a
 //! probe was started for), and the bounded run with fake commands.
 
+#![cfg(test)]
+#![allow(clippy::disallowed_methods)]
+
 use super::power::PowerTelemetry;
 use super::{
     BEAT, HeartbeatSample, HeartbeatScheduler, INVENTORY, NodeStoreHandle, PROBE_EVERY_MS,
@@ -476,7 +479,12 @@ fn the_worker_raises_and_clears_node_lost_in_the_store_in_order() {
     let url = std::env::var("SPAWN_TEST_DATABASE_URL")
         .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip");
     let schema = spawn_postgres::testing::TestSchema::new("node_alerts");
-    let store = PostgresStore::connect_in_schema(&url, &schema).expect("a schema, migrated");
+    let store = PostgresStore::connect_in_schema_with_options(
+        &url,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("a schema, migrated");
     let mut joined = inventory(DESKTOP).expect("an inventory");
     for (key, value) in [
         ("type", json!("node.joined")),
@@ -546,7 +554,12 @@ fn the_worker_raises_and_clears_node_lost_in_the_store_in_order() {
 
 #[test]
 fn ssh_runs_with_no_environment_shared_connection_or_forwarding() {
-    let command = ssh_command_via("ckl@desktop", &[], BEAT);
+    let command = ssh_command_via(
+        "ckl@desktop",
+        &[],
+        BEAT,
+        &crate::config::ssh_forwarded_env(),
+    );
     assert_eq!(command.get_program(), "ssh");
     let args: Vec<String> = command
         .get_args()
@@ -685,7 +698,12 @@ fn ssh_through_hops_hardens_every_jump_host_with_a_nested_proxy_command() {
     let names = ["ckl@jump", "ssh://ops@bastion:2222", "edge-gw"];
     for count in 1..=3 {
         let jumps: Vec<String> = names[..count].iter().map(ToString::to_string).collect();
-        let command = ssh_command_via("ckl@deep", &jumps, BEAT);
+        let command = ssh_command_via(
+            "ckl@deep",
+            &jumps,
+            BEAT,
+            &crate::config::ssh_forwarded_env(),
+        );
         let args: Vec<String> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -715,10 +733,11 @@ fn ssh_through_hops_hardens_every_jump_host_with_a_nested_proxy_command() {
         }
     }
     // Single hop: no ProxyCommand at all.
-    let args: Vec<String> = ssh_command_via("ckl@deep", &[], BEAT)
-        .get_args()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
+    let args: Vec<String> =
+        ssh_command_via("ckl@deep", &[], BEAT, &crate::config::ssh_forwarded_env())
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
     assert!(!args.iter().any(|arg| arg.starts_with("ProxyCommand")));
     // Quoting: a quote in a word stays one word.
     assert_eq!(

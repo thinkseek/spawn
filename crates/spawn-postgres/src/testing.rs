@@ -53,7 +53,7 @@ impl TestSchema {
     /// PID namespace the pid is the same on every run), and `n` counts the
     /// schemas this process named, so two cases started in the same
     /// nanosecond differ. The schema itself is made by whatever connects
-    /// in it first ([`TestSchema::store`], `PostgresStore::connect_in_schema`),
+    /// in it first ([`TestSchema::store`], `PostgresStore::connect_in_schema_with_options`),
     /// which dates it with the comment `{"made_at_ms": <ms>}` and names the
     /// connection after it (`application_name`, objective 094), so a reader
     /// tells a live test's schema from a leftover.
@@ -65,7 +65,8 @@ impl TestSchema {
     ///
     /// When `SPAWN_TEST_DATABASE_URL` is not set (tests do not skip), or
     /// `case` is not lowercase ASCII letters, digits and `_` (the schema
-    /// name goes into SQL unquoted, as `connect_in_schema` requires).
+    /// name goes into SQL unquoted, as `connect_in_schema_with_options` requires).
+    #[allow(clippy::disallowed_methods)]
     pub fn new(case: &str) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         assert!(
@@ -119,17 +120,24 @@ impl TestSchema {
         PostgresStore::connect_in_schema_with_options(
             &self.url,
             &self.name,
-            &ConnectOptions {
-                passfile: test_passfile(),
-                statement_timeout: None,
-            },
+            &test_connect_options(),
         )
         .unwrap_or_else(|error| panic!("connect and migrate in {}: {error}", self.name))
     }
 }
 
+/// Default connection options for tests, resolving libpq passfiles from the test boundary.
+#[must_use]
+pub fn test_connect_options() -> ConnectOptions {
+    ConnectOptions {
+        passfile: test_passfile(),
+        statement_timeout: None,
+    }
+}
+
 /// Resolve libpq passfile location at the test boundary (`PGPASSFILE` else `$HOME/.pgpass`).
 #[must_use]
+#[allow(clippy::disallowed_methods)]
 pub fn test_passfile() -> Option<std::path::PathBuf> {
     crate::resolve_passfile_path(
         std::env::var_os("PGPASSFILE").as_deref(),
@@ -215,6 +223,7 @@ pub const NODE_MEMBERS: &str = crate::nodes::MEMBERS;
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::TestSchema;
 
     fn exists(name: &str) -> bool {

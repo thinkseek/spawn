@@ -125,17 +125,11 @@ fn now_ms() -> i64 {
         })
 }
 
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
 /// The store: `--cas`, else `<SPAWN_WORKSPACE_ROOT>/.cas`.
 pub(crate) fn cas_dir(given: Option<&str>) -> Result<PathBuf, String> {
     match given {
         Some(dir) => Ok(PathBuf::from(dir)),
-        None => env_path("SPAWN_WORKSPACE_ROOT")
+        None => crate::config::workspace_root_dir()
             .map(|root| root.join(DEFAULT_CAS))
             .ok_or_else(|| "--cas <dir> is required (SPAWN_WORKSPACE_ROOT is not set)".to_string()),
     }
@@ -176,7 +170,7 @@ pub(crate) fn check_root(dir: &Path, cas: &Path) -> Result<PathBuf, String> {
     {
         return refuse("it is inside a transcript archive".to_string());
     }
-    if let Some(workspace) = env_path("SPAWN_WORKSPACE_ROOT") {
+    if let Some(workspace) = crate::config::workspace_root_dir() {
         let workspace = resolved(&workspace);
         if root.starts_with(&workspace) {
             return refuse(format!(
@@ -192,7 +186,7 @@ pub(crate) fn check_root(dir: &Path, cas: &Path) -> Result<PathBuf, String> {
             ));
         }
     }
-    if let Some(data_root) = env_path("SPAWN_DATA_ROOT") {
+    if let Some(data_root) = crate::config::data_root_dir() {
         let data_root = resolved(&data_root);
         if !root.starts_with(&data_root) {
             return refuse(format!(

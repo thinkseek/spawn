@@ -1223,8 +1223,12 @@ pub(crate) fn judge(
     scenario: Option<&Path>,
     env: &[(String, String)],
     limit: Duration,
+    host_load: &crate::config::GateLoadEnv,
 ) -> Result<Verdict, GateFailure> {
-    judge_seeing_base_check(gate, repo, base, candidate, scenarios, scenario, env, limit).0
+    judge_seeing_base_check(
+        gate, repo, base, candidate, scenarios, scenario, env, limit, host_load,
+    )
+    .0
 }
 
 /// [`judge`], and the red check the gate found passing on the base before
@@ -1242,6 +1246,7 @@ pub(crate) fn judge_seeing_base_check(
     scenario: Option<&Path>,
     env: &[(String, String)],
     limit: Duration,
+    host_load: &crate::config::GateLoadEnv,
 ) -> (Result<Verdict, GateFailure>, Option<String>) {
     let mut seen = None;
     // In a judging's directory when this thread runs one (gate v2 step 2,
@@ -1258,6 +1263,7 @@ pub(crate) fn judge_seeing_base_check(
         scenario,
         env,
         limit,
+        host_load,
         &mut seen,
     );
     (judged, seen)
@@ -1730,13 +1736,14 @@ fn judge_in(
     scenario: Option<&Path>,
     env: &[(String, String)],
     limit: Duration,
+    host_load: &crate::config::GateLoadEnv,
     seen: &mut Option<String>,
 ) -> Result<Verdict, GateFailure> {
     let policy = LoadPolicy::from_env(
         |name| {
             env_value(env, name)
                 .map(str::to_string)
-                .or_else(|| std::env::var(name).ok())
+                .or_else(|| host_load.get(name).map(str::to_string))
         },
         host_cores(),
     );
@@ -2965,6 +2972,7 @@ pub(crate) fn scenario_names(directory: &Path) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{
         BaseDisagrees, Cpu, GateFailure, PrivateDirectory, Shortfall, gate_env, judge, judge_in,
         on_shared_server, run_bounded, withhold_owners_cluster, write_gate_env,
@@ -3429,6 +3437,7 @@ mod tests {
                 None,
                 env,
                 Duration::from_secs(20),
+                &crate::config::GateLoadEnv::default(),
             )
         }
 
@@ -3447,6 +3456,7 @@ mod tests {
                 None,
                 &path_only(),
                 Duration::from_secs(20),
+                &crate::config::GateLoadEnv::default(),
             )
         }
 
@@ -3475,6 +3485,7 @@ mod tests {
                 None,
                 env,
                 limit,
+                &crate::config::GateLoadEnv::default(),
             )
         }
     }
@@ -3489,6 +3500,7 @@ mod tests {
             free_kb: Option<u64>,
         ) -> Result<super::Verdict, GateFailure> {
             let path = |name: &str| -> PathBuf { self.directory.path().join(name) };
+            let default_load = crate::config::GateLoadEnv::default();
             judge_in(
                 parent,
                 &|_| free_kb,
@@ -3500,6 +3512,7 @@ mod tests {
                 None,
                 env,
                 Duration::from_secs(20),
+                &default_load,
                 &mut None,
             )
         }

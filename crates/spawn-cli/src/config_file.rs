@@ -614,20 +614,26 @@ fn default_auto_approve() -> Option<String> {
 }
 
 impl SpawnConfig {
-    /// Parse and validate `spawn.toml` text.
-    pub fn from_toml_str(input: &str) -> Result<Self, String> {
+    /// Parse and validate `spawn.toml` text using an injected environment lookup.
+    pub fn from_toml_str_with(
+        input: &str,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, String> {
         let value = toml_parser::parse(input).map_err(|error| format!("parse TOML: {error}"))?;
         let config: Self = serde_json::from_value(value)
             .map_err(|error| format!("invalid spawn.toml: {error}"))?;
-        config.validate()?;
+        config.validate_with(env)?;
         Ok(config)
     }
 
-    /// Read, parse, and validate a `spawn.toml` file.
-    pub fn from_file(path: &Path) -> Result<Self, String> {
+    /// Read, parse, and validate a `spawn.toml` file using an injected environment lookup.
+    pub fn from_file_with(
+        path: &Path,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, String> {
         let text = fs::read_to_string(path)
             .map_err(|error| format!("read config {}: {error}", path.display()))?;
-        Self::from_toml_str(&text)
+        Self::from_toml_str_with(&text, env)
     }
 
     /// Compute derived directories under `[instance].data_dir`.
@@ -648,13 +654,18 @@ impl SpawnConfig {
 
     /// Validate every field and cross-field constraint.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with(&|_| None)
+    }
+
+    /// Validate every field and cross-field constraint using an injected environment lookup.
+    pub fn validate_with(&self, env: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(format!(
                 "unsupported schema_version {}: expected {SCHEMA_VERSION}",
                 self.schema_version
             ));
         }
-        self.validate_instance()?;
+        self.validate_instance_with(env)?;
         self.validate_database()?;
         self.validate_server()?;
         self.validate_storage()?;
@@ -666,7 +677,7 @@ impl SpawnConfig {
         Ok(())
     }
 
-    fn validate_instance(&self) -> Result<(), String> {
+    fn validate_instance_with(&self, env: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         let name = &self.instance.name;
         if name.is_empty()
             || !name
@@ -679,7 +690,7 @@ impl SpawnConfig {
                 "[instance].name {name:?} must be non-empty and use only letters, digits, '-', '_', '.'"
             ));
         }
-        validate_data_dir(&self.instance.data_dir)?;
+        validate_data_dir(&self.instance.data_dir, env("HOME").as_deref())?;
         if let Some(repo) = &self.instance.default_repo
             && (repo.as_os_str().is_empty() || !repo.is_absolute() || has_parent_dir(repo))
         {
@@ -1151,7 +1162,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     }
 }
 
-fn validate_data_dir(path: &Path) -> Result<(), String> {
+fn validate_data_dir(path: &Path, home: Option<&str>) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("[instance].data_dir must not be empty".to_string());
     }
@@ -1175,9 +1186,9 @@ fn validate_data_dir(path: &Path) -> Result<(), String> {
             text.trim_end_matches('/')
         ));
     }
-    if let Ok(home) = std::env::var("HOME")
+    if let Some(home) = home
         && !home.is_empty()
-        && normalize_lexically(Path::new(&home)) == normalized
+        && normalize_lexically(Path::new(home)) == normalized
     {
         return Err(format!(
             "[instance].data_dir {text:?} cannot be $HOME directly; use a dedicated subdirectory"
@@ -1259,11 +1270,6 @@ fn find_program_in_paths(program: &str, dirs: &[String]) -> Option<PathBuf> {
     dirs.iter()
         .map(|dir| Path::new(dir).join(program))
         .find(|candidate| is_executable_file(candidate))
-}
-
-/// Resolve all environment variables represented by [`SpawnConfig`].
-pub fn resolve_env_entries(cfg: &SpawnConfig) -> Result<Vec<(String, String)>, String> {
-    resolve_env_entries_with(cfg, &|name| std::env::var(name).ok())
 }
 
 /// Resolve all environment variables represented by [`SpawnConfig`] using a
@@ -1688,11 +1694,6 @@ pub fn redact_env_entries(
     out
 }
 
-/// Produce the redacted JSON view of the effective configuration and environment.
-pub fn effective_json(cfg: &SpawnConfig) -> Result<Value, String> {
-    effective_json_with(cfg, &|name| std::env::var(name).ok())
-}
-
 pub fn redacted_config_for_display(cfg: &SpawnConfig) -> SpawnConfig {
     let mut out = cfg.clone();
     out.network.http_proxy = out
@@ -1951,11 +1952,11 @@ fn collect_config_warnings(cfg: &SpawnConfig, warnings: &mut Vec<String>) {
     }
 }
 
-fn evaluate_config_check(path: &Path) -> CheckReport {
+fn evaluate_config_check(path: &Path, env: &dyn Fn(&str) -> Option<String>) -> CheckReport {
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
 
-    let cfg = match SpawnConfig::from_file(path) {
+    let cfg = match SpawnConfig::from_file_with(path, env) {
         Ok(cfg) => cfg,
         Err(error) => {
             errors.push(error);
@@ -1986,7 +1987,7 @@ fn evaluate_config_check(path: &Path) -> CheckReport {
         }
     }
 
-    if let Err(error) = resolve_env_entries(&cfg) {
+    if let Err(error) = resolve_env_entries_with(&cfg, env) {
         errors.push(error);
     }
 
@@ -2032,9 +2033,10 @@ pub fn exec_with_config(
     command: &str,
     rest: &[String],
     applied_env_key: &str,
+    env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<i32, String> {
-    let cfg = SpawnConfig::from_file(config_path)?;
-    let env_entries = resolve_env_entries(&cfg)?;
+    let cfg = SpawnConfig::from_file_with(config_path, env)?;
+    let env_entries = resolve_env_entries_with(&cfg, env)?;
     if matches!(command, "loop" | "tick" | "serve" | "integrate" | "init-db") {
         ensure_data_dirs(&cfg)?;
     }
@@ -2065,6 +2067,7 @@ fn parse_config_flag(
     global_config: Option<&str>,
     allowed_switches: &[&str],
     allowed_values: &[&str],
+    env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ParsedCliFlags, String> {
     let mut switches = BTreeSet::new();
     let mut values = BTreeMap::new();
@@ -2124,8 +2127,7 @@ fn parse_config_flag(
     } else if let Some(val) = global_config {
         Some((PathBuf::from(val), ConfigOrigin::Flag))
     } else {
-        std::env::var("SPAWN_CONFIG")
-            .ok()
+        env("SPAWN_CONFIG")
             .filter(|v| !v.is_empty())
             .map(|val| (PathBuf::from(val), ConfigOrigin::Env))
     };
@@ -2137,28 +2139,36 @@ fn parse_config_flag(
 }
 
 /// Entrypoint for `spawn config <check|effective|init|docker-plan>`.
-pub fn config_command(global_config: Option<&str>, rest: &[String]) -> Result<i32, String> {
+pub fn config_command(
+    global_config: Option<&str>,
+    rest: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<i32, String> {
     let Some((verb, args)) = rest.split_first() else {
         return Err(CONFIG_USAGE.to_string());
     };
     match verb.as_str() {
-        "check" => cmd_config_check(global_config, args),
-        "effective" => cmd_config_effective(global_config, args),
-        "init" => cmd_config_init(args),
-        "docker-plan" => cmd_config_docker_plan(global_config, args),
+        "check" => cmd_config_check(global_config, args, env),
+        "effective" => cmd_config_effective(global_config, args, env),
+        "init" => cmd_config_init(args, env),
+        "docker-plan" => cmd_config_docker_plan(global_config, args, env),
         other => Err(format!(
             "unknown `spawn config` verb {other:?}\n{CONFIG_USAGE}"
         )),
     }
 }
 
-fn cmd_config_check(global_config: Option<&str>, args: &[String]) -> Result<i32, String> {
-    let parsed = parse_config_flag(args, global_config, &["json"], &[])?;
+fn cmd_config_check(
+    global_config: Option<&str>,
+    args: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<i32, String> {
+    let parsed = parse_config_flag(args, global_config, &["json"], &[], env)?;
     let json_mode = parsed.switches.contains("json");
     let Some((path, _)) = parsed.config else {
         return Err("missing config path: pass --config <path> or set SPAWN_CONFIG".to_string());
     };
-    let report = evaluate_config_check(&path);
+    let report = evaluate_config_check(&path, env);
     if json_mode {
         let rendered = serde_json::to_string_pretty(&report)
             .map_err(|error| format!("serialize config check report: {error}"))?;
@@ -2179,14 +2189,18 @@ fn cmd_config_check(global_config: Option<&str>, args: &[String]) -> Result<i32,
     }
 }
 
-fn cmd_config_effective(global_config: Option<&str>, args: &[String]) -> Result<i32, String> {
-    let parsed = parse_config_flag(args, global_config, &["json"], &[])?;
+fn cmd_config_effective(
+    global_config: Option<&str>,
+    args: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<i32, String> {
+    let parsed = parse_config_flag(args, global_config, &["json"], &[], env)?;
     let json_mode = parsed.switches.contains("json");
     let Some((path, _)) = parsed.config else {
         return Err("missing config path: pass --config <path> or set SPAWN_CONFIG".to_string());
     };
-    let cfg = SpawnConfig::from_file(&path)?;
-    let effective = effective_json(&cfg)?;
+    let cfg = SpawnConfig::from_file_with(&path, env)?;
+    let effective = effective_json_with(&cfg, env)?;
     if json_mode {
         let rendered = serde_json::to_string_pretty(&effective)
             .map_err(|error| format!("serialize effective config: {error}"))?;
@@ -2206,14 +2220,20 @@ fn cmd_config_effective(global_config: Option<&str>, args: &[String]) -> Result<
     Ok(0)
 }
 
-fn cmd_config_init(args: &[String]) -> Result<i32, String> {
-    let parsed = parse_config_flag(args, None, &["from-host"], &["data-dir", "name", "output"])?;
+fn cmd_config_init(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<i32, String> {
+    let parsed = parse_config_flag(
+        args,
+        None,
+        &["from-host"],
+        &["data-dir", "name", "output"],
+        env,
+    )?;
     let data_dir_str = parsed
         .values
         .get("data-dir")
         .ok_or_else(|| "--data-dir <dir> is required".to_string())?;
     let data_dir = PathBuf::from(data_dir_str);
-    validate_data_dir(&data_dir)?;
+    validate_data_dir(&data_dir, env("HOME").as_deref())?;
 
     let name = parsed
         .values
@@ -2221,11 +2241,11 @@ fn cmd_config_init(args: &[String]) -> Result<i32, String> {
         .cloned()
         .unwrap_or_else(default_instance_name);
     let toml_text = if parsed.switches.contains("from-host") {
-        render_from_host_toml(&name, &data_dir)
+        render_from_host_toml(&name, &data_dir, env)
     } else {
         render_init_toml(&name, &data_dir)
     };
-    SpawnConfig::from_toml_str(&toml_text)?;
+    SpawnConfig::from_toml_str_with(&toml_text, env)?;
 
     if let Some(output) = parsed.values.get("output") {
         let out_path = Path::new(output);
@@ -2371,17 +2391,17 @@ fn scan_host_inherit_home(home: Option<&Path>) -> HostInheritScan {
     scan
 }
 
-fn scan_host_inherit() -> HostInheritScan {
-    let home = std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute());
+fn scan_host_inherit(env: &dyn Fn(&str) -> Option<String>) -> HostInheritScan {
+    let home = env("HOME").map(PathBuf::from).filter(|p| p.is_absolute());
     scan_host_inherit_home(home.as_deref())
 }
 
-fn find_program_with_common_dirs(name: &str) -> Option<PathBuf> {
+fn find_program_with_common_dirs(
+    name: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
     let mut dirs: Vec<String> = Vec::new();
-    if let Ok(path_env) = std::env::var("PATH") {
+    if let Some(path_env) = env("PATH") {
         for part in path_env.split(':').filter(|s| !s.is_empty()) {
             dirs.push(part.to_string());
         }
@@ -2391,7 +2411,7 @@ fn find_program_with_common_dirs(name: &str) -> Option<PathBuf> {
             dirs.push(extra.to_string());
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = env("HOME") {
         for rel in [".local/bin", ".cargo/bin"] {
             let p = PathBuf::from(&home).join(rel).display().to_string();
             if !dirs.iter().any(|d| d == &p) {
@@ -2402,10 +2422,14 @@ fn find_program_with_common_dirs(name: &str) -> Option<PathBuf> {
     find_program_in_paths(name, &dirs)
 }
 
-fn render_from_host_toml(name: &str, data_dir: &Path) -> String {
+fn render_from_host_toml(
+    name: &str,
+    data_dir: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> String {
     let dir_escaped = escape_toml_str(&data_dir.display().to_string());
     let name_escaped = escape_toml_str(name);
-    let view_cfg = spawn_host::ViewConfig::from_env(&|k| std::env::var(k).ok());
+    let view_cfg = spawn_host::ViewConfig::from_env(env);
     let bwrap_cap = spawn_host::probe_bwrap("bwrap", &view_cfg);
     let sandbox_mode = match bwrap_cap {
         spawn_host::BwrapCapability::BlockedInContainer(_) => "container",
@@ -2414,7 +2438,7 @@ fn render_from_host_toml(name: &str, data_dir: &Path) -> String {
 
     let mut toolchain_dirs: Vec<String> = Vec::new();
     for tool in ["git", "herdr", "bwrap", "claude", "agy"] {
-        if let Some(found) = find_program_with_common_dirs(tool)
+        if let Some(found) = find_program_with_common_dirs(tool, env)
             && let Some(parent) = found.parent()
         {
             let p = parent.display().to_string();
@@ -2433,10 +2457,8 @@ fn render_from_host_toml(name: &str, data_dir: &Path) -> String {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let has_agy = find_program_with_common_dirs("agy").is_some()
-        || std::env::var("HOME")
-            .ok()
-            .is_some_and(|h| Path::new(&h).join(".gemini/antigravity-cli").is_dir());
+    let has_agy = find_program_with_common_dirs("agy", env).is_some()
+        || env("HOME").is_some_and(|h| Path::new(&h).join(".gemini/antigravity-cli").is_dir());
     let claude_sandbox =
         matches!(bwrap_cap, spawn_host::BwrapCapability::Ready) || sandbox_mode == "container";
     let agy_block = if has_agy {
@@ -2541,8 +2563,9 @@ fn build_docker_plan_report(
     data_dir: &Path,
     repo: Option<&Path>,
     image: &str,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Value {
-    let scan = scan_host_inherit();
+    let scan = scan_host_inherit(env_lookup);
     let readonly_mounts = collect_docker_readonly_mounts(&scan, config_path);
     let mut writable_mounts = vec![(data_dir.display().to_string(), "/var/lib/spawn".to_string())];
     if let Some(repo_path) = repo {
@@ -2571,7 +2594,7 @@ fn build_docker_plan_report(
         "HTTPS_PROXY",
         "NO_PROXY",
     ] {
-        if let Ok(val) = std::env::var(var)
+        if let Some(val) = env_lookup(var)
             && !val.is_empty()
             && !url_has_userinfo(&val)
         {
@@ -2618,13 +2641,17 @@ fn build_docker_plan_report(
     })
 }
 
-fn cmd_config_docker_plan(global_config: Option<&str>, rest: &[String]) -> Result<i32, String> {
-    let parsed = parse_config_flag(rest, global_config, &["json"], &["data-dir", "image"])?;
+fn cmd_config_docker_plan(
+    global_config: Option<&str>,
+    rest: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<i32, String> {
+    let parsed = parse_config_flag(rest, global_config, &["json"], &["data-dir", "image"], env)?;
     let json_mode = parsed.switches.contains("json");
     let loaded = parsed
         .config
         .as_ref()
-        .map(|(p, _)| SpawnConfig::from_file(p))
+        .map(|(p, _)| SpawnConfig::from_file_with(p, env))
         .transpose()?;
     let data_dir = parsed
         .values
@@ -2632,7 +2659,7 @@ fn cmd_config_docker_plan(global_config: Option<&str>, rest: &[String]) -> Resul
         .map(PathBuf::from)
         .or_else(|| loaded.as_ref().map(|cfg| cfg.instance.data_dir.clone()))
         .ok_or_else(|| "missing data_dir: pass --config <path> or --data-dir <dir>".to_string())?;
-    validate_data_dir(&data_dir)?;
+    validate_data_dir(&data_dir, env("HOME").as_deref())?;
     let repo = loaded
         .as_ref()
         .and_then(|cfg| cfg.instance.default_repo.clone());
@@ -2647,6 +2674,7 @@ fn cmd_config_docker_plan(global_config: Option<&str>, rest: &[String]) -> Resul
         &data_dir,
         repo.as_deref(),
         &image,
+        env,
     );
     if json_mode {
         let rendered = serde_json::to_string_pretty(&plan)
@@ -2659,26 +2687,31 @@ fn cmd_config_docker_plan(global_config: Option<&str>, rest: &[String]) -> Resul
 }
 
 /// Entrypoint for `spawn doctor [--config <path>] [--root <dir>] [--json]`.
-pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i32, String> {
-    let parsed = parse_config_flag(rest, global_config, &["json"], &["root"])?;
+pub fn doctor_command(
+    global_config: Option<&str>,
+    rest: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<i32, String> {
+    let parsed = parse_config_flag(rest, global_config, &["json"], &["root"], env)?;
     let json_mode = parsed.switches.contains("json");
     let config = parsed.config;
 
     let loaded_config = if let Some((path, _)) = &config {
-        Some(SpawnConfig::from_file(path)?)
+        Some(SpawnConfig::from_file_with(path, env)?)
     } else {
         None
     };
 
     let explicit_root = parsed.values.get("root").map(PathBuf::from);
     let (workspaces_or_root, probe_root_origin) =
-        resolve_doctor_probe_root(explicit_root.as_deref(), loaded_config.as_ref());
+        resolve_doctor_probe_root(explicit_root.as_deref(), loaded_config.as_ref(), env);
 
     let report = build_doctor_report(
         config.as_ref().map(|(p, o)| (p.as_path(), *o)),
         (&workspaces_or_root, probe_root_origin),
         explicit_root.as_deref(),
         loaded_config.as_ref(),
+        env,
     );
 
     if json_mode {
@@ -2696,6 +2729,7 @@ fn build_doctor_report(
     probe_root: (&Path, ConfigOrigin),
     explicit_root: Option<&Path>,
     loaded_config: Option<&SpawnConfig>,
+    env: &dyn Fn(&str) -> Option<String>,
 ) -> Value {
     let (probe_root, probe_root_origin) = probe_root;
     let toolchain_paths: Vec<String> = loaded_config
@@ -2708,9 +2742,9 @@ fn build_doctor_report(
     let herdr = probe_herdr(&toolchain_paths);
     let bwrap = probe_simple_tool("bwrap", &toolchain_paths);
     let zstd = probe_simple_tool("zstd", &toolchain_paths);
-    let container = spawn_host::detect_container();
-    let bwrap_capability = probe_bwrap_capability(&bwrap);
-    let host_inherit = probe_host_inherit();
+    let container = spawn_host::detect_container(env("container").as_deref());
+    let bwrap_capability = probe_bwrap_capability(&bwrap, env);
+    let host_inherit = probe_host_inherit(env);
     let archive_mask_tool = probe_archive_mask_tool();
 
     let root_fs = df_filesystem_info(Path::new("/")).ok();
@@ -2727,12 +2761,11 @@ fn build_doctor_report(
 
     let storage_probes = probe_storage(probe_root);
     let (shared_build_caches, shared_cache_warnings) =
-        probe_shared_build_caches(explicit_root, loaded_config);
+        probe_shared_build_caches(explicit_root, loaded_config, env);
     warnings.extend(shared_cache_warnings);
-    let (model_endpoints, model_warnings) = probe_model_endpoints();
+    let (model_endpoints, model_warnings) = probe_model_endpoints(env);
     warnings.extend(model_warnings);
-    let (claude_config, claude_config_warnings) =
-        probe_claude_config_with(&|name| std::env::var(name).ok(), loaded_config);
+    let (claude_config, claude_config_warnings) = probe_claude_config_with(env, loaded_config);
     warnings.extend(claude_config_warnings);
 
     json!({
@@ -2791,12 +2824,12 @@ fn collect_doctor_target_warnings(
     warnings
 }
 
-fn probe_bwrap_capability(bwrap_tool: &Value) -> Value {
+fn probe_bwrap_capability(bwrap_tool: &Value, env: &dyn Fn(&str) -> Option<String>) -> Value {
     let bwrap_prog = bwrap_tool["program"]
         .as_str()
         .filter(|_| bwrap_tool["installed"].as_bool().unwrap_or(false))
         .unwrap_or("bwrap");
-    let cfg = spawn_host::ViewConfig::from_env(&|k| std::env::var(k).ok());
+    let cfg = spawn_host::ViewConfig::from_env(env);
     match spawn_host::probe_bwrap(bwrap_prog, &cfg) {
         spawn_host::BwrapCapability::Ready => json!({ "status": "ready" }),
         spawn_host::BwrapCapability::BlockedInContainer(reason) => json!({
@@ -2810,8 +2843,8 @@ fn probe_bwrap_capability(bwrap_tool: &Value) -> Value {
     }
 }
 
-fn probe_host_inherit() -> Value {
-    let scan = scan_host_inherit();
+fn probe_host_inherit(env: &dyn Fn(&str) -> Option<String>) -> Value {
+    let scan = scan_host_inherit(env);
     json!({
         "home": scan.home,
         "safe_dirs": scan.safe_dirs.iter().map(|(rel, p)| json!({ "rel": rel, "path": p })).collect::<Vec<_>>(),
@@ -2843,6 +2876,7 @@ fn probe_archive_mask_tool() -> Value {
 fn resolve_doctor_probe_root(
     explicit_root: Option<&Path>,
     cfg: Option<&SpawnConfig>,
+    env: &dyn Fn(&str) -> Option<String>,
 ) -> (PathBuf, ConfigOrigin) {
     if let Some(root) = explicit_root {
         return (nearest_existing_ancestor(root), ConfigOrigin::Flag);
@@ -2857,7 +2891,7 @@ fn resolve_doctor_probe_root(
             ConfigOrigin::File,
         );
     }
-    if let Ok(ws_env) = std::env::var("SPAWN_WORKSPACE_ROOT")
+    if let Some(ws_env) = env("SPAWN_WORKSPACE_ROOT")
         && !ws_env.is_empty()
     {
         return (
@@ -3103,9 +3137,9 @@ fn sanitize_shared_cache_error(raw: &str) -> String {
 fn probe_shared_build_caches(
     explicit_root: Option<&Path>,
     loaded_config: Option<&SpawnConfig>,
+    env: &dyn Fn(&str) -> Option<String>,
 ) -> (Value, Vec<String>) {
-    let env_ws = std::env::var("SPAWN_WORKSPACE_ROOT")
-        .ok()
+    let env_ws = env("SPAWN_WORKSPACE_ROOT")
         .map(|raw| raw.trim().to_string())
         .filter(|raw| !raw.is_empty())
         .map(PathBuf::from);
@@ -3114,7 +3148,7 @@ fn probe_shared_build_caches(
         .map(Path::to_path_buf)
         .or(derived_ws)
         .or(env_ws);
-    probe_shared_build_caches_with(ws_root.as_deref(), &|name| std::env::var(name).ok())
+    probe_shared_build_caches_with(ws_root.as_deref(), env)
 }
 
 const DOCTOR_SHARED_BUILD_CACHE_VARS: &[&str] = &[
@@ -3662,11 +3696,8 @@ fn print_doctor_claude_config(report: &Value) {
     );
 }
 
-fn probe_model_endpoints() -> (Value, Vec<String>) {
-    probe_model_endpoints_with(
-        &|name| std::env::var(name).ok(),
-        &spawn_jev::probe_http_endpoint,
-    )
+fn probe_model_endpoints(env: &dyn Fn(&str) -> Option<String>) -> (Value, Vec<String>) {
+    probe_model_endpoints_with(env, &spawn_jev::probe_http_endpoint)
 }
 
 fn probe_model_endpoints_with(
@@ -3764,7 +3795,7 @@ mod tests {
             "schema_version = 1\n\n[instance]\ndata_dir = \"/srv/spawn\"\n\n",
             "[engines.claude]\nconfig_dir = \"~/fleet-claude\"\n"
         );
-        let cfg = SpawnConfig::from_toml_str(toml).expect("config parses");
+        let cfg = SpawnConfig::from_toml_str_with(toml, &|_| None).expect("config parses");
         let home_only = |key: &str| (key == "HOME").then(|| base.display().to_string());
         let (toml_report, warnings) = probe_claude_config_with(&home_only, Some(&cfg));
         assert!(warnings.is_empty(), "{warnings:?}");

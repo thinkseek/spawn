@@ -2,6 +2,9 @@
 //! through the test database as the reader login, the catch-up, the one
 //! `LISTEN spawn_events` listener and a whole stream over HTTP.
 
+#![cfg(test)]
+#![allow(clippy::disallowed_methods)]
+
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,7 +106,12 @@ fn reader_schema(case: &str) -> (spawn_postgres::testing::TestSchema, PostgresSt
     let url = std::env::var("SPAWN_TEST_DATABASE_URL")
         .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip");
     let schema = spawn_postgres::testing::TestSchema::new(case);
-    let store = PostgresStore::connect_in_schema(&url, &schema).expect("migrated");
+    let store = PostgresStore::connect_in_schema_with_options(
+        &url,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("migrated");
     let separator = if url.contains('?') { '&' } else { '?' };
     let owner = format!("{url}{separator}options=-csearch_path%3D{}", &*schema);
     let reader = spawn_postgres::role_url_with_passfile(&owner, "spawn_reader", None)

@@ -5,6 +5,8 @@
 //! `agent send`, `agent wait`, `agent interrupt`, and fail-closed flag/guard
 //! validations.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

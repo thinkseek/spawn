@@ -257,11 +257,6 @@ impl JevConfig {
         self
     }
 
-    /// Construct a `JevConfig` from [`OUT_SOCK_ENV`] (`SPAWN_OUT_SOCK`) if set and non-empty.
-    pub fn from_out_sock_env() -> Option<Self> {
-        Self::from_out_sock_lookup(|key| std::env::var(key).ok())
-    }
-
     /// Construct a `JevConfig` using an injected environment lookup closure for [`OUT_SOCK_ENV`].
     pub fn from_out_sock_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<Self> {
         let raw = lookup(OUT_SOCK_ENV)?;
@@ -288,11 +283,6 @@ impl JevJudge {
     /// Judge using a local `out.sock` UNIX domain socket.
     pub fn from_out_sock(path: impl Into<PathBuf>) -> Self {
         Self::new(JevConfig::new_out_sock(path))
-    }
-
-    /// Judge configured from [`OUT_SOCK_ENV`] (`SPAWN_OUT_SOCK`), if non-empty.
-    pub fn from_out_sock_env() -> Option<Self> {
-        JevConfig::from_out_sock_env().map(Self::new)
     }
 }
 

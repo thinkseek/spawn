@@ -4033,6 +4033,7 @@ pub(super) fn prepare_source_for_bundle(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use std::sync::Arc;
     use std::thread;
@@ -5142,8 +5143,12 @@ mod tests {
         );
         let schema = spawn_postgres::testing::TestSchema::new("backup_d6_export");
         let store = Arc::new(
-            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
-                .expect("isolated schema store"),
+            spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("isolated schema store"),
         );
         let ledger = crate::sources::PostgresRefLedger::new(Arc::clone(&store));
 

@@ -3764,6 +3764,7 @@ fn open_d6_workspace_for_land(
         ws_root,
         std::sync::Arc::clone(&cas),
         ledger,
+        crate::config::workspace_max_file_bytes(),
     );
     Ok((cas, d6))
 }
@@ -3992,6 +3993,7 @@ fn task_land_cmd(rest: &[String]) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use spawn_core::event::ModelProfile;
 
     use serde_json::{Value, json};
@@ -4273,8 +4275,12 @@ mod tests {
             "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
         );
         let schema = spawn_postgres::testing::TestSchema::new("mission_add_features");
-        let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
-            .expect("a schema of its own, migrated");
+        let store = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("a schema of its own, migrated");
         let dir = std::env::temp_dir().join(format!(
             "spawn-feature-roundtrip-{}-{:?}",
             std::process::id(),
@@ -4693,8 +4699,12 @@ mod tests {
             "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
         );
         let schema = spawn_postgres::testing::TestSchema::new("mission_add_missing_head");
-        let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
-            .expect("a schema of its own, migrated");
+        let store = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("a schema of its own, migrated");
         let (base, source) = source_with_head_at_a_missing_branch("add");
         let words: Vec<String> = ["add", "--text", "missing head", "--source", &source]
             .iter()
@@ -5604,6 +5614,7 @@ mod tests {
 
 #[cfg(test)]
 mod database_tests {
+    #![allow(clippy::disallowed_methods)]
     use std::io::Cursor;
 
     use serde_json::json;
@@ -6439,8 +6450,12 @@ mod database_tests {
         );
         let schema = spawn_postgres::testing::TestSchema::new("missions_d6_two_names");
         let store = std::sync::Arc::new(
-            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
-                .expect("isolated schema"),
+            spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("isolated schema"),
         );
 
         let guard = super::TempDirGuard::create("missions-d6-two-names").expect("temp dir");
@@ -6520,8 +6535,12 @@ mod database_tests {
             "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
         );
         let schema = spawn_postgres::testing::TestSchema::new("mission_workspace_kinds");
-        let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
-            .expect("isolated schema");
+        let store = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("isolated schema");
         let root = std::env::temp_dir().join(format!(
             "spawn-mission-kind-{}-{:?}",
             std::process::id(),
@@ -6884,7 +6903,12 @@ mod database_tests {
             );
             let schema = spawn_postgres::testing::TestSchema::new(schema_name);
             let store = std::sync::Arc::new(
-                spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("test pg"),
+                spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                    &url,
+                    &schema,
+                    &spawn_postgres::testing::test_connect_options(),
+                )
+                .expect("test pg"),
             );
             let guard = super::TempDirGuard::create(dir_prefix).expect("temp dir");
             let root = guard.path.join("ws-root");

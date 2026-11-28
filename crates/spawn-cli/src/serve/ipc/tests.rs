@@ -1,3 +1,6 @@
+#![cfg(test)]
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -193,7 +196,12 @@ fn ipc_framing_enforces_reject_fixture_and_end_to_end_pg_routes() {
     let _cas = Store::open(&cas_root).unwrap();
 
     let schema = spawn_postgres::testing::TestSchema::new("serve_ipc");
-    let store = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
+    let store = PostgresStore::connect_in_schema_with_options(
+        &base_url,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .unwrap();
 
     let agent = AgentId::new("agent_ipc_1").unwrap();
     let session = SessionId::new("session_ipc_1").unwrap();
@@ -517,7 +525,12 @@ fn role_conn_pool_reuses_warm_conns_bounds_queue_and_evicts_broken() {
         return;
     };
     let schema = spawn_postgres::testing::TestSchema::new("role_pool_lifecycle");
-    let _owner_store = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
+    let _owner_store = PostgresStore::connect_in_schema_with_options(
+        &base_url,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .unwrap();
     let sep = if base_url.contains('?') { '&' } else { '?' };
     let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
     let reader_url =
@@ -679,7 +692,12 @@ fn with_write_never_replays_failed_write_and_recovers_stale_idle_before_dispatch
         return;
     };
     let schema = spawn_postgres::testing::TestSchema::new("pool_no_write_replay");
-    let _owner = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
+    let _owner = PostgresStore::connect_in_schema_with_options(
+        &base_url,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .unwrap();
     let sep = if base_url.contains('?') { '&' } else { '?' };
     let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
     let node_url =
@@ -756,7 +774,12 @@ fn pool_slot_drop_evicts_on_panic_and_unmarked_dead_backend_without_leaking_slot
         return;
     };
     let schema = spawn_postgres::testing::TestSchema::new("pool_panic_dirty");
-    let _owner = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
+    let _owner = PostgresStore::connect_in_schema_with_options(
+        &base_url,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .unwrap();
     let sep = if base_url.contains('?') { '&' } else { '?' };
     let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
     let reader_url =
@@ -808,7 +831,12 @@ fn broken_slot_eviction_closes_socket_before_waking_waiter() {
         return;
     };
     let schema = spawn_postgres::testing::TestSchema::new("pool_evict_order");
-    let _owner = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
+    let _owner = PostgresStore::connect_in_schema_with_options(
+        &base_url,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .unwrap();
     let sep = if base_url.contains('?') { '&' } else { '?' };
     let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
     let reader_url =
@@ -855,7 +883,12 @@ fn uds_four_concurrent_streams_under_reads_one_events_two_do_not_starve_reads() 
     let _cas = Store::open(&cas_root).unwrap();
 
     let schema = spawn_postgres::testing::TestSchema::new("ipc_stream_pool");
-    let store = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
+    let store = PostgresStore::connect_in_schema_with_options(
+        &base_url,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .unwrap();
     let sep = if base_url.contains('?') { '&' } else { '?' };
     let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
     let urls = RoleUrls::from_owner(&owner_in_schema).unwrap();

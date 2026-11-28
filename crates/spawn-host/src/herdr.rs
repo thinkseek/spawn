@@ -169,15 +169,13 @@ const LAUNCH_CLEAR_MAX_MS: u64 = 10_000;
 /// Maximum number of Herdr server shards a single [`HerdrPool`] manages.
 pub const MAX_SHARDS: usize = 64;
 
-fn launch_clear_limit_from(value: Option<&str>) -> Duration {
+/// Parse `SPAWN_HERDR_LAUNCH_CLEAR_MS` into a clamped launch-clear wait duration.
+#[must_use]
+pub fn launch_clear_limit_from(value: Option<&str>) -> Duration {
     value
         .and_then(|text| text.trim().parse::<u64>().ok())
         .filter(|ms| (LAUNCH_CLEAR_MIN_MS..=LAUNCH_CLEAR_MAX_MS).contains(ms))
         .map_or(LAUNCH_CLEAR_LIMIT, Duration::from_millis)
-}
-
-fn launch_clear_limit() -> Duration {
-    launch_clear_limit_from(std::env::var("SPAWN_HERDR_LAUNCH_CLEAR_MS").ok().as_deref())
 }
 
 /// Lines of the pane read while waiting for that clear: more than a reader
@@ -285,6 +283,8 @@ pub struct HerdrHost {
     /// What this host keeps in `$XDG_RUNTIME_DIR` goes here instead
     /// ([`HerdrHost::with_runtime_under`]): a test's own.
     runtime_base: Option<PathBuf>,
+    /// Injected process environment settings.
+    host_env: crate::terminal_support::TerminalHostEnv,
     /// The engines' projects root, pinned ([`HerdrHost::with_files_beneath`]).
     beneath: Option<crate::beneath::Beneath>,
     /// The session's API socket, once `status` said where it is.
@@ -462,13 +462,18 @@ pub(crate) fn valid_session(name: &str) -> bool {
 }
 
 impl HerdrHost {
-    /// Host on the Herdr session `session` of the `herdr` at `program`.
+    /// Host on the Herdr session `session` of the `herdr` at `program`, configured
+    /// with explicit process environment [`crate::TerminalHostEnv`].
     ///
     /// # Errors
     ///
     /// When `session` is no plain word (letters, digits, `_`, `-`), or is
     /// `default`: the host never runs on the user's own session.
-    pub fn on_session(program: &str, session: &str) -> Result<Self, TerminalError> {
+    pub fn on_session(
+        program: &str,
+        session: &str,
+        host_env: crate::terminal_support::TerminalHostEnv,
+    ) -> Result<Self, TerminalError> {
         if !valid_session(session) {
             return Err(TerminalError(format!(
                 "{session:?} cannot name Spawn's herdr session: use letters, digits, `_` and `-`, \
@@ -480,6 +485,7 @@ impl HerdrHost {
             session: session.to_string(),
             waits: (HANGUP_WAIT, KILL_WAIT),
             runtime_base: None,
+            host_env,
             beneath: None,
             socket: OnceLock::new(),
             protocol: PROTOCOL,
@@ -629,7 +635,12 @@ impl HerdrHost {
         let base = self
             .runtime_base
             .clone()
-            .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
+            .or_else(|| {
+                self.host_env
+                    .xdg_runtime_dir
+                    .clone()
+                    .filter(|p| !p.as_os_str().is_empty())
+            })
             .ok_or_else(|| {
                 TerminalError(
                     "the herdr host keeps its terminals in $XDG_RUNTIME_DIR, which is not set"
@@ -653,11 +664,7 @@ impl HerdrHost {
     fn herdr(&self, arguments: &[&str]) -> Command {
         let mut command = Command::new(&self.program);
         command.arg("--session").arg(&self.session).args(arguments);
-        for (name, _) in std::env::vars_os() {
-            if scrub(&name) {
-                command.env_remove(name);
-            }
-        }
+        crate::terminal_support::remove_scrubbed_env(&mut command, &self.host_env);
         command
     }
 
@@ -1112,7 +1119,11 @@ impl HerdrHost {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let deadline = Instant::now() + launch_clear_limit();
+        let limit = self
+            .host_env
+            .launch_clear_limit
+            .unwrap_or(LAUNCH_CLEAR_LIMIT);
+        let deadline = Instant::now() + limit;
         loop {
             if !script.exists() {
                 let Ok(read) = self.call(
@@ -1814,7 +1825,11 @@ impl TerminalHost for HerdrHost {
         crate::terminal_support::wait_sessions_gone(terminal, &leaders, self.waits, "pane.close")?;
         // What the engine detached from its session, still beneath the
         // workspace: ended by pid before the caller's final checkpoint.
-        crate::terminal_support::end_stragglers(workspace.path(), self.waits)?;
+        crate::terminal_support::end_stragglers(
+            workspace.path(),
+            self.waits,
+            self.host_env.home.as_deref(),
+        )?;
         self.forget(terminal);
         self.unfollow(terminal);
         Ok(())
@@ -2029,12 +2044,13 @@ impl HerdrPool {
         program: &str,
         base_session: &str,
         shards: usize,
+        host_env: &crate::terminal_support::TerminalHostEnv,
     ) -> Result<Self, TerminalError> {
         Ok(Self {
             shards: build_shards(
                 shards,
                 base_session,
-                |session| HerdrHost::on_session(program, session),
+                |session| HerdrHost::on_session(program, session, host_env.clone()),
                 PoolShard::Legacy,
             )?,
         })
@@ -2053,12 +2069,13 @@ impl HerdrPool {
         program: &str,
         base_session: &str,
         shards: usize,
+        host_env: &crate::terminal_support::TerminalHostEnv,
     ) -> Result<Self, TerminalError> {
         Ok(Self {
             shards: build_shards(
                 shards,
                 base_session,
-                |session| crate::HerdrCoreHost::on_session(program, session),
+                |session| crate::HerdrCoreHost::on_session(program, session, host_env.clone()),
                 PoolShard::Core,
             )?,
         })
@@ -2421,9 +2438,13 @@ mod tests {
     #[test]
     fn an_unknown_key_presses_nothing() {
         let base = crate::Scratch::new("spawn-herdr-keys");
-        let host = super::HerdrHost::on_session("/nonexistent/herdr", "spawn-unit")
-            .expect("valid session")
-            .with_runtime_under(base.to_path_buf());
+        let host = super::HerdrHost::on_session(
+            "/nonexistent/herdr",
+            "spawn-unit",
+            crate::TerminalHostEnv::default(),
+        )
+        .expect("valid session")
+        .with_runtime_under(base.to_path_buf());
         let terminal = TerminalName::new("spawn-exec_1").expect("terminal");
         let workspace = WorkspaceId::new("a:/tmp/a").expect("workspace");
         let error = host
@@ -2457,13 +2478,15 @@ mod tests {
     fn only_a_plain_session_of_spawn_s_own_is_taken() {
         for good in ["spawn", "spawn-test_1", "S2"] {
             assert!(
-                super::HerdrHost::on_session("herdr", good).is_ok(),
+                super::HerdrHost::on_session("herdr", good, crate::TerminalHostEnv::default())
+                    .is_ok(),
                 "{good}"
             );
         }
         for bad in ["", "default", "a b", "../x", "x/y", &"x".repeat(65)] {
             assert!(
-                super::HerdrHost::on_session("herdr", bad).is_err(),
+                super::HerdrHost::on_session("herdr", bad, crate::TerminalHostEnv::default())
+                    .is_err(),
                 "{bad:?}"
             );
         }
@@ -2478,9 +2501,13 @@ mod tests {
         let base = crate::Scratch::new("spawn-herdr-stage");
         std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700))
             .expect("0700");
-        let host = super::HerdrHost::on_session("/nonexistent/herdr", "spawn-unit")
-            .expect("valid session")
-            .with_runtime_under(base.to_path_buf());
+        let host = super::HerdrHost::on_session(
+            "/nonexistent/herdr",
+            "spawn-unit",
+            crate::TerminalHostEnv::default(),
+        )
+        .expect("valid session")
+        .with_runtime_under(base.to_path_buf());
         let terminal = TerminalName::new("spawn-exec_1").expect("terminal");
         let workspace = WorkspaceId::new("a:/tmp/a").expect("workspace");
         host.stage_text(&terminal, &workspace, "first")
@@ -2501,9 +2528,13 @@ mod tests {
         let open = crate::Scratch::new("spawn-herdr-open");
         std::fs::set_permissions(open.path(), std::fs::Permissions::from_mode(0o777))
             .expect("0777");
-        let exposed = super::HerdrHost::on_session("/nonexistent/herdr", "spawn-unit")
-            .expect("valid session")
-            .with_runtime_under(open.to_path_buf());
+        let exposed = super::HerdrHost::on_session(
+            "/nonexistent/herdr",
+            "spawn-unit",
+            crate::TerminalHostEnv::default(),
+        )
+        .expect("valid session")
+        .with_runtime_under(open.to_path_buf());
         assert!(exposed.stage_text(&terminal, &workspace, "secret").is_err());
         assert_eq!(std::fs::read_dir(open.path()).unwrap().count(), 0);
     }
@@ -2513,9 +2544,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700))
             .expect("0700");
-        super::HerdrHost::on_session("/nonexistent/herdr", "spawn-unit")
-            .expect("valid session")
-            .with_runtime_under(base.to_path_buf())
+        super::HerdrHost::on_session(
+            "/nonexistent/herdr",
+            "spawn-unit",
+            crate::TerminalHostEnv::default(),
+        )
+        .expect("valid session")
+        .with_runtime_under(base.to_path_buf())
     }
 
     /// Review #558 P2 #3: only a missing state directory means nothing was
@@ -2880,14 +2915,15 @@ mod tests {
     #[test]
     fn herdr_pool_shards_deterministically_and_validates_bounds() {
         use super::{HerdrPool, MAX_SHARDS, launch_clear_limit_from};
-        assert!(HerdrPool::on_session("herdr", "spawn-test", 0).is_err());
-        assert!(HerdrPool::on_session("herdr", "spawn-test", MAX_SHARDS + 1).is_err());
+        let env = crate::TerminalHostEnv::default();
+        assert!(HerdrPool::on_session("herdr", "spawn-test", 0, &env).is_err());
+        assert!(HerdrPool::on_session("herdr", "spawn-test", MAX_SHARDS + 1, &env).is_err());
 
-        let single = HerdrPool::on_session("herdr", "spawn-test", 1).expect("single shard");
+        let single = HerdrPool::on_session("herdr", "spawn-test", 1, &env).expect("single shard");
         assert_eq!(single.shard_count(), 1);
         assert_eq!(single.shards[0].session(), "spawn-test");
 
-        let pool = HerdrPool::on_session("herdr", "spawn-test", 8).expect("8 shards");
+        let pool = HerdrPool::on_session("herdr", "spawn-test", 8, &env).expect("8 shards");
         assert_eq!(pool.shard_count(), 8);
         assert_eq!(pool.shards[0].session(), "spawn-test-s0");
         assert_eq!(pool.shards[7].session(), "spawn-test-s7");
@@ -2925,17 +2961,19 @@ mod tests {
     #[test]
     fn herdr_pool_core_shards_deterministically_and_validates_bounds() {
         use super::{HerdrPool, MAX_SHARDS};
-        assert!(HerdrPool::on_core_session("spawn-hc", "hc-test", 0).is_err());
-        assert!(HerdrPool::on_core_session("spawn-hc", "hc-test", MAX_SHARDS + 1).is_err());
+        let env = crate::TerminalHostEnv::default();
+        assert!(HerdrPool::on_core_session("spawn-hc", "hc-test", 0, &env).is_err());
+        assert!(HerdrPool::on_core_session("spawn-hc", "hc-test", MAX_SHARDS + 1, &env).is_err());
 
-        let single = HerdrPool::on_core_session("spawn-hc", "hc-test", 1).expect("single shard");
+        let single =
+            HerdrPool::on_core_session("spawn-hc", "hc-test", 1, &env).expect("single shard");
         assert!(single.is_core());
         assert_eq!(single.shard_count(), 1);
         assert_eq!(single.shard_sessions(), vec!["hc-test"]);
         assert!(single.primary_core().is_some());
         assert!(single.primary_legacy().is_none());
 
-        let pool = HerdrPool::on_core_session("spawn-hc", "hc-test", 4).expect("4 shards");
+        let pool = HerdrPool::on_core_session("spawn-hc", "hc-test", 4, &env).expect("4 shards");
         assert!(pool.is_core());
         assert_eq!(pool.shard_count(), 4);
         assert_eq!(

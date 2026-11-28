@@ -10,6 +10,8 @@
 //! engine writes; an id recorded under the root as configured (before the
 //! root was resolved) still names the same directory.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -75,7 +77,11 @@ impl World {
     }
 
     fn store(&self) -> GitWorkspace {
-        GitWorkspace::new(&self.repo, self.configured())
+        GitWorkspace::new(
+            &self.repo,
+            self.configured(),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        )
     }
 }
 
@@ -284,7 +290,14 @@ impl Server {
     }
 
     fn host(&self) -> HerdrCoreHost {
-        HerdrCoreHost::on_session(&self.program, &self.session)
+        let host_env = spawn_host::TerminalHostEnv {
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            scrubbed_env_keys: spawn_host::TerminalHostEnv::collect_scrubbed_keys(
+                std::env::vars_os().map(|(k, _)| k),
+            ),
+            ..spawn_host::TerminalHostEnv::default()
+        };
+        HerdrCoreHost::on_session(&self.program, &self.session, host_env)
             .expect("valid session")
             .with_runtime_under(self.runtime())
     }

@@ -522,6 +522,7 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{
         GIB, Monitor, Place, RECOVERY_MARGIN, Reading, Thresholds, escalations,
         gate_room_escalations, hold_new_executions, parse_df, places,
@@ -701,8 +702,12 @@ mod tests {
             "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
         );
         let schema = spawn_postgres::testing::TestSchema::new("disk_unwatched");
-        let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
-            .expect("a schema of its own, migrated");
+        let store = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("a schema of its own, migrated");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let low = store
                 .host_record(&json!({"type": "host.disk", "label": "workspace",

@@ -2208,7 +2208,13 @@ mod commit_v2_tests {
         let ws_dir = dir.join("ws");
         let cas = Arc::new(CasMerkleStore::open(&cas_dir).expect("open cas"));
         let ledger = Arc::new(InMemoryRefLedger::new());
-        let workspace = D6Workspace::new("proj-prov-v2", &ws_dir, cas.clone(), ledger.clone());
+        let workspace = D6Workspace::new(
+            "proj-prov-v2",
+            &ws_dir,
+            cas.clone(),
+            ledger.clone(),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        );
         let branch = BranchName::new("prov_worker").expect("branch");
         workspace.ensure_branch(&branch, None).expect("ensure");
         let ws = workspace.mount(&branch).expect("mount");

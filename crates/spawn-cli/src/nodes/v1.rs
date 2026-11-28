@@ -444,6 +444,7 @@ pub(super) fn list_command(words: &[String]) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     fn words(text: &str) -> Vec<String> {
@@ -617,7 +618,12 @@ mod tests {
     #[test]
     fn enroll_token_revoke_list_drain_and_undrain_on_the_ledger() {
         let schema = spawn_postgres::testing::TestSchema::new("nodes_v1_cli");
-        let store = PostgresStore::connect_in_schema(schema.url(), &schema).expect("connect");
+        let store = PostgresStore::connect_in_schema_with_options(
+            schema.url(),
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("connect");
         let primary = primary_key(PRIMARY).unwrap();
 
         let (token, expires) = enroll_token(&store, "n252", Some("c0"), &primary).unwrap();

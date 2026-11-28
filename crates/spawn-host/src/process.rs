@@ -223,6 +223,7 @@ mod process_id_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{current_uid, undumpable};
     use std::io::{BufRead, BufReader, ErrorKind};
     use std::process::{Child, Command, Stdio};

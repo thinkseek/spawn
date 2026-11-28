@@ -8,6 +8,8 @@
 //! main takes a commit of its own; its landing (a merge with the
 //! integrator's trailers); and an unlanded branch (`spawn/agent_b`).
 
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

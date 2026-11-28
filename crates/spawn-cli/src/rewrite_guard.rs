@@ -217,6 +217,7 @@ pub(crate) fn refused(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{why_old, why_old_walked};
     use crate::sources::test_git as git;
 
@@ -246,8 +247,12 @@ mod tests {
     #[test]
     fn a_commit_is_refused_when_it_or_its_unreferenced_history_is_from_before_the_rewrite() {
         let schema = spawn_postgres::testing::TestSchema::new("rewrite_guard");
-        let store = spawn_postgres::PostgresStore::connect_in_schema(schema.url(), &schema)
-            .expect("connect");
+        let store = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+            schema.url(),
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("connect");
         let base = std::env::temp_dir().join(format!("spawn-rewrite-guard-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo = base.join("repo.git").to_string_lossy().to_string();
@@ -324,8 +329,12 @@ mod tests {
     #[test]
     fn a_commit_built_on_the_old_history_is_refused_whatever_ref_holds_it_walked_once() {
         let schema = spawn_postgres::testing::TestSchema::new("rewrite_guard_walk");
-        let store = spawn_postgres::PostgresStore::connect_in_schema(schema.url(), &schema)
-            .expect("connect");
+        let store = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+            schema.url(),
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("connect");
         let base = std::env::temp_dir().join(format!("spawn-rewrite-walk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let mirror = base.join("mirror.git").to_string_lossy().to_string();

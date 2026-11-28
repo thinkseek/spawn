@@ -2139,6 +2139,7 @@ impl Primary {
 
 #[cfg(test)]
 pub(super) mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use spawn_core::node_proto::codec::sha256_hex as core_sha256_hex;
     use spawn_core::node_proto::grant::{Grant, JobKind};
@@ -3219,7 +3220,12 @@ pub(super) mod tests {
     impl Ledger {
         pub(in crate::integrate) fn new(case: &str) -> Self {
             let schema = spawn_postgres::testing::TestSchema::new(case);
-            let store = PostgresStore::connect_in_schema(schema.url(), &schema).expect("connect");
+            let store = PostgresStore::connect_in_schema_with_options(
+                schema.url(),
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect");
             Self {
                 store: std::sync::Arc::new(store),
                 seqs: RefCell::new(HashMap::new()),

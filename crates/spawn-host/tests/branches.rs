@@ -52,7 +52,11 @@ impl Fixture {
         let root = base.join("work");
         fs::create_dir_all(&root).expect("create the workspace root");
         Self {
-            store: GitWorkspace::new(checkout.join(".git"), &root),
+            store: GitWorkspace::new(
+                checkout.join(".git"),
+                &root,
+                spawn_host::DEFAULT_MAX_FILE_BYTES,
+            ),
             checkout,
             _scratch: base,
         }

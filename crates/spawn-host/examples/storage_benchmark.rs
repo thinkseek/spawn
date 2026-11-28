@@ -36,7 +36,7 @@ use spawn_host::{
     LocalTranscriptArchive, RefLedger, ShadowD6Workspace, ShadowOracleMetrics, format_commit_body,
     git_command,
 };
-use spawn_postgres::{PostgresStore, RefKind};
+use spawn_postgres::{ConnectOptions, PostgresStore, RefKind};
 
 const USAGE: &str = "spawn storage benchmark\n\
 \n\
@@ -833,8 +833,9 @@ struct PgRefLedger {
 
 impl PgRefLedger {
     fn connect_schema(url: &str, schema: &str) -> Result<Self, String> {
-        let pg = PostgresStore::connect_in_schema(url, schema)
-            .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
+        let pg =
+            PostgresStore::connect_in_schema_with_options(url, schema, &ConnectOptions::default())
+                .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
         Ok(Self { pg: Arc::new(pg) })
     }
 
@@ -1901,6 +1902,7 @@ fn read_complete_crash_acks(ack_path: &Path) -> Result<Vec<CrashAck>, String> {
     Ok(acks)
 }
 
+#[allow(clippy::disallowed_methods)]
 fn internal_crash_writer_main(manifest_path: &Path) -> Result<(), String> {
     let url = env::var("SPAWN_BENCH_DATABASE_URL")
         .map_err(|_| "SPAWN_BENCH_DATABASE_URL required for internal crash writer".to_string())?;
@@ -1913,8 +1915,13 @@ fn internal_crash_writer_main(manifest_path: &Path) -> Result<(), String> {
         CasMerkleStore::open(&manifest.cas_root).map_err(|e| format!("writer open cas: {e}"))?,
     );
     let ledger = Arc::new(PgRefLedger::connect_schema(&url, &manifest.schema)?);
-    let ws_store = D6Workspace::new(&manifest.project, &manifest.disk_root, cas, ledger)
-        .with_max_file_bytes(u64::MAX);
+    let ws_store = D6Workspace::new(
+        &manifest.project,
+        &manifest.disk_root,
+        cas,
+        ledger,
+        u64::MAX,
+    );
 
     let mut branch_ws = Vec::with_capacity(2);
     for slot in 0..2 {
@@ -2285,6 +2292,7 @@ fn build_crash_verify_json(input: &CrashVerifyJsonInput<'_>) -> Value {
     })
 }
 
+#[allow(clippy::disallowed_methods)]
 fn internal_crash_verify_main(manifest_path: &Path, inject_torn: bool) -> Result<Value, String> {
     let url = env::var("SPAWN_BENCH_DATABASE_URL")
         .map_err(|_| "SPAWN_BENCH_DATABASE_URL required for internal crash verify".to_string())?;
@@ -2303,8 +2311,8 @@ fn internal_crash_verify_main(manifest_path: &Path, inject_torn: bool) -> Result
         &manifest.disk_root,
         fresh_cas.clone(),
         fresh_ledger.clone(),
-    )
-    .with_max_file_bytes(u64::MAX);
+        u64::MAX,
+    );
 
     let torn_tail_present_before_commit = prepare_torn_journal_for_verify(
         &fresh_cas.cas().refs_journal_path(),
@@ -2478,10 +2486,14 @@ impl D6Driver {
         let cas = init.cas;
         let config = init.config;
         let make_ws = |ledger: Arc<PgRefLedger>| {
-            let mut ws = D6Workspace::new(&project, &disk_root, cas.clone(), ledger);
-            if config.oversized_file_bytes.is_some() || config.land_payload_bytes > 0 {
-                ws = ws.with_max_file_bytes(u64::MAX);
-            }
+            let max_file_bytes =
+                if config.oversized_file_bytes.is_some() || config.land_payload_bytes > 0 {
+                    u64::MAX
+                } else {
+                    spawn_host::DEFAULT_MAX_FILE_BYTES
+                };
+            let mut ws =
+                D6Workspace::new(&project, &disk_root, cas.clone(), ledger, max_file_bytes);
             if let Some(t) = &config.tmpfs_root {
                 ws = ws.with_l1_policy(L1TmpfsPolicy::new(t, config.tmpfs_budget_mb));
             }
@@ -3452,24 +3464,20 @@ impl ShadowDriver {
         let mut oracles = Vec::with_capacity(config.concurrency);
         let coord_ledger = Arc::new(PgRefLedger::connect_schema(bench_url, schema)?);
         for _ in 0..config.concurrency {
-            let mut primary = GitWorkspace::new(&repo, &git_root);
-            if config.oversized_file_bytes.is_some() {
-                let cap = u64::try_from(config.file_bytes)
-                    .map_err(|_| "file_bytes overflow".to_string())?;
-                primary = primary.with_max_file_bytes(cap);
-            }
+            let cap = if config.oversized_file_bytes.is_some() {
+                u64::try_from(config.file_bytes).map_err(|_| "file_bytes overflow".to_string())?
+            } else {
+                spawn_host::DEFAULT_MAX_FILE_BYTES
+            };
+            let primary = GitWorkspace::new(&repo, &git_root, cap);
             let ledger = Arc::new(PgRefLedger::connect_schema(bench_url, schema)?);
             let mut shadow = D6Workspace::new(
                 repo.to_string_lossy().into_owned(),
                 &d6_root,
                 cas.clone(),
                 ledger,
+                cap,
             );
-            if config.oversized_file_bytes.is_some() {
-                let cap = u64::try_from(config.file_bytes)
-                    .map_err(|_| "file_bytes overflow".to_string())?;
-                shadow = shadow.with_max_file_bytes(cap);
-            }
             if let Some(t) = &config.tmpfs_root {
                 shadow = shadow.with_l1_policy(L1TmpfsPolicy::new(t, config.tmpfs_budget_mb));
             }
@@ -3783,8 +3791,9 @@ fn connect_pg_pool(
     schema: &str,
     count: usize,
 ) -> Result<Vec<Arc<PostgresStore>>, String> {
-    let first = PostgresStore::connect_in_schema(url, schema)
-        .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
+    let first =
+        PostgresStore::connect_in_schema_with_options(url, schema, &ConnectOptions::default())
+            .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
     let mut pool = Vec::with_capacity(count.max(1));
     for _ in 1..count.max(1) {
         let conn = first
@@ -3810,12 +3819,12 @@ fn build_driver(
             let workspaces_root = scratch.root.join("workspaces");
             fs::create_dir(&workspaces_root).map_err(|e| format!("create workspace root: {e}"))?;
             let _ = initialize_repository_with_main(&repo, &stage_seed)?;
-            let mut store = GitWorkspace::new(&repo, &workspaces_root);
-            if config.oversized_file_bytes.is_some() {
-                store = store.with_max_file_bytes(
-                    u64::try_from(config.file_bytes).map_err(|_| "overflow".to_string())?,
-                );
-            }
+            let cap = if config.oversized_file_bytes.is_some() {
+                u64::try_from(config.file_bytes).map_err(|_| "overflow".to_string())?
+            } else {
+                spawn_host::DEFAULT_MAX_FILE_BYTES
+            };
+            let store = GitWorkspace::new(&repo, &workspaces_root, cap);
             Ok(Arc::new(GitDriver {
                 repo,
                 stage_seed,
@@ -3868,6 +3877,7 @@ fn build_driver(
     }
 }
 
+#[allow(clippy::disallowed_methods)]
 fn run(config: &Config) -> Result<Value, String> {
     static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
     let bench_url = env::var("SPAWN_BENCH_DATABASE_URL").ok();

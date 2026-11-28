@@ -94,7 +94,11 @@ fn mains_copies_are_back_after_a_resume_remounts_the_workspace() {
     git(&checkout, &["commit", "-qm", "base"]);
     let root = base.join("work");
     fs::create_dir_all(&root).expect("root");
-    let workspaces = Arc::new(GitWorkspace::new(checkout.join(".git"), &root));
+    let workspaces = Arc::new(GitWorkspace::new(
+        checkout.join(".git"),
+        &root,
+        spawn_host::DEFAULT_MAX_FILE_BYTES,
+    ));
 
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let memory = Arc::new(MemoryStore::new("shop", clock.clone()));

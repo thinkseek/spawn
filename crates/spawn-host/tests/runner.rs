@@ -12,6 +12,8 @@
 //! - When the daemon stops on its own, `terminate` still waits for and kills
 //!   the recorded session leader.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -21,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::{Launch, Runner, ServerSeen, TerminalHost};
-use spawn_host::{HerdrCoreHost, Scratch};
+use spawn_host::{HerdrCoreHost, Scratch, TerminalHostEnv};
 
 /// Serialize external `spawn-hc` invocations in this test binary so concurrent
 /// forks never race on freshly written temporary scripts (`Text file busy`).
@@ -92,7 +94,14 @@ impl Server {
     }
 
     fn host_with(&self, program: &str) -> HerdrCoreHost {
-        HerdrCoreHost::on_session(program, &self.session)
+        let host_env = TerminalHostEnv {
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            scrubbed_env_keys: TerminalHostEnv::collect_scrubbed_keys(
+                std::env::vars_os().map(|(k, _)| k),
+            ),
+            ..TerminalHostEnv::default()
+        };
+        HerdrCoreHost::on_session(program, &self.session, host_env)
             .expect("valid session")
             .with_runtime_under(self.runtime())
     }

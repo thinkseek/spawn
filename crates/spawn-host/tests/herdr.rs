@@ -14,6 +14,8 @@
 //! The agent witness (issue #91 P2 PR 2) is tested against a stub `agy`
 //! ([`STUB_AGY`]) that draws the states Herdr's agy manifest reads.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::{AgentReading, AgentStatus, Launch, Runner, ServerSeen, TerminalHost};
-use spawn_host::{HerdrHost, Scratch};
+use spawn_host::{HerdrHost, Scratch, TerminalHostEnv};
 
 /// One test at a time: each starts a server of its own.
 fn exclusive() -> std::sync::MutexGuard<'static, ()> {
@@ -97,7 +99,14 @@ impl Session {
     }
 
     fn host(&self) -> HerdrHost {
-        HerdrHost::on_session(&self.program, &self.name)
+        let host_env = TerminalHostEnv {
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            scrubbed_env_keys: TerminalHostEnv::collect_scrubbed_keys(
+                std::env::vars_os().map(|(k, _)| k),
+            ),
+            ..TerminalHostEnv::default()
+        };
+        HerdrHost::on_session(&self.program, &self.name, host_env)
             .expect("a valid session")
             .with_runtime_under(self.runtime())
             .with_terminate_waits(Duration::from_secs(3), Duration::from_secs(2))

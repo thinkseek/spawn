@@ -213,6 +213,15 @@ fn resolve_installed_tool(installed_dir: &Path, exe_dir: Option<&Path>) -> Tool 
     Tool::Run(installed_dir.join("emit-locations.py"))
 }
 
+/// Environment configuration for [`CollectorMask`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CollectorMaskConfig {
+    /// Override stand-in collector executable (`SPAWN_ARCHIVE_LOCATIONS_TOOL`).
+    pub tool: Option<PathBuf>,
+    /// Sandbox marker (`SPAWN_GATE_SANDBOX`) allowing a stand-in collector.
+    pub sandbox: Option<String>,
+}
+
 /// The credential mask the value collector's places give (module docs).
 pub struct CollectorMask {
     tool: Tool,
@@ -221,15 +230,16 @@ pub struct CollectorMask {
 
 impl CollectorMask {
     /// The loop's mask, for `roots` (the workspace root and the transcripts
-    /// directory), as the environment configures it: the stand-in it
-    /// accepted, if one, to be said and its roots pinned.
+    /// directory), configured explicitly from [`CollectorMaskConfig`]: the
+    /// stand-in it accepted, if one, to be said and its roots pinned.
     #[must_use]
-    pub fn from_env(roots: &[PathBuf]) -> (Self, Option<StandIn>) {
-        let tool = std::env::var_os("SPAWN_ARCHIVE_LOCATIONS_TOOL")
-            .filter(|tool| !tool.is_empty())
-            .map(PathBuf::from);
-        let sandbox = std::env::var("SPAWN_GATE_SANDBOX").ok();
-        Self::configured(tool, sandbox.as_deref(), roots, &Home::of_account())
+    pub fn from_config(roots: &[PathBuf], config: &CollectorMaskConfig) -> (Self, Option<StandIn>) {
+        Self::configured(
+            config.tool.clone(),
+            config.sandbox.as_deref(),
+            roots,
+            &Home::of_account(),
+        )
     }
 
     /// The mask as `tool` (`SPAWN_ARCHIVE_LOCATIONS_TOOL`) and `sandbox`

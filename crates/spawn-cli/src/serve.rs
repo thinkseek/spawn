@@ -309,7 +309,7 @@ fn serve(flags: &Flags) -> Result<i32, String> {
     crate::cost::Prices::from_env()?;
     // Read once, here, so a bad value is warned of at start.
     crate::config::message_taken_ms();
-    let pool_config = ipc::PoolConfig::from_process_env()?;
+    let pool_config = ipc::PoolConfig::from_serve_pool_env(&crate::config::serve_pool_env())?;
     let owner_url = env_value("SPAWN_DATABASE_URL");
     let reader_override = env_value("SPAWN_SERVE_DATABASE_URL");
     let pools = ipc::ServePools::from_serve_env(
@@ -351,9 +351,9 @@ fn serve(flags: &Flags) -> Result<i32, String> {
         hosts,
         open,
         pools: Ok(pools),
-        agent_socket: env_value("HC_SOCKET")
-            .filter(|v| !v.trim().is_empty())
-            .map(PathBuf::from),
+        agent_socket: crate::config::herdr_discovery_env().hc_socket,
+        local_open: crate::config::serve_local_open(),
+        herdr_discovery: crate::config::herdr_discovery_env(),
     });
     // Listen again on the bound address, so a client's port stays right.
     let bound = server
@@ -477,6 +477,10 @@ struct Shared {
     /// Optional explicit Herdr UDS socket override for global `/api/agents*` endpoints
     /// (`HC_SOCKET` in production, or mock UDS socket in unit tests).
     agent_socket: Option<PathBuf>,
+    /// Whether loopback requests owned by the current uid may read without a token.
+    local_open: bool,
+    /// Injected global `herdr-core` discovery environment (`HC_SOCKET`, `XDG_RUNTIME_DIR`).
+    herdr_discovery: spawn_host::HerdrDiscoveryEnv,
 }
 
 impl Shared {
@@ -797,12 +801,6 @@ fn access_token(address: &str, token: Option<String>) -> Result<Option<String>, 
     Ok(token)
 }
 
-/// Whether the owner's own loopback clients may read without the token
-/// (`SPAWN_SERVE_LOCAL_OPEN=1`).
-fn local_open() -> bool {
-    std::env::var("SPAWN_SERVE_LOCAL_OPEN").is_ok_and(|value| value == "1")
-}
-
 /// `address` with an IPv4-mapped IPv6 address written as the IPv4 one, so
 /// a dual-stack listener's peer compares with the kernel's IPv4 tables.
 fn plain(address: SocketAddr) -> SocketAddr {
@@ -900,10 +898,10 @@ fn local_exemption(
         && peer_uid == owner
 }
 
-/// [`local_exemption`] for a request from `peer` to this server's `port`,
-/// with the uids read from `/proc`.
-fn owners_own_request(peer: Option<SocketAddr>, port: Option<u16>) -> bool {
-    local_open() && owners_client(peer, port)
+/// [`local_exemption`] for a request from `peer` to this server's
+/// `shared`, with the uids read from `/proc`.
+fn owners_own_request(peer: Option<SocketAddr>, shared: &Shared) -> bool {
+    shared.local_open && owners_client(peer, shared.port)
 }
 
 /// Whether the client end of a connection from `peer` to this server's
@@ -1202,7 +1200,8 @@ fn reader_pool_for_url(url: &str) -> Arc<ipc::RoleConnPool> {
     if let Some(pool) = map.get(url) {
         return Arc::clone(pool);
     }
-    let config = ipc::PoolConfig::from_process_env().unwrap_or_default();
+    let config =
+        ipc::PoolConfig::from_serve_pool_env(&crate::config::serve_pool_env()).unwrap_or_default();
     let pool = ipc::RoleConnPool::new(
         "reads",
         zeroize::Zeroizing::new(url.to_string()),
@@ -1404,7 +1403,7 @@ fn access(request: &Request, query: &str, shared: &Shared) -> Result<AuthPrincip
         return auth_token::authenticate_bearer(raw, master, auth_token::current_epoch_secs().ok())
             .ok_or(AccessDenied::Unauthorized);
     }
-    ((named && owners_own_request(peer, shared.port))
+    ((named && owners_own_request(peer, shared))
         || open_network_request(peer, host, origin, shared.port, &shared.open))
     .then_some(AuthPrincipal::LocalOwner)
     .ok_or(AccessDenied::Unauthorized)
@@ -1818,7 +1817,7 @@ fn parse_agent_route(path: &str) -> Option<AgentRoute> {
 }
 
 fn agent_socket_scope(shared: &Shared) -> Result<SocketScope, GlobalHerdrError> {
-    SocketScope::resolve(shared.agent_socket.as_deref())
+    SocketScope::resolve(shared.agent_socket.as_deref(), &shared.herdr_discovery)
 }
 
 fn agent_visibility(access: AuthPrincipal) -> DiscoveryScope {
@@ -5712,6 +5711,7 @@ fn content_type(path: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use serde_json::json;
 
     use super::{
@@ -6641,8 +6641,12 @@ mod tests {
             "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
         );
         let schema = spawn_postgres::testing::TestSchema::new("serve_input");
-        let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
-            .expect("a schema of its own, migrated");
+        let store = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("a schema of its own, migrated");
         let separator = if url.contains('?') { '&' } else { '?' };
         let owner = format!("{url}{separator}options=-csearch_path%3D{schema}");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -8394,6 +8398,8 @@ mod tests {
             open: open_networks(Some(open)).expect("networks"),
             pools: Shared::pools_from_owner(owner),
             agent_socket: None,
+            local_open: false,
+            herdr_discovery: spawn_host::HerdrDiscoveryEnv::default(),
         };
         let worker = std::thread::spawn(move || {
             let request = server.recv().expect("request");
@@ -8473,6 +8479,8 @@ mod tests {
             open: Vec::new(),
             pools: Ok(None),
             agent_socket: None,
+            local_open: false,
+            herdr_discovery: spawn_host::HerdrDiscoveryEnv::default(),
         });
         let slots = Slots::new(limit);
         let streams = Slots::new(stream::SSE_SLOTS);
@@ -8553,6 +8561,8 @@ mod tests {
             open: Vec::new(),
             pools: Ok(None),
             agent_socket: None,
+            local_open: false,
+            herdr_discovery: spawn_host::HerdrDiscoveryEnv::default(),
         });
         let address = format!("127.0.0.1:{port}");
         let slots = Slots::new(4);
@@ -9350,6 +9360,8 @@ mod tests {
             open: Vec::new(),
             pools: Ok(None),
             agent_socket: None,
+            local_open: false,
+            herdr_discovery: spawn_host::HerdrDiscoveryEnv::default(),
         });
         std::thread::spawn(move || serve_requests(&server, &shared, &slots, &streams));
         port
@@ -11017,6 +11029,8 @@ mod tests {
             open: open_networks(Some("")).expect("networks"),
             pools: Ok(None),
             agent_socket: None,
+            local_open: false,
+            herdr_discovery: spawn_host::HerdrDiscoveryEnv::default(),
         };
         let url_for_worker = reader_url.to_string();
         let worker = std::thread::spawn(move || {
@@ -11356,6 +11370,8 @@ mod tests {
                 open: Vec::new(),
                 pools: Ok(Some(pools)),
                 agent_socket: None,
+                local_open: false,
+                herdr_discovery: spawn_host::HerdrDiscoveryEnv::default(),
             });
             let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
             let server_for_loop = Arc::clone(&server);
@@ -11486,6 +11502,8 @@ mod tests {
                 open: Vec::new(),
                 pools: Ok(Some(Arc::clone(&pools))),
                 agent_socket: None,
+                local_open: false,
+                herdr_discovery: spawn_host::HerdrDiscoveryEnv::default(),
             });
             let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
             let server_for_loop = Arc::clone(&server);
@@ -11886,6 +11904,8 @@ mod tests {
             open: Vec::new(),
             pools: Ok(Some(Arc::clone(&pools))),
             agent_socket,
+            local_open: false,
+            herdr_discovery: spawn_host::HerdrDiscoveryEnv::default(),
         });
         let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
         let server_for_loop = Arc::clone(&server);

@@ -1677,13 +1677,14 @@ pub(crate) fn apply_move(
 
 impl CowWorkspace {
     /// Store over the bare repository `repo`, with workspaces under `root`
-    /// (resolved through its symlinks once, here).
-    pub fn new(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
+    /// (resolved through its symlinks once, here) and checkpoint file cap
+    /// `max_file_bytes`.
+    pub fn new(repo: impl AsRef<Path>, root: impl AsRef<Path>, max_file_bytes: u64) -> Self {
         let root = root.as_ref();
         let _ = fs::create_dir_all(root);
         let root = crate::root::canonical_root(root);
         Self {
-            git: GitWorkspace::new(repo, &root),
+            git: GitWorkspace::new(repo, &root, max_file_bytes),
             root,
             last: Mutex::new(CowStats::default()),
             diagnostics: Mutex::new(Vec::new()),
@@ -1692,12 +1693,9 @@ impl CowWorkspace {
         }
     }
 
-    /// The same store with a size cap of `bytes` for one file in a
-    /// checkpoint ([`GitWorkspace::with_max_file_bytes`]).
-    #[must_use]
-    pub fn with_max_file_bytes(mut self, bytes: u64) -> Self {
-        self.git = self.git.with_max_file_bytes(bytes);
-        self
+    /// Checkpoint file size cap in bytes.
+    pub const fn max_file_bytes(&self) -> u64 {
+        self.git.max_file_bytes()
     }
 
     /// The resolved root workspaces live under.
@@ -3701,7 +3699,11 @@ mod tests {
         git(&checkout, &["add", "-A"]);
         git(&checkout, &["commit", "-qm", "base"]);
         let repo = checkout.join(".git");
-        let store = CowWorkspace::new(&repo, scratch.join("work"));
+        let store = CowWorkspace::new(
+            &repo,
+            scratch.join("work"),
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         let branch = BranchName::new("agent_a").expect("branch");
         store.ensure_branch(&branch, None).expect("ensure");
         let workspace = store.mount(&branch).expect("mount");
@@ -3890,7 +3892,11 @@ mod tests {
         }
         git(&checkout, &["add", "-A"]);
         git(&checkout, &["commit", "-qm", "big"]);
-        let store = CowWorkspace::new(checkout.join(".git"), scratch.join("work"));
+        let store = CowWorkspace::new(
+            checkout.join(".git"),
+            scratch.join("work"),
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         store.faults.baseline.store(true, Ordering::Relaxed);
         let branch = BranchName::new("agent_a").expect("branch");
         store.ensure_branch(&branch, None).expect("ensure");

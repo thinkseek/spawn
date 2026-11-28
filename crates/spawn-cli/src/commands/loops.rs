@@ -538,7 +538,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     crate::serve::capabilities::start();
     // The other Claude Code sessions on this host, counted apart from the
     // engines' record: at start, then hourly, read only, appended bytes only.
-    cost::sessions::start(root.as_deref(), &prices);
+    cost::sessions::start(crate::config::home_dir(), root.as_deref(), &prices);
     let monitor = disk::Monitor::new(root.as_deref());
     let sampler = crate::storage::Sampler::new(root.as_deref());
     let mut fleet = Fleet {

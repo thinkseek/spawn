@@ -2,6 +2,8 @@
 //! `SecretRef`, env resolution, secret redaction), and the `spawn config` /
 //! `spawn doctor` / `--config` CLI commands.
 
+#![allow(clippy::disallowed_methods)]
+
 #[allow(dead_code)]
 #[path = "../src/toml_parser.rs"]
 mod toml_parser;
@@ -234,7 +236,8 @@ schema_version = 2
 [instance]
 data_dir = "/srv/spawn"
 "#;
-    let err = SpawnConfig::from_toml_str(wrong_version).expect_err("schema_version != 1");
+    let err =
+        SpawnConfig::from_toml_str_with(wrong_version, &|_| None).expect_err("schema_version != 1");
     assert!(err.contains("schema_version"), "{err}");
 
     let unknown_top = r#"
@@ -244,7 +247,8 @@ surprise = true
 [instance]
 data_dir = "/srv/spawn"
 "#;
-    let err = SpawnConfig::from_toml_str(unknown_top).expect_err("unknown top field");
+    let err =
+        SpawnConfig::from_toml_str_with(unknown_top, &|_| None).expect_err("unknown top field");
     assert!(err.contains("unknown field"), "{err}");
 
     let unknown_nested = r#"
@@ -257,7 +261,8 @@ data_dir = "/srv/spawn"
 mode = "required"
 extra_flag = 123
 "#;
-    let err = SpawnConfig::from_toml_str(unknown_nested).expect_err("unknown nested field");
+    let err = SpawnConfig::from_toml_str_with(unknown_nested, &|_| None)
+        .expect_err("unknown nested field");
     assert!(err.contains("unknown field"), "{err}");
 
     let unknown_mount = r#"
@@ -271,7 +276,8 @@ host = "/srv/shared"
 mode = "rw"
 extra = "nope"
 "#;
-    let err = SpawnConfig::from_toml_str(unknown_mount).expect_err("unknown mount field");
+    let err =
+        SpawnConfig::from_toml_str_with(unknown_mount, &|_| None).expect_err("unknown mount field");
     assert!(err.contains("unknown field"), "{err}");
 }
 
@@ -304,7 +310,8 @@ auth = "token"
 token = "plaintext-token"
 "#,
     ] {
-        let err = SpawnConfig::from_toml_str(snippet).expect_err("plaintext secret rejected");
+        let err = SpawnConfig::from_toml_str_with(snippet, &|_| None)
+            .expect_err("plaintext secret rejected");
         assert!(
             err.contains("from_env")
                 && err.contains("from_file")
@@ -334,7 +341,8 @@ fn spawn_config_rejects_relative_and_bare_system_data_dirs() {
         "/srv/spawn/../other",
     ] {
         let toml = format!("schema_version = 1\n[instance]\ndata_dir = \"{bad}\"\n");
-        let err = SpawnConfig::from_toml_str(&toml).expect_err(&format!("reject {bad}"));
+        let err =
+            SpawnConfig::from_toml_str_with(&toml, &|_| None).expect_err(&format!("reject {bad}"));
         assert!(err.contains("data_dir"), "bad={bad}: {err}");
     }
 }
@@ -345,11 +353,13 @@ fn spawn_config_validates_terminal_shards_range() {
         let toml = format!(
             "schema_version = 1\n[instance]\ndata_dir = \"/srv/spawn\"\n[terminal]\nshards = {bad}\n"
         );
-        let err = SpawnConfig::from_toml_str(&toml).expect_err(&format!("reject shards={bad}"));
+        let err = SpawnConfig::from_toml_str_with(&toml, &|_| None)
+            .expect_err(&format!("reject shards={bad}"));
         assert!(err.contains("shards"), "bad={bad}: {err}");
     }
-    let ok = SpawnConfig::from_toml_str(
+    let ok = SpawnConfig::from_toml_str_with(
         "schema_version = 1\n[instance]\ndata_dir = \"/srv/spawn\"\n[terminal]\nshards = 16\n",
+        &|_| None,
     )
     .expect("accept valid shards");
     assert_eq!(ok.terminal.shards, Some(16));
@@ -443,7 +453,7 @@ message_taken_secs = 90
         toolchain_bin = toolchain_bin.display(),
     );
 
-    let cfg = SpawnConfig::from_toml_str(&toml).expect("parse full config");
+    let cfg = SpawnConfig::from_toml_str_with(&toml, &|_| None).expect("parse full config");
     (cfg, data_dir, toolchain_bin)
 }
 
@@ -565,7 +575,7 @@ data_dir = "/srv/spawn-instance"
 [database]
 url = { from_env = "MY_DB_URL" }
 "#;
-    let cfg = SpawnConfig::from_toml_str(toml_env).expect("parse from_env");
+    let cfg = SpawnConfig::from_toml_str_with(toml_env, &|_| None).expect("parse from_env");
     let present = env_map(&[(
         "MY_DB_URL",
         "postgres://u:TopSecretFromEnv@localhost:5432/db",
@@ -593,7 +603,7 @@ url = { from_env = "MY_DB_URL" }
         "schema_version = 1\n[instance]\ndata_dir = \"/srv/spawn-instance\"\n[server]\nauth = \"token\"\ntoken = {{ from_file = \"{}\" }}\n",
         empty_file.display()
     );
-    let cfg_empty = SpawnConfig::from_toml_str(&toml_empty).expect("parse");
+    let cfg_empty = SpawnConfig::from_toml_str_with(&toml_empty, &|_| None).expect("parse");
     let empty_err = resolve_env_entries_with(&cfg_empty, &|_| None).expect_err("empty file");
     assert!(empty_err.contains("empty"), "{empty_err}");
 }
@@ -839,7 +849,7 @@ fn spawn_config_sandbox_defaults_startup_and_rejects_safe() {
         "schema_version = 1\n[instance]\nname = \"s1\"\ndata_dir = \"{}\"\n",
         data_dir.display()
     );
-    let cfg = SpawnConfig::from_toml_str(&default_toml).expect("default config");
+    let cfg = SpawnConfig::from_toml_str_with(&default_toml, &|_| None).expect("default config");
     assert_eq!(cfg.sandbox.auto_approve.as_deref(), Some("startup"));
     let resolved =
         env_as_map(resolve_env_entries_with(&cfg, &|_| None).expect("resolve default env"));
@@ -847,12 +857,13 @@ fn spawn_config_sandbox_defaults_startup_and_rejects_safe() {
 
     for valid in ["off", "startup", "all"] {
         let doc = format!("{default_toml}\n[sandbox]\nauto_approve = \"{valid}\"\n");
-        let parsed = SpawnConfig::from_toml_str(&doc).expect(valid);
+        let parsed = SpawnConfig::from_toml_str_with(&doc, &|_| None).expect(valid);
         assert_eq!(parsed.sandbox.auto_approve.as_deref(), Some(valid));
     }
 
     let safe_doc = format!("{default_toml}\n[sandbox]\nauto_approve = \"safe\"\n");
-    let err = SpawnConfig::from_toml_str(&safe_doc).expect_err("safe must be rejected");
+    let err =
+        SpawnConfig::from_toml_str_with(&safe_doc, &|_| None).expect_err("safe must be rejected");
     assert!(err.contains("[sandbox].auto_approve"), "{err}");
     assert!(err.contains("startup"), "{err}");
 }
@@ -879,7 +890,8 @@ fn spawn_config_rejects_proxy_userinfo_and_redacts_effective_json() {
             "schema_version = 1\n[instance]\nname = \"p\"\ndata_dir = \"{}\"\n[network]\n{field} = \"{url}\"\n",
             data_dir.display()
         );
-        let err = SpawnConfig::from_toml_str(&doc).expect_err("embedded proxy creds rejected");
+        let err = SpawnConfig::from_toml_str_with(&doc, &|_| None)
+            .expect_err("embedded proxy creds rejected");
         assert!(err.contains(field), "{err}");
         assert!(!err.contains(secret), "error must not echo secret: {err}");
     }
@@ -888,7 +900,7 @@ fn spawn_config_rejects_proxy_userinfo_and_redacts_effective_json() {
         "schema_version = 1\n[instance]\nname = \"p\"\ndata_dir = \"{}\"\n",
         data_dir.display()
     );
-    let mut cfg = SpawnConfig::from_toml_str(&base_doc).expect("base config");
+    let mut cfg = SpawnConfig::from_toml_str_with(&base_doc, &|_| None).expect("base config");
     cfg.network.http_proxy = Some("http://alice:Pr0xyPass!@proxy.local:3128".to_string());
     cfg.network.https_proxy = Some("http://TokOnlySecret@proxy.local:3129".to_string());
 
@@ -973,7 +985,7 @@ sandbox = true
 "#,
         data_dir.display()
     );
-    let cfg = SpawnConfig::from_toml_str(&doc).expect("valid config");
+    let cfg = SpawnConfig::from_toml_str_with(&doc, &|_| None).expect("valid config");
     let entries: BTreeMap<String, String> = resolve_env_entries_with(&cfg, &|name| {
         (name == "HOME").then(|| "/home/tester".to_string())
     })
@@ -1010,13 +1022,13 @@ sandbox = true
         "schema_version = 1\n[instance]\ndata_dir = \"{}\"\n[sandbox]\ninherit_host = \"unsafe\"\n",
         data_dir.display()
     );
-    assert!(SpawnConfig::from_toml_str(&bad_inherit).is_err());
+    assert!(SpawnConfig::from_toml_str_with(&bad_inherit, &|_| None).is_err());
 
     let bad_root = format!(
         "schema_version = 1\n[instance]\ndata_dir = \"{}\"\n[sandbox]\ninherit_host_paths = [\"/\"]\n",
         data_dir.display()
     );
-    assert!(SpawnConfig::from_toml_str(&bad_root).is_err());
+    assert!(SpawnConfig::from_toml_str_with(&bad_root, &|_| None).is_err());
 }
 
 #[test]
@@ -1062,7 +1074,8 @@ fn cli_config_init_from_host_docker_plan_and_doctor_emit_valid_outputs() {
         String::from_utf8_lossy(&init_out.stderr)
     );
     let generated = fs::read_to_string(&cfg_out).expect("read generated toml");
-    let parsed_cfg = SpawnConfig::from_toml_str(&generated).expect("generated toml validates");
+    let parsed_cfg =
+        SpawnConfig::from_toml_str_with(&generated, &|_| None).expect("generated toml validates");
     assert_eq!(parsed_cfg.sandbox.inherit_host.as_deref(), Some("auto"));
 
     let plan_out = Command::new(env!("CARGO_BIN_EXE_spawn"))
@@ -1412,7 +1425,7 @@ tmpfs_budget_mb = 4096
 strict_fail_closed = true
 "#
         );
-        let cfg = SpawnConfig::from_toml_str(&toml)
+        let cfg = SpawnConfig::from_toml_str_with(&toml, &|_| None)
             .unwrap_or_else(|e| panic!("accept backend {backend}: {e}"));
         let d6 = cfg.storage.d6.as_ref().expect("storage.d6 populated");
         assert_eq!(
@@ -1477,7 +1490,8 @@ workspace_backend = "d6-shadow"
 [storage.d6]
 strict_fail_closed = false
 "#;
-    let cfg_false = SpawnConfig::from_toml_str(strict_false).expect("strict false parses");
+    let cfg_false =
+        SpawnConfig::from_toml_str_with(strict_false, &|_| None).expect("strict false parses");
     let env_false = env_as_map(resolve_env_entries_with(&cfg_false, &|_| None).expect("env false"));
     assert_eq!(env_false["SPAWN_D6_STRICT_FAIL_CLOSED"], "0");
     assert!(!env_false.contains_key("SPAWN_D6_CAS_DIR"));
@@ -1492,15 +1506,16 @@ data_dir = "/srv/spawn"
 [storage]
 workspace_backend = "zfs"
 "#;
-    let err = SpawnConfig::from_toml_str(bad_backend).expect_err("invalid workspace_backend");
+    let err = SpawnConfig::from_toml_str_with(bad_backend, &|_| None)
+        .expect_err("invalid workspace_backend");
     assert!(err.contains("d6") && err.contains("d6-shadow"), "{err}");
 
     for bad_cas in ["relative/cas", "/", "/tmp", "/var/lib", "/srv/d6/../bad"] {
         let toml = format!(
             "schema_version = 1\n[instance]\ndata_dir = \"/srv/spawn\"\n[storage.d6]\ncas_dir = \"{bad_cas}\"\n"
         );
-        let err =
-            SpawnConfig::from_toml_str(&toml).expect_err(&format!("reject cas_dir={bad_cas}"));
+        let err = SpawnConfig::from_toml_str_with(&toml, &|_| None)
+            .expect_err(&format!("reject cas_dir={bad_cas}"));
         assert!(err.contains("[storage.d6].cas_dir"), "{err}");
     }
 
@@ -1508,8 +1523,8 @@ workspace_backend = "zfs"
         let toml = format!(
             "schema_version = 1\n[instance]\ndata_dir = \"/srv/spawn\"\n[storage.d6]\ntmpfs_root = \"{bad_tmpfs}\"\n"
         );
-        let err =
-            SpawnConfig::from_toml_str(&toml).expect_err(&format!("reject tmpfs_root={bad_tmpfs}"));
+        let err = SpawnConfig::from_toml_str_with(&toml, &|_| None)
+            .expect_err(&format!("reject tmpfs_root={bad_tmpfs}"));
         assert!(err.contains("[storage.d6].tmpfs_root"), "{err}");
     }
 
@@ -1520,7 +1535,8 @@ data_dir = "/srv/spawn"
 [storage.d6]
 tmpfs_budget_mb = 0
 "#;
-    let budget_err = SpawnConfig::from_toml_str(zero_budget).expect_err("reject zero budget");
+    let budget_err =
+        SpawnConfig::from_toml_str_with(zero_budget, &|_| None).expect_err("reject zero budget");
     assert!(
         budget_err.contains("[storage.d6].tmpfs_budget_mb"),
         "{budget_err}"
@@ -1533,7 +1549,8 @@ data_dir = "/srv/spawn"
 [storage.d6]
 unexpected_key = true
 "#;
-    let unknown_err = SpawnConfig::from_toml_str(unknown_d6).expect_err("reject unknown d6 field");
+    let unknown_err = SpawnConfig::from_toml_str_with(unknown_d6, &|_| None)
+        .expect_err("reject unknown d6 field");
     assert!(unknown_err.contains("unknown field"), "{unknown_err}");
 }
 
@@ -1623,6 +1640,7 @@ fn config_origin_and_secret_string_enforce_redaction_and_non_serialization() {
 
 #[test]
 fn effective_json_origins_distinguish_file_defaults_and_secret_subrefs() {
+    let parse = |raw: &str| SpawnConfig::from_toml_str_with(raw, &|_| None);
     // Passfile-authenticated [database] (host/user/name only) must report "file",
     // while omitted [storage].workspace_backend must report "default" and project "auto".
     let passfile_toml = r#"
@@ -1635,7 +1653,7 @@ port = 5432
 name = "spawn"
 user = "spawn"
 "#;
-    let passfile_cfg = SpawnConfig::from_toml_str(passfile_toml).expect("passfile cfg parses");
+    let passfile_cfg = parse(passfile_toml).expect("passfile cfg parses");
     assert_eq!(passfile_cfg.storage.workspace_backend, None);
     let passfile_eff = effective_json_with(&passfile_cfg, &|_| None).expect("passfile eff");
     assert_eq!(passfile_eff["origins"]["database"], json!("file"));
@@ -1663,7 +1681,7 @@ data_dir = "/srv/spawn"
 [storage]
 cas_dedup = false
 "#;
-    let bare_cfg = SpawnConfig::from_toml_str(bare_toml).expect("bare cfg parses");
+    let bare_cfg = parse(bare_toml).expect("bare cfg parses");
     assert_eq!(bare_cfg.storage.workspace_backend, None);
     let bare_eff = effective_json_with(&bare_cfg, &|_| None).expect("bare eff");
     assert_eq!(bare_eff["origins"]["database"], json!("default"));
@@ -1688,7 +1706,7 @@ workspace_backend = "auto"
 "#,
         pw_file.display()
     );
-    let subref_pw_cfg = SpawnConfig::from_toml_str(&subref_pw_toml).expect("subref pw parses");
+    let subref_pw_cfg = parse(&subref_pw_toml).expect("subref pw parses");
     assert_eq!(
         subref_pw_cfg.storage.workspace_backend,
         Some(WorkspaceBackend::Auto)
@@ -1714,7 +1732,7 @@ url = { from_env = "PROBE_DB_URL" }
 [storage]
 workspace_backend = "d6"
 "#;
-    let subref_url_cfg = SpawnConfig::from_toml_str(subref_url_toml).expect("subref url parses");
+    let subref_url_cfg = parse(subref_url_toml).expect("subref url parses");
     assert_eq!(
         subref_url_cfg.storage.workspace_backend,
         Some(WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6))

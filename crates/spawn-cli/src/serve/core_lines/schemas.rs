@@ -5,7 +5,7 @@
 //! hold:
 //! - no live session holds it: no session's `application_name` is its name
 //!   (a test's store names its session after its schema,
-//!   `PostgresStore::connect_in_schema`);
+//!   `PostgresStore::connect_in_schema_with_options`);
 //! - its owner's pid is gone: the `<pid>` of `spawn_test_<pid>_...` is no
 //!   process on this host (a pid that runs counts as alive: in a gate's PID
 //!   namespace that can only under-count); a name with no pid has no owner;
@@ -200,6 +200,7 @@ pub(super) fn write_seen(path: &Path, seen: &BTreeMap<String, i64>) -> Result<()
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{leaked, made_at, pid_of, update_seen, url_from_file};
     use serde_json::json;
     use std::collections::BTreeMap;

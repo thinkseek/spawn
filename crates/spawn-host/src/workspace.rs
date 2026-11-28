@@ -54,15 +54,18 @@ pub struct D6StoreOptions {
     pub ledger: DynRefLedger,
     /// Optional bounded L1 `tmpfs` upperdir policy.
     pub l1_policy: Option<L1TmpfsPolicy>,
+    /// Per-file checkpoint byte limit.
+    pub max_file_bytes: u64,
 }
 
 impl D6StoreOptions {
-    /// Create D6 store options with CAS and ledger handles (`l1_policy = None`).
-    pub fn new(cas: Arc<CasMerkleStore>, ledger: DynRefLedger) -> Self {
+    /// Create D6 store options with CAS, ledger, and checkpoint file cap (`l1_policy = None`).
+    pub fn new(cas: Arc<CasMerkleStore>, ledger: DynRefLedger, max_file_bytes: u64) -> Self {
         Self {
             cas,
             ledger,
             l1_policy: None,
+            max_file_bytes,
         }
     }
 
@@ -80,6 +83,7 @@ impl std::fmt::Debug for D6StoreOptions {
             .debug_struct("D6StoreOptions")
             .field("cas_root", &self.cas.cas().root())
             .field("l1_policy", &self.l1_policy)
+            .field("max_file_bytes", &self.max_file_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -99,14 +103,18 @@ pub struct D6ShadowOptions {
     pub strict_fail_closed: bool,
     /// Tracked-set scan policy (`Strict` by default).
     pub tracked_set_mode: ShadowTrackedSetMode,
+    /// Per-file checkpoint byte limit for primary and shadow stores.
+    pub max_file_bytes: u64,
 }
 
 impl D6ShadowOptions {
-    /// Create dual-track shadow options with strict leak checking and default scan mode.
+    /// Create dual-track shadow options with strict leak checking, default scan mode, and
+    /// explicit checkpoint file size cap `max_file_bytes`.
     pub fn new(
         shadow_root: impl Into<PathBuf>,
         cas: Arc<CasMerkleStore>,
         ledger: DynRefLedger,
+        max_file_bytes: u64,
     ) -> Self {
         Self {
             shadow_root: shadow_root.into(),
@@ -115,6 +123,7 @@ impl D6ShadowOptions {
             l1_policy: None,
             strict_fail_closed: false,
             tracked_set_mode: ShadowTrackedSetMode::Strict,
+            max_file_bytes,
         }
     }
 
@@ -149,6 +158,7 @@ impl std::fmt::Debug for D6ShadowOptions {
             .field("l1_policy", &self.l1_policy)
             .field("strict_fail_closed", &self.strict_fail_closed)
             .field("tracked_set_mode", &self.tracked_set_mode)
+            .field("max_file_bytes", &self.max_file_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -349,6 +359,105 @@ pub fn claim_root(root: &Path, backend: WorkspaceBackend) -> Result<(), String> 
     }
 }
 
+/// Dual-track `d6-shadow` store wrapping an authoritative [`GitWorkspace`]
+/// and a shadow [`D6Workspace`] constructed from a single shared
+/// `max_file_bytes` cap.
+///
+/// Fields are private so primary and shadow caps cannot diverge across
+/// construction or ledger rebinding.
+#[derive(Debug)]
+pub struct LocalD6ShadowStore {
+    oracle: ShadowD6Workspace<GitWorkspace, DynRefLedger>,
+    max_file_bytes: u64,
+}
+
+impl LocalD6ShadowStore {
+    /// Construct a dual-track `d6-shadow` store over bare repository `repo`
+    /// and working root `root`, sharing `options.max_file_bytes` across both
+    /// primary Git and shadow D6 stores.
+    pub fn new(repo: impl AsRef<Path>, root: impl AsRef<Path>, options: D6ShadowOptions) -> Self {
+        Self::build(repo, root, options, Vec::new())
+    }
+
+    fn build(
+        repo: impl AsRef<Path>,
+        root: impl AsRef<Path>,
+        options: D6ShadowOptions,
+        extra_exclude_files: Vec<PathBuf>,
+    ) -> Self {
+        let repo = repo.as_ref();
+        let max_file_bytes = options.max_file_bytes;
+        let primary = GitWorkspace::new(repo, root, max_file_bytes);
+        let mut shadow = D6Workspace::new(
+            primary.project().to_string(),
+            options.shadow_root,
+            options.cas,
+            Arc::new(options.ledger),
+            max_file_bytes,
+        )
+        .with_extra_exclude_files(extra_exclude_files);
+        if let Some(policy) = options.l1_policy {
+            shadow = shadow.with_l1_policy(policy);
+        }
+        let oracle = ShadowD6Workspace::with_git_repo(primary, shadow, repo)
+            .with_strict_fail_closed(options.strict_fail_closed)
+            .with_tracked_set_mode(options.tracked_set_mode);
+        debug_assert_eq!(oracle.primary().max_file_bytes(), max_file_bytes);
+        debug_assert_eq!(oracle.shadow().max_file_bytes(), max_file_bytes);
+        Self {
+            oracle,
+            max_file_bytes,
+        }
+    }
+
+    /// Rebuild this `d6-shadow` store with a new [`DynRefLedger`], keeping the
+    /// single shared `max_file_bytes` invariant intact.
+    #[must_use]
+    pub fn with_ledger(&self, ledger: DynRefLedger) -> Self {
+        let repo = self.oracle.git_repo().map_or_else(
+            || PathBuf::from(self.oracle.primary().project()),
+            Path::to_path_buf,
+        );
+        let mut opts = D6ShadowOptions::new(
+            self.oracle.shadow().root().to_path_buf(),
+            self.oracle.shadow().store().clone(),
+            ledger,
+            self.max_file_bytes,
+        )
+        .with_strict_fail_closed(self.oracle.strict_fail_closed())
+        .with_tracked_set_mode(self.oracle.tracked_set_mode());
+        if let Some(policy) = self.oracle.shadow().l1_policy() {
+            opts = opts.with_l1_policy(policy.clone());
+        }
+        Self::build(
+            &repo,
+            self.oracle.primary().root(),
+            opts,
+            self.oracle.shadow().extra_exclude_files().to_vec(),
+        )
+    }
+
+    /// Shared checkpoint file size cap in bytes enforced on both primary and shadow stores.
+    pub const fn max_file_bytes(&self) -> u64 {
+        self.max_file_bytes
+    }
+
+    /// Borrow the underlying [`ShadowD6Workspace`] oracle.
+    pub const fn oracle(&self) -> &ShadowD6Workspace<GitWorkspace, DynRefLedger> {
+        &self.oracle
+    }
+
+    /// Borrow the authoritative primary [`GitWorkspace`].
+    pub const fn primary(&self) -> &GitWorkspace {
+        self.oracle.primary()
+    }
+
+    /// Borrow the shadow [`D6Workspace`].
+    pub const fn shadow(&self) -> &D6Workspace<DynRefLedger> {
+        self.oracle.shadow()
+    }
+}
+
 /// The workspace store of this machine: Git working copies (the default),
 /// copy-on-write clones of a per-commit baseline, on Linux an unprivileged
 /// overlay over a per-commit snapshot layer, dual-track `d6-shadow` over Git,
@@ -366,50 +475,69 @@ pub enum LocalWorkspaceStore {
     #[cfg(target_os = "linux")]
     Overlay(OverlayWorkspace),
     /// Dual-track oracle running authoritative [`GitWorkspace`] with shadow [`D6Workspace`].
-    D6Shadow(ShadowD6Workspace<GitWorkspace, DynRefLedger>),
+    D6Shadow(LocalD6ShadowStore),
     /// Pure-Rust CAS Merkle + transactional ledger workspace store ([`D6Workspace`]).
     D6(D6Workspace<DynRefLedger>),
 }
 
 impl LocalWorkspaceStore {
     /// The Git store over the bare repository `repo`, workspaces under
-    /// `root`.
-    pub fn git(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
-        Self::Git(GitWorkspace::new(repo, root))
+    /// `root`, with checkpoint file size cap `max_file_bytes`.
+    pub fn git(repo: impl AsRef<Path>, root: impl AsRef<Path>, max_file_bytes: u64) -> Self {
+        Self::Git(GitWorkspace::new(repo, root, max_file_bytes))
     }
 
-    /// The copy-on-write store over `repo`, workspaces under `root`. It
-    /// works on any file system (a mount copies where it cannot clone);
-    /// [`Self::auto`] chooses it only where clones work.
-    pub fn cow(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
-        Self::Cow(CowWorkspace::new(repo, root))
+    /// The copy-on-write store over `repo`, workspaces under `root`, with
+    /// checkpoint file size cap `max_file_bytes`. It works on any file
+    /// system (a mount copies where it cannot clone); [`Self::auto`] chooses
+    /// it only where clones work.
+    pub fn cow(repo: impl AsRef<Path>, root: impl AsRef<Path>, max_file_bytes: u64) -> Self {
+        Self::Cow(CowWorkspace::new(repo, root, max_file_bytes))
     }
 
-    /// The overlay store over `repo`, workspaces under `root`, once the
-    /// kernel showed an unprivileged overlay mounts under `root`
-    /// ([`overlay_supported_in`]); refused, with the kernel's reason,
-    /// otherwise.
+    /// The overlay store over `repo`, workspaces under `root`, with
+    /// checkpoint file size cap `max_file_bytes`, once the kernel showed an
+    /// unprivileged overlay mounts under `root` ([`overlay_supported_in`]);
+    /// refused, with the kernel's reason, otherwise.
     #[cfg(target_os = "linux")]
-    pub fn overlay(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<Self, String> {
+    pub fn overlay(
+        repo: impl AsRef<Path>,
+        root: impl AsRef<Path>,
+        max_file_bytes: u64,
+    ) -> Result<Self, String> {
         let root = root.as_ref();
         std::fs::create_dir_all(root)
             .map_err(|error| format!("create {}: {error}", root.display()))?;
         overlay_supported_in(root)
             .map_err(|why| format!("no unprivileged overlay under {}: {why}", root.display()))?;
-        Ok(Self::Overlay(OverlayWorkspace::new(repo, root)))
+        Ok(Self::Overlay(OverlayWorkspace::new(
+            repo,
+            root,
+            max_file_bytes,
+        )))
     }
 
     /// The overlay store: never on a system other than Linux.
     #[cfg(not(target_os = "linux"))]
-    pub fn overlay(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<Self, String> {
-        let _ = (repo, root);
+    pub fn overlay(
+        repo: impl AsRef<Path>,
+        root: impl AsRef<Path>,
+        max_file_bytes: u64,
+    ) -> Result<Self, String> {
+        let _ = (repo, root, max_file_bytes);
         Err("the overlay workspace store needs Linux".to_string())
     }
 
     /// Pure-Rust CAS Merkle + ledger workspace store (`D6Workspace`) for `project`
     /// with workspaces under `root`.
     pub fn d6(project: impl Into<String>, root: impl AsRef<Path>, options: D6StoreOptions) -> Self {
-        let mut store = D6Workspace::new(project, root, options.cas, Arc::new(options.ledger));
+        let mut store = D6Workspace::new(
+            project,
+            root,
+            options.cas,
+            Arc::new(options.ledger),
+            options.max_file_bytes,
+        );
         if let Some(policy) = options.l1_policy {
             store = store.with_l1_policy(policy);
         }
@@ -423,21 +551,19 @@ impl LocalWorkspaceStore {
         root: impl AsRef<Path>,
         options: D6ShadowOptions,
     ) -> Self {
-        let repo = repo.as_ref();
-        let primary = GitWorkspace::new(repo, root);
-        let mut shadow = D6Workspace::new(
-            primary.project().to_string(),
-            options.shadow_root,
-            options.cas,
-            Arc::new(options.ledger),
-        );
-        if let Some(policy) = options.l1_policy {
-            shadow = shadow.with_l1_policy(policy);
+        Self::D6Shadow(LocalD6ShadowStore::new(repo, root, options))
+    }
+
+    /// Checkpoint file size cap in bytes across whichever backend this store wraps.
+    pub const fn max_file_bytes(&self) -> u64 {
+        match self {
+            Self::Git(git) => git.max_file_bytes(),
+            Self::Cow(cow) => cow.max_file_bytes(),
+            #[cfg(target_os = "linux")]
+            Self::Overlay(overlay) => overlay.max_file_bytes(),
+            Self::D6Shadow(store) => store.max_file_bytes(),
+            Self::D6(d6) => d6.max_file_bytes(),
         }
-        let oracle = ShadowD6Workspace::with_git_repo(primary, shadow, repo)
-            .with_strict_fail_closed(options.strict_fail_closed)
-            .with_tracked_set_mode(options.tracked_set_mode);
-        Self::D6Shadow(oracle)
     }
 
     /// The cheapest store `root` supports that every caller can serve
@@ -445,27 +571,28 @@ impl LocalWorkspaceStore {
     /// system clones ([`cow_clone_supported`]: btrfs, XFS with reflink,
     /// APFS), else Git working copies. Never the overlay, which is chosen
     /// by name alone ([`Self::overlay`]).
-    pub fn auto(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
+    pub fn auto(repo: impl AsRef<Path>, root: impl AsRef<Path>, max_file_bytes: u64) -> Self {
         let root = root.as_ref();
         match WorkspaceBackend::auto(root) {
-            WorkspaceBackend::Cow => Self::cow(repo, root),
-            _ => Self::git(repo, root),
+            WorkspaceBackend::Cow => Self::cow(repo, root, max_file_bytes),
+            _ => Self::git(repo, root, max_file_bytes),
         }
     }
 
-    /// The store of `backend` over `repo`, workspaces under `root`; the
-    /// overlay only where the kernel mounts one ([`Self::overlay`]). Opt-in
-    /// D6 backends require CAS + ledger configuration via [`Self::d6_shadow`]
-    /// or [`Self::d6`].
+    /// The store of `backend` over `repo`, workspaces under `root`, with
+    /// checkpoint file size cap `max_file_bytes`; the overlay only where the
+    /// kernel mounts one ([`Self::overlay`]). Opt-in D6 backends require CAS
+    /// + ledger configuration via [`Self::d6_shadow`] or [`Self::d6`].
     pub fn open(
         backend: WorkspaceBackend,
         repo: impl AsRef<Path>,
         root: impl AsRef<Path>,
+        max_file_bytes: u64,
     ) -> Result<Self, String> {
         match backend {
-            WorkspaceBackend::Git => Ok(Self::git(repo, root)),
-            WorkspaceBackend::Cow => Ok(Self::cow(repo, root)),
-            WorkspaceBackend::Overlay => Self::overlay(repo, root),
+            WorkspaceBackend::Git => Ok(Self::git(repo, root, max_file_bytes)),
+            WorkspaceBackend::Cow => Ok(Self::cow(repo, root, max_file_bytes)),
+            WorkspaceBackend::Overlay => Self::overlay(repo, root, max_file_bytes),
             WorkspaceBackend::D6Shadow | WorkspaceBackend::D6 => Err(format!(
                 "workspace backend {} requires CAS and RefLedger configuration (use \
                  LocalWorkspaceStore::{} or WorkspaceSettings)",
@@ -499,7 +626,7 @@ impl LocalWorkspaceStore {
     /// Oracle metrics snapshot when backed by [`Self::D6Shadow`].
     pub fn shadow_metrics(&self) -> Option<ShadowOracleMetrics> {
         match self {
-            Self::D6Shadow(oracle) => Some(oracle.metrics()),
+            Self::D6Shadow(store) => Some(store.oracle().metrics()),
             _ => None,
         }
     }
@@ -508,7 +635,7 @@ impl LocalWorkspaceStore {
     pub fn d6_l1_reserved_bytes(&self) -> Option<u64> {
         match self {
             Self::D6(store) => Some(store.l1_total_reserved_bytes()),
-            Self::D6Shadow(oracle) => Some(oracle.shadow().l1_total_reserved_bytes()),
+            Self::D6Shadow(store) => Some(store.shadow().l1_total_reserved_bytes()),
             _ => None,
         }
     }
@@ -526,7 +653,7 @@ impl LocalWorkspaceStore {
         &self,
     ) -> Option<&ShadowD6Workspace<GitWorkspace, DynRefLedger>> {
         match self {
-            Self::D6Shadow(oracle) => Some(oracle),
+            Self::D6Shadow(store) => Some(store.oracle()),
             _ => None,
         }
     }
@@ -598,7 +725,7 @@ impl LocalWorkspaceStore {
     /// Discard the mounted `workspace` directory cleanly (and any L1/shadow state).
     pub fn discard(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
         match self {
-            Self::D6Shadow(store) => store.discard(workspace),
+            Self::D6Shadow(store) => store.oracle().discard(workspace),
             Self::D6(store) => store.discard(workspace),
             _ => self.inner().unmount(workspace),
         }
@@ -621,7 +748,7 @@ impl LocalWorkspaceStore {
             Self::Cow(store) => store.set_aside_when(branch, start, message, ready),
             #[cfg(target_os = "linux")]
             Self::Overlay(store) => store.set_aside_when(branch, start, message, ready),
-            Self::D6Shadow(store) => store.set_aside_when(branch, start, message, ready),
+            Self::D6Shadow(store) => store.oracle().set_aside_when(branch, start, message, ready),
             Self::D6(store) => store.set_aside_when(branch, start, message, ready),
         }
     }
@@ -640,7 +767,9 @@ impl LocalWorkspaceStore {
             Self::Cow(store) => store.commit_or_take_back(workspace, message, take_back),
             #[cfg(target_os = "linux")]
             Self::Overlay(store) => store.commit_or_take_back(workspace, message, take_back),
-            Self::D6Shadow(store) => store.commit_or_take_back(workspace, message, take_back),
+            Self::D6Shadow(store) => store
+                .oracle()
+                .commit_or_take_back(workspace, message, take_back),
             Self::D6(store) => store.commit_or_take_back(workspace, message, take_back),
         }
     }
@@ -815,7 +944,7 @@ impl LocalWorkspaceStore {
             Self::Cow(store) => store,
             #[cfg(target_os = "linux")]
             Self::Overlay(store) => store,
-            Self::D6Shadow(store) => store,
+            Self::D6Shadow(store) => store.oracle(),
             Self::D6(store) => store,
         }
     }
@@ -937,8 +1066,8 @@ impl From<D6Workspace<DynRefLedger>> for LocalWorkspaceStore {
     }
 }
 
-impl From<ShadowD6Workspace<GitWorkspace, DynRefLedger>> for LocalWorkspaceStore {
-    fn from(store: ShadowD6Workspace<GitWorkspace, DynRefLedger>) -> Self {
+impl From<LocalD6ShadowStore> for LocalWorkspaceStore {
+    fn from(store: LocalD6ShadowStore) -> Self {
         Self::D6Shadow(store)
     }
 }
@@ -1046,10 +1175,59 @@ mod tests {
     fn open_requires_d6_options_and_never_falls_back_to_git() {
         let base = scratch_dir("open");
         for b in [WorkspaceBackend::D6Shadow, WorkspaceBackend::D6] {
-            let err = LocalWorkspaceStore::open(b, base.join("r.git"), &base)
-                .expect_err("requires options");
+            let err = LocalWorkspaceStore::open(
+                b,
+                base.join("r.git"),
+                &base,
+                crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+            )
+            .expect_err("requires options");
             assert!(err.contains(b.name()), "{err}");
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn d6_shadow_store_enforces_single_shared_max_file_bytes_across_rebind() {
+        let base = scratch_dir("shadow-single-cap");
+        let repo = base.join("repo.git");
+        let st = crate::git_process::test_git_command()
+            .args(["init", "--bare", &repo.to_string_lossy()])
+            .status()
+            .expect("git init --bare");
+        assert!(st.success(), "git init --bare failed");
+        let cap: u64 = 1 << 20;
+        let cas = Arc::new(crate::cas_merkle::CasMerkleStore::open(base.join("cas")).expect("cas"));
+        let ledger1: DynRefLedger = Arc::new(crate::cas_merkle::InMemoryRefLedger::default());
+        let l1_policy = L1TmpfsPolicy::new(base.join("l1-tmpfs"), 8);
+        let opts = D6ShadowOptions::new(base.join("shadow-work"), cas, ledger1, cap)
+            .with_strict_fail_closed(true)
+            .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
+            .with_l1_policy(l1_policy.clone());
+        let store = LocalWorkspaceStore::d6_shadow(&repo, base.join("git-work"), opts);
+        let LocalWorkspaceStore::D6Shadow(ref shadow_store) = store else {
+            panic!("expected D6Shadow");
+        };
+        assert_eq!(store.max_file_bytes(), cap);
+        assert_eq!(shadow_store.max_file_bytes(), cap);
+        assert_eq!(shadow_store.primary().max_file_bytes(), cap);
+        assert_eq!(shadow_store.shadow().max_file_bytes(), cap);
+
+        let ledger2: DynRefLedger = Arc::new(crate::cas_merkle::InMemoryRefLedger::default());
+        let rebound = LocalWorkspaceStore::from(shadow_store.with_ledger(ledger2));
+        let LocalWorkspaceStore::D6Shadow(ref rebound_shadow) = rebound else {
+            panic!("expected D6Shadow");
+        };
+        assert_eq!(rebound.max_file_bytes(), cap);
+        assert_eq!(rebound_shadow.max_file_bytes(), cap);
+        assert_eq!(rebound_shadow.primary().max_file_bytes(), cap);
+        assert_eq!(rebound_shadow.shadow().max_file_bytes(), cap);
+        assert!(rebound_shadow.oracle().strict_fail_closed());
+        assert_eq!(
+            rebound_shadow.oracle().tracked_set_mode(),
+            ShadowTrackedSetMode::SimulateUnfilteredScan
+        );
+        assert_eq!(rebound_shadow.shadow().l1_policy(), Some(&l1_policy));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

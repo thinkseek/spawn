@@ -8,6 +8,8 @@
 //! Every case runs in a schema of its own, so a shared database cannot leak
 //! events or commands between cases or between runs.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -607,7 +609,12 @@ fn a_bridge_without_worker_recovery_takes_no_ownership_and_keeps_live_leases() {
     // With the tick still alive, a resident loop takes the worker on another
     // server session (no advisory lock held) and on the tick's own store (no
     // local claim).
-    let loop_store = PostgresStore::connect_in_schema(&url(), schema.name()).expect("loop store");
+    let loop_store = PostgresStore::connect_in_schema_with_options(
+        &url(),
+        schema.name(),
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("loop store");
     let (loop_owner, recovered) = loop_store
         .recover_worker("spawn-worker")
         .expect("the tick holds no server-side ownership");
@@ -639,7 +646,14 @@ fn sigkill_claim_helper() {
         return;
     }
     let schema = std::env::var("SPAWN_SIGKILL_CLAIM_SCHEMA").expect("helper schema");
-    let store = Arc::new(PostgresStore::connect_in_schema(&url(), &schema).expect("helper store"));
+    let store = Arc::new(
+        PostgresStore::connect_in_schema_with_options(
+            &url(),
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("helper store"),
+    );
     let host = Arc::new(MemoryStore::new("crash-helper", Arc::new(SystemClock)));
     let mut bridge = Bridge::new(
         store.clone(),
@@ -663,7 +677,14 @@ fn sigkill_claim_helper() {
 
 #[cfg(unix)]
 fn new_postgres_bridge(schema: &str, host_name: &str) -> (Arc<PostgresStore>, Bridge) {
-    let store = Arc::new(PostgresStore::connect_in_schema(&url(), schema).expect("bridge store"));
+    let store = Arc::new(
+        PostgresStore::connect_in_schema_with_options(
+            &url(),
+            schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("bridge store"),
+    );
     let host = Arc::new(MemoryStore::new(host_name, Arc::new(SystemClock)));
     let bridge = Bridge::new(
         store.clone(),
@@ -1002,8 +1023,12 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
 #[test]
 fn two_connections_racing_to_start_one_session_record_one_execution() {
     let (first, schema) = store("one_execution");
-    let second = spawn_postgres::PostgresStore::connect_in_schema(&url(), &schema)
-        .expect("a second Bridge's connection");
+    let second = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+        &url(),
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("a second Bridge's connection");
     let started = |name: &str| {
         lifecycle(
             &ExecutionId::new(name).expect("valid execution"),
@@ -3894,7 +3919,12 @@ fn a_restarted_databases_broken_connection_is_unreachable_and_a_fresh_store_read
     let url = url();
     let separator = if url.contains('?') { '&' } else { '?' };
     let named = format!("{url}{separator}application_name={name}");
-    let store = PostgresStore::connect_in_schema(&named, &schema).expect("connect");
+    let store = PostgresStore::connect_in_schema_with_options(
+        &named,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("connect");
     assert!(
         store.watermark().is_ok(),
         "the connection works before the restart"
@@ -3917,7 +3947,12 @@ fn a_restarted_databases_broken_connection_is_unreachable_and_a_fresh_store_read
         "the loop paces an unreachable pass instead of ending: {error}"
     );
     // The loop's next pass: a store of its own, on a live connection.
-    let fresh = PostgresStore::connect_in_schema(&named, &schema).expect("reconnect");
+    let fresh = PostgresStore::connect_in_schema_with_options(
+        &named,
+        &schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("reconnect");
     assert!(
         fresh.watermark().is_ok(),
         "a fresh store reads the log again after the restart"
@@ -5982,7 +6017,12 @@ fn assert_sigkill_pruning_and_reshard(
     use spawn_core::port::StoreError;
 
     let mut client = admin(schema);
-    let store_kill = PostgresStore::connect_in_schema(&url(), schema).expect("connect store_kill");
+    let store_kill = PostgresStore::connect_in_schema_with_options(
+        &url(),
+        schema,
+        &spawn_postgres::testing::test_connect_options(),
+    )
+    .expect("connect store_kill");
     let own_kill = store_kill
         .recover_worker_for_shard("pg-kill-1", shard_one)
         .expect("recover before simulated kill");
@@ -6071,8 +6111,14 @@ fn sharded_bridge_rejects_mixed_totals_duplicate_slots_and_missing_shards_fail_c
     let _budget = ApiBudgetGuard::exclusive();
     let (store_a, schema) = store("shard_guards");
     let store_a = Arc::new(store_a);
-    let store_b =
-        Arc::new(PostgresStore::connect_in_schema(&url(), schema.name()).expect("connect store_b"));
+    let store_b = Arc::new(
+        PostgresStore::connect_in_schema_with_options(
+            &url(),
+            schema.name(),
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("connect store_b"),
+    );
     let shard_zero = BridgeShard::partition(0, 2).expect("0/2");
     let shard_one = BridgeShard::partition(1, 2).expect("1/2");
     let shard_four = BridgeShard::partition(0, 4).expect("0/4");
@@ -6160,8 +6206,12 @@ fn concurrent_first_claim_with_mixed_shard_totals_rejects_cleanly_without_deadlo
 
     for round in 0..4_u32 {
         let (store_a, schema) = store(&format!("concurrent_first_claim_{round}"));
-        let store_b =
-            PostgresStore::connect_in_schema(&url(), schema.name()).expect("connect store_b");
+        let store_b = PostgresStore::connect_in_schema_with_options(
+            &url(),
+            schema.name(),
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("connect store_b");
         let session = (1..1_000_u64)
             .map(|n| SessionId::new(format!("session_conc_{round}_{n}")).expect("session"))
             .find(|sid| shard_zero_of_2.owns_session(sid))

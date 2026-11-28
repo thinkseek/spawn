@@ -41,7 +41,11 @@ fn mounted(base: &Path) -> (PathBuf, GitWorkspace, spawn_core::id::WorkspaceId) 
     std::fs::write(checkout.join("README.md"), "base\n").expect("write");
     git(&checkout, &["add", "-A"]);
     git(&checkout, &["commit", "-qm", "base"]);
-    let store = GitWorkspace::new(checkout.join(".git"), base.join("work"));
+    let store = GitWorkspace::new(
+        checkout.join(".git"),
+        base.join("work"),
+        crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+    );
     let branch = BranchName::new("agent_a").expect("branch");
     store.ensure_branch(&branch, None).expect("ensure");
     let workspace = store.mount(&branch).expect("mount");

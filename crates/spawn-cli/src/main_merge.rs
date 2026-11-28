@@ -862,6 +862,7 @@ fn shown(files: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{Merge, conflict_note, delivery_note, into_workspace, into_workspace_when};
     use crate::push::{Pushed, Pusher, push_branch};
     use crate::sources::{ensure_mirror, fetch_pushed_into, test_git as git};
@@ -921,7 +922,7 @@ mod tests {
         git(&["clone", "-q", "--bare", &seed.to_string_lossy(), &source]).expect("source");
         let root = base.join("host");
         let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
-        let store = GitWorkspace::new(&mirror, &root);
+        let store = GitWorkspace::new(&mirror, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
         (base, source, root, mirror, store)
     }
 
@@ -1218,8 +1219,12 @@ mod tests {
             // Dropped after the store (declared after it), when the test passes (P19).
             let schema = spawn_postgres::testing::TestSchema::new(case);
             let url = schema.url().to_string();
-            let store =
-                spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect");
+            let store = spawn_postgres::PostgresStore::connect_in_schema_with_options(
+                &url,
+                &schema,
+                &spawn_postgres::testing::test_connect_options(),
+            )
+            .expect("connect");
             Self {
                 store: std::sync::Arc::new(store),
                 url,
@@ -2469,7 +2474,11 @@ mod tests {
 
         let cas = Arc::new(CasMerkleStore::open(root.join(".d6/cas")).expect("cas"));
         let ledger = Arc::new(InMemoryRefLedger::new());
-        let opts = spawn_host::workspace::D6StoreOptions::new(Arc::clone(&cas), ledger.clone());
+        let opts = spawn_host::workspace::D6StoreOptions::new(
+            Arc::clone(&cas),
+            ledger.clone(),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
+        );
         let store = LocalWorkspaceStore::d6("d6-unmarked-proj", &root, opts);
         let d6 = store.d6_workspace().expect("d6");
 
@@ -2589,6 +2598,7 @@ mod tests {
             false,
             &root,
             &Probes::host(),
+            spawn_host::DEFAULT_MAX_FILE_BYTES,
         )
         .expect("resolve d6")
         .with_d6(D6RuntimeConfig::default());

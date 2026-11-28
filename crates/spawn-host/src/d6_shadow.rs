@@ -2003,10 +2003,20 @@ mod tests {
         git(&checkout, &["commit", "-qm", "base"]);
 
         let bare = checkout.join(".git");
-        let primary = GitWorkspace::new(&bare, scratch.join("git-work"));
+        let primary = GitWorkspace::new(
+            &bare,
+            scratch.join("git-work"),
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("cas"));
         let ledger = Arc::new(InMemoryRefLedger::new());
-        let d6 = D6Workspace::new("proj", scratch.join("d6-work"), cas.clone(), ledger.clone());
+        let d6 = D6Workspace::new(
+            "proj",
+            scratch.join("d6-work"),
+            cas.clone(),
+            ledger.clone(),
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         let shadow_strict = ShadowD6Workspace::new(primary.clone(), d6);
 
         let branch = BranchName::new("agent_a").expect("branch");
@@ -2044,7 +2054,13 @@ mod tests {
             .expect("head")
             .id;
 
-        let d6_leaky = D6Workspace::new("proj", scratch.join("d6-work"), cas, ledger.clone());
+        let d6_leaky = D6Workspace::new(
+            "proj",
+            scratch.join("d6-work"),
+            cas,
+            ledger.clone(),
+            crate::workspace_rules::DEFAULT_MAX_FILE_BYTES,
+        );
         let leaky_oracle = ShadowD6Workspace::new(primary, d6_leaky)
             .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
             .with_strict_fail_closed(true);

@@ -3,6 +3,8 @@
 //! tree, and an unknown `--feature` fails with rc 1 naming it. No store is
 //! opened, so the environment is empty but for `PATH`.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 

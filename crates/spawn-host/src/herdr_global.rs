@@ -142,6 +142,15 @@ impl RpcFailure {
     }
 }
 
+/// Process environment inputs controlling global `herdr-core` socket resolution.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HerdrDiscoveryEnv {
+    /// Explicit socket path override from `HC_SOCKET` (when non-empty).
+    pub hc_socket: Option<PathBuf>,
+    /// User runtime base directory from `$XDG_RUNTIME_DIR`.
+    pub xdg_runtime_dir: Option<PathBuf>,
+}
+
 /// Target set of `herdr-core` UDS sockets resolved for global discovery or routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SocketScope {
@@ -152,9 +161,12 @@ pub enum SocketScope {
 }
 
 impl SocketScope {
-    /// Resolves `explicit` socket path, falling back to non-empty `HC_SOCKET`, or else
-    /// scanning [`HerdrGlobalClient::default_sockets`].
-    pub fn resolve(explicit: Option<&Path>) -> Result<Self, GlobalHerdrError> {
+    /// Resolves `explicit` socket path, falling back to `env.hc_socket` (`HC_SOCKET`),
+    /// or else scanning [`HerdrGlobalClient::default_sockets`].
+    pub fn resolve(
+        explicit: Option<&Path>,
+        env: &HerdrDiscoveryEnv,
+    ) -> Result<Self, GlobalHerdrError> {
         if let Some(path) = explicit {
             if path.as_os_str().is_empty() {
                 return Err(GlobalHerdrError::new(
@@ -164,10 +176,12 @@ impl SocketScope {
             }
             return Ok(Self::Explicit(path.to_path_buf()));
         }
-        if let Some(env_sock) = std::env::var_os("HC_SOCKET").filter(|v| !v.is_empty()) {
-            return Ok(Self::Explicit(PathBuf::from(env_sock)));
+        if let Some(env_sock) = env.hc_socket.as_ref().filter(|v| !v.as_os_str().is_empty()) {
+            return Ok(Self::Explicit(env_sock.clone()));
         }
-        Ok(Self::Discovered(HerdrGlobalClient::default_sockets()?))
+        Ok(Self::Discovered(HerdrGlobalClient::default_sockets(
+            env.xdg_runtime_dir.as_deref(),
+        )?))
     }
 }
 
@@ -225,10 +239,12 @@ impl HerdrGlobalClient {
 
     /// Discovers candidate `herdr-core` UDS sockets from standard runtime locations
     /// (`$XDG_RUNTIME_DIR/herdr-core` and `/run/user/<uid>/herdr-core`).
-    pub fn default_sockets() -> Result<Vec<PathBuf>, GlobalHerdrError> {
+    pub fn default_sockets(
+        xdg_runtime_dir: Option<&Path>,
+    ) -> Result<Vec<PathBuf>, GlobalHerdrError> {
         let mut dirs = Vec::new();
-        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
-            dirs.push(PathBuf::from(xdg).join("herdr-core"));
+        if let Some(xdg) = xdg_runtime_dir.filter(|v| !v.as_os_str().is_empty()) {
+            dirs.push(xdg.join("herdr-core"));
         }
         let run_user = PathBuf::from(format!("/run/user/{}/herdr-core", crate::current_uid()));
         if !dirs.contains(&run_user) {
@@ -1296,6 +1312,7 @@ fn parse_labels(value: &Value) -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};

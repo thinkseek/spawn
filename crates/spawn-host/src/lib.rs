@@ -50,6 +50,7 @@ pub mod workspace_rules;
 #[cfg(test)]
 mod audit;
 
+pub use archive_mask::CollectorMaskConfig;
 pub use cas_dedup::{ArtifactRoot, DedupConfig, DedupError, DedupReport, dedup_dirs, prune_unused};
 pub use cas_merkle::{
     CasMerkleStore, D6RefKind, D6StoreError, InMemoryRefLedger, LedgerRef, LedgerSnapshot,
@@ -85,7 +86,7 @@ pub use git_process::git_command;
 pub use git_process::test_git_command;
 pub use herdr::{HerdrHost, HerdrPool};
 pub use herdr_core::HerdrCoreHost;
-pub use herdr_global::HerdrGlobalClient;
+pub use herdr_global::{HerdrDiscoveryEnv, HerdrGlobalClient};
 pub use merkle_merge::{
     ConflictKind, ConflictLabels, MergeBaseError, MergeDriver, MergeOptions, MergeShadowOutcome,
     MergeSnapshotSpec, ShadowOracleSummary, build_merge_snapshot, classify_shadow_merge,
@@ -97,14 +98,16 @@ pub use process::{current_uid, undumpable};
 pub use root::canonical_root;
 #[cfg(any(test, feature = "testing"))]
 pub use scratch::Scratch;
+pub use terminal_support::TerminalHostEnv;
 pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};
 pub use watch::InotifyWatch;
 pub use workspace::{
-    BACKEND_MARKER, CAS_DIRECTORY, LocalWorkspaceStore, WorkspaceBackend, claim_root, root_backend,
+    BACKEND_MARKER, CAS_DIRECTORY, LocalD6ShadowStore, LocalWorkspaceStore, WorkspaceBackend,
+    claim_root, root_backend,
 };
 pub use workspace_rules::{
-    ENGINE_RUNTIME_FILES, MAIN_COPIES, SET_ASIDE_FILES, SET_ASIDE_WAITS, has_conflict_block,
-    has_conflict_block_sized, names_files_outside_git,
+    DEFAULT_MAX_FILE_BYTES, ENGINE_RUNTIME_FILES, MAIN_COPIES, SET_ASIDE_FILES, SET_ASIDE_WAITS,
+    has_conflict_block, has_conflict_block_sized, names_files_outside_git,
 };
 
 /// The terminal host of this machine Spawn runs on: embedded `herdr-core`
@@ -307,7 +310,12 @@ mod tests {
         }
 
         let host = LocalTerminalHost::HerdrCore(
-            HerdrCoreHost::on_session("spawn-hc", "spawn-hc-list-dirs").expect("herdr core host"),
+            HerdrCoreHost::on_session(
+                "spawn-hc",
+                "spawn-hc-list-dirs",
+                crate::TerminalHostEnv::default(),
+            )
+            .expect("herdr core host"),
         );
         let ws = WorkspaceId::new("local:/tmp").expect("workspace");
         let path = root.to_str().expect("utf8 path");

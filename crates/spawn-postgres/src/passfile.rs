@@ -217,6 +217,7 @@ fn fields(line: &str) -> Vec<Field> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{Target, fields, fill_from, lookup, password_in};
 
     fn target(host: &str, socket: bool) -> Target {

@@ -4,6 +4,8 @@
 //! `herdr-core` (`spawn-hc`) runs on isolated private sessions/runtime dirs so
 //! no test touches another server.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -16,7 +18,7 @@ use spawn_core::id::{BranchName, TerminalName, WorkspaceId};
 use spawn_core::port::{
     Commit, Launch, Runner, ServerSeen, TerminalError, TerminalHost, WorkspaceStore,
 };
-use spawn_host::{GitWorkspace, HerdrCoreHost, Scratch};
+use spawn_host::{GitWorkspace, HerdrCoreHost, Scratch, TerminalHostEnv};
 
 /// Serialize the external programs of this test binary.
 ///
@@ -69,7 +71,14 @@ fn start_session(host: &HerdrCoreHost, launch: &Launch) -> Result<(), TerminalEr
 /// `program`'s `HerdrCoreHost`, keeping in `scratch` what it would keep in
 /// `$XDG_RUNTIME_DIR`.
 fn host_in(scratch: &Scratch, program: &str, session: &str) -> HerdrCoreHost {
-    HerdrCoreHost::on_session(program, session)
+    let host_env = TerminalHostEnv {
+        home: std::env::var_os("HOME").map(PathBuf::from),
+        scrubbed_env_keys: TerminalHostEnv::collect_scrubbed_keys(
+            std::env::vars_os().map(|(k, _)| k),
+        ),
+        ..TerminalHostEnv::default()
+    };
+    HerdrCoreHost::on_session(program, session, host_env)
         .expect("valid session")
         .with_runtime_under(runtime(scratch))
 }
@@ -151,7 +160,7 @@ fn branch() -> BranchName {
 fn mount_of_an_unknown_branch_fails() {
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("unknown");
-    let store = GitWorkspace::new(&repo, &root);
+    let store = GitWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     assert!(store.mount(&branch()).is_err(), "no commit, no mount");
 }
 
@@ -159,7 +168,7 @@ fn mount_of_an_unknown_branch_fails() {
 fn ensure_branch_is_idempotent_and_mount_extracts_the_base() {
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("mount");
-    let store = GitWorkspace::new(&repo, &root);
+    let store = GitWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     store
         .ensure_branch(&branch(), None)
         .expect("create the branch");
@@ -183,7 +192,7 @@ fn ensure_branch_is_idempotent_and_mount_extracts_the_base() {
 fn an_untouched_workspace_produces_no_commit() {
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("unchanged");
-    let store = GitWorkspace::new(&repo, &root);
+    let store = GitWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     store
         .ensure_branch(&branch(), None)
         .expect("create the branch");
@@ -199,7 +208,7 @@ fn an_untouched_workspace_produces_no_commit() {
 fn a_changed_workspace_advances_the_branch() {
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("created");
-    let store = GitWorkspace::new(&repo, &root);
+    let store = GitWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     store
         .ensure_branch(&branch(), None)
         .expect("create the branch");
@@ -228,7 +237,7 @@ const CAP: u64 = 1 << 20;
 fn a_file_over_the_cap_stays_out_of_the_checkpoint_and_the_rest_goes_in() {
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("large");
-    let store = GitWorkspace::new(&repo, &root).with_max_file_bytes(CAP);
+    let store = GitWorkspace::new(&repo, &root, CAP);
     store
         .ensure_branch(&branch(), None)
         .expect("create the branch");
@@ -285,7 +294,7 @@ fn noise(seed: u64, length: usize) -> Vec<u8> {
 fn a_file_under_the_cap_is_a_blob_across_remounts() {
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("kept");
-    let store = GitWorkspace::new(&repo, &root);
+    let store = GitWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     let reference = format!("refs/heads/{}", branch());
     store
         .ensure_branch(&branch(), None)
@@ -340,7 +349,7 @@ fn a_file_under_the_cap_is_a_blob_across_remounts() {
 fn a_file_over_the_cap_named_like_a_pattern_drops_nothing_else() {
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("pattern");
-    let store = GitWorkspace::new(&repo, &root).with_max_file_bytes(CAP);
+    let store = GitWorkspace::new(&repo, &root, CAP);
     store
         .ensure_branch(&branch(), None)
         .expect("create the branch");
@@ -389,7 +398,7 @@ fn a_file_over_the_cap_of_any_name_is_left_out_and_told_of() {
     use std::os::unix::ffi::OsStrExt;
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("odd-names");
-    let store = GitWorkspace::new(&repo, &root).with_max_file_bytes(CAP);
+    let store = GitWorkspace::new(&repo, &root, CAP);
     store
         .ensure_branch(&branch(), None)
         .expect("create the branch");
@@ -434,7 +443,7 @@ fn a_file_over_the_cap_of_any_name_is_left_out_and_told_of() {
 fn a_commit_records_the_branch_from_the_identifier() {
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("identity");
-    let store = GitWorkspace::new(&repo, &root);
+    let store = GitWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     store
         .ensure_branch(&branch(), None)
         .expect("create the branch");
@@ -892,7 +901,10 @@ fn a_capture_from_a_herdr_core_that_never_answers_fails_in_time() {
 fn the_adapters_pass_the_shared_contract() {
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("contract");
-    contract::workspace_store("host_ws", &GitWorkspace::new(&repo, &root));
+    contract::workspace_store(
+        "host_ws",
+        &GitWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES),
+    );
     let hc = isolated_herdr_core("contract");
     let host = hc.host();
     contract::terminal("host_tty", &host);
@@ -974,7 +986,7 @@ fn parents(repo: &PathBuf, commit: &str) -> Vec<String> {
 fn a_branch_deleted_under_its_mounted_workspace_is_made_again_from_the_workspace() {
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("recreate");
-    let store = GitWorkspace::new(&repo, &root);
+    let store = GitWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     store.ensure_branch(&branch(), None).expect("branch");
     let workspace = store.mount(&branch()).expect("mount");
     let directory = PathBuf::from(workspace.path());
@@ -1084,7 +1096,7 @@ fn a_branch_deleted_under_its_mounted_workspace_is_made_again_from_the_workspace
 fn a_take_back_is_asked_under_the_lock_only_when_the_branch_is_gone() {
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("take-back");
-    let store = GitWorkspace::new(&repo, &root);
+    let store = GitWorkspace::new(&repo, &root, spawn_host::DEFAULT_MAX_FILE_BYTES);
     store.ensure_branch(&branch(), None).expect("branch");
     let workspace = store.mount(&branch()).expect("mount");
     let directory = PathBuf::from(workspace.path());

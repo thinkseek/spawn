@@ -3,6 +3,9 @@
 //! each case's own), replayed from recorded events or written by a real
 //! Bridge over an in-memory terminal host, then decided.
 
+#![cfg(test)]
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,7 +43,12 @@ impl Db {
         // Dropped after the store (declared after it), when the test passes (P19).
         let schema = spawn_postgres::testing::TestSchema::new(case);
         let url = schema.url().to_string();
-        let store = PostgresStore::connect_in_schema(&url, &schema).expect("connect and migrate");
+        let store = PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("connect and migrate");
         Self {
             store: Arc::new(store),
             url,

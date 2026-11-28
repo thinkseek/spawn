@@ -347,6 +347,7 @@ fn fold_file(path: &Path, messages: &mut BTreeMap<String, Folded>) -> Result<(),
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
@@ -573,7 +574,12 @@ mod tests {
             "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
         );
         let schema = spawn_postgres::testing::TestSchema::new("cost_archive");
-        let store = PostgresStore::connect_in_schema(&url, &schema).expect("connect and migrate");
+        let store = PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("connect and migrate");
         let root = scratch("count");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut client = owner(&url, &schema);

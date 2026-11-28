@@ -5,6 +5,8 @@
 //! why is part of the why, not a help request. Exercises the compiled
 //! `spawn` binary (`CARGO_BIN_EXE_spawn`) with an empty environment.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::process::{Command, Output};
 
 /// `spawn <arguments>` with an empty environment, plus `extra`.

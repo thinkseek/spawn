@@ -153,7 +153,7 @@ fn write(workspace: &Path, ack: &Ack) -> Result<PathBuf, String> {
 /// malformed ack or outside an agent's pane.
 pub(crate) fn command(words: &[String]) -> Result<i32, String> {
     let ack = parse(words)?;
-    let workspace = pane_workspace(&|name| std::env::var(name).ok())?;
+    let workspace = pane_workspace(&crate::config::process_env_for_config)?;
     write(&workspace, &ack)?;
     println!(
         "spawn: ack of message #{} ({}) taken; the loop records it",
@@ -336,6 +336,7 @@ pub(crate) fn answers(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     fn words(text: &str) -> Vec<String> {
@@ -466,7 +467,12 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.subsec_nanos());
         let schema = spawn_postgres::testing::TestSchema::new("acks");
-        let store = PostgresStore::connect_in_schema(&url, &schema).expect("connect and migrate");
+        let store = PostgresStore::connect_in_schema_with_options(
+            &url,
+            &schema,
+            &spawn_postgres::testing::test_connect_options(),
+        )
+        .expect("connect and migrate");
         let root =
             std::env::temp_dir().join(format!("spawn-acks-{}-{nanos:x}", std::process::id()));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

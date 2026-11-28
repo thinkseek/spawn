@@ -33,7 +33,7 @@ use spawn_core::port::{
 };
 use spawn_core::time::SystemClock;
 use spawn_host::LocalTranscriptArchive;
-use spawn_postgres::PostgresStore;
+use spawn_postgres::{ConnectOptions, PostgresStore};
 
 const USAGE: &str = "spawn always-on control-plane & attribution benchmark\n\
 \n\
@@ -2235,6 +2235,7 @@ impl Drop for BenchSchemaGuard {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
 fn run(cfg: &Config) -> Result<Value, String> {
     let bench_url = env::var("SPAWN_BENCH_DATABASE_URL").map_err(|_| {
         "SPAWN_BENCH_DATABASE_URL must be set to a disposable benchmark database URL".to_string()
@@ -2244,8 +2245,12 @@ fn run(cfg: &Config) -> Result<Value, String> {
         .map_or(0, |d| d.as_nanos());
     let schema = format!("spawn_always_on_{}_{nanos:x}", std::process::id());
     let _schema_guard = BenchSchemaGuard::new(bench_url.clone(), schema.clone())?;
-    let base_store = PostgresStore::connect_in_schema(&bench_url, &schema)
-        .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
+    let base_store = PostgresStore::connect_in_schema_with_options(
+        &bench_url,
+        &schema,
+        &ConnectOptions::default(),
+    )
+    .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
     let scratch_archive = ScratchArchive::new(cfg.archive_root.clone())?;
     let archive = LocalTranscriptArchive::new(scratch_archive.0.clone());
 

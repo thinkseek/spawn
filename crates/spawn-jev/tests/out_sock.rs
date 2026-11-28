@@ -1,4 +1,5 @@
 #![cfg(unix)]
+#![allow(clippy::disallowed_methods)]
 //! Tests for the local `out.sock` UNIX domain socket transport in `spawn-jev`,
 //! plus cross-process verification against `spawn-node front --serve outbound`.
 
