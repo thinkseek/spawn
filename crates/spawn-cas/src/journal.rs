@@ -1,13 +1,16 @@
 //! Append-only durability journal (`<cas_root>/refs.journal`) for D6 ref
 //! transitions (`#113` Fine Item 7.2).
 //!
-//! Each PostgreSQL ref commit (`spawn_ref_cas` / `spawn_ref_land_main`) appends
-//! one JSON line with `O_APPEND | O_NOFOLLOW` followed by `sync_all()` (`fsync`)
-//! so PG backup restore windows can fast-forward reconcile recent ref moves.
+//! Each PostgreSQL ref commit (`spawn_ref_cas` / `spawn_ref_land_main`) locks
+//! `refs.journal` exclusively, heals any unterminated trailing crash fragment
+//! back to the last committed newline boundary, and appends one JSON line
+//! opened with `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` followed by `sync_all()`
+//! (`fsync`) so PG backup restore windows can fast-forward reconcile recent
+//! ref moves.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -55,7 +58,68 @@ fn validate_entry(entry: &JournalEntry) -> Result<(), CasError> {
     Ok(())
 }
 
-/// Crash-safe reader and `O_APPEND | O_NOFOLLOW` writer for `refs.journal`.
+const TAIL_SCAN_CHUNK: usize = 8192;
+const TAIL_SCAN_CHUNK_U64: u64 = 8192;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailState {
+    /// File is empty or ends cleanly with `b'\n'`; ready to append at `eof`.
+    Clean { eof: u64 },
+    /// File ends with an unterminated trailing fragment starting at `valid_end`.
+    TornTail { valid_end: u64 },
+}
+
+fn find_last_committed_end(file: &mut fs::File, file_len: u64) -> io::Result<u64> {
+    let mut buf = [0_u8; TAIL_SCAN_CHUNK];
+    let mut cursor = file_len;
+    while cursor > 0 {
+        let step_u64 = cursor.min(TAIL_SCAN_CHUNK_U64);
+        let step = usize::try_from(step_u64).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "journal chunk size overflow")
+        })?;
+        let start = cursor - step_u64;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf[..step])?;
+        if let Some(rel) = buf[..step].iter().rposition(|&b| b == b'\n') {
+            let rel_u64 = u64::try_from(rel).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "journal offset overflow")
+            })?;
+            return Ok(start + rel_u64 + 1);
+        }
+        cursor = start;
+    }
+    Ok(0)
+}
+
+fn inspect_tail(file: &mut fs::File, file_len: u64) -> io::Result<TailState> {
+    if file_len == 0 {
+        return Ok(TailState::Clean { eof: 0 });
+    }
+    let mut last = [0_u8; 1];
+    file.seek(SeekFrom::Start(file_len - 1))?;
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(TailState::Clean { eof: file_len });
+    }
+    let valid_end = find_last_committed_end(file, file_len)?;
+    Ok(TailState::TornTail { valid_end })
+}
+
+fn heal_torn_tail_and_seek(file: &mut fs::File, file_len: u64) -> io::Result<()> {
+    match inspect_tail(file, file_len)? {
+        TailState::Clean { eof } => {
+            file.seek(SeekFrom::Start(eof))?;
+        }
+        TailState::TornTail { valid_end } => {
+            file.set_len(valid_end)?;
+            file.sync_all()?;
+            file.seek(SeekFrom::Start(valid_end))?;
+        }
+    }
+    Ok(())
+}
+
+/// Crash-safe reader and `flock`-serialized writer (`O_NOFOLLOW`) for `refs.journal`.
 #[derive(Debug, Clone)]
 pub struct RefJournal {
     path: PathBuf,
@@ -72,7 +136,10 @@ impl RefJournal {
         &self.path
     }
 
-    /// Append one committed entry with `O_APPEND | O_NOFOLLOW` and `fsync` (`sync_all`).
+    /// Acquire an exclusive `flock` on `refs.journal`, truncate any
+    /// unterminated torn trailing fragment back to the last committed newline
+    /// boundary (and `sync_all()`), then append one committed entry and
+    /// `sync_all()`.
     pub fn append(&self, entry: &JournalEntry) -> Result<(), CasError> {
         validate_entry(entry)?;
         let mut line = serde_json::to_string(entry)
@@ -92,9 +159,10 @@ impl RefJournal {
 
         let mut file = fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .read(true)
+            .write(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&self.path)
             .map_err(|error| {
                 if error.raw_os_error() == Some(libc::ELOOP) {
@@ -111,6 +179,12 @@ impl RefJournal {
             let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
         }
 
+        // Hold exclusive flock across tail inspection, torn-tail truncation, and write
+        // so concurrent writers/readers never interleave with healing or partial lines.
+        file.lock()?;
+        let file_len = file.metadata()?.len();
+        heal_torn_tail_and_seek(&mut file, file_len)?;
+
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
 
@@ -123,8 +197,8 @@ impl RefJournal {
         Ok(())
     }
 
-    /// Read all newline-committed entries, tolerating an incomplete/torn
-    /// trailing line without losing earlier committed entries.
+    /// Read all newline-committed entries under a shared `flock`, tolerating an
+    /// incomplete/torn trailing line without losing earlier committed entries.
     pub fn read_all(&self) -> Result<Vec<JournalEntry>, CasError> {
         let mut file = match open_nofollow(&self.path) {
             Ok(file) => file,
@@ -138,6 +212,7 @@ impl RefJournal {
             return Err(CasError::NotPlain(self.path.clone()));
         }
 
+        file.lock_shared()?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         let Some(last_newline) = bytes.iter().rposition(|&b| b == b'\n') else {
