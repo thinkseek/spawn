@@ -240,7 +240,7 @@ const COMMANDS: &[Command] = &[
         usage: &[serve::USAGE],
         run: |rest| {
             long_lived();
-            serve::serve(&Flags::parse_with_switches(rest, &["ipc"])?)
+            serve::command(rest)
         },
     },
     Command {

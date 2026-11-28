@@ -148,6 +148,7 @@
 mod answers;
 pub(crate) mod approvals;
 pub(crate) mod attention;
+mod auth_token;
 pub(crate) mod capabilities;
 pub(crate) mod core_lines;
 mod digest;
@@ -158,6 +159,8 @@ mod prov;
 mod pwa;
 mod storage;
 mod stream;
+
+use auth_token::AuthPrincipal;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -213,13 +216,60 @@ pub(super) const MAX_INPUT_TEXT: usize = 8 * 1024;
 
 /// The usage of `spawn serve`, the only copy (main's help reads it).
 pub(crate) const USAGE: &str = "usage: spawn serve [--address <host:port>] [--web <dir>] [--ipc [--ipc-sock <path>] [--cas <dir>]]\n      \
+                                spawn serve viewer-token [--ttl <duration>]\n      \
                                 (the dashboard and the HTTP API, docs/api.md; --address or\n       \
                                 SPAWN_SERVE_ADDRESS, default 127.0.0.1:8787; --web or SPAWN_WEB_DIR,\n       \
                                 default web/dist; off loopback it needs SPAWN_SERVE_TOKEN;\n       \
-                                --ipc serves HTTP/1.1-over-UDS at $XDG_RUNTIME_DIR/spawn/core.sock)";
+                                --ipc serves HTTP/1.1-over-UDS at $XDG_RUNTIME_DIR/spawn/core.sock;\n       \
+                                viewer-token mints a short-lived read-only sv1 token, default 2h, max 24h)";
+
+/// Dispatch `spawn serve` and `spawn serve viewer-token`.
+pub fn command(rest: &[String]) -> Result<i32, String> {
+    if rest.first().map(String::as_str) == Some("viewer-token") {
+        let flags = Flags::parse(&rest[1..])?;
+        return viewer_token(&flags);
+    }
+    serve(&Flags::parse_with_switches(rest, &["ipc"])?)
+}
+
+/// Mint and print a short-lived read-only `sv1` viewer token (`spawn serve viewer-token`).
+/// Never echoes `SPAWN_SERVE_TOKEN` or any credential value.
+fn viewer_token(flags: &Flags) -> Result<i32, String> {
+    if let Some(unknown) = flags.names().find(|&name| name != "ttl") {
+        return Err(format!(
+            "unknown flag --{unknown} for `spawn serve viewer-token`"
+        ));
+    }
+    let master = match serve_token() {
+        Ok(Some(token)) => zeroize::Zeroizing::new(token),
+        Ok(None) => {
+            return Err(
+                "SPAWN_SERVE_TOKEN (or $CREDENTIALS_DIRECTORY/spawn-serve.token) must be set to mint a viewer token"
+                    .to_string(),
+            );
+        }
+        Err(error) => {
+            eprintln!("serve: {error}");
+            return Ok(crate::config::CREDENTIAL_EXIT_CODE);
+        }
+    };
+    if !is_header_safe_token(&master) {
+        return Err(format!(
+            "refusing to mint viewer token: SPAWN_SERVE_TOKEN must be 1 to {MAX_TOKEN_LEN} visible ASCII characters"
+        ));
+    }
+    let ttl_secs = match flags.get("ttl") {
+        Some(raw) => auth_token::parse_ttl_secs(&raw)?,
+        None => auth_token::DEFAULT_VIEWER_TTL_SECS,
+    };
+    let now_secs = auth_token::current_epoch_secs()?;
+    let (token, _) = auth_token::mint_viewer_token(&master, now_secs, ttl_secs)?;
+    println!("{token}");
+    Ok(0)
+}
 
 /// Serve the API and the built UI until the process is killed.
-pub fn serve(flags: &Flags) -> Result<i32, String> {
+fn serve(flags: &Flags) -> Result<i32, String> {
     if flags.switch("ipc") || flags.get("ipc-sock").is_some() {
         return ipc::run(flags);
     }
@@ -1046,26 +1096,13 @@ fn header<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
         .map(|header| header.value.as_str())
 }
 
-/// Whether `request` carries `token`, as a bearer header or `?token=`.
-fn authorized(request: &Request, query: &str, token: &str) -> bool {
+/// Extract an explicitly presented credential (`Authorization: Bearer` takes priority over `?token=`).
+fn presented_token<'a>(request: &'a Request, query: &'a str) -> Option<&'a str> {
     let bearer = header(request, "Authorization").and_then(|value| {
         let (scheme, rest) = value.split_once(' ')?;
         scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
     });
-    [bearer, parameter(query, "token")]
-        .into_iter()
-        .flatten()
-        .any(|given| same_secret(given.as_bytes(), token.as_bytes()))
-}
-
-/// Byte equality whose time does not depend on where the inputs differ.
-fn same_secret(given: &[u8], expected: &[u8]) -> bool {
-    given.len() == expected.len()
-        && given
-            .iter()
-            .zip(expected)
-            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
-            == 0
+    bearer.or_else(|| parameter(query, "token"))
 }
 
 enum ReaderContext {
@@ -1316,40 +1353,29 @@ fn checkout_human(shared: &Shared) -> Result<ipc::CheckedOutConn, (u16, String)>
         .map_err(ipc::PoolError::status_and_message)
 }
 
-/// What the read guard decided for one API request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Access {
-    /// It may read (and so ask to write, [`input`]).
-    read: bool,
-    /// It carries the token.
-    token: bool,
-}
+/// Alias keeping sibling modules (`serve::approvals`) bound directly to [`AuthPrincipal`].
+type Access = AuthPrincipal;
 
-/// The read guard. Without the token a read needs a Host that names this
-/// server and no foreign Origin (DNS rebinding, a local proxy); with it,
-/// any. With SPAWN_SERVE_LOCAL_OPEN=1 the owner's browser on this machine
-/// needs no token: a client running as the owner's uid can read the token
-/// file anyway. Another user's loopback client still needs it. Off by
-/// default. A client of an open network (SPAWN_SERVE_OPEN_NETWORKS) that
-/// names this server by its address there needs none either.
-fn access(request: &Request, query: &str, shared: &Shared) -> Access {
+/// Resolve the closed authorization principal for one HTTP/SSE request.
+/// Explicitly presented credentials never silently fall back to `LocalOwner`.
+fn access(request: &Request, query: &str, shared: &Shared) -> Option<AuthPrincipal> {
     let host = header(request, "Host");
     let origin = header(request, "Origin");
     let named = tokenless_request(host, origin, &shared.hosts);
     let peer = request.remote_addr().copied();
-    let Some(token) = shared.token.as_deref() else {
-        return Access {
-            read: named,
-            token: false,
-        };
+    let presented = presented_token(request, query);
+    let Some(master) = shared.token.as_deref() else {
+        if presented.is_some_and(|raw| raw.starts_with(auth_token::VIEWER_TOKEN_PREFIX)) {
+            return None;
+        }
+        return named.then_some(AuthPrincipal::LocalOwner);
     };
-    let carries = authorized(request, query, token);
-    Access {
-        read: carries
-            || (named && owners_own_request(peer, shared.port))
-            || open_network_request(peer, host, origin, shared.port, &shared.open),
-        token: carries,
+    if let Some(raw) = presented {
+        return auth_token::authenticate_bearer(raw, master, auth_token::current_epoch_secs().ok());
     }
+    ((named && owners_own_request(peer, shared.port))
+        || open_network_request(peer, host, origin, shared.port, &shared.open))
+    .then_some(AuthPrincipal::LocalOwner)
 }
 
 /// Every canonical API route `spawn serve` answers: its method (`GET`
@@ -1582,9 +1608,11 @@ fn handle_api_request(
     query: &str,
     shared: &Shared,
 ) -> Result<Option<Request>, String> {
-    let access = access(&request, query, shared);
-    if !access.read {
+    let Some(access) = access(&request, query, shared) else {
         return refuse(request, shared.token.is_some()).map(|()| None);
+    };
+    if !access.can_mutate() && !matches!(request.method(), Method::Get | Method::Head) {
+        return refuse_readonly_mutation(request).map(|()| None);
     }
     if path == "/api/features/truth" || path == "/api/episodes" {
         if !matches!(request.method(), Method::Get | Method::Head) {
@@ -1673,6 +1701,14 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
         };
         request
     } else {
+        if !matches!(request.method(), Method::Get | Method::Head)
+            && matches!(
+                access(&request, query, shared),
+                Some(AuthPrincipal::ReadOnlyViewer { .. })
+            )
+        {
+            return refuse_readonly_mutation(request);
+        }
         request
     };
     // The PWA shell is the binary's own (serve/pwa.rs), whatever the
@@ -1779,6 +1815,16 @@ fn refuse(request: Request, token_set: bool) -> Result<(), String> {
     request.respond(response).map_err(|error| error.to_string())
 }
 
+/// 403 Forbidden returned when a `ReadOnlyViewer` token attempts any mutation.
+fn refuse_readonly_mutation(request: Request) -> Result<(), String> {
+    request
+        .respond(json_response(
+            403,
+            &json!({ "error": auth_token::READONLY_MUTATION_ERROR }),
+        ))
+        .map_err(|error| error.to_string())
+}
+
 /// 405, naming the one method (`allow`) the path takes.
 fn not_allowed(allow: &'static str) -> Response<std::io::Cursor<Vec<u8>>> {
     let header = Header::from_bytes("Allow", allow).expect("static header is valid");
@@ -1832,20 +1878,27 @@ fn write_body(
     shared: &Shared,
     what: &str,
 ) -> Result<(Vec<u8>, Option<String>), (u16, String)> {
-    if !access.token {
-        if !same_origin(header(request, "Host"), header(request, "Origin")) {
-            return Err((
-                403,
-                format!("forbidden: {what} without the token needs this page's own Origin"),
-            ));
+    match access {
+        AuthPrincipal::AdminToken => {}
+        AuthPrincipal::ReadOnlyViewer { .. } => {
+            return Err((403, auth_token::READONLY_MUTATION_ERROR.to_string()));
         }
-        if shared.token.is_none() && !owners_client(request.remote_addr().copied(), shared.port) {
-            return Err((
-                403,
-                "forbidden: with no SPAWN_SERVE_TOKEN set, only the owner's own client on this \
-                 machine types"
-                    .to_string(),
-            ));
+        AuthPrincipal::LocalOwner => {
+            if !same_origin(header(request, "Host"), header(request, "Origin")) {
+                return Err((
+                    403,
+                    format!("forbidden: {what} without the token needs this page's own Origin"),
+                ));
+            }
+            if shared.token.is_none() && !owners_client(request.remote_addr().copied(), shared.port)
+            {
+                return Err((
+                    403,
+                    "forbidden: with no SPAWN_SERVE_TOKEN set, only the owner's own client on this \
+                     machine types"
+                        .to_string(),
+                ));
+            }
         }
     }
     if !is_json(header(request, "Content-Type")) {
@@ -2629,13 +2682,19 @@ fn feature_scan_post(
             .respond(not_allowed("POST"))
             .map_err(|error| error.to_string());
     }
-    if !access.token && !same_origin(header(&request, "Host"), header(&request, "Origin")) {
-        return request
-            .respond(json_response(
-                403,
-                &json!({ "error": "forbidden: a scan without the token needs this page's own Origin" }),
-            ))
-            .map_err(|error| error.to_string());
+    match access {
+        AuthPrincipal::AdminToken => {}
+        AuthPrincipal::ReadOnlyViewer { .. } => return refuse_readonly_mutation(request),
+        AuthPrincipal::LocalOwner => {
+            if !same_origin(header(&request, "Host"), header(&request, "Origin")) {
+                return request
+                    .respond(json_response(
+                        403,
+                        &json!({ "error": "forbidden: a scan without the token needs this page's own Origin" }),
+                    ))
+                    .map_err(|error| error.to_string());
+            }
+        }
     }
     let _ = read_body(&mut request);
     let paths = with_shared_reader(
@@ -5356,9 +5415,9 @@ mod tests {
         feature_paths, handle, is_json, is_loopback, keep_listening, listen_again_pause,
         local_exemption, log_window, mission_feature_paths, mission_query, objective_json,
         objective_prompt, open_network_request, open_networks, owner_uid, peer_uid, proc_sockets,
-        public_nodes, rsi_objective, rsi_summary, same_origin, same_secret, serve_requests,
-        server_hosts, stream, tokenless_request, typed_text, with_activity, with_fleet_liveness,
-        with_last_gates, with_objectives, with_task_liveness,
+        public_nodes, rsi_objective, rsi_summary, same_origin, serve_requests, server_hosts,
+        stream, tokenless_request, typed_text, with_activity, with_fleet_liveness, with_last_gates,
+        with_objectives, with_task_liveness,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -8682,10 +8741,10 @@ mod tests {
 
     #[test]
     fn secrets_match_only_when_equal() {
-        assert!(same_secret(b"abc", b"abc"));
-        assert!(!same_secret(b"abd", b"abc"));
-        assert!(!same_secret(b"ab", b"abc"));
-        assert!(!same_secret(b"", b"abc"));
+        assert!(super::auth_token::constant_time_eq(b"abc", b"abc"));
+        assert!(!super::auth_token::constant_time_eq(b"abd", b"abc"));
+        assert!(!super::auth_token::constant_time_eq(b"ab", b"abc"));
+        assert!(!super::auth_token::constant_time_eq(b"", b"abc"));
     }
 
     #[test]
@@ -11170,6 +11229,344 @@ mod tests {
             }
             assert_eq!(pools.reader.stats().0, 0);
             assert_eq!(pools.events.stats().0, 0);
+
+            server.unblock();
+            let _ = server_thread.join();
+        });
+    }
+
+    fn send_method(
+        token: Option<&'static str>,
+        open: &str,
+        method: &str,
+        path: &str,
+        headers: &str,
+        body: &str,
+    ) -> Answer {
+        let len_hdr = if body.is_empty() {
+            String::new()
+        } else {
+            format!("Content-Length: {}\r\n", body.len())
+        };
+        exchange(
+            token,
+            open,
+            None,
+            &format!(
+                "{method} {path} HTTP/1.1\r\n{headers}{len_hdr}Connection: close\r\n\r\n{body}"
+            ),
+        )
+    }
+
+    fn raw_method(port: u16, method: &str, path: &str, headers: &str, body: &str) -> Answer {
+        use std::io::{Read, Write};
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        let len_hdr = if body.is_empty() {
+            String::new()
+        } else {
+            format!("Content-Length: {}\r\n", body.len())
+        };
+        client
+            .write_all(
+                format!(
+                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{headers}{len_hdr}Connection: close\r\n\r\n{body}"
+                )
+                .as_bytes(),
+            )
+            .expect("send");
+        let mut raw = String::new();
+        let _ = client.read_to_string(&mut raw);
+        let (head, resp_body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+        Answer {
+            status: head
+                .split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse().ok())
+                .unwrap_or(0),
+            head: head.to_string(),
+            body: serde_json::from_str(resp_body).unwrap_or(serde_json::Value::Null),
+        }
+    }
+
+    fn assert_viewer_rbac_matrix(viewer: &str, expired: &str, tampered: &str, wrong_secret: &str) {
+        let viewer_json = format!(
+            "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer {viewer}\r\nContent-Type: application/json\r\n"
+        );
+        let mutations = [
+            ("POST", INPUT, r#"{"text":"hi","key":"k1"}"#, false),
+            (
+                "POST",
+                "/api/sessions/session_supervisor/key",
+                r#"{"key":"enter","key_id":"k2"}"#,
+                false,
+            ),
+            (
+                "POST",
+                "/api/missions/1/resume",
+                r#"{"halt":1,"key":"k3"}"#,
+                false,
+            ),
+            (
+                "POST",
+                "/api/sessions/session_supervisor/restart",
+                r#"{"key":"k4"}"#,
+                false,
+            ),
+            (
+                "POST",
+                "/api/sessions/session_supervisor/reassign",
+                r#"{"key":"k5"}"#,
+                false,
+            ),
+            (
+                "POST",
+                "/api/approvals/session_supervisor/act",
+                r#"{"probe":true}"#,
+                false,
+            ),
+            (
+                "POST",
+                "/api/master/message",
+                r#"{"text":"hi","key":"k6"}"#,
+                false,
+            ),
+            ("POST", "/api/features/scan", "{}", false),
+            (
+                "POST",
+                "/api/features/associate",
+                r#"{"path":"a","features":["b"]}"#,
+                false,
+            ),
+            ("PUT", "/api/fleet", "{}", false),
+            ("PATCH", "/api/missions", "{}", false),
+            ("DELETE", INPUT, "", false),
+            ("POST", "/", "{}", false),
+            ("POST", INPUT, r#"{"text":"hi","key":"k7"}"#, true),
+        ];
+        for (method, path, body, use_query) in mutations {
+            let (target, hdrs) = if use_query {
+                (
+                    format!("{path}?token={viewer}"),
+                    "Host: 127.0.0.1:PORT\r\nContent-Type: application/json\r\n".to_string(),
+                )
+            } else {
+                (path.to_string(), viewer_json.clone())
+            };
+            let ans = send_method(Some("secret"), "127.0.0.0/8", method, &target, &hdrs, body);
+            assert_eq!(ans.status, 403, "{method} {path}: {ans:?}");
+            assert_eq!(
+                ans.body["error"].as_str(),
+                Some(super::auth_token::READONLY_MUTATION_ERROR),
+                "{method} {path}: {ans:?}"
+            );
+        }
+
+        for bad in [expired, tampered, wrong_secret] {
+            let hdrs = format!(
+                "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer {bad}\r\nContent-Type: application/json\r\n"
+            );
+            let bad_get = send_method(
+                Some("secret"),
+                "127.0.0.0/8",
+                "GET",
+                "/api/overview",
+                &hdrs,
+                "",
+            );
+            assert_eq!(bad_get.status, 401, "{bad_get:?}");
+            assert!(
+                bad_get.head.contains("WWW-Authenticate: Bearer"),
+                "{}",
+                bad_get.head
+            );
+
+            let bad_post = send_method(Some("secret"), "127.0.0.0/8", "POST", INPUT, &hdrs, BODY);
+            assert_eq!(bad_post.status, 401, "{bad_post:?}");
+        }
+    }
+
+    #[test]
+    fn viewer_token_http_rbac_allows_static_and_blocks_all_mutations_with_403() {
+        let now = super::auth_token::current_epoch_secs().expect("clock");
+        let (viewer, _) =
+            super::auth_token::mint_viewer_token("secret", now, 3_600).expect("mint viewer");
+        let (expired, _) =
+            super::auth_token::mint_viewer_token("secret", now.saturating_sub(120), 60)
+                .expect("mint expired");
+        let mut tampered_bytes = viewer.clone().into_bytes();
+        let last = tampered_bytes.len() - 1;
+        tampered_bytes[last] = if tampered_bytes[last] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        let tampered = String::from_utf8(tampered_bytes).expect("ascii");
+        let (wrong_secret, _) =
+            super::auth_token::mint_viewer_token("other-secret", now, 3_600).expect("mint wrong");
+
+        let viewer_auth = format!("Host: 127.0.0.1:PORT\r\nAuthorization: Bearer {viewer}\r\n");
+        let root_get = send_method(
+            Some("secret"),
+            "",
+            "GET",
+            "/manifest.webmanifest",
+            &viewer_auth,
+            "",
+        );
+        assert_eq!(root_get.status, 200, "{}", root_get.head);
+        let root_head = send_method(
+            Some("secret"),
+            "",
+            "HEAD",
+            "/manifest.webmanifest",
+            &viewer_auth,
+            "",
+        );
+        assert_eq!(root_head.status, 200, "{}", root_head.head);
+
+        assert_viewer_rbac_matrix(&viewer, &expired, &tampered, &wrong_secret);
+
+        let admin_post = post(Some("secret"), "", None, INPUT, SCRIPT, BODY);
+        assert_ne!(admin_post.status, 401, "{admin_post:?}");
+        assert_ne!(admin_post.status, 403, "{admin_post:?}");
+    }
+
+    fn open_query_sse(port: u16, token: &str) -> std::net::TcpStream {
+        use std::io::Write;
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(
+            client,
+            "GET /api/stream?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )
+        .unwrap();
+        client.flush().unwrap();
+        let _ = read_tcp_until(&mut client, "event: ready\n");
+        client
+    }
+
+    fn verify_live_viewer_requests(
+        port: u16,
+        master: &str,
+        viewer: &str,
+        expired: &str,
+        store: &spawn_postgres::PostgresStore,
+    ) {
+        use spawn_core::port::EventLog;
+
+        let bearer_hdr = format!("Authorization: Bearer {viewer}\r\n");
+        for (path, hdr) in [
+            ("/api/overview", bearer_hdr.as_str()),
+            ("/api/fleet", bearer_hdr.as_str()),
+            (&format!("/api/overview?token={viewer}"), ""),
+        ] {
+            let (st, body) = raw_status(port, path, hdr);
+            assert_eq!(st, 200, "GET {path}: {body}");
+        }
+        let head_ans = raw_method(port, "HEAD", "/api/overview", &bearer_hdr, "");
+        assert_eq!(head_ans.status, 200, "{}", head_ans.head);
+
+        let mut sse_bearer = open_tcp_sse(port, viewer);
+        let mut sse_query = open_query_sse(port, viewer);
+        let (expired_st, _) = raw_status(
+            port,
+            "/api/stream",
+            &format!("Authorization: Bearer {expired}\r\n"),
+        );
+        assert_eq!(expired_st, 401);
+
+        let live_id = store
+            .append(spawn_core::event::NewEvent {
+                agent_id: spawn_core::id::AgentId::new("agent_viewer_sse").unwrap(),
+                session_id: spawn_core::id::SessionId::new("session_viewer_sse").unwrap(),
+                execution_id: None,
+                source: spawn_core::event::Source::Bridge,
+                source_event_id: Some("viewer-sse-live".to_string()),
+                kind: spawn_core::event::EventKind::MessageReceived,
+            })
+            .unwrap()
+            .record
+            .position
+            .0;
+        for sse in [&mut sse_bearer, &mut sse_query] {
+            let seen = read_tcp_until(sse, &format!("id: {live_id}\n"));
+            assert!(seen.contains("\"session_viewer_sse\""), "{seen}");
+        }
+        drop((sse_bearer, sse_query));
+
+        let viewer_post = raw_method(
+            port,
+            "POST",
+            "/api/sessions/session_viewer_sse/input",
+            &format!("{bearer_hdr}Content-Type: application/json\r\n"),
+            r#"{"probe":true}"#,
+        );
+        assert_eq!(viewer_post.status, 403, "{viewer_post:?}");
+        assert_eq!(
+            viewer_post.body["error"].as_str(),
+            Some(super::auth_token::READONLY_MUTATION_ERROR)
+        );
+
+        let admin_post = raw_method(
+            port,
+            "POST",
+            "/api/sessions/session_viewer_sse/input",
+            &format!("Authorization: Bearer {master}\r\nContent-Type: application/json\r\n"),
+            r#"{"probe":true}"#,
+        );
+        assert_eq!(admin_post.status, 200, "{admin_post:?}");
+        assert_eq!(admin_post.body["writable"], true);
+    }
+
+    #[test]
+    fn viewer_token_live_http_reads_and_sse_stream_succeed_while_mutations_return_403() {
+        in_test_schema(|owner, store| {
+            execution_starts(store);
+            let master = "viewer-live-master-secret";
+            let now = super::auth_token::current_epoch_secs().expect("clock");
+            let (viewer, _) =
+                super::auth_token::mint_viewer_token(master, now, 3_600).expect("mint viewer");
+            let (expired, _) =
+                super::auth_token::mint_viewer_token(master, now.saturating_sub(120), 60)
+                    .expect("mint expired");
+
+            let config = super::ipc::PoolConfig {
+                reads: 2,
+                writes: 1,
+                node: 1,
+                events: 2,
+                wait_timeout: std::time::Duration::from_millis(500),
+            };
+            let pools = super::ipc::ServePools::from_serve_env(Some(owner), None, config)
+                .expect("pools")
+                .expect("configured");
+            let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("listen"));
+            let port = server.server_addr().to_ip().expect("ip").port();
+            let shared = Arc::new(Shared {
+                web: std::env::temp_dir(),
+                token: Some(master.to_string()),
+                port: Some(port),
+                hosts: server_hosts("127.0.0.1:0", port),
+                open: Vec::new(),
+                pools: Ok(Some(Arc::clone(&pools))),
+            });
+            let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
+            let server_for_loop = Arc::clone(&server);
+            let server_shared = Arc::clone(&shared);
+            let server_streams = Arc::clone(&streams);
+            let server_thread = std::thread::spawn(move || {
+                super::serve_requests_with_queue(
+                    &server_for_loop,
+                    &server_shared,
+                    MAX_IN_FLIGHT,
+                    super::MAX_REQUEST_QUEUE,
+                    &server_streams,
+                )
+            });
+
+            verify_live_viewer_requests(port, master, &viewer, &expired, store);
 
             server.unblock();
             let _ = server_thread.join();

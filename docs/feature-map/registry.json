@@ -3028,6 +3028,7 @@
         "crates/spawn-cli/src/serve.rs",
         "crates/spawn-cli/src/serve/answers.rs",
         "crates/spawn-cli/src/serve/approvals.rs",
+        "crates/spawn-cli/src/serve/auth_token.rs",
         "crates/spawn-cli/src/serve/attention.rs",
         "crates/spawn-cli/src/serve/capabilities.rs",
         "crates/spawn-cli/src/serve/core_lines.rs",
@@ -3053,6 +3054,7 @@
         "crates/spawn-cli/src/serve/labels.rs",
         "crates/spawn-cli/src/serve/storage.rs",
         "crates/spawn-cli/src/serve/stream.rs",
+        "crates/spawn-cli/tests/viewer_token.rs",
         "crates/spawn-postgres/sql/schema.sql",
         "crates/spawn-postgres/tests/dashboard.rs",
         "crates/spawn-postgres/tests/human_input.rs",
@@ -3197,7 +3199,8 @@
           "6c5d22782"
         ],
         "tests": [
-          "crates/spawn-cli/src/serve.rs"
+          "crates/spawn-cli/src/serve.rs",
+          "crates/spawn-cli/tests/viewer_token.rs"
         ],
         "deploys": [],
         "artifacts": [],
