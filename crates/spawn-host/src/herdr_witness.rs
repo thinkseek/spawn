@@ -13,6 +13,7 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::Path;
 
+use spawn_core::agent_events::{AgentEngine, ProcessNode, ProcessTreeTelemetry};
 use spawn_core::port::{AgentReading, AgentStatus};
 use spawn_core::screen::{
     ScreenState, drop_agy_account_lines, is_agy_trust_dialog, is_trust_dialog, read_agy_screen,
@@ -174,51 +175,66 @@ fn interpreter_target(argv: &[String]) -> Option<&str> {
     None
 }
 
-/// Walks the live `/proc` process tree rooted at `leader_pid` in BFS order,
-/// returning all live (non-zombie) PIDs starting with `leader_pid`.
-pub(crate) fn collect_process_tree(leader_pid: u32) -> Vec<u32> {
-    if leader_pid <= 1 {
-        return Vec::new();
-    }
-    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    let mut leader_alive = false;
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
+/// Point-in-time snapshot of live `/proc` PIDs, parent links, and states
+/// so callers inspecting multiple terminals only walk `/proc` once per tick.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProcSnapshot {
+    children: BTreeMap<u32, Vec<u32>>,
+    stats: BTreeMap<u32, (char, u32)>,
+}
+
+impl ProcSnapshot {
+    /// Reads `/proc` once and indexes all non-zombie PIDs.
+    pub(crate) fn capture() -> Self {
+        let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut stats: BTreeMap<u32, (char, u32)> = BTreeMap::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Self::default();
         };
-        if let Some((state, ppid)) = read_proc_stat(pid)
-            && state != 'Z'
-        {
-            if pid == leader_pid {
-                leader_alive = true;
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if let Some((state, ppid)) = read_proc_stat(pid)
+                && state != 'Z'
+            {
+                stats.insert(pid, (state, ppid));
+                children.entry(ppid).or_default().push(pid);
             }
-            children.entry(ppid).or_default().push(pid);
         }
+        Self { children, stats }
     }
-    if !leader_alive {
-        return Vec::new();
-    }
-    let mut order = Vec::new();
-    let mut queue = VecDeque::from([leader_pid]);
-    let mut seen = HashSet::from([leader_pid]);
-    while let Some(pid) = queue.pop_front() {
-        order.push(pid);
-        if let Some(kids) = children.get(&pid) {
-            for &kid in kids {
-                if seen.insert(kid) {
-                    queue.push_back(kid);
+
+    /// Returns all live PIDs rooted at `leader_pid` in BFS order.
+    pub(crate) fn tree_pids(&self, leader_pid: u32) -> Vec<u32> {
+        if leader_pid <= 1 || !self.stats.contains_key(&leader_pid) {
+            return Vec::new();
+        }
+        let mut order = Vec::new();
+        let mut queue = VecDeque::from([leader_pid]);
+        let mut seen = HashSet::from([leader_pid]);
+        while let Some(pid) = queue.pop_front() {
+            order.push(pid);
+            if let Some(kids) = self.children.get(&pid) {
+                for &kid in kids {
+                    if seen.insert(kid) {
+                        queue.push_back(kid);
+                    }
                 }
             }
         }
+        order
     }
-    order
+}
+
+/// Walks the live `/proc` process tree rooted at `leader_pid` in BFS order,
+/// returning all live (non-zombie) PIDs starting with `leader_pid`.
+pub(crate) fn collect_process_tree(leader_pid: u32) -> Vec<u32> {
+    ProcSnapshot::capture().tree_pids(leader_pid)
 }
 
 const MAX_PROCESS_TREE_NODES: usize = 32;
@@ -227,30 +243,23 @@ const IGNORE_LEAF_COMMS: &[&str] = &[
     "sh", "bash", "dash", "zsh", "fish", "sleep", "cat", "tail", "env", "timeout",
 ];
 
-/// Walks the live `/proc` process tree rooted at `leader_pid` and detects
-/// the first live supported coding agent descendant (or the leader itself).
-fn detect_agent_in_tree(leader_pid: u32) -> Option<spawn_core::agent_events::AgentEngine> {
-    collect_process_tree(leader_pid)
-        .into_iter()
-        .find_map(inspect_pid)
+fn detect_agent_in_pids(pids: &[u32]) -> Option<AgentEngine> {
+    pids.iter().copied().find_map(inspect_pid)
 }
 
-/// Samples up to 32 live `/proc` nodes rooted at `leader_pid`, gathering
-/// parent linkage, RSS memory usage, sanitized command lines, and the deepest
-/// active child command.
-pub(crate) fn inspect_process_tree(
+/// Samples up to 32 live `/proc` nodes rooted at `leader_pid` using a captured `ProcSnapshot`.
+pub(crate) fn inspect_process_tree_in(
+    snapshot: &ProcSnapshot,
     leader_pid: u32,
-) -> Option<spawn_core::agent_events::ProcessTreeTelemetry> {
-    use spawn_core::agent_events::{ProcessNode, ProcessTreeTelemetry};
-
-    let pids = collect_process_tree(leader_pid);
+) -> Option<ProcessTreeTelemetry> {
+    let pids = snapshot.tree_pids(leader_pid);
     if pids.is_empty() {
         return None;
     }
     let mut processes = Vec::new();
     let mut argvs = Vec::new();
     for pid in pids.into_iter().take(MAX_PROCESS_TREE_NODES) {
-        let Some((state, ppid)) = read_proc_stat(pid) else {
+        let Some(&(state, ppid)) = snapshot.stats.get(&pid) else {
             continue;
         };
         let (comm, argv) = read_proc_comm_argv(pid).unwrap_or_default();
@@ -367,16 +376,30 @@ fn inspect_pid(pid: u32) -> Option<spawn_core::agent_events::AgentEngine> {
     classify_process(&comm, &argv)
 }
 
+/// Combines `/proc` process verification (from `snapshot`) with screen and optional OSC 7501.
+pub(crate) fn observe_in(
+    snapshot: &ProcSnapshot,
+    leader_pid: Option<u32>,
+    raw_screen: &str,
+    osc_status: Option<&OscStatus>,
+) -> AgentReading {
+    let Some(pid) = leader_pid else {
+        return no_agent();
+    };
+    let pids = snapshot.tree_pids(pid);
+    let Some(agent) = detect_agent_in_pids(&pids) else {
+        return no_agent();
+    };
+    witness_screen(&agent, raw_screen, osc_status)
+}
+
 /// Combines `/proc` process verification with screen and optional OSC 7501 observation.
 pub(crate) fn observe(
     leader_pid: Option<u32>,
     raw_screen: &str,
     osc_status: Option<&OscStatus>,
 ) -> AgentReading {
-    let Some(agent) = leader_pid.and_then(detect_agent_in_tree) else {
-        return no_agent();
-    };
-    witness_screen(&agent, raw_screen, osc_status)
+    observe_in(&ProcSnapshot::capture(), leader_pid, raw_screen, osc_status)
 }
 
 /// Evaluates `raw_screen` and optional `osc_status` for a verified `agent`.
@@ -689,14 +712,19 @@ mod tests {
         assert_eq!(forged, no_agent());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn process_tree_telemetry_samples_live_pid_and_redacts_secrets() {
-        let tree = inspect_process_tree(std::process::id()).expect("live process tree");
+    fn process_tree_telemetry_samples_live_pid() {
+        let tree = inspect_process_tree_in(&ProcSnapshot::capture(), std::process::id())
+            .expect("live process tree");
         assert_eq!(tree.leader_pid, std::process::id());
         assert!(tree.process_count >= 1);
         assert_eq!(tree.child_count, tree.process_count.saturating_sub(1));
         assert!(!tree.processes.is_empty());
+    }
 
+    #[test]
+    fn sanitized_command_redacts_secrets_and_caps_length() {
         let sanitized = format_sanitized_command(
             "curl",
             &[

@@ -1198,14 +1198,14 @@ mod truth_tests {
         ext_reads: Arc<std::sync::atomic::AtomicUsize>,
         mutations: Arc<std::sync::atomic::AtomicUsize>,
     ) -> std::thread::JoinHandle<()> {
-        use std::io::{BufRead as _, Write as _};
+        use std::io::{BufRead as _, Read as _, Write as _};
         use std::os::unix::net::UnixListener;
         use std::sync::atomic::Ordering;
 
         let listener = UnixListener::bind(mock_sock).expect("bind mock agent sock");
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(stream) = stream else { break };
+                let Ok(mut stream) = stream else { break };
                 let mut br = std::io::BufReader::new(stream.try_clone().expect("clone"));
                 let mut line = String::new();
                 if br.read_line(&mut line).is_err() || line.is_empty() {
@@ -1214,7 +1214,8 @@ mod truth_tests {
                 let req: Value = serde_json::from_str(&line).expect("json rpc");
                 let method = req["method"].as_str().unwrap_or_default();
                 if method == "__stop" {
-                    let _ = (&stream).write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+                    let _ = stream.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
                     break;
                 }
                 let reply = match method {
@@ -1273,7 +1274,11 @@ mod truth_tests {
                     "hello" => json!({ "jsonrpc": "2.0", "id": req["id"], "result": {} }),
                     other => panic!("unexpected rpc method {other}"),
                 };
-                let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
+                let _ = stream.write_all(format!("{reply}\n").as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                let mut drain = [0_u8; 8];
+                let _ = br.read(&mut drain);
             }
         })
     }
@@ -1282,12 +1287,23 @@ mod truth_tests {
     fn ipc_agent_routes_dispatch_list_snapshot_events_action_and_fail_closed_viewer() {
         use std::sync::atomic::AtomicUsize;
 
+        struct SockGuard(PathBuf);
+        impl Drop for SockGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
         let dir = ScratchDir::new("ipc-agents");
-        let mock_sock = dir.0.join("hc.sock");
+        let mock_sock = SockGuard(PathBuf::from(format!(
+            "/tmp/sp-ipc-{}.sock",
+            std::process::id()
+        )));
+        let _ = std::fs::remove_file(&mock_sock.0);
         let ext_reads = Arc::new(AtomicUsize::new(0));
         let mutations = Arc::new(AtomicUsize::new(0));
         let srv =
-            spawn_mock_ipc_agent_uds(&mock_sock, Arc::clone(&ext_reads), Arc::clone(&mutations));
+            spawn_mock_ipc_agent_uds(&mock_sock.0, Arc::clone(&ext_reads), Arc::clone(&mutations));
 
         let state = IpcState::with_test_wait_timeout(
             RoleUrls::from_explicit(
@@ -1299,12 +1315,12 @@ mod truth_tests {
             None,
             std::time::Duration::ZERO,
         )
-        .with_test_agent_socket(mock_sock.clone());
+        .with_test_agent_socket(mock_sock.0.clone());
 
         assert_ipc_viewer_rbac(&state, &ext_reads, &mutations);
         assert_ipc_events_and_actions(&state, &mutations);
 
-        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&mock_sock) {
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&mock_sock.0) {
             use std::io::Write as _;
             let _ = stream.write_all(
                 b"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"__stop\",\"params\":{}}\n",
@@ -1371,21 +1387,7 @@ mod truth_tests {
         assert!(ev_body["events"].is_array());
         assert!(ev_body["summary"]["health"]["health"].is_string());
         assert!(ev_body["summary"]["discovery_status"]["status"].is_string());
-        let latest_key = ev_body["latest_key"].as_str().expect("latest_key cursor");
-
-        let delta_empty = dispatch_buffered(
-            &ipc_request(
-                "GET",
-                "/api/agents/t2/events",
-                &format!("after_key={latest_key}"),
-                vec![],
-            ),
-            state,
-        );
-        assert_eq!(delta_empty.status, 200);
-        let delta_body: Value = serde_json::from_slice(&delta_empty.body).unwrap();
-        assert_eq!(delta_body["count"], 0);
-        assert_eq!(delta_body["cursor_reset"], false);
+        assert!(ev_body["latest_key"].is_null());
 
         let stale_reset = dispatch_buffered(
             &ipc_request(

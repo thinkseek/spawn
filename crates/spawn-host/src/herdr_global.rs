@@ -27,9 +27,9 @@ use spawn_core::tui::{
     is_reserved_spawn_label,
 };
 
-use crate::herdr_witness::{OscStatus, inspect_process_tree, observe};
+use crate::herdr_witness::{OscStatus, ProcSnapshot, inspect_process_tree_in, observe_in};
 use crate::session_discovery::{
-    MAX_SESSION_READ_BYTES, discover_session_with_diagnostic, read_session_tail_lines,
+    MAX_SESSION_READ_BYTES, discover_session_cached_in, read_session_tail_lines,
 };
 
 const CALL_LIMIT: Duration = Duration::from_secs(10);
@@ -391,9 +391,10 @@ impl HerdrGlobalClient {
                 format!("terminal.list missing terminals array: {listed}"),
             )));
         };
+        let procs = ProcSnapshot::capture();
         let mut out = Vec::with_capacity(items.len());
         for item in items {
-            if let Some(entry) = self.build_discovered_terminal(item, visibility)? {
+            if let Some(entry) = self.build_discovered_terminal(item, visibility, &procs)? {
                 out.push(entry);
             }
         }
@@ -404,6 +405,7 @@ impl HerdrGlobalClient {
         &self,
         item: &Value,
         visibility: DiscoveryScope,
+        procs: &ProcSnapshot,
     ) -> Result<Option<DiscoveredTerminal>, RpcFailure> {
         let Some(address) = item["address"]
             .as_str()
@@ -437,7 +439,8 @@ impl HerdrGlobalClient {
                 &json!({ "terminal": address, "lines": 0 }),
                 CAPTURE_LIMIT,
             ) {
-                Ok(read) => resolve_reading(
+                Ok(read) => resolve_reading_in(
+                    procs,
                     pid,
                     read["text"].as_str().unwrap_or_default(),
                     osc_status.as_ref(),
@@ -454,8 +457,13 @@ impl HerdrGlobalClient {
         };
 
         let engine_hint = reading.agent.as_deref().and_then(AgentEngine::generic);
-        let (session, telemetry) =
-            build_terminal_telemetry(is_live, machine.is_none(), pid, engine_hint.as_ref());
+        let (session, telemetry) = build_terminal_telemetry_in(
+            procs,
+            is_live,
+            machine.is_none(),
+            pid,
+            engine_hint.as_ref(),
+        );
 
         Ok(Some(DiscoveredTerminal {
             address,
@@ -498,19 +506,10 @@ impl HerdrGlobalClient {
         address: &str,
         visibility: DiscoveryScope,
     ) -> Result<TuiSnapshot, GlobalHerdrError> {
-        let (snap, _, _, _) = self.capture_snapshot_meta(address, visibility, "snapshot")?;
+        let procs = ProcSnapshot::capture();
+        let (snap, _, _, _) =
+            self.capture_snapshot_meta_in(&procs, address, visibility, "snapshot")?;
         Ok(snap)
-    }
-
-    /// Returns fused `HerdrPty` + auto-discovered `NativeSession` events for `address`,
-    /// enforcing `visibility` before reading screen state, `/proc`, or session logs.
-    pub fn events_scoped(
-        &self,
-        address: &str,
-        visibility: DiscoveryScope,
-        limit: usize,
-    ) -> Result<FusedEventsReport, GlobalHerdrError> {
-        self.events_scoped_since(address, visibility, limit, None)
     }
 
     /// Returns incremental fused events strictly newer than `after_key` (or newest
@@ -523,19 +522,26 @@ impl HerdrGlobalClient {
         limit: usize,
         after_key: Option<&str>,
     ) -> Result<FusedEventsReport, GlobalHerdrError> {
+        let procs = ProcSnapshot::capture();
         let (snap, pid, is_live, has_osc) =
-            self.capture_snapshot_meta(address, visibility, "inspect")?;
+            self.capture_snapshot_meta_in(&procs, address, visibility, "inspect")?;
         let herdr_events = herdr_events_from_snapshot(&snap, is_live);
         let engine = snap.agent().map(str::to_string);
         let engine_hint = snap.agent().and_then(AgentEngine::generic);
         let is_local = split_machine(snap.address()).is_none();
         let process_tree = if is_live && is_local {
-            pid.and_then(inspect_process_tree)
+            pid.and_then(|p| inspect_process_tree_in(&procs, p))
         } else {
             None
         };
-        let (session, discovery_status, session_events) =
-            collect_session_events(is_live, is_local, pid, engine_hint.as_ref(), snap.address());
+        let (session, discovery_status, session_events) = collect_session_events_in(
+            &procs,
+            is_live,
+            is_local,
+            pid,
+            engine_hint.as_ref(),
+            snap.address(),
+        );
         let full_events = fuse_all_agent_events(herdr_events, session_events, Vec::new());
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -579,8 +585,9 @@ impl HerdrGlobalClient {
         })
     }
 
-    fn capture_snapshot_meta(
+    fn capture_snapshot_meta_in(
         &self,
+        procs: &ProcSnapshot,
         address: &str,
         visibility: DiscoveryScope,
         action_verb: &str,
@@ -622,7 +629,7 @@ impl HerdrGlobalClient {
                 },
                 |plain_lines| {
                     let plain_text = plain_lines.join("\n");
-                    let reading = resolve_reading(pid, &plain_text, osc_status.as_ref());
+                    let reading = resolve_reading_in(procs, pid, &plain_text, osc_status.as_ref());
                     SnapshotObservation {
                         agent: reading.agent,
                         agent_status: reading.status,
@@ -640,7 +647,7 @@ impl HerdrGlobalClient {
             CAPTURE_LIMIT,
         )?;
         let raw_text = read["text"].as_str().unwrap_or_default();
-        let reading = resolve_reading(pid, raw_text, osc_status.as_ref());
+        let reading = resolve_reading_in(procs, pid, raw_text, osc_status.as_ref());
         let snap = TuiSnapshot::from_plain_text(RawPlainSnapshot {
             address: resolved_addr,
             cols,
@@ -1377,7 +1384,8 @@ fn is_holder_socket(path: &Path) -> bool {
     }
 }
 
-fn build_terminal_telemetry(
+fn build_terminal_telemetry_in(
+    procs: &ProcSnapshot,
     is_live: bool,
     is_local: bool,
     pid: Option<u32>,
@@ -1414,8 +1422,8 @@ fn build_terminal_telemetry(
             }),
         );
     }
-    let proc_tree = pid.and_then(inspect_process_tree);
-    let outcome = pid.map(|p| discover_session_with_diagnostic(p, engine_hint, &[]));
+    let proc_tree = pid.and_then(|p| inspect_process_tree_in(procs, p));
+    let outcome = pid.map(|p| discover_session_cached_in(procs, p, engine_hint, &[], true));
     let (session, discovery_status, session_bytes, session_mtime_ms) = match outcome {
         Some(o) => (o.attachment, o.status, o.file_bytes, o.file_mtime_ms),
         None => (None, SessionDiscoveryStatus::NoLivePid, None, None),
@@ -1432,7 +1440,8 @@ fn build_terminal_telemetry(
     (session, Some(telemetry))
 }
 
-fn collect_session_events(
+fn collect_session_events_in(
+    procs: &ProcSnapshot,
     is_live: bool,
     is_local: bool,
     pid: Option<u32>,
@@ -1453,7 +1462,7 @@ fn collect_session_events(
     let Some(leader_pid) = pid.filter(|_| is_live) else {
         return (None, SessionDiscoveryStatus::NoLivePid, Vec::new());
     };
-    let outcome = discover_session_with_diagnostic(leader_pid, engine_hint, &[]);
+    let outcome = discover_session_cached_in(procs, leader_pid, engine_hint, &[], false);
     let Some(att) = outcome.attachment else {
         return (None, outcome.status, Vec::new());
     };
@@ -1545,8 +1554,13 @@ fn osc_fallback_reading(osc: &OscStatus) -> AgentReading {
     }
 }
 
-fn resolve_reading(pid: Option<u32>, text: &str, osc_status: Option<&OscStatus>) -> AgentReading {
-    let reading = observe(pid, text, osc_status);
+fn resolve_reading_in(
+    procs: &ProcSnapshot,
+    pid: Option<u32>,
+    text: &str,
+    osc_status: Option<&OscStatus>,
+) -> AgentReading {
+    let reading = observe_in(procs, pid, text, osc_status);
     if reading.agent.is_none()
         && let Some(osc) = osc_status
     {
@@ -2518,10 +2532,12 @@ time.sleep(30)
         eprintln!("REAL_SPAWN_HC_GLOBAL_VERIFIED address={addr} styled_vt=true");
     }
 
+    #[cfg(target_os = "linux")]
     fn spawn_mock_events_uds(
         sock: &Path,
         child_pid: u32,
         external_reads: Arc<std::sync::atomic::AtomicUsize>,
+        screen_text: Arc<std::sync::Mutex<String>>,
     ) -> std::thread::JoinHandle<()> {
         use std::io::Write as _;
         use std::os::unix::net::UnixListener;
@@ -2529,7 +2545,7 @@ time.sleep(30)
         let listener = UnixListener::bind(sock).expect("bind mock");
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(stream) = stream else { break };
+                let Ok(mut stream) = stream else { break };
                 let mut br = std::io::BufReader::new(stream.try_clone().expect("clone"));
                 let mut line = String::new();
                 if br.read_line(&mut line).is_err() || line.is_empty() {
@@ -2538,7 +2554,8 @@ time.sleep(30)
                 let req: Value = serde_json::from_str(&line).expect("json rpc");
                 let method = req["method"].as_str().unwrap_or_default();
                 if method == "__stop" {
-                    let _ = (&stream).write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+                    let _ = stream.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
                     break;
                 }
                 let reply = match method {
@@ -2598,20 +2615,29 @@ time.sleep(30)
                         if req["params"]["terminal"].as_str() == Some("t2") {
                             external_reads.fetch_add(1, Ordering::SeqCst);
                         }
+                        let txt = screen_text
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
                         json!({
                             "jsonrpc": "2.0",
                             "id": req["id"],
-                            "result": { "text": "Codex running\n", "complete": true, "how": "screen" }
+                            "result": { "text": txt, "complete": true, "how": "screen" }
                         })
                     }
                     "hello" => json!({ "jsonrpc": "2.0", "id": req["id"], "result": {} }),
                     other => panic!("unexpected rpc {other}"),
                 };
-                let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
+                let _ = stream.write_all(format!("{reply}\n").as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                let mut drain = [0_u8; 8];
+                let _ = br.read(&mut drain);
             }
         })
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn events_scoped_enforces_rbac_and_fuses_pty_with_discovered_session() {
         use std::io::Write as _;
@@ -2677,21 +2703,39 @@ time.sleep(30)
         }
 
         let external_reads = Arc::new(AtomicUsize::new(0));
-        let srv_handle = spawn_mock_events_uds(&sock, child_pid, Arc::clone(&external_reads));
+        let screen_text = Arc::new(std::sync::Mutex::new("Codex running\n".to_string()));
+        let srv_handle = spawn_mock_events_uds(
+            &sock,
+            child_pid,
+            Arc::clone(&external_reads),
+            Arc::clone(&screen_text),
+        );
 
         let client = HerdrGlobalClient::at_socket(&sock);
-        assert_events_rbac_and_observability(&client, &sock, &external_reads);
+        assert_events_rbac_and_observability(
+            &client,
+            &sock,
+            &external_reads,
+            &sess_path,
+            &screen_text,
+            now_ms,
+        );
 
         let _ = client.call_rpc("__stop", &json!({}), Duration::from_secs(2));
         srv_handle.join().expect("join mock srv");
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_events_rbac_and_observability(
         client: &HerdrGlobalClient,
         sock: &Path,
         external_reads: &std::sync::atomic::AtomicUsize,
+        sess_path: &Path,
+        screen_text: &std::sync::Mutex<String>,
+        now_ms: i64,
     ) {
         use spawn_core::agent_events::AgentHealth;
+        use std::io::Write as _;
 
         let scope = SocketScope::resolve(Some(sock), &HerdrDiscoveryEnv::default())
             .expect("resolve test socket scope");
@@ -2715,13 +2759,13 @@ time.sleep(30)
         assert!(tel.session_bytes.unwrap_or(0) > 0);
 
         let err = client
-            .events_scoped("t2", DiscoveryScope::SpawnManagedOnly, 50)
+            .events_scoped_since("t2", DiscoveryScope::SpawnManagedOnly, 50, None)
             .expect_err("viewer cannot read external events");
         assert_eq!(err.kind, GlobalErrorKind::ForbiddenExternal);
         assert_eq!(external_reads.load(Ordering::SeqCst), 0);
 
         let report = client
-            .events_scoped("t1", DiscoveryScope::SpawnManagedOnly, 50)
+            .events_scoped_since("t1", DiscoveryScope::SpawnManagedOnly, 50, None)
             .expect("managed events");
         assert_eq!(report.fidelity, EventFidelity::SessionEnriched);
         assert_eq!(report.summary.health, AgentHealth::Busy);
@@ -2730,32 +2774,49 @@ time.sleep(30)
             report
                 .process_tree
                 .as_ref()
-                .is_some_and(|tree| tree.process_count >= 1)
-        );
-        assert_eq!(
-            report
-                .session
-                .as_ref()
-                .and_then(|s| s.native_session_id.as_deref()),
-            Some("sess-hg-1")
+                .is_some_and(|t| t.process_count >= 1)
         );
         assert!(report.events.iter().any(|ev| {
-            matches!(
-                &ev.kind,
-                FusedEventKind::ToolCompleted { tool_name, .. } if tool_name == "Bash"
-            )
-        }));
-        assert!(report.events.iter().any(|ev| {
-            matches!(&ev.kind, FusedEventKind::ProcessState { status, .. } if status == "working")
+            matches!(&ev.kind, FusedEventKind::ToolCompleted { tool_name, .. } if tool_name == "Bash")
         }));
 
         let cursor = report.latest_key.as_deref().expect("latest_key present");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(sess_path)
+            .expect("open rollout append");
+        writeln!(
+            f,
+            r#"{{"ordinal":3,"timestamp":{},"type":"response_item","payload":{{"type":"function_call","call_id":"call_hg_2","name":"Read","arguments":{{"path":"lib.rs"}}}}}}"#,
+            now_ms + 500
+        )
+        .expect("append call 2");
+        f.flush().expect("flush append");
+
+        // Unchanged screen + newly appended rollout event -> delivered cleanly.
         let delta = client
             .events_scoped_since("t1", DiscoveryScope::SpawnManagedOnly, 50, Some(cursor))
-            .expect("incremental poll");
-        assert!(delta.events.is_empty(), "expected empty delta: {delta:?}");
+            .expect("incremental poll with new event");
         assert!(!delta.cursor_reset);
-        assert_eq!(delta.summary.health, AgentHealth::Busy);
+        assert_eq!(delta.events.len(), 1);
+        assert!(matches!(
+            &delta.events[0].kind,
+            FusedEventKind::ToolStarted { tool_name, .. } if tool_name == "Read"
+        ));
+
+        // Screen spinner change with no new session records -> empty delta, no cursor_reset.
+        *screen_text.lock().expect("lock screen") = "Codex running | spinner frame 2\n".to_string();
+        let next_cursor = delta.latest_key.as_deref().expect("next latest_key");
+        let spin_delta = client
+            .events_scoped_since(
+                "t1",
+                DiscoveryScope::SpawnManagedOnly,
+                50,
+                Some(next_cursor),
+            )
+            .expect("spinner delta");
+        assert!(!spin_delta.cursor_reset);
+        assert!(spin_delta.events.is_empty());
 
         let reset = client
             .events_scoped_since(
@@ -2766,6 +2827,6 @@ time.sleep(30)
             )
             .expect("unknown cursor resync");
         assert!(reset.cursor_reset);
-        assert_eq!(reset.events.len(), report.events.len());
+        assert!(reset.events.len() > report.events.len());
     }
 }

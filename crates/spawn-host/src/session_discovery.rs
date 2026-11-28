@@ -19,14 +19,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use spawn_core::agent_events::{
     AgentEngine, DiscoveryConfidence, SessionAttachment, SessionDiscoveryMethod,
     SessionDiscoveryStatus, SessionFileFormat, SniffedSessionMeta, sniff_session_metadata,
 };
 
-use crate::herdr_witness::collect_process_tree;
+use crate::herdr_witness::{ProcSnapshot, collect_process_tree};
 
 /// Hard cap on directory traversal depth below any candidate session root.
 const MAX_SCAN_DEPTH: usize = 8;
@@ -45,6 +46,15 @@ pub const MAX_SESSION_READ_BYTES: usize = 2 * 1024 * 1024;
 
 /// Grace slack before process start time for recently touched session logs.
 const START_MTIME_SLACK: Duration = Duration::from_secs(5);
+
+/// TTL for cached positive session file discovery hits (re-stat'd on read).
+const POSITIVE_CACHE_TTL: Duration = Duration::from_secs(15);
+
+/// TTL for cached negative misses on background list polls.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// Hard cap on entries stored in the process discovery cache.
+const MAX_CACHE_ENTRIES: usize = 256;
 
 /// Strict allowlist of non-secret directory environment keys inspected on target processes.
 /// Every other env key (credentials, API keys, DB URLs, tokens) is discarded immediately.
@@ -100,6 +110,151 @@ pub struct SessionDiscoveryOutcome {
     pub file_mtime_ms: Option<i64>,
 }
 
+#[derive(Clone)]
+struct CachedDiscoveryEntry {
+    engine_hint: Option<String>,
+    cached_at: Instant,
+    outcome: SessionDiscoveryOutcome,
+}
+
+static SESSION_CACHE: OnceLock<Mutex<BTreeMap<(u32, u64), CachedDiscoveryEntry>>> = OnceLock::new();
+
+fn session_cache() -> &'static Mutex<BTreeMap<(u32, u64), CachedDiscoveryEntry>> {
+    SESSION_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Cached variant of [`discover_session_with_diagnostic`] keyed by `(leader_pid, starttime_ticks)`.
+///
+/// Positive attachments stay cached up to 15s (always verifying file presence/size/mtime
+/// via a cheap `symlink_metadata` check); negative misses stay cached up to 5s only when
+/// `allow_negative_cache` is true (used by `/api/agents` list polling).
+#[must_use]
+pub fn discover_session_cached(
+    leader_pid: u32,
+    engine_hint: Option<&AgentEngine>,
+    explicit_roots: &[PathBuf],
+    allow_negative_cache: bool,
+) -> SessionDiscoveryOutcome {
+    discover_session_cached_in(
+        &ProcSnapshot::capture(),
+        leader_pid,
+        engine_hint,
+        explicit_roots,
+        allow_negative_cache,
+    )
+}
+
+/// Same as [`discover_session_cached`], reusing a pre-captured [`ProcSnapshot`].
+pub(crate) fn discover_session_cached_in(
+    snapshot: &ProcSnapshot,
+    leader_pid: u32,
+    engine_hint: Option<&AgentEngine>,
+    explicit_roots: &[PathBuf],
+    allow_negative_cache: bool,
+) -> SessionDiscoveryOutcome {
+    let hint_key = engine_hint.map(|e| e.as_str().to_string());
+    let (_, start_ticks) = read_proc_start_time_and_ticks(leader_pid);
+    if explicit_roots.is_empty()
+        && let Some(ticks) = start_ticks
+        && let Some(hit) =
+            try_cached_discovery(leader_pid, ticks, hint_key.as_deref(), allow_negative_cache)
+    {
+        return hit;
+    }
+    let outcome =
+        discover_session_in_pids(&snapshot.tree_pids(leader_pid), engine_hint, explicit_roots);
+    if explicit_roots.is_empty()
+        && let Some(ticks) = start_ticks
+    {
+        store_cached_discovery(leader_pid, ticks, hint_key, &outcome);
+    }
+    outcome
+}
+
+fn try_cached_discovery(
+    pid: u32,
+    start_ticks: u64,
+    hint_key: Option<&str>,
+    allow_negative_cache: bool,
+) -> Option<SessionDiscoveryOutcome> {
+    let mut cache = session_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = cache.get(&(pid, start_ticks))?.clone();
+    if entry.engine_hint.as_deref() != hint_key {
+        cache.remove(&(pid, start_ticks));
+        return None;
+    }
+    let age = entry.cached_at.elapsed();
+    if let Some(att) = entry.outcome.attachment {
+        if age < POSITIVE_CACHE_TTL
+            && let Some(refreshed) = revalidate_cached_attachment(&att)
+        {
+            return Some(refreshed);
+        }
+        cache.remove(&(pid, start_ticks));
+        return None;
+    }
+    if allow_negative_cache && age < NEGATIVE_CACHE_TTL {
+        return Some(entry.outcome);
+    }
+    cache.remove(&(pid, start_ticks));
+    None
+}
+
+fn revalidate_cached_attachment(att: &SessionAttachment) -> Option<SessionDiscoveryOutcome> {
+    let meta = fs::symlink_metadata(&att.path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+    let outcome = attached_outcome(att.clone());
+    if outcome.file_bytes == Some(0) {
+        return None;
+    }
+    Some(outcome)
+}
+
+fn store_cached_discovery(
+    pid: u32,
+    start_ticks: u64,
+    engine_hint: Option<String>,
+    outcome: &SessionDiscoveryOutcome,
+) {
+    if matches!(outcome.status, SessionDiscoveryStatus::NoLivePid) {
+        return;
+    }
+    let mut cache = session_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    if cache.len() >= MAX_CACHE_ENTRIES {
+        cache.retain(|_, v| {
+            let ttl = if v.outcome.attachment.is_some() {
+                POSITIVE_CACHE_TTL
+            } else {
+                NEGATIVE_CACHE_TTL
+            };
+            now.saturating_duration_since(v.cached_at) < ttl
+        });
+    }
+    if cache.len() >= MAX_CACHE_ENTRIES
+        && let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, v)| v.cached_at)
+            .map(|(k, _)| *k)
+    {
+        cache.remove(&oldest_key);
+    }
+    cache.insert(
+        (pid, start_ticks),
+        CachedDiscoveryEntry {
+            engine_hint,
+            cached_at: now,
+            outcome: outcome.clone(),
+        },
+    );
+}
+
 /// Discover a native session/transcript log for a live terminal rooted at `leader_pid`,
 /// returning structured attachment plus explicit discovery diagnostics and file stat metadata.
 #[must_use]
@@ -109,6 +264,14 @@ pub fn discover_session_with_diagnostic(
     explicit_roots: &[PathBuf],
 ) -> SessionDiscoveryOutcome {
     let pids = collect_process_tree(leader_pid);
+    discover_session_in_pids(&pids, engine_hint, explicit_roots)
+}
+
+fn discover_session_in_pids(
+    pids: &[u32],
+    engine_hint: Option<&AgentEngine>,
+    explicit_roots: &[PathBuf],
+) -> SessionDiscoveryOutcome {
     if pids.is_empty() {
         if !explicit_roots.is_empty() {
             return match discover_session_in_roots(
@@ -130,11 +293,11 @@ pub fn discover_session_with_diagnostic(
         };
     }
 
-    if let Some(open_fd) = discover_via_open_fds(&pids, engine_hint) {
+    if let Some(open_fd) = discover_via_open_fds(pids, engine_hint) {
         return attached_outcome(open_fd);
     }
 
-    let (cwd, env_roots, min_mtime) = collect_proc_context(&pids);
+    let (cwd, env_roots, min_mtime) = collect_proc_context(pids);
     let mut roots_checked = usize::from(!pids.is_empty()) + env_roots.len();
     if !env_roots.is_empty()
         && let Some(found) = discover_session_in_roots(
@@ -162,17 +325,6 @@ pub fn discover_session_with_diagnostic(
     }
 
     no_match_outcome(roots_checked)
-}
-
-/// Discover a native session/transcript log for a live terminal rooted at `leader_pid`,
-/// checking open FDs first, then process `cwd` + allowlisted env roots, then `explicit_roots`.
-#[must_use]
-pub fn discover_session_for_pid(
-    leader_pid: u32,
-    engine_hint: Option<&AgentEngine>,
-    explicit_roots: &[PathBuf],
-) -> Option<SessionAttachment> {
-    discover_session_with_diagnostic(leader_pid, engine_hint, explicit_roots).attachment
 }
 
 /// Scan `roots` (depth <= 5, symlinks skipped) for the best matching session file
@@ -316,6 +468,81 @@ fn discover_via_open_fds(
     best.map(|(_, _, att)| att)
 }
 
+fn parse_proc_stat_starttime_ticks(stat_text: &str) -> Option<u64> {
+    let after = stat_text.get(stat_text.rfind(')')? + 1..)?;
+    after.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+fn parse_proc_btime(proc_stat: &str) -> Option<u64> {
+    for line in proc_stat.lines() {
+        if let Some(rest) = line.strip_prefix("btime ") {
+            return rest.trim().parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+fn read_linux_clk_tck() -> u64 {
+    static CLK_TCK: OnceLock<u64> = OnceLock::new();
+    *CLK_TCK.get_or_init(|| {
+        let Ok(bytes) = fs::read("/proc/self/auxv") else {
+            return 100;
+        };
+        let word = std::mem::size_of::<usize>();
+        for entry in bytes.chunks_exact(2 * word) {
+            let Ok(k_bytes) = entry[..word].try_into() else {
+                break;
+            };
+            let Ok(v_bytes) = entry[word..].try_into() else {
+                break;
+            };
+            let key = usize::from_ne_bytes(k_bytes);
+            let val = usize::from_ne_bytes(v_bytes);
+            if key == 17 {
+                if let Ok(hz) = u64::try_from(val)
+                    && (1..=10_000).contains(&hz)
+                {
+                    return hz;
+                }
+                break;
+            }
+            if key == 0 {
+                break;
+            }
+        }
+        100
+    })
+}
+
+fn read_linux_btime() -> Option<u64> {
+    static BTIME: OnceLock<Option<u64>> = OnceLock::new();
+    *BTIME.get_or_init(|| {
+        fs::read_to_string("/proc/stat")
+            .ok()
+            .and_then(|s| parse_proc_btime(&s))
+    })
+}
+
+fn read_proc_start_time_and_ticks(pid: u32) -> (Option<SystemTime>, Option<u64>) {
+    let stat_text = fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+    let ticks = stat_text
+        .as_deref()
+        .and_then(parse_proc_stat_starttime_ticks);
+    let btime = read_linux_btime();
+    if let (Some(ticks), Some(btime)) = (ticks, btime) {
+        let hz = read_linux_clk_tck().max(1);
+        let secs = btime.saturating_add(ticks / hz);
+        let rem_ticks = ticks % hz;
+        let nanos =
+            u32::try_from((u128::from(rem_ticks) * 1_000_000_000) / u128::from(hz)).unwrap_or(0);
+        return (Some(UNIX_EPOCH + Duration::new(secs, nanos)), Some(ticks));
+    }
+    let dir_mtime = fs::symlink_metadata(format!("/proc/{pid}"))
+        .ok()
+        .and_then(|m| m.modified().ok());
+    (dir_mtime, ticks)
+}
+
 fn collect_proc_context(pids: &[u32]) -> (Option<PathBuf>, Vec<PathBuf>, Option<SystemTime>) {
     let mut cwd: Option<PathBuf> = None;
     let mut env_dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
@@ -331,9 +558,8 @@ fn collect_proc_context(pids: &[u32]) -> (Option<PathBuf>, Vec<PathBuf>, Option<
         if let Ok(bytes) = fs::read(format!("/proc/{pid}/environ")) {
             extract_allowlisted_env_dirs(&bytes, &mut env_dirs);
         }
-        if let Ok(meta) = fs::symlink_metadata(format!("/proc/{pid}/stat"))
-            && let Ok(created) = meta.modified()
-        {
+        let (started, _) = read_proc_start_time_and_ticks(pid);
+        if let Some(created) = started {
             earliest_start = Some(match earliest_start {
                 None => created,
                 Some(prev) => prev.min(created),
@@ -561,15 +787,20 @@ fn extract_session_id_from_path(path: &Path, format: SessionFileFormat) -> Optio
             is_safe_session_token(stem).then(|| stem.to_string())
         }
         SessionFileFormat::CodexRolloutJsonl => {
+            let file_name = path.file_name()?.to_str()?;
             let stem = path.file_stem()?.to_str()?;
             if let Some(after) = stem.strip_prefix("rollout-") {
                 let bytes = after.as_bytes();
                 if bytes.len() > 20 && bytes[10] == b'T' && bytes[19] == b'-' {
                     let cand = &after[20..];
-                    return is_safe_session_token(cand).then(|| cand.to_string());
+                    return (is_safe_session_token(cand)
+                        && spawn_core::driver_codex::is_codex_rollout_filename(file_name, cand))
+                    .then(|| cand.to_string());
                 }
             }
-            is_safe_session_token(stem).then(|| stem.to_string())
+            (is_safe_session_token(stem)
+                && spawn_core::driver_codex::is_codex_rollout_filename(file_name, stem))
+            .then(|| stem.to_string())
         }
         SessionFileFormat::OpenCodeJsonl | SessionFileFormat::GenericJsonl => None,
     }
@@ -736,8 +967,19 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn live_open_fd_discovery_finds_session_without_any_path_hints() {
+        use std::io::BufRead as _;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
         let dir = TempDir::new("open-fd");
         let log_path = dir.0.join("custom-location-rollout.jsonl");
         let mut f = File::create(&log_path).expect("create session log");
@@ -747,11 +989,29 @@ mod tests {
         )
         .expect("write header");
         f.flush().expect("flush");
+        drop(f);
 
-        // Keep `f` open in this process and discover via `/proc/<pid>/fd`.
-        let discovered =
-            discover_session_for_pid(std::process::id(), Some(&AgentEngine::Codex), &[])
-                .expect("must discover open session fd");
+        // Spawn an isolated child process holding ONLY `log_path` open so sibling test threads never race.
+        let mut child = ChildGuard(
+            std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    "import sys,time; f=open(sys.argv[1],'r'); sys.stdout.write('READY\\n'); sys.stdout.flush(); time.sleep(30)",
+                    log_path.to_str().expect("utf8 path"),
+                ])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn isolated fd holder"),
+        );
+        let child_pid = child.0.id();
+        if let Some(ref mut out) = child.0.stdout {
+            let mut br = BufReader::new(out);
+            let mut ready = String::new();
+            let _ = br.read_line(&mut ready);
+        }
+
+        let outcome = discover_session_with_diagnostic(child_pid, Some(&AgentEngine::Codex), &[]);
+        let discovered = outcome.attachment.expect("must discover open session fd");
         assert_eq!(discovered.method, SessionDiscoveryMethod::ProcessOpenFd);
         assert_eq!(discovered.confidence, DiscoveryConfidence::ExactFd);
         assert_eq!(discovered.format, SessionFileFormat::CodexRolloutJsonl);
@@ -931,5 +1191,72 @@ mod tests {
             diag.status,
             SessionDiscoveryStatus::NoMatchingSessionFile { scanned_roots: 1 }
         ));
+    }
+
+    #[test]
+    fn parses_proc_stat_starttime_even_with_parens_in_comm_and_btime() {
+        let tricky_stat = "4242 (my (agent) bin) S 1 4242 4242 0 -1 4194304 100 0 0 0 1 2 0 0 20 0 1 0 9876543 1024 10";
+        assert_eq!(
+            parse_proc_stat_starttime_ticks(tricky_stat),
+            Some(9_876_543)
+        );
+
+        let proc_stat = "cpu  1 2 3 4\nintr 0\nbtime 1700000000\nprocesses 100\n";
+        assert_eq!(parse_proc_btime(proc_stat), Some(1_700_000_000));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cached_discovery_hits_on_live_pid_and_invalidates_when_file_removed() {
+        use std::io::BufRead as _;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = TempDir::new("cache-inv");
+        let log_path = dir.0.join("rollout-2026-11-28T10-00-00-cache-1.jsonl");
+        fs::write(
+            &log_path,
+            "{\"ordinal\":0,\"timestamp\":\"2026-11-28T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"cache-1\",\"cwd\":\"/tmp\"}}\n",
+        )
+        .unwrap();
+
+        let mut child = ChildGuard(
+            std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    "import sys,time; f=open(sys.argv[1],'r'); sys.stdout.write('READY\\n'); sys.stdout.flush(); time.sleep(30)",
+                    log_path.to_str().expect("utf8"),
+                ])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn cache child"),
+        );
+        let pid = child.0.id();
+        if let Some(ref mut out) = child.0.stdout {
+            let mut br = BufReader::new(out);
+            let mut ready = String::new();
+            let _ = br.read_line(&mut ready);
+        }
+
+        let first = discover_session_cached(pid, Some(&AgentEngine::Codex), &[], true);
+        assert_eq!(
+            first
+                .attachment
+                .as_ref()
+                .and_then(|a| a.native_session_id.as_deref()),
+            Some("cache-1")
+        );
+        let second = discover_session_cached(pid, Some(&AgentEngine::Codex), &[], true);
+        assert_eq!(second.attachment, first.attachment);
+
+        fs::remove_file(&log_path).expect("remove log file");
+        let after_rm = discover_session_cached(pid, Some(&AgentEngine::Codex), &[], false);
+        assert!(after_rm.attachment.is_none());
     }
 }

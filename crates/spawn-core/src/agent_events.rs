@@ -875,10 +875,18 @@ pub fn sniff_session_metadata(head_lines: &[&str]) -> Option<SniffedSessionMeta>
     best
 }
 
-/// Sniff only the [`SessionFileFormat`] from candidate session head lines.
+#[cfg(test)]
 #[must_use]
-pub fn sniff_session_format(head_lines: &[&str]) -> Option<SessionFileFormat> {
+fn sniff_session_format(head_lines: &[&str]) -> Option<SessionFileFormat> {
     sniff_session_metadata(head_lines).map(|m| m.format)
+}
+
+fn stable_line_fallback(prefix: &str, ts: Option<i64>, raw_line: &str) -> String {
+    let hash = fnv1a_hex(raw_line);
+    match ts {
+        Some(t) => format!("{prefix}:t{t}:{hash}"),
+        None => format!("{prefix}:h:{hash}"),
+    }
 }
 
 fn make_session_event(
@@ -901,7 +909,6 @@ fn make_session_event(
 
 fn parse_claude_line(
     obj: &Value,
-    line_num: usize,
     raw_line: &str,
     addr: Option<&str>,
     fallback_sid: Option<&str>,
@@ -910,7 +917,7 @@ fn parse_claude_line(
     let ts = timestamp_ms_from_value(obj);
     let sid = non_empty_str(obj.get("sessionId")).or_else(|| fallback_sid.map(str::to_string));
     let base_key = non_empty_str(obj.get("uuid"))
-        .unwrap_or_else(|| format!("claude:{line_num}:{}", fnv1a_hex(raw_line)));
+        .unwrap_or_else(|| stable_line_fallback("claude", ts, raw_line));
 
     match obj.get("type").and_then(Value::as_str) {
         Some("user") => parse_claude_user(obj, ts, &base_key, sid, addr, &mut out),
@@ -1091,6 +1098,7 @@ fn parse_claude_assistant(
         obj.pointer("/message/model")
             .or_else(|| obj.get("requestedModel")),
     );
+    let message_id = non_empty_str(obj.pointer("/message/id"));
     let thinking_ms = obj.get("thinkingDurationMs").and_then(Value::as_u64);
     let ctx = LineEventCtx {
         ts,
@@ -1104,18 +1112,22 @@ fn parse_claude_assistant(
         }
     }
     if let Some(usage) = obj.pointer("/message/usage") {
-        parse_claude_assistant_usage(usage, model, &ctx, out);
+        parse_claude_assistant_usage(usage, message_id.as_deref(), model, &ctx, out);
     }
     if let Some(reason @ ("end_turn" | "max_tokens")) =
         obj.pointer("/message/stop_reason").and_then(Value::as_str)
     {
+        let stop_source = message_id.as_deref().map_or_else(
+            || format!("{base_key}:stop"),
+            |mid| format!("claude:msg:{mid}:stop"),
+        );
         out.push(make_session_event(
             &CanonicalEventKey::NativeRecord {
-                source_id: format!("{base_key}:stop"),
+                source_id: stop_source,
             },
             ts,
             FusedEventKind::TurnCompleted {
-                turn_id: non_empty_str(obj.pointer("/message/id")),
+                turn_id: message_id,
                 duration_ms: thinking_ms,
                 error: (reason == "max_tokens").then(|| "max_tokens".to_string()),
             },
@@ -1208,6 +1220,7 @@ fn parse_claude_assistant_block(
 
 fn parse_claude_assistant_usage(
     usage: &Value,
+    message_id: Option<&str>,
     model: Option<String>,
     ctx: &LineEventCtx<'_>,
     out: &mut Vec<FusedAgentEvent>,
@@ -1229,10 +1242,12 @@ fn parse_claude_assistant_usage(
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if (input, output, cache_read, cache_write) != (0, 0, 0, 0) {
+        let source_id = message_id.map_or_else(
+            || format!("{}:usage", ctx.line_key),
+            |mid| format!("claude:msg:{mid}:usage"),
+        );
         out.push(make_session_event(
-            &CanonicalEventKey::NativeRecord {
-                source_id: format!("{}:usage", ctx.line_key),
-            },
+            &CanonicalEventKey::NativeRecord { source_id },
             ctx.ts,
             FusedEventKind::UsageRecorded {
                 model,
@@ -1297,7 +1312,6 @@ fn parse_claude_cost_usage(obj: &Value) -> Option<FusedEventKind> {
 
 fn parse_codex_rollout_line(
     obj: &Value,
-    line_num: usize,
     raw_line: &str,
     addr: Option<&str>,
     fallback_sid: Option<&str>,
@@ -1307,11 +1321,10 @@ fn parse_codex_rollout_line(
     let payload = obj.get("payload");
     let sid = non_empty_str(payload.and_then(|p| p.get("session_id").or_else(|| p.get("id"))))
         .or_else(|| fallback_sid.map(str::to_string));
-    let ord = obj
-        .get("ordinal")
-        .and_then(Value::as_u64)
-        .map_or_else(|| format!("l{line_num}"), |n| format!("o{n}"));
-    let line_id = format!("codex:{ord}:{}", fnv1a_hex(raw_line));
+    let line_id = obj.get("ordinal").and_then(Value::as_u64).map_or_else(
+        || stable_line_fallback("codex", ts, raw_line),
+        |n| format!("codex:o{n}:{}", fnv1a_hex(raw_line)),
+    );
     let ctx = LineEventCtx {
         ts,
         line_key: &line_id,
@@ -1727,18 +1740,17 @@ fn parse_codex_tool_output(p: &Value, ctx: &LineEventCtx<'_>, out: &mut Vec<Fuse
 
 fn parse_agy_line(
     obj: &Value,
-    line_num: usize,
+    raw_line: &str,
     addr: Option<&str>,
     fallback_sid: Option<&str>,
 ) -> Vec<FusedAgentEvent> {
     let mut out = Vec::new();
     let ts = timestamp_ms_from_value(obj);
     let sid = non_empty_str(obj.get("session_id")).or_else(|| fallback_sid.map(str::to_string));
-    let step = obj
-        .get("step_index")
-        .and_then(Value::as_u64)
-        .unwrap_or(line_num as u64);
-    let base_key = format!("agy:{step}");
+    let base_key = obj.get("step_index").and_then(Value::as_u64).map_or_else(
+        || stable_line_fallback("agy", ts, raw_line),
+        |s| format!("agy:{s}"),
+    );
     let ctx = LineEventCtx {
         ts,
         line_key: &base_key,
@@ -1943,7 +1955,6 @@ fn parse_agy_planner_response(obj: &Value, ctx: &LineEventCtx<'_>, out: &mut Vec
 
 fn parse_generic_line(
     obj: &Value,
-    line_num: usize,
     raw_line: &str,
     addr: Option<&str>,
     fallback_sid: Option<&str>,
@@ -1957,7 +1968,7 @@ fn parse_generic_line(
     )
     .or_else(|| fallback_sid.map(str::to_string));
     let key = non_empty_str(obj.get("id").or_else(|| obj.get("uuid")))
-        .unwrap_or_else(|| format!("gen:{line_num}:{}", fnv1a_hex(raw_line)));
+        .unwrap_or_else(|| stable_line_fallback("gen", ts, raw_line));
 
     if let Some(tool) = non_empty_str(
         obj.get("tool")
@@ -2019,7 +2030,7 @@ pub fn parse_session_lines(
     fallback_session_id: Option<&str>,
 ) -> Vec<FusedAgentEvent> {
     let mut out = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -2027,38 +2038,70 @@ pub fn parse_session_lines(
         let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        let line_num = idx + 1;
         let parsed = match format {
-            SessionFileFormat::ClaudeJsonl => parse_claude_line(
-                &obj,
-                line_num,
-                trimmed,
-                terminal_address,
-                fallback_session_id,
-            ),
-            SessionFileFormat::CodexRolloutJsonl => parse_codex_rollout_line(
-                &obj,
-                line_num,
-                trimmed,
-                terminal_address,
-                fallback_session_id,
-            ),
+            SessionFileFormat::ClaudeJsonl => {
+                parse_claude_line(&obj, trimmed, terminal_address, fallback_session_id)
+            }
+            SessionFileFormat::CodexRolloutJsonl => {
+                parse_codex_rollout_line(&obj, trimmed, terminal_address, fallback_session_id)
+            }
             SessionFileFormat::AgyFullJsonl => {
-                parse_agy_line(&obj, line_num, terminal_address, fallback_session_id)
+                parse_agy_line(&obj, trimmed, terminal_address, fallback_session_id)
             }
             SessionFileFormat::OpenCodeJsonl | SessionFileFormat::GenericJsonl => {
-                parse_generic_line(
-                    &obj,
-                    line_num,
-                    trimmed,
-                    terminal_address,
-                    fallback_session_id,
-                )
+                parse_generic_line(&obj, trimmed, terminal_address, fallback_session_id)
             }
         };
         out.extend(parsed);
     }
+    let mut out = dedup_usage_records(out);
     correlate_tool_names(&mut out);
+    out
+}
+
+fn merge_usage_kind(existing: &mut FusedEventKind, incoming: FusedEventKind) {
+    if let (
+        FusedEventKind::UsageRecorded {
+            model: ex_model,
+            input_tokens: ex_in,
+            output_tokens: ex_out,
+            cache_read_tokens: ex_cr,
+            cache_write_tokens: ex_cw,
+        },
+        FusedEventKind::UsageRecorded {
+            model: in_model,
+            input_tokens: in_in,
+            output_tokens: in_out,
+            cache_read_tokens: in_cr,
+            cache_write_tokens: in_cw,
+        },
+    ) = (existing, incoming)
+    {
+        if in_model.is_some() {
+            *ex_model = in_model;
+        }
+        *ex_in = (*ex_in).max(in_in);
+        *ex_out = (*ex_out).max(in_out);
+        *ex_cr = (*ex_cr).max(in_cr);
+        *ex_cw = (*ex_cw).max(in_cw);
+    }
+}
+
+fn dedup_usage_records(events: Vec<FusedAgentEvent>) -> Vec<FusedAgentEvent> {
+    let mut out: Vec<FusedAgentEvent> = Vec::with_capacity(events.len());
+    let mut seen_usage: BTreeMap<String, usize> = BTreeMap::new();
+    for ev in events {
+        if matches!(ev.kind, FusedEventKind::UsageRecorded { .. }) {
+            if let Some(&idx) = seen_usage.get(&ev.canonical_key) {
+                merge_event(&mut out[idx], ev);
+            } else {
+                seen_usage.insert(ev.canonical_key.clone(), out.len());
+                out.push(ev);
+            }
+        } else {
+            out.push(ev);
+        }
+    }
     out
 }
 
@@ -2101,18 +2144,31 @@ fn merge_event(existing: &mut FusedAgentEvent, incoming: FusedAgentEvent) {
     } else if incoming.fidelity > existing.fidelity {
         existing.fidelity = incoming.fidelity;
     }
-    if existing.timestamp_ms.is_none() {
-        existing.timestamp_ms = incoming.timestamp_ms;
-    }
+    existing.timestamp_ms = match (existing.timestamp_ms, incoming.timestamp_ms) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
     if existing.session_id.is_none() {
         existing.session_id = incoming.session_id;
     }
     if existing.terminal_address.is_none() {
         existing.terminal_address = incoming.terminal_address;
     }
-    if incoming.kind.richness_score() > existing.kind.richness_score() {
+    if matches!(existing.kind, FusedEventKind::UsageRecorded { .. })
+        && matches!(incoming.kind, FusedEventKind::UsageRecorded { .. })
+    {
+        merge_usage_kind(&mut existing.kind, incoming.kind);
+    } else if incoming.kind.richness_score() > existing.kind.richness_score() {
         existing.kind = incoming.kind;
     }
+}
+
+/// Return `true` when `ev` originates from a durable session or control-plane record
+/// and may anchor incremental `after_key` cursors (never transient PTY screens).
+#[must_use]
+pub fn is_cursor_anchor_event(ev: &FusedAgentEvent) -> bool {
+    ev.origins.contains(&EventOrigin::NativeSession)
+        || ev.origins.contains(&EventOrigin::SpawnControl)
 }
 
 /// Fuse live `HerdrPty`, `NativeSession`, and `SpawnControl` streams via union,
@@ -2142,7 +2198,13 @@ pub fn fuse_all_agent_events(
     }
 
     let mut merged: Vec<(usize, FusedAgentEvent)> = by_key.into_values().collect();
-    merged.sort_by_key(|(order, ev)| (ev.timestamp_ms.unwrap_or(i64::MAX), *order));
+    merged.sort_by_key(|(order, ev)| {
+        (
+            !is_cursor_anchor_event(ev),
+            ev.timestamp_ms.unwrap_or(i64::MAX),
+            *order,
+        )
+    });
     let mut events: Vec<FusedAgentEvent> = merged.into_iter().map(|(_, ev)| ev).collect();
     correlate_tool_names(&mut events);
     events
@@ -2150,35 +2212,45 @@ pub fn fuse_all_agent_events(
 
 /// Slice a chronological fused event list strictly after `after_key` and keep at
 /// most `limit` newest events, returning `(events, latest_key, truncated, cursor_reset)`.
+///
+/// The `latest_key` cursor is anchored strictly to durable session/control events
+/// so transient screen updates neither hide newly appended session records nor
+/// trigger spurious `cursor_reset` window replays on spinner churn.
 #[must_use]
 pub fn slice_events_after_key(
-    mut events: Vec<FusedAgentEvent>,
+    events: Vec<FusedAgentEvent>,
     after_key: Option<&str>,
     limit: usize,
 ) -> (Vec<FusedAgentEvent>, Option<String>, bool, bool) {
-    let latest_key = events.last().map(|ev| ev.canonical_key.clone());
+    let (mut durable, transient): (Vec<FusedAgentEvent>, Vec<FusedAgentEvent>) =
+        events.into_iter().partition(is_cursor_anchor_event);
+    let latest_key = durable.last().map(|ev| ev.canonical_key.clone());
     let effective_limit = limit.max(1);
     let mut cursor_reset = false;
-    if let Some(cursor) = after_key.filter(|k| !k.is_empty()) {
-        if let Some(pos) = events.iter().rposition(|ev| ev.canonical_key == cursor) {
-            events.drain(..=pos);
+    let mut out = if let Some(cursor) = after_key.filter(|k| !k.is_empty()) {
+        if let Some(pos) = durable.iter().rposition(|ev| ev.canonical_key == cursor) {
+            durable.drain(..=pos);
+            durable
         } else {
             cursor_reset = true;
+            durable.extend(transient);
+            durable
         }
-    }
-    let truncated = events.len() > effective_limit;
+    } else {
+        durable.extend(transient);
+        durable
+    };
+    let truncated = out.len() > effective_limit;
     if truncated {
-        let drop_count = events.len() - effective_limit;
-        events.drain(..drop_count);
+        let drop_count = out.len() - effective_limit;
+        out.drain(..drop_count);
     }
-    (events, latest_key, truncated, cursor_reset)
+    (out, latest_key, truncated, cursor_reset)
 }
 
-/// Fuse live `HerdrPty`, `NativeSession`, and `SpawnControl` streams via union,
-/// deduplication on `canonical_key`, cross-event correlation, and tail truncation
-/// keeping the newest `limit` events (preserving chronological output order).
+#[cfg(test)]
 #[must_use]
-pub fn fuse_agent_events(
+fn fuse_agent_events(
     herdr_events: Vec<FusedAgentEvent>,
     session_events: Vec<FusedAgentEvent>,
     control_events: Vec<FusedAgentEvent>,
@@ -2198,7 +2270,7 @@ struct SummaryAccum {
     error_count: usize,
     blocked_count: usize,
     in_flight_tools: Vec<InFlightTool>,
-    usage_totals: UsageTotals,
+    usage_by_key: BTreeMap<String, FusedEventKind>,
     first_event_at_ms: Option<i64>,
     last_event_at_ms: Option<i64>,
     last_tool_name: Option<String>,
@@ -2227,7 +2299,9 @@ fn accumulate_event(acc: &mut SummaryAccum, ev: &FusedAgentEvent) {
         FusedEventKind::ToolStarted { .. } | FusedEventKind::ToolCompleted { .. } => {
             accumulate_tool_event(acc, ev);
         }
-        FusedEventKind::UsageRecorded { .. } => accumulate_usage_event(acc, &ev.kind),
+        FusedEventKind::UsageRecorded { .. } => {
+            accumulate_usage_event(acc, &ev.canonical_key, &ev.kind);
+        }
         FusedEventKind::PromptBlocked { .. } => {
             acc.blocked_count += 1;
         }
@@ -2317,32 +2391,40 @@ fn accumulate_tool_event(acc: &mut SummaryAccum, ev: &FusedAgentEvent) {
     }
 }
 
-fn accumulate_usage_event(acc: &mut SummaryAccum, kind: &FusedEventKind) {
-    if let FusedEventKind::UsageRecorded {
-        model,
-        input_tokens,
-        output_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-    } = kind
-    {
-        if let Some(m) = model {
-            acc.usage_totals.last_model = Some(m.clone());
-        }
-        acc.usage_totals.input_tokens = acc.usage_totals.input_tokens.saturating_add(*input_tokens);
-        acc.usage_totals.output_tokens = acc
-            .usage_totals
-            .output_tokens
-            .saturating_add(*output_tokens);
-        acc.usage_totals.cache_read_tokens = acc
-            .usage_totals
-            .cache_read_tokens
-            .saturating_add(*cache_read_tokens);
-        acc.usage_totals.cache_write_tokens = acc
-            .usage_totals
-            .cache_write_tokens
-            .saturating_add(*cache_write_tokens);
+fn accumulate_usage_event(acc: &mut SummaryAccum, key: &str, kind: &FusedEventKind) {
+    if !matches!(kind, FusedEventKind::UsageRecorded { .. }) {
+        return;
     }
+    if let Some(existing) = acc.usage_by_key.get_mut(key) {
+        merge_usage_kind(existing, kind.clone());
+    } else {
+        acc.usage_by_key.insert(key.to_string(), kind.clone());
+    }
+}
+
+fn fold_usage_totals(usage_by_key: &BTreeMap<String, FusedEventKind>) -> UsageTotals {
+    let mut totals = UsageTotals::default();
+    for kind in usage_by_key.values() {
+        if let FusedEventKind::UsageRecorded {
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        } = kind
+        {
+            if let Some(m) = model {
+                totals.last_model = Some(m.clone());
+            }
+            totals.input_tokens = totals.input_tokens.saturating_add(*input_tokens);
+            totals.output_tokens = totals.output_tokens.saturating_add(*output_tokens);
+            totals.cache_read_tokens = totals.cache_read_tokens.saturating_add(*cache_read_tokens);
+            totals.cache_write_tokens = totals
+                .cache_write_tokens
+                .saturating_add(*cache_write_tokens);
+        }
+    }
+    totals
 }
 
 fn derive_agent_health(input: &SummaryInput<'_>, acc: &SummaryAccum) -> AgentHealth {
@@ -2413,7 +2495,7 @@ pub fn summarize_agent_observability(input: &SummaryInput<'_>) -> AgentObservabi
         error_count: acc.error_count,
         blocked_count: acc.blocked_count,
         in_flight_tools: acc.in_flight_tools,
-        usage_totals: acc.usage_totals,
+        usage_totals: fold_usage_totals(&acc.usage_by_key),
         first_event_at_ms: acc.first_event_at_ms,
         last_event_at_ms: acc.last_event_at_ms,
         last_tool_name: acc.last_tool_name,
@@ -2806,5 +2888,178 @@ mod tests {
             slice_events_after_key(events, Some("nonexistent-cursor"), 2);
         assert!(cursor_reset);
         assert_eq!(reset_slice.len(), 2);
+    }
+
+    fn make_screen_state_event(digest: u64, rule: &str) -> FusedAgentEvent {
+        FusedAgentEvent {
+            canonical_key: CanonicalEventKey::ScreenSignal {
+                digest,
+                rule: rule.to_string(),
+            }
+            .canonical_string(),
+            timestamp_ms: None,
+            fidelity: EventFidelity::ScreenOnly,
+            origins: BTreeSet::from([EventOrigin::HerdrPty]),
+            kind: FusedEventKind::ProcessState {
+                status: "working".to_string(),
+                rule: Some(rule.to_string()),
+            },
+            session_id: None,
+            terminal_address: Some("t1".to_string()),
+        }
+    }
+
+    #[test]
+    fn incremental_cursor_handles_unchanged_screen_and_spinner_churn() {
+        let line1 = [
+            r#"{"ordinal":0,"timestamp":"2026-11-28T10:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/ws"}}"#,
+        ];
+        let rec1 = parse_session_lines(
+            SessionFileFormat::CodexRolloutJsonl,
+            &line1,
+            Some("t1"),
+            None,
+        );
+        let init_fused = fuse_all_agent_events(
+            vec![make_screen_state_event(7, "state:working")],
+            rec1.clone(),
+            Vec::new(),
+        );
+        let (init_slice, cur1, _, init_reset) = slice_events_after_key(init_fused, None, 50);
+        assert!(!init_reset);
+        assert_eq!(cur1.as_deref(), Some(rec1[0].canonical_key.as_str()));
+        assert_eq!(init_slice.len(), 2);
+
+        // (a) Screen digest unchanged (=7), new session event arrives -> delivered strictly, no loss.
+        let both_lines = [
+            line1[0],
+            r#"{"ordinal":1,"timestamp":"2026-11-28T10:00:05Z","type":"response_item","payload":{"type":"function_call","call_id":"call_a","name":"Bash","arguments":{}}}"#,
+        ];
+        let recs2 = parse_session_lines(
+            SessionFileFormat::CodexRolloutJsonl,
+            &both_lines,
+            Some("t1"),
+            None,
+        );
+        let fused2 = fuse_all_agent_events(
+            vec![make_screen_state_event(7, "state:working")],
+            recs2.clone(),
+            Vec::new(),
+        );
+        let (delta_a, cur2, _, reset_a) = slice_events_after_key(fused2, cur1.as_deref(), 50);
+        assert!(!reset_a);
+        assert_eq!(delta_a.len(), 1);
+        assert_eq!(delta_a[0].canonical_key, recs2[1].canonical_key);
+        assert_eq!(cur2.as_deref(), Some(recs2[1].canonical_key.as_str()));
+
+        // (b) Spinner churn changes screen digest (7 -> 8) with no new session events -> empty delta, no reset.
+        let fused_spin = fuse_all_agent_events(
+            vec![make_screen_state_event(8, "state:working")],
+            recs2,
+            Vec::new(),
+        );
+        let (delta_b, cur3, _, reset_b) = slice_events_after_key(fused_spin, cur2.as_deref(), 50);
+        assert!(!reset_b);
+        assert!(delta_b.is_empty());
+        assert_eq!(cur3, cur2);
+
+        // (c) Pure screen-only terminal yields `latest_key = None`.
+        let screen_only = fuse_all_agent_events(
+            vec![make_screen_state_event(9, "state:idle")],
+            Vec::new(),
+            Vec::new(),
+        );
+        let (_, cur_none, _, _) = slice_events_after_key(screen_only, None, 50);
+        assert!(cur_none.is_none());
+    }
+
+    #[test]
+    fn claude_split_assistant_message_deduplicates_usage_by_message_id() {
+        let lines = [
+            r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-11-28T10:00:00Z","message":{"id":"msg_split_1","model":"claude-sonnet-4","content":[{"type":"thinking","thinking":"step 1"}],"usage":{"input_tokens":1000,"output_tokens":5,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}"#,
+            r#"{"type":"assistant","uuid":"u2","sessionId":"s1","timestamp":"2026-11-28T10:00:01Z","message":{"id":"msg_split_1","model":"claude-sonnet-4","content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"cmd":"ls"}}],"usage":{"input_tokens":1000,"output_tokens":40,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}"#,
+            r#"{"type":"assistant","uuid":"u3","sessionId":"s1","timestamp":"2026-11-28T10:00:02Z","message":{"id":"msg_split_1","model":"claude-sonnet-4","stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":1000,"output_tokens":85,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}"#,
+            r#"{"type":"assistant","uuid":"u4","sessionId":"s1","timestamp":"2026-11-28T10:00:03Z","message":{"model":"claude-sonnet-4","content":[{"type":"text","text":"fallback"}],"usage":{"input_tokens":100,"output_tokens":10}}}"#,
+        ];
+        let parsed = parse_session_lines(SessionFileFormat::ClaudeJsonl, &lines, Some("t1"), None);
+        let usage_events: Vec<_> = parsed
+            .iter()
+            .filter(|e| matches!(e.kind, FusedEventKind::UsageRecorded { .. }))
+            .collect();
+        assert_eq!(usage_events.len(), 2);
+
+        let fused = fuse_all_agent_events(Vec::new(), parsed, Vec::new());
+        let summary = summarize_agent_observability(&SummaryInput {
+            events: &fused,
+            is_live: true,
+            agent_status: crate::port::AgentStatus::Idle,
+            active_rule: None,
+            has_osc_signal: false,
+            process_tree: None,
+            discovery_status: SessionDiscoveryStatus::NoLivePid,
+            now_ms: None,
+        });
+        assert_eq!(summary.usage_totals.input_tokens, 1100);
+        assert_eq!(summary.usage_totals.output_tokens, 95);
+        assert_eq!(summary.usage_totals.cache_read_tokens, 500);
+        assert_eq!(summary.usage_totals.cache_write_tokens, 200);
+
+        // Poll 1 sees u1 only; Poll 2 sees u1..=u3 where message.usage merges forward.
+        // Earliest-timestamp anchoring ensures u2 ToolStarted and u3 TurnCompleted are not skipped.
+        let parsed1 = parse_session_lines(
+            SessionFileFormat::ClaudeJsonl,
+            &lines[..1],
+            Some("t1"),
+            None,
+        );
+        let fused1 = fuse_all_agent_events(Vec::new(), parsed1, Vec::new());
+        let (_, cur1, _, _) = slice_events_after_key(fused1, None, 50);
+        assert!(cur1.is_some());
+
+        let parsed3 = parse_session_lines(
+            SessionFileFormat::ClaudeJsonl,
+            &lines[..3],
+            Some("t1"),
+            None,
+        );
+        let fused3 = fuse_all_agent_events(Vec::new(), parsed3, Vec::new());
+        let (delta, _, _, reset) = slice_events_after_key(fused3, cur1.as_deref(), 50);
+        assert!(!reset);
+        assert!(delta.iter().any(|ev| matches!(
+            &ev.kind,
+            FusedEventKind::ToolStarted { tool_name, .. } if tool_name == "Bash"
+        )));
+        assert!(
+            delta
+                .iter()
+                .any(|ev| matches!(ev.kind, FusedEventKind::TurnCompleted { .. }))
+        );
+    }
+
+    #[test]
+    fn codex_rollout_keys_remain_stable_across_tail_window_shift() {
+        let full = [
+            r#"{"timestamp":"2026-11-28T10:00:00Z","type":"session_meta","payload":{"id":"cx-no-ord","cwd":"/ws"}}"#,
+            r#"{"timestamp":"2026-11-28T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"checking"}}"#,
+            r#"{"timestamp":"2026-11-28T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":200}}"#,
+        ];
+        let shifted = &full[1..];
+        let ev_full = parse_session_lines(
+            SessionFileFormat::CodexRolloutJsonl,
+            &full,
+            Some("t1"),
+            None,
+        );
+        let ev_shifted = parse_session_lines(
+            SessionFileFormat::CodexRolloutJsonl,
+            shifted,
+            Some("t1"),
+            None,
+        );
+        assert_eq!(ev_full.len(), 3);
+        assert_eq!(ev_shifted.len(), 2);
+        assert_eq!(ev_full[1].canonical_key, ev_shifted[0].canonical_key);
+        assert_eq!(ev_full[2].canonical_key, ev_shifted[1].canonical_key);
+        assert!(!ev_full[1].canonical_key.contains(":l"));
     }
 }

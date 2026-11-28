@@ -424,9 +424,10 @@ fn run_events_command(
     }
 
     let mut cursor: Option<String> = req.after_key.map(str::to_string);
+    let mut last_screen_keys: Option<Vec<String>> = None;
     let mut first_batch = true;
     loop {
-        let report = client
+        let raw_report = client
             .events_scoped_since(
                 req.addr.as_str(),
                 DiscoveryScope::All,
@@ -434,9 +435,16 @@ fn run_events_command(
                 cursor.as_deref(),
             )
             .map_err(|err| err.to_string())?;
-        if let Some(latest) = &report.latest_key {
+        let cursor_was_none = cursor.is_none();
+        if let Some(latest) = &raw_report.latest_key {
             cursor = Some(latest.clone());
         }
+        let report = filter_follow_report(
+            raw_report,
+            &mut last_screen_keys,
+            first_batch,
+            cursor_was_none,
+        );
         let exited = matches!(report.summary.health, AgentHealth::Exited);
         emit_follow_batch(format, &report, first_batch, exited)?;
         let _ = std::io::stdout().flush();
@@ -446,6 +454,29 @@ fn run_events_command(
         }
         std::thread::sleep(Duration::from_millis(req.interval_ms));
     }
+}
+
+fn filter_follow_report(
+    mut report: FusedEventsReport,
+    last_screen_keys: &mut Option<Vec<String>>,
+    first_batch: bool,
+    cursor_was_none: bool,
+) -> FusedEventsReport {
+    if report.latest_key.is_some() || !cursor_was_none {
+        *last_screen_keys = None;
+        return report;
+    }
+    let current_keys: Vec<String> = report
+        .events
+        .iter()
+        .map(|ev| ev.canonical_key.clone())
+        .collect();
+    if !first_batch && let Some(prev) = last_screen_keys.as_ref() {
+        report.events.retain(|ev| !prev.contains(&ev.canonical_key));
+        report.count = report.events.len();
+    }
+    *last_screen_keys = Some(current_keys);
+    report
 }
 
 fn emit_follow_batch(
@@ -1522,5 +1553,24 @@ mod tests {
             rendered.contains("[pty+session]\ttool_start(Bash): cargo test"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn follow_filter_suppresses_repeated_screen_events_and_switches_to_session_cursor() {
+        let screen_only = FusedEventsReport {
+            latest_key: None,
+            ..sample_human_events_report()
+        };
+        let mut screen_keys = None;
+        let first = filter_follow_report(screen_only.clone(), &mut screen_keys, true, true);
+        assert_eq!(first.events.len(), 1);
+
+        let repeat = filter_follow_report(screen_only, &mut screen_keys, false, true);
+        assert!(repeat.events.is_empty());
+
+        let with_session = sample_human_events_report();
+        let resumed = filter_follow_report(with_session, &mut screen_keys, false, true);
+        assert_eq!(resumed.events.len(), 1);
+        assert!(screen_keys.is_none());
     }
 }
