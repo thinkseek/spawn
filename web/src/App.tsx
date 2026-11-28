@@ -1,4 +1,4 @@
-import { Orbit, PanelRight, WifiOff } from "lucide-react";
+import { Orbit, PanelRight, ShieldAlert, WifiOff } from "lucide-react";
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -25,6 +25,7 @@ import { TokenGate } from "./components/TokenGate";
 import {
   authStateFromProbe,
   authStateOnUnauthorized,
+  isAbortError,
   type AuthGateState,
 } from "./token";
 import { AlertsView, OpenAlerts } from "./components/alerts/AlertsView";
@@ -184,10 +185,19 @@ export default function App() {
 
   useEffect(() => {
     const controller = new AbortController();
-    void probeAuth(controller.signal).then((result) => {
-      if (controller.signal.aborted || !mounted.current) return;
-      setAuth(authStateFromProbe(result, getServeToken() !== null, getInitialTokenProblem()));
-    });
+    void probeAuth(controller.signal)
+      .then((result) => {
+        if (controller.signal.aborted || !mounted.current) return;
+        setAuth(authStateFromProbe(result, getServeToken() !== null, getInitialTokenProblem()));
+      })
+      .catch((cause: unknown) => {
+        if (isAbortError(cause) || controller.signal.aborted || !mounted.current) return;
+        setAuth({
+          kind: "unreachable",
+          message: cause instanceof Error ? cause.message : "无法连接到服务端",
+          hasStoredToken: getServeToken() !== null,
+        });
+      });
     return () => controller.abort();
   }, [probeSeq]);
 
@@ -208,13 +218,22 @@ export default function App() {
         });
         return;
       }
-      void probeAuth(controller.signal).then((result) => {
-        if (controller.signal.aborted || !mounted.current) return;
-        const next = authStateFromProbe(result, getServeToken() !== null, getInitialTokenProblem());
-        setAuth((current) =>
-          current.kind === "authenticated" && next.kind === "authenticated" ? current : next,
-        );
-      });
+      void probeAuth(controller.signal)
+        .then((result) => {
+          if (controller.signal.aborted || !mounted.current) return;
+          const next = authStateFromProbe(result, getServeToken() !== null, getInitialTokenProblem());
+          setAuth((current) =>
+            current.kind === "authenticated" && next.kind === "authenticated" ? current : next,
+          );
+        })
+        .catch((cause: unknown) => {
+          if (isAbortError(cause) || controller.signal.aborted || !mounted.current) return;
+          setAuth({
+            kind: "unreachable",
+            message: cause instanceof Error ? cause.message : "无法连接到服务端",
+            hasStoredToken: getServeToken() !== null,
+          });
+        });
     });
     return () => {
       controller.abort();
@@ -242,6 +261,41 @@ export default function App() {
         onAuthenticated={handleAuthenticated}
         onClearStoredAndRetry={handleClearStoredAndRetry}
       />
+    );
+  }
+
+  if (auth.kind === "forbidden") {
+    return (
+      <div className="h-dvh w-full overflow-y-auto bg-page-canvas text-label text-foreground">
+        <div className="flex min-h-full flex-col">
+          <header className="flex shrink-0 items-center justify-end px-4 pt-3 sm:px-6 sm:pt-4">
+            <ThemeSwitch />
+          </header>
+          <main className="flex flex-1 items-center justify-center px-4 py-4 sm:px-6">
+            <section className="w-full max-w-[400px] rounded-card bg-surface p-6 shadow-card sm:p-7">
+              <div className="flex items-center gap-2.5 text-foreground">
+                <ShieldAlert size={18} className="shrink-0 text-destructive" />
+                <h1 className="text-title-sm font-semibold">访问被服务端拒绝</h1>
+              </div>
+              <p className="mt-2.5 rounded-control bg-fail-tint px-3 py-2 text-caption text-destructive">
+                {auth.message}
+              </p>
+              <p className="mt-3 text-caption leading-relaxed text-faint-foreground">
+                服务端在只读探测（GET）阶段返回了 HTTP 403，通常源于 Host 或 Origin 安全策略拦截，而非只读 Token 限制。请核对浏览器访问域名或反向代理的 Host/Origin 转发配置后再重试。
+              </p>
+              <div className="mt-4">
+                <button
+                  type="button"
+                  onClick={retryProbe}
+                  className="inline-flex h-11 w-full items-center justify-center rounded-control bg-inset px-4 text-caption font-medium text-muted-foreground shadow-hairline transition-colors hover:bg-surface-hover hover:text-foreground"
+                >
+                  重新检查
+                </button>
+              </div>
+            </section>
+          </main>
+        </div>
+      </div>
     );
   }
 
