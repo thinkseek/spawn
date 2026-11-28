@@ -93,6 +93,10 @@ impl PostgresStore {
     }
 
     fn listen_channel(&self, channel: &str) -> Result<Listener, StoreError> {
+        // `listen()` opens 1 private `LISTEN` connection outside any `RoleConnPool`:
+        // `spawn serve`'s single shared hub in `ServePools` therefore holds 1 pooled
+        // events connection + 1 private connection, staying within the default
+        // `SPAWN_SERVE_EVENTS_POOL=2` budget solely because there is a single hub.
         let config = crate::passfile::config(&self.url).map_err(|error| backend(&error))?;
         let mut client = config.connect(NoTls).map_err(|error| backend(&error))?;
         client

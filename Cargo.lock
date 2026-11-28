@@ -966,6 +966,7 @@ name = "spawn-node-gateway"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "postgres",
  "ring",
  "serde",
  "serde_json",
