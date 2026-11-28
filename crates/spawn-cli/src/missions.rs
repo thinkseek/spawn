@@ -6104,277 +6104,243 @@ mod database_tests {
         );
     }
 
+    struct D6ReviewFixture {
+        harness: TestD6Harness,
+        project: String,
+        task_id: i64,
+        task_ref: String,
+        base_pub: spawn_host::PublishedSnapshot,
+        task_pub: spawn_host::PublishedSnapshot,
+        ctx: super::TaskRepoContext,
+        resolved: super::ResolvedTaskRefs,
+    }
+
+    impl D6ReviewFixture {
+        fn new(schema_name: &str, dir_prefix: &str) -> Self {
+            let harness = TestD6Harness::new(schema_name, dir_prefix, true);
+            // Intentional non-existent source repo path on disk (pure D6 mode).
+            let project = harness
+                .guard
+                .path
+                .join("pure-d6-source.git")
+                .to_string_lossy()
+                .into_owned();
+            let base_pub = harness.publish_main(
+                &project,
+                &[(b"hello.txt", b"base line\n")],
+                1_700_000_000_000,
+                "initial base commit",
+            );
+            let mission_id = harness
+                .store
+                .mission_add(
+                    "D6 task inspection mission",
+                    &serde_json::json!([project]),
+                    "human",
+                )
+                .expect("mission add");
+            let task_id = harness
+                .store
+                .task_assign(
+                    mission_id,
+                    "ephemeral",
+                    "agent_d6",
+                    "d6 change brief",
+                    "default",
+                )
+                .expect("task assign");
+            let task_ref = spawn_host::workspace_rules::task_head_ref(task_id, "head");
+            let task_pub = harness.publish_branch(
+                &project,
+                &task_ref,
+                &[(b"hello.txt", b"updated line\nsecond line\n")],
+                std::slice::from_ref(&base_pub.snapshot),
+                1_700_000_100_000,
+                "implement d6 change",
+            );
+            let ctx = super::load_task_repo(&harness.store, task_id, Some(&harness.root_str))
+                .expect("load d6 ctx");
+            let resolved = super::resolve_task_refs(&harness.store, &ctx).expect("resolve d6 refs");
+            Self {
+                harness,
+                project,
+                task_id,
+                task_ref,
+                base_pub,
+                task_pub,
+                ctx,
+                resolved,
+            }
+        }
+
+        fn assert_commits_and_diff(&self) {
+            assert!(matches!(self.ctx.repo, super::TaskRepo::D6Ledger { .. }));
+            assert!(self.ctx.is_landable());
+            let described = self.ctx.repo.describe();
+            assert!(described.starts_with("D6 ledger project "), "{described}");
+            assert_eq!(self.resolved.storage, crate::sources::ProjectStorage::D6);
+            assert_eq!(self.resolved.resolved_ref, self.task_ref);
+            assert_eq!(self.resolved.base_sha, self.base_pub.git_oid.to_hex());
+            assert_eq!(self.resolved.head_sha, self.task_pub.git_oid.to_hex());
+
+            let (_review_guard, review_dir) = super::materialize_review_repo(
+                &self.harness.store,
+                &self.ctx,
+                &self.resolved,
+                Some(&self.harness.cas_dir),
+            )
+            .expect("materialize d6 review repo");
+            let commits = super::list_commits_ahead(
+                &review_dir,
+                &self.resolved.base_sha,
+                &self.resolved.head_sha,
+            )
+            .expect("list d6 commits ahead");
+            assert_eq!(commits.len(), 1);
+            assert_eq!(commits[0].sha, self.task_pub.git_oid.to_hex());
+            assert_eq!(commits[0].subject, "implement d6 change");
+
+            let range = format!("{}...{}", self.resolved.base_sha, self.resolved.head_sha);
+            let diff = super::run_git_raw(
+                &review_dir,
+                &["diff", "--no-ext-diff", &range, "--"],
+                "diff",
+            )
+            .expect("d6 diff");
+            assert!(diff.contains("+updated line"), "{diff}");
+        }
+
+        fn execute_land(&self, mode: super::LandMode, dry_run: bool) -> Result<(), String> {
+            super::execute_task_land(
+                &self.harness.store,
+                &super::TaskLandArgs {
+                    task_id: self.task_id,
+                    mode,
+                    dry_run,
+                    json: false,
+                    root: Some(self.harness.root_str.clone()),
+                },
+                Some(&self.harness.cas_dir),
+            )
+        }
+
+        fn cas_file_count(&self) -> usize {
+            let mut count = 0usize;
+            let mut stack = vec![self.harness.cas_dir.clone()];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).expect("read cas dir") {
+                    let path = entry.expect("cas entry").path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+    }
+
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn d6_task_commits_diff_and_land_work_against_pg_and_cas() {
-        use spawn_cas::{Tree, TreeEntry, TreeEntryKind};
-        use spawn_host::{CasMerkleStore, D6RefKind, PublishRequest, format_commit_body};
+    fn d6_task_commits_diff_and_land_dry_run_and_refusal_work_against_pg_and_cas() {
+        let f = D6ReviewFixture::new("missions_d6_review_refusal", "missions-d6-review-refusal");
+        f.assert_commits_and_diff();
 
-        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
-            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
-        );
-        let schema = spawn_postgres::testing::TestSchema::new("missions_d6_review");
-        let store = std::sync::Arc::new(
-            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
-                .expect("isolated test schema"),
-        );
+        let cas_files_before = f.cas_file_count();
+        let refs_before = f
+            .harness
+            .store
+            .list_refs(Some(&f.project))
+            .expect("list refs before");
+        let logs_before = f
+            .harness
+            .store
+            .list_ref_log_after(0)
+            .expect("list ref log before");
 
-        let guard = super::TempDirGuard::create("missions-d6-review").expect("temp dir");
-        let root = guard.path.join("ws-root");
-        std::fs::create_dir_all(&root).expect("create root");
-        std::fs::write(root.join(".spawn-backend"), "d6\n").expect("write backend marker");
+        f.execute_land(super::LandMode::FfOnly, true)
+            .expect("d6 ff-only dry-run");
+        f.execute_land(super::LandMode::Squash, true)
+            .expect("d6 squash dry-run");
 
-        // Intentional non-existent source repo path on disk (pure D6 mode).
-        let project_repo = guard.path.join("pure-d6-source.git");
-        let project = project_repo.to_string_lossy().into_owned();
-        let cas_dir = root.join(".cas");
-        let cas = CasMerkleStore::open(&cas_dir).expect("open cas");
-        let ledger = crate::sources::PostgresRefLedger::new(std::sync::Arc::clone(&store));
-
-        let (b1, b1_len) = cas.put_bytes_blob(b"base line\n").expect("put base blob");
-        let base_tree = cas
-            .put_tree_cached(
-                &Tree::from_entries(vec![TreeEntry {
-                    kind: TreeEntryKind::File,
-                    name: b"hello.txt".to_vec(),
-                    id: b1.as_bytes(),
-                    size: b1_len,
-                }])
-                .expect("base tree"),
-            )
-            .expect("store base tree");
-        let base_body = format_commit_body(
-            "Spawn Test <test@spawn.local> 1700000000 +0000",
-            "Spawn Test <test@spawn.local> 1700000000 +0000",
-            "initial base commit\n",
-        );
-        let base_pub = cas
-            .publish_snapshot(
-                &ledger,
-                &PublishRequest {
-                    project: &project,
-                    ref_name: "main",
-                    kind: D6RefKind::Main,
-                    expected_ref: None,
-                    tree: &base_tree,
-                    parents: &[],
-                    commit_body: &base_body,
-                    created_at_ms: 1_700_000_000_000,
-                    reason: "bootstrap main",
-                    landing_task_id: None,
-                },
-            )
-            .expect("publish main");
-
-        let mission_id = store
-            .mission_add(
-                "D6 task inspection mission",
-                &serde_json::json!([project]),
-                "human",
-            )
-            .expect("mission add");
-        let task_id = store
-            .task_assign(
-                mission_id,
-                "ephemeral",
-                "agent_d6",
-                "d6 change brief",
-                "default",
-            )
-            .expect("task assign");
-
-        let (b2, b2_len) = cas
-            .put_bytes_blob(b"updated line\nsecond line\n")
-            .expect("put task blob");
-        let task_tree = cas
-            .put_tree_cached(
-                &Tree::from_entries(vec![TreeEntry {
-                    kind: TreeEntryKind::File,
-                    name: b"hello.txt".to_vec(),
-                    id: b2.as_bytes(),
-                    size: b2_len,
-                }])
-                .expect("task tree"),
-            )
-            .expect("store task tree");
-        let task_body = format_commit_body(
-            "Agent D6 <d6@spawn.local> 1700000100 +0000",
-            "Agent D6 <d6@spawn.local> 1700000100 +0000",
-            "implement d6 change\n",
-        );
-        let task_ref = spawn_host::workspace_rules::task_head_ref(task_id, "head");
-        let task_pub = cas
-            .publish_snapshot(
-                &ledger,
-                &PublishRequest {
-                    project: &project,
-                    ref_name: &task_ref,
-                    kind: D6RefKind::Branch,
-                    expected_ref: None,
-                    tree: &task_tree,
-                    parents: std::slice::from_ref(&base_pub.snapshot),
-                    commit_body: &task_body,
-                    created_at_ms: 1_700_000_100_000,
-                    reason: "preserve task head",
-                    landing_task_id: None,
-                },
-            )
-            .expect("publish task head");
-
-        let root_str = root.to_string_lossy().into_owned();
-        let ctx = super::load_task_repo(&store, task_id, Some(&root_str)).expect("load d6 ctx");
-        assert!(matches!(ctx.repo, super::TaskRepo::D6Ledger { .. }));
-        assert!(ctx.is_landable());
-        let described = ctx.repo.describe();
-        assert!(described.starts_with("D6 ledger project "), "{described}");
-
-        let resolved = super::resolve_task_refs(&store, &ctx).expect("resolve d6 refs");
-        assert_eq!(resolved.storage, crate::sources::ProjectStorage::D6);
-        assert_eq!(resolved.resolved_ref, task_ref);
-        assert_eq!(resolved.base_sha, base_pub.git_oid.to_hex());
-        assert_eq!(resolved.head_sha, task_pub.git_oid.to_hex());
-
-        let (_review_guard, review_dir) =
-            super::materialize_review_repo(&store, &ctx, &resolved, Some(&cas_dir))
-                .expect("materialize d6 review repo");
-        let commits =
-            super::list_commits_ahead(&review_dir, &resolved.base_sha, &resolved.head_sha)
-                .expect("list d6 commits ahead");
-        assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].sha, task_pub.git_oid.to_hex());
-        assert_eq!(commits[0].subject, "implement d6 change");
-
-        let range = format!("{}...{}", resolved.base_sha, resolved.head_sha);
-        let diff = super::run_git_raw(
-            &review_dir,
-            &["diff", "--no-ext-diff", &range, "--"],
-            "diff",
-        )
-        .expect("d6 diff");
-        assert!(diff.contains("+updated line"), "{diff}");
-
-        // `--dry-run` works cleanly for both --ff-only and --squash in D6 mode.
-        super::execute_task_land(
-            &store,
-            &super::TaskLandArgs {
-                task_id,
-                mode: super::LandMode::FfOnly,
-                dry_run: true,
-                json: false,
-                root: Some(root_str.clone()),
-            },
-            Some(&cas_dir),
-        )
-        .expect("d6 ff-only dry-run");
-        super::execute_task_land(
-            &store,
-            &super::TaskLandArgs {
-                task_id,
-                mode: super::LandMode::Squash,
-                dry_run: true,
-                json: false,
-                root: Some(root_str.clone()),
-            },
-            Some(&cas_dir),
-        )
-        .expect("d6 squash dry-run");
-
-        // Live `task land` before gate acceptance fails closed without mutating main.
         for (mode, expected) in [
             (super::LandMode::FfOnly, "accepted gate verdict"),
             (super::LandMode::Squash, "no accepted gate candidate"),
         ] {
-            let err = super::execute_task_land(
-                &store,
-                &super::TaskLandArgs {
-                    task_id,
-                    mode,
-                    dry_run: false,
-                    json: false,
-                    root: Some(root_str.clone()),
-                },
-                Some(&cas_dir),
-            )
-            .expect_err("ungated live d6 task land must fail closed");
+            let err = f
+                .execute_land(mode, false)
+                .expect_err("ungated live d6 task land must fail closed");
             assert!(!err.contains("spawn ship"), "{err}");
             assert!(err.contains(expected), "{err}");
         }
-        let main_before = store
-            .list_refs(Some(&project))
-            .expect("list refs")
-            .into_iter()
-            .find(|r| matches!(r.kind, spawn_postgres::RefKind::Main))
-            .expect("main remains");
-        assert_eq!(main_before.snapshot, base_pub.snapshot.to_string());
 
-        // Record delivery + accepted `task.gated` verdict, then live `task land` routes straight to D6 ledger.
-        store.task_delivered(task_id, 1).expect("delivered");
-        assert!(store.task_reported(task_id, "done").expect("reported"));
-        store
-            .integrator_record(&json!({
-                "type": "task.gated",
-                "id": task_id,
-                "revision": 0,
-                "verdict": "accepted",
-                "base": base_pub.git_oid.to_hex(),
-                "candidate": task_pub.git_oid.to_hex(),
-            }))
-            .expect("accepted verdict");
-
-        super::execute_task_land(
-            &store,
-            &super::TaskLandArgs {
-                task_id,
-                mode: super::LandMode::FfOnly,
-                dry_run: false,
-                json: false,
-                root: Some(root_str.clone()),
-            },
-            Some(&cas_dir),
-        )
-        .expect("live d6 ff-only task land succeeds");
-
-        let main_after = store
-            .list_refs(Some(&project))
-            .expect("list refs after land")
-            .into_iter()
-            .find(|r| matches!(r.kind, spawn_postgres::RefKind::Main))
-            .expect("main present");
-        assert_eq!(main_after.snapshot, task_pub.snapshot.to_string());
-        let logs = store.list_ref_log_after(0).expect("list ref log");
-        assert!(
-            logs.iter().any(|row| row.project == project
-                && row.name == "main"
-                && row.old_snapshot.as_deref() == Some(base_pub.snapshot.to_string().as_str())
-                && row.new_snapshot == task_pub.snapshot.to_string()),
-            "missing D6 land entry in ref log: {logs:?}"
+        assert_eq!(f.cas_file_count(), cas_files_before);
+        assert_eq!(
+            f.harness
+                .store
+                .list_refs(Some(&f.project))
+                .expect("list refs after"),
+            refs_before
+        );
+        assert_eq!(
+            f.harness
+                .store
+                .list_ref_log_after(0)
+                .expect("list ref log after"),
+            logs_before
+        );
+        assert_eq!(
+            latest_main_ref_snapshot(&f.harness.store, &f.project),
+            f.base_pub.snapshot.to_string()
         );
 
-        let repeat_err = super::execute_task_land(
-            &store,
-            &super::TaskLandArgs {
-                task_id,
-                mode: super::LandMode::FfOnly,
-                dry_run: false,
-                json: false,
-                root: Some(root_str.clone()),
-            },
-            Some(&cas_dir),
+        let missing_cas = f.harness.guard.path.join("missing-cas");
+        let missing_err = super::materialize_review_repo(
+            &f.harness.store,
+            &f.ctx,
+            &f.resolved,
+            Some(&missing_cas),
         )
-        .expect_err("re-landing already landed task must report nothing to land");
-        assert!(repeat_err.contains("nothing to land"), "{repeat_err}");
-
-        // Missing CAS store fails closed and never creates `.spawn-cas`.
-        let missing_cas = guard.path.join("missing-cas");
-        let missing_err =
-            super::materialize_review_repo(&store, &ctx, &resolved, Some(&missing_cas))
-                .err()
-                .expect("missing cas fails closed");
+        .err()
+        .expect("missing cas fails closed");
         assert!(
             missing_err.contains("D6 CAS store missing"),
             "{missing_err}"
         );
         assert!(!missing_cas.join(spawn_cas::CAS_MARKER).exists());
+    }
+
+    #[test]
+    fn d6_task_commits_diff_and_land_work_against_pg_and_cas() {
+        let f = D6ReviewFixture::new("missions_d6_review", "missions-d6-review");
+        f.assert_commits_and_diff();
+
+        record_task_gate_acceptance(
+            &f.harness.store,
+            f.task_id,
+            &f.base_pub.git_oid.to_hex(),
+            &f.task_pub.git_oid.to_hex(),
+        );
+        f.execute_land(super::LandMode::FfOnly, false)
+            .expect("live d6 ff-only task land succeeds");
+
+        assert_eq!(
+            latest_main_ref_snapshot(&f.harness.store, &f.project),
+            f.task_pub.snapshot.to_string()
+        );
+        let logs = f.harness.store.list_ref_log_after(0).expect("list ref log");
+        assert!(
+            logs.iter().any(|row| row.project == f.project
+                && row.name == "main"
+                && row.old_snapshot.as_deref() == Some(f.base_pub.snapshot.to_string().as_str())
+                && row.new_snapshot == f.task_pub.snapshot.to_string()),
+            "missing D6 land entry in ref log: {logs:?}"
+        );
+
+        let repeat_err = f
+            .execute_land(super::LandMode::FfOnly, false)
+            .expect_err("re-landing already landed task must report nothing to land");
+        assert!(repeat_err.contains("nothing to land"), "{repeat_err}");
     }
 
     fn publish_d6_main_and_task_head_pair(
