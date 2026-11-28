@@ -3,11 +3,8 @@ tree sha256:b71871a89314f5692d116601867087bbf9c346b06bb642ea3fcee9a43c237f04
 parent sha256:471a4bf181250d3c686b9fdcf7408606bbe106d1838dbaf204d678b8bcef5581
 parent sha256:8af322720a065f56189fdeaf56f179f9723048fd650dee075796d10579a55930
 at_ms -86400000
-agent_id integrator-1
-execution_id exec_land_99
-preset_id preset-land
-kind land
-boundary land
+actor system integrator-1
+origin land
 message 33
 merge landing from feature branch
 git_compat 142

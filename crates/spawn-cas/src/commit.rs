@@ -1,4 +1,4 @@
-//! Canonical `spawn-commit-v2` object codec, AI provenance projection, and dual
+//! Canonical `spawn-commit-v2` object codec, AI provenance model, and dual
 //! `V1`/`V2` [`CommitObject`] decoding (`Wave-1 S1`).
 //!
 //! `spawn-commit-v2` unifies code state (`tree`, `parents`, `at_ms`) and AI
@@ -89,31 +89,25 @@ impl CommitObject {
     }
 }
 
-/// Closed semantic classification of how a `CommitV2` state was produced.
+/// Specific tree change operation for [`CommitOrigin::Work`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CommitKind {
+pub enum WorkChange {
     /// Direct workspace edit or tool mutation commit.
     Edit,
     /// Derived tree transformation (merge resolution, rebase, patch apply).
     Derive,
-    /// Landing / integration commit advancing a canonical target branch/ref.
-    Land,
     /// Compensating revert commit restoring an earlier code state.
     Revert,
-    /// Initial or external history import into CAS.
-    Import,
 }
 
-impl CommitKind {
-    /// Canonical lowercase wire string for `kind`.
+impl WorkChange {
+    /// Canonical lowercase wire token for this work change.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Edit => "edit",
             Self::Derive => "derive",
-            Self::Land => "land",
             Self::Revert => "revert",
-            Self::Import => "import",
         }
     }
 
@@ -122,21 +116,19 @@ impl CommitKind {
         match text {
             "edit" => Ok(Self::Edit),
             "derive" => Ok(Self::Derive),
-            "land" => Ok(Self::Land),
             "revert" => Ok(Self::Revert),
-            "import" => Ok(Self::Import),
-            _ => Err(CasError::BadFormat("unknown commit kind")),
+            _ => Err(CasError::BadFormat("unknown work change")),
         }
     }
 }
 
-impl fmt::Display for CommitKind {
+impl fmt::Display for WorkChange {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
-impl FromStr for CommitKind {
+impl FromStr for WorkChange {
     type Err = CasError;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
@@ -144,31 +136,25 @@ impl FromStr for CommitKind {
     }
 }
 
-/// Closed execution lifecycle boundary at which a `CommitV2` was cut.
+/// Lifecycle boundary at which a [`CommitOrigin::Work`] commit was cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CommitBoundary {
+pub enum WorkBoundary {
     /// Periodic or pre-handoff workspace checkpoint.
     Checkpoint,
-    /// Worker completion / submission snapshot handed back to control plane.
+    /// Worker completion / submission snapshot handed back to the control plane.
     Submit,
-    /// Control-plane integration landing onto target ref.
-    Land,
-    /// Automated background/scheduled job boundary.
+    /// Automated background or scheduled job boundary.
     Job,
-    /// Historical commit backfill or migration.
-    Backfill,
 }
 
-impl CommitBoundary {
-    /// Canonical lowercase wire string for `boundary`.
+impl WorkBoundary {
+    /// Canonical lowercase wire token for this work boundary.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Checkpoint => "checkpoint",
             Self::Submit => "submit",
-            Self::Land => "land",
             Self::Job => "job",
-            Self::Backfill => "backfill",
         }
     }
 
@@ -177,21 +163,19 @@ impl CommitBoundary {
         match text {
             "checkpoint" => Ok(Self::Checkpoint),
             "submit" => Ok(Self::Submit),
-            "land" => Ok(Self::Land),
             "job" => Ok(Self::Job),
-            "backfill" => Ok(Self::Backfill),
-            _ => Err(CasError::BadFormat("unknown commit boundary")),
+            _ => Err(CasError::BadFormat("unknown work boundary")),
         }
     }
 }
 
-impl fmt::Display for CommitBoundary {
+impl fmt::Display for WorkBoundary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
-impl FromStr for CommitBoundary {
+impl FromStr for WorkBoundary {
     type Err = CasError;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
@@ -199,26 +183,245 @@ impl FromStr for CommitBoundary {
     }
 }
 
-/// Actor provenance recorded inside a canonical `spawn-commit-v2` object.
+/// Closed 11-state origin classifying how a `CommitV2` was produced without
+/// synonym duplication (`Work` 3×3 + `Land` + `Import`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommitOrigin {
+    /// Active workspace commit cut during agent/human execution.
+    Work {
+        /// Specific change operation that produced this snapshot.
+        change: WorkChange,
+        /// Lifecycle boundary at which the work snapshot was recorded.
+        boundary: WorkBoundary,
+    },
+    /// Control-plane integration landing advancing a canonical target branch/ref.
+    Land,
+    /// Initial or external history import / backfill into CAS (single canonical concept).
+    Import,
+}
+
+impl CommitOrigin {
+    /// Exhaustive list of all 11 valid `CommitOrigin` states.
+    pub const ALL: [Self; 11] = [
+        Self::Work {
+            change: WorkChange::Edit,
+            boundary: WorkBoundary::Checkpoint,
+        },
+        Self::Work {
+            change: WorkChange::Edit,
+            boundary: WorkBoundary::Submit,
+        },
+        Self::Work {
+            change: WorkChange::Edit,
+            boundary: WorkBoundary::Job,
+        },
+        Self::Work {
+            change: WorkChange::Derive,
+            boundary: WorkBoundary::Checkpoint,
+        },
+        Self::Work {
+            change: WorkChange::Derive,
+            boundary: WorkBoundary::Submit,
+        },
+        Self::Work {
+            change: WorkChange::Derive,
+            boundary: WorkBoundary::Job,
+        },
+        Self::Work {
+            change: WorkChange::Revert,
+            boundary: WorkBoundary::Checkpoint,
+        },
+        Self::Work {
+            change: WorkChange::Revert,
+            boundary: WorkBoundary::Submit,
+        },
+        Self::Work {
+            change: WorkChange::Revert,
+            boundary: WorkBoundary::Job,
+        },
+        Self::Land,
+        Self::Import,
+    ];
+
+    /// Canonical lowercase wire token for this origin.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Checkpoint,
+            } => "work/edit/checkpoint",
+            Self::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Submit,
+            } => "work/edit/submit",
+            Self::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Job,
+            } => "work/edit/job",
+            Self::Work {
+                change: WorkChange::Derive,
+                boundary: WorkBoundary::Checkpoint,
+            } => "work/derive/checkpoint",
+            Self::Work {
+                change: WorkChange::Derive,
+                boundary: WorkBoundary::Submit,
+            } => "work/derive/submit",
+            Self::Work {
+                change: WorkChange::Derive,
+                boundary: WorkBoundary::Job,
+            } => "work/derive/job",
+            Self::Work {
+                change: WorkChange::Revert,
+                boundary: WorkBoundary::Checkpoint,
+            } => "work/revert/checkpoint",
+            Self::Work {
+                change: WorkChange::Revert,
+                boundary: WorkBoundary::Submit,
+            } => "work/revert/submit",
+            Self::Work {
+                change: WorkChange::Revert,
+                boundary: WorkBoundary::Job,
+            } => "work/revert/job",
+            Self::Land => "land",
+            Self::Import => "import",
+        }
+    }
+
+    /// Parse strictly from one of the 11 canonical lowercase wire tokens.
+    pub fn parse(text: &str) -> Result<Self, CasError> {
+        match text {
+            "work/edit/checkpoint" => Ok(Self::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Checkpoint,
+            }),
+            "work/edit/submit" => Ok(Self::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Submit,
+            }),
+            "work/edit/job" => Ok(Self::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Job,
+            }),
+            "work/derive/checkpoint" => Ok(Self::Work {
+                change: WorkChange::Derive,
+                boundary: WorkBoundary::Checkpoint,
+            }),
+            "work/derive/submit" => Ok(Self::Work {
+                change: WorkChange::Derive,
+                boundary: WorkBoundary::Submit,
+            }),
+            "work/derive/job" => Ok(Self::Work {
+                change: WorkChange::Derive,
+                boundary: WorkBoundary::Job,
+            }),
+            "work/revert/checkpoint" => Ok(Self::Work {
+                change: WorkChange::Revert,
+                boundary: WorkBoundary::Checkpoint,
+            }),
+            "work/revert/submit" => Ok(Self::Work {
+                change: WorkChange::Revert,
+                boundary: WorkBoundary::Submit,
+            }),
+            "work/revert/job" => Ok(Self::Work {
+                change: WorkChange::Revert,
+                boundary: WorkBoundary::Job,
+            }),
+            "land" => Ok(Self::Land),
+            "import" => Ok(Self::Import),
+            _ => Err(CasError::BadFormat("unknown commit origin")),
+        }
+    }
+}
+
+impl fmt::Display for CommitOrigin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CommitOrigin {
+    type Err = CasError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::parse(text)
+    }
+}
+
+/// Closed actor provenance classifying who/what produced a `CommitV2`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitActor {
-    /// Stable identifier of the agent or human actor that produced the commit.
-    pub agent_id: String,
-    /// Optional execution attempt identifier when produced by a managed run.
-    pub execution_id: Option<String>,
-    /// Optional canonical model label active for the producing step.
-    pub model_label: Option<String>,
-    /// Optional preset/profile identifier active for the producing step.
-    pub preset_id: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommitActor {
+    /// Managed AI agent run with optional execution, model, and preset lineage.
+    Agent {
+        /// Stable identifier of the agent that produced the commit.
+        id: String,
+        /// Optional execution attempt identifier when produced by a managed run.
+        execution_id: Option<String>,
+        /// Optional canonical model label active for the producing step.
+        model_label: Option<String>,
+        /// Optional preset/profile identifier active for the producing step.
+        preset_id: Option<String>,
+    },
+    /// Interactive human operator.
+    Human {
+        /// Stable identifier of the human operator.
+        id: String,
+    },
+    /// Unattended control-plane or integrator component.
+    System {
+        /// Stable identifier of the system actor.
+        id: String,
+    },
+}
+
+impl CommitActor {
+    /// Stable actor identifier regardless of actor variant.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Agent { id, .. } | Self::Human { id } | Self::System { id } => id,
+        }
+    }
+
+    /// Canonical wire class token (`agent`, `human`, or `system`).
+    pub const fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Agent { .. } => "agent",
+            Self::Human { .. } => "human",
+            Self::System { .. } => "system",
+        }
+    }
+
+    /// Optional execution attempt identifier (`Some` only for [`Self::Agent`]).
+    pub fn execution_id(&self) -> Option<&str> {
+        match self {
+            Self::Agent { execution_id, .. } => execution_id.as_deref(),
+            Self::Human { .. } | Self::System { .. } => None,
+        }
+    }
+
+    /// Optional active model label (`Some` only for [`Self::Agent`]).
+    pub fn model_label(&self) -> Option<&str> {
+        match self {
+            Self::Agent { model_label, .. } => model_label.as_deref(),
+            Self::Human { .. } | Self::System { .. } => None,
+        }
+    }
+
+    /// Optional active preset identifier (`Some` only for [`Self::Agent`]).
+    pub fn preset_id(&self) -> Option<&str> {
+        match self {
+            Self::Agent { preset_id, .. } => preset_id.as_deref(),
+            Self::Human { .. } | Self::System { .. } => None,
+        }
+    }
 }
 
 /// Intent and ledger linkage recorded inside a canonical `spawn-commit-v2` object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitIntent {
-    /// Closed semantic kind of commit.
-    pub kind: CommitKind,
-    /// Closed workflow lifecycle boundary at which the commit was created.
-    pub boundary: CommitBoundary,
+    /// Closed 11-state origin classification of this commit.
+    pub origin: CommitOrigin,
     /// Optional mission/task ID linked to this commit.
     pub task_id: Option<i64>,
     /// Optional transcript digest/URI reference linking back to reasoning logs.
@@ -236,45 +439,12 @@ pub struct CommitV2 {
     pub parents: Vec<Digest>,
     /// Commit timestamp in Unix epoch milliseconds.
     pub at_ms: i64,
-    /// Producing actor and model provenance.
+    /// Closed producing actor and agent execution provenance.
     pub actor: CommitActor,
-    /// Workflow intent, optional task/transcript linkage, and message.
+    /// Closed origin, optional task/transcript linkage, and message.
     pub intent: CommitIntent,
     /// Optional raw Git compatibility commit body (omitted completely for native Spawn commits).
     pub git_compat_body: Option<Vec<u8>>,
-}
-
-/// Pure, lossless AI provenance summary projected solely from a decoded [`CommitV2`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitProvenanceSummary {
-    /// Root `spawn-tree-v1` digest.
-    pub tree: Digest,
-    /// Parent commit digests in first-parent order.
-    pub parents: Vec<Digest>,
-    /// Commit timestamp in Unix epoch milliseconds.
-    pub at_ms: i64,
-    /// Producing actor identifier.
-    pub agent_id: String,
-    /// Optional producing execution ID.
-    pub execution_id: Option<String>,
-    /// Optional model label.
-    pub model_label: Option<String>,
-    /// Optional preset identifier.
-    pub preset_id: Option<String>,
-    /// Closed commit semantic kind.
-    pub kind: CommitKind,
-    /// Closed workflow boundary.
-    pub boundary: CommitBoundary,
-    /// Optional task ID.
-    pub task_id: Option<i64>,
-    /// Optional transcript reference.
-    pub transcript_ref: Option<String>,
-    /// First line of `message`.
-    pub message_subject: String,
-    /// Full verbatim commit message.
-    pub message: String,
-    /// Whether an edge-compatibility Git body trailer is attached.
-    pub has_git_compat_body: bool,
 }
 
 fn validate_parents(parents: &[Digest]) -> Result<(), CasError> {
@@ -311,6 +481,22 @@ fn validate_optional_header(
 ) -> Result<(), CasError> {
     if let Some(inner) = value {
         validate_header_value(inner, empty_or_ws)?;
+    }
+    Ok(())
+}
+
+fn validate_actor(actor: &CommitActor) -> Result<(), CasError> {
+    validate_header_value(actor.id(), "invalid commit-v2 actor id")?;
+    if let CommitActor::Agent {
+        execution_id,
+        model_label,
+        preset_id,
+        ..
+    } = actor
+    {
+        validate_optional_header(execution_id.as_ref(), "invalid commit-v2 execution_id")?;
+        validate_optional_header(model_label.as_ref(), "invalid commit-v2 model_label")?;
+        validate_optional_header(preset_id.as_ref(), "invalid commit-v2 preset_id")?;
     }
     Ok(())
 }
@@ -453,6 +639,49 @@ fn push_opt_header(out: &mut String, key: &str, value: Option<&String>) {
     }
 }
 
+fn encode_actor_headers(out: &mut String, actor: &CommitActor) {
+    let _ = writeln!(out, "actor {} {}", actor.kind_str(), actor.id());
+    if let CommitActor::Agent {
+        execution_id,
+        model_label,
+        preset_id,
+        ..
+    } = actor
+    {
+        push_opt_header(out, "execution_id", execution_id.as_ref());
+        push_opt_header(out, "model_label", model_label.as_ref());
+        push_opt_header(out, "preset_id", preset_id.as_ref());
+    }
+}
+
+fn decode_actor_headers(cursor: &mut HeaderCursor<'_>) -> Result<CommitActor, CasError> {
+    let actor_line = cursor.take_required(b"actor ", "expected actor line in commit-v2")?;
+    let (kind_str, id_str) = actor_line
+        .split_once(' ')
+        .ok_or(CasError::BadFormat("malformed commit-v2 actor line"))?;
+    validate_header_value(id_str, "invalid commit-v2 actor id")?;
+    let id = id_str.to_string();
+    match kind_str {
+        "agent" => {
+            let execution_id =
+                decode_optional_header(cursor, b"execution_id ", "invalid commit-v2 execution_id")?;
+            let model_label =
+                decode_optional_header(cursor, b"model_label ", "invalid commit-v2 model_label")?;
+            let preset_id =
+                decode_optional_header(cursor, b"preset_id ", "invalid commit-v2 preset_id")?;
+            Ok(CommitActor::Agent {
+                id,
+                execution_id,
+                model_label,
+                preset_id,
+            })
+        }
+        "human" => Ok(CommitActor::Human { id }),
+        "system" => Ok(CommitActor::System { id }),
+        _ => Err(CasError::BadFormat("unknown commit-v2 actor class")),
+    }
+}
+
 fn decode_git_compat_trailer(bytes: &[u8], pos: usize) -> Result<Option<Vec<u8>>, CasError> {
     if pos == bytes.len() {
         return Ok(None);
@@ -485,16 +714,7 @@ impl CommitV2 {
     /// Validate all structural and provenance invariants without serializing.
     fn validate(&self) -> Result<(), CasError> {
         validate_parents(&self.parents)?;
-        validate_header_value(&self.actor.agent_id, "invalid commit-v2 agent_id")?;
-        validate_optional_header(
-            self.actor.execution_id.as_ref(),
-            "invalid commit-v2 execution_id",
-        )?;
-        validate_optional_header(
-            self.actor.model_label.as_ref(),
-            "invalid commit-v2 model_label",
-        )?;
-        validate_optional_header(self.actor.preset_id.as_ref(), "invalid commit-v2 preset_id")?;
+        validate_actor(&self.actor)?;
         validate_optional_header(
             self.intent.transcript_ref.as_ref(),
             "invalid commit-v2 transcript_ref",
@@ -517,16 +737,8 @@ impl CommitV2 {
             let _ = writeln!(header, "parent {parent}");
         }
         let _ = writeln!(header, "at_ms {}", self.at_ms);
-        let _ = writeln!(header, "agent_id {}", self.actor.agent_id);
-        push_opt_header(
-            &mut header,
-            "execution_id",
-            self.actor.execution_id.as_ref(),
-        );
-        push_opt_header(&mut header, "model_label", self.actor.model_label.as_ref());
-        push_opt_header(&mut header, "preset_id", self.actor.preset_id.as_ref());
-        let _ = writeln!(header, "kind {}", self.intent.kind);
-        let _ = writeln!(header, "boundary {}", self.intent.boundary);
+        encode_actor_headers(&mut header, &self.actor);
+        let _ = writeln!(header, "origin {}", self.intent.origin);
         if let Some(task_id) = self.intent.task_id {
             let _ = writeln!(header, "task_id {task_id}");
         }
@@ -601,29 +813,9 @@ impl CommitV2 {
         let at_ms_str = cursor.take_required(b"at_ms ", "expected at_ms line in commit-v2")?;
         let at_ms = parse_strict_i64(at_ms_str.as_bytes())
             .ok_or(CasError::BadFormat("invalid commit-v2 at_ms"))?;
-
-        let agent_id_str =
-            cursor.take_required(b"agent_id ", "expected agent_id line in commit-v2")?;
-        validate_header_value(agent_id_str, "invalid commit-v2 agent_id")?;
-        let execution_id = decode_optional_header(
-            &mut cursor,
-            b"execution_id ",
-            "invalid commit-v2 execution_id",
-        )?;
-        let model_label = decode_optional_header(
-            &mut cursor,
-            b"model_label ",
-            "invalid commit-v2 model_label",
-        )?;
-        let preset_id =
-            decode_optional_header(&mut cursor, b"preset_id ", "invalid commit-v2 preset_id")?;
-
-        let kind_str = cursor.take_required(b"kind ", "expected kind line in commit-v2")?;
-        let kind = CommitKind::parse(kind_str)?;
-
-        let boundary_str =
-            cursor.take_required(b"boundary ", "expected boundary line in commit-v2")?;
-        let boundary = CommitBoundary::parse(boundary_str)?;
+        let actor = decode_actor_headers(&mut cursor)?;
+        let origin_str = cursor.take_required(b"origin ", "expected origin line in commit-v2")?;
+        let origin = CommitOrigin::parse(origin_str)?;
 
         let task_id = match cursor.take_optional(b"task_id ")? {
             Some(raw) => Some(
@@ -663,15 +855,9 @@ impl CommitV2 {
             tree,
             parents,
             at_ms,
-            actor: CommitActor {
-                agent_id: agent_id_str.to_string(),
-                execution_id,
-                model_label,
-                preset_id,
-            },
+            actor,
             intent: CommitIntent {
-                kind,
-                boundary,
+                origin,
                 task_id,
                 transcript_ref,
                 message: message.to_string(),
@@ -685,31 +871,9 @@ impl CommitV2 {
         Ok(sha256_of(&self.encode()?))
     }
 
-    /// Lossless pure projection of code identity and AI lineage fields from this commit.
-    pub fn provenance_summary(&self) -> CommitProvenanceSummary {
-        let message_subject = self
-            .intent
-            .message
-            .split('\n')
-            .next()
-            .unwrap_or("")
-            .to_string();
-        CommitProvenanceSummary {
-            tree: self.tree.clone(),
-            parents: self.parents.clone(),
-            at_ms: self.at_ms,
-            agent_id: self.actor.agent_id.clone(),
-            execution_id: self.actor.execution_id.clone(),
-            model_label: self.actor.model_label.clone(),
-            preset_id: self.actor.preset_id.clone(),
-            kind: self.intent.kind,
-            boundary: self.intent.boundary,
-            task_id: self.intent.task_id,
-            transcript_ref: self.intent.transcript_ref.clone(),
-            message_subject,
-            message: self.intent.message.clone(),
-            has_git_compat_body: self.git_compat_body.is_some(),
-        }
+    /// First line of `intent.message`.
+    pub fn message_subject(&self) -> &str {
+        self.intent.message.split('\n').next().unwrap_or("")
     }
 }
 

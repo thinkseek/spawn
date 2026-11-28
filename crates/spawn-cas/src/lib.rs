@@ -65,8 +65,8 @@ pub use chunker::{
     fastcdc_gear_table, next_chunk_len,
 };
 pub use commit::{
-    COMMIT_V2_MAGIC, CommitActor, CommitBoundary, CommitIntent, CommitKind, CommitObject,
-    CommitProvenanceSummary, CommitV2,
+    COMMIT_V2_MAGIC, CommitActor, CommitIntent, CommitObject, CommitOrigin, CommitV2, WorkBoundary,
+    WorkChange,
 };
 pub use digest::{
     Algo, Digest, Hasher, Verified, is_hex64, sha256_of, sha256_reader, verify_reader,

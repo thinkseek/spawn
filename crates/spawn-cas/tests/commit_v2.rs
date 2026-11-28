@@ -1,7 +1,8 @@
 //! Golden fixtures, canonical encoding, dual `V1`/`V2` `CommitObject`
-//! decoding, AI provenance projection, persistent GC walk, and fail-closed
-//! validation tests for `CommitV2` (`Wave-1 S1`).
+//! decoding, AI lineage, persistent GC walk, and fail-closed validation tests
+//! for `CommitV2` (`Wave-1 S1` Round-2).
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -11,10 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use spawn_cas::{
-    CHUNK_MAX, COMMIT_V2_MAGIC, CasError, CommitActor, CommitBoundary, CommitIntent, CommitKind,
-    CommitObject, CommitProvenanceSummary, CommitV2, DEFAULT_PERSISTENT_GC_GRACE, Digest,
-    GcFenceBinding, NS_BLOB, NS_TREE, Snapshot, Store, Tree, TreeEntry, bind_gc_fence,
-    empty_tree_digest, sha256_of,
+    CHUNK_MAX, COMMIT_V2_MAGIC, CasError, CommitActor, CommitIntent, CommitObject, CommitOrigin,
+    CommitV2, DEFAULT_PERSISTENT_GC_GRACE, Digest, GcFenceBinding, NS_BLOB, NS_TREE, Snapshot,
+    Store, Tree, TreeEntry, WorkBoundary, WorkChange, bind_gc_fence, empty_tree_digest, sha256_of,
 };
 
 struct Scratch(PathBuf);
@@ -82,15 +82,17 @@ fn sample_commit() -> CommitV2 {
         tree: digest_n(0x11),
         parents: vec![digest_n(0x22)],
         at_ms: 1_795_700_000_000,
-        actor: CommitActor {
-            agent_id: "agent-alpha".to_string(),
+        actor: CommitActor::Agent {
+            id: "agent-alpha".to_string(),
             execution_id: Some("exec_123".to_string()),
             model_label: Some("model-v1".to_string()),
             preset_id: Some("preset-default".to_string()),
         },
         intent: CommitIntent {
-            kind: CommitKind::Edit,
-            boundary: CommitBoundary::Checkpoint,
+            origin: CommitOrigin::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Checkpoint,
+            },
             task_id: Some(77),
             transcript_ref: Some("transcript://exec_123/turn-1".to_string()),
             message: "checkpoint commit".to_string(),
@@ -173,15 +175,17 @@ fn golden_d6_cas_v2_native_and_minimal_vectors() {
         tree: v1_tree,
         parents: vec![v1_snap],
         at_ms: 1_795_700_123_456,
-        actor: CommitActor {
-            agent_id: "agent-s1-coder".to_string(),
+        actor: CommitActor::Agent {
+            id: "agent-s1-coder".to_string(),
             execution_id: Some("exec_01928374".to_string()),
             model_label: Some("claude-opus-4.5".to_string()),
             preset_id: Some("preset-architect".to_string()),
         },
         intent: CommitIntent {
-            kind: CommitKind::Edit,
-            boundary: CommitBoundary::Checkpoint,
+            origin: CommitOrigin::Work {
+                change: WorkChange::Edit,
+                boundary: WorkBoundary::Checkpoint,
+            },
             task_id: Some(42),
             transcript_ref: Some("transcript://exec_01928374/turn-3".to_string()),
             message: "feat(cas): native spawn commit-v2\n\nIncludes UTF-8 — résumé\tand literal:\ngit_compat 3\nabc".to_string(),
@@ -204,15 +208,11 @@ fn golden_d6_cas_v2_native_and_minimal_vectors() {
         tree: empty_tree_digest(),
         parents: Vec::new(),
         at_ms: 0,
-        actor: CommitActor {
-            agent_id: "human:owner".to_string(),
-            execution_id: None,
-            model_label: None,
-            preset_id: None,
+        actor: CommitActor::Human {
+            id: "owner".to_string(),
         },
         intent: CommitIntent {
-            kind: CommitKind::Import,
-            boundary: CommitBoundary::Backfill,
+            origin: CommitOrigin::Import,
             task_id: None,
             transcript_ref: None,
             message: "initial import".to_string(),
@@ -230,6 +230,7 @@ fn golden_d6_cas_v2_native_and_minimal_vectors() {
     let minimal_str = std::str::from_utf8(&minimal_raw).expect("utf8");
     assert!(!minimal_str.contains("git_compat "));
     assert!(!minimal_str.contains("execution_id "));
+    assert!(!minimal_str.contains("human:owner"));
 }
 
 #[test]
@@ -242,15 +243,11 @@ fn golden_d6_cas_v2_compat_and_v1_coexistence() {
         tree: v1_tree,
         parents: vec![v1_parent, v1_snap.clone()],
         at_ms: -86_400_000,
-        actor: CommitActor {
-            agent_id: "integrator-1".to_string(),
-            execution_id: Some("exec_land_99".to_string()),
-            model_label: None,
-            preset_id: Some("preset-land".to_string()),
+        actor: CommitActor::System {
+            id: "integrator-1".to_string(),
         },
         intent: CommitIntent {
-            kind: CommitKind::Land,
-            boundary: CommitBoundary::Land,
+            origin: CommitOrigin::Land,
             task_id: None,
             transcript_ref: None,
             message: "merge landing from feature branch".to_string(),
@@ -279,68 +276,105 @@ fn golden_d6_cas_v2_compat_and_v1_coexistence() {
 }
 
 #[test]
-fn deterministic_encoding_covers_all_enum_variants_and_edge_values() {
-    let kinds = [
-        CommitKind::Edit,
-        CommitKind::Derive,
-        CommitKind::Land,
-        CommitKind::Revert,
-        CommitKind::Import,
-    ];
-    let boundaries = [
-        CommitBoundary::Checkpoint,
-        CommitBoundary::Submit,
-        CommitBoundary::Land,
-        CommitBoundary::Job,
-        CommitBoundary::Backfill,
-    ];
+fn deterministic_encoding_covers_all_11_origins_and_all_actors() {
+    assert_eq!(CommitOrigin::ALL.len(), 11);
+    let mut origin_wires = BTreeSet::new();
+    let mut origin_digests = BTreeSet::new();
     let edge_times = [0_i64, -1, 1, i64::MIN, i64::MAX];
 
-    for (idx, (&kind, &boundary)) in kinds
-        .iter()
-        .flat_map(|k| boundaries.iter().map(move |b| (k, b)))
-        .enumerate()
-    {
-        let k_json = serde_json::to_string(&kind).expect("serialize kind");
-        let k_back: CommitKind = serde_json::from_str(&k_json).expect("deserialize kind");
-        assert_eq!(k_back, kind);
-        assert_eq!(CommitKind::parse(kind.as_str()).expect("parse kind"), kind);
+    for change in [WorkChange::Edit, WorkChange::Derive, WorkChange::Revert] {
+        let json = serde_json::to_string(&change).expect("ser change");
+        let back: WorkChange = serde_json::from_str(&json).expect("de change");
+        assert_eq!(back, change);
+        assert_eq!(WorkChange::parse(change.as_str()).expect("parse"), change);
         assert_eq!(
-            kind.to_string().parse::<CommitKind>().expect("from_str"),
-            kind
+            change.to_string().parse::<WorkChange>().expect("str"),
+            change
         );
+    }
+    for boundary in [
+        WorkBoundary::Checkpoint,
+        WorkBoundary::Submit,
+        WorkBoundary::Job,
+    ] {
+        let json = serde_json::to_string(&boundary).expect("ser boundary");
+        let back: WorkBoundary = serde_json::from_str(&json).expect("de boundary");
+        assert_eq!(back, boundary);
+        assert_eq!(
+            WorkBoundary::parse(boundary.as_str()).expect("parse"),
+            boundary
+        );
+        assert_eq!(
+            boundary.to_string().parse::<WorkBoundary>().expect("str"),
+            boundary
+        );
+    }
 
-        let b_json = serde_json::to_string(&boundary).expect("serialize boundary");
-        let b_back: CommitBoundary = serde_json::from_str(&b_json).expect("deserialize boundary");
-        assert_eq!(b_back, boundary);
+    for (idx, &origin) in CommitOrigin::ALL.iter().enumerate() {
+        assert!(origin_wires.insert(origin.as_str()));
+        let o_json = serde_json::to_string(&origin).expect("serialize origin");
+        let o_back: CommitOrigin = serde_json::from_str(&o_json).expect("deserialize origin");
+        assert_eq!(o_back, origin);
+        assert_eq!(CommitOrigin::parse(origin.as_str()).expect("parse"), origin);
         assert_eq!(
-            CommitBoundary::parse(boundary.as_str()).expect("parse boundary"),
-            boundary
-        );
-        assert_eq!(
-            boundary
+            origin
                 .to_string()
-                .parse::<CommitBoundary>()
+                .parse::<CommitOrigin>()
                 .expect("from_str"),
-            boundary
+            origin
         );
 
         let at_ms = edge_times[idx % edge_times.len()];
         let mut commit = sample_commit();
         commit.at_ms = at_ms;
-        commit.intent.kind = kind;
-        commit.intent.boundary = boundary;
+        commit.intent.origin = origin;
         commit.intent.task_id = Some(at_ms);
-        commit.intent.message = format!("line 1\t({kind}/{boundary})\n\ngit_compat 9\nfake_body");
+        commit.intent.message = format!("line 1\t({origin})\n\ngit_compat 9\nfake_body");
 
         let enc_a = commit.encode().expect("encode a");
         let enc_b = commit.encode().expect("encode b");
         assert_eq!(enc_a, enc_b);
+        assert!(origin_digests.insert(sha256_of(&enc_a)));
         assert_eq!(
             CommitObject::decode(&enc_a).expect("decode"),
-            CommitObject::V2(commit.clone())
+            CommitObject::V2(commit)
         );
     }
+    assert_eq!(origin_wires.len(), 11);
+    assert_eq!(origin_digests.len(), 11);
+
+    let actors = [
+        CommitActor::Agent {
+            id: "agent-full".to_string(),
+            execution_id: Some("exec_1".to_string()),
+            model_label: Some("claude-opus-4.5".to_string()),
+            preset_id: Some("preset-1".to_string()),
+        },
+        CommitActor::Agent {
+            id: "agent-bare".to_string(),
+            execution_id: None,
+            model_label: None,
+            preset_id: None,
+        },
+        CommitActor::Human {
+            id: "owner".to_string(),
+        },
+        CommitActor::System {
+            id: "integrator".to_string(),
+        },
+    ];
+    let mut actor_digests = BTreeSet::new();
+    for actor in actors {
+        let a_json = serde_json::to_string(&actor).expect("serialize actor");
+        let a_back: CommitActor = serde_json::from_str(&a_json).expect("deserialize actor");
+        assert_eq!(a_back, actor);
+        let mut c = sample_commit();
+        c.actor = actor;
+        let wire = c.encode().expect("encode actor commit");
+        assert!(actor_digests.insert(sha256_of(&wire)));
+        assert_eq!(CommitV2::decode(&wire).expect("decode actor commit"), c);
+    }
+    assert_eq!(actor_digests.len(), 4);
 }
 
 #[test]
@@ -465,8 +499,8 @@ fn store_gc_persistent_retains_mixed_v2_to_v1_graph() {
 }
 
 #[test]
-fn provenance_summary_projects_full_ai_lineage_from_single_root_hash() {
-    let scratch = Scratch::new("provenance");
+fn commit_v2_exposes_full_ai_lineage_from_single_root_hash() {
+    let scratch = Scratch::new("lineage");
     let store = Store::open(scratch.join("cas")).expect("open");
 
     let mut commit = sample_commit();
@@ -478,66 +512,51 @@ fn provenance_summary_projects_full_ai_lineage_from_single_root_hash() {
     let CommitObject::V2(decoded) = fetched else {
         panic!("expected CommitObject::V2");
     };
-    let summary = decoded.provenance_summary();
-    assert_eq!(summary.tree, commit.tree);
-    assert_eq!(summary.parents, commit.parents);
-    assert_eq!(summary.at_ms, commit.at_ms);
-    assert_eq!(summary.agent_id, "agent-alpha");
-    assert_eq!(summary.execution_id.as_deref(), Some("exec_123"));
-    assert_eq!(summary.model_label.as_deref(), Some("model-v1"));
-    assert_eq!(summary.preset_id.as_deref(), Some("preset-default"));
-    assert_eq!(summary.kind, CommitKind::Edit);
-    assert_eq!(summary.boundary, CommitBoundary::Checkpoint);
-    assert_eq!(summary.task_id, Some(77));
+    assert_eq!(decoded.tree, commit.tree);
+    assert_eq!(decoded.parents, commit.parents);
+    assert_eq!(decoded.at_ms, commit.at_ms);
+    assert_eq!(decoded.actor.kind_str(), "agent");
+    assert_eq!(decoded.actor.id(), "agent-alpha");
+    assert_eq!(decoded.actor.execution_id(), Some("exec_123"));
+    assert_eq!(decoded.actor.model_label(), Some("model-v1"));
+    assert_eq!(decoded.actor.preset_id(), Some("preset-default"));
     assert_eq!(
-        summary.transcript_ref.as_deref(),
+        decoded.intent.origin,
+        CommitOrigin::Work {
+            change: WorkChange::Edit,
+            boundary: WorkBoundary::Checkpoint,
+        }
+    );
+    assert_eq!(decoded.intent.task_id, Some(77));
+    assert_eq!(
+        decoded.intent.transcript_ref.as_deref(),
         Some("transcript://exec_123/turn-1")
     );
-    assert_eq!(summary.message_subject, "feat: converge provenance");
+    assert_eq!(decoded.message_subject(), "feat: converge provenance");
     assert_eq!(
-        summary.message,
+        decoded.intent.message,
         "feat: converge provenance\n\nBody paragraph 1"
     );
-    assert!(!summary.has_git_compat_body);
+    assert!(decoded.git_compat_body.is_none());
 
-    let json = serde_json::to_string(&summary).expect("serialize summary");
-    let roundtrip: CommitProvenanceSummary =
-        serde_json::from_str(&json).expect("deserialize summary");
-    assert_eq!(roundtrip, summary);
-
-    commit.git_compat_body = Some(b"author X <x@y> 0 +0000\n\nhi\n".to_vec());
-    assert!(commit.provenance_summary().has_git_compat_body);
+    let human = CommitActor::Human {
+        id: "alice".to_string(),
+    };
+    assert_eq!(human.kind_str(), "human");
+    assert_eq!(human.id(), "alice");
+    assert_eq!(human.execution_id(), None);
+    assert_eq!(human.model_label(), None);
+    assert_eq!(human.preset_id(), None);
 }
 
 #[test]
-fn fail_closed_encode_rejects_illegal_fields_and_oversize() {
-    for bad in ["", " ", "\t\n", " leading", "trailing "] {
-        let mut c = sample_commit();
-        c.actor.agent_id = bad.to_string();
-        assert!(matches!(c.encode(), Err(CasError::BadFormat(_))));
-
-        let mut c = sample_commit();
-        c.actor.execution_id = Some(bad.to_string());
-        assert!(matches!(c.encode(), Err(CasError::BadFormat(_))));
-
-        let mut c = sample_commit();
-        c.actor.model_label = Some(bad.to_string());
-        assert!(matches!(c.encode(), Err(CasError::BadFormat(_))));
-
-        let mut c = sample_commit();
-        c.actor.preset_id = Some(bad.to_string());
-        assert!(matches!(c.encode(), Err(CasError::BadFormat(_))));
-
-        let mut c = sample_commit();
-        c.intent.transcript_ref = Some(bad.to_string());
-        assert!(matches!(c.encode(), Err(CasError::BadFormat(_))));
-    }
-
-    let mut overlong = sample_commit();
-    overlong.actor.agent_id = "a".repeat(1_025);
-    assert!(matches!(overlong.encode(), Err(CasError::BadFormat(_))));
-
-    for ctrl in [
+fn fail_closed_encode_rejects_illegal_actor_and_headers() {
+    for bad in [
+        "",
+        " ",
+        "\t\n",
+        " leading",
+        "trailing ",
         "a\0b",
         "a\nb",
         "a\rb",
@@ -546,15 +565,66 @@ fn fail_closed_encode_rejects_illegal_fields_and_oversize() {
         "a\x7fb",
         "a\u{0085}b",
     ] {
+        for actor in [
+            CommitActor::Agent {
+                id: bad.to_string(),
+                execution_id: None,
+                model_label: None,
+                preset_id: None,
+            },
+            CommitActor::Human {
+                id: bad.to_string(),
+            },
+            CommitActor::System {
+                id: bad.to_string(),
+            },
+        ] {
+            let mut c = sample_commit();
+            c.actor = actor;
+            assert!(matches!(c.encode(), Err(CasError::BadFormat(_))));
+        }
+
         let mut c = sample_commit();
-        c.actor.agent_id = ctrl.to_string();
+        c.actor = CommitActor::Agent {
+            id: "agent-alpha".to_string(),
+            execution_id: Some(bad.to_string()),
+            model_label: None,
+            preset_id: None,
+        };
         assert!(matches!(c.encode(), Err(CasError::BadFormat(_))));
 
         let mut c = sample_commit();
-        c.intent.transcript_ref = Some(ctrl.to_string());
+        c.actor = CommitActor::Agent {
+            id: "agent-alpha".to_string(),
+            execution_id: None,
+            model_label: Some(bad.to_string()),
+            preset_id: None,
+        };
+        assert!(matches!(c.encode(), Err(CasError::BadFormat(_))));
+
+        let mut c = sample_commit();
+        c.actor = CommitActor::Agent {
+            id: "agent-alpha".to_string(),
+            execution_id: None,
+            model_label: None,
+            preset_id: Some(bad.to_string()),
+        };
+        assert!(matches!(c.encode(), Err(CasError::BadFormat(_))));
+
+        let mut c = sample_commit();
+        c.intent.transcript_ref = Some(bad.to_string());
         assert!(matches!(c.encode(), Err(CasError::BadFormat(_))));
     }
 
+    let mut overlong = sample_commit();
+    overlong.actor = CommitActor::Human {
+        id: "a".repeat(1_025),
+    };
+    assert!(matches!(overlong.encode(), Err(CasError::BadFormat(_))));
+}
+
+#[test]
+fn fail_closed_encode_rejects_illegal_messages_parents_and_oversize() {
     for bad_msg in [
         "",
         "   ",
@@ -604,7 +674,73 @@ fn fail_closed_encode_rejects_illegal_fields_and_oversize() {
 }
 
 #[test]
-fn fail_closed_decode_rejects_header_and_enum_violations() {
+fn fail_closed_decode_rejects_contradictory_origins_and_bad_actors() {
+    let base_tree = digest_n(0x11);
+
+    let bad_origins = [
+        "kind edit\nboundary checkpoint",
+        "origin land/checkpoint",
+        "origin import/submit",
+        "origin edit/land",
+        "origin land/backfill",
+        "origin work/land/checkpoint",
+        "origin work/import/submit",
+        "origin work/edit",
+        "origin work/edit/land",
+        "origin work/edit/backfill",
+        "origin work/edit/checkpoint/extra",
+        "origin backfill",
+        "origin checkpoint",
+        "origin edit",
+        "origin Land",
+        "origin merge",
+    ];
+    for raw_origin in bad_origins {
+        let wire = format!(
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\n{raw_origin}\nmessage 2\nhi"
+        );
+        assert!(
+            CommitV2::decode(wire.as_bytes()).is_err(),
+            "unexpectedly accepted {raw_origin:?}"
+        );
+        assert!(CommitOrigin::parse(raw_origin.trim_start_matches("origin ")).is_err());
+    }
+
+    let bad_actors = [
+        "agent_id a",
+        "actor bot x",
+        "actor human",
+        "actor human ",
+        "actor human  owner",
+        "actor agent agent-1\nmodel_label m\nexecution_id e",
+        "actor agent agent-1\nexecution_id e1\nexecution_id e2",
+        "actor human owner\nexecution_id e1",
+        "actor human owner\nmodel_label m1",
+        "actor human owner\npreset_id p1",
+        "actor system sys\nexecution_id e1",
+        "actor system sys\nmodel_label m1",
+        "actor system sys\npreset_id p1",
+        "actor agent a\tb",
+        "actor agent  leading",
+    ];
+    for raw_actor in bad_actors {
+        let wire = format!(
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\n{raw_actor}\norigin work/edit/checkpoint\nmessage 2\nhi"
+        );
+        assert!(
+            CommitV2::decode(wire.as_bytes()).is_err(),
+            "unexpectedly accepted actor {raw_actor:?}"
+        );
+    }
+
+    assert!(WorkChange::parse("land").is_err());
+    assert!(WorkChange::parse("import").is_err());
+    assert!(WorkBoundary::parse("land").is_err());
+    assert!(WorkBoundary::parse("backfill").is_err());
+}
+
+#[test]
+fn fail_closed_decode_rejects_header_and_number_violations() {
     let base_tree = digest_n(0x11);
     let base_p1 = digest_n(0x22);
 
@@ -613,63 +749,35 @@ fn fail_closed_decode_rejects_header_and_enum_violations() {
         b"spawn-tree-v1\n\x00\x00\x00\x00".to_vec(),
         b"spawn-commit-v2".to_vec(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nunknown foo\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi"
+            "spawn-commit-v2\ntree {base_tree}\nunknown foo\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nmodel_label m\nexecution_id e\nkind edit\nboundary checkpoint\nmessage 2\nhi"
+            "spawn-commit-v2\ntree {base_tree}\nparent {base_p1}\nparent {base_p1}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nexecution_id e1\nexecution_id e2\nkind edit\nboundary checkpoint\nmessage 2\nhi"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms +1\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nboundary checkpoint\nkind edit\nmessage 2\nhi"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 01\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nparent {base_p1}\nparent {base_p1}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms -0\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind merge\nboundary checkpoint\nmessage 2\nhi"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 9223372036854775808\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind Edit\nboundary checkpoint\nmessage 2\nhi"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\ntask_id 07\nmessage 2\nhi"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary merge\nmessage 2\nhi"
-        )
-        .into_bytes(),
-        format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms +1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi"
-        )
-        .into_bytes(),
-        format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 01\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi"
-        )
-        .into_bytes(),
-        format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms -0\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi"
-        )
-        .into_bytes(),
-        format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 9223372036854775808\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi"
-        )
-        .into_bytes(),
-        format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\ntask_id 07\nmessage 2\nhi"
-        )
-        .into_bytes(),
-        format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\tb\nkind edit\nboundary checkpoint\nmessage 2\nhi"
-        )
-        .into_bytes(),
-        format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id  leading\nkind edit\nboundary checkpoint\nmessage 2\nhi"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\ntranscript_ref t\ntask_id 7\nmessage 2\nhi"
         )
         .into_bytes(),
     ];
@@ -684,9 +792,6 @@ fn fail_closed_decode_rejects_header_and_enum_violations() {
             "bad_wire[{idx}] unexpectedly decoded via CommitObject::decode"
         );
     }
-
-    assert!(CommitKind::parse("unknown").is_err());
-    assert!(CommitBoundary::parse("unknown").is_err());
 }
 
 #[test]
@@ -695,51 +800,51 @@ fn fail_closed_decode_rejects_payload_lengths_limits_and_trailers() {
     let base_p2 = digest_n(0x33);
 
     let mut non_utf8_msg = format!(
-        "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\n"
+        "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 2\n"
     )
     .into_bytes();
     non_utf8_msg.extend_from_slice(&[0xFF, 0xFE]);
 
     let bad_payloads: Vec<Vec<u8>> = vec![
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 0\n"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 0\n"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 5\nhi"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 5\nhi"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 99999999999999999999999\nhi"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 99999999999999999999999\nhi"
         )
         .into_bytes(),
         non_utf8_msg,
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 4\nhi\r!"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 4\nhi\r!"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi!"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi!"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi\nunknown 1\nx"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi\nunknown 1\nx"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi\ngit_compat 0\n"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi\ngit_compat 0\n"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi\ngit_compat 4\nabc"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi\ngit_compat 4\nabc"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi\ngit_compat 3\nabcd"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi\ngit_compat 3\nabcd"
         )
         .into_bytes(),
         format!(
-            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi\ngit_compat 3\na\0c"
+            "spawn-commit-v2\ntree {base_tree}\nat_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi\ngit_compat 3\na\0c"
         )
         .into_bytes(),
     ];
@@ -766,7 +871,7 @@ fn fail_closed_decode_rejects_payload_lengths_limits_and_trailers() {
         );
     }
     wire_too_many_parents
-        .push_str("at_ms 1\nagent_id a\nkind edit\nboundary checkpoint\nmessage 2\nhi");
+        .push_str("at_ms 1\nactor agent a\norigin work/edit/checkpoint\nmessage 2\nhi");
     assert!(matches!(
         CommitV2::decode(wire_too_many_parents.as_bytes()),
         Err(CasError::BadFormat(_))
