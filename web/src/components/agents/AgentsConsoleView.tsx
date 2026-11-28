@@ -19,7 +19,6 @@ import {
   buildSendKeysAction,
   buildSendTextAction,
   defaultSendPolicyMode,
-  effectiveIncludeAll,
   evaluateActionCapabilities,
   isGuardedPolicyMode,
   isValidScreenGuard,
@@ -273,14 +272,13 @@ export function AgentsConsoleView({
   selectedAddress,
   onSelectAddress,
 }: AgentsConsoleViewProps) {
-  const [requestedAll, setRequestedAll] = useState(false);
+  const [includeAll, setIncludeAll] = useState(false);
   const [originFilter, setOriginFilter] = useState<OriginFilter>("all");
   const [query, setQuery] = useState("");
   const [refreshSeq, setRefreshSeq] = useState(0);
   const [mobileDetailOpen, setMobileDetailOpen] = useState(() => selectedAddress !== null);
   const [serverReadOnlyRefused, setServerReadOnlyRefused] = useState(false);
 
-  const includeAll = effectiveIncludeAll(role, requestedAll);
   const isReadOnly = role.kind === "viewer" || serverReadOnlyRefused;
 
   const [discovery, setDiscovery] = useState<AgentDiscoveryState>(() => ({
@@ -500,14 +498,37 @@ export function AgentsConsoleView({
     };
   }, [selectedAddress, refreshSeq, refreshSnapshotOnce]);
 
-  const activeSnapshot: TuiSnapshot | null = snapshotFromState(snapshotState);
+  const scopedSnapshotState: SnapshotLoadState = useMemo(() => {
+    if (selectedAddress === null) return { kind: "idle" };
+    if (snapshotState.kind !== "idle" && snapshotState.address === selectedAddress) {
+      return snapshotState;
+    }
+    return { kind: "loading", address: selectedAddress, previous: null };
+  }, [snapshotState, selectedAddress]);
+
+  const visibleActionState: ActionSubmissionState =
+    actionState.kind === "idle" ||
+    (selectedAddress !== null && actionState.address === selectedAddress)
+      ? actionState
+      : { kind: "idle" };
+
+  const activeSnapshot: TuiSnapshot | null = snapshotFromState(
+    snapshotState,
+    selectedAddress,
+  );
   const selectedSummary = useMemo(
     () => rawAgents.find((a) => a.address === selectedAddress) ?? null,
     [rawAgents, selectedAddress],
   );
   const capabilities = useMemo(
-    () => evaluateActionCapabilities(role, serverReadOnlyRefused, snapshotState),
-    [role, serverReadOnlyRefused, snapshotState],
+    () =>
+      evaluateActionCapabilities(
+        role,
+        serverReadOnlyRefused,
+        snapshotState,
+        selectedAddress,
+      ),
+    [role, serverReadOnlyRefused, snapshotState, selectedAddress],
   );
 
   const actionSubmitting = actionState.kind === "submitting";
@@ -693,21 +714,23 @@ export function AgentsConsoleView({
           </>
         }
       >
-        {!isReadOnly && (
-          <button
-            type="button"
-            onClick={() => setRequestedAll((v) => !v)}
-            aria-pressed={includeAll}
-            className={cx(
-              chip(includeAll),
-              "pointer-coarse:h-10",
-              FOCUS_RING,
-            )}
-            title="切换 GET /api/agents?all=true（包含已退出或外部终端）"
-          >
-            {includeAll ? "包含已退出 (?all=true)" : "仅运行中"}
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={() => setIncludeAll((v) => !v)}
+          aria-pressed={includeAll}
+          className={cx(
+            chip(includeAll),
+            "pointer-coarse:h-10",
+            FOCUS_RING,
+          )}
+          title={
+            isReadOnly
+              ? "切换 GET /api/agents?all=true（包含已退出的 Spawn 托管终端）"
+              : "切换 GET /api/agents?all=true（包含已退出终端；外部终端可见性由角色权限控制）"
+          }
+        >
+          {includeAll ? "包含已退出 (?all=true)" : "仅运行中"}
+        </button>
         <Button
           onClick={() => setRefreshSeq((s) => s + 1)}
           className="pointer-coarse:h-10"
@@ -808,7 +831,9 @@ export function AgentsConsoleView({
                     title="未发现匹配的终端"
                     hint={
                       isReadOnly
-                        ? "当前无运行中的 Spawn 受管 Herdr 终端（ReadOnlyViewer 不会显示外部非受管终端）。"
+                        ? includeAll
+                          ? "当前无运行中或已退出的 Spawn 受管 Herdr 终端（ReadOnlyViewer 不会显示外部非受管终端）。"
+                          : "当前无运行中的 Spawn 受管 Herdr 终端；可切换「包含已退出 (?all=true)」查看历史 Spawn 终端（外部终端仍不曝光）。"
                         : "确认 herdr-core 正在运行，或切换「仅运行中 / 包含已退出 (?all=true)」查看更多终端。"
                     }
                     className="px-3 py-10"
@@ -915,7 +940,7 @@ export function AgentsConsoleView({
                 hint="从左侧列表选择终端以查看实时屏幕保真度、ScreenGuard 摘要与可控操作。"
               />
             </div>
-          ) : snapshotState.kind === "forbidden_external" ? (
+          ) : scopedSnapshotState.kind === "forbidden_external" ? (
             <Card className="p-5">
               <div className="flex items-start gap-3">
                 <ShieldAlert size={18} className="mt-0.5 shrink-0 text-destructive" />
@@ -924,7 +949,7 @@ export function AgentsConsoleView({
                     外部终端观察已拦截（HTTP 403）
                   </h2>
                   <p className="text-caption text-destructive">
-                    {snapshotState.message}
+                    {scopedSnapshotState.message}
                   </p>
                   <p className="text-caption text-muted-foreground">
                     `ReadOnlyViewer` 凭据仅允许列出和读取 Spawn 受管终端的屏幕快照；未触发任何外部读屏操作。
@@ -932,19 +957,19 @@ export function AgentsConsoleView({
                 </div>
               </div>
             </Card>
-          ) : snapshotState.kind === "unauthorized" ? (
+          ) : scopedSnapshotState.kind === "unauthorized" ? (
             <Card className="p-5">
               <p className="text-caption text-destructive">
-                {snapshotState.message}
+                {scopedSnapshotState.message}
               </p>
             </Card>
-          ) : snapshotState.kind === "not_found" ? (
+          ) : scopedSnapshotState.kind === "not_found" ? (
             <Card className="p-5">
               <EmptyState
-                title={`终端 ${snapshotState.address} 已不存在或已释放`}
+                title={`终端 ${scopedSnapshotState.address} 已不存在或已释放`}
                 hint={
                   <div className="flex flex-col items-center gap-3">
-                    <span>{snapshotState.message}</span>
+                    <span>{scopedSnapshotState.message}</span>
                     <Button
                       onClick={() => {
                         onSelectAddress(null);
@@ -1002,7 +1027,7 @@ export function AgentsConsoleView({
                         {selectedSummary && <span>T{selectedSummary.turn}</span>}
                         <span
                           className="rounded bg-inset px-1.5 py-px text-foreground select-all"
-                          title={`Endpoint: ${agentSnapshotUrl(selectedAddress)} | snapshot_hash=${activeSnapshot.snapshot_hash}`}
+                          title={`Endpoint: ${agentSnapshotUrl(selectedAddress)} | guard=${activeSnapshot.guard}`}
                         >
                           guard {activeSnapshot.guard}
                         </span>
@@ -1076,9 +1101,9 @@ export function AgentsConsoleView({
                   </div>
                 )}
 
-                {snapshotState.kind === "error" && (
+                {scopedSnapshotState.kind === "error" && (
                   <div className="border-t border-surface-border bg-fail-tint px-4 py-2 text-caption text-destructive">
-                    {snapshotState.message}
+                    {scopedSnapshotState.message}
                   </div>
                 )}
               </Card>
@@ -1100,10 +1125,10 @@ export function AgentsConsoleView({
                         : `${activeSnapshot.plain_lines.length} plain lines`}
                     </span>
                   )}
-                  {snapshotState.kind === "ready" && (
+                  {scopedSnapshotState.kind === "ready" && (
                     <span className="ml-auto inline-flex items-center gap-1 font-mono text-micro text-faint-foreground">
                       <Clock size={11} />
-                      {relativeTime(snapshotState.capturedAtMs)}
+                      {relativeTime(scopedSnapshotState.capturedAtMs)}
                     </span>
                   )}
                 </header>
@@ -1196,7 +1221,7 @@ export function AgentsConsoleView({
                   </div>
                 )}
 
-              {actionState.kind === "conflict_guard_mismatch" && (
+              {visibleActionState.kind === "conflict_guard_mismatch" && (
                 <div
                   role="alert"
                   className="flex items-start gap-2.5 rounded-card border border-warning/40 bg-wait-tint px-3.5 py-3 text-caption text-warning"
@@ -1206,14 +1231,14 @@ export function AgentsConsoleView({
                     <div className="font-semibold">
                       ScreenGuard 冲突（HTTP 409 guard_mismatch）— 已停止自动提交
                     </div>
-                    <p className="break-words">{actionState.message}</p>
+                    <p className="break-words">{visibleActionState.message}</p>
                     <div className="flex flex-wrap gap-3 font-mono text-micro">
-                      <span>期望旧 Guard: {actionState.staleGuard ?? "—"}</span>
+                      <span>期望旧 Guard: {visibleActionState.staleGuard ?? "—"}</span>
                       <span>
-                        {actionState.refreshPhase === "refreshing"
+                        {visibleActionState.refreshPhase === "refreshing"
                           ? "正在自动刷新最新快照…"
-                          : actionState.refreshPhase === "refreshed"
-                            ? `已自动刷新最新 Guard: ${actionState.freshGuard ?? "—"}（请确认屏幕后手动重发）`
+                          : visibleActionState.refreshPhase === "refreshed"
+                            ? `已自动刷新最新 Guard: ${visibleActionState.freshGuard ?? "—"}（请确认屏幕后手动重发）`
                             : "快照自动刷新失败，请点击右上角「刷新」后重发"}
                       </span>
                     </div>
@@ -1228,41 +1253,41 @@ export function AgentsConsoleView({
                 </div>
               )}
 
-              {actionState.kind === "blocked_unobservable_selection" && (
+              {visibleActionState.kind === "blocked_unobservable_selection" && (
                 <div
                   role="alert"
                   className="rounded-card bg-wait-tint px-3.5 py-2.5 text-caption text-warning"
                 >
-                  {actionState.message}
+                  {visibleActionState.message}
                 </div>
               )}
 
-              {actionState.kind === "forbidden_readonly" && (
+              {visibleActionState.kind === "forbidden_readonly" && (
                 <div
                   role="alert"
                   className="flex items-start gap-2 rounded-card bg-fail-tint px-3.5 py-2.5 text-caption text-destructive"
                 >
                   <ShieldAlert size={15} className="mt-0.5 shrink-0" />
-                  <div>{actionState.message}</div>
+                  <div>{visibleActionState.message}</div>
                 </div>
               )}
 
-              {actionState.kind === "failed" && (
+              {visibleActionState.kind === "failed" && (
                 <div
                   role="alert"
                   className="rounded-card bg-fail-tint px-3.5 py-2.5 text-caption text-destructive"
                 >
-                  {actionState.message}
+                  {visibleActionState.message}
                 </div>
               )}
 
-              {actionState.kind === "succeeded" && (
+              {visibleActionState.kind === "succeeded" && (
                 <div
                   role="status"
                   className="flex items-center gap-2 rounded-card bg-ok-tint px-3.5 py-2.5 text-caption text-success"
                 >
                   <CheckCircle2 size={15} className="shrink-0" />
-                  <span>{formatActionOutcome(actionState.outcome)}</span>
+                  <span>{formatActionOutcome(visibleActionState.outcome)}</span>
                 </div>
               )}
 
