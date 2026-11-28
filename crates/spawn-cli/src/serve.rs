@@ -185,6 +185,10 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::TerminalHost;
+use spawn_core::tui::{TerminalAddress, TuiAction};
+use spawn_host::herdr_global::{
+    DiscoveryScope, GlobalErrorKind, GlobalHerdrError, HerdrGlobalClient, SocketScope,
+};
 
 use crate::objectives::{
     Landing, Outcome, Task, attempts, choose, holds, landed_value, load_backlog, metric_lines,
@@ -347,6 +351,9 @@ fn serve(flags: &Flags) -> Result<i32, String> {
         hosts,
         open,
         pools: Ok(pools),
+        agent_socket: env_value("HC_SOCKET")
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from),
     });
     // Listen again on the bound address, so a client's port stays right.
     let bound = server
@@ -467,6 +474,9 @@ struct Shared {
     /// Unified role connection pools (`reads`, `writes`, `node`, `events`)
     /// derived once at startup; the owner URL is dropped immediately.
     pools: Result<Option<Arc<ipc::ServePools>>, String>,
+    /// Optional explicit Herdr UDS socket override for global `/api/agents*` endpoints
+    /// (`HC_SOCKET` in production, or mock UDS socket in unit tests).
+    agent_socket: Option<PathBuf>,
 }
 
 impl Shared {
@@ -1658,6 +1668,9 @@ fn handle_api_request(
     if is_storage_read_route(path) {
         return respond_storage_read(request, path, query, shared).map(|()| None);
     }
+    if let Some(agent_route) = parse_agent_route(path) {
+        return respond_agent_route(request, agent_route, query, access, shared).map(|()| None);
+    }
     let Some((method, pattern, values)) = route(path) else {
         return static_file(request, &shared.web, path).map(|()| None);
     };
@@ -1764,6 +1777,256 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
     };
     let if_none_match = header(&request, "If-None-Match").map(str::to_string);
     answers::respond(request, &answer, if_none_match.as_deref())
+}
+
+const MAX_AGENT_WAIT_MS: u64 = 120_000;
+
+enum AgentRoute {
+    List,
+    Snapshot { address: TerminalAddress },
+    Action { address: TerminalAddress },
+    InvalidAddress,
+}
+
+fn decode_agent_address(raw: &str) -> Option<TerminalAddress> {
+    let decoded = percent_decoded(raw)?;
+    TerminalAddress::parse(&decoded).ok()
+}
+
+fn parse_agent_route(path: &str) -> Option<AgentRoute> {
+    if path == "/api/agents" {
+        return Some(AgentRoute::List);
+    }
+    let rest = path.strip_prefix("/api/agents/")?;
+    if let Some(raw_addr) = rest.strip_suffix("/snapshot") {
+        return Some(match decode_agent_address(raw_addr) {
+            Some(address) => AgentRoute::Snapshot { address },
+            None => AgentRoute::InvalidAddress,
+        });
+    }
+    if let Some(raw_addr) = rest.strip_suffix("/action") {
+        return Some(match decode_agent_address(raw_addr) {
+            Some(address) => AgentRoute::Action { address },
+            None => AgentRoute::InvalidAddress,
+        });
+    }
+    None
+}
+
+fn agent_socket_scope(shared: &Shared) -> Result<SocketScope, GlobalHerdrError> {
+    SocketScope::resolve(shared.agent_socket.as_deref())
+}
+
+fn agent_visibility(access: AuthPrincipal) -> DiscoveryScope {
+    if access.can_mutate() {
+        DiscoveryScope::All
+    } else {
+        DiscoveryScope::SpawnManagedOnly
+    }
+}
+
+const fn agent_error_status(kind: GlobalErrorKind) -> u16 {
+    match kind {
+        GlobalErrorKind::InvalidParams => 400,
+        GlobalErrorKind::ForbiddenExternal => 403,
+        GlobalErrorKind::NotFound => 404,
+        GlobalErrorKind::GuardMismatch
+        | GlobalErrorKind::UnobservableSelection
+        | GlobalErrorKind::StateConflict
+        | GlobalErrorKind::AmbiguousAddress => 409,
+        GlobalErrorKind::Unavailable => 503,
+        GlobalErrorKind::Internal => 500,
+    }
+}
+
+fn agent_error_tuple(err: GlobalHerdrError) -> (u16, String) {
+    (agent_error_status(err.kind), err.message)
+}
+
+fn parse_agents_all_query(query: &str) -> Result<bool, String> {
+    match query_param(query, "all") {
+        None => Ok(false),
+        Some(raw) => match percent_decoded(raw).as_deref() {
+            Some("true" | "1") => Ok(true),
+            Some("false" | "0") => Ok(false),
+            _ => Err(format!("{BAD_REQUEST}all must be true, false, 1, or 0")),
+        },
+    }
+}
+
+fn validate_agent_action(action: &TuiAction) -> Result<(), (u16, String)> {
+    match action {
+        TuiAction::SendText {
+            text,
+            wait_timeout_ms,
+            ..
+        } => {
+            if text.is_empty() {
+                return Err((
+                    400,
+                    format!("{BAD_REQUEST}send_text text must not be empty"),
+                ));
+            }
+            if text.len() > MAX_INPUT_TEXT {
+                return Err((
+                    400,
+                    format!("{BAD_REQUEST}send_text text exceeds {MAX_INPUT_TEXT} bytes"),
+                ));
+            }
+            if let Some(ms) = wait_timeout_ms
+                && (*ms == 0 || *ms > MAX_AGENT_WAIT_MS)
+            {
+                return Err((
+                    400,
+                    format!(
+                        "{BAD_REQUEST}wait_timeout_ms must be between 1 and {MAX_AGENT_WAIT_MS}"
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        TuiAction::SendKeys { .. } => Ok(()),
+        TuiAction::Interrupt { timeout_ms } => {
+            if let Some(ms) = timeout_ms
+                && (*ms == 0 || *ms > MAX_AGENT_WAIT_MS)
+            {
+                return Err((
+                    400,
+                    format!("{BAD_REQUEST}timeout_ms must be between 1 and {MAX_AGENT_WAIT_MS}"),
+                ));
+            }
+            Ok(())
+        }
+        TuiAction::WaitSettled { timeout_ms, .. } => {
+            if *timeout_ms == 0 || *timeout_ms > MAX_AGENT_WAIT_MS {
+                return Err((
+                    400,
+                    format!("{BAD_REQUEST}timeout_ms must be between 1 and {MAX_AGENT_WAIT_MS}"),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn agent_action_checked(
+    request: &mut Request,
+    address: &TerminalAddress,
+    access: AuthPrincipal,
+    shared: &Shared,
+) -> Result<(u16, Value), (u16, String)> {
+    let (raw_body, _) = write_body(request, access, shared, "an agent action")?;
+    let action: TuiAction = serde_json::from_slice(&raw_body).map_err(|error| {
+        (
+            400,
+            format!("{BAD_REQUEST}the body is not a valid TuiAction: {error}"),
+        )
+    })?;
+    validate_agent_action(&action)?;
+    let scope = agent_socket_scope(shared).map_err(agent_error_tuple)?;
+    let client = HerdrGlobalClient::client_for_address(&scope, address.as_str())
+        .map_err(agent_error_tuple)?;
+    let outcome = client
+        .execute(address.as_str(), &action)
+        .map_err(agent_error_tuple)?;
+    let body = serde_json::to_value(&outcome)
+        .map_err(|error| (500, format!("serialize TuiActionOutcome: {error}")))?;
+    Ok((200, body))
+}
+
+fn respond_agent_route(
+    mut request: Request,
+    route: AgentRoute,
+    query: &str,
+    access: AuthPrincipal,
+    shared: &Shared,
+) -> Result<(), String> {
+    match route {
+        AgentRoute::InvalidAddress => request
+            .respond(json_response(
+                400,
+                &json!({ "error": format!("{BAD_REQUEST}invalid agent terminal address") }),
+            ))
+            .map_err(|error| error.to_string()),
+        AgentRoute::List => {
+            if !matches!(request.method(), Method::Get | Method::Head) {
+                return request
+                    .respond(not_allowed("GET"))
+                    .map_err(|error| error.to_string());
+            }
+            let include_exited = match parse_agents_all_query(query) {
+                Ok(all) => all,
+                Err(error) => {
+                    return request
+                        .respond(json_response(400, &json!({ "error": error })))
+                        .map_err(|err| err.to_string());
+                }
+            };
+            let visibility = agent_visibility(access);
+            let read = agent_socket_scope(shared).and_then(|scope| {
+                HerdrGlobalClient::discover_in_scope(&scope, include_exited, visibility)
+            });
+            match read {
+                Ok(terminals) => {
+                    let answer = answers::answer(
+                        "/api/agents",
+                        Ok(json!({ "agents": terminals, "count": terminals.len() })),
+                        BAD_REQUEST,
+                    );
+                    let if_none_match = header(&request, "If-None-Match").map(str::to_string);
+                    answers::respond(request, &answer, if_none_match.as_deref())
+                }
+                Err(err) => request
+                    .respond(json_response(
+                        agent_error_status(err.kind),
+                        &json!({ "error": err.message }),
+                    ))
+                    .map_err(|error| error.to_string()),
+            }
+        }
+        AgentRoute::Snapshot { address } => {
+            if !matches!(request.method(), Method::Get | Method::Head) {
+                return request
+                    .respond(not_allowed("GET"))
+                    .map_err(|error| error.to_string());
+            }
+            let visibility = agent_visibility(access);
+            let read = agent_socket_scope(shared).and_then(|scope| {
+                let client = HerdrGlobalClient::client_for_address(&scope, address.as_str())?;
+                client.snapshot_scoped(address.as_str(), visibility)
+            });
+            match read {
+                Ok(snap) => {
+                    let value = serde_json::to_value(&snap)
+                        .map_err(|err| format!("serialize agent snapshot: {err}"));
+                    let answer = answers::answer("/api/agents/*/snapshot", value, BAD_REQUEST);
+                    let if_none_match = header(&request, "If-None-Match").map(str::to_string);
+                    answers::respond(request, &answer, if_none_match.as_deref())
+                }
+                Err(err) => request
+                    .respond(json_response(
+                        agent_error_status(err.kind),
+                        &json!({ "error": err.message }),
+                    ))
+                    .map_err(|error| error.to_string()),
+            }
+        }
+        AgentRoute::Action { address } => {
+            if *request.method() != Method::Post {
+                return request
+                    .respond(not_allowed("POST"))
+                    .map_err(|error| error.to_string());
+            }
+            let (status, body) = match agent_action_checked(&mut request, &address, access, shared)
+            {
+                Ok(answer) => answer,
+                Err((status, error)) => (status, json!({ "error": error })),
+            };
+            request
+                .respond(json_response(status, &body))
+                .map_err(|error| error.to_string())
+        }
+    }
 }
 
 /// One API read, not run yet.
@@ -8126,6 +8389,7 @@ mod tests {
             hosts: server_hosts("127.0.0.1:0", port),
             open: open_networks(Some(open)).expect("networks"),
             pools: Shared::pools_from_owner(owner),
+            agent_socket: None,
         };
         let worker = std::thread::spawn(move || {
             let request = server.recv().expect("request");
@@ -8204,6 +8468,7 @@ mod tests {
             hosts: server_hosts("127.0.0.1:0", port),
             open: Vec::new(),
             pools: Ok(None),
+            agent_socket: None,
         });
         let slots = Slots::new(limit);
         let streams = Slots::new(stream::SSE_SLOTS);
@@ -8283,6 +8548,7 @@ mod tests {
             hosts: server_hosts("127.0.0.1:0", port),
             open: Vec::new(),
             pools: Ok(None),
+            agent_socket: None,
         });
         let address = format!("127.0.0.1:{port}");
         let slots = Slots::new(4);
@@ -9079,6 +9345,7 @@ mod tests {
             hosts: server_hosts("127.0.0.1:0", port),
             open: Vec::new(),
             pools: Ok(None),
+            agent_socket: None,
         });
         std::thread::spawn(move || serve_requests(&server, &shared, &slots, &streams));
         port
@@ -10745,6 +11012,7 @@ mod tests {
             hosts: server_hosts("127.0.0.1:0", port),
             open: open_networks(Some("")).expect("networks"),
             pools: Ok(None),
+            agent_socket: None,
         };
         let url_for_worker = reader_url.to_string();
         let worker = std::thread::spawn(move || {
@@ -11080,6 +11348,7 @@ mod tests {
                 hosts: server_hosts("127.0.0.1:0", port),
                 open: Vec::new(),
                 pools: Ok(Some(pools)),
+                agent_socket: None,
             });
             let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
             let server_for_loop = Arc::clone(&server);
@@ -11209,6 +11478,7 @@ mod tests {
                 hosts: server_hosts("127.0.0.1:0", port),
                 open: Vec::new(),
                 pools: Ok(Some(Arc::clone(&pools))),
+                agent_socket: None,
             });
             let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
             let server_for_loop = Arc::clone(&server);
@@ -11580,6 +11850,15 @@ mod tests {
         master: &str,
         body: impl FnOnce(u16, &Arc<super::ipc::ServePools>),
     ) {
+        with_live_viewer_server_with_agent_socket(owner, master, None, body);
+    }
+
+    fn with_live_viewer_server_with_agent_socket(
+        owner: &str,
+        master: &str,
+        agent_socket: Option<PathBuf>,
+        body: impl FnOnce(u16, &Arc<super::ipc::ServePools>),
+    ) {
         let config = super::ipc::PoolConfig {
             reads: 2,
             writes: 1,
@@ -11599,6 +11878,7 @@ mod tests {
             hosts: server_hosts("127.0.0.1:0", port),
             open: Vec::new(),
             pools: Ok(Some(Arc::clone(&pools))),
+            agent_socket,
         });
         let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
         let server_for_loop = Arc::clone(&server);
@@ -11834,5 +12114,627 @@ mod tests {
                 assert_eq!(pools.events.stats().0, 0);
             });
         });
+    }
+
+    fn write_mock_herdr_frame(
+        stream: &mut std::os::unix::net::UnixStream,
+        channel: u32,
+        kind: u8,
+        payload: &[u8],
+    ) {
+        use std::io::Write as _;
+        let mut header = [0_u8; 9];
+        header[0..4].copy_from_slice(&channel.to_le_bytes());
+        header[4] = kind;
+        let len = u32::try_from(payload.len()).expect("frame fits u32");
+        header[5..9].copy_from_slice(&len.to_le_bytes());
+        let _ = stream.write_all(&header);
+        let _ = stream.write_all(payload);
+    }
+
+    struct MockAgentServerState {
+        selected: std::sync::atomic::AtomicUsize,
+        turn: std::sync::atomic::AtomicU64,
+        mutations: std::sync::atomic::AtomicUsize,
+        external_screen_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    fn handle_mock_framed_attach(
+        mut stream: std::os::unix::net::UnixStream,
+        state: &MockAgentServerState,
+    ) {
+        use std::io::{Read as _, Write as _};
+        let hello_ack =
+            "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"framed\":true}}\n";
+        if stream.write_all(hello_ack.as_bytes()).is_err() {
+            return;
+        }
+        let mut hdr = [0_u8; 9];
+        if stream.read_exact(&mut hdr).is_err() {
+            return;
+        }
+        let payload_len = u32::from_le_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]) as usize;
+        let mut payload = vec![0_u8; payload_len.min(64 * 1024)];
+        if stream.read_exact(&mut payload).is_err() {
+            return;
+        }
+        let req: serde_json::Value =
+            serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null);
+        if req["params"]["terminal"].as_str() == Some("t2") {
+            state
+                .external_screen_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let attach_ack = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"channel\":1}}";
+        write_mock_herdr_frame(&mut stream, 0, 0, attach_ack);
+        let sel = state.selected.load(std::sync::atomic::Ordering::SeqCst);
+        let paint = if sel == 0 {
+            concat!(
+                "\x18\x1b[!p\x1b[?1049l\x1b[H\x1b[2J",
+                "Select action:\r\n",
+                "  \x1b[0;7m1. Allow\x1b[0m\r\n",
+                "  2. Deny",
+                "\x1b(B\x1b[0m\x1b[2;3H\x1b[?25l\x1b[?9001l",
+            )
+        } else {
+            concat!(
+                "\x18\x1b[!p\x1b[?1049l\x1b[H\x1b[2J",
+                "Select action:\r\n",
+                "  1. Allow\r\n",
+                "  \x1b[0;7m2. Deny\x1b[0m",
+                "\x1b(B\x1b[0m\x1b[3;3H\x1b[?25l\x1b[?9001l",
+            )
+        };
+        write_mock_herdr_frame(&mut stream, 1, 0, paint.as_bytes());
+        write_mock_herdr_frame(&mut stream, 1, 2, b"");
+    }
+
+    fn mock_agent_list_result(turn_now: u64) -> serde_json::Value {
+        json!({
+            "terminals": [
+                {
+                    "address": "t1",
+                    "name": "managed-worker",
+                    "labels": {
+                        "spawn_owner": "loop-a",
+                        "spawn_terminal": "spawn-exec_1"
+                    },
+                    "argv": ["claude"],
+                    "cwd": "/repo",
+                    "state": "live",
+                    "pid": 101,
+                    "cols": 120,
+                    "rows": 40,
+                    "title": "claude",
+                    "turn": turn_now,
+                    "keep": false
+                },
+                {
+                    "address": "t2",
+                    "name": "human-pty",
+                    "labels": {},
+                    "argv": ["python3", "menu.py"],
+                    "cwd": "/tmp",
+                    "state": "live",
+                    "pid": 202,
+                    "cols": 120,
+                    "rows": 40,
+                    "title": "menu",
+                    "status": { "state": "idle" },
+                    "turn": turn_now,
+                    "keep": false
+                }
+            ],
+            "hidden_finished": 0,
+            "machines": []
+        })
+    }
+
+    fn mock_agent_get_reply(
+        id: &serde_json::Value,
+        term: &str,
+        turn_now: u64,
+    ) -> serde_json::Value {
+        if term != "t1" && term != "t2" {
+            return json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32000,
+                    "message": format!("{term} not found"),
+                    "data": { "kind": "not_found" }
+                }
+            });
+        }
+        let labels = if term == "t1" {
+            json!({ "spawn_owner": "loop-a", "spawn_terminal": "spawn-exec_1" })
+        } else {
+            json!({})
+        };
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "address": term,
+                "labels": labels,
+                "state": "live",
+                "pid": if term == "t1" { 101 } else { 202 },
+                "cols": 120,
+                "rows": 40,
+                "title": "menu",
+                "status": { "state": "idle" },
+                "turn": turn_now
+            }
+        })
+    }
+
+    fn mock_agent_rpc_reply(
+        req: &serde_json::Value,
+        state: &MockAgentServerState,
+    ) -> serde_json::Value {
+        let method = req["method"].as_str().unwrap_or_default();
+        let params = &req["params"];
+        let turn_now = state.turn.load(std::sync::atomic::Ordering::SeqCst);
+        match method {
+            "terminal.list" => json!({
+                "jsonrpc": "2.0",
+                "id": req["id"],
+                "result": mock_agent_list_result(turn_now)
+            }),
+            "terminal.get" => {
+                let term = params["terminal"].as_str().unwrap_or_default();
+                mock_agent_get_reply(&req["id"], term, turn_now)
+            }
+            "terminal.read" => {
+                if params["terminal"].as_str() == Some("t2") {
+                    state
+                        .external_screen_reads
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "result": {
+                        "text": "Select action:\n  1. Allow\n  2. Deny\n",
+                        "complete": true,
+                        "how": "screen"
+                    }
+                })
+            }
+            "terminal.keys" => {
+                state
+                    .mutations
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if params["keys"]
+                    .as_array()
+                    .is_some_and(|ks| ks.iter().any(|k| k.as_str() == Some("down")))
+                {
+                    state.selected.store(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let next_turn = state.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "result": { "status": "idle", "turn": next_turn }
+                })
+            }
+            "terminal.send" => {
+                state
+                    .mutations
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let next_turn = state.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "result": { "status": "working", "turn": next_turn, "started": true }
+                })
+            }
+            "terminal.interrupt" => {
+                state
+                    .mutations
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "result": { "outcome": "stopped", "key": "esc" }
+                })
+            }
+            "terminal.wait" => json!({
+                "jsonrpc": "2.0",
+                "id": req["id"],
+                "result": {
+                    "terminal": params["terminal"],
+                    "ended": true,
+                    "reason": "status",
+                    "status": "idle",
+                    "turn": turn_now
+                }
+            }),
+            other => panic!("unexpected mock agent rpc method: {other}"),
+        }
+    }
+
+    fn spawn_mock_agent_uds(
+        sock: &std::path::Path,
+    ) -> (std::thread::JoinHandle<()>, Arc<MockAgentServerState>) {
+        use std::io::{BufRead as _, Write as _};
+        let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind mock agent uds");
+        let state = Arc::new(MockAgentServerState {
+            selected: std::sync::atomic::AtomicUsize::new(0),
+            turn: std::sync::atomic::AtomicU64::new(1),
+            mutations: std::sync::atomic::AtomicUsize::new(0),
+            external_screen_reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let srv_state = Arc::clone(&state);
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    break;
+                };
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line.is_empty() {
+                    continue;
+                }
+                let req: serde_json::Value = serde_json::from_str(&line).expect("valid mock rpc");
+                let method = req["method"].as_str().unwrap_or_default();
+                if method == "__stop" {
+                    let _ = (&stream).write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+                    break;
+                }
+                if method == "hello" && req["params"]["framed"] == true {
+                    drop(reader);
+                    handle_mock_framed_attach(stream, &srv_state);
+                    continue;
+                }
+                let resp = mock_agent_rpc_reply(&req, &srv_state);
+                let _ = (&stream).write_all(format!("{resp}\n").as_bytes());
+            }
+        });
+        (handle, state)
+    }
+
+    fn stop_mock_agent_uds(sock: &std::path::Path) {
+        use std::io::Write as _;
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(sock) {
+            let _ = stream
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"__stop\",\"params\":{}}\n");
+        }
+    }
+
+    fn assert_agent_http_auth_and_viewer(
+        port: u16,
+        viewer: &str,
+        expired: &str,
+        srv_state: &MockAgentServerState,
+    ) {
+        use spawn_core::tui::{KeyChord, KeyChordSequence, TerminalOrigin, TuiAction, TuiSnapshot};
+
+        for (method, path, body) in [
+            ("GET", "/api/agents", ""),
+            ("GET", "/api/agents/t2/snapshot", ""),
+            ("POST", "/api/agents/t2/action", "{}"),
+        ] {
+            let anon = raw_method(port, method, path, "", body);
+            assert_eq!(anon.status, 401, "anon {method} {path}: {anon:?}");
+            let exp_ans = raw_method(
+                port,
+                method,
+                path,
+                &format!("Authorization: Bearer {expired}\r\nContent-Type: application/json\r\n"),
+                body,
+            );
+            assert_eq!(exp_ans.status, 401, "expired {method} {path}: {exp_ans:?}");
+        }
+
+        let viewer_hdr = format!("Authorization: Bearer {viewer}\r\n");
+        for path in ["/api/agents", "/api/agents?all=true"] {
+            let list_ans = raw_method(port, "GET", path, &viewer_hdr, "");
+            assert_eq!(list_ans.status, 200, "{path}: {list_ans:?}");
+            assert_eq!(
+                list_ans.body["count"], 1,
+                "viewer only sees SpawnManaged: {list_ans:?}"
+            );
+            let row = &list_ans.body["agents"][0];
+            assert_eq!(row["address"], "t1");
+            let origin: TerminalOrigin =
+                serde_json::from_value(row["origin"].clone()).expect("parse origin");
+            assert!(matches!(origin, TerminalOrigin::SpawnManaged { .. }));
+        }
+        assert_eq!(
+            raw_method(port, "HEAD", "/api/agents", &viewer_hdr, "").status,
+            200
+        );
+
+        let managed_snap = raw_method(port, "GET", "/api/agents/t1/snapshot", &viewer_hdr, "");
+        assert_eq!(managed_snap.status, 200, "{managed_snap:?}");
+        let t1_snap: TuiSnapshot =
+            serde_json::from_value(managed_snap.body.clone()).expect("t1 snapshot");
+        assert_eq!(t1_snap.address(), "t1");
+        assert_eq!(
+            raw_method(port, "HEAD", "/api/agents/t1/snapshot", &viewer_hdr, "").status,
+            200
+        );
+
+        for method in ["GET", "HEAD"] {
+            let denied = raw_method(port, method, "/api/agents/t2/snapshot", &viewer_hdr, "");
+            assert_eq!(
+                denied.status, 403,
+                "viewer {method} external snapshot must 403: {denied:?}"
+            );
+        }
+        assert_eq!(
+            srv_state
+                .external_screen_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "ReadOnlyViewer must never read external PTY screen"
+        );
+
+        let viewer_json_hdr = format!("{viewer_hdr}Content-Type: application/json\r\n");
+        let down_json = serde_json::to_string(&TuiAction::SendKeys {
+            keys: KeyChordSequence::single(KeyChord::parse("down").expect("down")),
+            expected_guard: Some(t1_snap.guard()),
+        })
+        .expect("serialize action");
+        for path in ["/api/agents/t1/action", "/api/agents/t2/action"] {
+            let viewer_action = raw_method(port, "POST", path, &viewer_json_hdr, &down_json);
+            assert_eq!(viewer_action.status, 403, "{path}: {viewer_action:?}");
+            assert_eq!(
+                viewer_action.body["error"].as_str(),
+                Some(super::auth_token::READONLY_MUTATION_ERROR)
+            );
+        }
+        assert_eq!(
+            srv_state
+                .mutations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    fn assert_agent_http_admin_validation(port: u16, admin_hdr: &str, admin_json_hdr: &str) {
+        use spawn_core::tui::TerminalOrigin;
+        let list_ans = raw_method(port, "GET", "/api/agents", admin_hdr, "");
+        assert_eq!(list_ans.status, 200, "{list_ans:?}");
+        assert_eq!(list_ans.body["count"], 2);
+        let origins: Vec<TerminalOrigin> = list_ans.body["agents"]
+            .as_array()
+            .expect("agents")
+            .iter()
+            .map(|item| serde_json::from_value(item["origin"].clone()).expect("origin"))
+            .collect();
+        assert!(origins.contains(&TerminalOrigin::External));
+        assert_eq!(
+            raw_method(port, "GET", "/api/agents?all=maybe", admin_hdr, "").status,
+            400
+        );
+        assert_eq!(
+            raw_method(
+                port,
+                "GET",
+                "/api/agents/bad%20addr/snapshot",
+                admin_hdr,
+                ""
+            )
+            .status,
+            400
+        );
+        assert_eq!(
+            raw_method(port, "GET", "/api/agents/a%2Fb%2Fc/snapshot", admin_hdr, "").status,
+            400
+        );
+        assert_eq!(
+            raw_method(port, "GET", "/api/agents/missing/snapshot", admin_hdr, "").status,
+            404
+        );
+        assert_eq!(
+            raw_method(port, "POST", "/api/agents", admin_json_hdr, "{}").status,
+            405
+        );
+        assert_eq!(
+            raw_method(port, "GET", "/api/agents/t2/action", admin_hdr, "").status,
+            405
+        );
+
+        for bad_body in [
+            "{}",
+            r#"{"action":"send_text","text":"","policy":{"kind":"when_unblocked"}}"#,
+            r#"{"action":"send_text","text":"x","policy":{"kind":"force_even_if_blocked","expected_guard":"0x1"}}"#,
+            r#"{"action":"wait_settled","timeout_ms":0}"#,
+        ] {
+            let invalid = raw_method(
+                port,
+                "POST",
+                "/api/agents/t2/action",
+                admin_json_hdr,
+                bad_body,
+            );
+            assert_eq!(invalid.status, 400, "{bad_body}: {invalid:?}");
+        }
+    }
+
+    fn assert_agent_http_admin_keys_and_guard(
+        port: u16,
+        admin_hdr: &str,
+        admin_json_hdr: &str,
+    ) -> spawn_core::tui::ScreenGuard {
+        use spawn_core::tui::{
+            KeyChord, KeyChordSequence, SnapshotFidelity, TerminalLiveState, TuiAction,
+            TuiActionOutcome, TuiSnapshot,
+        };
+
+        let snap_ans = raw_method(port, "GET", "/api/agents/t2/snapshot", admin_hdr, "");
+        assert_eq!(snap_ans.status, 200, "{snap_ans:?}");
+        let snap1: TuiSnapshot =
+            serde_json::from_value(snap_ans.body.clone()).expect("TuiSnapshot JSON");
+        assert!(matches!(
+            snap1.fidelity(),
+            SnapshotFidelity::StyledVt { .. }
+        ));
+        assert!(matches!(
+            snap1.live_state(),
+            TerminalLiveState::Live { pid: Some(202) }
+        ));
+        let guard1 = snap1.guard();
+        let down_json = serde_json::to_string(&TuiAction::SendKeys {
+            keys: KeyChordSequence::single(KeyChord::parse("down").expect("down")),
+            expected_guard: Some(guard1),
+        })
+        .expect("serialize down");
+
+        let exec_down = raw_method(
+            port,
+            "POST",
+            "/api/agents/t2/action",
+            admin_json_hdr,
+            &down_json,
+        );
+        assert_eq!(exec_down.status, 200, "{exec_down:?}");
+        let down_outcome: TuiActionOutcome =
+            serde_json::from_value(exec_down.body).expect("KeysSent");
+        assert!(matches!(down_outcome, TuiActionOutcome::KeysSent { .. }));
+
+        let enter_stale = serde_json::to_string(&TuiAction::SendKeys {
+            keys: KeyChordSequence::single(KeyChord::parse("enter").expect("enter")),
+            expected_guard: Some(guard1),
+        })
+        .expect("serialize enter");
+        let stale_res = raw_method(
+            port,
+            "POST",
+            "/api/agents/t2/action",
+            admin_json_hdr,
+            &enter_stale,
+        );
+        assert_eq!(stale_res.status, 409, "{stale_res:?}");
+
+        let fresh_snap: TuiSnapshot = serde_json::from_value(
+            raw_method(port, "GET", "/api/agents/t2/snapshot", admin_hdr, "").body,
+        )
+        .expect("fresh snapshot");
+        let guard2 = fresh_snap.guard();
+        assert_ne!(guard2, guard1);
+        guard2
+    }
+
+    fn assert_agent_http_admin_actions(port: u16, admin_hdr: &str, admin_json_hdr: &str) {
+        use spawn_core::tui::{SendPolicy, TuiAction, TuiActionOutcome, WaitReason};
+
+        let guard2 = assert_agent_http_admin_keys_and_guard(port, admin_hdr, admin_json_hdr);
+
+        let send_guarded = serde_json::to_string(&TuiAction::SendText {
+            text: "proceed".to_string(),
+            policy: SendPolicy::OnlyIf {
+                expected_guard: guard2,
+                status: None,
+            },
+            wait_timeout_ms: Some(1_000),
+        })
+        .expect("serialize guarded send");
+        let send_res = raw_method(
+            port,
+            "POST",
+            "/api/agents/t2/action",
+            admin_json_hdr,
+            &send_guarded,
+        );
+        assert_eq!(send_res.status, 200, "{send_res:?}");
+        assert!(matches!(
+            serde_json::from_value::<TuiActionOutcome>(send_res.body).expect("TextSent"),
+            TuiActionOutcome::TextSent { .. }
+        ));
+
+        let int_body = serde_json::to_string(&TuiAction::Interrupt {
+            timeout_ms: Some(1_000),
+        })
+        .expect("int");
+        let int_res = raw_method(
+            port,
+            "POST",
+            "/api/agents/t2/action",
+            admin_json_hdr,
+            &int_body,
+        );
+        assert_eq!(int_res.status, 200, "{int_res:?}");
+        assert!(matches!(
+            serde_json::from_value::<TuiActionOutcome>(int_res.body).expect("Interrupted"),
+            TuiActionOutcome::Interrupted(_)
+        ));
+
+        let wait_body = serde_json::to_string(&TuiAction::WaitSettled {
+            after_turn: None,
+            output_contains: None,
+            timeout_ms: 1_000,
+        })
+        .expect("wait");
+        let wait_res = raw_method(
+            port,
+            "POST",
+            "/api/agents/t2/action",
+            admin_json_hdr,
+            &wait_body,
+        );
+        assert_eq!(wait_res.status, 200, "{wait_res:?}");
+        assert!(matches!(
+            serde_json::from_value::<TuiActionOutcome>(wait_res.body).expect("Waited"),
+            TuiActionOutcome::Waited(ref w) if w.ended() && w.reason == WaitReason::Status
+        ));
+    }
+
+    #[test]
+    fn agent_error_status_maps_closed_kinds_without_substring_guessing() {
+        use spawn_host::herdr_global::GlobalErrorKind;
+        for (kind, status) in [
+            (GlobalErrorKind::InvalidParams, 400),
+            (GlobalErrorKind::ForbiddenExternal, 403),
+            (GlobalErrorKind::NotFound, 404),
+            (GlobalErrorKind::GuardMismatch, 409),
+            (GlobalErrorKind::UnobservableSelection, 409),
+            (GlobalErrorKind::StateConflict, 409),
+            (GlobalErrorKind::AmbiguousAddress, 409),
+            (GlobalErrorKind::Unavailable, 503),
+            (GlobalErrorKind::Internal, 500),
+        ] {
+            assert_eq!(super::agent_error_status(kind), status);
+        }
+    }
+
+    #[test]
+    fn agent_http_endpoints_enforce_rbac_snapshot_and_action_validation() {
+        let sock_dir =
+            std::env::temp_dir().join(format!("spawn-serve-agent-http-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sock_dir);
+        std::fs::create_dir_all(&sock_dir).expect("create sock dir");
+        let mock_sock = sock_dir.join("hc.sock");
+        let (srv_handle, srv_state) = spawn_mock_agent_uds(&mock_sock);
+
+        in_test_schema(|owner, store| {
+            execution_starts(store);
+            let master = "agent-http-master-secret";
+            let now = super::auth_token::current_epoch_secs().expect("clock");
+            let (viewer, _) =
+                super::auth_token::mint_viewer_token(master, now, 3_600).expect("mint viewer");
+            let (expired, _) =
+                super::auth_token::mint_viewer_token(master, now.saturating_sub(120), 60)
+                    .expect("mint expired");
+
+            with_live_viewer_server_with_agent_socket(
+                owner,
+                master,
+                Some(mock_sock.clone()),
+                |port, _pools| {
+                    assert_agent_http_auth_and_viewer(port, &viewer, &expired, &srv_state);
+                    let admin_hdr = format!("Authorization: Bearer {master}\r\n");
+                    let admin_json_hdr = format!("{admin_hdr}Content-Type: application/json\r\n");
+                    assert_agent_http_admin_validation(port, &admin_hdr, &admin_json_hdr);
+                    assert_agent_http_admin_actions(port, &admin_hdr, &admin_json_hdr);
+                },
+            );
+        });
+
+        stop_mock_agent_uds(&mock_sock);
+        srv_handle.join().expect("mock agent srv join");
+        let _ = std::fs::remove_dir_all(&sock_dir);
     }
 }

@@ -42,6 +42,8 @@
 //!   forwards its exit code.
 //! - `auth` manages unified decoupled auth profiles (`relay`, `native_login`,
 //!   `cloud_iam`, `local`) across engines without storing plaintext secrets.
+//! - `agent` discovers and inspects global Herdr terminals and executes
+//!   screen-guarded TUI controls (`ls`, `snapshot`, `send`, `keys`, `interrupt`, `wait`).
 //! - `version` prints `spawn <crate version>`.
 //!
 //! The nouns are as in docs/glossary.md.
@@ -57,6 +59,7 @@
 #![forbid(unsafe_code)]
 
 mod ack;
+mod agent_cmd;
 mod alerts;
 mod auth;
 mod backup;
@@ -116,7 +119,8 @@ const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|residen
 /// after it. A hand copy: each line is its command's own usage line, or a
 /// summary of its verbs (`spawn grade a|b|c ...`), as the tests below hold
 /// it to [`COMMANDS`].
-const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       \
+const MORE_USAGE: &str = concat!(
+    "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       \
      spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]> [--via <hop>[,<hop>...]] [--note <text>]\n       \
      spawn node list [--json]\n       \
      spawn node drain|undrain|remove <name>\n       \
@@ -165,7 +169,9 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn auth list [--config <path>] [--json]\n       \
      spawn auth add-relay <name> --url <url> (--key-env <VAR> | --key-file <PATH>) [--engines claude,codex] [--tiers L1,L2,L3] [--config <path>] [--json]\n       \
      spawn auth login <agy|claude|codex> [--profile <name>] [--config <path>]\n       \
-     spawn auth check [--config <path>] [--json]";
+     spawn auth check [--config <path>] [--json]\n",
+    agent_cmd::agent_usage_body!("       "),
+);
 
 /// What the whole usage says last, after the commands.
 const HELP_HINT: &str =
@@ -326,6 +332,12 @@ const COMMANDS: &[Command] = &[
         aliases: &[],
         usage: &[ack::USAGE],
         run: ack::command,
+    },
+    Command {
+        name: "agent",
+        aliases: &[],
+        usage: &[agent_cmd::USAGE],
+        run: agent_cmd::command,
     },
     Command {
         name: "mask",
@@ -962,7 +974,26 @@ mod tests {
                 "{removed} stays an unknown command"
             );
         }
-        assert_eq!(COMMANDS.len(), 36, "the commands: {words:?}");
+        assert_eq!(COMMANDS.len(), 37, "the commands: {words:?}");
+    }
+
+    #[test]
+    fn the_usage_names_the_agent_command_after_the_contracts_line() {
+        for line in [
+            "spawn agent ls [--all] [--socket <path>] [--json]",
+            "spawn agent snapshot <addr> [--socket <path>] [--json]",
+            "spawn agent send <addr> <text> [--if-guard <hash> | --force] [--socket <path>] [--json]",
+            "spawn agent keys <addr> <chord...> [--if-guard <hash>] [--socket <path>] [--json]",
+            "spawn agent interrupt <addr> [--timeout <duration>] [--socket <path>] [--json]",
+            "spawn agent wait <addr> [--timeout <duration>] [--after-turn <n>] [--output <text>] [--socket <path>] [--json]",
+        ] {
+            assert!(MORE_USAGE.contains(line), "{line}: {MORE_USAGE}");
+        }
+        assert!(!MORE_USAGE.contains("--submit"), "{MORE_USAGE}");
+        assert!(
+            !USAGE.contains("agent"),
+            "the contract's line stays as it was: {USAGE}"
+        );
     }
 
     #[test]
