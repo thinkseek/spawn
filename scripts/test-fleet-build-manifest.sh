@@ -199,5 +199,90 @@ refused "non-http URL" 1 --spawn-sha "$spawn_sha" --node-sha "$node_sha" --bin-d
 run_build --spawn-sha "$spawn_sha" --node-sha "$node_sha" --bin-dir "$bins" --out-dir "$bins"
 check "refuse: --out-dir equal to --bin-dir" '[ "$rc" = 1 ] && [ ! -e "$bins/release.manifest" ]'
 
+# 8. Control-plane mode: stages SHA256SUMS, binaries, web.tar.gz, registry.json, and feature-coverage.json,
+# natively compatible with deploy/self-upgrade.sh --role control-plane.
+cp_bins="$root/cp-bins"
+cp_repo="$root/cp-repo"
+mkdir -p "$cp_bins" "$cp_repo/docs/feature-map"
+cat > "$cp_bins/spawn" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1-}" = "features" ] && [ "${2-}" = "scan" ]; then
+  shift 2
+  seen_root=""
+  seen_registry=""
+  out_file=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --root) seen_root=$2; shift 2 ;;
+      --registry) seen_registry=$2; shift 2 ;;
+      --out) out_file=$2; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$out_file" ] || exit 1
+  printf '{"root":"%s","registry_path":"%s","registry_writable":false,"read_only_reason":"precomputed snapshot","report":{"schema_version":1},"features":[]}\n' "$seen_root" "$seen_registry" > "$out_file"
+  exit 0
+fi
+[ "${1-}" = --version ] && { echo "v3-spawn"; exit 0; }
+exit 0
+EOF
+chmod 0755 "$cp_bins/spawn"
+make_bin "$cp_bins/spawn-node-gateway" v3-gw
+make_bin "$cp_bins/spawn-hc" v3-hc
+printf '{"schema_version":1,"initiative_id":"spawn","boundary":{"project_name":"Spawn","description":"d","included_categories":[],"exclusions":[]},"features":[]}\n' > "$cp_repo/docs/feature-map/registry.json"
+
+out_cp="$root/out-control-plane"
+run_build --mode control-plane --bin-dir "$cp_bins" --web-dir "$web" --feature-root "$cp_repo" --out-dir "$out_cp"
+check "control-plane: build exits 0" '[ "$rc" = 0 ]'
+check "control-plane: SHA256SUMS written and no release.manifest" '[ -f "$out_cp/SHA256SUMS" ] && [ ! -e "$out_cp/release.manifest" ] && [ ! -e "$out_cp/SHA256SUMS.tmp" ]'
+check "control-plane: exactly expected artifacts staged" \
+  '[ "$(ls -A "$out_cp" | LC_ALL=C sort | tr "\n" " ")" = "SHA256SUMS feature-coverage.json registry.json spawn spawn-hc spawn-node-gateway web.tar.gz " ]'
+check "control-plane: JSON artifacts are non-empty and non-executable 0644" \
+  '[ -s "$out_cp/feature-coverage.json" ] && [ ! -x "$out_cp/feature-coverage.json" ] && [ -s "$out_cp/registry.json" ] && [ ! -x "$out_cp/registry.json" ]'
+check "control-plane: feature-coverage.json uses portable relative root and registry paths" \
+  'grep -q "\"root\":\"\\.\"" "$out_cp/feature-coverage.json" && grep -q "\"registry_path\":\"docs/feature-map/registry.json\"" "$out_cp/feature-coverage.json"'
+check "control-plane: SHA256SUMS verifies cleanly" '(cd "$out_cp" && sha256sum -c SHA256SUMS >/dev/null 2>&1)'
+
+# Prebuilt coverage snapshot cross-compile path without running $bin_dir/spawn.
+out_cp_pre="$root/out-control-plane-prebuilt"
+printf '#!/bin/sh\necho "should not execute target binary" >&2; exit 99\n' > "$cp_bins/spawn-cross"
+printf '{"root":"/pre","registry_path":"/pre/registry.json","registry_writable":false,"read_only_reason":"precomputed","report":{"schema_version":1},"features":[]}\n' > "$root/pre-cov.json"
+run_build --mode control-plane --bin-dir "$cp_bins" --web-dir "$web" \
+  --feature-coverage "$root/pre-cov.json" --feature-registry "$cp_repo/docs/feature-map/registry.json" \
+  --out-dir "$out_cp_pre"
+check "control-plane prebuilt: build exits 0" '[ "$rc" = 0 ] && cmp -s "$out_cp_pre/feature-coverage.json" "$root/pre-cov.json"'
+
+# Control-plane error paths fail closed.
+refused "control-plane missing feature-root/coverage" 2 --mode control-plane --bin-dir "$cp_bins" --web-dir "$web"
+refused "control-plane coverage without registry" 2 --mode control-plane --bin-dir "$cp_bins" --web-dir "$web" --feature-coverage "$root/pre-cov.json"
+mkdir -p "$root/cp-no-gw"
+cp "$cp_bins/spawn" "$root/cp-no-gw/spawn"
+chmod 0755 "$root/cp-no-gw/spawn"
+refused "control-plane missing spawn-node-gateway" 1 --mode control-plane --bin-dir "$root/cp-no-gw" --web-dir "$web" --feature-root "$cp_repo"
+: > "$root/empty-cov.json"
+refused "control-plane empty coverage file" 1 --mode control-plane --bin-dir "$cp_bins" --web-dir "$web" --feature-coverage "$root/empty-cov.json" --feature-registry "$cp_repo/docs/feature-map/registry.json"
+
+# Native deploy/self-upgrade.sh compatibility check (SHA256SUMS + current/{feature-coverage,registry}.json without linking JSONs into bin/).
+upgrade_sh="$here/../deploy/self-upgrade.sh"
+if [ -x "$upgrade_sh" ]; then
+  rsi_cp="$root/rsi-cp"
+  mkdir -p "$rsi_cp/releases/v1-cp" "$rsi_cp/bin"
+  cp -a "$out_cp/." "$rsi_cp/releases/v1-cp/"
+  set +e
+  up_out=$(SPAWN_RSI_DIR="$rsi_cp" bash "$upgrade_sh" --role control-plane --version v1-cp --rsi-dir "$rsi_cp" --allow-no-active-units 2>&1)
+  up_rc=$?
+  set -e
+  check "control-plane self-upgrade accepts feature-coverage.json + registry.json (rc=$up_rc)" '[ "$up_rc" = 0 ]'
+  check "control-plane self-upgrade exposes current JSONs and excludes them from bin/" \
+    '[ -f "$rsi_cp/current/feature-coverage.json" ] && [ -f "$rsi_cp/current/registry.json" ] && [ -L "$rsi_cp/bin/spawn" ] && [ -L "$rsi_cp/bin/spawn-node-gateway" ] && [ ! -e "$rsi_cp/bin/feature-coverage.json" ] && [ ! -e "$rsi_cp/bin/registry.json" ]'
+  echo 'tamper' >> "$rsi_cp/releases/v1-cp/feature-coverage.json"
+  set +e
+  tamper_out=$(SPAWN_RSI_DIR="$rsi_cp" bash "$upgrade_sh" --role control-plane --version v1-cp --rsi-dir "$rsi_cp" --allow-no-active-units 2>&1)
+  tamper_rc=$?
+  set -e
+  check "control-plane self-upgrade refuses tampered feature-coverage.json" '[ "$tamper_rc" = 1 ]'
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

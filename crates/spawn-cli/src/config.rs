@@ -183,6 +183,56 @@ pub(crate) fn serve_local_open() -> bool {
     process_var("SPAWN_SERVE_LOCAL_OPEN").is_ok_and(|value| value == "1")
 }
 
+/// Closed sum type selecting how `spawn serve` obtains feature-coverage data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FeatureCoverageSource {
+    /// Walk the local source tree against its registry file.
+    LiveRepo { root: PathBuf, registry: PathBuf },
+    /// Serve an immutable precomputed snapshot JSON without walking any source tree.
+    PrecomputedSnapshot { snapshot_path: PathBuf },
+}
+
+impl FeatureCoverageSource {
+    /// Resolve the active coverage source from an environment lookup and working directory.
+    pub(crate) fn resolve_with<F>(env: F, cwd: &Path) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let non_empty = |name: &str| env(name).filter(|value| !value.trim().is_empty());
+        if let Some(snapshot_path) = non_empty("SPAWN_FEATURE_COVERAGE_SNAPSHOT") {
+            return Self::PrecomputedSnapshot {
+                snapshot_path: PathBuf::from(snapshot_path),
+            };
+        }
+        let root = non_empty("SPAWN_FEATURE_ROOT").map_or_else(|| cwd.to_path_buf(), PathBuf::from);
+        let registry = non_empty("SPAWN_FEATURE_REGISTRY").map_or_else(
+            || root.join(crate::feature_inventory::DEFAULT_REGISTRY_REL),
+            PathBuf::from,
+        );
+        Self::LiveRepo { root, registry }
+    }
+}
+
+/// Resolve `SPAWN_FEATURE_ROOT` override from the process environment boundary.
+pub(crate) fn feature_root_override() -> Option<PathBuf> {
+    env_value("SPAWN_FEATURE_ROOT")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// Resolve `SPAWN_FEATURE_REGISTRY` override from the process environment boundary.
+pub(crate) fn feature_registry_override() -> Option<PathBuf> {
+    env_value("SPAWN_FEATURE_REGISTRY")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// Resolve [`FeatureCoverageSource`] from the process environment boundary.
+pub(crate) fn feature_coverage_source() -> FeatureCoverageSource {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    FeatureCoverageSource::resolve_with(env_value, &cwd)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ServePoolEnv {
     pub(crate) reads: Option<String>,
@@ -2166,6 +2216,66 @@ mod workspace_tests {
             auth_profiles_root_dir_with(&empty_env)
                 .unwrap_err()
                 .contains("refused")
+        );
+    }
+
+    #[test]
+    fn feature_coverage_source_resolves_snapshot_before_live_repo() {
+        use super::FeatureCoverageSource;
+        use std::collections::HashMap;
+
+        let env = |pairs: &[(&str, &str)]| {
+            let map: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            move |name: &str| map.get(name).cloned()
+        };
+        let cwd = Path::new("/srv/cwd");
+
+        assert_eq!(
+            FeatureCoverageSource::resolve_with(
+                env(&[
+                    ("SPAWN_FEATURE_COVERAGE_SNAPSHOT", "/var/lib/spawn/cov.json"),
+                    ("SPAWN_FEATURE_ROOT", "/srv/spawn"),
+                    ("SPAWN_FEATURE_REGISTRY", "/srv/spawn/custom.json"),
+                ]),
+                cwd,
+            ),
+            FeatureCoverageSource::PrecomputedSnapshot {
+                snapshot_path: PathBuf::from("/var/lib/spawn/cov.json"),
+            }
+        );
+
+        assert_eq!(
+            FeatureCoverageSource::resolve_with(
+                env(&[
+                    ("SPAWN_FEATURE_COVERAGE_SNAPSHOT", "   "),
+                    ("SPAWN_FEATURE_ROOT", "/srv/spawn"),
+                    ("SPAWN_FEATURE_REGISTRY", "/srv/spawn/custom.json"),
+                ]),
+                cwd,
+            ),
+            FeatureCoverageSource::LiveRepo {
+                root: PathBuf::from("/srv/spawn"),
+                registry: PathBuf::from("/srv/spawn/custom.json"),
+            }
+        );
+
+        assert_eq!(
+            FeatureCoverageSource::resolve_with(env(&[("SPAWN_FEATURE_ROOT", "/srv/repo")]), cwd),
+            FeatureCoverageSource::LiveRepo {
+                root: PathBuf::from("/srv/repo"),
+                registry: PathBuf::from("/srv/repo/docs/feature-map/registry.json"),
+            }
+        );
+
+        assert_eq!(
+            FeatureCoverageSource::resolve_with(env(&[]), cwd),
+            FeatureCoverageSource::LiveRepo {
+                root: PathBuf::from("/srv/cwd"),
+                registry: PathBuf::from("/srv/cwd/docs/feature-map/registry.json"),
+            }
         );
     }
 }

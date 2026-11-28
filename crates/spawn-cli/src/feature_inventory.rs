@@ -32,8 +32,8 @@ pub const DEFAULT_REGISTRY_REL: &str = "docs/feature-map/registry.json";
 /// Resolve the default project root from `SPAWN_FEATURE_ROOT` or current
 /// working directory.
 pub fn default_root() -> PathBuf {
-    if let Some(root) = crate::env_value("SPAWN_FEATURE_ROOT") {
-        return PathBuf::from(root);
+    if let Some(root) = crate::config::feature_root_override() {
+        return root;
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
@@ -41,8 +41,8 @@ pub fn default_root() -> PathBuf {
 /// Resolve the default registry path from `SPAWN_FEATURE_REGISTRY` or
 /// `<root>/docs/feature-map/registry.json`.
 pub fn default_registry_path(root: &Path) -> PathBuf {
-    if let Some(registry) = crate::env_value("SPAWN_FEATURE_REGISTRY") {
-        return PathBuf::from(registry);
+    if let Some(registry) = crate::config::feature_registry_override() {
+        return registry;
     }
     root.join(DEFAULT_REGISTRY_REL)
 }
@@ -149,24 +149,24 @@ pub fn load_registry(path: &Path) -> Result<FeatureRegistry, String> {
     Ok(registry)
 }
 
-/// Atomically persist a [`FeatureRegistry`] via sibling temp file + `sync_all`
-/// + `rename`.
-pub fn save_registry_atomic(path: &Path, registry: &FeatureRegistry) -> Result<(), String> {
+fn write_text_atomic(
+    path: &Path,
+    payload: &str,
+    unix_mode: Option<u32>,
+    kind: &str,
+) -> Result<(), String> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)
-            .map_err(|error| format!("create registry dir {}: {error}", parent.display()))?;
+            .map_err(|error| format!("create {kind} dir {}: {error}", parent.display()))?;
     }
-    let mut payload = serde_json::to_string_pretty(registry)
-        .map_err(|error| format!("serialize feature registry: {error}"))?;
-    payload.push('\n');
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("registry.json");
+        .unwrap_or("output.json");
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -174,15 +174,27 @@ pub fn save_registry_atomic(path: &Path, registry: &FeatureRegistry) -> Result<(
 
     let write_res = (|| -> Result<(), String> {
         let mut file = File::create(&tmp_path)
-            .map_err(|error| format!("create temp registry {}: {error}", tmp_path.display()))?;
+            .map_err(|error| format!("create temp {kind} {}: {error}", tmp_path.display()))?;
         file.write_all(payload.as_bytes())
-            .map_err(|error| format!("write temp registry {}: {error}", tmp_path.display()))?;
+            .map_err(|error| format!("write temp {kind} {}: {error}", tmp_path.display()))?;
+        if let Some(mode) = unix_mode {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(mode))
+                    .map_err(|error| {
+                        format!("chmod temp {kind} {}: {error}", tmp_path.display())
+                    })?;
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+        }
         file.sync_all()
-            .map_err(|error| format!("sync temp registry {}: {error}", tmp_path.display()))?;
+            .map_err(|error| format!("sync temp {kind} {}: {error}", tmp_path.display()))?;
         drop(file);
         fs::rename(&tmp_path, path).map_err(|error| {
             format!(
-                "rename temp registry {} -> {}: {error}",
+                "rename temp {kind} {} -> {}: {error}",
                 tmp_path.display(),
                 path.display()
             )
@@ -193,6 +205,15 @@ pub fn save_registry_atomic(path: &Path, registry: &FeatureRegistry) -> Result<(
         let _ = fs::remove_file(&tmp_path);
     }
     write_res
+}
+
+/// Atomically persist a [`FeatureRegistry`] via sibling temp file + `sync_all`
+/// + `rename`.
+pub fn save_registry_atomic(path: &Path, registry: &FeatureRegistry) -> Result<(), String> {
+    let mut payload = serde_json::to_string_pretty(registry)
+        .map_err(|error| format!("serialize feature registry: {error}"))?;
+    payload.push('\n');
+    write_text_atomic(path, &payload, None, "registry")
 }
 
 /// Whether the feature registry can be saved in place by
@@ -448,12 +469,178 @@ pub fn associate_and_save(
     Ok((update, report))
 }
 
+/// Human-readable reason surfaced when serving a precomputed coverage snapshot.
+pub(crate) const PRECOMPUTED_SNAPSHOT_READ_ONLY_REASON: &str = "precomputed feature coverage \
+    snapshot is read-only (control plane without local source checkout)";
+
+/// Maximum accepted size (16 MiB) for a precomputed coverage snapshot file.
+const MAX_COVERAGE_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Serialized feature entry inside [`ApiCoveragePayload`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApiCoverageFeature {
+    pub id: String,
+    pub title: String,
+    pub kind: FeatureKind,
+    pub parent: Option<String>,
+    pub summary: String,
+    pub status_note: Option<String>,
+    pub file_count: usize,
+    #[serde(default)]
+    pub relations: Vec<FeatureRelation>,
+    #[serde(default)]
+    pub provenance: FeatureProvenance,
+}
+
+/// Full JSON payload returned by `GET /api/features/coverage`,
+/// `POST /api/features/scan`, and `spawn features scan --snapshot`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApiCoveragePayload {
+    pub root: String,
+    pub registry_path: String,
+    pub registry_writable: bool,
+    pub read_only_reason: Option<String>,
+    pub report: ScanReport,
+    pub features: Vec<ApiCoverageFeature>,
+}
+
 /// Build the JSON payload served by `GET /api/features/coverage` and
 /// `POST /api/features/scan`.
 pub fn api_coverage_payload(root: &Path, registry_path: &Path) -> Result<Value, String> {
     let registry = load_registry(registry_path)?;
     let report = scan_project_root(root, &registry)?;
-    Ok(build_api_payload(&registry, &report, root, registry_path))
+    serialize_api_payload(&build_api_payload_struct(
+        &registry,
+        &report,
+        root,
+        registry_path,
+        probe_registry_writable(registry_path),
+    ))
+}
+
+/// Build a read-only precomputed [`ApiCoveragePayload`] directly from a live
+/// repo scan for release packaging (`spawn features scan --snapshot`).
+pub fn api_coverage_snapshot_payload(
+    root: &Path,
+    registry_path: &Path,
+) -> Result<ApiCoveragePayload, String> {
+    let registry = load_registry(registry_path)?;
+    let report = scan_project_root(root, &registry)?;
+    Ok(build_api_payload_struct(
+        &registry,
+        &report,
+        root,
+        registry_path,
+        RegistryWritability {
+            writable: false,
+            read_only_reason: Some(PRECOMPUTED_SNAPSHOT_READ_ONLY_REASON.to_string()),
+        },
+    ))
+}
+
+/// Read and strictly validate an immutable precomputed coverage snapshot JSON
+/// without walking any source directory. Unconditionally marks the payload as
+/// non-writable.
+pub fn load_coverage_snapshot(snapshot_path: &Path) -> Result<ApiCoveragePayload, String> {
+    use std::io::Read as _;
+
+    let file = File::open(snapshot_path).map_err(|error| {
+        format!(
+            "read coverage snapshot {}: {error}",
+            snapshot_path.display()
+        )
+    })?;
+    let meta = file.metadata().map_err(|error| {
+        format!(
+            "stat coverage snapshot {}: {error}",
+            snapshot_path.display()
+        )
+    })?;
+    if !meta.is_file() {
+        return Err(format!(
+            "coverage snapshot {} is not a regular file",
+            snapshot_path.display()
+        ));
+    }
+    if meta.len() == 0 {
+        return Err(format!(
+            "coverage snapshot {} is empty",
+            snapshot_path.display()
+        ));
+    }
+    if meta.len() > MAX_COVERAGE_SNAPSHOT_BYTES {
+        return Err(format!(
+            "coverage snapshot {} is {} bytes; maximum allowed is {MAX_COVERAGE_SNAPSHOT_BYTES}",
+            snapshot_path.display(),
+            meta.len()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_COVERAGE_SNAPSHOT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            format!(
+                "read coverage snapshot {}: {error}",
+                snapshot_path.display()
+            )
+        })?;
+    if bytes.is_empty() {
+        return Err(format!(
+            "coverage snapshot {} is empty",
+            snapshot_path.display()
+        ));
+    }
+    if bytes.len() as u64 > MAX_COVERAGE_SNAPSHOT_BYTES {
+        return Err(format!(
+            "coverage snapshot {} exceeds {MAX_COVERAGE_SNAPSHOT_BYTES} bytes",
+            snapshot_path.display()
+        ));
+    }
+    let raw = String::from_utf8(bytes).map_err(|error| {
+        format!(
+            "coverage snapshot {} is not valid UTF-8: {error}",
+            snapshot_path.display()
+        )
+    })?;
+    let mut payload: ApiCoveragePayload = serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "parse coverage snapshot {}: {error}",
+            snapshot_path.display()
+        )
+    })?;
+    if payload.report.schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported coverage snapshot schema_version {} in {} (expected {SCHEMA_VERSION})",
+            payload.report.schema_version,
+            snapshot_path.display()
+        ));
+    }
+    let was_writable = payload.registry_writable;
+    payload.registry_writable = false;
+    let has_reason = payload
+        .read_only_reason
+        .as_deref()
+        .is_some_and(|reason| !reason.trim().is_empty());
+    if was_writable || !has_reason {
+        payload.read_only_reason = Some(PRECOMPUTED_SNAPSHOT_READ_ONLY_REASON.to_string());
+    }
+    Ok(payload)
+}
+
+/// Serve feature coverage from either a live local repository or an immutable
+/// precomputed snapshot (closed sum type [`crate::config::FeatureCoverageSource`]).
+pub(crate) fn api_coverage_payload_from_source(
+    source: &crate::config::FeatureCoverageSource,
+) -> Result<Value, String> {
+    match source {
+        crate::config::FeatureCoverageSource::LiveRepo { root, registry } => {
+            api_coverage_payload(root, registry)
+        }
+        crate::config::FeatureCoverageSource::PrecomputedSnapshot { snapshot_path } => {
+            let payload = load_coverage_snapshot(snapshot_path)?;
+            serialize_api_payload(&payload)
+        }
+    }
 }
 
 /// Build the JSON payload served by `POST /api/features/associate`.
@@ -465,20 +652,31 @@ pub fn api_associate_payload(
 ) -> Result<Value, String> {
     let (update, report) = associate_and_save(root, registry_path, path, feature_ids)?;
     let registry = load_registry(registry_path)?;
-    let mut payload = build_api_payload(&registry, &report, root, registry_path);
+    let mut payload = serialize_api_payload(&build_api_payload_struct(
+        &registry,
+        &report,
+        root,
+        registry_path,
+        probe_registry_writable(registry_path),
+    ))?;
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("update".to_string(), json!(update));
     }
     Ok(payload)
 }
 
-fn build_api_payload(
+fn serialize_api_payload(payload: &ApiCoveragePayload) -> Result<Value, String> {
+    serde_json::to_value(payload).map_err(|error| format!("serialize coverage payload: {error}"))
+}
+
+fn build_api_payload_struct(
     registry: &FeatureRegistry,
     report: &ScanReport,
     root: &Path,
     registry_path: &Path,
-) -> Value {
-    let features: Vec<Value> = registry
+    writability: RegistryWritability,
+) -> ApiCoveragePayload {
+    let features = registry
         .features
         .iter()
         .map(|node| {
@@ -487,28 +685,27 @@ fn build_api_payload(
                 .feature_to_files
                 .get(&node.id)
                 .map_or(0, Vec::len);
-            json!({
-                "id": node.id,
-                "title": node.title,
-                "kind": node.kind,
-                "parent": node.parent,
-                "summary": node.summary,
-                "status_note": node.status_note,
-                "file_count": active_files,
-                "relations": node.relations,
-                "provenance": node.provenance,
-            })
+            ApiCoverageFeature {
+                id: node.id.clone(),
+                title: node.title.clone(),
+                kind: node.kind,
+                parent: node.parent.clone(),
+                summary: node.summary.clone(),
+                status_note: node.status_note.clone(),
+                file_count: active_files,
+                relations: node.relations.clone(),
+                provenance: node.provenance.clone(),
+            }
         })
         .collect();
-    let writability = probe_registry_writable(registry_path);
-    json!({
-        "root": root.display().to_string(),
-        "registry_path": registry_path.display().to_string(),
-        "registry_writable": writability.writable,
-        "read_only_reason": writability.read_only_reason,
-        "report": report,
-        "features": features,
-    })
+    ApiCoveragePayload {
+        root: root.display().to_string(),
+        registry_path: registry_path.display().to_string(),
+        registry_writable: writability.writable,
+        read_only_reason: writability.read_only_reason,
+        report: report.clone(),
+        features,
+    }
 }
 
 /// The usage of `spawn features`, the only copy (main's help reads it).
@@ -516,6 +713,7 @@ fn build_api_payload(
 /// extra subcommands while keeping `main.rs`'s `MORE_USAGE` contract exact.
 pub(crate) const USAGE: &str = "\
 usage: spawn features scan|check [--root <dir>] [--registry <file>] [--json]
+       scan options: [--snapshot] [--out <file>]
        check options: [--deps report|enforce] [--purity report|enforce] [--policy <file>]
        spawn features associate --path <file> --feature <id> [--feature <id>]... [--root <dir>] [--registry <file>] [--json]
        spawn features graph [--root <dir>] [--registry <file>] [--level file|unit|feature] [--from <id|path>] [--to <id|path>] [--feature <id>] [--json]
@@ -567,16 +765,20 @@ fn parse_gate_mode(flag: &str, value: Option<&str>) -> Result<GateMode, String> 
     }
 }
 
-struct CommonOpts {
+struct ScanOpts {
     root: PathBuf,
     registry: PathBuf,
     json: bool,
+    snapshot: bool,
+    out: Option<PathBuf>,
 }
 
-fn parse_common_opts(args: &[String]) -> Result<CommonOpts, String> {
+fn parse_scan_opts(args: &[String]) -> Result<ScanOpts, String> {
     let mut root: Option<PathBuf> = None;
     let mut registry: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
     let mut json_out = false;
+    let mut snapshot = false;
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -594,31 +796,62 @@ fn parse_common_opts(args: &[String]) -> Result<CommonOpts, String> {
                     .ok_or_else(|| "--registry requires a file path".to_string())?;
                 registry = Some(PathBuf::from(value));
             }
+            "--out" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| "--out requires a file path".to_string())?;
+                out = Some(PathBuf::from(value));
+            }
             "--json" => json_out = true,
+            "--snapshot" => snapshot = true,
             other => return Err(format!("unexpected argument {other:?}")),
         }
         idx += 1;
     }
+    if out.is_some() && !snapshot && !json_out {
+        return Err("--out requires --snapshot or --json".to_string());
+    }
     let root = root.unwrap_or_else(default_root);
     let registry = registry.unwrap_or_else(|| default_registry_path(&root));
-    Ok(CommonOpts {
+    Ok(ScanOpts {
         root,
         registry,
         json: json_out,
+        snapshot,
+        out,
     })
 }
 
 fn cmd_scan(args: &[String]) -> Result<i32, String> {
-    let opts = parse_common_opts(args)?;
-    let registry = load_registry(&opts.registry)?;
-    let report = scan_project_root(&opts.root, &registry)?;
-
-    if opts.json {
-        let text = serde_json::to_string_pretty(&report)
-            .map_err(|error| format!("serialize scan report: {error}"))?;
-        println!("{text}");
+    let opts = parse_scan_opts(args)?;
+    let rendered = if opts.snapshot {
+        let payload = api_coverage_snapshot_payload(&opts.root, &opts.registry)?;
+        Some(
+            serde_json::to_string_pretty(&payload)
+                .map_err(|error| format!("serialize coverage snapshot: {error}"))?,
+        )
+    } else if opts.json {
+        let registry = load_registry(&opts.registry)?;
+        let report = scan_project_root(&opts.root, &registry)?;
+        Some(
+            serde_json::to_string_pretty(&report)
+                .map_err(|error| format!("serialize scan report: {error}"))?,
+        )
     } else {
+        let registry = load_registry(&opts.registry)?;
+        let report = scan_project_root(&opts.root, &registry)?;
         print_human_report(&report);
+        None
+    };
+
+    if let Some(mut text) = rendered {
+        if let Some(out_path) = opts.out.as_deref() {
+            text.push('\n');
+            write_text_atomic(out_path, &text, Some(0o644), "coverage output")?;
+        } else {
+            println!("{text}");
+        }
     }
     Ok(0)
 }
@@ -3481,5 +3714,122 @@ mod tests {
         .expect("generate go registry");
         assert_eq!(gen_graph.units.len(), 1);
         assert!(feature_deps::check_purity(&generated, Some(&gen_graph)).is_clean());
+    }
+
+    #[test]
+    fn coverage_snapshot_round_trips_without_walking_source_tree() {
+        use crate::config::FeatureCoverageSource;
+
+        let root = temp_fixture("snapshot-roundtrip");
+        fs::create_dir_all(root.join("src")).expect("src");
+        fs::write(root.join("src/lib.rs"), "pub fn ok() {}\n").expect("lib.rs");
+        fs::write(root.join("src/wild.rs"), "pub fn wild() {}\n").expect("wild.rs");
+        let registry_path = root.join("docs/feature-map/registry.json");
+        save_registry_atomic(&registry_path, &minimal_registry(vec!["src/lib.rs"])).expect("save");
+
+        let live = api_coverage_payload(&root, &registry_path).expect("live payload");
+        let snapshot_dir = temp_fixture("snapshot-store");
+        let snapshot_path = snapshot_dir.join("feature-coverage.json");
+        let args = [
+            "--root".to_string(),
+            root.display().to_string(),
+            "--registry".to_string(),
+            registry_path.display().to_string(),
+            "--snapshot".to_string(),
+            "--out".to_string(),
+            snapshot_path.display().to_string(),
+        ];
+        assert_eq!(cmd_scan(&args).expect("cmd_scan snapshot"), 0);
+
+        // Remove the source tree completely: PrecomputedSnapshot must not touch it.
+        fs::remove_dir_all(&root).expect("remove source tree");
+
+        let loaded = load_coverage_snapshot(&snapshot_path).expect("load snapshot");
+        assert!(!loaded.registry_writable);
+        assert!(
+            loaded
+                .read_only_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty())
+        );
+
+        let served =
+            api_coverage_payload_from_source(&FeatureCoverageSource::PrecomputedSnapshot {
+                snapshot_path,
+            })
+            .expect("serve precomputed snapshot");
+        assert_eq!(served["root"], live["root"]);
+        assert_eq!(served["registry_path"], live["registry_path"]);
+        assert_eq!(served["registry_writable"], json!(false));
+        assert_eq!(served["report"]["counts"], live["report"]["counts"]);
+        assert_eq!(served["features"], live["features"]);
+
+        let _ = fs::remove_dir_all(&snapshot_dir);
+    }
+
+    #[test]
+    fn load_coverage_snapshot_fails_closed_on_missing_corrupt_or_tampered_input() {
+        let root = temp_fixture("snapshot-neg-src");
+        fs::create_dir_all(root.join("src")).expect("src");
+        fs::write(root.join("src/lib.rs"), "pub fn ok() {}\n").expect("lib.rs");
+        let registry_path = root.join("docs/feature-map/registry.json");
+        save_registry_atomic(&registry_path, &minimal_registry(vec!["src/lib.rs"])).expect("save");
+        let payload = api_coverage_snapshot_payload(&root, &registry_path).expect("snapshot");
+        let neg_dir = temp_fixture("snapshot-neg");
+        let snapshot_path = neg_dir.join("feature-coverage.json");
+
+        // Tampering registry_writable=true overwrites custom reason cleanly and forces read-only.
+        let mut tampered = serde_json::to_value(&payload).expect("value");
+        tampered["registry_writable"] = json!(true);
+        tampered["read_only_reason"] = json!("stale writable claim");
+        fs::write(&snapshot_path, tampered.to_string()).expect("write tampered");
+        let hardened = load_coverage_snapshot(&snapshot_path).expect("hardened load");
+        assert!(!hardened.registry_writable);
+        assert_eq!(
+            hardened.read_only_reason.as_deref(),
+            Some(PRECOMPUTED_SNAPSHOT_READ_ONLY_REASON)
+        );
+
+        assert!(
+            load_coverage_snapshot(&neg_dir.join("missing.json"))
+                .unwrap_err()
+                .contains("missing.json")
+        );
+        assert!(
+            load_coverage_snapshot(&neg_dir)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+
+        let raw_report = serde_json::to_string(&payload.report).expect("report");
+        let raw_registry = serde_json::to_string(&minimal_registry(vec![])).expect("registry");
+        let mut bad_ver = serde_json::to_value(&hardened).expect("value");
+        bad_ver["report"]["schema_version"] = json!(99);
+
+        for (name, body) in [
+            ("empty.json", String::new()),
+            ("invalid.json", "{not-json".to_string()),
+            ("truncated.json", "{\"root\":\"/x\"".to_string()),
+            ("raw-report.json", raw_report),
+            ("raw-registry.json", raw_registry),
+            ("bad-version.json", bad_ver.to_string()),
+        ] {
+            let bad = neg_dir.join(name);
+            fs::write(&bad, body).expect("write bad");
+            assert!(
+                load_coverage_snapshot(&bad).is_err(),
+                "{name} must fail closed"
+            );
+        }
+
+        let err_out = cmd_scan(&[
+            "--out".to_string(),
+            neg_dir.join("out.json").display().to_string(),
+        ])
+        .expect_err("--out without --snapshot/--json refused");
+        assert!(err_out.contains("--out"), "{err_out}");
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&neg_dir);
     }
 }

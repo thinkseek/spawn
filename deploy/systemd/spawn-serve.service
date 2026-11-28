@@ -12,6 +12,10 @@ Environment=SPAWN_WEB_DIR=%h/.local/share/spawn-rsi/web
 # The feature map's tree (/api/features, docs/feature-map/registry.json):
 # the controller, the deployed commit's, not the working directory.
 Environment=SPAWN_FEATURE_ROOT=%h/.local/share/spawn-rsi/controllers/spawn
+# ADR-006 Option B (control plane without source checkout): immutable release
+# coverage snapshot and registry fallback (staged 0644 under current/).
+Environment=SPAWN_FEATURE_COVERAGE_SNAPSHOT=%h/.local/share/spawn-rsi/current/feature-coverage.json
+Environment=SPAWN_FEATURE_REGISTRY=%h/.local/share/spawn-rsi/current/registry.json
 ExecStart=%h/.local/share/spawn-rsi/bin/spawn serve
 Restart=always
 RestartSec=3

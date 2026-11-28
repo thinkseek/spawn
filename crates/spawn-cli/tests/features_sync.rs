@@ -509,3 +509,77 @@ fn check_purity_reports_all_four_violations_and_enforces_exit_code() {
         1
     );
 }
+
+#[test]
+fn scan_snapshot_exports_api_compatible_read_only_payload_atomically() {
+    let project = Project::new("scan-snapshot-cli", POLYGLOT_REPO);
+    let root_s = project.0.to_string_lossy().into_owned();
+    let generated = spawn_features(&["generate", "--root", &root_s, "--apply", "--json"]);
+    assert_eq!(
+        generated.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    let out_dir = Project::new("scan-snapshot-out", &[]);
+    let out_file = out_dir.0.join("nested/feature-coverage.json");
+    let out_s = out_file.to_string_lossy().into_owned();
+    let reg_s = project
+        .0
+        .join("docs/feature-map/registry.json")
+        .to_string_lossy()
+        .into_owned();
+
+    let snap = spawn_features(&[
+        "scan",
+        "--root",
+        &root_s,
+        "--registry",
+        &reg_s,
+        "--snapshot",
+        "--out",
+        &out_s,
+    ]);
+    assert_eq!(
+        snap.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&snap.stderr)
+    );
+    assert!(snap.stdout.is_empty(), "snapshot written to --out cleanly");
+    assert!(out_file.is_file());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&out_file)
+            .expect("stat snapshot")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_file).expect("read snapshot"))
+            .expect("parse snapshot json");
+    assert_eq!(payload["root"], root_s);
+    assert_eq!(payload["registry_path"], reg_s);
+    assert_eq!(payload["registry_writable"], false);
+    assert!(
+        payload["read_only_reason"]
+            .as_str()
+            .is_some_and(|r| !r.trim().is_empty())
+    );
+    assert!(
+        payload["report"]["counts"]["in_scope"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+    );
+    assert!(
+        payload["features"]
+            .as_array()
+            .is_some_and(|features| !features.is_empty())
+    );
+}

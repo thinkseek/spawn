@@ -160,13 +160,15 @@ fn read_map(
             .source_pushes(source, None, MAX_OWNER_PUSHES_READ)
             .ok()
     });
-    Ok(build_with_owner_landings(
+    let fallback_registry = crate::config::feature_registry_override();
+    Ok(build_with_owner_landings_and_fallback(
         &missions,
         &verifications,
         &deployments,
         &live_anchor,
         &blockers,
         &owner_file_landings,
+        fallback_registry.as_deref(),
         now_ms(),
     ))
 }
@@ -639,7 +641,7 @@ fn build(
     )
 }
 
-/// [`build`], with each mission's gated owner landings per repo file.
+#[cfg(test)]
 fn build_with_owner_landings(
     missions: &[Value],
     verification: &Value,
@@ -647,6 +649,31 @@ fn build_with_owner_landings(
     live_anchor: &Value,
     blockers: &Value,
     owner_file_landings: &BTreeMap<i64, BTreeMap<String, GatedFileLanding>>,
+    now: i64,
+) -> Value {
+    build_with_owner_landings_and_fallback(
+        missions,
+        verification,
+        deployments,
+        live_anchor,
+        blockers,
+        owner_file_landings,
+        None,
+        now,
+    )
+}
+
+/// [`build`], with each mission's gated owner landings per repo file and an
+/// optional control-plane `SPAWN_FEATURE_REGISTRY` read-only fallback.
+#[allow(clippy::too_many_arguments)]
+fn build_with_owner_landings_and_fallback(
+    missions: &[Value],
+    verification: &Value,
+    deployments: &Value,
+    live_anchor: &Value,
+    blockers: &Value,
+    owner_file_landings: &BTreeMap<i64, BTreeMap<String, GatedFileLanding>>,
+    fallback_registry: Option<&Path>,
     now: i64,
 ) -> Value {
     let facts = Facts {
@@ -663,7 +690,7 @@ fn build_with_owner_landings(
     };
     let rows: Vec<Value> = missions
         .iter()
-        .map(|mission| mission_row(mission, &facts))
+        .map(|mission| mission_row(mission, &facts, fallback_registry))
         .collect();
     json!({
         "generated_at_ms": now,
@@ -677,9 +704,9 @@ fn build_with_owner_landings(
 }
 
 /// One mission's capabilities, counts, blocker and mapping.
-fn mission_row(mission: &Value, facts: &Facts) -> Value {
+fn mission_row(mission: &Value, facts: &Facts, fallback_registry: Option<&Path>) -> Value {
     let id = mission["id"].as_i64().unwrap_or_default();
-    let (specs, mapping) = specs_for(mission);
+    let (specs, mapping) = specs_for_with_fallback(mission, fallback_registry);
     let mut features: Vec<Value> = specs
         .iter()
         .map(|spec| derive(spec, mission, facts))
@@ -939,11 +966,103 @@ fn with_deployed(missions: &mut [Value], undeployed: &Value) {
     }
 }
 
-/// The mission's capabilities: a readable mapping file, or one capability
-/// per backlog objective.
+/// Whether `mission` tracks the Spawn repository itself (shipped by deploy
+/// or citing the Spawn repository in `sources`), and is therefore eligible
+/// for read-only `SPAWN_FEATURE_REGISTRY` control-plane fallback.
+pub(super) fn is_spawn_repo_mission(mission: &Value) -> bool {
+    if shipped_by_deploy(mission) {
+        return true;
+    }
+    mission["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|source| {
+            source.as_str().is_some_and(|raw| {
+                let trimmed = raw.trim().trim_end_matches('/');
+                trimmed.ends_with(DEPLOYED_SOURCE_SUFFIX)
+                    || trimmed.ends_with("github.com/thinkseek/spawn")
+                    || trimmed.ends_with("github.com/thinkseek/spawn.git")
+                    || trimmed.ends_with("github.com:thinkseek/spawn")
+                    || trimmed.ends_with("github.com:thinkseek/spawn.git")
+            })
+        })
+}
+
+/// Outcome of reading a mission's mapping file from local disk: only
+/// `NotFound` is eligible for control-plane `SPAWN_FEATURE_REGISTRY` fallback;
+/// corrupt or invalid local files never fall back silently.
+enum MappingRead {
+    Loaded(Vec<Spec>),
+    NotFound(String),
+    Invalid(String),
+}
+
+fn try_spawn_registry_fallback(
+    mission: &Value,
+    fallback_registry: Option<&Path>,
+    fallback: Vec<Spec>,
+    configured_path: Option<String>,
+    original_error: &str,
+) -> (Vec<Spec>, Value) {
+    let mission_id = mission["id"].as_i64().unwrap_or_default();
+    if is_spawn_repo_mission(mission)
+        && let Some(reg_path) = fallback_registry
+    {
+        return match read_mapping(reg_path, mission_id) {
+            Ok(specs) => (
+                specs,
+                json!({
+                    "kind": "file",
+                    "path": reg_path.display().to_string(),
+                    "error": Value::Null,
+                    "fallback": true,
+                    "configured_path": configured_path,
+                }),
+            ),
+            Err(fb_err) => (
+                fallback,
+                json!({
+                    "kind": "objectives",
+                    "path": configured_path.unwrap_or_else(|| reg_path.display().to_string()),
+                    "error": format!("{original_error}; fallback registry {}: {fb_err}", reg_path.display()),
+                }),
+            ),
+        };
+    }
+    (
+        fallback,
+        json!({"kind": "objectives", "path": configured_path, "error": original_error}),
+    )
+}
+
+/// The mission's capabilities: a readable mapping file, read-only Spawn
+/// control-plane registry fallback when local paths are absent, or one
+/// capability per backlog objective.
+#[cfg(test)]
 fn specs_for(mission: &Value) -> (Vec<Spec>, Value) {
+    specs_for_with_fallback(mission, None)
+}
+
+fn specs_for_with_fallback(
+    mission: &Value,
+    fallback_registry: Option<&Path>,
+) -> (Vec<Spec>, Value) {
     let fallback = fallback_specs(mission);
     let Some(given) = mission["features_file"].as_str() else {
+        if fallback.is_empty()
+            && let Some(backlog_err) = mission["backlog_error"].as_str()
+            && is_spawn_repo_mission(mission)
+            && fallback_registry.is_some()
+        {
+            return try_spawn_registry_fallback(
+                mission,
+                fallback_registry,
+                fallback,
+                None,
+                &format!("backlog unavailable: {backlog_err}"),
+            );
+        }
         return (
             fallback,
             json!({"kind": "objectives", "path": null, "error": null}),
@@ -952,22 +1071,32 @@ fn specs_for(mission: &Value) -> (Vec<Spec>, Value) {
     let path = match resolve(mission, given) {
         Ok(path) => path,
         Err(error) => {
-            return (
+            return try_spawn_registry_fallback(
+                mission,
+                fallback_registry,
                 fallback,
-                json!({"kind": "objectives", "path": given, "error": error}),
+                Some(given.to_string()),
+                &error,
             );
         }
     };
     let mission_id = mission["id"].as_i64().unwrap_or_default();
-    match read_mapping(&path, mission_id) {
-        Ok(specs) => (
+    match read_mapping_classified(&path, mission_id) {
+        MappingRead::Loaded(specs) => (
             specs,
             json!({"kind": "file", "path": path.display().to_string(), "error": null}),
         ),
-        Err(error) => (
+        MappingRead::Invalid(error) => (
             fallback,
             json!({"kind": "objectives", "path": path.display().to_string(),
                    "error": error}),
+        ),
+        MappingRead::NotFound(error) => try_spawn_registry_fallback(
+            mission,
+            fallback_registry,
+            fallback,
+            Some(path.display().to_string()),
+            &error,
         ),
     }
 }
@@ -997,23 +1126,48 @@ pub(crate) fn validate_file(path: &Path, mission_id: i64) -> Result<(), String> 
 /// belongs to: an objective source may leave its mission out, and may not
 /// name another.
 fn read_mapping(path: &Path, mission_id: i64) -> Result<Vec<Spec>, String> {
-    let meta =
-        std::fs::metadata(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    match read_mapping_classified(path, mission_id) {
+        MappingRead::Loaded(specs) => Ok(specs),
+        MappingRead::NotFound(err) | MappingRead::Invalid(err) => Err(err),
+    }
+}
+
+fn read_mapping_classified(path: &Path, mission_id: i64) -> MappingRead {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return MappingRead::NotFound(format!("read {}: {error}", path.display()));
+        }
+        Err(error) => {
+            return MappingRead::Invalid(format!("read {}: {error}", path.display()));
+        }
+    };
     if !meta.is_file() {
-        return Err(format!("{} is not a file", path.display()));
+        return MappingRead::Invalid(format!("{} is not a file", path.display()));
     }
     if meta.len() > MAX_MAPPING_BYTES {
-        return Err(format!(
+        return MappingRead::Invalid(format!(
             "{} is {} bytes; a feature map is at most {MAX_MAPPING_BYTES}",
             path.display(),
             meta.len()
         ));
     }
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("read {}: {error}", path.display()))?;
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|error| format!("parse {}: {error}", path.display()))?;
-    parse_mapping(&value, mission_id)
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            return MappingRead::Invalid(format!("read {}: {error}", path.display()));
+        }
+    };
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            return MappingRead::Invalid(format!("parse {}: {error}", path.display()));
+        }
+    };
+    match parse_mapping(&value, mission_id) {
+        Ok(specs) => MappingRead::Loaded(specs),
+        Err(error) => MappingRead::Invalid(error),
+    }
 }
 
 /// Check a feature map file for `mission_id`, a mission's own: the
@@ -5014,6 +5168,168 @@ mod tests {
             ["cap-resource-envelopes"],
             "4/029 is its own node"
         );
+    }
+
+    #[test]
+    fn control_plane_missing_paths_fallback_safely_only_for_spawn_missions() {
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-feature-map-cp-fallback-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let reg_path = dir.join("registry.json");
+        std::fs::write(
+            &reg_path,
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "initiative_id": "t559u",
+                "boundary": {
+                    "project_name": "Spawn",
+                    "description": "Spawn",
+                    "included_categories": [],
+                    "exclusions": []
+                },
+                "features": [
+                    {
+                        "id": "dom-core",
+                        "title": "Core Domain",
+                        "kind": "domain",
+                        "summary": "Core",
+                        "files": [],
+                        "relations": [],
+                        "provenance": {}
+                    },
+                    {
+                        "id": "cap-serve",
+                        "title": "Serve API",
+                        "kind": "capability",
+                        "parent": "dom-core",
+                        "summary": "Control plane API",
+                        "files": ["crates/spawn-cli/src/serve.rs"],
+                        "relations": [],
+                        "provenance": {"objectives": ["4/001"]}
+                    }
+                ]
+            }))
+            .expect("json"),
+        )
+        .expect("write fallback registry");
+
+        let spawn_mission = json!({
+            "id": 4,
+            "text": "Spawn RSI",
+            "state": "open",
+            "sources": ["/home/worker/.local/share/spawn-rsi/missions/spawn.git"],
+            "accept": "review",
+            "backlog": "/nonexistent/worker/backlog",
+            "backlog_error": "read /nonexistent/worker/backlog: No such file or directory",
+            "features_file": "../docs/feature-map/registry.json",
+            "objectives": [],
+            "shipped_by_deploy": true
+        });
+        let map = super::build_with_owner_landings_and_fallback(
+            std::slice::from_ref(&spawn_mission),
+            &json!({"landings": [], "verifications": []}),
+            &json!([]),
+            &Value::Null,
+            &json!([]),
+            &NO_OWNER_FILE_LANDINGS,
+            Some(&reg_path),
+            123,
+        );
+        let row = &map["missions"][0];
+        assert_eq!(row["features"].as_array().map(Vec::len), Some(2));
+        assert_eq!(row["mapping"]["kind"], "file");
+        assert_eq!(row["mapping"]["path"], reg_path.display().to_string());
+        assert_eq!(row["mapping"]["error"], Value::Null);
+        assert_eq!(row["mapping"]["fallback"], true);
+        assert_eq!(
+            row["mapping"]["configured_path"],
+            "/nonexistent/worker/backlog/../docs/feature-map/registry.json"
+        );
+        assert_eq!(
+            row["backlog_error"],
+            "read /nonexistent/worker/backlog: No such file or directory"
+        );
+
+        // Spawn mission with features_file unset AND missing backlog still recovers cleanly.
+        let mut unset_file = spawn_mission.clone();
+        unset_file["features_file"] = Value::Null;
+        unset_file["backlog"] = Value::Null;
+        let (specs_unset, mapping_unset) =
+            super::specs_for_with_fallback(&unset_file, Some(&reg_path));
+        assert_eq!(specs_unset.len(), 2);
+        assert_eq!(mapping_unset["kind"], "file");
+        assert_eq!(mapping_unset["fallback"], true);
+        assert_eq!(mapping_unset["error"], Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn control_plane_fallback_refuses_external_missions_and_corrupt_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-feature-map-cp-neg-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let reg_path = dir.join("registry.json");
+        std::fs::write(
+            &reg_path,
+            r#"{"schema_version":1,"initiative_id":"t","boundary":{"project_name":"Spawn","description":"d","included_categories":[],"exclusions":[]},"features":[{"id":"cap-a","title":"A","kind":"capability","summary":"a","files":[],"relations":[],"provenance":{}}]}"#,
+        )
+        .expect("write fallback registry");
+
+        let external_mission = json!({
+            "id": 9,
+            "sources": ["/home/worker/.local/share/spawn-rsi/missions/acme.git"],
+            "backlog": "/nonexistent/acme/backlog",
+            "backlog_error": "missing",
+            "features_file": "docs/feature-map/registry.json",
+            "objectives": [],
+            "shipped_by_deploy": false
+        });
+        let (ext_specs, ext_map) =
+            super::specs_for_with_fallback(&external_mission, Some(&reg_path));
+        assert!(ext_specs.is_empty());
+        assert_eq!(ext_map["kind"], "objectives");
+        assert!(ext_map["error"].as_str().is_some());
+
+        let corrupt_local = dir.join("corrupt.json");
+        std::fs::write(&corrupt_local, "{not valid json").expect("write corrupt");
+        let spawn_corrupt = json!({
+            "id": 4,
+            "sources": ["/home/worker/.local/share/spawn-rsi/missions/spawn.git"],
+            "features_file": corrupt_local.display().to_string(),
+            "objectives": [],
+            "shipped_by_deploy": true
+        });
+        let (corrupt_specs, corrupt_map) =
+            super::specs_for_with_fallback(&spawn_corrupt, Some(&reg_path));
+        assert!(corrupt_specs.is_empty());
+        assert_eq!(corrupt_map["kind"], "objectives");
+        assert!(corrupt_map["error"].as_str().unwrap().contains("parse "));
+
+        let missing_reg = dir.join("nope.json");
+        let spawn_missing = json!({
+            "id": 4,
+            "sources": ["/home/worker/.local/share/spawn-rsi/missions/spawn.git"],
+            "backlog": "/nonexistent/worker/backlog",
+            "features_file": "../docs/feature-map/registry.json",
+            "objectives": [],
+            "shipped_by_deploy": true
+        });
+        let (miss_specs, miss_map) =
+            super::specs_for_with_fallback(&spawn_missing, Some(&missing_reg));
+        assert!(miss_specs.is_empty());
+        assert_eq!(miss_map["kind"], "objectives");
+        let err_msg = miss_map["error"].as_str().expect("error");
+        assert!(err_msg.contains("fallback registry"), "{err_msg}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
