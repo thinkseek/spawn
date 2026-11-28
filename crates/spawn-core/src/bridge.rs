@@ -121,6 +121,7 @@ use crate::port::{
     TerminalHost, TranscriptArchive, UNMOUNT_IN_USE, ViewedLaunch, WatchError, WorkspaceError,
     WorkspaceStore,
 };
+pub use crate::port::{BridgeShard, ShardPartition};
 use crate::screen::{ScreenState, TAIL_LINES};
 use crate::time::{Clock, SystemClock};
 use crate::transcripts::{self, ArchiveProgress};
@@ -139,7 +140,7 @@ pub const END_RETRY_MS: i64 = 30_000;
 /// Backstop captures one pass takes at most (see [`BridgeConfig::screen_refresh`]):
 /// the screens that fell due are read over the next passes, so a fleet does
 /// not spend one pass capturing every pane and holding the next command.
-pub const BACKSTOPS_PER_PASS: usize = 2;
+pub const BACKSTOPS_PER_PASS: usize = 8;
 
 /// Why a pass wants a live execution's pane read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,11 +311,14 @@ pub struct BridgeConfig {
     pub max_concurrent_mounts: usize,
     /// Maximum checkpoint commits allowed in parallel (`SPAWN_MAX_CONCURRENT_CHECKPOINTS`).
     pub max_concurrent_checkpoints: usize,
-    /// Maximum idle backstop screen captures per pass (`SPAWN_BRIDGE_BACKSTOPS_PER_PASS`).
+    /// Maximum idle backstop screen captures per pass (`SPAWN_BACKSTOPS_PER_PASS`).
     pub backstops_per_pass: usize,
     /// Maximum session directories inspected when fallback-binding a reported session
     /// (`SPAWN_LIST_DIRS_LIMIT`).
     pub session_scan_limit: usize,
+    /// Horizontal shard assignment (`SPAWN_BRIDGE_SHARD`, e.g. `"0/4"`).
+    /// Defaults to [`BridgeShard::All`], preserving single-Bridge behavior.
+    pub shard: BridgeShard,
     /// Whether an engine with no deny rules of its own
     /// ([`crate::driver::Guard::Sandbox`]) runs inside a filesystem view
     /// (decision C2, N6; `SPAWN_ENGINE_VIEW`). Required by default, and
@@ -377,7 +381,7 @@ impl BridgeConfig {
             session_environment: Vec::new(),
             worker: worker.to_string(),
             lease_ttl: Duration::from_mins(2),
-            max_commands_per_tick: 16,
+            max_commands_per_tick: 64,
             ready_attempts: 40,
             ready_interval: Duration::from_millis(250),
             input_attempts: 4,
@@ -394,7 +398,8 @@ impl BridgeConfig {
             max_concurrent_mounts: MAX_CONCURRENT_MOUNTS,
             max_concurrent_checkpoints: MAX_CONCURRENT_CHECKPOINTS,
             backstops_per_pass: BACKSTOPS_PER_PASS,
-            session_scan_limit: crate::port::LIST_DIRS_LIMIT,
+            session_scan_limit: crate::port::DEFAULT_SESSION_SCAN_LIMIT,
+            shard: BridgeShard::All,
             engine_view: EngineViewPolicy::unconfigured(),
             claude_sandbox: false,
             input_wait_max_retry: Duration::from_mins(1),
@@ -597,7 +602,7 @@ struct Follow {
     /// When [`Bridge::bind_reported`] last scanned the engine's
     /// conversations for this execution's, by the Bridge's clock: at most
     /// once per [`SCAN_INTERVAL_MS`], since each scan may read up to
-    /// [`crate::port::LIST_DIRS_LIMIT`] transcripts.
+    /// [`crate::port::DEFAULT_SESSION_SCAN_LIMIT`] transcripts.
     scanned_at: Option<i64>,
     /// The host's agent reading (its `seq`) a recorded screen was last
     /// keyed by: a reading recorded once is never keyed again.
@@ -1556,10 +1561,10 @@ struct AbandonedMount {
 const MOUNT_POLL_RETRY: Duration = Duration::from_millis(25);
 
 /// The number of workspace copies that may run at once.
-const MAX_CONCURRENT_MOUNTS: usize = 8;
+const MAX_CONCURRENT_MOUNTS: usize = 16;
 
 /// Bounded parallelism when committing turn checkpoints across sessions.
-const MAX_CONCURRENT_CHECKPOINTS: usize = 8;
+const MAX_CONCURRENT_CHECKPOINTS: usize = 16;
 
 /// One transcript tail read returned by [`Bridge::read_followed`].
 type FollowedRead = Result<Option<(Vec<u8>, usize)>, TerminalError>;
@@ -1818,6 +1823,22 @@ enum Handled {
     Waiting { retry: Duration },
 }
 
+fn fold_checkpoint_state(view: &mut SessionView, kind: &EventKind) {
+    let Some(active) = view.active.as_mut() else {
+        return;
+    };
+    match kind {
+        EventKind::ArtifactCommitted { reason, .. } if *reason != CheckpointReason::BaseMerged => {
+            active.checkpoint = None;
+        }
+        other => {
+            if let Some(reason) = other.checkpoint_reason() {
+                active.checkpoint = Some(reason);
+            }
+        }
+    }
+}
+
 impl Bridge {
     /// Bridge over one store and one worker name.
     pub fn new(
@@ -1925,10 +1946,12 @@ impl Bridge {
             )
         });
         stop_waits
-            || self.sessions.values().any(|view| {
-                view.active
-                    .as_ref()
-                    .is_some_and(|active| active.follow.killing.is_some())
+            || self.sessions.iter().any(|(session, view)| {
+                self.config.shard.owns_session(session)
+                    && view
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active.follow.killing.is_some())
             })
     }
 
@@ -1946,12 +1969,47 @@ impl Bridge {
             })
     }
 
+    fn validate_config(&self) -> Result<(), StoreError> {
+        if self.config.worker.trim().is_empty() {
+            return Err(StoreError::Rejected(
+                "BridgeConfig::worker must not be empty".to_string(),
+            ));
+        }
+        if self.config.max_commands_per_tick == 0 {
+            return Err(StoreError::Rejected(
+                "BridgeConfig::max_commands_per_tick must be at least 1".to_string(),
+            ));
+        }
+        if self.config.backstops_per_pass == 0 {
+            return Err(StoreError::Rejected(
+                "BridgeConfig::backstops_per_pass must be at least 1".to_string(),
+            ));
+        }
+        if self.config.max_concurrent_mounts == 0 {
+            return Err(StoreError::Rejected(
+                "BridgeConfig::max_concurrent_mounts must be at least 1".to_string(),
+            ));
+        }
+        if self.config.max_concurrent_checkpoints == 0 {
+            return Err(StoreError::Rejected(
+                "BridgeConfig::max_concurrent_checkpoints must be at least 1".to_string(),
+            ));
+        }
+        if self.config.session_scan_limit == 0 {
+            return Err(StoreError::Rejected(
+                "BridgeConfig::session_scan_limit must be at least 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Rebuild state from the whole log. The first recovery exclusively owns
     /// this worker and makes the previous owner's unfinished leases claimable;
     /// a still-live previous owner makes this fail instead of duplicating work.
     /// With [`BridgeConfig::recover_worker_leases`] off it takes no ownership
     /// and expires no lease.
     pub fn recover(&mut self) -> Result<(), StoreError> {
+        self.validate_config()?;
         if self.config.recover_worker_leases && self.ownership.is_none() {
             let (ownership, recovered) = self.queue.recover_worker(&self.config.worker)?;
             self.ownership = Some(ownership);
@@ -1987,6 +2045,9 @@ impl Bridge {
             .collect();
         let mut orphans = Vec::new();
         for (session, view) in &self.sessions {
+            if !self.config.shard.owns_session(session) {
+                continue;
+            }
             for (command, steps) in &view.steps {
                 // Compared as the store names them now (an execution's
                 // workspace is read that way): one directory, one name.
@@ -2077,6 +2138,9 @@ impl Bridge {
             }
         }
         for (agent_id, (session, view, _)) in latest {
+            if !self.config.shard.owns_session(session) {
+                continue;
+            }
             let (Some((recorded, _)), Some((execution, _, ended))) =
                 (recorded.get(agent_id), view.latest.as_ref())
             else {
@@ -2120,7 +2184,12 @@ impl Bridge {
     /// one that the log keeps refusing is warned and stays waiting, and the
     /// other sessions go on.
     fn flush_unrecorded(&self, report: &mut TickReport) {
-        let waiting: Vec<SessionId> = self.unrecorded_commits_lock().keys().cloned().collect();
+        let waiting: Vec<SessionId> = self
+            .unrecorded_commits_lock()
+            .keys()
+            .filter(|session| self.config.shard.owns_session(session))
+            .cloned()
+            .collect();
         for session in waiting {
             if let Err(error) = self.record_unrecorded_commit(&session) {
                 report.warnings.push(format!(
@@ -2139,35 +2208,22 @@ impl Bridge {
         Ok(report)
     }
 
-    /// The Bridge's own reading of the log and of the command queue: catch
-    /// up with the events written since the last one, and claim the commands
-    /// waiting in the queue, one per session at a time, until none is
-    /// claimable or [`BridgeConfig::max_commands_per_tick`] is reached.
-    ///
-    /// This is the part of a tick that reads the database, and it reads it
-    /// for records: its input is the log's latest events and the queue's
-    /// rows, so it is run when the log's watermark has moved and not on a
-    /// clock (docs/design.md §14). `true` says the claim stopped at that
-    /// limit, so a command may still be waiting for a claim now: the caller
-    /// runs this again on its next pass. The wait a lease dates
-    /// (`lease_until_ms`) is the caller's to time.
-    pub fn work(&mut self) -> Result<(TickReport, bool), StoreError> {
-        self.catch_up()?;
-        self.reap_cancelled_mounts();
-        let mut report = TickReport::default();
+    fn work_pass(&mut self, report: &mut TickReport) -> Result<(), StoreError> {
         // Waiting commands keep their lease until the claims of this tick
         // are done, so commands on other sessions (and behind waiting inputs)
         // are claimed now. Each is then released for its own retry delay.
         let mut waited: Vec<(Claimed, i64, Duration)> = Vec::new();
         while report.commands < self.config.max_commands_per_tick {
-            let Some(claimed) = self
-                .queue
-                .claim(&self.config.worker, self.config.lease_ttl)?
+            let Some(claimed) = self.queue.claim_for_shard(
+                &self.config.worker,
+                self.config.lease_ttl,
+                self.config.shard,
+            )?
             else {
                 break;
             };
             let command_id = claimed.command_id;
-            match self.handle(&claimed, &mut report)? {
+            match self.handle(&claimed, report)? {
                 Handled::Finished(outcome) => {
                     if matches!(outcome, Outcome::Succeeded)
                         && claimed.principal == "spawn-liveness"
@@ -2206,6 +2262,27 @@ impl Bridge {
                 self.queue.release(claimed, remaining)?;
             }
         }
+        Ok(())
+    }
+
+    /// The Bridge's own reading of the log and of the command queue: catch
+    /// up with the events written since the last one, and claim the commands
+    /// waiting in the queue, one per session at a time, until none is
+    /// claimable or [`BridgeConfig::max_commands_per_tick`] is reached.
+    ///
+    /// This is the part of a tick that reads the database, and it reads it
+    /// for records: its input is the log's latest events and the queue's
+    /// rows, so it is run when the log's watermark has moved and not on a
+    /// clock (docs/design.md §14). `true` says the claim stopped at that
+    /// limit, so a command may still be waiting for a claim now: the caller
+    /// runs this again on its next pass. The wait a lease dates
+    /// (`lease_until_ms`) is the caller's to time.
+    pub fn work(&mut self) -> Result<(TickReport, bool), StoreError> {
+        self.validate_config()?;
+        self.catch_up()?;
+        self.reap_cancelled_mounts();
+        let mut report = TickReport::default();
+        self.work_pass(&mut report)?;
         report.notes.append(&mut self.stray_notes);
         let left = report.commands >= self.config.max_commands_per_tick;
         Ok((report, left))
@@ -2222,8 +2299,8 @@ impl Bridge {
     /// settling at the prompt are facts no append announces
     /// (objective 025 gives that schedule its own bounds).
     pub fn poll(&mut self) -> Result<TickReport, StoreError> {
+        self.validate_config()?;
         let mut report = TickReport::default();
-        self.backstops.store(0, std::sync::atomic::Ordering::SeqCst);
         self.reap_cancelled_mounts();
         // What changed in the engines' files since the last pass: a
         // transcript or an exit status is read when it is here, not on every
@@ -2341,7 +2418,9 @@ impl Bridge {
             }
             EventKind::ExecutionEnded { .. } if current && event.source == Source::Bridge => {
                 if let Some(active) = view.active.take() {
-                    let archives = self.transcripts.is_some().then_some(&self.ended_archives);
+                    let archives = (self.transcripts.is_some()
+                        && self.config.shard.owns_session(&event.session_id))
+                    .then_some(&self.ended_archives);
                     let watch = self.config.watch.as_deref();
                     ended(watch, archives, view, &event.session_id, &active);
                 }
@@ -2387,23 +2466,10 @@ impl Bridge {
             }
             // A merge of main is no checkpoint of the agent's work: one
             // still due stays due. Nor is a commit of an earlier execution.
-            EventKind::ArtifactCommitted { reason, .. }
-                if current && *reason != CheckpointReason::BaseMerged =>
-            {
-                if let Some(active) = view.active.as_mut() {
-                    active.checkpoint = None;
-                }
-            }
             // Checkpoints are the current execution's own: an event of an
             // earlier one that reaches the log late (or one with no
             // execution) asks for none.
-            other if current => {
-                if let Some(active) = view.active.as_mut()
-                    && let Some(reason) = other.checkpoint_reason()
-                {
-                    active.checkpoint = Some(reason);
-                }
-            }
+            _ if current => fold_checkpoint_state(view, &event.kind),
             _ => {}
         }
     }
@@ -2511,12 +2577,14 @@ impl Bridge {
     }
 
     fn act(&mut self, report: &mut TickReport) -> Result<(), StoreError> {
+        self.backstops.store(0, std::sync::atomic::Ordering::SeqCst);
         self.pass_started = self.clock.now().0;
         // Sessions with no running execution have no `advance` to do it.
         self.flush_unrecorded(report);
         let mut running: Vec<RunningSession> = self
             .sessions
             .iter()
+            .filter(|(session, _)| self.config.shard.owns_session(session))
             .filter_map(|(session, view)| {
                 let active = view.active.clone()?;
                 Some(RunningSession {
@@ -3180,8 +3248,9 @@ impl Bridge {
         self.config.watch.as_ref()?;
         let terminals: Vec<(TerminalName, WorkspaceId)> = self
             .sessions
-            .values()
-            .filter_map(|view| view.active.as_ref())
+            .iter()
+            .filter(|(session, _)| self.config.shard.owns_session(session))
+            .filter_map(|(_, view)| view.active.as_ref())
             .map(|active| (active.terminal(), active.workspace.clone()))
             .collect();
         if terminals.is_empty() {
@@ -3601,7 +3670,11 @@ impl Bridge {
                 .follow
                 .scanned_at
                 .is_none_or(|at| now.saturating_sub(at) >= SCAN_INTERVAL_MS)
-            && let Ok(names) = self.terminals.list_dirs(&workspace, &dir)
+            && let Ok(names) = self.terminals.list_dirs_up_to(
+                &workspace,
+                &dir,
+                self.config.session_scan_limit.max(1),
+            )
         {
             active.follow.scanned_at = Some(now);
             bound = names
@@ -4652,10 +4725,19 @@ impl Bridge {
         }
         if let Some(dir) =
             driver.session_scan_dir_for(&self.config.home_of(driver), Some(agent_id.as_str()))
-            && let Ok(names) = self.terminals.list_dirs(&active.workspace, &dir)
+            && let Ok(names) = self.terminals.list_dirs_up_to(
+                &active.workspace,
+                &dir,
+                self.config.session_scan_limit.max(1),
+            )
         {
-            self.preexisting
-                .insert(active.execution_id.clone(), names.into_iter().collect());
+            self.preexisting.insert(
+                active.execution_id.clone(),
+                names
+                    .into_iter()
+                    .take(self.config.session_scan_limit.max(1))
+                    .collect(),
+            );
         }
     }
 
@@ -6038,6 +6120,9 @@ impl Bridge {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         for (key, mut entry) in ended {
+            if !self.config.shard.owns_session(&entry.progress.session) {
+                continue;
+            }
             let live = self.sessions.values().any(|view| {
                 view.active.is_some()
                     && view.agent_id == key.0
@@ -6150,7 +6235,9 @@ impl Bridge {
                 active.follow.archiving.archived = record.archived;
                 continue;
             }
-            if record.live || record.behind_ms.is_some() {
+            if self.config.shard.owns_session(&record.session)
+                && (record.live || record.behind_ms.is_some())
+            {
                 list.insert(
                     (record.agent.clone(), record.native.clone()),
                     EndedArchive {
@@ -8633,7 +8720,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
 
-    use super::{Bridge, BridgeConfig, RESOLVE_PRINCIPAL, mounted_key, trust_answer_key, waits};
+    use super::{
+        Bridge, BridgeConfig, BridgeShard, RESOLVE_PRINCIPAL, ShardPartition, mounted_key,
+        trust_answer_key, waits,
+    };
     use super::{ENGINE_UNAVAILABLE, EngineViewPolicy, ViewedLaunch, rfc3339_ms};
     use crate::command::{CommandAction, NamedKey, Outcome, Submission};
     use crate::event::{CommandStep, ENGINE, EventKind, GlobalPosition, NewEvent, Source};
@@ -8643,8 +8733,8 @@ mod tests {
     };
     use crate::memory::{MemoryStore, MemoryWatch};
     use crate::port::{
-        Branch, CommandQueue, Commit, EventLog, Launch, StoreError, TerminalError, TerminalHost,
-        WorkspaceError, WorkspaceStore,
+        Branch, CommandQueue, Commit, EventLog, Launch, Runner, StoreError, TerminalError,
+        TerminalHost, WorkspaceError, WorkspaceStore,
     };
     use crate::screen::ScreenState;
     use crate::time::{ManualClock, Timestamp};
@@ -10111,17 +10201,27 @@ mod tests {
         }
         fn list_dirs(
             &self,
-            _workspace: &WorkspaceId,
+            workspace: &WorkspaceId,
             dir: &str,
         ) -> Result<Vec<String>, TerminalError> {
+            self.list_dirs_up_to(workspace, dir, crate::port::LIST_DIRS_LIMIT)
+        }
+        fn list_dirs_up_to(
+            &self,
+            _workspace: &WorkspaceId,
+            dir: &str,
+            limit: usize,
+        ) -> Result<Vec<String>, TerminalError> {
             self.listed.lock().expect("listed").push(dir.to_string());
-            Ok(self
+            let mut names = self
                 .dirs
                 .lock()
                 .expect("dirs")
                 .get(dir)
                 .cloned()
-                .unwrap_or_default())
+                .unwrap_or_default();
+            names.truncate(limit);
+            Ok(names)
         }
         fn agent(
             &self,
@@ -13472,6 +13572,7 @@ mod tests {
         }
         let mut config = BridgeConfig::new("tester");
         config.max_commands_per_tick = 64;
+        config.max_concurrent_mounts = 8;
         let mut bridge = Bridge::new(
             store.clone(),
             store.clone(),
@@ -13482,7 +13583,7 @@ mod tests {
         .with_clock(clock);
         let _release = ReleaseMounts(&mounts);
         drive_work(&mut bridge, &store, || {
-            mounts.calls.load(Ordering::SeqCst) == super::MAX_CONCURRENT_MOUNTS
+            mounts.calls.load(Ordering::SeqCst) == 8
         });
         assert_eq!(mounts.active.load(Ordering::SeqCst), 8);
         assert_eq!(mounts.peak.load(Ordering::SeqCst), 8);
@@ -14710,6 +14811,7 @@ mod tests {
 
     struct ConcurrentCommits {
         inner: Arc<MemoryStore>,
+        bound: usize,
         active: AtomicUsize,
         peak: AtomicUsize,
         entered: Mutex<usize>,
@@ -14717,9 +14819,10 @@ mod tests {
     }
 
     impl ConcurrentCommits {
-        fn new(inner: Arc<MemoryStore>) -> Arc<Self> {
+        fn with_bound(inner: Arc<MemoryStore>, bound: usize) -> Arc<Self> {
             Arc::new(Self {
                 inner,
+                bound,
                 active: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
                 entered: Mutex::new(0),
@@ -14754,7 +14857,7 @@ mod tests {
                 *entered += 1;
                 self.cv.notify_all();
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                while *entered < super::MAX_CONCURRENT_CHECKPOINTS {
+                while *entered < self.bound {
                     let rem = deadline.saturating_duration_since(std::time::Instant::now());
                     if rem.is_zero() {
                         break;
@@ -14791,10 +14894,11 @@ mod tests {
     fn act_runs_turn_checkpoints_concurrently_across_sessions_bounded_to_eight() {
         let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
         let store = Arc::new(MemoryStore::new("shop", clock.clone()));
-        let commits = ConcurrentCommits::new(store.clone());
+        let commits = ConcurrentCommits::with_bound(store.clone(), 8);
         let watch = Arc::new(MemoryWatch::new());
         let mut config = BridgeConfig::new("tester");
         config.max_commands_per_tick = 16;
+        config.max_concurrent_checkpoints = 8;
         config.watch = Some(watch.clone());
         let mut ids = Vec::new();
         for number in 1..=10 {
@@ -14850,9 +14954,8 @@ mod tests {
         let peak = commits.peak.load(Ordering::SeqCst);
         assert!(peak >= 2, "expected concurrent commits, saw peak {peak}");
         assert_eq!(
-            peak,
-            super::MAX_CONCURRENT_CHECKPOINTS,
-            "expected peak bounded to MAX_CONCURRENT_CHECKPOINTS (8)"
+            peak, 8,
+            "expected peak bounded to configured max_concurrent_checkpoints (8)"
         );
 
         let events = store.read_global(GlobalPosition(0), 2_000).expect("events");
@@ -15100,6 +15203,14 @@ mod tests {
             ttl: Duration,
         ) -> Result<Option<crate::command::Claimed>, StoreError> {
             self.inner.claim(worker, ttl)
+        }
+        fn claim_for_shard(
+            &self,
+            worker: &str,
+            ttl: Duration,
+            shard: BridgeShard,
+        ) -> Result<Option<crate::command::Claimed>, StoreError> {
+            self.inner.claim_for_shard(worker, ttl, shard)
         }
         fn finish(
             &self,
@@ -15767,5 +15878,627 @@ mod tests {
                 .expect("runner"),
             crate::port::Runner::Running
         );
+    }
+
+    #[test]
+    fn bridge_shard_partitions_1000_sessions_disjointly_and_validates_strictly() {
+        let sessions: Vec<SessionId> = (0..1_000)
+            .map(|i| SessionId::new(format!("session_shard_{i:04}")).expect("session id"))
+            .collect();
+
+        for session in &sessions {
+            assert!(BridgeShard::All.owns_session(session));
+        }
+
+        for total in [1_u16, 4, 7, 16] {
+            let shards: Vec<BridgeShard> = (0..total)
+                .map(|index| BridgeShard::partition(index, total).expect("valid partition"))
+                .collect();
+            let mut counts = vec![0usize; usize::from(total)];
+            for session in &sessions {
+                let owners: Vec<u16> = (0..total)
+                    .filter(|&index| shards[usize::from(index)].owns_session(session))
+                    .collect();
+                assert_eq!(
+                    owners.len(),
+                    1,
+                    "{session} under total={total} had owners {owners:?}"
+                );
+                let owner = owners[0];
+                counts[usize::from(owner)] += 1;
+                assert!(
+                    BridgeShard::parse(&format!("{owner}/{total}"))
+                        .expect("parse")
+                        .owns_session(session)
+                );
+            }
+            assert_eq!(counts.iter().sum::<usize>(), sessions.len());
+            if total >= 4 {
+                for (index, count) in counts.iter().enumerate() {
+                    assert!(
+                        *count > 0,
+                        "expected non-empty bucket for shard {index}/{total}: {counts:?}"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            BridgeShard::parse("2/4"),
+            Ok(BridgeShard::partition(2, 4).expect("valid partition"))
+        );
+        let one_of_four = ShardPartition::new(1, 4).expect("valid partition");
+        assert_eq!(one_of_four.index(), 1);
+        assert_eq!(one_of_four.total(), 4);
+        assert_eq!(one_of_four.to_string(), "1/4");
+        assert_eq!(BridgeShard::All.to_string(), "all");
+        assert_eq!(BridgeShard::Partition(one_of_four).to_string(), "1/4");
+        assert!(ShardPartition::new(0, 0).is_err());
+        assert!(ShardPartition::new(2, 2).is_err());
+        assert!(BridgeShard::partition(0, 0).is_err());
+        assert!(BridgeShard::partition(4, 4).is_err());
+
+        for bad in [
+            "",
+            "   ",
+            "0",
+            "0/0",
+            "1/0",
+            "4/4",
+            "5/4",
+            "-1/4",
+            "+0/4",
+            "0/+4",
+            "0/",
+            "/4",
+            "0/4/1",
+            "0 / 4",
+            "abc/4",
+            "0/xyz",
+            "65536/65537",
+        ] {
+            assert!(
+                BridgeShard::parse(bad).is_err(),
+                "expected BridgeShard::parse({bad:?}) to fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_shard_rejects_surrounding_whitespace() {
+        for bad in [
+            " 0/2 ", " 2/4 ", " 0/2", "0/2 ", "0 /2", "0/ 2", "\t0/2", "0/2\n", "0/2\r",
+        ] {
+            assert!(
+                BridgeShard::parse(bad).is_err(),
+                "BridgeShard::parse({bad:?}) must reject whitespace strictly"
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_bridge_rejects_invalid_config_fail_closed() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let invalidators: [fn(&mut BridgeConfig); 6] = [
+            |cfg| cfg.worker = "   ".to_string(),
+            |cfg| cfg.max_commands_per_tick = 0,
+            |cfg| cfg.backstops_per_pass = 0,
+            |cfg| cfg.max_concurrent_mounts = 0,
+            |cfg| cfg.max_concurrent_checkpoints = 0,
+            |cfg| cfg.session_scan_limit = 0,
+        ];
+        for mutate in invalidators {
+            let mut cfg = BridgeConfig::new("tester");
+            mutate(&mut cfg);
+            let mut bridge = Bridge::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                cfg,
+            )
+            .with_clock(clock.clone());
+            assert!(matches!(bridge.recover(), Err(StoreError::Rejected(_))));
+            assert!(matches!(bridge.work(), Err(StoreError::Rejected(_))));
+            assert!(matches!(bridge.poll(), Err(StoreError::Rejected(_))));
+        }
+    }
+
+    #[test]
+    fn session_scan_discovers_more_than_64_conversations_without_truncation() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let brain = format!("{AGY_HOME}/brain");
+        let decoys: Vec<String> = (0..249)
+            .map(|i| format!("cccccccc-0000-4000-8000-{i:012}"))
+            .collect();
+        for conversation in &decoys {
+            store.append_file(&agy_transcript(conversation), &agy_user_line("decoy"));
+        }
+        let pre_refs: Vec<&str> = decoys.iter().map(String::as_str).collect();
+        host.set_dirs(&brain, &pre_refs);
+
+        let id = submit_agy_start(&store, "hello");
+        let cfg = agy_config(Some("gemini-3.8-flash-low"));
+        assert!(
+            cfg.session_scan_limit >= 4096,
+            "default scan limit must exceed 64, got {}",
+            cfg.session_scan_limit
+        );
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            cfg,
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+
+        let ours = "dddddddd-0000-4000-8000-000000000249";
+        store.append_file(
+            &agy_transcript(ours),
+            &agy_user_line(&crate::message::marked("hello", id, true)),
+        );
+        let mut all_refs = pre_refs;
+        all_refs.push(ours);
+        assert_eq!(all_refs.len(), 250);
+        host.set_dirs(&brain, &all_refs);
+        clock.advance(Duration::from_secs(3));
+        bridge
+            .poll()
+            .expect("poll discovers conversation at index 249");
+        assert_eq!(
+            agy_natives(&store),
+            vec![(
+                "agy".to_string(),
+                ours.to_string(),
+                Some(agy_transcript(ours))
+            )]
+        );
+    }
+
+    #[test]
+    fn sharded_bridges_partition_120_sessions_with_zero_overlap() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let mut cmd_session = HashMap::new();
+        for number in 1..=120_u64 {
+            let cmd = submit_resumable_start(&store, number, "", READY);
+            cmd_session.insert(cmd, resumable_session(number));
+        }
+        let shards: Vec<BridgeShard> = (0..4)
+            .map(|idx| BridgeShard::partition(idx, 4).expect("shard"))
+            .collect();
+        let mut bridges: Vec<Bridge> = shards
+            .iter()
+            .enumerate()
+            .map(|(idx, shard)| {
+                let mut config = BridgeConfig::new(&format!("worker-{idx}"));
+                config.max_commands_per_tick = 16;
+                config.shard = *shard;
+                Bridge::new(
+                    store.clone(),
+                    store.clone(),
+                    store.clone(),
+                    store.clone(),
+                    config,
+                )
+                .with_clock(clock.clone())
+            })
+            .collect();
+
+        let mut handled_by_shard = vec![Vec::new(); 4];
+        for step in 0..80 {
+            for (idx, bridge) in bridges.iter_mut().enumerate() {
+                let report = bridge.tick().expect("sharded tick");
+                handled_by_shard[idx].extend(report.command_ids);
+            }
+            if cmd_session
+                .keys()
+                .all(|cmd| command_outcome(&store, *cmd) == Some(Outcome::Succeeded))
+            {
+                break;
+            }
+            clock.advance(Duration::from_millis(50));
+            assert!(step < 79, "120 sharded starts did not converge");
+        }
+
+        let mut seen = BTreeSet::new();
+        for (idx, cmds) in handled_by_shard.iter().enumerate() {
+            for cmd in cmds {
+                let sess = &cmd_session[cmd];
+                assert!(
+                    shards[idx].owns_session(sess),
+                    "wrong shard {idx} for {sess}"
+                );
+                if command_outcome(&store, *cmd) == Some(Outcome::Succeeded) {
+                    seen.insert(*cmd);
+                }
+            }
+        }
+        assert_eq!(seen.len(), 120);
+    }
+
+    #[test]
+    fn sharded_bridge_immediately_releases_foreign_claims() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let s1 = (1000..2000_u64)
+            .find(|n| {
+                BridgeShard::partition(1, 2)
+                    .expect("s1")
+                    .owns_session(&resumable_session(*n))
+            })
+            .expect("session for shard 1");
+        let foreign_cmd = submit_resumable_start(&store, s1, "", READY);
+        let mut s0_cfg = BridgeConfig::new("only-s0");
+        s0_cfg.shard = BridgeShard::partition(0, 2).expect("s0");
+        let mut b0 = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            s0_cfg,
+        )
+        .with_clock(clock.clone());
+        let (r0, left0) = b0.work().expect("b0 work");
+        assert_eq!(r0.commands, 0);
+        assert!(!left0);
+
+        let mut s1_cfg = BridgeConfig::new("only-s1");
+        s1_cfg.shard = BridgeShard::partition(1, 2).expect("s1");
+        let mut b1 = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            s1_cfg,
+        )
+        .with_clock(clock);
+        drive_work(&mut b1, &store, || {
+            command_outcome(&store, foreign_cmd).is_some()
+        });
+        assert_eq!(
+            command_outcome(&store, foreign_cmd),
+            Some(Outcome::Succeeded)
+        );
+    }
+
+    #[test]
+    fn adversarial_shard_zero_handles_owned_command_behind_1025_foreign_head_commands() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let recorded = RecordedQueue::new(store.clone());
+        let shard_zero = BridgeShard::partition(0, 2).expect("0/2");
+        let shard_one = BridgeShard::partition(1, 2).expect("1/2");
+
+        let foreign_numbers: Vec<u64> = (1..1_000_000_u64)
+            .filter(|n| shard_one.owns_session(&resumable_session(*n)))
+            .take(1_025)
+            .collect();
+        assert_eq!(foreign_numbers.len(), 1_025);
+
+        let mut foreign_ids = Vec::with_capacity(1_025);
+        for n in foreign_numbers {
+            foreign_ids.push(submit_resumable_start(&store, n, "", READY));
+        }
+        let owned_number = (1..1_000_000_u64)
+            .find(|n| shard_zero.owns_session(&resumable_session(*n)))
+            .expect("0/2 session");
+        let owned_cmd = submit_resumable_start(&store, owned_number, "", READY);
+
+        let mut s0_cfg = BridgeConfig::new("only-s0");
+        s0_cfg.shard = shard_zero;
+        s0_cfg.max_commands_per_tick = 1;
+        let mut b0 = Bridge::new(
+            store.clone(),
+            recorded.clone(),
+            store.clone(),
+            store.clone(),
+            s0_cfg,
+        )
+        .with_clock(clock.clone());
+
+        let report = b0
+            .tick()
+            .expect("single tick handles 0/2 behind 1025 1/2 commands");
+        assert_eq!(report.commands, 1);
+        assert_eq!(report.command_ids, vec![owned_cmd]);
+
+        let releases = recorded.take_releases();
+        assert!(
+            releases.iter().all(|(id, _)| *id == owned_cmd),
+            "no foreign 1/2 command may be leased or released: {releases:?}"
+        );
+
+        drive_work(&mut b0, &store, || {
+            command_outcome(&store, owned_cmd).is_some()
+        });
+        assert_eq!(command_outcome(&store, owned_cmd), Some(Outcome::Succeeded));
+        assert!(
+            store
+                .claim_for_shard("verifier-s0", Duration::from_mins(1), shard_zero)
+                .expect("claim 0/2")
+                .is_none()
+        );
+
+        let mut claimed_foreign = Vec::with_capacity(1_025);
+        for _ in 0..1_025 {
+            let claimed = store
+                .claim_for_shard("verifier-s1", Duration::from_mins(1), shard_one)
+                .expect("claim 1/2")
+                .expect("each of the 1025 foreign commands remains untouched");
+            assert_eq!(
+                claimed.attempt, 1,
+                "foreign command {} must never have been leased before",
+                claimed.command_id
+            );
+            claimed_foreign.push(claimed.command_id);
+        }
+        assert_eq!(claimed_foreign, foreign_ids);
+        assert!(
+            store
+                .claim_for_shard("verifier-s1", Duration::from_mins(1), shard_one)
+                .expect("claim 1/2 exhausted")
+                .is_none()
+        );
+    }
+
+    struct RunnersSpy {
+        inner: Arc<MemoryStore>,
+        calls: Mutex<Vec<Vec<TerminalName>>>,
+    }
+
+    impl TerminalHost for RunnersSpy {
+        fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+            self.inner.start(launch)
+        }
+        fn stage_text(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            text: &str,
+        ) -> Result<(), TerminalError> {
+            self.inner.stage_text(terminal, workspace, text)
+        }
+        fn submit_staged(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.submit_staged(terminal, workspace)
+        }
+        fn send_keys(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            keys: &[&str],
+        ) -> Result<(), TerminalError> {
+            self.inner.send_keys(terminal, workspace, keys)
+        }
+        fn is_alive(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<bool, TerminalError> {
+            self.inner.is_alive(terminal, workspace)
+        }
+        fn runners(
+            &self,
+            terminals: &[(TerminalName, WorkspaceId)],
+        ) -> Result<Vec<(TerminalName, Runner)>, TerminalError> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(terminals.iter().map(|(name, _)| name.clone()).collect());
+            self.inner.runners(terminals)
+        }
+        fn capture_tail(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            lines: usize,
+        ) -> Result<String, TerminalError> {
+            self.inner.capture_tail(terminal, workspace, lines)
+        }
+        fn read_from(
+            &self,
+            workspace: &WorkspaceId,
+            path: &str,
+            offset: u64,
+        ) -> Result<Option<Vec<u8>>, TerminalError> {
+            self.inner.read_from(workspace, path, offset)
+        }
+        fn write_new(
+            &self,
+            workspace: &WorkspaceId,
+            path: &str,
+            bytes: &[u8],
+        ) -> Result<bool, TerminalError> {
+            self.inner.write_new(workspace, path, bytes)
+        }
+        fn terminate(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.terminate(terminal, workspace)
+        }
+    }
+
+    #[test]
+    fn fleet_runners_filters_terminals_by_shard() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let shard_zero = BridgeShard::partition(0, 2).expect("0/2");
+        let shard_one = BridgeShard::partition(1, 2).expect("1/2");
+
+        let n0 = (1..1000_u64)
+            .find(|n| shard_zero.owns_session(&resumable_session(*n)))
+            .expect("s0");
+        let n1 = (1..1000_u64)
+            .find(|n| shard_one.owns_session(&resumable_session(*n)))
+            .expect("s1");
+        let c0 = submit_resumable_start(&store, n0, "", READY);
+        let c1 = submit_resumable_start(&store, n1, "", READY);
+
+        let mut setup = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            BridgeConfig::new("setup"),
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut setup, &store, || {
+            command_outcome(&store, c0) == Some(Outcome::Succeeded)
+                && command_outcome(&store, c1) == Some(Outcome::Succeeded)
+        });
+        drop(setup);
+
+        let term0 = TerminalName::for_execution(&ExecutionId::for_command(c0));
+        let spy = Arc::new(RunnersSpy {
+            inner: store.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut s0_cfg = BridgeConfig::new("shard-0");
+        s0_cfg.shard = shard_zero;
+        s0_cfg.watch = Some(Arc::new(MemoryWatch::new()));
+        let mut b0 =
+            Bridge::new(store.clone(), store.clone(), store, spy.clone(), s0_cfg).with_clock(clock);
+        b0.recover().expect("recover");
+        b0.poll().expect("poll");
+
+        let calls = spy.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], vec![term0]);
+    }
+
+    #[test]
+    fn bridge_tick_honors_configurable_max_commands_and_backstops_per_pass() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let terminal = Counted::over(store.clone());
+        let watch = Arc::new(MemoryWatch::new());
+        let mut config = BridgeConfig::new("tester");
+        config.max_commands_per_tick = 3;
+        config.backstops_per_pass = 4;
+        config.watch = Some(watch);
+        let mut ids = Vec::new();
+        for number in 1..=6 {
+            ids.push(submit_resumable_start(&store, number, "", READY));
+        }
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            terminal.clone(),
+            config,
+        )
+        .with_clock(clock.clone());
+
+        let (first_work, left) = bridge.work().expect("capped work");
+        assert_eq!(first_work.commands, 3);
+        assert!(left);
+        drive_work(&mut bridge, &store, || {
+            ids.iter().all(|id| command_outcome(&store, *id).is_some())
+        });
+        bridge.poll().expect("settle first capture");
+        bridge.poll().expect("settle second capture");
+        let before_backstops = terminal.captures();
+        clock.advance(Duration::from_secs(30));
+        bridge.tick().expect("tick caps backstops to 4");
+        assert_eq!(terminal.captures() - before_backstops, 4);
+        bridge
+            .tick()
+            .expect("second tick captures remaining 2 backstops");
+        assert_eq!(terminal.captures() - before_backstops, 6);
+    }
+
+    #[test]
+    fn concurrent_mount_and_checkpoint_workers_scale_past_eight() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let mounts = Arc::new(GatedMounts::new(store.clone()));
+        let mut ids = Vec::new();
+        for number in 1..=16 {
+            let id = submit_resumable_start(&store, number, "", READY);
+            ids.push(id);
+            mounts.hold(BranchName::for_agent(&resumable_agent(number)));
+        }
+        let mut mount_cfg = BridgeConfig::new("tester");
+        mount_cfg.max_commands_per_tick = 64;
+        mount_cfg.max_concurrent_mounts = 12;
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            mounts.clone(),
+            store.clone(),
+            mount_cfg,
+        )
+        .with_clock(clock.clone());
+        let _release = ReleaseMounts(&mounts);
+        drive_work(&mut bridge, &store, || {
+            mounts.calls.load(Ordering::SeqCst) == 12
+        });
+        assert_eq!(mounts.active.load(Ordering::SeqCst), 12);
+        mounts.release_all();
+        drive_work(&mut bridge, &store, || {
+            ids.iter().all(|id| command_outcome(&store, *id).is_some())
+        });
+        assert_eq!(mounts.peak.load(Ordering::SeqCst), 12);
+
+        let cp_store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let commits = ConcurrentCommits::with_bound(cp_store.clone(), 12);
+        let watch = Arc::new(MemoryWatch::new());
+        let mut cp_cfg = BridgeConfig::new("tester");
+        cp_cfg.max_commands_per_tick = 32;
+        cp_cfg.max_concurrent_checkpoints = 12;
+        cp_cfg.watch = Some(watch.clone());
+        let mut cp_ids = Vec::new();
+        for number in 1..=14 {
+            cp_ids.push(submit_resumable_start(&cp_store, number, "", READY));
+        }
+        let mut cp_bridge = Bridge::new(
+            cp_store.clone(),
+            cp_store.clone(),
+            commits.clone(),
+            cp_store.clone(),
+            cp_cfg,
+        )
+        .with_clock(clock);
+        drive_work(&mut cp_bridge, &cp_store, || {
+            cp_ids
+                .iter()
+                .all(|id| command_outcome(&cp_store, *id).is_some())
+        });
+        for record in cp_store
+            .read_global(GlobalPosition(0), 2_000)
+            .expect("read")
+        {
+            if let EventKind::ExecutionStarted { workspace, .. } = record.event.kind {
+                cp_store.mark_dirty(&workspace);
+            } else if let EventKind::NativeSessionStarted {
+                transcript_path: Some(path),
+                ..
+            } = record.event.kind
+            {
+                let session_id = &record.event.session_id;
+                cp_store.append_file(
+                    &path,
+                    &format!("{{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"s-{session_id}\"}}\n"),
+                );
+                watch.changed(&path);
+            }
+        }
+        let _ = cp_bridge.poll().expect("concurrent poll past 8");
+        assert_eq!(commits.peak.load(Ordering::SeqCst), 12);
     }
 }

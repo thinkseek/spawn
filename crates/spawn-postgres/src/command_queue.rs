@@ -6,7 +6,7 @@ use std::time::Duration;
 use postgres::Client;
 use spawn_core::command::{Claimed, Outcome, Submission};
 use spawn_core::id::{CommandId, Principal};
-use spawn_core::port::{CommandOwnership, CommandQueue, StoreError};
+use spawn_core::port::{BridgeShard, CommandOwnership, CommandQueue, StoreError};
 
 use crate::PostgresStore;
 use crate::row::{agent_id, bigint, command_id, corrupt, session_id};
@@ -19,6 +19,24 @@ pub(crate) const CLAIM: &str =
     "select out_id, out_attempt, out_agent, out_session, out_action, out_principal,
             out_created_at_ms
                    from spawn_claim($1, $2)";
+
+/// Lease the next command owned by shard `$3 / $4`, if any.
+pub(crate) const CLAIM_SHARD: &str =
+    "select out_id, out_attempt, out_agent, out_session, out_action, out_principal,
+            out_created_at_ms
+                   from spawn_claim_shard($1, $2, $3, $4)";
+
+fn claimed_from_row(row: &postgres::Row) -> Result<Claimed, StoreError> {
+    Ok(Claimed {
+        command_id: command_id(row, "out_id"),
+        attempt: u32::try_from(row.get::<_, i32>("out_attempt")).unwrap_or(0),
+        agent_id: agent_id(row, "out_agent")?,
+        session_id: session_id(row, "out_session")?,
+        principal: row.get("out_principal"),
+        created_at_ms: row.get("out_created_at_ms"),
+        action: row.get("out_action"),
+    })
+}
 
 /// Two-key advisory-lock namespace for Bridges, a key of their own: the
 /// integrator's lock (`INTEGRATOR_LOCK_KEY`, 1_399_957_336), the append lock
@@ -141,20 +159,28 @@ impl CommandQueue for PostgresStore {
     }
 
     fn claim(&self, worker: &str, ttl: Duration) -> Result<Option<Claimed>, StoreError> {
+        self.claim_for_shard(worker, ttl, BridgeShard::All)
+    }
+
+    fn claim_for_shard(
+        &self,
+        worker: &str,
+        ttl: Duration,
+        shard: BridgeShard,
+    ) -> Result<Option<Claimed>, StoreError> {
         let ttl = bigint(ttl.as_millis());
-        let rows = self.query_prepared(CLAIM, &[&worker, &ttl])?;
+        let rows = match shard {
+            BridgeShard::All => self.query_prepared(CLAIM, &[&worker, &ttl])?,
+            BridgeShard::Partition(partition) => {
+                let shard_index = i32::from(partition.index());
+                let shard_total = i32::from(partition.total());
+                self.query_prepared(CLAIM_SHARD, &[&worker, &ttl, &shard_index, &shard_total])?
+            }
+        };
         let Some(row) = rows.first() else {
             return Ok(None);
         };
-        Ok(Some(Claimed {
-            command_id: command_id(row, "out_id"),
-            attempt: u32::try_from(row.get::<_, i32>("out_attempt")).unwrap_or(0),
-            agent_id: agent_id(row, "out_agent")?,
-            session_id: session_id(row, "out_session")?,
-            principal: row.get("out_principal"),
-            created_at_ms: row.get("out_created_at_ms"),
-            action: row.get("out_action"),
-        }))
+        claimed_from_row(row).map(Some)
     }
 
     fn release(&self, claimed: &Claimed, retry_in: Duration) -> Result<(), StoreError> {

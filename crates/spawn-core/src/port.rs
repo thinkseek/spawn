@@ -110,6 +110,126 @@ pub trait EventLog: Send + Sync {
     }
 }
 
+const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_64_PRIME: u64 = 0x0100_0000_01b3;
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = FNV1A_64_OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV1A_64_PRIME);
+    }
+    hash
+}
+
+/// Validated non-empty horizontal shard partition (`total >= 1`, `index < total`).
+///
+/// Private fields guarantee illegal partitions (`total == 0` or `index >= total`)
+/// are unrepresentable at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShardPartition {
+    index: u16,
+    total: u16,
+}
+
+impl ShardPartition {
+    /// Construct a validated partition `index/total` (`total >= 1`, `index < total`).
+    pub fn new(index: u16, total: u16) -> Result<Self, String> {
+        if total == 0 {
+            return Err("shard total must be at least 1".to_string());
+        }
+        if index >= total {
+            return Err(format!(
+                "shard index {index} must be less than total {total}"
+            ));
+        }
+        Ok(Self { index, total })
+    }
+
+    /// Zero-based partition index (`< total`).
+    pub const fn index(self) -> u16 {
+        self.index
+    }
+
+    /// Total partition count (`>= 1`).
+    pub const fn total(self) -> u16 {
+        self.total
+    }
+}
+
+impl std::fmt::Display for ShardPartition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.index, self.total)
+    }
+}
+
+/// Closed-set horizontal sharding assignment for a [`crate::bridge::Bridge`] worker.
+///
+/// [`BridgeShard::All`] owns every session (single-Bridge behavior).
+/// [`BridgeShard::Partition`] deterministically owns sessions whose 64-bit
+/// FNV-1a hash modulo `total` equals `index`, guaranteeing disjoint and
+/// complete coverage across `0/total .. (total - 1)/total`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BridgeShard {
+    /// Single-Bridge mode owning every session.
+    #[default]
+    All,
+    /// Deterministic subset `index` of `total` partitions (`total >= 1`, `index < total`).
+    Partition(ShardPartition),
+}
+
+impl BridgeShard {
+    /// Construct a validated partition `index/total` (`total >= 1`, `index < total`).
+    pub fn partition(index: u16, total: u16) -> Result<Self, String> {
+        ShardPartition::new(index, total).map(Self::Partition)
+    }
+
+    /// Fail-closed parser for `"index/total"` shard specifications (rejects whitespace).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let Some((index_raw, total_raw)) = raw.split_once('/') else {
+            return Err(format!(
+                "expected \"index/total\" (e.g. \"0/4\"), got {raw:?}"
+            ));
+        };
+        if index_raw.is_empty()
+            || total_raw.is_empty()
+            || !index_raw.bytes().all(|b| b.is_ascii_digit())
+            || !total_raw.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(format!(
+                "expected unsigned digits in \"index/total\", got {raw:?}"
+            ));
+        }
+        let index = index_raw
+            .parse::<u16>()
+            .map_err(|err| format!("invalid shard index in {raw:?}: {err}"))?;
+        let total = total_raw
+            .parse::<u16>()
+            .map_err(|err| format!("invalid shard total in {raw:?}: {err}"))?;
+        Self::partition(index, total)
+    }
+
+    /// Deterministic hash ownership check for `session`.
+    pub fn owns_session(&self, session: &SessionId) -> bool {
+        match *self {
+            Self::All => true,
+            Self::Partition(partition) => {
+                fnv1a_64(session.as_str().as_bytes()) % u64::from(partition.total())
+                    == u64::from(partition.index())
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for BridgeShard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::All => f.write_str("all"),
+            Self::Partition(partition) => partition.fmt(f),
+        }
+    }
+}
+
 /// Exclusive ownership of one named Bridge worker.
 ///
 /// The backend releases this ownership when its process dies. Holding the
@@ -149,6 +269,23 @@ pub trait CommandQueue: Send + Sync {
     /// (it waits for the session's turn) does not hold the commands behind
     /// it; any other unfinished command does.
     fn claim(&self, worker: &str, ttl: Duration) -> Result<Option<Claimed>, StoreError>;
+
+    /// Lease the oldest unfinished command whose session is owned by `shard`
+    /// and that has no live lease, or `None`, without leasing or disturbing
+    /// commands belonging to other shards.
+    fn claim_for_shard(
+        &self,
+        worker: &str,
+        ttl: Duration,
+        shard: BridgeShard,
+    ) -> Result<Option<Claimed>, StoreError> {
+        match shard {
+            BridgeShard::All => self.claim(worker, ttl),
+            BridgeShard::Partition(partition) => Err(StoreError::Rejected(format!(
+                "command queue does not support sharded claiming for partition {partition}"
+            ))),
+        }
+    }
 
     /// Record the outcome and its `command.finished` event atomically.
     fn finish(&self, claimed: &Claimed, outcome: &Outcome) -> Result<(), StoreError>;
@@ -573,8 +710,16 @@ pub enum Runner {
 /// writes cannot make the Bridge hold an unbounded buffer.
 pub const READ_LIMIT: usize = 8 << 20;
 
-/// The most subdirectory names one [`TerminalHost::list_dirs`] returns.
+/// Legacy upper bound on subdirectory names returned by [`TerminalHost::list_dirs`].
+/// Bridge session discovery uses [`DEFAULT_SESSION_SCAN_LIMIT`] via
+/// [`TerminalHost::list_dirs_up_to`] to avoid silent 64-session truncation.
 pub const LIST_DIRS_LIMIT: usize = 64;
+
+/// Default upper bound on directory entries scanned when discovering
+/// reported-binding sessions (e.g. `agy` brain directories). High enough to
+/// cover 100–1,000+ active sessions without silent 64-entry truncation while
+/// retaining an explicit anti-OOM upper bound.
+pub const DEFAULT_SESSION_SCAN_LIMIT: usize = 4096;
 
 /// What a terminal host that watches agents itself (Herdr) says an agent
 /// is doing ([`TerminalHost::agent`]). Herdr's `done` (idle after work
@@ -781,6 +926,21 @@ pub trait TerminalHost: Send + Sync {
         _dir: &str,
     ) -> Result<Vec<String>, TerminalError> {
         Ok(Vec::new())
+    }
+
+    /// List plain subdirectories under `dir` newest-first, capped at `limit`
+    /// entries. Hosts that can scan past [`LIST_DIRS_LIMIT`] override this
+    /// method so high-density fleets avoid silent 64-entry truncation while
+    /// keeping an explicit anti-OOM upper bound.
+    fn list_dirs_up_to(
+        &self,
+        workspace: &WorkspaceId,
+        dir: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, TerminalError> {
+        let mut names = self.list_dirs(workspace, dir)?;
+        names.truncate(limit);
+        Ok(names)
     }
 
     /// Create the file at `path`, as the terminal's process sees it, with

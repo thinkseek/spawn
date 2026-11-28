@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use spawn_core::bridge::{Bridge, BridgeConfig, LaunchEnvironment, ModelRelay};
+use spawn_core::bridge::{Bridge, BridgeConfig, BridgeShard, LaunchEnvironment, ModelRelay};
 use spawn_core::observe::{Observer, StateJudge};
 use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
 use spawn_jev::{JevConfig, JevJudge};
@@ -177,11 +177,85 @@ fn parse_bounded_usize(
         return Ok(default);
     };
     let trimmed = raw.trim();
+    if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "{var}={trimmed:?} must be a whole number from {min} to {max}"
+        ));
+    }
     match trimmed.parse::<usize>() {
         Ok(value) if (min..=max).contains(&value) => Ok(value),
         _ => Err(format!(
             "{var}={trimmed:?} must be a whole number from {min} to {max}"
         )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BridgeScaling {
+    max_commands_per_tick: usize,
+    backstops_per_pass: usize,
+    max_concurrent_mounts: usize,
+    max_concurrent_checkpoints: usize,
+    session_scan_limit: usize,
+    shard: BridgeShard,
+}
+
+fn parse_bridge_shard(lookup: &dyn Fn(&str) -> Option<String>) -> Result<BridgeShard, String> {
+    match lookup("SPAWN_BRIDGE_SHARD") {
+        None => Ok(BridgeShard::All),
+        Some(raw) => BridgeShard::parse(&raw)
+            .map_err(|reason| format!("SPAWN_BRIDGE_SHARD={raw:?} is invalid: {reason}")),
+    }
+}
+
+fn parse_bridge_scaling(lookup: &dyn Fn(&str) -> Option<String>) -> Result<BridgeScaling, String> {
+    Ok(BridgeScaling {
+        max_commands_per_tick: parse_bounded_usize(
+            lookup,
+            "SPAWN_MAX_COMMANDS_PER_TICK",
+            64,
+            1,
+            1024,
+        )?,
+        backstops_per_pass: parse_bounded_usize(lookup, "SPAWN_BACKSTOPS_PER_PASS", 8, 1, 256)?,
+        max_concurrent_mounts: parse_bounded_usize(
+            lookup,
+            "SPAWN_MAX_CONCURRENT_MOUNTS",
+            16,
+            1,
+            256,
+        )?,
+        max_concurrent_checkpoints: parse_bounded_usize(
+            lookup,
+            "SPAWN_MAX_CONCURRENT_CHECKPOINTS",
+            16,
+            1,
+            256,
+        )?,
+        session_scan_limit: parse_bounded_usize(
+            lookup,
+            "SPAWN_LIST_DIRS_LIMIT",
+            spawn_core::port::DEFAULT_SESSION_SCAN_LIMIT,
+            1,
+            16_384,
+        )?,
+        shard: parse_bridge_shard(lookup)?,
+    })
+}
+
+fn default_worker_name(lookup: &dyn Fn(&str) -> Option<String>, shard: BridgeShard) -> String {
+    if let Some(worker) = lookup("SPAWN_WORKER").filter(|text| !text.trim().is_empty()) {
+        return worker;
+    }
+    match shard {
+        BridgeShard::All => "spawn-worker".to_string(),
+        BridgeShard::Partition(partition) => {
+            format!(
+                "spawn-worker-shard-{}-of-{}",
+                partition.index(),
+                partition.total()
+            )
+        }
     }
 }
 
@@ -223,23 +297,20 @@ pub(crate) fn view_config_for_backend_with_cache(
 
 /// Programs and environment the Bridge puts into every terminal it starts.
 fn bridge_config_for(herdr_backend: bool, workspace_root: &Path) -> Result<BridgeConfig, String> {
-    let mut config = BridgeConfig::new(&env_or("SPAWN_WORKER", "spawn-worker"));
+    let scaling = parse_bridge_scaling(&env_value)?;
+    let mut config = BridgeConfig::new(&default_worker_name(&env_value, scaling.shard));
     config.spawn_program = spawn_program();
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.claude_projects = claude_projects();
     config.engines = engines_for(env_value, herdr_backend)?;
-    config.max_commands_per_tick =
-        parse_bounded_usize(&env_value, "SPAWN_BRIDGE_MAX_COMMANDS", 16, 1, 512)?;
+    config.max_commands_per_tick = scaling.max_commands_per_tick;
     config.ready_attempts =
         parse_bounded_usize(&env_value, "SPAWN_BRIDGE_READY_ATTEMPTS", 40, 1, 240)?;
-    config.max_concurrent_mounts =
-        parse_bounded_usize(&env_value, "SPAWN_MAX_CONCURRENT_MOUNTS", 8, 1, 128)?;
-    config.max_concurrent_checkpoints =
-        parse_bounded_usize(&env_value, "SPAWN_MAX_CONCURRENT_CHECKPOINTS", 8, 1, 128)?;
-    config.backstops_per_pass =
-        parse_bounded_usize(&env_value, "SPAWN_BRIDGE_BACKSTOPS_PER_PASS", 2, 1, 64)?;
-    config.session_scan_limit =
-        parse_bounded_usize(&env_value, "SPAWN_LIST_DIRS_LIMIT", 64, 64, 4096)?;
+    config.max_concurrent_mounts = scaling.max_concurrent_mounts;
+    config.max_concurrent_checkpoints = scaling.max_concurrent_checkpoints;
+    config.backstops_per_pass = scaling.backstops_per_pass;
+    config.session_scan_limit = scaling.session_scan_limit;
+    config.shard = scaling.shard;
     let shared_cache = prepare_shared_build_caches(&env_value, workspace_root)?;
     config.claude_sandbox = claude_sandbox_enabled(&env_value);
     let (policy, said) = bridge_engine_view(
@@ -2363,6 +2434,81 @@ mod tests {
         assert!(parse_bounded_usize(&zero, "V", 8, 1, 128).is_err());
         let high = |_: &str| Some("129".to_string());
         assert!(parse_bounded_usize(&high, "V", 8, 1, 128).is_err());
+    }
+
+    #[test]
+    fn bridge_scaling_and_shard_env_parsing_and_fail_closed_validation() {
+        use super::{default_worker_name, parse_bridge_scaling};
+        use spawn_core::bridge::BridgeShard;
+
+        let empty_env = environment(&[]);
+        let defaults = parse_bridge_scaling(&empty_env).expect("default scaling");
+        assert_eq!(defaults.max_commands_per_tick, 64);
+        assert_eq!(defaults.backstops_per_pass, 8);
+        assert_eq!(defaults.max_concurrent_mounts, 16);
+        assert_eq!(defaults.max_concurrent_checkpoints, 16);
+        assert_eq!(
+            defaults.session_scan_limit,
+            spawn_core::port::DEFAULT_SESSION_SCAN_LIMIT
+        );
+        assert_eq!(defaults.shard, BridgeShard::All);
+        assert_eq!(
+            default_worker_name(&empty_env, defaults.shard),
+            "spawn-worker"
+        );
+
+        let custom_env = environment(&[
+            ("SPAWN_MAX_COMMANDS_PER_TICK", "256"),
+            ("SPAWN_BACKSTOPS_PER_PASS", "32"),
+            ("SPAWN_MAX_CONCURRENT_MOUNTS", "64"),
+            ("SPAWN_MAX_CONCURRENT_CHECKPOINTS", "48"),
+            ("SPAWN_LIST_DIRS_LIMIT", "2048"),
+            ("SPAWN_BRIDGE_SHARD", "2/8"),
+        ]);
+        let custom = parse_bridge_scaling(&custom_env).expect("custom scaling");
+        assert_eq!(custom.max_commands_per_tick, 256);
+        assert_eq!(custom.backstops_per_pass, 32);
+        assert_eq!(custom.max_concurrent_mounts, 64);
+        assert_eq!(custom.max_concurrent_checkpoints, 48);
+        assert_eq!(custom.session_scan_limit, 2048);
+        assert_eq!(custom.shard, BridgeShard::partition(2, 8).expect("shard"));
+        assert_eq!(
+            default_worker_name(&custom_env, custom.shard),
+            "spawn-worker-shard-2-of-8"
+        );
+
+        let explicit_worker = environment(&[("SPAWN_WORKER", "custom-worker")]);
+        assert_eq!(
+            default_worker_name(&explicit_worker, custom.shard),
+            "custom-worker"
+        );
+
+        for var in [
+            "SPAWN_MAX_COMMANDS_PER_TICK",
+            "SPAWN_BACKSTOPS_PER_PASS",
+            "SPAWN_MAX_CONCURRENT_MOUNTS",
+            "SPAWN_MAX_CONCURRENT_CHECKPOINTS",
+            "SPAWN_LIST_DIRS_LIMIT",
+        ] {
+            for bad in ["0", "-1", "+4", "abc", "1.5", "99999999999999999999999999"] {
+                let bad_env = environment(&[(var, bad)]);
+                assert!(
+                    parse_bridge_scaling(&bad_env).is_err(),
+                    "{var}={bad:?} must fail closed"
+                );
+            }
+        }
+
+        for bad_shard in [
+            "", "   ", " 0/2 ", " 2/4 ", "0 /2", "0/2\n", "0/0", "4/4", "5/4", "-1/4", "+0/4",
+            "0/", "/4", "a/b",
+        ] {
+            let bad_env = environment(&[("SPAWN_BRIDGE_SHARD", bad_shard)]);
+            assert!(
+                parse_bridge_scaling(&bad_env).is_err(),
+                "SPAWN_BRIDGE_SHARD={bad_shard:?} must fail closed"
+            );
+        }
     }
 
     #[test]
