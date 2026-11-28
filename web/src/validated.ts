@@ -115,6 +115,11 @@ export class Validated {
     return this.kept.size;
   }
 
+  /** Forget every kept response and ETag (for example on sign-out or token change). */
+  clear(): void {
+    this.kept.clear();
+  }
+
   private touch(url: string, kept: Kept) {
     this.kept.delete(url);
     this.kept.set(url, kept);

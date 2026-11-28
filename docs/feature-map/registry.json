@@ -3463,6 +3463,7 @@
         "web/src/components/BeautifulPrimitives.tsx",
         "web/src/components/Sidebar.tsx",
         "web/src/components/StateDot.tsx",
+        "web/src/components/TokenGate.tsx",
         "web/src/components/ViewToggle.tsx",
         "web/src/components/aui/HomeCard.tsx",
         "web/src/components/aui/NorthStarChart.tsx",

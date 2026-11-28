@@ -337,6 +337,7 @@ export class LiveStream {
   /** Tabs do not share this stream: it is closed while the tab is hidden. */
   private solo = false;
   private paused = false;
+  private stopped = false;
   /** The stream being ended is made again at once, without a pause. */
   private reconnectNow = false;
   private current: LiveStatus = { state: "idle", retry_at_ms: null, error: null, leader: false, last_event_id: null };
@@ -366,9 +367,30 @@ export class LiveStream {
     return () => this.listeners.delete(listener);
   }
 
-  /** Begin (once): lead when this tab gets the lock, else follow. */
+  /** Begin (or resume after [`stop`]): lead when this tab gets the lock, else follow. */
   start(): void {
-    if (this.started) return;
+    this.stopped = false;
+    if (this.started) {
+      this.paused = false;
+      this.attempt = 0;
+      if (!this.leader) {
+        this.wake();
+        return;
+      }
+      if (this.solo && this.hidden()) {
+        this.paused = true;
+        this.setStatus({ state: "paused", retry_at_ms: null, leader: true });
+        return;
+      }
+      if (this.abort !== null) {
+        this.reconnectNow = true;
+        this.abort.abort();
+        return;
+      }
+      this.clear();
+      void this.connect();
+      return;
+    }
     this.started = true;
     try {
       this.channel = this.deps.channel?.() ?? null;
@@ -405,11 +427,22 @@ export class LiveStream {
       .catch(() => this.lead());
   }
 
+  /** Stop reconnecting and close any active stream until [`start`] is called again. */
+  stop(): void {
+    this.stopped = true;
+    this.paused = true;
+    this.reconnectNow = false;
+    this.attempt = 0;
+    this.clear();
+    this.abort?.abort();
+    this.setStatus({ state: "idle", retry_at_ms: null, error: null });
+  }
+
   /** Connect now if this tab leads and is not connected (a page shown
    * again, a network back), and make a stale stream again at once; a
    * follower asks the leader. */
   wake(): void {
-    if (!this.started) return;
+    if (!this.started || this.stopped) return;
     if (!this.leader) {
       this.post({ type: "wake" });
       return;
@@ -447,7 +480,7 @@ export class LiveStream {
     if (this.leader) return;
     this.leader = true;
     this.setStatus({ leader: true });
-    void this.connect();
+    if (!this.stopped && !this.paused) void this.connect();
   }
 
   private heard(message: Wire): void {

@@ -1,4 +1,4 @@
-import { Activity, BellRing, Boxes, CircleDollarSign, FolderSearch, Gauge, GitBranch, House, Layers, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
+import { Activity, BellRing, Boxes, CircleDollarSign, FolderSearch, Gauge, GitBranch, House, Layers, LogOut, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
@@ -52,6 +52,7 @@ interface SidebarProps {
   onShowShow: () => void;
   onShowSessions: () => void;
   onSelect: (sessionId: string) => void;
+  onSignOut?: () => void;
 }
 
 function Brand() {
@@ -89,6 +90,7 @@ export function Sidebar({
   onShowStorage,
   onShowShow,
   onSelect,
+  onSignOut,
 }: SidebarProps) {
   const phase = rsiPhase(rsi);
   const [query, setQuery] = useState("");
@@ -109,208 +111,223 @@ export function Sidebar({
     return () => window.removeEventListener("keydown", onKey);
   }, [agents]);
   return (
-    <aside className="hidden w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar md:flex">
+    <aside className="hidden w-52 shrink-0 flex-col border-r border-sidebar-border bg-sidebar md:flex lg:w-60">
       <div className="flex h-12 shrink-0 items-center px-4">
         <Brand />
       </div>
 
-      <div className="space-y-px px-2 pt-2 pb-4">
-        <NavItem
-          active={view === "fleet"}
-          onClick={onShowFleet}
-          icon={<House size={15} />}
-          label="Home"
-          trailing={<AttentionCount {...attention} />}
-        />
-        <NavItem
-          active={view === "missions"}
-          onClick={onShowMissions}
-          icon={<Target size={15} />}
-          label="Missions"
-        />
-        <NavItem
-          active={view === "grading"}
-          onClick={onShowGrading}
-          icon={<Layers size={15} />}
-          label="Grading"
-        />
-        <NavItem
-          active={view === "features"}
-          onClick={onShowFeatures}
-          icon={<Boxes size={15} />}
-          label="Feature map"
-        />
-        <NavItem
-          active={view === "coverage"}
-          onClick={onShowCoverage}
-          icon={<FolderSearch size={15} />}
-          label="File coverage"
-        />
-        <NavItem
-          active={view === "rsi"}
-          onClick={onShowRsi}
-          icon={<Activity size={15} />}
-          label="RSI mission"
-          trailing={
-            phase && (
-              <span className="flex items-center gap-1.5 text-micro text-faint-foreground">
+      {/* Unified scroll rail so short 16:9 touch tablets never crush Sessions
+          or clip the status/theme footer below the fold. */}
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        <div className="space-y-px px-2 pt-2 pb-3">
+          <NavItem
+            active={view === "fleet"}
+            onClick={onShowFleet}
+            icon={<House size={15} />}
+            label="Home"
+            trailing={<AttentionCount {...attention} />}
+          />
+          <NavItem
+            active={view === "missions"}
+            onClick={onShowMissions}
+            icon={<Target size={15} />}
+            label="Missions"
+          />
+          <NavItem
+            active={view === "grading"}
+            onClick={onShowGrading}
+            icon={<Layers size={15} />}
+            label="Grading"
+          />
+          <NavItem
+            active={view === "features"}
+            onClick={onShowFeatures}
+            icon={<Boxes size={15} />}
+            label="Feature map"
+          />
+          <NavItem
+            active={view === "coverage"}
+            onClick={onShowCoverage}
+            icon={<FolderSearch size={15} />}
+            label="File coverage"
+          />
+          <NavItem
+            active={view === "rsi"}
+            onClick={onShowRsi}
+            icon={<Activity size={15} />}
+            label="RSI mission"
+            trailing={
+              phase && (
+                <span className="flex items-center gap-1.5 text-micro text-faint-foreground">
+                  <span
+                    className={cx(
+                      "size-1.5 rounded-full",
+                      phase === "halted" ? "bg-destructive" : phaseStyle(phase).dot,
+                      phaseStyle(phase).pulse && "animate-spawn-pulse",
+                    )}
+                  />
+                  {stateWords(phase)}
+                </span>
+              )
+            }
+          />
+          <NavItem
+            active={view === "alerts"}
+            onClick={onShowAlerts}
+            icon={<BellRing size={15} />}
+            label="Alerts"
+            trailing={
+              openAlerts > 0 && (
                 <span
-                  className={cx(
-                    "size-1.5 rounded-full",
-                    phase === "halted" ? "bg-destructive" : phaseStyle(phase).dot,
-                    phaseStyle(phase).pulse && "animate-spawn-pulse",
-                  )}
-                />
-                {stateWords(phase)}
-              </span>
-            )
-          }
-        />
-        <NavItem
-          active={view === "alerts"}
-          onClick={onShowAlerts}
-          icon={<BellRing size={15} />}
-          label="Alerts"
-          trailing={
-            openAlerts > 0 && (
-              <span
-                title={`${openAlerts} open alert${openAlerts === 1 ? "" : "s"}`}
-                className="tnum rounded bg-fail-tint px-1.5 py-px text-micro font-medium text-destructive"
-              >
-                {openAlerts}
-              </span>
-            )
-          }
-        />
-        <NavItem
-          active={view === "scorecard"}
-          onClick={onShowScorecard}
-          icon={<Gauge size={15} />}
-          label="Scorecard"
-        />
-        <NavItem
-          active={view === "cost"}
-          onClick={onShowCost}
-          icon={<CircleDollarSign size={15} />}
-          label="Cost"
-        />
-        <NavItem
-          active={view === "storage"}
-          onClick={onShowStorage}
-          icon={<GitBranch size={15} />}
-          label="Storage tree"
-        />
-        <NavItem
-          active={view === "show"}
-          onClick={onShowShow}
-          icon={<Waypoints size={15} />}
-          label="Show"
-        />
-      </div>
-
-      <div className="flex items-center px-4 pb-1.5 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
-        Sessions
-        <span className="tnum ml-auto normal-case tracking-normal">
-          {(agents?.length ?? sessions.length) || ""}
-        </span>
-      </div>
-
-      {agents && agents.length > 0 && (
-        <div className="relative shrink-0 px-2 pb-2">
-          <Search size={13} aria-hidden="true" className="pointer-events-none absolute top-1/2 left-4.5 -translate-y-1/2 text-faint-foreground" />
-          <input
-            ref={search}
-            type="search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            onKeyDown={(event) => {
-              // Esc clears the query; with none, it leaves the box. It never
-              // reaches a drawer's Esc while it clears.
-              if (event.key !== "Escape") return;
-              if (query) {
-                event.stopPropagation();
-                event.preventDefault();
-                setQuery("");
-              } else event.currentTarget.blur();
-            }}
-            placeholder="Find an agent, task or id"
-            aria-label="Find a session: by agent name, task number or title, mission, or id"
-            aria-keyshortcuts="/"
-            className={cx(
-              "h-8 w-full rounded-control border border-sidebar-border bg-surface pr-7 pl-7.5 text-label text-foreground placeholder:text-faint-foreground",
-              "[&::-webkit-search-cancel-button]:hidden",
-              FOCUS_RING_INSET,
-            )}
+                  title={`${openAlerts} open alert${openAlerts === 1 ? "" : "s"}`}
+                  className="tnum rounded bg-fail-tint px-1.5 py-px text-micro font-medium text-destructive"
+                >
+                  {openAlerts}
+                </span>
+              )
+            }
           />
-          {query ? (
-            <button
-              type="button"
-              onClick={() => {
-                setQuery("");
-                search.current?.focus();
-              }}
-              aria-label="Clear the search"
-              className="absolute top-1/2 right-3.5 grid size-5 -translate-y-1/2 place-items-center rounded text-faint-foreground hover:text-foreground"
-            >
-              <X size={12} aria-hidden="true" />
-            </button>
-          ) : (
-            <kbd
-              aria-hidden="true"
-              className="pointer-events-none absolute top-1/2 right-3.5 -translate-y-1/2 rounded border border-sidebar-border px-1 font-mono text-micro text-faint-foreground"
-            >
-              /
-            </kbd>
-          )}
+          <NavItem
+            active={view === "scorecard"}
+            onClick={onShowScorecard}
+            icon={<Gauge size={15} />}
+            label="Scorecard"
+          />
+          <NavItem
+            active={view === "cost"}
+            onClick={onShowCost}
+            icon={<CircleDollarSign size={15} />}
+            label="Cost"
+          />
+          <NavItem
+            active={view === "storage"}
+            onClick={onShowStorage}
+            icon={<GitBranch size={15} />}
+            label="Storage tree"
+          />
+          <NavItem
+            active={view === "show"}
+            onClick={onShowShow}
+            icon={<Waypoints size={15} />}
+            label="Show"
+          />
         </div>
-      )}
 
-      <nav
-        aria-label="Sessions"
-        className="min-h-0 flex-1 overflow-y-auto px-2 pb-3"
-      >
-        {agents ? (
-          <GroupedSessions
-            agents={agents}
-            context={context}
-            sessions={sessions}
-            selectedId={selectedId}
-            query={query}
-            onSelect={onSelect}
-          />
-        ) : sessions.length === 0 ? (
-          <p className="px-2 py-4 text-caption text-faint-foreground">
-            No sessions yet.
-          </p>
-        ) : (
-          <ul className="space-y-px">
-            {sessions.map((session) => (
-              <li key={session.session_id}>
-                <SessionRow
-                  sessionId={session.session_id}
-                  agentId={session.agent_id}
-                  state={session.state}
-                  label={sessionTaskLabel(session.session_id, rsi) ?? stateLabel(session.state)}
-                  at={session.recorded_at_ms}
-                  attention={false}
-                  selected={session.session_id === selectedId}
-                  onSelect={onSelect}
-                />
-              </li>
-            ))}
-          </ul>
+        <div className="flex items-center px-4 pt-1 pb-1.5 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
+          Sessions
+          <span className="tnum ml-auto normal-case tracking-normal">
+            {(agents?.length ?? sessions.length) || ""}
+          </span>
+        </div>
+
+        {agents && agents.length > 0 && (
+          <div className="relative px-2 pb-2">
+            <Search size={13} aria-hidden="true" className="pointer-events-none absolute top-1/2 left-4.5 -translate-y-1/2 text-faint-foreground" />
+            <input
+              ref={search}
+              type="search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                // Esc clears the query; with none, it leaves the box. It never
+                // reaches a drawer's Esc while it clears.
+                if (event.key !== "Escape") return;
+                if (query) {
+                  event.stopPropagation();
+                  event.preventDefault();
+                  setQuery("");
+                } else event.currentTarget.blur();
+              }}
+              placeholder="Find an agent, task or id"
+              aria-label="Find a session: by agent name, task number or title, mission, or id"
+              aria-keyshortcuts="/"
+              className={cx(
+                "h-8 w-full rounded-control border border-sidebar-border bg-surface pr-7 pl-7.5 text-label text-foreground placeholder:text-faint-foreground",
+                "[&::-webkit-search-cancel-button]:hidden",
+                FOCUS_RING_INSET,
+              )}
+            />
+            {query ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setQuery("");
+                  search.current?.focus();
+                }}
+                aria-label="Clear the search"
+                className="absolute top-1/2 right-3.5 grid size-5 -translate-y-1/2 place-items-center rounded text-faint-foreground hover:text-foreground"
+              >
+                <X size={12} aria-hidden="true" />
+              </button>
+            ) : (
+              <kbd
+                aria-hidden="true"
+                className="pointer-events-none absolute top-1/2 right-3.5 -translate-y-1/2 rounded border border-sidebar-border px-1 font-mono text-micro text-faint-foreground"
+              >
+                /
+              </kbd>
+            )}
+          </div>
         )}
-      </nav>
 
-      <div className="flex h-10 shrink-0 items-center gap-2 border-t border-sidebar-border px-4 text-micro text-faint-foreground">
+        <nav aria-label="Sessions" className="px-2 pb-3">
+          {agents ? (
+            <GroupedSessions
+              agents={agents}
+              context={context}
+              sessions={sessions}
+              selectedId={selectedId}
+              query={query}
+              onSelect={onSelect}
+            />
+          ) : sessions.length === 0 ? (
+            <p className="px-2 py-4 text-caption text-faint-foreground">
+              No sessions yet.
+            </p>
+          ) : (
+            <ul className="space-y-px">
+              {sessions.map((session) => (
+                <li key={session.session_id}>
+                  <SessionRow
+                    sessionId={session.session_id}
+                    agentId={session.agent_id}
+                    state={session.state}
+                    label={sessionTaskLabel(session.session_id, rsi) ?? stateLabel(session.state)}
+                    at={session.recorded_at_ms}
+                    attention={false}
+                    selected={session.session_id === selectedId}
+                    onSelect={onSelect}
+                  />
+                </li>
+              ))}
+            </ul>
+          )}
+        </nav>
+      </div>
+
+      <div className="flex h-10 shrink-0 items-center gap-2 border-t border-sidebar-border px-3 text-micro text-faint-foreground lg:px-4">
         <span
           className={cx(
-            "size-1.5 rounded-full",
+            "size-1.5 shrink-0 rounded-full",
             error ? "bg-destructive" : "bg-success",
           )}
         />
-        <span className="truncate font-mono">{window.location.host}</span>
-        <span className="ml-auto">{error ? "offline" : "online"}</span>
+        <span className="min-w-0 truncate font-mono">{window.location.host}</span>
+        <span className="ml-auto shrink-0">{error ? "offline" : "online"}</span>
+        {onSignOut && (
+          <button
+            type="button"
+            onClick={onSignOut}
+            title="退出登录 / 更换 Token"
+            aria-label="退出登录"
+            className={cx(
+              "grid size-5 shrink-0 place-items-center rounded-[5px] text-faint-foreground hover:text-foreground",
+              FOCUS_RING_INSET,
+            )}
+          >
+            <LogOut size={12} strokeWidth={2} />
+          </button>
+        )}
         <ThemeSwitch />
       </div>
     </aside>
@@ -524,8 +541,8 @@ function NavItem({
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cx(
-        // A fixed row: 32 px, 44 px under a finger.
-        "flex h-8 w-full items-center gap-2.5 rounded-control px-2.5 text-left text-label transition-colors pointer-coarse:h-11",
+        // A compact row: 32 px on pointer, 36 px under touch inside the scrollable rail.
+        "flex h-8 w-full items-center gap-2.5 rounded-control px-2.5 text-left text-label transition-colors pointer-coarse:h-9",
         FOCUS_RING_INSET,
         active
           ? "bg-surface-selected font-semibold text-foreground"
@@ -535,8 +552,8 @@ function NavItem({
       <span className={active ? "text-foreground" : "text-faint-foreground"}>
         {icon}
       </span>
-      {label}
-      {trailing && <span className="ml-auto">{trailing}</span>}
+      <span className="min-w-0 truncate">{label}</span>
+      {trailing && <span className="ml-auto shrink-0">{trailing}</span>}
     </button>
   );
 }
@@ -583,6 +600,7 @@ export function MobileNav({
   onShowStorage,
   onShowShow,
   onShowSessions,
+  onSignOut,
 }: Pick<
   SidebarProps,
   | "view"
@@ -600,11 +618,35 @@ export function MobileNav({
   | "onShowStorage"
   | "onShowShow"
   | "onShowSessions"
+  | "onSignOut"
 >) {
   return (
-    <div className="flex h-12 shrink-0 items-center gap-3 border-b border-sidebar-border bg-sidebar px-3 md:hidden">
-      <Brand />
-      <div className="ml-auto flex min-w-0 overflow-x-auto rounded-lg border border-surface-border bg-surface p-0.5">
+    <header className="flex shrink-0 flex-col border-b border-sidebar-border bg-sidebar md:hidden">
+      <div className="flex h-11 items-center gap-2 px-3">
+        <Brand />
+        <div className="ml-auto flex items-center gap-2">
+          {onSignOut && (
+            <button
+              type="button"
+              onClick={onSignOut}
+              title="退出登录 / 更换 Token"
+              aria-label="退出登录"
+              className={cx(
+                "grid size-6 place-items-center rounded-md text-muted-foreground hover:bg-surface-hover hover:text-foreground",
+                FOCUS_RING_INSET,
+              )}
+            >
+              <LogOut size={14} strokeWidth={2} />
+            </button>
+          )}
+          <ThemeSwitch />
+        </div>
+      </div>
+
+      <nav
+        aria-label="Sections"
+        className="flex items-center gap-1 overflow-x-auto px-2 pb-1.5"
+      >
         {(
           [
             ["fleet", "Home", <House key="f" size={13} />, onShowFleet],
@@ -627,10 +669,10 @@ export function MobileNav({
             onClick={onClick}
             aria-current={view === id ? "page" : undefined}
             className={cx(
-              "inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-caption font-medium transition-colors",
+              "inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-caption font-medium transition-colors",
               view === id
                 ? "bg-surface-selected text-foreground"
-                : "text-muted-foreground",
+                : "text-muted-foreground hover:text-foreground",
             )}
           >
             {icon}
@@ -643,17 +685,39 @@ export function MobileNav({
             )}
           </button>
         ))}
-      </div>
-    </div>
+      </nav>
+    </header>
   );
 }
 
 const THEME_ICON = { system: Monitor, light: Sun, dark: Moon } as const;
+const THEME_EVENT = "spawn:theme-change";
 
 /** The page's theme: the system's, light or dark (src/theme.ts). */
-function ThemeSwitch() {
+export function ThemeSwitch() {
   const [choice, choose] = useStoredChoice<ThemeChoice>(THEME_KEY, THEME_CHOICES, "system");
   useTheme(choice);
+
+  useEffect(() => {
+    const sync = () => {
+      try {
+        const stored = window.localStorage.getItem(THEME_KEY);
+        if (THEME_CHOICES.includes(stored as ThemeChoice) && stored !== choice) {
+          choose(stored as ThemeChoice);
+        }
+      } catch {
+        // Ignore storage read errors when syncing across sibling mounts.
+      }
+    };
+    window.addEventListener(THEME_EVENT, sync);
+    return () => window.removeEventListener(THEME_EVENT, sync);
+  }, [choice, choose]);
+
+  const selectTheme = (option: ThemeChoice) => {
+    choose(option);
+    if (typeof window !== "undefined") window.dispatchEvent(new Event(THEME_EVENT));
+  };
+
   return (
     <span role="radiogroup" aria-label="Theme" className="flex items-center gap-px rounded-md p-px ring-1 ring-surface-border">
       {THEME_CHOICES.map((option) => {
@@ -665,7 +729,7 @@ function ThemeSwitch() {
             role="radio"
             aria-checked={choice === option}
             title={`Theme: ${option}`}
-            onClick={() => choose(option)}
+            onClick={() => selectTheme(option)}
             className={cx(
               "grid size-5 place-items-center rounded-[5px]",
               FOCUS_RING_INSET,

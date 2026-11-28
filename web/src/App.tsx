@@ -1,7 +1,19 @@
-import { PanelRight } from "lucide-react";
-import { Suspense, lazy, useEffect, useMemo, useState } from "react";
+import { Orbit, PanelRight } from "lucide-react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
 
-import { fetchAlerts, fetchAttention, fetchOverview, fetchSessionTail, live, usePoll } from "./api";
+import {
+  fetchAlerts,
+  fetchAttention,
+  fetchOverview,
+  fetchSessionTail,
+  getInitialTokenProblem,
+  getServeToken,
+  live,
+  probeAuth,
+  setServeToken,
+  subscribeUnauthorized,
+  usePoll,
+} from "./api";
 import { PAGE_EVENTS } from "./sessionWindow";
 import type { PollResult, SessionTail } from "./api";
 import { markNeedsHuman, needsHuman } from "./attention";
@@ -9,6 +21,8 @@ import { inputTarget } from "./commands";
 import { DetailsRail, ExecutionSummary, RailContent } from "./components/DetailsRail";
 import { MobileNav, Sidebar } from "./components/Sidebar";
 import { Timeline } from "./components/Timeline";
+import { TokenGate } from "./components/TokenGate";
+import { unauthorizedReason, type AuthGateState, type AuthPromptReason } from "./token";
 import { AlertsView, OpenAlerts } from "./components/alerts/AlertsView";
 import { CostView } from "./components/cost/CostView";
 import { CoveragePage } from "./components/features/CoveragePage";
@@ -121,10 +135,99 @@ function useMinute(): number {
 }
 
 export default function App() {
+  const [auth, setAuth] = useState<AuthGateState>({ kind: "checking" });
+
+  const dropToGate = useCallback((reason?: AuthPromptReason) => {
+    live.stop();
+    const problem = getInitialTokenProblem();
+    setAuth({
+      kind: "unauthenticated",
+      reason: reason ?? unauthorizedReason(getServeToken() !== null, problem),
+      problem,
+    });
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void probeAuth(controller.signal)
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        if (result.kind === "unauthorized") {
+          dropToGate();
+          return;
+        }
+        setAuth({ kind: "authenticated", hasStoredToken: getServeToken() !== null });
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setAuth({ kind: "authenticated", hasStoredToken: getServeToken() !== null });
+      });
+    return () => controller.abort();
+  }, [dropToGate]);
+
+  useEffect(() => {
+    return subscribeUnauthorized((reason) => dropToGate(reason));
+  }, [dropToGate]);
+
+  if (auth.kind === "checking") {
+    return (
+      <div className="grid h-dvh w-full place-items-center bg-page-canvas text-caption text-faint-foreground">
+        <div className="flex items-center gap-2.5">
+          <Orbit size={16} className="animate-spin text-muted-foreground" />
+          <span>正在连接 Spawn…</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (auth.kind === "unauthenticated") {
+    return (
+      <TokenGate
+        reason={auth.reason}
+        problem={auth.problem}
+        onAuthenticated={() =>
+          setAuth({ kind: "authenticated", hasStoredToken: getServeToken() !== null })
+        }
+      />
+    );
+  }
+
+  return (
+    <DashboardShell
+      hasStoredToken={auth.hasStoredToken}
+      onUnauthorized={() => dropToGate()}
+      onSignOut={() => {
+        setServeToken(null);
+        setAuth({ kind: "unauthenticated", reason: "missing_token", problem: null });
+      }}
+    />
+  );
+}
+
+function DashboardShell({
+  hasStoredToken,
+  onUnauthorized,
+  onSignOut,
+}: {
+  hasStoredToken: boolean;
+  onUnauthorized: () => void;
+  onSignOut: () => void;
+}) {
   // The live log (stream.ts, shared among tabs): every poll that names a
   // topic reads again when an event of it arrives, and polls slower while
   // the stream is live.
-  useEffect(() => live.start(), []);
+  useEffect(() => {
+    live.start();
+    const unsubscribe = live.subscribe((signal) => {
+      if (signal.kind === "status" && signal.status.state === "unauthorized") {
+        onUnauthorized();
+      }
+    });
+    return () => {
+      unsubscribe();
+      live.stop();
+    };
+  }, [onUnauthorized]);
   const overview = usePoll("overview", fetchOverview, 2_000, { live: ["overview"] });
   // Both polled in every view: the sidebar shows what is escalated, which is
   // the dispatcher's view (/api/attention), never a judge's flag.
@@ -284,6 +387,7 @@ export default function App() {
         onShowStorage={() => setView("storage")}
         onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
+        onSignOut={hasStoredToken ? onSignOut : undefined}
       />
       <Sidebar
         sessions={overview.data?.sessions ?? []}
@@ -311,6 +415,7 @@ export default function App() {
           setSelectedId(id);
           setView("sessions");
         }}
+        onSignOut={hasStoredToken ? onSignOut : undefined}
       />
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">

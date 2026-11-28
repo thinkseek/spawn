@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { normalizeAttention, type Attention } from "./attention";
-import { chooseToken, type TokenChoice } from "./token";
+import {
+  chooseToken,
+  serveCredential,
+  unauthorizedReason,
+  validateSubmittedToken,
+  type AuthPromptReason,
+  type TokenChoice,
+} from "./token";
 import { markFresh, pageHidden, Validated } from "./validated";
 import { readTail } from "./sessionWindow.ts";
 import type { LiveStatus, LiveTopic } from "./stream.ts";
@@ -413,8 +420,122 @@ const tokenChoice: TokenChoice = (() => {
 })();
 
 /** The token every API read carries: always a header-safe credential
- * ([`chooseToken`]), never a raw `?token=`. */
-const serveToken: string | null = tokenChoice.token;
+ * ([`chooseToken`]), never a raw `?token=`. Mutable so the login gate and
+ * sign-out button can set or clear it without a full page reload. */
+let serveToken: string | null = tokenChoice.token;
+let initialTokenProblem: string | null = tokenChoice.problem;
+
+type UnauthorizedListener = (reason: AuthPromptReason) => void;
+const unauthorizedListeners = new Set<UnauthorizedListener>();
+
+/** Subscribe to 401 unauthorized events raised by API reads or writes. */
+export function subscribeUnauthorized(listener: UnauthorizedListener): () => void {
+  unauthorizedListeners.add(listener);
+  return () => unauthorizedListeners.delete(listener);
+}
+
+function notifyUnauthorized(): void {
+  const reason = unauthorizedReason(serveToken !== null, initialTokenProblem);
+  for (const listener of unauthorizedListeners) listener(reason);
+}
+
+export function getServeToken(): string | null {
+  return serveToken;
+}
+
+export function getInitialTokenProblem(): string | null {
+  return initialTokenProblem;
+}
+
+/** Update or clear the active serve token, persist/clear localStorage, and flush cached ETags. */
+export function setServeToken(next: string | null): void {
+  const normalized = next === null ? null : serveCredential(next);
+  serveToken = normalized;
+  initialTokenProblem = null;
+  try {
+    if (normalized !== null) localStorage.setItem(TOKEN_KEY, normalized);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    // Storage disabled: kept in this page only.
+  }
+  reads.clear();
+  if (normalized === null) live.stop();
+}
+
+export type AuthProbeResult =
+  | { kind: "authenticated" }
+  | { kind: "unauthorized" }
+  | { kind: "unreachable"; message: string };
+
+/** Probe whether the current session (stored token or loopback no-token host) is accepted. */
+export async function probeAuth(signal?: AbortSignal): Promise<AuthProbeResult> {
+  try {
+    const response = await fetch("/api/overview", {
+      signal,
+      cache: "no-store",
+      headers: apiHeaders(),
+    });
+    await response.arrayBuffer().catch(() => undefined);
+    if (response.ok || response.status === 304) return { kind: "authenticated" };
+    if (response.status === 401 || response.status === 403) return { kind: "unauthorized" };
+    return { kind: "unreachable", message: `HTTP ${response.status}` };
+  } catch (cause) {
+    if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+    return {
+      kind: "unreachable",
+      message: cause instanceof Error ? cause.message : "无法连接到服务端",
+    };
+  }
+}
+
+export type TokenVerifyResult =
+  | { ok: true }
+  | { ok: false; kind: "invalid" | "rejected" | "unreachable"; message: string };
+
+/** Validate format, verify against `GET /api/overview`, and store on success. */
+export async function verifyAndApplyToken(
+  raw: string,
+  signal?: AbortSignal,
+): Promise<TokenVerifyResult> {
+  const checked = validateSubmittedToken(raw);
+  if (!checked.ok) {
+    return { ok: false, kind: "invalid", message: checked.message };
+  }
+  try {
+    const response = await fetch("/api/overview", {
+      signal,
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${checked.token}`,
+      },
+    });
+    await response.arrayBuffer().catch(() => undefined);
+    if (response.ok || response.status === 304) {
+      setServeToken(checked.token);
+      return { ok: true };
+    }
+    if (response.status === 401 || response.status === 403) {
+      return {
+        ok: false,
+        kind: "rejected",
+        message: "Token 无效或被服务端拒绝（HTTP 401），请核对 SPAWN_SERVE_TOKEN 后重试。",
+      };
+    }
+    return {
+      ok: false,
+      kind: "unreachable",
+      message: `服务端返回异常状态（HTTP ${response.status}），请稍后重试。`,
+    };
+  } catch (cause) {
+    if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+    return {
+      ok: false,
+      kind: "unreachable",
+      message: cause instanceof Error ? `无法连接服务端：${cause.message}` : "无法连接服务端",
+    };
+  }
+}
 
 /** `href` without its `?token=` parameter; every other part is kept. */
 export function withoutToken(href: string): string {
@@ -426,7 +547,8 @@ export function withoutToken(href: string): string {
 /** The error of a failed API read. A 401 says how to give the token. */
 export function apiError(status: number, detail = ""): Error {
   if (status === 401) {
-    const problem = tokenChoice.problem ? `${tokenChoice.problem} ` : "";
+    notifyUnauthorized();
+    const problem = initialTokenProblem ? `${initialTokenProblem} ` : "";
     return new Error(
       problem +
       (serveToken
@@ -554,6 +676,9 @@ async function postJson(
   } catch (cause) {
     if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
     return { status: null, body: null };
+  }
+  if (response.status === 401) {
+    notifyUnauthorized();
   }
   let answer: unknown = null;
   try {

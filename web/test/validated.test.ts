@@ -188,3 +188,17 @@ test("a live-triggered read asks for a fresh answer, a periodic one shares", asy
   assert.equal(cacheControlFor(undefined), SHARED_FOR);
   assert.equal(cacheControlFor(new AbortController().signal), SHARED_FOR);
 });
+
+test("clear forgets kept ETags so the next read omits If-None-Match", async () => {
+  const { seen, fetcher } = server([
+    { body: { n: 1 }, etag: 'W/"a"' },
+    { body: { n: 1 }, etag: 'W/"a"' },
+  ]);
+  const reads = new Validated(fetcher);
+  await reads.read("/api/overview", (raw) => raw, options());
+  assert.equal(reads.size, 1);
+  reads.clear();
+  assert.equal(reads.size, 0);
+  await reads.read("/api/overview", (raw) => raw, options());
+  assert.equal(seen[1].headers["If-None-Match"], undefined);
+});
