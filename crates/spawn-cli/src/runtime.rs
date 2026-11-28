@@ -190,6 +190,26 @@ fn parse_bounded_usize(
     }
 }
 
+fn parse_shard_coverage_policy(
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<spawn_core::bridge::ShardCoveragePolicy, String> {
+    let Some(raw) =
+        lookup("SPAWN_BRIDGE_ALLOW_INCOMPLETE_SHARDS").filter(|text| !text.trim().is_empty())
+    else {
+        return Ok(spawn_core::bridge::ShardCoveragePolicy::RequireComplete);
+    };
+    let trimmed = raw.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(spawn_core::bridge::ShardCoveragePolicy::AllowIncomplete),
+        "0" | "false" | "no" | "off" => {
+            Ok(spawn_core::bridge::ShardCoveragePolicy::RequireComplete)
+        }
+        _ => Err(format!(
+            "SPAWN_BRIDGE_ALLOW_INCOMPLETE_SHARDS={trimmed:?} must be a boolean (true/false/1/0/yes/no/on/off)"
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BridgeScaling {
     max_commands_per_tick: usize,
@@ -198,6 +218,7 @@ struct BridgeScaling {
     max_concurrent_checkpoints: usize,
     session_scan_limit: usize,
     shard: BridgeShard,
+    shard_coverage_policy: spawn_core::bridge::ShardCoveragePolicy,
 }
 
 fn parse_bridge_shard(lookup: &dyn Fn(&str) -> Option<String>) -> Result<BridgeShard, String> {
@@ -240,6 +261,7 @@ fn parse_bridge_scaling(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Bridg
             16_384,
         )?,
         shard: parse_bridge_shard(lookup)?,
+        shard_coverage_policy: parse_shard_coverage_policy(lookup)?,
     })
 }
 
@@ -311,6 +333,7 @@ fn bridge_config_for(herdr_backend: bool, workspace_root: &Path) -> Result<Bridg
     config.backstops_per_pass = scaling.backstops_per_pass;
     config.session_scan_limit = scaling.session_scan_limit;
     config.shard = scaling.shard;
+    config.shard_coverage_policy = scaling.shard_coverage_policy;
     let shared_cache = prepare_shared_build_caches(&env_value, workspace_root)?;
     config.claude_sandbox = claude_sandbox_enabled(&env_value);
     let (policy, said) = bridge_engine_view(
@@ -2439,7 +2462,7 @@ mod tests {
     #[test]
     fn bridge_scaling_and_shard_env_parsing_and_fail_closed_validation() {
         use super::{default_worker_name, parse_bridge_scaling};
-        use spawn_core::bridge::BridgeShard;
+        use spawn_core::bridge::{BridgeShard, ShardCoveragePolicy};
 
         let empty_env = environment(&[]);
         let defaults = parse_bridge_scaling(&empty_env).expect("default scaling");
@@ -2452,6 +2475,10 @@ mod tests {
             spawn_core::port::DEFAULT_SESSION_SCAN_LIMIT
         );
         assert_eq!(defaults.shard, BridgeShard::All);
+        assert_eq!(
+            defaults.shard_coverage_policy,
+            ShardCoveragePolicy::RequireComplete
+        );
         assert_eq!(
             default_worker_name(&empty_env, defaults.shard),
             "spawn-worker"
@@ -2472,6 +2499,10 @@ mod tests {
         assert_eq!(custom.max_concurrent_checkpoints, 48);
         assert_eq!(custom.session_scan_limit, 2048);
         assert_eq!(custom.shard, BridgeShard::partition(2, 8).expect("shard"));
+        assert_eq!(
+            custom.shard_coverage_policy,
+            ShardCoveragePolicy::RequireComplete
+        );
         assert_eq!(
             default_worker_name(&custom_env, custom.shard),
             "spawn-worker-shard-2-of-8"
@@ -2507,6 +2538,47 @@ mod tests {
             assert!(
                 parse_bridge_scaling(&bad_env).is_err(),
                 "SPAWN_BRIDGE_SHARD={bad_shard:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_incomplete_shard_flag_parses_and_fails_closed() {
+        use super::parse_bridge_scaling;
+        use spawn_core::bridge::ShardCoveragePolicy;
+
+        // Legacy names are completely removed and leave canonical defaults untouched.
+        let ignored_legacy_env = environment(&[
+            ("SPAWN_BRIDGE_MAX_COMMANDS", "128"),
+            ("SPAWN_BRIDGE_BACKSTOPS_PER_PASS", "16"),
+        ]);
+        let parsed = parse_bridge_scaling(&ignored_legacy_env).expect("defaults without legacy");
+        assert_eq!(parsed.max_commands_per_tick, 64);
+        assert_eq!(parsed.backstops_per_pass, 8);
+
+        for allow_val in ["true", "1", "yes", "on", " TRUE "] {
+            let allow_env = environment(&[("SPAWN_BRIDGE_ALLOW_INCOMPLETE_SHARDS", allow_val)]);
+            assert_eq!(
+                parse_bridge_scaling(&allow_env)
+                    .expect("valid allow override")
+                    .shard_coverage_policy,
+                ShardCoveragePolicy::AllowIncomplete
+            );
+        }
+        for require_val in ["false", "0", "no", "off", " FALSE ", ""] {
+            let require_env = environment(&[("SPAWN_BRIDGE_ALLOW_INCOMPLETE_SHARDS", require_val)]);
+            assert_eq!(
+                parse_bridge_scaling(&require_env)
+                    .expect("valid require setting")
+                    .shard_coverage_policy,
+                ShardCoveragePolicy::RequireComplete
+            );
+        }
+        for bad_bool in ["maybe", "2", "enable", "true\nfalse"] {
+            let bad_env = environment(&[("SPAWN_BRIDGE_ALLOW_INCOMPLETE_SHARDS", bad_bool)]);
+            assert!(
+                parse_bridge_scaling(&bad_env).is_err(),
+                "SPAWN_BRIDGE_ALLOW_INCOMPLETE_SHARDS={bad_bool:?} must fail closed"
             );
         }
     }

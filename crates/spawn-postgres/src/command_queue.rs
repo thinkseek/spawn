@@ -6,7 +6,7 @@ use std::time::Duration;
 use postgres::Client;
 use spawn_core::command::{Claimed, Outcome, Submission};
 use spawn_core::id::{CommandId, Principal};
-use spawn_core::port::{BridgeShard, CommandOwnership, CommandQueue, StoreError};
+use spawn_core::port::{BridgeShard, CommandOwnership, CommandQueue, ShardCoverage, StoreError};
 
 use crate::PostgresStore;
 use crate::row::{agent_id, bigint, command_id, corrupt, session_id};
@@ -46,7 +46,8 @@ fn claimed_from_row(row: &postgres::Row) -> Result<Claimed, StoreError> {
 /// differently named workers stay apart.
 const WORKER_LOCK_NAMESPACE: i32 = 1_399_957_338;
 const WORKER_LOCK: &str = "select pg_try_advisory_lock(
-    $1, hashtext(current_schema() || ':bridge:' || $2)) as held";
+    $1, hashtext(current_schema() || ':bridge:' || $2)) as held,
+    hashtext(current_schema() || ':bridge:' || $2) as lock_key";
 const WORKER_UNLOCK: &str = "select pg_advisory_unlock(
     $1, hashtext(current_schema() || ':bridge:' || $2))";
 
@@ -63,14 +64,19 @@ impl CommandOwnership for PostgresOwnership {}
 
 impl Drop for PostgresOwnership {
     fn drop(&mut self) {
-        let _ = self
+        let mut client = self
             .client
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .query(
-                WORKER_UNLOCK,
-                &[&WORKER_LOCK_NAMESPACE, &self.worker.as_str()],
-            );
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = client.query(
+            "select spawn_unregister_bridge_shard($1)",
+            &[&self.worker.as_str()],
+        );
+        let _ = client.query(
+            WORKER_UNLOCK,
+            &[&WORKER_LOCK_NAMESPACE, &self.worker.as_str()],
+        );
+        drop(client);
         self.workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -83,6 +89,15 @@ impl CommandQueue for PostgresStore {
         &self,
         worker: &str,
     ) -> Result<(Box<dyn CommandOwnership>, usize), StoreError> {
+        self.recover_worker_for_shard(worker, BridgeShard::All)
+    }
+
+    fn recover_worker_for_shard(
+        &self,
+        worker: &str,
+        shard: BridgeShard,
+    ) -> Result<(Box<dyn CommandOwnership>, usize), StoreError> {
+        let (index, total) = shard.index_and_total();
         if !self
             .workers
             .lock()
@@ -93,18 +108,24 @@ impl CommandQueue for PostgresStore {
                 "Bridge worker {worker} is still owned by a live process"
             )));
         }
-        let acquired = self
-            .query_one(WORKER_LOCK, &[&WORKER_LOCK_NAMESPACE, &worker])
-            .map(|row| row.get::<_, bool>("held"));
+        let acquired = self.query_one(WORKER_LOCK, &[&WORKER_LOCK_NAMESPACE, &worker]);
         match acquired {
-            Ok(true) => {
-                // From here the guard rolls both the local and server-side
-                // ownership back if the recovery update fails.
+            Ok(row) if row.get::<_, bool>("held") => {
+                let lock_key: i32 = row.get("lock_key");
+                // Construct ownership guard before topology/slot registration and
+                // recovery update so any failure drops the advisory lock, removes
+                // any shard slot row, and clears `self.workers`.
                 let ownership = PostgresOwnership {
                     client: self.client.clone(),
                     workers: self.workers.clone(),
                     worker: worker.to_string(),
                 };
+                let shard_index = i32::from(index);
+                let shard_total = i32::from(total);
+                self.query(
+                    "select spawn_register_bridge_shard($1, $2, $3, $4)",
+                    &[&worker, &shard_index, &shard_total, &lock_key],
+                )?;
                 // Deliberately a direct owner-only update, not a definer
                 // function a restricted queue login could use to steal leases.
                 let recovered = self.execute(
@@ -120,7 +141,7 @@ impl CommandQueue for PostgresStore {
                     usize::try_from(recovered).unwrap_or(usize::MAX),
                 ))
             }
-            Ok(false) => {
+            Ok(_) => {
                 self.workers
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -137,6 +158,37 @@ impl CommandQueue for PostgresStore {
                 Err(error)
             }
         }
+    }
+
+    fn shard_coverage(&self) -> Result<Option<ShardCoverage>, StoreError> {
+        let rows = self.query(
+            "select out_total, out_present from spawn_shard_coverage()",
+            &[],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let total_i32: i32 = row.get("out_total");
+        let total = u16::try_from(total_i32)
+            .map_err(|_| StoreError::Backend(format!("invalid shard total {total_i32}")))?;
+        let raw_present: Vec<i32> = row.get("out_present");
+        let mut present_set = std::collections::BTreeSet::new();
+        for idx_i32 in raw_present {
+            let idx = u16::try_from(idx_i32)
+                .map_err(|_| StoreError::Backend(format!("invalid shard index {idx_i32}")))?;
+            if idx < total {
+                present_set.insert(idx);
+            }
+        }
+        let present: Vec<u16> = present_set.iter().copied().collect();
+        let missing: Vec<u16> = (0..total)
+            .filter(|idx| !present_set.contains(idx))
+            .collect();
+        Ok(Some(ShardCoverage {
+            total,
+            present,
+            missing,
+        }))
     }
 
     fn submit(
