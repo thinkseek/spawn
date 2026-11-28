@@ -11,20 +11,25 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use spawn_cas::sha256_of;
+use spawn_core::bridge::{Bridge, BridgeConfig};
 use spawn_core::command::{CommandAction, Outcome, Submission};
-use spawn_core::event::{
-    ENGINE, EndCause, EventKind, GlobalPosition, LaunchSummary, ModelProfile, NewEvent, Source,
-};
+use spawn_core::event::{ENGINE, EventKind, GlobalPosition, ModelProfile, NewEvent, Source};
 use spawn_core::id::{
-    AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, WorkspaceId,
+    AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
 };
+use spawn_core::ingest;
+use spawn_core::memory::{MemoryStore, MemoryWatch};
 use spawn_core::port::{BridgeShard, CommandQueue, EventLog, ShardPartition, TranscriptArchive};
+use spawn_core::time::SystemClock;
 use spawn_host::LocalTranscriptArchive;
 use spawn_postgres::{
     PostgresStore, ProvAttributionSource, ProvBoundary, ProvChangeInput, ProvChangeKind,
@@ -36,11 +41,11 @@ const USAGE: &str = "spawn always-on control-plane & attribution benchmark\n\
 Usage: cargo run --release -p spawn-host --example always_on_control_plane_bench -- [options]\n\
 \n\
   --sessions <n>              Simulated concurrent agent sessions (default: 16)\n\
-  --events-per-session <n>    Events written per session (default: 40)\n\
+  --events-per-session <n>    Events written per session (default: 64)\n\
   --shards <n>                Bridge partitions to run concurrently (default: 4)\n\
   --commands-per-session <n>  Commands submitted/claimed per session (default: 16)\n\
   --writer-pool <n>           Concurrent PG writer connections (default: 8)\n\
-  --attribution-tasks <n>     Synthetic tasks to check for full lineage (default: 16)\n\
+  --attribution-tasks <n>     Bridge-driven tasks to check for full lineage (default: 16)\n\
   --archive-root <dir>        Transcript archive root (default: unique temp dir)\n\
   --help                      Show this help\n\
 \n\
@@ -61,7 +66,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             sessions: 16,
-            events_per_session: 40,
+            events_per_session: 64,
             shards: 4,
             commands_per_session: 16,
             writer_pool: 8,
@@ -321,7 +326,273 @@ fn run_event_writer_loop(
     (lats, pos_set)
 }
 
-fn run_event_log_stress(base_store: &PostgresStore, cfg: &Config) -> Result<Value, String> {
+struct TempFilesGuard(Vec<PathBuf>);
+
+impl Drop for TempFilesGuard {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = fs::remove_file(p);
+        }
+    }
+}
+
+fn spawn_xid8_t1_psql(pg_envs: &[(String, String)]) -> Result<std::process::Child, String> {
+    let mut cmd = Command::new("psql");
+    cmd.args(["-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (k, v) in pg_envs {
+        cmd.env(k, v);
+    }
+    cmd.spawn()
+        .map_err(|e| format!("spawn psql for xid8 inversion: {e}"))
+}
+
+fn wait_for_t1_reserved_id(
+    child: &mut std::process::Child,
+    id_file: &Path,
+    ready_file: &Path,
+) -> Result<i64, String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            let mut err_buf = String::new();
+            if let Some(mut se) = child.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut se, &mut err_buf);
+            }
+            return Err(format!(
+                "psql xid8 T1 exited unexpectedly ({status}): {}",
+                err_buf.trim()
+            ));
+        }
+        if fs::read_to_string(ready_file).is_ok_and(|s| !s.trim().is_empty()) {
+            let raw_id = fs::read_to_string(id_file)
+                .map_err(|e| format!("read xid8 id file {}: {e}", id_file.display()))?;
+            return raw_id
+                .trim()
+                .parse::<i64>()
+                .map_err(|e| format!("parse reserved xid8 id {raw_id:?}: {e}"));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("timed out waiting for psql T1 nextval output".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn finish_t1_xid8_commit(
+    mut t1: std::process::Child,
+    mut t1_in: std::process::ChildStdin,
+    id_t1: i64,
+    round: usize,
+) -> Result<(), String> {
+    let phase2 = format!(
+        "SELECT pg_advisory_xact_lock(1399957401, hashtext('session_xid8_a_{round}'));\n\
+         INSERT INTO spawn_agent_sessions (agent_id, session_id) \
+         VALUES ('agent_xid8_a_{round}', 'session_xid8_a_{round}') ON CONFLICT DO NOTHING;\n\
+         INSERT INTO spawn_events (id, agent_id, session_id, execution_id, source, source_event_id, \
+         kind, session_seq, recorded_at_ms, commit_xid) \
+         VALUES ({id_t1}, 'agent_xid8_a_{round}', 'session_xid8_a_{round}', NULL, 'observer', \
+         'xid8-a:{round}', '{{\"name\":\"message.received\"}}'::jsonb, 1, spawn_now_ms(), pg_current_xact_id());\n\
+         SELECT spawn_session_fold('session_xid8_a_{round}');\n\
+         COMMIT;\n\
+         \\q\n"
+    );
+    if let Err(err) = t1_in
+        .write_all(phase2.as_bytes())
+        .and_then(|()| t1_in.flush())
+    {
+        let _ = t1.kill();
+        let _ = t1.wait();
+        return Err(format!("write xid8 T1 phase2 SQL: {err}"));
+    }
+    drop(t1_in);
+
+    let out = t1
+        .wait_with_output()
+        .map_err(|e| format!("wait xid8 T1 psql: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "xid8 T1 commit failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn run_single_xid8_inversion(
+    pg_envs: &[(String, String)],
+    schema: &str,
+    store: &PostgresStore,
+    cursor: &mut GlobalPosition,
+    round: usize,
+) -> Result<(), String> {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let base = env::temp_dir();
+    let id_file = base.join(format!("spawn_xid8_id_{pid}_{round}_{nanos:x}.txt"));
+    let ready_file = base.join(format!("spawn_xid8_ready_{pid}_{round}_{nanos:x}.txt"));
+    let _cleanup = TempFilesGuard(vec![id_file.clone(), ready_file.clone()]);
+
+    let mut t1 = spawn_xid8_t1_psql(pg_envs)?;
+    let mut t1_in = t1
+        .stdin
+        .take()
+        .ok_or_else(|| "missing stdin pipe for xid8 T1 psql".to_string())?;
+    let phase1 = format!(
+        "SET search_path TO {schema};\n\
+         BEGIN;\n\
+         SELECT nextval(pg_get_serial_sequence('spawn_events', 'id')) \\g {}\n\
+         SELECT 1 \\g {}\n",
+        id_file.display(),
+        ready_file.display(),
+    );
+    t1_in
+        .write_all(phase1.as_bytes())
+        .and_then(|()| t1_in.flush())
+        .map_err(|e| format!("write xid8 T1 phase1 SQL: {e}"))?;
+
+    let id_t1 = wait_for_t1_reserved_id(&mut t1, &id_file, &ready_file)?;
+    let pos_t1 = GlobalPosition(
+        u64::try_from(id_t1).map_err(|_| format!("invalid negative id_t1={id_t1}"))?,
+    );
+
+    let t2 = store
+        .append(NewEvent {
+            agent_id: AgentId::new(format!("agent_xid8_b_{round}")).map_err(|e| e.to_string())?,
+            session_id: SessionId::new(format!("session_xid8_b_{round}"))
+                .map_err(|e| e.to_string())?,
+            execution_id: None,
+            source: Source::Observer,
+            source_event_id: Some(format!("xid8-b:{round}")),
+            kind: EventKind::MessageReceived,
+        })
+        .map_err(|e| format!("append xid8 T2 event: {e}"))?;
+    let pos_t2 = t2.record.position;
+    if pos_t2 <= pos_t1 {
+        return Err(format!("expected T2 id {pos_t2:?} > T1 id {pos_t1:?}"));
+    }
+
+    let g1 = store
+        .read_global(*cursor, 100)
+        .map_err(|e| format!("read_global after T2 commit: {e}"))?;
+    let g1_pos: Vec<GlobalPosition> = g1.iter().map(|r| r.position).collect();
+    if g1_pos != [pos_t2] {
+        return Err(format!(
+            "xid8 inversion round {round}: expected [{pos_t2:?}] after T2, got {g1_pos:?}"
+        ));
+    }
+    *cursor = pos_t2;
+
+    finish_t1_xid8_commit(t1, t1_in, id_t1, round)?;
+
+    let g2 = store
+        .read_global(*cursor, 100)
+        .map_err(|e| format!("read_global after T1 commit: {e}"))?;
+    let g2_pos: Vec<GlobalPosition> = g2.iter().map(|r| r.position).collect();
+    if g2_pos != [pos_t1] {
+        return Err(format!(
+            "xid8 inversion round {round}: failed to recover backward id {pos_t1:?} after cursor {pos_t2:?}, got {g2_pos:?}"
+        ));
+    }
+    *cursor = pos_t1;
+
+    let g3 = store
+        .read_global(*cursor, 100)
+        .map_err(|e| format!("read_global post-inversion drain: {e}"))?;
+    if !g3.is_empty() {
+        return Err(format!(
+            "xid8 inversion round {round}: expected 0 duplicate trailing rows, got {}",
+            g3.len()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_deterministic_xid8_inversions(
+    bench_url: &str,
+    schema: &str,
+    store: &PostgresStore,
+    start_cursor: GlobalPosition,
+    rounds: usize,
+) -> Result<usize, String> {
+    if schema.is_empty()
+        || !schema
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!("invalid benchmark schema {schema:?}"));
+    }
+    let pg_envs = parse_pg_env(bench_url)?;
+    let mut cursor = start_cursor;
+    for round in 0..rounds {
+        run_single_xid8_inversion(&pg_envs, schema, store, &mut cursor, round)?;
+    }
+    Ok(rounds)
+}
+
+struct EventReadTally {
+    out_of_order_reads: usize,
+    commit_id_inversions: usize,
+    duplicate_reads: usize,
+    missing_reads: usize,
+    unexpected_reads: usize,
+}
+
+fn tally_event_log_reads(
+    read_positions: &[ReadSample],
+    written_positions: &BTreeSet<GlobalPosition>,
+) -> EventReadTally {
+    let mut out_of_order_reads = 0_usize;
+    let mut commit_id_inversions = 0_usize;
+    let mut duplicate_reads = 0_usize;
+    let mut seen_read = BTreeSet::new();
+    let mut prev_pos: Option<GlobalPosition> = None;
+    let mut per_session_last: BTreeMap<SessionId, (GlobalPosition, spawn_core::event::SessionSeq)> =
+        BTreeMap::new();
+    for sample in read_positions {
+        if let Some(p) = prev_pos
+            && sample.position <= p
+        {
+            commit_id_inversions += 1;
+        }
+        prev_pos = Some(sample.position);
+        if let Some((last_pos, last_seq)) = per_session_last.get(&sample.session_id)
+            && (sample.position <= *last_pos
+                || sample.session_seq <= *last_seq
+                || sample.session_seq.0 != last_seq.0 + 1)
+        {
+            out_of_order_reads += 1;
+        }
+        let _ = per_session_last.insert(
+            sample.session_id.clone(),
+            (sample.position, sample.session_seq),
+        );
+        if !seen_read.insert(sample.position) {
+            duplicate_reads += 1;
+        }
+    }
+    EventReadTally {
+        out_of_order_reads,
+        commit_id_inversions,
+        duplicate_reads,
+        missing_reads: written_positions.difference(&seen_read).count(),
+        unexpected_reads: seen_read.difference(written_positions).count(),
+    }
+}
+
+fn run_event_log_stress(
+    base_store: &PostgresStore,
+    bench_url: &str,
+    schema: &str,
+    cfg: &Config,
+) -> Result<Value, String> {
     let initial_cursor = drain_initial_events(base_store)?;
     let total_events = cfg.sessions * cfg.events_per_session;
     let counters = EventCounters {
@@ -370,38 +641,10 @@ fn run_event_log_stress(base_store: &PostgresStore, cfg: &Config) -> Result<Valu
             (all_write_lats, all_written, read_lats, read_pos)
         });
     let wall_ms = wall_t0.elapsed().as_secs_f64() * 1000.0;
-
-    let mut out_of_order_reads = 0_usize;
-    let mut commit_id_inversions = 0_usize;
-    let mut duplicate_reads = 0_usize;
-    let mut seen_read = BTreeSet::new();
-    let mut prev_pos: Option<GlobalPosition> = None;
-    let mut per_session_last: BTreeMap<SessionId, (GlobalPosition, spawn_core::event::SessionSeq)> =
-        BTreeMap::new();
-    for sample in &read_positions {
-        if let Some(p) = prev_pos
-            && sample.position <= p
-        {
-            commit_id_inversions += 1;
-        }
-        prev_pos = Some(sample.position);
-        if let Some((last_pos, last_seq)) = per_session_last.get(&sample.session_id)
-            && (sample.position <= *last_pos
-                || sample.session_seq <= *last_seq
-                || sample.session_seq.0 != last_seq.0 + 1)
-        {
-            out_of_order_reads += 1;
-        }
-        let _ = per_session_last.insert(
-            sample.session_id.clone(),
-            (sample.position, sample.session_seq),
-        );
-        if !seen_read.insert(sample.position) {
-            duplicate_reads += 1;
-        }
-    }
-    let missing_reads = written_positions.difference(&seen_read).count();
-    let unexpected_reads = seen_read.difference(&written_positions).count();
+    let tally = tally_event_log_reads(&read_positions, &written_positions);
+    let end_cursor = read_positions.last().map_or(initial_cursor, |s| s.position);
+    let deterministic_inversions =
+        verify_deterministic_xid8_inversions(bench_url, schema, base_store, end_cursor, 4)?;
 
     Ok(json!({
         "writer_pool": cfg.writer_pool,
@@ -409,11 +652,13 @@ fn run_event_log_stress(base_store: &PostgresStore, cfg: &Config) -> Result<Valu
         "events_target": total_events,
         "events_written": written_positions.len(),
         "events_read": read_positions.len(),
-        "out_of_order_reads": out_of_order_reads,
-        "commit_id_inversions": commit_id_inversions,
-        "duplicate_reads": duplicate_reads,
-        "missing_reads": missing_reads,
-        "unexpected_reads": unexpected_reads,
+        "out_of_order_reads": tally.out_of_order_reads,
+        "concurrent_commit_id_inversions": tally.commit_id_inversions,
+        "deterministic_commit_id_inversions": deterministic_inversions,
+        "commit_id_inversions": tally.commit_id_inversions + deterministic_inversions,
+        "duplicate_reads": tally.duplicate_reads,
+        "missing_reads": tally.missing_reads,
+        "unexpected_reads": tally.unexpected_reads,
         "deadlocks": counters.deadlocks.load(Ordering::Relaxed),
         "write_errors": counters.write_errors.load(Ordering::Relaxed),
         "read_errors": counters.read_errors.load(Ordering::Relaxed),
@@ -703,160 +948,360 @@ impl AttributionGaps {
     }
 }
 
-struct TaskFixture {
-    task_id: i64,
-    agent: AgentId,
-    session: SessionId,
-    execution: ExecutionId,
+/// Built-in first-party model pricing table matching `crates/spawn-cli/src/cost.rs`.
+fn built_in_model_prices() -> Value {
+    json!({
+        "claude-fable-5-2": {"input": 8.0, "output": 40.0, "cache_write": 10.0, "cache_read": 0.2},
+        "claude-opus-5-5": {"input": 4.0, "output": 20.0, "cache_write": 5.0, "cache_read": 0.2},
+        "claude-sonnet-5-5": {"input": 2.0, "output": 10.0, "cache_write": 2.5, "cache_read": 0.1},
+        "claude-opus-4-8": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.5},
+        "claude-opus-4-7": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.5},
+        "claude-opus-4-6": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.5},
+        "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.3},
+        "claude-sonnet-4-5": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.3},
+        "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_write": 1.25, "cache_read": 0.1},
+    })
+}
+
+/// Convert Unix epoch milliseconds to RFC3339 / ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS.mmmZ`).
+fn format_utc_iso_ms(epoch_ms: i64) -> String {
+    let clamped = epoch_ms.max(0);
+    let secs = clamped / 1_000;
+    let millis = clamped % 1_000;
+    let days = secs / 86_400;
+    let rem_secs = secs % 86_400;
+    let hour = rem_secs / 3_600;
+    let minute = (rem_secs % 3_600) / 60;
+    let second = rem_secs % 60;
+
+    // Howard Hinnant civil-from-days algorithm.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+struct BridgeStartedExecution {
+    execution_id: ExecutionId,
     native_sid: String,
-    model_label: &'static str,
-    transcript_ref: String,
-    payload: Vec<u8>,
+    transcript_path: String,
+    terminal: TerminalName,
+    exit_file: String,
 }
 
-fn build_attribution_events(
-    idx: usize,
-    command_id: CommandId,
-    now_ms: i64,
-    fix: &TaskFixture,
-) -> Result<[(String, Source, EventKind); 6], String> {
-    let workspace = WorkspaceId::new("0:/workspaces/always-on-bench").map_err(|e| e.to_string())?;
-    Ok([
-        (
-            format!("native:{idx}"),
-            Source::Bridge,
-            EventKind::NativeSessionStarted {
-                engine: ENGINE.to_string(),
-                native_session_id: fix.native_sid.clone(),
-                transcript_path: Some(fix.transcript_ref.clone()),
-                engine_version: Some("2.0.0-bench".to_string()),
-            },
-        ),
-        (
-            format!("start:{idx}"),
-            Source::Bridge,
-            EventKind::ExecutionStarted {
-                engine: ENGINE.to_string(),
-                workspace,
-                command_id,
-                fork: None,
-                model: ModelProfile::Default,
-                transcript_from: Some(0),
-                launch: Some(LaunchSummary {
-                    relay_url: None,
-                    model: Some(fix.model_label.to_string()),
-                    small_model: None,
-                    config_dir: None,
-                }),
-            },
-        ),
-        (
-            format!("tool_s:{idx}"),
-            Source::Claude,
-            EventKind::ToolStarted {
-                tool_name: "edit_file".to_string(),
-                tool_use_id: format!("tu_{idx}"),
-                summary: Some("crates/demo/src/lib.rs".to_string()),
-                summary_whole: true,
-            },
-        ),
-        (
-            format!("tool_c:{idx}"),
-            Source::Claude,
-            EventKind::ToolCompleted {
-                tool_use_id: format!("tu_{idx}"),
-                duration_ms: Some(120),
-            },
-        ),
-        (
-            format!("usage:{idx}"),
-            Source::Claude,
-            EventKind::ModelUsage {
-                message_id: format!("msg_attr_{idx}"),
-                model: fix.model_label.to_string(),
-                at_ms: now_ms,
-                input_tokens: 4_000,
-                output_tokens: 1_200,
-                cache_write_tokens: 2_000,
-                cache_read_tokens: 8_000,
-            },
-        ),
-        (
-            format!("turn:{idx}"),
-            Source::Claude,
-            EventKind::TurnStopped {
-                input_tokens: Some(4_000),
-                output_tokens: Some(1_200),
-            },
-        ),
-    ])
+struct StartedEventScan {
+    started: bool,
+    native: Option<(String, String)>,
 }
 
-fn append_attribution_execution_events(
+fn find_started_execution(
     store: &PostgresStore,
-    idx: usize,
-    command_id: CommandId,
-    fix: &TaskFixture,
-) -> Result<i64, String> {
-    let now_ms = store
-        .database_now_ms()
-        .map_err(|e| format!("database_now_ms: {e}"))?;
-    let events = build_attribution_events(idx, command_id, now_ms, fix)?;
+    cursor: &mut GlobalPosition,
+    session_id: &SessionId,
+    execution_id: &ExecutionId,
+) -> Result<StartedEventScan, String> {
+    let mut started = false;
+    let mut native = None;
+    loop {
+        let batch = store
+            .read_global(*cursor, 200)
+            .map_err(|e| format!("read_global bridge start: {e}"))?;
+        if batch.is_empty() {
+            break;
+        }
+        for rec in &batch {
+            *cursor = rec.position;
+            if &rec.event.session_id != session_id
+                || rec.event.execution_id.as_ref() != Some(execution_id)
+            {
+                continue;
+            }
+            match &rec.event.kind {
+                EventKind::ExecutionStarted { .. } => started = true,
+                EventKind::NativeSessionStarted {
+                    native_session_id,
+                    transcript_path: Some(path),
+                    ..
+                } => native = Some((native_session_id.clone(), path.clone())),
+                _ => {}
+            }
+        }
+        if batch.len() < 200 {
+            break;
+        }
+    }
+    Ok(StartedEventScan { started, native })
+}
 
-    for (ev_key, ev_src, ev_kind) in events {
-        let _ = store
-            .append(NewEvent {
-                agent_id: fix.agent.clone(),
-                session_id: fix.session.clone(),
-                execution_id: Some(fix.execution.clone()),
-                source: ev_src,
-                source_event_id: Some(ev_key),
-                kind: ev_kind,
+fn drive_bridge_until_started(
+    bridge: &mut Bridge,
+    store: &PostgresStore,
+    mem_host: &MemoryStore,
+    session_id: &SessionId,
+    execution_id: &ExecutionId,
+    scan_cursor: &mut GlobalPosition,
+) -> Result<BridgeStartedExecution, String> {
+    let mut saw_started = false;
+    let mut native_pair: Option<(String, String)> = None;
+    for _ in 0..500 {
+        let _ = bridge
+            .work()
+            .map_err(|e| format!("bridge.work start: {e}"))?;
+        let _ = bridge
+            .poll()
+            .map_err(|e| format!("bridge.poll start: {e}"))?;
+        let scan = find_started_execution(store, scan_cursor, session_id, execution_id)?;
+        if scan.started {
+            saw_started = true;
+        }
+        if scan.native.is_some() {
+            native_pair = scan.native;
+        }
+        if saw_started
+            && let Some((native_sid, transcript_path)) = &native_pair
+            && let Some(launch) = mem_host.launches().into_iter().rev().find(|l| {
+                l.environment
+                    .iter()
+                    .any(|(k, v)| k == "SPAWN_EXECUTION_ID" && v == execution_id.as_str())
             })
-            .map_err(|e| format!("append attr event: {e}"))?;
+            && let Some(exit_file) = launch
+                .environment
+                .iter()
+                .find(|(k, _)| k == "SPAWN_EXIT_FILE")
+                .map(|(_, v)| v.clone())
+        {
+            return Ok(BridgeStartedExecution {
+                execution_id: execution_id.clone(),
+                native_sid: native_sid.clone(),
+                transcript_path: transcript_path.clone(),
+                terminal: launch.terminal,
+                exit_file,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Err(format!(
+        "bridge did not start execution {execution_id} for session {session_id}"
+    ))
+}
+
+struct AttrTaskSpec<'a> {
+    task_id: i64,
+    idx: usize,
+    model_profile: ModelProfile,
+    model_name: &'a str,
+}
+
+fn drive_bridge_execution(
+    bridge: &mut Bridge,
+    store: &PostgresStore,
+    mem_host: &MemoryStore,
+    archive: &LocalTranscriptArchive,
+    spec: &AttrTaskSpec<'_>,
+) -> Result<SessionId, String> {
+    let task_id = spec.task_id;
+    let idx = spec.idx;
+    let model_name = spec.model_name;
+    let worker = format!("attr{idx:03}");
+    let agent_id =
+        AgentId::new(format!("agent_worker_{worker}_{task_id}")).map_err(|e| e.to_string())?;
+    let session_id =
+        SessionId::new(format!("session_worker_{worker}_{task_id}")).map_err(|e| e.to_string())?;
+    let principal = Principal::new("always-on-attr").map_err(|e| e.to_string())?;
+    let mut scan_cursor = drain_initial_events(store)?;
+
+    let cmd_id = store
+        .submit(
+            &principal,
+            &Submission {
+                agent_id: agent_id.clone(),
+                session_id: session_id.clone(),
+                idempotency_key: IdempotencyKey::new(format!("attr-start:{task_id}:{idx}"))
+                    .map_err(|e| e.to_string())?,
+                action: CommandAction::Start {
+                    engine: ENGINE.to_string(),
+                    prompt: format!("Work task {task_id} on {model_name}"),
+                    parent_session_id: None,
+                    from: None,
+                    model: Some(spec.model_profile),
+                    charter: None,
+                    model_label: None,
+                },
+            },
+        )
+        .map_err(|e| format!("submit attribution start: {e}"))?;
+    let exec_id = ExecutionId::for_command(cmd_id);
+    mem_host.set_pane(&TerminalName::for_execution(&exec_id), "❯ ");
+
+    let started = drive_bridge_until_started(
+        bridge,
+        store,
+        mem_host,
+        &session_id,
+        &exec_id,
+        &mut scan_cursor,
+    )?;
+
+    let pg_now_ms = store
+        .database_now_ms()
+        .map_err(|e| format!("database_now_ms for transcript: {e}"))?;
+    let ts_iso = format_utc_iso_ms(pg_now_ms);
+    let transcript_lines = format!(
+        "{{\"type\":\"assistant\",\"uuid\":\"u-tool-{idx}\",\"timestamp\":\"{ts_iso}\",\"message\":{{\"id\":\"msg-t-{idx}-{task_id}\",\"model\":\"{model_name}\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"tu_{idx}_{task_id}\",\"name\":\"Edit\",\"input\":{{\"file_path\":\"src/task_{idx}.rs\"}}}}]}}}}\n\
+         {{\"type\":\"assistant\",\"uuid\":\"u-msg-{idx}\",\"timestamp\":\"{ts_iso}\",\"message\":{{\"id\":\"msg-u-{idx}-{task_id}\",\"model\":\"{model_name}\",\"content\":[{{\"type\":\"text\",\"text\":\"implemented task {task_id}\"}}],\"usage\":{{\"input_tokens\":4000,\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":8000,\"output_tokens\":1200}}}}}}\n\
+         {{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"u-turn-{idx}\"}}\n"
+    );
+    mem_host.append_file(&started.transcript_path, &transcript_lines);
+    let _ = bridge
+        .work()
+        .map_err(|e| format!("bridge.work transcript: {e}"))?;
+    let _ = bridge
+        .poll()
+        .map_err(|e| format!("bridge.poll transcript: {e}"))?;
+
+    let copies = archive
+        .copies(&agent_id, &started.native_sid)
+        .map_err(|e| format!("archive.copies: {e}"))?;
+    if copies.is_empty() {
+        return Err(format!(
+            "Bridge did not archive transcript for {} ({})",
+            agent_id, started.native_sid
+        ));
     }
 
-    // Real elapsed duration between execution.started and execution.ended (> 0 ms in PG).
-    std::thread::sleep(Duration::from_millis(6));
-    let _ = store
-        .append(NewEvent {
-            agent_id: fix.agent.clone(),
-            session_id: fix.session.clone(),
-            execution_id: Some(fix.execution.clone()),
-            source: Source::Bridge,
-            source_event_id: Some(format!("end:{idx}")),
-            kind: EventKind::ExecutionEnded {
-                cause: EndCause::Exited,
-                exit_code: Some(0),
-                signal: None,
-                evidence: None,
-            },
-        })
-        .map_err(|e| format!("append execution.ended: {e}"))?;
-
-    store
-        .database_now_ms()
-        .map_err(|e| format!("database_now_ms: {e}"))
+    mem_host.exit_on_next_check(&started.terminal, &started.exit_file, "0\n");
+    for _ in 0..50 {
+        let _ = bridge.work().map_err(|e| format!("bridge.work end: {e}"))?;
+        let _ = bridge.poll().map_err(|e| format!("bridge.poll end: {e}"))?;
+        let execs = store
+            .executions(&session_id)
+            .map_err(|e| format!("executions poll: {e}"))?;
+        if execs
+            .iter()
+            .any(|e| e.execution_id == started.execution_id && e.ended_at.is_some())
+        {
+            return Ok(session_id);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Err(format!(
+        "execution {} in session {session_id} did not end cleanly",
+        started.execution_id
+    ))
 }
 
-fn record_landing_and_provenance(
+fn find_native_sid_for_execution(
     store: &PostgresStore,
+    execution_id: &str,
+) -> Result<Option<String>, String> {
+    let mut cursor = GlobalPosition(0);
+    let mut found = None;
+    loop {
+        let batch = store
+            .read_global(cursor, 500)
+            .map_err(|e| format!("read_global native sid: {e}"))?;
+        if batch.is_empty() {
+            break;
+        }
+        for rec in &batch {
+            cursor = rec.position;
+            if rec.event.execution_id.as_ref().map(ExecutionId::as_str) == Some(execution_id)
+                && let EventKind::NativeSessionStarted {
+                    native_session_id, ..
+                } = &rec.event.kind
+            {
+                found = Some(native_session_id.clone());
+            }
+        }
+        if batch.len() < 500 {
+            break;
+        }
+    }
+    Ok(found)
+}
+
+fn read_archived_transcript_bytes(
+    archive: &LocalTranscriptArchive,
+    agent_id: &str,
+    native_sid: &str,
+) -> Result<Vec<u8>, String> {
+    let agent = AgentId::new(agent_id).map_err(|e| e.to_string())?;
+    let copies = archive
+        .copies(&agent, native_sid)
+        .map_err(|e| format!("archive.copies({agent_id}, {native_sid}): {e}"))?;
+    let mut full = Vec::new();
+    for (copy_idx, &len) in copies.iter().enumerate() {
+        let chunk = archive
+            .read(
+                &agent,
+                native_sid,
+                copy_idx,
+                0,
+                usize::try_from(len).unwrap_or(usize::MAX),
+            )
+            .map_err(|e| format!("archive.read({agent_id}, {native_sid}, {copy_idx}): {e}"))?;
+        full.extend_from_slice(&chunk);
+    }
+    Ok(full)
+}
+
+fn record_landed_provenance_from_system(
+    store: &PostgresStore,
+    archive: &LocalTranscriptArchive,
+    task_id: i64,
+    session_id: &SessionId,
+    cost_execs_by_id: &BTreeMap<String, &Value>,
     idx: usize,
-    ended_ms: i64,
-    fix: &TaskFixture,
 ) -> Result<(), String> {
+    let task_facts = store
+        .prov_task_facts(&[task_id])
+        .map_err(|e| format!("prov_task_facts: {e}"))?;
+    let agent_id = task_facts
+        .get(&task_id)
+        .map(|f| f.agent_id.clone())
+        .ok_or_else(|| format!("task {task_id} missing from mission_tasks"))?;
+    let execs = store
+        .executions(session_id)
+        .map_err(|e| format!("executions({session_id}): {e}"))?;
+    let exec_row = execs
+        .iter()
+        .find(|e| e.ended_at.is_some())
+        .ok_or_else(|| format!("session {session_id} missing ended execution"))?;
+    let execution_id = exec_row.execution_id.as_str().to_string();
+    let native_sid = find_native_sid_for_execution(store, &execution_id)?
+        .ok_or_else(|| format!("execution {execution_id} missing NativeSessionStarted in PG"))?;
+    let archived_bytes = read_archived_transcript_bytes(archive, &agent_id, &native_sid)?;
+    let archive_sha = sha256_of(&archived_bytes);
+    let transcript_ref = format!(
+        "archive/{agent_id}/{native_sid}.jsonl#sha256={}",
+        archive_sha.hex()
+    );
+    let model_label = cost_execs_by_id
+        .get(&execution_id)
+        .and_then(|row| row["models"].as_array())
+        .and_then(|models| models.first())
+        .and_then(|m| m["model"].as_str())
+        .map(str::to_string);
+
     store
-        .task_delivered(fix.task_id, i64::try_from(idx + 1).expect("fits i64"))
+        .task_delivered(task_id, i64::try_from(idx + 1).expect("fits i64"))
         .map_err(|e| format!("task_delivered: {e}"))?;
     let commit_hex = format!("{:040x}", idx + 1);
     let base_hex = format!("{:040x}", idx + 10_000);
     let _ = store
-        .task_reported_with(fix.task_id, "done", Some(&commit_hex))
+        .task_reported_with(task_id, "done", Some(&commit_hex))
         .map_err(|e| format!("task_reported_with: {e}"))?;
     let _ = store
         .integrator_record(&json!({
             "type": "task.gated",
-            "id": fix.task_id,
+            "id": task_id,
             "revision": 0,
             "verdict": "accepted",
             "base": base_hex,
@@ -866,12 +1311,15 @@ fn record_landing_and_provenance(
     let _ = store
         .integrator_record(&json!({
             "type": "task.landed",
-            "id": fix.task_id,
+            "id": task_id,
             "revision": 0,
             "from": base_hex,
             "to": commit_hex,
         }))
         .map_err(|e| format!("integrator_record landed: {e}"))?;
+    let at_ms = store
+        .database_now_ms()
+        .map_err(|e| format!("database_now_ms provenance: {e}"))?;
     let _ = store
         .record_change(
             &ProvChangeInput {
@@ -879,23 +1327,23 @@ fn record_landing_and_provenance(
                 rev: 1,
                 kind: ProvChangeKind::Land,
                 domain: "d6:bench".to_string(),
-                agent_id: fix.agent.as_str().to_string(),
-                execution_id: Some(fix.execution.as_str().to_string()),
-                task_id: Some(fix.task_id),
-                preset_id: Some("always-on-default".to_string()),
-                model_label: Some(fix.model_label.to_string()),
-                transcript_ref: Some(fix.transcript_ref.clone()),
+                agent_id,
+                execution_id: Some(execution_id),
+                task_id: Some(task_id),
+                preset_id: None,
+                model_label,
+                transcript_ref: Some(transcript_ref),
                 attributed: ProvAttributionSource::Host,
                 base: base_hex,
                 result: commit_hex,
                 boundary: ProvBoundary::Land,
-                at_ms: ended_ms,
+                at_ms,
             },
             &[ProvEntryInput {
                 path: format!("src/task_{idx}.rs"),
                 before: None,
-                after: Some(sha256_of(&fix.payload).to_string()),
-                size: Some(i64::try_from(fix.payload.len()).expect("fits i64")),
+                after: Some(archive_sha.to_string()),
+                size: Some(i64::try_from(archived_bytes.len()).expect("fits i64")),
                 class: ProvEntryClass::Content,
                 origin: None,
             }],
@@ -905,79 +1353,244 @@ fn record_landing_and_provenance(
     Ok(())
 }
 
-fn emit_one_attribution_task(
-    store: &PostgresStore,
-    archive: &LocalTranscriptArchive,
-    mission: i64,
-    idx: usize,
-    model_label: &'static str,
-) -> Result<TaskFixture, String> {
-    let worker = format!("attr{idx:03}");
-    let (engine_name, task_model_label) = if idx.is_multiple_of(2) {
-        ("claude", None)
-    } else {
-        ("codex", Some(model_label))
-    };
-    let task_id = store
-        .task_assign_direct(
-            mission,
-            "ephemeral",
-            &worker,
-            &format!("Synthetic attribution task {idx}"),
-            "default",
-            false,
-            false,
-            Some(engine_name),
-            task_model_label,
-        )
-        .map_err(|e| format!("task_assign_direct: {e}"))?;
-
-    let agent =
-        AgentId::new(format!("agent_worker_{worker}_{task_id}")).map_err(|e| e.to_string())?;
-    let session =
-        SessionId::new(format!("session_worker_{worker}_{task_id}")).map_err(|e| e.to_string())?;
-    let cmd_num = u64::try_from(9_000_000 + idx).expect("fits u64");
-    let command_id = CommandId(cmd_num);
-    let execution = ExecutionId::for_command(command_id);
-    let native_sid = format!("native-attr-{idx:03}");
-    let payload = format!(
-        "{{\"task_id\":{task_id},\"model\":{model_label:?},\"role\":\"assistant\",\"msg\":\"work_{idx}\"}}\n"
-    )
-    .into_bytes();
-
-    archive
-        .append(&agent, &native_sid, 0, 0, &payload)
-        .map_err(|e| format!("archive.append: {e}"))?;
-    let transcript_ref = format!(
-        "archive/{}/{native_sid}.jsonl#sha256={}",
-        agent.as_str(),
-        sha256_of(&payload).hex()
-    );
-
-    let fix = TaskFixture {
-        task_id,
-        agent,
-        session,
-        execution,
-        native_sid,
-        model_label,
-        transcript_ref,
-        payload,
-    };
-    let ended_ms = append_attribution_execution_events(store, idx, command_id, &fix)?;
-    record_landing_and_provenance(store, idx, ended_ms, &fix)?;
-
-    Ok(fix)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatchState {
+    Matched,
+    Mismatched,
 }
 
-fn emit_synthetic_attribution_tasks(
+impl MatchState {
+    fn from_bool(ok: bool) -> Self {
+        if ok { Self::Matched } else { Self::Mismatched }
+    }
+
+    fn is_matched(self) -> bool {
+        self == Self::Matched
+    }
+}
+
+#[derive(Clone)]
+struct ObservedLineage {
+    task_id: Option<i64>,
+    prov_task_id: Option<i64>,
+    agent_matches_task: MatchState,
+    agent_matches_execution: MatchState,
+    has_execution_id: MatchState,
+    model_matches_cost: MatchState,
+    transcript_ref_valid: MatchState,
+    duration_ms: Option<i64>,
+    cost_usd: Option<f64>,
+    unpriced_tokens: i64,
+    has_landing_record: MatchState,
+}
+
+fn evaluate_observed_lineage(obs: &ObservedLineage, gaps: &mut AttributionGaps) -> Option<i64> {
+    let mut ok = true;
+    if !obs.agent_matches_task.is_matched() || !obs.agent_matches_execution.is_matched() {
+        gaps.missing_agent_id += 1;
+        ok = false;
+    }
+    if !obs.has_execution_id.is_matched() {
+        gaps.missing_execution_id += 1;
+        ok = false;
+    }
+    if obs.task_id.is_none() || obs.prov_task_id != obs.task_id {
+        gaps.missing_task_id += 1;
+        ok = false;
+    }
+    if !obs.model_matches_cost.is_matched() {
+        gaps.missing_model_label += 1;
+        ok = false;
+    }
+    if !obs.transcript_ref_valid.is_matched() {
+        gaps.missing_transcript_ref += 1;
+        ok = false;
+    }
+    let dur_ms = match obs.duration_ms {
+        Some(ms) if ms > 0 => Some(ms),
+        _ => {
+            gaps.missing_duration_ms += 1;
+            ok = false;
+            None
+        }
+    };
+    let cost_ok = obs.cost_usd.is_some_and(|u| u > 0.0) && obs.unpriced_tokens == 0;
+    if !cost_ok {
+        gaps.missing_cost_or_tokens += 1;
+        ok = false;
+    }
+    if !obs.has_landing_record.is_matched() {
+        gaps.missing_landing_record += 1;
+        ok = false;
+    }
+    if ok {
+        gaps.tasks_fully_attributed += 1;
+    }
+    dur_ms
+}
+
+fn verify_transcript_ref_against_disk(
+    archive: &LocalTranscriptArchive,
+    agent_id: &str,
+    native_sid: &str,
+    recorded_ref: Option<&str>,
+) -> bool {
+    let Some(tref) = recorded_ref else {
+        return false;
+    };
+    let expected_prefix = format!("archive/{agent_id}/{native_sid}.jsonl#sha256=");
+    let Some(hex_digest) = tref.strip_prefix(&expected_prefix) else {
+        return false;
+    };
+    let Ok(bytes) = read_archived_transcript_bytes(archive, agent_id, native_sid) else {
+        return false;
+    };
+    if bytes.is_empty() || sha256_of(&bytes).hex() != hex_digest {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    text.lines()
+        .any(|line| ingest::claude_usage(line).is_some())
+}
+
+fn read_observed_task_lineage(
     store: &PostgresStore,
     archive: &LocalTranscriptArchive,
-    count: usize,
-) -> Result<(Vec<TaskFixture>, i64), String> {
+    task_id: i64,
+    session_id: &SessionId,
+    landed_tasks: &BTreeSet<i64>,
+    cost_tasks: &BTreeMap<i64, &Value>,
+    cost_execs_by_id: &BTreeMap<String, &Value>,
+) -> Result<ObservedLineage, String> {
+    let provs = store
+        .prov_changes_for_task(task_id)
+        .map_err(|e| format!("prov_changes_for_task: {e}"))?;
+    let prov = provs.first();
+
+    let task_facts = store
+        .prov_task_facts(&[task_id])
+        .map_err(|e| format!("prov_task_facts: {e}"))?;
+    let task_agent = task_facts.get(&task_id).map(|f| f.agent_id.as_str());
+
+    let execs = store
+        .executions(session_id)
+        .map_err(|e| format!("executions: {e}"))?;
+    let ended_exec = execs.iter().find(|e| e.ended_at.is_some());
+    let exec_id_str = ended_exec.map(|e| e.execution_id.as_str().to_string());
+    let exec_agents = match &exec_id_str {
+        Some(id) => store
+            .prov_execution_agents(std::slice::from_ref(id))
+            .map_err(|e| format!("prov_execution_agents: {e}"))?,
+        None => std::collections::HashMap::new(),
+    };
+    let event_agent = exec_id_str
+        .as_ref()
+        .and_then(|id| exec_agents.get(id))
+        .map(String::as_str);
+
+    let cost_row = cost_tasks.get(&task_id).copied();
+    let cost_exec_row = exec_id_str
+        .as_ref()
+        .and_then(|id| cost_execs_by_id.get(id))
+        .copied();
+    let cost_model = cost_exec_row
+        .and_then(|r| r["models"].as_array())
+        .and_then(|m| m.first())
+        .and_then(|m| m["model"].as_str());
+
+    let agent_matches_task = MatchState::from_bool(
+        prov.zip(task_agent)
+            .is_some_and(|(p, t_ag)| !p.agent_id.is_empty() && p.agent_id == t_ag),
+    );
+    let agent_matches_execution = MatchState::from_bool(
+        prov.zip(event_agent)
+            .is_some_and(|(p, e_ag)| p.agent_id == e_ag),
+    );
+    let has_execution_id = MatchState::from_bool(
+        prov.zip(exec_id_str.as_deref())
+            .is_some_and(|(p, eid)| p.execution_id.as_deref() == Some(eid)),
+    );
+    let model_matches_cost = MatchState::from_bool(
+        prov.zip(cost_model)
+            .is_some_and(|(p, m)| p.model_label.as_deref() == Some(m) && !m.is_empty()),
+    );
+
+    let native_sid = match &exec_id_str {
+        Some(eid) => find_native_sid_for_execution(store, eid)?,
+        None => None,
+    };
+    let transcript_ref_valid =
+        MatchState::from_bool(prov.zip(native_sid.as_deref()).is_some_and(|(p, nsid)| {
+            verify_transcript_ref_against_disk(
+                archive,
+                &p.agent_id,
+                nsid,
+                p.transcript_ref.as_deref(),
+            )
+        }));
+
+    Ok(ObservedLineage {
+        task_id: Some(task_id),
+        prov_task_id: prov.and_then(|p| p.task_id),
+        agent_matches_task,
+        agent_matches_execution,
+        has_execution_id,
+        model_matches_cost,
+        transcript_ref_valid,
+        duration_ms: ended_exec.and_then(|e| e.duration_ms),
+        cost_usd: cost_row.and_then(|r| r["usd"].as_f64()),
+        unpriced_tokens: cost_row
+            .and_then(|r| r["unpriced_tokens"].as_i64())
+            .unwrap_or(1),
+        has_landing_record: MatchState::from_bool(landed_tasks.contains(&task_id)),
+    })
+}
+
+type LineageMutation = (&'static str, fn(&mut ObservedLineage));
+
+fn run_negative_attribution_falsification(valid: &ObservedLineage) -> Result<usize, String> {
+    let mutations: [LineageMutation; 8] = [
+        ("missing_agent_id", |o| {
+            o.agent_matches_task = MatchState::Mismatched;
+        }),
+        ("missing_execution_id", |o| {
+            o.has_execution_id = MatchState::Mismatched;
+        }),
+        ("missing_task_id", |o| o.prov_task_id = None),
+        ("missing_model_label", |o| {
+            o.model_matches_cost = MatchState::Mismatched;
+        }),
+        ("missing_transcript_ref", |o| {
+            o.transcript_ref_valid = MatchState::Mismatched;
+        }),
+        ("missing_duration_ms", |o| o.duration_ms = Some(0)),
+        ("missing_cost_or_tokens", |o| o.unpriced_tokens = 1),
+        ("missing_landing_record", |o| {
+            o.has_landing_record = MatchState::Mismatched;
+        }),
+    ];
+    for (name, mutate) in mutations {
+        let mut mutated = valid.clone();
+        mutate(&mut mutated);
+        let mut gaps = AttributionGaps::default();
+        let _ = evaluate_observed_lineage(&mutated, &mut gaps);
+        if gaps.tasks_fully_attributed != 0 || gaps.total_field_gaps() == 0 {
+            return Err(format!(
+                "negative attribution falsification failed: mutating {name} did not cause ATTRIBUTION_COMPLETENESS to fail"
+            ));
+        }
+    }
+    Ok(mutations.len())
+}
+
+fn run_attribution_bridge_tasks(
+    store: &PostgresStore,
+    archive: &LocalTranscriptArchive,
+    cfg: &Config,
+) -> Result<Vec<(i64, SessionId)>, String> {
     let mission = store
         .mission_add(
-            "Always-on attribution completeness benchmark",
+            "Always-on Bridge attribution completeness benchmark",
             &json!(["/tmp/always-on-bench-source.git"]),
             "human",
         )
@@ -986,98 +1599,101 @@ fn emit_synthetic_attribution_tasks(
         .mission_configure(mission, Some("/bench/gate"), "gate", None, None)
         .map_err(|e| format!("mission_configure: {e}"))?;
 
-    let mut fixtures = Vec::with_capacity(count);
-    let models = ["claude-sonnet-4-6", "gpt-5.4"];
-    let base_now = store
-        .database_now_ms()
-        .map_err(|e| format!("database_now_ms: {e}"))?;
-    let window_start = base_now.saturating_sub(60_000);
+    let pg_bridge = Arc::new(
+        store
+            .new_connection()
+            .map_err(|e| format!("bridge pg new_connection: {e}"))?,
+    );
+    let mem_host = Arc::new(MemoryStore::new("always-on-bench", Arc::new(SystemClock)));
+    let mut bcfg = BridgeConfig::new("always-on-attr-bridge");
+    bcfg.claude_projects = "/projects".to_string();
+    bcfg.watch = Some(Arc::new(MemoryWatch::refusing()));
+    bcfg.recover_worker_leases = false;
+    let mut bridge = Bridge::new(
+        pg_bridge.clone(),
+        pg_bridge,
+        mem_host.clone(),
+        mem_host.clone(),
+        bcfg,
+    )
+    .with_transcript_archive(Arc::new(archive.clone()));
+    bridge
+        .recover()
+        .map_err(|e| format!("bridge.recover: {e}"))?;
 
-    for idx in 0..count {
-        let model_label = models[idx % models.len()];
-        fixtures.push(emit_one_attribution_task(
+    let models = [
+        (ModelProfile::Default, "claude-opus-5-5"),
+        (ModelProfile::Default, "claude-sonnet-4-6"),
+    ];
+    let mut tasks = Vec::with_capacity(cfg.attribution_tasks);
+    for idx in 0..cfg.attribution_tasks {
+        let (profile, model_name) = models[idx % models.len()];
+        let worker = format!("attr{idx:03}");
+        let task_id = store
+            .task_assign_direct(
+                mission,
+                "ephemeral",
+                &worker,
+                &format!("Bridge attribution task {idx}"),
+                "default",
+                false,
+                false,
+                Some("claude"),
+                None,
+            )
+            .map_err(|e| format!("task_assign_direct: {e}"))?;
+        let session_id = drive_bridge_execution(
+            &mut bridge,
             store,
+            &mem_host,
             archive,
-            mission,
-            idx,
-            model_label,
-        )?);
+            &AttrTaskSpec {
+                task_id,
+                idx,
+                model_profile: profile,
+                model_name,
+            },
+        )?;
+        tasks.push((task_id, session_id));
     }
-
-    Ok((fixtures, window_start))
+    Ok(tasks)
 }
 
-fn verify_task_lineage(
+fn collect_attribution_gaps(
     store: &PostgresStore,
     archive: &LocalTranscriptArchive,
-    fix: &TaskFixture,
+    tasks: &[(i64, SessionId)],
     landed_tasks: &BTreeSet<i64>,
     cost_tasks: &BTreeMap<i64, &Value>,
-    gaps: &mut AttributionGaps,
-) -> Result<Option<i64>, String> {
-    let mut ok = true;
-    let provs = store
-        .prov_changes_for_execution(fix.execution.as_str())
-        .map_err(|e| format!("prov_changes_for_execution: {e}"))?;
-    let prov = provs.first();
-    if prov.is_none_or(|p| p.agent_id != fix.agent.as_str()) {
-        gaps.missing_agent_id += 1;
-        ok = false;
+    cost_execs_by_id: &BTreeMap<String, &Value>,
+) -> Result<(AttributionGaps, i64, usize), String> {
+    let mut gaps = AttributionGaps::default();
+    let mut total_work_duration_ms = 0_i64;
+    let mut sample_observed = None;
+    for (task_id, session_id) in tasks {
+        let obs = read_observed_task_lineage(
+            store,
+            archive,
+            *task_id,
+            session_id,
+            landed_tasks,
+            cost_tasks,
+            cost_execs_by_id,
+        )?;
+        if sample_observed.is_none() {
+            sample_observed = Some(obs.clone());
+        }
+        if let Some(ms) = evaluate_observed_lineage(&obs, &mut gaps) {
+            total_work_duration_ms = total_work_duration_ms.saturating_add(ms);
+        }
     }
-    if prov.is_none_or(|p| p.execution_id.as_deref() != Some(fix.execution.as_str())) {
-        gaps.missing_execution_id += 1;
-        ok = false;
-    }
-    if prov.is_none_or(|p| p.task_id != Some(fix.task_id)) {
-        gaps.missing_task_id += 1;
-        ok = false;
-    }
-    if prov.is_none_or(|p| p.model_label.as_deref() != Some(fix.model_label)) {
-        gaps.missing_model_label += 1;
-        ok = false;
-    }
-    let archive_ok = archive
-        .read(&fix.agent, &fix.native_sid, 0, 0, fix.payload.len())
-        .is_ok_and(|bytes| bytes == fix.payload);
-    if !archive_ok
-        || prov.is_none_or(|p| p.transcript_ref.as_deref() != Some(fix.transcript_ref.as_str()))
-    {
-        gaps.missing_transcript_ref += 1;
-        ok = false;
-    }
-
-    let execs = store
-        .executions(&fix.session)
-        .map_err(|e| format!("executions: {e}"))?;
-    let exec_dur = execs
-        .iter()
-        .find(|e| e.execution_id == fix.execution && e.ended_at.is_some())
-        .and_then(|e| e.duration_ms);
-    let dur_ms = match exec_dur {
-        Some(ms) if ms > 0 => Some(ms),
-        _ => {
-            gaps.missing_duration_ms += 1;
-            ok = false;
-            None
+    let neg_checked = match sample_observed.as_ref() {
+        Some(obs) => run_negative_attribution_falsification(obs)?,
+        None => {
+            return Err("no observed attribution task to run negative falsification".to_string());
         }
     };
-
-    let cost_ok = cost_tasks.get(&fix.task_id).is_some_and(|row| {
-        row["usd"].as_f64().is_some_and(|u| u > 0.0)
-            && row["unpriced_tokens"].as_i64().unwrap_or(1) == 0
-    });
-    if !cost_ok {
-        gaps.missing_cost_or_tokens += 1;
-        ok = false;
-    }
-    if !landed_tasks.contains(&fix.task_id) {
-        gaps.missing_landing_record += 1;
-        ok = false;
-    }
-    if ok {
-        gaps.tasks_fully_attributed += 1;
-    }
-    Ok(dur_ms)
+    Ok((gaps, total_work_duration_ms, neg_checked))
 }
 
 fn verify_attribution_completeness(
@@ -1085,27 +1701,43 @@ fn verify_attribution_completeness(
     archive: &LocalTranscriptArchive,
     cfg: &Config,
 ) -> Result<Value, String> {
-    let (fixtures, window_start) =
-        emit_synthetic_attribution_tasks(store, archive, cfg.attribution_tasks)?;
+    let window_start = store
+        .database_now_ms()
+        .map_err(|e| format!("database_now_ms window start: {e}"))?
+        .saturating_sub(60_000);
+    let tasks = run_attribution_bridge_tasks(store, archive, cfg)?;
 
-    let prices = json!({
-        "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
-        "gpt-5.4": {"input": 2.5, "output": 10.0, "cache_write": 2.50, "cache_read": 0.25},
-    });
     let recorded_msgs = store
-        .cost_record(&prices)
+        .cost_record(&built_in_model_prices())
         .map_err(|e| format!("cost_record: {e}"))?;
     let window_end = store
         .database_now_ms()
-        .map_err(|e| format!("database_now_ms: {e}"))?
+        .map_err(|e| format!("database_now_ms window_end: {e}"))?
         .saturating_add(60_000);
     let cost = store
         .cost_window(window_start, window_end)
         .map_err(|e| format!("cost_window: {e}"))?;
+    let cost_execs_by_id: BTreeMap<String, &Value> = cost["executions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["execution"].as_str().map(|id| (id.to_string(), row)))
+        .collect();
+
+    for (idx, (task_id, session_id)) in tasks.iter().enumerate() {
+        record_landed_provenance_from_system(
+            store,
+            archive,
+            *task_id,
+            session_id,
+            &cost_execs_by_id,
+            idx,
+        )?;
+    }
+
     let facts = store
         .scorecard_facts(window_end)
         .map_err(|e| format!("scorecard_facts: {e}"))?;
-
     let landed_tasks: BTreeSet<i64> = facts["control"]
         .as_array()
         .into_iter()
@@ -1120,17 +1752,16 @@ fn verify_attribution_completeness(
         .filter_map(|row| row["task"].as_i64().map(|id| (id, row)))
         .collect();
 
-    let mut gaps = AttributionGaps::default();
-    let mut total_work_duration_ms = 0_i64;
-    for fix in &fixtures {
-        if let Some(ms) =
-            verify_task_lineage(store, archive, fix, &landed_tasks, &cost_tasks, &mut gaps)?
-        {
-            total_work_duration_ms = total_work_duration_ms.saturating_add(ms);
-        }
-    }
+    let (gaps, total_work_duration_ms, neg_checked) = collect_attribution_gaps(
+        store,
+        archive,
+        &tasks,
+        &landed_tasks,
+        &cost_tasks,
+        &cost_execs_by_id,
+    )?;
 
-    let total_tasks = fixtures.len();
+    let total_tasks = tasks.len();
     let total_field_gaps = gaps.total_field_gaps();
     let completeness_pct = if total_tasks == 0 {
         0.0
@@ -1145,6 +1776,7 @@ fn verify_attribution_completeness(
         + tokens["cache_read"].as_i64().unwrap_or(0);
 
     Ok(json!({
+        "bridge_driven": true,
         "tasks_total": total_tasks,
         "tasks_fully_attributed": gaps.tasks_fully_attributed,
         "attribution_gaps": total_field_gaps,
@@ -1154,6 +1786,8 @@ fn verify_attribution_completeness(
         "total_tokens": total_tokens,
         "total_cost_usd": cost["total"]["usd"].as_f64().unwrap_or(0.0),
         "unpriced_tokens": cost["total"]["unpriced_tokens"].as_i64().unwrap_or(0),
+        "negative_falsification_passed": true,
+        "negative_cases_checked": neg_checked,
         "field_gaps": {
             "agent_id": gaps.missing_agent_id,
             "execution_id": gaps.missing_execution_id,
@@ -1167,6 +1801,134 @@ fn verify_attribution_completeness(
     }))
 }
 
+fn parse_pg_env(url: &str) -> Result<Vec<(String, String)>, String> {
+    let rest = url
+        .strip_prefix("postgres://")
+        .or_else(|| url.strip_prefix("postgresql://"))
+        .ok_or_else(|| "database URL must start with postgres:// or postgresql://".to_string())?;
+    let (before_query, query_opt) = rest.split_once('?').unwrap_or((rest, ""));
+    let (authority, db_opt) = before_query.split_once('/').unwrap_or((before_query, ""));
+    let mut envs = BTreeMap::new();
+    let hostport = if let Some((userinfo, hp)) = authority.rsplit_once('@') {
+        if let Some((user, pass)) = userinfo.split_once(':') {
+            if !user.is_empty() {
+                envs.insert("PGUSER".to_string(), user.to_string());
+            }
+            if !pass.is_empty() {
+                envs.insert("PGPASSWORD".to_string(), pass.to_string());
+            }
+        } else if !userinfo.is_empty() {
+            envs.insert("PGUSER".to_string(), userinfo.to_string());
+        }
+        hp
+    } else {
+        authority
+    };
+    if let Some((host, port)) = hostport.rsplit_once(':')
+        && !hostport.ends_with(']')
+    {
+        if !host.is_empty() {
+            envs.insert(
+                "PGHOST".to_string(),
+                host.trim_matches(['[', ']']).to_string(),
+            );
+        }
+        if !port.is_empty() {
+            envs.insert("PGPORT".to_string(), port.to_string());
+        }
+    } else if !hostport.is_empty() {
+        envs.insert(
+            "PGHOST".to_string(),
+            hostport.trim_matches(['[', ']']).to_string(),
+        );
+    }
+    if !db_opt.is_empty() {
+        envs.insert("PGDATABASE".to_string(), db_opt.to_string());
+    }
+    for pair in query_opt.split('&').filter(|p| !p.is_empty()) {
+        if let Some((k, v)) = pair.split_once('=')
+            && !v.is_empty()
+        {
+            match k {
+                "host" => {
+                    envs.insert("PGHOST".to_string(), v.to_string());
+                }
+                "port" => {
+                    envs.insert("PGPORT".to_string(), v.to_string());
+                }
+                "dbname" => {
+                    envs.insert("PGDATABASE".to_string(), v.to_string());
+                }
+                "user" => {
+                    envs.insert("PGUSER".to_string(), v.to_string());
+                }
+                "password" => {
+                    envs.insert("PGPASSWORD".to_string(), v.to_string());
+                }
+                "sslmode" => {
+                    envs.insert("PGSSLMODE".to_string(), v.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    envs.insert("PGCONNECT_TIMEOUT".to_string(), "5".to_string());
+    Ok(envs.into_iter().collect())
+}
+
+struct BenchSchemaGuard {
+    url: String,
+    schema: String,
+}
+
+impl BenchSchemaGuard {
+    fn new(url: String, schema: String) -> Result<Self, String> {
+        if schema.is_empty()
+            || !schema
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(format!("invalid disposable schema name: {schema:?}"));
+        }
+        Ok(Self { url, schema })
+    }
+}
+
+impl Drop for BenchSchemaGuard {
+    fn drop(&mut self) {
+        let Ok(pg_envs) = parse_pg_env(&self.url) else {
+            return;
+        };
+        let sql = format!(
+            "SET lock_timeout = '5s'; DROP SCHEMA IF EXISTS {} CASCADE;",
+            self.schema
+        );
+        let mut cmd = Command::new("psql");
+        cmd.args(["-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", &sql])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        for (k, v) in pg_envs {
+            cmd.env(k, v);
+        }
+        match cmd.output() {
+            Ok(out) if !out.status.success() => {
+                eprintln!(
+                    "always_on_control_plane_bench: schema cleanup warning for {}: {}",
+                    self.schema,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "always_on_control_plane_bench: schema cleanup skipped for {}: {err}",
+                    self.schema
+                );
+            }
+            Ok(_) => {}
+        }
+    }
+}
+
 fn run(cfg: &Config) -> Result<Value, String> {
     let bench_url = env::var("SPAWN_BENCH_DATABASE_URL").map_err(|_| {
         "SPAWN_BENCH_DATABASE_URL must be set to a disposable benchmark database URL".to_string()
@@ -1175,14 +1937,16 @@ fn run(cfg: &Config) -> Result<Value, String> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let schema = format!("spawn_always_on_{}_{nanos:x}", std::process::id());
+    let _schema_guard = BenchSchemaGuard::new(bench_url.clone(), schema.clone())?;
     let base_store = PostgresStore::connect_in_schema(&bench_url, &schema)
         .map_err(|e| format!("connect benchmark schema {schema}: {e}"))?;
     let scratch_archive = ScratchArchive::new(cfg.archive_root.clone())?;
     let archive = LocalTranscriptArchive::new(scratch_archive.0.clone());
 
-    let event_log = run_event_log_stress(&base_store, cfg)?;
+    let event_log = run_event_log_stress(&base_store, &bench_url, &schema, cfg)?;
     let shard_claims = run_shard_claim_stress(&base_store, cfg)?;
     let attribution = verify_attribution_completeness(&base_store, &archive, cfg)?;
+    drop(base_store);
 
     let created_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1227,5 +1991,65 @@ fn main() {
             eprintln!("{err}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utc_iso_roundtrips_with_ingest_parser() {
+        for ts in [0_i64, 1_700_000_000_123, 1_764_300_000_987] {
+            let iso = format_utc_iso_ms(ts);
+            assert_eq!(ingest::utc_ms(&iso), Some(ts), "roundtrip failed for {iso}");
+        }
+    }
+
+    #[test]
+    fn pg_env_parser_handles_unix_socket_override() {
+        let envs: BTreeMap<String, String> = parse_pg_env(
+            "postgres://spawn@127.0.0.1:65511/bench_db?host=/tmp/pgsock&sslmode=disable",
+        )
+        .expect("parse url")
+        .into_iter()
+        .collect();
+        assert_eq!(envs.get("PGUSER").map(String::as_str), Some("spawn"));
+        assert_eq!(envs.get("PGHOST").map(String::as_str), Some("/tmp/pgsock"));
+        assert_eq!(envs.get("PGPORT").map(String::as_str), Some("65511"));
+        assert_eq!(envs.get("PGDATABASE").map(String::as_str), Some("bench_db"));
+        assert_eq!(envs.get("PGSSLMODE").map(String::as_str), Some("disable"));
+    }
+
+    #[test]
+    fn attribution_negative_falsification_catches_all_eight_gaps() {
+        let valid = ObservedLineage {
+            task_id: Some(42),
+            prov_task_id: Some(42),
+            agent_matches_task: MatchState::Matched,
+            agent_matches_execution: MatchState::Matched,
+            has_execution_id: MatchState::Matched,
+            model_matches_cost: MatchState::Matched,
+            transcript_ref_valid: MatchState::Matched,
+            duration_ms: Some(12),
+            cost_usd: Some(0.05),
+            unpriced_tokens: 0,
+            has_landing_record: MatchState::Matched,
+        };
+        let mut baseline_gaps = AttributionGaps::default();
+        assert_eq!(
+            evaluate_observed_lineage(&valid, &mut baseline_gaps),
+            Some(12)
+        );
+        assert_eq!(baseline_gaps.tasks_fully_attributed, 1);
+        assert_eq!(baseline_gaps.total_field_gaps(), 0);
+        assert_eq!(run_negative_attribution_falsification(&valid), Ok(8));
+
+        let mut zero_usd = valid;
+        zero_usd.cost_usd = Some(0.0);
+        let mut zero_gaps = AttributionGaps::default();
+        let _ = evaluate_observed_lineage(&zero_usd, &mut zero_gaps);
+        assert_eq!(zero_gaps.tasks_fully_attributed, 0);
+        assert_eq!(zero_gaps.missing_cost_or_tokens, 1);
     }
 }

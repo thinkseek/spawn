@@ -11,20 +11,25 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use spawn_cas::{
-    Digest, GIT_POINTER_THRESHOLD, GitOid, Snapshot, git_blob_oid_of_bytes, git_pointer_bytes,
+    Digest, GIT_POINTER_THRESHOLD, GitOid, RefJournal, Snapshot, git_blob_oid_of_bytes,
+    git_pointer_bytes,
 };
 use spawn_core::id::{AgentId, BranchName, WorkspaceId};
 use spawn_core::port::{BaseMerge, Commit, TranscriptArchive, WorkspaceStore};
 use spawn_host::d6_workspace::L1TmpfsPolicy;
+use spawn_host::merkle_merge::merge_snapshots;
 use spawn_host::{
     CasMerkleStore, D6RefKind, D6StoreError, D6Workspace, GitWorkspace, LedgerRef, LedgerSnapshot,
     LocalTranscriptArchive, RefLedger, ShadowD6Workspace, ShadowOracleMetrics, format_commit_body,
@@ -36,31 +41,35 @@ const USAGE: &str = "spawn storage benchmark\n\
 \n\
 Usage: cargo run --release -p spawn-host --example storage_benchmark -- [options]\n\
 \n\
-  --root <new-directory>     Scratch root (default: a unique temporary path)\n\
-  --source-revision <sha>    Spawn source revision recorded in the report\n\
-  --backend <git|d6|shadow>  Storage backend (default: git)\n\
-  --concurrency <n>          Concurrent branch workers (default: 1)\n\
-  --pg-pool-size <n>         Shared PG connection pool size for d6 (0 = 1/worker)\n\
-  --tmpfs-root <directory>   Enable bounded L1 tmpfs upperdir root for d6/shadow\n\
-  --tmpfs-budget-mb <n>      L1 tmpfs budget in MiB when --tmpfs-root is set (default: 2048)\n\
-  --iterations <n>           Measured cycles per worker (default: 40)\n\
-  --warmup <n>               Warm-up cycles per worker (default: 5)\n\
-  --files <n>                Workspace files (default: 512)\n\
-  --file-bytes <n>           Bytes per workspace file (default: 4096)\n\
-  --edits <n>                Files changed before each checkpoint (default: 4)\n\
-  --transcript-bytes <n>     Durable transcript append per cycle (default: 16384)\n\
-  --oversized-file-bytes <n> Add a file over the cap (must exceed --file-bytes)\n\
-  --recreate-every <n>       Drop the branch before every nth checkpoint; 0 disables\n\
-  --remount-every <n>        Unmount/mount every n cycles; 0 disables (default: 0)\n\
-  --land-branches            Land all worker branches onto main and measure delta bytes\n\
-  --crash-restart-drill      Reopen D6 CAS/PG stores and verify 0 lost refs/commits/blobs\n\
-  --keep                     Keep the scratch root after a successful run\n\
-  --help                     Show this help\n\
+  --root <new-directory>        Scratch root (default: a unique temporary path)\n\
+  --source-revision <sha>       Spawn source revision recorded in the report\n\
+  --backend <git|d6|shadow>     Storage backend (default: git)\n\
+  --concurrency <n>             Concurrent branch workers (default: 1)\n\
+  --pg-pool-size <n>            Shared PG connection pool size for d6 (0 = 1/worker)\n\
+  --tmpfs-root <directory>      Enable bounded L1 tmpfs upperdir root for d6/shadow\n\
+  --tmpfs-budget-mb <n>         L1 tmpfs budget in MiB when --tmpfs-root is set (default: 2048)\n\
+  --iterations <n>              Measured cycles per worker (default: 40)\n\
+  --warmup <n>                  Warm-up cycles per worker (default: 5)\n\
+  --files <n>                   Workspace files (default: 512)\n\
+  --file-bytes <n>              Bytes per workspace file (default: 4096)\n\
+  --edits <n>                   Files changed before each checkpoint (default: 4)\n\
+  --transcript-bytes <n>        Durable transcript append per cycle (default: 16384)\n\
+  --oversized-file-bytes <n>    Add a file over the cap (must exceed --file-bytes)\n\
+  --recreate-every <n>          Drop the branch before every nth checkpoint; 0 disables\n\
+  --remount-every <n>           Unmount/mount every n cycles; 0 disables (default: 0)\n\
+  --land-branches               Concurrently 3-way merge and land all worker branches onto main\n\
+  --land-payload-bytes <n>      Unique branch deliverable bytes per landing (default: 131072)\n\
+  --crash-restart-drill         Run cross-process SIGKILL + torn-journal + reopen drill\n\
+  --save-crash-manifest <path>  Write crash manifest JSON for post-PG-restart verification\n\
+  --keep                        Keep the scratch root after a successful run\n\
+  --help                        Show this help\n\
 \n\
 SPAWN_BENCH_DATABASE_URL optionally enables PostgreSQL writes (and is required for\n\
 --backend d6|shadow). It must name a dedicated benchmark database, never the live store.\n";
 
 const LAND_DELTA_SLO_BYTES: u64 = 50 * 1024 * 1024;
+const DEFAULT_LAND_PAYLOAD_BYTES: usize = 128 * 1024;
+const BRANCH_INIT_FILES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -109,7 +118,9 @@ struct Config {
     recreate_every: usize,
     remount_every: usize,
     land_branches: bool,
+    land_payload_bytes: usize,
     crash_restart_drill: bool,
+    save_crash_manifest: Option<PathBuf>,
     keep: bool,
 }
 
@@ -133,7 +144,9 @@ impl Default for Config {
             recreate_every: 0,
             remount_every: 0,
             land_branches: false,
+            land_payload_bytes: DEFAULT_LAND_PAYLOAD_BYTES,
             crash_restart_drill: false,
+            save_crash_manifest: None,
             keep: false,
         }
     }
@@ -164,9 +177,10 @@ fn validate_config(config: &Config) -> Result<(), String> {
         || config.edits == 0
         || config.edits > config.files
         || config.transcript_bytes == 0
+        || config.land_payload_bytes == 0
     {
         return Err(
-            "concurrency, iterations, files, file-bytes, edits and transcript-bytes must be positive; edits cannot exceed files"
+            "concurrency, iterations, files, file-bytes, edits, transcript-bytes and land-payload-bytes must be positive; edits cannot exceed files"
                 .to_string(),
         );
     }
@@ -191,6 +205,9 @@ fn validate_config(config: &Config) -> Result<(), String> {
     if (config.land_branches || config.crash_restart_drill) && config.backend != Backend::D6 {
         return Err("--land-branches and --crash-restart-drill require --backend d6".to_string());
     }
+    if config.save_crash_manifest.is_some() && !config.crash_restart_drill {
+        return Err("--save-crash-manifest requires --crash-restart-drill".to_string());
+    }
     if let Some(revision) = &config.source_revision
         && (revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()))
     {
@@ -201,7 +218,11 @@ fn validate_config(config: &Config) -> Result<(), String> {
         .checked_add(config.iterations)
         .and_then(|cycles| cycles.checked_sub(1))
         .ok_or_else(|| "warmup plus iterations is too large".to_string())?;
-    let marker_bytes = format!("cycle={last_cycle} edit={}", config.edits - 1).len();
+    let marker_bytes = format!(
+        "// cycle={last_cycle} edit={} worker=999\n",
+        config.edits - 1
+    )
+    .len();
     if config.file_bytes < marker_bytes {
         return Err(format!(
             "--file-bytes must be at least {marker_bytes} to hold the edit marker"
@@ -265,7 +286,16 @@ fn config() -> Result<Option<Config>, String> {
                 config.remount_every = number(&mut arguments, "--remount-every")?;
             }
             "--land-branches" => config.land_branches = true,
+            "--land-payload-bytes" => {
+                config.land_payload_bytes = number(&mut arguments, "--land-payload-bytes")?;
+            }
             "--crash-restart-drill" => config.crash_restart_drill = true,
+            "--save-crash-manifest" => {
+                config.save_crash_manifest =
+                    Some(PathBuf::from(arguments.next().ok_or_else(|| {
+                        "--save-crash-manifest needs a path".to_string()
+                    })?));
+            }
             "--keep" => config.keep = true,
             "--help" | "-h" => return Ok(None),
             _ => return Err(format!("unknown option {argument:?}\n\n{USAGE}")),
@@ -423,31 +453,141 @@ fn directory_size(root: &Path) -> Result<DirStats, String> {
     Ok(stats)
 }
 
+fn strict_directory_size(root: &Path) -> Result<DirStats, String> {
+    let meta =
+        fs::symlink_metadata(root).map_err(|error| format!("stat {}: {error}", root.display()))?;
+    if !meta.is_dir() {
+        return Err(format!("{} is not a directory", root.display()));
+    }
+    let mut pending = vec![root.to_path_buf()];
+    let mut stats = DirStats::default();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("read {}: {error}", directory.display()))?
+        {
+            let entry = entry.map_err(|error| format!("read directory entry: {error}"))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("stat {}: {error}", path.display()))?;
+            if kind.is_symlink() {
+                return Err(format!("unexpected symlink in CAS: {}", path.display()));
+            }
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file() {
+                stats.bytes = stats.bytes.saturating_add(
+                    entry
+                        .metadata()
+                        .map_err(|error| format!("stat {}: {error}", path.display()))?
+                        .len(),
+                );
+                stats.files += 1;
+            } else {
+                return Err(format!("unexpected file type in CAS: {}", path.display()));
+            }
+        }
+    }
+    Ok(stats)
+}
+
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn fill_bytes(&mut self, buf: &mut [u8]) {
+        for chunk in buf.chunks_mut(8) {
+            let word = self.next_u64().to_le_bytes();
+            chunk.copy_from_slice(&word[..chunk.len()]);
+        }
+    }
+}
+
+/// Generate mixed structured-header + high-entropy PRNG bytes so neither intra-repo
+/// files nor oversized FastCDC payloads collapse via single-byte repetition.
+fn fill_mixed_payload(seed: u64, marker: &str, size: usize) -> Vec<u8> {
+    let mut out = vec![0_u8; size];
+    let mut pos = 0_usize;
+    let marker_bytes = marker.as_bytes();
+    let take_marker = marker_bytes.len().min(size);
+    out[..take_marker].copy_from_slice(&marker_bytes[..take_marker]);
+    pos += take_marker;
+
+    let mut rng = SplitMix64::new(seed);
+    let mut block_idx = 0_u64;
+    while pos < size {
+        if block_idx.is_multiple_of(3) {
+            let header = format!(
+                "// block={block_idx:06} seed={seed:016x} token={:016x}\n",
+                rng.next_u64()
+            );
+            let n = header.len().min(size - pos);
+            out[pos..pos + n].copy_from_slice(&header.as_bytes()[..n]);
+            pos += n;
+        } else {
+            let len = (size - pos).min(1536);
+            rng.fill_bytes(&mut out[pos..pos + len]);
+            pos += len;
+        }
+        block_idx += 1;
+    }
+    out
+}
+
 fn seed_workspace(workspace: &Path, config: &Config) -> Result<(), String> {
-    let payload = vec![b's'; config.file_bytes];
     for index in 0..config.files {
         let path = workspace.join(format!("tree/{:04}/{:06}.txt", index % 32, index));
         fs::create_dir_all(path.parent().expect("a seeded file has a parent"))
             .map_err(|error| format!("create {}: {error}", path.display()))?;
+        let seed = 0x5345_4544_u64.wrapping_mul((index as u64).wrapping_add(1));
+        let marker = format!("// seed index={index}\n");
+        let payload = fill_mixed_payload(seed, &marker, config.file_bytes);
         fs::write(&path, &payload).map_err(|error| format!("write {}: {error}", path.display()))?;
     }
     if let Some(bytes) = config.oversized_file_bytes {
-        fs::write(workspace.join("oversized.bin"), vec![b'o'; bytes])
+        let payload = fill_mixed_payload(0x4F56_4552_5349_5A45, "BINv1\n", bytes);
+        fs::write(workspace.join("oversized.bin"), payload)
             .map_err(|error| format!("write the oversized benchmark file: {error}"))?;
     }
     Ok(())
 }
 
-fn edit_workspace(workspace: &Path, config: &Config, cycle: usize) -> Result<(), String> {
+fn edit_workspace(
+    workspace: &Path,
+    config: &Config,
+    worker_idx: usize,
+    cycle: usize,
+    d6_disjoint: bool,
+) -> Result<(), String> {
     for edit in 0..config.edits {
-        let index = (cycle * config.edits + edit) % config.files;
-        let path = workspace.join(format!("tree/{:04}/{:06}.txt", index % 32, index));
-        let fill = b'a'
-            + u8::try_from(cycle % 26)
-                .map_err(|_| "cycle fill byte does not fit u8".to_string())?;
-        let mut payload = vec![fill; config.file_bytes];
-        let marker = format!("cycle={cycle} edit={edit}");
-        payload[..marker.len()].copy_from_slice(marker.as_bytes());
+        let slot = (cycle * config.edits + edit) % config.files.max(1);
+        let path = if d6_disjoint {
+            let dir_slot = slot % 16;
+            workspace.join(format!("branches/w{worker_idx:03}/work_{dir_slot:04}.txt"))
+        } else {
+            workspace.join(format!("tree/{:04}/{:06}.txt", slot % 32, slot))
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+        let seed = ((worker_idx as u64).wrapping_add(1) << 40)
+            ^ ((cycle as u64).wrapping_add(1) << 16)
+            ^ ((edit as u64).wrapping_add(1) << 1)
+            ^ 0x4544_4954;
+        let marker = format!("// cycle={cycle} edit={edit} worker={worker_idx}\n");
+        let payload = fill_mixed_payload(seed, &marker, config.file_bytes);
         fs::write(&path, payload).map_err(|error| format!("edit {}: {error}", path.display()))?;
     }
     Ok(())
@@ -839,11 +979,21 @@ fn setup_accepted_task(
     store
         .mission_configure(mission, Some("/scenarios"), "gate", None, None)
         .map_err(|e| format!("mission_configure: {e}"))?;
+    create_accepted_landing_task(store, mission, "w_bench", base_oid, candidate_oid)
+}
+
+fn create_accepted_landing_task(
+    store: &PostgresStore,
+    mission: i64,
+    worker: &str,
+    base_oid: &GitOid,
+    candidate_oid: &GitOid,
+) -> Result<i64, String> {
     let task = store
         .task_assign(
             mission,
             "ephemeral",
-            "w_bench",
+            worker,
             "land benchmark main",
             "default",
         )
@@ -872,6 +1022,7 @@ fn d6_seed_initial_main(
     ledger: &PgRefLedger,
     cas: &CasMerkleStore,
     project: &str,
+    config: &Config,
 ) -> Result<LedgerSnapshot, String> {
     let dummy = BranchName::new("agent_bench_bootstrap").map_err(|e| e.to_string())?;
     let _ = store
@@ -886,15 +1037,47 @@ fn d6_seed_initial_main(
     let (rd_d, rd_len) = cas
         .put_bytes_blob(b"benchmark base main\n")
         .map_err(|e| e.to_string())?;
+
+    let mut owned_blobs: Vec<(Vec<Vec<u8>>, Digest, u64)> =
+        Vec::with_capacity(config.files.saturating_add(3));
+    owned_blobs.push((vec![b".gitignore".to_vec()], gi_d, gi_len));
+    owned_blobs.push((vec![b"README.md".to_vec()], rd_d, rd_len));
+
+    for index in 0..config.files {
+        let seed = 0x5345_4544_u64.wrapping_mul((index as u64).wrapping_add(1));
+        let marker = format!("// base-main index={index}\n");
+        let payload = fill_mixed_payload(seed, &marker, config.file_bytes);
+        let (digest, len) = cas.put_bytes_blob(&payload).map_err(|e| e.to_string())?;
+        owned_blobs.push((
+            vec![
+                b"tree".to_vec(),
+                format!("{:04}", index % 32).into_bytes(),
+                format!("{index:06}.txt").into_bytes(),
+            ],
+            digest,
+            len,
+        ));
+    }
+
+    if let Some(bytes) = config.oversized_file_bytes {
+        let payload = fill_mixed_payload(0x4F56_4552_5349_5A45, "BINv1\n", bytes);
+        let (digest, len) = cas.put_bytes_blob(&payload).map_err(|e| e.to_string())?;
+        owned_blobs.push((vec![b"oversized.bin".to_vec()], digest, len));
+    }
+
+    let mutations: Vec<spawn_cas::TreeMutation> = owned_blobs
+        .iter()
+        .map(|(path, digest, size)| spawn_cas::TreeMutation::Upsert {
+            path: path.clone(),
+            kind: spawn_cas::TreeEntryKind::File,
+            id: digest.as_bytes(),
+            size: *size,
+        })
+        .collect();
     let tree = cas
-        .put_tree_cached(
-            &spawn_cas::Tree::from_entries(vec![
-                spawn_cas::TreeEntry::file(b".gitignore".to_vec(), &gi_d, gi_len),
-                spawn_cas::TreeEntry::file(b"README.md".to_vec(), &rd_d, rd_len),
-            ])
-            .map_err(|e| e.to_string())?,
-        )
+        .apply_mutations(&main0.tree, &mutations)
         .map_err(|e| e.to_string())?;
+
     let body = format_commit_body(
         "spawn <bench@localhost> 1700000010 +0000",
         "spawn <bench@localhost> 1700000010 +0000",
@@ -943,9 +1126,12 @@ fn d6_advance_main_step(
         .main_snapshot()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "main snapshot missing".to_string())?;
-    let (bd, blen) = cas
-        .put_bytes_blob(format!("merge step {step}\n").as_bytes())
-        .map_err(|e| e.to_string())?;
+    let payload = fill_mixed_payload(
+        0x4D41_494E_0000_u64.wrapping_add(step as u64),
+        &format!("// merge step {step}\n"),
+        512,
+    );
+    let (bd, blen) = cas.put_bytes_blob(&payload).map_err(|e| e.to_string())?;
     let next_tree = cas
         .apply_mutations(
             &main_now.tree,
@@ -999,6 +1185,7 @@ fn d6_advance_main_step(
 }
 
 struct WorkerState {
+    idx: usize,
     branch: BranchName,
     workspace: WorkspaceId,
     archive: LocalTranscriptArchive,
@@ -1023,9 +1210,14 @@ impl WorkerState {
     ) -> Result<Self, String> {
         let agent =
             AgentId::new(format!("agent_storage_benchmark_{idx}")).map_err(|e| e.to_string())?;
-        let mut transcript_payload = vec![b't'; config.transcript_bytes];
+        let mut transcript_payload = fill_mixed_payload(
+            0x5452_414E ^ (idx as u64),
+            &format!("// transcript worker={idx}\n"),
+            config.transcript_bytes,
+        );
         transcript_payload[config.transcript_bytes - 1] = b'\n';
         Ok(Self {
+            idx,
             branch,
             workspace,
             archive: LocalTranscriptArchive::new(archive_root.join(format!("w{idx}"))),
@@ -1165,8 +1357,12 @@ trait BenchDriver: Send + Sync {
     fn shadow_metrics_json(&self) -> Option<Value> {
         None
     }
-    fn always_on_d6_json(&self, _config: &Config, _logical_written_bytes: u64) -> Option<Value> {
-        None
+    fn always_on_d6_json(
+        &self,
+        _config: &Config,
+        _logical_written_bytes: u64,
+    ) -> Result<Option<Value>, String> {
+        Ok(None)
     }
 }
 
@@ -1280,26 +1476,475 @@ impl BenchDriver for GitDriver {
 #[derive(Default)]
 struct AlwaysOnD6State {
     land_deltas: Vec<u64>,
+    land_cas_retries: usize,
+    merged_files_verified: usize,
+    fastcdc_chunked_files: usize,
+    fastcdc_chunks_count: usize,
     crash_drill: Option<Value>,
 }
 
 fn cas_payload_bytes(cas_root: &Path) -> Result<u64, String> {
-    let objs = directory_size(&cas_root.join("objects"))?.bytes;
-    let idxs = directory_size(&cas_root.join("chunk-index"))?.bytes;
+    let objs_dir = cas_root.join("objects");
+    if !objs_dir.is_dir() {
+        return Err(format!(
+            "CAS objects directory missing: {}",
+            objs_dir.display()
+        ));
+    }
+    let objs = strict_directory_size(&objs_dir)?.bytes;
+    let idxs_dir = cas_root.join("chunk-index");
+    let idxs = if idxs_dir.exists() {
+        strict_directory_size(&idxs_dir)?.bytes
+    } else {
+        0
+    };
     Ok(objs.saturating_add(idxs))
+}
+
+fn evaluate_land_delta_slo(
+    landings_completed: usize,
+    expected_landings: usize,
+    merged_files_verified: usize,
+    max_delta: u64,
+) -> bool {
+    expected_landings > 0
+        && landings_completed == expected_landings
+        && merged_files_verified == expected_landings
+        && max_delta > 0
+        && max_delta < LAND_DELTA_SLO_BYTES
+}
+
+fn file_byte_len(path: &Path) -> Result<u64, String> {
+    fs::metadata(path)
+        .map(|m| m.len())
+        .map_err(|e| format!("stat {}: {e}", path.display()))
+}
+
+fn cas_blob_disk_bytes(
+    cas: &spawn_cas::Store,
+    digest: &Digest,
+    counted_chunks: &mut BTreeSet<Digest>,
+) -> Result<u64, String> {
+    if !counted_chunks.insert(digest.clone()) {
+        return Ok(0);
+    }
+    let idx_path = cas.chunk_index_path(digest);
+    if idx_path.is_file() {
+        let mut bytes = file_byte_len(&idx_path)?;
+        let index = cas
+            .read_chunk_index(digest)
+            .map_err(|e| format!("read chunk index {digest}: {e}"))?;
+        for chunk in index.chunks {
+            if counted_chunks.insert(chunk.id.clone()) {
+                bytes = bytes.saturating_add(file_byte_len(&cas.object_path(&chunk.id))?);
+            }
+        }
+        Ok(bytes)
+    } else {
+        file_byte_len(&cas.object_path(digest))
+    }
+}
+
+fn collect_tree_digests(
+    store: &CasMerkleStore,
+    root: &Digest,
+    out: &mut BTreeSet<Digest>,
+) -> Result<(), String> {
+    if !out.insert(root.clone()) {
+        return Ok(());
+    }
+    let tree = store
+        .read_tree_cached(root)
+        .map_err(|e| format!("read tree {root}: {e}"))?;
+    for entry in &tree.entries {
+        if entry.kind == spawn_cas::TreeEntryKind::Dir
+            && let Some(sub) = entry.digest()
+        {
+            collect_tree_digests(store, &sub, out)?;
+        }
+    }
+    Ok(())
+}
+
+struct PreparedLand {
+    deliverables: Vec<(String, Digest)>,
+    task_ids: Vec<i64>,
+}
+
+fn main_journal_line_bytes(
+    seq: u64,
+    project: &str,
+    old_snapshot: &Digest,
+    new_snapshot: &Digest,
+    git_oid: GitOid,
+    at_ms: i64,
+) -> Result<u64, String> {
+    let encoded = serde_json::to_string(&spawn_cas::JournalEntry {
+        seq,
+        project: project.to_string(),
+        name: "main".to_string(),
+        kind: "main".to_string(),
+        old_snapshot: Some(old_snapshot.clone()),
+        new_snapshot: new_snapshot.clone(),
+        git_oid,
+        at_ms,
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(u64::try_from(encoded.len() + 1).unwrap_or(0))
+}
+
+fn measure_landing_closure_bytes(
+    cas: &CasMerkleStore,
+    before_tree: &Digest,
+    after_tree: &Digest,
+    snap_id: &Digest,
+    journal_line_bytes: u64,
+) -> Result<u64, String> {
+    let mut before_trees = BTreeSet::new();
+    collect_tree_digests(cas, before_tree, &mut before_trees)?;
+    let mut after_trees = BTreeSet::new();
+    collect_tree_digests(cas, after_tree, &mut after_trees)?;
+
+    let before_flat = cas
+        .flatten_tree(before_tree)
+        .map_err(|e| format!("flatten before tree: {e}"))?;
+    let after_flat = cas
+        .flatten_tree(after_tree)
+        .map_err(|e| format!("flatten after tree: {e}"))?;
+
+    let mut counted = BTreeSet::new();
+    let mut total = file_byte_len(&cas.cas().object_path(snap_id))?;
+    total = total.saturating_add(journal_line_bytes);
+
+    for tree_digest in after_trees.difference(&before_trees) {
+        let p = cas.cas().object_path(tree_digest);
+        if p.exists() {
+            total = total.saturating_add(file_byte_len(&p)?);
+        }
+    }
+
+    for (path, entry) in after_flat {
+        let unchanged = before_flat.get(&path).is_some_and(|prev| {
+            prev.kind == entry.kind && prev.size == entry.size && prev.digest() == entry.digest()
+        });
+        if unchanged {
+            continue;
+        }
+        if let Some(d) = entry.digest() {
+            total = total.saturating_add(cas_blob_disk_bytes(cas.cas(), &d, &mut counted)?);
+        }
+    }
+    Ok(total)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CrashAck {
+    branch: String,
+    snapshot: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CrashManifest {
+    project: String,
+    schema: String,
+    cas_root: PathBuf,
+    disk_root: PathBuf,
+    ack_path: PathBuf,
+    expected_main: String,
+    expected_branches: Vec<(String, String)>,
+    expected_crash_branches: Vec<(String, String)>,
+    acked_snapshots: Vec<String>,
+}
+
+fn is_snapshot_ancestor(
+    cas: &CasMerkleStore,
+    descendant: &Digest,
+    ancestor: &Digest,
+) -> Result<bool, String> {
+    if descendant == ancestor {
+        return Ok(true);
+    }
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![descendant.clone()];
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(cur.clone()) {
+            continue;
+        }
+        let snap = cas
+            .cas()
+            .read_merkle_snapshot(&cur)
+            .map_err(|e| format!("read snapshot {cur} during ancestor walk: {e}"))?;
+        for parent in snap.parents {
+            if &parent == ancestor {
+                return Ok(true);
+            }
+            stack.push(parent);
+        }
+    }
+    Ok(false)
+}
+
+fn append_torn_journal_and_recover(
+    journal_path: &Path,
+    min_committed_entries: usize,
+) -> Result<usize, String> {
+    let torn_tail = b"{\"seq\":99999999,\"project\":\"proj-bench\",\"name\":\"branch/torn";
+    {
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(journal_path)
+            .map_err(|e| format!("open refs.journal for torn injection: {e}"))?;
+        f.write_all(torn_tail)
+            .map_err(|e| format!("write torn journal tail: {e}"))?;
+        f.sync_all()
+            .map_err(|e| format!("sync torn journal: {e}"))?;
+    }
+
+    let entries = RefJournal::new(journal_path)
+        .read_all()
+        .map_err(|e| format!("RefJournal::read_all failed on torn tail: {e}"))?;
+    if entries.len() < min_committed_entries {
+        return Err(format!(
+            "RefJournal recovered {} entries, expected >= {min_committed_entries}",
+            entries.len()
+        ));
+    }
+
+    // Heal the incomplete trailing fragment cleanly at the last committed newline boundary.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(journal_path)
+        .map_err(|e| format!("open refs.journal for truncation heal: {e}"))?;
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)
+        .map_err(|e| format!("read refs.journal for heal: {e}"))?;
+    let last_nl = raw
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .ok_or_else(|| "refs.journal contains no committed newline".to_string())?;
+    let clean_len =
+        u64::try_from(last_nl + 1).map_err(|_| "journal length overflows u64".to_string())?;
+    file.set_len(clean_len)
+        .map_err(|e| format!("truncate torn refs.journal tail: {e}"))?;
+    file.seek(SeekFrom::End(0))
+        .map_err(|e| format!("seek refs.journal end: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("sync healed refs.journal: {e}"))?;
+    Ok(entries.len())
+}
+
+fn read_complete_crash_acks(ack_path: &Path) -> Result<Vec<CrashAck>, String> {
+    if !ack_path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = fs::read(ack_path).map_err(|e| format!("read {}: {e}", ack_path.display()))?;
+    let Some(last_nl) = bytes.iter().rposition(|&b| b == b'\n') else {
+        return Ok(Vec::new());
+    };
+    let mut acks = Vec::new();
+    for raw in bytes[..last_nl].split(|&b| b == b'\n') {
+        if raw.is_empty() {
+            continue;
+        }
+        let parsed: CrashAck = serde_json::from_slice(raw)
+            .map_err(|e| format!("parse ack line in {}: {e}", ack_path.display()))?;
+        acks.push(parsed);
+    }
+    Ok(acks)
+}
+
+fn internal_crash_writer_main(manifest_path: &Path) -> Result<(), String> {
+    let url = env::var("SPAWN_BENCH_DATABASE_URL")
+        .map_err(|_| "SPAWN_BENCH_DATABASE_URL required for internal crash writer".to_string())?;
+    let raw = fs::read_to_string(manifest_path)
+        .map_err(|e| format!("read manifest {}: {e}", manifest_path.display()))?;
+    let manifest: CrashManifest =
+        serde_json::from_str(&raw).map_err(|e| format!("parse manifest: {e}"))?;
+
+    let cas = Arc::new(
+        CasMerkleStore::open(&manifest.cas_root).map_err(|e| format!("writer open cas: {e}"))?,
+    );
+    let ledger = Arc::new(PgRefLedger::connect_schema(&url, &manifest.schema)?);
+    let ws_store = D6Workspace::new(&manifest.project, &manifest.disk_root, cas, ledger)
+        .with_max_file_bytes(u64::MAX);
+
+    let mut branch_ws = Vec::with_capacity(2);
+    for slot in 0..2 {
+        let name = format!("crash_drill_{slot}");
+        let branch = BranchName::new(name.clone()).map_err(|e| e.to_string())?;
+        let _ = ws_store
+            .ensure_branch(&branch, None)
+            .map_err(|e| e.to_string())?;
+        let ws = ws_store.mount(&branch).map_err(|e| e.to_string())?;
+        branch_ws.push((name, ws));
+    }
+
+    let mut ack_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&manifest.ack_path)
+        .map_err(|e| format!("open ack file: {e}"))?;
+
+    let mut step = 0_usize;
+    loop {
+        let slot = step % branch_ws.len();
+        let (branch_name, ws) = &branch_ws[slot];
+        let payload_len = if step < 6 { 8 * 1024 } else { 128 * 1024 };
+        let rel = format!("crash/step_{step:05}.dat");
+        let target = Path::new(ws.path()).join(&rel);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let payload = fill_mixed_payload(
+            0x4352_4153_0000_u64.wrapping_add(step as u64),
+            &format!("// crash-writer step={step} branch={branch_name}\n"),
+            payload_len,
+        );
+        fs::write(&target, payload).map_err(|e| e.to_string())?;
+
+        match ws_store
+            .commit(ws, &format!("crash drill commit {step}"))
+            .map_err(|e| e.to_string())?
+        {
+            Commit::Created(commit_id)
+            | Commit::Recreated {
+                commit: commit_id, ..
+            } => {
+                let live = ws_store
+                    .branch_snapshot(branch_name)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("missing snapshot for {branch_name}"))?;
+                let _ = commit_id;
+                let ack_line = serde_json::to_string(&CrashAck {
+                    branch: branch_name.clone(),
+                    snapshot: live.id.to_string(),
+                })
+                .map_err(|e| e.to_string())?;
+                ack_file
+                    .write_all(format!("{ack_line}\n").as_bytes())
+                    .map_err(|e| format!("write ack: {e}"))?;
+                ack_file.sync_all().map_err(|e| format!("fsync ack: {e}"))?;
+            }
+            Commit::Unchanged => {
+                return Err(format!("unexpected unchanged commit on crash step {step}"));
+            }
+        }
+        step = step.saturating_add(1);
+    }
+}
+
+fn internal_crash_verify_main(manifest_path: &Path) -> Result<Value, String> {
+    let url = env::var("SPAWN_BENCH_DATABASE_URL")
+        .map_err(|_| "SPAWN_BENCH_DATABASE_URL required for internal crash verify".to_string())?;
+    let raw = fs::read_to_string(manifest_path)
+        .map_err(|e| format!("read manifest {}: {e}", manifest_path.display()))?;
+    let manifest: CrashManifest =
+        serde_json::from_str(&raw).map_err(|e| format!("parse manifest: {e}"))?;
+
+    let t0 = Instant::now();
+    let fresh_cas = Arc::new(
+        CasMerkleStore::open(&manifest.cas_root).map_err(|e| format!("verifier open cas: {e}"))?,
+    );
+    let fresh_ledger = Arc::new(PgRefLedger::connect_schema(&url, &manifest.schema)?);
+    let fresh_ws = D6Workspace::new(
+        &manifest.project,
+        &manifest.disk_root,
+        fresh_cas.clone(),
+        fresh_ledger.clone(),
+    );
+
+    let journal = fresh_cas
+        .cas()
+        .read_ref_journal()
+        .map_err(|e| format!("verifier read_ref_journal: {e}"))?;
+    let min_expected_journal = manifest.acked_snapshots.len();
+    let mut lost_refs = usize::from(journal.len() < min_expected_journal);
+    let mut snapshots_to_verify = BTreeSet::new();
+
+    let expected_main = Digest::parse(&manifest.expected_main).map_err(|e| e.to_string())?;
+    snapshots_to_verify.insert(expected_main.clone());
+    match fresh_ws.main_snapshot() {
+        Ok(Some(live)) if live.id == expected_main => {}
+        _ => lost_refs += 1,
+    }
+
+    for (branch, expected_hex) in &manifest.expected_branches {
+        let expected_id = Digest::parse(expected_hex).map_err(|e| e.to_string())?;
+        snapshots_to_verify.insert(expected_id.clone());
+        match fresh_ws.branch_snapshot(branch) {
+            Ok(Some(live)) if live.id == expected_id => {}
+            _ => lost_refs += 1,
+        }
+    }
+
+    for (branch, expected_acked_hex) in &manifest.expected_crash_branches {
+        let acked_id = Digest::parse(expected_acked_hex).map_err(|e| e.to_string())?;
+        snapshots_to_verify.insert(acked_id.clone());
+        match fresh_ws.branch_snapshot(branch) {
+            Ok(Some(live)) => {
+                snapshots_to_verify.insert(live.id.clone());
+                if !is_snapshot_ancestor(&fresh_cas, &live.id, &acked_id).unwrap_or(false) {
+                    lost_refs += 1;
+                }
+            }
+            _ => lost_refs += 1,
+        }
+    }
+
+    let mut acknowledged_recovered = 0_usize;
+    let mut missing_pg_ack = 0_usize;
+    for snap_hex in &manifest.acked_snapshots {
+        let d = Digest::parse(snap_hex).map_err(|e| e.to_string())?;
+        snapshots_to_verify.insert(d.clone());
+        match fresh_ledger.get_snapshot(&d) {
+            Ok(Some(_)) => acknowledged_recovered += 1,
+            _ => missing_pg_ack += 1,
+        }
+    }
+
+    let (lost_commits, corrupt_objects, blobs_verified) =
+        verify_reopened_objects(&fresh_cas, &snapshots_to_verify);
+    let lost_commits = lost_commits.saturating_add(missing_pg_ack);
+    let recovery_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let verified = lost_refs == 0
+        && lost_commits == 0
+        && corrupt_objects == 0
+        && acknowledged_recovered == manifest.acked_snapshots.len();
+
+    Ok(json!({
+        "verified": verified,
+        "verifier_pid": std::process::id(),
+        "branches_verified": manifest.expected_branches.len() + manifest.expected_crash_branches.len(),
+        "refs_verified": manifest.expected_branches.len() + manifest.expected_crash_branches.len() + 1,
+        "snapshots_verified": snapshots_to_verify.len(),
+        "blobs_verified": blobs_verified,
+        "acknowledged_recovered": acknowledged_recovered,
+        "journal_entries": journal.len(),
+        "lost_commits": lost_commits,
+        "lost_refs": lost_refs,
+        "corrupt_objects": corrupt_objects,
+        "recovery_ms": recovery_ms,
+    }))
 }
 
 struct D6Driver {
     project: String,
     disk_root: PathBuf,
     cas_root: PathBuf,
+    scratch_root: PathBuf,
     cas: Arc<CasMerkleStore>,
     coord_ledger: Arc<PgRefLedger>,
     coord_store: D6Workspace<PgRefLedger>,
+    worker_ledgers: Vec<Arc<PgRefLedger>>,
     worker_stores: Vec<D6Workspace<PgRefLedger>>,
     pg_url: String,
     schema: String,
     oversized_ingested: bool,
+    save_crash_manifest: Option<PathBuf>,
     always_on: Mutex<AlwaysOnD6State>,
 }
 
@@ -1307,6 +1952,7 @@ struct D6DriverInit<'a> {
     project: String,
     disk_root: PathBuf,
     cas_root: PathBuf,
+    scratch_root: PathBuf,
     cas: Arc<CasMerkleStore>,
     pg_pool: &'a [Arc<PostgresStore>],
     pg_url: String,
@@ -1353,11 +1999,12 @@ impl D6Driver {
         let project = init.project;
         let disk_root = init.disk_root;
         let cas_root = init.cas_root;
+        let scratch_root = init.scratch_root;
         let cas = init.cas;
         let config = init.config;
         let make_ws = |ledger: Arc<PgRefLedger>| {
             let mut ws = D6Workspace::new(&project, &disk_root, cas.clone(), ledger);
-            if config.oversized_file_bytes.is_some() {
+            if config.oversized_file_bytes.is_some() || config.land_payload_bytes > 0 {
                 ws = ws.with_max_file_bytes(u64::MAX);
             }
             if let Some(t) = &config.tmpfs_root {
@@ -1367,13 +2014,15 @@ impl D6Driver {
         };
         let coord_ledger = Arc::new(PgRefLedger::from_store(init.pg_pool[0].clone()));
         let coord_store = make_ws(coord_ledger.clone());
-        let _ = d6_seed_initial_main(&coord_store, &coord_ledger, &cas, &project)?;
+        let _ = d6_seed_initial_main(&coord_store, &coord_ledger, &cas, &project, config)?;
 
+        let mut worker_ledgers = Vec::with_capacity(config.concurrency);
         let mut worker_stores = Vec::with_capacity(config.concurrency);
         for idx in 0..config.concurrency {
             let l = Arc::new(PgRefLedger::from_store(
                 init.pg_pool[idx % init.pg_pool.len()].clone(),
             ));
+            worker_ledgers.push(l.clone());
             worker_stores.push(make_ws(l));
         }
 
@@ -1381,13 +2030,16 @@ impl D6Driver {
             project,
             disk_root,
             cas_root,
+            scratch_root,
             cas,
             coord_ledger,
             coord_store,
+            worker_ledgers,
             worker_stores,
             pg_url: init.pg_url,
             schema: init.schema,
             oversized_ingested: config.oversized_file_bytes.is_some(),
+            save_crash_manifest: config.save_crash_manifest.clone(),
             always_on: Mutex::new(AlwaysOnD6State::default()),
         })
     }
@@ -1396,7 +2048,7 @@ impl D6Driver {
         &self,
         branch: &BranchName,
         expected_size: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(Option<Digest>, usize), String> {
         let head = self
             .coord_store
             .branch_snapshot(branch.as_str())
@@ -1416,8 +2068,22 @@ impl D6Driver {
         let digest = ent
             .digest()
             .ok_or_else(|| "oversized.bin missing digest".to_string())?;
-        if expected_size > 4 * 1024 * 1024 && !self.cas.cas().chunk_index_path(&digest).is_file() {
-            return Err("oversized.bin was not FastCDC chunked into chunk-index".to_string());
+        let mut chunks_count = 0_usize;
+        if expected_size > 4 * 1024 * 1024 {
+            if !self.cas.cas().chunk_index_path(&digest).is_file() {
+                return Err("oversized.bin was not FastCDC chunked into chunk-index".to_string());
+            }
+            let idx = self
+                .cas
+                .cas()
+                .read_chunk_index(&digest)
+                .map_err(|e| format!("read oversized chunk index: {e}"))?;
+            chunks_count = idx.chunks.len();
+            if chunks_count < 2 {
+                return Err(format!(
+                    "heterogeneous oversized.bin expected >= 2 FastCDC chunks, got {chunks_count}"
+                ));
+            }
         }
         let projected_blob = spawn_cas::project_blob_oid(self.cas.cas(), &digest, want_size)
             .map_err(|e| e.to_string())?;
@@ -1428,108 +2094,313 @@ impl D6Driver {
                     "oversized.bin OID {projected_blob} != pointer OID {expected_pointer}"
                 ));
             }
+        } else {
+            let mut blob_bytes = Vec::new();
+            self.cas
+                .cas()
+                .stream_blob(&digest, &mut blob_bytes)
+                .map_err(|e| format!("stream oversized.bin <= threshold: {e}"))?;
+            let expected_blob_oid = git_blob_oid_of_bytes(&blob_bytes);
+            if projected_blob != expected_blob_oid {
+                return Err(format!(
+                    "oversized.bin OID {projected_blob} != blob OID {expected_blob_oid}"
+                ));
+            }
         }
-        Ok(())
+        Ok(((chunks_count > 0).then_some(digest), chunks_count))
     }
 
-    fn run_land_phase(&self, workers: &mut [WorkerState]) -> Result<(), String> {
-        let mut prev_cas_bytes = cas_payload_bytes(&self.cas_root)?;
-        let mut deltas = Vec::with_capacity(workers.len());
-        for (idx, worker) in workers.iter_mut().enumerate() {
-            let main_now = self
-                .coord_store
-                .main_snapshot()
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "main snapshot missing before land".to_string())?;
-            let branch_head = self
-                .coord_store
-                .branch_snapshot(worker.branch.as_str())
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("branch {} missing before land", worker.branch))?;
+    fn prepare_land_deliverables(
+        &self,
+        config: &Config,
+        workers: &[WorkerState],
+    ) -> Result<PreparedLand, String> {
+        let mut expected_deliverables: Vec<(String, Digest)> = Vec::with_capacity(workers.len());
+        let land_mission = self
+            .coord_ledger
+            .pg
+            .mission_add(
+                "D6 benchmark concurrent land",
+                &json!(["/tmp/d6-bench-land.git"]),
+                "human",
+            )
+            .map_err(|e| format!("land mission_add: {e}"))?;
+        self.coord_ledger
+            .pg
+            .mission_configure(land_mission, Some("/scenarios"), "gate", None, None)
+            .map_err(|e| format!("land mission_configure: {e}"))?;
+        let mut task_ids = Vec::with_capacity(workers.len());
 
-            let artifact = format!(
-                "branch={}\nsnapshot={}\ntree={}\ngit_oid={}\n",
-                worker.branch, branch_head.id, branch_head.tree, branch_head.git_oid
+        for w in workers {
+            let store = &self.worker_stores[w.idx];
+            let rel_path = format!("branches/w{:03}/deliverable.bin", w.idx);
+            let full_path = Path::new(w.workspace.path()).join(&rel_path);
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let deliv_payload = fill_mixed_payload(
+                0x4445_4C49_u64 ^ ((w.idx as u64).wrapping_add(1)),
+                &format!("// deliverable branch={} worker={}\n", w.branch, w.idx),
+                config.land_payload_bytes,
             );
-            let (bd, blen) = self
+            fs::write(&full_path, &deliv_payload).map_err(|e| e.to_string())?;
+            match store
+                .commit(&w.workspace, &format!("deliverable for {}", w.branch))
+                .map_err(|e| e.to_string())?
+            {
+                Commit::Created(_) => {}
+                other => {
+                    return Err(format!(
+                        "deliverable commit on {} returned {other:?}",
+                        w.branch
+                    ));
+                }
+            }
+            let head = store
+                .branch_snapshot(w.branch.as_str())
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("branch {} missing deliverable head", w.branch))?;
+            let flat = self
                 .cas
-                .put_bytes_blob(artifact.as_bytes())
+                .flatten_tree(&head.tree)
                 .map_err(|e| e.to_string())?;
-            let next_tree = self
-                .cas
-                .apply_mutations(
-                    &main_now.tree,
-                    &[spawn_cas::TreeMutation::Upsert {
-                        path: vec![
-                            b"landings".to_vec(),
-                            format!("worker_{idx}.txt").into_bytes(),
-                        ],
-                        kind: spawn_cas::TreeEntryKind::File,
-                        id: bd.as_bytes(),
-                        size: blen,
-                    }],
+            let digest = flat
+                .get(rel_path.as_bytes())
+                .and_then(spawn_cas::TreeEntry::digest)
+                .ok_or_else(|| format!("deliverable {rel_path} missing in branch tree"))?;
+            expected_deliverables.push((rel_path, digest));
+
+            let worker_name = format!("w_bench_{}", w.idx);
+            let task_id = self
+                .coord_ledger
+                .pg
+                .task_assign(
+                    land_mission,
+                    "ephemeral",
+                    &worker_name,
+                    &format!("land benchmark branch {}", w.branch),
+                    "default",
                 )
-                .map_err(|e| e.to_string())?;
-
-            let ts_ms = 1_700_000_500_000_i64 + i64::try_from(idx).unwrap_or(0) * 1_000;
-            let body = format_commit_body(
-                "spawn <bench@localhost> 1700000500 +0000",
-                "spawn <bench@localhost> 1700000500 +0000",
-                &format!("land branch {}\n", worker.branch),
-            );
-            let snap = Snapshot {
-                tree: next_tree.clone(),
-                parents: vec![main_now.id.clone(), branch_head.id.clone()],
-                commit_body: body,
-            };
-            let snap_id = self
-                .cas
-                .cas()
-                .put_merkle_snapshot(&snap)
-                .map_err(|e| e.to_string())?;
-            let oid = self
-                .cas
-                .project_snapshot_oid(&snap, &[main_now.git_oid, branch_head.git_oid])
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("land task_assign: {e}"))?;
+            self.coord_ledger
+                .pg
+                .task_delivered(task_id, 1)
+                .map_err(|e| format!("land task_delivered: {e}"))?;
             let _ = self
                 .coord_ledger
-                .record_snapshot(
-                    &snap_id,
-                    &oid,
-                    &next_tree,
-                    &snap.parents,
-                    &self.project,
-                    ts_ms,
-                )
-                .map_err(|e| e.to_string())?;
-            let task_id = setup_accepted_task(
-                &self.coord_ledger.pg,
-                &format!("/tmp/d6-bench-land-{idx}.git"),
-                &main_now.git_oid,
-                &oid,
-            )?;
-
-            let t0 = Instant::now();
-            let _ = self
-                .coord_store
-                .land_main_snapshot(Some(&main_now.id), &snap_id, Some(task_id), "bench land")
-                .map_err(|e| e.to_string())?;
-            let dur = t0.elapsed();
-            worker.samples.push("land_main", dur);
-
-            let after_cas_bytes = cas_payload_bytes(&self.cas_root)?;
-            deltas.push(after_cas_bytes.saturating_sub(prev_cas_bytes));
-            prev_cas_bytes = after_cas_bytes;
+                .pg
+                .task_reported(task_id, "done")
+                .map_err(|e| format!("land task_reported: {e}"))?;
+            task_ids.push(task_id);
         }
+
+        Ok(PreparedLand {
+            deliverables: expected_deliverables,
+            task_ids,
+        })
+    }
+
+    fn try_land_worker_attempt(
+        &self,
+        worker: &WorkerState,
+        task_id: i64,
+        attempt: usize,
+    ) -> Result<Option<(Duration, u64)>, String> {
+        let store = &self.worker_stores[worker.idx];
+        let ledger = &self.worker_ledgers[worker.idx];
+        let t0 = Instant::now();
+        let main_now = store
+            .main_snapshot()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "main snapshot missing before land".to_string())?;
+        let branch_head = store
+            .branch_snapshot(worker.branch.as_str())
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("branch {} missing before land", worker.branch))?;
+        let (_base, merge_report) = merge_snapshots(&self.cas, &main_now.id, &branch_head.id, None)
+            .map_err(|e| format!("merge_snapshots {}: {e}", worker.branch))?;
+        if !merge_report.conflicts.is_empty() {
+            return Err(format!(
+                "unexpected {} conflicts merging {}",
+                merge_report.conflicts.len(),
+                worker.branch
+            ));
+        }
+        let ts_ms = 1_700_000_500_000_i64
+            + i64::try_from(worker.idx).unwrap_or(0) * 1_000
+            + i64::try_from(attempt).unwrap_or(0);
+        let body = format_commit_body(
+            "spawn <bench@localhost> 1700000500 +0000",
+            "spawn <bench@localhost> 1700000500 +0000",
+            &format!("land branch {}\n", worker.branch),
+        );
+        let snap = Snapshot {
+            tree: merge_report.tree.clone(),
+            parents: vec![main_now.id.clone(), branch_head.id.clone()],
+            commit_body: body,
+        };
+        let snap_id = self
+            .cas
+            .cas()
+            .put_merkle_snapshot(&snap)
+            .map_err(|e| e.to_string())?;
+        let oid = self
+            .cas
+            .project_snapshot_oid(&snap, &[main_now.git_oid, branch_head.git_oid])
+            .map_err(|e| e.to_string())?;
+        let _ = ledger
+            .record_snapshot(
+                &snap_id,
+                &oid,
+                &merge_report.tree,
+                &snap.parents,
+                &self.project,
+                ts_ms,
+            )
+            .map_err(|e| e.to_string())?;
+        ledger
+            .pg
+            .integrator_record(&json!({
+                "type": "task.gated",
+                "id": task_id,
+                "revision": 0,
+                "verdict": "accepted",
+                "base": main_now.git_oid.to_hex(),
+                "candidate": oid.to_hex(),
+            }))
+            .map_err(|e| format!("land integrator_record: {e}"))?;
+        match store.land_main_snapshot(Some(&main_now.id), &snap_id, Some(task_id), "bench land") {
+            Ok(seq) => {
+                let dur = t0.elapsed();
+                let line_bytes = main_journal_line_bytes(
+                    seq,
+                    &self.project,
+                    &main_now.id,
+                    &snap_id,
+                    oid,
+                    ts_ms,
+                )?;
+                let delta_bytes = measure_landing_closure_bytes(
+                    &self.cas,
+                    &main_now.tree,
+                    &merge_report.tree,
+                    &snap_id,
+                    line_bytes,
+                )?;
+                Ok(Some((dur, delta_bytes)))
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains("CAS mismatch") {
+                    Ok(None)
+                } else {
+                    Err(format!("land_main {}: {msg}", worker.branch))
+                }
+            }
+        }
+    }
+
+    fn land_worker_with_retries(
+        &self,
+        worker: &mut WorkerState,
+        task_id: i64,
+        max_attempts: usize,
+    ) -> Result<(u64, usize), String> {
+        for (retries, attempt) in (0..max_attempts).enumerate() {
+            if let Some((dur, delta_bytes)) =
+                self.try_land_worker_attempt(worker, task_id, attempt)?
+            {
+                worker.samples.push("land_main", dur);
+                return Ok((delta_bytes, retries));
+            }
+            let backoff_ms = u64::try_from((worker.idx % 4) + 1).unwrap_or(1)
+                * u64::try_from((retries + 1).min(4)).unwrap_or(1)
+                * 2;
+            std::thread::sleep(Duration::from_millis(backoff_ms));
+        }
+        Err(format!(
+            "branch {} exceeded {max_attempts} concurrent CAS land retries",
+            worker.branch
+        ))
+    }
+
+    fn verify_landed_deliverables(
+        &self,
+        expected_deliverables: &[(String, Digest)],
+    ) -> Result<usize, String> {
+        let final_main = self
+            .coord_store
+            .main_snapshot()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "main snapshot missing after land".to_string())?;
+        let final_flat = self
+            .cas
+            .flatten_tree(&final_main.tree)
+            .map_err(|e| e.to_string())?;
+        let mut merged_files_verified = 0_usize;
+        for (rel_path, expected_digest) in expected_deliverables {
+            let actual = final_flat
+                .get(rel_path.as_bytes())
+                .and_then(spawn_cas::TreeEntry::digest)
+                .ok_or_else(|| format!("landed main missing merged deliverable {rel_path}"))?;
+            if &actual != expected_digest {
+                return Err(format!(
+                    "landed main deliverable {rel_path} digest mismatch: {actual} != {expected_digest}"
+                ));
+            }
+            merged_files_verified += 1;
+        }
+        Ok(merged_files_verified)
+    }
+
+    fn run_land_phase(&self, config: &Config, workers: &mut [WorkerState]) -> Result<(), String> {
+        let prepared = self.prepare_land_deliverables(config, workers)?;
+        let concurrency = workers.len();
+        let barrier = Arc::new(Barrier::new(concurrency));
+        let results: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::with_capacity(concurrency));
+        let max_attempts = concurrency.saturating_mul(12).max(32);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(concurrency);
+            for (worker, &task_id) in workers.iter_mut().zip(&prepared.task_ids) {
+                let bar = barrier.clone();
+                let res_ref = &results;
+                handles.push(scope.spawn(move || -> Result<(), String> {
+                    bar.wait();
+                    let outcome = self.land_worker_with_retries(worker, task_id, max_attempts)?;
+                    res_ref
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(outcome);
+                    Ok(())
+                }));
+            }
+            for h in handles {
+                h.join()
+                    .map_err(|_| "concurrent land worker panicked".to_string())??;
+            }
+            Ok::<(), String>(())
+        })?;
+
+        let merged_files_verified = self.verify_landed_deliverables(&prepared.deliverables)?;
+        let items = results
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut guard = self
             .always_on
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.land_deltas = deltas;
+        guard.land_deltas = items.iter().map(|(d, _)| *d).collect();
+        guard.land_cas_retries = items.iter().map(|(_, r)| *r).sum();
+        guard.merged_files_verified = merged_files_verified;
         Ok(())
     }
 
-    fn run_crash_restart_drill(&self, workers: &[WorkerState]) -> Result<(), String> {
+    fn build_initial_crash_manifest(
+        &self,
+        workers: &[WorkerState],
+        ack_path: &Path,
+    ) -> Result<(CrashManifest, usize), String> {
         let expected_main = self
             .coord_store
             .main_snapshot()
@@ -1542,7 +2413,7 @@ impl D6Driver {
                 .branch_snapshot(w.branch.as_str())
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("branch {} missing before crash drill", w.branch))?;
-            expected_branches.push((w.branch.as_str().to_string(), head.id));
+            expected_branches.push((w.branch.as_str().to_string(), head.id.to_string()));
         }
         let pre_journal_len = self
             .cas
@@ -1550,66 +2421,200 @@ impl D6Driver {
             .read_ref_journal()
             .map_err(|e| e.to_string())?
             .len();
+        let manifest = CrashManifest {
+            project: self.project.clone(),
+            schema: self.schema.clone(),
+            cas_root: self.cas_root.clone(),
+            disk_root: self.disk_root.clone(),
+            ack_path: ack_path.to_path_buf(),
+            expected_main: expected_main.id.to_string(),
+            expected_branches,
+            expected_crash_branches: Vec::new(),
+            acked_snapshots: Vec::new(),
+        };
+        Ok((manifest, pre_journal_len))
+    }
 
-        let t0 = Instant::now();
-        let fresh_cas =
-            Arc::new(CasMerkleStore::open(&self.cas_root).map_err(|e| format!("reopen cas: {e}"))?);
-        let fresh_ledger = Arc::new(PgRefLedger::connect_schema(&self.pg_url, &self.schema)?);
-        let fresh_ws = D6Workspace::new(
-            &self.project,
-            &self.disk_root,
-            fresh_cas.clone(),
-            fresh_ledger,
-        );
-
-        let journal = fresh_cas
-            .cas()
-            .read_ref_journal()
-            .map_err(|e| format!("reopen refs.journal: {e}"))?;
-        let mut lost_refs = usize::from(journal.len() < pre_journal_len);
-        let mut snapshots_to_verify = BTreeSet::new();
-        snapshots_to_verify.insert(expected_main.id.clone());
-
-        match fresh_ws.main_snapshot() {
-            Ok(Some(live)) if live.id == expected_main.id => {}
-            _ => lost_refs += 1,
+    fn spawn_and_sigkill_crash_writer(
+        exe: &Path,
+        manifest_path: &Path,
+        ack_path: &Path,
+        pg_url: &str,
+        target_acks: usize,
+    ) -> Result<(u32, Vec<CrashAck>), String> {
+        let mut writer = Command::new(exe)
+            .arg("--internal-crash-writer")
+            .arg(manifest_path)
+            .env("SPAWN_BENCH_DATABASE_URL", pg_url)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn crash writer child: {e}"))?;
+        let killed_child_pid = writer.id();
+        if killed_child_pid == std::process::id() {
+            return Err("crash writer child PID unexpectedly matched parent".to_string());
         }
-        for (branch, expected_id) in &expected_branches {
-            snapshots_to_verify.insert(expected_id.clone());
-            match fresh_ws.branch_snapshot(branch) {
-                Ok(Some(live)) if &live.id == expected_id => {}
-                _ => lost_refs += 1,
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = writer.try_wait().map_err(|e| e.to_string())? {
+                let mut err_buf = String::new();
+                if let Some(mut se) = writer.stderr.take() {
+                    let _ = se.read_to_string(&mut err_buf);
+                }
+                return Err(format!(
+                    "crash writer exited early ({status}) before SIGKILL: {}",
+                    err_buf.trim()
+                ));
             }
+            let acks = read_complete_crash_acks(ack_path)?;
+            if acks.len() >= target_acks {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = writer.kill();
+                let _ = writer.wait();
+                return Err(format!(
+                    "timed out waiting for {target_acks} committed acks from crash writer (got {})",
+                    acks.len()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
 
-        let (lost_commits, corrupt_objects, blobs_verified) =
-            verify_reopened_objects(&fresh_cas, &snapshots_to_verify);
-        let recovery_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let verified = lost_refs == 0 && lost_commits == 0 && corrupt_objects == 0;
+        writer
+            .kill()
+            .map_err(|e| format!("send SIGKILL to crash writer pid {killed_child_pid}: {e}"))?;
+        let kill_status = writer
+            .wait()
+            .map_err(|e| format!("wait killed crash writer: {e}"))?;
+        let exit_signal = kill_status.signal();
+        if exit_signal != Some(9) {
+            return Err(format!(
+                "crash writer did not terminate via SIGKILL (expected signal 9, got {exit_signal:?}, status {kill_status})"
+            ));
+        }
 
-        let report = json!({
-            "verified": verified,
-            "branches_verified": expected_branches.len(),
-            "refs_verified": expected_branches.len() + 1,
-            "snapshots_verified": snapshots_to_verify.len(),
-            "blobs_verified": blobs_verified,
-            "journal_entries": journal.len(),
-            "lost_commits": lost_commits,
-            "lost_refs": lost_refs,
-            "corrupt_objects": corrupt_objects,
-            "recovery_ms": recovery_ms,
-        });
+        let acks = read_complete_crash_acks(ack_path)?;
+        if acks.len() < target_acks {
+            return Err(format!(
+                "lost acked commits before SIGKILL: expected >= {target_acks}, got {}",
+                acks.len()
+            ));
+        }
+        Ok((killed_child_pid, acks))
+    }
+
+    fn run_crash_verifier_child(
+        &self,
+        exe: &Path,
+        manifest_path: &Path,
+        killed_child_pid: u32,
+        manifest: &CrashManifest,
+        recovered_entries: usize,
+    ) -> Result<Value, String> {
+        let ver_out = Command::new(exe)
+            .arg("--internal-crash-verify")
+            .arg(manifest_path)
+            .env("SPAWN_BENCH_DATABASE_URL", &self.pg_url)
+            .output()
+            .map_err(|e| format!("spawn crash verifier child: {e}"))?;
+        if !ver_out.status.success() {
+            return Err(format!(
+                "separate verifier process failed ({}): {}",
+                ver_out.status,
+                String::from_utf8_lossy(&ver_out.stderr).trim()
+            ));
+        }
+        let mut report: Value = serde_json::from_slice(&ver_out.stdout).map_err(|e| {
+            format!(
+                "parse verifier JSON failed ({e}): {}",
+                String::from_utf8_lossy(&ver_out.stdout)
+            )
+        })?;
+        let verifier_pid = report["verifier_pid"].as_u64().unwrap_or(0);
+        if verifier_pid == 0
+            || verifier_pid == u64::from(std::process::id())
+            || verifier_pid == u64::from(killed_child_pid)
+        {
+            return Err(format!(
+                "invalid verifier_pid={verifier_pid} (parent={}, killed={killed_child_pid})",
+                std::process::id()
+            ));
+        }
+        if let Value::Object(map) = &mut report {
+            map.insert("sigkill_executed".to_string(), json!(true));
+            map.insert("killed_child_pid".to_string(), json!(killed_child_pid));
+            map.insert("exit_signal".to_string(), json!(9));
+            map.insert(
+                "committed_before_kill".to_string(),
+                json!(manifest.acked_snapshots.len()),
+            );
+            map.insert("torn_journal_line_recovered".to_string(), json!(true));
+            map.insert(
+                "journal_entries_after_torn_heal".to_string(),
+                json!(recovered_entries),
+            );
+        }
+        Ok(report)
+    }
+
+    fn run_crash_restart_drill(&self, workers: &[WorkerState]) -> Result<(), String> {
+        let manifest_path = self.scratch_root.join("crash-manifest.json");
+        let ack_path = self.scratch_root.join("crash-acks.jsonl");
+        let _ = fs::remove_file(&ack_path);
+        let (mut manifest, pre_journal_len) =
+            self.build_initial_crash_manifest(workers, &ack_path)?;
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("write crash manifest: {e}"))?;
+
+        let exe = env::current_exe().map_err(|e| format!("resolve current_exe: {e}"))?;
+        let (killed_child_pid, acks) =
+            Self::spawn_and_sigkill_crash_writer(&exe, &manifest_path, &ack_path, &self.pg_url, 6)?;
+        let mut latest_by_branch: BTreeMap<String, String> = BTreeMap::new();
+        let mut acked_snapshots_set = BTreeSet::new();
+        for ack in &acks {
+            latest_by_branch.insert(ack.branch.clone(), ack.snapshot.clone());
+            acked_snapshots_set.insert(ack.snapshot.clone());
+        }
+        let recovered_entries = append_torn_journal_and_recover(
+            &self.cas.cas().refs_journal_path(),
+            pre_journal_len.saturating_add(acks.len()),
+        )?;
+
+        manifest.expected_crash_branches = latest_by_branch.into_iter().collect();
+        manifest.acked_snapshots = acked_snapshots_set.into_iter().collect();
+        let manifest_json = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
+        fs::write(&manifest_path, &manifest_json)
+            .map_err(|e| format!("update crash manifest: {e}"))?;
+        if let Some(save_path) = &self.save_crash_manifest {
+            if let Some(parent) = save_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            fs::write(save_path, &manifest_json)
+                .map_err(|e| format!("write saved crash manifest {}: {e}", save_path.display()))?;
+        }
+
+        let report = self.run_crash_verifier_child(
+            &exe,
+            &manifest_path,
+            killed_child_pid,
+            &manifest,
+            recovered_entries,
+        )?;
+        let verified = report["verified"].as_bool() == Some(true);
         {
             let mut guard = self
                 .always_on
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.crash_drill = Some(report);
+            guard.crash_drill = Some(report.clone());
         }
         if !verified {
-            return Err(format!(
-                "crash-restart drill failed: lost_refs={lost_refs}, lost_commits={lost_commits}, corrupt_objects={corrupt_objects}"
-            ));
+            return Err(format!("crash-restart drill failed verification: {report}"));
         }
         Ok(())
     }
@@ -1627,17 +2632,28 @@ impl BenchDriver for D6Driver {
             .ensure_branch(branch, None)
             .map_err(|e| e.to_string())?;
         let ws = store.mount(branch).map_err(|e| e.to_string())?;
-        seed_workspace(Path::new(ws.path()), config)?;
+        for file_idx in 0..BRANCH_INIT_FILES {
+            let path = Path::new(ws.path()).join(format!("branches/w{idx:03}/init_{file_idx}.dat"));
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let seed = ((idx as u64).wrapping_add(1) << 32)
+                ^ ((file_idx as u64).wrapping_add(1))
+                ^ 0x494E_4954;
+            let marker = format!("// branch-init worker={idx} slot={file_idx}\n");
+            let payload = fill_mixed_payload(seed, &marker, config.file_bytes);
+            fs::write(&path, payload).map_err(|e| e.to_string())?;
+        }
         if !matches!(
             store
-                .commit(&ws, "benchmark: seed")
+                .commit(&ws, "benchmark: seed unique branch files")
                 .map_err(|e| e.to_string())?,
             Commit::Created(_)
         ) {
             return Err("seeded D6 workspace produced no commit".to_string());
         }
         if let Some(sz) = config.oversized_file_bytes {
-            self.verify_oversized_chunked_in_cas(branch, sz)?;
+            let _ = self.verify_oversized_chunked_in_cas(branch, sz)?;
         }
         Ok(ws)
     }
@@ -1680,7 +2696,7 @@ impl BenchDriver for D6Driver {
 
     fn after_checkpoint(&self, branch: &BranchName, config: &Config) -> Result<(), String> {
         if let Some(sz) = config.oversized_file_bytes {
-            self.verify_oversized_chunked_in_cas(branch, sz)?;
+            let _ = self.verify_oversized_chunked_in_cas(branch, sz)?;
         }
         Ok(())
     }
@@ -1697,7 +2713,7 @@ impl BenchDriver for D6Driver {
 
     fn post_merge_phase(&self, config: &Config, workers: &mut [WorkerState]) -> Result<(), String> {
         if config.land_branches {
-            self.run_land_phase(workers)?;
+            self.run_land_phase(config, workers)?;
         }
         if config.crash_restart_drill {
             self.run_crash_restart_drill(workers)?;
@@ -1706,9 +2722,16 @@ impl BenchDriver for D6Driver {
     }
 
     fn verify_final(&self, branches: &[BranchName], config: &Config) -> Result<(), String> {
+        let mut unique_chunked = BTreeSet::new();
+        let mut total_chunks = 0_usize;
         for b in branches {
             if let Some(sz) = config.oversized_file_bytes {
-                self.verify_oversized_chunked_in_cas(b, sz)?;
+                let (digest_opt, chunks) = self.verify_oversized_chunked_in_cas(b, sz)?;
+                if let Some(d) = digest_opt
+                    && unique_chunked.insert(d)
+                {
+                    total_chunks = total_chunks.saturating_add(chunks);
+                }
             }
             let head = self
                 .coord_store
@@ -1727,6 +2750,12 @@ impl BenchDriver for D6Driver {
         if journal.is_empty() {
             return Err("refs.journal is empty after D6 benchmark".to_string());
         }
+        let mut guard = self
+            .always_on
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.fastcdc_chunked_files = unique_chunked.len();
+        guard.fastcdc_chunks_count = total_chunks;
         Ok(())
     }
 
@@ -1774,15 +2803,22 @@ impl BenchDriver for D6Driver {
         })
     }
 
-    fn always_on_d6_json(&self, config: &Config, logical_written_bytes: u64) -> Option<Value> {
+    fn always_on_d6_json(
+        &self,
+        config: &Config,
+        logical_written_bytes: u64,
+    ) -> Result<Option<Value>, String> {
         if !config.land_branches && !config.crash_restart_drill {
-            return None;
+            return Ok(None);
+        }
+        let cas_bytes = cas_payload_bytes(&self.cas_root)?;
+        if logical_written_bytes > 0 && cas_bytes == 0 {
+            return Err("cas_payload_bytes measured 0 after non-empty D6 workload".to_string());
         }
         let guard = self
             .always_on
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cas_bytes = cas_payload_bytes(&self.cas_root).unwrap_or(0);
         let dedup_ratio = u64_to_f64(logical_written_bytes) / u64_to_f64(cas_bytes.max(1));
         let landings = guard.land_deltas.len();
         let total_delta: u64 = guard.land_deltas.iter().copied().sum();
@@ -1792,21 +2828,33 @@ impl BenchDriver for D6Driver {
         } else {
             u64_to_f64(total_delta) / u64_to_f64(u64::try_from(landings).unwrap_or(1))
         };
-        Some(json!({
+        let slo_passed = evaluate_land_delta_slo(
+            landings,
+            if config.land_branches {
+                config.concurrency
+            } else {
+                0
+            },
+            guard.merged_files_verified,
+            max_delta,
+        );
+        Ok(Some(json!({
+            "expected_landings": if config.land_branches { config.concurrency } else { 0 },
             "landings_completed": landings,
+            "land_cas_retries": guard.land_cas_retries,
+            "merged_files_verified": guard.merged_files_verified,
             "bytes_per_landing": mean_delta,
             "max_bytes_per_landing": max_delta,
             "total_land_delta_bytes": total_delta,
             "slo_bytes_per_landing_limit": LAND_DELTA_SLO_BYTES,
-            "slo_bytes_per_landing_passed": max_delta < LAND_DELTA_SLO_BYTES,
+            "slo_bytes_per_landing_passed": slo_passed,
             "logical_written_bytes": logical_written_bytes,
             "cas_stored_bytes": cas_bytes,
             "dedup_ratio": dedup_ratio,
-            "fastcdc_chunked_files": usize::from(
-                config.oversized_file_bytes.is_some_and(|b| b > 4 * 1024 * 1024)
-            ),
+            "fastcdc_chunked_files": guard.fastcdc_chunked_files,
+            "fastcdc_chunks_count": guard.fastcdc_chunks_count,
             "crash_restart_drill": guard.crash_drill,
-        }))
+        })))
     }
 }
 
@@ -2072,7 +3120,13 @@ fn run_worker_cycles(
         let measured = cycle >= config.warmup;
         let cycle_clock = Instant::now();
 
-        edit_workspace(Path::new(worker.workspace.path()), config, cycle)?;
+        edit_workspace(
+            Path::new(worker.workspace.path()),
+            config,
+            worker.idx,
+            cycle,
+            config.backend == Backend::D6,
+        )?;
         let recreate =
             config.recreate_every > 0 && (cycle + 1).is_multiple_of(config.recreate_every);
         if recreate {
@@ -2197,6 +3251,7 @@ fn build_driver(
                 project: "proj-bench".to_string(),
                 disk_root,
                 cas_root,
+                scratch_root: scratch.root.clone(),
                 cas,
                 pg_pool: pool,
                 pg_url: url.to_string(),
@@ -2290,6 +3345,42 @@ fn run(config: &Config) -> Result<Value, String> {
     )
 }
 
+fn compute_logical_written_bytes(config: &Config) -> (u64, u64) {
+    let logical_workspace_bytes = u64::try_from(
+        config
+            .files
+            .saturating_mul(config.file_bytes)
+            .saturating_add(config.oversized_file_bytes.unwrap_or(0))
+            .saturating_mul(config.concurrency),
+    )
+    .unwrap_or(u64::MAX);
+    let total_cycles_per_worker = config.warmup.saturating_add(config.iterations);
+    let edited_bytes_all_workers = u64::try_from(
+        total_cycles_per_worker
+            .saturating_mul(config.edits)
+            .saturating_mul(config.file_bytes)
+            .saturating_mul(config.concurrency),
+    )
+    .unwrap_or(u64::MAX);
+    let extra_branch_bytes = if config.backend == Backend::D6 {
+        let init_bytes = BRANCH_INIT_FILES.saturating_mul(config.file_bytes);
+        let deliv_bytes = if config.land_branches {
+            config.land_payload_bytes
+        } else {
+            0
+        };
+        init_bytes
+            .saturating_add(deliv_bytes)
+            .saturating_mul(config.concurrency)
+    } else {
+        0
+    };
+    let logical_written_bytes = logical_workspace_bytes
+        .saturating_add(edited_bytes_all_workers)
+        .saturating_add(u64::try_from(extra_branch_bytes).unwrap_or(u64::MAX));
+    (logical_workspace_bytes, logical_written_bytes)
+}
+
 fn finalize_and_build_report(
     driver: &Arc<dyn BenchDriver>,
     config: &Config,
@@ -2332,23 +3423,7 @@ fn finalize_and_build_report(
     let benchmark_binary_sha256 = binary_sha256()?;
 
     let mut disk = driver.disk_breakdown(scratch, &active_paths)?;
-    let logical_workspace_bytes = u64::try_from(
-        config
-            .files
-            .saturating_mul(config.file_bytes)
-            .saturating_add(config.oversized_file_bytes.unwrap_or(0))
-            .saturating_mul(config.concurrency),
-    )
-    .unwrap_or(u64::MAX);
-    let total_cycles_per_worker = config.warmup.saturating_add(config.iterations);
-    let edited_bytes_all_workers = u64::try_from(
-        total_cycles_per_worker
-            .saturating_mul(config.edits)
-            .saturating_mul(config.file_bytes)
-            .saturating_mul(config.concurrency),
-    )
-    .unwrap_or(u64::MAX);
-    let logical_written_bytes = logical_workspace_bytes.saturating_add(edited_bytes_all_workers);
+    let (logical_workspace_bytes, logical_written_bytes) = compute_logical_written_bytes(config);
     let total_bytes = disk["total_bytes"].as_u64().unwrap_or(0);
     #[expect(clippy::cast_precision_loss)]
     let amp = (total_bytes as f64) / (logical_workspace_bytes.max(1) as f64);
@@ -2397,7 +3472,7 @@ fn finalize_and_build_report(
     if let Some(shadow) = driver.shadow_metrics_json() {
         report["shadow_oracle"] = shadow;
     }
-    if let Some(always_on) = driver.always_on_d6_json(config, logical_written_bytes) {
+    if let Some(always_on) = driver.always_on_d6_json(config, logical_written_bytes)? {
         report["always_on_d6"] = always_on;
     }
     Ok(report)
@@ -2428,6 +3503,7 @@ fn build_cfg_json(config: &Config, has_database: bool) -> Value {
     }
     if config.land_branches {
         cfg_json["land_branches"] = json!(true);
+        cfg_json["land_payload_bytes"] = json!(config.land_payload_bytes);
     }
     if config.crash_restart_drill {
         cfg_json["crash_restart_drill"] = json!(true);
@@ -2515,6 +3591,45 @@ fn run_merge_phase(
 }
 
 fn main() {
+    let mut raw_args = env::args().skip(1);
+    match raw_args.next().as_deref() {
+        Some("--internal-crash-writer") => {
+            let Some(path) = raw_args.next() else {
+                eprintln!("--internal-crash-writer requires a manifest path");
+                std::process::exit(2);
+            };
+            if let Err(err) = internal_crash_writer_main(Path::new(&path)) {
+                eprintln!("storage benchmark internal-crash-writer: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some("--internal-crash-verify") => {
+            let Some(path) = raw_args.next() else {
+                eprintln!("--internal-crash-verify requires a manifest path");
+                std::process::exit(2);
+            };
+            match internal_crash_verify_main(Path::new(&path)) {
+                Ok(report) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&report).expect("JSON verifier report")
+                    );
+                    let _ = std::io::stdout().flush();
+                    if report["verified"].as_bool() != Some(true) {
+                        std::process::exit(1);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("storage benchmark internal-crash-verify: {err}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+
     match config() {
         Ok(None) => print!("{USAGE}"),
         Ok(Some(config)) => match run(&config) {
@@ -2534,5 +3649,86 @@ fn main() {
             eprintln!("{error}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LAND_DELTA_SLO_BYTES, append_torn_journal_and_recover, cas_payload_bytes,
+        evaluate_land_delta_slo, fill_mixed_payload,
+    };
+    use spawn_cas::{Digest, GitOid, JournalEntry, RefJournal, sha256_of};
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-storage-bench-test-{tag}-{}-{nanos:x}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp test dir");
+        dir
+    }
+
+    #[test]
+    fn cas_payload_bytes_fails_closed_when_unreadable_or_missing() {
+        let dir = unique_tmp_dir("missing-cas");
+        assert!(cas_payload_bytes(&dir).is_err());
+        fs::write(dir.join("objects"), b"not-a-dir").expect("write file");
+        assert!(cas_payload_bytes(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixed_payload_corpus_is_heterogeneous_across_seeds_and_blocks() {
+        let a = fill_mixed_payload(1, "// branch-0\n", 16 * 1024);
+        let b = fill_mixed_payload(2, "// branch-1\n", 16 * 1024);
+        assert_ne!(sha256_of(&a), sha256_of(&b));
+        let unique_bytes: BTreeSet<u8> = a.iter().copied().collect();
+        assert!(
+            unique_bytes.len() > 200,
+            "expected high-entropy heterogeneous payload, got {} unique byte values",
+            unique_bytes.len()
+        );
+    }
+
+    #[test]
+    fn torn_journal_tail_is_ignored_and_healed_without_losing_committed_entries() {
+        let dir = unique_tmp_dir("torn-journal");
+        let jpath = dir.join("refs.journal");
+        let journal = RefJournal::new(&jpath);
+        for seq in 1..=3_u64 {
+            let entry = JournalEntry {
+                seq,
+                project: "proj-bench".to_string(),
+                name: format!("branch/b{seq}"),
+                kind: "branch".to_string(),
+                old_snapshot: None,
+                new_snapshot: Digest::parse(&sha256_of(format!("s{seq}").as_bytes()).to_string())
+                    .expect("digest"),
+                git_oid: GitOid::parse_hex(&format!("{seq:040x}")).expect("oid"),
+                at_ms: 1_700_000_000_000 + i64::try_from(seq).expect("i64"),
+            };
+            journal.append(&entry).expect("append entry");
+        }
+        let recovered = append_torn_journal_and_recover(&jpath, 3).expect("torn recovery");
+        assert_eq!(recovered, 3);
+        let reread = journal.read_all().expect("reread healed journal");
+        assert_eq!(reread.len(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn land_delta_slo_rejects_over_50_mib_and_empty_landings() {
+        assert!(evaluate_land_delta_slo(8, 8, 8, 256 * 1024));
+        assert!(!evaluate_land_delta_slo(8, 8, 8, LAND_DELTA_SLO_BYTES + 1));
+        assert!(!evaluate_land_delta_slo(8, 8, 8, LAND_DELTA_SLO_BYTES));
+        assert!(!evaluate_land_delta_slo(7, 8, 7, 256 * 1024));
+        assert!(!evaluate_land_delta_slo(0, 8, 0, 0));
     }
 }
