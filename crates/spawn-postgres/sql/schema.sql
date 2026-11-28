@@ -643,6 +643,122 @@ begin
     returning c.id, c.lease_attempt, c.agent_id, c.session_id, c.action, c.principal, c.created_at_ms;
 end $$;
 
+-- Deterministic 64-bit unsigned FNV-1a shard ownership matching Rust's
+-- `spawn_core::port::BridgeShard::owns_session` bit-for-bit across all UTF-8
+-- session IDs and u16 partition specs.
+drop function if exists spawn_fnv1a_shard_owns(text, integer, integer);
+create or replace function spawn_fnv1a_shard_owns(
+    p_session text,
+    p_index   integer,
+    p_total   integer
+) returns boolean language plpgsql immutable as $$
+declare
+    v_bytes   bytea;
+    v_len     integer;
+    v_i       integer;
+    v_hi      bigint := 3421674724; -- 0xcbf29ce4
+    v_lo      bigint := 2216829733; -- 0x84222325
+    v_lo_prod bigint;
+    v_carry   bigint;
+    v_new_hi  bigint;
+    v_mod     bigint;
+begin
+    if p_session is null
+       or p_total is null
+       or p_index is null
+       or p_total < 1
+       or p_total > 65535
+       or p_index < 0
+       or p_index >= p_total then
+        raise exception 'invalid shard check (%/% for session %)',
+                        p_index, p_total, p_session
+            using errcode = '22023';
+    end if;
+
+    v_bytes := convert_to(p_session, 'UTF8');
+    v_len := octet_length(v_bytes);
+    for v_i in 0 .. v_len - 1 loop
+        v_lo := v_lo # get_byte(v_bytes, v_i)::bigint;
+        -- 64-bit unsigned FNV-1a prime 0x0100_0000_01b3 = (1 << 40) + 435.
+        v_lo_prod := v_lo * 435::bigint;
+        v_carry := v_lo_prod >> 32;
+        v_new_hi := (v_hi * 435::bigint
+                     + ((v_lo & 16777215::bigint) << 8)
+                     + v_carry) & 4294967295::bigint;
+        v_lo := v_lo_prod & 4294967295::bigint;
+        v_hi := v_new_hi;
+    end loop;
+
+    v_mod := ((v_hi % p_total::bigint) * (4294967296::bigint % p_total::bigint)
+              + (v_lo % p_total::bigint)) % p_total::bigint;
+    return v_mod = p_index::bigint;
+end
+$$;
+
+-- Owner-only shard-filtered claim: leases the oldest claimable command whose
+-- session belongs to shard `(p_shard_index, p_shard_total)` without touching or
+-- leasing commands owned by other shards.
+drop function if exists spawn_claim_shard(text, bigint, integer, integer);
+create or replace function spawn_claim_shard(
+    p_worker      text,
+    p_ttl_ms      bigint,
+    p_shard_index integer,
+    p_shard_total integer
+) returns table (
+    out_id            bigint,
+    out_attempt       integer,
+    out_agent         text,
+    out_session       text,
+    out_action        jsonb,
+    out_principal     text,
+    out_created_at_ms bigint
+) language plpgsql security definer as $$
+begin
+    perform spawn_lock_migrate_shared();
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner claims sharded commands' using errcode = '42501';
+    end if;
+    if p_shard_total is null
+       or p_shard_index is null
+       or p_shard_total < 1
+       or p_shard_total > 65535
+       or p_shard_index < 0
+       or p_shard_index >= p_shard_total then
+        raise exception 'invalid shard partition %/%', p_shard_index, p_shard_total
+            using errcode = '22023';
+    end if;
+
+    return query
+    with candidate as (
+        select c.id
+        from spawn_commands c
+        where c.state not in ('finished', 'failed', 'cancelled')
+          and (c.lease_until_ms is null or c.lease_until_ms <= spawn_now_ms())
+          and spawn_fnv1a_shard_owns(c.session_id, p_shard_index, p_shard_total)
+          and not exists (
+              select 1 from spawn_commands o
+              where o.session_id = c.session_id
+                and o.state not in ('finished', 'failed', 'cancelled')
+                and o.id < c.id
+                and not exists (
+                    select 1 from spawn_events w
+                    where w.session_id = o.session_id and w.source = 'bridge'
+                      and w.source_event_id = 'cmd_' || o.id || ':waiting')
+          )
+        order by c.id
+        for update skip locked
+        limit 1
+    )
+    update spawn_commands c
+    set lease_worker = p_worker,
+        lease_attempt = c.lease_attempt + 1,
+        lease_until_ms = spawn_now_ms() + p_ttl_ms
+    from candidate
+    where c.id = candidate.id
+    returning c.id, c.lease_attempt, c.agent_id, c.session_id, c.action, c.principal, c.created_at_ms;
+end
+$$;
+
 -- Leave a claimed command unfinished and claimable again in `p_ms`: an
 -- input that waits for its turn. A lease that is no longer this attempt's
 -- changes nothing. Returns whether it released.
@@ -1142,6 +1258,8 @@ revoke execute on function spawn_append_trusted(text, text, text, text, text, js
 revoke execute on function spawn_session_fold(text) from public;
 revoke execute on function spawn_submit(text, text, text, text, jsonb) from public;
 revoke execute on function spawn_claim(text, bigint) from public;
+revoke execute on function spawn_fnv1a_shard_owns(text, integer, integer) from public;
+revoke execute on function spawn_claim_shard(text, bigint, integer, integer) from public;
 revoke execute on function spawn_release(bigint, integer, bigint) from public;
 revoke execute on function spawn_finish(bigint, integer, boolean, text) from public;
 revoke execute on function spawn_cancel(bigint, integer, text) from public;
@@ -1157,6 +1275,10 @@ begin
     );
     execute format(
         'alter function spawn_gateway_submit(text, text, text, jsonb) set search_path = %I, pg_temp',
+        current_schema()
+    );
+    execute format(
+        'alter function spawn_claim_shard(text, bigint, integer, integer) set search_path = %I, pg_temp',
         current_schema()
     );
 end

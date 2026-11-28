@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use postgres::{Client, NoTls};
-use spawn_core::bridge::{Bridge, BridgeConfig};
+use spawn_core::bridge::{Bridge, BridgeConfig, BridgeShard};
 use spawn_core::command::{Claimed, CommandAction, Outcome, Submission};
 use spawn_core::contract;
 use spawn_core::event::{
@@ -5425,4 +5425,341 @@ fn watermark_writers_never_use_temp_tables_or_early_pg_current_xact_id() {
             );
         }
     }
+}
+
+fn build_parity_sessions(count: usize) -> Vec<SessionId> {
+    let mut sessions: Vec<SessionId> = Vec::with_capacity(count);
+    for i in 0..500_u32 {
+        sessions.push(SessionId::new(format!("session_shard_{i:04}")).expect("seq session"));
+    }
+    for ch in b'a'..=b'z' {
+        sessions.push(SessionId::new(format!("session_{}", char::from(ch))).expect("short"));
+    }
+    sessions.push(SessionId::new(format!("session_{}", "x".repeat(248))).expect("max len 256"));
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+    while sessions.len() < count {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let len = 4 + usize::try_from(seed % 60).expect("small mod");
+        let mut raw = String::from("session_");
+        let mut x = seed;
+        for _ in 0..len {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let idx = usize::try_from((x >> 32) % u64::try_from(alphabet.len()).expect("len"))
+                .expect("alphabet index");
+            raw.push(char::from(alphabet[idx]));
+        }
+        sessions.push(SessionId::new(raw).expect("random session"));
+    }
+    sessions
+}
+
+fn assert_sql_shard_parity(client: &mut Client, sessions: &[SessionId]) {
+    let session_strs: Vec<&str> = sessions.iter().map(SessionId::as_str).collect();
+    for total in [1_u16, 2, 4, 7, 16] {
+        let total_i32 = i32::from(total);
+        let rows = client
+            .query(
+                "select s.ord::bigint, o.idx
+                   from unnest($1::text[]) with ordinality as s(sid, ord)
+                   cross join lateral (
+                       select idx from generate_series(0, $2 - 1) as idx
+                        where spawn_fnv1a_shard_owns(s.sid, idx, $2)
+                   ) o
+                  order by s.ord, o.idx",
+                &[&session_strs, &total_i32],
+            )
+            .expect("batch parity query");
+        assert_eq!(
+            rows.len(),
+            sessions.len(),
+            "every session must have exactly one PG owner under total={total}"
+        );
+        for (i, row) in rows.iter().enumerate() {
+            let ord: i64 = row.get(0);
+            let pg_owner = u16::try_from(row.get::<_, i32>(1)).expect("owner fits u16");
+            assert_eq!(
+                usize::try_from(ord).expect("ord fits usize"),
+                i + 1,
+                "row ordinality mismatch"
+            );
+            let shard = BridgeShard::partition(pg_owner, total).expect("valid partition");
+            assert!(
+                shard.owns_session(&sessions[i]),
+                "PG owner {pg_owner}/{total} diverged from Rust for {}",
+                sessions[i]
+            );
+        }
+    }
+
+    let fnv1a_ref = |raw: &str, total: u16| -> u16 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in raw.as_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        u16::try_from(h % u64::from(total)).expect("mod fits u16")
+    };
+    for raw in ["", "a", "日本語-session", "🚀/colon:dash", &"z".repeat(300)] {
+        for total in [2_u16, 7, 16] {
+            let expected = i32::from(fnv1a_ref(raw, total));
+            let owns_expected: bool = client
+                .query_one(
+                    "select spawn_fnv1a_shard_owns($1, $2, $3)",
+                    &[&raw, &expected, &i32::from(total)],
+                )
+                .expect("utf8 fnv1a check")
+                .get(0);
+            assert!(owns_expected, "UTF-8 parity failed for {raw:?} mod {total}");
+        }
+    }
+}
+
+fn start_for(agent_name: &str, submission_session: SessionId, key: &str) -> Submission {
+    Submission {
+        agent_id: AgentId::new(agent_name).expect("valid agent"),
+        session_id: submission_session,
+        idempotency_key: IdempotencyKey::new(key).expect("valid key"),
+        action: CommandAction::Start {
+            engine: ENGINE.to_string(),
+            prompt: "hello".to_string(),
+            parent_session_id: None,
+            from: None,
+            model: None,
+            charter: None,
+            model_label: None,
+        },
+    }
+}
+
+#[test]
+fn sharded_claim_matches_rust_ownership_across_1050_sessions() {
+    let (store, schema) = store("shard_parity");
+    let mut client = admin(&schema);
+    let principal = Principal::new("tester").expect("principal");
+    let sessions = build_parity_sessions(1_050);
+    assert_sql_shard_parity(&mut client, &sessions);
+
+    let mut expected_ids = std::collections::BTreeSet::new();
+    for (idx, sess) in sessions.iter().take(80).enumerate() {
+        let cmd_id = store
+            .submit(
+                &principal,
+                &start_for(
+                    &format!("agent_parity_{idx}"),
+                    sess.clone(),
+                    &format!("parity-{idx}"),
+                ),
+            )
+            .expect("submit");
+        expected_ids.insert(cmd_id);
+    }
+    let mut claimed_ids = std::collections::BTreeSet::new();
+    for shard_idx in 0..4_u16 {
+        let shard = BridgeShard::partition(shard_idx, 4).expect("shard");
+        while let Some(claimed) = store
+            .claim_for_shard(&format!("w-{shard_idx}"), Duration::from_mins(1), shard)
+            .expect("claim_for_shard")
+        {
+            assert!(
+                shard.owns_session(&claimed.session_id),
+                "PG claimed foreign session {} for {shard}",
+                claimed.session_id
+            );
+            assert!(
+                claimed_ids.insert(claimed.command_id),
+                "duplicate claim across shards: {}",
+                claimed.command_id
+            );
+        }
+    }
+    assert_eq!(claimed_ids, expected_ids);
+
+    for (idx, total) in [(0_i32, 0_i32), (2, 2), (-1, 2), (0, 65536)] {
+        let err = client
+            .query_opt(
+                "select out_id from spawn_claim_shard('w', 60000, $1, $2)",
+                &[&idx, &total],
+            )
+            .expect_err("invalid shard bounds must fail closed");
+        assert_eq!(
+            err.code(),
+            Some(&postgres::error::SqlState::INVALID_PARAMETER_VALUE),
+            "unexpected error for {idx}/{total}: {err}"
+        );
+    }
+    let mut reader = common::as_login(&schema, "spawn_reader");
+    let reader_err = reader
+        .query_opt(
+            "select out_id from spawn_claim_shard('w', 60000, 0, 2)",
+            &[],
+        )
+        .expect_err("reader must not execute spawn_claim_shard");
+    assert_eq!(
+        reader_err.code(),
+        Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+    );
+}
+
+#[test]
+fn shard_zero_claims_owned_command_behind_1025_foreign_commands_in_one_tick() {
+    let (store, schema) = store("shard_1025");
+    let store = Arc::new(store);
+    let mut client = admin(&schema);
+    let principal = Principal::new("tester").expect("principal");
+    let shard_zero = BridgeShard::partition(0, 2).expect("0/2");
+    let shard_one = BridgeShard::partition(1, 2).expect("1/2");
+
+    let mut foreign_ids = Vec::with_capacity(1_025);
+    let mut n: u64 = 1;
+    while foreign_ids.len() < 1_025 {
+        let sid = SessionId::new(format!("session_pg1025_{n:05}")).expect("session");
+        let agent_name = format!("agent_pg1025_{n:05}");
+        n += 1;
+        if shard_one.owns_session(&sid) {
+            let id = store
+                .submit(
+                    &principal,
+                    &start_for(&agent_name, sid, &format!("pg-foreign-{n}")),
+                )
+                .expect("submit foreign");
+            foreign_ids.push(id);
+        }
+    }
+    let (target_agent, target_session) = loop {
+        let sid = SessionId::new(format!("session_pg1025_{n:05}")).expect("session");
+        let agent_name = format!("agent_pg1025_{n:05}");
+        n += 1;
+        if shard_zero.owns_session(&sid) {
+            break (agent_name, sid);
+        }
+    };
+    let target_cmd_id = store
+        .submit(
+            &principal,
+            &start_for(&target_agent, target_session, "pg-owned-tail"),
+        )
+        .expect("submit owned");
+
+    let host = Arc::new(MemoryStore::new("pg-shard-host", Arc::new(SystemClock)));
+    let mut cfg = BridgeConfig::new("pg-shard-0");
+    cfg.shard = shard_zero;
+    cfg.max_commands_per_tick = 1;
+    let mut bridge = Bridge::new(store.clone(), store.clone(), host.clone(), host, cfg);
+    bridge.recover().expect("recover");
+
+    let report = bridge
+        .tick()
+        .expect("single tick handles 0/2 behind 1025 1/2 commands");
+    assert_eq!(report.commands, 1);
+    assert_eq!(report.command_ids, vec![target_cmd_id]);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while bridge.starts_pending() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        let _ = bridge.work();
+    }
+
+    let touched_foreign: i64 = client
+        .query_one(
+            "select count(*) from spawn_commands
+              where id <> $1
+                and (lease_attempt > 0 or lease_worker is not null or lease_until_ms is not null)",
+            &[&target_cmd_id.0.cast_signed()],
+        )
+        .expect("count touched foreign rows")
+        .get(0);
+    assert_eq!(
+        touched_foreign, 0,
+        "zero foreign 1/2 rows may be leased or disturbed"
+    );
+
+    let first_foreign = store
+        .claim_for_shard("pg-shard-1", Duration::from_mins(1), shard_one)
+        .expect("claim 1/2")
+        .expect("oldest 1/2 command still queued");
+    assert_eq!(first_foreign.command_id, foreign_ids[0]);
+    assert_eq!(first_foreign.attempt, 1);
+}
+
+#[test]
+fn spawn_claim_shard_respects_exclusive_l0_migration_lock() {
+    let _budget = ApiBudgetGuard::exclusive();
+    let (store, schema) = store("l0_claim_shard");
+    let principal = Principal::new("tester").expect("principal");
+    let shard_zero = BridgeShard::partition(0, 2).expect("0/2");
+    let session = (1..1_000_u64)
+        .map(|n| SessionId::new(format!("session_l0_shard_{n}")).expect("session"))
+        .find(|sid| shard_zero.owns_session(sid))
+        .expect("0/2 session");
+    let expected_id = store
+        .submit(&principal, &start_for("agent_l0_shard", session, "l0-key"))
+        .expect("submit command");
+    drop(store);
+
+    let mut mig_conn = admin(&schema);
+    let mut mig_tx = mig_conn.transaction().expect("mig tx");
+    mig_tx
+        .batch_execute(
+            "select pg_advisory_xact_lock(
+                 1399957400,
+                 (
+                     ((quote_ident(current_schema())::regnamespace)::oid::bigint
+                      - case when (quote_ident(current_schema())::regnamespace)::oid::bigint >= 2147483648
+                             then 4294967296 else 0 end)::integer
+                 )
+             );",
+        )
+        .expect("acquire L0 exclusive lock");
+
+    let schema_name = schema.name().to_string();
+    let schema_for_thread = schema_name.clone();
+    let claimer = std::thread::spawn(move || -> i64 {
+        let mut conn = admin(&schema_for_thread);
+        conn.query_one(
+            "select out_id from spawn_claim_shard('l0-shard-worker', 60000, 0, 2)",
+            &[],
+        )
+        .expect("spawn_claim_shard succeeds after L0 release")
+        .get(0)
+    });
+
+    let mut watcher = admin(&schema_name);
+    let started = std::time::Instant::now();
+    loop {
+        let waiting: bool = watcher
+            .query_one(
+                "select exists (
+                     select 1 from pg_locks l
+                      where l.locktype = 'advisory'
+                        and l.database = (select oid from pg_database where datname = current_database())
+                        and l.classid = 1399957400::oid
+                        and l.objsubid = 2
+                        and l.objid = quote_ident($1)::regnamespace
+                        and l.mode = 'ShareLock'
+                        and not l.granted
+                 )",
+                &[&schema_name],
+            )
+            .expect("poll L0 waiter")
+            .get(0);
+        if waiting {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "concurrent spawn_claim_shard never waited on L0 exclusive lock"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !claimer.is_finished(),
+        "concurrent spawn_claim_shard must stay blocked until L0 migration commits"
+    );
+
+    mig_tx.commit().expect("release L0 migration lock");
+    let claimed_id = claimer.join().expect("join blocked claimer");
+    assert_eq!(claimed_id, expected_id.0.cast_signed());
 }

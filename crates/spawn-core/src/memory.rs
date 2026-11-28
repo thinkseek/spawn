@@ -19,8 +19,8 @@ use crate::id::{
     TerminalName, WorkspaceId,
 };
 use crate::port::{
-    ArchiveError, BaseMerge, Branch, CommandOwnership, CommandQueue, Commit, EventLog, FileWatch,
-    ForkFrom, Hold, Launch, READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError,
+    ArchiveError, BaseMerge, Branch, BridgeShard, CommandOwnership, CommandQueue, Commit, EventLog,
+    FileWatch, ForkFrom, Hold, Launch, READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError,
     TerminalHost, TranscriptArchive, WatchError, WorkspaceError, WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
@@ -582,6 +582,15 @@ impl CommandQueue for MemoryStore {
     }
 
     fn claim(&self, worker: &str, ttl: Duration) -> Result<Option<Claimed>, StoreError> {
+        self.claim_for_shard(worker, ttl, BridgeShard::All)
+    }
+
+    fn claim_for_shard(
+        &self,
+        worker: &str,
+        ttl: Duration,
+        shard: BridgeShard,
+    ) -> Result<Option<Claimed>, StoreError> {
         let mut state = self.lock();
         let now = self.clock.now();
         let candidate = {
@@ -604,6 +613,7 @@ impl CommandQueue for MemoryStore {
                 .iter()
                 .enumerate()
                 .filter(|(_, row)| !row.finished)
+                .filter(|(_, row)| shard.owns_session(&row.submission.session_id))
                 .filter(|(index, row)| {
                     !commands[..*index].iter().any(|older| {
                         older.submission.session_id == row.submission.session_id
