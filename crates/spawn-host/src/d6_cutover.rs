@@ -829,6 +829,7 @@ pub fn reconcile_refs_journal<L: RefLedger + ?Sized>(
     pg_latest_ref_seq: u64,
     reason_prefix: &str,
 ) -> Result<ReconcileReport, D6StoreError> {
+    let _journal_lock = store.lock_refs_journal()?;
     let all_entries = store.cas().read_ref_journal()?;
     let last_journal_seq = all_entries.iter().map(|e| e.seq).max().unwrap_or(0);
     let journal_ts: HashMap<Digest, i64> = all_entries
@@ -891,39 +892,8 @@ pub fn reconcile_refs_journal<L: RefLedger + ?Sized>(
             )));
         }
 
-        let reason = format!("{reason_prefix}:seq={}", entry.seq);
-        let applied_seq = match kind {
-            D6RefKind::Main => {
-                let task_id = if entry.old_snapshot.is_some() {
-                    let parsed =
-                        extract_spawn_task_trailer(&snap.commit_body).ok_or_else(|| {
-                            D6StoreError::InvalidInput(format!(
-                                "reconciling main advance seq={} missing Spawn-Task trailer",
-                                entry.seq
-                            ))
-                        })?;
-                    Some(parsed)
-                } else {
-                    None
-                };
-                ledger.land_main_ref(
-                    &entry.project,
-                    &entry.name,
-                    entry.old_snapshot.as_ref(),
-                    &entry.new_snapshot,
-                    task_id,
-                    &reason,
-                )?
-            }
-            D6RefKind::Branch | D6RefKind::Wip | D6RefKind::Tag => ledger.cas_ref(
-                &entry.project,
-                &entry.name,
-                kind,
-                entry.old_snapshot.as_ref(),
-                &entry.new_snapshot,
-                &reason,
-            )?,
-        };
+        let applied_seq =
+            replay_reconcile_entry(ledger, entry, kind, &snap.commit_body, reason_prefix)?;
         current_refs.insert(key, entry.new_snapshot.clone());
         last_ledger_seq = last_ledger_seq.max(applied_seq);
         entries_replayed += 1;
@@ -936,6 +906,47 @@ pub fn reconcile_refs_journal<L: RefLedger + ?Sized>(
         last_journal_seq,
         last_ledger_seq,
     })
+}
+
+fn replay_reconcile_entry<L: RefLedger + ?Sized>(
+    ledger: &L,
+    entry: &spawn_cas::JournalEntry,
+    kind: D6RefKind,
+    commit_body: &[u8],
+    reason_prefix: &str,
+) -> Result<u64, D6StoreError> {
+    let reason = format!("{reason_prefix}:seq={}", entry.seq);
+    match kind {
+        D6RefKind::Main => {
+            let task_id = if entry.old_snapshot.is_some() {
+                let parsed = extract_spawn_task_trailer(commit_body).ok_or_else(|| {
+                    D6StoreError::InvalidInput(format!(
+                        "reconciling main advance seq={} missing Spawn-Task trailer",
+                        entry.seq
+                    ))
+                })?;
+                Some(parsed)
+            } else {
+                None
+            };
+            ledger.land_main_ref(
+                &entry.project,
+                &entry.name,
+                entry.old_snapshot.as_ref(),
+                &entry.new_snapshot,
+                task_id,
+                &reason,
+            )
+        }
+        D6RefKind::Branch | D6RefKind::Wip | D6RefKind::Tag => ledger.cas_ref(
+            &entry.project,
+            &entry.name,
+            kind,
+            entry.old_snapshot.as_ref(),
+            &entry.new_snapshot,
+            &reason,
+        ),
+    }
 }
 
 fn ensure_snapshot_recorded_in_ledger<L: RefLedger + ?Sized>(
@@ -1001,6 +1012,7 @@ pub fn check_gc_fence(
     live_binding: &GcFenceBinding,
     pg_latest_ref_seq: u64,
 ) -> Result<GcFenceStatus, D6StoreError> {
+    let _journal_lock = store.lock_refs_journal()?;
     let journal_latest_seq = store.cas().latest_seq()?;
     store
         .cas()
@@ -1021,6 +1033,7 @@ pub fn run_persistent_gc_for_ledger<L: RefLedger + ?Sized>(
     pg_latest_ref_seq: u64,
     grace: Duration,
 ) -> Result<PersistentGcReport, D6StoreError> {
+    let _journal_lock = store.lock_refs_journal()?;
     let all_refs = ledger.list_refs(None)?;
     let mut unique_roots = BTreeSet::new();
     for r in all_refs {

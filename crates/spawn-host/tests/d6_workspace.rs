@@ -2760,3 +2760,92 @@ fn pg_d6_pin_worker_head_half_write_then_branch_move_keeps_journal_chain_valid()
         );
     }
 }
+
+#[test]
+fn pg_d6_concurrent_checkpoint_pin_and_discard_keep_refs_journal_strictly_monotonic() {
+    let fx = seed_bootstrap_main_and_agent(
+        "pin_worker_concurrent_seq",
+        "d6_pin_worker_concurrent_seq",
+        "proj-pin-conc",
+        "agent_conc_base",
+    );
+    let threads = 6usize;
+    let branches: Vec<BranchName> = (0..threads)
+        .map(|idx| BranchName::new(format!("agent_conc_{idx}")).expect("branch"))
+        .collect();
+    for branch in &branches {
+        fx.store.ensure_branch(branch, None).expect("ensure_branch");
+    }
+
+    let barrier = std::sync::Barrier::new(threads);
+    std::thread::scope(|scope| {
+        for (idx, branch) in branches.iter().enumerate() {
+            let fx = &fx;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                let task_id = 950 + i64::try_from(idx).expect("thread index");
+                let task_ref = spawn_host::workspace_rules::task_head_ref(task_id, "head");
+                for round in 0..3 {
+                    let ws = fx.store.mount(branch).expect("mount");
+                    let ws_dir = PathBuf::from(ws.path());
+                    fs::write(ws_dir.join("work.txt"), format!("t{idx}-r{round}-a\n"))
+                        .expect("write a");
+                    assert!(matches!(
+                        fx.store
+                            .checkpoint(&ws, &format!("ckpt {idx}/{round}"))
+                            .expect("ckpt"),
+                        Commit::Created(_)
+                    ));
+                    fs::write(ws_dir.join("work.txt"), format!("t{idx}-r{round}-b\n"))
+                        .expect("write b");
+                    fx.store
+                        .pin_worker_head(branch.as_str(), Some(&ws_dir), &[&task_ref])
+                        .expect("pin dirty")
+                        .expect("dirty commit");
+                    fx.store
+                        .pin_worker_head(branch.as_str(), None, &[&task_ref])
+                        .expect("pin clean")
+                        .expect("clean commit");
+                    fx.store.discard(&ws).expect("discard");
+                }
+            });
+        }
+    });
+
+    let entries = fx.cas.cas().read_ref_journal().expect("read journal");
+    assert!(
+        entries.len() > 20,
+        "expected >= 20 entries, got {}",
+        entries.len()
+    );
+    assert!(
+        entries.windows(2).all(|w| w[1].seq > w[0].seq),
+        "non-monotonic seq in refs.journal"
+    );
+    let suffix = fx
+        .cas
+        .cas()
+        .reconcile_entries_after(1)
+        .expect("reconcile_entries_after(1) succeeds");
+    assert!(!suffix.is_empty());
+
+    let binding = binding_from_pg(&fx.ledger_pg.pg);
+    let pg_seq = fx.ledger_pg.pg.latest_ref_log_seq().expect("pg seq");
+    let fence = check_gc_fence(&fx.cas, &binding, pg_seq).expect("gc fence aligned");
+    assert_eq!(fence.pg_latest_ref_seq, fence.journal_latest_seq);
+
+    let live: std::collections::BTreeMap<String, Digest> = fx
+        .ledger_pg
+        .list_refs(Some(&fx.project))
+        .expect("list live refs")
+        .into_iter()
+        .map(|r| (r.name, r.snapshot))
+        .collect();
+    let restored: std::collections::BTreeMap<String, Digest> =
+        replay_journal_into_fresh_pg(&fx, "d6_pin_worker_concurrent_restore")
+            .into_iter()
+            .map(|r| (r.name, r.snapshot))
+            .collect();
+    assert_eq!(restored, live);
+}

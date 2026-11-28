@@ -52,7 +52,8 @@ mod audit;
 pub use cas_dedup::{ArtifactRoot, DedupConfig, DedupError, DedupReport, dedup_dirs, prune_unused};
 pub use cas_merkle::{
     CasMerkleStore, D6RefKind, D6StoreError, InMemoryRefLedger, LedgerRef, LedgerSnapshot,
-    PublishRequest, PublishedSnapshot, RefLedger, TrackedSetPolicy, format_commit_body,
+    PublishRequest, PublishedSnapshot, RefLedger, RefsJournalLock, TrackedSetPolicy,
+    format_commit_body,
 };
 pub use container::{BwrapCapability, ContainerEnv, detect_container, probe_bwrap};
 pub use cow::{
