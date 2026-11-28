@@ -849,3 +849,132 @@ fn alert_archives_holds_back_behind_in_flight_writer_and_delivers_both_on_commit
         .collect();
     assert_eq!(ids, vec![id_a, id_b], "{after_commit}");
 }
+
+/// Reversed `commit_xid` vs `id` order across `alert_clock_watermark`,
+/// `alert_mirror`, `alert_control`, and `alert_archives`, including an
+/// older open blocker transaction:
+/// 1) `tx_b` allocates `x_b` first, `tx_c` allocates `x_c` (blocker), `tx_a`
+///    allocates `x_a` third.
+/// 2) `tx_a` appends lower-ID control + archive events, `tx_b` appends higher-ID
+///    control + archive events and commits first.
+/// 3) First reads see `B` at `(x_b, id_b_arch)` and never move backward when `A`
+///    commits behind open blocker `C`; once `C` commits, replaying from `B`'s
+///    cursor recovers all lower-ID events from `A` with zero gaps or duplicates.
+fn current_xid(tx: &mut postgres::Transaction<'_>) -> u64 {
+    tx.query_one("select pg_current_xact_id()::text", &[])
+        .expect("xid")
+        .get::<_, String>(0)
+        .parse()
+        .expect("parse xid")
+}
+
+fn payload_event_ids(val: &Value) -> Vec<i64> {
+    val.as_array()
+        .expect("array")
+        .iter()
+        .map(|r| r["event_id"].as_i64().expect("event_id"))
+        .collect()
+}
+
+#[test]
+fn alerts_reversed_xid_vs_id_order_recovers_lower_ids_without_regression() {
+    let (store, schema) = store("alerts_rev_xid_order");
+    let baseline = store.committed_watermark().expect("baseline");
+
+    let (mut conn_b, mut conn_c, mut conn_a) = (admin(&schema), admin(&schema), admin(&schema));
+    let mut tx_b = conn_b.transaction().expect("begin tx_b");
+    let x_b = current_xid(&mut tx_b);
+    let mut tx_c = conn_c.transaction().expect("begin tx_c");
+    let x_c = current_xid(&mut tx_c);
+    tx_c.execute(
+        "select pg_advisory_xact_lock(1399957401, hashtext('blocker_alerts_c'))",
+        &[],
+    )
+    .expect("blocker lock");
+    let mut tx_a = conn_a.transaction().expect("begin tx_a");
+    let x_a = current_xid(&mut tx_a);
+    assert!(x_b < x_c && x_c < x_a, "x_b={x_b} x_c={x_c} x_a={x_a}");
+
+    let archive_kind = |native: &str| json!({"name": "archive.failed", "detail": {"native": native, "reason": "reversed xid"}});
+    let id_ctrl_a: i64 = tx_a
+        .query_one(
+            "select spawn_control_record($1)",
+            &[&json!({"type": "mission.added", "id": 901, "text": "a mission", "origin": "human"})],
+        )
+        .expect("ctrl a")
+        .get(0);
+    let id_arch_a: i64 = tx_a
+        .query_one(
+            "select out_id from spawn_append_trusted('agent_a', 'sess_rev_arch_a', null, 'bridge', null, $1)",
+            &[&archive_kind("native_rev_a")],
+        )
+        .expect("arch a")
+        .get(0);
+    let id_arch_b: i64 = tx_b
+        .query_one(
+            "select out_id from spawn_append_trusted('agent_b', 'sess_rev_arch_b', null, 'bridge', null, $1)",
+            &[&archive_kind("native_rev_b")],
+        )
+        .expect("arch b")
+        .get(0);
+    assert!(id_ctrl_a < id_arch_a && id_arch_a < id_arch_b);
+
+    tx_b.commit().expect("commit tx_b");
+    let (clock_1, _) = store.alert_clock_watermark().expect("clock 1");
+    assert_eq!(
+        clock_1,
+        spawn_postgres::CommittedWatermark::new(x_b, id_arch_b)
+    );
+    let mirror_1 = store.alert_mirror().expect("mirror 1");
+    assert_eq!(mirror_1["watermark"].as_i64(), Some(id_arch_b));
+    assert_eq!(
+        mirror_1["watermark_xid"].as_str(),
+        Some(x_b.to_string().as_str())
+    );
+
+    let ctrl_1 = store.alert_control(baseline.event_id, 100).expect("ctrl 1");
+    assert!(ctrl_1["records"].as_array().is_some_and(Vec::is_empty));
+    let ctrl_cursor_1 = ctrl_1["watermark"].as_i64().expect("watermark");
+    assert_eq!(ctrl_cursor_1, id_arch_b);
+    let arch_1 = store.alert_archives(baseline.event_id).expect("arch 1");
+    assert_eq!(payload_event_ids(&arch_1), vec![id_arch_b]);
+
+    // Step 2: A commits while blocker C stays open -> clock must NOT move backward B -> 0!
+    tx_a.commit().expect("commit tx_a");
+    let (clock_2, _) = store.alert_clock_watermark().expect("clock 2");
+    assert_eq!(
+        clock_2, clock_1,
+        "watermark must not move backward while C is open"
+    );
+
+    // Step 3: Blocker C commits -> clock advances monotonically to A, and replaying from B's
+    // higher event_id cursor delivers both A's lower-id control event and lower-id archive event!
+    tx_c.commit().expect("commit tx_c");
+    let (clock_3, _) = store.alert_clock_watermark().expect("clock 3");
+    assert_eq!(
+        clock_3,
+        spawn_postgres::CommittedWatermark::new(x_a, id_arch_a)
+    );
+    assert!(clock_3 > clock_2);
+    assert_eq!(
+        store.alert_mirror().expect("mirror 3")["watermark"].as_i64(),
+        Some(id_arch_a)
+    );
+
+    let ctrl_3 = store.alert_control(ctrl_cursor_1, 100).expect("ctrl 3");
+    assert_eq!(payload_event_ids(&ctrl_3["records"]), vec![id_ctrl_a]);
+    let ctrl_cursor_3 = ctrl_3["next"].as_i64().expect("next 3");
+    assert_eq!(ctrl_cursor_3, id_ctrl_a);
+    assert!(
+        store.alert_control(ctrl_cursor_3, 100).expect("ctrl tail")["records"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+
+    let arch_3 = store.alert_archives(id_arch_b).expect("arch 3");
+    assert_eq!(payload_event_ids(&arch_3), vec![id_arch_a]);
+    assert_eq!(
+        store.alert_archives(id_arch_a).expect("arch tail"),
+        json!([])
+    );
+}

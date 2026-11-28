@@ -7,9 +7,10 @@
 //! line starting with `#` is a comment. The first matching line wins. Host
 //! is the URL's TCP host by name or its socket directory by path, and
 //! `localhost` also matches a connection over a default socket directory;
-//! port is the URL's (default 5432); database and user come strictly from the
-//! URL or explicit caller defaults (`default_user`), never ambient OS/env
-//! identity, with database defaulting to the resolved user when absent.
+//! port is the URL's (default 5432); database defaults to the resolved user
+//! when absent; user resolves as `URL user -> explicit default_user -> OS
+//! process user fallback via whoami`, written back into `postgres::Config` so
+//! driver startup, `.pgpass` matching, and reconnects always agree.
 //!
 //! A file its group or others can read or write is not used, as libpq
 //! refuses it: said once on stderr, by its path. A URL that holds a
@@ -45,46 +46,103 @@ const DEFAULT_SOCKET_DIRS: [&str; 3] = ["/tmp", "/var/run/postgresql", "/run/pos
 /// The passfiles already said to be refused: each is said once.
 static REFUSED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
+/// Error constructing a `postgres::Config` with passfile password lookup.
+///
+/// Never embeds raw URLs, credentials, or passfile secrets in [`Display`].
+#[derive(Debug)]
+pub(crate) enum PassfileConfigError {
+    /// The database connection string failed to parse as a `postgres::Config`.
+    InvalidUrl(postgres::Error),
+    /// An explicitly configured passfile existed but could not be read or decoded.
+    PassfileRead { path: PathBuf, reason: String },
+}
+
+impl std::fmt::Display for PassfileConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidUrl(error) => write!(formatter, "{error}"),
+            Self::PassfileRead { path, reason } => {
+                write!(formatter, "invalid passfile {}: {reason}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for PassfileConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidUrl(error) => Some(error),
+            Self::PassfileRead { .. } => None,
+        }
+    }
+}
+
+/// Resolve the effective PostgreSQL login user identically for driver startup,
+/// `.pgpass` matching, and reconnects: explicit URL `user`, else caller-supplied
+/// `default_user`, else OS process user (`whoami`).
+fn resolve_effective_user(config: &postgres::Config, default_user: Option<&str>) -> Option<String> {
+    if let Some(user) = config.get_user().filter(|value| !value.is_empty()) {
+        return Some(user.to_string());
+    }
+    if let Some(user) = default_user.filter(|value| !value.is_empty()) {
+        return Some(user.to_string());
+    }
+    whoami::username().ok().filter(|value| !value.is_empty())
+}
+
 /// `url` parsed as the driver reads it, reading a password from `passfile`
-/// when the URL itself carries none, with no ambient OS-user fallback.
+/// when the URL itself carries none, with unified user resolution across
+/// driver startup, passfile matching, and reconnects.
 ///
 /// # Errors
 ///
-/// When the URL does not parse.
+/// When the URL does not parse or an existing passfile cannot be read/decoded.
 pub(crate) fn config(
     url: &str,
     passfile: Option<&Path>,
-) -> Result<postgres::Config, postgres::Error> {
+) -> Result<postgres::Config, PassfileConfigError> {
     config_with_default_user(url, passfile, None)
 }
 
 /// `url` parsed as the driver reads it, reading a password from `passfile`
-/// when the URL itself carries none and using an explicit `default_user` when
-/// the URL omits `user`.
+/// when the URL itself carries none and writing any resolved user (`config.user`,
+/// explicit `default_user`, or OS fallback) back into `postgres::Config` so
+/// driver startup, passfile matching, and reconnects always agree.
 ///
 /// # Errors
 ///
-/// When the URL does not parse.
+/// When the URL does not parse or an existing passfile cannot be read/decoded.
 pub(crate) fn config_with_default_user(
     url: &str,
     passfile: Option<&Path>,
     default_user: Option<&str>,
-) -> Result<postgres::Config, postgres::Error> {
-    let mut config: postgres::Config = url.parse()?;
+) -> Result<postgres::Config, PassfileConfigError> {
+    let mut config: postgres::Config = url.parse().map_err(PassfileConfigError::InvalidUrl)?;
+    let resolved_user = resolve_effective_user(&config, default_user);
+    if config.get_user().is_none()
+        && let Some(user) = resolved_user.as_deref()
+    {
+        config.user(user);
+    }
     if config.get_password().is_none()
         && let Some(path) = passfile
     {
-        fill_from(&mut config, path, default_user);
+        fill_from(&mut config, path, resolved_user.as_deref())?;
     }
     Ok(config)
 }
 
 /// Give `config`, which has no password, the password of the passfile at
-/// `path` when a line matches.
-fn fill_from(config: &mut postgres::Config, path: &Path, default_user: Option<&str>) {
-    if let Some(password) = lookup(path, &Target::of(config, default_user)) {
+/// `path` when a line matches, propagating typed passfile read/decode errors.
+fn fill_from(
+    config: &mut postgres::Config,
+    path: &Path,
+    default_user: Option<&str>,
+) -> Result<(), PassfileConfigError> {
+    if let Some(password) = lookup(path, &Target::of(config, default_user))? {
         config.password(password.expose_secret());
     }
+    Ok(())
 }
 
 /// What a passfile line is matched against.
@@ -101,13 +159,15 @@ struct Target {
 }
 
 impl Target {
-    /// The first host and port of `config`, its database and user (with only
-    /// an explicit caller-supplied `fallback_user`, never ambient OS user).
+    /// The effective host/hostaddr and port of `config`, its database and user.
     fn of(config: &postgres::Config, fallback_user: Option<&str>) -> Self {
         let (host, socket) = match config.get_hosts().first() {
             Some(postgres::config::Host::Tcp(name)) => (name.clone(), false),
             Some(postgres::config::Host::Unix(path)) => (path.display().to_string(), true),
-            None => (String::from("localhost"), true),
+            None => match config.get_hostaddrs().first() {
+                Some(ip) => (ip.to_string(), false),
+                None => (String::from("localhost"), true),
+            },
         };
         let default_socket = socket
             && (host == "localhost"
@@ -139,22 +199,38 @@ impl Target {
 }
 
 /// The password of the first line of the passfile at `path` matching
-/// `target`; `None` when the file is missing, refused or has no match.
-fn lookup(path: &Path, target: &Target) -> Option<SecretString> {
-    let meta = std::fs::metadata(path).ok()?;
+/// `target`; `Ok(None)` when the file does not exist, is not a regular file,
+/// has group/world permissions, or has no matching line. Propagates typed read/
+/// UTF-8 decode errors so callers never degrade corrupt passfiles into missing-password
+/// misses.
+fn lookup(path: &Path, target: &Target) -> Result<Option<SecretString>, PassfileConfigError> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(PassfileConfigError::PassfileRead {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            });
+        }
+    };
     if !meta.is_file() {
-        return None;
+        return Ok(None);
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         if meta.permissions().mode() & 0o077 != 0 {
             refused(path);
-            return None;
+            return Ok(None);
         }
     }
-    let text = SecretString::new(std::fs::read_to_string(path).ok()?);
-    password_in(text.expose_secret(), target)
+    let raw = std::fs::read_to_string(path).map_err(|error| PassfileConfigError::PassfileRead {
+        path: path.to_path_buf(),
+        reason: error.to_string(),
+    })?;
+    let text = SecretString::new(raw);
+    Ok(password_in(text.expose_secret(), target))
 }
 
 /// Say once that the passfile at `path` is not used, by its path.
@@ -365,14 +441,42 @@ mod tests {
         ));
         std::fs::write(&path, "*:*:*:*:pw\n").expect("write");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-        let refused = lookup(&path, &target("h", false));
+        let refused = lookup(&path, &target("h", false)).expect("0644 refused returns Ok(None)");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        let used = lookup(&path, &target("h", false));
-        let missing = lookup(&path.with_extension("none"), &target("h", false));
+        let used = lookup(&path, &target("h", false)).expect("valid passfile");
+        let missing =
+            lookup(&path.with_extension("none"), &target("h", false)).expect("missing is Ok(None)");
         let _ = std::fs::remove_file(&path);
         assert!(refused.is_none());
         assert_eq!(used.as_ref().map(SecretString::expose_secret), Some("pw"));
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn undecodable_mode_0600_passfile_returns_typed_read_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = std::env::temp_dir().join(format!(
+            "spawn-passfile-badutf8-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::write(&path, [0xff_u8, 0xfe, b'\n']).expect("write invalid bytes");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let lookup_err = lookup(&path, &target("h", false))
+            .expect_err("undecodable passfile must fail closed with PassfileRead");
+        assert!(matches!(
+            lookup_err,
+            super::PassfileConfigError::PassfileRead { .. }
+        ));
+        let cfg_err = super::config("postgres://u@h/db", Some(&path))
+            .expect_err("config() must propagate PassfileRead");
+        assert!(matches!(
+            cfg_err,
+            super::PassfileConfigError::PassfileRead { .. }
+        ));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -444,7 +548,142 @@ mod tests {
         let explicit = config_with_default_user("host=db.example", Some(&path), Some("alice"))
             .expect("parses");
         assert_eq!(explicit.get_password(), Some(&b"explicit_user_pw"[..]));
+        assert_eq!(explicit.get_user(), Some("alice"));
+
+        let os_default = super::config("postgres://db.example/alice", None).expect("parses");
+        let expected_os_user = whoami::username().ok().filter(|v| !v.is_empty());
+        assert_eq!(
+            os_default.get_user().map(str::to_string),
+            expected_os_user,
+            "config() resolves and populates the same OS user that startup uses when URL omits user"
+        );
         let _ = std::fs::remove_file(&path);
+    }
+
+    struct TempScramEnv {
+        admin: postgres::Client,
+        temp_db: String,
+        role_to_drop: Option<String>,
+        dir: std::path::PathBuf,
+    }
+    impl Drop for TempScramEnv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = self.admin.batch_execute(&format!(
+                "drop database if exists \"{}\" with (force)",
+                self.temp_db
+            ));
+            if let Some(ref role) = self.role_to_drop {
+                let ident = format!("\"{}\"", role.replace('"', "\"\""));
+                let _ = self
+                    .admin
+                    .batch_execute(&format!("drop role if exists {ident}"));
+            }
+        }
+    }
+
+    fn current_db_user(store: &crate::PostgresStore) -> String {
+        store
+            .lock()
+            .query_one("select current_user::text", &[])
+            .expect("current_user")
+            .get(0)
+    }
+
+    #[test]
+    fn live_scram_connects_when_url_omits_username_via_mode_0600_passfile() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Ok(url) = std::env::var("SPAWN_TEST_DATABASE_URL") else {
+            return;
+        };
+        let os_user = whoami::username().expect("process username");
+        let full: postgres::Config = url.parse().expect("parse test url");
+        let host = match full.get_hosts().first() {
+            Some(postgres::config::Host::Tcp(h)) => h.clone(),
+            Some(postgres::config::Host::Unix(p)) => p.display().to_string(),
+            None => "localhost".to_string(),
+        };
+        let port = full.get_ports().first().copied().unwrap_or(5432);
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("admin connect");
+        let nonce = format!(
+            "{}_{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        );
+        let temp_db = format!("spawn_pgpass_nouser_{nonce}");
+        let role_pw = format!("pgpass_scram_pw_{nonce}");
+        let role_exists: bool = admin
+            .query_one(
+                "select exists (select 1 from pg_roles where rolname = $1)",
+                &[&os_user],
+            )
+            .expect("check role")
+            .get(0);
+        assert!(
+            !role_exists || full.get_user() == Some(os_user.as_str()),
+            "test cluster unexpectedly already has OS user role {os_user:?}"
+        );
+        let role_ident = format!("\"{}\"", os_user.replace('"', "\"\""));
+        if !role_exists {
+            admin
+                .batch_execute(&format!(
+                    "create role {role_ident} login password '{}'",
+                    role_pw.replace('\'', "''")
+                ))
+                .expect("create OS-user role");
+        }
+        let pass_for_file = if role_exists {
+            String::from_utf8_lossy(full.get_password().unwrap_or_default()).into_owned()
+        } else {
+            role_pw
+        };
+        admin
+            .batch_execute(&format!("create database \"{temp_db}\" owner {role_ident}"))
+            .expect("create temp db");
+        let dir = std::env::temp_dir().join(format!("spawn-pgpass-nouser-{nonce}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let pf = dir.join("pgpass");
+        let _cleanup = TempScramEnv {
+            admin,
+            temp_db: temp_db.clone(),
+            role_to_drop: (!role_exists).then(|| os_user.clone()),
+            dir,
+        };
+        let line = format!(
+            "{}:{port}:{}:{}:{}\n",
+            escaped(&host),
+            escaped(&temp_db),
+            escaped(&os_user),
+            escaped(&pass_for_file)
+        );
+        std::fs::write(&pf, line).expect("write pgpass");
+        std::fs::set_permissions(&pf, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        let omitted_user_url = if host.starts_with('/') {
+            format!("postgres://{}:{port}/{temp_db}", host.replace('/', "%2F"))
+        } else {
+            format!("postgres://{host}:{port}/{temp_db}")
+        };
+        let opts = crate::ConnectOptions {
+            passfile: Some(pf),
+            statement_timeout: None,
+        };
+        let store = crate::PostgresStore::connect_with_options(&omitted_user_url, &opts)
+            .expect("omitted-username URL must connect via passfile + OS user");
+        assert_eq!(current_db_user(&store), os_user);
+
+        let child = store
+            .new_connection()
+            .expect("new_connection reconnects cleanly without URL username");
+        assert_eq!(current_db_user(&child), os_user);
+
+        let _connector_store = store
+            .connector(std::time::Duration::from_secs(5))
+            .connect()
+            .expect("StoreConnector connects without URL username");
     }
 
     /// A field written as a passfile writes it: `:` and `\` escaped.
@@ -512,7 +751,7 @@ mod tests {
             without.dbname(database);
         }
         let before = without.get_password().is_none();
-        fill_from(&mut without, &path, None);
+        fill_from(&mut without, &path, None).expect("fill_from valid passfile");
         let filled = without.get_password() == full.get_password();
         let connected = without.connect(postgres::NoTls).is_ok();
         let _ = std::fs::remove_file(&path);

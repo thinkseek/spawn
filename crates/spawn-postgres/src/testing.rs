@@ -162,10 +162,12 @@ impl std::fmt::Display for TestSchema {
 /// none (objective 109), so a schema made under a password-less URL is
 /// dropped as it was made; it gives up connecting after
 /// [`CONNECT_TIMEOUT`].
-fn client(url: &str) -> Result<postgres::Client, postgres::Error> {
-    crate::passfile::config(url, test_passfile().as_deref())?
+fn client(url: &str) -> Result<postgres::Client, String> {
+    crate::passfile::config(url, test_passfile().as_deref())
+        .map_err(|error| error.to_string())?
         .connect_timeout(CONNECT_TIMEOUT)
         .connect(postgres::NoTls)
+        .map_err(|error| error.to_string())
 }
 
 /// Drops the schema: as the test passes, and as a failing test unwinds (the
@@ -190,10 +192,12 @@ impl Drop for TestSchema {
             return;
         }
         let dropped = client(self.url.expose_secret()).and_then(|mut client| {
-            client.batch_execute(&format!(
-                "set lock_timeout = '5s'; drop schema if exists {} cascade",
-                self.name
-            ))
+            client
+                .batch_execute(&format!(
+                    "set lock_timeout = '5s'; drop schema if exists \"{}\" cascade",
+                    self.name.replace('"', "\"\"")
+                ))
+                .map_err(|error| error.to_string())
         });
         match dropped {
             Err(error) => eprintln!("cannot drop the test schema {}: {error}", self.name),
@@ -297,7 +301,10 @@ mod tests {
         let url = std::env::var(super::TEST_DATABASE_URL).expect("the test database");
         super::client(&url)
             .expect("connect")
-            .batch_execute(&format!("drop schema {name} cascade"))
+            .batch_execute(&format!(
+                "drop schema \"{}\" cascade",
+                name.replace('"', "\"\"")
+            ))
             .expect("drop the kept schema");
     }
 

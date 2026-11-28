@@ -202,8 +202,14 @@ fn test_database_read(
     statement: &str,
     passfile: Option<&std::path::Path>,
 ) -> Result<Value, StoreError> {
-    let mut config = crate::passfile::config(url, passfile)
-        .map_err(|_| StoreError::Backend("the URL is not a postgres URL".to_string()))?;
+    let mut config = crate::passfile::config(url, passfile).map_err(|error| match error {
+        crate::passfile::PassfileConfigError::InvalidUrl(_) => {
+            StoreError::Backend("the URL is not a postgres URL".to_string())
+        }
+        crate::passfile::PassfileConfigError::PassfileRead { .. } => {
+            StoreError::Backend(error.to_string())
+        }
+    })?;
     let limit = format!("-c statement_timeout={}", TEST_DATABASE_LIMIT.as_millis());
     let options = match config.get_options() {
         Some(options) if !options.trim().is_empty() => format!("{options} {limit}"),
@@ -265,13 +271,75 @@ pub struct LibpqDefaults {
     pub database: Option<String>,
 }
 
+fn is_loopback_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+/// Validated non-empty, non-loopback PostgreSQL remote host name or IP address.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RemoteHost(String);
+
+impl RemoteHost {
+    /// Parse and normalize a remote PostgreSQL TCP host name or IP address.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty/whitespace strings, bracketed or malformed host strings,
+    /// Unix socket paths (`/...`), `localhost`, and loopback IP addresses
+    /// (`127.0.0.0/8`, `::1`, `::ffff:127.0.0.0/8`).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        let bare = trimmed
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(trimmed)
+            .trim();
+        if bare.is_empty() {
+            return Err("names an empty host".to_string());
+        }
+        if bare.starts_with('/') {
+            return Err("unix socket path is local, not a remote host".to_string());
+        }
+        if bare.chars().any(char::is_whitespace) || bare.contains(['[', ']']) {
+            return Err("malformed remote host".to_string());
+        }
+        if bare.eq_ignore_ascii_case("localhost") {
+            return Err("localhost is local, not a remote host".to_string());
+        }
+        if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+            if is_loopback_ip(ip) {
+                return Err("loopback address is local, not a remote host".to_string());
+            }
+            return Ok(Self(ip.to_string()));
+        }
+        Ok(Self(bare.to_ascii_lowercase()))
+    }
+
+    /// Borrow the normalized remote host string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RemoteHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// Whether a PostgreSQL server is on this host or at a remote address.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HostLocality {
     /// A Unix socket, `localhost`, or a loopback IP address (`127.0.0.0/8`, `::1`).
     Local,
-    /// A non-empty, lowercased remote host name or non-loopback IP address.
-    Remote(String),
+    /// A validated, non-empty, non-loopback remote host name or IP address.
+    Remote(RemoteHost),
 }
 
 impl HostLocality {
@@ -281,12 +349,12 @@ impl HostLocality {
         matches!(self, Self::Local)
     }
 
-    /// The lowercased remote host name or address, or `None` when [`Self::Local`].
+    /// The normalized remote host name or address, or `None` when [`Self::Local`].
     #[must_use]
     pub fn remote_host(&self) -> Option<&str> {
         match self {
             Self::Local => None,
-            Self::Remote(host) => Some(host),
+            Self::Remote(host) => Some(host.as_str()),
         }
     }
 }
@@ -297,7 +365,7 @@ impl HostLocality {
 /// localhost or 127.0.0.1, an explicit 5432, another user) name the same.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseIdentity {
-    /// Whether the server is local to this host or at a remote host name.
+    /// Whether the server is local to this host or at a validated remote host.
     pub locality: HostLocality,
     /// TCP or Unix-socket port number (defaults to `LibpqDefaults::port` or 5432).
     pub port: u16,
@@ -314,12 +382,13 @@ impl DatabaseIdentity {
 }
 
 /// Resolve [`DatabaseIdentity`] using caller-supplied [`LibpqDefaults`] instead of
-/// ambient environment variables. Never names the URL in its error.
+/// ambient environment variables, honoring `tokio-postgres`'s real `hostaddr`
+/// precedence over `host`. Never names the URL in its error.
 ///
 /// # Errors
 ///
 /// A URL that does not parse as a postgres URL or key-value string, or one
-/// naming an empty host or more than one host or port.
+/// naming an empty host, malformed host, or more than one host/`hostaddr`/port.
 pub fn database_identity_with_defaults(
     url: &str,
     defaults: &LibpqDefaults,
@@ -329,24 +398,39 @@ pub fn database_identity_with_defaults(
         .parse()
         .map_err(|_: postgres::Error| "not a postgres URL".to_string())?;
     let hosts = config.get_hosts();
-    if hosts.len() > 1 {
+    let hostaddrs = config.get_hostaddrs();
+    if hosts.len() > 1 || hostaddrs.len() > 1 {
         return Err("names more than one host".to_string());
     }
-    let locality = match hosts.first() {
-        None | Some(postgres::config::Host::Unix(_)) => HostLocality::Local,
-        Some(postgres::config::Host::Tcp(name)) => {
-            let bare = name.trim().trim_start_matches('[').trim_end_matches(']');
-            if bare.is_empty() {
-                return Err("names an empty host".to_string());
-            }
-            let loopback = bare.eq_ignore_ascii_case("localhost")
-                || bare
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback());
-            if loopback {
-                HostLocality::Local
-            } else {
-                HostLocality::Remote(bare.to_ascii_lowercase())
+    let locality = if let Some(&ip) = hostaddrs.first() {
+        if is_loopback_ip(ip) {
+            HostLocality::Local
+        } else {
+            HostLocality::Remote(RemoteHost::parse(&ip.to_string())?)
+        }
+    } else {
+        match hosts.first() {
+            None | Some(postgres::config::Host::Unix(_)) => HostLocality::Local,
+            Some(postgres::config::Host::Tcp(name)) => {
+                let trimmed = name.trim();
+                let bare = trimmed
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or(trimmed)
+                    .trim();
+                if bare.is_empty() {
+                    return Err("names an empty host".to_string());
+                }
+                if bare.chars().any(char::is_whitespace) || bare.contains(['[', ']']) {
+                    return Err("malformed host".to_string());
+                }
+                let loopback = bare.eq_ignore_ascii_case("localhost")
+                    || bare.parse::<std::net::IpAddr>().is_ok_and(is_loopback_ip);
+                if loopback {
+                    HostLocality::Local
+                } else {
+                    HostLocality::Remote(RemoteHost::parse(bare)?)
+                }
             }
         }
     };
@@ -569,7 +653,7 @@ impl PostgresStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostLocality, LibpqDefaults, database_identity_with_defaults};
+    use super::{HostLocality, LibpqDefaults, RemoteHost, database_identity_with_defaults};
 
     #[test]
     fn database_identity_uses_explicit_defaults_without_reading_env() {
@@ -608,7 +692,7 @@ mod tests {
         assert!(!explicit_db.is_local());
         assert_eq!(
             explicit_db.locality,
-            HostLocality::Remote("db.example.com".to_string())
+            HostLocality::Remote(RemoteHost::parse("db.example.com").expect("remote"))
         );
         assert_eq!(explicit_db.locality.remote_host(), Some("db.example.com"));
         assert_eq!(explicit_db.port, 5433);
@@ -657,5 +741,90 @@ mod tests {
         .expect_err("empty bracket host must be refused");
         assert!(empty_host.contains("empty host"), "{empty_host}");
         assert!(!empty_host.contains("secret_pw"), "{empty_host}");
+    }
+
+    #[test]
+    fn hostaddr_precedence_and_remote_host_validation_match_driver() {
+        let remote_addr_with_local_host = database_identity_with_defaults(
+            "postgres://u:secret_pw@127.0.0.1/spawn_test?hostaddr=203.0.113.10",
+            &LibpqDefaults::default(),
+        )
+        .expect("parses hostaddr override");
+        assert!(!remote_addr_with_local_host.is_local());
+        assert_eq!(
+            remote_addr_with_local_host.locality.remote_host(),
+            Some("203.0.113.10")
+        );
+
+        let remote_addr_with_socket = database_identity_with_defaults(
+            "postgres://u@%2Fvar%2Frun%2Fpostgresql/spawn_test?hostaddr=203.0.113.10",
+            &LibpqDefaults::default(),
+        )
+        .expect("parses hostaddr over socket");
+        assert_eq!(remote_addr_with_socket, remote_addr_with_local_host);
+
+        let direct_remote = database_identity_with_defaults(
+            "postgres://u@203.0.113.10/spawn_test",
+            &LibpqDefaults::default(),
+        )
+        .expect("direct ip");
+        assert_eq!(remote_addr_with_local_host, direct_remote);
+
+        let local_hostaddr = database_identity_with_defaults(
+            "host=db.example.com hostaddr=127.0.0.1 dbname=spawn_test",
+            &LibpqDefaults::default(),
+        )
+        .expect("loopback hostaddr");
+        assert!(local_hostaddr.is_local());
+
+        let mapped_loopback = database_identity_with_defaults(
+            "postgres://u@[::ffff:127.0.0.1]/spawn_test",
+            &LibpqDefaults::default(),
+        )
+        .expect("v4-mapped loopback");
+        assert!(mapped_loopback.is_local());
+
+        let v6_long = database_identity_with_defaults(
+            "postgres://u@[2001:0db8::1]/spawn_test",
+            &LibpqDefaults::default(),
+        )
+        .expect("v6");
+        let v6_addr = database_identity_with_defaults(
+            "hostaddr=2001:db8::1 dbname=spawn_test",
+            &LibpqDefaults::default(),
+        )
+        .expect("v6 hostaddr");
+        assert_eq!(v6_long, v6_addr);
+        assert_eq!(v6_long.locality.remote_host(), Some("2001:db8::1"));
+
+        let multi_addr = database_identity_with_defaults(
+            "host=a,b hostaddr=127.0.0.1,127.0.0.2 dbname=spawn",
+            &LibpqDefaults::default(),
+        )
+        .expect_err("multiple hostaddrs must fail");
+        assert!(multi_addr.contains("more than one host"), "{multi_addr}");
+
+        for bad_remote in [
+            "",
+            "   ",
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.0.1.9",
+            "::1",
+            "[::1]",
+            "::ffff:127.0.0.1",
+            "/var/run/postgresql",
+            "bad host",
+        ] {
+            assert!(
+                RemoteHost::parse(bad_remote).is_err(),
+                "{bad_remote:?} must be refused by RemoteHost"
+            );
+        }
+        assert_eq!(
+            RemoteHost::parse("2001:0DB8::1").expect("valid").as_str(),
+            "2001:db8::1"
+        );
     }
 }

@@ -789,6 +789,11 @@ pub(crate) struct Monitor {
     started: bool,
     /// The last event id the step looked at.
     watermark: i64,
+    /// Transaction ID (`xid8`) paired with [`Self::watermark`].
+    watermark_xid: u64,
+    /// Monotonic `(commit_xid, event_id)` cursor already folded into alerts
+    /// (`MIRROR` / `CONTROL`), never regressed by clock lag or mid-step commits.
+    control_after: spawn_postgres::CommittedWatermark,
     /// When the host and the logs are read next, on the database's clock.
     next_reading_ms: i64,
     /// The earliest bound that has not fired yet.
@@ -1025,6 +1030,8 @@ impl Monitor {
             settings,
             started: false,
             watermark: 0,
+            watermark_xid: 0,
+            control_after: spawn_postgres::CommittedWatermark::default(),
             next_reading_ms: 0,
             next_bound_ms: None,
             known: BTreeMap::new(),
@@ -1066,6 +1073,23 @@ impl Monitor {
         }
     }
 
+    fn watermark_pos(&self) -> spawn_postgres::CommittedWatermark {
+        spawn_postgres::CommittedWatermark::new(self.watermark_xid, self.watermark)
+    }
+
+    fn set_watermark_pos(&mut self, pos: spawn_postgres::CommittedWatermark) {
+        self.watermark = pos.event_id;
+        self.watermark_xid = pos.commit_xid;
+    }
+
+    /// Parse a serialized `xid8` string field from alert JSON payloads.
+    fn parse_xid(value: &serde_json::Value) -> u64 {
+        value
+            .as_str()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
     /// One pass: read what is new, decide, record. Returns lines for the
     /// loop's log. Never fails the loop: the caller says the error and tries
     /// again at the next check.
@@ -1074,12 +1098,14 @@ impl Monitor {
         if !self.started {
             self.start(store, &mut lines)?;
         }
-        let (watermark, now) = store.alert_clock().map_err(|error| error.to_string())?;
+        let (clock_wm, now) = store
+            .alert_clock_watermark()
+            .map_err(|error| error.to_string())?;
         let reading_due = now >= self.next_reading_ms;
         let bound_due = self.next_bound_ms.is_some_and(|due| now >= due);
         // A Core lines reading in flight is looked at by every check.
         let guardrails_due = self.guardrail_reads.in_flight();
-        if watermark <= self.watermark
+        if clock_wm <= self.watermark_pos()
             && !reading_due
             && !bound_due
             && !guardrails_due
@@ -1088,10 +1114,10 @@ impl Monitor {
             return Ok(lines);
         }
         let mut events = Vec::new();
-        let moved = watermark > self.watermark;
-        if watermark > self.watermark {
+        let moved = clock_wm > self.watermark_pos();
+        if moved {
             let batch = store
-                .alert_control(self.watermark, BATCH)
+                .alert_control(self.control_after.event_id, BATCH)
                 .map_err(|error| error.to_string())?;
             let records = batch["records"].as_array().map_or(&[][..], Vec::as_slice);
             // One record at a time, as at the start: a halt and its resume
@@ -1103,16 +1129,29 @@ impl Monitor {
                 self.feed(id, at, &entry["record"], &mut fed);
                 self.flush(store, now, &fed, &mut lines);
             }
+            let batch_wm = batch["watermark"].as_i64().map_or(clock_wm, |id| {
+                spawn_postgres::CommittedWatermark::new(
+                    Self::parse_xid(&batch["watermark_xid"]),
+                    id,
+                )
+            });
+            let next_pos = batch["next"].as_i64().map_or(self.control_after, |id| {
+                spawn_postgres::CommittedWatermark::new(Self::parse_xid(&batch["next_xid"]), id)
+            });
             // What the step has read: the last control record when the
             // batch was cut at its limit (the rest waits for the next
-            // check), and otherwise everything up to the clock, which is
-            // what makes an idle check one statement (objective 023: the
-            // log's watermark, never the clock, says whether there is work).
-            self.watermark = if i64::try_from(records.len()).unwrap_or(i64::MAX) < BATCH {
-                watermark
+            // check), and otherwise everything up to CONTROL's own committed
+            // frontier so mid-step commits are never replayed (objective 023).
+            if i64::try_from(records.len()).unwrap_or(i64::MAX) < BATCH {
+                let advanced = clock_wm.max(batch_wm);
+                self.set_watermark_pos(self.watermark_pos().max(advanced));
+                self.control_after = self.control_after.max(advanced);
             } else {
-                batch["next"].as_i64().unwrap_or(self.watermark)
-            };
+                self.control_after = self.control_after.max(next_pos);
+                if next_pos < clock_wm {
+                    self.set_watermark_pos(self.watermark_pos().max(next_pos));
+                }
+            }
             let observations = store
                 .alert_observations()
                 .map_err(|error| error.to_string())?;
@@ -1186,12 +1225,19 @@ impl Monitor {
     fn start(&mut self, store: &PostgresStore, lines: &mut Vec<String>) -> Result<(), String> {
         let mirror = store.alert_mirror().map_err(|error| error.to_string())?;
         // Where the event log stood when the missions and tasks were read,
-        // from the same snapshot (objective 106): every record after it is
-        // the checks' to feed, whatever commits while the start runs, and
-        // none the mirror holds is fed again.
+        // from the same snapshot (objective 106): every record after it in
+        // `(commit_xid, id)` order is the checks' to feed, whatever commits
+        // while the start runs, and none the mirror holds is fed again.
         let watermark = mirror["watermark"]
             .as_i64()
             .ok_or_else(|| "the alert mirror holds no watermark".to_string())?;
+        let mirror_wm = spawn_postgres::CommittedWatermark::new(
+            Self::parse_xid(&mirror["watermark_xid"]),
+            watermark,
+        );
+        let clock_wm = mirror["clock"].as_i64().map_or(mirror_wm, |id| {
+            spawn_postgres::CommittedWatermark::new(Self::parse_xid(&mirror["clock_xid"]), id)
+        });
         let now = mirror["now_ms"]
             .as_i64()
             .unwrap_or_else(|| store.now_ms().unwrap_or_default());
@@ -1207,11 +1253,13 @@ impl Monitor {
         // one) finds the alert its predecessor fired and clears it, naming
         // itself; a record older than an open alert's own clears nothing
         // ([`after`]).
-        // A record after the watermark is the checks' (objective 106): fed
-        // here too, it would fold twice.
+        // A record after the mirror frontier in `(commit_xid, id)` order is
+        // the checks' (objective 106): fed here too, it would fold twice.
         for entry in history.as_array().into_iter().flatten() {
             let id = entry["event_id"].as_i64().unwrap_or_default();
-            if id > watermark {
+            let pos =
+                spawn_postgres::CommittedWatermark::new(Self::parse_xid(&entry["commit_xid"]), id);
+            if pos > mirror_wm {
                 continue;
             }
             let at = entry["at_ms"].as_i64().unwrap_or(now);
@@ -1264,7 +1312,8 @@ impl Monitor {
             .alert_messages_all(self.settings.message_taken_ms, &self.open_messages())
             .map_err(|error| error.to_string())?;
         self.messages(&messages, &mut events);
-        self.watermark = watermark;
+        self.set_watermark_pos(clock_wm);
+        self.control_after = mirror_wm;
         // Read after the watermark: a request or an outcome recorded since
         // is in both reads, and folds the same.
         self.seed_owner_requests(store, now, &mut events)?;
@@ -11984,6 +12033,236 @@ execute function alerts_test_deploys_mid_start();
                 restarted.check(store).expect("the step checks");
                 assert_eq!(archive_alerts("open").len(), 1);
                 assert_eq!(archive_alerts("cleared").len(), 1);
+            });
+        }
+
+        fn tx_row_xid(tx: &mut postgres::Transaction<'_>, event_id: i64) -> u64 {
+            tx.query_one(
+                "select commit_xid::text from spawn_events where id = $1",
+                &[&event_id],
+            )
+            .expect("commit_xid")
+            .get::<_, String>(0)
+            .parse()
+            .expect("parse commit_xid")
+        }
+
+        fn tx_append_note(tx: &mut postgres::Transaction<'_>, agent: &str, session: &str) -> i64 {
+            tx.query_one(
+                "select out_id from spawn_append_trusted($1, $2, null, 'bridge', null, $3)",
+                &[
+                    &agent,
+                    &session,
+                    &json!({"name": "session.noted", "detail": {"text": "xid"}}),
+                ],
+            )
+            .expect("append note")
+            .get(0)
+        }
+
+        fn tx_append_archive(
+            tx: &mut postgres::Transaction<'_>,
+            agent: &str,
+            session: &str,
+            name: &str,
+            detail: &serde_json::Value,
+        ) -> i64 {
+            tx.query_one(
+                "select out_id from spawn_append_trusted($1, $2, null, 'bridge', null, $3)",
+                &[&agent, &session, &json!({"name": name, "detail": detail})],
+            )
+            .expect("arch")
+            .get(0)
+        }
+
+        fn schema_conn(store: &PostgresStore, url: &str) -> postgres::Client {
+            let ident = store
+                .schema_scope()
+                .schema_name()
+                .expect("isolated")
+                .quote_ident();
+            let mut conn = postgres::Client::connect(url, postgres::NoTls).expect("conn");
+            conn.batch_execute(&format!("set search_path to {ident}"))
+                .expect("search_path");
+            conn
+        }
+
+        #[test]
+        fn monitor_check_and_archives_recover_lower_ids_committed_under_later_xid() {
+            in_schema("alerts_cli_rev_xid", |store| {
+                let url =
+                    std::env::var("SPAWN_TEST_DATABASE_URL").expect("SPAWN_TEST_DATABASE_URL");
+                let mut setup = schema_conn(store, &url);
+                setup
+                    .query_one(
+                        "select spawn_control_record($1)",
+                        &[&json!({"type": "mission.added", "id": 901, "text": "m1", "origin": "human"})],
+                    )
+                    .expect("add 901");
+                setup
+                    .batch_execute("select spawn_control_refold()")
+                    .expect("refold");
+
+                let mut monitor = super::monitor();
+                monitor.check(store).expect("initial start");
+
+                let (mut conn_b, mut conn_c, mut conn_a) = (
+                    schema_conn(store, &url),
+                    schema_conn(store, &url),
+                    schema_conn(store, &url),
+                );
+                let mut tx_b = conn_b.transaction().expect("tx_b");
+                let id_b0 = tx_append_note(&mut tx_b, "agent_b0", "sess_cli_b0");
+                let x_b = tx_row_xid(&mut tx_b, id_b0);
+                let mut tx_c = conn_c.transaction().expect("tx_c");
+                let id_c = tx_append_note(&mut tx_c, "agent_c", "sess_cli_c");
+                let x_c = tx_row_xid(&mut tx_c, id_c);
+                let mut tx_a = conn_a.transaction().expect("tx_a");
+                let id_ctrl_a: i64 = tx_a
+                    .query_one(
+                        "select spawn_control_record($1)",
+                        &[&json!({"type": "mission.halted", "id": 901, "reason": "rev_a"})],
+                    )
+                    .expect("ctrl a")
+                    .get(0);
+                let x_a = tx_row_xid(&mut tx_a, id_ctrl_a);
+                assert!(x_b < x_c && x_c < x_a);
+                let id_arch_a = tx_append_archive(
+                    &mut tx_a,
+                    "agent_a",
+                    "sess_cli_rev_a",
+                    "archive.failed",
+                    &json!({"native": "native_cli_a", "reason": "reversed xid"}),
+                );
+                let id_arch_b = tx_append_archive(
+                    &mut tx_b,
+                    "agent_b",
+                    "sess_cli_rev_b",
+                    "archive.resumed",
+                    &json!({"native": "native_cli_b", "copied": 1}),
+                );
+                assert!(id_ctrl_a < id_arch_a && id_arch_a < id_arch_b);
+                tx_b.commit().expect("commit tx_b");
+
+                monitor.check(store).expect("check step 1");
+                assert_eq!(
+                    monitor.watermark_pos(),
+                    spawn_postgres::CommittedWatermark::new(x_b, id_arch_b)
+                );
+                assert_eq!(
+                    monitor.control_after,
+                    spawn_postgres::CommittedWatermark::new(x_b, id_arch_b)
+                );
+                assert_eq!(monitor.archives_after, id_arch_b);
+
+                tx_c.commit().expect("commit tx_c");
+                tx_a.commit().expect("commit tx_a");
+
+                monitor.check(store).expect("check step 2");
+                assert_eq!(
+                    monitor.watermark_pos(),
+                    spawn_postgres::CommittedWatermark::new(x_a, id_arch_a)
+                );
+                assert_eq!(monitor.archives_after, id_arch_a);
+
+                let all_alerts = store.alerts(0).expect("alerts");
+                let rows = all_alerts.as_array().expect("array");
+                let keys: Vec<&str> = rows.iter().filter_map(|row| row["key"].as_str()).collect();
+                assert!(
+                    keys.contains(&format!("mission_halted:901:{id_ctrl_a}").as_str()),
+                    "{keys:?}"
+                );
+                assert!(
+                    keys.contains(
+                        &format!("archive_failed:agent_a:native_cli_a:{id_arch_a}").as_str()
+                    ),
+                    "{keys:?}"
+                );
+
+                monitor.check(store).expect("check step 3");
+                assert_eq!(
+                    store
+                        .alerts(0)
+                        .expect("alerts")
+                        .as_array()
+                        .expect("arr")
+                        .len(),
+                    rows.len()
+                );
+            });
+        }
+
+        #[test]
+        fn monitor_start_with_open_worker_keeps_clock_and_control_cursors_distinct() {
+            in_schema("alerts_cli_open_worker", |store| {
+                let url =
+                    std::env::var("SPAWN_TEST_DATABASE_URL").expect("SPAWN_TEST_DATABASE_URL");
+                let mut conn_w = schema_conn(store, &url);
+                let mut conn_ctrl = schema_conn(store, &url);
+
+                conn_ctrl
+                    .query_one(
+                        "select spawn_control_record($1)",
+                        &[&json!({"type": "mission.added", "id": 950, "text": "m", "origin": "human"})],
+                    )
+                    .expect("add 950");
+                conn_ctrl
+                    .batch_execute("select spawn_control_refold()")
+                    .expect("refold");
+
+                // Hold open an uncommitted worker transaction allocating an earlier XID via append.
+                let mut tx_w = conn_w.transaction().expect("tx_w");
+                let id_w: i64 = tx_w
+                    .query_one(
+                        "select out_id from spawn_append_trusted('agent_w', 'sess_cli_w', null, 'bridge', null, $1)",
+                        &[&json!({"name": "archive.failed", "detail": {"native": "nat_w", "reason": "open"}})],
+                    )
+                    .expect("arch w")
+                    .get(0);
+
+                // Commit a control event after tx_w started (`ctrl_top > clock_top`).
+                let id_ctrl: i64 = conn_ctrl
+                    .query_one(
+                        "select spawn_control_record($1)",
+                        &[&json!({"type": "mission.halted", "id": 950, "reason": "while worker open"})],
+                    )
+                    .expect("halted")
+                    .get(0);
+
+                // Start monitor while tx_w is still open.
+                let mut monitor = super::monitor();
+                monitor.check(store).expect("start check while worker open");
+                assert_eq!(monitor.control_after.event_id, id_ctrl);
+                assert!(
+                    monitor.watermark_pos() < monitor.control_after,
+                    "clock watermark {:?} must stay below open worker while control_after {:?}",
+                    monitor.watermark_pos(),
+                    monitor.control_after
+                );
+
+                // Commit tx_w: next check must see clock advance past tx_w and read archive_failed,
+                // without replaying id_ctrl.
+                tx_w.commit().expect("commit tx_w");
+                monitor.check(store).expect("check after worker commit");
+
+                let rows = store.alerts(0).expect("alerts");
+                let keys: Vec<&str> = rows
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .filter_map(|row| row["key"].as_str())
+                    .collect();
+                assert_eq!(
+                    keys.iter()
+                        .filter(|k| **k == format!("mission_halted:950:{id_ctrl}"))
+                        .count(),
+                    1,
+                    "{keys:?}"
+                );
+                assert!(
+                    keys.contains(&format!("archive_failed:agent_w:nat_w:{id_w}").as_str()),
+                    "{keys:?}"
+                );
             });
         }
 

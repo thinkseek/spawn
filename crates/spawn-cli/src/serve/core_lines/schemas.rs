@@ -331,6 +331,50 @@ mod tests {
     }
 
     #[test]
+    fn a_url_file_honors_hostaddr_precedence_and_canonical_ipv6_loopback() {
+        let scratch = Scratch(crate::storage::tests::scratch("url_files_hostaddr"));
+        let dir = &scratch.0;
+        let me = spawn_host::process::current_uid();
+        let check = |path: &Path| url_from_file(path, None, me);
+
+        let hostaddr_local = url_file(
+            dir,
+            "hostaddr_local",
+            "postgres://bb@db.example.com/spawn_test?hostaddr=127.0.0.1",
+            0o600,
+        );
+        assert!(check(&hostaddr_local).is_ok());
+
+        let hostaddr_remote = url_file(
+            dir,
+            "hostaddr_remote",
+            "postgres://bb@localhost/spawn_test?hostaddr=192.0.2.1",
+            0o600,
+        );
+        let why = check(&hostaddr_remote).expect_err("remote hostaddr must reject");
+        assert!(why.contains("not this one's"), "{why}");
+
+        let live_ipv6 = "postgres://spawn@[::1]:5432/spawn_live";
+        let same_ipv6 = url_file(
+            dir,
+            "same_ipv6",
+            "postgres://bb@[0:0:0:0:0:0:0:1]/spawn_live",
+            0o600,
+        );
+        let why = url_from_file(&same_ipv6, Some(live_ipv6), me).expect_err("canonical ipv6");
+        assert!(why.contains("live database"), "{why}");
+
+        let multi_host = url_file(
+            dir,
+            "multi_host",
+            "postgres://bb@127.0.0.1,192.0.2.1/spawn_test",
+            0o600,
+        );
+        let why = check(&multi_host).expect_err("multi-host must fail closed");
+        assert!(!why.contains("192.0.2"), "{why}");
+    }
+
+    #[test]
     fn a_schema_names_its_pid_and_its_comment_its_making() {
         assert_eq!(pid_of("spawn_test_4127_1a2b_0_case"), Some(4127));
         assert_eq!(pid_of("spawn_test_x_0"), None);

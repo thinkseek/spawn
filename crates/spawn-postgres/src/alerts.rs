@@ -29,40 +29,56 @@ pub(crate) const MISSION_GATES: &str = "select coalesce(jsonb_agg(jsonb_build_ob
     'mission', id, 'gate', gate, 'source', sources ->> 0) order by id), '[]'::jsonb)
   from mission_missions where state in ('open', 'active')";
 
-/// Schema-scoped contiguous committed event watermark under `commit_watermark_cte!()`
-/// (`wm.safe_xid`): greatest `id` whose transaction committed below `safe_xid` and
-/// precedes the earliest row with `commit_xid >= wm.safe_xid` so an out-of-order
-/// commit never leaps ahead of an open earlier writer.
-macro_rules! committed_contiguous_watermark_id {
-    () => {
-        "coalesce(
-            (select id from spawn_events
-              where commit_xid < wm.safe_xid
-                and id < coalesce(
-                        (select min(n.id) from spawn_events n where n.commit_xid >= wm.safe_xid),
-                        9223372036854775807::bigint
-                    )
-              order by id desc
-              limit 1),
-            0
-        )"
+/// Lower-bound `commit_xid` resolution for an arbitrary event-id cursor `$param`
+/// under `commit_watermark_cte!()`, matching `event_log::READ_GLOBAL` and
+/// `sessions::LOG_AFTER` so replay from a higher `id` with an earlier XID never
+/// skips lower-`id` rows committed in later transactions.
+macro_rules! xid_cursor_for {
+    ($param:literal) => {
+        concat!(
+            "case
+                when ",
+            $param,
+            "::bigint <= 0::bigint then '0'::xid8
+                else coalesce(
+                    (select w.commit_xid from spawn_events w where w.id = ",
+            $param,
+            "::bigint),
+                    (select w.commit_xid
+                       from spawn_events w
+                      where w.id < ",
+            $param,
+            "::bigint
+                        and w.commit_xid < wm.safe_xid
+                      order by w.commit_xid desc, w.id desc
+                      limit 1),
+                    '0'::xid8
+                )
+            end"
+        )
     };
 }
 
-/// The committed event watermark (`commit_watermark_cte!()`) and the database's
-/// clock, in one statement: an idle pass costs the loop one statement (objective 023),
-/// while in-flight transactions hold back the watermark so later commits on other
-/// sessions cannot jump past them.
+/// The committed event frontier (`commit_watermark_cte!()` in `(commit_xid, id)`
+/// order) and the database's clock, in one statement: an idle pass costs the
+/// loop one statement (objective 023), while in-flight transactions hold back
+/// the watermark so later commits on other sessions cannot jump past them.
 pub(crate) const CLOCK: &str = concat!(
     "with ",
     commit_watermark_cte!(),
     "
-      select ",
-    committed_contiguous_watermark_id!(),
-    " as id,
+      select coalesce(top.commit_xid, '0'::xid8)::text as xid,
+             coalesce(top.id, 0) as id,
              spawn_now_ms() as now_ms,
              wm.wm_raced
-        from wm"
+        from wm
+        left join lateral (
+            select commit_xid, id
+              from spawn_events
+             where commit_xid < wm.safe_xid
+             order by commit_xid desc, id desc
+             limit 1
+        ) top on true"
 );
 
 /// For a typed message (`spawn_command_message`'s `typed`):
@@ -207,24 +223,44 @@ pub(crate) const NOW: &str = "select spawn_now_ms()";
 /// task's delivery bound needs (its `task.assigned` record, and whether its
 /// agent holds a delivered or reported task).
 ///
-/// `watermark` is read from the same snapshot as the missions and tasks under
-/// `commit_watermark_cte!()`: it never advances past an uncommitted control writer
-/// (`greatest(contiguous_committed_watermark, max(control.recorded))` keeps
-/// already-folded control records reflected in `missions`/`tasks` from being
-/// re-fed if an unrelated non-control writer is in flight, preserving objective 106).
+/// `watermark` / `watermark_xid` is read from the same snapshot as the missions
+/// and tasks under `commit_watermark_cte!()`: it takes the greater of the clock
+/// frontier (`commit_xid < wm.safe_xid`, in `(commit_xid, id)` order) and the
+/// newest folded `control.recorded` event so already-folded control records
+/// reflected in `missions`/`tasks` are not re-fed while an unrelated non-control
+/// writer is in flight (objective 106). `clock` / `clock_xid` also report the
+/// snapshot's strict `< wm.safe_xid` frontier for worker steps.
 pub(crate) const MIRROR: &str = concat!(
     "with ",
     commit_watermark_cte!(),
-    r"
+    r", clock_top as (
+  select e.commit_xid, e.id
+    from spawn_events e, wm
+   where e.commit_xid < wm.safe_xid
+   order by e.commit_xid desc, e.id desc
+   limit 1
+), ctrl_top as (
+  select e.commit_xid, e.id
+    from spawn_events e
+   where e.session_id = 'session_control'
+     and e.event_name = 'control.recorded'
+   order by e.commit_xid desc, e.id desc
+   limit 1
+), frontier as (
+  select commit_xid, id from clock_top
+  union all
+  select commit_xid, id from ctrl_top
+  union all
+  select '0'::xid8 as commit_xid, 0::bigint as id
+  order by commit_xid desc, id desc
+  limit 1
+)
 select jsonb_build_object(
   'now_ms', spawn_now_ms(),
-  'watermark', greatest(",
-    committed_contiguous_watermark_id!(),
-    r",
-    coalesce((select max(e.id) from spawn_events e
-               where e.session_id = 'session_control'
-                 and e.event_name = 'control.recorded'), 0)
-  ),
+  'watermark', (select f.id from frontier f),
+  'watermark_xid', (select f.commit_xid::text from frontier f),
+  'clock', coalesce((select c.id from clock_top c), 0),
+  'clock_xid', coalesce((select c.commit_xid from clock_top c), '0'::xid8)::text,
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
         'id', m.id, 'state', m.state, 'halted', m.halted, 'accept', m.accept,
         'gated', m.gate is not null, 'gate_rejections', m.gate_rejections,
@@ -310,67 +346,97 @@ select jsonb_build_object(
         'cleared_evidence', a.cleared_evidence)
       order by a.fired_at_ms, a.key) from spawn_alerts a), '[]'::jsonb))";
 
-/// The committed control records after `$1` below the `xid8` watermark, oldest
-/// first, at most `$2`: what the loop has not looked at yet. `next` is the event
-/// id it continues from (the batch's last one, or `$1` when there was none).
+/// The committed control records after `$1` (in `(commit_xid, id)` order) below
+/// the `xid8` watermark, at most `$2`: what the loop has not looked at yet.
+/// `next` / `next_xid` mark the batch's last row (or `$1` when empty), and
+/// `watermark` / `watermark_xid` record this query's own snapshot frontier so the
+/// caller never replays records committed between `CLOCK` and `CONTROL`.
 pub(crate) const CONTROL: &str = concat!(
     "with ",
     commit_watermark_cte!(),
-    r", batch as (
-  select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
-    from spawn_events e, wm
+    r", top as (
+  select coalesce(t.commit_xid, '0'::xid8) as commit_xid,
+         coalesce(t.id, 0::bigint) as id
+    from wm
+    left join lateral (
+        select e.commit_xid, e.id
+          from spawn_events e
+         where e.commit_xid < wm.safe_xid
+         order by e.commit_xid desc, e.id desc
+         limit 1
+    ) t on true
+), pos as (
+  select ",
+    xid_cursor_for!("$1"),
+    r" as after_xid,
+         greatest($1::bigint, 0::bigint) as after_id
+    from wm
+), batch as (
+  select e.commit_xid, e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
+    from spawn_events e, wm, pos
    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
      and e.commit_xid < wm.safe_xid
-     and e.id < coalesce(
-             (select min(n.id) from spawn_events n where n.commit_xid >= wm.safe_xid),
-             9223372036854775807::bigint
-         )
-     and e.id > $1
-   order by e.id limit $2)
-select (select jsonb_build_object(
-          'next', coalesce(max(b.id), $1),
-          'records', coalesce(jsonb_agg(jsonb_build_object(
-                'event_id', b.id, 'at_ms', b.recorded_at_ms, 'record', b.record)
-              order by b.id), '[]'::jsonb))
-          from batch b) as payload,
+     and (e.commit_xid, e.id) > (pos.after_xid, pos.after_id)
+   order by e.commit_xid, e.id limit $2
+), last_row as (
+  select b.commit_xid, b.id
+    from batch b
+   order by b.commit_xid desc, b.id desc
+   limit 1
+)
+select jsonb_build_object(
+          'next', coalesce((select l.id from last_row l), $1),
+          'next_xid', coalesce((select l.commit_xid from last_row l), pos.after_xid)::text,
+          'watermark', top.id,
+          'watermark_xid', top.commit_xid::text,
+          'records', coalesce((
+              select jsonb_agg(jsonb_build_object(
+                    'event_id', b.id, 'commit_xid', b.commit_xid::text,
+                    'at_ms', b.recorded_at_ms, 'record', b.record)
+                  order by b.commit_xid, b.id)
+                from batch b
+          ), '[]'::jsonb)) as payload,
        wm.wm_raced
-  from wm"
+  from wm, pos, top"
 );
 
-/// The transcript archive's committed events with an id after `$1` below the
-/// `xid8` watermark, oldest first (objective 193, `archive_failed`).
+/// The transcript archive's committed events after `$1` in `(commit_xid, id)`
+/// order strictly below the `xid8` watermark (objective 193, `archive_failed`).
 pub(crate) const ARCHIVES: &str = concat!(
     "with ",
     commit_watermark_cte!(),
-    r"
+    r", pos as (
+  select ",
+    xid_cursor_for!("$1"),
+    r" as after_xid,
+         greatest($1::bigint, 0::bigint) as after_id
+    from wm
+)
 select coalesce((
          select jsonb_agg(jsonb_build_object(
                   'event_id', e.id, 'name', e.event_name, 'agent_id', e.agent_id,
                   'session_id', e.session_id, 'at_ms', e.recorded_at_ms,
                   'native', e.kind -> 'detail' ->> 'native',
                   'reason', e.kind -> 'detail' ->> 'reason')
-                order by e.id)
+                order by e.commit_xid, e.id)
            from spawn_events e
           where e.event_name in ('archive.failed', 'archive.resumed')
             and e.commit_xid < wm.safe_xid
-            and e.id < coalesce(
-                    (select min(n.id) from spawn_events n where n.commit_xid >= wm.safe_xid),
-                    9223372036854775807::bigint
-                )
-            and e.id > $1
+            and (e.commit_xid, e.id) > (pos.after_xid, pos.after_id)
        ), '[]'::jsonb) as payload,
        wm.wm_raced
-  from wm"
+  from wm, pos"
 );
 
-/// The records the alert conditions read, newest last, since `$1`: the ones
-/// objectives 028, 029, 031 and 033 define, and the halt and resume, so a
-/// loop that restarted still knows what is pending.
+/// The records the alert conditions read, newest last in `(commit_xid, id)` order,
+/// since `$1`: the ones objectives 028, 029, 031 and 033 define, and the halt
+/// and resume, so a loop that restarted still knows what is pending.
 pub(crate) const HISTORY: &str = r"
 select coalesce(jsonb_agg(jsonb_build_object(
-      'event_id', x.id, 'at_ms', x.recorded_at_ms, 'record', x.record)
-    order by x.id), '[]'::jsonb)
-from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
+      'event_id', x.id, 'commit_xid', x.commit_xid::text,
+      'at_ms', x.recorded_at_ms, 'record', x.record)
+    order by x.commit_xid, x.id), '[]'::jsonb)
+from (select e.id, e.commit_xid, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
         from spawn_events e
        where e.session_id = 'session_control' and e.event_name = 'control.recorded'
          and e.recorded_at_ms >= $1
@@ -378,28 +444,53 @@ from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
              ('mission.halted', 'mission.resumed', 'admission.waiting', 'admission.admitted',
               'backup.dumped', 'backup.bundled', 'backup.verified',
               'execution.interrupted', 'execution.cleared', 'host.judge')
-       order by e.id
+       order by e.commit_xid, e.id
        limit $2) x";
 
 /// The deploys' `deploy.finished` records after the event `$1` and up to
-/// `$2`, recorded since `$3`, oldest first, at most `$4`: what a restarted
-/// loop replays for `deploy_failed`. [`HISTORY`] does not list them: the
-/// step reads them from the last deploy record its `deploy_failed` alerts
+/// `$2` in `(commit_xid, id)` order, recorded since `$3`, at most `$4`: what a
+/// restarted loop replays for `deploy_failed`. [`HISTORY`] does not list them:
+/// the step reads them from the last deploy record its `deploy_failed` alerts
 /// name (`$1`), not from a time, so a failure that fired nothing while one
 /// was open is not a new occurrence at every restart. A deploy restarts the
 /// loop and only then records how it ended (deploy/deploy.sh), so its record
 /// is often at or below the new loop's watermark, where no check feeds it.
 pub(crate) const DEPLOYS: &str = r"
+with bounds as (
+  select
+    case
+      when $1::bigint <= 0::bigint then '0'::xid8
+      else coalesce(
+        (select w.commit_xid from spawn_events w where w.id = $1::bigint),
+        (select w.commit_xid from spawn_events w where w.id < $1::bigint
+          order by w.commit_xid desc, w.id desc limit 1),
+        '0'::xid8
+      )
+    end as after_xid,
+    greatest($1::bigint, 0::bigint) as after_id,
+    case
+      when $2::bigint <= 0::bigint then '0'::xid8
+      else coalesce(
+        (select w.commit_xid from spawn_events w where w.id = $2::bigint),
+        (select w.commit_xid from spawn_events w where w.id < $2::bigint
+          order by w.commit_xid desc, w.id desc limit 1),
+        '0'::xid8
+      )
+    end as upto_xid,
+    greatest($2::bigint, 0::bigint) as upto_id
+)
 select coalesce(jsonb_agg(jsonb_build_object(
       'event_id', x.id, 'at_ms', x.recorded_at_ms, 'record', x.record)
-    order by x.id), '[]'::jsonb)
-from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
-        from spawn_events e
+    order by x.commit_xid, x.id), '[]'::jsonb)
+from (select e.id, e.commit_xid, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
+        from spawn_events e, bounds b
        where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-         and e.id > $1 and e.id <= $2
+         and $2::bigint > 0::bigint
+         and (e.commit_xid, e.id) > (b.after_xid, b.after_id)
+         and (e.commit_xid, e.id) <= (b.upto_xid, b.upto_id)
          and e.recorded_at_ms >= $3
          and e.kind -> 'detail' -> 'record' ->> 'type' = 'deploy.finished'
-       order by e.id
+       order by e.commit_xid, e.id
        limit $4) x";
 
 /// Every session's latest judgement, with its execution's end when the
@@ -636,11 +727,23 @@ impl PostgresStore {
         }))
     }
 
-    /// The newest committed contiguous event id and the database's clock, in
+    /// The newest committed frontier event (`CommittedWatermark`) and the
+    /// database's clock, in one statement (`CLOCK`).
+    pub fn alert_clock_watermark(&self) -> Result<(crate::CommittedWatermark, i64), StoreError> {
+        let row = self.query_one_watermark_prepared(CLOCK, &[])?;
+        let xid: String = row.get("xid");
+        let commit_xid = crate::wake::parse_commit_xid(&xid)?;
+        Ok((
+            crate::CommittedWatermark::new(commit_xid, row.get("id")),
+            row.get("now_ms"),
+        ))
+    }
+
+    /// The newest committed frontier event id and the database's clock, in
     /// one statement (`CLOCK`).
     pub fn alert_clock(&self) -> Result<(i64, i64), StoreError> {
-        let row = self.query_one_watermark_prepared(CLOCK, &[])?;
-        Ok((row.get("id"), row.get("now_ms")))
+        self.alert_clock_watermark()
+            .map(|(watermark, now)| (watermark.as_i64(), now))
     }
 
     /// The database's clock in epoch ms (`NOW`).
