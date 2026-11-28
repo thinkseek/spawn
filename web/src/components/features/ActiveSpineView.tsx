@@ -117,7 +117,7 @@ export function ActiveSpineView({
   const meta = MODE_META[model.kind];
 
   return (
-    <div className="flex flex-col gap-3 xl:min-h-0 xl:flex-1">
+    <div className="flex flex-col gap-3 xl:min-h-0 xl:min-w-0 xl:flex-1">
       <Card className="shrink-0 border border-surface-border px-3.5 py-2">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
           <div className="flex min-w-0 items-center gap-2">

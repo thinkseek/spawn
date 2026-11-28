@@ -589,10 +589,15 @@ export function readApi<T>(
   signal: AbortSignal,
   normalize: (raw: unknown) => T,
 ): Promise<T> {
+  const requestEpoch = getAuthEpoch();
   return reads.read(url, normalize, {
     signal,
     headers: apiHeaders(),
+    isCurrent: () => getAuthEpoch() === requestEpoch,
     fail: (status, detail) => {
+      if (getAuthEpoch() !== requestEpoch) {
+        throw new DOMException("The operation was aborted.", "AbortError");
+      }
       reportUnauthorizedStatus(status);
       return apiError(status, detail, "read");
     },

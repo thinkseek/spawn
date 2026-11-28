@@ -418,7 +418,7 @@ function InspectorDrawer({
       className={cx(
         "flex min-h-[320px] max-h-[55vh] flex-col overflow-hidden rounded-card border border-surface-border shadow-card",
         desktopBreakpoint === "xl"
-          ? "shrink-0 xl:min-h-0 xl:max-h-none xl:shrink"
+          ? "shrink-0 xl:min-h-0 xl:max-h-none xl:shrink-0"
           : "lg:min-h-0 lg:max-h-none",
       )}
     >

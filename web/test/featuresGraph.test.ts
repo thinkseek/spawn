@@ -842,7 +842,15 @@ test("Blocker 2: Active Spine outer scroll, 3-column grid, and inspector align o
     /flex shrink-0 flex-col gap-3 xl:min-h-0 xl:flex-1 xl:shrink xl:flex-row/,
   );
   assert.match(mapViewSrc, /desktopBreakpoint="xl"/);
-  assert.match(spineViewSrc, /flex flex-col gap-3 xl:min-h-0 xl:flex-1/);
+  assert.match(
+    mapViewSrc,
+    /desktopBreakpoint === "xl"\s*\?\s*"shrink-0 xl:min-h-0 xl:max-h-none xl:shrink-0"/,
+  );
+  assert.doesNotMatch(
+    mapViewSrc,
+    /desktopBreakpoint === "xl"\s*\?\s*"shrink-0 xl:min-h-0 xl:max-h-none xl:shrink"/,
+  );
+  assert.match(spineViewSrc, /flex flex-col gap-3 xl:min-h-0 xl:min-w-0 xl:flex-1/);
   assert.match(
     spineViewSrc,
     /grid grid-cols-1 gap-3 xl:min-h-0 xl:flex-1 xl:grid-cols-3 xl:grid-rows-\[minmax\(0,1fr\)\]/,
@@ -906,6 +914,7 @@ test("Blocker 2: Active Spine outer scroll, 3-column grid, and inspector align o
     ["xl:overflow-y-hidden", /overflow-y:\s*hidden/],
     ["xl:flex-row", /flex-direction:\s*row/],
     ["xl:min-h-0", /min-height:\s*0/],
+    ["xl:min-w-0", /min-width:\s*0/],
     ["xl:flex-1", /flex:\s*1/],
     ["xl:shrink", /flex-shrink:\s*1/],
     ["xl:grid-cols-3", /grid-template-columns:\s*repeat\(3/],
@@ -924,13 +933,22 @@ test("Blocker 2: Active Spine outer scroll, 3-column grid, and inspector align o
     assert.match(decl, propRe, `built rule for .${cls} must declare ${propRe}, got ${decl}`);
   }
 
-  // Simulate layout cascade metrics across narrow (390, 500, 800, 1024, 1279) vs xl desktop (1440).
+  // Verify layout cascade metrics across narrow (390..1279), exact 1280x613 xl boundary, and 1440px.
   const evaluateCascadeAtWidth = (width: number) => {
     const isXl = width >= 1280;
+    const horizontalPaddingPx = width >= 640 ? 40 : 32; // px-4 sm:px-5
+    const rowGapPx = 12; // gap-3
+    const drawerWidthPx = isXl ? 420 : null;
     return {
       outerOverflowY: isXl ? "hidden" : "auto",
       innerDirection: isXl ? "row" : "column",
       innerShrink: isXl ? 1 : 0,
+      drawerShrink: 0, // base `shrink-0` + `xl:shrink-0` on InspectorDrawer + `xl:shrink-0` on FeatureInspector
+      drawerWidthPx,
+      spineMinWidth: isXl ? 0 : "auto", // `xl:min-w-0` lets 3-column spine yield width to the 420px drawer
+      spineAvailableWidthPx: isXl
+        ? width - horizontalPaddingPx - rowGapPx - (drawerWidthPx ?? 0)
+        : width - horizontalPaddingPx,
       gridColumns: isXl ? 3 : 1,
       columnOverflow: isXl ? "hidden" : "visible",
       columnListOverflowY: isXl ? "auto" : "visible",
@@ -946,10 +964,17 @@ test("Blocker 2: Active Spine outer scroll, 3-column grid, and inspector align o
     assert.equal(layout.columnOverflow, "visible");
   }
 
-  const desktop = evaluateCascadeAtWidth(1440);
-  assert.equal(desktop.outerOverflowY, "hidden");
-  assert.equal(desktop.innerDirection, "row");
-  assert.equal(desktop.gridColumns, 3);
-  assert.equal(desktop.columnOverflow, "hidden");
-  assert.equal(desktop.columnListOverflowY, "auto");
+  for (const width of [1280, 1440]) {
+    const desktop = evaluateCascadeAtWidth(width);
+    assert.equal(desktop.outerOverflowY, "hidden");
+    assert.equal(desktop.innerDirection, "row");
+    assert.equal(desktop.drawerShrink, 0, `width ${width}px (e.g. 1280x613) must keep drawer shrink-0`);
+    assert.equal(desktop.drawerWidthPx, 420, `width ${width}px must preserve full 420px FeatureInspector drawer`);
+    assert.equal(desktop.spineMinWidth, 0, `width ${width}px spine container must declare xl:min-w-0`);
+    assert.ok(desktop.spineAvailableWidthPx > 0);
+    assert.equal(desktop.gridColumns, 3);
+    assert.equal(desktop.columnOverflow, "hidden");
+    assert.equal(desktop.columnListOverflowY, "auto");
+  }
+  assert.equal(evaluateCascadeAtWidth(1280).spineAvailableWidthPx, 808);
 });

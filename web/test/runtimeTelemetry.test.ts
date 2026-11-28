@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { getAuthEpoch, setServeToken, subscribeAuthSync } from "../src/api.ts";
+import { getAuthEpoch, readApi, setServeToken, subscribeAuthSync } from "../src/api.ts";
 import {
   pollOptionalRuntimeTelemetry,
   readOptionalTelemetrySliceByKey,
@@ -469,6 +469,130 @@ test("Blocker 1 (real API): pollOptionalRuntimeTelemetry 401 never triggers glob
     assert.equal(state.grading.status, "unavailable");
     assert.equal(state.fleet.status, "ready");
     assert.equal(streamed.length, 4);
+  } finally {
+    unsubscribe();
+    setServeToken(null);
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test("Blocker 1 (real API): stale in-flight Session A readApi(/api/overview) 401 after switching to Session B aborts with 0 unauthorized events", async () => {
+  const prevFetch = globalThis.fetch;
+  const authEvents: string[] = [];
+  const unsubscribe = subscribeAuthSync((ev) => authEvents.push(ev.kind));
+  let resolveSlowSessionA!: (res: Response) => void;
+  const requests: Array<{ url: string; auth: string | undefined }> = [];
+
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    requests.push({ url: String(input), auth: headers.Authorization });
+    return new Promise<Response>((resolve) => {
+      resolveSlowSessionA = resolve;
+    });
+  }) as typeof fetch;
+
+  try {
+    setServeToken("tok_session_a");
+    const epochA = getAuthEpoch();
+    const pendingSessionA = readApi("/api/overview", new AbortController().signal, (raw) => raw);
+
+    // Switch to Session B while Session A's /api/overview request is still in flight.
+    setServeToken("tok_session_b");
+    assert.ok(getAuthEpoch() > epochA);
+
+    // Late 401 from Session A arrives after Session B is already signed in.
+    resolveSlowSessionA(new Response(JSON.stringify({ error: "session expired" }), { status: 401 }));
+
+    await assert.rejects(pendingSessionA, { name: "AbortError" });
+    assert.deepEqual(authEvents, []);
+    assert.equal(requests[0].url, "/api/overview");
+    assert.equal(requests[0].auth, "Bearer tok_session_a");
+  } finally {
+    unsubscribe();
+    setServeToken(null);
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test("Blocker 1 (real API): stale in-flight Session A readApi(/api/overview) 200 after switching to Session B aborts without polluting Session B cache", async () => {
+  const prevFetch = globalThis.fetch;
+  const authEvents: string[] = [];
+  const unsubscribe = subscribeAuthSync((ev) => authEvents.push(ev.kind));
+  let resolveSlowSessionA!: (res: Response) => void;
+  let callNum = 0;
+  const requests: Array<{ auth: string | undefined; ifNoneMatch: string | undefined }> = [];
+
+  globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    requests.push({ auth: headers.Authorization, ifNoneMatch: headers["If-None-Match"] });
+    callNum += 1;
+    if (callNum === 1) {
+      return new Promise<Response>((resolve) => {
+        resolveSlowSessionA = resolve;
+      });
+    }
+    return Promise.resolve(
+      new Response(JSON.stringify({ tenant: "B", active: 4 }), {
+        status: 200,
+        headers: { ETag: 'W/"session-b-overview"' },
+      }),
+    );
+  }) as typeof fetch;
+
+  try {
+    setServeToken("tok_session_a");
+    const pendingSessionA = readApi("/api/overview", new AbortController().signal, (raw) => raw);
+
+    setServeToken("tok_session_b");
+
+    // Late 200 with ETag from Session A arrives after auth transition.
+    resolveSlowSessionA(
+      new Response(JSON.stringify({ tenant: "A", active: 99 }), {
+        status: 200,
+        headers: { ETag: 'W/"session-a-stale"' },
+      }),
+    );
+
+    await assert.rejects(pendingSessionA, { name: "AbortError" });
+    assert.deepEqual(authEvents, []);
+
+    const sessionBOverview = (await readApi(
+      "/api/overview",
+      new AbortController().signal,
+      (raw) => raw,
+    )) as { tenant: string; active: number };
+    assert.deepEqual(sessionBOverview, { tenant: "B", active: 4 });
+    assert.equal(requests[1].auth, "Bearer tok_session_b");
+    assert.equal(
+      requests[1].ifNoneMatch,
+      undefined,
+      "late Session A 200 MUST NOT seed Session B's shared readApi ETag cache",
+    );
+  } finally {
+    unsubscribe();
+    setServeToken(null);
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test("Blocker 1 (real API): current-epoch readApi(/api/overview) 401 still broadcasts global unauthorized", async () => {
+  const prevFetch = globalThis.fetch;
+  const authEvents: string[] = [];
+  const unsubscribe = subscribeAuthSync((ev) => authEvents.push(ev.kind));
+
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ error: "token revoked" }), { status: 401 })) as typeof fetch;
+
+  try {
+    setServeToken("tok_current");
+    await assert.rejects(
+      readApi("/api/overview", new AbortController().signal, (raw) => raw),
+      (err: unknown) =>
+        err instanceof Error &&
+        !(err instanceof DOMException && err.name === "AbortError") &&
+        /HTTP 401/.test(err.message),
+    );
+    assert.deepEqual(authEvents, ["unauthorized"]);
   } finally {
     unsubscribe();
     setServeToken(null);
