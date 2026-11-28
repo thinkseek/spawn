@@ -135,6 +135,9 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn store get --area <area> --path <file> --into <dir> [--root <dir>]\n       \
      spawn store list|verify --area <area> [--root <dir>]\n       \
      spawn storage cutover --status|--to d6|--rollback git|--verify [--project <name>] [--repo <bare repo>] [--root <dir>] [--cas-dir <dir>] [--reason <text>] [--json]\n       \
+     spawn storage reconcile [--root <dir>] [--cas-dir <dir>] [--reason <prefix>] [--json]\n       \
+     spawn storage gc [--root <dir>] [--cas-dir <dir>] [--grace-secs <secs>] [--json]\n       \
+     spawn storage verify-bundle --bundle <output-path> [--project <name>] [--repo <bare repo>] [--root <dir>] [--cas-dir <dir>] [--json]\n       \
      spawn ack <command id> done|declined [<why>]\n       \
      spawn mask --values <file>\n       \
      spawn mask-hook --values <file>\n       \
