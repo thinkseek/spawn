@@ -729,6 +729,7 @@
         "Cargo.lock",
         "Cargo.toml",
         "crates/spawn-cli/Cargo.toml",
+        "crates/spawn-cli/src/agent_cmd.rs",
         "crates/spawn-cli/src/auth.rs",
         "crates/spawn-cli/src/commands/inspect.rs",
         "crates/spawn-cli/src/commands/loops.rs",
@@ -739,6 +740,7 @@
         "crates/spawn-cli/src/main.rs",
         "crates/spawn-cli/src/runtime.rs",
         "crates/spawn-cli/src/toml_parser.rs",
+        "crates/spawn-cli/tests/agent_cli.rs",
         "crates/spawn-cli/tests/config_toml.rs",
         "crates/spawn-cli/tests/help.rs",
         "crates/spawn-hc/Cargo.toml",
@@ -834,6 +836,7 @@
         ],
         "tests": [
           "crates/spawn-cli/src/main.rs",
+          "crates/spawn-cli/tests/agent_cli.rs",
           "crates/spawn-cli/tests/help.rs"
         ],
         "deploys": [],
