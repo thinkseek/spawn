@@ -117,7 +117,7 @@ export function ActiveSpineView({
   const meta = MODE_META[model.kind];
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-3">
+    <div className="flex flex-col gap-3 xl:min-h-0 xl:flex-1">
       <Card className="shrink-0 border border-surface-border px-3.5 py-2">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
           <div className="flex min-w-0 items-center gap-2">
@@ -163,7 +163,7 @@ export function ActiveSpineView({
         </div>
       </Card>
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 xl:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3 xl:min-h-0 xl:flex-1 xl:grid-cols-3 xl:grid-rows-[minmax(0,1fr)]">
         {/* Left Column: Upstream */}
         <ColumnShell
           ariaLabel="前依赖 (Upstream)"
@@ -258,7 +258,7 @@ function ColumnShell({
     <section
       aria-label={ariaLabel}
       className={cx(
-        "flex min-h-[240px] min-w-0 flex-col overflow-hidden rounded-card bg-surface shadow-card",
+        "flex min-h-[240px] min-w-0 flex-col rounded-card bg-surface shadow-card xl:min-h-0 xl:overflow-hidden",
         highlighted ? "border-2 border-info/40" : "border border-surface-border",
       )}
     >
@@ -280,7 +280,7 @@ function ColumnShell({
           {count}
         </span>
       </header>
-      <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-2.5">
+      <div className="flex flex-col gap-2 p-2.5 xl:min-h-0 xl:flex-1 xl:overflow-y-auto">
         {count === 0 ? (
           <p className="rounded-control border border-dashed border-surface-border px-3 py-5 text-center text-caption text-faint-foreground">
             {emptyMessage}

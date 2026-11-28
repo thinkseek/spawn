@@ -312,21 +312,33 @@ export interface OptionalSliceReadOptions {
   signal: AbortSignal;
   headers: Record<string, string>;
   timeoutMs?: number;
+  getEpoch?: () => number;
 }
 
-/** Local optional endpoint reader with strict isolation from global auth
- * sync: 401/403/timeout/network failures degrade locally to `"unavailable"`
- * and NEVER trigger global `unauthorized` broadcasts or logouts. */
-export async function readOptionalTelemetrySlice<T>(
+export type TelemetrySliceReadResult<T> =
+  | { kind: "current"; slice: TelemetrySlice<T> }
+  | { kind: "stale" };
+
+export type TelemetrySliceOutcome =
+  | { kind: "current"; update: TelemetrySliceUpdate }
+  | { kind: "stale" };
+
+/** Epoch-guarded optional endpoint reader:
+ * - Captures auth epoch before reading and skips cache writes or UI updates if the
+ *   session transitions mid-flight (`{ kind: "stale" }`).
+ * - Degrades 401/403/timeout/network failures locally without global logout. */
+export async function readOptionalTelemetrySliceGuarded<T>(
   reader: Validated,
   url: string,
   normalize: (raw: unknown) => T,
   options: OptionalSliceReadOptions,
-): Promise<TelemetrySlice<T>> {
+): Promise<TelemetrySliceReadResult<T>> {
   if (options.signal.aborted) {
     throw new DOMException("The operation was aborted.", "AbortError");
   }
 
+  const startEpoch = options.getEpoch?.() ?? null;
+  const isCurrentEpoch = () => startEpoch === null || options.getEpoch?.() === startEpoch;
   const timeoutMs = options.timeoutMs ?? TELEMETRY_REQUEST_TIMEOUT_MS;
   const sliceController = new AbortController();
   const onOuterAbort = () => sliceController.abort();
@@ -345,71 +357,93 @@ export async function readOptionalTelemetrySlice<T>(
     const data = await reader.read(url, normalize, {
       signal: sliceController.signal,
       headers: options.headers,
+      isCurrent: isCurrentEpoch,
       // Strictly local error creation — never calls `reportUnauthorizedStatus`.
       fail: (status, detail) => new Error(detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}`),
     });
-    return { status: "ready", data };
+    if (!isCurrentEpoch()) return { kind: "stale" };
+    return { kind: "current", slice: { status: "ready", data } };
   } catch {
+    if (!isCurrentEpoch()) return { kind: "stale" };
     if (options.signal.aborted && !timedOut) {
       throw new DOMException("The operation was aborted.", "AbortError");
     }
-    return { status: "unavailable" };
+    return { kind: "current", slice: { status: "unavailable" } };
   } finally {
     if (timer !== null) clearTimeout(timer);
     options.signal.removeEventListener("abort", onOuterAbort);
   }
 }
 
+/** Local optional endpoint reader returning the resolved `TelemetrySlice<T>`
+ * (`"unavailable"` on failure, timeout, or stale epoch). */
+export async function readOptionalTelemetrySlice<T>(
+  reader: Validated,
+  url: string,
+  normalize: (raw: unknown) => T,
+  options: OptionalSliceReadOptions,
+): Promise<TelemetrySlice<T>> {
+  const outcome = await readOptionalTelemetrySliceGuarded(reader, url, normalize, options);
+  return outcome.kind === "current" ? outcome.slice : { status: "unavailable" };
+}
+
 export async function readTelemetrySliceByKey(
   key: TelemetrySliceKey,
   options: OptionalSliceReadOptions & { reader: Validated },
-): Promise<TelemetrySliceUpdate> {
-  const { reader, signal, headers, timeoutMs } = options;
+): Promise<TelemetrySliceOutcome> {
+  const { reader, signal, headers, timeoutMs, getEpoch } = options;
+  const readOpts = { signal, headers, timeoutMs, getEpoch };
   switch (key) {
-    case "fleet":
-      return {
-        key: "fleet",
-        slice: await readOptionalTelemetrySlice(reader, "/api/fleet", normalizeFleetTelemetry, {
-          signal,
-          headers,
-          timeoutMs,
-        }),
-      };
-    case "grading":
-      return {
-        key: "grading",
-        slice: await readOptionalTelemetrySlice(reader, "/api/grading", normalizeGradingTelemetry, {
-          signal,
-          headers,
-          timeoutMs,
-        }),
-      };
-    case "cost24h":
-      return {
-        key: "cost24h",
-        slice: await readOptionalTelemetrySlice(
-          reader,
-          "/api/cost?window=24h",
-          (raw) => normalizeCostWindowTelemetry("24h", raw),
-          { signal, headers, timeoutMs },
-        ),
-      };
-    case "cost7d":
-      return {
-        key: "cost7d",
-        slice: await readOptionalTelemetrySlice(
-          reader,
-          "/api/cost?window=7d",
-          (raw) => normalizeCostWindowTelemetry("7d", raw),
-          { signal, headers, timeoutMs },
-        ),
-      };
+    case "fleet": {
+      const res = await readOptionalTelemetrySliceGuarded(
+        reader,
+        "/api/fleet",
+        normalizeFleetTelemetry,
+        readOpts,
+      );
+      return res.kind === "stale"
+        ? { kind: "stale" }
+        : { kind: "current", update: { key: "fleet", slice: res.slice } };
+    }
+    case "grading": {
+      const res = await readOptionalTelemetrySliceGuarded(
+        reader,
+        "/api/grading",
+        normalizeGradingTelemetry,
+        readOpts,
+      );
+      return res.kind === "stale"
+        ? { kind: "stale" }
+        : { kind: "current", update: { key: "grading", slice: res.slice } };
+    }
+    case "cost24h": {
+      const res = await readOptionalTelemetrySliceGuarded(
+        reader,
+        "/api/cost?window=24h",
+        (raw) => normalizeCostWindowTelemetry("24h", raw),
+        readOpts,
+      );
+      return res.kind === "stale"
+        ? { kind: "stale" }
+        : { kind: "current", update: { key: "cost24h", slice: res.slice } };
+    }
+    case "cost7d": {
+      const res = await readOptionalTelemetrySliceGuarded(
+        reader,
+        "/api/cost?window=7d",
+        (raw) => normalizeCostWindowTelemetry("7d", raw),
+        readOpts,
+      );
+      return res.kind === "stale"
+        ? { kind: "stale" }
+        : { kind: "current", update: { key: "cost7d", slice: res.slice } };
+    }
   }
 }
 
 /** Fire all 4 optional telemetry slice reads concurrently with independent
  * timeouts and immediate per-slice settlement callbacks so one slow/stalled
- * endpoint never starves healthy siblings. */
+ * endpoint never starves healthy siblings, while dropping stale-epoch replies. */
 export async function pollRuntimeTelemetrySlices(
   options: OptionalSliceReadOptions & {
     reader: Validated;
@@ -419,10 +453,11 @@ export async function pollRuntimeTelemetrySlices(
   let state: RuntimeTelemetryState = { ...INITIAL_RUNTIME_TELEMETRY };
   await Promise.allSettled(
     TELEMETRY_SLICE_KEYS.map((key) =>
-      readTelemetrySliceByKey(key, options).then((update) => {
-        state = applyTelemetrySliceUpdate(state, update);
+      readTelemetrySliceByKey(key, options).then((outcome) => {
+        if (outcome.kind === "stale") return;
+        state = applyTelemetrySliceUpdate(state, outcome.update);
         if (!options.signal.aborted) {
-          options.onSlice?.(update);
+          options.onSlice?.(outcome.update);
         }
       }),
     ),

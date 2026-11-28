@@ -54,6 +54,7 @@ export interface FeatureInspectorProps {
   fileIndex: FileIndex;
   relationIndex: RelationIndex;
   truth?: FeatureTruthResponse | null;
+  wideAt?: "lg" | "xl";
   onSelectNode: (nodeId: string) => void;
   onOpenSession: (sessionId: string) => void;
   onClose: () => void;
@@ -70,6 +71,7 @@ export function FeatureInspector({
   fileIndex,
   relationIndex,
   truth = null,
+  wideAt = "lg",
   onSelectNode,
   onOpenSession,
   onClose,
@@ -78,7 +80,10 @@ export function FeatureInspector({
   return (
     <aside
       aria-label={`Inspector: ${node.title}`}
-      className="flex h-full w-full flex-col border-l border-surface-border bg-surface lg:w-[390px] xl:w-[420px] lg:shrink-0"
+      className={cx(
+        "flex h-full w-full flex-col border-l border-surface-border bg-surface",
+        wideAt === "xl" ? "xl:w-[420px] xl:shrink-0" : "lg:w-[390px] xl:w-[420px] lg:shrink-0",
+      )}
     >
       <header className="flex shrink-0 items-start gap-2 border-b border-surface-border px-4 py-3">
         <div className="min-w-0 flex-1">

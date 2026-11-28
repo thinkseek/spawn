@@ -1,6 +1,7 @@
 import { Activity, Coins, Cpu } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { getAuthEpoch, subscribeAuthEpoch } from "../../api";
 import { readOptionalTelemetrySliceByKey } from "../../featuresApi";
 import { compactCount } from "../../format";
 import {
@@ -20,34 +21,57 @@ import { Card, cx } from "../ui";
 
 /** Non-blocking runtime status strip for `#/features`, reading existing
  * read-only endpoints (`/api/fleet`, `/api/grading`, `/api/cost?window=24h|7d`).
- * Each slice settles and updates independently with per-request timeout so one
- * slow endpoint cannot starve siblings or abort healthy reads. */
+ * Each slice settles and updates independently with per-request timeout and
+ * auth-epoch guard so slow/stale-session responses never starve or pollute UI. */
 export function RuntimeTelemetryStrip() {
   const [telemetry, setTelemetry] = useState<RuntimeTelemetryState>(INITIAL_RUNTIME_TELEMETRY);
 
   useEffect(() => {
-    const unmountController = new AbortController();
+    let unmounted = false;
+    let activeEpoch = getAuthEpoch();
+    let epochController = new AbortController();
     const inFlight = new Set<TelemetrySliceKey>();
 
     const refresh = () => {
+      if (unmounted) return;
       if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      const requestEpoch = activeEpoch;
+      const signal = epochController.signal;
       for (const key of TELEMETRY_SLICE_KEYS) {
         if (inFlight.has(key)) continue;
         inFlight.add(key);
-        void readOptionalTelemetrySliceByKey(key, unmountController.signal)
-          .then((update) => {
-            if (!unmountController.signal.aborted) {
-              setTelemetry((prev) => applyTelemetrySliceUpdate(prev, update));
+        void readOptionalTelemetrySliceByKey(key, signal)
+          .then((outcome) => {
+            if (
+              !unmounted &&
+              outcome.kind === "current" &&
+              activeEpoch === requestEpoch &&
+              getAuthEpoch() === requestEpoch
+            ) {
+              setTelemetry((prev) => applyTelemetrySliceUpdate(prev, outcome.update));
             }
           })
           .catch(() => {
-            // Unmount abort is expected; HTTP/timeout failures resolve as "unavailable".
+            // Unmount/epoch abort is expected; HTTP/timeout failures resolve as "unavailable".
           })
           .finally(() => {
-            inFlight.delete(key);
+            if (activeEpoch === requestEpoch) {
+              inFlight.delete(key);
+            }
           });
       }
     };
+
+    const unsubscribeEpoch = subscribeAuthEpoch((nextEpoch) => {
+      activeEpoch = nextEpoch;
+      epochController.abort();
+      epochController = new AbortController();
+      inFlight.clear();
+      if (!unmounted) {
+        setTelemetry(INITIAL_RUNTIME_TELEMETRY);
+        refresh();
+      }
+    });
 
     refresh();
     const timer = window.setInterval(refresh, TELEMETRY_POLL_MS);
@@ -57,7 +81,9 @@ export function RuntimeTelemetryStrip() {
     document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
-      unmountController.abort();
+      unmounted = true;
+      unsubscribeEpoch();
+      epochController.abort();
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };

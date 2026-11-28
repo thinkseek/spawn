@@ -228,14 +228,17 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
           No open objective mission has a capability map.
         </div>
       ) : viewMode === "spine" ? (
-        <div className="flex min-h-0 flex-1 flex-col gap-3 px-4 py-3 sm:px-5">
+        <div
+          data-spine-scroll-shell="true"
+          className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 py-3 sm:px-5 xl:overflow-y-hidden"
+        >
           <MissionHeaderStack
             mission={mission}
             graphIssues={graphIssues}
             relationsTotal={relationIndex.total}
             sharedFilesCount={Object.keys(fileIndex.sharedFiles).length}
           />
-          <div className="flex min-h-0 flex-1 flex-col gap-3 lg:flex-row">
+          <div className="flex shrink-0 flex-col gap-3 xl:min-h-0 xl:flex-1 xl:shrink xl:flex-row">
             <ActiveSpineView
               mission={mission}
               model={activeSpine}
@@ -253,6 +256,7 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
                 fileIndex={fileIndex}
                 relationIndex={relationIndex}
                 truth={truthData}
+                desktopBreakpoint="xl"
                 onSelectNode={handleJumpToNode}
                 onOpenSession={onOpenSession}
                 onClose={() => setSelectedNodeId(null)}
@@ -393,6 +397,7 @@ function InspectorDrawer({
   fileIndex,
   relationIndex,
   truth,
+  desktopBreakpoint = "lg",
   onSelectNode,
   onOpenSession,
   onClose,
@@ -403,12 +408,20 @@ function InspectorDrawer({
   fileIndex: FileIndex;
   relationIndex: RelationIndex;
   truth: FeatureTruthResponse | null;
+  desktopBreakpoint?: "lg" | "xl";
   onSelectNode: (nodeId: string) => void;
   onOpenSession: (sessionId: string) => void;
   onClose: () => void;
 }) {
   return (
-    <div className="flex min-h-[320px] max-h-[55vh] flex-col overflow-hidden rounded-card border border-surface-border shadow-card lg:min-h-0 lg:max-h-none">
+    <div
+      className={cx(
+        "flex min-h-[320px] max-h-[55vh] flex-col overflow-hidden rounded-card border border-surface-border shadow-card",
+        desktopBreakpoint === "xl"
+          ? "shrink-0 xl:min-h-0 xl:max-h-none xl:shrink"
+          : "lg:min-h-0 lg:max-h-none",
+      )}
+    >
       <FeatureInspector
         mission={mission}
         node={node}
@@ -416,6 +429,7 @@ function InspectorDrawer({
         fileIndex={fileIndex}
         relationIndex={relationIndex}
         truth={truth}
+        wideAt={desktopBreakpoint}
         onSelectNode={onSelectNode}
         onOpenSession={onOpenSession}
         onClose={onClose}

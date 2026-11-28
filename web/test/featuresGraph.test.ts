@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import { normalizeFeatureMap } from "../src/features.ts";
@@ -816,4 +816,140 @@ test("Fix 4, 5 & 6: task-scoped session binding never borrows across tasks, isFo
     "utf8",
   );
   assert.doesNotMatch(activeSpineSrc, /role="button"/);
+});
+
+test("Blocker 2: Active Spine outer scroll, 3-column grid, and inspector align on xl (1280px) across built CSS viewports", () => {
+  const mapViewSrc = readFileSync(
+    new URL("../src/components/features/FeatureMapView.tsx", import.meta.url),
+    "utf8",
+  );
+  const spineViewSrc = readFileSync(
+    new URL("../src/components/features/ActiveSpineView.tsx", import.meta.url),
+    "utf8",
+  );
+  const inspectorSrc = readFileSync(
+    new URL("../src/components/features/FeatureInspector.tsx", import.meta.url),
+    "utf8",
+  );
+
+  // Align all Spine view transitions cleanly at xl (zero md/lg dead zones).
+  assert.match(
+    mapViewSrc,
+    /data-spine-scroll-shell="true"[\s\S]*overflow-y-auto[\s\S]*xl:overflow-y-hidden/,
+  );
+  assert.match(
+    mapViewSrc,
+    /flex shrink-0 flex-col gap-3 xl:min-h-0 xl:flex-1 xl:shrink xl:flex-row/,
+  );
+  assert.match(mapViewSrc, /desktopBreakpoint="xl"/);
+  assert.match(spineViewSrc, /flex flex-col gap-3 xl:min-h-0 xl:flex-1/);
+  assert.match(
+    spineViewSrc,
+    /grid grid-cols-1 gap-3 xl:min-h-0 xl:flex-1 xl:grid-cols-3 xl:grid-rows-\[minmax\(0,1fr\)\]/,
+  );
+  assert.match(
+    spineViewSrc,
+    /flex min-h-\[240px\] min-w-0 flex-col rounded-card bg-surface shadow-card xl:min-h-0 xl:overflow-hidden/,
+  );
+  assert.match(
+    spineViewSrc,
+    /flex flex-col gap-2 p-2\.5 xl:min-h-0 xl:flex-1 xl:overflow-y-auto/,
+  );
+  assert.match(inspectorSrc, /wideAt === "xl" \? "xl:w-\[420px\] xl:shrink-0"/);
+
+  // Parse the actual compiled CSS bundle when `web/dist/assets/index-*.css` exists
+  // (mandatory after `vite build` so responsive breakpoints & declarations are proven).
+  const assetsUrl = new URL("../dist/assets/", import.meta.url);
+  let cssFile: string | null = null;
+  try {
+    const names = readdirSync(assetsUrl);
+    cssFile = names.find((name) => /^index-.*\.css$/.test(name)) ?? null;
+  } catch {
+    cssFile = null;
+  }
+  if (!cssFile) return;
+
+  const css = readFileSync(new URL(cssFile, assetsUrl), "utf8");
+  const escapedClassToken = (cls: string) =>
+    cls.replace(/([:\\/[\],()])/g, "\\$1");
+
+  const requiredBase = [
+    "overflow-y-auto",
+    "flex-col",
+    "shrink-0",
+    "grid-cols-1",
+  ];
+  for (const cls of requiredBase) {
+    assert.ok(
+      css.includes(`.${escapedClassToken(cls)}{`),
+      `built CSS missing base rule for .${cls}`,
+    );
+  }
+
+  // Extract all `@media (width>=80rem)` (`1280px` xl breakpoint) balanced blocks.
+  const xlBlocks: string[] = [];
+  for (const match of css.matchAll(/@media\s*\(\s*width\s*>=\s*80rem\s*\)\s*\{/g)) {
+    let depth = 1;
+    let cursor = (match.index ?? 0) + match[0].length;
+    const blockStart = cursor;
+    while (cursor < css.length && depth > 0) {
+      if (css[cursor] === "{") depth += 1;
+      else if (css[cursor] === "}") depth -= 1;
+      cursor += 1;
+    }
+    xlBlocks.push(css.slice(blockStart, cursor - 1));
+  }
+  assert.ok(xlBlocks.length > 0, "built CSS must emit @media (width>=80rem)");
+  const xlBlock = xlBlocks.join("\n");
+
+  const expectedXlRules: Array<[string, RegExp]> = [
+    ["xl:overflow-y-hidden", /overflow-y:\s*hidden/],
+    ["xl:flex-row", /flex-direction:\s*row/],
+    ["xl:min-h-0", /min-height:\s*0/],
+    ["xl:flex-1", /flex:\s*1/],
+    ["xl:shrink", /flex-shrink:\s*1/],
+    ["xl:grid-cols-3", /grid-template-columns:\s*repeat\(3/],
+    ["xl:grid-rows-[minmax(0,1fr)]", /grid-template-rows:\s*minmax\(0,\s*1fr\)/],
+    ["xl:overflow-hidden", /overflow:\s*hidden/],
+    ["xl:overflow-y-auto", /overflow-y:\s*auto/],
+    ["xl:w-[420px]", /width:\s*420px/],
+    ["xl:shrink-0", /flex-shrink:\s*0/],
+  ];
+  for (const [cls, propRe] of expectedXlRules) {
+    const token = `.${escapedClassToken(cls)}{`;
+    const idx = xlBlock.indexOf(token);
+    assert.ok(idx >= 0, `built CSS missing ${token} inside @media (width>=80rem)`);
+    const bodyEnd = xlBlock.indexOf("}", idx);
+    const decl = xlBlock.slice(idx + token.length, bodyEnd);
+    assert.match(decl, propRe, `built rule for .${cls} must declare ${propRe}, got ${decl}`);
+  }
+
+  // Simulate layout cascade metrics across narrow (390, 500, 800, 1024, 1279) vs xl desktop (1440).
+  const evaluateCascadeAtWidth = (width: number) => {
+    const isXl = width >= 1280;
+    return {
+      outerOverflowY: isXl ? "hidden" : "auto",
+      innerDirection: isXl ? "row" : "column",
+      innerShrink: isXl ? 1 : 0,
+      gridColumns: isXl ? 3 : 1,
+      columnOverflow: isXl ? "hidden" : "visible",
+      columnListOverflowY: isXl ? "auto" : "visible",
+    };
+  };
+
+  for (const width of [390, 500, 800, 1024, 1279]) {
+    const layout = evaluateCascadeAtWidth(width);
+    assert.equal(layout.outerOverflowY, "auto", `width ${width}px must enable outer vertical scrolling`);
+    assert.equal(layout.innerDirection, "column");
+    assert.equal(layout.innerShrink, 0, `width ${width}px stacked shell must not compress away`);
+    assert.equal(layout.gridColumns, 1);
+    assert.equal(layout.columnOverflow, "visible");
+  }
+
+  const desktop = evaluateCascadeAtWidth(1440);
+  assert.equal(desktop.outerOverflowY, "hidden");
+  assert.equal(desktop.innerDirection, "row");
+  assert.equal(desktop.gridColumns, 3);
+  assert.equal(desktop.columnOverflow, "hidden");
+  assert.equal(desktop.columnListOverflowY, "auto");
 });

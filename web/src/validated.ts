@@ -51,21 +51,32 @@ export interface ReadOptions {
   headers: Record<string, string>;
   /** The error of a failed read, from its status and the server's reason. */
   fail: (status: number, detail: string) => Error;
+  /** Optional caller epoch check; when false, response will never update kept ETags. */
+  isCurrent?: () => boolean;
 }
 
 /** The last answer read at each URL, with its tag. */
 export class Validated {
   private readonly kept = new Map<string, Kept>();
   private readonly fetcher: FetchLike;
+  private generation = 0;
 
   constructor(fetcher: FetchLike = (url, init) => fetch(url, init)) {
     this.fetcher = fetcher;
+  }
+
+  /** Monotonic invalidation generation bumped on every `clear()`. */
+  get epoch(): number {
+    return this.generation;
   }
 
   /** GET `url` and normalize it, or, answered 304, the value read last
    * time (the same object). A failure throws `fail`'s error, with the
    * server's `error` when it sent one. */
   async read<T>(url: string, normalize: (raw: unknown) => T, options: ReadOptions): Promise<T> {
+    const readGeneration = this.generation;
+    const stillCurrent = () =>
+      this.generation === readGeneration && (options.isCurrent?.() ?? true);
     const kept = this.kept.get(url);
     const headers: Record<string, string> = {
       ...options.headers,
@@ -84,7 +95,7 @@ export class Validated {
       // Read again by another caller with another reading of the same
       // answer: normalize it its own way.
       if (kept.normalize !== normalize) return normalize(kept.raw);
-      this.touch(url, kept);
+      if (stillCurrent()) this.touch(url, kept);
       return kept.normalized as T;
     }
     if (!response.ok) {
@@ -102,10 +113,12 @@ export class Validated {
     const raw: unknown = await response.json();
     const normalized = normalize(raw);
     const etag = response.headers.get("ETag");
-    if (etag) {
-      this.touch(url, { etag, raw, normalized, normalize });
-    } else {
-      this.kept.delete(url);
+    if (stillCurrent()) {
+      if (etag) {
+        this.touch(url, { etag, raw, normalized, normalize });
+      } else {
+        this.kept.delete(url);
+      }
     }
     return normalized;
   }
@@ -117,6 +130,7 @@ export class Validated {
 
   /** Forget every kept response and ETag (for example on sign-out or token change). */
   clear(): void {
+    this.generation += 1;
     this.kept.clear();
   }
 

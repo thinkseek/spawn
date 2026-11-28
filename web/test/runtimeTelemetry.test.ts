@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
+import { getAuthEpoch, setServeToken, subscribeAuthSync } from "../src/api.ts";
+import {
+  pollOptionalRuntimeTelemetry,
+  readOptionalTelemetrySliceByKey,
+} from "../src/featuresApi.ts";
 import {
   INITIAL_RUNTIME_TELEMETRY,
   TELEMETRY_POLL_MS,
@@ -281,4 +286,192 @@ test("Fix 2: stalled slice times out below poll interval while healthy sibling s
   assert.equal(finalState.cost24h.status, "ready");
   assert.equal(finalState.cost7d.status, "unavailable");
   assert.deepEqual(progressive, finalState);
+});
+
+test("Blocker 1 (real API): same-tab logout and re-login clears optional telemetry ETag and advances auth epoch", async () => {
+  const prevFetch = globalThis.fetch;
+  const requests: Array<{ url: string; auth: string | undefined; ifNoneMatch: string | undefined }> = [];
+
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    requests.push({
+      url,
+      auth: headers.Authorization,
+      ifNoneMatch: headers["If-None-Match"],
+    });
+    if (headers["If-None-Match"] === 'W/"sess-a"') {
+      return new Response(null, { status: 304, headers: { ETag: 'W/"sess-a"' } });
+    }
+    const isB = headers.Authorization === "Bearer tok_session_b";
+    return new Response(
+      JSON.stringify({
+        health: {
+          live: isB ? 5 : 2,
+          agents_total: isB ? 5 : 2,
+          by_state: { WORKING: isB ? 5 : 2, WAITING: 0, BLOCKED: 0 },
+        },
+      }),
+      {
+        status: 200,
+        headers: { ETag: isB ? 'W/"sess-b"' : 'W/"sess-a"' },
+      },
+    );
+  }) as typeof fetch;
+
+  try {
+    setServeToken("tok_session_a");
+    const epochA = getAuthEpoch();
+    const signal = new AbortController().signal;
+
+    const firstA = await readOptionalTelemetrySliceByKey("fleet", signal);
+    assert.equal(firstA.kind, "current");
+    if (firstA.kind === "current" && firstA.update.key === "fleet" && firstA.update.slice.status === "ready") {
+      assert.equal(firstA.update.slice.data.live, 2);
+    } else {
+      assert.fail("expected ready fleet slice in session A");
+    }
+
+    // Same session hits cached ETag cleanly.
+    const secondA = await readOptionalTelemetrySliceByKey("fleet", signal);
+    assert.equal(secondA.kind, "current");
+    assert.equal(requests[1].ifNoneMatch, 'W/"sess-a"');
+
+    // Same-tab logout -> re-login as session B MUST flush optionalTelemetryReads ETag cache.
+    setServeToken(null);
+    const epochSignedOut = getAuthEpoch();
+    assert.ok(epochSignedOut > epochA);
+
+    setServeToken("tok_session_b");
+    const epochB = getAuthEpoch();
+    assert.ok(epochB > epochSignedOut);
+
+    const firstB = await readOptionalTelemetrySliceByKey("fleet", signal);
+    assert.equal(firstB.kind, "current");
+    if (firstB.kind === "current" && firstB.update.key === "fleet" && firstB.update.slice.status === "ready") {
+      assert.equal(firstB.update.slice.data.live, 5);
+    } else {
+      assert.fail("expected ready fleet slice in session B");
+    }
+    assert.equal(requests[2].auth, "Bearer tok_session_b");
+    assert.equal(
+      requests[2].ifNoneMatch,
+      undefined,
+      "same-tab re-login MUST NOT send previous session ETag",
+    );
+  } finally {
+    setServeToken(null);
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test("Blocker 1 (real API): late in-flight session A telemetry response is discarded as stale and never backfills session B cache", async () => {
+  const prevFetch = globalThis.fetch;
+  const requests: Array<{ auth: string | undefined; ifNoneMatch: string | undefined }> = [];
+  let resolveSlowSessionA!: (res: Response) => void;
+  let callNum = 0;
+
+  globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    requests.push({ auth: headers.Authorization, ifNoneMatch: headers["If-None-Match"] });
+    callNum += 1;
+    if (callNum === 1) {
+      return new Promise<Response>((resolve) => {
+        resolveSlowSessionA = resolve;
+      });
+    }
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({ health: { live: 3, agents_total: 3, by_state: { WORKING: 3, WAITING: 0, BLOCKED: 0 } } }),
+        { status: 200, headers: { ETag: 'W/"sess-b-fresh"' } },
+      ),
+    );
+  }) as typeof fetch;
+
+  try {
+    setServeToken("tok_session_a");
+    const signal = new AbortController().signal;
+    const pendingSessionA = readOptionalTelemetrySliceByKey("fleet", signal);
+
+    // Mid-flight same-tab logout and login as session B before session A responds.
+    setServeToken(null);
+    setServeToken("tok_session_b");
+
+    // Late session A 200 response with ETag arrives after auth transition.
+    resolveSlowSessionA(
+      new Response(
+        JSON.stringify({ health: { live: 77, agents_total: 77, by_state: { WORKING: 77, WAITING: 0, BLOCKED: 0 } } }),
+        { status: 200, headers: { ETag: 'W/"late-sess-a"' } },
+      ),
+    );
+
+    const lateOutcome = await pendingSessionA;
+    assert.equal(lateOutcome.kind, "stale", "stale-epoch response must never publish UI state");
+
+    // Subsequent session B read MUST NOT carry session A's late ETag into If-None-Match.
+    const sessionBOutcome = await readOptionalTelemetrySliceByKey("fleet", signal);
+    assert.equal(sessionBOutcome.kind, "current");
+    if (
+      sessionBOutcome.kind === "current" &&
+      sessionBOutcome.update.key === "fleet" &&
+      sessionBOutcome.update.slice.status === "ready"
+    ) {
+      assert.equal(sessionBOutcome.update.slice.data.live, 3);
+    } else {
+      assert.fail("expected fresh ready fleet slice for session B");
+    }
+    assert.equal(requests[1].auth, "Bearer tok_session_b");
+    assert.equal(
+      requests[1].ifNoneMatch,
+      undefined,
+      "late session A response MUST NOT backfill optionalTelemetryReads cache",
+    );
+  } finally {
+    setServeToken(null);
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test("Blocker 1 (real API): pollOptionalRuntimeTelemetry 401 never triggers global subscribeAuthSync logout", async () => {
+  const prevFetch = globalThis.fetch;
+  const authEvents: string[] = [];
+  const unsubscribe = subscribeAuthSync((ev) => authEvents.push(ev.kind));
+
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url === "/api/grading") {
+      return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+    }
+    if (url === "/api/fleet") {
+      return new Response(
+        JSON.stringify({ health: { live: 1, agents_total: 1, by_state: { WORKING: 1, WAITING: 0, BLOCKED: 0 } } }),
+        { status: 200 },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        total: { usd: 0.1, tokens: { input: 100, output: 50, cache_write: 0, cache_read: 0 }, unpriced_tokens: 0 },
+        models: [],
+      }),
+      { status: 200 },
+    );
+  }) as typeof fetch;
+
+  try {
+    setServeToken("tok_live");
+    const streamed: string[] = [];
+    const state = await pollOptionalRuntimeTelemetry(
+      new AbortController().signal,
+      (u) => streamed.push(u.key),
+      200,
+    );
+    assert.deepEqual(authEvents, []);
+    assert.equal(state.grading.status, "unavailable");
+    assert.equal(state.fleet.status, "ready");
+    assert.equal(streamed.length, 4);
+  } finally {
+    unsubscribe();
+    setServeToken(null);
+    globalThis.fetch = prevFetch;
+  }
 });

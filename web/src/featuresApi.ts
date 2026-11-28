@@ -1,7 +1,7 @@
 // The Feature map's reads (`/api/features`, `/api/features/truth`). Its own
 // module, so the read model in features.ts stays pure for node's test runner.
 
-import { apiHeaders, readApi, subscribeAuthSync } from "./api";
+import { apiHeaders, getAuthEpoch, readApi, subscribeAuthEpoch } from "./api.ts";
 import {
   parseFeatureTruthResponse,
   truthUrl,
@@ -13,14 +13,17 @@ import {
   readTelemetrySliceByKey,
   type RuntimeTelemetryState,
   type TelemetrySliceKey,
+  type TelemetrySliceOutcome,
   type TelemetrySliceUpdate,
 } from "./runtimeTelemetry.ts";
 import { Validated } from "./validated.ts";
 
 /** Dedicated local reader for optional telemetry so 401/403/timeout on any
- * telemetry endpoint never flows through `readApi` or logs the session out. */
+ * telemetry endpoint never flows through `readApi` or logs the session out.
+ * Wired to `subscribeAuthEpoch` so both same-tab `setServeToken` and cross-tab
+ * storage auth transitions invalidate cached ETags immediately. */
 const optionalTelemetryReads = new Validated();
-subscribeAuthSync(() => optionalTelemetryReads.clear());
+subscribeAuthEpoch(() => optionalTelemetryReads.clear());
 
 /** GET /api/features: every open objective mission's capability map. */
 export async function fetchFeatureMap(signal: AbortSignal): Promise<FeatureMap> {
@@ -43,22 +46,23 @@ export async function fetchOptionalFeatureTruth(
 }
 
 /** Read a single optional runtime telemetry slice independently with per-slice
- * timeout and zero global `unauthorized` auth side effects. */
+ * timeout, auth-epoch guard, and zero global `unauthorized` auth side effects. */
 export async function readOptionalTelemetrySliceByKey(
   key: TelemetrySliceKey,
   signal: AbortSignal,
   timeoutMs?: number,
-): Promise<TelemetrySliceUpdate> {
+): Promise<TelemetrySliceOutcome> {
   return readTelemetrySliceByKey(key, {
     reader: optionalTelemetryReads,
     signal,
     headers: apiHeaders(),
     timeoutMs,
+    getEpoch: getAuthEpoch,
   });
 }
 
 /** Stream optional runtime telemetry slices concurrently, notifying `onSlice`
- * immediately as each individual endpoint settles. */
+ * immediately as each current-epoch endpoint settles. */
 export async function pollOptionalRuntimeTelemetry(
   signal: AbortSignal,
   onSlice: (update: TelemetrySliceUpdate) => void,
@@ -69,6 +73,7 @@ export async function pollOptionalRuntimeTelemetry(
     signal,
     headers: apiHeaders(),
     timeoutMs,
+    getEpoch: getAuthEpoch,
     onSlice,
   });
 }
