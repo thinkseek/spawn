@@ -53,6 +53,7 @@ export type AuthPromptReason = "missing_token" | "rejected_token" | "invalid_tok
 export type AuthProbeResult =
   | { kind: "authenticated" }
   | { kind: "needs_token" }
+  | { kind: "forbidden"; message: string }
   | { kind: "unreachable"; message: string };
 
 /** Closed authentication gate state for the web console. */
@@ -60,6 +61,7 @@ export type AuthGateState =
   | { kind: "checking" }
   | { kind: "authenticated"; hasStoredToken: boolean }
   | { kind: "needs_token"; reason: AuthPromptReason; problem: string | null; hasStoredToken: boolean }
+  | { kind: "forbidden"; message: string; hasStoredToken: boolean }
   | { kind: "unreachable"; message: string; hasStoredToken: boolean };
 
 /** Closed result of validating user-entered token text before probing the server. */
@@ -72,11 +74,21 @@ export type TokenVerifyResult =
   | { ok: true }
   | { ok: false; message: string };
 
-/** Cross-cutting auth synchronization events emitted at HTTP boundaries or storage events. */
+/** Canonical auth synchronization events emitted at HTTP boundaries or storage events. */
 export type AuthSyncEvent =
   | { kind: "unauthorized" }
   | { kind: "signed_out" }
-  | { kind: "token_updated" };
+  | { kind: "token_updated"; token: string };
+
+export const FORBIDDEN_HOST_OR_ORIGIN_MESSAGE =
+  "访问被服务端拒绝（HTTP 403）：当前 Host 或 Origin 未获服务端允许，请确认访问域名或代理 Host/Origin 配置。";
+
+export function isAbortError(cause: unknown): boolean {
+  return (
+    (cause instanceof DOMException || cause instanceof Error) &&
+    cause.name === "AbortError"
+  );
+}
 
 /** Structural response interface for pure fetch-based auth probing and unit tests. */
 export interface AuthFetchResponse {
@@ -133,8 +145,8 @@ export async function probeAuthWithFetch(
     if (response.status === 403) {
       await response.arrayBuffer().catch(() => undefined);
       return {
-        kind: "unreachable",
-        message: "只读权限受限（HTTP 403）：当前访问无法读取控制台概览，请确认权限配置。",
+        kind: "forbidden",
+        message: FORBIDDEN_HOST_OR_ORIGIN_MESSAGE,
       };
     }
     if (response.status === 304) {
@@ -164,7 +176,7 @@ export async function probeAuthWithFetch(
       };
     }
   } catch (cause) {
-    if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+    if (isAbortError(cause)) throw cause;
     return {
       kind: "unreachable",
       message: cause instanceof Error ? cause.message : "无法连接到服务端",
@@ -203,7 +215,7 @@ export async function verifyTokenWithFetch(
       await response.arrayBuffer().catch(() => undefined);
       return {
         ok: false,
-        message: "权限受限（HTTP 403）：当前 Token 无法访问控制台概览。",
+        message: FORBIDDEN_HOST_OR_ORIGIN_MESSAGE,
       };
     }
     if (response.status === 304) {
@@ -235,7 +247,7 @@ export async function verifyTokenWithFetch(
       };
     }
   } catch (cause) {
-    if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+    if (isAbortError(cause)) throw cause;
     return {
       ok: false,
       message: cause instanceof Error ? `无法连接服务端：${cause.message}` : "无法连接服务端",
@@ -249,22 +261,29 @@ export function authStateFromProbe(
   hasStoredToken: boolean,
   problem: string | null,
 ): AuthGateState {
-  if (result.kind === "authenticated") {
-    return { kind: "authenticated", hasStoredToken };
+  switch (result.kind) {
+    case "authenticated":
+      return { kind: "authenticated", hasStoredToken };
+    case "needs_token":
+      return {
+        kind: "needs_token",
+        reason: unauthorizedReason(hasStoredToken, problem),
+        problem,
+        hasStoredToken,
+      };
+    case "forbidden":
+      return {
+        kind: "forbidden",
+        message: result.message,
+        hasStoredToken,
+      };
+    case "unreachable":
+      return {
+        kind: "unreachable",
+        message: result.message,
+        hasStoredToken,
+      };
   }
-  if (result.kind === "needs_token") {
-    return {
-      kind: "needs_token",
-      reason: unauthorizedReason(hasStoredToken, problem),
-      problem,
-      hasStoredToken,
-    };
-  }
-  return {
-    kind: "unreachable",
-    message: result.message,
-    hasStoredToken,
-  };
 }
 
 /** Transition to the token login gate after an HTTP 401 on an API or SSE response. */
@@ -285,7 +304,7 @@ export function classifyStorageTokenEvent(
   key: string | null,
   newValue: string | null,
   currentToken: string | null,
-): { kind: "signed_out" } | { kind: "token_updated"; token: string } | null {
+): AuthSyncEvent | null {
   if (key !== null && key !== TOKEN_KEY) return null;
   const next = serveCredential(newValue);
   if (next === null) {

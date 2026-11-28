@@ -662,3 +662,69 @@ test("a 403 stream refusal retries without marking unauthorized, and stop() rele
   assert.deepEqual(startedUrls, ["A:/api/stream", "B:/api/stream?after=1"]);
   tabB.stop();
 });
+
+test("stop() followed after 0ms or 1ms by start() before async Web Lock teardown re-acquires leadership", async () => {
+  const queue: Array<{ cb: () => Promise<void>; resolveReq: () => void }> = [];
+  let held = false;
+  const runNext = () => {
+    if (held || queue.length === 0) return;
+    const item = queue.shift()!;
+    held = true;
+    void item.cb().finally(() => {
+      setTimeout(() => {
+        held = false;
+        item.resolveReq();
+        runNext();
+      }, 5);
+    });
+  };
+  const asyncLocks: LocksLike = {
+    request: (_name, cb) =>
+      new Promise<void>((resolve) => {
+        queue.push({ cb, resolveReq: resolve });
+        runNext();
+      }),
+  };
+
+  let fetches = 0;
+  const stream = new LiveStream(
+    deps({
+      channel: channels(),
+      locks: asyncLocks,
+      fetch: async () => {
+        fetches += 1;
+        return response(200, ['event: ready\ndata: {"latest_event_id":1,"replayed":0}\n\n'], true);
+      },
+    }),
+  );
+
+  const waitForLiveLeader = async (wantFetches: number) => {
+    const deadline = Date.now() + 500;
+    while (Date.now() < deadline) {
+      if (stream.status.leader && stream.status.state === "live" && fetches === wantFetches) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.fail(
+      `timed out waiting for leader+live (leader=${stream.status.leader}, state=${stream.status.state}, fetches=${fetches}, want=${wantFetches})`,
+    );
+  };
+
+  stream.start();
+  await waitForLiveLeader(1);
+
+  // 0 ms: synchronous stop() -> start() while lock teardown is still pending.
+  stream.stop();
+  stream.start();
+  await waitForLiveLeader(2);
+
+  // 1 ms: async gap shorter than the 5 ms Web Lock teardown.
+  stream.stop();
+  await new Promise((resolve) => setTimeout(resolve, 1));
+  stream.start();
+  await waitForLiveLeader(3);
+
+  stream.stop();
+  await new Promise((resolve) => setTimeout(resolve, 15));
+});

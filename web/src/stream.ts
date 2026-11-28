@@ -461,6 +461,9 @@ export class LiveStream {
       .finally(() => {
         this.lockRequested = false;
         this.releaseLock = null;
+        if (!this.stopped && !this.leader) {
+          this.requestLeadership();
+        }
       });
   }
 
