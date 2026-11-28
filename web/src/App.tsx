@@ -25,9 +25,12 @@ import { TokenGate } from "./components/TokenGate";
 import {
   authStateFromProbe,
   authStateOnUnauthorized,
+  classifyTokenRole,
   isAbortError,
   type AuthGateState,
+  type SessionRole,
 } from "./token";
+import { AgentsConsoleView } from "./components/agents/AgentsConsoleView";
 import { AlertsView, OpenAlerts } from "./components/alerts/AlertsView";
 import { CostView } from "./components/cost/CostView";
 import { CoveragePage } from "./components/features/CoveragePage";
@@ -54,6 +57,7 @@ const ShowView = lazy(() =>
 
 export type View =
   | "fleet"
+  | "agents"
   | "missions"
   | "grading"
   | "features"
@@ -68,13 +72,24 @@ export type View =
 
 interface Route {
   view: View;
-  /** Agent open in the fleet view's detail drawer. */
+  /** Agent open in the fleet view's detail drawer, or terminal address in Agents view. */
   agent: string | null;
 }
 
 function routeFromHash(): Route {
   const hash = window.location.hash;
   if (hash.startsWith("#/sessions")) return { view: "sessions", agent: null };
+  const agentsMatch = /^#\/agents\/(.+)$/.exec(hash);
+  if (agentsMatch) {
+    let agent: string | null = null;
+    try {
+      agent = decodeURIComponent(agentsMatch[1]);
+    } catch {
+      agent = null;
+    }
+    return { view: "agents", agent };
+  }
+  if (hash.startsWith("#/agents")) return { view: "agents", agent: null };
   if (hash.startsWith("#/rsi")) return { view: "rsi", agent: null };
   if (hash.startsWith("#/grading")) return { view: "grading", agent: null };
   if (hash.startsWith("#/missions")) return { view: "missions", agent: null };
@@ -102,6 +117,11 @@ function hashFor(route: Route): string {
     return route.agent
       ? `#/fleet/${encodeURIComponent(route.agent)}`
       : "#/fleet";
+  }
+  if (route.view === "agents") {
+    return route.agent
+      ? `#/agents/${encodeURIComponent(route.agent)}`
+      : "#/agents";
   }
   if (route.view === "missions") return "#/missions";
   if (route.view === "grading") return "#/grading";
@@ -408,6 +428,24 @@ function DashboardShell({
   // open agent) across reloads.
   const [route, setRoute] = useState<Route>(routeFromHash);
   const view = route.view;
+  const [tokenRole, setTokenRole] = useState<SessionRole>(() =>
+    classifyTokenRole(getServeToken()),
+  );
+  useEffect(() => {
+    setTokenRole(classifyTokenRole(getServeToken()));
+  }, [hasStoredToken]);
+  useEffect(() => {
+    return subscribeAuthSync(() => {
+      setTokenRole(classifyTokenRole(getServeToken()));
+    });
+  }, []);
+  const selectAgentAddress = useCallback(
+    (agent: string | null) =>
+      setRoute((curr) =>
+        curr.view === "agents" ? { view: "agents", agent } : curr,
+      ),
+    [],
+  );
   // Polled in every view too: the sidebar and the fleet board group agents
   // by the tasks they hold. Faster while the missions page shows them.
   const missions = usePoll<Missions>(
@@ -521,6 +559,7 @@ function DashboardShell({
         attention={humanCount}
         openAlerts={openAlerts}
         onShowFleet={() => setView("fleet")}
+        onShowAgents={() => setView("agents")}
         onShowMissions={() => setView("missions")}
         onShowGrading={() => setView("grading")}
         onShowFeatures={() => setView("features")}
@@ -544,6 +583,7 @@ function DashboardShell({
         error={overview.error}
         attention={humanCount}
         onShowFleet={() => setView("fleet")}
+        onShowAgents={() => setView("agents")}
         onShowMissions={() => setView("missions")}
         onShowGrading={() => setView("grading")}
         onShowFeatures={() => setView("features")}
@@ -579,6 +619,12 @@ function DashboardShell({
           selectedId={route.agent}
           onSelect={(agent) => setRoute({ view: "fleet", agent })}
           onOpenTimeline={openTimeline}
+        />
+      ) : view === "agents" ? (
+        <AgentsConsoleView
+          role={tokenRole}
+          selectedAddress={route.agent}
+          onSelectAddress={selectAgentAddress}
         />
       ) : view === "missions" ? (
         <MissionsView missions={missions} />

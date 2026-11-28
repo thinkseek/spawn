@@ -312,3 +312,25 @@ export function classifyStorageTokenEvent(
   }
   return next !== currentToken ? { kind: "token_updated", token: next } : null;
 }
+
+/** Closed client-side role derived from the active credential format.
+ * Stateless read-only `sv1.<exp>.<43-char b64url>` tokens are always `viewer`;
+ * absent tokens (local open mode) or non-`sv1` credentials are `operator`
+ * (still subject to server-side 401/403 enforcement). */
+export type SessionRole =
+  | { kind: "operator" }
+  | { kind: "viewer"; expiresAtMs: number };
+
+const VIEWER_TOKEN_PATTERN = /^sv1\.([1-9][0-9]*)\.([A-Za-z0-9_-]{43})$/;
+
+/** Classify the active serve token into operator vs read-only viewer without network I/O. */
+export function classifyTokenRole(token: string | null): SessionRole {
+  if (token === null) return { kind: "operator" };
+  const match = VIEWER_TOKEN_PATTERN.exec(token);
+  if (!match) return { kind: "operator" };
+  const expSecs = Number(match[1]);
+  if (!Number.isSafeInteger(expSecs)) return { kind: "operator" };
+  const expiresAtMs = expSecs * 1_000;
+  if (!Number.isSafeInteger(expiresAtMs)) return { kind: "operator" };
+  return { kind: "viewer", expiresAtMs };
+}
