@@ -11,8 +11,7 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -525,42 +524,36 @@ fn build_signed_spec_wire(
 }
 
 fn spawn_gw_activity_sampler(
-    base_db_url: String,
+    mut observer: postgres::Client,
     sampling: &Arc<AtomicBool>,
-) -> std::thread::JoinHandle<(i64, i64)> {
+) -> std::thread::JoinHandle<(usize, i64, i64)> {
     let sampling_flag = Arc::clone(sampling);
     std::thread::spawn(move || {
-        let Ok(mut child) = Command::new("psql")
-            .args([&base_db_url, "-At", "-F", ","])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
-            return (0_i64, 0_i64);
-        };
-        let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut samples = 0usize;
         let mut peak_total = 0_i64;
         let mut peak_gw = 0_i64;
-        let query = "select count(*)::bigint, count(*) filter (where application_name = 'spawn_gw_stress_1000' and usename like 'spawn_node_gateway%')::bigint from pg_stat_activity where datname = current_database();\n";
-        while sampling_flag.load(Ordering::Acquire) {
-            if stdin.write_all(query.as_bytes()).is_err() || stdin.flush().is_err() {
+        loop {
+            let row = observer
+                .query_one(
+                    "select count(*)::bigint,
+                            count(*) filter (
+                                where application_name = 'spawn_gw_stress_1000'
+                                  and usename like 'spawn_node_gateway%'
+                            )::bigint
+                       from pg_stat_activity
+                      where datname = current_database()",
+                    &[],
+                )
+                .expect("sample pg_stat_activity");
+            samples += 1;
+            peak_total = peak_total.max(row.get::<_, i64>(0));
+            peak_gw = peak_gw.max(row.get::<_, i64>(1));
+            if !sampling_flag.load(Ordering::Acquire) {
                 break;
-            }
-            let mut line = String::new();
-            if stdout.read_line(&mut line).unwrap_or(0) == 0 {
-                break;
-            }
-            if let Some((tot, gw)) = line.trim().split_once(',') {
-                peak_total = peak_total.max(tot.parse().unwrap_or(0));
-                peak_gw = peak_gw.max(gw.parse().unwrap_or(0));
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        drop(stdin);
-        let _ = child.wait();
-        (peak_total, peak_gw)
+        (samples, peak_total, peak_gw)
     })
 }
 
@@ -682,12 +675,13 @@ fn thousand_concurrent_gateway_requests_stay_bounded_under_1c1g_pg() {
     let boot = boot_id();
     let signers = enroll_stress_nodes(&owner, &harness, &spec_bytes, &beat_bytes, &boot, NODES);
 
+    let observer = postgres::Client::connect(schema.url(), postgres::NoTls).expect("observer pg");
     let sampling = Arc::new(AtomicBool::new(true));
-    let sampler = spawn_gw_activity_sampler(schema.url().to_string(), &sampling);
+    let monitor = spawn_gw_activity_sampler(observer, &sampling);
     let (mut latencies_us, ok, failures, too_many_clients, elapsed) =
         run_gw_stress_burst(&harness, &spec_bytes, &signers, &boot, CONCURRENCY);
     sampling.store(false, Ordering::Release);
-    let (peak_total, peak_gw) = sampler.join().expect("psql sampler");
+    let (sample_count, peak_total, peak_gw) = monitor.join().expect("gateway activity sampler");
 
     latencies_us.sort_unstable();
     let p50 = gw_percentile_ms(&latencies_us, 50, 100);
@@ -699,7 +693,7 @@ fn thousand_concurrent_gateway_requests_stay_bounded_under_1c1g_pg() {
     eprintln!(
         "[stress:spawn-node-gateway-1000] reqs={CONCURRENCY} ok={ok} failures={} \
          too_many_clients={too_many_clients} workers={DEFAULT_WORKERS} opened_conns={opened}/{DEFAULT_WORKERS} \
-         peak_gw_pg_conns={peak_gw}/{DEFAULT_WORKERS} peak_pg_stat_activity={peak_total}/22 \
+         samples={sample_count} peak_gw_pg_conns={peak_gw}/{DEFAULT_WORKERS} peak_pg_stat_activity={peak_total}/22 \
          elapsed_ms={:.1} rps={rps:.1} p50_ms={p50:.2} p95_ms={p95:.2} p99_ms={p99:.2}",
         CONCURRENCY - ok,
         elapsed.as_secs_f64() * 1000.0
@@ -708,15 +702,19 @@ fn thousand_concurrent_gateway_requests_stay_bounded_under_1c1g_pg() {
     assert_eq!(too_many_clients, 0, "must never hit max_connections");
     assert_eq!(ok, CONCURRENCY, "sample failures: {failures:?}");
     assert!(
+        sample_count > 0,
+        "pg_stat_activity sampler recorded 0 samples"
+    );
+    assert!(
         opened <= DEFAULT_WORKERS,
         "gateway opened {opened} conns > DEFAULT_WORKERS={DEFAULT_WORKERS}"
     );
     assert!(
-        peak_gw <= i64::try_from(DEFAULT_WORKERS).unwrap_or(i64::MAX),
-        "peak gateway pg conns {peak_gw} > {DEFAULT_WORKERS}"
+        peak_gw > 0 && peak_gw <= i64::try_from(DEFAULT_WORKERS).unwrap_or(i64::MAX),
+        "peak gateway pg conns {peak_gw} must be in 1..={DEFAULT_WORKERS}"
     );
     assert!(
-        peak_total <= 22,
-        "total pg_stat_activity {peak_total} exceeded 22"
+        peak_total > 0 && peak_total <= 22,
+        "total pg_stat_activity {peak_total} must be in 1..=22"
     );
 }

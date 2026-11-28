@@ -290,8 +290,6 @@ where
     F: Fn() -> H,
 {
     let addr = listener.local_addr()?;
-    let workers = workers.max(1);
-    let capacity = capacity.max(1);
     let (sender, receiver) = sync_channel::<TcpStream>(capacity);
     let receiver = Arc::new(Mutex::new(receiver));
     for index in 0..workers {

@@ -10812,29 +10812,35 @@ mod tests {
     fn spawn_serve_activity_sampler(
         mut observer: postgres::Client,
         sampling: &Arc<std::sync::atomic::AtomicBool>,
-    ) -> std::thread::JoinHandle<(i64, i64)> {
+    ) -> std::thread::JoinHandle<(usize, i64, i64)> {
         use std::sync::atomic::Ordering;
         let sampling_flag = Arc::clone(sampling);
         std::thread::spawn(move || {
+            let mut samples = 0usize;
             let mut peak_total = 0_i64;
             let mut peak_role = 0_i64;
-            while sampling_flag.load(Ordering::Acquire) {
-                if let Ok(row) = observer.query_one(
-                    "select count(*)::bigint,
-                            count(*) filter (
-                                where application_name = 'spawn_serve_stress_1000'
-                                  and (usename like 'spawn_reader%' or usename like 'spawn_human%')
-                            )::bigint
-                       from pg_stat_activity
-                      where datname = current_database()",
-                    &[],
-                ) {
-                    peak_total = peak_total.max(row.get::<_, i64>(0));
-                    peak_role = peak_role.max(row.get::<_, i64>(1));
+            loop {
+                let row = observer
+                    .query_one(
+                        "select count(*)::bigint,
+                                count(*) filter (
+                                    where application_name = 'spawn_serve_stress_1000'
+                                      and (usename like 'spawn_reader%' or usename like 'spawn_human%')
+                                )::bigint
+                           from pg_stat_activity
+                          where datname = current_database()",
+                        &[],
+                    )
+                    .expect("sample pg_stat_activity");
+                samples += 1;
+                peak_total = peak_total.max(row.get::<_, i64>(0));
+                peak_role = peak_role.max(row.get::<_, i64>(1));
+                if !sampling_flag.load(Ordering::Acquire) {
+                    break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            (peak_total, peak_role)
+            (samples, peak_total, peak_role)
         })
     }
 
@@ -10999,10 +11005,10 @@ mod tests {
             assert_eq!(warm_st, 200, "{warm_body}");
 
             let sampling = Arc::new(AtomicBool::new(true));
-            let sampler = spawn_serve_activity_sampler(observer, &sampling);
+            let monitor = spawn_serve_activity_sampler(observer, &sampling);
             let mut burst = run_serve_stress_burst(port, CONCURRENCY);
             sampling.store(false, Ordering::Release);
-            let (peak_total, peak_role) = sampler.join().expect("sampler thread");
+            let (sample_count, peak_total, peak_role) = monitor.join().expect("sampler thread");
             server.unblock();
             let _ = server_thread.join();
             drop(shared);
@@ -11016,7 +11022,7 @@ mod tests {
 
             eprintln!(
                 "[stress:spawn-serve-1000] reqs={CONCURRENCY} reads={} writes={} \
-                 failures={} too_many_clients={} peak_role_conns={peak_role}/8 \
+                 failures={} too_many_clients={} samples={sample_count} peak_role_conns={peak_role}/8 \
                  peak_pg_stat_activity={peak_total}/22 elapsed_ms={:.1} rps={rps:.1} \
                  p50_ms={p50:.2} p95_ms={p95:.2} p99_ms={p99:.2}",
                 burst.ok_reads,
@@ -11027,6 +11033,10 @@ mod tests {
             );
 
             assert_eq!(burst.too_many_clients, 0, "must never hit max_connections");
+            assert!(
+                sample_count > 0,
+                "pg_stat_activity sampler recorded 0 samples"
+            );
             assert_eq!(
                 burst.ok_reads + burst.ok_writes,
                 CONCURRENCY,
@@ -11034,12 +11044,12 @@ mod tests {
                 burst.failures
             );
             assert!(
-                peak_role <= 8,
-                "serve role pool connections exceeded budget 8: {peak_role}"
+                peak_role > 0 && peak_role <= 8,
+                "serve role pool connections must be in 1..=8, got {peak_role}"
             );
             assert!(
-                peak_total <= 22,
-                "total pg_stat_activity exceeded 22: {peak_total}"
+                peak_total > 0 && peak_total <= 22,
+                "total pg_stat_activity must be in 1..=22, got {peak_total}"
             );
         });
     }
