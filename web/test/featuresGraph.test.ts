@@ -6,6 +6,7 @@ import type { Feature, FeatureMission, RelationKind } from "../src/features.ts";
 import {
   allBranchIds,
   ancestorsOf,
+  buildActiveSpineModel,
   buildFeatureMindMapTree,
   buildFileIndex,
   buildRelationIndex,
@@ -391,4 +392,260 @@ test("mindMapGraphIdentity and reconcileExpandedIds preserve user expansion and 
   // Inspector open/close auto-fits only before the user manually pans or zooms.
   assert.equal(shouldAutoFitOnInspectorToggle(false), true);
   assert.equal(shouldAutoFitOnInspectorToggle(true), false);
+});
+
+test("buildActiveSpineModel handles empty and all-live missions and transitions cleanly on focus", () => {
+  const emptyMission = makeMission([], 4);
+  const emptyRel = buildRelationIndex(emptyMission.features);
+  const emptyModel = buildActiveSpineModel(emptyMission, emptyRel, null);
+  assert.equal(emptyModel.kind, "empty");
+  assert.equal(emptyModel.focusId, null);
+  assert.deepEqual(emptyModel.spine, []);
+  assert.deepEqual(emptyModel.upstream, []);
+  assert.deepEqual(emptyModel.downstream, []);
+  assert.equal(emptyModel.summary.totalFeatures, 0);
+
+  const allLive = makeMission([
+    {
+      id: "dom",
+      title: "Domain",
+      kind: "domain",
+      state: "live",
+      planned: false,
+      implemented: true,
+      verified: true,
+      live: true,
+    },
+    {
+      id: "core",
+      title: "Core",
+      state: "live",
+      planned: false,
+      implemented: true,
+      verified: true,
+      live: true,
+    },
+    {
+      id: "edge",
+      title: "Edge",
+      state: "live",
+      planned: false,
+      implemented: true,
+      verified: true,
+      live: true,
+      relations: [{ kind: "depends_on", target: "core" }],
+    },
+  ]);
+  const liveRel = buildRelationIndex(allLive.features);
+  const liveModel = buildActiveSpineModel(allLive, liveRel, null);
+  assert.equal(liveModel.kind, "all_live");
+  assert.equal(liveModel.focusId, null);
+  assert.deepEqual(
+    liveModel.spine.map((n) => n.feature.id),
+    ["core", "edge"],
+  );
+  assert.equal(liveModel.summary.liveCount, 3);
+  assert.equal(liveModel.summary.nonLiveCount, 0);
+
+  // Focusing an individual node switches cleanly to focused mode with upstream/downstream.
+  const focused = buildActiveSpineModel(allLive, liveRel, "edge");
+  assert.equal(focused.kind, "focused");
+  assert.equal(focused.focusId, "edge");
+  assert.deepEqual(
+    focused.spine.map((n) => n.feature.id),
+    ["edge"],
+  );
+  assert.deepEqual(
+    focused.upstream.map((u) => [u.feature.id, u.depth, u.proximity]),
+    [["core", 1, "direct"]],
+  );
+  assert.deepEqual(focused.downstream, []);
+
+  // Unknown focusId falls back to auto mode rather than returning an invalid focused mode.
+  const unknownFocus = buildActiveSpineModel(allLive, liveRel, "does-not-exist");
+  assert.equal(unknownFocus.kind, "all_live");
+  assert.equal(unknownFocus.focusId, null);
+});
+
+test("buildActiveSpineModel extracts transitive upstream/downstream and preserves server state immutability", () => {
+  // Graph:
+  //   root-db (live) <- depends_on - auth (implemented, active owner)
+  //   gate (planned) - blocks -> auth
+  //   auth <- depends_on - api (planned) <- depends_on - ui (planned)
+  //   blocked-hotfix (planned, blocked) - blocks -> ui
+  const rawList = [
+    {
+      id: "root-db",
+      title: "Root DB",
+      state: "live",
+      planned: false,
+      implemented: true,
+      verified: true,
+      live: true,
+      objectives: [1],
+    },
+    {
+      id: "gate",
+      title: "Security Gate",
+      state: "planned",
+      objectives: [2],
+      relations: [{ kind: "blocks", target: "auth", label: "needs audit" }],
+    },
+    {
+      id: "auth",
+      title: "Auth Service",
+      state: "implemented",
+      planned: false,
+      implemented: true,
+      verified: false,
+      live: false,
+      objectives: [3],
+      owner: {
+        task: 42,
+        agent_id: "worker-alpha",
+        session_id: "sess-auth-42",
+        kind: "worker",
+        state: "working",
+        since_ms: 5000,
+      },
+      relations: [{ kind: "depends_on", target: "root-db", label: "schema" }],
+    },
+    {
+      id: "api",
+      title: "HTTP API",
+      state: "planned",
+      objectives: [4],
+      relations: [{ kind: "depends_on", target: "auth" }],
+    },
+    {
+      id: "ui",
+      title: "Web UI",
+      state: "planned",
+      objectives: [5],
+      relations: [{ kind: "depends_on", target: "api" }],
+    },
+    {
+      id: "blocked-hotfix",
+      title: "Hotfix Blocker",
+      state: "planned",
+      objectives: [6],
+      blocked: {
+        kind: "main_red",
+        reason: "clippy red",
+        task: 55,
+        agent_id: "worker-beta",
+        session_id: "sess-hotfix-55",
+      },
+      relations: [{ kind: "blocks", target: "ui" }],
+    },
+  ];
+
+  const mission = makeMission(rawList);
+  const rel = buildRelationIndex(mission.features);
+  const model = buildActiveSpineModel(mission, rel, null);
+
+  assert.equal(model.kind, "active_work");
+  // Blocked hotfix ranks ahead of active owner auth; domain/idle planned nodes stay out of spine.
+  assert.deepEqual(
+    model.spine.map((n) => [n.feature.id, n.role, n.workSignal.kind, n.sessionId]),
+    [
+      ["blocked-hotfix", "in_flight", "blocked", "sess-hotfix-55"],
+      ["auth", "in_flight", "active_owner", "sess-auth-42"],
+    ],
+  );
+  // Upstream for spine includes incoming blocks (gate, planned priority) and direct depends_on (root-db, live).
+  assert.deepEqual(
+    model.upstream.map((u) => [
+      u.feature.id,
+      u.depth,
+      u.proximity,
+      u.links.map((l) => `${l.edgeKind}:${l.viaFeatureId}`),
+    ]),
+    [
+      ["gate", 1, "direct", ["blocked_by:auth"]],
+      ["root-db", 1, "direct", ["depends_on:auth"]],
+    ],
+  );
+  // Downstream unlocked includes direct api (required_by auth, objective 4) and ui (blocks blocked-hotfix, objective 5; kept at min depth 1).
+  assert.deepEqual(
+    model.downstream.map((d) => [d.feature.id, d.depth, d.proximity]),
+    [
+      ["api", 1, "direct"],
+      ["ui", 1, "direct"],
+    ],
+  );
+
+  // Shuffling input feature array must produce identical deterministic order.
+  const shuffled = makeMission([...rawList].reverse());
+  const shuffledModel = buildActiveSpineModel(shuffled, buildRelationIndex(shuffled.features), null);
+  assert.deepEqual(
+    shuffledModel.spine.map((n) => n.feature.id),
+    model.spine.map((n) => n.feature.id),
+  );
+  assert.deepEqual(
+    shuffledModel.upstream.map((n) => n.feature.id),
+    model.upstream.map((n) => n.feature.id),
+  );
+  assert.deepEqual(
+    shuffledModel.downstream.map((n) => n.feature.id),
+    model.downstream.map((n) => n.feature.id),
+  );
+
+  // Server states are never overwritten even when upstream dependencies are incomplete.
+  const authFeature = mission.features.find((f) => f.id === "auth");
+  assert.equal(authFeature?.state, "implemented");
+  assert.equal(authFeature?.implemented, true);
+  assert.equal(authFeature?.verified, false);
+  assert.equal(authFeature?.live, false);
+});
+
+test("buildActiveSpineModel guards against self-links, 2-node cycles, and transitive sub-cycles", () => {
+  const mission = makeMission([
+    {
+      id: "a",
+      title: "Node A",
+      state: "implemented",
+      planned: false,
+      implemented: true,
+      relations: [
+        { kind: "depends_on", target: "a" },
+        { kind: "depends_on", target: "b" },
+      ],
+    },
+    {
+      id: "b",
+      title: "Node B",
+      state: "planned",
+      relations: [
+        { kind: "depends_on", target: "c" },
+        { kind: "depends_on", target: "a" },
+      ],
+    },
+    {
+      id: "c",
+      title: "Node C",
+      state: "planned",
+      relations: [{ kind: "depends_on", target: "b" }],
+    },
+  ]);
+
+  const rel = buildRelationIndex(mission.features);
+  const model = buildActiveSpineModel(mission, rel, "a");
+
+  assert.equal(model.kind, "focused");
+  assert.deepEqual(
+    model.upstream.map((u) => [u.feature.id, u.depth]),
+    [
+      ["b", 1],
+      ["c", 2],
+    ],
+  );
+  assert.deepEqual(
+    model.downstream.map((d) => [d.feature.id, d.depth]),
+    [
+      ["b", 1],
+      ["c", 2],
+    ],
+  );
+  assert.ok(model.summary.cycleGuardedEdges > 0);
 });

@@ -3388,14 +3388,18 @@
         "docs/feature-map-mindmap.md",
         "docs/feature-map.md",
         "docs/landing-notes/2026-11-22-pr82.md",
+        "web/src/components/features/ActiveSpineView.tsx",
         "web/src/components/features/FeatureInspector.tsx",
         "web/src/components/features/FeatureMapView.tsx",
         "web/src/components/features/FeatureMindMap.tsx",
+        "web/src/components/features/RuntimeTelemetryStrip.tsx",
         "web/src/features.ts",
         "web/src/featuresApi.ts",
         "web/src/featuresGraph.ts",
+        "web/src/runtimeTelemetry.ts",
         "web/test/features.test.ts",
-        "web/test/featuresGraph.test.ts"
+        "web/test/featuresGraph.test.ts",
+        "web/test/runtimeTelemetry.test.ts"
       ],
       "relations": [
         {
