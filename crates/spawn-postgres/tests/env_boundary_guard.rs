@@ -1186,7 +1186,7 @@ fn collect_unexpected_clippy_configs(root: &Path, dir: &Path, out: &mut Vec<Path
         let meta =
             fs::symlink_metadata(&path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
         if meta.is_dir() {
-            if matches!(name, "target" | ".git") {
+            if dir == root && matches!(name, "target" | ".git") {
                 continue;
             }
             collect_unexpected_clippy_configs(root, &path, out);
@@ -2047,6 +2047,18 @@ fn env_boundary_guard_rejects_nested_and_dot_clippy_configs_only() {
         "too-many-arguments-threshold = 8\n",
     );
     ws.write(
+        "crates/spawn-kdf/src/target/clippy.toml",
+        "too-many-arguments-threshold = 8\n",
+    );
+    ws.write(
+        "crates/spawn-kdf/src/target/.clippy.toml",
+        "too-many-arguments-threshold = 8\n",
+    );
+    ws.write(
+        "crates/spawn-kdf/src/.git/clippy.toml",
+        "too-many-arguments-threshold = 8\n",
+    );
+    ws.write(
         "crates/spawn-core/.clippy.toml",
         "too-many-arguments-threshold = 8\n",
     );
@@ -2057,6 +2069,9 @@ fn env_boundary_guard_rejects_nested_and_dot_clippy_configs_only() {
             PathBuf::from(".clippy.toml"),
             PathBuf::from("crates/spawn-core/.clippy.toml"),
             PathBuf::from("crates/spawn-kdf/clippy.toml"),
+            PathBuf::from("crates/spawn-kdf/src/.git/clippy.toml"),
+            PathBuf::from("crates/spawn-kdf/src/target/.clippy.toml"),
+            PathBuf::from("crates/spawn-kdf/src/target/clippy.toml"),
         ]
     );
 }
