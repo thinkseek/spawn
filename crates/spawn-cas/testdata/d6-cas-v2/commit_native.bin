@@ -1,0 +1,17 @@
+spawn-commit-v2
+tree sha256:b71871a89314f5692d116601867087bbf9c346b06bb642ea3fcee9a43c237f04
+parent sha256:8af322720a065f56189fdeaf56f179f9723048fd650dee075796d10579a55930
+at_ms 1795700123456
+actor agent agent-s1-coder
+execution_id exec_01928374
+model_label claude-opus-4.5
+preset_id preset-architect
+origin work/edit/checkpoint
+task_id 42
+transcript_ref transcript://exec_01928374/turn-3
+message 92
+feat(cas): native spawn commit-v2
+
+Includes UTF-8 — résumé	and literal:
+git_compat 3
+abc

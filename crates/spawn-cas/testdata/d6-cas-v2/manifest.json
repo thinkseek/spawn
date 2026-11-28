@@ -1,0 +1,13 @@
+{
+  "v": 2,
+  "empty_tree_sha256": "sha256:a1688f42bc720acf7e7faa77ed1509be211fbd5706c98dc1a2e42da7a92cbc21",
+  "v1_tree_sha256": "sha256:b71871a89314f5692d116601867087bbf9c346b06bb642ea3fcee9a43c237f04",
+  "v1_snapshot_sha256": "sha256:8af322720a065f56189fdeaf56f179f9723048fd650dee075796d10579a55930",
+  "v1_parent_snapshot_sha256": "sha256:471a4bf181250d3c686b9fdcf7408606bbe106d1838dbaf204d678b8bcef5581",
+  "commit_native_len": 492,
+  "commit_native_sha256": "sha256:e495bfa5721fa0b20d99b782b1e58c5a8b55301c830f58c1272e0de9fac2bfcd",
+  "commit_minimal_len": 158,
+  "commit_minimal_sha256": "sha256:ba8aeacb2fec76663acbd7fda6242eb6414d13b9085b0b5ed9466d7537b0d14a",
+  "commit_git_compat_len": 507,
+  "commit_git_compat_sha256": "sha256:f7957cb254c90ffaeff5332037e75cc160fbb99563b5d2689db1059a1dd4c4db"
+}
