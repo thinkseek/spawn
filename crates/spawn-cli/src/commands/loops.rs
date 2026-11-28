@@ -136,8 +136,9 @@ pub(crate) const TICK_USAGE: &str = "usage: spawn tick [--repo <bare repo>] [--r
 
 /// The usage of `spawn loop`, the only copy (main's help reads it).
 pub(crate) const LOOP_USAGE: &str = "usage: spawn loop [--repo <bare repo>] [--root <workspace root>] [--judge-url <url>]\n      \
-                                     (the fleet until SIGTERM or SIGINT: Bridge, Observer, dispatcher\n       \
-                                     and, with SPAWN_SUPERVISOR=1, the supervisor's liveness rule)";
+                                     (the fleet until SIGTERM, SIGINT, or main-PID SIGUSR1 epoch drain: Bridge, Observer,\n       \
+                                     dispatcher and, with SPAWN_SUPERVISOR=1, the supervisor's liveness rule;\n       \
+                                     send SIGUSR1 only to $MAINPID / --kill-whom=main, never --kill-whom=all)";
 
 pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
     let (mut bridge, mut observer) = tick_runtime(flags)?;
@@ -158,13 +159,22 @@ pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
     Ok(0)
 }
 
-/// A flag SIGTERM and SIGINT set instead of killing the process: the loop
-/// ends after its pass, and dropping the Bridge makes the pushes still
-/// queued in memory (`MissionWorkspaces`' drop flushes its pusher). Without
-/// it a deploy's restart lost them (causality audit #4).
+/// A flag SIGTERM, SIGINT, and SIGUSR1 (epoch drain) set instead of killing
+/// the process: the loop finishes its current pass, drops the Bridge/workspaces
+/// cleanly (flushing pending pushes in `MissionWorkspaces`' drop), and leaves
+/// detached `spawn-hc` engine processes running.
+///
+/// Deployment note: `SIGUSR1` epoch drain must be sent only to the loop's main
+/// PID (e.g. `kill -USR1 $MAINPID` or `systemctl --user kill --kill-whom=main -s USR1 spawn-loop.service`),
+/// never `--kill-whom=all`, which would kill child processes in the cgroup
+/// without a `SIGUSR1` handler.
 fn stop_on_signal() -> Result<Arc<AtomicBool>, String> {
     let stop = Arc::new(AtomicBool::new(false));
-    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+    for signal in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGUSR1,
+    ] {
         signal_hook::flag::register(signal, Arc::clone(&stop))
             .map_err(|error| format!("handle signal {signal}: {error}"))?;
     }
@@ -452,8 +462,13 @@ impl Pace {
 }
 
 /// Run the Bridge, the Observer, the disk watch, the recovery, the
-/// dispatcher and the liveness rule, until SIGTERM or SIGINT ends it after
-/// its pass.
+/// dispatcher and the liveness rule, until SIGTERM, SIGINT, or SIGUSR1
+/// (epoch drain) ends it after its pass.
+///
+/// Always target only the loop's main PID when triggering epoch drain
+/// (`kill -USR1 $MAINPID` or `systemctl --user kill --kill-whom=main -s USR1 spawn-loop.service`);
+/// `--kill-whom=all` would deliver `SIGUSR1` to child processes in the cgroup
+/// without a handler (such as `spawn-hc`).
 ///
 /// What the loop reads follows what happens, not the clock
 /// (docs/fleet-architecture.md §3, docs/design.md §14): the log's watermark
@@ -1276,10 +1291,17 @@ mod tests {
         assert_eq!(schedule.earliest(), None);
     }
 
+    /// Process-wide signal handlers share delivery; serialize tests that raise
+    /// real process signals so parallel test threads do not race `stop` flags.
+    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A deploy's SIGTERM ends the loop's pause instead of the process, so
     /// the loop returns and its pending pushes are made.
     #[test]
     fn sigterm_ends_the_pause_not_the_process() {
+        let _guard = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stop = stop_on_signal().expect("handlers");
         let started = Instant::now();
         signal_hook::low_level::raise(signal_hook::consts::SIGTERM).expect("raise");
@@ -1287,6 +1309,40 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         stop.store(false, Ordering::SeqCst);
         assert!(!pause_unless_stopped(Duration::from_millis(10), &stop));
+    }
+
+    /// Epoch drain via SIGUSR1 flips the same lossless stop flag without
+    /// killing the loop or its managed `spawn-hc` engine processes.
+    #[test]
+    fn sigusr1_ends_the_pause_not_the_process() {
+        let _guard = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stop = stop_on_signal().expect("handlers");
+        let started = Instant::now();
+        signal_hook::low_level::raise(signal_hook::consts::SIGUSR1).expect("raise SIGUSR1");
+        assert!(pause_unless_stopped(Duration::from_secs(30), &stop));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        stop.store(false, Ordering::SeqCst);
+        assert!(!pause_unless_stopped(Duration::from_millis(10), &stop));
+    }
+
+    /// SIGUSR1 also exits `wait_unless_stopped` cleanly with `Waited::Stopped`
+    /// without polling file watches once the stop flag is set.
+    #[test]
+    fn sigusr1_ends_wait_unless_stopped() {
+        let _guard = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stop = stop_on_signal().expect("handlers");
+        let watch = Arc::new(StubWatch::new(false));
+        let bridge = memory_bridge(watch.clone());
+        let started = Instant::now();
+        signal_hook::low_level::raise(signal_hook::consts::SIGUSR1).expect("raise SIGUSR1");
+        let waited = wait_unless_stopped(None, Some(&bridge), Duration::from_secs(30), &stop);
+        assert!(matches!(waited, Waited::Stopped));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(watch.waits.load(Ordering::SeqCst), 0);
     }
 
     /// A ready file watch ends the wait with a hint for another Bridge pass.
