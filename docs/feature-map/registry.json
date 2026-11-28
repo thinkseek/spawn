@@ -1451,6 +1451,7 @@
       "files": [
         "crates/spawn-cas/Cargo.toml",
         "crates/spawn-cas/src/chunker.rs",
+        "crates/spawn-cas/src/commit.rs",
         "crates/spawn-cas/src/digest.rs",
         "crates/spawn-cas/src/gc.rs",
         "crates/spawn-cas/src/gc_fence.rs",
@@ -1467,6 +1468,11 @@
         "crates/spawn-cas/testdata/d6-cas-v1/pointer-100mib.bin",
         "crates/spawn-cas/testdata/d6-cas-v1/snapshot.bin",
         "crates/spawn-cas/testdata/d6-cas-v1/tree.bin",
+        "crates/spawn-cas/testdata/d6-cas-v2/commit_git_compat.bin",
+        "crates/spawn-cas/testdata/d6-cas-v2/commit_minimal.bin",
+        "crates/spawn-cas/testdata/d6-cas-v2/commit_native.bin",
+        "crates/spawn-cas/testdata/d6-cas-v2/manifest.json",
+        "crates/spawn-cas/tests/commit_v2.rs",
         "crates/spawn-cas/tests/d6_cas.rs",
         "crates/spawn-cas/tests/d6_journal_gc.rs",
         "crates/spawn-cas/tests/store.rs",
@@ -1519,6 +1525,7 @@
           "2a785c5cd"
         ],
         "tests": [
+          "crates/spawn-cas/tests/commit_v2.rs",
           "crates/spawn-cas/tests/d6_cas.rs",
           "crates/spawn-cas/tests/d6_journal_gc.rs",
           "crates/spawn-cas/tests/store.rs",

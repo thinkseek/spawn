@@ -45,6 +45,7 @@
 #![warn(missing_docs)]
 
 mod chunker;
+mod commit;
 mod digest;
 mod gc;
 mod gc_fence;
@@ -62,6 +63,10 @@ use std::path::PathBuf;
 pub use chunker::{
     CHUNK_AVG, CHUNK_MAX, CHUNK_MIN, CHUNKER_FASTCDC_V1, ChunkIndex, ChunkRef, StoredBlob,
     fastcdc_gear_table, next_chunk_len,
+};
+pub use commit::{
+    COMMIT_V2_MAGIC, CommitActor, CommitBoundary, CommitIntent, CommitKind, CommitObject,
+    CommitProvenanceSummary, CommitV2,
 };
 pub use digest::{
     Algo, Digest, Hasher, Verified, is_hex64, sha256_of, sha256_reader, verify_reader,
@@ -140,13 +145,14 @@ pub enum CasError {
         /// What is wrong with it.
         reason: &'static str,
     },
-    /// Canonical `spawn-tree-v1`, `spawn-snapshot-v1`, or `spawn-chunks-v1` encoding violation.
+    /// Canonical `spawn-tree-v1`, `spawn-snapshot-v1`, `spawn-commit-v2`, or
+    /// `spawn-chunks-v1` encoding violation.
     #[error("malformed CAS object format: {0}")]
     BadFormat(&'static str),
     /// Object exceeded the write-side 4 MiB single-object hard cap.
     #[error("{kind} object size {size} exceeds {max}-byte cap")]
     TooLarge {
-        /// Object kind (`tree`, `snapshot`, `chunk index`).
+        /// Object kind (`tree`, `snapshot`, `commit`, `chunk index`).
         kind: &'static str,
         /// Actual encoded byte size.
         size: usize,
