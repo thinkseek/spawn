@@ -234,6 +234,18 @@ pub fn is_safe_codex_session_id(native: &str) -> bool {
     plain_session_id(native) && !native.starts_with('-') && !native.starts_with('.')
 }
 
+/// Validate that `name` (file basename) belongs to Codex session `native`,
+/// accepting both legacy flat `<native>.jsonl` and real nested `rollout-*-<native>.jsonl`.
+pub fn is_codex_rollout_filename(name: &str, native: &str) -> bool {
+    if !is_safe_codex_session_id(native) {
+        return false;
+    }
+    if name == format!("{native}.jsonl") {
+        return true;
+    }
+    name.starts_with("rollout-") && name.ends_with(&format!("-{native}.jsonl"))
+}
+
 /// Validate that `model` is a safe Codex model identifier for `--model`.
 pub fn is_safe_codex_model(model: &str) -> bool {
     is_model_label(model.trim())
@@ -410,7 +422,8 @@ fn reported_session_from_line(line: &str) -> Option<String> {
                 .or_else(|| value.pointer("/payload/id"))
                 .and_then(Value::as_str),
             Some("session_meta") => value
-                .pointer("/payload/id")
+                .pointer("/payload/session_id")
+                .or_else(|| value.pointer("/payload/id"))
                 .or_else(|| value.get("session_id"))
                 .or_else(|| value.get("thread_id"))
                 .and_then(Value::as_str),
@@ -771,6 +784,11 @@ fn parse_rollout_event_msg(value: &Value, line_key: &str, events: &mut Vec<Norma
             ));
         }
         Some("token_count") => parse_rollout_token_count(value, payload, line_key, events),
+        Some("item_completed") => {
+            if let Some(ev) = parse_exec_item_completed(payload, line_key) {
+                events.push(ev);
+            }
+        }
         _ => {}
     }
 }

@@ -992,6 +992,7 @@ mod tests {
         for line in [
             "spawn agent ls [--all] [--socket <path>] [--json]",
             "spawn agent snapshot <addr> [--socket <path>] [--json]",
+            "spawn agent events <addr> [--limit <n>] [--after-key <key>] [--follow] [--interval <dur>] [--socket <path>] [--json]",
             "spawn agent send <addr> <text> [--if-guard <hash> | --force] [--socket <path>] [--json]",
             "spawn agent keys <addr> <chord...> [--if-guard <hash>] [--socket <path>] [--json]",
             "spawn agent interrupt <addr> [--timeout <duration>] [--socket <path>] [--json]",

@@ -638,6 +638,7 @@ pub(super) struct IpcState {
     pub(super) pools: Arc<ServePools>,
     pub(super) cas_root: PathBuf,
     pub(super) epoch: String,
+    pub(super) agent_socket: Option<PathBuf>,
 }
 
 impl IpcState {
@@ -653,6 +654,12 @@ impl IpcState {
             ..PoolConfig::default()
         };
         Self::with_config(urls, cas_root, schema, config)
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_test_agent_socket(mut self, socket: PathBuf) -> Self {
+        self.agent_socket = Some(socket);
+        self
     }
 
     fn with_config(
@@ -678,6 +685,7 @@ impl IpcState {
             pools,
             cas_root,
             epoch,
+            agent_socket: None,
         }
     }
 }

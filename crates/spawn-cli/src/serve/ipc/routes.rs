@@ -266,6 +266,10 @@ fn dispatch_buffered(req: &IpcRequest, state: &IpcState) -> IpcResponse {
         return handle_api_get("/api/episodes", req, state);
     }
 
+    if let Some(agent_route) = serve::parse_agent_route(&req.path) {
+        return handle_agent_ipc_route(agent_route, req, state);
+    }
+
     let Some((expected_method, pattern, values)) = route(&req.path) else {
         return IpcResponse::json(404, &json!({ "error": "not found", "code": "not_found" }));
     };
@@ -281,6 +285,158 @@ fn dispatch_buffered(req: &IpcRequest, state: &IpcState) -> IpcResponse {
         return handle_api_post(pattern, id, req, state);
     }
     handle_api_get(pattern, req, state)
+}
+
+fn ipc_agent_principal(req: &IpcRequest) -> serve::auth_token::AuthPrincipal {
+    if let Some(role) = req.header("x-spawn-role")
+        && !matches!(role.trim().to_ascii_lowercase().as_str(), "owner" | "admin")
+    {
+        return serve::auth_token::AuthPrincipal::ReadOnlyViewer {
+            expires_at_ms: i64::MAX,
+        };
+    }
+    if req
+        .header("x-spawn-viewer")
+        .is_some_and(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "false" | "0"))
+        || req
+            .header("authorization")
+            .is_some_and(|v| v.contains("sv1."))
+    {
+        return serve::auth_token::AuthPrincipal::ReadOnlyViewer {
+            expires_at_ms: i64::MAX,
+        };
+    }
+    serve::auth_token::AuthPrincipal::LocalOwner
+}
+
+fn ipc_agent_answer_response(
+    req: &IpcRequest,
+    res: Result<answers::Answer, (u16, String)>,
+) -> IpcResponse {
+    match res {
+        Ok(answer) => {
+            if let Some(etag) = answer.etag.as_deref()
+                && answers::not_modified(req.header("if-none-match"), etag)
+            {
+                return IpcResponse::empty(304)
+                    .with_header("ETag", etag)
+                    .with_header("Cache-Control", "no-cache");
+            }
+            let body = if req.method == "HEAD" {
+                Vec::new()
+            } else {
+                answer.body.into_bytes()
+            };
+            let mut resp =
+                IpcResponse::text(answer.status, "application/json; charset=utf-8", body)
+                    .with_header("Cache-Control", "no-cache");
+            if let Some(etag) = answer.etag {
+                resp = resp.with_header("ETag", etag);
+            }
+            resp
+        }
+        Err((status, message)) => {
+            let mut resp = IpcResponse::json(status, &json!({ "error": message }));
+            if req.method == "HEAD" {
+                resp.body.clear();
+            }
+            resp
+        }
+    }
+}
+
+fn handle_agent_ipc_route(
+    agent_route: serve::AgentRoute,
+    req: &IpcRequest,
+    state: &IpcState,
+) -> IpcResponse {
+    let access = ipc_agent_principal(req);
+    if !access.can_mutate() && !matches!(req.method.as_str(), "GET" | "HEAD") {
+        return IpcResponse::json(
+            403,
+            &json!({ "error": serve::auth_token::READONLY_MUTATION_ERROR }),
+        );
+    }
+    let discovery_env = crate::config::herdr_discovery_env();
+    let agent_socket = state.agent_socket.as_deref();
+    match agent_route {
+        serve::AgentRoute::InvalidAddress => IpcResponse::json(
+            400,
+            &json!({ "error": format!("{BAD_REQUEST}invalid agent terminal address") }),
+        ),
+        serve::AgentRoute::List => {
+            if !matches!(req.method.as_str(), "GET" | "HEAD") {
+                return IpcResponse::json(
+                    405,
+                    &json!({ "error": "method not allowed: this path takes GET only" }),
+                )
+                .with_header("Allow", "GET");
+            }
+            ipc_agent_answer_response(
+                req,
+                serve::agent_list_answer(&req.query, access, agent_socket, &discovery_env),
+            )
+        }
+        serve::AgentRoute::Snapshot { address } => {
+            if !matches!(req.method.as_str(), "GET" | "HEAD") {
+                return IpcResponse::json(
+                    405,
+                    &json!({ "error": "method not allowed: this path takes GET only" }),
+                )
+                .with_header("Allow", "GET");
+            }
+            ipc_agent_answer_response(
+                req,
+                serve::agent_snapshot_answer(&address, access, agent_socket, &discovery_env),
+            )
+        }
+        serve::AgentRoute::Events { address } => {
+            if !matches!(req.method.as_str(), "GET" | "HEAD") {
+                return IpcResponse::json(
+                    405,
+                    &json!({ "error": "method not allowed: this path takes GET only" }),
+                )
+                .with_header("Allow", "GET");
+            }
+            ipc_agent_answer_response(
+                req,
+                serve::agent_events_answer(
+                    &address,
+                    &req.query,
+                    access,
+                    agent_socket,
+                    &discovery_env,
+                ),
+            )
+        }
+        serve::AgentRoute::Action { address } => {
+            if req.method != "POST" {
+                return IpcResponse::json(
+                    405,
+                    &json!({ "error": "method not allowed: this path takes POST only" }),
+                )
+                .with_header("Allow", "POST");
+            }
+            if !access.can_mutate() {
+                return IpcResponse::json(
+                    403,
+                    &json!({ "error": serve::auth_token::READONLY_MUTATION_ERROR }),
+                );
+            }
+            if req.body.len() > 16 * 1024 {
+                return IpcResponse::json(413, &json!({ "error": "body exceeds 16384 bytes" }));
+            }
+            match serve::agent_action_checked_bytes(
+                &req.body,
+                &address,
+                agent_socket,
+                &discovery_env,
+            ) {
+                Ok((status, body)) => IpcResponse::json(status, &body),
+                Err((status, message)) => IpcResponse::json(status, &json!({ "error": message })),
+            }
+        }
+    }
 }
 
 fn handle_hello(state: &IpcState) -> IpcResponse {
@@ -676,6 +832,7 @@ pub(in crate::serve) fn dispatch_ipc_with_pools_for_test(
         pools,
         cas_root: std::env::temp_dir(),
         epoch: "test-epoch".to_string(),
+        agent_socket: None,
     };
     let req = IpcRequest {
         method: method.to_string(),
@@ -1034,5 +1191,263 @@ mod truth_tests {
                 }
             },
         );
+    }
+
+    fn spawn_mock_ipc_agent_uds(
+        mock_sock: &std::path::Path,
+        ext_reads: Arc<std::sync::atomic::AtomicUsize>,
+        mutations: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> std::thread::JoinHandle<()> {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::Ordering;
+
+        let listener = UnixListener::bind(mock_sock).expect("bind mock agent sock");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let mut br = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                if br.read_line(&mut line).is_err() || line.is_empty() {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(&line).expect("json rpc");
+                let method = req["method"].as_str().unwrap_or_default();
+                if method == "__stop" {
+                    let _ = (&stream).write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+                    break;
+                }
+                let reply = match method {
+                    "terminal.list" => json!({
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "terminals": [
+                                {
+                                    "address": "t1",
+                                    "labels": {"spawn_owner": "loop", "spawn_terminal": "spawn-exec_1"},
+                                    "state": "live", "pid": 101, "cols": 80, "rows": 24,
+                                    "title": "managed", "status": {"state": "working", "app": "claude"}, "turn": 1
+                                },
+                                {
+                                    "address": "t2",
+                                    "labels": {},
+                                    "state": "live", "pid": 202, "cols": 80, "rows": 24,
+                                    "title": "external", "status": {"state": "idle", "app": "codex"}, "turn": 1
+                                }
+                            ]
+                        }
+                    }),
+                    "terminal.get" => {
+                        let term = req["params"]["terminal"].as_str().unwrap_or_default();
+                        let labels = if term == "t1" {
+                            json!({"spawn_owner": "loop", "spawn_terminal": "spawn-exec_1"})
+                        } else {
+                            json!({})
+                        };
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": req["id"],
+                            "result": {
+                                "address": term, "labels": labels, "state": "live",
+                                "pid": if term == "t1" { 101 } else { 202 },
+                                "cols": 80, "rows": 24, "title": term,
+                                "status": {"state": "idle", "app": "claude"}, "turn": 1
+                            }
+                        })
+                    }
+                    "terminal.read" => {
+                        if req["params"]["terminal"].as_str() == Some("t2") {
+                            ext_reads.fetch_add(1, Ordering::SeqCst);
+                        }
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": req["id"],
+                            "result": { "text": "Select:\n  1. Yes\n  2. No\n", "complete": true, "how": "screen" }
+                        })
+                    }
+                    "terminal.keys" => {
+                        mutations.fetch_add(1, Ordering::SeqCst);
+                        json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "status": "idle", "turn": 2 } })
+                    }
+                    "hello" => json!({ "jsonrpc": "2.0", "id": req["id"], "result": {} }),
+                    other => panic!("unexpected rpc method {other}"),
+                };
+                let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
+            }
+        })
+    }
+
+    #[test]
+    fn ipc_agent_routes_dispatch_list_snapshot_events_action_and_fail_closed_viewer() {
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = ScratchDir::new("ipc-agents");
+        let mock_sock = dir.0.join("hc.sock");
+        let ext_reads = Arc::new(AtomicUsize::new(0));
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let srv =
+            spawn_mock_ipc_agent_uds(&mock_sock, Arc::clone(&ext_reads), Arc::clone(&mutations));
+
+        let state = IpcState::with_test_wait_timeout(
+            RoleUrls::from_explicit(
+                "postgres://spawn_reader@127.0.0.1:1/spawn".to_string(),
+                "postgres://spawn_human@127.0.0.1:1/spawn".to_string(),
+                "postgres://spawn_node_gateway@127.0.0.1:1/spawn".to_string(),
+            ),
+            dir.0.join("cas"),
+            None,
+            std::time::Duration::ZERO,
+        )
+        .with_test_agent_socket(mock_sock.clone());
+
+        assert_ipc_viewer_rbac(&state, &ext_reads, &mutations);
+        assert_ipc_events_and_actions(&state, &mutations);
+
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&mock_sock) {
+            use std::io::Write as _;
+            let _ = stream.write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"__stop\",\"params\":{}}\n",
+            );
+        }
+        srv.join().expect("join mock srv");
+    }
+
+    fn assert_ipc_viewer_rbac(
+        state: &IpcState,
+        ext_reads: &std::sync::atomic::AtomicUsize,
+        mutations: &std::sync::atomic::AtomicUsize,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        // Viewer headers (including unknown role and bearer viewer token) fail closed.
+        for (h_key, h_val) in [
+            ("x-spawn-role", "viewer"),
+            ("x-spawn-role", "untrusted_custom"),
+            ("x-spawn-viewer", "true"),
+            ("authorization", "Bearer sv1.123.sig"),
+        ] {
+            let list_resp = dispatch_buffered(
+                &ipc_request("GET", "/api/agents", "all=true", vec![(h_key, h_val)]),
+                state,
+            );
+            assert_eq!(list_resp.status, 200);
+            let list_json: Value = serde_json::from_slice(&list_resp.body).unwrap();
+            assert_eq!(list_json["count"], 1, "{h_key}={h_val}");
+            assert_eq!(list_json["agents"][0]["address"], "t1");
+
+            for path in ["/api/agents/t2/snapshot", "/api/agents/t2/events"] {
+                let deny =
+                    dispatch_buffered(&ipc_request("GET", path, "", vec![(h_key, h_val)]), state);
+                assert_eq!(deny.status, 403, "{path} {h_key}={h_val}");
+            }
+            let mut deny_act =
+                ipc_request("POST", "/api/agents/t1/action", "", vec![(h_key, h_val)]);
+            deny_act.body = br#"{"action":"interrupt"}"#.to_vec();
+            let deny_act_resp = dispatch_buffered(&deny_act, state);
+            assert_eq!(deny_act_resp.status, 403);
+        }
+        assert_eq!(ext_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(mutations.load(Ordering::SeqCst), 0);
+    }
+
+    fn assert_ipc_events_and_actions(state: &IpcState, mutations: &std::sync::atomic::AtomicUsize) {
+        use std::sync::atomic::Ordering;
+
+        // LocalOwner full flow + ETag 304 + HEAD + POST action.
+        let ev_resp = dispatch_buffered(
+            &ipc_request("GET", "/api/agents/t2/events", "limit=10", vec![]),
+            state,
+        );
+        assert_eq!(ev_resp.status, 200);
+        let etag = ev_resp
+            .headers
+            .iter()
+            .find(|(k, _)| *k == "ETag")
+            .map(|(_, v)| v.clone())
+            .expect("events ETag");
+        let ev_body: Value = serde_json::from_slice(&ev_resp.body).unwrap();
+        assert_eq!(ev_body["address"], "t2");
+        assert!(ev_body["events"].is_array());
+        assert!(ev_body["summary"]["health"]["health"].is_string());
+        assert!(ev_body["summary"]["discovery_status"]["status"].is_string());
+        let latest_key = ev_body["latest_key"].as_str().expect("latest_key cursor");
+
+        let delta_empty = dispatch_buffered(
+            &ipc_request(
+                "GET",
+                "/api/agents/t2/events",
+                &format!("after_key={latest_key}"),
+                vec![],
+            ),
+            state,
+        );
+        assert_eq!(delta_empty.status, 200);
+        let delta_body: Value = serde_json::from_slice(&delta_empty.body).unwrap();
+        assert_eq!(delta_body["count"], 0);
+        assert_eq!(delta_body["cursor_reset"], false);
+
+        let stale_reset = dispatch_buffered(
+            &ipc_request(
+                "GET",
+                "/api/agents/t2/events",
+                "after_key=stale-missing-key",
+                vec![],
+            ),
+            state,
+        );
+        assert_eq!(stale_reset.status, 200);
+        let reset_body: Value = serde_json::from_slice(&stale_reset.body).unwrap();
+        assert_eq!(reset_body["cursor_reset"], true);
+
+        assert_eq!(
+            dispatch_buffered(
+                &ipc_request("GET", "/api/agents/t2/events", "after_key=", vec![]),
+                state,
+            )
+            .status,
+            400
+        );
+
+        let ev_304 = dispatch_buffered(
+            &ipc_request(
+                "GET",
+                "/api/agents/t2/events",
+                "limit=10",
+                vec![("if-none-match", &etag)],
+            ),
+            state,
+        );
+        assert_eq!(ev_304.status, 304);
+
+        let head_ev = dispatch_buffered(
+            &ipc_request("HEAD", "/api/agents/t2/events", "limit=10", vec![]),
+            state,
+        );
+        assert_eq!(head_ev.status, 200);
+        assert!(head_ev.body.is_empty());
+
+        assert_eq!(
+            dispatch_buffered(
+                &ipc_request("GET", "/api/agents/t1/events", "limit=0", vec![]),
+                state
+            )
+            .status,
+            400
+        );
+        assert_eq!(
+            dispatch_buffered(
+                &ipc_request("POST", "/api/agents/t1/events", "", vec![]),
+                state
+            )
+            .status,
+            405
+        );
+
+        let mut act = ipc_request("POST", "/api/agents/t2/action", "", vec![]);
+        act.body = br#"{"action":"send_keys","keys":["down"]}"#.to_vec();
+        let act_resp = dispatch_buffered(&act, state);
+        assert_eq!(act_resp.status, 200);
+        assert_eq!(mutations.load(Ordering::SeqCst), 1);
     }
 }
