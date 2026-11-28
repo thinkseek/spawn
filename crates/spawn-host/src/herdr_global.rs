@@ -1,12 +1,13 @@
 //! Zero-invasion global Herdr (`herdr-core` / `spawn-hc`) discovery and control client.
 //!
 //! Connects directly to any `herdr-core` UDS socket without filtering by
-//! `spawn_owner` labels, letting Spawn discover, snapshot (with deterministic CAS
-//! hashes), drive with full VT key chords in a single RPC (zero artificial sleep),
-//! interrupt, and wait on both Spawn-managed and external/human-launched terminals.
+//! `spawn_owner` labels, letting Spawn discover, capture styled VT snapshots
+//! (via passive `terminal.attach(observe: true)` with plain-text fallback), drive
+//! via a single [`TuiAction`] interface guarded by optimistic pre-flight screen
+//! digests, interrupt, and wait on both Spawn-managed and external/human terminals.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -14,8 +15,9 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use spawn_core::port::{AgentReading, AgentStatus, TerminalError};
 use spawn_core::tui::{
-    DiscoveredTerminal, InterruptOutcome, InterruptReport, KeyChord, RawTuiSnapshot,
-    SendPrecondition, TerminalLiveState, TerminalOrigin, TuiSnapshot, WaitOutcome, WaitReason,
+    DiscoveredTerminal, ExitCause, InterruptOutcome, InterruptReport, KeyChord, RawPlainSnapshot,
+    RawStyledSnapshot, ScreenGuard, TerminalLiveState, TerminalOrigin, TuiAction, TuiActionOutcome,
+    TuiSnapshot, WaitOutcome, WaitReason, is_reserved_spawn_label,
 };
 
 use crate::herdr_witness::{OscStatus, observe};
@@ -25,6 +27,38 @@ const CAPTURE_LIMIT: Duration = Duration::from_secs(15);
 const WRITE_LIMIT: Duration = Duration::from_secs(20);
 const WAIT_BUFFER: Duration = Duration::from_secs(5);
 
+const WIRE_HEADER_LEN: usize = 9;
+const WIRE_DATA: u8 = 0;
+const WIRE_CREDIT: u8 = 1;
+const WIRE_CLOSE: u8 = 2;
+const MAX_WIRE_PAYLOAD: usize = 16 << 20;
+const MAX_PAINT_BYTES: usize = 2 << 20;
+const MAX_HELLO_LINE_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+enum RpcFailure {
+    Refused { kind: String, message: String },
+    Other(TerminalError),
+}
+
+impl RpcFailure {
+    fn into_terminal_error(self, method: &str) -> TerminalError {
+        match self {
+            Self::Refused { kind, message } => {
+                TerminalError(format!("herdr-core {method} refused ({kind}): {message}"))
+            }
+            Self::Other(err) => err,
+        }
+    }
+
+    fn is_transient_missing(&self) -> bool {
+        matches!(
+            self,
+            Self::Refused { kind, .. } if matches!(kind.as_str(), "not_found" | "finished")
+        )
+    }
+}
+
 /// Synchronous, zero-invasion client over a `herdr-core` / `spawn-hc` UDS socket.
 #[derive(Debug, Clone)]
 pub struct HerdrGlobalClient {
@@ -33,7 +67,6 @@ pub struct HerdrGlobalClient {
 
 impl HerdrGlobalClient {
     /// Connects subsequent calls to the `herdr-core` UDS endpoint at `socket`.
-    #[must_use]
     pub fn at_socket(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
@@ -41,7 +74,6 @@ impl HerdrGlobalClient {
     }
 
     /// Configured UDS socket path.
-    #[must_use]
     pub fn socket(&self) -> &Path {
         &self.socket
     }
@@ -104,6 +136,10 @@ impl HerdrGlobalClient {
 
     /// Discovers every terminal visible on this `herdr-core` (and federated peers)
     /// without applying any `spawn_owner` label filter.
+    ///
+    /// Fails closed on malformed entries missing an `address`, contradictory exit
+    /// metadata, or unexpected local `terminal.read` errors (allowing only concurrent
+    /// `not_found`/`finished` disappearance to degrade to OSC metadata).
     pub fn discover_all(
         &self,
         include_exited: bool,
@@ -120,29 +156,28 @@ impl HerdrGlobalClient {
         };
         let mut out = Vec::with_capacity(items.len());
         for item in items {
-            let Some(address) = item["address"].as_str().map(str::to_string) else {
-                continue;
+            let Some(address) = item["address"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+            else {
+                return Err(TerminalError(format!(
+                    "terminal.list item missing non-empty address: {item}"
+                )));
             };
             let machine = split_machine(&address);
             let labels = parse_labels(&item["labels"]);
             let origin = TerminalOrigin::from_labels(&labels);
-            let is_live = item["state"].as_str() == Some("live");
-            let state = if is_live {
-                TerminalLiveState::Live
-            } else {
-                TerminalLiveState::Exited {
-                    code: item["exit_code"]
-                        .as_i64()
-                        .and_then(|v| i32::try_from(v).ok()),
-                    signal: item["signal"].as_i64().and_then(|v| i32::try_from(v).ok()),
-                    reason: item["reason"].as_str().map(str::to_string),
-                }
+            let state = parse_live_state(item)?;
+            let pid = match state {
+                TerminalLiveState::Live { pid } => pid,
+                TerminalLiveState::Exited { .. } => None,
             };
-            let pid = item["pid"].as_u64().and_then(|v| u32::try_from(v).ok());
+            let is_live = matches!(state, TerminalLiveState::Live { .. });
             let osc_status = OscStatus::from_json(&item["status"]);
             let reading = if is_live && machine.is_none() {
                 // `lines: 0` reads only the visible screen so discovery never scrolls alt-screen TUIs.
-                match self.call_rpc(
+                match self.call_rpc_raw(
                     "terminal.read",
                     &json!({ "terminal": address, "lines": 0 }),
                     CAPTURE_LIMIT,
@@ -152,9 +187,10 @@ impl HerdrGlobalClient {
                         read["text"].as_str().unwrap_or_default(),
                         osc_status.as_ref(),
                     ),
-                    Err(_) => osc_status
+                    Err(err) if err.is_transient_missing() => osc_status
                         .as_ref()
                         .map_or_else(crate::herdr_witness::no_agent, osc_fallback_reading),
+                    Err(err) => return Err(err.into_terminal_error("terminal.read")),
                 }
             } else {
                 osc_status
@@ -168,7 +204,6 @@ impl HerdrGlobalClient {
                 name: item["name"].as_str().map(str::to_string),
                 origin,
                 state,
-                pid,
                 cwd: item["cwd"].as_str().unwrap_or_default().to_string(),
                 title: item["title"].as_str().unwrap_or_default().to_string(),
                 argv: item["argv"]
@@ -190,30 +225,59 @@ impl HerdrGlobalClient {
     }
 
     /// Captures a structured [`TuiSnapshot`] of the current visible screen (without
-    /// scrolling alt-screen history), including plain lines, choices, witness status,
-    /// and deterministic CAS hash for any local or peer terminal by address or name.
+    /// scrolling alt-screen history) for any local or peer terminal.
+    ///
+    /// For live terminals on framed `herdr-core` servers, passively observes via a
+    /// temporary `terminal.attach(observe: true, history: 0)` paint stream so SGR
+    /// styles (including reverse-video and color highlights), cursor coordinates,
+    /// and alt-screen state are preserved. Falls back to `terminal.read(lines: 0)`
+    /// (`SnapshotFidelity::PlainTextOnly`) when the terminal has finished or the
+    /// server does not speak framed mode.
     pub fn snapshot(&self, address: &str) -> Result<TuiSnapshot, TerminalError> {
         let info = self.call_rpc("terminal.get", &json!({ "terminal": address }), CALL_LIMIT)?;
+        let resolved_addr = info["address"].as_str().unwrap_or(address);
+        let cols = u16::try_from(info["cols"].as_u64().unwrap_or(0)).unwrap_or(0);
+        let rows = u16::try_from(info["rows"].as_u64().unwrap_or(0)).unwrap_or(0);
+        let is_live = info["state"].as_str() == Some("live");
+        let pid = is_live
+            .then(|| info["pid"].as_u64().and_then(|v| u32::try_from(v).ok()))
+            .flatten();
+        let osc_status = OscStatus::from_json(&info["status"]);
+
+        if is_live && let Some(raw_vt) = self.capture_styled_vt(resolved_addr, cols, rows)? {
+            let mut snap = TuiSnapshot::from_styled_vt(RawStyledSnapshot {
+                address: resolved_addr,
+                cols,
+                rows,
+                title: info["title"].as_str(),
+                raw_vt: &raw_vt,
+                agent: None,
+                agent_status: AgentStatus::Unknown,
+                rule: None,
+                blocker_visible: false,
+            });
+            let plain_text = snap.plain_lines.join("\n");
+            let reading = resolve_reading(pid, &plain_text, osc_status.as_ref());
+            snap.agent = reading.agent;
+            snap.agent_status = reading.status;
+            snap.rule = reading.rule;
+            snap.blocker_visible = reading.blocker_visible;
+            return Ok(snap);
+        }
+
         let read = self.call_rpc(
             "terminal.read",
             &json!({ "terminal": address, "lines": 0 }),
             CAPTURE_LIMIT,
         )?;
         let raw_text = read["text"].as_str().unwrap_or_default();
-        let pid = info["pid"].as_u64().and_then(|v| u32::try_from(v).ok());
-        let osc_status = OscStatus::from_json(&info["status"]);
         let reading = resolve_reading(pid, raw_text, osc_status.as_ref());
-        let cols = u16::try_from(info["cols"].as_u64().unwrap_or(0)).unwrap_or(0);
-        let rows = u16::try_from(info["rows"].as_u64().unwrap_or(0)).unwrap_or(0);
-        let resolved_addr = info["address"].as_str().unwrap_or(address);
-        let how = read["how"].as_str().unwrap_or("screen");
-        let complete = read["complete"].as_bool().unwrap_or(true);
-        Ok(TuiSnapshot::from_raw(RawTuiSnapshot {
+        Ok(TuiSnapshot::from_plain_text(RawPlainSnapshot {
             address: resolved_addr,
             cols,
             rows,
-            how,
-            complete,
+            how: read["how"].as_str().unwrap_or("screen"),
+            complete: read["complete"].as_bool().unwrap_or(true),
             why: read["why"].as_str(),
             title: info["title"].as_str(),
             raw_text,
@@ -224,84 +288,165 @@ impl HerdrGlobalClient {
         }))
     }
 
-    /// Pastes `text` and submits Enter via `terminal.send`, optionally verifying the
-    /// screen CAS digest first (`expected_hash`) and awaiting turn completion (`wait_timeout`).
-    pub fn send_text(
+    /// Executes a single [`TuiAction`] against a live terminal.
+    ///
+    /// When [`TuiAction::SendText`] or [`TuiAction::SendKeys`] specifies
+    /// `expected_guard: Some(want)`, performs an optimistic pre-flight verification by
+    /// taking a fresh [`Self::snapshot`] right before issuing the write RPC (this is
+    /// optimistic read-then-write verification across separate RPCs, not server-side
+    /// atomic CAS). Refuses fail-closed if the terminal's menu selection cannot be
+    /// observed (`unobservable_selection`) or if `snap.guard() != want` (`guard_mismatch`).
+    pub fn execute(
         &self,
         address: &str,
-        text: &str,
-        force: bool,
-        precondition: SendPrecondition,
-        expected_hash: Option<u64>,
-        wait_timeout: Option<Duration>,
-    ) -> Result<Value, TerminalError> {
-        self.verify_cas_hash(address, expected_hash)?;
-        let mut params = serde_json::Map::new();
-        params.insert("terminal".to_string(), json!(address));
-        params.insert("text".to_string(), json!(text));
-        params.insert("force".to_string(), json!(force));
-        if let Some(cond) = precondition.as_herdr_if() {
-            params.insert("if".to_string(), json!(cond));
-        }
-        let rpc_limit = match wait_timeout {
-            Some(wait_dur) => {
-                params.insert("wait".to_string(), json!(true));
-                params.insert("timeout".to_string(), json!(wait_dur.as_secs_f64()));
-                wait_dur.saturating_add(WAIT_BUFFER)
+        action: &TuiAction,
+    ) -> Result<TuiActionOutcome, TerminalError> {
+        match action {
+            TuiAction::SendText {
+                text,
+                policy,
+                expected_guard,
+                wait_timeout_ms,
+            } => {
+                self.verify_optimistic_guard(address, *expected_guard)?;
+                let (force, only_if) = policy.to_herdr_params();
+                let mut params = serde_json::Map::new();
+                params.insert("terminal".to_string(), json!(address));
+                params.insert("text".to_string(), json!(text));
+                params.insert("force".to_string(), json!(force));
+                if let Some(cond) = only_if {
+                    params.insert("if".to_string(), json!(cond));
+                }
+                let rpc_limit = match wait_timeout_ms {
+                    Some(ms) => {
+                        let dur = Duration::from_millis(*ms);
+                        params.insert("wait".to_string(), json!(true));
+                        params.insert("timeout".to_string(), json!(dur.as_secs_f64()));
+                        dur.saturating_add(WAIT_BUFFER)
+                    }
+                    None => WRITE_LIMIT,
+                };
+                let result = self.call_rpc("terminal.send", &Value::Object(params), rpc_limit)?;
+                Ok(TuiActionOutcome::TextSent {
+                    status: result["status"].as_str().map(str::to_string),
+                    turn: result["turn"].as_u64().unwrap_or(0),
+                    started: result["started"].as_bool(),
+                })
             }
-            None => WRITE_LIMIT,
-        };
-        self.call_rpc("terminal.send", &Value::Object(params), rpc_limit)
+            TuiAction::SendKeys {
+                keys,
+                expected_guard,
+            } => {
+                self.verify_optimistic_guard(address, *expected_guard)?;
+                let specs: Vec<String> = keys
+                    .as_slice()
+                    .iter()
+                    .map(KeyChord::to_herdr_spec)
+                    .collect();
+                let result = self.call_rpc(
+                    "terminal.keys",
+                    &json!({ "terminal": address, "keys": specs }),
+                    CALL_LIMIT,
+                )?;
+                Ok(TuiActionOutcome::KeysSent {
+                    status: result["status"].as_str().map(str::to_string),
+                    turn: result["turn"].as_u64().unwrap_or(0),
+                })
+            }
+            TuiAction::Interrupt { timeout_ms } => {
+                let mut params = serde_json::Map::new();
+                params.insert("terminal".to_string(), json!(address));
+                let rpc_limit = match timeout_ms {
+                    Some(ms) => {
+                        let dur = Duration::from_millis(*ms);
+                        params.insert("timeout".to_string(), json!(dur.as_secs_f64()));
+                        dur.saturating_add(WAIT_BUFFER)
+                    }
+                    None => CALL_LIMIT.saturating_add(WAIT_BUFFER),
+                };
+                let result =
+                    self.call_rpc("terminal.interrupt", &Value::Object(params), rpc_limit)?;
+                Ok(TuiActionOutcome::Interrupted(InterruptReport {
+                    outcome: InterruptOutcome::parse(
+                        result["outcome"].as_str().unwrap_or_default(),
+                    ),
+                    key_sent: result["key"].as_str().map(str::to_string),
+                }))
+            }
+            TuiAction::WaitSettled {
+                after_turn,
+                output_contains,
+                timeout_ms,
+            } => self
+                .wait_settled_inner(
+                    address,
+                    *after_turn,
+                    output_contains.as_deref(),
+                    Duration::from_millis(*timeout_ms),
+                )
+                .map(TuiActionOutcome::Waited),
+        }
     }
 
-    /// Sends one or more [`KeyChord`]s in a single `terminal.keys` RPC without any
-    /// artificial `KEY_PAUSE` sleep, optionally guarded by a screen CAS digest.
-    pub fn send_keys(
+    /// Attaches or updates non-reserved observation metadata labels (`""` removes a key)
+    /// without restarting or disrupting the terminal.
+    ///
+    /// Fails closed before issuing any RPC if `labels` is empty, contains an empty,
+    /// whitespace-containing, or `'='`-containing key, or attempts to write any
+    /// Spawn-reserved key (`spawn_owner`, `spawn_terminal`, `spawn_workspace`, or any
+    /// `spawn_*` prefix).
+    pub fn tag_observe(
         &self,
         address: &str,
-        keys: &[KeyChord],
-        expected_hash: Option<u64>,
-    ) -> Result<Value, TerminalError> {
-        if keys.is_empty() {
+        labels: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>, TerminalError> {
+        if labels.is_empty() {
             return Err(TerminalError(
-                "send_keys requires at least one KeyChord".to_string(),
+                "tag_observe requires at least one label".to_string(),
             ));
         }
-        self.verify_cas_hash(address, expected_hash)?;
-        let specs: Vec<String> = keys.iter().map(KeyChord::to_herdr_spec).collect();
-        self.call_rpc(
-            "terminal.keys",
-            &json!({ "terminal": address, "keys": specs }),
+        for key in labels.keys() {
+            if is_reserved_spawn_label(key) {
+                return Err(TerminalError(format!(
+                    "reserved_label: cannot mutate Spawn-managed label {key:?} via tag_observe"
+                )));
+            }
+            if key.is_empty() || key.contains('=') || key.chars().any(char::is_whitespace) {
+                return Err(TerminalError(format!("invalid_label_key: {key:?}")));
+            }
+        }
+        let result = self.call_rpc(
+            "terminal.label",
+            &json!({ "terminal": address, "labels": labels }),
             CALL_LIMIT,
-        )
+        )?;
+        Ok(parse_labels(&result["labels"]))
     }
 
-    /// Sends a native `terminal.interrupt` (`esc` for OSC-reporting programs, else `ctrl+c`).
-    pub fn interrupt(
+    fn verify_optimistic_guard(
         &self,
         address: &str,
-        timeout: Option<Duration>,
-    ) -> Result<InterruptReport, TerminalError> {
-        let mut params = serde_json::Map::new();
-        params.insert("terminal".to_string(), json!(address));
-        let rpc_limit = match timeout {
-            Some(dur) => {
-                params.insert("timeout".to_string(), json!(dur.as_secs_f64()));
-                dur.saturating_add(WAIT_BUFFER)
-            }
-            None => CALL_LIMIT.saturating_add(WAIT_BUFFER),
+        expected_guard: Option<ScreenGuard>,
+    ) -> Result<(), TerminalError> {
+        let Some(want) = expected_guard else {
+            return Ok(());
         };
-        let result = self.call_rpc("terminal.interrupt", &Value::Object(params), rpc_limit)?;
-        Ok(InterruptReport {
-            outcome: InterruptOutcome::parse(result["outcome"].as_str().unwrap_or("unknown")),
-            key_sent: result["key"].as_str().map(str::to_string),
-        })
+        let actual = self.snapshot(address)?;
+        if !actual.selection_observable() {
+            return Err(TerminalError(format!(
+                "unobservable_selection: terminal {address} menu selection cannot be verified under PlainTextOnly fidelity"
+            )));
+        }
+        let got = actual.guard();
+        if got != want {
+            return Err(TerminalError(format!(
+                "guard_mismatch: terminal {address} screen changed (expected {want}, got {got})"
+            )));
+        }
+        Ok(())
     }
 
-    /// Event-driven wait via `terminal.wait` until the terminal settles or `output_contains`
-    /// appears, bounded by `timeout`. When `after_turn` is given and `terminal.get` shows
-    /// the turn already advanced cleanly while no longer working, returns immediately.
-    pub fn wait_settled(
+    fn wait_settled_inner(
         &self,
         address: &str,
         after_turn: Option<u64>,
@@ -315,24 +460,27 @@ impl HerdrGlobalClient {
         {
             let cur_turn = info["turn"].as_u64().unwrap_or(0);
             let cur_status = info["status"]["state"].as_str().map(str::to_string);
-            let live = info["state"].as_str() == Some("live");
-            if !live || (cur_turn > prev_turn && cur_status.as_deref() != Some("working")) {
-                return Ok(WaitOutcome {
-                    terminal: info["address"].as_str().unwrap_or(address).to_string(),
-                    ended: true,
-                    reason: if live {
-                        WaitReason::Status
-                    } else {
-                        WaitReason::Exit
-                    },
-                    status: cur_status,
-                    turn: cur_turn,
-                    exit_code: info["exit_code"]
-                        .as_i64()
-                        .and_then(|v| i32::try_from(v).ok()),
-                    signal: info["signal"].as_i64().and_then(|v| i32::try_from(v).ok()),
-                    from: None,
-                });
+            let resolved = info["address"].as_str().unwrap_or(address).to_string();
+            match parse_live_state(&info)? {
+                TerminalLiveState::Exited { cause } => {
+                    return Ok(WaitOutcome {
+                        terminal: resolved,
+                        reason: WaitReason::Exit { cause },
+                        status: cur_status,
+                        turn: cur_turn,
+                    });
+                }
+                TerminalLiveState::Live { .. }
+                    if cur_turn > prev_turn && cur_status.as_deref() != Some("working") =>
+                {
+                    return Ok(WaitOutcome {
+                        terminal: resolved,
+                        reason: WaitReason::Status,
+                        status: cur_status,
+                        turn: cur_turn,
+                    });
+                }
+                TerminalLiveState::Live { .. } => {}
             }
         }
         let mut params = serde_json::Map::new();
@@ -346,56 +494,87 @@ impl HerdrGlobalClient {
             &Value::Object(params),
             timeout.saturating_add(WAIT_BUFFER),
         )?;
+        let exit_code = result["exit_code"]
+            .as_i64()
+            .and_then(|v| i32::try_from(v).ok());
+        let signal = result["signal"]
+            .as_i64()
+            .and_then(|v| i32::try_from(v).ok());
+        let from = result["from"].as_str().map(str::to_string);
+        let wire_ended = result["ended"].as_bool().ok_or_else(|| {
+            TerminalError(format!("terminal.wait missing boolean ended: {result}"))
+        })?;
+        let raw_reason = result["reason"].as_str().unwrap_or("unknown");
+        let reason = WaitReason::from_herdr(raw_reason, wire_ended, exit_code, signal, from)
+            .map_err(TerminalError)?;
         Ok(WaitOutcome {
             terminal: result["terminal"].as_str().unwrap_or(address).to_string(),
-            ended: result["ended"].as_bool().unwrap_or(false),
-            reason: WaitReason::parse(result["reason"].as_str().unwrap_or("unknown")),
+            reason,
             status: result["status"].as_str().map(str::to_string),
             turn: result["turn"].as_u64().unwrap_or(0),
-            exit_code: result["exit_code"]
-                .as_i64()
-                .and_then(|v| i32::try_from(v).ok()),
-            signal: result["signal"]
-                .as_i64()
-                .and_then(|v| i32::try_from(v).ok()),
-            from: result["from"].as_str().map(str::to_string),
         })
     }
 
-    /// Attaches or updates metadata labels (`""` removes a key) without restarting
-    /// or disrupting the terminal.
-    pub fn tag_observe(
+    fn capture_styled_vt(
         &self,
         address: &str,
-        labels: &BTreeMap<String, String>,
-    ) -> Result<Value, TerminalError> {
-        if labels.is_empty() {
+        cols: u16,
+        rows: u16,
+    ) -> Result<Option<String>, TerminalError> {
+        let mut stream = UnixStream::connect(&self.socket).map_err(|err| {
+            TerminalError(format!(
+                "herdr-core terminal.attach connect {}: {err}",
+                self.socket.display()
+            ))
+        })?;
+        let map_io =
+            |err: std::io::Error| TerminalError(format!("herdr-core terminal.attach: {err}"));
+        stream
+            .set_read_timeout(Some(CAPTURE_LIMIT))
+            .map_err(map_io)?;
+        stream
+            .set_write_timeout(Some(CAPTURE_LIMIT))
+            .map_err(map_io)?;
+
+        let hello_req = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "hello",
+            "params": { "generation": 1, "framed": true },
+        })
+        .to_string();
+        stream
+            .write_all(format!("{hello_req}\n").as_bytes())
+            .map_err(map_io)?;
+
+        let hello_line = read_line_unbuffered(&mut stream).map_err(map_io)?;
+        if hello_line.is_empty() {
             return Err(TerminalError(
-                "tag_observe requires at least one label".to_string(),
+                "herdr-core hello closed socket without reply".to_string(),
             ));
         }
-        self.call_rpc(
-            "terminal.label",
-            &json!({ "terminal": address, "labels": labels }),
-            CALL_LIMIT,
-        )
-    }
-
-    fn verify_cas_hash(
-        &self,
-        address: &str,
-        expected_hash: Option<u64>,
-    ) -> Result<(), TerminalError> {
-        let Some(want) = expected_hash else {
-            return Ok(());
-        };
-        let actual = self.snapshot(address)?.snapshot_hash;
-        if actual != want {
-            return Err(TerminalError(format!(
-                "cas_mismatch: terminal {address} screen changed (expected {want:#018x}, got {actual:#018x})"
-            )));
+        let hello_resp: Value = serde_json::from_str(&hello_line)
+            .map_err(|err| TerminalError(format!("herdr-core hello invalid JSON: {err}")))?;
+        if hello_resp.get("error").is_some() || hello_resp["result"]["framed"] != true {
+            return Ok(None);
         }
-        Ok(())
+
+        let attach_req = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "terminal.attach",
+            "params": {
+                "terminal": address,
+                "observe": true,
+                "history": 0,
+                "cols": cols,
+                "rows": rows,
+            }
+        }))
+        .map_err(|err| TerminalError(format!("encode terminal.attach: {err}")))?;
+        write_wire_frame(&mut stream, 0, WIRE_DATA, &attach_req).map_err(map_io)?;
+
+        read_attach_first_paint(&mut stream)
     }
 
     fn call_rpc(
@@ -404,13 +583,25 @@ impl HerdrGlobalClient {
         params: &Value,
         limit: Duration,
     ) -> Result<Value, TerminalError> {
+        self.call_rpc_raw(method, params, limit)
+            .map_err(|err| err.into_terminal_error(method))
+    }
+
+    fn call_rpc_raw(
+        &self,
+        method: &str,
+        params: &Value,
+        limit: Duration,
+    ) -> Result<Value, RpcFailure> {
         let stream = UnixStream::connect(&self.socket).map_err(|err| {
-            TerminalError(format!(
+            RpcFailure::Other(TerminalError(format!(
                 "herdr-core {method} connect {}: {err}",
                 self.socket.display()
-            ))
+            )))
         })?;
-        let map_io = |err: std::io::Error| TerminalError(format!("herdr-core {method}: {err}"));
+        let map_io = |err: std::io::Error| {
+            RpcFailure::Other(TerminalError(format!("herdr-core {method}: {err}")))
+        };
         stream.set_read_timeout(Some(limit)).map_err(map_io)?;
         stream.set_write_timeout(Some(limit)).map_err(map_io)?;
         let mut line = json!({
@@ -427,20 +618,182 @@ impl HerdrGlobalClient {
             .read_line(&mut answer)
             .map_err(map_io)?;
         if answer.is_empty() {
-            return Err(TerminalError(format!(
+            return Err(RpcFailure::Other(TerminalError(format!(
                 "herdr-core {method}: socket closed without reply"
-            )));
+            ))));
         }
-        let parsed: Value = serde_json::from_str(&answer)
-            .map_err(|err| TerminalError(format!("herdr-core {method} invalid JSON: {err}")))?;
+        let parsed: Value = serde_json::from_str(&answer).map_err(|err| {
+            RpcFailure::Other(TerminalError(format!(
+                "herdr-core {method} invalid JSON: {err}"
+            )))
+        })?;
         if let Some(error) = parsed.get("error") {
-            let kind = error["data"]["kind"].as_str().unwrap_or("internal");
-            let message = error["message"].as_str().unwrap_or_default();
-            return Err(TerminalError(format!(
-                "herdr-core {method} refused ({kind}): {message}"
-            )));
+            return Err(RpcFailure::Refused {
+                kind: error["data"]["kind"]
+                    .as_str()
+                    .unwrap_or("internal")
+                    .to_string(),
+                message: error["message"].as_str().unwrap_or_default().to_string(),
+            });
         }
         Ok(parsed["result"].clone())
+    }
+}
+
+fn read_attach_first_paint(stream: &mut UnixStream) -> Result<Option<String>, TerminalError> {
+    let mut target_channel: Option<u32> = None;
+    let mut paint_bytes = Vec::new();
+    while let Some((channel, kind, payload)) = read_wire_frame(stream)? {
+        if channel == 0 && kind == WIRE_DATA {
+            let reply: Value = serde_json::from_slice(&payload).map_err(|err| {
+                TerminalError(format!("herdr-core terminal.attach invalid JSON: {err}"))
+            })?;
+            if let Some(error) = reply.get("error") {
+                let err_kind = error["data"]["kind"].as_str().unwrap_or("internal");
+                if matches!(err_kind, "finished" | "not_found" | "needs_framed") {
+                    return Ok(None);
+                }
+                let message = error["message"].as_str().unwrap_or_default();
+                return Err(TerminalError(format!(
+                    "herdr-core terminal.attach refused ({err_kind}): {message}"
+                )));
+            }
+            let ch = reply["result"]["channel"]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| {
+                    TerminalError(format!("terminal.attach missing channel: {reply}"))
+                })?;
+            target_channel = Some(ch);
+            continue;
+        }
+        if target_channel == Some(channel) {
+            if kind == WIRE_DATA {
+                let take = payload
+                    .len()
+                    .min(MAX_PAINT_BYTES.saturating_sub(paint_bytes.len()));
+                paint_bytes.extend_from_slice(&payload[..take]);
+                let credit = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+                let _ = write_wire_frame(stream, channel, WIRE_CREDIT, &credit.to_le_bytes());
+                if contains_bytes(&paint_bytes, b"\x1b[?9001h")
+                    || contains_bytes(&paint_bytes, b"\x1b[?9001l")
+                    || paint_bytes.len() >= MAX_PAINT_BYTES
+                {
+                    return Ok(Some(String::from_utf8_lossy(&paint_bytes).into_owned()));
+                }
+            } else if kind == WIRE_CLOSE {
+                return Ok((!paint_bytes.is_empty())
+                    .then(|| String::from_utf8_lossy(&paint_bytes).into_owned()));
+            }
+        }
+    }
+    Ok((!paint_bytes.is_empty()).then(|| String::from_utf8_lossy(&paint_bytes).into_owned()))
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|win| win == needle)
+}
+
+fn read_line_unbuffered(stream: &mut UnixStream) -> std::io::Result<String> {
+    let mut buf = Vec::with_capacity(256);
+    let mut byte = [0_u8; 1];
+    loop {
+        match stream.read_exact(&mut byte) {
+            Ok(()) => {
+                buf.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if buf.len() >= MAX_HELLO_LINE_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "herdr-core hello line exceeded limit",
+                    ));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof && buf.is_empty() => {
+                return Ok(String::new());
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    String::from_utf8(buf)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))
+}
+
+fn write_wire_frame(
+    stream: &mut UnixStream,
+    channel: u32,
+    kind: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let len = u32::try_from(payload.len())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame too large"))?;
+    let mut frame = Vec::with_capacity(WIRE_HEADER_LEN + payload.len());
+    frame.extend_from_slice(&channel.to_le_bytes());
+    frame.push(kind);
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame)
+}
+
+fn read_wire_frame(stream: &mut UnixStream) -> Result<Option<(u32, u8, Vec<u8>)>, TerminalError> {
+    let mut header = [0_u8; WIRE_HEADER_LEN];
+    match stream.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => {
+            return Err(TerminalError(format!(
+                "herdr-core read framed header: {err}"
+            )));
+        }
+    }
+    let channel = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let kind = header[4];
+    let len = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
+    if len > MAX_WIRE_PAYLOAD {
+        return Err(TerminalError(format!(
+            "herdr-core framed payload {len} exceeds {MAX_WIRE_PAYLOAD}"
+        )));
+    }
+    let mut payload = vec![0_u8; len];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|err| TerminalError(format!("herdr-core read framed payload: {err}")))?;
+    Ok(Some((channel, kind, payload)))
+}
+
+fn parse_live_state(item: &Value) -> Result<TerminalLiveState, TerminalError> {
+    if item["state"].as_str() == Some("live") {
+        let pid = item["pid"].as_u64().and_then(|v| u32::try_from(v).ok());
+        return Ok(TerminalLiveState::Live { pid });
+    }
+    let code = item["exit_code"]
+        .as_i64()
+        .and_then(|v| i32::try_from(v).ok());
+    let signal = item["signal"].as_i64().and_then(|v| i32::try_from(v).ok());
+    let reason = item["reason"].as_str().map(str::to_string);
+    let cause = ExitCause::from_herdr(code, signal, reason).map_err(TerminalError)?;
+    Ok(TerminalLiveState::Exited { cause })
+}
+
+fn is_holder_socket(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let mut parts = stem.rsplit('.');
+    match (parts.next(), parts.next()) {
+        // `<session>.holder.sock`
+        (Some(last), Some(prefix)) if !prefix.is_empty() && last.eq_ignore_ascii_case("holder") => {
+            true
+        }
+        // `<session>.holder.<id>.sock`
+        (Some(id), Some(prev)) => {
+            !id.is_empty()
+                && parts.next().is_some_and(|prefix| !prefix.is_empty())
+                && prev.eq_ignore_ascii_case("holder")
+        }
+        _ => false,
     }
 }
 
@@ -467,26 +820,6 @@ fn resolve_reading(pid: Option<u32>, text: &str, osc_status: Option<&OscStatus>)
     reading
 }
 
-fn is_holder_socket(path: &Path) -> bool {
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    let mut parts = stem.rsplit('.');
-    match (parts.next(), parts.next()) {
-        // `<session>.holder.sock`
-        (Some(last), Some(prefix)) if !prefix.is_empty() && last.eq_ignore_ascii_case("holder") => {
-            true
-        }
-        // `<session>.holder.<id>.sock`
-        (Some(id), Some(prev)) => {
-            !id.is_empty()
-                && parts.next().is_some_and(|prefix| !prefix.is_empty())
-                && prev.eq_ignore_ascii_case("holder")
-        }
-        _ => false,
-    }
-}
-
 fn split_machine(address: &str) -> Option<String> {
     address
         .split_once('/')
@@ -510,6 +843,8 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+
+    use spawn_core::tui::{KeyChordSequence, SendPolicy, SnapshotFidelity};
 
     use super::*;
 
@@ -549,6 +884,7 @@ mod tests {
 
     fn mock_rpc_reply(method: &str, params: &Value) -> Value {
         match method {
+            "hello" => json!({ "generation": 1, "framed": false }),
             "terminal.list" => json!({
                 "terminals": [
                     {
@@ -612,7 +948,7 @@ mod tests {
                 "turn": 0
             }),
             "terminal.read" => json!({
-                "text": "Menu:\n❯ 1. First option\n  2. Second option\n",
+                "text": "Menu:\n  1. First option\n  2. Second option\n",
                 "complete": true,
                 "how": "screen"
             }),
@@ -675,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn mock_rpc_covers_unfiltered_discovery_cas_keys_interrupt_wait_and_label() {
+    fn mock_rpc_covers_unfiltered_discovery_unobservable_guard_actions_and_reserved_labels() {
         let dir = temp_dir("shg-mock");
         let sock = dir.0.join("core.sock");
         let (srv, recorded) = spawn_mock_rpc_server(&sock);
@@ -692,59 +1028,163 @@ mod tests {
         assert_eq!(found[2].machine.as_deref(), Some("n252"));
         assert_eq!(found[2].agent_status, AgentStatus::Working);
 
-        let snap = client.snapshot("t2").expect("snapshot");
-        assert_eq!(snap.choices.len(), 2);
-        assert!(snap.choices[0].selected);
+        let plain_snap = client.snapshot("t2").expect("snapshot");
+        assert_eq!(plain_snap.fidelity, SnapshotFidelity::PlainTextOnly);
+        assert!(!plain_snap.selection_observable());
 
+        let enter_keys = KeyChordSequence::single(KeyChord::parse("enter").expect("enter"));
         let err = client
-            .send_keys(
+            .execute(
                 "t2",
-                &[KeyChord::parse("down").expect("down")],
-                Some(snap.snapshot_hash ^ 0x55),
+                &TuiAction::SendKeys {
+                    keys: enter_keys,
+                    expected_guard: Some(plain_snap.guard()),
+                },
             )
-            .expect_err("wrong CAS hash must refuse");
-        assert!(err.0.contains("cas_mismatch"), "{err}");
+            .expect_err("PlainTextOnly unmarked menu must fail closed on guarded mutation");
+        assert!(err.0.contains("unobservable_selection"), "{err}");
 
-        client
-            .send_keys(
+        let keys_outcome = client
+            .execute(
                 "t2",
-                &[
-                    KeyChord::parse("down").expect("down"),
-                    KeyChord::parse("enter").expect("enter"),
-                ],
-                Some(snap.snapshot_hash),
+                &TuiAction::SendKeys {
+                    keys: KeyChordSequence::new(vec![
+                        KeyChord::parse("down").expect("down"),
+                        KeyChord::parse("enter").expect("enter"),
+                    ])
+                    .expect("non-empty keys"),
+                    expected_guard: None,
+                },
             )
-            .expect("send_keys with matching CAS succeeds in one RPC");
-        client
-            .send_text(
+            .expect("unguarded send_keys succeeds");
+        assert!(matches!(
+            keys_outcome,
+            TuiActionOutcome::KeysSent { turn: 1, .. }
+        ));
+
+        let send_outcome = client
+            .execute(
                 "t2",
-                "hello",
-                true,
-                SendPrecondition::OnlyIfIdle,
-                None,
-                Some(Duration::from_secs(2)),
+                &TuiAction::SendText {
+                    text: "hello".to_string(),
+                    policy: SendPolicy::OnlyIfIdle,
+                    expected_guard: None,
+                    wait_timeout_ms: Some(2000),
+                },
             )
             .expect("send_text succeeds");
+        assert!(matches!(
+            send_outcome,
+            TuiActionOutcome::TextSent {
+                started: Some(true),
+                ..
+            }
+        ));
 
-        let interrupt = client
-            .interrupt("t2", Some(Duration::from_secs(2)))
+        let int_outcome = client
+            .execute(
+                "t2",
+                &TuiAction::Interrupt {
+                    timeout_ms: Some(2000),
+                },
+            )
             .expect("interrupt");
-        assert_eq!(interrupt.outcome, InterruptOutcome::Stopped);
-        assert_eq!(interrupt.key_sent.as_deref(), Some("esc"));
+        assert_eq!(
+            int_outcome,
+            TuiActionOutcome::Interrupted(InterruptReport {
+                outcome: InterruptOutcome::Stopped,
+                key_sent: Some("esc".to_string()),
+            })
+        );
 
-        let waited = client
-            .wait_settled("t2", None, Some("PICKED_2"), Duration::from_secs(2))
+        assert_mock_wait_and_labels(&client, &sock, srv, &recorded);
+    }
+
+    fn assert_mock_wait_and_labels(
+        client: &HerdrGlobalClient,
+        _sock: &Path,
+        srv: std::thread::JoinHandle<()>,
+        recorded: &MockLog,
+    ) {
+        let wait_outcome = client
+            .execute(
+                "t2",
+                &TuiAction::WaitSettled {
+                    after_turn: None,
+                    output_contains: Some("PICKED_2".to_string()),
+                    timeout_ms: 2000,
+                },
+            )
             .expect("wait_settled");
-        assert!(waited.ended);
-        assert_eq!(waited.reason, WaitReason::Output);
+        assert!(matches!(
+            wait_outcome,
+            TuiActionOutcome::Waited(ref w) if w.ended() && w.reason == WaitReason::Output
+        ));
+
+        for forbidden in [
+            "spawn_owner",
+            "spawn_terminal",
+            "spawn_workspace",
+            "spawn_custom",
+            "SPAWN_OWNER",
+        ] {
+            let mut bad = BTreeMap::new();
+            bad.insert(forbidden.to_string(), "evil".to_string());
+            let err = client
+                .tag_observe("t2", &bad)
+                .expect_err("reserved label must fail closed before RPC");
+            assert!(err.0.contains("reserved_label"), "{forbidden}: {err}");
+        }
 
         let mut tags = BTreeMap::new();
         tags.insert("observed_by".to_string(), "test".to_string());
-        client.tag_observe("t2", &tags).expect("tag_observe");
+        let saved = client.tag_observe("t2", &tags).expect("tag_observe");
+        assert_eq!(saved.get("observed_by").map(String::as_str), Some("test"));
 
         let _ = client.call_rpc("__stop", &json!({}), CALL_LIMIT);
         srv.join().expect("mock server thread");
 
+        assert_recorded_mock_rpcs(recorded);
+    }
+
+    #[test]
+    fn discover_all_fails_closed_on_missing_address_and_contradictory_exit() {
+        for bad_list in [
+            json!({ "terminals": [{ "state": "live", "labels": {} }] }),
+            json!({
+                "terminals": [{
+                    "address": "t9",
+                    "state": "finished",
+                    "exit_code": 0,
+                    "signal": 9,
+                    "labels": {}
+                }]
+            }),
+        ] {
+            let dir = temp_dir("shg-bad");
+            let sock = dir.0.join("bad.sock");
+            let listener = UnixListener::bind(&sock).expect("bind");
+            let payload = json!({ "jsonrpc": "2.0", "id": 1, "result": bad_list });
+            let srv = std::thread::spawn(move || {
+                if let Ok((stream, _)) = listener.accept() {
+                    let mut line = String::new();
+                    let _ = std::io::BufReader::new(&stream).read_line(&mut line);
+                    let _ = (&stream).write_all(format!("{payload}\n").as_bytes());
+                }
+            });
+            let err = HerdrGlobalClient::at_socket(&sock)
+                .discover_all(true)
+                .expect_err("malformed terminal.list entry must fail closed");
+            assert!(
+                err.0.contains("missing non-empty address")
+                    || err.0.contains("contradictory Herdr exit state"),
+                "{err}"
+            );
+            srv.join().expect("server");
+        }
+    }
+
+    fn assert_recorded_mock_rpcs(recorded: &MockLog) {
         let calls = recorded.lock().expect("lock");
         let list_call = calls
             .iter()
@@ -769,27 +1209,79 @@ mod tests {
             .find(|(m, _)| m == "terminal.keys")
             .expect("terminal.keys recorded");
         assert_eq!(keys_call.1["keys"], json!(["down", "enter"]));
+        for (method, params) in calls.iter() {
+            if method == "terminal.label" {
+                let obj = params["labels"].as_object().expect("labels object");
+                assert!(obj.keys().all(|k| !is_reserved_spawn_label(k)));
+            }
+        }
     }
 
-    fn spawn_hc_binary() -> Option<String> {
+    fn find_sibling_spawn_hc() -> Option<String> {
+        let exe = std::env::current_exe().ok()?;
+        for dir in [exe.parent(), exe.parent().and_then(Path::parent)]
+            .into_iter()
+            .flatten()
+        {
+            let candidate = dir.join("spawn-hc");
+            if candidate.is_file() {
+                return Some(candidate.display().to_string());
+            }
+        }
+        None
+    }
+
+    fn require_spawn_hc_binary() -> String {
         if let Some(prog) = std::env::var_os("SPAWN_HERDR_CORE_PROGRAM")
             .map(|v| v.to_string_lossy().into_owned())
             .filter(|s| !s.is_empty())
         {
-            return Some(prog);
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            for dir in [exe.parent(), exe.parent().and_then(Path::parent)]
-                .into_iter()
-                .flatten()
-            {
-                let candidate = dir.join("spawn-hc");
-                if candidate.is_file() {
-                    return Some(candidate.display().to_string());
-                }
+            if prog.contains(std::path::MAIN_SEPARATOR) {
+                assert!(
+                    Path::new(&prog).is_file(),
+                    "SPAWN_HERDR_CORE_PROGRAM={prog:?} does not exist"
+                );
             }
+            return prog;
         }
-        None
+        if let Some(found) = find_sibling_spawn_hc() {
+            return found;
+        }
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let profile_dir = exe.parent().and_then(Path::parent);
+        let is_release = profile_dir
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str())
+            == Some("release");
+        let target_dir = profile_dir.and_then(Path::parent);
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root");
+
+        let mut build = std::process::Command::new(env!("CARGO"));
+        build
+            .current_dir(&workspace_root)
+            .args(["build", "--locked", "-p", "spawn-hc"]);
+        if is_release {
+            build.arg("--release");
+        }
+        if let Some(dir) = target_dir {
+            build.env("CARGO_TARGET_DIR", dir);
+        }
+        let output = build
+            .output()
+            .expect("invoke cargo build --locked -p spawn-hc");
+        assert!(
+            output.status.success(),
+            "cargo build --locked -p spawn-hc failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        find_sibling_spawn_hc().unwrap_or_else(|| {
+            panic!("spawn-hc binary still missing after cargo build in {workspace_root:?}")
+        })
     }
 
     struct HcEnvGuard {
@@ -834,16 +1326,20 @@ mod tests {
         }
     }
 
-    const MENU_SCRIPT: &str = r#"import sys, termios, tty, time
+    // Reverse-video ONLY selection (`\x1b[7m...\x1b[0m`), zero text glyphs like `❯`.
+    // Plain lines remain byte-for-byte identical whether item 1 or item 2 is selected.
+    const REVERSE_VIDEO_MENU_SCRIPT: &str = r#"import sys, termios, tty, time
 fd = sys.stdin.fileno()
 old = termios.tcgetattr(fd)
 sel = 0
-items = ["First Option", "Second Option"]
+items = ["Allow action", "Deny action"]
 def draw():
     sys.stdout.write("\x1b[2J\x1b[1;1HSelect action:\r\n")
     for idx, label in enumerate(items):
-        mark = "❯" if idx == sel else " "
-        sys.stdout.write(f" {mark} {idx + 1}. {label}\r\n")
+        if idx == sel:
+            sys.stdout.write(f"  \x1b[7m{idx + 1}. {label}\x1b[0m\r\n")
+        else:
+            sys.stdout.write(f"  {idx + 1}. {label}\r\n")
     sys.stdout.flush()
 try:
     tty.setraw(fd)
@@ -870,7 +1366,7 @@ time.sleep(30)
 
     fn launch_real_menu_terminal(env: &HcEnvGuard) -> String {
         let script_path = env.root.join("menu.py");
-        std::fs::write(&script_path, MENU_SCRIPT).expect("write menu script");
+        std::fs::write(&script_path, REVERSE_VIDEO_MENU_SCRIPT).expect("write menu script");
         let mut cmd = std::process::Command::new(&env.program);
         for (name, _) in std::env::vars_os() {
             if name
@@ -911,23 +1407,70 @@ time.sleep(30)
             .to_string()
     }
 
-    fn await_menu_snapshot(client: &HerdrGlobalClient, addr: &str) -> TuiSnapshot {
+    fn await_menu_snapshot(
+        client: &HerdrGlobalClient,
+        addr: &str,
+        selected_idx: usize,
+    ) -> TuiSnapshot {
         for _ in 0..40 {
             let cur = client.snapshot(addr).expect("snapshot");
-            if cur.choices.len() == 2 && cur.choices[0].selected {
+            if cur.choices.len() == 2
+                && cur.choices[selected_idx].selected
+                && !cur.choices[1 - selected_idx].selected
+            {
                 return cur;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("interactive menu choices never rendered");
+        panic!("reverse-video menu choice {selected_idx} never highlighted");
+    }
+
+    fn verify_real_labels_and_interrupt(client: &HerdrGlobalClient, addr: &str) {
+        let mut forbidden = BTreeMap::new();
+        forbidden.insert("spawn_owner".to_string(), "spoofed".to_string());
+        let label_err = client
+            .tag_observe(addr, &forbidden)
+            .expect_err("spawn_owner must be rejected fail-closed");
+        assert!(label_err.0.contains("reserved_label"), "{label_err}");
+
+        let mut labels = BTreeMap::new();
+        labels.insert("observed_by".to_string(), "ar1_r2".to_string());
+        let saved = client.tag_observe(addr, &labels).expect("tag_observe");
+        assert_eq!(saved.get("observed_by").map(String::as_str), Some("ar1_r2"));
+        let after_tag = client.discover_all(false).expect("discover after tag");
+        let still_external = after_tag
+            .iter()
+            .find(|t| t.address == addr)
+            .expect("still present");
+        assert_eq!(still_external.origin, TerminalOrigin::External);
+
+        let int_outcome = client
+            .execute(
+                addr,
+                &TuiAction::Interrupt {
+                    timeout_ms: Some(5000),
+                },
+            )
+            .expect("interrupt");
+        assert!(
+            matches!(
+                int_outcome,
+                TuiActionOutcome::Interrupted(ref r)
+                    if r.key_sent.is_some()
+                        && matches!(
+                            r.outcome,
+                            InterruptOutcome::Exited
+                                | InterruptOutcome::Stopped
+                                | InterruptOutcome::Unreported
+                        )
+            ),
+            "unexpected interrupt report: {int_outcome:?}"
+        );
     }
 
     #[test]
-    fn real_spawn_hc_global_discover_snapshot_cas_keys_interrupt_and_wait() {
-        let Some(program) = spawn_hc_binary() else {
-            eprintln!("skipping real_spawn_hc_global_* test: spawn-hc binary not built yet");
-            return;
-        };
+    fn real_spawn_hc_global_styled_vt_guard_keys_reserved_labels_and_wait() {
+        let program = require_spawn_hc_binary();
         let env = HcEnvGuard::new(program);
         let addr = launch_real_menu_terminal(&env);
 
@@ -942,76 +1485,87 @@ time.sleep(30)
             .find(|t| t.address == addr)
             .expect("unlabeled external terminal discovered");
         assert_eq!(ext.origin, TerminalOrigin::External);
-        assert_eq!(ext.state, TerminalLiveState::Live);
-        assert!(ext.pid.is_some());
+        assert!(matches!(
+            ext.state,
+            TerminalLiveState::Live { pid: Some(_) }
+        ));
 
-        let snap = await_menu_snapshot(&client, &addr);
-        assert_eq!(snap.choices[0].index, Some(1));
-        assert_eq!(snap.choices[1].index, Some(2));
+        let snap1 = await_menu_snapshot(&client, &addr, 0);
+        assert!(matches!(
+            snap1.fidelity,
+            SnapshotFidelity::StyledVt {
+                cursor: Some(_),
+                alt_screen: false
+            }
+        ));
+        assert!(snap1.selection_observable());
 
-        let mismatch = client
-            .send_keys(
+        client
+            .execute(
                 &addr,
-                &[KeyChord::parse("enter").expect("enter")],
-                Some(snap.snapshot_hash ^ 1),
+                &TuiAction::SendKeys {
+                    keys: KeyChordSequence::single(KeyChord::parse("down").expect("down")),
+                    expected_guard: Some(snap1.guard()),
+                },
             )
-            .expect_err("wrong CAS hash must be rejected");
-        assert!(mismatch.0.contains("cas_mismatch"), "{mismatch}");
+            .expect("guarded down succeeds");
+
+        let snap2 = await_menu_snapshot(&client, &addr, 1);
+        assert_eq!(snap2.plain_lines, snap1.plain_lines);
+        assert_ne!(
+            snap2.guard(),
+            snap1.guard(),
+            "reverse-video selection change 1 -> 2 must invalidate stale guard"
+        );
+
+        let stale_err = client
+            .execute(
+                &addr,
+                &TuiAction::SendKeys {
+                    keys: KeyChordSequence::single(KeyChord::parse("enter").expect("enter")),
+                    expected_guard: Some(snap1.guard()),
+                },
+            )
+            .expect_err("stale snap1 guard must reject enter");
+        assert!(stale_err.0.contains("guard_mismatch"), "{stale_err}");
 
         let watch_sock = env.socket.clone();
         let watch_addr = addr.clone();
         let watch_handle = std::thread::spawn(move || {
-            HerdrGlobalClient::at_socket(&watch_sock).wait_settled(
+            HerdrGlobalClient::at_socket(&watch_sock).execute(
                 &watch_addr,
-                None,
-                Some("PICKED_2"),
-                Duration::from_secs(5),
+                &TuiAction::WaitSettled {
+                    after_turn: None,
+                    output_contains: Some("PICKED_2".to_string()),
+                    timeout_ms: 5000,
+                },
             )
         });
         std::thread::sleep(Duration::from_millis(80));
 
         client
-            .send_keys(
+            .execute(
                 &addr,
-                &[
-                    KeyChord::parse("down").expect("down"),
-                    KeyChord::parse("enter").expect("enter"),
-                ],
-                Some(snap.snapshot_hash),
+                &TuiAction::SendKeys {
+                    keys: KeyChordSequence::single(KeyChord::parse("enter").expect("enter")),
+                    expected_guard: Some(snap2.guard()),
+                },
             )
-            .expect("send_keys down+enter");
+            .expect("fresh snap2 guard allows enter");
 
-        let waited = watch_handle
+        let wait_outcome = watch_handle
             .join()
             .expect("wait thread")
             .expect("wait_settled on PICKED_2");
-        assert!(waited.ended, "expected wait output match: {waited:?}");
-        assert_eq!(waited.reason, WaitReason::Output);
-
-        let mut labels = BTreeMap::new();
-        labels.insert("observed_by".to_string(), "ar1_test".to_string());
-        client.tag_observe(&addr, &labels).expect("tag_observe");
-        let after_tag = client.discover_all(false).expect("discover after tag");
-        let tagged = after_tag
-            .iter()
-            .find(|t| t.address == addr)
-            .expect("still present");
-        assert_eq!(
-            tagged.labels.get("observed_by").map(String::as_str),
-            Some("ar1_test")
-        );
-
-        let int_report = client
-            .interrupt(&addr, Some(Duration::from_secs(5)))
-            .expect("interrupt");
         assert!(
-            int_report.key_sent.is_some(),
-            "expected key_sent in InterruptReport: {int_report:?}"
+            matches!(
+                wait_outcome,
+                TuiActionOutcome::Waited(ref w) if w.ended() && w.reason == WaitReason::Output
+            ),
+            "expected PICKED_2 wait output: {wait_outcome:?}"
         );
-        assert!(matches!(
-            int_report.outcome,
-            InterruptOutcome::Exited | InterruptOutcome::Stopped | InterruptOutcome::Unknown
-        ));
-        eprintln!("REAL_SPAWN_HC_GLOBAL_VERIFIED address={addr}");
+
+        verify_real_labels_and_interrupt(&client, &addr);
+        eprintln!("REAL_SPAWN_HC_GLOBAL_VERIFIED address={addr} styled_vt=true");
     }
 }
