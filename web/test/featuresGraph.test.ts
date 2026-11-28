@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import { normalizeFeatureMap } from "../src/features.ts";
@@ -6,6 +7,7 @@ import type { Feature, FeatureMission, RelationKind } from "../src/features.ts";
 import {
   allBranchIds,
   ancestorsOf,
+  buildActiveSpineModel,
   buildFeatureMindMapTree,
   buildFileIndex,
   buildRelationIndex,
@@ -391,4 +393,588 @@ test("mindMapGraphIdentity and reconcileExpandedIds preserve user expansion and 
   // Inspector open/close auto-fits only before the user manually pans or zooms.
   assert.equal(shouldAutoFitOnInspectorToggle(false), true);
   assert.equal(shouldAutoFitOnInspectorToggle(true), false);
+});
+
+test("buildActiveSpineModel handles empty and all-live missions and transitions cleanly on focus", () => {
+  const emptyMission = makeMission([], 4);
+  const emptyRel = buildRelationIndex(emptyMission.features);
+  const emptyModel = buildActiveSpineModel(emptyMission, emptyRel, null);
+  assert.equal(emptyModel.kind, "empty");
+  assert.equal(emptyModel.focusId, null);
+  assert.deepEqual(emptyModel.spine, []);
+  assert.deepEqual(emptyModel.upstream, []);
+  assert.deepEqual(emptyModel.downstream, []);
+  assert.equal(emptyModel.summary.totalFeatures, 0);
+
+  const allLive = makeMission([
+    {
+      id: "dom",
+      title: "Domain",
+      kind: "domain",
+      state: "live",
+      planned: false,
+      implemented: true,
+      verified: true,
+      live: true,
+    },
+    {
+      id: "core",
+      title: "Core",
+      state: "live",
+      planned: false,
+      implemented: true,
+      verified: true,
+      live: true,
+    },
+    {
+      id: "edge",
+      title: "Edge",
+      state: "live",
+      planned: false,
+      implemented: true,
+      verified: true,
+      live: true,
+      relations: [{ kind: "depends_on", target: "core" }],
+    },
+  ]);
+  const liveRel = buildRelationIndex(allLive.features);
+  const liveModel = buildActiveSpineModel(allLive, liveRel, null);
+  assert.equal(liveModel.kind, "all_live");
+  assert.equal(liveModel.focusId, null);
+  assert.deepEqual(
+    liveModel.spine.map((n) => n.feature.id),
+    ["core", "edge"],
+  );
+  assert.equal(liveModel.summary.liveCount, 3);
+  assert.equal(liveModel.summary.nonLiveCount, 0);
+
+  // Focusing an individual node switches cleanly to focused mode with upstream/downstream.
+  const focused = buildActiveSpineModel(allLive, liveRel, "edge");
+  assert.equal(focused.kind, "focused");
+  assert.equal(focused.focusId, "edge");
+  assert.deepEqual(
+    focused.spine.map((n) => n.feature.id),
+    ["edge"],
+  );
+  assert.deepEqual(
+    focused.upstream.map((u) => [u.feature.id, u.depth, u.proximity]),
+    [["core", 1, "direct"]],
+  );
+  assert.deepEqual(focused.downstream, []);
+
+  // Unknown focusId falls back to auto mode rather than returning an invalid focused mode.
+  const unknownFocus = buildActiveSpineModel(allLive, liveRel, "does-not-exist");
+  assert.equal(unknownFocus.kind, "all_live");
+  assert.equal(unknownFocus.focusId, null);
+});
+
+test("buildActiveSpineModel extracts transitive upstream/downstream and preserves server state immutability", () => {
+  // Graph:
+  //   root-db (live) <- depends_on - auth (implemented, active owner)
+  //   gate (planned) - blocks -> auth
+  //   auth <- depends_on - api (planned) <- depends_on - ui (planned)
+  //   blocked-hotfix (planned, blocked) - blocks -> ui
+  const rawList = [
+    {
+      id: "root-db",
+      title: "Root DB",
+      state: "live",
+      planned: false,
+      implemented: true,
+      verified: true,
+      live: true,
+      objectives: [1],
+    },
+    {
+      id: "gate",
+      title: "Security Gate",
+      state: "planned",
+      objectives: [2],
+      relations: [{ kind: "blocks", target: "auth", label: "needs audit" }],
+    },
+    {
+      id: "auth",
+      title: "Auth Service",
+      state: "implemented",
+      planned: false,
+      implemented: true,
+      verified: false,
+      live: false,
+      objectives: [3],
+      owner: {
+        task: 42,
+        agent_id: "worker-alpha",
+        session_id: "sess-auth-42",
+        kind: "worker",
+        state: "working",
+        since_ms: 5000,
+      },
+      relations: [{ kind: "depends_on", target: "root-db", label: "schema" }],
+    },
+    {
+      id: "api",
+      title: "HTTP API",
+      state: "planned",
+      objectives: [4],
+      relations: [{ kind: "depends_on", target: "auth" }],
+    },
+    {
+      id: "ui",
+      title: "Web UI",
+      state: "planned",
+      objectives: [5],
+      relations: [{ kind: "depends_on", target: "api" }],
+    },
+    {
+      id: "blocked-hotfix",
+      title: "Hotfix Blocker",
+      state: "planned",
+      objectives: [6],
+      blocked: {
+        kind: "main_red",
+        reason: "clippy red",
+        task: 55,
+        agent_id: "worker-beta",
+        session_id: "sess-hotfix-55",
+      },
+      relations: [{ kind: "blocks", target: "ui" }],
+    },
+  ];
+
+  const mission = makeMission(rawList);
+  const rel = buildRelationIndex(mission.features);
+  const model = buildActiveSpineModel(mission, rel, null);
+
+  assert.equal(model.kind, "active_work");
+  // Blocked hotfix ranks ahead of active owner auth; domain/idle planned nodes stay out of spine.
+  assert.deepEqual(
+    model.spine.map((n) => [n.feature.id, n.role, n.workSignal.kind, n.sessionId]),
+    [
+      ["blocked-hotfix", "in_flight", "blocked", "sess-hotfix-55"],
+      ["auth", "in_flight", "active_owner", "sess-auth-42"],
+    ],
+  );
+  // Upstream for spine includes incoming blocks (gate, planned priority) and direct depends_on (root-db, live).
+  assert.deepEqual(
+    model.upstream.map((u) => [
+      u.feature.id,
+      u.depth,
+      u.proximity,
+      u.links.map((l) => `${l.edgeKind}:${l.viaFeatureId}`),
+    ]),
+    [
+      ["gate", 1, "direct", ["blocked_by:auth"]],
+      ["root-db", 1, "direct", ["depends_on:auth"]],
+    ],
+  );
+  // Downstream unlocked includes direct api (required_by auth, objective 4) and ui (blocks blocked-hotfix, objective 5; kept at min depth 1).
+  assert.deepEqual(
+    model.downstream.map((d) => [d.feature.id, d.depth, d.proximity]),
+    [
+      ["api", 1, "direct"],
+      ["ui", 1, "direct"],
+    ],
+  );
+
+  // Shuffling input feature array must produce identical deterministic order.
+  const shuffled = makeMission([...rawList].reverse());
+  const shuffledModel = buildActiveSpineModel(shuffled, buildRelationIndex(shuffled.features), null);
+  assert.deepEqual(
+    shuffledModel.spine.map((n) => n.feature.id),
+    model.spine.map((n) => n.feature.id),
+  );
+  assert.deepEqual(
+    shuffledModel.upstream.map((n) => n.feature.id),
+    model.upstream.map((n) => n.feature.id),
+  );
+  assert.deepEqual(
+    shuffledModel.downstream.map((n) => n.feature.id),
+    model.downstream.map((n) => n.feature.id),
+  );
+
+  // Server states are never overwritten even when upstream dependencies are incomplete.
+  const authFeature = mission.features.find((f) => f.id === "auth");
+  assert.equal(authFeature?.state, "implemented");
+  assert.equal(authFeature?.implemented, true);
+  assert.equal(authFeature?.verified, false);
+  assert.equal(authFeature?.live, false);
+});
+
+test("buildActiveSpineModel guards against self-links, 2-node cycles, and transitive sub-cycles", () => {
+  const mission = makeMission([
+    {
+      id: "a",
+      title: "Node A",
+      state: "implemented",
+      planned: false,
+      implemented: true,
+      relations: [
+        { kind: "depends_on", target: "a" },
+        { kind: "depends_on", target: "b" },
+      ],
+    },
+    {
+      id: "b",
+      title: "Node B",
+      state: "planned",
+      relations: [
+        { kind: "depends_on", target: "c" },
+        { kind: "depends_on", target: "a" },
+      ],
+    },
+    {
+      id: "c",
+      title: "Node C",
+      state: "planned",
+      relations: [{ kind: "depends_on", target: "b" }],
+    },
+  ]);
+
+  const rel = buildRelationIndex(mission.features);
+  const model = buildActiveSpineModel(mission, rel, "a");
+
+  assert.equal(model.kind, "focused");
+  assert.deepEqual(
+    model.upstream.map((u) => [u.feature.id, u.depth]),
+    [
+      ["b", 1],
+      ["c", 2],
+    ],
+  );
+  assert.deepEqual(
+    model.downstream.map((d) => [d.feature.id, d.depth]),
+    [
+      ["b", 1],
+      ["c", 2],
+    ],
+  );
+  assert.ok(model.summary.cycleGuardedEdges > 0);
+});
+
+test("Fix 3: diamond DAGs report 0 cycle warnings while real cycles still register", () => {
+  // Acyclic diamond DAG: A -> B, A -> C, C -> B
+  const diamondMission = makeMission([
+    {
+      id: "a",
+      title: "Focus A",
+      state: "implemented",
+      planned: false,
+      implemented: true,
+      relations: [
+        { kind: "depends_on", target: "b" },
+        { kind: "depends_on", target: "c" },
+      ],
+    },
+    {
+      id: "c",
+      title: "Middle C",
+      state: "planned",
+      relations: [{ kind: "depends_on", target: "b" }],
+    },
+    {
+      id: "b",
+      title: "Base B",
+      state: "live",
+      planned: false,
+      implemented: true,
+      verified: true,
+      live: true,
+    },
+  ]);
+
+  assert.deepEqual(validateFeatureGraph(diamondMission.features), []);
+  const diamondRel = buildRelationIndex(diamondMission.features);
+
+  const focusA = buildActiveSpineModel(diamondMission, diamondRel, "a");
+  assert.equal(focusA.kind, "focused");
+  assert.equal(focusA.summary.cycleGuardedEdges, 0);
+  assert.deepEqual(
+    focusA.upstream.map((u) => [u.feature.id, u.depth]),
+    [
+      ["c", 1],
+      ["b", 1],
+    ],
+  );
+
+  // Downstream diamond from B (C depends_on B, A depends_on B & C) must also report 0 cycles.
+  const focusB = buildActiveSpineModel(diamondMission, diamondRel, "b");
+  assert.equal(focusB.kind, "focused");
+  assert.equal(focusB.summary.cycleGuardedEdges, 0);
+  assert.deepEqual(
+    focusB.downstream.map((d) => [d.feature.id, d.depth]),
+    [
+      ["a", 1],
+      ["c", 1],
+    ],
+  );
+});
+
+test("Fix 4, 5 & 6: task-scoped session binding never borrows across tasks, isFocused is removed, and cards avoid nested role=button", () => {
+  const mission = makeMission([
+    {
+      id: "owner-no-session",
+      title: "Active Task 42 Without Session",
+      state: "implemented",
+      planned: false,
+      implemented: true,
+      owner: {
+        task: 42,
+        agent_id: "worker-42",
+        session_id: null,
+        kind: "worker",
+        state: "working",
+        since_ms: 2000,
+      },
+      last_owner: {
+        task: 17,
+        agent_id: "worker-17",
+        session_id: "sess-17",
+        kind: "worker",
+        state: "done",
+        since_ms: 1000,
+      },
+      evidence: {
+        tasks: [
+          { id: 17, state: "done", agent_id: "worker-17", session_id: "sess-17", updated_at_ms: 1000 },
+          { id: 42, state: "working", agent_id: "worker-42", session_id: null, updated_at_ms: 2000 },
+        ],
+        landings: [],
+        verifications: [],
+      },
+    },
+    {
+      id: "blocked-no-session",
+      title: "Blocked Task 43 Without Session",
+      state: "planned",
+      blocked: {
+        kind: "sent_back",
+        reason: "needs fix",
+        task: 43,
+        agent_id: "worker-43",
+        session_id: null,
+      },
+      evidence: {
+        tasks: [
+          { id: 19, state: "done", agent_id: "worker-19", session_id: "sess-19", updated_at_ms: 900 },
+          { id: 43, state: "sent_back", agent_id: "worker-43", session_id: null, updated_at_ms: 2100 },
+        ],
+        landings: [],
+        verifications: [],
+      },
+    },
+    {
+      id: "owner-from-same-task",
+      title: "Task 44 Carries Matching Task Session",
+      state: "verified",
+      planned: false,
+      implemented: true,
+      verified: true,
+      owner: {
+        task: 44,
+        agent_id: "worker-44",
+        session_id: null,
+        kind: "worker",
+        state: "working",
+        since_ms: 2200,
+      },
+      evidence: {
+        tasks: [
+          { id: 12, state: "done", agent_id: "worker-12", session_id: "sess-12", updated_at_ms: 800 },
+          { id: 44, state: "working", agent_id: "worker-44", session_id: "sess-44", updated_at_ms: 2200 },
+        ],
+        landings: [],
+        verifications: [],
+      },
+    },
+  ]);
+
+  const rel = buildRelationIndex(mission.features);
+  const activeModel = buildActiveSpineModel(mission, rel, null);
+  const byFeature = new Map(activeModel.spine.map((n) => [n.feature.id, n]));
+
+  const node42 = byFeature.get("owner-no-session")!;
+  assert.equal(node42.sessionId, null);
+  assert.equal(node42.workSignal.kind, "active_owner");
+  if (node42.workSignal.kind === "active_owner") {
+    assert.equal(node42.workSignal.sessionId, null);
+  }
+  assert.equal("isFocused" in node42, false);
+
+  const node43 = byFeature.get("blocked-no-session")!;
+  assert.equal(node43.sessionId, null);
+
+  const node44 = byFeature.get("owner-from-same-task")!;
+  assert.equal(node44.sessionId, "sess-44");
+
+  const focused42 = buildActiveSpineModel(mission, rel, "owner-no-session");
+  assert.equal(focused42.spine[0].role, "focused");
+  assert.equal("isFocused" in focused42.spine[0], false);
+
+  // Guard ActiveSpineView against nested interactive elements (`role="button"`).
+  const activeSpineSrc = readFileSync(
+    new URL("../src/components/features/ActiveSpineView.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(activeSpineSrc, /role="button"/);
+});
+
+test("Blocker 2: Active Spine outer scroll, 3-column grid, and inspector align on xl (1280px) across built CSS viewports", () => {
+  const mapViewSrc = readFileSync(
+    new URL("../src/components/features/FeatureMapView.tsx", import.meta.url),
+    "utf8",
+  );
+  const spineViewSrc = readFileSync(
+    new URL("../src/components/features/ActiveSpineView.tsx", import.meta.url),
+    "utf8",
+  );
+  const inspectorSrc = readFileSync(
+    new URL("../src/components/features/FeatureInspector.tsx", import.meta.url),
+    "utf8",
+  );
+
+  // Align all Spine view transitions cleanly at xl (zero md/lg dead zones).
+  assert.match(
+    mapViewSrc,
+    /data-spine-scroll-shell="true"[\s\S]*overflow-y-auto[\s\S]*xl:overflow-y-hidden/,
+  );
+  assert.match(
+    mapViewSrc,
+    /flex shrink-0 flex-col gap-3 xl:min-h-0 xl:flex-1 xl:shrink xl:flex-row/,
+  );
+  assert.match(mapViewSrc, /desktopBreakpoint="xl"/);
+  assert.match(
+    mapViewSrc,
+    /desktopBreakpoint === "xl"\s*\?\s*"shrink-0 xl:min-h-0 xl:max-h-none xl:shrink-0"/,
+  );
+  assert.doesNotMatch(
+    mapViewSrc,
+    /desktopBreakpoint === "xl"\s*\?\s*"shrink-0 xl:min-h-0 xl:max-h-none xl:shrink"/,
+  );
+  assert.match(spineViewSrc, /flex flex-col gap-3 xl:min-h-0 xl:min-w-0 xl:flex-1/);
+  assert.match(
+    spineViewSrc,
+    /grid grid-cols-1 gap-3 xl:min-h-0 xl:flex-1 xl:grid-cols-3 xl:grid-rows-\[minmax\(0,1fr\)\]/,
+  );
+  assert.match(
+    spineViewSrc,
+    /flex min-h-\[240px\] min-w-0 flex-col rounded-card bg-surface shadow-card xl:min-h-0 xl:overflow-hidden/,
+  );
+  assert.match(
+    spineViewSrc,
+    /flex flex-col gap-2 p-2\.5 xl:min-h-0 xl:flex-1 xl:overflow-y-auto/,
+  );
+  assert.match(inspectorSrc, /wideAt === "xl" \? "xl:w-\[420px\] xl:shrink-0"/);
+
+  // Parse the actual compiled CSS bundle when `web/dist/assets/index-*.css` exists
+  // (mandatory after `vite build` so responsive breakpoints & declarations are proven).
+  const assetsUrl = new URL("../dist/assets/", import.meta.url);
+  let cssFile: string | null = null;
+  try {
+    const names = readdirSync(assetsUrl);
+    cssFile = names.find((name) => /^index-.*\.css$/.test(name)) ?? null;
+  } catch {
+    cssFile = null;
+  }
+  if (!cssFile) return;
+
+  const css = readFileSync(new URL(cssFile, assetsUrl), "utf8");
+  const escapedClassToken = (cls: string) =>
+    cls.replace(/([:\\/[\],()])/g, "\\$1");
+
+  const requiredBase = [
+    "overflow-y-auto",
+    "flex-col",
+    "shrink-0",
+    "grid-cols-1",
+  ];
+  for (const cls of requiredBase) {
+    assert.ok(
+      css.includes(`.${escapedClassToken(cls)}{`),
+      `built CSS missing base rule for .${cls}`,
+    );
+  }
+
+  // Extract all `@media (width>=80rem)` (`1280px` xl breakpoint) balanced blocks.
+  const xlBlocks: string[] = [];
+  for (const match of css.matchAll(/@media\s*\(\s*width\s*>=\s*80rem\s*\)\s*\{/g)) {
+    let depth = 1;
+    let cursor = (match.index ?? 0) + match[0].length;
+    const blockStart = cursor;
+    while (cursor < css.length && depth > 0) {
+      if (css[cursor] === "{") depth += 1;
+      else if (css[cursor] === "}") depth -= 1;
+      cursor += 1;
+    }
+    xlBlocks.push(css.slice(blockStart, cursor - 1));
+  }
+  assert.ok(xlBlocks.length > 0, "built CSS must emit @media (width>=80rem)");
+  const xlBlock = xlBlocks.join("\n");
+
+  const expectedXlRules: Array<[string, RegExp]> = [
+    ["xl:overflow-y-hidden", /overflow-y:\s*hidden/],
+    ["xl:flex-row", /flex-direction:\s*row/],
+    ["xl:min-h-0", /min-height:\s*0/],
+    ["xl:min-w-0", /min-width:\s*0/],
+    ["xl:flex-1", /flex:\s*1/],
+    ["xl:shrink", /flex-shrink:\s*1/],
+    ["xl:grid-cols-3", /grid-template-columns:\s*repeat\(3/],
+    ["xl:grid-rows-[minmax(0,1fr)]", /grid-template-rows:\s*minmax\(0,\s*1fr\)/],
+    ["xl:overflow-hidden", /overflow:\s*hidden/],
+    ["xl:overflow-y-auto", /overflow-y:\s*auto/],
+    ["xl:w-[420px]", /width:\s*420px/],
+    ["xl:shrink-0", /flex-shrink:\s*0/],
+  ];
+  for (const [cls, propRe] of expectedXlRules) {
+    const token = `.${escapedClassToken(cls)}{`;
+    const idx = xlBlock.indexOf(token);
+    assert.ok(idx >= 0, `built CSS missing ${token} inside @media (width>=80rem)`);
+    const bodyEnd = xlBlock.indexOf("}", idx);
+    const decl = xlBlock.slice(idx + token.length, bodyEnd);
+    assert.match(decl, propRe, `built rule for .${cls} must declare ${propRe}, got ${decl}`);
+  }
+
+  // Verify layout cascade metrics across narrow (390..1279), exact 1280x613 xl boundary, and 1440px.
+  const evaluateCascadeAtWidth = (width: number) => {
+    const isXl = width >= 1280;
+    const horizontalPaddingPx = width >= 640 ? 40 : 32; // px-4 sm:px-5
+    const rowGapPx = 12; // gap-3
+    const drawerWidthPx = isXl ? 420 : null;
+    return {
+      outerOverflowY: isXl ? "hidden" : "auto",
+      innerDirection: isXl ? "row" : "column",
+      innerShrink: isXl ? 1 : 0,
+      drawerShrink: 0, // base `shrink-0` + `xl:shrink-0` on InspectorDrawer + `xl:shrink-0` on FeatureInspector
+      drawerWidthPx,
+      spineMinWidth: isXl ? 0 : "auto", // `xl:min-w-0` lets 3-column spine yield width to the 420px drawer
+      spineAvailableWidthPx: isXl
+        ? width - horizontalPaddingPx - rowGapPx - (drawerWidthPx ?? 0)
+        : width - horizontalPaddingPx,
+      gridColumns: isXl ? 3 : 1,
+      columnOverflow: isXl ? "hidden" : "visible",
+      columnListOverflowY: isXl ? "auto" : "visible",
+    };
+  };
+
+  for (const width of [390, 500, 800, 1024, 1279]) {
+    const layout = evaluateCascadeAtWidth(width);
+    assert.equal(layout.outerOverflowY, "auto", `width ${width}px must enable outer vertical scrolling`);
+    assert.equal(layout.innerDirection, "column");
+    assert.equal(layout.innerShrink, 0, `width ${width}px stacked shell must not compress away`);
+    assert.equal(layout.gridColumns, 1);
+    assert.equal(layout.columnOverflow, "visible");
+  }
+
+  for (const width of [1280, 1440]) {
+    const desktop = evaluateCascadeAtWidth(width);
+    assert.equal(desktop.outerOverflowY, "hidden");
+    assert.equal(desktop.innerDirection, "row");
+    assert.equal(desktop.drawerShrink, 0, `width ${width}px (e.g. 1280x613) must keep drawer shrink-0`);
+    assert.equal(desktop.drawerWidthPx, 420, `width ${width}px must preserve full 420px FeatureInspector drawer`);
+    assert.equal(desktop.spineMinWidth, 0, `width ${width}px spine container must declare xl:min-w-0`);
+    assert.ok(desktop.spineAvailableWidthPx > 0);
+    assert.equal(desktop.gridColumns, 3);
+    assert.equal(desktop.columnOverflow, "hidden");
+    assert.equal(desktop.columnListOverflowY, "auto");
+  }
+  assert.equal(evaluateCascadeAtWidth(1280).spineAvailableWidthPx, 808);
 });

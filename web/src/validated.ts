@@ -51,21 +51,37 @@ export interface ReadOptions {
   headers: Record<string, string>;
   /** The error of a failed read, from its status and the server's reason. */
   fail: (status: number, detail: string) => Error;
+  /** Optional caller epoch check; when false, the read aborts cleanly as stale. */
+  isCurrent?: () => boolean;
+}
+
+function staleReadAbort(): DOMException {
+  return new DOMException("The operation was aborted.", "AbortError");
 }
 
 /** The last answer read at each URL, with its tag. */
 export class Validated {
   private readonly kept = new Map<string, Kept>();
   private readonly fetcher: FetchLike;
+  private generation = 0;
 
   constructor(fetcher: FetchLike = (url, init) => fetch(url, init)) {
     this.fetcher = fetcher;
+  }
+
+  /** Monotonic invalidation generation bumped on every `clear()`. */
+  get epoch(): number {
+    return this.generation;
   }
 
   /** GET `url` and normalize it, or, answered 304, the value read last
    * time (the same object). A failure throws `fail`'s error, with the
    * server's `error` when it sent one. */
   async read<T>(url: string, normalize: (raw: unknown) => T, options: ReadOptions): Promise<T> {
+    const readGeneration = this.generation;
+    const stillCurrent = () =>
+      this.generation === readGeneration && (options.isCurrent?.() ?? true);
+    if (!stillCurrent()) throw staleReadAbort();
     const kept = this.kept.get(url);
     const headers: Record<string, string> = {
       ...options.headers,
@@ -77,10 +93,15 @@ export class Validated {
       cache: "no-store",
       headers,
     });
+    if (!stillCurrent()) {
+      void response.body?.cancel?.().catch(() => undefined);
+      throw staleReadAbort();
+    }
     if (response.status === 304 && kept) {
       // Read the (empty) body: left unread, the browser ends the request as
       // aborted, and its developer tools list every 304 as a failure.
       await response.arrayBuffer().catch(() => undefined);
+      if (!stillCurrent()) throw staleReadAbort();
       // Read again by another caller with another reading of the same
       // answer: normalize it its own way.
       if (kept.normalize !== normalize) return normalize(kept.raw);
@@ -97,9 +118,11 @@ export class Validated {
       } catch {
         // Not JSON: the status says enough.
       }
+      if (!stillCurrent()) throw staleReadAbort();
       throw options.fail(response.status, detail);
     }
     const raw: unknown = await response.json();
+    if (!stillCurrent()) throw staleReadAbort();
     const normalized = normalize(raw);
     const etag = response.headers.get("ETag");
     if (etag) {
@@ -117,6 +140,7 @@ export class Validated {
 
   /** Forget every kept response and ETag (for example on sign-out or token change). */
   clear(): void {
+    this.generation += 1;
     this.kept.clear();
   }
 

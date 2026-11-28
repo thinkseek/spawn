@@ -202,3 +202,84 @@ test("clear forgets kept ETags so the next read omits If-None-Match", async () =
   await reads.read("/api/overview", (raw) => raw, options());
   assert.equal(seen[1].headers["If-None-Match"], undefined);
 });
+
+test("clear bumps epoch and prevents late in-flight responses from repopulating kept cache", async () => {
+  let resolveSlow!: (res: Response) => void;
+  let callIndex = 0;
+  const seenHeaders: Array<Record<string, string>> = [];
+
+  const reads = new Validated(async (_url, init) => {
+    seenHeaders.push((init.headers ?? {}) as Record<string, string>);
+    callIndex += 1;
+    if (callIndex === 1) {
+      return await new Promise<Response>((resolve) => {
+        resolveSlow = resolve;
+      });
+    }
+    return new Response(JSON.stringify({ n: 2 }), {
+      status: 200,
+      headers: { ETag: 'W/"fresh-2"' },
+    });
+  });
+
+  const epochBefore = reads.epoch;
+  const pendingSlow = reads.read("/api/fleet", (raw) => raw, options());
+  reads.clear();
+  assert.ok(reads.epoch > epochBefore);
+
+  resolveSlow(
+    new Response(JSON.stringify({ n: 1 }), {
+      status: 200,
+      headers: { ETag: 'W/"stale-1"' },
+    }),
+  );
+  await assert.rejects(pendingSlow, { name: "AbortError" });
+  assert.equal(reads.size, 0, "stale response after clear() must never repopulate cache");
+
+  await reads.read("/api/fleet", (raw) => raw, options());
+  assert.equal(seenHeaders[1]["If-None-Match"], undefined);
+});
+
+test("stale in-flight 401 after clear() or isCurrent() transition aborts without invoking fail", async () => {
+  let resolveClearRace!: (res: Response) => void;
+  let resolveEpochRace!: (res: Response) => void;
+  let callNum = 0;
+
+  const reads = new Validated(async () => {
+    callNum += 1;
+    if (callNum === 1) {
+      return await new Promise<Response>((resolve) => {
+        resolveClearRace = resolve;
+      });
+    }
+    return await new Promise<Response>((resolve) => {
+      resolveEpochRace = resolve;
+    });
+  });
+
+  let clearFailCalls = 0;
+  const pendingClearRace = reads.read("/api/overview", (raw) => raw, {
+    ...options(() => {
+      clearFailCalls += 1;
+      return new Error("must not be called after clear");
+    }),
+  });
+  reads.clear();
+  resolveClearRace(new Response(JSON.stringify({ error: "expired" }), { status: 401 }));
+  await assert.rejects(pendingClearRace, { name: "AbortError" });
+  assert.equal(clearFailCalls, 0);
+
+  let epochCurrent = true;
+  let epochFailCalls = 0;
+  const pendingEpochRace = reads.read("/api/overview", (raw) => raw, {
+    ...options(() => {
+      epochFailCalls += 1;
+      return new Error("must not be called after isCurrent false");
+    }),
+    isCurrent: () => epochCurrent,
+  });
+  epochCurrent = false;
+  resolveEpochRace(new Response(JSON.stringify({ error: "expired" }), { status: 401 }));
+  await assert.rejects(pendingEpochRace, { name: "AbortError" });
+  assert.equal(epochFailCalls, 0);
+});

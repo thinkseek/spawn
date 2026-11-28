@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { normalizeAttention, type Attention } from "./attention";
+import { normalizeAttention, type Attention } from "./attention.ts";
 import {
   FORBIDDEN_HOST_OR_ORIGIN_MESSAGE,
   TOKEN_KEY,
@@ -12,8 +12,8 @@ import {
   type AuthSyncEvent,
   type TokenChoice,
   type TokenVerifyResult,
-} from "./token";
-import { markFresh, pageHidden, Validated } from "./validated";
+} from "./token.ts";
+import { markFresh, pageHidden, Validated } from "./validated.ts";
 import { readTail } from "./sessionWindow.ts";
 import type { LiveStatus, LiveTopic } from "./stream.ts";
 import { CHANNEL_NAME, LiveStream, topicsOf } from "./stream.ts";
@@ -397,7 +397,8 @@ export function normalizeSession(value: unknown): SessionDetail {
  * storage is touched: a browser whose storage throws keeps it in memory
  * only, never in the URL. */
 const tokenChoice: TokenChoice = (() => {
-  const fromUrl = new URLSearchParams(window.location.search).get("token");
+  const fromUrl =
+    typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("token") : null;
   if (fromUrl !== null) {
     try {
       window.history.replaceState(null, "", withoutToken(window.location.href));
@@ -430,6 +431,27 @@ let initialTokenProblem: string | null = tokenChoice.problem;
 
 type AuthSyncListener = (event: AuthSyncEvent) => void;
 const authSyncListeners = new Set<AuthSyncListener>();
+
+let authEpoch = 0;
+type AuthEpochListener = (epoch: number) => void;
+const authEpochListeners = new Set<AuthEpochListener>();
+
+/** Monotonic counter incremented on every same-tab or cross-tab session/token change. */
+export function getAuthEpoch(): number {
+  return authEpoch;
+}
+
+/** Subscribe to every same-tab (`setServeToken`) and cross-tab (`storage`) auth epoch transition. */
+export function subscribeAuthEpoch(listener: AuthEpochListener): () => void {
+  authEpochListeners.add(listener);
+  return () => authEpochListeners.delete(listener);
+}
+
+function advanceAuthEpoch(): void {
+  authEpoch += 1;
+  reads.clear();
+  for (const listener of authEpochListeners) listener(authEpoch);
+}
 
 /** Subscribe to 401 unauthorized events raised at HTTP boundaries and cross-tab storage updates. */
 export function subscribeAuthSync(listener: AuthSyncListener): () => void {
@@ -465,7 +487,7 @@ export function setServeToken(next: string | null): void {
   } catch {
     // Storage disabled: kept in this page only.
   }
-  reads.clear();
+  advanceAuthEpoch();
   if (normalized === null) live.stop();
 }
 
@@ -494,15 +516,16 @@ if (typeof window !== "undefined") {
     const change = classifyStorageTokenEvent(event.key, event.newValue, serveToken);
     if (!change) return;
     initialTokenProblem = null;
-    reads.clear();
     if (change.kind === "signed_out") {
       serveToken = null;
+      advanceAuthEpoch();
       live.stop();
       emitAuthSync(change);
       return;
     }
     if (change.kind === "token_updated") {
       serveToken = change.token;
+      advanceAuthEpoch();
       emitAuthSync(change);
     }
   });
@@ -566,10 +589,15 @@ export function readApi<T>(
   signal: AbortSignal,
   normalize: (raw: unknown) => T,
 ): Promise<T> {
+  const requestEpoch = getAuthEpoch();
   return reads.read(url, normalize, {
     signal,
     headers: apiHeaders(),
+    isCurrent: () => getAuthEpoch() === requestEpoch,
     fail: (status, detail) => {
+      if (getAuthEpoch() !== requestEpoch) {
+        throw new DOMException("The operation was aborted.", "AbortError");
+      }
       reportUnauthorizedStatus(status);
       return apiError(status, detail, "read");
     },

@@ -2,6 +2,7 @@ import {
   ArrowUpRight,
   ExternalLink,
   FileSearch,
+  GitBranch,
   LayoutGrid,
   Network,
   OctagonAlert,
@@ -36,18 +37,28 @@ import {
 } from "../../features";
 import type { FeatureTruthResponse } from "../../featureCoverage";
 import { fetchFeatureMap, fetchOptionalFeatureTruth } from "../../featuresApi";
-import type { GraphGroupingMode } from "../../featuresGraph";
+import type {
+  FeatureMindMapTree,
+  FileIndex,
+  GraphGroupingMode,
+  GraphValidationIssue,
+  MindMapTreeNode,
+  RelationIndex,
+} from "../../featuresGraph";
 import {
+  buildActiveSpineModel,
   buildFeatureMindMapTree,
   buildFileIndex,
   buildRelationIndex,
   validateFeatureGraph,
 } from "../../featuresGraph";
 import { Card, FOCUS_RING, LiveStatus, PageHeader, chip, cx } from "../ui";
+import { ActiveSpineView } from "./ActiveSpineView";
 import { FeatureInspector } from "./FeatureInspector";
 import { FeatureMindMap } from "./FeatureMindMap";
+import { RuntimeTelemetryStrip } from "./RuntimeTelemetryStrip";
 
-type ViewMode = "mindmap" | "columns";
+export type ViewMode = "spine" | "mindmap" | "columns";
 
 interface FeatureMapViewProps {
   /** Open a task's session timeline: the evidence behind a capability. */
@@ -57,14 +68,13 @@ interface FeatureMapViewProps {
 }
 
 /** The Feature map: a mission's capabilities, planned, implemented,
- * verified and live, each with the records that say so. Defaults to the
- * interactive navigable Mind Map view, with a secondary State Columns audit
- * view. The states are the server's, derived from Spawn's log; this page
- * only lays them out. */
+ * verified and live, each with the records that say so. Supports Active Spine
+ * (tri-column dependency focus), interactive Mind Map, and State Columns.
+ * States remain strictly server-derived from Spawn's event log. */
 export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapViewProps) {
   const poll = usePoll("features", fetchFeatureMap, 4_000, { checked: true });
   const [chosen, setChosen] = useState<number | null>(null);
-  const [viewMode, setViewMode] = useState<ViewMode>("mindmap");
+  const [viewMode, setViewMode] = useState<ViewMode>("spine");
   const [groupingMode, setGroupingMode] = useState<GraphGroupingMode>("auto");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [focusTrigger, setFocusTrigger] = useState(0);
@@ -120,6 +130,11 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
   }, []);
 
   const selectedNode = selectedNodeId && tree ? (tree.nodes[selectedNodeId] ?? null) : null;
+  const focusFeatureId = selectedNode?.feature?.id ?? null;
+  const activeSpine = useMemo(
+    () => (mission ? buildActiveSpineModel(mission, relationIndex, focusFeatureId) : null),
+    [mission, relationIndex, focusFeatureId],
+  );
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
@@ -130,12 +145,21 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
           </h1>
         }
       >
-        {/* View mode toggle: Mind Map (default) vs State Columns */}
+        {/* View mode toggle: Active Spine (default) vs Mind Map vs State Columns */}
         <div
           className="flex items-center gap-1"
           role="group"
           aria-label="Feature map view mode"
         >
+          <button
+            type="button"
+            onClick={() => setViewMode("spine")}
+            aria-pressed={viewMode === "spine"}
+            className={cx(chip(viewMode === "spine"), FOCUS_RING)}
+          >
+            <GitBranch size={13} />
+            Active spine
+          </button>
           <button
             type="button"
             onClick={() => setViewMode("mindmap")}
@@ -199,18 +223,53 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
         <div className="grid flex-1 place-items-center text-label text-muted-foreground">
           {poll.error ? `The feature map could not be read: ${poll.error}` : "Reading the map…"}
         </div>
-      ) : !mission || !tree ? (
+      ) : !mission || !tree || !activeSpine ? (
         <div className="grid flex-1 place-items-center px-6 text-center text-label text-muted-foreground">
           No open objective mission has a capability map.
         </div>
+      ) : viewMode === "spine" ? (
+        <div
+          data-spine-scroll-shell="true"
+          className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 py-3 sm:px-5 xl:overflow-y-hidden"
+        >
+          <MissionHeaderStack
+            mission={mission}
+            graphIssues={graphIssues}
+            relationsTotal={relationIndex.total}
+            sharedFilesCount={Object.keys(fileIndex.sharedFiles).length}
+          />
+          <div className="flex shrink-0 flex-col gap-3 xl:min-h-0 xl:flex-1 xl:shrink xl:flex-row">
+            <ActiveSpineView
+              mission={mission}
+              model={activeSpine}
+              selectedNodeId={selectedNodeId}
+              onSelectFeature={handleJumpToNode}
+              onResetFocus={() => setSelectedNodeId(null)}
+              onOpenSession={onOpenSession}
+              onInspectInMindMap={handleInspectInMap}
+            />
+            {selectedNode && (
+              <InspectorDrawer
+                mission={mission}
+                node={selectedNode}
+                tree={tree}
+                fileIndex={fileIndex}
+                relationIndex={relationIndex}
+                truth={truthData}
+                desktopBreakpoint="xl"
+                onSelectNode={handleJumpToNode}
+                onOpenSession={onOpenSession}
+                onClose={() => setSelectedNodeId(null)}
+              />
+            )}
+          </div>
+          <UnmappedNotice mission={mission} />
+        </div>
       ) : viewMode === "mindmap" ? (
         <div className="flex min-h-0 flex-1 flex-col gap-3 px-4 py-3 sm:px-5">
-          {mission.blocker && <MissionBlocker mission={mission} />}
-          {mission.backlog_error && <BacklogError mission={mission} />}
-          {mission.mapping.error && <MappingError mission={mission} />}
-          {graphIssues.length > 0 && <GraphIssuesBanner count={graphIssues.length} firstMessage={graphIssues[0].message} />}
-          <MissionHead
+          <MissionHeaderStack
             mission={mission}
+            graphIssues={graphIssues}
             relationsTotal={relationIndex.total}
             sharedFilesCount={Object.keys(fileIndex.sharedFiles).length}
           />
@@ -227,42 +286,27 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
               focusTrigger={focusTrigger}
             />
             {selectedNode && (
-              <div className="flex min-h-[320px] max-h-[55vh] flex-col overflow-hidden rounded-card border border-surface-border shadow-card lg:min-h-0 lg:max-h-none">
-                <FeatureInspector
-                  mission={mission}
-                  node={selectedNode}
-                  tree={tree}
-                  fileIndex={fileIndex}
-                  relationIndex={relationIndex}
-                  truth={truthData}
-                  onSelectNode={handleJumpToNode}
-                  onOpenSession={onOpenSession}
-                  onClose={() => setSelectedNodeId(null)}
-                />
-              </div>
+              <InspectorDrawer
+                mission={mission}
+                node={selectedNode}
+                tree={tree}
+                fileIndex={fileIndex}
+                relationIndex={relationIndex}
+                truth={truthData}
+                onSelectNode={handleJumpToNode}
+                onOpenSession={onOpenSession}
+                onClose={() => setSelectedNodeId(null)}
+              />
             )}
           </div>
-          {mission.unmapped.length > 0 && (
-            <p className="shrink-0 rounded-card border border-surface-border bg-surface px-3 py-2 text-caption text-muted-foreground">
-              <span className="font-medium text-foreground">
-                {mission.unmapped.length} objective
-                {mission.unmapped.length === 1 ? "" : "s"} not in the mapping:
-              </span>{" "}
-              {mission.unmapped
-                .map((objective) => objectiveName(mission.id, objective.id))
-                .join(", ")}
-            </p>
-          )}
+          <UnmappedNotice mission={mission} />
         </div>
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto flex max-w-[1600px] flex-col gap-3 px-4 py-4 sm:px-5">
-            {mission.blocker && <MissionBlocker mission={mission} />}
-            {mission.backlog_error && <BacklogError mission={mission} />}
-            {mission.mapping.error && <MappingError mission={mission} />}
-            {graphIssues.length > 0 && <GraphIssuesBanner count={graphIssues.length} firstMessage={graphIssues[0].message} />}
-            <MissionHead
+            <MissionHeaderStack
               mission={mission}
+              graphIssues={graphIssues}
               relationsTotal={relationIndex.total}
               sharedFilesCount={Object.keys(fileIndex.sharedFiles).length}
             />
@@ -303,17 +347,7 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
                 </section>
               ))}
             </div>
-            {mission.unmapped.length > 0 && (
-              <p className="rounded-card border border-surface-border bg-surface px-3 py-2 text-caption text-muted-foreground">
-                <span className="font-medium text-foreground">
-                  {mission.unmapped.length} objective
-                  {mission.unmapped.length === 1 ? "" : "s"} not in the mapping:
-                </span>{" "}
-                {mission.unmapped
-                  .map((objective) => objectiveName(mission.id, objective.id))
-                  .join(", ")}
-              </p>
-            )}
+            <UnmappedNotice mission={mission} />
             <p className="pb-2 text-micro text-faint-foreground">
               Planned is not implemented (a task, a merge or a review is not a landing).
               Implemented is not verified. Verified is not live: live is a successful deploy
@@ -324,6 +358,96 @@ export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapView
         </div>
       )}
     </main>
+  );
+}
+
+function MissionHeaderStack({
+  mission,
+  graphIssues,
+  relationsTotal,
+  sharedFilesCount,
+}: {
+  mission: FeatureMission;
+  graphIssues: GraphValidationIssue[];
+  relationsTotal: number;
+  sharedFilesCount: number;
+}) {
+  return (
+    <>
+      {mission.blocker && <MissionBlocker mission={mission} />}
+      {mission.backlog_error && <BacklogError mission={mission} />}
+      {mission.mapping.error && <MappingError mission={mission} />}
+      {graphIssues.length > 0 && (
+        <GraphIssuesBanner count={graphIssues.length} firstMessage={graphIssues[0].message} />
+      )}
+      <MissionHead
+        mission={mission}
+        relationsTotal={relationsTotal}
+        sharedFilesCount={sharedFilesCount}
+      />
+      <RuntimeTelemetryStrip />
+    </>
+  );
+}
+
+function InspectorDrawer({
+  mission,
+  node,
+  tree,
+  fileIndex,
+  relationIndex,
+  truth,
+  desktopBreakpoint = "lg",
+  onSelectNode,
+  onOpenSession,
+  onClose,
+}: {
+  mission: FeatureMission;
+  node: MindMapTreeNode;
+  tree: FeatureMindMapTree;
+  fileIndex: FileIndex;
+  relationIndex: RelationIndex;
+  truth: FeatureTruthResponse | null;
+  desktopBreakpoint?: "lg" | "xl";
+  onSelectNode: (nodeId: string) => void;
+  onOpenSession: (sessionId: string) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      className={cx(
+        "flex min-h-[320px] max-h-[55vh] flex-col overflow-hidden rounded-card border border-surface-border shadow-card",
+        desktopBreakpoint === "xl"
+          ? "shrink-0 xl:min-h-0 xl:max-h-none xl:shrink-0"
+          : "lg:min-h-0 lg:max-h-none",
+      )}
+    >
+      <FeatureInspector
+        mission={mission}
+        node={node}
+        tree={tree}
+        fileIndex={fileIndex}
+        relationIndex={relationIndex}
+        truth={truth}
+        wideAt={desktopBreakpoint}
+        onSelectNode={onSelectNode}
+        onOpenSession={onOpenSession}
+        onClose={onClose}
+      />
+    </div>
+  );
+}
+
+function UnmappedNotice({ mission }: { mission: FeatureMission }) {
+  if (mission.unmapped.length === 0) return null;
+  return (
+    <p className="shrink-0 rounded-card border border-surface-border bg-surface px-3 py-2 text-caption text-muted-foreground">
+      <span className="font-medium text-foreground">
+        {mission.unmapped.length} objective
+        {mission.unmapped.length === 1 ? "" : "s"} not in the mapping:
+      </span>{" "}
+      {mission.unmapped.map((objective) => objectiveName(mission.id, objective.id)).join(", ")}
+    </p>
   );
 }
 
