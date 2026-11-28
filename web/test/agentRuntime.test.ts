@@ -9,7 +9,6 @@ import {
   buildSendTextAction,
   classifyAgentHttpError,
   defaultSendPolicyMode,
-  effectiveIncludeAll,
   evaluateActionCapabilities,
   fetchAgentSnapshotWithFetch,
   fetchAgentsWithFetch,
@@ -24,6 +23,7 @@ import {
   reduceAction,
   reduceDiscovery,
   reduceSnapshot,
+  snapshotFromState,
   validateTerminalAddress,
   visibleAgentsForRole,
   type AgentDiscoveryState,
@@ -155,7 +155,6 @@ function styledSnapshotFixture(address = "t1", guard = "0x1122334455667788"): Tu
       { index: 2, label: "Second option", selected: false, line_index: 2 },
     ],
     guard,
-    snapshot_hash: 123456789,
   };
 }
 
@@ -179,7 +178,6 @@ function plainTextSnapshotFixture(address = "n252/t7"): TuiSnapshot {
     blocker_visible: false,
     choices: [],
     guard: "0xaabbccddeeff0011",
-    snapshot_hash: 987654321,
   };
 }
 
@@ -239,9 +237,14 @@ test("wire parsers decode StyledVt, PlainTextOnly, and flattened TuiActionOutcom
   assert.equal(listParsed.agents[0].origin.kind, "spawn_managed");
   assert.equal(listParsed.agents[1].origin.kind, "external");
 
-  const styled = parseTuiSnapshot(styledSnapshotFixture());
+  const styled = parseTuiSnapshot({
+    ...styledSnapshotFixture("t1", "0xffffffffffffffff"),
+    snapshot_hash: 18446744073709551615,
+  });
   assert.equal(styled.fidelity.fidelity, "styled_vt");
   assert.deepEqual(styled.fidelity.cursor, { row: 3, col: 4 });
+  assert.equal(styled.guard, "0xffffffffffffffff");
+  assert.equal("snapshot_hash" in styled, false);
 
   const plain = parseTuiSnapshot(plainTextSnapshotFixture());
   assert.equal(plain.fidelity.fidelity, "plain_text_only");
@@ -391,9 +394,33 @@ test("fetch helpers handle ?all=true, 304 ETag reuse, 401 vs 403 separation, and
   });
 });
 
-test("ReadOnlyViewer RBAC enforcement hides external terminals and blocks all mutations fail-closed", () => {
+test("ReadOnlyViewer RBAC allows ?all=true Spawn discovery, hides External, and blocks mutations fail-closed", async () => {
   const viewerRole: SessionRole = { kind: "viewer", expiresAtMs: 1_900_000_000_000 };
-  assert.equal(effectiveIncludeAll(viewerRole, true), false);
+  const requestedUrls: string[] = [];
+  const viewerListFetcher: AgentFetch = async (url) => {
+    requestedUrls.push(url);
+    // Server returns both live (t1) and exited (t9) Spawn-managed terminals under ?all=true.
+    const spawnOnly = sampleDiscoveredTerminals().filter(
+      (agent) => agent.origin.kind === "spawn_managed",
+    );
+    return fakeResponse(200, { agents: spawnOnly, count: spawnOnly.length });
+  };
+  const listedAll = await fetchAgentsWithFetch(
+    viewerListFetcher,
+    { Authorization: "Bearer sv1.x.y" },
+    true,
+  );
+  assert.equal(requestedUrls[0], "/api/agents?all=true");
+  assert.equal(listedAll.ok, true);
+  if (listedAll.ok) {
+    const visible = visibleAgentsForRole(listedAll.data.agents, viewerRole);
+    assert.deepEqual(
+      visible.map((a) => a.address),
+      ["t1", "t9"],
+    );
+  }
+
+  // Defense-in-depth client filter still drops External even if present in payload.
   const filtered = visibleAgentsForRole(sampleDiscoveredTerminals(), viewerRole);
   assert.deepEqual(
     filtered.map((a) => a.address),
@@ -406,7 +433,7 @@ test("ReadOnlyViewer RBAC enforcement hides external terminals and blocks all mu
     snapshot: styledSnapshotFixture(),
     capturedAtMs: 1_000,
   };
-  const caps = evaluateActionCapabilities(viewerRole, false, styledState);
+  const caps = evaluateActionCapabilities(viewerRole, false, styledState, "t1");
   assert.equal(caps.canMutate, false);
   assert.equal(caps.guarded.allowed, false);
   assert.equal(
@@ -417,6 +444,44 @@ test("ReadOnlyViewer RBAC enforcement hides external terminals and blocks all mu
     buildSendKeysAction({ keys: ["enter"], useGuard: true, capabilities: caps }).ok,
     false,
   );
+});
+
+test("snapshotFromState and evaluateActionCapabilities reject address mismatches on frame 0", () => {
+  const operatorRole: SessionRole = { kind: "operator" };
+  const t1Snap = styledSnapshotFixture("t1", "0x1122334455667788");
+  const readyT1: SnapshotLoadState = {
+    kind: "ready",
+    address: "t1",
+    snapshot: t1Snap,
+    capturedAtMs: 1_000,
+  };
+
+  assert.strictEqual(snapshotFromState(readyT1, "t1"), t1Snap);
+  assert.equal(snapshotFromState(readyT1, "t2"), null);
+  assert.equal(snapshotFromState(readyT1, null), null);
+
+  const staleFrame0Caps = evaluateActionCapabilities(operatorRole, false, readyT1, "t2");
+  assert.equal(staleFrame0Caps.canMutate, false);
+  assert.equal(staleFrame0Caps.guarded.allowed, false);
+  if (!staleFrame0Caps.guarded.allowed) {
+    assert.equal(staleFrame0Caps.guarded.reason, "no_snapshot");
+  }
+
+  const mismatchedPayload: SnapshotLoadState = {
+    kind: "ready",
+    address: "t2",
+    snapshot: t1Snap,
+    capturedAtMs: 1_000,
+  };
+  assert.equal(snapshotFromState(mismatchedPayload, "t2"), null);
+
+  const loadingWithT1Prev: SnapshotLoadState = {
+    kind: "loading",
+    address: "t1",
+    previous: t1Snap,
+  };
+  assert.strictEqual(snapshotFromState(loadingWithT1Prev, "t1"), t1Snap);
+  assert.equal(snapshotFromState(loadingWithT1Prev, "t2"), null);
 });
 
 test("PlainTextOnly fidelity blocks guarded SendKeys and only_if policies while allowing unguarded text", () => {
@@ -430,7 +495,7 @@ test("PlainTextOnly fidelity blocks guarded SendKeys and only_if policies while 
     snapshot: plain,
     capturedAtMs: 2_000,
   };
-  const caps = evaluateActionCapabilities(operatorRole, false, plainState);
+  const caps = evaluateActionCapabilities(operatorRole, false, plainState, "n252/t7");
   assert.equal(caps.canMutate, true);
   assert.equal(caps.selectionObservable, false);
   assert.equal(caps.guarded.allowed, false);
@@ -499,6 +564,7 @@ test("state machine reducers handle 409 guard_mismatch auto-refresh without retr
     { kind: "operator" },
     false,
     { kind: "ready", address: "t1", snapshot: styled, capturedAtMs: 5_000 },
+    "t1",
   );
   const built = buildSendKeysAction({
     keys: ["enter"],

@@ -104,7 +104,6 @@ export interface TuiSnapshot {
   blocker_visible: boolean;
   choices: TuiChoice[];
   guard: string;
-  snapshot_hash: number;
 }
 
 export type StatusPrecondition = "idle" | "working";
@@ -597,7 +596,6 @@ export function parseTuiSnapshot(raw: unknown): TuiSnapshot {
       parseTuiChoice(entry, `TuiSnapshot.choices[${idx}]`),
     ),
     guard,
-    snapshot_hash: requireNumber(obj, "snapshot_hash", "TuiSnapshot"),
   };
 }
 
@@ -1348,15 +1346,9 @@ export function reduceAction(
 // RBAC Visibility & Fail-Closed Action Capability Evaluators
 // ---------------------------------------------------------------------------
 
-/** `ReadOnlyViewer` cannot toggle `?all=true` or view External terminals. */
-export function effectiveIncludeAll(
-  role: SessionRole,
-  requestedAll: boolean,
-): boolean {
-  return role.kind === "viewer" ? false : requestedAll;
-}
-
-/** Client-side defense-in-depth mirror of `DiscoveryScope::SpawnManagedOnly`. */
+/** Client-side defense-in-depth mirror of `DiscoveryScope::SpawnManagedOnly`.
+ * Note: `?all=true` controls `include_exited` on the server while External
+ * visibility is strictly governed by the caller's RBAC principal. */
 export function visibleAgentsForRole(
   agents: readonly DiscoveredTerminal[],
   role: SessionRole,
@@ -1396,8 +1388,9 @@ export function evaluateActionCapabilities(
   role: SessionRole,
   serverReadOnlyRefused: boolean,
   snapshotState: SnapshotLoadState,
+  selectedAddress: string | null,
 ): ActionCapabilities {
-  const snapshot = snapshotFromState(snapshotState);
+  const snapshot = snapshotFromState(snapshotState, selectedAddress);
   const terminalExited = snapshot !== null && snapshot.live_state.state === "exited";
   const selectionObservable =
     snapshot !== null && snapshot.fidelity.fidelity === "styled_vt";
@@ -1470,9 +1463,24 @@ export function evaluateActionCapabilities(
   };
 }
 
-export function snapshotFromState(state: SnapshotLoadState): TuiSnapshot | null {
-  if (state.kind === "ready") return state.snapshot;
-  if (state.kind === "loading" || state.kind === "error") return state.previous;
+export function snapshotFromState(
+  state: SnapshotLoadState,
+  selectedAddress: string | null,
+): TuiSnapshot | null {
+  if (selectedAddress === null) return null;
+  if (state.kind === "ready") {
+    return state.address === selectedAddress &&
+      state.snapshot.address === selectedAddress
+      ? state.snapshot
+      : null;
+  }
+  if (state.kind === "loading" || state.kind === "error") {
+    return state.address === selectedAddress &&
+      state.previous !== null &&
+      state.previous.address === selectedAddress
+      ? state.previous
+      : null;
+  }
   return null;
 }
 
