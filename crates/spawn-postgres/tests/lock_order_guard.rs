@@ -2,17 +2,33 @@
 //! hierarchy (`L1 -> L0 -> L2 -> L3`), zero occurrences of the retired global
 //! lock `1399957335`, mandatory unconditional `perform spawn_lock_migrate_shared();`
 //! before DML or inner locks in non-trigger functions, forbidden dynamic DML /
-//! advisory lock strings in `EXECUTE`, and unconditional `blocking L3 + commit_xid`
-//! protection on every `spawn_events` write across **all** declared functions.
+//! advisory lock strings in `EXECUTE`, and unconditional transaction-scoped
+//! blocking `L3 + commit_xid` protection on every `spawn_events` write across
+//! **all** declared functions.
 //!
-//! Scope boundary: monotonic lock-order verification (`L1 -> L0 -> L2 -> L3`)
-//! inspects sequential lock acquisitions intra-procedurally within each
-//! individual function or `DO` block (it does not trace cross-function call
-//! graphs). Trigger functions (`RETURNS TRIGGER`) are exempt from self-acquiring
-//! `L0` (`spawn_lock_migrate_shared()`) because they fire inside an outer DML
-//! statement that already holds `L0`, **but trigger functions are still audited
-//! for monotonic lock ordering, zero retired `1399957335`, dynamic `EXECUTE`,
-//! and `spawn_events` write rules**.
+//! Scope boundaries and explicit assumptions:
+//! - **Intra-procedural order**: monotonic lock-order verification (`L1 -> L0 -> L2 -> L3`)
+//!   inspects sequential lock acquisitions within each individual function or `DO`
+//!   block (it does not trace cross-function call graphs). Trigger functions
+//!   (`RETURNS TRIGGER`) are exempt from self-acquiring `L0` (`spawn_lock_migrate_shared()`)
+//!   because they fire inside an outer DML statement that already holds `L0`,
+//!   **but trigger functions are still audited for monotonic lock ordering, zero
+//!   retired `1399957335`, dynamic `EXECUTE`, and `spawn_events` write rules**.
+//! - **Top-level statements & `DO` blocks**: writes to `spawn_events` outside
+//!   declared functions (top-level `sql/schema.sql` statements and `DO` blocks)
+//!   are exempt from `L3` under the explicit assumption that `schema.sql` bootstrap
+//!   and migrations execute under the exclusive bootstrap `L0` lock (`1399957400`)
+//!   acquired before the first `CREATE TABLE`, which blocks all concurrent
+//!   writers (every writer function acquires shared `L0`). `spawn_events_writers`
+//!   covers all declared SQL/PLpgSQL functions; `CREATE PROCEDURE` and unparseable
+//!   or non-dollar-quoted routines fail closed with `UnparseableRoutine`.
+//! - **Dynamic `EXECUTE`**: all PL/pgSQL `EXECUTE` forms (`EXECUTE`,
+//!   `RETURN QUERY EXECUTE`, `FOR ... IN EXECUTE`, `OPEN ... FOR EXECUTE`) are
+//!   audited, and non-literal or concatenated command expressions (`EXECUTE var`,
+//!   `EXECUTE 'select ' || var`, `EXECUTE var USING ...`) are rejected fail-closed.
+//!   Runtime values interpolated via `%s`/`%I`/`%L` into `EXECUTE format('<literal>', ...)`
+//!   remain an explicit static boundary unless string literals in those arguments
+//!   themselves contain forbidden DML/advisory-lock keywords.
 
 use std::fmt;
 
@@ -178,13 +194,19 @@ enum Violation {
         insert_line: usize,
         detail: String,
     },
+    UnparseableRoutine {
+        kind: &'static str,
+        name: String,
+        line: usize,
+        reason: String,
+    },
     UnusedExemption {
         function: String,
     },
 }
 
-impl fmt::Display for Violation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Violation {
+    fn fmt_core_detail(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RetiredGlobalLock { line, snippet } => {
                 write!(
@@ -192,12 +214,10 @@ impl fmt::Display for Violation {
                     "line {line}: retired lock {RETIRED_GLOBAL_LOCK}: {snippet}"
                 )
             }
-            Self::MissingExclusiveBootstrapLock => {
-                write!(
-                    f,
-                    "missing L0 exclusive lock ({LOCK_L0_MIGRATE}) before first CREATE TABLE"
-                )
-            }
+            Self::MissingExclusiveBootstrapLock => write!(
+                f,
+                "missing L0 exclusive lock ({LOCK_L0_MIGRATE}) before first CREATE TABLE"
+            ),
             Self::MissingMigrateSharedLock {
                 function,
                 line,
@@ -206,12 +226,10 @@ impl fmt::Display for Violation {
                 f,
                 "{function} (L{line}): missing spawn_lock_migrate_shared() ({reason})"
             ),
-            Self::ConditionalMigrateSharedLock { function, line } => {
-                write!(
-                    f,
-                    "{function} (L{line}): spawn_lock_migrate_shared() called only inside conditional scope"
-                )
-            }
+            Self::ConditionalMigrateSharedLock { function, line } => write!(
+                f,
+                "{function} (L{line}): spawn_lock_migrate_shared() called only inside conditional scope"
+            ),
             Self::MigrateSharedLockAfterDml {
                 function,
                 l0_line,
@@ -240,6 +258,14 @@ impl fmt::Display for Violation {
                 f,
                 "{scope}: invalid lock order {prev} (L{prev_line}) -> {next} (L{next_line})"
             ),
+            _ => unreachable!("handled in Display::fmt"),
+        }
+    }
+}
+
+impl fmt::Display for Violation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
             Self::UnknownAdvisoryLock { scope, line, call } => {
                 write!(
                     f,
@@ -271,12 +297,22 @@ impl fmt::Display for Violation {
                 f,
                 "{function} (L{insert_line}): INSERT INTO spawn_events bad commit_xid: {detail}"
             ),
+            Self::UnparseableRoutine {
+                kind,
+                name,
+                line,
+                reason,
+            } => write!(
+                f,
+                "{kind} `{name}` (L{line}): unparseable routine rejected fail-closed ({reason})"
+            ),
             Self::UnusedExemption { function } => {
                 write!(
                     f,
                     "exempt function `{function}` is missing or no longer exempt"
                 )
             }
+            _ => self.fmt_core_detail(f),
         }
     }
 }
@@ -564,24 +600,60 @@ fn split_statements(tokens: &[Token]) -> Vec<&[Token]> {
         .collect()
 }
 
-fn extract_schema(sql: &str) -> ExtractedSchema {
+fn extract_schema(sql: &str, violations: &mut Vec<Violation>) -> ExtractedSchema {
     let tokens = lex_sql(sql, 1);
     let mut extracted = ExtractedSchema::default();
-    process_statement_stream(&tokens, true, &mut extracted);
+    process_statement_stream(&tokens, true, &mut extracted, violations);
     extracted
 }
 
-fn process_statement_stream(tokens: &[Token], top_level: bool, extracted: &mut ExtractedSchema) {
+fn process_statement_stream(
+    tokens: &[Token],
+    top_level: bool,
+    extracted: &mut ExtractedSchema,
+    violations: &mut Vec<Violation>,
+) {
     for stmt in split_statements(tokens) {
-        if let Some(func) = try_parse_function(stmt) {
-            extracted.functions.push(func);
-            continue;
+        match parse_routine(stmt) {
+            RoutineParse::Parsed(func) => {
+                extracted.functions.push(func);
+                continue;
+            }
+            RoutineParse::Unparseable {
+                kind,
+                name,
+                line,
+                reason,
+            } => {
+                violations.push(Violation::UnparseableRoutine {
+                    kind,
+                    name,
+                    line,
+                    reason,
+                });
+                continue;
+            }
+            RoutineParse::NotARoutine => {}
         }
-        if top_level && let Some(do_block) = try_parse_do_block(stmt) {
-            inspect_table_defaults_in_tokens(&do_block.body_tokens, extracted);
-            collect_nested_dollar_functions(&do_block.body_tokens, extracted);
-            extracted.do_blocks.push(do_block);
-            continue;
+        if top_level {
+            match parse_do_block(stmt) {
+                DoBlockParse::Parsed(do_block) => {
+                    inspect_table_defaults_in_tokens(&do_block.body_tokens, extracted);
+                    collect_nested_dollar_functions(&do_block.body_tokens, extracted, violations);
+                    extracted.do_blocks.push(do_block);
+                    continue;
+                }
+                DoBlockParse::Unparseable { line, reason } => {
+                    violations.push(Violation::UnparseableRoutine {
+                        kind: "do",
+                        name: format!("DO@L{line}"),
+                        line,
+                        reason,
+                    });
+                    continue;
+                }
+                DoBlockParse::NotADo => {}
+            }
         }
         inspect_table_default_stmt(stmt, extracted);
         if top_level
@@ -596,7 +668,11 @@ fn process_statement_stream(tokens: &[Token], top_level: bool, extracted: &mut E
     }
 }
 
-fn collect_nested_dollar_functions(tokens: &[Token], extracted: &mut ExtractedSchema) {
+fn collect_nested_dollar_functions(
+    tokens: &[Token],
+    extracted: &mut ExtractedSchema,
+    violations: &mut Vec<Violation>,
+) {
     for tok in tokens {
         if let TokenKind::DollarQuoted {
             body,
@@ -604,7 +680,7 @@ fn collect_nested_dollar_functions(tokens: &[Token], extracted: &mut ExtractedSc
         } = &tok.kind
         {
             let nested = lex_sql(body, *body_start_line);
-            process_statement_stream(&nested, false, extracted);
+            process_statement_stream(&nested, false, extracted, violations);
         }
     }
 }
@@ -731,10 +807,27 @@ fn is_pg_current_xact_id_call(tokens: &[Token]) -> bool {
         && matches!(tokens[2].kind, TokenKind::RParen)
 }
 
-fn try_parse_function(stmt: &[Token]) -> Option<ParsedFunction> {
+enum RoutineParse {
+    NotARoutine,
+    Parsed(ParsedFunction),
+    Unparseable {
+        kind: &'static str,
+        name: String,
+        line: usize,
+        reason: String,
+    },
+}
+
+enum DoBlockParse {
+    NotADo,
+    Parsed(ParsedDoBlock),
+    Unparseable { line: usize, reason: String },
+}
+
+fn parse_routine(stmt: &[Token]) -> RoutineParse {
     let mut idx = 0;
-    if !stmt.get(idx)?.is_word("create") {
-        return None;
+    if !stmt.get(idx).is_some_and(|t| t.is_word("create")) {
+        return RoutineParse::NotARoutine;
     }
     idx += 1;
     if stmt.get(idx).is_some_and(|t| t.is_word("or"))
@@ -742,65 +835,127 @@ fn try_parse_function(stmt: &[Token]) -> Option<ParsedFunction> {
     {
         idx += 2;
     }
-    if !stmt.get(idx)?.is_word("function") {
-        return None;
-    }
-    idx += 1;
-    idx = skip_schema_prefix(stmt, idx);
-    let name = stmt.get(idx)?.as_word()?.to_string();
+    let Some(kind_word) = stmt.get(idx).and_then(Token::as_word) else {
+        return RoutineParse::NotARoutine;
+    };
     let line = stmt[0].line;
+    if kind_word == "procedure" {
+        let name_idx = skip_schema_prefix(stmt, idx + 1);
+        let name = stmt
+            .get(name_idx)
+            .and_then(Token::as_word)
+            .unwrap_or("<anonymous>")
+            .to_string();
+        return RoutineParse::Unparseable {
+            kind: "procedure",
+            name,
+            line,
+            reason: "CREATE PROCEDURE is rejected fail-closed (procedures may COMMIT/ROLLBACK mid-body and release xact locks)".to_string(),
+        };
+    }
+    if kind_word != "function" {
+        return RoutineParse::NotARoutine;
+    }
+    parse_function_body(stmt, idx + 1, line)
+}
 
-    let lparen = idx
-        + stmt[idx..]
-            .iter()
-            .position(|t| matches!(t.kind, TokenKind::LParen))?;
-    let rparen = find_matching_paren(stmt, lparen)?;
-    let as_pos = rparen
-        + 1
-        + stmt[rparen + 1..].windows(2).position(|pair| {
-            pair[0].is_word("as") && matches!(pair[1].kind, TokenKind::DollarQuoted { .. })
-        })?;
+fn parse_function_body(stmt: &[Token], idx: usize, line: usize) -> RoutineParse {
+    let name_idx = skip_schema_prefix(stmt, idx);
+    let Some(name) = stmt
+        .get(name_idx)
+        .and_then(Token::as_word)
+        .map(str::to_string)
+    else {
+        return RoutineParse::Unparseable {
+            kind: "function",
+            name: "<anonymous>".to_string(),
+            line,
+            reason: "missing function name".to_string(),
+        };
+    };
+    let Some(lparen_rel) = stmt[name_idx..]
+        .iter()
+        .position(|t| matches!(t.kind, TokenKind::LParen))
+    else {
+        return RoutineParse::Unparseable {
+            kind: "function",
+            name,
+            line,
+            reason: "missing function parameter list".to_string(),
+        };
+    };
+    let lparen = name_idx + lparen_rel;
+    let Some(rparen) = find_matching_paren(stmt, lparen) else {
+        return RoutineParse::Unparseable {
+            kind: "function",
+            name,
+            line,
+            reason: "unbalanced parameter list parentheses".to_string(),
+        };
+    };
+    let Some(as_rel) = stmt[rparen + 1..].windows(2).position(|pair| {
+        pair[0].is_word("as") && matches!(pair[1].kind, TokenKind::DollarQuoted { .. })
+    }) else {
+        return RoutineParse::Unparseable {
+            kind: "function",
+            name,
+            line,
+            reason: "function body must use dollar-quoted AS $tag$...$tag$ (single-quoted or SQL-standard bodies fail closed)".to_string(),
+        };
+    };
+    let as_pos = rparen + 1 + as_rel;
     let header_tail = &stmt[rparen + 1..as_pos];
     let is_trigger = header_tail
         .windows(2)
         .any(|pair| pair[0].is_word("returns") && pair[1].is_word("trigger"));
 
-    let (body, body_start_line) = match &stmt.get(as_pos + 1)?.kind {
-        TokenKind::DollarQuoted {
-            body,
-            body_start_line,
-        } => (body.as_str(), *body_start_line),
-        _ => return None,
+    let TokenKind::DollarQuoted {
+        body,
+        body_start_line,
+    } = &stmt[as_pos + 1].kind
+    else {
+        unreachable!();
     };
 
-    Some(ParsedFunction {
+    RoutineParse::Parsed(ParsedFunction {
         name,
         line,
         is_trigger,
-        body_tokens: lex_sql(body, body_start_line),
+        body_tokens: lex_sql(body, *body_start_line),
     })
 }
 
-fn try_parse_do_block(stmt: &[Token]) -> Option<ParsedDoBlock> {
-    if !stmt.first()?.is_word("do") {
-        return None;
+fn parse_do_block(stmt: &[Token]) -> DoBlockParse {
+    let Some(first) = stmt.first() else {
+        return DoBlockParse::NotADo;
+    };
+    if !first.is_word("do") {
+        return DoBlockParse::NotADo;
     }
     let mut idx = 1;
     if stmt.get(idx).is_some_and(|t| t.is_word("language")) {
         idx += 2;
     }
-    let tok = stmt.get(idx)?;
-    let (body, body_start_line) = match &tok.kind {
-        TokenKind::DollarQuoted {
-            body,
-            body_start_line,
-        } => (body.as_str(), *body_start_line),
-        _ => return None,
+    let Some(tok) = stmt.get(idx) else {
+        return DoBlockParse::Unparseable {
+            line: first.line,
+            reason: "DO block is missing body".to_string(),
+        };
     };
-    Some(ParsedDoBlock {
-        line: stmt[0].line,
-        offset: stmt[0].offset,
-        body_tokens: lex_sql(body, body_start_line),
+    let TokenKind::DollarQuoted {
+        body,
+        body_start_line,
+    } = &tok.kind
+    else {
+        return DoBlockParse::Unparseable {
+            line: first.line,
+            reason: "DO block body must be dollar-quoted".to_string(),
+        };
+    };
+    DoBlockParse::Parsed(ParsedDoBlock {
+        line: first.line,
+        offset: first.offset,
+        body_tokens: lex_sql(body, *body_start_line),
     })
 }
 
@@ -821,13 +976,34 @@ fn find_matching_paren(tokens: &[Token], open_idx: usize) -> Option<usize> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockStrength {
+    ExclusiveBlocking,
+    SharedBlocking,
+    TryExclusive,
+    TryShared,
+}
+
+impl LockStrength {
+    const fn is_blocking(self) -> bool {
+        matches!(self, Self::ExclusiveBlocking | Self::SharedBlocking)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockScope {
+    Transaction,
+    Session,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LockAcquisition {
     token_idx: usize,
     line: usize,
     tier: AdvisoryLockTier,
     cond_depth: usize,
-    blocking: bool,
+    strength: LockStrength,
+    scope: LockScope,
 }
 
 #[derive(Debug, Clone)]
@@ -845,34 +1021,50 @@ struct BodyScan {
     unconditional_l3_ready_at: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TryLockFallbackState {
+    Pending,
+    Acquired,
+    Voided,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScopeFrame {
-    Block {
-        in_exception: bool,
+    BlockBody {
+        lock_start: usize,
+        l3_ready_start: usize,
     },
+    BlockException,
     If,
     TryLockL3Fallback {
-        xact_scoped: bool,
         key_tokens: Vec<TokenKind>,
-        fallback_acquired: bool,
-        saw_elsif_or_else: bool,
+        state: TryLockFallbackState,
     },
     CaseStmt,
     CaseExpr,
     Loop,
 }
 
+struct ScanState {
+    stack: Vec<ScopeFrame>,
+    scan: BodyScan,
+    at_stmt_start: bool,
+}
+
+impl ScanState {
+    fn new() -> Self {
+        Self {
+            stack: Vec::new(),
+            scan: BodyScan::default(),
+            at_stmt_start: true,
+        }
+    }
+}
+
 fn cond_depth(stack: &[ScopeFrame]) -> usize {
     stack
         .iter()
-        .filter(|frame| {
-            !matches!(
-                frame,
-                ScopeFrame::Block {
-                    in_exception: false
-                }
-            )
-        })
+        .filter(|frame| !matches!(frame, ScopeFrame::BlockBody { .. }))
         .count()
 }
 
@@ -922,12 +1114,9 @@ fn try_match_l3_trylock_condition(tokens: &[Token], if_idx: usize) -> Option<Sco
     if !cond.first()?.is_word("not") {
         return None;
     }
-    let fn_name = cond.get(1)?.as_word()?;
-    let xact_scoped = match fn_name {
-        "pg_try_advisory_xact_lock" => true,
-        "pg_try_advisory_lock" => false,
-        _ => return None,
-    };
+    if cond.get(1)?.as_word()? != "pg_try_advisory_xact_lock" {
+        return None;
+    }
     if !matches!(cond.get(2).map(|t| &t.kind), Some(TokenKind::LParen)) {
         return None;
     }
@@ -945,72 +1134,143 @@ fn try_match_l3_trylock_condition(tokens: &[Token], if_idx: usize) -> Option<Sco
         return None;
     }
     Some(ScopeFrame::TryLockL3Fallback {
-        xact_scoped,
         key_tokens: args[1].iter().map(|t| t.kind.clone()).collect(),
-        fallback_acquired: false,
-        saw_elsif_or_else: false,
+        state: TryLockFallbackState::Pending,
     })
+}
+
+fn is_dynamic_execute(tokens: &[Token], i: usize, after_dot: bool) -> bool {
+    if after_dot || !tokens[i].is_word("execute") {
+        return false;
+    }
+    let prev = i.checked_sub(1).and_then(|idx| tokens.get(idx));
+    if prev.is_some_and(|t| t.is_word("grant") || t.is_word("revoke")) {
+        return false;
+    }
+    let is_trigger_exec = tokens
+        .get(i + 1)
+        .is_some_and(|t| t.is_word("function") || t.is_word("procedure"))
+        && tokens
+            .get(skip_schema_prefix(tokens, i + 2) + 1)
+            .is_some_and(|t| matches!(t.kind, TokenKind::LParen));
+    !is_trigger_exec
+}
+
+fn scan_dynamic_sql_text(scope: &str, text: &str, line: usize, violations: &mut Vec<Violation>) {
+    for sub in lex_sql(text, line) {
+        if let Some(word) = sub.as_word()
+            && (matches!(
+                word,
+                "insert" | "update" | "delete" | "truncate" | "merge" | "spawn_events"
+            ) || word.starts_with("pg_advisory"))
+        {
+            violations.push(Violation::ForbiddenDynamicSql {
+                scope: scope.to_string(),
+                line: sub.line,
+                detail: format!("dynamic EXECUTE contains forbidden keyword `{word}`"),
+            });
+        }
+    }
+}
+
+fn concat_string_literals(tokens: &[Token]) -> Option<(String, usize)> {
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut combined = String::new();
+    for tok in tokens {
+        match &tok.kind {
+            TokenKind::SingleQuoted(s) => combined.push_str(s),
+            TokenKind::DollarQuoted { body, .. } => combined.push_str(body),
+            _ => return None,
+        }
+    }
+    Some((combined, tokens[0].line))
 }
 
 fn check_dynamic_execute(scope: &str, tokens: &[Token], i: usize, violations: &mut Vec<Violation>) {
     let exec_line = tokens[i].line;
-    let mut saw_literal = false;
-    for tok in &tokens[i + 1..] {
-        if matches!(tok.kind, TokenKind::Semicolon) {
-            break;
-        }
-        let body = match &tok.kind {
-            TokenKind::SingleQuoted(s) => s.as_str(),
-            TokenKind::DollarQuoted { body, .. } => body.as_str(),
-            _ => continue,
-        };
-        saw_literal = true;
-        for sub in lex_sql(body, tok.line) {
-            if let Some(word) = sub.as_word()
-                && (matches!(
-                    word,
-                    "insert" | "update" | "delete" | "truncate" | "merge" | "spawn_events"
-                ) || word.starts_with("pg_advisory"))
-            {
-                violations.push(Violation::ForbiddenDynamicSql {
-                    scope: scope.to_string(),
-                    line: sub.line,
-                    detail: format!("dynamic EXECUTE contains forbidden keyword `{word}`"),
-                });
+    let mut paren_depth = 0_usize;
+    let mut expr_end = tokens.len();
+    for (offset, tok) in tokens[i + 1..].iter().enumerate() {
+        match tok.kind {
+            TokenKind::LParen => paren_depth += 1,
+            TokenKind::RParen => paren_depth = paren_depth.saturating_sub(1),
+            TokenKind::Semicolon if paren_depth == 0 => {
+                expr_end = i + 1 + offset;
+                break;
             }
+            _ if paren_depth == 0
+                && (tok.is_word("loop") || tok.is_word("into") || tok.is_word("using")) =>
+            {
+                expr_end = i + 1 + offset;
+                break;
+            }
+            _ => {}
         }
     }
-    if !saw_literal {
-        violations.push(Violation::ForbiddenDynamicSql {
-            scope: scope.to_string(),
-            line: exec_line,
-            detail: "opaque dynamic EXECUTE without literal SQL".to_string(),
-        });
+    let expr = &tokens[i + 1..expr_end];
+    if let Some((text, line)) = concat_string_literals(expr) {
+        scan_dynamic_sql_text(scope, &text, line, violations);
+        return;
     }
+    if expr.len() >= 3
+        && expr[0].is_word("format")
+        && matches!(expr[1].kind, TokenKind::LParen)
+        && find_matching_paren(expr, 1) == Some(expr.len() - 1)
+    {
+        let args = split_top_level_commas(&expr[2..expr.len() - 1]);
+        if let Some((fmt_text, fmt_line)) = args.first().and_then(|a| concat_string_literals(a)) {
+            scan_dynamic_sql_text(scope, &fmt_text, fmt_line, violations);
+            for arg in &args[1..] {
+                for tok in *arg {
+                    match &tok.kind {
+                        TokenKind::SingleQuoted(s) => {
+                            scan_dynamic_sql_text(scope, s, tok.line, violations);
+                        }
+                        TokenKind::DollarQuoted {
+                            body,
+                            body_start_line,
+                        } => {
+                            scan_dynamic_sql_text(scope, body, *body_start_line, violations);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            violations.push(Violation::ForbiddenDynamicSql {
+                scope: scope.to_string(),
+                line: exec_line,
+                detail: "dynamic EXECUTE format(...) requires a literal SQL template".to_string(),
+            });
+        }
+        return;
+    }
+    violations.push(Violation::ForbiddenDynamicSql {
+        scope: scope.to_string(),
+        line: exec_line,
+        detail: "dynamic EXECUTE expression must be a string literal or format('<literal>', ...)"
+            .to_string(),
+    });
 }
 
 fn handle_end_keyword(
     scope: &str,
     tokens: &[Token],
     i: usize,
-    stack: &mut Vec<ScopeFrame>,
-    scan: &mut BodyScan,
+    state: &mut ScanState,
     violations: &mut Vec<Violation>,
 ) -> usize {
     let line = tokens[i].line;
     let next = tokens.get(i + 1);
     if next.is_some_and(|t| t.is_word("if")) {
-        match stack.pop() {
-            Some(ScopeFrame::If) => {}
+        match state.stack.pop() {
             Some(ScopeFrame::TryLockL3Fallback {
-                fallback_acquired,
-                saw_elsif_or_else,
+                state: TryLockFallbackState::Acquired,
                 ..
-            }) => {
-                if fallback_acquired && !saw_elsif_or_else {
-                    scan.unconditional_l3_ready_at.push(i + 1);
-                }
-            }
+            }) => state.scan.unconditional_l3_ready_at.push(i + 1),
+            Some(ScopeFrame::If | ScopeFrame::TryLockL3Fallback { .. }) => {}
             other => violations.push(Violation::UnbalancedControlFlow {
                 scope: scope.to_string(),
                 line,
@@ -1020,7 +1280,7 @@ fn handle_end_keyword(
         return i + 2;
     }
     if next.is_some_and(|t| t.is_word("case")) {
-        match stack.pop() {
+        match state.stack.pop() {
             Some(ScopeFrame::CaseStmt) => {}
             other => violations.push(Violation::UnbalancedControlFlow {
                 scope: scope.to_string(),
@@ -1031,7 +1291,7 @@ fn handle_end_keyword(
         return i + 2;
     }
     if next.is_some_and(|t| t.is_word("loop")) {
-        match stack.pop() {
+        match state.stack.pop() {
             Some(ScopeFrame::Loop) => {}
             other => violations.push(Violation::UnbalancedControlFlow {
                 scope: scope.to_string(),
@@ -1041,8 +1301,8 @@ fn handle_end_keyword(
         }
         return i + 2;
     }
-    match stack.pop() {
-        Some(ScopeFrame::CaseExpr | ScopeFrame::Block { .. }) => {}
+    match state.stack.pop() {
+        Some(ScopeFrame::CaseExpr | ScopeFrame::BlockBody { .. } | ScopeFrame::BlockException) => {}
         other => violations.push(Violation::UnbalancedControlFlow {
             scope: scope.to_string(),
             line,
@@ -1052,107 +1312,125 @@ fn handle_end_keyword(
     i + 1
 }
 
+fn handle_exception_keyword(
+    scope: &str,
+    line: usize,
+    state: &mut ScanState,
+    violations: &mut Vec<Violation>,
+) {
+    if let Some(frame) = state.stack.last_mut()
+        && let ScopeFrame::BlockBody {
+            lock_start,
+            l3_ready_start,
+        } = *frame
+    {
+        // PostgreSQL runs a BEGIN ... EXCEPTION ... END block in a subtransaction:
+        // taking the EXCEPTION handler rolls back and releases every xact lock
+        // acquired inside the block body, so downgrade those locks retroactively.
+        for lock in &mut state.scan.locks[lock_start..] {
+            lock.cond_depth += 1;
+        }
+        state
+            .scan
+            .unconditional_l3_ready_at
+            .truncate(l3_ready_start);
+        *frame = ScopeFrame::BlockException;
+    } else {
+        violations.push(Violation::UnbalancedControlFlow {
+            scope: scope.to_string(),
+            line,
+            detail: "EXCEPTION without enclosing BEGIN block".to_string(),
+        });
+    }
+    state.at_stmt_start = false;
+}
+
 fn handle_control_word(
     scope: &str,
     tokens: &[Token],
     i: usize,
-    at_stmt_start: &mut bool,
-    stack: &mut Vec<ScopeFrame>,
+    state: &mut ScanState,
     violations: &mut Vec<Violation>,
 ) {
     let Some(word) = tokens[i].as_word() else {
-        *at_stmt_start = false;
+        state.at_stmt_start = false;
         return;
     };
     let prev = i.checked_sub(1).and_then(|idx| tokens.get(idx));
-    let stmt_start = *at_stmt_start;
+    let stmt_start = state.at_stmt_start;
     match word {
         "declare" if stmt_start => {
-            *at_stmt_start = true;
+            state.at_stmt_start = true;
         }
         "begin" if stmt_start => {
-            stack.push(ScopeFrame::Block {
-                in_exception: false,
+            state.stack.push(ScopeFrame::BlockBody {
+                lock_start: state.scan.locks.len(),
+                l3_ready_start: state.scan.unconditional_l3_ready_at.len(),
             });
-            *at_stmt_start = true;
+            state.at_stmt_start = true;
         }
         "exception" if stmt_start && !prev.is_some_and(|t| t.is_word("raise")) => {
-            if let Some(ScopeFrame::Block { in_exception }) = stack
-                .iter_mut()
-                .rev()
-                .find(|frame| matches!(frame, ScopeFrame::Block { .. }))
-            {
-                *in_exception = true;
-            } else {
-                violations.push(Violation::UnbalancedControlFlow {
-                    scope: scope.to_string(),
-                    line: tokens[i].line,
-                    detail: "EXCEPTION without enclosing BEGIN block".to_string(),
-                });
-            }
-            *at_stmt_start = false;
+            handle_exception_keyword(scope, tokens[i].line, state, violations);
         }
         "if" if stmt_start => {
-            let frame = if cond_depth(stack) == 0 {
+            let frame = if cond_depth(&state.stack) == 0 {
                 try_match_l3_trylock_condition(tokens, i).unwrap_or(ScopeFrame::If)
             } else {
                 ScopeFrame::If
             };
-            stack.push(frame);
-            *at_stmt_start = false;
+            state.stack.push(frame);
+            state.at_stmt_start = false;
         }
         "elsif" | "elseif" if stmt_start => {
             if let Some(ScopeFrame::TryLockL3Fallback {
-                saw_elsif_or_else, ..
-            }) = stack.last_mut()
+                state: fallback, ..
+            }) = state.stack.last_mut()
             {
-                *saw_elsif_or_else = true;
+                *fallback = TryLockFallbackState::Voided;
             }
-            *at_stmt_start = false;
+            state.at_stmt_start = false;
         }
         "case" => {
-            stack.push(if stmt_start {
+            state.stack.push(if stmt_start {
                 ScopeFrame::CaseStmt
             } else {
                 ScopeFrame::CaseExpr
             });
-            *at_stmt_start = false;
+            state.at_stmt_start = false;
         }
         "loop" => {
-            stack.push(ScopeFrame::Loop);
-            *at_stmt_start = true;
+            state.stack.push(ScopeFrame::Loop);
+            state.at_stmt_start = true;
         }
         "then" => {
-            *at_stmt_start = matches!(
-                stack.last(),
+            state.at_stmt_start = matches!(
+                state.stack.last(),
                 Some(
                     ScopeFrame::If
                         | ScopeFrame::TryLockL3Fallback { .. }
                         | ScopeFrame::CaseStmt
-                        | ScopeFrame::Block { in_exception: true }
+                        | ScopeFrame::BlockException
                 )
             );
         }
         "else" => {
             if let Some(ScopeFrame::TryLockL3Fallback {
-                saw_elsif_or_else, ..
-            }) = stack.last_mut()
+                state: fallback, ..
+            }) = state.stack.last_mut()
             {
-                *saw_elsif_or_else = true;
+                *fallback = TryLockFallbackState::Voided;
             }
-            *at_stmt_start = matches!(
-                stack.last(),
+            state.at_stmt_start = matches!(
+                state.stack.last(),
                 Some(ScopeFrame::If | ScopeFrame::TryLockL3Fallback { .. } | ScopeFrame::CaseStmt)
             );
         }
-        _ => *at_stmt_start = false,
+        _ => state.at_stmt_start = false,
     }
 }
 
 fn scan_body_events(scope: &str, tokens: &[Token], violations: &mut Vec<Violation>) -> BodyScan {
-    let mut scan = BodyScan::default();
-    let mut stack = Vec::new();
-    let mut at_stmt_start = true;
+    let mut state = ScanState::new();
     let mut i = 0;
 
     while i < tokens.len() {
@@ -1161,7 +1439,7 @@ fn scan_body_events(scope: &str, tokens: &[Token], violations: &mut Vec<Violatio
             continue;
         }
         if matches!(tokens[i].kind, TokenKind::Semicolon) {
-            at_stmt_start = true;
+            state.at_stmt_start = true;
             i += 1;
             continue;
         }
@@ -1170,82 +1448,95 @@ fn scan_body_events(scope: &str, tokens: &[Token], violations: &mut Vec<Violatio
             .and_then(|idx| tokens.get(idx))
             .is_some_and(|t| matches!(t.kind, TokenKind::Dot));
         if !after_dot && tokens[i].is_word("end") {
-            i = handle_end_keyword(scope, tokens, i, &mut stack, &mut scan, violations);
-            at_stmt_start = false;
+            i = handle_end_keyword(scope, tokens, i, &mut state, violations);
+            state.at_stmt_start = false;
             continue;
         }
-        if !after_dot && at_stmt_start && tokens[i].is_word("execute") {
+        if is_dynamic_execute(tokens, i, after_dot) {
             check_dynamic_execute(scope, tokens, i, violations);
-            at_stmt_start = false;
+            state.at_stmt_start = false;
             i += 1;
             continue;
         }
-        if let Some((acq, call_name, second_arg, next_i)) =
-            try_parse_lock_call(scope, tokens, i, cond_depth(&stack), violations)
+        if let Some((acq, second_arg, next_i)) =
+            try_parse_lock_call(scope, tokens, i, cond_depth(&state.stack), violations)
         {
-            if cond_depth(&stack) == 1 {
-                record_trylock_fallback_hit(&mut stack, acq, call_name, &second_arg);
+            if cond_depth(&state.stack) == 1 {
+                record_trylock_fallback_hit(&mut state.stack, acq, &second_arg);
             }
-            scan.locks.push(acq);
-            at_stmt_start = false;
+            state.scan.locks.push(acq);
+            state.at_stmt_start = false;
             i = next_i;
             continue;
         }
         if let Some(dml) = try_parse_dml(tokens, i) {
-            scan.dmls.push(dml);
+            state.scan.dmls.push(dml);
         }
         if after_dot {
-            at_stmt_start = false;
+            state.at_stmt_start = false;
         } else {
-            handle_control_word(scope, tokens, i, &mut at_stmt_start, &mut stack, violations);
+            handle_control_word(scope, tokens, i, &mut state, violations);
         }
         i += 1;
     }
 
-    if !stack.is_empty() {
+    if !state.stack.is_empty() {
         violations.push(Violation::UnbalancedControlFlow {
             scope: scope.to_string(),
             line: tokens.last().map_or(1, |t| t.line),
-            detail: format!("unclosed control-flow scopes at end of body: {stack:?}"),
+            detail: format!(
+                "unclosed control-flow scopes at end of body: {:?}",
+                state.stack
+            ),
         });
     }
-    scan
+    state.scan
 }
 
 fn record_trylock_fallback_hit(
     stack: &mut [ScopeFrame],
     acq: LockAcquisition,
-    call_name: &str,
     second_arg: &[TokenKind],
 ) {
-    if acq.tier != AdvisoryLockTier::L3Session || !acq.blocking {
+    if acq.tier != AdvisoryLockTier::L3Session
+        || acq.strength != LockStrength::ExclusiveBlocking
+        || acq.scope != LockScope::Transaction
+    {
         return;
     }
-    if let Some(ScopeFrame::TryLockL3Fallback {
-        xact_scoped,
-        key_tokens,
-        fallback_acquired,
-        saw_elsif_or_else: false,
-    }) = stack.last_mut()
+    if let Some(ScopeFrame::TryLockL3Fallback { key_tokens, state }) = stack.last_mut()
+        && *state == TryLockFallbackState::Pending
+        && second_arg == key_tokens.as_slice()
     {
-        let expected_call = if *xact_scoped {
-            "pg_advisory_xact_lock"
-        } else {
-            "pg_advisory_lock"
-        };
-        if call_name == expected_call && second_arg == key_tokens.as_slice() {
-            *fallback_acquired = true;
-        }
+        *state = TryLockFallbackState::Acquired;
     }
 }
 
-fn try_parse_lock_call<'a>(
+fn classify_advisory_lock_call(name: &str) -> Option<(LockStrength, LockScope)> {
+    match name {
+        "pg_advisory_xact_lock" => Some((LockStrength::ExclusiveBlocking, LockScope::Transaction)),
+        "pg_advisory_xact_lock_shared" => {
+            Some((LockStrength::SharedBlocking, LockScope::Transaction))
+        }
+        "pg_try_advisory_xact_lock" => Some((LockStrength::TryExclusive, LockScope::Transaction)),
+        "pg_try_advisory_xact_lock_shared" => {
+            Some((LockStrength::TryShared, LockScope::Transaction))
+        }
+        "pg_advisory_lock" => Some((LockStrength::ExclusiveBlocking, LockScope::Session)),
+        "pg_advisory_lock_shared" => Some((LockStrength::SharedBlocking, LockScope::Session)),
+        "pg_try_advisory_lock" => Some((LockStrength::TryExclusive, LockScope::Session)),
+        "pg_try_advisory_lock_shared" => Some((LockStrength::TryShared, LockScope::Session)),
+        _ => None,
+    }
+}
+
+fn try_parse_lock_call(
     scope: &str,
-    tokens: &'a [Token],
+    tokens: &[Token],
     i: usize,
     cond_depth: usize,
     violations: &mut Vec<Violation>,
-) -> Option<(LockAcquisition, &'a str, Vec<TokenKind>, usize)> {
+) -> Option<(LockAcquisition, Vec<TokenKind>, usize)> {
     let name = tokens[i].as_word()?;
     if !matches!(tokens.get(i + 1).map(|t| &t.kind), Some(TokenKind::LParen)) {
         return None;
@@ -1260,27 +1551,17 @@ fn try_parse_lock_call<'a>(
                 line,
                 tier: AdvisoryLockTier::L0SchemaMigrate,
                 cond_depth,
-                blocking: true,
+                strength: LockStrength::SharedBlocking,
+                scope: LockScope::Transaction,
             },
-            name,
             Vec::new(),
             close + 1,
         ));
     }
 
     let is_unlock = matches!(name, "pg_advisory_unlock" | "pg_advisory_unlock_shared");
-    let is_lock = matches!(
-        name,
-        "pg_advisory_xact_lock"
-            | "pg_advisory_xact_lock_shared"
-            | "pg_try_advisory_xact_lock"
-            | "pg_try_advisory_xact_lock_shared"
-            | "pg_advisory_lock"
-            | "pg_advisory_lock_shared"
-            | "pg_try_advisory_lock"
-            | "pg_try_advisory_lock_shared"
-    );
-    if !is_lock && !is_unlock {
+    let lock_kind = classify_advisory_lock_call(name);
+    if !is_unlock && lock_kind.is_none() {
         return None;
     }
 
@@ -1318,15 +1599,16 @@ fn try_parse_lock_call<'a>(
         }
         Some(key) => {
             if let Some(tier) = AdvisoryLockTier::from_lock_key(key) {
+                let (strength, lock_scope) = lock_kind.expect("checked non-unlock lock_kind");
                 Some((
                     LockAcquisition {
                         token_idx: i,
                         line,
                         tier,
                         cond_depth,
-                        blocking: !name.starts_with("pg_try_"),
+                        strength,
+                        scope: lock_scope,
                     },
-                    name,
                     second_arg_kinds,
                     close + 1,
                 ))
@@ -1513,7 +1795,12 @@ fn check_function_l0_rules(
     let first_unconditional_l0 = scan
         .locks
         .iter()
-        .find(|lock| lock.tier == AdvisoryLockTier::L0SchemaMigrate && lock.cond_depth == 0)
+        .find(|lock| {
+            lock.tier == AdvisoryLockTier::L0SchemaMigrate
+                && lock.strength.is_blocking()
+                && lock.scope == LockScope::Transaction
+                && lock.cond_depth == 0
+        })
         .copied();
 
     let Some(l0) = first_unconditional_l0 else {
@@ -1573,7 +1860,8 @@ fn check_spawn_events_write(
 ) {
     let has_unconditional_l3 = scan.locks.iter().any(|lock| {
         lock.tier == AdvisoryLockTier::L3Session
-            && lock.blocking
+            && lock.strength == LockStrength::ExclusiveBlocking
+            && lock.scope == LockScope::Transaction
             && lock.cond_depth == 0
             && lock.token_idx < dml.token_idx
     }) || scan
@@ -1737,7 +2025,7 @@ fn audit_schema_sql(sql: &str) -> Result<AuditSummary, Vec<Violation>> {
         }
     }
 
-    let extracted = extract_schema(sql);
+    let extracted = extract_schema(sql, &mut violations);
     let all_functions: Vec<&ParsedFunction> = extracted.functions.iter().collect();
 
     let mut summary = AuditSummary {
@@ -1794,7 +2082,8 @@ fn check_bootstrap_l0(extracted: &ExtractedSchema, violations: &mut Vec<Violatio
             let scan = scan_body_events(&scope, &block.body_tokens, &mut sink);
             scan.locks.iter().any(|lock| {
                 lock.tier == AdvisoryLockTier::L0SchemaMigrate
-                    && lock.blocking
+                    && lock.strength == LockStrength::ExclusiveBlocking
+                    && lock.scope == LockScope::Transaction
                     && lock.cond_depth == 0
             })
         });
@@ -2612,4 +2901,247 @@ fn mutation_enforces_lock_order_and_retired_lock_on_trigger_functions() {
             .any(|err| matches!(err, Violation::RetiredGlobalLock { .. })),
         "expected RetiredGlobalLock on trigger, got {ret_errs:?}"
     );
+}
+
+#[test]
+fn mutation_rejects_non_statement_start_and_concatenated_dynamic_execute() {
+    let cases = [
+        (
+            "return_query_execute",
+            "create or replace function spawn_r3_ret_exec() returns setof bigint language plpgsql as $$\n\
+             begin\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 return query execute 'delete from mission_tasks returning id';\n\
+             end $$;",
+        ),
+        (
+            "for_in_execute",
+            "create or replace function spawn_r3_for_exec() returns void language plpgsql as $$\n\
+             declare v_r record;\n\
+             begin\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 for v_r in execute 'select pg_advisory_xact_lock(42)' loop null; end loop;\n\
+             end $$;",
+        ),
+        (
+            "open_for_execute",
+            "create or replace function spawn_r3_open_exec() returns void language plpgsql as $$\n\
+             declare v_c refcursor;\n\
+             begin\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 open v_c for execute 'insert into spawn_events (id, commit_xid) values (1, pg_current_xact_id())';\n\
+             end $$;",
+        ),
+        (
+            "concat_execute",
+            "create or replace function spawn_r3_concat_exec(p_tbl text) returns void language plpgsql as $$\n\
+             begin\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 execute 'select count(*) from ' || p_tbl;\n\
+             end $$;",
+        ),
+        (
+            "var_using_execute",
+            "create or replace function spawn_r3_using_exec(p_sql text) returns void language plpgsql as $$\n\
+             begin\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 execute p_sql using 'harmless';\n\
+             end $$;",
+        ),
+    ];
+
+    for (name, fn_sql) in cases {
+        let sql = wrap_with_valid_bootstrap(fn_sql, true);
+        let errs = audit_schema_sql(&sql).expect_err(&format!("{name} must fail"));
+        assert!(
+            errs.iter()
+                .any(|err| matches!(err, Violation::ForbiddenDynamicSql { .. })),
+            "{name}: expected ForbiddenDynamicSql, got {errs:?}"
+        );
+    }
+
+    let safe_loop = wrap_with_valid_bootstrap(
+        "create or replace function spawn_r3_safe_for_exec() returns void language plpgsql as $$\n\
+         declare v_r record;\n\
+         begin\n\
+             perform spawn_lock_migrate_shared();\n\
+             for v_r in execute 'select 1 as x' loop null; end loop;\n\
+         end $$;",
+        true,
+    );
+    audit_schema_sql(&safe_loop).expect("safe FOR ... IN EXECUTE ... LOOP should stay balanced");
+}
+
+#[test]
+fn mutation_rejects_locks_rolled_back_by_exception_subtransactions() {
+    let l0_before_after_end = wrap_with_valid_bootstrap(
+        "create or replace function spawn_r3_exc_l0_after() returns void language plpgsql as $$\n\
+         begin\n\
+             begin\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 perform helper_might_fail();\n\
+             exception when others then null;\n\
+             end;\n\
+             delete from mission_tasks where id = 1;\n\
+         end $$;",
+        true,
+    );
+    let after_end_errs =
+        audit_schema_sql(&l0_before_after_end).expect_err("subtxn-rolled-back L0 must fail");
+    assert!(
+        after_end_errs
+            .iter()
+            .any(|e| matches!(e, Violation::ConditionalMigrateSharedLock { .. })),
+        "expected ConditionalMigrateSharedLock, got {after_end_errs:?}"
+    );
+
+    let l0_same_block_exc_dml = wrap_with_valid_bootstrap(
+        "create or replace function spawn_r3_exc_l0_handler() returns void language plpgsql as $$\n\
+         begin\n\
+             perform spawn_lock_migrate_shared();\n\
+             perform helper_might_fail();\n\
+         exception when others then\n\
+             delete from mission_tasks where id = 1;\n\
+         end $$;",
+        true,
+    );
+    let handler_errs = audit_schema_sql(&l0_same_block_exc_dml)
+        .expect_err("L0 rolled back before EXCEPTION DML handler must fail");
+    assert!(
+        handler_errs
+            .iter()
+            .any(|e| matches!(e, Violation::ConditionalMigrateSharedLock { .. })),
+        "expected ConditionalMigrateSharedLock, got {handler_errs:?}"
+    );
+
+    for (name, l3_stmt) in [
+        (
+            "blocking_l3_in_exc_subtxn",
+            "perform pg_advisory_xact_lock(1399957401, 1);",
+        ),
+        (
+            "trylock_fallback_in_exc_subtxn",
+            "if not pg_try_advisory_xact_lock(1399957401, 1) then perform pg_advisory_xact_lock(1399957401, 1); end if;",
+        ),
+    ] {
+        let l3_subtxn = wrap_with_valid_bootstrap(
+            &format!(
+                "create or replace function spawn_r3_{name}() returns void language plpgsql as $$\n\
+                 begin\n\
+                     perform spawn_lock_migrate_shared();\n\
+                     begin\n\
+                         {l3_stmt}\n\
+                         perform helper_might_fail();\n\
+                     exception when others then null;\n\
+                     end;\n\
+                     insert into spawn_events (id, commit_xid) values (1, pg_current_xact_id());\n\
+                 end $$;"
+            ),
+            true,
+        );
+        let subtxn_errs = audit_schema_sql(&l3_subtxn).expect_err(&format!("{name} must fail"));
+        assert!(
+            subtxn_errs
+                .iter()
+                .any(|e| matches!(e, Violation::SpawnEventsInsertWithoutL3Lock { .. })),
+            "{name}: expected SpawnEventsInsertWithoutL3Lock, got {subtxn_errs:?}"
+        );
+    }
+
+    let outer_l0_safe = wrap_with_valid_bootstrap(
+        "create or replace function spawn_r3_outer_l0_safe() returns void language plpgsql as $$\n\
+         begin\n\
+             perform spawn_lock_migrate_shared();\n\
+             begin perform helper_might_fail(); exception when others then null; end;\n\
+             delete from mission_tasks where id = 1;\n\
+         end $$;",
+        true,
+    );
+    audit_schema_sql(&outer_l0_safe).expect("outer L0 before inner subtxn block should pass");
+}
+
+#[test]
+fn mutation_fails_closed_on_procedures_and_non_dollar_quoted_routines() {
+    let cases = [
+        (
+            "procedure",
+            "evil_proc",
+            "create or replace procedure evil_proc() language plpgsql as $$ begin delete from mission_tasks; end $$;",
+        ),
+        (
+            "procedure",
+            "guarded_proc",
+            "create procedure guarded_proc() language plpgsql as $$ begin perform spawn_lock_migrate_shared(); delete from mission_tasks; end $$;",
+        ),
+        (
+            "function",
+            "evil_sq",
+            "create function evil_sq() returns void language plpgsql as 'begin delete from mission_tasks; end';",
+        ),
+        (
+            "do",
+            "DO@L3",
+            "do 'begin perform pg_advisory_xact_lock(999999999, 1); end';",
+        ),
+    ];
+
+    for (expected_kind, expected_name, stmt_sql) in cases {
+        let sql = wrap_with_valid_bootstrap(stmt_sql, true);
+        let errs = audit_schema_sql(&sql).expect_err(&format!("{expected_name} must fail closed"));
+        assert!(
+            errs.iter().any(|err| matches!(
+                err,
+                Violation::UnparseableRoutine { kind, name, .. }
+                if *kind == expected_kind && name == expected_name
+            )),
+            "expected UnparseableRoutine({expected_kind}, {expected_name}), got {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn mutation_rejects_session_level_and_shared_l3_locks_for_spawn_events() {
+    let cases = [
+        (
+            "session_lock_unlock",
+            "create or replace function spawn_r3_sess_l3() returns void language plpgsql as $$\n\
+             begin\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 perform pg_advisory_lock(1399957401, 1);\n\
+                 perform pg_advisory_unlock(1399957401, 1);\n\
+                 insert into spawn_events (id, commit_xid) values (1, pg_current_xact_id());\n\
+             end $$;",
+        ),
+        (
+            "session_trylock_fallback_unlock",
+            "create or replace function spawn_r3_sess_try_l3() returns void language plpgsql as $$\n\
+             begin\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 if not pg_try_advisory_lock(1399957401, 1) then\n\
+                     perform pg_advisory_lock(1399957401, 1);\n\
+                 end if;\n\
+                 perform pg_advisory_unlock(1399957401, 1);\n\
+                 insert into spawn_events (id, commit_xid) values (1, pg_current_xact_id());\n\
+             end $$;",
+        ),
+        (
+            "xact_shared_l3",
+            "create or replace function spawn_r3_shared_l3() returns void language plpgsql as $$\n\
+             begin\n\
+                 perform spawn_lock_migrate_shared();\n\
+                 perform pg_advisory_xact_lock_shared(1399957401, 1);\n\
+                 insert into spawn_events (id, commit_xid) values (1, pg_current_xact_id());\n\
+             end $$;",
+        ),
+    ];
+
+    for (name, fn_sql) in cases {
+        let sql = wrap_with_valid_bootstrap(fn_sql, true);
+        let errs = audit_schema_sql(&sql).expect_err(&format!("{name} must fail"));
+        assert!(
+            errs.iter()
+                .any(|err| matches!(err, Violation::SpawnEventsInsertWithoutL3Lock { .. })),
+            "{name}: expected SpawnEventsInsertWithoutL3Lock, got {errs:?}"
+        );
+    }
 }
