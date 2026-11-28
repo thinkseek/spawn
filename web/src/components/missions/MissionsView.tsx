@@ -15,6 +15,7 @@ import { Suspense, lazy, useState } from "react";
 import type { ReactNode } from "react";
 
 import type { PollResult } from "../../api";
+import { freshAt } from "../../validated";
 import { absoluteTitle, relativeTime, stageDuration } from "../../format";
 import type {
   Mission,
@@ -76,9 +77,10 @@ const MODE_OPTIONS: ReadonlyArray<ViewOption<Mode>> = [
  */
 export function MissionsView({ missions }: { missions: PollResult<Missions> }) {
   const { locale } = useLocale();
-  useNow(1_000);
+  const now = useNow(15_000);
   const data = missions.data;
-  const freshness = snapshotFreshness(data?.generated_at_ms ?? null);
+  const freshnessAt = data?.generated_at_ms != null ? freshAt(data.generated_at_ms, missions.checkedAt) : null;
+  const freshness = snapshotFreshness(freshnessAt, now);
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">

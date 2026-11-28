@@ -162,6 +162,7 @@ pub(crate) mod capabilities;
 pub(crate) mod core_lines;
 mod digest;
 pub(crate) mod feature_map;
+mod gzip;
 mod ipc;
 mod labels;
 mod prov;
@@ -5824,26 +5825,57 @@ fn static_file(request: Request, web: &Path, path: &str) -> Result<(), String> {
     };
     // A file's tag is its bytes'; the build's assets/ are named by their
     // content and kept by the browser for good, the page asked again.
+    let accept_encoding = header(&request, "Accept-Encoding").map(str::to_string);
+    let compressible = is_compressible(&relative);
     let etag = answers::file_etag(&bytes);
     let tag = Header::from_bytes("ETag", etag.as_str()).expect("a hex tag is a valid header");
     let cache = Header::from_bytes("Cache-Control", answers::file_cache_control(&relative))
         .expect("static header is valid");
     if answers::not_modified(header(&request, "If-None-Match"), &etag) {
-        let unchanged = Response::empty(304).with_header(tag).with_header(cache);
+        let mut unchanged = Response::empty(304).with_header(tag).with_header(cache);
+        if compressible {
+            unchanged.add_header(
+                Header::from_bytes("Vary", "Accept-Encoding").expect("static header is valid"),
+            );
+        }
         return request
             .respond(unchanged)
             .map_err(|error| error.to_string());
     }
     let header = Header::from_bytes("Content-Type", content_type(&relative))
         .expect("static header is valid");
+    let mut response = if compressible
+        && gzip::accepts_gzip(accept_encoding.as_deref())
+        && let Some(compressed) = gzip::compress_if_smaller(&bytes)
+    {
+        Response::from_data(compressed)
+            .with_header(header)
+            .with_header(tag)
+            .with_header(cache)
+            .with_header(
+                Header::from_bytes("Content-Encoding", "gzip").expect("static header is valid"),
+            )
+    } else {
+        Response::from_data(bytes)
+            .with_header(header)
+            .with_header(tag)
+            .with_header(cache)
+    };
+    if compressible {
+        response.add_header(
+            Header::from_bytes("Vary", "Accept-Encoding").expect("static header is valid"),
+        );
+    }
     request
-        .respond(
-            Response::from_data(bytes)
-                .with_header(header)
-                .with_header(tag)
-                .with_header(cache),
-        )
+        .respond(response)
         .map_err(|error| error.to_string())
+}
+
+fn is_compressible(relative: &str) -> bool {
+    matches!(
+        relative.rsplit('.').next(),
+        Some("html" | "js" | "css" | "svg" | "json" | "webmanifest")
+    )
 }
 
 /// The `Content-Type` of a built file: a web app manifest as

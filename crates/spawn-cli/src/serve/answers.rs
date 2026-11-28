@@ -25,18 +25,21 @@
 //!   it was (`<field>_bytes`), and the whole text is a GET of its own,
 //!   asked when the task is opened.
 //!
-//! Compression is not here: no gzip or deflate crate is in the offline
-//! cargo registry the build uses (only zstd, which browsers send in
-//! `Accept-Encoding` over https or to localhost only, never to this
-//! server's plain http on the owner's network).
+//! - Compression. API answers and compressible static assets are
+//!   negotiated with RFC 1952 `gzip` ([`super::gzip`]) whenever the client
+//!   advertises `Accept-Encoding: gzip` and compression shrinks the payload,
+//!   carrying `Vary: Accept-Encoding` and keeping the weak `ETag` (`W/"..."`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hasher};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tiny_http::{Header, Request, Response};
+
+use super::gzip;
 
 /// How long a board's answer is shared from when its reads began.
 pub(super) const SHARE_FOR: Duration = Duration::from_secs(1);
@@ -89,6 +92,7 @@ pub(super) fn answer(path: &str, read: Result<Value, String>, bad_request: &str)
 fn clocks(path: &str) -> &'static [&'static str] {
     CLOCKS
         .iter()
+        .chain(PATTERN_CLOCKS.iter())
         .find(|(pattern, _)| fits(pattern, path))
         .map_or(&[], |(_, fields)| fields)
 }
@@ -109,26 +113,69 @@ fn fits(pattern: &str, path: &str) -> bool {
 }
 
 /// [`clocks`]' table: a canonical path (`*` for one segment) and its clocks.
-const CLOCKS: [(&str, &[&str]); 7] = [
+const CLOCKS: [(&str, &[&str]); 9] = [
+    ("/api/overview", &["generated_at_ms"]),
+    ("/api/fleet", &["generated_at_ms"]),
+    ("/api/missions", &["generated_at_ms"]),
     ("/api/objectives", &["generated_at_ms"]),
     ("/api/approvals", &["generated_at_ms"]),
     ("/api/context/digest", &["generated_at_ms"]),
     ("/api/attention", &["generated_at_ms"]),
     ("/api/features", &["generated_at_ms"]),
     ("/api/objectives/pane", &["captured_at_ms"]),
-    ("/api/sessions/*/pane", &["captured_at_ms"]),
 ];
+
+/// Dynamic clock paths whose segment pattern has `*`.
+const PATTERN_CLOCKS: [(&str, &[&str]); 1] = [("/api/sessions/*/pane", &["captured_at_ms"])];
+
+fn bucket_i64(object: &mut serde_json::Map<String, Value>, key: &str, step: i64) {
+    if let Some(value) = object.get(key).and_then(Value::as_i64) {
+        object.insert(key.to_string(), Value::from(value.div_euclid(step)));
+    }
+}
+
+/// Normalize volatile sub-minute / sub-MB host telemetry in `/api/fleet`'s
+/// `health` object solely when computing the weak ETag, leaving the JSON body
+/// untouched.
+fn normalize_fleet_etag(root: &mut serde_json::Map<String, Value>) {
+    let Some(health) = root.get_mut("health").and_then(Value::as_object_mut) else {
+        return;
+    };
+    health.remove("generated_at_ms");
+    health.remove("agent_hours_24h");
+    bucket_i64(health, "agent_ms_24h", 60_000);
+    if let Some(memory) = health.get_mut("memory").and_then(Value::as_object_mut) {
+        bucket_i64(memory, "available_bytes", 32 * 1024 * 1024);
+    }
+    if let Some(storage) = health.get_mut("storage").and_then(Value::as_object_mut) {
+        bucket_i64(storage, "free_bytes", 16 * 1024 * 1024);
+    }
+    if let Some(disks) = health.get_mut("disk").and_then(Value::as_array_mut) {
+        for disk in disks {
+            if let Some(disk_obj) = disk.as_object_mut() {
+                bucket_i64(disk_obj, "free_bytes", 16 * 1024 * 1024);
+            }
+        }
+    }
+}
 
 /// The weak ETag of an answer of `path`: a hash of its body (`body`, the
 /// serialization of `value`) without its clocks.
 fn etag(path: &str, value: &Value, body: &str) -> String {
     let fields = clocks(path);
     let mut hasher = DefaultHasher::new();
+    let is_fleet = path == "/api/fleet";
     match value.as_object() {
-        Some(object) if fields.iter().any(|field| object.contains_key(*field)) => {
+        Some(object)
+            if fields.iter().any(|field| object.contains_key(*field))
+                || (is_fleet && object.contains_key("health")) =>
+        {
             let mut without = object.clone();
             for field in fields {
                 without.remove(*field);
+            }
+            if is_fleet {
+                normalize_fleet_etag(&mut without);
             }
             hasher.write(Value::Object(without).to_string().as_bytes());
         }
@@ -202,6 +249,14 @@ pub(super) fn shared(path: &str) -> bool {
             | "/api/scorecard"
             | "/api/approvals"
             | "/api/context/digest"
+            | "/api/alerts"
+            | "/api/interventions"
+            | "/api/core-lines"
+            | "/api/nodes"
+            | "/api/cost"
+            | "/api/grading"
+            | "/api/verifications"
+            | "/api/capabilities"
     ) || fits("/api/sessions/*/pane", path)
 }
 
@@ -304,18 +359,61 @@ impl Answers {
     }
 }
 
+/// Bounded cache of gzip-compressed payloads keyed by full SHA-256 of the
+/// exact response bytes (so distinct `generated_at_ms` bodies never alias).
+const GZIP_CACHE_MAX: usize = 24;
+
+#[derive(Default)]
+struct GzipCache {
+    order: VecDeque<[u8; 32]>,
+    entries: HashMap<[u8; 32], Option<Arc<[u8]>>>,
+}
+
+static GZIP_CACHE: LazyLock<Mutex<GzipCache>> = LazyLock::new(|| Mutex::new(GzipCache::default()));
+
+fn cached_gzip(body: &[u8]) -> Option<Arc<[u8]>> {
+    if body.len() < gzip::MIN_COMPRESS_BYTES {
+        return None;
+    }
+    let digest: [u8; 32] = Sha256::digest(body).into();
+    if let Some(hit) = GZIP_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entries
+        .get(&digest)
+    {
+        return hit.clone();
+    }
+    let compressed = gzip::compress_if_smaller(body).map(Arc::<[u8]>::from);
+    let mut cache = GZIP_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(hit) = cache.entries.get(&digest) {
+        return hit.clone();
+    }
+    if cache.order.len() >= GZIP_CACHE_MAX
+        && let Some(evicted) = cache.order.pop_front()
+    {
+        cache.entries.remove(&evicted);
+    }
+    cache.order.push_back(digest);
+    cache.entries.insert(digest, compressed.clone());
+    compressed
+}
+
 /// `Cache-Control` of every API answer: the page asks again every time
 /// (with its tag), and no cache in between keeps one.
 const API_CACHE_CONTROL: &str = "no-cache";
 
 /// Send `answer` to `request`: 304 with the tag alone when the request's
-/// `If-None-Match` names it, else the answer.
+/// `If-None-Match` names it, else the answer (gzip-compressed when the client
+/// advertises `Accept-Encoding: gzip` and compression shrinks the payload).
 pub(super) fn respond(
     request: Request,
     answer: &Answer,
     if_none_match: Option<&str>,
 ) -> Result<(), String> {
+    let accept_encoding = super::header(&request, "Accept-Encoding").map(str::to_string);
     let cache = Header::from_bytes("Cache-Control", API_CACHE_CONTROL).expect("static header");
+    let vary = Header::from_bytes("Vary", "Accept-Encoding").expect("static header");
     let tag = answer
         .etag
         .as_deref()
@@ -328,14 +426,29 @@ pub(super) fn respond(
         Some(tag) if unchanged => Response::empty(304)
             .with_header(tag)
             .with_header(cache)
+            .with_header(vary)
             .boxed(),
         tag => {
             let kind = Header::from_bytes("Content-Type", "application/json; charset=utf-8")
                 .expect("static header");
-            let mut response = Response::from_string(answer.body.clone())
-                .with_status_code(answer.status)
-                .with_header(kind)
-                .with_header(cache);
+            let mut response = if gzip::accepts_gzip(accept_encoding.as_deref())
+                && let Some(compressed) = cached_gzip(answer.body.as_bytes())
+            {
+                Response::from_data(compressed.as_ref())
+                    .with_status_code(answer.status)
+                    .with_header(kind)
+                    .with_header(cache)
+                    .with_header(
+                        Header::from_bytes("Content-Encoding", "gzip").expect("static header"),
+                    )
+                    .with_header(vary)
+            } else {
+                Response::from_string(answer.body.clone())
+                    .with_status_code(answer.status)
+                    .with_header(kind)
+                    .with_header(cache)
+                    .with_header(vary)
+            };
             if let Some(tag) = tag {
                 response.add_header(tag);
             }
@@ -550,7 +663,8 @@ mod tests {
         assert_eq!(first.etag, later.etag, "the map, read later");
         assert!(later.body.contains("\"generated_at_ms\":2"));
         assert_ne!(first.etag, features(2, json!([1])).etag);
-        // A pane's capture time likewise; the fleet's clock is part of it.
+        // Panes, /api/missions, and /api/fleet also leave their clocks and sub-MB
+        // telemetry jitter out of the tag while keeping exact values in the body.
         let pane = |at: i64| {
             answer(
                 "/api/sessions/session_a/pane",
@@ -560,8 +674,54 @@ mod tests {
             .etag
         };
         assert_eq!(pane(1), pane(2));
-        let fleet = |at: i64| answer("/api/fleet", Ok(json!({"generated_at_ms": at})), "").etag;
-        assert_ne!(fleet(1), fleet(2));
+
+        let missions_early = answer(
+            "/api/missions",
+            Ok(json!({"generated_at_ms": 1, "missions": []})),
+            "",
+        );
+        let missions_late = answer(
+            "/api/missions",
+            Ok(json!({"generated_at_ms": 9999, "missions": []})),
+            "",
+        );
+        assert_eq!(missions_early.etag, missions_late.etag);
+        assert!(missions_late.body.contains("\"generated_at_ms\":9999"));
+        assert_ne!(
+            missions_early.etag,
+            answer(
+                "/api/missions",
+                Ok(json!({"generated_at_ms": 9999, "missions": [1]})),
+                "",
+            )
+            .etag
+        );
+
+        let fleet_payload = |at: i64, free_bytes: i64, avail_bytes: i64, agent_ms: i64, agents: serde_json::Value| {
+            answer(
+                "/api/fleet",
+                Ok(json!({
+                    "generated_at_ms": at,
+                    "agents": agents,
+                    "health": {
+                        "generated_at_ms": at,
+                        "agent_ms_24h": agent_ms,
+                        "agent_hours_24h": 1.0 + f64::from(i32::try_from(agent_ms).expect("ms")) / 3_600_000.0,
+                        "memory": { "available_bytes": avail_bytes },
+                        "storage": { "free_bytes": free_bytes },
+                        "disk": [{ "free_bytes": free_bytes }]
+                    }
+                })),
+                "",
+            )
+        };
+        let f1 = fleet_payload(1_000, 44_206_051_328, 2_139_088_007_168, 37_413_512, json!([]));
+        let f2 = fleet_payload(5_000, 44_205_912_064, 2_139_076_714_496, 37_411_300, json!([]));
+        assert_eq!(f1.etag, f2.etag, "sub-MB / sub-minute fleet jitter keeps ETag");
+        assert!(f2.body.contains("\"generated_at_ms\":5000"));
+        assert!(f2.body.contains("44205912064"));
+        let f_changed = fleet_payload(5_000, 44_205_912_064, 2_139_076_714_496, 37_411_300, json!([{"id": 1}]));
+        assert_ne!(f1.etag, f_changed.etag, "agent change updates fleet ETag");
     }
 
     #[test]
@@ -599,6 +759,16 @@ mod tests {
             "/api/objectives/pane",
             "/api/features",
             "/api/scorecard",
+            "/api/approvals",
+            "/api/context/digest",
+            "/api/alerts",
+            "/api/interventions",
+            "/api/core-lines",
+            "/api/nodes",
+            "/api/cost",
+            "/api/grading",
+            "/api/verifications",
+            "/api/capabilities",
             "/api/sessions/session_a/pane",
         ] {
             assert!(shared(path), "{path}");
@@ -802,5 +972,68 @@ mod tests {
             "public, max-age=31536000, immutable"
         );
         assert_eq!(file_cache_control("index.html"), "no-cache");
+    }
+
+    #[test]
+    fn respond_negotiates_gzip_when_accepted_and_preserves_304() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let items = vec!["\"ok\""; 300].join(",");
+        let large_body = format!(r#"{{"missions":[{items}]}}"#);
+        let ans = answer("/api/missions", Ok(serde_json::from_str(&large_body).expect("json")), "");
+        let etag = ans.etag.clone().expect("etag");
+
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind test server");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let ans_clone = ans.clone();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let req = server.recv().expect("recv");
+                let inm = super::super::header(&req, "If-None-Match").map(str::to_string);
+                super::respond(req, &ans_clone, inm.as_deref()).expect("respond");
+            }
+        });
+
+        let send_raw = |raw_req: &str| -> Vec<u8> {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            stream.write_all(raw_req.as_bytes()).expect("write");
+            stream.shutdown(std::net::Shutdown::Write).expect("shutdown");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).expect("read");
+            buf
+        };
+
+        // 1. Accepts gzip -> Content-Encoding: gzip + Vary: Accept-Encoding + compressed body
+        let raw_gz = send_raw("GET /api/missions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAccept-Encoding: gzip\r\n\r\n");
+        let split = raw_gz.windows(4).position(|w| w == b"\r\n\r\n").expect("http headers");
+        let hdrs = String::from_utf8_lossy(&raw_gz[..split]).to_ascii_lowercase();
+        let gz_body = &raw_gz[split + 4..];
+        assert!(hdrs.starts_with("http/1.1 200"));
+        assert!(hdrs.contains("content-encoding: gzip"));
+        assert!(hdrs.contains("vary: accept-encoding"));
+        assert!(gz_body.len() < ans.body.len());
+
+        // 2. No Accept-Encoding -> uncompressed plain JSON + Vary: Accept-Encoding
+        let raw_plain = send_raw("GET /api/missions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        let split2 = raw_plain.windows(4).position(|w| w == b"\r\n\r\n").expect("http headers");
+        let hdrs2 = String::from_utf8_lossy(&raw_plain[..split2]).to_ascii_lowercase();
+        let plain_body = &raw_plain[split2 + 4..];
+        assert!(hdrs2.starts_with("http/1.1 200"));
+        assert!(!hdrs2.contains("content-encoding: gzip"));
+        assert!(hdrs2.contains("vary: accept-encoding"));
+        assert_eq!(plain_body, ans.body.as_bytes());
+
+        // 3. Matching If-None-Match -> 304 Not Modified + Vary: Accept-Encoding
+        let raw_304 = send_raw(&format!(
+            "GET /api/missions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAccept-Encoding: gzip\r\nIf-None-Match: {etag}\r\n\r\n"
+        ));
+        let split3 = raw_304.windows(4).position(|w| w == b"\r\n\r\n").expect("http headers");
+        let hdrs3 = String::from_utf8_lossy(&raw_304[..split3]).to_ascii_lowercase();
+        assert!(hdrs3.starts_with("http/1.1 304"));
+        assert!(hdrs3.contains("vary: accept-encoding"));
+        assert_eq!(&raw_304[split3 + 4..], b"");
+
+        handle.join().expect("server thread");
     }
 }

@@ -47,6 +47,20 @@ function pwaAssets(): Plugin {
 
 export default defineConfig({
   plugins: [contrast(), pwaAssets(), react(), tailwindcss()],
+  build: {
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            { name: "vendor-react", test: /node_modules[\\/](?:react|react-dom|scheduler)[\\/]/ },
+            { name: "vendor-icons", test: /node_modules[\\/]lucide-react[\\/]/ },
+            { name: "vendor-motion", test: /node_modules[\\/](?:motion|framer-motion)[\\/]/ },
+            { name: "vendor-d3", test: /node_modules[\\/]d3-/ },
+          ],
+        },
+      },
+    },
+  },
   // Inline, so vite never loads a postcss.config.js or .postcssrc from the
   // tree (deploy.sh builds the UI with `--config vite.config.ts`, so no
   // vite.config.js is loaded either). Tailwind runs as the plugin above.

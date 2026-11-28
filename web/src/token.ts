@@ -94,6 +94,7 @@ export function isAbortError(cause: unknown): boolean {
 export interface AuthFetchResponse {
   ok: boolean;
   status: number;
+  headers?: { get(name: string): string | null };
   json(): Promise<unknown>;
   arrayBuffer(): Promise<ArrayBuffer>;
 }
@@ -131,6 +132,7 @@ export async function probeAuthWithFetch(
   fetcher: AuthFetch,
   headers: Record<string, string>,
   signal?: AbortSignal,
+  onPayload?: (payload: unknown, etag: string | null) => void,
 ): Promise<AuthProbeResult> {
   try {
     const response = await fetcher("/api/overview", {
@@ -168,6 +170,7 @@ export async function probeAuthWithFetch(
           message: "服务端返回了非 JSON 概览响应，请检查网络或代理后重试。",
         };
       }
+      onPayload?.(payload, response.headers?.get("ETag") ?? null);
       return { kind: "authenticated" };
     } catch {
       return {
@@ -190,6 +193,7 @@ export async function verifyTokenWithFetch(
   fetcher: AuthFetch,
   onVerified: (token: string) => void,
   signal?: AbortSignal,
+  onPayload?: (payload: unknown, etag: string | null) => void,
 ): Promise<TokenVerifyResult> {
   const checked = validateSubmittedToken(raw);
   if (!checked.ok) {
@@ -239,6 +243,7 @@ export async function verifyTokenWithFetch(
         };
       }
       onVerified(checked.token);
+      onPayload?.(payload, response.headers?.get("ETag") ?? null);
       return { ok: true };
     } catch {
       return {

@@ -13,7 +13,14 @@ import {
   type TokenChoice,
   type TokenVerifyResult,
 } from "./token.ts";
-import { markFresh, pageHidden, Validated } from "./validated.ts";
+import {
+  clearSnapshots,
+  loadSnapshots,
+  saveSnapshot,
+  tokenScope,
+  type SnapshotStorageLike,
+} from "./snapshotCache.ts";
+import { markFresh, pageHidden, SHARED_FOR, Validated } from "./validated.ts";
 import { readTail } from "./sessionWindow.ts";
 import type { LiveStatus, LiveTopic } from "./stream.ts";
 import { CHANNEL_NAME, LiveStream, topicsOf } from "./stream.ts";
@@ -495,7 +502,32 @@ export type { AuthProbeResult, TokenVerifyResult };
 
 /** Probe whether the current session (stored token or loopback no-token host) is accepted. */
 export async function probeAuth(signal?: AbortSignal): Promise<AuthProbeResult> {
-  return probeAuthWithFetch((url, init) => fetch(url, init), apiHeaders(), signal);
+  const requestEpoch = getAuthEpoch();
+  const headers: Record<string, string> = {
+    ...apiHeaders(),
+    "Cache-Control": SHARED_FOR,
+  };
+  const cachedTag = reads.etagOf("/api/overview");
+  if (cachedTag) headers["If-None-Match"] = cachedTag;
+  const result = await probeAuthWithFetch(
+    (url, init) => fetch(url, init),
+    headers,
+    signal,
+    (payload, etag) => {
+      if (getAuthEpoch() !== requestEpoch) return;
+      reads.seed("/api/overview", etag, payload, 1_500);
+      if (etag) {
+        saveSnapshot(browserSessionStorage(), tokenScope(serveToken), "/api/overview", etag, payload);
+      }
+    },
+  );
+  if (getAuthEpoch() !== requestEpoch) return result;
+  if (result.kind === "needs_token") {
+    reads.clear();
+  } else if (result.kind === "authenticated" && cachedTag && reads.etagOf("/api/overview") === cachedTag) {
+    reads.markFreshFor("/api/overview", 1_500);
+  }
+  return result;
 }
 
 /** Validate format, verify against `GET /api/overview`, and store on success. */
@@ -508,6 +540,12 @@ export async function verifyAndApplyToken(
     (url, init) => fetch(url, init),
     (token) => setServeToken(token),
     signal,
+    (payload, etag) => {
+      reads.seed("/api/overview", etag, payload, 1_500);
+      if (etag) {
+        saveSnapshot(browserSessionStorage(), tokenScope(serveToken), "/api/overview", etag, payload);
+      }
+    },
   );
 }
 
@@ -579,8 +617,50 @@ export function apiHeaders(): Record<string, string> {
   return headers;
 }
 
-/** The page's last answer at each URL, with its tag (validated.ts). */
-const reads = new Validated();
+function browserSessionStorage(): SnapshotStorageLike | null {
+  try {
+    return typeof window !== "undefined" ? window.sessionStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The page's last answer at each URL, with its tag (validated.ts), backed by
+ * safe same-session storage for allowlisted dashboard boards. */
+const reads = new Validated(undefined, {
+  onPersist: (url, etag, raw) => {
+    saveSnapshot(browserSessionStorage(), tokenScope(serveToken), url, etag, raw);
+  },
+  onClear: () => {
+    clearSnapshots(browserSessionStorage());
+  },
+});
+
+{
+  const storage = browserSessionStorage();
+  if (storage) {
+    for (const entry of loadSnapshots(storage, tokenScope(serveToken))) {
+      reads.seed(entry.url, entry.etag, entry.raw);
+    }
+  }
+}
+
+/** Synchronously return the cached, normalized value for `url` if present. */
+export function peekApi<T>(url: string, normalize: (raw: unknown) => T): T | null {
+  return reads.peek(url, normalize);
+}
+
+export function peekOverview(): Overview | null {
+  return peekApi("/api/overview", normalizeOverview);
+}
+
+export function peekAttention(): Attention | null {
+  return peekApi("/api/attention", normalizeAttention);
+}
+
+export function peekAlerts(): Alert[] | null {
+  return peekApi("/api/alerts", normalizeAlerts);
+}
 
 /** GET an API read and normalize it; answered "not modified" (304), the
  * value read last time, the same object. Every module's reads go here. */
@@ -863,7 +943,7 @@ export interface PollResult<T> {
   checkedAt?: number | null;
 }
 
-export interface PollOptions {
+export interface PollOptions<T = unknown> {
   /** Keep `checkedAt`: a view that says how fresh its data is. Its owner
    * renders again on every answer, so the others do not ask. */
   checked?: boolean;
@@ -872,6 +952,8 @@ export interface PollOptions {
    * [`LIVE_MIN_GAP_MS`]), and while the stream is live the interval is
    * [`LIVE_STRETCH`] times longer. */
   live?: readonly LiveTopic[];
+  /** Optional synchronous hydrate reader for instant initial & tab-switch paint. */
+  initial?: () => T | null;
 }
 
 /** Poll a read endpoint every `intervalMs`, starting immediately. While
@@ -882,14 +964,16 @@ export function usePoll<T>(
   key: string,
   load: (signal: AbortSignal) => Promise<T>,
   intervalMs = 2_000,
-  options: PollOptions = {},
+  options: PollOptions<T> = {},
 ): PollResult<T> {
-  const [data, setData] = useState<T | null>(null);
+  const [data, setData] = useState<T | null>(() => options.initial?.() ?? null);
   const [error, setError] = useState<string | null>(null);
   const [checkedAt, setCheckedAt] = useState<number | null>(null);
   const loadRef = useRef(load);
   loadRef.current = load;
-  const keyRef = useRef<string | null>(null);
+  const initialRef = useRef(options.initial);
+  initialRef.current = options.initial;
+  const keyRef = useRef<string>(key);
   const checked = options.checked === true;
   const liveTopics = (options.live ?? []).join(",");
 
@@ -897,11 +981,11 @@ export function usePoll<T>(
     let cancelled = false;
     let inFlight = false;
     let controller: AbortController | null = null;
-    // A new key is a different resource: drop the old one. A new interval
-    // for the same key keeps what is on screen.
+    // A new key is a different resource: hydrate if cached, else drop the old one.
+    // A new interval for the same key keeps what is on screen.
     if (keyRef.current !== key) {
       keyRef.current = key;
-      setData(null);
+      setData(initialRef.current?.() ?? null);
       setError(null);
       setCheckedAt(null);
     }

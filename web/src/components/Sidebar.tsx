@@ -45,6 +45,7 @@ import {
 import type { FleetContext } from "../ordering";
 import { agentGroupLabel, groupAgents, heldTask, stateWords } from "../ordering";
 import { recordedState } from "../recordedState";
+import { prefetchView } from "../routePrefetch";
 import type { ThemeChoice } from "../theme";
 import { THEME_CHOICES, THEME_KEY, useTheme } from "../theme";
 import { StateDot, stateLabel } from "./StateDot";
@@ -246,6 +247,7 @@ function SideTabList({
             key={id}
             active={view === id}
             onClick={() => activate(id)}
+            onPrefetch={() => void prefetchView(id)}
             icon={navIcon(id)}
             label={compact ? compactLabelFor(id) : navLabel(id, locale)}
             compact={compact}
@@ -265,6 +267,7 @@ function SideTabList({
             key={id}
             active={view === id}
             onClick={() => activate(id)}
+            onPrefetch={() => void prefetchView(id)}
             icon={navIcon(id)}
             label={navLabel(id, locale)}
             compact={compact}
@@ -315,6 +318,7 @@ function SideTabList({
                 key={id}
                 active={view === id}
                 onClick={() => activate(id)}
+                onPrefetch={() => void prefetchView(id)}
                 icon={navIcon(id)}
                 label={navLabel(id, locale)}
                 compact={compact}
@@ -444,6 +448,8 @@ export function Sidebar(props: SidebarProps) {
           {compact ? (
             <button
               type="button"
+              onMouseEnter={() => void prefetchView("sessions")}
+              onFocus={() => void prefetchView("sessions")}
               onClick={() => {
                 setRailMode("expanded");
                 setSessionsStored("open");
@@ -461,6 +467,8 @@ export function Sidebar(props: SidebarProps) {
           ) : (
             <button
               type="button"
+              onMouseEnter={() => void prefetchView("sessions")}
+              onFocus={() => void prefetchView("sessions")}
               onClick={() => setSessionsStored(sessionsOpen ? "closed" : "open")}
               aria-expanded={sessionsOpen}
               className={cx(
@@ -841,6 +849,7 @@ function SessionRow({
 function NavItem({
   active,
   onClick,
+  onPrefetch,
   icon,
   label,
   compact = false,
@@ -849,6 +858,7 @@ function NavItem({
 }: {
   active: boolean;
   onClick: () => void;
+  onPrefetch?: () => void;
   icon: ReactNode;
   label: string;
   compact?: boolean;
@@ -859,6 +869,8 @@ function NavItem({
     <button
       type="button"
       onClick={onClick}
+      onMouseEnter={onPrefetch}
+      onFocus={onPrefetch}
       aria-current={active ? "page" : undefined}
       title={compact ? label : undefined}
       aria-label={compact ? label : undefined}
@@ -1085,6 +1097,7 @@ export function MobileNav(
                     handlers.sessions();
                     setDrawerOpen(false);
                   }}
+                  onPrefetch={() => void prefetchView("sessions")}
                   icon={navIcon("sessions")}
                   label={navLabel("sessions", locale)}
                 />

@@ -3,8 +3,9 @@ import { ChevronRight } from "lucide-react";
 
 import type { Alert, PollResult } from "../../api";
 import { fetchAlertsSince, usePoll } from "../../api";
+import { freshAt } from "../../validated";
 import type { Attention } from "../../attention";
-import type { Fleet } from "../../fleet";
+import type { Fleet, FleetAgent } from "../../fleet";
 import { relativeTime } from "../../format";
 import type { NeedItem } from "../../home";
 import {
@@ -23,7 +24,7 @@ import {
 } from "../../home";
 import { tr } from "../../i18n";
 import type { Missions } from "../../missions";
-import type { FleetContext } from "../../ordering";
+import type { AgentGroup, FleetContext } from "../../ordering";
 import { groupAgents, missingAlwaysOn, residentName, snapshotFreshness, usualEngine } from "../../ordering";
 import { useNow } from "../rsi/Phase";
 import { FOCUS_RING_INSET, LiveStatus, PageHeader, cx, useLocale } from "../ui";
@@ -90,7 +91,7 @@ export function FleetView({
 }: FleetViewProps) {
   const { locale } = useLocale();
   const [detailsOpen, setDetailsOpen] = useState(false);
-  useNow(1_000);
+  const now = useNow(15_000);
   const data = fleet.data;
   const selected =
     data?.agents.find((agent) => agent.session_id === selectedId) ?? null;
@@ -121,7 +122,6 @@ export function FleetView({
     }, null),
   };
 
-  const now = Date.now();
   const latestNodeBeatMs = useMemo(() => {
     if (!data?.nodes.length) return null;
     let max: number | null = null;
@@ -132,22 +132,19 @@ export function FleetView({
     }
     return max;
   }, [data?.nodes]);
-  const freshness = snapshotFreshness(data?.generated_at_ms ?? updated, now, latestNodeBeatMs);
+  const rawSnapshotAt = data?.generated_at_ms ?? updated;
+  const snapshotAt = rawSnapshotAt !== null ? freshAt(rawSnapshotAt, fleet.checkedAt) : null;
+  const displayUpdated = updated !== null ? freshAt(updated, fleet.checkedAt) : null;
+  const freshness = snapshotFreshness(snapshotAt, now, latestNodeBeatMs);
   const freshnessLabel = data
     ? freshness.level === "fresh"
-      ? updated
-        ? tr(locale, `更新于 ${relativeTime(updated)}`, `Updated ${relativeTime(updated)}`)
+      ? displayUpdated
+        ? tr(locale, `更新于 ${relativeTime(displayUpdated)}`, `Updated ${relativeTime(displayUpdated)}`)
         : tr(locale, "实时", "Live")
-      : `${freshness.label} · ${updated ? relativeTime(updated) : "live"}`
+      : `${freshness.label} · ${displayUpdated ? relativeTime(displayUpdated) : "live"}`
     : tr(locale, "连接中", "Connecting");
 
   const away = useAway();
-  const digestSpan = digestWindow(now, away?.from ?? null);
-  const span = alertsSpanMs(now, digestSpan.since);
-  const digestAlerts = usePoll(`alerts:since:${span}`, (signal) => fetchAlertsSince(span, signal), 60_000);
-  const day = usePoll("interventions-24h", (signal) => fetchInterventions("24h", signal), INTERVENTIONS_POLL_MS);
-  const week = usePoll("interventions-7d", (signal) => fetchInterventions("7d", signal), INTERVENTIONS_POLL_MS);
-  const coreLines = usePoll("core-lines", fetchCoreLines, CORE_LINES_POLL_MS);
   const openAgent = (session: string) => onSelect(session);
 
   const actionItems = useMemo(
@@ -270,61 +267,25 @@ export function FleetView({
             </button>
 
             {detailsOpen && (
-              <>
-                <DigestPanel />
-                <HomeRuntimeDetails
-                  now={now}
-                  notes={latestNotes(attention.data, now)}
-                  allNotes={allNotes(attention.data)}
-                  digest={digestSince(
-                    missions,
-                    digestAlerts.data ?? alerts,
-                    now,
-                    digestSpan.since,
-                    agents ?? null,
-                    digestSpan.away,
-                  )}
-                  back={away?.at ?? null}
-                  interventions={{
-                    day: figureState(day.data, day.error),
-                    week: figureState(week.data, week.error),
-                  }}
-                  coreLines={{
-                    answer: coreLines.data,
-                    error: coreLines.data ? null : coreLines.error,
-                  }}
-                  talk={
-                    <InputBox
-                      key={supervisor.session}
-                      sessionId={supervisor.session}
-                      to="the supervisor"
-                      stopped={!supervisor.live}
-                    />
-                  }
-                />
-                <AlwaysOnAgents
-                  agents={alwaysOn}
-                  missing={missing}
-                  context={context}
-                  usualEngine={engine}
-                  selectedId={selectedId}
-                  onSelect={onSelect}
-                />
-                <HealthStrip
-                  health={data.health}
-                  liveness={liveness}
-                  diagnostics={coreLines.data ? coreLinesView(coreLines.data).diagnostics : []}
-                />
-                <NodeRows fleetNodes={data.nodes} />
-                <FleetBoard
-                  groups={groups}
-                  total={data.agents}
-                  context={context}
-                  usualEngine={engine}
-                  selectedId={selectedId}
-                  onSelect={onSelect}
-                />
-              </>
+              <FleetDetailsSection
+                now={now}
+                data={data}
+                attention={attention}
+                context={context}
+                missions={missions}
+                alerts={alerts}
+                agents={agents}
+                awayFromMs={away?.from ?? null}
+                awayAtMs={away?.at ?? null}
+                supervisor={supervisor}
+                alwaysOn={alwaysOn}
+                missing={missing}
+                liveness={liveness}
+                groups={groups}
+                engine={engine}
+                selectedId={selectedId}
+                onSelect={onSelect}
+              />
             )}
           </div>
         </div>
@@ -341,5 +302,109 @@ export function FleetView({
         />
       )}
     </main>
+  );
+}
+
+/** Heavy Home details & engineering metrics: mounted (and polled) ONLY after the owner expands the fold. */
+function FleetDetailsSection({
+  now,
+  data,
+  attention,
+  context,
+  missions,
+  alerts,
+  agents,
+  awayFromMs,
+  awayAtMs,
+  supervisor,
+  alwaysOn,
+  missing,
+  liveness,
+  groups,
+  engine,
+  selectedId,
+  onSelect,
+}: {
+  now: number;
+  data: Fleet;
+  attention: PollResult<Attention>;
+  context: FleetContext;
+  missions: Missions | null;
+  alerts: Alert[] | null;
+  agents: Fleet["agents"] | undefined;
+  awayFromMs: number | null;
+  awayAtMs: number | null;
+  supervisor: { session: string; live: boolean };
+  alwaysOn: Fleet["agents"];
+  missing: ReturnType<typeof missingAlwaysOn>;
+  liveness: Liveness;
+  groups: AgentGroup<FleetAgent>[];
+  engine: ReturnType<typeof usualEngine>;
+  selectedId: string | null;
+  onSelect: (sessionId: string | null) => void;
+}) {
+  const digestSpan = digestWindow(now, awayFromMs);
+  const span = alertsSpanMs(now, digestSpan.since);
+  const digestAlerts = usePoll(`alerts:since:${span}`, (signal) => fetchAlertsSince(span, signal), 60_000);
+  const day = usePoll("interventions-24h", (signal) => fetchInterventions("24h", signal), INTERVENTIONS_POLL_MS);
+  const week = usePoll("interventions-7d", (signal) => fetchInterventions("7d", signal), INTERVENTIONS_POLL_MS);
+  const coreLines = usePoll("core-lines", fetchCoreLines, CORE_LINES_POLL_MS);
+
+  return (
+    <>
+      <DigestPanel />
+      <HomeRuntimeDetails
+        now={now}
+        notes={latestNotes(attention.data, now)}
+        allNotes={allNotes(attention.data)}
+        digest={digestSince(
+          missions,
+          digestAlerts.data ?? alerts,
+          now,
+          digestSpan.since,
+          agents ?? null,
+          digestSpan.away,
+        )}
+        back={awayAtMs}
+        interventions={{
+          day: figureState(day.data, day.error),
+          week: figureState(week.data, week.error),
+        }}
+        coreLines={{
+          answer: coreLines.data,
+          error: coreLines.data ? null : coreLines.error,
+        }}
+        talk={
+          <InputBox
+            key={supervisor.session}
+            sessionId={supervisor.session}
+            to="the supervisor"
+            stopped={!supervisor.live}
+          />
+        }
+      />
+      <AlwaysOnAgents
+        agents={alwaysOn}
+        missing={missing}
+        context={context}
+        usualEngine={engine}
+        selectedId={selectedId}
+        onSelect={onSelect}
+      />
+      <HealthStrip
+        health={data.health}
+        liveness={liveness}
+        diagnostics={coreLines.data ? coreLinesView(coreLines.data).diagnostics : []}
+      />
+      <NodeRows fleetNodes={data.nodes} />
+      <FleetBoard
+        groups={groups}
+        total={data.agents}
+        context={context}
+        usualEngine={engine}
+        selectedId={selectedId}
+        onSelect={onSelect}
+      />
+    </>
   );
 }

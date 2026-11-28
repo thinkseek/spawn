@@ -283,3 +283,60 @@ test("stale in-flight 401 after clear() or isCurrent() transition aborts without
   await assert.rejects(pendingEpochRace, { name: "AbortError" });
   assert.equal(epochFailCalls, 0);
 });
+
+test("seed, peek, fresh window, and persist/clear hooks preserve object identity and epoch safety", async () => {
+  const persisted: Array<{ url: string; etag: string }> = [];
+  let clears = 0;
+  const { seen, fetcher } = server([
+    { body: { n: 10 }, etag: 'W/"ten"' },
+    { body: { n: 20 }, etag: 'W/"twenty"' },
+  ]);
+  const reads = new Validated(fetcher, {
+    onPersist: (url, etag) => persisted.push({ url, etag }),
+    onClear: () => {
+      clears += 1;
+    },
+  });
+
+  let normalizedCalls = 0;
+  const normalize = (raw: unknown) => {
+    normalizedCalls += 1;
+    return { val: (raw as { n: number }).n };
+  };
+
+  // Seed without fresh window: peek memoizes object identity and supplies ETag, while read() still validates.
+  reads.seed("/api/fleet", 'W/"ten"', { n: 10 });
+  assert.equal(reads.etagOf("/api/fleet"), 'W/"ten"');
+  const peeked1 = reads.peek("/api/fleet", normalize);
+  const peeked2 = reads.peek("/api/fleet", normalize);
+  assert.deepEqual(peeked1, { val: 10 });
+  assert.equal(peeked1, peeked2, "peek returns memoized reference");
+  assert.equal(normalizedCalls, 1);
+
+  const after304 = await reads.read("/api/fleet", normalize, options());
+  assert.equal(after304, peeked1, "304 keeps exact peeked object identity");
+  assert.equal(seen[0].headers["If-None-Match"], 'W/"ten"');
+
+  // Seed with freshMs: first periodic read uses seeded payload without network, second hits network.
+  reads.seed("/api/overview", 'W/"seed"', { n: 42 }, 5_000);
+  const freshHit = await reads.read("/api/overview", normalize, options());
+  assert.deepEqual(freshHit, { val: 42 });
+  assert.equal(seen.length, 1, "fresh window skipped duplicate fetch");
+  assert.equal(persisted.length, 0, "seed itself does not trigger onPersist");
+
+  const revalidated = await reads.read("/api/overview", normalize, options());
+  assert.deepEqual(revalidated, { val: 20 });
+  assert.equal(seen[1].headers["If-None-Match"], 'W/"seed"');
+  assert.deepEqual(persisted, [{ url: "/api/overview", etag: 'W/"twenty"' }]);
+
+  // markFreshFor skips next read if still inside window, clear notifies onClear.
+  reads.markFreshFor("/api/overview", 5_000);
+  const markedHit = await reads.read("/api/overview", normalize, options());
+  assert.equal(markedHit, revalidated);
+  assert.equal(seen.length, 2);
+
+  reads.clear();
+  assert.equal(clears, 1);
+  assert.equal(reads.etagOf("/api/overview"), null);
+  assert.equal(reads.peek("/api/overview", normalize), null);
+});

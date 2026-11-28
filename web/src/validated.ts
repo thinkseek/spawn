@@ -37,10 +37,16 @@ export function cacheControlFor(signal: AbortSignal | undefined): string {
 const KEPT_URLS = 128;
 
 interface Kept {
-  etag: string;
+  etag: string | null;
   raw: unknown;
   normalized: unknown;
-  normalize: (raw: unknown) => unknown;
+  normalize: ((raw: unknown) => unknown) | null;
+  freshUntilMs: number;
+}
+
+export interface ValidatedHooks {
+  onPersist?: (url: string, etag: string, raw: unknown) => void;
+  onClear?: () => void;
 }
 
 export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
@@ -63,15 +69,62 @@ function staleReadAbort(): DOMException {
 export class Validated {
   private readonly kept = new Map<string, Kept>();
   private readonly fetcher: FetchLike;
+  private readonly hooks: ValidatedHooks | undefined;
   private generation = 0;
 
-  constructor(fetcher: FetchLike = (url, init) => fetch(url, init)) {
+  constructor(
+    fetcher: FetchLike = (url, init) => fetch(url, init),
+    hooks?: ValidatedHooks,
+  ) {
     this.fetcher = fetcher;
+    this.hooks = hooks;
   }
 
   /** Monotonic invalidation generation bumped on every `clear()`. */
   get epoch(): number {
     return this.generation;
+  }
+
+  /** Seed an entry in memory (e.g. from sessionStorage or an auth probe)
+   * without firing `onPersist`. */
+  seed(url: string, etag: string | null, raw: unknown, freshMs = 0): void {
+    const freshUntilMs = freshMs > 0 ? Date.now() + freshMs : 0;
+    if (!etag && freshUntilMs === 0) return;
+    this.touch(url, {
+      etag,
+      raw,
+      normalized: undefined,
+      normalize: null,
+      freshUntilMs,
+    });
+  }
+
+  /** Extend the one-shot fresh bypass window of an already held URL (for
+   * example when `probeAuth` revalidated `/api/overview` with 304). */
+  markFreshFor(url: string, freshMs: number): void {
+    if (freshMs <= 0) return;
+    const kept = this.kept.get(url);
+    if (kept) {
+      kept.freshUntilMs = Date.now() + freshMs;
+    }
+  }
+
+  /** Last ETag held for `url`, if any. */
+  etagOf(url: string): string | null {
+    return this.kept.get(url)?.etag ?? null;
+  }
+
+  /** Return the normalized value already held for `url`, lazily normalizing and
+   * memoizing it once so subsequent reads or 304s return the same object. */
+  peek<T>(url: string, normalize: (raw: unknown) => T): T | null {
+    const kept = this.kept.get(url);
+    if (!kept) return null;
+    if (kept.normalize === normalize) return kept.normalized as T;
+    const normalized = normalize(kept.raw);
+    kept.normalized = normalized;
+    kept.normalize = normalize;
+    this.touch(url, kept);
+    return normalized;
   }
 
   /** GET `url` and normalize it, or, answered 304, the value read last
@@ -83,11 +136,33 @@ export class Validated {
       this.generation === readGeneration && (options.isCurrent?.() ?? true);
     if (!stillCurrent()) throw staleReadAbort();
     const kept = this.kept.get(url);
+    if (
+      kept &&
+      kept.freshUntilMs > Date.now() &&
+      cacheControlFor(options.signal) !== FRESH
+    ) {
+      kept.freshUntilMs = 0;
+      const value =
+        kept.normalize === normalize
+          ? (kept.normalized as T)
+          : (() => {
+              const normalized = normalize(kept.raw);
+              kept.normalized = normalized;
+              kept.normalize = normalize;
+              return normalized;
+            })();
+      if (kept.etag) {
+        this.touch(url, kept);
+      } else {
+        this.kept.delete(url);
+      }
+      return value;
+    }
     const headers: Record<string, string> = {
       ...options.headers,
       "Cache-Control": cacheControlFor(options.signal),
     };
-    if (kept) headers["If-None-Match"] = kept.etag;
+    if (kept?.etag) headers["If-None-Match"] = kept.etag;
     const response = await this.fetcher(url, {
       signal: options.signal,
       cache: "no-store",
@@ -102,9 +177,16 @@ export class Validated {
       // aborted, and its developer tools list every 304 as a failure.
       await response.arrayBuffer().catch(() => undefined);
       if (!stillCurrent()) throw staleReadAbort();
+      kept.freshUntilMs = 0;
       // Read again by another caller with another reading of the same
       // answer: normalize it its own way.
-      if (kept.normalize !== normalize) return normalize(kept.raw);
+      if (kept.normalize !== normalize) {
+        const normalized = normalize(kept.raw);
+        kept.normalized = normalized;
+        kept.normalize = normalize;
+        this.touch(url, kept);
+        return normalized;
+      }
       this.touch(url, kept);
       return kept.normalized as T;
     }
@@ -126,7 +208,8 @@ export class Validated {
     const normalized = normalize(raw);
     const etag = response.headers.get("ETag");
     if (etag) {
-      this.touch(url, { etag, raw, normalized, normalize });
+      this.touch(url, { etag, raw, normalized, normalize, freshUntilMs: 0 });
+      this.hooks?.onPersist?.(url, etag, raw);
     } else {
       this.kept.delete(url);
     }
@@ -142,6 +225,7 @@ export class Validated {
   clear(): void {
     this.generation += 1;
     this.kept.clear();
+    this.hooks?.onClear?.();
   }
 
   private touch(url: string, kept: Kept) {

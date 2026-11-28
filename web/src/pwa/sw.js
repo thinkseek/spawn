@@ -21,7 +21,7 @@ const VERSION = "spawn-shell-v2";
 const ASSETS = "spawn-assets-v2";
 const ASSETS_MAX = 60;
 /** How long a navigation waits for the network before the kept page answers. */
-const NAVIGATION_TIMEOUT_MS = 4000;
+const NAVIGATION_TIMEOUT_MS = 1500;
 const PAGE_PATHS = ["/", "/index.html"];
 const SHELL_PATHS = ["/manifest.webmanifest", "/icon.svg"];
 
