@@ -695,3 +695,61 @@ fn native_session_launch_arguments_match_the_pre_refactor_launch() {
         assert_eq!(launch(&CodexDriver, session), codex, "codex {session:?}");
     }
 }
+
+#[test]
+fn rollout_filename_session_meta_and_event_msg_item_completed_work_end_to_end() {
+    use spawn_core::driver_codex::is_codex_rollout_filename;
+
+    assert!(is_codex_rollout_filename(
+        "0194b1e2-7c4d-7000-8000-000000000001.jsonl",
+        "0194b1e2-7c4d-7000-8000-000000000001"
+    ));
+    assert!(is_codex_rollout_filename(
+        "rollout-2026-11-28T10-00-00-0194b1e2-7c4d-7000-8000-000000000001.jsonl",
+        "0194b1e2-7c4d-7000-8000-000000000001"
+    ));
+    assert!(!is_codex_rollout_filename(
+        "session-0194b1e2-7c4d-7000-8000-000000000001.jsonl",
+        "0194b1e2-7c4d-7000-8000-000000000001"
+    ));
+    assert!(!is_codex_rollout_filename("rollout-bad.jsonl", "../escape"));
+
+    let codex = driver(CODEX_ID).expect("codex registered");
+    assert_eq!(
+        codex.reported_session(
+            r#"{"type":"session_meta","payload":{"session_id":"0194b1e2-9999-7000-8000-000000000002","id":"fallback"}}"#
+        ),
+        Some("0194b1e2-9999-7000-8000-000000000002".to_string())
+    );
+
+    let mut cursor = LineCursor::default();
+    let wrapped_ok = codex_line(
+        r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"id":"it_ok","type":"command_execution","status":"completed","exit_code":0,"duration_ms":25}}}"#,
+        &mut cursor,
+    );
+    assert_eq!(wrapped_ok.events.len(), 1);
+    assert_eq!(
+        wrapped_ok.events[0].source_event_id.as_deref(),
+        Some("it_ok:ended")
+    );
+    assert!(matches!(
+        &wrapped_ok.events[0].kind,
+        EventKind::ToolCompleted {
+            tool_use_id,
+            duration_ms: Some(25),
+        } if tool_use_id == "it_ok"
+    ));
+
+    let wrapped_err = codex_line(
+        r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"id":"it_err","type":"command_execution","status":"failed","exit_code":2,"error":"Authorization: Bearer secret-xyz failed"}}}"#,
+        &mut cursor,
+    );
+    assert_eq!(wrapped_err.events.len(), 1);
+    match &wrapped_err.events[0].kind {
+        EventKind::ToolFailed { tool_use_id, error } => {
+            assert_eq!(tool_use_id, "it_err");
+            assert!(!error.contains("secret-xyz"), "{error}");
+        }
+        other => panic!("expected ToolFailed, got {other:?}"),
+    }
+}

@@ -1784,10 +1784,12 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
 }
 
 const MAX_AGENT_WAIT_MS: u64 = 120_000;
+const MAX_AGENT_EVENTS_LIMIT: usize = 1_000;
 
-enum AgentRoute {
+pub(super) enum AgentRoute {
     List,
     Snapshot { address: TerminalAddress },
+    Events { address: TerminalAddress },
     Action { address: TerminalAddress },
     InvalidAddress,
 }
@@ -1797,7 +1799,7 @@ fn decode_agent_address(raw: &str) -> Option<TerminalAddress> {
     TerminalAddress::parse(&decoded).ok()
 }
 
-fn parse_agent_route(path: &str) -> Option<AgentRoute> {
+pub(super) fn parse_agent_route(path: &str) -> Option<AgentRoute> {
     if path == "/api/agents" {
         return Some(AgentRoute::List);
     }
@@ -1808,6 +1810,12 @@ fn parse_agent_route(path: &str) -> Option<AgentRoute> {
             None => AgentRoute::InvalidAddress,
         });
     }
+    if let Some(raw_addr) = rest.strip_suffix("/events") {
+        return Some(match decode_agent_address(raw_addr) {
+            Some(address) => AgentRoute::Events { address },
+            None => AgentRoute::InvalidAddress,
+        });
+    }
     if let Some(raw_addr) = rest.strip_suffix("/action") {
         return Some(match decode_agent_address(raw_addr) {
             Some(address) => AgentRoute::Action { address },
@@ -1815,10 +1823,6 @@ fn parse_agent_route(path: &str) -> Option<AgentRoute> {
         });
     }
     None
-}
-
-fn agent_socket_scope(shared: &Shared) -> Result<SocketScope, GlobalHerdrError> {
-    SocketScope::resolve(shared.agent_socket.as_deref(), &shared.herdr_discovery)
 }
 
 fn agent_visibility(access: AuthPrincipal) -> DiscoveryScope {
@@ -1855,6 +1859,27 @@ fn parse_agents_all_query(query: &str) -> Result<bool, String> {
             Some("false" | "0") => Ok(false),
             _ => Err(format!("{BAD_REQUEST}all must be true, false, 1, or 0")),
         },
+    }
+}
+
+fn parse_agent_events_limit_query(query: &str) -> Result<usize, String> {
+    match query_param(query, "limit") {
+        None => Ok(spawn_core::agent_events::DEFAULT_FUSED_EVENT_LIMIT),
+        Some(raw) => {
+            let decoded = percent_decoded(raw)
+                .ok_or_else(|| format!("{BAD_REQUEST}invalid limit query parameter"))?;
+            let parsed = decoded.trim().parse::<usize>().map_err(|_| {
+                format!(
+                    "{BAD_REQUEST}limit must be an integer between 1 and {MAX_AGENT_EVENTS_LIMIT}"
+                )
+            })?;
+            if !(1..=MAX_AGENT_EVENTS_LIMIT).contains(&parsed) {
+                return Err(format!(
+                    "{BAD_REQUEST}limit must be between 1 and {MAX_AGENT_EVENTS_LIMIT}"
+                ));
+            }
+            Ok(parsed)
+        }
     }
 }
 
@@ -1913,21 +1938,101 @@ fn validate_agent_action(action: &TuiAction) -> Result<(), (u16, String)> {
     }
 }
 
-fn agent_action_checked(
-    request: &mut Request,
+fn agent_list_answer(
+    query: &str,
+    access: AuthPrincipal,
+    agent_socket: Option<&Path>,
+    discovery_env: &spawn_host::HerdrDiscoveryEnv,
+) -> Result<answers::Answer, (u16, String)> {
+    let include_exited = parse_agents_all_query(query).map_err(|err| (400, err))?;
+    let visibility = agent_visibility(access);
+    let scope = SocketScope::resolve(agent_socket, discovery_env).map_err(agent_error_tuple)?;
+    let terminals = HerdrGlobalClient::discover_in_scope(&scope, include_exited, visibility)
+        .map_err(agent_error_tuple)?;
+    Ok(answers::answer(
+        "/api/agents",
+        Ok(json!({ "agents": terminals, "count": terminals.len() })),
+        BAD_REQUEST,
+    ))
+}
+
+fn agent_snapshot_answer(
     address: &TerminalAddress,
     access: AuthPrincipal,
-    shared: &Shared,
+    agent_socket: Option<&Path>,
+    discovery_env: &spawn_host::HerdrDiscoveryEnv,
+) -> Result<answers::Answer, (u16, String)> {
+    let visibility = agent_visibility(access);
+    let scope = SocketScope::resolve(agent_socket, discovery_env).map_err(agent_error_tuple)?;
+    let client = HerdrGlobalClient::client_for_address(&scope, address.as_str())
+        .map_err(agent_error_tuple)?;
+    let snap = client
+        .snapshot_scoped(address.as_str(), visibility)
+        .map_err(agent_error_tuple)?;
+    let value = serde_json::to_value(&snap)
+        .map_err(|err| (500, format!("serialize agent snapshot: {err}")))?;
+    Ok(answers::answer(
+        "/api/agents/*/snapshot",
+        Ok(value),
+        BAD_REQUEST,
+    ))
+}
+
+fn parse_agent_after_key_query(query: &str) -> Result<Option<String>, String> {
+    match query_param(query, "after_key") {
+        None => Ok(None),
+        Some(raw) => {
+            let decoded = percent_decoded(raw)
+                .ok_or_else(|| format!("{BAD_REQUEST}invalid after_key query parameter"))?;
+            if decoded.is_empty() || decoded.len() > 256 || decoded.chars().any(char::is_control) {
+                return Err(format!(
+                    "{BAD_REQUEST}after_key must be non-empty, <= 256 bytes, and contain no control characters"
+                ));
+            }
+            Ok(Some(decoded))
+        }
+    }
+}
+
+fn agent_events_answer(
+    address: &TerminalAddress,
+    query: &str,
+    access: AuthPrincipal,
+    agent_socket: Option<&Path>,
+    discovery_env: &spawn_host::HerdrDiscoveryEnv,
+) -> Result<answers::Answer, (u16, String)> {
+    let limit = parse_agent_events_limit_query(query).map_err(|err| (400, err))?;
+    let after_key = parse_agent_after_key_query(query).map_err(|err| (400, err))?;
+    let visibility = agent_visibility(access);
+    let scope = SocketScope::resolve(agent_socket, discovery_env).map_err(agent_error_tuple)?;
+    let client = HerdrGlobalClient::client_for_address(&scope, address.as_str())
+        .map_err(agent_error_tuple)?;
+    let report = client
+        .events_scoped_since(address.as_str(), visibility, limit, after_key.as_deref())
+        .map_err(agent_error_tuple)?;
+    let value = serde_json::to_value(&report)
+        .map_err(|err| (500, format!("serialize agent events: {err}")))?;
+    Ok(answers::answer(
+        "/api/agents/*/events",
+        Ok(value),
+        BAD_REQUEST,
+    ))
+}
+
+pub(super) fn agent_action_checked_bytes(
+    raw_body: &[u8],
+    address: &TerminalAddress,
+    agent_socket: Option<&Path>,
+    discovery_env: &spawn_host::HerdrDiscoveryEnv,
 ) -> Result<(u16, Value), (u16, String)> {
-    let (raw_body, _) = write_body(request, access, shared, "an agent action")?;
-    let action: TuiAction = serde_json::from_slice(&raw_body).map_err(|error| {
+    let action: TuiAction = serde_json::from_slice(raw_body).map_err(|error| {
         (
             400,
             format!("{BAD_REQUEST}the body is not a valid TuiAction: {error}"),
         )
     })?;
     validate_agent_action(&action)?;
-    let scope = agent_socket_scope(shared).map_err(agent_error_tuple)?;
+    let scope = SocketScope::resolve(agent_socket, discovery_env).map_err(agent_error_tuple)?;
     let client = HerdrGlobalClient::client_for_address(&scope, address.as_str())
         .map_err(agent_error_tuple)?;
     let outcome = client
@@ -1936,6 +2041,21 @@ fn agent_action_checked(
     let body = serde_json::to_value(&outcome)
         .map_err(|error| (500, format!("serialize TuiActionOutcome: {error}")))?;
     Ok((200, body))
+}
+
+fn respond_agent_answer(
+    request: Request,
+    res: Result<answers::Answer, (u16, String)>,
+) -> Result<(), String> {
+    match res {
+        Ok(answer) => {
+            let if_none_match = header(&request, "If-None-Match").map(str::to_string);
+            answers::respond(request, &answer, if_none_match.as_deref())
+        }
+        Err((status, message)) => request
+            .respond(json_response(status, &json!({ "error": message })))
+            .map_err(|error| error.to_string()),
+    }
 }
 
 fn respond_agent_route(
@@ -1958,35 +2078,15 @@ fn respond_agent_route(
                     .respond(not_allowed("GET"))
                     .map_err(|error| error.to_string());
             }
-            let include_exited = match parse_agents_all_query(query) {
-                Ok(all) => all,
-                Err(error) => {
-                    return request
-                        .respond(json_response(400, &json!({ "error": error })))
-                        .map_err(|err| err.to_string());
-                }
-            };
-            let visibility = agent_visibility(access);
-            let read = agent_socket_scope(shared).and_then(|scope| {
-                HerdrGlobalClient::discover_in_scope(&scope, include_exited, visibility)
-            });
-            match read {
-                Ok(terminals) => {
-                    let answer = answers::answer(
-                        "/api/agents",
-                        Ok(json!({ "agents": terminals, "count": terminals.len() })),
-                        BAD_REQUEST,
-                    );
-                    let if_none_match = header(&request, "If-None-Match").map(str::to_string);
-                    answers::respond(request, &answer, if_none_match.as_deref())
-                }
-                Err(err) => request
-                    .respond(json_response(
-                        agent_error_status(err.kind),
-                        &json!({ "error": err.message }),
-                    ))
-                    .map_err(|error| error.to_string()),
-            }
+            respond_agent_answer(
+                request,
+                agent_list_answer(
+                    query,
+                    access,
+                    shared.agent_socket.as_deref(),
+                    &shared.herdr_discovery,
+                ),
+            )
         }
         AgentRoute::Snapshot { address } => {
             if !matches!(request.method(), Method::Get | Method::Head) {
@@ -1994,26 +2094,32 @@ fn respond_agent_route(
                     .respond(not_allowed("GET"))
                     .map_err(|error| error.to_string());
             }
-            let visibility = agent_visibility(access);
-            let read = agent_socket_scope(shared).and_then(|scope| {
-                let client = HerdrGlobalClient::client_for_address(&scope, address.as_str())?;
-                client.snapshot_scoped(address.as_str(), visibility)
-            });
-            match read {
-                Ok(snap) => {
-                    let value = serde_json::to_value(&snap)
-                        .map_err(|err| format!("serialize agent snapshot: {err}"));
-                    let answer = answers::answer("/api/agents/*/snapshot", value, BAD_REQUEST);
-                    let if_none_match = header(&request, "If-None-Match").map(str::to_string);
-                    answers::respond(request, &answer, if_none_match.as_deref())
-                }
-                Err(err) => request
-                    .respond(json_response(
-                        agent_error_status(err.kind),
-                        &json!({ "error": err.message }),
-                    ))
-                    .map_err(|error| error.to_string()),
+            respond_agent_answer(
+                request,
+                agent_snapshot_answer(
+                    &address,
+                    access,
+                    shared.agent_socket.as_deref(),
+                    &shared.herdr_discovery,
+                ),
+            )
+        }
+        AgentRoute::Events { address } => {
+            if !matches!(request.method(), Method::Get | Method::Head) {
+                return request
+                    .respond(not_allowed("GET"))
+                    .map_err(|error| error.to_string());
             }
+            respond_agent_answer(
+                request,
+                agent_events_answer(
+                    &address,
+                    query,
+                    access,
+                    shared.agent_socket.as_deref(),
+                    &shared.herdr_discovery,
+                ),
+            )
         }
         AgentRoute::Action { address } => {
             if *request.method() != Method::Post {
@@ -2021,8 +2127,15 @@ fn respond_agent_route(
                     .respond(not_allowed("POST"))
                     .map_err(|error| error.to_string());
             }
-            let (status, body) = match agent_action_checked(&mut request, &address, access, shared)
-            {
+            let (status, body) = match write_body(&mut request, access, shared, "an agent action")
+                .and_then(|(raw_body, _)| {
+                    agent_action_checked_bytes(
+                        &raw_body,
+                        &address,
+                        shared.agent_socket.as_deref(),
+                        &shared.herdr_discovery,
+                    )
+                }) {
                 Ok(answer) => answer,
                 Err((status, error)) => (status, json!({ "error": error })),
             };
@@ -12803,6 +12916,7 @@ mod tests {
         for (method, path, body) in [
             ("GET", "/api/agents", ""),
             ("GET", "/api/agents/t2/snapshot", ""),
+            ("GET", "/api/agents/t2/events", ""),
             ("POST", "/api/agents/t2/action", "{}"),
         ] {
             let anon = raw_method(port, method, path, "", body);
@@ -12846,12 +12960,23 @@ mod tests {
             200
         );
 
+        let managed_events = raw_method(port, "GET", "/api/agents/t1/events", &viewer_hdr, "");
+        assert_eq!(managed_events.status, 200, "{managed_events:?}");
+        assert_eq!(managed_events.body["address"], "t1");
+        assert!(managed_events.body["events"].is_array());
+        assert_eq!(
+            raw_method(port, "HEAD", "/api/agents/t1/events", &viewer_hdr, "").status,
+            200
+        );
+
         for method in ["GET", "HEAD"] {
-            let denied = raw_method(port, method, "/api/agents/t2/snapshot", &viewer_hdr, "");
-            assert_eq!(
-                denied.status, 403,
-                "viewer {method} external snapshot must 403: {denied:?}"
-            );
+            for ext_path in ["/api/agents/t2/snapshot", "/api/agents/t2/events"] {
+                let denied = raw_method(port, method, ext_path, &viewer_hdr, "");
+                assert_eq!(
+                    denied.status, 403,
+                    "viewer {method} external {ext_path} must 403: {denied:?}"
+                );
+            }
         }
         assert_eq!(
             srv_state
@@ -12918,6 +13043,44 @@ mod tests {
             raw_method(port, "GET", "/api/agents/missing/snapshot", admin_hdr, "").status,
             404
         );
+        assert_eq!(
+            raw_method(port, "GET", "/api/agents/missing/events", admin_hdr, "").status,
+            404
+        );
+        for bad_ev in [
+            "/api/agents/t1/events?limit=0",
+            "/api/agents/t1/events?limit=1001",
+            "/api/agents/t1/events?limit=abc",
+            "/api/agents/t1/events?after_key=",
+            &format!("/api/agents/t1/events?after_key={}", "k".repeat(300)),
+        ] {
+            assert_eq!(
+                raw_method(port, "GET", bad_ev, admin_hdr, "").status,
+                400,
+                "{bad_ev}"
+            );
+        }
+        assert_eq!(
+            raw_method(port, "POST", "/api/agents/t1/events", admin_json_hdr, "{}").status,
+            405
+        );
+        let admin_events = raw_method(port, "GET", "/api/agents/t2/events?limit=10", admin_hdr, "");
+        assert_eq!(admin_events.status, 200, "{admin_events:?}");
+        assert_eq!(admin_events.body["address"], "t2");
+        assert!(admin_events.body["count"].as_u64().is_some());
+        assert!(admin_events.body["summary"]["health"]["health"].is_string());
+        if let Some(cursor) = admin_events.body["latest_key"].as_str() {
+            let delta = raw_method(
+                port,
+                "GET",
+                &format!("/api/agents/t2/events?after_key={cursor}"),
+                admin_hdr,
+                "",
+            );
+            assert_eq!(delta.status, 200, "{delta:?}");
+            assert_eq!(delta.body["count"], 0);
+            assert_eq!(delta.body["cursor_reset"], false);
+        }
         assert_eq!(
             raw_method(port, "POST", "/api/agents", admin_json_hdr, "{}").status,
             405

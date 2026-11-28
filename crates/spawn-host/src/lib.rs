@@ -40,6 +40,7 @@ pub mod process;
 pub mod root;
 #[cfg(any(test, feature = "testing"))]
 pub mod scratch;
+pub mod session_discovery;
 mod terminal_support;
 pub mod transcripts;
 pub mod tree_path;

@@ -6,6 +6,7 @@
 
 // `bridge.rs` carries 5 pre-existing private intra-doc links and is locked by
 // concurrent PRs (#126/#150); clean up inside `bridge.rs` after those merge.
+pub mod agent_events;
 #[allow(rustdoc::private_intra_doc_links)]
 pub mod bridge;
 pub mod command;

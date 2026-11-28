@@ -6,13 +6,19 @@
 //! via a single [`TuiAction`] interface guarded by optimistic pre-flight screen
 //! digests, interrupt, and wait on both Spawn-managed and external/human terminals.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use spawn_core::agent_events::{
+    AgentEngine, CanonicalEventKey, EventFidelity, EventOrigin, FusedAgentEvent, FusedEventKind,
+    FusedEventsReport, SessionDiscoveryStatus, SummaryInput, TerminalTelemetrySummary,
+    fuse_all_agent_events, parse_session_lines, slice_events_after_key,
+    summarize_agent_observability,
+};
 use spawn_core::port::{AgentReading, AgentStatus, TerminalError};
 use spawn_core::tui::{
     DiscoveredTerminal, ExitCause, InterruptOutcome, InterruptReport, KeyChord, RawPlainSnapshot,
@@ -21,7 +27,10 @@ use spawn_core::tui::{
     is_reserved_spawn_label,
 };
 
-use crate::herdr_witness::{OscStatus, observe};
+use crate::herdr_witness::{OscStatus, ProcSnapshot, inspect_process_tree_in, observe_in};
+use crate::session_discovery::{
+    MAX_SESSION_READ_BYTES, discover_session_cached_in, read_session_tail_lines,
+};
 
 const CALL_LIMIT: Duration = Duration::from_secs(10);
 const CAPTURE_LIMIT: Duration = Duration::from_secs(15);
@@ -382,9 +391,10 @@ impl HerdrGlobalClient {
                 format!("terminal.list missing terminals array: {listed}"),
             )));
         };
+        let procs = ProcSnapshot::capture();
         let mut out = Vec::with_capacity(items.len());
         for item in items {
-            if let Some(entry) = self.build_discovered_terminal(item, visibility)? {
+            if let Some(entry) = self.build_discovered_terminal(item, visibility, &procs)? {
                 out.push(entry);
             }
         }
@@ -395,6 +405,7 @@ impl HerdrGlobalClient {
         &self,
         item: &Value,
         visibility: DiscoveryScope,
+        procs: &ProcSnapshot,
     ) -> Result<Option<DiscoveredTerminal>, RpcFailure> {
         let Some(address) = item["address"]
             .as_str()
@@ -428,7 +439,8 @@ impl HerdrGlobalClient {
                 &json!({ "terminal": address, "lines": 0 }),
                 CAPTURE_LIMIT,
             ) {
-                Ok(read) => resolve_reading(
+                Ok(read) => resolve_reading_in(
+                    procs,
                     pid,
                     read["text"].as_str().unwrap_or_default(),
                     osc_status.as_ref(),
@@ -443,6 +455,15 @@ impl HerdrGlobalClient {
                 .as_ref()
                 .map_or_else(crate::herdr_witness::no_agent, osc_fallback_reading)
         };
+
+        let engine_hint = reading.agent.as_deref().and_then(AgentEngine::generic);
+        let (session, telemetry) = build_terminal_telemetry_in(
+            procs,
+            is_live,
+            machine.is_none(),
+            pid,
+            engine_hint.as_ref(),
+        );
 
         Ok(Some(DiscoveredTerminal {
             address,
@@ -463,6 +484,8 @@ impl HerdrGlobalClient {
             rows: u16::try_from(item["rows"].as_u64().unwrap_or(0)).unwrap_or(0),
             agent: reading.agent,
             agent_status: reading.status,
+            session,
+            telemetry,
             turn: item["turn"].as_u64().unwrap_or(0),
             keep: item["keep"].as_bool().unwrap_or(false),
         }))
@@ -483,6 +506,92 @@ impl HerdrGlobalClient {
         address: &str,
         visibility: DiscoveryScope,
     ) -> Result<TuiSnapshot, GlobalHerdrError> {
+        let procs = ProcSnapshot::capture();
+        let (snap, _, _, _) =
+            self.capture_snapshot_meta_in(&procs, address, visibility, "snapshot")?;
+        Ok(snap)
+    }
+
+    /// Returns incremental fused events strictly newer than `after_key` (or newest
+    /// `limit` events with `cursor_reset = true` when `after_key` is absent/unknown),
+    /// alongside structured `/proc` telemetry and [`AgentObservabilitySummary`].
+    pub fn events_scoped_since(
+        &self,
+        address: &str,
+        visibility: DiscoveryScope,
+        limit: usize,
+        after_key: Option<&str>,
+    ) -> Result<FusedEventsReport, GlobalHerdrError> {
+        let procs = ProcSnapshot::capture();
+        let (snap, pid, is_live, has_osc) =
+            self.capture_snapshot_meta_in(&procs, address, visibility, "inspect")?;
+        let herdr_events = herdr_events_from_snapshot(&snap, is_live);
+        let engine = snap.agent().map(str::to_string);
+        let engine_hint = snap.agent().and_then(AgentEngine::generic);
+        let is_local = split_machine(snap.address()).is_none();
+        let process_tree = if is_live && is_local {
+            pid.and_then(|p| inspect_process_tree_in(&procs, p))
+        } else {
+            None
+        };
+        let (session, discovery_status, session_events) = collect_session_events_in(
+            &procs,
+            is_live,
+            is_local,
+            pid,
+            engine_hint.as_ref(),
+            snap.address(),
+        );
+        let full_events = fuse_all_agent_events(herdr_events, session_events, Vec::new());
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok());
+        let summary = summarize_agent_observability(&SummaryInput {
+            events: &full_events,
+            is_live,
+            agent_status: snap.agent_status(),
+            active_rule: snap.rule(),
+            has_osc_signal: has_osc,
+            process_tree: process_tree.as_ref(),
+            discovery_status,
+            now_ms,
+        });
+        let (events, latest_key, truncated, cursor_reset) =
+            slice_events_after_key(full_events, after_key, limit.clamp(1, 1000));
+        let fidelity = if events
+            .iter()
+            .any(|ev| ev.fidelity == EventFidelity::SessionEnriched)
+            || summary
+                .sources_observed
+                .contains(&spawn_core::agent_events::ObservabilitySource::NativeSession)
+        {
+            EventFidelity::SessionEnriched
+        } else {
+            EventFidelity::ScreenOnly
+        };
+        Ok(FusedEventsReport {
+            address: snap.address().to_string(),
+            engine,
+            session,
+            fidelity,
+            summary,
+            process_tree,
+            latest_key,
+            cursor_reset,
+            count: events.len(),
+            truncated,
+            events,
+        })
+    }
+
+    fn capture_snapshot_meta_in(
+        &self,
+        procs: &ProcSnapshot,
+        address: &str,
+        visibility: DiscoveryScope,
+        action_verb: &str,
+    ) -> Result<(TuiSnapshot, Option<u32>, bool, bool), GlobalHerdrError> {
         TerminalAddress::parse(address)
             .map_err(|msg| GlobalHerdrError::new(GlobalErrorKind::InvalidParams, msg))?;
         let info = self.call_rpc("terminal.get", &json!({ "terminal": address }), CALL_LIMIT)?;
@@ -492,7 +601,9 @@ impl HerdrGlobalClient {
         {
             return Err(GlobalHerdrError::new(
                 GlobalErrorKind::ForbiddenExternal,
-                format!("forbidden: read-only viewer cannot snapshot external terminal {address}"),
+                format!(
+                    "forbidden: read-only viewer cannot {action_verb} external terminal {address}"
+                ),
             ));
         }
         let resolved_addr = info["address"].as_str().unwrap_or(address);
@@ -504,9 +615,10 @@ impl HerdrGlobalClient {
             TerminalLiveState::Exited { .. } => (false, None),
         };
         let osc_status = OscStatus::from_json(&info["status"]);
+        let has_osc = osc_status.is_some();
 
         if is_live && let Some(raw_vt) = self.capture_styled_vt(resolved_addr, cols, rows)? {
-            return Ok(TuiSnapshot::from_styled_vt_observed(
+            let snap = TuiSnapshot::from_styled_vt_observed(
                 RawStyledSnapshot {
                     address: resolved_addr,
                     cols,
@@ -517,7 +629,7 @@ impl HerdrGlobalClient {
                 },
                 |plain_lines| {
                     let plain_text = plain_lines.join("\n");
-                    let reading = resolve_reading(pid, &plain_text, osc_status.as_ref());
+                    let reading = resolve_reading_in(procs, pid, &plain_text, osc_status.as_ref());
                     SnapshotObservation {
                         agent: reading.agent,
                         agent_status: reading.status,
@@ -525,7 +637,8 @@ impl HerdrGlobalClient {
                         blocker_visible: reading.blocker_visible,
                     }
                 },
-            ));
+            );
+            return Ok((snap, pid, is_live, has_osc));
         }
 
         let read = self.call_rpc(
@@ -534,8 +647,8 @@ impl HerdrGlobalClient {
             CAPTURE_LIMIT,
         )?;
         let raw_text = read["text"].as_str().unwrap_or_default();
-        let reading = resolve_reading(pid, raw_text, osc_status.as_ref());
-        Ok(TuiSnapshot::from_plain_text(RawPlainSnapshot {
+        let reading = resolve_reading_in(procs, pid, raw_text, osc_status.as_ref());
+        let snap = TuiSnapshot::from_plain_text(RawPlainSnapshot {
             address: resolved_addr,
             cols,
             rows,
@@ -549,7 +662,8 @@ impl HerdrGlobalClient {
             agent_status: reading.status,
             rule: reading.rule.as_deref(),
             blocker_visible: reading.blocker_visible,
-        }))
+        });
+        Ok((snap, pid, is_live, has_osc))
     }
 
     /// Executes a single [`TuiAction`] against a live terminal.
@@ -1270,6 +1384,163 @@ fn is_holder_socket(path: &Path) -> bool {
     }
 }
 
+fn build_terminal_telemetry_in(
+    procs: &ProcSnapshot,
+    is_live: bool,
+    is_local: bool,
+    pid: Option<u32>,
+    engine_hint: Option<&AgentEngine>,
+) -> (
+    Option<spawn_core::agent_events::SessionAttachment>,
+    Option<TerminalTelemetrySummary>,
+) {
+    if !is_live {
+        return (
+            None,
+            Some(TerminalTelemetrySummary {
+                process_count: 0,
+                child_count: 0,
+                total_rss_kib: 0,
+                active_command: None,
+                discovery_status: SessionDiscoveryStatus::NoLivePid,
+                session_bytes: None,
+                session_mtime_ms: None,
+            }),
+        );
+    }
+    if !is_local {
+        return (
+            None,
+            Some(TerminalTelemetrySummary {
+                process_count: 0,
+                child_count: 0,
+                total_rss_kib: 0,
+                active_command: None,
+                discovery_status: SessionDiscoveryStatus::RemoteTerminalUnscanned,
+                session_bytes: None,
+                session_mtime_ms: None,
+            }),
+        );
+    }
+    let proc_tree = pid.and_then(|p| inspect_process_tree_in(procs, p));
+    let outcome = pid.map(|p| discover_session_cached_in(procs, p, engine_hint, &[], true));
+    let (session, discovery_status, session_bytes, session_mtime_ms) = match outcome {
+        Some(o) => (o.attachment, o.status, o.file_bytes, o.file_mtime_ms),
+        None => (None, SessionDiscoveryStatus::NoLivePid, None, None),
+    };
+    let telemetry = TerminalTelemetrySummary {
+        process_count: proc_tree.as_ref().map_or(0, |t| t.process_count),
+        child_count: proc_tree.as_ref().map_or(0, |t| t.child_count),
+        total_rss_kib: proc_tree.as_ref().map_or(0, |t| t.total_rss_kib),
+        active_command: proc_tree.and_then(|t| t.active_leaf_command),
+        discovery_status,
+        session_bytes,
+        session_mtime_ms,
+    };
+    (session, Some(telemetry))
+}
+
+fn collect_session_events_in(
+    procs: &ProcSnapshot,
+    is_live: bool,
+    is_local: bool,
+    pid: Option<u32>,
+    engine_hint: Option<&AgentEngine>,
+    addr: &str,
+) -> (
+    Option<spawn_core::agent_events::SessionAttachment>,
+    SessionDiscoveryStatus,
+    Vec<FusedAgentEvent>,
+) {
+    if !is_local {
+        return (
+            None,
+            SessionDiscoveryStatus::RemoteTerminalUnscanned,
+            Vec::new(),
+        );
+    }
+    let Some(leader_pid) = pid.filter(|_| is_live) else {
+        return (None, SessionDiscoveryStatus::NoLivePid, Vec::new());
+    };
+    let outcome = discover_session_cached_in(procs, leader_pid, engine_hint, &[], false);
+    let Some(att) = outcome.attachment else {
+        return (None, outcome.status, Vec::new());
+    };
+    match read_session_tail_lines(Path::new(&att.path), MAX_SESSION_READ_BYTES) {
+        Ok(lines) => {
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            let parsed = parse_session_lines(
+                att.format,
+                &refs,
+                Some(addr),
+                att.native_session_id.as_deref(),
+            );
+            (Some(att), outcome.status, parsed)
+        }
+        Err(err) => (
+            Some(att),
+            SessionDiscoveryStatus::ReadFailed {
+                reason: spawn_core::agent_events::clean_summary(&err),
+            },
+            Vec::new(),
+        ),
+    }
+}
+
+fn herdr_events_from_snapshot(snap: &TuiSnapshot, is_live: bool) -> Vec<FusedAgentEvent> {
+    let mut events = Vec::new();
+    let digest = snap.guard().as_u64();
+    let addr = Some(snap.address().to_string());
+    let status_label = if is_live {
+        match snap.agent_status() {
+            AgentStatus::Idle => "idle",
+            AgentStatus::Working => "working",
+            AgentStatus::Blocked => "blocked",
+            AgentStatus::Unknown => "unknown",
+        }
+    } else {
+        "exited"
+    };
+    if snap.agent().is_some() || !is_live || snap.agent_status() != AgentStatus::Unknown {
+        events.push(FusedAgentEvent {
+            canonical_key: CanonicalEventKey::ScreenSignal {
+                digest,
+                rule: format!("state:{status_label}"),
+            }
+            .canonical_string(),
+            timestamp_ms: None,
+            fidelity: EventFidelity::ScreenOnly,
+            origins: BTreeSet::from([EventOrigin::HerdrPty]),
+            kind: FusedEventKind::ProcessState {
+                status: status_label.to_string(),
+                rule: snap.rule().map(str::to_string),
+            },
+            session_id: None,
+            terminal_address: addr.clone(),
+        });
+    }
+    if snap.agent_status() == AgentStatus::Blocked {
+        let rule = snap.rule().unwrap_or("blocked").to_string();
+        events.push(FusedAgentEvent {
+            canonical_key: CanonicalEventKey::ScreenSignal {
+                digest,
+                rule: rule.clone(),
+            }
+            .canonical_string(),
+            timestamp_ms: None,
+            fidelity: EventFidelity::ScreenOnly,
+            origins: BTreeSet::from([EventOrigin::HerdrPty]),
+            kind: FusedEventKind::PromptBlocked {
+                rule,
+                choices_count: snap.choices().len(),
+            },
+            session_id: None,
+            terminal_address: addr,
+        });
+    }
+    events
+}
+
 fn osc_fallback_reading(osc: &OscStatus) -> AgentReading {
     let status = AgentStatus::from_herdr(&osc.state);
     AgentReading {
@@ -1283,8 +1554,13 @@ fn osc_fallback_reading(osc: &OscStatus) -> AgentReading {
     }
 }
 
-fn resolve_reading(pid: Option<u32>, text: &str, osc_status: Option<&OscStatus>) -> AgentReading {
-    let reading = observe(pid, text, osc_status);
+fn resolve_reading_in(
+    procs: &ProcSnapshot,
+    pid: Option<u32>,
+    text: &str,
+    osc_status: Option<&OscStatus>,
+) -> AgentReading {
+    let reading = observe_in(procs, pid, text, osc_status);
     if reading.agent.is_none()
         && let Some(osc) = osc_status
     {
@@ -2254,5 +2530,303 @@ time.sleep(30)
 
         verify_real_labels_and_interrupt(&client, &addr);
         eprintln!("REAL_SPAWN_HC_GLOBAL_VERIFIED address={addr} styled_vt=true");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_mock_events_uds(
+        sock: &Path,
+        child_pid: u32,
+        external_reads: Arc<std::sync::atomic::AtomicUsize>,
+        screen_text: Arc<std::sync::Mutex<String>>,
+    ) -> std::thread::JoinHandle<()> {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixListener;
+
+        let listener = UnixListener::bind(sock).expect("bind mock");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut br = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                if br.read_line(&mut line).is_err() || line.is_empty() {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(&line).expect("json rpc");
+                let method = req["method"].as_str().unwrap_or_default();
+                if method == "__stop" {
+                    let _ = stream.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    break;
+                }
+                let reply = match method {
+                    "terminal.list" => json!({
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "terminals": [
+                                {
+                                    "address": "t1",
+                                    "labels": {"spawn_owner": "loop", "spawn_terminal": "spawn-exec_1"},
+                                    "state": "live",
+                                    "pid": child_pid,
+                                    "cols": 80,
+                                    "rows": 24,
+                                    "title": "codex",
+                                    "status": {"state": "working", "app": "codex"},
+                                    "turn": 1
+                                },
+                                {
+                                    "address": "t2",
+                                    "labels": {},
+                                    "state": "live",
+                                    "pid": child_pid,
+                                    "cols": 80,
+                                    "rows": 24,
+                                    "title": "ext",
+                                    "turn": 1
+                                }
+                            ]
+                        }
+                    }),
+                    "terminal.get" => {
+                        let term = req["params"]["terminal"].as_str().unwrap_or_default();
+                        let labels = if term == "t1" {
+                            json!({"spawn_owner": "loop", "spawn_terminal": "spawn-exec_1"})
+                        } else {
+                            json!({})
+                        };
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": req["id"],
+                            "result": {
+                                "address": term,
+                                "labels": labels,
+                                "state": "live",
+                                "pid": child_pid,
+                                "cols": 80,
+                                "rows": 24,
+                                "title": "codex",
+                                "status": {"state": "working", "app": "codex"},
+                                "turn": 1
+                            }
+                        })
+                    }
+                    "terminal.read" => {
+                        if req["params"]["terminal"].as_str() == Some("t2") {
+                            external_reads.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let txt = screen_text
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": req["id"],
+                            "result": { "text": txt, "complete": true, "how": "screen" }
+                        })
+                    }
+                    "hello" => json!({ "jsonrpc": "2.0", "id": req["id"], "result": {} }),
+                    other => panic!("unexpected rpc {other}"),
+                };
+                let _ = stream.write_all(format!("{reply}\n").as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                let mut drain = [0_u8; 8];
+                let _ = br.read(&mut drain);
+            }
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn events_scoped_enforces_rbac_and_fuses_pty_with_discovered_session() {
+        use std::io::Write as _;
+        use std::sync::atomic::AtomicUsize;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = temp_dir("events-fused");
+        let sock = dir.0.join("hc.sock");
+        let sess_path = dir.0.join("rollout-test.jsonl");
+        let now_ms = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(1_800_000_000_000);
+        {
+            let mut f = std::fs::File::create(&sess_path).expect("create rollout");
+            writeln!(
+                f,
+                r#"{{"ordinal":0,"timestamp":{},"type":"session_meta","payload":{{"session_id":"sess-hg-1","cwd":"{}"}}}}"#,
+                now_ms - 2_000,
+                dir.0.display()
+            )
+            .expect("write meta");
+            writeln!(
+                f,
+                r#"{{"ordinal":1,"timestamp":{},"type":"response_item","payload":{{"type":"function_call","call_id":"call_hg_1","name":"Bash","arguments":{{"command":"ls"}}}}}}"#,
+                now_ms - 1_000,
+            )
+            .expect("write call");
+            writeln!(
+                f,
+                r#"{{"ordinal":2,"timestamp":{now_ms},"type":"response_item","payload":{{"type":"function_call_output","call_id":"call_hg_1","output":"ok"}}}}"#
+            )
+            .expect("write out");
+            f.flush().expect("flush");
+        }
+
+        let mut child = ChildGuard(
+            std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    "import sys,time; f=open(sys.argv[1],'r'); sys.stdout.write('READY\\n'); sys.stdout.flush(); time.sleep(30)",
+                    sess_path.to_str().expect("utf8 path"),
+                ])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn fd holder"),
+        );
+        let child_pid = child.0.id();
+        if let Some(ref mut out) = child.0.stdout {
+            let mut br = std::io::BufReader::new(out);
+            let mut line = String::new();
+            let _ = br.read_line(&mut line);
+        }
+
+        let external_reads = Arc::new(AtomicUsize::new(0));
+        let screen_text = Arc::new(std::sync::Mutex::new("Codex running\n".to_string()));
+        let srv_handle = spawn_mock_events_uds(
+            &sock,
+            child_pid,
+            Arc::clone(&external_reads),
+            Arc::clone(&screen_text),
+        );
+
+        let client = HerdrGlobalClient::at_socket(&sock);
+        assert_events_rbac_and_observability(
+            &client,
+            &sock,
+            &external_reads,
+            &sess_path,
+            &screen_text,
+            now_ms,
+        );
+
+        let _ = client.call_rpc("__stop", &json!({}), Duration::from_secs(2));
+        srv_handle.join().expect("join mock srv");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_events_rbac_and_observability(
+        client: &HerdrGlobalClient,
+        sock: &Path,
+        external_reads: &std::sync::atomic::AtomicUsize,
+        sess_path: &Path,
+        screen_text: &std::sync::Mutex<String>,
+        now_ms: i64,
+    ) {
+        use spawn_core::agent_events::AgentHealth;
+        use std::io::Write as _;
+
+        let scope = SocketScope::resolve(Some(sock), &HerdrDiscoveryEnv::default())
+            .expect("resolve test socket scope");
+        let viewer_list =
+            HerdrGlobalClient::discover_in_scope(&scope, false, DiscoveryScope::SpawnManagedOnly)
+                .expect("viewer list");
+        assert_eq!(viewer_list.len(), 1);
+        assert_eq!(viewer_list[0].address, "t1");
+        assert_eq!(
+            viewer_list[0]
+                .session
+                .as_ref()
+                .and_then(|s| s.native_session_id.as_deref()),
+            Some("sess-hg-1")
+        );
+        let tel = viewer_list[0]
+            .telemetry
+            .as_ref()
+            .expect("terminal telemetry populated for live local terminal");
+        assert!(tel.process_count >= 1);
+        assert!(tel.session_bytes.unwrap_or(0) > 0);
+
+        let err = client
+            .events_scoped_since("t2", DiscoveryScope::SpawnManagedOnly, 50, None)
+            .expect_err("viewer cannot read external events");
+        assert_eq!(err.kind, GlobalErrorKind::ForbiddenExternal);
+        assert_eq!(external_reads.load(Ordering::SeqCst), 0);
+
+        let report = client
+            .events_scoped_since("t1", DiscoveryScope::SpawnManagedOnly, 50, None)
+            .expect("managed events");
+        assert_eq!(report.fidelity, EventFidelity::SessionEnriched);
+        assert_eq!(report.summary.health, AgentHealth::Busy);
+        assert_eq!(report.summary.tool_call_count, 1);
+        assert!(
+            report
+                .process_tree
+                .as_ref()
+                .is_some_and(|t| t.process_count >= 1)
+        );
+        assert!(report.events.iter().any(|ev| {
+            matches!(&ev.kind, FusedEventKind::ToolCompleted { tool_name, .. } if tool_name == "Bash")
+        }));
+
+        let cursor = report.latest_key.as_deref().expect("latest_key present");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(sess_path)
+            .expect("open rollout append");
+        writeln!(
+            f,
+            r#"{{"ordinal":3,"timestamp":{},"type":"response_item","payload":{{"type":"function_call","call_id":"call_hg_2","name":"Read","arguments":{{"path":"lib.rs"}}}}}}"#,
+            now_ms + 500
+        )
+        .expect("append call 2");
+        f.flush().expect("flush append");
+
+        // Unchanged screen + newly appended rollout event -> delivered cleanly.
+        let delta = client
+            .events_scoped_since("t1", DiscoveryScope::SpawnManagedOnly, 50, Some(cursor))
+            .expect("incremental poll with new event");
+        assert!(!delta.cursor_reset);
+        assert_eq!(delta.events.len(), 1);
+        assert!(matches!(
+            &delta.events[0].kind,
+            FusedEventKind::ToolStarted { tool_name, .. } if tool_name == "Read"
+        ));
+
+        // Screen spinner change with no new session records -> empty delta, no cursor_reset.
+        *screen_text.lock().expect("lock screen") = "Codex running | spinner frame 2\n".to_string();
+        let next_cursor = delta.latest_key.as_deref().expect("next latest_key");
+        let spin_delta = client
+            .events_scoped_since(
+                "t1",
+                DiscoveryScope::SpawnManagedOnly,
+                50,
+                Some(next_cursor),
+            )
+            .expect("spinner delta");
+        assert!(!spin_delta.cursor_reset);
+        assert!(spin_delta.events.is_empty());
+
+        let reset = client
+            .events_scoped_since(
+                "t1",
+                DiscoveryScope::SpawnManagedOnly,
+                50,
+                Some("nonexistent-cursor"),
+            )
+            .expect("unknown cursor resync");
+        assert!(reset.cursor_reset);
+        assert!(reset.events.len() > report.events.len());
     }
 }

@@ -619,6 +619,12 @@ pub struct DiscoveredTerminal {
     pub agent: Option<String>,
     /// Observed coarse agent activity status.
     pub agent_status: AgentStatus,
+    /// Auto-discovered native session attachment when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::agent_events::SessionAttachment>,
+    /// Host-observed process tree, memory, and session discovery telemetry when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<crate::agent_events::TerminalTelemetrySummary>,
     /// Monotonic turn counter tracked by `herdr-core`.
     pub turn: u64,
     /// Whether `keep` keeps a shell open after the initial program drops.
