@@ -312,7 +312,7 @@ pub enum FusedEventKind {
         /// Bounded, redacted outcome/error summary.
         summary: String,
     },
-    /// Token accounting checkpoint recorded for an API step/turn.
+    /// Token accounting checkpoint recorded for an API step/turn or cumulative session snapshot.
     UsageRecorded {
         /// Model name when present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,6 +325,10 @@ pub enum FusedEventKind {
         cache_read_tokens: u64,
         /// Prompt cache write tokens.
         cache_write_tokens: u64,
+        /// True when this record reports a cumulative session-total snapshot
+        /// (such as Claude `cost-state.modelUsage`) rather than a single step/message delta.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cumulative: bool,
     },
     /// Interactive UI prompt/blocker observed directly on the live terminal.
     PromptBlocked {
@@ -927,7 +931,7 @@ fn parse_claude_line(
             if let Some(usage) = parse_claude_cost_usage(obj) {
                 out.push(make_session_event(
                     &CanonicalEventKey::NativeRecord {
-                        source_id: format!("{base_key}:cost"),
+                        source_id: "claude:cost-state".to_string(),
                     },
                     ts,
                     usage,
@@ -1255,6 +1259,7 @@ fn parse_claude_assistant_usage(
                 output_tokens: output,
                 cache_read_tokens: cache_read,
                 cache_write_tokens: cache_write,
+                cumulative: false,
             },
             ctx.sid.clone(),
             ctx.addr,
@@ -1307,6 +1312,7 @@ fn parse_claude_cost_usage(obj: &Value) -> Option<FusedEventKind> {
         output_tokens: output,
         cache_read_tokens: cache_read,
         cache_write_tokens: cache_write,
+        cumulative: true,
     })
 }
 
@@ -1500,6 +1506,7 @@ fn parse_codex_token_count(p: &Value, ctx: &LineEventCtx<'_>, out: &mut Vec<Fuse
                 output_tokens: output,
                 cache_read_tokens: cached,
                 cache_write_tokens: 0,
+                cumulative: false,
             },
             ctx.sid.clone(),
             ctx.addr,
@@ -1801,6 +1808,7 @@ fn parse_agy_line(
                         output_tokens: output,
                         cache_read_tokens: cached,
                         cache_write_tokens: 0,
+                        cumulative: false,
                     },
                     ctx.sid,
                     ctx.addr,
@@ -1946,6 +1954,7 @@ fn parse_agy_planner_response(obj: &Value, ctx: &LineEventCtx<'_>, out: &mut Vec
                 output_tokens: output,
                 cache_read_tokens: cached,
                 cache_write_tokens: 0,
+                cumulative: false,
             },
             ctx.sid.clone(),
             ctx.addr,
@@ -2067,6 +2076,7 @@ fn merge_usage_kind(existing: &mut FusedEventKind, incoming: FusedEventKind) {
             output_tokens: ex_out,
             cache_read_tokens: ex_cr,
             cache_write_tokens: ex_cw,
+            cumulative: ex_cum,
         },
         FusedEventKind::UsageRecorded {
             model: in_model,
@@ -2074,6 +2084,7 @@ fn merge_usage_kind(existing: &mut FusedEventKind, incoming: FusedEventKind) {
             output_tokens: in_out,
             cache_read_tokens: in_cr,
             cache_write_tokens: in_cw,
+            cumulative: in_cum,
         },
     ) = (existing, incoming)
     {
@@ -2084,6 +2095,7 @@ fn merge_usage_kind(existing: &mut FusedEventKind, incoming: FusedEventKind) {
         *ex_out = (*ex_out).max(in_out);
         *ex_cr = (*ex_cr).max(in_cr);
         *ex_cw = (*ex_cw).max(in_cw);
+        *ex_cum = *ex_cum || in_cum;
     }
 }
 
@@ -2163,12 +2175,14 @@ fn merge_event(existing: &mut FusedAgentEvent, incoming: FusedAgentEvent) {
     }
 }
 
-/// Return `true` when `ev` originates from a durable session or control-plane record
-/// and may anchor incremental `after_key` cursors (never transient PTY screens).
+/// Return `true` when `ev` originates from a timestamped durable session or
+/// control-plane record and may anchor incremental `after_key` cursors
+/// (never transient PTY screens or timestamp-less snapshots such as Claude `cost-state`).
 #[must_use]
 pub fn is_cursor_anchor_event(ev: &FusedAgentEvent) -> bool {
-    ev.origins.contains(&EventOrigin::NativeSession)
-        || ev.origins.contains(&EventOrigin::SpawnControl)
+    ev.timestamp_ms.is_some()
+        && (ev.origins.contains(&EventOrigin::NativeSession)
+            || ev.origins.contains(&EventOrigin::SpawnControl))
 }
 
 /// Fuse live `HerdrPty`, `NativeSession`, and `SpawnControl` streams via union,
@@ -2213,9 +2227,9 @@ pub fn fuse_all_agent_events(
 /// Slice a chronological fused event list strictly after `after_key` and keep at
 /// most `limit` newest events, returning `(events, latest_key, truncated, cursor_reset)`.
 ///
-/// The `latest_key` cursor is anchored strictly to durable session/control events
-/// so transient screen updates neither hide newly appended session records nor
-/// trigger spurious `cursor_reset` window replays on spinner churn.
+/// The `latest_key` cursor is anchored strictly to timestamped durable session/control
+/// events so neither transient screen updates nor timestamp-less records (such as Claude
+/// `cost-state`) hide newly appended records or trigger spurious `cursor_reset` replays.
 #[must_use]
 pub fn slice_events_after_key(
     events: Vec<FusedAgentEvent>,
@@ -2403,7 +2417,8 @@ fn accumulate_usage_event(acc: &mut SummaryAccum, key: &str, kind: &FusedEventKi
 }
 
 fn fold_usage_totals(usage_by_key: &BTreeMap<String, FusedEventKind>) -> UsageTotals {
-    let mut totals = UsageTotals::default();
+    let mut per_msg = UsageTotals::default();
+    let mut max_cum = UsageTotals::default();
     for kind in usage_by_key.values() {
         if let FusedEventKind::UsageRecorded {
             model,
@@ -2411,20 +2426,38 @@ fn fold_usage_totals(usage_by_key: &BTreeMap<String, FusedEventKind>) -> UsageTo
             output_tokens,
             cache_read_tokens,
             cache_write_tokens,
+            cumulative,
         } = kind
         {
-            if let Some(m) = model {
-                totals.last_model = Some(m.clone());
+            if *cumulative {
+                if let Some(m) = model {
+                    max_cum.last_model = Some(m.clone());
+                }
+                max_cum.input_tokens = max_cum.input_tokens.max(*input_tokens);
+                max_cum.output_tokens = max_cum.output_tokens.max(*output_tokens);
+                max_cum.cache_read_tokens = max_cum.cache_read_tokens.max(*cache_read_tokens);
+                max_cum.cache_write_tokens = max_cum.cache_write_tokens.max(*cache_write_tokens);
+            } else {
+                if let Some(m) = model {
+                    per_msg.last_model = Some(m.clone());
+                }
+                per_msg.input_tokens = per_msg.input_tokens.saturating_add(*input_tokens);
+                per_msg.output_tokens = per_msg.output_tokens.saturating_add(*output_tokens);
+                per_msg.cache_read_tokens =
+                    per_msg.cache_read_tokens.saturating_add(*cache_read_tokens);
+                per_msg.cache_write_tokens = per_msg
+                    .cache_write_tokens
+                    .saturating_add(*cache_write_tokens);
             }
-            totals.input_tokens = totals.input_tokens.saturating_add(*input_tokens);
-            totals.output_tokens = totals.output_tokens.saturating_add(*output_tokens);
-            totals.cache_read_tokens = totals.cache_read_tokens.saturating_add(*cache_read_tokens);
-            totals.cache_write_tokens = totals
-                .cache_write_tokens
-                .saturating_add(*cache_write_tokens);
         }
     }
-    totals
+    UsageTotals {
+        last_model: per_msg.last_model.or(max_cum.last_model),
+        input_tokens: per_msg.input_tokens.max(max_cum.input_tokens),
+        output_tokens: per_msg.output_tokens.max(max_cum.output_tokens),
+        cache_read_tokens: per_msg.cache_read_tokens.max(max_cum.cache_read_tokens),
+        cache_write_tokens: per_msg.cache_write_tokens.max(max_cum.cache_write_tokens),
+    }
 }
 
 fn derive_agent_health(input: &SummaryInput<'_>, acc: &SummaryAccum) -> AgentHealth {
@@ -3061,5 +3094,87 @@ mod tests {
         assert_eq!(ev_full[1].canonical_key, ev_shifted[0].canonical_key);
         assert_eq!(ev_full[2].canonical_key, ev_shifted[1].canonical_key);
         assert!(!ev_full[1].canonical_key.contains(":l"));
+    }
+
+    #[test]
+    fn timeless_cost_state_never_hijacks_incremental_cursor() {
+        let m1 = r#"{"type":"assistant","uuid":"u_m1","sessionId":"s1","timestamp":"2026-11-28T10:00:00Z","message":{"id":"msg_1","model":"claude-sonnet-4","content":[{"type":"text","text":"step one"}],"usage":{"input_tokens":100,"output_tokens":10}}}"#;
+        let cost = r#"{"type":"cost-state","sessionId":"s1","modelUsage":{"claude-sonnet-4":{"inputTokens":100,"outputTokens":10}}}"#;
+        let m2 = r#"{"type":"assistant","uuid":"u_m2","sessionId":"s1","timestamp":"2026-11-28T10:00:05Z","message":{"id":"msg_2","model":"claude-sonnet-4","content":[{"type":"text","text":"running tool"},{"type":"tool_use","id":"tu_m2","name":"Bash","input":{"cmd":"ls"}}],"usage":{"input_tokens":50,"output_tokens":5}}}"#;
+
+        let parsed1 = parse_session_lines(
+            SessionFileFormat::ClaudeJsonl,
+            &[m1, cost],
+            Some("t1"),
+            None,
+        );
+        let fused1 = fuse_all_agent_events(Vec::new(), parsed1, Vec::new());
+        let (_, cur1, _, init_reset) = slice_events_after_key(fused1, None, 50);
+        assert!(!init_reset);
+        let c1 = cur1.as_deref().expect("timestamped anchor cursor");
+        assert!(!c1.contains("cost-state"), "unexpected cursor: {c1}");
+
+        let parsed2 = parse_session_lines(
+            SessionFileFormat::ClaudeJsonl,
+            &[m1, cost, m2],
+            Some("t1"),
+            None,
+        );
+        let fused2 = fuse_all_agent_events(Vec::new(), parsed2, Vec::new());
+        let (delta, cur2, _, reset) = slice_events_after_key(fused2, Some(c1), 50);
+        assert!(!reset);
+        assert!(delta.iter().any(|ev| matches!(
+            &ev.kind,
+            FusedEventKind::AssistantMessage { summary } if summary == "running tool"
+        )));
+        assert!(delta.iter().any(|ev| matches!(
+            &ev.kind,
+            FusedEventKind::ToolStarted { tool_call_id, tool_name, .. }
+                if tool_call_id.as_deref() == Some("tu_m2") && tool_name == "Bash"
+        )));
+        let c2 = cur2.as_deref().expect("second anchor cursor");
+        assert_ne!(c2, c1);
+        assert!(!c2.contains("cost-state"), "unexpected cursor: {c2}");
+    }
+
+    #[test]
+    fn claude_cost_state_cumulative_snapshots_never_double_count_usage() {
+        let m1 = r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-11-28T10:00:00Z","message":{"id":"msg_1","model":"claude-sonnet-4","content":[{"type":"text","text":"one"}],"usage":{"input_tokens":100,"output_tokens":10}}}"#;
+        let cost1 = r#"{"type":"cost-state","sessionId":"s1","modelUsage":{"claude-sonnet-4":{"inputTokens":100,"outputTokens":10}}}"#;
+        let m2 = r#"{"type":"assistant","uuid":"u2","sessionId":"s1","timestamp":"2026-11-28T10:00:05Z","message":{"id":"msg_2","model":"claude-sonnet-4","content":[{"type":"text","text":"two"}],"usage":{"input_tokens":50,"output_tokens":5}}}"#;
+        let cost2 = r#"{"type":"cost-state","sessionId":"s1","modelUsage":{"claude-sonnet-4":{"inputTokens":150,"outputTokens":15}}}"#;
+        let cost_hi = r#"{"type":"cost-state","sessionId":"s1","modelUsage":{"claude-sonnet-4":{"inputTokens":220,"outputTokens":30}}}"#;
+
+        let sum_totals = |lines: &[&str]| {
+            let parsed =
+                parse_session_lines(SessionFileFormat::ClaudeJsonl, lines, Some("t1"), None);
+            let fused = fuse_all_agent_events(Vec::new(), parsed, Vec::new());
+            summarize_agent_observability(&SummaryInput {
+                events: &fused,
+                is_live: true,
+                agent_status: crate::port::AgentStatus::Idle,
+                active_rule: None,
+                has_osc_signal: false,
+                process_tree: None,
+                discovery_status: SessionDiscoveryStatus::NoLivePid,
+                now_ms: None,
+            })
+            .usage_totals
+        };
+
+        // Case A: interleaved per-message usage and cumulative cost-state snapshots.
+        let interleaved = sum_totals(&[m1, cost1, m2, cost2]);
+        assert_eq!(interleaved.input_tokens, 150);
+        assert_eq!(interleaved.output_tokens, 15);
+
+        // Case B: mid-session cumulative snapshot followed by incremental message.
+        let mid_session = sum_totals(&[m1, cost1, m2]);
+        assert_eq!(mid_session.input_tokens, 150);
+        assert_eq!(mid_session.output_tokens, 15);
+
+        // Case C: pure multiple cost-state snapshots take max cumulative snapshot, never sum.
+        let snapshots_only = sum_totals(&[cost1, cost_hi]);
+        assert_eq!(snapshots_only.input_tokens, 220);
+        assert_eq!(snapshots_only.output_tokens, 30);
     }
 }
