@@ -12,6 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use spawn_core::port::{AgentReading, AgentStatus, TerminalError};
 use spawn_core::tui::{
@@ -66,6 +67,62 @@ pub enum GlobalErrorKind {
     Unavailable,
     /// Unexpected daemon, protocol, or internal failure.
     Internal,
+}
+
+/// Diagnostic info for an unreachable `herdr-core` socket path encountered during discovery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnreachableSocketDiagnostic {
+    /// Filesystem path of the candidate control socket.
+    pub socket: String,
+    /// Short classification such as `"connect_unreachable"` or `"error"`.
+    pub kind: String,
+    /// Underlying connection/RPC failure message.
+    pub detail: String,
+}
+
+/// Non-silent discovery telemetry explaining how `/api/agents` resolved Herdr sockets and visibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryDiagnostics {
+    /// `"explicit"` (`--socket` / `HC_SOCKET`) or `"discovered"` (standard runtime dirs).
+    pub scope_kind: String,
+    /// All socket paths scanned within the active scope.
+    pub scanned_sockets: Vec<String>,
+    /// Socket paths that responded cleanly to `terminal.list`.
+    pub reachable_sockets: Vec<String>,
+    /// Socket paths that refused connection or failed cleanly during scan.
+    pub unreachable_sockets: Vec<UnreachableSocketDiagnostic>,
+    /// Active visibility mode (`"all"` or `"spawn_managed_only"`).
+    pub visibility: String,
+    /// Number of terminals matched by this scan.
+    pub terminal_count: usize,
+    /// Operator-facing explanation suitable for showing in empty/diagnostic UI states.
+    pub hint: String,
+}
+
+/// Parameters accepted by [`HerdrGlobalClient::spawn_terminal_in_scope`] (`POST /api/agents/spawn`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpawnTerminalRequest {
+    /// Optional shell command executed via `/bin/sh -lc <command>` when `argv` is empty.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Explicit command + arguments array (`["bash"]`, etc.). Takes precedence over `command`.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// Optional working directory for the new PTY session.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Optional human-friendly terminal name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Initial terminal width in columns (10..=400, default 120).
+    #[serde(default)]
+    pub cols: Option<u16>,
+    /// Initial terminal height in rows (4..=200, default 36).
+    #[serde(default)]
+    pub rows: Option<u16>,
+    /// Custom user labels; reserved `spawn_*` keys are rejected.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// Typed error returned by [`HerdrGlobalClient`] and [`SocketScope`].
@@ -290,6 +347,195 @@ impl HerdrGlobalClient {
                 Ok(merged)
             }
         }
+    }
+
+    /// Discovers terminals across `scope` while returning structured [`DiscoveryDiagnostics`]
+    /// so UIs and callers can diagnose missing sockets, stale sockets, or role visibility filtering.
+    pub fn discover_in_scope_with_diagnostics(
+        scope: &SocketScope,
+        include_exited: bool,
+        visibility: DiscoveryScope,
+    ) -> Result<(Vec<DiscoveredTerminal>, DiscoveryDiagnostics), GlobalHerdrError> {
+        let vis_label = match visibility {
+            DiscoveryScope::All => "all",
+            DiscoveryScope::SpawnManagedOnly => "spawn_managed_only",
+        }
+        .to_string();
+        match scope {
+            SocketScope::Explicit(sock) => {
+                let sock_str = sock.display().to_string();
+                let scanned = vec![sock_str.clone()];
+                let terminals =
+                    Self::at_socket(sock).discover_scoped(include_exited, visibility)?;
+                let hint = if terminals.is_empty() {
+                    if visibility == DiscoveryScope::SpawnManagedOnly && !include_exited {
+                        "Explicit herdr-core socket is reachable, but 0 Spawn-managed live terminals matched (external terminals require an operator token; or toggle ?all=true)."
+                            .to_string()
+                    } else {
+                        "Explicit herdr-core socket is reachable with 0 matching terminals."
+                            .to_string()
+                    }
+                } else {
+                    format!(
+                        "Explicit herdr-core socket is online with {} visible terminal(s).",
+                        terminals.len()
+                    )
+                };
+                let diag = DiscoveryDiagnostics {
+                    scope_kind: "explicit".to_string(),
+                    scanned_sockets: scanned.clone(),
+                    reachable_sockets: scanned,
+                    unreachable_sockets: Vec::new(),
+                    visibility: vis_label,
+                    terminal_count: terminals.len(),
+                    hint,
+                };
+                Ok((terminals, diag))
+            }
+            SocketScope::Discovered(socks) => {
+                let mut scanned = Vec::with_capacity(socks.len());
+                let mut reachable = Vec::new();
+                let mut unreachable = Vec::new();
+                let mut merged = Vec::new();
+                for sock in socks {
+                    let sock_str = sock.display().to_string();
+                    scanned.push(sock_str.clone());
+                    match Self::at_socket(sock).discover_raw(include_exited, visibility) {
+                        Ok(items) => {
+                            reachable.push(sock_str);
+                            merged.extend(items);
+                        }
+                        Err(RpcFailure::ConnectUnreachable(err)) => {
+                            unreachable.push(UnreachableSocketDiagnostic {
+                                socket: sock_str,
+                                kind: "connect_unreachable".to_string(),
+                                detail: err.message,
+                            });
+                        }
+                        Err(err) => return Err(err.into_error("terminal.list")),
+                    }
+                }
+                merged.sort_by(|a, b| a.address.cmp(&b.address));
+                let hint = if !merged.is_empty() {
+                    format!(
+                        "{} reachable herdr-core socket(s) returned {} visible terminal(s).",
+                        reachable.len(),
+                        merged.len()
+                    )
+                } else if scanned.is_empty() {
+                    "No herdr-core control sockets found in $XDG_RUNTIME_DIR/herdr-core or /run/user/<uid>/herdr-core; start `spawn-hc serve` or spawn a new terminal from the Web console."
+                        .to_string()
+                } else if reachable.is_empty() {
+                    "Found candidate herdr-core socket(s), but none accepted connections (all unreachable/stale)."
+                        .to_string()
+                } else if visibility == DiscoveryScope::SpawnManagedOnly && !include_exited {
+                    "herdr-core socket is reachable, but 0 Spawn-managed live terminals matched (external terminals require an operator token; or toggle ?all=true)."
+                        .to_string()
+                } else {
+                    "herdr-core socket is online and reachable with 0 matching terminals; use '+ New Terminal' to launch one."
+                        .to_string()
+                };
+                let diag = DiscoveryDiagnostics {
+                    scope_kind: "discovered".to_string(),
+                    scanned_sockets: scanned,
+                    reachable_sockets: reachable,
+                    unreachable_sockets: unreachable,
+                    visibility: vis_label,
+                    terminal_count: merged.len(),
+                    hint,
+                };
+                Ok((merged, diag))
+            }
+        }
+    }
+
+    /// Spawns a new interactive terminal via `herdr-core` `terminal.run` within `scope`.
+    pub fn spawn_terminal_in_scope(
+        scope: &SocketScope,
+        req: &SpawnTerminalRequest,
+    ) -> Result<Value, GlobalHerdrError> {
+        for key in req.labels.keys() {
+            if is_reserved_spawn_label(key) {
+                return Err(GlobalHerdrError::new(
+                    GlobalErrorKind::InvalidParams,
+                    format!("invalid_params: reserved spawn_* label key '{key}' is not permitted"),
+                ));
+            }
+        }
+        let cols = req.cols.unwrap_or(120);
+        let rows = req.rows.unwrap_or(36);
+        if !(10..=400).contains(&cols) || !(4..=200).contains(&rows) {
+            return Err(GlobalHerdrError::new(
+                GlobalErrorKind::InvalidParams,
+                "invalid_params: terminal cols must be 10..=400 and rows 4..=200",
+            ));
+        }
+        let argv: Vec<String> = if !req.argv.is_empty() {
+            if req.argv.iter().all(|part| part.trim().is_empty()) {
+                return Err(GlobalHerdrError::new(
+                    GlobalErrorKind::InvalidParams,
+                    "invalid_params: argv must contain a non-empty executable",
+                ));
+            }
+            req.argv.clone()
+        } else if let Some(cmd) = req
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            vec!["/bin/sh".to_string(), "-lc".to_string(), cmd.to_string()]
+        } else {
+            vec!["/bin/sh".to_string()]
+        };
+
+        let target_client = match scope {
+            SocketScope::Explicit(sock) => Self::at_socket(sock),
+            SocketScope::Discovered(socks) => socks
+                .iter()
+                .map(Self::at_socket)
+                .find(|client| {
+                    client
+                        .call_rpc_raw("terminal.list", &json!({ "all": false }), CALL_LIMIT)
+                        .is_ok()
+                })
+                .ok_or_else(|| {
+                    GlobalHerdrError::new(
+                        GlobalErrorKind::Unavailable,
+                        "unavailable: no live herdr-core socket found; start `spawn-hc serve` or set SPAWN_HERDR_SOCKET",
+                    )
+                })?,
+        };
+
+        let mut params = serde_json::Map::new();
+        params.insert("argv".to_string(), json!(argv));
+        params.insert("size".to_string(), json!({ "cols": cols, "rows": rows }));
+        params.insert("no_parent".to_string(), json!(true));
+        params.insert("no_notify".to_string(), json!(true));
+        params.insert("keep".to_string(), json!(true));
+        params.insert("rm".to_string(), json!(false));
+        params.insert("wait".to_string(), json!(false));
+        if let Some(cwd) = req.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            params.insert("cwd".to_string(), json!(cwd));
+        }
+        if let Some(name) = req.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            params.insert("name".to_string(), json!(name));
+        }
+        if !req.labels.is_empty() {
+            params.insert("labels".to_string(), json!(req.labels));
+        }
+
+        let started = target_client.call_rpc("terminal.run", &Value::Object(params), CALL_LIMIT)?;
+        let Some(address) = started["address"].as_str().map(str::to_string) else {
+            return Err(GlobalHerdrError::new(
+                GlobalErrorKind::Internal,
+                format!("herdr-core terminal.run returned no address: {started}"),
+            ));
+        };
+        Ok(json!({
+            "address": address,
+            "terminal": started,
+        }))
     }
 
     /// Resolves the [`HerdrGlobalClient`] owning `address` within `scope`.
@@ -1462,6 +1708,16 @@ mod tests {
             "terminal.label" => {
                 json!({ "address": params["terminal"], "labels": params["labels"] })
             }
+            "terminal.run" => {
+                json!({
+                    "address": "spawn-new-1",
+                    "argv": params["argv"],
+                    "cwd": params.get("cwd").cloned().unwrap_or(json!("/tmp")),
+                    "name": params.get("name").cloned().unwrap_or(json!("shell")),
+                    "labels": params.get("labels").cloned().unwrap_or(json!({})),
+                    "state": "live",
+                })
+            }
             other => panic!("unexpected rpc {other}"),
         }
     }
@@ -2254,5 +2510,99 @@ time.sleep(30)
 
         verify_real_labels_and_interrupt(&client, &addr);
         eprintln!("REAL_SPAWN_HC_GLOBAL_VERIFIED address={addr} styled_vt=true");
+    }
+
+    #[test]
+    fn discover_in_scope_with_diagnostics_reports_stale_sockets_and_hint() {
+        let dir = temp_dir("shg-diag");
+        let live_sock = dir.0.join("live.sock");
+        let stale_sock = dir.0.join("missing.sock");
+        let (srv, _recorded) = spawn_mock_rpc_server(&live_sock);
+
+        let scope = SocketScope::Discovered(vec![stale_sock.clone(), live_sock.clone()]);
+        let (found, diag) = super::HerdrGlobalClient::discover_in_scope_with_diagnostics(
+            &scope,
+            false,
+            DiscoveryScope::All,
+        )
+        .expect("discover with diagnostics");
+        assert_eq!(found.len(), 3);
+        assert_eq!(diag.scope_kind, "discovered");
+        assert_eq!(diag.scanned_sockets.len(), 2);
+        assert_eq!(
+            diag.reachable_sockets,
+            vec![live_sock.display().to_string()]
+        );
+        assert_eq!(diag.unreachable_sockets.len(), 1);
+        assert_eq!(
+            diag.unreachable_sockets[0].socket,
+            stale_sock.display().to_string()
+        );
+        assert_eq!(diag.terminal_count, 3);
+
+        // Viewer role on unreachable/empty scope produces helpful hint.
+        let empty_scope = SocketScope::Discovered(Vec::new());
+        let (empty, empty_diag) = super::HerdrGlobalClient::discover_in_scope_with_diagnostics(
+            &empty_scope,
+            false,
+            DiscoveryScope::SpawnManagedOnly,
+        )
+        .expect("empty discovery succeeds with hint");
+        assert!(empty.is_empty());
+        assert!(empty_diag.hint.contains("herdr-core"));
+
+        let _ = super::HerdrGlobalClient::at_socket(&live_sock).call_rpc(
+            "__stop",
+            &json!({}),
+            CALL_LIMIT,
+        );
+        let _ = srv.join();
+    }
+
+    #[test]
+    fn spawn_terminal_in_scope_validates_labels_and_invokes_terminal_run() {
+        let dir = temp_dir("shg-spawn");
+        let sock = dir.0.join("core.sock");
+        let (srv, recorded) = spawn_mock_rpc_server(&sock);
+        let scope = SocketScope::Explicit(sock.clone());
+
+        let mut bad_labels = BTreeMap::new();
+        bad_labels.insert("spawn_owner".to_string(), "spoof".to_string());
+        let bad = super::HerdrGlobalClient::spawn_terminal_in_scope(
+            &scope,
+            &super::SpawnTerminalRequest {
+                labels: bad_labels,
+                ..Default::default()
+            },
+        )
+        .expect_err("reserved spawn_* label rejected");
+        assert_eq!(bad.kind, GlobalErrorKind::InvalidParams);
+
+        let spawned = super::HerdrGlobalClient::spawn_terminal_in_scope(
+            &scope,
+            &super::SpawnTerminalRequest {
+                command: Some("echo hi".to_string()),
+                cwd: Some("/tmp".to_string()),
+                name: Some("debug-shell".to_string()),
+                cols: Some(100),
+                rows: Some(32),
+                ..Default::default()
+            },
+        )
+        .expect("spawn succeeds");
+        assert_eq!(spawned["address"], "spawn-new-1");
+
+        let log = recorded.lock().expect("lock");
+        let run_call = log
+            .iter()
+            .find(|(method, _)| method == "terminal.run")
+            .expect("terminal.run recorded");
+        assert_eq!(run_call.1["argv"], json!(["/bin/sh", "-lc", "echo hi"]));
+        assert_eq!(run_call.1["size"], json!({"cols": 100, "rows": 32}));
+        drop(log);
+
+        let _ =
+            super::HerdrGlobalClient::at_socket(&sock).call_rpc("__stop", &json!({}), CALL_LIMIT);
+        let _ = srv.join();
     }
 }

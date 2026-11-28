@@ -53,9 +53,40 @@ export interface DiscoveredTerminal {
   keep: boolean;
 }
 
+export interface UnreachableSocketDiagnostic {
+  socket: string;
+  kind: string;
+  detail: string;
+}
+
+export interface DiscoveryDiagnostics {
+  scope_kind: string;
+  scanned_sockets: string[];
+  reachable_sockets: string[];
+  unreachable_sockets: UnreachableSocketDiagnostic[];
+  visibility: string;
+  terminal_count: number;
+  hint: string;
+}
+
 export interface AgentsListResponse {
   agents: DiscoveredTerminal[];
   count: number;
+  diagnostics?: DiscoveryDiagnostics;
+}
+
+export interface SpawnTerminalRequest {
+  command?: string;
+  argv?: string[];
+  cwd?: string;
+  name?: string;
+  cols?: number;
+  rows?: number;
+}
+
+export interface SpawnTerminalResponse {
+  address: string;
+  terminal: Record<string, unknown>;
 }
 
 export type ReadMode =
@@ -500,7 +531,37 @@ function parseDiscoveredTerminal(value: unknown, label: string): DiscoveredTermi
   };
 }
 
-/** Parse `{ agents, count }` returned by `GET /api/agents`. */
+function parseDiscoveryDiagnostics(
+  value: unknown,
+  label: string,
+): DiscoveryDiagnostics | undefined {
+  if (value === undefined || value === null) return undefined;
+  const obj = requireObject(value, label);
+  const rawUnreachable = Array.isArray(obj.unreachable_sockets)
+    ? obj.unreachable_sockets
+    : [];
+  const unreachable_sockets: UnreachableSocketDiagnostic[] = rawUnreachable.map(
+    (entry, idx) => {
+      const item = requireObject(entry, `${label}.unreachable_sockets[${idx}]`);
+      return {
+        socket: requireString(item, "socket", `${label}.unreachable_sockets[${idx}]`),
+        kind: requireString(item, "kind", `${label}.unreachable_sockets[${idx}]`),
+        detail: requireString(item, "detail", `${label}.unreachable_sockets[${idx}]`),
+      };
+    },
+  );
+  return {
+    scope_kind: requireString(obj, "scope_kind", label),
+    scanned_sockets: requireStringArray(obj, "scanned_sockets", label),
+    reachable_sockets: requireStringArray(obj, "reachable_sockets", label),
+    unreachable_sockets,
+    visibility: requireString(obj, "visibility", label),
+    terminal_count: requireNumber(obj, "terminal_count", label),
+    hint: typeof obj.hint === "string" ? obj.hint : "",
+  };
+}
+
+/** Parse `{ agents, count, diagnostics? }` returned by `GET /api/agents`. */
 export function parseAgentsListResponse(raw: unknown): AgentsListResponse {
   const obj = requireObject(raw, "AgentsListResponse");
   if (!Array.isArray(obj.agents)) {
@@ -510,7 +571,11 @@ export function parseAgentsListResponse(raw: unknown): AgentsListResponse {
     parseDiscoveredTerminal(entry, `agents[${idx}]`),
   );
   const count = requireNumber(obj, "count", "AgentsListResponse");
-  return { agents, count };
+  const diagnostics = parseDiscoveryDiagnostics(
+    obj.diagnostics,
+    "AgentsListResponse.diagnostics",
+  );
+  return diagnostics ? { agents, count, diagnostics } : { agents, count };
 }
 
 function parseReadMode(value: unknown, label: string): ReadMode {
@@ -1018,6 +1083,177 @@ export async function postAgentActionWithFetch(
       },
     };
   }
+}
+
+export async function postSpawnTerminalWithFetch(
+  fetcher: AgentFetch,
+  headers: Record<string, string>,
+  requestBody: SpawnTerminalRequest,
+  options: {
+    signal?: AbortSignal;
+    onUnauthorized?: () => void;
+  } = {},
+): Promise<AgentResult<SpawnTerminalResponse>> {
+  let response: AgentResponseLike;
+  try {
+    response = await fetcher("/api/agents/spawn", {
+      method: "POST",
+      signal: options.signal,
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        ...headers,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+    });
+  } catch (cause) {
+    if (isAbortError(cause)) throw cause;
+    return {
+      ok: false,
+      error: classifyAgentHttpError(
+        null,
+        cause instanceof Error ? cause.message : "网络请求失败",
+        "write",
+      ),
+    };
+  }
+  if (response.status === 401) {
+    const detail = await readErrorDetail(response);
+    options.onUnauthorized?.();
+    return { ok: false, error: classifyAgentHttpError(401, detail, "write") };
+  }
+  if (!response.ok) {
+    const detail = await readErrorDetail(response);
+    return {
+      ok: false,
+      error: classifyAgentHttpError(response.status, detail, "write"),
+    };
+  }
+  try {
+    const obj = requireObject(await response.json(), "SpawnTerminalResponse");
+    const address = requireString(obj, "address", "SpawnTerminalResponse");
+    const terminal = requireObject(obj.terminal ?? {}, "SpawnTerminalResponse.terminal");
+    return { ok: true, data: { address, terminal } };
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        kind: "unavailable",
+        message: err instanceof Error ? err.message : "新建终端响应校验失败",
+      },
+    };
+  }
+}
+
+export interface KeyboardEventLike {
+  key: string;
+  ctrlKey?: boolean;
+  altKey?: boolean;
+  metaKey?: boolean;
+  shiftKey?: boolean;
+  isComposing?: boolean;
+}
+
+const DIRECT_NAMED_KEY_MAP: Record<string, string> = {
+  Enter: "enter",
+  Tab: "tab",
+  Escape: "esc",
+  Backspace: "backspace",
+  Delete: "delete",
+  Insert: "insert",
+  Home: "home",
+  End: "end",
+  PageUp: "pageup",
+  PageDown: "pagedown",
+  ArrowUp: "up",
+  ArrowDown: "down",
+  ArrowLeft: "left",
+  ArrowRight: "right",
+};
+
+const MODIFIER_ONLY_KEYS = new Set([
+  "Shift",
+  "Control",
+  "Alt",
+  "Meta",
+  "CapsLock",
+  "NumLock",
+  "ScrollLock",
+]);
+
+/** Convert a keyboard event inside Direct Keyboard mode into a validated `TuiAction`. */
+export function keyEventToHerdrAction(
+  ev: KeyboardEventLike,
+  capabilities: ActionCapabilities,
+): { ok: true; action: TuiAction } | { ok: false; ignored?: boolean; message?: string } {
+  if (ev.isComposing || ev.metaKey || ev.altKey || MODIFIER_ONLY_KEYS.has(ev.key)) {
+    return { ok: false, ignored: true };
+  }
+  if (!capabilities.canMutate) {
+    return {
+      ok: false,
+      message:
+        capabilities.readOnlyReason ??
+        (capabilities.terminalExited ? "终端已退出，不能发送按键" : "终端尚未就绪"),
+    };
+  }
+  if (ev.ctrlKey) {
+    const lower = ev.key.toLowerCase();
+    if (lower === "c") {
+      return { ok: true, action: { action: "interrupt", timeout_ms: 5_000 } };
+    }
+    const chord = normalizeKeyChord(`ctrl+${lower}`);
+    if (!chord) return { ok: false, ignored: true };
+    return buildSendKeysAction({
+      keys: [chord],
+      useGuard: capabilities.guarded.allowed,
+      capabilities,
+    });
+  }
+  const named = DIRECT_NAMED_KEY_MAP[ev.key];
+  if (named) {
+    if (named === "enter" && !capabilities.selectionObservable) {
+      return {
+        ok: true,
+        action: {
+          action: "send_text",
+          text: "\n",
+          policy: { kind: "when_unblocked" },
+        },
+      };
+    }
+    return buildSendKeysAction({
+      keys: [named],
+      useGuard: capabilities.guarded.allowed,
+      capabilities,
+    });
+  }
+  if (ev.key === " ") {
+    if (capabilities.guarded.allowed) {
+      return buildSendKeysAction({
+        keys: ["space"],
+        useGuard: true,
+        capabilities,
+      });
+    }
+    return {
+      ok: true,
+      action: {
+        action: "send_text",
+        text: " ",
+        policy: { kind: "when_unblocked" },
+      },
+    };
+  }
+  if (ev.key.length === 1) {
+    return buildSendTextAction({
+      text: ev.key,
+      mode: capabilities.guarded.allowed ? "only_if_guard" : "when_unblocked",
+      capabilities,
+    });
+  }
+  return { ok: false, ignored: true };
 }
 
 // ---------------------------------------------------------------------------

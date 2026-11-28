@@ -261,18 +261,18 @@ export function Drawer({
           width,
         )}
       >
-        <header className="flex h-14 shrink-0 items-center gap-3 border-b border-surface-border px-4 sm:px-5">
-          <div className="flex min-w-0 flex-1 items-center gap-2.5">
+        <header className="flex min-h-14 shrink-0 items-center gap-2.5 border-b border-surface-border px-4 pt-[max(0.5rem,env(safe-area-inset-top))] pb-2 sm:gap-3 sm:px-5">
+          <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden sm:gap-2.5">
             {header}
           </div>
-          <kbd className="hidden rounded border border-surface-border px-1.5 py-0.5 font-mono text-micro text-faint-foreground sm:inline">
+          <kbd className="hidden shrink-0 rounded border border-surface-border px-1.5 py-0.5 font-mono text-micro text-faint-foreground lg:inline pointer-coarse:hidden">
             esc
           </kbd>
           <button
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="grid size-8 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-surface-hover hover:text-foreground"
+            className="grid size-8 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-surface-hover hover:text-foreground focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-ring pointer-coarse:size-11"
           >
             <X size={16} />
           </button>

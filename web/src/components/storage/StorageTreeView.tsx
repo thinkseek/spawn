@@ -779,9 +779,9 @@ function SnapshotDrawer({
     <Drawer
       onClose={onClose}
       header={
-        <div className="flex min-w-0 items-center gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
           <GitCommitHorizontal size={16} className="shrink-0 text-muted-foreground" />
-          <span className="truncate font-mono text-body font-semibold text-foreground">
+          <span className="min-w-0 truncate font-mono text-body font-semibold text-foreground">
             Snapshot {shortOid(snap.snapshot_id, 12)}
           </span>
           {isMergeSnapshot(snap) && (
