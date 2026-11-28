@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 mod common;
 use common::{admin, as_login, schema_url, store};
-use spawn_postgres::{PostgresStore, PushRequest, role_url};
+use spawn_postgres::{PostgresStore, PushRequest, role_url_with_passfile};
 
 const SOURCE: &str = "/tmp/commit-map.git";
 
@@ -181,8 +181,11 @@ fn an_owner_request_of_a_pre_rewrite_commit_is_read_as_its_new_commit() {
 fn the_map_is_loaded_once_by_the_owner_and_never_changed() {
     let (store, schema) = store("commit_map_once");
     let h = history();
-    let login = role_url(&schema_url(&schema), "spawn_supervisor").expect("the login's URL");
-    let supervisor = PostgresStore::connect(&login).expect("log in");
+    let login = role_url_with_passfile(&schema_url(&schema), "spawn_supervisor", None)
+        .expect("the login's URL");
+    let supervisor =
+        PostgresStore::connect_with_options(&login, &spawn_postgres::ConnectOptions::default())
+            .expect("log in");
     let refused = supervisor
         .commit_map_load(&h.pairs())
         .expect_err("a restricted login loads no map")

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use spawn_core::event::{EventKind, NewEvent, Source};
 use spawn_core::id::{AgentId, SessionId};
 use spawn_core::port::EventLog;
-use spawn_postgres::PostgresStore;
+use spawn_postgres::{ConnectOptions, PostgresStore};
 
 use super::super::auth_token::{AuthPrincipal, current_epoch_ms};
 use super::{
@@ -106,10 +106,17 @@ fn reader_schema(case: &str) -> (spawn_postgres::testing::TestSchema, PostgresSt
     let store = PostgresStore::connect_in_schema(&url, &schema).expect("migrated");
     let separator = if url.contains('?') { '&' } else { '?' };
     let owner = format!("{url}{separator}options=-csearch_path%3D{}", &*schema);
-    let reader = spawn_postgres::role_url(&owner, "spawn_reader").expect("the reader's URL");
+    let reader = spawn_postgres::role_url_with_passfile(&owner, "spawn_reader", None)
+        .expect("the reader's URL");
     let open = Arc::new(move || {
-        PostgresStore::connect_with_statement_timeout(&reader, Duration::from_secs(10))
-            .map_err(|error| error.to_string())
+        PostgresStore::connect_with_options(
+            &reader,
+            &ConnectOptions {
+                passfile: None,
+                statement_timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .map_err(|error| error.to_string())
     });
     (schema, store, open)
 }
@@ -631,8 +638,14 @@ fn reset_pages_free_their_streams_within_two_seconds_round_after_round() {
     let separator = if url.contains('?') { '&' } else { '?' };
     let owner = format!("{url}{separator}options=-csearch_path%3D{}", &*schema);
     let open: Opener = Arc::new(move || {
-        PostgresStore::connect_with_statement_timeout(&owner, Duration::from_secs(10))
-            .map_err(|error| error.to_string())
+        PostgresStore::connect_with_options(
+            &owner,
+            &ConnectOptions {
+                passfile: None,
+                statement_timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .map_err(|error| error.to_string())
     });
     let first = append(&store, 1);
     let second = append(&store, 2);

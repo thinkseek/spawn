@@ -28,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{FlockOperation, flock};
 use spawn_core::port::StoreError;
-use spawn_postgres::{PostgresStore, role_url};
+use spawn_postgres::{PostgresStore, role_url_with_passfile};
 use zeroize::Zeroizing;
 
 use self::http::{ReadOutcome, read_request, write_json_error};
@@ -119,9 +119,22 @@ pub(super) struct RoleUrls {
 
 impl RoleUrls {
     pub(super) fn from_owner(owner_url: &str) -> Result<Self, String> {
-        let reader = Zeroizing::new(role_url(owner_url, "spawn_reader")?);
-        let human = Zeroizing::new(role_url(owner_url, "spawn_human")?);
-        let node_gateway = Zeroizing::new(role_url(owner_url, "spawn_node_gateway")?);
+        let passfile = crate::config::pg_passfile();
+        let reader = Zeroizing::new(role_url_with_passfile(
+            owner_url,
+            "spawn_reader",
+            passfile.as_deref(),
+        )?);
+        let human = Zeroizing::new(role_url_with_passfile(
+            owner_url,
+            "spawn_human",
+            passfile.as_deref(),
+        )?);
+        let node_gateway = Zeroizing::new(role_url_with_passfile(
+            owner_url,
+            "spawn_node_gateway",
+            passfile.as_deref(),
+        )?);
         Ok(Self {
             reader,
             human,
@@ -211,9 +224,9 @@ impl PoolSlot {
                 self.reused = true;
                 self.conn = Some(store);
             } else {
-                let store = PostgresStore::connect_with_statement_timeout(
+                let store = PostgresStore::connect_with_options(
                     &self.pool.url,
-                    STATEMENT_TIMEOUT,
+                    &crate::config::pg_connect_options(Some(STATEMENT_TIMEOUT)),
                 )
                 .map_err(|e| PoolError::Backend(e.to_string()))?;
                 #[cfg(test)]

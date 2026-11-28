@@ -16,7 +16,7 @@ use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, WorkspaceId,
 };
 use spawn_core::port::{CommandQueue, EventLog};
-use spawn_postgres::{HumanInput, HumanKey, PostgresStore, role_url};
+use spawn_postgres::{HumanInput, HumanKey, PostgresStore, role_url_with_passfile};
 
 mod common;
 use common::{admin, schema_url, store};
@@ -101,14 +101,16 @@ fn submitted(answer: HumanInput) -> CommandId {
 
 /// A store connected as this database's `spawn_human` login, in `schema`.
 fn human(schema: &str) -> PostgresStore {
-    let url = role_url(&schema_url(schema), "spawn_human").expect("the human login's URL");
+    let url = role_url_with_passfile(&schema_url(schema), "spawn_human", None)
+        .expect("the human login's URL");
     assert!(
         url.contains("://spawn_human_"),
         "the database's own login: {}",
         url.split_once('@')
             .map_or("", |(user, _)| user.split(':').next().unwrap_or(""))
     );
-    PostgresStore::connect(&url).expect("the human login connects")
+    PostgresStore::connect_with_options(&url, &spawn_postgres::ConnectOptions::default())
+        .expect("the human login connects")
 }
 
 /// `spawn_commands` rows of the case's schema: principal, key, agent,
@@ -402,7 +404,8 @@ fn only_the_human_login_types_and_only_what_a_person_types() {
     seen(&store);
     start(&store);
     let mut page = postgres::Client::connect(
-        &role_url(&schema_url(&schema), "spawn_human").expect("the login's URL"),
+        &role_url_with_passfile(&schema_url(&schema), "spawn_human", None)
+            .expect("the login's URL"),
         postgres::NoTls,
     )
     .expect("the human login connects");
@@ -445,7 +448,8 @@ fn only_the_human_login_types_and_only_what_a_person_types() {
         Some(&SqlState::INSUFFICIENT_PRIVILEGE),
         "the owner submits with spawn_submit, not as the page"
     );
-    let supervisor = role_url(&schema_url(&schema), "spawn_supervisor").expect("the login's URL");
+    let supervisor = role_url_with_passfile(&schema_url(&schema), "spawn_supervisor", None)
+        .expect("the login's URL");
     let error = call(
         &mut postgres::Client::connect(&supervisor, postgres::NoTls).expect("connects"),
         "k8",
@@ -472,7 +476,8 @@ fn the_human_login_can_do_nothing_but_type() {
         )
         .expect("a command it must not see");
     let mut page = postgres::Client::connect(
-        &role_url(&schema_url(&schema), "spawn_human").expect("the login's URL"),
+        &role_url_with_passfile(&schema_url(&schema), "spawn_human", None)
+            .expect("the login's URL"),
         postgres::NoTls,
     )
     .expect("the human login connects");

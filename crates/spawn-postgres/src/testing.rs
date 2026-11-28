@@ -17,7 +17,7 @@
 //! 270 a day on the ccd server, 2026-11-14). A process that is killed or
 //! aborts never unwinds, and its schemas are still left.
 
-use crate::PostgresStore;
+use crate::{ConnectOptions, PostgresStore};
 
 /// The variable that names the test database.
 pub(crate) const TEST_DATABASE_URL: &str = "SPAWN_TEST_DATABASE_URL";
@@ -104,15 +104,37 @@ impl TestSchema {
         &self.url
     }
 
+    /// Resolve libpq passfile path for test helpers (`PGPASSFILE` else `$HOME/.pgpass`).
+    #[must_use]
+    pub fn passfile() -> Option<std::path::PathBuf> {
+        test_passfile()
+    }
+
     /// A store in the schema, which it makes and migrates when absent.
     ///
     /// # Panics
     ///
     /// When the store cannot connect or migrate.
     pub fn store(&self) -> PostgresStore {
-        PostgresStore::connect_in_schema(&self.url, &self.name)
-            .unwrap_or_else(|error| panic!("connect and migrate in {}: {error}", self.name))
+        PostgresStore::connect_in_schema_with_options(
+            &self.url,
+            &self.name,
+            &ConnectOptions {
+                passfile: test_passfile(),
+                statement_timeout: None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("connect and migrate in {}: {error}", self.name))
     }
+}
+
+/// Resolve libpq passfile location at the test boundary (`PGPASSFILE` else `$HOME/.pgpass`).
+#[must_use]
+pub fn test_passfile() -> Option<std::path::PathBuf> {
+    crate::resolve_passfile_path(
+        std::env::var_os("PGPASSFILE").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
 }
 
 impl std::ops::Deref for TestSchema {
@@ -133,7 +155,7 @@ impl std::fmt::Display for TestSchema {
 /// dropped as it was made; it gives up connecting after
 /// [`CONNECT_TIMEOUT`].
 fn client(url: &str) -> Result<postgres::Client, postgres::Error> {
-    crate::passfile::config(url)?
+    crate::passfile::config(url, test_passfile().as_deref())?
         .connect_timeout(CONNECT_TIMEOUT)
         .connect(postgres::NoTls)
 }

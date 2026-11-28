@@ -197,9 +197,14 @@ fn a_node_joins_once_beats_is_lost_and_back_drains_and_is_removed() {
         (&node["join"], &node["heartbeat"], &node["state"]),
         (&json!(again), &Value::Null, &json!("live"))
     );
-    let url = spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader")
-        .expect("the reader's URL");
-    let reader = spawn_postgres::PostgresStore::connect(&url).expect("the reader connects");
+    let url =
+        spawn_postgres::role_url_with_passfile(&common::schema_url(&schema), "spawn_reader", None)
+            .expect("the reader's URL");
+    let reader = spawn_postgres::PostgresStore::connect_with_options(
+        &url,
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("the reader connects");
     assert_eq!(reader.nodes().expect("read")[0]["name"], "runner");
 }
 
@@ -713,9 +718,14 @@ fn the_reads_say_how_each_node_is_reached_and_default_an_old_join() {
                               "mem_available": 1, "disk_free": 1}),
         )
         .expect("a heartbeat over tcp");
-    let url = spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader")
-        .expect("the reader's URL");
-    let reader = spawn_postgres::PostgresStore::connect(&url).expect("the reader connects");
+    let url =
+        spawn_postgres::role_url_with_passfile(&common::schema_url(&schema), "spawn_reader", None)
+            .expect("the reader's URL");
+    let reader = spawn_postgres::PostgresStore::connect_with_options(
+        &url,
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("the reader connects");
     assert_eq!(reader.nodes().expect("read"), store.nodes().expect("read"));
 }
 

@@ -18,7 +18,7 @@ use common::{admin, as_login, migrate_warnings, schema_url, store};
 use spawn_postgres::{
     PostgresStore, ProvAttributionSource, ProvBlastRadiusNode, ProvBoundary, ProvChangeInput,
     ProvChangeKind, ProvDirection, ProvEdgeInput, ProvEdgeKind, ProvEntryClass, ProvEntryInput,
-    ProvLink, role_url,
+    ProvLink, role_url_with_passfile,
 };
 
 const TABLES: [&str; 3] = ["prov_changes", "prov_entries", "prov_edges"];
@@ -182,16 +182,23 @@ fn the_schema_applies_twice_and_only_the_owner_records() {
         .expect_err("the reader writes nothing");
     let refused = message(&refused);
     assert!(refused.contains("permission denied"), "{refused}");
+    assert_restricted_logins_cannot_record(&schema);
+    assert_eq!(count(&mut client, "prov_changes"), 1);
+}
+
+fn assert_restricted_logins_cannot_record(schema: &common::Schema) {
     for login in ["spawn_reader", "spawn_supervisor"] {
-        let url = role_url(&schema_url(&schema), login).expect("the login's URL");
-        let restricted = PostgresStore::connect(&url).expect("log in");
+        let url =
+            role_url_with_passfile(&schema_url(schema), login, None).expect("the login's URL");
+        let restricted =
+            PostgresStore::connect_with_options(&url, &spawn_postgres::ConnectOptions::default())
+                .expect("log in");
         let refused = restricted
             .record_change(&change("c-login", 1, "agent_a", 2_000), &[], &[])
             .expect_err("a restricted login records nothing")
             .to_string();
         assert!(refused.contains("permission denied"), "{login}: {refused}");
     }
-    assert_eq!(count(&mut client, "prov_changes"), 1);
 }
 
 /// A change, its entries and edges come back as recorded, by

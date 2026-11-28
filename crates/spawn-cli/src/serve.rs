@@ -769,8 +769,8 @@ fn serve_token_with(
     cred_dir: Option<&Path>,
     env_token: Option<String>,
 ) -> Result<Option<String>, String> {
-    if let Some(token) = crate::config::load_credential_value(cred_dir, "spawn-serve.token")? {
-        return Ok(Some(token));
+    if let Some(token) = crate::config::load_credential_secret(cred_dir, "spawn-serve.token")? {
+        return Ok(Some(token.into_inner()));
     }
     Ok(env_token)
 }
@@ -1345,7 +1345,11 @@ fn open_store() -> Result<PooledStore, String> {
                 .ok_or_else(|| "SPAWN_DATABASE_URL is not set".to_string())?;
             let url = match env_value("SPAWN_SERVE_DATABASE_URL") {
                 Some(url) => url,
-                None => spawn_postgres::role_url(&controller, "spawn_reader")?,
+                None => spawn_postgres::role_url_with_passfile(
+                    &controller,
+                    "spawn_reader",
+                    crate::config::pg_passfile().as_deref(),
+                )?,
             };
             checkout_pooled(&reader_pool_for_url(&url))
         }
@@ -11140,10 +11144,13 @@ mod tests {
     #[test]
     fn storage_tree_and_snapshot_endpoints_work_empty_and_with_d6_dag() {
         in_test_schema(|owner, store| {
-            let reader_url =
-                spawn_postgres::role_url(owner, "spawn_reader").expect("reader role url");
-            let reader_store =
-                spawn_postgres::PostgresStore::connect(&reader_url).expect("connect reader store");
+            let reader_url = spawn_postgres::role_url_with_passfile(owner, "spawn_reader", None)
+                .expect("reader role url");
+            let reader_store = spawn_postgres::PostgresStore::connect_with_options(
+                &reader_url,
+                &spawn_postgres::ConnectOptions::default(),
+            )
+            .expect("connect reader store");
 
             let empty = super::storage_tree_for_store(&reader_store, None, 120)
                 .expect("empty tree succeeds");

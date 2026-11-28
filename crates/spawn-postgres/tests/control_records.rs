@@ -701,8 +701,13 @@ fn pg_owner_and_spawn_reader_replay_episodes_and_match_sql_projections() {
     let _gated_ids = drive_gated_and_ops_mission(&store);
 
     let schema_url = common::schema_url(&schema);
-    let reader_url = spawn_postgres::role_url(&schema_url, "spawn_reader").expect("reader url");
-    let reader_store = PostgresStore::connect(&reader_url).expect("connect as spawn_reader");
+    let reader_url = spawn_postgres::role_url_with_passfile(&schema_url, "spawn_reader", None)
+        .expect("reader url");
+    let reader_store = PostgresStore::connect_with_options(
+        &reader_url,
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("connect as spawn_reader");
 
     assert_owner_and_reader_parity(&store, &reader_store);
 

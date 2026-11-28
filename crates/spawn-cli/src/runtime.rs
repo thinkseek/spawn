@@ -406,9 +406,11 @@ fn bridge_config_for(herdr_backend: bool, workspace_root: &Path) -> Result<Bridg
     // gateway, nothing more.
     // Without an owner password there is no supervisor login to hand out:
     // fatal on a supervised host, irrelevant elsewhere.
-    match spawn_postgres::role_url(
+    let passfile = crate::config::pg_passfile();
+    match spawn_postgres::role_url_with_passfile(
         &required_env("SPAWN_DATABASE_URL")?,
         crate::supervise::SUPERVISOR_PRINCIPAL,
+        passfile.as_deref(),
     ) {
         Ok(url) => config.session_environment.push((
             supervise::SUPERVISOR_SESSION.to_string(),
@@ -420,12 +422,15 @@ fn bridge_config_for(herdr_backend: bool, workspace_root: &Path) -> Result<Bridg
         Err(error) if crate::config::supervised() => return Err(error),
         Err(_) => {}
     }
-    if let Some(fleet) = FleetTestDatabase::from_env(env_value, |url| {
-        spawn_postgres::cluster_identity(url).map_err(|error| error.to_string())
-    }) {
+    if let Some(fleet) = FleetTestDatabase::from_env(env_value, fleet_cluster_identity) {
         config.launch_environment = Some(Arc::new(fleet));
     }
     Ok(config)
+}
+
+fn fleet_cluster_identity(url: &str) -> Result<String, String> {
+    spawn_postgres::cluster_identity_with_passfile(url, crate::config::pg_passfile().as_deref())
+        .map_err(|error| error.to_string())
 }
 
 /// Zero-secret toolchain build cache env variables mapped to subdirectories under
@@ -764,7 +769,7 @@ fn supply_pa_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String
 /// The variable a test reads its database from.
 const TEST_DATABASE: &str = "SPAWN_TEST_DATABASE_URL";
 
-/// How a server's identity is read: [`spawn_postgres::cluster_identity`].
+/// How a server's identity is read: [`spawn_postgres::cluster_identity_with_passfile`].
 type Identity = fn(&str) -> Result<String, String>;
 
 /// The fleet's own test server, which engines get as

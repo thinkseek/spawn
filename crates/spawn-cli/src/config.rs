@@ -8,7 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use spawn_postgres::PostgresStore;
+use spawn_postgres::{ConnectOptions, LibpqDefaults, PostgresStore};
+
+pub(crate) use crate::config_file::SecretString;
+pub(crate) use crate::workspace_backend::WorkspaceBackend;
 
 /// Process exit status (`EX_CONFIG` in `<sysexits.h>`) when a Keep-delivered
 /// `$CREDENTIALS_DIRECTORY/<id>` credential file is unreadable, empty, malformed,
@@ -52,12 +55,13 @@ pub(crate) fn load_credential_file(
     Ok(Some(path))
 }
 
-/// Read a single-value UTF-8 credential from `cred_dir/<id>`, stripping at most one
-/// trailing newline while rejecting empty values, embedded newlines/NULs, or symlinks.
-pub(crate) fn load_credential_value(
+/// Read a single-value UTF-8 credential from `cred_dir/<id>` into a [`SecretString`],
+/// stripping at most one trailing newline while rejecting empty values, embedded
+/// newlines/NULs, or symlinks.
+pub(crate) fn load_credential_secret(
     cred_dir: Option<&Path>,
     id: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<SecretString>, String> {
     let Some(path) = load_credential_file(cred_dir, id)? else {
         return Ok(None);
     };
@@ -77,12 +81,12 @@ pub(crate) fn load_credential_value(
             "credential {id} contains embedded newline or NUL byte"
         ));
     }
-    Ok(Some(trimmed.to_string()))
+    Ok(Some(SecretString::new(trimmed)))
 }
 
-/// Resolve `$CREDENTIALS_DIRECTORY/<id>` as a validated single-value secret string.
-pub(crate) fn credential_value(id: &str) -> Result<Option<String>, String> {
-    load_credential_value(
+/// Resolve `$CREDENTIALS_DIRECTORY/<id>` as a validated [`SecretString`].
+pub(crate) fn credential_secret(id: &str) -> Result<Option<SecretString>, String> {
+    load_credential_secret(
         env_value("CREDENTIALS_DIRECTORY").as_deref().map(Path::new),
         id,
     )
@@ -159,19 +163,45 @@ fn not_set(name: &str) -> String {
     }
 }
 
-/// Resolve the controller's PostgreSQL URL, preferring Keep's
+/// Resolve the controller's PostgreSQL URL as a [`SecretString`], preferring Keep's
 /// `$CREDENTIALS_DIRECTORY/spawn.database-url` when present and falling back to
 /// `SPAWN_DATABASE_URL`.
-pub(crate) fn database_url() -> Result<String, String> {
-    if let Some(url) = credential_value("spawn.database-url")? {
+pub(crate) fn database_url_secret() -> Result<SecretString, String> {
+    if let Some(url) = credential_secret("spawn.database-url")? {
         return Ok(url);
     }
-    required_env("SPAWN_DATABASE_URL")
+    required_env("SPAWN_DATABASE_URL").map(SecretString::new)
+}
+
+/// Resolve libpq passfile location at the CLI boundary (`PGPASSFILE` else `$HOME/.pgpass`).
+pub(crate) fn pg_passfile() -> Option<PathBuf> {
+    spawn_postgres::resolve_passfile_path(
+        std::env::var_os("PGPASSFILE").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Explicit libpq connect options injected from the CLI environment boundary.
+pub(crate) fn pg_connect_options(statement_timeout: Option<std::time::Duration>) -> ConnectOptions {
+    ConnectOptions {
+        passfile: pg_passfile(),
+        statement_timeout,
+    }
+}
+
+/// Explicit libpq default identity fields read at the CLI environment boundary.
+pub(crate) fn libpq_defaults() -> LibpqDefaults {
+    LibpqDefaults {
+        port: env_value("PGPORT").and_then(|port| port.trim().parse().ok()),
+        user: env_value("PGUSER").or_else(|| env_value("USER")),
+        database: env_value("PGDATABASE"),
+    }
 }
 
 pub(crate) fn open_store() -> Result<PostgresStore, String> {
-    let url = database_url()?;
-    PostgresStore::connect(&url).map_err(|error| error.to_string())
+    let url = database_url_secret()?;
+    PostgresStore::connect_with_options(url.expose_secret(), &pg_connect_options(None))
+        .map_err(|error| error.to_string())
 }
 
 /// Whether this host runs the supervisor (`SPAWN_SUPERVISOR` is set).
@@ -187,9 +217,10 @@ pub(crate) fn spawn_program() -> String {
 }
 
 fn resolve_spawn_program(configured: Option<String>, current: Option<PathBuf>) -> String {
-    configured
-        .or_else(|| current.map(|path| path.display().to_string()))
-        .unwrap_or_else(|| "spawn".to_string())
+    match configured {
+        Some(program) => program,
+        None => current.map_or_else(|| "spawn".to_string(), |path| path.display().to_string()),
+    }
 }
 
 /// `--root`, else `SPAWN_WORKSPACE_ROOT`, resolved through its symlinks,
@@ -273,55 +304,17 @@ pub(crate) fn loop_interval() -> std::time::Duration {
     )
 }
 
-/// What `SPAWN_WORKSPACE_BACKEND` asks for (docs/storage.md, "Workspace
-/// backends"): a backend by name, or `auto`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkspaceBackend {
-    /// Git working copies: the default.
-    Git,
-    /// Copy-on-write clones of a per-commit baseline.
-    Cow,
-    /// An unprivileged overlay per workspace (Linux): by name only.
-    Overlay,
-    /// Dual-track oracle wrapping authoritative `git` beside shadow `d6`: opt-in only.
-    D6Shadow,
-    /// Pure-Rust CAS Merkle + ledger workspace store (`D6Workspace`): opt-in only.
-    D6,
-    /// The cheapest backend the root supports that the loop serves
-    /// ([`spawn_host::WorkspaceBackend::auto_with`]), chosen once at start.
-    Auto,
-}
-
-impl WorkspaceBackend {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Git => "git",
-            Self::Cow => "cow",
-            Self::Overlay => "overlay",
-            Self::D6Shadow => "d6-shadow",
-            Self::D6 => "d6",
-            Self::Auto => "auto",
-        }
-    }
-}
-
 /// The backend `value` (`SPAWN_WORKSPACE_BACKEND`) names: git when it is
 /// unset or empty; anything it does not name is refused, never read as git.
 pub(crate) fn workspace_backend(value: Option<&str>) -> Result<WorkspaceBackend, String> {
     match value.map(str::trim) {
-        None | Some("") => Ok(WorkspaceBackend::Git),
-        Some("auto") => Ok(WorkspaceBackend::Auto),
-        Some(name) => match spawn_host::WorkspaceBackend::parse(name) {
-            Some(spawn_host::WorkspaceBackend::Git) => Ok(WorkspaceBackend::Git),
-            Some(spawn_host::WorkspaceBackend::Cow) => Ok(WorkspaceBackend::Cow),
-            Some(spawn_host::WorkspaceBackend::Overlay) => Ok(WorkspaceBackend::Overlay),
-            Some(spawn_host::WorkspaceBackend::D6Shadow) => Ok(WorkspaceBackend::D6Shadow),
-            Some(spawn_host::WorkspaceBackend::D6) => Ok(WorkspaceBackend::D6),
-            None => Err(format!(
+        None | Some("") => Ok(WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Git)),
+        Some(name) => WorkspaceBackend::parse(name).ok_or_else(|| {
+            format!(
                 "SPAWN_WORKSPACE_BACKEND={name:?} names no workspace backend: use git (the \
                  default), cow, overlay, d6-shadow, d6 or auto"
-            )),
-        },
+            )
+        }),
     }
 }
 
@@ -525,11 +518,7 @@ impl WorkspaceSettings {
         probes: &Probes<'_>,
     ) -> Result<Self, String> {
         let active = match configured {
-            WorkspaceBackend::Git => spawn_host::WorkspaceBackend::Git,
-            WorkspaceBackend::Cow => spawn_host::WorkspaceBackend::Cow,
-            WorkspaceBackend::D6Shadow => spawn_host::WorkspaceBackend::D6Shadow,
-            WorkspaceBackend::D6 => spawn_host::WorkspaceBackend::D6,
-            WorkspaceBackend::Overlay => {
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay) => {
                 (probes.overlay)(root).map_err(|why| {
                     format!(
                         "SPAWN_WORKSPACE_BACKEND=overlay: no unprivileged overlay under {}: \
@@ -539,6 +528,7 @@ impl WorkspaceSettings {
                 })?;
                 spawn_host::WorkspaceBackend::Overlay
             }
+            WorkspaceBackend::Named(host) => host,
             WorkspaceBackend::Auto => match (probes.marked)(root)? {
                 Some(there) => there,
                 None => spawn_host::WorkspaceBackend::auto_with((probes.cow)(root)),
@@ -641,14 +631,7 @@ impl WorkspaceSettings {
                 return serde_json::json!({ "error": error });
             }
         };
-        let named = match configured {
-            WorkspaceBackend::Git => Some(spawn_host::WorkspaceBackend::Git),
-            WorkspaceBackend::Cow => Some(spawn_host::WorkspaceBackend::Cow),
-            WorkspaceBackend::Overlay => Some(spawn_host::WorkspaceBackend::Overlay),
-            WorkspaceBackend::D6Shadow => Some(spawn_host::WorkspaceBackend::D6Shadow),
-            WorkspaceBackend::D6 => Some(spawn_host::WorkspaceBackend::D6),
-            WorkspaceBackend::Auto => None,
-        };
+        let named = configured.to_host();
         if let (Some(named), Some(marked)) = (named, marked)
             && !spawn_host::workspace::backends_compatible(marked, named)
         {
@@ -1317,19 +1300,36 @@ mod workspace_tests {
 
     #[test]
     fn the_workspace_backend_is_git_unless_another_is_named() {
-        assert_eq!(workspace_backend(None), Ok(WorkspaceBackend::Git));
-        assert_eq!(workspace_backend(Some("")), Ok(WorkspaceBackend::Git));
-        assert_eq!(workspace_backend(Some("git")), Ok(WorkspaceBackend::Git));
-        assert_eq!(workspace_backend(Some(" cow ")), Ok(WorkspaceBackend::Cow));
+        use spawn_host::WorkspaceBackend as HostBackend;
+
+        assert_eq!(
+            workspace_backend(None),
+            Ok(WorkspaceBackend::Named(HostBackend::Git))
+        );
+        assert_eq!(
+            workspace_backend(Some("")),
+            Ok(WorkspaceBackend::Named(HostBackend::Git))
+        );
+        assert_eq!(
+            workspace_backend(Some("git")),
+            Ok(WorkspaceBackend::Named(HostBackend::Git))
+        );
+        assert_eq!(
+            workspace_backend(Some(" cow ")),
+            Ok(WorkspaceBackend::Named(HostBackend::Cow))
+        );
         assert_eq!(
             workspace_backend(Some("overlay")),
-            Ok(WorkspaceBackend::Overlay)
+            Ok(WorkspaceBackend::Named(HostBackend::Overlay))
         );
         assert_eq!(
             workspace_backend(Some("d6-shadow")),
-            Ok(WorkspaceBackend::D6Shadow)
+            Ok(WorkspaceBackend::Named(HostBackend::D6Shadow))
         );
-        assert_eq!(workspace_backend(Some(" d6 ")), Ok(WorkspaceBackend::D6));
+        assert_eq!(
+            workspace_backend(Some(" d6 ")),
+            Ok(WorkspaceBackend::Named(HostBackend::D6))
+        );
         assert_eq!(workspace_backend(Some("auto")), Ok(WorkspaceBackend::Auto));
         for unknown in ["Git", "COW", "btrfs", "zfs", "overlayfs", "d6_shadow", "1"] {
             let error = workspace_backend(Some(unknown)).expect_err(unknown);
@@ -1358,21 +1358,14 @@ mod workspace_tests {
         let root = Path::new("/srv/work");
         let none = |_: &Path| Err("user namespaces are off".to_string());
         let clones = |_: &Path| true;
-        let error = WorkspaceSettings::resolve(
-            WorkspaceBackend::Overlay,
-            false,
-            root,
-            &probes(&none, &clones),
-        )
-        .expect_err("refused");
+        let overlay = WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay);
+        let error = WorkspaceSettings::resolve(overlay, false, root, &probes(&none, &clones))
+            .expect_err("refused");
         assert!(error.contains("SPAWN_WORKSPACE_BACKEND=overlay"), "{error}");
         assert!(error.contains("user namespaces are off"), "{error}");
         assert!(error.contains("/srv/work"), "{error}");
         #[cfg(not(target_os = "linux"))]
-        assert!(
-            WorkspaceSettings::resolve(WorkspaceBackend::Overlay, false, root, &Probes::host())
-                .is_err()
-        );
+        assert!(WorkspaceSettings::resolve(overlay, false, root, &Probes::host()).is_err());
     }
 
     /// `auto` is spawn-host's rule: Cow where clones work, else Git, and
@@ -1410,8 +1403,14 @@ mod workspace_tests {
         // Asked for by name, git and cow need no probe.
         let never_cow = |_: &Path| -> bool { panic!("no probe for a named backend") };
         for (configured, backend) in [
-            (WorkspaceBackend::Git, spawn_host::WorkspaceBackend::Git),
-            (WorkspaceBackend::Cow, spawn_host::WorkspaceBackend::Cow),
+            (
+                WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Git),
+                spawn_host::WorkspaceBackend::Git,
+            ),
+            (
+                WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Cow),
+                spawn_host::WorkspaceBackend::Cow,
+            ),
         ] {
             let settings =
                 WorkspaceSettings::resolve(configured, true, root, &probes(&never, &never_cow))
@@ -1437,7 +1436,7 @@ mod workspace_tests {
             "workspace backend cow under /srv/work (SPAWN_WORKSPACE_BACKEND=auto); cas dedup on"
         );
         let git = WorkspaceSettings::resolve(
-            WorkspaceBackend::Git,
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Git),
             true,
             root,
             &probes(&mounts, &clones),
@@ -1448,7 +1447,7 @@ mod workspace_tests {
         assert_eq!(git.store(Path::new("/r.git"), root).backend_name(), "git");
         assert_eq!(auto.store(Path::new("/r.git"), root).backend_name(), "cow");
         let overlay = WorkspaceSettings::resolve(
-            WorkspaceBackend::Overlay,
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay),
             false,
             root,
             &probes(&mounts, &clones),
@@ -1468,9 +1467,15 @@ mod workspace_tests {
     /// alone, a conflict said as the loop would refuse it.
     #[test]
     fn a_peek_reads_the_marker_and_names_a_conflict() {
+        use spawn_host::WorkspaceBackend as HostBackend;
+
         let peek = WorkspaceSettings::peek_with;
         assert_eq!(
-            peek(Ok(WorkspaceBackend::Git), Ok(false), Ok(None)),
+            peek(
+                Ok(WorkspaceBackend::Named(HostBackend::Git)),
+                Ok(false),
+                Ok(None)
+            ),
             json!({"configured": "git", "active": "git", "root": null, "cas_dedup": "off",
                    "servable": true})
         );
@@ -1483,20 +1488,24 @@ mod workspace_tests {
             peek(
                 Ok(WorkspaceBackend::Auto),
                 Ok(true),
-                Ok(Some(spawn_host::WorkspaceBackend::Cow))
+                Ok(Some(HostBackend::Cow))
             ),
             json!({"configured": "auto", "active": "cow", "root": "cow", "cas_dedup": "on",
                    "servable": true})
         );
         assert_eq!(
-            peek(Ok(WorkspaceBackend::Overlay), Ok(false), Ok(None)),
+            peek(
+                Ok(WorkspaceBackend::Named(HostBackend::Overlay)),
+                Ok(false),
+                Ok(None)
+            ),
             json!({"configured": "overlay", "active": "overlay", "root": null,
                    "cas_dedup": "off", "servable": false})
         );
         let conflict = peek(
-            Ok(WorkspaceBackend::Cow),
+            Ok(WorkspaceBackend::Named(HostBackend::Cow)),
             Ok(false),
-            Ok(Some(spawn_host::WorkspaceBackend::Git)),
+            Ok(Some(HostBackend::Git)),
         );
         assert!(
             conflict["error"]
@@ -1575,7 +1584,7 @@ mod workspace_tests {
         let mounts = |_: &Path| Ok(());
         let clones = |_: &Path| true;
         let overlay = WorkspaceSettings::resolve(
-            WorkspaceBackend::Overlay,
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay),
             false,
             &root,
             &probes(&mounts, &clones),
@@ -1592,7 +1601,7 @@ mod workspace_tests {
         );
         assert_eq!(spawn_host::root_backend(&root).unwrap(), None);
         let cow = WorkspaceSettings::resolve(
-            WorkspaceBackend::Cow,
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Cow),
             false,
             &root,
             &probes(&mounts, &clones),
@@ -1672,22 +1681,59 @@ mod workspace_tests {
     }
 
     #[test]
+    fn config_origin_and_secret_string_behavior() {
+        use super::{SecretString, resolve_spawn_program, resolve_workspace_root};
+        use crate::config_file::{ConfigOrigin, SpawnConfig};
+
+        assert_eq!(
+            resolve_spawn_program(Some("/opt/spawn".into()), None),
+            "/opt/spawn"
+        );
+        assert_eq!(resolve_spawn_program(None, None), "spawn");
+        assert_eq!(
+            resolve_workspace_root(Some("/flag".into()), Some("/env".into())).as_deref(),
+            Some("/flag")
+        );
+        assert_eq!(
+            resolve_workspace_root(None, Some("/env".into())).as_deref(),
+            Some("/env")
+        );
+        assert_eq!(ConfigOrigin::File.as_str(), "file");
+        assert_eq!(ConfigOrigin::Credential.as_str(), "credential");
+
+        let cfg = SpawnConfig::from_toml_str(
+            "schema_version = 1\n[instance]\ndata_dir = \"/srv/spawn\"\n",
+        )
+        .expect("parse");
+        let origins = cfg.field_origins();
+        assert_eq!(origins.get("instance"), Some(&ConfigOrigin::File));
+        assert_eq!(origins.get("database"), Some(&ConfigOrigin::Default));
+
+        let secret = SecretString::new("TopSecretValue_001");
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
+        assert_eq!(secret.expose_secret(), "TopSecretValue_001");
+        assert_eq!(secret.into_inner(), "TopSecretValue_001");
+    }
+
+    #[test]
     fn d6_shadow_and_d6_compatibility_in_resolve_and_peek() {
+        use spawn_host::WorkspaceBackend as HostBackend;
+
         let peek = WorkspaceSettings::peek_with;
         // git root allows d6-shadow (active=d6-shadow, root=git), refuses pure d6
         assert_eq!(
             peek(
-                Ok(WorkspaceBackend::D6Shadow),
+                Ok(WorkspaceBackend::Named(HostBackend::D6Shadow)),
                 Ok(false),
-                Ok(Some(spawn_host::WorkspaceBackend::Git))
+                Ok(Some(HostBackend::Git))
             ),
             json!({"configured": "d6-shadow", "active": "d6-shadow", "root": "git",
                    "cas_dedup": "off", "servable": true})
         );
         let refused_d6 = peek(
-            Ok(WorkspaceBackend::D6),
+            Ok(WorkspaceBackend::Named(HostBackend::D6)),
             Ok(false),
-            Ok(Some(spawn_host::WorkspaceBackend::Git)),
+            Ok(Some(HostBackend::Git)),
         );
         assert!(
             refused_d6["error"]
@@ -1699,17 +1745,17 @@ mod workspace_tests {
         // pure d6 root refuses git and d6-shadow
         assert!(
             peek(
-                Ok(WorkspaceBackend::Git),
+                Ok(WorkspaceBackend::Named(HostBackend::Git)),
                 Ok(false),
-                Ok(Some(spawn_host::WorkspaceBackend::D6))
+                Ok(Some(HostBackend::D6))
             )["error"]
                 .is_string()
         );
         assert!(
             peek(
-                Ok(WorkspaceBackend::D6Shadow),
+                Ok(WorkspaceBackend::Named(HostBackend::D6Shadow)),
                 Ok(false),
-                Ok(Some(spawn_host::WorkspaceBackend::D6))
+                Ok(Some(HostBackend::D6))
             )["error"]
                 .is_string()
         );
@@ -1718,10 +1764,10 @@ mod workspace_tests {
         let never_cow = |_: &Path| -> bool { panic!("no cow probe for d6") };
         for (cfg, eng) in [
             (
-                WorkspaceBackend::D6Shadow,
-                spawn_host::WorkspaceBackend::D6Shadow,
+                WorkspaceBackend::Named(HostBackend::D6Shadow),
+                HostBackend::D6Shadow,
             ),
-            (WorkspaceBackend::D6, spawn_host::WorkspaceBackend::D6),
+            (WorkspaceBackend::Named(HostBackend::D6), HostBackend::D6),
         ] {
             let s = WorkspaceSettings::resolve(
                 cfg,
@@ -1737,14 +1783,15 @@ mod workspace_tests {
 
     #[test]
     fn load_credential_supports_valid_files_absent_fallback_and_fail_closed_checks() {
-        use super::{load_credential_file, load_credential_value};
+        use super::{SecretString, load_credential_file, load_credential_secret};
         use std::os::unix::fs::PermissionsExt;
 
         let dir = crate::storage::tests::scratch("config-load-credential");
         assert_eq!(load_credential_file(None, "spawn.database-url"), Ok(None));
-        assert_eq!(
-            load_credential_value(Some(&dir), "spawn.database-url"),
-            Ok(None)
+        assert!(
+            load_credential_secret(Some(&dir), "spawn.database-url")
+                .unwrap()
+                .is_none()
         );
 
         let canary = "canary-cred-val-8391";
@@ -1757,7 +1804,9 @@ mod workspace_tests {
             Some(valid_0400.clone())
         );
         assert_eq!(
-            load_credential_value(Some(&dir), "spawn.database-url").unwrap(),
+            load_credential_secret(Some(&dir), "spawn.database-url")
+                .unwrap()
+                .map(SecretString::into_inner),
             Some(canary.to_string())
         );
 
@@ -1766,7 +1815,9 @@ mod workspace_tests {
         std::fs::set_permissions(&valid_0600, std::fs::Permissions::from_mode(0o600))
             .expect("chmod 600");
         assert_eq!(
-            load_credential_value(Some(&dir), "backup.key.k1").unwrap(),
+            load_credential_secret(Some(&dir), "backup.key.k1")
+                .unwrap()
+                .map(SecretString::into_inner),
             Some(canary.to_string())
         );
 
@@ -1781,7 +1832,7 @@ mod workspace_tests {
             let p = dir.join(name);
             std::fs::write(&p, bytes).expect("write bad");
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
-            errs.push(load_credential_value(Some(&dir), name).unwrap_err());
+            errs.push(load_credential_secret(Some(&dir), name).unwrap_err());
         }
 
         let target = dir.join("real.target");
@@ -1790,7 +1841,7 @@ mod workspace_tests {
         let link = dir.join("sym.cred");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
         errs.push(load_credential_file(Some(&dir), "sym.cred").unwrap_err());
-        errs.push(load_credential_value(Some(&dir), "sym.cred").unwrap_err());
+        errs.push(load_credential_secret(Some(&dir), "sym.cred").unwrap_err());
 
         for err in &errs {
             assert!(err.starts_with("credential "), "{err}");

@@ -611,14 +611,18 @@ pub(crate) fn report(store: &PostgresStore, now_ms: i64) -> Result<Value, String
         let database = store.database_size().map_err(|error| error.to_string())?;
         // The gates' test database and the engines', each when its URL is
         // set (objective 074).
+        let passfile = crate::config::pg_passfile();
         let tests = test_databases(
             crate::alerts::test_database_urls()
                 .into_iter()
                 .map(|(role, url)| {
                     (
                         role,
-                        spawn_postgres::test_database_size(&url.0)
-                            .map_err(|error| error.to_string()),
+                        spawn_postgres::test_database_size_with_passfile(
+                            &url.0,
+                            passfile.as_deref(),
+                        )
+                        .map_err(|error| error.to_string()),
                     )
                 })
                 .collect(),

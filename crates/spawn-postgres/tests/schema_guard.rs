@@ -26,10 +26,13 @@ fn a_schema_made_through_its_url_alone_is_dropped_with_its_guard() {
     let schema = Schema::new("guard_url");
     let name = schema.to_string();
     assert!(!exists(&name), "a fresh name names no schema yet");
-    PostgresStore::connect(&schema_url(&schema))
-        .expect("connect")
-        .migrate()
-        .expect("the migration makes the schema");
+    PostgresStore::connect_with_options(
+        &schema_url(&schema),
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("connect")
+    .migrate()
+    .expect("the migration makes the schema");
     assert!(exists(&name), "the migration made it");
     drop(schema);
     assert!(!exists(&name), "the guard dropped it");
@@ -42,10 +45,13 @@ fn several_schemas_of_one_case_are_each_dropped_with_their_guards() {
         .collect();
     let names: Vec<String> = schemas.iter().map(ToString::to_string).collect();
     for schema in &schemas {
-        PostgresStore::connect(&schema_url(schema))
-            .expect("connect")
-            .migrate()
-            .expect("migrate");
+        PostgresStore::connect_with_options(
+            &schema_url(schema),
+            &spawn_postgres::ConnectOptions::default(),
+        )
+        .expect("connect")
+        .migrate()
+        .expect("migrate");
     }
     assert!(names.iter().all(|name| exists(name)), "each was made");
     drop(schemas);

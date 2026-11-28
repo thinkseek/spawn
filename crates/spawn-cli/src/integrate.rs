@@ -4673,7 +4673,11 @@ impl Judge {
         let owner = std::env::var("SPAWN_DATABASE_URL").ok();
         let (mut gate_env, warning) =
             gate::withhold_owners_cluster(&self.gate_env, owner.as_deref(), |url| {
-                spawn_postgres::cluster_identity(url).map_err(|error| error.to_string())
+                spawn_postgres::cluster_identity_with_passfile(
+                    url,
+                    crate::config::pg_passfile().as_deref(),
+                )
+                .map_err(|error| error.to_string())
             });
         if !needs_test_database(scenarios) {
             gate_env.retain(|(name, _)| !withheld_without_test_database(name));

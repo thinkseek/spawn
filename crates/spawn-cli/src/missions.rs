@@ -5096,9 +5096,13 @@ mod tests {
         let url = schema.url();
         let separator = if url.contains('?') { '&' } else { '?' };
         let schema_url = format!("{url}{separator}options=-csearch_path%3D{schema}");
-        let sup_url =
-            spawn_postgres::role_url(&schema_url, "spawn_supervisor").expect("supervisor url");
-        let sup_store = spawn_postgres::PostgresStore::connect(&sup_url).expect("supervisor store");
+        let sup_url = spawn_postgres::role_url_with_passfile(&schema_url, "spawn_supervisor", None)
+            .expect("supervisor url");
+        let sup_store = spawn_postgres::PostgresStore::connect_with_options(
+            &sup_url,
+            &spawn_postgres::ConnectOptions::default(),
+        )
+        .expect("supervisor store");
 
         let root =
             std::env::temp_dir().join(format!("spawn-mission-show-sup-{}", std::process::id()));

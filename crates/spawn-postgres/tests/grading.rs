@@ -2264,8 +2264,13 @@ fn spawn_reader_and_spawn_supervisor_read_mission_board_and_mission_by_id_with_g
 
     for login in ["spawn_reader", "spawn_supervisor"] {
         let role_url =
-            spawn_postgres::role_url(&common::schema_url(&schema), login).expect("role url");
-        let role_store = PostgresStore::connect(&role_url).expect("connect restricted login");
+            spawn_postgres::role_url_with_passfile(&common::schema_url(&schema), login, None)
+                .expect("role url");
+        let role_store = PostgresStore::connect_with_options(
+            &role_url,
+            &spawn_postgres::ConnectOptions::default(),
+        )
+        .expect("connect restricted login");
         let role_board = role_store.mission_board(20).expect("role mission_board");
         let role_by_id = role_store
             .mission_by_id(mission)
@@ -2565,8 +2570,13 @@ fn pv5_samples_aggregate_deduplicated_outcomes_per_tier_and_allow_restricted_rea
 
     for login in ["spawn_reader", "spawn_supervisor"] {
         let role_url =
-            spawn_postgres::role_url(&common::schema_url(&schema), login).expect("role url");
-        let role_store = PostgresStore::connect(&role_url).expect("connect restricted login");
+            spawn_postgres::role_url_with_passfile(&common::schema_url(&schema), login, None)
+                .expect("role url");
+        let role_store = PostgresStore::connect_with_options(
+            &role_url,
+            &spawn_postgres::ConnectOptions::default(),
+        )
+        .expect("connect restricted login");
         assert_eq!(
             role_store.grading_pv5_samples().expect("role pv5 samples"),
             samples,

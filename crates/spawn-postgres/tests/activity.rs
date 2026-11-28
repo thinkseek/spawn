@@ -8,7 +8,7 @@
 
 use postgres::Client;
 use serde_json::{Value, json};
-use spawn_postgres::{PostgresStore, role_url};
+use spawn_postgres::{PostgresStore, role_url_with_passfile};
 
 mod common;
 use common::{admin, schema_url, store};
@@ -203,8 +203,11 @@ fn a_delivered_tasks_activity_is_its_engines_output_since_its_latest_delivery() 
     assert_eq!(activity["2"]["tool_calls"], 1);
 
     // The dashboard's reader login reads it.
-    let login = role_url(&schema_url(&schema), "spawn_reader").expect("the reader's URL");
-    let reader = PostgresStore::connect(&login).expect("log in");
+    let login = role_url_with_passfile(&schema_url(&schema), "spawn_reader", None)
+        .expect("the reader's URL");
+    let reader =
+        PostgresStore::connect_with_options(&login, &spawn_postgres::ConnectOptions::default())
+            .expect("log in");
     assert_eq!(
         reader.task_activity().expect("the reader reads it"),
         activity

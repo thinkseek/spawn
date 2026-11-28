@@ -2584,10 +2584,14 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("d6-root");
-        let settings =
-            WorkspaceSettings::resolve(WorkspaceBackend::D6, false, &root, &Probes::host())
-                .expect("resolve d6")
-                .with_d6(D6RuntimeConfig::default());
+        let settings = WorkspaceSettings::resolve(
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6),
+            false,
+            &root,
+            &Probes::host(),
+        )
+        .expect("resolve d6")
+        .with_d6(D6RuntimeConfig::default());
         settings.claim(&root).expect("claim d6");
 
         let source = "https://example.invalid/d6/merge.git";

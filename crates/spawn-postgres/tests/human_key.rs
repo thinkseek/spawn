@@ -18,7 +18,7 @@ use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, WorkspaceId,
 };
 use spawn_core::port::{CommandQueue, EventLog};
-use spawn_postgres::{HumanKey, PostgresStore, role_url};
+use spawn_postgres::{HumanKey, PostgresStore, role_url_with_passfile};
 
 mod common;
 use common::{admin, schema_url, store};
@@ -97,8 +97,10 @@ fn end(store: &PostgresStore) {
 
 /// A store connected as this database's `spawn_human` login.
 fn human(schema: &str) -> PostgresStore {
-    let url = role_url(&schema_url(schema), "spawn_human").expect("the human login's URL");
-    PostgresStore::connect(&url).expect("the human login connects")
+    let url = role_url_with_passfile(&schema_url(schema), "spawn_human", None)
+        .expect("the human login's URL");
+    PostgresStore::connect_with_options(&url, &spawn_postgres::ConnectOptions::default())
+        .expect("the human login connects")
 }
 
 /// `spawn_commands` rows: principal, key, agent, session, action.
@@ -236,7 +238,8 @@ fn only_the_human_login_presses_and_only_named_keys() {
     let (store, schema) = store("human_key_refused");
     seen(&store, true);
     let mut page = postgres::Client::connect(
-        &role_url(&schema_url(&schema), "spawn_human").expect("the login's URL"),
+        &role_url_with_passfile(&schema_url(&schema), "spawn_human", None)
+            .expect("the login's URL"),
         postgres::NoTls,
     )
     .expect("the human login connects");
@@ -313,7 +316,8 @@ fn only_the_human_login_presses_and_only_named_keys() {
     }
     let error = call(&mut admin(&schema), "k7", Some("up")).expect_err("the owner");
     assert_eq!(error.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
-    let supervisor = role_url(&schema_url(&schema), "spawn_supervisor").expect("the login's URL");
+    let supervisor = role_url_with_passfile(&schema_url(&schema), "spawn_supervisor", None)
+        .expect("the login's URL");
     let error = call(
         &mut postgres::Client::connect(&supervisor, postgres::NoTls).expect("connects"),
         "k8",

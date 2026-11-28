@@ -489,8 +489,10 @@ fn the_index_records_checkpoints_landings_and_imports_once_and_who_and_show_read
     check_who(&schema, &git_dir, &h);
 
     // The reader login reads what the routes read.
-    let reader = PostgresStore::connect(
-        &spawn_postgres::role_url(&schema_url(&schema), "spawn_reader").expect("the reader"),
+    let reader = PostgresStore::connect_with_options(
+        &spawn_postgres::role_url_with_passfile(&schema_url(&schema), "spawn_reader", None)
+            .expect("the reader"),
+        &spawn_postgres::ConnectOptions::default(),
     )
     .expect("the reader logs in");
     let history = reader

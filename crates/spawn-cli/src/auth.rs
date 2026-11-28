@@ -29,7 +29,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Value, json};
 
 use crate::config;
-use crate::config_file::SecretRef;
+use crate::config_file::{SecretRef, SecretString};
 use crate::toml_parser;
 
 /// CLI usage contract for `spawn auth`.
@@ -1063,11 +1063,14 @@ fn resolve_secret_safely(
     match secret_ref {
         SecretRef::FromEnv { from_env } => {
             validate_env_var_name(from_env).map_err(SecretResolveError::Invalid)?;
-            let value = secret_ref.resolve_with(env_lookup).map_err(|_| {
-                SecretResolveError::Missing(format!(
-                    "environment variable `{from_env}` is unset or empty"
-                ))
-            })?;
+            let value = secret_ref
+                .resolve_secret_with(env_lookup)
+                .map(SecretString::into_inner)
+                .map_err(|_| {
+                    SecretResolveError::Missing(format!(
+                        "environment variable `{from_env}` is unset or empty"
+                    ))
+                })?;
             Ok((value, Vec::new()))
         }
         SecretRef::FromFile { from_file } => {
@@ -1107,7 +1110,8 @@ fn resolve_secret_safely(
                 }
             }
             let value = secret_ref
-                .resolve_with(env_lookup)
+                .resolve_secret_with(env_lookup)
+                .map(SecretString::into_inner)
                 .map_err(SecretResolveError::Invalid)?;
             Ok((value, warnings))
         }

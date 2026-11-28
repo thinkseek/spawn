@@ -10,7 +10,7 @@ use postgres::{Client, NoTls};
 
 mod common;
 use common::{LOGIN_BASES, admin, schema_name, store, url};
-use spawn_postgres::{PostgresStore, role_url};
+use spawn_postgres::{PostgresStore, role_url_with_passfile};
 
 /// The test URL taken apart: `scheme://user:password@host/database`.
 struct Parts {
@@ -106,7 +106,8 @@ fn can_log_in(url: &str) -> bool {
 #[test]
 fn each_database_has_its_own_logins_and_another_install_sets_none_of_ours() {
     let (_store, schema) = store("roles_ours");
-    let ours = role_url(&common::schema_url(&schema), "spawn_supervisor").expect("our login");
+    let ours = role_url_with_passfile(&common::schema_url(&schema), "spawn_supervisor", None)
+        .expect("our login");
     assert!(can_log_in(&ours));
 
     // Another install on the cluster, with another owner and password.
@@ -114,11 +115,11 @@ fn each_database_has_its_own_logins_and_another_install_sets_none_of_ours() {
     let password = format!("{}x", owner.len() * 7919);
     let other = Database::new("roles_other", Some((&owner, &password)));
     let other_url = database_url(&owner, &password, &other.name);
-    PostgresStore::connect(&other_url)
+    PostgresStore::connect_with_options(&other_url, &spawn_postgres::ConnectOptions::default())
         .expect("the other owner connects")
         .migrate()
         .expect("the other install migrates");
-    let theirs = role_url(&other_url, "spawn_supervisor").expect("their login");
+    let theirs = role_url_with_passfile(&other_url, "spawn_supervisor", None).expect("their login");
     assert!(can_log_in(&theirs));
     assert!(
         theirs.contains(&format!("://spawn_supervisor_{}:", other.name)),
@@ -155,11 +156,15 @@ fn each_database_has_its_own_logins_and_another_install_sets_none_of_ours() {
 #[test]
 fn an_owner_password_given_as_a_parameter_is_the_same_password() {
     let database = Database::new("roles_param", None);
-    PostgresStore::connect(&database.url())
-        .expect("connect")
-        .migrate()
-        .expect("migrate with the owner's password");
-    let supervisor = role_url(&database.url(), "spawn_supervisor").expect("the login's URL");
+    PostgresStore::connect_with_options(
+        &database.url(),
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("connect")
+    .migrate()
+    .expect("migrate with the owner's password");
+    let supervisor =
+        role_url_with_passfile(&database.url(), "spawn_supervisor", None).expect("the login's URL");
     assert!(can_log_in(&supervisor));
     let login = format!("spawn_supervisor_{}", database.name);
     // As an earlier install left it: a fixed password anyone can guess.
@@ -183,7 +188,7 @@ fn an_owner_password_given_as_a_parameter_is_the_same_password() {
         "{scheme}://{user}@{host}/{}?password={encoded}",
         database.name
     );
-    PostgresStore::connect(&as_parameter)
+    PostgresStore::connect_with_options(&as_parameter, &spawn_postgres::ConnectOptions::default())
         .expect("the owner connects")
         .migrate()
         .expect("migrate");
@@ -193,7 +198,7 @@ fn an_owner_password_given_as_a_parameter_is_the_same_password() {
         "the same derived password as before"
     );
     assert_eq!(
-        role_url(&as_parameter, "spawn_supervisor").expect("the login's URL"),
+        role_url_with_passfile(&as_parameter, "spawn_supervisor", None).expect("the login's URL"),
         supervisor,
         "one login URL, whichever way the owner's password is given"
     );
@@ -267,10 +272,13 @@ fn the_logins_of_earlier_installs_lose_everything_here() {
             database.name
         ))
         .expect("an earlier install's database grant");
-    PostgresStore::connect(&database.url())
-        .expect("connect")
-        .migrate()
-        .expect("migrate");
+    PostgresStore::connect_with_options(
+        &database.url(),
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("connect")
+    .migrate()
+    .expect("migrate");
     let left: i64 = admin("public")
         .query_one(
             "select count(*) from pg_database d cross join lateral aclexplode(d.datacl) a
@@ -375,10 +383,15 @@ fn many_migrations_at_once_on_one_cluster_all_succeed() {
         .map(|url| {
             let start = std::sync::Arc::clone(&start);
             std::thread::spawn(move || {
-                let store = PostgresStore::connect(&url).map_err(|error| error.to_string())?;
+                let store = PostgresStore::connect_with_options(
+                    &url,
+                    &spawn_postgres::ConnectOptions::default(),
+                )
+                .map_err(|error| error.to_string())?;
                 start.wait();
                 store.migrate().map_err(|error| error.to_string())?;
-                role_url(&url, "spawn_supervisor").map(|login| can_log_in(&login))
+                role_url_with_passfile(&url, "spawn_supervisor", None)
+                    .map(|login| can_log_in(&login))
             })
         })
         .collect();
@@ -410,11 +423,15 @@ fn many_migrations_at_once_on_one_cluster_all_succeed() {
 #[test]
 fn a_login_password_never_appears_in_statement_text() {
     let database = Database::new("roles_l8", None);
-    PostgresStore::connect(&database.url())
-        .expect("connect")
-        .migrate()
-        .expect("the first migration");
-    let real = role_url(&database.url(), "spawn_supervisor").expect("the login's URL");
+    PostgresStore::connect_with_options(
+        &database.url(),
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("connect")
+    .migrate()
+    .expect("the first migration");
+    let real =
+        role_url_with_passfile(&database.url(), "spawn_supervisor", None).expect("the login's URL");
     let login = format!("spawn_supervisor_{}", database.name);
 
     // Hold the role's catalog row in an open transaction.
@@ -426,7 +443,7 @@ fn a_login_password_never_appears_in_statement_text() {
 
     let url = database.url();
     let migration = std::thread::spawn(move || {
-        PostgresStore::connect(&url)
+        PostgresStore::connect_with_options(&url, &spawn_postgres::ConnectOptions::default())
             .expect("connect")
             .migrate()
             .map_err(|error| error.to_string())
@@ -841,10 +858,13 @@ fn nothing_else_is_granted(client: &mut Client, logins: [&str; 4]) {
 fn each_login_holds_exactly_its_grants_and_no_more() {
     let database = Database::new("roles_matrix", None);
     let name = database.name.clone();
-    PostgresStore::connect(&database.url())
-        .expect("connect")
-        .migrate()
-        .expect("migrate");
+    PostgresStore::connect_with_options(
+        &database.url(),
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("connect")
+    .migrate()
+    .expect("migrate");
     let mut client = Client::connect(&database.url(), NoTls).expect("the owner in the database");
     let human = format!("spawn_human_{name}");
     let reader = format!("spawn_reader_{name}");

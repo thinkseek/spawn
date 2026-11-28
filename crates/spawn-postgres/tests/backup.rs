@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 mod common;
 use common::{admin, schema_url, store};
-use spawn_postgres::{PostgresStore, role_url};
+use spawn_postgres::{PostgresStore, role_url_with_passfile};
 
 fn record(kind: &str) -> Value {
     json!({
@@ -104,8 +104,11 @@ fn a_drills_last_pass_is_its_newest_record_with_ok_true() {
         None,
         "another type has no pass"
     );
-    let login = role_url(&schema_url(&schema), "spawn_reader").expect("the reader's URL");
-    let reader = PostgresStore::connect(&login).expect("log in");
+    let login = role_url_with_passfile(&schema_url(&schema), "spawn_reader", None)
+        .expect("the reader's URL");
+    let reader =
+        PostgresStore::connect_with_options(&login, &spawn_postgres::ConnectOptions::default())
+            .expect("log in");
     assert_eq!(
         reader
             .newest_passed_record("backup.verified")
@@ -154,8 +157,11 @@ fn a_drills_last_pass_is_its_newest_record_with_ok_true() {
 #[test]
 fn only_the_owner_records_backups() {
     let (_store, schema) = store("backup_owner");
-    let login = role_url(&schema_url(&schema), "spawn_supervisor").expect("the login's URL");
-    let supervisor = PostgresStore::connect(&login).expect("log in");
+    let login = role_url_with_passfile(&schema_url(&schema), "spawn_supervisor", None)
+        .expect("the login's URL");
+    let supervisor =
+        PostgresStore::connect_with_options(&login, &spawn_postgres::ConnectOptions::default())
+            .expect("log in");
     let refused = supervisor
         .backup_record(&record("backup.dumped"))
         .expect_err("a restricted login records no backup");

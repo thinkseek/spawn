@@ -15,7 +15,7 @@ use spawn_core::command::CommandAction;
 use spawn_core::event::{ENGINE, EndCause, EventKind, ModelProfile, NewEvent, Source};
 use spawn_core::id::{AgentId, CommandId, ExecutionId, IdempotencyKey, SessionId, WorkspaceId};
 use spawn_core::port::EventLog;
-use spawn_postgres::{HumanMaster, MasterMessageMode, PostgresStore, role_url};
+use spawn_postgres::{HumanMaster, MasterMessageMode, PostgresStore, role_url_with_passfile};
 
 mod common;
 use common::{admin, schema_url, store};
@@ -92,8 +92,10 @@ fn end(store: &PostgresStore) {
 }
 
 fn human(schema: &str) -> PostgresStore {
-    let url = role_url(&schema_url(schema), "spawn_human").expect("the human login's URL");
-    PostgresStore::connect(&url).expect("the human login connects")
+    let url = role_url_with_passfile(&schema_url(schema), "spawn_human", None)
+        .expect("the human login's URL");
+    PostgresStore::connect_with_options(&url, &spawn_postgres::ConnectOptions::default())
+        .expect("the human login connects")
 }
 
 fn key(text: &str) -> IdempotencyKey {
@@ -269,7 +271,7 @@ fn a_bad_message_is_refused_and_only_the_human_login_may_send() {
         ("", "hi", "auto", "no key"),
     ] {
         let error = postgres::Client::connect(
-            &role_url(&schema_url(&schema), "spawn_human").expect("url"),
+            &role_url_with_passfile(&schema_url(&schema), "spawn_human", None).expect("url"),
             postgres::NoTls,
         )
         .expect("connects")
@@ -302,7 +304,8 @@ fn a_bad_message_is_refused_and_only_the_human_login_may_send() {
         )
         .expect_err("the owner");
     assert_eq!(error.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
-    let supervisor = role_url(&schema_url(&schema), "spawn_supervisor").expect("url");
+    let supervisor =
+        role_url_with_passfile(&schema_url(&schema), "spawn_supervisor", None).expect("url");
     let error = postgres::Client::connect(&supervisor, postgres::NoTls)
         .expect("connects")
         .query_one(

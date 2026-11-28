@@ -432,7 +432,11 @@ fn available_mb(meminfo: &str) -> Option<u64> {
 
 /// The test database's probe, as `spawn integrate` runs it.
 fn probed_database(url: &str) -> Result<(), spawn_postgres::ProbeFailure> {
-    spawn_postgres::parallel_query_probe(url, DATABASE_PROBE_LIMIT)
+    spawn_postgres::parallel_query_probe_with_passfile(
+        url,
+        DATABASE_PROBE_LIMIT,
+        crate::config::pg_passfile().as_deref(),
+    )
 }
 
 /// Free KiB of the filesystem holding a path ([`Room`]'s disk measure).
@@ -457,7 +461,7 @@ pub(crate) type DatabaseProbe =
 /// 3. database: when SPAWN_TEST_DATABASE_URL is set in the integrator's
 ///    environment (whatever [`withhold_owners_cluster`] later decides for
 ///    the gate), a connection within 10 s, then a forced parallel query
-///    within 10 s ([`spawn_postgres::parallel_query_probe`]). Any error
+///    within 10 s ([`spawn_postgres::parallel_query_probe_with_passfile`]). Any error
 ///    fails it. Not for a gate whose mission's owner said it needs no test
 ///    database (`no-test-database`, [`Room::without_test_database`]): that
 ///    gate never gets the URL, and a test server that is down must not hold
@@ -1123,7 +1127,7 @@ pub(crate) fn write_gate_env(
 
 /// The decisive pass over [`gate_env`]'s result: SPAWN_TEST_DATABASE_URL
 /// stays only when the owner's server and the test server both answer with
-/// their identity (`identity`, `spawn_postgres::cluster_identity` in the
+/// their identity (`identity`, `spawn_postgres::cluster_identity_with_passfile` in the
 /// integrator) and the two differ. One server spelled two ways (its socket,
 /// a hostname, 127.0.0.2, a LAN address) has one identity. Fails closed: no
 /// owner URL, or a connection or query that fails, withholds the test URL

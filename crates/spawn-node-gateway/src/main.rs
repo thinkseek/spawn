@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use spawn_node_gateway::config::ConfigError;
 use spawn_node_gateway::{Config, Gateway, Settings, primary, spawn, system_clock};
-use spawn_postgres::PostgresStore;
+use spawn_postgres::{ConnectOptions, PostgresStore};
 
 /// A ledger statement (and a connect) gives up after this.
 const STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,6 +52,7 @@ fn run() -> Result<(), ConfigError> {
         );
     }
     let url = config.database_url.clone();
+    let passfile = config.passfile.clone();
     let gateway = Arc::new(Gateway::new(Settings {
         primary: key,
         cells: config.cells.clone(),
@@ -60,8 +61,14 @@ fn run() -> Result<(), ConfigError> {
         results: config.results.clone(),
         clock: system_clock(),
         connector: Arc::new(move || {
-            PostgresStore::connect_with_statement_timeout(&url, STATEMENT_TIMEOUT)
-                .map_err(|error| error.to_string())
+            PostgresStore::connect_with_options(
+                &url,
+                &ConnectOptions {
+                    passfile: passfile.clone(),
+                    statement_timeout: Some(STATEMENT_TIMEOUT),
+                },
+            )
+            .map_err(|error| error.to_string())
         }),
     }));
     let listener = TcpListener::bind(config.listen)

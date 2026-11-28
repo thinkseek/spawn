@@ -3083,7 +3083,7 @@ fn the_restricted_logins_have_derived_passwords_and_write_no_events() {
             postgres::Client::connect(&fixed, postgres::NoTls).is_err(),
             "{role} has no fixed password"
         );
-        let url = spawn_postgres::role_url(&common::schema_url(&schema), base)
+        let url = spawn_postgres::role_url_with_passfile(&common::schema_url(&schema), base, None)
             .expect("a password in the test URL");
         assert!(
             url.contains(&format!("://{role}:")),
@@ -3159,16 +3159,21 @@ fn respelling_moves_any_host_to_the_parameters() {
 fn a_cluster_is_known_by_its_identity_not_its_spelling() {
     let _budget = ApiBudgetGuard::shared();
     let url = common::url();
-    let identity = spawn_postgres::cluster_identity(&url).expect("identity");
+    let identity = spawn_postgres::cluster_identity_with_passfile(&url, None).expect("identity");
     assert!(!identity.is_empty());
     let other = respelled(&url);
     assert_ne!(other, url);
     assert_eq!(
-        spawn_postgres::cluster_identity(&other).expect("identity through another spelling"),
+        spawn_postgres::cluster_identity_with_passfile(&other, None)
+            .expect("identity through another spelling"),
         identity
     );
     assert!(
-        spawn_postgres::cluster_identity("postgres://nobody:x@%2Fnonexistent%2Fdir/db").is_err(),
+        spawn_postgres::cluster_identity_with_passfile(
+            "postgres://nobody:x@%2Fnonexistent%2Fdir/db",
+            None
+        )
+        .is_err(),
         "an unreachable server has no identity"
     );
 }
@@ -3285,9 +3290,12 @@ fn a_sweep_drops_only_the_logins_of_gone_databases_under_its_prefix() {
         databases.names.push(name.clone());
     }
     for name in [&kept, &long] {
-        spawn_postgres::PostgresStore::connect(&format!("{server}/{name}"))
-            .and_then(|store| store.migrate())
-            .expect("migrate");
+        spawn_postgres::PostgresStore::connect_with_options(
+            &format!("{server}/{name}"),
+            &spawn_postgres::ConnectOptions::default(),
+        )
+        .and_then(|store| store.migrate())
+        .expect("migrate");
     }
     for name in [&gone, &outside] {
         for base in ["spawn_supervisor", "spawn_reader", "spawn_human"] {
@@ -3622,9 +3630,12 @@ fn migrations_racing_on_one_server_all_succeed() {
         .map(|name| {
             let url = format!("{server}/{name}");
             std::thread::spawn(move || {
-                spawn_postgres::PostgresStore::connect(&url)
-                    .and_then(|store| store.migrate())
-                    .map_err(|error| error.to_string())
+                spawn_postgres::PostgresStore::connect_with_options(
+                    &url,
+                    &spawn_postgres::ConnectOptions::default(),
+                )
+                .and_then(|store| store.migrate())
+                .map_err(|error| error.to_string())
             })
         })
         .collect();
@@ -4218,9 +4229,14 @@ fn the_reader_reads_the_whole_log_from_a_time_without_screen_text() {
     admin(&schema)
         .batch_execute("update spawn_events set recorded_at_ms = 1000000 + id * 10000")
         .expect("spread the record times");
-    let url = spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader")
-        .expect("the reader's URL");
-    let reader = spawn_postgres::PostgresStore::connect(&url).expect("the reader connects");
+    let url =
+        spawn_postgres::role_url_with_passfile(&common::schema_url(&schema), "spawn_reader", None)
+            .expect("the reader's URL");
+    let reader = spawn_postgres::PostgresStore::connect_with_options(
+        &url,
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("the reader connects");
 
     let entries = reader
         .log_after(GlobalPosition(0), 10)
@@ -4437,6 +4453,18 @@ fn spawn_stress_writer(
 
 static STRESS_WORKLOAD_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn open_stress_clients(
+    schema_conn: &str,
+    writer_pool_size: usize,
+) -> (Vec<PostgresStore>, PostgresStore) {
+    let opts = spawn_postgres::ConnectOptions::default();
+    let writers = (0..writer_pool_size)
+        .map(|_| PostgresStore::connect_with_options(schema_conn, &opts).expect("writer connect"))
+        .collect();
+    let reader = PostgresStore::connect_with_options(schema_conn, &opts).expect("reader connect");
+    (writers, reader)
+}
+
 fn run_concurrent_session_workload(
     case: &str,
     sessions: usize,
@@ -4463,10 +4491,7 @@ fn run_concurrent_session_workload(
     let work = Arc::new(Mutex::new(queue));
 
     // Pre-open bounded writer pool + 1 continuous reader (= writer_pool_size + 1 <= max_connections).
-    let writers: Vec<_> = (0..writer_pool_size)
-        .map(|_| PostgresStore::connect(&schema_conn).expect("writer connect"))
-        .collect();
-    let reader = PostgresStore::connect(&schema_conn).expect("reader connect");
+    let (writers, reader) = open_stress_clients(&schema_conn, writer_pool_size);
 
     let writers_done = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(writer_pool_size + 2));
@@ -4615,8 +4640,13 @@ fn different_sessions_and_missions_append_concurrently_without_blocking() {
 fn xid8_watermark_recovers_out_of_order_lower_id_commit_without_gaps_or_duplicates() {
     let (store, schema) = store("xid8_ooo_lower_id");
     let reader_url =
-        spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader").expect("reader url");
-    let reader = PostgresStore::connect(&reader_url).expect("reader connect");
+        spawn_postgres::role_url_with_passfile(&common::schema_url(&schema), "spawn_reader", None)
+            .expect("reader url");
+    let reader = PostgresStore::connect_with_options(
+        &reader_url,
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("reader connect");
 
     let anchor = store
         .append(NewEvent {
@@ -4723,8 +4753,13 @@ fn xid8_watermark_recovers_out_of_order_lower_id_commit_without_gaps_or_duplicat
 fn xid8_watermark_holds_back_higher_xid_while_lower_xid_is_uncommitted() {
     let (store, schema) = store("xid8_xmin_barrier");
     let reader_url =
-        spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader").expect("reader url");
-    let reader = PostgresStore::connect(&reader_url).expect("reader connect");
+        spawn_postgres::role_url_with_passfile(&common::schema_url(&schema), "spawn_reader", None)
+            .expect("reader url");
+    let reader = PostgresStore::connect_with_options(
+        &reader_url,
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("reader connect");
 
     let anchor = store
         .append(NewEvent {
@@ -4872,8 +4907,13 @@ fn setup_anchor_and_reader(
 ) -> (PostgresStore, PostgresStore, ApiSchema, GlobalPosition) {
     let (store, schema) = store(case);
     let reader_url =
-        spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader").expect("reader url");
-    let reader = PostgresStore::connect(&reader_url).expect("reader connect");
+        spawn_postgres::role_url_with_passfile(&common::schema_url(&schema), "spawn_reader", None)
+            .expect("reader url");
+    let reader = PostgresStore::connect_with_options(
+        &reader_url,
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("reader connect");
     let anchor = store
         .append(NewEvent {
             agent_id: AgentId::new("agent_anchor").expect("agent"),
@@ -4926,8 +4966,13 @@ fn xid8_watermark_holds_back_commit_during_for_update_row_lock_on_spawn_events()
 fn xid8_watermark_holds_back_commit_during_spawn_commands_for_update_and_spawn_finish() {
     let (store, schema) = store("xid8_for_update_commands");
     let reader_url =
-        spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader").expect("reader url");
-    let reader = PostgresStore::connect(&reader_url).expect("reader connect");
+        spawn_postgres::role_url_with_passfile(&common::schema_url(&schema), "spawn_reader", None)
+            .expect("reader url");
+    let reader = PostgresStore::connect_with_options(
+        &reader_url,
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("reader connect");
 
     let mut setup = admin(&schema);
     let cmd_a: i64 = setup

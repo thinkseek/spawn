@@ -1,5 +1,5 @@
 //! The test database's probe before a gate (objective 018,
-//! `spawn_postgres::parallel_query_probe`): a connection, then a forced
+//! `spawn_postgres::parallel_query_probe_with_passfile`): a connection, then a forced
 //! parallel query, each bounded in time.
 //!
 //! A real database is required (`SPAWN_TEST_DATABASE_URL`).
@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::url;
-use spawn_postgres::parallel_query_probe;
+use spawn_postgres::parallel_query_probe_with_passfile;
 
 #[test]
 fn the_test_database_runs_the_parallel_probe() {
-    parallel_query_probe(&url(), Duration::from_secs(10))
+    parallel_query_probe_with_passfile(&url(), Duration::from_secs(10), None)
         .expect("the test database connects and runs a parallel query");
 }
 
@@ -29,7 +29,8 @@ fn a_socket_directory_with_no_server_fails_the_connect_probe_without_the_passwor
     let directory = empty.to_string_lossy().replace('/', "%2F");
     let url = format!("postgres://probe:pr0besecret@{directory}/nothing");
     let started = Instant::now();
-    let failure = parallel_query_probe(&url, Duration::from_secs(10)).expect_err("no server");
+    let failure = parallel_query_probe_with_passfile(&url, Duration::from_secs(10), None)
+        .expect_err("no server");
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "refused at once"
@@ -45,7 +46,11 @@ fn a_socket_directory_with_no_server_fails_the_connect_probe_without_the_passwor
 
 #[test]
 fn an_unreadable_url_fails_the_probe_that_reads_it() {
-    let failure = parallel_query_probe("postgres://u:p@host:notaport/db", Duration::from_secs(1))
-        .expect_err("not a URL");
+    let failure = parallel_query_probe_with_passfile(
+        "postgres://u:p@host:notaport/db",
+        Duration::from_secs(1),
+        None,
+    )
+    .expect_err("not a URL");
     assert!(failure.probe.contains("postgres URL"), "{failure:?}");
 }

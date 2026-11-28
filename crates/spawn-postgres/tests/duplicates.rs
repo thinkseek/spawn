@@ -14,7 +14,7 @@
 
 use postgres::Client;
 use serde_json::{Value, json};
-use spawn_postgres::{PostgresStore, role_url};
+use spawn_postgres::{PostgresStore, role_url_with_passfile};
 
 mod common;
 use common::{admin, schema_url, store};
@@ -46,8 +46,10 @@ fn mission(client: &mut Client, id: i64, gated: bool) {
 
 /// The supervisor's store: its own login in the case's schema.
 fn supervisor(schema: &str) -> PostgresStore {
-    PostgresStore::connect(
-        &role_url(&schema_url(schema), "spawn_supervisor").expect("the login's URL"),
+    PostgresStore::connect_with_options(
+        &role_url_with_passfile(&schema_url(schema), "spawn_supervisor", None)
+            .expect("the login's URL"),
+        &spawn_postgres::ConnectOptions::default(),
     )
     .expect("the supervisor logs in")
 }

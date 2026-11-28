@@ -12,6 +12,7 @@
 //! | `SPAWN_NODE_GATEWAY_PUBLIC_PREFIX` | empty | a path prefix a reverse proxy keeps |
 //! | `SPAWN_NODE_GATEWAY_WORKERS` | `6` | bounded worker threads & PostgreSQL connections |
 
+use std::ffi::OsStr;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -75,6 +76,8 @@ pub struct Config {
     pub public_prefix: String,
     /// Number of synchronous worker threads (each holds at most one DB connection).
     pub workers: usize,
+    /// Optional libpq passfile path resolved from `PGPASSFILE` or `$HOME/.pgpass`.
+    pub passfile: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Config {
@@ -88,6 +91,7 @@ impl std::fmt::Debug for Config {
             .field("cells", &self.cells)
             .field("public_prefix", &self.public_prefix)
             .field("workers", &self.workers)
+            .field("passfile", &self.passfile)
             .finish()
     }
 }
@@ -178,6 +182,12 @@ impl Config {
                 .filter(|value| *value >= 1)
                 .ok_or_else(|| format!("{ENV_WORKERS}={raw:?} must be an integer >= 1"))?,
         };
+        let pgpassfile = env("PGPASSFILE");
+        let home = env("HOME");
+        let passfile = spawn_postgres::resolve_passfile_path(
+            pgpassfile.as_deref().map(OsStr::new),
+            home.as_deref().map(OsStr::new),
+        );
         Ok(Self {
             database_url,
             key_file: required(ENV_KEY_FILE)?.into(),
@@ -187,6 +197,7 @@ impl Config {
             cells,
             public_prefix: normalize_prefix(&public_prefix)?,
             workers,
+            passfile,
         })
     }
 }
@@ -296,6 +307,7 @@ mod tests {
         );
 
         let mut pairs = BASE.to_vec();
+        pairs.push(("PGPASSFILE", "/run/secrets/pgpass"));
         pairs.push((ENV_CELLS, "c0, c1"));
         pairs.push((ENV_PUBLIC_PREFIX, "/env"));
         pairs.push((ENV_LISTEN, "0.0.0.0:9"));
@@ -306,6 +318,18 @@ mod tests {
         assert_eq!(config.public_prefix, "/gw");
         assert_eq!(config.listen.port(), 9);
         assert_eq!(config.workers, 12);
+        assert_eq!(
+            config.passfile.as_deref(),
+            Some(Path::new("/run/secrets/pgpass"))
+        );
+
+        let mut home_pairs = BASE.to_vec();
+        home_pairs.push(("HOME", "/home/gw"));
+        let home_cfg = Config::from_env(env(&home_pairs), &[]).unwrap();
+        assert_eq!(
+            home_cfg.passfile.as_deref(),
+            Some(Path::new("/home/gw/.pgpass"))
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use spawn_core::event::{ArtifactRef, CheckpointReason, EventKind, NewEvent, Source};
 use spawn_core::id::{AgentId, BranchName, CommitId, IdempotencyKey, SessionId};
 use spawn_core::port::EventLog;
-use spawn_postgres::{HumanTask, PostgresStore, role_url};
+use spawn_postgres::{HumanTask, PostgresStore, role_url_with_passfile};
 
 mod common;
 use common::{admin, schema_url, store};
@@ -255,8 +255,10 @@ fn the_page_restarts_and_reassigns_through_its_own_function_alone() {
     let (_, task) = delivered(&store, "paged");
     let session = SessionId::new(format!("session_worker_paged_{task}")).expect("session");
     let key = |value: &str| IdempotencyKey::new(value.to_string()).expect("valid key");
-    let page = PostgresStore::connect(
-        &role_url(&schema_url(&schema), "spawn_human").expect("the human login's URL"),
+    let page = PostgresStore::connect_with_options(
+        &role_url_with_passfile(&schema_url(&schema), "spawn_human", None)
+            .expect("the human login's URL"),
+        &spawn_postgres::ConnectOptions::default(),
     )
     .expect("the human login connects");
     let HumanTask::Moved(answer) = page
@@ -296,7 +298,8 @@ fn the_page_restarts_and_reassigns_through_its_own_function_alone() {
     // The page's login calls no other mission function; the owner does not
     // call the page's.
     let mut raw = Client::connect(
-        &role_url(&schema_url(&schema), "spawn_human").expect("the login's URL"),
+        &role_url_with_passfile(&schema_url(&schema), "spawn_human", None)
+            .expect("the login's URL"),
         postgres::NoTls,
     )
     .expect("connects");
@@ -349,8 +352,10 @@ fn human_restart_and_reassign_enforce_idempotency_replay_and_conflict() {
     let other_session =
         SessionId::new(format!("session_worker_other_paged_{other_task}")).expect("other session");
     let key = |value: &str| IdempotencyKey::new(value.to_string()).expect("valid key");
-    let page = PostgresStore::connect(
-        &role_url(&schema_url(&schema), "spawn_human").expect("the human login's URL"),
+    let page = PostgresStore::connect_with_options(
+        &role_url_with_passfile(&schema_url(&schema), "spawn_human", None)
+            .expect("the human login's URL"),
+        &spawn_postgres::ConnectOptions::default(),
     )
     .expect("the human login connects");
 
@@ -441,8 +446,10 @@ fn the_supervisor_restarts_and_reassigns_under_its_own_name() {
     let (store, schema) = store("restart_supervisor");
     let mut client = admin(&schema);
     let (_, task) = delivered(&store, "supervised");
-    let supervisor = PostgresStore::connect(
-        &role_url(&schema_url(&schema), "spawn_supervisor").expect("the login's URL"),
+    let supervisor = PostgresStore::connect_with_options(
+        &role_url_with_passfile(&schema_url(&schema), "spawn_supervisor", None)
+            .expect("the login's URL"),
+        &spawn_postgres::ConnectOptions::default(),
     )
     .expect("the supervisor's login connects");
     supervisor

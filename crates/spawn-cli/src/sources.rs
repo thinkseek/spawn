@@ -570,7 +570,7 @@ pub(crate) fn workspace_settings_readonly(
         )
         .is_d6()
     {
-        crate::config::WorkspaceBackend::D6
+        crate::config::WorkspaceBackend::Named(HostWorkspaceBackend::D6)
     } else {
         crate::config::workspace_backend(raw_backend.as_deref())?
     };
@@ -3269,9 +3269,9 @@ mod tests {
         let main = git(&["--git-dir", &repo.to_string_lossy(), "rev-parse", "main"]).expect("main");
         let mut ran = Vec::new();
         for configured in [
-            WorkspaceBackend::Git,
-            WorkspaceBackend::Cow,
-            WorkspaceBackend::Overlay,
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Git),
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Cow),
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay),
         ] {
             let root = base.join(format!("{configured:?}").to_lowercase());
             let settings =
@@ -3448,7 +3448,10 @@ mod tests {
         let base = std::env::temp_dir().join(format!("spawn-sources-gone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo = backend_repo(&base);
-        for configured in [WorkspaceBackend::Cow, WorkspaceBackend::Overlay] {
+        for configured in [
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Cow),
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::Overlay),
+        ] {
             let root = base.join(format!("{configured:?}").to_lowercase());
             let Ok(settings) =
                 WorkspaceSettings::resolve(configured, false, &root, &Probes::host())
@@ -3661,10 +3664,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let repo = backend_repo(&base);
         let root = base.join("shadow-root");
-        let settings =
-            WorkspaceSettings::resolve(WorkspaceBackend::D6Shadow, false, &root, &Probes::host())
-                .expect("resolve")
-                .with_d6(D6RuntimeConfig::default());
+        let settings = WorkspaceSettings::resolve(
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6Shadow),
+            false,
+            &root,
+            &Probes::host(),
+        )
+        .expect("resolve")
+        .with_d6(D6RuntimeConfig::default());
         settings.claim(&root).expect("claim d6-shadow");
 
         let factory = settings.factory(&root);
@@ -3730,15 +3737,19 @@ mod tests {
         std::fs::create_dir_all(&base).expect("base");
 
         let root = base.join("d6-root");
-        let settings =
-            WorkspaceSettings::resolve(WorkspaceBackend::D6, false, &root, &Probes::host())
-                .expect("resolve")
-                .with_d6(D6RuntimeConfig {
-                    cas_dir: None,
-                    tmpfs_root: Some(tmpfs_dir.clone()),
-                    tmpfs_budget_mb: Some(128),
-                    strict_fail_closed: false,
-                });
+        let settings = WorkspaceSettings::resolve(
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6),
+            false,
+            &root,
+            &Probes::host(),
+        )
+        .expect("resolve")
+        .with_d6(D6RuntimeConfig {
+            cas_dir: None,
+            tmpfs_root: Some(tmpfs_dir.clone()),
+            tmpfs_budget_mb: Some(128),
+            strict_fail_closed: false,
+        });
         settings.claim(&root).expect("claim d6");
         assert!(
             spawn_host::claim_root(&root, spawn_host::WorkspaceBackend::Git).is_err(),
@@ -3842,10 +3853,14 @@ mod tests {
         std::fs::create_dir_all(&base).expect("base");
 
         let root = base.join("d6-root");
-        let settings =
-            WorkspaceSettings::resolve(WorkspaceBackend::D6, false, &root, &Probes::host())
-                .expect("resolve")
-                .with_d6(D6RuntimeConfig::default());
+        let settings = WorkspaceSettings::resolve(
+            WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6),
+            false,
+            &root,
+            &Probes::host(),
+        )
+        .expect("resolve")
+        .with_d6(D6RuntimeConfig::default());
         settings.claim(&root).expect("claim d6");
 
         let source = "https://example.invalid/d6/pin.git";
@@ -4467,7 +4482,10 @@ mod tests {
             ProjectStorage::D6
         );
         if let Ok(settings) = workspace_settings_readonly(&d6_root) {
-            assert_eq!(settings.configured, WorkspaceBackend::D6);
+            assert_eq!(
+                settings.configured,
+                WorkspaceBackend::Named(spawn_host::WorkspaceBackend::D6)
+            );
         }
 
         let _ = std::fs::remove_dir_all(&scratch);

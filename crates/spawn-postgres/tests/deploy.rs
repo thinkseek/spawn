@@ -7,7 +7,7 @@
 
 use postgres::Client;
 use serde_json::{Value, json};
-use spawn_postgres::{PostgresStore, role_url};
+use spawn_postgres::{PostgresStore, role_url_with_passfile};
 
 mod common;
 use common::{admin, schema_url, store};
@@ -233,8 +233,11 @@ fn a_deploy_record_has_its_fields_and_nothing_else() {
 #[test]
 fn only_the_owner_records_deploys() {
     let (_store, schema) = store("deploy_owner");
-    let login = role_url(&schema_url(&schema), "spawn_supervisor").expect("the login's URL");
-    let supervisor = PostgresStore::connect(&login).expect("log in");
+    let login = role_url_with_passfile(&schema_url(&schema), "spawn_supervisor", None)
+        .expect("the login's URL");
+    let supervisor =
+        PostgresStore::connect_with_options(&login, &spawn_postgres::ConnectOptions::default())
+            .expect("log in");
     let refused = supervisor
         .deploy_record(
             &json!({"type": "deploy.finished", "ok": true, "head": commit('a'),

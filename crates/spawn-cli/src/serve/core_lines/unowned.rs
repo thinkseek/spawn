@@ -152,9 +152,10 @@ pub(super) fn plan(settings: &Settings) -> (Plan, Vec<(String, String)>) {
         .into_iter()
         .map(|(role, url)| (role.to_string(), url.0))
         .collect();
+    let defaults = crate::config::libpq_defaults();
     let mut refused = Vec::new();
     for file in &settings.url_files {
-        match schemas::url_from_file(&file.path, live.as_deref(), uid) {
+        match schemas::url_from_file_with(&file.path, live.as_deref(), uid, &defaults) {
             Ok(url) => servers.push((file.name.clone(), url)),
             Err(why) => refused.push((file.name.clone(), why)),
         }
@@ -255,8 +256,9 @@ pub(super) fn read(plan: &Plan, previous: Option<&Reading>, now_ms: i64, bound: 
     };
     let mut changed = false;
     let mut servers = Vec::new();
+    let passfile = crate::config::pg_passfile();
     for (name, url) in &plan.servers {
-        let listed = match spawn_postgres::test_schemas(url) {
+        let listed = match spawn_postgres::test_schemas_with_passfile(url, passfile.as_deref()) {
             Ok(listed) => listed,
             Err(error) => {
                 eprintln!("core-lines: the test server {name} is left out: {error}");

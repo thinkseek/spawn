@@ -4415,6 +4415,7 @@ times in a row)",
         lines: &mut Vec<String>,
     ) {
         let live = store.database_size().map_err(|error| error.to_string());
+        let passfile = crate::config::pg_passfile();
         let tests: Vec<(&'static str, Result<Value, String>)> = self
             .settings
             .test_databases
@@ -4422,7 +4423,8 @@ times in a row)",
             .map(|(role, url)| {
                 (
                     *role,
-                    spawn_postgres::test_database_size(&url.0).map_err(|error| error.to_string()),
+                    spawn_postgres::test_database_size_with_passfile(&url.0, passfile.as_deref())
+                        .map_err(|error| error.to_string()),
                 )
             })
             .collect();
