@@ -12,7 +12,7 @@ use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::command::NamedKey;
-use crate::port::AgentStatus;
+use crate::port::{AgentReading, AgentStatus};
 use crate::screen::strip_ansi;
 
 /// Label key written by Spawn's managed `HerdrCoreHost` on owned terminals
@@ -348,6 +348,153 @@ impl KeyChord {
         self.code.push_herdr_name(&mut out);
         out
     }
+
+    /// Parses a legacy tmux-style key name (`"Enter"`, `"BTab"`, `"C-c"`, `"M-x"`,
+    /// `"BSpace"`) or native Herdr key chord spec (`"ctrl+c"`, `"shift+tab"`),
+    /// rejecting empty/whitespace strings, duplicate modifiers, or unknown keys.
+    pub fn from_legacy_key_name(raw: &str) -> Result<Self, String> {
+        if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "invalid key chord {raw:?}: empty or contains whitespace"
+            ));
+        }
+        let mut rest = raw;
+        let mut modifiers = KeyModifiers::none();
+        while rest.len() > 2 {
+            let Some((prefix, tail)) = rest.split_at_checked(2) else {
+                break;
+            };
+            if prefix.eq_ignore_ascii_case("C-") {
+                if modifiers.ctrl {
+                    return Err(format!("duplicate ctrl modifier in {raw:?}"));
+                }
+                modifiers.ctrl = true;
+                rest = tail;
+            } else if prefix.eq_ignore_ascii_case("M-") {
+                if modifiers.alt {
+                    return Err(format!("duplicate alt modifier in {raw:?}"));
+                }
+                modifiers.alt = true;
+                rest = tail;
+            } else if prefix.eq_ignore_ascii_case("S-") {
+                if modifiers.shift {
+                    return Err(format!("duplicate shift modifier in {raw:?}"));
+                }
+                modifiers.shift = true;
+                rest = tail;
+            } else {
+                break;
+            }
+        }
+        let alias = match rest.to_ascii_lowercase().as_str() {
+            "btab" => {
+                if modifiers.shift {
+                    return Err(format!("duplicate shift modifier in {raw:?}"));
+                }
+                modifiers.shift = true;
+                Some(KeyCode::Tab)
+            }
+            "bspace" => Some(KeyCode::Backspace),
+            "dc" => Some(KeyCode::Delete),
+            "ic" => Some(KeyCode::Insert),
+            "ppage" => Some(KeyCode::PageUp),
+            "npage" => Some(KeyCode::PageDown),
+            _ => None,
+        };
+        if let Some(code) = alias {
+            return Ok(Self { modifiers, code });
+        }
+        let parsed = Self::parse(rest)?;
+        if (modifiers.ctrl && parsed.modifiers.ctrl)
+            || (modifiers.alt && parsed.modifiers.alt)
+            || (modifiers.shift && parsed.modifiers.shift)
+        {
+            return Err(format!("duplicate modifier in {raw:?}"));
+        }
+        Ok(Self {
+            modifiers: KeyModifiers {
+                ctrl: modifiers.ctrl || parsed.modifiers.ctrl,
+                alt: modifiers.alt || parsed.modifiers.alt,
+                shift: modifiers.shift || parsed.modifiers.shift,
+            },
+            code: parsed.code,
+        })
+    }
+
+    /// Maps an unmodified chord to its closed [`NamedKey`] audit-command variant,
+    /// returning `None` when any modifier is active or the key lies outside [`NamedKey`].
+    pub const fn to_named_key(&self) -> Option<NamedKey> {
+        if self.modifiers.ctrl || self.modifiers.alt || self.modifiers.shift {
+            return None;
+        }
+        match self.code {
+            KeyCode::Escape => Some(NamedKey::Escape),
+            KeyCode::Up => Some(NamedKey::Up),
+            KeyCode::Down => Some(NamedKey::Down),
+            KeyCode::Left => Some(NamedKey::Left),
+            KeyCode::Right => Some(NamedKey::Right),
+            KeyCode::Enter => Some(NamedKey::Enter),
+            KeyCode::Char(ch) => match ch.as_char() {
+                'y' => Some(NamedKey::Y),
+                'n' => Some(NamedKey::N),
+                '1' => Some(NamedKey::Digit1),
+                '2' => Some(NamedKey::Digit2),
+                '3' => Some(NamedKey::Digit3),
+                '4' => Some(NamedKey::Digit4),
+                '5' => Some(NamedKey::Digit5),
+                '6' => Some(NamedKey::Digit6),
+                '7' => Some(NamedKey::Digit7),
+                '8' => Some(NamedKey::Digit8),
+                '9' => Some(NamedKey::Digit9),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Converts this chord into a legacy tmux key name for fallback adapters.
+    pub fn to_legacy_tmux_name(&self) -> String {
+        if self.modifiers.shift
+            && !self.modifiers.ctrl
+            && !self.modifiers.alt
+            && self.code == KeyCode::Tab
+        {
+            return "BTab".to_string();
+        }
+        let mut out = String::new();
+        if self.modifiers.ctrl {
+            out.push_str("C-");
+        }
+        if self.modifiers.alt {
+            out.push_str("M-");
+        }
+        if self.modifiers.shift {
+            out.push_str("S-");
+        }
+        match self.code {
+            KeyCode::Escape => out.push_str("Escape"),
+            KeyCode::Enter => out.push_str("Enter"),
+            KeyCode::Tab => out.push_str("Tab"),
+            KeyCode::Backspace => out.push_str("BSpace"),
+            KeyCode::Space => out.push_str("Space"),
+            KeyCode::Delete => out.push_str("DC"),
+            KeyCode::Insert => out.push_str("IC"),
+            KeyCode::Home => out.push_str("Home"),
+            KeyCode::End => out.push_str("End"),
+            KeyCode::PageUp => out.push_str("PPage"),
+            KeyCode::PageDown => out.push_str("NPage"),
+            KeyCode::Up => out.push_str("Up"),
+            KeyCode::Down => out.push_str("Down"),
+            KeyCode::Left => out.push_str("Left"),
+            KeyCode::Right => out.push_str("Right"),
+            KeyCode::Function(fkey) => {
+                out.push('F');
+                out.push_str(&fkey.as_str()[1..]);
+            }
+            KeyCode::Char(ch) => out.push(ch.as_char()),
+        }
+        out
+    }
 }
 
 impl From<NamedKey> for KeyChord {
@@ -410,6 +557,16 @@ impl KeyChordSequence {
     /// Constructs a one-key sequence.
     pub fn single(key: KeyChord) -> Self {
         Self(vec![key])
+    }
+
+    /// Parses a non-empty legacy key slice (`&["y", "Enter"]`, `&["BTab"]`) into a
+    /// validated [`KeyChordSequence`], failing closed on empty or invalid input.
+    pub fn from_legacy_keys(keys: &[&str]) -> Result<Self, String> {
+        let parsed = keys
+            .iter()
+            .map(|raw| KeyChord::from_legacy_key_name(raw))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(parsed)
     }
 
     /// Ordered slice of validated key chords.
@@ -1062,6 +1219,29 @@ impl TuiSnapshot {
     /// Visible screen lines with ANSI control sequences stripped.
     pub fn plain_lines(&self) -> &[String] {
         &self.plain_lines
+    }
+
+    /// Visible screen lines joined with `'\n'`.
+    pub fn plain_text(&self) -> String {
+        self.plain_lines.join("\n")
+    }
+
+    /// First selected choice reported by this snapshot, if any.
+    pub fn selected_choice(&self) -> Option<&TuiChoice> {
+        self.choices.iter().find(|choice| choice.selected)
+    }
+
+    /// Projects this snapshot's witness observation into an [`AgentReading`].
+    pub fn to_agent_reading(&self) -> AgentReading {
+        AgentReading {
+            agent: self.agent.clone(),
+            status: self.agent_status,
+            rule: self.rule.clone(),
+            blocker_visible: self.blocker_visible,
+            session: None,
+            seq: 0,
+            manifest: None,
+        }
     }
 
     /// Detected agent runtime if any.
@@ -2373,5 +2553,91 @@ mod tests {
                 "plain must reject unknown field: {copy}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_key_conversion_and_snapshot_helpers_roundtrip() {
+        for named in NamedKey::ALL {
+            let chord = KeyChord::from_legacy_key_name(named.tmux()).expect("named tmux key");
+            assert_eq!(chord, KeyChord::from(named));
+            assert_eq!(chord.to_named_key(), Some(named));
+            assert_eq!(chord.to_legacy_tmux_name(), named.tmux());
+        }
+
+        let cases = [
+            ("BTab", "shift+tab", "BTab"),
+            ("C-c", "ctrl+c", "C-c"),
+            ("M-x", "alt+x", "M-x"),
+            ("C-BTab", "ctrl+shift+tab", "C-S-Tab"),
+            ("C-S-Tab", "ctrl+shift+tab", "C-S-Tab"),
+            ("BSpace", "backspace", "BSpace"),
+            ("DC", "delete", "DC"),
+            ("IC", "insert", "IC"),
+            ("PPage", "pageup", "PPage"),
+            ("NPage", "pagedown", "NPage"),
+            ("C--", "ctrl+-", "C--"),
+            ("-", "-", "-"),
+            ("F5", "f5", "F5"),
+            ("shift+tab", "shift+tab", "BTab"),
+            ("ctrl+shift+tab", "ctrl+shift+tab", "C-S-Tab"),
+        ];
+        for (raw, expected_herdr, expected_tmux) in cases {
+            let chord = KeyChord::from_legacy_key_name(raw).expect(raw);
+            assert_eq!(chord.to_herdr_spec(), expected_herdr, "{raw}");
+            assert_eq!(chord.to_legacy_tmux_name(), expected_tmux, "{raw}");
+        }
+
+        assert!(
+            KeyChord::from_legacy_key_name("C-y")
+                .expect("ctrl+y")
+                .to_named_key()
+                .is_none()
+        );
+        for invalid in [
+            "",
+            " C-c",
+            "C-C-c",
+            "S-BTab",
+            "C-ctrl+c",
+            "C-",
+            "shift+btab",
+            "BogusKey",
+        ] {
+            assert!(
+                KeyChord::from_legacy_key_name(invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+
+        assert!(KeyChordSequence::from_legacy_keys(&[]).is_err());
+        let seq = KeyChordSequence::from_legacy_keys(&["y", "Enter"]).expect("seq");
+        assert_eq!(seq.as_slice().len(), 2);
+
+        let snap = TuiSnapshot::from_styled_vt(
+            RawStyledSnapshot {
+                address: "t1",
+                cols: 120,
+                rows: 40,
+                live_state: TerminalLiveState::Live { pid: Some(7) },
+                title: None,
+                raw_vt: "\x1b[H\x1b[2J  1. Allow\r\n  \x1b[0;7m2. Deny\x1b[0m\r\n\x1b[?9001l",
+            },
+            SnapshotObservation {
+                agent: Some("agy".to_string()),
+                agent_status: AgentStatus::Blocked,
+                rule: Some("permission_prompt".to_string()),
+                blocker_visible: true,
+            },
+        );
+        assert_eq!(snap.plain_text(), "  1. Allow\n  2. Deny");
+        assert_eq!(
+            snap.selected_choice().map(|c| c.label.as_str()),
+            Some("Deny")
+        );
+        let reading = snap.to_agent_reading();
+        assert_eq!(reading.agent.as_deref(), Some("agy"));
+        assert_eq!(reading.status, AgentStatus::Blocked);
+        assert_eq!(reading.rule.as_deref(), Some("permission_prompt"));
+        assert!(reading.blocker_visible);
     }
 }

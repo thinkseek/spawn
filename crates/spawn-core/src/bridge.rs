@@ -125,6 +125,7 @@ pub use crate::port::{BridgeShard, ShardCoverage, ShardCoveragePolicy, ShardPart
 use crate::screen::{ScreenState, TAIL_LINES};
 use crate::time::{Clock, SystemClock};
 use crate::transcripts::{self, ArchiveProgress};
+use crate::tui::{KeyChord, KeyChordSequence, ScreenGuard, TuiSnapshot};
 
 /// Final checkpoints an ending execution tries on consecutive ticks before
 /// its end counts as stalled: the terminal is killed, the workspace stays
@@ -1506,6 +1507,7 @@ struct PromptProgress {
     answered_trust: bool,
     prompt_seen: bool,
     dialog: Option<String>,
+    dialog_guard: Option<ScreenGuard>,
     last_state: ScreenState,
     last_pane: Option<String>,
     transient: Option<String>,
@@ -1518,11 +1520,31 @@ impl Default for PromptProgress {
             answered_trust: false,
             prompt_seen: false,
             dialog: None,
+            dialog_guard: None,
             last_state: ScreenState::Unknown,
             last_pane: None,
             transient: None,
         }
     }
+}
+
+struct CapturedScreen {
+    pane: String,
+    snapshot: Option<TuiSnapshot>,
+}
+
+impl CapturedScreen {
+    fn expected_guard(&self) -> Option<ScreenGuard> {
+        self.snapshot
+            .as_ref()
+            .filter(|snap| snap.selection_observable())
+            .map(TuiSnapshot::guard)
+    }
+}
+
+enum DueAnswer {
+    Gone,
+    Due(Option<ScreenGuard>),
 }
 
 /// A workspace mount running off the Bridge thread. The worker only mounts;
@@ -3417,6 +3439,28 @@ impl Bridge {
         )
     }
 
+    /// Captures a structured [`TuiSnapshot`] when supported by the host, falling back
+    /// to plain [`TerminalHost::capture_tail`] for hosts without snapshot support.
+    fn capture_screen(&self, active: &Active) -> Result<CapturedScreen, TerminalError> {
+        let terminal = active.terminal();
+        if let Some(snapshot) = self
+            .terminals
+            .capture_snapshot(&terminal, &active.workspace)?
+        {
+            return Ok(CapturedScreen {
+                pane: snapshot.plain_text(),
+                snapshot: Some(snapshot),
+            });
+        }
+        let pane = self
+            .terminals
+            .capture_tail(&terminal, &active.workspace, TAIL_LINES)?;
+        Ok(CapturedScreen {
+            pane,
+            snapshot: None,
+        })
+    }
+
     /// Read the pane and record its state when it changes, or again after
     /// [`BridgeConfig::screen_refresh`] while a turn keeps it busy.
     fn follow_screen(
@@ -3428,10 +3472,7 @@ impl Bridge {
         if !self.capture_due(session, active) {
             return Ok(());
         }
-        let Ok(pane) =
-            self.terminals
-                .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
-        else {
+        let Ok(captured) = self.capture_screen(active) else {
             // A pane that cannot be read says nothing: the reading is due
             // again on the next pass, never read as a state (§14).
             active.follow.again = self.config.watch.is_some() && !active.follow.watch.poll;
@@ -3440,21 +3481,31 @@ impl Bridge {
         let now = self.clock.now().0;
         active.follow.last_capture = Some(now);
         active.follow.unread_since = None;
-        let mut reading = active.driver.read_screen(&pane);
+        let mut reading = active.driver.read_screen(&captured.pane);
         // The host's own reading of the agent, when it has one (Herdr): a
         // second witness. Without one (tmux, in memory) nothing below
         // changes. Claude Code's screens under Herdr (its screen-reader
         // layout) are not captured yet against Herdr's claude manifest
         // (design §9.2): until they are, Claude Code goes by its own
         // readings alone, on any host, and the host is not even asked.
-        let witness = (active.driver.id() != crate::driver::DEFAULT)
-            .then(|| {
-                self.terminals
-                    .agent(&active.terminal(), &active.workspace)
-                    .ok()
-                    .flatten()
-            })
-            .flatten();
+        let (witness, from_stream) = if active.driver.id() == crate::driver::DEFAULT {
+            (None, false)
+        } else if let Some(stream) = self
+            .terminals
+            .agent(&active.terminal(), &active.workspace)
+            .ok()
+            .flatten()
+        {
+            (Some(stream), true)
+        } else if let Some(snap) = captured
+            .snapshot
+            .as_ref()
+            .filter(|snap| snap.agent().is_some())
+        {
+            (Some(snap.to_agent_reading()), false)
+        } else {
+            (None, false)
+        };
         let mut agreed = false;
         if let Some(witness) = &witness {
             match merge_witness(active.driver, witness, &reading) {
@@ -3506,8 +3557,8 @@ impl Bridge {
             .follow
             .screen
             .is_none_or(|(state, _)| state != reading.state);
-        let key = match (&witness, self.terminals.server()) {
-            (Some(witness), ServerSeen::Answers(Some(server)))
+        let key = match (&witness, from_stream, self.terminals.server()) {
+            (Some(witness), true, ServerSeen::Answers(Some(server)))
                 if changed && active.follow.keyed_seq != Some(witness.seq) =>
             {
                 active.follow.keyed_seq = Some(witness.seq);
@@ -5466,12 +5517,16 @@ impl Bridge {
                 claimed.session_id
             )));
         };
-        if claimed.principal == RESOLVE_PRINCIPAL
+        let expected_guard = if claimed.principal == RESOLVE_PRINCIPAL
             && self.recorded_steps(claimed).press == Press::Due
-            && !self.answer_still_due(claimed, &active)
         {
-            return Ok(Outcome::Failed(GONE_DIALOG.to_string()));
-        }
+            match self.answer_still_due(claimed, &active) {
+                DueAnswer::Due(guard) => guard,
+                DueAnswer::Gone => return Ok(Outcome::Failed(GONE_DIALOG.to_string())),
+            }
+        } else {
+            None
+        };
         match self.recorded_steps(claimed).press {
             Press::Due => {}
             Press::Pressed => return Ok(Outcome::Succeeded),
@@ -5489,10 +5544,13 @@ impl Bridge {
             CommandStep::Pressing,
             None,
         )?;
-        match self
-            .terminals
-            .send_keys(&active.terminal(), &active.workspace, &[key.tmux()])
-        {
+        let chords = KeyChordSequence::single(KeyChord::from(key));
+        match self.terminals.send_key_chords(
+            &active.terminal(),
+            &active.workspace,
+            &chords,
+            expected_guard,
+        ) {
             Ok(()) => {
                 self.step(
                     claimed,
@@ -5522,15 +5580,16 @@ impl Bridge {
     /// (`Permission`, or its startup trust dialog), and no other command of
     /// the session was recorded `pressed` or `typed` since this one was
     /// accepted. A pane that cannot be read is no dialog.
-    fn answer_still_due(&self, claimed: &Claimed, active: &Active) -> bool {
-        let Ok(pane) =
-            self.terminals
-                .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
-        else {
-            return false;
+    ///
+    /// Returns [`DueAnswer::Due`] carrying `Some(guard)` for selection-observable
+    /// `StyledVt` snapshots (or `None` on plain fallback), or [`DueAnswer::Gone`].
+    fn answer_still_due(&self, claimed: &Claimed, active: &Active) -> DueAnswer {
+        let Ok(captured) = self.capture_screen(active) else {
+            return DueAnswer::Gone;
         };
-        let shows = active.driver.read_screen(&pane).state == ScreenState::Permission
-            || active.driver.startup_answer(&pane).is_some();
+        let pane = &captured.pane;
+        let shows = active.driver.read_screen(pane).state == ScreenState::Permission
+            || active.driver.startup_answer(pane).is_some();
         let view = self.sessions.get(&claimed.session_id);
         let accepted = view.and_then(|view| view.accepted_at.get(&claimed.command_id));
         let moved = match (accepted, view.and_then(|view| view.last_effect)) {
@@ -5539,7 +5598,11 @@ impl Bridge {
             // Not seen accepted: whether anything went since cannot be told.
             (None, _) => true,
         };
-        shows && !moved
+        if shows && !moved {
+            DueAnswer::Due(captured.expected_guard())
+        } else {
+            DueAnswer::Gone
+        }
     }
 
     /// Text into the engine's input box, at most once, ending with the
@@ -6848,25 +6911,22 @@ impl Bridge {
             // or staging refused before any key went, spends one attempt: only
             // a terminal that is gone ends the wait early.
             progress.attempts += 1;
-            let pane =
-                match self
-                    .terminals
-                    .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
-                {
-                    Ok(pane) => {
-                        progress.last_pane = Some(active.driver.excerpt_source(&pane));
-                        pane
+            let (pane, guard) = match self.capture_screen(active) {
+                Ok(captured) => {
+                    progress.last_pane = Some(active.driver.excerpt_source(&captured.pane));
+                    let guard = captured.expected_guard();
+                    (captured.pane, guard)
+                }
+                Err(error) => {
+                    if self.terminal_gone(active) {
+                        return Ok(Handled::Finished(Outcome::Failed(format!(
+                            "terminal disappeared: {error}"
+                        ))));
                     }
-                    Err(error) => {
-                        if self.terminal_gone(active) {
-                            return Ok(Handled::Finished(Outcome::Failed(format!(
-                                "terminal disappeared: {error}"
-                            ))));
-                        }
-                        progress.transient = Some(format!("capture: {error}"));
-                        return Ok(self.prompt_retry(&progress));
-                    }
-                };
+                    progress.transient = Some(format!("capture: {error}"));
+                    return Ok(self.prompt_retry(&progress));
+                }
+            };
             // The engine says it will not run what it was started on (agy's
             // unknown model): the start fails now, never waits on it.
             if let Some(why) = active.driver.start_refusal(&pane) {
@@ -6890,12 +6950,15 @@ impl Bridge {
                 && !progress.prompt_seen
                 && let Some(keys) = active.driver.startup_answer(&pane)
             {
-                if progress.dialog.as_deref() != Some(pane.as_str()) {
+                if progress.dialog.as_deref() != Some(pane.as_str())
+                    || progress.dialog_guard != guard
+                {
                     progress.dialog = Some(pane);
+                    progress.dialog_guard = guard;
                     return Ok(self.prompt_retry(&progress));
                 }
                 progress.answered_trust = true;
-                if let Err(error) = self.answer_trust(claimed, active, keys)? {
+                if let Err(error) = self.answer_trust(claimed, active, keys, guard)? {
                     return Ok(Handled::Finished(Outcome::Failed(format!(
                         "answer trust dialog: {error}"
                     ))));
@@ -6904,6 +6967,7 @@ impl Bridge {
                 return Ok(self.prompt_retry(&progress));
             }
             progress.dialog = None;
+            progress.dialog_guard = None;
             progress.last_state = reading.state;
             if !reading.state.accepts_input() {
                 return Ok(self.prompt_retry(&progress));
@@ -6948,12 +7012,12 @@ impl Bridge {
 
     /// The startup trust dialog's answer, audited: each key is a `key`
     /// command of [`RESOLVE_PRINCIPAL`] (keyed [`trust_answer_key`]),
-    /// submitted, recorded `pressing`, pressed with the others in one send
-    /// (as before: the dialog reads keys, and they go together), and
-    /// recorded `pressed`. The commands queue behind this start, so the
-    /// Bridge claims them once the start is done, finds them pressed and
-    /// finishes them without pressing anything again. A key recorded
-    /// `pressing` or `pressed` already (a restarted Bridge on the same
+    /// submitted, recorded `pressing`, pressed together in a single
+    /// [`KeyChordSequence`] batch (with optional [`ScreenGuard`] CAS and zero
+    /// inter-key pause), and recorded `pressed`. The commands queue behind
+    /// this start, so the Bridge claims them once the start is done, finds
+    /// them pressed and finishes them without pressing anything again. A key
+    /// recorded `pressing` or `pressed` already (a restarted Bridge on the same
     /// dialog) presses nothing. A key Spawn has no command for (none of
     /// today's) is pressed unaudited, as before.
     fn answer_trust(
@@ -6961,20 +7025,28 @@ impl Bridge {
         claimed: &Claimed,
         active: &Active,
         keys: &[&str],
+        expected_guard: Option<ScreenGuard>,
     ) -> Result<Result<(), TerminalError>, StoreError> {
-        let named: Option<Vec<NamedKey>> = keys
+        let chords = match KeyChordSequence::from_legacy_keys(keys) {
+            Ok(chords) => chords,
+            Err(err) => {
+                return Ok(Err(TerminalError(format!(
+                    "invalid trust dialog keys: {err}"
+                ))));
+            }
+        };
+        let named: Option<Vec<NamedKey>> = chords
+            .as_slice()
             .iter()
-            .map(|key| {
-                NamedKey::ALL
-                    .iter()
-                    .copied()
-                    .find(|named| named.tmux() == *key)
-            })
+            .map(KeyChord::to_named_key)
             .collect();
         let Some(named) = named else {
-            return Ok(self
-                .terminals
-                .send_keys(&active.terminal(), &active.workspace, keys));
+            return Ok(self.terminals.send_key_chords(
+                &active.terminal(),
+                &active.workspace,
+                &chords,
+                expected_guard,
+            ));
         };
         let principal = Principal::new(RESOLVE_PRINCIPAL)
             .map_err(|error| StoreError::Backend(error.to_string()))?;
@@ -7011,9 +7083,12 @@ impl Bridge {
         for key in &audited {
             self.step(key, Some(&active.execution_id), CommandStep::Pressing, None)?;
         }
-        let sent = self
-            .terminals
-            .send_keys(&active.terminal(), &active.workspace, keys);
+        let sent = self.terminals.send_key_chords(
+            &active.terminal(),
+            &active.workspace,
+            &chords,
+            expected_guard,
+        );
         if sent.is_ok() {
             for key in &audited {
                 self.step(key, Some(&active.execution_id), CommandStep::Pressed, None)?;
@@ -7176,33 +7251,27 @@ impl Bridge {
             }
             attempt += 1;
             let last = attempt >= self.config.input_attempts;
-            let pane =
-                match self
-                    .terminals
-                    .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
-                {
-                    Ok(pane) => pane,
-                    Err(error) => {
-                        if self.terminal_gone(active) {
-                            if waits(&claimed.principal) {
-                                return self.not_yet(claimed, active, shown, None, continue_nudge);
-                            }
-                            return finished(Outcome::Failed(format!(
-                                "terminal disappeared: {error}"
-                            )));
+            let pane = match self.capture_screen(active) {
+                Ok(captured) => captured.pane,
+                Err(error) => {
+                    if self.terminal_gone(active) {
+                        if waits(&claimed.principal) {
+                            return self.not_yet(claimed, active, shown, None, continue_nudge);
                         }
-                        if last {
-                            return self.not_yet(
-                                claimed,
-                                active,
-                                ScreenState::Unknown,
-                                Some(&format!("pane unread ({error})")),
-                                continue_nudge,
-                            );
-                        }
-                        continue;
+                        return finished(Outcome::Failed(format!("terminal disappeared: {error}")));
                     }
-                };
+                    if last {
+                        return self.not_yet(
+                            claimed,
+                            active,
+                            ScreenState::Unknown,
+                            Some(&format!("pane unread ({error})")),
+                            continue_nudge,
+                        );
+                    }
+                    continue;
+                }
+            };
             let reading = active.driver.read_screen(&pane);
             // A waiting input's busy readings are not recorded again each
             // time it is tried: they are no new fact.
@@ -9448,6 +9517,36 @@ mod tests {
             }
             self.inner.capture_tail(terminal, workspace, lines)
         }
+        fn capture_snapshot(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<Option<crate::tui::TuiSnapshot>, TerminalError> {
+            if self.delayed.lock().expect("delayed").contains(terminal) {
+                return Ok(None);
+            }
+            let snap = self.inner.capture_snapshot(terminal, workspace)?;
+            if snap.is_some() {
+                *self.captures.lock().expect("lock") += 1;
+            }
+            Ok(snap)
+        }
+        fn send_key_chords(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            keys: &crate::tui::KeyChordSequence,
+            expected_guard: Option<crate::tui::ScreenGuard>,
+        ) -> Result<(), TerminalError> {
+            self.inner
+                .send_key_chords(terminal, workspace, keys, expected_guard)?;
+            self.keys.lock().expect("keys").extend(
+                keys.as_slice()
+                    .iter()
+                    .map(crate::tui::KeyChord::to_legacy_tmux_name),
+            );
+            Ok(())
+        }
         fn read_from(
             &self,
             workspace: &WorkspaceId,
@@ -10156,6 +10255,10 @@ mod tests {
             *self.reading.lock().expect("reading") = Some(reading);
         }
 
+        fn clear(&self) {
+            *self.reading.lock().expect("reading") = None;
+        }
+
         fn set_dirs(&self, dir: &str, names: &[&str]) {
             self.dirs.lock().expect("dirs").insert(
                 dir.to_string(),
@@ -10215,6 +10318,23 @@ mod tests {
             lines: usize,
         ) -> Result<String, TerminalError> {
             self.inner.capture_tail(terminal, workspace, lines)
+        }
+        fn capture_snapshot(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<Option<crate::tui::TuiSnapshot>, TerminalError> {
+            self.inner.capture_snapshot(terminal, workspace)
+        }
+        fn send_key_chords(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            keys: &crate::tui::KeyChordSequence,
+            expected_guard: Option<crate::tui::ScreenGuard>,
+        ) -> Result<(), TerminalError> {
+            self.inner
+                .send_key_chords(terminal, workspace, keys, expected_guard)
         }
         fn read_from(
             &self,
@@ -13116,10 +13236,9 @@ mod tests {
         let execution = ExecutionId::for_command(id);
         let principal = Principal::new(RESOLVE_PRINCIPAL).expect("principal");
         for (at, key) in crate::screen::TRUST_KEYS.iter().enumerate() {
-            let named = NamedKey::ALL
-                .iter()
-                .copied()
-                .find(|named| named.tmux() == *key)
+            let named = crate::tui::KeyChord::from_legacy_key_name(key)
+                .expect("valid key")
+                .to_named_key()
                 .expect("a named key");
             let command = store
                 .submit(
@@ -15364,6 +15483,37 @@ mod tests {
             }
             self.inner.capture_tail(terminal, workspace, lines)
         }
+        fn capture_snapshot(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<Option<crate::tui::TuiSnapshot>, TerminalError> {
+            let snap = self.inner.capture_snapshot(terminal, workspace)?;
+            if snap.is_some() {
+                let advance_ms = {
+                    let mut slot = self.step_on.lock().expect("step_on");
+                    if slot.as_ref().is_some_and(|(target, _)| target == terminal) {
+                        slot.take().map(|(_, millis)| millis)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(millis) = advance_ms {
+                    self.clock.advance(Duration::from_millis(millis));
+                }
+            }
+            Ok(snap)
+        }
+        fn send_key_chords(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            keys: &crate::tui::KeyChordSequence,
+            expected_guard: Option<crate::tui::ScreenGuard>,
+        ) -> Result<(), TerminalError> {
+            self.inner
+                .send_key_chords(terminal, workspace, keys, expected_guard)
+        }
         fn read_from(
             &self,
             workspace: &WorkspaceId,
@@ -16360,6 +16510,23 @@ mod tests {
         ) -> Result<String, TerminalError> {
             self.inner.capture_tail(terminal, workspace, lines)
         }
+        fn capture_snapshot(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<Option<crate::tui::TuiSnapshot>, TerminalError> {
+            self.inner.capture_snapshot(terminal, workspace)
+        }
+        fn send_key_chords(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            keys: &crate::tui::KeyChordSequence,
+            expected_guard: Option<crate::tui::ScreenGuard>,
+        ) -> Result<(), TerminalError> {
+            self.inner
+                .send_key_chords(terminal, workspace, keys, expected_guard)
+        }
         fn read_from(
             &self,
             workspace: &WorkspaceId,
@@ -16704,5 +16871,316 @@ mod tests {
         b0.config.shard_coverage_policy = ShardCoveragePolicy::AllowIncomplete;
         b0.work()
             .expect("AllowIncomplete explicitly permits partial work");
+    }
+
+    fn styled_claude_trust(select_yes: bool) -> crate::tui::TuiSnapshot {
+        let raw_vt = if select_yes {
+            "\x1b[H\x1b[2JQuick safety check: Is this a project you created or one you trust?\r\n\
+             \x1b[0;7my. Yes, I trust this folder\x1b[0m\r\n\
+             n. No, exit\r\n\
+             Enter y/n:\r\n\
+             Enter to confirm · Esc to cancel\r\n\x1b[2;1H\x1b[?9001l"
+        } else {
+            "\x1b[H\x1b[2JQuick safety check: Is this a project you created or one you trust?\r\n\
+             y. Yes, I trust this folder\r\n\
+             \x1b[0;7mn. No, exit\x1b[0m\r\n\
+             Enter y/n:\r\n\
+             Enter to confirm · Esc to cancel\r\n\x1b[3;1H\x1b[?9001l"
+        };
+        crate::tui::TuiSnapshot::from_styled_vt(
+            crate::tui::RawStyledSnapshot {
+                address: "t1",
+                cols: 120,
+                rows: 40,
+                live_state: crate::tui::TerminalLiveState::Live { pid: Some(7) },
+                title: None,
+                raw_vt,
+            },
+            crate::tui::SnapshotObservation::default(),
+        )
+    }
+
+    #[test]
+    fn trust_dialog_uses_styled_snapshot_screen_guard_cas_and_sends_single_chord_batch() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Counted::over(store.clone());
+        let id = submit_resumable_start(&store, 1, "work", READY);
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(id));
+        let snap_no = styled_claude_trust(false);
+        let snap_yes = styled_claude_trust(true);
+        assert_eq!(snap_no.plain_text(), snap_yes.plain_text());
+        assert_ne!(snap_no.guard(), snap_yes.guard());
+
+        // Start on `snap_no`: first read records `snap_no.guard()`, then highlight moves to
+        // `snap_yes` with identical plain text — Bridge must wait for two equal guards.
+        store.set_snapshot(&terminal, snap_no);
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock);
+
+        bridge.work().expect("first trust read");
+        store.expire_leases();
+        assert!(store.key_chord_batches().is_empty());
+
+        store.set_snapshot(&terminal, snap_yes.clone());
+        bridge.work().expect("second read sees guard shift");
+        store.expire_leases();
+        assert!(
+            store.key_chord_batches().is_empty(),
+            "different ScreenGuard on identical plain lines must not answer yet"
+        );
+
+        // Third read confirms `snap_yes.guard()` and delivers ONE KeyChordSequence batch with CAS guard.
+        drive_work(&mut bridge, &store, || store.key_chord_batches().len() == 1);
+        let batches = store.key_chord_batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].0, terminal);
+        assert_eq!(
+            batches[0].1,
+            crate::tui::KeyChordSequence::from_legacy_keys(&crate::screen::TRUST_KEYS)
+                .expect("trust chords")
+        );
+        assert_eq!(batches[0].2, Some(snap_yes.guard()));
+
+        store.set_pane(&terminal, READY);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+    }
+
+    struct ShiftingHost {
+        inner: Arc<MemoryStore>,
+        next_snap: Mutex<Option<(TerminalName, crate::tui::TuiSnapshot)>>,
+    }
+
+    impl TerminalHost for ShiftingHost {
+        fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+            self.inner.start(launch)
+        }
+        fn stage_text(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            text: &str,
+        ) -> Result<(), TerminalError> {
+            self.inner.stage_text(terminal, workspace, text)
+        }
+        fn submit_staged(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.submit_staged(terminal, workspace)
+        }
+        fn send_keys(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            keys: &[&str],
+        ) -> Result<(), TerminalError> {
+            self.inner.send_keys(terminal, workspace, keys)
+        }
+        fn is_alive(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<bool, TerminalError> {
+            self.inner.is_alive(terminal, workspace)
+        }
+        fn capture_tail(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            lines: usize,
+        ) -> Result<String, TerminalError> {
+            self.inner.capture_tail(terminal, workspace, lines)
+        }
+        fn capture_snapshot(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<Option<crate::tui::TuiSnapshot>, TerminalError> {
+            self.inner.capture_snapshot(terminal, workspace)
+        }
+        fn send_key_chords(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            keys: &crate::tui::KeyChordSequence,
+            expected_guard: Option<crate::tui::ScreenGuard>,
+        ) -> Result<(), TerminalError> {
+            if let Some((target, mutated)) = self.next_snap.lock().expect("shift").take() {
+                self.inner.set_snapshot(&target, mutated);
+            }
+            self.inner
+                .send_key_chords(terminal, workspace, keys, expected_guard)
+        }
+        fn read_from(
+            &self,
+            workspace: &WorkspaceId,
+            path: &str,
+            offset: u64,
+        ) -> Result<Option<Vec<u8>>, TerminalError> {
+            self.inner.read_from(workspace, path, offset)
+        }
+        fn write_new(
+            &self,
+            workspace: &WorkspaceId,
+            path: &str,
+            bytes: &[u8],
+        ) -> Result<bool, TerminalError> {
+            self.inner.write_new(workspace, path, bytes)
+        }
+        fn terminate(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.terminate(terminal, workspace)
+        }
+    }
+
+    #[test]
+    fn resolver_key_command_fails_closed_on_screen_guard_mismatch() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Arc::new(ShiftingHost {
+            inner: store.clone(),
+            next_snap: Mutex::new(None),
+        });
+        let id = submit_resumable_start(&store, 1, "work", READY);
+        let execution = ExecutionId::for_command(id);
+        let terminal = TerminalName::for_execution(&execution);
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+
+        let snap1 = crate::tui::TuiSnapshot::from_styled_vt(
+            crate::tui::RawStyledSnapshot {
+                address: "t1",
+                cols: 120,
+                rows: 40,
+                live_state: crate::tui::TerminalLiveState::Live { pid: Some(7) },
+                title: None,
+                raw_vt: "\x1b[H\x1b[2JDo you want to proceed?\r\n\x1b[0;7m❯ 1. Yes\x1b[0m\r\n  2. No\r\n\x1b[?9001l",
+            },
+            crate::tui::SnapshotObservation::default(),
+        );
+        let snap2 = crate::tui::TuiSnapshot::from_styled_vt(
+            crate::tui::RawStyledSnapshot {
+                address: "t1",
+                cols: 120,
+                rows: 40,
+                live_state: crate::tui::TerminalLiveState::Live { pid: Some(7) },
+                title: None,
+                raw_vt: "\x1b[H\x1b[2JDo you want to proceed?\r\n  1. Yes\r\n\x1b[0;7m❯ 2. No\x1b[0m\r\n\x1b[?9001l",
+            },
+            crate::tui::SnapshotObservation::default(),
+        );
+        store.set_snapshot(&terminal, snap1);
+        *host.next_snap.lock().expect("arm shift") = Some((terminal, snap2));
+
+        let cmd = submit_key(
+            &store,
+            RESOLVE_PRINCIPAL,
+            &format!("resolve:{execution}:session_1:deadbeef:1:1"),
+            NamedKey::Digit1,
+        );
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, cmd).is_some()
+        });
+        match command_outcome(&store, cmd) {
+            Some(Outcome::Failed(why)) => {
+                assert!(why.contains("guard_mismatch"), "{why}");
+            }
+            other => panic!("expected Outcome::Failed(guard_mismatch), got {other:?}"),
+        }
+        assert!(
+            store.key_chord_batches().is_empty(),
+            "guard mismatch must abort key delivery"
+        );
+    }
+
+    #[test]
+    fn follow_screen_merges_witness_from_tui_snapshot() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let mut config = agy_config(Some("gemini-3.8-pro"));
+        config.engine_view = EngineViewPolicy::Off;
+        let id = submit_agy_start_on(&store, "hello", Some("gemini-3.8-pro"));
+        let execution = ExecutionId::for_command(id);
+        let terminal = TerminalName::for_execution(&execution);
+        store.set_pane(&terminal, &agy_idle());
+
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            config,
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+
+        // Clear the streaming `terminals.agent()` reading so `follow_screen` must rely on the
+        // structured `TuiSnapshot` witness (`snap.to_agent_reading()`).
+        host.clear();
+        let snap = crate::tui::TuiSnapshot::from_styled_vt(
+            crate::tui::RawStyledSnapshot {
+                address: "t1",
+                cols: 120,
+                rows: 40,
+                live_state: crate::tui::TerminalLiveState::Live { pid: Some(9) },
+                title: None,
+                raw_vt: "\x1b[H\x1b[2JRun command?\r\n\x1b[0;7m  1. Yes\x1b[0m\r\n  2. No\r\n\x1b[?9001l",
+            },
+            crate::tui::SnapshotObservation {
+                agent: Some("agy".to_string()),
+                agent_status: crate::port::AgentStatus::Blocked,
+                rule: Some("permission_prompt".to_string()),
+                blocker_visible: true,
+            },
+        );
+        store.set_snapshot(&terminal, snap);
+        clock.advance(bridge.config.screen_refresh);
+        bridge.poll().expect("follow_screen via snapshot");
+
+        let observed: Vec<(ScreenState, String, Option<String>)> = records(&store)
+            .into_iter()
+            .filter_map(|record| match record.event.kind {
+                EventKind::ScreenObserved { state, evidence } => {
+                    Some((state, evidence, record.event.source_event_id))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            observed.iter().any(|(state, evidence, key)| {
+                *state == ScreenState::Permission
+                    && evidence == "herdr agy: blocked (permission_prompt)"
+                    && key.is_none()
+            }),
+            "TuiSnapshot witness must promote Permission in follow_screen without a fake hs key: {observed:?}"
+        );
     }
 }

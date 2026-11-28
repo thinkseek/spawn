@@ -24,6 +24,7 @@ use crate::port::{
     TerminalError, TerminalHost, TranscriptArchive, WatchError, WorkspaceError, WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
+use crate::tui::{KeyChord, KeyChordSequence, KeyCode, ScreenGuard, TuiSnapshot};
 
 /// A command inside the queue.
 #[derive(Debug, Clone)]
@@ -106,6 +107,10 @@ struct State {
     /// Every terminal start, in order.
     launches: Vec<Launch>,
     panes: HashMap<TerminalName, String>,
+    /// Optional structured [`TuiSnapshot`] per terminal (cleared when [`MemoryStore::set_pane`] runs).
+    snapshots: HashMap<TerminalName, TuiSnapshot>,
+    /// Key chord batches sent via [`TerminalHost::send_key_chords`], in order.
+    key_chord_batches: Vec<(TerminalName, KeyChordSequence, Option<ScreenGuard>)>,
     /// Text staged for a terminal's next submit.
     staged: HashMap<TerminalName, String>,
     /// For every text submitted to a terminal, in order: whether a
@@ -282,7 +287,22 @@ impl MemoryStore {
 
     /// Replace the visible pane of a terminal. Test helper.
     pub fn set_pane(&self, terminal: &TerminalName, pane: &str) {
-        self.lock().panes.insert(terminal.clone(), pane.to_string());
+        let mut state = self.lock();
+        state.snapshots.remove(terminal);
+        state.panes.insert(terminal.clone(), pane.to_string());
+    }
+
+    /// Install a structured [`TuiSnapshot`] for a terminal (alongside its plain pane text).
+    /// Test helper.
+    pub fn set_snapshot(&self, terminal: &TerminalName, snapshot: TuiSnapshot) {
+        let mut state = self.lock();
+        state.panes.insert(terminal.clone(), snapshot.plain_text());
+        state.snapshots.insert(terminal.clone(), snapshot);
+    }
+
+    /// Recorded [`TerminalHost::send_key_chords`] batches, in order. Test helper.
+    pub fn key_chord_batches(&self) -> Vec<(TerminalName, KeyChordSequence, Option<ScreenGuard>)> {
+        self.lock().key_chord_batches.clone()
     }
 
     /// Make the engine of `terminal` exit at the next liveness check:
@@ -1111,6 +1131,7 @@ impl TerminalHost for MemoryStore {
         if let Some((path, bytes)) = state.exits_on_check.remove(terminal) {
             state.files.insert(path, bytes);
             state.terminals.remove(terminal);
+            state.snapshots.remove(terminal);
         }
         Ok(state.terminals.contains(terminal))
     }
@@ -1146,6 +1167,61 @@ impl TerminalHost for MemoryStore {
         let all: Vec<&str> = pane.lines().collect();
         let start = all.len().saturating_sub(lines);
         Ok(all[start..].join("\n"))
+    }
+
+    fn capture_snapshot(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<Option<TuiSnapshot>, TerminalError> {
+        let state = self.lock();
+        if !state.terminals.contains(terminal) {
+            return Err(TerminalError(format!("terminal {terminal} is gone")));
+        }
+        Ok(state.snapshots.get(terminal).cloned())
+    }
+
+    fn send_key_chords(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+        keys: &KeyChordSequence,
+        expected_guard: Option<ScreenGuard>,
+    ) -> Result<(), TerminalError> {
+        let mut state = self.lock();
+        if !state.terminals.contains(terminal) {
+            return Err(TerminalError(format!("terminal {terminal} is gone")));
+        }
+        if let Some(want) = expected_guard {
+            let Some(snapshot) = state.snapshots.get(terminal) else {
+                return Err(TerminalError(format!(
+                    "unobservable_selection: terminal {terminal} has no snapshot for guarded key send"
+                )));
+            };
+            if !snapshot.selection_observable() {
+                return Err(TerminalError(format!(
+                    "unobservable_selection: terminal {terminal} guarded key send rejected under PlainTextOnly fidelity"
+                )));
+            }
+            let got = snapshot.guard();
+            if got != want {
+                return Err(TerminalError(format!(
+                    "guard_mismatch: terminal {terminal} screen changed (expected {want}, got {got})"
+                )));
+            }
+        }
+        let pane = state.panes.entry(terminal.clone()).or_default();
+        for chord in keys.as_slice() {
+            if *chord == KeyChord::plain(KeyCode::Enter) {
+                pane.push('\n');
+            } else {
+                pane.push_str(&chord.to_legacy_tmux_name());
+            }
+        }
+        state
+            .key_chord_batches
+            .push((terminal.clone(), keys.clone(), expected_guard));
+        Ok(())
     }
 
     fn read_from(
@@ -1222,6 +1298,7 @@ impl TerminalHost for MemoryStore {
         }
         state.terminals.remove(terminal);
         state.panes.remove(terminal);
+        state.snapshots.remove(terminal);
         state.untracked.remove(terminal);
         Ok(())
     }
