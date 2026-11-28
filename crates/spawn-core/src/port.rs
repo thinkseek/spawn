@@ -14,6 +14,7 @@ use crate::event::{Appended, EventKind, EventRecord, Fork, GlobalPosition, NewEv
 use crate::id::{
     AgentId, BranchName, CommandId, CommitId, Principal, SessionId, TerminalName, WorkspaceId,
 };
+use crate::tui::{KeyChord, KeyChordSequence, ScreenGuard, TuiSnapshot};
 
 /// Storage failure.
 #[derive(Debug, Error)]
@@ -954,6 +955,56 @@ pub trait TerminalHost: Send + Sync {
         workspace: &WorkspaceId,
         lines: usize,
     ) -> Result<String, TerminalError>;
+
+    /// Structured [`TuiSnapshot`] of the terminal screen when the host
+    /// supports unified snapshot capture (`Ok(None)` falls back to
+    /// [`Self::capture_tail`]).
+    fn capture_snapshot(
+        &self,
+        _terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<Option<TuiSnapshot>, TerminalError> {
+        Ok(None)
+    }
+
+    /// Sends a non-empty [`KeyChordSequence`] in a single batch without inter-key
+    /// delays, verifying `expected_guard` against a selection-observable
+    /// [`TuiSnapshot`] when provided. Default implementation verifies the
+    /// optional guard via [`Self::capture_snapshot`] and forwards converted
+    /// chords to [`Self::send_keys`].
+    fn send_key_chords(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        keys: &KeyChordSequence,
+        expected_guard: Option<ScreenGuard>,
+    ) -> Result<(), TerminalError> {
+        if let Some(want) = expected_guard {
+            let Some(snapshot) = self.capture_snapshot(terminal, workspace)? else {
+                return Err(TerminalError(format!(
+                    "unobservable_selection: terminal {terminal} has no snapshot for guarded key send"
+                )));
+            };
+            if !snapshot.selection_observable() {
+                return Err(TerminalError(format!(
+                    "unobservable_selection: terminal {terminal} guarded key send rejected under PlainTextOnly fidelity"
+                )));
+            }
+            let got = snapshot.guard();
+            if got != want {
+                return Err(TerminalError(format!(
+                    "guard_mismatch: terminal {terminal} screen changed (expected {want}, got {got})"
+                )));
+            }
+        }
+        let legacy: Vec<String> = keys
+            .as_slice()
+            .iter()
+            .map(KeyChord::to_legacy_tmux_name)
+            .collect();
+        let refs: Vec<&str> = legacy.iter().map(String::as_str).collect();
+        self.send_keys(terminal, workspace, &refs)
+    }
 
     /// The bytes of the file at `path`, as the terminal's process sees it,
     /// from byte `offset`, at most [`READ_LIMIT`] of them; `None` when there

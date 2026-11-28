@@ -52,9 +52,15 @@ use std::collections::HashSet;
 use serde_json::Value;
 use spawn_core::command::{CommandAction, NamedKey, Submission};
 use spawn_core::driver::{Answer, Dialog, driver_or_default, hard_block, table_answer};
-use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId, WorkspaceId};
-use spawn_core::port::{AgentReading, AgentStatus};
+use spawn_core::id::{
+    AgentId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName, WorkspaceId,
+};
+use spawn_core::port::{AgentStatus, TerminalHost};
 use spawn_core::screen::ScreenState;
+use spawn_core::tui::{
+    KeyChord, KeyChordSequence, RawPlainSnapshot, ScreenGuard, TerminalLiveState, TuiSnapshot,
+};
+use spawn_host::herdr_global::{GlobalErrorKind, HerdrGlobalClient, SocketScope};
 
 use crate::serve::approvals::{Prompt, detect, fnv1a, normalized};
 
@@ -198,8 +204,12 @@ impl Ledger {
 /// What the resolver makes of one pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Decision {
-    /// Press `keys` for the dialog `dialog`.
-    Answer { dialog: String, keys: Vec<NamedKey> },
+    /// Press `keys` for the dialog `dialog`, optionally guarded by `expected_guard`.
+    Answer {
+        dialog: String,
+        keys: KeyChordSequence,
+        expected_guard: Option<ScreenGuard>,
+    },
     /// A person decides `dialog`: why.
     Escalate { dialog: String, why: String },
     /// Nothing to do (no dialog, a guard does not hold): why.
@@ -218,24 +228,17 @@ fn bottom_id(session: &str, rule: &str, pane: &str) -> String {
     format!("{session}:{:016x}", fnv1a(&format!("{rule}\n{bottom}")))
 }
 
-/// A tmux key name as a key command's key.
-fn named(key: &str) -> Option<NamedKey> {
-    NamedKey::ALL
-        .iter()
-        .copied()
-        .find(|named| named.tmux() == key)
-}
-
 /// A dialog's choices, the label its cursor stands on, and its body: from
-/// the approvals page's prompt, or from the pane itself for a dialog it
-/// reads no prompt on (agy's trust dialog).
+/// the approvals page's prompt, structured snapshot choices, or from the
+/// pane itself for a dialog it reads no prompt on (agy's trust dialog).
 fn dialog_parts(
     prompt: Option<&Prompt>,
+    snapshot: &TuiSnapshot,
     second: &str,
 ) -> (Vec<String>, Option<String>, Vec<String>) {
     let choices: Vec<String> = prompt.map_or_else(
         || {
-            second
+            let trust: Vec<String> = second
                 .lines()
                 .map(|line| {
                     line.trim()
@@ -244,7 +247,16 @@ fn dialog_parts(
                         .to_string()
                 })
                 .filter(|line| line.starts_with("Yes, I trust") || line.starts_with("No, exit"))
-                .collect()
+                .collect();
+            if trust.is_empty() {
+                snapshot
+                    .choices()
+                    .iter()
+                    .map(|choice| choice.label.clone())
+                    .collect()
+            } else {
+                trust
+            }
         },
         |prompt| {
             prompt
@@ -256,20 +268,33 @@ fn dialog_parts(
     );
     let cursor: Option<String> = prompt.map_or_else(
         || {
-            second.lines().find_map(|line| {
-                line.trim()
-                    .strip_prefix('>')
-                    .map(|rest| rest.trim().to_string())
-            })
+            snapshot
+                .selected_choice()
+                .map(|choice| choice.label.clone())
+                .or_else(|| {
+                    second.lines().find_map(|line| {
+                        line.trim()
+                            .strip_prefix('>')
+                            .map(|rest| rest.trim().to_string())
+                    })
+                })
         },
         |prompt| {
-            prompt.cursor.as_ref().and_then(|id| {
-                prompt
-                    .choices
-                    .iter()
-                    .find(|choice| &choice.id == id)
-                    .map(|choice| choice.label.clone())
-            })
+            prompt
+                .cursor
+                .as_ref()
+                .and_then(|id| {
+                    prompt
+                        .choices
+                        .iter()
+                        .find(|choice| &choice.id == id)
+                        .map(|choice| choice.label.clone())
+                })
+                .or_else(|| {
+                    snapshot
+                        .selected_choice()
+                        .map(|choice| choice.label.clone())
+                })
         },
     );
     let body: Vec<String> = prompt.map_or_else(
@@ -279,63 +304,70 @@ fn dialog_parts(
     (choices, cursor, body)
 }
 
-/// What one pane, read twice (`first`, then `second`), calls for: pure.
-/// `reading` is the host's own reading of the agent (none on tmux).
-pub(crate) fn decide(
+/// What one pane, read twice as structured snapshots (`first`, then `second`),
+/// calls for: pure. Enforces matching [`SnapshotFidelity`] and matching
+/// [`ScreenGuard`] CAS tokens when `selection_observable()` holds.
+pub(crate) fn decide_snapshots(
     session: &str,
     engine: &str,
     workspace: &WorkspaceId,
-    first: &str,
-    second: &str,
-    reading: Option<&AgentReading>,
+    first: &TuiSnapshot,
+    second: &TuiSnapshot,
 ) -> Decision {
+    if first.selection_observable() != second.selection_observable() {
+        return Decision::Nothing("snapshot fidelity changed between reads");
+    }
+    if first.selection_observable() && first.guard() != second.guard() {
+        return Decision::Nothing("screen guard changed between reads");
+    }
+    let expected_guard = second.selection_observable().then(|| second.guard());
+    let first_text = first.plain_text();
+    let second_text = second.plain_text();
     let driver = driver_or_default(engine);
-    let screen = driver.read_screen(second);
-    let herdr_rule = reading
-        .filter(|_| driver.id() != "claude")
-        .and_then(|reading| reading.rule.as_deref());
+    let screen = driver.read_screen(&second_text);
+    let herdr_rule = (driver.id() != "claude").then(|| second.rule()).flatten();
     let trust_rule = herdr_rule == Some("trust_prompt");
     if trust_rule {
         // An independent reading of the trust dialog, on both reads: the
         // host's rule alone is never enough.
-        if driver.startup_answer(first).is_none() || driver.startup_answer(second).is_none() {
+        if driver.startup_answer(&first_text).is_none()
+            || driver.startup_answer(&second_text).is_none()
+        {
             return Decision::Nothing("the engine's own reading shows no trust dialog");
         }
     } else if screen.state != ScreenState::Permission {
         return Decision::Nothing("the engine's own reading shows no dialog");
     }
-    let prompts: (Option<Prompt>, Option<Prompt>) = (detect(first), detect(second));
+    let prompts: (Option<Prompt>, Option<Prompt>) = (detect(&first_text), detect(&second_text));
     let (dialog, prompt) = match prompts {
         (Some(one), Some(two)) if one.id(session) == two.id(session) => {
             (two.id(session), Some(two))
         }
         (None, None)
             if trust_rule
-                && bottom_id(session, "trust_prompt", first)
-                    == bottom_id(session, "trust_prompt", second) =>
+                && bottom_id(session, "trust_prompt", &first_text)
+                    == bottom_id(session, "trust_prompt", &second_text) =>
         {
-            (bottom_id(session, "trust_prompt", second), None)
+            (bottom_id(session, "trust_prompt", &second_text), None)
         }
         (None, None) => {
             return Decision::Escalate {
-                dialog: bottom_id(session, "unread", second),
+                dialog: bottom_id(session, "unread", &second_text),
                 why: "a dialog Spawn reads no prompt on".to_string(),
             };
         }
         _ => return Decision::Nothing("two reads in a row show two dialogs"),
     };
     if driver.id() != "claude" {
-        let blocked = reading.is_some_and(|reading| {
-            reading.status == AgentStatus::Blocked
-                && reading.rule.is_some()
-                && reading.blocker_visible
-        });
+        let blocked = second.agent_status() == AgentStatus::Blocked
+            && second.rule().is_some()
+            && second.blocker_visible();
         if !blocked {
             return Decision::Nothing("the host does not read the agent blocked by a named rule");
         }
     }
-    let (choices, cursor, body) = dialog_parts(prompt.as_ref(), second);
-    if let Some(why) = hard_block(second, &choices) {
+    let (choices, cursor, body) = dialog_parts(prompt.as_ref(), second, &second_text);
+    if let Some(why) = hard_block(&second_text, &choices) {
         return Decision::Escalate {
             dialog,
             why: format!("a hard block ({why})"),
@@ -354,11 +386,15 @@ pub(crate) fn decide(
         body: &body,
     };
     match table_answer(driver.id(), &shown, workspace) {
-        Answer::Keys(keys) => match keys.iter().map(|key| named(key)).collect() {
-            Some(keys) => Decision::Answer { dialog, keys },
-            None => Decision::Escalate {
+        Answer::Keys(keys) => match KeyChordSequence::from_legacy_keys(keys) {
+            Ok(keys) => Decision::Answer {
                 dialog,
-                why: "an answer with a key Spawn has no command for".to_string(),
+                keys,
+                expected_guard,
+            },
+            Err(_) => Decision::Escalate {
+                dialog,
+                why: "an answer with an unsupported VT key chord".to_string(),
             },
         },
         Answer::Escalate(why) => Decision::Escalate {
@@ -380,8 +416,16 @@ pub(crate) struct Live {
     pub(crate) busy: bool,
 }
 
-/// What the step reads and writes: the store and the terminal host in the
-/// loop, a fake in the tests.
+/// Validated answer submission payload paired with optional CAS guard.
+struct AnswerPlan<'a> {
+    dialog: &'a str,
+    keys: &'a KeyChordSequence,
+    named: &'a [NamedKey],
+    expected_guard: Option<ScreenGuard>,
+}
+
+/// What the step reads and writes: the store and its terminal host /
+/// `HerdrGlobalClient` in the loop, a fake in the tests.
 pub(crate) trait World {
     /// The store's clock.
     fn now_ms(&self) -> Result<i64, String>;
@@ -389,14 +433,16 @@ pub(crate) trait World {
     fn ledger(&self) -> Result<Ledger, String>;
     /// The live executions.
     fn live(&self) -> Result<Vec<Live>, String>;
-    /// The pane's tail.
-    fn capture(&self, live: &Live) -> Result<String, String>;
+    /// A structured [`TuiSnapshot`] of the live execution's terminal.
+    fn capture_snapshot(&self, live: &Live) -> Result<TuiSnapshot, String>;
+    /// Pre-submit optimistic CAS guard check against the live screen.
+    fn verify_guard(&self, _live: &Live, _expected_guard: ScreenGuard) -> Result<bool, String> {
+        Ok(true)
+    }
     /// The pause between the two reads.
     fn pause(&self);
     /// The workspace the execution runs in.
     fn workspace(&self, live: &Live) -> Result<WorkspaceId, String>;
-    /// The host's reading of the agent, if it has one.
-    fn reading(&self, live: &Live) -> Option<AgentReading>;
     /// Submit a key command; its id (the first one for a key used before).
     fn submit(&self, live: &Live, key: &str, named: NamedKey) -> Result<i64, String>;
 }
@@ -443,36 +489,42 @@ impl Resolver {
                 continue;
             }
             let driver = driver_or_default(&live.engine);
-            let Ok(first) = world.capture(&live) else {
+            let Ok(first) = world.capture_snapshot(&live) else {
                 continue;
             };
-            let reading = world.reading(&live);
-            let trust = reading
-                .as_ref()
-                .is_some_and(|reading| reading.rule.as_deref() == Some("trust_prompt"));
-            if driver.read_screen(&first).state != ScreenState::Permission && !trust {
+            let trust = first.rule() == Some("trust_prompt");
+            if driver.read_screen(&first.plain_text()).state != ScreenState::Permission && !trust {
                 continue;
             }
             world.pause();
-            let Ok(second) = world.capture(&live) else {
+            let Ok(second) = world.capture_snapshot(&live) else {
                 continue;
             };
-            let reading = world.reading(&live);
             let workspace = world.workspace(&live)?;
-            match decide(
-                &live.session,
-                &live.engine,
-                &workspace,
-                &first,
-                &second,
-                reading.as_ref(),
-            ) {
+            match decide_snapshots(&live.session, &live.engine, &workspace, &first, &second) {
                 Decision::Nothing(_) => {}
                 Decision::Escalate { dialog, why } => {
                     let line = format!("resolve: {} escalated {dialog}: {why}", live.session);
                     self.say(&mut lines, &format!("{}:{dialog}", live.execution), line);
                 }
-                Decision::Answer { dialog, keys } => {
+                Decision::Answer {
+                    dialog,
+                    keys,
+                    expected_guard,
+                } => {
+                    let Some(named) = keys
+                        .as_slice()
+                        .iter()
+                        .map(KeyChord::to_named_key)
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        let line = format!(
+                            "resolve: {} escalated {dialog}: an answer with a VT key chord outside the audited key command set",
+                            live.session
+                        );
+                        self.say(&mut lines, &format!("{}:{dialog}", live.execution), line);
+                        continue;
+                    };
                     if let Some(why) = ledger.breaker(&live.session, live.started_ms, now) {
                         let line = format!(
                             "resolve: {} breaker open, escalated {dialog}: {why}",
@@ -481,9 +533,13 @@ impl Resolver {
                         self.say(&mut lines, &format!("{}:open", live.execution), line);
                         continue;
                     }
-                    if let Some(line) =
-                        self.answer(world, &mut ledger, &live, &dialog, &keys, now)?
-                    {
+                    let plan = AnswerPlan {
+                        dialog: &dialog,
+                        keys: &keys,
+                        named: &named,
+                        expected_guard,
+                    };
+                    if let Some(line) = self.answer(world, &mut ledger, &live, &plan, now)? {
                         lines.push(line);
                     }
                 }
@@ -493,23 +549,27 @@ impl Resolver {
     }
 
     /// Submit the one answer to `dialog` this execution may get, as the
-    /// log allows ([`Ledger`], `submit`'s idempotency): the line to log, if
-    /// any. Answered already: nothing, and once it still shows
-    /// [`STILL_SHOWS_MS`] after, one escalation.
+    /// log allows ([`Ledger`], `submit`'s idempotency, and optional
+    /// [`ScreenGuard`] CAS): the line to log, if any. Answered already:
+    /// nothing, and once it still shows [`STILL_SHOWS_MS`] after, one escalation.
     fn answer(
         &mut self,
         world: &dyn World,
         ledger: &mut Ledger,
         live: &Live,
-        dialog: &str,
-        keys: &[NamedKey],
+        plan: &AnswerPlan<'_>,
         now: i64,
     ) -> Result<Option<String>, String> {
+        if let Some(want) = plan.expected_guard
+            && !world.verify_guard(live, want)?
+        {
+            return Ok(None);
+        }
         let known: HashSet<i64> = ledger.answered.iter().map(|answered| answered.id).collect();
-        let key = |k: usize| format!("resolve:{}:{dialog}:1:{k}", live.execution);
-        let first = world.submit(live, &key(1), keys[0])?;
+        let key = |k: usize| format!("resolve:{}:{}:1:{k}", live.execution, plan.dialog);
+        let first = world.submit(live, &key(1), plan.named[0])?;
         if !known.contains(&first) {
-            for (at, named) in keys.iter().enumerate().skip(1) {
+            for (at, named) in plan.named.iter().enumerate().skip(1) {
                 world.submit(live, &key(at + 1), *named)?;
             }
             ledger.answered.insert(
@@ -520,10 +580,16 @@ impl Resolver {
                     created_at_ms: now,
                 },
             );
-            let pressed: Vec<&str> = keys.iter().map(|key| key.name()).collect();
+            let pressed: Vec<String> = plan
+                .keys
+                .as_slice()
+                .iter()
+                .map(KeyChord::to_herdr_spec)
+                .collect();
             return Ok(Some(format!(
-                "resolve: {} answered {dialog}: {}",
+                "resolve: {} answered {}: {}",
                 live.session,
+                plan.dialog,
                 pressed.join(" ")
             )));
         }
@@ -535,14 +601,15 @@ impl Resolver {
             return Ok(None);
         }
         let message = format!(
-            "resolve: {} escalated {dialog}: it still shows after its answer ({} s); it is \
+            "resolve: {} escalated {}: it still shows after its answer ({} s); it is \
              never answered automatically again",
             live.session,
+            plan.dialog,
             age / 1000
         );
         Ok(self
             .said
-            .insert(format!("{}:{dialog}:shows", live.execution))
+            .insert(format!("{}:{}:shows", live.execution, plan.dialog))
             .then_some(message))
     }
 }
@@ -573,10 +640,22 @@ pub(crate) fn auto_for(mode: Mode, ledger: &Ledger, session: &str, now_ms: i64) 
     })
 }
 
-/// The loop's world: its store and its terminal host.
+/// The loop's world: its store and its terminal host (backed by global Herdr
+/// snapshots & guard verification when available).
 pub(crate) struct Fleet<'a> {
     pub(crate) store: &'a spawn_postgres::PostgresStore,
     pub(crate) host: &'a spawn_host::LocalTerminalHost,
+}
+
+impl Fleet<'_> {
+    fn resolve_herdr(live: &Live) -> Result<Option<(HerdrGlobalClient, String)>, String> {
+        let execution = ExecutionId::new(&live.execution).map_err(|error| error.to_string())?;
+        let terminal = TerminalName::for_execution(&execution);
+        let scope = SocketScope::resolve(None, &crate::config::herdr_discovery_env())
+            .map_err(|error| error.to_string())?;
+        HerdrGlobalClient::resolve_spawn_terminal(&scope, terminal.as_str())
+            .map_err(|error| error.to_string())
+    }
 }
 
 impl World for Fleet<'_> {
@@ -630,11 +709,58 @@ impl World for Fleet<'_> {
         Ok(out)
     }
 
-    fn capture(&self, live: &Live) -> Result<String, String> {
-        let execution =
-            spawn_core::id::ExecutionId::new(&live.execution).map_err(|error| error.to_string())?;
+    fn capture_snapshot(&self, live: &Live) -> Result<TuiSnapshot, String> {
+        if let Some((client, addr)) = Self::resolve_herdr(live)? {
+            return client.snapshot(&addr).map_err(|error| error.to_string());
+        }
+        let execution = ExecutionId::new(&live.execution).map_err(|error| error.to_string())?;
         let session = SessionId::new(&live.session).map_err(|error| error.to_string())?;
-        crate::serve::approvals::capture(self.host, self.store, &session, &execution, &live.agent)
+        let raw_text = crate::serve::approvals::capture(
+            self.host,
+            self.store,
+            &session,
+            &execution,
+            &live.agent,
+        )?;
+        let terminal = TerminalName::for_execution(&execution);
+        let reading = workspace_of(&live.agent)
+            .ok()
+            .and_then(|ws| self.host.agent(&terminal, &ws).ok().flatten());
+        Ok(TuiSnapshot::from_plain_text(RawPlainSnapshot {
+            address: terminal.as_str(),
+            cols: 0,
+            rows: 0,
+            live_state: TerminalLiveState::Live { pid: None },
+            how: "screen",
+            complete: true,
+            why: None,
+            title: None,
+            raw_text: &raw_text,
+            agent: reading.as_ref().and_then(|r| r.agent.as_deref()),
+            agent_status: reading.as_ref().map_or(AgentStatus::Unknown, |r| r.status),
+            rule: reading.as_ref().and_then(|r| r.rule.as_deref()),
+            blocker_visible: reading.as_ref().is_some_and(|r| r.blocker_visible),
+        }))
+    }
+
+    fn verify_guard(&self, live: &Live, expected_guard: ScreenGuard) -> Result<bool, String> {
+        let Some((client, addr)) = Self::resolve_herdr(live)? else {
+            return Ok(false);
+        };
+        match client.verify_guard(&addr, expected_guard) {
+            Ok(()) => Ok(true),
+            Err(err)
+                if matches!(
+                    err.kind,
+                    GlobalErrorKind::GuardMismatch
+                        | GlobalErrorKind::UnobservableSelection
+                        | GlobalErrorKind::NotFound
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err.to_string()),
+        }
     }
 
     fn pause(&self) {
@@ -643,16 +769,6 @@ impl World for Fleet<'_> {
 
     fn workspace(&self, live: &Live) -> Result<WorkspaceId, String> {
         workspace_of(&live.agent)
-    }
-
-    fn reading(&self, live: &Live) -> Option<AgentReading> {
-        use spawn_core::port::TerminalHost;
-        let execution = spawn_core::id::ExecutionId::new(&live.execution).ok()?;
-        let terminal = spawn_core::id::TerminalName::for_execution(&execution);
-        self.host
-            .agent(&terminal, &workspace_of(&live.agent).ok()?)
-            .ok()
-            .flatten()
     }
 
     fn submit(&self, live: &Live, key: &str, named: NamedKey) -> Result<i64, String> {
@@ -674,13 +790,49 @@ impl World for Fleet<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Decision, Ledger, Live, Mode, PRINCIPAL, Resolver, STILL_SHOWS_MS, World, auto_for, decide,
+        Decision, Ledger, Live, Mode, PRINCIPAL, Resolver, STILL_SHOWS_MS, World, auto_for,
+        decide_snapshots,
     };
     use serde_json::json;
     use spawn_core::command::NamedKey;
     use spawn_core::id::WorkspaceId;
     use spawn_core::port::{AgentReading, AgentStatus};
+    use spawn_core::tui::{
+        KeyChord, KeyChordSequence, RawPlainSnapshot, RawStyledSnapshot, SnapshotObservation,
+        TerminalLiveState, TuiSnapshot,
+    };
     use std::cell::{Cell, RefCell};
+
+    fn plain_snapshot(pane: &str, reading: Option<&AgentReading>) -> TuiSnapshot {
+        TuiSnapshot::from_plain_text(RawPlainSnapshot {
+            address: "t1",
+            cols: 120,
+            rows: 40,
+            live_state: TerminalLiveState::Live { pid: Some(101) },
+            how: "screen",
+            complete: true,
+            why: None,
+            title: None,
+            raw_text: pane,
+            agent: reading.and_then(|r| r.agent.as_deref()),
+            agent_status: reading.map_or(AgentStatus::Unknown, |r| r.status),
+            rule: reading.and_then(|r| r.rule.as_deref()),
+            blocker_visible: reading.is_some_and(|r| r.blocker_visible),
+        })
+    }
+
+    fn decide(
+        session: &str,
+        engine: &str,
+        workspace: &WorkspaceId,
+        first: &str,
+        second: &str,
+        reading: Option<&AgentReading>,
+    ) -> Decision {
+        let first_snap = plain_snapshot(first, reading);
+        let second_snap = plain_snapshot(second, reading);
+        decide_snapshots(session, engine, workspace, &first_snap, &second_snap)
+    }
 
     /// Thirty seconds: once a second answer was allowed from then (Rev 0);
     /// never now.
@@ -728,12 +880,14 @@ mod tests {
         }
     }
 
-    /// A world in memory: one agy pane and Herdr's reading of it, a clock,
-    /// a command table with `submit`'s idempotency, and every read counted.
+    /// A world in memory: one agy pane (or structured [`TuiSnapshot`]) and Herdr's
+    /// reading of it, a clock, a command table with `submit`'s idempotency, and every read counted.
     struct Fake {
         now: Cell<i64>,
         lives: Vec<Live>,
         pane: RefCell<String>,
+        styled_sequence: RefCell<Vec<TuiSnapshot>>,
+        guard_ok: Cell<bool>,
         reading: Option<AgentReading>,
         commands: RefCell<Vec<(String, String, i64, i64)>>,
         reads: Cell<usize>,
@@ -745,6 +899,8 @@ mod tests {
                 now: Cell::new(1_000_000),
                 lives,
                 pane: RefCell::new(pane.to_string()),
+                styled_sequence: RefCell::new(Vec::new()),
+                guard_ok: Cell::new(true),
                 reading: Some(blocked("trust_prompt")),
                 commands: RefCell::new(Vec::new()),
                 reads: Cell::new(0),
@@ -786,16 +942,24 @@ mod tests {
             self.read();
             Ok(self.lives.clone())
         }
-        fn capture(&self, _live: &Live) -> Result<String, String> {
+        fn capture_snapshot(&self, _live: &Live) -> Result<TuiSnapshot, String> {
             self.read();
-            Ok(self.pane.borrow().clone())
+            let mut seq = self.styled_sequence.borrow_mut();
+            if !seq.is_empty() {
+                return Ok(seq.remove(0));
+            }
+            Ok(plain_snapshot(&self.pane.borrow(), self.reading.as_ref()))
+        }
+        fn verify_guard(
+            &self,
+            _live: &Live,
+            _expected_guard: spawn_core::tui::ScreenGuard,
+        ) -> Result<bool, String> {
+            Ok(self.guard_ok.get())
         }
         fn pause(&self) {}
         fn workspace(&self, _live: &Live) -> Result<WorkspaceId, String> {
             Ok(workspace())
-        }
-        fn reading(&self, _live: &Live) -> Option<AgentReading> {
-            self.reading.clone()
         }
         fn submit(&self, live: &Live, key: &str, _named: NamedKey) -> Result<i64, String> {
             let mut commands = self.commands.borrow_mut();
@@ -1000,7 +1164,8 @@ mod tests {
         let reading = blocked("trust_prompt");
         assert!(matches!(
             decide("s", "agy", &workspace(), TRUST, TRUST, Some(&reading)),
-            Decision::Answer { keys, .. } if keys == vec![NamedKey::Enter]
+            Decision::Answer { keys, expected_guard: None, .. }
+                if keys == KeyChordSequence::single(KeyChord::from(NamedKey::Enter))
         ));
         let elsewhere = WorkspaceId::new("agent_b:/tmp/ws/agent_b").expect("workspace");
         assert!(matches!(
@@ -1049,5 +1214,89 @@ mod tests {
             auto_for(Mode::All, &ledger, "session_b", 1_000_000),
             json!({"state": "all", "answered": 0, "breaker": "closed"})
         );
+    }
+
+    fn styled_trust_snapshot(select_yes: bool) -> TuiSnapshot {
+        let raw_vt = if select_yes {
+            "\x1b[H\x1b[2JAccessing workspace:\r\n\r\n/tmp/ws/agent_a\r\n\r\n\
+             Do you trust the contents of this project?\r\n\r\n\
+             Antigravity CLI requires permission to read, edit, and execute files here.\r\n\r\n\
+             \x1b[0;7m> Yes, I trust this folder\x1b[0m\r\n  No, exit\r\n\r\n  \
+             ↑/↓ Navigate · enter Confirm\r\n\x1b[9;3H\x1b[?9001l"
+        } else {
+            "\x1b[H\x1b[2JAccessing workspace:\r\n\r\n/tmp/ws/agent_a\r\n\r\n\
+             Do you trust the contents of this project?\r\n\r\n\
+             Antigravity CLI requires permission to read, edit, and execute files here.\r\n\r\n\
+             > Yes, I trust this folder\r\n\x1b[0;7m  No, exit\x1b[0m\r\n\r\n  \
+             ↑/↓ Navigate · enter Confirm\r\n\x1b[10;3H\x1b[?9001l"
+        };
+        TuiSnapshot::from_styled_vt(
+            RawStyledSnapshot {
+                address: "t1",
+                cols: 120,
+                rows: 40,
+                live_state: TerminalLiveState::Live { pid: Some(101) },
+                title: None,
+                raw_vt,
+            },
+            SnapshotObservation {
+                agent: Some("agy".to_string()),
+                agent_status: AgentStatus::Blocked,
+                rule: Some("trust_prompt".to_string()),
+                blocker_visible: true,
+            },
+        )
+    }
+
+    #[test]
+    fn decide_snapshots_rejects_guard_drift_and_fidelity_downgrade() {
+        let snap_yes = styled_trust_snapshot(true);
+        let snap_no_hl = styled_trust_snapshot(false);
+        assert_eq!(snap_yes.plain_lines(), snap_no_hl.plain_lines());
+        assert_ne!(snap_yes.guard(), snap_no_hl.guard());
+
+        assert_eq!(
+            decide_snapshots("s", "agy", &workspace(), &snap_yes, &snap_no_hl),
+            Decision::Nothing("screen guard changed between reads")
+        );
+
+        let plain = plain_snapshot(TRUST, Some(&blocked("trust_prompt")));
+        assert_eq!(
+            decide_snapshots("s", "agy", &workspace(), &snap_yes, &plain),
+            Decision::Nothing("snapshot fidelity changed between reads")
+        );
+
+        let decided = decide_snapshots("s", "agy", &workspace(), &snap_yes, &snap_yes);
+        assert!(matches!(
+            decided,
+            Decision::Answer {
+                keys,
+                expected_guard: Some(guard),
+                ..
+            } if keys == KeyChordSequence::single(KeyChord::from(NamedKey::Enter))
+                && guard == snap_yes.guard()
+        ));
+    }
+
+    #[test]
+    fn resolver_enforces_pre_submit_screen_guard_cas() {
+        let snap = styled_trust_snapshot(true);
+
+        let aborted = Fake::new(vec![live("session_a", false)], TRUST);
+        *aborted.styled_sequence.borrow_mut() = vec![snap.clone(), snap.clone()];
+        aborted.guard_ok.set(false);
+        let lines = Resolver::new(Mode::All).step(&aborted).expect("step");
+        assert!(lines.is_empty(), "{lines:?}");
+        assert!(
+            aborted.keys().is_empty(),
+            "stale/unobservable pre-submit guard must abort submit"
+        );
+
+        let passed = Fake::new(vec![live("session_a", false)], TRUST);
+        *passed.styled_sequence.borrow_mut() = vec![snap.clone(), snap];
+        passed.guard_ok.set(true);
+        let lines = Resolver::new(Mode::All).step(&passed).expect("step");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(passed.keys().len(), 1);
     }
 }

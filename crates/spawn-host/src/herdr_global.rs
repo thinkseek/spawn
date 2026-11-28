@@ -22,9 +22,9 @@ use spawn_core::agent_events::{
 use spawn_core::port::{AgentReading, AgentStatus, TerminalError};
 use spawn_core::tui::{
     DiscoveredTerminal, ExitCause, InterruptOutcome, InterruptReport, KeyChord, RawPlainSnapshot,
-    RawStyledSnapshot, ScreenGuard, SnapshotObservation, TerminalAddress, TerminalLiveState,
-    TerminalOrigin, TuiAction, TuiActionOutcome, TuiSnapshot, WaitOutcome, WaitReason,
-    is_reserved_spawn_label,
+    RawStyledSnapshot, SPAWN_TERMINAL_LABEL, ScreenGuard, SnapshotObservation, TerminalAddress,
+    TerminalLiveState, TerminalOrigin, TuiAction, TuiActionOutcome, TuiSnapshot, WaitOutcome,
+    WaitReason, is_reserved_spawn_label,
 };
 
 use crate::herdr_witness::{OscStatus, ProcSnapshot, inspect_process_tree_in, observe_in};
@@ -353,6 +353,96 @@ impl HerdrGlobalClient {
                 }
             }
         }
+    }
+
+    /// Resolves a live terminal matching `labels[spawn_terminal] == terminal` across
+    /// `scope` without filtering by `spawn_owner`.
+    ///
+    /// Returns `Ok(None)` if no live terminal matches, or fails closed with
+    /// [`GlobalErrorKind::AmbiguousAddress`] if more than one live terminal matches.
+    pub fn resolve_spawn_terminal(
+        scope: &SocketScope,
+        terminal: &str,
+    ) -> Result<Option<(Self, String)>, GlobalHerdrError> {
+        if terminal.is_empty()
+            || terminal
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace())
+        {
+            return Err(GlobalHerdrError::new(
+                GlobalErrorKind::InvalidParams,
+                format!("invalid spawn terminal name {terminal:?}"),
+            ));
+        }
+        let mut matches = Vec::new();
+        match scope {
+            SocketScope::Explicit(sock) => {
+                let client = Self::at_socket(sock);
+                for addr in client
+                    .find_spawn_terminal_raw(terminal)
+                    .map_err(|err| err.into_error("terminal.list"))?
+                {
+                    matches.push((client.clone(), addr));
+                }
+            }
+            SocketScope::Discovered(socks) => {
+                for sock in socks {
+                    let client = Self::at_socket(sock);
+                    match client.find_spawn_terminal_raw(terminal) {
+                        Ok(addrs) => {
+                            for addr in addrs {
+                                matches.push((client.clone(), addr));
+                            }
+                        }
+                        Err(RpcFailure::ConnectUnreachable(_)) => {}
+                        Err(err) => return Err(err.into_error("terminal.list")),
+                    }
+                }
+            }
+        }
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(matches.into_iter().next().expect("checked length 1"))),
+            _ => Err(GlobalHerdrError::new(
+                GlobalErrorKind::AmbiguousAddress,
+                format!(
+                    "ambiguous_address: spawn terminal {terminal:?} matched {} live herdr-core terminals",
+                    matches.len()
+                ),
+            )),
+        }
+    }
+
+    fn find_spawn_terminal_raw(&self, terminal: &str) -> Result<Vec<String>, RpcFailure> {
+        let listed = self.call_rpc_raw("terminal.list", &json!({ "all": false }), CALL_LIMIT)?;
+        let Some(items) = listed["terminals"].as_array() else {
+            return Err(RpcFailure::Other(GlobalHerdrError::new(
+                GlobalErrorKind::Internal,
+                format!("terminal.list missing terminals array: {listed}"),
+            )));
+        };
+        let mut addrs = Vec::new();
+        for item in items {
+            let state = parse_live_state(item).map_err(RpcFailure::Other)?;
+            if !matches!(state, TerminalLiveState::Live { .. }) {
+                continue;
+            }
+            let labels = parse_labels(&item["labels"]);
+            if labels.get(SPAWN_TERMINAL_LABEL).map(String::as_str) != Some(terminal) {
+                continue;
+            }
+            let Some(address) = item["address"].as_str().filter(|s| !s.is_empty()) else {
+                return Err(RpcFailure::Other(GlobalHerdrError::new(
+                    GlobalErrorKind::Internal,
+                    format!("terminal.list item missing non-empty address: {item}"),
+                )));
+            };
+            TerminalAddress::parse(address).map_err(|msg| {
+                RpcFailure::Other(GlobalHerdrError::new(GlobalErrorKind::Internal, msg))
+            })?;
+            addrs.push(address.to_string());
+        }
+        Ok(addrs)
     }
 
     /// Discovers every terminal visible on this `herdr-core` (and federated peers)
@@ -809,6 +899,21 @@ impl HerdrGlobalClient {
             CALL_LIMIT,
         )?;
         Ok(parse_labels(&result["labels"]))
+    }
+
+    /// Verifies an optimistic pre-flight [`ScreenGuard`] against a live styled VT snapshot.
+    ///
+    /// Returns [`GlobalErrorKind::UnobservableSelection`] on plain-text-only fidelity and
+    /// [`GlobalErrorKind::GuardMismatch`] when the live screen digest no longer equals
+    /// `expected_guard`.
+    pub fn verify_guard(
+        &self,
+        address: &str,
+        expected_guard: ScreenGuard,
+    ) -> Result<(), GlobalHerdrError> {
+        TerminalAddress::parse(address)
+            .map_err(|msg| GlobalHerdrError::new(GlobalErrorKind::InvalidParams, msg))?;
+        self.verify_optimistic_guard(address, Some(expected_guard))
     }
 
     fn verify_optimistic_guard(
@@ -1591,7 +1696,7 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use spawn_core::tui::{KeyChordSequence, SendPolicy, SnapshotFidelity};
@@ -2828,5 +2933,249 @@ time.sleep(30)
             .expect("unknown cursor resync");
         assert!(reset.cursor_reset);
         assert!(reset.events.len() > report.events.len());
+    }
+
+    #[test]
+    fn resolve_spawn_terminal_finds_live_without_owner_and_rejects_ambiguous() {
+        let dir = temp_dir("shg-resolve-term");
+        let sock_a = dir.0.join("01-a.sock");
+        let sock_b = dir.0.join("02-b.sock");
+        let spawn_srv = |sock: &Path, payload: Value| {
+            let listener = UnixListener::bind(sock).expect("bind resolve mock");
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else {
+                        break;
+                    };
+                    let mut line = String::new();
+                    if std::io::BufReader::new(&stream)
+                        .read_line(&mut line)
+                        .is_err()
+                        || line.is_empty()
+                    {
+                        continue;
+                    }
+                    let req: Value = serde_json::from_str(&line).expect("valid rpc");
+                    if req["method"].as_str() == Some("__stop") {
+                        let _ =
+                            (&stream).write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+                        break;
+                    }
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": payload,
+                    });
+                    (&stream)
+                        .write_all(format!("{resp}\n").as_bytes())
+                        .expect("write rpc");
+                }
+            })
+        };
+
+        // Notice `t_no_owner` has `spawn_terminal` ONLY (no `spawn_owner`), and `t_dead`
+        // is exited with the same label — only the live terminal may match.
+        let list_a = json!({
+            "terminals": [
+                {
+                    "address": "t_dead",
+                    "labels": { "spawn_terminal": "spawn-exec_42" },
+                    "state": "finished",
+                    "exit_code": 0
+                },
+                {
+                    "address": "t_no_owner",
+                    "labels": { "spawn_terminal": "spawn-exec_42" },
+                    "state": "live",
+                    "pid": 501
+                }
+            ]
+        });
+        let list_b = json!({
+            "terminals": [
+                {
+                    "address": "t_dup",
+                    "labels": { "spawn_terminal": "spawn-exec_42" },
+                    "state": "live",
+                    "pid": 601
+                }
+            ]
+        });
+        let srv_a = spawn_srv(&sock_a, list_a);
+        let srv_b = spawn_srv(&sock_b, list_b);
+
+        let err_bad = HerdrGlobalClient::resolve_spawn_terminal(
+            &SocketScope::Explicit(sock_a.clone()),
+            "bad terminal",
+        )
+        .expect_err("whitespace in terminal name must fail closed");
+        assert_eq!(err_bad.kind, GlobalErrorKind::InvalidParams);
+
+        let missing = HerdrGlobalClient::resolve_spawn_terminal(
+            &SocketScope::Explicit(sock_a.clone()),
+            "spawn-missing",
+        )
+        .expect("missing succeeds with None");
+        assert!(missing.is_none());
+
+        let (resolved_client, resolved_addr) = HerdrGlobalClient::resolve_spawn_terminal(
+            &SocketScope::Explicit(sock_a.clone()),
+            "spawn-exec_42",
+        )
+        .expect("resolve live spawn_terminal without spawn_owner")
+        .expect("must find live match");
+        assert_eq!(resolved_client.socket(), sock_a.as_path());
+        assert_eq!(resolved_addr, "t_no_owner");
+
+        let amb = HerdrGlobalClient::resolve_spawn_terminal(
+            &SocketScope::Discovered(vec![sock_a.clone(), sock_b.clone()]),
+            "spawn-exec_42",
+        )
+        .expect_err("duplicate spawn_terminal across sockets must fail closed");
+        assert_eq!(amb.kind, GlobalErrorKind::AmbiguousAddress);
+
+        let _ = HerdrGlobalClient::at_socket(&sock_a).call_rpc("__stop", &json!({}), CALL_LIMIT);
+        let _ = HerdrGlobalClient::at_socket(&sock_b).call_rpc("__stop", &json!({}), CALL_LIMIT);
+        srv_a.join().expect("srv_a");
+        srv_b.join().expect("srv_b");
+    }
+
+    fn reply_guard_mock_framed(
+        stream: &mut UnixStream,
+        req_id: &Value,
+        is_framed: bool,
+        alt: bool,
+    ) {
+        let resp = json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": { "generation": 1, "framed": is_framed },
+        });
+        stream
+            .write_all(format!("{resp}\n").as_bytes())
+            .expect("write hello");
+        if !is_framed {
+            return;
+        }
+        let _ = read_wire_frame_deadline(stream, Instant::now() + CALL_LIMIT);
+        let paint = if alt {
+            "\x1b[H\x1b[2J  1. Allow\r\n  \x1b[0;7m2. Deny\x1b[0m\r\n\x1b[2;3H\x1b[?9001l"
+        } else {
+            "\x1b[H\x1b[2J  \x1b[0;7m1. Allow\x1b[0m\r\n  2. Deny\r\n\x1b[1;3H\x1b[?9001l"
+        };
+        let attach_reply = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "channel": 1 }
+        }))
+        .expect("attach reply json");
+        for (channel, kind, payload) in [
+            (0, WIRE_DATA, attach_reply.as_slice()),
+            (1, WIRE_DATA, paint.as_bytes()),
+            (1, WIRE_CLOSE, &[][..]),
+        ] {
+            write_wire_frame_deadline(
+                stream,
+                channel,
+                kind,
+                payload,
+                Instant::now() + CALL_LIMIT,
+                "mock attach frame",
+            )
+            .expect("write attach frame");
+        }
+    }
+
+    fn spawn_guard_mock_server(
+        sock: &Path,
+        use_alt: Arc<AtomicBool>,
+        framed: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = UnixListener::bind(sock).expect("bind guard mock");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    break;
+                };
+                let mut line = String::new();
+                if std::io::BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .is_err()
+                    || line.is_empty()
+                {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(&line).expect("jsonrpc line");
+                let method = req["method"].as_str().unwrap_or_default();
+                if method == "__stop" {
+                    let _ = stream.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+                    break;
+                }
+                if method == "hello" {
+                    reply_guard_mock_framed(
+                        &mut stream,
+                        &req["id"],
+                        framed.load(Ordering::SeqCst),
+                        use_alt.load(Ordering::SeqCst),
+                    );
+                    continue;
+                }
+                let result = match method {
+                    "terminal.get" => json!({
+                        "address": req["params"]["terminal"],
+                        "labels": {},
+                        "state": "live",
+                        "pid": 77,
+                        "cols": 80,
+                        "rows": 24
+                    }),
+                    "terminal.read" => json!({
+                        "text": "  1. Allow\n  2. Deny\n",
+                        "complete": true,
+                        "how": "screen"
+                    }),
+                    other => panic!("unexpected rpc {other}"),
+                };
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "result": result,
+                });
+                stream
+                    .write_all(format!("{resp}\n").as_bytes())
+                    .expect("write rpc");
+            }
+        })
+    }
+
+    #[test]
+    fn verify_guard_accepts_styled_vt_match_and_rejects_plain_text_and_mismatch() {
+        let dir = temp_dir("shg-verify-guard");
+        let sock = dir.0.join("guard.sock");
+        let use_alt = Arc::new(AtomicBool::new(false));
+        let framed = Arc::new(AtomicBool::new(true));
+        let srv = spawn_guard_mock_server(&sock, Arc::clone(&use_alt), Arc::clone(&framed));
+
+        let client = HerdrGlobalClient::at_socket(&sock);
+        let snap1 = client.snapshot("t1").expect("styled snapshot");
+        assert!(snap1.selection_observable());
+        client
+            .verify_guard("t1", snap1.guard())
+            .expect("matching guard verifies");
+
+        use_alt.store(true, Ordering::SeqCst);
+        let mismatch = client
+            .verify_guard("t1", snap1.guard())
+            .expect_err("selection shift must trigger GuardMismatch");
+        assert_eq!(mismatch.kind, GlobalErrorKind::GuardMismatch);
+
+        framed.store(false, Ordering::SeqCst);
+        let unobs = client
+            .verify_guard("t1", snap1.guard())
+            .expect_err("plain-text degradation must fail closed");
+        assert_eq!(unobs.kind, GlobalErrorKind::UnobservableSelection);
+
+        let _ = client.call_rpc("__stop", &json!({}), CALL_LIMIT);
+        srv.join().expect("guard srv");
     }
 }
