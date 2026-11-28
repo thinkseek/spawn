@@ -2392,10 +2392,12 @@
         "crates/spawn-cli/src/serve/core_lines/quiet.rs",
         "crates/spawn-cli/src/serve/core_lines/trends.rs",
         "crates/spawn-cli/tests/cost_page.rs",
+        "crates/spawn-host/examples/always_on_control_plane_bench.rs",
         "crates/spawn-postgres/src/cost.rs",
         "crates/spawn-postgres/src/scorecard.rs",
         "crates/spawn-postgres/tests/cost.rs",
         "crates/spawn-postgres/tests/scorecard.rs",
+        "docs/always-on-benchmark.md",
         "docs/design.md",
         "rsi/backlog/017.json",
         "rsi/backlog/041.json",
@@ -2445,7 +2447,8 @@
         "rsi/scenarios/nightly/159.sh",
         "rsi/scenarios/nightly/168.sh",
         "rsi/scenarios/nightly/181.sh",
-        "rsi/scenarios/nightly/207.sh"
+        "rsi/scenarios/nightly/207.sh",
+        "scripts/bench-always-on.sh"
       ],
       "relations": [
         {
