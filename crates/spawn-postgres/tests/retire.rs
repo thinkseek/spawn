@@ -16,7 +16,7 @@
 
 use postgres::{Client, Transaction};
 use serde_json::{Value, json};
-use spawn_postgres::{PostgresStore, role_url};
+use spawn_postgres::{PostgresStore, role_url_with_passfile};
 
 mod common;
 use common::{admin, schema_url, store};
@@ -279,8 +279,11 @@ fn the_caller_is_the_logins_and_only_the_owner_and_supervisor_may_retire() {
     let mut client = admin(&schema);
     world(&mut client);
     let login = |role: &str| {
-        PostgresStore::connect(&role_url(&schema_url(&schema), role).expect("the login's URL"))
-            .expect("log in")
+        PostgresStore::connect_with_options(
+            &role_url_with_passfile(&schema_url(&schema), role, None).expect("the login's URL"),
+            &spawn_postgres::ConnectOptions::default(),
+        )
+        .expect("log in")
     };
     for role in ["spawn_reader", "spawn_human"] {
         let error = login(role)
@@ -377,8 +380,10 @@ fn a_retired_objective_is_on_the_board_and_closes_as_a_landing() {
         "oldest first, the first record of 6 wins"
     );
     assert_eq!(two, json!([]), "none");
-    let supervisor = PostgresStore::connect(
-        &role_url(&schema_url(&schema), "spawn_supervisor").expect("the login's URL"),
+    let supervisor = PostgresStore::connect_with_options(
+        &role_url_with_passfile(&schema_url(&schema), "spawn_supervisor", None)
+            .expect("the login's URL"),
+        &spawn_postgres::ConnectOptions::default(),
     )
     .expect("log in");
     assert_eq!(read(&supervisor), (one.clone(), two.clone()));

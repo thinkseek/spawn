@@ -14,7 +14,7 @@ use spawn_core::event::{EventKind, NewEvent, SessionSeq, Source};
 use spawn_core::id::{AgentId, SessionId};
 use spawn_core::observation::{Confidence, Observation, SemanticState};
 use spawn_core::port::EventLog;
-use spawn_postgres::{PostgresStore, role_url};
+use spawn_postgres::{PostgresStore, role_url_with_passfile};
 
 fn alert(client: &mut Client, key: &str) -> Value {
     client
@@ -518,8 +518,11 @@ fn only_the_owner_records_alerts() {
             "subject": "session_stuck", "evidence": {}, "text": "stuck", "notice": false,
         }))
         .expect("fire");
-    let login = role_url(&schema_url(&schema), "spawn_supervisor").expect("the login's URL");
-    let supervisor = PostgresStore::connect(&login).expect("log in");
+    let login = role_url_with_passfile(&schema_url(&schema), "spawn_supervisor", None)
+        .expect("the login's URL");
+    let supervisor =
+        PostgresStore::connect_with_options(&login, &spawn_postgres::ConnectOptions::default())
+            .expect("log in");
     let refused = supervisor
         .alert_record(&fired("memory_low:3", false))
         .expect_err("a restricted login records no alert");

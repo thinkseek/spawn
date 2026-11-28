@@ -388,10 +388,13 @@ fn an_idle_workers_next_task_stays_and_two_takers_have_one_winner() {
         .map(|to| {
             let url = url.clone();
             std::thread::spawn(move || {
-                PostgresStore::connect(&url)
-                    .expect("connect")
-                    .task_steal(second, to, "human", None)
-                    .is_ok()
+                PostgresStore::connect_with_options(
+                    &url,
+                    &spawn_postgres::ConnectOptions::default(),
+                )
+                .expect("connect")
+                .task_steal(second, to, "human", None)
+                .is_ok()
             })
         })
         .collect();

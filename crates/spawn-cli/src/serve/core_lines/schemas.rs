@@ -147,7 +147,7 @@ pub(super) fn update_seen(
 }
 
 /// How many of `server`'s `schemas` (`[{name, comment, held}]`, as
-/// `spawn_postgres::test_schemas` gives them) are leaked at `now_ms`: not
+/// `spawn_postgres::test_schemas_with_passfile` gives them) are leaked at `now_ms`: not
 /// held, their pid gone (`runs`), idle 24 h by their comment or else by
 /// their first sight in `seen`.
 pub(super) fn leaked(
@@ -496,7 +496,7 @@ mod tests {
             .batch_execute(&format!("set application_name to '{}'", names[0]))
             .expect("name the session");
 
-        let all = spawn_postgres::test_schemas(&url).expect("the read");
+        let all = spawn_postgres::test_schemas_with_passfile(&url, None).expect("the read");
         let mine: Vec<serde_json::Value> = all
             .as_array()
             .expect("an array")

@@ -7,7 +7,7 @@
 
 use postgres::Client;
 use serde_json::{Value, json};
-use spawn_postgres::{PostgresStore, role_url};
+use spawn_postgres::{PostgresStore, role_url_with_passfile};
 
 mod common;
 use common::{admin, schema_url, store};
@@ -159,8 +159,11 @@ fn only_the_owner_records_verifications() {
     mission(&mut client, 1);
     assigned(&mut client, 1, 1, 28, "Objective 28.");
     landed(&mut client, 1);
-    let login = role_url(&schema_url(&schema), "spawn_supervisor").expect("the login's URL");
-    let supervisor = PostgresStore::connect(&login).expect("log in");
+    let login = role_url_with_passfile(&schema_url(&schema), "spawn_supervisor", None)
+        .expect("the login's URL");
+    let supervisor =
+        PostgresStore::connect_with_options(&login, &spawn_postgres::ConnectOptions::default())
+            .expect("log in");
     let refused = supervisor
         .verification_record(&verification(1, 28, "pass"))
         .expect_err("a restricted login records no verification");

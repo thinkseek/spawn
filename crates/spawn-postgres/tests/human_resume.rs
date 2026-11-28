@@ -13,7 +13,7 @@ use postgres::Client;
 use postgres::error::SqlState;
 use serde_json::{Value, json};
 use spawn_core::id::IdempotencyKey;
-use spawn_postgres::{HumanResume, PostgresStore, role_url};
+use spawn_postgres::{HumanResume, PostgresStore, role_url_with_passfile};
 
 mod common;
 use common::{admin, schema_url, store};
@@ -159,8 +159,10 @@ fn the_page_resumes_exactly_the_halt_it_shows_once() {
     let (store, schema) = store("resume_human");
     let mut client = admin(&schema);
     let (mission, _) = gated_mission(&store);
-    let page = PostgresStore::connect(
-        &role_url(&schema_url(&schema), "spawn_human").expect("the human login's URL"),
+    let page = PostgresStore::connect_with_options(
+        &role_url_with_passfile(&schema_url(&schema), "spawn_human", None)
+            .expect("the human login's URL"),
+        &spawn_postgres::ConnectOptions::default(),
     )
     .expect("the human login connects");
 
@@ -247,7 +249,8 @@ fn the_page_resumes_exactly_the_halt_it_shows_once() {
     // call the page's.
     halt(&store, mission, "x", None);
     let mut raw = Client::connect(
-        &role_url(&schema_url(&schema), "spawn_human").expect("the login's URL"),
+        &role_url_with_passfile(&schema_url(&schema), "spawn_human", None)
+            .expect("the login's URL"),
         postgres::NoTls,
     )
     .expect("connects");

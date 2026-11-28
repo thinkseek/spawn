@@ -1472,9 +1472,14 @@ fn spawn_reader_reads_nodes_v1_with_build_sha_and_node_version_without_secrets()
     });
     assert_eq!(beat_once(&store, &n1, &b1, 1, &with_telemetry)["ok"], true);
 
-    let reader_url = spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader")
-        .expect("spawn_reader url");
-    let reader = PostgresStore::connect(&reader_url).expect("connect as spawn_reader");
+    let reader_url =
+        spawn_postgres::role_url_with_passfile(&common::schema_url(&schema), "spawn_reader", None)
+            .expect("spawn_reader url");
+    let reader = PostgresStore::connect_with_options(
+        &reader_url,
+        &spawn_postgres::ConnectOptions::default(),
+    )
+    .expect("connect as spawn_reader");
     let listed = reader.nodes_v1().expect("spawn_reader nodes_v1");
     let node = listed.iter().find(|n| n.name == "n252").expect("n252");
     assert_eq!(node.status, NodeStatus::Active);

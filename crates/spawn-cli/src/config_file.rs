@@ -66,7 +66,7 @@ const BARE_SYSTEM_DIRS: &[&str] = &[
 ];
 
 /// Closed source tag describing where an effective configuration value originated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigOrigin {
     /// Built-in default used when no higher-precedence source supplies a value.
@@ -98,7 +98,7 @@ impl ConfigOrigin {
 /// Secret string wrapper whose [`fmt::Debug`] always renders `[REDACTED]`,
 /// intentionally omits [`fmt::Display`] and [`serde::Serialize`] so secrets cannot be
 /// accidentally formatted or serialized in plaintext, and zeroizes bytes on drop.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct SecretString(String);
 
 impl SecretString {
@@ -182,15 +182,6 @@ impl SecretRef {
                 Ok(SecretString::new(trimmed))
             }
         }
-    }
-
-    /// Resolve the secret using a caller-supplied environment lookup function.
-    pub fn resolve_with(
-        &self,
-        env_lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<String, String> {
-        self.resolve_secret_with(env_lookup)
-            .map(SecretString::into_inner)
     }
 }
 
@@ -384,11 +375,13 @@ pub struct StorageD6Config {
     pub strict_fail_closed: Option<bool>,
 }
 
+pub use super::workspace_backend::WorkspaceBackend;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
-    #[serde(default = "default_workspace_backend")]
-    pub workspace_backend: Option<String>,
+    #[serde(default)]
+    pub workspace_backend: Option<WorkspaceBackend>,
     #[serde(default = "default_canonical_mount")]
     pub canonical_mount: Option<String>,
     #[serde(default = "default_true_opt")]
@@ -402,7 +395,7 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            workspace_backend: default_workspace_backend(),
+            workspace_backend: None,
             canonical_mount: default_canonical_mount(),
             cas_dedup: default_true_opt(),
             max_checkpoint_file_mb: None,
@@ -596,11 +589,6 @@ fn default_true_opt() -> Option<bool> {
 }
 
 #[allow(clippy::unnecessary_wraps)]
-fn default_workspace_backend() -> Option<String> {
-    Some("auto".to_string())
-}
-
-#[allow(clippy::unnecessary_wraps)]
 fn default_canonical_mount() -> Option<String> {
     Some("/workspace".to_string())
 }
@@ -778,16 +766,6 @@ impl SpawnConfig {
     }
 
     fn validate_storage(&self) -> Result<(), String> {
-        if let Some(backend) = &self.storage.workspace_backend
-            && !matches!(
-                backend.as_str(),
-                "auto" | "cow" | "git" | "overlay" | "d6" | "d6-shadow"
-            )
-        {
-            return Err(format!(
-                "[storage].workspace_backend = {backend:?} is invalid: expected \"auto\", \"cow\", \"git\", \"overlay\", \"d6\", or \"d6-shadow\""
-            ));
-        }
         if let Some(mount) = &self.storage.canonical_mount
             && !mount.is_empty()
             && mount != "off"
@@ -1019,13 +997,20 @@ impl SpawnConfig {
     pub fn field_origins(&self) -> BTreeMap<&'static str, ConfigOrigin> {
         let mut origins = BTreeMap::new();
         origins.insert("instance", ConfigOrigin::File);
-        origins.insert(
-            "database",
-            self.database
-                .as_ref()
-                .and_then(|db| db.url.as_ref().or(db.password.as_ref()))
-                .map_or(ConfigOrigin::Default, SecretRef::origin),
-        );
+        match &self.database {
+            Some(db) => {
+                origins.insert("database", ConfigOrigin::File);
+                if let Some(url) = &db.url {
+                    origins.insert("database.url", url.origin());
+                }
+                if let Some(password) = &db.password {
+                    origins.insert("database.password", password.origin());
+                }
+            }
+            None => {
+                origins.insert("database", ConfigOrigin::Default);
+            }
+        }
         origins.insert(
             "server.token",
             self.server
@@ -1033,7 +1018,14 @@ impl SpawnConfig {
                 .as_ref()
                 .map_or(ConfigOrigin::Default, SecretRef::origin),
         );
-        origins.insert("storage.workspace_backend", ConfigOrigin::File);
+        origins.insert(
+            "storage.workspace_backend",
+            if self.storage.workspace_backend.is_some() {
+                ConfigOrigin::File
+            } else {
+                ConfigOrigin::Default
+            },
+        );
         origins.insert(
             "storage.d6",
             if self.storage.d6.is_some() {
@@ -1335,8 +1327,9 @@ fn resolve_storage_env(cfg: &SpawnConfig, entries: &mut BTreeMap<String, String>
         "SPAWN_WORKSPACE_BACKEND".to_string(),
         cfg.storage
             .workspace_backend
-            .clone()
-            .unwrap_or_else(|| "auto".to_string()),
+            .unwrap_or(WorkspaceBackend::Auto)
+            .name()
+            .to_string(),
     );
     entries.insert(
         "SPAWN_CAS_DEDUP".to_string(),
@@ -1935,7 +1928,7 @@ fn collect_config_warnings(cfg: &SpawnConfig, warnings: &mut Vec<String>) {
             }
         }
     }
-    if cfg.storage.workspace_backend.as_deref() == Some("overlay") {
+    if cfg.storage.workspace_backend == Some(WorkspaceBackend::Overlay) {
         warnings.push(
             "storage.workspace_backend = \"overlay\" is experimental and refused by `spawn loop`"
                 .to_string(),
@@ -2059,6 +2052,7 @@ pub fn exec_with_config(
 
 struct ParsedCliFlags {
     config_path: Option<PathBuf>,
+    config_path_origin: Option<ConfigOrigin>,
     switches: BTreeSet<String>,
     values: BTreeMap<String, String>,
 }
@@ -2122,14 +2116,18 @@ fn parse_config_flag(
         return Err(format!("unknown flag --{name}"));
     }
 
-    let config_path = values
-        .get("config")
-        .cloned()
-        .or_else(|| global_config.map(str::to_string))
-        .or_else(|| std::env::var("SPAWN_CONFIG").ok().filter(|v| !v.is_empty()))
-        .map(PathBuf::from);
+    let (config_path, config_path_origin) = if let Some(val) = values.get("config").cloned() {
+        (Some(PathBuf::from(val)), Some(ConfigOrigin::Flag))
+    } else if let Some(val) = global_config {
+        (Some(PathBuf::from(val)), Some(ConfigOrigin::Flag))
+    } else if let Some(val) = std::env::var("SPAWN_CONFIG").ok().filter(|v| !v.is_empty()) {
+        (Some(PathBuf::from(val)), Some(ConfigOrigin::Env))
+    } else {
+        (None, None)
+    };
     Ok(ParsedCliFlags {
         config_path,
+        config_path_origin,
         switches,
         values,
     })
@@ -2662,26 +2660,49 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
     let parsed = parse_config_flag(rest, global_config, &["json"], &["root"])?;
     let json_mode = parsed.switches.contains("json");
     let config_path = parsed.config_path;
+    let config_path_origin = parsed.config_path_origin;
 
     let loaded_config = if let Some(path) = &config_path {
-        Some((path.clone(), SpawnConfig::from_file(path)?))
+        Some(SpawnConfig::from_file(path)?)
     } else {
         None
     };
 
-    let toolchain_paths: Vec<String> = loaded_config
-        .as_ref()
-        .and_then(|(_, cfg)| cfg.terminal.toolchain_paths.clone())
-        .unwrap_or_default();
-
     let explicit_root = parsed.values.get("root").map(PathBuf::from);
-    let data_dir = loaded_config
-        .as_ref()
-        .map(|(_, cfg)| cfg.instance.data_dir.clone());
-    let workspaces_or_root = resolve_doctor_probe_root(
+    let (workspaces_or_root, probe_root_origin) =
+        resolve_doctor_probe_root(explicit_root.as_deref(), loaded_config.as_ref());
+
+    let report = build_doctor_report(
+        config_path.as_deref(),
+        config_path_origin,
+        &workspaces_or_root,
+        probe_root_origin,
         explicit_root.as_deref(),
-        loaded_config.as_ref().map(|(_, cfg)| cfg),
+        loaded_config.as_ref(),
     );
+
+    if json_mode {
+        let rendered = serde_json::to_string_pretty(&report)
+            .map_err(|error| format!("serialize doctor report: {error}"))?;
+        println!("{rendered}");
+    } else {
+        print_doctor_human(&report);
+    }
+    Ok(0)
+}
+
+fn build_doctor_report(
+    config_path: Option<&Path>,
+    config_path_origin: Option<ConfigOrigin>,
+    probe_root: &Path,
+    probe_root_origin: ConfigOrigin,
+    explicit_root: Option<&Path>,
+    loaded_config: Option<&SpawnConfig>,
+) -> Value {
+    let toolchain_paths: Vec<String> = loaded_config
+        .and_then(|cfg| cfg.terminal.toolchain_paths.clone())
+        .unwrap_or_default();
+    let data_dir = loaded_config.map(|cfg| cfg.instance.data_dir.as_path());
 
     let kernel = probe_kernel();
     let git = probe_git(&toolchain_paths);
@@ -2694,38 +2715,33 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
     let archive_mask_tool = probe_archive_mask_tool();
 
     let root_fs = df_filesystem_info(Path::new("/")).ok();
-    let data_fs_target = explicit_root
-        .as_deref()
-        .or(data_dir.as_deref())
-        .unwrap_or_else(|| Path::new("/"));
+    let data_fs_target = explicit_root.or(data_dir).unwrap_or_else(|| Path::new("/"));
     let data_fs = df_filesystem_info(data_fs_target).ok();
     let other_mounts = other_persistent_mounts();
 
     let mut warnings = collect_doctor_target_warnings(
-        loaded_config.as_ref().map(|(_, cfg)| cfg),
+        loaded_config,
         data_fs.as_ref(),
         data_fs_target,
         &other_mounts,
     );
 
-    let storage_probes = probe_storage(&workspaces_or_root);
-    let (shared_build_caches, shared_cache_warnings) = probe_shared_build_caches(
-        explicit_root.as_deref(),
-        loaded_config.as_ref().map(|(_, cfg)| cfg),
-    );
+    let storage_probes = probe_storage(probe_root);
+    let (shared_build_caches, shared_cache_warnings) =
+        probe_shared_build_caches(explicit_root, loaded_config);
     warnings.extend(shared_cache_warnings);
     let (model_endpoints, model_warnings) = probe_model_endpoints();
     warnings.extend(model_warnings);
-    let (claude_config, claude_config_warnings) = probe_claude_config_with(
-        &|name| std::env::var(name).ok(),
-        loaded_config.as_ref().map(|(_, cfg)| cfg),
-    );
+    let (claude_config, claude_config_warnings) =
+        probe_claude_config_with(&|name| std::env::var(name).ok(), loaded_config);
     warnings.extend(claude_config_warnings);
 
-    let report = json!({
+    json!({
         "ok": git["ok"].as_bool().unwrap_or(false) && kernel["ok"].as_bool().unwrap_or(false),
         "config_path": config_path,
-        "probe_root": workspaces_or_root,
+        "config_path_origin": config_path_origin.map(ConfigOrigin::as_str),
+        "probe_root": probe_root,
+        "probe_root_origin": probe_root_origin.as_str(),
         "kernel": kernel,
         "tools": {
             "git": git,
@@ -2751,16 +2767,7 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
         "model_endpoints": model_endpoints,
         "claude_config": claude_config,
         "warnings": warnings,
-    });
-
-    if json_mode {
-        let rendered = serde_json::to_string_pretty(&report)
-            .map_err(|error| format!("serialize doctor report: {error}"))?;
-        println!("{rendered}");
-    } else {
-        print_doctor_human(&report);
-    }
-    Ok(0)
+    })
 }
 
 fn collect_doctor_target_warnings(
@@ -2834,23 +2841,32 @@ fn probe_archive_mask_tool() -> Value {
     })
 }
 
-fn resolve_doctor_probe_root(explicit_root: Option<&Path>, cfg: Option<&SpawnConfig>) -> PathBuf {
+fn resolve_doctor_probe_root(
+    explicit_root: Option<&Path>,
+    cfg: Option<&SpawnConfig>,
+) -> (PathBuf, ConfigOrigin) {
     if let Some(root) = explicit_root {
-        return nearest_existing_ancestor(root);
+        return (nearest_existing_ancestor(root), ConfigOrigin::Flag);
     }
     if let Some(cfg) = cfg {
         let ws = cfg.derived_paths().workspaces;
         if ws.is_dir() {
-            return ws;
+            return (ws, ConfigOrigin::File);
         }
-        return nearest_existing_ancestor(&cfg.instance.data_dir);
+        return (
+            nearest_existing_ancestor(&cfg.instance.data_dir),
+            ConfigOrigin::File,
+        );
     }
     if let Ok(ws_env) = std::env::var("SPAWN_WORKSPACE_ROOT")
         && !ws_env.is_empty()
     {
-        return nearest_existing_ancestor(Path::new(&ws_env));
+        return (
+            nearest_existing_ancestor(Path::new(&ws_env)),
+            ConfigOrigin::Env,
+        );
     }
-    std::env::temp_dir()
+    (std::env::temp_dir(), ConfigOrigin::Default)
 }
 
 fn find_tool(name: &str, toolchain_paths: &[String]) -> PathBuf {

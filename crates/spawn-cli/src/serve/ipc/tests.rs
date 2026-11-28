@@ -520,7 +520,8 @@ fn role_conn_pool_reuses_warm_conns_bounds_queue_and_evicts_broken() {
     let _owner_store = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
     let sep = if base_url.contains('?') { '&' } else { '?' };
     let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
-    let reader_url = spawn_postgres::role_url(&owner_in_schema, "spawn_reader").unwrap();
+    let reader_url =
+        spawn_postgres::role_url_with_passfile(&owner_in_schema, "spawn_reader", None).unwrap();
 
     // Observer client inspects backend PIDs and terminates idle connections.
     let mut observer = postgres::Client::connect(&base_url, postgres::NoTls).unwrap();
@@ -681,7 +682,9 @@ fn with_write_never_replays_failed_write_and_recovers_stale_idle_before_dispatch
     let _owner = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
     let sep = if base_url.contains('?') { '&' } else { '?' };
     let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
-    let node_url = spawn_postgres::role_url(&owner_in_schema, "spawn_node_gateway").unwrap();
+    let node_url =
+        spawn_postgres::role_url_with_passfile(&owner_in_schema, "spawn_node_gateway", None)
+            .unwrap();
     let mut observer = postgres::Client::connect(&base_url, postgres::NoTls).unwrap();
 
     let pool = super::RoleConnPool::new(
@@ -756,7 +759,8 @@ fn pool_slot_drop_evicts_on_panic_and_unmarked_dead_backend_without_leaking_slot
     let _owner = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
     let sep = if base_url.contains('?') { '&' } else { '?' };
     let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
-    let reader_url = spawn_postgres::role_url(&owner_in_schema, "spawn_reader").unwrap();
+    let reader_url =
+        spawn_postgres::role_url_with_passfile(&owner_in_schema, "spawn_reader", None).unwrap();
     let mut observer = postgres::Client::connect(&base_url, postgres::NoTls).unwrap();
 
     let pool = super::RoleConnPool::new(
@@ -807,7 +811,8 @@ fn broken_slot_eviction_closes_socket_before_waking_waiter() {
     let _owner = PostgresStore::connect_in_schema(&base_url, &schema).unwrap();
     let sep = if base_url.contains('?') { '&' } else { '?' };
     let owner_in_schema = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
-    let reader_url = spawn_postgres::role_url(&owner_in_schema, "spawn_reader").unwrap();
+    let reader_url =
+        spawn_postgres::role_url_with_passfile(&owner_in_schema, "spawn_reader", None).unwrap();
 
     let pool = super::RoleConnPool::new(
         "reads",

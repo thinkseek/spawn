@@ -279,7 +279,8 @@ fn the_size_reading_names_the_database_its_log_and_its_schemas() {
     assert_eq!(log_after, want_log);
 
     // The test database's reading: the same server, through its URL.
-    let test = spawn_postgres::test_database_size(&common::url()).expect("read");
+    let test =
+        spawn_postgres::test_database_size_with_passfile(&common::url(), None).expect("read");
     assert_eq!(test["name"], json!(name));
     assert!(test["bytes"].as_i64().expect("bytes") > 0);
     assert!(test["schemas"].as_i64().expect("schemas") >= 1, "{test}");
@@ -288,11 +289,14 @@ fn the_size_reading_names_the_database_its_log_and_its_schemas() {
         "a test database has no log of its own"
     );
     // A server that is not there: an error, without the URL.
-    let error =
-        spawn_postgres::test_database_size("postgres://spawn:secret-074@127.0.0.1:1/nothing")
-            .expect_err("nothing listens on port 1");
+    let error = spawn_postgres::test_database_size_with_passfile(
+        "postgres://spawn:secret-074@127.0.0.1:1/nothing",
+        None,
+    )
+    .expect_err("nothing listens on port 1");
     assert!(!error.to_string().contains("secret-074"), "{error}");
-    let error = spawn_postgres::test_database_size("not a url secret-074").expect_err("no URL");
+    let error = spawn_postgres::test_database_size_with_passfile("not a url secret-074", None)
+        .expect_err("no URL");
     assert!(!error.to_string().contains("secret-074"), "{error}");
 }
 

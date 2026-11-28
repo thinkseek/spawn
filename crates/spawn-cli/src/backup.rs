@@ -119,7 +119,7 @@ use spawn_postgres::PostgresStore;
 
 use crate::Flags;
 use crate::config::{
-    CREDENTIAL_EXIT_CODE, database_url, env_or, env_value, open_store, workspace_root,
+    CREDENTIAL_EXIT_CODE, database_url_secret, env_or, env_value, open_store, workspace_root,
 };
 
 mod recoverable;
@@ -426,8 +426,8 @@ pub(super) fn config_exit_code(reason: &str) -> i32 {
 /// Resolve the disposable restore-drill PostgreSQL URL, preferring Keep's
 /// `$CREDENTIALS_DIRECTORY/spawn.backup-drill-database-url` when present.
 fn drill_database_url() -> Result<Option<String>, String> {
-    if let Some(url) = crate::config::credential_value(CRED_DRILL_DB_URL)? {
-        return Ok(Some(url));
+    if let Some(url) = crate::config::credential_secret(CRED_DRILL_DB_URL)? {
+        return Ok(Some(url.into_inner()));
     }
     Ok(env_value("SPAWN_BACKUP_DRILL_DATABASE_URL"))
 }
@@ -1336,7 +1336,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
     };
     let _lock = Lock::acquire(&settings.root)?;
     let store = open_store()?;
-    let url = parse_pg_url(&database_url()?)?;
+    let url = parse_pg_url(database_url_secret()?.expose_secret())?;
     let now_ms = store.now_ms().map_err(|error| error.to_string())?;
     let now = Stamp::at(now_ms);
     let previous = dump_records(&store, &settings.prefix, now_ms)?;
@@ -4014,7 +4014,11 @@ mod tests {
             .batch_execute(&format!("create database \"{scratch_db}\""))
             .expect("create scratch db");
         let scratch_url = super::url_for_database(&base_url, &scratch_db).expect("scratch url");
-        let scoped = super::PostgresStore::connect(&scratch_url).expect("scoped connect");
+        let scoped = super::PostgresStore::connect_with_options(
+            &scratch_url,
+            &spawn_postgres::ConnectOptions::default(),
+        )
+        .expect("scoped connect");
         let setup = (|| -> Result<(), String> {
             scoped.migrate().map_err(|e| format!("migrate: {e}"))?;
             let agent = spawn_core::id::AgentId::new("agent_b").expect("agent");

@@ -1,6 +1,6 @@
 //! The gateway over a real ledger (PostgreSQL, `SPAWN_TEST_DATABASE_URL`, a
 //! schema per test), logged in as the schema's restricted
-//! `spawn_node_gateway` login (`spawn_postgres::role_url`), with the
+//! `spawn_node_gateway` login (`spawn_postgres::role_url_with_passfile`), with the
 //! fixtures' node and primary keys: enroll with the fixture token, beats,
 //! a signed grant, a streamed result and its `lease_fenced` twin (whose
 //! files are removed), spec, replay, verify-then-commit's rollback, a
@@ -30,7 +30,8 @@ use spawn_node_proto::result::ResultMeta;
 use spawn_node_proto::{Method, NodeSigner, Refusal, SigningKey};
 use spawn_postgres::testing::TestSchema;
 use spawn_postgres::{
-    NodeAction, PostgresStore, RemoteJobKind, RemoteJobProgress, RemoteJobSpec, RemoteJobState,
+    ConnectOptions, NodeAction, PostgresStore, RemoteJobKind, RemoteJobProgress, RemoteJobSpec,
+    RemoteJobState,
 };
 
 const JOB: &str = "gate-0123456789ab-k3x9q2ma";
@@ -47,11 +48,15 @@ fn schema_url(schema: &TestSchema) -> String {
 fn setup(case: &str) -> (TestSchema, PostgresStore, Harness) {
     let schema = TestSchema::new(case);
     let owner = schema.store();
-    let gateway_url = spawn_postgres::role_url(&schema_url(&schema), "spawn_node_gateway")
-        .expect("the login's URL");
+    let gateway_url =
+        spawn_postgres::role_url_with_passfile(&schema_url(&schema), "spawn_node_gateway", None)
+            .expect("the login's URL");
     let harness = Harness::start(
         case,
-        Arc::new(move || PostgresStore::connect(&gateway_url).map_err(|error| error.to_string())),
+        Arc::new(move || {
+            PostgresStore::connect_with_options(&gateway_url, &ConnectOptions::default())
+                .map_err(|error| error.to_string())
+        }),
     );
     (schema, owner, harness)
 }
@@ -652,7 +657,8 @@ fn thousand_concurrent_gateway_requests_stay_bounded_under_1c1g_pg() {
     let schema = TestSchema::new("gw_stress_1000");
     let owner = schema.store();
     let base_gw_url =
-        spawn_postgres::role_url(&schema_url(&schema), "spawn_node_gateway").expect("gateway url");
+        spawn_postgres::role_url_with_passfile(&schema_url(&schema), "spawn_node_gateway", None)
+            .expect("gateway url");
     let sep = if base_gw_url.contains('?') { '&' } else { '?' };
     let gateway_url = format!("{base_gw_url}{sep}application_name=spawn_gw_stress_1000");
 
@@ -661,7 +667,9 @@ fn thousand_concurrent_gateway_requests_stay_bounded_under_1c1g_pg() {
     let harness = Arc::new(Harness::start_with_workers(
         "gw_stress_1000",
         Arc::new(move || {
-            let store = PostgresStore::connect(&gateway_url).map_err(|e| e.to_string())?;
+            let store =
+                PostgresStore::connect_with_options(&gateway_url, &ConnectOptions::default())
+                    .map_err(|e| e.to_string())?;
             opened_counter.fetch_add(1, Ordering::AcqRel);
             Ok(store)
         }),

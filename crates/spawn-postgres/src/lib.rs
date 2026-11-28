@@ -10,7 +10,7 @@
 //! Connections either authenticate as the schema **owner** (for migrations,
 //! dispatcher/integrator mutations, alerts, backups, and D6/provenance ledger
 //! writes) or as one of four database-scoped least-privilege logins derived by
-//! [`role_url`]:
+//! [`role_url_with_passfile`]:
 //! - `spawn_supervisor`: decision/mission actions and supervised table reads.
 //! - `spawn_reader`: read-only queries (`spawn_read_*` functions and relation `SELECT`).
 //! - `spawn_human`: `SECURITY DEFINER` human-gateway entrypoints (`spawn_human_*`).
@@ -278,11 +278,12 @@ pub use gateway::{
 };
 pub use grading::RoutedTask;
 pub use host::{
-    DatabaseIdentity, LibpqDefaults, database_identity, database_identity_with_defaults,
-    test_database_size, test_database_size_with_passfile, test_schemas, test_schemas_with_passfile,
+    DatabaseIdentity, LibpqDefaults, database_identity_with_defaults,
+    test_database_size_with_passfile, test_schemas_with_passfile,
 };
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use nodes::StoreConnector;
+pub use passfile::resolve_passfile_path;
 pub use provenance::{
     ProvAttributionSource, ProvBlastRadiusNode, ProvBoundary, ProvChangeInput, ProvChangeKind,
     ProvChangeRecord, ProvDirection, ProvEdgeInput, ProvEdgeKind, ProvEdgeRecord, ProvEntryClass,
@@ -373,7 +374,7 @@ pub struct PostgresStore {
 /// act as the principals of their names, `spawn_human` (which may only call
 /// `spawn_human_input`) as `human`, and `spawn_node_gateway` (spawn-node
 /// v1's gateway, which may only call the four `spawn_node_gw_*` functions)
-/// as nobody. Their passwords derive from the owner's ([`role_url`]) and are
+/// as nobody. Their passwords derive from the owner's ([`role_url_with_passfile`]) and are
 /// set on every migration.
 const LOGINS: [&str; 4] = [
     "spawn_supervisor",
@@ -383,11 +384,6 @@ const LOGINS: [&str; 4] = [
 ];
 
 impl PostgresStore {
-    /// Connect to the database in the URL.
-    pub fn connect(url: &str) -> Result<Self, StoreError> {
-        Self::connect_with_options(url, &ConnectOptions::default())
-    }
-
     /// Connect to the database in `url` using explicit boundary [`ConnectOptions`].
     pub fn connect_with_options(url: &str, options: &ConnectOptions) -> Result<Self, StoreError> {
         let mut config =
@@ -403,22 +399,6 @@ impl PostgresStore {
                 .connect_timeout(std::time::Duration::from_secs(5));
         }
         Self::connect_config(config, url, options.passfile.clone())
-    }
-
-    /// [`Self::connect`] for a reader that must never wait on the server
-    /// for long (the dashboard): every statement of the session gives up
-    /// after `timeout` (`statement_timeout`), and connecting after 5 s.
-    pub fn connect_with_statement_timeout(
-        url: &str,
-        timeout: std::time::Duration,
-    ) -> Result<Self, StoreError> {
-        Self::connect_with_options(
-            url,
-            &ConnectOptions {
-                passfile: None,
-                statement_timeout: Some(timeout),
-            },
-        )
     }
 
     fn connect_config(
@@ -446,7 +426,8 @@ impl PostgresStore {
         })
     }
 
-    /// Connect and move this session into `schema`, creating it when absent.
+    /// Connect and move this session into `schema`, creating it when absent,
+    /// using explicit [`ConnectOptions`].
     ///
     /// Tests use one schema per case, so a shared database cannot leak
     /// commands or events between them. The session carries the schema's
@@ -454,7 +435,11 @@ impl PostgresStore {
     /// `{"made_at_ms": <ms>}` as its comment ([`made_schema_sql`]), so a
     /// reader tells a schema a live test holds, and how old one is
     /// (objective 094).
-    pub fn connect_in_schema(url: &str, schema: &str) -> Result<Self, StoreError> {
+    pub fn connect_in_schema_with_options(
+        url: &str,
+        schema: &str,
+        options: &ConnectOptions,
+    ) -> Result<Self, StoreError> {
         if !schema
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
@@ -463,7 +448,7 @@ impl PostgresStore {
                 "schema name {schema} is not a plain identifier"
             )));
         }
-        let mut store = Self::connect(url)?;
+        let mut store = Self::connect_with_options(url, options)?;
         store.schema = Some(schema.to_string());
         {
             let mut client = store.lock();
@@ -476,6 +461,11 @@ impl PostgresStore {
         }
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Connect and move this session into `schema`, creating it when absent.
+    pub fn connect_in_schema(url: &str, schema: &str) -> Result<Self, StoreError> {
+        Self::connect_in_schema_with_options(url, schema, &ConnectOptions::default())
     }
 
     fn lock(&self) -> MutexGuard<'_, Client> {
@@ -741,23 +731,13 @@ fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
 
 /// The owner's URL with its credentials replaced by one of the database's
 /// restricted logins (`spawn_supervisor`, `spawn_reader`, `spawn_human`: the
-/// role of that name for this database, see `spawn_login_role`). It reads the login's
+/// role of that name for this database, see `spawn_login_role`), using an explicit
+/// `passfile` when the owner's URL omits its password. It reads the login's
 /// name and salt through the owner's URL, which must be the one that
 /// migrated (its search path finds the schema). The boundary is the
 /// login's privileges; its password keeps anyone who lacks the owner's
 /// credentials from using it, which matters once the database is reachable
 /// from elsewhere.
-///
-/// # Errors
-///
-/// When the owner's URL is not `scheme://...` or has no password, in it or
-/// in the passfile (the logins' passwords derive from it, and from nothing
-/// they would be public), or the database is unreachable or not migrated.
-pub fn role_url(owner: &str, role: &str) -> Result<String, String> {
-    role_url_with_passfile(owner, role, None)
-}
-
-/// [`role_url`] using an explicit `passfile` when the owner's URL omits its password.
 ///
 /// # Errors
 ///
@@ -838,17 +818,8 @@ fn login_url(scheme: &str, rest: &str, role: &str, password: &str) -> Result<Str
 /// The identity of the server `url` reaches: its `system_identifier`, set
 /// once by initdb. Two URLs that spell one server differently (socket or
 /// TCP, a hostname, 127.0.0.2, a LAN address) give the same identity. One
-/// read, no writes; the connection gives up after 5 seconds.
-///
-/// # Errors
-///
-/// When the URL does not parse, the server is unreachable, or the login may
-/// not read `pg_control_system()`.
-pub fn cluster_identity(url: &str) -> Result<String, StoreError> {
-    cluster_identity_with_passfile(url, None)
-}
-
-/// [`cluster_identity`] using an explicit `passfile` when `url` omits its password.
+/// read, no writes; the connection gives up after 5 seconds. Uses an explicit
+/// `passfile` when `url` omits its password.
 ///
 /// # Errors
 ///
@@ -890,21 +861,11 @@ const PROBE_ROWS: i64 = 100_000;
 /// free): a Gather with a worker, so the server allocates the dynamic shared
 /// memory a parallel query needs (/dev/shm in a container). A server whose
 /// /dev/shm is too small fails it with "could not resize shared memory
-/// segment" instead of failing a gate's tests 25 minutes in.
+/// segment" instead of failing a gate's tests 25 minutes in. Uses an
+/// explicit `passfile` when `url` omits its password.
 ///
 /// Each step is bounded by `limit` whatever the server does: the probe runs
 /// on a thread of its own, abandoned if it does not answer in time.
-///
-/// # Errors
-///
-/// The step that failed and its error: a URL that does not parse, a
-/// connection refused or not made within `limit`, a query that errs or does
-/// not finish within `limit`.
-pub fn parallel_query_probe(url: &str, limit: std::time::Duration) -> Result<(), ProbeFailure> {
-    parallel_query_probe_with_passfile(url, limit, None)
-}
-
-/// [`parallel_query_probe`] using an explicit `passfile` when `url` omits its password.
 ///
 /// # Errors
 ///
@@ -1154,7 +1115,7 @@ pub fn made_schema_sql(schema: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{login_url, role_password, role_url, url_password};
+    use super::{ConnectOptions, login_url, role_password, role_url_with_passfile, url_password};
 
     /// The restricted logins' passwords are byte for byte what every install
     /// already has (computed by the derivation as it was at 554a4bd4, before
@@ -1204,9 +1165,14 @@ mod tests {
         use std::time::{Duration, Instant};
         let url = std::env::var("SPAWN_TEST_DATABASE_URL")
             .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database");
-        let reader =
-            super::PostgresStore::connect_with_statement_timeout(&url, Duration::from_millis(200))
-                .expect("connect");
+        let reader = super::PostgresStore::connect_with_options(
+            &url,
+            &ConnectOptions {
+                passfile: None,
+                statement_timeout: Some(Duration::from_millis(200)),
+            },
+        )
+        .expect("connect");
         let started = Instant::now();
         let slow = reader.lock().query_one("select pg_sleep(5)::text", &[]);
         let error = slow.expect_err("a five-second statement ran to the end");
@@ -1220,7 +1186,8 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-        let plain = super::PostgresStore::connect(&url).expect("connect");
+        let plain = super::PostgresStore::connect_with_options(&url, &ConnectOptions::default())
+            .expect("connect");
         assert!(
             plain
                 .lock()
@@ -1306,9 +1273,12 @@ mod tests {
             .map_or(url.clone(), |(base, _)| format!("{base}/{name}"));
         let login = format!("spawn_supervisor_{name}");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let store = super::PostgresStore::connect(&ours).expect("connect");
+            let store =
+                super::PostgresStore::connect_with_options(&ours, &ConnectOptions::default())
+                    .expect("connect");
             store.migrate().expect("migrate with the owner's password");
-            let supervisor = role_url(&ours, "spawn_supervisor").expect("the login's URL");
+            let supervisor =
+                role_url_with_passfile(&ours, "spawn_supervisor", None).expect("the login's URL");
             assert!(Client::connect(&supervisor, NoTls).is_ok());
             // As an earlier install left it: a fixed password anyone can guess.
             Client::connect(&url, NoTls)
@@ -1319,7 +1289,9 @@ mod tests {
             fixed.user(&login).password(&login);
             assert!(fixed.connect(NoTls).is_ok());
 
-            let mut passwordless = super::PostgresStore::connect(&ours).expect("connect");
+            let mut passwordless =
+                super::PostgresStore::connect_with_options(&ours, &ConnectOptions::default())
+                    .expect("connect");
             passwordless.password = String::new();
             passwordless
                 .migrate()
@@ -1356,7 +1328,7 @@ mod tests {
                 "{warnings:?}"
             );
             // A migration with the password turns them on again.
-            super::PostgresStore::connect(&ours)
+            super::PostgresStore::connect_with_options(&ours, &ConnectOptions::default())
                 .expect("connect")
                 .migrate()
                 .expect("migrate with the owner's password");
@@ -1430,8 +1402,14 @@ mod tests {
 
     #[test]
     fn no_owner_password_means_no_login_url() {
-        assert!(role_url("postgres://spawn@localhost/spawn", "spawn_reader").is_err());
-        assert!(role_url("host=/run/postgresql dbname=spawn", "spawn_reader").is_err());
+        assert!(
+            role_url_with_passfile("postgres://spawn@localhost/spawn", "spawn_reader", None)
+                .is_err()
+        );
+        assert!(
+            role_url_with_passfile("host=/run/postgresql dbname=spawn", "spawn_reader", None)
+                .is_err()
+        );
         assert_eq!(
             login_url(
                 "postgres",

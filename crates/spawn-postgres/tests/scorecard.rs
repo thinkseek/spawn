@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 mod common;
 use common::{admin, schema_url, store};
-use spawn_postgres::{PostgresStore, role_url};
+use spawn_postgres::{PostgresStore, role_url_with_passfile};
 
 /// One control record at `at`, written straight into the log as the stream
 /// writes it (the next `session_seq`).
@@ -446,8 +446,11 @@ fn the_reader_login_reads_the_facts_and_the_databases_clock() {
     store
         .mission_add("Ship it", &json!(["/tmp/source.git"]), "human")
         .expect("add");
-    let url = role_url(&schema_url(&schema), "spawn_reader").expect("the reader's URL");
-    let reader = PostgresStore::connect(&url).expect("the reader connects");
+    let url = role_url_with_passfile(&schema_url(&schema), "spawn_reader", None)
+        .expect("the reader's URL");
+    let reader =
+        PostgresStore::connect_with_options(&url, &spawn_postgres::ConnectOptions::default())
+            .expect("the reader connects");
     let now = reader.database_now_ms().expect("the clock");
     let host = i64::try_from(
         std::time::SystemTime::now()
@@ -479,8 +482,10 @@ fn a_cancellation_names_who_cancelled() {
     let by_supervisor = store
         .task_assign(mission, "ephemeral", "b", "second", "default")
         .expect("assign");
-    let supervisor = PostgresStore::connect(
-        &role_url(&schema_url(&schema), "spawn_supervisor").expect("the supervisor's URL"),
+    let supervisor = PostgresStore::connect_with_options(
+        &role_url_with_passfile(&schema_url(&schema), "spawn_supervisor", None)
+            .expect("the supervisor's URL"),
+        &spawn_postgres::ConnectOptions::default(),
     )
     .expect("the supervisor connects");
     supervisor
@@ -1382,7 +1387,11 @@ fn a_database_made_again_under_its_name_is_another_store() {
                 .batch_execute(&format!("create database {name}"))
                 .expect("the database");
             (made, ever_made) = (true, true);
-            let store = PostgresStore::connect(&ours).expect("connect");
+            let store = PostgresStore::connect_with_options(
+                &ours,
+                &spawn_postgres::ConnectOptions::default(),
+            )
+            .expect("connect");
             store.migrate().expect("migrate");
             let mut client = Client::connect(&ours, NoTls).expect("its owner");
             for (n, id) in (1_i64..).zip(ids) {

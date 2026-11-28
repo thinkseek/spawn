@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use spawn_postgres::{ConnectOptions, LibpqDefaults, PostgresStore};
 
-pub(crate) use crate::config_file::{ConfigOrigin, SecretString};
+pub(crate) use crate::config_file::SecretString;
+pub(crate) use crate::workspace_backend::WorkspaceBackend;
 
 /// Process exit status (`EX_CONFIG` in `<sysexits.h>`) when a Keep-delivered
 /// `$CREDENTIALS_DIRECTORY/<id>` credential file is unreadable, empty, malformed,
@@ -83,26 +84,12 @@ pub(crate) fn load_credential_secret(
     Ok(Some(SecretString::new(trimmed)))
 }
 
-/// Read a single-value UTF-8 credential from `cred_dir/<id>`, stripping at most one
-/// trailing newline while rejecting empty values, embedded newlines/NULs, or symlinks.
-pub(crate) fn load_credential_value(
-    cred_dir: Option<&Path>,
-    id: &str,
-) -> Result<Option<String>, String> {
-    Ok(load_credential_secret(cred_dir, id)?.map(SecretString::into_inner))
-}
-
 /// Resolve `$CREDENTIALS_DIRECTORY/<id>` as a validated [`SecretString`].
 pub(crate) fn credential_secret(id: &str) -> Result<Option<SecretString>, String> {
     load_credential_secret(
         env_value("CREDENTIALS_DIRECTORY").as_deref().map(Path::new),
         id,
     )
-}
-
-/// Resolve `$CREDENTIALS_DIRECTORY/<id>` as a validated single-value secret string.
-pub(crate) fn credential_value(id: &str) -> Result<Option<String>, String> {
-    Ok(credential_secret(id)?.map(SecretString::into_inner))
 }
 
 pub(crate) fn env_value(name: &str) -> Option<String> {
@@ -176,31 +163,22 @@ fn not_set(name: &str) -> String {
     }
 }
 
-/// Resolve the controller's PostgreSQL URL with its [`ConfigOrigin`], preferring
-/// Keep's `$CREDENTIALS_DIRECTORY/spawn.database-url` (`Credential`) when present
-/// and falling back to `SPAWN_DATABASE_URL` (`Env`).
-pub(crate) fn database_url_with_origin() -> Result<(SecretString, ConfigOrigin), String> {
-    if let Some(url) = credential_secret("spawn.database-url")? {
-        return Ok((url, ConfigOrigin::Credential));
-    }
-    required_env("SPAWN_DATABASE_URL").map(|url| (SecretString::new(url), ConfigOrigin::Env))
-}
-
-/// Resolve the controller's PostgreSQL URL, preferring Keep's
+/// Resolve the controller's PostgreSQL URL as a [`SecretString`], preferring Keep's
 /// `$CREDENTIALS_DIRECTORY/spawn.database-url` when present and falling back to
 /// `SPAWN_DATABASE_URL`.
-pub(crate) fn database_url() -> Result<String, String> {
-    database_url_with_origin().map(|(url, _)| url.into_inner())
+pub(crate) fn database_url_secret() -> Result<SecretString, String> {
+    if let Some(url) = credential_secret("spawn.database-url")? {
+        return Ok(url);
+    }
+    required_env("SPAWN_DATABASE_URL").map(SecretString::new)
 }
 
 /// Resolve libpq passfile location at the CLI boundary (`PGPASSFILE` else `$HOME/.pgpass`).
 pub(crate) fn pg_passfile() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("PGPASSFILE").filter(|path| !path.is_empty()) {
-        return Some(PathBuf::from(path));
-    }
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(|home| Path::new(&home).join(".pgpass"))
+    spawn_postgres::resolve_passfile_path(
+        std::env::var_os("PGPASSFILE").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
 }
 
 /// Explicit libpq connect options injected from the CLI environment boundary.
@@ -221,7 +199,7 @@ pub(crate) fn libpq_defaults() -> LibpqDefaults {
 }
 
 pub(crate) fn open_store() -> Result<PostgresStore, String> {
-    let (url, _origin) = database_url_with_origin()?;
+    let url = database_url_secret()?;
     PostgresStore::connect_with_options(url.expose_secret(), &pg_connect_options(None))
         .map_err(|error| error.to_string())
 }
@@ -238,21 +216,11 @@ pub(crate) fn spawn_program() -> String {
     resolve_spawn_program(env_value("SPAWN_PROGRAM"), std::env::current_exe().ok())
 }
 
-fn resolve_spawn_program_with_origin(
-    configured: Option<String>,
-    current: Option<PathBuf>,
-) -> (String, ConfigOrigin) {
-    match configured {
-        Some(program) => (program, ConfigOrigin::Env),
-        None => (
-            current.map_or_else(|| "spawn".to_string(), |path| path.display().to_string()),
-            ConfigOrigin::Default,
-        ),
-    }
-}
-
 fn resolve_spawn_program(configured: Option<String>, current: Option<PathBuf>) -> String {
-    resolve_spawn_program_with_origin(configured, current).0
+    match configured {
+        Some(program) => program,
+        None => current.map_or_else(|| "spawn".to_string(), |path| path.display().to_string()),
+    }
 }
 
 /// `--root`, else `SPAWN_WORKSPACE_ROOT`, resolved through its symlinks,
@@ -262,12 +230,8 @@ fn resolve_spawn_program(configured: Option<String>, current: Option<PathBuf>) -
 /// derive from this one root, so no two of them can name a workspace two
 /// ways.
 pub(crate) fn workspace_root(flags: &Flags) -> Option<String> {
-    resolve_workspace_root_with_origin(flags.get("root"), env_value("SPAWN_WORKSPACE_ROOT")).map(
-        |(root, origin)| {
-            let _ = origin.as_str();
-            canonical_workspace_root(&root)
-        },
-    )
+    resolve_workspace_root(flags.get("root"), env_value("SPAWN_WORKSPACE_ROOT"))
+        .map(|root| canonical_workspace_root(&root))
 }
 
 /// `root` resolved through its symlinks ([`workspace_root`]).
@@ -277,17 +241,8 @@ fn canonical_workspace_root(root: &str) -> String {
         .to_string()
 }
 
-fn resolve_workspace_root_with_origin(
-    flag: Option<String>,
-    environment: Option<String>,
-) -> Option<(String, ConfigOrigin)> {
-    flag.map(|value| (value, ConfigOrigin::Flag))
-        .or_else(|| environment.map(|value| (value, ConfigOrigin::Env)))
-}
-
-#[cfg(test)]
 fn resolve_workspace_root(flag: Option<String>, environment: Option<String>) -> Option<String> {
-    resolve_workspace_root_with_origin(flag, environment).map(|(value, _)| value)
+    flag.or(environment)
 }
 
 /// The oldest git Spawn runs on. Merges of main into a branch, the Bridge's
@@ -349,55 +304,17 @@ pub(crate) fn loop_interval() -> std::time::Duration {
     )
 }
 
-/// What `SPAWN_WORKSPACE_BACKEND` asks for (docs/storage.md, "Workspace
-/// backends"): a backend by name, or `auto`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkspaceBackend {
-    /// Git working copies: the default.
-    Git,
-    /// Copy-on-write clones of a per-commit baseline.
-    Cow,
-    /// An unprivileged overlay per workspace (Linux): by name only.
-    Overlay,
-    /// Dual-track oracle wrapping authoritative `git` beside shadow `d6`: opt-in only.
-    D6Shadow,
-    /// Pure-Rust CAS Merkle + ledger workspace store (`D6Workspace`): opt-in only.
-    D6,
-    /// The cheapest backend the root supports that the loop serves
-    /// ([`spawn_host::WorkspaceBackend::auto_with`]), chosen once at start.
-    Auto,
-}
-
-impl WorkspaceBackend {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Git => "git",
-            Self::Cow => "cow",
-            Self::Overlay => "overlay",
-            Self::D6Shadow => "d6-shadow",
-            Self::D6 => "d6",
-            Self::Auto => "auto",
-        }
-    }
-}
-
 /// The backend `value` (`SPAWN_WORKSPACE_BACKEND`) names: git when it is
 /// unset or empty; anything it does not name is refused, never read as git.
 pub(crate) fn workspace_backend(value: Option<&str>) -> Result<WorkspaceBackend, String> {
     match value.map(str::trim) {
         None | Some("") => Ok(WorkspaceBackend::Git),
-        Some("auto") => Ok(WorkspaceBackend::Auto),
-        Some(name) => match spawn_host::WorkspaceBackend::parse(name) {
-            Some(spawn_host::WorkspaceBackend::Git) => Ok(WorkspaceBackend::Git),
-            Some(spawn_host::WorkspaceBackend::Cow) => Ok(WorkspaceBackend::Cow),
-            Some(spawn_host::WorkspaceBackend::Overlay) => Ok(WorkspaceBackend::Overlay),
-            Some(spawn_host::WorkspaceBackend::D6Shadow) => Ok(WorkspaceBackend::D6Shadow),
-            Some(spawn_host::WorkspaceBackend::D6) => Ok(WorkspaceBackend::D6),
-            None => Err(format!(
+        Some(name) => WorkspaceBackend::parse(name).ok_or_else(|| {
+            format!(
                 "SPAWN_WORKSPACE_BACKEND={name:?} names no workspace backend: use git (the \
                  default), cow, overlay, d6-shadow, d6 or auto"
-            )),
-        },
+            )
+        }),
     }
 }
 
@@ -601,10 +518,6 @@ impl WorkspaceSettings {
         probes: &Probes<'_>,
     ) -> Result<Self, String> {
         let active = match configured {
-            WorkspaceBackend::Git => spawn_host::WorkspaceBackend::Git,
-            WorkspaceBackend::Cow => spawn_host::WorkspaceBackend::Cow,
-            WorkspaceBackend::D6Shadow => spawn_host::WorkspaceBackend::D6Shadow,
-            WorkspaceBackend::D6 => spawn_host::WorkspaceBackend::D6,
             WorkspaceBackend::Overlay => {
                 (probes.overlay)(root).map_err(|why| {
                     format!(
@@ -619,6 +532,9 @@ impl WorkspaceSettings {
                 Some(there) => there,
                 None => spawn_host::WorkspaceBackend::auto_with((probes.cow)(root)),
             },
+            other => other
+                .to_host()
+                .expect("non-auto/overlay variant maps to host backend"),
         };
         Ok(Self {
             configured,
@@ -717,14 +633,7 @@ impl WorkspaceSettings {
                 return serde_json::json!({ "error": error });
             }
         };
-        let named = match configured {
-            WorkspaceBackend::Git => Some(spawn_host::WorkspaceBackend::Git),
-            WorkspaceBackend::Cow => Some(spawn_host::WorkspaceBackend::Cow),
-            WorkspaceBackend::Overlay => Some(spawn_host::WorkspaceBackend::Overlay),
-            WorkspaceBackend::D6Shadow => Some(spawn_host::WorkspaceBackend::D6Shadow),
-            WorkspaceBackend::D6 => Some(spawn_host::WorkspaceBackend::D6),
-            WorkspaceBackend::Auto => None,
-        };
+        let named = configured.to_host();
         if let (Some(named), Some(marked)) = (named, marked)
             && !spawn_host::workspace::backends_compatible(marked, named)
         {
@@ -1749,29 +1658,32 @@ mod workspace_tests {
 
     #[test]
     fn config_origin_and_secret_string_behavior() {
-        use super::{
-            ConfigOrigin, SecretString, resolve_spawn_program_with_origin,
-            resolve_workspace_root_with_origin,
-        };
+        use super::{SecretString, resolve_spawn_program, resolve_workspace_root};
+        use crate::config_file::{ConfigOrigin, SpawnConfig};
 
         assert_eq!(
-            resolve_spawn_program_with_origin(Some("/opt/spawn".into()), None),
-            ("/opt/spawn".to_string(), ConfigOrigin::Env)
+            resolve_spawn_program(Some("/opt/spawn".into()), None),
+            "/opt/spawn"
+        );
+        assert_eq!(resolve_spawn_program(None, None), "spawn");
+        assert_eq!(
+            resolve_workspace_root(Some("/flag".into()), Some("/env".into())).as_deref(),
+            Some("/flag")
         );
         assert_eq!(
-            resolve_spawn_program_with_origin(None, None),
-            ("spawn".to_string(), ConfigOrigin::Default)
-        );
-        assert_eq!(
-            resolve_workspace_root_with_origin(Some("/flag".into()), Some("/env".into())),
-            Some(("/flag".to_string(), ConfigOrigin::Flag))
-        );
-        assert_eq!(
-            resolve_workspace_root_with_origin(None, Some("/env".into())),
-            Some(("/env".to_string(), ConfigOrigin::Env))
+            resolve_workspace_root(None, Some("/env".into())).as_deref(),
+            Some("/env")
         );
         assert_eq!(ConfigOrigin::File.as_str(), "file");
         assert_eq!(ConfigOrigin::Credential.as_str(), "credential");
+
+        let cfg = SpawnConfig::from_toml_str(
+            "schema_version = 1\n[instance]\ndata_dir = \"/srv/spawn\"\n",
+        )
+        .expect("parse");
+        let origins = cfg.field_origins();
+        assert_eq!(origins.get("instance"), Some(&ConfigOrigin::File));
+        assert_eq!(origins.get("database"), Some(&ConfigOrigin::Default));
 
         let secret = SecretString::new("TopSecretValue_001");
         assert_eq!(format!("{secret:?}"), "[REDACTED]");
@@ -1845,14 +1757,15 @@ mod workspace_tests {
 
     #[test]
     fn load_credential_supports_valid_files_absent_fallback_and_fail_closed_checks() {
-        use super::{load_credential_file, load_credential_value};
+        use super::{SecretString, load_credential_file, load_credential_secret};
         use std::os::unix::fs::PermissionsExt;
 
         let dir = crate::storage::tests::scratch("config-load-credential");
         assert_eq!(load_credential_file(None, "spawn.database-url"), Ok(None));
-        assert_eq!(
-            load_credential_value(Some(&dir), "spawn.database-url"),
-            Ok(None)
+        assert!(
+            load_credential_secret(Some(&dir), "spawn.database-url")
+                .unwrap()
+                .is_none()
         );
 
         let canary = "canary-cred-val-8391";
@@ -1865,7 +1778,9 @@ mod workspace_tests {
             Some(valid_0400.clone())
         );
         assert_eq!(
-            load_credential_value(Some(&dir), "spawn.database-url").unwrap(),
+            load_credential_secret(Some(&dir), "spawn.database-url")
+                .unwrap()
+                .map(SecretString::into_inner),
             Some(canary.to_string())
         );
 
@@ -1874,7 +1789,9 @@ mod workspace_tests {
         std::fs::set_permissions(&valid_0600, std::fs::Permissions::from_mode(0o600))
             .expect("chmod 600");
         assert_eq!(
-            load_credential_value(Some(&dir), "backup.key.k1").unwrap(),
+            load_credential_secret(Some(&dir), "backup.key.k1")
+                .unwrap()
+                .map(SecretString::into_inner),
             Some(canary.to_string())
         );
 
@@ -1889,7 +1806,7 @@ mod workspace_tests {
             let p = dir.join(name);
             std::fs::write(&p, bytes).expect("write bad");
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
-            errs.push(load_credential_value(Some(&dir), name).unwrap_err());
+            errs.push(load_credential_secret(Some(&dir), name).unwrap_err());
         }
 
         let target = dir.join("real.target");
@@ -1898,7 +1815,7 @@ mod workspace_tests {
         let link = dir.join("sym.cred");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
         errs.push(load_credential_file(Some(&dir), "sym.cred").unwrap_err());
-        errs.push(load_credential_value(Some(&dir), "sym.cred").unwrap_err());
+        errs.push(load_credential_secret(Some(&dir), "sym.cred").unwrap_err());
 
         for err in &errs {
             assert!(err.starts_with("credential "), "{err}");

@@ -769,8 +769,8 @@ fn serve_token_with(
     cred_dir: Option<&Path>,
     env_token: Option<String>,
 ) -> Result<Option<String>, String> {
-    if let Some(token) = crate::config::load_credential_value(cred_dir, "spawn-serve.token")? {
-        return Ok(Some(token));
+    if let Some(token) = crate::config::load_credential_secret(cred_dir, "spawn-serve.token")? {
+        return Ok(Some(token.into_inner()));
     }
     Ok(env_token)
 }
@@ -11144,10 +11144,13 @@ mod tests {
     #[test]
     fn storage_tree_and_snapshot_endpoints_work_empty_and_with_d6_dag() {
         in_test_schema(|owner, store| {
-            let reader_url =
-                spawn_postgres::role_url(owner, "spawn_reader").expect("reader role url");
-            let reader_store =
-                spawn_postgres::PostgresStore::connect(&reader_url).expect("connect reader store");
+            let reader_url = spawn_postgres::role_url_with_passfile(owner, "spawn_reader", None)
+                .expect("reader role url");
+            let reader_store = spawn_postgres::PostgresStore::connect_with_options(
+                &reader_url,
+                &spawn_postgres::ConnectOptions::default(),
+            )
+            .expect("connect reader store");
 
             let empty = super::storage_tree_for_store(&reader_store, None, 120)
                 .expect("empty tree succeeds");

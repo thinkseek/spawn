@@ -769,7 +769,7 @@ fn supply_pa_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String
 /// The variable a test reads its database from.
 const TEST_DATABASE: &str = "SPAWN_TEST_DATABASE_URL";
 
-/// How a server's identity is read: [`spawn_postgres::cluster_identity`].
+/// How a server's identity is read: [`spawn_postgres::cluster_identity_with_passfile`].
 type Identity = fn(&str) -> Result<String, String>;
 
 /// The fleet's own test server, which engines get as

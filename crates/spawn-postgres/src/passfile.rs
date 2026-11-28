@@ -16,8 +16,20 @@
 //! before reading anything. No password is ever printed.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+/// Resolve libpq passfile path from explicit boundary environment values
+/// (`PGPASSFILE` when non-empty, else `$HOME/.pgpass` when `HOME` is non-empty).
+#[must_use]
+pub fn resolve_passfile_path(pgpassfile: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    if let Some(path) = pgpassfile.filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    home.filter(|value| !value.is_empty())
+        .map(|home_dir| Path::new(home_dir).join(".pgpass"))
+}
 
 /// The port a URL without one connects to.
 const DEFAULT_PORT: u16 = 5432;
@@ -396,5 +408,32 @@ mod tests {
             "the passfile's line matched the URL's own host, port, database and user"
         );
         assert!(connected, "the passfile's password logs in");
+    }
+
+    #[test]
+    fn resolve_passfile_path_prefers_pgpassfile_then_home_pgpass() {
+        use std::ffi::OsStr;
+        use std::path::PathBuf;
+
+        assert_eq!(
+            super::resolve_passfile_path(
+                Some(OsStr::new("/run/secrets/pgpass")),
+                Some(OsStr::new("/home/u")),
+            ),
+            Some(PathBuf::from("/run/secrets/pgpass"))
+        );
+        assert_eq!(
+            super::resolve_passfile_path(Some(OsStr::new("")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.pgpass"))
+        );
+        assert_eq!(
+            super::resolve_passfile_path(None, Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.pgpass"))
+        );
+        assert_eq!(
+            super::resolve_passfile_path(Some(OsStr::new("")), Some(OsStr::new(""))),
+            None
+        );
+        assert_eq!(super::resolve_passfile_path(None, None), None);
     }
 }

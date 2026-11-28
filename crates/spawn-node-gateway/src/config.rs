@@ -12,6 +12,7 @@
 //! | `SPAWN_NODE_GATEWAY_PUBLIC_PREFIX` | empty | a path prefix a reverse proxy keeps |
 //! | `SPAWN_NODE_GATEWAY_WORKERS` | `6` | bounded worker threads & PostgreSQL connections |
 
+use std::ffi::OsStr;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -181,14 +182,12 @@ impl Config {
                 .filter(|value| *value >= 1)
                 .ok_or_else(|| format!("{ENV_WORKERS}={raw:?} must be an integer >= 1"))?,
         };
-        let passfile = env("PGPASSFILE")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                env("HOME")
-                    .filter(|value| !value.is_empty())
-                    .map(|home| PathBuf::from(home).join(".pgpass"))
-            });
+        let pgpassfile = env("PGPASSFILE");
+        let home = env("HOME");
+        let passfile = spawn_postgres::resolve_passfile_path(
+            pgpassfile.as_deref().map(OsStr::new),
+            home.as_deref().map(OsStr::new),
+        );
         Ok(Self {
             database_url,
             key_file: required(ENV_KEY_FILE)?.into(),

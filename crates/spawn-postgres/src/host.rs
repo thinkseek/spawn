@@ -176,21 +176,12 @@ const TEST_DATABASE_LIMIT: std::time::Duration = std::time::Duration::from_secs(
 /// The name, size and schemas of the test database at `url` (the gates' or
 /// the fleet's, objective 074), as `{name, bytes, schemas}`: one read-only
 /// statement on a connection of its own, which gives up after 5 s
-/// connecting and 5 s querying.
-///
-/// # Errors
-///
-/// A URL that does not parse, a server that cannot be reached, a statement
-/// that fails. The error never names the URL.
-pub fn test_database_size(url: &str) -> Result<Value, StoreError> {
-    test_database_size_with_passfile(url, None)
-}
-
-/// [`test_database_size`] using an explicit passfile when the URL omits its password.
+/// connecting and 5 s querying, using an explicit passfile when the URL omits its password.
 ///
 /// # Errors
 ///
 /// A URL that does not parse, a server that cannot be reached, or a query failure.
+/// The error never names the URL.
 pub fn test_database_size_with_passfile(
     url: &str,
     passfile: Option<&std::path::Path>,
@@ -247,21 +238,13 @@ select coalesce(jsonb_agg(jsonb_build_object(
 
 /// The schemas of the test database at `url` (`TEST_SCHEMAS`): one
 /// read-only statement on a connection of its own, which gives up after 5 s
-/// connecting and 5 s querying, as [`test_database_size`]'s.
-///
-/// # Errors
-///
-/// A URL that does not parse, a server that cannot be reached, a statement
-/// that fails. The error never names the URL.
-pub fn test_schemas(url: &str) -> Result<Value, StoreError> {
-    test_schemas_with_passfile(url, None)
-}
-
-/// [`test_schemas`] using an explicit passfile when the URL omits its password.
+/// connecting and 5 s querying, as [`test_database_size_with_passfile`]'s, using
+/// an explicit passfile when the URL omits its password.
 ///
 /// # Errors
 ///
 /// A URL that does not parse, a server that cannot be reached, or a query failure.
+/// The error never names the URL.
 pub fn test_schemas_with_passfile(
     url: &str,
     passfile: Option<&std::path::Path>,
@@ -297,17 +280,6 @@ pub struct DatabaseIdentity {
     pub port: u16,
     /// Target database name resolved after libpq defaults.
     pub database: String,
-}
-
-/// The database `url` names ([`DatabaseIdentity`]), without consulting process
-/// environment variables (`port` defaults to `5432`). Never names the URL in its error.
-///
-/// # Errors
-///
-/// A URL that does not parse as a postgres URL or key-value string, or one
-/// naming more than one host or port.
-pub fn database_identity(url: &str) -> Result<DatabaseIdentity, String> {
-    database_identity_with_defaults(url, &LibpqDefaults::default())
 }
 
 /// Resolve [`DatabaseIdentity`] using caller-supplied [`LibpqDefaults`] instead of
@@ -564,11 +536,13 @@ impl PostgresStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{LibpqDefaults, database_identity, database_identity_with_defaults};
+    use super::{LibpqDefaults, database_identity_with_defaults};
 
     #[test]
     fn database_identity_uses_explicit_defaults_without_reading_env() {
-        let bare = database_identity("postgres:///spawn_test").expect("parse");
+        let bare =
+            database_identity_with_defaults("postgres:///spawn_test", &LibpqDefaults::default())
+                .expect("parse");
         assert!(bare.local);
         assert_eq!(bare.port, 5432);
         assert_eq!(bare.database, "spawn_test");

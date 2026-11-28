@@ -104,6 +104,7 @@ mod storage_cutover;
 mod supervise;
 mod toml_parser;
 mod verify;
+mod workspace_backend;
 
 // Re-exported at the crate root, where the command modules import them.
 pub(crate) use config::{Flags, env_or, env_value, open_store};

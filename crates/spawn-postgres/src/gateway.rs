@@ -413,8 +413,8 @@ impl PostgresStore {
     /// returns the first command) for the same session and text only: a
     /// `key` another session's input used, or other text, is refused
     /// ([`HumanInput::KeyUsed`]) and nothing is recorded. Only a store
-    /// connected as the `spawn_human` login may call it (`role_url(owner,
-    /// "spawn_human")`); that login can do nothing else.
+    /// connected as the `spawn_human` login may call it (`role_url_with_passfile(owner,
+    /// "spawn_human", passfile)`); that login can do nothing else.
     /// [`HumanInput::NoAgent`] when no agent has used the session; a session
     /// that runs no execution is refused ([`HumanInput::NotRunning`]) and
     /// nothing is recorded, though a repeated key still returns its first

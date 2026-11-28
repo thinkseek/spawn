@@ -6,6 +6,9 @@
 #[path = "../src/toml_parser.rs"]
 mod toml_parser;
 
+#[path = "../src/workspace_backend.rs"]
+mod workspace_backend;
+
 #[allow(dead_code)]
 #[path = "../src/config_file.rs"]
 mod config_file;
@@ -18,7 +21,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use config_file::{
-    ConfigOrigin, SecretRef, SecretString, SpawnConfig, effective_json_with,
+    ConfigOrigin, SecretRef, SecretString, SpawnConfig, WorkspaceBackend, effective_json_with,
     resolve_env_entries_with,
 };
 use serde_json::{Value, json};
@@ -1114,6 +1117,55 @@ fn cli_config_init_from_host_docker_plan_and_doctor_emit_valid_outputs() {
     assert!(doc_json.get("host_inherit").is_some());
     assert!(doc_json.get("archive_mask_tool").is_some());
     assert!(doc_json.get("model_endpoints").is_some());
+    assert_eq!(doc_json["probe_root_origin"], json!("flag"));
+    assert_eq!(doc_json["config_path_origin"], json!(null));
+}
+
+#[test]
+fn cli_doctor_reports_config_and_probe_root_origins() {
+    let dir = TempDir::new("doctor-origins");
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    let cfg_path = dir.path().join("spawn.toml");
+    fs::write(
+        &cfg_path,
+        format!(
+            "schema_version = 1\n[instance]\ndata_dir = \"{}\"\n",
+            data_dir.display()
+        ),
+    )
+    .expect("write cfg");
+
+    let doc_cfg = spawn_bin(
+        &[
+            "doctor",
+            "--config",
+            &cfg_path.display().to_string(),
+            "--json",
+        ],
+        &[],
+    );
+    assert!(
+        doc_cfg.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&doc_cfg.stderr)
+    );
+    let doc_cfg_json: Value = serde_json::from_slice(&doc_cfg.stdout).expect("doctor cfg JSON");
+    assert_eq!(doc_cfg_json["config_path_origin"], json!("flag"));
+    assert_eq!(doc_cfg_json["probe_root_origin"], json!("file"));
+
+    let doc_env = spawn_bin(
+        &["doctor", "--json"],
+        &[("SPAWN_CONFIG", &cfg_path.display().to_string())],
+    );
+    assert!(
+        doc_env.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&doc_env.stderr)
+    );
+    let doc_env_json: Value = serde_json::from_slice(&doc_env.stdout).expect("doctor env JSON");
+    assert_eq!(doc_env_json["config_path_origin"], json!("env"));
+    assert_eq!(doc_env_json["probe_root_origin"], json!("file"));
 }
 
 #[test]
@@ -1497,8 +1549,14 @@ fn config_origin_and_secret_string_enforce_redaction_and_non_serialization() {
             false
         }
     }
+    trait FallbackNoPartialEq {
+        fn implements_partial_eq(&self) -> bool {
+            false
+        }
+    }
     struct DisplayProbe<T>(std::marker::PhantomData<T>);
     struct SerProbe<T>(std::marker::PhantomData<T>);
+    struct EqProbe<T>(std::marker::PhantomData<T>);
 
     impl<T> FallbackNoDisplay for DisplayProbe<T> {}
     impl<T: std::fmt::Display> DisplayProbe<T> {
@@ -1511,6 +1569,14 @@ fn config_origin_and_secret_string_enforce_redaction_and_non_serialization() {
     impl<T> FallbackNoSerialize for SerProbe<T> {}
     impl<T: serde::Serialize> SerProbe<T> {
         fn implements_serialize(&self) -> bool {
+            let _ = &self.0;
+            true
+        }
+    }
+
+    impl<T> FallbackNoPartialEq for EqProbe<T> {}
+    impl<T: PartialEq> EqProbe<T> {
+        fn implements_partial_eq(&self) -> bool {
             let _ = &self.0;
             true
         }
@@ -1548,4 +1614,160 @@ fn config_origin_and_secret_string_enforce_redaction_and_non_serialization() {
     let sec_ser = SerProbe::<SecretString>(std::marker::PhantomData);
     assert!(str_ser.implements_serialize());
     assert!(!sec_ser.implements_serialize());
+
+    let str_eq = EqProbe::<String>(std::marker::PhantomData);
+    let sec_eq = EqProbe::<SecretString>(std::marker::PhantomData);
+    assert!(str_eq.implements_partial_eq());
+    assert!(!sec_eq.implements_partial_eq());
+}
+
+#[test]
+fn effective_json_origins_distinguish_file_defaults_and_secret_subrefs() {
+    // Passfile-authenticated [database] (host/user/name only) must report "file",
+    // while omitted [storage].workspace_backend must report "default" and project "auto".
+    let passfile_toml = r#"
+schema_version = 1
+[instance]
+data_dir = "/srv/spawn"
+[database]
+host = "127.0.0.1"
+port = 5432
+name = "spawn"
+user = "spawn"
+"#;
+    let passfile_cfg = SpawnConfig::from_toml_str(passfile_toml).expect("passfile cfg parses");
+    assert_eq!(passfile_cfg.storage.workspace_backend, None);
+    let passfile_eff = effective_json_with(&passfile_cfg, &|_| None).expect("passfile eff");
+    assert_eq!(passfile_eff["origins"]["database"], json!("file"));
+    assert!(passfile_eff["origins"].get("database.url").is_none());
+    assert!(passfile_eff["origins"].get("database.password").is_none());
+    assert_eq!(
+        passfile_eff["origins"]["storage.workspace_backend"],
+        json!("default")
+    );
+    assert_eq!(
+        passfile_eff["env"]["SPAWN_WORKSPACE_BACKEND"],
+        json!("auto")
+    );
+
+    // Omitted [database] -> "default"; explicit workspace_backend = "auto" even inside empty [storage]
+    let dir = TempDir::new("origins-probes");
+    let pw_file = dir.path().join("db.pw");
+    fs::write(&pw_file, "S3cr3tPass_991\n").expect("write pw");
+    fs::set_permissions(&pw_file, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    let bare_toml = r#"
+schema_version = 1
+[instance]
+data_dir = "/srv/spawn"
+[storage]
+cas_dedup = false
+"#;
+    let bare_cfg = SpawnConfig::from_toml_str(bare_toml).expect("bare cfg parses");
+    assert_eq!(bare_cfg.storage.workspace_backend, None);
+    let bare_eff = effective_json_with(&bare_cfg, &|_| None).expect("bare eff");
+    assert_eq!(bare_eff["origins"]["database"], json!("default"));
+    assert_eq!(
+        bare_eff["origins"]["storage.workspace_backend"],
+        json!("default")
+    );
+    assert_eq!(bare_eff["env"]["SPAWN_WORKSPACE_BACKEND"], json!("auto"));
+
+    // Secret sub-refs under [database] report database = "file" + database.{url,password} = env/credential
+    let subref_pw_toml = format!(
+        r#"
+schema_version = 1
+[instance]
+data_dir = "/srv/spawn"
+[database]
+name = "spawn"
+user = "spawn"
+password = {{ from_file = "{}" }}
+[storage]
+workspace_backend = "auto"
+"#,
+        pw_file.display()
+    );
+    let subref_pw_cfg = SpawnConfig::from_toml_str(&subref_pw_toml).expect("subref pw parses");
+    assert_eq!(
+        subref_pw_cfg.storage.workspace_backend,
+        Some(WorkspaceBackend::Auto)
+    );
+    let subref_pw_eff = effective_json_with(&subref_pw_cfg, &|_| None).expect("subref pw eff");
+    assert_eq!(subref_pw_eff["origins"]["database"], json!("file"));
+    assert_eq!(
+        subref_pw_eff["origins"]["database.password"],
+        json!("credential")
+    );
+    assert!(subref_pw_eff["origins"].get("database.url").is_none());
+    assert_eq!(
+        subref_pw_eff["origins"]["storage.workspace_backend"],
+        json!("file")
+    );
+
+    let subref_url_toml = r#"
+schema_version = 1
+[instance]
+data_dir = "/srv/spawn"
+[database]
+url = { from_env = "PROBE_DB_URL" }
+[storage]
+workspace_backend = "d6"
+"#;
+    let subref_url_cfg = SpawnConfig::from_toml_str(subref_url_toml).expect("subref url parses");
+    assert_eq!(
+        subref_url_cfg.storage.workspace_backend,
+        Some(WorkspaceBackend::D6)
+    );
+    let url_env = env_map(&[("PROBE_DB_URL", "postgres://u:pw@127.0.0.1:5432/db")]);
+    let subref_url_eff =
+        effective_json_with(&subref_url_cfg, &|k| url_env.get(k).cloned()).expect("subref url eff");
+    assert_eq!(subref_url_eff["origins"]["database"], json!("file"));
+    assert_eq!(subref_url_eff["origins"]["database.url"], json!("env"));
+    assert!(subref_url_eff["origins"].get("database.password").is_none());
+    assert_eq!(
+        subref_url_eff["origins"]["storage.workspace_backend"],
+        json!("file")
+    );
+}
+
+#[test]
+fn workspace_backend_host_roundtrip_and_auto() {
+    let concrete = [
+        (
+            spawn_host::WorkspaceBackend::Git,
+            WorkspaceBackend::Git,
+            "git",
+        ),
+        (
+            spawn_host::WorkspaceBackend::Cow,
+            WorkspaceBackend::Cow,
+            "cow",
+        ),
+        (
+            spawn_host::WorkspaceBackend::Overlay,
+            WorkspaceBackend::Overlay,
+            "overlay",
+        ),
+        (
+            spawn_host::WorkspaceBackend::D6Shadow,
+            WorkspaceBackend::D6Shadow,
+            "d6-shadow",
+        ),
+        (spawn_host::WorkspaceBackend::D6, WorkspaceBackend::D6, "d6"),
+    ];
+    for (host, cfg_variant, name) in concrete {
+        let converted = WorkspaceBackend::from_host(host);
+        assert_eq!(converted, cfg_variant);
+        assert_eq!(converted.to_host(), Some(host));
+        assert_eq!(converted.name(), name);
+        assert_eq!(WorkspaceBackend::parse(name), Some(cfg_variant));
+    }
+    assert_eq!(WorkspaceBackend::Auto.to_host(), None);
+    assert_eq!(WorkspaceBackend::Auto.name(), "auto");
+    assert_eq!(
+        WorkspaceBackend::parse("auto"),
+        Some(WorkspaceBackend::Auto)
+    );
+    assert_eq!(WorkspaceBackend::parse("unknown"), None);
 }
