@@ -1041,7 +1041,7 @@ fn timed<T>(part: &mut Option<Duration>, work: impl FnOnce() -> T) -> T {
 /// `GET /api/core-lines`.
 pub(super) fn core_lines() -> Result<Value, String> {
     core_lines_at(
-        &super::open_store()?,
+        &*super::open_store()?,
         ranges_path().as_deref(),
         nightly_dir().as_deref(),
     )

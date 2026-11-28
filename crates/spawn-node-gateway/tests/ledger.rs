@@ -11,12 +11,18 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use common::{
     Harness, Reply, Req, boot_id, node_id, now_ms, primary_key, read, signer, stranger, v,
 };
 use serde_json::json;
+use spawn_node_gateway::config::DEFAULT_WORKERS;
+use spawn_node_gateway::http::Timeouts;
 use spawn_node_gateway::{ResultAnswer, SpecAnswer};
 use spawn_node_proto::enroll::{EnrollAnswer, EnrollToken};
 use spawn_node_proto::grant::JobKind;
@@ -417,4 +423,300 @@ fn unknown_nodes_bad_tokens_and_a_result_before_any_beat() {
     let (line, body) = result_body(JOB, 1, b"log");
     post_result(&harness, 2, JOB, &line, &body).assert_refused(Refusal::BeatFirst, 2);
     assert_eq!(harness.gateway.db_calls(), calls);
+}
+
+fn gw_percentile_ms(sorted_us: &[u128], num: usize, den: usize) -> f64 {
+    if sorted_us.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted_us.len() - 1) * num) / den;
+    Duration::from_micros(u64::try_from(sorted_us[idx]).unwrap_or(u64::MAX)).as_secs_f64() * 1000.0
+}
+
+fn enroll_stress_nodes(
+    owner: &PostgresStore,
+    harness: &Harness,
+    spec_bytes: &[u8],
+    beat_bytes: &[u8],
+    boot: &str,
+    nodes: usize,
+) -> Vec<Arc<NodeSigner>> {
+    let primary_pub = primary_key().public_key();
+    let mut signers = Vec::with_capacity(nodes);
+    for idx in 0..nodes {
+        let idx_u64 = u64::try_from(idx).unwrap();
+        let mut seed = [0_u8; 32];
+        seed[0..8].copy_from_slice(&(idx_u64 + 10).to_le_bytes());
+        let sk = SigningKey::from_seed(&seed).unwrap();
+        let pubkey_b64 = sk.public_key().to_b64u();
+        let node_signer = NodeSigner::new(sk, boot).unwrap();
+
+        let mut tok_secret = [0_u8; 32];
+        tok_secret[0..8].copy_from_slice(&(idx_u64 + 1000).to_le_bytes());
+        let tok = EnrollToken::new(tok_secret, &primary_pub);
+        let token_sha: [u8; 32] = spawn_node_proto::codec::sha256(tok.as_str().as_bytes());
+        owner
+            .node_enroll_token(&format!("stress-n{idx:03}"), None, &token_sha, 600_000)
+            .expect("enroll token");
+
+        let mut body = format!(
+            "{{\"v\":1,\"token\":\"{}\",\"pubkey\":\"{}\",\"spec\":",
+            tok.as_str(),
+            pubkey_b64
+        )
+        .into_bytes();
+        body.extend_from_slice(spec_bytes);
+        body.push(b'}');
+
+        let xff = vec![(
+            "X-Forwarded-For".to_string(),
+            format!("198.51.99.{}", idx + 1),
+        )];
+        let enr_env = node_signer
+            .sign(Method::Post, "/node/v1/enroll", 0, now_ms(), &body)
+            .unwrap();
+        let mut enr_hdrs: Vec<(String, String)> = enr_env
+            .to_headers()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        enr_hdrs.extend(xff.clone());
+        let enrolled = harness.send("POST", "/node/v1/enroll", &enr_hdrs, Some(&body));
+        assert_eq!(enrolled.status, 200, "enroll {idx}: {}", enrolled.json());
+
+        let beat_env = node_signer
+            .sign(Method::Post, "/node/v1/heartbeat", 1, now_ms(), beat_bytes)
+            .unwrap();
+        let mut beat_hdrs: Vec<(String, String)> = beat_env
+            .to_headers()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        beat_hdrs.extend(xff);
+        let ack = harness.send("POST", "/node/v1/heartbeat", &beat_hdrs, Some(beat_bytes));
+        assert_eq!(ack.status, 200, "beat {idx}: {}", ack.json());
+
+        signers.push(Arc::new(node_signer));
+    }
+    signers
+}
+
+fn build_signed_spec_wire(
+    signer: &NodeSigner,
+    spec_bytes: &[u8],
+    seq: u64,
+    ts_ms: u64,
+    client_ip: &str,
+) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let envelope = signer
+        .sign(Method::Post, "/node/v1/spec", seq, ts_ms, spec_bytes)
+        .unwrap();
+    let mut head = String::from("POST /node/v1/spec HTTP/1.1\r\nHost: gateway\r\n");
+    for (name, value) in envelope.to_headers() {
+        let _ = write!(head, "{name}: {value}\r\n");
+    }
+    let _ = write!(head, "X-Forwarded-For: {client_ip}\r\n");
+    let _ = write!(head, "Content-Length: {}\r\n", spec_bytes.len());
+    head.push_str("Connection: close\r\n\r\n");
+    let mut wire = head.into_bytes();
+    wire.extend_from_slice(spec_bytes);
+    wire
+}
+
+fn spawn_gw_activity_sampler(
+    base_db_url: String,
+    sampling: &Arc<AtomicBool>,
+) -> std::thread::JoinHandle<(i64, i64)> {
+    let sampling_flag = Arc::clone(sampling);
+    std::thread::spawn(move || {
+        let Ok(mut child) = Command::new("psql")
+            .args([&base_db_url, "-At", "-F", ","])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return (0_i64, 0_i64);
+        };
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut peak_total = 0_i64;
+        let mut peak_gw = 0_i64;
+        let query = "select count(*)::bigint, count(*) filter (where application_name = 'spawn_gw_stress_1000' and usename like 'spawn_node_gateway%')::bigint from pg_stat_activity where datname = current_database();\n";
+        while sampling_flag.load(Ordering::Acquire) {
+            if stdin.write_all(query.as_bytes()).is_err() || stdin.flush().is_err() {
+                break;
+            }
+            let mut line = String::new();
+            if stdout.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            if let Some((tot, gw)) = line.trim().split_once(',') {
+                peak_total = peak_total.max(tot.parse().unwrap_or(0));
+                peak_gw = peak_gw.max(gw.parse().unwrap_or(0));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(stdin);
+        let _ = child.wait();
+        (peak_total, peak_gw)
+    })
+}
+
+fn run_gw_stress_burst(
+    harness: &Harness,
+    spec_bytes: &[u8],
+    signers: &[Arc<NodeSigner>],
+    boot: &str,
+    concurrency: usize,
+) -> (Vec<u128>, usize, Vec<(u16, String)>, usize, Duration) {
+    let nodes = signers.len();
+    let ts_ms = now_ms();
+    let mut prepared = Vec::with_capacity(concurrency);
+    for i in 0..concurrency {
+        let stream = std::net::TcpStream::connect(harness.addr).expect("pre-connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .expect("write timeout");
+        let seq = u64::try_from(i / nodes + 2).unwrap();
+        let node_signer = Arc::clone(&signers[i % nodes]);
+        let wire = build_signed_spec_wire(
+            &node_signer,
+            spec_bytes,
+            seq,
+            ts_ms,
+            &format!("198.51.100.{}", (i % 200) + 1),
+        );
+        prepared.push((stream, wire, node_signer, seq));
+    }
+
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let begun = Instant::now();
+    let handles: Vec<_> = prepared
+        .into_iter()
+        .map(|(mut stream, wire, node_signer, seq)| {
+            let barrier = Arc::clone(&barrier);
+            let boot = boot.to_string();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let t0 = Instant::now();
+                let _ = stream.write_all(&wire);
+                let reply = Reply::read_from(&mut stream);
+                let lat_us = t0.elapsed().as_micros();
+                let ok_sig = if reply.status == 200 {
+                    reply.verify(&node_signer.node_id, &boot, seq);
+                    true
+                } else {
+                    false
+                };
+                (
+                    reply.status,
+                    ok_sig,
+                    lat_us,
+                    String::from_utf8_lossy(&reply.body).into_owned(),
+                )
+            })
+        })
+        .collect();
+
+    let mut latencies_us = Vec::with_capacity(concurrency);
+    let mut ok = 0usize;
+    let mut failures = Vec::new();
+    let mut too_many_clients = 0usize;
+    for h in handles {
+        let (status, ok_sig, lat_us, body) = h.join().expect("gateway client thread");
+        latencies_us.push(lat_us);
+        if body
+            .to_ascii_lowercase()
+            .contains("too many clients already")
+        {
+            too_many_clients += 1;
+        }
+        if status == 200 && ok_sig {
+            ok += 1;
+        } else if failures.len() < 10 {
+            failures.push((status, body));
+        }
+    }
+    (
+        latencies_us,
+        ok,
+        failures,
+        too_many_clients,
+        begun.elapsed(),
+    )
+}
+
+#[test]
+fn thousand_concurrent_gateway_requests_stay_bounded_under_1c1g_pg() {
+    const NODES: usize = 100;
+    const CONCURRENCY: usize = 1000;
+
+    let schema = TestSchema::new("gw_stress_1000");
+    let owner = schema.store();
+    let base_gw_url =
+        spawn_postgres::role_url(&schema_url(&schema), "spawn_node_gateway").expect("gateway url");
+    let sep = if base_gw_url.contains('?') { '&' } else { '?' };
+    let gateway_url = format!("{base_gw_url}{sep}application_name=spawn_gw_stress_1000");
+
+    let opened_conns = Arc::new(AtomicUsize::new(0));
+    let opened_counter = Arc::clone(&opened_conns);
+    let harness = Arc::new(Harness::start_with_workers(
+        "gw_stress_1000",
+        Arc::new(move || {
+            let store = PostgresStore::connect(&gateway_url).map_err(|e| e.to_string())?;
+            opened_counter.fetch_add(1, Ordering::AcqRel);
+            Ok(store)
+        }),
+        "",
+        Timeouts::default(),
+        DEFAULT_WORKERS,
+    ));
+
+    let spec_bytes = Arc::new(read("spec.json"));
+    let beat_bytes = v("beat_body").into_bytes();
+    let boot = boot_id();
+    let signers = enroll_stress_nodes(&owner, &harness, &spec_bytes, &beat_bytes, &boot, NODES);
+
+    let sampling = Arc::new(AtomicBool::new(true));
+    let sampler = spawn_gw_activity_sampler(schema.url().to_string(), &sampling);
+    let (mut latencies_us, ok, failures, too_many_clients, elapsed) =
+        run_gw_stress_burst(&harness, &spec_bytes, &signers, &boot, CONCURRENCY);
+    sampling.store(false, Ordering::Release);
+    let (peak_total, peak_gw) = sampler.join().expect("psql sampler");
+
+    latencies_us.sort_unstable();
+    let p50 = gw_percentile_ms(&latencies_us, 50, 100);
+    let p95 = gw_percentile_ms(&latencies_us, 95, 100);
+    let p99 = gw_percentile_ms(&latencies_us, 99, 100);
+    let rps = f64::from(u32::try_from(CONCURRENCY).unwrap_or(u32::MAX)) / elapsed.as_secs_f64();
+    let opened = opened_conns.load(Ordering::Acquire);
+
+    eprintln!(
+        "[stress:spawn-node-gateway-1000] reqs={CONCURRENCY} ok={ok} failures={} \
+         too_many_clients={too_many_clients} workers={DEFAULT_WORKERS} opened_conns={opened}/{DEFAULT_WORKERS} \
+         peak_gw_pg_conns={peak_gw}/{DEFAULT_WORKERS} peak_pg_stat_activity={peak_total}/22 \
+         elapsed_ms={:.1} rps={rps:.1} p50_ms={p50:.2} p95_ms={p95:.2} p99_ms={p99:.2}",
+        CONCURRENCY - ok,
+        elapsed.as_secs_f64() * 1000.0
+    );
+
+    assert_eq!(too_many_clients, 0, "must never hit max_connections");
+    assert_eq!(ok, CONCURRENCY, "sample failures: {failures:?}");
+    assert!(
+        opened <= DEFAULT_WORKERS,
+        "gateway opened {opened} conns > DEFAULT_WORKERS={DEFAULT_WORKERS}"
+    );
+    assert!(
+        peak_gw <= i64::try_from(DEFAULT_WORKERS).unwrap_or(i64::MAX),
+        "peak gateway pg conns {peak_gw} > {DEFAULT_WORKERS}"
+    );
+    assert!(
+        peak_total <= 22,
+        "total pg_stat_activity {peak_total} exceeded 22"
+    );
 }

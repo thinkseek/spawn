@@ -13,8 +13,6 @@ use spawn_node_gateway::config::ConfigError;
 use spawn_node_gateway::{Config, Gateway, Settings, primary, spawn, system_clock};
 use spawn_postgres::PostgresStore;
 
-/// Worker threads, each with its own database connection.
-const WORKERS: usize = 16;
 /// A ledger statement (and a connect) gives up after this.
 const STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -35,7 +33,7 @@ fn run() -> Result<(), ConfigError> {
             "usage: spawn-node-gateway [--public-prefix /path]\n\
              environment: SPAWN_NODE_GATEWAY_DATABASE_URL (or $CREDENTIALS_DIRECTORY/spawn-node-gateway.database-url), \
              SPAWN_NODE_GATEWAY_KEY_FILE, SPAWN_NODE_ARTIFACTS, SPAWN_NODE_RESULTS (required); \
-             SPAWN_NODE_GATEWAY_LISTEN (127.0.0.1:18096), SPAWN_NODE_GATEWAY_CELLS (c0), SPAWN_NODE_GATEWAY_PUBLIC_PREFIX"
+             SPAWN_NODE_GATEWAY_LISTEN (127.0.0.1:18096), SPAWN_NODE_GATEWAY_CELLS (c0), SPAWN_NODE_GATEWAY_PUBLIC_PREFIX, SPAWN_NODE_GATEWAY_WORKERS (6)"
         );
         return Ok(());
     }
@@ -68,11 +66,13 @@ fn run() -> Result<(), ConfigError> {
     }));
     let listener = TcpListener::bind(config.listen)
         .map_err(|error| fail(format!("listen on {}: {error}", config.listen)))?;
-    let addr = spawn(listener, &gateway, WORKERS).map_err(|error| fail(error.to_string()))?;
+    let addr =
+        spawn(listener, &gateway, config.workers).map_err(|error| fail(error.to_string()))?;
     let primary = gateway.primary_key();
     eprintln!(
-        "spawn-node-gateway: listening on {addr} (cells {}), primary key {} ({})",
+        "spawn-node-gateway: listening on {addr} (cells {}, workers {}), primary key {} ({})",
         config.cells.join(","),
+        config.workers,
         primary.key_id(),
         primary.to_b64u()
     );

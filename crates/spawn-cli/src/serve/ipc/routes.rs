@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use spawn_core::id::{IdempotencyKey, SessionId};
 
 use super::IpcState;
+use super::PoolError;
 use super::events::{latest_cursor, serve_api_sse, serve_ndjson_events};
 use super::http::{IpcRequest, IpcResponse, write_response};
 use super::node::handle_node_route;
@@ -285,19 +286,9 @@ fn dispatch_buffered(req: &IpcRequest, state: &IpcState) -> IpcResponse {
 }
 
 fn handle_hello(state: &IpcState) -> IpcResponse {
-    let Some(_permit) = state.pools.reads_gate.try_acquire() else {
-        return IpcResponse::json(
-            503,
-            &json!({ "error": "busy: reads pool saturated", "code": "busy" }),
-        );
-    };
-    let reader_conn = match state.pools.reader.checkout() {
-        Ok(c) => c,
-        Err(e) => return IpcResponse::json(500, &json!({ "error": e })),
-    };
-    let latest_id = match latest_cursor(&reader_conn) {
-        Ok((id, _)) => id,
-        Err(e) => return IpcResponse::json(500, &json!({ "error": e })),
+    let (latest_id, _) = match super::with_read(&state.pools.reader, latest_cursor) {
+        Ok(cur) => cur,
+        Err((status, msg)) => return IpcResponse::json(status, &json!({ "error": msg })),
     };
     IpcResponse::json(
         200,
@@ -313,19 +304,20 @@ fn handle_hello(state: &IpcState) -> IpcResponse {
 }
 
 fn handle_api_get(_pattern: &str, req: &IpcRequest, state: &IpcState) -> IpcResponse {
-    let Some(_permit) = state.pools.reads_gate.try_acquire() else {
-        return IpcResponse::json(
-            503,
-            &json!({ "error": "busy: reads pool saturated", "code": "busy" }),
-        );
-    };
-    let reader_url = state.urls.reader.as_str();
     let cache_control = req.header("cache-control").map(str::to_string);
     let if_none_match = req.header("if-none-match").map(str::to_string);
 
     if req.path == "/api/features/coverage" && serve::mission_query(&req.query).is_some() {
-        let (status, value) =
-            serve::with_reader_url(reader_url, || serve::feature_coverage_for_query(&req.query));
+        let (status, value) = serve::run_with_reader_pool_status(
+            &state.pools.reader,
+            true,
+            || serve::feature_coverage_for_query(&req.query),
+            |(st, _)| *st == 500,
+            |err| {
+                let (st, msg) = err.status_and_message();
+                (st, json!({ "error": msg }))
+            },
+        );
         let mut resp = IpcResponse::json(status, &value).with_header("Cache-Control", "no-cache");
         if req.method == "HEAD" {
             resp.body.clear();
@@ -333,35 +325,46 @@ fn handle_api_get(_pattern: &str, req: &IpcRequest, state: &IpcState) -> IpcResp
         return resp;
     }
 
-    let answer = if req.path == "/api/features/truth" {
-        serve::with_reader_url(reader_url, || {
-            serve::feature_map::feature_truth_answer(&req.query)
-        })
-    } else if req.path == "/api/episodes" {
-        serve::with_reader_url(reader_url, || serve::episodes_answer(&req.query))
-    } else {
-        serve::with_reader_url(reader_url, || {
-            let Some(read) = serve::reader(&req.path, &req.query) else {
-                return answers::Answer {
-                    status: 404,
-                    body: json!({ "error": "not found" }).to_string(),
-                    etag: None,
-                };
-            };
-            let compute = || answers::answer(&req.path, read(), BAD_REQUEST);
-            if answers::shared(&req.path) {
-                answers::ANSWERS.get(
-                    &answers::key(&req.path, &req.query),
-                    answers::accepted_age(cache_control.as_deref()),
-                    compute,
-                )
+    let answer = serve::run_with_reader_pool_status(
+        &state.pools.reader,
+        true,
+        || {
+            if req.path == "/api/features/truth" {
+                serve::feature_map::feature_truth_answer(&req.query)
+            } else if req.path == "/api/episodes" {
+                serve::episodes_answer(&req.query)
             } else {
-                std::sync::Arc::new(compute())
+                let Some(read) = serve::reader(&req.path, &req.query) else {
+                    return answers::Answer {
+                        status: 404,
+                        body: json!({ "error": "not found" }).to_string(),
+                        etag: None,
+                    };
+                };
+                let compute = || answers::answer(&req.path, read(), BAD_REQUEST);
+                if answers::shared(&req.path) {
+                    answers::ANSWERS.get(
+                        &answers::key(&req.path, &req.query),
+                        answers::accepted_age(cache_control.as_deref()),
+                        compute,
+                    )
+                } else {
+                    std::sync::Arc::new(compute())
+                }
+                .as_ref()
+                .clone()
             }
-            .as_ref()
-            .clone()
-        })
-    };
+        },
+        |ans| ans.status == 500,
+        |err| {
+            let (status, msg) = err.status_and_message();
+            answers::Answer {
+                status,
+                body: json!({ "error": msg }).to_string(),
+                etag: None,
+            }
+        },
+    );
 
     if let Some(etag) = answer.etag.as_deref()
         && answers::not_modified(if_none_match.as_deref(), etag)
@@ -385,50 +388,60 @@ fn handle_api_get(_pattern: &str, req: &IpcRequest, state: &IpcState) -> IpcResp
 }
 
 fn handle_api_post(pattern: &str, id: &str, req: &IpcRequest, state: &IpcState) -> IpcResponse {
-    let Some(_permit) = state.pools.writes_gate.try_acquire() else {
-        return IpcResponse::json(
-            503,
-            &json!({ "error": "busy: writes pool saturated", "code": "busy" }),
-        );
-    };
     if pattern == "/api/features/scan" {
-        let (status, value) = serve::with_reader_url(&state.urls.reader, || {
-            serve::feature_coverage_for_query(&req.query)
-        });
+        let (status, value) = serve::run_with_reader_pool_status(
+            &state.pools.reader,
+            false,
+            || serve::feature_coverage_for_query(&req.query),
+            |(st, _)| *st == 500,
+            |err| {
+                let (st, msg) = err.status_and_message();
+                (st, json!({ "error": msg }))
+            },
+        );
         return IpcResponse::json(status, &value);
     }
     if pattern == "/api/features/associate" {
-        let (status, value) = match serve::with_reader_url(&state.urls.reader, || {
-            serve::feature_paths(&req.query)
-        }) {
-            Ok((root, registry)) => {
-                match serve::feature_associate_at(&root, &registry, &req.body) {
-                    Ok(ans) | Err(FeatureAssociateRefusal::Structured(ans)) => ans,
-                    Err(FeatureAssociateRefusal::Plain((st, msg))) => (st, json!({ "error": msg })),
+        let (status, value) = serve::run_with_reader_pool_status(
+            &state.pools.reader,
+            false,
+            || match serve::feature_paths(&req.query) {
+                Ok((root, registry)) => {
+                    match serve::feature_associate_at(&root, &registry, &req.body) {
+                        Ok(ans) | Err(FeatureAssociateRefusal::Structured(ans)) => ans,
+                        Err(FeatureAssociateRefusal::Plain((st, msg))) => {
+                            (st, json!({ "error": msg }))
+                        }
+                    }
                 }
-            }
-            Err(refusal) => refusal,
-        };
+                Err(refusal) => refusal,
+            },
+            |(st, _)| *st == 500,
+            |err| {
+                let (st, msg) = err.status_and_message();
+                (st, json!({ "error": msg }))
+            },
+        );
         return IpcResponse::json(status, &value);
     }
 
-    let open_human = || state.pools.human.checkout().map(serve::WriterConn::Pooled);
+    let human = state.pools.human_pool();
     let header_key = req.idempotency_key.clone();
     let result = match pattern {
         "/api/sessions/<id>/input" => {
-            serve::apply_input_body(&req.body, id, header_key, true, &open_human)
+            serve::apply_input_body(&req.body, id, header_key, true, human)
         }
-        "/api/sessions/<id>/key" => serve::apply_key_body(&req.body, id, header_key, &open_human),
+        "/api/sessions/<id>/key" => serve::apply_key_body(&req.body, id, header_key, human),
         "/api/sessions/<id>/restart" => {
-            serve::apply_move_body(&req.body, id, "restart", header_key, &open_human)
+            serve::apply_move_body(&req.body, id, "restart", header_key, human)
         }
         "/api/sessions/<id>/reassign" => {
-            serve::apply_move_body(&req.body, id, "reassign", header_key, &open_human)
+            serve::apply_move_body(&req.body, id, "reassign", header_key, human)
         }
         "/api/missions/<id>/resume" => {
-            serve::apply_resume_body(&req.body, id, header_key, true, &open_human)
+            serve::apply_resume_body(&req.body, id, header_key, true, human)
         }
-        "/api/master/message" => serve::apply_master_body(&req.body, header_key, true, &open_human),
+        "/api/master/message" => serve::apply_master_body(&req.body, header_key, true, human),
         "/api/approvals/<session_id>/act" => apply_approval_act(&req.body, id, header_key, state),
         _ => Err((404, "not found".to_string())),
     };
@@ -474,7 +487,11 @@ fn apply_approval_act(
                     format!("{BAD_REQUEST}{}", approvals::PROBE_EXTRA_FIELDS),
                 ));
             }
-            let _ = state.pools.human.checkout().map_err(|e| (500, e))?;
+            let _ = state
+                .pools
+                .human_pool()
+                .checkout_verified()
+                .map_err(PoolError::status_and_message)?;
             return Ok((200, approvals::probe_response(&session, MAX_INPUT_TEXT)));
         }
         approvals::ActRequest::Perform { key, act } => (key, act),
@@ -501,7 +518,6 @@ fn submit_approval_sending(
     sending: approvals::Send,
     state: &IpcState,
 ) -> Result<(u16, Value), (u16, String)> {
-    let human_conn = state.pools.human.checkout().map_err(|e| (500, e))?;
     let no_agent = || {
         (
             404,
@@ -511,9 +527,14 @@ fn submit_approval_sending(
             ),
         )
     };
-    let mut ids = Vec::new();
-    match &sending {
+    let ids = match &sending {
         approvals::Send::Keys(keys) => {
+            let human_conn = state
+                .pools
+                .human_pool()
+                .checkout_verified()
+                .map_err(PoolError::status_and_message)?;
+            let mut ids = Vec::new();
             for (at, name) in keys.iter().enumerate() {
                 let derived = IdempotencyKey::new(format!("{}:{}", key.as_str(), at + 1))
                     .map_err(|error| (400, format!("{BAD_REQUEST}the key: {error}")))?;
@@ -524,20 +545,26 @@ fn submit_approval_sending(
                         spawn_postgres::HumanKey::NotRunning(why)
                         | spawn_postgres::HumanKey::KeyUsed(why),
                     ) => return Err((409, why)),
-                    Err(error) => return Err((500, error.to_string())),
+                    Err(error) => {
+                        human_conn.mark_broken();
+                        return Err((500, error.to_string()));
+                    }
                 }
             }
+            ids
         }
-        approvals::Send::Text(text) => match human_conn.submit_human_input(session, key, text) {
-            Ok(spawn_postgres::HumanInput::Submitted(cmd)) => ids.push(cmd.0),
-            Ok(spawn_postgres::HumanInput::NoAgent) => return Err(no_agent()),
-            Ok(
+        approvals::Send::Text(text) => {
+            let outcome = super::with_write(state.pools.human_pool(), |human_conn| {
+                human_conn.submit_human_input(session, key, text)
+            })?;
+            match outcome {
+                spawn_postgres::HumanInput::Submitted(cmd) => vec![cmd.0],
+                spawn_postgres::HumanInput::NoAgent => return Err(no_agent()),
                 spawn_postgres::HumanInput::NotRunning(why)
-                | spawn_postgres::HumanInput::KeyUsed(why),
-            ) => return Err((409, why)),
-            Err(error) => return Err((500, error.to_string())),
-        },
-    }
+                | spawn_postgres::HumanInput::KeyUsed(why) => return Err((409, why)),
+            }
+        }
+    };
     let (keys_json, text_json) = match sending {
         approvals::Send::Keys(keys) => (
             json!(keys.iter().map(|k| k.name()).collect::<Vec<_>>()),
@@ -564,8 +591,13 @@ fn load_ipc_prompt_choices(
     doing: &str,
     state: &IpcState,
 ) -> Result<Vec<approvals::Choice>, (u16, String)> {
-    let payload =
-        serve::with_reader_url(&state.urls.reader, approvals::approvals).map_err(|e| (500, e))?;
+    let payload = serve::run_with_reader_pool_status(
+        &state.pools.reader,
+        false,
+        || approvals::approvals().map_err(|e| (500, e)),
+        |res| matches!(res, Err((500, _))),
+        |err| Err(err.status_and_message()),
+    )?;
     let item = payload["items"]
         .as_array()
         .and_then(|arr| {
@@ -753,7 +785,7 @@ mod truth_tests {
 
         with_test_default_project(&dir.0, &registry_file, || {
             // Bind a strictly read-only role URL and unused writes/node URLs.
-            let state = IpcState::new(
+            let state = IpcState::with_test_wait_timeout(
                 RoleUrls::from_explicit(
                     "postgres://spawn_reader@127.0.0.1:1/spawn".to_string(),
                     "postgres://spawn_human@127.0.0.1:1/spawn".to_string(),
@@ -761,6 +793,7 @@ mod truth_tests {
                 ),
                 dir.0.join("cas"),
                 None,
+                std::time::Duration::ZERO,
             );
 
             let resp = dispatch_buffered(
@@ -812,7 +845,7 @@ mod truth_tests {
             // Exhausting the reads pool saturates GET /api/features/truth (proving reads pool binding).
             let mut permits = Vec::new();
             for _ in 0..super::super::READS_POOL_SIZE {
-                permits.push(state.pools.reads_gate.try_acquire().unwrap());
+                permits.push(state.pools.reader.try_acquire_slot().unwrap());
             }
             let busy = dispatch_buffered(
                 &ipc_request("GET", "/api/features/truth", "", vec![]),
@@ -826,7 +859,7 @@ mod truth_tests {
     #[test]
     fn episodes_route_rejects_post_with_405_saturates_reads_pool_with_503_and_validates_query() {
         let dir = ScratchDir::new("episodes-ipc");
-        let state = IpcState::new(
+        let state = IpcState::with_test_wait_timeout(
             RoleUrls::from_explicit(
                 "postgres://spawn_reader@127.0.0.1:1/spawn".to_string(),
                 "postgres://spawn_human@127.0.0.1:1/spawn".to_string(),
@@ -834,6 +867,7 @@ mod truth_tests {
             ),
             dir.0.join("cas"),
             None,
+            std::time::Duration::ZERO,
         );
 
         let post_resp =
@@ -850,7 +884,7 @@ mod truth_tests {
 
         let mut permits = Vec::new();
         for _ in 0..super::super::READS_POOL_SIZE {
-            permits.push(state.pools.reads_gate.try_acquire().unwrap());
+            permits.push(state.pools.reader.try_acquire_slot().unwrap());
         }
         let busy = dispatch_buffered(&ipc_request("GET", "/api/episodes", "", vec![]), &state);
         assert_eq!(busy.status, 503);

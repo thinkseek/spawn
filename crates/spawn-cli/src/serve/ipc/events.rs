@@ -8,14 +8,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use spawn_core::event::GlobalPosition;
+use spawn_core::port::StoreError;
 use spawn_core::time::Timestamp;
 use spawn_postgres::{LogEntry, PostgresStore};
 
 use super::http::{MAX_IPC_BODY_BYTES, write_json_error};
 use super::{IpcState, WRITE_TIMEOUT};
-use crate::serve::stream::{CLIENT_BUFFER, Frame, PROBE, PROBE_FRAME, REPLAY_MAX, cursor};
+use crate::serve::stream::{
+    CLIENT_BUFFER, Frame, PROBE, PROBE_FRAME, REPLAY_MAX, Subscription, cursor,
+};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const POLL_WAIT: Duration = Duration::from_millis(500);
@@ -135,16 +138,13 @@ fn parse_events_query(query: &str) -> Result<StartCursor, String> {
     Ok(StartCursor::Live)
 }
 
-pub(super) fn latest_cursor(store: &PostgresStore) -> Result<(u64, i64), String> {
-    let latest_pos = store
-        .position_before(Timestamp(i64::MAX))
-        .map_err(|e| e.to_string())?;
+pub(super) fn latest_cursor(store: &PostgresStore) -> Result<(u64, i64), StoreError> {
+    let latest_pos = store.position_before(Timestamp(i64::MAX))?;
     let recorded_at_ms = if latest_pos.0 == 0 {
         0
     } else {
         store
-            .log_after(GlobalPosition(latest_pos.0.saturating_sub(1)), 1)
-            .map_err(|e| e.to_string())?
+            .log_after(GlobalPosition(latest_pos.0.saturating_sub(1)), 1)?
             .last()
             .map_or(0, |entry| entry.recorded_at.0)
     };
@@ -187,7 +187,7 @@ fn collect_ndjson_catchup(
     start: StartCursor,
     latest_id: u64,
     latest_ts: i64,
-) -> (Vec<String>, u64, i64, usize) {
+) -> Result<(Vec<String>, u64, i64, usize), StoreError> {
     let mut pending_lines = Vec::new();
     let mut cursor_id = latest_id;
     let mut cursor_ts = latest_ts;
@@ -198,13 +198,12 @@ fn collect_ndjson_catchup(
         StartCursor::Tail(n) => {
             if n > 0 && latest_id > 0 {
                 let start_pos = latest_id.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
-                if let Ok(entries) = store.log_after(GlobalPosition(start_pos), n) {
-                    replayed = entries.len();
-                    for entry in &entries {
-                        cursor_id = entry.position.0;
-                        cursor_ts = entry.recorded_at.0;
-                        pending_lines.push(event_line(entry));
-                    }
+                let entries = store.log_after(GlobalPosition(start_pos), n)?;
+                replayed = entries.len();
+                for entry in &entries {
+                    cursor_id = entry.position.0;
+                    cursor_ts = entry.recorded_at.0;
+                    pending_lines.push(event_line(entry));
                 }
             }
         }
@@ -226,7 +225,8 @@ fn collect_ndjson_catchup(
                     Some(latest_id),
                     Some(latest_ts),
                 ));
-            } else if let Ok(entries) = store.log_after(GlobalPosition(id), REPLAY_MAX + 1) {
+            } else {
+                let entries = store.log_after(GlobalPosition(id), REPLAY_MAX + 1)?;
                 if entries.len() > REPLAY_MAX {
                     pending_lines.push(resync_line(
                         "behind",
@@ -245,10 +245,71 @@ fn collect_ndjson_catchup(
             }
         }
     }
-    (pending_lines, cursor_id, cursor_ts, replayed)
+    Ok((pending_lines, cursor_id, cursor_ts, replayed))
 }
 
-/// Serve `GET /ipc/v1/events` as NDJSON over UDS (`events` pool, `spawn_reader`).
+fn emit_stream_err(writer: &mut EventTimedWriter, err: EmitError, after_id: Option<u64>) {
+    if matches!(err, EmitError::SlowConsumer | EmitError::Oversize) {
+        let _ = writer.emit_line(&resync_line("slow_consumer", after_id, None, None));
+    }
+}
+
+fn emit_ndjson_live_frame(
+    writer: &mut EventTimedWriter,
+    frame: &Frame,
+    cursor_id: &mut u64,
+    cursor_ts: &mut i64,
+) -> bool {
+    if frame.event == "resync" {
+        if let Ok(data) = serde_json::from_str::<Value>(&frame.data) {
+            let reason = data["reason"].as_str().unwrap_or("stream_reset");
+            let after_id = data["after_event_id"].as_u64();
+            let latest_id = data["latest_event_id"].as_u64();
+            if let Err(err) = writer.emit_line(&resync_line(reason, after_id, latest_id, None)) {
+                emit_stream_err(writer, err, Some(*cursor_id));
+                return false;
+            }
+            if let Some(latest_id) = latest_id {
+                *cursor_id = latest_id;
+            }
+        }
+        return true;
+    }
+    let Some(id_i64) = frame.id else {
+        return true;
+    };
+    let id = u64::try_from(id_i64).unwrap_or(0);
+    if id <= *cursor_id {
+        return true;
+    }
+    let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(&frame.data) else {
+        return true;
+    };
+    let recorded_at_ms = obj
+        .get("recorded_at_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(*cursor_ts);
+    if recorded_at_ms < *cursor_ts {
+        let _ = writer.emit_line(&resync_line(
+            "stream_reset",
+            Some(*cursor_id),
+            Some(id),
+            Some(recorded_at_ms),
+        ));
+        return false;
+    }
+    obj.insert("type".to_string(), Value::String("event".to_string()));
+    if let Err(err) = writer.emit_line(&Value::Object(obj).to_string()) {
+        emit_stream_err(writer, err, Some(*cursor_id));
+        return false;
+    }
+    *cursor_id = id;
+    *cursor_ts = recorded_at_ms;
+    true
+}
+
+/// Serve `GET /ipc/v1/events` as NDJSON over UDS via the shared `events_hub`
+/// (`EVENTS_POOL`), holding a `READS_POOL` connection only for transient catch-up.
 pub(super) fn serve_ndjson_events(
     mut stream: UnixStream,
     query: &str,
@@ -262,41 +323,36 @@ pub(super) fn serve_ndjson_events(
             return;
         }
     };
-    let Some(_permit) = state.pools.events_gate.try_acquire() else {
-        let _ = write_json_error(
-            &mut stream,
-            503,
-            "busy",
-            "busy: too many IPC event streams",
-            true,
-        );
-        return;
-    };
-    let reader_conn = match state.pools.reader.checkout() {
-        Ok(conn) => conn,
-        Err(err) => {
-            let _ = write_json_error(&mut stream, 503, "busy", &err, true);
-            return;
-        }
-    };
-    let (latest_id, latest_ts) = match latest_cursor(&reader_conn) {
-        Ok(cur) => cur,
-        Err(err) => {
-            let _ = write_json_error(&mut stream, 500, "internal", &err, true);
-            return;
-        }
-    };
+    let live = state.pools.events_hub.subscribe();
+    state.pools.ensure_stream_listener();
+    let (latest_id, latest_ts, pending_lines, mut cursor_id, mut cursor_ts, replayed) =
+        match super::with_read(&state.pools.reader, |reader_conn| {
+            let (latest_id, latest_ts) = latest_cursor(reader_conn)?;
+            let (pending_lines, cursor_id, cursor_ts, replayed) =
+                collect_ndjson_catchup(reader_conn, start, latest_id, latest_ts)?;
+            Ok((
+                latest_id,
+                latest_ts,
+                pending_lines,
+                cursor_id,
+                cursor_ts,
+                replayed,
+            ))
+        }) {
+            Ok(caught) => caught,
+            Err((status, msg)) => {
+                let code = if status == 503 { "busy" } else { "internal" };
+                let _ = write_json_error(&mut stream, status, code, &msg, true);
+                return;
+            }
+        };
+    live.floor(i64::try_from(cursor_id).unwrap_or(i64::MAX));
+
     let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\n\
                 Cache-Control: no-store\r\nConnection: close\r\n\r\n";
     if stream.write_all(head.as_bytes()).is_err() || stream.flush().is_err() {
         return;
     }
-
-    let (pending_lines, cursor_id, cursor_ts, replayed) =
-        collect_ndjson_catchup(&reader_conn, start, latest_id, latest_ts);
-    let Ok(mut listener) = reader_conn.listen() else {
-        return;
-    };
     let mut writer = EventTimedWriter::new(stream, WRITE_TIMEOUT);
     let ready = json!({
         "type": "ready",
@@ -314,91 +370,86 @@ pub(super) fn serve_ndjson_events(
             return;
         }
     }
-    run_ndjson_loop(
-        &reader_conn,
-        &mut listener,
-        &mut writer,
-        shutdown,
-        cursor_id,
-        cursor_ts,
-    );
+    let mut last_hb = Instant::now();
+    while !shutdown.load(Ordering::Acquire) {
+        match live.recv_timeout(POLL_WAIT) {
+            Ok(frame) => {
+                let prev = cursor_id;
+                if !emit_ndjson_live_frame(&mut writer, &frame, &mut cursor_id, &mut cursor_ts) {
+                    return;
+                }
+                if cursor_id != prev {
+                    last_hb = Instant::now();
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if last_hb.elapsed() >= HEARTBEAT_INTERVAL {
+                    let hb = json!({
+                        "type": "hb",
+                        "latest_id": cursor_id,
+                        "recorded_at_ms": cursor_ts,
+                    })
+                    .to_string();
+                    if let Err(err) = writer.emit_line(&hb) {
+                        emit_stream_err(&mut writer, err, Some(cursor_id));
+                        return;
+                    }
+                    last_hb = Instant::now();
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ =
+                    writer.emit_line(&resync_line("slow_consumer", Some(cursor_id), None, None));
+                return;
+            }
+        }
+    }
 }
 
-fn run_ndjson_loop(
-    store: &PostgresStore,
-    listener: &mut spawn_postgres::Listener,
+fn stream_sse_live(
     writer: &mut EventTimedWriter,
+    live: &Subscription,
     shutdown: &AtomicBool,
-    mut cursor_id: u64,
-    mut cursor_ts: i64,
+    mut sent: i64,
 ) {
     let mut last_hb = Instant::now();
     while !shutdown.load(Ordering::Acquire) {
-        let Ok(page) = store.log_after(GlobalPosition(cursor_id), REPLAY_MAX + 1) else {
-            return;
-        };
-        if page.len() > REPLAY_MAX {
-            if let Ok((now_id, now_ts)) = latest_cursor(store) {
-                let _ = writer.emit_line(&resync_line(
-                    "stream_reset",
-                    Some(cursor_id),
-                    Some(now_id),
-                    Some(now_ts),
-                ));
-                cursor_id = now_id;
-                cursor_ts = now_ts;
-            }
-            last_hb = Instant::now();
-            continue;
-        }
-        if page.is_empty() {
-            if last_hb.elapsed() >= HEARTBEAT_INTERVAL {
-                let hb = json!({
-                    "type": "hb",
-                    "latest_id": cursor_id,
-                    "recorded_at_ms": cursor_ts,
-                })
-                .to_string();
-                if let Err(err) = writer.emit_line(&hb) {
-                    emit_stream_err(writer, err, Some(cursor_id));
+        match live.recv_timeout(PROBE) {
+            Ok(frame) => {
+                if frame.id.is_some_and(|id| id <= sent) {
+                    continue;
+                }
+                sent = frame.id.unwrap_or(sent);
+                if writer.emit_raw(frame.render().as_bytes()).is_err() {
                     return;
                 }
                 last_hb = Instant::now();
             }
-            if listener.wait(POLL_WAIT).is_err() {
+            Err(RecvTimeoutError::Timeout) => {
+                let frame_bytes = if last_hb.elapsed() >= HEARTBEAT_INTERVAL {
+                    last_hb = Instant::now();
+                    b": keepalive\n\n".as_slice()
+                } else {
+                    PROBE_FRAME.as_bytes()
+                };
+                if writer.emit_raw(frame_bytes).is_err() {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = writer.emit_raw(
+                    crate::serve::stream::resync("slow_consumer", sent, None)
+                        .render()
+                        .as_bytes(),
+                );
                 return;
             }
-            continue;
-        }
-        for entry in &page {
-            if entry.recorded_at.0 < cursor_ts {
-                let _ = writer.emit_line(&resync_line(
-                    "stream_reset",
-                    Some(cursor_id),
-                    Some(entry.position.0),
-                    Some(entry.recorded_at.0),
-                ));
-                return;
-            }
-            cursor_id = entry.position.0;
-            cursor_ts = entry.recorded_at.0;
-            if let Err(err) = writer.emit_line(&event_line(entry)) {
-                emit_stream_err(writer, err, Some(cursor_id));
-                return;
-            }
-            last_hb = Instant::now();
         }
     }
 }
 
-fn emit_stream_err(writer: &mut EventTimedWriter, err: EmitError, after_id: Option<u64>) {
-    if matches!(err, EmitError::SlowConsumer | EmitError::Oversize) {
-        let _ = writer.emit_line(&resync_line("slow_consumer", after_id, None, None));
-    }
-}
-
-/// Serve `GET /api/stream` directly over UDS if requested without an edge
-/// fan-out proxy (uses the same `spawn_reader` `events` pool).
+/// Serve `GET /api/stream` over UDS via the shared `events_hub` (`EVENTS_POOL`),
+/// borrowing `READS_POOL` strictly for transient catch-up before streaming.
 pub(super) fn serve_api_sse(
     mut stream: UnixStream,
     query: &str,
@@ -413,31 +464,20 @@ pub(super) fn serve_api_sse(
             return;
         }
     };
-    let Some(_permit) = state.pools.events_gate.try_acquire() else {
-        let _ = write_json_error(&mut stream, 503, "busy", "busy: too many streams", true);
-        return;
-    };
-    let reader_conn = match state.pools.reader.checkout() {
-        Ok(conn) => conn,
-        Err(err) => {
-            let _ = write_json_error(&mut stream, 503, "busy", &err, true);
-            return;
-        }
-    };
-    let (first, mut sent) = match crate::serve::stream::catch_up(&reader_conn, wanted) {
+    let live = state.pools.events_hub.subscribe();
+    state.pools.ensure_stream_listener();
+    let (first, sent) = match super::with_read(&state.pools.reader, |reader_conn| {
+        crate::serve::stream::catch_up_store(reader_conn, wanted)
+    }) {
         Ok(caught) => caught,
-        Err(err) => {
-            let _ = write_json_error(&mut stream, 500, "internal", &err, true);
+        Err((status, msg)) => {
+            let code = if status == 503 { "busy" } else { "internal" };
+            let _ = write_json_error(&mut stream, status, code, &msg, true);
             return;
         }
     };
-    let mut listener = match reader_conn.listen() {
-        Ok(listener) => listener,
-        Err(err) => {
-            let _ = write_json_error(&mut stream, 500, "internal", &err.to_string(), true);
-            return;
-        }
-    };
+    live.floor(sent);
+
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n\
                 Cache-Control: no-cache, no-store\r\nConnection: close\r\n\r\nretry: 3000\n\n";
     if stream.write_all(head.as_bytes()).is_err() || stream.flush().is_err() {
@@ -449,46 +489,5 @@ pub(super) fn serve_api_sse(
             return;
         }
     }
-    let mut last_hb = Instant::now();
-    while !shutdown.load(Ordering::Acquire) {
-        let start_from = GlobalPosition(u64::try_from(sent.max(0)).unwrap_or(0));
-        let Ok(page) = reader_conn.log_after(start_from, REPLAY_MAX + 1) else {
-            return;
-        };
-        if page.is_empty() {
-            let frame_bytes = if last_hb.elapsed() >= HEARTBEAT_INTERVAL {
-                last_hb = Instant::now();
-                b": keepalive\n\n".as_slice()
-            } else {
-                PROBE_FRAME.as_bytes()
-            };
-            if writer.emit_raw(frame_bytes).is_err() || listener.wait(PROBE).is_err() {
-                return;
-            }
-            continue;
-        }
-        for entry in &page {
-            let id = i64::try_from(entry.position.0).unwrap_or(i64::MAX);
-            let frame = Frame {
-                id: Some(id),
-                event: entry.event_name.clone(),
-                data: json!({
-                    "id": entry.position.0,
-                    "agent_id": entry.agent_id,
-                    "session_id": entry.session_id,
-                    "execution_id": entry.execution_id,
-                    "source": entry.source,
-                    "event_name": entry.event_name,
-                    "detail": entry.detail,
-                    "recorded_at_ms": entry.recorded_at.0,
-                })
-                .to_string(),
-            };
-            if writer.emit_raw(frame.render().as_bytes()).is_err() {
-                return;
-            }
-            sent = id;
-            last_hb = Instant::now();
-        }
-    }
+    stream_sse_live(&mut writer, &live, shutdown, sent);
 }

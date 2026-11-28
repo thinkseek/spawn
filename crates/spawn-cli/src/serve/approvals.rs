@@ -102,8 +102,8 @@ use spawn_core::port::TerminalHost;
 use tiny_http::{Method, Request};
 
 use super::{
-    Access, BAD_REQUEST, Shared, idempotency, json_response, not_allowed, now_ms, session_id,
-    typed_text, write_body, writer,
+    Access, BAD_REQUEST, Shared, checkout_human, idempotency, json_response, not_allowed, now_ms,
+    session_id, typed_text, write_body,
 };
 
 /// The pane lines a prompt is looked for in (the bottom of the screen).
@@ -1370,7 +1370,7 @@ pub(super) fn what_to_send(
 }
 
 fn submit_sending(
-    store: &spawn_postgres::PostgresStore,
+    shared: &Shared,
     session: &SessionId,
     key: &IdempotencyKey,
     sending: &Send,
@@ -1387,6 +1387,7 @@ fn submit_sending(
     let mut ids = Vec::new();
     match sending {
         Send::Keys(keys) => {
+            let store = checkout_human(shared)?;
             for (at, name) in keys.iter().enumerate() {
                 let derived = IdempotencyKey::new(format!("{}:{}", key.as_str(), at + 1))
                     .map_err(|error| (400, format!("{BAD_REQUEST}the key: {error}")))?;
@@ -1397,19 +1398,25 @@ fn submit_sending(
                         spawn_postgres::HumanKey::NotRunning(why)
                         | spawn_postgres::HumanKey::KeyUsed(why),
                     ) => return Err((409, why)),
-                    Err(error) => return Err((500, error.to_string())),
+                    Err(error) => {
+                        store.mark_broken();
+                        return Err((500, error.to_string()));
+                    }
                 }
             }
         }
-        Send::Text(text) => match store.submit_human_input(session, key, text) {
-            Ok(spawn_postgres::HumanInput::Submitted(command)) => ids.push(command.0),
-            Ok(spawn_postgres::HumanInput::NoAgent) => return Err(no_agent()),
-            Ok(
+        Send::Text(text) => {
+            let human = super::human_pool(shared)?;
+            let outcome = super::ipc::with_write(&human, |store| {
+                store.submit_human_input(session, key, text)
+            })?;
+            match outcome {
+                spawn_postgres::HumanInput::Submitted(command) => ids.push(command.0),
+                spawn_postgres::HumanInput::NoAgent => return Err(no_agent()),
                 spawn_postgres::HumanInput::NotRunning(why)
-                | spawn_postgres::HumanInput::KeyUsed(why),
-            ) => return Err((409, why)),
-            Err(error) => return Err((500, error.to_string())),
-        },
+                | spawn_postgres::HumanInput::KeyUsed(why) => return Err((409, why)),
+            }
+        }
     }
     Ok(ids)
 }
@@ -1430,7 +1437,7 @@ pub(super) fn acted(
             if header_key.is_some() {
                 return Err((400, format!("{BAD_REQUEST}{PROBE_EXTRA_FIELDS}")));
             }
-            writer(shared).map_err(|error| (500, error))?;
+            checkout_human(shared)?;
             return Ok((200, probe_response(&session, super::MAX_INPUT_TEXT)));
         }
         ActRequest::Perform { key, act } => (key, act),
@@ -1447,8 +1454,7 @@ pub(super) fn acted(
     }
     let action = act.action_name();
     let sending = what_to_send(act, &session, prompt)?;
-    let store = writer(shared).map_err(|error| (500, error))?;
-    let ids = submit_sending(&store, &session, &key, &sending)?;
+    let ids = submit_sending(shared, &session, &key, &sending)?;
     let (keys, text) = match sending {
         Send::Keys(keys) => (
             json!(keys.iter().map(|key| key.name()).collect::<Vec<_>>()),
