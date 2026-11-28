@@ -99,3 +99,71 @@ test("buildSessionStream builds ordered turns, durations, repeat loops, slow fla
   );
   assert.equal(filterStreamSteps(turn1.steps, "issues").length, 3);
 });
+
+test("buildSessionStream orders steps and turns by authoritative session_seq even under clock skew", () => {
+  const t0 = 1_794_224_000_000;
+  // Earlier seq has a later recorded_at_ms timestamp (e.g., host NTP drift or skew).
+  const events: TimelineEvent[] = [
+    ev(10, t0 + 20_000, "message.received", { prompt: "Step seq test" }),
+    ev(11, t0 + 25_000, "tool.started", { tool_name: "Read", tool_use_id: "r_first", summary: "first.ts" }),
+    ev(12, t0 + 26_000, "tool.completed", { tool_use_id: "r_first" }),
+    ev(13, t0 + 18_000, "tool.started", { tool_name: "Edit", tool_use_id: "e_second", summary: "second.ts" }),
+    ev(14, t0 + 19_000, "tool.completed", { tool_use_id: "e_second" }),
+    ev(15, t0 + 27_000, "turn.stopped", {}),
+  ];
+
+  const stream = buildSessionStream(events, t0 + 30_000);
+  assert.equal(stream.turns.length, 1);
+  assert.deepEqual(
+    stream.turns[0].steps.map((s) => s.summary),
+    ["first.ts", "second.ts"],
+  );
+  assert.deepEqual(
+    stream.turns[0].steps.map((s) => s.index),
+    [1, 2],
+  );
+});
+
+test("buildSessionStream detects A -> B -> A -> B alternating loops without false positives on A -> B -> A or A -> B -> C -> A -> B", () => {
+  const t0 = 1_794_224_000_000;
+  const mkPair = (seqBase: number, id: string, tool: string, summary: string): TimelineEvent[] => [
+    ev(seqBase, t0 + seqBase * 1_000, "tool.started", { tool_name: tool, tool_use_id: id, summary }),
+    ev(seqBase + 1, t0 + seqBase * 1_000 + 500, "tool.completed", { tool_use_id: id }),
+  ];
+
+  // 1) Pure A -> B -> A -> B alternating loop should flag all 4 steps with cycles=2 and repeatPattern='alternating'
+  const altLoopEvents: TimelineEvent[] = [
+    ev(1, t0 + 500, "message.received", { prompt: "Inspect loop" }),
+    ...mkPair(2, "t1", "Read", "src/a.ts"),
+    ...mkPair(4, "t2", "Edit", "src/a.ts"),
+    ...mkPair(6, "t3", "Read", "src/a.ts"),
+    ...mkPair(8, "t4", "Edit", "src/a.ts"),
+    ev(10, t0 + 12_000, "turn.stopped", {}),
+  ];
+  const altStream = buildSessionStream(altLoopEvents, t0 + 15_000);
+  assert.equal(altStream.summary.repeatedSteps, 4);
+  assert.deepEqual(
+    altStream.turns[0].steps.map((s) => [s.repeatedCount, s.repeatPattern]),
+    [
+      [2, "alternating"],
+      [2, "alternating"],
+      [2, "alternating"],
+      [2, "alternating"],
+    ],
+  );
+  assert.equal(filterStreamSteps(altStream.turns[0].steps, "issues").length, 4);
+
+  // 2) Interrupted A -> B -> C -> A -> B and short A -> B -> A must NOT flag alternating loops
+  const nonLoopEvents: TimelineEvent[] = [
+    ev(1, t0 + 500, "message.received", { prompt: "Non-loop" }),
+    ...mkPair(2, "n1", "Read", "src/a.ts"),
+    ...mkPair(4, "n2", "Edit", "src/a.ts"),
+    ...mkPair(6, "n3", "Bash", "pnpm test"),
+    ...mkPair(8, "n4", "Read", "src/a.ts"),
+    ...mkPair(10, "n5", "Edit", "src/a.ts"),
+    ev(12, t0 + 20_000, "turn.stopped", {}),
+  ];
+  const nonLoop = buildSessionStream(nonLoopEvents, t0 + 25_000);
+  assert.equal(nonLoop.summary.repeatedSteps, 0);
+  assert.ok(nonLoop.turns[0].steps.every((s) => s.repeatedCount === 1 && s.repeatPattern === null));
+});

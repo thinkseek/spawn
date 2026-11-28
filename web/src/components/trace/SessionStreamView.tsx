@@ -152,7 +152,11 @@ function StepRow({ step, locale }: { step: StreamStep; locale: Locale }) {
           {step.repeatedCount >= 2 && (
             <span
               className="tnum inline-flex items-center gap-0.5 rounded-chip bg-wait-tint px-1.5 py-px text-micro font-medium text-warning"
-              title={tr(locale, "连续重复执行相同操作（长程循环信号）", "Consecutive identical step (possible loop)")}
+              title={
+                step.repeatPattern === "alternating"
+                  ? tr(locale, "交替重复执行相同步骤序列（疑似 A→B→A→B 循环）", "Alternating repeated step sequence (possible A→B→A→B loop)")
+                  : tr(locale, "连续重复执行相同操作（长程循环信号）", "Consecutive identical step (possible loop)")
+              }
             >
               <Repeat size={10} aria-hidden="true" />
               ×{step.repeatedCount}
@@ -430,7 +434,7 @@ export function SessionStreamView({
             hint={tr(
               locale,
               "可切换至「原始事件」查看底层事件日志。",
-              "Switch to Raw List to inspect underlying log records.",
+              "Switch to List to inspect underlying log records.",
             )}
           />
         ) : (

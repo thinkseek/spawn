@@ -26,13 +26,12 @@ import type {
   Digest,
   MissionProgressRow,
   MissionProgressSummary,
-  MissionsToday,
   NeedItem,
   NoteRow,
   NotesShown,
   SystemStatusModel,
 } from "../../home";
-import { awayFrom, needsSummary, noWorkText, quietText } from "../../home";
+import { awayFrom, needsSummary } from "../../home";
 import { tr } from "../../i18n";
 import { HomeCard } from "../aui/HomeCard";
 import { Badge, Button, Card, EmptyState } from "../aui/kit";
@@ -571,15 +570,15 @@ export function NeedsYou({
     <HomeCard
       icon={<CircleAlert size={14} className={act ? "text-destructive" : undefined} />}
       title={tr(locale, "待你处理", "Action Required")}
-      meta={<span className="tnum text-caption text-muted-foreground">{needsSummary(items)}</span>}
+      meta={<span className="tnum text-caption text-muted-foreground">{needsSummary(items, locale)}</span>}
     >
       <ul className="divide-y divide-surface-border">
         {items.map((item) => (
           <li key={item.key} className="flex min-w-0 flex-wrap items-start gap-x-3 gap-y-2 py-2.5 first:pt-0 last:pb-0">
             {item.tone === "act" ? (
-              <Flag size={13} className="mt-0.5 shrink-0 text-destructive" aria-label="to act on" />
+              <Flag size={13} className="mt-0.5 shrink-0 text-destructive" aria-label={tr(locale, "待处理", "to act on")} />
             ) : (
-              <Info size={13} className="mt-0.5 shrink-0 text-faint-foreground" aria-label="to know" />
+              <Info size={13} className="mt-0.5 shrink-0 text-faint-foreground" aria-label={tr(locale, "仅知悉", "to know")} />
             )}
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 items-baseline gap-2">
@@ -591,7 +590,7 @@ export function NeedsYou({
               <NeedDetail item={item} />
               {showJudgeHint && item.judge && (
                 <p className="mt-0.5 min-w-0 truncate text-caption text-faint-foreground">
-                  Should not have been raised?{" "}
+                  {tr(locale, "误报或已过时？", "Should not have been raised?")}{" "}
                   <code className="rounded-chip bg-inset px-1 font-mono text-micro text-muted-foreground select-all">
                     {item.judge}
                   </code>
@@ -617,75 +616,6 @@ export function NeedsYou({
           </li>
         ))}
       </ul>
-    </HomeCard>
-  );
-}
-
-export function MissionsTodayCard({ model, onOpen }: { model: MissionsToday; onOpen: () => void }) {
-  return (
-    <HomeCard icon={<Target size={14} />} title="Missions" meta={<span className="text-caption text-muted-foreground">today</span>}>
-      {model.rows.length === 0 ? (
-        <p className="text-caption text-muted-foreground">{noWorkText(model)}</p>
-      ) : (
-        <ul className="divide-y divide-surface-border">
-          {model.rows.map((row) => (
-            <li key={row.id ?? row.name}>
-              <button
-                type="button"
-                onClick={onOpen}
-                className={cx("-mx-2 block w-[calc(100%+1rem)] rounded-control px-2 py-2.5 text-left hover:bg-surface-hover", FOCUS_RING_INSET)}
-              >
-                <div className="flex min-w-0 items-baseline gap-2">
-                  <span className="tnum shrink-0 text-caption text-faint-foreground">#{row.id}</span>
-                  <span className="shrink-0 text-label font-semibold text-foreground">{row.name}</span>
-                  {row.paused && <Badge tone="neutral">paused</Badge>}
-                  {row.halted && <Badge tone="danger">halted</Badge>}
-                  <span className="tnum ml-auto shrink-0 text-caption text-muted-foreground">
-                    {row.landedToday} landed today
-                  </span>
-                </div>
-                <ul className="mt-1 space-y-0.5">
-                  {row.inFlight.map((task) => (
-                    <li key={task.task_id ?? task.title} className="flex min-w-0 items-baseline gap-2 text-caption">
-                      <span className="tnum shrink-0 rounded-chip bg-inset px-1.5 py-px font-mono text-micro text-muted-foreground shadow-hairline">
-                        T{task.task_id}
-                      </span>
-                      <span className="min-w-0 flex-1 truncate text-foreground">{task.title ?? "untitled"}</span>
-                      {task.conflictText && (
-                        <span className="shrink-0 font-medium text-warning" title="Each conflict spent a worker round and a gate run again">
-                          {task.conflictText}
-                        </span>
-                      )}
-                      <span className="tnum shrink-0 text-muted-foreground">
-                        {task.state}
-                        {task.since_ms !== null && ` ${sinceText(task.since_ms)}`}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-                {row.lastRejection && (
-                  <p className="mt-1 truncate text-caption text-muted-foreground">
-                    last sent back: T{row.lastRejection.task_id} {row.lastRejection.verdict}{" "}
-                    {relativeTime(row.lastRejection.at_ms)}
-                    {row.lastRejection.reason && <> · {row.lastRejection.reason}</>}
-                  </p>
-                )}
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-      {(model.quiet.length > 0 || model.closed > 0) && (
-        <p className="border-t border-surface-border pt-2 text-caption text-faint-foreground">
-          {model.quiet.length > 0 && (
-            <>
-              Nothing open: {quietText(model.quiet)}
-            </>
-          )}
-          {model.quiet.length > 0 && model.closed > 0 && " · "}
-          {model.closed > 0 && `${model.closed} closed`}
-        </p>
-      )}
     </HomeCard>
   );
 }

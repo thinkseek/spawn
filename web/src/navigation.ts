@@ -122,7 +122,12 @@ export function isDiagnosticView(view: NavView): boolean {
   return DIAGNOSTIC_SET.has(view);
 }
 
-/** Auto-expands Diagnostics only when the user opened it or navigated directly to a diagnostic route. */
-export function shouldExpandDiagnostics(stored: "open" | "closed", activeView: NavView): boolean {
+/** Auto-expands Diagnostics when the user navigated directly to a diagnostic route, unless manually toggled on that route. */
+export function shouldExpandDiagnostics(
+  stored: "open" | "closed",
+  activeView: NavView,
+  manualOverride: "open" | "closed" | null = null,
+): boolean {
+  if (manualOverride !== null) return manualOverride === "open";
   return stored === "open" || isDiagnosticView(activeView);
 }

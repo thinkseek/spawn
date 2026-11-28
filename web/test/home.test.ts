@@ -1148,7 +1148,10 @@ test("tasks made at the same time order by id for their earlier attempts (object
 
 test("Home's in-flight line shows the conflict text beside the task's state, in the warning tone", () => {
   const home = readFileSync(new URL("../src/components/home/Home.tsx", import.meta.url), "utf8");
-  const line = home.slice(home.indexOf("row.inFlight.map"), home.indexOf("row.lastRejection &&"));
+  const start = home.indexOf("shownTasks.map");
+  const end = home.indexOf("{hiddenCount > 0", start);
+  assert.ok(start >= 0 && end > start, "MissionCompletionCard renders shownTasks");
+  const line = home.slice(start, end);
   assert.match(line, /\{task\.conflictText && \(\s*<span className="[^"]*text-warning[^"]*"[^>]*>\s*\{task\.conflictText\}/);
   assert.ok(line.indexOf("task.conflictText") < line.indexOf("{task.state}"), "the text sits beside the state");
 });

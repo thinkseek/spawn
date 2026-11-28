@@ -43,7 +43,7 @@ import {
   type NavView,
 } from "../navigation";
 import type { FleetContext } from "../ordering";
-import { AGENT_GROUP_LABEL, groupAgents, heldTask, stateWords } from "../ordering";
+import { agentGroupLabel, groupAgents, heldTask, stateWords } from "../ordering";
 import { recordedState } from "../recordedState";
 import type { ThemeChoice } from "../theme";
 import { THEME_CHOICES, THEME_KEY, useTheme } from "../theme";
@@ -225,6 +225,18 @@ function SideTabList({
     return undefined;
   };
 
+  const compactLabelFor = (id: NavView): string => {
+    const base = navLabel(id, locale);
+    if (id !== "fleet") return base;
+    if (attention.count !== null && attention.count > 0) {
+      return tr(locale, `${base}（${attention.count} 项待处理）`, `${base} (${attention.count} pending)`);
+    }
+    if (attention.count === null && attention.error) {
+      return `${base} (/api/attention: ${attention.error})`;
+    }
+    return base;
+  };
+
   return (
     <nav aria-label={tr(locale, "主导航", "Sections")} className="px-2 pt-2 pb-2">
       {!compact && <NavSectionLabel label={tr(locale, "核心", "Core")} />}
@@ -235,9 +247,12 @@ function SideTabList({
             active={view === id}
             onClick={() => activate(id)}
             icon={navIcon(id)}
-            label={navLabel(id, locale)}
+            label={compact ? compactLabelFor(id) : navLabel(id, locale)}
             compact={compact}
             trailing={renderTrailing(id)}
+            compactBadge={
+              compact && id === "fleet" ? <AttentionCount {...attention} badgeOnly /> : undefined
+            }
           />
         ))}
       </div>
@@ -313,6 +328,23 @@ function SideTabList({
   );
 }
 
+function useDiagnosticsToggle(view: View) {
+  const [diagnosticsStored, setDiagnosticsStored] = useStoredChoice(
+    "spawn.sidebar.diagnostics",
+    ["open", "closed"] as const,
+    "closed",
+  );
+  const [override, setOverride] = useState<{ view: View; state: "open" | "closed" } | null>(null);
+  const manualOverride = override?.view === view ? override.state : null;
+  const diagnosticsOpen = shouldExpandDiagnostics(diagnosticsStored, view, manualOverride);
+  const toggleDiagnostics = () => {
+    const next = diagnosticsOpen ? "closed" : "open";
+    setDiagnosticsStored(next);
+    setOverride({ view, state: next });
+  };
+  return { diagnosticsOpen, toggleDiagnostics };
+}
+
 export function Sidebar(props: SidebarProps) {
   const {
     sessions,
@@ -333,12 +365,7 @@ export function Sidebar(props: SidebarProps) {
     "expanded",
   );
   const compact = railMode === "collapsed";
-  const [diagnosticsStored, setDiagnosticsStored] = useStoredChoice(
-    "spawn.sidebar.diagnostics",
-    ["open", "closed"] as const,
-    "closed",
-  );
-  const diagnosticsOpen = shouldExpandDiagnostics(diagnosticsStored, view);
+  const { diagnosticsOpen, toggleDiagnostics } = useDiagnosticsToggle(view);
   const [sessionsStored, setSessionsStored] = useStoredChoice(
     "spawn.sidebar.sessions",
     ["open", "closed"] as const,
@@ -410,9 +437,7 @@ export function Sidebar(props: SidebarProps) {
           rsi={rsi}
           handlers={handlers}
           diagnosticsOpen={diagnosticsOpen}
-          onToggleDiagnostics={() =>
-            setDiagnosticsStored(diagnosticsOpen ? "closed" : "open")
-          }
+          onToggleDiagnostics={toggleDiagnostics}
         />
 
         <div className="mx-2 border-t border-sidebar-border/80 pt-2">
@@ -564,9 +589,11 @@ export function Sidebar(props: SidebarProps) {
                 "size-2 shrink-0 rounded-full",
                 error ? "bg-destructive" : "bg-success",
               )}
-              title={`${window.location.host} · ${error ? "offline" : "online"}`}
+              title={`${window.location.host} · ${error ? tr(locale, "离线", "offline") : tr(locale, "在线", "online")}`}
             />
             <LocaleSwitch compact />
+            <ThemeSwitch compact />
+            {onSignOut && <SignOutButton onSignOut={onSignOut} compact iconOnly />}
           </>
         ) : (
           <>
@@ -599,6 +626,19 @@ export function Sidebar(props: SidebarProps) {
 /** States whose words a held task's says better: the worker idles at its
  * prompt while its task is judged or lands. */
 const AT_THE_GATE = new Set(["gating", "landing", "in review"]);
+
+const GATE_STATE_ZH: Record<string, string> = {
+  gating: "门禁校验中",
+  landing: "正在合入",
+  "in review": "评审中",
+};
+
+const RECORDED_STATE_ZH: Record<string, string> = {
+  Running: "运行中",
+  Waiting: "等待中",
+  Ended: "已结束",
+  "No execution": "无执行记录",
+};
 
 function GroupedSessions({
   agents,
@@ -648,11 +688,12 @@ function GroupedSessions({
         if (group.agents.length === 0) return null;
         const folds = group.id === "ended" && !searching;
         const open = !folds || ended === "open";
+        const groupTitle = agentGroupLabel(group.id, locale);
         return (
-          <section key={group.id} aria-label={AGENT_GROUP_LABEL[group.id]}>
+          <section key={group.id} aria-label={groupTitle}>
             <GroupHeader
               className="px-2 pb-1"
-              label={AGENT_GROUP_LABEL[group.id]}
+              label={groupTitle}
               count={group.agents.length}
               expanded={folds ? open : undefined}
               onToggle={folds ? () => setEnded(open ? "closed" : "open") : undefined}
@@ -667,8 +708,10 @@ function GroupedSessions({
                     const recorded = recordedState(agent);
                     const label =
                       held && AT_THE_GATE.has(held.label)
-                        ? `Task ${held.label}`
-                        : recorded.label;
+                        ? tr(locale, `任务 ${GATE_STATE_ZH[held.label] ?? held.label}`, `Task ${held.label}`)
+                        : locale === "zh"
+                          ? (RECORDED_STATE_ZH[recorded.label] ?? recorded.label)
+                          : recorded.label;
                     const at =
                       recorded.since ?? observed.get(agent.session_id)?.recorded_at_ms ?? null;
                     return (
@@ -680,7 +723,7 @@ function GroupedSessions({
                           line={
                             named && named !== held
                               ? named.title
-                                ? `last: ${named.title}`
+                                ? tr(locale, `上次：${named.title}`, `last: ${named.title}`)
                                 : null
                               : (named?.title ?? agent.task_title)
                           }
@@ -688,7 +731,13 @@ function GroupedSessions({
                           label={label}
                           at={at}
                           attention={agent.attention}
-                          task={held ? `T${held.task_id ?? "?"} ${held.label}${held.title ? ` · ${held.title}` : ""}` : null}
+                          task={
+                            held
+                              ? `T${held.task_id ?? "?"} ${
+                                  locale === "zh" ? (GATE_STATE_ZH[held.label] ?? held.label) : held.label
+                                }${held.title ? ` · ${held.title}` : ""}`
+                              : null
+                          }
                           selected={agent.session_id === selectedId}
                           onSelect={onSelect}
                         />
@@ -731,6 +780,7 @@ function SessionRow({
   selected: boolean;
   onSelect: (sessionId: string) => void;
 }) {
+  const { locale } = useLocale();
   return (
     <button
       type="button"
@@ -760,9 +810,12 @@ function SessionRow({
           />
         )}
         {attention && (
-          <span className="ml-auto flex shrink-0 text-warning" title="Escalated">
+          <span
+            className="ml-auto flex shrink-0 text-warning"
+            title={tr(locale, "已上报关注", "Escalated")}
+          >
             <BellRing size={11} aria-hidden="true" />
-            <span className="sr-only">escalated</span>
+            <span className="sr-only">{tr(locale, "已上报关注", "escalated")}</span>
           </span>
         )}
       </span>
@@ -792,6 +845,7 @@ function NavItem({
   label,
   compact = false,
   trailing,
+  compactBadge,
 }: {
   active: boolean;
   onClick: () => void;
@@ -799,6 +853,7 @@ function NavItem({
   label: string;
   compact?: boolean;
   trailing?: ReactNode;
+  compactBadge?: ReactNode;
 }) {
   return (
     <button
@@ -808,7 +863,7 @@ function NavItem({
       title={compact ? label : undefined}
       aria-label={compact ? label : undefined}
       className={cx(
-        "flex h-8 w-full items-center rounded-control text-left text-label transition-colors pointer-coarse:h-11",
+        "relative flex h-8 w-full items-center rounded-control text-left text-label transition-colors pointer-coarse:h-11",
         compact ? "justify-center px-0" : "gap-2.5 px-2.5",
         FOCUS_RING_INSET,
         active
@@ -819,6 +874,9 @@ function NavItem({
       <span className={active ? "text-foreground" : "text-faint-foreground"}>
         {icon}
       </span>
+      {compact && compactBadge && (
+        <span className="pointer-events-none absolute top-0.5 right-0.5">{compactBadge}</span>
+      )}
       {!compact && <span className="min-w-0 truncate">{label}</span>}
       {!compact && trailing && <span className="ml-auto shrink-0">{trailing}</span>}
     </button>
@@ -826,13 +884,23 @@ function NavItem({
 }
 
 /** Genuine actionable human item badge on Home (never noisy alert counts). */
-function AttentionCount({ count, error }: HumanCount) {
+function AttentionCount({
+  count,
+  error,
+  badgeOnly = false,
+}: HumanCount & { badgeOnly?: boolean }) {
+  const { locale } = useLocale();
   if (count === null) {
     if (!error) return null;
     return (
       <span
         title={`/api/attention: ${error}`}
-        className="tnum rounded bg-muted px-1.5 py-px text-micro font-medium text-faint-foreground"
+        className={cx(
+          "tnum font-medium text-faint-foreground",
+          badgeOnly
+            ? "inline-flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-muted px-1 text-[10px] leading-none ring-1 ring-sidebar"
+            : "rounded bg-muted px-1.5 py-px text-micro",
+        )}
       >
         ?
       </span>
@@ -841,13 +909,25 @@ function AttentionCount({ count, error }: HumanCount) {
   if (count <= 0) return null;
   return (
     <span
-      title={`${count} pending action${count === 1 ? "" : "s"}`}
-      className="tnum rounded bg-wait-tint px-1.5 py-px text-micro font-medium text-warning"
+      title={tr(
+        locale,
+        `${count} 项待处理`,
+        `${count} pending action${count === 1 ? "" : "s"}`,
+      )}
+      className={cx(
+        "tnum font-medium text-warning",
+        badgeOnly
+          ? "inline-flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-wait-tint px-1 text-[10px] leading-none font-semibold ring-1 ring-sidebar"
+          : "rounded bg-wait-tint px-1.5 py-px text-micro",
+      )}
     >
-      {count}
+      {badgeOnly && count > 99 ? "99+" : count}
     </span>
   );
 }
+
+const DRAWER_FOCUSABLE_SELECTOR =
+  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 /** Compact header + slide-over left Side Tab drawer below the `md` breakpoint. */
 export function MobileNav(
@@ -877,18 +957,52 @@ export function MobileNav(
   const { view, rsi = null, error = null, attention, onSignOut } = props;
   const { locale } = useLocale();
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [diagnosticsStored, setDiagnosticsStored] = useStoredChoice(
-    "spawn.sidebar.diagnostics",
-    ["open", "closed"] as const,
-    "closed",
-  );
-  const diagnosticsOpen = shouldExpandDiagnostics(diagnosticsStored, view);
+  const { diagnosticsOpen, toggleDiagnostics } = useDiagnosticsToggle(view);
   const handlers = viewHandlersOf(props);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const drawerRef = useRef<HTMLElement>(null);
+  const closeBtnRef = useRef<HTMLButtonElement>(null);
+  const wasOpenRef = useRef(false);
 
   useEffect(() => {
-    if (!drawerOpen) return;
+    if (!drawerOpen) {
+      if (wasOpenRef.current) {
+        wasOpenRef.current = false;
+        triggerRef.current?.focus();
+      }
+      return;
+    }
+    wasOpenRef.current = true;
+    const target = closeBtnRef.current ?? drawerRef.current;
+    target?.focus();
+
     const onKey = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") setDrawerOpen(false);
+      if (event.key === "Escape") {
+        setDrawerOpen(false);
+        return;
+      }
+      if (event.key !== "Tab" || !drawerRef.current) return;
+      const focusables = Array.from(
+        drawerRef.current.querySelectorAll<HTMLElement>(DRAWER_FOCUSABLE_SELECTOR),
+      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+      if (focusables.length === 0) {
+        event.preventDefault();
+        drawerRef.current.focus();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      if (!active || !drawerRef.current.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && active === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -898,6 +1012,7 @@ export function MobileNav(
     <>
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-sidebar-border bg-sidebar px-3 md:hidden">
         <button
+          ref={triggerRef}
           type="button"
           onClick={() => setDrawerOpen(true)}
           aria-expanded={drawerOpen}
@@ -928,14 +1043,17 @@ export function MobileNav(
             className="animate-fade-in absolute inset-0 bg-black/55 backdrop-blur-[2px]"
           />
           <aside
+            ref={drawerRef}
+            tabIndex={-1}
             role="dialog"
             aria-modal="true"
             aria-label={tr(locale, "侧边导航栏", "Side navigation")}
-            className="relative flex h-full w-72 max-w-[85vw] flex-col border-r border-sidebar-border bg-sidebar shadow-[var(--floating-shadow)]"
+            className="relative flex h-full w-72 max-w-[85vw] flex-col border-r border-sidebar-border bg-sidebar shadow-[var(--floating-shadow)] focus:outline-none"
           >
             <div className="flex h-12 shrink-0 items-center justify-between border-b border-sidebar-border px-3.5">
               <Brand />
               <button
+                ref={closeBtnRef}
                 type="button"
                 onClick={() => setDrawerOpen(false)}
                 aria-label={tr(locale, "关闭侧边导航", "Close navigation")}
@@ -956,9 +1074,7 @@ export function MobileNav(
                 rsi={rsi}
                 handlers={handlers}
                 diagnosticsOpen={diagnosticsOpen}
-                onToggleDiagnostics={() =>
-                  setDiagnosticsStored(diagnosticsOpen ? "closed" : "open")
-                }
+                onToggleDiagnostics={toggleDiagnostics}
                 onNavigate={() => setDrawerOpen(false)}
               />
 
@@ -1033,9 +1149,11 @@ export function LocaleSwitch({ compact = false }: { compact?: boolean }) {
 function SignOutButton({
   onSignOut,
   compact = false,
+  iconOnly = false,
 }: {
   onSignOut: () => void;
   compact?: boolean;
+  iconOnly?: boolean;
 }) {
   const { locale } = useLocale();
   const [confirming, setConfirming] = useState(false);
@@ -1070,25 +1188,31 @@ function SignOutButton({
         confirming ? tr(locale, "确认退出登录", "Confirm sign out") : tr(locale, "退出登录", "Sign out")
       }
       className={cx(
-        "inline-flex shrink-0 items-center gap-1 rounded-control px-2 text-caption font-medium transition-colors",
-        compact ? "h-7 pointer-coarse:h-10" : "h-9 pointer-coarse:h-11",
+        "inline-flex shrink-0 items-center gap-1 rounded-control text-caption font-medium transition-colors",
+        iconOnly ? "size-7 justify-center px-0" : compact ? "h-7 px-2 pointer-coarse:h-10" : "h-9 px-2 pointer-coarse:h-11",
         confirming
           ? "bg-fail-tint text-destructive"
           : "text-muted-foreground hover:bg-surface-hover hover:text-foreground",
         FOCUS_RING_INSET,
       )}
     >
-      <LogOut size={compact ? 12 : 14} strokeWidth={2} aria-hidden="true" />
-      <span>{confirming ? tr(locale, "确认", "Confirm") : tr(locale, "退出", "Exit")}</span>
+      <LogOut size={iconOnly || compact ? 12 : 14} strokeWidth={2} aria-hidden="true" />
+      {!iconOnly && <span>{confirming ? tr(locale, "确认", "Confirm") : tr(locale, "退出", "Exit")}</span>}
     </button>
   );
 }
 
 const THEME_ICON = { system: Monitor, light: Sun, dark: Moon } as const;
 const THEME_EVENT = "spawn:theme-change";
+const THEME_LABELS: Record<ThemeChoice, Record<Locale, string>> = {
+  system: { zh: "跟随系统", en: "system" },
+  light: { zh: "浅色", en: "light" },
+  dark: { zh: "深色", en: "dark" },
+};
 
 /** The page's theme: the system's, light or dark (src/theme.ts). */
-export function ThemeSwitch() {
+export function ThemeSwitch({ compact = false }: { compact?: boolean }) {
+  const { locale } = useLocale();
   const [choice, choose] = useStoredChoice<ThemeChoice>(THEME_KEY, THEME_CHOICES, "system");
   useTheme(choice);
 
@@ -1112,17 +1236,46 @@ export function ThemeSwitch() {
     if (typeof window !== "undefined") window.dispatchEvent(new Event(THEME_EVENT));
   };
 
+  if (compact) {
+    const idx = THEME_CHOICES.indexOf(choice);
+    const nextOption = THEME_CHOICES[(idx + 1) % THEME_CHOICES.length];
+    const Icon = THEME_ICON[choice];
+    const currentLabel = THEME_LABELS[choice][locale];
+    const nextLabel = THEME_LABELS[nextOption][locale];
+    return (
+      <button
+        type="button"
+        onClick={() => selectTheme(nextOption)}
+        title={tr(locale, `主题：${currentLabel}（点击切换为${nextLabel}）`, `Theme: ${currentLabel} (switch to ${nextLabel})`)}
+        aria-label={tr(locale, `切换主题（当前：${currentLabel}）`, `Switch theme (current: ${currentLabel})`)}
+        className={cx(
+          "grid size-7 place-items-center rounded-control text-muted-foreground hover:bg-surface-hover hover:text-foreground",
+          FOCUS_RING_INSET,
+        )}
+      >
+        <Icon size={13} strokeWidth={2} />
+      </button>
+    );
+  }
+
   return (
-    <span role="radiogroup" aria-label="Theme" className="flex items-center gap-px rounded-md p-px ring-1 ring-surface-border">
+    <span
+      role="radiogroup"
+      aria-label={tr(locale, "主题模式", "Theme")}
+      className="flex items-center gap-px rounded-md p-px ring-1 ring-surface-border"
+    >
       {THEME_CHOICES.map((option) => {
         const Icon = THEME_ICON[option];
+        const optionLabel = THEME_LABELS[option][locale];
+        const tip = tr(locale, `主题：${optionLabel}`, `Theme: ${optionLabel}`);
         return (
           <button
             key={option}
             type="button"
             role="radio"
             aria-checked={choice === option}
-            title={`Theme: ${option}`}
+            title={tip}
+            aria-label={tip}
             onClick={() => selectTheme(option)}
             className={cx(
               "grid size-5 place-items-center rounded-[5px]",

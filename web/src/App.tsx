@@ -472,9 +472,10 @@ function DashboardShell({
         health: fleetPoll.data?.health ?? null,
         missingAlwaysOn: missing.length,
         now: minute,
+        locale,
         nameOf: (session) => pollNames.get(session) ?? null,
       }),
-    [attention.data, missions.data, alerts.data, fleetPoll.data, missing, minute, pollNames],
+    [attention.data, missions.data, alerts.data, fleetPoll.data, missing, minute, locale, pollNames],
   );
   const homeNeeds = useMemo(() => actionableHomeNeeds(needItems), [needItems]);
   const humanCount = {

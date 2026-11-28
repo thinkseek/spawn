@@ -33,6 +33,7 @@ export type StreamStepKind =
   | "system";
 
 export type StreamFilter = "all" | "key" | "issues";
+export type RepeatPattern = "consecutive" | "alternating";
 
 export interface StreamStep {
   id: string;
@@ -48,6 +49,7 @@ export interface StreamStep {
   outcome: string | null;
   slow: boolean;
   repeatedCount: number;
+  repeatPattern: RepeatPattern | null;
   events: TimelineEvent[];
 }
 
@@ -382,6 +384,16 @@ function isFineStepKind(kind: StreamStepKind): boolean {
   );
 }
 
+function compareBySeqThenTime(
+  a: { seq: number; startMs: number },
+  b: { seq: number; startMs: number },
+): number {
+  if (a.seq > 0 && b.seq > 0 && a.seq !== b.seq) {
+    return a.seq - b.seq;
+  }
+  return a.startMs - b.startMs || a.seq - b.seq;
+}
+
 /**
  * Transform session timeline events, executions, and commands into sequential Turns and Steps.
  */
@@ -461,7 +473,7 @@ export function buildSessionStream(
       });
     }
 
-    rawSteps.sort((a, b) => a.startMs - b.startMs || a.seq - b.seq);
+    rawSteps.sort(compareBySeqThenTime);
 
     rawTurns.push({
       id: turn.id,
@@ -537,7 +549,7 @@ export function buildSessionStream(
   }
 
   if (outsideSteps.length > 0 && rawTurns.length === 0) {
-    outsideSteps.sort((a, b) => a.startMs - b.startMs || a.seq - b.seq);
+    outsideSteps.sort(compareBySeqThenTime);
     const first = outsideSteps[0];
     const last = outsideSteps[outsideSteps.length - 1];
     const hasFailed = outsideSteps.some((s) => s.status === "failed");
@@ -559,19 +571,23 @@ export function buildSessionStream(
     extraOutput = 0;
     extraCache = 0;
   } else if (rawTurns.length > 0 && outsideSteps.length > 0) {
-    // Merge remaining non-turn checkpoints/errors into chronologically nearest preceding turn.
-    rawTurns.sort((a, b) => a.startMs - b.startMs || a.seq - b.seq);
+    // Merge remaining non-turn checkpoints/errors into preceding turn by authoritative seq (falling back to timestamps).
+    rawTurns.sort(compareBySeqThenTime);
     for (const step of outsideSteps) {
       let target = rawTurns[0];
       for (const candidate of rawTurns) {
-        if (candidate.startMs <= step.startMs) target = candidate;
+        const precedes =
+          candidate.seq > 0 && step.seq > 0
+            ? candidate.seq <= step.seq
+            : candidate.startMs <= step.startMs;
+        if (precedes) target = candidate;
       }
       target.rawSteps.push(step);
-      target.rawSteps.sort((a, b) => a.startMs - b.startMs || a.seq - b.seq);
+      target.rawSteps.sort(compareBySeqThenTime);
     }
   }
 
-  rawTurns.sort((a, b) => a.startMs - b.startMs || a.seq - b.seq);
+  rawTurns.sort(compareBySeqThenTime);
 
   // Number steps sequentially across the session and compute repeat/slow diagnostics.
   let stepIndex = 0;
@@ -593,8 +609,9 @@ export function buildSessionStream(
     const sigKey = (step: RawStep) =>
       step.summary ? `${step.kind}\u0000${step.title}\u0000${step.summary}` : null;
 
-    // First compute consecutive run lengths inside the turn for loop visibility.
+    // 1) Consecutive identical steps (A, A, ...)
     const counts = new Array<number>(raw.rawSteps.length).fill(1);
+    const repeatPatterns = new Array<RepeatPattern | null>(raw.rawSteps.length).fill(null);
     let runStart = 0;
     while (runStart < raw.rawSteps.length) {
       const k = sigKey(raw.rawSteps[runStart]);
@@ -606,9 +623,45 @@ export function buildSessionStream(
       }
       const len = runEnd - runStart;
       if (len > 1) {
-        for (let i = runStart; i < runEnd; i += 1) counts[i] = len;
+        for (let i = runStart; i < runEnd; i += 1) {
+          counts[i] = len;
+          repeatPatterns[i] = "consecutive";
+        }
       }
       runStart = runEnd;
+    }
+
+    // 2) Two-step alternating loops (A -> B -> A -> B, at least 2 full (A, B) cycles)
+    let altStart = 0;
+    while (altStart + 3 < raw.rawSteps.length) {
+      const kA = sigKey(raw.rawSteps[altStart]);
+      const kB = sigKey(raw.rawSteps[altStart + 1]);
+      if (
+        kA !== null &&
+        kB !== null &&
+        kA !== kB &&
+        sigKey(raw.rawSteps[altStart + 2]) === kA &&
+        sigKey(raw.rawSteps[altStart + 3]) === kB
+      ) {
+        let altEnd = altStart + 4;
+        while (altEnd < raw.rawSteps.length) {
+          const expected = (altEnd - altStart) % 2 === 0 ? kA : kB;
+          if (sigKey(raw.rawSteps[altEnd]) !== expected) break;
+          altEnd += 1;
+        }
+        const cycles = Math.floor((altEnd - altStart) / 2);
+        for (let i = altStart; i < altEnd; i += 1) {
+          if (cycles > counts[i]) {
+            counts[i] = cycles;
+            repeatPatterns[i] = "alternating";
+          } else if (repeatPatterns[i] === null) {
+            repeatPatterns[i] = "alternating";
+          }
+        }
+        altStart = altEnd;
+        continue;
+      }
+      altStart += 1;
     }
 
     const steps: StreamStep[] = raw.rawSteps.map((step, i) => {
@@ -638,6 +691,7 @@ export function buildSessionStream(
         outcome: step.outcome,
         slow,
         repeatedCount,
+        repeatPattern: repeatPatterns[i],
         events: step.events,
       };
     });
