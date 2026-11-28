@@ -1,9 +1,10 @@
 # Direct D6 cutover and legacy-backend sunset
 
 Status: executable runbook and retirement inventory, audited against `origin/main`
-`1aac7b9e40dcee591016fe81ca26cc23953bb633`. **The current main has not switched
-its default yet**: `crates/spawn-cli/src/config.rs::workspace_backend` still maps an
-unset `SPAWN_WORKSPACE_BACKEND` to `WorkspaceBackend::Git`, and
+`fa6405fc0631225bcd8996b45ec391c2550e1191` (`fa6405fc`). Note that PR #261
+(`CommitV2`) has landed on `main`, while **the default runtime backend has not
+switched yet**: `crates/spawn-cli/src/config.rs::workspace_backend` still maps
+an unset `SPAWN_WORKSPACE_BACKEND` to `WorkspaceBackend::Git`, and
 `crates/spawn-host/src/workspace.rs::WorkspaceBackend` still has five variants.
 This document does not claim those Wave-1/2 changes have landed.
 
@@ -22,15 +23,23 @@ and start Always-On writers only after every proof below passes.
    restores the newest encrypted dump and opens the newest source/transcript
    bundle (`crates/spawn-cli/src/backup.rs::verify` and `verify_bundle`).
 3. Provision a new, empty PostgreSQL database/schema. Do not point the tool at the
-   live database. The tool checks `current_database()`, `current_schema()`, and
-   that the selected schema has no `pg_class` or `pg_proc` entries.
+   live database. Before stopping any writer, the tool checks
+   `current_database()`, `current_schema()`, and proves the selected schema has
+   no `pg_class`, `pg_proc`, user-defined `pg_type` (composites, domains, enums,
+   ranges, multiranges), or `pg_extension` entries, and re-checks immediately
+   before `spawn init-db`.
 4. Provision a new D6 CAS root. Do not reuse a CAS whose `.gc-fence` is bound to
    the old database identity (`docs/d6-cas-v1.md`). A clean DB plus an old,
    bound CAS is not a clean cutover.
-5. Export the target owner URL into `SPAWN_CLEAN_DATABASE_URL` through the normal
-   secret manager and set `SPAWN_CLEAN_EXPECT_DATABASE` to its exact database
-   name. Never put either value in shell history, logs, tickets, or unit files
-   readable by other users.
+5. Export the live database URL into `SPAWN_DATABASE_URL` (needed by step 4
+   below so `spawn node list --json` exports live node metadata), export the new
+   target owner URL (including a non-empty owner password so `spawn init-db` can
+   provision SCRAM verifiers for the restricted login roles) into
+   `SPAWN_CLEAN_DATABASE_URL`, and set `SPAWN_CLEAN_EXPECT_DATABASE` to the exact
+   target database name. Never put any URL or password in shell history, logs,
+   tickets, or unit files readable by other users. `clean-remigrate-db.sh`
+   passes target credentials to `psql` strictly through a `0600` temporary
+   `PGSERVICEFILE` cleaned on exit, never through argv, logs, or `PGDATABASE`.
 
 ### Offline preview (default)
 
@@ -56,20 +65,29 @@ non-secret database identifier, not a URL. The ordered hard gates are:
 
 1. `systemctl --user start --wait spawn-backup.service` must succeed.
 2. `spawn-backup-bundle.service` must succeed, preserving transcripts and source
-   history.
+   history. Note that steps 1–2 snapshot the live database before writers stop;
+   writes between dump completion and step 6 remain only in the old database.
 3. `spawn-backup-verify.service` must succeed, proving the latest encrypted DB
    object restores and the latest transcript/source bundle opens. Any failure
    stops before archive creation, writer shutdown, or target access.
-4. `spawn node list --json` is written as `nodes.json` mode `0600` under a mode
-   `0700`, new/empty archive directory. This file is operational metadata, not a
-   public artifact. No token/private key is requested or printed.
-5. Stop and prove `inactive`: `spawn-loop.service`, `spawn-integrate.service`,
-   `spawn-serve.service`, `spawn-core.service`, and `spawn-node-gateway.service`.
-   Stopping only HTTP leaves the loop/integrator writing and is not a cutover.
-6. Prove the expected target identity and empty schema, then run `spawn init-db`
-   with the target URL supplied only through its environment. The script never
-   drops a live schema; destruction is outside its authority.
-7. Verify all of the following or exit nonzero:
+4. `spawn node list --json` (using `SPAWN_DATABASE_URL`) is written atomically as
+   `nodes.json` mode `0600` under a newly created mode-`0700` `--archive-dir`
+   (existing paths and symlinked parents are rejected). This file is operational
+   metadata, not a public artifact. No token/private key is requested or printed.
+5. Pre-flight check the expected target identity (`current_database()`,
+   `current_schema()`) and empty schema (`pg_class`, `pg_proc`, user `pg_type`,
+   `pg_extension`) BEFORE stopping any writer (fast-fail prevents needless
+   outages on URL/target mistakes).
+6. Stop auto-restart triggers (`spawn-deploy-on-landing.timer` and
+   `spawn-node-gateway.path`) if active, then stop and prove `inactive`:
+   `spawn-loop.service`, `spawn-integrate.service`, `spawn-serve.service`,
+   `spawn-core.service`, and `spawn-node-gateway.service`. Stopping only HTTP
+   leaves the loop/integrator or timers restarting writers and is not a cutover.
+7. Re-verify the expected target identity and empty schema, then run
+   `spawn init-db` with `SPAWN_DATABASE_URL` set to the target owner URL. The
+   script never drops a live schema; destruction is outside its authority.
+8. Verify all of the following via stdin SQL interpolated by `psql` or exit
+   nonzero:
    - `spawn_events.commit_xid` has PostgreSQL type `xid8`;
    - `spawn_events`, `spawn_snapshots`, `spawn_refs`, `spawn_ref_log`,
      `prov_changes`, `prov_entries`, and `prov_edges` exist;
@@ -95,10 +113,17 @@ enable the timers for Always-On operation. Do not automatically roll back to the
 old backend: restore the verified backup into another clean target if recovery
 is necessary.
 
-Tests: `deploy/test-clean-remigrate-db.sh` mocks every `systemctl`, `spawn`, and
-`psql` call. It covers offline dry-run, argument rejection, backup/verify
-failure, live-writer refusal, nonempty-target refusal, `xid8`/role failures, and
-the successful ordered path, and scans output/call logs for a made-up password.
+Tests: `deploy/test-clean-remigrate-db.sh` enforces strict connection/SQL checks
+across mocked `systemctl`, `spawn`, and `psql` calls (rejecting `PGDATABASE`
+URIs, CLI credential leakage, and `-c` variable misuse, and covering dry-run,
+argument rejection, missing-password URL refusal, backup/bundle/verify failures,
+symlink/existing archive refusal, pre-stop identity/schema/nonempty refusal,
+stuck trigger/writer refusal, `xid8`/table/trigger/role failures, exact execution
+ordering, and credential-leak scans). Setting `SPAWN_TEST_REAL_PG=1` and
+`SPAWN_REAL_BIN` also executes real PostgreSQL 16 + real `spawn init-db`
+end-to-end verification (refusing enum/domain-only schemas, initializing and
+verifying a fresh DB, refusing repeat `--execute`, and scanning PG16 server logs
+for zero leaked credentials).
 
 ## 2. Exact sunset inventory after Wave-1/2
 
