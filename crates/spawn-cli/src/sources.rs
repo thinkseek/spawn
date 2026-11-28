@@ -1955,53 +1955,9 @@ fn d6_pin_worker_head<L: RefLedger + Send + Sync>(
     agent_id: &str,
     target_refs: &[&str],
 ) -> Result<Option<String>, String> {
-    if agent_id.is_empty() || agent_id.starts_with('-') {
-        return Err(format!("invalid branch name {agent_id:?}"));
-    }
-    for target in target_refs {
-        if !target.starts_with("refs/spawn/") {
-            return Err(format!(
-                "refusing to pin worker HEAD outside refs/spawn/: {target}"
-            ));
-        }
-    }
-    let worker_ref = spawn_host::workspace_rules::worker_head_ref(agent_id);
-    let snap = match d6
-        .branch_snapshot(agent_id)
-        .map_err(|error| error.to_string())?
-    {
-        Some(snap) => snap,
-        None => match d6
-            .branch_snapshot(&worker_ref)
-            .map_err(|error| error.to_string())?
-        {
-            Some(snap) => snap,
-            None => return Ok(None),
-        },
-    };
-    let existing_refs = d6
-        .ledger()
-        .list_refs(Some(d6.project_name()))
-        .map_err(|error| error.to_string())?;
-    for target in std::iter::once(worker_ref.as_str()).chain(target_refs.iter().copied()) {
-        let expected = existing_refs
-            .iter()
-            .find(|r| r.name == target)
-            .map(|r| r.snapshot.clone());
-        if expected.as_ref() != Some(&snap.id) {
-            d6.ledger()
-                .cas_ref(
-                    d6.project_name(),
-                    target,
-                    D6RefKind::Branch,
-                    expected.as_ref(),
-                    &snap.id,
-                    "d6:pin_worker_head",
-                )
-                .map_err(|error| error.to_string())?;
-        }
-    }
-    Ok(Some(snap.git_oid.to_hex()))
+    d6.pin_worker_head(agent_id, None, target_refs)
+        .map(|commit| commit.map(|id| id.as_str().to_string()))
+        .map_err(|error| error.to_string())
 }
 
 fn persist_worker_commits_with_store(
@@ -4558,5 +4514,184 @@ mod tests {
             ProjectStorage::D6
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn copy_cas_dir_with_journal(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).expect("mkdir dst");
+        for entry in std::fs::read_dir(src).expect("read src") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name();
+            if name == ".gc-fence" || name == ".lock" || name == ".refs-journal.lock" {
+                continue;
+            }
+            let from = entry.path();
+            let to = dst.join(&name);
+            let ft = entry.file_type().expect("file type");
+            if ft.is_dir() {
+                copy_cas_dir_with_journal(&from, &to);
+            } else if ft.is_file() {
+                std::fs::copy(&from, &to).expect("copy cas entry");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mode = std::fs::metadata(&from).expect("meta").permissions().mode() & 0o777;
+                    std::fs::set_permissions(&to, std::fs::Permissions::from_mode(mode))
+                        .expect("chmod copy");
+                }
+            }
+        }
+    }
+
+    fn open_bound_cas_and_pg(
+        schema_name: &str,
+        cas_dir: &Path,
+    ) -> (
+        spawn_postgres::testing::TestSchema,
+        std::sync::Arc<spawn_postgres::PostgresStore>,
+        std::sync::Arc<spawn_host::CasMerkleStore>,
+        spawn_cas::GcFenceBinding,
+    ) {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new(schema_name);
+        let pg = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+        );
+        let cas = std::sync::Arc::new(spawn_host::CasMerkleStore::open(cas_dir).expect("open cas"));
+        let ident = pg.database_identity().expect("db ident");
+        let binding = spawn_cas::GcFenceBinding {
+            db_system_id: ident.db_system_id,
+            db_oid: ident.db_oid,
+            schema_name: ident.schema_name,
+        };
+        spawn_host::bind_store_gc_fence(&cas, &binding).expect("bind gc fence");
+        (schema, pg, cas, binding)
+    }
+
+    fn replay_cli_journal_into_fresh_pg(
+        cas_dir: &Path,
+        restored_dir: &Path,
+    ) -> Vec<spawn_host::LedgerRef> {
+        copy_cas_dir_with_journal(cas_dir, restored_dir);
+        let (_schema, pg, restored_cas, binding) =
+            open_bound_cas_and_pg("d6_cli_pin_journal_restore", restored_dir);
+        let ledger = super::PostgresRefLedger::new(std::sync::Arc::clone(&pg));
+        let report =
+            spawn_host::reconcile_refs_journal(&restored_cas, &ledger, 0, "test_cli_pin_reconcile")
+                .expect("reconcile_refs_journal recovers pinned refs");
+        assert!(report.entries_replayed >= 4);
+        let restored_seq = pg.latest_ref_log_seq().expect("restored seq");
+        let fence = spawn_host::check_gc_fence(&restored_cas, &binding, restored_seq)
+            .expect("restored gc fence aligned");
+        assert_eq!(fence.pg_latest_ref_seq, fence.journal_latest_seq);
+        spawn_host::RefLedger::list_refs(&ledger, None).expect("list restored refs")
+    }
+
+    #[test]
+    fn d6_pin_worker_head_journals_worker_and_target_refs_and_survives_replay() {
+        use spawn_core::port::WorkspaceStore as _;
+
+        let base = TempDirGuard(std::env::temp_dir().join(format!(
+            "spawn-sources-d6-pin-journal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        std::fs::create_dir_all(&base.0).expect("mkdir base");
+        let cas_dir = base.0.join("cas");
+        let (_schema, store, cas, binding) = open_bound_cas_and_pg("d6_cli_pin_journal", &cas_dir);
+        let ledger =
+            std::sync::Arc::new(super::PostgresRefLedger::new(std::sync::Arc::clone(&store)));
+        let project = "proj-cli-pin-journal";
+        let _main0 = publish_test_ref(
+            &cas,
+            ledger.as_ref(),
+            project,
+            "main",
+            spawn_host::D6RefKind::Main,
+            (b"README.md", b"base\n"),
+            1_700_000_000_000,
+        );
+        let d6 = spawn_host::D6Workspace::new(
+            project,
+            base.0.join("work"),
+            std::sync::Arc::clone(&cas),
+            ledger,
+        );
+        let branch = BranchName::new("agent_pin").expect("branch");
+        d6.ensure_branch(&branch, None).expect("ensure_branch");
+        let ws = d6.mount(&branch).expect("mount");
+        std::fs::write(
+            Path::new(ws.path()).join("feature.rs"),
+            "pub fn v() -> i32 { 7 }\n",
+        )
+        .expect("write");
+        let Commit::Created(head_commit) = d6.checkpoint(&ws, "worker commit").expect("ckpt")
+        else {
+            panic!("expected Commit::Created");
+        };
+        d6.unmount(&ws).expect("unmount");
+        let head_snap = d6
+            .branch_snapshot(branch.as_str())
+            .expect("branch_snapshot")
+            .expect("present");
+
+        for bad_agent in ["", "-bad", "a..b", "a@{b"] {
+            let err = super::d6_pin_worker_head(&d6, bad_agent, &[]).unwrap_err();
+            assert!(err.contains("invalid branch name"), "{bad_agent}: {err}");
+        }
+        let bad_target =
+            super::d6_pin_worker_head(&d6, branch.as_str(), &["refs/heads/main"]).unwrap_err();
+        assert!(bad_target.contains("refs/spawn/"), "{bad_target}");
+
+        let head_ref = spawn_host::workspace_rules::task_head_ref(88, "head");
+        let extra_ref = spawn_host::workspace_rules::task_head_ref(88, "extra");
+        let accepted_ref = spawn_host::workspace_rules::task_head_ref(88, "accepted");
+        let worker_ref = spawn_host::workspace_rules::worker_head_ref(branch.as_str());
+        assert_eq!(
+            super::d6_pin_worker_head(&d6, branch.as_str(), &[&head_ref, &extra_ref])
+                .expect("pin head+extra")
+                .as_deref(),
+            Some(head_commit.as_str())
+        );
+        assert_eq!(
+            super::d6_pin_worker_head(&d6, branch.as_str(), &[&accepted_ref])
+                .expect("pin accepted")
+                .as_deref(),
+            Some(head_commit.as_str())
+        );
+
+        let entries = cas.cas().read_ref_journal().expect("read refs.journal");
+        assert!(entries.windows(2).all(|w| w[1].seq > w[0].seq));
+        let suffix = cas
+            .cas()
+            .reconcile_entries_after(1)
+            .expect("reconcile_entries_after(1) valid");
+        assert!(suffix.len() >= 5);
+        let pg_seq = store.latest_ref_log_seq().expect("pg seq");
+        let fence = spawn_host::check_gc_fence(&cas, &binding, pg_seq).expect("gc fence aligned");
+        assert_eq!(fence.pg_latest_ref_seq, fence.journal_latest_seq);
+
+        let restored = replay_cli_journal_into_fresh_pg(&cas_dir, &base.0.join("cas-restored"));
+        for expected in [&worker_ref, &head_ref, &extra_ref, &accepted_ref] {
+            assert!(
+                entries.iter().any(|e| &e.name == expected),
+                "missing journal entry for {expected}"
+            );
+            assert!(
+                restored.iter().any(|r| {
+                    r.project == project && &r.name == expected && r.snapshot == head_snap.id
+                }),
+                "missing restored ref {expected} in {restored:?}"
+            );
+        }
     }
 }
