@@ -7,14 +7,27 @@ import type { Attention } from "../../attention";
 import type { Fleet } from "../../fleet";
 import { relativeTime } from "../../format";
 import type { NeedItem } from "../../home";
-import { agentNames, agentsNow, allNotes, nameTask, alertsSpanMs, digestSince, digestWindow, latestNotes, missionsToday, needsSummary } from "../../home";
+import {
+  actionableHomeNeeds,
+  agentNames,
+  agentsNow,
+  alertsSpanMs,
+  allNotes,
+  buildSystemStatusModel,
+  digestSince,
+  digestWindow,
+  latestNotes,
+  missionProgressSummary,
+  nameTask,
+} from "../../home";
+import { tr } from "../../i18n";
 import type { Missions } from "../../missions";
 import type { FleetContext } from "../../ordering";
 import { groupAgents, missingAlwaysOn, residentName, snapshotFreshness, usualEngine } from "../../ordering";
 import { useNow } from "../rsi/Phase";
-import { FOCUS_RING_INSET, LiveStatus, PageHeader, cx } from "../ui";
+import { FOCUS_RING_INSET, LiveStatus, PageHeader, cx, useLocale } from "../ui";
 import { useAway } from "../home/Home";
-import { HomeView } from "../home/HomeView";
+import { HomeRuntimeDetails, HomeView } from "../home/HomeView";
 import { AgentDetail } from "./AgentDetail";
 import { AlwaysOnAgents, uptimeMs } from "./AlwaysOnAgents";
 import { FleetBoard } from "./FleetBoard";
@@ -37,27 +50,27 @@ interface FleetViewProps {
   attention: PollResult<Attention>;
   /** Residents and held tasks, from /api/missions (App polls it). */
   context: FleetContext;
-  /** The missions themselves, for the home page's mission rows. */
+  /** The missions themselves, for completion progress rows. */
   missions: Missions | null;
-  /** The alert window (App polls it for the band). */
+  /** The alert window (folded into details digest). */
   alerts: Alert[] | null;
-  /** "Needs you", computed once in App (its badge counts the same). */
+  /** Raw "Needs you" computed in App; filtered to actionable items on Home. */
   needs: NeedItem[];
+  /** Action-only filtered needs for Home. */
+  actionableNeeds?: NeedItem[];
   onShowMissions: () => void;
+  onShowFeatures?: () => void;
+  onShowAgents?: () => void;
   selectedId: string | null;
   onSelect: (sessionId: string | null) => void;
   onOpenTimeline: (sessionId: string) => void;
 }
 
 /**
- * The home page, in the order the owner asks (design-ui-information.md §3,
- * layout A): does anything need me, is work moving (each mission today),
- * who is working now and on what, what the supervisor said lately (with
- * the box to type to it), today as a digest, and the north star (human
- * interventions per agent-hour, with the interventions behind it). The always-on cards, the
- * health tiles and the whole fleet board are folded under "Every agent and
- * the host" at the bottom. The polls live in App, so the sidebar shows the
- * same counts from any view.
+ * Primary Overview page (`#fleet`): leads with System Status & Mission Completion,
+ * keeps Approvals / Action Required conditional, and folds heavy engineering
+ * diagnostics (`AlwaysOnAgents`, `HealthStrip`, `NodeRows`, `FleetBoard`,
+ * `Digest`, `Interventions`, `CoreLines`) cleanly at the bottom.
  */
 export function FleetView({
   fleet,
@@ -66,13 +79,16 @@ export function FleetView({
   missions,
   alerts,
   needs,
+  actionableNeeds,
   selectedId,
   onSelect,
   onOpenTimeline,
   onShowMissions,
+  onShowFeatures,
+  onShowAgents,
 }: FleetViewProps) {
+  const { locale } = useLocale();
   const [detailsOpen, setDetailsOpen] = useState(false);
-  // Relative times ("12s ago", "waiting 4m") tick between polls.
   useNow(1_000);
   const data = fleet.data;
   const selected =
@@ -80,10 +96,7 @@ export function FleetView({
   const updated = data?.health.generated_at_ms ?? null;
   const agents = data?.agents;
   const groups = useMemo(() => groupAgents(agents ?? [], context), [agents, context]);
-  // One name per agent (design §4.5), the sidebar's and home's.
   const names = useMemo(() => agentNames(agents ?? [], context), [agents, context]);
-  // Who the box at the top types to: the dispatcher's supervisor, else the
-  // board's, else the one Spawn starts.
   const onBoard = agents?.find((agent) => agent.role === "supervisor") ?? null;
   const supervisor = {
     session:
@@ -100,7 +113,9 @@ export function FleetView({
       const ms = uptimeMs(agent);
       if (ms === null || agent.started_at_ms === null || (best && best.ms <= ms)) return best;
       const name =
-        agent.role === "supervisor" ? "supervisor" : `resident ${residentName(agent, context) ?? agent.agent_id}`;
+        agent.role === "supervisor"
+          ? "supervisor"
+          : `resident ${residentName(agent, context) ?? agent.agent_id}`;
       return { name, ms, since: agent.started_at_ms };
     }, null),
   };
@@ -117,43 +132,63 @@ export function FleetView({
     return max;
   }, [data?.nodes]);
   const freshness = snapshotFreshness(data?.generated_at_ms ?? updated, now, latestNodeBeatMs);
-  // What happened while the reader was away: at least the last 24 h (design §3 Q4).
+  const freshnessLabel = data
+    ? freshness.level === "fresh"
+      ? updated
+        ? tr(locale, `更新于 ${relativeTime(updated)}`, `Updated ${relativeTime(updated)}`)
+        : tr(locale, "实时", "Live")
+      : `${freshness.label} · ${updated ? relativeTime(updated) : "live"}`
+    : tr(locale, "连接中", "Connecting");
+
   const away = useAway();
   const digestSpan = digestWindow(now, away?.from ?? null);
-  // The alerts as far back as the digest reads (the shared poll holds the
-  // server's 24 h); slow, since news of days ago does not move by the second.
   const span = alertsSpanMs(now, digestSpan.since);
   const digestAlerts = usePoll(`alerts:since:${span}`, (signal) => fetchAlertsSince(span, signal), 60_000);
-  // Home's north star and core lines (HomeView renders them from these).
   const day = usePoll("interventions-24h", (signal) => fetchInterventions("24h", signal), INTERVENTIONS_POLL_MS);
   const week = usePoll("interventions-7d", (signal) => fetchInterventions("7d", signal), INTERVENTIONS_POLL_MS);
   const coreLines = usePoll("core-lines", fetchCoreLines, CORE_LINES_POLL_MS);
   const openAgent = (session: string) => onSelect(session);
+
+  const actionItems = useMemo(
+    () => actionableNeeds ?? actionableHomeNeeds(needs),
+    [actionableNeeds, needs],
+  );
+  const missionProgress = useMemo(
+    () => missionProgressSummary(missions, now),
+    [missions, now],
+  );
+  const systemStatus = useMemo(
+    () =>
+      buildSystemStatusModel({
+        health: data?.health ?? null,
+        liveness,
+        agents: agents ?? null,
+        nodes: data?.nodes ?? [],
+        missionProgress,
+        actionCount: actionItems.filter((item) => item.tone === "act").length,
+        freshnessLevel: freshness.level,
+      }),
+    [data?.health, data?.nodes, liveness, agents, missionProgress, actionItems, freshness.level],
+  );
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
       <PageHeader
         title={
           <h1 className="truncate text-body font-semibold text-foreground">
-            Home
+            {tr(locale, "系统总览", "Overview")}
           </h1>
         }
       >
-        <span className="tnum hidden text-caption text-muted-foreground sm:inline">
-          {needsSummary(needs)}
-        </span>
+        {actionItems.length > 0 && (
+          <span className="tnum hidden rounded-chip bg-wait-tint px-2 py-0.5 text-caption font-medium text-warning sm:inline">
+            {tr(locale, `${actionItems.length} 项待处理`, `${actionItems.length} to act on`)}
+          </span>
+        )}
         <LiveStatus
           error={fleet.error}
           freshness={freshness.level}
-          label={
-            data
-              ? freshness.level === "fresh"
-                ? updated
-                  ? `Updated ${relativeTime(updated)}`
-                  : "Live"
-                : `${freshness.label} · ${updated ? relativeTime(updated) : "live"}`
-              : "Connecting"
-          }
+          label={freshnessLabel}
         />
       </PageHeader>
 
@@ -161,8 +196,8 @@ export function FleetView({
         <div className="grid flex-1 place-items-center">
           <p className="text-caption text-faint-foreground">
             {fleet.error
-              ? `Could not reach the fleet API: ${fleet.error}`
-              : "Loading the fleet…"}
+              ? tr(locale, `无法获取控制面状态：${fleet.error}`, `Could not reach the fleet API: ${fleet.error}`)
+              : tr(locale, "正在加载系统状态与任务进度…", "Loading system status and missions…")}
           </p>
         </div>
       ) : (
@@ -173,48 +208,47 @@ export function FleetView({
                 role="status"
                 className="rounded-lg border border-destructive/30 bg-fail-tint px-3 py-2 text-caption text-destructive"
               >
-                {freshness.label}：控制面快照未及时更新
+                {freshness.label}：
+                {tr(locale, "控制面快照未及时更新", "Control-plane snapshot has stalled")}
                 {freshness.driftMs !== null && freshness.driftMs > 0
-                  ? `（节点心跳仍领先 ${Math.floor(freshness.driftMs / 60_000)}m）`
+                  ? tr(
+                      locale,
+                      `（节点心跳仍领先 ${Math.floor(freshness.driftMs / 60_000)}m）`,
+                      ` (node heartbeats lead by ${Math.floor(freshness.driftMs / 60_000)}m)`,
+                    )
                   : freshness.ageMs !== null
-                    ? `（已滞后 ${Math.floor(freshness.ageMs / 60_000)}m）`
+                    ? tr(
+                        locale,
+                        `（已滞后 ${Math.floor(freshness.ageMs / 60_000)}m）`,
+                        ` (${Math.floor(freshness.ageMs / 60_000)}m behind)`,
+                      )
                     : ""}
-                ，请先核实节点健康后再派单。
+                {tr(locale, "，请先核实节点健康后再派单。", ". Verify node health before dispatching.")}
               </div>
             )}
-            {/* Issue #91 P1b: the live digest line, the prompts to answer
-                and Master Control, above the home page. */}
-            <DigestPanel />
-            <ApprovalsQueue onOpenAgent={openAgent} />
-            <MasterComposer />
+
             <HomeView
               now={now}
-              needs={needs}
-              missions={missionsToday(missions, now)}
+              systemStatus={systemStatus}
+              missionProgress={missionProgress}
+              freshnessLevel={freshness.level}
+              freshnessLabel={freshnessLabel}
+              actionableNeeds={actionItems}
+              approvals={<ApprovalsQueue onOpenAgent={openAgent} />}
+              masterControl={<MasterComposer />}
               agents={agentsNow(agents ?? null, context)}
-              notes={latestNotes(attention.data, now)}
-              allNotes={allNotes(attention.data)}
-              digest={digestSince(missions, digestAlerts.data ?? alerts, now, digestSpan.since, agents ?? null, digestSpan.away)}
-              back={away?.at ?? null}
-              interventions={{ day: figureState(day.data, day.error), week: figureState(week.data, week.error) }}
-              coreLines={{ answer: coreLines.data, error: coreLines.data ? null : coreLines.error }}
-              talk={
-                <InputBox
-                  key={supervisor.session}
-                  sessionId={supervisor.session}
-                  to="the supervisor"
-                  stopped={!supervisor.live}
-                />
-              }
               onOpenAgent={openAgent}
               onShowMissions={onShowMissions}
+              onShowAgents={onShowAgents ?? (() => undefined)}
+              onShowFeatures={onShowFeatures ?? (() => undefined)}
             />
+
             <button
               type="button"
               onClick={() => setDetailsOpen((value) => !value)}
               aria-expanded={detailsOpen}
               className={cx(
-                "mt-2 flex items-center gap-1.5 self-start rounded-control px-2 py-1 text-caption font-medium text-muted-foreground hover:bg-surface-hover hover:text-foreground",
+                "mt-1 flex items-center gap-1.5 self-start rounded-control px-2 py-1 text-caption font-medium text-muted-foreground hover:bg-surface-hover hover:text-foreground",
                 FOCUS_RING_INSET,
               )}
             >
@@ -223,35 +257,71 @@ export function FleetView({
                 aria-hidden="true"
                 className={cx("transition-transform motion-reduce:transition-none", detailsOpen && "rotate-90")}
               />
-              Every agent and the host
+              {tr(locale, "展开系统详情与工程指标", "System details & engineering metrics")}
               <span className="tnum font-normal text-faint-foreground">
-                {data.agents.length} agents · health · resources
+                {tr(
+                  locale,
+                  `${data.agents.length} 个 Agent · 节点 · 资源 · 主控日志`,
+                  `${data.agents.length} agents · nodes · resources · digest`,
+                )}
               </span>
             </button>
+
             {detailsOpen && (
               <>
-            <AlwaysOnAgents
-              agents={alwaysOn}
-              missing={missing}
-              context={context}
-              usualEngine={engine}
-              selectedId={selectedId}
-              onSelect={onSelect}
-            />
-            <HealthStrip
-              health={data.health}
-              liveness={liveness}
-              diagnostics={coreLines.data ? coreLinesView(coreLines.data).diagnostics : []}
-            />
-            <NodeRows fleetNodes={data.nodes} />
-            <FleetBoard
-              groups={groups}
-              total={data.agents}
-              context={context}
-              usualEngine={engine}
-              selectedId={selectedId}
-              onSelect={onSelect}
-            />
+                <DigestPanel />
+                <HomeRuntimeDetails
+                  now={now}
+                  notes={latestNotes(attention.data, now)}
+                  allNotes={allNotes(attention.data)}
+                  digest={digestSince(
+                    missions,
+                    digestAlerts.data ?? alerts,
+                    now,
+                    digestSpan.since,
+                    agents ?? null,
+                    digestSpan.away,
+                  )}
+                  back={away?.at ?? null}
+                  interventions={{
+                    day: figureState(day.data, day.error),
+                    week: figureState(week.data, week.error),
+                  }}
+                  coreLines={{
+                    answer: coreLines.data,
+                    error: coreLines.data ? null : coreLines.error,
+                  }}
+                  talk={
+                    <InputBox
+                      key={supervisor.session}
+                      sessionId={supervisor.session}
+                      to="the supervisor"
+                      stopped={!supervisor.live}
+                    />
+                  }
+                />
+                <AlwaysOnAgents
+                  agents={alwaysOn}
+                  missing={missing}
+                  context={context}
+                  usualEngine={engine}
+                  selectedId={selectedId}
+                  onSelect={onSelect}
+                />
+                <HealthStrip
+                  health={data.health}
+                  liveness={liveness}
+                  diagnostics={coreLines.data ? coreLinesView(coreLines.data).diagnostics : []}
+                />
+                <NodeRows fleetNodes={data.nodes} />
+                <FleetBoard
+                  groups={groups}
+                  total={data.agents}
+                  context={context}
+                  usualEngine={engine}
+                  selectedId={selectedId}
+                  onSelect={onSelect}
+                />
               </>
             )}
           </div>

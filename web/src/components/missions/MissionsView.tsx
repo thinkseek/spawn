@@ -47,7 +47,7 @@ import { taskLiveness } from "../../taskActivity";
 import { Fact, SectionLabel } from "../fleet/bits";
 import { VerdictBadge, useNow } from "../rsi/Phase";
 import { TaskActivityLine } from "./TaskActivity";
-import { Ago, Card, CardHeader, EmptyState, FOCUS_RING, GroupHeader, LiveStatus, PageHeader, cx } from "../ui";
+import { Ago, Card, CardHeader, EmptyState, FOCUS_RING, GroupHeader, LiveStatus, PageHeader, cx, tr, useLocale } from "../ui";
 import { HeldSources } from "./HeldSources";
 import { Markdown } from "./Markdown";
 import { TaskText, useTaskTexts } from "./TaskTexts";
@@ -75,6 +75,7 @@ const MODE_OPTIONS: ReadonlyArray<ViewOption<Mode>> = [
  * fleet view and commands a human copies into a terminal.
  */
 export function MissionsView({ missions }: { missions: PollResult<Missions> }) {
+  const { locale } = useLocale();
   useNow(1_000);
   const data = missions.data;
   const freshness = snapshotFreshness(data?.generated_at_ms ?? null);
@@ -84,7 +85,7 @@ export function MissionsView({ missions }: { missions: PollResult<Missions> }) {
       <PageHeader
         title={
           <h1 className="truncate text-body font-semibold text-foreground">
-            Missions
+            {tr(locale, "任务进度", "Missions")}
           </h1>
         }
       >
@@ -94,9 +95,17 @@ export function MissionsView({ missions }: { missions: PollResult<Missions> }) {
           label={
             data
               ? freshness.level === "fresh"
-                ? `${data.missions.length} mission${data.missions.length === 1 ? "" : "s"}`
-                : `${freshness.label} · ${data.missions.length} mission${data.missions.length === 1 ? "" : "s"}`
-              : "Connecting"
+                ? tr(
+                    locale,
+                    `${data.missions.length} 个任务`,
+                    `${data.missions.length} mission${data.missions.length === 1 ? "" : "s"}`,
+                  )
+                : tr(
+                    locale,
+                    `${freshness.label} · ${data.missions.length} 个任务`,
+                    `${freshness.label} · ${data.missions.length} mission${data.missions.length === 1 ? "" : "s"}`,
+                  )
+              : tr(locale, "连接中", "Connecting")
           }
         />
       </PageHeader>
@@ -105,8 +114,8 @@ export function MissionsView({ missions }: { missions: PollResult<Missions> }) {
         <div className="grid flex-1 place-items-center">
           <p className="text-caption text-faint-foreground">
             {missions.error
-              ? `Could not reach the missions API: ${missions.error}`
-              : "Loading missions…"}
+              ? tr(locale, `无法获取任务列表：${missions.error}`, `Could not reach the missions API: ${missions.error}`)
+              : tr(locale, "正在加载任务…", "Loading missions…")}
           </p>
         </div>
       ) : (
@@ -118,9 +127,14 @@ export function MissionsView({ missions }: { missions: PollResult<Missions> }) {
 
 /** The page body for one snapshot of /api/missions. */
 export function MissionsBody({ data }: { data: Missions }) {
+  const { locale } = useLocale();
   const [mode, choose] = useStoredChoice<Mode>("spawn.missions.mode", MODES, "timeline");
+  const modeOptions: ReadonlyArray<ViewOption<Mode>> = MODE_OPTIONS.map((opt) => ({
+    ...opt,
+    label: opt.id === "timeline" ? tr(locale, "时间轴", "Timeline") : tr(locale, "卡片", "Cards"),
+  }));
   const toggle = (
-    <ViewToggle label="Missions view" options={MODE_OPTIONS} value={mode} onChange={choose} />
+    <ViewToggle label={tr(locale, "任务视图", "Missions view")} options={modeOptions} value={mode} onChange={choose} />
   );
   if (mode === "timeline") {
     const proposed = data.residents.some((resident) => resident.state === "proposed");

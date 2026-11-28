@@ -1100,3 +1100,312 @@ export function digestToday(
 ): Digest {
   return digestSince(missions, alerts, now, now - TODAY_MS, agents);
 }
+
+// ---------------------------------------------------------------------------
+// Focused Home models (Actionable needs, Mission Completion, System Status)
+
+/**
+ * Filter `needsYou` items down to genuine human action/blocking items for Home,
+ * omitting noisy system `alert:*` chatter so the front page stays calm.
+ */
+export function actionableHomeNeeds(items: readonly NeedItem[]): NeedItem[] {
+  return items.filter((item) => {
+    if (item.key.startsWith("alert:")) return false;
+    if (item.key.startsWith("halt:")) return true;
+    if (item.key.startsWith("attention:")) return item.tone === "act";
+    if (item.key.startsWith("disk:") || item.key === "memory") return true;
+    return item.tone === "act";
+  });
+}
+
+export type MissionProgressStatus = "active" | "halted" | "paused" | "idle";
+
+export interface MissionProgressRow {
+  id: number | null;
+  name: string;
+  status: MissionProgressStatus;
+  completedTasks: number;
+  totalTasks: number;
+  inFlightTasks: number;
+  blockedTasks: number;
+  /** Whole percentage `0..100`, or null when the mission has zero non-cancelled tasks. */
+  completionPct: number | null;
+  landedToday: number;
+  inFlight: InFlight[];
+  lastRejection: MissionRow["lastRejection"];
+  haltedReason: string | null;
+}
+
+export interface MissionProgressSummary {
+  rows: MissionProgressRow[];
+  openMissions: number;
+  closedMissions: number;
+  totalTasks: number;
+  completedTasks: number;
+  inFlightTasks: number;
+  blockedTasks: number;
+  landedToday: number;
+  overallPct: number | null;
+}
+
+function isTaskCompleted(task: MissionTask, mission: Mission): boolean {
+  return task.state === "landed" || (!mission.gate && task.state === "accepted");
+}
+
+function isTaskBlocked(task: MissionTask): boolean {
+  return task.state === "revise" || Boolean(task.parked) || task.held_by !== null;
+}
+
+const PROGRESS_STATUS_RANK: Record<MissionProgressStatus, number> = {
+  halted: 0,
+  active: 1,
+  paused: 2,
+  idle: 3,
+};
+
+/**
+ * Summarize completion progress across all open missions and their non-cancelled tasks.
+ */
+export function missionProgressSummary(
+  missions: Missions | null,
+  now: number,
+): MissionProgressSummary {
+  const rows: Array<MissionProgressRow & { moved: number }> = [];
+  let closedMissions = 0;
+  let totalTasks = 0;
+  let completedTasks = 0;
+  let inFlightTasks = 0;
+  let blockedTasks = 0;
+  let landedToday = 0;
+  const since = now - TODAY_MS;
+
+  for (const mission of missions?.missions ?? []) {
+    const kind = missionClass(mission);
+    if (kind === "closed") {
+      closedMissions += 1;
+      continue;
+    }
+
+    const countable = mission.tasks.filter((task) => task.state !== "cancelled");
+    const completed = countable.filter((task) => isTaskCompleted(task, mission)).length;
+    const blocked = countable.filter(isTaskBlocked).length;
+    const inFlight: InFlight[] = mission.tasks
+      .filter((task) => isOpenTask(task, mission))
+      .map((task) => {
+        const conflicts = conflictCount(task);
+        const earlierConflicts = earlierConflictCount(task, mission);
+        return {
+          task_id: task.id,
+          title: task.task_title,
+          state: taskStateLabel(task, mission),
+          since_ms: latestRecord(task),
+          conflicts,
+          earlierConflicts,
+          conflictText: conflictText(conflicts, earlierConflicts),
+        };
+      })
+      .sort((left, right) => (left.task_id ?? 0) - (right.task_id ?? 0));
+
+    let missionLandedToday = 0;
+    let lastRejection: MissionRow["lastRejection"] = null;
+    let moved = mission.updated_at_ms ?? 0;
+    for (const task of mission.tasks) {
+      const landed = landedAt(task, mission);
+      if (landed !== null && landed >= since) missionLandedToday += 1;
+      moved = Math.max(moved, latestRecord(task) ?? 0);
+      for (const back of sendBacks(task)) {
+        if (back.at_ms < since || (lastRejection && lastRejection.at_ms >= back.at_ms)) continue;
+        const gate = task.last_gate;
+        lastRejection = {
+          task_id: task.id,
+          verdict: back.verdict,
+          reason: gate && gate.verdict === back.verdict ? gate.reason : null,
+          at_ms: back.at_ms,
+        };
+      }
+    }
+
+    const status: MissionProgressStatus = mission.halted
+      ? "halted"
+      : mission.paused
+        ? "paused"
+        : inFlight.length > 0
+          ? "active"
+          : "idle";
+
+    const missionTotal = countable.length;
+    const completionPct = missionTotal > 0 ? Math.round((completed / missionTotal) * 100) : null;
+
+    totalTasks += missionTotal;
+    completedTasks += completed;
+    inFlightTasks += inFlight.length;
+    blockedTasks += blocked;
+    landedToday += missionLandedToday;
+
+    rows.push({
+      id: mission.id,
+      name: missionName(mission),
+      status,
+      completedTasks: completed,
+      totalTasks: missionTotal,
+      inFlightTasks: inFlight.length,
+      blockedTasks: blocked,
+      completionPct,
+      landedToday: missionLandedToday,
+      inFlight,
+      lastRejection,
+      haltedReason: mission.halted ?? null,
+      moved,
+    });
+  }
+
+  rows.sort((left, right) => {
+    const byStatus = PROGRESS_STATUS_RANK[left.status] - PROGRESS_STATUS_RANK[right.status];
+    if (byStatus !== 0) return byStatus;
+    return right.moved - left.moved;
+  });
+
+  const overallPct = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : null;
+
+  return {
+    rows: rows.map(({ moved: _moved, ...row }) => row),
+    openMissions: rows.length,
+    closedMissions,
+    totalTasks,
+    completedTasks,
+    inFlightTasks,
+    blockedTasks,
+    landedToday,
+    overallPct,
+  };
+}
+
+export type SystemHealthTone = "healthy" | "attention" | "degraded";
+
+export interface SystemLivenessInput {
+  total: number;
+  up: number;
+}
+
+export interface NodeStatusInput {
+  state: string;
+}
+
+export interface SystemStatusInput {
+  health: FleetHealth | null;
+  liveness: SystemLivenessInput | null;
+  agents: readonly FleetAgent[] | null;
+  nodes: readonly NodeStatusInput[];
+  missionProgress: MissionProgressSummary;
+  actionCount: number;
+  freshnessLevel: "fresh" | "aging" | "frozen";
+}
+
+export interface SystemStatusModel {
+  tone: SystemHealthTone;
+  nodesOnline: number;
+  nodesTotal: number;
+  alwaysOnUp: number;
+  alwaysOnTotal: number;
+  restarts24h: number;
+  agentsLive: number;
+  agentsTotal: number;
+  workingCount: number;
+  waitingCount: number;
+  blockedCount: number;
+  memoryUsedPct: number | null;
+  memoryAvailBytes: number | null;
+  tightestDiskLabel: string | null;
+  tightestDiskFreeBytes: number | null;
+  diskLowCount: number;
+  haltedMissions: number;
+  actionCount: number;
+}
+
+/**
+ * Aggregate live host/agent/mission health into a single Home hero model.
+ */
+export function buildSystemStatusModel(input: SystemStatusInput): SystemStatusModel {
+  const { health, liveness, agents, nodes, missionProgress, actionCount, freshnessLevel } = input;
+  const nodesTotal = nodes.length;
+  const nodesOnline = nodes.filter((node) => node.state === "live").length;
+  const alwaysOnTotal = liveness?.total ?? 0;
+  const alwaysOnUp = liveness?.up ?? 0;
+  const restarts24h = health?.ladder_24h.liveness ?? 0;
+  const agentsLive = health?.live ?? (agents?.filter((agent) => agent.live).length ?? 0);
+  const agentsTotal = health?.agents_total ?? (agents?.length ?? 0);
+  const workingCount =
+    health?.by_state.WORKING ?? (agents?.filter((agent) => agent.live && agent.state === "WORKING").length ?? 0);
+  const waitingCount =
+    health?.by_state.WAITING ?? (agents?.filter((agent) => agent.live && agent.state === "WAITING").length ?? 0);
+  const blockedCount =
+    health?.by_state.BLOCKED ?? (agents?.filter((agent) => agent.live && agent.state === "BLOCKED").length ?? 0);
+
+  let memoryUsedPct: number | null = null;
+  const memoryAvailBytes = health?.memory?.available_bytes ?? null;
+  const memoryTotalBytes = health?.memory?.total_bytes ?? null;
+  if (
+    memoryAvailBytes !== null &&
+    memoryTotalBytes !== null &&
+    memoryTotalBytes > 0
+  ) {
+    memoryUsedPct = Math.max(
+      0,
+      Math.min(100, Math.round(((memoryTotalBytes - memoryAvailBytes) / memoryTotalBytes) * 100)),
+    );
+  }
+  const memoryLow =
+    health?.memory !== null &&
+    health?.memory !== undefined &&
+    health.memory.available_bytes !== null &&
+    health.memory.available_bytes < health.memory.warn_bytes;
+
+  let tightestDiskLabel: string | null = null;
+  let tightestDiskFreeBytes: number | null = null;
+  let diskLowCount = 0;
+  for (const place of health?.disk ?? []) {
+    if (place.free_bytes === null) continue;
+    if (place.free_bytes < place.warn_bytes) diskLowCount += 1;
+    if (tightestDiskFreeBytes === null || place.free_bytes < tightestDiskFreeBytes) {
+      tightestDiskFreeBytes = place.free_bytes;
+      tightestDiskLabel = place.label;
+    }
+  }
+
+  const haltedMissions = missionProgress.rows.filter((row) => row.status === "halted").length;
+  const nodesLost = nodes.some((node) => node.state === "lost");
+  const alwaysOnDown = alwaysOnTotal > 0 && alwaysOnUp < alwaysOnTotal;
+
+  const tone: SystemHealthTone =
+    freshnessLevel === "frozen" || haltedMissions > 0 || nodesLost
+      ? "degraded"
+      : freshnessLevel === "aging" ||
+          alwaysOnDown ||
+          blockedCount > 0 ||
+          diskLowCount > 0 ||
+          memoryLow ||
+          actionCount > 0
+        ? "attention"
+        : "healthy";
+
+  return {
+    tone,
+    nodesOnline,
+    nodesTotal,
+    alwaysOnUp,
+    alwaysOnTotal,
+    restarts24h,
+    agentsLive,
+    agentsTotal,
+    workingCount,
+    waitingCount,
+    blockedCount,
+    memoryUsedPct,
+    memoryAvailBytes,
+    tightestDiskLabel,
+    tightestDiskFreeBytes,
+    diskLowCount,
+    haltedMissions,
+    actionCount,
+  };
+}

@@ -6,7 +6,7 @@ import type { FleetAgent } from "../../fleet";
 import { alertMoot, alertRowWords, alertStale, alertTitle, openAlertsLine } from "../../home";
 import { absoluteTitle, localDateTime, relativeTime } from "../../format";
 import { currentNotices, earlierWords, externalMainAdvanceCount, missionListText, noticeTitle, safeNoticeEvidence, sourceMainNotice, type SourceMainNotice } from "../../notices";
-import { LiveStatus, PageHeader, cx } from "../ui";
+import { LiveStatus, PageHeader, cx, tr, useLocale } from "../ui";
 import { useNowEvery } from "../timeaxis/useTimeWindow";
 
 /** What each state looks like: a condition still true, news, or done. */
@@ -153,6 +153,7 @@ export function AlertsView({
   nameOf?: (session: string) => string | null;
   onShowHome?: () => void;
 }) {
+  const { locale } = useLocale();
   const alerts = usePoll("alerts", fetchAlerts, 3_000);
   const now = useNowEvery(60_000);
   const data = alerts.data ?? [];
@@ -170,9 +171,15 @@ export function AlertsView({
         title={
           <>
             <BellRing size={15} className="text-muted-foreground" />
-            <h1 className="text-body font-semibold text-foreground">Alerts</h1>
+            <h1 className="text-body font-semibold text-foreground">
+              {tr(locale, "告警日志", "Alerts Log")}
+            </h1>
             <span className="text-caption text-muted-foreground">
-              what Spawn raised on its own, with its evidence
+              {tr(
+                locale,
+                "系统内部诊断事件记录（仅作日志留存，不弹窗打断首页）",
+                "quiet system diagnostic log and evidence",
+              )}
             </span>
           </>
         }
