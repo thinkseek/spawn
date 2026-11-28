@@ -1,15 +1,21 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import {
   INITIAL_RUNTIME_TELEMETRY,
+  TELEMETRY_POLL_MS,
+  TELEMETRY_REQUEST_TIMEOUT_MS,
+  applyTelemetrySliceUpdate,
   classifyCostAmount,
   formatCostAmountText,
   formatTelemetryUsd,
   normalizeCostWindowTelemetry,
   normalizeFleetTelemetry,
   normalizeGradingTelemetry,
+  pollRuntimeTelemetrySlices,
 } from "../src/runtimeTelemetry.ts";
+import { Validated, type FetchLike } from "../src/validated.ts";
 
 test("billing red line: models with usd == null && unpriced_tokens > 0 show unpriced, never $0.00", () => {
   const modelAmount = classifyCostAmount(null, 60_000, 60_000);
@@ -174,4 +180,105 @@ test("telemetry normalizers and INITIAL_RUNTIME_TELEMETRY degrade gracefully on 
   assert.equal(emptyCost.totalTokens, 0);
   assert.equal(emptyCost.amount.kind, "unavailable");
   assert.equal(formatCostAmountText(emptyCost.amount), "—");
+});
+
+test("Fix 1: optional telemetry 401 degrades locally to unavailable without calling global unauthorized hooks", async () => {
+  const fetcher: FetchLike = async (url) => {
+    if (url === "/api/grading") {
+      return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+    }
+    if (url === "/api/fleet") {
+      return new Response(JSON.stringify({ health: { live: 2, agents_total: 3, by_state: { WORKING: 2, WAITING: 1, BLOCKED: 0 } } }), { status: 200 });
+    }
+    return new Response(
+      JSON.stringify({
+        total: { usd: 0.42, tokens: { input: 1000, output: 500, cache_write: 0, cache_read: 0 }, unpriced_tokens: 0 },
+        models: [],
+      }),
+      { status: 200 },
+    );
+  };
+
+  const reader = new Validated(fetcher);
+  const controller = new AbortController();
+  const state = await pollRuntimeTelemetrySlices({
+    reader,
+    signal: controller.signal,
+    headers: { Accept: "application/json" },
+    timeoutMs: 250,
+  });
+
+  assert.equal(state.grading.status, "unavailable");
+  assert.equal(state.fleet.status, "ready");
+  assert.equal(state.fleet.data.live, 2);
+  assert.equal(state.cost24h.status, "ready");
+  assert.equal(state.cost7d.status, "ready");
+
+  // Guard featuresApi source: optional telemetry uses dedicated local reader, never readApi or reportUnauthorizedStatus.
+  const featuresApiSrc = readFileSync(new URL("../src/featuresApi.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(featuresApiSrc, /reportUnauthorizedStatus/);
+  assert.match(featuresApiSrc, /optionalTelemetryReads\s*=\s*new Validated\(\)/);
+  assert.match(featuresApiSrc, /fetchFeatureMap[\s\S]*readApi\("\/api\/features"/);
+  const telemetrySection = featuresApiSrc.slice(featuresApiSrc.indexOf("readOptionalTelemetrySliceByKey"));
+  assert.doesNotMatch(telemetrySection, /\breadApi\s*\(/);
+});
+
+test("Fix 2: stalled slice times out below poll interval while healthy sibling slices settle immediately", async () => {
+  assert.ok(TELEMETRY_REQUEST_TIMEOUT_MS < TELEMETRY_POLL_MS);
+
+  const fetcher: FetchLike = (url, init) => {
+    if (url === "/api/cost?window=7d") {
+      return new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("Aborted", "AbortError")),
+          { once: true },
+        );
+      });
+    }
+    if (url === "/api/fleet") {
+      return Promise.resolve(
+        new Response(JSON.stringify({ health: { live: 1, agents_total: 1, by_state: { WORKING: 1, WAITING: 0, BLOCKED: 0 } } }), { status: 200 }),
+      );
+    }
+    if (url === "/api/grading") {
+      return Promise.resolve(
+        new Response(JSON.stringify({ presets: [{ preset_id: "p1", model_label: "sonnet", state: "active", routing_grade: "l2" }] }), { status: 200 }),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          total: { usd: 1.25, tokens: { input: 500, output: 100, cache_write: 0, cache_read: 0 }, unpriced_tokens: 0 },
+          models: [],
+        }),
+        { status: 200 },
+      ),
+    );
+  };
+
+  const settledOrder: string[] = [];
+  let progressive = INITIAL_RUNTIME_TELEMETRY;
+  const reader = new Validated(fetcher);
+  const controller = new AbortController();
+
+  const finalState = await pollRuntimeTelemetrySlices({
+    reader,
+    signal: controller.signal,
+    headers: { Accept: "application/json" },
+    timeoutMs: 35,
+    onSlice: (update) => {
+      settledOrder.push(update.key);
+      progressive = applyTelemetrySliceUpdate(progressive, update);
+    },
+  });
+
+  // The three healthy endpoints settle before the stalled /api/cost?window=7d hits its timeout.
+  assert.equal(settledOrder.length, 4);
+  assert.equal(settledOrder[3], "cost7d");
+  assert.equal(finalState.fleet.status, "ready");
+  assert.equal(finalState.grading.status, "ready");
+  assert.equal(finalState.cost24h.status, "ready");
+  assert.equal(finalState.cost7d.status, "unavailable");
+  assert.deepEqual(progressive, finalState);
 });

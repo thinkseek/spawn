@@ -313,62 +313,61 @@ function SpineCard({
   const signal = workSignalView(item.workSignal);
 
   return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={onSelect}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onSelect();
-        }
-      }}
-      aria-pressed={selected}
+    <article
       className={cx(
-        "flex w-full cursor-pointer flex-col gap-1.5 rounded-control border p-3 text-left transition-colors",
+        "flex w-full flex-col gap-1.5 rounded-control border p-3 transition-colors",
         selected
           ? "border-info bg-surface-selected"
-          : "border-surface-border bg-surface hover:bg-surface-hover",
-        FOCUS_RING,
+          : "border-surface-border bg-surface",
       )}
     >
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span
-          className={cx(
-            "inline-flex items-center gap-1 rounded-chip px-1.5 py-px text-micro font-medium ring-1 ring-inset",
-            stateInfo.badge,
-          )}
-        >
-          <span className={cx("size-1.5 rounded-full", stateInfo.dot)} />
-          {stateInfo.label}
-        </span>
-        <span className="rounded-chip bg-info-tint px-1.5 py-px text-micro font-medium text-info">
-          {item.role === "focused"
-            ? "focused"
-            : item.role === "in_flight"
-              ? "in flight"
-              : item.role === "live_reference"
-                ? "live"
-                : "planned"}
-        </span>
-        {feature.objectives.length > 0 && (
-          <span className="tnum font-mono text-micro text-faint-foreground">
-            {objectiveName(missionId, feature.objectives[0])}
-          </span>
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-pressed={selected}
+        className={cx(
+          "flex w-full flex-col gap-1.5 rounded-control text-left transition-colors hover:bg-surface-hover",
+          FOCUS_RING,
         )}
-        <span className="tnum ml-auto text-micro text-faint-foreground">
-          ← {item.directUpstreamCount} · {item.directDownstreamCount} →
-        </span>
-      </div>
+      >
+        <div className="flex w-full flex-wrap items-center gap-1.5">
+          <span
+            className={cx(
+              "inline-flex items-center gap-1 rounded-chip px-1.5 py-px text-micro font-medium ring-1 ring-inset",
+              stateInfo.badge,
+            )}
+          >
+            <span className={cx("size-1.5 rounded-full", stateInfo.dot)} />
+            {stateInfo.label}
+          </span>
+          <span className="rounded-chip bg-info-tint px-1.5 py-px text-micro font-medium text-info">
+            {item.role === "focused"
+              ? "focused"
+              : item.role === "in_flight"
+                ? "in flight"
+                : item.role === "live_reference"
+                  ? "live"
+                  : "planned"}
+          </span>
+          {feature.objectives.length > 0 && (
+            <span className="tnum font-mono text-micro text-faint-foreground">
+              {objectiveName(missionId, feature.objectives[0])}
+            </span>
+          )}
+          <span className="tnum ml-auto text-micro text-faint-foreground">
+            ← {item.directUpstreamCount} · {item.directDownstreamCount} →
+          </span>
+        </div>
 
-      <div>
-        <h3 className="text-label font-semibold text-foreground">{feature.title}</h3>
-        <p className="truncate font-mono text-micro text-faint-foreground">{feature.id}</p>
-      </div>
+        <div className="w-full">
+          <h3 className="text-label font-semibold text-foreground">{feature.title}</h3>
+          <p className="truncate font-mono text-micro text-faint-foreground">{feature.id}</p>
+        </div>
 
-      {feature.summary && (
-        <p className="line-clamp-2 text-caption text-muted-foreground">{feature.summary}</p>
-      )}
+        {feature.summary && (
+          <p className="line-clamp-2 w-full text-caption text-muted-foreground">{feature.summary}</p>
+        )}
+      </button>
 
       <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
         <span className={cx("max-w-full truncate rounded-chip px-1.5 py-px text-micro", signal.toneClass)}>
@@ -378,8 +377,7 @@ function SpineCard({
           {item.sessionId && (
             <button
               type="button"
-              onClick={(e) => {
-                e.stopPropagation();
+              onClick={() => {
                 if (item.sessionId) onOpenSession(item.sessionId);
               }}
               className={cx(
@@ -392,10 +390,7 @@ function SpineCard({
           )}
           <button
             type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onInspectInMindMap(feature.id);
-            }}
+            onClick={() => onInspectInMindMap(feature.id)}
             className={cx(
               "inline-flex items-center gap-0.5 rounded-chip px-1.5 py-px text-micro text-muted-foreground hover:bg-surface-hover hover:text-foreground",
               FOCUS_RING,
@@ -405,7 +400,7 @@ function SpineCard({
           </button>
         </div>
       </div>
-    </div>
+    </article>
   );
 }
 
@@ -427,70 +422,69 @@ function DependencyCard({
   const signal = workSignalView(item.workSignal);
 
   return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={onSelect}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onSelect();
-        }
-      }}
-      aria-pressed={selected}
+    <article
       className={cx(
-        "flex w-full cursor-pointer flex-col gap-1.5 rounded-control border p-2.5 text-left transition-colors",
+        "flex w-full flex-col gap-1.5 rounded-control border p-2.5 transition-colors",
         selected
           ? "border-info bg-surface-selected"
-          : "border-surface-border bg-surface hover:bg-surface-hover",
-        FOCUS_RING,
+          : "border-surface-border bg-surface",
       )}
     >
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span
-          className={cx(
-            "inline-flex items-center gap-1 rounded-chip px-1.5 py-px text-micro font-medium ring-1 ring-inset",
-            stateInfo.badge,
-          )}
-        >
-          <span className={cx("size-1.5 rounded-full", stateInfo.dot)} />
-          {stateInfo.label}
-        </span>
-        <span
-          className={cx(
-            "tnum rounded-chip px-1.5 py-px text-micro",
-            item.proximity === "direct"
-              ? "bg-surface-selected font-medium text-foreground"
-              : "bg-muted text-muted-foreground",
-          )}
-        >
-          {item.proximity === "direct" ? "direct" : `hop ${item.depth}`}
-        </span>
-        {feature.objectives.length > 0 && (
-          <span className="tnum ml-auto font-mono text-micro text-faint-foreground">
-            {objectiveName(missionId, feature.objectives[0])}
-          </span>
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-pressed={selected}
+        className={cx(
+          "flex w-full flex-col gap-1.5 rounded-control text-left transition-colors hover:bg-surface-hover",
+          FOCUS_RING,
         )}
-      </div>
-
-      <div>
-        <h3 className="text-label font-medium text-foreground">{feature.title}</h3>
-        <p className="truncate font-mono text-micro text-faint-foreground">{feature.id}</p>
-      </div>
-
-      {item.links.length > 0 && (
-        <div className="flex flex-wrap gap-1">
-          {item.links.slice(0, 3).map((link) => (
-            <span
-              key={`${link.viaFeatureId}:${link.edgeKind}`}
-              title={link.label ?? undefined}
-              className="truncate rounded-chip bg-muted px-1.5 py-px font-mono text-micro text-muted-foreground"
-            >
-              {edgeLabel(link.edgeKind)} · {link.viaFeatureId}
+      >
+        <div className="flex w-full flex-wrap items-center gap-1.5">
+          <span
+            className={cx(
+              "inline-flex items-center gap-1 rounded-chip px-1.5 py-px text-micro font-medium ring-1 ring-inset",
+              stateInfo.badge,
+            )}
+          >
+            <span className={cx("size-1.5 rounded-full", stateInfo.dot)} />
+            {stateInfo.label}
+          </span>
+          <span
+            className={cx(
+              "tnum rounded-chip px-1.5 py-px text-micro",
+              item.proximity === "direct"
+                ? "bg-surface-selected font-medium text-foreground"
+                : "bg-muted text-muted-foreground",
+            )}
+          >
+            {item.proximity === "direct" ? "direct" : `hop ${item.depth}`}
+          </span>
+          {feature.objectives.length > 0 && (
+            <span className="tnum ml-auto font-mono text-micro text-faint-foreground">
+              {objectiveName(missionId, feature.objectives[0])}
             </span>
-          ))}
+          )}
         </div>
-      )}
+
+        <div className="w-full">
+          <h3 className="text-label font-medium text-foreground">{feature.title}</h3>
+          <p className="truncate font-mono text-micro text-faint-foreground">{feature.id}</p>
+        </div>
+
+        {item.links.length > 0 && (
+          <div className="flex w-full flex-wrap gap-1">
+            {item.links.slice(0, 3).map((link) => (
+              <span
+                key={`${link.viaFeatureId}:${link.edgeKind}`}
+                title={link.label ?? undefined}
+                className="truncate rounded-chip bg-muted px-1.5 py-px font-mono text-micro text-muted-foreground"
+              >
+                {edgeLabel(link.edgeKind)} · {link.viaFeatureId}
+              </span>
+            ))}
+          </div>
+        )}
+      </button>
 
       <div className="flex flex-wrap items-center gap-1.5">
         <span className={cx("max-w-full truncate rounded-chip px-1.5 py-px text-micro", signal.toneClass)}>
@@ -499,8 +493,7 @@ function DependencyCard({
         {item.sessionId && (
           <button
             type="button"
-            onClick={(e) => {
-              e.stopPropagation();
+            onClick={() => {
               if (item.sessionId) onOpenSession(item.sessionId);
             }}
             className={cx(
@@ -512,6 +505,6 @@ function DependencyCard({
           </button>
         )}
       </div>
-    </div>
+    </article>
   );
 }

@@ -6,6 +6,10 @@
 
 import { compactCount } from "./format.ts";
 import { groupByTopDownTier, normalizeGrading, type SkillGrade } from "./grading.ts";
+import { Validated } from "./validated.ts";
+
+export const TELEMETRY_POLL_MS = 15_000;
+export const TELEMETRY_REQUEST_TIMEOUT_MS = 6_000;
 
 export type CostDisplayAmount =
   | { kind: "unpriced"; unpricedTokens: number; text: "unpriced" }
@@ -280,4 +284,151 @@ export function normalizeCostWindowTelemetry(
     models,
     unpricedModelCount,
   };
+}
+
+export type TelemetrySliceKey = keyof RuntimeTelemetryState;
+
+export const TELEMETRY_SLICE_KEYS: ReadonlyArray<TelemetrySliceKey> = [
+  "fleet",
+  "grading",
+  "cost24h",
+  "cost7d",
+];
+
+export type TelemetrySliceUpdate =
+  | { key: "fleet"; slice: TelemetrySlice<TelemetryAgentsSummary> }
+  | { key: "grading"; slice: TelemetrySlice<TelemetryModelsSummary> }
+  | { key: "cost24h"; slice: TelemetrySlice<TelemetryCostWindow> }
+  | { key: "cost7d"; slice: TelemetrySlice<TelemetryCostWindow> };
+
+export function applyTelemetrySliceUpdate(
+  state: RuntimeTelemetryState,
+  update: TelemetrySliceUpdate,
+): RuntimeTelemetryState {
+  return { ...state, [update.key]: update.slice };
+}
+
+export interface OptionalSliceReadOptions {
+  signal: AbortSignal;
+  headers: Record<string, string>;
+  timeoutMs?: number;
+}
+
+/** Local optional endpoint reader with strict isolation from global auth
+ * sync: 401/403/timeout/network failures degrade locally to `"unavailable"`
+ * and NEVER trigger global `unauthorized` broadcasts or logouts. */
+export async function readOptionalTelemetrySlice<T>(
+  reader: Validated,
+  url: string,
+  normalize: (raw: unknown) => T,
+  options: OptionalSliceReadOptions,
+): Promise<TelemetrySlice<T>> {
+  if (options.signal.aborted) {
+    throw new DOMException("The operation was aborted.", "AbortError");
+  }
+
+  const timeoutMs = options.timeoutMs ?? TELEMETRY_REQUEST_TIMEOUT_MS;
+  const sliceController = new AbortController();
+  const onOuterAbort = () => sliceController.abort();
+  options.signal.addEventListener("abort", onOuterAbort, { once: true });
+
+  let timedOut = false;
+  const timer: ReturnType<typeof setTimeout> | null =
+    timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          sliceController.abort();
+        }, timeoutMs)
+      : null;
+
+  try {
+    const data = await reader.read(url, normalize, {
+      signal: sliceController.signal,
+      headers: options.headers,
+      // Strictly local error creation — never calls `reportUnauthorizedStatus`.
+      fail: (status, detail) => new Error(detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}`),
+    });
+    return { status: "ready", data };
+  } catch {
+    if (options.signal.aborted && !timedOut) {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
+    return { status: "unavailable" };
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    options.signal.removeEventListener("abort", onOuterAbort);
+  }
+}
+
+export async function readTelemetrySliceByKey(
+  key: TelemetrySliceKey,
+  options: OptionalSliceReadOptions & { reader: Validated },
+): Promise<TelemetrySliceUpdate> {
+  const { reader, signal, headers, timeoutMs } = options;
+  switch (key) {
+    case "fleet":
+      return {
+        key: "fleet",
+        slice: await readOptionalTelemetrySlice(reader, "/api/fleet", normalizeFleetTelemetry, {
+          signal,
+          headers,
+          timeoutMs,
+        }),
+      };
+    case "grading":
+      return {
+        key: "grading",
+        slice: await readOptionalTelemetrySlice(reader, "/api/grading", normalizeGradingTelemetry, {
+          signal,
+          headers,
+          timeoutMs,
+        }),
+      };
+    case "cost24h":
+      return {
+        key: "cost24h",
+        slice: await readOptionalTelemetrySlice(
+          reader,
+          "/api/cost?window=24h",
+          (raw) => normalizeCostWindowTelemetry("24h", raw),
+          { signal, headers, timeoutMs },
+        ),
+      };
+    case "cost7d":
+      return {
+        key: "cost7d",
+        slice: await readOptionalTelemetrySlice(
+          reader,
+          "/api/cost?window=7d",
+          (raw) => normalizeCostWindowTelemetry("7d", raw),
+          { signal, headers, timeoutMs },
+        ),
+      };
+  }
+}
+
+/** Fire all 4 optional telemetry slice reads concurrently with independent
+ * timeouts and immediate per-slice settlement callbacks so one slow/stalled
+ * endpoint never starves healthy siblings. */
+export async function pollRuntimeTelemetrySlices(
+  options: OptionalSliceReadOptions & {
+    reader: Validated;
+    onSlice?: (update: TelemetrySliceUpdate) => void;
+  },
+): Promise<RuntimeTelemetryState> {
+  let state: RuntimeTelemetryState = { ...INITIAL_RUNTIME_TELEMETRY };
+  await Promise.allSettled(
+    TELEMETRY_SLICE_KEYS.map((key) =>
+      readTelemetrySliceByKey(key, options).then((update) => {
+        state = applyTelemetrySliceUpdate(state, update);
+        if (!options.signal.aborted) {
+          options.onSlice?.(update);
+        }
+      }),
+    ),
+  );
+  if (options.signal.aborted) {
+    throw new DOMException("The operation was aborted.", "AbortError");
+  }
+  return state;
 }

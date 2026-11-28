@@ -1,7 +1,7 @@
 // The Feature map's reads (`/api/features`, `/api/features/truth`). Its own
 // module, so the read model in features.ts stays pure for node's test runner.
 
-import { readApi } from "./api";
+import { apiHeaders, readApi, subscribeAuthSync } from "./api";
 import {
   parseFeatureTruthResponse,
   truthUrl,
@@ -9,13 +9,18 @@ import {
 } from "./featureCoverage.ts";
 import { normalizeFeatureMap, type FeatureMap } from "./features.ts";
 import {
-  INITIAL_RUNTIME_TELEMETRY,
-  normalizeCostWindowTelemetry,
-  normalizeFleetTelemetry,
-  normalizeGradingTelemetry,
+  pollRuntimeTelemetrySlices,
+  readTelemetrySliceByKey,
   type RuntimeTelemetryState,
-  type TelemetrySlice,
+  type TelemetrySliceKey,
+  type TelemetrySliceUpdate,
 } from "./runtimeTelemetry.ts";
+import { Validated } from "./validated.ts";
+
+/** Dedicated local reader for optional telemetry so 401/403/timeout on any
+ * telemetry endpoint never flows through `readApi` or logs the session out. */
+const optionalTelemetryReads = new Validated();
+subscribeAuthSync(() => optionalTelemetryReads.clear());
 
 /** GET /api/features: every open objective mission's capability map. */
 export async function fetchFeatureMap(signal: AbortSignal): Promise<FeatureMap> {
@@ -37,18 +42,35 @@ export async function fetchOptionalFeatureTruth(
   }
 }
 
-async function readOptionalSlice<T>(
-  url: string,
+/** Read a single optional runtime telemetry slice independently with per-slice
+ * timeout and zero global `unauthorized` auth side effects. */
+export async function readOptionalTelemetrySliceByKey(
+  key: TelemetrySliceKey,
   signal: AbortSignal,
-  normalize: (raw: unknown) => T,
-): Promise<TelemetrySlice<T>> {
-  try {
-    const data = await readApi(url, signal, normalize);
-    return { status: "ready", data };
-  } catch (cause) {
-    if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
-    return { status: "unavailable" };
-  }
+  timeoutMs?: number,
+): Promise<TelemetrySliceUpdate> {
+  return readTelemetrySliceByKey(key, {
+    reader: optionalTelemetryReads,
+    signal,
+    headers: apiHeaders(),
+    timeoutMs,
+  });
+}
+
+/** Stream optional runtime telemetry slices concurrently, notifying `onSlice`
+ * immediately as each individual endpoint settles. */
+export async function pollOptionalRuntimeTelemetry(
+  signal: AbortSignal,
+  onSlice: (update: TelemetrySliceUpdate) => void,
+  timeoutMs?: number,
+): Promise<RuntimeTelemetryState> {
+  return pollRuntimeTelemetrySlices({
+    reader: optionalTelemetryReads,
+    signal,
+    headers: apiHeaders(),
+    timeoutMs,
+    onSlice,
+  });
 }
 
 /** Non-blocking optional runtime telemetry for `#/features` from existing
@@ -57,30 +79,5 @@ async function readOptionalSlice<T>(
 export async function fetchOptionalRuntimeTelemetry(
   signal: AbortSignal,
 ): Promise<RuntimeTelemetryState> {
-  const [fleetRes, gradingRes, cost24hRes, cost7dRes] = await Promise.allSettled([
-    readOptionalSlice("/api/fleet", signal, normalizeFleetTelemetry),
-    readOptionalSlice("/api/grading", signal, normalizeGradingTelemetry),
-    readOptionalSlice("/api/cost?window=24h", signal, (raw) =>
-      normalizeCostWindowTelemetry("24h", raw),
-    ),
-    readOptionalSlice("/api/cost?window=7d", signal, (raw) =>
-      normalizeCostWindowTelemetry("7d", raw),
-    ),
-  ]);
-
-  if (signal.aborted) {
-    throw new DOMException("The operation was aborted.", "AbortError");
-  }
-
-  const pick = <T,>(
-    res: PromiseSettledResult<TelemetrySlice<T>>,
-    fallback: TelemetrySlice<T>,
-  ): TelemetrySlice<T> => (res.status === "fulfilled" ? res.value : fallback);
-
-  return {
-    fleet: pick(fleetRes, INITIAL_RUNTIME_TELEMETRY.fleet),
-    grading: pick(gradingRes, INITIAL_RUNTIME_TELEMETRY.grading),
-    cost24h: pick(cost24hRes, INITIAL_RUNTIME_TELEMETRY.cost24h),
-    cost7d: pick(cost7dRes, INITIAL_RUNTIME_TELEMETRY.cost7d),
-  };
+  return pollOptionalRuntimeTelemetry(signal, () => {});
 }

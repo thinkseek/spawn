@@ -1,45 +1,52 @@
 import { Activity, Coins, Cpu } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { fetchOptionalRuntimeTelemetry } from "../../featuresApi";
+import { readOptionalTelemetrySliceByKey } from "../../featuresApi";
 import { compactCount } from "../../format";
 import {
   INITIAL_RUNTIME_TELEMETRY,
+  TELEMETRY_POLL_MS,
+  TELEMETRY_SLICE_KEYS,
+  applyTelemetrySliceUpdate,
   formatCostAmountText,
   type RuntimeTelemetryState,
   type TelemetryAgentsSummary,
   type TelemetryCostWindow,
   type TelemetryModelsSummary,
   type TelemetrySlice,
+  type TelemetrySliceKey,
 } from "../../runtimeTelemetry";
 import { Card, cx } from "../ui";
 
-const TELEMETRY_POLL_MS = 15_000;
-
 /** Non-blocking runtime status strip for `#/features`, reading existing
  * read-only endpoints (`/api/fleet`, `/api/grading`, `/api/cost?window=24h|7d`).
- * Individual endpoint errors degrade silently without blocking the feature map. */
+ * Each slice settles and updates independently with per-request timeout so one
+ * slow endpoint cannot starve siblings or abort healthy reads. */
 export function RuntimeTelemetryStrip() {
   const [telemetry, setTelemetry] = useState<RuntimeTelemetryState>(INITIAL_RUNTIME_TELEMETRY);
 
   useEffect(() => {
-    let cancelled = false;
-    let activeController: AbortController | null = null;
+    const unmountController = new AbortController();
+    const inFlight = new Set<TelemetrySliceKey>();
 
     const refresh = () => {
       if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-      activeController?.abort();
-      const controller = new AbortController();
-      activeController = controller;
-      void fetchOptionalRuntimeTelemetry(controller.signal)
-        .then((next) => {
-          if (!cancelled && !controller.signal.aborted) {
-            setTelemetry(next);
-          }
-        })
-        .catch(() => {
-          // Abort on cleanup/unmount is expected; slice reads already degrade cleanly.
-        });
+      for (const key of TELEMETRY_SLICE_KEYS) {
+        if (inFlight.has(key)) continue;
+        inFlight.add(key);
+        void readOptionalTelemetrySliceByKey(key, unmountController.signal)
+          .then((update) => {
+            if (!unmountController.signal.aborted) {
+              setTelemetry((prev) => applyTelemetrySliceUpdate(prev, update));
+            }
+          })
+          .catch(() => {
+            // Unmount abort is expected; HTTP/timeout failures resolve as "unavailable".
+          })
+          .finally(() => {
+            inFlight.delete(key);
+          });
+      }
     };
 
     refresh();
@@ -50,10 +57,9 @@ export function RuntimeTelemetryStrip() {
     document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
-      cancelled = true;
+      unmountController.abort();
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
-      activeController?.abort();
     };
   }, []);
 

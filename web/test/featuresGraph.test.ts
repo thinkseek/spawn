@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import { normalizeFeatureMap } from "../src/features.ts";
@@ -648,4 +649,171 @@ test("buildActiveSpineModel guards against self-links, 2-node cycles, and transi
     ],
   );
   assert.ok(model.summary.cycleGuardedEdges > 0);
+});
+
+test("Fix 3: diamond DAGs report 0 cycle warnings while real cycles still register", () => {
+  // Acyclic diamond DAG: A -> B, A -> C, C -> B
+  const diamondMission = makeMission([
+    {
+      id: "a",
+      title: "Focus A",
+      state: "implemented",
+      planned: false,
+      implemented: true,
+      relations: [
+        { kind: "depends_on", target: "b" },
+        { kind: "depends_on", target: "c" },
+      ],
+    },
+    {
+      id: "c",
+      title: "Middle C",
+      state: "planned",
+      relations: [{ kind: "depends_on", target: "b" }],
+    },
+    {
+      id: "b",
+      title: "Base B",
+      state: "live",
+      planned: false,
+      implemented: true,
+      verified: true,
+      live: true,
+    },
+  ]);
+
+  assert.deepEqual(validateFeatureGraph(diamondMission.features), []);
+  const diamondRel = buildRelationIndex(diamondMission.features);
+
+  const focusA = buildActiveSpineModel(diamondMission, diamondRel, "a");
+  assert.equal(focusA.kind, "focused");
+  assert.equal(focusA.summary.cycleGuardedEdges, 0);
+  assert.deepEqual(
+    focusA.upstream.map((u) => [u.feature.id, u.depth]),
+    [
+      ["c", 1],
+      ["b", 1],
+    ],
+  );
+
+  // Downstream diamond from B (C depends_on B, A depends_on B & C) must also report 0 cycles.
+  const focusB = buildActiveSpineModel(diamondMission, diamondRel, "b");
+  assert.equal(focusB.kind, "focused");
+  assert.equal(focusB.summary.cycleGuardedEdges, 0);
+  assert.deepEqual(
+    focusB.downstream.map((d) => [d.feature.id, d.depth]),
+    [
+      ["a", 1],
+      ["c", 1],
+    ],
+  );
+});
+
+test("Fix 4, 5 & 6: task-scoped session binding never borrows across tasks, isFocused is removed, and cards avoid nested role=button", () => {
+  const mission = makeMission([
+    {
+      id: "owner-no-session",
+      title: "Active Task 42 Without Session",
+      state: "implemented",
+      planned: false,
+      implemented: true,
+      owner: {
+        task: 42,
+        agent_id: "worker-42",
+        session_id: null,
+        kind: "worker",
+        state: "working",
+        since_ms: 2000,
+      },
+      last_owner: {
+        task: 17,
+        agent_id: "worker-17",
+        session_id: "sess-17",
+        kind: "worker",
+        state: "done",
+        since_ms: 1000,
+      },
+      evidence: {
+        tasks: [
+          { id: 17, state: "done", agent_id: "worker-17", session_id: "sess-17", updated_at_ms: 1000 },
+          { id: 42, state: "working", agent_id: "worker-42", session_id: null, updated_at_ms: 2000 },
+        ],
+        landings: [],
+        verifications: [],
+      },
+    },
+    {
+      id: "blocked-no-session",
+      title: "Blocked Task 43 Without Session",
+      state: "planned",
+      blocked: {
+        kind: "sent_back",
+        reason: "needs fix",
+        task: 43,
+        agent_id: "worker-43",
+        session_id: null,
+      },
+      evidence: {
+        tasks: [
+          { id: 19, state: "done", agent_id: "worker-19", session_id: "sess-19", updated_at_ms: 900 },
+          { id: 43, state: "sent_back", agent_id: "worker-43", session_id: null, updated_at_ms: 2100 },
+        ],
+        landings: [],
+        verifications: [],
+      },
+    },
+    {
+      id: "owner-from-same-task",
+      title: "Task 44 Carries Matching Task Session",
+      state: "verified",
+      planned: false,
+      implemented: true,
+      verified: true,
+      owner: {
+        task: 44,
+        agent_id: "worker-44",
+        session_id: null,
+        kind: "worker",
+        state: "working",
+        since_ms: 2200,
+      },
+      evidence: {
+        tasks: [
+          { id: 12, state: "done", agent_id: "worker-12", session_id: "sess-12", updated_at_ms: 800 },
+          { id: 44, state: "working", agent_id: "worker-44", session_id: "sess-44", updated_at_ms: 2200 },
+        ],
+        landings: [],
+        verifications: [],
+      },
+    },
+  ]);
+
+  const rel = buildRelationIndex(mission.features);
+  const activeModel = buildActiveSpineModel(mission, rel, null);
+  const byFeature = new Map(activeModel.spine.map((n) => [n.feature.id, n]));
+
+  const node42 = byFeature.get("owner-no-session")!;
+  assert.equal(node42.sessionId, null);
+  assert.equal(node42.workSignal.kind, "active_owner");
+  if (node42.workSignal.kind === "active_owner") {
+    assert.equal(node42.workSignal.sessionId, null);
+  }
+  assert.equal("isFocused" in node42, false);
+
+  const node43 = byFeature.get("blocked-no-session")!;
+  assert.equal(node43.sessionId, null);
+
+  const node44 = byFeature.get("owner-from-same-task")!;
+  assert.equal(node44.sessionId, "sess-44");
+
+  const focused42 = buildActiveSpineModel(mission, rel, "owner-no-session");
+  assert.equal(focused42.spine[0].role, "focused");
+  assert.equal("isFocused" in focused42.spine[0], false);
+
+  // Guard ActiveSpineView against nested interactive elements (`role="button"`).
+  const activeSpineSrc = readFileSync(
+    new URL("../src/components/features/ActiveSpineView.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(activeSpineSrc, /role="button"/);
 });

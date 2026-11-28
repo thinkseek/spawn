@@ -1268,7 +1268,6 @@ export interface SpineDependencyNode {
 export interface ActiveSpineNode {
   feature: Feature;
   role: "focused" | "in_flight" | "non_live" | "live_reference";
-  isFocused: boolean;
   workSignal: SpineWorkSignal;
   sessionId: string | null;
   directUpstreamCount: number;
@@ -1348,6 +1347,17 @@ function signalSessionId(signal: SpineWorkSignal): string | null {
   }
 }
 
+function sessionForTask(
+  feature: Feature,
+  taskId: number | null,
+  directSessionId: string | null,
+): string | null {
+  if (directSessionId !== null) return directSessionId;
+  if (taskId === null) return null;
+  const matched = feature.evidence.tasks.find((task) => task.id === taskId);
+  return matched?.session_id ?? null;
+}
+
 function deriveSpineWorkSignal(feature: Feature): SpineWorkSignal {
   const sortedTasks = [...feature.evidence.tasks].sort(
     (a, b) => (b.updated_at_ms ?? 0) - (a.updated_at_ms ?? 0) || (b.id ?? 0) - (a.id ?? 0),
@@ -1356,14 +1366,6 @@ function deriveSpineWorkSignal(feature: Feature): SpineWorkSignal {
     (task) => !TERMINAL_TASK_STATES.has(task.state.trim().toLowerCase()),
   );
   const newestActive = activeTasks[0] ?? null;
-  const newestAny = sortedTasks[0] ?? null;
-  const sessionId =
-    feature.blocked?.session_id ??
-    feature.owner?.session_id ??
-    newestActive?.session_id ??
-    feature.last_owner?.session_id ??
-    newestAny?.session_id ??
-    null;
 
   if (feature.blocked !== null) {
     return {
@@ -1372,7 +1374,7 @@ function deriveSpineWorkSignal(feature: Feature): SpineWorkSignal {
       reason: feature.blocked.reason,
       taskId: feature.blocked.task,
       agentId: feature.blocked.agent_id,
-      sessionId,
+      sessionId: sessionForTask(feature, feature.blocked.task, feature.blocked.session_id),
     };
   }
   if (feature.owner !== null) {
@@ -1380,7 +1382,7 @@ function deriveSpineWorkSignal(feature: Feature): SpineWorkSignal {
       kind: "active_owner",
       taskId: feature.owner.task,
       agentId: feature.owner.agent_id,
-      sessionId,
+      sessionId: sessionForTask(feature, feature.owner.task, feature.owner.session_id),
       taskState: feature.owner.state,
       activeTaskCount: Math.max(1, activeTasks.length),
     };
@@ -1390,7 +1392,7 @@ function deriveSpineWorkSignal(feature: Feature): SpineWorkSignal {
       kind: "active_tasks",
       taskId: newestActive.id,
       agentId: newestActive.agent_id,
-      sessionId,
+      sessionId: newestActive.session_id ?? null,
       taskState: newestActive.state,
       activeTaskCount: activeTasks.length,
     };
@@ -1400,7 +1402,7 @@ function deriveSpineWorkSignal(feature: Feature): SpineWorkSignal {
       kind: "recent_owner",
       taskId: feature.last_owner.task,
       agentId: feature.last_owner.agent_id,
-      sessionId,
+      sessionId: sessionForTask(feature, feature.last_owner.task, feature.last_owner.session_id),
       taskState: feature.last_owner.state,
     };
   }
@@ -1514,6 +1516,38 @@ function uniqueNeighborFeatureCount(
   return unique.size;
 }
 
+function countReachableCycleEdges(
+  spineIds: ReadonlyArray<string>,
+  direction: "upstream" | "downstream",
+  relationIndex: RelationIndex,
+  byId: ReadonlyMap<string, Feature>,
+): number {
+  const color = new Map<string, 1 | 2>(); // 1 = visiting (on active recursion stack), 2 = visited
+  let backEdges = 0;
+
+  function dfs(nodeId: string): void {
+    color.set(nodeId, 1);
+    for (const edge of directNeighbors(nodeId, direction, relationIndex, byId)) {
+      const nextColor = color.get(edge.nextId);
+      if (nextColor === 1) {
+        // Real back-edge into an active ancestor on the DFS stack (including self-loops).
+        backEdges += 1;
+      } else if (nextColor === undefined) {
+        dfs(edge.nextId);
+      }
+      // `nextColor === 2` is a DAG cross/forward edge — never a cycle.
+    }
+    color.set(nodeId, 2);
+  }
+
+  for (const rootId of spineIds) {
+    if (color.get(rootId) === undefined) {
+      dfs(rootId);
+    }
+  }
+  return backEdges;
+}
+
 function collectSpineDependencies(
   spineIds: ReadonlyArray<string>,
   direction: "upstream" | "downstream",
@@ -1531,20 +1565,12 @@ function collectSpineDependencies(
     queue.push({ id, depth: 0 });
   }
 
-  let cycleGuardedEdges = 0;
   for (let head = 0; head < queue.length; head += 1) {
     const { id: currId, depth } = queue[head];
     const neighbors = directNeighbors(currId, direction, relationIndex, byId);
     for (const edge of neighbors) {
       const nextId = edge.nextId;
-      if (nextId === currId) {
-        cycleGuardedEdges += 1;
-        continue;
-      }
-      if (spineSet.has(nextId)) {
-        if (depth > 0) {
-          cycleGuardedEdges += 1;
-        }
+      if (nextId === currId || spineSet.has(nextId)) {
         continue;
       }
 
@@ -1569,8 +1595,6 @@ function collectSpineDependencies(
             existing.push(link);
             linksById.set(nextId, existing);
           }
-        } else if (prevDepth <= depth) {
-          cycleGuardedEdges += 1;
         }
         continue;
       }
@@ -1580,6 +1604,13 @@ function collectSpineDependencies(
       queue.push({ id: nextId, depth: nextDepth });
     }
   }
+
+  const cycleGuardedEdges = countReachableCycleEdges(
+    spineIds,
+    direction,
+    relationIndex,
+    byId,
+  );
 
   const collected: SpineDependencyNode[] = [];
   for (const [id, depth] of visitedDepth.entries()) {
@@ -1691,7 +1722,6 @@ export function buildActiveSpineModel(
     return {
       feature,
       role,
-      isFocused: kind === "focused" && feature.id === focusedFeature?.id,
       workSignal,
       sessionId: signalSessionId(workSignal),
       directUpstreamCount: uniqueNeighborFeatureCount(feature.id, "upstream", relationIndex, byId),
