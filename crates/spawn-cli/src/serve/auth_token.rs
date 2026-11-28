@@ -42,6 +42,24 @@ impl AuthPrincipal {
     pub(super) const fn can_mutate(self) -> bool {
         matches!(self, Self::LocalOwner | Self::AdminToken)
     }
+
+    /// Wall-clock Unix deadline in milliseconds beyond which an active `/api/stream`
+    /// connection for this principal must close (`None` for unbounded principals).
+    pub(super) const fn stream_expires_at_ms(self) -> Option<i64> {
+        match self {
+            Self::LocalOwner | Self::AdminToken => None,
+            Self::ReadOnlyViewer { expires_at_ms } => Some(expires_at_ms),
+        }
+    }
+}
+
+/// Current Unix timestamp in milliseconds, returning `None` if the system
+/// clock precedes the Unix epoch or overflows `i64` (fails closed).
+pub(super) fn current_epoch_ms() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
 }
 
 /// Closed reason why a `sv1` viewer token failed verification (every variant maps
@@ -367,6 +385,8 @@ mod tests {
         let admin = authenticate_bearer(MASTER, MASTER, Some(NOW));
         assert_eq!(admin, Some(AuthPrincipal::AdminToken));
         assert!(admin.is_some_and(AuthPrincipal::can_mutate));
+        assert_eq!(AuthPrincipal::LocalOwner.stream_expires_at_ms(), None);
+        assert_eq!(AuthPrincipal::AdminToken.stream_expires_at_ms(), None);
 
         let viewer = authenticate_bearer(&tok, MASTER, Some(NOW));
         assert_eq!(
@@ -376,6 +396,10 @@ mod tests {
             })
         );
         assert!(!viewer.is_some_and(AuthPrincipal::can_mutate));
+        assert_eq!(
+            viewer.and_then(AuthPrincipal::stream_expires_at_ms),
+            Some(exp_ms)
+        );
 
         assert_eq!(authenticate_bearer(&tok, MASTER, Some(NOW + 3_600)), None);
         assert_eq!(authenticate_bearer(&tok, MASTER, None), None);

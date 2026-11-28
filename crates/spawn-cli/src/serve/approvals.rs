@@ -102,8 +102,8 @@ use spawn_core::port::TerminalHost;
 use tiny_http::{Method, Request};
 
 use super::{
-    Access, BAD_REQUEST, Shared, checkout_human, idempotency, json_response, not_allowed, now_ms,
-    session_id, typed_text, write_body,
+    BAD_REQUEST, Shared, auth_token::AuthPrincipal, checkout_human, idempotency, json_response,
+    not_allowed, now_ms, session_id, typed_text, write_body,
 };
 
 /// The pane lines a prompt is looked for in (the bottom of the screen).
@@ -1190,7 +1190,7 @@ pub(super) enum Send {
 pub(super) fn act(
     mut request: Request,
     id: &str,
-    access: Access,
+    access: AuthPrincipal,
     shared: &Shared,
 ) -> Result<(), String> {
     if *request.method() != Method::Post {
@@ -1425,7 +1425,7 @@ fn submit_sending(
 pub(super) fn acted(
     request: &mut Request,
     id: &str,
-    access: Access,
+    access: AuthPrincipal,
     shared: &Shared,
     prompt: &dyn Fn(&SessionId) -> Result<Option<Prompt>, String>,
 ) -> Result<(u16, Value), (u16, String)> {

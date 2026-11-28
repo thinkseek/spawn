@@ -15,6 +15,21 @@ fn run_spawn(args: &[&str], env: &[(&str, &str)]) -> Output {
         .expect("execute spawn binary")
 }
 
+fn assert_clean_viewer_stderr(stderr: &str) {
+    assert!(
+        !stderr.contains(TEST_MASTER_TOKEN),
+        "master secret leaked into stderr"
+    );
+    for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+        let benign_non_linux = cfg!(not(target_os = "linux"))
+            && line.starts_with("spawn: not dumpable is a Linux setting;");
+        assert!(
+            benign_non_linux,
+            "unexpected stderr line: {line:?} (full stderr: {stderr:?})"
+        );
+    }
+}
+
 #[test]
 fn viewer_token_cli_emits_only_sv1_token_and_never_echoes_master_secret() {
     let default_out = run_spawn(
@@ -24,7 +39,7 @@ fn viewer_token_cli_emits_only_sv1_token_and_never_echoes_master_secret() {
     let stdout = String::from_utf8_lossy(&default_out.stdout);
     let stderr = String::from_utf8_lossy(&default_out.stderr);
     assert_eq!(default_out.status.code(), Some(0), "{stderr}");
-    assert!(stderr.is_empty(), "expected clean stderr, got: {stderr}");
+    assert_clean_viewer_stderr(&stderr);
     let trimmed = stdout.trim();
     let parts: Vec<&str> = trimmed.split('.').collect();
     assert_eq!(parts.len(), 3, "unexpected token shape: {trimmed:?}");
@@ -46,7 +61,7 @@ fn viewer_token_cli_emits_only_sv1_token_and_never_echoes_master_secret() {
     let custom_stdout = String::from_utf8_lossy(&custom_out.stdout);
     let custom_stderr = String::from_utf8_lossy(&custom_out.stderr);
     assert_eq!(custom_out.status.code(), Some(0), "{custom_stderr}");
-    assert!(custom_stderr.is_empty(), "{custom_stderr}");
+    assert_clean_viewer_stderr(&custom_stderr);
     assert!(custom_stdout.trim().starts_with("sv1."));
     assert!(!custom_stdout.contains(TEST_MASTER_TOKEN));
 }
@@ -76,7 +91,7 @@ fn viewer_token_cli_reads_keep_credential_file_without_echoing_secret() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.is_empty(), "{stderr}");
+    assert_clean_viewer_stderr(&stderr);
     assert!(stdout.trim().starts_with("sv1."));
     assert!(!stdout.contains(TEST_MASTER_TOKEN));
     assert!(!stderr.contains(TEST_MASTER_TOKEN));
@@ -141,6 +156,6 @@ fn serve_help_documents_viewer_token_and_opens_no_store() {
             stdout.contains("spawn serve viewer-token [--ttl <duration>]"),
             "{stdout}"
         );
-        assert!(stderr.is_empty(), "{stderr}");
+        assert_clean_viewer_stderr(&stderr);
     }
 }
