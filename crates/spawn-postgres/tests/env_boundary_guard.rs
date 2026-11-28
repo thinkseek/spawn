@@ -16,12 +16,15 @@
 //! 2. **Zero unallowlisted clippy/env lint suppressions**: Rejects any
 //!    production `allow(...)` or `expect(...)` mentioning `disallowed_methods`,
 //!    `clippy::all`, `clippy::style`, bare `clippy`, or `warnings` outside
-//!    `ENV_BOUNDARY_ALLOWLIST` and verifies root `clippy.toml` forbids all four
-//!    `std::env::{var, var_os, vars, vars_os}` methods.
+//!    `ENV_BOUNDARY_ALLOWLIST`, verifies root `clippy.toml` forbids all four
+//!    `std::env::{var, var_os, vars, vars_os}` methods, and forbids any nested
+//!    or dot Clippy config outside the single root `clippy.toml`.
 //! 3. **Production `--force-warn clippy::disallowed_methods` audit**: Runs real `cargo clippy`
-//!    with `--offline --locked --force-warn clippy::disallowed_methods` across all workspace
+//!    with `--offline --locked --force-warn clippy::disallowed_methods` and
+//!    `CLIPPY_CONF_DIR` pinned to the workspace root across all workspace
 //!    production targets (`--lib --bins`) so even macro-generated `#[allow/expect(clippy::disallowed_methods)]`
-//!    suppressions cannot silence disallowed `std::env` calls outside `ENV_BOUNDARY_ALLOWLIST`.
+//!    suppressions or crate-local configs cannot silence disallowed `std::env` calls
+//!    outside `ENV_BOUNDARY_ALLOWLIST`.
 //! 4. **Workspace member parity**: Asserts `WORKSPACE_CRATES` matches `[workspace] members`
 //!    in root `Cargo.toml` so newly added workspace crates cannot evade auditing.
 //! 5. **Zero production `spawn-postgres/testing` activation**: Queries Cargo's real
@@ -1021,7 +1024,15 @@ fn run_clippy_force_warn_disallowed_methods(
     let manifest_dir = manifest_path
         .parent()
         .expect("Cargo.toml has parent directory");
+    assert!(
+        manifest_dir.join("clippy.toml").is_file(),
+        "expected workspace root clippy.toml under {}",
+        manifest_dir.display()
+    );
     let mut cmd = Command::new(env!("CARGO"));
+    // Pin CLIPPY_CONF_DIR to the workspace root containing `clippy.toml` so
+    // crate-local configs or inherited env vars cannot shadow `disallowed-methods`.
+    cmd.env("CLIPPY_CONF_DIR", manifest_dir);
     cmd.args([
         "clippy",
         "--offline",
@@ -1164,6 +1175,39 @@ fn parse_workspace_members(cargo_toml: &str) -> Vec<String> {
     members
 }
 
+fn collect_unexpected_clippy_configs(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+    let mut paths: Vec<PathBuf> = entries.map(|e| e.expect("dir entry").path()).collect();
+    paths.sort();
+    for path in paths {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let meta =
+            fs::symlink_metadata(&path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+        if meta.is_dir() {
+            if matches!(name, "target" | ".git") {
+                continue;
+            }
+            collect_unexpected_clippy_configs(root, &path, out);
+            continue;
+        }
+        if matches!(name, "clippy.toml" | ".clippy.toml") {
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            if rel != Path::new("clippy.toml") {
+                out.push(rel);
+            }
+        }
+    }
+}
+
+fn find_unexpected_clippy_configs(root: &Path) -> Vec<PathBuf> {
+    let mut unexpected = Vec::new();
+    collect_unexpected_clippy_configs(root, root, &mut unexpected);
+    unexpected.sort();
+    unexpected
+}
+
 // ---------------------------------------------------------------------------
 // Cargo Dependency Graph Guard (`cargo tree --offline --locked --target all`)
 // ---------------------------------------------------------------------------
@@ -1301,6 +1345,12 @@ fn workspace_crates_list_matches_root_cargo_toml_and_clippy_toml_forbids_all_env
     assert!(
         missing.is_empty(),
         "root clippy.toml is missing required std::env entries: {missing:?}"
+    );
+
+    let unexpected_clippy_configs = find_unexpected_clippy_configs(&root);
+    assert!(
+        unexpected_clippy_configs.is_empty(),
+        "unexpected nested or dot clippy config(s) outside root clippy.toml: {unexpected_clippy_configs:?}"
     );
 }
 
@@ -1862,7 +1912,9 @@ pub fn via_allow() -> Option<std::ffi::OsString> {
     let ws = setup_clippy_macro_workspace(sneaky_src);
     let target_dir = ws.0.join("target");
     // Baseline: standard `-D warnings` lets macro-generated `#[expect/allow]` suppress the read.
-    let baseline = Command::new(env!("CARGO"))
+    let mut baseline_cmd = Command::new(env!("CARGO"));
+    baseline_cmd
+        .env("CLIPPY_CONF_DIR", &ws.0)
         .args([
             "clippy",
             "--offline",
@@ -1874,7 +1926,8 @@ pub fn via_allow() -> Option<std::ffi::OsString> {
         .arg(&target_dir)
         .arg("--manifest-path")
         .arg(ws.root_manifest())
-        .args(["--", "-D", "warnings"])
+        .args(["--", "-D", "warnings"]);
+    let baseline = baseline_cmd
         .output()
         .expect("run baseline clippy -D warnings");
     assert!(
@@ -1917,5 +1970,93 @@ pub fn via_allow() -> Option<std::ffi::OsString> {
             .iter()
             .any(|v| v.contains("std::env::var_os")),
         "missing std::env::var_os violation: {audit:?}"
+    );
+}
+
+#[test]
+fn clippy_force_warn_ignores_crate_local_clippy_toml_on_cold_and_cached_runs() {
+    let sneaky_src = r#"
+macro_rules! allow_local_override {
+    ($m:ident, $f:ident) => {{
+        #[allow(clippy::disallowed_methods)]
+        let v = std::$m::$f("LOCAL_CLIPPY_BYPASS");
+        v.ok()
+    }};
+}
+
+pub fn via_local_clippy() -> Option<String> {
+    allow_local_override!(env, var)
+}
+"#;
+    let ws = setup_clippy_macro_workspace(sneaky_src);
+    ws.write("sneaky/clippy.toml", "too-many-arguments-threshold = 8\n");
+    assert_eq!(
+        find_unexpected_clippy_configs(&ws.0),
+        vec![PathBuf::from("sneaky/clippy.toml")]
+    );
+
+    let target_dir = ws.0.join("target");
+    let cold = run_clippy_force_warn_disallowed_methods(
+        &ws.root_manifest(),
+        Some(&target_dir),
+        &["boundary/src/lib.rs"],
+    );
+    assert!(
+        cold.allowlisted_diagnostics >= 1,
+        "expected allowlisted boundary diagnostic on cold run, got {cold:?}"
+    );
+    assert_eq!(
+        cold.violations.len(),
+        1,
+        "expected crate-local clippy.toml override to still fail cold force-warn audit: {cold:?}"
+    );
+    assert!(
+        cold.violations[0].contains("sneaky/src/lib.rs:")
+            && cold.violations[0].contains("std::env::var"),
+        "unexpected cold violation details: {cold:?}"
+    );
+
+    let cached = run_clippy_force_warn_disallowed_methods(
+        &ws.root_manifest(),
+        Some(&target_dir),
+        &["boundary/src/lib.rs"],
+    );
+    assert_eq!(
+        cached, cold,
+        "expected cached rerun to catch the same violation stably under crate-local clippy.toml"
+    );
+}
+
+#[test]
+fn env_boundary_guard_rejects_nested_and_dot_clippy_configs_only() {
+    let ws = TempWorkspace::new("nested-clippy-cfg");
+    ws.write(
+        "clippy.toml",
+        "disallowed-methods = [\n  { path = \"std::env::var\" },\n]\n",
+    );
+    ws.write("crates/spawn-kdf/src/lib.rs", "");
+    ws.write("target/clippy.toml", "too-many-arguments-threshold = 8\n");
+    ws.write(".git/.clippy.toml", "too-many-arguments-threshold = 8\n");
+    assert!(
+        find_unexpected_clippy_configs(&ws.0).is_empty(),
+        "expected root clippy.toml plus target/ and .git/ to pass"
+    );
+
+    ws.write(
+        "crates/spawn-kdf/clippy.toml",
+        "too-many-arguments-threshold = 8\n",
+    );
+    ws.write(
+        "crates/spawn-core/.clippy.toml",
+        "too-many-arguments-threshold = 8\n",
+    );
+    ws.write(".clippy.toml", "too-many-arguments-threshold = 8\n");
+    assert_eq!(
+        find_unexpected_clippy_configs(&ws.0),
+        vec![
+            PathBuf::from(".clippy.toml"),
+            PathBuf::from("crates/spawn-core/.clippy.toml"),
+            PathBuf::from("crates/spawn-kdf/clippy.toml"),
+        ]
     );
 }
