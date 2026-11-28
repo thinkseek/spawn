@@ -32,6 +32,54 @@ use crate::workspace_rules::{ENGINE_RUNTIME_FILES, LARGE_FILE_TRAILER};
 /// unless tracked in both `base_tree` and `main_tree`.
 pub const BUILD_OUTPUT: [&str; 2] = ["target", ".spawn"];
 
+const REFS_JOURNAL_LOCK: &str = ".refs-journal.lock";
+
+/// Exclusive OS-level `flock` guard serializing PostgreSQL `RefLedger` ref writes
+/// alongside `<cas_root>/refs.journal` appends and reconciliation across threads and processes.
+pub struct RefsJournalLock {
+    _file: fs::File,
+}
+
+fn open_refs_journal_lock(path: &Path) -> Result<fs::File, D6StoreError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if !meta.is_file() {
+                return Err(CasError::NotPlain(path.to_path_buf()).into());
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|err| {
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                D6StoreError::Cas(CasError::NotPlain(path.to_path_buf()))
+            } else {
+                D6StoreError::Io(err)
+            }
+        })?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(CasError::NotPlain(path.to_path_buf()).into());
+    }
+    if meta.permissions().mode() & 0o777 != 0o600 {
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
+}
+
 /// Errors returned by [`CasMerkleStore`] and [`crate::GitBorderAdapter`].
 #[derive(Debug)]
 pub enum D6StoreError {
@@ -650,6 +698,20 @@ impl CasMerkleStore {
         &self.cas
     }
 
+    /// Path to `<cas_root>/.refs-journal.lock`, the cross-thread / cross-process `flock` file
+    /// serializing ledger ref updates with `refs.journal` appends.
+    pub fn refs_journal_lock_path(&self) -> PathBuf {
+        self.cas.root().join(REFS_JOURNAL_LOCK)
+    }
+
+    /// Acquire an exclusive OS-level `flock` covering PG `RefLedger` ref writes and
+    /// `refs.journal` appends/reconciliation (must be acquired BEFORE any PG `cas_ref` call).
+    pub fn lock_refs_journal(&self) -> Result<RefsJournalLock, D6StoreError> {
+        let file = open_refs_journal_lock(&self.refs_journal_lock_path())?;
+        file.lock()?;
+        Ok(RefsJournalLock { _file: file })
+    }
+
     /// Store a byte slice into the persistent `blob` namespace (`NS_BLOB`),
     /// transparently FastCDC-chunking payloads `> 4 MiB`.
     pub fn put_bytes_blob(&self, bytes: &[u8]) -> Result<(Digest, u64), D6StoreError> {
@@ -1074,6 +1136,7 @@ impl CasMerkleStore {
             req.created_at_ms,
         )?;
         let snapshot_id = &canonical;
+        let _journal_lock = self.lock_refs_journal()?;
         let ref_seq = match req.kind {
             D6RefKind::Main => ledger.land_main_ref(
                 req.project,
@@ -1978,4 +2041,53 @@ pub(crate) fn is_pointer_sized(entry: &TreeEntry) -> bool {
         && entry.kind != TreeEntryKind::Dir
         && entry.kind != TreeEntryKind::Gitlink
         && entry.size > GIT_POINTER_THRESHOLD
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    use super::*;
+    use crate::scratch::Scratch;
+
+    #[test]
+    fn refs_journal_lock_serializes_threads_and_rejects_symlink_lock_file() {
+        let scratch = Scratch::new("cas-merkle-jlock");
+        let cas_dir = scratch.join("cas");
+        let store_a = CasMerkleStore::open(&cas_dir).expect("open store a");
+        let store_b = CasMerkleStore::open(&cas_dir).expect("open store b");
+
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let barrier = Barrier::new(6);
+        thread::scope(|scope| {
+            for idx in 0..6 {
+                let store = if idx % 2 == 0 { &store_a } else { &store_b };
+                let active = &active;
+                let peak = &peak;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..8 {
+                        let _guard = store.lock_refs_journal().expect("acquire journal lock");
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, Ordering::SeqCst);
+                        thread::yield_now();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+
+        let lock_path = store_a.refs_journal_lock_path();
+        fs::remove_file(&lock_path).expect("remove lock file");
+        let outside = scratch.join("outside-target");
+        fs::write(&outside, b"keep").expect("write target");
+        symlink(&outside, &lock_path).expect("symlink lock");
+        let err = store_a.lock_refs_journal().err().expect("reject symlink");
+        assert!(matches!(err, D6StoreError::Cas(CasError::NotPlain(_))));
+    }
 }

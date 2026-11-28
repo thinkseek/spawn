@@ -47,8 +47,8 @@ use spawn_core::port::{
 use crate::agent_files::{AgentFileError, read_regular, rename_within, replace_with};
 use crate::cas_merkle::{
     BUILD_OUTPUT as D6_BUILD_OUTPUT, CasMerkleStore, D6RefKind, D6StoreError, LedgerRef,
-    LedgerSnapshot, PublishRequest, PublishedSnapshot, RefLedger, ScannedEntry, ScannedKind,
-    TrackedSetPolicy, format_commit_body,
+    LedgerSnapshot, PublishRequest, PublishedSnapshot, RefLedger, RefsJournalLock, ScannedEntry,
+    ScannedKind, TrackedSetPolicy, format_commit_body,
 };
 use crate::cow::clone_or_copy;
 use crate::d6_layer0::{
@@ -484,22 +484,32 @@ fn resolve_ledger_worker_pin(
 }
 
 impl<L: RefLedger> D6Workspace<L> {
-    fn append_ref_journal_entry(&self, entry: &JournalEntry) -> Result<(), WorkspaceError> {
+    fn ensure_cas_synced(&self, synced: &mut bool) -> Result<(), WorkspaceError> {
+        if !*synced {
+            self.store.cas().sync_store().map_err(map_cas_err)?;
+            *synced = true;
+        }
+        Ok(())
+    }
+
+    fn append_ref_journal_entry(
+        &self,
+        entry: &JournalEntry,
+        _journal_lock: &RefsJournalLock,
+    ) -> Result<(), WorkspaceError> {
         self.store
             .cas()
             .append_ref_journal(entry)
             .map_err(map_cas_err)
     }
 
-    fn cas_branch_ref_and_journal(
+    fn cas_branch_ref_and_journal_locked(
         &self,
         update: &BranchRefUpdate<'_>,
         synced: &mut bool,
+        journal_lock: &RefsJournalLock,
     ) -> Result<u64, WorkspaceError> {
-        if !*synced {
-            self.store.cas().sync_store().map_err(map_cas_err)?;
-            *synced = true;
-        }
+        self.ensure_cas_synced(synced)?;
         let seq = self
             .ledger
             .cas_ref(
@@ -511,16 +521,19 @@ impl<L: RefLedger> D6Workspace<L> {
                 update.reason,
             )
             .map_err(map_store_err)?;
-        self.append_ref_journal_entry(&JournalEntry {
-            seq,
-            project: self.project.clone(),
-            name: update.ref_name.to_string(),
-            kind: D6RefKind::Branch.as_str().to_string(),
-            old_snapshot: update.journal_old.cloned(),
-            new_snapshot: update.new_snapshot.clone(),
-            git_oid: update.git_oid,
-            at_ms: update.at_ms,
-        })?;
+        self.append_ref_journal_entry(
+            &JournalEntry {
+                seq,
+                project: self.project.clone(),
+                name: update.ref_name.to_string(),
+                kind: D6RefKind::Branch.as_str().to_string(),
+                old_snapshot: update.journal_old.cloned(),
+                new_snapshot: update.new_snapshot.clone(),
+                git_oid: update.git_oid,
+                at_ms: update.at_ms,
+            },
+            journal_lock,
+        )?;
         Ok(seq)
     }
 
@@ -971,6 +984,7 @@ impl<L: RefLedger> D6Workspace<L> {
             ts
         };
         let new_snapshot = &canonical;
+        let journal_lock = self.store.lock_refs_journal().map_err(map_store_err)?;
         let seq = self
             .ledger
             .land_main_ref(
@@ -982,16 +996,19 @@ impl<L: RefLedger> D6Workspace<L> {
                 reason,
             )
             .map_err(map_store_err)?;
-        self.append_ref_journal_entry(&JournalEntry {
-            seq,
-            project: self.project.clone(),
-            name: BASE_BRANCH.to_string(),
-            kind: D6RefKind::Main.as_str().to_string(),
-            old_snapshot: expected_base.cloned(),
-            new_snapshot: new_snapshot.clone(),
-            git_oid,
-            at_ms,
-        })?;
+        self.append_ref_journal_entry(
+            &JournalEntry {
+                seq,
+                project: self.project.clone(),
+                name: BASE_BRANCH.to_string(),
+                kind: D6RefKind::Main.as_str().to_string(),
+                old_snapshot: expected_base.cloned(),
+                new_snapshot: new_snapshot.clone(),
+                git_oid,
+                at_ms,
+            },
+            &journal_lock,
+        )?;
         Ok(seq)
     }
 
@@ -1246,11 +1263,24 @@ impl<L: RefLedger> D6Workspace<L> {
         git_oid: GitOid,
         synced: &mut bool,
     ) -> Result<(), WorkspaceError> {
+        self.ensure_cas_synced(synced)?;
+        let journal_lock = self.store.lock_refs_journal().map_err(map_store_err)?;
+        self.ensure_ref_journal_healed_locked(ref_name, snapshot, git_oid, synced, &journal_lock)
+    }
+
+    fn ensure_ref_journal_healed_locked(
+        &self,
+        ref_name: &str,
+        snapshot: &Digest,
+        git_oid: GitOid,
+        synced: &mut bool,
+        journal_lock: &RefsJournalLock,
+    ) -> Result<(), WorkspaceError> {
         let journal_snap = self.latest_journal_snapshot_for_ref(ref_name)?;
         if journal_snap.as_ref() == Some(snapshot) {
             return Ok(());
         }
-        self.cas_branch_ref_and_journal(
+        self.cas_branch_ref_and_journal_locked(
             &BranchRefUpdate {
                 ref_name,
                 expected: Some(snapshot),
@@ -1261,6 +1291,7 @@ impl<L: RefLedger> D6Workspace<L> {
                 reason: "d6:pin_worker_head:heal_journal",
             },
             synced,
+            journal_lock,
         )?;
         Ok(())
     }
@@ -1272,22 +1303,31 @@ impl<L: RefLedger> D6Workspace<L> {
         git_oid: GitOid,
         synced: &mut bool,
     ) -> Result<(), WorkspaceError> {
+        self.ensure_cas_synced(synced)?;
+        let journal_lock = self.store.lock_refs_journal().map_err(map_store_err)?;
         let existing = self.branch_snapshot(ref_name)?;
         if let Some(existing_snap) = &existing {
             if existing_snap.id == *snapshot {
-                return self.ensure_ref_journal_healed(ref_name, snapshot, git_oid, synced);
+                return self.ensure_ref_journal_healed_locked(
+                    ref_name,
+                    snapshot,
+                    git_oid,
+                    synced,
+                    &journal_lock,
+                );
             }
             // If PG advanced on a prior half-write without appending refs.journal, heal the
             // missing transition up to `existing_snap.id` before appending `existing -> snapshot`.
-            self.ensure_ref_journal_healed(
+            self.ensure_ref_journal_healed_locked(
                 ref_name,
                 &existing_snap.id,
                 existing_snap.git_oid,
                 synced,
+                &journal_lock,
             )?;
         }
         let old_snapshot = existing.map(|s| s.id);
-        self.cas_branch_ref_and_journal(
+        self.cas_branch_ref_and_journal_locked(
             &BranchRefUpdate {
                 ref_name,
                 expected: old_snapshot.as_ref(),
@@ -1298,6 +1338,7 @@ impl<L: RefLedger> D6Workspace<L> {
                 reason: "d6:pin_worker_head",
             },
             synced,
+            &journal_lock,
         )?;
         Ok(())
     }
@@ -1431,13 +1472,16 @@ impl<L: RefLedger> D6Workspace<L> {
         ) && worker_snap.id != branch_snap.id
         {
             let mut synced = false;
-            self.ensure_ref_journal_healed(
+            self.ensure_cas_synced(&mut synced)?;
+            let journal_lock = self.store.lock_refs_journal().map_err(map_store_err)?;
+            self.ensure_ref_journal_healed_locked(
                 &worker_ref,
                 &worker_snap.id,
                 worker_snap.git_oid,
                 &mut synced,
+                &journal_lock,
             )?;
-            self.cas_branch_ref_and_journal(
+            self.cas_branch_ref_and_journal_locked(
                 &BranchRefUpdate {
                     ref_name: &worker_ref,
                     expected: Some(&worker_snap.id),
@@ -1448,6 +1492,7 @@ impl<L: RefLedger> D6Workspace<L> {
                     reason: "d6:discard_reset_worker_head",
                 },
                 &mut synced,
+                &journal_lock,
             )?;
         }
         Ok(())
@@ -1778,7 +1823,9 @@ impl<L: RefLedger + Send + Sync> WorkspaceStore for D6Workspace<L> {
 
         let at_ms = self.now_ms();
         let mut synced = false;
-        self.cas_branch_ref_and_journal(
+        self.ensure_cas_synced(&mut synced)?;
+        let journal_lock = self.store.lock_refs_journal().map_err(map_store_err)?;
+        self.cas_branch_ref_and_journal_locked(
             &BranchRefUpdate {
                 ref_name: branch.as_str(),
                 expected: None,
@@ -1789,6 +1836,7 @@ impl<L: RefLedger + Send + Sync> WorkspaceStore for D6Workspace<L> {
                 reason: "d6:ensure_branch",
             },
             &mut synced,
+            &journal_lock,
         )?;
 
         Ok(Branch::Created(Fork {
@@ -3251,7 +3299,8 @@ impl<L: RefLedger> D6Workspace<L> {
             .record_snapshot(snap_id, git_oid, tree, parents, &self.project, at_ms)
             .map_err(map_store_err)?;
         let mut synced = true;
-        self.cas_branch_ref_and_journal(
+        let journal_lock = self.store.lock_refs_journal().map_err(map_store_err)?;
+        self.cas_branch_ref_and_journal_locked(
             &BranchRefUpdate {
                 ref_name: branch,
                 expected: Some(expected_old),
@@ -3262,6 +3311,7 @@ impl<L: RefLedger> D6Workspace<L> {
                 reason,
             },
             &mut synced,
+            &journal_lock,
         )
     }
 

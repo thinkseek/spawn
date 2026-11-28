@@ -783,35 +783,39 @@ impl GitBorderAdapter {
                 continue;
             }
 
-            let seq = match raw.kind {
-                D6RefKind::Main => ledger.land_main_ref(
-                    project,
-                    &raw.ledger_name,
-                    expected.as_ref(),
-                    snap_id,
-                    None,
-                    reason,
-                )?,
-                D6RefKind::Branch | D6RefKind::Tag | D6RefKind::Wip => ledger.cas_ref(
-                    project,
-                    &raw.ledger_name,
-                    raw.kind,
-                    expected.as_ref(),
-                    snap_id,
-                    reason,
-                )?,
-            };
+            let seq = {
+                let _journal_lock = store.lock_refs_journal()?;
+                let seq = match raw.kind {
+                    D6RefKind::Main => ledger.land_main_ref(
+                        project,
+                        &raw.ledger_name,
+                        expected.as_ref(),
+                        snap_id,
+                        None,
+                        reason,
+                    )?,
+                    D6RefKind::Branch | D6RefKind::Tag | D6RefKind::Wip => ledger.cas_ref(
+                        project,
+                        &raw.ledger_name,
+                        raw.kind,
+                        expected.as_ref(),
+                        snap_id,
+                        reason,
+                    )?,
+                };
 
-            store.cas().append_ref_journal(&JournalEntry {
-                seq,
-                project: project.to_string(),
-                name: raw.ledger_name.clone(),
-                kind: raw.kind.as_str().to_string(),
-                old_snapshot: expected,
-                new_snapshot: snap_id.clone(),
-                git_oid: raw.commit_oid,
-                at_ms: *at_ms,
-            })?;
+                store.cas().append_ref_journal(&JournalEntry {
+                    seq,
+                    project: project.to_string(),
+                    name: raw.ledger_name.clone(),
+                    kind: raw.kind.as_str().to_string(),
+                    old_snapshot: expected,
+                    new_snapshot: snap_id.clone(),
+                    git_oid: raw.commit_oid,
+                    at_ms: *at_ms,
+                })?;
+                seq
+            };
 
             let verified_oid = self.rev_parse_commit(source_repo, &raw.git_ref)?;
             if verified_oid != raw.commit_oid {
