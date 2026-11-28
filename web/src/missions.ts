@@ -549,6 +549,11 @@ export async function fetchMissions(signal: AbortSignal): Promise<Missions> {
   return readApi("/api/missions", signal, normalizeMissions);
 }
 
+export async function fetchMissionsSummary(signal: AbortSignal): Promise<Missions> {
+  const { readApi } = await import("./api.ts");
+  return readApi("/api/missions?summary=1", signal, normalizeMissions);
+}
+
 /** A task's texts in full, as `/api/tasks/<n>` answers them. */
 export interface TaskTexts {
   id: number | null;

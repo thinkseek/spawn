@@ -57,22 +57,40 @@ pub(super) fn asset(path: &str) -> Option<&'static Asset> {
 
 /// Answer `request` with `asset` (module doc).
 pub(super) fn respond(request: Request, asset: &Asset) -> Result<(), String> {
+    let accept_encoding = header(&request, "Accept-Encoding").map(str::to_string);
+    let vary = Header::from_bytes("Vary", "Accept-Encoding").expect("static header is valid");
     let etag = answers::file_etag(asset.body.as_bytes());
     let tag = Header::from_bytes("ETag", etag.as_str()).expect("a hex tag is a valid header");
     let cache = Header::from_bytes("Cache-Control", CACHE_CONTROL).expect("static header is valid");
     if answers::not_modified(header(&request, "If-None-Match"), &etag) {
         return request
-            .respond(Response::empty(304).with_header(tag).with_header(cache))
+            .respond(
+                Response::empty(304)
+                    .with_header(tag)
+                    .with_header(cache)
+                    .with_header(vary),
+            )
             .map_err(|error| error.to_string());
     }
     let kind =
         Header::from_bytes("Content-Type", asset.content_type).expect("static header is valid");
-    request
-        .respond(
-            Response::from_data(asset.body.as_bytes())
-                .with_header(kind)
-                .with_header(tag)
-                .with_header(cache),
-        )
-        .map_err(|error| error.to_string())
+    let response = if super::gzip::accepts_gzip(accept_encoding.as_deref())
+        && let Some(compressed) = super::gzip::compress_if_smaller(asset.body.as_bytes())
+    {
+        Response::from_data(compressed)
+            .with_header(kind)
+            .with_header(tag)
+            .with_header(cache)
+            .with_header(
+                Header::from_bytes("Content-Encoding", "gzip").expect("static header is valid"),
+            )
+            .with_header(vary)
+    } else {
+        Response::from_data(asset.body.as_bytes())
+            .with_header(kind)
+            .with_header(tag)
+            .with_header(cache)
+            .with_header(vary)
+    };
+    request.respond(response).map_err(|error| error.to_string())
 }

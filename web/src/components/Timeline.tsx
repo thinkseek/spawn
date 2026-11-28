@@ -1,6 +1,8 @@
 import { ArrowDown, ChevronsUp, GanttChart, List, ListOrdered } from "lucide-react";
-import { Fragment, Suspense, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
+
+import { RouteErrorBoundary, retryableLazy } from "./RouteErrorBoundary";
 
 import { sessionReader, usePoll } from "../api";
 import { fetchCommands } from "../fleet";
@@ -18,7 +20,7 @@ import type { ViewOption } from "./ViewToggle";
 
 // The trace carries Motion and d3: loaded when first shown, so the first
 // page stays light.
-const TraceView = lazy(() =>
+const TraceView = retryableLazy(() =>
   import("./trace/TraceView").then((module) => ({ default: module.TraceView })),
 );
 
@@ -178,9 +180,11 @@ export function Timeline({
       header={toggle}
     />
   ) : mode === "trace" ? (
-    <Suspense fallback={<div className="min-h-0 flex-1" />}>
-      <TraceView events={events} executions={executions} commands={commands} to={to} header={toggle} />
-    </Suspense>
+    <RouteErrorBoundary resetKey={`trace:${sessionId}`} compact>
+      <Suspense fallback={<div className="min-h-0 flex-1" />}>
+        <TraceView events={events} executions={executions} commands={commands} to={to} header={toggle} />
+      </Suspense>
+    </RouteErrorBoundary>
   ) : (
     <EventList events={events} header={toggle} />
   );

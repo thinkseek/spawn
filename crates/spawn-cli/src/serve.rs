@@ -162,6 +162,7 @@ pub(crate) mod capabilities;
 pub(crate) mod core_lines;
 mod digest;
 pub(crate) mod feature_map;
+mod gzip;
 mod ipc;
 mod labels;
 mod prov;
@@ -2053,7 +2054,7 @@ pub(super) fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         }
         "/api/fleet" => Box::new(fleet),
         "/api/attention" => Box::new(attention::attention),
-        "/api/missions" => Box::new(missions),
+        "/api/missions" => Box::new(move || missions(query)),
         "/api/events" => Box::new(move || events(query)),
         "/api/scorecard" => Box::new(move || scorecard(query)),
         "/api/scorecard/fleet" => Box::new(move || scorecard_fleet(query)),
@@ -3437,7 +3438,7 @@ fn now_ms() -> i64 {
 /// `/api/tasks/<n>`. Each mission carries its `mission_name`, each
 /// task its `label`, `task_title` and `mission_name`, each resident its
 /// `label` ([`labels`]).
-fn missions() -> Result<Value, String> {
+fn missions(query: &str) -> Result<Value, String> {
     let store = open_store()?;
     let mut board = store.mission_board(50).map_err(err)?;
     let gates = store.last_gates().map_err(err)?;
@@ -3446,7 +3447,11 @@ fn missions() -> Result<Value, String> {
     with_activity(&mut board, &activity);
     with_task_liveness(&mut board, now_ms());
     labels::label_board(&mut board);
-    answers::slim_board(&mut board);
+    if flag_param(query, "summary") {
+        answers::summary_board(&mut board);
+    } else {
+        answers::slim_board(&mut board);
+    }
     Ok(board)
 }
 
@@ -5696,10 +5701,25 @@ fn interventions(query: &str) -> Result<Value, String> {
 /// --json` with the same flag (`crate::alerts::window`, notices folded:
 /// objectives 151 and 166), from the same store method, read through the
 /// reader login. An empty parameter is the configured window.
+fn retain_active_alerts(value: &mut Value) {
+    let Some(rows) = value.as_array_mut() else {
+        return;
+    };
+    rows.retain(|alert| {
+        let cleared = alert.get("state").and_then(Value::as_str) == Some("cleared");
+        let superseded = alert.get("superseded_by").is_some_and(|v| !v.is_null());
+        !cleared && !superseded
+    });
+}
+
 fn alerts(query: &str) -> Result<Value, String> {
     let store = open_store()?;
     let since = alerts_since(query)?;
-    crate::alerts::window(&store, since.as_deref())
+    let mut rows = crate::alerts::window(&store, since.as_deref())?;
+    if flag_param(query, "active") {
+        retain_active_alerts(&mut rows);
+    }
+    Ok(rows)
 }
 
 /// `/api/alerts`' span: `?since=`, or its alias `?window=` (both at once,
@@ -5794,6 +5814,164 @@ fn parameter<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+fn flag_param(query: &str, name: &str) -> bool {
+    parameter(query, name).is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+const STATIC_CACHE_MAX_ENTRIES: usize = 32;
+const STATIC_CACHE_MAX_ENTRY_BYTES: usize = 1024 * 1024;
+const STATIC_CACHE_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
+fn metadata_ino(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
+#[derive(Clone)]
+struct CachedStaticAsset {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    ino: u64,
+    etag: String,
+    raw: Arc<[u8]>,
+    gzip: Option<Arc<[u8]>>,
+}
+
+impl CachedStaticAsset {
+    fn byte_size(&self) -> usize {
+        self.raw
+            .len()
+            .saturating_add(self.gzip.as_ref().map_or(0, |gz| gz.len()))
+    }
+}
+
+struct StaticAssetCache {
+    max_entries: usize,
+    max_entry_bytes: usize,
+    max_total_bytes: usize,
+    total_bytes: usize,
+    order: VecDeque<PathBuf>,
+    entries: HashMap<PathBuf, CachedStaticAsset>,
+}
+
+impl StaticAssetCache {
+    fn new(max_entries: usize, max_entry_bytes: usize, max_total_bytes: usize) -> Self {
+        Self {
+            max_entries,
+            max_entry_bytes,
+            max_total_bytes,
+            total_bytes: 0,
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get_matching(
+        &mut self,
+        path: &Path,
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+        ino: u64,
+    ) -> Option<CachedStaticAsset> {
+        if let Some(entry) = self.entries.get(path) {
+            if entry.len == len && entry.modified == modified && entry.ino == ino {
+                return Some(entry.clone());
+            }
+        } else {
+            return None;
+        }
+        if let Some(stale) = self.entries.remove(path) {
+            self.total_bytes = self.total_bytes.saturating_sub(stale.byte_size());
+            self.order.retain(|queued| queued != path);
+        }
+        None
+    }
+
+    fn insert(&mut self, path: PathBuf, asset: CachedStaticAsset) {
+        if let Some(previous) = self.entries.remove(&path) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.byte_size());
+            self.order.retain(|queued| queued != &path);
+        }
+        let entry_bytes = asset.byte_size();
+        if entry_bytes > self.max_entry_bytes || entry_bytes > self.max_total_bytes {
+            return;
+        }
+        while !self.order.is_empty()
+            && (self.order.len() >= self.max_entries
+                || self.total_bytes.saturating_add(entry_bytes) > self.max_total_bytes)
+        {
+            if let Some(evicted) = self.order.pop_front()
+                && let Some(removed) = self.entries.remove(&evicted)
+            {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.byte_size());
+            }
+        }
+        if self.order.len() < self.max_entries
+            && self.total_bytes.saturating_add(entry_bytes) <= self.max_total_bytes
+        {
+            self.total_bytes += entry_bytes;
+            self.order.push_back(path.clone());
+            self.entries.insert(path, asset);
+        }
+    }
+}
+
+static STATIC_ASSET_CACHE: LazyLock<Mutex<StaticAssetCache>> = LazyLock::new(|| {
+    Mutex::new(StaticAssetCache::new(
+        STATIC_CACHE_MAX_ENTRIES,
+        STATIC_CACHE_MAX_ENTRY_BYTES,
+        STATIC_CACHE_MAX_TOTAL_BYTES,
+    ))
+});
+
+fn load_static_asset(
+    file: PathBuf,
+    compressible: bool,
+    cache: &Mutex<StaticAssetCache>,
+) -> Option<CachedStaticAsset> {
+    let meta = std::fs::metadata(&file).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
+    let modified = meta.modified().ok();
+    let ino = metadata_ino(&meta);
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_matching(&file, len, modified, ino)
+    {
+        return Some(hit);
+    }
+    let bytes = std::fs::read(&file).ok()?;
+    let etag = answers::file_etag(&bytes);
+    let raw = Arc::<[u8]>::from(bytes);
+    let gzip = compressible
+        .then(|| gzip::compress_if_smaller(&raw).map(Arc::<[u8]>::from))
+        .flatten();
+    let asset = CachedStaticAsset {
+        len,
+        modified,
+        ino,
+        etag,
+        raw,
+        gzip,
+    };
+    cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(file, asset.clone());
+    Some(asset)
+}
+
 fn static_file(request: Request, web: &Path, path: &str) -> Result<(), String> {
     let relative = match path {
         "/" => "index.html".to_string(),
@@ -5808,42 +5986,70 @@ fn static_file(request: Request, web: &Path, path: &str) -> Result<(), String> {
     let file = web.join(&relative);
     // `..` is refused above; a symlink inside the built directory could still
     // point outside it, so the resolved path must stay under the root.
-    let inside = match (std::fs::canonicalize(&file), std::fs::canonicalize(web)) {
-        (Ok(file), Ok(root)) => file.starts_with(root),
-        _ => false,
+    let canonical = match (std::fs::canonicalize(&file), std::fs::canonicalize(web)) {
+        (Ok(file), Ok(root)) if file.starts_with(&root) => Some(file),
+        _ => None,
     };
-    if !inside {
+    let Some(file) = canonical else {
         return request
             .respond(Response::empty(404))
             .map_err(|error| error.to_string());
-    }
-    let Ok(bytes) = std::fs::read(&file) else {
+    };
+    let compressible = is_compressible(&relative);
+    let Some(asset) = load_static_asset(file, compressible, &STATIC_ASSET_CACHE) else {
         return request
             .respond(Response::empty(404))
             .map_err(|error| error.to_string());
     };
     // A file's tag is its bytes'; the build's assets/ are named by their
     // content and kept by the browser for good, the page asked again.
-    let etag = answers::file_etag(&bytes);
-    let tag = Header::from_bytes("ETag", etag.as_str()).expect("a hex tag is a valid header");
+    let accept_encoding = header(&request, "Accept-Encoding").map(str::to_string);
+    let tag = Header::from_bytes("ETag", asset.etag.as_str()).expect("a hex tag is a valid header");
     let cache = Header::from_bytes("Cache-Control", answers::file_cache_control(&relative))
         .expect("static header is valid");
-    if answers::not_modified(header(&request, "If-None-Match"), &etag) {
-        let unchanged = Response::empty(304).with_header(tag).with_header(cache);
+    if answers::not_modified(header(&request, "If-None-Match"), &asset.etag) {
+        let mut unchanged = Response::empty(304).with_header(tag).with_header(cache);
+        if compressible {
+            unchanged.add_header(
+                Header::from_bytes("Vary", "Accept-Encoding").expect("static header is valid"),
+            );
+        }
         return request
             .respond(unchanged)
             .map_err(|error| error.to_string());
     }
     let header = Header::from_bytes("Content-Type", content_type(&relative))
         .expect("static header is valid");
-    request
-        .respond(
-            Response::from_data(bytes)
-                .with_header(header)
-                .with_header(tag)
-                .with_header(cache),
-        )
-        .map_err(|error| error.to_string())
+    let mut response = if compressible
+        && gzip::accepts_gzip(accept_encoding.as_deref())
+        && let Some(ref compressed) = asset.gzip
+    {
+        Response::from_data(compressed.as_ref())
+            .with_header(header)
+            .with_header(tag)
+            .with_header(cache)
+            .with_header(
+                Header::from_bytes("Content-Encoding", "gzip").expect("static header is valid"),
+            )
+    } else {
+        Response::from_data(asset.raw.as_ref())
+            .with_header(header)
+            .with_header(tag)
+            .with_header(cache)
+    };
+    if compressible {
+        response.add_header(
+            Header::from_bytes("Vary", "Accept-Encoding").expect("static header is valid"),
+        );
+    }
+    request.respond(response).map_err(|error| error.to_string())
+}
+
+fn is_compressible(relative: &str) -> bool {
+    matches!(
+        relative.rsplit('.').next(),
+        Some("html" | "js" | "css" | "svg" | "json" | "webmanifest" | "wasm")
+    )
 }
 
 /// The `Content-Type` of a built file: a web app manifest as
@@ -5860,6 +6066,7 @@ fn content_type(path: &str) -> &'static str {
         Some("svg") => "image/svg+xml",
         Some("json") => "application/json; charset=utf-8",
         Some("woff2") => "font/woff2",
+        Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
     }
 }
@@ -8996,6 +9203,7 @@ mod tests {
         assert_eq!(content_type("icon-192.png"), "image/png");
         assert_eq!(content_type("favicon.ico"), "image/x-icon");
         assert_eq!(content_type("index.html"), "text/html; charset=utf-8");
+        assert_eq!(content_type("unkernel.wasm"), "application/wasm");
         assert_eq!(content_type("unknown"), "application/octet-stream");
     }
 
@@ -13433,5 +13641,96 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&base);
         });
+    }
+
+    #[test]
+    fn active_alerts_filter_keeps_open_and_current_notices_only() {
+        let mut rows = json!([
+            {"key": "open-1", "state": "open", "superseded_by": null},
+            {"key": "cleared-1", "state": "cleared", "superseded_by": null},
+            {"key": "notice-old", "state": "notice", "superseded_by": "notice-new"},
+            {"key": "notice-new", "state": "notice", "superseded_by": null}
+        ]);
+        super::retain_active_alerts(&mut rows);
+        let keys: Vec<&str> = rows
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|row| row["key"].as_str())
+            .collect();
+        assert_eq!(keys, vec!["open-1", "notice-new"]);
+    }
+
+    #[test]
+    fn static_asset_cache_hits_and_invalidates_when_file_changes() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir =
+            std::env::temp_dir().join(format!("spawn-static-cache-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("app.js");
+        let payload_a = "console.log('a');".repeat(40);
+        std::fs::write(&file, &payload_a).expect("write a");
+
+        let cache = std::sync::Mutex::new(super::StaticAssetCache::new(
+            4,
+            super::STATIC_CACHE_MAX_ENTRY_BYTES,
+            super::STATIC_CACHE_MAX_TOTAL_BYTES,
+        ));
+        let first = super::load_static_asset(file.clone(), true, &cache).expect("first load");
+        assert_eq!(first.raw.as_ref(), payload_a.as_bytes());
+        assert!(first.gzip.is_some());
+
+        // Second load hits the same cached entry.
+        let second = super::load_static_asset(file.clone(), true, &cache).expect("cached load");
+        assert_eq!(first.etag, second.etag);
+        assert!(Arc::ptr_eq(&first.raw, &second.raw));
+
+        // Rewrite with different length invalidates the cached entry.
+        let payload_b = format!("{payload_a}\nconsole.log('b');");
+        std::fs::write(&file, &payload_b).expect("write b");
+        let third = super::load_static_asset(file, true, &cache).expect("reloaded");
+        assert_eq!(third.raw.as_ref(), payload_b.as_bytes());
+        assert_ne!(first.etag, third.etag);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn static_asset_cache_enforces_entry_and_total_byte_budgets() {
+        let mut cache = super::StaticAssetCache::new(4, 100, 150);
+        let asset = |raw_len: usize, tag: &str| super::CachedStaticAsset {
+            len: raw_len as u64,
+            modified: None,
+            ino: 0,
+            etag: tag.to_string(),
+            raw: Arc::from(vec![b'x'; raw_len]),
+            gzip: None,
+        };
+
+        // Entry over max_entry_bytes is skipped.
+        cache.insert(PathBuf::from("/oversize.js"), asset(101, "over"));
+        assert_eq!(cache.total_bytes, 0);
+        assert!(
+            cache
+                .get_matching(std::path::Path::new("/oversize.js"), 101, None, 0)
+                .is_none()
+        );
+
+        cache.insert(PathBuf::from("/a.js"), asset(80, "a"));
+        cache.insert(PathBuf::from("/b.js"), asset(80, "b"));
+        // 80 + 80 > 150, so /a.js is FIFO-evicted.
+        assert!(
+            cache
+                .get_matching(std::path::Path::new("/a.js"), 80, None, 0)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_matching(std::path::Path::new("/b.js"), 80, None, 0)
+                .is_some()
+        );
+        assert_eq!(cache.total_bytes, 80);
     }
 }

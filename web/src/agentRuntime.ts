@@ -1131,6 +1131,37 @@ export type SnapshotEvent =
     }
   | { type: "fetch_failed"; address: string; error: AgentHttpError };
 
+function stringArrayEqual(a: readonly string[], b: readonly string[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function snapshotsEquivalent(a: TuiSnapshot, b: TuiSnapshot): boolean {
+  if (a === b) return true;
+  if (
+    a.guard !== b.guard ||
+    a.agent_status !== b.agent_status ||
+    a.live_state.state !== b.live_state.state ||
+    a.cols !== b.cols ||
+    a.rows !== b.rows ||
+    a.title !== b.title ||
+    a.blocker_visible !== b.blocker_visible ||
+    a.choices.length !== b.choices.length ||
+    a.fidelity.fidelity !== b.fidelity.fidelity ||
+    !stringArrayEqual(a.plain_lines, b.plain_lines)
+  ) {
+    return false;
+  }
+  if (a.fidelity.fidelity === "styled_vt" && b.fidelity.fidelity === "styled_vt") {
+    return stringArrayEqual(a.fidelity.styled_lines, b.fidelity.styled_lines);
+  }
+  return true;
+}
+
 export function reduceSnapshot(
   state: SnapshotLoadState,
   event: SnapshotEvent,
@@ -1152,13 +1183,29 @@ export function reduceSnapshot(
       }
       return { kind: "loading", address: event.address, previous };
     }
-    case "fetch_succeeded":
+    case "fetch_succeeded": {
+      if (
+        state.kind === "ready" &&
+        state.address === event.address &&
+        snapshotsEquivalent(state.snapshot, event.snapshot)
+      ) {
+        if (event.nowMs === state.capturedAtMs || event.nowMs - state.capturedAtMs < 15_000) {
+          return state;
+        }
+        return {
+          kind: "ready",
+          address: event.address,
+          snapshot: state.snapshot,
+          capturedAtMs: event.nowMs,
+        };
+      }
       return {
         kind: "ready",
         address: event.address,
         snapshot: event.snapshot,
         capturedAtMs: event.nowMs,
       };
+    }
     case "fetch_failed": {
       if (event.error.kind === "unauthorized") {
         return {

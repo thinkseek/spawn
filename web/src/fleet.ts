@@ -6,7 +6,7 @@ import type { SessionState } from "./api";
 import type { Labels } from "./label.ts";
 import type { CommandMessage, MessageActed } from "./messages.ts";
 import { labels } from "./label.ts";
-import { readApi } from "./api";
+import { peekApi, readApi } from "./api";
 import type { NodeRow } from "./nodes";
 import { normalizeNodeList } from "./nodes";
 import type { Backups, GateRoom, Memory, Storage } from "./resources";
@@ -589,6 +589,10 @@ const sessionPath = (id: string) => encodeURIComponent(id);
 
 export async function fetchFleet(signal: AbortSignal): Promise<Fleet> {
   return readApi("/api/fleet", signal, normalizeFleet);
+}
+
+export function peekFleet(): Fleet | null {
+  return peekApi("/api/fleet", normalizeFleet);
 }
 
 export async function fetchJudgements(

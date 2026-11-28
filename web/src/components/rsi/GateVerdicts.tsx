@@ -1,5 +1,7 @@
 import { Gavel, GanttChart, Table2 } from "lucide-react";
-import { Suspense, lazy, useMemo } from "react";
+import { Suspense, useMemo } from "react";
+
+import { RouteErrorBoundary, retryableLazy } from "../RouteErrorBoundary";
 
 import { usePoll } from "../../api";
 import type { VerdictReasons } from "../../missionTimeline";
@@ -13,7 +15,7 @@ import type { ViewOption } from "../ViewToggle";
 import { VerdictList } from "./Verdicts";
 
 // Loaded when first shown: it carries Motion and d3.
-const MissionTimeline = lazy(() =>
+const MissionTimeline = retryableLazy(() =>
   import("../missions/MissionTimeline").then((module) => ({
     default: module.MissionTimeline,
   })),
@@ -105,16 +107,18 @@ export function GateVerdicts({
         />
       ) : (
         <div className="flex h-[26rem] min-h-0 flex-col">
-          <Suspense fallback={<div className="min-h-0 flex-1" />}>
-            <MissionTimeline
-              missions={shown}
-              header={null}
-              reasons={reasons}
-              compact
-              selectedTask={selected}
-              onSelectTask={onSelect}
-            />
-          </Suspense>
+          <RouteErrorBoundary resetKey={`rsi-timeline:${mission.id}`} compact>
+            <Suspense fallback={<div className="min-h-0 flex-1" />}>
+              <MissionTimeline
+                missions={shown}
+                header={null}
+                reasons={reasons}
+                compact
+                selectedTask={selected}
+                onSelectTask={onSelect}
+              />
+            </Suspense>
+          </RouteErrorBoundary>
         </div>
       )}
     </Card>

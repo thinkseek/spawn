@@ -617,3 +617,32 @@ test("state machine reducers handle 409 guard_mismatch auto-refresh without retr
   });
   assert.equal(act.kind, "forbidden_readonly");
 });
+
+test("reduceSnapshot preserves snapshot identity across unchanged polls", () => {
+  const first = styledSnapshotFixture("t1", "0xaaaa111122223333");
+  const duplicate = styledSnapshotFixture("t1", "0xaaaa111122223333");
+  let state = reduceSnapshot(
+    { kind: "idle" },
+    { type: "fetch_succeeded", address: "t1", snapshot: first, nowMs: 10_000 },
+  );
+  assert.equal(state.kind, "ready");
+  const unchangedWithinWindow = reduceSnapshot(state, {
+    type: "fetch_succeeded",
+    address: "t1",
+    snapshot: duplicate,
+    nowMs: 12_000,
+  });
+  assert.equal(unchangedWithinWindow, state);
+
+  const unchangedAfterWindow = reduceSnapshot(state, {
+    type: "fetch_succeeded",
+    address: "t1",
+    snapshot: duplicate,
+    nowMs: 30_000,
+  });
+  assert.equal(unchangedAfterWindow.kind, "ready");
+  if (unchangedAfterWindow.kind === "ready") {
+    assert.equal(unchangedAfterWindow.snapshot, first);
+    assert.equal(unchangedAfterWindow.capturedAtMs, 30_000);
+  }
+});
