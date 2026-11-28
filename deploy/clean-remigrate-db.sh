@@ -81,9 +81,20 @@ urldecode() {
 }
 
 write_pg_kv() {
+  local LC_ALL=C
   local key=$1 val=$2
   [[ $key =~ ^[a-z_][a-z0-9_]*$ ]] || die "unsupported libpq parameter in target URL: $key"
   [[ $val != *$'\n'* && $val != *$'\r'* ]] || die "newline not allowed in target URL parameter: $key"
+  if [ -n "$val" ]; then
+    case ${val: -1} in
+      ' '|$'\t'|$'\v'|$'\f')
+        die "trailing whitespace is not supported in target URL parameter: $key"
+        ;;
+    esac
+  fi
+  if [ $(( ${#key} + 1 + ${#val} )) -gt 1021 ]; then
+    die "target URL parameter exceeds libpq service-file line limit: $key"
+  fi
   printf '%s=%s\n' "$key" "$val" >> "$PG_SERVICE_FILE"
 }
 
@@ -92,6 +103,7 @@ write_pg_service_file() {
   local raw_user="" raw_pw="" raw_host="" pg_user="" pg_pw="" pg_host="" pg_port="" pg_db=""
   local pair raw_k raw_v k v
   local -a extra_kvs=()
+  local -a query_pairs=()
 
   [[ $raw_uri != *$'\n'* && $raw_uri != *$'\r'* ]] || die "newlines are not allowed in SPAWN_CLEAN_DATABASE_URL"
   case $raw_uri in
@@ -145,8 +157,8 @@ write_pg_service_file() {
   fi
 
   if [ -n "$query" ]; then
-    local IFS='&'
-    for pair in $query; do
+    IFS='&' read -r -a query_pairs <<< "$query"
+    for pair in ${query_pairs[@]+"${query_pairs[@]}"}; do
       [ -n "$pair" ] || continue
       if [[ $pair == *=* ]]; then
         raw_k=${pair%%=*}
@@ -158,19 +170,11 @@ write_pg_service_file() {
         v=""
       fi
       case $k in
-        dbname) pg_db=$v ;;
-        user) pg_user=$v ;;
-        password) pg_pw=$v ;;
-        host) pg_host=$v ;;
-        port)
-          [[ $v =~ ^[0-9]+$ ]] || die "invalid port query parameter in target URL"
-          pg_port=$v
+        host|hostaddr|port|dbname|user|password|service|servicefile)
+          die "target URL query must not override $k"
           ;;
-        hostaddr|sslmode|sslrootcert|sslcert|sslkey|sslpassword|channel_binding|connect_timeout|options|target_session_attrs|application_name|gssencmode|krbsrvname|requiressl)
+        sslmode|sslrootcert|sslcert|sslkey|sslpassword|channel_binding|connect_timeout|options|target_session_attrs|application_name|gssencmode|krbsrvname|requiressl)
           extra_kvs+=("$k=$v")
-          ;;
-        service|servicefile)
-          die "target URL must not override $k"
           ;;
         *)
           die "unsupported libpq query parameter in target URL: $k"
@@ -179,6 +183,8 @@ write_pg_service_file() {
     done
   fi
 
+  [ -n "$pg_host" ] || die "target URL must specify a host"
+  [[ $pg_host != *,* ]] || die "target URL must specify a single host"
   [ -n "$pg_db" ] || die "target URL must name the target database"
   [ -n "$pg_user" ] || die "target URL must specify an owner username"
   [ -n "$pg_pw" ] || die "target URL must include a non-empty owner password"
@@ -192,7 +198,7 @@ write_pg_service_file() {
   write_pg_kv dbname "$pg_db"
   write_pg_kv user "$pg_user"
   write_pg_kv password "$pg_pw"
-  [ -z "$pg_host" ] || write_pg_kv host "$pg_host"
+  write_pg_kv host "$pg_host"
   [ -z "$pg_port" ] || write_pg_kv port "$pg_port"
   for pair in ${extra_kvs[@]+"${extra_kvs[@]}"}; do
     write_pg_kv "${pair%%=*}" "${pair#*=}"
@@ -232,8 +238,8 @@ if [ "$MODE" = dry-run ]; then
 $PROG: DRY RUN; no command is executed and no file is created.
 $PROG: 1. Complete spawn-backup.service and spawn-backup-bundle.service.
 $PROG: 2. Complete spawn-backup-verify.service (latest encrypted dump and transcript bundle).
-$PROG: 3. Archive a mode-0600 'spawn node list --json' summary under a new archive directory.
-$PROG: 4. Prove target DB/schema identity and empty target BEFORE stopping any writer (fast-fail).
+$PROG: 3. Prove target DB/schema identity and empty target BEFORE archiving or stopping any writer (fast-fail).
+$PROG: 4. Archive a mode-0600 'spawn node list --json' summary under a new archive directory.
 $PROG: 5. Stop auto-restart triggers (${TRIGGER_UNITS[*]}) if active, and stop/prove inactive: ${WRITER_UNITS[*]}.
 $PROG: 6. Re-verify empty target schema, then run spawn init-db via SPAWN_DATABASE_URL.
 $PROG: 7. Verify xid8, D6/provenance tables, triggers, and restricted login roles via 0600 PGSERVICEFILE.
@@ -297,6 +303,9 @@ start_unit spawn-backup.service
 start_unit spawn-backup-bundle.service
 start_unit spawn-backup-verify.service
 
+log "pre-flight verifying empty target before archiving or stopping writers"
+verify_target_empty
+
 ARCHIVE_PARENT=$(dirname "$ARCHIVE_DIR")
 [ ! -L "$ARCHIVE_PARENT" ] || die "archive parent directory must not be a symbolic link"
 [ ! -L "$ARCHIVE_DIR" ] || die "archive directory must not be a symbolic link"
@@ -315,9 +324,6 @@ if [ ! -s "$tmp_nodes" ]; then
 fi
 chmod 600 "$tmp_nodes"
 mv -f "$tmp_nodes" "$ARCHIVE_DIR/nodes.json"
-
-log "pre-flight verifying empty target before stopping writers"
-verify_target_empty
 
 for unit in "${TRIGGER_UNITS[@]}"; do
   state=$("$SYSTEMCTL" --user is-active "$unit" 2>/dev/null || true)

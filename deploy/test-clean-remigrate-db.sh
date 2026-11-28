@@ -104,10 +104,14 @@ file_mode() {
   stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
 }
 
-if [ -n "${PGDATABASE-}" ]; then
-  printf 'forbidden PGDATABASE env var set in psql invocation\n' >&2
-  exit 90
-fi
+for pg_var in PGDATABASE PGHOST PGHOSTADDR PGPORT PGUSER PGPASSWORD PGPASSFILE \
+              PGOPTIONS PGSSLMODE PGSSLROOTCERT PGSSLCERT PGSSLKEY \
+              PGCHANNELBINDING PGTARGETSESSIONATTRS; do
+  if [ -n "${!pg_var-}" ]; then
+    printf 'forbidden %s env var set in psql invocation\n' "$pg_var" >&2
+    exit 90
+  fi
+done
 
 for arg in "$@"; do
   case $arg in
@@ -133,6 +137,10 @@ if ! grep -Fqx '[remigrate]' "$svc_file" || \
    ! grep -Fqx 'host=127.0.0.1' "$svc_file" || \
    ! grep -Fq 'password=' "$svc_file"; then
   printf 'PGSERVICEFILE missing required libpq fields\n' >&2
+  exit 94
+fi
+if [ -n "${MOCK_EXPECT_SERVICE_LINE-}" ] && ! grep -Fqx "$MOCK_EXPECT_SERVICE_LINE" "$svc_file"; then
+  printf 'PGSERVICEFILE missing expected line: %s\n' "$MOCK_EXPECT_SERVICE_LINE" >&2
   exit 94
 fi
 
@@ -248,25 +256,36 @@ run_case() {
   local -a vars=()
   while [ "$1" != -- ]; do vars+=("$1"); shift; done
   shift
-  mkdir -p "$dir/state" "$dir/home"
+  mkdir -p "$dir/state" "$dir/home" "$dir/tmp"
   MOCK_LOG=$dir/calls
   MOCK_STATE_DIR=$dir/state
   export MOCK_LOG MOCK_STATE_DIR
   : > "$MOCK_LOG"
   set +e
-  env -i PATH="$work/bin:/usr/bin:/bin" HOME="$dir/home" \
-    MOCK_LOG="$MOCK_LOG" MOCK_STATE_DIR="$MOCK_STATE_DIR" \
-    SPAWN_CLEAN_DATABASE_URL='postgres://owner:secret-value@127.0.0.1/clean_target' \
-    SPAWN_CLEAN_EXPECT_DATABASE=clean_target \
-    ${vars[@]+"${vars[@]}"} \
-    bash "$script" "$@" > "$dir/out" 2>&1
+  (
+    cd "$dir" || exit 1
+    env -i PATH="$work/bin:/usr/bin:/bin" HOME="$dir/home" TMPDIR="$dir/tmp" \
+      MOCK_LOG="$MOCK_LOG" MOCK_STATE_DIR="$MOCK_STATE_DIR" \
+      SPAWN_CLEAN_DATABASE_URL='postgres://owner:secret-value@127.0.0.1/clean_target' \
+      SPAWN_CLEAN_EXPECT_DATABASE=clean_target \
+      ${vars[@]+"${vars[@]}"} \
+      bash "$script" "$@" > "$dir/out" 2>&1
+  )
   status=$?
   set -e
   OUT=$dir/out
   CALLS=$dir/calls
   DIR=$dir
+  if [ -n "$(find "$dir/tmp" -mindepth 1 -print -quit)" ]; then
+    bad "$name left temporary files in TMPDIR"
+  fi
   if grep -Rqs 'secret-value' "$dir/out" "$dir/calls" || grep -Rqs 'postgres://' "$dir/out" "$dir/calls"; then
     bad "$name leaked credential or database URI"
+  fi
+  if [ -d "$dir/archive" ] && [ ! -L "$dir/archive" ]; then
+    if grep -Rqs 'secret-value' "$dir/archive" || grep -Rqs 'postgres://' "$dir/archive"; then
+      bad "$name leaked credential or database URI into archive"
+    fi
   fi
 }
 
@@ -291,6 +310,134 @@ else
   bad "owner URL without password accepted"
 fi
 
+# 1b. URL query-override (B1), host multiplicity, injection, glob, and password-format guards
+for kv in "host=127.0.0.2" "hostaddr=127.0.0.2" "port=5433" "dbname=other_db" \
+          "user=other_user" "password=other_pw" "service=evil" "servicefile=/etc/pg_service.conf"; do
+  qcase="reject-query-${kv%%=*}"
+  run_case "$qcase" "SPAWN_CLEAN_DATABASE_URL=postgres://owner:secret-value@127.0.0.1:5432/clean_target?$kv" \
+    -- --execute --archive-dir "$work/$qcase/archive" --confirm-clean-remigrate=clean_target
+  if [ "$status" != 0 ] && [ ! -s "$CALLS" ] && [ ! -e "$DIR/archive" ] && grep -qi 'must not override' "$OUT"; then
+    ok "query override ${kv%%=*} rejected before commands"
+  else
+    bad "query override ${kv%%=*} was not rejected cleanly"
+  fi
+done
+
+run_case multi-host-url 'SPAWN_CLEAN_DATABASE_URL=postgres://owner:secret-value@127.0.0.1,127.0.0.2/clean_target' \
+  -- --execute --archive-dir "$work/multi-host-url/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -s "$CALLS" ]; then
+  ok "multi-host authority URL rejected before commands"
+else
+  bad "multi-host authority URL accepted"
+fi
+
+run_case empty-host-url 'SPAWN_CLEAN_DATABASE_URL=postgres://owner:secret-value@/clean_target' \
+  -- --execute --archive-dir "$work/empty-host-url/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -s "$CALLS" ]; then
+  ok "empty authority host URL rejected before commands"
+else
+  bad "empty authority host URL accepted"
+fi
+
+run_case inject-pw-lf 'SPAWN_CLEAN_DATABASE_URL=postgres://owner:secret-value%0Ahost=evil@127.0.0.1/clean_target' \
+  -- --execute --archive-dir "$work/inject-pw-lf/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -s "$CALLS" ]; then
+  ok "%0A newline injection in password rejected before commands"
+else
+  bad "%0A newline injection in password accepted"
+fi
+
+run_case inject-pw-cr 'SPAWN_CLEAN_DATABASE_URL=postgres://owner:secret-value%0Dhost=evil@127.0.0.1/clean_target' \
+  -- --execute --archive-dir "$work/inject-pw-cr/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -s "$CALLS" ]; then
+  ok "%0D carriage-return injection in password rejected before commands"
+else
+  bad "%0D carriage-return injection in password accepted"
+fi
+
+run_case inject-pw-nul 'SPAWN_CLEAN_DATABASE_URL=postgres://owner:secret-value%00@127.0.0.1/clean_target' \
+  -- --execute --archive-dir "$work/inject-pw-nul/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -s "$CALLS" ]; then
+  ok "%00 NUL byte injection in password rejected before commands"
+else
+  bad "%00 NUL byte injection in password accepted"
+fi
+
+run_case inject-query-lf 'SPAWN_CLEAN_DATABASE_URL=postgres://owner:secret-value@127.0.0.1/clean_target?application_name=ok%0Ahost=evil' \
+  -- --execute --archive-dir "$work/inject-query-lf/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -s "$CALLS" ]; then
+  ok "%0A newline injection in query value rejected before commands"
+else
+  bad "%0A newline injection in query value accepted"
+fi
+
+run_case inject-raw-lf $'SPAWN_CLEAN_DATABASE_URL=postgres://owner:secret-value@127.0.0.1/clean_target?application_name=a\nhost=evil' \
+  -- --execute --archive-dir "$work/inject-raw-lf/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -s "$CALLS" ]; then
+  ok "raw newline in target URL rejected before commands"
+else
+  bad "raw newline in target URL accepted"
+fi
+
+run_case pw-trailing-space 'SPAWN_CLEAN_DATABASE_URL=postgres://owner:secret-value%20@127.0.0.1/clean_target' \
+  -- --execute --archive-dir "$work/pw-trailing-space/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -s "$CALLS" ] && grep -qi 'trailing whitespace' "$OUT"; then
+  ok "trailing-space password refused upfront before commands"
+else
+  bad "trailing-space password not refused cleanly"
+fi
+
+run_case pw-trailing-ff 'SPAWN_CLEAN_DATABASE_URL=postgres://owner:secret-value%0C@127.0.0.1/clean_target' \
+  -- --execute --archive-dir "$work/pw-trailing-ff/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -s "$CALLS" ] && grep -qi 'trailing whitespace' "$OUT"; then
+  ok "trailing-form-feed password refused upfront before commands"
+else
+  bad "trailing-form-feed password not refused cleanly"
+fi
+
+max_ok_val=$(printf '%*s' 1012 '' | tr ' ' a)
+run_case pw-max-ok "SPAWN_CLEAN_DATABASE_URL=postgres://owner:${max_ok_val}@127.0.0.1/clean_target" \
+  -- --execute --archive-dir "$work/pw-max-ok/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" = 0 ] && grep -q SUCCESS "$OUT"; then
+  ok "1012-byte max libpq service-file password accepted"
+else
+  bad "1012-byte password unexpectedly rejected"
+fi
+
+over_len_val=$(printf '%*s' 1013 '' | tr ' ' a)
+run_case pw-too-long "SPAWN_CLEAN_DATABASE_URL=postgres://owner:${over_len_val}@127.0.0.1/clean_target" \
+  -- --execute --archive-dir "$work/pw-too-long/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -s "$CALLS" ] && grep -qi 'line limit' "$OUT"; then
+  ok "1013-byte over-limit password refused upfront before commands"
+else
+  bad "1013-byte password not refused cleanly"
+fi
+
+mkdir -p "$work/query-glob"
+: > "$work/query-glob/application_name=cutover_expanded"
+run_case query-glob \
+  'SPAWN_CLEAN_DATABASE_URL=postgres://owner:secret-value@127.0.0.1/clean_target?application_name=cutover_*' \
+  'MOCK_EXPECT_SERVICE_LINE=application_name=cutover_*' \
+  -- --execute --archive-dir "$work/query-glob/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" = 0 ] && grep -q SUCCESS "$OUT"; then
+  ok "query value with glob wildcard is preserved without pathname expansion"
+else
+  bad "query glob expansion check failed"
+fi
+
+run_case inherited-pg-env \
+  PGDATABASE=live_prod PGHOST=evil.host PGHOSTADDR=10.0.0.9 PGPORT=9999 \
+  PGUSER=wrong PGPASSWORD=wrong PGPASSFILE=/nonexistent \
+  'PGOPTIONS=-c search_path=evil' PGSSLMODE=require \
+  PGSSLROOTCERT=/nonexistent PGSSLCERT=/nonexistent PGSSLKEY=/nonexistent \
+  PGCHANNELBINDING=require PGTARGETSESSIONATTRS=read-write \
+  -- --execute --archive-dir "$work/inherited-pg-env/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" = 0 ] && grep -q SUCCESS "$OUT"; then
+  ok "inherited PG* environment variables stripped before psql"
+else
+  bad "inherited PG* env stripping failed"
+fi
+
 # 2. Backup & verify hard gates
 run_case backup-fail MOCK_FAIL_UNIT=spawn-backup.service -- --execute --archive-dir "$work/backup-fail/archive" --confirm-clean-remigrate=clean_target
 if [ "$status" != 0 ] && grep -q spawn-backup.service "$OUT" && ! grep -q spawn-backup-bundle.service "$CALLS"; then
@@ -307,13 +454,51 @@ else
 fi
 
 run_case verify-fail MOCK_FAIL_UNIT=spawn-backup-verify.service -- --execute --archive-dir "$work/verify-fail/archive" --confirm-clean-remigrate=clean_target
-if [ "$status" != 0 ] && [ ! -e "$DIR/archive/nodes.json" ] && ! grep -q '<stop>' "$CALLS"; then
-  ok "object verification failure stops before archive/writers"
+if [ "$status" != 0 ] && [ ! -e "$DIR/archive" ] && ! grep -q '<stop>' "$CALLS"; then
+  ok "object verification failure stops before target/archive/writers"
 else
   bad "verify gate"
 fi
 
-# 3. Archive path & export failures
+# 3. Pre-flight target checks (identity, schema, nonempty, psql error) MUST stop 0 writers and leave 0 archive dir
+run_case wrong-identity MOCK_DB=other_db -- --execute --archive-dir "$work/wrong-identity/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -e "$DIR/archive" ] && ! grep -q '<node> <list>' "$CALLS" && ! grep -q '<stop>' "$CALLS" && ! grep -q '<init-db>' "$CALLS"; then
+  ok "target DB mismatch fails before archiving, stopping writers, or init-db"
+else
+  bad "wrong-identity gate"
+fi
+
+run_case wrong-schema MOCK_SCHEMA=other_schema -- --execute --archive-dir "$work/wrong-schema/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -e "$DIR/archive" ] && ! grep -q '<node> <list>' "$CALLS" && ! grep -q '<stop>' "$CALLS" && ! grep -q '<init-db>' "$CALLS"; then
+  ok "target schema mismatch fails before archiving, stopping writers, or init-db"
+else
+  bad "wrong-schema gate"
+fi
+
+run_case nonempty MOCK_OBJECTS=1 -- --execute --archive-dir "$work/nonempty/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -e "$DIR/archive" ] && ! grep -q '<node> <list>' "$CALLS" && ! grep -q '<stop>' "$CALLS" && ! grep -q '<init-db>' "$CALLS"; then
+  ok "nonempty target blocks before archiving, stopping writers, or init-db"
+else
+  bad "nonempty target gate"
+fi
+
+run_case psql-error-no-leak MOCK_PSQL_FAIL=1 -- --execute --archive-dir "$work/psql-error-no-leak/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && [ ! -e "$DIR/archive" ] && ! grep -q '<node> <list>' "$CALLS" && ! grep -q '<stop>' "$CALLS" && ! grep -q '<init-db>' "$CALLS"; then
+  ok "psql connection error fails before archiving or stopping writers without credential leaks"
+else
+  bad "psql error leak/gate"
+fi
+
+# 4. Archive path & export failures
+mkdir -p "$work/real-parent" "$work/symlink-parent"
+ln -s "$work/real-parent" "$work/symlink-parent/parent"
+run_case symlink-parent -- --execute --archive-dir "$work/symlink-parent/parent/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && grep -q 'symbolic link' "$OUT" && [ ! -e "$work/real-parent/archive" ] && ! grep -q '<node> <list>' "$CALLS" && ! grep -q '<stop>' "$CALLS"; then
+  ok "symlinked archive parent rejected before export or stopping writers"
+else
+  bad "symlink parent gate"
+fi
+
 mkdir -p "$work/symlink-archive" "$work/existing-target"
 ln -s "$work/existing-target" "$work/symlink-archive/archive"
 run_case symlink-archive -- --execute --archive-dir "$work/symlink-archive/archive" --confirm-clean-remigrate=clean_target
@@ -341,33 +526,11 @@ else
   bad "existing archive gate"
 fi
 
-# 4. Pre-stop fast-fail checks (identity, schema, nonempty, psql error) MUST stop 0 writers
-run_case wrong-identity MOCK_DB=other_db -- --execute --archive-dir "$work/wrong-identity/archive" --confirm-clean-remigrate=clean_target
-if [ "$status" != 0 ] && ! grep -q '<stop>' "$CALLS" && ! grep -q '<init-db>' "$CALLS"; then
-  ok "target DB mismatch fails before stopping writers"
+run_case empty-node-export MOCK_NODE_LIST_EMPTY=1 -- --execute --archive-dir "$work/empty-node-export/archive" --confirm-clean-remigrate=clean_target
+if [ "$status" != 0 ] && grep -qi 'empty' "$OUT" && [ ! -e "$DIR/archive/nodes.json" ] && [ ! -e "$DIR/archive/.nodes.json.tmp" ] && ! grep -q '<stop>' "$CALLS"; then
+  ok "empty node summary export rejected cleanly before stopping writers"
 else
-  bad "wrong-identity gate"
-fi
-
-run_case wrong-schema MOCK_SCHEMA=other_schema -- --execute --archive-dir "$work/wrong-schema/archive" --confirm-clean-remigrate=clean_target
-if [ "$status" != 0 ] && ! grep -q '<stop>' "$CALLS" && ! grep -q '<init-db>' "$CALLS"; then
-  ok "target schema mismatch fails before stopping writers"
-else
-  bad "wrong-schema gate"
-fi
-
-run_case nonempty MOCK_OBJECTS=1 -- --execute --archive-dir "$work/nonempty/archive" --confirm-clean-remigrate=clean_target
-if [ "$status" != 0 ] && ! grep -q '<stop>' "$CALLS" && ! grep -q '<init-db>' "$CALLS"; then
-  ok "nonempty target blocks before stopping writers and init-db"
-else
-  bad "nonempty target gate"
-fi
-
-run_case psql-error-no-leak MOCK_PSQL_FAIL=1 -- --execute --archive-dir "$work/psql-error-no-leak/archive" --confirm-clean-remigrate=clean_target
-if [ "$status" != 0 ] && ! grep -q '<stop>' "$CALLS" && ! grep -q '<init-db>' "$CALLS"; then
-  ok "psql connection error fails before stopping writers without credential leaks"
-else
-  bad "psql error leak/gate"
+  bad "empty node export gate"
 fi
 
 # 5. Stop triggers & writers enforcement
@@ -411,9 +574,9 @@ expected_calls=$(cat <<'EOF'
 systemctl <--user> <start> <--wait> <spawn-backup.service>
 systemctl <--user> <start> <--wait> <spawn-backup-bundle.service>
 systemctl <--user> <start> <--wait> <spawn-backup-verify.service>
-spawn <node> <list> <--json>
 psql <identity>
 psql <empty>
+spawn <node> <list> <--json>
 systemctl <--user> <is-active> <spawn-deploy-on-landing.timer>
 systemctl <--user> <stop> <spawn-deploy-on-landing.timer>
 systemctl <--user> <is-active> <spawn-deploy-on-landing.timer>
@@ -518,28 +681,31 @@ EOF
   uri_enum="postgres://pgowner:$pg_pw@127.0.0.1:$pg_port/enum_only?sslmode=disable"
   uri_clean="postgres://pgowner:$pg_pw@127.0.0.1:$pg_port/real_clean?sslmode=disable"
 
-  # R1: enum + domain-only schema must be rejected BEFORE stopping writers.
-  mkdir -p "$real_work/r1/state" "$real_work/r1/home"
+  # R1: enum + domain-only schema must be rejected BEFORE archiving or stopping writers.
+  mkdir -p "$real_work/r1/state" "$real_work/r1/home" "$real_work/r1/tmp"
   : > "$real_work/r1/calls"
   set +e
-  env -i PATH="$real_work/bin:/usr/bin:/bin" HOME="$real_work/r1/home" \
+  env -i PATH="$real_work/bin:/usr/bin:/bin" HOME="$real_work/r1/home" TMPDIR="$real_work/r1/tmp" \
     MOCK_LOG="$real_work/r1/calls" MOCK_STATE_DIR="$real_work/r1/state" \
     SPAWN_REAL_BIN="$real_bin" PSQL="$real_psql" MOCK_TRIGGER_ACTIVE=active \
     SPAWN_CLEAN_DATABASE_URL="$uri_enum" SPAWN_CLEAN_EXPECT_DATABASE=enum_only \
     bash "$script" --execute --archive-dir "$real_work/r1/archive" --confirm-clean-remigrate=enum_only > "$real_work/r1/out" 2>&1
   r1_rc=$?
   set -e
-  if [ "$r1_rc" != 0 ] && ! grep -q '<stop>' "$real_work/r1/calls" && ! grep -q '<init-db>' "$real_work/r1/calls"; then
-    ok "real PG16: enum/domain-only schema refused before stopping writers"
+  if [ "$r1_rc" != 0 ] && [ ! -e "$real_work/r1/archive" ] && \
+     [ -z "$(find "$real_work/r1/tmp" -mindepth 1 -print -quit)" ] && \
+     ! grep -q '<node> <list>' "$real_work/r1/calls" && \
+     ! grep -q '<stop>' "$real_work/r1/calls" && ! grep -q '<init-db>' "$real_work/r1/calls"; then
+    ok "real PG16: enum/domain-only schema refused before archiving or stopping writers"
   else
     bad "real PG16 R1 failed (rc=$r1_rc)"
   fi
 
   # R2: real empty PG16 database succeeds end-to-end with real psql + real spawn init-db.
-  mkdir -p "$real_work/r2/state" "$real_work/r2/home"
+  mkdir -p "$real_work/r2/state" "$real_work/r2/home" "$real_work/r2/tmp"
   : > "$real_work/r2/calls"
   set +e
-  env -i PATH="$real_work/bin:/usr/bin:/bin" HOME="$real_work/r2/home" \
+  env -i PATH="$real_work/bin:/usr/bin:/bin" HOME="$real_work/r2/home" TMPDIR="$real_work/r2/tmp" \
     MOCK_LOG="$real_work/r2/calls" MOCK_STATE_DIR="$real_work/r2/state" \
     SPAWN_REAL_BIN="$real_bin" PSQL="$real_psql" MOCK_TRIGGER_ACTIVE=active \
     SPAWN_CLEAN_DATABASE_URL="$uri_clean" SPAWN_CLEAN_EXPECT_DATABASE=real_clean \
@@ -547,6 +713,7 @@ EOF
   r2_rc=$?
   set -e
   if [ "$r2_rc" = 0 ] && grep -q SUCCESS "$real_work/r2/out" && \
+     [ -z "$(find "$real_work/r2/tmp" -mindepth 1 -print -quit)" ] && \
      [ "$(grep -c '<stop>' "$real_work/r2/calls")" = 7 ] && \
      [ -s "$real_work/r2/archive/nodes.json" ] && \
      [ "$(file_mode "$real_work/r2/archive/nodes.json")" = 600 ]; then
@@ -555,24 +722,46 @@ EOF
     bad "real PG16 R2 failed (rc=$r2_rc): $(cat "$real_work/r2/out")"
   fi
 
-  # R3: repeated run against the same initialized PG16 DB must fail closed before stop & init-db.
-  mkdir -p "$real_work/r3/state" "$real_work/r3/home"
+  # R3: repeated run against the same initialized PG16 DB must fail closed before archive, stop, & init-db.
+  mkdir -p "$real_work/r3/state" "$real_work/r3/home" "$real_work/r3/tmp"
   : > "$real_work/r3/calls"
   set +e
-  env -i PATH="$real_work/bin:/usr/bin:/bin" HOME="$real_work/r3/home" \
+  env -i PATH="$real_work/bin:/usr/bin:/bin" HOME="$real_work/r3/home" TMPDIR="$real_work/r3/tmp" \
     MOCK_LOG="$real_work/r3/calls" MOCK_STATE_DIR="$real_work/r3/state" \
     SPAWN_REAL_BIN="$real_bin" PSQL="$real_psql" MOCK_TRIGGER_ACTIVE=active \
     SPAWN_CLEAN_DATABASE_URL="$uri_clean" SPAWN_CLEAN_EXPECT_DATABASE=real_clean \
     bash "$script" --execute --archive-dir "$real_work/r3/archive" --confirm-clean-remigrate=real_clean > "$real_work/r3/out" 2>&1
   r3_rc=$?
   set -e
-  if [ "$r3_rc" != 0 ] && ! grep -q '<stop>' "$real_work/r3/calls" && ! grep -q '<init-db>' "$real_work/r3/calls"; then
+  if [ "$r3_rc" != 0 ] && [ ! -e "$real_work/r3/archive" ] && \
+     [ -z "$(find "$real_work/r3/tmp" -mindepth 1 -print -quit)" ] && \
+     ! grep -q '<node> <list>' "$real_work/r3/calls" && \
+     ! grep -q '<stop>' "$real_work/r3/calls" && ! grep -q '<init-db>' "$real_work/r3/calls"; then
     ok "real PG16: repeat execute on initialized database refused fail-closed"
   else
     bad "real PG16 R3 failed (rc=$r3_rc)"
   fi
 
-  # R4: zero leakage of test password or URI in script outputs, call logs, or PG16 server log.
+  # R4: URL with query target overrides must fail closed before any backup, target access, or archive creation.
+  mkdir -p "$real_work/r4/state" "$real_work/r4/home" "$real_work/r4/tmp"
+  : > "$real_work/r4/calls"
+  set +e
+  env -i PATH="$real_work/bin:/usr/bin:/bin" HOME="$real_work/r4/home" TMPDIR="$real_work/r4/tmp" \
+    MOCK_LOG="$real_work/r4/calls" MOCK_STATE_DIR="$real_work/r4/state" \
+    SPAWN_REAL_BIN="$real_bin" PSQL="$real_psql" MOCK_TRIGGER_ACTIVE=active \
+    SPAWN_CLEAN_DATABASE_URL="${uri_clean}&host=127.0.0.1&port=${pg_port}" \
+    SPAWN_CLEAN_EXPECT_DATABASE=real_clean \
+    bash "$script" --execute --archive-dir "$real_work/r4/archive" --confirm-clean-remigrate=real_clean > "$real_work/r4/out" 2>&1
+  r4_rc=$?
+  set -e
+  if [ "$r4_rc" != 0 ] && [ ! -s "$real_work/r4/calls" ] && [ ! -e "$real_work/r4/archive" ] && \
+     [ -z "$(find "$real_work/r4/tmp" -mindepth 1 -print -quit)" ] && grep -qi 'must not override' "$real_work/r4/out"; then
+    ok "real PG16: query-parameter host/port override refused before any command"
+  else
+    bad "real PG16 R4 failed (rc=$r4_rc)"
+  fi
+
+  # R5: zero leakage of test password or URI in script outputs, call logs, or PG16 server log.
   if grep -RqsF "$pg_pw" "$real_work" "$pg_log" || grep -RqsF 'postgres://' "$real_work" "$pg_log"; then
     bad "real PG16 leaked test credential or database URI into logs/output"
   else
