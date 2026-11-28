@@ -1855,15 +1855,15 @@ fn is_snapshot_ancestor(
         if !seen.insert(cur.clone()) {
             continue;
         }
-        let snap = cas
+        let commit = cas
             .cas()
-            .read_merkle_snapshot(&cur)
-            .map_err(|e| format!("read snapshot {cur} during ancestor walk: {e}"))?;
-        for parent in snap.parents {
-            if &parent == ancestor {
+            .get_commit_object(&cur)
+            .map_err(|e| format!("read commit {cur} during ancestor walk: {e}"))?;
+        for parent in commit.parents() {
+            if parent == ancestor {
                 return Ok(true);
             }
-            stack.push(parent);
+            stack.push(parent.clone());
         }
     }
     Ok(false)
@@ -2451,8 +2451,8 @@ fn verify_reopened_objects(
     let mut corrupt_objects = 0_usize;
     let mut blob_digests = BTreeSet::new();
     for snap_id in snapshots {
-        match fresh_cas.cas().read_merkle_snapshot(snap_id) {
-            Ok(snap) => match fresh_cas.flatten_tree(&snap.tree) {
+        match fresh_cas.cas().get_commit_object(snap_id) {
+            Ok(commit) => match fresh_cas.flatten_tree(commit.tree()) {
                 Ok(entries) => {
                     for entry in entries.into_values() {
                         if let Some(d) = entry.digest() {
@@ -3046,9 +3046,10 @@ impl D6Driver {
             .map_err(|e| format!("spawn crash verifier child: {e}"))?;
         if !ver_out.status.success() {
             return Err(format!(
-                "separate verifier process failed ({}): {}",
+                "separate verifier process failed ({}): stderr={}; stdout={}",
                 ver_out.status,
-                String::from_utf8_lossy(&ver_out.stderr).trim()
+                String::from_utf8_lossy(&ver_out.stderr).trim(),
+                String::from_utf8_lossy(&ver_out.stdout).trim(),
             ));
         }
         let mut report: Value = serde_json::from_slice(&ver_out.stdout).map_err(|e| {
@@ -4225,9 +4226,13 @@ mod tests {
     use super::{
         LAND_DELTA_SLO_BYTES, TORN_JOURNAL_TAIL, build_shifted_oversized_payload,
         cas_payload_bytes, evaluate_cdc_dedup_slo, evaluate_land_delta_slo, fill_mixed_payload,
-        inject_torn_journal_tail, measure_shifted_cdc_dedup,
+        inject_torn_journal_tail, is_snapshot_ancestor, measure_shifted_cdc_dedup,
+        verify_reopened_objects,
     };
-    use spawn_cas::{NS_BLOB, Store, empty_tree_digest, sha256_of};
+    use spawn_cas::{
+        CommitActor, CommitIntent, CommitOrigin, CommitV2, NS_BLOB, Snapshot, Store, WorkBoundary,
+        WorkChange, empty_tree_digest, sha256_of,
+    };
     use spawn_host::d6_cutover::reconcile_refs_journal;
     use spawn_host::{
         CasMerkleStore, D6RefKind, InMemoryRefLedger, PublishRequest, RefLedger, format_commit_body,
@@ -4504,5 +4509,108 @@ mod tests {
         assert!(!evaluate_land_delta_slo(8, 8, 8, LAND_DELTA_SLO_BYTES));
         assert!(!evaluate_land_delta_slo(7, 8, 7, 256 * 1024));
         assert!(!evaluate_land_delta_slo(0, 8, 0, 0));
+    }
+
+    #[test]
+    fn crash_verifier_helpers_support_v1_snapshots_and_commit_v2() {
+        let dir = unique_tmp_dir("v1-v2-verify");
+        let cas = CasMerkleStore::open(&dir).expect("open cas");
+        let empty = empty_tree_digest();
+        let make_tree = |name: &str, payload: &[u8]| {
+            let (blob_d, blob_len) = cas.put_bytes_blob(payload).expect("put blob");
+            cas.apply_mutations(
+                &empty,
+                &[spawn_cas::TreeMutation::Upsert {
+                    path: vec![name.as_bytes().to_vec()],
+                    kind: spawn_cas::TreeEntryKind::File,
+                    id: blob_d.as_bytes(),
+                    size: blob_len,
+                }],
+            )
+            .expect("apply tree")
+        };
+
+        let body = format_commit_body(
+            "spawn <bench@localhost> 1700000010 +0000",
+            "spawn <bench@localhost> 1700000010 +0000",
+            "v1 snapshot in mixed v1/v2 regression test\n",
+        );
+        let t_v1_root = make_tree("v1_root.txt", b"v1-root-payload");
+        let v1_root = cas
+            .cas()
+            .put_merkle_snapshot(&Snapshot {
+                tree: t_v1_root,
+                parents: Vec::new(),
+                commit_body: body.clone(),
+            })
+            .expect("put v1 root");
+
+        let t_v1_child = make_tree("v1_child.txt", b"v1-child-payload");
+        let v1_child = cas
+            .cas()
+            .put_merkle_snapshot(&Snapshot {
+                tree: t_v1_child,
+                parents: vec![v1_root.clone()],
+                commit_body: body,
+            })
+            .expect("put v1 child");
+
+        let make_v2 = |tree, parent, at_ms, msg: &str| {
+            cas.cas()
+                .put_commit_v2(&CommitV2 {
+                    tree,
+                    parents: vec![parent],
+                    at_ms,
+                    actor: CommitActor::System {
+                        id: "bench-test".to_string(),
+                    },
+                    intent: CommitIntent {
+                        origin: CommitOrigin::Work {
+                            change: WorkChange::Edit,
+                            boundary: WorkBoundary::Checkpoint,
+                        },
+                        task_id: None,
+                        transcript_ref: None,
+                        message: msg.to_string(),
+                    },
+                    git_compat_body: None,
+                })
+                .expect("put commit v2")
+        };
+
+        let t_v2_mid = make_tree("v2_mid.txt", b"v2-mid-payload");
+        let v2_mid = make_v2(
+            t_v2_mid,
+            v1_child.clone(),
+            1_700_000_000_003,
+            "v2 mid checkpoint",
+        );
+
+        let t_v2_child = make_tree("v2_child.txt", b"v2-child-payload");
+        let v2_child = make_v2(
+            t_v2_child,
+            v2_mid.clone(),
+            1_700_000_000_004,
+            "v2 child checkpoint",
+        );
+
+        assert!(is_snapshot_ancestor(&cas, &v1_child, &v1_root).expect("v1->v1 ancestor"));
+        assert!(!is_snapshot_ancestor(&cas, &v1_root, &v1_child).expect("v1 reverse"));
+        assert!(is_snapshot_ancestor(&cas, &v2_child, &v2_mid).expect("v2->v2 ancestor"));
+        assert!(is_snapshot_ancestor(&cas, &v2_child, &v1_child).expect("v2->v1 child"));
+        assert!(is_snapshot_ancestor(&cas, &v2_child, &v1_root).expect("v2->v1 root"));
+        assert!(!is_snapshot_ancestor(&cas, &v1_root, &v2_child).expect("v1->v2 reverse"));
+
+        let mut all_four = BTreeSet::new();
+        all_four.insert(v1_root);
+        all_four.insert(v1_child);
+        all_four.insert(v2_mid);
+        all_four.insert(v2_child);
+        assert_eq!(verify_reopened_objects(&cas, &all_four), (0, 0, 4));
+
+        all_four.insert(sha256_of(b"missing-commit-sentinel"));
+        assert_eq!(verify_reopened_objects(&cas, &all_four), (1, 0, 4));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
